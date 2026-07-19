@@ -25,6 +25,7 @@ Initial target formats:
 - **vdi** - VirtualBox Disk Image (read-only input: convert/compare/dd source; no create/write)
 - **parallels** - Parallels Disk Image, both magics (read-only input: convert/compare/dd/bench source; no create/write)
 - **qcow** (QCOW1) - qemu's original deprecated format, including backing chains and compressed clusters (read-only input: convert/compare/dd/bench source; no create/write)
+- **dmg** - Apple UDIF disk image (koly trailer, XML-plist and resource-fork chunk tables, zero/raw/ignore/zlib chunk codecs; read-only input: convert/compare/dd/bench source; no create/write)
 
 ## Project Status
 

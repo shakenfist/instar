@@ -267,6 +267,29 @@ provides a modular architecture with:
   non-QCOW2 format to support backing-chain fall-through, mirroring
   the QCOW2 arm's own unallocated-cluster recursion instead of the
   VDI/Parallels arms' zero-fill (PLAN-format-coverage phase 4).
+- **crates/dmg/** - Shared DMG (Apple UDIF) format crate: koly-trailer
+  parsing (reusing the phase-1 shared trailer helpers), chunk-table
+  assembly from either the XML-plist path (string-scanned `<data>`
+  blocks, decoded with a byte-for-byte port of glib's lenient base64)
+  or the old resource-fork path, mish/BLKX chunk-entry parsing into a
+  sorted, verified lookup table, and `DmgState` for stateful per-
+  sector chunk lookup (`init`/`chunk_lookup`, returning span-typed
+  Zero/Raw/Zlib results). Codec scope is zero/raw/ignore/zlib
+  (zlib-WRAPPED inflate, unlike QCOW1's raw-deflate); ADC/bzip2/
+  lzfse/zstd/unknown chunk types get a typed init refusal naming the
+  code rather than qemu's drop-then-EIO shape, and a chunk table that
+  parses to zero entries is refused cleanly at init (where qemu
+  SIGSEGVs on every version tested). Enforces its own bounded-memory
+  caps (`DMG_REGION_STAGE_CAP`, `DMG_MAX_CHUNKS`,
+  `DMG_MAX_STAGED_SECTOR_COUNT`), distinct from qemu's own larger
+  legal range, as typed refusals. Read-only: no write/output support;
+  chunk *decompression* and byte copies live in the reader arm, not
+  this crate. Linked into the qcow2 crate's chain reader behind the
+  `dmg-input` feature (which also pulls in the `decompress` feature)
+  and used by convert, compare, bench, and rebase; unlike every other
+  format-coverage reader, DMG reads a missing/truncated span as an
+  ERROR rather than zero-filling, matching qemu exactly
+  (PLAN-format-coverage phase 5).
 - **crates/luks/** - Shared LUKS format crate: LUKS v1/v2 header
   constants, header parsing, PBKDF2 key derivation, Argon2id key
   derivation (behind `kdf-argon2` feature), AFsplitter key recovery,

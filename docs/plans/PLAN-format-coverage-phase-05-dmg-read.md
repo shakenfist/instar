@@ -2,7 +2,7 @@
 
 Master plan: [PLAN-format-coverage.md](PLAN-format-coverage.md)
 
-## Status: Ready for execution (planned 2026-07-19)
+## Status: Complete (2026-07-19)
 
 ## Prompt
 
@@ -417,6 +417,275 @@ commits first.
 Sequencing: 5a → 5b → 5c strictly (reader before variant);
 5d's testdata portion parallel with 5a-5c, its instar-side
 edits after 5c; 5e after 5c + 5d; 5f after 5c; 5g last.
+
+## Findings: step 5a — dmg crate
+
+* `src/crates/dmg/` landed as planned: koly-trailer parsing reuses
+  the phase-1 shared helpers
+  (`shared::format_detection::{detect_dmg_koly_offset,
+  find_last_dmg_koly, parse_dmg_koly}`) rather than duplicating the
+  window-scan/true-length-recovery logic, so the crate and the info
+  op's trailer probe share one source of truth for trailer geometry.
+* Both chunk-table sources landed: the XML-plist `<data>…</data>`
+  string scan with a byte-for-byte port of glib's lenient base64
+  (invalid characters skipped, never erroring; a missing `</data>` is
+  the one case treated as malformed XML and refused), and the old
+  resource-fork walk (`u32 rsrc_data_offset`, `u32 count`, then
+  `[u32 size][mish]` resources) — path selection is
+  `RsrcForkLength != 0` first, else `XMLLength != 0`, else refused,
+  matching qemu's `dmg_open` exactly.
+* mish/BLKX parsing applies `out_offset`/`data_offset`/
+  `DataForkOffset` exactly as qemu does, enforces qemu's own
+  per-chunk caps (`comp_len <= 64 MiB`, `sector_count <= 131072` with
+  zero/ignore chunks exempt) as one refusal class, and instar's own
+  smaller bounded-memory caps (`DMG_REGION_STAGE_CAP` = 1 MiB,
+  `DMG_MAX_CHUNKS` = 32768, `DMG_MAX_STAGED_SECTOR_COUNT` = 4096
+  sectors) as a **distinct** typed refusal class — the two never
+  share a message, so a fixture's refusal reason unambiguously
+  records which cap it hit.
+* Unsupported/unknown codec types (ADC `0x80000004`, bzip2
+  `0x80000006`, lzfse `0x80000007`, zstd `0x80000008`, and any other
+  unrecognised code) get a typed `DmgRefusal::UnsupportedCodec`
+  refusal naming the exact u32; comment (`0x7ffffffe`) and terminator
+  (`0xffffffff`) entries are dropped silently, matching qemu.
+* The empty-table refusal (`DmgRefusal::EmptyChunkTable`) — the
+  reader's answer to qemu's universal zero-chunk NULL-deref crash —
+  fires whenever the assembled table has zero entries, regardless of
+  which chunk-table source produced it (an empty plist, an
+  all-garbage-base64 plist, or an empty resource fork all collapse to
+  the same refusal).
+* Sortedness verification landed as specified: the table is checked
+  sorted-by-sector at init and an unsorted/overlapping table is
+  refused rather than silently binary-searched against (qemu's own
+  behaviour there is silent-arbitrary); no shipped fixture exercises
+  an unsorted table, recorded as an accepted un-fixtured corner
+  matching the established policy elsewhere in this document.
+* `DmgState::init`/`chunk_lookup` follow the sibling crates' stateful
+  shape (`init` stages the table into caller scratch, `chunk_lookup`
+  returns span-typed `Zero`/`Raw{host_offset}`/`Zlib{host_offset,
+  comp_len}` results with the containing chunk's bounds). `no_std`,
+  panic-free, workspace member; unit tests cover every koly
+  validation accept/reject, both table paths, the lenient-base64
+  edge cases, both cap classes at their exact boundaries, every codec
+  refusal, the empty-table refusal, the unsorted-table refusal, the
+  multipart absolute-sector arithmetic, and lookup walks including
+  gap spans — `make instar`/`lint`/`test-rust` clean.
+
+## Findings: step 5b — guest reader arm
+
+* The `dmg-input = ["dep:dmg", "decompress"]` feature landed in the
+  qcow2 crate, with `ChainStates.dmg_states` and a per-device scratch
+  slot carved from a caller-reserved region sized
+  `DMG_REQUIRED_SCRATCH` (~3.25 MiB: a 1.25 MiB persistent chunk
+  table plus a 2 MiB transient plist/decode region). `convert`'s
+  memory-layout compile-time assertion
+  (`src/operations/convert/src/main.rs`) was extended to account for
+  the new region; the transient init suffix reuses convert's existing
+  staging buffer, so the layout's **net** addition is only the
+  persistent 1.25 MiB table, not the full 3.25 MiB slot size.
+  `compare` reserves two slots (either side of the comparison may be
+  a DMG); `bench`/`rebase` use the write-only overlay-scratch shape.
+* **EIO parity is the one genuinely new architectural piece this
+  phase** (inverting the phase 2-4 zero-fill posture, commented
+  prominently in the arm per the plan's explicit instruction): a raw
+  span whose bytes are unavailable (past capacity or short), a gap
+  (no covering chunk, including the koly-`SectorCount`-vs-mish-
+  coverage tail), and truncated/short compressed data all make the
+  reader return `false` rather than zero-filling. Zero/ignore spans
+  still write zeros (that part of the posture is unchanged from every
+  other format).
+* Zlib spans read `comp_len` bytes (byte-accurate, possibly
+  unaligned) into the compressed buffer and inflate
+  **zlib-wrapped** (`TINFL_FLAG_PARSE_ZLIB_HEADER`, matching the
+  qcow2 crate's own zlib-first helper flags — explicitly NOT QCOW1's
+  raw-deflate-only call) with exact-uncompressed-length verification.
+  The decompressed-chunk staging cache is keyed by the chunk's host
+  file offset with bit 63 OR'd in
+  (`cache_key = host_offset | (1u64 << 63)`), which can never collide
+  with the qcow2/vmdk staging cache's own offset-keyed entries (real
+  file offsets are always well under 2^63) — so consecutive reads
+  within one chunk avoid re-inflation without any risk of aliasing
+  another format's cached cluster.
+* No backing-file descent from this arm — DMG carries no backing
+  reference of its own, so the arm never recurses into a "next
+  device," unlike QCOW1's arm.
+* `read_offset_sectors`'s cfg gate was widened to include
+  `dmg-input`; the feature was enabled in convert/compare/bench/
+  rebase `Cargo.toml`s and the Makefile's qcow2 test-features line
+  was extended. Behaviour was unchanged this step (no chain variant
+  yet — the #444 gate still refused DMG at this point in the commit
+  sequence); the three pre-existing DMG refusal tests stayed green
+  through this step, confirming the reader-before-variant ordering
+  held.
+* Unit tests mirror the VDI/Parallels/QCOW1 pattern plus DMG-specific
+  cases: a mixed-type chunk walk, a zlib chunk cached across two
+  reads (asserting a single inflation via `bytes_read` accounting), a
+  raw-span EIO on truncation, a gap EIO, zero spans, multipart-table
+  reads, and an over-cap init refusal propagating cleanly up through
+  the arm.
+
+## Findings: step 5c — graduation and pins
+
+* Landed as two separate commits per the plan: `ede8fd4` (the
+  `chain::ImageFormat::Dmg` variant — `from_str "dmg"`,
+  `to_shared_format_u32 => 16`, `Display "dmg"`, and bench
+  `read_family`'s `Dmg => Some(8)`) and `9033505` (the pins). No info
+  changes were needed in this step — info already emitted `dmg`
+  correctly from phase 1 — confirmed by a full `test_info_safe` run
+  with zero drift.
+* Three empirically-grounded pin deviations from the plan's initial
+  expectations, all confirmed correct during this step rather than
+  assumed:
+  1. **`check` names the format "raw", not "dmg"** — because check's
+     own format dispatch never runs the koly-trailer probe (that
+     probe lives only in the `info` op's guest chain), check sees a
+     DMG image as `Raw` and refuses with `This image format (raw)
+     does not support checks`, exit 63. This is still genuine rc
+     parity with qemu-img's own dmg-check refusal (also exit 63,
+     "does not support checks") — only the named format differs.
+  2. **`dmg-sectorcount-negative` is a pre-existing unknown-format
+     pass-through, not a reader-refusal fixture** — the negative
+     `SectorCount` collapses the shared trailer helper's detection to
+     `unknown` (not `dmg`) before the image ever reaches the #444
+     gate or the DMG reader, so it reads as ordinary raw pass-through
+     on the small container. This behaviour predates phase 5 (phase-1
+     detection logic); this step added the first test pinning it.
+  3. **`dmg-no-chunk-table` keeps its clean-EINVAL shape and is
+     distinct from the new `dmg-empty-table` segfault reproducer** —
+     the four pre-existing malformed trailer fixtures' adversarial
+     convert expectations moved from the gate-refusal message to
+     reader-init failure messages, but `dmg-no-chunk-table`
+     specifically (both `RsrcForkLength` and `XMLLength` zero) never
+     reaches table-build at all, so it refuses at koly path-selection
+     with a different reason than the empty-table case.
+* The new `dmg-empty-table` fixture (the actual qemu-segfault
+  reproducer) was confirmed to fail convert cleanly on instar with no
+  crash and the typed empty-table message, as required.
+* map/measure/resize raw-pass-through pins were re-run and confirmed
+  **unchanged** — graduation only affects chain-discovery consumers
+  (convert/compare/dd/bench), and none of the three raw-pass-through
+  pins flipped, so no management-review stop was triggered.
+
+## Findings: step 5d — fixtures, baselines, and manifest/oslo
+
+* `instar-testdata/scripts/generate-dmg-fixtures.py` was extended
+  with the twelve new fixtures deterministically (three-run
+  byte-identical, per the established DMG generator posture): four
+  safe (`dmg-mixed`, `dmg-multipart`, `dmg-rsrc-fork`, `dmg-gap`) and
+  eight malformed/refused (`dmg-chunk-len-over`, `dmg-sc-over`,
+  `dmg-codec-bzip2`, `dmg-codec-lzfse`, `dmg-codec-adc`,
+  `dmg-overcap-chunk`, `dmg-empty-table`, plus the pre-existing four
+  trailer fixtures whose manifest entries carried forward unchanged
+  in id/description but changed expectation for convert). Combined
+  with the phase-1 `dmg-simple` and four trailer fixtures, the DMG
+  fixture inventory now totals **16** images (5 safe, 11 malformed/
+  refused) — more than the plan's rough step-5g estimate of 13,
+  because the Design section's malformed set (7 new fixtures) plus
+  the 4 pre-existing trailer fixtures came to 11, not 8.
+* Safe fixtures were validated on 6.0.0 and 10.2.0: `info` + convert
+  md5 agreement for `dmg-mixed`/`dmg-multipart`/`dmg-rsrc-fork`;
+  `dmg-gap` recorded as an error-parity fixture instead (`info` rc 0
+  both sides at virtual size 8192; convert rc 1 both sides, messages
+  differ and are not compared).
+* Codec fixtures record the per-version matrix honestly rather than
+  asserting one qemu build as the oracle: `dmg-codec-bzip2` decodes
+  on static 6.0.0 and host 10.0.11 (md5 `3b4c90d4a1a30682b7ec51174fb-
+  6928d`) but EIOs elsewhere; `dmg-codec-lzfse` and `dmg-codec-adc`
+  EIO on every tested version. `dmg-overcap-chunk` (the capacity-
+  divergence fixture) converts fine on every qemu version (md5
+  `dd8d16c0893059dd98d1a3bf1f8675bd`) despite being over instar's
+  staging cap. All codec/capacity fixtures carry `skip_qemu_img` in
+  the manifest with the build-dependence or divergence noted in the
+  description text.
+* `dmg-empty-table` was constructed as a well-formed XML plist whose
+  single `<data>` block decodes to a mish with a corrupted magic
+  (`0xDEADBEEF`) — confirmed to reproduce the universal SIGSEGV (rc
+  139) on static 6.0.0, static 10.2.0, and host 10.0.11 alike, with
+  `info` unaffected (rc 0) since it never touches the chunk table.
+  `skip_qemu_img` since no convert baseline can exist against a
+  crashing tool.
+* Instar-side manifest entries (safe fixtures `run_in_ci`; refused
+  fixtures `skip_qemu_img` + `expected_error` recording instar's
+  typed guest-side message verbatim) landed after step 5c, as
+  required. Oslo entries: `KNOWN_FORMAT_DIVERGENCES` = `('dmg',
+  'raw')` for all four new safe fixtures (oslo has no DMG inspector,
+  falls back to `RawFileInspector`), plus `KNOWN_VSIZE_DIVERGENCES`
+  recording each fixture's file size (all four fit under oslo's
+  262144-byte raw-fallback read-chunk cap, so oslo reports the whole
+  file length while instar reports the koly-derived virtual size) —
+  verified live against oslo.utils 10.1.2.dev8 (git master). The
+  eight refused fixtures joined `OSLO_SKIP_IMAGES`.
+
+## Findings: step 5e — integration tests
+
+* The full sequential suite matrix ran clean: `test_info_safe`
+  954/0, `test_convert` 251/0, `test_compare` 65/0, `test_dd` 45/0,
+  `test_adversarial` 96/0, `test_oslo_crossval` 279/0, `test_bench`
+  80/0, `test_rebase` 28/0, `qcow1_smoke` 12/0, `test_check_formats`
+  77/0, `test_map` 268/0, `test_measure` 570/0, `test_resize` 125/0 —
+  zero failures across every consumer suite, confirming the
+  crate-change consumer-suite rule needed no bisection this phase.
+* Byte parity confirmed for `dmg-simple`/`dmg-mixed`/`dmg-multipart`/
+  `dmg-rsrc-fork` convert-to-raw against `qemu-img convert`;
+  multipart-equals-concatenation pinned directly (converting
+  `dmg-multipart` byte-matches the concatenation of its two mish
+  parts); `dmg-mixed` converted to qcow2 and vpc and flatten-compared
+  clean; compare pinned `dmg-simple` identical to its raw conversion
+  and `dmg-mixed` different from `dmg-multipart`.
+* Windowed `dd` was pinned crossing both a zlib/raw chunk boundary
+  and a zero span, with absolute-from-0 counts, confirming the
+  per-chunk arm walk handles sub-chunk windowing correctly.
+* `dmg-gap` was confirmed to fail convert AND dd non-zero cleanly on
+  both instar and qemu (error parity, messages differ, never
+  byte-parity, as designed).
+* All refused fixtures — the four pre-existing trailer fixtures plus
+  the eight new codec/capacity/empty-table fixtures — were confirmed
+  to refuse convert/compare/dd non-zero cleanly with no hang and no
+  crash, including a dedicated no-crash assertion for
+  `dmg-empty-table` (the qemu-segfault reproducer).
+* The extensionless-file divergence was pinned exactly as specified:
+  a copy of `dmg-simple` without its `.dmg` suffix converts as raw
+  container bytes under `qemu-img convert` (no `-f` given, extension
+  probe falls through to raw) but as the real decoded 4 MiB disk
+  under instar (content-based trailer detection) — both behaviours
+  asserted, with a comment citing this plan.
+* **The `-F dmg` backing-chain convergence** (the DMG-at-any-chain-
+  position proof): a qcow2 overlay created with `qemu-img create -f
+  qcow2 -b <dmg> -F dmg` reads through instar's chain walker and
+  converges byte-for-byte with the same chain read through
+  `qemu-img convert` — confirming the DMG reader arm composes
+  correctly with the existing chain-descent machinery even though DMG
+  itself has no backing-file concept, because the *overlay*'s backing
+  reference (not DMG's own) is what places the DMG reader mid-chain.
+* `bench` on `dmg-simple` confirmed header parity with `qemu-img
+  bench`.
+
+## Findings: step 5f — fuzzing
+
+* `fuzz_dmg_table` (koly → plist/rsrc-fork → base64 → mish → table
+  build + lookups) and `fuzz_dmg_chunk` (arm-level lookup + inflate
+  invariants) both ran crash-free in local 60-second sessions:
+  approximately 67k exec/s for the table target (the plist scanner
+  and lenient base64 are the heaviest part of that target) and
+  approximately 28k exec/s for the chunk target. Both drive the XML
+  and resource-fork table paths from fuzz bytes, and both assert
+  qemu's exact caps, sortedness handling, and no panics.
+* The differential fuzzer's `generate_image` gained a `dmg` branch
+  using a ported deterministic mini-builder (qemu-img cannot create
+  DMG images itself), seeded from the iteration rng: chunk-type mixes
+  of zero/raw/zlib, 1-3 mish blocks, chunk sizes kept within instar's
+  caps, and no gaps — every generated image is a valid, fully-openable
+  DMG so the differential comparison stays meaningful. `FORMATS`
+  gained `'dmg'`; `op_map` was gated to `('raw', 'vdi', 'parallels',
+  'qcow', 'dmg')` and `op_measure` to `('vdi', 'parallels', 'qcow',
+  'dmg')`, citing this plan, since instar's map/measure still treat
+  DMG as raw (the retained phase-1 divergence — see step 5c).
+* A ~200-iteration forced burn-in (seed 52001) against the
+  differential harness produced **zero divergences**, matching every
+  prior format-coverage phase's clean burn-in result. The custom
+  builder proved robust enough that the full differential scope
+  (convert/dd/compare, not a reduced convert-only fallback) landed as
+  originally planned.
 
 ## Verification (management-session review checklist)
 

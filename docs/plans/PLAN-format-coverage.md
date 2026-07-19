@@ -228,7 +228,7 @@ is the tracking source of truth.
 | 2. VDI convert-from (dynamic + static read path, new `src/crates/vdi/`) | [PLAN-format-coverage-phase-02-vdi-read.md](PLAN-format-coverage-phase-02-vdi-read.md) | Complete (commits 6cd14b5..cf213ed + docs commit) |
 | 3. Parallels convert-from (v2 read path, new `src/crates/parallels/`) | [PLAN-format-coverage-phase-03-parallels-read.md](PLAN-format-coverage-phase-03-parallels-read.md) | Complete (commits 3f43472..f2bacf4 + docs commit) |
 | 4. QCOW1 convert-from (read path, new `src/crates/qcow1/`; fixes the misdetection-as-qcow2 defect) | [PLAN-format-coverage-phase-04-qcow1-read.md](PLAN-format-coverage-phase-04-qcow1-read.md) | Complete (commits 23b240f..efdc42e + docs commit) |
-| 5. DMG convert-from (BLKX chunk table + zlib chunks, new `src/crates/dmg/`; EIO-parity error semantics, typed codec/capacity refusals) | [PLAN-format-coverage-phase-05-dmg-read.md](PLAN-format-coverage-phase-05-dmg-read.md) | Planned (2026-07-19) |
+| 5. DMG convert-from (BLKX chunk table + zlib chunks, new `src/crates/dmg/`; EIO-parity error semantics, typed codec/capacity refusals) | [PLAN-format-coverage-phase-05-dmg-read.md](PLAN-format-coverage-phase-05-dmg-read.md) | Complete (commits 71a20d9..9d8111c + docs commit) |
 | 6. QED decision: read path or documented refusal (see Open question 1) | PLAN-format-coverage-phase-06-qed.md | Not written |
 | 7. Docs: qemu-img-parity axis in format-coverage.md, README/ARCHITECTURE/CHANGELOG updates | PLAN-format-coverage-phase-07-docs.md | Not written |
 
@@ -471,8 +471,18 @@ We should list obvious extensions, known issues, unrelated bugs
 we encountered, and anything else we should one day do but have
 chosen to defer to here so that we don't forget them.
 
-* DMG bzip2 (UDBZ) and lzfse (ULFO) chunk codecs (deferred
-  from phase 5 per Open question 3).
+* DMG bzip2 (UDBZ), lzfse (ULFO), and ADC chunk codec decode
+  support (deferred from phase 5 per Open question 3; instar
+  issues typed refusals naming the code instead, and qemu's
+  own support is compile-flag dependent across the version
+  matrix anyway, so there is no single parity target — see
+  `docs/quirks.md` "Format-coverage phase 5").
+* Streaming decompression for DMG chunks that exceed instar's
+  bounded-memory staging caps (1 MiB plist region, 32768-chunk
+  table, 4096-sector per-chunk staging): phase 5's typed
+  capacity refusal (pinned by `dmg-overcap-chunk`) stands in;
+  revisit only if real-world images exceed the 2 MiB per-chunk
+  staging cap in practice.
 * Write/create/output support for VDI or Parallels, if real
   demand appears.
 * VMDK subformat expansion (twoGbMaxExtentSparse output,
@@ -480,11 +490,16 @@ chosen to defer to here so that we don't forget them.
 * `map` / `measure` / `dd` support for the new input
   formats, where each phase plan chose to defer it.
 * Wire DMG koly-trailer probing into the in-place-op
-  detection paths (host `probe_*_target` prefix probes and
-  the guest map/measure ops), so DMG is refused there like
-  bochs/cloop/parallels instead of passing through as raw
-  (phase-1 step-5a finding; pinned by tests as accepted
-  behaviour until then, and naturally revisited by phase 5).
+  detection paths (host `probe_*_target` prefix probes, the
+  guest map/measure ops, `resize`, and `check`'s own format
+  dispatch), so DMG is refused/recognised there like
+  bochs/cloop/parallels instead of passing through as (or
+  being refused while named) raw. Phase 5 graduated DMG to a
+  full read format for convert/compare/dd/bench but
+  deliberately left this bullet open — map/measure/resize
+  pins are unchanged and `check` still names the format "raw"
+  (see `docs/quirks.md` "Format-coverage phase 5" and "DMG
+  Pass-Through as Raw in the In-Place Ops").
 * `instar check` support for VDI (phase 2 future work: qemu-img
   `check` validates the VDI block map; unconsumed check baselines
   already exist in instar-testdata from `generate-baselines.py`).
@@ -500,7 +515,10 @@ chosen to defer to here so that we don't forget them.
   qemu-img from 6.0.0 through host 10.0.11 on any read (`info` is
   unaffected). Found by phase-5 planning's empirical pass
   (2026-07-19); instar's phase-5 reader refuses the empty table
-  cleanly instead of mirroring the crash.
+  cleanly instead of mirroring the crash. The reproducer has since
+  shipped as the `dmg-empty-table` instar-testdata fixture
+  (`skip_qemu_img`, since qemu crashes on convert) — use it directly
+  when filing the upstream report rather than reconstructing one.
 * Report the qemu `parallels_check_duplicate` assertion crash
   (10.2.0's `qemu-img check` asserts on an out-of-image BAT entry
   that 6.0.0 reports cleanly) upstream to the qemu project; this is

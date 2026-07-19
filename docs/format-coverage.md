@@ -39,7 +39,7 @@ for details on why this approach is secure.
 | Parallels | No | **Yes** | parallels-v1, parallels-v2, parallels-data-v1, parallels-data-v2, and 7 more (see below) |
 | Bochs | No | **Yes** | bochs-growing |
 | cloop | No | **Yes** | cloop-simple |
-| DMG | No | **Yes**† | dmg-simple, dmg-truncated-koly, dmg-sectorcount-negative, dmg-sectorcount-huge, dmg-no-chunk-table |
+| DMG | No | **Yes**† | dmg-simple, dmg-mixed, dmg-multipart, dmg-rsrc-fork, and 12 more (see below) |
 
 *\* ISO detection is controlled by `--unsafe-quirks` flag: by default instar reports "iso", but with `--unsafe-quirks` it reports "raw" to match qemu-img behavior. See [quirks.md](quirks.md) for details.*
 
@@ -81,6 +81,7 @@ The `instar convert` operation supports writing output in the following formats:
 | vdi (dynamic and static) | Supported | Header validated against qemu's 12 open-time rules; allocation-order block-map lookup, sector-cached reads; qemu parity for discarded blocks, past-EOF reads (zero-fill), and odd `disk_size` (rounded up to 512) |
 | parallels (v1 and v2/ext) | Supported | Open validated against qemu's RO rules (tracks/bat_entries limits, both magics); per-magic BAT decoding (sector-valued under v1, cluster-valued under v2), sector-cached reads; past-EOF and out-of-BAT reads zero-fill, `inuse`-dirty images read normally, `ext_off != 0` refused |
 | qcow (v1) | Supported | Header validated against qemu's exact RO rules (cluster_bits/l2_bits ranges, size bounds incl. the "Image too large" boundary, crypt_method, backing-name length); per-cluster walk (clusters down to 512 B), backing-chain fall-through to the next chain device on unallocated clusters (the first non-QCOW2 backing format), raw-DEFLATE compressed clusters (no zlib wrapper, unlike QCOW2's zlib-first two-try); past-EOF/truncated data clusters zero-fill; odd header sizes truncate down (opposite of VDI's round-up); encrypted (AES, crypt_method=1) images: `info` works and reports `encrypted: yes`, data ops refuse cleanly |
+| dmg (UDIF) | Supported | koly-trailer detection (content-based, not the `.dmg` extension qemu-img probes for); XML-plist AND old resource-fork chunk-table paths, lenient (glib-parity) base64; zero/raw/ignore/zlib chunk codecs, typed refusals naming the codec for ADC/bzip2/lzfse/zstd/unknown; **reads ERROR on gaps and truncation — never zero-fill**, the inverse of every other format's posture; bounded-memory caps on plist size/chunk count/per-chunk staging (documented divergence from qemu's larger legal range); supported at any backing-chain position; `check`/`map`/`measure`/`resize` unaffected (retained raw pass-through / generic refusal) |
 | luks (v1/v2, native) | Supported | Decrypts with `--luks-passphrase`; v1 PBKDF2, v2 Argon2id (`--max-guest-memory`); detects inner format (raw, QCOW2) |
 | luks wrapping qcow2 | Supported | Transparent inner QCOW2 detection and decryption via CallTable function pointer wrapping |
 
@@ -295,6 +296,7 @@ full reference.
 | VDI | None | Pass-through | Detects format, UUID; convert/compare/dd read via a full reader — header validated against qemu's 12 open-time rules, block-map entries bounds-checked, past-EOF block reads zero-filled (`check` still refuses, exit 63) |
 | Parallels | None | Pass-through | Detects format, magic, version; convert/compare/dd/bench read via a full reader — open validated per qemu's RO rules, BAT decoded per-magic (sector-valued v1, cluster-valued v2/ext), past-EOF and out-of-BAT reads zero-filled, `ext_off != 0` refused (`check` still refuses, exit 63) |
 | QCOW1 ("qcow") | None | Pass-through | Detects format (version-aware split from QCOW2, fixed in phase 4), cluster/L2 bits, backing file, encryption; convert/compare/dd/bench read via a full reader — per-cluster walk, backing-chain fall-through, raw-DEFLATE compressed clusters, past-EOF zero-fill (`check` still refuses, exit 63; `map`/`measure` still refuse, a recorded divergence since qemu supports both) |
+| DMG (UDIF) | None | Pass-through | Detects format via koly-trailer content scan; convert/compare/dd/bench read via a full reader — koly + mish/BLKX chunk table (XML-plist and resource-fork paths), zero/raw/ignore/zlib codecs, typed refusals for unsupported codecs and over-cap chunks, gaps and truncation are read ERRORS (never zero-fill) (`check` still refuses, exit 63, naming the format "raw" since check never runs the koly probe; `map`/`measure`/`resize` still pass DMG through as raw, an unchanged divergence since qemu supports all three) |
 | ISO | None | Pass-through | Detects format* |
 | VHD | None | Pass-through | Detects creator app; full check validation (footer/header checksums, version/feature validation, BAT bounds, overlap detection, fragmentation, fixed VHD size check, footer copy consistency) |
 | VHDX | None | Pass-through | Detects block size; full check validation (file identifier, dual header CRC-32C, region table 1+2 cross-check, metadata, BAT bounds/alignment/overlap, fragmentation) |
@@ -431,15 +433,26 @@ full reference.
 |----------|-------------|--------|--------------|
 | cloop-simple | QEMU iotests `simple-pattern.cloop`, V2.0 magic | safe | Detect + info test |
 
-#### DMG Images (5)
+#### DMG Images (16)
 
 | Image ID | Description | Safety | Key Features |
 |----------|-------------|--------|--------------|
-| dmg-simple | Minimal valid UDIF image, UDZO/zlib chunks + koly trailer | safe | Content-based trailer detection |
+| dmg-simple | Minimal valid 4 MiB UDIF, UDZO/zlib chunks + koly trailer | safe | Content-based trailer detection; convert/compare/dd/bench read baseline |
+| dmg-mixed | ~2 MiB UDIF, one mish mixing zero + raw + zlib + ignore chunks plus a comment and terminator entry | safe | Full chunk-type mix in one table; byte-parity convert |
+| dmg-multipart | 1 MiB UDIF composed of two mish blocks at absolute sectors (`out_offset`) | safe | Convert equals the concatenation of the two zlib parts |
+| dmg-rsrc-fork | 512 KiB UDIF using the OLD resource-fork chunk-table path (`RsrcForkLength != 0`, `XMLLength = 0`) | safe | Pins the non-XML chunk-table source; byte-parity convert |
+| dmg-gap | UDIF whose koly `SectorCount` (16) exceeds mish coverage (8 sectors) | safe (error-parity fixture) | `info` succeeds both sides (vsize 8192); `convert`/`dd` FAIL both sides (qemu EIO on the uncovered tail, instar a clean gap refusal) — never byte-parity |
 | dmg-truncated-koly | koly magic present but trailer cut short | malformed | No valid 512-byte trailer at any candidate offset |
-| dmg-sectorcount-negative | Valid koly trailer, SectorCount top bit set | malformed | Rejected as unknown (qemu's negative-total refusal) |
+| dmg-sectorcount-negative | Valid koly trailer, SectorCount top bit set | malformed | Collapses koly *detection* to `unknown`; raw pass-through on the small container, exempted from the #444 gate |
 | dmg-sectorcount-huge | Valid koly trailer, absurd-but-positive SectorCount | malformed | 128 PiB reported vsize, matches qemu |
-| dmg-no-chunk-table | Valid koly trailer, RsrcForkLength and XMLLength both zero | malformed | `skip_qemu_img`: qemu-img open fails, instar reports from trailer alone |
+| dmg-no-chunk-table | Valid koly trailer, RsrcForkLength and XMLLength both zero | malformed | `skip_qemu_img`: qemu's clean EINVAL (no chunk source at all, never reaches table-build) — distinct from dmg-empty-table's segfault shape |
+| dmg-chunk-len-over | One zlib chunk with `comp_len` = 64 MiB + 1 | malformed | qemu refuses at open ("larger than max (67108864)"); instar refuses typed at reader init |
+| dmg-sc-over | One raw chunk with `sector_count` = 131073 (raw is not cap-exempt) | malformed | qemu refuses at open ("larger than max (131072)"); instar refuses typed at reader init |
+| dmg-codec-bzip2 | One real bzip2 (UDBZ, `0x80000006`) chunk | malformed | `skip_qemu_img`: qemu behaviour is build-dependent (decodes on static 6.0.0 and host 10.0.11; EIO elsewhere) — instar issues a typed UDBZ refusal |
+| dmg-codec-lzfse | One lzfse (ULFO, `0x80000007`) chunk | malformed | No qemu build in the matrix ships lzfse (dropped at open, EIO on read); instar issues a typed ULFO refusal |
+| dmg-codec-adc | One ADC (UDCO, `0x80000004`) chunk | malformed | qemu enum-names ADC but never implements it (dropped, EIO); instar issues a typed UDCO refusal |
+| dmg-overcap-chunk | One qemu-legal zlib chunk, `sector_count` 8192 (4 MiB uncompressed) — under qemu's 131072-sector cap but over instar's 4096-sector (2 MiB) staging cap | malformed (capacity-divergence fixture) | qemu CONVERTS it fine on every version (md5 `dd8d16c0...`); instar refuses typed |
+| dmg-empty-table | Valid koly + well-formed XML plist whose single `<data>` block decodes to a mish with a corrupted magic, so qemu parses ZERO chunks | malformed | The true qemu zero-chunk-table NULL-deref: `info` succeeds (rc 0), but convert/read SIGSEGVs (rc 139) on every qemu build tested; instar refuses cleanly at init. Shipped upstream-report reproducer |
 
 #### LUKS Images (9)
 
@@ -683,6 +696,58 @@ qcow2-luks).
     QCOW1 as `"qcow2"` (magic-only) with the correct virtual size and
     no dedicated inspector; recorded as a divergence.
 
+21. **DMG Input Support** - Convert, compare, dd, and bench support
+    DMG (Apple UDIF) as read-only input, via a new `src/crates/dmg/`
+    crate wired into the qcow2 crate's chain reader
+    (PLAN-format-coverage phase 5). The reader parses the koly
+    trailer (reusing the phase-1 shared trailer helpers), then the
+    chunk table from EITHER the XML-plist path (a byte-for-byte port
+    of glib's lenient string-scanning base64 decoder — invalid
+    characters are skipped, never erroring) OR the old resource-fork
+    path, and finally the mish/BLKX chunk entries into a sorted,
+    verified lookup table. Codec scope is zero/raw/ignore/zlib
+    (zlib-WRAPPED inflate — unlike QCOW1's raw-deflate); ADC, bzip2,
+    lzfse, zstd, and any unknown chunk type get a typed refusal
+    naming the code, rather than qemu's drop-then-EIO shape. The
+    koly `SectorCount` always wins for virtual size, even when it
+    exceeds mish coverage.
+    **The read-error model inverts every prior phase's posture**: a
+    sector covered by no chunk (a gap, a dropped/refused chunk, or
+    the koly-vs-mish tail), a truncated raw span, or truncated
+    compressed data is a read ERROR, matching qemu exactly — never
+    zero-fill. Overlapping chunks are not an error (binary search
+    deterministically picks one, matching qemu).
+    A universal qemu crash was found and NOT mirrored: any DMG whose
+    chunk table parses to zero entries (bad mish magic, broken
+    base64, or no `<data>` blocks) SIGSEGVs every qemu-img version
+    tested (6.0.0 through host 10.0.11) on read, while `info` is
+    unaffected — instar refuses the empty table cleanly at reader
+    init instead (shipped reproducer `dmg-empty-table`; a candidate
+    upstream report, recorded as master-plan future work).
+    instar enforces its own bounded-memory caps — distinct from
+    qemu's own, larger, legal range — on the staged plist/rsrc
+    region (1 MiB), the chunk table (32768 chunks), and per-chunk
+    staging (4096 sectors / 2 MiB): a qemu-legal chunk beyond these
+    caps gets a typed refusal, a documented capacity divergence
+    pinned by `dmg-overcap-chunk` (qemu converts it; instar refuses).
+    Detection remains the phase-1 content-based koly-trailer scan,
+    strictly stronger than qemu-img's `.dmg`-extension-only probe —
+    an extensionless valid DMG converts as its raw container bytes
+    under qemu but as the real decoded disk under instar, a pinned
+    divergence. DMG is supported at ANY backing-chain position,
+    proven by a `qcow2 -F dmg` overlay-over-DMG chain converging
+    byte-for-byte with qemu. `check` still refuses DMG (exit 63) but
+    — because check never runs the koly probe — names the format
+    "raw", not "dmg", unlike every other refused format in this
+    table. `map`, `measure`, and `resize` are unaffected by this
+    phase: they still pass DMG through as raw (the phase-1 divergence
+    recorded above), since their probe paths never see the trailer;
+    the master-plan future-work bullet stays open. The typed guest-
+    side refusal strings (e.g. "dmg: unsupported chunk codec …") are
+    debug output, not user-facing — the failure a caller actually
+    sees is the generic "convert operation failed" wrapper, matching
+    the VDI-precedent posture for adversarial pins.
+
 ### Detections to Add
 
 All oslo.utils formats are now detected. No remaining format detections needed.
@@ -732,6 +797,7 @@ cd tests && ../.venv/bin/stestr run test_oslo_crossval
 | Format | dmg-simple | dmg | raw | oslo has no DMG inspector; falls back to RawFileInspector |
 | Format | qcow1-data and other safe qcow1 fixtures | qcow | qcow2 | oslo has no qcow1 inspector; magic-only detection (`QFI\xfb`) routes qcow1 through the qcow2 inspector — virtual size agrees (the size u64 field sits at the same offset 24 in both formats) |
 | Vsize | qcow1-odd-size | 1048576 | 1048577 | oslo reads the header size u64 field verbatim; qemu/instar truncate down to `total_sectors*512` (see the QCOW1 Images fixture table) |
+| Format | dmg-mixed, dmg-multipart, dmg-rsrc-fork, dmg-gap | dmg | raw | Same rule as dmg-simple: oslo has no DMG inspector and falls back to RawFileInspector on all four new phase-5 safe fixtures (vsize also diverges the same way as dmg-simple's, per `KNOWN_VSIZE_DIVERGENCES` in `test_oslo_crossval.py` — recorded, not runtime-asserted, since the format divergence skips the vsize test first) |
 
 ### CI Integration
 
@@ -753,4 +819,4 @@ are surfaced as warnings rather than blocking PRs.
 
 ---
 
-*Document updated: 2026-07-18*
+*Document updated: 2026-07-19*

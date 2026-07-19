@@ -45,6 +45,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Format-coverage phase 5: DMG convert-from read path
+  (PLAN-format-coverage phase 5).** `instar convert`, `compare`,
+  `dd`, and `bench` now accept DMG (Apple UDIF) as input, via a new
+  `src/crates/dmg/` no_std parser crate wired into the qcow2 crate's
+  chain reader (`dmg-input` feature, enabled by convert/compare/
+  bench/rebase). The reader parses the koly trailer, then the chunk
+  table from either the XML-plist path (a byte-for-byte port of
+  glib's lenient, invalid-character-skipping base64 decoder) or the
+  old resource-fork path, into a sorted, verified mish/BLKX chunk
+  lookup. Codec scope is zero/raw/ignore/zlib (zlib-wrapped inflate,
+  unlike QCOW1's raw-deflate); ADC/bzip2/lzfse/zstd/unknown chunk
+  types get a typed init refusal naming the code, since qemu's own
+  codec support is compile-flag dependent across the version matrix
+  (bzip2 decodes only on static 6.0.0 and host 10.0.11; lzfse and
+  ADC decode nowhere) and no single build makes a valid parity
+  target. **DMG inverts every prior phase's error posture**: a gap
+  (an uncovered sector, a dropped/refused chunk, or the koly
+  `SectorCount`-vs-mish-coverage tail), a truncated raw span, or
+  truncated compressed data are all read ERRORS, matching qemu
+  exactly — never zero-fill, the opposite of VDI/Parallels/QCOW1's
+  zero-fill posture. **instar avoids a universal qemu crash**: any
+  DMG whose chunk table parses to zero entries (bad mish magic,
+  broken base64, or no `<data>` blocks) SIGSEGVs every tested
+  qemu-img version (static 6.0.0, static 10.2.0, host 10.0.11) on
+  read, while `info` is unaffected; instar refuses the empty table
+  cleanly at reader init instead, shipped as the `dmg-empty-table`
+  reproducer and recorded as a candidate upstream report — distinct
+  from `dmg-no-chunk-table`'s ordinary clean-EINVAL shape (no chunk
+  source at all). instar's own bounded-memory caps (1 MiB staged
+  plist/resource-fork region, 32768-entry chunk table, 4096-sector
+  per-chunk staging) are smaller than qemu's own legal range, a
+  documented capacity divergence pinned by `dmg-overcap-chunk` (a
+  qemu-legal 4 MiB chunk that qemu converts fine but instar refuses
+  typed). Detection stays the phase-1 content-based koly-trailer
+  scan, strictly stronger than qemu-img's `.dmg`-extension-only
+  probe — now with a real behavioural consequence: an extensionless
+  DMG converts as its raw container bytes under qemu but as the real
+  decoded disk under instar, pinned as a deliberate divergence. DMG
+  is supported at any backing-chain position, proven by a `qcow2 -F
+  dmg` overlay-over-DMG chain converging byte-for-byte with qemu.
+  `check` still refuses DMG (exit 63) but names the format "raw",
+  not "dmg", since check's dispatch never runs the koly probe — a
+  genuine rc parity with qemu-img's own dmg-check refusal, wording
+  aside. `map`, `measure`, and `resize` are unaffected by this phase
+  and keep their phase-1 raw pass-through (master-plan future work).
+  Sixteen fixtures total (five safe including the phase-1
+  `dmg-simple`: `dmg-mixed`, `dmg-multipart`, `dmg-rsrc-fork`, and
+  the error-parity `dmg-gap`; eleven malformed/refused, extending the
+  four phase-1 trailer fixtures with seven new reader-refusal
+  fixtures for over-cap sizes, each unsupported codec, the capacity
+  divergence, and the empty-table crash reproducer), cross-version
+  qemu-img baselines where parity exists, oslo cross-validation,
+  coverage-guided fuzzing of the table/chunk parsers
+  (`fuzz_dmg_table`, `fuzz_dmg_chunk`), and `dmg` added to the
+  differential fuzzer's format pool via a deterministic mini-builder
+  (qemu-img cannot create DMGs) with `op_map`/`op_measure` gated to
+  reflect the retained raw-pass-through divergence. See
+  [docs/format-coverage.md](docs/format-coverage.md) and
+  [docs/quirks.md](docs/quirks.md) for the full divergence records.
+
 - **Format-coverage phase 4: QCOW1 convert-from read path
   (PLAN-format-coverage phase 4).** `instar convert`, `compare`,
   `dd`, and `bench` now accept QCOW1 ("qcow", qemu's original
