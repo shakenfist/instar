@@ -4004,6 +4004,159 @@ new region. Binary size grew by roughly +9.5 KB per DMG-enabled
 guest operation (convert now sits at roughly 41% of the 768 KB
 per-operation cap, per `make check-binary-sizes`).
 
+## Format-coverage phase 6: QED read-refusal as policy
+
+Phase 6 of `PLAN-format-coverage.md` resolved the master plan's Open
+question 1 — does QED get a read path, like VDI/Parallels/QCOW1/DMG in
+phases 2-5, or a principled, documented, fully-tested refusal? — by
+choosing refusal as deliberate policy, not a read path. Step 6a added
+QED-named refusal pins for every op that lacked one (check, map,
+measure, bench, resize, rebase, commit, amend, snapshot, bitmap;
+convert/compare/dd/oslo were already pinned) and reconciled a stale,
+unconsumed testdata baseline set; step 6b is this documentation
+record. Commits: `3fd48e6` (pins, instar), `cecb16565a` (baseline
+retirement, instar-testdata main). See
+[docs/plans/PLAN-format-coverage-phase-06-qed.md](plans/PLAN-format-coverage-phase-06-qed.md)
+for the full decision record and findings.
+
+### QED Read-Refusal Is Deliberate Policy, Not a Parity Gap
+
+**Classification: Safe Quirk** (a recorded scope decision, not a
+defect)
+
+#### Observed Behavior
+
+Every prior format-coverage phase (2-5) graduated a detect-only format
+to a full read path. QED does not get one. `instar info` reads QED
+correctly (byte-parity with qemu-img, human and JSON); every other
+subcommand refuses it cleanly with a typed message and no file
+modification, verified by byte-hash after every mutating op. The
+per-op audit behind this decision (recorded in the phase-6 plan's
+Situation section) found **zero dangerous cases**: no raw
+pass-through, no crash, no silent-wrong output for any of the fifteen
+subcommands.
+
+#### Why This Matters
+
+Three grounded facts justify refusal over a read path:
+
+1. **Nil demand.** QED was a short-lived qcow2 alternative that never
+   saw wide deployment; no user demand for reading QED archives has
+   surfaced during five phases of format work.
+2. **oslo.utils bans QED outright.** `format_inspector.detect_file_format`
+   returns a real `QEDInspector`, whose safety check then raises
+   `SafetyCheckFailed: ... banned` ("This file format is not
+   allowed") — a stronger ecosystem statement than the DMG/VDI/
+   Parallels/QCOW1 case, where oslo merely *lacks* an inspector and
+   instar deliberately reads what oslo cannot. For QED, oslo has an
+   inspector and refuses by policy; instar's refusal aligns with that
+   stance rather than filling a gap oslo doesn't have.
+3. **The refusal is already complete and safe.** The audit's
+   zero-dangerous-cases result means finishing the job costs only
+   test pins and documentation, not new parser code.
+
+**Revisit criteria**, recorded so the decision is cheap to reverse: a
+real user request to read QED input, or QED images surfacing in a
+workload instar serves. The phase-6 plan preserves a path-(b) sketch
+(a qcow1-class reader — 68-byte LE header, two-level L1/L2 tables, no
+compression/encryption) as the starting point if that day comes.
+
+#### instar Behavior
+
+**Always**: `info` supports QED; every other subcommand refuses it.
+The per-op refusal/divergence table:
+
+| Op | qemu-img on QED | instar on QED | Notes |
+|----|------------------|----------------|-------|
+| info | Supported (rc 0) | Supported (rc 0), byte-parity | Only fully-supported op |
+| convert | Supported (rc 0) | Refused (issue-#444 chain gate) | "input format 'qed' is detected but not supported for reading (detection and info only)"; mid-chain backing position also refused |
+| compare | Supported (rc 0) | Refused (chain gate) | Same message shape as convert |
+| dd | Supported (rc 0) | Refused (chain gate) | Same message shape as convert |
+| bench | Supported (rc 0) | Refused (chain gate) | Same underlying gate as convert, but with no `"bench:"` message prefix — a deviation from the other three ops, and empty stdout |
+| check | Supported (rc 0) | Refused, exit 63 | "This image format (qed) does not support checks" — check's own probe DOES see QED's offset-0 magic, so (unlike DMG) it names the real format |
+| map | Supported (rc 0) | Refused, exit 1 | "source format unrecognised" |
+| measure | Supported (rc 0) | Refused, exit 1 | "source image is unsupported format" |
+| resize | Supported (rc 0) | Refused | "format Qed is not supported for in-place resize" — divergence, qemu's QED driver resizes fine |
+| rebase | Supported (rc 0) | Refused | "format 'Qed' does not support rebase (qcow2 and vmdk only)" — divergence, qemu rebases QED overlays fine |
+| commit | Supported (rc 0) | Refused | "format 'qed' does not support commit (qcow2 and vmdk only)" — divergence, qemu commits QED overlays fine |
+| amend | Refused (rc 1) | Refused | qemu: "Format driver 'qed' does not support option amendment"; instar: "only qcow2 images can be amended" — not a divergence |
+| snapshot | Refused (rc 1) | Refused | qemu: "Operation not supported"; instar: "snapshot: source is not qcow2" — not a divergence |
+| bitmap | Refused (rc 1) | Refused | qemu: "Operation not supported" (no persistent-bitmap store); instar: "not a qcow2 image" — not a divergence |
+
+The convert/compare/dd/bench/check/map/measure/resize/rebase/commit
+rows are genuine divergences — qemu-img performs these successfully on
+QED (all rc 0, empirically verified against qemu-img 10.0.11), instar
+refuses by policy, in the same recorded-divergence class as the
+map/measure scope refusals phases 2-5 chose for VDI/Parallels/QCOW1/
+DMG. Only the amend/snapshot/bitmap rows are **not** divergences:
+qemu-img itself refuses those on QED (no amend driver, no internal
+snapshots, no persistent-bitmap store), so there instar's refusal
+matches qemu's own posture.
+
+### Cosmetic Refusal Inconsistencies, Pinned As-Is
+
+**Classification: Safe Quirk**
+
+#### Observed Behavior
+
+Two wording/exit-code inconsistencies exist across the QED refusal
+surface, both pre-existing and orthogonal to this phase's scope:
+
+- `resize` and `rebase` render the Rust `Debug` spelling `"Qed"`
+  (capital Q) in their refusal messages, while `commit`, `check`, and
+  the chain-gate messages use lowercase `"qed"`.
+- `check` exits 63 ("This image format (qed) does not support
+  checks"), matching qemu-img's own check-refusal exit code for
+  unsupported formats; every other QED refusal in the table above
+  exits 1.
+
+#### Why This Matters
+
+Normalising these would touch shared refusal-message code paths used
+by every other format's equivalent refusals, for a purely cosmetic,
+zero-user-value gain — explicitly out of scope for phase 6 (see the
+phase plan's "Out of scope" section).
+
+#### instar Behavior
+
+**Unchanged, pinned as-is with comments** in the step-6a test suites:
+`resize`/`rebase`'s `"Qed"` spelling and `check`'s 63-vs-1 exit code
+are asserted verbatim, not normalised.
+
+### The qemu-Deprecation Claim Was Wrong — Corrected
+
+**Classification: closes a stale documentation claim** (not a code
+behaviour change)
+
+#### Observed Behavior
+
+Earlier drafts of `docs/plans/PLAN-format-coverage.md` (and other
+repository docs) described QED as "(deprecated)" in qemu-img. Phase 6's
+empirical research found this to be **false**: QED has no entry in any
+`deprecated.rst`/`removed-features.rst`, no runtime warning on any op
+or qemu version, and `qemu-img create -f qed` still succeeds on
+10.2.0. qemu-img reads, writes, checks, maps, measures, and benches
+QED normally on every version in the matrix (all rc 0, convert md5
+version-stable).
+
+#### Why This Matters
+
+The refusal decision is instar's own scope choice (nil demand +
+alignment with oslo.utils' explicit ban), not a response to qemu
+sunsetting the format. Documenting QED as "deprecated" would have
+implied a removal timeline that does not exist and misattributed the
+rationale for instar's refusal.
+
+#### instar Behavior
+
+**Documentation only**: the master plan's Open question 1 carries a
+dated RESOLVED addendum correcting the framing (the original question
+text itself is left as historical record); other repository docs that
+called QED "(deprecated)" without qualification have been corrected
+by this phase to state plainly that qemu does not deprecate it. QED
+detection and refusal behaviour is unchanged by this correction — it
+is a documentation-accuracy fix, not a functional one.
+
 ## Future Additions
 
 Additional quirks will be documented here as they are discovered during

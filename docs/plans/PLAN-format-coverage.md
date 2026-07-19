@@ -180,7 +180,12 @@ tracked manner:
    still works on 10.2.0) — the refusal is instar's own
    scope choice, aligned with oslo.utils' explicit ban and
    nil demand, with recorded revisit criteria and a
-   path-(b) sketch preserved in the phase plan.
+   path-(b) sketch preserved in the phase plan. **Phase 6
+   executed this decision on 2026-07-20**: QED-named refusal
+   pins now cover every subcommand that previously lacked
+   one, and a stale, unconsumed testdata baseline set was
+   retired (commits `3fd48e6` in instar, `cecb16565a` in
+   instar-testdata).
 2. **DMG detection is trailer-based.** DMG has no magic at
    offset 0 — the UDIF "koly" signature lives in the last
    512 bytes of the file. `detect_format_from_header()`
@@ -239,7 +244,7 @@ is the tracking source of truth.
 | 3. Parallels convert-from (v2 read path, new `src/crates/parallels/`) | [PLAN-format-coverage-phase-03-parallels-read.md](PLAN-format-coverage-phase-03-parallels-read.md) | Complete (commits 3f43472..f2bacf4 + docs commit) |
 | 4. QCOW1 convert-from (read path, new `src/crates/qcow1/`; fixes the misdetection-as-qcow2 defect) | [PLAN-format-coverage-phase-04-qcow1-read.md](PLAN-format-coverage-phase-04-qcow1-read.md) | Complete (commits 23b240f..efdc42e + docs commit) |
 | 5. DMG convert-from (BLKX chunk table + zlib chunks, new `src/crates/dmg/`; EIO-parity error semantics, typed codec/capacity refusals) | [PLAN-format-coverage-phase-05-dmg-read.md](PLAN-format-coverage-phase-05-dmg-read.md) | Complete (commits 71a20d9..9d8111c + docs commit) |
-| 6. QED decision: refusal as policy (Open question 1 RESOLVED; per-op pins + testdata reconciliation + decision record) | [PLAN-format-coverage-phase-06-qed.md](PLAN-format-coverage-phase-06-qed.md) | Planned (2026-07-19) |
+| 6. QED decision: refusal as policy (Open question 1 RESOLVED; per-op pins + testdata reconciliation + decision record) | [PLAN-format-coverage-phase-06-qed.md](PLAN-format-coverage-phase-06-qed.md) | Complete (2026-07-20; commits 3fd48e6 instar, cecb16565a testdata) |
 | 7. Docs: qemu-img-parity axis in format-coverage.md, README/ARCHITECTURE/CHANGELOG updates | PLAN-format-coverage-phase-07-docs.md | Not written |
 
 Sequencing rationale: phase 1 is cheap, self-contained, and
@@ -461,7 +466,12 @@ because the following statements will be true:
   `qemu-img convert` output.
 * Bochs, cloop, vvfat (and QED, per the phase-6 decision)
   produce clean, tested, documented refusals rather than
-  misdetection as raw.
+  misdetection as raw. **Satisfied for QED by phase 6**
+  (2026-07-20, commits `3fd48e6` instar / `cecb16565a`
+  testdata): every subcommand lacking a QED-named refusal
+  pin now has one, and the decision record lives in
+  `docs/quirks.md` and
+  [PLAN-format-coverage-phase-06-qed.md](PLAN-format-coverage-phase-06-qed.md).
 * New format parsing lives in shared crates under
   `src/crates/`, `no_std`-compatible for guest use, with
   coverage-guided fuzz targets.
@@ -481,6 +491,14 @@ We should list obvious extensions, known issues, unrelated bugs
 we encountered, and anything else we should one day do but have
 chosen to defer to here so that we don't forget them.
 
+* QED read support (phase 6's path-(b) sketch: a qcow1-class
+  reader — 68-byte LE header, two-level L1/L2 cluster-offset
+  tables, no compression/encryption, in-header backing name).
+  Deliberately deferred, not abandoned — the phase-6 decision
+  is refusal as policy, revisit only on a real user request to
+  read QED input or QED images surfacing in a served workload
+  (see `docs/plans/PLAN-format-coverage-phase-06-qed.md`'s
+  Decision section for the full revisit criteria and sketch).
 * DMG bzip2 (UDBZ), lzfse (ULFO), and ADC chunk codec decode
   support (deferred from phase 5 per Open question 3; instar
   issues typed refusals naming the code instead, and qemu's

@@ -64,7 +64,7 @@ chain config.
 | 6 | `Vhdx` | VHDX |
 | 7 | `Qcow1` | QCOW version 1 |
 | 8 | `Vdi` | VDI (VirtualBox) |
-| 9 | `Qed` | QED (deprecated) |
+| 9 | `Qed` | QED (read-refused by policy, not because qemu deprecates it — see `docs/quirks.md` "Format-coverage phase 6") |
 | 10 | `Iso` | ISO 9660 |
 | 11 | `Luks` | LUKS encrypted container |
 

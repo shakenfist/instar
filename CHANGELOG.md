@@ -45,6 +45,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Format-coverage phase 6: QED read-refusal recorded as policy
+  (PLAN-format-coverage phase 6).** Resolves the master plan's Open
+  question 1: QED stays a read-refused format, by deliberate
+  decision rather than a parity gap. `instar info` already reads QED
+  correctly (byte-parity with qemu-img); every other subcommand now
+  carries a QED-named refusal pin — check (exit 63, naming the real
+  format "qed" since check's own probe sees QED's offset-0 magic,
+  unlike DMG), map, measure, bench (via the issue-#444 chain gate,
+  with no `"bench:"` message prefix — a deviation from convert/
+  compare/dd), resize, rebase, commit, amend, snapshot, and bitmap
+  (convert/compare/dd and the oslo divergence were already pinned).
+  The decision rests on nil real-world demand for reading QED plus
+  oslo.utils' own explicit ban (a real `QEDInspector` that raises
+  `SafetyCheckFailed: ... banned`) — a stronger ecosystem signal than
+  the "oslo simply lacks an inspector" case that justified reading
+  DMG/VDI/Parallels/QCOW1. This phase also **corrects a stale
+  documentation claim**: QED is not formally deprecated by qemu (no
+  `deprecated.rst` entry, no runtime warning, `qemu-img create -f
+  qed` still works on 10.2.0) — qemu-img reads/writes/checks/maps/
+  measures/benches QED normally; the refusal is instar's own scope
+  choice. Two cosmetic wording inconsistencies are pinned as-is
+  rather than normalised (the `"Qed"` Debug-spelling in resize/
+  rebase; check's exit 63 vs. every other refusal's exit 1). The
+  `qed-simple` baselines in instar-testdata were reconciled: the
+  check/compare trees (permanently unconsumable under this policy)
+  were retired and the generator's check/compare/measure/map
+  whitelists lost `qed`, while the qemu-img-{human,json} trees were
+  kept since they back `info`'s baseline coverage and are the raw
+  source of truth profiles regenerate from. Revisit criteria (a real user
+  request to read QED, or QED images surfacing in a served workload)
+  and a qcow1-class reader sketch are recorded for a future phase if
+  the decision is ever reversed. See
+  [docs/format-coverage.md](docs/format-coverage.md) and
+  [docs/quirks.md](docs/quirks.md) for the full decision record.
+
 - **Format-coverage phase 5: DMG convert-from read path
   (PLAN-format-coverage phase 5).** `instar convert`, `compare`,
   `dd`, and `bench` now accept DMG (Apple UDIF) as input, via a new

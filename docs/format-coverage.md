@@ -291,7 +291,7 @@ full reference.
 
 | Format | Check | oslo.utils | instar |
 |--------|-------|------------|-------|
-| QED | Banned entirely | Rejects | Detects format |
+| QED | Banned entirely | Rejects | Detects format; `info` reads correctly (byte-parity with qemu-img) but every other op is **refused by policy (phase 6)**, not just detected — a deliberate decision, not a parity gap: qemu-img converts/checks/maps/measures/benches/resizes/rebases/commits QED normally (all rc 0) but instar refuses all of those; only amend/snapshot/bitmap match qemu's own refusals. See [quirks.md](quirks.md#format-coverage-phase-6-qed-read-refusal-as-policy) |
 | LUKS | Version check (only v1) | Rejects v2+ | Detects format, version, cipher, hash, UUID, payload offset, key slots, inner format (with passphrase); convert decrypts v1/v2 containers |
 | VDI | None | Pass-through | Detects format, UUID; convert/compare/dd read via a full reader — header validated against qemu's 12 open-time rules, block-map entries bounds-checked, past-EOF block reads zero-filled (`check` still refuses, exit 63) |
 | Parallels | None | Pass-through | Detects format, magic, version; convert/compare/dd/bench read via a full reader — open validated per qemu's RO rules, BAT decoded per-magic (sector-valued v1, cluster-valued v2/ext), past-EOF and out-of-BAT reads zero-filled, `ext_off != 0` refused (`check` still refuses, exit 63) |
@@ -386,7 +386,7 @@ full reference.
 
 | Image ID | Description | Safety | Key Features |
 |----------|-------------|--------|--------------|
-| qed-simple | QED format image | safe | Deprecated format test |
+| qed-simple | QED format image | safe | `info` byte-parity with qemu-img; every other op refused by policy (phase 6) — not because qemu deprecates QED (it doesn't) |
 
 #### QCOW1 Images (12)
 
@@ -748,6 +748,46 @@ qcow2-luks).
     sees is the generic "convert operation failed" wrapper, matching
     the VDI-precedent posture for adversarial pins.
 
+22. **QED Read-Refusal as Policy** - Phase 6 resolved the master
+    plan's Open question 1 (read support vs. refusal for QED) by
+    choosing refusal as deliberate policy rather than a sixth read
+    path (PLAN-format-coverage phase 6). A per-op audit found zero
+    dangerous cases: `info` already reads QED correctly (byte-parity
+    with qemu-img), and every other subcommand refuses cleanly with a
+    typed message and no file modification. QED-named refusal pins
+    now cover every op that previously lacked one — check (exit 63,
+    "This image format (qed) does not support checks" — check's own
+    probe sees QED's offset-0 magic, so unlike DMG it names the real
+    format), map, measure, bench (refused via the issue-#444 chain
+    gate, with no `"bench:"` message prefix, a deviation from
+    convert/compare/dd), resize, rebase, commit, amend, snapshot, and
+    bitmap. Two cosmetic inconsistencies are pinned as-is rather than
+    normalised: `resize`/`rebase` render the Debug spelling `"Qed"`
+    where other refusals say `"qed"`, and `check` exits 63 while every
+    other refusal exits 1. The decision rests on nil real-world demand
+    plus oslo.utils' own explicit ban (`SafetyCheckFailed: ... banned`
+    from a real `QEDInspector`) — a stronger ecosystem statement than
+    the "oslo simply has no inspector" case that justified reading
+    VDI/Parallels/QCOW1/DMG. This phase also **corrected a stale
+    documentation claim**: QED is NOT formally deprecated by qemu (no
+    `deprecated.rst` entry, no runtime warning, `qemu-img create -f
+    qed` still works on 10.2.0) — qemu-img reads, writes, checks,
+    maps, measures, and benches QED normally on every version tested.
+    The refusal is instar's own scope choice, not a response to qemu
+    sunsetting the format. The `qed-simple` baselines in
+    instar-testdata (predating its `skip_qemu_img: true` manifest
+    flag) were reconciled: the check/compare baseline trees
+    (permanently unconsumable under this policy) were retired and the
+    generator's check/compare/measure/map whitelists lost `qed`, while
+    the qemu-img-{human,json} trees were kept — they back `info`'s 14
+    active `test_info_safe` scenarios and are the raw source of truth
+    profiles regenerate from.
+    Revisit criteria are recorded in the phase plan: a real user
+    request to read QED, or QED images surfacing in a served workload.
+    See [docs/quirks.md](quirks.md#format-coverage-phase-6-qed-read-refusal-as-policy)
+    for the full per-op divergence table and cosmetic-inconsistency
+    record.
+
 ### Detections to Add
 
 All oslo.utils formats are now detected. No remaining format detections needed.
@@ -819,4 +859,4 @@ are surfaced as warnings rather than blocking PRs.
 
 ---
 
-*Document updated: 2026-07-19*
+*Document updated: 2026-07-20*
