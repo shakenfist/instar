@@ -50,6 +50,34 @@ const _: () = assert!(
     "Scratch memory too small for L1/L2 caches + staging buffer"
 );
 
+// Per-device DMG chunk-table scratch, placed as a DEDICATED region above
+// the staging buffer (compare has ample headroom, so unlike convert it
+// does not reuse the staging buffer for the DMG init transient). compare
+// reads TWO independent chains, each possibly a standalone DMG, so it
+// reserves DMG_SLOTS = 2 contiguous slots. The region is
+// (DMG_SLOTS-1)*DMG_TABLE_REGION + DMG_REQUIRED_SCRATCH bytes: N table
+// slots laid DMG_TABLE_REGION apart, plus the last slot's 2 MiB transient
+// tail. init_chain_states runs the two inits sequentially, so slot 1's
+// table safely reuses slot 0's finished transient.
+const DMG_SLOTS: usize = 2;
+const DMG_SCRATCH_LEN: usize =
+    (DMG_SLOTS - 1) * qcow2::DMG_TABLE_REGION + qcow2::DMG_REQUIRED_SCRATCH;
+// Worst-case fit: 16 device caches + staging + the DMG region.
+const _: () = assert!(
+    DYNAMIC_BUFS_START
+        + MAX_CHAIN_DEVICES * 2 * MAX_SECTOR_SIZE
+        + MAX_CLUSTER_SIZE
+        + DMG_SCRATCH_LEN
+        <= ALLOC_HEAP_BASE,
+    "Scratch memory too small for L1/L2 caches + staging + DMG tables"
+);
+
+/// Base of the DMG chunk-table scratch: after the per-device caches and
+/// the staging buffer.
+fn dmg_scratch_base(total_devices: usize) -> usize {
+    DYNAMIC_BUFS_START + total_devices * 2 * MAX_SECTOR_SIZE + MAX_CLUSTER_SIZE
+}
+
 /// Describes the format and key parameters for one image (top of its chain).
 struct DeviceInfo {
     virtual_size: u64,
@@ -187,6 +215,8 @@ pub unsafe extern "C" fn _start() -> u64 {
         total_devices,
         sector_size,
         DYNAMIC_BUFS_START,
+        dmg_scratch_base(total_devices),
+        DMG_SCRATCH_LEN,
         &mut bytes_read,
     ) {
         (call_table.debug_print)(b"compare: failed to init chain states\n\0".as_ptr());

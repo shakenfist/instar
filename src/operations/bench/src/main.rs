@@ -127,6 +127,19 @@ const _: () = assert!(bench::BENCH_MAX_BUFSIZE == MAX_CLUSTER_SIZE as u64);
 /// First free byte above the dynamic per-device caches.
 const WRITE_SCRATCH_BASE: usize = DYNAMIC_START + 2 * MAX_SECTOR_SIZE * MAX_CHAIN_DEVICES;
 
+/// Base of the per-device DMG chunk-table scratch handed to
+/// `init_chain_states`. It ALIASES the qcow2 write scratch: a DMG source
+/// is read-only (the `-w` path is refused pre-bracket for DMG), so the
+/// write scratch is never live while a DMG chunk table exists. The DMG
+/// region (DMG_REQUIRED_SCRATCH ≈ 3.25 MiB) is a strict subset of the
+/// write scratch [WRITE_SCRATCH_BASE, WRITE_SCRATCH_END), so no new top-of-
+/// scratch budget is consumed. bench reads a single chain → one slot.
+const DMG_SCRATCH_BASE: usize = WRITE_SCRATCH_BASE;
+const _: () = assert!(
+    DMG_SCRATCH_BASE + qcow2::DMG_REQUIRED_SCRATCH <= ALLOC_HEAP_BASE,
+    "DMG chunk-table scratch overlaps the allocator heap"
+);
+
 /// Upper bound on staged refcount blocks. Setup-time growth
 /// (`qcow2_grow_refcounts`) preemptively provisions the whole schedule's
 /// worst-case coverage, so this cap — together with the byte limits
@@ -1384,6 +1397,14 @@ pub unsafe extern "C" fn _start() -> u64 {
         device_count,
         sector_size,
         DYNAMIC_START,
+        // The per-device DMG chunk-table scratch OVERLAYS the qcow2 write
+        // scratch region: a DMG source is always read-only (bench refuses
+        // `-w` on DMG at the pre-bracket format fork — Gate id 0, "format
+        // has no write support"), so the write scratch is never live while
+        // a DMG state exists. bench reads a single chain, so at most one
+        // DMG device / one slot. See DMG_SCRATCH_BASE below.
+        DMG_SCRATCH_BASE,
+        qcow2::DMG_REQUIRED_SCRATCH,
         &mut bytes_read,
     ) {
         return fail(

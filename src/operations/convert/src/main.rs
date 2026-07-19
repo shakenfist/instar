@@ -95,22 +95,46 @@ impl ScratchLayout {
         }
     }
 
-    /// Address of the decompression staging buffer, after per-device
-    /// L1/L2 caches in the dynamic region.
-    fn staging_buf_addr(&self, input_device_count: usize) -> usize {
+    /// Base of the per-device DMG chunk-table scratch, immediately after
+    /// the per-device L1/L2 caches. `init_chain_states` carves one
+    /// `DMG_REQUIRED_SCRATCH`-sized slot per DMG input device here; the
+    /// persistent chunk table occupies the first `DMG_TABLE_REGION` bytes
+    /// of the slot and the 2 MiB transient suffix REUSES the staging
+    /// buffer that follows (see `staging_buf_addr`) — the staging buffer
+    /// is unused during `init_chain_states`, so the overlap is safe.
+    /// convert reads a single input chain, so at most one DMG device.
+    fn dmg_scratch_base(&self, input_device_count: usize) -> usize {
         self.dynamic_start + input_device_count * 2 * MAX_SECTOR_SIZE
+    }
+
+    /// Address of the decompression staging buffer. Shifted up by
+    /// `DMG_TABLE_REGION` so the persistent DMG chunk table can live below
+    /// it (the table survives for the whole conversion; the staging buffer
+    /// is the DMG init's transient plist/decode area, reused after init).
+    fn staging_buf_addr(&self, input_device_count: usize) -> usize {
+        self.dmg_scratch_base(input_device_count) + qcow2::DMG_TABLE_REGION
     }
 }
 
 // Verify worst-case layout fits: 2MB output clusters + 16 input
-// devices + staging buffer.
+// devices + the persistent DMG chunk table + staging buffer.
+//
+// The DMG table (DMG_TABLE_REGION = 1.25 MiB) sits between the per-device
+// caches and the staging buffer. Its 2 MiB transient init suffix reuses
+// the staging buffer (unused during init_chain_states), so only the
+// 1.25 MiB table is a NET addition. Numbers (all hex, ALLOC_HEAP_BASE =
+// 0xF70000):
+//   0x300000 base + 0x210000 compressed + 0x400000 (2x2MiB bufs)
+//   + 0x200000 (16 dev caches) + 0x140000 (DMG table) + 0x200000 staging
+//   = 0xE50000 <= 0xF70000 (1.125 MiB spare). For compressed QCOW2
+//   output the refcount array uses the remaining scratch above the L1
+//   table, so the DMG table shrinks that tail by 1.25 MiB.
 const _: () = assert!(
-    // BUF_COMPRESSED + BUF_MULTIPURPOSE(2MB) + BUF_DATA(2MB)
-    // + 16 device caches + staging buffer
     SCRATCH_MEM_BASE
         + COMPRESSED_BUF_SIZE
         + MAX_CLUSTER_SIZE * 2
         + MAX_CHAIN_DEVICES * 2 * MAX_SECTOR_SIZE
+        + qcow2::DMG_TABLE_REGION
         + MAX_CLUSTER_SIZE
         <= ALLOC_HEAP_BASE,
     "Scratch memory too small for max layout"
@@ -280,6 +304,8 @@ pub unsafe extern "C" fn _start() -> u64 {
         input_device_count,
         sector_size,
         layout.dynamic_start,
+        layout.dmg_scratch_base(input_device_count),
+        qcow2::DMG_REQUIRED_SCRATCH,
         &mut bytes_read,
     ) {
         (call_table.debug_print)(b"convert: failed to init chain states\n\0".as_ptr());
@@ -998,6 +1024,11 @@ unsafe fn convert_luks_wrapped_qcow2(
         1,
         sector_size,
         layout.dynamic_start,
+        // The LUKS-wrapped inner is always forced to QCOW2 (device 0
+        // above), so no DMG state is ever initialised here; the region is
+        // still a valid one-device DMG slot for signature symmetry.
+        layout.dmg_scratch_base(1),
+        qcow2::DMG_REQUIRED_SCRATCH,
         bytes_read,
     ) {
         (call_table.debug_print)(b"convert: failed to init inner QCOW2 chain states\n\0".as_ptr());

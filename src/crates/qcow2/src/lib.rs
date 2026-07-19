@@ -38,6 +38,14 @@ use vhdx::{VhdxBlockLookup, VhdxState};
 #[cfg(feature = "vmdk-input")]
 use vmdk::{GrainLookup, VmdkState};
 
+// Re-export the DMG scratch-layout constants so the chain-discovery
+// consumers (convert / compare / bench / rebase) can reserve the
+// per-device DMG scratch in their own memory maps without depending on
+// the `dmg` crate directly. See `init_chain_states` for how the region is
+// carved.
+#[cfg(feature = "dmg-input")]
+pub use dmg::{DmgRefusal, DmgState, DMG_REQUIRED_SCRATCH, DMG_TABLE_REGION};
+
 // ============================================================================
 // QCOW2 Header Constants
 // ============================================================================
@@ -2839,7 +2847,8 @@ pub unsafe fn read_cluster_sectors(
     feature = "vhd-input",
     feature = "vdi-input",
     feature = "parallels-input",
-    feature = "qcow1-input"
+    feature = "qcow1-input",
+    feature = "dmg-input"
 ))]
 unsafe fn read_offset_sectors(
     call_table: &CallTable,
@@ -6717,6 +6726,10 @@ mod tests {
                 1,
                 512,
                 dynamic_bufs_start,
+                // No DMG device in this chain; the DMG scratch args are
+                // unused (0/0 is fine — the DMG arm is never reached).
+                0,
+                0,
                 &mut bytes_read,
             )
         };
@@ -6729,6 +6742,599 @@ mod tests {
             chain_states.qcow1_states[0].is_none(),
             "no state should be recorded for the refused encrypted device"
         );
+    }
+
+    // ========================================================================
+    // DMG chain-reader arm (read_chain_virtual_cluster ImageFormat::Dmg)
+    //
+    // Synthetic UDIF images ([data fork][xml plist w/ one mish][koly]) are
+    // served through a zero-padded mock device (a real virtio device
+    // rounds capacity up to a sector, reading zeros past the file tail).
+    // data_fork_offset / mish out_offset / data_offset are all 0, so a
+    // chunk's effective host offset equals its raw comp_offset.
+    // ========================================================================
+
+    #[cfg(feature = "dmg-input")]
+    const DMG_MOCK_LEN: usize = 4 * 1024 * 1024;
+    #[cfg(feature = "dmg-input")]
+    static DMG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    #[cfg(feature = "dmg-input")]
+    static mut DMG_IMAGE: [u8; DMG_MOCK_LEN] = [0u8; DMG_MOCK_LEN];
+    #[cfg(feature = "dmg-input")]
+    static mut DMG_CAP: u64 = 0;
+    #[cfg(feature = "dmg-input")]
+    static mut DMG_SSZ: usize = 512;
+    // Captured debug_print message (typed refusal string), null-stripped.
+    #[cfg(feature = "dmg-input")]
+    static mut DMG_DBG_BUF: [u8; 128] = [0u8; 128];
+    #[cfg(feature = "dmg-input")]
+    static mut DMG_DBG_LEN: usize = 0;
+
+    #[cfg(feature = "dmg-input")]
+    unsafe extern "C" fn dmg_read_sector(
+        _device_idx: u32,
+        sector: u64,
+        out_buf: *mut u8,
+        sector_size: usize,
+    ) -> bool {
+        if sector >= DMG_CAP {
+            return false;
+        }
+        let start = match (sector as usize).checked_mul(sector_size) {
+            Some(s) => s,
+            None => return false,
+        };
+        if start + sector_size > DMG_MOCK_LEN {
+            return false;
+        }
+        let src = core::ptr::addr_of!(DMG_IMAGE) as *const u8;
+        core::ptr::copy_nonoverlapping(src.add(start), out_buf, sector_size);
+        true
+    }
+
+    #[cfg(feature = "dmg-input")]
+    unsafe extern "C" fn dmg_capacity(_device_idx: u32) -> u64 {
+        DMG_CAP
+    }
+
+    #[cfg(feature = "dmg-input")]
+    unsafe extern "C" fn dmg_ssz(_device_idx: u32) -> usize {
+        DMG_SSZ
+    }
+
+    #[cfg(feature = "dmg-input")]
+    unsafe extern "C" fn dmg_dbg(msg: *const u8) {
+        let mut n = 0usize;
+        while n < 127 && *msg.add(n) != 0 {
+            n += 1;
+        }
+        let dst = core::ptr::addr_of_mut!(DMG_DBG_BUF) as *mut u8;
+        core::ptr::copy_nonoverlapping(msg, dst, n);
+        DMG_DBG_LEN = n;
+    }
+
+    #[cfg(feature = "dmg-input")]
+    fn dmg_call_table() -> shared::CallTable {
+        shared::CallTable {
+            read_input_sector: dmg_read_sector,
+            get_input_capacity: dmg_capacity,
+            get_input_sector_size: dmg_ssz,
+            debug_print: dmg_dbg,
+            ..stub_call_table()
+        }
+    }
+
+    /// Install an image into the zero-padded mock; return its capacity in
+    /// sectors. Caller holds DMG_LOCK.
+    #[cfg(feature = "dmg-input")]
+    fn install_dmg(image: &[u8], sector_size: usize) -> u64 {
+        assert!(image.len() <= DMG_MOCK_LEN, "image too big for mock");
+        unsafe {
+            let img = core::ptr::addr_of_mut!(DMG_IMAGE) as *mut u8;
+            core::ptr::write_bytes(img, 0, DMG_MOCK_LEN);
+            core::ptr::copy_nonoverlapping(image.as_ptr(), img, image.len());
+            DMG_CAP = image.len().div_ceil(sector_size) as u64;
+            DMG_SSZ = sector_size;
+            DMG_CAP
+        }
+    }
+
+    #[cfg(feature = "dmg-input")]
+    fn dmg_b64(data: &[u8]) -> std::string::String {
+        const A: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = std::string::String::new();
+        for c in data.chunks(3) {
+            let b0 = c[0] as u32;
+            let b1 = if c.len() > 1 { c[1] as u32 } else { 0 };
+            let b2 = if c.len() > 2 { c[2] as u32 } else { 0 };
+            let n = (b0 << 16) | (b1 << 8) | b2;
+            out.push(A[((n >> 18) & 63) as usize] as char);
+            out.push(A[((n >> 12) & 63) as usize] as char);
+            out.push(if c.len() > 1 {
+                A[((n >> 6) & 63) as usize] as char
+            } else {
+                '='
+            });
+            out.push(if c.len() > 2 {
+                A[(n & 63) as usize] as char
+            } else {
+                '='
+            });
+        }
+        out
+    }
+
+    /// One synthetic mish chunk entry.
+    #[cfg(feature = "dmg-input")]
+    #[derive(Clone, Copy)]
+    struct DChunk {
+        ctype: u32,
+        sector: u64,
+        sector_count: u64,
+        comp_offset: u64,
+        comp_len: u64,
+    }
+
+    #[cfg(feature = "dmg-input")]
+    fn build_mish(chunks: &[DChunk]) -> std::vec::Vec<u8> {
+        use shared::{write_be_u32, write_be_u64};
+        let mut b = std::vec![0u8; dmg::MISH_HEADER_LEN + chunks.len() * dmg::MISH_ENTRY_LEN];
+        write_be_u32(&mut b, 0, dmg::MISH_MAGIC);
+        // out_offset @8 and data_offset @0x18 both left 0.
+        let mut off = dmg::MISH_HEADER_LEN;
+        for c in chunks {
+            write_be_u32(&mut b, off, c.ctype);
+            write_be_u64(&mut b, off + 8, c.sector);
+            write_be_u64(&mut b, off + 0x10, c.sector_count);
+            write_be_u64(&mut b, off + 0x18, c.comp_offset);
+            write_be_u64(&mut b, off + 0x20, c.comp_len);
+            off += dmg::MISH_ENTRY_LEN;
+        }
+        b
+    }
+
+    #[cfg(feature = "dmg-input")]
+    fn build_koly(xml_offset: u64, xml_length: u64, sector_count: u64) -> [u8; 512] {
+        use shared::write_be_u64;
+        let mut b = [0u8; 512];
+        b[0..4].copy_from_slice(b"koly");
+        // data_fork_offset @0x18 = 0; rsrc @0x28/0x30 = 0.
+        write_be_u64(&mut b, 0xd8, xml_offset);
+        write_be_u64(&mut b, 0xe0, xml_length);
+        write_be_u64(&mut b, 0x1ec, sector_count);
+        b
+    }
+
+    /// Assemble `[data_fork][<data>base64(mish)</data> plist][koly]`.
+    #[cfg(feature = "dmg-input")]
+    fn assemble_dmg(data_fork: &[u8], mish: &[u8], koly_sector_count: u64) -> std::vec::Vec<u8> {
+        let mut xml = std::string::String::from("<plist><dict><key>blkx</key><array><data>");
+        xml.push_str(&dmg_b64(mish));
+        xml.push_str("</data></array></dict></plist>");
+        let xb = xml.as_bytes();
+        let xml_offset = data_fork.len();
+        let koly_offset = xml_offset + xb.len();
+        let total = koly_offset + 512;
+        let mut img = std::vec![0u8; total];
+        img[..data_fork.len()].copy_from_slice(data_fork);
+        img[xml_offset..xml_offset + xb.len()].copy_from_slice(xb);
+        let koly = build_koly(xml_offset as u64, xb.len() as u64, koly_sector_count);
+        img[koly_offset..koly_offset + 512].copy_from_slice(&koly);
+        img
+    }
+
+    /// Init a `DmgState` from `image`, wire a one-device chain, and read one
+    /// span through `read_chain_virtual_cluster`. Returns (ok, produced,
+    /// bytes_read). The output buffer is pre-poisoned with 0xAA so EIO-parity
+    /// tests can assert the arm did NOT zero-fill on failure.
+    #[cfg(feature = "dmg-input")]
+    fn run_dmg_read(
+        image: &[u8],
+        sector_size: usize,
+        voff: u64,
+        chunk: u64,
+    ) -> (bool, std::vec::Vec<u8>) {
+        let _g = DMG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cap = install_dmg(image, sector_size);
+        let ct = dmg_call_table();
+        let mut scratch = std::vec![0u8; dmg::DMG_REQUIRED_SCRATCH];
+        let mut br = 0u64;
+        let state = unsafe {
+            dmg::DmgState::init(
+                &ct,
+                0,
+                sector_size,
+                cap,
+                scratch.as_mut_ptr(),
+                scratch.len(),
+                &mut br,
+            )
+        }
+        .expect("DmgState::init should succeed for a valid image");
+        let mut cs = ChainStates::default();
+        cs.dmg_states[0] = Some(state);
+        let mut cc = ChainConfig::new();
+        cc.magic = ChainConfig::MAGIC;
+        cc.version = ChainConfig::VERSION;
+        cc.device_count = 1;
+        cc.devices[0].format = ImageFormat::Dmg as u32;
+        let mut comp = std::vec![0u8; COMPRESSED_BUF_SIZE];
+        let mut stg = std::vec![0u8; MAX_CLUSTER_SIZE];
+        let mut sco = u64::MAX;
+        let mut out = std::vec![0xAAu8; chunk as usize];
+        let ok = unsafe {
+            read_chain_virtual_cluster(
+                &ct,
+                0,
+                1,
+                voff,
+                out.as_mut_ptr(),
+                chunk,
+                sector_size,
+                &cc,
+                &mut cs,
+                comp.as_mut_ptr(),
+                stg.as_mut_ptr(),
+                &mut sco,
+                None,
+                None,
+                0,
+                &mut br,
+            )
+        };
+        // `scratch` must outlive the read (state.table_ptr borrows it).
+        let _ = &scratch;
+        (ok, out)
+    }
+
+    // (a) A single chunk-spanning read walks zero + raw + zlib chunks.
+    #[cfg(feature = "dmg-input")]
+    #[test]
+    fn dmg_arm_mixed_zero_raw_zlib_walk() {
+        // Data fork: raw bytes at 0x1000, a zlib blob at 0x2000.
+        let raw: std::vec::Vec<u8> = (0..512u32).map(|i| (i * 7 + 3) as u8).collect();
+        let plain: std::vec::Vec<u8> = (0..1024u32).map(|i| (i ^ 0x5a) as u8).collect();
+        let blob = miniz_oxide::deflate::compress_to_vec_zlib(&plain, 6);
+        let mut fork = std::vec![0u8; 0x4000];
+        fork[0x1000..0x1000 + raw.len()].copy_from_slice(&raw);
+        fork[0x2000..0x2000 + blob.len()].copy_from_slice(&blob);
+        // sector0: zero (1 sector); sector1: raw (1); sectors 2-3: zlib (2).
+        let mish = build_mish(&[
+            DChunk {
+                ctype: dmg::CHUNK_ZERO,
+                sector: 0,
+                sector_count: 1,
+                comp_offset: 0,
+                comp_len: 0,
+            },
+            DChunk {
+                ctype: dmg::CHUNK_RAW,
+                sector: 1,
+                sector_count: 1,
+                comp_offset: 0x1000,
+                comp_len: 512,
+            },
+            DChunk {
+                ctype: dmg::CHUNK_ZLIB,
+                sector: 2,
+                sector_count: 2,
+                comp_offset: 0x2000,
+                comp_len: blob.len() as u64,
+            },
+        ]);
+        let img = assemble_dmg(&fork, &mish, 4);
+        let (ok, out) = run_dmg_read(&img, 512, 0, 4 * 512);
+        assert!(ok, "mixed walk read must succeed");
+        assert!(out[..512].iter().all(|&b| b == 0), "sector 0 zero chunk");
+        assert_eq!(out[512..1024], raw[..], "sector 1 raw chunk");
+        assert_eq!(out[1024..2048], plain[..], "sectors 2-3 zlib chunk");
+    }
+
+    // (b) A large zlib chunk is inflated ONCE and cached across two reads.
+    #[cfg(feature = "dmg-input")]
+    #[test]
+    fn dmg_arm_zlib_chunk_cached_across_reads() {
+        let plain: std::vec::Vec<u8> = (0..4096u32).map(|i| ((i >> 1) ^ i) as u8).collect();
+        let blob = miniz_oxide::deflate::compress_to_vec_zlib(&plain, 6);
+        let mut fork = std::vec![0u8; 0x4000];
+        fork[0x1000..0x1000 + blob.len()].copy_from_slice(&blob);
+        // One 8-sector (4096-byte) zlib chunk.
+        let mish = build_mish(&[DChunk {
+            ctype: dmg::CHUNK_ZLIB,
+            sector: 0,
+            sector_count: 8,
+            comp_offset: 0x1000,
+            comp_len: blob.len() as u64,
+        }]);
+        let img = assemble_dmg(&fork, &mish, 8);
+
+        let _g = DMG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cap = install_dmg(&img, 512);
+        let ct = dmg_call_table();
+        let mut scratch = std::vec![0u8; dmg::DMG_REQUIRED_SCRATCH];
+        let mut br = 0u64;
+        let state = unsafe {
+            dmg::DmgState::init(
+                &ct,
+                0,
+                512,
+                cap,
+                scratch.as_mut_ptr(),
+                scratch.len(),
+                &mut br,
+            )
+        }
+        .expect("init");
+        let mut cs = ChainStates::default();
+        cs.dmg_states[0] = Some(state);
+        let mut cc = ChainConfig::new();
+        cc.magic = ChainConfig::MAGIC;
+        cc.version = ChainConfig::VERSION;
+        cc.device_count = 1;
+        cc.devices[0].format = ImageFormat::Dmg as u32;
+        let mut comp = std::vec![0u8; COMPRESSED_BUF_SIZE];
+        let mut stg = std::vec![0u8; MAX_CLUSTER_SIZE];
+        let mut sco = u64::MAX;
+
+        // First read: sectors 0-1 (bytes 0..1024). Inflates the chunk.
+        let mut o1 = std::vec![0u8; 1024];
+        let br_before_1 = br;
+        let ok1 = unsafe {
+            read_chain_virtual_cluster(
+                &ct,
+                0,
+                1,
+                0,
+                o1.as_mut_ptr(),
+                1024,
+                512,
+                &cc,
+                &mut cs,
+                comp.as_mut_ptr(),
+                stg.as_mut_ptr(),
+                &mut sco,
+                None,
+                None,
+                0,
+                &mut br,
+            )
+        };
+        let first_read_bytes = br - br_before_1;
+        // Second read: sectors 4-5 (bytes 2048..3072) of the SAME chunk. Cache
+        // hit => NO further device reads (no re-inflation).
+        let mut o2 = std::vec![0u8; 1024];
+        let br_before_2 = br;
+        let ok2 = unsafe {
+            read_chain_virtual_cluster(
+                &ct,
+                0,
+                1,
+                2048,
+                o2.as_mut_ptr(),
+                1024,
+                512,
+                &cc,
+                &mut cs,
+                comp.as_mut_ptr(),
+                stg.as_mut_ptr(),
+                &mut sco,
+                None,
+                None,
+                0,
+                &mut br,
+            )
+        };
+        let second_read_bytes = br - br_before_2;
+        let _ = &scratch;
+
+        assert!(ok1 && ok2, "both cached reads must succeed");
+        assert_eq!(o1[..], plain[0..1024], "first window");
+        assert_eq!(o2[..], plain[2048..3072], "second window");
+        assert!(
+            first_read_bytes > 0,
+            "first read must fetch the compressed bytes"
+        );
+        assert_eq!(
+            second_read_bytes, 0,
+            "second read within the cached chunk must NOT re-fetch/re-inflate"
+        );
+    }
+
+    // (c) A raw span whose bytes lie past capacity FAILS (EIO parity) — it
+    // must NOT zero-fill (the poisoned 0xAA buffer must survive).
+    #[cfg(feature = "dmg-input")]
+    #[test]
+    fn dmg_arm_raw_truncated_is_eio_not_zerofill() {
+        let fork = std::vec![0u8; 0x1000];
+        // Raw chunk whose comp_offset points far past the file/capacity.
+        let mish = build_mish(&[DChunk {
+            ctype: dmg::CHUNK_RAW,
+            sector: 0,
+            sector_count: 1,
+            comp_offset: 8 * 1024 * 1024, // well past cap
+            comp_len: 512,
+        }]);
+        let img = assemble_dmg(&fork, &mish, 1);
+        let (ok, out) = run_dmg_read(&img, 512, 0, 512);
+        assert!(!ok, "raw span past capacity must return false (EIO parity)");
+        assert!(
+            out.iter().all(|&b| b == 0xAA),
+            "EIO parity: buffer must NOT be zero-filled on a truncated raw read"
+        );
+    }
+
+    // (d) A gap between chunks FAILS (EIO parity), never zero-fills.
+    #[cfg(feature = "dmg-input")]
+    #[test]
+    fn dmg_arm_interior_gap_is_eio() {
+        let fork = std::vec![0u8; 0x2000];
+        // Chunks at sector 0 and sector 3 leave sectors 1-2 uncovered.
+        let mish = build_mish(&[
+            DChunk {
+                ctype: dmg::CHUNK_ZERO,
+                sector: 0,
+                sector_count: 1,
+                comp_offset: 0,
+                comp_len: 0,
+            },
+            DChunk {
+                ctype: dmg::CHUNK_ZERO,
+                sector: 3,
+                sector_count: 1,
+                comp_offset: 0,
+                comp_len: 0,
+            },
+        ]);
+        let img = assemble_dmg(&fork, &mish, 4);
+        let (ok, out) = run_dmg_read(&img, 512, 0, 4 * 512);
+        assert!(!ok, "a gap between chunks must return false (EIO parity)");
+        // The pre-gap sector 0 zero chunk may have been written; the gap
+        // sector triggers the failure. The key invariant is `ok == false`.
+        let _ = out;
+    }
+
+    // (e) The koly-SectorCount tail (virtual size > mish coverage) FAILS.
+    #[cfg(feature = "dmg-input")]
+    #[test]
+    fn dmg_arm_tail_gap_is_eio() {
+        let fork = std::vec![0u8; 0x2000];
+        // Coverage is sectors 0-1, but the koly claims 4 sectors.
+        let mish = build_mish(&[DChunk {
+            ctype: dmg::CHUNK_ZERO,
+            sector: 0,
+            sector_count: 2,
+            comp_offset: 0,
+            comp_len: 0,
+        }]);
+        let img = assemble_dmg(&fork, &mish, 4);
+        // Read sectors 2-3 (the koly-wins tail beyond coverage).
+        let (ok, _out) = run_dmg_read(&img, 512, 2 * 512, 2 * 512);
+        assert!(
+            !ok,
+            "the koly-SectorCount tail must return false (EIO parity)"
+        );
+    }
+
+    /// Run `init_chain_states` over `formats` and capture the last typed
+    /// refusal message. Returns (ok, captured_message).
+    #[cfg(feature = "dmg-input")]
+    fn run_dmg_init(
+        images: &[&[u8]],
+        formats: &[ImageFormat],
+        dmg_scratch_len: usize,
+    ) -> (bool, std::string::String) {
+        // For a single-image chain the mock serves device 0; multi-device
+        // init tests below reuse one image for every DMG slot.
+        let _g = DMG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cap = install_dmg(images[0], 512);
+        let ct = dmg_call_table();
+        unsafe { DMG_DBG_LEN = 0 };
+
+        let mut cs = ChainStates::default();
+        let mut cc = ChainConfig::new();
+        cc.magic = ChainConfig::MAGIC;
+        cc.version = ChainConfig::VERSION;
+        cc.device_count = formats.len() as u32;
+        for (i, f) in formats.iter().enumerate() {
+            cc.devices[i].format = *f as u32;
+        }
+        // Caches for any non-DMG device (unused by the DMG arm).
+        let mut caches = std::vec![0u8; 2 * MAX_SECTOR_SIZE * MAX_CHAIN_DEVICES];
+        // DMG scratch, sized by the caller to exercise the slot cap.
+        let mut dmg_scratch = std::vec![0u8; dmg_scratch_len.max(1)];
+        let _ = cap;
+        let mut br = 0u64;
+        let ok = unsafe {
+            init_chain_states(
+                &ct,
+                &cc,
+                &mut cs,
+                formats.len(),
+                512,
+                caches.as_mut_ptr() as usize,
+                dmg_scratch.as_mut_ptr() as usize,
+                dmg_scratch_len,
+                &mut br,
+            )
+        };
+        let msg = unsafe {
+            let n = DMG_DBG_LEN;
+            let src = core::ptr::addr_of!(DMG_DBG_BUF) as *const u8;
+            let slice = core::slice::from_raw_parts(src, n);
+            std::string::String::from_utf8_lossy(slice).into_owned()
+        };
+        let _ = (&caches, &dmg_scratch);
+        (ok, msg)
+    }
+
+    // (f) An empty parsed chunk table refuses at init with the typed message.
+    #[cfg(feature = "dmg-input")]
+    #[test]
+    fn dmg_arm_empty_table_refusal_propagates() {
+        // A well-formed <data> block whose mish magic is corrupt => zero
+        // parsed chunks => EmptyChunkTable (the qemu-segfault case).
+        let mut mish = build_mish(&[DChunk {
+            ctype: dmg::CHUNK_ZERO,
+            sector: 0,
+            sector_count: 1,
+            comp_offset: 0,
+            comp_len: 0,
+        }]);
+        mish[0] ^= 0xff; // break the mish magic
+        let img = assemble_dmg(&std::vec![0u8; 0x1000], &mish, 1);
+        let (ok, msg) = run_dmg_init(&[&img], &[ImageFormat::Dmg], dmg::DMG_REQUIRED_SCRATCH);
+        assert!(!ok, "empty chunk table must refuse at init");
+        assert_eq!(msg, "dmg: empty chunk table\n");
+    }
+
+    // (g) An unsupported codec refuses at init with the code-naming message.
+    #[cfg(feature = "dmg-input")]
+    #[test]
+    fn dmg_arm_codec_refusal_propagates() {
+        let mish = build_mish(&[DChunk {
+            ctype: dmg::CHUNK_BZIP2, // 0x80000006
+            sector: 0,
+            sector_count: 1,
+            comp_offset: 0x1000,
+            comp_len: 16,
+        }]);
+        let img = assemble_dmg(&std::vec![0u8; 0x2000], &mish, 1);
+        let (ok, msg) = run_dmg_init(&[&img], &[ImageFormat::Dmg], dmg::DMG_REQUIRED_SCRATCH);
+        assert!(!ok, "unsupported codec must refuse at init");
+        assert_eq!(msg, "dmg: unsupported chunk codec 0x80000006\n");
+    }
+
+    // (h) Two DMG devices both init when the reserved region holds two slots
+    // (the compare dmg-vs-dmg case); a single-slot region refuses the second
+    // with the typed over-cap message.
+    #[cfg(feature = "dmg-input")]
+    #[test]
+    fn dmg_arm_multi_device_slots_and_overcap() {
+        let mish = build_mish(&[DChunk {
+            ctype: dmg::CHUNK_ZERO,
+            sector: 0,
+            sector_count: 1,
+            comp_offset: 0,
+            comp_len: 0,
+        }]);
+        let img = assemble_dmg(&std::vec![0u8; 0x1000], &mish, 1);
+
+        // Two slots reserved => both DMG devices init successfully.
+        let two_slots = dmg::DMG_TABLE_REGION + dmg::DMG_REQUIRED_SCRATCH;
+        let (ok2, _m2) = run_dmg_init(&[&img], &[ImageFormat::Dmg, ImageFormat::Dmg], two_slots);
+        assert!(ok2, "two DMG devices must init with a two-slot region");
+
+        // One slot reserved => the second DMG device refuses, typed.
+        let (ok1, m1) = run_dmg_init(
+            &[&img],
+            &[ImageFormat::Dmg, ImageFormat::Dmg],
+            dmg::DMG_REQUIRED_SCRATCH,
+        );
+        assert!(
+            !ok1,
+            "a second DMG must refuse when only one slot is reserved"
+        );
+        assert_eq!(m1, "dmg: too many dmg devices for scratch\n");
     }
 }
 
@@ -8168,6 +8774,224 @@ pub unsafe fn read_chain_virtual_cluster(
                 }
                 return true;
             }
+            #[cfg(feature = "dmg-input")]
+            ImageFormat::Dmg => {
+                // ================= EIO PARITY (READ THIS) =================
+                // This arm INVERTS the phase 2-4 zero-fill posture. Unlike
+                // the VDI / Parallels / VHD / qcow1 arms, DMG reads ERROR
+                // where those formats zero-fill. qemu's block/dmg.c short-
+                // preads a truncated data fork and treats a gap (a sector
+                // covered by no chunk: a hole between chunks, a dropped
+                // unsupported-codec chunk, or the koly-SectorCount tail
+                // beyond mish coverage) as a hard I/O error — convert exits
+                // non-zero. We mirror that exactly: any span whose bytes
+                // the device cannot supply, and any Gap, returns `false`
+                // here — NEVER a zero-fill. Only genuine zero/ignore chunks
+                // write zeros. DMG has no backing file, so there is no
+                // chain descent from this arm.
+                let state = match &chain_states.dmg_states[dev_idx] {
+                    Some(s) => s,
+                    None => return false,
+                };
+                let cap_bytes = cap.saturating_mul(sector_size as u64);
+                let mut done = 0u64;
+                while done < chunk_size {
+                    let cur_virtual = virtual_offset + done;
+                    // DMG virtual sectors are always 512 bytes; the koly
+                    // SectorCount and every chunk boundary are in those
+                    // units. `intra` is a sub-512 remainder (virtually
+                    // always 0, since chunk reads are >= sector_size).
+                    let cur_sector = cur_virtual / dmg::SECTOR_BYTES;
+                    let intra = cur_virtual % dmg::SECTOR_BYTES;
+                    let dst = buf.add(done as usize);
+                    let remaining = chunk_size - done;
+
+                    match state.chunk_lookup(cur_sector) {
+                        dmg::DmgLookup::Zero { span_sectors } => {
+                            let span_bytes = span_sectors
+                                .saturating_mul(dmg::SECTOR_BYTES)
+                                .saturating_sub(intra);
+                            let span = if remaining < span_bytes {
+                                remaining
+                            } else {
+                                span_bytes
+                            };
+                            core::ptr::write_bytes(dst, 0, span as usize);
+                            done += span;
+                        }
+                        dmg::DmgLookup::Raw {
+                            host_offset,
+                            span_sectors,
+                        } => {
+                            let span_bytes = span_sectors
+                                .saturating_mul(dmg::SECTOR_BYTES)
+                                .saturating_sub(intra);
+                            let span = if remaining < span_bytes {
+                                remaining
+                            } else {
+                                span_bytes
+                            };
+                            // `host_offset` is already advanced to
+                            // cur_sector's start; add the sub-512 remainder
+                            // for a (rare) unaligned start.
+                            let read_at = host_offset.saturating_add(intra);
+                            // EIO PARITY: any needed byte at/past capacity
+                            // fails the read (qemu short-pread -> EIO). NOT
+                            // a zero-fill.
+                            let end = read_at.saturating_add(span);
+                            if read_at >= cap_bytes || end > cap_bytes {
+                                return false;
+                            }
+                            let intra_sector = (read_at % sector_size as u64) as usize;
+                            let ok = if intra_sector == 0 {
+                                read_cluster_sectors(
+                                    call_table,
+                                    dev_idx as u32,
+                                    read_at,
+                                    dst,
+                                    span,
+                                    sector_size,
+                                    bytes_read,
+                                )
+                            } else {
+                                read_offset_sectors(
+                                    call_table,
+                                    dev_idx as u32,
+                                    read_at,
+                                    dst,
+                                    span,
+                                    sector_size,
+                                    compressed_buf,
+                                    bytes_read,
+                                )
+                            };
+                            if !ok {
+                                return false;
+                            }
+                            done += span;
+                        }
+                        dmg::DmgLookup::Zlib {
+                            host_offset,
+                            comp_len,
+                            chunk_first_sector,
+                            chunk_sector_count,
+                        } => {
+                            // Staging cache key: the chunk's host comp
+                            // offset, TAGGED with bit 63. The qcow2/vmdk
+                            // arms key `staging_cluster_offset` by a
+                            // *virtual* cluster/grain base, which is always
+                            // < 2^63 (bit 63 clear); file offsets are also
+                            // < 2^63, so OR-ing bit 63 yields a key that can
+                            // never alias a qcow2/vmdk key. This makes a
+                            // DMG-backing-under-qcow2 chain share the one
+                            // staging buffer safely, and lets consecutive
+                            // read calls landing in the same (large) DMG
+                            // chunk skip re-inflation — qemu caches exactly
+                            // one decompressed chunk the same way.
+                            let cache_key = host_offset | (1u64 << 63);
+                            if *staging_cluster_offset != cache_key {
+                                let uncompressed = match chunk_sector_count
+                                    .checked_mul(dmg::SECTOR_BYTES)
+                                    .filter(|&n| n as usize <= MAX_CLUSTER_SIZE)
+                                {
+                                    Some(n) => n,
+                                    None => return false,
+                                };
+                                // EIO PARITY: the whole compressed chunk
+                                // must lie in-file. A truncated data fork
+                                // fails — we do NOT inflate from fabricated
+                                // zero bytes (the qcow1 arm's posture).
+                                let comp_end = host_offset.saturating_add(comp_len);
+                                if comp_len as usize > COMPRESSED_BUF_SIZE
+                                    || host_offset >= cap_bytes
+                                    || comp_end > cap_bytes
+                                {
+                                    return false;
+                                }
+                                // Byte-accurate read of comp_len bytes (the
+                                // comp offset may be unaligned) into
+                                // compressed_buf.
+                                if comp_len > 0
+                                    && !read_cluster_sectors(
+                                        call_table,
+                                        dev_idx as u32,
+                                        host_offset,
+                                        compressed_buf,
+                                        comp_len,
+                                        sector_size,
+                                        bytes_read,
+                                    )
+                                {
+                                    return false;
+                                }
+                                // Inflate ZLIB-WRAPPED: UDZO chunks carry
+                                // the 0x78 zlib header, so we use the
+                                // qcow2-style first-try flags
+                                // (TINFL_FLAG_PARSE_ZLIB_HEADER), NOT
+                                // qcow1's raw-DEFLATE-only call. Require
+                                // Done status AND an exactly-sized output.
+                                let comp_slice = core::slice::from_raw_parts(
+                                    compressed_buf as *const u8,
+                                    comp_len as usize,
+                                );
+                                let out_slice = core::slice::from_raw_parts_mut(
+                                    staging_buf,
+                                    uncompressed as usize,
+                                );
+                                use miniz_oxide::inflate::core::inflate_flags;
+                                use miniz_oxide::inflate::TINFLStatus;
+                                let mut decomp =
+                                    miniz_oxide::inflate::core::DecompressorOxide::new();
+                                let (status, _in_consumed, out_produced) =
+                                    miniz_oxide::inflate::core::decompress(
+                                        &mut decomp,
+                                        comp_slice,
+                                        out_slice,
+                                        0,
+                                        inflate_flags::TINFL_FLAG_PARSE_ZLIB_HEADER
+                                            | inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF,
+                                    );
+                                if status != TINFLStatus::Done
+                                    || out_produced != uncompressed as usize
+                                {
+                                    // staging_buf is now clobbered; drop the
+                                    // stale cache marker.
+                                    *staging_cluster_offset = u64::MAX;
+                                    return false;
+                                }
+                                *staging_cluster_offset = cache_key;
+                            }
+                            // Serve from the offset within the cached
+                            // inflated chunk.
+                            let chunk_base_bytes =
+                                chunk_first_sector.saturating_mul(dmg::SECTOR_BYTES);
+                            let within = cur_virtual.saturating_sub(chunk_base_bytes);
+                            let chunk_bytes = chunk_sector_count.saturating_mul(dmg::SECTOR_BYTES);
+                            let span_bytes = chunk_bytes.saturating_sub(within);
+                            let span = if remaining < span_bytes {
+                                remaining
+                            } else {
+                                span_bytes
+                            };
+                            core::ptr::copy_nonoverlapping(
+                                staging_buf.add(within as usize),
+                                dst,
+                                span as usize,
+                            );
+                            done += span;
+                        }
+                        dmg::DmgLookup::Gap { span_sectors } => {
+                            // EIO PARITY: a hole between chunks, a dropped
+                            // (unsupported-codec) chunk, or the
+                            // koly-SectorCount tail is a hard I/O error in
+                            // qemu — NOT a zero-fill.
+                            let _ = span_sectors;
+                            return false;
+                        }
+                    }
+                }
+                return true;
+            }
             ImageFormat::VmdkDescriptor => {
                 // A VMDK flat descriptor holds no content of its
                 // own; the flat extent(s) live on data device(s)
@@ -8382,6 +9206,8 @@ pub struct ChainStates {
     pub parallels_states: [Option<parallels::ParallelsState>; MAX_CHAIN_DEVICES],
     #[cfg(feature = "qcow1-input")]
     pub qcow1_states: [Option<qcow1::Qcow1State>; MAX_CHAIN_DEVICES],
+    #[cfg(feature = "dmg-input")]
+    pub dmg_states: [Option<dmg::DmgState>; MAX_CHAIN_DEVICES],
 }
 
 /// Initialize format-specific state for all devices in a chain.
@@ -8407,8 +9233,26 @@ pub unsafe fn init_chain_states(
     device_count: usize,
     sector_size: usize,
     dynamic_bufs_start: usize,
+    dmg_scratch_base: usize,
+    dmg_scratch_len: usize,
     bytes_read: &mut u64,
 ) -> bool {
+    // The DMG chunk table needs a persistent, per-device home in guest
+    // scratch (unlike every other format, whose per-device state is a
+    // fixed-size cache that fits in the shared L1/L2 cache slots). The
+    // caller hands us a `[dmg_scratch_base, +dmg_scratch_len)` region it
+    // has reserved; we carve one `DMG_REQUIRED_SCRATCH`-sized slot per DMG
+    // device out of it, contiguously. Only the first `DMG_TABLE_REGION`
+    // bytes of each slot must survive `DmgState::init`; the 2 MiB staging
+    // suffix is transient (see the crate's scratch-layout docs and the
+    // per-consumer memory maps). A chain can legitimately hold more than
+    // one DMG (e.g. `compare` reads two independent chains, each possibly
+    // a DMG), so we allocate slots sequentially and refuse cleanly if the
+    // reserved region cannot hold another.
+    #[cfg(not(feature = "dmg-input"))]
+    let _ = (dmg_scratch_base, dmg_scratch_len);
+    #[cfg(feature = "dmg-input")]
+    let mut dmg_slot: usize = 0;
     for dev_idx in 0..device_count {
         let dev_info = &chain_config.devices[dev_idx];
         let format = dev_info.detected_format();
@@ -8529,8 +9373,99 @@ pub unsafe fn init_chain_states(
                     return false;
                 }
             }
+            #[cfg(feature = "dmg-input")]
+            ImageFormat::Dmg => {
+                // Carve the next contiguous DMG slot out of the caller's
+                // reserved region. `DmgState::init` stages the full
+                // DMG_REQUIRED_SCRATCH (~3.25 MiB: 1.25 MiB persistent
+                // table + 2 MiB transient plist/decode) at `slot_base`,
+                // and retains only the first DMG_TABLE_REGION bytes. Slots
+                // are laid out `DMG_TABLE_REGION` apart, so slot N+1's
+                // table reuses slot N's transient — safe because init runs
+                // sequentially (slot N has returned before slot N+1
+                // begins), and every earlier slot's persistent table sits
+                // below where the current slot writes.
+                let slot_base = dmg_scratch_base + dmg_slot * dmg::DMG_TABLE_REGION;
+                if slot_base
+                    .checked_add(dmg::DMG_REQUIRED_SCRATCH)
+                    .map(|end| end > dmg_scratch_base + dmg_scratch_len)
+                    .unwrap_or(true)
+                {
+                    // More DMG devices than the reserved region can hold.
+                    (call_table.debug_print)(b"dmg: too many dmg devices for scratch\n\0".as_ptr());
+                    return false;
+                }
+                match dmg::DmgState::init(
+                    call_table,
+                    dev_idx as u32,
+                    sector_size,
+                    cap,
+                    slot_base as *mut u8,
+                    dmg::DMG_REQUIRED_SCRATCH,
+                    bytes_read,
+                ) {
+                    Ok(state) => {
+                        chain_states.dmg_states[dev_idx] = Some(state);
+                        dmg_slot += 1;
+                    }
+                    Err(refusal) => {
+                        // Emit the typed, stable message so malformed
+                        // fixtures can pin the exact reason (5c/5d rely on
+                        // these strings verbatim).
+                        dmg_debug_print_refusal(call_table, refusal);
+                        return false;
+                    }
+                }
+            }
             _ => {} // Raw and other formats need no per-device state
         }
     }
     true
+}
+
+/// Emit the stable, typed `dmg:`-prefixed refusal string for a
+/// [`dmg::DmgRefusal`] via the call table's `debug_print`. These strings
+/// are the `expected_error` contract for the malformed DMG fixtures, so
+/// they must stay stable. [`dmg::DmgRefusal::UnsupportedCodec`] carries the
+/// raw chunk-type code, which is rendered as `0x`-prefixed lowercase hex
+/// into a fixed stack buffer.
+#[cfg(feature = "dmg-input")]
+fn dmg_debug_print_refusal(call_table: &CallTable, refusal: dmg::DmgRefusal) {
+    use dmg::DmgRefusal;
+    let msg: &[u8] = match refusal {
+        DmgRefusal::ScratchTooSmall => b"dmg: scratch region too small\n\0",
+        DmgRefusal::TrailerNotFound => b"dmg: koly trailer not found\n\0",
+        DmgRefusal::KolyRead => b"dmg: koly trailer read failed\n\0",
+        DmgRefusal::KolyFieldOutOfRange => b"dmg: koly field out of range\n\0",
+        DmgRefusal::BadDataForkOffset => b"dmg: bad data fork offset\n\0",
+        DmgRefusal::BadRsrcForkRegion => b"dmg: bad resource fork region\n\0",
+        DmgRefusal::BadXmlRegion => b"dmg: bad xml region\n\0",
+        DmgRefusal::NegativeSectorCount => b"dmg: negative sector count\n\0",
+        DmgRefusal::NoChunkSource => b"dmg: no chunk source\n\0",
+        DmgRefusal::RegionTooLarge => b"dmg: metadata region too large\n\0",
+        DmgRefusal::RegionReadFailed => b"dmg: metadata region read failed\n\0",
+        DmgRefusal::MalformedXml => b"dmg: malformed xml\n\0",
+        DmgRefusal::RsrcForkMalformed => b"dmg: malformed resource fork\n\0",
+        DmgRefusal::QemuSectorCountTooLarge => b"dmg: chunk sector count exceeds max (131072)\n\0",
+        DmgRefusal::QemuChunkLengthTooLarge => b"dmg: chunk length exceeds max (67108864)\n\0",
+        DmgRefusal::ChunkTableTooLarge => b"dmg: chunk table too large\n\0",
+        DmgRefusal::StagedSectorCountTooLarge => b"dmg: chunk exceeds staging cap\n\0",
+        DmgRefusal::StagedChunkLengthTooLarge => b"dmg: compressed chunk exceeds buffer\n\0",
+        DmgRefusal::EmptyChunkTable => b"dmg: empty chunk table\n\0",
+        DmgRefusal::UnsortedOrOverlapping => b"dmg: unsorted or overlapping chunk table\n\0",
+        DmgRefusal::ArithmeticOverflow => b"dmg: arithmetic overflow\n\0",
+        DmgRefusal::UnsupportedCodec(code) => {
+            // "dmg: unsupported chunk codec 0x________\n\0"
+            let mut buf = *b"dmg: unsupported chunk codec 0x00000000\n\0";
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            // The eight hex digits start right after the "0x" (index 31).
+            for i in 0..8 {
+                let nibble = ((code >> ((7 - i) * 4)) & 0xf) as usize;
+                buf[31 + i] = HEX[nibble];
+            }
+            unsafe { (call_table.debug_print)(buf.as_ptr()) };
+            return;
+        }
+    };
+    unsafe { (call_table.debug_print)(msg.as_ptr()) };
 }

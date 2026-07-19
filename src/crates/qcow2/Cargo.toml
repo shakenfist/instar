@@ -27,6 +27,11 @@ parallels-input = ["parallels"]
 # feature: the reader arm inflates compressed (raw-DEFLATE) clusters via
 # miniz_oxide, the same dependency the qcow2 `decompress` feature provides.
 qcow1-input = ["dep:qcow1", "decompress"]
+# DMG (Apple UDIF) read support pulls in the dmg parser crate and the
+# `decompress` feature: the reader arm inflates zlib-WRAPPED (UDZO) chunks
+# via miniz_oxide, the same dependency the qcow2 `decompress` feature
+# provides.
+dmg-input = ["dep:dmg", "decompress"]
 create = []
 
 [dependencies]
@@ -41,6 +46,7 @@ vhdx = { path = "../vhdx", optional = true }
 vdi = { path = "../vdi", optional = true }
 parallels = { path = "../parallels", optional = true }
 qcow1 = { path = "../qcow1", optional = true }
+dmg = { path = "../dmg", optional = true }
 
 # Tests only: the qcow1-input compressed-cluster arm test builds a real
 # raw-DEFLATE blob with miniz_oxide's compressor (`with-alloc`). The guest
