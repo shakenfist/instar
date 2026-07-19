@@ -228,7 +228,7 @@ is the tracking source of truth.
 | 2. VDI convert-from (dynamic + static read path, new `src/crates/vdi/`) | [PLAN-format-coverage-phase-02-vdi-read.md](PLAN-format-coverage-phase-02-vdi-read.md) | Complete (commits 6cd14b5..cf213ed + docs commit) |
 | 3. Parallels convert-from (v2 read path, new `src/crates/parallels/`) | [PLAN-format-coverage-phase-03-parallels-read.md](PLAN-format-coverage-phase-03-parallels-read.md) | Complete (commits 3f43472..f2bacf4 + docs commit) |
 | 4. QCOW1 convert-from (read path, new `src/crates/qcow1/`; fixes the misdetection-as-qcow2 defect) | [PLAN-format-coverage-phase-04-qcow1-read.md](PLAN-format-coverage-phase-04-qcow1-read.md) | Complete (commits 23b240f..efdc42e + docs commit) |
-| 5. DMG convert-from (koly trailer + BLKX chunk table + zlib chunks, new `src/crates/dmg/`) | PLAN-format-coverage-phase-05-dmg-read.md | Not written |
+| 5. DMG convert-from (BLKX chunk table + zlib chunks, new `src/crates/dmg/`; EIO-parity error semantics, typed codec/capacity refusals) | [PLAN-format-coverage-phase-05-dmg-read.md](PLAN-format-coverage-phase-05-dmg-read.md) | Planned (2026-07-19) |
 | 6. QED decision: read path or documented refusal (see Open question 1) | PLAN-format-coverage-phase-06-qed.md | Not written |
 | 7. Docs: qemu-img-parity axis in format-coverage.md, README/ARCHITECTURE/CHANGELOG updates | PLAN-format-coverage-phase-07-docs.md | Not written |
 
@@ -494,6 +494,13 @@ chosen to defer to here so that we don't forget them.
   creatable fixture needs it today (deliberate divergence, see
   `docs/quirks.md` "Format-coverage phase 3"). Revisit if a real
   need for extension/dirty-bitmap data appears.
+* Report the qemu DMG zero-chunk NULL-dereference crash upstream:
+  a DMG with a valid koly trailer but zero parsed chunks (bad mish
+  magic, broken base64, or no `<data>` blocks) segfaults every
+  qemu-img from 6.0.0 through host 10.0.11 on any read (`info` is
+  unaffected). Found by phase-5 planning's empirical pass
+  (2026-07-19); instar's phase-5 reader refuses the empty table
+  cleanly instead of mirroring the crash.
 * Report the qemu `parallels_check_duplicate` assertion crash
   (10.2.0's `qemu-img check` asserts on an out-of-image BAT entry
   that 6.0.0 reports cleanly) upstream to the qemu project; this is
