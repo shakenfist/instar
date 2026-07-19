@@ -45,6 +45,8 @@ pub enum ImageFormat {
     /// VMDK monolithicFlat descriptor file (text, points to a
     /// separate flat extent file that holds the actual content).
     VmdkDescriptor,
+    /// DMG (Apple UDIF) disk image
+    Dmg,
     /// Unknown or unsupported format
     Unknown,
 }
@@ -65,6 +67,7 @@ impl ImageFormat {
             "vdi" => ImageFormat::Vdi,
             "parallels" => ImageFormat::Parallels,
             "luks" => ImageFormat::Luks,
+            "dmg" => ImageFormat::Dmg,
             _ => ImageFormat::Unknown,
         }
     }
@@ -93,6 +96,7 @@ impl ImageFormat {
             ImageFormat::Parallels => 13,
             ImageFormat::Luks => 11,
             ImageFormat::VmdkDescriptor => 12,
+            ImageFormat::Dmg => 16,
         }
     }
 }
@@ -115,6 +119,7 @@ impl std::fmt::Display for ImageFormat {
             // monolithicFlat — matches the `name()` method on
             // `shared::ImageFormat::VmdkDescriptor`.
             ImageFormat::VmdkDescriptor => write!(f, "vmdk"),
+            ImageFormat::Dmg => write!(f, "dmg"),
             ImageFormat::Unknown => write!(f, "unknown"),
         }
     }
