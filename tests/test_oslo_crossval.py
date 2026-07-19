@@ -151,6 +151,22 @@ OSLO_SKIP_IMAGES = {
     'qcow1-huge-size',
     'qcow1-crypt-invalid',
     'qcow1-backing-name-too-long',
+    # Malformed/refused DMG fixtures (format-coverage phase 5,
+    # PLAN-format-coverage-phase-05-dmg-read.md). safety: "malformed",
+    # run_in_ci: true, so they need an explicit skip. oslo has no DMG inspector
+    # and falls back to RawFileInspector ('raw'), blindly accepting every one;
+    # qemu refuses the two cap fixtures at open, decodes/refuses the codec
+    # fixtures build-dependently, converts the overcap fixture (which instar
+    # refuses on its staging cap), and segfaults on read for dmg-empty-table
+    # (rc 139) even though its info succeeds. Cross-validating oslo's blind raw
+    # acceptance against instar's typed refusals is not meaningful.
+    'dmg-chunk-len-over',
+    'dmg-sc-over',
+    'dmg-codec-bzip2',
+    'dmg-codec-lzfse',
+    'dmg-codec-adc',
+    'dmg-overcap-chunk',
+    'dmg-empty-table',
 }
 
 # Format name mapping: instar -> oslo.utils.
@@ -220,6 +236,14 @@ KNOWN_FORMAT_DIVERGENCES = {
     'bochs-growing': ('bochs', 'raw'),
     'cloop-simple': ('cloop', 'raw'),
     'dmg-simple': ('dmg', 'raw'),
+    # Format-coverage phase 5 (PLAN-format-coverage-phase-05-dmg-read.md):
+    # the four new safe DMG fixtures detect the same way as dmg-simple --
+    # oslo.utils ships no DMG inspector and falls back to RawFileInspector
+    # ('raw'), while instar's koly-trailer probe reports 'dmg'.
+    'dmg-mixed': ('dmg', 'raw'),
+    'dmg-multipart': ('dmg', 'raw'),
+    'dmg-rsrc-fork': ('dmg', 'raw'),
+    'dmg-gap': ('dmg', 'raw'),
 }
 
 # Known safety divergences: images where instar does not
@@ -298,6 +322,18 @@ KNOWN_VSIZE_DIVERGENCES = {
     'bochs-growing': (2560, 1032192),
     'cloop-simple': (1690, 1024 * 1024),
     'dmg-simple': (11747, 4 * 1024 * 1024),
+    # Format-coverage phase 5 (PLAN-format-coverage-phase-05-dmg-read.md):
+    # the four new safe DMG fixtures follow the same oslo rule as dmg-simple --
+    # RawFileInspector.virtual_size is min(file_size, 262144); all four fit
+    # entirely in oslo's first read chunk, so oslo returns each whole file
+    # length, while instar reports the koly SectorCount * 512 virtual size.
+    # Because these are also KNOWN_FORMAT_DIVERGENCES entries, TestOsloVirtualSize
+    # skips them before reaching this dict; the pairs are a documented, verified
+    # reference (captured live against oslo.utils 10.1.2.dev8, git master).
+    'dmg-mixed': (37029, 2162688),
+    'dmg-multipart': (4719, 1048576),
+    'dmg-rsrc-fork': (2218, 524288),
+    'dmg-gap': (1480, 8192),
     # Format-coverage phase 2 (PLAN-format-coverage-phase-02-vdi-read.md):
     # vdi-odd-size has its VDI header disk_size patched to 1048577, a non-512
     # multiple. oslo.utils' VDIInspector reports the raw disk_size u64 verbatim
