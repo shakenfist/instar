@@ -825,6 +825,168 @@ class TestAdversarialDmgManifest(InstarTestBase):
         )
 
 
+class TestAdversarialDmgReaderRefusals(InstarTestBase):
+    """The phase-5 refused DMG fixtures: reader-init refusals (fmt-cov 5e).
+
+    Seven fixtures reach the DMG reader (valid koly, non-empty chunk
+    source) but must be refused at init for a reason instar names but qemu
+    handles differently or crashes on:
+
+      dmg-chunk-len-over  comp_len 64 MiB + 1 -> qemu open refusal ("larger
+                          than max (67108864)"); instar refuses at init.
+      dmg-sc-over         sector_count 131073 -> qemu open refusal ("larger
+                          than max (131072)"); instar refuses at init.
+      dmg-codec-bzip2     UDBZ (0x80000006).  qemu's behaviour is
+                          BUILD-DEPENDENT: static 6.0.0 and host 10.0.11
+                          ship the module and decode it, every other static
+                          build reads EIO -- there is no single qemu parity
+                          target, so it is skip_qemu_img.  instar issues a
+                          typed UDBZ codec refusal.
+      dmg-codec-lzfse     ULFO (0x80000007) -> dropped at open on every
+                          qemu build; instar typed ULFO refusal.
+      dmg-codec-adc       UDCO (0x80000004) -> enum-named, never
+                          implemented; instar typed UDCO refusal.
+      dmg-overcap-chunk   qemu-LEGAL 4 MiB zlib chunk over instar's
+                          4096-sector (2 MiB) staging cap -- qemu converts
+                          it fine, instar refuses typed (the documented
+                          capacity divergence).
+      dmg-empty-table     valid koly + plist whose <data> decodes to a mish
+                          with a corrupted magic -> qemu parses zero chunks
+                          and SIGSEGVs on read; instar refuses the empty
+                          table.  qemu is NEVER run on it here.
+
+    For each: convert, compare (self), and dd must exit non-zero with a
+    non-empty message and without hanging or crashing (run_adversarial
+    fails on any signal kill, so a SIGSEGV is caught directly; the empty
+    -table fixture additionally pins rc != 139 explicitly).  info parses
+    ONLY the koly trailer, never the chunk table, so all seven report
+    ``file format: dmg`` with the trailer-derived virtual size and exit 0
+    -- pinned per fixture below.  As with the other adversarial manifests,
+    convert/dd surface the reader-init failure as the generic ``convert
+    operation failed`` and compare as a content mismatch; only the exit
+    code and clean termination are pinned, not instar's typed string.
+    """
+
+    #: cap on any produced convert/dd output -- a refused fixture must
+    #: never balloon into a huge raw file.
+    _OUTPUT_CAP = 100 * 1024 * 1024
+
+    #: (fixture id, trailer-derived virtual size in bytes) for the info pin.
+    #: SectorCount * 512 in every case (info never touches the chunk table).
+    INFO_VSIZE = {
+        'dmg-chunk-len-over': 4096,        # sector_count 8
+        'dmg-sc-over': 67109376,           # sector_count 131073
+        'dmg-codec-bzip2': 4096,           # sector_count 8
+        'dmg-codec-lzfse': 4096,           # sector_count 8
+        'dmg-codec-adc': 4096,             # sector_count 8
+        'dmg-overcap-chunk': 4194304,      # sector_count 8192 (4 MiB)
+        'dmg-empty-table': 4096,           # sector_count 8
+    }
+
+    def _assert_reader_refused(self, image_id):
+        """convert/compare(self)/dd refuse cleanly; info is clean, exit 0."""
+        image = self.get_adversarial_image(image_id)
+        instar = str(self.get_instar_binary())
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+            # convert: must refuse, non-zero, non-empty message, no crash.
+            c_out, c_err, c_rc = self.run_adversarial(
+                [instar, 'convert', '-O', 'raw', str(image.path), out.name],
+                timeout=15,
+            )
+            self.assertNotEqual(
+                c_rc, 0, f'convert should refuse {image_id}')
+            self.assertNotEqual(
+                c_rc, 139,
+                f'instar must not SIGSEGV converting {image_id}')
+            self.assertTrue(
+                (c_out + c_err).strip(),
+                f'convert should emit a non-empty error for {image_id}')
+            self.assertLess(
+                Path(out.name).stat().st_size, self._OUTPUT_CAP,
+                f'convert output suspiciously large for {image_id}')
+
+        # compare against itself: the read failure surfaces as a mismatch
+        # (proving compare is not silently reading it as raw), never a crash.
+        m_out, m_err, m_rc = self.run_adversarial(
+            [instar, 'compare', str(image.path), str(image.path)],
+            timeout=15,
+        )
+        self.assertNotEqual(
+            m_rc, 0, f'compare(self) should refuse {image_id}')
+        self.assertNotEqual(
+            m_rc, 139, f'instar must not SIGSEGV comparing {image_id}')
+        self.assertTrue(
+            (m_out + m_err).strip(),
+            f'compare should emit a non-empty message for {image_id}')
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+            d_out, d_err, d_rc = self.run_adversarial(
+                [instar, 'dd', '-O', 'raw',
+                 f'if={image.path}', f'of={out.name}'],
+                timeout=15,
+            )
+            self.assertNotEqual(
+                d_rc, 0, f'dd should refuse {image_id}')
+            self.assertNotEqual(
+                d_rc, 139, f'instar must not SIGSEGV in dd for {image_id}')
+            self.assertTrue(
+                (d_out + d_err).strip(),
+                f'dd should emit a non-empty error for {image_id}')
+            self.assertLess(
+                Path(out.name).stat().st_size, self._OUTPUT_CAP,
+                f'dd output suspiciously large for {image_id}')
+
+        # info: parses only the koly trailer -> exit 0, format dmg, the
+        # trailer-derived virtual size.  No crash, no hang.
+        i_out, i_err, i_rc = self.run_adversarial(
+            [instar, 'info', str(image.path)],
+            timeout=15,
+        )
+        self.assertEqual(
+            i_rc, 0,
+            f'info should parse the trailer and exit 0 for {image_id}; '
+            f'stdout={i_out!r} stderr={i_err!r}')
+        self.assertIn(
+            'file format: dmg', i_out.lower(),
+            f'info should report format dmg for {image_id}: {i_out!r}')
+        vsize = self.INFO_VSIZE[image_id]
+        self.assertIn(
+            f'({vsize} bytes)', i_out,
+            f'info should report the trailer-derived vsize {vsize} for '
+            f'{image_id}: {i_out!r}')
+
+    def test_dmg_chunk_len_over_refused(self):
+        self._assert_reader_refused('dmg-chunk-len-over')
+
+    def test_dmg_sc_over_refused(self):
+        self._assert_reader_refused('dmg-sc-over')
+
+    def test_dmg_codec_bzip2_refused(self):
+        # qemu 6.0.0 / host 10.0.11 decode UDBZ; other builds EIO --
+        # build-dependent, so no qemu run here (skip_qemu_img).  instar's
+        # typed UDBZ refusal is what we pin.
+        self._assert_reader_refused('dmg-codec-bzip2')
+
+    def test_dmg_codec_lzfse_refused(self):
+        self._assert_reader_refused('dmg-codec-lzfse')
+
+    def test_dmg_codec_adc_refused(self):
+        self._assert_reader_refused('dmg-codec-adc')
+
+    def test_dmg_overcap_chunk_refused(self):
+        # qemu CONVERTS this legal 4 MiB chunk fine; instar refuses over its
+        # 2 MiB staging cap (the documented capacity divergence).  qemu is
+        # not run here.
+        self._assert_reader_refused('dmg-overcap-chunk')
+
+    def test_dmg_empty_table_refused(self):
+        # The qemu zero-chunk SIGSEGV reproducer: qemu is NEVER run on it.
+        # instar refuses the empty table cleanly (rc != 0 and, crucially,
+        # rc != 139) -- enforced by _assert_reader_refused.
+        self._assert_reader_refused('dmg-empty-table')
+
+
 class TestAdversarialVdiManifest(InstarTestBase):
     """Verify malformed VDI fixtures are refused cleanly (format-coverage 2).
 

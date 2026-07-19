@@ -2154,3 +2154,43 @@ class TestBenchQcow1(BenchTestBase):
             f'  instar: {self.header_line(i_out)!r}\n'
             f'  qemu:   {self.header_line(q_out)!r}')
         self.assertRegex(q_out.splitlines()[-1], COMPLETION_RE)
+
+
+class TestBenchDmg(BenchTestBase):
+    """Smoke test for benchmarking DMG input (format-coverage phase 5).
+
+    DMG graduates to a real read format for the reader-linking ops,
+    including bench (bench's Cargo.toml enables the qcow2 ``dmg-input``
+    feature and its guest ``read_family`` allowlist gained a Dmg arm).
+    This pins that ``instar bench`` reads the dmg-mixed fixture
+    successfully (exit 0, well-formed header + completion line) and stays
+    header-byte-identical to ``qemu-img bench``, rather than refusing it
+    with ``ERROR_UNSUPPORTED_FORMAT`` as before graduation.  The ``-f
+    dmg`` format hint is qemu's own name for the format.
+    """
+
+    def test_bench_dmg_mixed(self):
+        """bench reads dmg-mixed: exit 0, header parity with qemu-img."""
+        self._require_kvm()
+        image = self.get_image('dmg-mixed')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        args = ['-c', '100', '-f', 'dmg', str(image.path)]
+
+        i_out, i_err, i_rc = self.run_instar_bench(*args)
+        self.assertEqual(
+            i_rc, 0, f'instar bench on dmg failed: stderr={i_err!r}')
+        self.assertRegex(i_out.splitlines()[-1], COMPLETION_RE)
+
+        q_out, q_err, q_rc = self.run_qemu_bench(*args)
+        self.assertEqual(
+            q_rc, 0, f'qemu-img bench on dmg failed: stderr={q_err!r}')
+
+        self.assertEqual(
+            self.header_line(i_out), self.header_line(q_out),
+            f'bench header mismatch on dmg:\n'
+            f'  instar: {self.header_line(i_out)!r}\n'
+            f'  qemu:   {self.header_line(q_out)!r}')
+        self.assertRegex(q_out.splitlines()[-1], COMPLETION_RE)

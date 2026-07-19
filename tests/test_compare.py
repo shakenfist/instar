@@ -1285,6 +1285,74 @@ class TestCompareDmg(InstarTestBase):
             )
             self.assertIn('identical', (stdout + stderr).lower())
 
+    def test_compare_dmg_multipart_vs_flattened(self):
+        """compare dmg-multipart against its own qemu-flattened raw.
+
+        Reading the multipart mish composition through compare must match
+        qemu's raw view byte-for-byte -- proving compare walks the absolute
+        (out_offset) sector table rather than the container bytes.
+        """
+        image = self.get_image('dmg-multipart')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') as qemu_raw:
+            _, q_stderr, q_rc = self.run_qemu_img_convert(
+                image.path, Path(qemu_raw.name), timeout=120)
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img convert failed for dmg-multipart: {q_stderr}')
+
+            stdout, stderr, rc = self.run_instar_compare(
+                image.path, Path(qemu_raw.name), timeout=120)
+            self.assertEqual(
+                rc, 0,
+                f'compare dmg-multipart vs raw should be identical; '
+                f'stdout={stdout!r} stderr={stderr!r}')
+            self.assertIn('identical', (stdout + stderr).lower())
+
+    def test_compare_dmg_rsrc_fork_self(self):
+        """compare dmg-rsrc-fork against itself reports identical.
+
+        The old resource-fork table path decodes deterministically, so a
+        self-compare must report identical content and exit 0.
+        """
+        image = self.get_image('dmg-rsrc-fork')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        stdout, stderr, rc = self.run_instar_compare(
+            image.path, image.path, timeout=120)
+        self.assertEqual(
+            rc, 0,
+            f'compare dmg-rsrc-fork self should be identical; '
+            f'stdout={stdout!r} stderr={stderr!r}')
+        self.assertIn('identical', (stdout + stderr).lower())
+
+    def test_compare_dmg_mixed_vs_multipart_differ(self):
+        """compare dmg-mixed vs dmg-multipart reports a mismatch (exit != 0).
+
+        Two safe DMG fixtures with different decoded content must compare
+        as different, proving compare reads the real disks (both would be
+        'identical' only if compare read the container bytes wrong).
+        """
+        mixed = self.get_image('dmg-mixed')
+        multipart = self.get_image('dmg-multipart')
+        for img in (mixed, multipart):
+            if not img.path.exists():
+                self.skipTest(f'Image not found: {img.path}')
+            self.skip_if_hash_mismatch(img)
+
+        stdout, stderr, rc = self.run_instar_compare(
+            mixed.path, multipart.path, timeout=120)
+        self.assertNotEqual(
+            rc, 0,
+            f'compare of two differing DMG fixtures should report a '
+            f'mismatch; stdout={stdout!r} stderr={stderr!r}')
+        self.assertNotIn('identical', (stdout + stderr).lower())
+
 
 class TestCompareVdi(InstarTestBase):
     """Smoke test for comparing VDI input (format-coverage phase 2).

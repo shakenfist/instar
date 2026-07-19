@@ -6469,6 +6469,339 @@ class TestConvertDmgToRaw(InstarTestBase):
                 'convert output for dmg-simple differs from qemu-img'
             )
 
+    # ------------------------------------------------------------------
+    # Phase-5e fixture matrix: byte parity for the three safe read-path
+    # fixtures beyond dmg-simple (mixed chunk types, multipart mish
+    # composition, the old resource-fork table path).
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _pattern_sectors(label, sector_count):
+        """Mirror the testdata generator's ``pattern_sectors`` helper.
+
+        A labelled ASCII line tiled to fill ``sector_count`` * 512 bytes,
+        letting the multipart-concatenation test reconstruct the expected
+        raw content without shelling out to the generator.
+        """
+        unit = ('%s\n' % label).encode('ascii')
+        size = sector_count * 512
+        reps = (size // len(unit)) + 1
+        return (unit * reps)[:size]
+
+    def _assert_convert_parity(self, image_id):
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') as instar_raw, \
+                tempfile.NamedTemporaryFile(suffix='.raw') as qemu_raw:
+            _, stderr, rc = self.run_instar_convert(
+                image.path, Path(instar_raw.name), timeout=120)
+            self.assertEqual(
+                rc, 0, f'instar convert failed for {image_id}: {stderr}')
+
+            _, q_stderr, q_rc = self.run_qemu_img_convert(
+                image.path, Path(qemu_raw.name), timeout=120)
+            self.assertEqual(
+                q_rc, 0, f'qemu-img convert failed for {image_id}: {q_stderr}')
+
+            self.assertEqual(
+                Path(instar_raw.name).read_bytes(),
+                Path(qemu_raw.name).read_bytes(),
+                f'convert output for {image_id} differs from qemu-img')
+
+    def test_convert_dmg_mixed(self):
+        """Convert dmg-mixed to raw (zero + raw + zlib + ignore chunks)."""
+        self._assert_convert_parity('dmg-mixed')
+
+    def test_convert_dmg_multipart(self):
+        """Convert dmg-multipart to raw (two mish blocks at absolute sectors)."""
+        self._assert_convert_parity('dmg-multipart')
+
+    def test_convert_dmg_rsrc_fork(self):
+        """Convert dmg-rsrc-fork to raw (the old resource-fork table path)."""
+        self._assert_convert_parity('dmg-rsrc-fork')
+
+    def test_convert_dmg_multipart_equals_concatenation(self):
+        """dmg-multipart convert equals the concatenation of its two parts.
+
+        The generator composes the disk from two mish blocks: part 0
+        (label INSTAR-DMG-MULTIPART-0, 1024 sectors) at absolute sectors
+        [0, 1024) and part 1 (INSTAR-DMG-MULTIPART-1, 1024 sectors) at
+        [1024, 2048), each a zlib chunk whose compressed_offset is relative
+        to DataForkOffset.  A correct absolute-sector (out_offset) walk
+        must therefore reproduce part0-bytes ++ part1-bytes exactly.  We
+        assert instar == qemu AND both == the reconstructed concatenation,
+        the strongest honest form of the composition pin.
+        """
+        image = self.get_image('dmg-multipart')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        expected = (
+            self._pattern_sectors('INSTAR-DMG-MULTIPART-0', 1024)
+            + self._pattern_sectors('INSTAR-DMG-MULTIPART-1', 1024))
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') as instar_raw, \
+                tempfile.NamedTemporaryFile(suffix='.raw') as qemu_raw:
+            _, stderr, rc = self.run_instar_convert(
+                image.path, Path(instar_raw.name), timeout=120)
+            self.assertEqual(
+                rc, 0, f'instar convert failed for dmg-multipart: {stderr}')
+            _, q_stderr, q_rc = self.run_qemu_img_convert(
+                image.path, Path(qemu_raw.name), timeout=120)
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img convert failed for dmg-multipart: {q_stderr}')
+
+            instar_bytes = Path(instar_raw.name).read_bytes()
+            self.assertEqual(
+                instar_bytes, Path(qemu_raw.name).read_bytes(),
+                'dmg-multipart convert output differs from qemu-img')
+            self.assertEqual(
+                instar_bytes, expected,
+                'dmg-multipart convert output does not equal the '
+                'concatenation of its two mish parts')
+
+    # ------------------------------------------------------------------
+    # DMG read validated through non-raw output formats.  Convert
+    # dmg-mixed with instar to qcow2 / vpc, flatten the instar output back
+    # to raw with qemu-img, and compare against the canonical qemu-img raw
+    # view.  vpc's writer rounds up to CHS geometry, so the flattened raws
+    # are compared on their common prefix with any tail required to be
+    # zero padding (mirrors TestConvertQcow1ToRaw's output-format checks).
+    # ------------------------------------------------------------------
+
+    def _test_dmg_output_format(self, fmt):
+        image = self.get_image('dmg-mixed')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') as ref_raw, \
+                tempfile.NamedTemporaryFile(suffix=f'.{fmt}') as instar_out, \
+                tempfile.NamedTemporaryFile(suffix='.raw') as flat_raw:
+            _, q_stderr, q_rc = self.run_qemu_img_convert(
+                image.path, Path(ref_raw.name), timeout=120)
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img convert to raw failed for dmg-mixed: {q_stderr}')
+
+            _, stderr, rc = self.run_instar_convert(
+                image.path, Path(instar_out.name),
+                output_format=fmt, timeout=120)
+            self.assertEqual(
+                rc, 0, f'instar convert dmg-mixed -> {fmt} failed: {stderr}')
+
+            result = subprocess.run(
+                ['qemu-img', 'convert', '-O', 'raw',
+                 instar_out.name, flat_raw.name],
+                capture_output=True, text=True, timeout=120)
+            self.assertEqual(
+                result.returncode, 0,
+                f'qemu-img flatten of instar {fmt} output failed: '
+                f'{result.stderr}')
+
+            ref_bytes = Path(ref_raw.name).read_bytes()
+            flat_bytes = Path(flat_raw.name).read_bytes()
+            n = min(len(ref_bytes), len(flat_bytes))
+            self.assertEqual(
+                ref_bytes[:n], flat_bytes[:n],
+                f'instar {fmt} output (flattened) differs from qemu raw '
+                f'for dmg-mixed in the common prefix')
+            self.assertFalse(
+                any(ref_bytes[n:]) or any(flat_bytes[n:]),
+                f'non-zero tail beyond common prefix for {fmt} '
+                f'(ref={len(ref_bytes)} flat={len(flat_bytes)})')
+
+    def test_convert_dmg_mixed_to_qcow2(self):
+        """Convert dmg-mixed to qcow2 and validate the read path."""
+        self._test_dmg_output_format('qcow2')
+
+    def test_convert_dmg_mixed_to_vpc(self):
+        """Convert dmg-mixed to vpc and validate the read path."""
+        self._test_dmg_output_format('vpc')
+
+    def test_convert_dmg_gap_error_parity(self):
+        """dmg-gap convert fails non-zero cleanly on BOTH instar and qemu.
+
+        The koly SectorCount (16) exceeds the mish coverage (8 sectors), so
+        the tail is an uncovered gap.  DMG reads ERROR on a gap rather than
+        zero-filling (the phase-5 EIO-parity semantic), so convert fails on
+        both sides -- but the messages differ: qemu emits ``error while
+        reading ... Input/output error`` while instar surfaces the generic
+        ``convert operation failed``.  This is an error-parity fixture, not
+        a byte-parity one; only the non-zero exit and clean termination are
+        pinned.  The fixture carries a ``.dmg`` extension so unforced qemu
+        probes it as dmg.
+        """
+        image = self.get_image('dmg-gap')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') as instar_raw, \
+                tempfile.NamedTemporaryFile(suffix='.raw') as qemu_raw:
+            i_out, i_err, i_rc = self.run_instar_convert(
+                image.path, Path(instar_raw.name), timeout=60)
+            self.assertNotEqual(
+                i_rc, 0,
+                f'instar convert of dmg-gap should fail cleanly; '
+                f'stdout={i_out!r} stderr={i_err!r}')
+
+            q_out, q_err, q_rc = self.run_qemu_img_convert(
+                image.path, Path(qemu_raw.name), timeout=60)
+            self.assertNotEqual(
+                q_rc, 0,
+                f'qemu-img convert of dmg-gap should fail (EIO on the '
+                f'uncovered tail); stdout={q_out!r} stderr={q_err!r}')
+
+    def test_convert_dmg_extensionless_divergence(self):
+        """Extensionless DMG: qemu probes raw, instar detects via trailer.
+
+        qemu's dmg probe is purely the ``.dmg`` filename extension (phase-5
+        plan, "Probe"): an extensionless copy of dmg-simple is probed as
+        RAW by an unforced ``qemu-img convert`` -- its output is the whole
+        container copied verbatim (11747 bytes, sector-rounded up to 11776),
+        NOT the 4 MiB decoded disk.  instar's detection is trailer-based and
+        strictly stronger: it finds the koly trailer regardless of filename
+        and converts the real UDIF content, byte-identical to the
+        extension-ful conversion.  Both behaviours are pinned; the
+        divergence is intentional and documented.
+        """
+        image = self.get_image('dmg-simple')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        tmpdir = tempfile.mkdtemp()
+        try:
+            noext = os.path.join(tmpdir, 'dmg-simple-noext')
+            shutil.copyfile(str(image.path), noext)
+
+            instar_noext = os.path.join(tmpdir, 'instar-noext.raw')
+            instar_ext = os.path.join(tmpdir, 'instar-ext.raw')
+            qemu_noext = os.path.join(tmpdir, 'qemu-noext.raw')
+
+            # instar: trailer detection ignores the missing extension.
+            _, i_err, i_rc = self.run_instar_convert(
+                Path(noext), Path(instar_noext), timeout=120)
+            self.assertEqual(
+                i_rc, 0,
+                f'instar convert of extensionless dmg should succeed via '
+                f'trailer detection: {i_err}')
+            _, e_err, e_rc = self.run_instar_convert(
+                image.path, Path(instar_ext), timeout=120)
+            self.assertEqual(
+                e_rc, 0, f'instar convert of dmg-simple failed: {e_err}')
+
+            instar_noext_bytes = Path(instar_noext).read_bytes()
+            self.assertEqual(
+                instar_noext_bytes, Path(instar_ext).read_bytes(),
+                'instar extensionless convert differs from the extension-ful '
+                'conversion (trailer detection should be filename-agnostic)')
+            self.assertEqual(
+                len(instar_noext_bytes), 4 * 1024 * 1024,
+                'instar should decode the full 4 MiB UDIF disk')
+
+            # qemu (unforced): filename-only probe -> reads the container
+            # bytes as raw, NOT the decoded disk.
+            result = subprocess.run(
+                ['qemu-img', 'convert', '-O', 'raw', noext, qemu_noext],
+                capture_output=True, text=True, timeout=120)
+            self.assertEqual(
+                result.returncode, 0,
+                f'qemu-img convert of extensionless dmg (as raw) failed: '
+                f'{result.stderr}')
+            qemu_noext_bytes = Path(qemu_noext).read_bytes()
+            self.assertNotEqual(
+                qemu_noext_bytes, instar_noext_bytes,
+                'extensionless qemu (raw pass-through) must diverge from '
+                'instar (trailer-decoded); this is the documented probe '
+                'divergence')
+            container_size = image.path.stat().st_size
+            self.assertLess(
+                len(qemu_noext_bytes), 4 * 1024 * 1024,
+                'qemu raw pass-through of the container must be far smaller '
+                'than the 4 MiB decoded disk')
+            # qemu rounds the container up to the next sector.
+            self.assertEqual(
+                len(qemu_noext_bytes),
+                ((container_size + 511) // 512) * 512,
+                'qemu raw output should be the container size rounded up to '
+                'a 512-byte sector')
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_convert_qcow2_over_dmg_backing_chain(self):
+        """Convert a qcow2 overlay backed by a DMG image; match qemu-img.
+
+        Empirically verified (phase-5e) that qemu accepts ``qemu-img create
+        -b <dmg> -F dmg`` for a qcow2 overlay and reads the composed chain.
+        Builds ``overlay.qcow2`` over a copied dmg-simple in the test
+        tmpdir (instar only reads backing files inside the overlay's
+        directory), writes a 64 KiB overlay pattern over part of the
+        backing, then asserts instar and qemu-img produce identical raw
+        output.  This exercises the mid-chain DMG position the 5b reader arm
+        was designed for.  Skipped only if the tested qemu refuses -F dmg
+        (it does not on this host).
+        """
+        image = self.get_image('dmg-simple')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+        if not shutil.which('qemu-io'):
+            self.skipTest('qemu-io not available')
+
+        tmpdir = tempfile.mkdtemp()
+        try:
+            backing = os.path.join(tmpdir, 'backing.dmg')
+            overlay = os.path.join(tmpdir, 'overlay.qcow2')
+            shutil.copyfile(str(image.path), backing)
+
+            create = subprocess.run(
+                ['qemu-img', 'create', '-f', 'qcow2',
+                 '-b', 'backing.dmg', '-F', 'dmg', 'overlay.qcow2'],
+                capture_output=True, text=True, timeout=60, cwd=tmpdir)
+            if create.returncode != 0:
+                self.skipTest(
+                    f'qemu-img does not accept -F dmg backing format: '
+                    f'{create.stderr}')
+
+            # Overwrite one 64 KiB region so the composed view mixes overlay
+            # and backing (DMG-decoded) data.
+            io = subprocess.run(
+                ['qemu-io', '-c', 'write -P 0xEE 131072 65536', overlay],
+                capture_output=True, text=True, timeout=60)
+            self.assertEqual(
+                io.returncode, 0, f'qemu-io overlay write failed: {io.stderr}')
+
+            instar_raw = os.path.join(tmpdir, 'instar.raw')
+            qemu_raw = os.path.join(tmpdir, 'qemu.raw')
+
+            _, stderr, rc = self.run_instar_convert(
+                Path(overlay), Path(instar_raw), timeout=120)
+            self.assertEqual(
+                rc, 0,
+                f'instar convert of qcow2-over-dmg chain failed: {stderr}')
+
+            _, q_stderr, q_rc = self.run_qemu_img_convert(
+                Path(overlay), Path(qemu_raw), timeout=120)
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img convert of qcow2-over-dmg chain failed: '
+                f'{q_stderr}')
+
+            self.assertEqual(
+                Path(instar_raw).read_bytes(),
+                Path(qemu_raw).read_bytes(),
+                'instar convert of qcow2-over-dmg chain differs from '
+                'qemu-img')
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
 
 class TestConvertDetectOnlyRefusal(InstarTestBase):
     """convert refuses detect-only input formats instead of reading raw.
