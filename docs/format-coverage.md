@@ -1,9 +1,19 @@
 # Format Detection and Safety Check Coverage
 
-This document compares instar's format detection and safety reporting capabilities
-against OpenStack's oslo.utils `format_inspector` module. The goal is to ensure
-instar can detect all the same security-relevant metadata that OpenStack uses for
-image safety validation.
+This document tracks instar's format coverage along two axes:
+
+1. **oslo.utils `format_inspector` parity** — instar's format detection and
+   safety reporting compared against OpenStack's oslo.utils `format_inspector`
+   module, ensuring instar detects all the same security-relevant metadata that
+   OpenStack uses for image safety validation. This was the document's original
+   charter, and instar meets it in full.
+2. **qemu-img roster coverage** — which of qemu-img's real on-disk image-format
+   drivers instar supports, broken down per subcommand, and exactly where
+   instar's behaviour diverges from qemu-img. See
+   [qemu-img parity axis](#qemu-img-parity-axis) below for the consolidated
+   op × format matrix. This axis was added by
+   [PLAN-format-coverage](plans/PLAN-format-coverage.md) so future gaps land in
+   a table rather than being rediscovered by archaeology.
 
 ## Important Distinction: Detection vs Rejection
 
@@ -50,6 +60,218 @@ for details on why this approach is secure.
 ### Formats Not Yet Detected by Instar
 
 All formats detected by oslo.utils are now also detected by instar.
+
+---
+
+## qemu-img parity axis
+
+This section tracks instar's coverage against qemu-img's **actual** on-disk
+image-format roster — the 14 formats instar detects — for every subcommand
+surface, and records where instar diverges from qemu-img. It is the
+consolidated op × format matrix that the per-op tables further down
+(Resize / Rebase / Commit / DD, and the Other Format Safety Checks table)
+provide the detail behind.
+
+The underlying evidence for every divergence recorded here lives in the six
+`docs/quirks.md` "Format-coverage phase" sections:
+[phase 1](quirks.md#format-coverage-phase-1-parallels-bochs-cloop-dmg-detection)
+(detection, the #444 detect-only refusal, DMG raw pass-through in the in-place
+ops),
+[phase 2](quirks.md#format-coverage-phase-2-vdi-convert-from-read-path) (VDI),
+[phase 3](quirks.md#format-coverage-phase-3-parallels-convert-from-read-path)
+(Parallels),
+[phase 4](quirks.md#format-coverage-phase-4-qcow1-convert-from-read-path)
+(QCOW1),
+[phase 5](quirks.md#format-coverage-phase-5-dmg-convert-from-read-path) (DMG),
+and
+[phase 6](quirks.md#format-coverage-phase-6-qed-read-refusal-as-policy) (QED).
+Cells with no recorded source were measured empirically on 2026-07-20 against
+the built instar binary and qemu-img 10.0.11, using the existing
+instar-testdata fixtures; those measurements are recorded in
+[PLAN-format-coverage-phase-07-docs](plans/PLAN-format-coverage-phase-07-docs.md).
+
+**Legend**
+
+| Symbol | Meaning |
+|--------|---------|
+| ✓ | instar supports the op with qemu-img parity |
+| ✓‡ | instar supports the op where qemu-img **refuses** it (instar-only capability; recorded divergence) |
+| R‡ | instar **refuses** the op where qemu-img supports it (recorded divergence) |
+| R= | instar refuses and qemu-img also refuses / cannot perform it (parity refusal — neither tool supports it) |
+| ~‡ | instar treats the container as **raw** (pass-through), not recognising the real format — diverges from qemu-img's format-aware handling (recorded divergence) |
+| — | not applicable (format is not in the op's supported roster) |
+
+Numbered cells carry a note in **Notes** below the tables.
+
+### Read-side ops
+
+These ops read an image without mutating it.
+
+| Format | info | check | convert | compare | dd | bench | map | measure |
+|--------|------|-------|---------|---------|----|-------|-----|---------|
+| raw | ✓ | R= | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| qcow2 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| vmdk | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| vhd / vpc | ✓ | ✓‡ 9 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| vhdx | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓‡ 10 | ✓ |
+| luks | ✓ | R= 16 | ✓ 16 | ✓ 16 | ✓ 16 | R= 16 | R= 16 | R= 16 |
+| vdi | ✓ | R‡ 1 | ✓ | ✓ | ✓ | ✓ | R‡ 2 | R‡ 2 |
+| parallels | ✓ | R‡ 3 | ✓ | ✓ | ✓ | ✓ | R‡ 2 | R‡ 2 |
+| qcow (v1) | ✓ | R= 4 | ✓ | ✓ | ✓ | ✓ | R‡ 2 | R‡ 2 |
+| dmg | ✓ | R= 5 | ✓ | ✓ | ✓ | ✓ | ~‡ 6 | ~‡ 6 |
+| qed | ✓ | R‡ 7 | R‡ 7 | R‡ 7 | R‡ 7 | R‡ 7 | R‡ 7 | R‡ 7 |
+| bochs | ✓ | R= 12 | R‡ 11 | R‡ 11 | R‡ 11 | R‡ 11 | R= 12 | R‡ 12 |
+| cloop | ✓ | R= 12 | R‡ 11 | R‡ 11 | R‡ 11 | R‡ 11 | R= 12 | R‡ 12 |
+| iso | ✓ | R= 13 | ✓ 13 | ✓ 13 | ✓ 13 | R‡ 13 | ✓ 13 | ✓ 13 |
+
+### In-place ops
+
+These ops mutate an existing image.
+
+| Format | resize | rebase | commit | amend | snapshot | bitmap |
+|--------|--------|--------|--------|-------|----------|--------|
+| raw | ✓ | R= | R= | R= | R= | R= |
+| qcow2 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| vmdk | ✓‡ 8 | ✓‡ 8 | ✓ 14 | R= | R= | R= |
+| vhd / vpc | ✓‡ 8 | R= | R= | R= | R= | R= |
+| vhdx | ✓‡ 8 | R= | R= | R= | R= | R= |
+| luks | R= 16 | R= | R= | R= | R= | R= |
+| vdi | R= | R= | R= | R= | R= | R= |
+| parallels | R= | R= | R= | R= | R= | R= |
+| qcow (v1) | R= | R= | R= | R= | R= | R= |
+| dmg | ~‡ 6 | R= | R= | R= | R= | R= |
+| qed | R‡ 7 | R‡ 7 | R‡ 7 | R= 7 | R= 7 | R= 7 |
+| bochs | R= | R= | R= | R= | R= | R= |
+| cloop | R= | R= | R= | R= | R= | R= |
+| iso | ✓ 13 | R= | R= | R= | R= | R= |
+
+### Output side
+
+The convert-output / `create` / `dd`-output roster is unchanged by the
+format-coverage programme: instar writes **raw, qcow2, vmdk, vpc (VHD), and
+vhdx** only. qemu-img can additionally *create* vdi / parallels / qcow (v1) /
+qed images; instar refuses those by scope, not by inability (note 15).
+
+| Format | create / convert-output / dd-output |
+|--------|--------------------------------------|
+| raw | ✓ |
+| qcow2 | ✓ |
+| vmdk | ✓ |
+| vhd / vpc | ✓ |
+| vhdx | ✓ |
+| luks | — 15 |
+| vdi | R‡ 15 |
+| parallels | R‡ 15 |
+| qcow (v1) | R‡ 15 |
+| qed | R‡ 15 |
+| dmg | R= 15 |
+| bochs | R= 15 |
+| cloop | R= 15 |
+| iso | — 15 |
+
+### Notes
+
+1. **VDI `check`** — instar refuses (exit 63, "does not support checks");
+   qemu-img validates the VDI block map (rc 0). Recorded in quirks.md phase 2
+   ("`check` Still Refuses VDI; `qemu-img check` Does Not").
+2. **VDI / Parallels / QCOW1 `map` and `measure`** — instar refuses ("source
+   format unrecognised" / "source image is unsupported format"); qemu-img
+   supports both against these sources (rc 0). Deliberate scope divergence,
+   tracked as master-plan future work; QCOW1's is recorded in quirks.md
+   phase 4 ("`check`, `map`, and `measure`"). Measured 2026-07-20 vs
+   qemu-img 10.0.11.
+3. **Parallels `check`** — instar refuses (exit 63); qemu-img has a Parallels
+   check but **asserts and crashes** (`parallels_check_duplicate`) on
+   adversarial BAT input on 10.x, where 6.0.0 reported cleanly — a real qemu
+   regression. Recorded in quirks.md phase 3.
+4. **QCOW1 `check`** — genuine parity: **both** refuse (qemu's qcow driver has
+   no check implementation; instar exits 63 with a "(qcow)"-named message,
+   qemu with a shorter one). Recorded in quirks.md phase 4.
+5. **DMG `check`** — both refuse (exit 63). instar's message names the format
+   **"raw"**, not "dmg", because `check`'s own dispatch never runs the koly
+   trailer probe. Recorded in quirks.md phase 5 ("`check` Names the Format
+   '(raw)', Not '(dmg)'").
+6. **DMG `map` / `measure` / `resize`** — instar treats the UDIF container as a
+   **raw** disk image (the koly probe is wired only into the `info`/convert
+   chain, not these paths), so it returns success against the wrong bytes;
+   qemu-img handles the real DMG for `map`/`measure`, and under filename-probe
+   auto-detection also reads a `.dmg` as raw for `resize`. Recorded in
+   quirks.md phase 1 ("DMG Pass-Through as Raw in the In-Place Ops") and
+   phase 5. Measured 2026-07-20.
+7. **QED (all cells)** — instar refuses every op except `info` **by policy**
+   (nil demand + oslo.utils' explicit QED ban), not by inability. qemu-img
+   performs convert / compare / dd / bench / check / map / measure / resize /
+   rebase / commit on QED (all rc 0), so those are recorded divergences;
+   `amend` / `snapshot` / `bitmap` are R= because qemu-img refuses them on QED
+   too. Full per-op record in quirks.md phase 6 ("QED Read-Refusal Is
+   Deliberate Policy, Not a Parity Gap").
+8. **VMDK / VHD / VHDX `resize` and VMDK `rebase` — instar-only** — qemu-img
+   refuses these on every shipped version ("Image format driver does not
+   support resize / rebase"); instar performs them (monolithicSparse for
+   vmdk). See the Resize and Rebase Format Support tables below. Measured
+   2026-07-20.
+9. **VHD `check` — instar-only** — instar runs full VHD footer/BAT validation
+   (rc 0); qemu-img refuses `check` on vpc ("This image format does not
+   support checks", exit 63). Measured 2026-07-20.
+10. **VHDX `map` — instar-only** — instar emits the VHDX allocation map (rc 0);
+    qemu-img `map` refuses dynamic VHDX ("File contains external, encrypted or
+    compressed clusters", rc 1). Measured 2026-07-20.
+11. **Bochs / cloop convert / compare / dd / bench** — instar refuses via the
+    #444 detect-only gate ("detected but not supported for reading (detection
+    and info only)"); qemu-img reads both (rc 0). Bochs and cloop are
+    detect + info only in instar (quirks.md phase 1). Measured 2026-07-20.
+12. **Bochs / cloop `map` and `measure`** — instar refuses both. qemu-img
+    **measures** both (rc 0) — an R‡ divergence — but its `map` also refuses
+    both ("File contains external, encrypted or compressed clusters"), so `map`
+    is an R= parity refusal. `check` is likewise R= (both exit 63). Measured
+    2026-07-20.
+13. **ISO** — instar reads ISO as **raw** for convert / compare / dd / map /
+    measure / resize, matching qemu-img (which has no ISO driver and also reads
+    it as raw) — the deliberate #444 ISO exemption (quirks.md phase 1).
+    `check` is R= (both exit 63, instar naming "raw"). The one divergence is
+    `bench`, which instar refuses ("bench: unsupported input format") where
+    qemu-img benches the raw container (rc 0). Measured 2026-07-20.
+14. **VMDK `commit`** — parity via explicit `-b base.vmdk`; the implicit-`-b`
+    form is blocked by the info-side `parentFileNameHint` gap. See the Commit
+    Format Support table below.
+15. **Output side** — instar's write roster (raw / qcow2 / vmdk / vpc / vhdx)
+    is deliberately unchanged by this programme (master plan, "Explicitly out
+    of scope: write/create/output support for any new format"). qemu-img
+    additionally *creates* vdi / parallels / qcow / qed (rc 0), which instar
+    refuses by scope (R‡). qemu-img itself refuses `create` for bochs / cloop /
+    dmg ("Format driver ... does not support image creation"), so those are
+    R= parity refusals. luks and iso are not standalone instar output formats
+    (instar's only LUKS-output path is LUKS-encrypted qcow2 via
+    `--luks-encrypt-passphrase`; qemu-img has no iso driver). Measured
+    2026-07-20.
+16. **LUKS non-decrypting ops** — instar's LUKS support is `info` plus
+    decrypting convert / compare / dd via `--luks-passphrase` (see the Input
+    Format Support table). `check` / `bench` / `map` / `measure` and every
+    in-place op refuse; qemu-img cannot open a LUKS container for these without
+    key material (`--object secret`) either, so on a bare LUKS fixture both
+    tools refuse (R=). Measured 2026-07-20.
+
+### vvfat
+
+vvfat is a directory-backed qemu **pseudo-format**: it synthesises a FAT
+filesystem over a host directory on the fly and has **no on-disk single-file
+container**. There is therefore nothing for instar to detect or refuse at the
+file level — vvfat cannot arrive as an image file, so it appears in no row of
+the matrix above.
+
+qemu-img cannot create one either. Re-verified 2026-07-20 against
+qemu-img 10.0.11:
+
+```
+$ qemu-img create -f vvfat /path/to/dir
+qemu-img: /path/to/dir: Format driver 'vvfat' does not support image creation
+```
+
+This satisfies the master plan's success-criteria clause — "Bochs, cloop,
+vvfat (and QED …) produce clean, tested, documented refusals rather than
+misdetection as raw" — for vvfat by documented rationale rather than code:
+there is no on-disk artefact to misdetect, so no detection or refusal path is
+owed.
 
 ---
 
@@ -821,6 +1043,10 @@ cd tests && ../.venv/bin/stestr run test_oslo_crossval
 
 ### Documented Divergences
 
+The table below records instar-vs-oslo.utils divergences. For instar-vs-qemu-img
+divergences per subcommand, see the [qemu-img parity axis](#qemu-img-parity-axis)
+above.
+
 | Area | Image(s) | instar | oslo.utils | Reason |
 |------|----------|-------|-----------|--------|
 | Format | raw-mbr-partitioned, raw-gpt-partitioned | raw | gpt | oslo GPTInspector detects partition tables; instar matches qemu-img |
@@ -859,4 +1085,4 @@ are surfaced as warnings rather than blocking PRs.
 
 ---
 
-*Document updated: 2026-07-20*
+*Document updated: 2026-07-20 (qemu-img parity axis added)*
