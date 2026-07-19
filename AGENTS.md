@@ -53,8 +53,23 @@ The core principle: **never parse untrusted data with host privileges**.
 
 ### Supported Formats
 
-Target formats: qcow2 (including external data files), raw, vmdk, vpc (VHD),
-vhdx (VHDX), luks (info + convert with decryption)
+Write formats (create / convert-output / dd-output): qcow2 (including
+external data files), raw, vmdk, vpc (VHD), vhdx (VHDX).
+
+luks: info + decrypting convert / compare / dd (v1/v2; no create/write).
+
+Read-only input formats (convert / compare / dd / bench source; no
+create/write): vdi, parallels (both magics), qcow (QCOW1, including
+backing chains and compressed clusters), dmg (UDIF, zlib/raw/zero/ignore
+chunk codecs).
+
+Detection + info only (no read path): bochs, cloop.
+
+qed: detected; every other op refused by policy (nil demand plus
+oslo.utils' explicit ban), not by inability.
+
+See [docs/format-coverage.md](docs/format-coverage.md)'s qemu-img
+parity axis for the full op × format matrix.
 
 ### Operations
 

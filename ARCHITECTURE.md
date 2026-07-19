@@ -249,8 +249,9 @@ provides a modular architecture with:
   write/output support. Linked into the qcow2 crate's chain reader
   behind the `parallels-input` feature and used by convert, compare,
   bench, and rebase (PLAN-format-coverage phase 3).
-- **crates/qcow1/** - Shared QCOW1 ("qcow", qemu's original deprecated
-  format) crate: header parsing and validation against qemu's exact
+- **crates/qcow1/** - Shared QCOW1 ("qcow", qemu's original
+  copy-on-write format, superseded by qcow2 but not formally
+  deprecated by qemu) crate: header parsing and validation against qemu's exact
   RO `qcow_open` rules (magic + version == 1, `cluster_bits`/`l2_bits`
   ranges, size bounds including the empirically-pinned "Image too
   large" boundary, `crypt_method` <= 1 at parse, backing-file-name

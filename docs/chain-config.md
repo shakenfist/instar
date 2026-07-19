@@ -67,6 +67,11 @@ chain config.
 | 9 | `Qed` | QED (read-refused by policy, not because qemu deprecates it — see `docs/quirks.md` "Format-coverage phase 6") |
 | 10 | `Iso` | ISO 9660 |
 | 11 | `Luks` | LUKS encrypted container |
+| 12 | `VmdkDescriptor` | VMDK monolithicFlat descriptor file (text; content lives in a separate flat extent file) |
+| 13 | `Parallels` | Parallels Disk Image, both magics — full read support (convert/compare/dd/bench) as of PLAN-format-coverage phase 3 |
+| 14 | `Bochs` | Bochs growing disk image — detection and info only, no read path |
+| 15 | `Cloop` | cloop compressed loopback image — detection and info only, no read path |
+| 16 | `Dmg` | Apple UDIF disk image — full read support (convert/compare/dd/bench) as of PLAN-format-coverage phase 5 |
 
 ## Feature Flags
 

@@ -873,7 +873,8 @@ qcow2-luks).
     `measure`, and `resize` are unchanged refusals.
 
 20. **QCOW1 Input Support** - Convert, compare, dd, and bench
-    support QCOW1 ("qcow", qemu's original deprecated format) as
+    support QCOW1 ("qcow", qemu's original copy-on-write format,
+    superseded by qcow2 but not formally deprecated by qemu) as
     read-only input, including backing chains and compressed
     clusters (`src/crates/qcow1/`, PLAN-format-coverage phase 4).
     This phase also **fixed a pre-existing detection defect**: real

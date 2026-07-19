@@ -15,17 +15,23 @@ provides a reading order and annotated walkthrough of the codebase.
 
 ## Supported Formats
 
-Initial target formats:
+Supported formats:
 - **qcow2** - QEMU Copy-On-Write format (including external data files)
 - **raw** - Raw disk images
 - **vmdk** - VMware Virtual Machine Disk
 - **vpc** (VHD) - Virtual Hard Disk (Hyper-V, Virtual PC)
 - **vhdx** - VHDX Virtual Hard Disk v2 (Hyper-V)
 - **luks** - LUKS encrypted containers (v1/v2, info + convert with decryption)
-- **vdi** - VirtualBox Disk Image (read-only input: convert/compare/dd source; no create/write)
+- **vdi** - VirtualBox Disk Image (read-only input: convert/compare/dd/bench source; no create/write)
 - **parallels** - Parallels Disk Image, both magics (read-only input: convert/compare/dd/bench source; no create/write)
-- **qcow** (QCOW1) - qemu's original deprecated format, including backing chains and compressed clusters (read-only input: convert/compare/dd/bench source; no create/write)
+- **qcow** (QCOW1) - qemu's original copy-on-write format (superseded by qcow2 but not formally deprecated by qemu), including backing chains and compressed clusters (read-only input: convert/compare/dd/bench source; no create/write)
 - **dmg** - Apple UDIF disk image (koly trailer, XML-plist and resource-fork chunk tables, zero/raw/ignore/zlib chunk codecs; read-only input: convert/compare/dd/bench source; no create/write)
+
+Also detected: **bochs** and **cloop** (detection + info only — no read
+path) and **qed** (detected; every other op refused by policy, not by
+inability). See [docs/format-coverage.md](docs/format-coverage.md)'s
+qemu-img parity axis for the full op × format matrix, including where
+instar diverges from qemu-img.
 
 ## Project Status
 

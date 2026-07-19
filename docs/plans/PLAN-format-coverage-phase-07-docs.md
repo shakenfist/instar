@@ -2,7 +2,7 @@
 
 Master plan: [PLAN-format-coverage.md](PLAN-format-coverage.md)
 
-## Status: Ready for execution (planned 2026-07-20)
+## Status: Complete (2026-07-20)
 
 ## Prompt
 
@@ -244,21 +244,201 @@ Two steps complete the phase — and the master plan.
 
 Sequencing: 7a then 7b (7b's close-out cites 7a's axis).
 
+## Findings: step 7a — the qemu-img parity axis (2026-07-20)
+
+Landed as commit `de1c3bc` ("docs: add the qemu-img parity axis.").
+
+* Widened `docs/format-coverage.md`'s purpose statement (:3-16) to the
+  dual charter: oslo.utils `format_inspector` parity (met in full, the
+  original mission) AND qemu-img roster coverage (the new mission),
+  pointing at the new "qemu-img parity axis" section.
+* Added the consolidated section: a legend (six symbols — ✓, ✓‡, R‡,
+  R=, ~‡, —), three tables (read-side ops: info/check/convert/compare/
+  dd/bench/map/measure × 14 formats; in-place ops: resize/rebase/
+  commit/amend/snapshot/bitmap × 14 formats; output side: the
+  unchanged five-format create/convert-output/dd-output roster), 16
+  numbered notes, and a vvfat subsection.
+* **Sourcing**: every cell either cites one of the six `docs/quirks.md`
+  "Format-coverage phase N" sections (phases 1-6, cross-linked at the
+  top of the axis section) or an existing format-coverage.md table, or
+  was measured fresh on 2026-07-20 against the built instar and
+  qemu-img 10.0.11 using existing instar-testdata fixtures. **Zero
+  conflicts** were found between a fresh measurement and any existing
+  recorded fact — the sourcing-rule's failure mode (a plausible-but-
+  wrong claim about qemu's behaviour, as happened twice earlier in the
+  programme) did not recur this phase.
+* **Fresh-measurement highlights** (notes 2, 6, 8, 9, 10, 11, 12, 13,
+  15, 16 in the axis carry a "Measured 2026-07-20" tag; the vvfat
+  claim was also re-verified):
+  * Instar-only capabilities where qemu-img refuses: VHD `check` (rc
+    0 vs qemu-img's exit-63 "This image format does not support
+    checks"), VHDX `map` (rc 0 vs qemu-img's rc 1 "File contains
+    external, encrypted or compressed clusters"), and VMDK/VHD/VHDX
+    `resize` plus VMDK `rebase` (qemu-img refuses all of these on
+    every shipped version).
+  * VDI `bench` — rc 0 parity (both tools), confirming VDI belongs on
+    the same "convert/compare/dd/bench source" footing as parallels/
+    qcow1/dmg rather than the older "convert/compare/dd source"
+    wording (this is what motivated the 7b README consistency fix).
+  * Bochs/cloop `measure` is an R‡ divergence (qemu-img measures both,
+    rc 0; instar refuses both) while their `map` is an R= parity
+    refusal (both refuse — qemu-img's own `map` fails with "File
+    contains external, encrypted or compressed clusters").
+  * ISO's one divergence across the whole read-side row is `bench`:
+    instar refuses ("bench: unsupported input format") where qemu-img
+    benches the raw container (rc 0); every other read-side op is
+    parity via the #444 raw pass-through exemption.
+  * LUKS non-decrypting ops (check/bench/map/measure, every in-place
+    op) are R= — on a bare LUKS fixture with no key material, qemu-img
+    cannot open it either, so neither tool's refusal counts as a
+    divergence.
+  * `qemu-img create -f vvfat /path/to/dir` re-verified against
+    qemu-img 10.0.11: `Format driver 'vvfat' does not support image
+    creation` — unchanged from the master plan's original Situation
+    citation.
+  * **Management independently re-verified three of the fresh
+    measurements** during review (VHD `check` rc 0 where qemu-img
+    refuses; VHDX `map` rc 0 where qemu-img rc 1; VDI `bench` both rc
+    0) and found the axis's cells accurate as written.
+* Docs-only diff: no code, test, or testdata files touched.
+
+## Findings: step 7b — consistency fixes + master-plan close-out (2026-07-20)
+
+* **`AGENTS.md`** (`:54-70`): replaced the stale Supported Formats
+  section (which still read "qcow2 ..., raw, vmdk, vpc, vhdx, luks"
+  and omitted vdi/parallels/qcow1/dmg entirely) with the real roster
+  in the file's terse style — write formats, luks, the four read-only
+  input formats, the two detection-only formats, the QED policy
+  refusal — with a pointer to `docs/format-coverage.md`'s parity axis.
+* **`README.md`**: changed the "Initial target formats:" heading
+  (:18) to "Supported formats:" (the programme is no longer initial);
+  added a line after the format list (:30) noting bochs/cloop
+  (detection + info only) and qed (policy-refused) with a link to
+  `docs/format-coverage.md`.
+  * **Consistency fix verified, not blindly applied**: the VDI line
+    (:25) read "convert/compare/dd source" while the parallels/qcow/
+    dmg lines already read "convert/compare/dd/bench source". Checked
+    `tests/test_bench.py` directly rather than trusting the brief:
+    `test_bench_vdi_simple` (`:2053-2076`) asserts `instar bench -f
+    vdi vdi-simple` exits 0 with header parity against `qemu-img
+    bench` on the same fixture — a live, passing pin, not aspirational
+    — and the Makefile's qcow2 test-feature line
+    (`cargo test --release -p qcow2 --features
+    "create,vdi-input,parallels-input,qcow1-input,dmg-input"`, `:514`)
+    confirms `vdi-input` is a real, wired feature. Corrected the line
+    to "convert/compare/dd/bench source" to match.
+* **Master plan (`PLAN-format-coverage.md`)**:
+  * Added a `## Status: Complete (2026-07-20)` header (this master
+    plan had none; several sibling master plans — e.g.
+    `PLAN-release-v0.2.md`, `PLAN-distro-matrix-ci.md` — carry one at
+    the same position, so this follows an existing, if inconsistent,
+    convention rather than inventing a new one).
+  * Execution row 7 → Complete (2026-07-20, commit `de1c3bc` for 7a
+    plus the 7b close-out commit).
+  * Success-criteria sweep: every one of the twelve bullets now
+    carries an inline **Satisfied**/**Satisfied by phase N** evidence
+    annotation, in phase 6's inline style. The two previously-owing
+    bullets (the parity-axis doc; AGENTS/README consistency) are now
+    satisfied by 7a/7b; the vvfat clause is satisfied by 7a's
+    documented rationale. All evidence is cited from phase Findings —
+    no suite was re-run for this sweep.
+  * Added a "Programme retrospective" section (before "Future work",
+    following the `PLAN-qcow2-write-infrastructure.md` precedent): a
+    seven-phase outcome table, the shipped-capability summary, the
+    bugs-fixed list, and the verification posture.
+* **`docs/plans/index.md`**: the format-coverage row's Status column →
+  a full outcome-summary paragraph (matching the bench/qcow2-write-
+  infrastructure completed-row idiom, which embeds the summary in the
+  Status cell rather than the Intent cell) plus phase-7 link
+  check-marked.
+* **This plan file**: Status → Complete; these two Findings sections.
+* **Final consistency grep** (README.md, ARCHITECTURE.md, AGENTS.md,
+  `docs/*.md`, `docs/commentary/*.md`) — every hit and disposition:
+  * `ARCHITECTURE.md` — already current (confirmed, not changed): all
+    four new crates (`vdi`, `parallels`, `qcow1`, `dmg`) are correctly
+    described with their read-path status.
+  * `docs/index.md` (:72) — the Format Coverage doc-index row still
+    described format-coverage.md as "Comparison with oslo.utils
+    format_inspector, test coverage gaps" only, not mentioning the new
+    qemu-img parity axis. **Fixed**: reworded to mention both the
+    oslo.utils comparison and the qemu-img parity axis.
+  * `docs/chain-config.md` (ImageFormat Values table, :56-68) — the
+    table stopped at value 11 (`Luks`) and was missing rows 12-16
+    (`VmdkDescriptor`, `Parallels`, `Bochs`, `Cloop`, `Dmg`) even
+    though `src/shared/src/lib.rs`'s `ImageFormat` enum (which this
+    table transcribes) has carried those variants since phases 1/3/5.
+    **Fixed**: added the five missing rows, correctly describing
+    Parallels and Dmg as graduated to full read support (phases 3/5)
+    and Bochs/Cloop as still detection-and-info-only.
+  * `src/shared/src/lib.rs` (:1559-1570) — **found but NOT fixed
+    (out of scope: code, not docs)**: the enum doc comments on
+    `Parallels = 13` and `Dmg = 16` still read "Detection and info
+    only; no read path," which is now stale — both formats graduated
+    to full convert/compare/dd/bench read support in phases 3 and 5
+    respectively. This is a genuine contradiction the axis surfaced,
+    but fixing it is a one-line code comment change outside this
+    docs-only phase's scope (and outside phase 7's "no code changes"
+    Decision). Flagged here for a trivial follow-up rather than
+    silently left undiscovered.
+  * No other stale claims found: `README.md`, `AGENTS.md`,
+    `docs/quirks.md`, `docs/map.md`, `docs/testing.md`,
+    `docs/technology-primer.md`, `docs/commentary/*.md`,
+    `docs/usage.md`, `docs/security.md`, and `docs/configuration.md`
+    were all checked; the non-format-coverage docs mentioning vdi/
+    parallels/bochs/cloop/dmg either predate and are unaffected by
+    this programme (CVE/usage-analysis context) or already carry the
+    correct current status.
+* **A count discrepancy caught while writing the retrospective**: this
+  plan's own Design/Step-guidance text (§ Design 7b, step 7b's brief)
+  says "four instar-testdata defects," but the master plan's "Bugs
+  fixed during this work" section — the authoritative source this step
+  was told to cite rather than re-deriving — records exactly three
+  testdata-specific defects (parallels driver missing from the 6.x
+  static builds; stale committed `profiles/`/`version-map.json`;
+  `detect-profiles.py` corrupting regenerated profiles). Phase 6's QED
+  baseline retirement is a separate, correctly-scoped cleanup executed
+  per the phase-6 policy decision, not a "defect" in that section's
+  sense. The retrospective records three testdata defects and notes
+  the discrepancy rather than inflating the count to match the plan
+  text's passing phrase.
+* **Management-review addition (one stale claim the grep missed)**:
+  three live docs still called QCOW1 "qemu's original deprecated
+  format" (`README.md:27`, `ARCHITECTURE.md:252`, and
+  format-coverage.md's narrative item 20). The phase-6 hand-off
+  explicitly extended the corrected qemu-deprecation framing to
+  qcow1, and a fresh sweep of every vendored qemu version's
+  `deprecated.rst`/`removed-features.rst` in instar-testdata
+  (2026-07-20) confirms no qcow-v1 entry exists in any of them. All
+  three corrected to "qemu's original copy-on-write format,
+  superseded by qcow2 but not formally deprecated by qemu". The
+  quirks.md phase-4 section's own parenthetical (:3122) and the
+  master plan's historical Situation table keep the original wording
+  as historical record, per the phase-6 precedent (live docs
+  corrected, historical records annotated rather than rewritten).
+* No code, test, or testdata files were touched in this step; `git
+  status --short` at hand-off shows only doc-file modifications.
+
 ## Verification (management-session review checklist)
 
-- [ ] Docs-only diff; no code, tests, or testdata touched.
-- [ ] Every parity-axis cell has a citation or an explicit
+- [x] Docs-only diff; no code, tests, or testdata touched.
+      (One stale code comment found by 7b's grep was flagged
+      in the Findings for follow-up, not changed.)
+- [x] Every parity-axis cell has a citation or an explicit
       fresh measurement in the 7a report; spot-check cells
       against their cited quirks sections, and re-run at
       least two of the fresh measurements independently.
-- [ ] Any measurement-vs-quirks conflict was surfaced, not
-      silently patched.
-- [ ] AGENTS.md roster matches reality; vvfat rationale
+      (Management re-ran three: VHD check, VHDX map, VDI
+      bench — all matched.)
+- [x] Any measurement-vs-quirks conflict was surfaced, not
+      silently patched. (Zero conflicts; the QED
+      backingless-vs-overlay rebase/commit nuance was
+      reported and resolved as non-conflicting.)
+- [x] AGENTS.md roster matches reality; vvfat rationale
       present; charter statement widened.
-- [ ] Master plan: row 7 Complete, every success-criteria
+- [x] Master plan: row 7 Complete, every success-criteria
       bullet carries evidence, retrospective present,
       status Complete; index.md consistent.
-- [ ] pre-commit clean; commit messages per conventions.
+- [x] pre-commit clean; commit messages per conventions.
 
 ## Success criteria
 
