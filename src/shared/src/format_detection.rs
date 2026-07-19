@@ -90,6 +90,21 @@ pub const CLOOP_MAGIC: &[u8] =
 pub const DMG_KOLY_MAGIC: [u8; 4] = *b"koly";
 /// Size of the koly trailer block.
 pub const DMG_KOLY_TRAILER_LEN: usize = 512;
+/// Offset within the koly trailer of the BE u64 DataForkOffset field
+/// (`dmg_open` reads `offset + 0x18`; must be `<=` the koly file offset).
+pub const DMG_KOLY_DATA_FORK_OFFSET_OFFSET: usize = 0x18;
+/// Offset within the koly trailer of the BE u64 RsrcForkOffset field
+/// (`dmg_open` reads `offset + 0x28`).
+pub const DMG_KOLY_RSRC_FORK_OFFSET_OFFSET: usize = 0x28;
+/// Offset within the koly trailer of the BE u64 RsrcForkLength field
+/// (`dmg_open` reads `offset + 0x30`).
+pub const DMG_KOLY_RSRC_FORK_LENGTH_OFFSET: usize = 0x30;
+/// Offset within the koly trailer of the BE u64 XMLOffset field
+/// (`dmg_open` reads `offset + 0xd8`).
+pub const DMG_KOLY_XML_OFFSET_OFFSET: usize = 0xd8;
+/// Offset within the koly trailer of the BE u64 XMLLength field
+/// (`dmg_open` reads `offset + 0xe0`).
+pub const DMG_KOLY_XML_LENGTH_OFFSET: usize = 0xe0;
 /// Offset within the koly trailer of the BE u64 SectorCount field.
 pub const DMG_KOLY_SECTOR_COUNT_OFFSET: usize = 0x1ec;
 
@@ -390,6 +405,110 @@ pub fn dmg_sector_count(buffer: &[u8], len: usize, koly_offset: usize) -> Option
     }
 
     Some(raw)
+}
+
+/// The subset of the DMG koly trailer the UDIF reader needs, extracted
+/// verbatim from the trailer bytes.
+///
+/// This is a *pure extraction*: the fields are returned raw (subject only
+/// to lying within the supplied buffer). qemu's `dmg_open` validation
+/// (`data_fork_offset <= koly_offset`; the resource-fork and XML region
+/// bounds; the negative-SectorCount refusal) is applied by the reader
+/// crate so it can attribute a distinct, typed refusal to each failing
+/// check. `sector_count_raw` is the unmodified BE u64; callers reject a
+/// set top bit (qemu's `bs->total_sectors < 0`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DmgKolyTrailer {
+    /// Absolute file offset of the koly magic (== file length − 512).
+    pub koly_offset: u64,
+    /// DataForkOffset (BE u64 @ `koly + 0x18`).
+    pub data_fork_offset: u64,
+    /// RsrcForkOffset (BE u64 @ `koly + 0x28`).
+    pub rsrc_fork_offset: u64,
+    /// RsrcForkLength (BE u64 @ `koly + 0x30`).
+    pub rsrc_fork_length: u64,
+    /// XMLOffset (BE u64 @ `koly + 0xd8`).
+    pub xml_offset: u64,
+    /// XMLLength (BE u64 @ `koly + 0xe0`).
+    pub xml_length: u64,
+    /// Raw SectorCount (BE u64 @ `koly + 0x1ec`); caller refuses a set
+    /// top bit.
+    pub sector_count_raw: u64,
+}
+
+/// Find the LAST `koly` magic in a device tail buffer.
+///
+/// A virtio-block device reports a sector-rounded-up capacity, so the
+/// real DMG trailer (the file's final 512 bytes) can sit mid-buffer with
+/// a zero-filled tail after it; a stray earlier `koly` in the data would
+/// be shadowed by the real one. This scans the whole buffer and returns
+/// the index of the last occurrence, which the caller pairs with the
+/// buffer's device base to recover the true file length. Mirrors the
+/// last-match loop in the info op's `probe_dmg_trailer`; factored here so
+/// the reader crate reuses it rather than duplicating the recovery math.
+///
+/// Returns the byte index of the last `koly` magic, or `None` if the
+/// magic does not appear.
+pub fn find_last_dmg_koly(tail: &[u8]) -> Option<usize> {
+    let mut found: Option<usize> = None;
+    let mut i = 0usize;
+    while i + DMG_KOLY_MAGIC.len() <= tail.len() {
+        if tail[i..i + DMG_KOLY_MAGIC.len()] == DMG_KOLY_MAGIC {
+            found = Some(i);
+        }
+        i += 1;
+    }
+    found
+}
+
+/// Extract the koly trailer fields the UDIF reader needs.
+///
+/// `buffer` holds the final `buffer.len()` bytes of the file (so
+/// `buffer[i]` is file byte `len - buffer.len() + i`), exactly like the
+/// buffer passed to [`detect_dmg_koly_offset`]/[`dmg_sector_count`].
+/// `koly_offset` is the absolute file offset of the koly magic as
+/// returned by [`detect_dmg_koly_offset`].
+///
+/// Returns `Some` with the raw field values if every field lies entirely
+/// within both `buffer` and the file. Applies NO semantic validation —
+/// that is the reader crate's job (see [`DmgKolyTrailer`]). Returns
+/// `None` only when a field cannot be read in-bounds.
+pub fn parse_dmg_koly(buffer: &[u8], len: usize, koly_offset: usize) -> Option<DmgKolyTrailer> {
+    let buffer_base = len.saturating_sub(buffer.len());
+
+    // Read a BE u64 field at `koly_offset + field_off`, bounds-checked
+    // against both the file length and the supplied buffer window.
+    let read_field = |field_off: usize| -> Option<u64> {
+        let field_offset = koly_offset.checked_add(field_off)?;
+        let field_end = field_offset.checked_add(8)?;
+        if field_offset < buffer_base || field_end > len {
+            return None;
+        }
+        let idx = field_offset - buffer_base;
+        if idx + 8 > buffer.len() {
+            return None;
+        }
+        Some(u64::from_be_bytes([
+            buffer[idx],
+            buffer[idx + 1],
+            buffer[idx + 2],
+            buffer[idx + 3],
+            buffer[idx + 4],
+            buffer[idx + 5],
+            buffer[idx + 6],
+            buffer[idx + 7],
+        ]))
+    };
+
+    Some(DmgKolyTrailer {
+        koly_offset: koly_offset as u64,
+        data_fork_offset: read_field(DMG_KOLY_DATA_FORK_OFFSET_OFFSET)?,
+        rsrc_fork_offset: read_field(DMG_KOLY_RSRC_FORK_OFFSET_OFFSET)?,
+        rsrc_fork_length: read_field(DMG_KOLY_RSRC_FORK_LENGTH_OFFSET)?,
+        xml_offset: read_field(DMG_KOLY_XML_OFFSET_OFFSET)?,
+        xml_length: read_field(DMG_KOLY_XML_LENGTH_OFFSET)?,
+        sector_count_raw: read_field(DMG_KOLY_SECTOR_COUNT_OFFSET)?,
+    })
 }
 
 /// Detect ISO 9660 format from buffer at the standard offset.
