@@ -15,7 +15,7 @@ instar/
 ├── src/            # Main instar implementation
 │   ├── vmm/        # Virtual machine monitor (host-side)
 │   ├── core/       # Core guest initialization
-│   ├── crates/     # Shared format crates (qcow2, raw, vmdk, vhd, vhdx, luks)
+│   ├── crates/     # Shared format crates (qcow2, raw, vmdk, vhd, vhdx, luks, vdi, parallels, qcow1, dmg)
 │   ├── shared/     # Shared library code (byte-order helpers, configs)
 │   ├── operations/ # Pluggable operations (info, copy, check, compare, convert, dd, measure, create, resize, rebase, commit, map, snapshot, amend, bitmap, bench)
 │   └── build.sh    # Build script
@@ -179,8 +179,9 @@ parity axis for the full op × format matrix.
   sandboxed I/O path (guest format layer → virtio-block → host I/O
   thread) rather than qemu's block layer over the page cache, so the
   two tools' numbers are comparable only to each other on an identical
-  invocation, never in isolation. Reads all five formats; write tests
-  (`-w`) are supported on raw and qcow2 only, including qcow2 overlays.
+  invocation, never in isolation. Reads all nine formats (raw, qcow2,
+  vmdk, vhd, vhdx, vdi, parallels, qcow1, dmg); write tests (`-w`) are
+  supported on raw and qcow2 only, including qcow2 overlays.
   The qcow2 `-w` path runs on the shared `crates/qcow2-write` planner
   and `crates/qcow2-write-exec` executor (third consumer after commit
   and rebase; PLAN-qcow2-write-infrastructure phase 6), and the

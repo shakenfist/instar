@@ -1544,7 +1544,9 @@ pub enum ImageFormat {
     Qcow1 = 7,
     /// VDI format (VirtualBox, magic: 0xbeda107f at offset 64)
     Vdi = 8,
-    /// QED format (deprecated QEMU format, magic: 0x00444551 "QED\0")
+    /// QED format (magic: 0x00444551 "QED\0"). Read-refused by
+    /// policy — qemu does not deprecate QED, see docs/quirks.md
+    /// format-coverage phase 6.
     Qed = 9,
     /// ISO 9660 format (CD/DVD image, magic: "CD001" at offset 0x8001)
     Iso = 10,
@@ -1557,7 +1559,8 @@ pub enum ImageFormat {
     VmdkDescriptor = 12,
     /// Parallels disk image (magic: "WithoutFreeSpace" or
     /// "WithouFreSpacExt" at offset 0, version 2 at offset 16).
-    /// Detection and info only; no read path.
+    /// Full read support (convert/compare/dd/bench) since
+    /// PLAN-format-coverage phase 3.
     Parallels = 13,
     /// Bochs growing disk image (magic: "Bochs Virtual HD Image" /
     /// "Redolog" / "Growing" NUL-terminated fields, version at
@@ -1567,7 +1570,8 @@ pub enum ImageFormat {
     /// magic at offset 0). Detection and info only; no read path.
     Cloop = 15,
     /// Apple disk image (UDIF), identified by a "koly" trailer near
-    /// the end of the file. Detection and info only; no read path.
+    /// the end of the file. Full read support (convert/compare/dd/
+    /// bench) since PLAN-format-coverage phase 5.
     Dmg = 16,
 }
 

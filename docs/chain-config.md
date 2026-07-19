@@ -62,8 +62,8 @@ chain config.
 | 4 | `Vmdk3` | VMDK version 3 (COWD) |
 | 5 | `Vhd` | VHD/VPC |
 | 6 | `Vhdx` | VHDX |
-| 7 | `Qcow1` | QCOW version 1 |
-| 8 | `Vdi` | VDI (VirtualBox) |
+| 7 | `Qcow1` | QCOW version 1 — full read support (convert/compare/dd/bench) as of PLAN-format-coverage phase 4 |
+| 8 | `Vdi` | VDI (VirtualBox) — full read support (convert/compare/dd/bench) as of PLAN-format-coverage phase 2 |
 | 9 | `Qed` | QED (read-refused by policy, not because qemu deprecates it — see `docs/quirks.md` "Format-coverage phase 6") |
 | 10 | `Iso` | ISO 9660 |
 | 11 | `Luks` | LUKS encrypted container |

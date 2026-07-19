@@ -1055,6 +1055,72 @@ process the inner image without modification. LUKS v2 containers
 using Argon2id KDF require `--max-guest-memory` to allocate the
 working memory needed for key derivation.
 
+### vdi
+
+VirtualBox Disk Image. Read-only input for convert / compare / dd /
+bench (`src/crates/vdi/`, PLAN-format-coverage phase 2), both
+dynamic and static images. Key structures: a single header
+(validated against qemu's 12 open-time rules) plus a flat block
+map, walked with an allocation-order lookup through the standard
+sector-cached read path. Discarded and unallocated block-map
+entries read as zeros, and reads at or past device capacity
+zero-fill rather than error, matching qemu's lack of length
+validation. `check` still refuses VDI (exit 63); `map`, `measure`,
+and `resize` are unchanged refusals. See
+[docs/format-coverage.md](docs/format-coverage.md) and
+[docs/quirks.md](docs/quirks.md) for the full parity and quirks
+detail.
+
+### parallels
+
+Parallels disk images. Read-only input for convert / compare / dd /
+bench (`src/crates/parallels/`, PLAN-format-coverage phase 3),
+both the legacy "WithoutFreeSpace" (v1) and "WithouFreSpacExt"
+(v2/ext) magics. Key structures: a header (tracks, catalog/BAT
+size, `ext_off`) plus a per-magic BAT (sector-valued under v1,
+cluster-valued under v2), walked through the standard sector-cached
+read path. BAT value 0 and offsets beyond BAT coverage read as
+zeros; `ext_off != 0` is refused at init (a deliberate divergence —
+instar does not parse the format extension). `check` still refuses
+Parallels (exit 63); `map`, `measure`, and `resize` are unchanged
+refusals. See [docs/format-coverage.md](docs/format-coverage.md)
+and [docs/quirks.md](docs/quirks.md) for the full parity and
+quirks detail.
+
+### qcow1 (qcow)
+
+QEMU's original copy-on-write format ("qcow", superseded by qcow2
+but not formally deprecated by qemu). Read-only input for convert /
+compare / dd / bench (`src/crates/qcow1/`, PLAN-format-coverage
+phase 4), including backing chains and compressed clusters. Key
+structures: a header plus two-level (L1/L2) block lookup, with
+compressed clusters as raw DEFLATE (no zlib wrapper) — distinct
+from qcow2's zlib-first decompression helper. QCOW1 is the first
+non-QCOW2 backing format: unallocated clusters fall through to the
+next chain device rather than zero-filling. `check` still refuses
+QCOW1 (exit 63) — genuine parity, since qemu's own qcow driver also
+refuses checks. `map` and `measure` stay refusals (a deliberate
+divergence; qemu supports both on qcow1). See
+[docs/format-coverage.md](docs/format-coverage.md) and
+[docs/quirks.md](docs/quirks.md) for the full parity and quirks
+detail.
+
+### dmg
+
+Apple UDIF disk image. Read-only input for convert / compare / dd /
+bench (`src/crates/dmg/`, PLAN-format-coverage phase 5). Key
+structures: the koly trailer (shared trailer helpers), the
+XML-plist or resource-fork chunk table, and per-sector chunk
+lookup. Supports zlib, raw, ADC, bzip2, and LZFSE-compressed
+chunks. The read-error model inverts every prior phase's posture:
+most malformed inputs are refused rather than best-effort parsed.
+DMG is supported at any backing-chain position. `check` still
+refuses DMG (exit 63), but the refusal reports format `"raw"`, not
+`"dmg"`, matching qemu-img's passthrough divergence. See
+[docs/format-coverage.md](docs/format-coverage.md) and
+[docs/quirks.md](docs/quirks.md) for the full parity and quirks
+detail.
+
 ## Test Image Generation
 
 Synthetic test images that cannot be created by `qemu-img` are built
@@ -1229,11 +1295,17 @@ A mock `CallTable` (in `src/fuzz/src/lib.rs`) backed by thread-local
 fuzzer input provides sector-based I/O, allowing libFuzzer to explore
 deeply malformed inputs.
 
-32 fuzz targets cover all parser crates: format detection, header
-parsing (QCOW2, VMDK, VHD, VHDX, RAW, LUKS), L1/L2 cluster lookup,
-refcount table traversal, zlib decompression, grain directory lookup,
-BAT traversal, VHDX metadata parsing, the measure subcommand's
-calculator math (`fuzz_measure_calc`) and the per-parser
+40 fuzz targets cover all parser crates: format detection, header
+parsing (QCOW2, VMDK, VHD, VHDX, VDI, Parallels, QCOW1, DMG, RAW,
+LUKS), L1/L2 cluster lookup, refcount table traversal, zlib
+decompression, grain directory lookup, BAT traversal, VHDX metadata
+parsing, VDI header parsing and block-map lookup
+(`fuzz_vdi_header`, `fuzz_vdi_bat`), Parallels header parsing and
+BAT lookup (`fuzz_parallels_header`, `fuzz_parallels_bat`), QCOW1
+header parsing and L1/L2 lookup (`fuzz_qcow1_header`,
+`fuzz_qcow1_table`), and DMG koly-trailer/chunk-table parsing and
+per-chunk decode (`fuzz_dmg_table`, `fuzz_dmg_chunk`), the measure
+subcommand's calculator math (`fuzz_measure_calc`) and the per-parser
 `scan_allocation` entry points (`fuzz_measure_scan`), the map
 subcommand's per-parser `map_extents` entry points (`fuzz_map_iter`
 — exercises `qcow2::Qcow2State::map_extents` and the vmdk / vhd /

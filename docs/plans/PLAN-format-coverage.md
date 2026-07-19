@@ -749,6 +749,30 @@ chosen to defer to here so that we don't forget them.
   `measure` / `dd` support for the new input formats" bullet above,
   which now also applies to qcow1's map/measure gap specifically —
   `dd` itself is already supported for qcow1).
+* A `--no-commit`-style output-type-limiting flag for
+  `instar-testdata`'s `generate-baselines.py`: recorded as
+  recommended in the phase-2 findings and manually worked around
+  in phases 3-6, but never centrally tracked until now.
+* Report oslo.utils' qcow1-misdetected-as-qcow2 behaviour
+  upstream (phase-4 finding; parallel to the two qemu
+  upstream-report items already listed above).
+* Extract a shared rounds-protocol-length helper in
+  `src/vmm/src/main.rs` so the human and JSON info emitters
+  can't drift (pre-push audit, code-quality advisory; mirrors
+  the existing `should_emit_encrypted_line` pattern).
+* Evaluate a shared resolve-and-read-span helper across all six
+  chain-reader arms (VHD/VMDK/VDI/Parallels/Qcow1/Dmg) in
+  `src/crates/qcow2` (pre-push audit advisory; the duplication
+  predates this branch).
+* Tidy `src/operations/info`'s `probe_dmg_trailer` to use
+  `checked_mul` like the dmg crate's `read_koly` (pre-push audit
+  security-informational; operands are host-controlled, not
+  attacker-reachable).
+* Update `.github/workflows/functional-tests.yml`'s inline
+  cargo-test list and `coverage-fuzz.yml`'s `TARGETS` array
+  mechanism so they can't drift from the Makefile/fuzz crate
+  again (being fixed point-in-time by this audit; the structural
+  drift-proofing is future work).
 
 ### Bugs fixed during this work
 

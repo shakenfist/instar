@@ -743,6 +743,10 @@ instar/
 │   │   ├── vhdx/   # VHDX headers, region table, metadata, BAT, CRC-32C
 │   │   ├── vmdk/   # VMDK4 header and descriptor parsing
 │   │   ├── luks/   # LUKS header parsing, KDF, AFsplitter, decryption
+│   │   ├── vdi/    # VDI header parsing, block-map lookup
+│   │   ├── parallels/ # Parallels header parsing, BAT lookup
+│   │   ├── qcow1/  # QCOW1 (v1) header, L1/L2 block-lookup
+│   │   ├── dmg/    # DMG koly trailer, chunk-table, chunk lookup
 │   │   └── ...     # Per-operation planner crates (measure, create,
 │   │               # resize, rebase, commit, snapshot)
 │   ├── operations/ # Pluggable operations (info, copy, check, compare, convert, measure, create, resize, rebase, commit, map, snapshot, amend, dd, bitmap, bench)
@@ -942,19 +946,19 @@ cd src/fuzz
 cargo fuzz run fuzz_qcow2_header -- -max_total_time=60
 ```
 
-32 fuzz targets cover all parser crates (QCOW2, VMDK, VHD, VHDX, RAW,
-LUKS) including header parsing, L1/L2 lookup, refcount traversal, and
-decompression, plus the create / resize / rebase / commit planners,
-the qcow2 check-repair planners (`fuzz_check_repair`), the map extent
-walkers, the snapshot table parser (`fuzz_snapshot_parse`), the
-snapshot refcount mutators (`fuzz_snapshot_refcount`), the dd
-window math (`fuzz_dd_window`), CHS geometry rounding
+40 fuzz targets cover all parser crates (QCOW2, VMDK, VHD, VHDX,
+VDI, Parallels, QCOW1, DMG, RAW, LUKS) including header parsing,
+L1/L2 lookup, refcount traversal, and decompression, plus the
+create / resize / rebase / commit planners, the qcow2 check-repair
+planners (`fuzz_check_repair`), the map extent walkers, the
+snapshot table parser (`fuzz_snapshot_parse`), the snapshot
+refcount mutators (`fuzz_snapshot_refcount`), the dd window math
+(`fuzz_dd_window`), CHS geometry rounding
 (`fuzz_chs_rounded_size`), windowed read primitives
-(`fuzz_dd_read`), and the qcow2-write planner
-(`fuzz_qcow2_write`, which drives the write/copy-on-write planner
-through the crate's `sim` harness asserting the `max_rc < 3` COW
-invariant oracle, and `fuzz_qcow2_write_growth`). Seed the corpus
-from `instar-testdata`:
+(`fuzz_dd_read`), and the qcow2-write planner (`fuzz_qcow2_write`,
+which drives the write/copy-on-write planner through the crate's
+`sim` harness asserting the `max_rc < 3` COW invariant oracle, and
+`fuzz_qcow2_write_growth`). Seed the corpus from `instar-testdata`:
 
 ```bash
 python3 scripts/extract-fuzz-corpus.py --testdata /path/to/instar-testdata

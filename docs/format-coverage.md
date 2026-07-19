@@ -42,7 +42,7 @@ for details on why this approach is secure.
 | RAW | Yes | Yes | raw-mbr-partitioned, raw-gpt-partitioned, etc. |
 | MBR partition table | Yes | Yes | raw-mbr-partitioned |
 | GPT partition table | Yes | Yes | raw-gpt-partitioned |
-| VDI | Yes | Yes | vdi-simple |
+| VDI | Yes | Yes | vdi-simple, vdi-data-dynamic, vdi-static-data, vdi-odd-size, and 6 more (see below) |
 | QED | Yes (banned) | Yes | qed-simple |
 | ISO | Yes | Yes* | iso-simple |
 | LUKS | Yes | Yes | luks-v1, luks-v2, luks-v1-raw-gpt, luks-v1-qcow2, luks-v1-aes-xts |
@@ -382,7 +382,7 @@ divergent clusters from the old chain). Per-format support:
 |--------|---------------|----------------|------------------|
 | qcow2 v2 / v3 | Yes | Yes | Byte-equivalent across qemu-img 6.0.0–10.2.0 (modulo `KNOWN_REBASE_DIVERGENCES`) |
 | vmdk monolithicSparse | Yes | Reject (planner gap) | **instar-only**: `qemu-img rebase` rejects vmdk on every shipped version |
-| Other formats | Reject | Reject | n/a (both refuse) |
+| Other formats | Reject | Reject | n/a (both refuse; exception: qemu-img rebases QED — instar refuses by policy, see the qemu-img parity axis Note 7) |
 
 For qcow2, the post-rebase `qemu-img info --output=json`
 matches `qemu-img rebase` byte-for-byte across every
@@ -410,7 +410,7 @@ overlay's metadata. Per-format support:
 |--------|---------------|---------------|------------------|
 | qcow2 v2 / v3 | Yes | Yes | Byte-equivalent across qemu-img 6.0.0–10.2.0 (modulo `KNOWN_COMMIT_DIVERGENCES`) |
 | vmdk monolithicSparse | Reject (info-side gap) | Yes | Cross-version baselines recorded; implicit-`-b` blocked by info-vmdk-backing-file follow-up |
-| Other formats | Reject | Reject | n/a (both refuse) |
+| Other formats | Reject | Reject | n/a (both refuse; exception: qemu-img commits QED — instar refuses by policy, see the qemu-img parity axis Note 7) |
 
 For qcow2, post-commit `qemu-img info --output=json` for
 both the overlay and the backing matches `qemu-img commit`
