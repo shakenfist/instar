@@ -2976,7 +2976,7 @@ unsafe fn read_compressed_data(
 
     // Read compressed data sector by sector
     let first_sector = compressed_offset / sector_size as u64;
-    let last_sector = (data_end + sector_size as u64 - 1) / sector_size as u64;
+    let last_sector = data_end.div_ceil(sector_size as u64);
     let sectors_to_read = last_sector - first_sector;
 
     if sectors_to_read * sector_size as u64 > COMPRESSED_BUF_SIZE as u64 {
@@ -9392,7 +9392,8 @@ pub unsafe fn init_chain_states(
                     .unwrap_or(true)
                 {
                     // More DMG devices than the reserved region can hold.
-                    (call_table.debug_print)(b"dmg: too many dmg devices for scratch\n\0".as_ptr());
+                    let msg: &[u8] = b"dmg: too many dmg devices for scratch\n\0";
+                    (call_table.debug_print)(msg.as_ptr());
                     return false;
                 }
                 match dmg::DmgState::init(

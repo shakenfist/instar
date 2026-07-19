@@ -127,6 +127,13 @@ jobs:
               --exclude bitmap-op \
               --exclude bench-op
 
+      - name: Feature-gated crate tests in container
+        # Mirrors the feature-gated tail of the Makefile's test-rust
+        # target (luks crypto, qcow2 create, the qcow2 chain-reader
+        # arms, the create crate) -- the workspace invocation above
+        # runs default features only and silently skips all of them.
+        run: tools/ci/rust-feature-tests.sh
+
       - name: Test config commands in container
         run: |
           # Run all config tests inside the container to avoid glibc mismatch
