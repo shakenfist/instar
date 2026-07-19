@@ -171,6 +171,16 @@ tracked manner:
    was never widely deployed — but if archives of QED images
    surface in practice, (b) is a small format (it is
    essentially a simplified qcow2 without refcounts).
+   **RESOLVED 2026-07-19 by phase 6: (a), refusal as
+   policy** — see
+   [PLAN-format-coverage-phase-06-qed.md](PLAN-format-coverage-phase-06-qed.md)
+   for the decision record, with one correction to this
+   question's framing: QEMU does NOT formally deprecate QED
+   (no deprecated.rst entry, no runtime warning, create
+   still works on 10.2.0) — the refusal is instar's own
+   scope choice, aligned with oslo.utils' explicit ban and
+   nil demand, with recorded revisit criteria and a
+   path-(b) sketch preserved in the phase plan.
 2. **DMG detection is trailer-based.** DMG has no magic at
    offset 0 — the UDIF "koly" signature lives in the last
    512 bytes of the file. `detect_format_from_header()`
@@ -229,7 +239,7 @@ is the tracking source of truth.
 | 3. Parallels convert-from (v2 read path, new `src/crates/parallels/`) | [PLAN-format-coverage-phase-03-parallels-read.md](PLAN-format-coverage-phase-03-parallels-read.md) | Complete (commits 3f43472..f2bacf4 + docs commit) |
 | 4. QCOW1 convert-from (read path, new `src/crates/qcow1/`; fixes the misdetection-as-qcow2 defect) | [PLAN-format-coverage-phase-04-qcow1-read.md](PLAN-format-coverage-phase-04-qcow1-read.md) | Complete (commits 23b240f..efdc42e + docs commit) |
 | 5. DMG convert-from (BLKX chunk table + zlib chunks, new `src/crates/dmg/`; EIO-parity error semantics, typed codec/capacity refusals) | [PLAN-format-coverage-phase-05-dmg-read.md](PLAN-format-coverage-phase-05-dmg-read.md) | Complete (commits 71a20d9..9d8111c + docs commit) |
-| 6. QED decision: read path or documented refusal (see Open question 1) | PLAN-format-coverage-phase-06-qed.md | Not written |
+| 6. QED decision: refusal as policy (Open question 1 RESOLVED; per-op pins + testdata reconciliation + decision record) | [PLAN-format-coverage-phase-06-qed.md](PLAN-format-coverage-phase-06-qed.md) | Planned (2026-07-19) |
 | 7. Docs: qemu-img-parity axis in format-coverage.md, README/ARCHITECTURE/CHANGELOG updates | PLAN-format-coverage-phase-07-docs.md | Not written |
 
 Sequencing rationale: phase 1 is cheap, self-contained, and
