@@ -245,7 +245,7 @@ is the tracking source of truth.
 | 4. QCOW1 convert-from (read path, new `src/crates/qcow1/`; fixes the misdetection-as-qcow2 defect) | [PLAN-format-coverage-phase-04-qcow1-read.md](PLAN-format-coverage-phase-04-qcow1-read.md) | Complete (commits 23b240f..efdc42e + docs commit) |
 | 5. DMG convert-from (BLKX chunk table + zlib chunks, new `src/crates/dmg/`; EIO-parity error semantics, typed codec/capacity refusals) | [PLAN-format-coverage-phase-05-dmg-read.md](PLAN-format-coverage-phase-05-dmg-read.md) | Complete (commits 71a20d9..9d8111c + docs commit) |
 | 6. QED decision: refusal as policy (Open question 1 RESOLVED; per-op pins + testdata reconciliation + decision record) | [PLAN-format-coverage-phase-06-qed.md](PLAN-format-coverage-phase-06-qed.md) | Complete (2026-07-20; commits 3fd48e6 instar, cecb16565a testdata) |
-| 7. Docs: qemu-img-parity axis in format-coverage.md, README/ARCHITECTURE/CHANGELOG updates | PLAN-format-coverage-phase-07-docs.md | Not written |
+| 7. Docs: qemu-img-parity axis in format-coverage.md, README/ARCHITECTURE/CHANGELOG updates | [PLAN-format-coverage-phase-07-docs.md](PLAN-format-coverage-phase-07-docs.md) | Planned (2026-07-20) |
 
 Sequencing rationale: phase 1 is cheap, self-contained, and
 settles the one architectural question (trailer probing)
