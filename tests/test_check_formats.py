@@ -2273,3 +2273,73 @@ class TestCheckDmgRefusal(InstarTestBase):
             f'Expected raw format in json (check does not koly-probe): '
             f'{stdout}'
         )
+
+
+class TestCheckQedRefusal(InstarTestBase):
+    """check has no QED support and must refuse it cleanly (fmt-cov 6).
+
+    Format-coverage phase 6 records QED as read-refused by deliberate
+    policy (see docs/plans/PLAN-format-coverage-phase-06-qed.md): QED
+    keeps its info/detection path but gains no reader.  check does not
+    link the chain reader and its own format dispatch has no QED arm.
+    Unlike DMG (a koly-trailer probe that check never sees, so check
+    names the container "raw"), QED carries an offset-0 header magic
+    that check's format probe DOES recognise -- so check names the
+    format "qed" and refuses with exit 63 "This image format (qed) does
+    not support checks".
+
+    qemu-img check on the same file is deliberately NOT mirrored:
+    qemu-img *can* check QED (a real driver, rc 0).  instar's refusal
+    is the recorded scope divergence, pinned here so it cannot regress
+    into a silent raw read.
+    """
+
+    def test_check_refuses_qed(self):
+        """check on qed-simple exits 63 with the not-supported message."""
+        image = self.get_image('qed-simple')
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        stdout, stderr, rc = self.run_instar_check(
+            image.path, output_format='human'
+        )
+        self.assertEqual(
+            rc, 63,
+            f'check on qed should report not-supported (exit 63); '
+            f'got {rc}, stdout={stdout!r} stderr={stderr!r}'
+        )
+        # Exact wording (recorded empirically): QED's offset-0 magic is
+        # recognised, so check names the format "qed" (not "raw").
+        self.assertIn(
+            'This image format (qed) does not support checks',
+            stdout + stderr,
+            f'Expected qed not-supported message: '
+            f'stdout={stdout!r} stderr={stderr!r}'
+        )
+
+    def test_check_qed_json_reports_qed_format(self):
+        """check --output json on qed exits 63; format is qed.
+
+        The JSON envelope is emitted (format=qed, zero errors) but the
+        process still exits non-zero, so no caller mistakes the empty
+        result for a successful check.
+        """
+        image = self.get_image('qed-simple')
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        stdout, stderr, rc = self.run_instar_check(
+            image.path, output_format='json'
+        )
+        self.assertEqual(
+            rc, 63,
+            f'check --output json on qed should exit 63; got {rc}, '
+            f'stderr={stderr!r}'
+        )
+        result = json.loads(stdout)
+        self.assertEqual(
+            result.get('format', '').lower(), 'qed',
+            f'Expected qed format in json: {stdout}'
+        )

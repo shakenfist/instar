@@ -676,6 +676,24 @@ class TestMapErrorPaths(TestMapSmoke):
         self.assertNotEqual(rc, 0, f'stdout: {stdout!r} stderr: {stderr!r}')
         self.assertIn('source format unrecognised', stderr)
 
+    def test_qed_refused(self):
+        """map refuses a qed-simple source (header-detected).
+
+        Format-coverage phase 6 keeps QED read-refused as policy (see
+        docs/plans/PLAN-format-coverage-phase-06-qed.md).  QED's
+        offset-0 header magic is recognised by the guest probe but has
+        no reader arm, so it lands in the same default arm as
+        bochs/cloop/parallels and is refused with "source format
+        unrecognised".  qemu-img maps QED (rc 0); instar's refusal is
+        the recorded scope divergence.
+        """
+        image = self.get_image('qed-simple')
+        if not image.path.exists():
+            self.skipTest(f'fixture not available: {image.path}')
+        stdout, stderr, rc = self.run_instar_map(str(image.path))
+        self.assertNotEqual(rc, 0, f'stdout: {stdout!r} stderr: {stderr!r}')
+        self.assertIn('source format unrecognised', stderr)
+
     def test_dmg_reads_as_raw(self):
         """map does NOT refuse dmg-simple; it reads it as raw.
 

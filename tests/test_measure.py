@@ -1137,6 +1137,23 @@ class TestMeasureNewFormatRefusal(TestMeasureSmoke):
         self.assertNotEqual(rc, 0, f'stdout: {stdout!r} stderr: {stderr!r}')
         self.assertIn('source image is unsupported format', stderr)
 
+    def test_qed_refused(self):
+        """measure refuses a qed-simple source (header-detected).
+
+        Format-coverage phase 6 keeps QED read-refused as policy (see
+        docs/plans/PLAN-format-coverage-phase-06-qed.md).  QED's
+        offset-0 header magic is recognised by the guest probe but has
+        no reader arm, so it lands in the same default arm as
+        bochs/cloop/parallels and is reported as "source image is
+        unsupported format".  qemu-img measures QED (rc 0); instar's
+        refusal is the recorded scope divergence.
+        """
+        image = self._refusal_image('qed-simple')
+        stdout, stderr, rc = self.run_instar_measure(
+            str(image.path), '-O', 'qcow2')
+        self.assertNotEqual(rc, 0, f'stdout: {stdout!r} stderr: {stderr!r}')
+        self.assertIn('source image is unsupported format', stderr)
+
     def test_dmg_measured_as_raw(self):
         """measure does NOT refuse dmg-simple; it sizes it as raw.
 

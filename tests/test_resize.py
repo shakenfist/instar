@@ -847,6 +847,34 @@ class TestResizeErrorPaths(TestResizeSmoke):
             self.assertEqual(path.stat().st_size, 16 * 1024 * 1024)
             self.assertNotEqual(path.stat().st_size, original_size)
 
+    def test_qed_refused(self):
+        """resize refuses a qed-simple target and leaves it byte-unchanged.
+
+        Format-coverage phase 6 keeps QED read-refused as policy (see
+        docs/plans/PLAN-format-coverage-phase-06-qed.md).  QED's
+        offset-0 header magic is recognised by `probe_resize_target`, so
+        it lands in the default arm and is refused before any write.
+
+        COSMETIC PIN (as-is, do not normalise): the message renders the
+        Rust Debug spelling of the format variant -- capital-Q "Qed" --
+        where the chain-gate ops say lowercase "qed".  A wording quirk,
+        not a safety issue; phase 6 pins it rather than touching other
+        formats' messages for zero user value.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            path = self._copy_fixture('qed-simple', td, '.qed')
+            before = path.read_bytes()
+            _, stderr, rc = self.run_instar_resize(str(path), '20M')
+            self.assertNotEqual(rc, 0, f'stderr: {stderr!r}')
+            self.assertIn(
+                'format Qed is not supported for in-place resize',
+                stderr,
+            )
+            self.assertEqual(
+                path.read_bytes(), before,
+                'a refused resize must not touch the qed file',
+            )
+
 
 # ----------------------------------------------------------------------
 # Surface 3: live cross-validation against the system qemu-img.

@@ -151,6 +151,37 @@ class TestCommitErrorPaths(TestCommitSmoke):
                 'exceeds backing virtual size', stderr,
                 f'unexpected stderr: {stderr}')
 
+    def test_qed_overlay_refused(self):
+        """A qed overlay is refused by the format probe, byte-unchanged.
+
+        Format-coverage phase 6 keeps QED read-refused as policy (see
+        docs/plans/PLAN-format-coverage-phase-06-qed.md).  QED's
+        offset-0 header magic is recognised by the overlay format probe,
+        which has no QED arm (commit is qcow2/vmdk only), so the commit
+        is refused before any backing byte changes.  Unlike
+        resize/rebase -- which render the Debug spelling "Qed" -- commit
+        names the format lowercase "qed"; both are pinned as-is.
+        qemu-img has no QED commit driver either, so this is not a
+        divergence, only a refusal pin.
+        """
+        image = self.get_image('qed-simple')
+        if not image.path.exists():
+            self.skipTest(f'fixture not available: {image.path}')
+        self.skip_if_hash_mismatch(image)
+        with tempfile.TemporaryDirectory() as td:
+            overlay = Path(td) / 'overlay.qed'
+            shutil.copy(image.path, overlay)
+            before = overlay.read_bytes()
+            _, stderr, rc = self.run_instar_commit(overlay)
+            self.assertNotEqual(rc, 0, f'unexpected stderr: {stderr}')
+            self.assertIn(
+                "format 'qed' does not support commit (qcow2 and vmdk only)",
+                stderr,
+                f'unexpected stderr: {stderr}')
+            self.assertEqual(
+                overlay.read_bytes(), before,
+                'a refused commit must not touch the qed overlay')
+
 
 # ----------------------------------------------------------------------
 # Success-path tests — end-to-end with the commit guest

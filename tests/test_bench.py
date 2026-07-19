@@ -2194,3 +2194,44 @@ class TestBenchDmg(BenchTestBase):
             f'  instar: {self.header_line(i_out)!r}\n'
             f'  qemu:   {self.header_line(q_out)!r}')
         self.assertRegex(q_out.splitlines()[-1], COMPLETION_RE)
+
+
+class TestBenchQed(BenchTestBase):
+    """bench refuses QED input (format-coverage phase 6).
+
+    Unlike VDI/Parallels/QCOW1/DMG -- which graduated to real read
+    formats -- QED stays read-refused by deliberate policy (see
+    docs/plans/PLAN-format-coverage-phase-06-qed.md).  bench routes
+    every source through the issue-#444 host chain-discovery gate, so a
+    QED input is refused there ("input format 'qed' is detected but not
+    supported for reading (detection and info only)") before any guest
+    launches -- no KVM required.  qemu-img benches QED (rc 0); instar's
+    refusal is the recorded scope divergence.  Pinned so it cannot
+    regress into a silent raw read or a graduation.
+    """
+
+    def test_bench_refuses_qed(self):
+        """bench on qed-simple exits 1 via the chain-discovery gate."""
+        image = self.get_image('qed-simple')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        i_out, i_err, i_rc = self.run_instar_bench(
+            '-c', '100', str(image.path))
+        self.assertEqual(
+            i_rc, 1, f'stdout={i_out!r} stderr={i_err!r}')
+        # No header may be printed before discovery fails (mirrors the
+        # zero-byte early-failure divergence pin).
+        self.assertEqual(
+            i_out, '', 'instar must not print a header before the '
+                       'QED refusal')
+        # The refusal surfaces through the chain-discovery gate.  Unlike
+        # convert/dd (which prefix "convert:"/"dd:"), bench renders the
+        # gate error as "error discovering backing chain for <path>: ...".
+        self.assertIn('error discovering backing chain', i_err)
+        self.assertIn(
+            "input format 'qed' is detected but not supported for "
+            'reading (detection and info only)',
+            i_err,
+            f'missing typed qed refusal: stderr={i_err!r}')
