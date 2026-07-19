@@ -1715,6 +1715,72 @@ class TestDdInputFormats(InstarTestBase):
             )
 
 
+class TestDdDmg(InstarTestBase):
+    """Windowed dd on DMG input (format-coverage phase 5).
+
+    Pins the graduation of DMG to a real read format.  dmg-simple is a
+    4 MiB UDIF image with two zlib-wrapped UDZO chunks: chunk 0 covers
+    [0, 2 MiB) and chunk 1 covers [2 MiB, 4 MiB).  A bs=65536 skip=31
+    count=33 window copies blocks [31, 33) -- offsets [2031616, 2162688)
+    -- which straddle the 2 MiB chunk boundary (qemu-img dd's ``count``
+    is absolute from offset 0).  The window must be byte-identical to
+    qemu-img dd and must actually cross the boundary (first block from
+    chunk 0, second block from chunk 1), proving dd walks the UDIF chunk
+    table rather than reading the container as raw.
+    """
+
+    def test_input_dmg_windowed(self):
+        """Windowed dd on dmg-simple crosses the zlib chunk boundary."""
+        image = self.get_image('dmg-simple')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        window = ['bs=65536', 'skip=31', 'count=33']
+        with (
+            tempfile.NamedTemporaryFile(suffix='.raw') as instar_out,
+            tempfile.NamedTemporaryFile(suffix='.raw') as qemu_out,
+        ):
+            stdout, stderr, rc = self.run_instar_dd(
+                [f'if={image.path}', f'of={instar_out.name}'] + window,
+                output_format='raw',
+                timeout=120,
+            )
+            self.assertEqual(
+                rc, 0,
+                f'[dmg-window] instar dd -O raw failed: stderr={stderr!r}',
+            )
+
+            q_stdout, q_stderr, q_rc = self.run_qemu_img_dd(
+                [f'if={image.path}', f'of={qemu_out.name}'] + window,
+                output_format='raw',
+                timeout=120,
+            )
+            self.assertEqual(
+                q_rc, 0,
+                f'[dmg-window] qemu-img dd -O raw failed: stderr={q_stderr!r}',
+            )
+
+            instar_bytes = _bytes_of(instar_out.name)
+            qemu_bytes = _bytes_of(qemu_out.name)
+            self.assertEqual(
+                instar_bytes,
+                qemu_bytes,
+                f'[dmg-window] instar dd output differs from qemu-img dd '
+                f'(instar={len(instar_bytes)} B, qemu={len(qemu_bytes)} B)',
+            )
+            # Sanity: the window straddles the chunk boundary -- the first
+            # block carries chunk-0 content and the second chunk-1 content.
+            self.assertIn(
+                b'CHUNK-0', instar_bytes[:65536],
+                '[dmg-window] first block should carry chunk-0 data',
+            )
+            self.assertIn(
+                b'CHUNK-1', instar_bytes[65536:],
+                '[dmg-window] second block should carry chunk-1 data',
+            )
+
+
 class TestDdDetectOnlyRefusal(InstarTestBase):
     """dd refuses detect-only input formats instead of reading raw.
 
@@ -1762,9 +1828,9 @@ class TestDdDetectOnlyRefusal(InstarTestBase):
         """dd refuses a cloop-simple input with the typed message."""
         self._assert_refused('cloop-simple', 'cloop')
 
-    def test_dd_refuses_dmg(self):
-        """dd refuses a dmg-simple input with the typed message."""
-        self._assert_refused('dmg-simple', 'dmg')
+    # NOTE: dmg is no longer refused here.  Format-coverage phase 5
+    # graduates DMG to a real read format; dd now reads it.  The windowed
+    # dd byte-parity smoke lives in TestDdDmg below.
 
     def test_dd_iso_passthrough(self):
         """dd keeps reading iso as raw (deliberate qemu parity).

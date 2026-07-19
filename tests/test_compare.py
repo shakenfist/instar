@@ -1234,9 +1234,9 @@ class TestCompareDetectOnlyRefusal(InstarTestBase):
         """compare refuses a cloop-simple input with the typed message."""
         self._assert_refused('cloop-simple', 'cloop')
 
-    def test_compare_refuses_dmg(self):
-        """compare refuses a dmg-simple input with the typed message."""
-        self._assert_refused('dmg-simple', 'dmg')
+    # NOTE: dmg is no longer refused here.  Format-coverage phase 5
+    # graduates DMG to a real read format; compare now reads it.  The
+    # dmg-simple-vs-raw identical smoke lives in TestCompareDmg below.
 
     def test_compare_iso_passthrough(self):
         """compare keeps reading iso as raw (deliberate qemu parity)."""
@@ -1247,6 +1247,43 @@ class TestCompareDetectOnlyRefusal(InstarTestBase):
             f'iso compare should succeed; stderr={stderr!r}'
         )
         self.assertIn('identical', (stdout + stderr).lower())
+
+
+class TestCompareDmg(InstarTestBase):
+    """Smoke test for comparing DMG input (format-coverage phase 5).
+
+    Pins the graduation of DMG from the issue-#444 detect-only refusal to
+    a real read format: comparing the dmg-simple fixture against its own
+    qemu-img raw conversion must report identical content and exit 0,
+    which proves compare reads the UDIF chunks rather than the container
+    bytes.  The full DMG compare matrix is covered in step 5e.
+    """
+
+    def test_compare_dmg_simple_vs_raw(self):
+        """compare dmg-simple against its qemu-img raw conversion."""
+        image = self.get_image('dmg-simple')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') as qemu_raw:
+            q_stdout, q_stderr, q_rc = self.run_qemu_img_convert(
+                image.path, Path(qemu_raw.name), timeout=120
+            )
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img convert failed for dmg-simple: {q_stderr}'
+            )
+
+            stdout, stderr, rc = self.run_instar_compare(
+                image.path, Path(qemu_raw.name), timeout=120
+            )
+            self.assertEqual(
+                rc, 0,
+                f'compare dmg-simple vs raw should be identical; '
+                f'stdout={stdout!r} stderr={stderr!r}'
+            )
+            self.assertIn('identical', (stdout + stderr).lower())
 
 
 class TestCompareVdi(InstarTestBase):

@@ -6426,6 +6426,50 @@ class TestConvertVhdxBlockSize(InstarTestBase):
         )
 
 
+class TestConvertDmgToRaw(InstarTestBase):
+    """DMG (Apple UDIF) convert-to-raw byte parity (format-coverage phase 5).
+
+    Pins the graduation of dmg from the issue-#444 detect-only gate to a
+    real read format.  dmg-simple is a 4 MiB UDIF image with two
+    zlib-wrapped UDZO chunks (chunk 0 covers [0, 2 MiB), chunk 1 covers
+    [2 MiB, 4 MiB)); instar convert-to-raw must reproduce qemu-img
+    convert byte-for-byte.  The fixture carries a ``.dmg`` extension so
+    unforced qemu-img probes it as dmg (qemu's dmg probe is filename-only,
+    per the phase-5 plan).  Modelled on TestConvertQcow1ToRaw's parity
+    smoke, but reads the manifest fixture directly since DMGs cannot be
+    created locally (only the testdata generator builds them).
+    """
+
+    def test_convert_dmg_simple(self):
+        """Convert dmg-simple to raw with byte parity vs qemu-img."""
+        image = self.get_image('dmg-simple')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') as instar_raw, \
+                tempfile.NamedTemporaryFile(suffix='.raw') as qemu_raw:
+            stdout, stderr, rc = self.run_instar_convert(
+                image.path, Path(instar_raw.name), timeout=120
+            )
+            self.assertEqual(
+                rc, 0, f'instar convert failed for dmg-simple: {stderr}'
+            )
+
+            q_stdout, q_stderr, q_rc = self.run_qemu_img_convert(
+                image.path, Path(qemu_raw.name), timeout=120
+            )
+            self.assertEqual(
+                q_rc, 0, f'qemu-img convert failed for dmg-simple: {q_stderr}'
+            )
+
+            self.assertEqual(
+                Path(instar_raw.name).read_bytes(),
+                Path(qemu_raw.name).read_bytes(),
+                'convert output for dmg-simple differs from qemu-img'
+            )
+
+
 class TestConvertDetectOnlyRefusal(InstarTestBase):
     """convert refuses detect-only input formats instead of reading raw.
 
@@ -6474,9 +6518,11 @@ class TestConvertDetectOnlyRefusal(InstarTestBase):
         """convert refuses a cloop-simple input with the typed message."""
         self._assert_refused('cloop-simple', 'cloop')
 
-    def test_convert_refuses_dmg(self):
-        """convert refuses a dmg-simple input with the typed message."""
-        self._assert_refused('dmg-simple', 'dmg')
+    # NOTE: dmg is no longer refused here.  Format-coverage phase 5
+    # graduates DMG (Apple UDIF) to a real read format: the chain
+    # discovery variant now maps "dmg" to a reader arm, so convert reads
+    # it byte-for-byte instead of gating it.  The convert byte-parity
+    # smoke lives in TestConvertDmgToRaw below.
 
     def test_convert_refuses_midchain_qed(self):
         """convert refuses when a qcow2 overlay's backing file is qed.

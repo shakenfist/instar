@@ -2201,3 +2201,75 @@ class TestCheckParallelsRefusal(InstarTestBase):
             result.get('format', '').lower(), 'parallels',
             f'Expected parallels format in json: {stdout}'
         )
+
+
+class TestCheckDmgRefusal(InstarTestBase):
+    """check has no DMG support and must refuse it cleanly (fmt-cov 5).
+
+    Format-coverage phase 5 graduates DMG to a real *read* format for
+    convert/compare/dd/bench, which lifts the phase-1 host gate for every
+    op that discovers a backing chain.  check is deliberately NOT one of
+    those consumers: it does not link the chain reader, and its own
+    format dispatch has no DMG arm.  Unlike VDI/Parallels -- whose header
+    *signatures* the check op still recognises -- DMG detection is a
+    koly-trailer probe that lives only in the info op, so check sees the
+    UDIF container as ``raw`` and refuses with exit 63 "This image format
+    (raw) does not support checks".
+
+    qemu-img check on the same file is ALSO exit 63 ("does not support
+    checks") -- it detects dmg (extension probe) and dmg has no check
+    driver.  So the exit code is parity; only the named format differs
+    (instar says raw, qemu says dmg), a documented consequence of check
+    not being a chain-discovery consumer.  Real DMG check is future work.
+    """
+
+    def test_check_refuses_dmg(self):
+        """check on dmg-simple exits 63 with the not-supported message."""
+        image = self.get_image('dmg-simple')
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        stdout, stderr, rc = self.run_instar_check(
+            image.path, output_format='human'
+        )
+        self.assertEqual(
+            rc, 63,
+            f'check on dmg should report not-supported (exit 63); '
+            f'got {rc}, stdout={stdout!r} stderr={stderr!r}'
+        )
+        # Exact wording (recorded empirically): check probes no koly
+        # trailer, so it names the container "raw", not "dmg".
+        self.assertIn(
+            'This image format (raw) does not support checks',
+            stdout + stderr,
+            f'Expected raw not-supported message for dmg: '
+            f'stdout={stdout!r} stderr={stderr!r}'
+        )
+
+    def test_check_dmg_json_reports_raw_format(self):
+        """check --output json on dmg exits 63; format is raw (no koly probe).
+
+        The JSON envelope is emitted (format=raw, zero errors) but the
+        process still exits non-zero, so no caller mistakes the empty
+        result for a successful check.
+        """
+        image = self.get_image('dmg-simple')
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        stdout, stderr, rc = self.run_instar_check(
+            image.path, output_format='json'
+        )
+        self.assertEqual(
+            rc, 63,
+            f'check --output json on dmg should exit 63; got {rc}, '
+            f'stderr={stderr!r}'
+        )
+        result = json.loads(stdout)
+        self.assertEqual(
+            result.get('format', '').lower(), 'raw',
+            f'Expected raw format in json (check does not koly-probe): '
+            f'{stdout}'
+        )

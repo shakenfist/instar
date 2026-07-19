@@ -650,36 +650,83 @@ class TestAdversarialVmdkDescriptor(InstarTestBase):
 
 
 class TestAdversarialDmgManifest(InstarTestBase):
-    """Verify malformed DMG koly-trailer manifests are handled safely.
+    """Verify malformed DMG fixtures are handled safely (format-coverage 5).
 
-    Four fixtures probe the koly-trailer parsing at its edges: a
-    trailer cut short (no valid 512-byte block at any candidate
-    offset), a SectorCount with the top bit set (rejected as
-    negative), an absurd-but-positive SectorCount, and a valid
-    trailer whose chunk table is empty (instar reports from the
-    trailer alone; qemu-img would fail to open it — a documented
-    trailer-only divergence). None of these should hang, crash, or
-    consume excessive memory. `convert` must either refuse via the
-    3b detect-only gate (when the header still resolves to `dmg`) or
-    otherwise fail/succeed cleanly (when the malformation collapses
-    detection to `unknown`, convert falls through to the iso/unknown
-    raw pass-through) — in every case any produced output must stay
-    small.
+    Four fixtures probe the koly-trailer / chunk-table parsing at its
+    edges: a trailer cut short (no valid 512-byte block at any candidate
+    offset), a SectorCount with the top bit set (rejected as negative),
+    an absurd-but-positive SectorCount, and a valid trailer whose chunk
+    source is absent (empty rsrc+XML lengths).  A fifth, dmg-empty-table,
+    is the qemu zero-chunk segfault reproducer (valid koly + well-formed
+    plist whose single ``<data>`` block decodes with a corrupted mish
+    magic → zero parsed chunks); it is NOT yet registered in the instar
+    manifest (that lands with the 5d testdata commit), so it is exercised
+    by a direct path into the testdata tree.
+
+    Phase 5 graduates DMG to a real read format, so the pre-graduation
+    issue-#444 detect-only gate no longer fires.  The empirical
+    post-graduation convert behaviour, pinned below per fixture, is:
+
+      dmg-truncated-koly     info reports vsize 0; convert refuses
+                             host-side ("input image has zero virtual
+                             size"), exit 1.
+      dmg-sectorcount-negative  the negative SectorCount collapses koly
+                             *detection* to ``unknown`` (dmg_sector_count
+                             refuses it), so info/convert fall through to
+                             the raw pass-through: convert SUCCEEDS (exit
+                             0) on the small container, NOT a dmg read.
+      dmg-sectorcount-huge   koly parses (vsize 128 PiB); convert fails
+                             cleanly ("convert operation failed"), exit 1.
+      dmg-no-chunk-table     koly parses (vsize 4 MiB) but no chunk
+                             source; the dmg reader refuses at init and
+                             convert fails cleanly, exit 1.
+      dmg-empty-table        koly parses (vsize 4 KiB); the dmg reader
+                             refuses the empty chunk table at init and
+                             convert fails cleanly, exit 1 -- crucially
+                             NOT SIGSEGV (rc != 139): instar does not
+                             mirror qemu's NULL-deref crash.
+
+    The reader-init refusal reason (e.g. "dmg: no chunk source", "dmg:
+    empty chunk table") is guest-side and surfaces to the host as the
+    generic "convert operation failed"; like the VDI/Parallels manifests,
+    only the exit code and clean termination (no hang, no crash, bounded
+    output) are pinned, not the typed string.  ``info`` parses only the
+    trailer and is unchanged (asserted no-hang/no-crash below).
     """
 
-    def _assert_convert_output_small(self, image_id):
-        image = self.get_adversarial_image(image_id)
+    #: cap on any produced convert output — a malformed fixture must
+    #: never balloon into a huge raw file.
+    _OUTPUT_CAP = 100 * 1024 * 1024
+
+    def _run_convert(self, image_path):
+        """Run convert against a fixture path; assert no hang/crash and
+        bounded output.  Returns (stdout, stderr, rc)."""
         with tempfile.NamedTemporaryFile(suffix='.raw') as out:
-            self.run_adversarial(
+            stdout, stderr, rc = self.run_adversarial(
                 [str(self.get_instar_binary()), 'convert', '-O', 'raw',
-                 str(image.path), out.name],
-                timeout=10
+                 str(image_path), out.name],
+                timeout=15
             )
             out_size = Path(out.name).stat().st_size
             self.assertLess(
-                out_size, 100 * 1024 * 1024,
-                f'convert output suspiciously large for {image_id}'
+                out_size, self._OUTPUT_CAP,
+                f'convert output suspiciously large for {image_path}'
             )
+        return stdout, stderr, rc
+
+    def _assert_convert_refused_clean(self, image_id):
+        """convert must fail non-zero with a non-empty message, cleanly."""
+        image = self.get_adversarial_image(image_id)
+        stdout, stderr, rc = self._run_convert(image.path)
+        self.assertNotEqual(
+            rc, 0,
+            f'convert should refuse malformed {image_id}; '
+            f'stdout={stdout!r} stderr={stderr!r}'
+        )
+        self.assertTrue(
+            (stdout + stderr).strip(),
+            f'convert should emit a non-empty error for {image_id}'
+        )
 
     # --- dmg-truncated-koly: no valid trailer at any candidate offset ---
 
@@ -691,9 +738,11 @@ class TestAdversarialDmgManifest(InstarTestBase):
         )
 
     def test_convert_dmg_truncated_koly(self):
-        self._assert_convert_output_small('dmg-truncated-koly')
+        # info reports vsize 0 → host refuses ("input image has zero
+        # virtual size") before opening the reader.
+        self._assert_convert_refused_clean('dmg-truncated-koly')
 
-    # --- dmg-sectorcount-negative: top bit set, rejected as negative ---
+    # --- dmg-sectorcount-negative: top bit set, collapses to unknown ---
 
     def test_info_dmg_sectorcount_negative(self):
         image = self.get_adversarial_image('dmg-sectorcount-negative')
@@ -703,7 +752,19 @@ class TestAdversarialDmgManifest(InstarTestBase):
         )
 
     def test_convert_dmg_sectorcount_negative(self):
-        self._assert_convert_output_small('dmg-sectorcount-negative')
+        # A negative SectorCount is refused by the koly detector, so the
+        # image is NOT detected as dmg: it collapses to ``unknown`` and
+        # convert reads it via the raw pass-through, succeeding (exit 0)
+        # on the tiny container.  Pin the pass-through (no gate, no dmg
+        # read) rather than a refusal — this fixture never reaches the
+        # reader.  Only clean termination + bounded output are required.
+        image = self.get_adversarial_image('dmg-sectorcount-negative')
+        _stdout, _stderr, rc = self._run_convert(image.path)
+        self.assertEqual(
+            rc, 0,
+            'dmg-sectorcount-negative collapses to unknown/raw and should '
+            f'convert cleanly (exit 0); got {rc}'
+        )
 
     # --- dmg-sectorcount-huge: absurd but positive SectorCount ---
 
@@ -715,7 +776,8 @@ class TestAdversarialDmgManifest(InstarTestBase):
         )
 
     def test_convert_dmg_sectorcount_huge(self):
-        self._assert_convert_output_small('dmg-sectorcount-huge')
+        # koly parses (vsize 128 PiB); convert fails cleanly.
+        self._assert_convert_refused_clean('dmg-sectorcount-huge')
 
     # --- dmg-no-chunk-table: valid trailer, empty rsrc+XML lengths ---
 
@@ -727,7 +789,40 @@ class TestAdversarialDmgManifest(InstarTestBase):
         )
 
     def test_convert_dmg_no_chunk_table(self):
-        self._assert_convert_output_small('dmg-no-chunk-table')
+        # qemu's clean-EINVAL shape (no chunk source); the dmg reader
+        # refuses at init and convert fails cleanly.
+        self._assert_convert_refused_clean('dmg-no-chunk-table')
+
+    # --- dmg-empty-table: the qemu zero-chunk SIGSEGV reproducer ---
+    #     (not yet in the manifest; exercised by direct testdata path)
+
+    def _empty_table_path(self):
+        path = self._testdata_root / 'custom' / 'audit' / 'dmg-empty-table.dmg'
+        if not path.exists():
+            self.skipTest(f'Test image not found: {path}')
+        return path
+
+    def test_convert_dmg_empty_table_no_crash(self):
+        """convert of the zero-chunk fixture refuses cleanly, never crashes.
+
+        qemu-img SIGSEGVs (NULL sectors[] deref) reading a valid-koly
+        image whose plist parses to zero chunks; instar must refuse the
+        empty chunk table at reader init instead.  run_adversarial fails
+        the test on any signal kill, so a crash is caught directly; we
+        additionally pin exit != 0 and exit != 139 explicitly.
+        """
+        path = self._empty_table_path()
+        stdout, stderr, rc = self._run_convert(path)
+        self.assertNotEqual(
+            rc, 0,
+            f'convert should refuse the empty-table fixture; '
+            f'stdout={stdout!r} stderr={stderr!r}'
+        )
+        self.assertNotEqual(
+            rc, 139,
+            'instar must NOT mirror qemu\'s SIGSEGV on the zero-chunk '
+            f'fixture (rc 139); got {rc}'
+        )
 
 
 class TestAdversarialVdiManifest(InstarTestBase):
