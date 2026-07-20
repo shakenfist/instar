@@ -1188,3 +1188,419 @@ class TestCompareLuksQcow2(InstarTestBase):
                 luks_passphrase='wrong-passphrase'
             )
             self.assertNotEqual(rc, 0)
+
+
+class TestCompareDetectOnlyRefusal(InstarTestBase):
+    """compare refuses detect-only input formats instead of reading raw.
+
+    Without the refusal gate compare would report "Images are identical."
+    for a qed file compared with itself (both read as raw), masking
+    that the container is not actually read (issue #444).  iso keeps its
+    raw pass-through per the post-1a management decision.
+    """
+
+    def _refusal_image(self, image_id):
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+        return image
+
+    def _assert_refused(self, image_id, fmt):
+        image = self._refusal_image(image_id)
+        stdout, stderr, rc = self.run_instar_compare(image.path, image.path)
+        self.assertNotEqual(
+            rc, 0,
+            f'compare should refuse {fmt} input; stdout={stdout!r} '
+            f'stderr={stderr!r}'
+        )
+        expected = (
+            f"compare: input format '{fmt}' is detected but not supported "
+            f'for reading (detection and info only)'
+        )
+        self.assertIn(
+            expected, stdout + stderr,
+            f'missing typed refusal for {fmt}: stderr={stderr!r}'
+        )
+
+    def test_compare_refuses_qed(self):
+        """compare refuses a qed input with the typed message."""
+        self._assert_refused('qed-simple', 'qed')
+
+    def test_compare_refuses_bochs(self):
+        """compare refuses a bochs-growing input with the typed message."""
+        self._assert_refused('bochs-growing', 'bochs')
+
+    def test_compare_refuses_cloop(self):
+        """compare refuses a cloop-simple input with the typed message."""
+        self._assert_refused('cloop-simple', 'cloop')
+
+    # NOTE: dmg is no longer refused here.  Format-coverage phase 5
+    # graduates DMG to a real read format; compare now reads it.  The
+    # dmg-simple-vs-raw identical smoke lives in TestCompareDmg below.
+
+    def test_compare_iso_passthrough(self):
+        """compare keeps reading iso as raw (deliberate qemu parity)."""
+        image = self._refusal_image('iso-simple')
+        stdout, stderr, rc = self.run_instar_compare(image.path, image.path)
+        self.assertEqual(
+            rc, 0,
+            f'iso compare should succeed; stderr={stderr!r}'
+        )
+        self.assertIn('identical', (stdout + stderr).lower())
+
+
+class TestCompareDmg(InstarTestBase):
+    """Smoke test for comparing DMG input (format-coverage phase 5).
+
+    Pins the graduation of DMG from the issue-#444 detect-only refusal to
+    a real read format: comparing the dmg-simple fixture against its own
+    qemu-img raw conversion must report identical content and exit 0,
+    which proves compare reads the UDIF chunks rather than the container
+    bytes.  The full DMG compare matrix is covered in step 5e.
+    """
+
+    def test_compare_dmg_simple_vs_raw(self):
+        """compare dmg-simple against its qemu-img raw conversion."""
+        image = self.get_image('dmg-simple')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') as qemu_raw:
+            q_stdout, q_stderr, q_rc = self.run_qemu_img_convert(
+                image.path, Path(qemu_raw.name), timeout=120
+            )
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img convert failed for dmg-simple: {q_stderr}'
+            )
+
+            stdout, stderr, rc = self.run_instar_compare(
+                image.path, Path(qemu_raw.name), timeout=120
+            )
+            self.assertEqual(
+                rc, 0,
+                f'compare dmg-simple vs raw should be identical; '
+                f'stdout={stdout!r} stderr={stderr!r}'
+            )
+            self.assertIn('identical', (stdout + stderr).lower())
+
+    def test_compare_dmg_multipart_vs_flattened(self):
+        """compare dmg-multipart against its own qemu-flattened raw.
+
+        Reading the multipart mish composition through compare must match
+        qemu's raw view byte-for-byte -- proving compare walks the absolute
+        (out_offset) sector table rather than the container bytes.
+        """
+        image = self.get_image('dmg-multipart')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') as qemu_raw:
+            _, q_stderr, q_rc = self.run_qemu_img_convert(
+                image.path, Path(qemu_raw.name), timeout=120)
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img convert failed for dmg-multipart: {q_stderr}')
+
+            stdout, stderr, rc = self.run_instar_compare(
+                image.path, Path(qemu_raw.name), timeout=120)
+            self.assertEqual(
+                rc, 0,
+                f'compare dmg-multipart vs raw should be identical; '
+                f'stdout={stdout!r} stderr={stderr!r}')
+            self.assertIn('identical', (stdout + stderr).lower())
+
+    def test_compare_dmg_rsrc_fork_self(self):
+        """compare dmg-rsrc-fork against itself reports identical.
+
+        The old resource-fork table path decodes deterministically, so a
+        self-compare must report identical content and exit 0.
+        """
+        image = self.get_image('dmg-rsrc-fork')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        stdout, stderr, rc = self.run_instar_compare(
+            image.path, image.path, timeout=120)
+        self.assertEqual(
+            rc, 0,
+            f'compare dmg-rsrc-fork self should be identical; '
+            f'stdout={stdout!r} stderr={stderr!r}')
+        self.assertIn('identical', (stdout + stderr).lower())
+
+    def test_compare_dmg_mixed_vs_multipart_differ(self):
+        """compare dmg-mixed vs dmg-multipart reports a mismatch (exit != 0).
+
+        Two safe DMG fixtures with different decoded content must compare
+        as different, proving compare reads the real disks (both would be
+        'identical' only if compare read the container bytes wrong).
+        """
+        mixed = self.get_image('dmg-mixed')
+        multipart = self.get_image('dmg-multipart')
+        for img in (mixed, multipart):
+            if not img.path.exists():
+                self.skipTest(f'Image not found: {img.path}')
+            self.skip_if_hash_mismatch(img)
+
+        stdout, stderr, rc = self.run_instar_compare(
+            mixed.path, multipart.path, timeout=120)
+        self.assertNotEqual(
+            rc, 0,
+            f'compare of two differing DMG fixtures should report a '
+            f'mismatch; stdout={stdout!r} stderr={stderr!r}')
+        self.assertNotIn('identical', (stdout + stderr).lower())
+
+
+class TestCompareVdi(InstarTestBase):
+    """Smoke test for comparing VDI input (format-coverage phase 2).
+
+    Pins the graduation of VDI from a detect-only refusal to a real read
+    format: comparing the aligned vdi-simple fixture against its own
+    qemu-img raw conversion must report identical content and exit 0.
+    The full VDI compare matrix is covered in step 2e.
+    """
+
+    def test_compare_vdi_simple_vs_raw(self):
+        """compare vdi-simple against its qemu-img raw conversion."""
+        image = self.get_image('vdi-simple')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') as qemu_raw:
+            q_stdout, q_stderr, q_rc = self.run_qemu_img_convert(
+                image.path, Path(qemu_raw.name), timeout=120
+            )
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img convert failed for vdi-simple: {q_stderr}'
+            )
+
+            stdout, stderr, rc = self.run_instar_compare(
+                image.path, Path(qemu_raw.name), timeout=120
+            )
+            self.assertEqual(
+                rc, 0,
+                f'compare vdi-simple vs raw should be identical; '
+                f'stdout={stdout!r} stderr={stderr!r}'
+            )
+            self.assertIn('identical', (stdout + stderr).lower())
+
+    def test_compare_vdi_vs_vdi_identical(self):
+        """compare vdi-data-dynamic against a qemu-img vdi copy of itself.
+
+        Round-tripping the fixture through ``qemu-img convert -O vdi``
+        re-encodes the same virtual content into a fresh VDI (different
+        on-disk block map ordering), so an identical result exercises the
+        VDI read path on both sides of the compare.
+        """
+        image = self.get_image('vdi-data-dynamic')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        with tempfile.NamedTemporaryFile(suffix='.vdi') as vdi_copy:
+            result = subprocess.run(
+                ['qemu-img', 'convert', '-O', 'vdi',
+                 str(image.path), vdi_copy.name],
+                capture_output=True, text=True, timeout=120
+            )
+            self.assertEqual(
+                result.returncode, 0,
+                f'qemu-img convert to vdi failed: {result.stderr}'
+            )
+
+            stdout, stderr, rc = self.run_instar_compare(
+                image.path, Path(vdi_copy.name), timeout=120
+            )
+            self.assertEqual(
+                rc, 0,
+                f'compare vdi-data-dynamic vs its vdi copy should be '
+                f'identical; stdout={stdout!r} stderr={stderr!r}'
+            )
+            self.assertIn('identical', (stdout + stderr).lower())
+
+    def test_compare_vdi_vs_vdi_differs(self):
+        """compare two different VDI images reports a mismatch (exit 1).
+
+        vdi-data-dynamic (8 MiB, data at 2 MiB) and vdi-static-data
+        (3 MiB, data in a middle block) differ in both size and content,
+        so compare must exit 1 like qemu-img compare.
+        """
+        img_a = self.get_image('vdi-data-dynamic')
+        img_b = self.get_image('vdi-static-data')
+        for img in (img_a, img_b):
+            if not img.path.exists():
+                self.skipTest(f'Image not found: {img.path}')
+            self.skip_if_hash_mismatch(img)
+
+        stdout, stderr, rc = self.run_instar_compare(
+            img_a.path, img_b.path, timeout=120
+        )
+        self.assertEqual(
+            rc, 1,
+            f'compare of differing VDI images should exit 1; '
+            f'rc={rc} stdout={stdout!r} stderr={stderr!r}'
+        )
+        self.assertIn('mismatch', (stdout + stderr).lower())
+
+
+class TestCompareParallels(InstarTestBase):
+    """Smoke test for comparing Parallels input (format-coverage phase 3).
+
+    Phase 1 gated Parallels for compare but never added a refusal test
+    (a documented gap this phase closes with positive coverage).  Pins
+    the graduation to a real read format: comparing the parallels-v2
+    ('WithouFreSpacExt') fixture against its own qemu-img raw conversion
+    must report identical content and exit 0.  The full compare matrix
+    (both magics, differing pairs) lands in step 3e.
+    """
+
+    def test_compare_parallels_v2_vs_raw(self):
+        """compare parallels-v2 against its qemu-img raw conversion."""
+        image = self.get_image('parallels-v2')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        with tempfile.NamedTemporaryFile(suffix='.raw') as qemu_raw:
+            q_stdout, q_stderr, q_rc = self.run_qemu_img_convert(
+                image.path, Path(qemu_raw.name), timeout=120
+            )
+            self.assertEqual(
+                q_rc, 0,
+                f'qemu-img convert failed for parallels-v2: {q_stderr}'
+            )
+
+            stdout, stderr, rc = self.run_instar_compare(
+                image.path, Path(qemu_raw.name), timeout=120
+            )
+            self.assertEqual(
+                rc, 0,
+                f'compare parallels-v2 vs raw should be identical; '
+                f'stdout={stdout!r} stderr={stderr!r}'
+            )
+            self.assertIn('identical', (stdout + stderr).lower())
+
+    def test_compare_parallels_v1_vs_v2_identical(self):
+        """compare parallels-data-v1 vs parallels-data-v2: identical, exit 0.
+
+        These are two DIFFERENT files (different magic, different BAT
+        encoding: v1 sector-valued 'WithoutFreeSpace' vs v2
+        cluster-valued 'WithouFreSpacExt', and the v2 twin has a swapped
+        BAT) that decode to the same virtual content.  compare reading
+        both through the Parallels path must report identical and exit 0
+        -- a cross-magic equivalence pin.
+        """
+        img_a = self.get_image('parallels-data-v1')
+        img_b = self.get_image('parallels-data-v2')
+        for img in (img_a, img_b):
+            if not img.path.exists():
+                self.skipTest(f'Image not found: {img.path}')
+            self.skip_if_hash_mismatch(img)
+
+        stdout, stderr, rc = self.run_instar_compare(
+            img_a.path, img_b.path, timeout=120
+        )
+        self.assertEqual(
+            rc, 0,
+            f'compare parallels-data-v1 vs parallels-data-v2 should be '
+            f'identical; stdout={stdout!r} stderr={stderr!r}'
+        )
+        self.assertIn('identical', (stdout + stderr).lower())
+
+    def test_compare_parallels_differs(self):
+        """compare two differing Parallels images reports a mismatch (exit 1).
+
+        parallels-data-v2 (2 MiB, 64 KiB clusters) and parallels-cluster-4k
+        (256 KiB, 4 KiB clusters) differ in both size and content, so
+        compare must exit 1 like qemu-img compare.
+        """
+        img_a = self.get_image('parallels-data-v2')
+        img_b = self.get_image('parallels-cluster-4k')
+        for img in (img_a, img_b):
+            if not img.path.exists():
+                self.skipTest(f'Image not found: {img.path}')
+            self.skip_if_hash_mismatch(img)
+
+        stdout, stderr, rc = self.run_instar_compare(
+            img_a.path, img_b.path, timeout=120
+        )
+        self.assertEqual(
+            rc, 1,
+            f'compare of differing Parallels images should exit 1; '
+            f'rc={rc} stdout={stdout!r} stderr={stderr!r}'
+        )
+        self.assertIn('mismatch', (stdout + stderr).lower())
+
+
+class TestCompareQcow1(InstarTestBase):
+    """compare read-path pins for QCOW1 ('qcow' v1) (format-coverage phase 4)."""
+
+    def _skip_unless(self, *image_ids):
+        images = []
+        for image_id in image_ids:
+            img = self.get_image(image_id)
+            if not img.path.exists():
+                self.skipTest(f'Image not found: {img.path}')
+            self.skip_if_hash_mismatch(img)
+            images.append(img)
+        return images
+
+    def test_compare_qcow1_data_vs_compressed_identical(self):
+        """compare qcow1-data vs qcow1-compressed: identical, exit 0.
+
+        These are two DIFFERENT files (uncompressed vs raw-DEFLATE
+        clusters) that decode to the same virtual content, so compare
+        must report identical and exit 0 -- the compressed-decode
+        equivalence pin.
+        """
+        img_a, img_b = self._skip_unless('qcow1-data', 'qcow1-compressed')
+        stdout, stderr, rc = self.run_instar_compare(
+            img_a.path, img_b.path, timeout=120)
+        self.assertEqual(
+            rc, 0,
+            f'compare qcow1-data vs qcow1-compressed should be identical; '
+            f'stdout={stdout!r} stderr={stderr!r}')
+        self.assertIn('identical', (stdout + stderr).lower())
+
+    def test_compare_qcow1_data_differs(self):
+        """compare qcow1-data vs qcow1-backing reports a mismatch (exit 1).
+
+        qcow1-data (2 MiB) and qcow1-backing (1 MiB, different content)
+        differ in both size and content, so compare must exit 1.
+        """
+        img_a, img_b = self._skip_unless('qcow1-data', 'qcow1-backing')
+        stdout, stderr, rc = self.run_instar_compare(
+            img_a.path, img_b.path, timeout=120)
+        self.assertEqual(
+            rc, 1,
+            f'compare of differing qcow1 images should exit 1; '
+            f'rc={rc} stdout={stdout!r} stderr={stderr!r}')
+        self.assertIn('mismatch', (stdout + stderr).lower())
+
+    def test_compare_qcow1_backing_matches_flattened(self):
+        """compare the qcow1 backing overlay against its qemu-flattened view.
+
+        Flatten qcow1-backing to raw with qemu-img (resolving the
+        512-byte-cluster overlay through its base), then instar compare
+        the overlay against that flat raw: identical, exit 0.  Pins that
+        instar's backing fall-through composes the same bytes qemu does.
+        """
+        (img,) = self._skip_unless('qcow1-backing')
+        with tempfile.NamedTemporaryFile(suffix='.raw') as flat:
+            _, q_stderr, q_rc = self.run_qemu_img_convert(
+                img.path, Path(flat.name), timeout=120)
+            self.assertEqual(
+                q_rc, 0, f'qemu-img flatten of qcow1-backing failed: {q_stderr}')
+
+            stdout, stderr, rc = self.run_instar_compare(
+                img.path, Path(flat.name), timeout=120)
+            self.assertEqual(
+                rc, 0,
+                f'compare qcow1-backing vs its flattened raw should be '
+                f'identical; stdout={stdout!r} stderr={stderr!r}')
+            self.assertIn('identical', (stdout + stderr).lower())

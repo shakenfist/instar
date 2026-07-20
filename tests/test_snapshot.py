@@ -991,6 +991,42 @@ class TestSnapshotErrorPaths(TestSnapshotSmoke):
             shutil.copy2(str(img.path), str(copy))
             self._assert_refusal(copy, ('-c', 'snap'), 'vmdk create')
 
+    def test_qed_list_refused(self):
+        """``-l`` on a qed image: non-zero exit.
+
+        Format-coverage phase 6 keeps QED read-refused as policy (see
+        docs/plans/PLAN-format-coverage-phase-06-qed.md).  snapshot is
+        qcow2-only; a QED source (recognised by its offset-0 header
+        magic) is refused just like raw/vmdk/vhdx above.
+        """
+        img = self.get_image('qed-simple')
+        if not img.path.exists():
+            self.skipTest(f'fixture not found: {img.path}')
+        _, _, rc = self.run_instar_snapshot('-l', str(img.path))
+        self.assertNotEqual(rc, 0)
+
+    def test_qed_create_refused(self):
+        """``-c`` on a qed image: refused with the not-qcow2 message,
+        image byte-unchanged.
+
+        Pins the exact refusal (``snapshot: source is not qcow2 ...``)
+        and, via ``_assert_refusal``, that the QED file is untouched.
+        qemu-img has no QED snapshot driver either, so this is a
+        refusal pin, not a divergence.
+        """
+        self._require_kvm()
+        img = self.get_image('qed-simple')
+        if not img.path.exists():
+            self.skipTest(f'fixture not found: {img.path}')
+        with tempfile.TemporaryDirectory() as td:
+            copy = Path(td) / 'test.qed'
+            shutil.copy2(str(img.path), str(copy))
+            out = self._assert_refusal(copy, ('-c', 'snap'), 'qed create')
+            self.assertIn(
+                'snapshot: source is not qcow2 (qemu-img refuses '
+                'non-qcow2 sources too)', out,
+                f'unexpected output: {out!r}')
+
     # --- LUKS: hand-set crypt_method in a plain qcow2 header ---
 
     def test_luks_create_refused(self):

@@ -1,0 +1,21 @@
+[package]
+name = "qcow1"
+version = "0.1.0"
+edition = "2021"
+description = "QCOW1 (qemu 'qcow' v1) disk image format parsing for bare-metal guest operations"
+license = "Apache-2.0"
+repository = "https://github.com/shakenfist/instar"
+authors = ["Michael Still <mikal@stillhq.com>"]
+keywords = ["qcow", "disk-image", "no-std", "parser"]
+categories = ["no-std", "parser-implementations"]
+# Not published to crates.io: internal to instar's bare-metal sandbox.
+publish = false
+
+[dependencies]
+shared = { path = "../../shared" }
+
+[lib]
+# No std, this is used by bare-metal code
+
+[lints]
+workspace = true

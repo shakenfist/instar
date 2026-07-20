@@ -228,6 +228,69 @@ provides a modular architecture with:
   exposes `VhdxState::scan_allocation` plus `count_allocated_in_bat`
   (which handles the chunk_ratio bitmap interleaving) for the measure
   subcommand.
+- **crates/vdi/** - Shared VDI (VirtualBox Disk Image) format crate:
+  header parsing and validation against qemu's twelve `vdi_open`
+  rules (signature/version/geometry checks, odd `disk_size` rounded
+  up to 512 rather than rejected, any `image_type` accepted,
+  `block_extra` parsed but unused), allocation-order block-map
+  reading with sector-cached lookups, and `VdiState` for stateful
+  block I/O (`init`/`block_lookup`, mirroring `vhd::VhdState`).
+  Read-only: no write/output support. Linked into the qcow2 crate's
+  chain reader behind the `vdi-input` feature and used by convert,
+  compare, bench, and rebase (PLAN-format-coverage phase 2).
+- **crates/parallels/** - Shared Parallels Disk Image format crate:
+  header parsing and validation against qemu's RO `parallels_open`
+  rules (both magics, version check, `tracks`/`bat_entries` limits,
+  `ext_off != 0` refused), per-magic BAT decoding (sector-valued
+  entries under the legacy `WithoutFreeSpace` magic, cluster-valued
+  entries under `WithouFreSpacExt`), the v1-only 32-bit `nb_sectors`
+  mask, and `ParallelsState` for stateful block I/O
+  (`init`/`block_lookup`, mirroring `vdi::VdiState`). Read-only: no
+  write/output support. Linked into the qcow2 crate's chain reader
+  behind the `parallels-input` feature and used by convert, compare,
+  bench, and rebase (PLAN-format-coverage phase 3).
+- **crates/qcow1/** - Shared QCOW1 ("qcow", qemu's original
+  copy-on-write format, superseded by qcow2 but not formally
+  deprecated by qemu) crate: header parsing and validation against qemu's exact
+  RO `qcow_open` rules (magic + version == 1, `cluster_bits`/`l2_bits`
+  ranges, size bounds including the empirically-pinned "Image too
+  large" boundary, `crypt_method` <= 1 at parse, backing-file-name
+  length), two-level L1/L2 block lookup (entries are absolute byte
+  offsets; bit 63 marks a compressed cluster with a byte-granular
+  `{host_offset, csize}` pair), and `Qcow1State` for stateful block
+  I/O (`init`/`block_lookup`, mirroring `parallels::ParallelsState`;
+  `init` additionally refuses `crypt_method != 0`, while `parse`
+  stays lenient for info's benefit). Read-only: no write/output
+  support. Linked into the qcow2 crate's chain reader behind the
+  `qcow1-input` feature (which also pulls in the `decompress`
+  feature for raw-DEFLATE compressed-cluster inflation) and used by
+  convert, compare, bench, and rebase; the reader arm is the first
+  non-QCOW2 format to support backing-chain fall-through, mirroring
+  the QCOW2 arm's own unallocated-cluster recursion instead of the
+  VDI/Parallels arms' zero-fill (PLAN-format-coverage phase 4).
+- **crates/dmg/** - Shared DMG (Apple UDIF) format crate: koly-trailer
+  parsing (reusing the phase-1 shared trailer helpers), chunk-table
+  assembly from either the XML-plist path (string-scanned `<data>`
+  blocks, decoded with a byte-for-byte port of glib's lenient base64)
+  or the old resource-fork path, mish/BLKX chunk-entry parsing into a
+  sorted, verified lookup table, and `DmgState` for stateful per-
+  sector chunk lookup (`init`/`chunk_lookup`, returning span-typed
+  Zero/Raw/Zlib results). Codec scope is zero/raw/ignore/zlib
+  (zlib-WRAPPED inflate, unlike QCOW1's raw-deflate); ADC/bzip2/
+  lzfse/zstd/unknown chunk types get a typed init refusal naming the
+  code rather than qemu's drop-then-EIO shape, and a chunk table that
+  parses to zero entries is refused cleanly at init (where qemu
+  SIGSEGVs on every version tested). Enforces its own bounded-memory
+  caps (`DMG_REGION_STAGE_CAP`, `DMG_MAX_CHUNKS`,
+  `DMG_MAX_STAGED_SECTOR_COUNT`), distinct from qemu's own larger
+  legal range, as typed refusals. Read-only: no write/output support;
+  chunk *decompression* and byte copies live in the reader arm, not
+  this crate. Linked into the qcow2 crate's chain reader behind the
+  `dmg-input` feature (which also pulls in the `decompress` feature)
+  and used by convert, compare, bench, and rebase; unlike every other
+  format-coverage reader, DMG reads a missing/truncated span as an
+  ERROR rather than zero-filling, matching qemu exactly
+  (PLAN-format-coverage phase 5).
 - **crates/luks/** - Shared LUKS format crate: LUKS v1/v2 header
   constants, header parsing, PBKDF2 key derivation, Argon2id key
   derivation (behind `kdf-argon2` feature), AFsplitter key recovery,
@@ -992,6 +1055,72 @@ process the inner image without modification. LUKS v2 containers
 using Argon2id KDF require `--max-guest-memory` to allocate the
 working memory needed for key derivation.
 
+### vdi
+
+VirtualBox Disk Image. Read-only input for convert / compare / dd /
+bench (`src/crates/vdi/`, PLAN-format-coverage phase 2), both
+dynamic and static images. Key structures: a single header
+(validated against qemu's 12 open-time rules) plus a flat block
+map, walked with an allocation-order lookup through the standard
+sector-cached read path. Discarded and unallocated block-map
+entries read as zeros, and reads at or past device capacity
+zero-fill rather than error, matching qemu's lack of length
+validation. `check` still refuses VDI (exit 63); `map`, `measure`,
+and `resize` are unchanged refusals. See
+[docs/format-coverage.md](docs/format-coverage.md) and
+[docs/quirks.md](docs/quirks.md) for the full parity and quirks
+detail.
+
+### parallels
+
+Parallels disk images. Read-only input for convert / compare / dd /
+bench (`src/crates/parallels/`, PLAN-format-coverage phase 3),
+both the legacy "WithoutFreeSpace" (v1) and "WithouFreSpacExt"
+(v2/ext) magics. Key structures: a header (tracks, catalog/BAT
+size, `ext_off`) plus a per-magic BAT (sector-valued under v1,
+cluster-valued under v2), walked through the standard sector-cached
+read path. BAT value 0 and offsets beyond BAT coverage read as
+zeros; `ext_off != 0` is refused at init (a deliberate divergence —
+instar does not parse the format extension). `check` still refuses
+Parallels (exit 63); `map`, `measure`, and `resize` are unchanged
+refusals. See [docs/format-coverage.md](docs/format-coverage.md)
+and [docs/quirks.md](docs/quirks.md) for the full parity and
+quirks detail.
+
+### qcow1 (qcow)
+
+QEMU's original copy-on-write format ("qcow", superseded by qcow2
+but not formally deprecated by qemu). Read-only input for convert /
+compare / dd / bench (`src/crates/qcow1/`, PLAN-format-coverage
+phase 4), including backing chains and compressed clusters. Key
+structures: a header plus two-level (L1/L2) block lookup, with
+compressed clusters as raw DEFLATE (no zlib wrapper) — distinct
+from qcow2's zlib-first decompression helper. QCOW1 is the first
+non-QCOW2 backing format: unallocated clusters fall through to the
+next chain device rather than zero-filling. `check` still refuses
+QCOW1 (exit 63) — genuine parity, since qemu's own qcow driver also
+refuses checks. `map` and `measure` stay refusals (a deliberate
+divergence; qemu supports both on qcow1). See
+[docs/format-coverage.md](docs/format-coverage.md) and
+[docs/quirks.md](docs/quirks.md) for the full parity and quirks
+detail.
+
+### dmg
+
+Apple UDIF disk image. Read-only input for convert / compare / dd /
+bench (`src/crates/dmg/`, PLAN-format-coverage phase 5). Key
+structures: the koly trailer (shared trailer helpers), the
+XML-plist or resource-fork chunk table, and per-sector chunk
+lookup. Supports zlib, raw, ADC, bzip2, and LZFSE-compressed
+chunks. The read-error model inverts every prior phase's posture:
+most malformed inputs are refused rather than best-effort parsed.
+DMG is supported at any backing-chain position. `check` still
+refuses DMG (exit 63), but the refusal reports format `"raw"`, not
+`"dmg"`, matching qemu-img's passthrough divergence. See
+[docs/format-coverage.md](docs/format-coverage.md) and
+[docs/quirks.md](docs/quirks.md) for the full parity and quirks
+detail.
+
 ## Test Image Generation
 
 Synthetic test images that cannot be created by `qemu-img` are built
@@ -1166,11 +1295,17 @@ A mock `CallTable` (in `src/fuzz/src/lib.rs`) backed by thread-local
 fuzzer input provides sector-based I/O, allowing libFuzzer to explore
 deeply malformed inputs.
 
-32 fuzz targets cover all parser crates: format detection, header
-parsing (QCOW2, VMDK, VHD, VHDX, RAW, LUKS), L1/L2 cluster lookup,
-refcount table traversal, zlib decompression, grain directory lookup,
-BAT traversal, VHDX metadata parsing, the measure subcommand's
-calculator math (`fuzz_measure_calc`) and the per-parser
+40 fuzz targets cover all parser crates: format detection, header
+parsing (QCOW2, VMDK, VHD, VHDX, VDI, Parallels, QCOW1, DMG, RAW,
+LUKS), L1/L2 cluster lookup, refcount table traversal, zlib
+decompression, grain directory lookup, BAT traversal, VHDX metadata
+parsing, VDI header parsing and block-map lookup
+(`fuzz_vdi_header`, `fuzz_vdi_bat`), Parallels header parsing and
+BAT lookup (`fuzz_parallels_header`, `fuzz_parallels_bat`), QCOW1
+header parsing and L1/L2 lookup (`fuzz_qcow1_header`,
+`fuzz_qcow1_table`), and DMG koly-trailer/chunk-table parsing and
+per-chunk decode (`fuzz_dmg_table`, `fuzz_dmg_chunk`), the measure
+subcommand's calculator math (`fuzz_measure_calc`) and the per-parser
 `scan_allocation` entry points (`fuzz_measure_scan`), the map
 subcommand's per-parser `map_extents` entry points (`fuzz_map_iter`
 — exercises `qcow2::Qcow2State::map_extents` and the vmdk / vhd /

@@ -2069,3 +2069,277 @@ class TestCheckQcow2Snapshots(InstarTestBase):
             'Snapshot count', stdout,
             f'Should not report snapshots: {stdout}'
         )
+
+
+class TestCheckVdiRefusal(InstarTestBase):
+    """check has no VDI support and must refuse it cleanly.
+
+    Format-coverage phase 2 graduates VDI to a real *read* format for
+    convert/compare/dd/bench, which lifts the phase-1 host gate for
+    every op that discovers a backing chain -- including check.  But
+    check does not link the chain reader; its own format dispatch has
+    no VDI arm.  This pins that check fails cleanly (non-zero exit,
+    "does not support checks" message) rather than silently reading the
+    VDI container as raw or hanging.  Real qemu-img-style VDI check
+    (bmap validation) is future work.
+    """
+
+    def test_check_refuses_vdi(self):
+        """check on vdi-simple exits 63 with the not-supported message."""
+        image = self.get_image('vdi-simple')
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        stdout, stderr, rc = self.run_instar_check(
+            image.path, output_format='human'
+        )
+        self.assertNotEqual(
+            rc, 0,
+            f'check should refuse vdi; stdout={stdout!r} stderr={stderr!r}'
+        )
+        self.assertEqual(
+            rc, 63,
+            f'check on vdi should report not-supported (exit 63); '
+            f'got {rc}, stdout={stdout!r} stderr={stderr!r}'
+        )
+        self.assertIn(
+            'does not support checks', (stdout + stderr).lower(),
+            f'Expected not-supported message for vdi: '
+            f'stdout={stdout!r} stderr={stderr!r}'
+        )
+
+    def test_check_vdi_json_reports_vdi_format(self):
+        """check --output json on vdi still exits 63 and names vdi.
+
+        The JSON envelope is emitted (format=vdi, zero errors) but the
+        process still exits non-zero, so no caller mistakes the empty
+        result for a successful raw read.
+        """
+        image = self.get_image('vdi-simple')
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        stdout, stderr, rc = self.run_instar_check(
+            image.path, output_format='json'
+        )
+        self.assertEqual(
+            rc, 63,
+            f'check --output json on vdi should exit 63; got {rc}, '
+            f'stderr={stderr!r}'
+        )
+        result = json.loads(stdout)
+        self.assertEqual(
+            result.get('format', '').lower(), 'vdi',
+            f'Expected vdi format in json: {stdout}'
+        )
+
+
+class TestCheckParallelsRefusal(InstarTestBase):
+    """check has no Parallels support and must refuse it cleanly.
+
+    Format-coverage phase 3 graduates Parallels to a real *read* format
+    for convert/compare/dd/bench, which lifts the phase-1 host gate for
+    every op that discovers a backing chain -- including check.  But
+    check does not link the chain reader; its own format dispatch has no
+    Parallels arm.  This pins that check fails cleanly (exit 63, "does
+    not support checks" message) rather than silently reading the
+    Parallels container as raw or hanging.  qemu-img's own parallels
+    check is deliberately not mirrored (it asserts on newer qemu for
+    out-of-image BAT entries); refusal stays.
+    """
+
+    def test_check_refuses_parallels(self):
+        """check on parallels-v2 exits 63 with the not-supported message."""
+        image = self.get_image('parallels-v2')
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        stdout, stderr, rc = self.run_instar_check(
+            image.path, output_format='human'
+        )
+        self.assertNotEqual(
+            rc, 0,
+            f'check should refuse parallels; '
+            f'stdout={stdout!r} stderr={stderr!r}'
+        )
+        self.assertEqual(
+            rc, 63,
+            f'check on parallels should report not-supported (exit 63); '
+            f'got {rc}, stdout={stdout!r} stderr={stderr!r}'
+        )
+        self.assertIn(
+            'does not support checks', (stdout + stderr).lower(),
+            f'Expected not-supported message for parallels: '
+            f'stdout={stdout!r} stderr={stderr!r}'
+        )
+
+    def test_check_parallels_json_reports_parallels_format(self):
+        """check --output json on parallels still exits 63 and names it.
+
+        The JSON envelope is emitted (format=parallels, zero errors) but
+        the process still exits non-zero, so no caller mistakes the empty
+        result for a successful raw read.
+        """
+        image = self.get_image('parallels-v2')
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        stdout, stderr, rc = self.run_instar_check(
+            image.path, output_format='json'
+        )
+        self.assertEqual(
+            rc, 63,
+            f'check --output json on parallels should exit 63; got {rc}, '
+            f'stderr={stderr!r}'
+        )
+        result = json.loads(stdout)
+        self.assertEqual(
+            result.get('format', '').lower(), 'parallels',
+            f'Expected parallels format in json: {stdout}'
+        )
+
+
+class TestCheckDmgRefusal(InstarTestBase):
+    """check has no DMG support and must refuse it cleanly (fmt-cov 5).
+
+    Format-coverage phase 5 graduates DMG to a real *read* format for
+    convert/compare/dd/bench, which lifts the phase-1 host gate for every
+    op that discovers a backing chain.  check is deliberately NOT one of
+    those consumers: it does not link the chain reader, and its own
+    format dispatch has no DMG arm.  Unlike VDI/Parallels -- whose header
+    *signatures* the check op still recognises -- DMG detection is a
+    koly-trailer probe that lives only in the info op, so check sees the
+    UDIF container as ``raw`` and refuses with exit 63 "This image format
+    (raw) does not support checks".
+
+    qemu-img check on the same file is ALSO exit 63 ("does not support
+    checks") -- it detects dmg (extension probe) and dmg has no check
+    driver.  So the exit code is parity; only the named format differs
+    (instar says raw, qemu says dmg), a documented consequence of check
+    not being a chain-discovery consumer.  Real DMG check is future work.
+    """
+
+    def test_check_refuses_dmg(self):
+        """check on dmg-simple exits 63 with the not-supported message."""
+        image = self.get_image('dmg-simple')
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        stdout, stderr, rc = self.run_instar_check(
+            image.path, output_format='human'
+        )
+        self.assertEqual(
+            rc, 63,
+            f'check on dmg should report not-supported (exit 63); '
+            f'got {rc}, stdout={stdout!r} stderr={stderr!r}'
+        )
+        # Exact wording (recorded empirically): check probes no koly
+        # trailer, so it names the container "raw", not "dmg".
+        self.assertIn(
+            'This image format (raw) does not support checks',
+            stdout + stderr,
+            f'Expected raw not-supported message for dmg: '
+            f'stdout={stdout!r} stderr={stderr!r}'
+        )
+
+    def test_check_dmg_json_reports_raw_format(self):
+        """check --output json on dmg exits 63; format is raw (no koly probe).
+
+        The JSON envelope is emitted (format=raw, zero errors) but the
+        process still exits non-zero, so no caller mistakes the empty
+        result for a successful check.
+        """
+        image = self.get_image('dmg-simple')
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        stdout, stderr, rc = self.run_instar_check(
+            image.path, output_format='json'
+        )
+        self.assertEqual(
+            rc, 63,
+            f'check --output json on dmg should exit 63; got {rc}, '
+            f'stderr={stderr!r}'
+        )
+        result = json.loads(stdout)
+        self.assertEqual(
+            result.get('format', '').lower(), 'raw',
+            f'Expected raw format in json (check does not koly-probe): '
+            f'{stdout}'
+        )
+
+
+class TestCheckQedRefusal(InstarTestBase):
+    """check has no QED support and must refuse it cleanly (fmt-cov 6).
+
+    Format-coverage phase 6 records QED as read-refused by deliberate
+    policy (see docs/plans/PLAN-format-coverage-phase-06-qed.md): QED
+    keeps its info/detection path but gains no reader.  check does not
+    link the chain reader and its own format dispatch has no QED arm.
+    Unlike DMG (a koly-trailer probe that check never sees, so check
+    names the container "raw"), QED carries an offset-0 header magic
+    that check's format probe DOES recognise -- so check names the
+    format "qed" and refuses with exit 63 "This image format (qed) does
+    not support checks".
+
+    qemu-img check on the same file is deliberately NOT mirrored:
+    qemu-img *can* check QED (a real driver, rc 0).  instar's refusal
+    is the recorded scope divergence, pinned here so it cannot regress
+    into a silent raw read.
+    """
+
+    def test_check_refuses_qed(self):
+        """check on qed-simple exits 63 with the not-supported message."""
+        image = self.get_image('qed-simple')
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        stdout, stderr, rc = self.run_instar_check(
+            image.path, output_format='human'
+        )
+        self.assertEqual(
+            rc, 63,
+            f'check on qed should report not-supported (exit 63); '
+            f'got {rc}, stdout={stdout!r} stderr={stderr!r}'
+        )
+        # Exact wording (recorded empirically): QED's offset-0 magic is
+        # recognised, so check names the format "qed" (not "raw").
+        self.assertIn(
+            'This image format (qed) does not support checks',
+            stdout + stderr,
+            f'Expected qed not-supported message: '
+            f'stdout={stdout!r} stderr={stderr!r}'
+        )
+
+    def test_check_qed_json_reports_qed_format(self):
+        """check --output json on qed exits 63; format is qed.
+
+        The JSON envelope is emitted (format=qed, zero errors) but the
+        process still exits non-zero, so no caller mistakes the empty
+        result for a successful check.
+        """
+        image = self.get_image('qed-simple')
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        stdout, stderr, rc = self.run_instar_check(
+            image.path, output_format='json'
+        )
+        self.assertEqual(
+            rc, 63,
+            f'check --output json on qed should exit 63; got {rc}, '
+            f'stderr={stderr!r}'
+        )
+        result = json.loads(stdout)
+        self.assertEqual(
+            result.get('format', '').lower(), 'qed',
+            f'Expected qed format in json: {stdout}'
+        )

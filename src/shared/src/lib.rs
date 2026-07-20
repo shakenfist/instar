@@ -1544,7 +1544,9 @@ pub enum ImageFormat {
     Qcow1 = 7,
     /// VDI format (VirtualBox, magic: 0xbeda107f at offset 64)
     Vdi = 8,
-    /// QED format (deprecated QEMU format, magic: 0x00444551 "QED\0")
+    /// QED format (magic: 0x00444551 "QED\0"). Read-refused by
+    /// policy — qemu does not deprecate QED, see docs/quirks.md
+    /// format-coverage phase 6.
     Qed = 9,
     /// ISO 9660 format (CD/DVD image, magic: "CD001" at offset 0x8001)
     Iso = 10,
@@ -1555,6 +1557,22 @@ pub enum ImageFormat {
     /// content; content lives in a separate flat extent file
     /// pointed to from the descriptor's extent line.
     VmdkDescriptor = 12,
+    /// Parallels disk image (magic: "WithoutFreeSpace" or
+    /// "WithouFreSpacExt" at offset 0, version 2 at offset 16).
+    /// Full read support (convert/compare/dd/bench) since
+    /// PLAN-format-coverage phase 3.
+    Parallels = 13,
+    /// Bochs growing disk image (magic: "Bochs Virtual HD Image" /
+    /// "Redolog" / "Growing" NUL-terminated fields, version at
+    /// offset 64). Detection and info only; no read path.
+    Bochs = 14,
+    /// cloop compressed loopback image (87-byte V2.0 shell-script
+    /// magic at offset 0). Detection and info only; no read path.
+    Cloop = 15,
+    /// Apple disk image (UDIF), identified by a "koly" trailer near
+    /// the end of the file. Full read support (convert/compare/dd/
+    /// bench) since PLAN-format-coverage phase 5.
+    Dmg = 16,
 }
 
 impl ImageFormat {
@@ -1573,6 +1591,10 @@ impl ImageFormat {
             10 => ImageFormat::Iso,
             11 => ImageFormat::Luks,
             12 => ImageFormat::VmdkDescriptor,
+            13 => ImageFormat::Parallels,
+            14 => ImageFormat::Bochs,
+            15 => ImageFormat::Cloop,
+            16 => ImageFormat::Dmg,
             _ => ImageFormat::Unknown,
         }
     }
@@ -1587,7 +1609,10 @@ impl ImageFormat {
             ImageFormat::Vmdk3 => "vmdk3",
             ImageFormat::Vhd => "vhd",
             ImageFormat::Vhdx => "vhdx",
-            ImageFormat::Qcow1 => "qcow1",
+            // qemu-img / oslo spell the v1 format "qcow" (not "qcow1");
+            // this feeds the check "(qcow)" refusal message and other
+            // guest result strings.
+            ImageFormat::Qcow1 => "qcow",
             ImageFormat::Vdi => "vdi",
             ImageFormat::Qed => "qed",
             ImageFormat::Iso => "iso",
@@ -1596,6 +1621,10 @@ impl ImageFormat {
             // monolithicFlat — the user sees the container format,
             // not the descriptor/flat split.
             ImageFormat::VmdkDescriptor => "vmdk",
+            ImageFormat::Parallels => "parallels",
+            ImageFormat::Bochs => "bochs",
+            ImageFormat::Cloop => "cloop",
+            ImageFormat::Dmg => "dmg",
         }
     }
 }

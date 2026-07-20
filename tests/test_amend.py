@@ -580,6 +580,34 @@ class TestAmendRefusals(TestAmendSmoke):
                 f'qemu unexpectedly accepted cluster_size amend: '
                 f'stderr={qr.stderr!r}')
 
+    def test_qed_refused(self):
+        """amend refuses a qed image, leaving it byte-unchanged.
+
+        Format-coverage phase 6 keeps QED read-refused as policy (see
+        docs/plans/PLAN-format-coverage-phase-06-qed.md).  amend is
+        qcow2-only; a QED image (recognised by its offset-0 header
+        magic) is refused with "only qcow2 images can be amended"
+        before any header byte changes.  qemu-img has no QED amend
+        driver either, so this is a refusal pin, not a divergence.
+        """
+        image = self.get_image('qed-simple')
+        if not image.path.exists():
+            self.skipTest(f'fixture not available: {image.path}')
+        self.skip_if_hash_mismatch(image)
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'inst.qed'
+            shutil.copy2(str(image.path), str(path))
+            before = path.read_bytes()
+            _, stderr, rc = self.run_instar_amend(
+                '-o', 'compat=1.1', str(path))
+            self.assertNotEqual(rc, 0, f'stderr={stderr!r}')
+            self.assertIn(
+                'only qcow2 images can be amended', stderr,
+                f'unexpected stderr: {stderr!r}')
+            self.assertEqual(
+                path.read_bytes(), before,
+                'a refused amend must not touch the qed image')
+
     # --------- Backing-preservation assertions (via instar info) ---------
 
     def test_upgrade_with_backing_preserves_backing(self):

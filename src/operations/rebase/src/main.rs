@@ -182,6 +182,12 @@ const _: () = assert!(
     PLANNER_SCRATCH + PLANNER_SCRATCH_LIMIT <= shared::ALLOC_HEAP_BASE,
     "rebase unsafe/vmdk scratch carve overlaps the allocator heap"
 );
+// The DMG chunk-table init scratch overlays the PLANNER_SCRATCH carve
+// (see the init_chain_states call); it must fit within that carve.
+const _: () = assert!(
+    qcow2::DMG_REQUIRED_SCRATCH <= PLANNER_SCRATCH_LIMIT,
+    "DMG init scratch does not fit in PLANNER_SCRATCH"
+);
 const _: () = assert!(
     STEP_BUF % core::mem::align_of::<Step>() == 0,
     "step buffer must be aligned for [Step; N]"
@@ -1199,6 +1205,17 @@ unsafe fn run_qcow2_safe(call_table: &CallTable, config: &RebaseConfig) -> Rebas
             device_count,
             sector_size,
             CHAIN_CACHES,
+            // Per-device DMG chunk-table scratch. rebase's chain reader
+            // (`read_chain_over_range`) only serves qcow2/raw devices and
+            // refuses every other format, so a DMG device in a rebase
+            // chain is refused at READ time and its chunk table is never
+            // consulted. We still hand init_chain_states a valid,
+            // init-time-free region (the `-u`/vmdk PLANNER_SCRATCH carve,
+            // unused on the safe-mode qcow2 path that reaches here) so the
+            // DMG init has somewhere to stage; DMG_REQUIRED_SCRATCH
+            // (≈3.25 MiB) fits within PLANNER_SCRATCH_LIMIT (4 MiB).
+            PLANNER_SCRATCH,
+            qcow2::DMG_REQUIRED_SCRATCH,
             &mut bytes_read,
         )
     {

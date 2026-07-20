@@ -45,6 +45,276 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Format-coverage phase 6: QED read-refusal recorded as policy
+  (PLAN-format-coverage phase 6).** Resolves the master plan's Open
+  question 1: QED stays a read-refused format, by deliberate
+  decision rather than a parity gap. `instar info` already reads QED
+  correctly (byte-parity with qemu-img); every other subcommand now
+  carries a QED-named refusal pin — check (exit 63, naming the real
+  format "qed" since check's own probe sees QED's offset-0 magic,
+  unlike DMG), map, measure, bench (via the issue-#444 chain gate,
+  with no `"bench:"` message prefix — a deviation from convert/
+  compare/dd), resize, rebase, commit, amend, snapshot, and bitmap
+  (convert/compare/dd and the oslo divergence were already pinned).
+  The decision rests on nil real-world demand for reading QED plus
+  oslo.utils' own explicit ban (a real `QEDInspector` that raises
+  `SafetyCheckFailed: ... banned`) — a stronger ecosystem signal than
+  the "oslo simply lacks an inspector" case that justified reading
+  DMG/VDI/Parallels/QCOW1. This phase also **corrects a stale
+  documentation claim**: QED is not formally deprecated by qemu (no
+  `deprecated.rst` entry, no runtime warning, `qemu-img create -f
+  qed` still works on 10.2.0) — qemu-img reads/writes/checks/maps/
+  measures/benches QED normally; the refusal is instar's own scope
+  choice. Two cosmetic wording inconsistencies are pinned as-is
+  rather than normalised (the `"Qed"` Debug-spelling in resize/
+  rebase; check's exit 63 vs. every other refusal's exit 1). The
+  `qed-simple` baselines in instar-testdata were reconciled: the
+  check/compare trees (permanently unconsumable under this policy)
+  were retired and the generator's check/compare/measure/map
+  whitelists lost `qed`, while the qemu-img-{human,json} trees were
+  kept since they back `info`'s baseline coverage and are the raw
+  source of truth profiles regenerate from. Revisit criteria (a real user
+  request to read QED, or QED images surfacing in a served workload)
+  and a qcow1-class reader sketch are recorded for a future phase if
+  the decision is ever reversed. See
+  [docs/format-coverage.md](docs/format-coverage.md) and
+  [docs/quirks.md](docs/quirks.md) for the full decision record.
+
+- **Format-coverage phase 5: DMG convert-from read path
+  (PLAN-format-coverage phase 5).** `instar convert`, `compare`,
+  `dd`, and `bench` now accept DMG (Apple UDIF) as input, via a new
+  `src/crates/dmg/` no_std parser crate wired into the qcow2 crate's
+  chain reader (`dmg-input` feature, enabled by convert/compare/
+  bench/rebase). The reader parses the koly trailer, then the chunk
+  table from either the XML-plist path (a byte-for-byte port of
+  glib's lenient, invalid-character-skipping base64 decoder) or the
+  old resource-fork path, into a sorted, verified mish/BLKX chunk
+  lookup. Codec scope is zero/raw/ignore/zlib (zlib-wrapped inflate,
+  unlike QCOW1's raw-deflate); ADC/bzip2/lzfse/zstd/unknown chunk
+  types get a typed init refusal naming the code, since qemu's own
+  codec support is compile-flag dependent across the version matrix
+  (bzip2 decodes only on static 6.0.0 and host 10.0.11; lzfse and
+  ADC decode nowhere) and no single build makes a valid parity
+  target. **DMG inverts every prior phase's error posture**: a gap
+  (an uncovered sector, a dropped/refused chunk, or the koly
+  `SectorCount`-vs-mish-coverage tail), a truncated raw span, or
+  truncated compressed data are all read ERRORS, matching qemu
+  exactly — never zero-fill, the opposite of VDI/Parallels/QCOW1's
+  zero-fill posture. **instar avoids a universal qemu crash**: any
+  DMG whose chunk table parses to zero entries (bad mish magic,
+  broken base64, or no `<data>` blocks) SIGSEGVs every tested
+  qemu-img version (static 6.0.0, static 10.2.0, host 10.0.11) on
+  read, while `info` is unaffected; instar refuses the empty table
+  cleanly at reader init instead, shipped as the `dmg-empty-table`
+  reproducer and recorded as a candidate upstream report — distinct
+  from `dmg-no-chunk-table`'s ordinary clean-EINVAL shape (no chunk
+  source at all). instar's own bounded-memory caps (1 MiB staged
+  plist/resource-fork region, 32768-entry chunk table, 4096-sector
+  per-chunk staging) are smaller than qemu's own legal range, a
+  documented capacity divergence pinned by `dmg-overcap-chunk` (a
+  qemu-legal 4 MiB chunk that qemu converts fine but instar refuses
+  typed). Detection stays the phase-1 content-based koly-trailer
+  scan, strictly stronger than qemu-img's `.dmg`-extension-only
+  probe — now with a real behavioural consequence: an extensionless
+  DMG converts as its raw container bytes under qemu but as the real
+  decoded disk under instar, pinned as a deliberate divergence. DMG
+  is supported at any backing-chain position, proven by a `qcow2 -F
+  dmg` overlay-over-DMG chain converging byte-for-byte with qemu.
+  `check` still refuses DMG (exit 63) but names the format "raw",
+  not "dmg", since check's dispatch never runs the koly probe — a
+  genuine rc parity with qemu-img's own dmg-check refusal, wording
+  aside. `map`, `measure`, and `resize` are unaffected by this phase
+  and keep their phase-1 raw pass-through (master-plan future work).
+  Sixteen fixtures total (five safe including the phase-1
+  `dmg-simple`: `dmg-mixed`, `dmg-multipart`, `dmg-rsrc-fork`, and
+  the error-parity `dmg-gap`; eleven malformed/refused, extending the
+  four phase-1 trailer fixtures with seven new reader-refusal
+  fixtures for over-cap sizes, each unsupported codec, the capacity
+  divergence, and the empty-table crash reproducer), cross-version
+  qemu-img baselines where parity exists, oslo cross-validation,
+  coverage-guided fuzzing of the table/chunk parsers
+  (`fuzz_dmg_table`, `fuzz_dmg_chunk`), and `dmg` added to the
+  differential fuzzer's format pool via a deterministic mini-builder
+  (qemu-img cannot create DMGs) with `op_map`/`op_measure` gated to
+  reflect the retained raw-pass-through divergence. See
+  [docs/format-coverage.md](docs/format-coverage.md) and
+  [docs/quirks.md](docs/quirks.md) for the full divergence records.
+
+- **Format-coverage phase 4: QCOW1 convert-from read path
+  (PLAN-format-coverage phase 4).** `instar convert`, `compare`,
+  `dd`, and `bench` now accept QCOW1 ("qcow", qemu's original
+  deprecated format) as input, including backing chains and
+  compressed clusters, via a new `src/crates/qcow1/` no_std parser
+  crate wired into the qcow2 crate's chain reader (`qcow1-input`
+  feature, enabled by convert/compare/bench/rebase). This phase also
+  **fixed two pre-existing defects**: (1) real QCOW1 images were
+  misdetected as QCOW2 — `detect_format_from_header` checked only
+  the shared `QFI\xfb` magic and never the version field, producing
+  garbage `info` output (virtual size 0, a QCOW2-shaped `compat:
+  0.10` block) and a misleading convert error; detection is now
+  version-aware (`QFI\xfb` + version 1 => QCOW1, else the QCOW2
+  route), with the reader arm landing strictly before the detection
+  fix to avoid a latent silent-raw-read hazard; (2)
+  `INFO_RESULT_FLAG_ENCRYPTED` was declared but never consumed by
+  either info emitter — both now print `encrypted: yes` /
+  `"encrypted": true`, gated off for the `"luks"` format string so
+  the hand-maintained LUKS goldens stay byte-identical (encrypted
+  QCOW2 images pick up the line for free as a side effect, with no
+  baseline churn). The reader matches qemu's exact RO open path:
+  `cluster_bits`/`l2_bits` range checks, size bounds including the
+  empirically-pinned "Image too large" boundary, `crypt_method` <= 1
+  at parse; a per-cluster walk (clusters down to 512 bytes);
+  backing-chain fall-through on unallocated clusters — QCOW1 is the
+  first non-QCOW2 format with backing support, and the reader arm
+  mirrors the QCOW2 arm's own recursion mechanism rather than the
+  VDI/Parallels arms' zero-fill; raw-DEFLATE compressed clusters (no
+  zlib wrapper, unlike QCOW2's zlib-first two-try helper); past-EOF
+  and truncated data-cluster reads zero-fill on every qemu version
+  (no Parallels-style 8.1.x window); and odd header sizes truncate
+  **down** to `total_sectors*512`, the opposite of VDI's round-up.
+  instar now emits the format string `"qcow"` (matching qemu-img and
+  oslo.utils), with `"qcow1"` kept as an accepted input alias.
+  Malformed QCOW1 fixtures get a distinct `info` posture from
+  VDI/Parallels: the new info arm validates the same fields the
+  reader does and falls back to an empty (virtual size 0) default on
+  failure, rather than best-effort nonzero fields. `check` still
+  refuses QCOW1 (exit 63) — genuine parity, since qemu's own qcow
+  driver has no check support either (wording differs only
+  cosmetically). `map` and `measure` stay refusals — a deliberate,
+  recorded divergence, since qemu-img actually supports both on
+  qcow1 (master-plan future work; AES decryption of encrypted qcow1
+  is future work too). Encrypted (AES, crypt_method=1) QCOW1 images:
+  `info` works and reports the new encrypted line; data ops refuse
+  cleanly, matching keyless qemu. Twelve new fixtures (seven safe:
+  scattered-allocation data, a compressed twin, a backing overlay +
+  base pair doubling as small-cluster coverage, an encrypted image,
+  a past-EOF data cluster, and an odd-size header; five malformed:
+  bad cluster_bits, bad l2_bits, oversized, invalid crypt_method, an
+  overlong backing name), cross-version qemu-img baselines, oslo
+  cross-validation (oslo detects qcow1 as `"qcow2"` by magic alone;
+  virtual sizes agree except on the odd-size fixture), coverage-
+  guided fuzzing of the header parser and two-level table walk
+  (`fuzz_qcow1_header`, `fuzz_qcow1_table`), and `qcow` added to the
+  differential fuzzer's format pool. A recorded qemu-img quirk:
+  `convert -c -O qcow` writes a valid compressed image but exits 1
+  with empty stderr on every version; the fixture generator and
+  differential fuzzer verify by roundtrip instead of exit code. See
+  [docs/format-coverage.md](docs/format-coverage.md) and
+  [docs/quirks.md](docs/quirks.md) for the full divergence records.
+
+- **Format-coverage phase 3: Parallels convert-from read path
+  (PLAN-format-coverage phase 3).** `instar convert`, `compare`,
+  `dd`, and `bench` now accept Parallels Disk Image as input — both
+  the legacy `WithoutFreeSpace` (v1) and newer `WithouFreSpacExt`
+  (v2/ext) magics — via a new `src/crates/parallels/` no_std parser
+  crate wired into the qcow2 crate's chain reader (`parallels-input`
+  feature, enabled by convert/compare/bench/rebase to avoid the
+  raw-fallback hazard #444 closed). The reader matches qemu's RO open
+  path exactly: `tracks`/`bat_entries` limits (the `tracks` cap is
+  4186127, corrected during this phase from an off-by-681 planning
+  estimate), per-magic BAT decoding (sector-valued entries under v1,
+  cluster-valued entries under v2/ext), the v1-only 32-bit
+  `nb_sectors` mask, `inuse`-dirty images always readable (instar
+  only ever opens read-only), `data_off` ignored by reads, and
+  past-EOF/truncated reads zero-filling rather than erroring — with
+  one recorded version drift: qemu 8.1.0-8.1.5 refuse a past-EOF BAT
+  entry at open (a regression window closed in 8.2.0), which instar's
+  uniform zero-fill diverges from; the affected baselines are recorded
+  faithfully via a new `profile-8-1-0` bucket, and
+  `tests/test_info_safe.py` gained a general mechanism to skip
+  scenario generation for any profile whose baseline meta records a
+  non-zero qemu-img return code. A non-zero `ext_off` is refused at
+  init — a deliberate divergence from qemu's read-only format-
+  extension parsing (dirty bitmaps); no shipped or creatable fixture
+  needs it today. Because qemu prints no `cluster_size` for Parallels,
+  `instar info` now computes and stores it internally
+  (`tracks << 9`) so the chain reader's chunking respects real cluster
+  boundaries, while both emitters suppress the field for the
+  `"parallels"` format string so `info` output stays byte-identical to
+  qemu (verified by a full `test_info_safe` run, zero regressions).
+  `parallels` leaves the phase-1 #444 refusal set entirely — it now
+  has a real reader instead of a typed refusal. `check` is unaffected
+  and still refuses Parallels (exit 63, "This image format
+  (parallels) does not support checks"); qemu-img's own Parallels
+  check is not mirrored because it asserts/crashes on newer qemu
+  (10.2.0's `parallels_check_duplicate` assertion) for out-of-image
+  BAT entries, making refusal the safer stance. `map`, `measure`, and
+  `resize` are unchanged refusals. Nine new fixtures (five safe: a
+  non-contiguous/swapped BAT, the v1-magic twin with sector-valued
+  BAT entries, an `inuse`-dirty twin, a past-EOF BAT entry, and a
+  4 KiB-cluster small-cluster case; four malformed: zero tracks, huge
+  tracks, huge catalog, bad extension magic) plus the existing
+  `parallels-v1`/`parallels-v2` joining the convert-parity matrix, all
+  with cross-version qemu-img baselines, coverage-guided fuzzing of
+  the header parser and BAT walk across both magics
+  (`fuzz_parallels_header`, `fuzz_parallels_bat`), and `parallels`
+  added to the differential fuzzer's format pool. See
+  [docs/format-coverage.md](docs/format-coverage.md) and
+  [docs/quirks.md](docs/quirks.md) for the full divergence records.
+
+- **Format-coverage phase 2: VDI convert-from read path
+  (PLAN-format-coverage phase 2).** `instar convert`, `compare`, and
+  `dd` now accept VDI (VirtualBox Disk Image) as input — both dynamic
+  and static images — via a new `src/crates/vdi/` no_std parser crate
+  wired into the qcow2 crate's chain reader (`vdi-input` feature,
+  enabled by convert/compare/bench/rebase to avoid the raw-fallback
+  hazard #444 closed). The reader matches qemu's `vdi_open` exactly:
+  all twelve open-time validation rules, allocation-order block-map
+  lookup, discarded/unallocated entries reading as zeros,
+  `block_extra` never participating in offset math, any `image_type`
+  accepted (only type 2 is special, and needs no extra handling), and
+  reads at or past the device capacity — including straddling reads —
+  zero-filling rather than erroring, since qemu never validates VDI
+  file length. An odd `disk_size` rounds up to 512 at open, matching
+  qemu; `instar info`'s existing VDI parser now reports the rounded
+  value too (previously reported the raw bytes), with a
+  `KNOWN_VSIZE_DIVERGENCES` entry recording the resulting oslo.utils
+  split (oslo reports the raw value). `vdi` leaves the phase-1 #444
+  refusal set entirely — it now has a real reader instead of a typed
+  refusal. `check` is unaffected and still refuses VDI (exit 63, "This
+  image format (vdi) does not support checks"); `map`, `measure`, and
+  `resize` are unchanged refusals. Nine new fixtures (four safe: data
+  at multiple blocks with a discarded entry, static/identity block
+  map, odd-size round-up, past-EOF zero-fill; five malformed:
+  bad version, unaligned block-map offset, wrong block size, non-NULL
+  parent UUID, too many blocks) plus the existing `vdi-simple` flipped
+  to CI, all with cross-version qemu-img baselines, coverage-guided
+  fuzzing of the header parser and block-map walk (`fuzz_vdi_header`,
+  `fuzz_vdi_bat`), and `vdi` added to the differential fuzzer's format
+  pool. See [docs/format-coverage.md](docs/format-coverage.md) and
+  [docs/quirks.md](docs/quirks.md) for the full divergence records.
+
+- **Format-coverage phase 1: Parallels, Bochs, cloop, and DMG
+  detection + info parity (PLAN-format-coverage phase 1).** `instar
+  info` now detects and correctly sizes four previously-unrecognised
+  formats — Parallels (both `WithoutFreeSpace` and
+  `WithouFreSpacExt` magics), Bochs (growing-mode), cloop (V2.0), and
+  DMG (UDIF, detected by a new content-based koly-trailer scan rather
+  than qemu-img's `.dmg`-filename probe) — matching `qemu-img info`
+  byte-for-byte (human and JSON) across the 80-version baseline
+  matrix. Also closes
+  [#444](https://github.com/shakenfist/instar/issues/444): convert,
+  compare, and dd previously read any detected-but-unsupported input
+  format (qed, vdi, and now also the four new formats) silently as
+  raw bytes zero-padded to the declared virtual size; a new central
+  refusal gate in `discover_backing_chain` now rejects these with a
+  typed `"<op>: input format '<fmt>' is detected but not supported
+  for reading (detection and info only)"` error, covering mid-chain
+  backing positions too. ISO is deliberately exempt (its raw
+  interpretation is semantically correct and matches qemu-img, which
+  has no ISO driver). Host info-emitter parity fixes: qemu-img's
+  human-size formatter unit-selection for sub-MiB, KiB-round values,
+  512-byte child-node file-length rounding for structured formats,
+  and JSON `dirty-flag` suppression for the four detect-only drivers.
+  New fixtures registered in `tests/manifest.json`: `parallels-v1`,
+  `parallels-v2`, `bochs-growing`, `cloop-simple` (existing
+  `instar-testdata` images, newly exercised), plus a generated
+  `dmg-simple` UDIF image and four adversarial DMG fixtures
+  (truncated koly, negative/huge SectorCount, missing chunk table),
+  all with cross-version qemu-img baselines. See
+  [docs/format-coverage.md](docs/format-coverage.md) and
+  [docs/quirks.md](docs/quirks.md) for the full divergence records.
+
 - **Fuzzing for the qcow2-write planner and its snapshot-bearing
   copy-on-write paths (PLAN-qcow2-write-infrastructure phase 8).**
   Two new coverage-guided libFuzzer targets exercise the

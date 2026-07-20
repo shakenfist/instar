@@ -577,7 +577,7 @@ pub fn af_diffuse_sha1(data: &mut [u8], key_bytes: usize) {
         let offset = i * digest_size;
         let block_num = (i as u32).to_be_bytes();
         let mut hasher = Sha1::new();
-        hasher.update(&block_num);
+        hasher.update(block_num);
         hasher.update(&data[offset..offset + digest_size]);
         let result = hasher.finalize();
         data[offset..offset + digest_size].copy_from_slice(&result);
@@ -586,7 +586,7 @@ pub fn af_diffuse_sha1(data: &mut [u8], key_bytes: usize) {
         let offset = full_blocks * digest_size;
         let block_num = (full_blocks as u32).to_be_bytes();
         let mut hasher = Sha1::new();
-        hasher.update(&block_num);
+        hasher.update(block_num);
         hasher.update(&data[offset..offset + remainder]);
         let result = hasher.finalize();
         data[offset..offset + remainder].copy_from_slice(&result[..remainder]);
@@ -604,7 +604,7 @@ pub fn af_diffuse_sha256(data: &mut [u8], key_bytes: usize) {
         let offset = i * digest_size;
         let block_num = (i as u32).to_be_bytes();
         let mut hasher = Sha256::new();
-        hasher.update(&block_num);
+        hasher.update(block_num);
         hasher.update(&data[offset..offset + digest_size]);
         let result = hasher.finalize();
         data[offset..offset + digest_size].copy_from_slice(&result);
@@ -613,7 +613,7 @@ pub fn af_diffuse_sha256(data: &mut [u8], key_bytes: usize) {
         let offset = full_blocks * digest_size;
         let block_num = (full_blocks as u32).to_be_bytes();
         let mut hasher = Sha256::new();
-        hasher.update(&block_num);
+        hasher.update(block_num);
         hasher.update(&data[offset..offset + remainder]);
         let result = hasher.finalize();
         data[offset..offset + remainder].copy_from_slice(&result[..remainder]);
@@ -931,9 +931,9 @@ pub fn pbkdf2_derive(
     use_sha256: bool,
 ) {
     if use_sha256 {
-        pbkdf2::<Hmac<Sha256>>(passphrase, salt, iterations, output).unwrap_or_else(|_| {});
+        pbkdf2::<Hmac<Sha256>>(passphrase, salt, iterations, output).unwrap_or(());
     } else {
-        pbkdf2::<Hmac<Sha1>>(passphrase, salt, iterations, output).unwrap_or_else(|_| {});
+        pbkdf2::<Hmac<Sha1>>(passphrase, salt, iterations, output).unwrap_or(());
     }
 }
 

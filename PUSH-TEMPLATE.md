@@ -37,7 +37,7 @@ It performs (and exits non-zero on any failure):
   the rust-lint container)
 - `make instar` (full build, including guest binaries
   via the devcontainer)
-- `make check-binary-sizes` (384KB-per-operation cap)
+- `make check-binary-sizes` (768KB-per-operation cap)
 - `make test-rust` (workspace unit tests, excluding the
   no_main guest binaries)
 - `make fuzz-build` (compiles every libFuzzer target; the
@@ -90,7 +90,7 @@ conventions in `AGENTS.md`:
   raw pointer arithmetic.
 - Guest operation conventions: each operation lives in
   `src/operations/<name>/`, links against the shared
-  format crates, and stays under the 384KB binary cap.
+  format crates, and stays under the 768KB binary cap.
 - Field rename / unit-change discipline: did any field
   silently change units (e.g. bytes → sectors, sectors
   → clusters) without a rename or doc comment?

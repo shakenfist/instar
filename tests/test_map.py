@@ -634,6 +634,82 @@ class TestMapErrorPaths(TestMapSmoke):
             f'stderr: {stderr!r}'
         )
 
+    # ----------- Phase-1 format-coverage: new-format refusals -----------
+    #
+    # map does not use the host chain-discovery gate (issue #444); it
+    # calls the guest's `detect_format_from_header` directly and any
+    # non-raw, non-read format falls into the default arm, which the
+    # guest reports as ERROR_INVALID_SOURCE ("source format
+    # unrecognised") and the host surfaces as a non-zero exit. Bochs,
+    # cloop, and parallels are header-detected, so they hit this path.
+    # DMG is detected only by its koly trailer, and that trailer probe
+    # is wired into `instar info` only (not into
+    # `detect_format_from_header`), so map never sees it as anything
+    # but raw -- it reads the DMG container bytes as a raw device
+    # instead of refusing. This mirrors the iso quirk pinned in
+    # TestConvertDetectOnlyRefusal.test_convert_iso_passthrough.
+
+    def test_bochs_refused(self):
+        """map refuses a bochs-growing source (header-detected)."""
+        image = self.get_image('bochs-growing')
+        if not image.path.exists():
+            self.skipTest(f'fixture not available: {image.path}')
+        stdout, stderr, rc = self.run_instar_map(str(image.path))
+        self.assertNotEqual(rc, 0, f'stdout: {stdout!r} stderr: {stderr!r}')
+        self.assertIn('source format unrecognised', stderr)
+
+    def test_cloop_refused(self):
+        """map refuses a cloop-simple source (header-detected)."""
+        image = self.get_image('cloop-simple')
+        if not image.path.exists():
+            self.skipTest(f'fixture not available: {image.path}')
+        stdout, stderr, rc = self.run_instar_map(str(image.path))
+        self.assertNotEqual(rc, 0, f'stdout: {stdout!r} stderr: {stderr!r}')
+        self.assertIn('source format unrecognised', stderr)
+
+    def test_parallels_refused(self):
+        """map refuses a parallels-v1 source (header-detected)."""
+        image = self.get_image('parallels-v1')
+        if not image.path.exists():
+            self.skipTest(f'fixture not available: {image.path}')
+        stdout, stderr, rc = self.run_instar_map(str(image.path))
+        self.assertNotEqual(rc, 0, f'stdout: {stdout!r} stderr: {stderr!r}')
+        self.assertIn('source format unrecognised', stderr)
+
+    def test_qed_refused(self):
+        """map refuses a qed-simple source (header-detected).
+
+        Format-coverage phase 6 keeps QED read-refused as policy (see
+        docs/plans/PLAN-format-coverage-phase-06-qed.md).  QED's
+        offset-0 header magic is recognised by the guest probe but has
+        no reader arm, so it lands in the same default arm as
+        bochs/cloop/parallels and is refused with "source format
+        unrecognised".  qemu-img maps QED (rc 0); instar's refusal is
+        the recorded scope divergence.
+        """
+        image = self.get_image('qed-simple')
+        if not image.path.exists():
+            self.skipTest(f'fixture not available: {image.path}')
+        stdout, stderr, rc = self.run_instar_map(str(image.path))
+        self.assertNotEqual(rc, 0, f'stdout: {stdout!r} stderr: {stderr!r}')
+        self.assertIn('source format unrecognised', stderr)
+
+    def test_dmg_reads_as_raw(self):
+        """map does NOT refuse dmg-simple; it reads it as raw.
+
+        DMG detection is trailer-only and not wired into map's guest
+        format probe (`detect_format_from_header`), so a DMG source is
+        indistinguishable from raw here and map succeeds, mapping the
+        whole file as one allocated raw extent. Documents the phase-1
+        gap rather than asserting a refusal that does not exist.
+        """
+        image = self.get_image('dmg-simple')
+        if not image.path.exists():
+            self.skipTest(f'fixture not available: {image.path}')
+        stdout, stderr, rc = self.run_instar_map(str(image.path))
+        self.assertEqual(rc, 0, f'stdout: {stdout!r} stderr: {stderr!r}')
+        self.assertIn(str(image.path), stdout)
+
 
 class TestMapDivergenceRegression(TestMapSmoke):
     """Assert each KNOWN_MAP_DIVERGENCES entry still diverges.

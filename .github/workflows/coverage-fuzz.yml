@@ -257,6 +257,14 @@ jobs:
               fuzz_bench_schedule
               fuzz_qcow2_write
               fuzz_qcow2_write_growth
+              fuzz_vdi_header
+              fuzz_vdi_bat
+              fuzz_parallels_header
+              fuzz_parallels_bat
+              fuzz_qcow1_header
+              fuzz_qcow1_table
+              fuzz_dmg_table
+              fuzz_dmg_chunk
             )
           fi
 

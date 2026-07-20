@@ -189,7 +189,7 @@ detailed enough for it to succeed.
 as if briefing a colleague who has never seen the
 codebase. Include: what to change, which files to touch,
 what patterns to follow, and any non-obvious constraints
-(memory layout, the 384KB guest binary cap, the
+(memory layout, the 768KB guest binary cap, the
 no-`std` requirement of the format crates, the call
 table boundary). The better the brief, the lower the
 effort level needed and the lighter the model that can
@@ -200,7 +200,7 @@ did, so the implementing agent doesn't repeat it. For
 example, instead of "add tests for the QCOW2 L2 parser",
 write "add tests for `parse_l2_entry()` in
 `src/crates/qcow2/src/lib.rs`. Use the adversarial
-fixtures in `imago-testdata/adversarial/qcow2/` (cluster
+fixtures in `instar-testdata/adversarial/qcow2/` (cluster
 boundary edges, OFLAG_COMPRESSED set with extended L2
 cluster, refcount underflow). The function takes
 `(entry: u64, cluster_bits: u32)` and returns
@@ -216,7 +216,7 @@ should verify:
 - [ ] No unrelated files were modified.
 - [ ] `make instar` builds and `make lint` is clean.
 - [ ] Guest binaries pass `make check-binary-sizes`
-      (384KB limit per operation).
+      (768KB limit per operation).
 - [ ] `make test-rust` and the relevant
       `make test-integration` targets pass.
 - [ ] `pre-commit run --all-files` passes.
@@ -234,7 +234,7 @@ We will know when this plan has been successfully implemented
 because the following statements will be true:
 
 * `make instar` builds and `make lint` is clean.
-* Guest binaries pass `make check-binary-sizes` (384KB limit).
+* Guest binaries pass `make check-binary-sizes` (768KB limit).
 * All Rust unit tests pass (`make test-rust`).
 * All Python integration tests pass (`make test-integration`).
 * `pre-commit run --all-files` passes.

@@ -1229,6 +1229,35 @@ class TestBitmapRefusals(TestBitmapSmoke):
             self.assertIn('not a qcow2 image', stderr,
                           f'unexpected stderr: {stderr!r}')
 
+    def test_qed_refused(self):
+        """A qed image is refused host-side, byte-unchanged.
+
+        Format-coverage phase 6 keeps QED read-refused as policy (see
+        docs/plans/PLAN-format-coverage-phase-06-qed.md).  QED's
+        offset-0 header magic is recognised by `probe_bitmap_target`,
+        which runs before any guest launch (no kvm) and refuses every
+        non-qcow2 format -- so a QED image is refused with "not a qcow2
+        image" and left untouched.  qemu-img has no QED bitmap driver
+        either, so this is a refusal pin, not a divergence.
+        """
+        image = self.get_image('qed-simple')
+        if not image.path.exists():
+            self.skipTest(f'fixture not available: {image.path}')
+        self.skip_if_hash_mismatch(image)
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'img.qed'
+            shutil.copy(str(image.path), str(path))
+            before = path.read_bytes()
+            _, stderr, rc = self.run_instar_bitmap('--add', str(path), 'b0')
+            self.assertNotEqual(
+                rc, 0,
+                f'instar should refuse a qed image; stderr={stderr!r}')
+            self.assertIn('not a qcow2 image', stderr,
+                          f'unexpected stderr: {stderr!r}')
+            self.assertEqual(
+                path.read_bytes(), before,
+                'a refused bitmap op must not touch the qed image')
+
     # ---- Guest-side refusals (mapped from map_bitmap_error; need kvm) --
 
     def test_v2_image_refused(self):

@@ -2036,3 +2036,202 @@ class TestBenchDivergenceRegression(BenchTestBase):
                 f'qemu-img unexpectedly refused the headerless raw file '
                 f'(the divergence premise no longer holds): '
                 f'stderr={q_err!r}')
+
+
+class TestBenchVdi(BenchTestBase):
+    """Smoke test for benchmarking VDI input (format-coverage phase 2).
+
+    VDI graduates to a real read format for the reader-linking ops,
+    including bench (bench's Cargo.toml enables the qcow2 `vdi-input`
+    feature and its guest `read_family` allowlist gained a Vdi arm).
+    This pins that `instar bench` reads the aligned vdi-simple fixture
+    successfully (exit 0, well-formed header + completion line) and
+    stays header-byte-identical to `qemu-img bench`, rather than
+    refusing it with `ERROR_UNSUPPORTED_FORMAT` as before graduation.
+    """
+
+    def test_bench_vdi_simple(self):
+        """bench reads vdi-simple: exit 0, header parity with qemu-img."""
+        self._require_kvm()
+        image = self.get_image('vdi-simple')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        args = ['-c', '100', '-f', 'vdi', str(image.path)]
+
+        i_out, i_err, i_rc = self.run_instar_bench(*args)
+        self.assertEqual(
+            i_rc, 0, f'instar bench on vdi failed: stderr={i_err!r}')
+        self.assertRegex(i_out.splitlines()[-1], COMPLETION_RE)
+
+        q_out, q_err, q_rc = self.run_qemu_bench(*args)
+        self.assertEqual(
+            q_rc, 0, f'qemu-img bench on vdi failed: stderr={q_err!r}')
+
+        self.assertEqual(
+            self.header_line(i_out), self.header_line(q_out),
+            f'bench header mismatch on vdi:\n'
+            f'  instar: {self.header_line(i_out)!r}\n'
+            f'  qemu:   {self.header_line(q_out)!r}')
+        self.assertRegex(q_out.splitlines()[-1], COMPLETION_RE)
+
+
+class TestBenchParallels(BenchTestBase):
+    """Smoke test for benchmarking Parallels input (format-coverage phase 3).
+
+    Parallels graduates to a real read format for the reader-linking ops,
+    including bench (bench's Cargo.toml enables the qcow2 `parallels-input`
+    feature and its guest `read_family` allowlist gained a Parallels arm).
+    This pins that `instar bench` reads the parallels-v2 fixture
+    successfully (exit 0, well-formed header + completion line) and stays
+    header-byte-identical to `qemu-img bench`, rather than refusing it
+    with `ERROR_UNSUPPORTED_FORMAT` as before graduation.
+    """
+
+    def test_bench_parallels_v2(self):
+        """bench reads parallels-v2: exit 0, header parity with qemu-img."""
+        self._require_kvm()
+        image = self.get_image('parallels-v2')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        args = ['-c', '100', '-f', 'parallels', str(image.path)]
+
+        i_out, i_err, i_rc = self.run_instar_bench(*args)
+        self.assertEqual(
+            i_rc, 0, f'instar bench on parallels failed: stderr={i_err!r}')
+        self.assertRegex(i_out.splitlines()[-1], COMPLETION_RE)
+
+        q_out, q_err, q_rc = self.run_qemu_bench(*args)
+        self.assertEqual(
+            q_rc, 0, f'qemu-img bench on parallels failed: stderr={q_err!r}')
+
+        self.assertEqual(
+            self.header_line(i_out), self.header_line(q_out),
+            f'bench header mismatch on parallels:\n'
+            f'  instar: {self.header_line(i_out)!r}\n'
+            f'  qemu:   {self.header_line(q_out)!r}')
+        self.assertRegex(q_out.splitlines()[-1], COMPLETION_RE)
+
+
+class TestBenchQcow1(BenchTestBase):
+    """Smoke test for benchmarking QCOW1 input (format-coverage phase 4).
+
+    qcow1 graduates to a real read format for the reader-linking ops,
+    including bench (bench's Cargo.toml enables the qcow2 ``qcow1-input``
+    feature and its guest ``read_family`` allowlist gained a Qcow1 arm).
+    This pins that ``instar bench`` reads the qcow1-data fixture
+    successfully (exit 0, well-formed header + completion line) and stays
+    header-byte-identical to ``qemu-img bench``, rather than being
+    misdetected as qcow2.  The ``-f qcow`` format hint is qemu's own name
+    for the format.
+    """
+
+    def test_bench_qcow1_data(self):
+        """bench reads qcow1-data: exit 0, header parity with qemu-img."""
+        self._require_kvm()
+        image = self.get_image('qcow1-data')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        args = ['-c', '100', '-f', 'qcow', str(image.path)]
+
+        i_out, i_err, i_rc = self.run_instar_bench(*args)
+        self.assertEqual(
+            i_rc, 0, f'instar bench on qcow1 failed: stderr={i_err!r}')
+        self.assertRegex(i_out.splitlines()[-1], COMPLETION_RE)
+
+        q_out, q_err, q_rc = self.run_qemu_bench(*args)
+        self.assertEqual(
+            q_rc, 0, f'qemu-img bench on qcow1 failed: stderr={q_err!r}')
+
+        self.assertEqual(
+            self.header_line(i_out), self.header_line(q_out),
+            f'bench header mismatch on qcow1:\n'
+            f'  instar: {self.header_line(i_out)!r}\n'
+            f'  qemu:   {self.header_line(q_out)!r}')
+        self.assertRegex(q_out.splitlines()[-1], COMPLETION_RE)
+
+
+class TestBenchDmg(BenchTestBase):
+    """Smoke test for benchmarking DMG input (format-coverage phase 5).
+
+    DMG graduates to a real read format for the reader-linking ops,
+    including bench (bench's Cargo.toml enables the qcow2 ``dmg-input``
+    feature and its guest ``read_family`` allowlist gained a Dmg arm).
+    This pins that ``instar bench`` reads the dmg-mixed fixture
+    successfully (exit 0, well-formed header + completion line) and stays
+    header-byte-identical to ``qemu-img bench``, rather than refusing it
+    with ``ERROR_UNSUPPORTED_FORMAT`` as before graduation.  The ``-f
+    dmg`` format hint is qemu's own name for the format.
+    """
+
+    def test_bench_dmg_mixed(self):
+        """bench reads dmg-mixed: exit 0, header parity with qemu-img."""
+        self._require_kvm()
+        image = self.get_image('dmg-mixed')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        args = ['-c', '100', '-f', 'dmg', str(image.path)]
+
+        i_out, i_err, i_rc = self.run_instar_bench(*args)
+        self.assertEqual(
+            i_rc, 0, f'instar bench on dmg failed: stderr={i_err!r}')
+        self.assertRegex(i_out.splitlines()[-1], COMPLETION_RE)
+
+        q_out, q_err, q_rc = self.run_qemu_bench(*args)
+        self.assertEqual(
+            q_rc, 0, f'qemu-img bench on dmg failed: stderr={q_err!r}')
+
+        self.assertEqual(
+            self.header_line(i_out), self.header_line(q_out),
+            f'bench header mismatch on dmg:\n'
+            f'  instar: {self.header_line(i_out)!r}\n'
+            f'  qemu:   {self.header_line(q_out)!r}')
+        self.assertRegex(q_out.splitlines()[-1], COMPLETION_RE)
+
+
+class TestBenchQed(BenchTestBase):
+    """bench refuses QED input (format-coverage phase 6).
+
+    Unlike VDI/Parallels/QCOW1/DMG -- which graduated to real read
+    formats -- QED stays read-refused by deliberate policy (see
+    docs/plans/PLAN-format-coverage-phase-06-qed.md).  bench routes
+    every source through the issue-#444 host chain-discovery gate, so a
+    QED input is refused there ("input format 'qed' is detected but not
+    supported for reading (detection and info only)") before any guest
+    launches -- no KVM required.  qemu-img benches QED (rc 0); instar's
+    refusal is the recorded scope divergence.  Pinned so it cannot
+    regress into a silent raw read or a graduation.
+    """
+
+    def test_bench_refuses_qed(self):
+        """bench on qed-simple exits 1 via the chain-discovery gate."""
+        image = self.get_image('qed-simple')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        i_out, i_err, i_rc = self.run_instar_bench(
+            '-c', '100', str(image.path))
+        self.assertEqual(
+            i_rc, 1, f'stdout={i_out!r} stderr={i_err!r}')
+        # No header may be printed before discovery fails (mirrors the
+        # zero-byte early-failure divergence pin).
+        self.assertEqual(
+            i_out, '', 'instar must not print a header before the '
+                       'QED refusal')
+        # The refusal surfaces through the chain-discovery gate.  Unlike
+        # convert/dd (which prefix "convert:"/"dd:"), bench renders the
+        # gate error as "error discovering backing chain for <path>: ...".
+        self.assertIn('error discovering backing chain', i_err)
+        self.assertIn(
+            "input format 'qed' is detected but not supported for "
+            'reading (detection and info only)',
+            i_err,
+            f'missing typed qed refusal: stderr={i_err!r}')

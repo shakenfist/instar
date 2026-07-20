@@ -75,6 +75,18 @@ def _generate_scenarios():
                     f'{image_id}.stdout.txt'
                 )
                 if baseline_path.exists():
+                    # Skip profiles where qemu-img itself refused the image
+                    # (baseline meta records a non-zero return code): there is
+                    # no output parity to assert, and instar may deliberately
+                    # diverge. First case: parallels-bat-past-eof, which qemu
+                    # 8.1.0-8.1.5 refuse at open while every other version
+                    # (and instar, uniformly) zero-fills — see
+                    # docs/plans/PLAN-format-coverage-phase-03-parallels-read.md.
+                    meta_path = baseline_path.with_name(f'{image_id}.meta.json')
+                    if meta_path.exists():
+                        with open(meta_path) as mf:
+                            if json.load(mf).get('return_code', 0) != 0:
+                                continue
                     scenario_name = f'{output_type}-{profile_name}-{image_id}'
                     scenarios.append((scenario_name, {
                         'profile': profile_name,

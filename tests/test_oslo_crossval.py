@@ -97,6 +97,76 @@ OSLO_SKIP_IMAGES = {
     'cve-2015-5162-tiny-petabyte',
     'cve-2014-0223-l1-overflow-boundary',
     'cve-2024-4467-json-prefix',
+    # Malformed DMG koly-trailer fixtures (format-coverage phase 1).
+    # safety: "malformed", run_in_ci: true, so (unlike the run_in_ci:
+    # false raw-*-truncated entries above) they are not filtered out
+    # by _generate_scenarios and need an explicit skip here, matching
+    # the precedent set by the malicious/malformed VMDK, VHD, and
+    # qcow2 fixtures just above: deliberately broken container
+    # metadata is not suitable for cross-validation against oslo's
+    # format_inspector.
+    'dmg-truncated-koly',
+    'dmg-sectorcount-negative',
+    'dmg-sectorcount-huge',
+    'dmg-no-chunk-table',
+    # Malformed VDI header fixtures (format-coverage phase 2). Like the
+    # malformed DMG fixtures above they are safety: "malformed",
+    # run_in_ci: true, so they are enrolled by _generate_scenarios and
+    # need an explicit skip. oslo.utils' VDIInspector only reads the
+    # signature (0x40) and disk_size (0x170); it does not validate the
+    # version, block-map offset, block size, parent UUID, or block count,
+    # so it detects all five as safe 'vdi' with a plausible virtual size.
+    # qemu (and instar after graduation) refuse every one of them at open,
+    # so cross-validating oslo's blind acceptance against instar's refusal
+    # is not meaningful.
+    'vdi-bad-version',
+    'vdi-unaligned-bmap',
+    'vdi-wrong-blocksize',
+    'vdi-nonnull-parent',
+    'vdi-too-many-blocks',
+    # Malformed Parallels header fixtures (format-coverage phase 3,
+    # PLAN-format-coverage-phase-03-parallels-read.md). Like the malformed
+    # VDI/DMG fixtures above they are safety: "malformed", run_in_ci: true, so
+    # they are enrolled by _generate_scenarios and need an explicit skip.
+    # oslo.utils ships no Parallels inspector, so it falls back to
+    # RawFileInspector (format_match unconditionally True) and reports every
+    # one as a safely-openable 'raw' image, while qemu (and instar after
+    # graduation) refuse each at open (zero tracks, too-big cluster, catalog
+    # too large, bad format-extension magic). Cross-validating oslo's blind
+    # acceptance against instar's refusal is not meaningful.
+    'parallels-zero-tracks',
+    'parallels-huge-tracks',
+    'parallels-huge-catalog',
+    'parallels-ext-bad-magic',
+    # Malformed QCOW1 header fixtures (format-coverage phase 4,
+    # PLAN-format-coverage-phase-04-qcow1-read.md). safety: "malformed",
+    # run_in_ci: true, so they need an explicit skip. oslo detects them as
+    # 'qcow2' by magic and its safety_check raises on the unsupported version,
+    # while qemu (and instar) refuse each at open under the qcow driver
+    # (bad cluster_bits, bad l2_bits, image too large, invalid crypt_method,
+    # backing name too long). Cross-validating oslo's blind qcow2 acceptance
+    # against instar's refusal is not meaningful.
+    'qcow1-bad-cluster-bits',
+    'qcow1-bad-l2-bits',
+    'qcow1-huge-size',
+    'qcow1-crypt-invalid',
+    'qcow1-backing-name-too-long',
+    # Malformed/refused DMG fixtures (format-coverage phase 5,
+    # PLAN-format-coverage-phase-05-dmg-read.md). safety: "malformed",
+    # run_in_ci: true, so they need an explicit skip. oslo has no DMG inspector
+    # and falls back to RawFileInspector ('raw'), blindly accepting every one;
+    # qemu refuses the two cap fixtures at open, decodes/refuses the codec
+    # fixtures build-dependently, converts the overcap fixture (which instar
+    # refuses on its staging cap), and segfaults on read for dmg-empty-table
+    # (rc 139) even though its info succeeds. Cross-validating oslo's blind raw
+    # acceptance against instar's typed refusals is not meaningful.
+    'dmg-chunk-len-over',
+    'dmg-sc-over',
+    'dmg-codec-bzip2',
+    'dmg-codec-lzfse',
+    'dmg-codec-adc',
+    'dmg-overcap-chunk',
+    'dmg-empty-table',
 }
 
 # Format name mapping: instar -> oslo.utils.
@@ -127,6 +197,53 @@ KNOWN_FORMAT_DIVERGENCES = {
     'luks-v1-raw-gpt': ('unknown', 'luks'),
     'luks-v1-qcow2': ('unknown', 'luks'),
     'luks-v2-raw-gpt': ('unknown', 'luks'),
+    # Format-coverage phase 1: oslo.utils' format_inspector ships no
+    # Parallels, Bochs, cloop, or DMG inspector. detect_file_format()
+    # still returns a real inspector (not None) for these — it falls
+    # back to RawFileInspector, whose `format_match` is unconditionally
+    # True, so oslo reports 'raw' for all four. instar has dedicated
+    # content/trailer probes for all four (see
+    # src/shared/src/format_detection.rs) and reports the real format.
+    'parallels-v1': ('parallels', 'raw'),
+    'parallels-v2': ('parallels', 'raw'),
+    # Format-coverage phase 3 (PLAN-format-coverage-phase-03-parallels-read.md):
+    # the five new safe Parallels fixtures detect the same way as the two
+    # existing parallels-v1/v2 images -- oslo has no Parallels inspector and
+    # falls back to RawFileInspector ('raw'), while instar reports 'parallels'.
+    'parallels-data-v2': ('parallels', 'raw'),
+    'parallels-data-v1': ('parallels', 'raw'),
+    'parallels-inuse': ('parallels', 'raw'),
+    'parallels-bat-past-eof': ('parallels', 'raw'),
+    'parallels-cluster-4k': ('parallels', 'raw'),
+    # Format-coverage phase 4 (PLAN-format-coverage-phase-04-qcow1-read.md):
+    # oslo.utils detects qcow1 by magic only (QFI\xfb) and reports 'qcow2',
+    # ignoring the version field; instar reports 'qcow'. Virtual sizes agree
+    # (the size u64 sits at offset 24 in both formats), so these have no
+    # KNOWN_VSIZE_DIVERGENCES entry (and TestOsloVirtualSize skips them here
+    # anyway). oslo's safety_check() raises SafetyCheckFailed
+    # ('unknown_features': "Unsupported qcow2 version") for all; qcow1-backing
+    # additionally flags 'backing_file' (offset-8 backing pointer), which the
+    # generic safety cross-val matches against instar's backing-filename.
+    # qcow1-odd-size is the one exception with a (documented-only)
+    # KNOWN_VSIZE_DIVERGENCES entry below.
+    'qcow1-data': ('qcow', 'qcow2'),
+    'qcow1-compressed': ('qcow', 'qcow2'),
+    'qcow1-backing-base': ('qcow', 'qcow2'),
+    'qcow1-backing': ('qcow', 'qcow2'),
+    'qcow1-encrypted': ('qcow', 'qcow2'),
+    'qcow1-past-eof': ('qcow', 'qcow2'),
+    'qcow1-odd-size': ('qcow', 'qcow2'),
+    'bochs-growing': ('bochs', 'raw'),
+    'cloop-simple': ('cloop', 'raw'),
+    'dmg-simple': ('dmg', 'raw'),
+    # Format-coverage phase 5 (PLAN-format-coverage-phase-05-dmg-read.md):
+    # the four new safe DMG fixtures detect the same way as dmg-simple --
+    # oslo.utils ships no DMG inspector and falls back to RawFileInspector
+    # ('raw'), while instar's koly-trailer probe reports 'dmg'.
+    'dmg-mixed': ('dmg', 'raw'),
+    'dmg-multipart': ('dmg', 'raw'),
+    'dmg-rsrc-fork': ('dmg', 'raw'),
+    'dmg-gap': ('dmg', 'raw'),
 }
 
 # Known safety divergences: images where instar does not
@@ -158,6 +275,85 @@ KNOWN_VSIZE_DIVERGENCES = {
     'vmdk-flat-1m': (0, 1 * 1024 * 1024),
     'vmdk-flat-10m': (0, 10 * 1024 * 1024),
     'vmdk-flat-with-parent': (0, 1 * 1024 * 1024),
+    # Format-coverage phase 1, paired with the KNOWN_FORMAT_DIVERGENCES
+    # entries above. RawFileInspector.virtual_size returns however many
+    # bytes oslo's detection loop consumed before it settled on 'raw',
+    # not necessarily the full file length: for bochs-growing (2560 B),
+    # cloop-simple (1690 B), and dmg-simple (11747 B) that happens to
+    # equal the exact file size (the whole file fits in oslo's first
+    # read chunk); for parallels-v1/v2 (327680 B on disk) oslo stops
+    # after consuming only 262144 B. instar reports the real virtual
+    # disk size parsed from each format's own header/trailer. Values
+    # below were captured from a live run against oslo.utils 10.1.2.dev8
+    # (git master, matching .github/workflows/functional-tests.yml's
+    # `pip install ... git+https://github.com/openstack/oslo.utils.git`)
+    # and instar's `info --output json` on the exact staged fixtures.
+    #
+    # NOTE: because 'parallels-v1'/'parallels-v2'/'bochs-growing'/
+    # 'cloop-simple'/'dmg-simple' are also KNOWN_FORMAT_DIVERGENCES
+    # entries, TestOsloVirtualSize.test_virtual_size_agrees skips them
+    # before ever reaching this dict (see its `if self.image_id in
+    # KNOWN_FORMAT_DIVERGENCES: self.skipTest(...)` guard) — identical
+    # to the pre-existing raw-mbr-partitioned/raw-gpt-partitioned/
+    # vmdk-multi-partition entries, none of which has a paired
+    # KNOWN_VSIZE_DIVERGENCES entry either. These five are recorded
+    # here anyway as a documented, verified reference of the actual
+    # numbers rather than being asserted at runtime.
+    'parallels-v1': (262144, 2 * 1024 * 1024),
+    'parallels-v2': (262144, 2 * 1024 * 1024),
+    # Format-coverage phase 3 (PLAN-format-coverage-phase-03-parallels-read.md):
+    # the five new safe Parallels fixtures follow the same oslo rule as
+    # parallels-v1/v2 -- RawFileInspector.virtual_size is min(file_size,
+    # 262144), i.e. however many bytes oslo's detection loop consumed before
+    # settling on 'raw' (capped at its first 262144 B read chunk), while instar
+    # reports the real virtual size parsed from the Parallels header
+    # (nb_sectors * 512). The four 327680 B images stop oslo at the 262144 B
+    # cap; parallels-cluster-4k (20480 B on disk) fits entirely in the first
+    # read chunk, so oslo returns its whole 20480 B file length. Because these
+    # five are also KNOWN_FORMAT_DIVERGENCES entries, TestOsloVirtualSize skips
+    # them before reaching this dict, so (like parallels-v1/v2 above) the pairs
+    # are a documented, verified reference rather than a runtime assertion.
+    # Values captured from a live oslo.utils run against the staged fixtures.
+    'parallels-data-v2': (262144, 2 * 1024 * 1024),
+    'parallels-data-v1': (262144, 2 * 1024 * 1024),
+    'parallels-inuse': (262144, 2 * 1024 * 1024),
+    'parallels-bat-past-eof': (262144, 2 * 1024 * 1024),
+    'parallels-cluster-4k': (20480, 256 * 1024),
+    'bochs-growing': (2560, 1032192),
+    'cloop-simple': (1690, 1024 * 1024),
+    'dmg-simple': (11747, 4 * 1024 * 1024),
+    # Format-coverage phase 5 (PLAN-format-coverage-phase-05-dmg-read.md):
+    # the four new safe DMG fixtures follow the same oslo rule as dmg-simple --
+    # RawFileInspector.virtual_size is min(file_size, 262144); all four fit
+    # entirely in oslo's first read chunk, so oslo returns each whole file
+    # length, while instar reports the koly SectorCount * 512 virtual size.
+    # Because these are also KNOWN_FORMAT_DIVERGENCES entries, TestOsloVirtualSize
+    # skips them before reaching this dict; the pairs are a documented, verified
+    # reference (captured live against oslo.utils 10.1.2.dev8, git master).
+    'dmg-mixed': (37029, 2162688),
+    'dmg-multipart': (4719, 1048576),
+    'dmg-rsrc-fork': (2218, 524288),
+    'dmg-gap': (1480, 8192),
+    # Format-coverage phase 2 (PLAN-format-coverage-phase-02-vdi-read.md):
+    # vdi-odd-size has its VDI header disk_size patched to 1048577, a non-512
+    # multiple. oslo.utils' VDIInspector reports the raw disk_size u64 verbatim
+    # (1048577), while qemu's vdi_open rounds an odd disk_size up to the next
+    # 512 boundary (1049088) and instar mirrors that round-up for byte parity.
+    # This entry is asserted at runtime (vdi-odd-size is NOT a
+    # KNOWN_FORMAT_DIVERGENCES entry), so both tools must keep reporting these
+    # exact values or the test fails and forces a re-evaluation.
+    'vdi-odd-size': (1048577, 1049088),
+    # Format-coverage phase 4 (PLAN-format-coverage-phase-04-qcow1-read.md):
+    # qcow1-odd-size has its QCOW1 header size u64 (offset 24) patched to the odd
+    # value 1048577. oslo.utils' qcow2 inspector reads that u64 verbatim
+    # (1048577), while qemu computes total_sectors = size/512 and reports
+    # total_sectors*512 = 1048576 (truncate-DOWN) -- instar mirrors qemu for byte
+    # parity. Unlike vdi-odd-size (asserted at runtime because instar and oslo
+    # agree on 'vdi'), qcow1-odd-size is ALSO a KNOWN_FORMAT_DIVERGENCES entry
+    # (instar 'qcow' vs oslo 'qcow2'), so TestOsloVirtualSize skips it before
+    # reaching this dict; the pair is a documented, verified reference (captured
+    # live: oslo 1048577, instar 1048576) rather than a runtime assertion.
+    'qcow1-odd-size': (1048577, 1048576),
 }
 
 

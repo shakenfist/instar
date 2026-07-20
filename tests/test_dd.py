@@ -1235,6 +1235,223 @@ class TestDdInputFormats(InstarTestBase):
             )
             self._assert_input_fmt_parity(vhdx.name, 'vhdx', label='vhdx')
 
+    def test_input_vdi(self):
+        """dd reads a vdi input full-copy and matches qemu-img dd byte-for-byte.
+
+        Format-coverage phase 2 graduates VDI to a real read format.  This
+        smoke test uses the aligned vdi-simple fixture and does a full-image
+        copy (no skip/count window) so the whole read path is exercised;
+        windowed and data-bearing VDI coverage is added in step 2e.
+        """
+        image = self.get_image('vdi-simple')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        with (
+            tempfile.NamedTemporaryFile(suffix='.raw') as instar_out,
+            tempfile.NamedTemporaryFile(suffix='.raw') as qemu_out,
+        ):
+            stdout, stderr, rc = self.run_instar_dd(
+                [f'if={image.path}', f'of={instar_out.name}'],
+                output_format='raw',
+                timeout=120,
+            )
+            self.assertEqual(
+                rc, 0,
+                f'[vdi] instar dd -O raw failed: stderr={stderr!r}',
+            )
+
+            q_stdout, q_stderr, q_rc = self.run_qemu_img_dd(
+                [f'if={image.path}', f'of={qemu_out.name}'],
+                output_format='raw',
+                timeout=120,
+            )
+            self.assertEqual(
+                q_rc, 0,
+                f'[vdi] qemu-img dd -O raw failed: stderr={q_stderr!r}',
+            )
+
+            instar_bytes = _bytes_of(instar_out.name)
+            qemu_bytes = _bytes_of(qemu_out.name)
+            self.assertEqual(
+                instar_bytes,
+                qemu_bytes,
+                f'[vdi] instar dd output differs from qemu-img dd '
+                f'(instar={len(instar_bytes)} B, qemu={len(qemu_bytes)} B)',
+            )
+
+    def test_input_parallels(self):
+        """dd reads a parallels input full-copy and matches qemu-img dd.
+
+        Format-coverage phase 3 graduates Parallels to a real read format;
+        phase 1 gated dd for parallels but never added a refusal test (a
+        documented gap this phase closes with positive coverage).  This
+        smoke uses parallels-v2 ('WithouFreSpacExt') and does a full-image
+        copy (no skip/count window) so the whole read path is exercised;
+        windowed and both-magic coverage is added in step 3e.
+        """
+        image = self.get_image('parallels-v2')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        with (
+            tempfile.NamedTemporaryFile(suffix='.raw') as instar_out,
+            tempfile.NamedTemporaryFile(suffix='.raw') as qemu_out,
+        ):
+            stdout, stderr, rc = self.run_instar_dd(
+                [f'if={image.path}', f'of={instar_out.name}'],
+                output_format='raw',
+                timeout=120,
+            )
+            self.assertEqual(
+                rc, 0,
+                f'[parallels] instar dd -O raw failed: stderr={stderr!r}',
+            )
+
+            q_stdout, q_stderr, q_rc = self.run_qemu_img_dd(
+                [f'if={image.path}', f'of={qemu_out.name}'],
+                output_format='raw',
+                timeout=120,
+            )
+            self.assertEqual(
+                q_rc, 0,
+                f'[parallels] qemu-img dd -O raw failed: stderr={q_stderr!r}',
+            )
+
+            instar_bytes = _bytes_of(instar_out.name)
+            qemu_bytes = _bytes_of(qemu_out.name)
+            self.assertEqual(
+                instar_bytes,
+                qemu_bytes,
+                f'[parallels] instar dd output differs from qemu-img dd '
+                f'(instar={len(instar_bytes)} B, qemu={len(qemu_bytes)} B)',
+            )
+
+    def test_input_parallels_windowed(self):
+        """Windowed dd on a Parallels image crosses a hole->data boundary.
+
+        parallels-data-v2 (2 MiB, 64 KiB clusters) fills guest clusters
+        1/3/5/7 (0x11/0x33/0x55/0x77) and leaves the rest holes.  At
+        bs=65536 one block == one cluster, so cluster 2 is a hole and
+        cluster 3 carries 0x33.  qemu-img dd's ``count`` is an absolute
+        end position in blocks (bytes copied = (count - skip) * bs), so
+        skip=2 count=4 reads blocks [2, 4): one hole block then one data
+        block, pinning the unallocated->allocated transition against
+        qemu-img dd byte-for-byte.
+        """
+        image = self.get_image('parallels-data-v2')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        window = ['bs=65536', 'skip=2', 'count=4']
+        with (
+            tempfile.NamedTemporaryFile(suffix='.raw') as instar_out,
+            tempfile.NamedTemporaryFile(suffix='.raw') as qemu_out,
+        ):
+            stdout, stderr, rc = self.run_instar_dd(
+                [f'if={image.path}', f'of={instar_out.name}'] + window,
+                output_format='raw',
+                timeout=120,
+            )
+            self.assertEqual(
+                rc, 0,
+                f'[parallels-window] instar dd -O raw failed: '
+                f'stderr={stderr!r}',
+            )
+
+            q_stdout, q_stderr, q_rc = self.run_qemu_img_dd(
+                [f'if={image.path}', f'of={qemu_out.name}'] + window,
+                output_format='raw',
+                timeout=120,
+            )
+            self.assertEqual(
+                q_rc, 0,
+                f'[parallels-window] qemu-img dd -O raw failed: '
+                f'stderr={q_stderr!r}',
+            )
+
+            instar_bytes = _bytes_of(instar_out.name)
+            qemu_bytes = _bytes_of(qemu_out.name)
+            self.assertEqual(
+                instar_bytes,
+                qemu_bytes,
+                f'[parallels-window] instar dd output differs from qemu-img '
+                f'dd (instar={len(instar_bytes)} B, qemu={len(qemu_bytes)} B)',
+            )
+            # Sanity: the window really straddles the boundary -- the first
+            # block is a hole (zeros) and the second carries data.
+            self.assertFalse(
+                any(instar_bytes[:65536]),
+                '[parallels-window] first block should be a hole (zeros)',
+            )
+            self.assertTrue(
+                any(instar_bytes[65536:]),
+                '[parallels-window] second block should carry data',
+            )
+
+    def test_input_vdi_windowed(self):
+        """Windowed dd on a data-bearing VDI crosses a hole->data boundary.
+
+        vdi-data-dynamic holds a 1 MiB data block at guest 2 MiB
+        (block 32 at bs=65536); blocks 30-31 are holes.  qemu-img dd's
+        ``count`` is an absolute end position in blocks (bytes copied =
+        (count - skip) * bs), so skip=30 count=34 reads blocks [30, 34):
+        two hole blocks then two data blocks.  This pins the
+        unallocated->allocated transition in the read path against
+        qemu-img dd byte-for-byte.
+        """
+        image = self.get_image('vdi-data-dynamic')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        window = ['bs=65536', 'skip=30', 'count=34']
+        with (
+            tempfile.NamedTemporaryFile(suffix='.raw') as instar_out,
+            tempfile.NamedTemporaryFile(suffix='.raw') as qemu_out,
+        ):
+            stdout, stderr, rc = self.run_instar_dd(
+                [f'if={image.path}', f'of={instar_out.name}'] + window,
+                output_format='raw',
+                timeout=120,
+            )
+            self.assertEqual(
+                rc, 0,
+                f'[vdi-window] instar dd -O raw failed: stderr={stderr!r}',
+            )
+
+            q_stdout, q_stderr, q_rc = self.run_qemu_img_dd(
+                [f'if={image.path}', f'of={qemu_out.name}'] + window,
+                output_format='raw',
+                timeout=120,
+            )
+            self.assertEqual(
+                q_rc, 0,
+                f'[vdi-window] qemu-img dd -O raw failed: stderr={q_stderr!r}',
+            )
+
+            instar_bytes = _bytes_of(instar_out.name)
+            qemu_bytes = _bytes_of(qemu_out.name)
+            self.assertEqual(
+                instar_bytes,
+                qemu_bytes,
+                f'[vdi-window] instar dd output differs from qemu-img dd '
+                f'(instar={len(instar_bytes)} B, qemu={len(qemu_bytes)} B)',
+            )
+            # Sanity: the window really straddles the boundary -- the first
+            # two blocks are a hole (zeros) and the last two carry data.
+            self.assertFalse(
+                any(instar_bytes[:131072]),
+                '[vdi-window] first half of window should be a hole (zeros)',
+            )
+            self.assertTrue(
+                any(instar_bytes[131072:]),
+                '[vdi-window] second half of window should carry data',
+            )
+
     def test_input_backing_chain_qcow2(self):
         """dd composes a qcow2 backing chain and matches qemu-img dd byte-for-byte.
 
@@ -1376,3 +1593,365 @@ class TestDdInputFormats(InstarTestBase):
                 f'instar dd -f raw output differs from qemu-img dd '
                 f'(instar={len(instar_bytes)} B, qemu={len(qemu_bytes)} B)',
             )
+
+    def test_input_qcow1_windowed(self):
+        """Windowed dd on a qcow1 image crosses a hole->data boundary.
+
+        qcow1-data (2 MiB, 4 KiB clusters) fills guest clusters
+        0/5/17/100/300/511 and leaves the rest holes.  At bs=4096 one
+        block == one cluster, so cluster 4 is a hole and cluster 5
+        carries data.  The same operands are handed to both tools
+        (qemu-img dd's ``count`` is absolute from offset 0: skip=4
+        count=6 copies blocks [4, 6) -- one hole block then one data
+        block), pinning the unallocated->allocated transition against
+        qemu-img dd byte-for-byte.
+        """
+        image = self.get_image('qcow1-data')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        window = ['bs=4096', 'skip=4', 'count=6']
+        with (
+            tempfile.NamedTemporaryFile(suffix='.raw') as instar_out,
+            tempfile.NamedTemporaryFile(suffix='.raw') as qemu_out,
+        ):
+            stdout, stderr, rc = self.run_instar_dd(
+                [f'if={image.path}', f'of={instar_out.name}'] + window,
+                output_format='raw',
+                timeout=120,
+            )
+            self.assertEqual(
+                rc, 0,
+                f'[qcow1-window] instar dd -O raw failed: stderr={stderr!r}',
+            )
+
+            q_stdout, q_stderr, q_rc = self.run_qemu_img_dd(
+                [f'if={image.path}', f'of={qemu_out.name}'] + window,
+                output_format='raw',
+                timeout=120,
+            )
+            self.assertEqual(
+                q_rc, 0,
+                f'[qcow1-window] qemu-img dd -O raw failed: stderr={q_stderr!r}',
+            )
+
+            instar_bytes = _bytes_of(instar_out.name)
+            qemu_bytes = _bytes_of(qemu_out.name)
+            self.assertEqual(
+                instar_bytes,
+                qemu_bytes,
+                f'[qcow1-window] instar dd output differs from qemu-img dd '
+                f'(instar={len(instar_bytes)} B, qemu={len(qemu_bytes)} B)',
+            )
+            # Sanity: the window really straddles the boundary -- the first
+            # block is a hole (zeros) and the second carries data.
+            self.assertFalse(
+                any(instar_bytes[:4096]),
+                '[qcow1-window] first block should be a hole (zeros)',
+            )
+            self.assertTrue(
+                any(instar_bytes[4096:]),
+                '[qcow1-window] second block should carry data',
+            )
+
+    def test_input_qcow1_backing_windowed(self):
+        """Windowed dd on a qcow1 overlay crosses an overlay-mask boundary.
+
+        qcow1-backing is a 512-byte-cluster overlay masking its base at
+        guest offsets 0/4096 (0x77/0x88) with every other offset reading
+        through to the base (0xCC at offset 8192).  At bs=4096 skip=0
+        count=3 the window spans two overlay-masked blocks and one
+        read-through block, pinning that the dd path descends to the base
+        for unallocated clusters -- byte-identical to qemu-img dd.
+        """
+        image = self.get_image('qcow1-backing')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        window = ['bs=4096', 'skip=0', 'count=3']
+        with (
+            tempfile.NamedTemporaryFile(suffix='.raw') as instar_out,
+            tempfile.NamedTemporaryFile(suffix='.raw') as qemu_out,
+        ):
+            stdout, stderr, rc = self.run_instar_dd(
+                [f'if={image.path}', f'of={instar_out.name}'] + window,
+                output_format='raw',
+                timeout=120,
+            )
+            self.assertEqual(
+                rc, 0,
+                f'[qcow1-backing-window] instar dd -O raw failed: '
+                f'stderr={stderr!r}',
+            )
+
+            q_stdout, q_stderr, q_rc = self.run_qemu_img_dd(
+                [f'if={image.path}', f'of={qemu_out.name}'] + window,
+                output_format='raw',
+                timeout=120,
+            )
+            self.assertEqual(
+                q_rc, 0,
+                f'[qcow1-backing-window] qemu-img dd -O raw failed: '
+                f'stderr={q_stderr!r}',
+            )
+
+            instar_bytes = _bytes_of(instar_out.name)
+            qemu_bytes = _bytes_of(qemu_out.name)
+            self.assertEqual(
+                instar_bytes,
+                qemu_bytes,
+                f'[qcow1-backing-window] instar dd output differs from '
+                f'qemu-img dd (instar={len(instar_bytes)} B, '
+                f'qemu={len(qemu_bytes)} B)',
+            )
+            # Sanity: the read-through block (offset 8192, base 0xCC) is
+            # non-zero data descended from the backing file.
+            self.assertTrue(
+                any(instar_bytes[8192:12288]),
+                '[qcow1-backing-window] read-through block should carry '
+                'base data',
+            )
+
+
+class TestDdDmg(InstarTestBase):
+    """Windowed dd on DMG input (format-coverage phase 5).
+
+    Pins the graduation of DMG to a real read format.  dmg-simple is a
+    4 MiB UDIF image with two zlib-wrapped UDZO chunks: chunk 0 covers
+    [0, 2 MiB) and chunk 1 covers [2 MiB, 4 MiB).  A bs=65536 skip=31
+    count=33 window copies blocks [31, 33) -- offsets [2031616, 2162688)
+    -- which straddle the 2 MiB chunk boundary (qemu-img dd's ``count``
+    is absolute from offset 0).  The window must be byte-identical to
+    qemu-img dd and must actually cross the boundary (first block from
+    chunk 0, second block from chunk 1), proving dd walks the UDIF chunk
+    table rather than reading the container as raw.
+    """
+
+    def test_input_dmg_windowed(self):
+        """Windowed dd on dmg-simple crosses the zlib chunk boundary."""
+        image = self.get_image('dmg-simple')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        window = ['bs=65536', 'skip=31', 'count=33']
+        with (
+            tempfile.NamedTemporaryFile(suffix='.raw') as instar_out,
+            tempfile.NamedTemporaryFile(suffix='.raw') as qemu_out,
+        ):
+            stdout, stderr, rc = self.run_instar_dd(
+                [f'if={image.path}', f'of={instar_out.name}'] + window,
+                output_format='raw',
+                timeout=120,
+            )
+            self.assertEqual(
+                rc, 0,
+                f'[dmg-window] instar dd -O raw failed: stderr={stderr!r}',
+            )
+
+            q_stdout, q_stderr, q_rc = self.run_qemu_img_dd(
+                [f'if={image.path}', f'of={qemu_out.name}'] + window,
+                output_format='raw',
+                timeout=120,
+            )
+            self.assertEqual(
+                q_rc, 0,
+                f'[dmg-window] qemu-img dd -O raw failed: stderr={q_stderr!r}',
+            )
+
+            instar_bytes = _bytes_of(instar_out.name)
+            qemu_bytes = _bytes_of(qemu_out.name)
+            self.assertEqual(
+                instar_bytes,
+                qemu_bytes,
+                f'[dmg-window] instar dd output differs from qemu-img dd '
+                f'(instar={len(instar_bytes)} B, qemu={len(qemu_bytes)} B)',
+            )
+            # Sanity: the window straddles the chunk boundary -- the first
+            # block carries chunk-0 content and the second chunk-1 content.
+            self.assertIn(
+                b'CHUNK-0', instar_bytes[:65536],
+                '[dmg-window] first block should carry chunk-0 data',
+            )
+            self.assertIn(
+                b'CHUNK-1', instar_bytes[65536:],
+                '[dmg-window] second block should carry chunk-1 data',
+            )
+
+    def test_input_dmg_mixed_windowed(self):
+        """Windowed dd on dmg-mixed crosses a zero->raw->zlib chunk run.
+
+        dmg-mixed's chunk layout (from the generator): zero [0, 1 MiB),
+        raw [1 MiB, 1 MiB+32 KiB), zlib [1 MiB+32 KiB, 2 MiB+32 KiB),
+        ignore tail.  A bs=65536 skip=15 count=17 window copies blocks
+        [15, 17) -- offsets [983040, 1114112) (qemu-img dd's ``count`` is
+        absolute from offset 0).  Block 15 lies wholly in the zero span;
+        block 16 straddles the zero->raw boundary at 1 MiB and the
+        raw->zlib boundary 32 KiB later, so it carries the full raw span
+        plus the head of the zlib span.  The window must be byte-identical
+        to qemu-img dd and must actually cross all three chunk types,
+        proving dd walks the UDIF chunk table span-by-span rather than
+        reading the container as raw.
+        """
+        image = self.get_image('dmg-mixed')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        window = ['bs=65536', 'skip=15', 'count=17']
+        with (
+            tempfile.NamedTemporaryFile(suffix='.raw') as instar_out,
+            tempfile.NamedTemporaryFile(suffix='.raw') as qemu_out,
+        ):
+            stdout, stderr, rc = self.run_instar_dd(
+                [f'if={image.path}', f'of={instar_out.name}'] + window,
+                output_format='raw',
+                timeout=120,
+            )
+            self.assertEqual(
+                rc, 0,
+                f'[dmg-mixed-window] instar dd -O raw failed: stderr={stderr!r}',
+            )
+
+            q_stdout, q_stderr, q_rc = self.run_qemu_img_dd(
+                [f'if={image.path}', f'of={qemu_out.name}'] + window,
+                output_format='raw',
+                timeout=120,
+            )
+            self.assertEqual(
+                q_rc, 0,
+                f'[dmg-mixed-window] qemu-img dd -O raw failed: '
+                f'stderr={q_stderr!r}',
+            )
+
+            instar_bytes = _bytes_of(instar_out.name)
+            qemu_bytes = _bytes_of(qemu_out.name)
+            self.assertEqual(
+                instar_bytes,
+                qemu_bytes,
+                f'[dmg-mixed-window] instar dd output differs from qemu-img '
+                f'dd (instar={len(instar_bytes)} B, qemu={len(qemu_bytes)} B)',
+            )
+            # Sanity: block 15 is all-zero; block 16 carries the raw span in
+            # its first 32 KiB and the zlib span in its second 32 KiB.
+            self.assertEqual(
+                instar_bytes[:65536], bytes(65536),
+                '[dmg-mixed-window] first block should be all zero',
+            )
+            self.assertIn(
+                b'MIXED-RAW', instar_bytes[65536:65536 + 32768],
+                '[dmg-mixed-window] raw span expected in the second block',
+            )
+            self.assertIn(
+                b'MIXED-ZLIB', instar_bytes[65536 + 32768:],
+                '[dmg-mixed-window] zlib span expected after the raw span',
+            )
+
+    def test_input_dmg_gap_error_parity(self):
+        """dd on dmg-gap fails non-zero cleanly on BOTH instar and qemu.
+
+        The koly SectorCount exceeds the mish coverage, so the tail is an
+        uncovered gap.  DMG reads ERROR on a gap rather than zero-filling
+        (the phase-5 EIO-parity semantic), so dd fails on both sides -- the
+        messages differ (qemu ``Input/output error`` vs instar's generic
+        operation failure).  Only the non-zero exit and clean termination
+        are pinned, not the message.
+        """
+        image = self.get_image('dmg-gap')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
+        self.skip_if_hash_mismatch(image)
+
+        with (
+            tempfile.NamedTemporaryFile(suffix='.raw') as instar_out,
+            tempfile.NamedTemporaryFile(suffix='.raw') as qemu_out,
+        ):
+            i_out, i_err, i_rc = self.run_instar_dd(
+                [f'if={image.path}', f'of={instar_out.name}'],
+                output_format='raw',
+                timeout=60,
+            )
+            self.assertNotEqual(
+                i_rc, 0,
+                f'[dmg-gap] instar dd should fail cleanly; '
+                f'stdout={i_out!r} stderr={i_err!r}',
+            )
+
+            q_out, q_err, q_rc = self.run_qemu_img_dd(
+                [f'if={image.path}', f'of={qemu_out.name}'],
+                output_format='raw',
+                timeout=60,
+            )
+            self.assertNotEqual(
+                q_rc, 0,
+                f'[dmg-gap] qemu-img dd should fail (EIO on the uncovered '
+                f'tail); stdout={q_out!r} stderr={q_err!r}',
+            )
+
+
+class TestDdDetectOnlyRefusal(InstarTestBase):
+    """dd refuses detect-only input formats instead of reading raw.
+
+    qed is detected/sized by info but has no read path; dd must
+    refuse it rather than emitting the container bytes plus zero padding
+    (issue #444).  iso keeps its raw pass-through per the post-1a
+    management decision (exact-length output, no sector padding).
+    """
+
+    def _refusal_image(self, image_id):
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(f'Test image not found: {image.path}')
+        return image
+
+    def _assert_refused(self, image_id, fmt):
+        image = self._refusal_image(image_id)
+        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+            stdout, stderr, rc = self.run_instar_dd(
+                [f'if={image.path}', f'of={out.name}']
+            )
+        self.assertNotEqual(
+            rc, 0,
+            f'dd should refuse {fmt} input; stdout={stdout!r} '
+            f'stderr={stderr!r}'
+        )
+        expected = (
+            f"dd: input format '{fmt}' is detected but not supported "
+            f'for reading (detection and info only)'
+        )
+        self.assertIn(
+            expected, stdout + stderr,
+            f'missing typed refusal for {fmt}: stderr={stderr!r}'
+        )
+
+    def test_dd_refuses_qed(self):
+        """dd refuses a qed input with the typed message."""
+        self._assert_refused('qed-simple', 'qed')
+
+    def test_dd_refuses_bochs(self):
+        """dd refuses a bochs-growing input with the typed message."""
+        self._assert_refused('bochs-growing', 'bochs')
+
+    def test_dd_refuses_cloop(self):
+        """dd refuses a cloop-simple input with the typed message."""
+        self._assert_refused('cloop-simple', 'cloop')
+
+    # NOTE: dmg is no longer refused here.  Format-coverage phase 5
+    # graduates DMG to a real read format; dd now reads it.  The windowed
+    # dd byte-parity smoke lives in TestDdDmg below.
+
+    def test_dd_iso_passthrough(self):
+        """dd keeps reading iso as raw (deliberate qemu parity).
+
+        Pins the step-1a behaviour: rc 0, output is the exact 376832-byte
+        container length (dd sizes to the file, not the padded vsize).
+        """
+        image = self._refusal_image('iso-simple')
+        with tempfile.NamedTemporaryFile(suffix='.raw') as out:
+            stdout, stderr, rc = self.run_instar_dd(
+                [f'if={image.path}', f'of={out.name}']
+            )
+            self.assertEqual(rc, 0, f'iso dd should succeed; stderr={stderr!r}')
+            self.assertEqual(len(_bytes_of(out.name)), 376832)

@@ -127,6 +127,19 @@ const _: () = assert!(bench::BENCH_MAX_BUFSIZE == MAX_CLUSTER_SIZE as u64);
 /// First free byte above the dynamic per-device caches.
 const WRITE_SCRATCH_BASE: usize = DYNAMIC_START + 2 * MAX_SECTOR_SIZE * MAX_CHAIN_DEVICES;
 
+/// Base of the per-device DMG chunk-table scratch handed to
+/// `init_chain_states`. It ALIASES the qcow2 write scratch: a DMG source
+/// is read-only (the `-w` path is refused pre-bracket for DMG), so the
+/// write scratch is never live while a DMG chunk table exists. The DMG
+/// region (DMG_REQUIRED_SCRATCH ≈ 3.25 MiB) is a strict subset of the
+/// write scratch [WRITE_SCRATCH_BASE, WRITE_SCRATCH_END), so no new top-of-
+/// scratch budget is consumed. bench reads a single chain → one slot.
+const DMG_SCRATCH_BASE: usize = WRITE_SCRATCH_BASE;
+const _: () = assert!(
+    DMG_SCRATCH_BASE + qcow2::DMG_REQUIRED_SCRATCH <= ALLOC_HEAP_BASE,
+    "DMG chunk-table scratch overlaps the allocator heap"
+);
+
 /// Upper bound on staged refcount blocks. Setup-time growth
 /// (`qcow2_grow_refcounts`) preemptively provisions the whole schedule's
 /// worst-case coverage, so this cap — together with the byte limits
@@ -247,10 +260,19 @@ fn panic(_info: &PanicInfo) -> ! {
 ///
 /// This is exactly the set the qcow2 chain reader
 /// (`read_chain_virtual_cluster`) has an arm for: qcow2, vmdk (binary
-/// `Vmdk4` and the monolithicFlat `VmdkDescriptor`), vhd, vhdx, and raw
-/// (its `_ =>` fallback, which `read_raw_sectors` serves). Every other
-/// format — LUKS, qcow1, vdi, qed, iso, the legacy COWD `Vmdk3` — would
-/// be silently misread by that raw fallback, so bench refuses it.
+/// `Vmdk4` and the monolithicFlat `VmdkDescriptor`), vhd, vhdx, vdi,
+/// parallels, qcow1, dmg, and raw (its `_ =>` fallback, which
+/// `read_raw_sectors` serves). Every other format — LUKS, qed, iso, the
+/// legacy COWD `Vmdk3` — would be silently misread by that raw fallback,
+/// so bench refuses it.
+///
+/// vdi is served by the qcow2 crate's `vdi-input` arm, parallels by its
+/// `parallels-input` arm, qcow1 by its `qcow1-input` arm, and dmg by
+/// its `dmg-input` arm, which bench enables in its Cargo.toml (alongside
+/// `vhd-input`/`vhdx-input`); format-coverage phases 2, 3, 4 and 5
+/// graduate them here in lock-step with the host `chain::ImageFormat`
+/// graduation so bench reads VDI, Parallels, QCOW1 and DMG rather than
+/// refusing them.
 ///
 /// Returns a family tag: distinct formats compare unequal, but `Vmdk4`
 /// and `VmdkDescriptor` share a family so a descriptor whose flat
@@ -262,6 +284,10 @@ fn read_family(f: ImageFormat) -> Option<u8> {
         ImageFormat::Vmdk4 | ImageFormat::VmdkDescriptor => Some(2),
         ImageFormat::Vhd => Some(3),
         ImageFormat::Vhdx => Some(4),
+        ImageFormat::Vdi => Some(5),
+        ImageFormat::Parallels => Some(6),
+        ImageFormat::Qcow1 => Some(7),
+        ImageFormat::Dmg => Some(8),
         _ => None,
     }
 }
@@ -1373,6 +1399,14 @@ pub unsafe extern "C" fn _start() -> u64 {
         device_count,
         sector_size,
         DYNAMIC_START,
+        // The per-device DMG chunk-table scratch OVERLAYS the qcow2 write
+        // scratch region: a DMG source is always read-only (bench refuses
+        // `-w` on DMG at the pre-bracket format fork — Gate id 0, "format
+        // has no write support"), so the write scratch is never live while
+        // a DMG state exists. bench reads a single chain, so at most one
+        // DMG device / one slot. See DMG_SCRATCH_BASE below.
+        DMG_SCRATCH_BASE,
+        qcow2::DMG_REQUIRED_SCRATCH,
         &mut bytes_read,
     ) {
         return fail(

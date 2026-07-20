@@ -319,7 +319,7 @@ const INFO_RESULT_MAGIC: u32 = 0x52455355; // "RESU"
 const INFO_RESULT_FLAG_HAS_BACKING_FILE: u32 = 1 << 0;
 #[allow(dead_code)]
 const INFO_RESULT_FLAG_HAS_EXTERNAL_DATA: u32 = 1 << 1;
-#[allow(dead_code)]
+// Consumed by should_emit_encrypted_line (both info emitters).
 const INFO_RESULT_FLAG_ENCRYPTED: u32 = 1 << 2;
 #[allow(dead_code)]
 const INFO_RESULT_FLAG_COMPRESSED: u32 = 1 << 3;
@@ -1056,8 +1056,41 @@ fn format_size_human(bytes: u64, qemu_compat: bool) -> String {
     const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
     const TIB: f64 = 1024.0 * 1024.0 * 1024.0 * 1024.0;
 
-    let bytes_f = bytes as f64;
+    if bytes == 0 {
+        // qemu-img's info output emits just "0" for zero bytes, no unit.
+        return "0".to_string();
+    }
 
+    if qemu_compat {
+        // Replicate qemu-img's size_to_str() (util/cutils.c) exactly:
+        //
+        //   frexp(val / (1000.0 / 1024.0), &i);
+        //   i = (i - 1) / 10 * 10;
+        //   div = 1ULL << i;
+        //   printf("%0.3g %sB", (double)val / div, iec_binary_prefix(i));
+        //
+        // The `1000/1024` correction promotes a value to the next unit once
+        // its integer part reaches 1000, so e.g. 1032192 bytes renders
+        // "0.984 MiB" rather than the naive threshold result "1008 KiB".
+        // Threshold-based unit selection only diverges from this inside the
+        // [1000, 1024) window below each power of 1024, so every existing
+        // baseline value (none of which fall in that window) is unaffected.
+        const UNITS: [&str; 7] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
+        let val = bytes as f64;
+        let exp = frexp_exponent(val / (1000.0 / 1024.0));
+        // For bytes >= 1, val / (1000/1024) >= 1.024, so exp >= 1 and
+        // (exp - 1) is non-negative; the division truncates like C's.
+        let mut idx = ((exp - 1) / 10) as usize;
+        if idx >= UNITS.len() {
+            idx = UNITS.len() - 1;
+        }
+        let div = 1u64 << (idx * 10);
+        return format_size_value(val / div as f64, UNITS[idx], true);
+    }
+
+    // Non-qemu-compat (instar's own --ignore-quirks "accurate" mode): keep
+    // the simple threshold-based unit selection.
+    let bytes_f = bytes as f64;
     if bytes_f >= TIB {
         format_size_value(bytes_f / TIB, "TiB", qemu_compat)
     } else if bytes_f >= GIB {
@@ -1066,13 +1099,30 @@ fn format_size_human(bytes: u64, qemu_compat: bool) -> String {
         format_size_value(bytes_f / MIB, "MiB", qemu_compat)
     } else if bytes_f >= KIB {
         format_size_value(bytes_f / KIB, "KiB", qemu_compat)
-    } else if bytes == 0 {
-        // qemu-img outputs just "0" for zero bytes, no unit
-        "0".to_string()
     } else {
         // qemu-img uses "B" for byte unit, not "bytes"
         format!("{bytes} B")
     }
+}
+
+/// C `frexp` exponent: for a finite, non-zero `x`, returns the `e` such that
+/// `x == m * 2^e` with `0.5 <= |m| < 1` — exactly the exponent glibc's
+/// `frexp` writes out, which qemu's `size_to_str` relies on for unit
+/// selection. Zero and non-finite inputs return 0 (as `frexp` does for zero).
+fn frexp_exponent(x: f64) -> i32 {
+    if x == 0.0 || !x.is_finite() {
+        return 0;
+    }
+    let raw_exp = ((x.to_bits() >> 52) & 0x7ff) as i32;
+    if raw_exp == 0 {
+        // Subnormal: normalise by scaling up by 2^64, then correct. (Not
+        // reachable from format_size_human, which only passes x >= 1.024.)
+        return frexp_exponent(x * (2.0_f64).powi(64)) - 64;
+    }
+    // Normalised: value = 1.f * 2^(raw_exp - 1023) with 1 <= 1.f < 2, so
+    // value = (1.f / 2) * 2^(raw_exp - 1023 + 1); frexp's exponent is
+    // therefore raw_exp - 1022.
+    raw_exp - 1022
 }
 
 /// Round half to even (banker's rounding) - matches C printf behavior
@@ -1128,6 +1178,19 @@ fn format_size_value(value: f64, unit: &str, qemu_compat: bool) -> String {
             format!("{rounded:.1} {unit}")
         }
     }
+}
+
+/// True when qemu-img would print the encrypted marker for this image
+/// (`encrypted: yes` in human output, `"encrypted": true` in JSON).
+///
+/// Driven by `INFO_RESULT_FLAG_ENCRYPTED`, which the guest sets for a
+/// qcow1 AES header (`crypt_method != 0`), a qcow2 encrypted header, or
+/// a LUKS container. LUKS is gated OUT: qemu-img prints no encrypted
+/// line for a bare LUKS container, and instar's hand-maintained LUKS
+/// goldens pin that (no-line) output — emitting the marker for LUKS
+/// would break them byte-for-byte.
+fn should_emit_encrypted_line(info: &guest_::InfoResultMessage) -> bool {
+    info.flags & INFO_RESULT_FLAG_ENCRYPTED != 0 && info.format != "luks"
 }
 
 /// Print InfoResult in qemu-img compatible format
@@ -1222,8 +1285,20 @@ fn print_info_result(
         };
         println!("disk size: {}", format_size_human(disk_size, qemu_compat));
 
-        // Line 5: cluster_size (with underscore, matching qemu-img)
-        if info.cluster_size > 0 {
+        // Encrypted line: qemu-img prints "encrypted: yes" between the
+        // disk-size and cluster_size lines when the image declares
+        // encryption (e.g. an AES qcow1, crypt_method != 0). LUKS is
+        // gated out below (see should_emit_encrypted_line).
+        if should_emit_encrypted_line(info) {
+            println!("encrypted: yes");
+        }
+
+        // Line 5: cluster_size (with underscore, matching qemu-img).
+        // parallels carries a real cluster_size internally (tracks × 512,
+        // set by the info op so the chain reader chunks on cluster
+        // boundaries), but qemu-img prints no cluster_size for parallels,
+        // so suppress it by format to keep info output byte-identical.
+        if info.cluster_size > 0 && info.format != "parallels" {
             println!("cluster_size: {}", info.cluster_size);
         }
 
@@ -1416,12 +1491,22 @@ fn print_info_result(
             } else {
                 std::cmp::max(file_size, info.actual_size)
             };
-            // For raw format, round up to 512-byte sector boundary. VMDK
-            // flat descriptors are likewise treated as unstructured files
-            // by qemu-img, so their protocol-node length is rounded up to
-            // a sector — the same computation the JSON path applies to
-            // descriptor_vsize.
-            let effective_child_file_length = if info.format == "raw" || vmdk_flat.is_some() {
+            // qemu-img reports the protocol-node length rounded up to a
+            // 512-byte sector for the container formats whose driver opens the
+            // underlying file at 512-sector granularity: raw, the VMDK flat
+            // descriptor's protocol node, the read-only sector-based drivers
+            // parallels/bochs/cloop/dmg, and qcow (v1). cloop (1690 -> 2048)
+            // and dmg (11747 -> 11776) first exercised this; qcow1-compressed
+            // (10774 -> 11264) is the qcow example. Every other qcow fixture's
+            // file is already sector-aligned, so rounding them is a no-op.
+            // Other structured formats keep instar's exact protocol length
+            // (e.g. the malformed luks-v1 golden reports 592, which qemu-img
+            // cannot even open).
+            let rounds_protocol_length = matches!(
+                info.format.as_str(),
+                "raw" | "parallels" | "bochs" | "cloop" | "dmg" | "qcow"
+            ) || vmdk_flat.is_some();
+            let effective_child_file_length = if rounds_protocol_length {
                 child_file_length.div_ceil(512) * 512
             } else {
                 child_file_length
@@ -1469,8 +1554,22 @@ fn print_info_result_json(
         info.virtual_size
     };
 
-    // For child file length in raw/unknown format, also round up to 512-byte sectors
-    let effective_child_file_length = if is_unstructured {
+    // qemu-img reports the child node's virtual-size rounded up to a 512-byte
+    // sector for the container formats whose driver opens the underlying file
+    // at 512-sector granularity: raw/unknown, the VMDK flat descriptor, the
+    // read-only sector-based drivers parallels/bochs/cloop/dmg, and qcow (v1).
+    // cloop (1690 -> 2048) and dmg (11747 -> 11776) first exercised this;
+    // qcow1-compressed (10774 -> 11264) is the qcow example. Every other qcow
+    // fixture's file is already sector-aligned. Other structured formats keep
+    // instar's exact protocol length (e.g. the malformed luks-v1 golden
+    // reports 592). NOTE: qcow is added ONLY here, not to is_unstructured —
+    // its top-level virtual-size comes from the header, not the file length.
+    let rounds_protocol_length = is_unstructured
+        || matches!(
+            info.format.as_str(),
+            "parallels" | "bochs" | "cloop" | "dmg" | "qcow"
+        );
+    let effective_child_file_length = if rounds_protocol_length {
         child_file_length.div_ceil(512) * 512
     } else {
         child_file_length
@@ -1565,9 +1664,12 @@ fn print_info_result_json(
         println!("    ],");
     }
 
-    // Backing file format - always output when there's a backing file
-    // For QCOW2, this comes from header extensions (v3)
-    if has_backing_file {
+    // Backing file format - output when there's a backing file.
+    // For QCOW2, this comes from header extensions (v3). QCOW1 stores no
+    // backing-format field (qemu resolves it by probing at open) and
+    // qemu-img emits NO "backing-filename-format" key for qcow — the
+    // qcow1-backing JSON baseline confirms — so suppress it by format.
+    if has_backing_file && info.format != "qcow" {
         // Use the format from header extension if available, otherwise default to qcow2
         let backing_format = if !info.qcow2_info.backing_format.is_empty() {
             info.qcow2_info.backing_format.as_str()
@@ -1580,12 +1682,44 @@ fn print_info_result_json(
     println!("    \"virtual-size\": {effective_virtual_size},");
     println!("    \"filename\": \"{}\",", escape_json_string(abs_path));
 
-    if info.cluster_size > 0 {
+    // parallels carries a real cluster_size internally (tracks × 512, set
+    // by the info op so the chain reader chunks on cluster boundaries),
+    // but qemu-img emits no cluster-size for parallels, so suppress it by
+    // format to keep the JSON byte-identical.
+    if info.cluster_size > 0 && info.format != "parallels" {
         println!("    \"cluster-size\": {},", info.cluster_size);
     }
 
     println!("    \"format\": \"{}\",", info.format);
-    println!("    \"actual-size\": {disk_size},");
+
+    // qemu-img omits the top-level "dirty-flag" entirely for the
+    // detection-and-info-only drivers (parallels, bochs, cloop, dmg): those
+    // block drivers do not implement bdrv_get_info, so QEMU never populates
+    // ImageInfo.dirty-flag for them. Every other format QEMU reports (qcow2,
+    // vmdk, vpc, vhdx, qed, vdi, raw, ...) emits it. When it is suppressed,
+    // "actual-size" becomes the object's last member — and for these four
+    // formats nothing else follows it (no format-specific section, no backing
+    // file) — so drop its trailing comma to keep the JSON well-formed.
+    let emit_dirty_flag = !matches!(
+        info.format.as_str(),
+        "parallels" | "bochs" | "cloop" | "dmg"
+    );
+    if emit_dirty_flag {
+        println!("    \"actual-size\": {disk_size},");
+    } else {
+        println!("    \"actual-size\": {disk_size}");
+    }
+
+    // Encrypted key: qemu-img emits "encrypted": true immediately after
+    // "actual-size" (and before the format-specific section / backing
+    // filenames / dirty-flag) when the image declares encryption. Pinned
+    // from the qcow1-encrypted JSON baselines. LUKS is gated out (see
+    // should_emit_encrypted_line). A trailing comma is always correct
+    // here because for every encryption-declaring format at least
+    // "dirty-flag" still follows.
+    if should_emit_encrypted_line(info) {
+        println!("    \"encrypted\": true,");
+    }
 
     // Format-specific section
     if info.format == "qcow2" {
@@ -1827,13 +1961,16 @@ fn print_info_result_json(
     // For QCOW2, use the dirty flag from the image header
     // For other formats, always report false
     // Note: dirty-flag output was added in qemu-img 6.1; for 6.0 compatibility,
-    // always report false when profile.include_dirty_flag is false
-    let dirty_flag = if profile.include_dirty_flag && info.format == "qcow2" {
-        info.qcow2_info.dirty
-    } else {
-        false
-    };
-    println!("    \"dirty-flag\": {dirty_flag}");
+    // always report false when profile.include_dirty_flag is false.
+    // parallels/bochs/cloop/dmg omit the field entirely (see emit_dirty_flag).
+    if emit_dirty_flag {
+        let dirty_flag = if profile.include_dirty_flag && info.format == "qcow2" {
+            info.qcow2_info.dirty
+        } else {
+            false
+        };
+        println!("    \"dirty-flag\": {dirty_flag}");
+    }
     println!("}}");
 }
 
@@ -2240,6 +2377,38 @@ fn discover_backing_chain(
         // Always use secure mode (unsafe_quirks=false) for backing chain discovery
         let info_result = execute_info_operation(&current, sector_size, false)
             .map_err(|e| ChainError::InfoOperationFailed(e.to_string()))?;
+
+        // Refuse detected-but-unsupported input formats instead of
+        // silently reading them as raw. The guest info op can *name* and
+        // *size* formats that instar has no read path for (qed, vdi, and
+        // the newly detected parallels/bochs/cloop/dmg);
+        // `ImageFormat::from_str` collapses every such string to `Unknown`,
+        // and the guest chain reader's default arm would then read those
+        // bytes as raw — emitting the container header plus zero padding in
+        // place of the virtual-disk content. Gate on the info-reported
+        // string *before* the `from_str` -> `Unknown` collapse so any
+        // future detect-only format is refused automatically. Because this
+        // runs once per chain position, mid-chain backing files (e.g. a
+        // qcow2 whose backing file is a qed image) are refused identically.
+        //
+        // `iso` is deliberately exempt: this is qemu parity, not an
+        // oversight. An ISO's container bytes *are* its virtual-disk
+        // content, so reading it as raw is semantically correct, and
+        // qemu-img (which has no iso driver) converts ISOs as raw
+        // routinely — refusing them would be a parity regression, not a
+        // safety fix. `raw`/`unknown` stay pass-through so genuinely
+        // unidentifiable input keeps its secure-mode partition-gate
+        // behaviour. This mirrors the post-1a management decision recorded
+        // in docs/plans/PLAN-format-coverage-phase-01-detection.md.
+        if matches!(
+            ImageFormat::from_str(&info_result.format),
+            ImageFormat::Unknown
+        ) && !matches!(info_result.format.as_str(), "raw" | "unknown" | "iso")
+        {
+            return Err(ChainError::UnsupportedInputFormat(
+                info_result.format.clone(),
+            ));
+        }
 
         // Get actual filesystem size for the chain config. The guest
         // info operation may report actual_size=0 for non-QCOW2 formats
@@ -11476,10 +11645,16 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     let security_config = config::load_config().config.security;
     let chain1 =
         discover_backing_chain(Path::new(&args.image1), args.sector_size, &security_config)
-            .map_err(|e| format!("error discovering backing chain for {}: {}", args.image1, e))?;
+            .map_err(|e| match &e {
+                ChainError::UnsupportedInputFormat(_) => format!("compare: {e}"),
+                _ => format!("error discovering backing chain for {}: {}", args.image1, e),
+            })?;
     let chain2 =
         discover_backing_chain(Path::new(&args.image2), args.sector_size, &security_config)
-            .map_err(|e| format!("error discovering backing chain for {}: {}", args.image2, e))?;
+            .map_err(|e| match &e {
+                ChainError::UnsupportedInputFormat(_) => format!("compare: {e}"),
+                _ => format!("error discovering backing chain for {}: {}", args.image2, e),
+            })?;
 
     if verbose {
         debug!("Image 1 chain ({} image(s)):", chain1.len());
@@ -12293,7 +12468,13 @@ fn execute_convert(
     // Discover input backing chain
     let security_config = config::load_config().config.security;
     let chain = discover_backing_chain(Path::new(&exec.input), exec.sector_size, &security_config)
-        .map_err(|e| format!("error discovering backing chain for {}: {}", exec.input, e))?;
+        .map_err(|e| match &e {
+            // `execute_convert` is shared by convert and dd, but dd runs
+            // its own chain discovery first (and refuses there with a
+            // `dd:` prefix), so a refusal reaching this point is convert's.
+            ChainError::UnsupportedInputFormat(_) => format!("convert: {e}"),
+            _ => format!("error discovering backing chain for {}: {}", exec.input, e),
+        })?;
 
     if verbose {
         debug!("Input chain ({} image(s)):", chain.len());
@@ -13680,11 +13861,12 @@ fn run_dd(args: DdArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>>
     }
     let security_config = config::load_config().config.security;
     let chain = discover_backing_chain(Path::new(&parsed.input), sector_size, &security_config)
-        .map_err(|e| {
-            format!(
+        .map_err(|e| match &e {
+            ChainError::UnsupportedInputFormat(_) => format!("dd: {e}"),
+            _ => format!(
                 "error discovering backing chain for {}: {}",
                 parsed.input, e
-            )
+            ),
         })?;
     let virtual_size = chain.images()[0].virtual_size;
 

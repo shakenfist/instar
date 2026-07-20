@@ -167,6 +167,40 @@ class TestRebaseErrorPaths(TestRebaseSmoke):
                 'does not support rebase', stderr.lower(),
                 f'unexpected stderr: {stderr}')
 
+    def test_qed_overlay_refused(self):
+        """A qed overlay is refused by the probe, byte-unchanged.
+
+        Format-coverage phase 6 keeps QED read-refused as policy (see
+        docs/plans/PLAN-format-coverage-phase-06-qed.md).  QED's
+        offset-0 header magic is recognised by the overlay probe, which
+        has no QED arm, so the rebase is refused before any write (even
+        with `-u`, whose unsafe path is reached only after the format
+        check).
+
+        COSMETIC PIN (as-is, do not normalise): the message renders the
+        Rust Debug spelling of the format variant -- capital-Q "Qed" --
+        where the chain-gate ops say lowercase "qed".  A wording quirk,
+        not a safety issue.
+        """
+        image = self.get_image('qed-simple')
+        if not image.path.exists():
+            self.skipTest(f'fixture not available: {image.path}')
+        self.skip_if_hash_mismatch(image)
+        with tempfile.TemporaryDirectory() as td:
+            overlay = Path(td) / 'overlay.qed'
+            shutil.copy(image.path, overlay)
+            before = overlay.read_bytes()
+            _, stderr, rc = self.run_instar_rebase(
+                overlay, '-u', '-b', '/tmp/anything')
+            self.assertNotEqual(rc, 0, f'unexpected stderr: {stderr}')
+            self.assertIn(
+                "format 'Qed' does not support rebase (qcow2 and vmdk only)",
+                stderr,
+                f'unexpected stderr: {stderr}')
+            self.assertEqual(
+                overlay.read_bytes(), before,
+                'a refused rebase must not touch the qed overlay')
+
 
 # ----------------------------------------------------------------------
 # Success-path tests — end-to-end with the rebase guest

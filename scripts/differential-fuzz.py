@@ -22,6 +22,7 @@ Usage:
 """
 
 import argparse
+import base64
 import hashlib
 import json
 import logging
@@ -33,6 +34,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import zlib
 from pathlib import Path
 
 # The snapshot read-back oracle (COW parity contract C6/C7/C8) is the
@@ -49,7 +51,7 @@ from helpers.snapshot_readback import snapshot_readback  # noqa: E402
 # Constants
 # ---------------------------------------------------------------------------
 
-FORMATS = ['qcow2', 'raw', 'vmdk', 'vpc']
+FORMATS = ['qcow2', 'raw', 'vmdk', 'vpc', 'vdi', 'parallels', 'qcow', 'dmg']
 OUTPUT_FORMATS = ['qcow2', 'raw', 'vmdk', 'vpc']
 VIRTUAL_SIZES = ['1M', '4M', '16M', '64M', '256M', '1G']
 QCOW2_CLUSTER_SIZES = [512, 4096, 65536, 262144, 2097152]
@@ -112,6 +114,207 @@ def write_mbr_header(path):
         ))
 
 
+# ---------------------------------------------------------------------------
+# DMG mini-builder (PLAN-format-coverage-phase-05-dmg-read.md, "Fuzzing")
+#
+# qemu-img CANNOT create DMG images (block/dmg.c is read-only), so unlike
+# every other FORMATS entry, dmg images are synthesised directly here
+# rather than via `qemu-img create` + a data-pattern-writing step. The
+# koly/mish/plist helpers below are a deliberately minimal PORT of
+# instar-testdata's scripts/generate-dmg-fixtures.py build_koly/build_mish
+# /build_plist (instar-testdata is a SEPARATE git repository from this
+# one, hence a copy rather than an import).
+#
+# Unlike the fixture generator, every image built here is GAP-FREE (koly
+# SectorCount always equals the exact mish coverage): a gap image fails
+# convert on BOTH sides (EIO parity, per the dmg-gap fixture) and would
+# only pollute the differential content-comparison signal, not exercise
+# it. Only zero / raw / zlib chunks are used (the phase-5 read scope; no
+# ADC/bzip2/lzfse/zstd codecs), and every chunk stays within instar's own
+# bounded-memory staging cap (DMG_MAX_STAGED_SECTOR_COUNT = 4096 sectors,
+# comp_len well under COMPRESSED_BUF_SIZE) so the fuzzer explores real
+# convertible images -- the capacity-divergence corner is already pinned
+# by the dmg-overcap-chunk fixture in the integration matrix (5e), not
+# fuzzed here.
+# ---------------------------------------------------------------------------
+
+DMG_SECTOR_SIZE = 512
+DMG_CHUNK_ZERO = 0x00000000
+DMG_CHUNK_RAW = 0x00000001
+DMG_CHUNK_ZLIB = 0x80000005
+DMG_CHUNK_TERMINATOR = 0xFFFFFFFF
+DMG_MISH_MAGIC = 0x6D697368
+
+# instar's per-chunk bounded-memory staging cap
+# (DMG_MAX_STAGED_SECTOR_COUNT in src/crates/dmg/src/lib.rs): 4096
+# sectors == 2 MiB uncompressed. Chosen (rather than qemu's own, much
+# larger DMG_SECTORCOUNTS_MAX) so every chunk this builder emits is one
+# instar can actually stage -- see the section note above.
+DMG_MAX_CHUNK_SECTORS = 4096
+
+
+def _dmg_build_mish(first_sector, total_sectors, chunks):
+    """Build a 204-byte mish header + 40-byte BE chunk entries.
+
+    Ported from instar-testdata/scripts/generate-dmg-fixtures.py's
+    build_mish (see the section provenance comment above).
+    """
+    header = bytearray(204)
+    struct.pack_into('>I', header, 0x00, DMG_MISH_MAGIC)
+    struct.pack_into('>I', header, 0x04, 1)                  # version
+    struct.pack_into('>Q', header, 0x08, first_sector)
+    struct.pack_into('>Q', header, 0x10, total_sectors)
+    struct.pack_into('>Q', header, 0x18, 0)                  # data_offset
+    struct.pack_into('>I', header, 0x20, 1)                  # buffers_needed
+    struct.pack_into('>I', header, 0x24, len(chunks))        # block_descriptor
+    struct.pack_into('>I', header, 0xC8, len(chunks))        # number_of_chunks
+
+    body = bytearray()
+    for entry_type, sector_number, sector_count, comp_offset, comp_length in chunks:
+        body += struct.pack(
+            '>IIQQQQ', entry_type, 0, sector_number, sector_count,
+            comp_offset, comp_length)
+    return bytes(header) + bytes(body)
+
+
+def _dmg_build_plist(mish_blocks):
+    """Wrap base64-encoded mish blocks in an Apple resource-fork/blkx plist.
+
+    Ported from generate-dmg-fixtures.py's build_plist.
+    """
+    entries = []
+    for index, mish in enumerate(mish_blocks):
+        encoded = base64.b64encode(mish).decode('ascii')
+        wrapped = '\n'.join(
+            '\t\t\t\t\t\t' + encoded[i:i + 64] for i in range(0, len(encoded), 64))
+        entries.append(
+            '\t\t\t\t<dict>\n'
+            '\t\t\t\t\t<key>Attributes</key>\n\t\t\t\t\t<string>0x0050</string>\n'
+            f'\t\t\t\t\t<key>Data</key>\n\t\t\t\t\t<data>\n{wrapped}\n\t\t\t\t\t</data>\n'
+            f'\t\t\t\t\t<key>ID</key>\n\t\t\t\t\t<string>{index}</string>\n'
+            '\t\t\t\t\t<key>Name</key>\n\t\t\t\t\t<string>instar-fuzz</string>\n'
+            '\t\t\t\t</dict>')
+    blkx_array = '\n'.join(entries)
+    plist = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+        '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+        '<plist version="1.0">\n<dict>\n\t<key>resource-fork</key>\n\t<dict>\n'
+        '\t\t<key>blkx</key>\n\t\t<array>\n'
+        f'{blkx_array}\n'
+        '\t\t</array>\n\t</dict>\n</dict>\n</plist>\n')
+    return plist.encode('ascii')
+
+
+def _dmg_build_koly(data_fork_offset, data_fork_length, xml_offset, xml_length,
+                     sector_count, rsrc_fork_length=0, rsrc_fork_offset=0):
+    """Build the 512-byte big-endian koly trailer.
+
+    Ported from generate-dmg-fixtures.py's build_koly.
+    """
+    koly = bytearray(512)
+    koly[0:4] = b'koly'
+    struct.pack_into('>I', koly, 0x04, 4)                    # version
+    struct.pack_into('>I', koly, 0x08, 512)                  # header size
+    struct.pack_into('>I', koly, 0x0C, 1)                    # flags
+    struct.pack_into('>Q', koly, 0x18, data_fork_offset)
+    struct.pack_into('>Q', koly, 0x20, data_fork_length)
+    struct.pack_into('>Q', koly, 0x28, rsrc_fork_offset)
+    struct.pack_into('>Q', koly, 0x30, rsrc_fork_length)
+    struct.pack_into('>Q', koly, 0xD8, xml_offset)
+    struct.pack_into('>Q', koly, 0xE0, xml_length)
+    struct.pack_into('>Q', koly, 0x1EC, sector_count)
+    return bytes(koly)
+
+
+def _dmg_build_image(rng):
+    """Build a complete, valid, gap-free DMG (Apple UDIF) image from `rng`.
+
+    Picks 1-8 chunks (zero/raw/zlib, sector counts <= DMG_MAX_CHUNK_SECTORS
+    each, zlib level 9); ~25% of the time splits them across two mish
+    blocks (multipart, composed via out_offset, mirroring
+    generate-dmg-fixtures.py's build_multipart_dmg); ~20% of the time uses
+    the old resource-fork table path instead of the XML plist (both are
+    qemu-supported -- see the plan's koly trailer notes). koly SectorCount
+    always equals the exact chunk coverage (no gap).
+    """
+    num_chunks = rng.randint(1, 8)
+    chunk_specs = [
+        (rng.choice(['zero', 'raw', 'zlib']), rng.randint(1, DMG_MAX_CHUNK_SECTORS))
+        for _ in range(num_chunks)
+    ]
+
+    multipart = num_chunks >= 2 and rng.random() < 0.25
+    if multipart:
+        split = rng.randint(1, num_chunks - 1)
+        block_specs = [chunk_specs[:split], chunk_specs[split:]]
+    else:
+        block_specs = [chunk_specs]
+
+    data_fork = bytearray()
+    mish_blocks = []
+    out_offset = 0
+    for specs in block_specs:
+        entries = []
+        sector = 0
+        for kind, sector_count in specs:
+            if kind == 'zero':
+                entries.append((DMG_CHUNK_ZERO, sector, sector_count, 0, 0))
+            else:
+                payload = rng.randbytes(sector_count * DMG_SECTOR_SIZE)
+                if kind == 'raw':
+                    comp_offset = len(data_fork)
+                    data_fork += payload
+                    entries.append(
+                        (DMG_CHUNK_RAW, sector, sector_count, comp_offset, len(payload)))
+                else:
+                    comp = zlib.compress(payload, 9)
+                    comp_offset = len(data_fork)
+                    data_fork += comp
+                    entries.append(
+                        (DMG_CHUNK_ZLIB, sector, sector_count, comp_offset, len(comp)))
+            sector += sector_count
+        block_total = sector
+        entries.append((DMG_CHUNK_TERMINATOR, block_total, 0, len(data_fork), 0))
+        mish_blocks.append(_dmg_build_mish(out_offset, block_total, entries))
+        out_offset += block_total
+
+    total_sectors = out_offset
+    use_rsrc_fork = rng.random() < 0.20
+
+    if use_rsrc_fork:
+        # The resource-fork walk (parse_resource_fork) reads a sequence
+        # of [u32 size][mish] resources back-to-back, so multiple mish
+        # blocks (the multipart case) compose naturally here too.
+        resource_bytes = bytearray()
+        for mish in mish_blocks:
+            resource_bytes += struct.pack('>I', len(mish)) + mish
+        rsrc_data_offset = 16
+        rsrc_fork = bytearray(rsrc_data_offset)
+        struct.pack_into('>I', rsrc_fork, 0x00, rsrc_data_offset)
+        struct.pack_into('>I', rsrc_fork, 0x08, len(resource_bytes))
+        rsrc_fork += resource_bytes
+
+        koly = _dmg_build_koly(
+            data_fork_offset=0,
+            data_fork_length=len(data_fork),
+            xml_offset=0,
+            xml_length=0,
+            sector_count=total_sectors,
+            rsrc_fork_length=len(rsrc_fork),
+            rsrc_fork_offset=len(data_fork))
+        return bytes(data_fork) + bytes(rsrc_fork) + koly
+
+    xml = _dmg_build_plist(mish_blocks)
+    koly = _dmg_build_koly(
+        data_fork_offset=0,
+        data_fork_length=len(data_fork),
+        xml_offset=len(data_fork),
+        xml_length=len(xml),
+        sector_count=total_sectors)
+    return bytes(data_fork) + xml + koly
+
+
 def generate_image(rng, workdir, iteration):
     """Generate a random disk image using qemu-img.
 
@@ -130,6 +333,25 @@ def generate_image(rng, workdir, iteration):
     image_name = f'fuzz-{iteration:06d}.{fmt}'
     image_path = workdir / image_name
 
+    # DMG is qemu-img-uncreatable (block/dmg.c is read-only), so it takes
+    # a completely different path: the mini-builder synthesises the whole
+    # file directly instead of `qemu-img create` + a data-pattern-writing
+    # step (there is no qemu-side writer to drive with qemu-io either).
+    # `vsize`/`pattern` are left in attrs as None for log-shape
+    # consistency but are not honoured -- the builder derives its own
+    # (small, staging-cap-bounded) shape from `rng`. The `.dmg` extension
+    # on image_path (from `image_name` above) is what makes qemu-img
+    # autoprobe the file as dmg later (its probe is purely extension-
+    # based, per the plan) since instar/qemu-img are never invoked with
+    # an explicit `-f` for the source side.
+    if fmt == 'dmg':
+        image_bytes = _dmg_build_image(rng)
+        image_path.write_bytes(image_bytes)
+        attrs['virtual_size'] = None
+        attrs['pattern'] = None
+        attrs['dmg_bytes'] = len(image_bytes)
+        return image_path, fmt, attrs
+
     # Build qemu-img create command
     cmd = ['qemu-img', 'create', '-f', fmt]
 
@@ -141,6 +363,37 @@ def generate_image(rng, workdir, iteration):
     if fmt == 'vmdk':
         # VMDK only supports specific sub-formats; use monolithicSparse
         cmd.extend(['-o', 'subformat=monolithicSparse'])
+
+    if fmt == 'vdi':
+        # VDI supports dynamic (default) and static (pre-allocated,
+        # identity block map) images; instar's reader must handle both
+        # (PLAN-format-coverage-phase-02-vdi-read.md step 2f), so pick
+        # static some of the time.
+        static = rng.random() < 0.3
+        attrs['static'] = static
+        if static:
+            cmd.extend(['-o', 'static=on'])
+
+    if fmt == 'parallels':
+        # Parallels' cluster size (tracks * 512) is user-settable via
+        # -o cluster_size (qemu-img default is 1 MiB, tracks=2048);
+        # instar's reader derives cluster boundaries from it, so pick
+        # a non-default value -- including small ones that exercise
+        # chunk-boundary handling -- some of the time
+        # (PLAN-format-coverage-phase-03-parallels-read.md step 3f),
+        # mirroring the vdi static=on branch above.
+        if rng.random() < 0.3:
+            cluster_size = rng.choice([4096, 65536, 1048576])
+            attrs['cluster_size'] = cluster_size
+            cmd.extend(['-o', f'cluster_size={cluster_size}'])
+
+    # qcow (v1, qemu's create name for the format instar's qcow1 crate
+    # reads) supports no -o options this fuzzer needs to vary
+    # (PLAN-format-coverage-phase-04-qcow1-read.md step 4f) — cluster_bits
+    # and l2_bits default to 12/9 and there is no supported way to set
+    # them via qemu-img create. No branch needed here; the compressed
+    # variant is applied as a post-processing step below, after the data
+    # pattern is written, since it needs a fully-populated source image.
 
     cmd.extend([str(image_path), vsize])
 
@@ -161,7 +414,70 @@ def generate_image(rng, workdir, iteration):
         # Leave as-is (all zeros, sparse allocation)
         pass
 
+    if fmt == 'qcow':
+        image_path, compressed = _maybe_compress_qcow1(
+            rng, image_path, iteration, workdir,
+        )
+        attrs['compressed'] = compressed
+
     return image_path, fmt, attrs
+
+
+def _maybe_compress_qcow1(rng, image_path, iteration, workdir):
+    """~30% of the time, replace a qcow (v1) image with its compressed
+    twin via `qemu-img convert -c -O qcow`.
+
+    Returns (path, compressed) — `path` is `image_path` itself unless the
+    compressed twin was accepted, in which case it now points at the
+    (still `image_path`-named) compressed file; `compressed` records
+    whether that happened, for attrs/log diagnostics.
+
+    Verified qemu quirk (PLAN-format-coverage-phase-04-qcow1-read.md,
+    "Fuzzing" / "Other subcommands"): this command writes a fully valid
+    compressed qcow image but exits 1 with empty stderr, on every
+    spot-checked qemu version. Tolerating rc 0 *or* 1 for exactly this
+    call is safe because the result isn't trusted on rc alone — the
+    output is independently verified with `qemu-img info` (does it open
+    at all) before being accepted; if that verification fails for any
+    reason the uncompressed image is kept instead, so a real conversion
+    failure degrades to "less coverage this iteration" rather than a
+    corrupt fixture entering the fuzz loop.
+    """
+    if rng.random() >= 0.3:
+        return image_path, False
+
+    compressed_path = workdir / f'fuzz-{iteration:06d}.qcow.compressed'
+    conv_cmd = [
+        'qemu-img', 'convert', '-c', '-f', 'qcow', '-O', 'qcow',
+        str(image_path), str(compressed_path),
+    ]
+    try:
+        conv_result = subprocess.run(
+            conv_cmd, capture_output=True, text=True, timeout=30
+        )
+    except subprocess.TimeoutExpired:
+        return image_path, False
+
+    # rc 0 *and* rc 1 are both "the command ran"; anything else (e.g. a
+    # signal) means something unexpected happened and the compressed
+    # output should not be trusted.
+    if conv_result.returncode not in (0, 1):
+        return image_path, False
+
+    if not compressed_path.exists():
+        return image_path, False
+
+    info_check = subprocess.run(
+        ['qemu-img', 'info', str(compressed_path)],
+        capture_output=True, text=True, timeout=30,
+    )
+    if info_check.returncode != 0:
+        compressed_path.unlink()
+        return image_path, False
+
+    image_path.unlink()
+    compressed_path.rename(image_path)
+    return image_path, True
 
 
 def _write_random_data(rng, image_path, fmt):
@@ -1007,7 +1323,31 @@ def op_measure(instar_bin, instar_copy, qemu_copy, fmt,
                timeout, rng):
     """Run instar measure and compare to qemu-img measure (raw/qcow2)
     or instar convert's actual output size (vmdk/vpc/vhdx).
+
+    VDI, Parallels, and qcow (v1) sources are gated out: `measure` is
+    out of scope for all three read paths
+    (PLAN-format-coverage-phase-02-vdi-read.md,
+    PLAN-format-coverage-phase-03-parallels-read.md, and
+    PLAN-format-coverage-phase-04-qcow1-read.md, all "Out of scope" —
+    measure isn't one of the reader-linking ops those phases graduated),
+    so instar refuses a VDI, Parallels, or qcow source while qemu-img
+    measure succeeds. Comparing would be a spurious exit_code_divergence
+    (a deliberate, documented divergence), not a real instar defect.
+
+    DMG is gated out too, for a DIFFERENT reason: instar's measure never
+    wires in the koly-trailer probe and treats a dmg source as raw bytes
+    (PLAN-format-coverage-phase-05-dmg-read.md, "map/measure/resize keep
+    their raw-pass-through behaviour" — a deliberate, documented,
+    retained divergence, not something 5f's graduation touches), while
+    qemu-img measure opens it as a real dmg and reports the koly virtual
+    size. Both sides succeed (rc 0), so this would surface as a spurious
+    measure_numeric_divergence rather than an exit-code divergence, but
+    it is exactly as inapplicable a comparison as the exit_code_divergence
+    cases above.
     """
+    if fmt in ('vdi', 'parallels', 'qcow', 'dmg'):
+        return None
+
     # Pick a target format.
     target_fmt = rng.choice(['raw', 'qcow2', 'vmdk', 'vpc', 'vhdx'])
 
@@ -3499,11 +3839,33 @@ def op_map(instar_bin, instar_copy, qemu_copy, fmt, timeout, rng):
     docs/quirks.md) that would noise-flood the fuzzer. The same
     posture as `op_info`'s raw skip.
 
+    DMG is gated out for the SAME reason as raw, not a new one: instar's
+    map never wires in the koly-trailer probe and treats a dmg source as
+    raw bytes (PLAN-format-coverage-phase-05-dmg-read.md, "map/measure/
+    resize keep their raw-pass-through behaviour" — a deliberate,
+    documented, retained divergence 5f's graduation does not touch), so
+    it emits the same one-fully-allocated-extent shape while qemu-img's
+    dmg map walks the real chunk table (with its own compressed-cluster
+    JSON-field drift across versions, per the plan's "Other subcommands"
+    notes) — the identical raw-vs-SEEK_HOLE-shaped divergence as above,
+    just reached via a different source format.
+
+    VDI, Parallels, and qcow (v1) are gated out too: instar refuses
+    `map` on VDI, Parallels, and qcow sources (guest-side
+    ERROR_INVALID_SOURCE — map is out of scope for all three read
+    paths, PLAN-format-coverage-phase-02-vdi-read.md,
+    PLAN-format-coverage-phase-03-parallels-read.md, and
+    PLAN-format-coverage-phase-04-qcow1-read.md, all "Out of scope")
+    while qemu-img map succeeds, which would be a spurious
+    exit_code_divergence on every VDI/Parallels/qcow iteration rather
+    than a real instar defect. This is a deliberate, documented
+    divergence (master-plan future-work item), not a bug.
+
     Other format-level divergences (chain qcow2 refused, vmdk
     multi-extent refused, vhdx partial-present) don't fire here
     because generate_image() never produces those shapes.
     """
-    if fmt == 'raw':
+    if fmt in ('raw', 'vdi', 'parallels', 'qcow', 'dmg'):
         return None
 
     virtual_size = _map_probe_virtual_size(qemu_copy, timeout)

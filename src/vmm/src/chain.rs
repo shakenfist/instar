@@ -36,11 +36,17 @@ pub enum ImageFormat {
     Vhd,
     /// VHDX format
     Vhdx,
+    /// VDI format (VirtualBox Disk Image)
+    Vdi,
+    /// Parallels disk image (WithoutFreeSpace / WithouFreSpacExt magics)
+    Parallels,
     /// LUKS encrypted container
     Luks,
     /// VMDK monolithicFlat descriptor file (text, points to a
     /// separate flat extent file that holds the actual content).
     VmdkDescriptor,
+    /// DMG (Apple UDIF) disk image
+    Dmg,
     /// Unknown or unsupported format
     Unknown,
 }
@@ -51,12 +57,17 @@ impl ImageFormat {
         match s {
             "raw" => ImageFormat::Raw,
             "qcow2" => ImageFormat::Qcow2,
-            "qcow1" => ImageFormat::Qcow1,
+            // The info op emits "qcow" (qemu-img / oslo spelling); "qcow1"
+            // is kept as an accepted input alias.
+            "qcow" | "qcow1" => ImageFormat::Qcow1,
             "vmdk" => ImageFormat::Vmdk4,
             "vmdk3" => ImageFormat::Vmdk3,
             "vpc" => ImageFormat::Vhd,
             "vhdx" => ImageFormat::Vhdx,
+            "vdi" => ImageFormat::Vdi,
+            "parallels" => ImageFormat::Parallels,
             "luks" => ImageFormat::Luks,
+            "dmg" => ImageFormat::Dmg,
             _ => ImageFormat::Unknown,
         }
     }
@@ -81,8 +92,11 @@ impl ImageFormat {
             ImageFormat::Vhd => 5,
             ImageFormat::Vhdx => 6,
             ImageFormat::Qcow1 => 7,
+            ImageFormat::Vdi => 8,
+            ImageFormat::Parallels => 13,
             ImageFormat::Luks => 11,
             ImageFormat::VmdkDescriptor => 12,
+            ImageFormat::Dmg => 16,
         }
     }
 }
@@ -92,16 +106,20 @@ impl std::fmt::Display for ImageFormat {
         match self {
             ImageFormat::Raw => write!(f, "raw"),
             ImageFormat::Qcow2 => write!(f, "qcow2"),
-            ImageFormat::Qcow1 => write!(f, "qcow1"),
+            // qemu-img / oslo call the v1 format "qcow" (not "qcow1").
+            ImageFormat::Qcow1 => write!(f, "qcow"),
             ImageFormat::Vmdk4 => write!(f, "vmdk"),
             ImageFormat::Vmdk3 => write!(f, "vmdk3"),
             ImageFormat::Vhd => write!(f, "vpc"),
             ImageFormat::Vhdx => write!(f, "vhdx"),
+            ImageFormat::Vdi => write!(f, "vdi"),
+            ImageFormat::Parallels => write!(f, "parallels"),
             ImageFormat::Luks => write!(f, "luks"),
             // Reports as "vmdk" to match qemu-img info output for
             // monolithicFlat — matches the `name()` method on
             // `shared::ImageFormat::VmdkDescriptor`.
             ImageFormat::VmdkDescriptor => write!(f, "vmdk"),
+            ImageFormat::Dmg => write!(f, "dmg"),
             ImageFormat::Unknown => write!(f, "unknown"),
         }
     }
@@ -230,6 +248,10 @@ pub enum ChainError {
     CircularReference(PathBuf),
     /// Failed to resolve backing file path
     PathResolutionError(String),
+    /// Input format is detected (and describable by the `info` op) but has
+    /// no read path, so treating it as raw would silently misrepresent its
+    /// contents. Carries the detected format string reported by info.
+    UnsupportedInputFormat(String),
     /// I/O error
     IoError(std::io::Error),
 }
@@ -259,6 +281,13 @@ impl std::fmt::Display for ChainError {
             }
             ChainError::PathResolutionError(msg) => {
                 write!(f, "Path resolution error: {msg}")
+            }
+            ChainError::UnsupportedInputFormat(fmt) => {
+                write!(
+                    f,
+                    "input format '{fmt}' is detected but not supported for reading \
+                     (detection and info only)"
+                )
             }
             ChainError::IoError(e) => write!(f, "I/O error: {e}"),
         }
