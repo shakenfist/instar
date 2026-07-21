@@ -38,6 +38,15 @@ pub const LUKS2_UUID_OFFSET: usize = 168;
 pub const LUKS2_BINARY_HEADER_SIZE: usize = 4096;
 pub const LUKS2_JSON_SCAN_SIZE: usize = 16384;
 
+/// Upper bounds on the LUKS2 Argon2 KDF cost parameters read from the
+/// (attacker-controlled) JSON header. Real LUKS2 headers use small values
+/// (single-digit `time`, a handful of `cpus`), so these caps sit far above
+/// any legitimate header while bounding the guest-side CPU cost of a
+/// crafted keyslot (issue #449). `kdf_memory` is separately bounded by the
+/// caller against the fixed Argon2 working region.
+pub const LUKS2_MAX_KDF_TIME: u32 = 512;
+pub const LUKS2_MAX_KDF_CPUS: u32 = 16;
+
 // ─── Parsed header structures ───────────────────────────────────────
 
 /// LUKS v1 key slot parameters.
@@ -413,6 +422,18 @@ pub fn parse_v2_keyslot(json: &[u8]) -> Option<LuksV2KeySlot> {
     let kdf_time = extract_json_number(kdf_data, b"\"time\"")? as u32;
     let kdf_memory = extract_json_number(kdf_data, b"\"memory\"")? as u32;
     let kdf_cpus = extract_json_number(kdf_data, b"\"cpus\"")? as u32;
+
+    // Reject out-of-range cost parameters before they reach the Argon2 KDF;
+    // a crafted keyslot could otherwise request an enormous iteration count
+    // and spin the guest CPU when the operator supplies a passphrase
+    // (issue #449). Real headers use tiny values, so this never rejects a
+    // legitimate keyslot. `kdf_memory` is bounded separately at the sink.
+    if kdf_time == 0 || kdf_time > LUKS2_MAX_KDF_TIME {
+        return None;
+    }
+    if kdf_cpus == 0 || kdf_cpus > LUKS2_MAX_KDF_CPUS {
+        return None;
+    }
 
     let salt_b64 = extract_json_string(kdf_data, b"\"salt\"")?;
     let mut kdf_salt = [0u8; 32];
