@@ -136,6 +136,18 @@ pub unsafe extern "C" fn _start() -> u64 {
     let input_capacity = (call_table.get_input_capacity)(0);
     let input_sector_size = (call_table.get_input_sector_size)(0);
 
+    // Defense-in-depth: `input_sector_size` is host-configured and already
+    // capped by the VMM, but re-check it in-guest so info carries the same
+    // backstop as map/measure before it sizes reads into the
+    // MAX_SECTOR_SIZE buffer (issue #448).
+    let sector_size_ok = input_sector_size >= 512
+        && input_sector_size <= MAX_SECTOR_SIZE
+        && input_sector_size.is_power_of_two();
+    if !sector_size_ok {
+        (call_table.send_error)(b"info\0".as_ptr(), b"input\0".as_ptr(), 0, 1);
+        return 0;
+    }
+
     // Calculate device capacity (may be padded to sector boundary)
     let device_capacity = input_capacity * input_sector_size as u64;
 

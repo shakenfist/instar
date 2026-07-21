@@ -220,6 +220,16 @@ impl VirtioBlockDevice {
                 self.state.queue_sel = value;
             }
             reg::QUEUE_NUM => {
+                // Clamp the guest-supplied queue size to the advertised
+                // maximum and require a power of two, per the virtio spec.
+                // Every downstream use of `queue.num` is already
+                // independently bounds-checked, so an out-of-spec value is
+                // not exploitable today, but enforcing it here removes the
+                // reliance on those backstops (issue #447). An invalid
+                // value leaves the queue size unchanged (unconfigured).
+                if value == 0 || value > QUEUE_SIZE_MAX as u32 || !value.is_power_of_two() {
+                    return;
+                }
                 self.state.current_queue_mut().num = value as u16;
             }
             reg::QUEUE_READY => {
