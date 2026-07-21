@@ -191,6 +191,17 @@ pub unsafe extern "C" fn _start() -> u64 {
     let input_capacity = (call_table.get_input_capacity)(0);
     let input_sector_size = (call_table.get_input_sector_size)(0);
 
+    // Defense-in-depth: re-check the host-configured sector size in-guest
+    // so check carries the same backstop as map/measure before it sizes
+    // reads into the MAX_SECTOR_SIZE buffer (issue #448).
+    let sector_size_ok = input_sector_size >= 512
+        && input_sector_size <= MAX_SECTOR_SIZE
+        && input_sector_size.is_power_of_two();
+    if !sector_size_ok {
+        (call_table.send_error)(b"check\0".as_ptr(), b"input\0".as_ptr(), 0, 1);
+        return 0;
+    }
+
     // Calculate actual file size
     let actual_size = input_capacity.saturating_mul(input_sector_size as u64);
 

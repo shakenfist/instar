@@ -49,6 +49,25 @@ pub unsafe extern "C" fn _start() -> u64 {
     let output_sector_size = (call_table.get_output_sector_size)();
     let progress_interval = (call_table.get_progress_interval)();
 
+    // Defense-in-depth: both sector sizes are host-configured and VMM-
+    // capped, but re-check them in-guest before they size reads/writes
+    // into the MAX_SECTOR_SIZE buffer, matching the backstop map/measure
+    // already carry (issue #448).
+    let input_ss_ok = input_sector_size >= 512
+        && input_sector_size <= MAX_SECTOR_SIZE
+        && input_sector_size.is_power_of_two();
+    let output_ss_ok = output_sector_size >= 512
+        && output_sector_size <= MAX_SECTOR_SIZE
+        && output_sector_size.is_power_of_two();
+    if !input_ss_ok {
+        (call_table.send_error)(b"copy\0".as_ptr(), b"input\0".as_ptr(), 0, 1);
+        return 0;
+    }
+    if !output_ss_ok {
+        (call_table.send_error)(b"copy\0".as_ptr(), b"output\0".as_ptr(), 0, 2);
+        return 0;
+    }
+
     // Calculate sectors to copy based on config
     let start_sector = cfg_start;
     let end_sector = if cfg_count == 0 {
