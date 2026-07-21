@@ -59,19 +59,7 @@ jobs:
       - name: Prepare instar-testdata
         env:
           TESTDATA_TOKEN: ${{ secrets.GITLAB_TESTDATA_TOKEN }}
-        run: |
-          CACHED=/srv/ci/cached/instar-testdata
-          if [ -d "$CACHED/.git" ]; then
-            cd "$CACHED" && git pull --ff-only \
-              "https://oauth2:${TESTDATA_TOKEN}@gitlab.home.stillhq.com/private/instar-testdata.git" \
-              2>/dev/null || true
-            echo "TESTDATA_PATH=${CACHED}" >> $GITHUB_ENV
-          else
-            git clone --depth 1 \
-              "https://oauth2:${TESTDATA_TOKEN}@gitlab.home.stillhq.com/private/instar-testdata.git" \
-              ${GITHUB_WORKSPACE}/instar-testdata
-            echo "TESTDATA_PATH=${GITHUB_WORKSPACE}/instar-testdata" >> $GITHUB_ENV
-          fi
+        run: ${GITHUB_WORKSPACE}/tools/ci/prepare-testdata.sh
 
       - name: Verify corpus push token
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'

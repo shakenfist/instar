@@ -88,23 +88,9 @@ jobs:
           fetch-depth: 0
 
       - name: Prepare instar-testdata
-        run: |
-          CACHED=/srv/ci/cached/instar-testdata
-          if [ -d "${CACHED}/.git" ]; then
-            echo "Using cached testdata, updating in place..."
-            cd "${CACHED}"
-            git remote set-url origin \
-              "https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/instar-testdata.git"
-            git fetch --depth 1 origin main
-            git reset --hard origin/main
-            echo "TESTDATA_PATH=${CACHED}" >> $GITHUB_ENV
-          else
-            echo "No cache found, cloning fresh..."
-            git clone --depth 1 \
-              "https://oauth2:${{ secrets.GITLAB_TESTDATA_TOKEN }}@gitlab.home.stillhq.com/private/instar-testdata.git" \
-              ${GITHUB_WORKSPACE}/instar-testdata
-            echo "TESTDATA_PATH=${GITHUB_WORKSPACE}/instar-testdata" >> $GITHUB_ENV
-          fi
+        env:
+          TESTDATA_TOKEN: ${{ secrets.GITLAB_TESTDATA_TOKEN }}
+        run: ${GITHUB_WORKSPACE}/instar/tools/ci/prepare-testdata.sh
 
       - name: Resparsify test images
         run: |
