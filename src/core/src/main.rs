@@ -11,6 +11,7 @@
 #![no_std]
 #![no_main]
 
+mod idt;
 mod serial;
 mod virtio;
 
@@ -137,6 +138,11 @@ static CONFIG: SingleThreadCell<Option<DeviceConfig>> = SingleThreadCell::new(No
 /// Entry point
 #[no_mangle]
 pub extern "C" fn _start() -> ! {
+    // Install exception handlers before anything can fault, so a CPU
+    // exception (e.g. a codegen-miscompile #UD, issue #375) is reported
+    // to the host as a clean error instead of a silent triple fault.
+    idt::install();
+
     debug_print("core: start\n");
 
     // Read MMIO base from VMM parameters (may differ from default for large guest memory)

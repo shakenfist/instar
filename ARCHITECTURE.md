@@ -169,7 +169,13 @@ Cons:
 The `info` prototype has been promoted to the main implementation in `src/`. This
 provides a modular architecture with:
 - **vmm/** - Host-side virtual machine monitor
-- **core/** - Guest initialization (device init, call table)
+- **core/** - Guest initialization (device init, call table). Also installs
+  a minimal IDT (`core/src/idt.rs`) covering the CPU exception vectors
+  (0..=31) as its first boot step, so any guest CPU exception — an invalid
+  opcode (`#UD`) from a codegen miscompile, a page fault from a stray
+  pointer — is caught and reported to the host as a clean `cpu-exception`
+  error (naming the vector and faulting RIP) instead of escalating to a
+  silent triple fault. See [issue #375](https://github.com/shakenfist/instar/issues/375).
 - **crates/qcow2/** - Shared QCOW2 format crate: header parsing, L1/L2
   cluster lookup (including extended L2 with 16-byte entries
   and full subcluster bitmap parsing), subcluster bitmap validation

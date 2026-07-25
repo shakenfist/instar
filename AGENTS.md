@@ -51,6 +51,21 @@ The core principle: **never parse untrusted data with host privileges**.
   `docs/security-audits.md` for full results and `PLAN-audit.md`
   for methodology
 
+### Guest fault handling
+
+The guest `core` installs a minimal IDT (`core/src/idt.rs`) as its first
+boot step, covering the CPU exception vectors (0..=31). Any guest CPU
+exception — for example an invalid opcode (`#UD`) from a codegen
+miscompile, or a page fault from a stray pointer — is caught and reported
+to the host as a clean `cpu-exception` error naming the vector and
+faulting RIP, instead of escalating to a silent triple fault (which KVM
+surfaces only as an opaque `VcpuExit::Shutdown`). This is the safety net
+behind the guest ops' `#[inline(never)]` discipline: several runners carry
+`#[inline(never)]` to dodge an intermittent `opt-level=z`+`lto` control-flow
+miscompile (issue #375). Those attributes are still load-bearing, but a
+recurrence now reports the vector and address instead of vanishing. Keep
+them, and prefer the small-`_start` shape when adding operations.
+
 ### Supported Formats
 
 Write formats (create / convert-output / dd-output): qcow2 (including
