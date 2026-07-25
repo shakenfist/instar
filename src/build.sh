@@ -15,6 +15,16 @@
 #   - snapshot.bin at 0x30000 (snapshot operation, same address as info)
 #   - bench.bin at 0x30000 (read/write throughput benchmark, same address as info)
 
+# Toolchain note: cargo is invoked WITHOUT a +nightly override. The
+# devcontainer's default toolchain is a pinned nightly (see
+# src/.devcontainer/Dockerfile, ARG RUST_NIGHTLY) with rust-src and
+# llvm-tools installed for the guest build-std cross-builds. A literal
+# `+nightly` here would make rustup auto-install the FLOATING nightly
+# inside the container — without rust-src, and without the pin's
+# protection against broken nightlies — which is exactly what the pin
+# exists to prevent. Run this script inside the devcontainer
+# (`make instar`); outside it you need a nightly default toolchain with
+# the same components yourself.
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -22,7 +32,7 @@ cd "$SCRIPT_DIR"
 
 echo "=== Building core binary ==="
 cd core
-cargo +nightly build --release
+cargo build --release
 cd ..
 
 # Convert core ELF to flat binary
@@ -41,7 +51,7 @@ fi
 echo ""
 echo "=== Building info operation ==="
 cd operations/info
-cargo +nightly build --release
+cargo build --release
 cd ../..
 
 # Convert info ELF to flat binary
@@ -60,7 +70,7 @@ fi
 echo ""
 echo "=== Building copy operation ==="
 cd operations/copy
-cargo +nightly build --release
+cargo build --release
 cd ../..
 
 # Convert copy ELF to flat binary
@@ -79,7 +89,7 @@ fi
 echo ""
 echo "=== Building check operation ==="
 cd operations/check
-cargo +nightly build --release
+cargo build --release
 cd ../..
 
 # Convert check ELF to flat binary
@@ -98,7 +108,7 @@ fi
 echo ""
 echo "=== Building compare operation ==="
 cd operations/compare
-cargo +nightly build --release
+cargo build --release
 cd ../..
 
 # Convert compare ELF to flat binary
@@ -117,7 +127,7 @@ fi
 echo ""
 echo "=== Building convert operation ==="
 cd operations/convert
-cargo +nightly build --release
+cargo build --release
 cd ../..
 
 # Convert convert ELF to flat binary
@@ -136,7 +146,7 @@ fi
 echo ""
 echo "=== Building measure operation ==="
 cd operations/measure
-cargo +nightly build --release
+cargo build --release
 cd ../..
 
 # Convert measure ELF to flat binary
@@ -155,7 +165,7 @@ fi
 echo ""
 echo "=== Building create operation ==="
 cd operations/create
-cargo +nightly build --release
+cargo build --release
 cd ../..
 
 # Convert create ELF to flat binary
@@ -174,7 +184,7 @@ fi
 echo ""
 echo "=== Building resize operation ==="
 cd operations/resize
-cargo +nightly build --release
+cargo build --release
 cd ../..
 
 # Convert resize ELF to flat binary
@@ -193,7 +203,7 @@ fi
 echo ""
 echo "=== Building rebase operation ==="
 cd operations/rebase
-cargo +nightly build --release
+cargo build --release
 cd ../..
 
 # Convert rebase ELF to flat binary
@@ -212,7 +222,7 @@ fi
 echo ""
 echo "=== Building commit operation ==="
 cd operations/commit
-cargo +nightly build --release
+cargo build --release
 cd ../..
 
 # Convert commit ELF to flat binary
@@ -231,7 +241,7 @@ fi
 echo ""
 echo "=== Building map operation ==="
 cd operations/map
-cargo +nightly build --release
+cargo build --release
 cd ../..
 
 # Convert map ELF to flat binary
@@ -250,7 +260,7 @@ fi
 echo ""
 echo "=== Building snapshot operation ==="
 cd operations/snapshot
-cargo +nightly build --release
+cargo build --release
 cd ../..
 
 # Convert snapshot ELF to flat binary
@@ -269,7 +279,7 @@ fi
 echo ""
 echo "=== Building amend operation ==="
 cd operations/amend
-cargo +nightly build --release
+cargo build --release
 cd ../..
 
 # Convert amend ELF to flat binary
@@ -288,7 +298,7 @@ fi
 echo ""
 echo "=== Building bitmap operation ==="
 cd operations/bitmap
-cargo +nightly build --release
+cargo build --release
 cd ../..
 
 # Convert bitmap ELF to flat binary
@@ -307,7 +317,7 @@ fi
 echo ""
 echo "=== Building bench operation ==="
 cd operations/bench
-cargo +nightly build --release
+cargo build --release
 cd ../..
 
 # Convert bench ELF to flat binary

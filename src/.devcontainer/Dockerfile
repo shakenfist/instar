@@ -37,10 +37,21 @@ RUN mkdir -p /build && chmod 777 /build
 
 # Install Rust nightly via rustup into /build
 # Use umask 0000 so directories are world-writable (any user can write to cargo cache)
+#
+# The nightly is PINNED, not floating. A broken nightly otherwise breaks
+# every from-scratch build of this image: on 2026-07-24 the then-current
+# nightly ICE'd compiling tokio during `cargo install cargo-audit`, which
+# failed CI's "Build devcontainer" step until this pin was introduced.
+# The pin is moved forward by .github/workflows/rust-nightly-bump.yml,
+# which weekly test-builds this image (and instar itself) against the
+# newest published nightly and opens a bump PR only when the full build
+# succeeds. Renovate does not manage rustup toolchain pins, so do not
+# expect it to bump this line.
+ARG RUST_NIGHTLY=nightly-2026-07-22
 ENV CARGO_HOME=/build/.cargo
 ENV RUSTUP_HOME=/build/.rustup
 RUN umask 0000 && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
-    sh -s -- -y --default-toolchain nightly
+    sh -s -- -y --default-toolchain "${RUST_NIGHTLY}"
 
 # Add cargo to PATH
 ENV PATH="/build/.cargo/bin:${PATH}"

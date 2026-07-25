@@ -261,6 +261,21 @@ pre-commit run --all-files
 The hooks use a dedicated Docker container (`.devcontainer/rust-lint/`) with
 stable Rust to ensure consistent results across all development environments.
 
+### Toolchain pinning
+
+The build devcontainer (`src/.devcontainer/Dockerfile`) pins its Rust
+nightly via `ARG RUST_NIGHTLY=nightly-YYYY-MM-DD` — a broken floating
+nightly otherwise breaks every from-scratch image build (a 2026-07-24
+nightly ICE'd compiling tokio inside `cargo install cargo-audit` and
+took out CI's "Build devcontainer" step). Renovate cannot bump rustup
+toolchain pins; instead the weekly `rust-nightly-bump` workflow
+(`tools/ci/bump-rust-nightly.sh`) test-builds the image, instar, and
+the Rust test suite against the newest published nightly and opens a
+bump PR only when everything passes. Do not un-pin the toolchain, and
+do not bump the pin by hand without at least building the full image.
+(The lint container is separate and uses a stable `rust:` tag Renovate
+does manage.)
+
 ### CI test partition
 
 Integration tests are split across several CI jobs by stestr regex
