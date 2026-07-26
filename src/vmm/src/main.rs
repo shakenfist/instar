@@ -734,8 +734,40 @@ impl DeviceSet {
 ///
 /// Uses VecDeque for O(1) removal from the front when discarding invalid bytes
 /// or draining consumed data, compared to Vec's O(n) operations.
+/// Human-readable name for an Intel exception vector (0..=31), used when
+/// the guest IDT reports a caught CPU exception (issue #375).
+fn exception_name(vector: u32) -> &'static str {
+    match vector {
+        0 => "divide error (#DE)",
+        1 => "debug (#DB)",
+        2 => "non-maskable interrupt (NMI)",
+        3 => "breakpoint (#BP)",
+        4 => "overflow (#OF)",
+        5 => "bound range exceeded (#BR)",
+        6 => "invalid opcode (#UD)",
+        7 => "device not available (#NM)",
+        8 => "double fault (#DF)",
+        10 => "invalid TSS (#TS)",
+        11 => "segment not present (#NP)",
+        12 => "stack-segment fault (#SS)",
+        13 => "general protection fault (#GP)",
+        14 => "page fault (#PF)",
+        16 => "x87 floating-point (#MF)",
+        17 => "alignment check (#AC)",
+        18 => "machine check (#MC)",
+        19 => "SIMD floating-point (#XM)",
+        21 => "control protection (#CP)",
+        _ => "reserved/unknown exception",
+    }
+}
+
 struct SerialDecoder {
     buffer: VecDeque<u8>,
+    /// The last guest CPU exception the IDT reported, as `(vector, rip)`.
+    /// Set when an `error` message with `op=cpu-exception` is decoded so a
+    /// run loop that ends without a result can say *why* (issue #375)
+    /// instead of the opaque "guest did not return a result".
+    last_cpu_exception: Option<(u32, u64)>,
 }
 
 /// Maximum serial decoder buffer size: frame header + max protobuf message
@@ -746,6 +778,21 @@ impl SerialDecoder {
     fn new() -> Self {
         Self {
             buffer: VecDeque::new(),
+            last_cpu_exception: None,
+        }
+    }
+
+    /// Format the terminal error for a run loop that ended without a
+    /// result. If the guest IDT reported a CPU exception (issue #375),
+    /// name the vector and faulting address; otherwise fall back to the
+    /// generic message.
+    fn no_result_error(&self, op: &str) -> String {
+        match self.last_cpu_exception {
+            Some((vector, rip)) => format!(
+                "{op}: guest CPU exception: {} at guest RIP 0x{rip:x}",
+                exception_name(vector)
+            ),
+            None => format!("{op}: guest did not return a result"),
         }
     }
 
@@ -779,12 +826,57 @@ impl SerialDecoder {
         // Try to decode
         if let Some((msg, consumed)) = decode_framed(slice) {
             self.buffer.drain(..consumed);
+            // Capture a guest-reported CPU exception so a resultless run
+            // loop can explain the failure (issue #375).
+            if let Some(guest_::GuestMessage_::Payload::Error(err)) = &msg.payload {
+                if err.operation == "cpu-exception" {
+                    self.last_cpu_exception = Some((err.status, err.sector));
+                }
+            }
             return Some(msg);
         }
 
         // Decode failed - discard first byte and try again later (O(1) with VecDeque)
         self.buffer.pop_front();
         None
+    }
+}
+
+#[cfg(test)]
+mod guest_exception_tests {
+    //! Tests for the guest CPU-exception reporting path (issue #375):
+    //! when the guest IDT catches a fault, a resultless run loop must
+    //! explain *why* instead of the opaque "guest did not return a result".
+
+    #[test]
+    fn exception_name_maps_key_vectors() {
+        assert!(super::exception_name(6).contains("#UD"));
+        assert!(super::exception_name(13).contains("#GP"));
+        assert!(super::exception_name(14).contains("#PF"));
+        assert!(super::exception_name(8).contains("#DF"));
+        // Reserved / out-of-range vectors get a stable fallback.
+        assert_eq!(super::exception_name(9), "reserved/unknown exception");
+        assert_eq!(super::exception_name(99), "reserved/unknown exception");
+    }
+
+    #[test]
+    fn no_result_error_is_generic_without_an_exception() {
+        let decoder = super::SerialDecoder::new();
+        assert_eq!(
+            decoder.no_result_error("amend"),
+            "amend: guest did not return a result"
+        );
+    }
+
+    #[test]
+    fn no_result_error_names_the_exception_when_captured() {
+        let mut decoder = super::SerialDecoder::new();
+        // Mimic add_byte having decoded `op=cpu-exception status=6 sector=RIP`.
+        decoder.last_cpu_exception = Some((6, 0x300ec));
+        let msg = decoder.no_result_error("amend");
+        assert!(msg.contains("amend: guest CPU exception"), "{msg}");
+        assert!(msg.contains("invalid opcode (#UD)"), "{msg}");
+        assert!(msg.contains("0x300ec"), "{msg}");
     }
 }
 
@@ -889,10 +981,23 @@ fn format_message(msg: &guest_::GuestMessage) -> String {
             )
         }
         Some(guest_::GuestMessage_::Payload::Error(err)) => {
-            format!(
-                "error op={} device={} sector={} status={}",
-                err.operation, err.device, err.sector, err.status
-            )
+            if err.operation == "cpu-exception" {
+                // The guest IDT caught a CPU exception (issue #375): status
+                // is the vector, sector is the faulting RIP.
+                format!(
+                    "error op={} device={} rip=0x{:x} vector={} ({})",
+                    err.operation,
+                    err.device,
+                    err.sector,
+                    err.status,
+                    exception_name(err.status)
+                )
+            } else {
+                format!(
+                    "error op={} device={} sector={} status={}",
+                    err.operation, err.device, err.sector, err.status
+                )
+            }
         }
         Some(guest_::GuestMessage_::Payload::Complete(comp)) => {
             format!(
@@ -4822,7 +4927,7 @@ fn run_bench_guest(
         return Err(error.into());
     }
     if !result_seen {
-        return Err("bench: guest did not return a result".into());
+        return Err(serial_decoder.no_result_error("bench").into());
     }
     Ok((harvested, bench_elapsed))
 }
@@ -7747,7 +7852,7 @@ fn run_resize_guest(
         return Err(error.into());
     }
     if !result_seen {
-        return Err("resize: guest did not return a result".into());
+        return Err(serial_decoder.no_result_error("resize").into());
     }
     Ok(harvested)
 }
@@ -8729,7 +8834,7 @@ fn run_amend_guest(
         return Err(error.into());
     }
     if !result_seen {
-        return Err("amend: guest did not return a result".into());
+        return Err(serial_decoder.no_result_error("amend").into());
     }
     Ok(harvested)
 }
@@ -9135,7 +9240,7 @@ fn run_bitmap_guest(
         return Err(error.into());
     }
     if !result_seen {
-        return Err("bitmap: guest did not return a result".into());
+        return Err(serial_decoder.no_result_error("bitmap").into());
     }
     Ok(harvested)
 }
@@ -9549,7 +9654,7 @@ fn run_rebase_guest(
         return Err(error.into());
     }
     if !result_seen {
-        return Err("rebase: guest did not return a result".into());
+        return Err(serial_decoder.no_result_error("rebase").into());
     }
     Ok(harvested)
 }
@@ -9933,7 +10038,7 @@ fn run_commit_guest(
         return Err(error.into());
     }
     if !result_seen {
-        return Err("commit: guest did not return a result".into());
+        return Err(serial_decoder.no_result_error("commit").into());
     }
     Ok(harvested)
 }
@@ -14482,7 +14587,7 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     }
 
     if !measure_result_seen {
-        return Err("measure: guest did not return a result".into());
+        return Err(serial_decoder.no_result_error("measure").into());
     }
 
     if measure_error != MEASURE_RESULT_ERROR_OK {
@@ -17071,7 +17176,7 @@ fn run_create_guest(
         return Err(error.into());
     }
     if !create_result_seen {
-        return Err("create: guest did not return a result".into());
+        return Err(serial_decoder.no_result_error("create").into());
     }
 
     Ok(harvested)
