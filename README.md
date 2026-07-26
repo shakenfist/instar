@@ -29,7 +29,7 @@ Supported formats:
 
 Also detected: **bochs** and **cloop** (detection + info only — no read
 path) and **qed** (detected; every other op refused by policy, not by
-inability). See [docs/format-coverage.md](docs/format-coverage.md)'s
+inability). See [docs/format-coverage.md](https://github.com/shakenfist/instar/blob/develop/docs/format-coverage.md)'s
 qemu-img parity axis for the full op × format matrix, including where
 instar diverges from qemu-img.
 
