@@ -6,6 +6,12 @@ description = "Protocol Buffers-based serial protocol for guest-to-VMM communica
 license = "Apache-2.0"
 publish = false
 
+# This crate is standalone (not a member of the src/ workspace), so it
+# declares the unwrap lint directly rather than inheriting workspace
+# lints (rust-unwrap-lint audit).
+[lints.clippy]
+unwrap_used = "warn"
+
 [features]
 default = []
 std = []  # Enable for VMM parsing support
