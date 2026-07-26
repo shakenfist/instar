@@ -1,0 +1,49 @@
+# Weekly Rust nightly pin bump.
+#
+# The devcontainer pins its Rust nightly (src/.devcontainer/Dockerfile,
+# ARG RUST_NIGHTLY) because a broken floating nightly breaks every
+# from-scratch image build — on 2026-07-24 the then-current nightly
+# ICE'd compiling tokio during `cargo install cargo-audit`, failing
+# every workflow's "Build devcontainer" step. Renovate cannot manage
+# rustup toolchain pins, so this job moves the pin forward instead:
+# weekly, it test-builds the devcontainer (and instar, and the Rust
+# test suite) against the newest published nightly, and opens a bump
+# PR only if everything passes. See tools/ci/bump-rust-nightly.sh for
+# the details.
+#
+# Note: PRs created with the default GITHUB_TOKEN do not trigger CI
+# workflows on the PR (a GitHub limitation shared with fuzz-autofix).
+# The candidate is fully validated on the runner before the PR is
+# opened, so the PR itself carries the evidence.
+
+name: Rust nightly pin bump
+
+on:
+  schedule:
+    # Mondays 03:00 UTC, before the daily fuzz schedules.
+    - cron: '0 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: rust-nightly-bump
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: [self-hosted, debian-12, xl]
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout instar
+        uses: actions/checkout@v7
+        with:
+          ref: develop
+
+      - name: Bump the nightly pin if a newer one validates
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: tools/ci/bump-rust-nightly.sh
