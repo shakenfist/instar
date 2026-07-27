@@ -2,7 +2,7 @@
 # wave1.sh -- pre-push audit, mechanical wave.
 #
 # Runs the build, lint, and test verification described in
-# PUSH-TEMPLATE.md wave 1. Single approval, single script,
+# PUSH-AUDIT.md wave 1. Single approval, single script,
 # structured exit code.
 #
 # Style conformance is intentionally kept narrow here -- only the
