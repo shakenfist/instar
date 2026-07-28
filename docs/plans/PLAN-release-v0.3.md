@@ -157,8 +157,8 @@ management session, not delegated.
 | #  | Step | Effort | Model | Status |
 |----|------|--------|-------|--------|
 | 1  | Land this plan: `docs/plans/PLAN-release-v0.3.md` + `index.md` row + `order.yml` entry, PR into `develop` | low | (management) | In progress (this PR) |
-| 2  | Packaging fix on a prep branch: add the ten missing operation binaries to both asset lists in `src/vmm/Cargo.toml`, refresh `extended-description`; prove with `make package` + `dpkg-deb -c` / `rpm -qlp` diffed against `ls src/operations/` | medium | sonnet | Not started |
-| 3  | Extend `tools/test-package-install.sh`: verify all 16 `.bin` files by roster, exercise one post-v0.2 subcommand end-to-end (e.g. `instar create` + `instar map` on the fixture); confirm the extended test fails against the pre-fix manifest | medium | sonnet | Not started |
+| 2  | Packaging fix on a prep branch: add the ten missing operation binaries to both asset lists in `src/vmm/Cargo.toml`, refresh `extended-description`; prove with `make package` + `dpkg-deb -c` / `rpm -qlp` diffed against `ls src/operations/` | medium | sonnet | Complete (this branch; both package listings verified complete) |
+| 3  | Extend `tools/test-package-install.sh`: verify all 16 `.bin` files by roster, exercise one post-v0.2 subcommand end-to-end (e.g. `instar create` + `instar map` on the fixture); confirm the extended test fails against the pre-fix manifest | medium | sonnet | Complete (this branch; roster now derived from `src/operations/`; extended test failed on all ten missing binaries pre-fix, passes post-fix incl. create+map under KVM) |
 | 4  | CHANGELOG coverage review: spot-check `[Unreleased]` against `git log v0.2.0..develop` and the master-plan index for missing headline items | medium | sonnet | Not started |
 | 5  | Run `make test` end-to-end (Rust unit + Python integration); record any flakes | medium | sonnet | Not started |
 | 6  | Run `make audit` (cargo audit in the devcontainer); triage findings per open question 4 | medium | sonnet | Not started |
