@@ -9,6 +9,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **The .deb and .rpm packages now ship all fifteen operation
+  binaries (commits `dd45714` and `7be1523`).** The
+  `[package.metadata.deb]` and `[package.metadata.generate-rpm]`
+  asset lists in `src/vmm/Cargo.toml` were last touched for v0.2.0
+  and still shipped only the original six guest binaries (core,
+  info, copy, check, compare, convert), so every post-v0.2
+  subcommand of an installed package failed at runtime with a
+  missing `/usr/lib/instar/<op>.bin`. Both manifests now carry
+  `core.bin` plus one binary per operation (amend, bench, bitmap,
+  commit, create, map, measure, rebase, resize and snapshot join
+  the original five), and the package install smoke test
+  (`tools/test-package-install.sh`) derives its expected roster
+  from `src/operations/` — a future operation missing from the
+  manifests fails the smoke test automatically — and exercises
+  `create` and `map` from the installed package.
+
+- **Guest CPU exceptions now fail loudly instead of
+  triple-faulting (issue #375, PR #457).** The guest had no
+  interrupt descriptor table, so any CPU fault — an invalid opcode
+  from the dormant opt-level=z + lto miscompile the guest ops carry
+  `#[inline(never)]` to dodge, a page fault from a stray pointer —
+  escalated to a triple fault that KVM surfaced only as an opaque
+  `VcpuExit::Shutdown` ("possible triple fault"): no vector, no
+  faulting address. The guest core now installs a minimal IDT
+  (`core/src/idt.rs`) covering the Intel exception vectors 0..=31
+  as the first step of `_start`; each handler reports the vector
+  and faulting RIP over the serial error channel and halts, and the
+  host enriches the "guest did not return a result" error to name
+  them (e.g. `amend: guest CPU exception: invalid opcode (#UD) at
+  guest RIP 0x3002c`). A diagnostics improvement across every
+  subcommand; the `#[inline(never)]` attributes stay as the primary
+  defense against the miscompile itself.
+
+- **Security hardening across the parse and device surfaces
+  (issues #446–#449, PR #454).** Four defense-in-depth closures.
+  The behaviour-visible one: LUKS2 Argon2 `kdf_time` and `kdf_cpus`
+  are now clamped at parse time (zero, or above 512 / 16
+  respectively, is refused), so a crafted LUKS2 header can no
+  longer drive unbounded key-derivation CPU cost when the operator
+  supplies a passphrase — such headers are refused, while real
+  headers use tiny values and are unaffected (#449). Also:
+  the virtio-block device rejects guest-written queue sizes that
+  are zero, exceed the advertised maximum of 256, or are not a
+  power of two, instead of relying solely on the downstream
+  bounds checks (#447); the info, check and copy guest ops re-check
+  `sector_size` in-guest, matching the backstop map and measure
+  already carried (#448); and resize's host-side VHDX virtual-size
+  probe now bounds its metadata read instead of sizing an
+  allocation from an attacker-controlled u32 region length, closing
+  a crafted-VHDX ~4 GiB host-allocation denial of service (#446).
+
 - **`instar resize` now grows qemu-img-created qcow2 images
   (issue #373).** qemu-img truncates a fresh image at the exact end
   of its L1 table, so a valid image's file size is usually not a
@@ -681,59 +732,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   See `instar-testdata` commits `4e56008d8` (generator
   extension), `8e0498ca3` + `315859c3d` (profile dedup),
   and `0f972d5b1` (raw baselines).
-- **`instar map` output polish (PLAN-map phase 4).** Replaces
-  the phase 3 placeholder renderer with a streaming
-  `MapRenderer<'a, W: Write>` that emits each extent to
-  stdout as the guest sends it (via a `BufWriter` over
-  `stdout().lock()`), bringing host memory back to O(1) for
-  pathologically fragmented sources. Human and JSON output
-  now match `qemu-img map` byte-for-byte, modulo eight
-  documented divergences in `docs/quirks.md` (raw
-  `SEEK_HOLE` not implemented, qcow2 compressed clusters
-  emitted as `compressed: false`, VHDX partially-present
-  reported as fully data, depth always 0 in v1, etc.).
-  21 byte-exact unit tests pin the renderer against
-  expected output sequences captured from `qemu-img 10.0.8`
-  during plan research. BrokenPipe on stdout (user piped
-  into `head` / `less`) short-circuits cleanly with exit 0.
-- **`instar map` host CLI surface (PLAN-map phase 3).** The
-  guest binary from phases 1-2 is now reachable end-to-end via
-  `instar map [-f FMT] [--output={human,json}]
-  [--start-offset=OFFSET] [--max-length=LEN] [--sector-size=N]
-  FILENAME`. `run_map` validates args (refusing `--image-opts`,
-  VMDK monolithicFlat sources, and `--start-offset >= file
-  size` on the host), populates `MapConfig`, attaches the
-  source read-only, runs the vCPU loop accumulating extent
-  records, and routes the result through a placeholder
-  human/JSON renderer (`format_map_human` / `format_map_json`)
-  that produces *valid* output for both formats. The renderer
-  is structural-only in phase 3; phase 4 of PLAN-map polishes
-  to byte-for-byte qemu-img parity against the cross-version
-  baseline matrix. 18 new unit tests pin the state-triple
-  table, JSON field ordering, and error-message table so the
-  phase 4 refactor preserves the contract.
-- **`instar map` subcommand foundation (PLAN-map phases 1-2).**
-  Per-format extent walkers (`<Format>State::map_extents`) on
-  every parser crate (`raw`, `qcow2`, `vmdk`, `vhd`, `vhdx`)
-  emit coalesced `MapExtent` records via a callback / coalescer
-  pair in `shared`. The new `operations/map/map.bin` guest
-  binary reads a `MapConfig`, detects the source format,
-  refuses sources with chain composition (single-image v1),
-  dispatches to the matching walker, and streams one
-  `MapExtentRecord` per extent through the call table's new
-  `send_map_extent` function pointer, followed by a `MapResult`
-  summary through `send_map_result`. Window filtering
-  (`start_offset` / `max_length`) is applied in the emit
-  closure. Two new protobuf payloads (`MapExtentMessage` field
-  15, `MapResultMessage` field 16) land in the `GuestMessage`
-  oneof. The `CallTable::VERSION` bumps from 15 to 16 to add
-  the two new streaming function pointers (the streaming-emit
-  shape is new — every other operation sends exactly one
-  result message). Backing-chain composition, walker-side
-  window pruning, host CLI surface, output rendering,
-  cross-version baselines, integration tests, and fuzz are
-  follow-ups in PLAN-map phases 3-9. `map.bin` builds at
-  ~28 KiB / 384 KiB.
+- **New `instar map` subcommand (PLAN-map phases 1-4).** Reports
+  which byte ranges of a disk image are data, zero, or
+  unallocated, and where they live in the file — the sandboxed
+  equivalent of `qemu-img map`: `instar map [-f FMT]
+  [--output={human,json}] [--start-offset=OFFSET]
+  [--max-length=LEN] [--sector-size=N] FILENAME`. Per-format
+  extent walkers (`<Format>State::map_extents`) on every parser
+  crate (`raw`, `qcow2`, `vmdk`, `vhd`, `vhdx`) emit coalesced
+  `MapExtent` records, which the new `operations/map/map.bin`
+  guest binary streams one at a time through the call table's new
+  `send_map_extent` function pointer (a new streaming-emit shape —
+  every other operation sends exactly one result message),
+  followed by a `MapResult` summary; `CallTable::VERSION` bumps
+  from 15 to 16 for the two new function pointers. The host
+  renders each extent as it arrives via a streaming
+  `MapRenderer<'a, W: Write>`, keeping host memory O(1) for
+  pathologically fragmented sources; human and JSON output match
+  `qemu-img map` byte-for-byte modulo the documented divergences
+  in `docs/quirks.md` (raw `SEEK_HOLE` sparseness not detected,
+  qcow2 compressed clusters emitted as `compressed: false`, VHDX
+  partially-present blocks reported as fully data, VHD unallocated
+  BAT entries as `present: false`, etc.). Window filtering
+  (`--start-offset` / `--max-length`) matches qemu-img, including
+  silently empty output for a window past the end of the image.
+  Sources with chain composition are refused (single-image v1 —
+  backing-chain walking is deferred, so the JSON `depth` field is
+  always 0), as are `--image-opts` and descriptor-based VMDK
+  layouts. BrokenPipe on stdout (user piped into `head` / `less`)
+  short-circuits cleanly with exit 0. `map.bin` builds at ~30 KiB,
+  well inside the 768 KiB operation region.
 - **New `instar rebase` subcommand.** Changes the backing-file
   pointer recorded in a qcow2 or vmdk overlay and, in safe mode,
   copies divergent clusters from the old backing chain into the
@@ -1268,37 +1296,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   carried the corrected growth through byte-identically. See
   [docs/plans/PLAN-qcow2-write-infrastructure.md](docs/plans/PLAN-qcow2-write-infrastructure.md).
 
-- **`instar commit` refuses snapshot-bearing images instead of
-  corrupting internal snapshots (issues #420 and #423, the latter an
-  overlay-side defect found during the gate work).** commit's
-  per-cluster loop blind-overwrites snapshot-shared backing clusters
-  that qemu-img COWs and preserves — silent snapshot corruption,
-  invisible to `qemu-img check`. commit now refuses before any
-  mutation when either side has internal snapshots: backing side
-  (error 14, "the backing file has internal snapshots; committing
-  would corrupt them") and overlay side (error 15, "the overlay has
-  internal snapshots; the post-commit clear pass would corrupt
-  them") — the latter covering a second defect the gate's own parity
-  test exposed, where the overlay-clear pass decrements clusters an
-  overlay snapshot still references (refcount=0 with a live
-  reference; latent snapshot data loss). Both refusals are
-  byte-idempotent and test-proven. This is an interim gate: qemu-img
-  proceeds on these shapes, and the real fix is copy-on-write in
-  phase 7 of PLAN-qcow2-write-infrastructure.
+- **`instar commit` no longer corrupts internal snapshots (issues
+  #420 and #423, the latter an overlay-side defect found during the
+  gate work).** commit's per-cluster loop blind-overwrote
+  snapshot-shared backing clusters that qemu-img COWs and
+  preserves — silent snapshot corruption, invisible to `qemu-img
+  check` — and the post-commit overlay-clear pass decremented
+  clusters an overlay snapshot still referenced (refcount=0 with a
+  live reference; latent snapshot data loss). An interim gate first
+  made commit refuse before any mutation when either side carried
+  internal snapshots (errors 14 and 15); the phase-7 copy-on-write
+  work (see the PLAN-qcow2-write-infrastructure phase 7 entry under
+  *Added*) then resolved the defects properly — snapshot-shared
+  clusters are copied before writing, backing snapshots are
+  preserved bit-identically, and no refusal remains.
 
-- **`instar rebase` refuses safe mode on snapshot-bearing overlays
-  instead of corrupting them (issue #421).** Safe-mode rebase
-  (including safe-mode detach) mutates snapshot-shared L2 tables in
-  place and under-counts refcounts on doubly-referenced clusters,
-  enabling live data loss via a later `snapshot -d`. It now refuses
-  before any mutation (error 14, "the overlay has internal
-  snapshots; a safe-mode rebase would corrupt them. Use -u for a
-  metadata-only rebase or fall back to `qemu-img rebase`"),
-  byte-idempotent and test-proven. `-u` metadata-only rebase never
-  touches snapshot-shared state and stays allowed, with a new parity
-  test against qemu-img (exit codes, check-clean, info-equivalence,
-  identical snapshot read-back). Interim gate; real fix is phase 7
-  copy-on-write.
+- **`instar rebase` safe mode no longer corrupts snapshot-bearing
+  overlays (issue #421).** Safe-mode rebase (including safe-mode
+  detach) mutated snapshot-shared L2 tables in place and
+  under-counted refcounts on doubly-referenced clusters, enabling
+  live data loss via a later `snapshot -d`. An interim gate first
+  refused safe mode on snapshot-bearing overlays before any
+  mutation (error 14; `-u` metadata-only rebase never touches
+  snapshot-shared state and stayed allowed); the phase-7
+  copy-on-write work (see *Added*) then lifted the refusal —
+  snapshot-shared tables and clusters are copied before mutation,
+  with snapshot read-back verified against a qemu-img twin.
 
 - **`instar rebase` hung on deep-allocation safe rebases (issue
   #422, reported as a 512-byte-cluster livelock).** The root cause
@@ -1351,17 +1374,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `compare`-identical; only the dead bytes differ. See the updated
   "Freed-cluster bytes" quirk in docs/quirks.md.
 
-- **Differential fuzzer: bench `-w` recipes steered away from small
-  qcow2 clusters (issues #397–#401).** bench's v1 write path
-  allocates only from the refblocks populated at startup — never
-  allocating new refblocks or growing the refcount table — and one
-  16-bit refblock covers just `cluster_size²/2` bytes of host file:
-  128 KiB at 512-byte clusters, outrun by almost any allocating
-  schedule. The picker's new `qcow2-write-refblock-coverage`
-  steer-around pins `-w` qcow2 recipes to cluster sizes of at least
-  64 KiB (one refblock then covers 2 GiB+); the limitation is now a
-  registered `KNOWN_BENCH_DIVERGENCES` entry with a live regression
-  test and a docs/bench.md known-divergence bullet.
+- **Differential fuzzer: bench `-w` recipes temporarily steered
+  away from small qcow2 clusters (issues #397–#401; steer-around
+  since retired).** bench's original v1 write path allocated only
+  from the refblocks populated at startup — never allocating new
+  refblocks or growing the refcount table — and one 16-bit refblock
+  covers just `cluster_size²/2` bytes of host file: 128 KiB at
+  512-byte clusters, outrun by almost any allocating schedule. The
+  picker's `qcow2-write-refblock-coverage` steer-around pinned `-w`
+  qcow2 recipes to cluster sizes of at least 64 KiB while the
+  limitation stood. The PLAN-bench-refcount-growth work (see
+  *Added*) then taught bench to grow the refcount structures
+  preemptively, and the steer-around and its
+  `KNOWN_BENCH_DIVERGENCES` entry were retired — the full
+  cluster-size matrix is back in `-w` differential coverage.
 
 - **`instar info`'s human output for flat VMDK extents diverged from
   `qemu-img` (commit `dad884e`).** For monolithicFlat /
