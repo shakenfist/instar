@@ -7,6 +7,7 @@ on:
       - 'crates/**'
       - 'tests/**'
       - 'scripts/**'
+      - 'tools/**'
       - 'Makefile'
       - '.github/workflows/functional-tests.yml'
   workflow_dispatch:

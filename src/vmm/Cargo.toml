@@ -58,20 +58,32 @@ section = "otherosfs"
 priority = "optional"
 depends = "$auto"
 extended-description = """\
-instar performs disk image operations (info, copy, check, compare,
-convert) inside a KVM-sandboxed guest. The host-side VMM is isolated
-from format-parsing code by the hardware virtualization boundary,
-limiting the impact of bugs in qcow2/vmdk/vhd/vhdx/luks parsers.
-Supports raw, QCOW2, VMDK, VHD, VHDX, and LUKS inputs.
+instar performs disk image operations (info, check, compare, convert,
+create, resize, rebase, commit, map, measure, snapshot, amend, dd,
+bitmap, bench, copy) inside a KVM-sandboxed guest. The host-side VMM
+is isolated from format-parsing code by the hardware virtualization
+boundary, limiting the impact of bugs in the format parsers. Reads
+raw, QCOW2, QCOW1, VMDK, VHD, VHDX, VDI, Parallels, DMG, and LUKS
+images.
 """
 assets = [
     ["target/release/instar", "usr/bin/", "755"],
     ["target/release/core.bin", "usr/lib/instar/", "644"],
-    ["target/release/info.bin", "usr/lib/instar/", "644"],
-    ["target/release/copy.bin", "usr/lib/instar/", "644"],
+    ["target/release/amend.bin", "usr/lib/instar/", "644"],
+    ["target/release/bench.bin", "usr/lib/instar/", "644"],
+    ["target/release/bitmap.bin", "usr/lib/instar/", "644"],
     ["target/release/check.bin", "usr/lib/instar/", "644"],
+    ["target/release/commit.bin", "usr/lib/instar/", "644"],
     ["target/release/compare.bin", "usr/lib/instar/", "644"],
     ["target/release/convert.bin", "usr/lib/instar/", "644"],
+    ["target/release/copy.bin", "usr/lib/instar/", "644"],
+    ["target/release/create.bin", "usr/lib/instar/", "644"],
+    ["target/release/info.bin", "usr/lib/instar/", "644"],
+    ["target/release/map.bin", "usr/lib/instar/", "644"],
+    ["target/release/measure.bin", "usr/lib/instar/", "644"],
+    ["target/release/rebase.bin", "usr/lib/instar/", "644"],
+    ["target/release/resize.bin", "usr/lib/instar/", "644"],
+    ["target/release/snapshot.bin", "usr/lib/instar/", "644"],
     ["../../README.md", "usr/share/doc/instar/README", "644"],
     ["../../LICENSE", "usr/share/doc/instar/copyright", "644"],
 ]
@@ -82,13 +94,23 @@ assets = [
 [package.metadata.generate-rpm]
 auto-req = "auto"
 assets = [
-    { source = "target/release/instar",      dest = "/usr/bin/instar",            mode = "0755" },
-    { source = "target/release/core.bin",    dest = "/usr/lib/instar/core.bin",   mode = "0644" },
-    { source = "target/release/info.bin",    dest = "/usr/lib/instar/info.bin",   mode = "0644" },
-    { source = "target/release/copy.bin",    dest = "/usr/lib/instar/copy.bin",   mode = "0644" },
-    { source = "target/release/check.bin",   dest = "/usr/lib/instar/check.bin",  mode = "0644" },
-    { source = "target/release/compare.bin", dest = "/usr/lib/instar/compare.bin", mode = "0644" },
-    { source = "target/release/convert.bin", dest = "/usr/lib/instar/convert.bin", mode = "0644" },
+    { source = "target/release/instar",       dest = "/usr/bin/instar",             mode = "0755" },
+    { source = "target/release/core.bin",     dest = "/usr/lib/instar/core.bin",    mode = "0644" },
+    { source = "target/release/amend.bin",    dest = "/usr/lib/instar/amend.bin",   mode = "0644" },
+    { source = "target/release/bench.bin",    dest = "/usr/lib/instar/bench.bin",   mode = "0644" },
+    { source = "target/release/bitmap.bin",   dest = "/usr/lib/instar/bitmap.bin",  mode = "0644" },
+    { source = "target/release/check.bin",    dest = "/usr/lib/instar/check.bin",   mode = "0644" },
+    { source = "target/release/commit.bin",   dest = "/usr/lib/instar/commit.bin",  mode = "0644" },
+    { source = "target/release/compare.bin",  dest = "/usr/lib/instar/compare.bin", mode = "0644" },
+    { source = "target/release/convert.bin",  dest = "/usr/lib/instar/convert.bin", mode = "0644" },
+    { source = "target/release/copy.bin",     dest = "/usr/lib/instar/copy.bin",    mode = "0644" },
+    { source = "target/release/create.bin",   dest = "/usr/lib/instar/create.bin",  mode = "0644" },
+    { source = "target/release/info.bin",     dest = "/usr/lib/instar/info.bin",    mode = "0644" },
+    { source = "target/release/map.bin",      dest = "/usr/lib/instar/map.bin",     mode = "0644" },
+    { source = "target/release/measure.bin",  dest = "/usr/lib/instar/measure.bin", mode = "0644" },
+    { source = "target/release/rebase.bin",   dest = "/usr/lib/instar/rebase.bin",  mode = "0644" },
+    { source = "target/release/resize.bin",   dest = "/usr/lib/instar/resize.bin",  mode = "0644" },
+    { source = "target/release/snapshot.bin", dest = "/usr/lib/instar/snapshot.bin", mode = "0644" },
     { source = "../../README.md", dest = "/usr/share/doc/instar/README",    mode = "0644" },
     { source = "../../LICENSE",   dest = "/usr/share/doc/instar/copyright", mode = "0644" },
 ]
