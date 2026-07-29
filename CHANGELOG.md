@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-02
+
 ### Fixed
 
 - **The .deb and .rpm packages now ship all fifteen operation
@@ -93,6 +95,302 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   contract); differentially validated against `qemu-img create -f
   vpc` 10.0.8 footers across 337 sizes including the window edges,
   plus an end-to-end `instar dd` vs `qemu-img dd` footer comparison.
+
+- **qcow2 chain reader ignored the classic-L2 zero flag (#432).** A v3
+  `QCOW_OFLAG_ZERO` (bit 0) cluster reached through a backing chain read
+  as the wrong bytes — host == 0 fell through to a lower backing and
+  host != 0 read stale host bytes — silent active-view corruption with
+  blast radius rebase / convert / compare / bench. `cluster_lookup` in
+  `crates/qcow2` gained a `ClusterLookup::Zero` verdict and the chain
+  reader now zero-fills for it (both host cases). Fixed fix-first as
+  step 7z of PLAN-qcow2-write-infrastructure phase 7.
+
+- **`instar bench -w` left the refcount table referencing
+  unmaterialized blocks past EOF on overwrite-dominant growth
+  schedules (issue #433).** An overwrite-dominant qcow2 `-w` schedule
+  that also crossed the preemptive refcount-growth threshold
+  provisioned refcount blocks and wrote their refcount-table pointers,
+  but the run allocated nothing, so `flush_dirty_refblocks` (which
+  writes back only dirty blocks) never materialized them — the
+  refcount table ended up pointing at refcount blocks past
+  end-of-file. Silent (exit 0) and `qemu-img check`-dirty on a
+  check-clean input; repairable by `check -r`, but a later allocator
+  could double-allocate. Growth now marks every newly provisioned
+  refcount block dirty before its eager flush, materializing every
+  block the refcount table references (restoring qemu's
+  every-RT-referenced-block-is-allocated invariant); the write rides
+  the existing growth fsync, so the flush census is unchanged.
+  Regression test
+  `test_overwrite_only_growth_check_clean_issue_433`. Found by the
+  phase-6 probes and fixed before the phase-6 migration, which then
+  carried the corrected growth through byte-identically. See
+  [docs/plans/PLAN-qcow2-write-infrastructure.md](docs/plans/PLAN-qcow2-write-infrastructure.md).
+
+- **`instar commit` no longer corrupts internal snapshots (issues
+  #420 and #423, the latter an overlay-side defect found during the
+  gate work).** commit's per-cluster loop blind-overwrote
+  snapshot-shared backing clusters that qemu-img COWs and
+  preserves — silent snapshot corruption, invisible to `qemu-img
+  check` — and the post-commit overlay-clear pass decremented
+  clusters an overlay snapshot still referenced (refcount=0 with a
+  live reference; latent snapshot data loss). An interim gate first
+  made commit refuse before any mutation when either side carried
+  internal snapshots (errors 14 and 15); the phase-7 copy-on-write
+  work (see the PLAN-qcow2-write-infrastructure phase 7 entry under
+  *Added*) then resolved the defects properly — snapshot-shared
+  clusters are copied before writing, backing snapshots are
+  preserved bit-identically, and no refusal remains.
+
+- **`instar rebase` safe mode no longer corrupts snapshot-bearing
+  overlays (issue #421).** Safe-mode rebase (including safe-mode
+  detach) mutated snapshot-shared L2 tables in place and
+  under-counted refcounts on doubly-referenced clusters, enabling
+  live data loss via a later `snapshot -d`. An interim gate first
+  refused safe mode on snapshot-bearing overlays before any
+  mutation (error 14; `-u` metadata-only rebase never touches
+  snapshot-shared state and stayed allowed); the phase-7
+  copy-on-write work (see *Added*) then lifted the refusal —
+  snapshot-shared tables and clusters are copied before mutation,
+  with snapshot read-back verified against a qemu-img twin.
+
+- **`instar rebase` hung on deep-allocation safe rebases (issue
+  #422, reported as a 512-byte-cluster livelock).** The root cause
+  was a guest panic, not a livelock: the safe-mode L2 lookup slice
+  was built once with the initial staged-L2 count, so staging a new
+  L2 table and then visiting another cluster in its coverage indexed
+  past the stale length — an out-of-bounds panic spinning forever in
+  the guest's `loop {}` panic handler. Reproducible at the default
+  64 KiB cluster size with sparse overlays, not cs=512-specific. A
+  second latent defect fixed at the same time: the staged-L2 growth
+  arena was carved before the refblock staging regions and could
+  clobber them. The lookup slice is now re-derived after growth and
+  the staging layout reordered (growable arena last). The original
+  issue fixture now terminates in 0.58 s with the pre-existing
+  refcount-exhaustion refusal (v1 never appends refblocks — a
+  documented capacity limit retired later by the master plan's
+  refcount-growth work), a previously-hanging 64 KiB sparse shape
+  completes with qemu-identical content, and output byte-invariance
+  on previously-working shapes was proven against a pre-fix build.
+
+- **`instar dd`/`convert -O vpc` declared a different virtual size
+  than `qemu-img` for windowed copies (issue #382).** The VHD size
+  rounding (`vhd::chs_rounded_size`) approximated qemu's CHS rounding
+  with one pass of ceiling divisions; qemu (`vpc.c
+  calculate_rounded_image_size`) instead searches upward from the
+  requested sector count for the first candidate whose floor-geometry
+  product covers the request. For a 69632-sector dd window qemu
+  declares 69700 sectors (CHS 820/5/17) while instar declared 69936 —
+  with a footer CHS (822/5/17) that could not even address its own
+  current_size. `compute_vhd_geometry` also carried a non-qemu
+  "medium-large" 255-sectors-per-track branch at `65535*3*17` sectors
+  (qemu switches at `65535*16*63`), diverging on every vpc output of
+  roughly 1.6 GiB and larger. Both are now exact mirrors of qemu
+  vpc.c, validated against `qemu-img` 10.0.8 across the branch
+  boundaries and swept for the fixed-point property that lets
+  `build_footer` recompute the identical CHS from current_size. The
+  `fuzz_chs_rounded_size` target now asserts exact geometry
+  reconstruction and idempotence instead of the old one-cylinder
+  tolerance that had been documenting the bug.
+
+- **Differential fuzzer: snapshot byte compare now ignores
+  dead-cluster residue (issue #381).** Byte differences confined to
+  clusters whose refcount is 0 in *both* images are residue, not
+  divergence: under metadata-cache pressure (512-byte clusters) qemu
+  flushes a half-refreshed freed L2 mid-walk even with
+  `file.discard=ignore` — the eviction writes partially-updated
+  COPIED flags to disk, then the remaining dirty flags are discarded
+  with the cache entry when the L2 is freed — while instar never
+  writes freed clusters at all. Both images are `check`-clean and
+  `compare`-identical; only the dead bytes differ. See the updated
+  "Freed-cluster bytes" quirk in docs/quirks.md.
+
+- **Differential fuzzer: bench `-w` recipes temporarily steered
+  away from small qcow2 clusters (issues #397–#401; steer-around
+  since retired).** bench's original v1 write path allocated only
+  from the refblocks populated at startup — never allocating new
+  refblocks or growing the refcount table — and one 16-bit refblock
+  covers just `cluster_size²/2` bytes of host file: 128 KiB at
+  512-byte clusters, outrun by almost any allocating schedule. The
+  picker's `qcow2-write-refblock-coverage` steer-around pinned `-w`
+  qcow2 recipes to cluster sizes of at least 64 KiB while the
+  limitation stood. The PLAN-bench-refcount-growth work (see
+  *Added*) then taught bench to grow the refcount structures
+  preemptively, and the steer-around and its
+  `KNOWN_BENCH_DIVERGENCES` entry were retired — the full
+  cluster-size matrix is back in `-w` differential coverage.
+
+- **`instar info`'s human output for flat VMDK extents diverged from
+  `qemu-img` (commit `dad884e`).** For monolithicFlat /
+  twoGbMaxExtentFlat images, the human formatter emitted a single
+  hardcoded placeholder extent block (descriptor path, empty format,
+  a spurious "cluster size: 0"), omitted the `Child node
+  '/extents.N'` blocks entirely, and reported `/file`'s length as the
+  raw descriptor byte size instead of the protocol-node length
+  rounded up to a 512-byte sector. The JSON path was already correct
+  via `ResolvedVmdkDescriptor.flat_extents`; the human path now
+  mirrors it (one entry per resolved flat extent, gated `/extents.N`
+  child blocks, the same `div_ceil(512)` rounding the raw format
+  already used). Found by the memory-map lift's full integration run
+  (`test_info_safe` 526/536 → 536/536); non-flat vmdk output is
+  unchanged.
+
+- **`instar convert -O vmdk|vpc|vhdx` silently truncated data when
+  the input qcow2 had clusters smaller than the output grain/block
+  size (commit `779e7a7`).** The structured writers (vmdk, vhd,
+  vhdx) filled only one input cluster per output grain/block,
+  leaving the remainder of each grain zero-filled when the qcow2
+  cluster size was smaller than the output grain or block size. The
+  correct fix is `qcow2::read_chain_virtual_range`, which fills the
+  full output grain by chaining as many input-cluster reads as
+  needed. This is a pre-existing bug in the shipped `instar convert`
+  command, found and fixed during `dd` implementation (phase 9).
+
+- **Dense VHD output capacity under-estimate could stall the final
+  write (commit `b80c5d7`).** The VHD writer computed output
+  capacity from the pre-window virtual size rather than the
+  post-window byte count when producing dense (dd-style) output,
+  causing the capacity hint passed to the guest to be too small for
+  the actual number of blocks written; the final write to the last
+  block stalled waiting for capacity that was never signalled. Fixed
+  by deriving the dense-output capacity from the actual window size.
+
+- **Guest core `.bss` overflow corrupting operation code.** `core.bin`'s
+  `.bss` (the `INPUT_DEVICES`/`OUTPUT_DEVICE` virtio statics) overflowed
+  its 64 KiB budget into the operation region at `0x20000`; core's
+  device init wrote a `VirtioBlock` struct to `0x20380`, clobbering ~72
+  bytes of the loaded operation's code. Only `amend` had critical branch
+  logic at that offset, so it surfaced as spurious `ERROR_HEADER_MISMATCH`
+  for some qcow2 cluster sizes. Fixed by raising `OPERATION_LOAD_ADDR`
+  `0x20000` → `0x22000` (giving core a 72 KiB region) and updating every
+  `src/operations/*/linker.ld`; `scripts/check-binary-sizes.sh` now
+  validates the `.bss`-inclusive ELF memory extent (not just the flat
+  `.bin` file size, which excluded `.bss`) and warns as a binary nears
+  its limit. Found by the phase-8 differential fuzzer.
+
+- **`instar create` could emit an unrepresentable Fixed VHD plan for
+  enormous virtual sizes (#353, #355, #357, #361, #362, #363, #367).**
+  `plan_vhd` placed the footer at `byte_offset == virtual_size` with
+  no upper bound, so a `virtual_size` near `u64::MAX` overflowed the
+  file-size bookkeeping (the `fuzz_create_emitters` invariant panic).
+  `plan_vhd` now rejects `virtual_size` above VHD's maximum
+  (`0xFF000000` sectors = 2040 GiB, matching qemu `vpc.c`) before the
+  subformat split.
+
+- **`instar resize` panicked on a VHDX header with a near-maximum
+  sequence number (#354, #360).** The grow planner incremented the
+  parsed (attacker-controllable) `sequence_number` by 1 and 2 for the
+  two header copies without bounds; a value within 2 of `u64::MAX`
+  overflowed (the `fuzz_resize_planners` panic). The planner now
+  rejects such a header up front with `Overflow`.
+
+- **qcow2 sub-byte refcounts corrupted on `create` and `resize
+  --shrink` (#365).** `crates/qcow2::create::build_header` hardcoded
+  the header's `refcount_order` field to the 16-bit default instead
+  of deriving it from `refcount_bits`, and `set_refcount_to_one`
+  packed sub-byte (1/2/4-bit) refcount entries MSB-first while qemu
+  (and instar's own `lookup_refcount`) are LSB-first. Both writers
+  are shared by `create` and by the `resize --shrink` header rebuild,
+  so `instar create -o refcount_bits=1` and `instar resize --shrink`
+  on a `refcount_bits` 1/2/4 image produced files that exited 0 but
+  failed `qemu-img check` (referenced clusters left at refcount 0).
+  `build_header` now derives `refcount_order = log2(refcount_bits)`
+  and sub-byte widths pack LSB-first; `create` and `resize --shrink`
+  across `refcount_bits` 1/2/4/16 are `qemu-img check`-clean. The
+  differential fuzzer's create and resize pickers gained a
+  `refcount_bits` dimension to guard the path.
+
+- **Sub-byte refcount accessors used the wrong bit order.** The
+  `snapshot` crate's `read_refcount_in_block` /
+  `set_refcount_in_block` (lifted from `resize::qcow2`, which now
+  delegates to them) packed 1/2/4-bit refcount entries MSB-first
+  within each byte; qemu's `get/set_refcount_ro0/ro1/ro2` are
+  LSB-first. Round-trip tests pass under either order, which is
+  how the divergence survived — found by the pre-push audit's
+  cross-check against `qcow2::lookup_refcount` and pinned
+  byte-exactly against the qemu source. Production impact was
+  limited: the snapshot mutating modes refuse `refcount_bits !=
+  16`. (The separate `instar resize --shrink` / `create`
+  sub-byte corruption noted here originally is now also fixed —
+  see the entry above.)
+
+- **Snapshot list rows over-padded multibyte UTF-8 names.**
+  qemu's `qemu-img snapshot -l` pads the ID and TAG columns with
+  C `printf` minimum field widths, which count **bytes**; the
+  renderer used Rust's `{:<7}` / `{:<16}`, which count chars and
+  over-pad multibyte names (`snäp-名前` drew 9 pad spaces from
+  instar, 4 from qemu). The columns now pad by byte length, so
+  `-l` output is byte-identical for any name qemu can create.
+  Found by PLAN-snapshot phase 13's differential fuzzer on its
+  first smoke run — the phase 10/11 fixture names were all
+  ASCII, where the two semantics agree (commit `5f6a1b9`).
+
+- **Snapshot delete left stale COPIED flags in surviving L2s.**
+  qemu's delete decrement walk also recomputes `OFLAG_COPIED` on
+  every L2 entry it visits and flushes dirty L2s whose clusters
+  were not freed, so an L2 shared between the deleted snapshot
+  and a surviving one lands on disk with refreshed flags.
+  instar's delete refreshed only the active chain, leaving
+  stale COPIED-clear entries in the surviving snapshot's L2 —
+  safe (a spurious COW after a later apply at worst; `qemu-img
+  check` clean) but not byte-identical. Delete now refreshes
+  the deleted chain's staged L2 set and writes back the
+  surviving (refcount > 0) snap-set L2s in its final write
+  group, matching qemu's cache-discard behaviour for freed L2s.
+  Found by the phase 13 differential fuzzer's soak (commit
+  `a5d0767`); a shared-L2 regression scenario joined
+  `tools/snapshot-delete-matrix.sh`.
+
+- **`convert --snapshot` picked the wrong snapshot on
+  ID/name-collision images.** `qcow2::find_snapshot` matched
+  id-or-name per entry and returned the first hit, where
+  qemu's `find_snapshot_by_id_or_name` (the resolver behind
+  `qemu-img convert -l` and `snapshot -a`) makes one full ID
+  pass and only then a name pass. On an image with `id=1
+  name="2"` and `id=2 name="x"`, `instar convert --snapshot 2`
+  extracted the snapshot *named* "2" while qemu extracts ID 2.
+  The matcher is now two full passes; the dead
+  `find_snapshot_streaming` variant was removed. A collision
+  regression test joins the convert suite; the bounded
+  16-entry lookup residual is documented in `docs/quirks.md`
+  (PLAN-snapshot phase 14, probe 1).
+
+- **Zero `date_sec` rendered a blank snapshot DATE column.**
+  qemu feeds a zero `date_sec` through `localtime` and renders
+  the Unix epoch; instar early-returned an empty string,
+  diverging on hand-crafted images (the value is unreachable
+  via either tool's create). The early return is removed and
+  the epoch renders like any other timestamp (PLAN-snapshot
+  phase 14, probe 2; found by phase 13's date-normalization
+  probes).
+
+- **Fuzzing bug backlog (44 issues).** Five categories of fuzz
+  findings from coverage-guided and differential fuzzing are
+  closed by the `PLAN-fuzzing-bugs` work:
+  - `create::plan_vmdk` no longer panics on adversarial
+    `(virtual_size, grain_size)` tuples — capacity arithmetic
+    now uses `checked_mul` and surfaces
+    `CreateError::Overflow` (commit `0220ae9`).
+  - `qcow2::scan_allocation` honours the invariant
+    `allocated_bytes <= virtual_size` for on-disk L2 entries
+    past `virtual_size`, which the spec allows but the
+    measure path rejects. Last-cluster contributions are
+    capped at `virtual_size - cluster_start`
+    (commit `6de9687`).
+  - The measure calculators (`measure_raw`, `measure_qcow2`,
+    `measure_vmdk`, `measure_vhd`, `measure_vhdx`) route
+    construction of their `MeasureOutput` through a new
+    `try_new` helper that rejects sum-overflow on
+    `required + fully_allocated` (commit `b4e312d`).
+  - The dynamic-VHD, VHDX, and VMDK allocation scanners
+    clamp `allocated_bytes` at `virtual_size`, fixing the
+    `instar measure` failure on small dynamic-VPC images
+    where a single 2 MiB block exceeds the 1 MiB virtual
+    size (commit `bed14fc`).
+  - `scripts/differential-fuzz.py` reclassifies external-
+    tool subprocess timeouts as `inconclusive_external_timeout`
+    rather than `exit_code_divergence`, so qemu-img hangs
+    on adversarial qcow2 shrink inputs no longer file
+    GitHub issues against instar (commit `71e3e33`).
 
 ### Added
 
@@ -1263,304 +1561,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   equivalent `bitmaps size: 0` trailing line in human output when
   the source is a qcow2 v3 image, matching qemu-img exactly
   (surfaced and refined by phase 7c source-image tests).
-
-### Fixed
-
-- **qcow2 chain reader ignored the classic-L2 zero flag (#432).** A v3
-  `QCOW_OFLAG_ZERO` (bit 0) cluster reached through a backing chain read
-  as the wrong bytes — host == 0 fell through to a lower backing and
-  host != 0 read stale host bytes — silent active-view corruption with
-  blast radius rebase / convert / compare / bench. `cluster_lookup` in
-  `crates/qcow2` gained a `ClusterLookup::Zero` verdict and the chain
-  reader now zero-fills for it (both host cases). Fixed fix-first as
-  step 7z of PLAN-qcow2-write-infrastructure phase 7.
-
-- **`instar bench -w` left the refcount table referencing
-  unmaterialized blocks past EOF on overwrite-dominant growth
-  schedules (issue #433).** An overwrite-dominant qcow2 `-w` schedule
-  that also crossed the preemptive refcount-growth threshold
-  provisioned refcount blocks and wrote their refcount-table pointers,
-  but the run allocated nothing, so `flush_dirty_refblocks` (which
-  writes back only dirty blocks) never materialized them — the
-  refcount table ended up pointing at refcount blocks past
-  end-of-file. Silent (exit 0) and `qemu-img check`-dirty on a
-  check-clean input; repairable by `check -r`, but a later allocator
-  could double-allocate. Growth now marks every newly provisioned
-  refcount block dirty before its eager flush, materializing every
-  block the refcount table references (restoring qemu's
-  every-RT-referenced-block-is-allocated invariant); the write rides
-  the existing growth fsync, so the flush census is unchanged.
-  Regression test
-  `test_overwrite_only_growth_check_clean_issue_433`. Found by the
-  phase-6 probes and fixed before the phase-6 migration, which then
-  carried the corrected growth through byte-identically. See
-  [docs/plans/PLAN-qcow2-write-infrastructure.md](docs/plans/PLAN-qcow2-write-infrastructure.md).
-
-- **`instar commit` no longer corrupts internal snapshots (issues
-  #420 and #423, the latter an overlay-side defect found during the
-  gate work).** commit's per-cluster loop blind-overwrote
-  snapshot-shared backing clusters that qemu-img COWs and
-  preserves — silent snapshot corruption, invisible to `qemu-img
-  check` — and the post-commit overlay-clear pass decremented
-  clusters an overlay snapshot still referenced (refcount=0 with a
-  live reference; latent snapshot data loss). An interim gate first
-  made commit refuse before any mutation when either side carried
-  internal snapshots (errors 14 and 15); the phase-7 copy-on-write
-  work (see the PLAN-qcow2-write-infrastructure phase 7 entry under
-  *Added*) then resolved the defects properly — snapshot-shared
-  clusters are copied before writing, backing snapshots are
-  preserved bit-identically, and no refusal remains.
-
-- **`instar rebase` safe mode no longer corrupts snapshot-bearing
-  overlays (issue #421).** Safe-mode rebase (including safe-mode
-  detach) mutated snapshot-shared L2 tables in place and
-  under-counted refcounts on doubly-referenced clusters, enabling
-  live data loss via a later `snapshot -d`. An interim gate first
-  refused safe mode on snapshot-bearing overlays before any
-  mutation (error 14; `-u` metadata-only rebase never touches
-  snapshot-shared state and stayed allowed); the phase-7
-  copy-on-write work (see *Added*) then lifted the refusal —
-  snapshot-shared tables and clusters are copied before mutation,
-  with snapshot read-back verified against a qemu-img twin.
-
-- **`instar rebase` hung on deep-allocation safe rebases (issue
-  #422, reported as a 512-byte-cluster livelock).** The root cause
-  was a guest panic, not a livelock: the safe-mode L2 lookup slice
-  was built once with the initial staged-L2 count, so staging a new
-  L2 table and then visiting another cluster in its coverage indexed
-  past the stale length — an out-of-bounds panic spinning forever in
-  the guest's `loop {}` panic handler. Reproducible at the default
-  64 KiB cluster size with sparse overlays, not cs=512-specific. A
-  second latent defect fixed at the same time: the staged-L2 growth
-  arena was carved before the refblock staging regions and could
-  clobber them. The lookup slice is now re-derived after growth and
-  the staging layout reordered (growable arena last). The original
-  issue fixture now terminates in 0.58 s with the pre-existing
-  refcount-exhaustion refusal (v1 never appends refblocks — a
-  documented capacity limit retired later by the master plan's
-  refcount-growth work), a previously-hanging 64 KiB sparse shape
-  completes with qemu-identical content, and output byte-invariance
-  on previously-working shapes was proven against a pre-fix build.
-
-- **`instar dd`/`convert -O vpc` declared a different virtual size
-  than `qemu-img` for windowed copies (issue #382).** The VHD size
-  rounding (`vhd::chs_rounded_size`) approximated qemu's CHS rounding
-  with one pass of ceiling divisions; qemu (`vpc.c
-  calculate_rounded_image_size`) instead searches upward from the
-  requested sector count for the first candidate whose floor-geometry
-  product covers the request. For a 69632-sector dd window qemu
-  declares 69700 sectors (CHS 820/5/17) while instar declared 69936 —
-  with a footer CHS (822/5/17) that could not even address its own
-  current_size. `compute_vhd_geometry` also carried a non-qemu
-  "medium-large" 255-sectors-per-track branch at `65535*3*17` sectors
-  (qemu switches at `65535*16*63`), diverging on every vpc output of
-  roughly 1.6 GiB and larger. Both are now exact mirrors of qemu
-  vpc.c, validated against `qemu-img` 10.0.8 across the branch
-  boundaries and swept for the fixed-point property that lets
-  `build_footer` recompute the identical CHS from current_size. The
-  `fuzz_chs_rounded_size` target now asserts exact geometry
-  reconstruction and idempotence instead of the old one-cylinder
-  tolerance that had been documenting the bug.
-
-- **Differential fuzzer: snapshot byte compare now ignores
-  dead-cluster residue (issue #381).** Byte differences confined to
-  clusters whose refcount is 0 in *both* images are residue, not
-  divergence: under metadata-cache pressure (512-byte clusters) qemu
-  flushes a half-refreshed freed L2 mid-walk even with
-  `file.discard=ignore` — the eviction writes partially-updated
-  COPIED flags to disk, then the remaining dirty flags are discarded
-  with the cache entry when the L2 is freed — while instar never
-  writes freed clusters at all. Both images are `check`-clean and
-  `compare`-identical; only the dead bytes differ. See the updated
-  "Freed-cluster bytes" quirk in docs/quirks.md.
-
-- **Differential fuzzer: bench `-w` recipes temporarily steered
-  away from small qcow2 clusters (issues #397–#401; steer-around
-  since retired).** bench's original v1 write path allocated only
-  from the refblocks populated at startup — never allocating new
-  refblocks or growing the refcount table — and one 16-bit refblock
-  covers just `cluster_size²/2` bytes of host file: 128 KiB at
-  512-byte clusters, outrun by almost any allocating schedule. The
-  picker's `qcow2-write-refblock-coverage` steer-around pinned `-w`
-  qcow2 recipes to cluster sizes of at least 64 KiB while the
-  limitation stood. The PLAN-bench-refcount-growth work (see
-  *Added*) then taught bench to grow the refcount structures
-  preemptively, and the steer-around and its
-  `KNOWN_BENCH_DIVERGENCES` entry were retired — the full
-  cluster-size matrix is back in `-w` differential coverage.
-
-- **`instar info`'s human output for flat VMDK extents diverged from
-  `qemu-img` (commit `dad884e`).** For monolithicFlat /
-  twoGbMaxExtentFlat images, the human formatter emitted a single
-  hardcoded placeholder extent block (descriptor path, empty format,
-  a spurious "cluster size: 0"), omitted the `Child node
-  '/extents.N'` blocks entirely, and reported `/file`'s length as the
-  raw descriptor byte size instead of the protocol-node length
-  rounded up to a 512-byte sector. The JSON path was already correct
-  via `ResolvedVmdkDescriptor.flat_extents`; the human path now
-  mirrors it (one entry per resolved flat extent, gated `/extents.N`
-  child blocks, the same `div_ceil(512)` rounding the raw format
-  already used). Found by the memory-map lift's full integration run
-  (`test_info_safe` 526/536 → 536/536); non-flat vmdk output is
-  unchanged.
-
-- **`instar convert -O vmdk|vpc|vhdx` silently truncated data when
-  the input qcow2 had clusters smaller than the output grain/block
-  size (commit `779e7a7`).** The structured writers (vmdk, vhd,
-  vhdx) filled only one input cluster per output grain/block,
-  leaving the remainder of each grain zero-filled when the qcow2
-  cluster size was smaller than the output grain or block size. The
-  correct fix is `qcow2::read_chain_virtual_range`, which fills the
-  full output grain by chaining as many input-cluster reads as
-  needed. This is a pre-existing bug in the shipped `instar convert`
-  command, found and fixed during `dd` implementation (phase 9).
-
-- **Dense VHD output capacity under-estimate could stall the final
-  write (commit `b80c5d7`).** The VHD writer computed output
-  capacity from the pre-window virtual size rather than the
-  post-window byte count when producing dense (dd-style) output,
-  causing the capacity hint passed to the guest to be too small for
-  the actual number of blocks written; the final write to the last
-  block stalled waiting for capacity that was never signalled. Fixed
-  by deriving the dense-output capacity from the actual window size.
-
-- **Guest core `.bss` overflow corrupting operation code.** `core.bin`'s
-  `.bss` (the `INPUT_DEVICES`/`OUTPUT_DEVICE` virtio statics) overflowed
-  its 64 KiB budget into the operation region at `0x20000`; core's
-  device init wrote a `VirtioBlock` struct to `0x20380`, clobbering ~72
-  bytes of the loaded operation's code. Only `amend` had critical branch
-  logic at that offset, so it surfaced as spurious `ERROR_HEADER_MISMATCH`
-  for some qcow2 cluster sizes. Fixed by raising `OPERATION_LOAD_ADDR`
-  `0x20000` → `0x22000` (giving core a 72 KiB region) and updating every
-  `src/operations/*/linker.ld`; `scripts/check-binary-sizes.sh` now
-  validates the `.bss`-inclusive ELF memory extent (not just the flat
-  `.bin` file size, which excluded `.bss`) and warns as a binary nears
-  its limit. Found by the phase-8 differential fuzzer.
-
-- **`instar create` could emit an unrepresentable Fixed VHD plan for
-  enormous virtual sizes (#353, #355, #357, #361, #362, #363, #367).**
-  `plan_vhd` placed the footer at `byte_offset == virtual_size` with
-  no upper bound, so a `virtual_size` near `u64::MAX` overflowed the
-  file-size bookkeeping (the `fuzz_create_emitters` invariant panic).
-  `plan_vhd` now rejects `virtual_size` above VHD's maximum
-  (`0xFF000000` sectors = 2040 GiB, matching qemu `vpc.c`) before the
-  subformat split.
-
-- **`instar resize` panicked on a VHDX header with a near-maximum
-  sequence number (#354, #360).** The grow planner incremented the
-  parsed (attacker-controllable) `sequence_number` by 1 and 2 for the
-  two header copies without bounds; a value within 2 of `u64::MAX`
-  overflowed (the `fuzz_resize_planners` panic). The planner now
-  rejects such a header up front with `Overflow`.
-
-- **qcow2 sub-byte refcounts corrupted on `create` and `resize
-  --shrink` (#365).** `crates/qcow2::create::build_header` hardcoded
-  the header's `refcount_order` field to the 16-bit default instead
-  of deriving it from `refcount_bits`, and `set_refcount_to_one`
-  packed sub-byte (1/2/4-bit) refcount entries MSB-first while qemu
-  (and instar's own `lookup_refcount`) are LSB-first. Both writers
-  are shared by `create` and by the `resize --shrink` header rebuild,
-  so `instar create -o refcount_bits=1` and `instar resize --shrink`
-  on a `refcount_bits` 1/2/4 image produced files that exited 0 but
-  failed `qemu-img check` (referenced clusters left at refcount 0).
-  `build_header` now derives `refcount_order = log2(refcount_bits)`
-  and sub-byte widths pack LSB-first; `create` and `resize --shrink`
-  across `refcount_bits` 1/2/4/16 are `qemu-img check`-clean. The
-  differential fuzzer's create and resize pickers gained a
-  `refcount_bits` dimension to guard the path.
-
-- **Sub-byte refcount accessors used the wrong bit order.** The
-  `snapshot` crate's `read_refcount_in_block` /
-  `set_refcount_in_block` (lifted from `resize::qcow2`, which now
-  delegates to them) packed 1/2/4-bit refcount entries MSB-first
-  within each byte; qemu's `get/set_refcount_ro0/ro1/ro2` are
-  LSB-first. Round-trip tests pass under either order, which is
-  how the divergence survived — found by the pre-push audit's
-  cross-check against `qcow2::lookup_refcount` and pinned
-  byte-exactly against the qemu source. Production impact was
-  limited: the snapshot mutating modes refuse `refcount_bits !=
-  16`. (The separate `instar resize --shrink` / `create`
-  sub-byte corruption noted here originally is now also fixed —
-  see the entry above.)
-
-- **Snapshot list rows over-padded multibyte UTF-8 names.**
-  qemu's `qemu-img snapshot -l` pads the ID and TAG columns with
-  C `printf` minimum field widths, which count **bytes**; the
-  renderer used Rust's `{:<7}` / `{:<16}`, which count chars and
-  over-pad multibyte names (`snäp-名前` drew 9 pad spaces from
-  instar, 4 from qemu). The columns now pad by byte length, so
-  `-l` output is byte-identical for any name qemu can create.
-  Found by PLAN-snapshot phase 13's differential fuzzer on its
-  first smoke run — the phase 10/11 fixture names were all
-  ASCII, where the two semantics agree (commit `5f6a1b9`).
-
-- **Snapshot delete left stale COPIED flags in surviving L2s.**
-  qemu's delete decrement walk also recomputes `OFLAG_COPIED` on
-  every L2 entry it visits and flushes dirty L2s whose clusters
-  were not freed, so an L2 shared between the deleted snapshot
-  and a surviving one lands on disk with refreshed flags.
-  instar's delete refreshed only the active chain, leaving
-  stale COPIED-clear entries in the surviving snapshot's L2 —
-  safe (a spurious COW after a later apply at worst; `qemu-img
-  check` clean) but not byte-identical. Delete now refreshes
-  the deleted chain's staged L2 set and writes back the
-  surviving (refcount > 0) snap-set L2s in its final write
-  group, matching qemu's cache-discard behaviour for freed L2s.
-  Found by the phase 13 differential fuzzer's soak (commit
-  `a5d0767`); a shared-L2 regression scenario joined
-  `tools/snapshot-delete-matrix.sh`.
-
-- **`convert --snapshot` picked the wrong snapshot on
-  ID/name-collision images.** `qcow2::find_snapshot` matched
-  id-or-name per entry and returned the first hit, where
-  qemu's `find_snapshot_by_id_or_name` (the resolver behind
-  `qemu-img convert -l` and `snapshot -a`) makes one full ID
-  pass and only then a name pass. On an image with `id=1
-  name="2"` and `id=2 name="x"`, `instar convert --snapshot 2`
-  extracted the snapshot *named* "2" while qemu extracts ID 2.
-  The matcher is now two full passes; the dead
-  `find_snapshot_streaming` variant was removed. A collision
-  regression test joins the convert suite; the bounded
-  16-entry lookup residual is documented in `docs/quirks.md`
-  (PLAN-snapshot phase 14, probe 1).
-
-- **Zero `date_sec` rendered a blank snapshot DATE column.**
-  qemu feeds a zero `date_sec` through `localtime` and renders
-  the Unix epoch; instar early-returned an empty string,
-  diverging on hand-crafted images (the value is unreachable
-  via either tool's create). The early return is removed and
-  the epoch renders like any other timestamp (PLAN-snapshot
-  phase 14, probe 2; found by phase 13's date-normalization
-  probes).
-
-- **Fuzzing bug backlog (44 issues).** Five categories of fuzz
-  findings from coverage-guided and differential fuzzing are
-  closed by the `PLAN-fuzzing-bugs` work:
-  - `create::plan_vmdk` no longer panics on adversarial
-    `(virtual_size, grain_size)` tuples — capacity arithmetic
-    now uses `checked_mul` and surfaces
-    `CreateError::Overflow` (commit `0220ae9`).
-  - `qcow2::scan_allocation` honours the invariant
-    `allocated_bytes <= virtual_size` for on-disk L2 entries
-    past `virtual_size`, which the spec allows but the
-    measure path rejects. Last-cluster contributions are
-    capped at `virtual_size - cluster_start`
-    (commit `6de9687`).
-  - The measure calculators (`measure_raw`, `measure_qcow2`,
-    `measure_vmdk`, `measure_vhd`, `measure_vhdx`) route
-    construction of their `MeasureOutput` through a new
-    `try_new` helper that rejects sum-overflow on
-    `required + fully_allocated` (commit `b4e312d`).
-  - The dynamic-VHD, VHDX, and VMDK allocation scanners
-    clamp `allocated_bytes` at `virtual_size`, fixing the
-    `instar measure` failure on small dynamic-VPC images
-    where a single 2 MiB block exceeds the 1 MiB virtual
-    size (commit `bed14fc`).
-  - `scripts/differential-fuzz.py` reclassifies external-
-    tool subprocess timeouts as `inconclusive_external_timeout`
-    rather than `exit_code_divergence`, so qemu-img hangs
-    on adversarial qcow2 shrink inputs no longer file
-    GitHub issues against instar (commit `71e3e33`).
 
 ### Changed
 
