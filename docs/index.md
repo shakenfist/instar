@@ -34,15 +34,27 @@ Confused about how `instar` does these things? Perhaps read the
 
 # Main Implementation Documentation
 
-## Instar-Specific Features
+## Getting Started
 
-Features unique to instar that do not exist in qemu-img.
+| Document | Description |
+|----------|-------------|
+| [Installation](installation.md) | Pre-built packages, system requirements, building from source |
+| [Development](development.md) | Building, Makefile targets, tests, fuzzing, releases, GitHub automation |
+
+## Per-Command Guides and Instar-Specific Features
+
+The user guide for each subcommand, plus features unique to instar
+that do not exist in qemu-img.
 
 | Document | Description |
 |----------|-------------|
 | [Configuration Guide](configuration.md) | Command-line flags, config files, quirk control |
 | [Chain Discovery](chain-discovery.md) | `instar info --chain` - secure backing chain discovery |
 | [Chain Config Protocol](chain-config.md) | Chain config structure layout and VMM-to-guest data flow |
+| [Info](info.md) | `instar info` - image format information and version-profile output |
+| [Check](check.md) | `instar check` - structural validation and qcow2 repair |
+| [Compare](compare.md) | `instar compare` - content comparison across formats |
+| [Convert](convert.md) | `instar convert` - format conversion, compression, encryption |
 | [Measure](measure.md) | `instar measure` - predict file size for a target format |
 | [Create](create.md) | `instar create` - create a new empty disk image |
 | [Resize](resize.md) | `instar resize` - change a disk image's virtual size |
