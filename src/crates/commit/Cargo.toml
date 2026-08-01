@@ -1,6 +1,6 @@
 [package]
 name = "commit"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Plan in-place metadata mutations to commit overlay clusters into a backing image (no I/O)"
 license = "Apache-2.0"

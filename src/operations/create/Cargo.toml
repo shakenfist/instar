@@ -1,6 +1,6 @@
 [package]
 name = "create-op"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Create operation: emit empty image metadata for a target format"
 license = "Apache-2.0"

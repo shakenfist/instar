@@ -1,6 +1,6 @@
 [package]
 name = "resize-op"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Resize operation: in-place mutation of an existing disk image"
 license = "Apache-2.0"

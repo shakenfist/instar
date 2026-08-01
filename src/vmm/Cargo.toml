@@ -1,6 +1,6 @@
 [package]
 name = "instar"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Safe, sandboxed disk image operations using KVM isolation"
 license = "Apache-2.0"

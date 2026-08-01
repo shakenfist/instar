@@ -1,6 +1,6 @@
 [package]
 name = "commit-op"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Commit operation: merge overlay clusters into the backing image"
 license = "Apache-2.0"

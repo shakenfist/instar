@@ -1,6 +1,6 @@
 [package]
 name = "luks"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "LUKS v1/v2 header parsing and key derivation for bare-metal guest operations"
 license = "Apache-2.0"

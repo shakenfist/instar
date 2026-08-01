@@ -1,6 +1,6 @@
 [package]
 name = "convert"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Convert operation: transform between disk image formats"
 license = "Apache-2.0"

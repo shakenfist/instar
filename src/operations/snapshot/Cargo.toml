@@ -1,6 +1,6 @@
 [package]
 name = "snapshot-op"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Snapshot operation: list / apply / create / delete qcow2 internal snapshots"
 license = "Apache-2.0"
