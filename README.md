@@ -29,7 +29,7 @@ provides a reading order and annotated walkthrough of the codebase.
 ## Installation
 
 ```bash
-VERSION=0.2.0
+VERSION=0.3.0
 curl -sLO "https://github.com/shakenfist/instar/releases/download/v${VERSION}/instar_${VERSION}-1_amd64.deb"
 sudo apt install "./instar_${VERSION}-1_amd64.deb"
 ```
