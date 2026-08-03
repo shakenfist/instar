@@ -772,9 +772,15 @@ jobs:
     # runner, timeout, fork restriction, bot-commit check --
     # lives in the shared workflow so it stays in step with the
     # rest of the fleet.
+    #
+    # Every job which can fail the PR is named here, so the gate means
+    # what the sentence above says. The one deliberate omission is
+    # oslo-crossval-master, which is continue-on-error: true and so
+    # could never gate anything.
     needs:
       - test-partition
       - build-and-test
+      - package-smoke
       - integration-core
       - integration-convert-qcow2
       - integration-convert-vhd
@@ -785,5 +791,9 @@ jobs:
       contents: read
       pull-requests: write
       issues: write
+    # No secrets: block. The shared workflow and the review-pr-with-claude
+    # action it calls reference no secrets at all -- they authenticate with
+    # github.token, which a reusable workflow gets from the permissions
+    # above. "secrets: inherit" would hand every secret this repository has
+    # to another repository's workflow tracked at @main, for nothing.
     uses: shakenfist/actions/.github/workflows/pr-auto-review.yml@main
-    secrets: inherit
