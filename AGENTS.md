@@ -607,6 +607,19 @@ Comment on a PR with these commands (requires write access to the repository):
 
 ### How Automated Review Works
 
+The review job lives in the shared workflow
+`shakenfist/actions/.github/workflows/pr-auto-review.yml`, not in this
+repository. `automated_reviewer` in `functional-tests.yml` is only the caller:
+its `needs:` list names this project's test jobs, which is what gates the
+review on CI passing. The runner, the timeout, the bot-commit check and the
+fork restriction all live in the shared workflow.
+
+Reviews run on same-repository pull requests only. The reviewer runs Claude
+Code with `--dangerously-skip-permissions` while holding a token with
+`pull-requests: write` and `issues: write`, and the PR diff is untrusted
+input, so a fork PR is skipped rather than reviewed. Fork PRs get a skipped
+job, not a failing one.
+
 The automated reviewer outputs structured JSON that is:
 1. Validated against a JSON schema (`tools/review-schema.json`)
 2. GitHub issues are created for actionable items (action=fix or action=document)
@@ -641,7 +654,9 @@ This allows reviewers to cherry-pick or drop individual fixes as needed.
 
 ### Workflow Files
 
-- `.github/workflows/functional-tests.yml` - Main CI with automated review
+- `.github/workflows/functional-tests.yml` - Main CI, and the caller for the
+  shared automated review workflow
+  (`shakenfist/actions/.github/workflows/pr-auto-review.yml`)
 - `.github/workflows/release.yml` - Release workflow (Sigstore-signed tags, GitHub Releases with pre-compiled binaries)
 - `.github/workflows/pr-re-review.yml` - Manual re-review trigger
 - `.github/workflows/pr-retest.yml` - Manual retest trigger via bot command

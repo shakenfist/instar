@@ -18,32 +18,6 @@ permissions:
   issues: write
 
 jobs:
-  # Check if the last commit was from the bot to prevent infinite loops in
-  # automated fixer jobs. This runs early so other jobs can depend on it.
-  check-bot-commit:
-    name: "Check bot commit"
-    if: github.event_name == 'pull_request'
-    runs-on: [self-hosted, static]
-    outputs:
-      is_bot: ${{ steps.check.outputs.is_bot }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 1
-
-      - name: Check if last commit was from bot
-        id: check
-        run: |
-          LAST_AUTHOR_EMAIL=$(git log -1 --format='%ae')
-          echo "Last commit author: $LAST_AUTHOR_EMAIL"
-          if [ "$LAST_AUTHOR_EMAIL" = "bot@shakenfist.com" ]; then
-            echo "is_bot=true" >> $GITHUB_OUTPUT
-            echo "Last commit was from bot - automated fixers will be skipped"
-          else
-            echo "is_bot=false" >> $GITHUB_OUTPUT
-          fi
-
   # Assert every Python integration test is claimed by at least one of
   # the integration jobs below. Cheap (pure Python + stestr discovery,
   # no /dev/kvm, no testdata, no build), so it runs on a small runner
@@ -792,22 +766,34 @@ jobs:
 
   automated_reviewer:
     name: "Automated reviewer"
-    runs-on: [self-hosted, claude-code]
-    needs: [check-bot-commit, test-partition, build-and-test, integration-core, integration-convert-qcow2, integration-convert-vhd, snapshot-harnesses]
-    if: >-
-      ${{ github.event_name == 'pull_request' &&
-          needs.check-bot-commit.outputs.is_bot != 'true' }}
-    concurrency:
-      group: ${{ github.workflow }}-${{ github.ref }}-reviewer
-      cancel-in-progress: true
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - name: Run automated reviewer
-        uses: shakenfist/actions/review-pr-with-claude@main
-        with:
-          pr-number: ${{ github.event.pull_request.number }}
+    # The needs: list is the "review only once CI has passed" gate:
+    # a job skipped because a dependency failed never starts the
+    # reusable workflow. Everything else about the reviewer --
+    # runner, timeout, fork restriction, bot-commit check --
+    # lives in the shared workflow so it stays in step with the
+    # rest of the fleet.
+    #
+    # Every job which can fail the PR is named here, so the gate means
+    # what the sentence above says. The one deliberate omission is
+    # oslo-crossval-master, which is continue-on-error: true and so
+    # could never gate anything.
+    needs:
+      - test-partition
+      - build-and-test
+      - package-smoke
+      - integration-core
+      - integration-convert-qcow2
+      - integration-convert-vhd
+      - snapshot-harnesses
+    # A cross-repository reusable workflow cannot grant itself more
+    # token scope than its caller has, so the permissions go here.
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    # No secrets: block. The shared workflow and the review-pr-with-claude
+    # action it calls reference no secrets at all -- they authenticate with
+    # github.token, which a reusable workflow gets from the permissions
+    # above. "secrets: inherit" would hand every secret this repository has
+    # to another repository's workflow tracked at @main, for nothing.
+    uses: shakenfist/actions/.github/workflows/pr-auto-review.yml@main
