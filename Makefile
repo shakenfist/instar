@@ -12,7 +12,7 @@
 .PHONY: help list-prototypes build-prototype build-all clean-prototype clean-all \
         clean-devcontainers lint lint-fix build-lint-container \
         install-hooks run-prototype guest-protocol \
-        instar instar-devcontainer clean-instar run-instar check-binary-sizes \
+        instar instar-devcontainer build-devcontainer clean-instar run-instar check-binary-sizes \
         metadata audit deb rpm package \
         test-venv test test-rust test-integration test-ci test-malicious test-report clean-tests \
         fuzz-build fuzz-run snapshot-harnesses \
@@ -31,7 +31,8 @@ help:
 	@echo ""
 	@echo "Main Project (src/):"
 	@echo "  instar                Build the main instar project"
-	@echo "  instar-devcontainer   Build devcontainer for main instar"
+	@echo "  instar-devcontainer   Build the dev/test devcontainer image"
+	@echo "  build-devcontainer    Build the release build image (bullseye, glibc floor)"
 	@echo "  clean-instar          Clean the main instar build"
 	@echo "  run-instar            Show how to run instar"
 	@echo "  check-binary-sizes   Verify binaries fit within memory regions"
@@ -105,7 +106,15 @@ PROTOTYPES := \
 
 # Docker image names
 LINT_IMAGE := instar-rust-lint
-INSTAR_IMAGE := instar-build
+# The release build image (instar-release: debian:bullseye, glibc 2.31,
+# toolchain only) produces the `instar` binary and the .deb/.rpm
+# packages. The dev/test image keeps the established `instar-build`
+# name (full Debian with qemu-utils, libyal parsers, fuzz/audit tools)
+# and runs everything else, so the many CI `docker run instar-build`
+# test/fuzz invocations stay correct without change. See
+# docs/plans/PLAN-distro-matrix-ci-phase-01-glibc-build.md.
+INSTAR_BUILD_IMAGE := instar-release
+INSTAR_DEV_IMAGE := instar-build
 
 # Paths
 SRC_DIR := src
@@ -118,8 +127,9 @@ CARGO_CACHE_DIR := .cargo-cache
 # Main Instar Project Targets
 # =============================================================================
 
-# Build the main instar project (runs inside devcontainer)
-instar: instar-devcontainer
+# Build the main instar project (runs inside the release build image so
+# the host binary picks up the low glibc floor)
+instar: build-devcontainer
 	@echo "Building instar..."
 	@mkdir -p "$(CURDIR)/$(CARGO_CACHE_DIR)/registry" "$(CURDIR)/$(CARGO_CACHE_DIR)/git"
 	docker run --rm \
@@ -130,14 +140,23 @@ instar: instar-devcontainer
 		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/registry:/build/.cargo/registry" \
 		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/git:/build/.cargo/git" \
 		-w "/workspace/$(SRC_DIR)" \
-		"$(INSTAR_IMAGE)" \
+		"$(INSTAR_BUILD_IMAGE)" \
 		bash build.sh
 
-# Build the instar devcontainer
+# Build the release build image (debian:bullseye, toolchain only).
+# Used by `instar`, `deb`, `rpm`.
+build-devcontainer:
+	@if ! docker image inspect "$(INSTAR_BUILD_IMAGE)" >/dev/null 2>&1; then \
+		echo "Building instar release build image..."; \
+		docker build -t "$(INSTAR_BUILD_IMAGE)" "$(SRC_DIR)/$(DEVCONTAINER_DIR)/build"; \
+	fi
+
+# Build the instar dev/test devcontainer (full Debian with test, fuzz,
+# and audit tooling). Used by everything except release artifact builds.
 instar-devcontainer:
-	@if ! docker image inspect "$(INSTAR_IMAGE)" >/dev/null 2>&1; then \
+	@if ! docker image inspect "$(INSTAR_DEV_IMAGE)" >/dev/null 2>&1; then \
 		echo "Building instar devcontainer image..."; \
-		docker build -t "$(INSTAR_IMAGE)" "$(SRC_DIR)/$(DEVCONTAINER_DIR)"; \
+		docker build -t "$(INSTAR_DEV_IMAGE)" "$(SRC_DIR)/$(DEVCONTAINER_DIR)"; \
 	fi
 
 # Validate workspace Cargo.toml manifests parse cleanly. Fast manifest-only
@@ -154,7 +173,7 @@ metadata: instar-devcontainer
 		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/registry:/build/.cargo/registry" \
 		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/git:/build/.cargo/git" \
 		-w "/workspace/$(SRC_DIR)" \
-		"$(INSTAR_IMAGE)" \
+		"$(INSTAR_DEV_IMAGE)" \
 		cargo metadata --format-version 1 --no-deps >/dev/null
 	@echo "Workspace manifests OK."
 
@@ -172,14 +191,14 @@ audit: instar-devcontainer
 		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/registry:/build/.cargo/registry" \
 		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/git:/build/.cargo/git" \
 		-w "/workspace/$(SRC_DIR)" \
-		"$(INSTAR_IMAGE)" \
+		"$(INSTAR_DEV_IMAGE)" \
 		cargo audit
 
 # Build a Debian package from the artifacts produced by `make instar`.
 # Runs cargo-deb inside the devcontainer with --no-build so no
 # compilation happens here -- run `make instar` first. Output:
 # src/target/debian/instar_*.deb
-deb: instar-devcontainer
+deb: build-devcontainer
 	@if [ ! -f "$(SRC_DIR)/target/release/instar" ] || \
 	    [ ! -f "$(SRC_DIR)/target/release/core.bin" ]; then \
 	    echo "Error: build artifacts missing. Run 'make instar' first."; \
@@ -195,7 +214,7 @@ deb: instar-devcontainer
 		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/registry:/build/.cargo/registry" \
 		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/git:/build/.cargo/git" \
 		-w "/workspace/$(SRC_DIR)" \
-		"$(INSTAR_IMAGE)" \
+		"$(INSTAR_BUILD_IMAGE)" \
 		cargo deb --no-build -p instar
 	@echo ""
 	@ls -la "$(SRC_DIR)/target/debian/"*.deb
@@ -204,7 +223,7 @@ deb: instar-devcontainer
 # Runs cargo-generate-rpm inside the devcontainer; like cargo-deb it
 # does not compile, only package. Output:
 # src/target/generate-rpm/instar-*.rpm
-rpm: instar-devcontainer
+rpm: build-devcontainer
 	@if [ ! -f "$(SRC_DIR)/target/release/instar" ] || \
 	    [ ! -f "$(SRC_DIR)/target/release/core.bin" ]; then \
 	    echo "Error: build artifacts missing. Run 'make instar' first."; \
@@ -220,7 +239,7 @@ rpm: instar-devcontainer
 		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/registry:/build/.cargo/registry" \
 		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/git:/build/.cargo/git" \
 		-w "/workspace/$(SRC_DIR)" \
-		"$(INSTAR_IMAGE)" \
+		"$(INSTAR_BUILD_IMAGE)" \
 		cargo generate-rpm -p vmm
 	@echo ""
 	@ls -la "$(SRC_DIR)/target/generate-rpm/"*.rpm
@@ -231,12 +250,12 @@ package: deb rpm
 # Clean the main instar build
 clean-instar:
 	@echo "Cleaning instar build..."
-	@if docker image inspect "$(INSTAR_IMAGE)" >/dev/null 2>&1; then \
+	@if docker image inspect "$(INSTAR_DEV_IMAGE)" >/dev/null 2>&1; then \
 		echo "Using container to clean (handles root-owned files)..."; \
 		docker run --rm \
 			-v "$(CURDIR):/workspace" \
 			-w "/workspace/$(SRC_DIR)" \
-			"$(INSTAR_IMAGE)" \
+			"$(INSTAR_DEV_IMAGE)" \
 			sh -c "rm -rf target *.bin"; \
 	else \
 		rm -rf "$(SRC_DIR)/target" 2>/dev/null || true; \
@@ -305,7 +324,7 @@ build-prototype: check-prototype instar-devcontainer
 		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/registry:/build/.cargo/registry" \
 		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/git:/build/.cargo/git" \
 		-w "/workspace/$(PROTO_DIR)/$(PROTOTYPE)" \
-		"$(INSTAR_IMAGE)" \
+		"$(INSTAR_DEV_IMAGE)" \
 		bash build.sh
 
 # Build all prototypes (uses shared devcontainer)
@@ -333,7 +352,7 @@ guest-protocol: instar-devcontainer
 		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/registry:/build/.cargo/registry" \
 		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/git:/build/.cargo/git" \
 		-w "/workspace/crates/guest-protocol" \
-		"$(INSTAR_IMAGE)" \
+		"$(INSTAR_DEV_IMAGE)" \
 		cargo build --release
 
 # Build the rust-lint container
@@ -345,12 +364,12 @@ build-lint-container:
 # Uses shared devcontainer to handle root-owned files from builds
 clean-prototype: check-prototype
 	@echo "Cleaning target directory for: $(PROTOTYPE)"
-	@if docker image inspect "$(INSTAR_IMAGE)" >/dev/null 2>&1; then \
+	@if docker image inspect "$(INSTAR_DEV_IMAGE)" >/dev/null 2>&1; then \
 		echo "Using container to clean (handles root-owned files)..."; \
 		docker run --rm \
 			-v "$(CURDIR):/workspace" \
 			-w "/workspace/$(PROTO_DIR)/$(PROTOTYPE)" \
-			"$(INSTAR_IMAGE)" \
+			"$(INSTAR_DEV_IMAGE)" \
 			sh -c "rm -rf target *.bin"; \
 		echo "Cleaned $(PROTO_DIR)/$(PROTOTYPE)"; \
 	else \
@@ -367,14 +386,14 @@ clean-prototype: check-prototype
 # Uses shared devcontainer to handle root-owned files
 clean-all: clean-instar
 	@echo "Cleaning all prototype target directories..."
-	@if docker image inspect "$(INSTAR_IMAGE)" >/dev/null 2>&1; then \
+	@if docker image inspect "$(INSTAR_DEV_IMAGE)" >/dev/null 2>&1; then \
 		for p in $(PROTOTYPES); do \
 			if [ -d "$(PROTO_DIR)/$$p" ]; then \
 				echo "Cleaning $$p (via container)..."; \
 				docker run --rm \
 					-v "$(CURDIR):/workspace" \
 					-w "/workspace/$(PROTO_DIR)/$$p" \
-					"$(INSTAR_IMAGE)" \
+					"$(INSTAR_DEV_IMAGE)" \
 					sh -c "rm -rf target *.bin" 2>/dev/null || true; \
 			fi; \
 		done; \
@@ -389,15 +408,18 @@ clean-all: clean-instar
 	fi
 	@echo "Clean complete."
 
-# Remove devcontainer image
+# Remove devcontainer images (both the dev/test image and the release
+# build image)
 clean-devcontainers:
-	@echo "Removing devcontainer image..."
-	@if docker image inspect "$(INSTAR_IMAGE)" >/dev/null 2>&1; then \
-		docker rmi "$(INSTAR_IMAGE)" || true; \
-		echo "Removed $(INSTAR_IMAGE)"; \
-	else \
-		echo "$(INSTAR_IMAGE) not found"; \
-	fi
+	@echo "Removing devcontainer images..."
+	@for img in "$(INSTAR_DEV_IMAGE)" "$(INSTAR_BUILD_IMAGE)"; do \
+		if docker image inspect "$$img" >/dev/null 2>&1; then \
+			docker rmi "$$img" || true; \
+			echo "Removed $$img"; \
+		else \
+			echo "$$img not found"; \
+		fi; \
+	done
 
 # Remove the rust-lint Docker image
 clean-lint-container:
@@ -491,7 +513,7 @@ test-rust: instar-devcontainer
 		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/registry:/build/.cargo/registry" \
 		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/git:/build/.cargo/git" \
 		-w "/workspace/src" \
-		"$(INSTAR_IMAGE)" \
+		"$(INSTAR_DEV_IMAGE)" \
 		bash -c 'cargo test --release --workspace \
 			--exclude core \
 			--exclude info \
@@ -531,7 +553,7 @@ fuzz-build: instar-devcontainer
 		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/registry:/build/.cargo/registry" \
 		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/git:/build/.cargo/git" \
 		-w "/workspace/src/fuzz" \
-		"$(INSTAR_IMAGE)" \
+		"$(INSTAR_DEV_IMAGE)" \
 		bash -c "cargo fuzz build $(FUZZ_TARGET)"
 
 # Run a single fuzz target for a bounded wall-clock budget (seconds).
@@ -551,7 +573,7 @@ fuzz-run: instar-devcontainer
 		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/registry:/build/.cargo/registry" \
 		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/git:/build/.cargo/git" \
 		-w "/workspace/src/fuzz" \
-		"$(INSTAR_IMAGE)" \
+		"$(INSTAR_DEV_IMAGE)" \
 		bash -c "cargo fuzz run $(FUZZ_TARGET) -- -max_total_time=$(FUZZ_DURATION)"
 
 # Run the seven snapshot shell harnesses (tools/snapshot-*.sh):
@@ -576,7 +598,7 @@ snapshot-harnesses: instar-devcontainer
 		-e HOME=/build \
 		-v "$(CURDIR):/workspace" \
 		-w "/workspace" \
-		"$(INSTAR_IMAGE)" \
+		"$(INSTAR_DEV_IMAGE)" \
 		bash -c 'set -e; for h in tools/snapshot-*.sh; do \
 			echo ""; echo "=== $$h ==="; bash "$$h"; done'
 
@@ -604,7 +626,7 @@ test-container: instar-devcontainer instar
 		-v "$(CURDIR):/workspace" \
 		-v "$(TESTDATA_PATH):/testdata:ro" \
 		-w "/workspace" \
-		"$(INSTAR_IMAGE)" \
+		"$(INSTAR_DEV_IMAGE)" \
 		bash -c '\
 			echo "Setting up test environment..."; \
 			python3 -m venv /build/test-venv && \
@@ -634,7 +656,7 @@ test-container-core: instar-devcontainer instar
 		-v "$(CURDIR):/workspace" \
 		-v "$(TESTDATA_PATH):/testdata:ro" \
 		-w "/workspace" \
-		"$(INSTAR_IMAGE)" \
+		"$(INSTAR_DEV_IMAGE)" \
 		bash -c '\
 			echo "Setting up test environment..."; \
 			python3 -m venv /build/test-venv && \
@@ -663,7 +685,7 @@ test-container-convert-qcow2: instar-devcontainer instar
 		-v "$(CURDIR):/workspace" \
 		-v "$(TESTDATA_PATH):/testdata:ro" \
 		-w "/workspace" \
-		"$(INSTAR_IMAGE)" \
+		"$(INSTAR_DEV_IMAGE)" \
 		bash -c '\
 			echo "Setting up test environment..."; \
 			python3 -m venv /build/test-venv && \
@@ -693,7 +715,7 @@ test-container-convert-vhd: instar-devcontainer instar
 		-v "$(CURDIR):/workspace" \
 		-v "$(TESTDATA_PATH):/testdata:ro" \
 		-w "/workspace" \
-		"$(INSTAR_IMAGE)" \
+		"$(INSTAR_DEV_IMAGE)" \
 		bash -c '\
 			echo "Setting up test environment..."; \
 			python3 -m venv /build/test-venv && \
