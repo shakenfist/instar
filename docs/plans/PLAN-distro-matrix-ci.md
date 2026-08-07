@@ -105,29 +105,34 @@ Chosen: the widest coverage — all seven distros in the matrix below,
 including Ubuntu 22.04 LTS (glibc 2.35) and Rocky/RHEL 9 (glibc 2.34).
 That requires a build-glibc floor of **≤ 2.34**.
 
-**Mechanism (phase 1 decides empirically, recommendation recorded
-here).** The floor is a property of the *build* image only. Two
-candidate build images hit the floor:
+**Build base: `debian:bullseye` (Debian 11, glibc 2.31) — agreed
+2026-08-08.** The floor is a property of the *build* image only.
+bullseye's 2.31 sits below the matrix floor (Rocky 9's 2.34) with ~3
+minor-versions of margin, so a bullseye-built binary runs on every
+target distro. It keeps the whole build toolchain apt-based and
+identical in shape to today's Dockerfile (rustup nightly,
+`protobuf-compiler`, `cargo-binutils`) — no port to a non-Debian
+package manager — and the libyal / `cargo-fuzz` / `cargo-audit`
+tooling that is awkward outside Debian does **not** move, because it
+is test-only and stays on the existing Debian dev image. bullseye is
+Debian oldstable (still supported), not an EOL base; the next-older
+Debian (buster, glibc 2.28) is archived and deliberately not chosen.
 
-- **`debian:bullseye` (Debian 11, glibc 2.31) — recommended.** Lower
-  than required (2.31 ≤ 2.34), so it covers every target with margin,
-  and it keeps the entire build toolchain apt-based and identical in
-  shape to today's Dockerfile (rustup nightly, `protobuf-compiler`,
-  `cargo-binutils`). No port to a non-Debian package manager. The
-  libyal/`cargo-fuzz`/`cargo-audit` tooling that is awkward outside
-  Debian does **not** need to move — it is test-only and stays on the
-  existing Debian dev image.
-- **`rockylinux:9` (glibc 2.34) — fallback.** The option as literally
-  selected. Hits the floor exactly, but building on Rocky 9 means
-  porting the toolchain install to dnf and dealing with rougher
-  nightly-Rust ergonomics. Only worth it if a bullseye-built binary
-  proves to have a concrete problem on a target distro (none is
-  expected).
+This is the concrete form of the broader principle Michael affirmed:
+**build Debian-only; validate on the real distros.** The build never
+leaves Debian; the non-Debian coverage comes entirely from installing
+and running the produced package *inside* the real target-distro
+containers (phases 3–4), not from building there.
 
-Phase 1 builds instar on the recommended image and **verifies the
-binary actually runs on every distro in the matrix** (that is the real
-acceptance test, not the nominal glibc number), falling back to
-`rockylinux:9` only if a specific distro fails.
+`rockylinux:9` (glibc 2.34) is retained only as a **contingency** — to
+be used solely if phase 1's empirical verification finds a concrete
+distro on which the bullseye-built binary fails (none is expected).
+Adopting it would mean porting the toolchain install to dnf, so it is
+not the plan of record.
+
+Phase 1 still **verifies the binary actually runs on every distro in
+the matrix** (`tools/verify-glibc-floor.sh`) — that empirical check,
+not the nominal glibc number, is the acceptance gate for the floor.
 
 **Architecture: split the devcontainer.** Introduce a minimal
 low-glibc *build* image (toolchain only) that produces the binary and
