@@ -6,7 +6,9 @@ self-hosted-runner:
   labels:
     - claude-code
     - debian-12
+    - debian-13
     - static
+    - vm
     - xs
     - s
     - m

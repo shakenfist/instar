@@ -1,0 +1,44 @@
+# Repository secret scanning.
+#
+# Runs on every PR to develop and on pushes to develop, plus a weekly
+# cron to catch drift. gitleaks-action@v2 refuses to run on
+# organization repos without a paid licence, so we invoke the upstream
+# gitleaks binary directly instead, which has no such restriction.
+# gitleaks is only packaged from Debian 13 (trixie) onward -- bookworm
+# has no gitleaks package -- so this job runs on debian-13. This
+# follows ryll's supply-chain.yml, trimmed to the gitleaks job:
+# instar runs cargo-audit via make audit in the devcontainer and
+# shellcheck via pre-commit, and does not use cargo-deny.
+
+name: Supply chain
+
+on:
+  pull_request:
+    branches: [develop]
+  push:
+    branches: [develop]
+  schedule:
+    # Weekly at 09:00 UTC on Monday.
+    - cron: '0 9 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    name: gitleaks
+    runs-on: [self-hosted, vm, debian-13, s]
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-gitleaks
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install gitleaks
+        run: sudo apt-get update && sudo apt-get install -y gitleaks
+
+      - name: Run gitleaks
+        run: gitleaks detect --source . --redact --verbose --no-banner
