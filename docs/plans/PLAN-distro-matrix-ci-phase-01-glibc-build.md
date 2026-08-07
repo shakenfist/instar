@@ -1,80 +1,165 @@
 # Phase 1: Build/dev container split + lower glibc floor
 
 Master plan: [PLAN-distro-matrix-ci.md](PLAN-distro-matrix-ci.md).
-Planning effort: **high**. Isolation: **worktree** (breaks every build
-if wrong).
+Planning effort: **high**. Isolation: **worktree** (a wrong change
+here breaks every build and every release).
 
 ## Objective
 
-Lower the release binary's glibc floor to ≤ 2.34 so a single artifact
-runs on all seven matrix distros (down to Rocky 9 / Ubuntu 22.04),
-without dragging the test/fuzz tooling onto an old base. Split the
-current all-in-one devcontainer into a minimal low-glibc **build**
-image and the existing fat Debian **dev/test** image.
+Lower the released `instar` binary's glibc floor to run on all seven
+matrix distros (down to Rocky 9 / Ubuntu 22.04) by building it on
+**`debian:bullseye`** (glibc 2.31), without dragging the test/fuzz
+tooling onto that old base. Achieve this by splitting the current
+all-in-one devcontainer into:
 
-Also closes issue #474 (manual validation of the published v0.3.0
-artifacts) as the human baseline the automation will reproduce.
+- a minimal **build image** (`instar-build`, bullseye, toolchain only)
+  that produces the release binary and the `.deb`/`.rpm`, and
+- the existing fat **dev/test image** (renamed `instar-dev`) that keeps
+  `qemu-utils`, the libyal parsers, `cargo-fuzz`, `cargo-audit`, `gh`
+  for the test and fuzz suites and the VS Code devcontainer.
 
-## Background (verified facts)
+Also close issue #474 (manual real-VM validation of the *published*
+v0.3.0 artifacts) as the human baseline the automation reproduces.
 
-- Current base: `mcr.microsoft.com/devcontainers/base:debian`
-  (floating, currently glibc 2.41) — `src/.devcontainer/Dockerfile:2`.
-- The Dockerfile installs both build toolchain (`protobuf-compiler`,
-  rustup nightly pinned `nightly-2026-07-22`, `cargo-binutils`) and
-  test/dev tooling (`qemu-utils`, `libqcow-utils`, `libvhdi-utils`,
-  `libvmdk-utils`, `cargo-fuzz`, `cargo-audit`, `gh`). Only the first
-  group sets the binary's glibc floor.
-- `make instar` runs the build inside `$(INSTAR_IMAGE)` built from
-  `src/.devcontainer/` (`Makefile:121-144`). `make deb` / `make rpm`
-  run `cargo deb` / `cargo generate-rpm` `--no-build` in the same image
-  (`Makefile:182+`). `make audit`, fuzz targets, and `make test` also
-  use it.
-- glibc is forward-compatible only: build on the oldest glibc to
-  support. Rocky 9 = 2.34 is the matrix floor.
-- The nightly is pinned and force-bumped by
-  `.github/workflows/rust-nightly-bump.yml`; that workflow test-builds
-  the devcontainer image. If phase 1 adds a second image, the bump
-  workflow must build both (see step 1f).
+## Why bullseye (recap of D1)
 
-## Approach
+glibc is forward-compatible only: a binary runs on hosts whose glibc is
+≥ the build glibc. The matrix floor is Rocky 9 at **2.34**; bullseye's
+**2.31** clears it with ~3 minor-versions of margin and clears every
+other distro (Ubuntu 22.04 = 2.35, Debian 12 = 2.36, …). bullseye is
+Debian oldstable (supported), keeps the toolchain apt-based, and — the
+key point — the build never leaves Debian. Non-Debian coverage comes
+only from installing and running the produced package inside the real
+target-distro containers (phases 3–4), never from building there.
 
-Recommended build base: **`debian:bullseye`** (glibc 2.31, apt-based,
-minimal toolchain port). Fallback: `rockylinux:9` (glibc 2.34) only if
-a bullseye-built binary fails on a specific distro. The **acceptance
-test is empirical**: the built binary must run `instar info` + one
-post-v0.2 subcommand on every matrix distro, not merely report a low
-glibc number.
+## Verified starting state (grounding facts)
+
+- **One image today.** `INSTAR_IMAGE := instar-build` (`Makefile:108`)
+  is built from `src/.devcontainer/Dockerfile` (base
+  `mcr.microsoft.com/devcontainers/base:debian`, floating → glibc
+  2.41) and used by **every** container target: `instar`, `deb`,
+  `rpm`, `metadata`, `audit`, `build-prototype`, and the test targets.
+- **The build path.** `make instar` (`Makefile:121-134`) runs `bash
+  build.sh` in `/workspace/src` as the host uid, `HOME=/build`,
+  `CARGO_HOME=/build/.cargo`, with `.cargo-cache/{registry,git}`
+  bind-mounted. `build.sh` runs `cargo build --release` per crate and
+  `rust-objcopy` (from `cargo-binutils`) to flatten each guest ELF.
+- **The `+nightly` trap (memory: instar_devcontainer_nightly_ice).**
+  `build.sh` deliberately calls `cargo` with **no** `+nightly`
+  override and documents why: the container's *default* toolchain must
+  BE the pinned nightly (`ARG RUST_NIGHTLY=nightly-2026-07-22` +
+  `rust-src` + `llvm-tools-preview`). A literal `+nightly` would
+  auto-install the floating nightly without `rust-src`. **The build
+  image must set the same pinned nightly as its default toolchain.**
+- **Guest cross-builds are glibc-independent.** The guest ops target
+  `x86_64-unknown-none` (freestanding, build-std, needs `rust-src`);
+  their glibc floor is irrelevant. Only the host `instar` VMM binary
+  links glibc, so only *its* build image sets the floor.
+- **Packaging is compile-free.** `make deb` = `cargo deb --no-build -p
+  instar` (`Makefile:199`); `make rpm` = `cargo generate-rpm -p vmm`
+  (`Makefile:224`). They only package the artifacts `make instar`
+  produced, so the build image (not the packaging step) fixes the
+  glibc floor — but the packaging tools (`cargo-deb`,
+  `cargo-generate-rpm`) must live on the build image.
+- **CI artifact path.** `release.yml` does `docker image rm -f
+  instar-build` → `make instar` → `make package` (lines 119/122/143).
+  `functional-tests.yml` `package-smoke` (line 256) does the same rm +
+  `make instar && make deb`. Keeping the **build** image named
+  `instar-build` leaves both correct.
+- **proto toolchain.** `crates/guest-protocol/build.rs` drives
+  `micropb-gen` 0.6, which shells to system `protoc`
+  (`protobuf-compiler`). The proto is `proto3` using `oneof` and
+  message-typed fields — **no `optional` keyword** — so bullseye's
+  protoc 3.12 is *expected* to suffice, but this must be **verified at
+  build**, not assumed (see Risk R1).
+
+## Design: the two-image split
+
+| Concern | Image | Dockerfile | Make targets |
+|---------|-------|------------|--------------|
+| Produce release binary + packages | `instar-build` (bullseye) | `src/.devcontainer/build/Dockerfile` (new) | `instar`, `deb`, `rpm`, `package` |
+| Tests, fuzz, audit, manifests, prototypes, VS Code | `instar-dev` (Debian, pinned) | `src/.devcontainer/Dockerfile` (existing, base pinned) | `test`, `audit`, `metadata`, `build-prototype`, fuzz targets |
+
+Makefile variables become `INSTAR_BUILD_IMAGE := instar-build` and
+`INSTAR_DEV_IMAGE := instar-dev`; the two devcontainer-build targets
+are `build-devcontainer` (build image) and the existing
+`instar-devcontainer` repurposed to the dev image (keep its name so
+prototype/test targets need no rename beyond the variable). The
+`docker run` invocation body (uid, HOME, CARGO_HOME, mounts, workdir)
+is identical for both — only the image tag differs, so factor it if it
+reduces duplication, but a faithful copy is acceptable.
+
+The **build image** installs only: `protobuf-compiler` (or a pinned
+protoc, per R1), `curl`/`ca-certificates`/`git`, rustup with the
+**same** `${RUST_NIGHTLY}` pin as default toolchain + `rust-src` +
+`llvm-tools-preview`, and `cargo-binutils`, `cargo-deb`,
+`cargo-generate-rpm`. It does **not** install `qemu-utils`, the libyal
+`*-utils` parsers, `cargo-fuzz`, `cargo-audit`, or `gh` — those stay on
+`instar-dev`. Replicate the existing world-writable `/build`
+CARGO_HOME/RUSTUP_HOME `umask 0000` pattern exactly (memory:
+rust_devcontainer_permissions_investigation,
+instar_worktree_target_ownership — any docker run writing into the
+bind-mounted tree runs as host uid with a writable CARGO_HOME).
+
+The VS Code `devcontainer.json` (if present under `src/.devcontainer/`)
+stays pointed at the **dev** Dockerfile — humans get the full toolchain,
+not the stripped build image.
 
 ## Steps
 
 | Step | Effort | Model | Isolation | Brief for sub-agent |
 |------|--------|-------|-----------|---------------------|
-| 1a | low | sonnet | none | **Close #474 first (manual, operator-run).** Provide Michael a copy-paste script: on a clean KVM-capable Debian/Ubuntu VM `apt install ./instar_0.3.0-1_amd64.deb` then run `instar info`, `instar create`, `instar map` on a sample qcow2; on Fedora/Rocky 10 the same with the published `.rpm`. Record outputs. This is operator-driven — the sub-agent produces the script and the expected-output checklist, Michael runs it. Post results to #474 and close it. This establishes the human baseline. |
-| 1b | high | opus | worktree | Create `src/.devcontainer/build/Dockerfile` — the minimal build image `FROM debian:bullseye`, installing ONLY: `protobuf-compiler`, `curl`/`ca-certificates`, rustup with the same pinned `${RUST_NIGHTLY}` + `rust-src`/`llvm-tools-preview` components, and `cargo-binutils` (for `rust-objcopy`), `cargo-deb`, `cargo-generate-rpm`. NO qemu-utils, libyal, cargo-fuzz, cargo-audit, gh. Match the existing `/build` world-writable CARGO_HOME/RUSTUP_HOME umask pattern exactly (see the worktree-target-ownership and rust-devcontainer-permissions memory notes — any docker run writing into the bind-mounted tree must run as host uid with a writable CARGO_HOME). Keep the existing `src/.devcontainer/Dockerfile` as the dev/test image unchanged. |
-| 1c | high | opus | worktree | Rewire the Makefile: `make instar`, `make deb`, `make rpm` use the new build image (`$(INSTAR_BUILD_IMAGE)` from `src/.devcontainer/build/`); `make test`, `make audit`, and the fuzz targets keep `$(INSTAR_IMAGE)` (dev image). Add a `build-devcontainer` target parallel to `instar-devcontainer`. Verify `make instar && make deb && make rpm` produce artifacts and `check-binary-sizes` still passes. |
-| 1d | high | opus | worktree | **Empirical glibc verification.** Write `tools/verify-glibc-floor.sh` that, given a built .deb and .rpm, installs each in a throwaway container for every matrix distro image (debian:12, debian:13, ubuntu:22.04, ubuntu:24.04, fedora:latest, rockylinux:9, rockylinux:10) and runs `instar info` + `instar create` + `instar map` on a fixture, asserting clean exit. This is the real acceptance test for the floor. If any distro fails on a bullseye-built binary, STOP and report — do not silently switch to rockylinux:9 without management review. |
-| 1e | medium | sonnet | worktree | Pin the *dev/test* image base too while here: change `src/.devcontainer/Dockerfile` FROM to a pinned Debian tag (not floating `:debian`) so dev-image rebuilds are reproducible, matching the nightly-pin rationale already in the file. Coordinate the exact tag with Michael. |
-| 1f | medium | sonnet | none | Update `.github/workflows/rust-nightly-bump.yml` to test-build BOTH images against a candidate nightly (the build image and the dev image) so a nightly that breaks either blocks the bump. Update `package-smoke` in `functional-tests.yml` if the build-image change alters `make instar`/`make deb` invocation. |
-| 1g | low | sonnet | none | Docs: CHANGELOG entry (lower glibc floor → wider distro support; the container split); `docs/development.md` and `AGENTS.md`/`ARCHITECTURE.md` for the two-image model and which make targets use which; note the new minimum-glibc in README install section if it states one. |
+| 1a | low | (operator) | none | **Close #474 (manual, Michael-run).** Produce a copy-paste validation script + expected-output checklist: on a clean KVM-capable Debian/Ubuntu VM, `apt install ./instar_0.3.0-1_amd64.deb`, then `instar info` + `instar create` + `instar map` on a sample qcow2; on Fedora-latest or Rocky 10, the same with the published `.rpm`. The sub-agent writes the script + checklist only; Michael runs it on real VMs, posts results to #474, and closes it. This is the human baseline the matrix must reproduce; it is independent of the bullseye work (the shipped v0.3.0 artifacts are glibc-2.41 trixie builds). |
+| 1b | high | opus | worktree | **Create `src/.devcontainer/build/Dockerfile`** — the bullseye build image. `FROM debian:bullseye`. Install `protobuf-compiler`, `curl ca-certificates git`, then rustup with `--default-toolchain ${RUST_NIGHTLY}` (`ARG RUST_NIGHTLY=nightly-2026-07-22`, matching the dev image byte-for-byte), `rustup component add rust-src llvm-tools-preview`, and `cargo install cargo-binutils cargo-deb cargo-generate-rpm`. Reproduce the `/build` world-writable CARGO_HOME/RUSTUP_HOME/`umask 0000`/PATH pattern from the current Dockerfile. End with a verify line: `rustc --version && rust-objcopy --version && cargo deb --version && cargo generate-rpm --version && protoc --version`. Do **not** add qemu/libyal/fuzz/audit/gh. Build the image and confirm it builds clean. |
+| 1c | high | opus | worktree | **Split the Makefile.** Introduce `INSTAR_BUILD_IMAGE := instar-build` and `INSTAR_DEV_IMAGE := instar-dev`; add a `build-devcontainer` target that `docker build`s `src/.devcontainer/build/`; point `instar`, `deb`, `rpm` (and thus `package`) at the build image + `build-devcontainer`; repoint `metadata`, `audit`, `build-prototype`, and the test/fuzz targets at `instar-dev` via the existing `instar-devcontainer` target (now building the dev image). Keep every `docker run` body (uid/HOME/CARGO_HOME/mounts/workdir) unchanged. Verify end-to-end: `make instar && make deb && make rpm` produce `src/target/release/instar`, `.deb`, `.rpm`; `make check-binary-sizes` passes; `make metadata` still works on the dev image. |
+| 1d | high | opus | worktree | **Write `tools/verify-glibc-floor.sh <deb> <rpm>`** — the empirical floor gate. For each matrix distro image (`debian:12`, `debian:13`, `ubuntu:22.04`, `ubuntu:24.04`, `fedora:latest`, `rockylinux:9`, `rockylinux:10`): `docker run` the image, install the appropriate package (apt vs dnf), and run `instar info` + `instar create` + `instar map` on a fixture (needs `--device /dev/kvm`; skip-with-loud-warning if KVM absent locally, but CI must run it with KVM). Assert clean exit on every distro. If the **bullseye-built** binary fails on any distro, STOP and report to management — do NOT silently switch to the rockylinux:9 contingency without review. `shellcheck` clean. |
+| 1e | medium | sonnet | worktree | **Pin the dev image base.** Change `src/.devcontainer/Dockerfile`'s `FROM mcr.microsoft.com/devcontainers/base:debian` to a pinned Debian tag (a specific digest or `:bookworm`/`:trixie`-dated tag — confirm the exact pin with Michael) so dev-image rebuilds are reproducible, matching the nightly-pin rationale already documented in that file. Confirm `devcontainer.json` (if any) still references this Dockerfile and that `make test` still builds/runs on the repinned dev image. |
+| 1f | medium | sonnet | none | **Audit every workflow + script reference to the image names and make targets.** `release.yml` (`docker image rm -f instar-build` + `make instar`/`make package` → build image, should stay correct — confirm), `functional-tests.yml` `package-smoke` (build image — confirm) and `build-and-test` / test jobs (must target `instar-dev` now — fix any `instar-build` references that meant the dev image), and **`rust-nightly-bump.yml`** (must test-build **both** images against a candidate nightly so a nightly that breaks either image blocks the bump — today it builds one). Grep the whole tree for `instar-build` and `instar-devcontainer` and reconcile each hit. |
+| 1g | low | sonnet | none | **Docs.** CHANGELOG (`[Unreleased]`): lowered glibc floor → Debian/Ubuntu/Fedora/Rocky coverage incl. Rocky 9 & Ubuntu 22.04, via the build/dev container split. `docs/development.md`: the two-image model, which make targets use which image, the bullseye rationale, and the R1 protoc note. `ARCHITECTURE.md` / `AGENTS.md`: brief pointer to the split (not duplicating docs/). README install section: state the new minimum glibc (2.31) if it names one. |
 
 ## Acceptance
 
-- `make instar && make deb && make rpm` produce working artifacts from
-  the new build image.
-- `tools/verify-glibc-floor.sh` passes on all seven matrix distros.
-- `package-smoke` still green.
+- `make instar && make deb && make rpm` build working artifacts from
+  the bullseye `instar-build` image; `make check-binary-sizes` passes.
+- `tools/verify-glibc-floor.sh` passes on **all seven** matrix distros
+  with the bullseye-built packages (the real floor gate).
+- `make test` (and fuzz/audit) still pass on `instar-dev`.
+- `release.yml` and `functional-tests.yml package-smoke` still green
+  (they build the same artifacts via the same make targets).
+- `rust-nightly-bump.yml` now test-builds both images.
 - #474 closed with recorded real-VM results.
-- Full `make test` still passes on the dev image (the split did not
-  disturb the test path).
-- `pre-commit run --all-files` clean.
+- `pre-commit run --all-files` clean; `shellcheck` clean.
+- One commit per logical change: (1b) build Dockerfile, (1c) Makefile
+  split, (1d) verify script, (1e) dev-base pin, (1f) workflow audit,
+  (1g) docs. 1a lands via #474, not a code commit.
 
-## Notes / risks
+## Risks
 
-- If bullseye's rustup nightly ergonomics bite (unlikely — rustup is
-  distro-agnostic), the pin already protects us; the fuzz/audit tools
-  that are genuinely awkward on old bases are NOT in the build image.
-- Watch CARGO_HOME/target ownership: the build image runs as host uid
-  writing into the bind-mounted source tree (memory:
-  instar_worktree_target_ownership, rust_devcontainer_permissions).
-- Do not remove the dev image or move fuzz tooling — differential
-  fuzzing still needs libyal on Debian.
+- **R1 — bullseye protoc version.** protoc 3.12 is *expected* to
+  compile the proto (proto3, `oneof`, no `optional` keyword), but if
+  the `guest-protocol` build fails on protoc in 1b, install a pinned
+  upstream `protoc` release binary in the build Dockerfile instead of
+  the apt `protobuf-compiler` (download + checksum-verify a fixed
+  version), and record it. Do not silently accept a version skew from
+  the dev image's protoc — note any difference.
+- **R2 — the floor is empirical, not nominal.** 2.31 ≤ 2.34 is
+  necessary but not sufficient; a distro could fail for a non-glibc
+  reason (missing runtime dep, SELinux, package scriptlet). 1d is the
+  gate; a failure there triggers management review, not an automatic
+  contingency switch.
+- **R3 — nightly on bullseye.** rustup is distro-agnostic and the pin
+  protects against a broken nightly, but if a toolchain component fails
+  to install on bullseye, that is a 1b blocker to surface immediately
+  (the awkward-on-old-base tooling — fuzz/audit — is deliberately NOT
+  in this image, which minimises this surface).
+- **R4 — CARGO_HOME/target ownership.** The build image runs as host
+  uid writing into the bind-mounted tree; get the `/build` writable
+  CARGO_HOME + `umask 0000` exactly right or rebuilds poison ownership
+  (memory notes). Verify a second `make instar` (cache warm) works.
+
+## Out of scope for this phase
+
+- The runner script, matrix job, and merge queue (phases 3–5).
+- Any change to what the binary *does* — this phase changes only where
+  it is built and proves where it runs.
+- The rockylinux:9 contingency build — only revisited if 1d fails.
