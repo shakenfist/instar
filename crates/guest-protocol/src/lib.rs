@@ -29,6 +29,8 @@
 #![allow(non_snake_case)]
 #![allow(non_upper_case_globals)]
 #![allow(unused_imports)]
+#![allow(unused_labels)]
+#![allow(unused_mut)]
 #![allow(unused_parens)]
 #![allow(unused_variables)]
 
