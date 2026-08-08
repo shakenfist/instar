@@ -86,12 +86,16 @@ jobs:
 
       - name: Remove previous devcontainers, if any
         run: |
-          docker image rm -f instar-build 2>/dev/null || true
+          docker image rm -f instar-build instar-release 2>/dev/null || true
 
       - name: Build and test via devcontainer
         run: |
-          # Build the devcontainer and run cargo build + test inside it
+          # Build the dev/test image (the cargo test steps below run in
+          # it) and the release binary. make instar builds the release
+          # image (instar-release); make instar-devcontainer builds the
+          # dev/test image (instar-build) the docker-run steps use.
           make instar
+          make instar-devcontainer
           # Run unit tests inside the container (all workspace crates
           # except no_main guest binaries)
           docker run --rm \
@@ -294,7 +298,7 @@ jobs:
 
       - name: Remove previous devcontainers, if any
         run: |
-          docker image rm -f instar-build 2>/dev/null || true
+          docker image rm -f instar-build instar-release 2>/dev/null || true
 
       - name: Build instar and the .deb package
         run: |
@@ -352,7 +356,7 @@ jobs:
 
       - name: Remove previous devcontainers, if any
         run: |
-          docker image rm -f instar-build 2>/dev/null || true
+          docker image rm -f instar-build instar-release 2>/dev/null || true
 
       - name: Build instar
         run: |
@@ -533,7 +537,7 @@ jobs:
 
       - name: Remove previous devcontainers, if any
         run: |
-          docker image rm -f instar-build 2>/dev/null || true
+          docker image rm -f instar-build instar-release 2>/dev/null || true
 
       - name: Build instar
         run: |
@@ -613,7 +617,7 @@ jobs:
 
       - name: Remove previous devcontainers, if any
         run: |
-          docker image rm -f instar-build 2>/dev/null || true
+          docker image rm -f instar-build instar-release 2>/dev/null || true
 
       - name: Build instar
         run: |
@@ -680,7 +684,7 @@ jobs:
 
       - name: Remove previous devcontainers, if any
         run: |
-          docker image rm -f instar-build 2>/dev/null || true
+          docker image rm -f instar-build instar-release 2>/dev/null || true
 
       - name: Build instar
         run: |
@@ -753,12 +757,16 @@ jobs:
 
       - name: Remove previous devcontainers, if any
         run: |
-          docker image rm -f instar-build 2>/dev/null || true
+          docker image rm -f instar-build instar-release 2>/dev/null || true
 
       - name: Build instar
         run: |
           cd ${GITHUB_WORKSPACE}/instar
+          # The crossval step runs in the dev/test image (instar-build)
+          # via a raw docker run, so build it here alongside the release
+          # binary.
           make instar
+          make instar-devcontainer
 
       - name: Run oslo crossval with oslo.utils master
         run: |
