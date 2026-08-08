@@ -16,6 +16,32 @@ sudo src/target/release/instar info <IMAGE>
 sudo src/target/release/instar copy <INPUT> <OUTPUT>
 ```
 
+### Build and dev containers
+
+The build runs in Docker, and there are **two** devcontainer images:
+
+- **`instar-release`** — a minimal `debian:bullseye` image
+  (`src/.devcontainer/build/Dockerfile`) carrying only the toolchain
+  that produces the release artifacts: the C linker,
+  `protobuf-compiler`, the pinned Rust nightly with `rust-src` +
+  `llvm-tools`, `cargo-binutils`, `cargo-deb`, `cargo-generate-rpm`.
+  Used by `make instar`, `make deb`, `make rpm`. It is built on
+  bullseye deliberately: glibc is forward-compatible, so building the
+  host binary against glibc 2.31 lets one artifact run on every distro
+  down to Rocky/RHEL 9 and Ubuntu 22.04 (see
+  [installation.md](installation.md)).
+- **`instar-build`** — the full Debian dev/test image
+  (`src/.devcontainer/Dockerfile`, base pinned by digest) with
+  `qemu-utils`, the libyal parsers, `cargo-fuzz`, `cargo-audit`, and
+  `gh`. Used by everything else: `make test`, `make test-rust`, the
+  `make test-container*` targets, `make audit`, the fuzz targets, and
+  the VS Code devcontainer.
+
+`make clean-devcontainers` removes both. To prove the release binary's
+glibc floor empirically, `tools/verify-glibc-floor.sh <deb> <rpm>`
+installs the packages on every target distribution and runs
+`info`/`create`/`map` under KVM.
+
 ## Pre-commit hooks
 
 This project uses pre-commit hooks for Rust code quality:

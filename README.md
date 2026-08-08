@@ -35,7 +35,7 @@ sudo apt install "./instar_${VERSION}-1_amd64.deb"
 ```
 
 RPM and tarball artifacts are also published; you need Linux with KVM
-access (`/dev/kvm`) and glibc 2.39 or newer. See
+access (`/dev/kvm`) and glibc 2.31 or newer. See
 [docs/installation.md](https://github.com/shakenfist/instar/blob/develop/docs/installation.md)
 for all package formats, system requirements, and building from source.
 

@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Lowered the release binary's glibc floor to run on far more
+  distributions.** The `instar` binary is now built on Debian 11
+  (bullseye, glibc 2.31) instead of a rolling recent Debian, so a
+  single published artifact runs across Debian 11+, Ubuntu 22.04 LTS
+  and 24.04 LTS, Fedora, and Rocky/RHEL 9 and 10 — previously the
+  packages required glibc 2.39 and excluded Ubuntu 22.04 and
+  Rocky/RHEL 9. glibc is forward-compatible, so building on the
+  oldest supported glibc is what widens the range. The devcontainer
+  is now split into a minimal `debian:bullseye` release build image
+  (toolchain only, produces the binary and the `.deb`/`.rpm`) and the
+  existing full Debian dev/test image (qemu-utils, the libyal
+  parsers, and the fuzz/audit tooling), so lowering the floor does
+  not drag the test tooling onto an older base.
+  `tools/verify-glibc-floor.sh` installs the built packages on every
+  target distribution and exercises them under KVM as the empirical
+  acceptance check.
+
 ## [0.3.0] - 2026-08-02
 
 ### Fixed
