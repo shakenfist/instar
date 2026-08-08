@@ -339,6 +339,51 @@ stestr run --serial -- --verbose
 stestr list
 ```
 
+### Running against an installed package (distro matrix)
+
+The make targets above run the suite against the in-tree build
+(`src/target/release/instar`). The distro-matrix CI instead runs it
+against the **installed `.deb`/`.rpm`**, inside a target-distro
+container, using that distro's own `qemu-img` as the differential
+oracle. `tools/test-package-functional.sh` is the per-distro runner:
+
+```bash
+# Full suite, against the .deb installed on Debian 12 (qemu-img 7.2.x)
+tools/test-package-functional.sh src/target/debian/instar_*.deb debian:12
+
+# Fast subset, against the .rpm installed on Rocky 9 (proves the dnf path)
+tools/test-package-functional.sh --smoke \
+    src/target/generate-rpm/instar-*.rpm rockylinux:9
+
+# Dial concurrency down when several matrix containers share one KVM host
+tools/test-package-functional.sh --concurrency 2 \
+    src/target/debian/instar_*.deb ubuntu:22.04
+```
+
+The design is **tests from the source tree, binary from the package**:
+the whole `tests/` tree is copied into the container and driven by
+`stestr`, while the harness is pointed at the installed
+`/usr/bin/instar` via `INSTAR_BINARY_PATH` (so the packaged binary and
+its packaged guest binaries under `/usr/lib/instar/` are what runs).
+The container runs as root (package + prerequisite install need it) and
+the repo is mounted read-only, so no `.stestr/` artefacts leak into the
+host worktree. `test_info_malicious` and `test_bench` are excluded from
+the matrix run; `--smoke` restricts to a fast version/create/map/info
+subset for local one-distro checks.
+
+`TESTDATA_PATH` (default `../instar-testdata`) must already be git-LFS
+materialised — in CI that is `tools/ci/prepare-testdata.sh`; the script
+canary-checks for pointer files and refuses to run against them. This
+runner is distinct from `tools/test-package-install.sh`, which stays the
+fast packaging smoke check (file layout, `--help`, info/create/map).
+
+Because this exercises instar against **older** qemu-img versions than
+the dev host's, it is the first thing to surface output-format parity
+gaps that single-version CI cannot: any command whose qemu-img output
+changed across versions, where instar hard-codes the newest form, will
+diverge here. See "qemu-img version profiles and the distro matrix"
+below.
+
 ### CI job layout and the partition guard
 
 On a pull request the integration suite is split across several jobs

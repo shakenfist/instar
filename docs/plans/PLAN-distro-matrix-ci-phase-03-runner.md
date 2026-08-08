@@ -132,6 +132,57 @@ wrong and would run zero tests. The real, verified mechanics:
   reduced per-distro selection if wall-clock forces it, and must
   `log()` anything it drops (no silent truncation).
 
+## Execution results (2026-08-09)
+
+Executed on the develop/matrix-ci worktree; the runner drives real
+distro containers (deb via apt, rpm via dnf).
+
+- **Runner built and validated on both families.**
+  `tools/test-package-functional.sh` installs the package, installs
+  prerequisites, copies the `tests/` tree into the container, points the
+  harness at `/usr/bin/instar`, and runs the `stestr` suite. shellcheck
+  clean. Two script bugs were found and fixed during validation:
+  - `--smoke` used bare module names as the stestr selector, which
+    substring-matched across modules (`test_create` also selected
+    `test_snapshot`'s `test_create_list_agreement`). Anchored each with a
+    trailing `\.`.
+  - Rocky/RHEL 9's default `python3` is 3.9, but `testtools >= 2.9.1`
+    requires Python >= 3.10, so the venv build failed. The runner now
+    installs and selects `python3.12`/`python3.11` on the dnf family
+    (both are in RHEL 9 AppStream) and picks the newest `python3.x >=
+    3.10` present. (Also: `instar` has no `--version` flag; the info line
+    was corrected.)
+- **rockylinux:9 (.rpm / dnf): PASS, 0 failures** — 1225 passed, 181
+  skipped, using `python3.12` and the distro's `qemu-img 10.1.0`
+  (→ profile-10-0-0). This proves the dnf path, the provides-agnostic
+  `qemu-img || /usr/bin/qemu-img` install, the interpreter selection, and
+  the phase-1 glibc floor together. Note: Rocky 9 ships **qemu 10.1.0**,
+  not the 8.2 the master-plan matrix table estimated — the estimate is
+  stale.
+- **debian:12 (.deb / apt): runner works; suite is NOT green — it
+  surfaced two real, pre-existing instar parity gaps.** These appear only
+  against qemu older than the dev host's 10.x, so single-version CI never
+  caught them. Both stem from instar hard-coding the newest qemu output
+  while `version.rs` carries only two booleans:
+  1. **`map --output=json` emits `"compressed"` unconditionally**
+     (`src/vmm/src/main.rs:15141,15149`). qemu added the field at
+     **8.2.0** (0/38 profile-6-1-0 baselines carry it; 38/38 of
+     profile-10-0-0 do). instar diverges for any pre-8.2 emulation —
+     19 `test_map` failures on debian:12; Ubuntu 22.04 (6.2.0) is equally
+     affected.
+  2. **`snapshot -l` header format** — instar emits `VM SIZE`/`VM CLOCK`
+     + `00:00:00.000`; qemu 7.2.22 emits `VM_SIZE`/`VM_CLOCK` +
+     `0000:00:00.000`. The live-oracle `test_create_list_agreement`
+     fails on debian:12.
+- **This revises phase 2's "no version.rs widen needed" conclusion.**
+  That held for `info` (its adjacent-profile diffs are harness-
+  normalised), but `map` and `snapshot` have genuine parity gaps. Fixing
+  them is the widen-vs-document decision phase 2d reserved for
+  management, and is out of phase-3 scope (phase 3 is the runner; these
+  are instar emitter/version-model changes). Tracked as follow-up; a full
+  (non-`--smoke`) debian:12 + ubuntu:22.04 inventory run should scope the
+  complete set of pre-10.x parity gaps before the fix is designed.
+
 ## Risks
 
 - **KVM-under-load flakiness.** Seven parallel KVM containers, each at

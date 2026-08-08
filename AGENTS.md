@@ -390,6 +390,15 @@ records the `qemu-img` version each matrix distro ships. See
 ("qemu-img version profiles and the distro matrix") for the model and
 the per-distro table.
 
+`tools/test-package-functional.sh <package> <distro-image>` runs the
+full suite against the **installed** `.deb`/`.rpm` inside a target-distro
+container, using that distro's own `qemu-img` as the oracle (tests from
+the tree, binary from the package via `INSTAR_BINARY_PATH`). It is the
+per-entry runner for the distro-matrix CI and the first check to surface
+version-specific output-format parity gaps that host-only CI cannot. It
+is distinct from `tools/test-package-install.sh` (fast packaging smoke)
+and is driven across the matrix by the phase-4 `merge_group` job.
+
 ```bash
 # Set up test environment
 make test-venv
