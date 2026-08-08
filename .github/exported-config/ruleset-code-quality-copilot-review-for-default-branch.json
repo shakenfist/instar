@@ -8,7 +8,7 @@
             ]
         }
     },
-    "enforcement": "active",
+    "enforcement": "disabled",
     "name": "Code Quality Copilot review for default branch",
     "rules": [
         {
