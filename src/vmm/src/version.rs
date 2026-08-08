@@ -132,9 +132,19 @@ pub fn detect_qemu_version() -> Option<Version> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_qemu_version_output(&stdout)
+}
 
-    // Parse "qemu-img version X.Y.Z ..." or "qemu-img version X.Y ..."
-    // Example: "qemu-img version 7.2.0 (Debian 1:7.2+dfsg-7+deb12u6)"
+/// Parse a `qemu-img --version` banner into a [`Version`].
+///
+/// The version token is the whitespace-delimited word immediately after
+/// `qemu-img version `; the trailing distro parenthetical is ignored,
+/// including the Debian epoch form (`1:7.2+dfsg`) whose embedded version
+/// must not be matched. Examples:
+/// - `qemu-img version 7.2.22 (Debian 1:7.2+dfsg-7+deb12u18+b3)` -> 7.2
+/// - `qemu-img version 10.2.2 (qemu-10.2.2-1.fc44)`              -> 10.2
+/// - `qemu-img version 10.1.0 (qemu-kvm-10.1.0-17.el9_8.5)`      -> 10.1
+fn parse_qemu_version_output(stdout: &str) -> Option<Version> {
     for line in stdout.lines() {
         if let Some(rest) = line.strip_prefix("qemu-img version ") {
             // Take characters until space or end
@@ -209,6 +219,64 @@ mod tests {
         assert!(OutputProfile::for_version(Version::new(7, 2)).include_dirty_flag);
         assert!(OutputProfile::for_version(Version::new(8, 0)).include_dirty_flag);
         assert!(OutputProfile::for_version(Version::new(10, 0)).include_dirty_flag);
+    }
+
+    #[test]
+    fn test_parse_qemu_version_output_real_distro_strings() {
+        // The exact `qemu-img --version` banners the CI matrix distros
+        // ship (tools/probe-qemu-versions.sh, phase-2 step 2a). A parse
+        // failure here would silently fall back to newest() (10.0) and
+        // emit wrong output on an older-qemu distro.
+        let cases = [
+            (
+                "qemu-img version 7.2.22 (Debian 1:7.2+dfsg-7+deb12u18+b3)",
+                Version::new(7, 2),
+            ),
+            (
+                "qemu-img version 10.0.11 (Debian 1:10.0.11+ds-0+deb13u1)",
+                Version::new(10, 0),
+            ),
+            (
+                "qemu-img version 6.2.0 (Debian 1:6.2+dfsg-2ubuntu6.31)",
+                Version::new(6, 2),
+            ),
+            (
+                "qemu-img version 8.2.2 (Debian 1:8.2.2+ds-0ubuntu1.18)",
+                Version::new(8, 2),
+            ),
+            (
+                "qemu-img version 10.2.2 (qemu-10.2.2-1.fc44)",
+                Version::new(10, 2),
+            ),
+            (
+                "qemu-img version 10.1.0 (qemu-kvm-10.1.0-17.el9_8.5)",
+                Version::new(10, 1),
+            ),
+            (
+                "qemu-img version 10.1.0 (qemu-kvm-10.1.0-16.el10_2.2)",
+                Version::new(10, 1),
+            ),
+        ];
+        for (banner, expected) in cases {
+            assert_eq!(
+                parse_qemu_version_output(banner),
+                Some(expected),
+                "failed to parse: {banner}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_qemu_version_output_ignores_epoch_and_junk() {
+        // The epoch '1:7.2' in the parenthetical must not win over the
+        // leading 7.2.22 token.
+        assert_eq!(
+            parse_qemu_version_output("qemu-img version 7.2.22 (Debian 1:7.2+dfsg-7+deb12u18+b3)"),
+            Some(Version::new(7, 2))
+        );
+        // No banner line -> None (caller falls back to newest()).
+        assert_eq!(parse_qemu_version_output("qemu-img: not found"), None);
+        assert_eq!(parse_qemu_version_output(""), None);
     }
 
     #[test]

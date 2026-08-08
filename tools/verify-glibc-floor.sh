@@ -60,8 +60,10 @@ done
 #   .deb: Debian 12 (2.36), Debian 13 (2.41), Ubuntu 22.04 (2.35),
 #         Ubuntu 24.04 (2.39)
 #   .rpm: Fedora latest (2.39+), Rocky 9 (2.34), Rocky 10 (2.39)
+# Rocky 10 is not in the Docker Official `rockylinux` library (which
+# stops at 9); pull it from the maintained `rockylinux/rockylinux` org.
 DEB_DISTROS="${DEB_DISTROS:-debian:12 debian:13 ubuntu:22.04 ubuntu:24.04}"
-RPM_DISTROS="${RPM_DISTROS:-fedora:latest rockylinux:9 rockylinux:10}"
+RPM_DISTROS="${RPM_DISTROS:-fedora:latest rockylinux:9 rockylinux/rockylinux:10}"
 
 PASSED=""
 FAILED=""

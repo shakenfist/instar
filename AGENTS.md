@@ -382,6 +382,14 @@ corrupt test images, cross-validate `instar compare` output against
 `qemu-img convert`, and cross-validate `instar measure` output against
 `qemu-img measure` for raw and qcow2 targets. Tests use Python testtools/stestr.
 
+instar emulates the host's `qemu-img` version; the harness selects the
+matching output baseline profile by full `major.minor.patch`
+(`base.py::_select_version_match`). `tools/probe-qemu-versions.sh`
+records the `qemu-img` version each matrix distro ships. See
+[docs/testing.md](https://github.com/shakenfist/instar/blob/develop/docs/testing.md)
+("qemu-img version profiles and the distro matrix") for the model and
+the per-distro table.
+
 ```bash
 # Set up test environment
 make test-venv

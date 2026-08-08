@@ -1,6 +1,6 @@
 # Plan: Multi-distro install + qemu-img differential CI
 
-## Status: Planned (phases drafted), not started
+## Status: Phases 1–2 code complete; phases 3–5 drafted
 
 Rewritten 2026-08-08 from the original 2026-05-08 draft. The v0.3.0
 release has shipped and the `package-smoke` job in
@@ -200,7 +200,7 @@ logical change; at minimum one commit per phase.
 | Phase | Plan | Status |
 |-------|------|--------|
 | 1. Build/dev container split + lower glibc floor (closes #474 manually) | PLAN-distro-matrix-ci-phase-01-glibc-build.md | Code complete (steps 1b-1g landed; build base is debian:bullseye, binary floor GLIBC_2.30 verified on Rocky 9 + Debian 12; dev base digest-pinned; workflows reconciled). Remaining: operator step 1a — run tools/validate-published-release.sh on real .deb and .rpm VMs to close #474. |
-| 2. qemu-img version→profile coverage + live version-detection | PLAN-distro-matrix-ci-phase-02-qemu-profiles.md | Not started |
+| 2. qemu-img version→profile coverage + live version-detection | PLAN-distro-matrix-ci-phase-02-qemu-profiles.md | Code complete. Matrix qemu versions enumerated (tools/probe-qemu-versions.sh); full-version profile/baseline selection replaces the 7.2.19-boundary prefix bug (only Debian 12 mis-selected, and benignly — differing fields are normalised); parsers pinned both sides; docs/testing.md updated. No version.rs widen needed. Live in-container per-distro runs deferred to phase 3. |
 | 3. In-container matrix runner script | PLAN-distro-matrix-ci-phase-03-runner.md | Not started |
 | 4. Workflow integration (merge_group package-matrix job) | PLAN-distro-matrix-ci-phase-04-workflow.md | Not started |
 | 5. Enable the GitHub merge queue + live verification | PLAN-distro-matrix-ci-phase-05-merge-queue.md | Not started |

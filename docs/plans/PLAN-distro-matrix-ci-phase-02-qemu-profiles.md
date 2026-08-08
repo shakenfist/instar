@@ -110,6 +110,65 @@ never exercised; the matrix will.
   instar-testdata via a separate PR (2e).
 - `make test` still green on the dev image; `pre-commit` clean.
 
+## Execution results (2026-08-08)
+
+Executed on the develop worktree; host qemu-img 10.0.11 (Debian 13).
+
+- **2a — enumerated** via the new `tools/probe-qemu-versions.sh`. The
+  captured strings and their true vs (old) selected profile:
+
+  | Distro | `qemu-img --version` | Parsed | True profile | Old prefix-match |
+  |--------|----------------------|--------|--------------|------------------|
+  | Debian 12 | `7.2.22 (Debian 1:7.2+dfsg-7+deb12u18+b3)` | 7.2.22 | `profile-7-2-19` | `profile-6-1-0` ✗ |
+  | Debian 13 | `10.0.11 (Debian 1:10.0.11+ds-0+deb13u1)` | 10.0.11 | `profile-10-0-0` | `profile-10-0-0` |
+  | Ubuntu 22.04 | `6.2.0 (Debian 1:6.2+dfsg-2ubuntu6.31)` | 6.2.0 | `profile-6-1-0` | `profile-6-1-0` |
+  | Ubuntu 24.04 | `8.2.2 (Debian 1:8.2.2+ds-0ubuntu1.18)` | 8.2.2 | `profile-8-0-0` | `profile-8-0-0` |
+  | Fedora latest | `10.2.2 (qemu-10.2.2-1.fc44)` | 10.2.2 | `profile-10-2-0` | `profile-10-2-0` |
+  | Rocky 9 | `10.1.0 (qemu-kvm-10.1.0-17.el9_8.5)` | 10.1.0 | `profile-10-0-0` | `profile-10-0-0` |
+  | Rocky 10 | `10.1.0 (qemu-kvm-10.1.0-16.el10_2.2)` | 10.1.0 | `profile-10-0-0` | `profile-10-0-0` |
+
+  **Only Debian 12 (7.2.22) mis-selected** — exactly the predicted
+  7.2.19-boundary bug. No matrix distro ships 8.1.x, so the parallels
+  8.1 ambiguity never arises. Rocky 10 is only published under the
+  `rockylinux/rockylinux` org repo (Docker Official stops at 9); fixed
+  in `probe-qemu-versions.sh`, `verify-glibc-floor.sh`, and phase 1's
+  plan.
+
+- **2b — parsing verified.** Both parsers already read every real string
+  correctly (the Debian epoch `1:7.2` never wins over the leading
+  token). Extracted pure functions (`parse_qemu_version` in `base.py`,
+  `parse_qemu_version_output` in `version.rs`) and pinned them with
+  fixture tests over the captured strings. The Python side now retains
+  the **patch** level (`_qemu_version` is a 3-tuple), required for 2d.
+
+- **2d — selection fixed and de-duplicated.** Replaced the first-prefix
+  match with `_select_version_match` (full major.minor.patch, highest
+  ≤ host). The same buggy selector was duplicated in five baseline-dir
+  harnesses (create/resize/commit/amend/bitmap); all now delegate to the
+  shared `base.py` helpers. A matrix regression test
+  (`TestProfileSelectionMatrix`) asserts every row above against the
+  **real** testdata map. 791 selector/baseline tests pass on host qemu
+  10.x; the full Rust workspace unit tests pass.
+
+- **2c — classification: no functional divergence, no version.rs widen.**
+  The only in-matrix ambiguity (Debian 12, 6-1-0 vs 7-2-19) differs
+  between profiles solely in fields the harness normalises: `disk size`
+  (a filesystem `st_blocks*512` fact — instar emits 512 KiB uniformly,
+  verified by running `instar info` under forced `--qemu-version`) and
+  vmdk `cid` (a random nonce stripped by `assert_info_equivalent`). So
+  the mis-selection was **benign** (masked by normalisation), which is
+  why single-version CI stayed green. The fix is correctness hygiene
+  that future-proofs the boundary. **No instar-vs-qemu parity gap
+  surfaced, so version.rs stays at two booleans.** Full in-container
+  execution of the live-oracle suites against each distro's qemu-img is
+  deferred to the phase-3 runner (this host cannot `docker run` the
+  matrix directly).
+
+- **2e — no missing profile.** Debian 13's 10.0.11 and Fedora's 10.2.2
+  ship patch levels the map doesn't enumerate, but `_select_version_match`
+  resolves them (→ profile-10-0-0 / profile-10-2-0) with no output
+  change, so no new baselines were generated.
+
 ## Risks / notes
 
 - **Distro qemu output ≠ upstream-version output.** A distro can

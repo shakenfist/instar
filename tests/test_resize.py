@@ -255,20 +255,7 @@ class TestResizeSmoke(InstarTestBase):
         recorded version. Mirrors the create harness's logic at
         tests/test_create.py:_baseline_version_dir.
         """
-        root = self._baseline_root(target)
-        if not root.exists():
-            return None
-        names = [p.name for p in root.iterdir() if p.is_dir()]
-        if not names:
-            return None
-        names.sort(key=lambda v: tuple(int(p) for p in v.split('.')))
-        if self._qemu_version is not None:
-            major, minor = self._qemu_version
-            prefix = f'{major}.{minor}.'
-            matches = [n for n in names if n.startswith(prefix)]
-            if matches:
-                return root / matches[0]
-        return root / names[-1]
+        return self._pick_baseline_version_dir(self._baseline_root(target))
 
     def _baseline_stdout(self, target, case_name):
         v_dir = self._baseline_version_dir(target)

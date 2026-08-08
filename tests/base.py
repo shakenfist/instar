@@ -22,6 +22,31 @@ from helpers.comparators import (
 from helpers.types import TestImage
 
 
+def parse_qemu_version(text: str) -> Optional[Tuple[int, int, int]]:
+    """Parse (major, minor, patch) from `qemu-img --version` output.
+
+    The version token is the one immediately after 'qemu-img version ';
+    the trailing distro parenthetical is ignored, including the Debian
+    epoch form whose own embedded version must not be matched, e.g.:
+
+      'qemu-img version 7.2.22 (Debian 1:7.2+dfsg-7+deb12u18+b3)' -> (7, 2, 22)
+      'qemu-img version 10.0.11 (Debian 1:10.0.11+ds-0+deb13u1)'  -> (10, 0, 11)
+      'qemu-img version 6.2.0 (Debian 1:6.2+dfsg-2ubuntu6.31)'    -> (6, 2, 0)
+      'qemu-img version 8.2.2 (Debian 1:8.2.2+ds-0ubuntu1.18)'    -> (8, 2, 2)
+      'qemu-img version 10.2.2 (qemu-10.2.2-1.fc44)'              -> (10, 2, 2)
+      'qemu-img version 10.1.0 (qemu-kvm-10.1.0-17.el9_8.5)'      -> (10, 1, 0)
+
+    Patch defaults to 0 when absent. Returns None if no version is found.
+    Anchoring on the literal 'qemu-img version ' prefix keeps re.search
+    from matching the epoch (`1:7.2`) inside the parenthetical.
+    """
+    match = re.search(r'qemu-img version (\d+)\.(\d+)(?:\.(\d+))?', text)
+    if not match:
+        return None
+    patch = int(match.group(3)) if match.group(3) is not None else 0
+    return (int(match.group(1)), int(match.group(2)), patch)
+
+
 # Mapping from command names to output type directory prefixes
 # 'info' uses legacy names for backwards compatibility
 COMMAND_OUTPUT_DIRS = {
@@ -43,7 +68,7 @@ class InstarTestBase(testtools.TestCase):
     _manifest = None
     _images_by_id = None
     _testdata_root = None
-    _qemu_version: Optional[Tuple[int, int]] = None
+    _qemu_version: Optional[Tuple[int, int, int]] = None
     _hash_verification_results: dict = {}  # image_id -> (valid, actual_hash)
 
     @classmethod
@@ -90,9 +115,11 @@ class InstarTestBase(testtools.TestCase):
         """
         Detect the installed qemu-img version.
 
-        This is only used for tests that verify our version detection code.
-        Profile output tests don't need this - they iterate all profiles
-        explicitly with --qemu-version.
+        Records (major, minor, patch); the patch level is required to
+        distinguish output profiles that transition within a stable
+        series (e.g. qemu 7.2.18 -> 7.2.19), which the live-qemu matrix
+        exercises. Profile output tests that iterate all profiles
+        explicitly with --qemu-version don't rely on this.
         """
         if cls._qemu_version is not None:
             return
@@ -103,9 +130,9 @@ class InstarTestBase(testtools.TestCase):
                 capture_output=True,
                 text=True
             )
-            match = re.search(r'qemu-img version (\d+)\.(\d+)', result.stdout)
-            if match:
-                cls._qemu_version = (int(match.group(1)), int(match.group(2)))
+            parsed = parse_qemu_version(result.stdout)
+            if parsed is not None:
+                cls._qemu_version = parsed
         except FileNotFoundError:
             pass
 
@@ -190,6 +217,77 @@ class InstarTestBase(testtools.TestCase):
             return f'{parts[0]}.{parts[1]}'
         return parts[0]
 
+    @staticmethod
+    def _select_version_match(candidates, detected):
+        """Pick the version string from `candidates` best matching the
+        detected (major, minor, patch).
+
+        Precedence:
+        1. exact major.minor.patch match;
+        2. within the same major.minor, the highest patch <= detected
+           patch (falling to the lowest patch in that series if every
+           enumerated patch is above the detected one);
+        3. across all candidates, the highest version <= detected;
+        4. the lowest candidate overall (detected predates the matrix).
+
+        Returns the chosen candidate string, or None if `candidates`
+        yields no numeric-parseable version. When `detected` is None
+        (no qemu-img installed) the highest known version is chosen,
+        mirroring instar's own OutputProfile::newest() fallback.
+
+        This replaces the historical first-`{major}.{minor}.`-prefix
+        match, which could not distinguish 7.2.0 (profile-6-1-0) from
+        7.2.22 (profile-7-2-19) and so mis-selected on any 7.2.19+ host
+        such as Debian 12 -- the ambiguity the live-qemu matrix exposes.
+        """
+        parsed = []
+        for c in candidates:
+            try:
+                nums = tuple(int(p) for p in c.split('.'))
+            except ValueError:
+                continue
+            parsed.append(((nums + (0, 0, 0))[:3], c))
+        if not parsed:
+            return None
+        if detected is None:
+            return max(parsed)[1]
+        d = (tuple(detected) + (0, 0, 0))[:3]
+        for nums, c in parsed:
+            if nums == d:
+                return c
+        same = [(nums, c) for nums, c in parsed if nums[:2] == d[:2]]
+        below = [(nums, c) for nums, c in same if nums[2] <= d[2]]
+        if below:
+            return max(below)[1]
+        if same:
+            return min(same)[1]
+        below_all = [(nums, c) for nums, c in parsed if nums <= d]
+        if below_all:
+            return max(below_all)[1]
+        return min(parsed)[1]
+
+    def _pick_baseline_version_dir(self, root: Path) -> Optional[Path]:
+        """Return the version subdir of `root` whose name best matches
+        the installed qemu-img, or None when `root` is missing or has no
+        subdirs.
+
+        Shared by the create/resize/commit/amend/bitmap baseline
+        harnesses so they all select by full version (via
+        _select_version_match) instead of the first-prefix match each
+        used to duplicate.
+        """
+        if not root.exists():
+            return None
+        names = [p.name for p in root.iterdir() if p.is_dir()]
+        if not names:
+            return None
+        chosen = self._select_version_match(names, self._qemu_version)
+        if chosen is not None:
+            return root / chosen
+        # No parseable version dir names: fall back to the lexically
+        # last so a baseline is still exercised.
+        return root / sorted(names)[-1]
+
     def get_profile_for_installed_qemu(
         self,
         output_type: str,
@@ -202,19 +300,20 @@ class InstarTestBase(testtools.TestCase):
         format transitions across the 6.0-10.2 range), so the
         existing `next(iter(profiles['profiles']))` pattern is no
         longer safe for any command that has multiple profiles for
-        a given output_type. This helper looks up the host's
-        qemu-img version in `version_to_profile` via major-minor
-        prefix matching.
+        a given output_type. This looks up the host's qemu-img version
+        in `version_to_profile` by full major.minor.patch match
+        (_select_version_match), so a 7.2.22 host correctly selects
+        profile-7-2-19 rather than the profile-6-1-0 that a
+        `{major}.{minor}.` prefix match returned for every 7.2.x.
 
         Args:
             output_type: 'human' or 'json'
             command: 'info', 'check', 'measure', 'map', etc.
 
         Returns:
-            Profile name (e.g. 'profile-10-0-0'). Falls back to
-            the first profile in the version map when the host's
-            qemu-img version isn't in the matrix (e.g. a newer
-            qemu-img than the baselines cover); byte-equality
+            Profile name (e.g. 'profile-10-0-0'). Falls back to the
+            first profile in the version map when the host's qemu-img
+            version can't be resolved against the matrix; byte-equality
             assertions will then surface real format drift.
         """
         profiles = self.get_output_profiles(output_type, command)
@@ -222,25 +321,10 @@ class InstarTestBase(testtools.TestCase):
         if not v2p:
             return next(iter(profiles['profiles']))
 
-        if self._qemu_version is None:
+        key = self._select_version_match(v2p.keys(), self._qemu_version)
+        if key is None:
             return next(iter(v2p.values()))
-
-        major, minor = self._qemu_version
-        prefix = f'{major}.{minor}.'
-        for key, profile in v2p.items():
-            if key.startswith(prefix):
-                return profile
-        # Major-version fallback: pick the closest version with a
-        # matching major, irrespective of minor. Useful when the
-        # host runs qemu-img 10.99 and the baselines stop at 10.2.
-        major_prefix = f'{major}.'
-        for key, profile in v2p.items():
-            if key.startswith(major_prefix):
-                return profile
-        # Last resort: first entry in the map. Real format drift
-        # will fail the byte-equality assertion with a clear
-        # message.
-        return next(iter(v2p.values()))
+        return v2p[key]
 
     def get_image(self, image_id: str) -> TestImage:
         """Get a test image by its ID."""

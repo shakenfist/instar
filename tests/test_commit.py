@@ -593,14 +593,12 @@ class TestCommitBaselineMatrix(TestCommitSmoke):
         names = [p.name for p in overlay_root.iterdir() if p.is_dir()]
         if not names:
             return None, None
-        names.sort(key=_version_key)
-        chosen = names[-1]
-        if self._qemu_version is not None:
-            major, minor = self._qemu_version
-            prefix = f'{major}.{minor}.'
-            matches = [n for n in names if n.startswith(prefix)]
-            if matches:
-                chosen = matches[0]
+        # Full-version selection (base helper); the same chosen version
+        # dir name indexes both the overlay and backing baseline trees.
+        chosen = self._select_version_match(names, self._qemu_version)
+        if chosen is None:
+            names.sort(key=_version_key)
+            chosen = names[-1]
         return overlay_root / chosen, backing_root / chosen
 
     def _baseline_overlay_stdout(self, target, case_name):

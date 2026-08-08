@@ -521,6 +521,90 @@ The test suite performs exact string comparison. On failure, it shows:
 - `↵` for trailing newlines
 - Raw repr() of both outputs for debugging
 
+Before comparing, the harness normalises the fields that legitimately
+vary between runs rather than between qemu versions:
+
+- **Disk size / actual-size** is substituted from the live filesystem
+  (`st_blocks * 512`, `helpers/comparators.get_disk_size`), because it
+  reflects the current file's allocation, not a format decision. instar
+  computes it the same way, so it always matches.
+- **vmdk `cid`/`parent-cid`, the dirty flag, and vhdx log-size** are
+  stripped by `assert_info_equivalent` — a vmdk content-ID is a random
+  nonce written at creation, not a stable output.
+
+This matters for the version matrix: two adjacent baseline profiles
+often differ *only* in these normalised fields (see below), so a profile
+mismatch is invisible to the assertions until a genuinely version-gated
+field changes.
+
+## qemu-img version profiles and the distro matrix
+
+instar emulates the `qemu-img` build installed on the host so its output
+is byte-identical to the real tool. Two mechanisms cooperate:
+
+**Runtime model (`src/vmm/src/version.rs`).** instar runs
+`qemu-img --version`, parses `major.minor.patch`, and derives just two
+booleans: `include_child_node` (qemu ≥ 8.0 adds the `Child node '/file'`
+section) and `include_dirty_flag` (qemu ≥ 6.1 exposes the dirty flag).
+If qemu-img is absent it falls back to the newest profile. `--qemu-version`
+overrides detection.
+
+**Baseline profiles (instar-testdata).** Because qemu changed some output
+*within* stable series, `expected-outputs/<command>/version-map.json`
+records several empirical profiles (e.g. `profile-6-1-0`, `profile-7-2-19`,
+`profile-8-0-0`, `profile-8-1-0`, `profile-10-0-0`, `profile-10-2-0`) and a
+`version_to_profile` map from full version strings to profile names.
+
+**Selecting a profile for the host qemu.** `base.py`
+`get_profile_for_installed_qemu` / `_pick_baseline_version_dir` resolve
+the host version against the map with **full major.minor.patch matching**
+(`_select_version_match`): exact match, else the highest enumerated
+version ≤ the host within the same `major.minor`, else the highest
+version ≤ the host overall. A `{major}.{minor}.` *prefix* match (the
+previous behaviour) could not tell `7.2.0` (profile-6-1-0) from `7.2.22`
+(profile-7-2-19) and mis-selected on any 7.2.19+ host such as Debian 12.
+The single-qemu-version CI never exposed this; the distro matrix does.
+
+**Portable vs version-specific tests.** `test_info_safe` and the
+`--qemu-version` baseline suites (create/resize/amend/commit/bitmap)
+drive instar with an explicit version per profile and compare to the
+stored baseline — they are qemu-version-independent and pass identically
+on every distro. The live-oracle suites (`test_convert`, `test_compare`,
+`test_dd`, `test_check_*`, `test_map`, `test_measure`,
+`test_oslo_crossval`) use the host's real qemu-img as the differential
+oracle and pick their comparison profile from the detected version, so
+they are the ones the matrix actually exercises.
+
+**The CI matrix (`tools/probe-qemu-versions.sh`).** The `qemu-img`
+version each matrix distro ships, and the profile it selects:
+
+| Distro | `qemu-img --version` | Profile |
+|--------|----------------------|---------|
+| Debian 12 (bookworm) | 7.2.22 | `profile-7-2-19` |
+| Debian 13 (trixie)   | 10.0.11 | `profile-10-0-0` |
+| Ubuntu 22.04 (jammy) | 6.2.0  | `profile-6-1-0` |
+| Ubuntu 24.04 (noble) | 8.2.2  | `profile-8-0-0` |
+| Fedora latest        | 10.2.2 | `profile-10-2-0` |
+| Rocky/RHEL 9         | 10.1.0 | `profile-10-0-0` |
+| Rocky/RHEL 10        | 10.1.0 | `profile-10-0-0` |
+
+Run `tools/probe-qemu-versions.sh` to refresh this table (it pulls each
+image and prints its `qemu-img --version`). Rocky 10 is pulled from the
+`rockylinux/rockylinux` org repo — the Docker Official `rockylinux`
+library stops at 9. Regression tests pinning the parser and the selection
+rule against these exact strings live in `tests/test_version_detection.py`
+and `src/vmm/src/version.rs`.
+
+**Known divergences.** None specific to the matrix. Only Debian 12's
+7.2.22 lands in a `major.minor` (7.2) whose profile transitions mid-series
+(at 7.2.19), so it is the only distro the full-version fix changes. The
+profile-6-1-0 vs profile-7-2-19 baselines differ *only* in normalised
+fields (disk size, vmdk cid), so the selection is correctness hygiene
+that also future-proofs against a later version-gated field appearing at
+that boundary. Full in-container execution of the live-oracle suites
+against every distro's qemu-img is the job of the in-container runner
+(matrix-CI phase 3).
+
 ## Environment Variables
 
 | Variable | Description |
