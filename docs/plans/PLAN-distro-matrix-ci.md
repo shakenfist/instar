@@ -199,7 +199,7 @@ logical change; at minimum one commit per phase.
 
 | Phase | Plan | Status |
 |-------|------|--------|
-| 1. Build/dev container split + lower glibc floor (closes #474 manually) | PLAN-distro-matrix-ci-phase-01-glibc-build.md | Not started |
+| 1. Build/dev container split + lower glibc floor (closes #474 manually) | PLAN-distro-matrix-ci-phase-01-glibc-build.md | Code complete (steps 1b-1g landed; build base is debian:bullseye, binary floor GLIBC_2.30 verified on Rocky 9 + Debian 12; dev base digest-pinned; workflows reconciled). Remaining: operator step 1a — run tools/validate-published-release.sh on real .deb and .rpm VMs to close #474. |
 | 2. qemu-img version→profile coverage + live version-detection | PLAN-distro-matrix-ci-phase-02-qemu-profiles.md | Not started |
 | 3. In-container matrix runner script | PLAN-distro-matrix-ci-phase-03-runner.md | Not started |
 | 4. Workflow integration (merge_group package-matrix job) | PLAN-distro-matrix-ci-phase-04-workflow.md | Not started |
