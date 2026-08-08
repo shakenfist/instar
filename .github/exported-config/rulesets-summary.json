@@ -1,6 +1,6 @@
 [
     {
-        "enforcement": "active",
+        "enforcement": "disabled",
         "id": 19389569,
         "name": "Code Quality Copilot review for default branch",
         "target": "branch"
