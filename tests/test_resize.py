@@ -857,7 +857,7 @@ class TestResizeErrorPaths(TestResizeSmoke):
                 'format Qed is not supported for in-place resize',
                 stderr,
             )
-            self.assertEqual(
+            self.assert_bytes_identical(
                 path.read_bytes(), before,
                 'a refused resize must not touch the qed file',
             )

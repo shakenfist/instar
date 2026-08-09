@@ -398,6 +398,19 @@ per-entry runner for the distro-matrix CI and the first check to surface
 version-specific output-format parity gaps that host-only CI cannot. It
 is distinct from `tools/test-package-install.sh` (fast packaging smoke)
 and is driven across the matrix by the phase-4 `merge_group` job.
+`--select REGEX` replays a single failure on one distro, which matters
+because two containers sharing a KVM host produce timeout failures that
+mimic real divergences — always re-run uncontended before attributing
+one. The runner also refuses to report a **truncated** run as a pass
+(see docs/testing.md); do not weaken that guard.
+
+Two facts about distro qemu that the version model does not capture:
+RHEL-family `qemu-kvm` omits the `qed`, `qcow`, `parallels`, `dmg`,
+`bochs` and `cloop` drivers, so tests needing qemu-img as the oracle for
+those formats must call `skip_unless_qemu_supports()`; and image buffers
+must be compared with `assert_bytes_identical()` rather than
+`assertEqual`, because a multi-megabyte mismatch exceeds subunit's
+packet limit and silently truncates the run.
 
 ```bash
 # Set up test environment

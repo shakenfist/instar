@@ -178,7 +178,7 @@ class TestCommitErrorPaths(TestCommitSmoke):
                 "format 'qed' does not support commit (qcow2 and vmdk only)",
                 stderr,
                 f'unexpected stderr: {stderr}')
-            self.assertEqual(
+            self.assert_bytes_identical(
                 overlay.read_bytes(), before,
                 'a refused commit must not touch the qed overlay')
 

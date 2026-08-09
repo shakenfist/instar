@@ -1237,7 +1237,7 @@ class TestBitmapRefusals(TestBitmapSmoke):
                 f'instar should refuse a qed image; stderr={stderr!r}')
             self.assertIn('not a qcow2 image', stderr,
                           f'unexpected stderr: {stderr!r}')
-            self.assertEqual(
+            self.assert_bytes_identical(
                 path.read_bytes(), before,
                 'a refused bitmap op must not touch the qed image')
 

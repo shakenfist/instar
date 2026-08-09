@@ -150,7 +150,13 @@ Executed on the develop worktree; host qemu-img 10.0.11 (Debian 13).
   **real** testdata map. 791 selector/baseline tests pass on host qemu
   10.x; the full Rust workspace unit tests pass.
 
-- **2c — classification: no functional divergence, no version.rs widen.**
+- **2c — PARTIAL on 2026-08-08 (host-only); completed 2026-08-09.** The
+  original entry below stands for what it measured, but its deferral of
+  the in-container live-oracle runs left the step unfinished; see
+  "2c completion" after the 2e entry for the full-matrix results, which
+  overturn its "no version.rs widen" conclusion.
+
+- **2c (2026-08-08, host-only) — classification: no functional divergence.**
   The only in-matrix ambiguity (Debian 12, 6-1-0 vs 7-2-19) differs
   between profiles solely in fields the harness normalises: `disk size`
   (a filesystem `st_blocks*512` fact — instar emits 512 KiB uniformly,
@@ -168,6 +174,87 @@ Executed on the develop worktree; host qemu-img 10.0.11 (Debian 13).
   ship patch levels the map doesn't enumerate, but `_select_version_match`
   resolves them (→ profile-10-0-0 / profile-10-2-0) with no output
   change, so no new baselines were generated.
+
+## 2c completion — full matrix live-oracle runs (2026-08-09)
+
+The deferred half of 2c: the full suite run in-container against every
+matrix distro's own qemu-img, via the phase-3 runner. (The 2026-08-08
+note claimed this host could not `docker run` the matrix; it can, and
+does.) Divergences are attributed per 2c's rule, and every failure was
+re-run **uncontended** before being called real — running two containers
+at once saturates KVM and manufactures timeout failures that mimic
+divergences (five such false positives appeared and all cleared).
+
+| Distro | qemu | Ran | Real failures |
+|--------|------|-----|---------------|
+| Debian 12 | 7.2.22 | 3253 | 21 — 19 map + 1 snapshot + 1 vpc |
+| Ubuntu 22.04 | 6.2.0 | 3253 | 21 — same three classes |
+| Ubuntu 24.04 | 8.2.2 | 3253 | 2 — 1 snapshot + 1 vpc, **0 map** |
+| Debian 13 | 10.0.11 | 3253 | 0 |
+| Fedora | 10.2.2 | 3253 | 0 |
+| Rocky 9 | 10.1.0 | 3253 | 0 (846 skipped: 785 baseline + 61 no-oracle) |
+| Rocky 10 | 10.1.0 | 3253 | 0 (846 skipped, same split) |
+
+Every distro now runs the whole 3253-test suite. The Rocky rows are
+the fixed state: the last raw run showed 1 failure on Rocky 9 and 5 on
+Rocky 10, of which one (`test_dd`'s `test_input_parallels`) was a
+missing capability skip — added — and four were load artifacts that
+passed on an idle host.
+
+Attribution:
+
+- **Legitimate qemu-version output differences → phase 2b.** The map,
+  snapshot and qcow1→vpc classes are instar emitting its newest-qemu
+  output regardless of the emulated version. Ubuntu 24.04 is the useful
+  new data point: **zero** map failures at 8.2.2 confirms the `compressed`
+  boundary at 8.2 from the live side, independently of the baselines,
+  while snapshot and vpc still fail there — so the snapshot boundary is
+  **above 8.2**, which the testdata alone could not establish (2b-B's
+  blocker). This is the widen-vs-document decision 2c reserved for
+  management, and it is phase 2b's subject.
+- **Distro capability, not version → fixed here.** RHEL-family qemu-kvm
+  is built without the `qed`, `qcow`, `parallels`, `dmg`, `bochs` and
+  `cloop` drivers (verified by direct probe on Rocky 9 *and* 10; Debian
+  carries all of them). Tests using qemu-img as the oracle for those
+  formats had no oracle and failed. The version-profile model cannot
+  express this — two hosts can report the same qemu version and disagree
+  about which formats open. Added `skip_unless_qemu_supports()` to
+  `tests/base.py` and applied it to the seven classes that need such an
+  oracle; the instar-only suites (check-refusal, adversarial) keep
+  running there, so this costs no Rocky coverage of instar itself.
+- **Harness defect, not a divergence → fixed here.** A failing
+  comparison of two multi-megabyte image buffers exceeds subunit v2's
+  ~4MB packet limit (`ValueError: Length too long`), killing the stestr
+  worker; its remaining tests never run and stestr still exits 0 if
+  nothing else failed. A Rocky run therefore reported "0 failures"
+  having executed **454 of 3253** tests — which is almost certainly what
+  the phase-3 note recording "rockylinux:9 full run: 0 failures"
+  actually saw. Added `assert_bytes_identical()` (reports sizes and the
+  first differing offset, never the buffers) and converted the 21 whole
+  image comparisons; the runner now fails on the crash marker, on any
+  `N/A` worker, and on a full-run test count far below ~3250, so a
+  truncated run can never again be reported as a pass.
+
+- **Host load manufactures failures that look like data corruption.**
+  Nine failures across this inventory were load artifacts — two matrix
+  containers sharing the KVM host, and later a stray `find /` of mine
+  competing with a run. They are not benign-looking: the large
+  `test_convert` re-encodes fail under load as
+  `Error: "convert operation failed"` and
+  `Content mismatch at offset 0!`, which reads as a correctness bug, and
+  they abort early (26s) rather than timing out at the ~110s the test
+  needs when it passes. Every one of them passed serially on an idle
+  host. **Never attribute a matrix failure without an uncontended
+  replay** (`--select`); phase 4 must also bound how many matrix entries
+  share a runner, or the queue will see these as real.
+
+- **2f — docs.** `docs/testing.md` said "Known divergences: None specific
+  to the matrix", which the runs disproved. It now carries the measured
+  divergence table with its affected distros, the capability-vs-version
+  distinction and how to probe it, the truncation trap, and the
+  contention-replay discipline. `AGENTS.md` gained the two rules an agent
+  can otherwise violate silently (use `skip_unless_qemu_supports` and
+  `assert_bytes_identical`; do not weaken the truncation guard).
 
 ## Risks / notes
 

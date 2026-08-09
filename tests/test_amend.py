@@ -586,7 +586,7 @@ class TestAmendRefusals(TestAmendSmoke):
             self.assertIn(
                 'only qcow2 images can be amended', stderr,
                 f'unexpected stderr: {stderr!r}')
-            self.assertEqual(
+            self.assert_bytes_identical(
                 path.read_bytes(), before,
                 'a refused amend must not touch the qed image')
 

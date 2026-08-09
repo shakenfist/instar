@@ -69,6 +69,7 @@ class InstarTestBase(testtools.TestCase):
     _images_by_id = None
     _testdata_root = None
     _qemu_version: Optional[Tuple[int, int, int]] = None
+    _qemu_formats: dict = {}  # format name -> driver present?
     _hash_verification_results: dict = {}  # image_id -> (valid, actual_hash)
 
     @classmethod
@@ -395,6 +396,112 @@ class InstarTestBase(testtools.TestCase):
                 f'  Actual SHA256:   {actual_hash}\n'
                 f'Regenerate baselines in instar-testdata or update manifest hash.'
             )
+
+    @classmethod
+    def qemu_img_supports_format(cls, fmt: str) -> bool:
+        """
+        Whether the installed qemu-img carries the block driver for *fmt*.
+
+        Distro qemu builds do not all ship the same drivers. RHEL-family
+        qemu-kvm (Rocky/RHEL 9 and 10) is built without qed, qcow (qcow1),
+        parallels, dmg, bochs and cloop, all of which Debian's qemu-utils
+        does carry. That is a *capability* difference and is orthogonal to
+        the version-profile model, which encodes only the qemu version --
+        two hosts can report the same version and still disagree about
+        which formats qemu-img can open.
+
+        It matters because this suite uses qemu-img as its differential
+        oracle. Where the driver is absent there is no oracle to compare
+        against, so the honest outcome is a skip, not a failure.
+
+        Detected by asking qemu-img to open a nonexistent file with an
+        explicit format: a missing driver reports "Unknown driver 'fmt'",
+        while a present one gets as far as complaining that the file does
+        not exist. That wording is stable across the matrix (verified on
+        qemu 7.2 and 10.1); `qemu-img --help` is not usable here because
+        qemu 10.x dropped its "Supported formats:" line.
+        """
+        if fmt in cls._qemu_formats:
+            return cls._qemu_formats[fmt]
+
+        supported = True
+        try:
+            result = subprocess.run(
+                ['qemu-img', 'info', '-f', fmt,
+                 '/nonexistent-instar-capability-probe.img'],
+                capture_output=True, text=True, timeout=30
+            )
+            if 'Unknown driver' in (result.stderr + result.stdout):
+                supported = False
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            # No qemu-img at all is a separate problem; leave the decision
+            # to the tests that actually invoke it.
+            supported = True
+
+        cls._qemu_formats[fmt] = supported
+        return supported
+
+    def skip_unless_qemu_supports(self, *formats: str) -> None:
+        """
+        Skip unless the host qemu-img can open every named format.
+
+        Use this in any test that relies on qemu-img as the oracle for a
+        format the RHEL-family builds omit (qed, qcow, parallels, dmg,
+        bochs, cloop). Without it those tests fail on Rocky/RHEL for a
+        reason that has nothing to do with instar.
+        """
+        missing = [f for f in formats if not self.qemu_img_supports_format(f)]
+        if missing:
+            self.skipTest(
+                f'host qemu-img has no driver for: {", ".join(missing)}. '
+                f'This qemu build cannot act as the differential oracle '
+                f'for these formats (RHEL-family qemu-kvm omits them).'
+            )
+
+    def assert_bytes_identical(
+        self, actual: bytes, expected: bytes, msg: str = ''
+    ) -> None:
+        """
+        Assert two byte buffers are identical without ever rendering them.
+
+        Image buffers here run to megabytes. testtools renders both sides
+        of a failed assertEqual, and subunit v2 refuses to write a packet
+        over ~4MB -- it raises "ValueError: Length too long", which kills
+        the stestr worker mid-stream. Every test still queued on that
+        worker then silently never runs, and stestr exits 0 if nothing
+        else failed, so a truncated run looks like a pass. That is how a
+        Rocky run reported "0 failures" having executed 454 of 3253 tests
+        (matrix-CI phase 2c).
+
+        Report sizes, the first differing offset and a short hex window
+        instead -- which is more useful for diagnosis than a megabyte of
+        hex anyway.
+        """
+        if actual == expected:
+            return
+
+        detail = [msg] if msg else []
+        detail.append(f'sizes: actual={len(actual)} expected={len(expected)}')
+
+        offset = None
+        for i in range(min(len(actual), len(expected))):
+            if actual[i] != expected[i]:
+                offset = i
+                break
+        if offset is None:
+            offset = min(len(actual), len(expected))
+            detail.append(
+                f'common prefix of {offset} bytes is identical; the buffers '
+                f'differ only in length'
+            )
+        else:
+            lo = max(0, offset - 16)
+            hi = offset + 16
+            detail.append(f'first difference at byte {offset}')
+            detail.append(f'  actual  [{lo}:{hi}]: {actual[lo:hi].hex()}')
+            detail.append(f'  expected[{lo}:{hi}]: {expected[lo:hi].hex()}')
+
+        self.fail('\n'.join(detail))
 
     def get_instar_binary(self) -> Path:
         """Get path to the instar binary."""

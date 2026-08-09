@@ -358,7 +358,24 @@ tools/test-package-functional.sh --smoke \
 # Dial concurrency down when several matrix containers share one KVM host
 tools/test-package-functional.sh --concurrency 2 \
     src/target/debian/instar_*.deb ubuntu:22.04
+
+# Replay one failure on one distro without paying for the whole suite
+tools/test-package-functional.sh --select 'test_convert\.' \
+    src/target/debian/instar_*.deb debian:13
 ```
+
+**Classify before you attribute.** Running two matrix containers at
+once — or any other heavy job on the host — starves the suite, and the
+resulting failures do not look like resource problems. The large
+`test_convert` re-encodes fail under load with
+`Error: "convert operation failed"` and `Content mismatch at offset 0!`,
+which reads as data corruption, and they abort early (~26s) rather than
+timing out at the ~110s they need when passing. Nine such failures
+appeared across the 2026-08-09 matrix inventory and **every one passed
+on an idle host**. A failure counts as a divergence only once it
+reproduces with the host otherwise quiet; `--select` gives you that
+replay cheaply. Same discipline as the differential-fuzzing
+spurious-divergence rule.
 
 The design is **tests from the source tree, binary from the package**:
 the whole `tests/` tree is copied into the container and driven by
@@ -640,15 +657,55 @@ library stops at 9. Regression tests pinning the parser and the selection
 rule against these exact strings live in `tests/test_version_detection.py`
 and `src/vmm/src/version.rs`.
 
-**Known divergences.** None specific to the matrix. Only Debian 12's
-7.2.22 lands in a `major.minor` (7.2) whose profile transitions mid-series
-(at 7.2.19), so it is the only distro the full-version fix changes. The
+**Profile selection is not the whole story.** Debian 12's 7.2.22 is the
+only distro whose `major.minor` (7.2) transitions profile mid-series (at
+7.2.19), so it is the only one the full-version fix re-points, and the
 profile-6-1-0 vs profile-7-2-19 baselines differ *only* in normalised
-fields (disk size, vmdk cid), so the selection is correctness hygiene
-that also future-proofs against a later version-gated field appearing at
-that boundary. Full in-container execution of the live-oracle suites
-against every distro's qemu-img is the job of the in-container runner
-(matrix-CI phase 3).
+fields (disk size, vmdk cid). Running the live-oracle suites against
+every distro's real qemu-img (via
+`tools/test-package-functional.sh`) then found divergences the baseline
+comparison never could — see below.
+
+**Known divergences (measured 2026-08-09, full suite on all seven).**
+instar hard-codes its newest-qemu output for two commands, so it
+diverges on distros shipping an older qemu:
+
+| Divergence | Affected distros | Status |
+|------------|------------------|--------|
+| `map --output=json` emits `compressed` unconditionally; qemu added the field at **8.2** | Debian 12 (7.2.22), Ubuntu 22.04 (6.2.0) — 19 tests each | matrix-CI phase 2b |
+| `snapshot -l` header form (`VM_SIZE`/`0000:00:00.000` vs the older `VM SIZE`/`00:00:00.000`); the change lands **above 8.2** | Debian 12, Ubuntu 22.04, Ubuntu 24.04 (8.2.2) | matrix-CI phase 2b |
+| `convert` qcow1→vpc drops the final 8192 bytes vs qemu's qcow1→raw (a VHD CHS-geometry difference) | Debian 12, Ubuntu 22.04, Ubuntu 24.04 | matrix-CI phase 2b, pending a real old-qemu oracle |
+
+Ubuntu 24.04 (8.2.2) shows **no** `map` failures, which confirms the 8.2
+boundary from the live side; Debian 13, Fedora and Rocky (all ≥ 10.0)
+are clean.
+
+**qemu capability is not the same as qemu version.** Distro qemu builds
+do not all carry the same block drivers, and the version-profile model
+says nothing about this. RHEL-family `qemu-kvm` (Rocky/RHEL 9 and 10) is
+built **without** the `qed`, `qcow` (qcow1), `parallels`, `dmg`, `bochs`
+and `cloop` drivers that Debian's `qemu-utils` carries — so on those
+distros qemu-img cannot act as the differential oracle for those formats
+at all. Tests that need such an oracle call
+`skip_unless_qemu_supports(fmt)` (`tests/base.py`), which probes the
+driver by opening a nonexistent file with an explicit format and looking
+for `Unknown driver`; tests that exercise instar alone (the check-refusal
+and adversarial suites) keep running there. Detect capability this way
+rather than from `qemu-img --help`, whose "Supported formats:" line qemu
+10.x no longer prints.
+
+**A truncated run must never look green.** subunit v2 refuses to write a
+packet larger than ~4MB, so a failing assertion that renders a
+multi-megabyte image buffer raises `ValueError: Length too long` and
+kills the stestr worker. Every test still queued on that worker silently
+never runs, and stestr exits 0 if nothing else failed — a partial run
+that reports as a pass (one Rocky run "passed" having executed 454 of
+3253 tests). Two defences: compare image buffers with
+`assert_bytes_identical` (`tests/base.py`), which reports sizes and the
+first differing offset rather than the buffers, and
+`tools/test-package-functional.sh`, which fails the run outright on the
+crash marker, on any worker reporting `N/A` elapsed time, or on a
+full-suite test count far below the expected ~3250.
 
 ## Environment Variables
 

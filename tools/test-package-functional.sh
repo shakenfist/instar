@@ -10,6 +10,12 @@
 #   --smoke            Run only a fast KVM-exercising subset (version
 #                      detection, safe info, create, map) instead of the
 #                      full suite. For quick local one-distro checks.
+#   --select REGEX     Run only tests matching REGEX (a stestr selection
+#                      regex). Use it to replay a specific failure on one
+#                      distro without paying for the whole suite --
+#                      classifying a failure as a real divergence needs an
+#                      uncontended re-run, and this is how you get one.
+#                      Mutually exclusive with --smoke.
 #   --concurrency N    stestr worker count (default 4). Lower it when
 #                      several matrix containers share one KVM host.
 #   -h, --help         Show this help.
@@ -19,6 +25,8 @@
 #       src/target/debian/instar_*.deb debian:12
 #   tools/test-package-functional.sh --smoke \
 #       src/target/generate-rpm/instar-*.rpm rockylinux:9
+#   tools/test-package-functional.sh --select 'test_convert\.' \
+#       src/target/debian/instar_*.deb debian:13
 #
 # Environment:
 #   TESTDATA_PATH   instar-testdata working tree to mount read-only at
@@ -52,10 +60,11 @@
 set -euo pipefail
 
 SMOKE=0
+SELECT=''
 CONCURRENCY=4
 
 usage() {
-    sed -n '2,49p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,58p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 POSITIONAL=()
@@ -64,6 +73,14 @@ while [ $# -gt 0 ]; do
         --smoke)
             SMOKE=1
             shift
+            ;;
+        --select)
+            SELECT="${2:-}"
+            if [ -z "$SELECT" ]; then
+                echo "Error: --select needs a regex" >&2
+                exit 2
+            fi
+            shift 2
             ;;
         --concurrency)
             CONCURRENCY="${2:-}"
@@ -163,16 +180,24 @@ fi
 # value here, so it is excluded from the default full run too.
 EXCLUDE_RE='(test_info_malicious|test_bench)'
 SELECT_RE=''
+if [ "$SMOKE" -eq 1 ] && [ -n "$SELECT" ]; then
+    echo "Error: --smoke and --select are mutually exclusive" >&2
+    exit 2
+fi
 if [ "$SMOKE" -eq 1 ]; then
     # Anchor each module name with a trailing '\.' so the selector cannot
     # leak into unrelated modules by substring (e.g. bare "test_create"
     # would also match test_snapshot's test_create_list_agreement).
     SELECT_RE='(test_version_detection\.|test_info_safe\.|test_create\.|test_map\.)'
+elif [ -n "$SELECT" ]; then
+    SELECT_RE="$SELECT"
 fi
 
 echo "=== Functional-testing $PKG_FILE on $DISTRO_IMAGE ==="
 if [ "$SMOKE" -eq 1 ]; then
     echo "    mode: smoke subset, concurrency $CONCURRENCY"
+elif [ -n "$SELECT" ]; then
+    echo "    mode: selection '$SELECT', concurrency $CONCURRENCY"
 else
     echo "    mode: full suite, concurrency $CONCURRENCY"
 fi
@@ -249,7 +274,43 @@ fi
 if [ -n "$SELECT_RE" ]; then
     STESTR_ARGS+=("$SELECT_RE")
 fi
-/tmp/test-venv/bin/stestr "${STESTR_ARGS[@]}"
+set +e
+/tmp/test-venv/bin/stestr "${STESTR_ARGS[@]}" 2>&1 | tee /tmp/stestr-output.txt
+STESTR_RC=${PIPESTATUS[0]}
+set -e
+
+# Truncation guard. A stestr worker that dies mid-stream (the subunit v2
+# packet-size limit is one real way: a test attaching more than ~4MB of
+# captured output raises "ValueError: Length too long") silently drops
+# every remaining test in that worker. stestr then reports a totals block
+# for the tests it did see and exits 0 if none of them failed -- a
+# partial run that looks green. Never let that pass as a result.
+if grep -q "Length too long" /tmp/stestr-output.txt; then
+    echo "" >&2
+    echo "Error: a stestr worker died on the subunit packet-size limit" >&2
+    echo "(a test attached >4MB of captured output). The run is PARTIAL:" >&2
+    echo "the tests remaining in that worker never executed." >&2
+    exit 1
+fi
+if grep -qE "^ - Worker [0-9]+ \([0-9]+ tests\) => N/A" /tmp/stestr-output.txt; then
+    echo "" >&2
+    echo "Error: stestr reported a worker with no elapsed time (N/A)," >&2
+    echo "which means that worker crashed rather than finishing. The run" >&2
+    echo "is PARTIAL and its result is not trustworthy." >&2
+    exit 1
+fi
+if [ -z "$SELECT_RE" ]; then
+    # Full-suite floor. The suite is ~3250 tests; anything dramatically
+    # short means the run was cut off before stestr noticed.
+    RAN=$(sed -n "s/^Ran: \([0-9]*\) tests.*/\1/p" /tmp/stestr-output.txt | tail -n1)
+    if [ -n "$RAN" ] && [ "$RAN" -lt 2500 ]; then
+        echo "" >&2
+        echo "Error: full run executed only $RAN tests (expected ~3250)." >&2
+        echo "The run was truncated; treat it as a failure, not a pass." >&2
+        exit 1
+    fi
+fi
+exit "$STESTR_RC"
 '
 
 set +e

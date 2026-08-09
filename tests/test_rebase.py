@@ -197,7 +197,7 @@ class TestRebaseErrorPaths(TestRebaseSmoke):
                 "format 'Qed' does not support rebase (qcow2 and vmdk only)",
                 stderr,
                 f'unexpected stderr: {stderr}')
-            self.assertEqual(
+            self.assert_bytes_identical(
                 overlay.read_bytes(), before,
                 'a refused rebase must not touch the qed overlay')
 
