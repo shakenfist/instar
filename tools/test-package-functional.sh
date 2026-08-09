@@ -192,7 +192,12 @@ if [ "$PKG_KIND" = deb ]; then
     apt-get update -qq
     apt-get install -y -q "/pkg/$PKG_FILE"
     # Every .deb matrix distro ships python3 >= 3.10 by default.
-    apt-get install -y -q python3 python3-venv python3-pip qemu-utils
+    # qemu-storage-daemon is the oracle for the bitmap differential
+    # tests; Debian 12 (bookworm) ships it in qemu-system-common, while
+    # Debian 13 (trixie) moved it into qemu-utils. Installing both covers
+    # every .deb distro (the extra package is harmless where redundant).
+    apt-get install -y -q python3 python3-venv python3-pip \
+        qemu-utils qemu-system-common
 else
     dnf install -y --setopt=install_weak_deps=False "/pkg/$PKG_FILE"
     # The test deps (testtools >= 2.9.1) require Python >= 3.10, but some
