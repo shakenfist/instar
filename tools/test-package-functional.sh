@@ -232,6 +232,13 @@ else
     dnf install -y python3 python3-pip || true
     # The package that *provides* qemu-img differs across EL streams.
     dnf install -y qemu-img || dnf install -y /usr/bin/qemu-img
+    # qemu-storage-daemon is the oracle for the bitmap differential
+    # tests. Fedora ships it as its own package; some EL streams do not
+    # package it at all, so this is best-effort -- the tests skip
+    # cleanly when it is missing rather than erroring.
+    dnf install -y qemu-storage-daemon || \
+        dnf install -y /usr/bin/qemu-storage-daemon || \
+        echo "note: qemu-storage-daemon unavailable; bitmap oracle tests will skip"
 fi
 
 # Pick a Python >= 3.10 for the test venv (testtools requirement).

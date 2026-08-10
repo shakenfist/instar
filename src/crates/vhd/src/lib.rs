@@ -1064,11 +1064,30 @@ pub fn build_footer(
     write_be_u64(buf, FOOTER_DATA_OFFSET_OFFSET, data_offset);
     // Timestamp: 0 (we don't track creation time)
     write_be_u32(buf, FOOTER_TIMESTAMP_OFFSET, 0);
-    // Creator application: "imgo"
-    buf[FOOTER_CREATOR_APP_OFFSET] = b'i';
-    buf[FOOTER_CREATOR_APP_OFFSET + 1] = b'm';
-    buf[FOOTER_CREATOR_APP_OFFSET + 2] = b'g';
-    buf[FOOTER_CREATOR_APP_OFFSET + 3] = b'o';
+    // Creator application: "qem2".
+    //
+    // This is qemu's `force_size` marker, and it is load-bearing
+    // rather than cosmetic. qemu's vpc_open derives the disk size
+    // from the footer's CHS geometry unless the creator app is
+    // "win " (Hyper-V) or "qem2", or the CHS is at its maximum.
+    // instar keeps the requested size verbatim and writes the
+    // VHD-spec FLOOR geometry for sizes qemu itself would never
+    // produce (see `footer_geometry`), so its CHS product can
+    // address less than the declared current_size — for a 2 MiB
+    // image, 8192 bytes less. With any other creator app every
+    // qemu before 10.0 therefore reads instar's VHDs short and
+    // silently truncates the tail; qemu 10.0 changed the default,
+    // which is why this stayed invisible on a 10.x dev host.
+    //
+    // "qem2" makes every version from 6.0.0 to 10.2.0 honour
+    // current_size, which is exactly the "current_size is
+    // authoritative" contract `footer_geometry` already documents.
+    // Verified against instar-testdata's static per-version
+    // qemu-img builds; see PLAN-distro-matrix-ci-phase-02b.
+    buf[FOOTER_CREATOR_APP_OFFSET] = b'q';
+    buf[FOOTER_CREATOR_APP_OFFSET + 1] = b'e';
+    buf[FOOTER_CREATOR_APP_OFFSET + 2] = b'm';
+    buf[FOOTER_CREATOR_APP_OFFSET + 3] = b'2';
     // Creator version: 1.0
     write_be_u32(buf, FOOTER_CREATOR_VERSION_OFFSET, 0x0001_0000);
     // Creator host OS: "Wi2k" (Windows) — standard value
@@ -1325,6 +1344,54 @@ mod tests {
         // Verify checksum
         let computed = compute_checksum(&buf, FOOTER_CHECKSUM_OFFSET);
         assert_eq!(footer.checksum, computed);
+    }
+
+    #[test]
+    fn build_footer_creator_app_is_qem2() {
+        // Do not "tidy" this to a friendlier identifier. qemu's
+        // vpc_open uses the footer's CHS product as the disk size
+        // unless the creator app is "win " or "qem2" (or the CHS is
+        // maxed), and instar writes floor geometry that can address
+        // less than current_size. Any other creator app makes every
+        // qemu before 10.0 truncate instar's VHDs.
+        let mut buf = [0u8; 512];
+        build_footer(
+            &mut buf,
+            2 * 1024 * 1024,
+            DISK_TYPE_DYNAMIC,
+            512,
+            &[0u8; 16],
+        );
+        assert_eq!(
+            &buf[FOOTER_CREATOR_APP_OFFSET..FOOTER_CREATOR_APP_OFFSET + 4],
+            b"qem2",
+        );
+    }
+
+    #[test]
+    fn build_footer_declares_a_size_old_readers_can_reach() {
+        // The defect this guards: a footer whose CHS product is
+        // smaller than current_size is only safe because "qem2"
+        // tells the reader to ignore the geometry. Assert the pairing
+        // holds for the sizes that exposed it -- 2 MiB floors to
+        // 60/4/17 = 2088960, 8192 short of the declared 2097152.
+        for size in [2 * 1024 * 1024u64, 100 * 1024 * 1024, 1024 * 1024 * 1024] {
+            let mut buf = [0u8; 512];
+            build_footer(&mut buf, size, DISK_TYPE_DYNAMIC, 512, &[0u8; 16]);
+            let footer = VhdFooter::parse(&buf).unwrap();
+            assert_eq!(footer.current_size, size);
+
+            let (c, h, s) = footer_geometry(size);
+            let chs_bytes = c as u64 * h as u64 * s as u64 * 512;
+            if chs_bytes < size {
+                assert_eq!(
+                    &buf[FOOTER_CREATOR_APP_OFFSET..FOOTER_CREATOR_APP_OFFSET + 4],
+                    b"qem2",
+                    "size {size} has under-addressing CHS ({chs_bytes}) and so \
+                     REQUIRES the qem2 creator app to be read correctly",
+                );
+            }
+        }
     }
 
     #[test]

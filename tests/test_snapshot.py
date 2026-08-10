@@ -42,12 +42,13 @@ UTC and the DATE column is local-time-rendered.
 Skip taxonomy (mirrors test_map.py):
   1. Image file missing on disk (sparse checkouts).
   2. Baseline meta reports non-zero exit (qemu-img couldn't list).
-  3. Old-profile host: if the resolved profile is not profile-10-0-0
-     (i.e. qemu-img < 9.0.0), the list matrix skips with a
-     docs/quirks.md pointer — instar targets the modern ≥9.0 format.
-  4. instar returns non-zero for a list operation (format gap, not
+  3. instar returns non-zero for a list operation (format gap, not
      regression; add to KNOWN_SNAPSHOT_DIVERGENCES if deliberate).
-  5. No baseline file for the resolved profile.
+  4. No baseline file for the resolved profile.
+
+There is deliberately no "old qemu-img" skip: since phase 2b instar
+emits whichever column layout the detected version uses, so every
+profile is byte-comparable on every host.
 """
 
 import hashlib
@@ -62,9 +63,6 @@ from pathlib import Path
 
 from base import InstarTestBase
 
-# The profile name that marks the ≥9.0.0 / modern output format.
-# list-matrix tests skip when the host resolves to an older profile.
-_MODERN_PROFILE = 'profile-10-0-0'
 
 # DATE column pattern for regex normalisation in create round-trips.
 # Matches 'YYYY-MM-DD HH:MM:SS' so freshly-created snapshot dates
@@ -165,12 +163,14 @@ class TestSnapshotSmoke(InstarTestBase):
 class TestSnapshotListHuman(TestSnapshotSmoke):
     """Byte-compare ``instar snapshot -l`` against the phase 10 profile.
 
+    Runs against whichever profile the host qemu-img resolves to; both
+    the pre-9.0 and 9.0+ layouts are compared byte-for-byte.
+
     Skip taxonomy:
       1. Image file missing on disk.
       2. Baseline meta reports non-zero exit.
-      3. Host resolves to old profile (qemu-img < 9.0.0).
-      4. instar returns non-zero for the list.
-      5. No baseline file for the resolved profile.
+      3. instar returns non-zero for the list.
+      4. No baseline file for the resolved profile.
     """
 
 
@@ -178,16 +178,14 @@ def _make_list_human_test(image_id):
     """Factory: one test method per baselined snapshot image."""
 
     def test(self):
-        # Skip 3: old-profile host.
+        # instar emits whichever layout the host qemu-img uses (the
+        # columns changed at 9.0.0), so every profile is comparable.
+        # This used to skip on any pre-9.0 host because instar only
+        # ever emitted the modern form -- which meant Debian 12 and
+        # Ubuntu 22.04 silently tested nothing here. See phase 2b.
         profile_name = self.get_profile_for_installed_qemu(
             output_type='human', command='snapshot-list',
         )
-        if profile_name != _MODERN_PROFILE:
-            self.skipTest(
-                f'host qemu-img resolves to old profile {profile_name!r}; '
-                f'instar snapshot targets the modern ≥9.0 format — '
-                f'see docs/quirks.md cross-version note'
-            )
 
         # Skip divergence.
         divergence = KNOWN_SNAPSHOT_DIVERGENCES.get(image_id)

@@ -311,6 +311,18 @@ class TestBitmapSmoke(InstarTestBase):
         read-only export. Needs no /dev/kvm. The daemon is always torn
         down and the sockets removed in a `finally`.
         """
+        # An absent oracle is a skip, not an error. qemu-storage-daemon
+        # is packaged separately from qemu-img and is not available on
+        # every distro in the CI matrix (the .deb family gets it from
+        # qemu-system-common or qemu-utils; some EL streams ship no
+        # equivalent at all). Without it there is nothing to compare
+        # against, so the differential assertion cannot run -- the same
+        # discipline as base.py's skip_unless_qemu_supports().
+        if shutil.which('qemu-storage-daemon') is None:
+            self.skipTest(
+                'qemu-storage-daemon not installed; the bitmap differential '
+                'oracle is unavailable on this distro')
+
         tmpd = tempfile.mkdtemp(prefix='bitmap-oracle.')
         nbd_sock = os.path.join(tmpd, 'nbd.sock')
         qmp_sock = os.path.join(tmpd, 'qmp.sock')

@@ -410,7 +410,18 @@ RHEL-family `qemu-kvm` omits the `qed`, `qcow`, `parallels`, `dmg`,
 those formats must call `skip_unless_qemu_supports()`; and image buffers
 must be compared with `assert_bytes_identical()` rather than
 `assertEqual`, because a multi-megabyte mismatch exceeds subunit's
-packet limit and silently truncates the run.
+packet limit and silently truncates the run. An oracle that is simply
+absent (`qemu-storage-daemon` on some EL streams) is a `skipTest`, never
+an error.
+
+**Never guess a qemu version boundary — measure it.** instar-testdata
+carries 80 static per-version `qemu-img` builds under
+`qemu-img-binaries/x86_64/<version>/`, 6.0.0 through 10.2.0, that run
+directly on the host. Every boundary in `version::OutputProfile` was
+established by running the real binary; the version maps and profile
+baselines have been wrong before, and so has reasoning from qemu source.
+`info`, `map` and `snapshot` all accept `--qemu-version`, so both sides
+of a boundary are testable on the dev host without a distro container.
 
 ```bash
 # Set up test environment

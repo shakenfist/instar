@@ -77,6 +77,29 @@ pub struct OutputProfile {
     /// Added in qemu-img 6.1. Before 6.1, dirty images were detected but the
     /// flag was not exposed in the output.
     pub include_dirty_flag: bool,
+
+    /// Include the "present" key in `map --output=json` extents.
+    /// Added in qemu-img 6.1.0 (measured: absent at 6.0.1, present at
+    /// 6.1.0), the same release that exposed the dirty flag. No distro
+    /// in the CI matrix ships anything this old — the oldest is Ubuntu
+    /// 22.04 at 6.2.0 — so only the cross-profile baseline tests
+    /// exercise this boundary.
+    pub include_map_present: bool,
+
+    /// Include the "compressed" key in `map --output=json` extents.
+    /// Added in qemu-img 8.2.0: measured absent at 8.1.5 and present at
+    /// 8.2.0 against instar-testdata's static per-version qemu-img
+    /// builds, and confirmed live by Ubuntu 24.04 (8.2.2), which shows
+    /// no map divergence while every pre-8.2 distro does.
+    pub include_map_compressed: bool,
+
+    /// Use the qemu-img 9.0+ `snapshot -l` column layout: `VM_SIZE` /
+    /// `VM_CLOCK` titles, space-separated widths 7/16/8/19/15/10, and a
+    /// 4-digit-hour clock. Before 9.0 the titles are `VM SIZE` /
+    /// `VM CLOCK`, the fields are concatenated with no separators at
+    /// widths 10/18/7/20/13/11, and hours are 2-digit. The boundary is
+    /// exactly 9.0.0, measured across 6.0.0-10.2.0.
+    pub snapshot_underscored_columns: bool,
 }
 
 impl OutputProfile {
@@ -85,12 +108,21 @@ impl OutputProfile {
     /// The profile features are determined by version thresholds:
     /// - `include_dirty_flag`: true for version >= 6.1
     /// - `include_child_node`: true for major >= 8
+    /// - `include_map_present`: true for version >= 6.1
+    /// - `include_map_compressed`: true for version >= 8.2
+    /// - `snapshot_underscored_columns`: true for major >= 9
     pub fn for_version(v: Version) -> Self {
         Self {
             version: Some(v),
             include_child_node: v.major >= 8,
             // Dirty flag output was added in qemu-img 6.1
             include_dirty_flag: v.major > 6 || (v.major == 6 && v.minor >= 1),
+            // map --output=json gained "present" in qemu-img 6.1
+            include_map_present: v.major > 6 || (v.major == 6 && v.minor >= 1),
+            // map --output=json gained "compressed" in qemu-img 8.2
+            include_map_compressed: v.major > 8 || (v.major == 8 && v.minor >= 2),
+            // snapshot -l switched to the underscored layout in qemu-img 9.0
+            snapshot_underscored_columns: v.major >= 9,
         }
     }
 
@@ -219,6 +251,60 @@ mod tests {
         assert!(OutputProfile::for_version(Version::new(7, 2)).include_dirty_flag);
         assert!(OutputProfile::for_version(Version::new(8, 0)).include_dirty_flag);
         assert!(OutputProfile::for_version(Version::new(10, 0)).include_dirty_flag);
+    }
+
+    #[test]
+    fn test_profile_map_compressed() {
+        // qemu-img map --output=json gained the "compressed" key in
+        // 8.2.0. Measured directly: absent at 8.1.5, present at 8.2.0
+        // (instar-testdata qemu-img-binaries/x86_64), and confirmed
+        // live by Ubuntu 24.04 (8.2.2) showing no map divergence.
+        for (major, minor) in [(6, 0), (6, 2), (7, 2), (8, 0), (8, 1)] {
+            assert!(
+                !OutputProfile::for_version(Version::new(major, minor)).include_map_compressed,
+                "{major}.{minor} predates the compressed field"
+            );
+        }
+        for (major, minor) in [(8, 2), (9, 0), (10, 0), (10, 2)] {
+            assert!(
+                OutputProfile::for_version(Version::new(major, minor)).include_map_compressed,
+                "{major}.{minor} emits the compressed field"
+            );
+        }
+    }
+
+    #[test]
+    fn test_profile_map_present() {
+        // "present" arrived in 6.1.0 alongside the dirty flag.
+        // Measured: absent at 6.0.0 and 6.0.1, present from 6.1.0.
+        assert!(!OutputProfile::for_version(Version::new(6, 0)).include_map_present);
+        for (major, minor) in [(6, 1), (6, 2), (7, 2), (8, 2), (10, 2)] {
+            assert!(
+                OutputProfile::for_version(Version::new(major, minor)).include_map_present,
+                "{major}.{minor} emits the present field"
+            );
+        }
+    }
+
+    #[test]
+    fn test_profile_snapshot_columns() {
+        // qemu-img snapshot -l switched from `VM SIZE`/`VM CLOCK` to
+        // `VM_SIZE`/`VM_CLOCK` (and 2- to 4-digit hours) at exactly
+        // 9.0.0; 8.2.2 still emits the old layout. Measured across
+        // 6.0.0 through 10.2.0.
+        for (major, minor) in [(6, 0), (7, 2), (8, 0), (8, 2)] {
+            assert!(
+                !OutputProfile::for_version(Version::new(major, minor))
+                    .snapshot_underscored_columns,
+                "{major}.{minor} uses the pre-9.0 snapshot layout"
+            );
+        }
+        for (major, minor) in [(9, 0), (9, 2), (10, 0), (10, 2)] {
+            assert!(
+                OutputProfile::for_version(Version::new(major, minor)).snapshot_underscored_columns,
+                "{major}.{minor} uses the 9.0+ snapshot layout"
+            );
+        }
     }
 
     #[test]

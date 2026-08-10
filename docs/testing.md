@@ -666,19 +666,55 @@ every distro's real qemu-img (via
 `tools/test-package-functional.sh`) then found divergences the baseline
 comparison never could — see below.
 
-**Known divergences (measured 2026-08-09, full suite on all seven).**
-instar hard-codes its newest-qemu output for two commands, so it
-diverges on distros shipping an older qemu:
+**Known divergences (found 2026-08-09, fixed in phase 2b 2026-08-10).**
+instar used to hard-code its newest-qemu behaviour for three things, so
+it diverged on every distro shipping an older qemu. All three are now
+version-gated:
 
-| Divergence | Affected distros | Status |
-|------------|------------------|--------|
-| `map --output=json` emits `compressed` unconditionally; qemu added the field at **8.2** | Debian 12 (7.2.22), Ubuntu 22.04 (6.2.0) — 19 tests each | matrix-CI phase 2b |
-| `snapshot -l` header form (`VM_SIZE`/`0000:00:00.000` vs the older `VM SIZE`/`00:00:00.000`); the change lands **above 8.2** | Debian 12, Ubuntu 22.04, Ubuntu 24.04 (8.2.2) | matrix-CI phase 2b |
-| `convert` qcow1→vpc drops the final 8192 bytes vs qemu's qcow1→raw (a VHD CHS-geometry difference) | Debian 12, Ubuntu 22.04, Ubuntu 24.04 | matrix-CI phase 2b, pending a real old-qemu oracle |
+| Divergence | Affected distros | Boundary | Status |
+|------------|------------------|----------|--------|
+| `map --output=json` emitted `compressed` unconditionally | Debian 12 (7.2.22), Ubuntu 22.04 (6.2.0) — 19 tests each | **8.2.0** (absent at 8.1.5) | Fixed: gated on `include_map_compressed` |
+| `map --output=json` emitted `present` unconditionally | none in the matrix (oldest is 6.2.0) | **6.1.0** (absent at 6.0.1) | Fixed: gated on `include_map_present` |
+| `snapshot -l` used the newer column layout unconditionally | Debian 12, Ubuntu 22.04, Ubuntu 24.04 (8.2.2) | **9.0.0** (8.2.2 is old-form) | Fixed: gated on `snapshot_underscored_columns` |
+| Every VHD instar wrote declared a size its CHS geometry did not cover, so qemu < 10.0 read it short and truncated the tail | Debian 12, Ubuntu 22.04, Ubuntu 24.04, RHEL 9 | reader default changed at **10.0.0** | Fixed: the writer now stamps creator app `qem2` |
 
-Ubuntu 24.04 (8.2.2) shows **no** `map` failures, which confirms the 8.2
-boundary from the live side; Debian 13, Fedora and Rocky (all ≥ 10.0)
-are clean.
+The third was not an output-format divergence at all but silent data
+loss in the VHD writer, found because the qcow1→vpc test compares a
+flattened round-trip. See `docs/quirks.md` ("VHD Virtual Size
+Calculation") and phase 2b's plan.
+
+One divergence remains documented rather than fixed: instar applies the
+qemu 10.0+ VHD size rule to VHDs with an *unrecognised* creator app,
+where a pre-10.0 qemu-img would use the CHS product. It needs an image
+whose creator app is outside the known table and whose CHS disagrees
+with its disk_size, and no such image exists in the corpus. The rule is
+evaluated guest-side, so gating it would mean widening the guest ABI.
+
+**How the boundaries were measured.** instar-testdata ships 80 static
+per-version `qemu-img` builds at `qemu-img-binaries/x86_64/<version>/`,
+covering 6.0.0 to 10.2.0. Run the real binary rather than reasoning
+from the version map or from qemu source — two of the three boundaries
+above were initially recorded wrongly from indirect evidence:
+
+```bash
+TD=../instar-testdata
+$TD/qemu-img-binaries/x86_64/8.1.5/qemu-img map --output=json image.qcow2
+$TD/qemu-img-binaries/x86_64/9.0.0/qemu-img snapshot -l image.qcow2
+```
+
+Both `map` and `snapshot` accept `--qemu-version` (as `info` already
+did), so both sides of every boundary are exercisable on the dev host
+rather than only inside the matrix.
+
+**Cross-profile baseline tests.** The ordinary baseline tests compare
+only against the profile matching the *installed* qemu-img, so a
+single-version host checks exactly one side of every boundary — which
+is how the `compressed` divergence survived to the distro matrix.
+`TestMapCrossProfile` drives `--qemu-version` for every profile the
+version map declares and compares against that profile's own
+baselines, so a new boundary is caught wherever the suite runs. It
+immediately found one the matrix could not: `map --output=json` gained
+`present` in 6.1.0, and no matrix distro is old enough to notice.
 
 **qemu capability is not the same as qemu version.** Distro qemu builds
 do not all carry the same block drivers, and the version-profile model

@@ -78,7 +78,9 @@ verbatim (old is 79 chars, new is 80):
     ID      TAG               VM_SIZE                DATE        VM_CLOCK     ICOUNT
 
 The old layout is a single concatenated printf with **no separators**
-and different widths — `%-10s%-18s%7s%20s%13s%11s` — where the current
+and different widths — `%-10s%-16s%9s%20s%13s%11s` (the 18/7 split
+recorded when this plan was drafted is indistinguishable for any tag
+that fits its field; see the execution notes) — where the current
 (≥9.0) emitter at `main.rs:16177` uses space-separated
 `{:<7} {:<16} {:>8} {:>19} {:>15} {:>10}`. The clock also narrows:
 `%02d:%02d:%02d.%03d` (12 chars) below 9.0 versus the 4-digit-hour
@@ -86,7 +88,11 @@ and different widths — `%-10s%-18s%7s%20s%13s%11s` — where the current
 second rendering branch, not a title swap. Verify the reconstruction
 byte-for-byte against the static builds before writing code:
 
-    ID %-10s | TAG %-18s | VM SIZE %7s | DATE %20s | VM CLOCK %13s | ICOUNT %11s
+    ID %-10s | TAG %-16s | VM SIZE %9s | DATE %20s | VM CLOCK %13s | ICOUNT %11s
+
+Derive field widths by growing an input past the field boundary, not by
+reading a single row: adjacent (pad, width) pairs that sum the same are
+indistinguishable until something overflows.
 
 ### The `snapshot-list-human` testdata baselines are wrong
 
@@ -231,6 +237,129 @@ pre-boundary distro rather than on the dev host. 2b-A does that first.
   phase introduces (2b-A/2b-B/2b-C).
 - Full functional suite green on all seven matrix distros (2b-H);
   `make test` green; `pre-commit` clean.
+
+## Execution results (2026-08-10)
+
+All steps implemented on the `matrix-ci` branch. Each fix was verified
+against the real per-version `qemu-img` binaries, not just against the
+test suite.
+
+**2b-A.** `resolve_output_profile()` replaces the inline resolution in
+`run_info`; `map` and `snapshot` now accept `--qemu-version` and pass
+the profile into their renderers. `run_snapshot` resolves the profile
+before dispatch, so a bogus version is refused in the mutating modes
+too rather than silently ignored.
+
+**2b-B.** `include_map_compressed` (≥8.2) gates the key, which is now
+omitted rather than emitted false. Verified emulating 8.1.5, 8.2.0 and
+10.0.0: instar's output matches the corresponding real binary
+byte-for-byte, including the separators either side of the gap.
+
+2b-B also added `TestMapCrossProfile`, which drives `--qemu-version`
+for every profile the version map declares instead of only the
+installed one — the coverage gap that let `compressed` reach the distro
+matrix undetected. **It immediately found a fourth boundary the matrix
+could never have found:** `map --output=json` gained `present` in
+6.1.0 (absent at 6.0.1, the same release that exposed the dirty flag),
+and the oldest matrix distro is Ubuntu 22.04 at 6.2.0. Gated on
+`include_map_present`. Both keys are now built as complete fragments so
+the surrounding separators and field order cannot drift.
+
+**2b-C.** `snapshot_underscored_columns` (≥9.0) selects between the two
+layouts, with `format_qemu_snapshot_clock_legacy` for the 2-digit hour.
+Verified against 8.2.2 and 9.0.0: byte-identical on both sides.
+
+The pre-9.0 widths in the grounding facts above were **wrong**, and the
+error survived every short-tag comparison. `%-18s%7s` and `%-16s%9s`
+render identically for any tag that fits its field — 18+7 == 16+9 — and
+diverge only once the tag overflows and its padding disappears. The
+real widths are **10/16/9/20/13/11**, derived by growing a tag from 1
+to 40 characters against real qemu 8.2.2 and watching where the VM SIZE
+column lands, rather than by reading a sample row. A regression test
+pins the overflow case for both layouts.
+
+Two process points from this. First, it was caught only because
+removing a stale skip (below) let the 200-character-tag fixture run
+against a real 7.2.22 oracle; deriving a format from one sample row is
+not measurement. Second, `TestSnapshotListHuman` had skipped entirely
+on any pre-9.0 host since the layout was introduced — "instar targets
+the modern ≥9.0 format" — so Debian 12 and Ubuntu 22.04 were asserting
+nothing there. That skip is now removed, which is what turned the
+matrix run into a real check.
+
+**2b-D.** The raw per-version captures were correct all along — only
+the derived `profiles/` were stale, so `detect-profiles.py` regenerated
+them cleanly and the version map (already split at 9.0.0) did not move.
+Added `validate_profiles()` to that script, which now refuses to commit
+a profile tree whose `.stdout.txt` sizes contradict their `.meta.json`
+`stdout_bytes`, or where two profiles of one output type have identical
+stdout. Confirmed it flags the original defect (12 errors) and passes
+on the fixed tree. The audit across every output type is clean;
+`create-info-json`'s 80 identical profiles are redundant but legitimate
+and are exempted by the "more than one profile" condition.
+
+**2b-E.** `build_footer` stamps `qem2`. Every version from 6.0.0 to
+10.2.0 now reports the declared size for an instar-written VHD, and the
+qcow1→vpc flatten is byte-identical to the reference raw on 6.2.0,
+7.2.22, 8.2.2 and 10.0.0 (previously 8192 bytes short on the first
+three). `test_convert_qcow1_to_vpc` passes. Two unit tests pin the
+creator app and, more importantly, the *reason*: the second asserts
+that any size whose CHS product under-addresses `current_size` is
+accompanied by `qem2`.
+
+**2b-F. Decided: document, do not widen the ABI.** The fixture the plan
+asked for was built by restamping the creator app on instar's own vpc
+output and reading it with eight qemu versions:
+
+| Creator app | qemu < 10.0 | qemu ≥ 10.0 | instar |
+|-------------|-------------|-------------|--------|
+| `vpc ` | CHS | CHS | CHS (agrees) |
+| `win `, `qem2` | current_size | current_size | current_size (agrees) |
+| `xen `, `azur`, zeros | **CHS** | current_size | current_size (**diverges below 10.0**) |
+
+So the divergence is real, but only for a creator app outside the known
+table whose CHS disagrees with its `current_size`. No such image exists
+in the corpus, and after 2b-E instar cannot produce one. The rule is
+evaluated guest-side (`src/operations/info/src/main.rs:747`), so gating
+it means widening the guest ABI to carry the emulated version — which
+the plan explicitly says not to do speculatively. Recorded as a known
+divergence in `docs/quirks.md` with the measurements. **If a real image
+in this class ever turns up, the fix is an additive
+`InfoResultMessage` field carrying the CHS product so the host can
+apply the version rule without the guest needing to know the version.**
+
+**2b-G.** The dnf branch of the runner never installed
+`qemu-storage-daemon`. Measured on rockylinux:9: the *package* of that
+name does not exist on EL9 (`Unable to find a match`), but the binary
+is shipped by `qemu-img` itself, which the runner already installs. So
+the oracle was available all along and the 53 `test_bitmap` tests —
+including the `TestBitmapMergeBits` and `TestBitmapCrossValidation`
+cases that actually drive it — run and pass on Rocky exactly as they
+do on the .deb distros. The runner now asks for the binary by path
+(`dnf install /usr/bin/qemu-storage-daemon`) so the dependency is
+explicit rather than incidental, and `_bitmap_dirty_extents` skips if
+it is ever genuinely missing. The skip is a safety net that correctly
+did not fire, not a workaround: no bitmap coverage is lost on the RPM
+family.
+
+**2b-H.** Dev host: Rust unit tests 0-fail; the full integration suite
+runs 3344 tests 0-fail (up from 3335 — the cross-profile tests). Full
+matrix, each row run **sequentially** on an idle host so no result is a
+load artifact, 3262 tests per row (the runner also excludes
+`test_bench`):
+
+| Distro (qemu) | Before | After |
+|---------------|--------|-------|
+| debian:12 (7.2.22) | 21 failed | **0** |
+| ubuntu:22.04 (6.2.0) | 21 failed | **0** |
+| ubuntu:24.04 (8.2.2) | 2 failed | **0** |
+| debian:13 (10.0.11) | 0 | **0** |
+| fedora (10.2.2) | 0 | **0** |
+| rockylinux:9 (10.1.0) | 0 | **0** (847 skipped: 785 baseline + 62 no-oracle) |
+| rockylinux/rockylinux:10 (10.1.0) | 0 | **0** (847 skipped) |
+
+The three ≥10.0 rows are not a formality: 2b-E changes the footer bytes
+of every VHD instar writes, on every distro.
 
 ## Risks / notes
 
