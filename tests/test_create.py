@@ -815,42 +815,43 @@ class TestCreateBaselineMatrix(TestCreateSmoke):
     sides via the divergence whitelist, and asserts byte-equivalence
     against the version-matched baseline recorded in instar-testdata.
 
-    Bypasses ``get_expected_output()`` and reads
-    ``expected-outputs/create-info-json/<target>/<version>/<case>.stdout.txt``
-    directly — phase 7's ``detect-profiles.py`` flat-copies into
-    ``profiles/profile-NN/`` keyed by case-name only, so collisions
-    between targets (1M-default, 64M-default, 1G-default) silently
-    overwrite. Reading the raw per-target bucket sidesteps the bug.
-    The fix is logged as a phase-7 follow-up in phase 8's plan.
+    Reads the derived profile for the host's qemu-img, the same way
+    every other output type does. This class used to bypass the profile
+    layer and read the raw per-target buckets, because
+    ``detect-profiles.py`` flat-copied into ``profiles/profile-NN/``
+    under bare case names and the five targets' shared cases
+    (1M-default, 64M-default, 1G-default) silently overwrote each other,
+    leaving only vmdk. The generator now names create-info-json profile
+    files ``<target>-<case>``, so the workaround is gone.
     """
 
     @classmethod
-    def _baseline_root(cls, target):
+    def _profile_dir(cls, profile):
         return (cls._testdata_root / 'expected-outputs' /
-                'create-info-json' / target)
+                'create-info-json' / 'profiles' / profile)
 
-    def _baseline_version_dir(self, target):
-        """Pick the version dir under <target>/ matching the installed
-        qemu-img. Falls back to the most-recent recorded version.
+    def _baseline_profile(self):
+        """Resolve the create-info-json profile matching the host qemu."""
+        return self.get_profile_for_installed_qemu('json', 'create')
 
-        Returns the Path, or None if the matrix isn't populated for
-        this target.
+    def _baseline_path(self, target, case_name, suffix):
+        """Path to one baseline file, or None when it isn't recorded.
+
+        create-info-json qualifies every profile filename with its
+        target bucket, so ``vhd-`` and ``vhdx-`` stay distinct and a
+        name is derivable from (target, case) without listing the
+        directory.
         """
-        return self._pick_baseline_version_dir(self._baseline_root(target))
-
-    def _baseline_stdout(self, target, case_name):
-        v_dir = self._baseline_version_dir(target)
-        if v_dir is None:
-            return None
-        p = v_dir / f'{case_name}.stdout.txt'
+        p = self._profile_dir(self._baseline_profile()) / (
+            f'{target}-{case_name}.{suffix}')
         return p if p.exists() else None
 
+    def _baseline_stdout(self, target, case_name):
+        return self._baseline_path(target, case_name, 'stdout.txt')
+
     def _baseline_meta(self, target, case_name):
-        v_dir = self._baseline_version_dir(target)
-        if v_dir is None:
-            return None
-        p = v_dir / f'{case_name}.meta.json'
-        if not p.exists():
+        p = self._baseline_path(target, case_name, 'meta.json')
+        if p is None:
             return None
         with open(p) as f:
             return json.load(f)
@@ -886,19 +887,23 @@ class TestCreateBaselineMatrix(TestCreateSmoke):
     def test_create_cases_match_baselines(self):
         """Every baseline on disk must have a matching CREATE_CASES entry.
 
-        Walks <testdata>/expected-outputs/create-info-json/<target>/<version>/
-        for each known target and asserts the set of <case>.stdout.txt
-        filenames matches the case-name set in CREATE_CASES[target].
-        Catches drift between this mirror and the generator.
+        Walks the host's create-info-json profile and asserts that, for
+        each target, the set of <target>-<case>.stdout.txt files matches
+        the case-name set in CREATE_CASES[target]. Catches drift between
+        this mirror and the generator.
         """
+        profile_dir = self._profile_dir(self._baseline_profile())
+        if not profile_dir.is_dir():
+            self.skipTest(f'no create-info-json profile at {profile_dir}')
+
         for target, cases in CREATE_CASES.items():
-            v_dir = self._baseline_version_dir(target)
-            if v_dir is None:
-                self.skipTest(f'no baseline dir for target {target}')
+            prefix = f'{target}-'
             on_disk = {
-                p.stem.rsplit('.stdout', 1)[0]
-                for p in v_dir.glob('*.stdout.txt')
+                p.name[len(prefix):-len('.stdout.txt')]
+                for p in profile_dir.glob(f'{prefix}*.stdout.txt')
             }
+            if not on_disk:
+                self.skipTest(f'no baselines for target {target}')
             in_mirror = {c[0] for c in cases}
             missing_from_mirror = on_disk - in_mirror
             missing_from_disk = in_mirror - on_disk

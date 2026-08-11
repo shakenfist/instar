@@ -569,7 +569,8 @@ provides a modular architecture with:
   `tests/test_create.py` cross-validate the create writer on
   three surfaces: per-`(target, case)` comparison via
   `qemu-img info` against phase 7's recorded baselines
-  (`instar-testdata/expected-outputs/create-info-json/<target>/`);
+  (the `create-info-json` profile matching the host's
+  qemu-img, whose files are named `<target>-<case>`);
   runtime cross-validation creating the same image twice
   (instar + system qemu-img) and comparing via `instar info`;
   and full-matrix `instar check` round-trip for writer/reader
@@ -1176,7 +1177,15 @@ of the same image. The create baselines bucket by target format
 (`create-info-json/<target>/<version>/<case-name>.{stdout,…}`)
 and run a two-step pipeline (`qemu-img create` then `qemu-img
 info --output=json`) — the recorded artefact is the info JSON
-on the produced fixture, not create's own log line. Per-
+on the produced fixture, not create's own log line. Case names
+like `1M-default` recur under every target, so `detect-profiles.py`
+names create-info-json's derived profile files `<target>-<case>`;
+flattening them under bare names silently discarded four of the
+five targets until 2026-08-11. Output types whose case names
+already encode the target (dd, map, measure, snapshot-list) are
+left unprefixed, so the prefix is decided per output type rather
+than per file and a consumer can always build the name it wants
+from `(target, case)`. Per-
 invocation random fields (vmdk `cid` / `parent-cid`, vhdx
 header-id) prevent dedup from collapsing duplicate-output
 versions, so each version gets its own profile; phase 8's

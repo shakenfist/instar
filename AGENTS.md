@@ -423,6 +423,19 @@ baselines have been wrong before, and so has reasoning from qemu source.
 `info`, `map` and `snapshot` all accept `--qemu-version`, so both sides
 of a boundary are testable on the dev host without a distro container.
 
+**A green suite does not mean the baselines are right.** The derived
+`expected-outputs/*/profiles/` directories have been silently wrong
+twice while the `raw/` captures they come from were correct — once for
+`snapshot-list-human`, once for `create-info-json`, where every profile
+carried 10.2.0's output and four of five target formats had been
+overwritten out of existence. Neither showed up as a failure: a test
+that skips on the host's qemu version, or asserts only that a profile
+*exists*, passes just as loudly as one that compares bytes. When a
+baseline is suspect, diff `profiles/` against `raw/` and check the
+recorded `*_stdout_bytes` in each `.meta.json`, which is what
+`detect-profiles.py`'s `validate_profiles()` now does before it will
+commit anything.
+
 ```bash
 # Set up test environment
 make test-venv
