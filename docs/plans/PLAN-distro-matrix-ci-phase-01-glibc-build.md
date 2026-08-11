@@ -109,7 +109,7 @@ not the stripped build image.
 
 | Step | Effort | Model | Isolation | Brief for sub-agent |
 |------|--------|-------|-----------|---------------------|
-| 1a | low | (operator) | none | **Close #474 (manual, Michael-run).** Produce a copy-paste validation script + expected-output checklist: on a clean KVM-capable Debian/Ubuntu VM, `apt install ./instar_0.3.0-1_amd64.deb`, then `instar info` + `instar create` + `instar map` on a sample qcow2; on Fedora-latest or Rocky 10, the same with the published `.rpm`. The sub-agent writes the script + checklist only; Michael runs it on real VMs, posts results to #474, and closes it. This is the human baseline the matrix must reproduce; it is independent of the bullseye work (the shipped v0.3.0 artifacts are glibc-2.41 trixie builds). |
+| 1a | low | (operator) | none | **Done 2026-08-11 — see "Step 1a outcome" below. Close #474 (manual, Michael-run).** Produce a copy-paste validation script + expected-output checklist: on a clean KVM-capable Debian/Ubuntu VM, `apt install ./instar_0.3.0-1_amd64.deb`, then `instar info` + `instar create` + `instar map` on a sample qcow2; on Fedora-latest or Rocky 10, the same with the published `.rpm`. The sub-agent writes the script + checklist only; Michael runs it on real VMs, posts results to #474, and closes it. This is the human baseline the matrix must reproduce; it is independent of the bullseye work (the shipped v0.3.0 artifacts are glibc-2.41 trixie builds). |
 | 1b | high | opus | worktree | **Create `src/.devcontainer/build/Dockerfile`** — the bullseye build image. `FROM debian:bullseye`. Install `protobuf-compiler`, `curl ca-certificates git`, then rustup with `--default-toolchain ${RUST_NIGHTLY}` (`ARG RUST_NIGHTLY=nightly-2026-07-22`, matching the dev image byte-for-byte), `rustup component add rust-src llvm-tools-preview`, and `cargo install cargo-binutils cargo-deb cargo-generate-rpm`. Reproduce the `/build` world-writable CARGO_HOME/RUSTUP_HOME/`umask 0000`/PATH pattern from the current Dockerfile. End with a verify line: `rustc --version && rust-objcopy --version && cargo deb --version && cargo generate-rpm --version && protoc --version`. Do **not** add qemu/libyal/fuzz/audit/gh. Build the image and confirm it builds clean. |
 | 1c | high | opus | worktree | **Split the Makefile.** Introduce `INSTAR_BUILD_IMAGE := instar-build` and `INSTAR_DEV_IMAGE := instar-dev`; add a `build-devcontainer` target that `docker build`s `src/.devcontainer/build/`; point `instar`, `deb`, `rpm` (and thus `package`) at the build image + `build-devcontainer`; repoint `metadata`, `audit`, `build-prototype`, and the test/fuzz targets at `instar-dev` via the existing `instar-devcontainer` target (now building the dev image). Keep every `docker run` body (uid/HOME/CARGO_HOME/mounts/workdir) unchanged. Verify end-to-end: `make instar && make deb && make rpm` produce `src/target/release/instar`, `.deb`, `.rpm`; `make check-binary-sizes` passes; `make metadata` still works on the dev image. |
 | 1d | high | opus | worktree | **Write `tools/verify-glibc-floor.sh <deb> <rpm>`** — the empirical floor gate. For each matrix distro image (`debian:12`, `debian:13`, `ubuntu:22.04`, `ubuntu:24.04`, `fedora:latest`, `rockylinux:9`, `rockylinux/rockylinux:10` — Rocky 10 is
@@ -118,6 +118,34 @@ not in the Docker Official `rockylinux` library, which stops at 9):
 | 1e | medium | sonnet | worktree | **Pin the dev image base.** Change `src/.devcontainer/Dockerfile`'s `FROM mcr.microsoft.com/devcontainers/base:debian` to a pinned Debian tag (a specific digest or `:bookworm`/`:trixie`-dated tag — confirm the exact pin with Michael) so dev-image rebuilds are reproducible, matching the nightly-pin rationale already documented in that file. Confirm `devcontainer.json` (if any) still references this Dockerfile and that `make test` still builds/runs on the repinned dev image. |
 | 1f | medium | sonnet | none | **Audit every workflow + script reference to the image names and make targets.** `release.yml` (`docker image rm -f instar-build` + `make instar`/`make package` → build image, should stay correct — confirm), `functional-tests.yml` `package-smoke` (build image — confirm) and `build-and-test` / test jobs (must target `instar-dev` now — fix any `instar-build` references that meant the dev image), and **`rust-nightly-bump.yml`** (must test-build **both** images against a candidate nightly so a nightly that breaks either image blocks the bump — today it builds one). Grep the whole tree for `instar-build` and `instar-devcontainer` and reconcile each hit. |
 | 1g | low | sonnet | none | **Docs.** CHANGELOG (`[Unreleased]`): lowered glibc floor → Debian/Ubuntu/Fedora/Rocky coverage incl. Rocky 9 & Ubuntu 22.04, via the build/dev container split. `docs/development.md`: the two-image model, which make targets use which image, the bullseye rationale, and the R1 protoc note. `ARCHITECTURE.md` / `AGENTS.md`: brief pointer to the split (not duplicating docs/). README install section: state the new minimum glibc (2.31) if it names one. |
+
+## Step 1a outcome (2026-08-11)
+
+`tools/validate-published-release.sh` ran on two real KVM VMs against
+the **published** v0.3.0 assets. Both ended in `PASS`, with every
+checklist item present: a clean install with no unmet dependencies,
+`/usr/bin/instar` plus `/usr/lib/instar/*.bin`, `--help`, `info`
+reporting `file format: qcow2`, `create` printing `Created:`, and
+`map`'s table header.
+
+| VM | Package | Distro qemu-img | Result |
+|----|---------|-----------------|--------|
+| Debian 13 (trixie) | `.deb` | 10.0.11 | PASS |
+| Rocky Linux 10.1 | `.rpm` | 10.1.0 | PASS |
+
+Transcripts are recorded on #474.
+
+**Why trixie and Rocky 10 rather than the matrix floor.** The
+published v0.3.0 `.deb` declares `Depends: libc6 (>= 2.39)` and its
+highest referenced symbol version is `GLIBC_2.39` — so it *cannot*
+install on Debian 12 (2.36), Ubuntu 22.04 (2.35) or Rocky 9 (2.34).
+That is the historical record this step exists to capture, not a
+regression: those three distros are precisely what the bullseye
+rebuild in 1b-1c exists to reach, and the rebuilt binary's floor is
+`GLIBC_2.30`. Note also that the master plan's phrasing "the shipped
+v0.3.0 artifacts are glibc-2.41 trixie builds" describes the *build
+image's* glibc, not the binary's requirement — the artifact's actual
+floor is 2.39, which is what constrains where it can be validated.
 
 ## Acceptance
 
@@ -129,7 +157,8 @@ not in the Docker Official `rockylinux` library, which stops at 9):
 - `release.yml` and `functional-tests.yml package-smoke` still green
   (they build the same artifacts via the same make targets).
 - `rust-nightly-bump.yml` now test-builds both images.
-- #474 closed with recorded real-VM results.
+- #474 closed with recorded real-VM results. **Done 2026-08-11**:
+  PASS on Debian 13 (.deb) and Rocky Linux 10.1 (.rpm).
 - `pre-commit run --all-files` clean; `shellcheck` clean.
 - One commit per logical change: (1b) build Dockerfile, (1c) Makefile
   split, (1d) verify script, (1e) dev-base pin, (1f) workflow audit,
