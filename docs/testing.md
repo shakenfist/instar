@@ -832,11 +832,49 @@ if the self-hosted runner pool has spare physical cores during the
 nightly window, since each libFuzzer target pins a core — confirm core
 availability before adding jobs.
 
+#### Crash reporting
+
 Crashes are minimized with `cargo fuzz tmin` and filed as GitHub
-Issues with the `security-audit` label immediately when found. New
-corpus entries are pushed to `instar-testdata/custom/fuzz-corpus/`
-after nightly runs, and restored by target name on the next run so
-coverage compounds.
+Issues with the `security-audit` label immediately when found, by
+`tools/ci/report-fuzz-crash.sh`. New corpus entries are pushed to
+`instar-testdata/custom/fuzz-corpus/` after nightly runs, and restored
+by target name on the next run so coverage compounds.
+
+Two rules make that reporting safe, both learned from a month of
+silently broken nightlies:
+
+- **The log excerpt is bounded in bytes, and never travels on a command
+  line.** `cargo fuzz` prints the failing input as a `std::fmt::Debug`
+  dump on a *single* line, so with `-max_len=4194304` one crash can
+  produce a 370KB log line. The excerpt is therefore clipped per line
+  (`cut -b`), then per line count, then per byte, scrubbed to valid
+  UTF-8, and handed to `jq` with `--rawfile`. The original code passed a
+  `tail -30` through `jq --arg`, and an 81KB crash input in
+  `fuzz_rebase_planners` made that a 371KB argv entry — over Linux's
+  128KiB `MAX_ARG_STRLEN`, so `jq` exited with "Argument list too long".
+- **A reporting failure is never fatal to the run.** The fuzz step runs
+  under `bash -e`, so that `jq` failure aborted the whole step at the
+  first crash: 21 of the 40 targets were never fuzzed, no issue was
+  filed, and the corpus push was skipped — every night from 2026-07-16
+  to 2026-08-11. Reporting failures are now counted and warned about
+  per target, the loop continues to the remaining targets, and the step
+  fails at the *end* if any crash went unreported, so a fuzz run that
+  cannot report is still red.
+
+Run the reporter by hand against a downloaded `coverage-fuzz-logs`
+artifact to check what an issue would say, without filing anything:
+
+```bash
+tools/ci/report-fuzz-crash.sh fuzz_rebase_planners \
+    src/fuzz/artifacts/fuzz_rebase_planners/crash-<hash> \
+    coverage-fuzz-logs/fuzz_rebase_planners.log --dry-run
+```
+
+Do not pass `-max_len` to `cargo fuzz tmin`: it supplies its own, and a
+second one trips libFuzzer's `assert(MaxInputLen == 0)`, so
+minimization fails and leaves a 0-byte `minimized-from-*` artifact
+behind. The workflow skips empty and `minimized-from-*` files when
+choosing the crash input to report.
 
 ### Automated bug fixes
 

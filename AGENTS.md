@@ -677,3 +677,4 @@ This allows reviewers to cherry-pick or drop individual fixes as needed.
 - `scripts/differential-fuzz.py` - Differential fuzzing script (instar vs qemu-img + libyal)
 - `scripts/extract-fuzz-corpus.py` - Seeds + restores the coverage-fuzz corpus from instar-testdata
 - `tools/ci/fuzz-tier.sh` - Computes tiered nightly per-target fuzz durations
+- `tools/ci/report-fuzz-crash.sh` - Files the `security-audit` issue for a coverage-fuzz crash (bounds the log excerpt; see "Crash reporting" in `docs/testing.md`)
