@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **The merge queue now tests the released packages on seven
+  distributions.** A `package-matrix` job builds one `.deb` and one
+  `.rpm` and runs the full integration suite against the *installed*
+  package on Debian 12/13, Ubuntu 22.04/24.04, Fedora, and Rocky 9/10 —
+  each against the `qemu-img` that distribution ships, which ranges from
+  6.2 to 10.2. This catches two classes single-distro CI cannot:
+  packaging regressions (the v0.3.0 incident, where ten of sixteen
+  operation binaries were missing from the manifests) and output-format
+  parity gaps against older `qemu-img`. It runs only in the merge queue,
+  so pull-request latency is unchanged.
+
 - **Lowered the release binary's glibc floor to run on far more
   distributions.** The `instar` binary is now built on Debian 11
   (bullseye, glibc 2.31) instead of a rolling recent Debian, so a

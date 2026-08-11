@@ -397,7 +397,11 @@ the tree, binary from the package via `INSTAR_BINARY_PATH`). It is the
 per-entry runner for the distro-matrix CI and the first check to surface
 version-specific output-format parity gaps that host-only CI cannot. It
 is distinct from `tools/test-package-install.sh` (fast packaging smoke)
-and is driven across the matrix by the phase-4 `merge_group` job.
+and is driven across seven distros by the `package-matrix` job, which
+runs **only** in the merge queue and on `workflow_dispatch` — never on a
+pull request. `tools/ci/run-matrix-entry.sh` is the CI wrapper; use it
+(with `MATRIX_SELECT`) to reproduce an entry exactly as CI runs it.
+`can_merge` is the queue's required check, not the individual entries.
 `--select REGEX` replays a single failure on one distro, which matters
 because two containers sharing a KVM host produce timeout failures that
 mimic real divergences — always re-run uncontended before attributing

@@ -188,6 +188,53 @@ latency is the right trade.
 | 4f | medium | sonnet | none | **`can_merge` aggregate gate (corrects sketch 4e).** New job: `needs: [package-build, package-matrix]`, `if: always() && github.event_name == 'merge_group'`, `runs-on: [self-hosted, static]` (it is a five-second jq check — do not boot an on-demand VM for it; the sibling's `can_merge`/`can_enqueue` use `static` for the same reason, and this repo already uses that label in five places), `permissions: {actions: read}`, and the sibling's jq body — `ALL_SUCCESS=$(echo "$NEEDS_JSON" \| jq '. \| to_entries \| map([.value.result == "success", .value.result == "skipped"] \| any) \| all')` then `[ $ALL_SUCCESS == true ]`. Do **not** touch `automated_reviewer`'s `needs:`. This job's name is what phase 5 makes the queue's required check. |
 | 4g | low | sonnet | none | **Docs.** `docs/testing.md`: the PR-vs-merge-queue job split, the seven entries, the quarantine policy, and how to reproduce one entry locally (`tools/test-package-functional.sh` with `--select`). `AGENTS.md`/`ARCHITECTURE.md`: a pointer only, no duplication. CHANGELOG `[Unreleased]`. Update the master plan's phase-4 row and its stale qemu-version estimates against the phase-2c/2b measurements. |
 
+## Execution results (2026-08-11)
+
+Implemented 4a-4g. Three new scripts keep the workflow declarative, per
+the no-large-scripts-in-CI-steps rule: `tools/ci/resolve-package.sh`
+(glob one package of a kind, failing loudly on zero or two matches),
+`tools/ci/summarise-matrix-entry.sh` (parse the runner's log into a
+job-summary row), and `tools/ci/run-matrix-entry.sh` (the per-entry
+wrapper CI calls).
+
+**Verified locally:**
+
+- Job graph simulated per event. `pull_request` runs exactly today's
+  nine jobs — no matrix, no `can_merge`, no added latency.
+  `merge_group` runs only `build-and-test`, `package-build`,
+  `package-matrix`, `can_merge`. `workflow_dispatch` runs everything
+  except `test-partition` and `can_merge`, which is the dry-run path.
+- Both package families end-to-end through the real wrapper: `Debian 13`
+  / `.deb` / apt reported `qemu-img 10.0.11`, and `Rocky 9` / `.rpm` /
+  dnf reported `qemu-img 10.1.0`, each producing a correct summary row.
+  (Run with `MATRIX_SELECT` to bound cost; the full-suite behaviour is
+  phase 3's, unchanged.)
+- The summariser degrades correctly: a run that dies before the
+  versions block reports `qemu-img unknown` and `?` totals rather than
+  failing, and a missing log warns instead of crashing.
+- `resolve-package.sh` rejects both the no-match and multi-match cases.
+- `actionlint` and `shellcheck` clean.
+
+**One design change from the plan.** `allow_failure` is declared
+explicitly as `false` on all seven entries rather than being an
+optional key: actionlint types the matrix object from its literal
+entries, so an absent property is an error even behind `|| false`.
+Declaring it per entry is better anyway — quarantine state is visible
+per row, and flipping one is a one-word diff.
+
+**Still outstanding**, and only obtainable from a real run:
+
+- Measured wall-clock, split into runner boot + image pull versus suite
+  runtime (R1/R3). The 120-minute timeout is a placeholder chosen to be
+  generous, not a measurement.
+- Confirmation that `GITLAB_TESTDATA_TOKEN` reaches `merge_group`
+  (R4 — expected fine, per Michael).
+- The seven-wide fan-out itself. Everything above validates single
+  entries and the graph; nothing has yet run seven at once in CI.
+
+The `workflow_dispatch` dry run is the cheapest way to get all three,
+and is the first thing phase 5 should do before enabling the queue.
+
 ## Acceptance
 
 - A `workflow_dispatch` dry run fans out over all seven distros, each

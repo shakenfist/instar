@@ -364,6 +364,22 @@ tools/test-package-functional.sh --select 'test_convert\.' \
     src/target/debian/instar_*.deb debian:13
 ```
 
+To reproduce a **CI matrix entry** exactly as the merge queue runs it —
+same package resolution, same summary line — use the wrapper CI calls
+rather than the runner directly:
+
+```bash
+make package
+PACKAGE_DIR=src/target/debian \
+TESTDATA_PATH=../instar-testdata \
+MATRIX_SELECT='test_map\.' \
+    tools/ci/run-matrix-entry.sh 'Debian 12' debian:12 deb
+```
+
+`MATRIX_SELECT` exists for exactly this and is never set in CI: it
+makes the run partial, and a partial run must not be able to report as
+a green matrix entry. The wrapper prints a warning whenever it is set.
+
 **Classify before you attribute.** Running two matrix containers at
 once — or any other heavy job on the host — starves the suite, and the
 resulting failures do not look like resource problems. The large
@@ -400,6 +416,59 @@ gaps that single-version CI cannot: any command whose qemu-img output
 changed across versions, where instar hard-codes the newest form, will
 diverge here. See "qemu-img version profiles and the distro matrix"
 below.
+
+### Pull requests versus the merge queue
+
+`functional-tests.yml` runs two different sets of jobs depending on the
+event, and the split is deliberate:
+
+| Event | Jobs |
+|-------|------|
+| `pull_request` | `test-partition`, `build-and-test`, `package-smoke`, the three `integration-*` jobs, `snapshot-harnesses`, `oslo-crossval-master`, `automated_reviewer` — all against the **in-tree build** |
+| `merge_group` | `build-and-test`, `package-build`, `package-matrix` (seven distros), `can_merge` |
+| `workflow_dispatch` | everything except `test-partition` and `can_merge` — this is how you dry-run the matrix without enqueuing anything |
+
+The merge queue does **not** re-run the PR integration jobs. That is a
+coverage argument rather than a cost one: each matrix entry runs the
+*full* Python suite against the installed package on its own distro,
+against that distro's `qemu-img`, so the queue's coverage is a superset
+of the PR jobs on seven distros instead of one. `build-and-test` is the
+deliberate exception — it stays in both as the cheap fast-fail, and
+`package-build` depends on it.
+
+`package-build` builds one `.deb` and one `.rpm` and uploads them as a
+single artifact that all seven entries consume. This works only because
+the release binary is built on `debian:bullseye` (symbol floor
+`GLIBC_2.30`), so one artifact set installs everywhere down to Rocky
+9's glibc 2.34. **If a matrix entry fails while *installing* the
+package, that is a glibc-floor regression in the build image, not a
+test failure.**
+
+`can_merge` is the queue's required check — the job name to configure in
+branch protection, rather than the individual entries, whose names
+change whenever the distro list does. It uses `always()` plus a jq
+expression asserting every dependency ended `success` or `skipped`,
+because a required check that never reports leaves the queue waiting
+forever.
+
+Each entry writes a row to the job summary naming the distro, its
+**live** `qemu-img` version, and the test totals. The version is what
+distinguishes "instar broke" from "instar diverges at this qemu version
+boundary", so read it before attributing a red row.
+
+**Flake quarantine.** Every matrix entry carries an explicit
+`allow_failure: false`. An entry that fails twice consecutively for an
+established environmental reason may be flipped to `true` with a linked
+issue, so one flaky distro cannot block every merge; the flag comes off
+when the issue closes. Note the sharp edge: `continue-on-error` makes
+the job report *success* to the `needs` context, so a quarantined entry
+stops gating merges entirely rather than merely tolerating its own
+failure. Never leave a flag behind after its issue is fixed.
+
+Because `merge_group` does not inherit the `pull_request` trigger's
+`paths:` filter, this workflow always runs in the queue — including for
+docs-only changes. That is deliberate (a required check that never runs
+hangs the queue), at the cost of matrix latency on doc merges.
 
 ### CI job layout and the partition guard
 
