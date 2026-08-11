@@ -37,11 +37,28 @@ jobs:
     runs-on: [self-hosted, debian-12, xl]
     timeout-minutes: 120
 
+    env:
+      DOCKER_BUILDKIT: 1
+
     steps:
       - name: Checkout instar
         uses: actions/checkout@v7
         with:
           ref: develop
+
+      # The self-hosted runners do not ship docker, and the validation
+      # step builds the devcontainer image, so install it here as every
+      # other docker-using job in this repository does.
+      - name: Install Docker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y docker.io
+          sudo systemctl start docker
+          sudo chmod 666 /var/run/docker.sock
+
+      - name: Remove previous devcontainers, if any
+        run: |
+          docker image rm -f instar-build 2>/dev/null || true
 
       - name: Bump the nightly pin if a newer one validates
         env:

@@ -666,6 +666,11 @@ This allows reviewers to cherry-pick or drop individual fixes as needed.
 - `.github/workflows/differential-fuzz.yml` - On-demand differential fuzzing (instar vs qemu-img + libyal)
 - `.github/workflows/coverage-fuzz.yml` - Coverage-guided fuzzing of parser crates (nightly + PR)
 - `.github/workflows/fuzz-autofix.yml` - Automated fuzzer bug fix (daily Claude Code, 30-turn limit)
+- `.github/workflows/rust-nightly-bump.yml` - Weekly devcontainer Rust nightly pin bump (see "Toolchain pinning" above)
+
+The self-hosted runners have no Docker preinstalled, so any job touching
+`docker` or a container-backed Makefile target needs an "Install Docker"
+step -- see "Self-hosted runners and Docker" in `docs/development.md`.
 
 ### Scripts
 
