@@ -1054,6 +1054,45 @@ jobs:
     # to another repository's workflow tracked at @main, for nothing.
     uses: shakenfist/actions/.github/workflows/pr-auto-review.yml@main
 
+  # The pull-request-side gate: "is this PR allowed into the queue?"
+  #
+  # Twin of can_merge below, and required for the same reason its
+  # counterpart is: branch protection needs a stable context name to
+  # require, and the individual job names churn. This one aggregates the
+  # jobs that actually run on a pull request.
+  #
+  # It exists so that requiring a merge-queue-only check does not leave
+  # the PR side with nothing to satisfy -- the queue decides whether a
+  # merge group is good, this decides whether a PR may enter it.
+  can_enqueue:
+    name: "Can enqueue"
+    needs:
+      - ci-tooling
+      - build-and-test
+      - package-smoke
+      - integration-core
+      - integration-convert-qcow2
+      - integration-convert-vhd
+      - snapshot-harnesses
+    # Deliberately not gated to pull_request alone: workflow_dispatch
+    # runs most of these jobs too, and reporting the aggregate there is
+    # useful. oslo-crossval-master is omitted on purpose -- it is
+    # continue-on-error and so could never gate anything.
+    if: always() && github.event_name != 'merge_group'
+    permissions:
+      actions: read
+    runs-on: [self-hosted, static]
+    timeout-minutes: 5
+    steps:
+      - env:
+          NEEDS_JSON: "${{ toJSON(needs) }}"
+        name: Transform outcomes
+        run: |
+          echo "ALL_SUCCESS=$(echo "$NEEDS_JSON" | jq '. | to_entries | map([.value.result == "success", .value.result == "skipped"] | any) | all')" >>$GITHUB_ENV
+
+      - name: Check outcomes
+        run: "[ $ALL_SUCCESS == true ]"
+
   # The merge queue's required check. THIS is the job name to configure
   # in branch protection -- not the individual matrix entries, whose
   # names change whenever the distro list does.

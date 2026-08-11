@@ -424,9 +424,9 @@ event, and the split is deliberate:
 
 | Event | Jobs |
 |-------|------|
-| `pull_request` | `test-partition`, `build-and-test`, `package-smoke`, the three `integration-*` jobs, `snapshot-harnesses`, `oslo-crossval-master`, `automated_reviewer` — all against the **in-tree build** |
+| `pull_request` | `ci-tooling`, `build-and-test`, `package-smoke`, the three `integration-*` jobs, `snapshot-harnesses`, `oslo-crossval-master`, `automated_reviewer`, `can_enqueue` — all against the **in-tree build** |
 | `merge_group` | `build-and-test`, `package-build`, `package-matrix` (seven distros), `can_merge` |
-| `workflow_dispatch` | everything except `test-partition` and `can_merge` — this is how you dry-run the matrix without enqueuing anything |
+| `workflow_dispatch` | everything except `ci-tooling` and `can_merge` — this is how you dry-run the matrix without enqueuing anything. Note `automated_reviewer` also skips here, because it needs `ci-tooling` and a skipped dependency skips its dependents; the two aggregates use `always()` precisely so they report anyway |
 
 The merge queue does **not** re-run the PR integration jobs. That is a
 coverage argument rather than a cost one: each matrix entry runs the
@@ -444,12 +444,15 @@ the release binary is built on `debian:bullseye` (symbol floor
 package, that is a glibc-floor regression in the build image, not a
 test failure.**
 
-`can_merge` is the queue's required check — the job name to configure in
-branch protection, rather than the individual entries, whose names
-change whenever the distro list does. It uses `always()` plus a jq
+`can_enqueue` and `can_merge` are the two aggregate gates, and they are
+the names configured as required checks — never the individual jobs or
+matrix entries, whose names change whenever the distro list does.
+`can_enqueue` aggregates the pull-request jobs ("may this PR enter the
+queue?"); `can_merge` aggregates the merge-queue jobs ("is this merge
+group good?"). Both use `always()` plus an event test and a jq
 expression asserting every dependency ended `success` or `skipped`,
 because a required check that never reports leaves the queue waiting
-forever.
+forever. See [development.md](development.md) for the ruleset itself.
 
 Each entry writes a row to the job summary naming the distro, its
 **live** `qemu-img` version, and the test totals. The version is what

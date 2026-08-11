@@ -368,6 +368,56 @@ Omitting the step does not fail at job start -- it fails part way through
 with `docker: command not found`, whenever the first container command is
 reached.
 
+### Merge queue and the `develop` ruleset
+
+`develop` is gated by a repository **ruleset** named "Develop branch"
+(not classic branch protection — the whole Shaken Fist fleet uses
+rulesets). It requires merges to go through GitHub's merge queue, which
+is what runs the seven-distro package matrix; see
+[testing.md](testing.md) for what runs on a pull request versus in the
+queue.
+
+The configuration is recorded here so it can be recreated if the
+repository ever is. It mirrors `shakenfist/shakenfist`'s ruleset of the
+same name:
+
+| Setting | Value |
+|---------|-------|
+| Target | `refs/heads/develop` |
+| Enforcement | active |
+| Bypass | team `shakenfist/sf-can-skip-merge-queue`, mode `always` |
+| Rules | `deletion`, `non_fast_forward`, `merge_queue`, `pull_request`, `required_status_checks` |
+| Required checks | `Can enqueue`, `Can merge` (both GitHub Actions, integration 15368) |
+| Queue grouping | `ALLGREEN`, `max_entries_to_build: 1`, `max_entries_to_merge: 5` |
+| Queue merge method | `MERGE`, min 1 entry, 5 minute wait |
+| Check timeout | 360 minutes |
+| Required approvals | 0 (`dismiss_stale_reviews_on_push: true`) |
+
+Two of those deserve explanation:
+
+- **`max_entries_to_build: 1`** bounds the cost of the matrix. Only one
+  merge group builds at a time, so the seven-wide fan-out is seven
+  on-demand runners for one PR, not seven per queued PR.
+- **The required checks are the two aggregate jobs, never the individual
+  matrix entries.** Entry names change whenever the distro list does,
+  and a required check whose name no longer exists blocks every merge
+  permanently. `can_enqueue` aggregates the pull-request jobs;
+  `can_merge` aggregates the merge-queue jobs. Both use `always()` plus
+  an event test so they always report, because a required check that
+  never reports leaves the queue waiting forever.
+
+To inspect or recreate it:
+
+```bash
+gh api repos/shakenfist/instar/rulesets --jq '.[] | "\(.id) \(.name) \(.enforcement)"'
+gh api repos/shakenfist/instar/rulesets/<id>
+```
+
+`.github/exported-config/` carries the nightly export of the live
+ruleset state, which is the machine-readable companion to the table
+above; the export proposes its updates as pull requests rather than
+committing directly.
+
 ### Differential fuzzing
 
 On-demand differential fuzzing compares instar against qemu-img on randomly
