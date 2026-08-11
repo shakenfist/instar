@@ -155,13 +155,26 @@ Ship the matrix first; revisit if docs-only merges prove painful. Note
 it explicitly in the phase-5 handover so the operator knows a docs-only
 PR currently pays full matrix latency.
 
-### D5. Fan-out control
+### D5. Fan-out control — full seven-wide, no `max-parallel`
 
-`fail-fast: false` always — one distro's failure must not mask the
-other six. Add `max-parallel` as a tunable, defaulting to a value the
-operator confirms against the real `xl` pool size (see R1); the
-KVM-contention risk (R2) argues for a number below seven regardless of
-pool size.
+`fail-fast: false` always: one distro's failure must not mask the other
+six.
+
+**Do not set `max-parallel`.** An earlier draft of this plan proposed
+capping it, reasoning from seven containers at `--concurrency 4` as "28
+concurrent KVM workloads". That framing was wrong. The `xl` runners are
+**started on demand** (confirmed with Michael 2026-08-11; the repo
+distinguishes on-demand `s`/`xl` from the always-up `[self-hosted,
+static]` pool, which it already uses in five places). Each matrix entry
+therefore lands on its **own** VM: 4 concurrent KVM workloads per
+runner, seven runners, no cross-entry contention. The phase-2c load
+artifacts that motivated the cap came from running all seven *on the
+dev host simultaneously*, which is not what CI does.
+
+Capping the fan-out would serialise on-demand VMs that never compete
+for anything, multiplying merge-queue wall clock for no benefit. Since
+the matrix gates merges rather than pushes, one-entry-plus-runner-start
+latency is the right trade.
 
 ## Steps
 
@@ -169,10 +182,10 @@ pool size.
 |------|--------|-------|-----------|---------------------|
 | 4a | medium | sonnet | none | **Triggers and gates (D1, D2).** Add bare `merge_group:` to `on:`. Add `if: github.event_name != 'merge_group'` to `package-smoke`, `integration-core`, `integration-convert-qcow2`, `integration-convert-vhd`, `snapshot-harnesses`, `oslo-crossval-master`, `automated_reviewer`; leave `build-and-test` ungated and `test-partition` as it is. Comment the *why* (D2's coverage argument) at the top of the job list. Verify with `actionlint` and by reading each job's resulting effective condition — do not add the matrix yet. |
 | 4b | medium | sonnet | none | **`package-build` job (D3).** `needs: build-and-test`, gated `merge_group \|\| workflow_dispatch`, `[self-hosted, debian-12, xl]`. Copy `package-smoke`'s docker install + `docker image rm -f instar-build instar-release` preamble. Run `make instar && make package`. `actions/upload-artifact@v4` with a single named artifact containing both `src/target/debian/instar_*.deb` and `src/target/generate-rpm/instar-*.rpm`; `if-no-files-found: error` so a missing `.rpm` fails here rather than in seven confusing places. |
-| 4c | high | opus | none | **`package-matrix` job.** `needs: package-build`, same gate, `[self-hosted, debian-12, xl]`, `strategy: {fail-fast: false, max-parallel: <D5>}`, `matrix.distro` as a list of objects `{name, image, pkg_kind}` over the seven entries in the master-plan table (`debian:12`, `debian:13`, `ubuntu:22.04`, `ubuntu:24.04`, `fedora:latest`, `rockylinux:9`, `rockylinux/rockylinux:10`). `name: "${{ matrix.distro.name }}"`. Steps: checkout into `instar/` (mirror `integration-core`'s two-checkout layout), `prepare-testdata.sh` with `TESTDATA_TOKEN`, the resparsify loop, docker install, `download-artifact`, then `tools/test-package-functional.sh <resolved package> <image>`. Resolve the package path by `pkg_kind` in a **script, not inline YAML** (per the no-large-scripts-in-workflow-steps rule) — extend `tools/ci/` with a small resolver or add a `--pkg-kind` mode to the runner; decide and document which. `timeout-minutes` per R3. |
+| 4c | high | opus | none | **`package-matrix` job.** `needs: package-build`, same gate, `[self-hosted, debian-12, xl]`, `strategy: {fail-fast: false}` with **no `max-parallel`** (D5 — on-demand runners, one VM per entry), `matrix.distro` as a list of objects `{name, image, pkg_kind}` over the seven entries in the master-plan table (`debian:12`, `debian:13`, `ubuntu:22.04`, `ubuntu:24.04`, `fedora:latest`, `rockylinux:9`, `rockylinux/rockylinux:10`). `name: "${{ matrix.distro.name }}"`. Steps: checkout into `instar/` (mirror `integration-core`'s two-checkout layout), `prepare-testdata.sh` with `TESTDATA_TOKEN`, the resparsify loop, docker install, `download-artifact`, then `tools/test-package-functional.sh <resolved package> <image>`. Resolve the package path by `pkg_kind` in a **script, not inline YAML** (per the no-large-scripts-in-workflow-steps rule) — extend `tools/ci/` with a small resolver or add a `--pkg-kind` mode to the runner; decide and document which. `timeout-minutes` per R3. |
 | 4d | medium | sonnet | none | **Result surfacing.** Tee the runner output; on completion append a row to `$GITHUB_STEP_SUMMARY` with distro name, image, the live qemu-img version parsed from the runner's `--- Versions under test ---` block, the `Ran:/Passed/Skipped/Failed` totals, and PASS/FAIL. Use `if: always()` so failures report too. Put the parsing in a `tools/ci/` script, not inline YAML. The qemu version in the summary is what makes a red row attributable to a version boundary rather than a packaging bug (phase 2/2b lineage). |
 | 4e | medium | sonnet | none | **Flake quarantine (master-plan policy).** Support an optional `allow_failure: true` key on a matrix entry, consumed as `continue-on-error: ${{ matrix.distro.allow_failure \|\| false }}`. Default **no entry** to it. Document in the workflow comment and `docs/testing.md`: an entry that fails twice consecutively for a reason established as environmental gets the flag with a linked issue, and the flag is removed when the issue closes. Note the sharp edge — a `continue-on-error` job reports `success` to the `needs` context, so a quarantined entry genuinely stops gating. |
-| 4f | medium | sonnet | none | **`can_merge` aggregate gate (corrects sketch 4e).** New job: `needs: [package-build, package-matrix]`, `if: always() && github.event_name == 'merge_group'`, small runner, `permissions: {actions: read}`, and the sibling's jq body — `ALL_SUCCESS=$(echo "$NEEDS_JSON" \| jq '. \| to_entries \| map([.value.result == "success", .value.result == "skipped"] \| any) \| all')` then `[ $ALL_SUCCESS == true ]`. Do **not** touch `automated_reviewer`'s `needs:`. This job's name is what phase 5 makes the queue's required check. |
+| 4f | medium | sonnet | none | **`can_merge` aggregate gate (corrects sketch 4e).** New job: `needs: [package-build, package-matrix]`, `if: always() && github.event_name == 'merge_group'`, `runs-on: [self-hosted, static]` (it is a five-second jq check — do not boot an on-demand VM for it; the sibling's `can_merge`/`can_enqueue` use `static` for the same reason, and this repo already uses that label in five places), `permissions: {actions: read}`, and the sibling's jq body — `ALL_SUCCESS=$(echo "$NEEDS_JSON" \| jq '. \| to_entries \| map([.value.result == "success", .value.result == "skipped"] \| any) \| all')` then `[ $ALL_SUCCESS == true ]`. Do **not** touch `automated_reviewer`'s `needs:`. This job's name is what phase 5 makes the queue's required check. |
 | 4g | low | sonnet | none | **Docs.** `docs/testing.md`: the PR-vs-merge-queue job split, the seven entries, the quarantine policy, and how to reproduce one entry locally (`tools/test-package-functional.sh` with `--select`). `AGENTS.md`/`ARCHITECTURE.md`: a pointer only, no duplication. CHANGELOG `[Unreleased]`. Update the master plan's phase-4 row and its stale qemu-version estimates against the phase-2c/2b measurements. |
 
 ## Acceptance
@@ -187,24 +200,29 @@ pool size.
   latency. Verify by reading a real PR run, not by reasoning.
 - `can_merge` exists, aggregates the matrix, and reports only on
   `merge_group`. `automated_reviewer` still runs on PRs.
-- Measured per-entry and total wall-clock recorded in this file, so
-  phase 5 can size the queue (R1, R3).
+- Measured wall-clock recorded in this file, split into runner
+  boot + image pull versus suite runtime, so phase 5 can size the queue
+  (R1, R3).
 - `actionlint` and `shellcheck` clean via `pre-commit run --all-files`.
 
 ## Risks
 
-- **R1 — runner pool size is unknown.** Seven concurrent `xl` entries,
-  each pulling a distro image and running a full KVM suite. I could not
-  enumerate the pool (`gh api orgs/shakenfist/actions/runners` needs
-  `admin:org`), so `max-parallel` must be set from a number Michael
-  confirms, not guessed. Getting this wrong starves the rest of the
-  fleet rather than failing loudly.
-- **R2 — KVM contention manufactures failures.** Phase 2c saw nine
-  failures that were host-load artifacts reading as data corruption,
-  and phase 2b had to re-run serially. Seven containers at
-  `--concurrency 4` is 28 concurrent KVM workloads. Dial `max-parallel`
-  and `--concurrency` together, and classify any first-run divergence by
-  isolated `--select` replay before calling it a regression (memory:
+- **R1 — RESOLVED 2026-08-11: runner pool elasticity.** The `xl`
+  runners are started on demand, so seven concurrent entries do not
+  starve a fixed pool and `max-parallel` is unnecessary (D5). What
+  remains is *cost*, not contention: each entry boots a VM and pulls a
+  distro image before any test runs, and the queue pays that seven
+  times per merge. Measure the boot+pull overhead separately from suite
+  wall-clock in 4c's dispatch run, so phase 5 can size the queue
+  honestly.
+- **R2 — KVM contention within an entry.** Cross-entry contention is
+  not a risk (D5: one VM per entry). Within an entry, the container
+  still runs at `--concurrency 4`, which is the setting phase 3 made
+  tunable for exactly this reason. Phase 2c's nine load-artifact
+  failures came from co-located runs on the dev host, so they do not
+  predict CI behaviour — but the failure *mode* is still live at any
+  concurrency, and any first-run divergence must be classified by
+  isolated `--select` replay before being called a regression (memory:
   diffuzz_spurious_divergence_contention).
 - **R3 — timeouts are unmeasured.** The suite is ~3250 tests; the dev
   host does ~15 min across 16 workers, and phase 3 flagged that
@@ -212,13 +230,16 @@ pool size.
   recording the number. Set generous `timeout-minutes` (90 as a
   starting point), measure on the first dispatch run, then tighten. A
   timeout that fires mid-suite in the queue looks like a flaky distro.
-- **R4 — `GITLAB_TESTDATA_TOKEN` in `merge_group`.** Flagged by the
-  master plan and again by phase 3. Verify the secret is exposed to the
-  `merge_group` event class before relying on it; a queue run that
-  cannot fetch testdata fails opaquely, and the LFS-pointer failure mode
-  looks like a mass instar regression (memory:
-  testdata_lfs_pointer_drift). The dispatch dry run in 4c's acceptance
-  exercises the same path and is the cheap way to find out.
+- **R4 — `GITLAB_TESTDATA_TOKEN` in `merge_group`. Downgraded
+  2026-08-11**: Michael is confident the token is available to merge CI,
+  so this is no longer a design risk and needs no contingency. It stays
+  listed only because the failure mode is deceptive — a queue run that
+  cannot fetch testdata mounts LFS pointer files and produces a mass
+  "file format: unknown" result that reads as an instar regression
+  rather than a credentials problem (memory:
+  testdata_lfs_pointer_drift). `prepare-testdata.sh` canary-checks for
+  exactly this, so it will fail loudly and early; no separate
+  verification step is needed.
 - **R5 — a skipped dependency skips its dependents.** The mechanism
   behind the sketch's broken 4e. Any `needs:` edge crossing the
   PR/merge_group boundary must use `if: always() && <event test>`, as
