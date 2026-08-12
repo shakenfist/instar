@@ -36,7 +36,8 @@
 # The JSON field names are a contract with fuzz-autofix.yml, which reads
 # .target/.signature/.reproducer/.log_excerpt/.crash_input_size out of
 # the issue body and feeds only those fields to Claude. Do not rename
-# them without updating that workflow.
+# them without updating that workflow. .dedup_key is read only by this
+# script, on its next run.
 #
 # tools/ci/test-report-fuzz-crash.sh exercises all of this against
 # synthetic logs, including the 370KB-single-line case that broke the
@@ -54,8 +55,14 @@
 # issue for the same crash.
 #
 # Inputs (environment):
-#   GH_TOKEN      (required unless --dry-run) for `gh issue create`.
-#   WORKFLOW_URL  (optional) run URL recorded in the issue body.
+#   GH_TOKEN          (required unless --dry-run) for `gh issue create`.
+#   WORKFLOW_URL      (optional) run URL recorded in the issue body.
+#   MAX_EXCERPT_BYTES (default 4000) byte cap on the whole excerpt.
+#   MAX_LINE_BYTES    (default 200) byte cap on each excerpt line.
+#
+# The two byte caps exist mostly so the tests can drive the
+# oversize-body path, which the defaults cannot reach: 30 lines of 200
+# bytes cannot approach the 60000 byte guard.
 
 set -euo pipefail
 
@@ -130,12 +137,51 @@ fi
 # every signature from a log with a stray high byte in it silently
 # degrades to 'unknown crash'. Reading it as text is safe here because
 # the result is bounded and scrubbed immediately below.
-SIGNATURE="$(grep -a -m1 -A1 'panicked at\|SUMMARY:' "${LOG_FILE}" \
-    2>/dev/null \
-    | tr '\n\t' '  ' | tr -d '\000' | head -c 200 \
-    | "${SCRUB[@]}" 2>/dev/null || true)"
-if [ -z "${SIGNATURE}" ]; then
+scrub_field() {
+    # Bound and scrub one line of fuzzer-derived text for jq.
+    tr '\n\t' '  ' | tr -d '\000' | head -c 200 \
+        | "${SCRUB[@]}" 2>/dev/null || true
+}
+
+# The crash location on its own ("panicked at foo.rs:278:17") and the
+# message on its own are each read separately, because they are used
+# differently below: both go into the signature, but only the message
+# is normalized for the dedup key.
+CRASH_HIT="$(grep -a -n -m1 'panicked at\|SUMMARY:' "${LOG_FILE}" \
+    2>/dev/null || true)"
+CRASH_LINE="${CRASH_HIT%%:*}"
+SIG_LOC="$(printf '%s' "${CRASH_HIT#*:}" | scrub_field)"
+SIG_MSG=""
+if [ -n "${CRASH_LINE}" ]; then
+    SIG_MSG="$(sed -n "$((CRASH_LINE + 1))p" "${LOG_FILE}" 2>/dev/null \
+        | scrub_field)"
+fi
+
+SIGNATURE="$(printf '%s %s' "${SIG_LOC}" "${SIG_MSG}" | scrub_field)"
+if [ -z "${SIG_LOC}" ]; then
     SIGNATURE='unknown crash'
+fi
+
+# Dedup matches on this, not on the signature, because a Rust panic
+# message routinely interpolates the fuzz-derived values that provoked
+# it -- the real crash behind this change reads "Write patch 0
+# (72057594037927944..72057594037928200) exceeds total_file_size
+# (281076066929798)". Two inputs hitting the same assertion produce
+# different numbers, so exact-signature matching would file a fresh
+# issue every night for one bug. Collapsing standalone numbers in the
+# MESSAGE fixes that; the location is left alone, so two different
+# assertion sites in one file still get two issues.
+#
+# \b, so only whole numbers collapse. A bare sed 's/[0-9]*/N/g' would
+# also eat the digits inside identifiers -- "qcow2" and "qcow3" would
+# both become "qcowN" and two genuinely different bugs would share one
+# issue. Over-merging is the worse direction here: a duplicate issue is
+# noise, a swallowed crash is a crash nobody hears about.
+DEDUP_KEY="$(printf '%s %s' "${SIG_LOC}" \
+    "$(printf '%s' "${SIG_MSG}" | sed 's/\b[0-9][0-9]*\b/N/g')" \
+    | scrub_field)"
+if [ -z "${SIG_LOC}" ]; then
+    DEDUP_KEY='unknown crash'
 fi
 
 CRASH_SIZE="$(stat -c%s "${CRASH_FILE}" 2>/dev/null || echo unknown)"
@@ -147,24 +193,50 @@ EXCERPT_FILE="$(mktemp)"
 BODY_FILE="$(mktemp)"
 trap 'rm -f "${EXCERPT_FILE}" "${BODY_FILE}"' EXIT
 
-# Truncate every LINE first, then take the last few. Bounding by bytes
-# alone would work but would hand back the tail of the Debug dump --
-# raw byte soup -- while the lines that matter (the panic, the libFuzzer
-# SUMMARY, the artifact path) sit just above it. Clipping each line to
-# MAX_LINE_BYTES keeps those intact and reduces the dump to a stub.
-# `cut -b` and the trailing byte cap are what actually bound the result;
-# `tail -n` alone cannot, because one line here can be 370KB wide.
+# Window the excerpt on the CRASH, not on the end of the file. A real
+# `cargo fuzz run` failure prints, after the panic: a ~30 frame
+# symbolized stack trace, the SUMMARY, the MS: mutation line, the
+# artifact path, the Debug dump, and cargo-fuzz's own reproduction
+# block. In the 379KB log that motivated this change the panic is line
+# 30 of 91, so a `tail -n 30` window starts at line 62 and contains no
+# panic line and no panic message at all -- 28 stack frames and
+# boilerplate instead. Since log_excerpt is the richest field
+# fuzz-autofix hands to Claude, anchoring matters more than recency.
+#
+# Every LINE is clipped first, because bounding by bytes alone would
+# hand back the tail of the Debug dump -- raw byte soup -- while the
+# lines that matter sit above it. `cut -b` and the byte cap are what
+# actually bound the result; a line count cannot, because one line here
+# can be 370KB wide.
 #
 # Then drop NULs and re-encode as UTF-8, discarding invalid sequences:
 # fuzz logs carry raw mutated bytes, a byte-wise cut can slice a
 # multi-byte character in half, and jq rejects invalid UTF-8 -- as does
 # the GitHub API.
 MAX_LINE_BYTES="${MAX_LINE_BYTES:-200}"
-cut -b "1-${MAX_LINE_BYTES}" "${LOG_FILE}" 2>/dev/null \
-    | tail -n 30 \
-    | tail -c "${MAX_EXCERPT_BYTES}" \
-    | tr -d '\000' \
-    | "${SCRUB[@]}" 2>/dev/null > "${EXCERPT_FILE}" || true
+CONTEXT_BEFORE=5
+CONTEXT_AFTER=25
+
+if [ -n "${CRASH_LINE}" ]; then
+    WINDOW_START=$((CRASH_LINE - CONTEXT_BEFORE))
+    [ "${WINDOW_START}" -lt 1 ] && WINDOW_START=1
+    WINDOW_END=$((CRASH_LINE + CONTEXT_AFTER))
+    # head -c, not tail -c: the panic is at the TOP of this window, so
+    # trimming from the end is what keeps it.
+    sed -n "${WINDOW_START},${WINDOW_END}p" "${LOG_FILE}" 2>/dev/null \
+        | cut -b "1-${MAX_LINE_BYTES}" \
+        | head -c "${MAX_EXCERPT_BYTES}" \
+        | tr -d '\000' \
+        | "${SCRUB[@]}" 2>/dev/null > "${EXCERPT_FILE}" || true
+else
+    # No panic or SUMMARY to anchor on -- a build failure, a truncated
+    # log. The tail is then the best guess at where the trouble is.
+    cut -b "1-${MAX_LINE_BYTES}" "${LOG_FILE}" 2>/dev/null \
+        | tail -n 30 \
+        | tail -c "${MAX_EXCERPT_BYTES}" \
+        | tr -d '\000' \
+        | "${SCRUB[@]}" 2>/dev/null > "${EXCERPT_FILE}" || true
+fi
 
 # One definition of the body, called twice: the field names are a
 # contract with fuzz-autofix.yml, and two copies of them is two things
@@ -174,12 +246,14 @@ build_body() {
         --arg source "coverage-fuzz" \
         --arg target "${TARGET}" \
         --arg signature "${SIGNATURE}" \
+        --arg dedup_key "${DEDUP_KEY}" \
         --arg reproducer "${REPRO}" \
         --arg crash_input_size "${CRASH_SIZE} bytes" \
         --rawfile log_excerpt "${EXCERPT_FILE}" \
         --arg ci_run "${WORKFLOW_URL:-unknown}" \
         '{source: $source, target: $target,
-          signature: $signature, reproducer: $reproducer,
+          signature: $signature, dedup_key: $dedup_key,
+          reproducer: $reproducer,
           crash_input_size: $crash_input_size,
           log_excerpt: $log_excerpt, ci_run: $ci_run}' \
         > "${BODY_FILE}"
@@ -203,11 +277,12 @@ if [ "${DRY_RUN}" -eq 1 ]; then
 fi
 
 # Comment on the existing issue rather than filing a duplicate. Match on
-# target AND signature: the same target can crash in more than one way,
+# target AND dedup key: the same target can crash in more than one way,
 # and those want separate issues, but the same crash every night does
-# not. A lookup that fails (no token, API trouble) falls through to
-# filing, because a duplicate issue is a much smaller problem than an
-# unreported crash.
+# not. Issues filed before dedup_key existed are matched on their
+# signature instead. A lookup that fails (no token, API trouble) falls
+# through to filing, because a duplicate issue is a much smaller problem
+# than an unreported crash.
 if [ "${DEDUP}" -eq 1 ]; then
     EXISTING="$(gh issue list \
         --label "security-audit" \
@@ -215,8 +290,12 @@ if [ "${DEDUP}" -eq 1 ]; then
         --json number,title,body \
         --limit 100 2>/dev/null \
         | jq -r --arg title "${TITLE}" --arg sig "${SIGNATURE}" \
+            --arg key "${DEDUP_KEY}" \
             'map(select(.title == $title
-                        and ((.body | fromjson?).signature == $sig)))
+                        and (.body | fromjson? | . as $b
+                             | if $b.dedup_key
+                               then $b.dedup_key == $key
+                               else $b.signature == $sig end)))
              | .[0].number // empty' 2>/dev/null || true)"
 
     if [ -n "${EXISTING}" ]; then

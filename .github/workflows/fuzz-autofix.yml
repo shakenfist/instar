@@ -13,6 +13,16 @@ name: Auto-fix fuzzer findings
 # --dangerously-skip-permissions (required for file edits in CI).
 # The shared prompt template (tools/autofix-prompt-base.txt) contains
 # the authoritative instructions; issue body provides context only.
+#
+# That last point matters more than "only trusted contributors" makes
+# it sound. Coverage-fuzz issues are filed by CI, not by a person, and
+# two of the fields interpolated below -- .signature and .log_excerpt
+# -- are verbatim bytes off a fuzzer-mutated input's panic path, which
+# a mutated input can in principle steer. They are bounded, NUL-
+# stripped and re-encoded to valid UTF-8 by
+# tools/ci/report-fuzz-crash.sh before they ever reach an issue body,
+# and only the named fields are read out again here. The prompt
+# template, not the issue, is the instruction source.
 
 on:
   schedule:

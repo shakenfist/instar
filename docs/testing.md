@@ -364,7 +364,7 @@ class-level convert split has a subtler gap: a `test_convert` class
 containing `Vhd` but not matching `TestConvert.*Vhd` would be excluded
 by the qcow2 job and missed by the vhd job.
 
-The **`test-partition` CI job** guards against both. It runs
+The **`ci-tooling` CI job** guards against both. It runs
 `tools/ci/check-test-partition.sh`, which enumerates the suite with
 `stestr list`, reads the *actual* job selectors from the Makefile and
 workflow (no duplicated copy to drift), and fails if any test is run
@@ -870,20 +870,42 @@ of silently broken nightlies:
   scraping uses `grep -a`: without it `grep` decides a log containing
   raw mutated bytes is binary, prints nothing, and every such crash
   silently degrades to a signature of `unknown crash`.
+- **The excerpt is windowed on the crash, not on the end of the log.**
+  A real `cargo fuzz run` failure prints the panic, then ~30 stack
+  frames, the `SUMMARY`, the artifact path, the Debug dump and
+  cargo-fuzz's reproduction block. In the 379KB log that motivated this
+  change the panic is line 30 of 91, so a `tail -n 30` window starts at
+  line 62 and contains no panic line and no panic message at all. The
+  window is five lines before the first `panicked at`/`SUMMARY:` and 25
+  after, trimmed from the *end* so the panic survives the byte cap; with
+  no such line to anchor on — a build failure, a truncated log — it
+  falls back to the tail.
 - **The same crash is not refiled every night.** Since the run no longer
   stops at the first crash, a recurring crash would otherwise file one
   issue per target per night, and `fuzz-autofix.yml` only drains one
   issue per day. An open `security-audit` issue whose title matches the
-  target *and* whose body carries the same `signature` gets a comment
-  instead of a duplicate. Matching on both means one target crashing two
-  different ways still gets two issues. A lookup that fails falls
-  through to filing, because a duplicate issue is a much smaller problem
-  than an unreported crash; `--no-dedup` forces that behaviour by hand.
+  target *and* whose body carries the same `dedup_key` gets a comment
+  instead of a duplicate. A lookup that fails falls through to filing,
+  because a duplicate issue is a much smaller problem than an unreported
+  crash; `--no-dedup` forces that behaviour by hand.
 
 The signature is the first `panicked at`/`SUMMARY:` line *and the line
 after it*: Rust prints the location and the message separately, and
 `panicked at fuzz_rebase_planners.rs:278:17` on its own does not
-identify a crash — nor distinguish two crashes for dedup purposes.
+identify a crash.
+
+Dedup matches on `dedup_key` rather than on that signature, because a
+panic message interpolates the fuzz-derived values that provoked it —
+the real crash behind this change reads `Write patch 0
+(72057594037927944..72057594037928200) exceeds total_file_size
+(281076066929798)`. Two inputs hitting one assertion produce two
+different signatures, so exact matching would file a fresh issue every
+night for a single bug. The key is the location verbatim plus the
+message with standalone numbers collapsed to `N`. Digits *inside*
+identifiers are left alone, so `qcow2` and `qcow3` do not merge: a
+duplicate issue is only noise, whereas two different bugs sharing one
+issue loses a crash. Issues filed before `dedup_key` existed are still
+matched on their `signature`.
 
 Run the reporter by hand against a downloaded `coverage-fuzz-logs`
 artifact to check what an issue would say, without filing anything:
@@ -898,22 +920,45 @@ tools/ci/report-fuzz-crash.sh fuzz_rebase_planners \
 synthetic logs — the 370KB single line, raw mutated bytes, a missing
 log, a missing crash file, and the dedup decisions with a stubbed `gh`
 — and asserts the emitted body still satisfies the field predicate
-`fuzz-autofix.yml` validates against. It runs on pull requests as the
-`Fuzz crash reporter tests` job, and needs only bash and `jq`:
+`fuzz-autofix.yml` validates against. Its fixture reproduces the
+*layout* of a real libFuzzer log, not just its content, because an
+earlier ten-line fixture let a tail-anchored excerpt look correct while
+on a real log it captured 28 stack frames and no panic.
+
+Both suites run on pull requests in the `ci-tooling` job, and need only
+bash and `jq`:
 
 ```bash
 tools/ci/test-report-fuzz-crash.sh
+tools/ci/test-pick-fuzz-artifact.sh
 ```
+
+#### Choosing which artifact to report
+
+`tools/ci/pick-fuzz-artifact.sh` decides which file in
+`src/fuzz/artifacts/<target>/` is the reproducer. It used to be inline
+YAML in the workflow, which is where two of the three bugs behind the
+broken month were hiding, so it is a script with tests now.
 
 Do not pass `-max_len` to `cargo fuzz tmin`: it supplies its own, and a
 second one trips libFuzzer's `assert(MaxInputLen == 0)`, so
 minimization fails and leaves a 0-byte `minimized-from-*` artifact
-behind. The workflow skips empty and `minimized-from-*` files when
-choosing which crash input to minimize, then prefers the non-empty
-`minimized-from-*` that `tmin` produced when reporting — otherwise the
-issue would quote the size of, and the reproducer would point at, the
-original large artifact, and the minimization step would cost CI time
-without improving anything.
+behind — which an unsorted `find | head -1` would then happily report as
+the reproducer for a later crash. The picker therefore skips empty files
+and `minimized-from-*` when choosing what to minimize, and afterwards is
+asked separately for the non-empty `minimized-from-*` that `tmin`
+produced; without that second step the issue would quote the size of,
+and the reproducer point at, the original large artifact, and
+minimization would cost CI time without improving anything.
+
+Artifacts are taken in an explicit order of preference — `crash-`,
+`oom-`, `leak-`, `timeout-`, `slow-unit-`, then anything else — rather
+than by sorting the names. Lexicographic order happens to put crashes
+first, but it also puts `slow-unit-` ahead of `timeout-`, and libFuzzer
+writes a `slow-unit-` file for any input over 10s (its default
+`-report_slow_units`). Since these targets run against 4MB inputs, a
+slow unit can easily be sitting in the directory when a real timeout
+arrives, and the reported reproducer would then be the wrong file.
 
 ### Automated bug fixes
 

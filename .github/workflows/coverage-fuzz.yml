@@ -17,6 +17,7 @@ on:
       - 'scripts/extract-fuzz-corpus.py'
       - 'tools/ci/fuzz-tier.sh'
       - 'tools/ci/report-fuzz-crash.sh'
+      - 'tools/ci/pick-fuzz-artifact.sh'
 
   # Post-merge smoke test: 15s per target
   push:
@@ -27,6 +28,7 @@ on:
       - '.github/workflows/coverage-fuzz.yml'
       - 'tools/ci/fuzz-tier.sh'
       - 'tools/ci/report-fuzz-crash.sh'
+      - 'tools/ci/pick-fuzz-artifact.sh'
 
   # Manual: configurable duration and target selection
   workflow_dispatch:
@@ -306,13 +308,13 @@ jobs:
               echo "!!! $TARGET exited non-zero (code $EXIT_CODE) !!!"
               CRASHES_FOUND=$((CRASHES_FOUND + 1))
 
-              # Pick a real crash artifact. Skip minimized-from-* files:
-              # a failed `cargo fuzz tmin` leaves a 0-byte one behind,
-              # and an unsorted `find | head -1` would happily report
-              # that empty file as the reproducer for a later crash.
-              CRASH_FILE=$(find "src/fuzz/artifacts/$TARGET/" -type f \
-                ! -name 'minimized-from-*' -size +0c 2>/dev/null \
-                | sort | head -1)
+              # Which artifact to report is a decision with its own
+              # failure modes, and it used to live here as inline YAML
+              # with no test -- which is how it shipped a bug that could
+              # report a 0-byte file as the reproducer. See
+              # tools/ci/pick-fuzz-artifact.sh.
+              CRASH_FILE=$(tools/ci/pick-fuzz-artifact.sh crash \
+                "src/fuzz/artifacts/$TARGET/")
               if [ -n "$CRASH_FILE" ]; then
                 echo "Minimizing crash: $CRASH_FILE"
                 # No -max_len here: cargo fuzz tmin passes its own, and
@@ -333,14 +335,12 @@ jobs:
                       2>&1 | tee /workspace/coverage-fuzz-logs/${TARGET}-tmin.log
                   " || true
 
-                # Report the minimized input when tmin produced one. It
-                # is written next to the original as minimized-from-*,
-                # and preferring it is the point of running tmin at all:
+                # Report the minimized input when tmin produced one:
                 # otherwise the issue quotes the size of, and the
-                # reproducer points at, the original large artifact.
-                MIN_FILE=$(find "src/fuzz/artifacts/$TARGET/" -type f \
-                  -name 'minimized-from-*' -size +0c 2>/dev/null \
-                  | sort | head -1)
+                # reproducer points at, the original large artifact,
+                # and minimization costs CI time for nothing.
+                MIN_FILE=$(tools/ci/pick-fuzz-artifact.sh minimized \
+                  "src/fuzz/artifacts/$TARGET/")
                 if [ -n "$MIN_FILE" ]; then
                   echo "Minimized to: $MIN_FILE"
                   CRASH_FILE=$MIN_FILE
@@ -451,6 +451,12 @@ jobs:
       # upload have run. When issue filing is the thing that broke, the
       # uploaded artifacts are how the crash reaches a human, so they
       # must not be collateral damage of failing the run.
+      #
+      # crashes_found is deliberately NOT consulted. A crash that was
+      # successfully filed as an issue has already reached a human, and
+      # going red on every recurring known crash would leave the nightly
+      # permanently red and therefore ignored. Only crashes nobody was
+      # told about fail the run.
       - name: Fail on unreported crashes
         if: always()
         run: |

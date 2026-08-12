@@ -54,28 +54,65 @@ run_reporter() {
     "${REPORTER}" "$@" --dry-run | tail -n +3
 }
 
-# A libFuzzer log shaped like the real thing: some preamble, the panic
-# location and message on separate lines, the SUMMARY, and then the
-# `std::fmt::Debug` dump of the input as ONE line of the requested
-# width.
+# A libFuzzer log with the layout of a real one. This shape is copied
+# from the 379KB fuzz_rebase_planners.log of run 31358293537, the crash
+# that motivated the change: 91 lines, the panic at line 30, a ~30
+# frame symbolized stack trace after it, the SUMMARY at line 67, then
+# the artifact path, the single-line `std::fmt::Debug` dump, and
+# cargo-fuzz's own reproduction block.
+#
+# The layout is the test, not decoration. An earlier fixture here was
+# only ten lines, which let a `tail -n 30` excerpt look correct while
+# on the real log it captured 28 stack frames and no panic at all.
 make_log() {
-    local path="$1" dump_bytes="$2"
+    local path="$1" dump_bytes="$2" msg="${3:-}"
+    if [ -z "${msg}" ]; then
+        msg="qcow2 safe (deferred): Write patch 0"
+        msg="${msg} (72057594037927944..72057594037928200) exceeds"
+        msg="${msg} total_file_size (281076066929798)"
+    fi
     {
         echo "INFO: Running with entropic power schedule"
         echo "#2      INITED cov: 118 ft: 119 corp: 1/1b"
-        echo "thread '<unnamed>' panicked at fuzz_targets/" \
-            "fuzz_rebase_planners.rs:278:17:"
-        echo "Write patch 0 (offset 4096, len 512) exceeds" \
-            "total_file_size (4096)"
+        # 25 lines of libFuzzer progress, so the panic sits well outside
+        # any window anchored on the end of the file.
+        for i in $(seq 1 25); do
+            echo "#${i}00000	REDUCE cov: 316 ft: 580 corp: 152/393Kb" \
+                "lim: 90096 exec/s: 130692 rss: 455Mb L: 61485/61486"
+        done
+        echo "thread '<unnamed>' (47) panicked at" \
+            "fuzz_targets/fuzz_rebase_planners.rs:278:17:"
+        echo "${msg}"
         echo "note: run with \`RUST_BACKTRACE=1\` for a backtrace"
-        echo "==12345== ERROR: libFuzzer: deadly signal"
+        echo "==47== ERROR: libFuzzer: deadly signal"
+        # Full-width frames on purpose. A real symbolized frame is
+        # around 190 bytes, so the 31 line window runs past the 4000
+        # byte excerpt cap and the cap decides what survives. With
+        # short frames the cap never binds and the test cannot tell
+        # head -c from tail -c -- which is the difference between
+        # keeping the panic and keeping the last stack frames.
+        for i in $(seq 0 29); do
+            echo "    #${i} 0x5632290eb561  (/workspace/src/fuzz/target/" \
+                "x86_64-unknown-linux-gnu/release/fuzz_rebase_planners" \
+                "+0xff561) (BuildId: 478ffff1a6a6a463242d24ca1189da04" \
+                "caf37eb5aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)"
+        done
+        echo "NOTE: libFuzzer has rudimentary signal handlers."
         echo "SUMMARY: libFuzzer: deadly signal"
+        echo "MS: 4 ShuffleBytes-CopyPart-ChangeBit-CMP-; base unit: 79125"
+        echo "artifact_prefix='./'; Test unit written to" \
+            "./artifacts/fuzz_rebase_planners/crash-deadbeef"
+        echo "Failing input:"
+        echo "	artifacts/fuzz_rebase_planners/crash-deadbeef"
         # shellcheck disable=SC2016  # libFuzzer's own wording
         printf 'Output of `std::fmt::Debug`:\n'
         head -c "${dump_bytes}" < /dev/zero | tr '\0' 'a'
         printf '\n'
-        echo "artifact_prefix='./'; Test unit written to" \
-            "./artifacts/fuzz_rebase_planners/crash-deadbeef"
+        echo "Reproduce with:"
+        echo "	cargo fuzz run fuzz_rebase_planners artifacts/x"
+        echo "Minimize test case with:"
+        echo "	cargo fuzz tmin fuzz_rebase_planners artifacts/x"
+        echo "Error: Fuzz target exited with exit status: 77"
     } > "${path}"
 }
 
@@ -107,20 +144,41 @@ else
     fail "body is ${BODY_BYTES} bytes, over the 60000 cap"
 fi
 
-# The whole point of clipping per line rather than per byte: the lines
-# that identify the crash survive, the dump does not.
-if jq -e '.log_excerpt | contains("SUMMARY: libFuzzer")' \
+# Why the excerpt is windowed on the crash and not on the end of the
+# file. On a real log the panic is a third of the way in, with 30 stack
+# frames and a reproduction block after it, so a tail-anchored window
+# shows neither the panic nor its message -- which is what the excerpt
+# is for, since it is the richest field fuzz-autofix sees.
+if jq -e '.log_excerpt | contains("panicked at")' \
         < "${BODY}" > /dev/null; then
-    ok "excerpt keeps the libFuzzer SUMMARY"
+    ok "excerpt keeps the panic line"
 else
-    fail "excerpt lost the libFuzzer SUMMARY"
+    fail "excerpt lost the panic line"
 fi
 
-if jq -e '.log_excerpt | contains("artifacts/fuzz_rebase_planners")' \
+if jq -e '.log_excerpt | contains("exceeds total_file_size")' \
         < "${BODY}" > /dev/null; then
-    ok "excerpt keeps the artifact path"
+    ok "excerpt keeps the panic message"
 else
-    fail "excerpt lost the artifact path"
+    fail "excerpt lost the panic message"
+fi
+
+# Context before the panic, so the excerpt shows the run reaching it.
+if jq -e '.log_excerpt | contains("REDUCE cov:")' \
+        < "${BODY}" > /dev/null; then
+    ok "excerpt keeps the lines leading up to the panic"
+else
+    fail "excerpt lost the lines before the panic"
+fi
+
+# The whole point of clipping per line rather than per byte: a 370KB
+# Debug dump must not be able to crowd anything out. Note the dump line
+# is below the window here, so its absence is expected either way; what
+# matters is that the excerpt stayed small.
+if jq -e '.log_excerpt | length < 5000' < "${BODY}" > /dev/null; then
+    ok "excerpt is bounded"
+else
+    fail "excerpt is not bounded"
 fi
 
 # --- The cross-workflow contract --------------------------------------
@@ -256,11 +314,25 @@ check "excerpt is empty" "$(jq -r '.log_excerpt' < "${MBODY}")" ""
 
 start "a log with no panic or SUMMARY falls back to 'unknown crash'"
 QUIET_LOG="${WORK}/quiet.log"
-echo "INFO: seed corpus: files: 12 min: 1b max: 4096b" > "${QUIET_LOG}"
+{
+    echo "INFO: seed corpus: files: 12 min: 1b max: 4096b"
+    for i in $(seq 1 40); do echo "error[E0308]: mismatch ${i}"; done
+    echo "error: could not compile fuzz_targets"
+} > "${QUIET_LOG}"
 QBODY="${WORK}/quiet.json"
 run_reporter fuzz_vdi "${CRASH}" "${QUIET_LOG}" > "${QBODY}"
 check "signature falls back" \
     "$(jq -r '.signature' < "${QBODY}")" "unknown crash"
+check "dedup key falls back too" \
+    "$(jq -r '.dedup_key' < "${QBODY}")" "unknown crash"
+# With nothing to anchor on -- a build failure, a truncated log -- the
+# tail is the best guess at where the trouble is.
+if jq -e '.log_excerpt | contains("could not compile")' \
+        < "${QBODY}" > /dev/null; then
+    ok "excerpt falls back to the tail of the log"
+else
+    fail "excerpt did not fall back to the tail"
+fi
 
 start "a missing crash file reports an unknown size"
 SBODY="${WORK}/nosize.json"
@@ -273,9 +345,19 @@ check "crash_input_size falls back" \
 # reach 60000 -- so the branch is only ever exercised by raising them,
 # which is exactly what this does.
 start "an oversize body drops the excerpt rather than failing"
+# Needs a log with no panic to anchor on, because the anchored window
+# sits above the Debug dump and so cannot get near 60000 bytes however
+# the caps are set. The fallback tail window can, which is the path
+# that has to survive it.
+HUGE_LOG="${WORK}/huge.log"
+{
+    echo "error: could not compile fuzz_targets"
+    head -c 200000 < /dev/zero | tr '\0' 'z'
+    printf '\n'
+} > "${HUGE_LOG}"
 OBODY="${WORK}/oversize.json"
 MAX_LINE_BYTES=100000 MAX_EXCERPT_BYTES=200000 \
-    run_reporter fuzz_rebase_planners "${CRASH}" "${BIG_LOG}" \
+    run_reporter fuzz_rebase_planners "${CRASH}" "${HUGE_LOG}" \
     > "${OBODY}" 2>/dev/null
 if jq -e . < "${OBODY}" > /dev/null 2>&1; then
     ok "body is valid JSON"
@@ -299,15 +381,31 @@ mkdir -p "${STUB_BIN}"
 cat > "${STUB_BIN}/gh" <<'STUB'
 #!/usr/bin/env bash
 # Records the subcommand to ${GH_LOG} and answers `issue list` from
-# ${GH_ISSUES} (a JSON array). Any other subcommand just succeeds.
+# ${GH_ISSUES} (a JSON array). GH_LIST_FAILS / GH_CREATE_FAILS /
+# GH_COMMENT_FAILS make the matching subcommand fail like a 403 or a
+# network error would.
 echo "$1 $2" >> "${GH_LOG}"
-if [ "$1 $2" = "issue list" ]; then
-    if [ "${GH_LIST_FAILS:-0}" = "1" ]; then
-        echo "gh: could not reach api.github.com" >&2
-        exit 1
-    fi
-    cat "${GH_ISSUES}"
-fi
+case "$1 $2" in
+    "issue list")
+        if [ "${GH_LIST_FAILS:-0}" = "1" ]; then
+            echo "gh: could not reach api.github.com" >&2
+            exit 1
+        fi
+        cat "${GH_ISSUES}"
+        ;;
+    "issue create")
+        if [ "${GH_CREATE_FAILS:-0}" = "1" ]; then
+            echo "gh: HTTP 403: Resource not accessible" >&2
+            exit 1
+        fi
+        ;;
+    "issue comment")
+        if [ "${GH_COMMENT_FAILS:-0}" = "1" ]; then
+            echo "gh: HTTP 403: Resource not accessible" >&2
+            exit 1
+        fi
+        ;;
+esac
 exit 0
 STUB
 chmod +x "${STUB_BIN}/gh"
@@ -315,9 +413,11 @@ chmod +x "${STUB_BIN}/gh"
 export GH_LOG GH_ISSUES
 GH_ISSUES="${WORK}/issues.json"
 
-# The signature the reporter derives from BIG_LOG, so the canned issue
-# body matches the crash being reported.
+# What the reporter derives from BIG_LOG, so a canned issue body can be
+# made to match -- or deliberately not match -- the crash being
+# reported.
 KNOWN_SIG="$(jq -r '.signature' < "${BODY}")"
+KNOWN_KEY="$(jq -r '.dedup_key' < "${BODY}")"
 
 FILE_STATUS=0
 file_crash() {
@@ -331,7 +431,72 @@ file_crash() {
         "${CRASH}" "$@" > /dev/null 2>&1 || FILE_STATUS=$?
 }
 
-start "an open issue with the same target and signature is not refiled"
+start "an open issue with the same target and key is not refiled"
+jq -n --arg key "${KNOWN_KEY}" \
+    '[{number: 42,
+       title: "Coverage fuzz crash: fuzz_rebase_planners",
+       body: ({source: "coverage-fuzz",
+               target: "fuzz_rebase_planners",
+               dedup_key: $key} | tojson)}]' > "${GH_ISSUES}"
+file_crash "${BIG_LOG}"
+check "commented on the existing issue" \
+    "$(grep -c 'issue comment' "${GH_LOG}")" "1"
+check "did not create a new issue" \
+    "$(grep -c 'issue create' "${GH_LOG}")" "0"
+
+start "the same bug with different fuzz operands is not refiled"
+# The case exact-signature matching got wrong, and the reason dedup_key
+# exists: a Rust panic message interpolates the values that provoked it,
+# so two inputs hitting one assertion produce two different signatures.
+# Without normalization this files a fresh issue every single night,
+# while fuzz-autofix only drains one issue per day.
+VARIANT_LOG="${WORK}/variant.log"
+VARIANT_MSG="qcow2 safe (deferred): Write patch 7 (99..1234) exceeds"
+VARIANT_MSG="${VARIANT_MSG} total_file_size (4096)"
+make_log "${VARIANT_LOG}" 1000 "${VARIANT_MSG}"
+VBODY="${WORK}/variant.json"
+run_reporter fuzz_rebase_planners "${CRASH}" "${VARIANT_LOG}" > "${VBODY}"
+VARIANT_SIG="$(jq -r '.signature' < "${VBODY}")"
+VARIANT_KEY="$(jq -r '.dedup_key' < "${VBODY}")"
+if [ "${VARIANT_SIG}" != "${KNOWN_SIG}" ]; then
+    ok "the two signatures genuinely differ"
+else
+    fail "the fixture does not actually vary the operands"
+fi
+check "but the dedup keys match" "${VARIANT_KEY}" "${KNOWN_KEY}"
+jq -n --arg key "${KNOWN_KEY}" \
+    '[{number: 42,
+       title: "Coverage fuzz crash: fuzz_rebase_planners",
+       body: ({source: "coverage-fuzz",
+               target: "fuzz_rebase_planners",
+               dedup_key: $key} | tojson)}]' > "${GH_ISSUES}"
+file_crash "${VARIANT_LOG}"
+check "commented on the existing issue" \
+    "$(grep -c 'issue comment' "${GH_LOG}")" "1"
+check "did not create a duplicate" \
+    "$(grep -c 'issue create' "${GH_LOG}")" "0"
+
+start "digits inside identifiers are not collapsed"
+# A bare digit collapse would turn qcow2 and qcow3 both into qcowN and
+# merge two different bugs into one issue -- the wrong direction to err
+# in, since a duplicate issue is only noise.
+OTHER_LOG="${WORK}/other.log"
+OTHER_MSG="qcow3 safe (deferred): Write patch 0 (1..2) exceeds"
+OTHER_MSG="${OTHER_MSG} total_file_size (4096)"
+make_log "${OTHER_LOG}" 1000 "${OTHER_MSG}"
+OBODY2="${WORK}/other.json"
+run_reporter fuzz_rebase_planners "${CRASH}" "${OTHER_LOG}" > "${OBODY2}"
+if [ "$(jq -r '.dedup_key' < "${OBODY2}")" != "${KNOWN_KEY}" ]; then
+    ok "qcow3 and qcow2 get different keys"
+else
+    fail "qcow3 and qcow2 collapsed to the same key"
+fi
+file_crash "${OTHER_LOG}"
+check "created a separate issue" \
+    "$(grep -c 'issue create' "${GH_LOG}")" "1"
+
+start "an issue filed before dedup_key existed still matches"
+# Issues already open when this shipped carry only a signature.
 jq -n --arg sig "${KNOWN_SIG}" \
     '[{number: 42,
        title: "Coverage fuzz crash: fuzz_rebase_planners",
@@ -339,9 +504,9 @@ jq -n --arg sig "${KNOWN_SIG}" \
                target: "fuzz_rebase_planners",
                signature: $sig} | tojson)}]' > "${GH_ISSUES}"
 file_crash "${BIG_LOG}"
-check "commented on the existing issue" \
+check "commented on the legacy issue" \
     "$(grep -c 'issue comment' "${GH_LOG}")" "1"
-check "did not create a new issue" \
+check "did not create a duplicate" \
     "$(grep -c 'issue create' "${GH_LOG}")" "0"
 
 start "--no-dedup files even when a duplicate exists"
@@ -350,24 +515,24 @@ check "created an issue" "$(grep -c 'issue create' "${GH_LOG}")" "1"
 check "did not look for duplicates" \
     "$(grep -c 'issue list' "${GH_LOG}")" "0"
 
-start "a different signature on the same target is a new issue"
+start "a different crash on the same target is a new issue"
 jq -n '[{number: 42,
          title: "Coverage fuzz crash: fuzz_rebase_planners",
          body: ({source: "coverage-fuzz",
                  target: "fuzz_rebase_planners",
-                 signature: "some other panic"} | tojson)}]' \
+                 dedup_key: "some other panic"} | tojson)}]' \
     > "${GH_ISSUES}"
 file_crash "${BIG_LOG}"
 check "created an issue" "$(grep -c 'issue create' "${GH_LOG}")" "1"
 check "did not comment" "$(grep -c 'issue comment' "${GH_LOG}")" "0"
 
-start "a different target with the same signature is a new issue"
-jq -n --arg sig "${KNOWN_SIG}" \
+start "a different target with the same key is a new issue"
+jq -n --arg key "${KNOWN_KEY}" \
     '[{number: 42,
        title: "Coverage fuzz crash: fuzz_qcow2",
        body: ({source: "coverage-fuzz",
                target: "fuzz_qcow2",
-               signature: $sig} | tojson)}]' > "${GH_ISSUES}"
+               dedup_key: $key} | tojson)}]' > "${GH_ISSUES}"
 file_crash "${BIG_LOG}"
 check "created an issue" "$(grep -c 'issue create' "${GH_LOG}")" "1"
 
@@ -382,7 +547,7 @@ check "created an issue" "$(grep -c 'issue create' "${GH_LOG}")" "1"
 start "a hand-written body elsewhere in the list does not break dedup"
 # The security-audit label is applied by humans too. One issue whose
 # body is not JSON must not stop the match on the one that is.
-jq -n --arg sig "${KNOWN_SIG}" \
+jq -n --arg key "${KNOWN_KEY}" \
     '[{number: 41,
        title: "Coverage fuzz crash: fuzz_rebase_planners",
        body: "filed by hand, no JSON here"},
@@ -390,7 +555,7 @@ jq -n --arg sig "${KNOWN_SIG}" \
        title: "Coverage fuzz crash: fuzz_rebase_planners",
        body: ({source: "coverage-fuzz",
                target: "fuzz_rebase_planners",
-               signature: $sig} | tojson)}]' > "${GH_ISSUES}"
+               dedup_key: $key} | tojson)}]' > "${GH_ISSUES}"
 file_crash "${BIG_LOG}"
 check "commented on the existing issue" \
     "$(grep -c 'issue comment' "${GH_LOG}")" "1"
@@ -405,6 +570,48 @@ jq -n '[]' > "${GH_ISSUES}"
 GH_LIST_FAILS=1 file_crash "${BIG_LOG}"
 check "reporter exited 0" "${FILE_STATUS}" "0"
 check "created an issue" "$(grep -c 'issue create' "${GH_LOG}")" "1"
+
+# --- Never silently green ----------------------------------------------
+# The guarantee the whole change rests on: when the reporter cannot tell
+# anyone about a crash it must exit non-zero, so the caller's `if ! ...`
+# increments REPORT_FAILURES and the final workflow step turns the run
+# red. Nothing downstream of here can recover a crash that was neither
+# filed nor counted.
+start "a failed issue create makes the reporter exit non-zero"
+jq -n '[]' > "${GH_ISSUES}"
+GH_CREATE_FAILS=1 file_crash "${BIG_LOG}"
+if [ "${FILE_STATUS}" -ne 0 ]; then
+    ok "reporter exited ${FILE_STATUS}"
+else
+    fail "reporter exited 0 despite failing to file"
+fi
+
+start "a failed issue comment makes the reporter exit non-zero"
+jq -n --arg key "${KNOWN_KEY}" \
+    '[{number: 42,
+       title: "Coverage fuzz crash: fuzz_rebase_planners",
+       body: ({source: "coverage-fuzz",
+               target: "fuzz_rebase_planners",
+               dedup_key: $key} | tojson)}]' > "${GH_ISSUES}"
+GH_COMMENT_FAILS=1 file_crash "${BIG_LOG}"
+if [ "${FILE_STATUS}" -ne 0 ]; then
+    ok "reporter exited ${FILE_STATUS}"
+else
+    fail "reporter exited 0 despite failing to comment"
+fi
+
+start "a missing gh binary makes the reporter exit non-zero"
+EMPTY_BIN="${WORK}/emptybin"
+mkdir -p "${EMPTY_BIN}"
+GH_LOG="${WORK}/gh.log"; : > "${GH_LOG}"
+STATUS=0
+PATH="${EMPTY_BIN}" "${REPORTER}" fuzz_rebase_planners "${CRASH}" \
+    "${BIG_LOG}" > /dev/null 2>&1 || STATUS=$?
+if [ "${STATUS}" -ne 0 ]; then
+    ok "reporter exited ${STATUS}"
+else
+    fail "reporter exited 0 with no gh available"
+fi
 
 # --- Argument handling -------------------------------------------------
 start "bad arguments are rejected"

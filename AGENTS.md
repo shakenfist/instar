@@ -678,4 +678,5 @@ This allows reviewers to cherry-pick or drop individual fixes as needed.
 - `scripts/extract-fuzz-corpus.py` - Seeds + restores the coverage-fuzz corpus from instar-testdata
 - `tools/ci/fuzz-tier.sh` - Computes tiered nightly per-target fuzz durations
 - `tools/ci/report-fuzz-crash.sh` - Files the `security-audit` issue for a coverage-fuzz crash (bounds the log excerpt, dedups against open issues; see "Crash reporting" in `docs/testing.md`)
-- `tools/ci/test-report-fuzz-crash.sh` - Tests for the above; run it after any change to the reporter
+- `tools/ci/pick-fuzz-artifact.sh` - Chooses which libFuzzer artifact to report as the reproducer
+- `tools/ci/test-report-fuzz-crash.sh`, `tools/ci/test-pick-fuzz-artifact.sh` - Tests for those two; run them after any change (the `ci-tooling` CI job does)
