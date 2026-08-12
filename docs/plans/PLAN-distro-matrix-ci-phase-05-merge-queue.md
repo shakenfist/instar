@@ -79,12 +79,27 @@ required. Creating the ruleset first would block every merge on a
 context that never shows up. The correct order is:
 
 1. Merge the phase-4 work to `develop` normally, with no queue.
-2. `workflow_dispatch` dry run on `develop` — validates the seven-wide
-   fan-out, yields the wall-clock numbers phase 4 could not measure,
-   and proves `GITLAB_TESTDATA_TOKEN` reaches a non-`pull_request`
-   event (5b).
+2. `workflow_dispatch` dry run — validates the seven-wide fan-out,
+   yields the wall-clock numbers phase 4 could not measure, and proves
+   `GITLAB_TESTDATA_TOKEN` reaches a non-`pull_request` event (5b).
+   **Done 2026-08-11 on the `matrix-ci` branch** (run 31533536833): all
+   seven distros PASS, 0 failures, 89 minutes for the matrix. Full
+   table in the phase-4 plan.
 3. Create the ruleset (5a).
 4. Verification merge (5c).
+
+**One consequence of that run for 5a.** `can_merge` has still never
+executed — it is `merge_group`-only, so GitHub has never seen its check
+context. `Can enqueue` *has* now reported (success). Requiring a context
+that has never appeared is the classic way to jam every merge, so either:
+
+- create the ruleset requiring only `Can enqueue`, take one PR through
+  the queue so `Can merge` appears, then add it; or
+- create it requiring both and be ready to `DELETE` the ruleset if the
+  first merge hangs.
+
+The first is safer and costs one extra step. Prefer it unless Michael
+wants the gate complete from the first merge.
 
 ## Steps
 

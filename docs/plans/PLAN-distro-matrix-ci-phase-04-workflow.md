@@ -222,18 +222,56 @@ entries, so an absent property is an error even behind `|| false`.
 Declaring it per entry is better anyway — quarantine state is visible
 per row, and flipping one is a one-word diff.
 
-**Still outstanding**, and only obtainable from a real run:
+## First live fan-out (run 31533536833, 2026-08-11)
 
-- Measured wall-clock, split into runner boot + image pull versus suite
-  runtime (R1/R3). The 120-minute timeout is a placeholder chosen to be
-  generous, not a measurement.
-- Confirmation that `GITLAB_TESTDATA_TOKEN` reaches `merge_group`
-  (R4 — expected fine, per Michael).
-- The seven-wide fan-out itself. Everything above validates single
-  entries and the graph; nothing has yet run seven at once in CI.
+`workflow_dispatch` on `matrix-ci`. **All seven entries PASS, 0
+failures**, spanning six qemu-img versions from 6.2.0 to 10.2.2:
 
-The `workflow_dispatch` dry run is the cheapest way to get all three,
-and is the first thing phase 5 should do before enabling the queue.
+| Distro | qemu-img | Ran | Passed | Skipped | Failed | Duration |
+|--------|----------|-----|--------|---------|--------|----------|
+| Ubuntu 22.04 | 6.2.0 | 3262 | 2477 | 785 | 0 | 34 min |
+| Debian 12 | 7.2.22 | 3262 | 2477 | 785 | 0 | 23 min |
+| Ubuntu 24.04 | 8.2.2 | 3262 | 2477 | 785 | 0 | 39 min |
+| Debian 13 | 10.0.11 | 3262 | 2477 | 785 | 0 | 35 min |
+| Rocky 9 | 10.1.0 | 3262 | 2415 | 847 | 0 | 25 min |
+| Rocky 10 | 10.1.0 | 3262 | 2415 | 847 | 0 | 48 min |
+| Fedora latest | 10.2.2 | 3262 | 2477 | 785 | 0 | 28 min |
+
+Every entry ran the same 3262 tests. The two RHEL rows skip exactly 62
+more than the rest, which is `skip_unless_qemu_supports()` handling
+RHEL's qemu omitting the qed/qcow/parallels/dmg/bochs/cloop drivers
+(phase 2) — a consistent, explained difference, not drift.
+
+This also confirms phase 2b against **live** old qemu rather than the
+static per-version binaries it was measured with: Ubuntu 22.04 (6.2.0)
+and Debian 12 (7.2.22) were 21 failures each before 2b, and Ubuntu
+24.04 was 2.
+
+**Timings (R1/R3 answered).** Per-entry suite runtime is 23-48 min,
+median ~34 — well inside the 120-minute timeout, which can stay as
+headroom. The whole matrix took **89 minutes** wall-clock (01:14 →
+02:43) in two waves, so the effective `xl` concurrency was about four
+then three, not seven. Provisioning, not the cap we declined to set, is
+what serialises the fan-out; `max-parallel` would only have made this
+worse, so D5 stands even though its "one entry plus boot" latency
+estimate was optimistic.
+
+Note this dispatch is the **worst case** for scheduling: it runs the PR
+jobs *and* the matrix, and it competed with a concurrent PR run
+(31533917315) for the same pool. `package-build` sat queued 2h20m as a
+result. A real `merge_group` event runs only `build-and-test`,
+`package-build` and the matrix, so it should schedule better than this.
+
+**Still outstanding:**
+
+- `GITLAB_TESTDATA_TOKEN` on a `merge_group` event specifically. The
+  token demonstrably works on `workflow_dispatch`, which is strong
+  evidence (secrets are exposed the same way to non-fork events) but
+  not the same event class. First queue run confirms it.
+- `can_merge` has never reported — it is `merge_group`-only, so its
+  check context does not yet exist in this repository. That matters for
+  phase 5: requiring a context GitHub has never seen is the one way to
+  jam every merge.
 
 ## Acceptance
 
