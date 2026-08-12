@@ -51,6 +51,16 @@ cd "${REPO_ROOT}"
 DOCKERFILE="src/.devcontainer/Dockerfile"
 DIST_URL="https://static.rust-lang.org/dist"
 
+# --- 0. Prerequisites -----------------------------------------------------
+# Check up front rather than half way through: without this the missing
+# tool is only discovered at the validation step, after the Dockerfile has
+# already been rewritten, leaving a modified tree behind.
+if ! command -v docker >/dev/null 2>&1; then
+    echo "ERROR: docker is required to validate a candidate nightly but is not installed." >&2
+    echo "       CI installs it in the workflow's 'Install Docker' step." >&2
+    exit 1
+fi
+
 # --- 1. Current pin -------------------------------------------------------
 CURRENT="$(sed -nE 's/^ARG RUST_NIGHTLY=(nightly-[0-9]{4}-[0-9]{2}-[0-9]{2})$/\1/p' "${DOCKERFILE}")"
 if [ -z "${CURRENT}" ]; then
