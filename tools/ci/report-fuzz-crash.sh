@@ -168,18 +168,38 @@ fi
 # (72057594037927944..72057594037928200) exceeds total_file_size
 # (281076066929798)". Two inputs hitting the same assertion produce
 # different numbers, so exact-signature matching would file a fresh
-# issue every night for one bug. Collapsing standalone numbers in the
-# MESSAGE fixes that; the location is left alone, so two different
-# assertion sites in one file still get two issues.
+# issue every night for one bug.
 #
-# \b, so only whole numbers collapse. A bare sed 's/[0-9]*/N/g' would
-# also eat the digits inside identifiers -- "qcow2" and "qcow3" would
-# both become "qcowN" and two genuinely different bugs would share one
-# issue. Over-merging is the worse direction here: a duplicate issue is
-# noise, a swallowed crash is a crash nobody hears about.
-DEDUP_KEY="$(printf '%s %s' "${SIG_LOC}" \
-    "$(printf '%s' "${SIG_MSG}" | sed 's/\b[0-9][0-9]*\b/N/g')" \
-    | scrub_field)"
+# The location contributes verbatim except for the thread id: Rust
+# >=1.86 prints "thread '<unnamed>' (47) panicked at ...", and that 47
+# varies run to run. The file:line:col is deliberately NOT normalized,
+# so two different assertion sites in one file still get two issues.
+LOC_KEY="$(printf '%s' "${SIG_LOC}" \
+    | sed -E "s/^thread '[^']*' (\([0-9]+\) )?//")"
+
+# The message contributes only for a Rust panic. When the anchor is a
+# libFuzzer SUMMARY -- an OOM, a timeout, a deadly signal with no panic
+# -- the following line is libFuzzer's "MS:" mutation line, which ends
+# in a per-input "base unit: <hex>". That is unique to the input, not
+# to the bug, and hex survives digit collapsing, so including it would
+# give every recurring OOM a fresh key and a fresh issue every night.
+# The SUMMARY line alone identifies that class of failure.
+case "${SIG_LOC}" in
+    *SUMMARY:*)
+        DEDUP_KEY="$(printf '%s' "${LOC_KEY}" | scrub_field)"
+        ;;
+    *)
+        # \b, so only whole numbers collapse. A bare
+        # sed 's/[0-9]*/N/g' would also eat the digits inside
+        # identifiers -- "qcow2" and "qcow3" would both become "qcowN"
+        # and two genuinely different bugs would share one issue.
+        # Over-merging is the worse direction here: a duplicate issue
+        # is noise, a swallowed crash is one nobody hears about.
+        DEDUP_KEY="$(printf '%s %s' "${LOC_KEY}" \
+            "$(printf '%s' "${SIG_MSG}" | sed 's/\b[0-9][0-9]*\b/N/g')" \
+            | scrub_field)"
+        ;;
+esac
 if [ -z "${SIG_LOC}" ]; then
     DEDUP_KEY='unknown crash'
 fi
@@ -284,9 +304,16 @@ fi
 # through to filing, because a duplicate issue is a much smaller problem
 # than an unreported crash.
 if [ "${DEDUP}" -eq 1 ]; then
+    # --search narrows server-side to this target's issues, so the
+    # --limit page cannot fill up with other targets' crashes and push
+    # the match off the end -- which is most likely in exactly the
+    # situation dedup is for, a large backlog the once-a-day autofix
+    # cannot drain. The client-side match below is still the authority;
+    # the search only decides which issues get looked at.
     EXISTING="$(gh issue list \
         --label "security-audit" \
         --state open \
+        --search "in:title \"${TITLE}\"" \
         --json number,title,body \
         --limit 100 2>/dev/null \
         | jq -r --arg title "${TITLE}" --arg sig "${SIGNATURE}" \

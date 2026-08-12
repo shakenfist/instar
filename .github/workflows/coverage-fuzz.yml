@@ -375,6 +375,18 @@ jobs:
           echo "Total crashes found: $CRASHES_FOUND"
           echo "crashes_found=$CRASHES_FOUND" >> $GITHUB_ENV
 
+          # A run where every crash was filed successfully is green, so
+          # put the counts somewhere a reader sees without opening the
+          # step log.
+          {
+            echo "### Coverage fuzz"
+            echo ""
+            echo "- targets fuzzed: $(echo "$PLAN" | grep -c .)"
+            echo "- non-zero exits: $CRASHES_FOUND"
+            echo "- could not be reported: $REPORT_FAILURES"
+            echo "- exited without an artifact: $NO_ARTIFACT"
+          } >> $GITHUB_STEP_SUMMARY
+
           # Deliberately does NOT fail here. Failing this step would skip
           # the corpus push below, throwing away the night's new corpus
           # -- one of the three harms the original bug caused. The counts

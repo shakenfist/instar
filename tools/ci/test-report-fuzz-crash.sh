@@ -476,6 +476,81 @@ check "commented on the existing issue" \
 check "did not create a duplicate" \
     "$(grep -c 'issue create' "${GH_LOG}")" "0"
 
+start "an OOM recurring with different inputs is not refiled"
+# Not every fuzz failure is a Rust panic. On an OOM, a timeout or a
+# deadly signal the anchor is libFuzzer's SUMMARY line, and the line
+# after it is the MS: mutation line ending in a per-INPUT
+# "base unit: <hex>". Hex survives digit collapsing, so including that
+# line would give every recurring OOM a fresh key -- and a fresh issue
+# every night, into a queue drained once a day.
+make_oom_log() {
+    {
+        echo "==47== ERROR: libFuzzer: out-of-memory (malloc(4294967296))"
+        echo "SUMMARY: libFuzzer: out-of-memory"
+        echo "MS: 4 ShuffleBytes-CopyPart-ChangeBit-CMP-; base unit: $2"
+        echo "artifact_prefix='./'; Test unit written to ./oom-abc"
+    } > "$1"
+}
+make_oom_log "${WORK}/oom-a.log" 79125abc12
+make_oom_log "${WORK}/oom-b.log" aa4f9912cd
+OOM_A="$(run_reporter fuzz_qcow2 "${CRASH}" "${WORK}/oom-a.log" \
+    | jq -r '.dedup_key')"
+OOM_B="$(run_reporter fuzz_qcow2 "${CRASH}" "${WORK}/oom-b.log" \
+    | jq -r '.dedup_key')"
+check "the two OOM keys match" "${OOM_A}" "${OOM_B}"
+case "${OOM_A}" in
+    *"base unit"*) fail "key still carries the per-input base unit" ;;
+    *out-of-memory*) ok "key is the SUMMARY line: ${OOM_A}" ;;
+    *) fail "key does not identify the failure: ${OOM_A}" ;;
+esac
+
+start "a varying thread id does not change the key"
+# Rust >=1.86 prints "thread '<unnamed>' (47) panicked at ...", and the
+# 47 is a thread id that varies between runs.
+make_tid_log() {
+    {
+        echo "thread '<unnamed>' ($2) panicked at src/lib.rs:1:1:"
+        echo "boom at offset 4096"
+    } > "$1"
+}
+make_tid_log "${WORK}/tid-a.log" 47
+make_tid_log "${WORK}/tid-b.log" 12
+TID_A="$(run_reporter fuzz_vhd "${CRASH}" "${WORK}/tid-a.log" \
+    | jq -r '.dedup_key')"
+TID_B="$(run_reporter fuzz_vhd "${CRASH}" "${WORK}/tid-b.log" \
+    | jq -r '.dedup_key')"
+check "the two keys match" "${TID_A}" "${TID_B}"
+case "${TID_A}" in
+    *src/lib.rs:1:1*) ok "key keeps the crash location" ;;
+    *) fail "key lost the crash location: ${TID_A}" ;;
+esac
+# The signature a human reads keeps the thread id; only the key drops
+# it.
+SIG_A="$(run_reporter fuzz_vhd "${CRASH}" "${WORK}/tid-a.log" \
+    | jq -r '.signature')"
+case "${SIG_A}" in
+    *"(47)"*) ok "signature still shows the thread id" ;;
+    *) fail "signature lost the thread id: ${SIG_A}" ;;
+esac
+
+start "two assertion sites in one file stay separate"
+# The over-merge guard: normalizing the location's line:col would fold
+# these into one issue.
+make_tid_log "${WORK}/site-a.log" 47
+{
+    echo "thread '<unnamed>' (47) panicked at src/lib.rs:900:3:"
+    echo "boom at offset 4096"
+} > "${WORK}/site-b.log"
+SITE_A="$(run_reporter fuzz_vhd "${CRASH}" "${WORK}/site-a.log" \
+    | jq -r '.dedup_key')"
+SITE_B="$(run_reporter fuzz_vhd "${CRASH}" "${WORK}/site-b.log" \
+    | jq -r '.dedup_key')"
+if [ "${SITE_A}" != "${SITE_B}" ]; then
+    ok "different lines in one file get different keys"
+else
+    fail "two assertion sites collapsed to one key"
+fi
+
 start "digits inside identifiers are not collapsed"
 # A bare digit collapse would turn qcow2 and qcow3 both into qcowN and
 # merge two different bugs into one issue -- the wrong direction to err
@@ -600,18 +675,23 @@ else
     fail "reporter exited 0 despite failing to comment"
 fi
 
-start "a missing gh binary makes the reporter exit non-zero"
-EMPTY_BIN="${WORK}/emptybin"
-mkdir -p "${EMPTY_BIN}"
-GH_LOG="${WORK}/gh.log"; : > "${GH_LOG}"
+start "an unavailable gh makes the reporter exit non-zero"
+# Shadow gh specifically. Emptying PATH instead would kill the script
+# at its first mktemp, long before gh, and the assertion would pass on
+# an unrelated failure -- so a regression making a missing gh non-fatal
+# would still look green.
+MISSING_BIN="${WORK}/missingbin"
+mkdir -p "${MISSING_BIN}"
+cat > "${MISSING_BIN}/gh" <<'STUB'
+#!/usr/bin/env bash
+echo "gh: command not found" >&2
+exit 127
+STUB
+chmod +x "${MISSING_BIN}/gh"
 STATUS=0
-PATH="${EMPTY_BIN}" "${REPORTER}" fuzz_rebase_planners "${CRASH}" \
-    "${BIG_LOG}" > /dev/null 2>&1 || STATUS=$?
-if [ "${STATUS}" -ne 0 ]; then
-    ok "reporter exited ${STATUS}"
-else
-    fail "reporter exited 0 with no gh available"
-fi
+PATH="${MISSING_BIN}:${PATH}" "${REPORTER}" fuzz_rebase_planners \
+    "${CRASH}" "${BIG_LOG}" > /dev/null 2>&1 || STATUS=$?
+check "reporter propagated gh's failure" "${STATUS}" "127"
 
 # --- Argument handling -------------------------------------------------
 start "bad arguments are rejected"

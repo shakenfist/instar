@@ -54,10 +54,21 @@ setup "crash-aaa:100"
 check "crash picked" "$(pick crash)" "${D}/crash-aaa"
 check "no minimized file yet" "$(pick minimized)" ""
 
-start "a 0-byte artifact is never chosen"
-# The exact shape a failed `cargo fuzz tmin` used to leave behind.
+start "an empty crash artifact is still reported"
+# libFuzzer writes a 0-byte crash-* when a target panics on the empty
+# input. Rejecting it would send the workflow down its no-artifact
+# branch, which files nothing and tells the reader to check the build
+# -- pointing away from a real crash. Only minimized-from-* needs the
+# empty-file filter, where empty means tmin failed.
 setup "crash-aaa:0"
-check "empty crash rejected" "$(pick crash)" ""
+check "empty crash reported" "$(pick crash)" "${D}/crash-aaa"
+
+# With only the 0-byte crash present the catch-all branch would return
+# it either way, so pair it with a lower-ranked artifact: the crash has
+# to win on rank, not fall through on size.
+setup "crash-aaa:0" "timeout-zzz:100"
+check "empty crash still outranks a timeout" \
+    "$(pick crash)" "${D}/crash-aaa"
 
 start "a failed minimization does not become the reproducer"
 setup "crash-aaa:100" "minimized-from-aaa:0"
@@ -122,6 +133,38 @@ setup "crash-aaa:100"
 mkdir -p "${D}/nested"
 head -c 100 < /dev/zero | tr '\0' 'x' > "${D}/nested/crash-000"
 check "nested file ignored" "$(pick crash)" "${D}/crash-aaa"
+
+start "a large artifacts directory does not make the picker fail"
+# `find | sort | head -1` exits 141 once sort's output outgrows the
+# 64KB pipe buffer and it takes EPIPE. Under this script's
+# `set -euo pipefail` that beats its own `exit 0`, and the workflow
+# call site is a bare `CRASH_FILE=$(...)` under `bash -e` -- so the
+# fuzz step would abort at the first crash, which is the entire failure
+# this script was extracted to prevent. Every other case here uses one
+# to three files and so cannot see it.
+D="${WORK}/many"
+mkdir -p "${D}"
+python3 - "${D}" <<'PY'
+import sys
+d = sys.argv[1]
+for i in range(3000):
+    with open(f'{d}/crash-{i:06d}', 'w') as f:
+        f.write('x' * 40)
+PY
+STATUS=0
+OUT="$(pick crash)" || STATUS=$?
+check "exited 0 with 3000 artifacts" "${STATUS}" "0"
+check "still returned the first artifact" "${OUT}" "${D}/crash-000000"
+
+STATUS=0
+OUT="$(pick minimized)" || STATUS=$?
+check "minimized mode exited 0 too" "${STATUS}" "0"
+
+# The shape the workflow actually uses.
+STATUS=0
+bash -e -c "CRASH_FILE=\$('${PICK}' crash '${D}'); [ -n \"\${CRASH_FILE}\" ]" \
+    || STATUS=$?
+check "survives a bare assignment under bash -e" "${STATUS}" "0"
 
 start "bad arguments are rejected"
 if "${PICK}" crash > /dev/null 2>&1; then

@@ -42,12 +42,30 @@ if [ ! -d "${DIR}" ]; then
     exit 0
 fi
 
+# Take the first line WITHOUT `head`. `find | sort | head -1` looks
+# harmless, but head exits after one line, and once sort's output
+# outgrows the 64KB pipe buffer sort takes EPIPE and the pipeline exits
+# 141. Under this script's `set -euo pipefail` that kills it before its
+# `exit 0` -- and in the workflow the call site is a bare
+# `CRASH_FILE=$(...)` under `bash -e`, so the whole fuzz step would
+# abort at the first crash. That is precisely the failure this script
+# was extracted to prevent. Measured: 3000 artifacts, exit 141, no
+# output.
+first_line() {
+    local all
+    all="$(cat)"
+    [ -n "${all}" ] || return 0
+    printf '%s\n' "${all%%$'\n'*}"
+}
+
 case "${MODE}" in
     minimized)
         # -size +0c: a failed tmin leaves an empty file, and reporting
         # that as the reproducer is worse than reporting the original.
+        # This is the ONLY place the empty-file filter belongs -- see
+        # the crash branch below.
         find "${DIR}" -maxdepth 1 -type f -name 'minimized-from-*' \
-            -size +0c 2>/dev/null | sort | head -1
+            -size +0c 2>/dev/null | sort | first_line
         exit 0
         ;;
     crash)
@@ -71,17 +89,25 @@ esac
 #
 # minimized-from-* is excluded here because this is the file tmin is
 # about to be pointed AT; the caller asks for `minimized` afterwards.
+#
+# Note there is no -size +0c here. libFuzzer writes a 0-byte crash-*
+# when a target panics on the empty input, and that is a real crash
+# worth an issue -- report-fuzz-crash.sh already copes with a zero or
+# unknown size. Filtering it out here would make the workflow take its
+# no-artifact branch and tell the reader to go and check the build.
+# Only minimized-from-* needs the empty-file filter, because there an
+# empty file means tmin failed rather than that the input was empty.
 for PREFIX in 'crash-' 'oom-' 'leak-' 'timeout-' 'slow-unit-'; do
     MATCH="$(find "${DIR}" -maxdepth 1 -type f -name "${PREFIX}*" \
-        -size +0c 2>/dev/null | sort | head -1)"
+        2>/dev/null | sort | first_line)"
     if [ -n "${MATCH}" ]; then
         echo "${MATCH}"
         exit 0
     fi
 done
 
-# Anything else non-empty that is not a minimization leftover: a prefix
-# we have not seen before is still better than reporting nothing.
-find "${DIR}" -maxdepth 1 -type f ! -name 'minimized-from-*' -size +0c \
-    2>/dev/null | sort | head -1
+# Anything else that is not a minimization leftover: a prefix we have
+# not seen before is still better than reporting nothing.
+find "${DIR}" -maxdepth 1 -type f ! -name 'minimized-from-*' \
+    2>/dev/null | sort | first_line
 exit 0

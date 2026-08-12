@@ -840,7 +840,7 @@ Issues with the `security-audit` label immediately when found, by
 `instar-testdata/custom/fuzz-corpus/` after nightly runs, and restored
 by target name on the next run so coverage compounds.
 
-Four rules make that reporting safe, most of them learned from a month
+These rules make that reporting safe, most of them learned from a month
 of silently broken nightlies:
 
 - **The log excerpt is bounded in bytes, and never travels on a command
@@ -900,12 +900,23 @@ the real crash behind this change reads `Write patch 0
 (72057594037927944..72057594037928200) exceeds total_file_size
 (281076066929798)`. Two inputs hitting one assertion produce two
 different signatures, so exact matching would file a fresh issue every
-night for a single bug. The key is the location verbatim plus the
+night for a single bug. The key is the location plus the
 message with standalone numbers collapsed to `N`. Digits *inside*
 identifiers are left alone, so `qcow2` and `qcow3` do not merge: a
 duplicate issue is only noise, whereas two different bugs sharing one
-issue loses a crash. Issues filed before `dedup_key` existed are still
-matched on their `signature`.
+issue loses a crash. For the same reason the `file:line:col` is never
+normalized — two assertion sites in one file stay two issues — but the
+thread id in `thread '<unnamed>' (47) panicked at …` is dropped, since
+it varies run to run.
+
+Not every fuzz failure is a Rust panic. An OOM, a timeout or a deadly
+signal anchors on libFuzzer's `SUMMARY:` line instead, and the line
+after *that* is the `MS:` mutation line, which ends in a per-input
+`base unit: <hex>`. Hex survives digit collapsing, so for a
+SUMMARY-anchored failure the key is the `SUMMARY:` line alone;
+including the `MS:` line would give every recurring OOM a new key and a
+new issue every night. Issues filed before `dedup_key` existed are
+still matched on their `signature`.
 
 Run the reporter by hand against a downloaded `coverage-fuzz-logs`
 artifact to check what an issue would say, without filing anything:
@@ -944,12 +955,18 @@ Do not pass `-max_len` to `cargo fuzz tmin`: it supplies its own, and a
 second one trips libFuzzer's `assert(MaxInputLen == 0)`, so
 minimization fails and leaves a 0-byte `minimized-from-*` artifact
 behind — which an unsorted `find | head -1` would then happily report as
-the reproducer for a later crash. The picker therefore skips empty files
-and `minimized-from-*` when choosing what to minimize, and afterwards is
+the reproducer for a later crash. The picker therefore skips
+`minimized-from-*` when choosing what to minimize, and afterwards is
 asked separately for the non-empty `minimized-from-*` that `tmin`
 produced; without that second step the issue would quote the size of,
 and the reproducer point at, the original large artifact, and
 minimization would cost CI time without improving anything.
+
+The empty-file filter applies *only* to `minimized-from-*`, where an
+empty file means `tmin` failed. A 0-byte `crash-*` is a real crash —
+libFuzzer writes one when a target panics on the empty input — and
+filtering it out would send the workflow down its no-artifact branch,
+filing nothing and telling the reader to go and check the build.
 
 Artifacts are taken in an explicit order of preference — `crash-`,
 `oom-`, `leak-`, `timeout-`, `slow-unit-`, then anything else — rather

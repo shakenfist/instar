@@ -291,11 +291,19 @@ do not bump the pin by hand without at least building the full image.
 (The lint container is separate and uses a stable `rust:` tag Renovate
 does manage.)
 
-### CI test partition
+### CI tooling guards
+
+The `ci-tooling` CI job runs the cheap guards over CI's own tooling:
+the test-partition check below, plus
+`tools/ci/test-report-fuzz-crash.sh` and
+`tools/ci/test-pick-fuzz-artifact.sh` for the coverage-fuzz helpers
+(see "Crash reporting" in [docs/testing.md](docs/testing.md)). It is
+also the job named in `automated_reviewer`'s `needs` list, which is
+required to list every job that can fail a PR.
 
 Integration tests are split across several CI jobs by stestr regex
-selectors (the `test-container-*` Makefile targets). The
-`test-partition` CI job (`tools/ci/check-test-partition.sh`) fails if
+selectors (the `test-container-*` Makefile targets).
+`tools/ci/check-test-partition.sh` fails if
 any `test_*.py` test is run by **no** pull-request job. When you add a
 new integration test module or a new integration job, the guard
 validates that the new partition still covers everything; an orphan is
