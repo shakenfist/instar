@@ -15,6 +15,16 @@ repos:
         pass_filenames: false
         files: ^src/
 
+      # The two devcontainer images must pin the same Rust nightly.
+      # bump-rust-nightly.sh enforces this too, but only weekly; here it
+      # catches a hand-edit before it lands.
+      - id: nightly-pins
+        name: devcontainer Rust nightly pins agree
+        entry: ./tools/ci/check-nightly-pins.sh
+        language: script
+        pass_filenames: false
+        files: ^src/\.devcontainer/.*Dockerfile$
+
   - repo: https://github.com/rhysd/actionlint
     rev: v1.7.7
     hooks:

@@ -64,7 +64,11 @@ SELECT=''
 CONCURRENCY=4
 
 usage() {
-    sed -n '2,58p' "$0" | sed 's/^# \{0,1\}//'
+    # Self-delimiting: print the header comment block from line 2 up to
+    # the first line that is not a comment. A hard-coded end line goes
+    # quietly wrong -- truncating or over-running --help -- the next
+    # time anyone edits this (deliberately extensive) header.
+    awk 'NR > 1 { if (!/^#/) exit; sub(/^# ?/, ""); print }' "$0"
 }
 
 POSITIONAL=()

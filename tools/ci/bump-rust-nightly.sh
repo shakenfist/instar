@@ -73,12 +73,10 @@ if [ -z "${CURRENT}" ]; then
     exit 1
 fi
 # The two Dockerfiles must agree; a drift means a previous bump only
-# touched one of them.
-BUILD_CURRENT="$(sed -nE 's/^ARG RUST_NIGHTLY=(nightly-[0-9]{4}-[0-9]{2}-[0-9]{2})$/\1/p' "${BUILD_DOCKERFILE}")"
-if [ "${BUILD_CURRENT}" != "${CURRENT}" ]; then
-    echo "ERROR: pin drift: ${DOCKERFILE}=${CURRENT} but ${BUILD_DOCKERFILE}=${BUILD_CURRENT}" >&2
-    exit 1
-fi
+# touched one of them. The comparison lives in its own script so that
+# pre-commit and build-and-test can run it on every change rather than
+# only when this weekly bump fires.
+tools/ci/check-nightly-pins.sh
 echo "Current pin: ${CURRENT}"
 
 # --- 2. Newest published nightly ------------------------------------------

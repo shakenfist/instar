@@ -97,8 +97,14 @@ pub struct OutputProfile {
     /// `VM_CLOCK` titles, space-separated widths 7/16/8/19/15/10, and a
     /// 4-digit-hour clock. Before 9.0 the titles are `VM SIZE` /
     /// `VM CLOCK`, the fields are concatenated with no separators at
-    /// widths 10/18/7/20/13/11, and hours are 2-digit. The boundary is
+    /// widths 10/16/9/20/13/11, and hours are 2-digit. The boundary is
     /// exactly 9.0.0, measured across 6.0.0-10.2.0.
+    ///
+    /// The 16/9 split is load-bearing and was got wrong once: 10/18/7
+    /// renders identically for any tag that fits its field (16 + 9 ==
+    /// 18 + 7) and only diverges on overflow. See
+    /// `snapshot_human_overflowing_tag_pins_the_column_widths`, which
+    /// is the test that actually distinguishes them.
     pub snapshot_underscored_columns: bool,
 }
 

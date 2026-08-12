@@ -75,6 +75,11 @@ set +e
 RC=${PIPESTATUS[0]}
 set -e
 
-"${REPO_ROOT}/tools/ci/summarise-matrix-entry.sh" "$NAME" "$IMAGE" "$RC" "$LOG"
+# The summary must never change the verdict. Under `set -e` a summariser
+# failure -- an unwritable $GITHUB_STEP_SUMMARY, a sed error on a
+# half-written log -- would kill this script before `exit "$RC"` and
+# report a passing two-hour matrix entry as a merge-gating failure.
+"${REPO_ROOT}/tools/ci/summarise-matrix-entry.sh" "$NAME" "$IMAGE" "$RC" "$LOG" \
+    || echo 'warning: summary generation failed; the result below stands' >&2
 
 exit "$RC"

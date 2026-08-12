@@ -119,6 +119,32 @@ not in the Docker Official `rockylinux` library, which stops at 9):
 | 1f | medium | sonnet | none | **Audit every workflow + script reference to the image names and make targets.** `release.yml` (`docker image rm -f instar-build` + `make instar`/`make package` → build image, should stay correct — confirm), `functional-tests.yml` `package-smoke` (build image — confirm) and `build-and-test` / test jobs (must target `instar-dev` now — fix any `instar-build` references that meant the dev image), and **`rust-nightly-bump.yml`** (must test-build **both** images against a candidate nightly so a nightly that breaks either image blocks the bump — today it builds one). Grep the whole tree for `instar-build` and `instar-devcontainer` and reconcile each hit. |
 | 1g | low | sonnet | none | **Docs.** CHANGELOG (`[Unreleased]`): lowered glibc floor → Debian/Ubuntu/Fedora/Rocky coverage incl. Rocky 9 & Ubuntu 22.04, via the build/dev container split. `docs/development.md`: the two-image model, which make targets use which image, the bullseye rationale, and the R1 protoc note. `ARCHITECTURE.md` / `AGENTS.md`: brief pointer to the split (not duplicating docs/). README install section: state the new minimum glibc (2.31) if it names one. |
 
+## Execution results
+
+**The image names shipped the other way round from this plan.** The
+design section below says the bullseye build image keeps the name
+`instar-build` and the dev/test image is renamed `instar-dev`. What
+landed is the reverse:
+
+| Role | Plan said | Shipped as |
+|------|-----------|------------|
+| Minimal bullseye release build | `instar-build` | **`instar-release`** |
+| Fat dev/test image (qemu, libyal, fuzzers) | `instar-dev` | **`instar-build`** |
+
+`INSTAR_BUILD_IMAGE := instar-release` and `INSTAR_DEV_IMAGE :=
+instar-build` (`Makefile:116-117`), and AGENTS.md, `docs/development.md`
+and the Makefile comments all describe the shipped scheme. The reason
+is in the Makefile: many existing CI steps run `docker run ...
+instar-build ...` to execute tests, and every one of them means the
+*dev* image. Keeping `instar-build` pointing at the dev image left all
+of those correct without edits, and gave the genuinely new thing a new
+name.
+
+Read the rest of this file with that substitution in mind. Following it
+literally means running `docker run instar-build` expecting the minimal
+bullseye image and silently getting the fat dev image, which has a
+different glibc and different tooling.
+
 ## Step 1a outcome (2026-08-11)
 
 `tools/validate-published-release.sh` ran on two real KVM VMs against

@@ -746,6 +746,8 @@ This allows reviewers to cherry-pick or drop individual fixes as needed.
 - `.github/workflows/coverage-fuzz.yml` - Coverage-guided fuzzing of parser crates (nightly + PR)
 - `.github/workflows/fuzz-autofix.yml` - Automated fuzzer bug fix (daily Claude Code, 30-turn limit)
 - `.github/workflows/rust-nightly-bump.yml` - Weekly devcontainer Rust nightly pin bump (see "Toolchain pinning" above)
+- `.github/workflows/codeql-analysis.yml` - CodeQL static analysis (push/PR to develop, plus weekly cron)
+- `.github/workflows/supply-chain.yml` - gitleaks secret scanning on debian-13 (PR/push, plus weekly cron)
 
 The self-hosted runners have no Docker preinstalled, so any job touching
 `docker` or a container-backed Makefile target needs an "Install Docker"

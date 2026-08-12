@@ -40,5 +40,12 @@ jobs:
       - name: Install gitleaks
         run: sudo apt-get update && sudo apt-get install -y gitleaks
 
+      # Findings are suppressed by fingerprint in .gitleaksignore, which
+      # documents the format and the rotate-before-suppressing rule.
+      # This repository legitimately carries LUKS test passphrases,
+      # synthetic keys from scripts/create-luks-*, and fixture UUIDs, so
+      # a false positive is a question of when rather than whether --
+      # and without an in-repo suppression path the first one turns
+      # every subsequent PR red until someone edits this workflow.
       - name: Run gitleaks
         run: gitleaks detect --source . --redact --verbose --no-banner

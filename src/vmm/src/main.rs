@@ -19340,7 +19340,7 @@ Offset          Length          Mapped to       File
         // Captured from instar-testdata's static qemu-img builds:
         // every version from 6.0.0 through 8.2.2 emits this header,
         // and 9.0.0 onwards emits the underscored one. The fields are
-        // concatenated with NO separators at widths 10/18/7/20/13/11,
+        // concatenated with NO separators at widths 10/16/9/20/13/11,
         // giving a 79-character line against the modern layout's 80.
         let e = snap("9999", "short", 0, 0, 0, 0, 0, 0);
         let out = render_snapshot_human_as(&[e], 8, 2);
@@ -19354,8 +19354,10 @@ Offset          Length          Mapped to       File
         );
         assert_eq!(header.len(), 79, "pre-9.0 header is 79 bytes");
 
-        // ID padded to 10, TAG to 18, then VM SIZE right-aligned in
-        // 7 — so 17 spaces sit between "short" and "0 B".
+        // ID padded to 10, TAG to 16, then VM SIZE right-aligned in
+        // 9 — 11 + 6 = 17 spaces sit between "short" and "0 B".
+        // (10/18/7 gives the same 17 here; only an overflowing tag
+        // tells the two splits apart.)
         assert!(
             text.contains("9999      short                 0 B"),
             "row: {:?}",

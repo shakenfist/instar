@@ -1,24 +1,22 @@
 name: Functional Tests
 
 on:
+  # Deliberately NO `paths:` filter on any trigger. This workflow
+  # produces the `Can enqueue` and `Can merge` contexts that branch
+  # protection requires, and a required check is only satisfied by a
+  # check that *reports*. A trigger-level `paths:` filter does not make
+  # the check skip -- it stops the workflow running at all, so the
+  # context never appears and GitHub leaves it Pending forever. That is
+  # a permanent block, not a skip. (A skipped *job* reports success,
+  # which is why `can_merge` skipping on pull requests is fine; a
+  # workflow that never runs is a different thing entirely.)
+  #
+  # Docs-only changes are cheap instead of untested: the `check_paths`
+  # job below computes whether any code changed, and the expensive jobs
+  # gate on its output. They skip, `can_enqueue` still reports, and the
+  # PR is mergeable.
   pull_request:
-    paths:
-      - 'src/**'
-      - 'crates/**'
-      - 'tests/**'
-      - 'scripts/**'
-      - 'tools/**'
-      - 'Makefile'
-      - '.github/workflows/functional-tests.yml'
   workflow_dispatch:
-  # The merge queue runs the distro matrix and nothing else -- see the
-  # comment above the job list. Note that `merge_group` does NOT inherit
-  # the `paths:` filter above: this workflow always runs in the queue.
-  # That is deliberate. A required check that never runs leaves the
-  # queue waiting forever, so the matrix must always report. The cost is
-  # that a docs-only PR still pays full matrix latency; adding a
-  # paths-filter job (as shakenfist/shakenfist does with check_paths) is
-  # the fix if that becomes painful.
   merge_group:
 
 permissions:
@@ -40,11 +38,51 @@ permissions:
 # superset of the PR integration jobs, on seven distros instead of one.
 # Re-running the PR jobs in the queue would buy a second copy of a
 # strictly weaker signal. build-and-test is the deliberate exception --
-# it stays ungated as the cheap fast-fail, and package-build needs it.
+# it runs in both as the cheap fast-fail, and package-build needs it.
+#
+# Orthogonally, every expensive job also gates on check_paths, so a
+# docs-only pull request skips them all and is gated only by the
+# aggregates.
 #
 # If you are here to "fix" the gating so everything runs everywhere,
 # read docs/plans/PLAN-distro-matrix-ci-phase-04-workflow.md first.
 jobs:
+  # Detect docs-only changes so the heavy jobs can skip them. This
+  # replaces the trigger-level `paths:` filter this workflow used to
+  # carry -- see the comment on `on:` for why that filter was a merge
+  # blocker once `Can enqueue` became a required check.
+  #
+  # For anything other than a pull request the filter step is skipped
+  # and the output falls back to `code_changed=true`, so the merge queue
+  # and manual dispatches always run everything. A merge group that
+  # contains only docs therefore still pays for the matrix; that is the
+  # safe direction, and cheap to revisit if it proves annoying.
+  check_paths:
+    name: "Check paths"
+    runs-on: [self-hosted, static]
+    timeout-minutes: 10
+    outputs:
+      code_changed: ${{ steps.filter.outputs.code || 'true' }}
+    steps:
+      - uses: actions/checkout@v7
+        if: github.event_name == 'pull_request'
+
+      - uses: dorny/paths-filter@v4
+        id: filter
+        if: github.event_name == 'pull_request'
+        with:
+          # By default a file matches if it matches ANY listed pattern,
+          # which makes '**' match everything and silently defeats the
+          # exclusions. 'every' requires a file to match ALL patterns,
+          # which is the correct semantics for "everything except docs".
+          predicate-quantifier: 'every'
+          filters: |
+            code:
+              - '**'
+              - '!docs/**'
+              - '!**/*.md'
+              - '!.github/exported-config/**'
+
   # Guards over CI's own tooling: cheap enough (pure Python, bash and
   # jq -- no /dev/kvm, no testdata, no build) to share one small runner
   # and give fast feedback.
@@ -61,7 +99,10 @@ jobs:
   # docs/testing.md.
   ci-tooling:
     name: "CI tooling guards"
-    if: github.event_name == 'pull_request'
+    needs: check_paths
+    if: >-
+      github.event_name == 'pull_request'
+      && needs.check_paths.outputs.code_changed != 'false'
     runs-on: [self-hosted, debian-12, s]
     timeout-minutes: 10
     steps:
@@ -92,6 +133,8 @@ jobs:
         run: tools/ci/test-pick-fuzz-artifact.sh
 
   build-and-test:
+    needs: check_paths
+    if: needs.check_paths.outputs.code_changed != 'false'
     runs-on: [self-hosted, debian-12, s]
     timeout-minutes: 30
 
@@ -152,6 +195,9 @@ jobs:
               --exclude amend-op \
               --exclude bitmap-op \
               --exclude bench-op
+
+      - name: Check devcontainer Rust nightly pins agree
+        run: tools/ci/check-nightly-pins.sh
 
       - name: Feature-gated crate tests in container
         # Mirrors the feature-gated tail of the Makefile's test-rust
@@ -305,8 +351,10 @@ jobs:
   # queue matrix; see docs/plans/PLAN-distro-matrix-ci.md for the
   # full design.
   package-smoke:
-    needs: build-and-test
-    if: github.event_name != 'merge_group'
+    needs: [check_paths, build-and-test]
+    if: >-
+      github.event_name != 'merge_group'
+      && needs.check_paths.outputs.code_changed != 'false'
     runs-on: [self-hosted, debian-12, xl]
     timeout-minutes: 30
 
@@ -530,8 +578,10 @@ jobs:
   # Core integration tests: info, check, security, version-detection, oslo-crossval
   # These are fast (header-parsing only, no full image conversion)
   integration-core:
-    needs: build-and-test
-    if: github.event_name != 'merge_group'
+    needs: [check_paths, build-and-test]
+    if: >-
+      github.event_name != 'merge_group'
+      && needs.check_paths.outputs.code_changed != 'false'
     runs-on: [self-hosted, debian-12, xl]
     timeout-minutes: 45
 
@@ -712,8 +762,10 @@ jobs:
 
   # QCOW2/VMDK/RAW conversion and comparison tests
   integration-convert-qcow2:
-    needs: build-and-test
-    if: github.event_name != 'merge_group'
+    needs: [check_paths, build-and-test]
+    if: >-
+      github.event_name != 'merge_group'
+      && needs.check_paths.outputs.code_changed != 'false'
     runs-on: [self-hosted, debian-12, xl]
     timeout-minutes: 60
 
@@ -793,8 +845,10 @@ jobs:
 
   # VHD/VHDX conversion tests (slowest format family)
   integration-convert-vhd:
-    needs: build-and-test
-    if: github.event_name != 'merge_group'
+    needs: [check_paths, build-and-test]
+    if: >-
+      github.event_name != 'merge_group'
+      && needs.check_paths.outputs.code_changed != 'false'
     runs-on: [self-hosted, debian-12, xl]
     timeout-minutes: 90
 
@@ -883,8 +937,10 @@ jobs:
   # with /dev/kvm passed through, the same execution model as
   # the differential-fuzz workflow.
   snapshot-harnesses:
-    needs: build-and-test
-    if: github.event_name != 'merge_group'
+    needs: [check_paths, build-and-test]
+    if: >-
+      github.event_name != 'merge_group'
+      && needs.check_paths.outputs.code_changed != 'false'
     runs-on: [self-hosted, debian-12, xl]
     timeout-minutes: 30
 
@@ -930,8 +986,10 @@ jobs:
   # This catches drift from oslo.utils development before
   # it reaches PyPI. Allowed to fail (informational).
   oslo-crossval-master:
-    needs: build-and-test
-    if: github.event_name != 'merge_group'
+    needs: [check_paths, build-and-test]
+    if: >-
+      github.event_name != 'merge_group'
+      && needs.check_paths.outputs.code_changed != 'false'
     runs-on: [self-hosted, debian-12, xl]
     timeout-minutes: 30
     continue-on-error: true
@@ -1067,6 +1125,7 @@ jobs:
   can_enqueue:
     name: "Can enqueue"
     needs:
+      - check_paths
       - ci-tooling
       - build-and-test
       - package-smoke

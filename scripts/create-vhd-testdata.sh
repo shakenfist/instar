@@ -69,6 +69,18 @@ def build_footer(disk_size, disk_type):
     # Fixed: data_offset = 0xFFFFFFFFFFFFFFFF
     data_offset = 0xFFFFFFFFFFFFFFFF
     timestamp = 0
+    # Deliberately NOT the marker instar itself writes. instar stamps
+    # "qem2" so that qemu-img < 10.0 trusts current_size instead of
+    # recomputing the size from CHS geometry, which can under-address it
+    # and silently truncate the tail (docs/quirks.md, "unknown creator
+    # apps under emulated qemu < 10.0"). This generator mimics a
+    # third-party writer, so it keeps the unknown-creator marker on
+    # purpose: these fixtures are how that read path stays exercised.
+    # Do not "fix" this to qem2.
+    #
+    # NB: this whole block is inside python3 -c with single quotes, so
+    # an apostrophe here terminates the shell string and breaks the
+    # script. Keep the prose apostrophe-free.
     creator_app = b"imgo"
     creator_ver = 0x00010000
     creator_os = b"Wi2k"
