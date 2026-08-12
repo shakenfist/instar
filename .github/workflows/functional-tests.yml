@@ -441,7 +441,7 @@ jobs:
           ls -la dist/
 
       - name: Upload packages
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: instar-packages
           path: dist/
@@ -568,7 +568,7 @@ jobs:
 
       - name: Upload logs
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: matrix-${{ matrix.distro.pkg_kind }}-${{ strategy.job-index }}-logs
           path: ${{ github.workspace }}/matrix.log
