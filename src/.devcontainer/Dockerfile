@@ -1,5 +1,19 @@
 # syntax=docker/dockerfile:1
-FROM mcr.microsoft.com/devcontainers/base:debian
+#
+# Dev/test image: the full Debian toolchain (qemu-utils, the libyal
+# parsers, cargo-fuzz/audit, gh) used by the test and fuzz suites and
+# the VS Code devcontainer. The release binary is built on the separate
+# minimal build image (src/.devcontainer/build/Dockerfile,
+# debian:bullseye) so its glibc floor is not tied to this base.
+#
+# The base is pinned by digest for reproducibility (the qemu-img this
+# image ships is the differential fuzzer's reference oracle, so a
+# silent base change would move that oracle). The :debian tag is kept
+# alongside the digest so Renovate's Docker manager walks the digest
+# forward with a PR whenever the rolling tag is rebuilt upstream; the
+# renovate.json digest rule routes those as reviewable (non-automerged)
+# PRs.
+FROM mcr.microsoft.com/devcontainers/base:debian@sha256:025b74bb5f7ac53edd77e01aa7188c359aab100e23a2f6220bde50bbb9fd31dd
 
 # Install build dependencies and test tools
 # - protobuf-compiler: required for micropb-gen

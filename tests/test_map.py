@@ -28,6 +28,7 @@ import tempfile
 from pathlib import Path
 
 from base import InstarTestBase
+from helpers.comparators import substitute_testdata_root
 
 
 class TestMapSmoke(InstarTestBase):
@@ -820,4 +821,133 @@ for _img_id, (_pattern, _reason) in KNOWN_MAP_DIVERGENCES.items():
             TestMapDivergenceRegression,
             _name,
             _make_divergence_regression_test(_img_id, _ot, _reason),
+        )
+
+
+class TestMapCrossProfile(TestMapSmoke):
+    """Every map profile is emitted correctly, on any host.
+
+    The baseline tests above compare only against the profile
+    matching the *installed* qemu-img, so a single-version host
+    exercises exactly one side of every version boundary. That
+    is how the `compressed` divergence survived until the distro
+    matrix ran: the dev host is 10.x, where instar's
+    unconditional `compressed` happened to be right.
+
+    These tests drive `--qemu-version` explicitly and compare
+    against that profile's own baselines, so both sides of the
+    8.2 boundary are checked wherever the suite runs.
+    """
+
+
+def _make_cross_profile_test(profile_name, version, output_type):
+    """Factory: assert one profile's baselines are reproduced when
+    that profile is selected explicitly."""
+
+    def test(self):
+        profile_dir = (
+            self._testdata_root / 'expected-outputs' /
+            f'map-{output_type}' / 'profiles' / profile_name
+        )
+        if not profile_dir.is_dir():
+            self.skipTest(f'no profile dir: {profile_dir}')
+
+        checked = 0
+        for image_dict in _safe_tier_images():
+            image_id = image_dict['id']
+            if image_id in KNOWN_MAP_DIVERGENCES:
+                continue
+            image_path = self._testdata_root / image_dict['path']
+            if not image_path.exists():
+                continue
+            baseline = profile_dir / f'{image_id}.stdout.txt'
+            meta_path = profile_dir / f'{image_id}.meta.json'
+            if not baseline.exists() or not meta_path.exists():
+                continue
+            with meta_path.open() as f:
+                if json.load(f).get('return_code', 0) != 0:
+                    continue
+
+            stdout, stderr, rc = self.run_instar_map(
+                str(image_path), '--output', output_type,
+                '--qemu-version', version,
+            )
+            if rc != 0:
+                # Same allowance as the baseline tests: a source
+                # instar cannot read is not a version-parity fact.
+                continue
+
+            expected = substitute_testdata_root(
+                baseline.read_text(), str(self._testdata_root)
+            )
+            self.assertEqual(
+                stdout, expected,
+                f'{image_id} ({output_type}) does not match '
+                f'{profile_name} when emulating qemu {version}',
+            )
+            checked += 1
+
+        if checked == 0:
+            self.skipTest(
+                f'no comparable images for {profile_name} ({output_type})'
+            )
+
+    test.__name__ = (
+        f'test_profile_{profile_name.replace("-", "_")}_{output_type}'
+    )
+    test.__doc__ = (
+        f'instar map --qemu-version {version} --output={output_type} '
+        f'reproduces {profile_name}.'
+    )
+    return test
+
+
+def _testdata_root():
+    """Resolve the testdata root at import time.
+
+    Mirrors `InstarTestBase.setUpClass`; the profile enumeration
+    below runs before any test class is set up.
+    """
+    env = os.environ.get('INSTAR_TESTDATA_PATH')
+    if env:
+        return Path(env)
+    return Path(__file__).parent.parent.parent / 'instar-testdata'
+
+
+def _map_profiles_for(output_type):
+    """(profile_name, representative_version) for one output type.
+
+    Read straight off the version map so a new profile in
+    instar-testdata is picked up without editing this file.
+    """
+    version_map_path = (
+        _testdata_root() / 'expected-outputs' /
+        f'map-{output_type}' / 'version-map.json'
+    )
+    if not version_map_path.exists():
+        return []
+    with version_map_path.open() as f:
+        version_map = json.load(f)
+    pairs = []
+    for name, info in sorted(version_map.get('profiles', {}).items()):
+        versions = info.get('versions') or []
+        if not versions:
+            continue
+        # Lowest version in the group: unambiguous, and the one
+        # whose behaviour the profile is named for.
+        lowest = min(versions, key=lambda v: tuple(
+            int(p) for p in v.split('.')
+        ))
+        major, minor = lowest.split('.')[:2]
+        pairs.append((name, f'{major}.{minor}'))
+    return pairs
+
+
+for _ot in ('human', 'json'):
+    for _profile, _version in _map_profiles_for(_ot):
+        _name = f'test_profile_{_profile.replace("-", "_")}_{_ot}'
+        setattr(
+            TestMapCrossProfile,
+            _name,
+            _make_cross_profile_test(_profile, _version, _ot),
         )

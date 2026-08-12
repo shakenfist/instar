@@ -245,7 +245,7 @@ def _assert_dd_parity(
                 f'[{label}] qemu-img dd: expected empty output, got {len(qemu_bytes)} bytes'
             )
 
-        test_case.assertEqual(
+        test_case.assert_bytes_identical(
             instar_bytes,
             qemu_bytes,
             f'[{label}] instar dd output differs from qemu-img dd '
@@ -469,11 +469,10 @@ def _assert_structured_dd_parity(
             ibytes = fh.read()
         with open(qemu_raw.name, 'rb') as fh:
             qbytes = fh.read()
-        test_case.assertEqual(
+        test_case.assert_bytes_identical(
             ibytes,
             qbytes,
-            f'[{label}] round-trip raw mismatch '
-            f'(instar={len(ibytes)} B, qemu={len(qbytes)} B)',
+            f'[{label}] round-trip raw mismatch',
         )
 
 
@@ -1094,7 +1093,7 @@ class TestDdOutputDefault(InstarTestBase):
             # Both outputs must be byte-identical.
             instar_bytes = _bytes_of(instar_out.name)
             qemu_bytes = _bytes_of(qemu_out.name)
-            self.assertEqual(
+            self.assert_bytes_identical(
                 instar_bytes,
                 qemu_bytes,
                 f'instar dd (no -O) output differs from qemu-img dd '
@@ -1173,7 +1172,7 @@ class TestDdInputFormats(InstarTestBase):
 
             instar_bytes = _bytes_of(instar_out.name)
             qemu_bytes = _bytes_of(qemu_out.name)
-            self.assertEqual(
+            self.assert_bytes_identical(
                 instar_bytes,
                 qemu_bytes,
                 f'[{label}] instar dd output differs from qemu-img dd '
@@ -1274,7 +1273,7 @@ class TestDdInputFormats(InstarTestBase):
 
             instar_bytes = _bytes_of(instar_out.name)
             qemu_bytes = _bytes_of(qemu_out.name)
-            self.assertEqual(
+            self.assert_bytes_identical(
                 instar_bytes,
                 qemu_bytes,
                 f'[vdi] instar dd output differs from qemu-img dd '
@@ -1291,6 +1290,9 @@ class TestDdInputFormats(InstarTestBase):
         copy (no skip/count window) so the whole read path is exercised;
         windowed and both-magic coverage is added in step 3e.
         """
+        # qemu-img is the oracle here and the RHEL-family builds have no
+        # driver for this format.
+        self.skip_unless_qemu_supports('parallels')
         image = self.get_image('parallels-v2')
         if not image.path.exists():
             self.skipTest(f'Image not found: {image.path}')
@@ -1322,7 +1324,7 @@ class TestDdInputFormats(InstarTestBase):
 
             instar_bytes = _bytes_of(instar_out.name)
             qemu_bytes = _bytes_of(qemu_out.name)
-            self.assertEqual(
+            self.assert_bytes_identical(
                 instar_bytes,
                 qemu_bytes,
                 f'[parallels] instar dd output differs from qemu-img dd '
@@ -1341,6 +1343,9 @@ class TestDdInputFormats(InstarTestBase):
         block, pinning the unallocated->allocated transition against
         qemu-img dd byte-for-byte.
         """
+        # qemu-img is the oracle here and the RHEL-family
+        # builds have no driver for this format.
+        self.skip_unless_qemu_supports('parallels')
         image = self.get_image('parallels-data-v2')
         if not image.path.exists():
             self.skipTest(f'Image not found: {image.path}')
@@ -1375,7 +1380,7 @@ class TestDdInputFormats(InstarTestBase):
 
             instar_bytes = _bytes_of(instar_out.name)
             qemu_bytes = _bytes_of(qemu_out.name)
-            self.assertEqual(
+            self.assert_bytes_identical(
                 instar_bytes,
                 qemu_bytes,
                 f'[parallels-window] instar dd output differs from qemu-img '
@@ -1435,7 +1440,7 @@ class TestDdInputFormats(InstarTestBase):
 
             instar_bytes = _bytes_of(instar_out.name)
             qemu_bytes = _bytes_of(qemu_out.name)
-            self.assertEqual(
+            self.assert_bytes_identical(
                 instar_bytes,
                 qemu_bytes,
                 f'[vdi-window] instar dd output differs from qemu-img dd '
@@ -1541,7 +1546,7 @@ class TestDdInputFormats(InstarTestBase):
                 )
 
                 # Byte-identical to qemu-img dd.
-                self.assertEqual(
+                self.assert_bytes_identical(
                     instar_bytes,
                     qemu_bytes,
                     f'[backing-chain] instar dd output differs from qemu-img dd '
@@ -1587,7 +1592,7 @@ class TestDdInputFormats(InstarTestBase):
 
             instar_bytes = _bytes_of(instar_out.name)
             qemu_bytes = _bytes_of(qemu_out.name)
-            self.assertEqual(
+            self.assert_bytes_identical(
                 instar_bytes,
                 qemu_bytes,
                 f'instar dd -f raw output differs from qemu-img dd '
@@ -1606,6 +1611,9 @@ class TestDdInputFormats(InstarTestBase):
         block), pinning the unallocated->allocated transition against
         qemu-img dd byte-for-byte.
         """
+        # qemu-img is the oracle here and the RHEL-family
+        # builds have no driver for this format.
+        self.skip_unless_qemu_supports('qcow')
         image = self.get_image('qcow1-data')
         if not image.path.exists():
             self.skipTest(f'Image not found: {image.path}')
@@ -1638,7 +1646,7 @@ class TestDdInputFormats(InstarTestBase):
 
             instar_bytes = _bytes_of(instar_out.name)
             qemu_bytes = _bytes_of(qemu_out.name)
-            self.assertEqual(
+            self.assert_bytes_identical(
                 instar_bytes,
                 qemu_bytes,
                 f'[qcow1-window] instar dd output differs from qemu-img dd '
@@ -1665,6 +1673,9 @@ class TestDdInputFormats(InstarTestBase):
         read-through block, pinning that the dd path descends to the base
         for unallocated clusters -- byte-identical to qemu-img dd.
         """
+        # qemu-img is the oracle here and the RHEL-family
+        # builds have no driver for this format.
+        self.skip_unless_qemu_supports('qcow')
         image = self.get_image('qcow1-backing')
         if not image.path.exists():
             self.skipTest(f'Image not found: {image.path}')
@@ -1699,7 +1710,7 @@ class TestDdInputFormats(InstarTestBase):
 
             instar_bytes = _bytes_of(instar_out.name)
             qemu_bytes = _bytes_of(qemu_out.name)
-            self.assertEqual(
+            self.assert_bytes_identical(
                 instar_bytes,
                 qemu_bytes,
                 f'[qcow1-backing-window] instar dd output differs from '
@@ -1728,6 +1739,12 @@ class TestDdDmg(InstarTestBase):
     chunk 0, second block from chunk 1), proving dd walks the UDIF chunk
     table rather than reading the container as raw.
     """
+
+    def setUp(self):
+        super().setUp()
+        # This class compares instar against qemu-img for dmg; without
+        # that driver the host qemu cannot act as the oracle at all.
+        self.skip_unless_qemu_supports('dmg')
 
     def test_input_dmg_windowed(self):
         """Windowed dd on dmg-simple crosses the zlib chunk boundary."""
@@ -1763,7 +1780,7 @@ class TestDdDmg(InstarTestBase):
 
             instar_bytes = _bytes_of(instar_out.name)
             qemu_bytes = _bytes_of(qemu_out.name)
-            self.assertEqual(
+            self.assert_bytes_identical(
                 instar_bytes,
                 qemu_bytes,
                 f'[dmg-window] instar dd output differs from qemu-img dd '
@@ -1828,7 +1845,7 @@ class TestDdDmg(InstarTestBase):
 
             instar_bytes = _bytes_of(instar_out.name)
             qemu_bytes = _bytes_of(qemu_out.name)
-            self.assertEqual(
+            self.assert_bytes_identical(
                 instar_bytes,
                 qemu_bytes,
                 f'[dmg-mixed-window] instar dd output differs from qemu-img '

@@ -38,7 +38,23 @@ def _qemu_io(fmt, image, *cmds):
     subprocess.run(args, capture_output=True, check=True)
 
 
-class TestQcow1ConvertSmoke(InstarTestBase):
+class Qcow1SmokeBase(InstarTestBase):
+    """
+    Common setup for the qcow1 smoke pins.
+
+    Every test here builds its fixture with the host `qemu-img -f qcow`
+    and compares instar against qemu-img, so the whole module needs a
+    qemu that carries the qcow1 driver. RHEL-family qemu-kvm does not
+    (Rocky/RHEL 9 and 10), which makes these tests unrunnable there
+    rather than failing.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.skip_unless_qemu_supports('qcow')
+
+
+class TestQcow1ConvertSmoke(Qcow1SmokeBase):
     """convert / compare read-path parity vs qemu-img on a plain qcow."""
 
     def test_convert_to_raw_byte_identical(self):
@@ -63,7 +79,7 @@ class TestQcow1ConvertSmoke(InstarTestBase):
 
             self.run_qemu_img_convert(src, q_out)
 
-            self.assertEqual(
+            self.assert_bytes_identical(
                 i_out.read_bytes(), q_out.read_bytes(),
                 'instar convert-to-raw differs from qemu-img',
             )
@@ -119,13 +135,13 @@ class TestQcow1ConvertSmoke(InstarTestBase):
                              f'failed: {stderr!r}')
 
             self.run_qemu_img_convert(comp, q_out)
-            self.assertEqual(
+            self.assert_bytes_identical(
                 i_out.read_bytes(), q_out.read_bytes(),
                 'instar read of compressed qcow differs from qemu-img',
             )
 
 
-class TestQcow1BackingChain(InstarTestBase):
+class TestQcow1BackingChain(Qcow1SmokeBase):
     """Overlay + base (both qcow) read-through parity."""
 
     def test_overlay_reads_through_base(self):
@@ -157,13 +173,13 @@ class TestQcow1BackingChain(InstarTestBase):
                              f'{stderr!r}')
 
             self.run_qemu_img_convert(overlay, q_out)
-            self.assertEqual(
+            self.assert_bytes_identical(
                 i_out.read_bytes(), q_out.read_bytes(),
                 'instar overlay read-through differs from qemu-img',
             )
 
 
-class TestQcow1Dd(InstarTestBase):
+class TestQcow1Dd(Qcow1SmokeBase):
     """dd windowed read-path parity vs qemu-img."""
 
     def test_dd_window_byte_identical(self):
@@ -195,13 +211,13 @@ class TestQcow1Dd(InstarTestBase):
             _, q_err, q_rc = self.run_qemu_img_dd(q_operands)
             self.assertEqual(q_rc, 0, f'qemu-img dd failed: {q_err!r}')
 
-            self.assertEqual(
+            self.assert_bytes_identical(
                 i_out.read_bytes(), q_out.read_bytes(),
                 'instar dd window differs from qemu-img dd',
             )
 
 
-class TestQcow1SubcommandPolicy(InstarTestBase):
+class TestQcow1SubcommandPolicy(Qcow1SmokeBase):
     """check rc-63 and the map/measure refusals (recorded divergences)."""
 
     def _make_plain_qcow(self, tmp, name='src.qcow', size='2M'):
@@ -266,7 +282,7 @@ class TestQcow1SubcommandPolicy(InstarTestBase):
                           r.stdout + r.stderr)
 
 
-class TestQcow1Encrypted(InstarTestBase):
+class TestQcow1Encrypted(Qcow1SmokeBase):
     """Encrypted (AES, crypt_method=1) qcow posture."""
 
     def _make_encrypted_qcow(self, tmp, size='2M'):
@@ -314,7 +330,7 @@ class TestQcow1Encrypted(InstarTestBase):
             self.assertIn('convert operation failed', stdout + stderr)
 
 
-class TestQcow1MisdetectionGuard(InstarTestBase):
+class TestQcow1MisdetectionGuard(Qcow1SmokeBase):
     """A fresh qcow must no longer be misdetected as qcow2 with vsize 0."""
 
     def test_info_reports_qcow_with_real_size(self):

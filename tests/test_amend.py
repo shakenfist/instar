@@ -124,29 +124,11 @@ class TestAmendSmoke(InstarTestBase):
                 'amend-info-json' / 'qcow2')
 
     def _baseline_version_dir(self):
-        """Pick the version dir matching the installed qemu-img.
-
-        Lists version dirs under _baseline_root(), sorts them
-        numerically, prefers the one whose name starts with
-        f'{major}.{minor}.' from self._qemu_version, and falls back
-        to the most-recent recorded version. Returns None when the
-        root is missing or empty. Mirrors
-        TestResizeSmoke._baseline_version_dir.
+        """Version dir under _baseline_root() best matching the
+        installed qemu-img (full-version selection via the shared
+        base helper), or None when the root is missing or empty.
         """
-        root = self._baseline_root()
-        if not root.exists():
-            return None
-        names = [p.name for p in root.iterdir() if p.is_dir()]
-        if not names:
-            return None
-        names.sort(key=lambda v: tuple(int(p) for p in v.split('.')))
-        if self._qemu_version is not None:
-            major, minor = self._qemu_version
-            prefix = f'{major}.{minor}.'
-            matches = [n for n in names if n.startswith(prefix)]
-            if matches:
-                return root / matches[0]
-        return root / names[-1]
+        return self._pick_baseline_version_dir(self._baseline_root())
 
     def _baseline_stdout(self, case_name):
         """Return the Path to <version>/<case>.stdout.txt, or None."""
@@ -604,7 +586,7 @@ class TestAmendRefusals(TestAmendSmoke):
             self.assertIn(
                 'only qcow2 images can be amended', stderr,
                 f'unexpected stderr: {stderr!r}')
-            self.assertEqual(
+            self.assert_bytes_identical(
                 path.read_bytes(), before,
                 'a refused amend must not touch the qed image')
 

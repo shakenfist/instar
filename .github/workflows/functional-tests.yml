@@ -1,23 +1,88 @@
 name: Functional Tests
 
 on:
+  # Deliberately NO `paths:` filter on any trigger. This workflow
+  # produces the `Can enqueue` and `Can merge` contexts that branch
+  # protection requires, and a required check is only satisfied by a
+  # check that *reports*. A trigger-level `paths:` filter does not make
+  # the check skip -- it stops the workflow running at all, so the
+  # context never appears and GitHub leaves it Pending forever. That is
+  # a permanent block, not a skip. (A skipped *job* reports success,
+  # which is why `can_merge` skipping on pull requests is fine; a
+  # workflow that never runs is a different thing entirely.)
+  #
+  # Docs-only changes are cheap instead of untested: the `check_paths`
+  # job below computes whether any code changed, and the expensive jobs
+  # gate on its output. They skip, `can_enqueue` still reports, and the
+  # PR is mergeable.
   pull_request:
-    paths:
-      - 'src/**'
-      - 'crates/**'
-      - 'tests/**'
-      - 'scripts/**'
-      - 'tools/**'
-      - 'Makefile'
-      - '.github/workflows/functional-tests.yml'
   workflow_dispatch:
+  merge_group:
 
 permissions:
   contents: read
   pull-requests: write
   issues: write
 
+# What runs where, and why.
+#
+# Pull requests run the jobs below against the in-tree build: the
+# partition guard, build-and-test, package-smoke, the three integration
+# jobs, and the snapshot harnesses.
+#
+# The merge queue runs `package-build` + `package-matrix` (and the
+# `can_merge` gate), and NOT the PR integration jobs. That is a coverage
+# argument, not just a cost one: every matrix entry runs the *full*
+# Python suite against the installed package on its own distro, using
+# that distro's qemu-img as the oracle. So the queue's coverage is a
+# superset of the PR integration jobs, on seven distros instead of one.
+# Re-running the PR jobs in the queue would buy a second copy of a
+# strictly weaker signal. build-and-test is the deliberate exception --
+# it runs in both as the cheap fast-fail, and package-build needs it.
+#
+# Orthogonally, every expensive job also gates on check_paths, so a
+# docs-only pull request skips them all and is gated only by the
+# aggregates.
+#
+# If you are here to "fix" the gating so everything runs everywhere,
+# read docs/plans/PLAN-distro-matrix-ci-phase-04-workflow.md first.
 jobs:
+  # Detect docs-only changes so the heavy jobs can skip them. This
+  # replaces the trigger-level `paths:` filter this workflow used to
+  # carry -- see the comment on `on:` for why that filter was a merge
+  # blocker once `Can enqueue` became a required check.
+  #
+  # For anything other than a pull request the filter step is skipped
+  # and the output falls back to `code_changed=true`, so the merge queue
+  # and manual dispatches always run everything. A merge group that
+  # contains only docs therefore still pays for the matrix; that is the
+  # safe direction, and cheap to revisit if it proves annoying.
+  check_paths:
+    name: "Check paths"
+    runs-on: [self-hosted, static]
+    timeout-minutes: 10
+    outputs:
+      code_changed: ${{ steps.filter.outputs.code || 'true' }}
+    steps:
+      - uses: actions/checkout@v7
+        if: github.event_name == 'pull_request'
+
+      - uses: dorny/paths-filter@v4
+        id: filter
+        if: github.event_name == 'pull_request'
+        with:
+          # By default a file matches if it matches ANY listed pattern,
+          # which makes '**' match everything and silently defeats the
+          # exclusions. 'every' requires a file to match ALL patterns,
+          # which is the correct semantics for "everything except docs".
+          predicate-quantifier: 'every'
+          filters: |
+            code:
+              - '**'
+              - '!docs/**'
+              - '!**/*.md'
+              - '!.github/exported-config/**'
+
   # Guards over CI's own tooling: cheap enough (pure Python, bash and
   # jq -- no /dev/kvm, no testdata, no build) to share one small runner
   # and give fast feedback.
@@ -34,7 +99,10 @@ jobs:
   # docs/testing.md.
   ci-tooling:
     name: "CI tooling guards"
-    if: github.event_name == 'pull_request'
+    needs: check_paths
+    if: >-
+      github.event_name == 'pull_request'
+      && needs.check_paths.outputs.code_changed != 'false'
     runs-on: [self-hosted, debian-12, s]
     timeout-minutes: 10
     steps:
@@ -65,6 +133,8 @@ jobs:
         run: tools/ci/test-pick-fuzz-artifact.sh
 
   build-and-test:
+    needs: check_paths
+    if: needs.check_paths.outputs.code_changed != 'false'
     runs-on: [self-hosted, debian-12, s]
     timeout-minutes: 30
 
@@ -86,12 +156,16 @@ jobs:
 
       - name: Remove previous devcontainers, if any
         run: |
-          docker image rm -f instar-build 2>/dev/null || true
+          docker image rm -f instar-build instar-release 2>/dev/null || true
 
       - name: Build and test via devcontainer
         run: |
-          # Build the devcontainer and run cargo build + test inside it
+          # Build the dev/test image (the cargo test steps below run in
+          # it) and the release binary. make instar builds the release
+          # image (instar-release); make instar-devcontainer builds the
+          # dev/test image (instar-build) the docker-run steps use.
           make instar
+          make instar-devcontainer
           # Run unit tests inside the container (all workspace crates
           # except no_main guest binaries)
           docker run --rm \
@@ -121,6 +195,9 @@ jobs:
               --exclude amend-op \
               --exclude bitmap-op \
               --exclude bench-op
+
+      - name: Check devcontainer Rust nightly pins agree
+        run: tools/ci/check-nightly-pins.sh
 
       - name: Feature-gated crate tests in container
         # Mirrors the feature-gated tail of the Makefile's test-rust
@@ -274,7 +351,10 @@ jobs:
   # queue matrix; see docs/plans/PLAN-distro-matrix-ci.md for the
   # full design.
   package-smoke:
-    needs: build-and-test
+    needs: [check_paths, build-and-test]
+    if: >-
+      github.event_name != 'merge_group'
+      && needs.check_paths.outputs.code_changed != 'false'
     runs-on: [self-hosted, debian-12, xl]
     timeout-minutes: 30
 
@@ -294,7 +374,7 @@ jobs:
 
       - name: Remove previous devcontainers, if any
         run: |
-          docker image rm -f instar-build 2>/dev/null || true
+          docker image rm -f instar-build instar-release 2>/dev/null || true
 
       - name: Build instar and the .deb package
         run: |
@@ -307,10 +387,201 @@ jobs:
             src/target/debian/instar_*.deb \
             debian:trixie
 
+  # Build the .deb and .rpm ONCE for the whole matrix below.
+  #
+  # This is only valid because the release binary is built on
+  # debian:bullseye (glibc 2.31, symbol floor GLIBC_2.30), so a single
+  # artifact set installs on every distro in the matrix -- down to Rocky
+  # 9's glibc 2.34. That was the entire point of the build/dev container
+  # split; see docs/plans/PLAN-distro-matrix-ci-phase-01-glibc-build.md.
+  #
+  # Consequence worth knowing when reading a red matrix: if an entry
+  # fails while *installing* the package, that is a glibc-floor
+  # regression in the build image, not a test failure.
+  package-build:
+    needs: build-and-test
+    if: >-
+      github.event_name == 'merge_group' ||
+      github.event_name == 'workflow_dispatch'
+    runs-on: [self-hosted, debian-12, xl]
+    timeout-minutes: 45
+
+    env:
+      DOCKER_BUILDKIT: 1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Docker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y docker.io
+          sudo systemctl start docker
+          sudo chmod 666 /var/run/docker.sock
+
+      - name: Remove previous devcontainers, if any
+        run: |
+          docker image rm -f instar-build instar-release 2>/dev/null || true
+
+      - name: Build instar and both packages
+        run: |
+          make instar
+          make package
+
+      # Flatten both packages into one directory so the matrix entries
+      # can glob with a fixed depth. resolve-package.sh also asserts
+      # exactly one of each kind exists, which fails here rather than
+      # seven times over in the matrix.
+      - name: Stage packages
+        run: |
+          mkdir -p dist
+          cp "$(tools/ci/resolve-package.sh deb)" dist/
+          cp "$(tools/ci/resolve-package.sh rpm)" dist/
+          ls -la dist/
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: instar-packages
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  # The distro matrix: install the shared package on each distro and run
+  # the FULL Python suite against that distro's own qemu-img.
+  #
+  # No max-parallel. The xl runners are started on demand, so each entry
+  # gets its own VM and the entries do not contend for KVM with each
+  # other; capping the fan-out would only serialise independent VMs and
+  # multiply merge-queue latency.
+  package-matrix:
+    needs: package-build
+    if: >-
+      github.event_name == 'merge_group' ||
+      github.event_name == 'workflow_dispatch'
+    name: "Matrix: ${{ matrix.distro.name }}"
+    runs-on: [self-hosted, debian-12, xl]
+    # Generous on purpose: the suite is ~3250 tests at concurrency 4 in
+    # a container, and a timeout firing mid-suite is indistinguishable
+    # from a flaky distro in the summary. Tighten once the first runs
+    # give real numbers.
+    timeout-minutes: 120
+    # Quarantine hatch (master-plan flake policy): an entry that fails
+    # twice consecutively for an established environmental reason gets
+    # `allow_failure: true` added below, with a linked issue, and loses
+    # it when that issue closes. Nothing is quarantined today.
+    #
+    # Sharp edge: continue-on-error makes the job report SUCCESS to the
+    # `needs` context, so a quarantined entry stops gating merges
+    # entirely -- it does not merely tolerate its own failure. Never
+    # leave a flag behind after its issue is fixed.
+    continue-on-error: ${{ matrix.distro.allow_failure }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        distro:
+          - name: 'Debian 12'
+            image: 'debian:12'
+            pkg_kind: 'deb'
+            allow_failure: false
+          - name: 'Debian 13'
+            image: 'debian:13'
+            pkg_kind: 'deb'
+            allow_failure: false
+          - name: 'Ubuntu 22.04'
+            image: 'ubuntu:22.04'
+            pkg_kind: 'deb'
+            allow_failure: false
+          - name: 'Ubuntu 24.04'
+            image: 'ubuntu:24.04'
+            pkg_kind: 'deb'
+            allow_failure: false
+          - name: 'Fedora latest'
+            image: 'fedora:latest'
+            pkg_kind: 'rpm'
+            allow_failure: false
+          - name: 'Rocky 9'
+            image: 'rockylinux:9'
+            pkg_kind: 'rpm'
+            allow_failure: false
+          # Rocky 10 is not in the Docker Official `rockylinux` library,
+          # which stops at 9; it lives under the vendor namespace.
+          - name: 'Rocky 10'
+            image: 'rockylinux/rockylinux:10'
+            pkg_kind: 'rpm'
+            allow_failure: false
+
+    env:
+      DOCKER_BUILDKIT: 1
+
+    steps:
+      - name: Checkout instar
+        uses: actions/checkout@v7
+        with:
+          path: instar
+          fetch-depth: 0
+
+      - name: Prepare instar-testdata
+        env:
+          TESTDATA_TOKEN: ${{ secrets.GITLAB_TESTDATA_TOKEN }}
+        run: ${GITHUB_WORKSPACE}/instar/tools/ci/prepare-testdata.sh
+
+      - name: Resparsify test images
+        run: |
+          cd ${TESTDATA_PATH}
+          find downloaded/ -type f \( \
+            -name "*.qcow2" -o \
+            -name "*.vmdk" -o \
+            -name "*.vhd" -o \
+            -name "*.vhdx" -o \
+            -name "*.img" \
+          \) -print0 | while IFS= read -r -d '' file; do
+            cp --sparse=always "$file" "$file.sparse"
+            mv "$file.sparse" "$file"
+          done
+
+      - name: Install Docker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y docker.io
+          sudo systemctl start docker
+          sudo chmod 666 /var/run/docker.sock
+
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          name: instar-packages
+          path: ${{ github.workspace }}/packages
+
+      - name: Run the suite on ${{ matrix.distro.image }}
+        env:
+          PACKAGE_DIR: ${{ github.workspace }}/packages
+          MATRIX_LOG: ${{ github.workspace }}/matrix.log
+        run: |
+          cd ${GITHUB_WORKSPACE}/instar
+          tools/ci/run-matrix-entry.sh \
+            "${{ matrix.distro.name }}" \
+            "${{ matrix.distro.image }}" \
+            "${{ matrix.distro.pkg_kind }}"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: matrix-${{ matrix.distro.pkg_kind }}-${{ strategy.job-index }}-logs
+          path: ${{ github.workspace }}/matrix.log
+          retention-days: 7
+          if-no-files-found: warn
+
   # Core integration tests: info, check, security, version-detection, oslo-crossval
   # These are fast (header-parsing only, no full image conversion)
   integration-core:
-    needs: build-and-test
+    needs: [check_paths, build-and-test]
+    if: >-
+      github.event_name != 'merge_group'
+      && needs.check_paths.outputs.code_changed != 'false'
     runs-on: [self-hosted, debian-12, xl]
     timeout-minutes: 45
 
@@ -352,7 +623,7 @@ jobs:
 
       - name: Remove previous devcontainers, if any
         run: |
-          docker image rm -f instar-build 2>/dev/null || true
+          docker image rm -f instar-build instar-release 2>/dev/null || true
 
       - name: Build instar
         run: |
@@ -491,7 +762,10 @@ jobs:
 
   # QCOW2/VMDK/RAW conversion and comparison tests
   integration-convert-qcow2:
-    needs: build-and-test
+    needs: [check_paths, build-and-test]
+    if: >-
+      github.event_name != 'merge_group'
+      && needs.check_paths.outputs.code_changed != 'false'
     runs-on: [self-hosted, debian-12, xl]
     timeout-minutes: 60
 
@@ -533,7 +807,7 @@ jobs:
 
       - name: Remove previous devcontainers, if any
         run: |
-          docker image rm -f instar-build 2>/dev/null || true
+          docker image rm -f instar-build instar-release 2>/dev/null || true
 
       - name: Build instar
         run: |
@@ -571,7 +845,10 @@ jobs:
 
   # VHD/VHDX conversion tests (slowest format family)
   integration-convert-vhd:
-    needs: build-and-test
+    needs: [check_paths, build-and-test]
+    if: >-
+      github.event_name != 'merge_group'
+      && needs.check_paths.outputs.code_changed != 'false'
     runs-on: [self-hosted, debian-12, xl]
     timeout-minutes: 90
 
@@ -613,7 +890,7 @@ jobs:
 
       - name: Remove previous devcontainers, if any
         run: |
-          docker image rm -f instar-build 2>/dev/null || true
+          docker image rm -f instar-build instar-release 2>/dev/null || true
 
       - name: Build instar
         run: |
@@ -660,7 +937,10 @@ jobs:
   # with /dev/kvm passed through, the same execution model as
   # the differential-fuzz workflow.
   snapshot-harnesses:
-    needs: build-and-test
+    needs: [check_paths, build-and-test]
+    if: >-
+      github.event_name != 'merge_group'
+      && needs.check_paths.outputs.code_changed != 'false'
     runs-on: [self-hosted, debian-12, xl]
     timeout-minutes: 30
 
@@ -680,7 +960,7 @@ jobs:
 
       - name: Remove previous devcontainers, if any
         run: |
-          docker image rm -f instar-build 2>/dev/null || true
+          docker image rm -f instar-build instar-release 2>/dev/null || true
 
       - name: Build instar
         run: |
@@ -706,7 +986,10 @@ jobs:
   # This catches drift from oslo.utils development before
   # it reaches PyPI. Allowed to fail (informational).
   oslo-crossval-master:
-    needs: build-and-test
+    needs: [check_paths, build-and-test]
+    if: >-
+      github.event_name != 'merge_group'
+      && needs.check_paths.outputs.code_changed != 'false'
     runs-on: [self-hosted, debian-12, xl]
     timeout-minutes: 30
     continue-on-error: true
@@ -753,12 +1036,16 @@ jobs:
 
       - name: Remove previous devcontainers, if any
         run: |
-          docker image rm -f instar-build 2>/dev/null || true
+          docker image rm -f instar-build instar-release 2>/dev/null || true
 
       - name: Build instar
         run: |
           cd ${GITHUB_WORKSPACE}/instar
+          # The crossval step runs in the dev/test image (instar-build)
+          # via a raw docker run, so build it here alongside the release
+          # binary.
           make instar
+          make instar-devcontainer
 
       - name: Run oslo crossval with oslo.utils master
         run: |
@@ -805,6 +1092,13 @@ jobs:
       - integration-convert-qcow2
       - integration-convert-vhd
       - snapshot-harnesses
+    # Every job in that needs: list is now gated out of the merge queue,
+    # so on a merge_group event they all skip and this job would skip
+    # with them. Say so explicitly rather than relying on that chain:
+    # there is nothing for a PR reviewer to review in a merge queue.
+    # (Deliberately `!= merge_group` rather than `== pull_request`, so
+    # workflow_dispatch behaviour is unchanged.)
+    if: github.event_name != 'merge_group'
     # A cross-repository reusable workflow cannot grant itself more
     # token scope than its caller has, so the permissions go here.
     permissions:
@@ -817,3 +1111,77 @@ jobs:
     # above. "secrets: inherit" would hand every secret this repository has
     # to another repository's workflow tracked at @main, for nothing.
     uses: shakenfist/actions/.github/workflows/pr-auto-review.yml@main
+
+  # The pull-request-side gate: "is this PR allowed into the queue?"
+  #
+  # Twin of can_merge below, and required for the same reason its
+  # counterpart is: branch protection needs a stable context name to
+  # require, and the individual job names churn. This one aggregates the
+  # jobs that actually run on a pull request.
+  #
+  # It exists so that requiring a merge-queue-only check does not leave
+  # the PR side with nothing to satisfy -- the queue decides whether a
+  # merge group is good, this decides whether a PR may enter it.
+  can_enqueue:
+    name: "Can enqueue"
+    needs:
+      - check_paths
+      - ci-tooling
+      - build-and-test
+      - package-smoke
+      - integration-core
+      - integration-convert-qcow2
+      - integration-convert-vhd
+      - snapshot-harnesses
+    # Deliberately not gated to pull_request alone: workflow_dispatch
+    # runs most of these jobs too, and reporting the aggregate there is
+    # useful. oslo-crossval-master is omitted on purpose -- it is
+    # continue-on-error and so could never gate anything.
+    if: always() && github.event_name != 'merge_group'
+    permissions:
+      actions: read
+    runs-on: [self-hosted, static]
+    timeout-minutes: 5
+    steps:
+      - env:
+          NEEDS_JSON: "${{ toJSON(needs) }}"
+        name: Transform outcomes
+        run: |
+          echo "ALL_SUCCESS=$(echo "$NEEDS_JSON" | jq '. | to_entries | map([.value.result == "success", .value.result == "skipped"] | any) | all')" >>$GITHUB_ENV
+
+      - name: Check outcomes
+        run: "[ $ALL_SUCCESS == true ]"
+
+  # The merge queue's required check. THIS is the job name to configure
+  # in branch protection -- not the individual matrix entries, whose
+  # names change whenever the distro list does.
+  #
+  # It must use `always()`, because a `needs:` dependency that is skipped
+  # would otherwise skip this job too, and a required check that never
+  # reports leaves the queue waiting forever. `always()` makes it run
+  # regardless, and the jq expression below decides the verdict:
+  # every dependency must have ended `success` or `skipped`.
+  #
+  # Do NOT add these jobs to automated_reviewer's needs: list instead.
+  # That job is the PR reviewer, not a gate; making it depend on
+  # merge-queue-only jobs would skip the reviewer on every PR.
+  can_merge:
+    name: "Can merge"
+    needs:
+      - build-and-test
+      - package-build
+      - package-matrix
+    if: always() && github.event_name == 'merge_group'
+    permissions:
+      actions: read
+    runs-on: [self-hosted, static]
+    timeout-minutes: 5
+    steps:
+      - env:
+          NEEDS_JSON: "${{ toJSON(needs) }}"
+        name: Transform outcomes
+        run: |
+          echo "ALL_SUCCESS=$(echo "$NEEDS_JSON" | jq '. | to_entries | map([.value.result == "success", .value.result == "skipped"] | any) | all')" >>$GITHUB_ENV
+
+      - name: Check outcomes
+        run: "[ $ALL_SUCCESS == true ]"

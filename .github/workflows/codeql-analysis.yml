@@ -1,0 +1,73 @@
+name: CodeQL
+
+# Scope, stated plainly: this analyses the Python test harness and the
+# GitHub Actions workflows. It does NOT analyse the Rust host code.
+#
+# That is deliberate rather than an oversight. CodeQL's Rust support is
+# preview and needs a build it can observe, but instar builds entirely
+# inside Docker (`make instar`), so `autobuild` on a runner without a
+# toolchain would either fail or silently analyse nothing. An analysis
+# that reports success while covering none of the security-critical
+# code is worse than no analysis, because it reads as coverage.
+#
+# The Rust host code is covered instead by the security audit
+# (docs/security-audits.md), clippy in pre-commit and lint.yml, the
+# coverage-guided fuzzers, and the differential fuzzer. If CodeQL's Rust
+# support leaves preview, revisit this -- it would need an explicit
+# build command producing artifacts CodeQL can see, on a runner with the
+# toolchain, not autobuild.
+
+permissions: {}
+
+on:
+  push:
+    branches: [develop]
+  pull_request:
+    branches: [develop]
+  schedule:
+    - cron: '0 17 * * 2'
+
+jobs:
+  analyze:
+    name: Analyze
+    # Fork pull requests get a read-only GITHUB_TOKEN regardless of the
+    # permissions block below, so the SARIF upload in `analyze` cannot
+    # succeed. Skip rather than fail: a red check on every fork PR
+    # teaches contributors to ignore red checks.
+    if: >-
+      github.event_name != 'pull_request'
+      || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, static]
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.ref }}-${{ matrix.language }}
+      cancel-in-progress: true
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [python, actions]
+
+    steps:
+      # No fetch-depth or HEAD^2 dance. The old `git checkout HEAD^2`
+      # is the retired starter-template pattern: it moves the analysis
+      # off the merge commit onto the raw PR head, so alerts are
+      # computed against code that was never going to be merged.
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+
+      # No autobuild step: neither Python nor Actions needs a build, and
+      # autobuild on a toolchain-less runner is exactly how this job
+      # would come to analyse nothing while reporting success.
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: /language:${{ matrix.language }}

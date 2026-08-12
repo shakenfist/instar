@@ -199,7 +199,7 @@ jobs:
         if: steps.find_issue.outputs.found == 'true'
         run: |
           cd ${GITHUB_WORKSPACE}/instar
-          docker image rm -f instar-build 2>/dev/null || true
+          docker image rm -f instar-build instar-release 2>/dev/null || true
           make instar 2>&1 | tee ${GITHUB_WORKSPACE}/build-log.txt
 
       - name: Construct prompt (attempt 1)

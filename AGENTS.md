@@ -276,20 +276,33 @@ pre-commit run --all-files
 The hooks use a dedicated Docker container (`.devcontainer/rust-lint/`) with
 stable Rust to ensure consistent results across all development environments.
 
+### Build and dev containers
+
+The build runs in two devcontainer images: a minimal `debian:bullseye`
+release build image (`src/.devcontainer/build/Dockerfile`, image
+`instar-release`) that produces the binary and packages at a low glibc
+floor, and the full Debian dev/test image
+(`src/.devcontainer/Dockerfile`, image `instar-build`) that runs the
+test, fuzz, and audit suites. `make instar`/`deb`/`rpm` use the former;
+everything else uses the latter. See
+[docs/development.md](https://github.com/shakenfist/instar/blob/develop/docs/development.md)
+for which target uses which image and why bullseye.
+
 ### Toolchain pinning
 
-The build devcontainer (`src/.devcontainer/Dockerfile`) pins its Rust
-nightly via `ARG RUST_NIGHTLY=nightly-YYYY-MM-DD` — a broken floating
-nightly otherwise breaks every from-scratch image build (a 2026-07-24
-nightly ICE'd compiling tokio inside `cargo install cargo-audit` and
-took out CI's "Build devcontainer" step). Renovate cannot bump rustup
-toolchain pins; instead the weekly `rust-nightly-bump` workflow
-(`tools/ci/bump-rust-nightly.sh`) test-builds the image, instar, and
-the Rust test suite against the newest published nightly and opens a
-bump PR only when everything passes. Do not un-pin the toolchain, and
-do not bump the pin by hand without at least building the full image.
-(The lint container is separate and uses a stable `rust:` tag Renovate
-does manage.)
+Both devcontainer Dockerfiles pin the same Rust nightly via
+`ARG RUST_NIGHTLY=nightly-YYYY-MM-DD` — a broken floating nightly
+otherwise breaks every from-scratch image build (a 2026-07-24 nightly
+ICE'd compiling tokio inside `cargo install cargo-audit` and took out
+CI's "Build devcontainer" step). Renovate cannot bump rustup toolchain
+pins; instead the weekly `rust-nightly-bump` workflow
+(`tools/ci/bump-rust-nightly.sh`) rewrites and test-builds **both**
+images, then instar and the Rust test suite, against the newest
+published nightly and opens a bump PR only when everything passes. Do
+not un-pin the toolchain, and do not bump the pin by hand without at
+least building both images. (The lint container is separate and uses a
+stable `rust:` tag Renovate does manage; the dev image's Debian base is
+pinned by digest and Renovate walks it forward.)
 
 ### CI tooling guards
 
@@ -368,6 +381,64 @@ corrupt test images, cross-validate `instar compare` output against
 `qemu-img compare`, cross-validate `instar convert` output against
 `qemu-img convert`, and cross-validate `instar measure` output against
 `qemu-img measure` for raw and qcow2 targets. Tests use Python testtools/stestr.
+
+instar emulates the host's `qemu-img` version; the harness selects the
+matching output baseline profile by full `major.minor.patch`
+(`base.py::_select_version_match`). `tools/probe-qemu-versions.sh`
+records the `qemu-img` version each matrix distro ships. See
+[docs/testing.md](https://github.com/shakenfist/instar/blob/develop/docs/testing.md)
+("qemu-img version profiles and the distro matrix") for the model and
+the per-distro table.
+
+`tools/test-package-functional.sh <package> <distro-image>` runs the
+full suite against the **installed** `.deb`/`.rpm` inside a target-distro
+container, using that distro's own `qemu-img` as the oracle (tests from
+the tree, binary from the package via `INSTAR_BINARY_PATH`). It is the
+per-entry runner for the distro-matrix CI and the first check to surface
+version-specific output-format parity gaps that host-only CI cannot. It
+is distinct from `tools/test-package-install.sh` (fast packaging smoke)
+and is driven across seven distros by the `package-matrix` job, which
+runs **only** in the merge queue and on `workflow_dispatch` — never on a
+pull request. `tools/ci/run-matrix-entry.sh` is the CI wrapper; use it
+(with `MATRIX_SELECT`) to reproduce an entry exactly as CI runs it.
+`can_merge` is the queue's required check, not the individual entries.
+`--select REGEX` replays a single failure on one distro, which matters
+because two containers sharing a KVM host produce timeout failures that
+mimic real divergences — always re-run uncontended before attributing
+one. The runner also refuses to report a **truncated** run as a pass
+(see docs/testing.md); do not weaken that guard.
+
+Two facts about distro qemu that the version model does not capture:
+RHEL-family `qemu-kvm` omits the `qed`, `qcow`, `parallels`, `dmg`,
+`bochs` and `cloop` drivers, so tests needing qemu-img as the oracle for
+those formats must call `skip_unless_qemu_supports()`; and image buffers
+must be compared with `assert_bytes_identical()` rather than
+`assertEqual`, because a multi-megabyte mismatch exceeds subunit's
+packet limit and silently truncates the run. An oracle that is simply
+absent (`qemu-storage-daemon` on some EL streams) is a `skipTest`, never
+an error.
+
+**Never guess a qemu version boundary — measure it.** instar-testdata
+carries 80 static per-version `qemu-img` builds under
+`qemu-img-binaries/x86_64/<version>/`, 6.0.0 through 10.2.0, that run
+directly on the host. Every boundary in `version::OutputProfile` was
+established by running the real binary; the version maps and profile
+baselines have been wrong before, and so has reasoning from qemu source.
+`info`, `map` and `snapshot` all accept `--qemu-version`, so both sides
+of a boundary are testable on the dev host without a distro container.
+
+**A green suite does not mean the baselines are right.** The derived
+`expected-outputs/*/profiles/` directories have been silently wrong
+twice while the `raw/` captures they come from were correct — once for
+`snapshot-list-human`, once for `create-info-json`, where every profile
+carried 10.2.0's output and four of five target formats had been
+overwritten out of existence. Neither showed up as a failure: a test
+that skips on the host's qemu version, or asserts only that a profile
+*exists*, passes just as loudly as one that compares bytes. When a
+baseline is suspect, diff `profiles/` against `raw/` and check the
+recorded `*_stdout_bytes` in each `.meta.json`, which is what
+`detect-profiles.py`'s `validate_profiles()` now does before it will
+commit anything.
 
 ```bash
 # Set up test environment
@@ -675,6 +746,8 @@ This allows reviewers to cherry-pick or drop individual fixes as needed.
 - `.github/workflows/coverage-fuzz.yml` - Coverage-guided fuzzing of parser crates (nightly + PR)
 - `.github/workflows/fuzz-autofix.yml` - Automated fuzzer bug fix (daily Claude Code, 30-turn limit)
 - `.github/workflows/rust-nightly-bump.yml` - Weekly devcontainer Rust nightly pin bump (see "Toolchain pinning" above)
+- `.github/workflows/codeql-analysis.yml` - CodeQL static analysis (push/PR to develop, plus weekly cron)
+- `.github/workflows/supply-chain.yml` - gitleaks secret scanning on debian-13 (PR/push, plus weekly cron)
 
 The self-hosted runners have no Docker preinstalled, so any job touching
 `docker` or a container-backed Makefile target needs an "Install Docker"

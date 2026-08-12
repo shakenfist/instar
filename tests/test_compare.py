@@ -1259,6 +1259,12 @@ class TestCompareDmg(InstarTestBase):
     bytes.  The full DMG compare matrix is covered in step 5e.
     """
 
+    def setUp(self):
+        super().setUp()
+        # This class compares instar against qemu-img for dmg; without
+        # that driver the host qemu cannot act as the oracle at all.
+        self.skip_unless_qemu_supports('dmg')
+
     def test_compare_dmg_simple_vs_raw(self):
         """compare dmg-simple against its qemu-img raw conversion."""
         image = self.get_image('dmg-simple')
@@ -1459,6 +1465,12 @@ class TestCompareParallels(InstarTestBase):
     (both magics, differing pairs) lands in step 3e.
     """
 
+    def setUp(self):
+        super().setUp()
+        # This class compares instar against qemu-img for parallels; without
+        # that driver the host qemu cannot act as the oracle at all.
+        self.skip_unless_qemu_supports('parallels')
+
     def test_compare_parallels_v2_vs_raw(self):
         """compare parallels-v2 against its qemu-img raw conversion."""
         image = self.get_image('parallels-v2')
@@ -1539,6 +1551,12 @@ class TestCompareParallels(InstarTestBase):
 
 class TestCompareQcow1(InstarTestBase):
     """compare read-path pins for QCOW1 ('qcow' v1) (format-coverage phase 4)."""
+
+    def setUp(self):
+        super().setUp()
+        # This class compares instar against qemu-img for qcow; without
+        # that driver the host qemu cannot act as the oracle at all.
+        self.skip_unless_qemu_supports('qcow')
 
     def _skip_unless(self, *image_ids):
         images = []

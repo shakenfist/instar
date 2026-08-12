@@ -113,28 +113,11 @@ class TestBitmapSmoke(InstarTestBase):
                 'bitmap-info-json' / 'qcow2')
 
     def _baseline_version_dir(self):
-        """Pick the version dir matching the installed qemu-img.
-
-        Lists version dirs under _baseline_root(), sorts them
-        numerically, prefers the one whose name starts with
-        f'{major}.{minor}.' from self._qemu_version, and falls back to
-        the most-recent recorded version. Returns None when the root is
-        missing or empty. Mirrors TestAmendSmoke._baseline_version_dir.
+        """Version dir under _baseline_root() best matching the
+        installed qemu-img (full-version selection via the shared
+        base helper), or None when the root is missing or empty.
         """
-        root = self._baseline_root()
-        if not root.exists():
-            return None
-        names = [p.name for p in root.iterdir() if p.is_dir()]
-        if not names:
-            return None
-        names.sort(key=lambda v: tuple(int(p) for p in v.split('.')))
-        if self._qemu_version is not None:
-            major, minor = self._qemu_version
-            prefix = f'{major}.{minor}.'
-            matches = [n for n in names if n.startswith(prefix)]
-            if matches:
-                return root / matches[0]
-        return root / names[-1]
+        return self._pick_baseline_version_dir(self._baseline_root())
 
     def _baseline_stdout(self, case_name):
         """Return the Path to <version>/<case>.stdout.txt, or None."""
@@ -328,6 +311,18 @@ class TestBitmapSmoke(InstarTestBase):
         read-only export. Needs no /dev/kvm. The daemon is always torn
         down and the sockets removed in a `finally`.
         """
+        # An absent oracle is a skip, not an error. qemu-storage-daemon
+        # is packaged separately from qemu-img and is not available on
+        # every distro in the CI matrix (the .deb family gets it from
+        # qemu-system-common or qemu-utils; some EL streams ship no
+        # equivalent at all). Without it there is nothing to compare
+        # against, so the differential assertion cannot run -- the same
+        # discipline as base.py's skip_unless_qemu_supports().
+        if shutil.which('qemu-storage-daemon') is None:
+            self.skipTest(
+                'qemu-storage-daemon not installed; the bitmap differential '
+                'oracle is unavailable on this distro')
+
         tmpd = tempfile.mkdtemp(prefix='bitmap-oracle.')
         nbd_sock = os.path.join(tmpd, 'nbd.sock')
         qmp_sock = os.path.join(tmpd, 'qmp.sock')
@@ -1254,7 +1249,7 @@ class TestBitmapRefusals(TestBitmapSmoke):
                 f'instar should refuse a qed image; stderr={stderr!r}')
             self.assertIn('not a qcow2 image', stderr,
                           f'unexpected stderr: {stderr!r}')
-            self.assertEqual(
+            self.assert_bytes_identical(
                 path.read_bytes(), before,
                 'a refused bitmap op must not touch the qed image')
 

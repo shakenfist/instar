@@ -15,8 +15,8 @@
 # to the Makefile, add it here too (structural drift-proofing is
 # tracked in PLAN-format-coverage.md future work).
 #
-# Expects the instar-build image to exist (the workflow builds it via
-# `make instar` earlier in the job).
+# Expects the instar-build dev/test image to exist (the workflow builds
+# it via `make instar-devcontainer` earlier in the job).
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."

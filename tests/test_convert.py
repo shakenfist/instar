@@ -2517,7 +2517,7 @@ class TestConvertVmdkFlatOutput(InstarTestBase):
             # Verify content matches raw input
             raw_data = raw_path.read_bytes()
             flat_bytes = flat_data.read_bytes()
-            self.assertEqual(
+            self.assert_bytes_identical(
                 raw_data, flat_bytes,
                 'Flat extent content should match raw input'
             )
@@ -2590,7 +2590,7 @@ class TestConvertVmdkFlatOutput(InstarTestBase):
             # Verify: step1.raw == step3.raw
             raw1 = raw_path.read_bytes()
             raw2 = raw2_path.read_bytes()
-            self.assertEqual(
+            self.assert_bytes_identical(
                 raw1, raw2,
                 'Round-trip content mismatch'
             )
@@ -3620,6 +3620,12 @@ class TestConvertParallelsToRaw(InstarTestBase):
     matrix (data-v1/v2, cluster-4k, inuse, past-eof) lands in step 3e.
     """
 
+    def setUp(self):
+        super().setUp()
+        # This class compares instar against qemu-img for parallels; without
+        # that driver the host qemu cannot act as the oracle at all.
+        self.skip_unless_qemu_supports('parallels')
+
     def _assert_convert_parity(self, image_id):
         image = self.get_image(image_id)
         if not image.path.exists():
@@ -3784,7 +3790,7 @@ class TestConvertParallelsToRaw(InstarTestBase):
             ref_bytes = Path(ref_raw.name).read_bytes()
             flat_bytes = Path(flat_raw.name).read_bytes()
             n = min(len(ref_bytes), len(flat_bytes))
-            self.assertEqual(
+            self.assert_bytes_identical(
                 ref_bytes[:n], flat_bytes[:n],
                 f'instar {fmt} output (flattened) differs from qemu raw '
                 f'for parallels-data-v2 in the common prefix'
@@ -3874,7 +3880,7 @@ class TestConvertParallelsToRaw(InstarTestBase):
                 f'{q_stderr}'
             )
 
-            self.assertEqual(
+            self.assert_bytes_identical(
                 Path(instar_raw).read_bytes(),
                 Path(qemu_raw).read_bytes(),
                 'instar convert of qcow2-over-parallels chain differs from '
@@ -3907,6 +3913,12 @@ class TestConvertQcow1ToRaw(InstarTestBase):
     separately below.
     """
 
+    def setUp(self):
+        super().setUp()
+        # This class compares instar against qemu-img for qcow; without
+        # that driver the host qemu cannot act as the oracle at all.
+        self.skip_unless_qemu_supports('qcow')
+
     def _assert_convert_parity(self, image_id):
         image = self.get_image(image_id)
         if not image.path.exists():
@@ -3931,7 +3943,7 @@ class TestConvertQcow1ToRaw(InstarTestBase):
                 f'qemu-img convert failed for {image_id}: {q_stderr}'
             )
 
-            self.assertEqual(
+            self.assert_bytes_identical(
                 Path(instar_raw.name).read_bytes(),
                 Path(qemu_raw.name).read_bytes(),
                 f'convert output for {image_id} differs from qemu-img'
@@ -3996,7 +4008,7 @@ class TestConvertQcow1ToRaw(InstarTestBase):
 
             self.run_qemu_img_convert(
                 image.path, Path(qemu_raw.name), timeout=120)
-            self.assertEqual(
+            self.assert_bytes_identical(
                 instar_bytes, Path(qemu_raw.name).read_bytes(),
                 'qcow1-odd-size convert output differs from qemu-img')
 
@@ -4025,7 +4037,7 @@ class TestConvertQcow1ToRaw(InstarTestBase):
             self.assertEqual(
                 c_rc, 0, f'convert qcow1-compressed failed: {c_err}')
 
-            self.assertEqual(
+            self.assert_bytes_identical(
                 Path(comp_raw.name).read_bytes(),
                 Path(data_raw.name).read_bytes(),
                 'qcow1-compressed convert output differs from qcow1-data')
@@ -4097,7 +4109,7 @@ class TestConvertQcow1ToRaw(InstarTestBase):
             ref_bytes = Path(ref_raw.name).read_bytes()
             flat_bytes = Path(flat_raw.name).read_bytes()
             n = min(len(ref_bytes), len(flat_bytes))
-            self.assertEqual(
+            self.assert_bytes_identical(
                 ref_bytes[:n], flat_bytes[:n],
                 f'instar {fmt} output (flattened) differs from qemu raw '
                 f'for qcow1-data in the common prefix')
@@ -4173,7 +4185,7 @@ class TestConvertQcow1ToRaw(InstarTestBase):
                 f'qemu-img convert of qcow2-over-qcow1 chain failed: '
                 f'{q_stderr}')
 
-            self.assertEqual(
+            self.assert_bytes_identical(
                 Path(instar_raw).read_bytes(),
                 Path(qemu_raw).read_bytes(),
                 'instar convert of qcow2-over-qcow1 chain differs from '
@@ -4237,7 +4249,7 @@ class TestConvertQcow1ToRaw(InstarTestBase):
                 q_rc, 0,
                 f'qemu-img convert of qcow-over-raw chain failed: {q_stderr}')
 
-            self.assertEqual(
+            self.assert_bytes_identical(
                 Path(instar_raw).read_bytes(),
                 Path(qemu_raw).read_bytes(),
                 'instar convert of qcow-over-raw chain differs from qemu-img')
@@ -4427,7 +4439,7 @@ class TestConvertVdiToRaw(InstarTestBase):
             ref_bytes = Path(ref_raw.name).read_bytes()
             flat_bytes = Path(flat_raw.name).read_bytes()
             n = min(len(ref_bytes), len(flat_bytes))
-            self.assertEqual(
+            self.assert_bytes_identical(
                 ref_bytes[:n], flat_bytes[:n],
                 f'instar {fmt} output (flattened) differs from qemu raw '
                 f'for vdi-data-dynamic in the common prefix'
@@ -4514,7 +4526,7 @@ class TestConvertVdiToRaw(InstarTestBase):
                 f'{q_stderr}'
             )
 
-            self.assertEqual(
+            self.assert_bytes_identical(
                 Path(instar_raw).read_bytes(),
                 Path(qemu_raw).read_bytes(),
                 'instar convert of qcow2-over-vdi chain differs from '
@@ -6440,6 +6452,12 @@ class TestConvertDmgToRaw(InstarTestBase):
     created locally (only the testdata generator builds them).
     """
 
+    def setUp(self):
+        super().setUp()
+        # This class compares instar against qemu-img for dmg; without
+        # that driver the host qemu cannot act as the oracle at all.
+        self.skip_unless_qemu_supports('dmg')
+
     def test_convert_dmg_simple(self):
         """Convert dmg-simple to raw with byte parity vs qemu-img."""
         image = self.get_image('dmg-simple')
@@ -6463,7 +6481,7 @@ class TestConvertDmgToRaw(InstarTestBase):
                 q_rc, 0, f'qemu-img convert failed for dmg-simple: {q_stderr}'
             )
 
-            self.assertEqual(
+            self.assert_bytes_identical(
                 Path(instar_raw.name).read_bytes(),
                 Path(qemu_raw.name).read_bytes(),
                 'convert output for dmg-simple differs from qemu-img'
@@ -6506,7 +6524,7 @@ class TestConvertDmgToRaw(InstarTestBase):
             self.assertEqual(
                 q_rc, 0, f'qemu-img convert failed for {image_id}: {q_stderr}')
 
-            self.assertEqual(
+            self.assert_bytes_identical(
                 Path(instar_raw.name).read_bytes(),
                 Path(qemu_raw.name).read_bytes(),
                 f'convert output for {image_id} differs from qemu-img')
@@ -6557,7 +6575,7 @@ class TestConvertDmgToRaw(InstarTestBase):
                 f'qemu-img convert failed for dmg-multipart: {q_stderr}')
 
             instar_bytes = Path(instar_raw.name).read_bytes()
-            self.assertEqual(
+            self.assert_bytes_identical(
                 instar_bytes, Path(qemu_raw.name).read_bytes(),
                 'dmg-multipart convert output differs from qemu-img')
             self.assertEqual(
@@ -6607,7 +6625,7 @@ class TestConvertDmgToRaw(InstarTestBase):
             ref_bytes = Path(ref_raw.name).read_bytes()
             flat_bytes = Path(flat_raw.name).read_bytes()
             n = min(len(ref_bytes), len(flat_bytes))
-            self.assertEqual(
+            self.assert_bytes_identical(
                 ref_bytes[:n], flat_bytes[:n],
                 f'instar {fmt} output (flattened) differs from qemu raw '
                 f'for dmg-mixed in the common prefix')
@@ -6698,7 +6716,7 @@ class TestConvertDmgToRaw(InstarTestBase):
                 e_rc, 0, f'instar convert of dmg-simple failed: {e_err}')
 
             instar_noext_bytes = Path(instar_noext).read_bytes()
-            self.assertEqual(
+            self.assert_bytes_identical(
                 instar_noext_bytes, Path(instar_ext).read_bytes(),
                 'instar extensionless convert differs from the extension-ful '
                 'conversion (trailer detection should be filename-agnostic)')
@@ -6794,7 +6812,7 @@ class TestConvertDmgToRaw(InstarTestBase):
                 f'qemu-img convert of qcow2-over-dmg chain failed: '
                 f'{q_stderr}')
 
-            self.assertEqual(
+            self.assert_bytes_identical(
                 Path(instar_raw).read_bytes(),
                 Path(qemu_raw).read_bytes(),
                 'instar convert of qcow2-over-dmg chain differs from '
@@ -6872,6 +6890,9 @@ class TestConvertDetectOnlyRefusal(InstarTestBase):
             overlay = tmpdir / 'overlay.qcow2'
             # Backing file in the same directory as the overlay keeps it
             # inside the default backing-path allowlist (image dir).
+            # Building the overlay needs a qemu that knows qed; the
+            # RHEL-family builds do not carry that driver.
+            self.skip_unless_qemu_supports('qed')
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'qcow2',
                  '-b', 'backing.qed', '-F', 'qed', str(overlay), '10M'],

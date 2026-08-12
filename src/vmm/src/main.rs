@@ -3342,6 +3342,12 @@ struct MapArgs {
     #[arg(long, default_value = "65536")]
     sector_size: u32,
 
+    /// Target qemu-img version for output compatibility (e.g., "7.2", "8.0", "10.0").
+    /// By default, instar detects the installed qemu-img version and matches its output format.
+    /// `map --output=json` gained the "compressed" field in qemu-img 8.2.
+    #[arg(long, value_name = "VERSION")]
+    qemu_version: Option<String>,
+
     /// Refused for parity-rejection: qemu-img's
     /// --image-opts descriptor-based source specification
     /// is deferred. Documented in docs/quirks.md.
@@ -3415,6 +3421,12 @@ struct SnapshotArgs {
     /// of qemu-img's surface; instar-specific.
     #[arg(long, default_value = "65536")]
     sector_size: u32,
+
+    /// Target qemu-img version for output compatibility (e.g., "7.2", "8.0", "10.0").
+    /// By default, instar detects the installed qemu-img version and matches its output format.
+    /// `snapshot -l`'s column layout changed in qemu-img 9.0.
+    #[arg(long, value_name = "VERSION")]
+    qemu_version: Option<String>,
 }
 
 /// Host-side holder for the harvested `CommitResultMessage`.
@@ -10067,6 +10079,39 @@ fn run_config(args: ConfigArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// Resolve the qemu-img output profile for a subcommand.
+///
+/// `flag` is the subcommand's `--qemu-version` value when the user
+/// supplied one; otherwise the installed qemu-img is detected and its
+/// profile used (falling back to the newest known format when qemu-img
+/// is absent). Shared by every subcommand whose output is
+/// version-dependent — `info`, `map` and `snapshot` — so the
+/// resolution rule and the error text stay in one place.
+fn resolve_output_profile(
+    flag: Option<&str>,
+) -> Result<version::OutputProfile, Box<dyn std::error::Error>> {
+    match flag {
+        Some(version_str) => match version::profile_for_version_str(version_str) {
+            Some(p) => {
+                debug!("Using output profile for qemu-img version {version_str}");
+                Ok(p)
+            }
+            None => {
+                Err(format!("invalid qemu version '{version_str}' (expected format: X.Y)").into())
+            }
+        },
+        None => {
+            let p = version::get_profile();
+            if let Some(v) = &p.version {
+                debug!("Detected qemu-img version {v}, using matching output profile");
+            } else {
+                debug!("qemu-img not found, using newest output profile");
+            }
+            Ok(p.clone())
+        }
+    }
+}
+
 /// Run the info operation (format detection)
 fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Validate sector size (must be power of 2, 512 to 64KB)
@@ -10095,27 +10140,7 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     }
 
     // Determine output profile (from --qemu-version flag or by detection)
-    let profile = if let Some(ref version_str) = args.qemu_version {
-        match version::profile_for_version_str(version_str) {
-            Some(p) => {
-                debug!("Using output profile for qemu-img version {version_str}");
-                p
-            }
-            None => {
-                return Err(
-                    format!("invalid qemu version '{version_str}' (expected format: X.Y)").into(),
-                );
-            }
-        }
-    } else {
-        let p = version::get_profile();
-        if let Some(v) = &p.version {
-            debug!("Detected qemu-img version {v}, using matching output profile");
-        } else {
-            debug!("qemu-img not found, using newest output profile");
-        }
-        p.clone()
-    };
+    let profile = resolve_output_profile(args.qemu_version.as_deref())?;
 
     // Auto-discover binaries in same directory as executable
     let core_path = get_binary_path("core.bin");
@@ -14612,6 +14637,10 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
 /// CLI with a placeholder renderer (step 3c); phase 4 polishes
 /// the renderer to byte-for-byte qemu-img parity.
 fn run_map(args: MapArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+    // Determine output profile (from --qemu-version flag or by detection).
+    // Resolved before any image work so an invalid version fails fast.
+    let profile = resolve_output_profile(args.qemu_version.as_deref())?;
+
     // --- Validate args ---------------------------------------------------
     if args.image_opts {
         return Err(
@@ -14840,7 +14869,7 @@ fn run_map(args: MapArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error
     // the streaming path clean (documented in docs/quirks.md).
     let stdout = std::io::stdout();
     let mut writer = std::io::BufWriter::new(stdout.lock());
-    let mut renderer = MapRenderer::new(&mut writer, &args.output, args.input.clone());
+    let mut renderer = MapRenderer::new(&mut writer, &args.output, args.input.clone(), &profile);
     renderer.begin()?;
 
     let mut map_result: Option<guest_::MapResultMessage> = None;
@@ -15076,10 +15105,18 @@ struct MapRenderer<'a, W: std::io::Write> {
     /// (lower than the guest's `extents_emitted` in human mode
     /// because holes are skipped).
     extents_written: u64,
+    /// The qemu-img output profile being emulated. Drives the
+    /// JSON `compressed` field, which qemu-img added in 8.2.
+    profile: version::OutputProfile,
 }
 
 impl<'a, W: std::io::Write> MapRenderer<'a, W> {
-    fn new(writer: &'a mut W, output_format: &str, filename: String) -> Self {
+    fn new(
+        writer: &'a mut W,
+        output_format: &str,
+        filename: String,
+        profile: &version::OutputProfile,
+    ) -> Self {
         let fmt = match output_format {
             "json" => MapOutputFormat::Json,
             _ => MapOutputFormat::Human,
@@ -15090,6 +15127,7 @@ impl<'a, W: std::io::Write> MapRenderer<'a, W> {
             filename,
             first_extent_json: true,
             extents_written: 0,
+            profile: profile.clone(),
         }
     }
 
@@ -15133,21 +15171,41 @@ impl<'a, W: std::io::Write> MapRenderer<'a, W> {
                     writeln!(self.writer, ",")?;
                 }
                 self.first_extent_json = false;
+                // Two keys arrived after the original extent shape and
+                // are omitted entirely — not emitted false — by the
+                // versions that predate them: "present" in 6.1 (with
+                // the dirty flag) and "compressed" in 8.2. Both are
+                // built as complete fragments so the surrounding
+                // separators and field order never move.
+                let present_field = if self.profile.include_map_present {
+                    format!(" \"present\": {},", present)
+                } else {
+                    String::new()
+                };
+                let compressed_field = if self.profile.include_map_compressed {
+                    ", \"compressed\": false"
+                } else {
+                    ""
+                };
                 if has_offset {
                     write!(
                         self.writer,
-                        "{{ \"start\": {}, \"length\": {}, \"depth\": 0, \
-                         \"present\": {}, \"zero\": {}, \"data\": {}, \
-                         \"compressed\": false, \"offset\": {}}}",
-                        ext.start, ext.length, present, zero, data, ext.file_offset
+                        "{{ \"start\": {}, \"length\": {}, \"depth\": 0,\
+                         {} \"zero\": {}, \"data\": {}{}, \"offset\": {}}}",
+                        ext.start,
+                        ext.length,
+                        present_field,
+                        zero,
+                        data,
+                        compressed_field,
+                        ext.file_offset
                     )?;
                 } else {
                     write!(
                         self.writer,
-                        "{{ \"start\": {}, \"length\": {}, \"depth\": 0, \
-                         \"present\": {}, \"zero\": {}, \"data\": {}, \
-                         \"compressed\": false}}",
-                        ext.start, ext.length, present, zero, data
+                        "{{ \"start\": {}, \"length\": {}, \"depth\": 0,\
+                         {} \"zero\": {}, \"data\": {}{}}}",
+                        ext.start, ext.length, present_field, zero, data, compressed_field
                     )?;
                 }
                 self.extents_written += 1;
@@ -15242,6 +15300,12 @@ fn run_snapshot(args: SnapshotArgs, verbose: bool) -> Result<(), Box<dyn std::er
         );
     }
 
+    // Determine output profile (from --qemu-version flag or by
+    // detection). Only list mode's output is version-dependent, but
+    // resolving here means an invalid version is refused in every mode
+    // rather than being silently ignored by the mutating ones.
+    let profile = resolve_output_profile(args.qemu_version.as_deref())?;
+
     // Mode selection. D2 (PLAN-snapshot-phase-09): bare `instar
     // snapshot FILE` (no mode flag) defaults to list, matching
     // `qemu-img snapshot` which documents `-l` as "the default".
@@ -15258,14 +15322,18 @@ fn run_snapshot(args: SnapshotArgs, verbose: bool) -> Result<(), Box<dyn std::er
         return run_snapshot_apply(&args, &needle, verbose);
     }
     // Explicit `-l` or bare filename (no mode flag): both resolve to list.
-    run_snapshot_list(&args, verbose)
+    run_snapshot_list(&args, &profile, verbose)
 }
 
 /// Drive `MODE_LIST` end-to-end: launch the guest, consume
 /// `SnapshotEntryMessage` records as they stream in, capture the
 /// terminating `SnapshotResultMessage`, and render to stdout via
 /// [`SnapshotRenderer`]. Modelled on `run_map`.
-fn run_snapshot_list(args: &SnapshotArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn run_snapshot_list(
+    args: &SnapshotArgs,
+    profile: &version::OutputProfile,
+    verbose: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let input_path = Path::new(&args.filename);
     let input_meta = std::fs::metadata(input_path)?;
     let input_size = input_meta.len();
@@ -15458,7 +15526,7 @@ fn run_snapshot_list(args: &SnapshotArgs, verbose: bool) -> Result<(), Box<dyn s
     let mut writer = std::io::BufWriter::new(stdout.lock());
     // The renderer holds a &mut to writer and must be scoped so
     // the borrow ends before we drop writer for the final flush.
-    let mut renderer = SnapshotRenderer::new(&mut writer, &args.output);
+    let mut renderer = SnapshotRenderer::new(&mut writer, &args.output, profile);
     renderer.begin()?;
 
     let mut snapshot_result: Option<guest_::SnapshotResultMessage> = None;
@@ -16137,10 +16205,13 @@ struct SnapshotRenderer<'a, W: std::io::Write> {
     /// True until the first JSON object is emitted. Drives the
     /// `,\n` inter-object separator.
     first_entry_json: bool,
+    /// The qemu-img output profile being emulated. Drives the
+    /// human-mode column layout, which qemu-img changed in 9.0.
+    profile: version::OutputProfile,
 }
 
 impl<'a, W: std::io::Write> SnapshotRenderer<'a, W> {
-    fn new(writer: &'a mut W, output_format: &str) -> Self {
+    fn new(writer: &'a mut W, output_format: &str, profile: &version::OutputProfile) -> Self {
         let fmt = match output_format {
             "json" => SnapshotOutputFormat::Json,
             _ => SnapshotOutputFormat::Human,
@@ -16150,6 +16221,7 @@ impl<'a, W: std::io::Write> SnapshotRenderer<'a, W> {
             output_format: fmt,
             first_entry_emitted: false,
             first_entry_json: true,
+            profile: profile.clone(),
         }
     }
 
@@ -16170,20 +16242,44 @@ impl<'a, W: std::io::Write> SnapshotRenderer<'a, W> {
     fn emit_snapshot(&mut self, entry: &guest_::SnapshotEntryMessage) -> std::io::Result<()> {
         match self.output_format {
             SnapshotOutputFormat::Human => {
+                let modern = self.profile.snapshot_underscored_columns;
+
                 if !self.first_entry_emitted {
                     writeln!(self.writer, "Snapshot list:")?;
-                    writeln!(
-                        self.writer,
-                        "{:<7} {:<16} {:>8} {:>19} {:>15} {:>10}",
-                        "ID", "TAG", "VM_SIZE", "DATE", "VM_CLOCK", "ICOUNT"
-                    )?;
+                    if modern {
+                        writeln!(
+                            self.writer,
+                            "{:<7} {:<16} {:>8} {:>19} {:>15} {:>10}",
+                            "ID", "TAG", "VM_SIZE", "DATE", "VM_CLOCK", "ICOUNT"
+                        )?;
+                    } else {
+                        // Pre-9.0 qemu concatenates the fields with no
+                        // separators at different widths, so this is a
+                        // whole second layout rather than a title swap.
+                        //
+                        // The widths were derived by growing a tag past
+                        // the field boundary against real qemu 8.2.2,
+                        // not read off a sample row: 16/9 and 18/7
+                        // render identically for every tag short enough
+                        // to fit, and only diverge once the TAG column
+                        // overflows and its padding disappears.
+                        writeln!(
+                            self.writer,
+                            "{:<10}{:<16}{:>9}{:>20}{:>13}{:>11}",
+                            "ID", "TAG", "VM SIZE", "DATE", "VM CLOCK", "ICOUNT"
+                        )?;
+                    }
                     self.first_entry_emitted = true;
                 }
 
                 let date_sec: u64 = ((entry.date_sec_hi as u64) << 32) | (entry.date_sec_lo as u64);
                 let date_str = format_qemu_snapshot_date_local(date_sec);
                 let vm_size_str = format_snapshot_vm_size(entry.vm_state_size);
-                let clock_str = format_qemu_snapshot_clock(entry.vm_clock_nsec);
+                let clock_str = if modern {
+                    format_qemu_snapshot_clock(entry.vm_clock_nsec)
+                } else {
+                    format_qemu_snapshot_clock_legacy(entry.vm_clock_nsec)
+                };
                 let icount_str = if entry.icount == u64::MAX {
                     "--".to_string()
                 } else {
@@ -16195,19 +16291,44 @@ impl<'a, W: std::io::Write> SnapshotRenderer<'a, W> {
                 // printf("%-7s"/"%-16s"). Rust's `{:<7}` counts
                 // chars, which diverges for multibyte UTF-8 names.
                 // The right-aligned columns carry ASCII-only
-                // generated strings, so `{:>N}` is safe there.
-                writeln!(
-                    self.writer,
-                    "{}{} {}{} {:>8} {:>19} {:>15} {:>10}",
-                    entry.id,
-                    " ".repeat(7usize.saturating_sub(entry.id.len())),
-                    entry.name,
-                    " ".repeat(16usize.saturating_sub(entry.name.len())),
-                    vm_size_str,
-                    date_str,
-                    clock_str,
-                    icount_str
-                )
+                // generated strings, so `{:>N}` is safe there. The
+                // reasoning is width-independent, so both layouts pad
+                // the same way — only the widths differ.
+                let (id_width, tag_width) = if modern {
+                    (7usize, 16usize)
+                } else {
+                    (10usize, 16usize)
+                };
+                let id_pad = " ".repeat(id_width.saturating_sub(entry.id.len()));
+                let tag_pad = " ".repeat(tag_width.saturating_sub(entry.name.len()));
+
+                if modern {
+                    writeln!(
+                        self.writer,
+                        "{}{} {}{} {:>8} {:>19} {:>15} {:>10}",
+                        entry.id,
+                        id_pad,
+                        entry.name,
+                        tag_pad,
+                        vm_size_str,
+                        date_str,
+                        clock_str,
+                        icount_str
+                    )
+                } else {
+                    writeln!(
+                        self.writer,
+                        "{}{}{}{}{:>9}{:>20}{:>13}{:>11}",
+                        entry.id,
+                        id_pad,
+                        entry.name,
+                        tag_pad,
+                        vm_size_str,
+                        date_str,
+                        clock_str,
+                        icount_str
+                    )
+                }
             }
             SnapshotOutputFormat::Json => {
                 if !self.first_entry_json {
@@ -16293,6 +16414,25 @@ fn format_qemu_snapshot_clock(vm_clock_nsec: u64) -> String {
     let m: u64 = total_m % 60;
     let h: u64 = total_m / 60;
     format!("{:04}:{:02}:{:02}.{:03}", h, m, s, ms)
+}
+
+/// Format the snapshot VM clock as `HH:MM:SS.mmm` for qemu-img
+/// before 9.0.
+///
+/// Identical to [`format_qemu_snapshot_clock`] except that the hour
+/// field is 2-digit rather than 4-digit — qemu widened it in 9.0
+/// alongside the column-layout change. Hours are not wrapped at 100:
+/// qemu's `%02d` is a minimum width, so a clock past 99 hours simply
+/// prints wider, and this mirrors that.
+fn format_qemu_snapshot_clock_legacy(vm_clock_nsec: u64) -> String {
+    let total_ms: u64 = vm_clock_nsec / 1_000_000;
+    let ms: u64 = total_ms % 1000;
+    let total_s: u64 = total_ms / 1000;
+    let s: u64 = total_s % 60;
+    let total_m: u64 = total_s / 60;
+    let m: u64 = total_m % 60;
+    let h: u64 = total_m / 60;
+    format!("{:02}:{:02}:{:02}.{:03}", h, m, s, ms)
 }
 
 /// Format a snapshot creation timestamp as
@@ -18626,7 +18766,29 @@ mod map_renderer_tests {
     fn render_human(extents: &[guest_::MapExtentMessage], filename: &str) -> Vec<u8> {
         let mut buf: Vec<u8> = Vec::new();
         {
-            let mut r = MapRenderer::new(&mut buf, "human", filename.to_string());
+            let mut r = MapRenderer::new(
+                &mut buf,
+                "human",
+                filename.to_string(),
+                &version::OutputProfile::newest(),
+            );
+            r.begin().unwrap();
+            for e in extents {
+                r.emit_extent(e).unwrap();
+            }
+            r.finish().unwrap();
+        }
+        buf
+    }
+
+    /// Render JSON as the given qemu-img version would. The
+    /// `compressed` field arrived in 8.2, so every JSON expectation
+    /// below is version-specific.
+    fn render_json_as(extents: &[guest_::MapExtentMessage], major: u32, minor: u32) -> Vec<u8> {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let profile = version::OutputProfile::for_version(version::Version::new(major, minor));
+            let mut r = MapRenderer::new(&mut buf, "json", "<unused>".to_string(), &profile);
             r.begin().unwrap();
             for e in extents {
                 r.emit_extent(e).unwrap();
@@ -18639,7 +18801,12 @@ mod map_renderer_tests {
     fn render_json(extents: &[guest_::MapExtentMessage]) -> Vec<u8> {
         let mut buf: Vec<u8> = Vec::new();
         {
-            let mut r = MapRenderer::new(&mut buf, "json", "<unused>".to_string());
+            let mut r = MapRenderer::new(
+                &mut buf,
+                "json",
+                "<unused>".to_string(),
+                &version::OutputProfile::newest(),
+            );
             r.begin().unwrap();
             for e in extents {
                 r.emit_extent(e).unwrap();
@@ -18866,15 +19033,81 @@ Offset          Length          Mapped to       File
     #[test]
     fn json_compressed_false_emitted_for_every_state() {
         for state in ["hole", "zero", "data"] {
-            let out = render_json(&[ext(0, 0x10000, state, 0)]);
+            let out = render_json_as(&[ext(0, 0x10000, state, 0)], 8, 2);
             let s = std::str::from_utf8(&out).unwrap();
             assert!(
                 s.contains("\"compressed\": false"),
-                "state {} must emit compressed: false; got: {}",
+                "state {} must emit compressed: false at 8.2; got: {}",
                 state,
                 s,
             );
         }
+    }
+
+    #[test]
+    fn json_compressed_omitted_entirely_before_8_2() {
+        // qemu-img < 8.2 has no "compressed" key at all — it does
+        // not emit it as false. Anything containing the substring
+        // would break byte-parity against a pre-8.2 baseline.
+        for state in ["hole", "zero", "data"] {
+            let out = render_json_as(&[ext(0, 0x10000, state, 0)], 8, 1);
+            let s = std::str::from_utf8(&out).unwrap();
+            assert!(
+                !s.contains("compressed"),
+                "state {} must omit compressed below 8.2; got: {}",
+                state,
+                s,
+            );
+        }
+    }
+
+    #[test]
+    fn json_present_omitted_entirely_before_6_1() {
+        // qemu-img 6.0 has no "present" key at all. Measured against
+        // the 6.0.1 and 6.1.0 static builds; found by the cross-profile
+        // baseline test, not by the distro matrix, because no matrix
+        // distro ships anything older than 6.2.
+        let out = render_json_as(&[ext(0, 0x100000, "hole", 0)], 6, 0);
+        let expected = b"[{ \"start\": 0, \"length\": 1048576, \"depth\": 0, \
+                          \"zero\": true, \"data\": false}]\n";
+        assert_eq!(
+            std::str::from_utf8(&out).unwrap(),
+            std::str::from_utf8(expected).unwrap()
+        );
+
+        // 6.1 reinstates it, still without "compressed".
+        let out = render_json_as(&[ext(0, 0x100000, "hole", 0)], 6, 1);
+        let expected = b"[{ \"start\": 0, \"length\": 1048576, \"depth\": 0, \
+                          \"present\": false, \"zero\": true, \"data\": false}]\n";
+        assert_eq!(
+            std::str::from_utf8(&out).unwrap(),
+            std::str::from_utf8(expected).unwrap()
+        );
+    }
+
+    #[test]
+    fn json_pre_8_2_extents_are_byte_exact() {
+        // The exact bytes qemu-img 8.1.5 emits for a data extent
+        // (with offset) and a hole (without), captured from
+        // instar-testdata's static per-version builds. Closing the
+        // gap must not disturb the separators either side of it.
+        let out = render_json_as(
+            &[
+                ext(0, 0x10000, "data", 0x90000),
+                ext(0x10000, 0xf0000, "hole", 0),
+            ],
+            8,
+            1,
+        );
+        let expected = b"[{ \"start\": 0, \"length\": 65536, \"depth\": 0, \
+                          \"present\": true, \"zero\": false, \"data\": true, \
+                          \"offset\": 589824},\n\
+                          { \"start\": 65536, \"length\": 983040, \"depth\": 0, \
+                          \"present\": false, \"zero\": true, \"data\": false}]\n";
+        assert_eq!(
+            std::str::from_utf8(&out).unwrap(),
+            std::str::from_utf8(expected).unwrap()
+        );
     }
 
     #[test]
@@ -18927,7 +19160,12 @@ Offset          Length          Mapped to       File
     #[test]
     fn renderer_extents_written_counts_data_only_in_human() {
         let mut buf: Vec<u8> = Vec::new();
-        let mut r = MapRenderer::new(&mut buf, "human", "img".to_string());
+        let mut r = MapRenderer::new(
+            &mut buf,
+            "human",
+            "img".to_string(),
+            &version::OutputProfile::newest(),
+        );
         r.begin().unwrap();
         r.emit_extent(&ext(0, 0x10000, "hole", 0)).unwrap();
         r.emit_extent(&ext(0x10000, 0x10000, "data", 0x50000))
@@ -18941,7 +19179,12 @@ Offset          Length          Mapped to       File
     #[test]
     fn renderer_extents_written_counts_all_in_json() {
         let mut buf: Vec<u8> = Vec::new();
-        let mut r = MapRenderer::new(&mut buf, "json", "img".to_string());
+        let mut r = MapRenderer::new(
+            &mut buf,
+            "json",
+            "img".to_string(),
+            &version::OutputProfile::newest(),
+        );
         r.begin().unwrap();
         r.emit_extent(&ext(0, 0x10000, "hole", 0)).unwrap();
         r.emit_extent(&ext(0x10000, 0x10000, "data", 0x50000))
@@ -18991,10 +19234,31 @@ Offset          Length          Mapped to       File
         }
     }
 
+    /// Render human mode as the given qemu-img version would. The
+    /// column layout changed in 9.0, so every human expectation below
+    /// is version-specific.
+    fn render_snapshot_human_as(
+        entries: &[guest_::SnapshotEntryMessage],
+        major: u32,
+        minor: u32,
+    ) -> Vec<u8> {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let profile = version::OutputProfile::for_version(version::Version::new(major, minor));
+            let mut r = SnapshotRenderer::new(&mut buf, "human", &profile);
+            r.begin().unwrap();
+            for e in entries {
+                r.emit_snapshot(e).unwrap();
+            }
+            r.finish().unwrap();
+        }
+        buf
+    }
+
     fn render_snapshot_human(entries: &[guest_::SnapshotEntryMessage]) -> Vec<u8> {
         let mut buf: Vec<u8> = Vec::new();
         {
-            let mut r = SnapshotRenderer::new(&mut buf, "human");
+            let mut r = SnapshotRenderer::new(&mut buf, "human", &version::OutputProfile::newest());
             r.begin().unwrap();
             for e in entries {
                 r.emit_snapshot(e).unwrap();
@@ -19007,7 +19271,7 @@ Offset          Length          Mapped to       File
     fn render_snapshot_json(entries: &[guest_::SnapshotEntryMessage]) -> Vec<u8> {
         let mut buf: Vec<u8> = Vec::new();
         {
-            let mut r = SnapshotRenderer::new(&mut buf, "json");
+            let mut r = SnapshotRenderer::new(&mut buf, "json", &version::OutputProfile::newest());
             r.begin().unwrap();
             for e in entries {
                 r.emit_snapshot(e).unwrap();
@@ -19069,6 +19333,104 @@ Offset          Length          Mapped to       File
         );
         assert!(text.contains("0000:00:00.000"), "clock: {:?}", text);
         assert!(text.ends_with("          0\n"), "icount tail: {:?}", text);
+    }
+
+    #[test]
+    fn snapshot_human_pre_9_0_header_byte_exact() {
+        // Captured from instar-testdata's static qemu-img builds:
+        // every version from 6.0.0 through 8.2.2 emits this header,
+        // and 9.0.0 onwards emits the underscored one. The fields are
+        // concatenated with NO separators at widths 10/16/9/20/13/11,
+        // giving a 79-character line against the modern layout's 80.
+        let e = snap("9999", "short", 0, 0, 0, 0, 0, 0);
+        let out = render_snapshot_human_as(&[e], 8, 2);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.starts_with("Snapshot list:\n"), "got: {:?}", text);
+
+        let header = text.lines().nth(1).unwrap();
+        assert_eq!(
+            header,
+            "ID        TAG               VM SIZE                DATE     VM CLOCK     ICOUNT"
+        );
+        assert_eq!(header.len(), 79, "pre-9.0 header is 79 bytes");
+
+        // ID padded to 10, TAG to 16, then VM SIZE right-aligned in
+        // 9 — 11 + 6 = 17 spaces sit between "short" and "0 B".
+        // (10/18/7 gives the same 17 here; only an overflowing tag
+        // tells the two splits apart.)
+        assert!(
+            text.contains("9999      short                 0 B"),
+            "row: {:?}",
+            text
+        );
+        // 2-digit hours below 9.0, not the 4-digit `0000:00:00.000`.
+        assert!(text.contains(" 00:00:00.000"), "clock: {:?}", text);
+        assert!(!text.contains("0000:00:00.000"), "clock: {:?}", text);
+        assert!(text.ends_with("          0\n"), "icount tail: {:?}", text);
+    }
+
+    #[test]
+    fn snapshot_human_overflowing_tag_pins_the_column_widths() {
+        // A tag longer than the TAG field is the ONLY input that
+        // distinguishes the real pre-9.0 widths (10/16/9/...) from the
+        // 18/7 split that renders identically for every tag that fits:
+        // 16+9 == 18+7. Once the tag overflows, its padding vanishes
+        // and only the VM SIZE width remains, so the gap collapses to
+        // 6 characters ("      0 B") under either layout.
+        //
+        // Measured against real qemu 8.2.2 and 9.0.0 by growing a tag
+        // from 1 to 40 characters; both saturate at a 6-character gap.
+        for (major, minor) in [(8, 2), (9, 0)] {
+            let long_tag = "a".repeat(40);
+            let out =
+                render_snapshot_human_as(&[snap("1", &long_tag, 0, 0, 0, 0, 0, 0)], major, minor);
+            let text = String::from_utf8(out).unwrap();
+            let row = text.lines().nth(2).unwrap();
+            assert!(
+                row.contains(&format!("{long_tag}      0 B")),
+                "{major}.{minor}: an overflowing tag must be followed by \
+                 exactly six spaces before the VM SIZE column; got {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_human_layout_switches_at_9_0() {
+        // The boundary itself: 8.2 is the last old-layout version and
+        // 9.0 the first new one. Measured, not inferred.
+        let old = String::from_utf8(render_snapshot_human_as(
+            &[snap("1", "snap1", 0, 0, 0, 0, 0, 0)],
+            8,
+            2,
+        ))
+        .unwrap();
+        assert!(old.contains("VM SIZE"), "8.2 uses spaces: {:?}", old);
+        assert!(!old.contains("VM_SIZE"), "8.2 uses spaces: {:?}", old);
+
+        let new = String::from_utf8(render_snapshot_human_as(
+            &[snap("1", "snap1", 0, 0, 0, 0, 0, 0)],
+            9,
+            0,
+        ))
+        .unwrap();
+        assert!(new.contains("VM_SIZE"), "9.0 uses underscores: {:?}", new);
+        assert!(!new.contains("VM SIZE"), "9.0 uses underscores: {:?}", new);
+    }
+
+    #[test]
+    fn snapshot_legacy_clock_is_two_digit_hours() {
+        // 90 seconds wraps into the minute field in both layouts; the
+        // only difference is the hour width.
+        assert_eq!(
+            format_qemu_snapshot_clock_legacy(90_000_000_000),
+            "00:01:30.000"
+        );
+        assert_eq!(format_qemu_snapshot_clock(90_000_000_000), "0000:01:30.000");
+        // Past 9 hours the legacy field is still 2-digit.
+        assert_eq!(
+            format_qemu_snapshot_clock_legacy(36_000_000_000_000),
+            "10:00:00.000"
+        );
     }
 
     #[test]
@@ -19350,6 +19712,7 @@ Offset          Length          Mapped to       File
             image_opts: false,
             output: "human".to_string(),
             sector_size: 65536,
+            qemu_version: None,
         }
     }
 

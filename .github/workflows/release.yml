@@ -116,7 +116,7 @@ jobs:
 
       - name: Remove previous devcontainers, if any
         run: |
-          docker image rm -f instar-build 2>/dev/null || true
+          docker image rm -f instar-build instar-release 2>/dev/null || true
 
       - name: Build instar (VMM + guest binaries)
         run: make instar

@@ -7,6 +7,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `map` and `snapshot` accept `--qemu-version`, forcing the qemu-img
+  version whose output format is emulated instead of detecting the
+  host's. This is how the per-version baselines are exercised without
+  installing seven qemu builds.
+
+### Changed
+
+- **`map --output=json` and `snapshot -l` now match the output of the
+  qemu-img version being emulated, not just the newest one.** `map`
+  omits `present` below qemu 6.1 and `compressed` below 8.2 rather than
+  emitting them unconditionally, and `snapshot -l` emits the pre-9.0
+  column layout (`VM SIZE` / `VM CLOCK` titles, 2-digit hours) when the
+  detected qemu-img is older than 9.0. Both boundaries were measured
+  against static per-version qemu-img builds. If you parse instar's
+  output on a host with qemu older than 10.x, it now differs — because
+  it now agrees with your qemu-img.
+
+- **The merge queue now tests the released packages on seven
+  distributions.** A `package-matrix` job builds one `.deb` and one
+  `.rpm` and runs the full integration suite against the *installed*
+  package on Debian 12/13, Ubuntu 22.04/24.04, Fedora, and Rocky 9/10 —
+  each against the `qemu-img` that distribution ships, which ranges from
+  6.2 to 10.2. This catches two classes single-distro CI cannot:
+  packaging regressions (the v0.3.0 incident, where ten of sixteen
+  operation binaries were missing from the manifests) and output-format
+  parity gaps against older `qemu-img`. It runs only in the merge queue,
+  so pull-request latency is unchanged.
+
+- **Lowered the release binary's glibc floor to run on far more
+  distributions.** The `instar` binary is now built on Debian 11
+  (bullseye, glibc 2.31) instead of a rolling recent Debian, so a
+  single published artifact runs across Debian 11+, Ubuntu 22.04 LTS
+  and 24.04 LTS, Fedora, and Rocky/RHEL 9 and 10 — previously the
+  packages required glibc 2.39 and excluded Ubuntu 22.04 and
+  Rocky/RHEL 9. glibc is forward-compatible, so building on the
+  oldest supported glibc is what widens the range. The devcontainer
+  is now split into a minimal `debian:bullseye` release build image
+  (toolchain only, produces the binary and the `.deb`/`.rpm`) and the
+  existing full Debian dev/test image (qemu-utils, the libyal
+  parsers, and the fuzz/audit tooling), so lowering the floor does
+  not drag the test tooling onto an older base.
+  `tools/verify-glibc-floor.sh` installs the built packages on every
+  target distribution and exercises them under KVM as the empirical
+  acceptance check.
+
+### Fixed
+
+- **VHD images instar writes are no longer silently truncated when
+  read by qemu-img older than 10.0.** instar stamped its VHD footers
+  with the creator app `imgo`; for any creator it does not recognise,
+  qemu before 10.0 computes the disk size from the footer's CHS
+  geometry rather than trusting `current_size`, and instar's CHS
+  product can address less than the size it declares. The tail of the
+  disk was therefore invisible — silent data loss — on Debian 12,
+  Ubuntu 22.04 and 24.04, and RHEL/Rocky 9, in `create`, `convert` and
+  `resize` alike. Footers are now stamped `qem2`, which those versions
+  do recognise, so they read `current_size` and see the whole disk.
+
+  Existing VHDs are not corrupt and do not change size, but newly
+  written ones differ byte-wise from previous releases (the four
+  creator-app bytes and the footer checksum). Images written by other
+  tools that use an unrecognised creator app remain subject to the
+  same qemu behaviour; see docs/quirks.md.
+
 ## [0.3.0] - 2026-08-02
 
 ### Fixed
