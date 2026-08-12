@@ -291,11 +291,19 @@ do not bump the pin by hand without at least building the full image.
 (The lint container is separate and uses a stable `rust:` tag Renovate
 does manage.)
 
-### CI test partition
+### CI tooling guards
+
+The `ci-tooling` CI job runs the cheap guards over CI's own tooling:
+the test-partition check below, plus
+`tools/ci/test-report-fuzz-crash.sh` and
+`tools/ci/test-pick-fuzz-artifact.sh` for the coverage-fuzz helpers
+(see "Crash reporting" in [docs/testing.md](docs/testing.md)). It is
+also the job named in `automated_reviewer`'s `needs` list, which is
+required to list every job that can fail a PR.
 
 Integration tests are split across several CI jobs by stestr regex
-selectors (the `test-container-*` Makefile targets). The
-`test-partition` CI job (`tools/ci/check-test-partition.sh`) fails if
+selectors (the `test-container-*` Makefile targets).
+`tools/ci/check-test-partition.sh` fails if
 any `test_*.py` test is run by **no** pull-request job. When you add a
 new integration test module or a new integration job, the guard
 validates that the new partition still covers everything; an orphan is
@@ -682,3 +690,6 @@ step -- see "Self-hosted runners and Docker" in `docs/development.md`.
 - `scripts/differential-fuzz.py` - Differential fuzzing script (instar vs qemu-img + libyal)
 - `scripts/extract-fuzz-corpus.py` - Seeds + restores the coverage-fuzz corpus from instar-testdata
 - `tools/ci/fuzz-tier.sh` - Computes tiered nightly per-target fuzz durations
+- `tools/ci/report-fuzz-crash.sh` - Files the `security-audit` issue for a coverage-fuzz crash (bounds the log excerpt, dedups against open issues; see "Crash reporting" in `docs/testing.md`)
+- `tools/ci/pick-fuzz-artifact.sh` - Chooses which libFuzzer artifact to report as the reproducer
+- `tools/ci/test-report-fuzz-crash.sh`, `tools/ci/test-pick-fuzz-artifact.sh` - Tests for those two; run them after any change (the `ci-tooling` CI job does)

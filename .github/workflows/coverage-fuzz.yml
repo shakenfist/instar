@@ -16,6 +16,8 @@ on:
       - '.github/workflows/coverage-fuzz.yml'
       - 'scripts/extract-fuzz-corpus.py'
       - 'tools/ci/fuzz-tier.sh'
+      - 'tools/ci/report-fuzz-crash.sh'
+      - 'tools/ci/pick-fuzz-artifact.sh'
 
   # Post-merge smoke test: 15s per target
   push:
@@ -25,6 +27,8 @@ on:
       - 'scripts/extract-fuzz-corpus.py'
       - '.github/workflows/coverage-fuzz.yml'
       - 'tools/ci/fuzz-tier.sh'
+      - 'tools/ci/report-fuzz-crash.sh'
+      - 'tools/ci/pick-fuzz-artifact.sh'
 
   # Manual: configurable duration and target selection
   workflow_dispatch:
@@ -270,6 +274,8 @@ jobs:
           echo "$PLAN"
 
           CRASHES_FOUND=0
+          REPORT_FAILURES=0
+          NO_ARTIFACT=0
 
           while read -r TARGET DURATION; do
             [ -z "$TARGET" ] && continue
@@ -296,13 +302,24 @@ jobs:
               " || EXIT_CODE=$?
 
             if [ $EXIT_CODE -ne 0 ]; then
-              echo "!!! Crash found in $TARGET (exit code $EXIT_CODE) !!!"
+              # Not necessarily a crash: cargo fuzz also exits non-zero
+              # for a build error or an OOM. Which it was is decided by
+              # whether an artifact turned up, below.
+              echo "!!! $TARGET exited non-zero (code $EXIT_CODE) !!!"
               CRASHES_FOUND=$((CRASHES_FOUND + 1))
 
-              # Attempt to minimize the crash
-              CRASH_FILE=$(find src/fuzz/artifacts/$TARGET/ -type f 2>/dev/null | head -1)
+              # Which artifact to report is a decision with its own
+              # failure modes, and it used to live here as inline YAML
+              # with no test -- which is how it shipped a bug that could
+              # report a 0-byte file as the reproducer. See
+              # tools/ci/pick-fuzz-artifact.sh.
+              CRASH_FILE=$(tools/ci/pick-fuzz-artifact.sh crash \
+                "src/fuzz/artifacts/$TARGET/")
               if [ -n "$CRASH_FILE" ]; then
                 echo "Minimizing crash: $CRASH_FILE"
+                # No -max_len here: cargo fuzz tmin passes its own, and
+                # a second one trips libFuzzer's
+                # `assert(MaxInputLen == 0)` so minimization always fails.
                 docker run --rm \
                   -u "$(id -u):$(id -g)" \
                   -e HOME=/build \
@@ -315,40 +332,40 @@ jobs:
                   bash -c "
                     set -o pipefail
                     cargo fuzz tmin $TARGET /workspace/$CRASH_FILE \
-                      -- -max_len=4194304 \
                       2>&1 | tee /workspace/coverage-fuzz-logs/${TARGET}-tmin.log
                   " || true
 
-                # Extract crash signature from log
-                SIGNATURE=$(grep -m1 'panicked at\|SUMMARY:' \
-                  coverage-fuzz-logs/${TARGET}.log 2>/dev/null \
-                  | head -c 120 || echo "unknown crash")
+                # Report the minimized input when tmin produced one:
+                # otherwise the issue quotes the size of, and the
+                # reproducer points at, the original large artifact,
+                # and minimization costs CI time for nothing.
+                MIN_FILE=$(tools/ci/pick-fuzz-artifact.sh minimized \
+                  "src/fuzz/artifacts/$TARGET/")
+                if [ -n "$MIN_FILE" ]; then
+                  echo "Minimized to: $MIN_FILE"
+                  CRASH_FILE=$MIN_FILE
+                fi
 
-                # File GitHub issue with structured JSON body.
-                # The autofix workflow validates this schema before
-                # including any fields in the Claude prompt.
-                CRASH_SIZE=$(stat -c%s "$CRASH_FILE" 2>/dev/null || echo "unknown")
-                LOG_TAIL=$(tail -30 "coverage-fuzz-logs/${TARGET}.log" 2>/dev/null || true)
-                REPRO="cd src/fuzz && cargo fuzz run $TARGET artifacts/$TARGET/<crash-file>"
-
-                jq -n \
-                  --arg source "coverage-fuzz" \
-                  --arg target "$TARGET" \
-                  --arg signature "$SIGNATURE" \
-                  --arg reproducer "$REPRO" \
-                  --arg crash_input_size "$CRASH_SIZE bytes" \
-                  --arg log_excerpt "$LOG_TAIL" \
-                  --arg ci_run "$WORKFLOW_URL" \
-                  '{source: $source, target: $target,
-                    signature: $signature, reproducer: $reproducer,
-                    crash_input_size: $crash_input_size,
-                    log_excerpt: $log_excerpt, ci_run: $ci_run}' \
-                  > /tmp/issue-body.txt
-
-                gh issue create \
-                  --label "security-audit" \
-                  --title "Coverage fuzz crash: $TARGET" \
-                  --body-file /tmp/issue-body.txt
+                # Reporting must never end the run: the remaining targets
+                # still have to be fuzzed. Failures are counted and turned
+                # into a failure in the final step, so a fuzz run that
+                # could not tell anyone about a crash is never silently
+                # green.
+                if ! tools/ci/report-fuzz-crash.sh "$TARGET" "$CRASH_FILE" \
+                    "coverage-fuzz-logs/${TARGET}.log"; then
+                  echo "::warning::Could not file an issue for the" \
+                    "$TARGET crash; the crash input and logs are in" \
+                    "this run's artifacts."
+                  REPORT_FAILURES=$((REPORT_FAILURES + 1))
+                fi
+              else
+                # `cargo fuzz run` also exits non-zero for build errors
+                # and container/OOM failures, which leave no artifact
+                # behind. Counted separately so the run says "check the
+                # build" rather than blaming the crash reporter.
+                echo "::warning::$TARGET exited non-zero but left no" \
+                  "crash artifact."
+                NO_ARTIFACT=$((NO_ARTIFACT + 1))
               fi
             fi
 
@@ -357,6 +374,26 @@ jobs:
 
           echo "Total crashes found: $CRASHES_FOUND"
           echo "crashes_found=$CRASHES_FOUND" >> $GITHUB_ENV
+
+          # A run where every crash was filed successfully is green, so
+          # put the counts somewhere a reader sees without opening the
+          # step log.
+          {
+            echo "### Coverage fuzz"
+            echo ""
+            echo "- targets fuzzed: $(echo "$PLAN" | grep -c .)"
+            echo "- non-zero exits: $CRASHES_FOUND"
+            echo "- could not be reported: $REPORT_FAILURES"
+            echo "- exited without an artifact: $NO_ARTIFACT"
+          } >> $GITHUB_STEP_SUMMARY
+
+          # Deliberately does NOT fail here. Failing this step would skip
+          # the corpus push below, throwing away the night's new corpus
+          # -- one of the three harms the original bug caused. The counts
+          # are handed to the final step instead, which runs with
+          # always() after everything that persists work.
+          echo "report_failures=$REPORT_FAILURES" >> $GITHUB_ENV
+          echo "no_artifact_targets=$NO_ARTIFACT" >> $GITHUB_ENV
 
       - name: Push corpus to instar-testdata
         if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
@@ -420,3 +457,31 @@ jobs:
             coverage-fuzz-logs/
             src/fuzz/artifacts/
           retention-days: 90
+
+      # Last, and with always(), so a crash nobody could report still
+      # turns the run red -- but only after the corpus push and the log
+      # upload have run. When issue filing is the thing that broke, the
+      # uploaded artifacts are how the crash reaches a human, so they
+      # must not be collateral damage of failing the run.
+      #
+      # crashes_found is deliberately NOT consulted. A crash that was
+      # successfully filed as an issue has already reached a human, and
+      # going red on every recurring known crash would leave the nightly
+      # permanently red and therefore ignored. Only crashes nobody was
+      # told about fail the run.
+      - name: Fail on unreported crashes
+        if: always()
+        run: |
+          STATUS=0
+          if [ "${report_failures:-0}" -ne 0 ]; then
+            echo "::error::${report_failures} crash(es) could not be" \
+              "reported as issues"
+            STATUS=1
+          fi
+          if [ "${no_artifact_targets:-0}" -ne 0 ]; then
+            echo "::error::${no_artifact_targets} target(s) exited" \
+              "non-zero with no crash artifact -- check for build or" \
+              "container failures"
+            STATUS=1
+          fi
+          exit $STATUS
