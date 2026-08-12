@@ -44,6 +44,31 @@ jobs:
       - name: Check CI test partition
         run: tools/ci/check-test-partition.sh
 
+  # The coverage-fuzz crash reporter only runs when a target actually
+  # crashes, so nothing in the normal suite exercises it -- which is how
+  # it managed to break every nightly fuzz run for a month. These tests
+  # synthesise the log shapes it has to survive. Pure bash + jq, so it
+  # shares the small runner with the partition guard above. See
+  # "Crash reporting" in docs/testing.md.
+  fuzz-reporter:
+    name: "Fuzz crash reporter tests"
+    if: github.event_name == 'pull_request'
+    runs-on: [self-hosted, debian-12, s]
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Ensure jq is available
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Test the fuzz crash reporter
+        run: tools/ci/test-report-fuzz-crash.sh
+
   build-and-test:
     runs-on: [self-hosted, debian-12, s]
     timeout-minutes: 30

@@ -840,8 +840,8 @@ Issues with the `security-audit` label immediately when found, by
 `instar-testdata/custom/fuzz-corpus/` after nightly runs, and restored
 by target name on the next run so coverage compounds.
 
-Two rules make that reporting safe, both learned from a month of
-silently broken nightlies:
+Four rules make that reporting safe, most of them learned from a month
+of silently broken nightlies:
 
 - **The log excerpt is bounded in bytes, and never travels on a command
   line.** `cargo fuzz` prints the failing input as a `std::fmt::Debug`
@@ -857,9 +857,33 @@ silently broken nightlies:
   first crash: 21 of the 40 targets were never fuzzed, no issue was
   filed, and the corpus push was skipped — every night from 2026-07-16
   to 2026-08-11. Reporting failures are now counted and warned about
-  per target, the loop continues to the remaining targets, and the step
-  fails at the *end* if any crash went unreported, so a fuzz run that
-  cannot report is still red.
+  per target, and the loop continues to the remaining targets. The
+  failure is raised by a final `Fail on unreported crashes` step that
+  runs with `if: always()` *after* the corpus push and the log upload,
+  so an unreportable crash still turns the run red without costing the
+  night's corpus — and without hiding the artifacts that are the only
+  remaining way for that crash to reach a human.
+- **Anything read out of a fuzz log is treated as hostile bytes.** Both
+  the excerpt and the signature are NUL-stripped, length-bounded and
+  re-encoded with `iconv -c`, because a panic message can itself carry
+  fuzz data and `jq` — like the GitHub API — rejects invalid UTF-8. Log
+  scraping uses `grep -a`: without it `grep` decides a log containing
+  raw mutated bytes is binary, prints nothing, and every such crash
+  silently degrades to a signature of `unknown crash`.
+- **The same crash is not refiled every night.** Since the run no longer
+  stops at the first crash, a recurring crash would otherwise file one
+  issue per target per night, and `fuzz-autofix.yml` only drains one
+  issue per day. An open `security-audit` issue whose title matches the
+  target *and* whose body carries the same `signature` gets a comment
+  instead of a duplicate. Matching on both means one target crashing two
+  different ways still gets two issues. A lookup that fails falls
+  through to filing, because a duplicate issue is a much smaller problem
+  than an unreported crash; `--no-dedup` forces that behaviour by hand.
+
+The signature is the first `panicked at`/`SUMMARY:` line *and the line
+after it*: Rust prints the location and the message separately, and
+`panicked at fuzz_rebase_planners.rs:278:17` on its own does not
+identify a crash — nor distinguish two crashes for dedup purposes.
 
 Run the reporter by hand against a downloaded `coverage-fuzz-logs`
 artifact to check what an issue would say, without filing anything:
@@ -870,11 +894,26 @@ tools/ci/report-fuzz-crash.sh fuzz_rebase_planners \
     coverage-fuzz-logs/fuzz_rebase_planners.log --dry-run
 ```
 
+`tools/ci/test-report-fuzz-crash.sh` exercises the reporter against
+synthetic logs — the 370KB single line, raw mutated bytes, a missing
+log, a missing crash file, and the dedup decisions with a stubbed `gh`
+— and asserts the emitted body still satisfies the field predicate
+`fuzz-autofix.yml` validates against. It runs on pull requests as the
+`Fuzz crash reporter tests` job, and needs only bash and `jq`:
+
+```bash
+tools/ci/test-report-fuzz-crash.sh
+```
+
 Do not pass `-max_len` to `cargo fuzz tmin`: it supplies its own, and a
 second one trips libFuzzer's `assert(MaxInputLen == 0)`, so
 minimization fails and leaves a 0-byte `minimized-from-*` artifact
 behind. The workflow skips empty and `minimized-from-*` files when
-choosing the crash input to report.
+choosing which crash input to minimize, then prefers the non-empty
+`minimized-from-*` that `tmin` produced when reporting — otherwise the
+issue would quote the size of, and the reproducer would point at, the
+original large artifact, and the minimization step would cost CI time
+without improving anything.
 
 ### Automated bug fixes
 
