@@ -8,6 +8,10 @@
   "schedule": [
     "after 9pm"
   ],
+  "pre-commit": {
+    "description": "Renovate's pre-commit manager is opt-in, so .pre-commit-config.yaml was unmanaged and its hook pins drifted silently while cargo, dockerfile and github-actions stayed current.",
+    "enabled": true
+  },
   "packageRules": [
     {
       "description": "Automatically merge minor and patch-level updates",
