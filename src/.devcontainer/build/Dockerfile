@@ -24,7 +24,7 @@
 # NOTE: debian:bullseye is minimal and ships no compiler, unlike the
 # devcontainers base image the dev image builds on — build-essential is
 # installed explicitly here for the host binary's linker.
-FROM debian:bullseye
+FROM debian:trixie
 
 # Build toolchain only:
 # - build-essential: cc/ld for linking the host `instar` VMM binary
