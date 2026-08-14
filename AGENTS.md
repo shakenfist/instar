@@ -766,4 +766,5 @@ step -- see "Self-hosted runners and Docker" in `docs/development.md`.
 - `tools/ci/report-fuzz-crash.sh` - Files the `security-audit` issue for a coverage-fuzz crash (bounds the log excerpt, dedups against open issues; see "Crash reporting" in `docs/testing.md`)
 - `tools/ci/pick-fuzz-artifact.sh` - Chooses which libFuzzer artifact to report as the reproducer
 - `tools/ci/test-report-fuzz-crash.sh`, `tools/ci/test-pick-fuzz-artifact.sh` - Tests for those two; run them after any change (the `ci-tooling` CI job does)
-- `tools/ci/check-glibc-floor.sh` - Fails if the built `instar` binary needs a glibc above the matrix floor (`GLIBC_2.34`, Rocky 9). Runs in `build-and-test` after `make instar`. Do not raise the ceiling to make it pass: it means the release image's base moved, and `src/.devcontainer/build/Dockerfile` must stay on `debian:bullseye`
+- `tools/ci/check-glibc-floor.sh` - Fails if the built `instar` binary needs a glibc above the published floor (`GLIBC_2.31`, Debian 11; see `docs/installation.md`). Runs immediately after `make instar` in both `build-and-test` and the release workflow. Do not raise the ceiling to make it pass: it means the release image's base moved, and `src/.devcontainer/build/Dockerfile` must stay on `debian:bullseye`
+- `tools/ci/test-check-glibc-floor.sh` - Tests for that check; the `ci-tooling` CI job runs it

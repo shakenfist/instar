@@ -32,6 +32,13 @@
 # 22.04 and Debian 12 in the merge queue matrix. renovate.json now
 # excludes this file; tools/ci/check-glibc-floor.sh fails the build if
 # the floor rises again by any other route.
+#
+# That instruction is not unconditional, it just is not yours to decide
+# alone: bullseye LTS ends 2026-08-31, after which this image's
+# apt-get layer will eventually break. The successors and what each
+# costs in support matrix are written up under "When bullseye reaches
+# end of life" in docs/development.md. Read that before changing this
+# line -- bookworm is NOT a drop-in, it drops Rocky 9.
 FROM debian:bullseye
 
 # Build toolchain only:

@@ -52,19 +52,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   not drag the test tooling onto an older base.
   `tools/verify-glibc-floor.sh` installs the built packages on every
   target distribution and exercises them under KVM as the empirical
-  acceptance check.
+  acceptance check. The floor is now guarded rather than merely
+  chosen: `renovate.json` excludes the release image's Dockerfile from
+  automated base bumps, and `tools/ci/check-glibc-floor.sh` fails the
+  build if the shipped binary ever requires a glibc above 2.31.
 
 ### Fixed
-
-- **The released binary runs on Rocky/RHEL 9, Ubuntu 22.04 and Debian
-  12 again.** An automated dependency bump moved the release build
-  image from `debian:bullseye` to `debian:trixie`, raising the binary's
-  glibc floor from `GLIBC_2.30` to `GLIBC_2.39` — above the glibc those
-  three distributions ship, so the binary would not start there. The
-  base is pinned back, excluded from automated bumps, and
-  `tools/ci/check-glibc-floor.sh` now fails the build if the floor
-  rises again. No released version was affected; the regression was
-  caught on `develop` by the merge queue distro matrix.
 
 - **VHD images instar writes are no longer silently truncated when
   read by qemu-img older than 10.0.** instar stamped its VHD footers

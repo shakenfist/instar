@@ -1,11 +1,16 @@
 #!/bin/bash
-# Assert the built instar binary's glibc floor is low enough to run on
-# every distribution in the matrix CI.
+# Assert the built instar binary's glibc floor is low enough to honour
+# the support promise the project publishes.
 #
 # glibc is forward-compatible only: a binary runs where the host glibc
-# is >= the highest GLIBC_x.y symbol version it references. The oldest
-# distro in the matrix is Rocky/RHEL 9 at glibc 2.34, so anything above
-# that will not start there.
+# is >= the highest GLIBC_x.y symbol version it references. docs/
+# installation.md and README.md promise glibc 2.31 or newer and Debian
+# 11+, so 2.31 is the ceiling — not the matrix CI's oldest distro
+# (Rocky 9, glibc 2.34), which is looser than the published promise and
+# would let a base moving to, say, glibc 2.33 pass while breaking
+# Debian 11. Debian 11 is not in the matrix, so nothing else would
+# catch that. bullseye's own glibc is 2.31, so a correctly built binary
+# structurally cannot exceed the ceiling; today it tops out at 2.30.
 #
 # This is the cheap nominal check, and it exists because the expensive
 # empirical one (tools/verify-glibc-floor.sh, which installs the real
@@ -21,12 +26,13 @@
 # Usage: tools/ci/check-glibc-floor.sh [binary]
 #
 # Defaults to src/target/release/instar. Override the ceiling with
-# MAX_GLIBC, e.g. MAX_GLIBC=2.31 for a stricter local check.
+# MAX_GLIBC, e.g. MAX_GLIBC=2.34 to check only that the matrix CI's
+# distributions would run the binary.
 
 set -euo pipefail
 
 BINARY="${1:-src/target/release/instar}"
-MAX_GLIBC="${MAX_GLIBC:-2.34}"
+MAX_GLIBC="${MAX_GLIBC:-2.31}"
 
 if [ ! -f "$BINARY" ]; then
     echo "error: $BINARY does not exist; build it with 'make instar' first" >&2
@@ -52,12 +58,14 @@ fi
 
 floor=$(echo "$versions" | sed 's/^GLIBC_//' | sort -uV | tail -1)
 
-# sort -V puts the ceiling last when the floor is acceptable.
+# sort -V puts the ceiling last when the floor is acceptable, including
+# when the two are equal.
 highest=$(printf '%s\n%s\n' "$floor" "$MAX_GLIBC" | sort -V | tail -1)
-if [ "$highest" != "$MAX_GLIBC" ] && [ "$floor" != "$MAX_GLIBC" ]; then
+if [ "$highest" != "$MAX_GLIBC" ]; then
     echo "error: $BINARY requires GLIBC_$floor, above the $MAX_GLIBC ceiling" >&2
     echo >&2
-    echo "The binary will not start on the oldest distros in the matrix." >&2
+    echo "The binary will not start on every platform the project says it" >&2
+    echo "supports (glibc 2.31+, Debian 11+; see docs/installation.md)." >&2
     echo "This almost always means the release build image's base moved:" >&2
     echo "check FROM in src/.devcontainer/build/Dockerfile is still" >&2
     echo "debian:bullseye. Symbol versions referenced:" >&2
