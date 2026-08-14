@@ -4,5 +4,11 @@
         "id": 19389569,
         "name": "Code Quality Copilot review for default branch",
         "target": "branch"
+    },
+    {
+        "enforcement": "active",
+        "id": 20783686,
+        "name": "Develop branch",
+        "target": "branch"
     }
 ]
