@@ -52,7 +52,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   not drag the test tooling onto an older base.
   `tools/verify-glibc-floor.sh` installs the built packages on every
   target distribution and exercises them under KVM as the empirical
-  acceptance check.
+  acceptance check. The floor is now guarded rather than merely
+  chosen: `renovate.json` excludes the release image's Dockerfile from
+  automated base bumps, and `tools/ci/check-glibc-floor.sh` fails the
+  build if the shipped binary ever requires a glibc above 2.31.
 
 ### Fixed
 

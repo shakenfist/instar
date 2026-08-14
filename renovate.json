@@ -14,6 +14,13 @@
   },
   "packageRules": [
     {
+      "description": "Never bump the release build image's base. src/.devcontainer/build/Dockerfile pins debian:bullseye because its glibc 2.31 sets the floor of the shipped binary, so a newer base is a regression rather than an update: PR #488 moved it to trixie and broke Rocky 9, Ubuntu 22.04 and Debian 12. The dev/test image in src/.devcontainer/Dockerfile is not covered by this rule and stays managed.",
+      "matchFileNames": [
+        "src/.devcontainer/build/Dockerfile"
+      ],
+      "enabled": false
+    },
+    {
       "description": "Automatically merge minor and patch-level updates",
       "matchUpdateTypes": [
         "minor",

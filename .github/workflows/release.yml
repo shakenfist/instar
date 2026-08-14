@@ -121,6 +121,13 @@ jobs:
       - name: Build instar (VMM + guest binaries)
         run: make instar
 
+      # The only build path that produces user-facing binaries, and the
+      # one place the floor is the shipped artifact rather than a CI
+      # property. build-and-test checks the same thing, but a tag can be
+      # cut from a commit that never went through it.
+      - name: Check the release binary's glibc floor
+        run: tools/ci/check-glibc-floor.sh
+
       - name: Package tarball
         run: |
           TAG_NAME="${GITHUB_REF#refs/tags/}"

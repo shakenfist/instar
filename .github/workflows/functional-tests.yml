@@ -132,6 +132,9 @@ jobs:
       - name: Test the fuzz artifact picker
         run: tools/ci/test-pick-fuzz-artifact.sh
 
+      - name: Test the glibc floor check
+        run: tools/ci/test-check-glibc-floor.sh
+
   build-and-test:
     needs: check_paths
     if: needs.check_paths.outputs.code_changed != 'false'
@@ -165,6 +168,12 @@ jobs:
           # image (instar-release); make instar-devcontainer builds the
           # dev/test image (instar-build) the docker-run steps use.
           make instar
+          # Immediately, before anything else can touch the binary. The
+          # cargo test run below builds bin targets into the same
+          # src/target/release/ from the dev image, so checking after it
+          # would risk reading a binary that image relinked and blaming
+          # the release Dockerfile for it.
+          tools/ci/check-glibc-floor.sh
           make instar-devcontainer
           # Run unit tests inside the container (all workspace crates
           # except no_main guest binaries)
