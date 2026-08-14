@@ -42,6 +42,31 @@ glibc floor empirically, `tools/verify-glibc-floor.sh <deb> <rpm>`
 installs the packages on every target distribution and runs
 `info`/`create`/`map` under KVM.
 
+### Do not bump the release image's base
+
+`src/.devcontainer/build/Dockerfile` pins `debian:bullseye`, and that
+pin is the product rather than an implementation detail: the base's
+glibc *is* the floor of every binary we ship, so a newer Debian is a
+regression dressed as an update. `renovate.json` excludes the file for
+that reason; the dev/test image next door stays managed normally.
+
+Two checks back the pin up, because a comment is not a control:
+
+- `tools/ci/check-glibc-floor.sh` runs in `build-and-test` immediately
+  after `make instar`, and fails if the binary references a symbol
+  above `GLIBC_2.34` (Rocky 9, the oldest distro in the matrix). It
+  needs nothing but the built binary, so it gates every pull request.
+- `tools/verify-glibc-floor.sh` is the empirical version above, and
+  remains the real acceptance gate — but it needs containers, packages
+  and `/dev/kvm`, so it runs in the merge queue matrix or by hand.
+
+The gap between those two is not hypothetical. Renovate raised the base
+to `debian:trixie` in #488; the floor went from `GLIBC_2.30` to
+`GLIBC_2.39`; pull request CI passed completely, because nothing on the
+pull request path looks at the floor; and the failure surfaced as three
+red distros in the merge queue after the change was already on
+`develop`. The cheap check exists to make that a pull request failure.
+
 ## Pre-commit hooks
 
 This project uses pre-commit hooks for Rust code quality:

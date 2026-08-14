@@ -196,6 +196,9 @@ jobs:
               --exclude bitmap-op \
               --exclude bench-op
 
+      - name: Check the release binary's glibc floor
+        run: tools/ci/check-glibc-floor.sh
+
       - name: Check devcontainer Rust nightly pins agree
         run: tools/ci/check-nightly-pins.sh
 

@@ -24,7 +24,15 @@
 # NOTE: debian:bullseye is minimal and ships no compiler, unlike the
 # devcontainers base image the dev image builds on — build-essential is
 # installed explicitly here for the host binary's linker.
-FROM debian:trixie
+#
+# DO NOT BUMP THIS TAG. It is deliberately old: the base's glibc IS the
+# product here, not an implementation detail, and a newer Debian is
+# strictly worse for it. Renovate proposed trixie in #488 and the bump
+# raised the binary's floor to GLIBC_2.39, which broke Rocky 9, Ubuntu
+# 22.04 and Debian 12 in the merge queue matrix. renovate.json now
+# excludes this file; tools/ci/check-glibc-floor.sh fails the build if
+# the floor rises again by any other route.
+FROM debian:bullseye
 
 # Build toolchain only:
 # - build-essential: cc/ld for linking the host `instar` VMM binary
