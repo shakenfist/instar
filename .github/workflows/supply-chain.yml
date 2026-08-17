@@ -47,5 +47,15 @@ jobs:
       # a false positive is a question of when rather than whether --
       # and without an in-repo suppression path the first one turns
       # every subsequent PR red until someone edits this workflow.
+      # --log-opts="HEAD" scopes the scan to this branch and the
+      # history behind it. Without it gitleaks scans every ref, which
+      # is not what anyone means by "scan this project's history": it
+      # pulls in every other branch, and on a project that publishes a
+      # site from one it scans a built copy of its own documentation.
+      # gitleaks 8.16 then attributes those findings to unrelated merge
+      # commits, so they cannot be triaged either. HEAD still reaches
+      # all of develop, so nothing is given up.
       - name: Run gitleaks
-        run: gitleaks detect --source . --redact --verbose --no-banner
+        run: >-
+          gitleaks detect --source . --log-opts="HEAD" --redact
+          --verbose --no-banner
