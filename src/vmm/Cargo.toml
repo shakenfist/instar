@@ -89,8 +89,13 @@ assets = [
 ]
 
 # RPM package metadata. Same layout as the .deb. auto-req = "auto"
-# (the cargo-generate-rpm default) uses ldd-based detection on the
-# VMM binary to populate Requires entries.
+# populates Requires from the VMM binary, but "auto" is two different
+# implementations: it uses /usr/lib/rpm/find-requires when that exists
+# and otherwise falls back to a builtin `ldd -v` parser that mangles
+# WEAK version references into uninstallable "[WEAK]" dependencies. The
+# build image therefore installs rpm so the first path is always taken
+# -- do not drop it. See docs/development.md, "RPM dependency
+# generation".
 [package.metadata.generate-rpm]
 auto-req = "auto"
 assets = [
