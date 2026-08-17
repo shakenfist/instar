@@ -83,7 +83,10 @@ Per-format feature detail is in
   `ARG RUST_NIGHTLY=nightly-YYYY-MM-DD`; a floating nightly has taken
   out from-scratch image builds before. Renovate cannot bump rustup
   toolchain pins, so the weekly `rust-nightly-bump` workflow rebuilds
-  and tests both images before opening a bump PR. See
+  and tests both images before opening a bump PR. A bump can also change
+  the .rpm's generated dependencies and make the package uninstallable,
+  which nothing in the pull-request gate will catch — see "RPM
+  dependency generation" in
   [docs/development.md](docs/development.md).
 
 - **A new integration test module needs a CI partition.**

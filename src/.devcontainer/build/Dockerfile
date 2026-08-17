@@ -46,12 +46,26 @@ FROM debian:bullseye
 # - protobuf-compiler: protoc for micropb-gen (guest-protocol codegen)
 # - curl, ca-certificates: fetch rustup
 # - git: cargo fetching git dependencies, if any
+# - rpm: NOT for building the package -- cargo-generate-rpm does that.
+#   It is here purely so /usr/lib/rpm/find-requires exists. With
+#   `auto-req = "auto"` (src/vmm/Cargo.toml) cargo-generate-rpm uses
+#   find-requires when that path is present and otherwise falls back to
+#   its builtin `ldd -v` parser, which is subtly wrong: it strips spaces
+#   out of the ldd line, so a WEAK version reference prints as
+#   "libc.so.6 (GLIBC_2.25) [WEAK]" and becomes the dependency
+#   "libc.so.6(GLIBC_2.25)[WEAK](64bit)". Nothing Provides that, so the
+#   .rpm is uninstallable on every RPM distro. rpm's own elfdeps ignores
+#   VER_FLG_WEAK and emits the plain "libc.so.6(GLIBC_2.25)(64bit)".
+#   This is latent until a toolchain starts marking glibc version needs
+#   weak -- nightly-2026-08-17 did, and broke the whole RPM half of the
+#   matrix. See docs/development.md, "RPM dependency generation".
 RUN apt-get update && apt-get install -y \
     build-essential \
     ca-certificates \
     curl \
     git \
     protobuf-compiler \
+    rpm \
     && rm -rf /var/lib/apt/lists/*
 
 # Create a shared build directory that any user can use

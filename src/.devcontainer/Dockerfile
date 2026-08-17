@@ -22,6 +22,11 @@ FROM mcr.microsoft.com/devcontainers/base:debian@sha256:025b74bb5f7ac53edd77e01a
 # - libqcow-utils, libvhdi-utils, libvmdk-utils: libyal forensic parsers
 #   for differential fuzzing (independent QCOW2/VHD/VHDX/VMDK reference)
 # - wget: for downloading gh CLI keyring
+# - rpm: provides /usr/lib/rpm/find-requires so `make rpm` here
+#   generates the same dependencies as the release build image. Without
+#   it cargo-generate-rpm silently falls back to a builtin ldd parser
+#   that emits bogus "[WEAK]" dependencies; see the long note in
+#   build/Dockerfile. Keep the two images in step.
 RUN apt-get update && apt-get install -y \
     libqcow-utils \
     libvhdi-utils \
@@ -31,6 +36,7 @@ RUN apt-get update && apt-get install -y \
     python3-pip \
     python3-venv \
     qemu-utils \
+    rpm \
     wget \
     && rm -rf /var/lib/apt/lists/*
 
