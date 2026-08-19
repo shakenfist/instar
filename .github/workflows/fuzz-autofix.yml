@@ -265,6 +265,16 @@ jobs:
           find ~/.claude/projects -name "*.jsonl" -newermt "@${start_time}" \
             -exec cp {} ${GITHUB_WORKSPACE}/claude-logs/ \; 2>/dev/null || true
 
+          # Stage what Claude changed before anything inspects the
+          # tree. The complexity and verification steps below read
+          # `git diff --cached`, so an unstaged fix reads as no fix at
+          # all: every attempt before this was added reported "No
+          # changes staged by Claude" and the issue was labelled
+          # autofix-failed with a real edit sitting in the working
+          # tree. `-u` stages tracked modifications only, so temp
+          # files and editor artifacts stay out.
+          git add -u
+
           # Capture changes
           echo "=== Git Status ===" > ${GITHUB_WORKSPACE}/claude-changes-1.txt
           git status >> ${GITHUB_WORKSPACE}/claude-changes-1.txt 2>&1
@@ -488,6 +498,16 @@ jobs:
           find ~/.claude/projects -name "*.jsonl" -newermt "@${start_time}" \
             -exec cp {} ${GITHUB_WORKSPACE}/claude-logs/ \; 2>/dev/null || true
 
+          # Stage what Claude changed before anything inspects the
+          # tree. The complexity and verification steps below read
+          # `git diff --cached`, so an unstaged fix reads as no fix at
+          # all: every attempt before this was added reported "No
+          # changes staged by Claude" and the issue was labelled
+          # autofix-failed with a real edit sitting in the working
+          # tree. `-u` stages tracked modifications only, so temp
+          # files and editor artifacts stay out.
+          git add -u
+
           echo "=== Git Status ===" > ${GITHUB_WORKSPACE}/claude-changes-2.txt
           git status >> ${GITHUB_WORKSPACE}/claude-changes-2.txt 2>&1
           echo "" >> ${GITHUB_WORKSPACE}/claude-changes-2.txt
@@ -631,9 +651,10 @@ jobs:
         run: |
           cd ${GITHUB_WORKSPACE}/instar
 
-          # Claude is instructed to stage files itself. Only stage
-          # tracked modified files as a safety net (not -A which would
-          # pick up temp files or editor artifacts).
+          # Already staged after each Claude attempt; repeated here so
+          # this step does not depend on that having happened. Tracked
+          # modifications only (not -A, which would pick up temp files
+          # or editor artifacts).
           git add -u
 
           if [ -z "$(git diff --cached --name-only)" ]; then
