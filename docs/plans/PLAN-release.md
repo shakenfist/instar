@@ -1,6 +1,6 @@
 # Plan: First Public Release of Instar
 
-## Status: Complete (2026-08-19)
+## Status: Complete
 
 The umbrella goal — "prepare instar for its first public release"
 — was met on 2026-05-09 when v0.2.0 was tagged and published, and
