@@ -41,7 +41,13 @@
 #     attempt. git hides ignored paths from the untracked listing
 #     entirely, so without the --baseline comparison these vanish
 #     without a trace -- and `**/*.bin` is in .gitignore, which is
-#     exactly what a fuzz-crash regression fixture would be called;
+#     exactly what a fuzz-crash regression fixture would be called.
+#     Known limit: the listing collapses a wholly-ignored directory to
+#     one entry, so a file created inside a directory that was ALREADY
+#     ignored when the baseline was taken produces no new entry and no
+#     refusal. What qualifies is build output nobody would put a
+#     fixture in, and closing it would mean an mtime pass over every
+#     ignored tree on every run;
 #   * a change under .github/workflows/. `git push` with the
 #     GITHUB_TOKEN actions/checkout persists is refused for any commit
 #     touching one, and the `workflows` scope it needs cannot be
@@ -60,10 +66,13 @@
 #       Record the ignored paths that exist now, before the attempt
 #       starts. Stages nothing.
 #
-#   tools/ci/stage-autofix-changes.sh [--baseline FILE] [REPO_DIR]
+#   tools/ci/stage-autofix-changes.sh [--baseline FILE]
+#                                     [--refused-file FILE] [REPO_DIR]
 #       Stage tracked modifications; refuse on anything above. Without
 #       --baseline no ignored-file comparison is made, so a new ignored
-#       file is not detected -- pass it.
+#       file is not detected -- pass it. --refused-file records the
+#       ignored paths that caused a refusal, for a caller that wants to
+#       delete them before retrying.
 #
 #   tools/ci/stage-autofix-changes.sh --tracked-only [REPO_DIR]
 #       Stage tracked modifications and check nothing. For call sites
@@ -80,11 +89,12 @@ set -euo pipefail
 REFUSED=3
 
 usage() {
-    echo "usage: $0 [--snapshot FILE | --baseline FILE | --tracked-only] [REPO_DIR]"
+    echo "usage: $0 [--snapshot FILE | --baseline FILE [--refused-file FILE] | --tracked-only] [REPO_DIR]"
 }
 
 MODE=check
 BASELINE=
+REFUSED_FILE=
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --snapshot)
@@ -96,6 +106,11 @@ while [ "$#" -gt 0 ]; do
         --baseline)
             BASELINE="${2:-}"
             [ -n "${BASELINE}" ] || { usage >&2; exit 2; }
+            shift 2
+            ;;
+        --refused-file)
+            REFUSED_FILE="${2:-}"
+            [ -n "${REFUSED_FILE}" ] || { usage >&2; exit 2; }
             shift 2
             ;;
         --tracked-only) MODE=tracked-only; shift ;;
@@ -149,6 +164,18 @@ fi
 # refuse routine runs.
 ARTIFACT_NAMES='(^|/)(\.#[^/]*|[^/]*~|[^/]*\.(orig|rej|bak|tmp|swp|swo))$'
 
+# Build and test output directories. The prompt tells Claude to run
+# `make instar` and `make test-container-core`, and the latter writes
+# tests/.stestr/ and tests/__pycache__/ into the tree -- neither of
+# which exists when the baseline is taken, because nothing runs the
+# tests before the attempt. Without this, every attempt that follows
+# its own instructions is refused, and so is every attempt 2 after a
+# test failure, since `git clean -fd` has no -x and the directories
+# survive. These are names no regression fixture would legitimately
+# live under: the ARTIFACT_NAMES mechanism, not a judgement about
+# which new files are worth keeping.
+CI_OUTPUT_DIRS='(^|/)(\.stestr|__pycache__|target|\.cargo-cache|fuzz-logs|\.venv)/'
+
 WORKFLOW_CHANGES=()
 while IFS= read -r -d '' FILE; do
     WORKFLOW_CHANGES+=("${FILE}")
@@ -184,7 +211,8 @@ NEW_IGNORED=()
 if [ -n "${BASELINE}" ] && [ -f "${BASELINE}" ]; then
     while IFS= read -r FILE; do
         [ -n "${FILE}" ] || continue
-        if [[ "${FILE}" =~ ${ARTIFACT_NAMES} ]]; then
+        if [[ "${FILE}" =~ ${ARTIFACT_NAMES} ]] \
+            || [[ "${FILE}" =~ ${CI_OUTPUT_DIRS} ]]; then
             ARTIFACTS+=("${FILE}")
         else
             NEW_IGNORED+=("${FILE}")
@@ -193,7 +221,7 @@ if [ -n "${BASELINE}" ] && [ -f "${BASELINE}" ]; then
 fi
 
 if [ ${#ARTIFACTS[@]} -gt 0 ]; then
-    echo "Ignoring ${#ARTIFACTS[@]} editor or merge artifact(s):"
+    echo "Ignoring ${#ARTIFACTS[@]} artifact(s) and build or test output:"
     printf '    %s\n' "${ARTIFACTS[@]}"
 fi
 
@@ -215,6 +243,12 @@ if [ ${#NEW_IGNORED[@]} -gt 0 ]; then
     REFUSE=true
     echo "REFUSED: the attempt created these, which .gitignore hides and which would not reach the pull request:"
     printf '    %s\n' "${NEW_IGNORED[@]}"
+    # `git clean -fd` has no -x, so these survive a retry reset and
+    # would refuse the next attempt whatever it did. The caller deletes
+    # what is named here before retrying.
+    if [ -n "${REFUSED_FILE}" ]; then
+        printf '%s\n' "${NEW_IGNORED[@]}" > "${REFUSED_FILE}"
+    fi
 fi
 
 if [ "${REFUSE}" = true ]; then

@@ -66,6 +66,8 @@ setup() {
     mkdir -p "${D}/src/crates/qcow2" "${D}/tests" "${D}/docs"
     echo 'fn main() {}' > "${D}/src/main.rs"
     echo 'fn parse() {}' > "${D}/src/crates/qcow2/lib.rs"
+    echo 'def test_x(): pass' > "${D}/tests/test_x.py"
+    echo '# docs' > "${D}/docs/index.md"
     printf '**/target/\n**/*.bin\n*.swp\n' > "${D}/.gitignore"
     git -C "${D}" add -A
     git -C "${D}" commit -qm 'base'
@@ -152,7 +154,7 @@ echo x > "${D}/src/main.rs.bak"
 echo x > "${D}/src/.#main.rs"
 stage
 check "exit 0" "${RC}" "0"
-contains "reported as artifacts" "${OUT}" "editor or merge artifact(s)"
+contains "reported as artifacts" "${OUT}" "artifact(s) and build or test output"
 lacks "not refused" "${OUT}" "REFUSED"
 
 # git hides ignored paths from the untracked listing entirely, and
@@ -196,14 +198,47 @@ check "exit 0" "${RC}" "0"
 check "the fix is staged" "$(staged)" "src/main.rs"
 lacks "not refused" "${OUT}" "REFUSED"
 
-start "ignored output created during the attempt is still refused"
+# The prompt tells Claude to run `make instar` and
+# `make test-container-core`, and the latter writes tests/.stestr/ and
+# tests/__pycache__/ into the tree. Nothing runs the tests before the
+# baseline is taken, so without the CI-output filter every attempt
+# that follows its own instructions is refused -- and so is every
+# attempt 2 after a test failure, since `git clean -fd` has no -x.
+start "build and test output created during the attempt is not refused"
+setup
+printf '__pycache__/\n.venv/\n.stestr/\n' > "${D}/tests/.gitignore"
+git -C "${D}" add tests/.gitignore
+git -C "${D}" commit -qm testsignore
+snapshot
+mkdir -p "${D}/src/target/debug" "${D}/tests/.stestr" "${D}/tests/__pycache__"
+echo x > "${D}/src/target/debug/instar"
+echo x > "${D}/tests/.stestr/0"
+echo x > "${D}/tests/__pycache__/t.pyc"
+echo 'fn main() { fixed(); }' > "${D}/src/main.rs"
+stage
+check "exit 0" "${RC}" "0"
+check "the fix is staged" "$(staged)" "src/main.rs"
+lacks "not refused" "${OUT}" "REFUSED"
+
+# `git clean -fd` has no -x, so a refusing fixture survives into
+# attempt 2 and would refuse it whatever it did. Name them so the
+# retry can delete them first.
+start "--refused-file names the ignored paths that caused the refusal"
 setup
 snapshot
-mkdir -p "${D}/src/target/debug"
-echo x > "${D}/src/target/debug/instar"
-stage
+printf 'x' > "${D}/tests/crash.bin"
+run --baseline "${BASE}" --refused-file "${WORK}/refused.txt" "${D}"
 check "exit ${REFUSED}" "${RC}" "${REFUSED}"
-contains "names the collapsed tree" "${OUT}" "src/target/"
+check "the path is recorded" "$(cat "${WORK}/refused.txt")" "tests/crash.bin"
+
+start "--refused-file is not written when nothing is refused"
+setup
+snapshot
+rm -f "${WORK}/refused2.txt"
+echo 'fn main() { fixed(); }' > "${D}/src/main.rs"
+run --baseline "${BASE}" --refused-file "${WORK}/refused2.txt" "${D}"
+check "exit 0" "${RC}" "0"
+check "no file written" "$([ -e "${WORK}/refused2.txt" ] && echo yes || echo no)" "no"
 
 start "a gitignored editor artifact is not a refusal"
 setup
@@ -211,7 +246,7 @@ snapshot
 echo x > "${D}/src/main.rs.swp"
 stage
 check "exit 0" "${RC}" "0"
-contains "reported as an artifact" "${OUT}" "editor or merge artifact(s)"
+contains "reported as an artifact" "${OUT}" "artifact(s) and build or test output"
 
 start "without a baseline no ignored comparison is made"
 setup
@@ -337,6 +372,8 @@ run --snapshot
 check "--snapshot with no file" "${RC}" "2"
 run --baseline
 check "--baseline with no file" "${RC}" "2"
+run --refused-file
+check "--refused-file with no file" "${RC}" "2"
 # Exit 2 alone does not pin this: an unhandled flag falls through to
 # REPO_DIR and fails the -d test with the same status. One argument,
 # not two, or the argument-count check prints usage anyway.

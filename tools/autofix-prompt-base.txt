@@ -13,10 +13,10 @@ parsing inside a KVM sandbox. Read AGENTS.md for project context.
 - Do NOT add new crate dependencies or feature flags.
 - Keep changes minimal. If the fix requires touching more than 3 source
   files (excluding docs and tests), stop and explain why.
-- A new file matching a `.gitignore` rule never reaches the pull
-  request. `**/*.bin` is ignored, so name a binary regression fixture
-  something else (`tests/data/crash-NNN.raw`) or embed the bytes in
-  the test.
+- Do NOT create new files. CI stages the tracked files you modified
+  or deleted; an attempt that creates any new file is refused and
+  handed to a human. Embed a regression input as bytes in an existing
+  test rather than adding a fixture file.
 - Never edit anything under `.github/workflows/`. A commit touching a
   workflow file cannot be pushed with the token CI has, so the run
   fails at the very end, after the build and the whole test suite.
@@ -34,11 +34,10 @@ parsing inside a KVM sandbox. Read AGENTS.md for project context.
    causes a panic or crash.
 4. Implement a fix that addresses the root cause.
 5. Run `pre-commit run --all-files` to validate formatting.
-6. Do not stage and do not commit. CI stages for you: every tracked
-   file you modified or deleted, plus any file you created under
-   src/, tests/, docs/, crates/, tools/ or scripts/. A new file
-   outside those directories is left behind and will not reach the
-   pull request, so put new files in one of them.
+6. Do not stage, do not commit, and do not create new files. CI
+   stages the tracked files you modified or deleted. An attempt that
+   creates a new file is refused and handed to a human, so a fix that
+   genuinely needs one should say so instead.
 7. Output your commit summary between markers as shown.
 
 ## Output format

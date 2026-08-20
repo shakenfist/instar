@@ -260,9 +260,8 @@ jobs:
           # created from build output that was already there --
           # .gitignore hides both, and refusing on the latter would
           # refuse every run. The porcelain status is for a human
-          # reading a failure report.
-          git status --porcelain \
-            > ${GITHUB_WORKSPACE}/pre-attempt-status-1.txt 2>&1 || true
+          # reading a failure report gets the tracked side from the
+          # `=== Git Status ===` block already in claude-changes-N.txt.
           # One baseline for the whole run. Attempt 2 reuses it on
           # purpose: Prepare retry's `git clean -fd` has no -x, so an
           # ignored file attempt 1 created survives into attempt 2.
@@ -293,6 +292,7 @@ jobs:
           set +e
           tools/ci/stage-autofix-changes.sh \
             --baseline ${GITHUB_WORKSPACE}/pre-run-ignored.txt \
+            --refused-file ${GITHUB_WORKSPACE}/stager-refused-1.txt \
             > ${GITHUB_WORKSPACE}/stager-1.txt 2>&1
           echo "$?" > ${GITHUB_WORKSPACE}/stager-rc-1.txt
           set -e
@@ -318,6 +318,18 @@ jobs:
           ISSUE_NUMBER: ${{ steps.find_issue.outputs.issue_number }}
         run: |
           cd ${GITHUB_WORKSPACE}/instar
+
+          # A refused attempt has staged tracked edits it will never
+          # commit. Counting them here can label the issue
+          # autofix-complex and stop the run, so the real reason -- a
+          # file that cannot reach the pull request -- would reach
+          # neither the retry prompt nor the human.
+          if [ "$(cat ${GITHUB_WORKSPACE}/stager-rc-1.txt 2>/dev/null || echo 0)" = "3" ]; then
+            echo "Stager refused the attempt; leaving the verdict to the verify step"
+            echo "changed_files=0" >> $GITHUB_OUTPUT
+            echo "too_complex=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
 
           # Count changed source files (exclude docs, tests, manifests)
           CHANGED_SRC=$(git diff --cached --name-only \
@@ -442,21 +454,22 @@ jobs:
           # Save the failed diff for context
           git diff --cached > ${GITHUB_WORKSPACE}/attempt1-diff.txt 2>&1
 
-          # Save failure output
-          if [ "$FAILURE_REASON" = "build" ]; then
-            FAILURE_OUTPUT=$(tail -50 ${GITHUB_WORKSPACE}/verify-build-1.txt)
-          elif [ "$FAILURE_REASON" = "tests" ]; then
-            FAILURE_OUTPUT=$(tail -50 ${GITHUB_WORKSPACE}/verify-test-1.txt)
-          elif [ "$FAILURE_REASON" = "newfiles" ]; then
-            FAILURE_OUTPUT=$(cat ${GITHUB_WORKSPACE}/stager-1.txt)
-          else
-            FAILURE_OUTPUT="The previous attempt changed no files at all."
-          fi
-
           # Reset to clean state
           git reset HEAD -- . 2>/dev/null || true
           git checkout -- . 2>/dev/null || true
           git clean -fd 2>/dev/null || true
+
+          # `git clean -fd` has no -x on purpose -- -x would delete
+          # src/target/ and force a full rebuild -- so an ignored file
+          # attempt 1 created survives it, and the stager would refuse
+          # attempt 2 for that file whatever attempt 2 did. Delete just
+          # the paths it named.
+          if [ -s ${GITHUB_WORKSPACE}/stager-refused-1.txt ]; then
+            while IFS= read -r REFUSED_PATH; do
+              [ -n "${REFUSED_PATH}" ] || continue
+              rm -rf -- "${REFUSED_PATH}"
+            done < ${GITHUB_WORKSPACE}/stager-refused-1.txt
+          fi
 
           # Shared prompt template (same as attempt 1)
           cd ${GITHUB_WORKSPACE}/instar
@@ -554,6 +567,7 @@ jobs:
           set +e
           tools/ci/stage-autofix-changes.sh \
             --baseline ${GITHUB_WORKSPACE}/pre-run-ignored.txt \
+            --refused-file ${GITHUB_WORKSPACE}/stager-refused-2.txt \
             > ${GITHUB_WORKSPACE}/stager-2.txt 2>&1
           echo "$?" > ${GITHUB_WORKSPACE}/stager-rc-2.txt
           set -e
@@ -579,6 +593,19 @@ jobs:
           ISSUE_NUMBER: ${{ steps.find_issue.outputs.issue_number }}
         run: |
           cd ${GITHUB_WORKSPACE}/instar
+
+          # A refused attempt has staged tracked edits it will never
+          # commit. Counting them here can label the issue
+          # autofix-complex and stop the run, so the real reason -- a
+          # file that cannot reach the pull request -- would reach
+          # neither the retry prompt nor the human.
+          if [ "$(cat ${GITHUB_WORKSPACE}/stager-rc-2.txt 2>/dev/null || echo 0)" = "3" ]; then
+            echo "Stager refused the attempt; leaving the verdict to the verify step"
+            echo "changed_files=0" >> $GITHUB_OUTPUT
+            echo "too_complex=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
           CHANGED_SRC=$(git diff --cached --name-only \
             | grep -vE '(\.md$|^tests/|^docs/|manifest\.json$)' \
             || true)
@@ -874,9 +901,9 @@ jobs:
             claude-logs/
             autofix-prompt*.txt
             attempt1-diff.txt
-            pre-attempt-status-*.txt
             pre-run-ignored.txt
             stager-*.txt
+            stager-refused-*.txt
             verify-build-*.txt
             verify-test-*.txt
             commit-summary.txt
