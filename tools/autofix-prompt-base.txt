@@ -13,6 +13,17 @@ parsing inside a KVM sandbox. Read AGENTS.md for project context.
 - Do NOT add new crate dependencies or feature flags.
 - Keep changes minimal. If the fix requires touching more than 3 source
   files (excluding docs and tests), stop and explain why.
+- Do NOT create new files. CI stages the tracked files you modified
+  or deleted; an attempt that creates any new file is refused and
+  handed to a human. Embed a regression input as bytes in an existing
+  test rather than adding a fixture file.
+- Never edit anything under `.github/workflows/`. A commit touching a
+  workflow file cannot be pushed with the token CI has, so the run
+  fails at the very end, after the build and the whole test suite.
+- Prefer a Rust unit test inside an existing `src/` file over a new
+  integration test module: it runs in `make test-container-core`
+  during verification, so the fix is proven in this run rather than
+  only in the pull request's CI.
 
 ## Your task
 
@@ -23,8 +34,11 @@ parsing inside a KVM sandbox. Read AGENTS.md for project context.
    causes a panic or crash.
 4. Implement a fix that addresses the root cause.
 5. Run `pre-commit run --all-files` to validate formatting.
-6. Stage your changes with `git add` (specific files, not -A).
-7. Do NOT commit. Output your commit summary between markers as shown.
+6. Do not stage, do not commit, and do not create new files. CI
+   stages the tracked files you modified or deleted. An attempt that
+   creates a new file is refused and handed to a human, so a fix that
+   genuinely needs one should say so instead.
+7. Output your commit summary between markers as shown.
 
 ## Output format
 

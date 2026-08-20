@@ -255,6 +255,31 @@ jobs:
 
           start_time=$(date +%s)
 
+          # Record what the tree looked like before the attempt. The
+          # stager needs the ignored listing to tell a fixture Claude
+          # created from build output that was already there --
+          # .gitignore hides both, and refusing on the latter would
+          # refuse every run. Only the ignored listing is snapshotted:
+          # a human reading a failure report gets the tracked side from
+          # the `=== Git Status ===` block already in
+          # claude-changes-N.txt.
+          # actions/checkout uses `path: instar`, so it cleans only
+          # the checkout -- everything written at the workspace root
+          # survives into the next scheduled run on this self-hosted
+          # runner. A stale rc of 3 would refuse a fresh attempt and
+          # report the previous run's files into the issue comment.
+          rm -f ${GITHUB_WORKSPACE}/stager-*.txt \
+                ${GITHUB_WORKSPACE}/pre-run-ignored.txt \
+                ${GITHUB_WORKSPACE}/pre-retry-ignored.txt
+
+          # Attempt 2 takes its own baseline in Prepare retry, once
+          # the tree has been reset and attempt 1's refused files
+          # deleted -- otherwise it would be judged against a snapshot
+          # taken before the verify build and test run, and refused for
+          # their output rather than for anything Claude did.
+          tools/ci/stage-autofix-changes.sh \
+            --snapshot ${GITHUB_WORKSPACE}/pre-run-ignored.txt
+
           claude -p "$(cat ${GITHUB_WORKSPACE}/autofix-prompt.txt)" \
             --dangerously-skip-permissions \
             --max-turns ${MAX_TURNS} \
@@ -265,12 +290,34 @@ jobs:
           find ~/.claude/projects -name "*.jsonl" -newermt "@${start_time}" \
             -exec cp {} ${GITHUB_WORKSPACE}/claude-logs/ \; 2>/dev/null || true
 
-          # Capture changes
+          # Stage what Claude changed before anything inspects the
+          # tree. The complexity and verification steps below read
+          # `git diff --cached`, so an unstaged fix reads as no fix at
+          # all. Exit 3 means the attempt created a file that cannot be
+          # staged safely, so it is refused rather than committed as a
+          # partial fix; the verify step reads the code below. The
+          # script holds the rationale and is tested by
+          # tools/ci/test-stage-autofix-changes.sh.
+          set +e
+          tools/ci/stage-autofix-changes.sh \
+            --baseline ${GITHUB_WORKSPACE}/pre-run-ignored.txt \
+            --refused-file ${GITHUB_WORKSPACE}/stager-refused-1.txt \
+            > ${GITHUB_WORKSPACE}/stager-1.txt 2>&1
+          echo "$?" > ${GITHUB_WORKSPACE}/stager-rc-1.txt
+          set -e
+          cat ${GITHUB_WORKSPACE}/stager-1.txt
+
           echo "=== Git Status ===" > ${GITHUB_WORKSPACE}/claude-changes-1.txt
           git status >> ${GITHUB_WORKSPACE}/claude-changes-1.txt 2>&1
           echo "" >> ${GITHUB_WORKSPACE}/claude-changes-1.txt
           echo "=== Staged Changes ===" >> ${GITHUB_WORKSPACE}/claude-changes-1.txt
           git diff --cached >> ${GITHUB_WORKSPACE}/claude-changes-1.txt 2>&1
+          echo "" >> ${GITHUB_WORKSPACE}/claude-changes-1.txt
+          # Last, because `Report failure` quotes the tail of this file
+          # and a refusal is the first thing a reader needs.
+          echo "=== Stager ===" >> ${GITHUB_WORKSPACE}/claude-changes-1.txt
+          cat ${GITHUB_WORKSPACE}/stager-1.txt \
+            >> ${GITHUB_WORKSPACE}/claude-changes-1.txt 2>&1
 
       - name: Check complexity (attempt 1)
         id: complexity1
@@ -280,6 +327,31 @@ jobs:
           ISSUE_NUMBER: ${{ steps.find_issue.outputs.issue_number }}
         run: |
           cd ${GITHUB_WORKSPACE}/instar
+
+          # A refused attempt has staged tracked edits it will never
+          # commit. Counting them here can label the issue
+          # autofix-complex and stop the run, so the real reason -- a
+          # file that cannot reach the pull request -- would reach
+          # neither the retry prompt nor the human.
+          STAGER_RC=$(cat ${GITHUB_WORKSPACE}/stager-rc-1.txt 2>/dev/null || echo 0)
+          # Anything other than 0 or 3 is a usage error -- a mistyped
+          # flag, a REPO_DIR that is not a work tree. The index is then
+          # empty, which reads downstream as "Claude changed nothing"
+          # and labels the issue autofix-failed: a wiring bug wearing
+          # the costume of a Claude failure, which is the exact
+          # misattribution this workflow spent four months inside.
+          if [ "${STAGER_RC}" != "0" ] && [ "${STAGER_RC}" != "3" ]; then
+            echo "Stager failed with ${STAGER_RC}; this is a workflow bug, not a fix failure"
+            cat ${GITHUB_WORKSPACE}/stager-1.txt || true
+            exit 1
+          fi
+
+          if [ "${STAGER_RC}" = "3" ]; then
+            echo "Stager refused the attempt; leaving the verdict to the verify step"
+            echo "changed_files=0" >> $GITHUB_OUTPUT
+            echo "too_complex=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
 
           # Count changed source files (exclude docs, tests, manifests)
           CHANGED_SRC=$(git diff --cached --name-only \
@@ -345,8 +417,34 @@ jobs:
           cd ${GITHUB_WORKSPACE}/instar
 
           # Check if there are any staged changes at all
+          # Exit 3 from the stager means the attempt created a file
+          # that cannot be staged safely -- a new source file, a
+          # fixture .gitignore hides, a workflow edit that could not be
+          # pushed. The tree it built against is not the tree the
+          # commit would contain, so verifying it would prove nothing.
+          STAGER_RC=$(cat ${GITHUB_WORKSPACE}/stager-rc-1.txt 2>/dev/null || echo 0)
+          # Anything other than 0 or 3 is a usage error -- a mistyped
+          # flag, a REPO_DIR that is not a work tree. The index is then
+          # empty, which reads downstream as "Claude changed nothing"
+          # and labels the issue autofix-failed: a wiring bug wearing
+          # the costume of a Claude failure, which is the exact
+          # misattribution this workflow spent four months inside.
+          if [ "${STAGER_RC}" != "0" ] && [ "${STAGER_RC}" != "3" ]; then
+            echo "Stager failed with ${STAGER_RC}; this is a workflow bug, not a fix failure"
+            cat ${GITHUB_WORKSPACE}/stager-1.txt || true
+            exit 1
+          fi
+
+          if [ "${STAGER_RC}" = "3" ]; then
+            echo "Refused: the attempt created files that cannot reach the pull request"
+            cat ${GITHUB_WORKSPACE}/stager-1.txt || true
+            echo "fix_succeeded=false" >> $GITHUB_OUTPUT
+            echo "failure_reason=newfiles" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
           if [ -z "$(git diff --cached --name-only)" ]; then
-            echo "No changes staged by Claude"
+            echo "Claude modified no tracked file"
             echo "fix_succeeded=false" >> $GITHUB_OUTPUT
             exit 0
           fi
@@ -391,19 +489,32 @@ jobs:
           # Save the failed diff for context
           git diff --cached > ${GITHUB_WORKSPACE}/attempt1-diff.txt 2>&1
 
-          # Save failure output
-          if [ "$FAILURE_REASON" = "build" ]; then
-            FAILURE_OUTPUT=$(tail -50 ${GITHUB_WORKSPACE}/verify-build-1.txt)
-          elif [ "$FAILURE_REASON" = "tests" ]; then
-            FAILURE_OUTPUT=$(tail -50 ${GITHUB_WORKSPACE}/verify-test-1.txt)
-          else
-            FAILURE_OUTPUT="Claude did not stage any changes."
-          fi
-
           # Reset to clean state
           git reset HEAD -- . 2>/dev/null || true
           git checkout -- . 2>/dev/null || true
           git clean -fd 2>/dev/null || true
+
+          # `git clean -fd` has no -x on purpose -- -x would delete
+          # src/target/ and force a full rebuild -- so an ignored file
+          # attempt 1 created survives it, and the stager would refuse
+          # attempt 2 for that file whatever attempt 2 did. Delete just
+          # the paths it named.
+          if [ -s ${GITHUB_WORKSPACE}/stager-refused-1.txt ]; then
+            while IFS= read -r REFUSED_PATH; do
+              [ -n "${REFUSED_PATH}" ] || continue
+              rm -rf -- "${REFUSED_PATH}"
+            done < ${GITHUB_WORKSPACE}/stager-refused-1.txt
+          fi
+
+          # Baseline for attempt 2, taken here rather than reused from
+          # before attempt 1: the tree now holds whatever the verify
+          # build and test run wrote, and nothing attempt 1 created --
+          # `git clean -fd` took the untracked files and the loop above
+          # took the ignored ones. CI_OUTPUT_DIRS covers the build
+          # output known today, but it is a denylist, and this keeps
+          # attempt 2 from depending on it being complete.
+          tools/ci/stage-autofix-changes.sh \
+            --snapshot ${GITHUB_WORKSPACE}/pre-retry-ignored.txt
 
           # Shared prompt template (same as attempt 1)
           cd ${GITHUB_WORKSPACE}/instar
@@ -428,8 +539,10 @@ jobs:
             elif [ "$FAILURE_REASON" = "tests" ]; then
               tail -50 ${GITHUB_WORKSPACE}/verify-test-1.txt 2>/dev/null \
                 | sed 's/^/    /' || true
+            elif [ "$FAILURE_REASON" = "newfiles" ]; then
+              sed 's/^/    /' ${GITHUB_WORKSPACE}/stager-1.txt || true
             else
-              echo "    Claude did not stage any changes."
+              echo "    The previous attempt changed no files at all."
             fi
             echo ""
             echo "Try a DIFFERENT approach. Do not repeat the same fix."
@@ -488,11 +601,34 @@ jobs:
           find ~/.claude/projects -name "*.jsonl" -newermt "@${start_time}" \
             -exec cp {} ${GITHUB_WORKSPACE}/claude-logs/ \; 2>/dev/null || true
 
+          # Stage what Claude changed before anything inspects the
+          # tree. The complexity and verification steps below read
+          # `git diff --cached`, so an unstaged fix reads as no fix at
+          # all. Exit 3 means the attempt created a file that cannot be
+          # staged safely, so it is refused rather than committed as a
+          # partial fix; the verify step reads the code below. The
+          # script holds the rationale and is tested by
+          # tools/ci/test-stage-autofix-changes.sh.
+          set +e
+          tools/ci/stage-autofix-changes.sh \
+            --baseline ${GITHUB_WORKSPACE}/pre-retry-ignored.txt \
+            --refused-file ${GITHUB_WORKSPACE}/stager-refused-2.txt \
+            > ${GITHUB_WORKSPACE}/stager-2.txt 2>&1
+          echo "$?" > ${GITHUB_WORKSPACE}/stager-rc-2.txt
+          set -e
+          cat ${GITHUB_WORKSPACE}/stager-2.txt
+
           echo "=== Git Status ===" > ${GITHUB_WORKSPACE}/claude-changes-2.txt
           git status >> ${GITHUB_WORKSPACE}/claude-changes-2.txt 2>&1
           echo "" >> ${GITHUB_WORKSPACE}/claude-changes-2.txt
           echo "=== Staged Changes ===" >> ${GITHUB_WORKSPACE}/claude-changes-2.txt
           git diff --cached >> ${GITHUB_WORKSPACE}/claude-changes-2.txt 2>&1
+          echo "" >> ${GITHUB_WORKSPACE}/claude-changes-2.txt
+          # Last, because `Report failure` quotes the tail of this file
+          # and a refusal is the first thing a reader needs.
+          echo "=== Stager ===" >> ${GITHUB_WORKSPACE}/claude-changes-2.txt
+          cat ${GITHUB_WORKSPACE}/stager-2.txt \
+            >> ${GITHUB_WORKSPACE}/claude-changes-2.txt 2>&1
 
       - name: Check complexity (attempt 2)
         id: complexity2
@@ -502,6 +638,32 @@ jobs:
           ISSUE_NUMBER: ${{ steps.find_issue.outputs.issue_number }}
         run: |
           cd ${GITHUB_WORKSPACE}/instar
+
+          # A refused attempt has staged tracked edits it will never
+          # commit. Counting them here can label the issue
+          # autofix-complex and stop the run, so the real reason -- a
+          # file that cannot reach the pull request -- would reach
+          # neither the retry prompt nor the human.
+          STAGER_RC=$(cat ${GITHUB_WORKSPACE}/stager-rc-2.txt 2>/dev/null || echo 0)
+          # Anything other than 0 or 3 is a usage error -- a mistyped
+          # flag, a REPO_DIR that is not a work tree. The index is then
+          # empty, which reads downstream as "Claude changed nothing"
+          # and labels the issue autofix-failed: a wiring bug wearing
+          # the costume of a Claude failure, which is the exact
+          # misattribution this workflow spent four months inside.
+          if [ "${STAGER_RC}" != "0" ] && [ "${STAGER_RC}" != "3" ]; then
+            echo "Stager failed with ${STAGER_RC}; this is a workflow bug, not a fix failure"
+            cat ${GITHUB_WORKSPACE}/stager-2.txt || true
+            exit 1
+          fi
+
+          if [ "${STAGER_RC}" = "3" ]; then
+            echo "Stager refused the attempt; leaving the verdict to the verify step"
+            echo "changed_files=0" >> $GITHUB_OUTPUT
+            echo "too_complex=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
           CHANGED_SRC=$(git diff --cached --name-only \
             | grep -vE '(\.md$|^tests/|^docs/|manifest\.json$)' \
             || true)
@@ -558,8 +720,34 @@ jobs:
         run: |
           cd ${GITHUB_WORKSPACE}/instar
 
+          # Exit 3 from the stager means the attempt created a file
+          # that cannot be staged safely -- a new source file, a
+          # fixture .gitignore hides, a workflow edit that could not be
+          # pushed. The tree it built against is not the tree the
+          # commit would contain, so verifying it would prove nothing.
+          STAGER_RC=$(cat ${GITHUB_WORKSPACE}/stager-rc-2.txt 2>/dev/null || echo 0)
+          # Anything other than 0 or 3 is a usage error -- a mistyped
+          # flag, a REPO_DIR that is not a work tree. The index is then
+          # empty, which reads downstream as "Claude changed nothing"
+          # and labels the issue autofix-failed: a wiring bug wearing
+          # the costume of a Claude failure, which is the exact
+          # misattribution this workflow spent four months inside.
+          if [ "${STAGER_RC}" != "0" ] && [ "${STAGER_RC}" != "3" ]; then
+            echo "Stager failed with ${STAGER_RC}; this is a workflow bug, not a fix failure"
+            cat ${GITHUB_WORKSPACE}/stager-2.txt || true
+            exit 1
+          fi
+
+          if [ "${STAGER_RC}" = "3" ]; then
+            echo "Refused: the attempt created files that cannot reach the pull request"
+            cat ${GITHUB_WORKSPACE}/stager-2.txt || true
+            echo "fix_succeeded=false" >> $GITHUB_OUTPUT
+            echo "failure_reason=newfiles" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
           if [ -z "$(git diff --cached --name-only)" ]; then
-            echo "No changes staged by Claude"
+            echo "Claude modified no tracked file"
             echo "fix_succeeded=false" >> $GITHUB_OUTPUT
             exit 0
           fi
@@ -631,10 +819,21 @@ jobs:
         run: |
           cd ${GITHUB_WORKSPACE}/instar
 
-          # Claude is instructed to stage files itself. Only stage
-          # tracked modified files as a safety net (not -A which would
-          # pick up temp files or editor artifacts).
-          git add -u
+          # Already staged after each Claude attempt; repeated here so
+          # this step does not depend on that having happened.
+          # --tracked-only because the checks have already run: the
+          # verify build and test run have since written to the tree,
+          # so a full check here would refuse on their output. It still
+          # keeps .github/workflows/ out of the index, because a commit
+          # touching one cannot be pushed with the token CI holds.
+          #
+          # `git add -u` runs downstream of the complexity guardrail,
+          # so a tracked file modified by the verify build between the
+          # gate and here is committed without having been counted
+          # against the 3-file limit. Not new -- the old net was a bare
+          # `git add -u` -- but newly reachable, since the flow never
+          # got this far before.
+          tools/ci/stage-autofix-changes.sh --tracked-only
 
           if [ -z "$(git diff --cached --name-only)" ]; then
             echo "No changes staged"
@@ -773,6 +972,9 @@ jobs:
             claude-logs/
             autofix-prompt*.txt
             attempt1-diff.txt
+            pre-run-ignored.txt
+            pre-retry-ignored.txt
+            stager-*.txt
             verify-build-*.txt
             verify-test-*.txt
             commit-summary.txt
