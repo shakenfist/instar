@@ -17,13 +17,13 @@ parsing inside a KVM sandbox. Read AGENTS.md for project context.
   request. `**/*.bin` is ignored, so name a binary regression fixture
   something else (`tests/data/crash-NNN.raw`) or embed the bytes in
   the test.
-- Never edit anything under `.github/`. A commit touching a workflow
-  file cannot be pushed with the token CI has, so the run fails at the
-  very end, after the build and the whole test suite.
+- Never edit anything under `.github/workflows/`. A commit touching a
+  workflow file cannot be pushed with the token CI has, so the run
+  fails at the very end, after the build and the whole test suite.
 - Prefer a Rust unit test inside an existing `src/` file over a new
-  integration test module. A new `tests/test_*.py` must also be added
-  to the allowlist in `tools/ci/check-test-partition.py`, or
-  `tools/ci/check-test-partition.sh` fails the resulting PR.
+  integration test module: it runs in `make test-container-core`
+  during verification, so the fix is proven in this run rather than
+  only in the pull request's CI.
 
 ## Your task
 

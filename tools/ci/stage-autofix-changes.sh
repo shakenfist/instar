@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# Stage what a Claude Code autofix run left in the working tree, so the
-# steps that decide whether a fix exists can actually see it.
+# Stage what a Claude Code autofix run left in the working tree, and
+# refuse the attempt if it left anything that cannot be staged safely.
 #
 # .github/workflows/fuzz-autofix.yml judges an attempt by inspecting the
 # index (`git diff --cached --name-only`), and an empty index means "no
@@ -14,58 +14,91 @@
 # empty "=== Staged Changes ===" block). Move or delete the call to this
 # script and that failure comes straight back.
 #
+# It stages tracked modifications and deletions, and NOTHING ELSE. A
+# file the fix created is refused, not guessed at:
+#
+#   * staging new files means classifying them -- source file or editor
+#     leftover, fixture or build output -- and a wrong guess ships a
+#     branch that does not compile behind a PR that says "Build
+#     succeeded", because the verify build runs against the working
+#     tree where the file is present;
+#   * refusing means the run stops, the file is named, and the issue
+#     keeps its autofix-failed label for a human. A wrong guess costs a
+#     look at an issue that was already going to get one.
+#
+# The second failure is the cheap one, so the classification is not
+# worth having. An earlier revision of this script tried it and grew a
+# source-root allowlist, an artifact denylist, gitignored-file
+# reporting and a workflow-path exclusion; each refinement introduced
+# the next defect. If you are about to add a rule for which new files
+# are safe to stage, that is the history you are repeating.
+#
+# Refusal cases, all reported by path:
+#
+#   * an untracked file, excluding editor and merge leftovers (`*~`,
+#     `*.orig`, ...) which pre-commit and editors produce routinely;
+#   * a file matching a .gitignore rule that was not there before the
+#     attempt. git hides ignored paths from the untracked listing
+#     entirely, so without the --baseline comparison these vanish
+#     without a trace -- and `**/*.bin` is in .gitignore, which is
+#     exactly what a fuzz-crash regression fixture would be called;
+#   * a change under .github/workflows/. `git push` with the
+#     GITHUB_TOKEN actions/checkout persists is refused for any commit
+#     touching one, and the `workflows` scope it needs cannot be
+#     granted through the workflow's `permissions:` key -- so a staged
+#     workflow edit does not fail here, it fails two hours later at the
+#     push. Actively unstaged, because Claude may have staged it
+#     itself, in which case declining to add it is not enough.
+#
 # This is a script rather than inline YAML for the same reason
 # pick-fuzz-artifact.sh is: logic that only runs inside a live daily
-# workflow run cannot be tested there, and the previous three bugs in
-# this area all hid in inline YAML. Covered by
-# tools/ci/test-stage-autofix-changes.sh.
-#
-# What gets staged:
-#
-#   * every tracked modification and deletion (`git add -u`);
-#   * newly created files under a source root, because a fix that adds
-#     a regression test or a new module is otherwise invisible to the
-#     index while still being present for `make instar` and
-#     `make test-container-core` -- which would verify green and then
-#     commit a branch that does not compile.
-#
-# What does not, and why it is not `git add -A`: untracked files outside
-# the source roots, and editor/merge artifacts (`*~`, `*.orig`, `*.rej`,
-# ...) anywhere. Those are the temp files the original comment was
-# guarding against, plus edits under .github/workflows/, which cannot be
-# pushed with the token the workflow has. They are reported rather than
-# silently dropped, so a
-# failure report shows what was left behind, and separately so a reader
-# can tell why a path was left. New files matching a .gitignore rule are
-# reported too, loudly: git hides them from the untracked listing
-# entirely, so before that pass they were dropped without a trace.
+# workflow run cannot be tested there, and the bugs in this area all
+# hid in inline YAML. Covered by tools/ci/test-stage-autofix-changes.sh.
 #
 # Usage:
-#   tools/ci/stage-autofix-changes.sh [--tracked-only] [REPO_DIR]
+#   tools/ci/stage-autofix-changes.sh --snapshot FILE [REPO_DIR]
+#       Record the ignored paths that exist now, before the attempt
+#       starts. Stages nothing.
 #
-# --tracked-only stages tracked modifications and nothing else. It is
-# for call sites downstream of the complexity guardrail: staging a new
-# file there would commit it into the PR without it ever having been
-# counted against the 3-file limit or the cross-crate check. The
-# per-attempt call sites run upstream of those gates and take the full
-# behaviour.
+#   tools/ci/stage-autofix-changes.sh [--baseline FILE] [REPO_DIR]
+#       Stage tracked modifications; refuse on anything above. Without
+#       --baseline no ignored-file comparison is made, so a new ignored
+#       file is not detected -- pass it.
 #
-# REPO_DIR defaults to the current directory; the script then works from
-# the top level of whatever work tree it names, so the source roots mean
-# the same thing whichever subdirectory a caller happens to be in.
+#   tools/ci/stage-autofix-changes.sh --tracked-only [REPO_DIR]
+#       Stage tracked modifications and check nothing. For call sites
+#       downstream of the gates, where the checks have already run and
+#       the verify build has since written to the tree.
 #
-# Always exits 0 on a well-formed tree, including a tree with nothing to
-# stage: "Claude changed nothing" is a state the caller decides about,
-# not an error here.
+# REPO_DIR defaults to the current directory; the script works from the
+# top level of whatever work tree it names.
+#
+# Exit codes: 0 staged (or nothing to stage), 2 usage error, 3 refused.
 
 set -euo pipefail
 
-usage() { echo "usage: $0 [--tracked-only] [REPO_DIR]"; }
+REFUSED=3
 
-TRACKED_ONLY=false
+usage() {
+    echo "usage: $0 [--snapshot FILE | --baseline FILE | --tracked-only] [REPO_DIR]"
+}
+
+MODE=check
+BASELINE=
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        --tracked-only) TRACKED_ONLY=true; shift ;;
+        --snapshot)
+            MODE=snapshot
+            BASELINE="${2:-}"
+            [ -n "${BASELINE}" ] || { usage >&2; exit 2; }
+            shift 2
+            ;;
+        --baseline)
+            BASELINE="${2:-}"
+            [ -n "${BASELINE}" ] || { usage >&2; exit 2; }
+            shift 2
+            ;;
+        --tracked-only) MODE=tracked-only; shift ;;
         -h|--help) usage; exit 0 ;;
         --) shift; break ;;
         -*) usage >&2; exit 2 ;;
@@ -93,114 +126,104 @@ if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
 fi
 
 # `git add -u` is repo-wide but `git ls-files --others` prints paths
-# relative to the cwd, so without this the source roots would anchor at
-# REPO_DIR while the staging did not -- two different notions of "root"
-# in one run, and `REPO_DIR=src` would match src/tests/ as `^tests/`.
+# relative to the cwd, so without this the two would disagree about
+# what "the repo" means.
 cd "$(git rev-parse --show-toplevel)"
 
-# Directories a fix is allowed to create files in. Anchored at the repo
-# root, so a stray `report.md` at the top level is not swept up.
-SOURCE_ROOTS='^(src|tests|docs|crates|tools|scripts)/'
+# One collapsed entry per wholly-ignored directory, so src/target/ is
+# one line rather than thousands. Used for both the snapshot and the
+# comparison, so the two are always in the same shape.
+list_ignored() {
+    git ls-files --others --ignored --exclude-standard --directory \
+        | LC_ALL=C sort
+}
 
-# Editor backups, merge leftovers and scratch files. .gitignore already
-# covers *.swp/*.swo and build output; this catches the rest, including
-# inside the source roots where the path filter alone would let them
-# through.
+if [ "${MODE}" = snapshot ]; then
+    list_ignored > "${BASELINE}"
+    echo "Recorded $(grep -c . < "${BASELINE}" || true) ignored path(s) as the pre-attempt baseline."
+    exit 0
+fi
+
+# Editor backups and merge leftovers. `pre-commit run --all-files` is
+# in the prompt and its hooks produce these, so refusing on them would
+# refuse routine runs.
 ARTIFACT_NAMES='(^|/)(\.#[^/]*|[^/]*~|[^/]*\.(orig|rej|bak|tmp|swp|swo))$'
 
-# `git push` with the GITHUB_TOKEN actions/checkout persists is refused
-# for any commit touching .github/workflows/; the `workflows` scope it
-# needs cannot be granted through the workflow's `permissions:` key. So
-# a staged workflow edit does not fail here, it fails two hours later
-# at the push, after the build and the test run. Excluded and reported
-# rather than staged. Moot before this script existed, because nothing
-# was ever staged at all.
-WORKFLOW_EDITS=()
+WORKFLOW_CHANGES=()
 while IFS= read -r -d '' FILE; do
-    WORKFLOW_EDITS+=("${FILE}")
-done < <(git diff --name-only -z -- '.github/workflows/')
+    WORKFLOW_CHANGES+=("${FILE}")
+done < <(git diff HEAD --name-only -z -- '.github/workflows/')
 
-# Tracked modifications and deletions.
+# Declining to add it is not enough: Claude may have staged it already,
+# and an exclude pathspec does not remove what is in the index.
+if [ ${#WORKFLOW_CHANGES[@]} -gt 0 ]; then
+    git reset -q HEAD -- '.github/workflows/' 2>/dev/null || true
+fi
+
 git add -u -- . ':(exclude).github/workflows/'
 
-STAGED_NEW=()
-SKIPPED_ARTIFACT=()
-SKIPPED_OUTSIDE=()
-IGNORED=()
+if [ "${MODE}" = tracked-only ]; then
+    if [ ${#WORKFLOW_CHANGES[@]} -gt 0 ]; then
+        echo "Unstaged ${#WORKFLOW_CHANGES[@]} workflow change(s); a commit touching these cannot be pushed:"
+        printf '    %s\n' "${WORKFLOW_CHANGES[@]}"
+    fi
+    exit 0
+fi
 
-if [ "${TRACKED_ONLY}" = false ]; then
-    while IFS= read -r -d '' FILE; do
+UNTRACKED=()
+ARTIFACTS=()
+while IFS= read -r -d '' FILE; do
+    if [[ "${FILE}" =~ ${ARTIFACT_NAMES} ]]; then
+        ARTIFACTS+=("${FILE}")
+    else
+        UNTRACKED+=("${FILE}")
+    fi
+done < <(git ls-files --others --exclude-standard -z)
+
+NEW_IGNORED=()
+if [ -n "${BASELINE}" ] && [ -f "${BASELINE}" ]; then
+    while IFS= read -r FILE; do
+        [ -n "${FILE}" ] || continue
         if [[ "${FILE}" =~ ${ARTIFACT_NAMES} ]]; then
-            SKIPPED_ARTIFACT+=("${FILE}")
-        elif [[ "${FILE}" =~ ${SOURCE_ROOTS} ]]; then
-            STAGED_NEW+=("${FILE}")
+            ARTIFACTS+=("${FILE}")
         else
-            SKIPPED_OUTSIDE+=("${FILE}")
+            NEW_IGNORED+=("${FILE}")
         fi
-    done < <(git ls-files --others --exclude-standard -z)
-
-    # `--exclude-standard` hides gitignored paths completely, so
-    # without this pass a new file matching an ignore rule is neither
-    # staged nor mentioned. `**/*.bin` is in .gitignore and is exactly
-    # what a fuzz-crash regression fixture would be called, so the
-    # build would go green against a working tree holding the fixture
-    # and then commit a branch without it -- the failure this script
-    # exists to prevent, arrived at silently. Not staged (that would
-    # sweep in build output); reported, so it is visible in the log and
-    # in claude-changes-N.txt.
-    #
-    # `--directory` collapses a wholly-ignored directory to one entry,
-    # which is what keeps src/target/ from flooding the report. Those
-    # entries are reported, NOT skipped: src/fuzz/.gitignore ignores
-    # `corpus/` and `artifacts/` as whole directories, and a fuzz-crash
-    # input is more likely to land there than anywhere else. An earlier
-    # version dropped every collapsed directory to keep the output
-    # tidy and reopened the exact hole this pass exists to close. A
-    # couple of dozen predictable lines per run -- the guest operation
-    # `*.bin` files and the collapsed target/ trees, if Claude has run
-    # `make instar` -- is the price of never silently dropping one. Do
-    # not add a denylist to tidy that up without a way to tell build
-    # output from a file Claude created; the last attempt to make this
-    # block tidier is what reopened the hole.
-    while IFS= read -r -d '' FILE; do
-        if [[ "${FILE}" =~ ${ARTIFACT_NAMES} ]]; then
-            # An editor leftover that also matches an ignore rule is
-            # routine junk, not a lost fix. Keeping it out of the loud
-            # heading is what stops a reader skimming past the line
-            # that matters.
-            SKIPPED_ARTIFACT+=("${FILE}")
-        elif [[ "${FILE}" =~ ${SOURCE_ROOTS} ]]; then
-            IGNORED+=("${FILE}")
-        fi
-    done < <(git ls-files --others --ignored --exclude-standard --directory -z)
+    done < <(LC_ALL=C comm -13 "${BASELINE}" <(list_ignored))
 fi
 
-if [ ${#STAGED_NEW[@]} -gt 0 ]; then
-    git add -- "${STAGED_NEW[@]}"
-    echo "Staged ${#STAGED_NEW[@]} newly created file(s):"
-    printf '    %s\n' "${STAGED_NEW[@]}"
+if [ ${#ARTIFACTS[@]} -gt 0 ]; then
+    echo "Ignoring ${#ARTIFACTS[@]} editor or merge artifact(s):"
+    printf '    %s\n' "${ARTIFACTS[@]}"
 fi
 
-if [ ${#SKIPPED_ARTIFACT[@]} -gt 0 ]; then
-    echo "Left ${#SKIPPED_ARTIFACT[@]} editor or merge artifact(s) unstaged:"
-    printf '    %s\n' "${SKIPPED_ARTIFACT[@]}"
+REFUSE=false
+
+if [ ${#WORKFLOW_CHANGES[@]} -gt 0 ]; then
+    REFUSE=true
+    echo "REFUSED: a commit touching these cannot be pushed with the token CI holds:"
+    printf '    %s\n' "${WORKFLOW_CHANGES[@]}"
 fi
 
-if [ ${#SKIPPED_OUTSIDE[@]} -gt 0 ]; then
-    echo "Left ${#SKIPPED_OUTSIDE[@]} untracked file(s) outside a source root unstaged:"
-    printf '    %s\n' "${SKIPPED_OUTSIDE[@]}"
+if [ ${#UNTRACKED[@]} -gt 0 ]; then
+    REFUSE=true
+    echo "REFUSED: the attempt created these files, which are not staged and would not reach the pull request:"
+    printf '    %s\n' "${UNTRACKED[@]}"
 fi
 
-if [ ${#WORKFLOW_EDITS[@]} -gt 0 ]; then
-    echo "NOT staged, a commit touching these cannot be pushed with GITHUB_TOKEN:"
-    printf '    %s\n' "${WORKFLOW_EDITS[@]}"
+if [ ${#NEW_IGNORED[@]} -gt 0 ]; then
+    REFUSE=true
+    echo "REFUSED: the attempt created these, which .gitignore hides and which would not reach the pull request:"
+    printf '    %s\n' "${NEW_IGNORED[@]}"
 fi
 
-if [ ${#IGNORED[@]} -gt 0 ]; then
-    echo "Ignored by .gitignore, NOT staged, will NOT reach the pull request:"
-    printf '    %s\n' "${IGNORED[@]}"
+if [ "${REFUSE}" = true ]; then
+    echo "A fix that needs a new file needs a human. The tracked edits above are"
+    echo "staged so the failure report and the retry prompt can show them, but this"
+    echo "attempt will not become a pull request."
+    exit "${REFUSED}"
 fi
 
 if [ -z "$(git diff --cached --name-only)" ]; then
-    echo "Nothing staged: no tracked file was modified and no new source file was created."
+    echo "Nothing staged: the attempt modified no tracked file."
 fi

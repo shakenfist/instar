@@ -1281,26 +1281,37 @@ no cross-crate changes, no new dependencies).
 
 CI stages Claude's work, not Claude: `tools/ci/stage-autofix-changes.sh`
 runs immediately after each attempt and stages every tracked
-modification plus any new file under `src/`, `tests/`, `docs/`,
-`crates/`, `tools/` or `scripts/`, leaving editor and merge artifacts
-behind. A new file anywhere else is reported and left unstaged, so it
-never reaches the pull request. Two other things are reported rather
-than staged, because staging them would break the run rather than fix
-it: a new file matching a `.gitignore` rule (git hides those from the
-untracked listing entirely, so before the stager they vanished without
-a trace), and an edit under `.github/workflows/`, which cannot be
-pushed with the token CI holds. That matters because every gate downstream --
-the complexity count, the rebuild decision, the "did anything change"
-check -- reads the index rather than the working tree. Between
-2026-04 and 2026-08 the staging ran only in the create-PR step,
-downstream of those gates, so 28 issues were attempted, every one
-reported "No changes staged by Claude" with the fix sitting unstaged
-in the working tree, and no PR was ever opened. The same script runs
-in `test-drift-fix.yml`, whose commit step likewise tests the index, so
-a new `docs/image_notes/` entry reaches the commit only because the
-stager staged it. If an autofix report shows an empty `=== Staged Changes ===`
-block, that now means Claude changed nothing -- not that it forgot to
-stage.
+modification. That matters because every gate downstream -- the
+complexity count, the rebuild decision, the "did anything change"
+check -- reads the index rather than the working tree. Between 2026-04
+and 2026-08 the staging ran only in the create-PR step, downstream of
+those gates, so 28 issues were attempted, every one reported "No
+changes staged by Claude" with the fix sitting unstaged in the working
+tree, and no PR was ever opened. If an autofix report shows an empty
+`=== Staged Changes ===` block, that now means Claude changed nothing
+-- not that it forgot to stage.
+
+It stages tracked modifications and nothing else. A file the attempt
+*created* is refused, by name, and the run stops with the issue left
+labelled `autofix-failed` for a human: a new source file, a fixture
+`.gitignore` hides (git omits ignored paths from the untracked listing
+entirely, so these otherwise vanish without a trace -- `**/*.bin` is
+ignored and is exactly what a crash fixture gets called), or an edit
+under `.github/workflows/`, which cannot be pushed with the token CI
+holds. Staging those instead would mean classifying them, and a wrong
+guess ships a branch that does not compile behind a pull request
+saying "Build succeeded", because the verify build runs against the
+working tree where the file is present. A wrong refusal costs a look
+at an issue that was already going to get one. The script's header
+records an earlier revision that tried the classification and the
+sequence of defects it produced.
+
+Telling a file the attempt created from build output that was already
+there needs a before picture, so the workflow snapshots the ignored
+paths once before attempt 1 (`pre-run-ignored.txt`) and judges both
+attempts against it -- `Prepare retry`'s `git clean -fd` has no `-x`,
+so an ignored file from attempt 1 survives into attempt 2 and is still
+new relative to the run.
 
 ## Related Documentation
 

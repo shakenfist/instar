@@ -255,15 +255,22 @@ jobs:
 
           start_time=$(date +%s)
 
-          # The stager cannot tell Claude's edits from dirt that
-          # predates the attempt, so record what was already dirty. Not
-          # a gate -- the preceding steps write only to gitignored
-          # paths -- but without it a failure report gives a reader no
-          # way to attribute a staged path. Attempt 2 needs no
-          # equivalent: Prepare retry resets, reverts and cleans the
-          # tree immediately beforehand.
+          # Record what the tree looked like before the attempt. The
+          # stager needs the ignored listing to tell a fixture Claude
+          # created from build output that was already there --
+          # .gitignore hides both, and refusing on the latter would
+          # refuse every run. The porcelain status is for a human
+          # reading a failure report.
           git status --porcelain \
             > ${GITHUB_WORKSPACE}/pre-attempt-status-1.txt 2>&1 || true
+          # One baseline for the whole run. Attempt 2 reuses it on
+          # purpose: Prepare retry's `git clean -fd` has no -x, so an
+          # ignored file attempt 1 created survives into attempt 2.
+          # Judged against the pre-run baseline it is still new, so
+          # attempt 2 is refused for it instead of building green
+          # against a file its commit would omit.
+          tools/ci/stage-autofix-changes.sh \
+            --snapshot ${GITHUB_WORKSPACE}/pre-run-ignored.txt
 
           claude -p "$(cat ${GITHUB_WORKSPACE}/autofix-prompt.txt)" \
             --dangerously-skip-permissions \
@@ -278,19 +285,30 @@ jobs:
           # Stage what Claude changed before anything inspects the
           # tree. The complexity and verification steps below read
           # `git diff --cached`, so an unstaged fix reads as no fix at
-          # all. The script holds the rationale and the rules for
-          # which untracked files count; it is tested by
-          # tools/ci/test-stage-autofix-changes.sh. Tolerate a
-          # failure: the capture below is the only record of why, and
-          # the step runs under `bash -e`.
-          tools/ci/stage-autofix-changes.sh || echo "stager failed with $?"
+          # all. Exit 3 means the attempt created a file that cannot be
+          # staged safely, so it is refused rather than committed as a
+          # partial fix; the verify step reads the code below. The
+          # script holds the rationale and is tested by
+          # tools/ci/test-stage-autofix-changes.sh.
+          set +e
+          tools/ci/stage-autofix-changes.sh \
+            --baseline ${GITHUB_WORKSPACE}/pre-run-ignored.txt \
+            > ${GITHUB_WORKSPACE}/stager-1.txt 2>&1
+          echo "$?" > ${GITHUB_WORKSPACE}/stager-rc-1.txt
+          set -e
+          cat ${GITHUB_WORKSPACE}/stager-1.txt
 
-          # Capture changes
           echo "=== Git Status ===" > ${GITHUB_WORKSPACE}/claude-changes-1.txt
           git status >> ${GITHUB_WORKSPACE}/claude-changes-1.txt 2>&1
           echo "" >> ${GITHUB_WORKSPACE}/claude-changes-1.txt
           echo "=== Staged Changes ===" >> ${GITHUB_WORKSPACE}/claude-changes-1.txt
           git diff --cached >> ${GITHUB_WORKSPACE}/claude-changes-1.txt 2>&1
+          echo "" >> ${GITHUB_WORKSPACE}/claude-changes-1.txt
+          # Last, because `Report failure` quotes the tail of this file
+          # and a refusal is the first thing a reader needs.
+          echo "=== Stager ===" >> ${GITHUB_WORKSPACE}/claude-changes-1.txt
+          cat ${GITHUB_WORKSPACE}/stager-1.txt \
+            >> ${GITHUB_WORKSPACE}/claude-changes-1.txt 2>&1
 
       - name: Check complexity (attempt 1)
         id: complexity1
@@ -365,8 +383,21 @@ jobs:
           cd ${GITHUB_WORKSPACE}/instar
 
           # Check if there are any staged changes at all
+          # Exit 3 from the stager means the attempt created a file
+          # that cannot be staged safely -- a new source file, a
+          # fixture .gitignore hides, a workflow edit that could not be
+          # pushed. The tree it built against is not the tree the
+          # commit would contain, so verifying it would prove nothing.
+          if [ "$(cat ${GITHUB_WORKSPACE}/stager-rc-1.txt 2>/dev/null || echo 0)" = "3" ]; then
+            echo "Refused: the attempt created files that cannot reach the pull request"
+            cat ${GITHUB_WORKSPACE}/stager-1.txt || true
+            echo "fix_succeeded=false" >> $GITHUB_OUTPUT
+            echo "failure_reason=newfiles" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
           if [ -z "$(git diff --cached --name-only)" ]; then
-            echo "Claude modified no tracked file and created no new source file"
+            echo "Claude modified no tracked file"
             echo "fix_succeeded=false" >> $GITHUB_OUTPUT
             exit 0
           fi
@@ -416,6 +447,8 @@ jobs:
             FAILURE_OUTPUT=$(tail -50 ${GITHUB_WORKSPACE}/verify-build-1.txt)
           elif [ "$FAILURE_REASON" = "tests" ]; then
             FAILURE_OUTPUT=$(tail -50 ${GITHUB_WORKSPACE}/verify-test-1.txt)
+          elif [ "$FAILURE_REASON" = "newfiles" ]; then
+            FAILURE_OUTPUT=$(cat ${GITHUB_WORKSPACE}/stager-1.txt)
           else
             FAILURE_OUTPUT="The previous attempt changed no files at all."
           fi
@@ -448,6 +481,8 @@ jobs:
             elif [ "$FAILURE_REASON" = "tests" ]; then
               tail -50 ${GITHUB_WORKSPACE}/verify-test-1.txt 2>/dev/null \
                 | sed 's/^/    /' || true
+            elif [ "$FAILURE_REASON" = "newfiles" ]; then
+              sed 's/^/    /' ${GITHUB_WORKSPACE}/stager-1.txt || true
             else
               echo "    The previous attempt changed no files at all."
             fi
@@ -511,18 +546,30 @@ jobs:
           # Stage what Claude changed before anything inspects the
           # tree. The complexity and verification steps below read
           # `git diff --cached`, so an unstaged fix reads as no fix at
-          # all. The script holds the rationale and the rules for
-          # which untracked files count; it is tested by
-          # tools/ci/test-stage-autofix-changes.sh. Tolerate a
-          # failure: the capture below is the only record of why, and
-          # the step runs under `bash -e`.
-          tools/ci/stage-autofix-changes.sh || echo "stager failed with $?"
+          # all. Exit 3 means the attempt created a file that cannot be
+          # staged safely, so it is refused rather than committed as a
+          # partial fix; the verify step reads the code below. The
+          # script holds the rationale and is tested by
+          # tools/ci/test-stage-autofix-changes.sh.
+          set +e
+          tools/ci/stage-autofix-changes.sh \
+            --baseline ${GITHUB_WORKSPACE}/pre-run-ignored.txt \
+            > ${GITHUB_WORKSPACE}/stager-2.txt 2>&1
+          echo "$?" > ${GITHUB_WORKSPACE}/stager-rc-2.txt
+          set -e
+          cat ${GITHUB_WORKSPACE}/stager-2.txt
 
           echo "=== Git Status ===" > ${GITHUB_WORKSPACE}/claude-changes-2.txt
           git status >> ${GITHUB_WORKSPACE}/claude-changes-2.txt 2>&1
           echo "" >> ${GITHUB_WORKSPACE}/claude-changes-2.txt
           echo "=== Staged Changes ===" >> ${GITHUB_WORKSPACE}/claude-changes-2.txt
           git diff --cached >> ${GITHUB_WORKSPACE}/claude-changes-2.txt 2>&1
+          echo "" >> ${GITHUB_WORKSPACE}/claude-changes-2.txt
+          # Last, because `Report failure` quotes the tail of this file
+          # and a refusal is the first thing a reader needs.
+          echo "=== Stager ===" >> ${GITHUB_WORKSPACE}/claude-changes-2.txt
+          cat ${GITHUB_WORKSPACE}/stager-2.txt \
+            >> ${GITHUB_WORKSPACE}/claude-changes-2.txt 2>&1
 
       - name: Check complexity (attempt 2)
         id: complexity2
@@ -588,8 +635,21 @@ jobs:
         run: |
           cd ${GITHUB_WORKSPACE}/instar
 
+          # Exit 3 from the stager means the attempt created a file
+          # that cannot be staged safely -- a new source file, a
+          # fixture .gitignore hides, a workflow edit that could not be
+          # pushed. The tree it built against is not the tree the
+          # commit would contain, so verifying it would prove nothing.
+          if [ "$(cat ${GITHUB_WORKSPACE}/stager-rc-2.txt 2>/dev/null || echo 0)" = "3" ]; then
+            echo "Refused: the attempt created files that cannot reach the pull request"
+            cat ${GITHUB_WORKSPACE}/stager-2.txt || true
+            echo "fix_succeeded=false" >> $GITHUB_OUTPUT
+            echo "failure_reason=newfiles" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
           if [ -z "$(git diff --cached --name-only)" ]; then
-            echo "Claude modified no tracked file and created no new source file"
+            echo "Claude modified no tracked file"
             echo "fix_succeeded=false" >> $GITHUB_OUTPUT
             exit 0
           fi
@@ -663,17 +723,18 @@ jobs:
 
           # Already staged after each Claude attempt; repeated here so
           # this step does not depend on that having happened.
-          # --tracked-only because this runs downstream of the
-          # complexity guardrail: staging a new file here would commit
-          # it into the PR without it ever having been counted against
-          # the 3-file limit or the cross-crate check. New files are
-          # handled by the per-attempt calls, upstream of the gates.
-          # `git add -u` still runs, so a tracked file modified between
-          # the complexity check and here -- by the verify build or
-          # test run, both of which mount the tree read-write -- is
-          # committed without the guardrail having counted it. Not new
-          # (the old net was a bare `git add -u`) but newly reachable,
-          # since the flow never got this far before.
+          # --tracked-only because the checks have already run: the
+          # verify build and test run have since written to the tree,
+          # so a full check here would refuse on their output. It still
+          # keeps .github/workflows/ out of the index, because a commit
+          # touching one cannot be pushed with the token CI holds.
+          #
+          # `git add -u` runs downstream of the complexity guardrail,
+          # so a tracked file modified by the verify build between the
+          # gate and here is committed without having been counted
+          # against the 3-file limit. Not new -- the old net was a bare
+          # `git add -u` -- but newly reachable, since the flow never
+          # got this far before.
           tools/ci/stage-autofix-changes.sh --tracked-only
 
           if [ -z "$(git diff --cached --name-only)" ]; then
@@ -814,6 +875,8 @@ jobs:
             autofix-prompt*.txt
             attempt1-diff.txt
             pre-attempt-status-*.txt
+            pre-run-ignored.txt
+            stager-*.txt
             verify-build-*.txt
             verify-test-*.txt
             commit-summary.txt

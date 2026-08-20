@@ -6,9 +6,8 @@
 # workflow YAML that only ever ran during a live daily autofix run, and
 # it was in the wrong step for months without anything noticing. These
 # cases pin the states the working tree can be in when Claude Code hands
-# back control: nothing changed, a tracked file edited or deleted, a new
-# source file created, and the untracked junk the `-A` alternative was
-# rejected for picking up.
+# back control: nothing changed, a tracked file edited or deleted, and
+# each of the things the script refuses rather than guesses at.
 
 set -euo pipefail
 
@@ -23,6 +22,8 @@ trap 'rm -rf "${WORK}"' EXIT
 # there) the "not a work tree" case would find that checkout and the
 # scratch repos would be nested. Stop the walk at the scratch root.
 export GIT_CEILING_DIRECTORIES="${WORK}"
+
+REFUSED=3
 
 FAILURES=0
 
@@ -39,8 +40,22 @@ check() {
     fi
 }
 
-# A scratch repo with one commit, the source roots the real repo has,
-# and the ignore rules that matter to staging.
+contains() {
+    # contains DESCRIPTION HAYSTACK NEEDLE
+    case "$2" in
+        *"$3"*) ok "$1" ;;
+        *) fail "$1: '$3' not in '$2'" ;;
+    esac
+}
+
+lacks() {
+    case "$2" in
+        *"$3"*) fail "$1: '$3' unexpectedly in '$2'" ;;
+        *) ok "$1" ;;
+    esac
+}
+
+# A scratch repo with one commit and the ignore rules that matter.
 setup() {
     D="${WORK}/repo"
     rm -rf "${D}"
@@ -48,394 +63,293 @@ setup() {
     git -C "${D}" init -q
     git -C "${D}" config user.email bot@example.com
     git -C "${D}" config user.name bot
-    mkdir -p "${D}/src/crates/qcow2" "${D}/tests" "${D}/docs" \
-        "${D}/tools/ci" "${D}/scripts" "${D}/crates" "${D}/prototypes"
+    mkdir -p "${D}/src/crates/qcow2" "${D}/tests" "${D}/docs"
     echo 'fn main() {}' > "${D}/src/main.rs"
     echo 'fn parse() {}' > "${D}/src/crates/qcow2/lib.rs"
-    echo '# notes' > "${D}/docs/testing.md"
     printf '**/target/\n**/*.bin\n*.swp\n' > "${D}/.gitignore"
     git -C "${D}" add -A
     git -C "${D}" commit -qm 'base'
+    BASE="${WORK}/baseline.txt"
+    rm -f "${BASE}"
 }
 
-stage() { "${STAGE}" "${D}"; }
+# Run and capture both output and status without tripping `set -e`.
+run() {
+    set +e
+    OUT="$("${STAGE}" "$@" 2>&1)"
+    RC=$?
+    set -e
+}
 
-# Newline-separated sorted list of staged paths, so a check can compare
-# against a literal.
-staged() { git -C "${D}" diff --cached --name-only | sort | tr '\n' ' ' | sed 's/ $//'; }
+stage() { run --baseline "${BASE}" "${D}"; }
+snapshot() { run --snapshot "${BASE}" "${D}"; }
+staged() { git -C "${D}" diff --cached --name-only | LC_ALL=C sort | tr '\n' ' ' | sed 's/ $//'; }
 
 start "a clean tree stages nothing and says so"
 setup
-OUT="$(stage)"
+snapshot
+stage
+check "exit 0" "${RC}" "0"
 check "nothing staged" "$(staged)" ""
-case "${OUT}" in
-    *"Nothing staged"*) ok "reports the empty case" ;;
-    *) fail "reports the empty case: got '${OUT}'" ;;
-esac
+contains "reports the empty case" "${OUT}" "Nothing staged"
 
 start "a tracked modification is staged"
 setup
+snapshot
 echo 'fn main() { fixed(); }' > "${D}/src/main.rs"
-stage > /dev/null
+stage
+check "exit 0" "${RC}" "0"
 check "modified file staged" "$(staged)" "src/main.rs"
 
 start "a tracked deletion is staged"
 setup
+snapshot
 rm "${D}/src/crates/qcow2/lib.rs"
-stage > /dev/null
+stage
+check "exit 0" "${RC}" "0"
 check "deletion staged" "$(staged)" "src/crates/qcow2/lib.rs"
 
 start "a file already staged by Claude stays staged"
 setup
+snapshot
 echo 'fn main() { fixed(); }' > "${D}/src/main.rs"
 git -C "${D}" add src/main.rs
-stage > /dev/null
+stage
+check "exit 0" "${RC}" "0"
 check "still staged, once" "$(staged)" "src/main.rs"
 
-# The case the review flagged: `git add -u` alone leaves a new file
-# untracked, so `make instar` and `make test-container-core` verify a
-# working tree the commit then does not contain -- a PR that reports
-# "Build succeeded" and does not compile.
-start "a newly created file under a source root is staged"
+# The whole point of the design: a created file is refused by name
+# rather than classified. Staging it wrong ships a branch that does not
+# compile behind a PR claiming the build passed.
+start "a newly created file is refused, not staged"
 setup
+snapshot
 echo 'fn t() {}' > "${D}/tests/regression_qcow2.rs"
-OUT="$(stage)"
-check "new test file staged" "$(staged)" "tests/regression_qcow2.rs"
-case "${OUT}" in
-    *"Staged 1 newly created file"*) ok "reports what it staged" ;;
-    *) fail "reports what it staged: got '${OUT}'" ;;
-esac
+echo 'fn main() { fixed(); }' > "${D}/src/main.rs"
+stage
+check "exit ${REFUSED}" "${RC}" "${REFUSED}"
+contains "names the file" "${OUT}" "tests/regression_qcow2.rs"
+contains "says why" "${OUT}" "would not reach the pull request"
+check "the tracked edit is still staged for the report" "$(staged)" "src/main.rs"
 
-start "every source root is covered"
+start "a file created anywhere is refused, not just under a source root"
 setup
-for P in src/new.rs tests/new.rs docs/new.md crates/new.rs \
-         tools/ci/new.sh scripts/new.sh; do
-    echo x > "${D}/${P}"
-done
-stage > /dev/null
-check "all six staged" "$(staged)" \
-    "crates/new.rs docs/new.md scripts/new.sh src/new.rs tests/new.rs tools/ci/new.sh"
-
-start "an untracked file outside the source roots is not staged"
-setup
+snapshot
 echo 'scratch' > "${D}/notes.txt"
-mkdir -p "${D}/prototypes/src"
-echo 'x' > "${D}/prototypes/spike.rs"
-# The roots are anchored at the repo root, so a directory that merely
-# contains one of their names further down does not qualify.
-echo 'x' > "${D}/prototypes/src/spike.rs"
-OUT="$(stage)"
-check "nothing staged" "$(staged)" ""
-case "${OUT}" in
-    *"Left 3 untracked file(s) outside a source root unstaged"*) ok "reports what it skipped" ;;
-    *) fail "reports what it skipped: got '${OUT}'" ;;
-esac
+stage
+check "exit ${REFUSED}" "${RC}" "${REFUSED}"
+contains "names it" "${OUT}" "notes.txt"
 
-# Editor and merge leftovers land inside src/ as readily as anywhere
-# else, so the path filter alone is not enough -- this is the temp-file
-# protection that ruled out `git add -A`.
-start "editor and merge artifacts inside a source root are not staged"
+# pre-commit is in the prompt and its hooks leave these behind, so
+# refusing on them would refuse routine runs.
+start "editor and merge artifacts do not cause a refusal"
 setup
+snapshot
 echo x > "${D}/src/main.rs~"
 echo x > "${D}/src/main.rs.orig"
 echo x > "${D}/src/main.rs.rej"
 echo x > "${D}/src/main.rs.bak"
 echo x > "${D}/src/.#main.rs"
-stage > /dev/null
-check "no artifact staged" "$(staged)" ""
+stage
+check "exit 0" "${RC}" "0"
+contains "reported as artifacts" "${OUT}" "editor or merge artifact(s)"
+lacks "not refused" "${OUT}" "REFUSED"
 
-start "the two skip reasons are reported separately"
+# git hides ignored paths from the untracked listing entirely, and
+# `**/*.bin` is exactly what a fuzz-crash fixture gets called.
+start "a new gitignored file is refused"
 setup
-echo 'fn main() { fixed(); }' > "${D}/src/main.rs"
-echo x > "${D}/src/main.rs.orig"
-echo x > "${D}/notes.txt"
-OUT="$(stage)"
-check "only the fix staged" "$(staged)" "src/main.rs"
-case "${OUT}" in
-    *"Left 1 editor or merge artifact(s) unstaged:"*"src/main.rs.orig"*)
-        ok "artifact reported as an artifact" ;;
-    *) fail "artifact reported as an artifact: got '${OUT}'" ;;
-esac
-case "${OUT}" in
-    *"outside a source root unstaged:"*"notes.txt"*)
-        ok "out-of-root file reported separately" ;;
-    *) fail "out-of-root file reported separately: got '${OUT}'" ;;
-esac
-
-# `git ls-files --others --exclude-standard` does not list ignored
-# paths at all, so before the second pass a new fixture matching
-# `**/*.bin` was staged nowhere and reported nowhere -- the build went
-# green against a tree holding it and the commit shipped without it.
-start "a gitignored new file under a source root is reported, not staged"
-setup
+snapshot
 printf 'x' > "${D}/tests/crash.bin"
-OUT="$(stage)"
-check "not staged" "$(staged)" ""
-case "${OUT}" in
-    *"Ignored by .gitignore, NOT staged"*"tests/crash.bin"*)
-        ok "reported loudly" ;;
-    *) fail "reported loudly: got '${OUT}'" ;;
-esac
-
-start "a whole ignored tree is reported as one collapsed entry"
-setup
-mkdir -p "${D}/src/target/debug"
-echo x > "${D}/src/target/debug/instar"
-echo x > "${D}/src/target/debug/deps.d"
-OUT="$(stage)"
-check "nothing staged" "$(staged)" ""
-case "${OUT}" in
-    *"Ignored by .gitignore"*"src/target/"*) ok "reported collapsed" ;;
-    *) fail "reported collapsed: got '${OUT}'" ;;
-esac
-check "one line, not one per file" \
-    "$(echo "${OUT}" | grep -c 'src/target')" "1"
+stage
+check "exit ${REFUSED}" "${RC}" "${REFUSED}"
+contains "names it" "${OUT}" "tests/crash.bin"
+contains "says .gitignore hides it" "${OUT}" ".gitignore hides"
 
 # src/fuzz/.gitignore ignores `corpus/` and `artifacts/` as whole
-# directories, and a fuzz-crash regression input is likelier to land
-# there than anywhere else. Dropping collapsed directories to keep the
-# report tidy silently reopened exactly the hole the pass closes.
-start "a new file inside a wholly-ignored directory is still reported"
+# directories, which is where a fuzz-crash input would land.
+start "a new file inside a wholly-ignored directory is refused"
 setup
-mkdir -p "${D}/src/fuzz/corpus/fuzz_qcow2_header"
-printf 'corpus/\nartifacts/\n' > "${D}/src/fuzz/.gitignore"
+mkdir -p "${D}/src/fuzz"
+printf 'corpus/\n' > "${D}/src/fuzz/.gitignore"
 git -C "${D}" add src/fuzz/.gitignore
 git -C "${D}" commit -qm fuzzignore
+snapshot
+mkdir -p "${D}/src/fuzz/corpus/fuzz_qcow2_header"
 echo crashbytes > "${D}/src/fuzz/corpus/fuzz_qcow2_header/crash-abc"
-OUT="$(stage)"
-check "not staged" "$(staged)" ""
-case "${OUT}" in
-    *"Ignored by .gitignore"*"src/fuzz/corpus/"*) ok "reported" ;;
-    *) fail "reported: got '${OUT}'" ;;
-esac
+stage
+check "exit ${REFUSED}" "${RC}" "${REFUSED}"
+contains "names the collapsed directory" "${OUT}" "src/fuzz/corpus/"
 
-# The artifact classification only ran in the first loop, so an editor
-# leftover that also matched an ignore rule landed under the loud
-# heading beside a genuinely lost fixture.
-start "a gitignored editor artifact is not reported as a lost file"
-setup
-echo x > "${D}/src/main.rs.swp"
-printf 'x' > "${D}/src/lost.bin"
-OUT="$(stage)"
-case "${OUT}" in
-    *"Ignored by .gitignore"*"src/main.rs.swp"*)
-        fail "swap file should not be in the loud list: got '${OUT}'" ;;
-    *) ok "swap file kept out of the loud list" ;;
-esac
-case "${OUT}" in
-    *"Ignored by .gitignore"*"src/lost.bin"*) ok "the real loss is still reported" ;;
-    *) fail "the real loss is still reported: got '${OUT}'" ;;
-esac
-case "${OUT}" in
-    *"editor or merge artifact(s) unstaged:"*"src/main.rs.swp"*)
-        ok "reported as an artifact instead" ;;
-    *) fail "reported as an artifact instead: got '${OUT}'" ;;
-esac
-
-# A commit touching .github/workflows/ cannot be pushed with the
-# GITHUB_TOKEN actions/checkout persists, and the failure lands two
-# hours downstream at the push rather than here.
-start "a workflow edit is excluded and reported"
-setup
-mkdir -p "${D}/.github/workflows"
-echo 'name: x' > "${D}/.github/workflows/ci.yml"
-git -C "${D}" add .github/workflows/ci.yml
-git -C "${D}" commit -qm workflow
-echo 'name: edited' > "${D}/.github/workflows/ci.yml"
-echo 'fn main() { fixed(); }' > "${D}/src/main.rs"
-OUT="$(stage)"
-check "workflow edit not staged" "$(staged)" "src/main.rs"
-case "${OUT}" in
-    *"cannot be pushed with GITHUB_TOKEN"*".github/workflows/ci.yml"*) ok "reported" ;;
-    *) fail "reported: got '${OUT}'" ;;
-esac
-
-start "--tracked-only also excludes workflow edits"
-setup
-mkdir -p "${D}/.github/workflows"
-echo 'name: x' > "${D}/.github/workflows/ci.yml"
-git -C "${D}" add .github/workflows/ci.yml
-git -C "${D}" commit -qm workflow
-echo 'name: edited' > "${D}/.github/workflows/ci.yml"
-echo 'fn main() { fixed(); }' > "${D}/src/main.rs"
-"${STAGE}" --tracked-only "${D}" > /dev/null
-check "workflow edit not staged" "$(staged)" "src/main.rs"
-
-start "an ignored file outside the source roots is not reported"
-setup
-echo x > "${D}/root.bin"
-OUT="$(stage)"
-case "${OUT}" in
-    *"Ignored by .gitignore"*) fail "out-of-root ignored file should not be listed: got '${OUT}'" ;;
-    *) ok "not listed" ;;
-esac
-
-start "--tracked-only does not report ignored files either"
-setup
-printf 'x' > "${D}/tests/crash.bin"
-echo 'fn main() { fixed(); }' > "${D}/src/main.rs"
-OUT="$("${STAGE}" --tracked-only "${D}")"
-check "only the tracked modification" "$(staged)" "src/main.rs"
-case "${OUT}" in
-    *"Ignored by .gitignore"*) fail "tracked-only should not enumerate: got '${OUT}'" ;;
-    *) ok "no untracked enumeration at all" ;;
-esac
-
-start "gitignored build output is not staged"
+# Build output that predates the attempt is not the attempt's doing.
+# Without this the stager would refuse every run, since the prompt
+# tells Claude to run `make instar`.
+start "ignored build output present before the attempt is not refused"
 setup
 mkdir -p "${D}/src/target/debug"
 echo x > "${D}/src/target/debug/instar"
 echo x > "${D}/src/core.bin"
+snapshot
+echo 'fn main() { fixed(); }' > "${D}/src/main.rs"
+stage
+check "exit 0" "${RC}" "0"
+check "the fix is staged" "$(staged)" "src/main.rs"
+lacks "not refused" "${OUT}" "REFUSED"
+
+start "ignored output created during the attempt is still refused"
+setup
+snapshot
+mkdir -p "${D}/src/target/debug"
+echo x > "${D}/src/target/debug/instar"
+stage
+check "exit ${REFUSED}" "${RC}" "${REFUSED}"
+contains "names the collapsed tree" "${OUT}" "src/target/"
+
+start "a gitignored editor artifact is not a refusal"
+setup
+snapshot
 echo x > "${D}/src/main.rs.swp"
-OUT="$(stage)"
-check "nothing staged" "$(staged)" ""
-case "${OUT}" in
-    *"untracked file(s) unstaged"*) fail "ignored files should not even be reported" ;;
-    *) ok "ignored files are invisible, not skipped" ;;
-esac
+stage
+check "exit 0" "${RC}" "0"
+contains "reported as an artifact" "${OUT}" "editor or merge artifact(s)"
 
-start "a new source file with a space in its name is staged"
+start "without a baseline no ignored comparison is made"
 setup
-echo x > "${D}/docs/image notes.md"
-stage > /dev/null
-check "space-bearing path staged" "$(staged)" "docs/image notes.md"
+printf 'x' > "${D}/tests/crash.bin"
+run "${D}"
+check "exit 0" "${RC}" "0"
+lacks "nothing about the ignored file" "${OUT}" "crash.bin"
 
-start "a mixed tree stages the fix and leaves the junk"
+# `git push` with the GITHUB_TOKEN actions/checkout persists is refused
+# for any commit touching .github/workflows/, and that failure lands
+# two hours downstream at the push.
+start "a workflow edit is unstaged and refused"
 setup
+mkdir -p "${D}/.github/workflows"
+echo 'name: x' > "${D}/.github/workflows/ci.yml"
+git -C "${D}" add .github/workflows/ci.yml
+git -C "${D}" commit -qm workflow
+snapshot
+echo 'name: edited' > "${D}/.github/workflows/ci.yml"
+echo 'fn main() { fixed(); }' > "${D}/src/main.rs"
+stage
+check "exit ${REFUSED}" "${RC}" "${REFUSED}"
+check "only the source file staged" "$(staged)" "src/main.rs"
+contains "names the workflow" "${OUT}" ".github/workflows/ci.yml"
+
+# An exclude pathspec declines to add a path; it does not remove what
+# is already in the index, and Claude does sometimes stage.
+start "a workflow edit Claude staged itself is actively unstaged"
+setup
+mkdir -p "${D}/.github/workflows"
+echo 'name: x' > "${D}/.github/workflows/ci.yml"
+git -C "${D}" add .github/workflows/ci.yml
+git -C "${D}" commit -qm workflow
+snapshot
+echo 'name: edited' > "${D}/.github/workflows/ci.yml"
+git -C "${D}" add .github/workflows/ci.yml
+stage
+check "exit ${REFUSED}" "${RC}" "${REFUSED}"
+check "unstaged" "$(staged)" ""
+contains "names it" "${OUT}" ".github/workflows/ci.yml"
+
+start "a new workflow file Claude staged itself is unstaged"
+setup
+mkdir -p "${D}/.github/workflows"
+snapshot
+echo 'name: new' > "${D}/.github/workflows/new.yml"
+git -C "${D}" add .github/workflows/new.yml
+stage
+check "exit ${REFUSED}" "${RC}" "${REFUSED}"
+check "unstaged" "$(staged)" ""
+contains "names it" "${OUT}" ".github/workflows/new.yml"
+
+start "--tracked-only stages tracked edits and checks nothing"
+setup
+snapshot
 echo 'fn main() { fixed(); }' > "${D}/src/main.rs"
 echo 'fn t() {}' > "${D}/tests/regression.rs"
-echo x > "${D}/src/main.rs.orig"
-echo x > "${D}/scratch.log"
-stage > /dev/null
-check "fix staged, junk left" "$(staged)" "src/main.rs tests/regression.rs"
-
-start "an untracked symlink under a source root is staged"
-setup
-ln -s main.rs "${D}/src/alias.rs"
-stage > /dev/null
-check "symlink staged" "$(staged)" "src/alias.rs"
-
-start "a directory whose name merely starts with a root is not staged"
-setup
-mkdir -p "${D}/srcfoo" "${D}/testsuite"
-echo x > "${D}/srcfoo/bar.rs"
-echo x > "${D}/testsuite/bar.rs"
-stage > /dev/null
-check "nothing staged" "$(staged)" ""
-
-start "a new nested directory under a source root is staged"
-setup
-mkdir -p "${D}/src/crates/newcrate/src"
-echo 'fn f() {}' > "${D}/src/crates/newcrate/src/lib.rs"
-echo '[package]' > "${D}/src/crates/newcrate/Cargo.toml"
-stage > /dev/null
-check "both new files staged" "$(staged)" \
-    "src/crates/newcrate/Cargo.toml src/crates/newcrate/src/lib.rs"
-
-# The create-PR step runs the stager over a tree the per-attempt call
-# has already staged, so a second run must be a no-op.
-start "running twice is idempotent"
-setup
-echo 'fn main() { fixed(); }' > "${D}/src/main.rs"
-echo 'fn t() {}' > "${D}/tests/regression.rs"
-stage > /dev/null
-FIRST="$(staged)"
-stage > /dev/null
-check "index unchanged by the second run" "$(staged)" "${FIRST}"
-check "and it is the expected set" "${FIRST}" "src/main.rs tests/regression.rs"
-
-start "a path containing a newline is staged"
-setup
-printf 'x' > "${D}/docs/two
-lines.md"
-stage > /dev/null
-# The name itself contains a newline, so count the NUL delimiters
-# rather than lines.
-check "exactly one path staged" \
-    "$(git -C "${D}" diff --cached --name-only -z | tr -cd '\0' | wc -c)" "1"
-
-# --tracked-only is what the create-PR step uses: it runs after the
-# complexity guardrail, so staging a file the guardrail never counted
-# would put it in the PR uncounted.
-start "--tracked-only stages modifications but no new files"
-setup
-echo 'fn main() { fixed(); }' > "${D}/src/main.rs"
-echo 'fn t() {}' > "${D}/tests/regression.rs"
-"${STAGE}" --tracked-only "${D}" > /dev/null
+printf 'x' > "${D}/tests/crash.bin"
+run --tracked-only "${D}"
+check "exit 0" "${RC}" "0"
 check "only the tracked modification" "$(staged)" "src/main.rs"
+lacks "no refusal" "${OUT}" "REFUSED"
 
-start "--tracked-only leaves an already-staged new file alone"
+start "--tracked-only still keeps workflow edits out of the index"
 setup
-echo 'fn t() {}' > "${D}/tests/regression.rs"
-stage > /dev/null
-"${STAGE}" --tracked-only "${D}" > /dev/null
-check "still staged" "$(staged)" "tests/regression.rs"
+mkdir -p "${D}/.github/workflows"
+echo 'name: x' > "${D}/.github/workflows/ci.yml"
+git -C "${D}" add .github/workflows/ci.yml
+git -C "${D}" commit -qm workflow
+echo 'name: edited' > "${D}/.github/workflows/ci.yml"
+git -C "${D}" add .github/workflows/ci.yml
+echo 'fn main() { fixed(); }' > "${D}/src/main.rs"
+run --tracked-only "${D}"
+check "exit 0" "${RC}" "0"
+check "workflow edit unstaged" "$(staged)" "src/main.rs"
+contains "reported" "${OUT}" ".github/workflows/ci.yml"
 
-# REPO_DIR names a work tree, not a root to anchor the source roots at:
-# before this was normalised, `REPO_DIR=src` matched src/tests/ as
-# `^tests/` and reported it under the wrong path.
-start "a REPO_DIR below the top level still anchors at the top level"
-setup
-mkdir -p "${D}/prototypes/src"
-echo x > "${D}/prototypes/src/spike.rs"
-"${STAGE}" "${D}/prototypes" > /dev/null
-check "root-named subdir of REPO_DIR does not qualify" "$(staged)" ""
-# And a path that does qualify is reported repo-relative, not
-# REPO_DIR-relative.
-setup
-mkdir -p "${D}/src/tests"
-echo x > "${D}/src/tests/new.rs"
-OUT="$("${STAGE}" "${D}/src")"
-check "staged under its repo-relative path" "$(staged)" "src/tests/new.rs"
-case "${OUT}" in
-    *"    src/tests/new.rs"*) ok "reported repo-relative" ;;
-    *) fail "reported repo-relative: got '${OUT}'" ;;
-esac
-
-start "a tracked modification is staged from a subdirectory too"
+start "--snapshot records the baseline and stages nothing"
 setup
 echo 'fn main() { fixed(); }' > "${D}/src/main.rs"
-"${STAGE}" "${D}/src" > /dev/null
-check "repo-relative path staged" "$(staged)" "src/main.rs"
+printf 'x' > "${D}/src/core.bin"
+snapshot
+check "exit 0" "${RC}" "0"
+check "nothing staged" "$(staged)" ""
+contains "reports the count" "${OUT}" "as the pre-attempt baseline"
+check "baseline holds the ignored file" \
+    "$(grep -c 'src/core.bin' "${BASE}")" "1"
+
+start "a path with a space is refused by name"
+setup
+snapshot
+echo x > "${D}/docs/image notes.md"
+stage
+check "exit ${REFUSED}" "${RC}" "${REFUSED}"
+contains "names it" "${OUT}" "docs/image notes.md"
 
 start "the zero-argument form both workflows use behaves the same"
 setup
+snapshot
 echo 'fn main() { fixed(); }' > "${D}/src/main.rs"
-echo 'fn t() {}' > "${D}/tests/regression.rs"
-(cd "${D}" && "${STAGE}" > /dev/null)
-check "default REPO_DIR is the cwd" "$(staged)" "src/main.rs tests/regression.rs"
+set +e
+OUT="$(cd "${D}" && "${STAGE}" --baseline "${BASE}" 2>&1)"
+RC=$?
+set -e
+check "exit 0" "${RC}" "0"
+check "default REPO_DIR is the cwd" "$(staged)" "src/main.rs"
 
-start "--tracked-only with no REPO_DIR behaves the same"
+start "a REPO_DIR below the top level works from the top level"
 setup
+snapshot
 echo 'fn main() { fixed(); }' > "${D}/src/main.rs"
-echo 'fn t() {}' > "${D}/tests/regression.rs"
-(cd "${D}" && "${STAGE}" --tracked-only > /dev/null)
-check "flag consumed, cwd used" "$(staged)" "src/main.rs"
+run --baseline "${BASE}" "${D}/src"
+check "exit 0" "${RC}" "0"
+check "repo-relative path staged" "$(staged)" "src/main.rs"
 
 start "argument errors are rejected"
 setup
-set +e
-"${STAGE}" "${D}" extra > /dev/null 2>&1
-check "too many arguments" "$?" "2"
-"${STAGE}" --tracked-only "${D}" extra > /dev/null 2>&1
-check "too many arguments after a flag" "$?" "2"
+run "${D}" extra
+check "too many arguments" "${RC}" "2"
+run --tracked-only "${D}" extra
+check "too many arguments after a flag" "${RC}" "2"
+run --snapshot
+check "--snapshot with no file" "${RC}" "2"
+run --baseline
+check "--baseline with no file" "${RC}" "2"
 # Exit 2 alone does not pin this: an unhandled flag falls through to
-# REPO_DIR and fails the -d test with the same status but a message
-# about a missing directory.
-# One argument, not two: with a REPO_DIR present the arg-count check
-# would print usage anyway, so that form cannot tell the flag case from
-# the fall-through.
-ERR="$("${STAGE}" --nonsense 2>&1 >/dev/null)" || true
-check "unrecognised flag reports usage" \
-    "$(case "${ERR}" in usage:*) echo yes ;; *) echo "no: ${ERR}" ;; esac)" "yes"
-"${STAGE}" --help > /dev/null 2>&1
-check "help exits 0" "$?" "0"
-"${STAGE}" "${WORK}/not-a-repo" > /dev/null 2>&1
-check "missing directory" "$?" "2"
+# REPO_DIR and fails the -d test with the same status. One argument,
+# not two, or the argument-count check prints usage anyway.
+run --nonsense
+check "unrecognised flag" "${RC}" "2"
+contains "reports usage" "${OUT}" "usage:"
+run --help
+check "help exits 0" "${RC}" "0"
+run "${WORK}/not-a-repo"
+check "missing directory" "${RC}" "2"
 mkdir -p "${WORK}/plain-dir"
-"${STAGE}" "${WORK}/plain-dir" > /dev/null 2>&1
-check "not a work tree" "$?" "2"
-set -e
+run "${WORK}/plain-dir"
+check "not a work tree" "${RC}" "2"
 
 if [ "${FAILURES}" -ne 0 ]; then
     echo "${FAILURES} failure(s)" >&2
