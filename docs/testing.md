@@ -1291,8 +1291,9 @@ check -- reads the index rather than the working tree. Between
 downstream of those gates, so 28 issues were attempted, every one
 reported "No changes staged by Claude" with the fix sitting unstaged
 in the working tree, and no PR was ever opened. The same script runs
-in `test-drift-fix.yml`, whose verify step gates its rebuild the same
-way. If an autofix report shows an empty `=== Staged Changes ===`
+in `test-drift-fix.yml`, whose commit step likewise tests the index, so
+a new `docs/image_notes/` entry reaches the commit only because the
+stager staged it. If an autofix report shows an empty `=== Staged Changes ===`
 block, that now means Claude changed nothing -- not that it forgot to
 stage.
 

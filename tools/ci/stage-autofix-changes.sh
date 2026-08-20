@@ -33,7 +33,10 @@
 # the source roots, and editor/merge artifacts (`*~`, `*.orig`, `*.rej`,
 # ...) anywhere. Those are the temp files the original comment was
 # guarding against. They are reported rather than silently dropped, so a
-# failure report shows what was left behind.
+# failure report shows what was left behind, and separately so a reader
+# can tell why a path was left. New files matching a .gitignore rule are
+# reported too, loudly: git hides them from the untracked listing
+# entirely, so before that pass they were dropped without a trace.
 #
 # Usage:
 #   tools/ci/stage-autofix-changes.sh [--tracked-only] [REPO_DIR]
@@ -55,16 +58,23 @@
 
 set -euo pipefail
 
+usage() { echo "usage: $0 [--tracked-only] [REPO_DIR]"; }
+
 TRACKED_ONLY=false
-if [ "${1:-}" = "--tracked-only" ]; then
-    TRACKED_ONLY=true
-    shift
-fi
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --tracked-only) TRACKED_ONLY=true; shift ;;
+        -h|--help) usage; exit 0 ;;
+        --) shift; break ;;
+        -*) usage >&2; exit 2 ;;
+        *) break ;;
+    esac
+done
 
 REPO_DIR="${1:-.}"
 
 if [ "$#" -gt 1 ]; then
-    echo "usage: $0 [--tracked-only] [REPO_DIR]" >&2
+    usage >&2
     exit 2
 fi
 
@@ -100,19 +110,41 @@ ARTIFACT_NAMES='(^|/)(\.#[^/]*|[^/]*~|[^/]*\.(orig|rej|bak|tmp|swp|swo))$'
 git add -u
 
 STAGED_NEW=()
-SKIPPED=()
+SKIPPED_ARTIFACT=()
+SKIPPED_OUTSIDE=()
+IGNORED=()
 
 if [ "${TRACKED_ONLY}" = false ]; then
     while IFS= read -r -d '' FILE; do
         if [[ "${FILE}" =~ ${ARTIFACT_NAMES} ]]; then
-            SKIPPED+=("${FILE}")
+            SKIPPED_ARTIFACT+=("${FILE}")
         elif [[ "${FILE}" =~ ${SOURCE_ROOTS} ]]; then
             git add -- "${FILE}"
             STAGED_NEW+=("${FILE}")
         else
-            SKIPPED+=("${FILE}")
+            SKIPPED_OUTSIDE+=("${FILE}")
         fi
     done < <(git ls-files --others --exclude-standard -z)
+
+    # `--exclude-standard` hides gitignored paths completely, so
+    # without this pass a new file matching an ignore rule is neither
+    # staged nor mentioned. `**/*.bin` is in .gitignore and is exactly
+    # what a fuzz-crash regression fixture would be called, so the
+    # build would go green against a working tree holding the fixture
+    # and then commit a branch without it -- the failure this script
+    # exists to prevent, arrived at silently. Not staged (that would
+    # sweep in build output); reported, so it is visible in the log and
+    # in claude-changes-N.txt. `--directory` collapses whole ignored
+    # trees like src/target/ to one entry, and those are dropped below
+    # so the report stays readable.
+    while IFS= read -r -d '' FILE; do
+        case "${FILE}" in
+            */) continue ;;
+        esac
+        if [[ "${FILE}" =~ ${SOURCE_ROOTS} ]]; then
+            IGNORED+=("${FILE}")
+        fi
+    done < <(git ls-files --others --ignored --exclude-standard --directory -z)
 fi
 
 if [ ${#STAGED_NEW[@]} -gt 0 ]; then
@@ -120,9 +152,19 @@ if [ ${#STAGED_NEW[@]} -gt 0 ]; then
     printf '    %s\n' "${STAGED_NEW[@]}"
 fi
 
-if [ ${#SKIPPED[@]} -gt 0 ]; then
-    echo "Left ${#SKIPPED[@]} untracked file(s) unstaged:"
-    printf '    %s\n' "${SKIPPED[@]}"
+if [ ${#SKIPPED_ARTIFACT[@]} -gt 0 ]; then
+    echo "Left ${#SKIPPED_ARTIFACT[@]} editor or merge artifact(s) unstaged:"
+    printf '    %s\n' "${SKIPPED_ARTIFACT[@]}"
+fi
+
+if [ ${#SKIPPED_OUTSIDE[@]} -gt 0 ]; then
+    echo "Left ${#SKIPPED_OUTSIDE[@]} untracked file(s) outside a source root unstaged:"
+    printf '    %s\n' "${SKIPPED_OUTSIDE[@]}"
+fi
+
+if [ ${#IGNORED[@]} -gt 0 ]; then
+    echo "Ignored by .gitignore, NOT staged, will NOT reach the pull request:"
+    printf '    %s\n' "${IGNORED[@]}"
 fi
 
 if [ -z "$(git diff --cached --name-only)" ]; then

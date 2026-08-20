@@ -127,7 +127,7 @@ echo 'x' > "${D}/prototypes/src/spike.rs"
 OUT="$(stage)"
 check "nothing staged" "$(staged)" ""
 case "${OUT}" in
-    *"Left 3 untracked file(s) unstaged"*) ok "reports what it skipped" ;;
+    *"Left 3 untracked file(s) outside a source root unstaged"*) ok "reports what it skipped" ;;
     *) fail "reports what it skipped: got '${OUT}'" ;;
 esac
 
@@ -143,6 +143,71 @@ echo x > "${D}/src/main.rs.bak"
 echo x > "${D}/src/.#main.rs"
 stage > /dev/null
 check "no artifact staged" "$(staged)" ""
+
+start "the two skip reasons are reported separately"
+setup
+echo 'fn main() { fixed(); }' > "${D}/src/main.rs"
+echo x > "${D}/src/main.rs.orig"
+echo x > "${D}/notes.txt"
+OUT="$(stage)"
+check "only the fix staged" "$(staged)" "src/main.rs"
+case "${OUT}" in
+    *"Left 1 editor or merge artifact(s) unstaged:"*"src/main.rs.orig"*)
+        ok "artifact reported as an artifact" ;;
+    *) fail "artifact reported as an artifact: got '${OUT}'" ;;
+esac
+case "${OUT}" in
+    *"outside a source root unstaged:"*"notes.txt"*)
+        ok "out-of-root file reported separately" ;;
+    *) fail "out-of-root file reported separately: got '${OUT}'" ;;
+esac
+
+# `git ls-files --others --exclude-standard` does not list ignored
+# paths at all, so before the second pass a new fixture matching
+# `**/*.bin` was staged nowhere and reported nowhere -- the build went
+# green against a tree holding it and the commit shipped without it.
+start "a gitignored new file under a source root is reported, not staged"
+setup
+printf 'x' > "${D}/tests/crash.bin"
+OUT="$(stage)"
+check "not staged" "$(staged)" ""
+case "${OUT}" in
+    *"Ignored by .gitignore, NOT staged"*"tests/crash.bin"*)
+        ok "reported loudly" ;;
+    *) fail "reported loudly: got '${OUT}'" ;;
+esac
+
+start "a whole ignored tree collapses to nothing in the report"
+setup
+mkdir -p "${D}/src/target/debug"
+echo x > "${D}/src/target/debug/instar"
+echo x > "${D}/src/target/debug/deps.d"
+OUT="$(stage)"
+check "nothing staged" "$(staged)" ""
+case "${OUT}" in
+    *"Ignored by .gitignore"*) fail "ignored directories should not be listed: got '${OUT}'" ;;
+    *) ok "ignored directory not listed" ;;
+esac
+
+start "an ignored file outside the source roots is not reported"
+setup
+echo x > "${D}/root.bin"
+OUT="$(stage)"
+case "${OUT}" in
+    *"Ignored by .gitignore"*) fail "out-of-root ignored file should not be listed: got '${OUT}'" ;;
+    *) ok "not listed" ;;
+esac
+
+start "--tracked-only does not report ignored files either"
+setup
+printf 'x' > "${D}/tests/crash.bin"
+echo 'fn main() { fixed(); }' > "${D}/src/main.rs"
+OUT="$("${STAGE}" --tracked-only "${D}")"
+check "only the tracked modification" "$(staged)" "src/main.rs"
+case "${OUT}" in
+    *"Ignored by .gitignore"*) fail "tracked-only should not enumerate: got '${OUT}'" ;;
+    *) ok "no untracked enumeration at all" ;;
+esac
 
 start "gitignored build output is not staged"
 setup
@@ -261,6 +326,20 @@ echo 'fn main() { fixed(); }' > "${D}/src/main.rs"
 "${STAGE}" "${D}/src" > /dev/null
 check "repo-relative path staged" "$(staged)" "src/main.rs"
 
+start "the zero-argument form both workflows use behaves the same"
+setup
+echo 'fn main() { fixed(); }' > "${D}/src/main.rs"
+echo 'fn t() {}' > "${D}/tests/regression.rs"
+(cd "${D}" && "${STAGE}" > /dev/null)
+check "default REPO_DIR is the cwd" "$(staged)" "src/main.rs tests/regression.rs"
+
+start "--tracked-only with no REPO_DIR behaves the same"
+setup
+echo 'fn main() { fixed(); }' > "${D}/src/main.rs"
+echo 'fn t() {}' > "${D}/tests/regression.rs"
+(cd "${D}" && "${STAGE}" --tracked-only > /dev/null)
+check "flag consumed, cwd used" "$(staged)" "src/main.rs"
+
 start "argument errors are rejected"
 setup
 set +e
@@ -268,6 +347,17 @@ set +e
 check "too many arguments" "$?" "2"
 "${STAGE}" --tracked-only "${D}" extra > /dev/null 2>&1
 check "too many arguments after a flag" "$?" "2"
+# Exit 2 alone does not pin this: an unhandled flag falls through to
+# REPO_DIR and fails the -d test with the same status but a message
+# about a missing directory.
+# One argument, not two: with a REPO_DIR present the arg-count check
+# would print usage anyway, so that form cannot tell the flag case from
+# the fall-through.
+ERR="$("${STAGE}" --nonsense 2>&1 >/dev/null)" || true
+check "unrecognised flag reports usage" \
+    "$(case "${ERR}" in usage:*) echo yes ;; *) echo "no: ${ERR}" ;; esac)" "yes"
+"${STAGE}" --help > /dev/null 2>&1
+check "help exits 0" "$?" "0"
 "${STAGE}" "${WORK}/not-a-repo" > /dev/null 2>&1
 check "missing directory" "$?" "2"
 mkdir -p "${WORK}/plain-dir"

@@ -424,6 +424,14 @@ jobs:
           # Record start time to find conversation logs created during this run
           start_time=$(date +%s)
 
+          # The stager cannot tell Claude's edits from dirt that
+          # predates the attempt, and here a full `make test-container`
+          # has already run against a read-write mount of the tree.
+          # Record what was already dirty so a staged path can be
+          # attributed.
+          git status --porcelain \
+            > ${GITHUB_WORKSPACE}/pre-attempt-status.txt 2>&1 || true
+
           claude -p "$(cat ${GITHUB_WORKSPACE}/claude-prompt.txt)" \
             --dangerously-skip-permissions \
             --max-turns ${{ inputs.max_turns || '50' }} \
@@ -435,13 +443,17 @@ jobs:
             -exec cp {} ${GITHUB_WORKSPACE}/claude-logs/ \; 2>/dev/null || true
 
           # Stage what Claude changed before anything inspects the
-          # tree. The verify step below gates its rebuild on
-          # `git diff --cached --name-only | grep -q "\.rs$"`, so an
-          # unstaged Rust fix skips the rebuild and `make test-container`
-          # then passes against a stale binary -- reporting a fix as
-          # verified without ever having compiled it. This is the same
-          # defect fuzz-autofix.yml carried for months; see the script.
-          tools/ci/stage-autofix-changes.sh
+          # tree. The Commit step below tests the index, so anything
+          # Claude created rather than modified -- a new
+          # docs/image_notes/<image-id>.md per prompt step 3, a new
+          # test module -- reaches the commit only because this call
+          # stages it. (The conditional `make instar` in the verify
+          # step also reads the index, but nothing rides on that:
+          # `test-container` depends on the .PHONY `instar` target, so
+          # it rebuilds either way.)
+          # Tolerate a failure: the capture below is the only record
+          # of why, and the step runs under `bash -e`.
+          tools/ci/stage-autofix-changes.sh || echo "stager failed with $?"
 
           # Capture git state for debugging failed attempts
           echo "=== Git Status ===" > ${GITHUB_WORKSPACE}/claude-changes.txt
@@ -714,6 +726,7 @@ jobs:
             ${{ github.workspace }}/commit-message.txt
             ${{ github.workspace }}/new-images.txt
             ${{ github.workspace }}/claude-logs/
+            ${{ github.workspace }}/pre-attempt-status.txt
             ${{ github.workspace }}/fs-info.txt
             ${{ github.workspace }}/prior-ci-failures.txt
           retention-days: 14

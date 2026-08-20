@@ -255,6 +255,14 @@ jobs:
 
           start_time=$(date +%s)
 
+          # The stager cannot tell Claude's edits from dirt that
+          # predates the attempt, so record what was already dirty. Not
+          # a gate -- the preceding steps write only to gitignored
+          # paths -- but without it a failure report gives a reader no
+          # way to attribute a staged path.
+          git status --porcelain \
+            > ${GITHUB_WORKSPACE}/pre-attempt-status-1.txt 2>&1 || true
+
           claude -p "$(cat ${GITHUB_WORKSPACE}/autofix-prompt.txt)" \
             --dangerously-skip-permissions \
             --max-turns ${MAX_TURNS} \
@@ -270,8 +278,10 @@ jobs:
           # `git diff --cached`, so an unstaged fix reads as no fix at
           # all. The script holds the rationale and the rules for
           # which untracked files count; it is tested by
-          # tools/ci/test-stage-autofix-changes.sh.
-          tools/ci/stage-autofix-changes.sh
+          # tools/ci/test-stage-autofix-changes.sh. Tolerate a
+          # failure: the capture below is the only record of why, and
+          # the step runs under `bash -e`.
+          tools/ci/stage-autofix-changes.sh || echo "stager failed with $?"
 
           # Capture changes
           echo "=== Git Status ===" > ${GITHUB_WORKSPACE}/claude-changes-1.txt
@@ -501,8 +511,10 @@ jobs:
           # `git diff --cached`, so an unstaged fix reads as no fix at
           # all. The script holds the rationale and the rules for
           # which untracked files count; it is tested by
-          # tools/ci/test-stage-autofix-changes.sh.
-          tools/ci/stage-autofix-changes.sh
+          # tools/ci/test-stage-autofix-changes.sh. Tolerate a
+          # failure: the capture below is the only record of why, and
+          # the step runs under `bash -e`.
+          tools/ci/stage-autofix-changes.sh || echo "stager failed with $?"
 
           echo "=== Git Status ===" > ${GITHUB_WORKSPACE}/claude-changes-2.txt
           git status >> ${GITHUB_WORKSPACE}/claude-changes-2.txt 2>&1
@@ -654,6 +666,12 @@ jobs:
           # it into the PR without it ever having been counted against
           # the 3-file limit or the cross-crate check. New files are
           # handled by the per-attempt calls, upstream of the gates.
+          # `git add -u` still runs, so a tracked file modified between
+          # the complexity check and here -- by the verify build or
+          # test run, both of which mount the tree read-write -- is
+          # committed without the guardrail having counted it. Not new
+          # (the old net was a bare `git add -u`) but newly reachable,
+          # since the flow never got this far before.
           tools/ci/stage-autofix-changes.sh --tracked-only
 
           if [ -z "$(git diff --cached --name-only)" ]; then
@@ -793,6 +811,7 @@ jobs:
             claude-logs/
             autofix-prompt*.txt
             attempt1-diff.txt
+            pre-attempt-status-*.txt
             verify-build-*.txt
             verify-test-*.txt
             commit-summary.txt
