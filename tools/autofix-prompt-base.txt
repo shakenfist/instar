@@ -23,8 +23,12 @@ parsing inside a KVM sandbox. Read AGENTS.md for project context.
    causes a panic or crash.
 4. Implement a fix that addresses the root cause.
 5. Run `pre-commit run --all-files` to validate formatting.
-6. Stage your changes with `git add` (specific files, not -A).
-7. Do NOT commit. Output your commit summary between markers as shown.
+6. Do not stage and do not commit. CI stages for you: every tracked
+   file you modified or deleted, plus any file you created under
+   src/, tests/, docs/, crates/, tools/ or scripts/. A new file
+   outside those directories is left behind and will not reach the
+   pull request, so put new files in one of them.
+7. Output your commit summary between markers as shown.
 
 ## Output format
 

@@ -135,6 +135,9 @@ jobs:
       - name: Test the glibc floor check
         run: tools/ci/test-check-glibc-floor.sh
 
+      - name: Test the autofix stager
+        run: tools/ci/test-stage-autofix-changes.sh
+
   build-and-test:
     needs: check_paths
     if: needs.check_paths.outputs.code_changed != 'false'

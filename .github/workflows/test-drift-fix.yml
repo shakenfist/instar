@@ -297,12 +297,15 @@ jobs:
           4. Add any new images to the test suite
           5. Run `make test` to verify all fixes
           6. Run `pre-commit run --all-files` to check formatting
-          7. Stage all changes with git add (do NOT commit)
+          7. Do not stage and do not commit -- CI stages for you: every
+             tracked file you modified or deleted, plus any file you
+             created under src/, tests/, docs/, crates/, tools/ or
+             scripts/
           8. Output a commit summary (see below)
 
           ## REQUIRED: Commit Summary Output
 
-          After completing your work and staging changes, you MUST output a commit
+          After completing your work, you MUST output a commit
           summary in the following exact format. This will be used as the git commit
           message, so make it descriptive and specific to what you actually changed:
 
@@ -430,6 +433,15 @@ jobs:
           mkdir -p ${GITHUB_WORKSPACE}/claude-logs
           find ~/.claude/projects -name "*.jsonl" -newermt "@${start_time}" \
             -exec cp {} ${GITHUB_WORKSPACE}/claude-logs/ \; 2>/dev/null || true
+
+          # Stage what Claude changed before anything inspects the
+          # tree. The verify step below gates its rebuild on
+          # `git diff --cached --name-only | grep -q "\.rs$"`, so an
+          # unstaged Rust fix skips the rebuild and `make test-container`
+          # then passes against a stale binary -- reporting a fix as
+          # verified without ever having compiled it. This is the same
+          # defect fuzz-autofix.yml carried for months; see the script.
+          tools/ci/stage-autofix-changes.sh
 
           # Capture git state for debugging failed attempts
           echo "=== Git Status ===" > ${GITHUB_WORKSPACE}/claude-changes.txt

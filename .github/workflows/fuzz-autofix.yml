@@ -268,12 +268,10 @@ jobs:
           # Stage what Claude changed before anything inspects the
           # tree. The complexity and verification steps below read
           # `git diff --cached`, so an unstaged fix reads as no fix at
-          # all: every attempt before this was added reported "No
-          # changes staged by Claude" and the issue was labelled
-          # autofix-failed with a real edit sitting in the working
-          # tree. `-u` stages tracked modifications only, so temp
-          # files and editor artifacts stay out.
-          git add -u
+          # all. The script holds the rationale and the rules for
+          # which untracked files count; it is tested by
+          # tools/ci/test-stage-autofix-changes.sh.
+          tools/ci/stage-autofix-changes.sh
 
           # Capture changes
           echo "=== Git Status ===" > ${GITHUB_WORKSPACE}/claude-changes-1.txt
@@ -356,7 +354,7 @@ jobs:
 
           # Check if there are any staged changes at all
           if [ -z "$(git diff --cached --name-only)" ]; then
-            echo "No changes staged by Claude"
+            echo "Claude modified no tracked file and created no new source file"
             echo "fix_succeeded=false" >> $GITHUB_OUTPUT
             exit 0
           fi
@@ -407,7 +405,7 @@ jobs:
           elif [ "$FAILURE_REASON" = "tests" ]; then
             FAILURE_OUTPUT=$(tail -50 ${GITHUB_WORKSPACE}/verify-test-1.txt)
           else
-            FAILURE_OUTPUT="Claude did not stage any changes."
+            FAILURE_OUTPUT="The previous attempt changed no files at all."
           fi
 
           # Reset to clean state
@@ -439,7 +437,7 @@ jobs:
               tail -50 ${GITHUB_WORKSPACE}/verify-test-1.txt 2>/dev/null \
                 | sed 's/^/    /' || true
             else
-              echo "    Claude did not stage any changes."
+              echo "    The previous attempt changed no files at all."
             fi
             echo ""
             echo "Try a DIFFERENT approach. Do not repeat the same fix."
@@ -501,12 +499,10 @@ jobs:
           # Stage what Claude changed before anything inspects the
           # tree. The complexity and verification steps below read
           # `git diff --cached`, so an unstaged fix reads as no fix at
-          # all: every attempt before this was added reported "No
-          # changes staged by Claude" and the issue was labelled
-          # autofix-failed with a real edit sitting in the working
-          # tree. `-u` stages tracked modifications only, so temp
-          # files and editor artifacts stay out.
-          git add -u
+          # all. The script holds the rationale and the rules for
+          # which untracked files count; it is tested by
+          # tools/ci/test-stage-autofix-changes.sh.
+          tools/ci/stage-autofix-changes.sh
 
           echo "=== Git Status ===" > ${GITHUB_WORKSPACE}/claude-changes-2.txt
           git status >> ${GITHUB_WORKSPACE}/claude-changes-2.txt 2>&1
@@ -579,7 +575,7 @@ jobs:
           cd ${GITHUB_WORKSPACE}/instar
 
           if [ -z "$(git diff --cached --name-only)" ]; then
-            echo "No changes staged by Claude"
+            echo "Claude modified no tracked file and created no new source file"
             echo "fix_succeeded=false" >> $GITHUB_OUTPUT
             exit 0
           fi
@@ -652,10 +648,8 @@ jobs:
           cd ${GITHUB_WORKSPACE}/instar
 
           # Already staged after each Claude attempt; repeated here so
-          # this step does not depend on that having happened. Tracked
-          # modifications only (not -A, which would pick up temp files
-          # or editor artifacts).
-          git add -u
+          # this step does not depend on that having happened.
+          tools/ci/stage-autofix-changes.sh
 
           if [ -z "$(git diff --cached --name-only)" ]; then
             echo "No changes staged"

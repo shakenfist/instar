@@ -1279,6 +1279,21 @@ per issue; failed issues are labelled `autofix-failed` for human
 attention. Complexity guardrails prevent runaway fixes (max 3 files,
 no cross-crate changes, no new dependencies).
 
+CI stages Claude's work, not Claude: `tools/ci/stage-autofix-changes.sh`
+runs immediately after each attempt and stages every tracked
+modification plus any new file under a source root, leaving editor and
+merge artifacts behind. That matters because every gate downstream --
+the complexity count, the rebuild decision, the "did anything change"
+check -- reads the index rather than the working tree. Between
+2026-04 and 2026-08 the staging ran only in the create-PR step,
+downstream of those gates, so 28 issues were attempted, every one
+reported "No changes staged by Claude" with the fix sitting unstaged
+in the working tree, and no PR was ever opened. The same script runs
+in `test-drift-fix.yml`, whose verify step gates its rebuild the same
+way. If an autofix report shows an empty `=== Staged Changes ===`
+block, that now means Claude changed nothing -- not that it forgot to
+stage.
+
 ## Related Documentation
 
 - [Format Coverage](format-coverage.md) - Comparison with oslo.utils format_inspector
