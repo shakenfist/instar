@@ -1281,8 +1281,10 @@ no cross-crate changes, no new dependencies).
 
 CI stages Claude's work, not Claude: `tools/ci/stage-autofix-changes.sh`
 runs immediately after each attempt and stages every tracked
-modification plus any new file under a source root, leaving editor and
-merge artifacts behind. That matters because every gate downstream --
+modification plus any new file under `src/`, `tests/`, `docs/`,
+`crates/`, `tools/` or `scripts/`, leaving editor and merge artifacts
+behind. A new file anywhere else is reported and left unstaged, so it
+never reaches the pull request. That matters because every gate downstream --
 the complexity count, the rebuild decision, the "did anything change"
 check -- reads the index rather than the working tree. Between
 2026-04 and 2026-08 the staging ran only in the create-PR step,

@@ -36,19 +36,35 @@
 # failure report shows what was left behind.
 #
 # Usage:
-#   tools/ci/stage-autofix-changes.sh [REPO_DIR]
+#   tools/ci/stage-autofix-changes.sh [--tracked-only] [REPO_DIR]
 #
-# REPO_DIR defaults to the current directory. Always exits 0 on a
-# well-formed tree, including a tree with nothing to stage: "Claude
-# changed nothing" is a state the caller decides about, not an error
-# here.
+# --tracked-only stages tracked modifications and nothing else. It is
+# for call sites downstream of the complexity guardrail: staging a new
+# file there would commit it into the PR without it ever having been
+# counted against the 3-file limit or the cross-crate check. The
+# per-attempt call sites run upstream of those gates and take the full
+# behaviour.
+#
+# REPO_DIR defaults to the current directory; the script then works from
+# the top level of whatever work tree it names, so the source roots mean
+# the same thing whichever subdirectory a caller happens to be in.
+#
+# Always exits 0 on a well-formed tree, including a tree with nothing to
+# stage: "Claude changed nothing" is a state the caller decides about,
+# not an error here.
 
 set -euo pipefail
+
+TRACKED_ONLY=false
+if [ "${1:-}" = "--tracked-only" ]; then
+    TRACKED_ONLY=true
+    shift
+fi
 
 REPO_DIR="${1:-.}"
 
 if [ "$#" -gt 1 ]; then
-    echo "usage: $0 [REPO_DIR]" >&2
+    echo "usage: $0 [--tracked-only] [REPO_DIR]" >&2
     exit 2
 fi
 
@@ -63,6 +79,12 @@ if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     echo "stage-autofix-changes: ${REPO_DIR} is not a git work tree" >&2
     exit 2
 fi
+
+# `git add -u` is repo-wide but `git ls-files --others` prints paths
+# relative to the cwd, so without this the source roots would anchor at
+# REPO_DIR while the staging did not -- two different notions of "root"
+# in one run, and `REPO_DIR=src` would match src/tests/ as `^tests/`.
+cd "$(git rev-parse --show-toplevel)"
 
 # Directories a fix is allowed to create files in. Anchored at the repo
 # root, so a stray `report.md` at the top level is not swept up.
@@ -80,16 +102,18 @@ git add -u
 STAGED_NEW=()
 SKIPPED=()
 
-while IFS= read -r -d '' FILE; do
-    if [[ "${FILE}" =~ ${ARTIFACT_NAMES} ]]; then
-        SKIPPED+=("${FILE}")
-    elif [[ "${FILE}" =~ ${SOURCE_ROOTS} ]]; then
-        git add -- "${FILE}"
-        STAGED_NEW+=("${FILE}")
-    else
-        SKIPPED+=("${FILE}")
-    fi
-done < <(git ls-files --others --exclude-standard -z)
+if [ "${TRACKED_ONLY}" = false ]; then
+    while IFS= read -r -d '' FILE; do
+        if [[ "${FILE}" =~ ${ARTIFACT_NAMES} ]]; then
+            SKIPPED+=("${FILE}")
+        elif [[ "${FILE}" =~ ${SOURCE_ROOTS} ]]; then
+            git add -- "${FILE}"
+            STAGED_NEW+=("${FILE}")
+        else
+            SKIPPED+=("${FILE}")
+        fi
+    done < <(git ls-files --others --exclude-standard -z)
+fi
 
 if [ ${#STAGED_NEW[@]} -gt 0 ]; then
     echo "Staged ${#STAGED_NEW[@]} newly created file(s):"

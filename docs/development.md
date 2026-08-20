@@ -783,3 +783,5 @@ step -- see "Self-hosted runners and Docker" in `docs/development.md`.
 - `tools/ci/test-report-fuzz-crash.sh`, `tools/ci/test-pick-fuzz-artifact.sh` - Tests for those two; run them after any change (the `ci-tooling` CI job does)
 - `tools/ci/check-glibc-floor.sh` - Fails if the built `instar` binary needs a glibc above the published floor (`GLIBC_2.31`, Debian 11; see `docs/installation.md`). Runs immediately after `make instar` in both `build-and-test` and the release workflow. Do not raise the ceiling to make it pass: it means the release image's base moved, and `src/.devcontainer/build/Dockerfile` must stay on `debian:bullseye`
 - `tools/ci/test-check-glibc-floor.sh` - Tests for that check; the `ci-tooling` CI job runs it
+- `tools/ci/stage-autofix-changes.sh` - Stages what a Claude Code autofix run left in the working tree, before the steps that judge whether a fix exists read the index. Called from `fuzz-autofix.yml` and `test-drift-fix.yml`; see "Automated bug fixes" in `docs/testing.md`
+- `tools/ci/test-stage-autofix-changes.sh` - Tests for that stager; the `ci-tooling` CI job runs it

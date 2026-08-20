@@ -649,7 +649,12 @@ jobs:
 
           # Already staged after each Claude attempt; repeated here so
           # this step does not depend on that having happened.
-          tools/ci/stage-autofix-changes.sh
+          # --tracked-only because this runs downstream of the
+          # complexity guardrail: staging a new file here would commit
+          # it into the PR without it ever having been counted against
+          # the 3-file limit or the cross-crate check. New files are
+          # handled by the per-attempt calls, upstream of the gates.
+          tools/ci/stage-autofix-changes.sh --tracked-only
 
           if [ -z "$(git diff --cached --name-only)" ]; then
             echo "No changes staged"

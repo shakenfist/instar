@@ -517,8 +517,18 @@ jobs:
         run: |
           cd ${GITHUB_WORKSPACE}/instar
 
-          if [ -n "$(git status --porcelain)" ]; then
-            git add -A
+          # Already staged after the Claude attempt; repeated here so
+          # this step does not depend on that having happened.
+          # --tracked-only for the same reason fuzz-autofix.yml uses it:
+          # this is downstream of the verify step. Not `git add -A`,
+          # which would sweep back in exactly the editor and merge
+          # artifacts the stager deliberately left behind and make the
+          # contract the prompt states false. The test is on the index,
+          # not the work tree -- `git status --porcelain` is non-empty
+          # when the only thing present is that skipped junk.
+          tools/ci/stage-autofix-changes.sh --tracked-only
+
+          if [ -n "$(git diff --cached --name-only)" ]; then
 
             # Use Claude's commit summary if available, otherwise use fallback
             if [ "${{ steps.extract_summary.outputs.summary_found }}" == "true" ] && \

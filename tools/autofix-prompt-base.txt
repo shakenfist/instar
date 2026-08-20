@@ -13,6 +13,11 @@ parsing inside a KVM sandbox. Read AGENTS.md for project context.
 - Do NOT add new crate dependencies or feature flags.
 - Keep changes minimal. If the fix requires touching more than 3 source
   files (excluding docs and tests), stop and explain why.
+- Prefer a Rust unit test inside an existing `src/` file over a new
+  integration test module. A new `tests/test_*.py` must also be claimed
+  by a pull-request job in `.github/workflows/functional-tests.yml` or
+  by the allowlist in `tools/ci/check-test-partition.py`, or
+  `tools/ci/check-test-partition.sh` fails the resulting PR.
 
 ## Your task
 
