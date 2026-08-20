@@ -262,12 +262,20 @@ jobs:
           # refuse every run. The porcelain status is for a human
           # reading a failure report gets the tracked side from the
           # `=== Git Status ===` block already in claude-changes-N.txt.
-          # One baseline for the whole run. Attempt 2 reuses it on
-          # purpose: Prepare retry's `git clean -fd` has no -x, so an
-          # ignored file attempt 1 created survives into attempt 2.
-          # Judged against the pre-run baseline it is still new, so
-          # attempt 2 is refused for it instead of building green
-          # against a file its commit would omit.
+          # actions/checkout uses `path: instar`, so it cleans only
+          # the checkout -- everything written at the workspace root
+          # survives into the next scheduled run on this self-hosted
+          # runner. A stale rc of 3 would refuse a fresh attempt and
+          # report the previous run's files into the issue comment.
+          rm -f ${GITHUB_WORKSPACE}/stager-*.txt \
+                ${GITHUB_WORKSPACE}/pre-run-ignored.txt \
+                ${GITHUB_WORKSPACE}/pre-retry-ignored.txt
+
+          # Attempt 2 takes its own baseline in Prepare retry, once
+          # the tree has been reset and attempt 1's refused files
+          # deleted -- otherwise it would be judged against a snapshot
+          # taken before the verify build and test run, and refused for
+          # their output rather than for anything Claude did.
           tools/ci/stage-autofix-changes.sh \
             --snapshot ${GITHUB_WORKSPACE}/pre-run-ignored.txt
 
@@ -471,6 +479,16 @@ jobs:
             done < ${GITHUB_WORKSPACE}/stager-refused-1.txt
           fi
 
+          # Baseline for attempt 2, taken here rather than reused from
+          # before attempt 1: the tree now holds whatever the verify
+          # build and test run wrote, and nothing attempt 1 created --
+          # `git clean -fd` took the untracked files and the loop above
+          # took the ignored ones. CI_OUTPUT_DIRS covers the build
+          # output known today, but it is a denylist, and this keeps
+          # attempt 2 from depending on it being complete.
+          tools/ci/stage-autofix-changes.sh \
+            --snapshot ${GITHUB_WORKSPACE}/pre-retry-ignored.txt
+
           # Shared prompt template (same as attempt 1)
           cd ${GITHUB_WORKSPACE}/instar
           cp tools/autofix-prompt-base.txt ${GITHUB_WORKSPACE}/autofix-prompt-2.txt
@@ -566,7 +584,7 @@ jobs:
           # tools/ci/test-stage-autofix-changes.sh.
           set +e
           tools/ci/stage-autofix-changes.sh \
-            --baseline ${GITHUB_WORKSPACE}/pre-run-ignored.txt \
+            --baseline ${GITHUB_WORKSPACE}/pre-retry-ignored.txt \
             --refused-file ${GITHUB_WORKSPACE}/stager-refused-2.txt \
             > ${GITHUB_WORKSPACE}/stager-2.txt 2>&1
           echo "$?" > ${GITHUB_WORKSPACE}/stager-rc-2.txt
@@ -902,6 +920,7 @@ jobs:
             autofix-prompt*.txt
             attempt1-diff.txt
             pre-run-ignored.txt
+            pre-retry-ignored.txt
             stager-*.txt
             stager-refused-*.txt
             verify-build-*.txt

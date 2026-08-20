@@ -298,6 +298,39 @@ stage
 check "exit ${REFUSED}" "${RC}" "${REFUSED}"
 check "unstaged" "$(staged)" ""
 contains "names it" "${OUT}" ".github/workflows/new.yml"
+# The reset turns it untracked, so without a guard it is named twice
+# under two different reasons.
+check "named once, not twice" \
+    "$(echo "${OUT}" | grep -c 'workflows/new.yml')" "1"
+
+# `git ls-files --others` does not list a path already in the index,
+# so without reading the index too, whether a new file is refused
+# depends on whether Claude happened to run `git add`.
+start "a new file Claude staged itself is still refused"
+setup
+snapshot
+echo 'fn newmod() {}' > "${D}/src/newmod.rs"
+git -C "${D}" add src/newmod.rs
+echo 'fn main() { fixed(); }' > "${D}/src/main.rs"
+stage
+check "exit ${REFUSED}" "${RC}" "${REFUSED}"
+contains "names it" "${OUT}" "src/newmod.rs"
+
+# core.quotePath is on by default and octal-escapes non-ASCII paths in
+# the newline-separated listing. The quoted form goes into
+# --refused-file, and the retry's `rm -rf` then matches nothing, so the
+# file survives and refuses attempt 2 unconditionally.
+start "a non-ASCII ignored path is recorded verbatim, not octal-escaped"
+setup
+snapshot
+printf 'x' > "${D}/tests/crash""$(printf '\303\251')"".bin"
+run --baseline "${BASE}" --refused-file "${WORK}/refused3.txt" "${D}"
+check "exit ${REFUSED}" "${RC}" "${REFUSED}"
+# Testing that the recorded path resolves is the property that
+# matters: an octal-escaped, quoted name does not name a real file, so
+# the retry's `rm -rf` would match nothing.
+check "the recorded path exists" \
+    "$([ -e "${D}/$(cat "${WORK}/refused3.txt")" ] && echo yes || echo no)" "yes"
 
 start "--tracked-only stages tracked edits and checks nothing"
 setup

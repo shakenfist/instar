@@ -80,7 +80,8 @@
 #       the verify build has since written to the tree.
 #
 # REPO_DIR defaults to the current directory; the script works from the
-# top level of whatever work tree it names.
+# top level of whatever work tree it names. The FILE arguments are
+# resolved after that chdir, so pass absolute paths.
 #
 # Exit codes: 0 staged (or nothing to stage), 2 usage error, 3 refused.
 
@@ -149,7 +150,15 @@ cd "$(git rev-parse --show-toplevel)"
 # one line rather than thousands. Used for both the snapshot and the
 # comparison, so the two are always in the same shape.
 list_ignored() {
-    git ls-files --others --ignored --exclude-standard --directory \
+    # -c core.quotePath=false: the listing has to be newline
+    # separated so `comm` can diff it against the baseline, which means
+    # git would otherwise octal-escape and quote any non-ASCII path.
+    # That quoted string ends up in --refused-file, and the retry's
+    # `rm -rf` then matches nothing, so the file survives and refuses
+    # attempt 2 unconditionally -- the failure the deletion exists to
+    # prevent.
+    git -c core.quotePath=false \
+        ls-files --others --ignored --exclude-standard --directory \
         | LC_ALL=C sort
 }
 
@@ -176,6 +185,20 @@ ARTIFACT_NAMES='(^|/)(\.#[^/]*|[^/]*~|[^/]*\.(orig|rej|bak|tmp|swp|swo))$'
 # which new files are worth keeping.
 CI_OUTPUT_DIRS='(^|/)(\.stestr|__pycache__|target|\.cargo-cache|fuzz-logs|\.venv)/'
 
+# Read before `git add -u` so this reflects what Claude staged, not
+# what this script is about to stage. `git ls-files --others` does not
+# list a path that is already in the index, so without this a new file
+# Claude ran `git add` on would reach a pull request without the human
+# look the refusal exists to force -- and the whole point of this
+# script is not to depend on Claude following the prompt.
+CLAUDE_ADDED=()
+while IFS= read -r -d '' FILE; do
+    case "${FILE}" in
+        .github/workflows/*) continue ;;
+    esac
+    CLAUDE_ADDED+=("${FILE}")
+done < <(git diff --cached --name-only -z --diff-filter=A)
+
 WORKFLOW_CHANGES=()
 while IFS= read -r -d '' FILE; do
     WORKFLOW_CHANGES+=("${FILE}")
@@ -197,9 +220,15 @@ if [ "${MODE}" = tracked-only ]; then
     exit 0
 fi
 
-UNTRACKED=()
+UNTRACKED=("${CLAUDE_ADDED[@]}")
 ARTIFACTS=()
 while IFS= read -r -d '' FILE; do
+    case "${FILE}" in
+        # Already reported under its own heading, and the reset above
+        # turned a staged new workflow file into an untracked one, so
+        # without this it is named twice for two different reasons.
+        .github/workflows/*) continue ;;
+    esac
     if [[ "${FILE}" =~ ${ARTIFACT_NAMES} ]]; then
         ARTIFACTS+=("${FILE}")
     else
