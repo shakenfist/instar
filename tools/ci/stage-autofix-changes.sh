@@ -152,11 +152,15 @@ cd "$(git rev-parse --show-toplevel)"
 list_ignored() {
     # -c core.quotePath=false: the listing has to be newline
     # separated so `comm` can diff it against the baseline, which means
-    # git would otherwise octal-escape and quote any non-ASCII path.
-    # That quoted string ends up in --refused-file, and the retry's
-    # `rm -rf` then matches nothing, so the file survives and refuses
-    # attempt 2 unconditionally -- the failure the deletion exists to
-    # prevent.
+    # git would otherwise octal-escape and quote any path with
+    # non-ASCII bytes. That quoted string ends up in --refused-file,
+    # and the retry's `rm -rf` then matches nothing, so the file
+    # survives and refuses attempt 2 unconditionally -- the failure the
+    # deletion exists to prevent. It fixes the non-ASCII case only:
+    # git still C-quotes a path containing a newline, tab or double
+    # quote, and one of those would round-trip the same broken way.
+    # Making that safe means a NUL-separated comparison rather than
+    # `comm`, which is more than the case is worth here.
     git -c core.quotePath=false \
         ls-files --others --ignored --exclude-standard --directory \
         | LC_ALL=C sort
@@ -185,6 +189,16 @@ ARTIFACT_NAMES='(^|/)(\.#[^/]*|[^/]*~|[^/]*\.(orig|rej|bak|tmp|swp|swo))$'
 # which new files are worth keeping.
 CI_OUTPUT_DIRS='(^|/)(\.stestr|__pycache__|target|\.cargo-cache|fuzz-logs|\.venv)/'
 
+# The same idea by filename, because .gitignore hides by pattern too.
+# `**/Cargo.lock` is the one that bites: any cargo invocation in a
+# workspace directory nothing built before the baseline creates one.
+# A refusal that fires on every run is not the cheap failure the
+# header argues for -- it is this workflow's original failure again,
+# every issue labelled autofix-failed and looking like a hard bug.
+CI_OUTPUT_NAMES='(^|/)(Cargo\.lock|\.DS_Store|[^/]*\.py[cod])$'
+
+declare -A REPORTED_WORKFLOW=()
+
 # Read before `git add -u` so this reflects what Claude staged, not
 # what this script is about to stage. `git ls-files --others` does not
 # list a path that is already in the index, so without this a new file
@@ -208,6 +222,9 @@ done < <(git diff HEAD --name-only -z -- '.github/workflows/')
 # and an exclude pathspec does not remove what is in the index.
 if [ ${#WORKFLOW_CHANGES[@]} -gt 0 ]; then
     git reset -q HEAD -- '.github/workflows/' 2>/dev/null || true
+    for WF in "${WORKFLOW_CHANGES[@]}"; do
+        REPORTED_WORKFLOW["${WF}"]=1
+    done
 fi
 
 git add -u -- . ':(exclude).github/workflows/'
@@ -223,12 +240,16 @@ fi
 UNTRACKED=("${CLAUDE_ADDED[@]}")
 ARTIFACTS=()
 while IFS= read -r -d '' FILE; do
-    case "${FILE}" in
-        # Already reported under its own heading, and the reset above
-        # turned a staged new workflow file into an untracked one, so
-        # without this it is named twice for two different reasons.
-        .github/workflows/*) continue ;;
-    esac
+    # Skip only what the workflow heading actually named. The reset
+    # above turns a staged new workflow file untracked, so a blanket
+    # skip would stop it being named twice -- but it would also hide a
+    # workflow file the attempt created and never staged, which
+    # `git diff HEAD` cannot see either. That one exits 0 and is
+    # dropped from the commit, which is the outcome this whole script
+    # exists to prevent.
+    if [ -n "${REPORTED_WORKFLOW["${FILE}"]:-}" ]; then
+        continue
+    fi
     if [[ "${FILE}" =~ ${ARTIFACT_NAMES} ]]; then
         ARTIFACTS+=("${FILE}")
     else
@@ -241,7 +262,8 @@ if [ -n "${BASELINE}" ] && [ -f "${BASELINE}" ]; then
     while IFS= read -r FILE; do
         [ -n "${FILE}" ] || continue
         if [[ "${FILE}" =~ ${ARTIFACT_NAMES} ]] \
-            || [[ "${FILE}" =~ ${CI_OUTPUT_DIRS} ]]; then
+            || [[ "${FILE}" =~ ${CI_OUTPUT_DIRS} ]] \
+            || [[ "${FILE}" =~ ${CI_OUTPUT_NAMES} ]]; then
             ARTIFACTS+=("${FILE}")
         else
             NEW_IGNORED+=("${FILE}")

@@ -259,9 +259,10 @@ jobs:
           # stager needs the ignored listing to tell a fixture Claude
           # created from build output that was already there --
           # .gitignore hides both, and refusing on the latter would
-          # refuse every run. The porcelain status is for a human
-          # reading a failure report gets the tracked side from the
-          # `=== Git Status ===` block already in claude-changes-N.txt.
+          # refuse every run. Only the ignored listing is snapshotted:
+          # a human reading a failure report gets the tracked side from
+          # the `=== Git Status ===` block already in
+          # claude-changes-N.txt.
           # actions/checkout uses `path: instar`, so it cleans only
           # the checkout -- everything written at the workspace root
           # survives into the next scheduled run on this self-hosted
@@ -332,7 +333,20 @@ jobs:
           # autofix-complex and stop the run, so the real reason -- a
           # file that cannot reach the pull request -- would reach
           # neither the retry prompt nor the human.
-          if [ "$(cat ${GITHUB_WORKSPACE}/stager-rc-1.txt 2>/dev/null || echo 0)" = "3" ]; then
+          STAGER_RC=$(cat ${GITHUB_WORKSPACE}/stager-rc-1.txt 2>/dev/null || echo 0)
+          # Anything other than 0 or 3 is a usage error -- a mistyped
+          # flag, a REPO_DIR that is not a work tree. The index is then
+          # empty, which reads downstream as "Claude changed nothing"
+          # and labels the issue autofix-failed: a wiring bug wearing
+          # the costume of a Claude failure, which is the exact
+          # misattribution this workflow spent four months inside.
+          if [ "${STAGER_RC}" != "0" ] && [ "${STAGER_RC}" != "3" ]; then
+            echo "Stager failed with ${STAGER_RC}; this is a workflow bug, not a fix failure"
+            cat ${GITHUB_WORKSPACE}/stager-1.txt || true
+            exit 1
+          fi
+
+          if [ "${STAGER_RC}" = "3" ]; then
             echo "Stager refused the attempt; leaving the verdict to the verify step"
             echo "changed_files=0" >> $GITHUB_OUTPUT
             echo "too_complex=false" >> $GITHUB_OUTPUT
@@ -408,7 +422,20 @@ jobs:
           # fixture .gitignore hides, a workflow edit that could not be
           # pushed. The tree it built against is not the tree the
           # commit would contain, so verifying it would prove nothing.
-          if [ "$(cat ${GITHUB_WORKSPACE}/stager-rc-1.txt 2>/dev/null || echo 0)" = "3" ]; then
+          STAGER_RC=$(cat ${GITHUB_WORKSPACE}/stager-rc-1.txt 2>/dev/null || echo 0)
+          # Anything other than 0 or 3 is a usage error -- a mistyped
+          # flag, a REPO_DIR that is not a work tree. The index is then
+          # empty, which reads downstream as "Claude changed nothing"
+          # and labels the issue autofix-failed: a wiring bug wearing
+          # the costume of a Claude failure, which is the exact
+          # misattribution this workflow spent four months inside.
+          if [ "${STAGER_RC}" != "0" ] && [ "${STAGER_RC}" != "3" ]; then
+            echo "Stager failed with ${STAGER_RC}; this is a workflow bug, not a fix failure"
+            cat ${GITHUB_WORKSPACE}/stager-1.txt || true
+            exit 1
+          fi
+
+          if [ "${STAGER_RC}" = "3" ]; then
             echo "Refused: the attempt created files that cannot reach the pull request"
             cat ${GITHUB_WORKSPACE}/stager-1.txt || true
             echo "fix_succeeded=false" >> $GITHUB_OUTPUT
@@ -617,7 +644,20 @@ jobs:
           # autofix-complex and stop the run, so the real reason -- a
           # file that cannot reach the pull request -- would reach
           # neither the retry prompt nor the human.
-          if [ "$(cat ${GITHUB_WORKSPACE}/stager-rc-2.txt 2>/dev/null || echo 0)" = "3" ]; then
+          STAGER_RC=$(cat ${GITHUB_WORKSPACE}/stager-rc-2.txt 2>/dev/null || echo 0)
+          # Anything other than 0 or 3 is a usage error -- a mistyped
+          # flag, a REPO_DIR that is not a work tree. The index is then
+          # empty, which reads downstream as "Claude changed nothing"
+          # and labels the issue autofix-failed: a wiring bug wearing
+          # the costume of a Claude failure, which is the exact
+          # misattribution this workflow spent four months inside.
+          if [ "${STAGER_RC}" != "0" ] && [ "${STAGER_RC}" != "3" ]; then
+            echo "Stager failed with ${STAGER_RC}; this is a workflow bug, not a fix failure"
+            cat ${GITHUB_WORKSPACE}/stager-2.txt || true
+            exit 1
+          fi
+
+          if [ "${STAGER_RC}" = "3" ]; then
             echo "Stager refused the attempt; leaving the verdict to the verify step"
             echo "changed_files=0" >> $GITHUB_OUTPUT
             echo "too_complex=false" >> $GITHUB_OUTPUT
@@ -685,7 +725,20 @@ jobs:
           # fixture .gitignore hides, a workflow edit that could not be
           # pushed. The tree it built against is not the tree the
           # commit would contain, so verifying it would prove nothing.
-          if [ "$(cat ${GITHUB_WORKSPACE}/stager-rc-2.txt 2>/dev/null || echo 0)" = "3" ]; then
+          STAGER_RC=$(cat ${GITHUB_WORKSPACE}/stager-rc-2.txt 2>/dev/null || echo 0)
+          # Anything other than 0 or 3 is a usage error -- a mistyped
+          # flag, a REPO_DIR that is not a work tree. The index is then
+          # empty, which reads downstream as "Claude changed nothing"
+          # and labels the issue autofix-failed: a wiring bug wearing
+          # the costume of a Claude failure, which is the exact
+          # misattribution this workflow spent four months inside.
+          if [ "${STAGER_RC}" != "0" ] && [ "${STAGER_RC}" != "3" ]; then
+            echo "Stager failed with ${STAGER_RC}; this is a workflow bug, not a fix failure"
+            cat ${GITHUB_WORKSPACE}/stager-2.txt || true
+            exit 1
+          fi
+
+          if [ "${STAGER_RC}" = "3" ]; then
             echo "Refused: the attempt created files that cannot reach the pull request"
             cat ${GITHUB_WORKSPACE}/stager-2.txt || true
             echo "fix_succeeded=false" >> $GITHUB_OUTPUT
@@ -922,7 +975,6 @@ jobs:
             pre-run-ignored.txt
             pre-retry-ignored.txt
             stager-*.txt
-            stager-refused-*.txt
             verify-build-*.txt
             verify-test-*.txt
             commit-summary.txt

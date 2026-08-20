@@ -332,6 +332,45 @@ check "exit ${REFUSED}" "${RC}" "${REFUSED}"
 check "the recorded path exists" \
     "$([ -e "${D}/$(cat "${WORK}/refused3.txt")" ] && echo yes || echo no)" "yes"
 
+# `git diff HEAD` cannot see an untracked file, so a blanket skip of
+# .github/workflows/ in the untracked loop hid a workflow file the
+# attempt created and never staged: exit 0, and the commit drops it.
+start "a new workflow file the attempt did not stage is still refused"
+setup
+mkdir -p "${D}/.github/workflows"
+echo 'name: keep' > "${D}/.github/workflows/keep.yml"
+git -C "${D}" add .github/workflows/keep.yml
+git -C "${D}" commit -qm workflow
+snapshot
+echo 'name: sneaky' > "${D}/.github/workflows/new.yml"
+echo 'fn main() { fixed(); }' > "${D}/src/main.rs"
+stage
+check "exit ${REFUSED}" "${RC}" "${REFUSED}"
+contains "names it" "${OUT}" ".github/workflows/new.yml"
+
+# .gitignore hides by filename as well as by directory, and a cargo
+# invocation in a workspace nothing built before the baseline creates
+# a Cargo.lock. A refusal that fires on every run is this workflow's
+# original failure again.
+start "gitignored build byproducts by filename do not refuse"
+setup
+printf '**/target/\n**/*.bin\n*.swp\n**/Cargo.lock\n' > "${D}/.gitignore"
+git -C "${D}" add .gitignore
+git -C "${D}" commit -qm ignorelock
+# A tracked file so the directory does not collapse -- src/fuzz/ in
+# the real repo holds the fuzz targets.
+mkdir -p "${D}/src/fuzz"
+echo 'fn fuzz() {}' > "${D}/src/fuzz/target_a.rs"
+git -C "${D}" add src/fuzz/target_a.rs
+git -C "${D}" commit -qm fuzztarget
+snapshot
+echo '[[package]]' > "${D}/src/fuzz/Cargo.lock"
+echo 'fn main() { fixed(); }' > "${D}/src/main.rs"
+stage
+check "exit 0" "${RC}" "0"
+check "the fix is staged" "$(staged)" "src/main.rs"
+lacks "not refused" "${OUT}" "REFUSED"
+
 start "--tracked-only stages tracked edits and checks nothing"
 setup
 snapshot

@@ -1307,11 +1307,15 @@ records an earlier revision that tried the classification and the
 sequence of defects it produced.
 
 Telling a file the attempt created from build output that was already
-there needs a before picture, so the workflow snapshots the ignored
-paths once before attempt 1 (`pre-run-ignored.txt`) and judges both
-attempts against it -- `Prepare retry`'s `git clean -fd` has no `-x`,
-so an ignored file from attempt 1 survives into attempt 2 and is still
-new relative to the run.
+there needs a before picture, and each attempt gets its own.
+`pre-run-ignored.txt` is taken after `Build instar` and before attempt
+1. `Prepare retry` then deletes the paths named in
+`stager-refused-1.txt` -- its `git clean -fd` has no `-x`, so an
+ignored file attempt 1 created would otherwise survive and refuse
+attempt 2 whatever attempt 2 did -- and snapshots again into
+`pre-retry-ignored.txt`, which attempt 2 is judged against. A single
+baseline would judge attempt 2 against a tree from before the verify
+build and the full test run, and refuse it for their output.
 
 ## Related Documentation
 
