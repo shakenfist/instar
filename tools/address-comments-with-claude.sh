@@ -184,6 +184,19 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Abandon whatever the current item left behind, so the next item's
+# commit contains only its own work. Every path that gives up on an
+# item has to call this: without it, edits from an item Claude failed
+# or disagreed with are staged by the next item and committed under
+# that item's review id and rationale.
+reset_worktree() {
+    git reset -q HEAD -- . 2>/dev/null || true
+    git checkout -- . 2>/dev/null || true
+    # No -x: ignored build output is expensive to recreate and is not
+    # what leaks between items.
+    git clean -qfd 2>/dev/null || true
+}
+
 # CI mode output helper
 ci_output() {
     local key="$1"
@@ -230,6 +243,17 @@ fi
 
 if ! command -v jq &> /dev/null; then
     echo -e "${RED}Error: jq not found${NC}"
+    exit 1
+fi
+
+# Checked up front rather than at the call site: if this is missing,
+# every item silently falls back to whatever Claude happened to stage,
+# which is the defect this script was fixed for (#510). Better to
+# refuse to start than to reproduce it quietly.
+stager="${tools_dir}/ci/stage-autofix-changes.sh"
+if [ ! -x "${stager}" ]; then
+    echo -e "${RED}Error: stager not found or not executable: ${stager}${NC}"
+    echo "TOOLS_DIR must point at a tools/ directory containing ci/."
     exit 1
 fi
 
@@ -459,8 +483,13 @@ ${item_suggestion}
 3. If valid:
    - Make the necessary code changes
    - Run \`pre-commit run --all-files\` to validate formatting
-   - Stage your changes with \`git add\`
-   - Do NOT commit - I will handle the commit
+   - Do NOT stage and do NOT commit existing files - CI stages the
+     tracked files you modify or delete, and makes the commit
+   - If you create a NEW file, stage it with \`git add <path>\`; that
+     is the one case CI cannot do for you
+   - Do NOT edit anything under \`.github/workflows/\`; a commit
+     touching one cannot be pushed with the token CI holds, and the
+     push at the end of the run would fail
 
 4. If you disagree with the comment or it's not actionable:
    - Explain your rationale clearly
@@ -496,6 +525,7 @@ PROMPT_EOF
     echo "Running Claude Code..."
     claude_output_file="${output_dir}/claude-output-${i}.txt"
 
+
     if ! "${claude_bin}" -p "$(cat "${output_dir}/claude-prompt-${i}.txt")" \
         --dangerously-skip-permissions \
         --max-turns "${max_turns}" \
@@ -505,8 +535,31 @@ PROMPT_EOF
         row+=" Claude execution failed |"
         echo "${row}" >> "${summary_file}"
         skipped_count=$((skipped_count + 1))
+        reset_worktree
         continue
     fi
+
+    # Stage what Claude changed, before the index is read below. Claude
+    # Code edits the working tree and does not reliably stage, so an
+    # unstaged fix used to reach the `git diff --cached` test empty and
+    # be recorded as "No changes needed" -- the same defect that stopped
+    # the fuzz autofix workflow opening a single PR in four months
+    # (issue #510).
+    #
+    # --tracked-only, not the full check: that mode refuses an attempt
+    # that created a file, which is right for an unattended fuzz fix and
+    # wrong here, where a review item can legitimately ask for a new
+    # file and the result lands on a pull request a human reads. New
+    # files stay Claude's job, which is why the prompt still asks for
+    # them explicitly. The mode does keep .github/workflows/ out of the
+    # index, because a commit touching one cannot be pushed with the
+    # token this workflow holds -- and that failure would land at the
+    # push, discarding every other item's commit with it.
+    #
+    # Run from ${tools_dir} so this is the trusted copy checked out from
+    # the base branch, not the PR's own.
+    "${stager}" --tracked-only "${work_dir}" \
+        || echo "Stager failed; continuing with whatever is staged"
 
     # Check for disagreement
     if grep -q "DISAGREEMENT_START" "${claude_output_file}"; then
@@ -522,6 +575,7 @@ PROMPT_EOF
         row+=" ${rationale_escaped} |"
         echo "${row}" >> "${summary_file}"
         skipped_count=$((skipped_count + 1))
+        reset_worktree
         continue
     fi
 
@@ -534,12 +588,16 @@ PROMPT_EOF
         change_summary=$(sanitize_commit_subject "${change_summary_raw}")
 
         # Check if there are actually staged changes
+        # With CI staging on Claude's behalf, an empty index means it
+        # modified no tracked file and staged no new one -- not that it
+        # forgot to stage.
         if [ -z "$(git diff --cached --name-only)" ]; then
-            echo -e "${YELLOW}No changes were staged${NC}"
+            echo -e "${YELLOW}Claude reported a change but modified no file${NC}"
             row="| ${item_id} | ${item_title} | ⏭️ Skipped | - |"
-            row+=" No changes needed |"
+            row+=" Reported a change but modified no file |"
             echo "${row}" >> "${summary_file}"
             skipped_count=$((skipped_count + 1))
+            reset_worktree
             continue
         fi
 
@@ -575,9 +633,7 @@ PROMPT_EOF
         row+=" No summary marker found |"
         echo "${row}" >> "${summary_file}"
         skipped_count=$((skipped_count + 1))
-
-        # Reset any unstaged changes
-        git checkout -- . 2>/dev/null || true
+        reset_worktree
     fi
 
     echo

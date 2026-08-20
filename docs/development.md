@@ -771,7 +771,7 @@ step -- see "Self-hosted runners and Docker" in `docs/development.md`.
 ## Scripts
 
 - `tools/review-pr-with-claude.sh` - Performs automated PR reviews (outputs JSON)
-- `tools/address-comments-with-claude.sh` - Addresses review comments (reads JSON)
+- `tools/address-comments-with-claude.sh` - Addresses review comments (reads JSON). CI stages Claude's tracked edits for it, via `tools/ci/stage-autofix-changes.sh --tracked-only`; without that an unstaged fix reached the script's `git diff --cached` test empty and was recorded as "No changes needed" (#510). New files remain Claude's job here, unlike the fuzz autofix, because a review item can legitimately ask for one and the result lands on a pull request a human reads
 - `tools/create-review-issues.py` - Creates GitHub issues for actionable items
 - `tools/render-review.py` - Renders review JSON to markdown (includes issue links)
 - `tools/review-schema.json` - JSON schema for review output validation
