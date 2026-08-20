@@ -259,7 +259,9 @@ jobs:
           # predates the attempt, so record what was already dirty. Not
           # a gate -- the preceding steps write only to gitignored
           # paths -- but without it a failure report gives a reader no
-          # way to attribute a staged path.
+          # way to attribute a staged path. Attempt 2 needs no
+          # equivalent: Prepare retry resets, reverts and cleans the
+          # tree immediately beforehand.
           git status --porcelain \
             > ${GITHUB_WORKSPACE}/pre-attempt-status-1.txt 2>&1 || true
 

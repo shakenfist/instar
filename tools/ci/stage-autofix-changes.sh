@@ -32,7 +32,9 @@
 # What does not, and why it is not `git add -A`: untracked files outside
 # the source roots, and editor/merge artifacts (`*~`, `*.orig`, `*.rej`,
 # ...) anywhere. Those are the temp files the original comment was
-# guarding against. They are reported rather than silently dropped, so a
+# guarding against, plus edits under .github/workflows/, which cannot be
+# pushed with the token the workflow has. They are reported rather than
+# silently dropped, so a
 # failure report shows what was left behind, and separately so a reader
 # can tell why a path was left. New files matching a .gitignore rule are
 # reported too, loudly: git hides them from the untracked listing
@@ -106,8 +108,20 @@ SOURCE_ROOTS='^(src|tests|docs|crates|tools|scripts)/'
 # through.
 ARTIFACT_NAMES='(^|/)(\.#[^/]*|[^/]*~|[^/]*\.(orig|rej|bak|tmp|swp|swo))$'
 
+# `git push` with the GITHUB_TOKEN actions/checkout persists is refused
+# for any commit touching .github/workflows/; the `workflows` scope it
+# needs cannot be granted through the workflow's `permissions:` key. So
+# a staged workflow edit does not fail here, it fails two hours later
+# at the push, after the build and the test run. Excluded and reported
+# rather than staged. Moot before this script existed, because nothing
+# was ever staged at all.
+WORKFLOW_EDITS=()
+while IFS= read -r -d '' FILE; do
+    WORKFLOW_EDITS+=("${FILE}")
+done < <(git diff --name-only -z -- '.github/workflows/')
+
 # Tracked modifications and deletions.
-git add -u
+git add -u -- . ':(exclude).github/workflows/'
 
 STAGED_NEW=()
 SKIPPED_ARTIFACT=()
@@ -119,7 +133,6 @@ if [ "${TRACKED_ONLY}" = false ]; then
         if [[ "${FILE}" =~ ${ARTIFACT_NAMES} ]]; then
             SKIPPED_ARTIFACT+=("${FILE}")
         elif [[ "${FILE}" =~ ${SOURCE_ROOTS} ]]; then
-            git add -- "${FILE}"
             STAGED_NEW+=("${FILE}")
         else
             SKIPPED_OUTSIDE+=("${FILE}")
@@ -134,20 +147,36 @@ if [ "${TRACKED_ONLY}" = false ]; then
     # and then commit a branch without it -- the failure this script
     # exists to prevent, arrived at silently. Not staged (that would
     # sweep in build output); reported, so it is visible in the log and
-    # in claude-changes-N.txt. `--directory` collapses whole ignored
-    # trees like src/target/ to one entry, and those are dropped below
-    # so the report stays readable.
+    # in claude-changes-N.txt.
+    #
+    # `--directory` collapses a wholly-ignored directory to one entry,
+    # which is what keeps src/target/ from flooding the report. Those
+    # entries are reported, NOT skipped: src/fuzz/.gitignore ignores
+    # `corpus/` and `artifacts/` as whole directories, and a fuzz-crash
+    # input is more likely to land there than anywhere else. An earlier
+    # version dropped every collapsed directory to keep the output
+    # tidy and reopened the exact hole this pass exists to close. A
+    # couple of dozen predictable lines per run -- the guest operation
+    # `*.bin` files and the collapsed target/ trees, if Claude has run
+    # `make instar` -- is the price of never silently dropping one. Do
+    # not add a denylist to tidy that up without a way to tell build
+    # output from a file Claude created; the last attempt to make this
+    # block tidier is what reopened the hole.
     while IFS= read -r -d '' FILE; do
-        case "${FILE}" in
-            */) continue ;;
-        esac
-        if [[ "${FILE}" =~ ${SOURCE_ROOTS} ]]; then
+        if [[ "${FILE}" =~ ${ARTIFACT_NAMES} ]]; then
+            # An editor leftover that also matches an ignore rule is
+            # routine junk, not a lost fix. Keeping it out of the loud
+            # heading is what stops a reader skimming past the line
+            # that matters.
+            SKIPPED_ARTIFACT+=("${FILE}")
+        elif [[ "${FILE}" =~ ${SOURCE_ROOTS} ]]; then
             IGNORED+=("${FILE}")
         fi
     done < <(git ls-files --others --ignored --exclude-standard --directory -z)
 fi
 
 if [ ${#STAGED_NEW[@]} -gt 0 ]; then
+    git add -- "${STAGED_NEW[@]}"
     echo "Staged ${#STAGED_NEW[@]} newly created file(s):"
     printf '    %s\n' "${STAGED_NEW[@]}"
 fi
@@ -160,6 +189,11 @@ fi
 if [ ${#SKIPPED_OUTSIDE[@]} -gt 0 ]; then
     echo "Left ${#SKIPPED_OUTSIDE[@]} untracked file(s) outside a source root unstaged:"
     printf '    %s\n' "${SKIPPED_OUTSIDE[@]}"
+fi
+
+if [ ${#WORKFLOW_EDITS[@]} -gt 0 ]; then
+    echo "NOT staged, a commit touching these cannot be pushed with GITHUB_TOKEN:"
+    printf '    %s\n' "${WORKFLOW_EDITS[@]}"
 fi
 
 if [ ${#IGNORED[@]} -gt 0 ]; then

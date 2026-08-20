@@ -177,7 +177,7 @@ case "${OUT}" in
     *) fail "reported loudly: got '${OUT}'" ;;
 esac
 
-start "a whole ignored tree collapses to nothing in the report"
+start "a whole ignored tree is reported as one collapsed entry"
 setup
 mkdir -p "${D}/src/target/debug"
 echo x > "${D}/src/target/debug/instar"
@@ -185,9 +185,81 @@ echo x > "${D}/src/target/debug/deps.d"
 OUT="$(stage)"
 check "nothing staged" "$(staged)" ""
 case "${OUT}" in
-    *"Ignored by .gitignore"*) fail "ignored directories should not be listed: got '${OUT}'" ;;
-    *) ok "ignored directory not listed" ;;
+    *"Ignored by .gitignore"*"src/target/"*) ok "reported collapsed" ;;
+    *) fail "reported collapsed: got '${OUT}'" ;;
 esac
+check "one line, not one per file" \
+    "$(echo "${OUT}" | grep -c 'src/target')" "1"
+
+# src/fuzz/.gitignore ignores `corpus/` and `artifacts/` as whole
+# directories, and a fuzz-crash regression input is likelier to land
+# there than anywhere else. Dropping collapsed directories to keep the
+# report tidy silently reopened exactly the hole the pass closes.
+start "a new file inside a wholly-ignored directory is still reported"
+setup
+mkdir -p "${D}/src/fuzz/corpus/fuzz_qcow2_header"
+printf 'corpus/\nartifacts/\n' > "${D}/src/fuzz/.gitignore"
+git -C "${D}" add src/fuzz/.gitignore
+git -C "${D}" commit -qm fuzzignore
+echo crashbytes > "${D}/src/fuzz/corpus/fuzz_qcow2_header/crash-abc"
+OUT="$(stage)"
+check "not staged" "$(staged)" ""
+case "${OUT}" in
+    *"Ignored by .gitignore"*"src/fuzz/corpus/"*) ok "reported" ;;
+    *) fail "reported: got '${OUT}'" ;;
+esac
+
+# The artifact classification only ran in the first loop, so an editor
+# leftover that also matched an ignore rule landed under the loud
+# heading beside a genuinely lost fixture.
+start "a gitignored editor artifact is not reported as a lost file"
+setup
+echo x > "${D}/src/main.rs.swp"
+printf 'x' > "${D}/src/lost.bin"
+OUT="$(stage)"
+case "${OUT}" in
+    *"Ignored by .gitignore"*"src/main.rs.swp"*)
+        fail "swap file should not be in the loud list: got '${OUT}'" ;;
+    *) ok "swap file kept out of the loud list" ;;
+esac
+case "${OUT}" in
+    *"Ignored by .gitignore"*"src/lost.bin"*) ok "the real loss is still reported" ;;
+    *) fail "the real loss is still reported: got '${OUT}'" ;;
+esac
+case "${OUT}" in
+    *"editor or merge artifact(s) unstaged:"*"src/main.rs.swp"*)
+        ok "reported as an artifact instead" ;;
+    *) fail "reported as an artifact instead: got '${OUT}'" ;;
+esac
+
+# A commit touching .github/workflows/ cannot be pushed with the
+# GITHUB_TOKEN actions/checkout persists, and the failure lands two
+# hours downstream at the push rather than here.
+start "a workflow edit is excluded and reported"
+setup
+mkdir -p "${D}/.github/workflows"
+echo 'name: x' > "${D}/.github/workflows/ci.yml"
+git -C "${D}" add .github/workflows/ci.yml
+git -C "${D}" commit -qm workflow
+echo 'name: edited' > "${D}/.github/workflows/ci.yml"
+echo 'fn main() { fixed(); }' > "${D}/src/main.rs"
+OUT="$(stage)"
+check "workflow edit not staged" "$(staged)" "src/main.rs"
+case "${OUT}" in
+    *"cannot be pushed with GITHUB_TOKEN"*".github/workflows/ci.yml"*) ok "reported" ;;
+    *) fail "reported: got '${OUT}'" ;;
+esac
+
+start "--tracked-only also excludes workflow edits"
+setup
+mkdir -p "${D}/.github/workflows"
+echo 'name: x' > "${D}/.github/workflows/ci.yml"
+git -C "${D}" add .github/workflows/ci.yml
+git -C "${D}" commit -qm workflow
+echo 'name: edited' > "${D}/.github/workflows/ci.yml"
+echo 'fn main() { fixed(); }' > "${D}/src/main.rs"
+"${STAGE}" --tracked-only "${D}" > /dev/null
+check "workflow edit not staged" "$(staged)" "src/main.rs"
 
 start "an ignored file outside the source roots is not reported"
 setup

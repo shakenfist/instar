@@ -530,15 +530,20 @@ jobs:
           cd ${GITHUB_WORKSPACE}/instar
 
           # Already staged after the Claude attempt; repeated here so
-          # this step does not depend on that having happened.
-          # --tracked-only for the same reason fuzz-autofix.yml uses it:
-          # this is downstream of the verify step. Not `git add -A`,
-          # which would sweep back in exactly the editor and merge
-          # artifacts the stager deliberately left behind and make the
-          # contract the prompt states false. The test is on the index,
-          # not the work tree -- `git status --porcelain` is non-empty
-          # when the only thing present is that skipped junk.
-          tools/ci/stage-autofix-changes.sh --tracked-only
+          # this step does not depend on that having happened -- and it
+          # genuinely does not, because this is the full mode. The
+          # per-attempt call tolerates a stager failure, so with
+          # --tracked-only a new docs/image_notes/<image-id>.md would
+          # be dropped from a commit announced as having added it.
+          # Unlike fuzz-autofix.yml there is no complexity guardrail
+          # here for a new file to slip past, so nothing argues for the
+          # narrower mode. Not `git add -A` either: that would sweep
+          # back in the editor and merge artifacts the stager
+          # deliberately left behind and make the contract the prompt
+          # states false. The test below is on the index, not the work
+          # tree -- `git status --porcelain` is non-empty when the only
+          # thing present is that skipped junk.
+          tools/ci/stage-autofix-changes.sh
 
           if [ -n "$(git diff --cached --name-only)" ]; then
 
