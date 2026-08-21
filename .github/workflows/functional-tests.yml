@@ -138,6 +138,12 @@ jobs:
       - name: Test the autofix stager
         run: tools/ci/test-stage-autofix-changes.sh
 
+      - name: Test the autofix worktree reset
+        run: tools/ci/test-reset-autofix-worktree.sh
+
+      - name: Test the review-comment staging loop
+        run: tools/ci/test-address-comments-staging.sh
+
   build-and-test:
     needs: check_paths
     if: needs.check_paths.outputs.code_changed != 'false'

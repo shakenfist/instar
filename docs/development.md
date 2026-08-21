@@ -739,12 +739,29 @@ When you trigger `@shakenfist-bot please address comments`:
 2. It extracts items where `action` is `fix` or `document`
 3. For each actionable item, Claude Code:
    - Analyzes whether the item should be addressed
-   - If valid: makes the fix, runs pre-commit, and stages changes
+   - If valid: makes the fix and runs pre-commit, staging nothing
    - If disagreeing: provides a rationale explaining why
-4. Each valid fix gets its own commit with attribution
-5. All commits are pushed and a summary is posted to the PR
+4. CI stages what the fix touched, via
+   `tools/ci/stage-autofix-changes.sh --tracked-only` plus the new files
+   the item created. Claude Code edits the working tree and does not
+   reliably stage, and the script judges an item by reading the index --
+   so before this, an unstaged fix reached that test with an empty index
+   and was recorded as "No changes needed" (#510). Past runs are worth
+   re-reading with that in mind before their skipped rows are believed
+5. Each valid fix gets its own commit with attribution
+6. All commits are pushed and a summary is posted to the PR
 
 This allows reviewers to cherry-pick or drop individual fixes as needed.
+
+New files are staged here, unlike in the fuzz autofix, which refuses an
+attempt that created one: a review item can legitimately ask for a new
+file, and the result lands on a pull request a human reads before it goes
+anywhere. Edits under `.github/workflows/` go the other way and are
+dropped, because a commit touching one cannot be pushed with the token the
+workflow holds -- and since the loop commits per item and pushes once at
+the end, that failure would discard every other item's commit with it. An
+item whose whole fix was a workflow edit is reported as "Not pushable" so
+a maintainer knows to apply it by hand.
 
 ## Workflow Files
 
@@ -771,7 +788,7 @@ step -- see "Self-hosted runners and Docker" in `docs/development.md`.
 ## Scripts
 
 - `tools/review-pr-with-claude.sh` - Performs automated PR reviews (outputs JSON)
-- `tools/address-comments-with-claude.sh` - Addresses review comments (reads JSON). CI stages Claude's tracked edits for it, via `tools/ci/stage-autofix-changes.sh --tracked-only`; without that an unstaged fix reached the script's `git diff --cached` test empty and was recorded as "No changes needed" (#510). New files remain Claude's job here, unlike the fuzz autofix, because a review item can legitimately ask for one and the result lands on a pull request a human reads
+- `tools/address-comments-with-claude.sh` - Addresses review comments (reads JSON); CI stages each fix for it via `tools/ci/stage-autofix-changes.sh --tracked-only` (see "How Automated Comment Addressing Works" above)
 - `tools/create-review-issues.py` - Creates GitHub issues for actionable items
 - `tools/render-review.py` - Renders review JSON to markdown (includes issue links)
 - `tools/review-schema.json` - JSON schema for review output validation
@@ -785,3 +802,6 @@ step -- see "Self-hosted runners and Docker" in `docs/development.md`.
 - `tools/ci/test-check-glibc-floor.sh` - Tests for that check; the `ci-tooling` CI job runs it
 - `tools/ci/stage-autofix-changes.sh` - Stages the tracked edits a Claude Code autofix run left in the working tree, before the steps that judge whether a fix exists read the index, and refuses the attempt (exit 3) if it created a file that cannot be staged safely. Called from `fuzz-autofix.yml`, and in `--tracked-only` mode from `tools/address-comments-with-claude.sh`; see "Automated bug fixes" in `docs/testing.md`
 - `tools/ci/test-stage-autofix-changes.sh` - Tests for that stager; the `ci-tooling` CI job runs it
+- `tools/ci/reset-autofix-worktree.sh` - Discards staged edits, unstaged edits and new files, keeping ignored build output; called on every path that abandons a review item, so the next item's commit holds only its own work
+- `tools/ci/test-reset-autofix-worktree.sh` - Tests for that reset; the `ci-tooling` CI job runs it
+- `tools/ci/test-address-comments-staging.sh` - Drives the `tools/address-comments-with-claude.sh` item loop against a scratch repo with `claude` and `gh` stubbed; the `ci-tooling` CI job runs it

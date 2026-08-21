@@ -61,6 +61,11 @@ work_dir="${WORK_DIR:-$(cd "${script_dir}/.." && pwd)}"
 
 cd "${work_dir}"
 
+# The staging helper anchors itself at the top level and the index
+# check below is repo-wide whatever the cwd, so the per-item git calls
+# have to agree with them rather than with ${work_dir}.
+repo_top=$(git rev-parse --show-toplevel 2>/dev/null || echo "${work_dir}")
+
 # Default options
 pr_number=""
 review_json=""
@@ -189,12 +194,11 @@ trap cleanup EXIT
 # item has to call this: without it, edits from an item Claude failed
 # or disagreed with are staged by the next item and committed under
 # that item's review id and rationale.
+#
+# The work is in tools/ci/reset-autofix-worktree.sh so it can be
+# tested; see the header there for what it discards and what it keeps.
 reset_worktree() {
-    git reset -q HEAD -- . 2>/dev/null || true
-    git checkout -- . 2>/dev/null || true
-    # No -x: ignored build output is expensive to recreate and is not
-    # what leaks between items.
-    git clean -qfd 2>/dev/null || true
+    "${resetter}" "${work_dir}" || echo "Reset failed; the next item may inherit this one's edits"
 }
 
 # CI mode output helper
@@ -246,16 +250,21 @@ if ! command -v jq &> /dev/null; then
     exit 1
 fi
 
-# Checked up front rather than at the call site: if this is missing,
-# every item silently falls back to whatever Claude happened to stage,
-# which is the defect this script was fixed for (#510). Better to
-# refuse to start than to reproduce it quietly.
+# Checked up front rather than at the call sites: if the stager is
+# missing, every item silently falls back to whatever Claude happened
+# to stage, which is the defect this script was fixed for (#510); if
+# the resetter is missing, an abandoned item's edits are committed
+# under the next item's review id. Better to refuse to start than to
+# reproduce either quietly.
 stager="${tools_dir}/ci/stage-autofix-changes.sh"
-if [ ! -x "${stager}" ]; then
-    echo -e "${RED}Error: stager not found or not executable: ${stager}${NC}"
-    echo "TOOLS_DIR must point at a tools/ directory containing ci/."
-    exit 1
-fi
+resetter="${tools_dir}/ci/reset-autofix-worktree.sh"
+for helper in "${stager}" "${resetter}"; do
+    if [ ! -x "${helper}" ]; then
+        echo -e "${RED}Error: helper not found or not executable: ${helper}${NC}"
+        echo "TOOLS_DIR must point at a tools/ directory containing ci/."
+        exit 1
+    fi
+done
 
 # Get PR number if not provided
 if [ -z "${pr_number}" ]; then
@@ -483,10 +492,8 @@ ${item_suggestion}
 3. If valid:
    - Make the necessary code changes
    - Run \`pre-commit run --all-files\` to validate formatting
-   - Do NOT stage and do NOT commit existing files - CI stages the
-     tracked files you modify or delete, and makes the commit
-   - If you create a NEW file, stage it with \`git add <path>\`; that
-     is the one case CI cannot do for you
+   - Do NOT stage and do NOT commit - CI stages the files you
+     modify, delete or create, and makes the commit
    - Do NOT edit anything under \`.github/workflows/\`; a commit
      touching one cannot be pushed with the token CI holds, and the
      push at the end of the run would fail
@@ -525,7 +532,6 @@ PROMPT_EOF
     echo "Running Claude Code..."
     claude_output_file="${output_dir}/claude-output-${i}.txt"
 
-
     if ! "${claude_bin}" -p "$(cat "${output_dir}/claude-prompt-${i}.txt")" \
         --dangerously-skip-permissions \
         --max-turns "${max_turns}" \
@@ -558,8 +564,86 @@ PROMPT_EOF
     #
     # Run from ${tools_dir} so this is the trusted copy checked out from
     # the base branch, not the PR's own.
-    "${stager}" --tracked-only "${work_dir}" \
-        || echo "Stager failed; continuing with whatever is staged"
+    #
+    # A failure here is an item-level error, not a warning. In
+    # --tracked-only mode the stager exits non-zero only on a usage
+    # error or a REPO_DIR that is not a work tree, under which nothing
+    # is staged at all -- so continuing would reach the empty-index
+    # branch and report "modified no file", which is the #510 misreport
+    # again by another route.
+    if ! "${stager}" --tracked-only "${work_dir}"; then
+        echo -e "${RED}Staging failed for item ${i}${NC}"
+        row="| ${item_id} | ${item_title} | ❌ Error | - |"
+        row+=" Staging failed |"
+        echo "${row}" >> "${summary_file}"
+        skipped_count=$((skipped_count + 1))
+        reset_worktree
+        continue
+    fi
+
+    # Notes appended to this item's summary row, for things a
+    # maintainer reading the PR comment has to know but that do not
+    # change the outcome.
+    row_notes=""
+
+    # --tracked-only stages tracked edits and nothing else, so a file
+    # Claude created is invisible to it. Left untracked, that file
+    # would be missing from a commit that references it, behind a row
+    # saying "Fixed" -- #510 again, narrowed to new files.
+    #
+    # This is where the two autofix paths diverge. The fuzz autofix
+    # refuses an attempt that created a file, because a wrong guess
+    # there ships an unreviewed branch; here a review item can
+    # legitimately ask for a new file, and the result lands on a pull
+    # request a human reads before it goes anywhere. Opting out of the
+    # refusal is not a reason to opt out of the detection, so the files
+    # are staged and named rather than silently dropped.
+    #
+    # Editor and merge leftovers are skipped, matching ARTIFACT_NAMES
+    # in the stager: `pre-commit run --all-files` is in the prompt and
+    # its hooks produce these routinely. Anything under
+    # .github/workflows/ is skipped too -- the stager has just
+    # unstaged the tracked ones, and adding an untracked one back
+    # would break the push for every other item's commit.
+    new_files=()
+    while IFS= read -r -d '' f; do
+        case "${f}" in
+            .github/workflows/*) continue ;;
+        esac
+        if [[ "${f}" =~ (^|/)(\.#[^/]*|[^/]*~|[^/]*\.(orig|rej|bak|tmp|swp|swo))$ ]]; then
+            continue
+        fi
+        new_files+=("${f}")
+    done < <(git -C "${repo_top}" ls-files --others --exclude-standard -z)
+
+    if [ ${#new_files[@]} -gt 0 ]; then
+        echo -e "${YELLOW}Claude created files it did not stage:${NC}"
+        printf '    %s\n' "${new_files[@]}"
+        git -C "${repo_top}" add -- "${new_files[@]}"
+        row_notes+=" Also staged new file(s) Claude left untracked:"
+        row_notes+=" $(printf '%s, ' "${new_files[@]}" | sed 's/, $//')."
+    fi
+
+    # Read before the index check below, so the empty-index branch can
+    # tell "Claude changed nothing" from "Claude changed only a
+    # workflow file and CI just threw it away". Both untracked and
+    # modified, because `git diff HEAD` cannot see a file that was
+    # created.
+    workflow_edits=$(
+        {
+            git -C "${repo_top}" diff HEAD --name-only -- '.github/workflows/'
+            git -C "${repo_top}" ls-files --others --exclude-standard \
+                -- '.github/workflows/'
+        } | LC_ALL=C sort -u | tr '\n' ' ' | sed 's/ $//'
+    )
+    if [ -n "${workflow_edits}" ]; then
+        echo -e "${YELLOW}Discarding .github/workflows/ edit(s): ${workflow_edits}${NC}"
+        row_notes+=" Discarded .github/workflows/ edit(s) that cannot be"
+        row_notes+=" pushed with the CI token: ${workflow_edits}."
+    fi
+
+    # The rows below are markdown table cells.
+    row_notes="${row_notes//|/\\|}"
 
     # Check for disagreement
     if grep -q "DISAGREEMENT_START" "${claude_output_file}"; then
@@ -592,9 +676,24 @@ PROMPT_EOF
         # modified no tracked file and staged no new one -- not that it
         # forgot to stage.
         if [ -z "$(git diff --cached --name-only)" ]; then
-            echo -e "${YELLOW}Claude reported a change but modified no file${NC}"
-            row="| ${item_id} | ${item_title} | ⏭️ Skipped | - |"
-            row+=" Reported a change but modified no file |"
+            # "Modified no file" is wrong when the whole fix was a
+            # workflow edit: Claude did modify a file, and CI discarded
+            # it a moment ago because a commit touching
+            # .github/workflows/ cannot be pushed with this workflow's
+            # token. That needs a maintainer to apply it by hand, which
+            # is a different response to "Claude did nothing", and the
+            # reset below is about to destroy the evidence.
+            if [ -n "${workflow_edits}" ]; then
+                echo -e "${YELLOW}Item edited .github/workflows/ only; not pushable${NC}"
+                row="| ${item_id} | ${item_title} | ⚠️ Not pushable | - |"
+                row+=" Edited \`${workflow_edits}\` only; a commit touching"
+                row+=" .github/workflows/ cannot be pushed with the CI token,"
+                row+=" so this needs applying by hand |"
+            else
+                echo -e "${YELLOW}Claude reported a change but modified no file${NC}"
+                row="| ${item_id} | ${item_title} | ⏭️ Skipped | - |"
+                row+=" Reported a change but modified no file |"
+            fi
             echo "${row}" >> "${summary_file}"
             skipped_count=$((skipped_count + 1))
             reset_worktree
@@ -624,7 +723,7 @@ PROMPT_EOF
 
         echo -e "${GREEN}Created commit: ${commit_sha}${NC}"
         row="| ${item_id} | ${item_title} | ✅ Fixed |"
-        row+=" \`${commit_sha}\` | ${change_summary} |"
+        row+=" \`${commit_sha}\` | ${change_summary}${row_notes} |"
         echo "${row}" >> "${summary_file}"
         addressed_count=$((addressed_count + 1))
     else
