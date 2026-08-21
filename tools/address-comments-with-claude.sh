@@ -61,6 +61,11 @@ work_dir="${WORK_DIR:-$(cd "${script_dir}/.." && pwd)}"
 
 cd "${work_dir}"
 
+# The staging helper anchors itself at the top level and the index
+# check below is repo-wide whatever the cwd, so the per-item git calls
+# have to agree with them rather than with ${work_dir}.
+repo_top=$(git rev-parse --show-toplevel 2>/dev/null || echo "${work_dir}")
+
 # Default options
 pr_number=""
 review_json=""
@@ -177,12 +182,48 @@ else
     cleanup_output=false
 fi
 
+# The per-item reset runs `git clean -fd` over the whole work tree, so
+# an output directory inside it is deleted partway through the run: the
+# next item's `jq` cannot find its item file, `set -e` aborts, and the
+# summary goes with it. The workflow keeps the two apart already; this
+# is so a local run cannot discover the coupling the hard way.
+output_real=$(realpath "${output_dir}" 2>/dev/null || echo "${output_dir}")
+if [ -n "${repo_top}" ] && \
+        [ "${output_real}" != "${output_real#"${repo_top}"/}" ]; then
+    echo -e "${RED}Error: --output-dir is inside the work tree: ${output_dir}${NC}"
+    echo "The per-item reset would delete it. Put it outside ${repo_top}."
+    exit 1
+fi
+
 cleanup() {
     if [ "${cleanup_output}" = true ]; then
         rm -rf "${output_dir}"
     fi
 }
 trap cleanup EXIT
+
+# Abandon whatever the current item left behind, so the next item's
+# commit contains only its own work. Every path that gives up on an
+# item has to call this: without it, edits from an item Claude failed
+# or disagreed with are staged by the next item and committed under
+# that item's review id and rationale.
+#
+# The work is in tools/ci/reset-autofix-worktree.sh so it can be
+# tested; see the header there for what it discards and what it keeps.
+reset_worktree() {
+    "${resetter}" "${work_dir}" || echo "Reset failed; the next item may inherit this one's edits"
+}
+
+# Give up on the current item without giving up on the run. Anything
+# that cannot tell whether Claude produced a fix has to end up here
+# rather than falling through: the empty-index branch would report
+# "modified no file", which is the #510 misreport by another name.
+item_error() {
+    echo -e "${RED}$1 for item ${i}${NC}"
+    echo "| ${item_id} | ${item_title} | ❌ Error | - | $1 |" >> "${summary_file}"
+    skipped_count=$((skipped_count + 1))
+    reset_worktree
+}
 
 # CI mode output helper
 ci_output() {
@@ -230,6 +271,45 @@ fi
 
 if ! command -v jq &> /dev/null; then
     echo -e "${RED}Error: jq not found${NC}"
+    exit 1
+fi
+
+# Checked up front rather than at the call sites: if the stager is
+# missing, every item silently falls back to whatever Claude happened
+# to stage, which is the defect this script was fixed for (#510); if
+# the resetter is missing, an abandoned item's edits are committed
+# under the next item's review id. Better to refuse to start than to
+# reproduce either quietly.
+stager="${tools_dir}/ci/stage-autofix-changes.sh"
+resetter="${tools_dir}/ci/reset-autofix-worktree.sh"
+patterns="${tools_dir}/ci/autofix-artifact-patterns.sh"
+for helper in "${stager}" "${resetter}"; do
+    if [ ! -x "${helper}" ]; then
+        echo -e "${RED}Error: helper not found or not executable: ${helper}${NC}"
+        echo "TOOLS_DIR must point at a tools/ directory containing ci/."
+        exit 1
+    fi
+done
+if [ ! -r "${patterns}" ]; then
+    echo -e "${RED}Error: helper not found or not readable: ${patterns}${NC}"
+    echo "TOOLS_DIR must point at a tools/ directory containing ci/."
+    exit 1
+fi
+
+# The same list the stager refuses on, so what it calls a leftover and
+# what this stages onto a commit cannot drift apart.
+# shellcheck source=tools/ci/autofix-artifact-patterns.sh
+. "${patterns}"
+
+# Every abandonment path discards staged edits, unstaged edits and new
+# files across the whole work tree. Against a fresh CI checkout that is
+# right. Against a maintainer's checkout it would throw away work they
+# never offered to this script, the first time an item is skipped, with
+# no prompt and no way back -- so a local run has to start clean.
+if [ "${ci_mode}" != true ] && [ -n "$(git -C "${repo_top}" status --porcelain)" ]; then
+    echo -e "${RED}Error: the work tree has uncommitted changes${NC}"
+    echo "Abandoning a review item discards staged edits, unstaged edits"
+    echo "and untracked files across ${repo_top}. Commit or stash first."
     exit 1
 fi
 
@@ -459,8 +539,11 @@ ${item_suggestion}
 3. If valid:
    - Make the necessary code changes
    - Run \`pre-commit run --all-files\` to validate formatting
-   - Stage your changes with \`git add\`
-   - Do NOT commit - I will handle the commit
+   - Do NOT stage and do NOT commit - CI stages the files you
+     modify, delete or create, and makes the commit
+   - Do NOT edit anything under \`.github/workflows/\`; a commit
+     touching one cannot be pushed with the token CI holds, and the
+     push at the end of the run would fail
 
 4. If you disagree with the comment or it's not actionable:
    - Explain your rationale clearly
@@ -492,6 +575,27 @@ DISAGREEMENT_END
 - If the fix requires changes you're unsure about, explain and skip
 PROMPT_EOF
 
+    # What the tree already held, so what Claude adds can be told from
+    # what was lying around. Without this the staging below sweeps up
+    # every untracked path in the repo and attributes it to whichever
+    # item happened to finish next -- a developer's scratch file, or
+    # this run's own output directory, committed onto the pull request
+    # under someone else's review id.
+    untracked_before="${output_dir}/untracked-before-${i}.txt"
+    git -C "${repo_top}" ls-files --others --exclude-standard \
+        | LC_ALL=C sort > "${untracked_before}"
+
+    # git omits ignored paths from that listing entirely, so a new file
+    # matching a .gitignore rule is invisible to it -- and `**/*.bin` is
+    # in this repo's .gitignore, which is what a fuzz regression fixture
+    # is called. Taken with the stager's own snapshot mode so both
+    # scripts mean the same thing by "the ignored paths".
+    ignored_before="${output_dir}/ignored-before-${i}.txt"
+    if ! "${stager}" --snapshot "${ignored_before}" "${work_dir}" > /dev/null; then
+        item_error "Baseline snapshot failed"
+        continue
+    fi
+
     # Run Claude for this item
     echo "Running Claude Code..."
     claude_output_file="${output_dir}/claude-output-${i}.txt"
@@ -500,13 +604,142 @@ PROMPT_EOF
         --dangerously-skip-permissions \
         --max-turns "${max_turns}" \
         --output-format text > "${claude_output_file}" 2>&1; then
-        echo -e "${RED}Claude failed for item ${i}${NC}"
-        row="| ${item_id} | ${item_title} | ❌ Error | - |"
-        row+=" Claude execution failed |"
-        echo "${row}" >> "${summary_file}"
-        skipped_count=$((skipped_count + 1))
+        item_error "Claude execution failed"
         continue
     fi
+
+    # Stage what Claude changed, before the index is read below. Claude
+    # Code edits the working tree and does not reliably stage, so an
+    # unstaged fix used to reach the `git diff --cached` test empty and
+    # be recorded as "No changes needed" -- the same defect that stopped
+    # the fuzz autofix workflow opening a single PR in four months
+    # (issue #510).
+    #
+    # --tracked-only, not the full check: that mode refuses an attempt
+    # that created a file, which is right for an unattended fuzz fix and
+    # wrong here, where a review item can legitimately ask for a new
+    # file and the result lands on a pull request a human reads. New
+    # files stay Claude's job, which is why the prompt still asks for
+    # them explicitly. The mode does keep .github/workflows/ out of the
+    # index, because a commit touching one cannot be pushed with the
+    # token this workflow holds -- and that failure would land at the
+    # push, discarding every other item's commit with it.
+    #
+    # Run from ${tools_dir} so this is the trusted copy checked out from
+    # the base branch, not the PR's own.
+    #
+    # A failure here is an item-level error, not a warning. In
+    # --tracked-only mode the stager exits non-zero only on a usage
+    # error or a REPO_DIR that is not a work tree, under which nothing
+    # is staged at all -- so continuing would reach the empty-index
+    # branch and report "modified no file", which is the #510 misreport
+    # again by another route.
+    if ! "${stager}" --tracked-only "${work_dir}"; then
+        item_error "Staging failed"
+        continue
+    fi
+
+    # Notes appended to this item's summary row, for things a
+    # maintainer reading the PR comment has to know but that do not
+    # change the outcome.
+    row_notes=""
+
+    # --tracked-only stages tracked edits and nothing else, so a file
+    # Claude created is invisible to it. Left untracked, that file
+    # would be missing from a commit that references it, behind a row
+    # saying "Fixed" -- #510 again, narrowed to new files.
+    #
+    # This is where the two autofix paths diverge. The fuzz autofix
+    # refuses an attempt that created a file, because a wrong guess
+    # there ships an unreviewed branch; here a review item can
+    # legitimately ask for a new file, and the result lands on a pull
+    # request a human reads before it goes anywhere. Opting out of the
+    # refusal is not a reason to opt out of the detection, so the files
+    # are staged and named rather than silently dropped.
+    #
+    # Editor and merge leftovers are skipped, matching ARTIFACT_NAMES
+    # in the stager: `pre-commit run --all-files` is in the prompt and
+    # its hooks produce these routinely. Anything under
+    # .github/workflows/ is skipped too -- the stager has just
+    # unstaged the tracked ones, and adding an untracked one back
+    # would break the push for every other item's commit.
+    new_files=()
+    while IFS= read -r f; do
+        [ -n "${f}" ] || continue
+        case "${f}" in
+            .github/workflows/*) continue ;;
+        esac
+        if [[ "${f}" =~ ${ARTIFACT_NAMES} ]] \
+                || [[ "${f}" =~ ${CI_OUTPUT_DIRS} ]] \
+                || [[ "${f}" =~ ${CI_OUTPUT_NAMES} ]]; then
+            continue
+        fi
+        new_files+=("${f}")
+    done < <(comm -13 "${untracked_before}" \
+        <(git -C "${repo_top}" ls-files --others --exclude-standard \
+            | LC_ALL=C sort))
+
+    if [ ${#new_files[@]} -gt 0 ]; then
+        echo -e "${YELLOW}Claude created files it did not stage:${NC}"
+        printf '    %s\n' "${new_files[@]}"
+        git -C "${repo_top}" add -- "${new_files[@]}"
+        row_notes+=" Also staged new file(s) Claude left untracked:"
+        row_notes+=" $(printf '%s, ' "${new_files[@]}" | sed 's/, $//')."
+    fi
+
+    # A new file matching a .gitignore rule reaches neither `git add -u`
+    # nor the listing above, so without this it is dropped from the
+    # commit and the item reports "modified no file" -- #510 by a third
+    # route. Named rather than staged: adding one needs `git add -f`,
+    # and a path the repo ignores on purpose is a call for the
+    # maintainer reading the pull request, not for this script. The
+    # build and test output the prompt tells Claude to produce is
+    # filtered out, or every item that follows its instructions would
+    # report src/target/.
+    ignored_after="${output_dir}/ignored-after-${i}.txt"
+    if ! "${stager}" --snapshot "${ignored_after}" "${work_dir}" > /dev/null; then
+        item_error "Ignored-path snapshot failed"
+        continue
+    fi
+    new_ignored=()
+    while IFS= read -r f; do
+        [ -n "${f}" ] || continue
+        if [[ "${f}" =~ ${ARTIFACT_NAMES} ]] \
+                || [[ "${f}" =~ ${CI_OUTPUT_DIRS} ]] \
+                || [[ "${f}" =~ ${CI_OUTPUT_NAMES} ]]; then
+            continue
+        fi
+        new_ignored+=("${f}")
+    done < <(comm -13 "${ignored_before}" "${ignored_after}")
+
+    ignored_list=""
+    if [ ${#new_ignored[@]} -gt 0 ]; then
+        ignored_list=$(printf '%s, ' "${new_ignored[@]}" | sed 's/, $//')
+        echo -e "${YELLOW}Claude created ignored path(s): ${ignored_list}${NC}"
+        row_notes+=" Created ignored path(s) left out of the commit,"
+        row_notes+=" because .gitignore matches them: ${ignored_list}."
+    fi
+
+    # Read before the index check below, so the empty-index branch can
+    # tell "Claude changed nothing" from "Claude changed only a
+    # workflow file and CI just threw it away". Both untracked and
+    # modified, because `git diff HEAD` cannot see a file that was
+    # created.
+    workflow_edits=$(
+        {
+            git -C "${repo_top}" diff HEAD --name-only -- '.github/workflows/'
+            git -C "${repo_top}" ls-files --others --exclude-standard \
+                -- '.github/workflows/'
+        } | LC_ALL=C sort -u | tr '\n' ' ' | sed 's/ $//'
+    )
+    if [ -n "${workflow_edits}" ]; then
+        echo -e "${YELLOW}Discarding .github/workflows/ edit(s): ${workflow_edits}${NC}"
+        row_notes+=" Discarded .github/workflows/ edit(s) that cannot be"
+        row_notes+=" pushed with the CI token: ${workflow_edits}."
+    fi
+
+    # The rows below are markdown table cells.
+    row_notes="${row_notes//|/\\|}"
 
     # Check for disagreement
     if grep -q "DISAGREEMENT_START" "${claude_output_file}"; then
@@ -522,6 +755,7 @@ PROMPT_EOF
         row+=" ${rationale_escaped} |"
         echo "${row}" >> "${summary_file}"
         skipped_count=$((skipped_count + 1))
+        reset_worktree
         continue
     fi
 
@@ -534,12 +768,37 @@ PROMPT_EOF
         change_summary=$(sanitize_commit_subject "${change_summary_raw}")
 
         # Check if there are actually staged changes
+        # With CI staging on Claude's behalf, an empty index means it
+        # modified no tracked file and staged no new one -- not that it
+        # forgot to stage.
         if [ -z "$(git diff --cached --name-only)" ]; then
-            echo -e "${YELLOW}No changes were staged${NC}"
-            row="| ${item_id} | ${item_title} | ⏭️ Skipped | - |"
-            row+=" No changes needed |"
+            # "Modified no file" is wrong when the whole fix was a
+            # workflow edit: Claude did modify a file, and CI discarded
+            # it a moment ago because a commit touching
+            # .github/workflows/ cannot be pushed with this workflow's
+            # token. That needs a maintainer to apply it by hand, which
+            # is a different response to "Claude did nothing", and the
+            # reset below is about to destroy the evidence.
+            if [ -n "${ignored_list}" ]; then
+                echo -e "${YELLOW}Item created ignored path(s) only${NC}"
+                row="| ${item_id} | ${item_title} | ⚠️ Not staged | - |"
+                row+=" Created \`${ignored_list}\`, which .gitignore"
+                row+=" matches; add with \`git add -f\` by hand if it"
+                row+=" belongs in the tree |"
+            elif [ -n "${workflow_edits}" ]; then
+                echo -e "${YELLOW}Item edited .github/workflows/ only; not pushable${NC}"
+                row="| ${item_id} | ${item_title} | ⚠️ Not pushable | - |"
+                row+=" Edited \`${workflow_edits}\` only; a commit touching"
+                row+=" .github/workflows/ cannot be pushed with the CI token,"
+                row+=" so this needs applying by hand |"
+            else
+                echo -e "${YELLOW}Claude reported a change but modified no file${NC}"
+                row="| ${item_id} | ${item_title} | ⏭️ Skipped | - |"
+                row+=" Reported a change but modified no file |"
+            fi
             echo "${row}" >> "${summary_file}"
             skipped_count=$((skipped_count + 1))
+            reset_worktree
             continue
         fi
 
@@ -566,18 +825,23 @@ PROMPT_EOF
 
         echo -e "${GREEN}Created commit: ${commit_sha}${NC}"
         row="| ${item_id} | ${item_title} | ✅ Fixed |"
-        row+=" \`${commit_sha}\` | ${change_summary} |"
+        row+=" \`${commit_sha}\` | ${change_summary}${row_notes} |"
         echo "${row}" >> "${summary_file}"
         addressed_count=$((addressed_count + 1))
+
+        # The commit emptied the index, but not the working tree: the
+        # .github/workflows/ edits the stager refused are still sitting
+        # there, and the next item's checks would read them as its own
+        # and tell a maintainer it made a workflow edit it never made.
+        # A no-op on the tree a well-behaved item leaves behind.
+        reset_worktree
     else
         echo -e "${YELLOW}No clear outcome from Claude${NC}"
         row="| ${item_id} | ${item_title} | ⚠️ Unclear | - |"
         row+=" No summary marker found |"
         echo "${row}" >> "${summary_file}"
         skipped_count=$((skipped_count + 1))
-
-        # Reset any unstaged changes
-        git checkout -- . 2>/dev/null || true
+        reset_worktree
     fi
 
     echo
