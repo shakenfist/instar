@@ -81,3 +81,17 @@ cd "$(git rev-parse --show-toplevel)"
 git reset -q HEAD -- . 2>/dev/null || true
 git checkout -- . 2>/dev/null || true
 git clean -qfd 2>/dev/null || true
+
+# The three commands above swallow their own failures, which covers the
+# unborn-HEAD case where `git reset HEAD` has nothing to reset. That
+# leaves nothing for a caller to act on, so the result is checked
+# rather than the exit codes: a file the fix made read-only, or a
+# directory the runner cannot write, and `git clean` leaves the residue
+# behind for the next item to commit under its own review id. Silence
+# there is the failure this script exists to prevent.
+REMAINING="$(git status --porcelain 2>/dev/null || true)"
+if [ -n "${REMAINING}" ]; then
+    echo "reset-autofix-worktree: work tree still dirty after reset" >&2
+    echo "${REMAINING}" >&2
+    exit 1
+fi

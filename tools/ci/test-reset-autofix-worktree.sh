@@ -175,6 +175,25 @@ check "exit 0" "${RC}" "0"
 check "nothing left" "$(dirt)" ""
 check "outside file restored" "$(cat "${D}/src/main.rs")" "fn main() {}"
 
+# The three git commands swallow their own failures, so the exit code
+# has to come from checking the result. Without that the caller's
+# warning is unreachable and a leak is silent -- which is the failure
+# this script exists to prevent, not a cosmetic issue.
+start "a tree that cannot be cleaned reports failure"
+setup
+if [ "$(id -u)" -eq 0 ]; then
+    echo "    skipped: running as root, which ignores the directory mode"
+else
+    mkdir -p "${D}/src/locked"
+    echo 'new' > "${D}/src/locked/stuck.rs"
+    chmod 0555 "${D}/src/locked"
+    run "${D}"
+    chmod 0755 "${D}/src/locked"
+    check "exit 1" "${RC}" "1"
+    contains "says the tree is still dirty" "${OUT}" "still dirty"
+    contains "names what is left" "${OUT}" "src/locked"
+fi
+
 start "argument handling"
 setup
 run --nonsense

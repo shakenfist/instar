@@ -87,6 +87,17 @@
 
 set -euo pipefail
 
+# What counts as a leftover rather than part of the fix. Shared with
+# address-comments-with-claude.sh, which stages new files onto a
+# review-comment commit and needs to skip exactly the same paths.
+#
+# Resolved here rather than at the point of use: this script cd's to
+# REPO_DIR and then to its top level, and fuzz-autofix.yml invokes it
+# by the relative path tools/ci/stage-autofix-changes.sh, so a dirname
+# taken after those cd's points somewhere else.
+# shellcheck source=tools/ci/autofix-artifact-patterns.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/autofix-artifact-patterns.sh"
+
 REFUSED=3
 
 usage() {
@@ -172,30 +183,6 @@ if [ "${MODE}" = snapshot ]; then
     exit 0
 fi
 
-# Editor backups and merge leftovers. `pre-commit run --all-files` is
-# in the prompt and its hooks produce these, so refusing on them would
-# refuse routine runs.
-ARTIFACT_NAMES='(^|/)(\.#[^/]*|[^/]*~|[^/]*\.(orig|rej|bak|tmp|swp|swo))$'
-
-# Build and test output directories. The prompt tells Claude to run
-# `make instar` and `make test-container-core`, and the latter writes
-# tests/.stestr/ and tests/__pycache__/ into the tree -- neither of
-# which exists when the baseline is taken, because nothing runs the
-# tests before the attempt. Without this, every attempt that follows
-# its own instructions is refused, and so is every attempt 2 after a
-# test failure, since `git clean -fd` has no -x and the directories
-# survive. These are names no regression fixture would legitimately
-# live under: the ARTIFACT_NAMES mechanism, not a judgement about
-# which new files are worth keeping.
-CI_OUTPUT_DIRS='(^|/)(\.stestr|__pycache__|target|\.cargo-cache|fuzz-logs|\.venv)/'
-
-# The same idea by filename, because .gitignore hides by pattern too.
-# `**/Cargo.lock` is the one that bites: any cargo invocation in a
-# workspace directory nothing built before the baseline creates one.
-# A refusal that fires on every run is not the cheap failure the
-# header argues for -- it is this workflow's original failure again,
-# every issue labelled autofix-failed and looking like a hard bug.
-CI_OUTPUT_NAMES='(^|/)(Cargo\.lock|\.DS_Store|[^/]*\.py[cod])$'
 
 declare -A REPORTED_WORKFLOW=()
 

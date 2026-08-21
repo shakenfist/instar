@@ -182,6 +182,19 @@ else
     cleanup_output=false
 fi
 
+# The per-item reset runs `git clean -fd` over the whole work tree, so
+# an output directory inside it is deleted partway through the run: the
+# next item's `jq` cannot find its item file, `set -e` aborts, and the
+# summary goes with it. The workflow keeps the two apart already; this
+# is so a local run cannot discover the coupling the hard way.
+output_real=$(realpath "${output_dir}" 2>/dev/null || echo "${output_dir}")
+if [ -n "${repo_top}" ] && \
+        [ "${output_real}" != "${output_real#"${repo_top}"/}" ]; then
+    echo -e "${RED}Error: --output-dir is inside the work tree: ${output_dir}${NC}"
+    echo "The per-item reset would delete it. Put it outside ${repo_top}."
+    exit 1
+fi
+
 cleanup() {
     if [ "${cleanup_output}" = true ]; then
         rm -rf "${output_dir}"
@@ -199,6 +212,17 @@ trap cleanup EXIT
 # tested; see the header there for what it discards and what it keeps.
 reset_worktree() {
     "${resetter}" "${work_dir}" || echo "Reset failed; the next item may inherit this one's edits"
+}
+
+# Give up on the current item without giving up on the run. Anything
+# that cannot tell whether Claude produced a fix has to end up here
+# rather than falling through: the empty-index branch would report
+# "modified no file", which is the #510 misreport by another name.
+item_error() {
+    echo -e "${RED}$1 for item ${i}${NC}"
+    echo "| ${item_id} | ${item_title} | ❌ Error | - | $1 |" >> "${summary_file}"
+    skipped_count=$((skipped_count + 1))
+    reset_worktree
 }
 
 # CI mode output helper
@@ -258,6 +282,7 @@ fi
 # reproduce either quietly.
 stager="${tools_dir}/ci/stage-autofix-changes.sh"
 resetter="${tools_dir}/ci/reset-autofix-worktree.sh"
+patterns="${tools_dir}/ci/autofix-artifact-patterns.sh"
 for helper in "${stager}" "${resetter}"; do
     if [ ! -x "${helper}" ]; then
         echo -e "${RED}Error: helper not found or not executable: ${helper}${NC}"
@@ -265,6 +290,28 @@ for helper in "${stager}" "${resetter}"; do
         exit 1
     fi
 done
+if [ ! -r "${patterns}" ]; then
+    echo -e "${RED}Error: helper not found or not readable: ${patterns}${NC}"
+    echo "TOOLS_DIR must point at a tools/ directory containing ci/."
+    exit 1
+fi
+
+# The same list the stager refuses on, so what it calls a leftover and
+# what this stages onto a commit cannot drift apart.
+# shellcheck source=tools/ci/autofix-artifact-patterns.sh
+. "${patterns}"
+
+# Every abandonment path discards staged edits, unstaged edits and new
+# files across the whole work tree. Against a fresh CI checkout that is
+# right. Against a maintainer's checkout it would throw away work they
+# never offered to this script, the first time an item is skipped, with
+# no prompt and no way back -- so a local run has to start clean.
+if [ "${ci_mode}" != true ] && [ -n "$(git -C "${repo_top}" status --porcelain)" ]; then
+    echo -e "${RED}Error: the work tree has uncommitted changes${NC}"
+    echo "Abandoning a review item discards staged edits, unstaged edits"
+    echo "and untracked files across ${repo_top}. Commit or stash first."
+    exit 1
+fi
 
 # Get PR number if not provided
 if [ -z "${pr_number}" ]; then
@@ -528,6 +575,27 @@ DISAGREEMENT_END
 - If the fix requires changes you're unsure about, explain and skip
 PROMPT_EOF
 
+    # What the tree already held, so what Claude adds can be told from
+    # what was lying around. Without this the staging below sweeps up
+    # every untracked path in the repo and attributes it to whichever
+    # item happened to finish next -- a developer's scratch file, or
+    # this run's own output directory, committed onto the pull request
+    # under someone else's review id.
+    untracked_before="${output_dir}/untracked-before-${i}.txt"
+    git -C "${repo_top}" ls-files --others --exclude-standard \
+        | LC_ALL=C sort > "${untracked_before}"
+
+    # git omits ignored paths from that listing entirely, so a new file
+    # matching a .gitignore rule is invisible to it -- and `**/*.bin` is
+    # in this repo's .gitignore, which is what a fuzz regression fixture
+    # is called. Taken with the stager's own snapshot mode so both
+    # scripts mean the same thing by "the ignored paths".
+    ignored_before="${output_dir}/ignored-before-${i}.txt"
+    if ! "${stager}" --snapshot "${ignored_before}" "${work_dir}" > /dev/null; then
+        item_error "Baseline snapshot failed"
+        continue
+    fi
+
     # Run Claude for this item
     echo "Running Claude Code..."
     claude_output_file="${output_dir}/claude-output-${i}.txt"
@@ -536,12 +604,7 @@ PROMPT_EOF
         --dangerously-skip-permissions \
         --max-turns "${max_turns}" \
         --output-format text > "${claude_output_file}" 2>&1; then
-        echo -e "${RED}Claude failed for item ${i}${NC}"
-        row="| ${item_id} | ${item_title} | ❌ Error | - |"
-        row+=" Claude execution failed |"
-        echo "${row}" >> "${summary_file}"
-        skipped_count=$((skipped_count + 1))
-        reset_worktree
+        item_error "Claude execution failed"
         continue
     fi
 
@@ -572,12 +635,7 @@ PROMPT_EOF
     # branch and report "modified no file", which is the #510 misreport
     # again by another route.
     if ! "${stager}" --tracked-only "${work_dir}"; then
-        echo -e "${RED}Staging failed for item ${i}${NC}"
-        row="| ${item_id} | ${item_title} | ❌ Error | - |"
-        row+=" Staging failed |"
-        echo "${row}" >> "${summary_file}"
-        skipped_count=$((skipped_count + 1))
-        reset_worktree
+        item_error "Staging failed"
         continue
     fi
 
@@ -606,15 +664,20 @@ PROMPT_EOF
     # unstaged the tracked ones, and adding an untracked one back
     # would break the push for every other item's commit.
     new_files=()
-    while IFS= read -r -d '' f; do
+    while IFS= read -r f; do
+        [ -n "${f}" ] || continue
         case "${f}" in
             .github/workflows/*) continue ;;
         esac
-        if [[ "${f}" =~ (^|/)(\.#[^/]*|[^/]*~|[^/]*\.(orig|rej|bak|tmp|swp|swo))$ ]]; then
+        if [[ "${f}" =~ ${ARTIFACT_NAMES} ]] \
+                || [[ "${f}" =~ ${CI_OUTPUT_DIRS} ]] \
+                || [[ "${f}" =~ ${CI_OUTPUT_NAMES} ]]; then
             continue
         fi
         new_files+=("${f}")
-    done < <(git -C "${repo_top}" ls-files --others --exclude-standard -z)
+    done < <(comm -13 "${untracked_before}" \
+        <(git -C "${repo_top}" ls-files --others --exclude-standard \
+            | LC_ALL=C sort))
 
     if [ ${#new_files[@]} -gt 0 ]; then
         echo -e "${YELLOW}Claude created files it did not stage:${NC}"
@@ -622,6 +685,39 @@ PROMPT_EOF
         git -C "${repo_top}" add -- "${new_files[@]}"
         row_notes+=" Also staged new file(s) Claude left untracked:"
         row_notes+=" $(printf '%s, ' "${new_files[@]}" | sed 's/, $//')."
+    fi
+
+    # A new file matching a .gitignore rule reaches neither `git add -u`
+    # nor the listing above, so without this it is dropped from the
+    # commit and the item reports "modified no file" -- #510 by a third
+    # route. Named rather than staged: adding one needs `git add -f`,
+    # and a path the repo ignores on purpose is a call for the
+    # maintainer reading the pull request, not for this script. The
+    # build and test output the prompt tells Claude to produce is
+    # filtered out, or every item that follows its instructions would
+    # report src/target/.
+    ignored_after="${output_dir}/ignored-after-${i}.txt"
+    if ! "${stager}" --snapshot "${ignored_after}" "${work_dir}" > /dev/null; then
+        item_error "Ignored-path snapshot failed"
+        continue
+    fi
+    new_ignored=()
+    while IFS= read -r f; do
+        [ -n "${f}" ] || continue
+        if [[ "${f}" =~ ${ARTIFACT_NAMES} ]] \
+                || [[ "${f}" =~ ${CI_OUTPUT_DIRS} ]] \
+                || [[ "${f}" =~ ${CI_OUTPUT_NAMES} ]]; then
+            continue
+        fi
+        new_ignored+=("${f}")
+    done < <(comm -13 "${ignored_before}" "${ignored_after}")
+
+    ignored_list=""
+    if [ ${#new_ignored[@]} -gt 0 ]; then
+        ignored_list=$(printf '%s, ' "${new_ignored[@]}" | sed 's/, $//')
+        echo -e "${YELLOW}Claude created ignored path(s): ${ignored_list}${NC}"
+        row_notes+=" Created ignored path(s) left out of the commit,"
+        row_notes+=" because .gitignore matches them: ${ignored_list}."
     fi
 
     # Read before the index check below, so the empty-index branch can
@@ -683,7 +779,13 @@ PROMPT_EOF
             # token. That needs a maintainer to apply it by hand, which
             # is a different response to "Claude did nothing", and the
             # reset below is about to destroy the evidence.
-            if [ -n "${workflow_edits}" ]; then
+            if [ -n "${ignored_list}" ]; then
+                echo -e "${YELLOW}Item created ignored path(s) only${NC}"
+                row="| ${item_id} | ${item_title} | ⚠️ Not staged | - |"
+                row+=" Created \`${ignored_list}\`, which .gitignore"
+                row+=" matches; add with \`git add -f\` by hand if it"
+                row+=" belongs in the tree |"
+            elif [ -n "${workflow_edits}" ]; then
                 echo -e "${YELLOW}Item edited .github/workflows/ only; not pushable${NC}"
                 row="| ${item_id} | ${item_title} | ⚠️ Not pushable | - |"
                 row+=" Edited \`${workflow_edits}\` only; a commit touching"
@@ -726,6 +828,13 @@ PROMPT_EOF
         row+=" \`${commit_sha}\` | ${change_summary}${row_notes} |"
         echo "${row}" >> "${summary_file}"
         addressed_count=$((addressed_count + 1))
+
+        # The commit emptied the index, but not the working tree: the
+        # .github/workflows/ edits the stager refused are still sitting
+        # there, and the next item's checks would read them as its own
+        # and tell a maintainer it made a workflow edit it never made.
+        # A no-op on the tree a well-behaved item leaves behind.
+        reset_worktree
     else
         echo -e "${YELLOW}No clear outcome from Claude${NC}"
         row="| ${item_id} | ${item_title} | ⚠️ Unclear | - |"

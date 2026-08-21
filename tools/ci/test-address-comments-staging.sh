@@ -93,6 +93,13 @@ case "${prompt}" in
     *ITEM-workflow*)
         echo 'name: edited' > .github/workflows/ci.yml
         summary 'Fix workflow' ;;
+    *ITEM-both*)
+        echo 'fn main() { both(); }' > src/main.rs
+        echo 'name: alsoedited' > .github/workflows/ci.yml
+        summary 'Fix both' ;;
+    *ITEM-ignored*)
+        echo 'crash' > docs/fixture.bin
+        summary 'Add fixture' ;;
     *ITEM-nothing*)
         summary 'Did nothing' ;;
     *ITEM-artifact*)
@@ -109,8 +116,8 @@ esac
 STUB
 chmod +x "${BIN}/claude"
 
-ITEMS='ITEM-tracked ITEM-newfile ITEM-newonly ITEM-workflow ITEM-nothing
-       ITEM-artifact ITEM-disagree ITEM-after'
+ITEMS='ITEM-tracked ITEM-newfile ITEM-newonly ITEM-workflow ITEM-ignored
+       ITEM-both ITEM-nothing ITEM-artifact ITEM-disagree ITEM-after'
 
 REVIEW="${WORK}/review.json"
 {
@@ -139,7 +146,7 @@ setup() {
     echo 'fn main() {}' > "${D}/src/main.rs"
     echo '# docs' > "${D}/docs/index.md"
     echo 'name: ci' > "${D}/.github/workflows/ci.yml"
-    printf 'target/\n' > "${D}/.gitignore"
+    printf 'target/\n**/*.bin\n' > "${D}/.gitignore"
     echo 'expensive' > "${D}/target/instar"
     git -C "${D}" add -A
     git -C "${D}" commit -qm base
@@ -153,9 +160,11 @@ added_commits() { git -C "${D}" log --oneline "${BASE_SHA}..HEAD" -- "$@"; }
 # Run the loop with TOOLS_DIR pointing wherever the case needs, which
 # is how CI supplies the base-branch copy of tools/.
 run() {
+    local tools="$1"
+    shift
     set +e
-    OUT="$(TOOLS_DIR="$1" WORK_DIR="${D}" CLAUDE_BIN="${BIN}/claude" \
-        "${ADDRESS}" --pr 511 --review-json "${REVIEW}" 2>&1)"
+    OUT="$(TOOLS_DIR="${tools}" WORK_DIR="${D}" CLAUDE_BIN="${BIN}/claude" \
+        "${ADDRESS}" --pr 511 --review-json "${REVIEW}" "$@" 2>&1)"
     RC=$?
     set -e
 }
@@ -201,8 +210,26 @@ lacks "not reported as changing nothing" "$(row ITEM-workflow)" "modified no fil
 check "workflow edit not committed" \
     "$(added_commits .github/workflows/ | wc -l)" "0"
 
+# The success path leaves the workflow edit the stager refused in the
+# tree. Without a reset after the commit it is still there when the
+# next item is judged, so an item that touched nothing is told it made
+# a workflow edit needing hand application.
+contains "mixed item is fixed" "$(row ITEM-both)" "✅ Fixed"
+contains "mixed item notes the dropped workflow edit" "$(row ITEM-both)" "Discarded"
+check "workflow edit not committed with it" \
+    "$(commit_files 'Fix both')" "src/main.rs"
+
 # An item that really changed nothing still has to say so.
 contains "empty item is skipped" "$(row ITEM-nothing)" "modified no file"
+lacks "empty item inherits no workflow residue" "$(row ITEM-nothing)" "Not pushable"
+lacks "empty item inherits no discard note" "$(row ITEM-nothing)" "Discarded"
+
+# git hides ignored paths from the untracked listing, and `**/*.bin` is
+# in this repo's .gitignore -- which is what a fuzz regression fixture
+# is called. Reported as changing nothing, it is #510 by a third route.
+lacks "ignored new file is not reported as no change" \
+    "$(row ITEM-ignored)" "modified no file"
+contains "ignored new file is named" "$(row ITEM-ignored)" "docs/fixture.bin"
 
 # pre-commit hooks leave these routinely, so they are not a fix.
 contains "editor leftover is not a fix" "$(row ITEM-artifact)" "modified no file"
@@ -225,7 +252,8 @@ check "ignored build output survives" "$(cat "${D}/target/instar")" "expensive"
 # commits one item's work under another's id.
 start "a TOOLS_DIR missing a helper refuses to start"
 setup
-for HELPER in stage-autofix-changes.sh reset-autofix-worktree.sh; do
+for HELPER in stage-autofix-changes.sh reset-autofix-worktree.sh \
+        autofix-artifact-patterns.sh; do
     PARTIAL="${WORK}/tools-no-${HELPER}"
     rm -rf "${PARTIAL}"
     cp -r "${REPO_ROOT}/tools" "${PARTIAL}"
@@ -253,6 +281,42 @@ contains "reports an error" "$(row ITEM-tracked)" "❌ Error"
 lacks "does not claim nothing changed" "$(row ITEM-tracked)" "modified no file"
 check "made no commit" "$(added_commits | wc -l)" "0"
 check "tree left clean" "$(git -C "${D}" status --porcelain)" ""
+
+# Staging swept every untracked path in the repo, so anything sitting
+# in the tree when an item finished was attributed to that item and
+# committed. --ci because the run refuses a dirty tree otherwise, which
+# is the other half of the same problem.
+start "a file the run did not create is never committed"
+setup
+echo 'mine' > "${D}/scratch.txt"
+run "${REPO_ROOT}/tools" --ci
+check "exit 0" "${RC}" "0"
+check "scratch file not committed" "$(added_commits scratch.txt | wc -l)" "0"
+contains "the item that did create one still works" \
+    "$(row ITEM-newfile)" "src/helper.rs"
+
+# The reset runs `git clean -fd` over the whole work tree, so an output
+# directory inside it is deleted partway through the run: the next
+# item's jq cannot find its file and set -e takes the summary with it.
+start "an output directory inside the work tree is refused"
+setup
+run "${REPO_ROOT}/tools" --output-dir "${D}/address-output"
+check "refuses" "${RC}" "1"
+contains "says why" "${OUT}" "inside the work tree"
+check "made no commit" "$(added_commits | wc -l)" "0"
+
+# Against a fresh CI checkout the reset is right. Against a
+# maintainer's checkout it would discard work the script was never
+# offered, the first time an item is skipped.
+start "a dirty work tree is refused outside CI mode"
+setup
+echo 'work in progress' > "${D}/src/main.rs"
+run "${REPO_ROOT}/tools"
+check "refuses" "${RC}" "1"
+contains "says why" "${OUT}" "uncommitted changes"
+check "local edit survives" "$(cat "${D}/src/main.rs")" "work in progress"
+run "${REPO_ROOT}/tools" --ci
+check "--ci proceeds anyway" "${RC}" "0"
 
 if [ "${FAILURES}" -ne 0 ]; then
     echo "${FAILURES} failure(s)" >&2
