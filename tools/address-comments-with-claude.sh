@@ -278,12 +278,15 @@ fi
 # missing, every item silently falls back to whatever Claude happened
 # to stage, which is the defect this script was fixed for (#510); if
 # the resetter is missing, an abandoned item's edits are committed
-# under the next item's review id. Better to refuse to start than to
-# reproduce either quietly.
+# under the next item's review id; if the result reader is missing,
+# `set -e` kills the run partway through the first item and takes the
+# summary table with it. Better to refuse to start than to reproduce
+# any of them quietly.
 stager="${tools_dir}/ci/stage-autofix-changes.sh"
 resetter="${tools_dir}/ci/reset-autofix-worktree.sh"
 patterns="${tools_dir}/ci/autofix-artifact-patterns.sh"
-for helper in "${stager}" "${resetter}"; do
+claude_result="${tools_dir}/ci/claude-result.sh"
+for helper in "${stager}" "${resetter}" "${claude_result}"; do
     if [ ! -x "${helper}" ]; then
         echo -e "${RED}Error: helper not found or not executable: ${helper}${NC}"
         echo "TOOLS_DIR must point at a tools/ directory containing ci/."
@@ -599,11 +602,54 @@ PROMPT_EOF
     # Run Claude for this item
     echo "Running Claude Code..."
     claude_output_file="${output_dir}/claude-output-${i}.txt"
+    claude_stream_file="${output_dir}/claude-stream-${i}.jsonl"
+    claude_stderr_file="${output_dir}/claude-stderr-${i}.txt"
 
-    if ! "${claude_bin}" -p "$(cat "${output_dir}/claude-prompt-${i}.txt")" \
+    # stream-json emits one JSON object per line as the run proceeds,
+    # so a run killed by the job timeout still leaves a usable prefix,
+    # and the final result line names the model the CLI resolved to --
+    # which is where the commit trailer below comes from. Plain
+    # `--output-format json` gives neither: it is written atomically at
+    # exit, and on turn exhaustion, the dominant outcome for a run
+    # capped by --max-turns, it omits `.result` entirely.
+    # --verbose is mandatory rather than decorative: under --print the
+    # CLI refuses stream-json without it.
+    #
+    # stderr goes to its own file instead of being folded in with
+    # `2>&1`, both so it cannot corrupt the stream and because a
+    # pre-flight CLI refusal writes there and nowhere else -- that is
+    # the file the reader falls back to.
+    #
+    # Unlike the two workflows that capture the same way, this is
+    # deliberately not piped through `tee`. The status checked below is
+    # `claude`'s own; a pipe would replace it with `tee`'s, and every
+    # failed run would be reported as a successful one that happened to
+    # say nothing.
+    claude_rc=0
+    "${claude_bin}" -p "$(cat "${output_dir}/claude-prompt-${i}.txt")" \
         --dangerously-skip-permissions \
         --max-turns "${max_turns}" \
-        --output-format text > "${claude_output_file}" 2>&1; then
+        --output-format stream-json \
+        --verbose \
+        > "${claude_stream_file}" 2> "${claude_stderr_file}" || claude_rc=$?
+
+    # Reduce the stream back to the text file the rest of this item
+    # reads: the DISAGREEMENT and CHANGE_SUMMARY markers are grepped
+    # out of it below, and what they wrap is published in the pull
+    # request's summary comment, so that filename must not change. The
+    # reader reconstructs the assistant text, appends a diagnostic
+    # block when the run reported an error or the stream has no result
+    # line, and prints the stderr file verbatim when the stream holds
+    # nothing usable at all.
+    #
+    # Deliberately before the exit status is acted on rather than
+    # inside the success branch: a run that failed is exactly the one
+    # whose stderr has to survive into the uploaded artifacts, and
+    # item_error's `continue` would skip this.
+    "${claude_result}" --text "${claude_stream_file}" \
+        --raw-fallback "${claude_stderr_file}" > "${claude_output_file}"
+
+    if [ "${claude_rc}" -ne 0 ]; then
         item_error "Claude execution failed"
         continue
     fi
@@ -816,8 +862,15 @@ PROMPT_EOF
             printf 'Prompt: @shakenfist-bot please address comments on PR #%s\n\n' \
                 "${pr_number}"
             printf 'Signed-off-by: Michael Still <mikal@stillhq.com>\n'
-            printf 'Assisted-By: Claude Code\n'
-            printf 'Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\n'
+            # The sign-off above is the human who owns this automation
+            # and stays hardcoded. The two Claude lines do not: the
+            # name baked in here went stale against a CLI that had long
+            # since stopped resolving to it, and the two other Claude
+            # automations had drifted to a different stale name again.
+            # This item's own stream says what ran, so the reader
+            # prints both lines from it, falling back to an unqualified
+            # `Co-Authored-By: Claude` when the stream does not say.
+            "${claude_result}" --trailer "${claude_stream_file}"
         } > "${commit_msg_file}"
 
         git commit -F "${commit_msg_file}"
