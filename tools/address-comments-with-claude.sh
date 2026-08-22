@@ -646,8 +646,33 @@ PROMPT_EOF
     # inside the success branch: a run that failed is exactly the one
     # whose stderr has to survive into the uploaded artifacts, and
     # item_error's `continue` would skip this.
+    #
+    # Guarded even though the reader is written never to fail, because
+    # this loop runs under `set -e` with nothing above it to catch an
+    # abort: the two workflows that call the same reader have
+    # `continue-on-error: true` and this script has no equivalent, so
+    # one non-zero exit here would end the run partway through an item
+    # and take the summary table with it. That is the failure the
+    # helper check at startup exists to prevent, and it must not come
+    # back through the call site. Degrade to a pointer at the raw
+    # stream, loudly -- never quietly, or a reader with no output is
+    # left thinking Claude said nothing.
+    reduce_rc=0
     "${claude_result}" --text "${claude_stream_file}" \
-        --raw-fallback "${claude_stderr_file}" > "${claude_output_file}"
+        --raw-fallback "${claude_stderr_file}" > "${claude_output_file}" \
+        || reduce_rc=$?
+    if [ "${reduce_rc}" -ne 0 ]; then
+        echo -e "${RED}Result reader failed (exit ${reduce_rc}) for item ${i}${NC}"
+        {
+            echo "The result reader exited ${reduce_rc}, so this item's output could"
+            echo "not be reduced from ${claude_stream_file}."
+            echo "The raw stream and stderr are in this run's uploaded artifacts."
+            if [ -s "${claude_stderr_file}" ]; then
+                echo
+                cat "${claude_stderr_file}"
+            fi
+        } > "${claude_output_file}"
+    fi
 
     if [ "${claude_rc}" -ne 0 ]; then
         item_error "Claude execution failed"
@@ -870,7 +895,16 @@ PROMPT_EOF
             # This item's own stream says what ran, so the reader
             # prints both lines from it, falling back to an unqualified
             # `Co-Authored-By: Claude` when the stream does not say.
-            "${claude_result}" --trailer "${claude_stream_file}"
+            #
+            # The `||` is the same guard as the reduction above: this
+            # is a `set -e` shell, and a non-zero exit inside this
+            # group would abandon the run with the commit unmade and
+            # the summary table unprinted. Writing the unqualified
+            # trailer by hand is the documented fallback, and it is
+            # still a valid trailer if the reader had already printed
+            # its first line before failing.
+            "${claude_result}" --trailer "${claude_stream_file}" \
+                || echo "Co-Authored-By: Claude <noreply@anthropic.com>"
         } > "${commit_msg_file}"
 
         git commit -F "${commit_msg_file}"

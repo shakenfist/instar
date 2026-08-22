@@ -94,7 +94,7 @@ echo 'error: unknown option --nonsense' > "${STDERR}"
 # --text
 # --------------------------------------------------------------------
 
-start "a successful stream prints the assistant text and no diagnostics"
+start "a successful stream prints the result string and no diagnostics"
 SUCCESS="${WORK}/success.jsonl"
 cat > "${SUCCESS}" <<'EOF'
 {"type":"system","subtype":"init","session_id":"abc","model":"claude-opus-5"}
@@ -105,10 +105,56 @@ cat > "${SUCCESS}" <<'EOF'
 EOF
 run --text "${SUCCESS}" --raw-fallback "${STDERR}"
 check "exit 0" "${RC}" "0"
-check "both text blocks, in order, tool_use skipped" "${OUT}" \
-    "$(printf 'Reading the header parser.\nFixed the offset check.')"
+# The old --output-format text semantics, exactly: the final result
+# text and nothing else. The narration above it is NOT included --
+# every consumer greps this output for a marker and one of them
+# branches on the result, so a superset is not a safe superset.
+check "the result string alone" "${OUT}" "Fixed the offset check."
+lacks "the narration is not concatenated in" "${OUT}" "Reading the header parser."
 lacks "no diagnostic block" "${OUT}" "==="
 lacks "the stderr fallback is not used" "${OUT}" "unknown option"
+
+# The regression this preference exists to stop. A run that drafts a
+# marker block and then restates it used to have both drafts
+# concatenated, and `sed -n '/START/,/END/p'` restarts its range on the
+# second START -- so fuzz-autofix.yml's commit message held both, and
+# address-comments-with-claude.sh, which BRANCHES on a marker, threw a
+# real fix away when a superseded DISAGREEMENT block came back.
+start "a restated marker block does not reach the output twice"
+RESTATED="${WORK}/restated.jsonl"
+cat > "${RESTATED}" <<'EOF'
+{"type":"assistant","message":{"content":[{"type":"text","text":"Let me draft this.\nCOMMIT_SUMMARY_START\nFix the thing (draft).\nCOMMIT_SUMMARY_END"}]}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"On reflection, better:\nCOMMIT_SUMMARY_START\nFix the thing properly.\nCOMMIT_SUMMARY_END"}]}}
+{"type":"result","subtype":"success","is_error":false,"num_turns":2,"result":"COMMIT_SUMMARY_START\nFix the thing properly.\nCOMMIT_SUMMARY_END","modelUsage":{"claude-opus-5":{"outputTokens":9,"contextWindow":1000000,"canonicalModel":"claude-opus-5"}}}
+EOF
+run --text "${RESTATED}" --raw-fallback "${STDERR}"
+check "exit 0" "${RC}" "0"
+check "one START marker only" \
+    "$(printf '%s\n' "${OUT}" | grep -c COMMIT_SUMMARY_START)" "1"
+lacks "the superseded draft is gone" "${OUT}" "Fix the thing (draft)."
+# The workflows' own extraction, run over this output verbatim.
+check "the workflow extraction yields only the final block" \
+    "$(printf '%s\n' "${OUT}" \
+        | sed -n '/COMMIT_SUMMARY_START/,/COMMIT_SUMMARY_END/p' \
+        | grep -v COMMIT_SUMMARY_START | grep -v COMMIT_SUMMARY_END | cat -s)" \
+    "Fix the thing properly."
+
+# ... and the other half: with no .result to prefer, the concatenation
+# is all there is, and losing it would empty the failure report this
+# script exists to fill. Same stream, turn-exhausted.
+start "with no result string the concatenation is still kept"
+RESTATED_MAXTURNS="${WORK}/restated-max-turns.jsonl"
+head -n 2 "${RESTATED}" > "${RESTATED_MAXTURNS}"
+printf '%s\n' \
+    '{"type":"result","subtype":"error_max_turns","is_error":true,"terminal_reason":"max_turns","num_turns":2,"errors":["Reached maximum number of turns (2)"],"modelUsage":{"claude-opus-5":{"outputTokens":9,"contextWindow":1000000,"canonicalModel":"claude-opus-5"}}}' \
+    >> "${RESTATED_MAXTURNS}"
+run --text "${RESTATED_MAXTURNS}" --raw-fallback "${STDERR}"
+check "exit 0" "${RC}" "0"
+contains "the draft survives" "${OUT}" "Fix the thing (draft)."
+contains "the restatement survives" "${OUT}" "Fix the thing properly."
+check "both blocks are there" \
+    "$(printf '%s\n' "${OUT}" | grep -c COMMIT_SUMMARY_START)" "2"
+contains "and the failure is still diagnosed" "${OUT}" "terminal_reason: max_turns"
 
 # The case the plan got wrong. .result is ABSENT, not empty, so a
 # helper that read .result would report nothing at all here -- and this
@@ -153,7 +199,7 @@ printf '%s\n' \
     > "${MALFORMED}"
 run --text "${MALFORMED}" --raw-fallback "${STDERR}"
 check "exit 0" "${RC}" "0"
-contains "the text survives" "${OUT}" "Said before the corruption."
+check "the result string survives the trailing garbage" "${OUT}" "ok"
 lacks "the good result line is still found, so no truncation notice" "${OUT}" "did not finish"
 run --trailer "${MALFORMED}"
 check "trailer exit 0" "${RC}" "0"
@@ -238,12 +284,86 @@ contains "reported as a failure" "${OUT}" "reported a failure"
 contains "the API status is named" "${OUT}" "api_error_status: 404"
 lacks "the stderr fallback is not used" "${OUT}" "unknown option"
 
-start "a result line with is_error false and no assistant text is quiet"
+# Used to print nothing at all, because there was no assistant text to
+# concatenate. The result string is text, and it is the only text this
+# run produced.
+start "a result line with is_error false and no assistant text prints the result"
 QUIET="${WORK}/quiet.jsonl"
 usage_stream "${QUIET}" '{"claude-opus-5":{"outputTokens":1,"contextWindow":1000000}}'
 run --text "${QUIET}" --raw-fallback "${STDERR}"
 check "exit 0" "${RC}" "0"
-check "no output" "${OUT}" ""
+check "the result string" "${OUT}" "done"
+lacks "no diagnostic block" "${OUT}" "==="
+
+# Nothing reconstructible by either route. Silence here is an empty
+# output file downstream, which reads exactly like a run that said
+# nothing -- so it has to say why, and name the file to go and read.
+start "a result line yielding no text at all says so instead of nothing"
+NOTEXT="${WORK}/no-text.jsonl"
+printf '%s\n' \
+    '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"modelUsage":{}}' \
+    > "${NOTEXT}"
+run --text "${NOTEXT}" --raw-fallback "${STDERR}"
+check "exit 0" "${RC}" "0"
+contains "says no text could be read" "${OUT}" "No text could be read"
+contains "names the stream file" "${OUT}" "${NOTEXT}"
+lacks "the stderr fallback is not used" "${OUT}" "unknown option"
+
+# A future CLI could emit .message.content as a bare string rather than
+# an array; `arrays` drops it, which is right, but the run must not
+# then look silent. The result string covers it, being a plain string
+# independent of the content-block schema.
+start "content as a bare string still produces output"
+BARESTR="${WORK}/bare-string.jsonl"
+printf '%s\n' \
+    '{"type":"assistant","message":{"content":"Fixed it in a new shape."}}' \
+    '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"result":"Fixed it in a new shape.","modelUsage":{}}' \
+    > "${BARESTR}"
+run --text "${BARESTR}" --raw-fallback "${STDERR}"
+check "exit 0" "${RC}" "0"
+check "the result string carries it" "${OUT}" "Fixed it in a new shape."
+
+start "content as a bare string with no result string degrades visibly"
+BARESTR2="${WORK}/bare-string-no-result.jsonl"
+printf '%s\n' \
+    '{"type":"assistant","message":{"content":"Fixed it in a new shape."}}' \
+    '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"modelUsage":{}}' \
+    > "${BARESTR2}"
+run --text "${BARESTR2}" --raw-fallback "${STDERR}"
+check "exit 0" "${RC}" "0"
+contains "not an empty file" "${OUT}" "No text could be read"
+contains "names the stream file" "${OUT}" "${BARESTR2}"
+
+# Whitespace reaches a marker grep exactly as zero bytes do, and tells
+# a human just as little, so it takes the same branch as no text.
+start "an assistant text block of only whitespace counts as no text"
+BLANK="${WORK}/blank-text.jsonl"
+printf '%s\n' \
+    '{"type":"assistant","message":{"content":[{"type":"text","text":"   \n  \t"}]}}' \
+    '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"modelUsage":{}}' \
+    > "${BLANK}"
+run --text "${BLANK}" --raw-fallback "${STDERR}"
+check "exit 0" "${RC}" "0"
+contains "reported rather than emitted as whitespace" "${OUT}" "No text could be read"
+
+# A run that FINISHED is judged by its result string alone, even when
+# that string is blank. Falling back to the narration here would let a
+# marker Claude typed mid-run and moved past reach a consumer that
+# branches on one -- which discards a real fix in the review-comment
+# loop. The narration is still in the uploaded stream; what is given
+# up is only its convenience, and only on a run that ended saying
+# nothing.
+start "a blank result string on a finished run does not fall back"
+BLANKRESULT="${WORK}/blank-result.jsonl"
+printf '%s\n' \
+    '{"type":"assistant","message":{"content":[{"type":"text","text":"DISAGREEMENT_START\nnot really\nDISAGREEMENT_END"}]}}' \
+    '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"result":"   ","modelUsage":{}}' \
+    > "${BLANKRESULT}"
+run --text "${BLANKRESULT}" --raw-fallback "${STDERR}"
+check "exit 0" "${RC}" "0"
+lacks "the mid-run marker does not survive" "${OUT}" "DISAGREEMENT_START"
+contains "says why there is no text" "${OUT}" "carries no"
+contains "names the stream file" "${OUT}" "${BLANKRESULT}"
 
 # --------------------------------------------------------------------
 # --trailer
@@ -323,6 +443,25 @@ run --trailer "${NOCANON}"
 check "the key is used" "$(trailer_line)" \
     "Co-Authored-By: Claude claude-sonnet-4-5-20250929 (200K context) <noreply@anthropic.com>"
 
+# The `strings` filter is what makes an explicit null behave like an
+# absent key rather than putting the word "null" in a commit trailer,
+# and nothing exercised it.
+start "a null canonicalModel falls back to the map key"
+NULLCANON="${WORK}/null-canonical.jsonl"
+usage_stream "${NULLCANON}" '{"claude-sonnet-4-5-20250929":{"outputTokens":12,"contextWindow":200000,"canonicalModel":null}}'
+run --trailer "${NULLCANON}"
+check "the key is used, not null" "$(trailer_line)" \
+    "Co-Authored-By: Claude claude-sonnet-4-5-20250929 (200K context) <noreply@anthropic.com>"
+
+# Likewise `numbers`: a window arriving as a JSON string must drop the
+# parenthetical rather than render an unvalidated value into it.
+start "a context window given as a string drops the parenthetical"
+STRWINDOW="${WORK}/string-window.jsonl"
+usage_stream "${STRWINDOW}" '{"claude-opus-5":{"outputTokens":1,"contextWindow":"1000000","canonicalModel":"claude-opus-5"}}'
+run --trailer "${STRWINDOW}"
+check "the model still lands, without a window" "$(trailer_line)" \
+    "Co-Authored-By: Claude claude-opus-5 <noreply@anthropic.com>"
+
 # Decision 2: no prettifying, no lookup table. The id goes out verbatim.
 start "the model id is emitted verbatim, not prettified"
 run --trailer "${SUCCESS}"
@@ -374,6 +513,47 @@ check "the later line is used" "$(trailer_line)" \
     "Co-Authored-By: Claude claude-opus-5 (1M context) <noreply@anthropic.com>"
 
 # --------------------------------------------------------------------
+# A broken environment
+# --------------------------------------------------------------------
+
+# "It does not fail" has to hold for a missing jq too. This script runs
+# under `set -euo pipefail` and address-comments-with-claude.sh calls
+# it from a `set -e` loop with no continue-on-error to catch an abort,
+# so a non-zero exit here would end that run and take its summary table
+# with it. Only cat and tail are linked in, which is everything the
+# degraded paths use, plus bash itself for the `/usr/bin/env bash`
+# shebang.
+NOJQ="${WORK}/nojq-bin"
+mkdir -p "${NOJQ}"
+for B in bash cat tail; do ln -sf "$(command -v "${B}")" "${NOJQ}/${B}"; done
+
+run_nojq() {
+    set +e
+    OUT="$(PATH="${NOJQ}" "${CLAUDE_RESULT}" "$@" 2>&1)"
+    RC=$?
+    set -e
+}
+
+start "a missing jq degrades rather than exiting non-zero"
+run_nojq --text "${SUCCESS}" --raw-fallback "${STDERR}"
+check "exit 0" "${RC}" "0"
+contains "says jq is missing" "${OUT}" "jq is not installed"
+contains "names the stream to read by hand" "${OUT}" "${SUCCESS}"
+contains "the stderr is still surfaced" "${OUT}" "unknown option"
+
+start "a missing jq still emits usable trailers"
+run_nojq --trailer "${SUCCESS}"
+check "exit 0" "${RC}" "0"
+check "Assisted-By" "$(printf '%s\n' "${OUT}" | sed -n '1p')" "Assisted-By: Claude Code"
+check "unqualified Co-Authored-By" "$(trailer_line)" \
+    "Co-Authored-By: Claude <noreply@anthropic.com>"
+check "exactly two lines" "$(printf '%s\n' "${OUT}" | wc -l | tr -d ' ')" "2"
+
+start "a missing jq does not turn a usage error into a success"
+run_nojq --nonsense
+check "still exits 2" "${RC}" "2"
+
+# --------------------------------------------------------------------
 # Usage
 # --------------------------------------------------------------------
 
@@ -393,6 +573,14 @@ run --text "${SUCCESS}" extra
 check "a stray positional argument" "${RC}" "2"
 run --trailer "${SUCCESS}" --raw-fallback "${STDERR}"
 check "--raw-fallback is meaningless with --trailer" "${RC}" "2"
+# Last-one-wins on a second mode flag would silently write a commit
+# trailer into a file the caller greps for COMMIT_SUMMARY.
+run --text "${SUCCESS}" --trailer "${SUCCESS}"
+check "two different mode flags" "${RC}" "2"
+run --trailer "${SUCCESS}" --text "${SUCCESS}"
+check "two different mode flags, other order" "${RC}" "2"
+run --text "${SUCCESS}" --text "${MALFORMED}"
+check "the same mode flag twice" "${RC}" "2"
 run --help
 check "help exits 0" "${RC}" "0"
 contains "help reports usage" "${OUT}" "usage:"

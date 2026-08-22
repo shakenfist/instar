@@ -53,6 +53,62 @@
 #     diagnosis with none at all. Whether the run failed is already
 #     known from `claude`'s own exit status at the call site.
 #
+#     That contract is why the one external dependency, jq, is checked
+#     for by hand below and degraded around rather than left to fail
+#     under this script's own `set -euo pipefail`. Both workflows are
+#     insulated by `continue-on-error: true`;
+#     address-comments-with-claude.sh is not, and runs its whole
+#     multi-item loop under `set -e`, so a missing jq there would
+#     abort the run and take the summary table with it. The only
+#     honest thing left is to say jq is missing, on stdout, and exit
+#     0.
+#
+# WHY --text PREFERS THE RESULT STRING
+#
+# --text does not simply concatenate every assistant message. When the
+# result line carries a `.result` key at all, that string alone is the
+# output -- even when it is blank. The concatenation is the fallback
+# only for a run that never got as far as a result string: turn
+# exhaustion and truncation, where the narration is all there is.
+#
+# The key's presence is the test rather than its content, because a
+# run that finished having said nothing at the end would otherwise
+# fall through to the narration, and a marker Claude typed mid-run and
+# moved past would reach a consumer that branches on one. In the
+# review-comment loop that discards a fix that was actually made.
+#
+# The automations this replaced captured `--output-format text`, which
+# printed the final result text and nothing else, and every consumer
+# was written against exactly that. fuzz-autofix.yml and
+# test-drift-fix.yml pull the COMMIT_SUMMARY block out with a single
+# `sed -n '/START/,/END/p'`, and address-comments-with-claude.sh
+# *branches* on `grep -q DISAGREEMENT_START`. Concatenating the whole
+# narration breaks both: a run that drafts a COMMIT_SUMMARY block and
+# then restates it makes sed restart its range on the second START, so
+# the commit message holds both drafts run together; and a run that
+# emits a disagreement block, moves past it and then fixes the item --
+# or merely quotes the marker while reasoning -- is recorded as
+# Skipped, at which point reset_worktree throws the fix away.
+#
+# Preferring `.result` reproduces the old `--output-format text`
+# semantics exactly for every run that finished, and keeps the
+# superset only for the cases this script exists to rescue: turn
+# exhaustion and truncation, where there is no `.result` at all and
+# the narration is the only thing left. One change here, rather than
+# teaching three consumers to keep only the last block.
+#
+# The dangerous half -- narration driving control flow -- closes
+# completely, and the reasoning is worth having written down. `.result`
+# is absent only when `claude` exited non-zero: turn exhaustion exits
+# 1, and a killed process never writes a result line at all. In
+# address-comments-with-claude.sh a non-zero `claude` reaches
+# item_error and `continue` before the marker scan below it, so no
+# fallback text can ever reach that branch. The one residual is a run
+# that exits 0 with a blank `.result` -- the CLI ends a successful run
+# on a final assistant message, so that would mean an empty final
+# message, which has not been observed -- and it degrades to this
+# script's pre-fix behaviour rather than to anything worse.
+#
 # WHY THE INPUT LOOKS LIKE THIS
 #
 # The automations used to capture `--output-format text` with stderr
@@ -64,9 +120,10 @@
 # run killed by a timeout leaves zero bytes on both streams. The
 # line-delimited stream fixes both: it tees for live CI output, a
 # killed run still leaves a usable prefix, and the assistant text
-# reconstructed from it is a superset of what `--output-format text`
-# gave. The cost is that every read here has to tolerate a file that
-# ends mid-line.
+# reconstructed from it is available as a superset of what
+# `--output-format text` gave -- used only when there is no `.result`
+# to prefer, for the reasons above. The cost is that every read here
+# has to tolerate a file that ends mid-line.
 #
 # Turn exhaustion is therefore the primary case, not an edge case. Its
 # result line carries `"subtype":"error_max_turns"`, `"is_error":true`,
@@ -76,13 +133,18 @@
 #
 # Usage:
 #   tools/ci/claude-result.sh --text STREAM [--raw-fallback FILE]
-#       Print the assistant text, followed by a diagnostic block if the
-#       run reported an error or the stream has no result line. If
-#       neither any assistant text nor any result line can be read,
-#       print FILE verbatim instead -- that is the pre-flight CLI error
-#       case, where `claude` wrote nothing to stdout but a real message
-#       to stderr, and that message has to survive into the issue
-#       comment.
+#       Print the run's text -- the result line's `.result` when it
+#       carries a non-blank one, otherwise every assistant text block
+#       in the stream, concatenated -- followed by a diagnostic block
+#       if the run reported an error or the stream has no result line.
+#       If a result line exists but no text could be reconstructed by
+#       either route, print a note naming the stream rather than
+#       nothing at all: downstream, an empty file is indistinguishable
+#       from a genuinely silent run. If neither any text nor any
+#       result line can be read, print FILE verbatim instead -- that
+#       is the pre-flight CLI error case, where `claude` wrote nothing
+#       to stdout but a real message to stderr, and that message has
+#       to survive into the issue comment.
 #
 #   tools/ci/claude-result.sh --trailer STREAM
 #       Print two lines:
@@ -106,13 +168,19 @@ STREAM=
 RAW_FALLBACK=
 while [ "$#" -gt 0 ]; do
     case "$1" in
+        # A second mode flag is a caller bug, not a preference: taking
+        # the last one silently would have `--text a --trailer b`
+        # write a commit trailer into a file the caller then greps for
+        # COMMIT_SUMMARY, and report nothing missing.
         --text)
+            [ -z "${MODE}" ] || { usage >&2; exit 2; }
             MODE=text
             STREAM="${2:-}"
             [ -n "${STREAM}" ] || { usage >&2; exit 2; }
             shift 2
             ;;
         --trailer)
+            [ -z "${MODE}" ] || { usage >&2; exit 2; }
             MODE=trailer
             STREAM="${2:-}"
             [ -n "${STREAM}" ] || { usage >&2; exit 2; }
@@ -137,6 +205,32 @@ fi
 if [ "${MODE}" != text ] && [ -n "${RAW_FALLBACK}" ]; then
     usage >&2
     exit 2
+fi
+
+# Checked here rather than left to fail at the first call: every read
+# below goes through jq, and this script's contract with its callers is
+# that it exits 0 and prints something usable no matter what it was
+# handed. A usage error is still a usage error, which is why this comes
+# after the parsing and not before it.
+if ! command -v jq > /dev/null 2>&1; then
+    case "${MODE}" in
+        text)
+            echo "jq is not installed, so ${STREAM} could not be read."
+            echo "The raw stream is in this run's uploaded artifacts; read it there."
+            if [ -n "${RAW_FALLBACK}" ] && [ -s "${RAW_FALLBACK}" ]; then
+                echo
+                cat "${RAW_FALLBACK}"
+            fi
+            ;;
+        trailer)
+            # The documented fallback for a stream that does not say
+            # what ran. A commit message is being assembled around
+            # this; it has to get valid trailers or none.
+            echo "Assisted-By: Claude Code"
+            echo "Co-Authored-By: Claude <noreply@anthropic.com>"
+            ;;
+    esac
+    exit 0
 fi
 
 # Every read of the stream goes through one of these two, and both are
@@ -179,11 +273,53 @@ last_result() {
     ' "${STREAM}" | tail -n 1
 }
 
-emit_text() {
-    local text result had_error diagnostics
+# Whitespace-only is empty for every purpose here. A file holding two
+# spaces reaches a marker grep exactly as a zero-byte one does, and
+# tells the human reading it just as little, so it must take the same
+# branches.
+is_blank() {
+    case "$1" in
+        *[![:space:]]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
 
-    text="$(assistant_text)"
+emit_text() {
+    local text result result_text has_result had_error diagnostics
+
     result="$(last_result)"
+
+    # `.result` first, the concatenated narration only as a fallback.
+    # See WHY --text PREFERS THE RESULT STRING at the top: the
+    # concatenation is a superset of what the old --output-format text
+    # produced, and consumers that grep for a marker -- one of which
+    # branches on it -- cannot take a superset.
+    #
+    # The test is whether the key EXISTS, not whether it is blank. A
+    # run that finished with a blank final message would otherwise
+    # fall through to the narration and could drive the disagreement
+    # branch off a marker Claude typed mid-run and moved past --
+    # discarding a real fix. That is a data-loss outcome; the thing
+    # given up to avoid it is inline narration on a run that said
+    # nothing at the end, which the note below still points at and
+    # which is in the uploaded stream either way.
+    result_text=
+    has_result=no
+    if [ -n "${result}" ]; then
+        if [ "$(printf '%s' "${result}" | jq -r 'has("result")')" = true ]; then
+            has_result=yes
+            result_text="$(printf '%s' "${result}" | jq -r '.result | strings // ""')"
+        fi
+    fi
+
+    if [ "${has_result}" = yes ]; then
+        text="${result_text}"
+    else
+        text="$(assistant_text)"
+    fi
+    if is_blank "${text}"; then
+        text=
+    fi
 
     if [ -z "${text}" ] && [ -z "${result}" ]; then
         # Nothing usable in the stream. The real message is on
@@ -224,7 +360,26 @@ emit_text() {
     fi
 
     had_error="$(printf '%s' "${result}" | jq -r 'if (.is_error == true) then "yes" else "no" end')"
-    [ "${had_error}" = yes ] || return 0
+    if [ "${had_error}" != yes ]; then
+        # A run that reported success and yet yielded no text by
+        # either route. Nothing above has printed anything, and the
+        # diagnostic block below is not reached, so without this the
+        # caller's output file is empty and every downstream report
+        # says only "No summary marker found". Reachable today when
+        # the stream uses a message shape neither read here
+        # understands -- .message.content as a bare string rather than
+        # an array, say -- which is precisely when a human needs to be
+        # sent to the raw stream.
+        if [ -z "${text}" ]; then
+            echo "No text could be read from ${STREAM}."
+            echo "It holds a result line reporting no error, but that line carries no"
+            echo "result string. Anything Claude said before it is in the raw stream,"
+            echo "which is in this run's uploaded artifacts -- it is deliberately not"
+            echo "reproduced here, because a marker typed mid-run and moved past must"
+            echo "not reach the consumers that branch on one."
+        fi
+        return 0
+    fi
 
     # Report .subtype, never branch on it: it reads "success" on an
     # API error. Only the keys that are present are named, because

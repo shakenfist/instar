@@ -70,11 +70,12 @@ export PATH="${BIN}:${PATH}"
 # stages none of it, which is what the real thing does.
 #
 # stdout is the `--output-format stream-json --verbose` stream the loop
-# now captures, not prose: one assistant line carrying the text the
-# markers are grepped out of, and one result line carrying the
-# .modelUsage the commit trailer is derived from. A stub that still
-# printed prose would leave the reduced output empty and turn every
-# case below into "No summary marker found".
+# now captures, not prose: assistant lines carrying the text, and a
+# result line repeating the final one in `.result` -- which is what the
+# reducer reports -- alongside the .modelUsage the commit trailer is
+# derived from. A stub that still printed prose would leave the reduced
+# output empty and turn every case below into "No summary marker
+# found".
 cat > "${BIN}/claude" <<'STUB'
 #!/usr/bin/env bash
 prompt=""
@@ -85,15 +86,25 @@ while [ $# -gt 0 ]; do
     esac
 done
 cd "${WORK_DIR}"
-say() {
+# One assistant line and nothing else: narration the run went on past.
+narrate() {
     jq -nc --arg t "$1" \
         '{type: "assistant",
           message: {content: [{type: "text", text: $t}]}}'
-    jq -nc '{type: "result", subtype: "success", is_error: false,
-             num_turns: 1,
-             modelUsage: {"claude-opus-5": {outputTokens: 4,
-                                            contextWindow: 1000000,
-                                            canonicalModel: "claude-opus-5"}}}'
+}
+# The last assistant line and the result line that ends the run. The
+# real CLI puts the final assistant message in `.result`, and the
+# reducer prefers it over the concatenated narration -- so a stub that
+# left `.result` out would not exercise the path the loop actually
+# takes.
+say() {
+    narrate "$1"
+    jq -nc --arg t "$1" \
+        '{type: "result", subtype: "success", is_error: false,
+          num_turns: 1, result: $t,
+          modelUsage: {"claude-opus-5": {outputTokens: 4,
+                                         contextWindow: 1000000,
+                                         canonicalModel: "claude-opus-5"}}}'
 }
 summary() { say "CHANGE_SUMMARY_START
 $1
@@ -133,12 +144,22 @@ DISAGREEMENT_END' ;;
     *ITEM-after*)
         echo 'fn main() { later(); }' > src/main.rs
         summary 'Later fix' ;;
+    # A disagreement raised mid-run and then abandoned: it argues the
+    # item away, changes its mind, and fixes it. Only the final message
+    # -- the one carrying the change summary -- describes the outcome.
+    *ITEM-reconsidered*)
+        narrate 'DISAGREEMENT_START
+On reflection I do not think this is a real problem
+DISAGREEMENT_END'
+        echo 'fn main() { reconsidered(); }' > src/main.rs
+        summary 'Fix after reconsidering' ;;
 esac
 STUB
 chmod +x "${BIN}/claude"
 
 ITEMS='ITEM-tracked ITEM-newfile ITEM-newonly ITEM-workflow ITEM-ignored
-       ITEM-both ITEM-nothing ITEM-artifact ITEM-disagree ITEM-after'
+       ITEM-both ITEM-nothing ITEM-artifact ITEM-disagree ITEM-after
+       ITEM-reconsidered'
 
 REVIEW="${WORK}/review.json"
 {
@@ -275,6 +296,21 @@ check "next item commits only its own file" \
 check "abandoned new file never committed" \
     "$(added_commits src/stray.rs | wc -l)" "0"
 
+# The other side of the same grep, and a data-loss path rather than a
+# reporting one. The DISAGREEMENT check is control flow: match it and
+# the item is recorded as Skipped and reset_worktree throws the working
+# tree away. A run that raised a disagreement mid-stream and then went
+# on to fix the item -- or that merely quoted the marker while
+# reasoning -- must not trip it, which is why the reducer reports the
+# final result text rather than every assistant message concatenated.
+contains "a reconsidered disagreement is still fixed" \
+    "$(row ITEM-reconsidered)" "✅ Fixed"
+lacks "not recorded as skipped" "$(row ITEM-reconsidered)" "Skipped"
+lacks "the abandoned rationale is not published" \
+    "$(row ITEM-reconsidered)" "On reflection"
+check "the fix is committed, not discarded" \
+    "$(commit_files 'Fix after reconsidering')" "src/main.rs"
+
 check "tree left clean" "$(git -C "${D}" status --porcelain)" ""
 check "ignored build output survives" "$(cat "${D}/target/instar")" "expensive"
 
@@ -315,6 +351,30 @@ contains "reports an error" "$(row ITEM-tracked)" "❌ Error"
 lacks "does not claim nothing changed" "$(row ITEM-tracked)" "modified no file"
 check "made no commit" "$(added_commits | wc -l)" "0"
 check "tree left clean" "$(git -C "${D}" status --porcelain)" ""
+
+# The reader is written never to fail, and is guarded anyway: this
+# loop is `set -e` with no continue-on-error above it, so one non-zero
+# exit would abandon the run mid-item and take the summary table with
+# it -- which is exactly what the startup helper check exists to
+# prevent, arriving through the call site instead.
+start "a failing result reader degrades instead of aborting the run"
+setup
+BADREADER="${WORK}/tools-broken-reader"
+rm -rf "${BADREADER}"
+cp -r "${REPO_ROOT}/tools" "${BADREADER}"
+printf '#!/bin/sh\nexit 3\n' > "${BADREADER}/ci/claude-result.sh"
+chmod +x "${BADREADER}/ci/claude-result.sh"
+READER_OUT="${WORK}/out-bad-reader"
+rm -rf "${READER_OUT}"
+run "${BADREADER}" --output-dir "${READER_OUT}"
+check "exit 0" "${RC}" "0"
+contains "says the reader failed" "${OUT}" "Result reader failed"
+contains "the summary table still reaches the end" "$(row ITEM-reconsidered)" \
+    "ITEM-reconsidered"
+contains "the output file names the failure" \
+    "$(cat "${READER_OUT}/claude-output-1.txt")" "The result reader exited 3"
+contains "the output file points at the raw stream" \
+    "$(cat "${READER_OUT}/claude-output-1.txt")" "claude-stream-1.jsonl"
 
 # Staging swept every untracked path in the repo, so anything sitting
 # in the tree when an item finished was attributed to that item and
