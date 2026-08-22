@@ -149,6 +149,30 @@ jobs:
     if: needs.check_paths.outputs.code_changed != 'false'
     runs-on: [self-hosted, debian-12, s]
     timeout-minutes: 30
+    # These jobs had no concurrency group at all, so a superseded run
+    # held its ephemeral runner to completion. github.ref is the
+    # obvious key and is right on every event except merge_group, where
+    # it is the per-attempt queue branch
+    # gh-readonly-queue/develop/pr-<N>-<SHA> and GitHub mints a fresh
+    # SHA every time it rebuilds the group -- which it does on every
+    # push to develop. Keyed on that, every rebuild lands in a group of
+    # its own and cancel-in-progress never matches, so branch the key on
+    # the event. See shakenfist/kerbside#284 and shakenfist/development
+    # audits/merge-group-cancellation.md.
+    #
+    # Cancelling is safe because this queue is serial
+    # (max_entries_to_build: 1), so any other in-flight merge_group run
+    # is by definition superseded and its queue branch already
+    # abandoned. The merge_group- prefix keeps a queue run from sharing
+    # a group with a workflow_dispatch run on develop, whose github.ref
+    # is the same string.
+    concurrency:
+      group: >-
+        ${{ github.workflow }}-build-and-test-${{
+        github.event_name == 'merge_group'
+        && format('merge_group-{0}', github.event.merge_group.base_ref)
+        || github.ref }}
+      cancel-in-progress: true
 
     env:
       DOCKER_BUILDKIT: 1
@@ -423,6 +447,13 @@ jobs:
       github.event_name == 'workflow_dispatch'
     runs-on: [self-hosted, debian-12, xl]
     timeout-minutes: 45
+    concurrency:
+      group: >-
+        ${{ github.workflow }}-package-build-${{
+        github.event_name == 'merge_group'
+        && format('merge_group-{0}', github.event.merge_group.base_ref)
+        || github.ref }}
+      cancel-in-progress: true
 
     env:
       DOCKER_BUILDKIT: 1
@@ -485,6 +516,13 @@ jobs:
     # from a flaky distro in the summary. Tighten once the first runs
     # give real numbers.
     timeout-minutes: 120
+    concurrency:
+      group: >-
+        ${{ github.workflow }}-package-matrix-${{ matrix.distro.name }}-${{
+        github.event_name == 'merge_group'
+        && format('merge_group-{0}', github.event.merge_group.base_ref)
+        || github.ref }}
+      cancel-in-progress: true
     # Quarantine hatch (master-plan flake policy): an entry that fails
     # twice consecutively for an established environmental reason gets
     # `allow_failure: true` added below, with a linked issue, and loses
