@@ -1050,6 +1050,35 @@ jobs:
 
           gh issue comment "$ISSUE_NUMBER" --body-file /tmp/fail-comment.txt
 
+      - name: Gzip Claude streams
+        if: always()
+        run: |
+          # claude-logs/ already holds the CLI's own session transcript
+          # in a different format, but claude-stream-N.jsonl is the raw
+          # bytes tools/ci/claude-result.sh actually parsed -- including
+          # every tool result (file contents, diffs, build output) --
+          # which is genuinely useful when debugging the helper itself,
+          # so it stays, just compressed: over a 30-turn run on this
+          # Rust tree it easily runs tens of megabytes uncompressed,
+          # against a 14-day retention.
+          #
+          # This has to run after `Commit, push, and create PR`, which
+          # is the last step to read a raw stream (it derives the
+          # commit trailer from claude-stream-${ATTEMPT}.jsonl) --
+          # gzipping any earlier would break that read.
+          #
+          # `if` rather than `[ -f ... ] && gzip`: steps run under
+          # `bash -e`, an unmatched glob leaves the pattern literal,
+          # and a trailing false test would make the loop -- and so
+          # the step -- exit non-zero. Most runs of this workflow find
+          # no eligible issue and write no stream at all, so that is
+          # the common case, not the rare one.
+          for f in ${GITHUB_WORKSPACE}/claude-stream-*.jsonl; do
+            if [ -f "$f" ]; then
+              gzip -f "$f"
+            fi
+          done
+
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v7
@@ -1064,7 +1093,7 @@ jobs:
             attempt1-diff.txt
             pre-run-ignored.txt
             pre-retry-ignored.txt
-            claude-stream-*.jsonl
+            claude-stream-*.jsonl.gz
             claude-stderr-*.txt
             stager-*.txt
             verify-build-*.txt

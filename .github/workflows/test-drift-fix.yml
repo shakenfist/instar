@@ -73,6 +73,30 @@ jobs:
       PR_REF: ${{ inputs.ref }}
 
     steps:
+      - name: Clear stale Claude stream files
+        if: always()
+        run: |
+          # actions/checkout below uses `path: instar`, so it cleans
+          # only the checkout -- claude-stream.jsonl and
+          # claude-stderr.txt, written at the workspace root by `Run
+          # Claude Code to fix issues`, survive into the next run on
+          # this self-hosted runner.
+          #
+          # Extract commit summary, Verify fixes, and Commit changes
+          # all gate on steps.claude_fix.outputs.claude_available,
+          # which is only set when the Claude step actually ran, so a
+          # stale file is never read as this run's output. What IS
+          # reachable is `Upload artifacts` below, which runs
+          # unconditionally (`if: always()`): a run whose Claude step
+          # is skipped (initial tests passed and no prior CI failures)
+          # would otherwise upload the *previous* run's
+          # claude-stream.jsonl and claude-stderr.txt under this run's
+          # artifact name, misleading anyone who opens it. Placed as
+          # the first step, ahead of the Claude step's own `if:` gate,
+          # so the cleanup happens whether or not that step runs.
+          rm -f ${{ github.workspace }}/claude-stream.jsonl \
+                ${{ github.workspace }}/claude-stderr.txt
+
       - name: Set environment variables
         run: |
           {
@@ -726,6 +750,26 @@ jobs:
               labels: ['test-failure', 'needs-attention']
             });
 
+      - name: Gzip Claude stream
+        if: always()
+        run: |
+          # claude-logs/ already holds the CLI's own session transcript
+          # in a different format, but claude-stream.jsonl is the raw
+          # bytes tools/ci/claude-result.sh actually parsed -- including
+          # every tool result (file contents, diffs, build output) --
+          # which is genuinely useful when debugging the helper itself,
+          # so it stays, just compressed: over a run on this Rust tree
+          # it easily runs tens of megabytes uncompressed, against a
+          # 14-day retention.
+          #
+          # This has to run after `Commit changes`, which is the last
+          # step to read the raw stream (it derives the commit trailer
+          # from claude-stream.jsonl) -- gzipping any earlier would
+          # break that read.
+          if [ -f ${{ github.workspace }}/claude-stream.jsonl ]; then
+            gzip -f ${{ github.workspace }}/claude-stream.jsonl
+          fi
+
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v7
@@ -736,7 +780,7 @@ jobs:
             ${{ github.workspace }}/test-output.txt
             ${{ github.workspace }}/verify-output.txt
             ${{ github.workspace }}/claude-output.txt
-            ${{ github.workspace }}/claude-stream.jsonl
+            ${{ github.workspace }}/claude-stream.jsonl.gz
             ${{ github.workspace }}/claude-stderr.txt
             ${{ github.workspace }}/claude-prompt.txt
             ${{ github.workspace }}/claude-changes.txt
