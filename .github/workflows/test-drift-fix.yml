@@ -421,10 +421,47 @@ jobs:
           # Record start time to find conversation logs created during this run
           start_time=$(date +%s)
 
+          # stream-json emits one JSON object per line as the run
+          # proceeds, so `tee` keeps live output in the CI log and a
+          # run killed by the job timeout still leaves a usable prefix.
+          # Plain `--output-format json` gives neither: it is written
+          # atomically at exit, and on turn exhaustion -- the dominant
+          # outcome for a run capped by --max-turns -- it omits
+          # `.result` entirely.
+          # --verbose is mandatory, not decorative: under --print the
+          # CLI refuses stream-json without it. stderr is captured to
+          # its own file rather than folded into stdout, both so it
+          # cannot corrupt the stream and because a pre-flight CLI
+          # error writes there and nowhere else -- that is the file the
+          # helper falls back to.
+          #
+          # The pipe makes the exit status `tee`'s rather than
+          # `claude`'s. Nothing here reads it (the step is
+          # continue-on-error and ends `|| true`), so there is
+          # deliberately no `pipefail`.
           claude -p "$(cat ${GITHUB_WORKSPACE}/claude-prompt.txt)" \
             --dangerously-skip-permissions \
             --max-turns ${{ inputs.max_turns || '50' }} \
-            --output-format text 2>&1 | tee ${GITHUB_WORKSPACE}/claude-output.txt || true
+            --output-format stream-json \
+            --verbose \
+            2> ${GITHUB_WORKSPACE}/claude-stderr.txt \
+            | tee ${GITHUB_WORKSPACE}/claude-stream.jsonl || true
+
+          # Reduce the stream back to the text file everything
+          # downstream reads -- `Extract commit summary` greps it for
+          # the COMMIT_SUMMARY markers, and it is what a human opens in
+          # the uploaded artifacts -- so that filename must not change.
+          # The helper reconstructs the assistant text, appends a
+          # diagnostic block when the run reported an error or the
+          # stream has no result line, and prints the stderr file
+          # verbatim when the stream holds nothing usable at all: a
+          # pre-flight CLI refusal writes only to stderr, and losing it
+          # would leave the failure with no explanation anywhere.
+          tools/ci/claude-result.sh \
+            --text ${GITHUB_WORKSPACE}/claude-stream.jsonl \
+            --raw-fallback ${GITHUB_WORKSPACE}/claude-stderr.txt \
+            > ${GITHUB_WORKSPACE}/claude-output.txt
+          cat ${GITHUB_WORKSPACE}/claude-output.txt
 
           # Collect Claude Code conversation logs for artifacts
           mkdir -p ${GITHUB_WORKSPACE}/claude-logs
@@ -508,6 +545,18 @@ jobs:
           if [ -n "$(git status --porcelain)" ]; then
             git add -A
 
+            # Build commit message. The trailer is derived from this
+            # run's own stream rather than hardcoded: this workflow
+            # named a hardcoded Opus release long after the CLI
+            # stopped resolving to it. The helper reads the model and
+            # context window the run itself reported, and emits an
+            # unqualified `Co-Authored-By: Claude` if the stream does
+            # not say. Every branch below writes a message file and a
+            # single `git commit -F` after the branching applies it,
+            # so the derived trailer can be appended without fighting
+            # a heredoc's baked-in indentation.
+            STREAM="${GITHUB_WORKSPACE}/claude-stream.jsonl"
+
             # Use Claude's commit summary if available, otherwise use fallback
             if [ "${{ steps.extract_summary.outputs.summary_found }}" == "true" ] && \
                [ -s ${GITHUB_WORKSPACE}/commit-summary.txt ]; then
@@ -518,31 +567,32 @@ jobs:
                 if [ "${IS_PR_RUN}" == "true" ]; then
                   echo "Triggered-By: @shakenfist-bot please attempt to fix on PR #${PR_NUMBER}"
                 fi
-                echo "Assisted-By: Claude Code"
-                echo "Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>"
+                tools/ci/claude-result.sh --trailer "${STREAM}"
               } > ${GITHUB_WORKSPACE}/commit-message.txt
-
-              git commit -F ${GITHUB_WORKSPACE}/commit-message.txt
             else
               # Fallback to generic message if no summary found
               if [ "${IS_PR_RUN}" == "true" ]; then
-                git commit -m "Fix test failures on PR #${PR_NUMBER}.
-
-          Claude Code automatically fixed test failures.
-
-          Triggered-By: @shakenfist-bot please attempt to fix on PR #${PR_NUMBER}
-          Assisted-By: Claude Code
-          Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>"
+                {
+                  echo "Fix test failures on PR #${PR_NUMBER}."
+                  echo ""
+                  echo "Claude Code automatically fixed test failures."
+                  echo ""
+                  echo "Triggered-By: @shakenfist-bot please attempt to fix on PR #${PR_NUMBER}"
+                  tools/ci/claude-result.sh --trailer "${STREAM}"
+                } > ${GITHUB_WORKSPACE}/commit-message.txt
               else
-                git commit -m "Fix test suite drift for ${DATESTAMP}.
-
-          Claude Code automatically fixed test failures and/or added new
-          test images to the integration test suite.
-
-          Assisted-By: Claude Code
-          Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>"
+                {
+                  echo "Fix test suite drift for ${DATESTAMP}."
+                  echo ""
+                  echo "Claude Code automatically fixed test failures and/or added new"
+                  echo "test images to the integration test suite."
+                  echo ""
+                  tools/ci/claude-result.sh --trailer "${STREAM}"
+                } > ${GITHUB_WORKSPACE}/commit-message.txt
               fi
             fi
+
+            git commit -F ${GITHUB_WORKSPACE}/commit-message.txt
           fi
 
       - name: Push changes (PR mode)
@@ -686,6 +736,8 @@ jobs:
             ${{ github.workspace }}/test-output.txt
             ${{ github.workspace }}/verify-output.txt
             ${{ github.workspace }}/claude-output.txt
+            ${{ github.workspace }}/claude-stream.jsonl
+            ${{ github.workspace }}/claude-stderr.txt
             ${{ github.workspace }}/claude-prompt.txt
             ${{ github.workspace }}/claude-changes.txt
             ${{ github.workspace }}/commit-summary.txt
