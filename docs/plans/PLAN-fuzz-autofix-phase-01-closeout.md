@@ -269,9 +269,22 @@ else in the master plan was found to be wrong.
    whenever the final result line reports `.is_error` or is missing
    entirely (a truncated stream). If the stream yields nothing usable
    at all it prints the raw stderr file verbatim, so the pre-flight
-   CLI errors of contract row 3 still reach the issue comment. A
-   trailer derived from an unusable stream falls back to
+   CLI errors of contract row 3 survive. A trailer derived from an
+   unusable stream falls back to
    `Co-Authored-By: Claude <noreply@anthropic.com>`.
+
+   *Corrected during step 3:* this plan asserted that
+   `fuzz-autofix.yml`'s `Report failure` step quotes
+   `claude-output-N.txt` into the issue comment. It does not — it
+   quotes `tail -30` of `claude-changes-N.txt` (git status, staged
+   diff, stager output), and the derived text file reaches a human
+   only through the uploaded run artifact and through
+   `Extract commit summary`'s marker grep. The claim *is* true of
+   `tools/address-comments-with-claude.sh`, which greps the same file
+   for `DISAGREEMENT_START` and `CHANGE_SUMMARY_START` and publishes
+   what it finds in the pull request's summary comment. The design is
+   unchanged — an empty derived file is still a real loss in both
+   places — but the stated reason was wrong for one of the two.
 
 7. **Prove the loop by dispatching on #485, and review the resulting
    PR on its merits.** Manual dispatch bypasses the label gate without

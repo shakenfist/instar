@@ -267,10 +267,15 @@ jobs:
           # the checkout -- everything written at the workspace root
           # survives into the next scheduled run on this self-hosted
           # runner. A stale rc of 3 would refuse a fresh attempt and
-          # report the previous run's files into the issue comment.
+          # report the previous run's files into the issue comment,
+          # and a stale claude stream would be parsed as this run's --
+          # reporting the previous run's text into the issue and
+          # deriving the commit trailer from the previous run's model.
           rm -f ${GITHUB_WORKSPACE}/stager-*.txt \
                 ${GITHUB_WORKSPACE}/pre-run-ignored.txt \
-                ${GITHUB_WORKSPACE}/pre-retry-ignored.txt
+                ${GITHUB_WORKSPACE}/pre-retry-ignored.txt \
+                ${GITHUB_WORKSPACE}/claude-stream-*.jsonl \
+                ${GITHUB_WORKSPACE}/claude-stderr-*.txt
 
           # Attempt 2 takes its own baseline in Prepare retry, once
           # the tree has been reset and attempt 1's refused files
@@ -280,11 +285,47 @@ jobs:
           tools/ci/stage-autofix-changes.sh \
             --snapshot ${GITHUB_WORKSPACE}/pre-run-ignored.txt
 
+          # stream-json emits one JSON object per line as the run
+          # proceeds, so `tee` keeps live output in the CI log and a
+          # run killed by the job timeout still leaves a usable prefix.
+          # Plain `--output-format json` gives neither: it is written
+          # atomically at exit, and on turn exhaustion -- the dominant
+          # outcome for a run capped by --max-turns -- it omits
+          # `.result` entirely.
+          # --verbose is mandatory, not decorative: under --print the
+          # CLI refuses stream-json without it. stderr is captured to
+          # its own file rather than folded into stdout, both so it
+          # cannot corrupt the stream and because a pre-flight CLI
+          # error writes there and nowhere else -- that is the file the
+          # helper falls back to.
+          #
+          # The pipe makes the exit status `tee`'s rather than
+          # `claude`'s. Nothing here reads it (the step is
+          # continue-on-error and ends `|| true`), so there is
+          # deliberately no `pipefail`.
           claude -p "$(cat ${GITHUB_WORKSPACE}/autofix-prompt.txt)" \
             --dangerously-skip-permissions \
             --max-turns ${MAX_TURNS} \
-            --output-format text \
-            2>&1 | tee ${GITHUB_WORKSPACE}/claude-output-1.txt || true
+            --output-format stream-json \
+            --verbose \
+            2> ${GITHUB_WORKSPACE}/claude-stderr-1.txt \
+            | tee ${GITHUB_WORKSPACE}/claude-stream-1.jsonl || true
+
+          # Reduce the stream back to the text file everything
+          # downstream reads -- `Extract commit summary` greps it for
+          # the COMMIT_SUMMARY markers, and it is what a human opens in
+          # the uploaded artifacts -- so that filename must not change.
+          # The helper reconstructs the assistant text, appends a
+          # diagnostic block when the run reported an error or the
+          # stream has no result line, and prints the stderr file
+          # verbatim when the stream holds nothing usable at all: a
+          # pre-flight CLI refusal writes only to stderr, and losing it
+          # would leave the failure with no explanation anywhere.
+          tools/ci/claude-result.sh \
+            --text ${GITHUB_WORKSPACE}/claude-stream-1.jsonl \
+            --raw-fallback ${GITHUB_WORKSPACE}/claude-stderr-1.txt \
+            > ${GITHUB_WORKSPACE}/claude-output-1.txt
+          cat ${GITHUB_WORKSPACE}/claude-output-1.txt
 
           mkdir -p ${GITHUB_WORKSPACE}/claude-logs
           find ~/.claude/projects -name "*.jsonl" -newermt "@${start_time}" \
@@ -592,11 +633,47 @@ jobs:
 
           start_time=$(date +%s)
 
+          # stream-json emits one JSON object per line as the run
+          # proceeds, so `tee` keeps live output in the CI log and a
+          # run killed by the job timeout still leaves a usable prefix.
+          # Plain `--output-format json` gives neither: it is written
+          # atomically at exit, and on turn exhaustion -- the dominant
+          # outcome for a run capped by --max-turns -- it omits
+          # `.result` entirely.
+          # --verbose is mandatory, not decorative: under --print the
+          # CLI refuses stream-json without it. stderr is captured to
+          # its own file rather than folded into stdout, both so it
+          # cannot corrupt the stream and because a pre-flight CLI
+          # error writes there and nowhere else -- that is the file the
+          # helper falls back to.
+          #
+          # The pipe makes the exit status `tee`'s rather than
+          # `claude`'s. Nothing here reads it (the step is
+          # continue-on-error and ends `|| true`), so there is
+          # deliberately no `pipefail`.
           claude -p "$(cat ${GITHUB_WORKSPACE}/autofix-prompt-2.txt)" \
             --dangerously-skip-permissions \
             --max-turns ${MAX_TURNS} \
-            --output-format text \
-            2>&1 | tee ${GITHUB_WORKSPACE}/claude-output-2.txt || true
+            --output-format stream-json \
+            --verbose \
+            2> ${GITHUB_WORKSPACE}/claude-stderr-2.txt \
+            | tee ${GITHUB_WORKSPACE}/claude-stream-2.jsonl || true
+
+          # Reduce the stream back to the text file everything
+          # downstream reads -- `Extract commit summary` greps it for
+          # the COMMIT_SUMMARY markers, and it is what a human opens in
+          # the uploaded artifacts -- so that filename must not change.
+          # The helper reconstructs the assistant text, appends a
+          # diagnostic block when the run reported an error or the
+          # stream has no result line, and prints the stderr file
+          # verbatim when the stream holds nothing usable at all: a
+          # pre-flight CLI refusal writes only to stderr, and losing it
+          # would leave the failure with no explanation anywhere.
+          tools/ci/claude-result.sh \
+            --text ${GITHUB_WORKSPACE}/claude-stream-2.jsonl \
+            --raw-fallback ${GITHUB_WORKSPACE}/claude-stderr-2.txt \
+            > ${GITHUB_WORKSPACE}/claude-output-2.txt
+          cat ${GITHUB_WORKSPACE}/claude-output-2.txt
 
           find ~/.claude/projects -name "*.jsonl" -newermt "@${start_time}" \
             -exec cp {} ${GITHUB_WORKSPACE}/claude-logs/ \; 2>/dev/null || true
@@ -840,26 +917,39 @@ jobs:
             exit 0
           fi
 
-          # Build commit message
+          # Build commit message. The trailer is derived from the
+          # winning attempt's own stream rather than hardcoded: this
+          # workflow named a hardcoded Opus release long after the CLI
+          # stopped resolving to it, and the two other Claude
+          # automations had drifted to a different stale name again.
+          # The helper reads the model and context window the run
+          # itself reported, and emits an unqualified
+          # `Co-Authored-By: Claude` if the stream does not say.
+          # Both branches write a message file and
+          # use `git commit -F`, so the two derived lines can be
+          # appended without fighting a heredoc's baked-in indentation.
+          ATTEMPT=${{ steps.result.outputs.attempt }}
+          STREAM="${GITHUB_WORKSPACE}/claude-stream-${ATTEMPT}.jsonl"
+
           if [ "${{ steps.extract_summary.outputs.summary_found }}" == "true" ] && \
              [ -s ${GITHUB_WORKSPACE}/commit-summary.txt ]; then
             {
               cat ${GITHUB_WORKSPACE}/commit-summary.txt
               echo ""
-              echo "Assisted-By: Claude Code"
-              echo "Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>"
+              tools/ci/claude-result.sh --trailer "${STREAM}"
             } > ${GITHUB_WORKSPACE}/commit-message.txt
-            git commit -F ${GITHUB_WORKSPACE}/commit-message.txt
           else
-            git commit -m "Fix fuzzer crash in issue #${ISSUE_NUMBER}.
-
-          Automated fix for security-audit issue.
-
-          Fixes #${ISSUE_NUMBER}
-
-          Assisted-By: Claude Code
-          Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>"
+            {
+              echo "Fix fuzzer crash in issue #${ISSUE_NUMBER}."
+              echo ""
+              echo "Automated fix for security-audit issue."
+              echo ""
+              echo "Fixes #${ISSUE_NUMBER}"
+              echo ""
+              tools/ci/claude-result.sh --trailer "${STREAM}"
+            } > ${GITHUB_WORKSPACE}/commit-message.txt
           fi
+          git commit -F ${GITHUB_WORKSPACE}/commit-message.txt
 
           # Push and create PR
           BRANCH="autofix/issue-${ISSUE_NUMBER}"
@@ -974,6 +1064,8 @@ jobs:
             attempt1-diff.txt
             pre-run-ignored.txt
             pre-retry-ignored.txt
+            claude-stream-*.jsonl
+            claude-stderr-*.txt
             stager-*.txt
             verify-build-*.txt
             verify-test-*.txt

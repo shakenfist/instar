@@ -43,11 +43,15 @@
 #     ever reported, never branched on.
 #
 #   * It does not fail. A truncated, malformed or entirely empty
-#     stream is an expected input, not an exceptional one, and the
-#     callers redirect this script's stdout into a file they quote into
-#     a GitHub issue comment. Exiting non-zero there would replace a
-#     partial diagnosis with none at all. Whether the run failed is
-#     already known from `claude`'s own exit status at the call site.
+#     stream is an expected input, not an exceptional one, and every
+#     caller redirects this script's stdout into a file it then reads
+#     for markers and publishes: fuzz-autofix.yml greps it for the
+#     COMMIT_SUMMARY block and uploads it as a run artifact, and
+#     address-comments-with-claude.sh greps it for DISAGREEMENT_START
+#     and CHANGE_SUMMARY_START, whose contents reach the pull request's
+#     summary comment. Exiting non-zero there would replace a partial
+#     diagnosis with none at all. Whether the run failed is already
+#     known from `claude`'s own exit status at the call site.
 #
 # WHY THE INPUT LOOKS LIKE THIS
 #
@@ -182,10 +186,10 @@ emit_text() {
     result="$(last_result)"
 
     if [ -z "${text}" ] && [ -z "${result}" ]; then
-        # Nothing usable in the stream. The real message is on stderr:
-        # `claude` refuses a bad flag or an empty prompt before it
-        # writes a single line of stdout, and a CI step quotes this
-        # output into a GitHub issue comment.
+        # Nothing usable in the stream. The real message is on
+        # stderr: `claude` refuses a bad flag or an empty prompt
+        # before it writes a single line of stdout, and this output is
+        # the only place a human will look for the reason.
         if [ -n "${RAW_FALLBACK}" ] && [ -s "${RAW_FALLBACK}" ]; then
             cat "${RAW_FALLBACK}"
             return 0
