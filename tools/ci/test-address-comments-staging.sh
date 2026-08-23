@@ -68,6 +68,14 @@ export PATH="${BIN}:${PATH}"
 # prompt. Each branch leaves the working tree in one of the states the
 # loop has to tell apart, and -- the point of the whole exercise --
 # stages none of it, which is what the real thing does.
+#
+# stdout is the `--output-format stream-json --verbose` stream the loop
+# now captures, not prose: assistant lines carrying the text, and a
+# result line repeating the final one in `.result` -- which is what the
+# reducer reports -- alongside the .modelUsage the commit trailer is
+# derived from. A stub that still printed prose would leave the reduced
+# output empty and turn every case below into "No summary marker
+# found".
 cat > "${BIN}/claude" <<'STUB'
 #!/usr/bin/env bash
 prompt=""
@@ -78,7 +86,29 @@ while [ $# -gt 0 ]; do
     esac
 done
 cd "${WORK_DIR}"
-summary() { echo 'CHANGE_SUMMARY_START'; echo "$1"; echo 'CHANGE_SUMMARY_END'; }
+# One assistant line and nothing else: narration the run went on past.
+narrate() {
+    jq -nc --arg t "$1" \
+        '{type: "assistant",
+          message: {content: [{type: "text", text: $t}]}}'
+}
+# The last assistant line and the result line that ends the run. The
+# real CLI puts the final assistant message in `.result`, and the
+# reducer prefers it over the concatenated narration -- so a stub that
+# left `.result` out would not exercise the path the loop actually
+# takes.
+say() {
+    narrate "$1"
+    jq -nc --arg t "$1" \
+        '{type: "result", subtype: "success", is_error: false,
+          num_turns: 1, result: $t,
+          modelUsage: {"claude-opus-5": {outputTokens: 4,
+                                         contextWindow: 1000000,
+                                         canonicalModel: "claude-opus-5"}}}'
+}
+summary() { say "CHANGE_SUMMARY_START
+$1
+CHANGE_SUMMARY_END"; }
 case "${prompt}" in
     *ITEM-tracked*)
         echo 'fn main() { fixed(); }' > src/main.rs
@@ -108,16 +138,28 @@ case "${prompt}" in
     *ITEM-disagree*)
         echo 'fn main() { half_done(); }' > src/main.rs
         echo 'stray' > src/stray.rs
-        echo 'DISAGREEMENT_START'; echo 'Not a real problem'; echo 'DISAGREEMENT_END' ;;
+        say 'DISAGREEMENT_START
+Not a real problem
+DISAGREEMENT_END' ;;
     *ITEM-after*)
         echo 'fn main() { later(); }' > src/main.rs
         summary 'Later fix' ;;
+    # A disagreement raised mid-run and then abandoned: it argues the
+    # item away, changes its mind, and fixes it. Only the final message
+    # -- the one carrying the change summary -- describes the outcome.
+    *ITEM-reconsidered*)
+        narrate 'DISAGREEMENT_START
+On reflection I do not think this is a real problem
+DISAGREEMENT_END'
+        echo 'fn main() { reconsidered(); }' > src/main.rs
+        summary 'Fix after reconsidering' ;;
 esac
 STUB
 chmod +x "${BIN}/claude"
 
 ITEMS='ITEM-tracked ITEM-newfile ITEM-newonly ITEM-workflow ITEM-ignored
-       ITEM-both ITEM-nothing ITEM-artifact ITEM-disagree ITEM-after'
+       ITEM-both ITEM-nothing ITEM-artifact ITEM-disagree ITEM-after
+       ITEM-reconsidered'
 
 REVIEW="${WORK}/review.json"
 {
@@ -189,6 +231,17 @@ check "exit 0" "${RC}" "0"
 contains "tracked edit is fixed" "$(row ITEM-tracked)" "✅ Fixed"
 check "tracked edit committed" "$(commit_files 'Fix main')" "src/main.rs"
 
+# The trailer names whatever the stream said ran, rather than a model
+# name typed in once and left to go stale -- which is what it had done.
+TRACKED_MSG="$(git -C "${D}" log --format='%H %s' | grep -F ' Fix main.' \
+    | head -1 | cut -d' ' -f1 \
+    | xargs -r git -C "${D}" log -1 --format=%B)"
+contains "trailer names the model the stream reported" "${TRACKED_MSG}" \
+    "Co-Authored-By: Claude claude-opus-5 (1M context) <noreply@anthropic.com>"
+contains "trailer keeps the sign-off" "${TRACKED_MSG}" \
+    "Signed-off-by: Michael Still"
+lacks "trailer names no hardcoded model" "${TRACKED_MSG}" "Opus 4"
+
 # The defect the --tracked-only mode opens up. `git add -u` cannot see
 # a file Claude created, so before this the commit went out saying
 # "Fixed" with the new file missing from it entirely.
@@ -243,17 +296,34 @@ check "next item commits only its own file" \
 check "abandoned new file never committed" \
     "$(added_commits src/stray.rs | wc -l)" "0"
 
+# The other side of the same grep, and a data-loss path rather than a
+# reporting one. The DISAGREEMENT check is control flow: match it and
+# the item is recorded as Skipped and reset_worktree throws the working
+# tree away. A run that raised a disagreement mid-stream and then went
+# on to fix the item -- or that merely quoted the marker while
+# reasoning -- must not trip it, which is why the reducer reports the
+# final result text rather than every assistant message concatenated.
+contains "a reconsidered disagreement is still fixed" \
+    "$(row ITEM-reconsidered)" "✅ Fixed"
+lacks "not recorded as skipped" "$(row ITEM-reconsidered)" "Skipped"
+lacks "the abandoned rationale is not published" \
+    "$(row ITEM-reconsidered)" "On reflection"
+check "the fix is committed, not discarded" \
+    "$(commit_files 'Fix after reconsidering')" "src/main.rs"
+
 check "tree left clean" "$(git -C "${D}" status --porcelain)" ""
 check "ignored build output survives" "$(cat "${D}/target/instar")" "expensive"
 
-# Both helpers are resolved from TOOLS_DIR, which in CI is a sparse
+# The helpers are resolved from TOOLS_DIR, which in CI is a sparse
 # checkout of the base branch. A missing one must stop the run: falling
-# back to whatever Claude staged is #510, and skipping the reset
-# commits one item's work under another's id.
+# back to whatever Claude staged is #510, skipping the reset commits
+# one item's work under another's id, and without the result reader
+# `set -e` kills the run partway through the first item and takes the
+# summary table with it.
 start "a TOOLS_DIR missing a helper refuses to start"
 setup
 for HELPER in stage-autofix-changes.sh reset-autofix-worktree.sh \
-        autofix-artifact-patterns.sh; do
+        autofix-artifact-patterns.sh claude-result.sh; do
     PARTIAL="${WORK}/tools-no-${HELPER}"
     rm -rf "${PARTIAL}"
     cp -r "${REPO_ROOT}/tools" "${PARTIAL}"
@@ -282,6 +352,30 @@ lacks "does not claim nothing changed" "$(row ITEM-tracked)" "modified no file"
 check "made no commit" "$(added_commits | wc -l)" "0"
 check "tree left clean" "$(git -C "${D}" status --porcelain)" ""
 
+# The reader is written never to fail, and is guarded anyway: this
+# loop is `set -e` with no continue-on-error above it, so one non-zero
+# exit would abandon the run mid-item and take the summary table with
+# it -- which is exactly what the startup helper check exists to
+# prevent, arriving through the call site instead.
+start "a failing result reader degrades instead of aborting the run"
+setup
+BADREADER="${WORK}/tools-broken-reader"
+rm -rf "${BADREADER}"
+cp -r "${REPO_ROOT}/tools" "${BADREADER}"
+printf '#!/bin/sh\nexit 3\n' > "${BADREADER}/ci/claude-result.sh"
+chmod +x "${BADREADER}/ci/claude-result.sh"
+READER_OUT="${WORK}/out-bad-reader"
+rm -rf "${READER_OUT}"
+run "${BADREADER}" --output-dir "${READER_OUT}"
+check "exit 0" "${RC}" "0"
+contains "says the reader failed" "${OUT}" "Result reader failed"
+contains "the summary table still reaches the end" "$(row ITEM-reconsidered)" \
+    "ITEM-reconsidered"
+contains "the output file names the failure" \
+    "$(cat "${READER_OUT}/claude-output-1.txt")" "The result reader exited 3"
+contains "the output file points at the raw stream" \
+    "$(cat "${READER_OUT}/claude-output-1.txt")" "claude-stream-1.jsonl"
+
 # Staging swept every untracked path in the repo, so anything sitting
 # in the tree when an item finished was attributed to that item and
 # committed. --ci because the run refuses a dirty tree otherwise, which
@@ -294,6 +388,32 @@ check "exit 0" "${RC}" "0"
 check "scratch file not committed" "$(added_commits scratch.txt | wc -l)" "0"
 contains "the item that did create one still works" \
     "$(row ITEM-newfile)" "src/helper.rs"
+
+# The capture writes stdout to a JSONL stream and stderr to its own
+# file, and neither is piped -- a pipe would hand the `if` below
+# `tee`'s exit status instead of `claude`'s, and a run that died would
+# be reported as one that simply said nothing. The reduction runs
+# before the status is acted on, so the stderr of a run that failed is
+# still what a maintainer reads in the artifacts.
+start "a claude that exits non-zero is an item-level error"
+setup
+FAILING="${WORK}/claude-failing"
+printf '#!/bin/sh\necho "boom: model unavailable" >&2\nexit 1\n' > "${FAILING}"
+chmod +x "${FAILING}"
+FAILING_OUT="${WORK}/out-failing"
+rm -rf "${FAILING_OUT}"
+set +e
+OUT="$(TOOLS_DIR="${REPO_ROOT}/tools" WORK_DIR="${D}" CLAUDE_BIN="${FAILING}" \
+    "${ADDRESS}" --pr 511 --review-json "${REVIEW}" \
+    --output-dir "${FAILING_OUT}" 2>&1)"
+RC=$?
+set -e
+check "exit 0" "${RC}" "0"
+contains "reports an error" "$(row ITEM-tracked)" "❌ Error"
+contains "names the failure" "$(row ITEM-tracked)" "Claude execution failed"
+check "made no commit" "$(added_commits | wc -l)" "0"
+contains "stderr reaches the reported output" \
+    "$(cat "${FAILING_OUT}/claude-output-1.txt")" "boom: model unavailable"
 
 # The reset runs `git clean -fd` over the whole work tree, so an output
 # directory inside it is deleted partway through the run: the next

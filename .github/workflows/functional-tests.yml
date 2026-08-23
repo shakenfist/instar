@@ -138,6 +138,9 @@ jobs:
       - name: Test the autofix stager
         run: tools/ci/test-stage-autofix-changes.sh
 
+      - name: Test the Claude result parser
+        run: tools/ci/test-claude-result.sh
+
       - name: Test the autofix worktree reset
         run: tools/ci/test-reset-autofix-worktree.sh
 
