@@ -127,6 +127,10 @@ alongside the work it describes, with phase plans named
 `docs/plans/index.md` summarises every master plan; `docs/plans/order.yml`
 controls the documentation navigation order.
 
+`PUSH-AUDIT.md` at the repo root is the pre-push audit runbook — two
+waves of build, lint and judgment checks over a change — and it runs as
+the last phase of every master plan.
+
 Plan phase numbers belong in plan documents only. Documentation
 describes what the software does today; if a feature is not built yet,
 link the master plan rather than citing a phase.
