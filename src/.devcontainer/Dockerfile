@@ -67,7 +67,7 @@ RUN mkdir -p /build && chmod 777 /build
 # newest published nightly and opens a bump PR only when the full build
 # succeeds. Renovate does not manage rustup toolchain pins, so do not
 # expect it to bump this line.
-ARG RUST_NIGHTLY=nightly-2026-08-17
+ARG RUST_NIGHTLY=nightly-2026-08-24
 ENV CARGO_HOME=/build/.cargo
 ENV RUSTUP_HOME=/build/.rustup
 RUN umask 0000 && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \

@@ -82,7 +82,7 @@ RUN mkdir -p /build && chmod 777 /build
 # protection against broken nightlies. Keep this ARG in lockstep with
 # the dev image; .github/workflows/rust-nightly-bump.yml test-builds
 # both images against a candidate nightly before bumping either.
-ARG RUST_NIGHTLY=nightly-2026-08-17
+ARG RUST_NIGHTLY=nightly-2026-08-24
 ENV CARGO_HOME=/build/.cargo
 ENV RUSTUP_HOME=/build/.rustup
 RUN umask 0000 && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
