@@ -212,6 +212,20 @@ canonical copy lives in shakenfist/development at
   `constraints.python` in `renovate.json` all move together.
 <!-- shared-block-end -->
 
+!!! note "In this project"
+
+    instar ships no Python package: there is no `pyproject.toml`,
+    `setup.py` or `setup.cfg`, and neither `requires-python` nor
+    `constraints.python` appears anywhere in the tree. Python here is
+    the integration test suite and the scripts under `tools/`, so the
+    clauses about the declared floor and about moving `renovate.json`
+    with it are inert — do not go looking for the files they name. The
+    floor that does bite is the oldest `python3` on a supported
+    distribution — Rocky 9 ships 3.9, which is why
+    `tools/test-package-functional.sh` searches for a newer interpreter
+    before running the suite there rather than taking `python3`. The
+    typing clause applies normally.
+
 Report findings as a bullet list.  For each finding,
 state the file, line, and whether it's blocking (must
 fix before push) or advisory (can address later).
@@ -466,6 +480,19 @@ the canonical copy lives in shakenfist/development at
   process-chosen, say so in a comment rather than leaving the
   reader to re-derive it.
 <!-- shared-block-end -->
+
+!!! note "In this project"
+
+    `safe_path_join()` and `send_from_directory` are the occystrap and
+    Flask helpers; instar is Rust with no web framework, so read those
+    as the shape to look for rather than the API to call. There is no
+    archive extraction here and no request parameter. The value that
+    fits the block's description is the backing file path read out of a
+    disk image header, which the chain walker resolves relative to the
+    image it came from and then opens — an attacker-supplied path out of
+    a file the tool was pointed at, in exactly the sense the block
+    means. Everything else is a path the operator typed. The joins are
+    all host side: the guest is handed block devices, not a filesystem.
 
 Report findings with severity (critical / high /
 medium / low / informational). For each finding, state

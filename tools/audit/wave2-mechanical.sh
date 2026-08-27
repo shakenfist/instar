@@ -66,6 +66,24 @@ if git rev-parse --verify develop >/dev/null 2>&1; then
 fi
 echo
 
+bold "=== wave 2c: phase references outside plans directories ==="
+# PUSH-AUDIT.md's plan-phase-references block says the audit greps
+# README.md and docs/ for a phase number, and that a line which is
+# genuinely not about an implementation plan is exempted with a
+# trailing marker. Without this the block described a check nobody
+# ran, and a contributor reading it would reasonably assume otherwise.
+PHASE_REFS=$(grep -rEni 'phase [0-9]' README.md docs/ --include='*.md' \
+    | grep -v '^docs/plans/' \
+    | grep -v 'audit-ok: phase-reference' \
+    || true)
+if [[ -n "$PHASE_REFS" ]]; then
+    echo "$PHASE_REFS"
+    echo "(documentation outside docs/plans/ describes what the software does, not which phase built it: describe the behaviour, link the master plan, or append '<!-- audit-ok: phase-reference -->' if the reference is not about an implementation plan)"
+else
+    echo "(none)"
+fi
+echo
+
 bold "=== wave 2d: VMM unsafe blocks added (host-side, higher risk) ==="
 if git rev-parse --verify develop >/dev/null 2>&1; then
     VMM_UNSAFE=$(git diff develop...HEAD -- 'src/vmm/**/*.rs' \
