@@ -77,7 +77,8 @@ jobs:
     timeout-minutes: 60
     # Two re-review requests in quick succession would otherwise run
     # concurrently on the scarce runner and post two reviews on the same
-    # pull request. pr-auto-review.yml carries the same guard.
+    # pull request. shakenfist/actions' pr-auto-review.yml carries the
+    # same guard.
     concurrency:
       group: pr-re-review-${{ github.event.issue.number }}
       cancel-in-progress: true
@@ -90,12 +91,29 @@ jobs:
       # change against the conventions as they were *before* it. The
       # diff itself comes from the API and is unaffected, which is what
       # makes the symptom subtle: a real review, calibrated wrongly.
-      # pr-auto-review.yml checks out the merge ref for this reason and
-      # says so in its header.
+      # shakenfist/actions' pr-auto-review.yml -- the shared workflow
+      # functional-tests.yml calls for the automatic review, not a file
+      # in this repository -- checks out the merge ref for this reason
+      # and says so in its header.
       #
       # This puts the pull request's code on the runner, which is
       # exactly why pr-bot-trigger refusing fork pull requests above is
-      # load bearing rather than tidiness.
+      # load bearing rather than tidiness. It also puts the pull
+      # request's AGENTS.md, ARCHITECTURE.md and README.md into the
+      # prompt review-pr-with-claude.sh builds, and its .claude/ into
+      # the working tree Claude Code runs over. That content is now
+      # correct rather than trusted-but-stale, and attacker-influenced
+      # rather than fixed; the same-repository guard is what makes it
+      # acceptable, because an author who can push to this repository
+      # is already trusted with far more than a prompt.
+      #
+      # GitHub only publishes refs/pull/N/merge while the pull request
+      # merges cleanly, so a conflicted pull request -- or one caught in
+      # the window where mergeability is being recomputed after a push
+      # to develop -- fails this step with "couldn't find remote ref".
+      # The requester sees the trigger job's acknowledgement and then a
+      # git error. Rebase and ask again; falling back to the head branch
+      # would silently restore the miscalibration this ref exists to fix.
       #
       # persist-credentials: false because this working tree holds the
       # pull request's code and the next step runs Claude Code over it
