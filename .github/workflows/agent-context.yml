@@ -5,9 +5,13 @@
 #
 # The job runs the pre-commit hook rather than invoking skillsaw
 # directly, so .pre-commit-config.yaml's rev is the only place the
-# version is written down. skillsaw's rule set moves between releases,
-# and Renovate's pre-commit manager bumps the hook on its own, so a
-# second pin in this workflow would drift without anyone choosing it.
+# skillsaw version is written down. skillsaw's rule set moves between
+# releases, and Renovate's pre-commit manager raises the hook bump as
+# its own reviewable pull request (automerge is off for minor and patch
+# here), so a second pin in this workflow would drift without anyone
+# choosing it. pre-commit itself is pinned, in
+# tools/ci/pre-commit-requirements.txt: the harness that enforces the
+# hook rev should not be the one floating thing in the job.
 #
 # This is its own workflow rather than a job in lint.yml because that
 # workflow's path filter is the Rust tree: sharing it would either run
@@ -17,6 +21,22 @@
 name: Agent context
 
 on:
+  # Also on push, because a commit that lands on develop without a pull
+  # request -- an admin push, a bot commit -- would otherwise never be
+  # linted, and AGENTS.md and .claude/ are exactly the files where an
+  # unreviewed change is worth catching late if it was not caught early.
+  # There is deliberately no merge_group trigger: this is not a required
+  # check, and a path-filtered workflow made required reports pending
+  # forever on the pull requests it filters out.
+  push:
+    branches:
+      - develop
+    paths:
+      - 'AGENTS.md'
+      - 'CLAUDE.md'
+      - '.claude/**'
+      - '.pre-commit-config.yaml'
+      - '.github/workflows/agent-context.yml'
   pull_request:
     paths:
       - 'AGENTS.md'
@@ -49,7 +69,8 @@ jobs:
         run: |
           python3 -m venv "${RUNNER_TEMP}/venv-skillsaw"
           "${RUNNER_TEMP}/venv-skillsaw/bin/pip" install --quiet \
-              --disable-pip-version-check pre-commit
+              --disable-pip-version-check \
+              -r tools/ci/pre-commit-requirements.txt
           echo "${RUNNER_TEMP}/venv-skillsaw/bin" >> "${GITHUB_PATH}"
 
       # Just this hook. The others have jobs of their own, and running
