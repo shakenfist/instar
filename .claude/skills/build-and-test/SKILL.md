@@ -1,3 +1,8 @@
+---
+name: build-and-test
+description: "Build and test instar through its Docker devcontainer Makefile targets. Use when building instar, running its Rust unit tests or Python integration tests, or when tempted to run cargo, build.sh or a test runner directly."
+---
+
 # Instar Build and Test Skill
 
 ## Overview

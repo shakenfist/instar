@@ -1,3 +1,8 @@
+---
+name: correct-fixes
+description: "Prefer the root-cause fix over the workaround in this security-focused codebase. Use when fixing a bug, when a function receives a value of the wrong type or shape, or when deciding whether a quick workaround is acceptable."
+---
+
 # Correct Fixes Over Easy Fixes
 
 ## Philosophy

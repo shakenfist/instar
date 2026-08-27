@@ -1,3 +1,8 @@
+---
+name: instar-calltable
+description: "Call table API reference for guest operations: the I/O, progress and configuration function pointers the core places at CALL_TABLE_ADDR. Use when writing or debugging operation code that talks to the core."
+---
+
 # /instar-calltable - Call Table API Reference
 
 Complete reference for the call table API used by instar operations to communicate with the core.

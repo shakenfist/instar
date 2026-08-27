@@ -1,3 +1,8 @@
+---
+name: instar-add-test-image
+description: "Add a disk image to the instar integration test suite, safe or malicious, including tests/manifest.json and the handling of expected output. Use when adding a test image or expanding format or edge-case coverage."
+---
+
 # Skill: Add Test Image to instar Test Suite
 
 Add a new disk image to the instar integration test suite. This skill handles

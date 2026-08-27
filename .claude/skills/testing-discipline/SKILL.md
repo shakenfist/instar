@@ -1,3 +1,8 @@
+---
+name: testing-discipline
+description: "Never accept a test failure as pre-existing without verifying it against a clean baseline. Use when tests fail, or before committing changes that touch tested code."
+---
+
 # Instar Testing Discipline
 
 ## Golden Rule

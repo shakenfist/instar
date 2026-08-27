@@ -1,3 +1,8 @@
+---
+name: error-handling
+description: "Consistent error reporting in instar: every error reported, propagated to main(), and described with context. Use when adding error handling to an operation or to host code, or when reviewing error propagation."
+---
+
 # /error-handling - Consistent Error Reporting in Instar
 
 Guidelines for ensuring all error conditions in instar return proper error codes with descriptive messages.
