@@ -140,9 +140,11 @@ Beyond the Rust hooks, `pre-commit run --all-files` also runs:
   its own environment on first run, so the first invocation after a
   fresh checkout is slower than the rest. The same hook runs in CI as
   the `Agent context` check.
-- `actionlint` over `.github/workflows/`, `shellcheck` over `tools/`,
-  and `check-nightly-pins.sh`, which fails if the two devcontainer
-  Dockerfiles disagree about the Rust nightly.
+- `actionlint` over `.github/workflows/`, and `shellcheck` over
+  `scripts/` and `tools/`.
+- `binary-sizes`, which checks the built binaries against the guest
+  memory layout, and `nightly-pins`, which fails if the two
+  devcontainer Dockerfiles disagree about the Rust nightly.
 
 To auto-fix formatting issues:
 
@@ -693,16 +695,7 @@ a hard CI failure. Deliberate exclusions live in an allowlist in
 `tools/ci/check-test-partition.py` (currently just the malicious
 suite). See [docs/testing.md](testing.md).
 
-## GitHub Automation
-
-The project includes Claude Code-powered GitHub automation for common PR tasks.
-
-## Available Bot Commands
-
-See [Bot commands](#bot-commands) above. The list used to appear in
-both places and the two copies drifted apart, so there is now one.
-
-## How Automated Review Works
+## How automated review works
 
 The review job lives in the shared workflow
 `shakenfist/actions/.github/workflows/pr-auto-review.yml`, not in this

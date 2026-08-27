@@ -100,11 +100,11 @@ Project reference files:
 - [AGENTS.md](https://github.com/shakenfist/instar/blob/develop/AGENTS.md) - Guide for AI coding assistants, including the project's Claude Code skills
 - [CHANGELOG.md](https://github.com/shakenfist/instar/blob/develop/CHANGELOG.md) - Release history
 
-This project includes Claude Code skills in `.claude/skills/` for
-common development tasks (scaffolding operations, format references,
-debugging, test images and more) — see
-[AGENTS.md](https://github.com/shakenfist/instar/blob/develop/AGENTS.md)
-for the list.
+This project includes twelve Claude Code skills in
+[.claude/skills/](https://github.com/shakenfist/instar/tree/develop/.claude/skills)
+for common development tasks — scaffolding operations, format
+references, debugging, test images, and the project's own conventions
+for error handling, testing and documentation.
 
 ## License
 
