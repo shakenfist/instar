@@ -171,10 +171,10 @@ Experimental implementations exploring secure isolated execution.
 | [Virtio-Block3](prototypes/virtio-block3.md) | Virtio-block with configurable sector sizes |
 | [Virtio-Block4](prototypes/virtio-block4.md) | Virtio-block with performance statistics |
 | [Virtio-Block5](prototypes/virtio-block5.md) | Virtio-block with ioeventfd/irqfd optimizations |
-| [Virtio-Block6](../prototypes/virtio-block6/README.md) | Sparse/dynamic output file support |
-| [Pluggable](../prototypes/pluggable/README.md) | Modular operation architecture with shared infrastructure |
-| [Pluggable2](../prototypes/pluggable2/README.md) | Separate binary loading for operations (minimal attack surface) |
-| [Info](../prototypes/info/README.md) | Image format detection (`qemu-img info` equivalent) |
+| [Virtio-Block6](https://github.com/shakenfist/instar/blob/develop/prototypes/virtio-block6/README.md) | Sparse/dynamic output file support |
+| [Pluggable](https://github.com/shakenfist/instar/blob/develop/prototypes/pluggable/README.md) | Modular operation architecture with shared infrastructure |
+| [Pluggable2](https://github.com/shakenfist/instar/blob/develop/prototypes/pluggable2/README.md) | Separate binary loading for operations (minimal attack surface) |
+| [Info](https://github.com/shakenfist/instar/blob/develop/prototypes/info/README.md) | Image format detection (`qemu-img info` equivalent) |
 
 ## KVM Virtualization Research
 

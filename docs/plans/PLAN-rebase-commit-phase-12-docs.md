@@ -4,7 +4,7 @@
 
 Before responding to questions or discussion points in this
 document, explore the codebase thoroughly. Read
-[docs/resize.md](resize.md) and [docs/create.md](create.md)
+[docs/resize.md](../resize.md) and [docs/create.md](../create.md)
 end-to-end — they're the structural twins for the new
 per-subcommand user guides. Read the existing
 `CHANGELOG.md`'s `[Unreleased]` section (the resize entry

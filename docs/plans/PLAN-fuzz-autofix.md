@@ -129,7 +129,7 @@ audit that ends every master plan.
 | Phase | Plan | Status |
 |-------|------|--------|
 | 1. Derived trailers and an end-to-end proof | [PLAN-fuzz-autofix-phase-01-closeout.md](PLAN-fuzz-autofix-phase-01-closeout.md) | In progress |
-| 2. Push audit | [PLAN-fuzz-autofix-phase-02-push-audit.md](PLAN-fuzz-autofix-phase-02-push-audit.md) | Not started |
+| 2. Push audit | `PLAN-fuzz-autofix-phase-02-push-audit.md` (not yet written) | Not started |
 
 ### 2. Push audit
 
