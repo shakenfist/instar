@@ -130,6 +130,20 @@ pre-commit run --all-files
 The hooks run rustfmt (formatting) and clippy (linting) on all Rust code via
 Docker, ensuring consistent tooling regardless of local Rust installation.
 
+Beyond the Rust hooks, `pre-commit run --all-files` also runs:
+
+- `skillsaw`, which lints the agent context — `AGENTS.md`, `CLAUDE.md`
+  and the skills and settings under `.claude/` — for malformed
+  frontmatter, instructions smuggled into a file an agent is handed,
+  embedded credentials, and dangerous hook or settings configuration.
+  The hook is pinned by `rev` in `.pre-commit-config.yaml` and fetches
+  its own environment on first run, so the first invocation after a
+  fresh checkout is slower than the rest. The same hook runs in CI as
+  the `Agent context` check.
+- `actionlint` over `.github/workflows/`, `shellcheck` over `tools/`,
+  and `check-nightly-pins.sh`, which fails if the two devcontainer
+  Dockerfiles disagree about the Rust nightly.
+
 To auto-fix formatting issues:
 
 ```bash
@@ -376,6 +390,7 @@ Comment on a PR with these commands (requires write access):
 | Command | Description |
 |---------|-------------|
 | `@shakenfist-bot please re-review` | Request a fresh automated code review |
+| `@shakenfist-bot please retest` | Re-run functional tests without pushing a new commit |
 | `@shakenfist-bot please attempt to fix` | Attempt to fix failing tests |
 
 ### GitHub issues
@@ -684,11 +699,8 @@ The project includes Claude Code-powered GitHub automation for common PR tasks.
 
 ## Available Bot Commands
 
-Comment on a PR with these commands (requires write access to the repository):
-
-- `@shakenfist-bot please re-review` - Request a fresh automated code review
-- `@shakenfist-bot please retest` - Re-run functional tests without pushing a new commit
-- `@shakenfist-bot please attempt to fix` - Have Claude attempt to fix failing tests
+See [Bot commands](#bot-commands) above. The list used to appear in
+both places and the two copies drifted apart, so there is now one.
 
 ## How Automated Review Works
 
@@ -736,6 +748,10 @@ Each review item has an `action` field:
 - `.github/workflows/rust-nightly-bump.yml` - Weekly devcontainer Rust nightly pin bump (see "Toolchain pinning" above)
 - `.github/workflows/codeql-analysis.yml` - CodeQL static analysis (push/PR to develop, plus weekly cron)
 - `.github/workflows/supply-chain.yml` - gitleaks secret scanning on debian-13 (PR/push, plus weekly cron)
+- `.github/workflows/agent-context.yml` - skillsaw lint of `AGENTS.md`, `CLAUDE.md` and `.claude/`, by running the pre-commit hook (PR and push to develop, both path-filtered)
+- `.github/workflows/lint.yml` - rustfmt and clippy in the containerised toolchain (PR, path-filtered to the Rust tree)
+- `.github/workflows/export-repo-config.yml` - nightly export of this repository's GitHub settings for the fleet configuration audit
+- `.github/workflows/renovate.yml` - self-hosted Renovate dependency updates (hourly)
 
 The self-hosted runners have no Docker preinstalled, so any job touching
 `docker` or a container-backed Makefile target needs an "Install Docker"

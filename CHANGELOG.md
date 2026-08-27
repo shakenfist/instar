@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **The agent context is linted.** `skillsaw` now runs as a pre-commit
+  hook and as the `Agent context` CI check over `AGENTS.md`, `CLAUDE.md`
+  and `.claude/`, looking for malformed frontmatter, instructions
+  smuggled into a file an agent is handed, embedded credentials and
+  dangerous hook configuration. Running `pre-commit run --all-files`
+  after this change fetches the new hook's environment once. The twelve
+  Claude Code skills moved to `.claude/skills/<name>/SKILL.md` with
+  frontmatter at the same time — as bare markdown files they had never
+  been loadable, so none of them had ever been discovered.
+
 - `map` and `snapshot` accept `--qemu-version`, forcing the qemu-img
   version whose output format is emulated instead of detecting the
   host's. This is how the per-version baselines are exercised without

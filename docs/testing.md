@@ -1338,9 +1338,9 @@ and its context window out of the final result line's `.modelUsage`.
 A run whose stream could not be read -- a killed process, a pre-flight
 CLI refusal -- falls back to an unqualified `Co-Authored-By: Claude`.
 The same derivation backs the trailers `test-drift-fix.yml` commits,
-so no model name is written down in either: when the CLI resolves to
-something new, the trailers follow it with no edit at all. They had
-previously drifted to different stale names between them.
+so neither it nor `fuzz-autofix.yml` writes a model name down: when the
+CLI resolves to something new, the trailers follow it with no edit at
+all. The two had previously drifted to different stale names.
 
 Telling a file the attempt created from build output that was already
 there needs a before picture, and each attempt gets its own.
