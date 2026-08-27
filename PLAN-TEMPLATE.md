@@ -139,6 +139,12 @@ copy lives in shakenfist/development at
     union of those ranges rather than over `git diff develop...HEAD`,
     which is empty once the phases have merged.
 
+    The obligation starts with plans written from here on, and with
+    any plan still open that carries an audit phase. Plans that were
+    already `Complete` when the rule arrived are not being backfilled,
+    so a `Phase | Plan | Status` table with no `Merged` column is a
+    plan that predates this, not a plan that has drifted from it.
+
 <!-- shared-block: plan-status-vocabulary v1 -->
 Plan status vocabulary (shared block; do not edit -- the canonical
 copy lives in shakenfist/development at
