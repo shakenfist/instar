@@ -60,6 +60,12 @@ jobs:
         run: |
           docker image rm -f instar-build 2>/dev/null || true
 
+      # The self-hosted runners do not ship gh, and the script opens the
+      # bump PR with it; installing it here is what the 2026-08-24 run
+      # was missing.
+      - name: Install GitHub CLI on host
+        run: tools/ci/install-gh-cli.sh
+
       - name: Bump the nightly pin if a newer one validates
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
