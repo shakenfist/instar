@@ -58,6 +58,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          tools/ci/install-gh-cli.sh
           gh issue create \
             --title "Release ${{ steps.check.outputs.tag }}: Cargo.toml version mismatch" \
             --label "bug" \
