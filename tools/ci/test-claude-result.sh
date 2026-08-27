@@ -118,8 +118,8 @@ lacks "the stderr fallback is not used" "${OUT}" "unknown option"
 # marker block and then restates it used to have both drafts
 # concatenated, and `sed -n '/START/,/END/p'` restarts its range on the
 # second START -- so fuzz-autofix.yml's commit message held both, and
-# address-comments-with-claude.sh, which BRANCHES on a marker, threw a
-# real fix away when a superseded DISAGREEMENT block came back.
+# the comment addresser, which BRANCHED on a marker, threw a real fix
+# away when a superseded DISAGREEMENT block came back.
 start "a restated marker block does not reach the output twice"
 RESTATED="${WORK}/restated.jsonl"
 cat > "${RESTATED}" <<'EOF'
@@ -517,10 +517,10 @@ check "the later line is used" "$(trailer_line)" \
 # --------------------------------------------------------------------
 
 # "It does not fail" has to hold for a missing jq too. This script runs
-# under `set -euo pipefail` and address-comments-with-claude.sh calls
-# it from a `set -e` loop with no continue-on-error to catch an abort,
-# so a non-zero exit here would end that run and take its summary table
-# with it. Only cat and tail are linked in, which is everything the
+# under `set -euo pipefail`, and a caller invoking it from a `set -e`
+# loop with no continue-on-error to catch an abort -- as the retired
+# comment addresser did -- would have a non-zero exit here end the run
+# and take its summary table with it. Only cat and tail are linked in, which is everything the
 # degraded paths use, plus bash itself for the `/usr/bin/env bash`
 # shebang.
 NOJQ="${WORK}/nojq-bin"

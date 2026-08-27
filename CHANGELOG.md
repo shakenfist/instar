@@ -57,6 +57,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   automated base bumps, and `tools/ci/check-glibc-floor.sh` fails the
   build if the shipped binary ever requires a glibc above 2.31.
 
+### Removed
+
+- **The `@shakenfist-bot please address comments` automation is
+  retired**, along with `pr-address-comments.yml` and its helper
+  scripts. It triggered on `issue_comment`, so it held `contents:
+  write` on the pull request branch for a feature nobody used, and it
+  was the last caller of the local review renderer and schema — copies
+  of what now lives in `shakenfist/actions` beside the reviewer itself.
+  Review feedback is addressed by hand, or by asking for a re-review
+  once it has been.
+
 ### Fixed
 
 - **VHD images instar writes are no longer silently truncated when

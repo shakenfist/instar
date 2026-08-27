@@ -87,9 +87,9 @@
 
 set -euo pipefail
 
-# What counts as a leftover rather than part of the fix. Shared with
-# address-comments-with-claude.sh, which stages new files onto a
-# review-comment commit and needs to skip exactly the same paths.
+# What counts as a leftover rather than part of the fix. Kept in its
+# own sourced file so a second automation staging a Claude Code run's
+# output cannot drift from this one.
 #
 # Resolved here rather than at the point of use: this script cd's to
 # REPO_DIR and then to its top level, and fuzz-autofix.yml invokes it

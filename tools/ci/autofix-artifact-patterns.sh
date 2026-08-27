@@ -3,16 +3,12 @@
 # Which files a Claude Code autofix run creates that are not part of
 # its fix. Sourced, never executed.
 #
-# Two scripts need this list and they need the same one:
-# stage-autofix-changes.sh, to decide what it refuses an attempt for,
-# and address-comments-with-claude.sh, to decide what it stages onto a
-# review-comment commit. Two copies would drift, and the direction they
-# drift in is a run that refuses or commits routine build output.
-#
-# Both files live in tools/ci/, which CI checks out together --
-# fuzz-autofix.yml from the repo, pr-address-comments.yml from the
-# base-branch sparse checkout of tools/ -- so a caller that can find
-# one can find the other.
+# Its own file rather than a block inside stage-autofix-changes.sh,
+# which is its only consumer today: it was shared with the comment
+# addresser until that was retired, and a second automation staging a
+# Claude Code run's output needs exactly this list. A private copy
+# would drift, and the direction it drifts in is a run that refuses or
+# commits routine build output.
 #
 # shellcheck disable=SC2034  # every variable here is used by the sourcing script
 
