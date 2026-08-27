@@ -67,6 +67,17 @@ jobs:
     # regression in the shared action cannot quietly widen what runs
     # here, and a reader (or a scanner) can see the restriction without
     # leaving the file.
+    #
+    # It is a cross-repository contract, though, and the only consumer
+    # of that output in this repository: pr-fix-tests.yml and
+    # pr-retest.yml take only authorized and pr-ref. The name is
+    # `same-repo` on shakenfist/actions' pr-bot-trigger, mapped to
+    # `same_repo` by the trigger job above. If the action ever renames
+    # or drops it, this reads as the empty string, the condition is
+    # false, and the re-review is skipped on a green run -- the
+    # requester gets the rocket reaction and then silence. Failing
+    # closed is the right direction; being invisible is not, so a change
+    # to pr-bot-trigger's outputs should grep the fleet for this name.
     if: >-
       needs.trigger-re-review.outputs.authorized == 'true' &&
       needs.trigger-re-review.outputs.same_repo == 'true'

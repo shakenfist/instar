@@ -17,6 +17,21 @@
 # workflow's path filter is the Rust tree: sharing it would either run
 # the half-hour containerised clippy build on a documentation change,
 # or leave this job unable to trigger on one.
+#
+# Living in its own file has one consequence worth stating, because it
+# is an exception to a convention AGENTS.md records: this job can fail a
+# pull request but is named in neither automated_reviewer's needs: list
+# nor can_enqueue's, since needs: cannot cross workflow files. It is not
+# a required check on the develop ruleset either -- see the note on the
+# push trigger below for why a path-filtered required check is a trap.
+# So a red Agent context is visible on the pull request and blocks
+# nothing automatically. Both lists in functional-tests.yml name this
+# workflow as the second deliberate omission.
+#
+# CLAUDE.md appears in the path filters below and this repository has no
+# such file. That is on purpose: the filter is what makes one linted
+# from its very first commit, rather than from whenever somebody
+# remembered to add it here.
 
 name: Agent context
 
