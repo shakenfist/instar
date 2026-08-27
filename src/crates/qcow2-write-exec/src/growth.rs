@@ -10,7 +10,7 @@
 //!
 //! Moved verbatim (behaviour byte-identical) out of
 //! `src/operations/bench` by phase 7 (settled decision 5, mechanism A)
-//! of `docs/plans/PLAN-qcow2-write-infrastructure-phase-07-write.md`,
+//! of `docs/plans/PLAN-qcow2-write-infrastructure-phase-07-cow.md`,
 //! generalized so `commit`/`rebase` can reuse it. Two mechanical
 //! generalizations make it region-agnostic:
 //!

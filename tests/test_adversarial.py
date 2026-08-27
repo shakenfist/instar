@@ -5,7 +5,9 @@ These tests verify that instar safely handles malicious and malformed images
 without crashing, hanging, or consuming excessive resources. Each test uses
 the run_adversarial() helper which enforces timeouts and memory limits.
 
-See PLAN-adversarial-images.md for the full adversarial testing strategy.
+See the "Adversarial Image Tests" section of docs/testing.md for the full
+adversarial testing strategy, and for where the images these tests need are
+allowed to live.
 """
 
 import tempfile
