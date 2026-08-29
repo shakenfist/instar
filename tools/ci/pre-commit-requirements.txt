@@ -1,0 +1,4 @@
+# pre-commit for .github/workflows/agent-context.yml, pinned so the
+# harness that enforces .pre-commit-config.yaml's hook revisions is not
+# itself floating. Renovate's pip_requirements manager tracks this file.
+pre-commit==4.6.2

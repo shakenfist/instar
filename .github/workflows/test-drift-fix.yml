@@ -265,7 +265,7 @@ jobs:
           ## Before You Start
 
           1. Read AGENTS.md to understand the project structure and testing approach
-          2. Read the /instar-add-test-image skill at .claude/skills/instar-add-test-image.md
+          2. Read the /instar-add-test-image skill at .claude/skills/instar-add-test-image/SKILL.md
           3. Read docs/quirks.md to understand known qemu-img compatibility quirks
 
           PROMPT_EOF

@@ -5,8 +5,8 @@
 # automation reports or the commit trailer naming the model that
 # actually ran.
 #
-# Three automations run Claude Code unattended -- fuzz-autofix.yml,
-# test-drift-fix.yml and tools/address-comments-with-claude.sh -- and
+# Three automations ran Claude Code unattended -- fuzz-autofix.yml,
+# test-drift-fix.yml and the since-retired comment addresser -- and
 # every one of them used to hardcode the model in its Co-Authored-By
 # trailer. By the time anyone looked they disagreed three ways
 # (`Claude Opus 4.6 (1M context)` in one, `Claude Opus 4.5` in the
@@ -46,9 +46,9 @@
 #     stream is an expected input, not an exceptional one, and every
 #     caller redirects this script's stdout into a file it then reads
 #     for markers and publishes: fuzz-autofix.yml greps it for the
-#     COMMIT_SUMMARY block and uploads it as a run artifact, and
-#     address-comments-with-claude.sh greps it for DISAGREEMENT_START
-#     and CHANGE_SUMMARY_START, whose contents reach the pull request's
+#     COMMIT_SUMMARY block and uploads it as a run artifact, and the
+#     retired comment addresser grepped it for DISAGREEMENT_START and
+#     CHANGE_SUMMARY_START, whose contents reached the pull request's
 #     summary comment. Exiting non-zero there would replace a partial
 #     diagnosis with none at all. Whether the run failed is already
 #     known from `claude`'s own exit status at the call site.
@@ -56,12 +56,11 @@
 #     That contract is why the one external dependency, jq, is checked
 #     for by hand below and degraded around rather than left to fail
 #     under this script's own `set -euo pipefail`. Both workflows are
-#     insulated by `continue-on-error: true`;
-#     address-comments-with-claude.sh is not, and runs its whole
-#     multi-item loop under `set -e`, so a missing jq there would
-#     abort the run and take the summary table with it. The only
-#     honest thing left is to say jq is missing, on stdout, and exit
-#     0.
+#     insulated by `continue-on-error: true`; a caller that is not --
+#     the retired comment addresser ran its whole multi-item loop
+#     under `set -e` -- would have a missing jq abort the run and take
+#     the summary table with it. The only honest thing left is to say
+#     jq is missing, on stdout, and exit 0.
 #
 # WHY --text PREFERS THE RESULT STRING
 #
@@ -81,29 +80,29 @@
 # printed the final result text and nothing else, and every consumer
 # was written against exactly that. fuzz-autofix.yml and
 # test-drift-fix.yml pull the COMMIT_SUMMARY block out with a single
-# `sed -n '/START/,/END/p'`, and address-comments-with-claude.sh
-# *branches* on `grep -q DISAGREEMENT_START`. Concatenating the whole
-# narration breaks both: a run that drafts a COMMIT_SUMMARY block and
+# `sed -n '/START/,/END/p'`, and the comment addresser *branched* on
+# `grep -q DISAGREEMENT_START`. Concatenating the whole narration
+# breaks both shapes: a run that drafts a COMMIT_SUMMARY block and
 # then restates it makes sed restart its range on the second START, so
 # the commit message holds both drafts run together; and a run that
 # emits a disagreement block, moves past it and then fixes the item --
 # or merely quotes the marker while reasoning -- is recorded as
-# Skipped, at which point reset_worktree throws the fix away.
+# Skipped, at which point the fix is thrown away.
 #
 # Preferring `.result` reproduces the old `--output-format text`
 # semantics exactly for every run that finished, and keeps the
 # superset only for the cases this script exists to rescue: turn
 # exhaustion and truncation, where there is no `.result` at all and
 # the narration is the only thing left. One change here, rather than
-# teaching three consumers to keep only the last block.
+# teaching every consumer to keep only the last block.
 #
 # The dangerous half -- narration driving control flow -- closes
 # completely, and the reasoning is worth having written down. `.result`
 # is absent only when `claude` exited non-zero: turn exhaustion exits
-# 1, and a killed process never writes a result line at all. In
-# address-comments-with-claude.sh a non-zero `claude` reaches
-# item_error and `continue` before the marker scan below it, so no
-# fallback text can ever reach that branch. The one residual is a run
+# 1, and a killed process never writes a result line at all. A caller
+# that branches on a marker sees this too: the comment addresser sent
+# a non-zero `claude` to its error path before the marker scan, so no
+# fallback text could ever reach that branch. The one residual is a run
 # that exits 0 with a blank `.result` -- the CLI ends a successful run
 # on a final assistant message, so that would mean an empty final
 # message, which has not been observed -- and it degrades to this

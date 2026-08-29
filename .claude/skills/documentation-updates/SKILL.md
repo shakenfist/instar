@@ -1,3 +1,8 @@
+---
+name: documentation-updates
+description: "Work out which documentation a change must update, and update it. Use when adding or changing a CLI flag, subcommand, format behaviour, output format or security behaviour, and before committing any user-visible change."
+---
+
 # Instar Documentation Updates
 
 ## Golden Rule

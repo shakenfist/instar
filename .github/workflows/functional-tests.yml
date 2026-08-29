@@ -141,12 +141,6 @@ jobs:
       - name: Test the Claude result parser
         run: tools/ci/test-claude-result.sh
 
-      - name: Test the autofix worktree reset
-        run: tools/ci/test-reset-autofix-worktree.sh
-
-      - name: Test the review-comment staging loop
-        run: tools/ci/test-address-comments-staging.sh
-
   build-and-test:
     needs: check_paths
     if: needs.check_paths.outputs.code_changed != 'false'
@@ -1140,9 +1134,12 @@ jobs:
     # rest of the fleet.
     #
     # Every job which can fail the PR is named here, so the gate means
-    # what the sentence above says. The one deliberate omission is
-    # oslo-crossval-master, which is continue-on-error: true and so
-    # could never gate anything.
+    # what the sentence above says. There are two deliberate omissions.
+    # oslo-crossval-master is continue-on-error: true and so could never
+    # gate anything. agent-context.yml's skillsaw job can fail a pull
+    # request but lives in its own workflow file, and needs: cannot cross
+    # workflow files -- see that workflow's header for why it is separate
+    # and why it is not a required check either.
     needs:
       - ci-tooling
       - build-and-test
@@ -1194,8 +1191,10 @@ jobs:
       - snapshot-harnesses
     # Deliberately not gated to pull_request alone: workflow_dispatch
     # runs most of these jobs too, and reporting the aggregate there is
-    # useful. oslo-crossval-master is omitted on purpose -- it is
-    # continue-on-error and so could never gate anything.
+    # useful. Two omissions are on purpose: oslo-crossval-master is
+    # continue-on-error and so could never gate anything, and
+    # agent-context.yml's skillsaw job is in another workflow file, which
+    # needs: cannot reach.
     if: always() && github.event_name != 'merge_group'
     permissions:
       actions: read

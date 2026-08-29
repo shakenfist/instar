@@ -1,3 +1,8 @@
+---
+name: instar-new-op
+description: "Scaffold a new instar guest operation binary under src/operations/, with its main.rs, Cargo.toml, linker script and cargo configuration. Use when adding a new operation to the call table."
+---
+
 # /instar-new-op - Scaffold a New Instar Operation
 
 Create a new instar operation binary that runs inside the sandboxed VM.

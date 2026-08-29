@@ -96,7 +96,10 @@ Per-format feature detail is in
   `tools/ci/check-test-partition.py`.
 
 - **`automated_reviewer`'s `needs` list must name every job that can
-  fail a PR**, including `ci-tooling`.
+  fail a PR**, including `ci-tooling`. Two jobs are deliberately
+  outside it, each for a stated reason in the comment above the list:
+  `oslo-crossval-master` is `continue-on-error`, and `agent-context.yml`
+  is a separate workflow file, which `needs:` cannot reach.
 
 - **The call table is append-at-end and versioned.** Adding an entry
   bumps `VERSION`; never reorder or reuse an index. The entries and
@@ -137,13 +140,16 @@ link the master plan rather than citing a phase.
 
 ## Claude Code skills
 
-Custom skills in `.claude/skills/` cover the repetitive work:
+Twelve skills in `.claude/skills/<name>/SKILL.md` cover the repetitive
+work, seven of them the project's own conventions (error handling,
+testing discipline, documentation updates, pull request preparation and
+so on). They are selected by their `description` frontmatter rather than
+invoked by name, so read the directory rather than a list here — an
+enumeration in this file is a second copy that goes stale, and every
+line here costs context on every task.
 
-- `/instar-new-op <name> [description]` — scaffold a complete operation
-  skeleton with all required files.
-- `/instar-format` — disk image format reference.
-- `/instar-debug` — troubleshooting guide.
-- `/instar-calltable [io|progress|config]` — call table API reference.
-- `/instar-add-test-image` — guided process for adding a disk image to
-  the integration test suite, including `tests/manifest.json` and the
-  safe handling of expected output for malicious images.
+Two are worth knowing exist because they are hard to guess at:
+`instar-new-op` scaffolds a complete operation skeleton with all its
+required files, and `instar-add-test-image` walks through adding a disk
+image to the integration suite, including `tests/manifest.json` and the
+safe handling of expected output for malicious images.

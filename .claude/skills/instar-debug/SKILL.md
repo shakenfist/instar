@@ -1,3 +1,8 @@
+---
+name: instar-debug
+description: "Diagnose instar guest operation failures across build, boot, virtio, call table and panic issues. Use when an operation fails to build, hangs, triple-faults, or misbehaves inside the sandbox VM."
+---
+
 # /instar-debug - Troubleshooting Instar Operations
 
 Diagnose and fix common issues when developing instar guest operations.

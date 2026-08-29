@@ -1,3 +1,8 @@
+---
+name: instar-format
+description: "Disk image format reference: magic numbers, header layouts, endianness and parsing details for qcow2, vmdk, raw and the other supported formats. Use when parsing or writing format structures."
+---
+
 # /instar-format - Disk Image Format Reference
 
 Quick reference for disk image format structures, magic numbers, and parsing details.

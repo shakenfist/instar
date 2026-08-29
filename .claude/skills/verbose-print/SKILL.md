@@ -1,3 +1,8 @@
+---
+name: verbose-print
+description: "Add diagnostic output to guest operations with verbose_print() and debug_print(), and choose correctly between them. Use when adding new code paths to an operation, or when reviewing verbose output coverage."
+---
+
 # /verbose-print - Adding Diagnostic Output to Operations
 
 Guidelines for adding verbose_print() calls to instar guest operations for consistent, useful diagnostic output.
