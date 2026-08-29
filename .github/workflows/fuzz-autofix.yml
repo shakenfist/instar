@@ -202,6 +202,27 @@ jobs:
           docker image rm -f instar-build instar-release 2>/dev/null || true
           make instar 2>&1 | tee ${GITHUB_WORKSPACE}/build-log.txt
 
+      - name: Prepare instar-testdata
+        if: steps.find_issue.outputs.found == 'true'
+        env:
+          TESTDATA_TOKEN: ${{ secrets.GITLAB_TESTDATA_TOKEN }}
+        run: ${GITHUB_WORKSPACE}/instar/tools/ci/prepare-testdata.sh
+
+      - name: Resparsify test images
+        if: steps.find_issue.outputs.found == 'true'
+        run: |
+          cd ${TESTDATA_PATH}
+          find downloaded/ -type f \( \
+            -name "*.qcow2" -o \
+            -name "*.vmdk" -o \
+            -name "*.vhd" -o \
+            -name "*.vhdx" -o \
+            -name "*.img" \
+          \) -print0 | while IFS= read -r -d '' file; do
+            cp --sparse=always "$file" "$file.sparse"
+            mv "$file.sparse" "$file"
+          done
+
       - name: Construct prompt (attempt 1)
         if: steps.find_issue.outputs.found == 'true'
         env:
