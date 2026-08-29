@@ -301,7 +301,13 @@ After Claude finishes:
 2. **Build:** Run `make instar` to verify the fix compiles.
 3. **Run reproducer:** Execute the fuzz target with the crash
    input. If the target no longer crashes (exit code 0), the
-   fix is verified.
+   fix is verified. **Not implemented** -- the workflow reads
+   `.reproducer` into the prompt and into the pull request body
+   but never executes it, so verification is the build and the
+   core tests only. Tracked as issue #529, which records why it
+   is more than a missing line: the crash input is not in the
+   issue body, only in the `coverage-fuzz-logs` artifact of the
+   run named by `.ci_run`, and those expire after 90 days.
 4. **Run existing tests:** Run `make test-container-core` to
    ensure the fix doesn't break existing functionality.
 
@@ -352,8 +358,8 @@ ${COMMIT_BODY}
 
 ## Verification
 
-- Reproducer no longer crashes after fix
-- Existing tests pass (make test-container-core)
+- Build succeeded (make instar)
+- Core tests passed (make test-container-core)
 
 ## Reproduction
 
