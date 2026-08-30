@@ -314,6 +314,15 @@ pub unsafe fn compress_deflate_raw(
 /// operations pick the fields they require.
 pub struct QcowHeader {
     pub version: u32,
+    /// Length of the fixed header, i.e. the offset at which header
+    /// extensions begin. For v3 this is the raw `header_length` field
+    /// at offset 100 (qemu 5.1+ writes 112, not the 104 minimum,
+    /// because `compression_type` at offset 104 is followed by
+    /// padding). v2 has no such field and its header is always
+    /// [`V2_HEADER_EXTENSION_OFFSET`] bytes long. Untrusted: a v3
+    /// image can declare any value, so callers using this as a bound
+    /// must clamp it themselves.
+    pub header_length: u32,
     pub cluster_bits: u32,
     pub cluster_size: u64,
     pub virtual_size: u64,
@@ -365,6 +374,14 @@ impl QcowHeader {
         if version != 2 && version != 3 {
             return None;
         }
+
+        // v2 headers stop at V2_HEADER_EXTENSION_OFFSET and carry no
+        // header_length field; only v3 declares its own length.
+        let header_length = if version >= 3 {
+            be_u32(header, HEADER_LENGTH_OFFSET)
+        } else {
+            V2_HEADER_EXTENSION_OFFSET as u32
+        };
 
         let cluster_bits = be_u32(header, CLUSTER_BITS_OFFSET);
         if !(9..=21).contains(&cluster_bits) {
@@ -431,6 +448,7 @@ impl QcowHeader {
 
         Some(QcowHeader {
             version,
+            header_length,
             cluster_bits,
             cluster_size,
             virtual_size,

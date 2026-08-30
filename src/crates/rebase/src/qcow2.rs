@@ -38,6 +38,20 @@ use crate::{RebaseError, RebaseMode, RebasePatch, RebasePlan};
 /// `CreateConfig::MAX_BACKING_FILE` (1024 bytes).
 pub const MAX_BACKING_PATH_LEN: usize = 1024;
 
+/// Bytes both modes rewrite in the fixed header: the
+/// `backing_file_offset` u64 at [`BACKING_FILE_OFFSET_OFFSET`]
+/// immediately followed by the `backing_file_size` u32. Every
+/// use of this span — the minimum-overlay check, and the
+/// header-rewrite scratch carve in each planner — reads it from
+/// here so the three cannot drift apart.
+const HEADER_REWRITE_SPAN: usize = 12;
+
+const _: () = assert!(
+    BACKING_FILE_SIZE_OFFSET - BACKING_FILE_OFFSET_OFFSET == 8
+        && HEADER_REWRITE_SPAN == (BACKING_FILE_SIZE_OFFSET - BACKING_FILE_OFFSET_OFFSET) + 4,
+    "header field layout assumption broken"
+);
+
 /// Options for [`plan_rebase_qcow2`].
 ///
 /// Borrows are bound to the lifetime of the caller's staging
@@ -155,10 +169,17 @@ pub fn plan_rebase_qcow2<'a>(
         return Err(RebaseError::LuksUnsupported);
     }
 
-    // Both modes rewrite the header's backing-file pointer at
-    // bytes 8..20, so an overlay too short to hold the fixed
-    // header has no slot for that patch either.
-    if opts.overlay_file_size < (BACKING_FILE_SIZE_OFFSET + 4) as u64 {
+    // Both modes rewrite the header's backing-file pointer, so
+    // an overlay too short to hold even the header it just
+    // parsed has no room for that patch. `parsed.header_length`
+    // is the honest floor — an image declaring a 112-byte header
+    // in a 64-byte file is corrupt for a more fundamental reason
+    // than the pointer rewrite not fitting — but it is
+    // attacker-controlled, so the rewrite span is the floor that
+    // actually has to hold.
+    let min_overlay_size = (BACKING_FILE_OFFSET_OFFSET + HEADER_REWRITE_SPAN)
+        .max(parsed.header_length as usize) as u64;
+    if opts.overlay_file_size < min_overlay_size {
         return Err(RebaseError::OverlayCorrupt);
     }
 
@@ -221,7 +242,7 @@ fn plan_qcow2_safe<'a>(
     // (The staged refcount-block copy and dirty bitmap the
     // old in-crate allocator carved here moved into the
     // guest's qcow2-write staging in phase 5.)
-    let header_rewrite_len = 12usize; // backing_file_offset u64 + backing_file_size u32
+    let header_rewrite_len = HEADER_REWRITE_SPAN;
     let path_buf_len = MAX_BACKING_PATH_LEN;
     let need = header_rewrite_len
         .checked_add(path_buf_len)
@@ -268,12 +289,6 @@ fn plan_qcow2_safe<'a>(
         bytes: header_patch_bytes,
     })?;
 
-    debug_assert_eq!(
-        BACKING_FILE_SIZE_OFFSET - BACKING_FILE_OFFSET_OFFSET,
-        8,
-        "header field layout assumption broken"
-    );
-
     let context = RebaseQcow2SafeContext {
         overlay_cluster_size: cluster_size as u32,
         overlay_cluster_count: parsed.virtual_size.div_ceil(cluster_size),
@@ -296,7 +311,7 @@ fn plan_qcow2_unsafe<'a>(
     parsed: &QcowHeader,
     scratch: &'a mut [u8],
 ) -> Result<Qcow2RebaseOutput<'a>, RebaseError> {
-    let header_rewrite_len = 12usize;
+    let header_rewrite_len = HEADER_REWRITE_SPAN;
     let path_buf_len = MAX_BACKING_PATH_LEN;
     let need = header_rewrite_len
         .checked_add(path_buf_len)
@@ -350,9 +365,12 @@ fn plan_qcow2_unsafe<'a>(
 /// `BackingPathTooLong` for now.
 ///
 /// The in-place case additionally requires the existing slot
-/// to be a region the overlay actually has: inside the file
-/// and clear of the fixed header. A header describing anything
-/// else is rejected with `HeaderMismatch`.
+/// to sit where the qcow2 format says a backing name lives:
+/// inside the overlay's first cluster and clear of the fixed
+/// header and its extensions. A header describing anything else
+/// is rejected with `HeaderMismatch`. A detach is exempt — it
+/// zeroes the pointer and writes nothing to the slot, so the
+/// slot's coordinates never become a write offset.
 fn compute_path_target(
     opts: &Qcow2RebaseOpts<'_>,
     parsed: &QcowHeader,
@@ -374,23 +392,48 @@ fn compute_path_target(
 
     // `backing_file_offset` and `backing_file_size` are raw
     // header fields and `QcowHeader::parse` range-checks
-    // neither. The slot they describe is only writable if it is
-    // a real region of the overlay that starts after the fixed
-    // header — the plan rewrites bytes 8..20 itself, and path
-    // bytes landing anywhere in the header would corrupt the
-    // image. An overlay claiming an offset past EOF otherwise
-    // makes the planner emit a Write patch outside the file
-    // (issue #485).
+    // neither, yet the in-place rewrite turns them straight into
+    // a write offset. Left unchecked that is issue #485: a
+    // fuzzed header claiming an offset past EOF made the planner
+    // emit a Write patch outside the file.
+    //
+    // The bound is the one the format itself defines, not merely
+    // "somewhere in the file". qemu's qcow2_do_open refuses
+    // `backing_file_offset > cluster_size`, and again refuses a
+    // name longer than `cluster_size - backing_file_offset`, so
+    // the whole slot must live in the first cluster; that is also
+    // the invariant `RebaseError::HeaderMismatch` already
+    // documents. Accepting anything inside the file instead would
+    // still let the header aim the path bytes at an L2 table or a
+    // guest data cluster — the same class of bug as #485, just
+    // relocated inside the file rather than past its end.
+    //
+    // The lower bound is the end of the fixed header, since the
+    // plan's own second patch rewrites the pointer field and path
+    // bytes landing in the header would corrupt the image. For v3
+    // that is the declared `header_length` (qemu 5.1+ writes 112,
+    // not the 104 minimum, to cover `compression_type` and its
+    // padding), floored at the 104-byte minimum so a header
+    // under-declaring its own length cannot lower the bar. It is
+    // deliberately not raised past the extensions: parsing them
+    // here would mean trusting a second set of unchecked lengths,
+    // and both qemu and instar's create path lay the backing
+    // string down after the extensions anyway.
     let header_end = if parsed.version >= 3 {
-        QCOW2_HEADER_LENGTH_V3 as u64
+        u64::from(parsed.header_length.max(QCOW2_HEADER_LENGTH_V3))
     } else {
         V2_HEADER_EXTENSION_OFFSET as u64
     };
+    // `cluster_size` is `1 << cluster_bits` with `cluster_bits`
+    // validated to 9..=21 by `QcowHeader::parse`, so it is never
+    // zero here. Clamping to the overlay's size as well keeps the
+    // bound honest for an overlay smaller than one cluster.
+    let slot_limit = parsed.cluster_size.min(opts.overlay_file_size);
     let slot_end = parsed
         .backing_file_offset
         .checked_add(u64::from(parsed.backing_file_size))
         .ok_or(RebaseError::HeaderMismatch)?;
-    if parsed.backing_file_offset < header_end || slot_end > opts.overlay_file_size {
+    if parsed.backing_file_offset < header_end || slot_end > slot_limit {
         return Err(RebaseError::HeaderMismatch);
     }
 
@@ -405,11 +448,31 @@ fn compute_path_target(
 mod tests {
     use super::*;
 
-    /// Build a minimal v3 qcow2 header buffer for tests.
-    /// `cluster_bits = 16` (64 KB clusters), `refcount_bits =
-    /// 16`, `virtual_size`, `backing_file_offset`,
-    /// `backing_file_size` configurable.
+    /// Build a minimal v3 qcow2 header buffer for tests, with a
+    /// declared `header_length` of 104. `cluster_bits = 16` (64
+    /// KB clusters), `refcount_bits = 16`, `virtual_size`,
+    /// `backing_file_offset`, `backing_file_size` configurable.
     fn make_header(
+        virtual_size: u64,
+        backing_file_offset: u64,
+        backing_file_size: u32,
+    ) -> [u8; 4096] {
+        make_header_versioned(
+            3,
+            QCOW2_HEADER_LENGTH_V3,
+            virtual_size,
+            backing_file_offset,
+            backing_file_size,
+        )
+    }
+
+    /// As [`make_header`], but with the header version and the
+    /// declared `header_length` under the test's control. v2
+    /// headers end at `V2_HEADER_EXTENSION_OFFSET` and carry no
+    /// `header_length` field; qemu 5.1+ writes 112 for v3.
+    fn make_header_versioned(
+        version: u32,
+        header_length: u32,
         virtual_size: u64,
         backing_file_offset: u64,
         backing_file_size: u32,
@@ -417,8 +480,7 @@ mod tests {
         let mut h = [0u8; 4096];
         // magic "QFI\xfb"
         h[0..4].copy_from_slice(&qcow2::QCOW2_MAGIC.to_be_bytes());
-        // version = 3
-        h[4..8].copy_from_slice(&3u32.to_be_bytes());
+        h[4..8].copy_from_slice(&version.to_be_bytes());
         // backing_file_offset @ 8
         h[8..16].copy_from_slice(&backing_file_offset.to_be_bytes());
         // backing_file_size @ 16
@@ -437,14 +499,59 @@ mod tests {
         h[56..60].copy_from_slice(&1u32.to_be_bytes());
         // refcount_order @ 96 = 4 (i.e. 16-bit)
         h[96..100].copy_from_slice(&4u32.to_be_bytes());
-        // header_length @ 100 = 104
-        h[100..104].copy_from_slice(&104u32.to_be_bytes());
+        // header_length @ 100 (v3 only; parse ignores it for v2)
+        h[100..104].copy_from_slice(&header_length.to_be_bytes());
         h
+    }
+
+    /// Plan an unsafe-mode rebase of an overlay described by
+    /// `header`, with everything not under test held constant.
+    /// Returns the planner's result so a test can assert on the
+    /// error or reach into the emitted patches.
+    fn plan_unsafe_with<'a>(
+        header: &[u8],
+        overlay_file_size: u64,
+        path: &[u8],
+        detach: bool,
+        scratch: &'a mut [u8],
+    ) -> Result<Qcow2RebaseOutput<'a>, RebaseError> {
+        let opts = Qcow2RebaseOpts {
+            mode: RebaseMode::Unsafe,
+            overlay_header: header,
+            overlay_file_size,
+            refcount_table: &[],
+            refblock_host_offsets: &[],
+            refcount_blocks: &[],
+            refblock_count: 0,
+            new_backing_virtual_size: 1 << 20,
+            new_backing_path: path,
+            detach,
+        };
+        plan_rebase_qcow2(&opts, scratch)
+    }
+
+    /// The byte offset of the path-bytes patch in a plan, i.e.
+    /// where the planner decided the new backing name goes.
+    fn path_patch_offset(out: &Qcow2RebaseOutput<'_>) -> Option<u64> {
+        let plan = match out {
+            Qcow2RebaseOutput::Unsafe { plan } => plan,
+            Qcow2RebaseOutput::Safe {
+                deferred_metadata, ..
+            } => deferred_metadata,
+        };
+        plan.patches().iter().find_map(|p| match p {
+            RebasePatch::Write { byte_offset, .. }
+                if *byte_offset != BACKING_FILE_OFFSET_OFFSET as u64 =>
+            {
+                Some(*byte_offset)
+            }
+            _ => None,
+        })
     }
 
     #[test]
     fn rejects_external_data_file() {
-        let mut h = make_header(1 << 20, 65536, 16);
+        let mut h = make_header(1 << 20, 112, 16);
         // INCOMPAT_EXTERNAL_DATA at offset 72
         h[72..80].copy_from_slice(&INCOMPAT_EXTERNAL_DATA.to_be_bytes());
 
@@ -467,7 +574,7 @@ mod tests {
 
     #[test]
     fn rejects_encrypted() {
-        let mut h = make_header(1 << 20, 65536, 16);
+        let mut h = make_header(1 << 20, 112, 16);
         // crypt_method @ 32 = 1 (AES)
         h[32..36].copy_from_slice(&1u32.to_be_bytes());
         let mut scratch = [0u8; 65536];
@@ -489,7 +596,7 @@ mod tests {
 
     #[test]
     fn rejects_backing_smaller_than_overlay() {
-        let h = make_header(2 << 20, 65536, 16);
+        let h = make_header(2 << 20, 112, 16);
         let mut scratch = [0u8; 65536];
         let opts = Qcow2RebaseOpts {
             mode: RebaseMode::Safe,
@@ -509,7 +616,7 @@ mod tests {
 
     #[test]
     fn rejects_oversized_path() {
-        let h = make_header(1 << 20, 65536, 16);
+        let h = make_header(1 << 20, 112, 16);
         let mut scratch = [0u8; 65536];
         let too_long = [b'x'; MAX_BACKING_PATH_LEN + 1];
         let opts = Qcow2RebaseOpts {
@@ -530,9 +637,9 @@ mod tests {
 
     #[test]
     fn safe_mode_plan_emits_in_place_rewrite() {
-        // Existing backing slot at offset 65536, size 32
+        // Existing backing slot at offset 112, size 32
         // bytes. New path is 14 bytes; fits.
-        let h = make_header(1 << 20, 65536, 32);
+        let h = make_header(1 << 20, 112, 32);
         let mut scratch = [0u8; 65536 * 4];
         let one_block_of_refcounts = [0u8; 65536];
         let offsets = [65536u64];
@@ -561,7 +668,7 @@ mod tests {
                 // First patch: path bytes at the old offset.
                 match patches[0] {
                     RebasePatch::Write { byte_offset, bytes } => {
-                        assert_eq!(byte_offset, 65536);
+                        assert_eq!(byte_offset, 112);
                         assert_eq!(bytes, b"/tmp/new.qcow2");
                     }
                     _ => panic!("expected Write for path"),
@@ -573,7 +680,7 @@ mod tests {
                         assert_eq!(bytes.len(), 12);
                         let bo = u64::from_be_bytes(bytes[0..8].try_into().unwrap());
                         let bs = u32::from_be_bytes(bytes[8..12].try_into().unwrap());
-                        assert_eq!(bo, 65536);
+                        assert_eq!(bo, 112);
                         assert_eq!(bs, 14);
                     }
                     _ => panic!("expected Write for header"),
@@ -585,7 +692,7 @@ mod tests {
 
     #[test]
     fn safe_mode_detach_writes_zero_pointer() {
-        let h = make_header(1 << 20, 65536, 32);
+        let h = make_header(1 << 20, 112, 32);
         let mut scratch = [0u8; 65536 * 4];
         let one_block_of_refcounts = [0u8; 65536];
         let offsets = [65536u64];
@@ -629,7 +736,7 @@ mod tests {
         // mode=Unsafe. The result should be a plan with the
         // same two patches (path bytes, then header field
         // rewrite) and no context.
-        let h = make_header(1 << 20, 65536, 32);
+        let h = make_header(1 << 20, 112, 32);
         let mut scratch = [0u8; 65536 * 4];
         let opts = Qcow2RebaseOpts {
             mode: RebaseMode::Unsafe,
@@ -650,7 +757,7 @@ mod tests {
                 assert_eq!(patches.len(), 2);
                 match patches[0] {
                     RebasePatch::Write { byte_offset, bytes } => {
-                        assert_eq!(byte_offset, 65536);
+                        assert_eq!(byte_offset, 112);
                         assert_eq!(bytes, b"/tmp/new.qcow2");
                     }
                     _ => panic!("expected Write for path"),
@@ -670,7 +777,7 @@ mod tests {
 
     #[test]
     fn unsafe_mode_detach() {
-        let h = make_header(1 << 20, 65536, 32);
+        let h = make_header(1 << 20, 112, 32);
         let mut scratch = [0u8; 65536 * 4];
         let opts = Qcow2RebaseOpts {
             mode: RebaseMode::Unsafe,
@@ -732,26 +839,57 @@ mod tests {
         }
     }
 
+    /// A slot that is comfortably inside the file but outside
+    /// the first cluster still aims the path bytes at an L2
+    /// table or a guest data cluster. Same class as #485, just
+    /// relocated inside the file — and rejected for the same
+    /// reason qemu rejects it at open time.
+    #[test]
+    fn rejects_backing_slot_outside_first_cluster() {
+        let h = make_header(1 << 20, 1 << 20, 256);
+        let mut scratch = [0u8; 65536 * 4];
+        let path = [b'x'; 256];
+        for mode in [RebaseMode::Unsafe, RebaseMode::Safe] {
+            let opts = Qcow2RebaseOpts {
+                mode,
+                overlay_header: &h,
+                overlay_file_size: 8 * 1024 * 1024,
+                refcount_table: &[],
+                refblock_host_offsets: &[],
+                refcount_blocks: &[],
+                refblock_count: 0,
+                new_backing_virtual_size: 1 << 20,
+                new_backing_path: &path,
+                detach: false,
+            };
+            let r = plan_rebase_qcow2(&opts, &mut scratch);
+            assert_eq!(r.err(), Some(RebaseError::HeaderMismatch));
+        }
+    }
+
     /// A slot whose end overflows u64 is a corrupt header, not
-    /// an arithmetic surprise.
+    /// an arithmetic surprise. Both modes share
+    /// `compute_path_target`, so both must refuse.
     #[test]
     fn rejects_backing_slot_offset_overflow() {
         let h = make_header(1 << 20, u64::MAX - 4, 16);
         let mut scratch = [0u8; 65536 * 4];
-        let opts = Qcow2RebaseOpts {
-            mode: RebaseMode::Unsafe,
-            overlay_header: &h,
-            overlay_file_size: 8 * 1024 * 1024,
-            refcount_table: &[],
-            refblock_host_offsets: &[],
-            refcount_blocks: &[],
-            refblock_count: 0,
-            new_backing_virtual_size: 1 << 20,
-            new_backing_path: b"/tmp/new.qcow2",
-            detach: false,
-        };
-        let r = plan_rebase_qcow2(&opts, &mut scratch);
-        assert_eq!(r.err(), Some(RebaseError::HeaderMismatch));
+        for mode in [RebaseMode::Unsafe, RebaseMode::Safe] {
+            let opts = Qcow2RebaseOpts {
+                mode,
+                overlay_header: &h,
+                overlay_file_size: 8 * 1024 * 1024,
+                refcount_table: &[],
+                refblock_host_offsets: &[],
+                refcount_blocks: &[],
+                refblock_count: 0,
+                new_backing_virtual_size: 1 << 20,
+                new_backing_path: b"/tmp/new.qcow2",
+                detach: false,
+            };
+            let r = plan_rebase_qcow2(&opts, &mut scratch);
+            assert_eq!(r.err(), Some(RebaseError::HeaderMismatch));
+        }
     }
 
     /// A slot inside the fixed header would have the path
@@ -761,47 +899,151 @@ mod tests {
     fn rejects_backing_slot_inside_header() {
         let h = make_header(1 << 20, 8, 64);
         let mut scratch = [0u8; 65536 * 4];
-        let opts = Qcow2RebaseOpts {
-            mode: RebaseMode::Unsafe,
-            overlay_header: &h,
-            overlay_file_size: 8 * 1024 * 1024,
-            refcount_table: &[],
-            refblock_host_offsets: &[],
-            refcount_blocks: &[],
-            refblock_count: 0,
-            new_backing_virtual_size: 1 << 20,
-            new_backing_path: b"/tmp/new.qcow2",
-            detach: false,
-        };
-        let r = plan_rebase_qcow2(&opts, &mut scratch);
+        for mode in [RebaseMode::Unsafe, RebaseMode::Safe] {
+            let opts = Qcow2RebaseOpts {
+                mode,
+                overlay_header: &h,
+                overlay_file_size: 8 * 1024 * 1024,
+                refcount_table: &[],
+                refblock_host_offsets: &[],
+                refcount_blocks: &[],
+                refblock_count: 0,
+                new_backing_virtual_size: 1 << 20,
+                new_backing_path: b"/tmp/new.qcow2",
+                detach: false,
+            };
+            let r = plan_rebase_qcow2(&opts, &mut scratch);
+            assert_eq!(r.err(), Some(RebaseError::HeaderMismatch));
+        }
+    }
+
+    /// qemu 5.1+ declares `header_length = 112` so the fixed
+    /// header covers `compression_type` and its padding. A slot
+    /// at 104 in such an image is inside the header, and writing
+    /// the path there would clobber `compression_type`.
+    #[test]
+    fn rejects_backing_slot_in_declared_header_tail() {
+        let mut scratch = [0u8; 65536 * 4];
+
+        // header_length = 112: 104 is inside the header.
+        let h = make_header_versioned(3, 112, 1 << 20, 104, 32);
+        let r = plan_unsafe_with(&h, 1 << 20, b"/tmp/new.qcow2", false, &mut scratch);
+        assert_eq!(r.err(), Some(RebaseError::HeaderMismatch));
+
+        // 112 is the first byte past it, and is accepted.
+        let h = make_header_versioned(3, 112, 1 << 20, 112, 32);
+        let r = plan_unsafe_with(&h, 1 << 20, b"/tmp/new.qcow2", false, &mut scratch);
+        assert_eq!(
+            path_patch_offset(&r.expect("plan should succeed")),
+            Some(112)
+        );
+    }
+
+    /// A header under-declaring its own length must not be able
+    /// to lower the bound below the 104-byte v3 minimum.
+    #[test]
+    fn under_declared_header_length_does_not_lower_bound() {
+        let mut scratch = [0u8; 65536 * 4];
+        let h = make_header_versioned(3, 72, 1 << 20, 80, 32);
+        let r = plan_unsafe_with(&h, 1 << 20, b"/tmp/new.qcow2", false, &mut scratch);
         assert_eq!(r.err(), Some(RebaseError::HeaderMismatch));
     }
 
-    /// An overlay shorter than the fixed header cannot hold
-    /// the backing-pointer rewrite either.
+    /// The v2 arm of the bound: v2 headers end at
+    /// `V2_HEADER_EXTENSION_OFFSET` (72) and declare no
+    /// `header_length`, so 71 is inside the header and 72 is the
+    /// first writable byte.
+    #[test]
+    fn v2_slot_bound_is_the_v2_header_end() {
+        let mut scratch = [0u8; 65536 * 4];
+
+        let h = make_header_versioned(2, 0, 1 << 20, 71, 32);
+        let r = plan_unsafe_with(&h, 1 << 20, b"/tmp/new.qcow2", false, &mut scratch);
+        assert_eq!(r.err(), Some(RebaseError::HeaderMismatch));
+
+        let h = make_header_versioned(2, 0, 1 << 20, 72, 32);
+        let r = plan_unsafe_with(&h, 1 << 20, b"/tmp/new.qcow2", false, &mut scratch);
+        assert_eq!(
+            path_patch_offset(&r.expect("plan should succeed")),
+            Some(72)
+        );
+    }
+
+    /// The accepting edges of the v3 bound: a slot starting
+    /// exactly at `header_end`, and one ending exactly at the
+    /// first-cluster boundary. Both are legal and must not be
+    /// rejected by an off-by-one.
+    #[test]
+    fn accepts_slot_at_both_boundaries() {
+        let mut scratch = [0u8; 65536 * 4];
+
+        // Starts exactly at the declared header end.
+        let h = make_header(1 << 20, QCOW2_HEADER_LENGTH_V3 as u64, 32);
+        let r = plan_unsafe_with(&h, 1 << 20, b"/tmp/new.qcow2", false, &mut scratch);
+        assert_eq!(
+            path_patch_offset(&r.expect("plan should succeed")),
+            Some(QCOW2_HEADER_LENGTH_V3 as u64)
+        );
+
+        // Ends exactly at the end of the first cluster.
+        let h = make_header(1 << 20, 65536 - 32, 32);
+        let r = plan_unsafe_with(&h, 1 << 20, b"/tmp/new.qcow2", false, &mut scratch);
+        assert_eq!(
+            path_patch_offset(&r.expect("plan should succeed")),
+            Some(65536 - 32)
+        );
+
+        // One byte further out is not.
+        let h = make_header(1 << 20, 65536 - 31, 32);
+        let r = plan_unsafe_with(&h, 1 << 20, b"/tmp/new.qcow2", false, &mut scratch);
+        assert_eq!(r.err(), Some(RebaseError::HeaderMismatch));
+    }
+
+    /// An overlay smaller than one cluster is bounded by the
+    /// overlay, not by the nominal cluster size.
+    #[test]
+    fn slot_bound_clamps_to_a_sub_cluster_overlay() {
+        let mut scratch = [0u8; 65536 * 4];
+        let h = make_header(1 << 20, 4096 - 32, 32);
+
+        let r = plan_unsafe_with(&h, 4096, b"/tmp/new.qcow2", false, &mut scratch);
+        assert_eq!(
+            path_patch_offset(&r.expect("plan should succeed")),
+            Some(4064)
+        );
+
+        let r = plan_unsafe_with(&h, 4095, b"/tmp/new.qcow2", false, &mut scratch);
+        assert_eq!(r.err(), Some(RebaseError::HeaderMismatch));
+    }
+
+    /// A detach is deliberately exempt: it zeroes the header
+    /// pointer and writes nothing to the slot, so a corrupt
+    /// slot never becomes a write offset. Pinning this so the
+    /// exemption cannot be removed by accident — nor added to
+    /// by accident, hence the assertion that no path patch is
+    /// emitted.
+    #[test]
+    fn detach_is_exempt_from_the_slot_bound() {
+        let h = make_header(1 << 20, 70_267_192_421_360_547, 256);
+        let mut scratch = [0u8; 65536 * 4];
+        let out = plan_unsafe_with(&h, 8 * 1024 * 1024, b"", true, &mut scratch)
+            .expect("detach should plan despite the corrupt slot");
+        assert_eq!(path_patch_offset(&out), None);
+    }
+
+    /// An overlay shorter than the header it declares cannot
+    /// hold the backing-pointer rewrite either.
     #[test]
     fn rejects_overlay_shorter_than_header_fields() {
-        let h = make_header(1 << 20, 65536, 32);
+        let h = make_header(1 << 20, 112, 32);
         let mut scratch = [0u8; 65536 * 4];
-        let opts = Qcow2RebaseOpts {
-            mode: RebaseMode::Unsafe,
-            overlay_header: &h,
-            overlay_file_size: 16,
-            refcount_table: &[],
-            refblock_host_offsets: &[],
-            refcount_blocks: &[],
-            refblock_count: 0,
-            new_backing_virtual_size: 1 << 20,
-            new_backing_path: b"/tmp/new.qcow2",
-            detach: false,
-        };
-        let r = plan_rebase_qcow2(&opts, &mut scratch);
+        let r = plan_unsafe_with(&h, 16, b"/tmp/new.qcow2", false, &mut scratch);
         assert_eq!(r.err(), Some(RebaseError::OverlayCorrupt));
     }
 
     #[test]
     fn unsafe_mode_rejects_long_path() {
-        let h = make_header(1 << 20, 65536, 4); // tiny slot
+        let h = make_header(1 << 20, 112, 4); // tiny slot
         let mut scratch = [0u8; 65536 * 4];
         let opts = Qcow2RebaseOpts {
             mode: RebaseMode::Unsafe,

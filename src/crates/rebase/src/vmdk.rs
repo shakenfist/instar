@@ -100,11 +100,18 @@ impl<'a> VmdkRebaseOpts<'a> {
     /// planner returns
     /// [`RebaseError::OverlayCorrupt`] if invoked against the
     /// resulting opts.
+    ///
+    /// `overlay_file_size` is *not* a safe-mode-only field and
+    /// so is a parameter: unsafe mode bounds the descriptor slot
+    /// against it, and it becomes the emitted plan's
+    /// `total_file_size`. It was previously zeroed here, which
+    /// left the unsafe-mode plan claiming a zero-byte target.
     pub fn unsafe_only(
         overlay_virtual_size: u64,
         overlay_descriptor: &'a [u8],
         overlay_descriptor_size: u32,
         overlay_descriptor_offset: u64,
+        overlay_file_size: u64,
         new_backing_virtual_size: u64,
         new_backing_path: &'a [u8],
         new_parent_cid: u32,
@@ -124,7 +131,7 @@ impl<'a> VmdkRebaseOpts<'a> {
             num_gtes_per_gt: 0,
             num_gd_entries: 0,
             gd_offset_sectors: 0,
-            overlay_file_size: 0,
+            overlay_file_size,
             overlay_grain_directory: &[],
             overlay_grain_tables: &[],
             allocated_gt_host_sectors: &[],
@@ -295,6 +302,27 @@ pub fn plan_rebase_vmdk<'a>(
     }
     if !opts.detach && opts.new_backing_virtual_size < opts.overlay_virtual_size {
         return Err(RebaseError::NewBackingIncompatible);
+    }
+
+    // Both modes rewrite the descriptor slot in place, so the
+    // slot's coordinates become a write offset the same way
+    // qcow2's `backing_file_offset` does — the shape of issue
+    // #485. They are just as untrusted: `run_vmdk_unsafe` takes
+    // them from the overlay's own vmdk header
+    // (`desc_offset_sectors`), and that path is live, dispatched
+    // from `ImageFormat::Vmdk4`. Until now nothing here bounded
+    // them; the only thing standing between a header pointing
+    // past EOF and a write there was that reading the descriptor
+    // from that offset happens to fail first. The fuzzer cannot
+    // reach this either — `fuzz_rebase_planners` synthesises the
+    // descriptor offset as `overlay_file_size - 64 KiB` rather
+    // than taking it from the input.
+    let descriptor_end = opts
+        .overlay_descriptor_offset
+        .checked_add(u64::from(opts.overlay_descriptor_size))
+        .ok_or(RebaseError::HeaderMismatch)?;
+    if descriptor_end > opts.overlay_file_size {
+        return Err(RebaseError::HeaderMismatch);
     }
 
     match opts.mode {
@@ -613,11 +641,44 @@ mod tests {
             descriptor,
             1024,
             512,
+            1024 * 1024,
             if detach { 0 } else { 1024 * 1024 * 1024 },
             new_path,
             cid,
             detach,
         )
+    }
+
+    /// The vmdk twin of issue #485: the descriptor slot's
+    /// coordinates become a write offset, so a slot the overlay
+    /// does not contain is refused before it can become a patch.
+    /// The error is `HeaderMismatch` rather than the plan-level
+    /// `Overflow` backstop, which is what pins the planner's own
+    /// check as the thing doing the rejecting.
+    #[test]
+    fn rejects_descriptor_slot_outside_overlay() {
+        let mut scratch = [0u8; 64 * 1024];
+
+        // Slot runs one byte past the end of the overlay.
+        let mut opts = unsafe_opts(SAMPLE_DESCRIPTOR, b"new.vmdk", 1, false);
+        opts.overlay_file_size = 1024 * 1024;
+        opts.overlay_descriptor_offset = 1024 * 1024 - 1023;
+        opts.overlay_descriptor_size = 1024;
+        assert_eq!(
+            plan_rebase_vmdk(&opts, &mut scratch).err(),
+            Some(RebaseError::HeaderMismatch)
+        );
+
+        // Ending exactly at EOF is legal.
+        opts.overlay_descriptor_offset = 1024 * 1024 - 1024;
+        assert!(plan_rebase_vmdk(&opts, &mut scratch).is_ok());
+
+        // An offset whose end overflows u64 is caught, not wrapped.
+        opts.overlay_descriptor_offset = u64::MAX - 4;
+        assert_eq!(
+            plan_rebase_vmdk(&opts, &mut scratch).err(),
+            Some(RebaseError::HeaderMismatch)
+        );
     }
 
     #[test]

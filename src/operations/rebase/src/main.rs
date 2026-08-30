@@ -1593,11 +1593,17 @@ unsafe fn run_vmdk_unsafe(call_table: &CallTable, config: &RebaseConfig) -> Reba
         );
     };
 
+    // Same capacity-hint sizing as the qcow2 unsafe runner: the
+    // planner bounds the descriptor slot against this and stamps
+    // it as the plan's total_file_size.
+    let overlay_file_size = (call_table.get_output_capacity)().saturating_mul(sector_size as u64);
+
     let opts = VmdkRebaseOpts::unsafe_only(
         parsed.virtual_size,
         descriptor_bytes,
         desc_byte_size as u32,
         desc_byte_offset,
+        overlay_file_size,
         parsed.virtual_size,
         new_backing_path,
         new_parent_cid,
