@@ -24,7 +24,7 @@ vhdx = { path = "../../crates/vhdx" }
 luks = { path = "../../crates/luks", features = ["decrypt", "encrypt", "kdf-argon2"] }
 
 # Argon2 crate still needed directly for Block type in memory allocation
-argon2 = { version = "0.5", default-features = false }
+argon2 = { version = "0.6", default-features = false }
 
 [lints]
 workspace = true
