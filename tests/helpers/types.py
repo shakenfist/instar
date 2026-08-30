@@ -22,6 +22,7 @@ class TestImage:
     sha256: Optional[str] = None
     unsafe_quirks_required: bool = False
     data_file: Optional[str] = None
+    instar_unsupported: Optional[str] = None
 
     @property
     def data_file_path(self) -> Optional[Path]:
@@ -50,6 +51,19 @@ class TestImage:
         """
         return self.unsafe_quirks_required
 
+    @property
+    def is_instar_unsupported(self) -> bool:
+        """Return True if instar cannot yet handle this image's format.
+
+        The manifest sets ``instar_unsupported`` to a human-readable reason for
+        images whose format qemu-img understands but instar does not implement
+        yet. Baselines are still generated and stored so the parity gap is
+        measurable, but output-comparison tests skip rather than fail. Clearing
+        the manifest field is all that is needed to turn the tests back on once
+        support lands.
+        """
+        return self.instar_unsupported is not None
+
     @classmethod
     def from_dict(cls, data: dict, testdata_root: Path) -> 'TestImage':
         """Create TestImage from manifest dictionary."""
@@ -68,4 +82,5 @@ class TestImage:
             sha256=data.get('sha256'),
             unsafe_quirks_required=data.get('unsafe_quirks_required', False),
             data_file=data.get('data_file'),
+            instar_unsupported=data.get('instar_unsupported'),
         )

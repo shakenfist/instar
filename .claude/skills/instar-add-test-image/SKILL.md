@@ -81,7 +81,26 @@ Optional fields, all of which appear in real entries: `skip_qemu_img` (never
 generate baselines, even for a `safe` image — use when qemu crashes or when
 instar diverges by design), `expected_error`, `generated_by` (the script that
 created the fixture), `cve_references`, `unsafe_quirks_required`, `passphrase`,
-`data_file`.
+`data_file`, `instar_unsupported`.
+
+**`instar_unsupported` is for formats qemu-img reads but instar does not
+implement yet.** Set it to a human-readable reason. The image stays
+`safety: safe` and baselines are still generated, so the parity gap stays
+measured; `test_info_safe.py` skips the comparison instead of failing. Reach for
+it only when the format is genuinely unimplemented and that fact is recorded in
+`docs/format-coverage.md` — never to silence a real regression, and never by
+relabelling a benign image's `safety` to dodge the test. Clearing the field is
+all that is needed to switch the tests back on once support lands.
+
+**Choosing between `instar_unsupported` and a `KNOWN_*_DIVERGENCES` entry.**
+`test_map.py` and `test_measure.py` keep in-module dicts
+(`KNOWN_MAP_DIVERGENCES`, `KNOWN_SOURCE_SCANNER_DIVERGENCES`) for gaps where one
+command's *output* differs but instar still opens the image. Use those for
+per-command divergence. Use the manifest field when instar cannot open the
+format at all, so the gap applies to every command at once and would otherwise
+have to be repeated in each dict. Note that `test_map.py` and `test_measure.py`
+already skip on a non-zero instar exit by design, so a whole-format gap only
+turns into a hard failure in `test_info_safe.py`.
 
 **Edit the file as text, not by reserialising it.** `json.dump` will reflow
 every `tags` array onto separate lines and produce a 1200-line diff for a
@@ -198,6 +217,13 @@ make test
 
 If existing images fail after a compatibility change, that is a regression, not
 a baseline problem — do not regenerate baselines to make a failure go away.
+
+If your *new* image fails because instar does not implement its format at all,
+that is not a regression either. Confirm the gap is real (read the error back to
+the source — for VMDK descriptors, `src/vmm/src/chain.rs`), record it in
+`docs/format-coverage.md`, and mark the entry `instar_unsupported`. Registering
+a fixture ahead of support is deliberate: the baselines are what a future
+implementation gets graded against.
 
 ## Gotchas
 

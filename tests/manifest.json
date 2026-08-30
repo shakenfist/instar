@@ -2093,7 +2093,8 @@
             "run_in_ci": true,
             "description": "Real VMware Workstation twoGbMaxExtentSparse VMDK: descriptor plus 26 sparse extents, 100 GiB virtual in 1.29 GiB. The only complete split-sparse chain in the corpus; custom/format-coverage/vmdk-multi-extent.vmdk is a descriptor whose extents deliberately do not exist. Extent filenames contain spaces and are kept verbatim because the descriptor references them by name",
             "tags": ["vmdk", "twoGbMaxExtentSparse", "multi-extent", "vmware-workstation", "real-world", "spaces-in-path"],
-            "sha256": "66494c3c6d44122bac09a4791ccf44aa63fb176835921cdbe21cf055f6e012f5"
+            "sha256": "66494c3c6d44122bac09a4791ccf44aa63fb176835921cdbe21cf055f6e012f5",
+            "instar_unsupported": "twoGbMaxExtentSparse: multi-extent SPARSE descriptors report FLAG_NOT_SUPPORTED; only FLAT extents are resolved (docs/format-coverage.md)"
         },
         {
             "id": "osboxes-vmdk-freedos-sparse",
