@@ -2084,6 +2084,69 @@
             "tags": ["dmg", "udif", "corrupt", "malformed", "empty-table", "segfault", "format-coverage"],
             "sha256": "c96fe4488515af162d370d9b3b9ddd121485198544e605c1fea2d3c60bd0ec58",
             "generated_by": "instar-testdata/scripts/generate-dmg-fixtures.py"
+        },
+        {
+            "id": "osboxes-vmdk-split-sparse",
+            "path": "downloaded/osboxes/android-x86-5.1-rc1-split-sparse/Android-x86 5.1 RC1.vmdk",
+            "format": "vmdk",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "Real VMware Workstation twoGbMaxExtentSparse VMDK: descriptor plus 26 sparse extents, 100 GiB virtual in 1.29 GiB. The only complete split-sparse chain in the corpus; custom/format-coverage/vmdk-multi-extent.vmdk is a descriptor whose extents deliberately do not exist. Extent filenames contain spaces and are kept verbatim because the descriptor references them by name",
+            "tags": ["vmdk", "twoGbMaxExtentSparse", "multi-extent", "vmware-workstation", "real-world", "spaces-in-path"],
+            "sha256": "66494c3c6d44122bac09a4791ccf44aa63fb176835921cdbe21cf055f6e012f5",
+            "instar_unsupported": "twoGbMaxExtentSparse: multi-extent SPARSE descriptors report FLAG_NOT_SUPPORTED; only FLAT extents are resolved (docs/format-coverage.md)"
+        },
+        {
+            "id": "osboxes-vmdk-freedos-sparse",
+            "path": "downloaded/osboxes/freedos-1.2-monolithic-sparse.vmdk",
+            "format": "vmdk",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "Real VMware Workstation monolithicSparse VMDK carrying encoding=\"windows-1252\" and isNativeSnapshot in its descriptor; no other VMDK in the corpus sets encoding at all. 200 GiB virtual in 105 MiB, a ~2000:1 sparse ratio for map and measure accounting",
+            "tags": ["vmdk", "monolithicSparse", "vmware-workstation", "descriptor-encoding", "sparse-ratio", "real-world"],
+            "sha256": "c2bae6ef56d6ca79d624d37a936610898badd2183fafe83dfc97df6169bfd511"
+        },
+        {
+            "id": "osboxes-vmdk-android-sparse",
+            "path": "downloaded/osboxes/android-x86-1.6-r2-monolithic-sparse.vmdk",
+            "format": "vmdk",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "Real VMware Workstation monolithicSparse VMDK, virtualHWVersion 10, encoding=UTF-8, 500 GiB virtual. Its descriptor names the extent \"Android 1.6 R2 (32bit).vmdk\", which does not match the containing file name",
+            "tags": ["vmdk", "monolithicSparse", "vmware-workstation", "real-world"],
+            "sha256": "6f433254d15f7e054c9557fe7adabec217594aef0460c0cb242dbc2d881b6987"
+        },
+        {
+            "id": "ova-vmdk-vyos-streamoptimized",
+            "path": "downloaded/ova-derived/vyos-1.2.1-disk1-streamoptimized.vmdk",
+            "format": "vmdk",
+            "safety": "safe",
+            "run_in_ci": true,
+            "description": "streamOptimized VMDK unpacked from the VyOS 1.2.1 release OVA. VMware ovftool emits a trailing space on every descriptor line (version=1 , CID=9040bba6 ) and uses the RDONLY extent access mode, neither of which appears elsewhere in the corpus",
+            "tags": ["vmdk", "streamOptimized", "ova", "ovftool", "descriptor-whitespace", "real-world"],
+            "sha256": "7ebfe6297649ea9200ca27fb8dd22a194447731c7e16c815ac74fbd8730b32cf"
+        },
+        {
+            "id": "ova-vmdk-wazuh-descriptor-only",
+            "path": "downloaded/ova-derived/descriptors/wazuh-4.9.1-disk-1.vmdk-descriptor",
+            "format": "vmdk",
+            "safety": "malformed",
+            "run_in_ci": false,
+            "expected_error": "Failed to read footer",
+            "description": "First 1024 bytes of the AWS VM Export streamOptimized VMDK from the Wazuh 4.9.1 OVA: the 512-byte sparse header plus the complete embedded descriptor (descriptorOffset=1, descriptorSize=1), truncated before any grain or footer. Header declares 50 GiB. The real descriptor names an absolute host path as its extent, /mnt/export-i-036908ca47aeaf214-disk-1.vmdk, and misspells ddb.longContentId; field evidence for custom/security/vmdk-path-traversal.vmdk",
+            "tags": ["vmdk", "streamOptimized", "ova", "truncated", "descriptor", "aws-vm-export", "path-traversal", "error-handling"],
+            "sha256": "d966d0e9c06694b9188aa12b42f03b2eabd51786c5713816d8a342691680ba1b"
+        },
+        {
+            "id": "ova-vmdk-splunk-descriptor-only",
+            "path": "downloaded/ova-derived/descriptors/splunk-dcn-4.0.6-disk1.vmdk-descriptor",
+            "format": "vmdk",
+            "safety": "malformed",
+            "run_in_ci": false,
+            "expected_error": "Failed to read footer",
+            "description": "First 1024 bytes of the ovftool streamOptimized VMDK from the Splunk Data Collection Node 4.0.6 OVA: sparse header plus complete embedded descriptor, truncated before any grain or footer. virtualHWVersion 13, declares 16 GiB",
+            "tags": ["vmdk", "streamOptimized", "ova", "ovftool", "truncated", "descriptor", "error-handling"],
+            "sha256": "3ee4652273ea5efebf2322306d6473f40cd60a1b89aeba67d6f3fc630cfcceb4"
         }
     ]
 }

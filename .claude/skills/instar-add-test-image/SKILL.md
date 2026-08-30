@@ -5,241 +5,276 @@ description: "Add a disk image to the instar integration test suite, safe or mal
 
 # Skill: Add Test Image to instar Test Suite
 
-Add a new disk image to the instar integration test suite. This skill handles
-both safe images (compared against stored baseline outputs) and malicious images
-(compared against stored expected output files).
+Add a new disk image to the instar integration test suite. Images live in the
+`instar-testdata` repository; `tests/manifest.json` in *this* repository is the
+inventory that makes them visible to the tests. An image that is not in the
+manifest is never opened by anything.
 
 ## When to Use
 
 - Adding a new test image to verify instar compatibility
-- Adding a malicious/crafted image for security testing
+- Adding a malformed or malicious image for security testing
 - Expanding test coverage for a specific format or edge case
 
-## Process Overview
+## The Two Paths
 
-### Step 1: Gather Image Information
+How much work an image needs depends entirely on its safety class, because
+only `safe` images are driven automatically:
 
-Ask the user for:
-1. **Image location** - Path relative to instar-testdata root (e.g., `downloaded/edge-cases/myimage.qcow2`)
-2. **Safety classification**:
-   - `safe` - Known-good image, can run qemu-img on it
-   - `caution` - Potentially problematic, test in isolation
-   - `malicious` - Known exploit/attack image, never run qemu-img
-3. **Format** - qcow2, vmdk, vhd, vhdx, raw, etc.
-4. **Description** - What makes this image interesting for testing
-5. **Tags** - Searchable tags (e.g., `["qcow2", "backing-file", "v3"]`)
+| Safety | Baselines | How it gets tested |
+|--------|-----------|--------------------|
+| `safe` | Yes, all 7 profiles | Automatically. `test_info_safe.py` discovers every `safety: safe` manifest entry and multiplies it across profiles |
+| `malformed` | No | Only by a test you write by hand |
+| `malicious` | No | Only by a test you write by hand |
 
-### Step 2: Generate Image ID
+There is no `caution` level despite what older docs say; the manifest uses
+`safe`, `malformed` and `malicious` only.
 
-Create a kebab-case ID from the description:
-- `cirros-qcow2` for CirrOS QCOW2 image
-- `qcow2-backing-passwd` for QCOW2 with /etc/passwd backing file
-- `vmdk-monolithic-sparse` for monolithicSparse VMDK
+## Step 1: Gather Image Information
 
-### Step 3: Compute Image Hash
+1. **Image location** — path relative to the instar-testdata root
+   (e.g. `downloaded/edge-cases/myimage.qcow2`)
+2. **Safety classification** — see the table above
+3. **Format** — qcow2, vmdk, vhd, vhdx, raw, vdi, parallels, qcow, dmg, luks
+4. **Description** — what makes this image interesting. Be specific about the
+   property being pinned; these descriptions are the main documentation of why
+   a fixture exists
+5. **Tags** — searchable tags (e.g. `["qcow2", "backing-file", "v3"]`)
 
-Compute the SHA256 hash of the image file for integrity verification:
+## Step 2: Generate Image ID
+
+Kebab-case, derived from what the image *is*. This ID becomes a filename for
+every baseline, so keep it filesystem-safe:
+
+- `cirros-qcow2`
+- `osboxes-vmdk-split-sparse`
+- `vmdk-path-traversal`
+
+## Step 3: Compute the Hash
 
 ```bash
 sha256sum ../instar-testdata/<path-to-image>
 ```
 
-This hash is stored in the manifest and verified at test time. If the image
-changes but baselines aren't regenerated, the test will skip with a clear
-message instead of failing with a confusing diff.
+Verified at test time (`tests/base.py:360`). If the image changes without its
+baselines being regenerated, the test skips with a clear message rather than
+failing with a confusing diff.
 
-### Step 4: Update Manifest
+## Step 4: Update the Manifest
 
-Add entry to `tests/manifest.json`:
+Add an entry to `tests/manifest.json`:
 
 ```json
 {
     "id": "<image-id>",
     "path": "<relative-path-in-testdata>",
     "format": "<format>",
-    "safety": "<safe|caution|malicious>",
-    "run_in_ci": <true for safe, false for malicious>,
+    "safety": "<safe|malformed|malicious>",
+    "run_in_ci": <true for safe, false for malformed/malicious>,
     "description": "<description>",
     "tags": ["<tag1>", "<tag2>"],
     "sha256": "<sha256-hash-from-step-3>"
 }
 ```
 
-For malicious images, also add:
-```json
-    "expected_override": "expected_outputs/<image-id>.txt"
-```
+Optional fields, all of which appear in real entries: `skip_qemu_img` (never
+generate baselines, even for a `safe` image — use when qemu crashes or when
+instar diverges by design), `expected_error`, `generated_by` (the script that
+created the fixture), `cve_references`, `unsafe_quirks_required`, `passphrase`,
+`data_file`, `instar_unsupported`.
 
-### Step 5: For Safe Images - Generate Baseline Outputs
+**`instar_unsupported` is for formats qemu-img reads but instar does not
+implement yet.** Set it to a human-readable reason. The image stays
+`safety: safe` and baselines are still generated, so the parity gap stays
+measured; `test_info_safe.py` skips the comparison instead of failing. Reach for
+it only when the format is genuinely unimplemented and that fact is recorded in
+`docs/format-coverage.md` — never to silence a real regression, and never by
+relabelling a benign image's `safety` to dodge the test. Clearing the field is
+all that is needed to switch the tests back on once support lands.
 
-Safe images are tested against stored baseline outputs in the `instar-testdata`
-repository. The test suite iterates all known output profiles (qemu-img version
-groups) and verifies that instar produces matching output for each profile.
+**Choosing between `instar_unsupported` and a `KNOWN_*_DIVERGENCES` entry.**
+`test_map.py` and `test_measure.py` keep in-module dicts
+(`KNOWN_MAP_DIVERGENCES`, `KNOWN_SOURCE_SCANNER_DIVERGENCES`) for gaps where one
+command's *output* differs but instar still opens the image. Use those for
+per-command divergence. Use the manifest field when instar cannot open the
+format at all, so the gap applies to every command at once and would otherwise
+have to be repeated in each dict. Note that `test_map.py` and `test_measure.py`
+already skip on a non-zero instar exit by design, so a whole-format gap only
+turns into a hard failure in `test_info_safe.py`.
 
-**Important**: Tests do NOT run qemu-img live. They compare against pre-generated
-baselines stored in `instar-testdata/expected-outputs/`.
+**Edit the file as text, not by reserialising it.** `json.dump` will reflow
+every `tags` array onto separate lines and produce a 1200-line diff for a
+six-entry addition. Insert the new objects before the closing `]` and keep the
+existing formatting (4-space indent, `tags` inline on one line).
 
-1. **Add to test_images list** in `tests/test_info_safe.py`:
-   ```python
-   test_images = [
-       'cirros-qcow2',
-       'qcow2-v2',
-       '<image-id>',  # Add your new image
-   ]
-   ```
+Older versions of this skill described an `expected_override` field. It does
+not exist and never did; the field you want is `expected_error`.
 
-2. **Generate baseline outputs** in the `instar-testdata` repository:
-   - For each profile (profile-6-0-0, profile-8-0-0), run qemu-img on the image
-     using a qemu-img version that matches that profile
-   - Store outputs in `expected-outputs/qemu-img-human/profiles/<profile>/<image-id>.stdout.txt`
+## Step 5: Safe Images — Generate Baselines
 
-3. **Alternatively**, run the baseline generation scripts in instar-testdata:
-   ```bash
-   cd ../instar-testdata
-   ./scripts/capture-outputs.sh
-   ./scripts/generate-profiles.sh
-   ```
+Tests do **not** run qemu-img live. They compare instar's output against
+baselines captured from all 80 qemu-img builds in
+`instar-testdata/qemu-img-binaries/<arch>/`, deduplicated into 7 profiles.
 
-### Step 6: For Malicious Images - Create Expected Output
+There is nothing to add to `test_info_safe.py` — it calls
+`_get_safe_images_from_manifest()` and picks up the new entry automatically. It
+also guards on the baseline existing, so a manifest entry without baselines
+silently contributes no test cases rather than failing.
 
-**CRITICAL**: Never run qemu-img on malicious images.
+### Generate only your image
 
-1. Run `instar info` on the image to get output:
-   ```bash
-   ./src/target/release/instar info <path-to-image>
-   ```
-
-2. Verify the output is correct (format detected, backing files reported, etc.)
-
-3. Save to `tests/expected_outputs/<image-id>.txt`
-
-4. Add scenario to `tests/test_info_malicious.py`:
-   ```python
-   scenarios = [
-       # ... existing scenarios ...
-       ('<image-id>', {'image_id': '<image-id>'}),
-   ]
-   ```
-
-### Step 7: Run Tests
+`generate-baselines.py` has no per-image filter and overwrites every output it
+produces, so running it unfiltered rewrites baselines for all ~190 images.
+Drive it with a filtered manifest instead:
 
 ```bash
-# For safe images
-make test
+cd ../instar-testdata
+python3 - <<'PY' > /tmp/manifest-new-only.json
+import json
+m = json.load(open('../instar/tests/manifest.json'))
+keep = {'<image-id>'}
+m['images'] = [i for i in m['images'] if i['id'] in keep]
+print(json.dumps(m, indent=4))
+PY
 
-# For malicious images (explicit opt-in)
-make test-malicious
+for cmd in info check compare map measure; do
+    python3 scripts/generate-baselines.py --command "$cmd" \
+        --manifest /tmp/manifest-new-only.json --no-commit
+done
 ```
 
-### Step 8: Verify Output Matches
+Those five commands are what a `safe` image needs; `--manifest` does not change
+where output lands, so this produces exactly the new files and touches nothing
+else. Confirm with `git status --short expected-outputs` — you want only `??`
+lines and zero ` M` lines.
 
-For safe images, the test iterates all output profiles and compares instar output
-(when run with `--qemu-version X.Y`) against stored baseline outputs.
-Any difference fails the test.
+**Always pass `--no-commit`.** The script auto-commits the generated baselines
+otherwise.
 
-For malicious images, the test compares instar output against the stored
-expected output file.
+### Fold raw outputs into profiles
 
-### Step 9: Document Any Quirks Discovered
+```bash
+python3 scripts/detect-profiles.py
+```
 
-If the test reveals unexpected qemu-img behavior that required compatibility
-work in instar:
+`generate-baselines.py` writes `<type>/raw/<version>/`; `detect-profiles.py`
+groups versions producing identical output into `<type>/profiles/<profile>/`
+and rewrites `version-map.json`. The tests read only `profiles/`, so this step
+is not optional. It has no image filter — run it after all generation is done
+and check the diff.
 
-1. **Create image notes** in `docs/image_notes/<image-id>.md`:
-   - Document the specific values that revealed the behavior
-   - Explain how qemu-img handles the case
-   - Explain how instar now handles it
-   - Link to relevant quirks documentation
+Watch for a **profile split**: profiles group versions that are identical
+across the whole corpus, so a new image that distinguishes two previously
+identical qemu versions creates a new profile, and every existing image gains a
+baseline copy in it. That is correct behaviour but a large diff, and worth
+calling out in the commit message rather than letting it look like churn.
 
-2. **Update docs/quirks.md** if this is a new quirk:
-   - Document the observed behavior
-   - Explain the root cause (if known)
-   - Document instar's default behavior
-   - Document `--ignore-quirks` behavior
+## Step 6: Malformed and Malicious Images
 
-3. **Update docs/image_notes/README.md** to add the new image to the index
+These get **no baselines** — every malformed entry in the manifest has zero,
+which is why `--all-images` is not part of the workflow above.
 
-See existing files like `docs/image_notes/qcow2-v2.md` for examples.
+Be aware of what registering one does and does not buy you. `expected_error` is
+parsed into the `TestImage` dataclass (`tests/helpers/types.py:20`) but no test
+asserts against it; it is documentation of the contract, not an executable one.
+`tests/test_info_malicious.py` is a stub whose `scenarios` list is entirely
+commented out, so it always skips. There is no `tests/expected_outputs/`
+directory.
 
-### Step 10: Verify All Tests Still Pass
+So a manifest entry alone makes the image *registered and hashed*, not
+*tested*. To actually exercise it, write an explicit test method alongside the
+existing hand-written ones in `tests/test_adversarial.py`, following the local
+pattern (`test_info_compression_bomb_zlib`, `test_check_chain_circular_2`, …).
 
-After making any changes to support the new image, run the full test suite
-to ensure existing images still pass:
+**Never run qemu-img on a `malicious` image.** That is the entire point of
+instar. Malformed images are safe to run qemu-img against — that is how the AFL
+fixtures were characterised — but they still get no baselines.
+
+## Step 7: Run the Tests
 
 ```bash
 make test
 ```
 
-If any existing tests fail after your changes, you may have introduced a
-regression. Check that your compatibility fix doesn't break other images.
+For a safe image, verify your new scenarios actually appeared rather than
+being silently skipped — a missing baseline produces no test case and no error.
 
-## Example: Adding a Safe Image
+## Step 8: Document Any Quirks Discovered
 
-```
-User: Add the CirrOS 0.6.3 image to the test suite
+If the image reveals qemu-img behaviour that required compatibility work:
 
-1. Image path: downloaded/cirros/cirros-0.6.3-x86_64-disk.img
-2. Safety: safe
-3. Format: qcow2
-4. Description: CirrOS minimal cloud image, real-world qcow2 example
-5. Tags: qcow2, cloud-image, production-like
-```
+1. Create `docs/image_notes/<image-id>.md` — the values that revealed it, how
+   qemu-img behaves, how instar now behaves.
+2. Update `docs/quirks.md` if the quirk is new, including `--ignore-quirks`
+   behaviour.
+3. Add the image to `docs/image_notes/README.md`.
 
-Steps:
-1. Add to manifest.json
-2. Add image ID to test_images list in test_info_safe.py
-3. Generate baseline outputs in instar-testdata for all profiles
-4. Run `make test` to verify
+## Step 9: Verify Nothing Else Broke
 
-## Example: Adding a Malicious Image
-
-```
-User: Add a QCOW2 image with backing file pointing to /etc/passwd
-
-1. Image path: malicious/qcow2-backing-passwd.qcow2
-2. Safety: malicious
-3. Format: qcow2
-4. Description: QCOW2 with backing file reference to /etc/passwd
-5. Tags: qcow2, backing-file, security, path-traversal
+```bash
+make test
 ```
 
-For malicious images:
-- Create the expected output file FIRST
-- Run instar (not qemu-img) to generate expected output
-- Verify backing file path is correctly reported
-- Verify no actual file content from /etc/passwd appears
+If existing images fail after a compatibility change, that is a regression, not
+a baseline problem — do not regenerate baselines to make a failure go away.
+
+If your *new* image fails because instar does not implement its format at all,
+that is not a regression either. Confirm the gap is real (read the error back to
+the source — for VMDK descriptors, `src/vmm/src/chain.rs`), record it in
+`docs/format-coverage.md`, and mark the entry `instar_unsupported`. Registering
+a fixture ahead of support is deliberate: the baselines are what a future
+implementation gets graded against.
+
+## Gotchas
+
+**Fields normalised before comparison.** Do not chase diffs in these:
+
+- `disk size` / `actual-size` is substituted from the live filesystem
+  (`tests/helpers/comparators.py:111`), because it is allocation state, not a
+  format decision. Baseline values for it are cosmetic.
+- vmdk `cid`/`parent-cid`, the dirty flag and vhdx log-size are stripped by
+  `assert_info_equivalent`. A vmdk content ID is a random nonce.
+
+**`generate-baselines.py` resparsifies `downloaded/` before running** (not
+`custom/`). It rewrites allocation, never content, so pinned hashes survive —
+but it is why `custom/` fixtures accumulate `disk size` drift against their
+baselines while `downloaded/` ones do not.
+
+**Multi-file images.** Formats with external extents (vmdk `twoGbMaxExtent*`,
+`monolithicFlat`) resolve extent filenames relative to the descriptor. Keep the
+extent filenames exactly as the descriptor names them; rename the containing
+directory if you need a friendlier path. `osboxes-vmdk-split-sparse` is the
+worked example, and its extent names contain spaces.
+
+**Paths with spaces** work throughout — the generator uses `subprocess.run`
+argument lists, never `shell=True`.
 
 ## Output Profiles
 
-The test suite verifies instar output against multiple qemu-img version profiles:
+Seven profiles, regenerated by `detect-profiles.py`; treat this list as
+illustrative and read `version-map.json` for the current grouping:
 
-| Profile | qemu-img Versions | Key Feature |
-|---------|-------------------|-------------|
-| `profile-6-0-0` | 6.0 - 7.x | No "Child node '/file'" section |
-| `profile-8-0-0` | 8.0+ | Includes "Child node '/file'" section |
+`profile-6-0-0`, `profile-6-1-0`, `profile-7-2-19`, `profile-8-0-0`,
+`profile-8-1-0`, `profile-10-0-0`, `profile-10-2-0`
 
-See `docs/output-formats.md` for detailed profile documentation.
+Adjacent profiles often differ *only* in normalised fields, so a profile
+mis-assignment stays invisible to the assertions until a genuinely
+version-gated field changes. See `docs/output-formats.md`.
 
 ## Key Files
 
 | File | Purpose |
 |------|---------|
-| `tests/manifest.json` | Test image definitions |
-| `tests/test_info_safe.py` | Safe image test - iterates profiles and baselines |
-| `tests/test_info_malicious.py` | Malicious image test scenarios |
-| `tests/expected_outputs/` | Expected output files for malicious images |
-| `tests/helpers/types.py` | TestImage dataclass |
-| `docs/quirks.md` | qemu-img quirks and `--ignore-quirks` documentation |
+| `tests/manifest.json` | Test image inventory — the entry point for everything |
+| `tests/test_info_safe.py` | Safe images; auto-discovers from the manifest |
+| `tests/test_adversarial.py` | Hand-written tests for malformed/malicious images |
+| `tests/test_info_malicious.py` | Stub, currently always skips |
+| `tests/helpers/types.py` | `TestImage` dataclass — the authoritative field list |
+| `tests/helpers/comparators.py` | Normalisation applied before comparison |
+| `tests/base.py` | Manifest loading, hash verification, baseline lookup |
+| `docs/testing.md` | Fuller testing documentation |
 | `docs/image_notes/` | Per-image documentation of quirks discovered |
-| `docs/image_notes/README.md` | Index of image notes |
-| `instar-testdata/expected-outputs/` | Stored baseline outputs for all profiles |
-| `instar-testdata/expected-outputs/qemu-img-human/version-map.json` | Profile definitions |
-
-## Safety Reminders
-
-1. **Never run qemu-img on malicious images** - This defeats the purpose of instar
-2. **Always verify expected output** - Malicious images should report dangerous
-   references but not leak actual file contents
-3. **Mark CI appropriately** - Malicious images should have `run_in_ci: false`
-4. **Document the threat** - Description should explain what makes the image
-   malicious and what security property is being tested
+| `instar-testdata/scripts/generate-baselines.py` | Captures raw baselines |
+| `instar-testdata/scripts/detect-profiles.py` | Folds raw into profiles |
+| `instar-testdata/expected-outputs/` | Stored baselines, raw and per-profile |
+| `instar-testdata/README.md` | Per-image provenance and manifest-id index |

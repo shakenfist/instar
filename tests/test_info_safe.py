@@ -111,6 +111,18 @@ class TestInfoSafe(testscenarios.WithScenarios, InstarTestBase):
         if not image.path.exists():
             self.skipTest(f'Image file not found: {image.path}')
 
+        # Skip images whose format instar does not implement yet. qemu-img
+        # reads these fine, so a baseline exists and the parity gap stays
+        # measurable, but asserting equality would just pin a known TODO as a
+        # hard failure. Currently twoGbMaxExtentSparse: multi-extent SPARSE
+        # descriptors report FLAG_NOT_SUPPORTED (docs/format-coverage.md).
+        # Clear the manifest field to re-enable these tests.
+        if image.is_instar_unsupported:
+            self.skipTest(
+                f'instar does not support {self.image_id} yet: '
+                f'{image.instar_unsupported}'
+            )
+
         # Skip if image hash doesn't match (indicates baselines need regeneration)
         self.skip_if_hash_mismatch(image)
 
