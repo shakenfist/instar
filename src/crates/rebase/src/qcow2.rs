@@ -29,7 +29,7 @@
 
 use qcow2::{
     QcowHeader, BACKING_FILE_OFFSET_OFFSET, BACKING_FILE_SIZE_OFFSET, INCOMPAT_CORRUPT,
-    INCOMPAT_DIRTY, INCOMPAT_EXTERNAL_DATA,
+    INCOMPAT_DIRTY, INCOMPAT_EXTERNAL_DATA, QCOW2_HEADER_LENGTH_V3, V2_HEADER_EXTENSION_OFFSET,
 };
 
 use crate::{RebaseError, RebaseMode, RebasePatch, RebasePlan};
@@ -153,6 +153,13 @@ pub fn plan_rebase_qcow2<'a>(
     }
     if parsed.crypt_method != 0 {
         return Err(RebaseError::LuksUnsupported);
+    }
+
+    // Both modes rewrite the header's backing-file pointer at
+    // bytes 8..20, so an overlay too short to hold the fixed
+    // header has no slot for that patch either.
+    if opts.overlay_file_size < (BACKING_FILE_SIZE_OFFSET + 4) as u64 {
+        return Err(RebaseError::OverlayCorrupt);
     }
 
     // Detach is encoded as an empty path; reject paths that
@@ -341,6 +348,11 @@ fn plan_qcow2_unsafe<'a>(
 /// the allocator's refcount-block staging path wired
 /// through to both modes. v1 rejects with
 /// `BackingPathTooLong` for now.
+///
+/// The in-place case additionally requires the existing slot
+/// to be a region the overlay actually has: inside the file
+/// and clear of the fixed header. A header describing anything
+/// else is rejected with `HeaderMismatch`.
 fn compute_path_target(
     opts: &Qcow2RebaseOpts<'_>,
     parsed: &QcowHeader,
@@ -359,6 +371,29 @@ fn compute_path_target(
         // relocation; deferred.
         return Err(RebaseError::BackingPathTooLong);
     }
+
+    // `backing_file_offset` and `backing_file_size` are raw
+    // header fields and `QcowHeader::parse` range-checks
+    // neither. The slot they describe is only writable if it is
+    // a real region of the overlay that starts after the fixed
+    // header — the plan rewrites bytes 8..20 itself, and path
+    // bytes landing anywhere in the header would corrupt the
+    // image. An overlay claiming an offset past EOF otherwise
+    // makes the planner emit a Write patch outside the file
+    // (issue #485).
+    let header_end = if parsed.version >= 3 {
+        QCOW2_HEADER_LENGTH_V3 as u64
+    } else {
+        V2_HEADER_EXTENSION_OFFSET as u64
+    };
+    let slot_end = parsed
+        .backing_file_offset
+        .checked_add(u64::from(parsed.backing_file_size))
+        .ok_or(RebaseError::HeaderMismatch)?;
+    if parsed.backing_file_offset < header_end || slot_end > opts.overlay_file_size {
+        return Err(RebaseError::HeaderMismatch);
+    }
+
     Ok((parsed.backing_file_offset, path_len as u32))
 }
 
@@ -667,6 +702,101 @@ mod tests {
             }
             _ => panic!("expected Unsafe variant"),
         }
+    }
+
+    /// Regression for issue #485: a fuzzed overlay header
+    /// whose `backing_file_offset` points far beyond EOF made
+    /// the planner emit a Write patch outside the file.
+    #[test]
+    fn rejects_backing_slot_past_eof() {
+        // Offset from the crash: 70267192421360547, with a
+        // 256-byte declared slot and an 8 MiB overlay.
+        let h = make_header(1 << 20, 70_267_192_421_360_547, 256);
+        let mut scratch = [0u8; 65536 * 4];
+        let path = [b'x'; 256];
+        for mode in [RebaseMode::Unsafe, RebaseMode::Safe] {
+            let opts = Qcow2RebaseOpts {
+                mode,
+                overlay_header: &h,
+                overlay_file_size: 8 * 1024 * 1024,
+                refcount_table: &[],
+                refblock_host_offsets: &[],
+                refcount_blocks: &[],
+                refblock_count: 0,
+                new_backing_virtual_size: 1 << 20,
+                new_backing_path: &path,
+                detach: false,
+            };
+            let r = plan_rebase_qcow2(&opts, &mut scratch);
+            assert_eq!(r.err(), Some(RebaseError::HeaderMismatch));
+        }
+    }
+
+    /// A slot whose end overflows u64 is a corrupt header, not
+    /// an arithmetic surprise.
+    #[test]
+    fn rejects_backing_slot_offset_overflow() {
+        let h = make_header(1 << 20, u64::MAX - 4, 16);
+        let mut scratch = [0u8; 65536 * 4];
+        let opts = Qcow2RebaseOpts {
+            mode: RebaseMode::Unsafe,
+            overlay_header: &h,
+            overlay_file_size: 8 * 1024 * 1024,
+            refcount_table: &[],
+            refblock_host_offsets: &[],
+            refcount_blocks: &[],
+            refblock_count: 0,
+            new_backing_virtual_size: 1 << 20,
+            new_backing_path: b"/tmp/new.qcow2",
+            detach: false,
+        };
+        let r = plan_rebase_qcow2(&opts, &mut scratch);
+        assert_eq!(r.err(), Some(RebaseError::HeaderMismatch));
+    }
+
+    /// A slot inside the fixed header would have the path
+    /// bytes clobber the header — including the very fields
+    /// the plan's second patch rewrites.
+    #[test]
+    fn rejects_backing_slot_inside_header() {
+        let h = make_header(1 << 20, 8, 64);
+        let mut scratch = [0u8; 65536 * 4];
+        let opts = Qcow2RebaseOpts {
+            mode: RebaseMode::Unsafe,
+            overlay_header: &h,
+            overlay_file_size: 8 * 1024 * 1024,
+            refcount_table: &[],
+            refblock_host_offsets: &[],
+            refcount_blocks: &[],
+            refblock_count: 0,
+            new_backing_virtual_size: 1 << 20,
+            new_backing_path: b"/tmp/new.qcow2",
+            detach: false,
+        };
+        let r = plan_rebase_qcow2(&opts, &mut scratch);
+        assert_eq!(r.err(), Some(RebaseError::HeaderMismatch));
+    }
+
+    /// An overlay shorter than the fixed header cannot hold
+    /// the backing-pointer rewrite either.
+    #[test]
+    fn rejects_overlay_shorter_than_header_fields() {
+        let h = make_header(1 << 20, 65536, 32);
+        let mut scratch = [0u8; 65536 * 4];
+        let opts = Qcow2RebaseOpts {
+            mode: RebaseMode::Unsafe,
+            overlay_header: &h,
+            overlay_file_size: 16,
+            refcount_table: &[],
+            refblock_host_offsets: &[],
+            refcount_blocks: &[],
+            refblock_count: 0,
+            new_backing_virtual_size: 1 << 20,
+            new_backing_path: b"/tmp/new.qcow2",
+            detach: false,
+        };
+        let r = plan_rebase_qcow2(&opts, &mut scratch);
+        assert_eq!(r.err(), Some(RebaseError::OverlayCorrupt));
     }
 
     #[test]

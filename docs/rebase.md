@@ -218,6 +218,16 @@ and the overlay becomes standalone.
  classification inconsistencies. The sparse-table refusal
  fires before any mutation and is byte-idempotent;
  qemu-img rebases the same shape check-clean.
+- **Overlays whose backing-path slot lies outside the file
+ are refused.** The header's `backing_file_offset` and
+ `backing_file_size` describe where the existing backing
+ name is stored, and both modes rewrite that slot in
+ place. A slot that runs past the overlay's end-of-file,
+ that overlaps the fixed header instar rewrites itself, or
+ whose end overflows 64 bits is refused with
+ `ERROR_HEADER_MISMATCH` (issue #485) instead of becoming
+ a write at an offset the header picked. qemu-img refuses
+ to open such an image at all.
 - **Deep-allocation safe rebases refuse on refcount
  exhaustion.** v1 never appends refblocks, so a safe
  rebase that needs more cluster allocations than the

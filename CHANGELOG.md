@@ -80,6 +80,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`rebase` no longer plans a write at an arbitrary offset for an
+  overlay with a corrupt backing-path pointer.** The qcow2 rebase
+  planner took the overlay header's `backing_file_offset` /
+  `backing_file_size` at face value when rewriting the backing name
+  in place, and `QcowHeader::parse` range-checks neither. A header
+  claiming a slot past end-of-file, inside the fixed header, or one
+  whose end overflows 64 bits produced a patch the guest would have
+  applied outside the image (found by fuzzing, issue #485). Both
+  modes now refuse such an overlay with `ERROR_HEADER_MISMATCH`, as
+  does an overlay file too short to hold the header fields the
+  rewrite touches (`ERROR_OVERLAY_CORRUPT`).
+
 - **VHD images instar writes are no longer silently truncated when
   read by qemu-img older than 10.0.** instar stamped its VHD footers
   with the creator app `imgo`; for any creator it does not recognise,
