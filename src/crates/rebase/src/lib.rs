@@ -103,8 +103,10 @@ pub enum RebaseError {
     /// new-backing-reference text. Maps to
     /// `RebaseResult::ERROR_DESCRIPTOR_TOO_LARGE`.
     DescriptorTooLarge,
-    /// An internal size or offset computation overflowed. Maps
-    /// to `RebaseResult::ERROR_INTERNAL_OVERFLOW`.
+    /// An internal size or offset computation overflowed, or a
+    /// planner tried to push a patch whose byte range falls
+    /// outside the plan's target file. Maps to
+    /// `RebaseResult::ERROR_INTERNAL_OVERFLOW`.
     Overflow,
     /// A format-specific parser failed to interpret the staged
     /// header bytes. Indicates either a corrupted image or a
@@ -239,11 +241,40 @@ impl<'a> RebasePlan<'a> {
 
     /// Append a patch to the plan. Returns
     /// [`RebaseError::ScratchTooSmall`] if the plan's storage
-    /// is full.
+    /// is full, or [`RebaseError::Overflow`] if the patch's
+    /// byte range does not fit inside `total_file_size`.
+    ///
+    /// The range check is the single choke point that makes an
+    /// out-of-file write unrepresentable: `patches_storage` is
+    /// private, so every patch any planner emits — qcow2 or
+    /// vmdk, present or future — passes through here. Both
+    /// planners derive patch offsets from untrusted image
+    /// metadata, and issue #485 was exactly such an offset
+    /// escaping into a plan the guest would then have applied
+    /// past the end of the device. Formats bound their own
+    /// fields more tightly (see the qcow2 planner's
+    /// first-cluster rule for the backing-path slot); this is
+    /// the backstop underneath them, and it is what the fuzz
+    /// harness's invariants 3 and 4 assert.
+    ///
+    /// `Append` is held to the same bound: `total_file_size` is
+    /// the file size *after* the whole plan is applied, so a
+    /// patch appending beyond it would still be a write past
+    /// the final EOF.
     pub fn push(&mut self, patch: RebasePatch<'a>) -> Result<(), RebaseError> {
         let idx = self.patch_count as usize;
         if idx >= MAX_REBASE_PATCHES {
             return Err(RebaseError::ScratchTooSmall);
+        }
+        let (byte_offset, len) = match &patch {
+            RebasePatch::Write { byte_offset, bytes }
+            | RebasePatch::Append { byte_offset, bytes } => (*byte_offset, bytes.len()),
+        };
+        let end = byte_offset
+            .checked_add(len as u64)
+            .ok_or(RebaseError::Overflow)?;
+        if end > self.total_file_size {
+            return Err(RebaseError::Overflow);
         }
         self.patches_storage[idx] = patch;
         self.patch_count += 1;
@@ -291,5 +322,52 @@ mod tests {
         let overflow = plan.push(RebasePatch::EMPTY);
         assert_eq!(overflow, Err(RebaseError::ScratchTooSmall));
         assert_eq!(plan.patches().len(), MAX_REBASE_PATCHES);
+    }
+
+    /// The plan-level backstop for issue #485: no planner can
+    /// place a patch that runs past the target file size, and a
+    /// rejected patch is not stored.
+    #[test]
+    fn plan_push_rejects_patch_past_total_file_size() {
+        let bytes = [0u8; 8];
+
+        let mut plan = RebasePlan::new(1024);
+        assert_eq!(
+            plan.push(RebasePatch::Write {
+                byte_offset: 1020,
+                bytes: &bytes,
+            }),
+            Err(RebaseError::Overflow)
+        );
+        assert_eq!(plan.patches().len(), 0);
+
+        // Ending exactly at total_file_size is legal.
+        assert!(plan
+            .push(RebasePatch::Write {
+                byte_offset: 1016,
+                bytes: &bytes,
+            })
+            .is_ok());
+        assert_eq!(plan.patches().len(), 1);
+
+        // Appends are held to the same final-EOF bound.
+        assert_eq!(
+            plan.push(RebasePatch::Append {
+                byte_offset: 1024,
+                bytes: &bytes,
+            }),
+            Err(RebaseError::Overflow)
+        );
+
+        // An offset whose end overflows u64 is caught before the
+        // comparison, not wrapped into an accepted range.
+        assert_eq!(
+            plan.push(RebasePatch::Write {
+                byte_offset: u64::MAX - 4,
+                bytes: &bytes,
+            }),
+            Err(RebaseError::Overflow)
+        );
+        assert_eq!(plan.patches().len(), 1);
     }
 }

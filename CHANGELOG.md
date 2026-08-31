@@ -80,6 +80,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`rebase` no longer plans a write at an arbitrary offset for an
+  overlay with a corrupt backing-path pointer.** The qcow2 rebase
+  planner took the overlay header's `backing_file_offset` /
+  `backing_file_size` at face value when rewriting the backing name
+  in place, and `QcowHeader::parse` range-checks neither. A header
+  claiming a slot past end-of-file produced a patch the guest would
+  have applied outside the image (found by fuzzing, issue #485).
+  When rewriting the backing name in place, both modes now require
+  the slot to sit where the format says it lives — wholly inside the
+  overlay's first cluster and clear of the fixed header — and refuse
+  anything else with `ERROR_HEADER_MISMATCH`, matching the images
+  qemu-img is willing to open. A detach is unaffected: it zeroes the
+  header pointer and never writes to the slot. An overlay file too
+  short to hold the header it declares is refused with
+  `ERROR_OVERLAY_CORRUPT`.
+
+- **A rebase plan can no longer carry a patch that falls outside the
+  file it targets.** `RebasePlan::push` now range-checks every patch
+  against the plan's `total_file_size`, which is the single point
+  every planner's patches pass through. This is the backstop
+  underneath the per-format rules above, and it also closes the same
+  shape of bug on the vmdk side, where neither planner bounded the
+  descriptor slot against the overlay even though `rebase -u` takes
+  that slot's position from the overlay's own vmdk header. The vmdk
+  planners now refuse a descriptor slot the overlay does not
+  contain, and `VmdkRebaseOpts::unsafe_only` takes the overlay file
+  size rather than zeroing it, so an unsafe-mode vmdk plan reports
+  the size it actually targets.
+
 - **VHD images instar writes are no longer silently truncated when
   read by qemu-img older than 10.0.** instar stamped its VHD footers
   with the creator app `imgo`; for any creator it does not recognise,

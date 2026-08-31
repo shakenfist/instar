@@ -11,6 +11,12 @@
 //!   3. Every `Write` patch's range lies within
 //!      `plan.total_file_size`.
 //!   4. `Append`s end at or below `plan.total_file_size`.
+//!
+//! Invariants 2-4 are also enforced by `RebasePlan::push`
+//! itself since issue #485, so a planner cannot build a plan
+//! that violates them. They are kept here as a backstop against
+//! that enforcement being weakened, and because the harness
+//! asserts them on plans it did not build.
 //!   5. No two `Write` patches overlap.
 //!
 //! For safe-mode `RebaseQcow2SafeContext` (plain overlay
