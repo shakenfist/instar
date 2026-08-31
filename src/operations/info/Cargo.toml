@@ -15,7 +15,7 @@ vmdk = { path = "../../crates/vmdk" }
 luks = { path = "../../crates/luks", features = ["decrypt", "kdf-argon2"] }
 
 # Argon2 crate still needed directly for Block type in memory allocation
-argon2 = { version = "0.5", default-features = false }
+argon2 = { version = "0.6", default-features = false }
 
 [profile.release]
 panic = "abort"
