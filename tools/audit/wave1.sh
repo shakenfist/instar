@@ -102,15 +102,16 @@ fi
 #    should live in tools/). Heuristic: count consecutive non-blank
 #    lines under any `run: |` and flag blocks of >5 lines.
 INLINE=$(awk '
-    /run: \|/ { in_run=1; count=0; start=NR; file=FILENAME; next }
+    /run: \|/ { in_run=1; count=0; start=FNR; file=FILENAME; next }
     in_run && /^[[:space:]]*$/ { in_run=0; if (count > 5) print file":"start": run-block of "count" lines"; next }
     in_run && /^[a-zA-Z-]+:/ { in_run=0; if (count > 5) print file":"start": run-block of "count" lines"; next }
     in_run { count++ }
     END { if (in_run && count > 5) print file":"start": run-block of "count" lines" }
 ' .github/workflows/*.yml 2>/dev/null || true)
 if [[ -n "$INLINE" ]]; then
-    echo "ADVISORY: long inline scripts in CI workflows (move to tools/):"
-    echo "$INLINE" | head -20
+    INLINE_COUNT=$(echo "$INLINE" | wc -l | tr -d ' ')
+    echo "ADVISORY: long inline scripts in CI workflows (move to tools/): $INLINE_COUNT hits"
+    echo "$INLINE"
 fi
 
 # 3. Adversarial / CVE fixture check: any new test asset committed
