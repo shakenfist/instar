@@ -132,8 +132,8 @@ audit that ends every master plan.
 
 | Phase | Plan | Status | Merged |
 |-------|------|--------|--------|
-| 1. Derived trailers and an end-to-end proof | [PLAN-fuzz-autofix-phase-01-closeout.md](PLAN-fuzz-autofix-phase-01-closeout.md) | Complete | `b6b67a8` (#520), `931b5a9` (#530) |
-| 2. Push audit | `PLAN-fuzz-autofix-phase-02-push-audit.md` (not yet written) | Not started | |
+| 1. Derived trailers and an end-to-end proof | [PLAN-fuzz-autofix-phase-01-closeout.md](PLAN-fuzz-autofix-phase-01-closeout.md) | Complete | `b6b67a8` (#520), `931b5a9` (#530), `7b4e860` (#535) |
+| 2. Push audit | [PLAN-fuzz-autofix-phase-02-push-audit.md](PLAN-fuzz-autofix-phase-02-push-audit.md) | In progress | |
 
 The `Merged` column is the one `PLAN-TEMPLATE.md` requires of a plan
 carrying a push audit phase: phase 2 runs the audit over the union of
@@ -141,20 +141,43 @@ the earlier phases' merge ranges, because `git diff develop...HEAD` is
 empty once they have landed. Phase 1 landed across three pull requests
 rather than one -- #520 built the helper and switched the automations
 to it, #530 gave the workflow its test data and corrected this plan's
-account of verification, and the close-out pull request that records
-the result adds its own merge commit to that cell when it lands.
-Phase 2's cell is empty because it has not started.
+account of verification, and #535 recorded the result of the
+end-to-end run. Phase 2's cell fills when its own pull request lands.
+
+The column only covers the two phases the table tracks. Most of this
+plan's work predates the table and was recorded in the sections above
+rather than as merge commits, so phase 2 had to reconstruct that part
+of the scope from the merge history; the reconstruction is a table in
+[PLAN-fuzz-autofix-phase-02-push-audit.md](PLAN-fuzz-autofix-phase-02-push-audit.md)
+under *What the survey found*, and it is the authority on what the
+audit reads.
 
 ### 2. Push audit
 
 This phase runs `PUSH-AUDIT.md` over this plan's accumulated
-diff against `develop` — every phase's work together, not phase 1's
-diff alone, because the workflow, the stager and its tests were built
-across separate branches and what they did to each other is only
-visible in the sum. Findings land as their own pull request against
-`develop`, and this plan is not complete until each one is fixed or
-declined in writing here, with the reason. If the audit finds nothing,
-that gets recorded in one sentence and the plan closes.
+work — every phase together, not phase 1 alone, because the workflow,
+the stager and its tests were built across separate branches and what
+they did to each other is only visible in the sum. There is no single
+range to audit: the phases have merged, so `git diff develop...HEAD`
+is empty, and most of the work landed before this plan recorded merge
+commits at all. The scope was therefore reconstructed commit by commit
+and is written out in
+[PLAN-fuzz-autofix-phase-02-push-audit.md](PLAN-fuzz-autofix-phase-02-push-audit.md).
+Two of the merges in it belong to other plans' pull requests (#226 and
+#484) and are path-filtered to this plan's files.
+
+Planning the phase also found two bugs in the runbook's own wave 1
+inline-script check — it prints `NR` where it means `FNR`, so every
+line number it has reported for any workflow but the first is past
+that file's end, and its `head -20` hides the hits for this plan's
+second workflow entirely. The phase repairs `tools/audit/wave1.sh`
+before running it, which is outside the scope it set itself; the
+reasoning is Decision 7 of the phase plan.
+
+Findings land as their own pull request against `develop`, and this
+plan is not complete until each one is fixed or declined in writing
+here, with the reason. If the audit finds nothing, that gets recorded
+in one sentence and the plan closes.
 
 ## Prompt
 
