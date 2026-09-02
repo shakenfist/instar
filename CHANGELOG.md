@@ -78,6 +78,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Review feedback is addressed by hand, or by asking for a re-review
   once it has been.
 
+- **The automated fuzzer bug fix workflow is retired**, along with
+  `fuzz-autofix.yml` and its staging, complexity and artifact-pattern
+  helpers. A push audit found its safety boundary did not hold and its
+  orchestration could not be tested (see
+  `docs/plans/PLAN-fuzz-autofix.md`). Fuzzer crashes and differential
+  divergences still become GitHub issues automatically; they are now
+  fixed by hand.
+
 ### Fixed
 
 - **`rebase` no longer plans a write at an arbitrary offset for an
