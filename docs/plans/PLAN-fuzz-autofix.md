@@ -133,7 +133,7 @@ audit that ends every master plan.
 | Phase | Plan | Status | Merged |
 |-------|------|--------|--------|
 | 1. Derived trailers and an end-to-end proof | [PLAN-fuzz-autofix-phase-01-closeout.md](PLAN-fuzz-autofix-phase-01-closeout.md) | Complete | `b6b67a8` (#520), `931b5a9` (#530), `7b4e860` (#535) |
-| 2. Push audit | [PLAN-fuzz-autofix-phase-02-push-audit.md](PLAN-fuzz-autofix-phase-02-push-audit.md) | In progress | |
+| 2. Push audit, and the retirement it recommended | [PLAN-fuzz-autofix-phase-02-push-audit.md](PLAN-fuzz-autofix-phase-02-push-audit.md) | In progress | |
 
 The `Merged` column is the one `PLAN-TEMPLATE.md` requires of a plan
 carrying a push audit phase: phase 2 runs the audit over the union of
@@ -152,32 +152,42 @@ of the scope from the merge history; the reconstruction is a table in
 under *What the survey found*, and it is the authority on what the
 audit reads.
 
-### 2. Push audit
+### 2. Push audit, and the retirement it recommended
 
-This phase runs `PUSH-AUDIT.md` over this plan's accumulated
-work — every phase together, not phase 1 alone, because the workflow,
-the stager and its tests were built across separate branches and what
-they did to each other is only visible in the sum. There is no single
-range to audit: the phases have merged, so `git diff develop...HEAD`
-is empty, and most of the work landed before this plan recorded merge
-commits at all. The scope was therefore reconstructed commit by commit
-and is written out in
+This phase ran `PUSH-AUDIT.md` over the plan's accumulated work --
+every phase together, because the workflow, the stager and its tests
+were built across separate branches and what they did to each other
+is only visible in the sum. There was no single range to audit, so the
+scope was reconstructed commit by commit; that reconstruction, and
+everything the audit found, is in
 [PLAN-fuzz-autofix-phase-02-push-audit.md](PLAN-fuzz-autofix-phase-02-push-audit.md).
-Two of the merges in it belong to other plans' pull requests (#226 and
-#484) and are path-filtered to this plan's files.
 
-Planning the phase also found two bugs in the runbook's own wave 1
-inline-script check — it prints `NR` where it means `FNR`, so every
-line number it has reported for any workflow but the first is past
-that file's end, and its `head -20` hides the hits for this plan's
-second workflow entirely. The phase repairs `tools/audit/wave1.sh`
-before running it, which is outside the scope it set itself; the
-reasoning is Decision 7 of the phase plan.
+**The audit's verdict is that the workflow should be removed rather
+than repaired, and the phase removes it.** The reasoning is set out in
+full in the phase plan under *The verdict*; in short, the loop ran 60
+times and produced one pull request, the safety boundary the stager
+exists to provide does not actually hold, the boundary can be
+rewritten by the process it constrains, the orchestration that needs
+the most trust is the part no test can reach, and the one fix the loop
+did produce drew its value from the human review it received rather
+than from the fix it generated. The fair counter-argument -- that the
+workflow has only been functional since #530 merged on 2026-08-30, so
+the sample is one -- is recorded there too.
 
-Findings land as their own pull request against `develop`, and this
-plan is not complete until each one is fixed or declined in writing
-here, with the reason. If the audit finds nothing, that gets recorded
-in one sentence and the plan closes.
+The fuzzers' *reporting* half stays. Crashes and divergences still
+become GitHub issues automatically through
+`tools/ci/report-fuzz-crash.sh`; they are now fixed by hand, which is
+how 29 of the 30 closed `security-audit` issues were fixed anyway.
+
+Planning the phase also found three bugs in the runbook's own wave 1
+inline-script check, all in `tools/audit/wave1.sh`: it printed `NR`
+where it meant `FNR`, so every line number it reported for any
+workflow but the alphabetically first was past that file's end; its
+`head -20` hid the hits for this plan's second workflow entirely; and
+it stopped counting a `run:` block at the block's first blank line,
+undercounting `fuzz-autofix.yml` at 4 blocks where there were 16. All
+three are fixed, because an audit cannot be run honestly through an
+instrument known to be lying.
 
 ## Prompt
 
