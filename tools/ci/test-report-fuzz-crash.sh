@@ -148,7 +148,7 @@ fi
 # file. On a real log the panic is a third of the way in, with 30 stack
 # frames and a reproduction block after it, so a tail-anchored window
 # shows neither the panic nor its message -- which is what the excerpt
-# is for, since it is the richest field fuzz-autofix sees.
+# is for, since it is the richest field in the issue.
 if jq -e '.log_excerpt | contains("panicked at")' \
         < "${BODY}" > /dev/null; then
     ok "excerpt keeps the panic line"
@@ -181,13 +181,13 @@ else
     fail "excerpt is not bounded"
 fi
 
-# --- The cross-workflow contract --------------------------------------
-start "the body satisfies fuzz-autofix.yml's validation predicate"
+# --- The fields a triager needs first -----------------------------------
+start "the body carries the fields a triager needs first"
 if jq -e '.source and .target and .signature and .reproducer' \
         < "${BODY}" > /dev/null; then
     ok "source, target, signature and reproducer are all present"
 else
-    fail "a field fuzz-autofix.yml requires is missing or empty"
+    fail "a field a triager needs is missing or empty"
 fi
 
 check "target is the fuzz target" \
@@ -280,7 +280,7 @@ else
 fi
 # The scrub discards invalid sequences. Without it jq's own leniency
 # lets them through as U+FFFD replacement characters, which is then
-# what gets interpolated into the fuzz-autofix prompt.
+# what lands in the issue body a person reads.
 if printf '%s' "${USIG}" | grep -q "$(printf '\357\277\275')"; then
     fail "signature carries U+FFFD; the scrub did not run"
 else
@@ -304,9 +304,9 @@ else
 fi
 if jq -e '.source and .target and .signature and .reproducer' \
         < "${MBODY}" > /dev/null; then
-    ok "body still satisfies the autofix predicate"
+    ok "body still carries the fields a triager needs"
 else
-    fail "body does not satisfy the autofix predicate"
+    fail "body is missing a field a triager needs"
 fi
 check "signature falls back" \
     "$(jq -r '.signature' < "${MBODY}")" "unknown crash"
@@ -367,9 +367,9 @@ fi
 check "excerpt was dropped" "$(jq -r '.log_excerpt' < "${OBODY}")" ""
 if jq -e '.source and .target and .signature and .reproducer' \
         < "${OBODY}" > /dev/null; then
-    ok "body still satisfies the autofix predicate"
+    ok "body still carries the fields a triager needs"
 else
-    fail "body does not satisfy the autofix predicate"
+    fail "body is missing a field a triager needs"
 fi
 
 # --- Duplicate suppression ---------------------------------------------
@@ -449,7 +449,7 @@ start "the same bug with different fuzz operands is not refiled"
 # exists: a Rust panic message interpolates the values that provoked it,
 # so two inputs hitting one assertion produce two different signatures.
 # Without normalization this files a fresh issue every single night,
-# while fuzz-autofix only drains one issue per day.
+# flooding the security-audit queue with duplicates of one bug.
 VARIANT_LOG="${WORK}/variant.log"
 VARIANT_MSG="qcow2 safe (deferred): Write patch 7 (99..1234) exceeds"
 VARIANT_MSG="${VARIANT_MSG} total_file_size (4096)"

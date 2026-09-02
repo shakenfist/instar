@@ -117,9 +117,11 @@ lacks "the stderr fallback is not used" "${OUT}" "unknown option"
 # The regression this preference exists to stop. A run that drafts a
 # marker block and then restates it used to have both drafts
 # concatenated, and `sed -n '/START/,/END/p'` restarts its range on the
-# second START -- so fuzz-autofix.yml's commit message held both, and
-# the comment addresser, which BRANCHED on a marker, threw a real fix
-# away when a superseded DISAGREEMENT block came back.
+# second START -- so test-drift-fix.yml's commit message would hold
+# both, the same defect that used to reach the retired fuzzer autofix
+# loop's commits, and the comment addresser, which BRANCHED on a
+# marker, threw a real fix away when a superseded DISAGREEMENT block
+# came back.
 start "a restated marker block does not reach the output twice"
 RESTATED="${WORK}/restated.jsonl"
 cat > "${RESTATED}" <<'EOF'

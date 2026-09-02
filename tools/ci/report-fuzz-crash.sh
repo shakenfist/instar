@@ -30,14 +30,14 @@
 # crashing targets reports N crashes, and it does so again every night
 # until each is fixed. An open issue for the same target and signature
 # is therefore commented on rather than refiled, so the security-audit
-# queue that fuzz-autofix.yml drains (one issue per day) does not grow a
-# duplicate per crash per night.
+# queue -- worked through by hand -- does not grow a duplicate per
+# crash per night.
 #
-# The JSON field names are a contract with fuzz-autofix.yml, which reads
-# .target/.signature/.reproducer/.log_excerpt/.crash_input_size out of
-# the issue body and feeds only those fields to Claude. Do not rename
-# them without updating that workflow. .dedup_key is read only by this
-# script, on its next run.
+# The JSON fields are the structured summary a person triaging a crash
+# needs first: .target/.signature/.reproducer/.log_excerpt/
+# .crash_input_size, chosen so the issue is skimmable without opening
+# the workflow log. .dedup_key is read only by this script, on its
+# next run.
 #
 # tools/ci/test-report-fuzz-crash.sh exercises all of this against
 # synthetic logs, including the 370KB-single-line case that broke the
@@ -128,9 +128,9 @@ fi
 # lines, and a location on its own does not identify a crash. Bounded,
 # because a panic message can itself carry fuzz data -- and scrubbed the
 # same way the excerpt is, since `head -c` can slice a multi-byte
-# character in half and this value is also interpolated into the
-# fuzz-autofix prompt. grep -m1 into head -c closes the pipe early, so
-# tolerate the SIGPIPE/no-match.
+# character in half and this value also lands in the GitHub issue
+# body a person reads. grep -m1 into head -c closes the pipe early,
+# so tolerate the SIGPIPE/no-match.
 #
 # -a matters: a fuzz log carries raw mutated bytes, and without it grep
 # decides the file is binary and prints nothing at all to stdout, so
@@ -220,8 +220,8 @@ trap 'rm -f "${EXCERPT_FILE}" "${BODY_FILE}"' EXIT
 # block. In the 379KB log that motivated this change the panic is line
 # 30 of 91, so a `tail -n 30` window starts at line 62 and contains no
 # panic line and no panic message at all -- 28 stack frames and
-# boilerplate instead. Since log_excerpt is the richest field
-# fuzz-autofix hands to Claude, anchoring matters more than recency.
+# boilerplate instead. Since log_excerpt is the richest field in the
+# issue body, anchoring matters more than recency.
 #
 # Every LINE is clipped first, because bounding by bytes alone would
 # hand back the tail of the Debug dump -- raw byte soup -- while the
@@ -258,9 +258,9 @@ else
         | "${SCRUB[@]}" 2>/dev/null > "${EXCERPT_FILE}" || true
 fi
 
-# One definition of the body, called twice: the field names are a
-# contract with fuzz-autofix.yml, and two copies of them is two things
-# to keep in step.
+# One definition of the body, called twice: the field names are the
+# issue body's own format, and two copies of them is two things to
+# keep in step.
 build_body() {
     jq -n \
         --arg source "coverage-fuzz" \
@@ -307,9 +307,9 @@ if [ "${DEDUP}" -eq 1 ]; then
     # --search narrows server-side to this target's issues, so the
     # --limit page cannot fill up with other targets' crashes and push
     # the match off the end -- which is most likely in exactly the
-    # situation dedup is for, a large backlog the once-a-day autofix
-    # cannot drain. The client-side match below is still the authority;
-    # the search only decides which issues get looked at.
+    # situation dedup is for, a large backlog nobody has worked
+    # through by hand yet. The client-side match below is still the
+    # authority; the search only decides which issues get looked at.
     EXISTING="$(gh issue list \
         --label "security-audit" \
         --state open \

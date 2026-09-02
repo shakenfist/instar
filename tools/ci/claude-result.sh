@@ -5,18 +5,19 @@
 # automation reports or the commit trailer naming the model that
 # actually ran.
 #
-# Three automations ran Claude Code unattended -- fuzz-autofix.yml,
-# test-drift-fix.yml and the since-retired comment addresser -- and
-# every one of them used to hardcode the model in its Co-Authored-By
-# trailer. By the time anyone looked they disagreed three ways
-# (`Claude Opus 4.6 (1M context)` in one, `Claude Opus 4.5` in the
-# other two) and none of them named the model the CLI actually
-# resolves to today. The master plan justified the hardcoding by
-# asserting that the workflow "cannot introspect which model the
-# `claude` CLI resolves to". That was measured and it is false: the
-# run's own output reports the resolved model and its context window
-# in `.modelUsage`. Deriving the trailer here is the only version of
-# this that cannot go stale a fourth time.
+# `test-drift-fix.yml` is the one automation left that runs Claude
+# Code unattended; the fuzzer autofix loop and the comment addresser
+# that used to be the other two are both retired. All three used to
+# hardcode the model in their Co-Authored-By trailer. By the time
+# anyone looked they disagreed three ways (`Claude Opus 4.6 (1M
+# context)` in one, `Claude Opus 4.5` in the other two) and none of
+# them named the model the CLI actually resolves to today. The
+# master plan justified the hardcoding by asserting that the workflow
+# "cannot introspect which model the `claude` CLI resolves to". That
+# was measured and it is false: the run's own output reports the
+# resolved model and its context window in `.modelUsage`. Deriving
+# the trailer here is the only version of this that cannot go stale
+# a fourth time.
 #
 # WHAT IT DELIBERATELY DOES NOT DO
 #
@@ -43,20 +44,22 @@
 #     ever reported, never branched on.
 #
 #   * It does not fail. A truncated, malformed or entirely empty
-#     stream is an expected input, not an exceptional one, and every
+#     stream is an expected input, not an exceptional one, and its
 #     caller redirects this script's stdout into a file it then reads
-#     for markers and publishes: fuzz-autofix.yml greps it for the
-#     COMMIT_SUMMARY block and uploads it as a run artifact, and the
-#     retired comment addresser grepped it for DISAGREEMENT_START and
-#     CHANGE_SUMMARY_START, whose contents reached the pull request's
-#     summary comment. Exiting non-zero there would replace a partial
-#     diagnosis with none at all. Whether the run failed is already
-#     known from `claude`'s own exit status at the call site.
+#     for markers and publishes: test-drift-fix.yml greps it for the
+#     COMMIT_SUMMARY block and uploads it as a run artifact. The two
+#     retired automations did the same -- the fuzzer autofix loop for
+#     the same COMMIT_SUMMARY block, the comment addresser for
+#     DISAGREEMENT_START and CHANGE_SUMMARY_START, whose contents
+#     reached the pull request's summary comment. Exiting non-zero
+#     there would replace a partial diagnosis with none at all.
+#     Whether the run failed is already known from `claude`'s own
+#     exit status at the call site.
 #
 #     That contract is why the one external dependency, jq, is checked
 #     for by hand below and degraded around rather than left to fail
-#     under this script's own `set -euo pipefail`. Both workflows are
-#     insulated by `continue-on-error: true`; a caller that is not --
+#     under this script's own `set -euo pipefail`. `test-drift-fix.yml`
+#     is insulated by `continue-on-error: true`; a caller that is not --
 #     the retired comment addresser ran its whole multi-item loop
 #     under `set -e` -- would have a missing jq abort the run and take
 #     the summary table with it. The only honest thing left is to say
@@ -78,10 +81,11 @@
 #
 # The automations this replaced captured `--output-format text`, which
 # printed the final result text and nothing else, and every consumer
-# was written against exactly that. fuzz-autofix.yml and
-# test-drift-fix.yml pull the COMMIT_SUMMARY block out with a single
-# `sed -n '/START/,/END/p'`, and the comment addresser *branched* on
-# `grep -q DISAGREEMENT_START`. Concatenating the whole narration
+# was written against exactly that. `test-drift-fix.yml` -- and the
+# retired fuzzer autofix loop before it -- pull the COMMIT_SUMMARY
+# block out with a single `sed -n '/START/,/END/p'`, and the retired
+# comment addresser *branched* on `grep -q DISAGREEMENT_START`.
+# Concatenating the whole narration
 # breaks both shapes: a run that drafts a COMMIT_SUMMARY block and
 # then restates it makes sed restart its range on the second START, so
 # the commit message holds both drafts run together; and a run that

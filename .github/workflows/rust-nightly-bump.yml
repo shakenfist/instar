@@ -12,9 +12,10 @@
 # the details.
 #
 # Note: PRs created with the default GITHUB_TOKEN do not trigger CI
-# workflows on the PR (a GitHub limitation shared with fuzz-autofix).
-# The candidate is fully validated on the runner before the PR is
-# opened, so the PR itself carries the evidence.
+# workflows on the PR (a general GitHub limitation, to stop a
+# workflow from recursively triggering itself). The candidate is
+# fully validated on the runner before the PR is opened, so the PR
+# itself carries the evidence.
 
 name: Rust nightly pin bump
 
