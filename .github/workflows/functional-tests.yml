@@ -138,6 +138,9 @@ jobs:
       - name: Test the Claude result parser
         run: tools/ci/test-claude-result.sh
 
+      - name: Test the inline-script audit check
+        run: tools/audit/test-inline-script-check.sh
+
   build-and-test:
     needs: check_paths
     if: needs.check_paths.outputs.code_changed != 'false'

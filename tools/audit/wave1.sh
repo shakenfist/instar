@@ -99,40 +99,13 @@ fi
 
 # 2. Inline-script check: warn on multi-line `run: |` blocks in
 #    GitHub Actions workflow files (CLAUDE.md says scripts >5 lines
-#    should live in tools/). Heuristic: count non-blank lines under
-#    any `run: |` and flag blocks of >5 lines. A blank line does not
-#    end the block -- `run:` bodies routinely open with `cd $DIR`
-#    followed by a blank line, and previously that truncated the
-#    block before it ever reached the threshold. The block ends only
-#    on a dedent to a YAML key (optionally list-item-prefixed with
-#    `- `) at or below the indentation of the `run:` key that opened
-#    it.
-INLINE=$(awk '
-    FNR == 1 {
-        if (in_run && count > 5) print file":"start": run-block of "count" lines"
-        in_run = 0
-    }
-    {
-        if (in_run) {
-            if ($0 ~ /^[[:space:]]*$/) { next }
-            indent = match($0, /[^ ]/) - 1
-            if (indent <= run_indent && $0 ~ /^[[:space:]]*(-[[:space:]]+)?[A-Za-z0-9_.-]+:/) {
-                if (count > 5) print file":"start": run-block of "count" lines"
-                in_run = 0
-            }
-        }
-        if (!in_run && $0 ~ /run: \|/) {
-            in_run = 1
-            count = 0
-            start = FNR
-            file = FILENAME
-            run_indent = match($0, /[^ ]/) - 1
-            next
-        }
-        if (in_run) { count++ }
-    }
-    END { if (in_run && count > 5) print file":"start": run-block of "count" lines" }
-' .github/workflows/*.yml 2>/dev/null || true)
+#    should live in tools/). The counting rule, the three bugs it has
+#    already had, and the one limitation it keeps are documented in
+#    the awk program itself, which is separate so that
+#    test-inline-script-check.sh can exercise it against fixtures
+#    without running the rest of wave 1.
+INLINE=$(awk -f "$SCRIPT_DIR/inline-script-check.awk" \
+    .github/workflows/*.yml 2>/dev/null || true)
 if [[ -n "$INLINE" ]]; then
     INLINE_COUNT=$(echo "$INLINE" | wc -l | tr -d ' ')
     echo "ADVISORY: long inline scripts in CI workflows (move to tools/): $INLINE_COUNT hits"
