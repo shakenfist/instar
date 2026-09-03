@@ -410,6 +410,16 @@ which are carried to Future work.
    run an audit through an instrument it knows to be lying. It is
    recorded as a finding against the runbook, not against this plan.
 
+   The PR review found a fourth: the terminator this step introduced
+   ends a block only on a dedented *YAML key*, so it ran through the
+   comments between steps and counted them as script. Fixed on the
+   same reasoning, and this time the program moved to
+   `tools/audit/inline-script-check.awk` with fixtures in
+   `tools/audit/test-inline-script-check.sh` wired into the
+   `ci-tooling` job. Four silent mis-counts in twenty lines is the
+   pattern a test exists to break, and the previous verification
+   baseline was a file this phase deletes.
+
 7. **Findings that touch surviving files are carried to the master
    plan's Future work, not fixed here.** A retirement should not grow
    into a `test-drift-fix.yml` repair project. Named explicitly:
@@ -442,9 +452,14 @@ which are carried to Future work.
 
 Falsifiable, in order:
 
-1. `tools/audit/wave1.sh`'s inline-script check reports 16 oversized
-   blocks in `fuzz-autofix.yml` and 15 in `test-drift-fix.yml` before
-   step 2 deletes the former, and `tools/audit/wave1.sh` exits 0.
+1. `tools/audit/test-inline-script-check.sh` passes, and fails
+   against both of the terminators it replaced, and
+   `tools/audit/wave1.sh` exits 0. (Relaxed from "reports 16
+   oversized blocks in `fuzz-autofix.yml` and 15 in
+   `test-drift-fix.yml`": step 2 deletes the first of those files, so
+   half the baseline could not be re-run from the tree, and the
+   review's fourth bug changed the counts on the second. Fixture
+   tests are the durable form of the same check.)
 2. The six files named in *Scope* under **Removed** do not exist, and
    `functional-tests.yml` has no `Test the autofix stager` step.
 3. This returns hits only in `docs/plans/`:
