@@ -1294,7 +1294,7 @@ writes a `slow-unit-` file for any input over 10s (its default
 slow unit can easily be sitting in the directory when a real timeout
 arrives, and the reported reproducer would then be the wrong file.
 
-### Automated bug fixes
+### Fixing fuzzer findings
 
 Fuzzer crashes and differential divergences become `security-audit`
 GitHub issues automatically (`tools/ci/report-fuzz-crash.sh`, called

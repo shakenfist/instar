@@ -1,5 +1,13 @@
 # Automated fuzzer bug fix workflow
 
+> **Retired.** The workflow described below no longer exists. A
+> push audit found its safety boundary unsound and untestable, and
+> it was removed rather than repaired -- see
+> [phase 2](PLAN-fuzz-autofix-phase-02-push-audit.md) for the
+> measurement and the reasoning. Everything past this line is
+> written in the present tense about a workflow that has been
+> deleted, and is kept as history until this plan is closed out.
+
 ## Status: In progress
 
 The workflow is built, scheduled, and running daily. It had **never

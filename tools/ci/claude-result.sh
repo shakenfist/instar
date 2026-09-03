@@ -58,11 +58,14 @@
 #
 #     That contract is why the one external dependency, jq, is checked
 #     for by hand below and degraded around rather than left to fail
-#     under this script's own `set -euo pipefail`. `test-drift-fix.yml`
-#     is insulated by `continue-on-error: true`; a caller that is not --
-#     the retired comment addresser ran its whole multi-item loop
-#     under `set -e` -- would have a missing jq abort the run and take
-#     the summary table with it. The only honest thing left is to say
+#     under this script's own `set -euo pipefail`. Only one of the two
+#     surviving call sites is insulated: the `--text` call in
+#     test-drift-fix.yml's "Run Claude Code to fix issues" step carries
+#     `continue-on-error: true`, but the three `--trailer` calls in its
+#     "Commit changes" step do not, and neither did the retired comment
+#     addresser, which ran its whole multi-item loop under `set -e`.
+#     There a missing jq would abort the step and take the commit -- or
+#     the summary table -- with it. The only honest thing left is to say
 #     jq is missing, on stdout, and exit 0.
 #
 # WHY --text PREFERS THE RESULT STRING
