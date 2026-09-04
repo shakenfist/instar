@@ -24,6 +24,8 @@ enabling machine-readable progress reporting and error handling.
 
 ```mermaid
 flowchart TB
+    src[("Source file")]
+    dst[("Dest file")]
     subgraph vmm["VMM"]
         kvm["KVM VM + vCPU"]
         indev["Input device (read-only)"]
@@ -31,9 +33,9 @@ flowchart TB
         mem["Guest memory (8MB)"]
         decoder["Protobuf decoder"]
     end
-    kvm --> mem
-    indev -- "backed by source file" --> mem
-    outdev -- "backed by dest file" --> mem
+    kvm -- "owns" --> mem
+    src --> indev --> mem
+    mem --> outdev --> dst
     mem -- "serial port (0x3f8)" --> decoder
 ```
 

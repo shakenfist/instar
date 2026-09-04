@@ -994,7 +994,7 @@ flowchart TB
         end
     end
     vmm -- "virtio-block (input)" --> guest
-    vmm -- "virtio-block (output)" --> guest
+    guest -- "virtio-block (output)" --> vmm
 ```
 
 **What the guest includes:**
