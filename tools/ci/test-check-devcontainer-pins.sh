@@ -95,6 +95,101 @@ mutate() {
     ok "${description}"
 }
 
+# Each mutation is a function rather than an inline `bash -c '...'`:
+# these edits are full of dollar signs and nested quotes, and spelling
+# them inside a single-quoted argument makes them unreadable and trips
+# SC2016 on every line. ${DEV} and ${BUILD} name the two Dockerfiles in
+# the fixture tree.
+
+# The literal ${...} text is the point here -- these strings are
+# written into a Dockerfile, where Docker expands them, so single
+# quotes are correct and SC2016 is noise.
+# shellcheck disable=SC2016
+AUDIT_SPEC='cargo-audit@"${CARGO_AUDIT_VERSION}"'
+AUDIT_COMMENT='# renovate: datasource=crate depName=cargo-audit'
+
+drift_nightly() {
+    sed -i 's/^ARG RUST_NIGHTLY=.*/ARG RUST_NIGHTLY=nightly-2020-01-01/' "${DEV}"
+}
+delete_nightly() { sed -i '/^ARG RUST_NIGHTLY=/d' "${BUILD}"; }
+drift_shared_tool() {
+    sed -i 's/^ARG CARGO_DEB_VERSION=.*/ARG CARGO_DEB_VERSION=0.0.1/' "${BUILD}"
+}
+delete_shared_tool() { sed -i '/^ARG CARGO_GENERATE_RPM_VERSION=/d' "${BUILD}"; }
+
+strip_locked() {
+    sed -i 's/cargo install --locked cargo-audit@/cargo install cargo-audit@/' "${DEV}"
+}
+# shellcheck disable=SC2016
+append_unlocked_install() {
+    printf 'RUN cargo install cargo-nextest@"${CARGO_NEXTEST_VERSION}"\n' >> "${DEV}"
+}
+append_prose() {
+    printf '# A comment about running cargo install by hand.\n' >> "${DEV}"
+}
+
+hardcode_version() { sed -i "s|${AUDIT_SPEC}|cargo-audit@0.22.2|" "${DEV}"; }
+drop_version() { sed -i "s|${AUDIT_SPEC}|cargo-audit|" "${DEV}"; }
+append_versionless_install() {
+    printf 'RUN cargo install --locked cargo-nextest\n' >> "${DEV}"
+}
+mismatch_arg_name() {
+    sed -i "s|${AUDIT_SPEC}|cargo-audit@\"\${CARGO_FUZZ_VERSION}\"|" "${DEV}"
+}
+# --locked is present and the ARG is named correctly for the crate, so
+# only the "is it actually declared?" check stands between this and a
+# silently unpinned install: Docker expands an undefined ARG to the
+# empty string, making the spec `cargo-nextest@`.
+# shellcheck disable=SC2016
+append_undeclared_arg_install() {
+    printf 'RUN cargo install --locked cargo-nextest@"${CARGO_NEXTEST_VERSION}"\n' \
+        >> "${DEV}"
+}
+append_unreferenced_arg() {
+    # Appended rather than inserted mid-file, so this trips the
+    # reference check alone: inserting it above an existing ARG would
+    # also detach that ARG from its renovate comment, and the assertion
+    # could then pass on the wrong error.
+    printf '# renovate: datasource=crate depName=cargo-unused\n' >> "${DEV}"
+    printf 'ARG CARGO_UNUSED_VERSION=1.0.0\n' >> "${DEV}"
+}
+
+# shellcheck disable=SC2016
+append_two_installs() {
+    printf 'RUN cargo install --locked cargo-deb@"${CARGO_DEB_VERSION}" && %s\n' \
+        'cargo install --locked cargo-binutils@"${CARGO_BINUTILS_VERSION}"' >> "${DEV}"
+}
+# shellcheck disable=SC2016
+append_chained_unlocked_install() {
+    printf 'RUN cargo install --locked cargo-deb@"${CARGO_DEB_VERSION}" && %s\n' \
+        'cargo install cargo-binutils@"${CARGO_BINUTILS_VERSION}"' >> "${DEV}"
+}
+
+split_install_across_lines() {
+    # The same install, rewritten so --locked and the crate spec sit on
+    # different physical lines.
+    python3 - "${DEV}" <<'SPLIT'
+import sys
+path = sys.argv[1]
+text = open(path).read()
+old = 'cargo install --locked cargo-audit@'
+new = 'cargo install \\\n        --locked \\\n        cargo-audit@'
+assert text.count(old) == 1, text.count(old)
+open(path, 'w').write(text.replace(old, new))
+SPLIT
+}
+
+quote_pin_value() {
+    sed -i 's/^ARG CARGO_AUDIT_VERSION=\(.*\)/ARG CARGO_AUDIT_VERSION="\1"/' "${DEV}"
+}
+delete_renovate_comment() { sed -i "\|^${AUDIT_COMMENT}$|d" "${DEV}"; }
+detach_renovate_comment() {
+    sed -i "\|^${AUDIT_COMMENT}$|a # an interposed comment" "${DEV}"
+}
+misname_renovate_comment() {
+    sed -i "s|^${AUDIT_COMMENT}$|${AUDIT_COMMENT}-typo|" "${DEV}"
+}
+
 start "the tree as it ships"
 reset_tree
 run_check
@@ -106,63 +201,60 @@ else
 fi
 
 start "the Rust nightly comparison"
-mutate "a drifted nightly fails" 1 "Rust nightly pin drift" -- \
-    bash -c 'sed -i "s/^ARG RUST_NIGHTLY=.*/ARG RUST_NIGHTLY=nightly-2020-01-01/" "${DEV}"'
-mutate "a missing nightly pin fails" 1 "no 'ARG RUST_NIGHTLY" -- \
-    bash -c 'sed -i "/^ARG RUST_NIGHTLY=/d" "${BUILD}"'
+mutate "a drifted nightly fails" 1 "Rust nightly pin drift" -- drift_nightly
+mutate "a missing nightly pin fails" 1 "no 'ARG RUST_NIGHTLY" -- delete_nightly
 
 start "the shared cargo tool comparison"
-mutate "a drifted shared tool fails" 1 "CARGO_DEB_VERSION drift" -- \
-    bash -c 'sed -i "s/^ARG CARGO_DEB_VERSION=.*/ARG CARGO_DEB_VERSION=0.0.1/" "${BUILD}"'
+mutate "a drifted shared tool fails" 1 "CARGO_DEB_VERSION drift" -- drift_shared_tool
 mutate "a missing shared tool pin fails" 1 "no 'ARG CARGO_GENERATE_RPM_VERSION" -- \
-    bash -c 'sed -i "/^ARG CARGO_GENERATE_RPM_VERSION=/d" "${BUILD}"'
+    delete_shared_tool
 
 # From here the mutations target the dev image's dev-only tools
 # (cargo-fuzz, cargo-audit), which the shared-pin comparison above does
 # not look at. The earlier checks exit on failure, so a mutation that
 # tripped one of them would never reach the check under test.
 start "--locked on every install"
-mutate "a stripped --locked fails" 1 "'cargo install' without --locked" -- \
-    bash -c 'sed -i "s/cargo install --locked cargo-audit@/cargo install cargo-audit@/" "${DEV}"'
+mutate "a stripped --locked fails" 1 "'cargo install' without --locked" -- strip_locked
 mutate "a new unlocked install fails" 1 "'cargo install' without --locked" -- \
-    bash -c 'printf "RUN cargo install cargo-nextest@\"\${CARGO_NEXTEST_VERSION}\"\n" >> "${DEV}"'
-mutate "prose mentioning cargo install is not a hit" 0 "" -- \
-    bash -c 'printf "# A comment about running cargo install by hand.\n" >> "${DEV}"'
+    append_unlocked_install
+mutate "prose mentioning cargo install is not a hit" 0 "" -- append_prose
 
 start "every crate arrives through its ARG"
-mutate "a hardcoded crate version fails" 1 "crate must be installed as" -- \
-    bash -c 'sed -i "s/cargo-audit@\"\${CARGO_AUDIT_VERSION}\"/cargo-audit@0.22.2/" "${DEV}"'
+mutate "a hardcoded crate version fails" 1 "crate must be installed as" -- hardcode_version
 # The gap the first draft of this guard left: --locked is present, no
 # version is hardcoded and no ARG is referenced, so a rule-by-rule check
 # sees nothing wrong while the crate floats exactly as it did before.
 mutate "an install with no version at all fails" 1 "crate must be installed as" -- \
-    bash -c 'sed -i "s/cargo-audit@\"\${CARGO_AUDIT_VERSION}\"/cargo-audit/" "${DEV}"'
+    drop_version
 mutate "a versionless install added later fails" 1 "crate must be installed as" -- \
-    bash -c 'printf "RUN cargo install --locked cargo-nextest\n" >> "${DEV}"'
-mutate "an ARG named after a different crate fails" 1 "name the ARG" -- \
-    bash -c 'sed -i "s/cargo-audit@\"\${CARGO_AUDIT_VERSION}\"/cargo-audit@\"\${CARGO_FUZZ_VERSION}\"/" "${DEV}"'
-# Appended rather than inserted mid-file, so this trips the reference
-# check alone: inserting it above an existing ARG would also detach that
-# ARG from its renovate comment and the assertion could pass on the
-# wrong error.
-mutate "an unreferenced ARG fails" 1 "is never referenced" -- \
-    bash -c 'printf "# renovate: datasource=crate depName=cargo-unused\nARG CARGO_UNUSED_VERSION=1.0.0\n" >> "${DEV}"'
+    append_versionless_install
+mutate "an ARG named after a different crate fails" 1 "name the ARG" -- mismatch_arg_name
+mutate "an install referencing an undeclared ARG fails" 1 "is not declared as an ARG" -- \
+    append_undeclared_arg_install
+mutate "an unreferenced ARG fails" 1 "is never referenced" -- append_unreferenced_arg
+
+start "several installs chained on one RUN"
+# The images already write `umask 0000 && cargo install ...`, so a check
+# that treated everything after the first `cargo install` as its
+# arguments would misread a second one as a crate named "cargo".
+mutate "two valid installs on one line pass" 0 "" -- append_two_installs
+# One --locked must not cover both.
+mutate "an unlocked install chained after a locked one fails" 1 "without --locked" -- \
+    append_chained_unlocked_install
 
 start "installs split across continuation lines"
 # --locked and the crate spec need not share a physical line, and a
 # guard that greps line by line would fail this valid form.
-mutate "--locked on a continuation line passes" 0 "" -- \
-    bash -c 'perl -0pi -e "s/cargo install --locked cargo-audit\@/cargo install \\\\\n        --locked \\\\\n        cargo-audit\@/" "${DEV}"'
+mutate "--locked on a continuation line passes" 0 "" -- split_install_across_lines
 
 start "pins stay visible to Renovate"
-mutate "a quoted pin value fails" 1 "must be unquoted" -- \
-    bash -c 'sed -i "s/^ARG CARGO_AUDIT_VERSION=\(.*\)/ARG CARGO_AUDIT_VERSION=\"\1\"/" "${DEV}"'
+mutate "a quoted pin value fails" 1 "must be unquoted" -- quote_pin_value
 mutate "a deleted renovate comment fails" 1 "must be directly preceded by" -- \
-    bash -c 'sed -i "/^# renovate: datasource=crate depName=cargo-audit\$/d" "${DEV}"'
+    delete_renovate_comment
 mutate "a detached renovate comment fails" 1 "must be directly preceded by" -- \
-    bash -c 'sed -i "/^# renovate: datasource=crate depName=cargo-audit\$/a # an interposed comment" "${DEV}"'
+    detach_renovate_comment
 mutate "a renovate comment naming the wrong crate fails" 1 "must be directly preceded by" -- \
-    bash -c 'sed -i "s/^# renovate: datasource=crate depName=cargo-audit\$/# renovate: datasource=crate depName=cargo-audit-typo/" "${DEV}"'
+    misname_renovate_comment
 
 echo
 if [ "${FAILURES}" -ne 0 ]; then

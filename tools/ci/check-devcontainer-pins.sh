@@ -183,48 +183,61 @@ for f in "$DOCKERFILE" "$BUILD_DOCKERFILE"; do
             *) continue ;;
         esac
 
-        case "$content" in
-            *--locked*) ;;
-            *)
-                echo "ERROR: $f:$lineno: 'cargo install' without --locked:" >&2
-                echo "  $content" >&2
-                problems=1
-                ;;
-        esac
-
-        # Word splitting is the point here: the crate specs are the
-        # non-flag arguments after `cargo install`.
-        # shellcheck disable=SC2086
-        for spec in ${content#*cargo install}; do
-            case "$spec" in
-                -*) continue ;;
+        # A RUN chains commands, and the images already use
+        # `umask 0000 && cargo install ...`. Split on the shell
+        # separators so each install is checked on its own: taking
+        # everything after the first `cargo install` as its arguments
+        # would misread a second one on the same line as a crate named
+        # "cargo", and would let one --locked cover both.
+        while IFS= read -r segment; do
+            case "$segment" in
+                *"cargo install"*) ;;
+                *) continue ;;
             esac
 
-            if ! printf '%s' "$spec" \
-                    | grep -qE '^[a-z0-9-]+@"?\$\{[A-Z0-9_]+\}"?$'; then
-                echo "ERROR: $f:$lineno: crate must be installed as" >&2
-                echo "       <crate>@\"\${<CRATE>_VERSION}\", not:" >&2
-                echo "  $spec" >&2
-                problems=1
-                continue
-            fi
+            case "$segment" in
+                *--locked*) ;;
+                *)
+                    echo "ERROR: $f:$lineno: 'cargo install' without --locked:" >&2
+                    echo " ${segment}" >&2
+                    problems=1
+                    ;;
+            esac
 
-            crate="${spec%%@*}"
-            var="${spec#*@}"
-            var="${var#\"}"
-            var="${var%\"}"
-            var="${var#\$\{}"
-            var="${var%\}}"
+            # Word splitting is the point here: the crate specs are the
+            # non-flag arguments after `cargo install`.
+            # shellcheck disable=SC2086
+            for spec in ${segment#*cargo install}; do
+                case "$spec" in
+                    -*) continue ;;
+                esac
 
-            if [ "$var" != "$(crate_to_arg "$crate")" ]; then
-                echo "ERROR: $f:$lineno: $crate is installed from \${$var};" >&2
-                echo "       name the ARG $(crate_to_arg "$crate") after the crate" >&2
-                problems=1
-            elif ! grep -qE "^ARG $var=" "$f"; then
-                echo "ERROR: $f:$lineno: \${$var} is not declared as an ARG" >&2
-                problems=1
-            fi
-        done
+                if ! printf '%s' "$spec" \
+                        | grep -qE '^[a-z0-9-]+@"?\$\{[A-Z0-9_]+\}"?$'; then
+                    echo "ERROR: $f:$lineno: crate must be installed as" >&2
+                    echo "       <crate>@\"\${<CRATE>_VERSION}\", not:" >&2
+                    echo "  $spec" >&2
+                    problems=1
+                    continue
+                fi
+
+                crate="${spec%%@*}"
+                var="${spec#*@}"
+                var="${var#\"}"
+                var="${var%\"}"
+                var="${var#\$\{}"
+                var="${var%\}}"
+
+                if [ "$var" != "$(crate_to_arg "$crate")" ]; then
+                    echo "ERROR: $f:$lineno: $crate is installed from \${$var};" >&2
+                    echo "       name the ARG $(crate_to_arg "$crate") after the crate" >&2
+                    problems=1
+                elif ! grep -qE "^ARG $var=" "$f"; then
+                    echo "ERROR: $f:$lineno: \${$var} is not declared as an ARG" >&2
+                    problems=1
+                fi
+            done
+        done < <(printf '%s\n' "$content" | sed -e 's/&&/\n/g' -e 's/||/\n/g' -e 's/;/\n/g')
     done < <(logical_lines "$f")
 
     while IFS= read -r hit; do
@@ -245,7 +258,7 @@ for f in "$DOCKERFILE" "$BUILD_DOCKERFILE"; do
         fi
 
         # The ARG has to actually reach an install line.
-        if ! grep -qE "\\\$\{$name\}" "$f"; then
+        if ! grep -qF "\${$name}" "$f"; then
             echo "ERROR: $f:$lineno: ARG $name is never referenced as \${$name}" >&2
             problems=1
         fi
