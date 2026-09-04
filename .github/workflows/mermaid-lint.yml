@@ -10,16 +10,34 @@
 # static runners do not have one: `debian-12-docker` is the fleet's
 # docker-capable image. Add it to .github/actionlint.yaml's runner
 # labels or actionlint fails.
+#
+# Living in its own file has one consequence worth stating. This job
+# can fail a pull request, but a `needs:` list in another workflow
+# cannot reach it, and it is deliberately not a required check either
+# -- see "Required status checks" in the template README for why a
+# path-filtered required check is a trap. So a red Mermaid lint is
+# visible on the pull request and blocks nothing automatically. Where
+# a repository records which jobs gate a pull request, this one
+# belongs on the list of deliberate exceptions.
 name: Mermaid lint
 
 on:
   pull_request:
-    # Only markdown can break a diagram. REVIEWS.md is excluded for the
-    # same reason every other expensive lane excludes it: a review
-    # session or a bot prune rewrites it and changes no diagram, and
-    # this lane costs a virtual machine.
+    # Markdown can break a diagram, and so can the checker itself: a
+    # pull request that edits the script or this workflow and no
+    # markdown would otherwise ship a change to the lane that was never
+    # run.
+    #
+    # REVIEWS.md is excluded because a review session or a bot prune
+    # rewrites it and changes no diagram, while this lane costs a
+    # virtual machine. A repository that has no REVIEWS.md keeps the
+    # line anyway, so that the exclusion is in force from the first
+    # commit of one rather than from whenever somebody remembered it.
+    # The negation is last because a later pattern wins.
     paths:
       - '**.md'
+      - '.github/workflows/mermaid-lint.yml'
+      - 'tools/mermaid-lint.sh'
       - '!REVIEWS.md'
   workflow_dispatch:
 

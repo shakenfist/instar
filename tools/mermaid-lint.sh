@@ -25,10 +25,13 @@
 
 set -euo pipefail
 
-# Pinned deliberately. Renovate's stock managers do not read a docker
-# reference out of a shell script, so this moves when somebody moves
-# it; check for a newer tag when a mermaid feature is missing.
-IMAGE="ghcr.io/mermaid-js/mermaid-cli/mermaid-cli:11.4.2"
+# Pinned deliberately, by digest as well as by tag: a tag is mutable
+# and this runs a third-party container on a runner with a docker
+# daemon. Renovate's stock managers do not read a docker reference out
+# of a shell script, so this moves when somebody moves it; check for a
+# newer tag when a mermaid feature is missing, and take the new digest
+# from the pull rather than trusting the tag alone.
+IMAGE="ghcr.io/mermaid-js/mermaid-cli/mermaid-cli:11.4.2@sha256:99c983b3ab4e14033f2880bc1b9de17e5090b4515dabd63fe9cf8c0ae6130956"
 
 repo_root=$(git rev-parse --show-toplevel)
 
@@ -64,11 +67,18 @@ else
 fi
 
 # Backticks only, and no space before the language: that is what mmdc
-# recognises. A ~~~mermaid block renders nothing and exits zero, which
-# is why check_mermaid_lint_ci in the development repository matches
-# the same narrow form -- the audit must not call a repository covered
-# for a diagram this script cannot see.
+# recognises. A tilde-fenced block renders nothing and exits zero,
+# which is why check_mermaid_lint_ci in the development repository
+# matches the same narrow form -- the audit must not call a repository
+# covered for a diagram this script cannot see.
+#
+# GitHub renders a tilde fence as a diagram all the same, so one would
+# otherwise ship unlinted through the exact gap this script exists to
+# close. Rather than fail open, refuse the file and say which fence to
+# use: the narrow mmdc-compatible form stays the only one that can be
+# committed unnoticed.
 files=()
+unlintable=()
 for candidate in "${candidates[@]}"; do
     # Only reachable on the git ls-files path, where an entry can be
     # staged for deletion; a named file was checked above.
@@ -76,7 +86,18 @@ for candidate in "${candidates[@]}"; do
     if grep -q '^[[:space:]]*```mermaid' "${candidate}"; then
         files+=("${candidate}")
     fi
+    if grep -q '^[[:space:]]*~~~mermaid' "${candidate}"; then
+        unlintable+=("${candidate}")
+    fi
 done
+
+if [ "${#unlintable[@]}" -ne 0 ]; then
+    for unlintable_file in "${unlintable[@]}"; do
+        echo "mermaid-lint: ${unlintable_file}: mermaid in a tilde fence" \
+            "is not linted; use a backtick fence" >&2
+    done
+    exit 1
+fi
 
 if [ "${#files[@]}" -eq 0 ]; then
     echo "No markdown files contain mermaid diagrams; nothing to lint."
