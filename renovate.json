@@ -83,8 +83,7 @@
       ],
       "matchStrings": [
         "# renovate: datasource=(?<datasource>[a-z-]+?) depName=(?<depName>[^\\s]+?)\\s+ARG \\w+=(?<currentValue>[^\\s\"]+)"
-      ],
-      "versioningTemplate": "semver"
+      ]
     }
   ]
 }

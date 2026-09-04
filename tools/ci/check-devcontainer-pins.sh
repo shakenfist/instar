@@ -1,6 +1,14 @@
 #!/bin/bash
-# Assert the two devcontainer Dockerfiles agree on every pin they share:
-# the Rust nightly, and the versions of the cargo tools both install.
+# Assert the devcontainer Dockerfiles pin their toolchain correctly.
+#
+# Three separate properties, all of which fail silently in production:
+#
+#   1. The two images agree on every pin they share -- the Rust nightly,
+#      and the versions of the cargo tools both install.
+#   2. Every `cargo install` runs with --locked, and takes its version
+#      from an ARG rather than a hardcoded literal.
+#   3. Every pin stays matchable by the customManagers entry in
+#      renovate.json, so it keeps being bumped.
 #
 # The dev/test image and the release build image must use the same
 # toolchain: the release image compiles the shipped binary and the
@@ -22,7 +30,10 @@
 # tests exercised.
 #
 # Usage: tools/ci/check-devcontainer-pins.sh
-# Exits 0 when the pins agree, 1 otherwise.
+# Exits 0 when every property above holds, 1 otherwise.
+#
+# tools/ci/test-check-devcontainer-pins.sh exercises each failure path
+# by mutating a copy of the real tree.
 
 set -euo pipefail
 
@@ -109,3 +120,156 @@ if [ "$drift" -ne 0 ]; then
 fi
 
 echo "Shared cargo tool pins agree: ${SHARED_TOOLS[*]}"
+
+# The pins are only half the protection, and not the half that fixed the
+# outage this check was extended for: --locked is what builds each tool
+# against the dependency set its author released it with, so a broken
+# transitive dependency published upstream cannot reach the image. A pin
+# without --locked still re-resolves the whole tree. CHANGELOG.md,
+# docs/development.md, AGENTS.md and both Dockerfiles all state --locked
+# as a rule; without a check, deleting it from one line -- or adding a
+# new `cargo install` without it -- passes pre-commit and CI in silence
+# and restores exactly the failure mode.
+#
+# The `# renovate:` comments are the other silent-failure surface. They
+# are what puts each pin under Renovate's 3-day minimumReleaseAge, and a
+# comment that stops matching does not error anywhere: the pin simply
+# freezes forever, which is worse than the floating installs it
+# replaced. So the format the customManagers regex in renovate.json
+# needs is asserted here rather than trusted.
+#
+# Rather than check those two things directly, the checks below make the
+# whole chain derivable from the crate name:
+#
+#     cargo-deb  ->  CARGO_DEB_VERSION  ->  # renovate: depName=cargo-deb
+#
+# Every crate on an install line must arrive as `<crate>@${<ARG>}`, that
+# ARG must be declared with the name the crate implies, and the renovate
+# comment above it must name the same crate. Checking a spelling of the
+# rule would leave the gaps between them: `cargo install --locked
+# cargo-audit` with no version at all carries a --locked, references no
+# ARG and hardcodes nothing, so it satisfies each rule separately while
+# floating exactly as it did before this was pinned.
+
+# Docker continues a RUN across backslash-terminated lines, so the
+# --locked and the crate specs of one install can sit on three different
+# lines. Emit one logical line per instruction, prefixed with the line
+# number it starts at, so a check can look at a whole invocation. Whole
+# line comments are dropped (the blocks above these installs discuss
+# `cargo install` in prose); Docker has no other kind.
+logical_lines() {
+    awk '
+        cont == 0 && /^[[:space:]]*#/ { next }
+        {
+            if (cont == 0) { start = NR; buf = $0 } else { buf = buf " " $0 }
+            cont = /\\[[:space:]]*$/ ? 1 : 0
+            if (cont == 0) { gsub(/\\/, " ", buf); print start ":" buf }
+        }
+    ' "$1"
+}
+
+# cargo-generate-rpm -> CARGO_GENERATE_RPM_VERSION, and back again.
+crate_to_arg() { printf '%s_VERSION\n' "$1" | tr 'a-z-' 'A-Z_'; }
+arg_to_crate() { printf '%s\n' "${1%_VERSION}" | tr 'A-Z_' 'a-z-'; }
+
+problems=0
+
+for f in "$DOCKERFILE" "$BUILD_DOCKERFILE"; do
+    while IFS= read -r logical; do
+        lineno="${logical%%:*}"
+        content="${logical#*:}"
+        case "$content" in
+            *"cargo install"*) ;;
+            *) continue ;;
+        esac
+
+        case "$content" in
+            *--locked*) ;;
+            *)
+                echo "ERROR: $f:$lineno: 'cargo install' without --locked:" >&2
+                echo "  $content" >&2
+                problems=1
+                ;;
+        esac
+
+        # Word splitting is the point here: the crate specs are the
+        # non-flag arguments after `cargo install`.
+        # shellcheck disable=SC2086
+        for spec in ${content#*cargo install}; do
+            case "$spec" in
+                -*) continue ;;
+            esac
+
+            if ! printf '%s' "$spec" \
+                    | grep -qE '^[a-z0-9-]+@"?\$\{[A-Z0-9_]+\}"?$'; then
+                echo "ERROR: $f:$lineno: crate must be installed as" >&2
+                echo "       <crate>@\"\${<CRATE>_VERSION}\", not:" >&2
+                echo "  $spec" >&2
+                problems=1
+                continue
+            fi
+
+            crate="${spec%%@*}"
+            var="${spec#*@}"
+            var="${var#\"}"
+            var="${var%\"}"
+            var="${var#\$\{}"
+            var="${var%\}}"
+
+            if [ "$var" != "$(crate_to_arg "$crate")" ]; then
+                echo "ERROR: $f:$lineno: $crate is installed from \${$var};" >&2
+                echo "       name the ARG $(crate_to_arg "$crate") after the crate" >&2
+                problems=1
+            elif ! grep -qE "^ARG $var=" "$f"; then
+                echo "ERROR: $f:$lineno: \${$var} is not declared as an ARG" >&2
+                problems=1
+            fi
+        done
+    done < <(logical_lines "$f")
+
+    while IFS= read -r hit; do
+        [ -n "$hit" ] || continue
+        lineno="${hit%%:*}"
+        content="${hit#*:}"
+        name="${content%%=*}"
+        name="${name#ARG }"
+
+        # The customManagers regex captures `[^\s"]+`, so a quoted value
+        # -- which Docker accepts, and which matches the quoting style of
+        # the install lines right below -- silently fails to match.
+        if ! printf '%s' "$content" | grep -qE "^ARG $name=[^[:space:]\"]+[[:space:]]*\$"; then
+            echo "ERROR: $f:$lineno: pin value must be unquoted, or Renovate" >&2
+            echo "       will not match it:" >&2
+            echo "  $content" >&2
+            problems=1
+        fi
+
+        # The ARG has to actually reach an install line.
+        if ! grep -qE "\\\$\{$name\}" "$f"; then
+            echo "ERROR: $f:$lineno: ARG $name is never referenced as \${$name}" >&2
+            problems=1
+        fi
+
+        # And the renovate comment has to sit directly above it, naming
+        # the crate the ARG is named after.
+        expected="# renovate: datasource=crate depName=$(arg_to_crate "$name")"
+        previous=""
+        [ "$lineno" -gt 1 ] && previous="$(sed -n "$((lineno - 1))p" "$f")"
+        if [ "$previous" != "$expected" ]; then
+            echo "ERROR: $f:$lineno: ARG $name must be directly preceded by" >&2
+            echo "       $expected" >&2
+            echo "  found: ${previous:-<start of file>}" >&2
+            problems=1
+        fi
+    done < <(grep -nE '^ARG CARGO_[A-Z0-9_]*_VERSION=' "$f" || true)
+done
+
+if [ "$problems" -ne 0 ]; then
+    echo "" >&2
+    echo "Every cargo tool install in the devcontainer images must run with" >&2
+    echo "--locked and take its version from an ARG that Renovate can see." >&2
+    echo "See docs/development.md, 'Cargo tool pinning'." >&2
+    exit 1
+fi
+
+echo "Every cargo install is --locked and every pin is Renovate-visible"

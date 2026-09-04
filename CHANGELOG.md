@@ -114,7 +114,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   1.13.2 — with nothing in the repository having changed. Each tool is
   now installed at an `ARG`-pinned version with `cargo install --locked`,
   and the pins are bumped by Renovate under the repo's three-day
-  `minimumReleaseAge`.
+  `minimumReleaseAge`. `tools/ci/check-devcontainer-pins.sh` (pre-commit
+  and CI) holds all of that in place: it fails on a lost `--locked`, on a
+  hardcoded crate version, and on a pin whose `# renovate:` comment has
+  gone missing or detached — each of which would otherwise reopen the
+  hole without any error.
 
 - **`rebase` no longer plans a write at an arbitrary offset for an
   overlay with a corrupt backing-path pointer.** The qcow2 rebase

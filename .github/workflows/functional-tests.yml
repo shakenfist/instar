@@ -135,6 +135,9 @@ jobs:
       - name: Test the glibc floor check
         run: tools/ci/test-check-glibc-floor.sh
 
+      - name: Test the devcontainer pin check
+        run: tools/ci/test-check-devcontainer-pins.sh
+
       - name: Test the Claude result parser
         run: tools/ci/test-claude-result.sh
 
@@ -235,7 +238,7 @@ jobs:
               --exclude bitmap-op \
               --exclude bench-op
 
-      - name: Check devcontainer nightly and cargo tool pins agree
+      - name: Check devcontainer pins
         run: tools/ci/check-devcontainer-pins.sh
 
       - name: Feature-gated crate tests in container

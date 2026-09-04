@@ -163,8 +163,11 @@ Beyond the Rust hooks, `pre-commit run --all-files` also runs:
 - `actionlint` over `.github/workflows/`, and `shellcheck` over
   `scripts/` and `tools/`.
 - `binary-sizes`, which checks the built binaries against the guest
-  memory layout, and `nightly-pins`, which fails if the two
-  devcontainer Dockerfiles disagree about the Rust nightly.
+  memory layout, and `devcontainer-pins`, which fails if the two
+  devcontainer Dockerfiles disagree about the Rust nightly or about the
+  version of any cargo tool they both install, if a `cargo install` line
+  has lost its `--locked`, or if a version pin has stopped being visible
+  to Renovate. See "Cargo tool pinning" below.
 
 To auto-fix formatting issues:
 
@@ -752,6 +755,16 @@ and those installs are pinned two ways:
   dependency versions its author released it with instead of
   re-resolving to the newest semver-compatible transitive dependencies.
 
+`tools/ci/check-devcontainer-pins.sh` enforces both, from pre-commit
+and from the `build-and-test` CI job: it fails if the two images
+disagree about the nightly or about a shared tool version, if any
+`cargo install` line has lost its `--locked`, if a crate is installed
+at a hardcoded version rather than through its ARG, or if a pin's
+`# renovate:` comment is missing, detached, or names a different crate
+than the ARG. A quoted pin value fails too — `renovate.json` captures
+`[^\s"]+`, so `ARG CARGO_DEB_VERSION="3.8.0"` would match nothing and
+freeze silently.
+
 The second is what protects against a broken *transitive* dependency,
 and it is not hypothetical: on 2026-09-03 `tinyvec` 1.13.0 was
 published with `use alloc::vec::{self, Vec}`, which shadows the `vec!`
@@ -773,7 +786,9 @@ The `ci-tooling` CI job runs the cheap guards over CI's own tooling:
 the test-partition check below, plus
 `tools/ci/test-report-fuzz-crash.sh` and
 `tools/ci/test-pick-fuzz-artifact.sh` for the coverage-fuzz helpers
-(see "Crash reporting" in [docs/testing.md](testing.md)). It is
+(see "Crash reporting" in [docs/testing.md](testing.md)) and
+`tools/ci/test-check-devcontainer-pins.sh` for the devcontainer pin
+guard (see "Cargo tool pinning" above). It is
 also the job named in `automated_reviewer`'s `needs` list, which is
 required to list every job that can fail a PR.
 
