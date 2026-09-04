@@ -79,6 +79,18 @@ fi
 green "PASS: make fuzz-build"
 echo
 
+# Mermaid fails at render time rather than at commit time, so a broken
+# diagram commits cleanly and passes every other check here. The script
+# renders in the upstream mermaid-cli container; do not pipe it, or the
+# pipeline reports the filter's status and every failure turns green.
+bold "=== wave 1a: tools/mermaid-lint.sh (render every diagram) ==="
+if ! ./tools/mermaid-lint.sh; then
+    red "FAIL: mermaid-lint (a diagram does not render)"
+    exit 8
+fi
+green "PASS: mermaid-lint"
+echo
+
 bold "=== wave 1b: mechanical style checks ==="
 
 # 1. Long-line check: warn on Rust source lines over 120 chars in

@@ -44,6 +44,10 @@ It performs (and exits non-zero on any failure):
   `src/fuzz` crate is outside the main workspace, so this
   catches a fuzz target drifting out of sync with a
   workspace struct change before it fails in coverage-fuzz CI)
+- `tools/mermaid-lint.sh` (renders every mermaid diagram in
+  the tree through the upstream mermaid-cli container;
+  mermaid fails at render time, so a broken diagram commits
+  cleanly and nothing else here reads one)
 - mechanical style checks: lines wrapped at 120
   characters in changed Rust files, no large inline
   scripts in CI workflow steps (advisory), single
@@ -60,6 +64,7 @@ Exit codes:
 | 4    | binary size cap exceeded         |
 | 5    | `make test-rust` failed          |
 | 7    | `make fuzz-build` failed          |
+| 8    | a mermaid diagram does not render |
 
 If wave 1 fails, fix the cause and re-run before
 spending on wave 2.

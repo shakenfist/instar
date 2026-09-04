@@ -96,10 +96,13 @@ Per-format feature detail is in
   `tools/ci/check-test-partition.py`.
 
 - **`automated_reviewer`'s `needs` list must name every job that can
-  fail a PR**, including `ci-tooling`. Two jobs are deliberately
+  fail a PR**, including `ci-tooling`. Three jobs are deliberately
   outside it, each for a stated reason in the comment above the list:
   `oslo-crossval-master` is `continue-on-error`, and `agent-context.yml`
-  is a separate workflow file, which `needs:` cannot reach.
+  and `mermaid-lint.yml` are separate workflow files, which `needs:`
+  cannot reach. Both of those are path-filtered and neither is a
+  required check, so a red result on either is visible on the pull
+  request and blocks nothing automatically.
 
 - **The call table is append-at-end and versioned.** Adding an entry
   bumps `VERSION`; never reorder or reuse an index. The entries and

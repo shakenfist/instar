@@ -194,8 +194,13 @@ tools/mermaid-lint.sh docs/x.md  # just this one
 
 Check the exit status directly. Piping the script into `tail` or `grep`
 reports the filter's status, not the script's, and turns every failure
-green. CI runs the same script from `mermaid-lint.yml` on any pull request
-that touches markdown.
+green. `tools/audit/wave1.sh` runs it as part of the pre-push audit, and
+CI runs the same script from `mermaid-lint.yml` on any pull request that
+touches markdown.
+
+A tilde-fenced mermaid block is rejected rather than skipped. GitHub
+renders one, `mmdc` does not read one, so the script refuses the file and
+names the fence to use instead of quietly leaving the diagram unlinted.
 
 ## Makefile
 
@@ -848,8 +853,6 @@ step -- see "Self-hosted runners and the GitHub CLI" in
 - `scripts/differential-fuzz.py` - Differential fuzzing script (instar vs qemu-img + libyal)
 - `scripts/extract-fuzz-corpus.py` - Seeds + restores the coverage-fuzz corpus from instar-testdata
 - `tools/ci/install-gh-cli.sh` - Installs the GitHub CLI on a self-hosted runner if absent (see "Self-hosted runners and the GitHub CLI" above)
-- `tools/mermaid-lint.sh` - Renders every tracked markdown file that contains a
-  mermaid fence, in the upstream mermaid-cli container (see "Diagrams" above)
 - `tools/ci/fuzz-tier.sh` - Computes tiered nightly per-target fuzz durations
 - `tools/ci/report-fuzz-crash.sh` - Files the `security-audit` issue for a coverage-fuzz crash (bounds the log excerpt, dedups against open issues; see "Crash reporting" in `docs/testing.md`)
 - `tools/ci/pick-fuzz-artifact.sh` - Chooses which libFuzzer artifact to report as the reproducer
@@ -858,3 +861,4 @@ step -- see "Self-hosted runners and the GitHub CLI" in
 - `tools/ci/test-check-glibc-floor.sh` - Tests for that check; the `ci-tooling` CI job runs it
 - `tools/ci/claude-result.sh` - Reads the JSONL stream a `claude -p --output-format stream-json --verbose` run leaves behind; `--text` reconstructs the assistant text (plus a diagnostic block when the run reported an error or the stream was truncated), `--trailer` emits the `Assisted-By:`/`Co-Authored-By:` pair naming the model the run actually resolved to. Called from `test-drift-fix.yml`
 - `tools/ci/test-claude-result.sh` - Tests for that helper; the `ci-tooling` CI job runs it
+- `tools/mermaid-lint.sh` - Renders every tracked markdown file that contains a mermaid fence, in the upstream mermaid-cli container (see "Diagrams" above); `mermaid-lint.yml` and the push audit's wave 1 both run it
