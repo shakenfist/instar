@@ -22,25 +22,19 @@ enabling machine-readable progress reporting and error handling.
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                        VMM                               │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────┐  │
-│  │   KVM VM    │  │  Input Dev  │  │   Output Dev    │  │
-│  │   + vCPU    │  │  (read-only)│  │   (write)       │  │
-│  └──────┬──────┘  └──────┬──────┘  └────────┬────────┘  │
-│         │                │                   │           │
-│         │                │ Backed by        │ Backed by │
-│         │                ▼ source file      ▼ dest file │
-│  ┌──────┴───────────────────────────────────────────┐   │
-│  │              Guest Memory (8MB)                   │   │
-│  └──────────────────────────────────────────────────┘   │
-│                         │                                │
-│                         ▼ Serial port (0x3f8)           │
-│              ┌─────────────────────┐                    │
-│              │ Protobuf decoder    │                    │
-│              └─────────────────────┘                    │
-└─────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph vmm["VMM"]
+        kvm["KVM VM + vCPU"]
+        indev["Input device (read-only)"]
+        outdev["Output device (write)"]
+        mem["Guest memory (8MB)"]
+        decoder["Protobuf decoder"]
+    end
+    kvm --> mem
+    indev -- "backed by source file" --> mem
+    outdev -- "backed by dest file" --> mem
+    mem -- "serial port (0x3f8)" --> decoder
 ```
 
 ## Protocol Messages

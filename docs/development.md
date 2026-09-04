@@ -172,6 +172,31 @@ To auto-fix formatting issues:
 ./scripts/check-rust.sh fix
 ```
 
+## Diagrams
+
+Diagrams of structure or flow -- components and the arrows between them,
+an ordered exchange of messages, a state machine -- are written as fenced
+`mermaid` blocks, which GitHub renders natively. Character art that is
+*not* a diagram stays in a plain fence: file trees, memory maps, register
+and bit-field layouts, wire-format byte layouts and captured terminal
+output all carry their meaning in the column alignment, and mermaid would
+destroy it. The full policy is the `diagram-discipline` shared block in
+`PUSH-AUDIT.md`.
+
+Mermaid fails at render time rather than at commit time, so a syntax error
+commits cleanly and then shows an error box on GitHub. Render before you
+push:
+
+```bash
+tools/mermaid-lint.sh            # every tracked markdown file
+tools/mermaid-lint.sh docs/x.md  # just this one
+```
+
+Check the exit status directly. Piping the script into `tail` or `grep`
+reports the filter's status, not the script's, and turns every failure
+green. CI runs the same script from `mermaid-lint.yml` on any pull request
+that touches markdown.
+
 ## Makefile
 
 A Makefile is provided for common development tasks:
@@ -467,6 +492,11 @@ or any other container-backed Makefile target must install it first:
 Omitting the step does not fail at job start -- it fails part way through
 with `docker: command not found`, whenever the first container command is
 reached.
+
+The one exception is `mermaid-lint.yml`, which runs on
+`[self-hosted, vm, debian-12-docker, s]`. That is the fleet image that
+ships `docker.io`, so it needs no install step -- but the label has to be
+listed in `.github/actionlint.yaml` or actionlint rejects the workflow.
 
 ### Self-hosted runners and the GitHub CLI
 
@@ -802,6 +832,7 @@ Each review item has an `action` field:
 - `.github/workflows/lint.yml` - rustfmt and clippy in the containerised toolchain (PR, path-filtered to the Rust tree)
 - `.github/workflows/export-repo-config.yml` - nightly export of this repository's GitHub settings for the fleet configuration audit
 - `.github/workflows/renovate.yml` - self-hosted Renovate dependency updates (hourly)
+- `.github/workflows/mermaid-lint.yml` - renders every mermaid diagram in the repository's markdown and fails on any that does not parse (PR, path-filtered to markdown)
 
 The self-hosted runners have no Docker preinstalled, so any job touching
 `docker` or a container-backed Makefile target needs an "Install Docker"
@@ -817,6 +848,8 @@ step -- see "Self-hosted runners and the GitHub CLI" in
 - `scripts/differential-fuzz.py` - Differential fuzzing script (instar vs qemu-img + libyal)
 - `scripts/extract-fuzz-corpus.py` - Seeds + restores the coverage-fuzz corpus from instar-testdata
 - `tools/ci/install-gh-cli.sh` - Installs the GitHub CLI on a self-hosted runner if absent (see "Self-hosted runners and the GitHub CLI" above)
+- `tools/mermaid-lint.sh` - Renders every tracked markdown file that contains a
+  mermaid fence, in the upstream mermaid-cli container (see "Diagrams" above)
 - `tools/ci/fuzz-tier.sh` - Computes tiered nightly per-target fuzz durations
 - `tools/ci/report-fuzz-crash.sh` - Files the `security-audit` issue for a coverage-fuzz crash (bounds the log excerpt, dedups against open issues; see "Crash reporting" in `docs/testing.md`)
 - `tools/ci/pick-fuzz-artifact.sh` - Chooses which libFuzzer artifact to report as the reproducer

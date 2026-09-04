@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Documentation diagrams are rendered pictures.** The thirteen
+  box-and-arrow diagrams in `ARCHITECTURE.md` and `docs/` are now
+  `mermaid` fences, which GitHub renders natively, instead of ASCII art.
+  Character art whose meaning is its column alignment — memory maps,
+  register and byte layouts, file trees — is unchanged. A new
+  `tools/mermaid-lint.sh` renders every diagram in the tree, and the
+  `mermaid-lint.yml` workflow runs it on any pull request that touches
+  markdown, because mermaid fails at render time rather than at commit
+  time.
+
 - **The agent context is linted.** `skillsaw` now runs as a pre-commit
   hook and as the `Agent context` CI check over `AGENTS.md`, `CLAUDE.md`
   and `.claude/`, looking for malformed frontmatter, instructions

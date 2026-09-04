@@ -115,6 +115,13 @@ Per-format feature detail is in
   and linted by `clippy`, both enforced by the pre-commit hooks;
   `./scripts/check-rust.sh fix` auto-fixes formatting.
 
+- **Diagrams of structure or flow are `mermaid` fences, not ASCII art**,
+  and they fail at render time rather than at commit time, so run
+  `tools/mermaid-lint.sh` before pushing. Character art whose meaning is
+  its column alignment -- file trees, memory maps, register layouts, byte
+  layouts, terminal output -- stays in a plain fence. See "Diagrams" in
+  [docs/development.md](docs/development.md).
+
 ## Adding a prototype
 
 1. Create a subdirectory under `prototypes/` with a descriptive name
