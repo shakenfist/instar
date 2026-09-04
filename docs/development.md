@@ -733,6 +733,40 @@ least building both images. (The lint container is separate and uses a
 stable `rust:` tag Renovate does manage; the dev image's Debian base is
 pinned by digest and Renovate walks it forward.)
 
+### Cargo tool pinning
+
+The Rust nightly is not the only thing a from-scratch image build
+resolves at build time. Both Dockerfiles `cargo install` their tooling
+from crates.io — `cargo-binutils`, `cargo-deb` and `cargo-generate-rpm`
+in both images, plus `cargo-fuzz` and `cargo-audit` in the dev image —
+and those installs are pinned two ways:
+
+* **An `ARG <TOOL>_VERSION` per crate**, so the tool version itself does
+  not float. Each ARG carries a `# renovate: datasource=crate
+  depName=<crate>` comment directly above it, which a `customManagers`
+  entry in `renovate.json` matches. Keep the comment adjacent to its
+  ARG or the pin silently stops being managed. Renovate raises one PR
+  per crate covering every file it appears in, so the dev and build
+  images move together — never bump one file alone.
+* **`cargo install --locked`**, so each tool builds against the exact
+  dependency versions its author released it with instead of
+  re-resolving to the newest semver-compatible transitive dependencies.
+
+The second is what protects against a broken *transitive* dependency,
+and it is not hypothetical: on 2026-09-03 `tinyvec` 1.13.0 was
+published with `use alloc::vec::{self, Vec}`, which shadows the `vec!`
+macro so the crate does not compile at all. `cargo install cargo-audit`
+picked it up within the hour and failed the "Build and test via
+devcontainer" step on every PR until upstream shipped 1.13.2. Nothing
+in the repository had changed. `--locked` would have held cargo-audit
+to the tinyvec its lockfile names.
+
+Note the interaction with the Renovate rule that freezes
+`src/.devcontainer/build/Dockerfile`: that rule is scoped to the
+`docker` datasource, so it still pins `debian:bullseye` (whose glibc
+2.31 sets the floor of the shipped binary) while leaving the crate
+pins in the same file managed.
+
 ## CI tooling guards
 
 The `ci-tooling` CI job runs the cheap guards over CI's own tooling:

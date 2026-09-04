@@ -14,11 +14,14 @@
   },
   "packageRules": [
     {
-      "description": "Never bump the release build image's base. src/.devcontainer/build/Dockerfile pins debian:bullseye because its glibc 2.31 sets the floor of the shipped binary, so a newer base is a regression rather than an update: PR #488 moved it to trixie and broke Rocky 9, Ubuntu 22.04 and Debian 12. The dev/test image in src/.devcontainer/Dockerfile is not covered by this rule and stays managed.",
+      "description": "Never bump the release build image's base. src/.devcontainer/build/Dockerfile pins debian:bullseye because its glibc 2.31 sets the floor of the shipped binary, so a newer base is a regression rather than an update: PR #488 moved it to trixie and broke Rocky 9, Ubuntu 22.04 and Debian 12. Scoped to the docker datasource so it freezes the base image only -- the cargo tool pins in that same file are managed by the customManagers entry below, and must track the dev image. The dev/test image in src/.devcontainer/Dockerfile is not covered by this rule and stays managed.",
       "matchFileNames": [
         "src/.devcontainer/build/Dockerfile"
       ],
-      "enabled": false
+      "enabled": false,
+      "matchDatasources": [
+        "docker"
+      ]
     },
     {
       "description": "Automatically merge minor and patch-level updates",
@@ -69,5 +72,19 @@
     }
   ],
   "minimumReleaseAge": "3 days",
-  "rollbackPrs": true
+  "rollbackPrs": true,
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Bump the pinned `cargo install` tool versions in both devcontainer images. These tools are installed from crates.io rather than declared in a Cargo.toml, so no built-in manager sees them and they floated to the newest release on every from-scratch image build until they were pinned. Matching them here brings them under the repo-wide minimumReleaseAge, and because Renovate raises one PR per crate across all matching files, the shared pins in the dev and build images move together.",
+      "managerFilePatterns": [
+        "src/.devcontainer/Dockerfile",
+        "src/.devcontainer/build/Dockerfile"
+      ],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>[a-z-]+?) depName=(?<depName>[^\\s]+?)\\s+ARG \\w+=(?<currentValue>[^\\s\"]+)"
+      ],
+      "versioningTemplate": "semver"
+    }
+  ]
 }

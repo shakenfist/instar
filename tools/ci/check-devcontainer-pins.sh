@@ -1,5 +1,6 @@
 #!/bin/bash
-# Assert the two devcontainer Dockerfiles pin the same Rust nightly.
+# Assert the two devcontainer Dockerfiles agree on every pin they share:
+# the Rust nightly, and the versions of the cargo tools both install.
 #
 # The dev/test image and the release build image must use the same
 # toolchain: the release image compiles the shipped binary and the
@@ -14,7 +15,13 @@
 # build-and-test on every pull request. bump-rust-nightly.sh calls it
 # rather than duplicating the comparison.
 #
-# Usage: tools/ci/check-nightly-pins.sh
+# The cargo tool pins matter for the same reason. Renovate bumps a crate
+# across both files in a single PR, so drift means someone edited one
+# file by hand -- and the release image would then package with a
+# different cargo-deb / cargo-generate-rpm than the one the dev image's
+# tests exercised.
+#
+# Usage: tools/ci/check-devcontainer-pins.sh
 # Exits 0 when the pins agree, 1 otherwise.
 
 set -euo pipefail
@@ -62,3 +69,43 @@ if [ "$DEV_PIN" != "$BUILD_PIN" ]; then
 fi
 
 echo "Rust nightly pins agree: $DEV_PIN"
+
+# The cargo tools both images install. The dev image installs cargo-fuzz
+# and cargo-audit as well; those are deliberately absent here because the
+# release image does not have them to compare against.
+SHARED_TOOLS=(CARGO_BINUTILS_VERSION CARGO_DEB_VERSION CARGO_GENERATE_RPM_VERSION)
+
+read_tool_pin() {
+    # $1 = Dockerfile, $2 = ARG name
+    sed -nE "s/^ARG $2=([^[:space:]]+)\$/\\1/p" "$1"
+}
+
+drift=0
+for arg in "${SHARED_TOOLS[@]}"; do
+    dev="$(read_tool_pin "$DOCKERFILE" "$arg")"
+    build="$(read_tool_pin "$BUILD_DOCKERFILE" "$arg")"
+
+    for pair in "$DOCKERFILE:$dev" "$BUILD_DOCKERFILE:$build"; do
+        if [ -z "${pair#*:}" ]; then
+            echo "ERROR: no 'ARG $arg=<version>' pin found in ${pair%%:*}" >&2
+            drift=1
+        fi
+    done
+
+    if [ -n "$dev" ] && [ -n "$build" ] && [ "$dev" != "$build" ]; then
+        echo "ERROR: $arg drift between the devcontainer images:" >&2
+        echo "  $DOCKERFILE       = $dev" >&2
+        echo "  $BUILD_DOCKERFILE = $build" >&2
+        drift=1
+    fi
+done
+
+if [ "$drift" -ne 0 ]; then
+    echo "" >&2
+    echo "Both images must install the same version of every shared cargo" >&2
+    echo "tool. Renovate bumps a crate across both files in one PR, so do" >&2
+    echo "not fix this by hand-editing a single file." >&2
+    exit 1
+fi
+
+echo "Shared cargo tool pins agree: ${SHARED_TOOLS[*]}"

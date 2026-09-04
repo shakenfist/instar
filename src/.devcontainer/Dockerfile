@@ -79,27 +79,62 @@ ENV PATH="/build/.cargo/bin:${PATH}"
 # Install required components (world-writable so any user can update)
 RUN umask 0000 && rustup component add rust-src llvm-tools-preview
 
+# Cargo tool versions are PINNED, and every `cargo install` below runs
+# with --locked. The two halves guard different failures and neither is
+# sufficient alone:
+#
+#   --locked builds each tool against the exact dependency versions its
+#   author released it with, rather than re-resolving to the newest
+#   semver-compatible transitive dependencies at image-build time. On
+#   2026-09-03 tinyvec 1.13.0 was published with `use alloc::vec::{self,
+#   Vec}`, which shadows the `vec!` macro so the crate does not compile
+#   at all; `cargo install cargo-audit` pulled it in within the hour and
+#   broke this layer for every PR until upstream shipped 1.13.2.
+#
+#   The version pins keep the tools themselves out of that same race, and
+#   put them under Renovate -- whose repo-wide minimumReleaseAge of 3
+#   days is what actually holds a fresh bad release back. The
+#   `# renovate:` comments drive the customManagers entry in
+#   renovate.json, so keep each comment directly above its ARG.
+#
+# The shared tools are pinned identically in
+# src/.devcontainer/build/Dockerfile. Renovate raises one PR per crate
+# covering every occurrence, so the two images stay in lockstep on their
+# own; do not bump one file alone.
+
+# renovate: datasource=crate depName=cargo-binutils
+ARG CARGO_BINUTILS_VERSION=0.4.0
 # Install cargo-binutils for rust-objcopy (cached registry for faster rebuilds)
 RUN --mount=type=cache,target=/build/.cargo/registry,sharing=locked \
     --mount=type=cache,target=/build/.cargo/git,sharing=locked \
-    umask 0000 && cargo install cargo-binutils
+    umask 0000 && cargo install --locked cargo-binutils@"${CARGO_BINUTILS_VERSION}"
 
+# renovate: datasource=crate depName=cargo-fuzz
+ARG CARGO_FUZZ_VERSION=0.13.2
 # Install cargo-fuzz for coverage-guided fuzzing of parser crates
 RUN --mount=type=cache,target=/build/.cargo/registry,sharing=locked \
     --mount=type=cache,target=/build/.cargo/git,sharing=locked \
-    umask 0000 && cargo install cargo-fuzz
+    umask 0000 && cargo install --locked cargo-fuzz@"${CARGO_FUZZ_VERSION}"
 
+# renovate: datasource=crate depName=cargo-deb
+ARG CARGO_DEB_VERSION=3.8.0
+# renovate: datasource=crate depName=cargo-generate-rpm
+ARG CARGO_GENERATE_RPM_VERSION=0.21.0
 # Install packaging tools for `make deb` / `make rpm`. Both run with
 # --no-build against artifacts produced by `make instar`.
 RUN --mount=type=cache,target=/build/.cargo/registry,sharing=locked \
     --mount=type=cache,target=/build/.cargo/git,sharing=locked \
-    umask 0000 && cargo install cargo-deb cargo-generate-rpm
+    umask 0000 && cargo install --locked \
+        cargo-deb@"${CARGO_DEB_VERSION}" \
+        cargo-generate-rpm@"${CARGO_GENERATE_RPM_VERSION}"
 
+# renovate: datasource=crate depName=cargo-audit
+ARG CARGO_AUDIT_VERSION=0.22.2
 # Install cargo-audit for `make audit` (RUSTSEC advisory check
 # against the workspace dependency tree).
 RUN --mount=type=cache,target=/build/.cargo/registry,sharing=locked \
     --mount=type=cache,target=/build/.cargo/git,sharing=locked \
-    umask 0000 && cargo install cargo-audit
+    umask 0000 && cargo install --locked cargo-audit@"${CARGO_AUDIT_VERSION}"
 
 # Verify installation
 RUN rustc --version && cargo --version && rust-objcopy --version \

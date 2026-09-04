@@ -15,12 +15,13 @@ repos:
         pass_filenames: false
         files: ^src/
 
-      # The two devcontainer images must pin the same Rust nightly.
-      # bump-rust-nightly.sh enforces this too, but only weekly; here it
-      # catches a hand-edit before it lands.
-      - id: nightly-pins
-        name: devcontainer Rust nightly pins agree
-        entry: ./tools/ci/check-nightly-pins.sh
+      # The two devcontainer images must agree on every pin they share:
+      # the Rust nightly and the versions of the cargo tools both
+      # install. bump-rust-nightly.sh enforces the nightly half too, but
+      # only weekly; here it catches a hand-edit before it lands.
+      - id: devcontainer-pins
+        name: devcontainer nightly and cargo tool pins agree
+        entry: ./tools/ci/check-devcontainer-pins.sh
         language: script
         pass_filenames: false
         files: ^src/\.devcontainer/.*Dockerfile$

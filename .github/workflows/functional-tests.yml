@@ -235,8 +235,8 @@ jobs:
               --exclude bitmap-op \
               --exclude bench-op
 
-      - name: Check devcontainer Rust nightly pins agree
-        run: tools/ci/check-nightly-pins.sh
+      - name: Check devcontainer nightly and cargo tool pins agree
+        run: tools/ci/check-devcontainer-pins.sh
 
       - name: Feature-gated crate tests in container
         # Mirrors the feature-gated tail of the Makefile's test-rust
