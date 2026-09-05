@@ -147,8 +147,10 @@ generic failures into the same typed refusal, rather than
 assuming VHDX is already correct because it exits non-zero. Both
 measured 2026-09-05 against the `d59cc40` binary.
 
-There are no open GitHub issues on the differencing surface today,
-beyond #547 for the VHD misread.
+Two issues now record the read-side defects: #547 for the VHD
+silent misread, and #548 for `compare` reporting a content
+mismatch between a differencing VHDX and itself. Phase 4 closes
+both.
 
 ## Mission and problem statement
 
@@ -604,6 +606,14 @@ status becomes `Complete`.
   and `backing_fmt`, and marked both "Yes" for backing support,
   where both planners reject a backing reference outright. Fixed
   on this branch in `a93615d`, ahead of the phase 1 plan file.
+* `instar compare` reports "Content mismatch at offset 0!" for a
+  differencing VHDX compared against itself, because
+  `VhdxState::init`'s refusal happens in the guest rather than on
+  the host and `compare` reads the resulting absence of content
+  as a difference. A format refused on the host, such as bochs or
+  qed, refuses cleanly by name. Filed as
+  [#548](https://github.com/shakenfist/instar/issues/548); phase
+  4 fixes it alongside #547.
 * The silent parent-ignoring read of differencing VHDs is a live
   correctness defect, not merely a missing feature: `convert`
   produces a wrong image and exits 0. Filed by step 1d as
