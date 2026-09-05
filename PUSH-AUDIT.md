@@ -47,7 +47,10 @@ It performs (and exits non-zero on any failure):
 - `tools/mermaid-lint.sh` (renders every mermaid diagram in
   the tree through the upstream mermaid-cli container;
   mermaid fails at render time, so a broken diagram commits
-  cleanly and nothing else here reads one)
+  cleanly and nothing else here reads one. It also refuses a
+  fence `mmdc` cannot read -- a tilde fence, or a space
+  before the language -- which GitHub renders and the
+  renderer does not, naming the file and the line)
 - mechanical style checks: lines wrapped at 120
   characters in changed Rust files, no large inline
   scripts in CI workflow steps (advisory), single
@@ -55,16 +58,16 @@ It performs (and exits non-zero on any failure):
 
 Exit codes:
 
-| Code | Meaning                          |
-|------|----------------------------------|
-| 0    | all wave 1 checks passed         |
-| 1    | pre-commit failed                |
-| 2    | rustfmt or clippy failed         |
-| 3    | `make instar` failed             |
-| 4    | binary size cap exceeded         |
-| 5    | `make test-rust` failed          |
-| 7    | `make fuzz-build` failed          |
-| 8    | a mermaid diagram does not render |
+| Code | Meaning                        |
+|------|--------------------------------|
+| 0    | all wave 1 checks passed       |
+| 1    | pre-commit failed              |
+| 2    | rustfmt or clippy failed       |
+| 3    | `make instar` failed           |
+| 4    | binary size cap exceeded       |
+| 5    | `make test-rust` failed        |
+| 7    | `make fuzz-build` failed       |
+| 8    | `tools/mermaid-lint.sh` failed |
 
 If wave 1 fails, fix the cause and re-run before
 spending on wave 2.

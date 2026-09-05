@@ -16,9 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   register and byte layouts, file trees — is unchanged, and so are the
   ASCII originals in the prototype sources under `prototypes/*/README.md`.
   A new `tools/mermaid-lint.sh` renders every diagram in the tree, and
-  the `mermaid-lint.yml` workflow runs it on any pull request that
-  touches markdown, because mermaid fails at render time rather than at
-  commit time.
+  the `mermaid-lint.yml` workflow runs it on any pull request or push to
+  `develop` that touches markdown, because mermaid fails at render time
+  rather than at commit time. A fence the renderer cannot read — a tilde
+  fence, or a space before the language — is refused by name rather than
+  skipped, since GitHub renders both and would otherwise ship the
+  diagram unlinted.
 
 - **The agent context is linted.** `skillsaw` now runs as a pre-commit
   hook and as the `Agent context` CI check over `AGENTS.md`, `CLAUDE.md`
