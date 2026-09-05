@@ -110,6 +110,18 @@ proposes five adversarial parent-locator fixtures (absolute
 disagreeing locators). That priority is unstarted, and it becomes
 directly relevant the moment instar parses a locator table.
 
+The host is further along than the rest of this picture
+suggests, which phase 1's survey established and which matters
+most to phase 11. `discover_backing_chain`
+(`src/vmm/src/main.rs:2416`) is not qcow2-only: it walks a chain
+with circular-reference detection, a depth limit and a path
+allowlist, and it already carries a non-qcow2 special case in the
+VMDK flat-descriptor short-circuit that resolves
+`parentFileNameHint`. Its security knobs,
+`security.backing_path_allowlist` and `security.max_chain_depth`,
+are declared at `src/vmm/src/config.rs:65` and `:67`. Composition
+extends that function; it does not write one.
+
 There are no open GitHub issues on the differencing surface today.
 
 ## Mission and problem statement
@@ -221,7 +233,7 @@ records `instar-testdata <sha> (#pr)` and is audited there.
 
 | Phase | Plan | Status | Merged |
 |-------|------|--------|--------|
-| 1. Semantics pin, oracle selection, and the doc correction | PLAN-differencing-phase-01-pin.md | In progress | |
+| 1. Semantics pin, oracle selection, and the doc correction | [PLAN-differencing-phase-01-pin.md](PLAN-differencing-phase-01-pin.md) | In progress | |
 | 2. Real differencing fixtures, happy-path and adversarial (instar-testdata) | PLAN-differencing-phase-02-fixtures.md | Not started | |
 | 3. Parent-locator parsing in `crates/vhd` and `crates/vhdx` | PLAN-differencing-phase-03-parse.md | Not started | |
 | 4. Read-side policy: close the silent parent-ignoring read | PLAN-differencing-phase-04-read-policy.md | Not started | |
