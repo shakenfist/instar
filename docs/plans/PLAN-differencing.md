@@ -154,8 +154,8 @@ Out of scope, and deliberately left to their own work:
    the operator: **both, in that order.** The plan refuses first
    and composes last. Phase 4 turns the silent parent-ignoring
    read into a typed refusal, which closes the wrong-data hole
-   immediately and holds while the emitters land; phase 11 then
-   implements real chain composition for VHD and VHDX, the way
+   immediately and holds while the emitters land; phases 11 to 16
+   then implement real chain composition for VHD and VHDX, the way
    instar already composes qcow2 backing chains -- the host
    attaches each chain member as its own virtio device and the
    guest takes an `input_device_count`. The refusal is therefore
@@ -231,8 +231,13 @@ records `instar-testdata <sha> (#pr)` and is audited there.
 | 8. Rust unit tests and Python integration tests | PLAN-differencing-phase-08-tests.md | Not started | |
 | 9. Coverage fuzzing of the locator parsers | PLAN-differencing-phase-09-fuzz.md | Not started | |
 | 10. Documentation | PLAN-differencing-phase-10-docs.md | Not started | |
-| 11. Chain composition on read for VHD and VHDX | PLAN-differencing-phase-11-composition.md | Not started | |
-| 12. Push audit | PLAN-differencing-phase-12-push-audit.md | Not started | |
+| 11. Composition: host chain discovery, device attachment, `info --chain` | PLAN-differencing-phase-11-chain-host.md | Not started | |
+| 12. Composition: guest VHD sector-bitmap read path | PLAN-differencing-phase-12-vhd-compose.md | Not started | |
+| 13. Composition: guest VHDX sector-bitmap read path | PLAN-differencing-phase-13-vhdx-compose.md | Not started | |
+| 14. Composition: per-op rollout, replacing phase 4's refusals | PLAN-differencing-phase-14-op-rollout.md | Not started | |
+| 15. Composition: integration tests and fuzz | PLAN-differencing-phase-15-compose-tests.md | Not started | |
+| 16. Composition: documentation | PLAN-differencing-phase-16-compose-docs.md | Not started | |
+| 17. Push audit | PLAN-differencing-phase-17-push-audit.md | Not started | |
 
 ### Sequencing rationale
 
@@ -259,22 +264,51 @@ Phases 5 and 6 are independent of each other and could be
 parallelised; VHD goes first because its parent locator table is
 the simpler structure and the lessons carry into VHDX.
 
-Phase 11 is last of the implementation phases because it is
-the only one that can be built on everything else: it needs the
-locator parsing from phase 3 to find a parent, the emitters from
-phases 5 and 6 to generate chains to read, and the fixtures from
-phase 2 to read chains instar did not write. It replaces phase
-4's refusal with composition op by op, so each op moves from
-"refuses, correctly" to "composes, correctly" and never passes
-back through "silently wrong".
+Phases 11 to 16 are the composition work, and they come last
+because they are the only part that can be built on everything
+else: composition needs the locator parsing from phase 3 to find
+a parent, the emitters from phases 5 and 6 to generate chains to
+read, and the fixtures from phase 2 to read chains instar did not
+write. Phase 14 replaces phase 4's refusal op by op, so each op
+moves from "refuses, correctly" to "composes, correctly" and
+never passes back through "silently wrong".
 
-It is also the largest, and its phase plan is expected to
-decompose into sub-phases the way `PLAN-resize-followup-01`
-did -- host-side chain discovery, guest-side VHD composition,
-guest-side VHDX composition, and the per-op rollout are
-separable, and the two guest paths are not the same problem.
-Two specifics its plan must confront, both already visible in the
-crates:
+Composition is a plan's worth of work on its own -- it is the
+half of this plan that touches the guest read path, where the
+output half touches only the writer -- so it is decomposed here
+rather than left as one phase to be split later, the way
+`PLAN-resize-followup-01` split its own:
+
+* **Phase 11, host side.** Resolving a locator path to a real
+  parent, applying the same resolution and depth rules qcow2
+  backing chains get, and attaching each chain member as its own
+  virtio device. Ends with `info --chain` walking a VHD or VHDX
+  chain, which is the cheapest possible proof the host half
+  works and needs no guest change at all.
+* **Phases 12 and 13, guest side.** The two formats are not the
+  same problem and each is a self-contained read-path change, so
+  they are separate phases that can be planned, reviewed and
+  reverted independently. VHD first, for the same reason its
+  emitter goes first.
+* **Phase 14, rollout.** Turning the refusals into composition
+  across `convert`, `compare`, `dd`, `bench`, `map`, `measure`
+  and `check`. Mechanical once 11 to 13 land, but it is the
+  phase that changes what users see, and it wants its own review
+  rather than being tacked onto a guest phase.
+* **Phase 15, tests and fuzz.** Cross-validation against the
+  phase 1 oracle for chains instar wrote and chains it did not,
+  plus coverage fuzzing of the compose path. Phase 9 fuzzes the
+  locator *parsers*; composing a chain is new surface, and a
+  malicious child pointing at a well-formed parent is a
+  different input space from a malformed locator table.
+* **Phase 16, documentation.** Separate because phase 10 will
+  have documented a refusal that phase 14 removes: at minimum
+  `docs/chain-discovery.md`, `docs/chain-config.md` and the
+  read-side rows and divergence notes of
+  `docs/format-coverage.md`.
+
+Two specifics phases 12 and 13 must confront, both already
+visible in the crates:
 
 * VHD differencing selects between child and parent at **sector**
   granularity, not block granularity: the per-block sector bitmap
@@ -290,14 +324,8 @@ crates:
   (`:571`, `:581`, `:601`) -- a v1 simplification that is only
   safe while differencing images are rejected outright.
 
-Because phase 11 lands after the documentation phase, it
-carries its own documentation rather than deferring it: at
-minimum `docs/chain-discovery.md`, `docs/chain-config.md` and
-the read-side rows of `docs/format-coverage.md`, which phase 10
-will have written to describe a refusal.
-
 Whether `map`'s per-extent `depth` field participates is a
-scoping call for that phase plan: `PLAN-map.md` deferred
+scoping call for phase 14's plan: `PLAN-map.md` deferred
 backing-chain depth composition for qcow2 as well, so VHD/VHDX
 depth may reasonably follow qcow2's rather than lead it.
 
@@ -388,7 +416,7 @@ We will know this plan has been implemented because:
   and the false "differencing with backing chains" input claim
   at `CHANGELOG.md:1922` is reconciled by a current statement of
   what is actually supported.
-* The push audit in phase 11 has run over the union of the
+* The push audit in phase 17 has run over the union of the
   merged ranges, and its findings are resolved or declined in
   writing.
 
