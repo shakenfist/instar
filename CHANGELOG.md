@@ -118,7 +118,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and CI) holds all of that in place: it fails on a lost `--locked`, on a
   hardcoded crate version, and on a pin whose `# renovate:` comment has
   gone missing or detached — each of which would otherwise reopen the
-  hole without any error.
+  hole without any error. It derives the tools it compares from what the
+  images actually install rather than from a list, and it runs the
+  `customManagers` regex as written in `renovate.json` over both
+  Dockerfiles, so neither a tool added later nor a typo in the Renovate
+  config can leave a pin silently unmanaged.
 
 - **`rebase` no longer plans a write at an arbitrary offset for an
   overlay with a corrupt backing-path pointer.** The qcow2 rebase

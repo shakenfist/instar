@@ -765,6 +765,25 @@ than the ARG. A quoted pin value fails too — `renovate.json` captures
 `[^\s"]+`, so `ARG CARGO_DEB_VERSION="3.8.0"` would match nothing and
 freeze silently.
 
+Nothing in the guard is keyed off a list of tool names or a `cargo-`
+prefix. The shared set it compares across the two images is the
+*intersection of what they actually install*, so a tool added to both
+later is covered from the day it is added rather than when someone
+remembers to extend a list; and the Renovate-visibility rules are
+applied to whatever crates the install lines name, so a dependency
+whose crate is not called `cargo-something` gets the same treatment.
+
+The guard also runs the `customManagers` regex **as it is written in
+`renovate.json` today** over both Dockerfiles, and requires it to find
+exactly the pins the guard found by its own parse — same crates, same
+versions, no more and no fewer (`tools/ci/check-renovate-manager.py`).
+Without that, the format rules above are only this repository's memory
+of what Renovate needs: a typo in `matchStrings`, or a
+`managerFilePatterns` entry that stops naming these files, would freeze
+all eight pins forever while the guard still reported them healthy. A
+frozen pin is worse than the floating install it replaced, because
+nothing errors anywhere.
+
 The second is what protects against a broken *transitive* dependency,
 and it is not hypothetical: on 2026-09-03 `tinyvec` 1.13.0 was
 published with `use alloc::vec::{self, Vec}`, which shadows the `vec!`

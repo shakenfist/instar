@@ -2,10 +2,11 @@
 #
 # Tests for tools/ci/check-devcontainer-pins.sh.
 #
-# The check defends four invariants that nothing else on the pull
-# request path looks at: the two images agree on the Rust nightly and on
-# every cargo tool they share, every `cargo install` runs with --locked,
-# and every pin stays visible to Renovate's customManager. All four fail
+# The check defends invariants that nothing else on the pull request
+# path looks at: the two images agree on the Rust nightly and on every
+# cargo tool they share, every `cargo install` runs with --locked, every
+# pin stays visible to Renovate's customManager, and the customManager
+# as written in renovate.json really does match them. All of them fail
 # silently in production -- a drifted nightly builds guest binaries with
 # a different compiler than the packages, a lost --locked reopens the
 # tinyvec 1.13.0 outage, and a pin Renovate stops matching simply
@@ -14,17 +15,24 @@
 #
 # The guard resolves its own repository root from BASH_SOURCE and reads
 # fixed paths under it, so the fixtures are a miniature tree -- the real
-# script and the real Dockerfiles, copied into a temp directory in the
-# same layout -- and it runs unmodified against them. That keeps the
-# production script free of test-only path overrides, and means the
-# mutations below are applied to exactly the files that ship.
+# scripts, the real Dockerfiles and the real renovate.json, copied into
+# a temp directory in the same layout -- and it runs unmodified against
+# them. That keeps the production script free of test-only path
+# overrides, and means the mutations below are applied to exactly the
+# files that ship.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CHECK_REL="tools/ci/check-devcontainer-pins.sh"
+MANAGER_REL="tools/ci/check-renovate-manager.py"
 DEV_REL="src/.devcontainer/Dockerfile"
 BUILD_REL="src/.devcontainer/build/Dockerfile"
+RENOVATE_REL="renovate.json"
+
+# The files a mutation is allowed to edit. Copied into the fixture tree,
+# and diffed against the originals afterwards to prove the edit landed.
+FIXTURES=("${DEV_REL}" "${BUILD_REL}" "${RENOVATE_REL}")
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK}"' EXIT
@@ -41,8 +49,11 @@ reset_tree() {
     rm -rf "${TREE}"
     mkdir -p "${TREE}/tools/ci" "${TREE}/src/.devcontainer/build"
     cp "${REPO_ROOT}/${CHECK_REL}" "${TREE}/${CHECK_REL}"
-    cp "${REPO_ROOT}/${DEV_REL}" "${TREE}/${DEV_REL}"
-    cp "${REPO_ROOT}/${BUILD_REL}" "${TREE}/${BUILD_REL}"
+    cp "${REPO_ROOT}/${MANAGER_REL}" "${TREE}/${MANAGER_REL}"
+    local rel
+    for rel in "${FIXTURES[@]}"; do
+        cp "${REPO_ROOT}/${rel}" "${TREE}/${rel}"
+    done
 }
 
 RUN_STATUS=0
@@ -58,24 +69,29 @@ run_check() {
 
 # mutate DESCRIPTION EXPECTED_STATUS EXPECTED_MESSAGE_SUBSTRING -- COMMAND...
 #
-# COMMAND runs against the freshly reset fixture tree; ${DEV} and
-# ${BUILD} name the two Dockerfiles inside it.
+# COMMAND runs against the freshly reset fixture tree; ${DEV}, ${BUILD}
+# and ${RENOVATE} name the mutable files inside it.
 mutate() {
     local description="$1" expected="$2" needle="$3"
     shift 4  # description, status, needle, the literal --
 
     reset_tree
-    DEV="${TREE}/${DEV_REL}" BUILD="${TREE}/${BUILD_REL}" "$@"
+    DEV="${TREE}/${DEV_REL}" BUILD="${TREE}/${BUILD_REL}" \
+        RENOVATE="${TREE}/${RENOVATE_REL}" "$@"
 
     # A mutation that quietly failed to apply -- a sed expression that
     # stopped matching after the Dockerfiles were reworded, say -- would
     # leave every assertion below testing the pristine tree and passing
     # for the wrong reason. Every case here is supposed to edit
     # something, so prove it did.
-    if diff -q "${TREE}/${DEV_REL}" "${REPO_ROOT}/${DEV_REL}" > /dev/null \
-            && diff -q "${TREE}/${BUILD_REL}" "${REPO_ROOT}/${BUILD_REL}" \
-                > /dev/null; then
-        fail "${description}: the mutation did not change either Dockerfile"
+    local rel changed=0
+    for rel in "${FIXTURES[@]}"; do
+        if ! diff -q "${TREE}/${rel}" "${REPO_ROOT}/${rel}" > /dev/null; then
+            changed=1
+        fi
+    done
+    if [ "${changed}" -eq 0 ]; then
+        fail "${description}: the mutation did not change any fixture"
         return
     fi
 
@@ -85,6 +101,7 @@ mutate() {
 
     if [ "${RUN_STATUS}" != "${expected}" ]; then
         fail "${description}: expected exit ${expected}, got ${RUN_STATUS}"
+        printf '%s\n' "${output}" | sed 's/^/        /' >&2
         return
     fi
     if [ -n "${needle}" ] && [[ "${output}" != *"${needle}"* ]]; then
@@ -98,8 +115,8 @@ mutate() {
 # Each mutation is a function rather than an inline `bash -c '...'`:
 # these edits are full of dollar signs and nested quotes, and spelling
 # them inside a single-quoted argument makes them unreadable and trips
-# SC2016 on every line. ${DEV} and ${BUILD} name the two Dockerfiles in
-# the fixture tree.
+# SC2016 on every line. ${DEV}, ${BUILD} and ${RENOVATE} name the
+# mutable fixtures.
 
 # The literal ${...} text is the point here -- these strings are
 # written into a Dockerfile, where Docker expands them, so single
@@ -116,6 +133,33 @@ drift_shared_tool() {
     sed -i 's/^ARG CARGO_DEB_VERSION=.*/ARG CARGO_DEB_VERSION=0.0.1/' "${BUILD}"
 }
 delete_shared_tool() { sed -i '/^ARG CARGO_GENERATE_RPM_VERSION=/d' "${BUILD}"; }
+
+# Appends a complete, correctly-formed pin for CRATE at VERSION to FILE.
+# $1 = file, $2 = crate, $3 = ARG name, $4 = version.
+#
+# The literal ${...} is written into a Dockerfile for Docker to expand,
+# so the single quotes are correct and SC2016 is noise.
+# shellcheck disable=SC2016
+append_pin() {
+    {
+        printf '# renovate: datasource=crate depName=%s\n' "$2"
+        printf 'ARG %s=%s\n' "$3" "$4"
+        printf 'RUN cargo install --locked %s@"${%s}"\n' "$2" "$3"
+    } >> "$1"
+}
+
+# A cargo tool added to both images later, at versions that disagree.
+# The whole point of deriving the shared set from the install lines: a
+# hardcoded list would exempt this from the drift comparison, silently,
+# which is the failure mode the guard exists to prevent.
+append_drifting_new_shared_tool() {
+    append_pin "${DEV}" cargo-nextest CARGO_NEXTEST_VERSION 0.9.100
+    append_pin "${BUILD}" cargo-nextest CARGO_NEXTEST_VERSION 0.9.1
+}
+append_agreeing_new_shared_tool() {
+    append_pin "${DEV}" cargo-nextest CARGO_NEXTEST_VERSION 0.9.100
+    append_pin "${BUILD}" cargo-nextest CARGO_NEXTEST_VERSION 0.9.100
+}
 
 strip_locked() {
     sed -i 's/cargo install --locked cargo-audit@/cargo install cargo-audit@/' "${DEV}"
@@ -154,6 +198,19 @@ append_unreferenced_arg() {
     printf 'ARG CARGO_UNUSED_VERSION=1.0.0\n' >> "${DEV}"
 }
 
+# A crate whose name does not start with "cargo-", pinned correctly in
+# every respect except that nothing tells Renovate about it. Anchoring
+# the Renovate-visibility checks on an ARG-name prefix would let this
+# through, and the pin would then freeze forever with no error anywhere.
+# shellcheck disable=SC2016
+append_noncargo_crate_without_comment() {
+    printf 'ARG SCCACHE_VERSION=0.8.0\n' >> "${DEV}"
+    printf 'RUN cargo install --locked sccache@"${SCCACHE_VERSION}"\n' >> "${DEV}"
+}
+append_noncargo_crate() {
+    append_pin "${DEV}" sccache SCCACHE_VERSION 0.8.0
+}
+
 # shellcheck disable=SC2016
 append_two_installs() {
     printf 'RUN cargo install --locked cargo-deb@"${CARGO_DEB_VERSION}" && %s\n' \
@@ -179,6 +236,24 @@ open(path, 'w').write(text.replace(old, new))
 SPLIT
 }
 
+comment_inside_continuation() {
+    # Docker strips a whole-line comment wherever it appears, including
+    # inside a backslash continuation, and does not treat it as ending
+    # the continuation. Annotating one crate of a multi-crate install is
+    # a realistic edit in files this comment-dense, and it is valid.
+    python3 - "${DEV}" <<'INLINE'
+import sys
+path = sys.argv[1]
+text = open(path).read()
+old = 'cargo install --locked cargo-audit@'
+new = ('cargo install --locked \\\n'
+       '    # cargo-audit is the RUSTSEC advisory checker\n'
+       '        cargo-audit@')
+assert text.count(old) == 1, text.count(old)
+open(path, 'w').write(text.replace(old, new))
+INLINE
+}
+
 quote_pin_value() {
     sed -i 's/^ARG CARGO_AUDIT_VERSION=\(.*\)/ARG CARGO_AUDIT_VERSION="\1"/' "${DEV}"
 }
@@ -188,6 +263,35 @@ detach_renovate_comment() {
 }
 misname_renovate_comment() {
     sed -i "s|^${AUDIT_COMMENT}$|${AUDIT_COMMENT}-typo|" "${DEV}"
+}
+
+# The mutations below break renovate.json itself. Every check above
+# asserts the format the customManager needs from the script's own
+# memory of it; these prove the script notices when the live config
+# stops agreeing, which is the one path that could freeze all the pins
+# at once while everything else still reports them healthy.
+break_manager_regex() {
+    sed -i 's/depName=(?<depName>/depNam=(?<depName>/' "${RENOVATE}"
+}
+uncompilable_manager_regex() {
+    sed -i 's/depName=(?<depName>\[^\\\\s\]+?)/depName=(?<depName>[^\\\\s]+?(/' "${RENOVATE}"
+}
+narrow_manager_file_patterns() {
+    python3 - "${RENOVATE}" <<'NARROW'
+import json
+import sys
+path = sys.argv[1]
+config = json.load(open(path))
+for manager in config['customManagers']:
+    patterns = manager.get('managerFilePatterns', [])
+    if 'src/.devcontainer/build/Dockerfile' in patterns:
+        patterns.remove('src/.devcontainer/build/Dockerfile')
+json.dump(config, open(path, 'w'), indent=2)
+NARROW
+}
+wrong_manager_datasource() {
+    sed -i 's/datasource=(?<datasource>\[a-z-\]+?)/datasource=(?<datasource>[a-z-]+?)x/' \
+        "${RENOVATE}"
 }
 
 start "the tree as it ships"
@@ -206,13 +310,15 @@ mutate "a missing nightly pin fails" 1 "no 'ARG RUST_NIGHTLY" -- delete_nightly
 
 start "the shared cargo tool comparison"
 mutate "a drifted shared tool fails" 1 "CARGO_DEB_VERSION drift" -- drift_shared_tool
-mutate "a missing shared tool pin fails" 1 "no 'ARG CARGO_GENERATE_RPM_VERSION" -- \
+mutate "a missing shared tool pin fails" 1 "is not declared as an ARG" -- \
     delete_shared_tool
+# The shared set is the intersection of what the two files install, not
+# a list kept in the script: a tool added to both images later is
+# compared from the day it is added.
+mutate "a newly shared tool that drifts fails" 1 "CARGO_NEXTEST_VERSION drift" -- \
+    append_drifting_new_shared_tool
+mutate "a newly shared tool that agrees passes" 0 "" -- append_agreeing_new_shared_tool
 
-# From here the mutations target the dev image's dev-only tools
-# (cargo-fuzz, cargo-audit), which the shared-pin comparison above does
-# not look at. The earlier checks exit on failure, so a mutation that
-# tripped one of them would never reach the check under test.
 start "--locked on every install"
 mutate "a stripped --locked fails" 1 "'cargo install' without --locked" -- strip_locked
 mutate "a new unlocked install fails" 1 "'cargo install' without --locked" -- \
@@ -246,6 +352,7 @@ start "installs split across continuation lines"
 # --locked and the crate spec need not share a physical line, and a
 # guard that greps line by line would fail this valid form.
 mutate "--locked on a continuation line passes" 0 "" -- split_install_across_lines
+mutate "a comment inside a continuation passes" 0 "" -- comment_inside_continuation
 
 start "pins stay visible to Renovate"
 mutate "a quoted pin value fails" 1 "must be unquoted" -- quote_pin_value
@@ -255,6 +362,38 @@ mutate "a detached renovate comment fails" 1 "must be directly preceded by" -- \
     detach_renovate_comment
 mutate "a renovate comment naming the wrong crate fails" 1 "must be directly preceded by" -- \
     misname_renovate_comment
+# Not every crate is named cargo-something. Anchoring these checks on an
+# ARG-name prefix would let a correctly-formed non-cargo- crate skip
+# them entirely and freeze forever.
+mutate "a non-cargo crate with no renovate comment fails" 1 "must be directly preceded by" -- \
+    append_noncargo_crate_without_comment
+mutate "a correctly pinned non-cargo crate passes" 0 "" -- append_noncargo_crate
+
+start "renovate.json really matches the pins"
+mutate "a typo in matchStrings fails" 1 "does not match it" -- break_manager_regex
+mutate "an uncompilable matchStrings fails" 1 "does not compile" -- \
+    uncompilable_manager_regex
+mutate "dropping a file from managerFilePatterns fails" 1 \
+    "no customManagers entry" -- narrow_manager_file_patterns
+mutate "a manager that captures the wrong datasource fails" 1 \
+    "does not match it" -- wrong_manager_datasource
+
+start "every problem is reported before exiting"
+# The checks used to exit on the first failure, so a contributor with
+# two broken things fixed one, re-ran, and only then met the other.
+reset_tree
+DEV="${TREE}/${DEV_REL}" drift_nightly
+DEV="${TREE}/${DEV_REL}" strip_locked
+run_check
+OUTPUT="$(cat "${RUN_OUTPUT}")"
+if [ "${RUN_STATUS}" = 1 ] \
+        && [[ "${OUTPUT}" == *"Rust nightly pin drift"* ]] \
+        && [[ "${OUTPUT}" == *"without --locked"* ]]; then
+    ok "two unrelated problems are both reported in one run"
+else
+    fail "two unrelated problems are both reported in one run (exit ${RUN_STATUS})"
+    printf '%s\n' "${OUTPUT}" | sed 's/^/        /' >&2
+fi
 
 echo
 if [ "${FAILURES}" -ne 0 ]; then

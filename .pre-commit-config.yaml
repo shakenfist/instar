@@ -22,12 +22,17 @@ repos:
       # same script also asserts that every `cargo install` keeps its
       # --locked and that every pin stays matchable by the Renovate
       # customManager, both of which fail silently in production.
+      #
+      # renovate.json and the guard's own two files are in the filter as
+      # well as the Dockerfiles: the check runs the customManager regex
+      # as it is actually written today over both images, so an edit to
+      # either half can break the pairing without touching a Dockerfile.
       - id: devcontainer-pins
         name: devcontainer pins agree, are --locked and Renovate-visible
         entry: ./tools/ci/check-devcontainer-pins.sh
         language: script
         pass_filenames: false
-        files: ^src/\.devcontainer/.*Dockerfile$
+        files: ^(src/\.devcontainer/.*Dockerfile|renovate\.json|tools/ci/check-(devcontainer-pins\.sh|renovate-manager\.py))$
 
   # Lints the agent context (AGENTS.md, CLAUDE.md, .claude/ and
   # anything else an agent is handed) for malformed structure,
