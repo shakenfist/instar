@@ -18,10 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   A new `tools/mermaid-lint.sh` renders every diagram in the tree, and
   the `mermaid-lint.yml` workflow runs it on any pull request or push to
   `develop` that touches markdown, because mermaid fails at render time
-  rather than at commit time. A fence the renderer cannot read — a tilde
-  fence, or a space before the language — is refused by name rather than
-  skipped, since GitHub renders both and would otherwise ship the
-  diagram unlinted.
+  rather than at commit time. `mmdc` reads exactly one fence — three
+  backticks, then `mermaid`, then nothing — and GitHub renders a wider
+  family, so a tilde fence, a space before the language, four or more
+  backticks, or a trailing `title=x` is refused by name rather than
+  shipped unlinted.
 
 - **The agent context is linted.** `skillsaw` now runs as a pre-commit
   hook and as the `Agent context` CI check over `AGENTS.md`, `CLAUDE.md`

@@ -196,21 +196,25 @@ Check the exit status directly. Piping the script into `tail` or `grep`
 reports the filter's status, not the script's, and turns every failure
 green. `tools/audit/wave1.sh` runs it as part of the pre-push audit, and
 CI runs the same script from `mermaid-lint.yml` on any pull request that
-touches markdown, and on any push to `develop` that does -- the lane
-gates nothing automatically, so without the second trigger a commit that
-lands without a pull request would go unlinted until it failed somebody
-else's markdown change.
+touches markdown, on any push to `develop` or `main` that does, and on
+demand via `workflow_dispatch`. The lane gates nothing automatically, so
+without the push trigger a commit that lands without a pull request would
+go unlinted until it failed somebody else's markdown change. (The
+template ships both branch names because the fleet's default branch
+varies; here only `develop` ever matches.)
 
-A mermaid block the renderer cannot read is rejected rather than skipped:
-a tilde fence, or a space between the backticks and `mermaid`. GitHub
-renders both, `mmdc` reads neither, so the script names the file, the
-line and the fence to use instead of quietly leaving the diagram
-unlinted. Quoting one of those forms in a document is fine -- a fence
-nested inside a longer fence is an example, not a diagram, and this
-paragraph's own page is the case that rule exists for.
+`mmdc` reads exactly one fence: three backticks, then `mermaid`, then
+nothing. GitHub renders a wider family, and every shape in between is
+rejected rather than skipped -- a tilde fence, a space before the
+language, four or more backticks, and anything after the language such
+as ```` ```mermaid title=x ````. The script names the file, the line and
+what to change. Trailing whitespace after the language is fine; `mmdc`
+reads that. Quoting one of the rejected forms in a document is also fine
+-- a fence nested inside a longer fence is an example, not a diagram, and
+this paragraph's own page is the case that rule exists for.
 
-`REVIEWS.md` is the one tracked markdown file the script does not walk
-into, matching the workflow's path filter: a review session rewrites it
+If this repository ever grows a `REVIEWS.md`, the script skips it,
+matching the workflow's path filter: a review session rewrites the file
 and changes no diagram. Name it as an argument to lint it anyway.
 
 The container runs with `--network none`, so a diagram that reaches for a
@@ -852,7 +856,7 @@ Each review item has an `action` field:
 - `.github/workflows/lint.yml` - rustfmt and clippy in the containerised toolchain (PR, path-filtered to the Rust tree)
 - `.github/workflows/export-repo-config.yml` - nightly export of this repository's GitHub settings for the fleet configuration audit
 - `.github/workflows/renovate.yml` - self-hosted Renovate dependency updates (hourly)
-- `.github/workflows/mermaid-lint.yml` - renders every mermaid diagram in the repository's markdown and fails on any that does not parse (PR and push to develop, path-filtered to markdown)
+- `.github/workflows/mermaid-lint.yml` - renders every mermaid diagram in the repository's markdown and fails on any that does not parse (PR, push to develop, and workflow_dispatch; path-filtered to markdown)
 
 The self-hosted runners have no Docker preinstalled, so any job touching
 `docker` or a container-backed Makefile target needs an "Install Docker"

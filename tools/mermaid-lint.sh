@@ -91,18 +91,25 @@ else
         < <(git ls-files -z '*.md' ':(exclude)REVIEWS.md')
 fi
 
-# Backticks only, and no space before the language: that is what mmdc
-# recognises. Anything else renders nothing and exits zero, which is
-# why check_mermaid_lint_ci in the development repository matches the
-# same narrow form -- the audit must not call a repository covered for
-# a diagram this script cannot see.
+# Exactly three backticks, then "mermaid", then nothing: that is what
+# mmdc recognises. Anything else renders nothing and exits zero, which
+# is why check_mermaid_lint_ci in the development repository matches
+# the same narrow form -- the audit must not call a repository covered
+# for a diagram this script cannot see.
 #
-# GitHub renders both a tilde fence and a spaced info string as
-# diagrams all the same, so either would otherwise ship unlinted
-# through the exact gap this script exists to close. Rather than fail
-# open, refuse the file and say what to change: the narrow
-# mmdc-compatible form stays the only one that can be committed
-# unnoticed.
+# There are four ways to miss it, and GitHub renders all four as
+# diagrams: a tilde fence, a space between the fence and the language,
+# four or more backticks, and anything after the language in the info
+# string. Any of them would otherwise ship unlinted through the exact
+# gap this script exists to close. Rather than fail open, refuse the
+# file and say what to change: the narrow mmdc-compatible form stays
+# the only one that can be committed unnoticed.
+#
+# Selecting such a fence rather than refusing it is worse than
+# skipping it, which is what the two length and info-string cases used
+# to do. The file reaches the renderer, mmdc finds no chart in it,
+# the run prints "ok" and counts the file in "Linting N file(s)" --
+# a diagram nobody rendered, reported as one that rendered cleanly.
 #
 # Which means the scan has to track fence state rather than match bare
 # lines. A fence shown inside a longer fence is an example being
@@ -214,20 +221,32 @@ if [ "${#existing[@]}" -ne 0 ]; then
             if (ch == "`" && index(substr(line, run + 1), "`"))
                 next
 
-            # Two readings of the info string. CommonMark allows
-            # whitespace before it, and a closing fence is one that
-            # carries nothing else, so the closing test uses the
-            # stripped form. mmdc wants the language hard against the
-            # backticks, so the opening test uses the raw form: `` `
-            # mermaid `` is a fence GitHub renders and mmdc reads
-            # nothing in, which is the same failure as a tilde fence
-            # and is refused the same way.
+            # Three readings of the info string, because mmdc reads
+            # one exact form and GitHub renders a family.
+            #
+            # info is the first word with surrounding whitespace
+            # stripped. It answers "is this fence about mermaid at
+            # all", and it is also the closing test, since a closing
+            # fence is one that carries nothing else.
+            #
+            # raw keeps the leading whitespace, because mmdc wants the
+            # language hard against the backticks: `` ` mermaid `` is
+            # a fence GitHub renders and mmdc reads nothing in.
+            #
+            # full is the whole info string, trimmed at both ends but
+            # not cut at the first word, because mmdc also wants the
+            # language to be all there is: ```` ```mermaid title=x ````
+            # is likewise rendered by GitHub and ignored by mmdc.
             info = substr(line, run + 1)
             sub(/^[ \t]+/, "", info)
             sub(/[ \t].*$/, "", info)
 
             raw = substr(line, run + 1)
             sub(/[ \t].*$/, "", raw)
+
+            full = substr(line, run + 1)
+            sub(/^[ \t]+/, "", full)
+            sub(/[ \t]+$/, "", full)
 
             if (fence != "") {
                 if (ch == fence && run >= flen && info == "")
@@ -259,20 +278,51 @@ if [ "${#existing[@]}" -ne 0 ]; then
             # digits, so the reader can split the two off the front
             # and keep everything after as the name.
             #
-            # The fence character is tested before the info string,
-            # so that a tilde fence with a space gets a remedy that
-            # fixes it. Classified the other way it is told to remove
-            # the space, which yields a tilde fence, which the next
-            # run refuses -- the round trip again.
+            # Exactly one linted form: three backticks, then
+            # "mermaid", then nothing. Each of the three ways to
+            # depart from it is rendered by GitHub and ignored by
+            # mmdc, so each is refused rather than selected -- a
+            # selected fence mmdc cannot read is worse than a skipped
+            # one, because the file is then counted in the "Linting N
+            # file(s)" line and reported ok.
+            spaced_fault = (raw != "mermaid")
+            long_fault = (run > 3)
+            extra_fault = (full != "mermaid")
+
+            # Every remedy has to reach the linted form in one step,
+            # or the author fixes a fence, re-runs, and is told about
+            # the next fault in the same fence -- the round trip the
+            # refusals fall through to the render step to avoid. So a
+            # fence with one fault gets the message for that fault,
+            # and a fence with more than one is told the target form
+            # outright rather than the first of several corrections.
+            #
+            # The fence character is tested first for the same
+            # reason: told only to remove the space, the author of a
+            # spaced tilde fence is left with a tilde fence.
             if (ch == "~") {
-                if (raw != "mermaid")
+                if (long_fault || extra_fault)
+                    printf "%s:%d:%s%c", "noncanonical", FNR, name, 0
+                else if (spaced_fault)
                     printf "%s:%d:%s%c", "tilde_spaced", FNR, name, 0
                 else
                     printf "%s:%d:%s%c", "tilde", FNR, name, 0
                 next
             }
-            if (raw != "mermaid") {
+            if (spaced_fault + long_fault + extra_fault > 1) {
+                printf "%s:%d:%s%c", "noncanonical", FNR, name, 0
+                next
+            }
+            if (spaced_fault) {
                 printf "%s:%d:%s%c", "spaced", FNR, name, 0
+                next
+            }
+            if (long_fault) {
+                printf "%s:%d:%s%c", "long", FNR, name, 0
+                next
+            }
+            if (extra_fault) {
+                printf "%s:%d:%s%c", "extra", FNR, name, 0
                 next
             }
             if (!backtick) {
@@ -287,6 +337,9 @@ files=()
 tilde_fenced=()
 spaced_info=()
 tilde_spaced=()
+long_fenced=()
+extra_info=()
+noncanonical=()
 # IFS emptied and -d '' set, so a name keeping a leading or trailing
 # space arrives intact. The default read would strip both.
 while IFS= read -r -d '' record; do
@@ -299,6 +352,9 @@ while IFS= read -r -d '' record; do
         tilde) tilde_fenced+=("${scanned_file}:${lineno}") ;;
         spaced) spaced_info+=("${scanned_file}:${lineno}") ;;
         tilde_spaced) tilde_spaced+=("${scanned_file}:${lineno}") ;;
+        long) long_fenced+=("${scanned_file}:${lineno}") ;;
+        extra) extra_info+=("${scanned_file}:${lineno}") ;;
+        noncanonical) noncanonical+=("${scanned_file}:${lineno}") ;;
     esac
 done < "${workdir}/scan"
 
@@ -335,6 +391,38 @@ if [ "${#tilde_spaced[@]}" -ne 0 ]; then
     both="mermaid in a spaced tilde fence is not linted;"
     refuse "${both} use a backtick fence with no space" \
         "${tilde_spaced[@]}"
+    rc=1
+fi
+
+# CommonMark opens a fence on three backticks *or more*, and GitHub
+# renders a four-backtick mermaid block as a diagram. mmdc reads only
+# the three-backtick form, so this was the worst shape of all: the
+# file was selected, sent to the renderer, found to contain no chart,
+# and reported ok inside the "Linting N file(s)" count.
+if [ "${#long_fenced[@]}" -ne 0 ]; then
+    long_msg="mermaid in a fence of more than three backticks is not"
+    refuse "${long_msg} linted; use exactly three" \
+        "${long_fenced[@]}"
+    rc=1
+fi
+
+# GitHub takes the first word of the info string as the language, so
+# it renders ```mermaid title=x. mmdc matches the info string whole
+# and reads nothing in it -- the same silent pass as above.
+if [ "${#extra_info[@]}" -ne 0 ]; then
+    extra_msg="mermaid followed by anything else in the info string is"
+    refuse "${extra_msg} not linted; make it exactly mermaid" \
+        "${extra_info[@]}"
+    rc=1
+fi
+
+# More than one fault in the same fence. Naming the first correction
+# would leave the author to discover the rest one run at a time, so
+# this states the target form instead.
+if [ "${#noncanonical[@]}" -ne 0 ]; then
+    nc_msg="this mermaid fence is not the form mmdc reads; write it as"
+    refuse "${nc_msg} exactly three backticks followed by mermaid" \
+        "${noncanonical[@]}"
     rc=1
 fi
 

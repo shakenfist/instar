@@ -66,6 +66,7 @@ Exit codes:
 | 3    | `make instar` failed           |
 | 4    | binary size cap exceeded       |
 | 5    | `make test-rust` failed        |
+| 6    | could not enter the repo root  |
 | 7    | `make fuzz-build` failed       |
 | 8    | `tools/mermaid-lint.sh` failed |
 
