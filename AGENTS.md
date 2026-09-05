@@ -122,8 +122,9 @@ Per-format feature detail is in
   and they fail at render time rather than at commit time, so run
   `tools/mermaid-lint.sh` before pushing. Character art whose meaning is
   its column alignment -- file trees, memory maps, register layouts, byte
-  layouts, terminal output -- stays in a plain fence. See "Diagrams" in
-  [docs/development.md](docs/development.md).
+  layouts, terminal output -- stays in a plain fence. `prototypes/*/README.md`
+  is out of scope and keeps its original ASCII as a historical record.
+  See "Diagrams" in [docs/development.md](docs/development.md).
 
 ## Adding a prototype
 

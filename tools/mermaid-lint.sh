@@ -38,6 +38,12 @@ IMAGE="${IMAGE_TAG}@sha256:99c983b3ab4e14033f2880bc1b9de17e5090b4515dabd63fe9cf8
 
 repo_root=$(git rev-parse --show-toplevel)
 
+# The workdir is made up here rather than at the render step, because
+# both the candidate listing and the scan write into it, and both do
+# so because a bash variable cannot hold a NUL byte.
+workdir=$(mktemp -d)
+trap 'rm -rf "${workdir}"' EXIT
+
 # Named files are resolved against the caller's directory and turned
 # into repository-relative paths, because everything below -- the cd,
 # the /src mount, the paths printed in the output -- is relative to
@@ -87,8 +93,22 @@ else
     # The pathspec is a literal, so it matches the file at the
     # repository root and not a docs/REVIEWS.md -- the same scope the
     # workflow's '!REVIEWS.md' has.
-    mapfile -d '' -t candidates \
-        < <(git ls-files -z '*.md' ':(exclude)REVIEWS.md')
+    #
+    # Into a file with the status checked, rather than through a
+    # process substitution. A process substitution does not trip
+    # set -e, so an ls-files that failed after rev-parse had
+    # succeeded -- a corrupt index, or a pathspec a future git
+    # rejects -- would leave the list empty, print "nothing to lint"
+    # and exit 0. That is the fail-open this script exists to
+    # prevent, and the awk scan below is already handled this way for
+    # the same reason. A file rather than a variable because the
+    # listing is NUL delimited and a bash variable cannot hold a NUL.
+    if ! git ls-files -z '*.md' ':(exclude)REVIEWS.md' \
+            > "${workdir}/candidates"; then
+        echo "mermaid-lint: could not list tracked markdown files" >&2
+        exit 1
+    fi
+    mapfile -d '' -t candidates < "${workdir}/candidates"
 fi
 
 # Exactly three backticks, then "mermaid", then nothing: that is what
@@ -165,11 +185,6 @@ for candidate in "${candidates[@]}"; do
         existing+=("./${candidate}")
     fi
 done
-
-# The workdir is made here rather than at the render step, because the
-# scan writes into it too.
-workdir=$(mktemp -d)
-trap 'rm -rf "${workdir}"' EXIT
 
 # Into a file rather than through a process substitution, so that an
 # awk that dies takes the script with it under set -e. A scan that
@@ -479,9 +494,15 @@ docker run --rm --network none -u "$(id -u):$(id -g)" \
         mmdc=/home/mermaidcli/node_modules/.bin/mmdc
         rc=0
         while IFS= read -r f; do
+            # stdin closed, for the reason the awk scan has it
+            # closed: this loop is reading files.txt, so a renderer
+            # that read stdin would swallow the rest of the list and
+            # the run would report success having rendered only the
+            # first file. The pinned image does not, measured rather
+            # than assumed; a future node or puppeteer might.
             if "${mmdc}" -p /puppeteer-config.json \
                     -i "/src/${f}" -o /work/rendered.md \
-                    >/work/log 2>&1; then
+                    </dev/null >/work/log 2>&1; then
                 echo "ok    ${f}"
             else
                 rc=1

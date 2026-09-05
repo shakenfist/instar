@@ -213,6 +213,13 @@ reads that. Quoting one of the rejected forms in a document is also fine
 -- a fence nested inside a longer fence is an example, not a diagram, and
 this paragraph's own page is the case that rule exists for.
 
+Put a diagram at the top level. A `mermaid` fence inside a blockquote is
+the one shape that is neither linted nor rejected: GitHub renders it and
+`mmdc` finds nothing in the file, so it passes silently. That is a
+deliberate blind spot rather than an oversight -- refusing one means
+ruling on a fence nested inside a blockquoted fence -- but it does mean a
+blockquoted diagram is unchecked.
+
 If this repository ever grows a `REVIEWS.md`, the script skips it,
 matching the workflow's path filter: a review session rewrites the file
 and changes no diagram. Name it as an argument to lint it anyway.
