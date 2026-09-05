@@ -34,12 +34,49 @@
 # the floor rises again by any other route.
 #
 # That instruction is not unconditional, it just is not yours to decide
-# alone: bullseye LTS ends 2026-08-31, after which this image's
-# apt-get layer will eventually break. The successors and what each
-# costs in support matrix are written up under "When bullseye reaches
-# end of life" in docs/development.md. Read that before changing this
+# alone. The successors and what each costs in support matrix are
+# written up under "bullseye reached end of life: apt is pinned to a
+# snapshot" in docs/development.md. Read that before changing this
 # line -- bookworm is NOT a drop-in, it drops Rocky 9.
 FROM debian:bullseye
+
+# bullseye LTS ended 2026-08-31 and the deb.debian.org view of it is
+# gone: the final bullseye-security Release expired 2026-09-07
+# 21:13 UTC, and even before that the CDN was 404ing pool objects its
+# own index still advertised (gnupg2, glibc, xz-utils -- see #550).
+# archive.debian.org carries `debian/dists/bullseye` but still has no
+# `debian-security/dists/bullseye-security`, so it is not a complete
+# replacement.
+#
+# So apt is pointed at a FROZEN snapshot.debian.org timestamp instead,
+# chosen just after the last bullseye-security publication so the image
+# gets the final security state of the suite. This is the option
+# docs/development.md names as the one to reach for when the deadline
+# arrives before a decision does: it keeps glibc 2.31 and the published
+# support matrix exactly as they are, and costs a build toolchain that
+# no longer receives updates. That trade is deliberate -- the shipped
+# binary's security posture rests on the Rust toolchain and our own
+# code, not on this image's C library.
+#
+# Check-Valid-Until must be off: a snapshot serves the historical
+# Release file verbatim, including its long-past Valid-Until. That is
+# safe here precisely because the snapshot is immutable and pinned --
+# it is not a licence to skip verification, gpg signature checking
+# against the shipped bullseye keyring stays on.
+#
+# These are http:// URLs, not https://, for the same reason the base
+# image's own sources are: debian:bullseye ships no ca-certificates,
+# and this is the layer that installs it. Integrity comes from the
+# Release signature, exactly as it did before.
+ARG DEBIAN_SNAPSHOT=20260901T000000Z
+RUN rm -f /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources && \
+    printf '%s\n' \
+    "deb http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ bullseye main" \
+    "deb http://snapshot.debian.org/archive/debian/${DEBIAN_SNAPSHOT}/ bullseye-updates main" \
+    "deb http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/ bullseye-security main" \
+    > /etc/apt/sources.list && \
+    printf '%s\n' 'Acquire::Check-Valid-Until "false";' \
+    > /etc/apt/apt.conf.d/99no-check-valid-until
 
 # Build toolchain only:
 # - build-essential: cc/ld for linking the host `instar` VMM binary

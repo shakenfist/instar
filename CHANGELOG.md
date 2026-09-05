@@ -88,6 +88,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **The release build image builds from scratch again.** Debian 11
+  reached end of life on 2026-08-31 and the `deb.debian.org` view of
+  `bullseye` went with it: pool objects the security index still
+  advertised started returning 404, and the suite's final `Release`
+  expired on 2026-09-07, after which apt refuses it outright. Every
+  cold-runner `make instar`, `make deb` and `make rpm` failed in
+  `build-devcontainer` while warm runners stayed green. The image now
+  builds its apt sources against a frozen `snapshot.debian.org`
+  timestamp (`ARG DEBIAN_SNAPSHOT`) rather than `deb.debian.org`. The
+  base stays `debian:bullseye`, so the published glibc floor
+  (`GLIBC_2.31`) and the supported distribution matrix are unchanged;
+  the cost is a build toolchain that no longer receives updates. The
+  alternatives, and why this one, are in
+  [docs/development.md](docs/development.md).
+
 - **`rebase` no longer plans a write at an arbitrary offset for an
   overlay with a corrupt backing-path pointer.** The qcow2 rebase
   planner took the overlay header's `backing_file_offset` /
