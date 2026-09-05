@@ -83,16 +83,25 @@ What the outside world does:
   and never mentions a parent. So instar's silent read is
   qemu-parity, but both are silently wrong rather than right.
 * This makes differencing output an instar-only capability with
-  **no qemu-img oracle**, like the vmdk/vhd/vhdx `resize` and
-  vmdk `rebase` divergences already recorded as note 8 in
-  `docs/format-coverage.md`. Every other write path instar has
-  shipped was validated against qemu-img. This one cannot be, so
-  the plan has to establish an oracle before it writes anything.
-* Debian 13 packages `libvhdi-utils` (`vhdiinfo`, `vhdiexport`)
+  **no qemu-img oracle for creation or composition**, like the
+  vmdk/vhd/vhdx `resize` and vmdk `rebase` divergences already
+  recorded as note 8 in `docs/format-coverage.md`. Every other
+  write path instar has shipped was validated against qemu-img.
+  This one cannot be, so the plan has to establish an oracle
+  before it writes anything. The absence is not total, and the
+  plan should not overstate it: step 1b MEASURED that qemu-img
+  10.0.11 validates the VHD head footer's checksum and refuses a
+  corrupted one ("Could not open: Incorrect header checksum"),
+  so that one field is externally cross-checked even though qemu
+  never resolves the parent. The dynamic header checksum, the
+  tail footer copy's checksum and the whole locator table are
+  not.
+* Debian 13 packages `libvhdi-utils` (`vhdiinfo`, `vhdimount`)
   and `python3-libvhdi` from the libyal project, which does
-  implement VHD and VHDX parent chains. It is the leading oracle
-  candidate and phase 1 has to prove it before phase 5 relies on
-  it.
+  implement VHD and VHDX parent chains. Phase 1 accepted it as
+  this plan's oracle; open question 2 carries the verdict and
+  the two gaps that come with it -- there is no `vhdiexport`,
+  and libvhdi never parses the VHD parent locator table.
 
 The fixtures are not usable as they stand.
 `instar-testdata/custom/format-coverage/vhd-differencing.vhd` has
@@ -122,7 +131,24 @@ VMDK flat-descriptor short-circuit that resolves
 are declared at `src/vmm/src/config.rs:65` and `:67`. Composition
 extends that function; it does not write one.
 
-There are no open GitHub issues on the differencing surface today.
+Step 1c narrowed the read-side defect, and the narrowing
+matters to phase 4. The silent misread is **VHD only**. On a
+differencing VHDX every read op already fails, because
+`VhdxState::init` rejects a parent at the crate level before any
+op-specific logic runs -- so convert, compare, dd, bench and
+measure inherit a refusal none of them wrote. What they inherit
+is a generic message rather than a diagnosis: `instar convert -O
+raw` on a Hyper-V differencing VHDX gives "convert operation
+failed", and `instar compare` given the same differencing VHDX as
+both arguments reports "Content mismatch at offset 0!" -- a file
+differing from itself. Phase 4's job is therefore two-sided:
+turn the VHD silence into a typed refusal, and turn the VHDX
+generic failures into the same typed refusal, rather than
+assuming VHDX is already correct because it exits non-zero. Both
+measured 2026-09-05 against the `d59cc40` binary.
+
+There are no open GitHub issues on the differencing surface today,
+beyond #547 for the VHD misread.
 
 ## Mission and problem statement
 
@@ -134,9 +160,9 @@ as though they had none.
 In scope:
 
 * Differencing VHD output: `disk_type = 4`, parent unique id,
-  parent timestamp, parent unicode name, and a populated parent
-  locator table, with both checksums correct and the BAT wholly
-  unallocated.
+  parent timestamp, parent unicode name, and a parent locator
+  table carrying the single entry open question 3 settles on,
+  with both checksums correct and the BAT wholly unallocated.
 * Differencing VHDX output: the `HasParent` file-parameter bit, a
   populated parent locator metadata item carrying the
   `parent_linkage` GUID and the locator path entries.
@@ -176,49 +202,114 @@ Out of scope, and deliberately left to their own work:
    writes. Phase 4 is still worth its own phase: it is the only
    part of the read-side answer that has to be true before the
    emitters ship, and it is a defect fix rather than a feature.
-2. **Is libvhdi a sufficient oracle?** It must resolve a chain
-   instar wrote, for both VHD and VHDX, and export composed
-   content that matches what instar intended. Phase 1 proves or
-   disproves this. If it fails on VHDX, the fallbacks are a
-   Windows/Hyper-V-produced reference sample checked into
-   testdata as read-only evidence, or a hand-decoded structural
-   assertion suite with no content-level oracle. Say which
-   before phase 6 starts.
-3. **Which locator entries do we emit?** The VHD spec allows
-   eight entries in several platform codes; Hyper-V typically
-   writes `W2ru` (relative) and `W2ku` (absolute) plus the
-   Unicode parent name. *Recommendation: emit relative and
-   absolute Unicode entries and leave the remaining slots zero*,
-   which is the most portable minimum, but phase 1 should
-   confirm against what libvhdi and any real Hyper-V sample
-   accept.
+2. **Is libvhdi a sufficient oracle?** RESOLVED 2026-09-05 by
+   step 1a: **yes, with one named gap.** libvhdi 20240509
+   (Debian `libvhdi-utils`, `libvhdi1` and `python3-libvhdi`,
+   all `20240509-2+b1`) resolved Hyper-V produced differencing
+   chains for *both* formats -- `fat-differential.vhd`,
+   `ntfs-differential.vhd` and their `.vhdx` counterparts from
+   the `log2timeline/dfvfs` test corpus, creator application
+   `win `, images nothing in this project wrote -- reporting a
+   parent identifier equal to the parent's own identifier and
+   the correct parent filename. Its compositions matched the
+   content the chains were built to represent byte for byte:
+   `cmp` exit 0 for our generated VHD and VHDX chains against
+   their intended raw images, with parent-only and child-only
+   controls differing, and a sector-provenance analysis of the
+   composed Hyper-V VHD chain finding every composed sector
+   attributable to exactly one file. Two corrections to how the
+   oracle is driven, both from step 1a: **`vhdiexport` does not
+   exist** -- libvhdi ships `vhdiinfo` and `vhdimount`, and
+   Debian builds the latter without FUSE -- so composition runs
+   through the `python3-libvhdi` binding with an explicit
+   `set_parent()` rather than a CLI export; and **libvhdi never
+   parses the VHD parent locator table**, since
+   `libvhdi_parent_locator*` is reached only from the VHDX
+   metadata path and VHD resolution uses the parent unicode name
+   field alone. That table therefore has no content oracle at
+   all, which is the single biggest gap here: phase 5 must not
+   assume otherwise and phase 8's assertions on it are
+   structural only. Step 1b then added one field back that
+   libvhdi does not cover: qemu-img 10.0.11 **does** validate
+   the VHD head footer's checksum and refuses a corrupted image
+   with "Could not open: Incorrect header checksum", where
+   libvhdi opens it and resolves the parent regardless. The
+   dynamic header checksum has no oracle in either tool. The
+   full verdict, tool versions, command lines and the list of
+   fields nothing external checks are in the phase 1 plan's
+   *Result -- step 1a* and *What has no oracle* sections.
+3. **Which locator entries do we emit?** RESOLVED 2026-09-05 by
+   step 1b: **one entry, in slot 1, whose platform code
+   describes the string the user actually gave us** -- `W2ru`
+   when the typed backing path is relative, `W2ku` when it is
+   absolute -- with slots 2 through 8 left zero. This is a
+   deliberate divergence from Hyper-V. MEASURED in both corpus
+   VHDs, Hyper-V writes exactly two populated entries: `W2ku`
+   carrying the absolute path in slot 1 at offset 1088 and
+   `W2ru` carrying the child-relative path in slot 2 at 1112,
+   with slots 3 to 8 zero. What decides against copying that is
+   a host-side fact: `run_create_nonraw` resolves the typed
+   backing path against the output's directory *for opening the
+   file* but sends the guest `typed_backing.as_bytes()`
+   unchanged (`src/vmm/src/main.rs:16710-16769`). The guest
+   therefore has one string, and writing two entries would mean
+   fabricating the other -- `.\<basename>` is simply wrong
+   whenever parent and child are in different directories, and a
+   fabricated locator is worse than an absent one. Passing a
+   second, host-resolved path would need a new call table field,
+   and this plan's premise that differencing output needs no ABI
+   change (see phase 7's rationale below) is worth more than a
+   cosmetic match to Hyper-V. The oracle cannot arbitrate:
+   libvhdi ignores the VHD locator table entirely, so it cannot
+   tell us whether one entry is enough for other readers, and no
+   Windows host is in this plan's reach to ask. The falsifier is
+   a Windows or Hyper-V rejection of a single-entry child;
+   adding a second entry later is additive to the emitter and to
+   nothing else. The VHDX side follows the same rule for the
+   same reason: `parent_linkage` plus exactly one of
+   `relative_path` or `absolute_win32_path`, and never
+   `volume_path` (which needs a Windows volume GUID) or
+   `parent_linkage2`.
 4. **Does an instar-only capability need an opt-in flag?**
-   qemu-img refuses this operation entirely. *Recommendation:
-   no flag.* instar already performs vmdk/vhd/vhdx `resize` and
-   vmdk `rebase` where qemu-img refuses, without a flag, and
-   these are recorded divergences rather than hidden ones.
-5. **Parent path resolution and its security posture.** A
-   locator path is untrusted data, exactly as a qcow2 backing
-   reference is. On write we control the path; on read (even to
-   refuse) we parse attacker-controlled bytes. The plan must
-   state that instar never opens a path it read out of an image
-   without the same host-side resolution rule qcow2 backing
-   files get (resolve relative to the child's directory, never
-   follow into the guest), and phase 3 has to be
-   bounds-check-clean against `PLAN-extra-coverage` priority 7
-   inputs even before those fixtures exist.
-6. **Do we pull in the adversarial fixtures now?** Priority 7 of
-   the testdata plan is unstarted. *Recommendation: yes, as part
-   of phase 2*, because phase 3 is the code that needs them and
-   generating both sets from one script is cheaper than two
-   passes.
+   RESOLVED 2026-09-05: **no flag.** instar already performs
+   vmdk/vhd/vhdx `resize` and vmdk `rebase` where qemu-img
+   refuses on every shipped version, unflagged, and records them
+   as note 8 in `docs/format-coverage.md`. Differencing output
+   is a recorded divergence in the same way rather than a gated
+   one.
+5. **Parent path resolution and its security posture.**
+   RESOLVED 2026-09-05 by phase 1's survey, and the resolution
+   is a description of code that already exists rather than a
+   new rule to write. `discover_backing_chain`
+   (`src/vmm/src/main.rs:2416`) is not qcow2-only: it already
+   performs circular-reference detection, depth limiting and
+   allowlist checking for every chain the host walks, governed
+   by `security.backing_path_allowlist` and
+   `security.max_chain_depth` (`src/vmm/src/config.rs:65` and
+   `:67`), and it already carries a non-qcow2 special case in
+   the VMDK flat-descriptor short-circuit. Differencing parents
+   go through that same function -- phase 11 extends it rather
+   than writing one -- so a path read out of an image is
+   resolved relative to the child's directory and checked
+   against the allowlist before anything opens it, and nothing
+   in the guest ever opens a path read out of an image. Phase 3
+   is still required to be bounds-check-clean against
+   `PLAN-extra-coverage` priority 7 inputs; that requirement is
+   unchanged by this resolution.
+6. **Do we pull in the adversarial fixtures now?** RESOLVED
+   2026-09-05: **yes, in phase 2**, taking priority 7 of
+   `instar-testdata/docs/plans/PLAN-extra-coverage.md` (the
+   absolute `/etc/passwd`, `../../../etc/passwd`, UNC and
+   eight-mutually-disagreeing-locator cases). Phase 3 is the
+   code that needs them, and generating the happy-path and
+   adversarial sets from one script is cheaper than two passes.
 7. **Must a differencing child's parent share its format?**
-   Hyper-V requires VHD parents for VHD children and VHDX for
-   VHDX. instar's `create -b` path currently accepts any
-   detectable parent format. *Recommendation: require a matching
-   parent format for differencing output and reject the rest
-   with a typed error*, rather than emitting a chain no
-   implementation can resolve.
+   RESOLVED 2026-09-05 by decision 5 of the phase 1 plan:
+   **yes, with a typed error otherwise.** Hyper-V requires VHD
+   parents for VHD children and VHDX for VHDX, and emitting a
+   chain no implementation can resolve is worse than a typed
+   refusal. instar's `create -b` path currently accepts any
+   detectable parent format; phase 7 wires the error.
 
 ## Execution
 
@@ -233,7 +324,7 @@ records `instar-testdata <sha> (#pr)` and is audited there.
 
 | Phase | Plan | Status | Merged |
 |-------|------|--------|--------|
-| 1. Semantics pin, oracle selection, and the doc correction | [PLAN-differencing-phase-01-pin.md](PLAN-differencing-phase-01-pin.md) | In progress | |
+| 1. Semantics pin, oracle selection, and the doc correction | [PLAN-differencing-phase-01-pin.md](PLAN-differencing-phase-01-pin.md) | Complete | |
 | 2. Real differencing fixtures, happy-path and adversarial (instar-testdata) | PLAN-differencing-phase-02-fixtures.md | Not started | |
 | 3. Parent-locator parsing in `crates/vhd` and `crates/vhdx` | PLAN-differencing-phase-03-parse.md | Not started | |
 | 4. Read-side policy: close the silent parent-ignoring read | PLAN-differencing-phase-04-read-policy.md | Not started | |
@@ -276,6 +367,48 @@ Phases 5 and 6 are independent of each other and could be
 parallelised; VHD goes first because its parent locator table is
 the simpler structure and the lessons carry into VHDX.
 
+Phase 6 carries a trap step 1b found by reading the tree, and it
+is worth stating here because it changes what phase 8 can test.
+The VHDX `parent_linkage` key is the parent's DataWriteGuid,
+settled by measurement against Hyper-V bytes and confirmed
+against SPEC(VHDX) 2.6.2.6.3 and libvhdi's source. But
+`vhdx::build_header` derives the DataWriteGuid from the sequence
+number alone (`src/crates/vhdx/src/lib.rs:1341-1345`), and every
+instar VHDX writer passes sequence numbers 1 and 2 -- `plan_vhdx`
+at `src/crates/create/src/lib.rs:964-966` and the convert op at
+`src/operations/convert/src/main.rs:4469` and `:4492`. Every VHDX
+instar has ever written therefore shares one active-header
+DataWriteGuid, which makes libvhdi's parent-identity check
+**vacuous for instar-written chains**: any instar parent
+satisfies any instar child. `plan_vhd` has the same hole for the
+same reason -- it writes `UUID_ZERO` as the footer unique id of
+every image it creates (`src/crates/create/src/lib.rs:776`,
+`:820`), and that field is exactly what a differencing child
+copies into its dynamic header at offset 552. Phase 6 should
+confirm the VHDX half against a real instar-produced image (the
+claim is read from code, not measured on output) and consider
+giving created images a real DataWriteGuid; phase 8's
+negative identity test must be built against a **third-party**
+parent either way, because an instar-created parent cannot fail
+it.
+
+Phases 8 and 15 both build fixtures with partially populated
+blocks, and both must account for a libvhdi defect step 1a found
+and did not fix:
+`libvhdi_block_descriptor_read_sector_bitmap_data` decodes the
+VHD per-block sector bitmap with an unmasked shift, so once any
+higher bit in a bitmap byte is set, every later sector covered by
+that byte reads as present in the child. It was measured on
+Hyper-V's own `fat-differential.vhd` and reproduced
+deterministically with a probe that predicted seven wrong sectors
+and got exactly those seven. VHD fixtures must therefore keep
+parent-owned and child-owned sectors out of the same bitmap byte,
+or carry expected output that accounts for the bug; discovering
+it in phase 15 instead would look exactly like an instar bug. The
+VHDX branch of the same function is correct, and `instar create`
+output is unaffected because a freshly created child has a wholly
+unallocated BAT and no sector bitmaps at all.
+
 Phases 11 to 16 are the composition work, and they come last
 because they are the only part that can be built on everything
 else: composition needs the locator parsing from phase 3 to find
@@ -309,10 +442,13 @@ rather than left as one phase to be split later, the way
   rather than being tacked onto a guest phase.
 * **Phase 15, tests and fuzz.** Cross-validation against the
   phase 1 oracle for chains instar wrote and chains it did not,
-  plus coverage fuzzing of the compose path. Phase 9 fuzzes the
-  locator *parsers*; composing a chain is new surface, and a
-  malicious child pointing at a well-formed parent is a
-  different input space from a malformed locator table.
+  plus coverage fuzzing of the compose path. Its harness drives
+  the `python3-libvhdi` binding with an explicit `set_parent()`
+  rather than a CLI export, and its VHD fixtures are subject to
+  the sector-bitmap caveat above. Phase 9 fuzzes the locator
+  *parsers*; composing a chain is new surface, and a malicious
+  child pointing at a well-formed parent is a different input
+  space from a malformed locator table.
 * **Phase 16, documentation.** Separate because phase 10 will
   have documented a refusal that phase 14 removes: at minimum
   `docs/chain-discovery.md`, `docs/chain-config.md` and the
@@ -346,8 +482,12 @@ already attaches the backing file as input device 0 when `-b` is
 given (`run_create_nonraw`, `src/vmm/src/main.rs:16612`), so the
 guest can read the parent's footer for its unique id and
 timestamp without any new call-table primitive. That is the fact
-that makes this plan tractable, and phase 1 should confirm it
-still holds before phase 7 is planned.
+that makes this plan tractable, and phase 1 confirmed it still
+holds: step 1b read the same function and found that it opens the
+host-resolved parent but embeds `typed_backing.as_bytes()`
+verbatim in what the guest receives (`:16710-16769`). That single
+typed string is also what forces the single-locator-entry answer
+in open question 3.
 
 ### Constraints that apply throughout
 
@@ -409,10 +549,11 @@ We will know this plan has been implemented because:
   `info`, `check`, `convert`, `compare`, `dd`, `bench`, `map`
   and `measure`.
 * `instar convert -O raw` on a differencing child produces the
-  same bytes as the phase 1 oracle's composed export of the same
-  chain, for chains instar wrote and for chains it did not, and
-  `instar info --chain` walks a VHD or VHDX chain the way it
-  walks a qcow2 one.
+  same bytes as the phase 1 oracle's composition of the same
+  chain -- driven through the `python3-libvhdi` binding, since
+  there is no `vhdiexport` -- for chains instar wrote and for
+  chains it did not, and `instar info --chain` walks a VHD or
+  VHDX chain the way it walks a qcow2 one.
 * `crates/vhd` and `crates/vhdx` parse parent locator structures
   and are clean under the new fuzz targets, including the
   adversarial fixtures from phase 2.
@@ -465,9 +606,12 @@ status becomes `Complete`.
   on this branch in `a93615d`, ahead of the phase 1 plan file.
 * The silent parent-ignoring read of differencing VHDs is a live
   correctness defect, not merely a missing feature: `convert`
-  produces a wrong image and exits 0. Phase 1 files it as a
-  GitHub issue and phase 4 fixes it. There were no open issues
-  on this surface when the plan was written.
+  produces a wrong image and exits 0. Filed by step 1d as
+  [issue #547](https://github.com/shakenfist/instar/issues/547),
+  "VHD differencing (disk type 4): convert -O raw silently
+  composes wrong data, exits 0", labelled `bug`; phase 4 fixes
+  it. There were no open issues on this surface when the plan
+  was written.
 * `instar-testdata/custom/format-coverage/vhd-differencing.vhd`
   is a `disk_type = 4` marker with an empty parent name and
   eight zeroed locator entries, so it does not exercise what its
