@@ -108,7 +108,8 @@ The fixtures are not usable as they stand.
 `disk_type = 4` in its footer but its parent unique id, parent
 unicode name and all eight parent locator entries are zero: it is
 a type marker, not a differencing disk, and its companion
-`vhd-diff-base.vhd` is not referenced by it. There is no VHDX differencing fixture at all.
+`vhd-diff-base.vhd` is not referenced by it. There is no VHDX
+differencing fixture at all.
 
 The generator is not missing, though — phase 2's survey found it
 in the other repository from where the master plan looked for it.

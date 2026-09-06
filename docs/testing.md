@@ -1324,7 +1324,14 @@ by scripts in `scripts/`:
   parent-locator VHDs (absolute path, relative traversal, UNC, URL,
   an over-long unterminated parent name, and mutually conflicting
   locator entries) that are structurally valid and hostile only in a
-  path string
+  path string. It takes two output directories,
+  `create-vhd-testdata.sh [output-dir] [audit-dir]`, because the six
+  adversarial fixtures belong in `custom/audit/` and everything else
+  in `custom/format-coverage/`. Every file it writes is
+  byte-reproducible except the VHDX parent/child pair, where
+  `qemu-img` stamps fresh GUIDs on each run; that pair is therefore
+  skipped when both files already exist, and rebuilding it needs
+  `REGEN_VHDX=1` and a commit of both files together
 - `create-vmdk-testdata.sh` — Binary VMDK4 with multi-extent descriptor
 - `create-luks-testdata.sh` — LUKS v1 containers with inner formats
 - `create-native-luks-testdata.py` — LUKS v1/v2 with known encrypted

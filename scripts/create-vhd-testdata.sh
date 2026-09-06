@@ -2,9 +2,14 @@
 # Generate synthetic VHD test images for instar integration tests.
 #
 # Usage:
-#   ./scripts/create-vhd-testdata.sh [output-dir]
+#   ./scripts/create-vhd-testdata.sh [output-dir] [audit-dir]
 #
 # Default output: ../instar-testdata/custom/format-coverage/
+# Default audit output: ../instar-testdata/custom/audit/
+#
+# The adversarial parent-locator fixtures below go to the audit directory,
+# which is where tests/manifest.json and docs/testing.md say they live; every
+# other file goes to the output directory.
 #
 # Creates:
 #   vhd-fixed.vhd         - 10 MiB fixed VHD (disk_type=2)
@@ -15,20 +20,22 @@
 # and three real differencing chains, each with the raw image it is intended
 # to compose to:
 #
-#   vhd-diff-parent.vhd            - 16 MiB dynamic VHD, shared by both children
+#   vhd-diff-parent.vhd            - 16 MiB dynamic VHD, shared by both
+#                                    children
 #   vhd-diff-child-aligned.vhd     - differencing child, byte-aligned bitmap
 #   vhd-diff-aligned-composed.raw  - the composition of those two
 #   vhd-diff-child-mixed.vhd       - differencing child, mixed bitmap bytes
-#   vhd-diff-mixed-composed.raw    - the composition of that child and the parent
+#   vhd-diff-mixed-composed.raw    - the composition of that child and the
+#                                    parent
 #   vhdx-diff-parent.vhdx          - 16 MiB dynamic VHDX, 1 MiB blocks
 #   vhdx-diff-child.vhdx           - differencing child exercising all three
 #                                    payload block states
 #   vhdx-diff-composed.raw         - the composition of those two
 #
-# and six adversarial parent-locator fixtures, each a well-formed
-# differencing VHD that differs from vhd-diff-child-aligned.vhd only in its
-# parent unicode name and locator table (instar-testdata
-# docs/plans/PLAN-extra-coverage.md priority 7):
+# and six adversarial parent-locator fixtures, written to the AUDIT
+# directory, each a well-formed differencing VHD that differs from
+# vhd-diff-child-aligned.vhd only in its parent unicode name and locator table
+# (instar-testdata docs/plans/PLAN-extra-coverage.md priority 7):
 #
 #   vhd-diff-locator-etc-passwd.vhd  - absolute /etc/passwd
 #   vhd-diff-locator-dotdot.vhd      - relative ../../../etc/passwd
@@ -55,15 +62,31 @@
 # the parent DataWriteGuid, so a child paired with a differently generated
 # parent will not resolve.
 #
+# Because they are not reproducible, the VHDX pair is OPT IN: it is skipped
+# when both files already exist, so a run made to prove the VHD half is
+# idempotent does not replace 24 MiB of committed LFS objects with
+# functionally identical but byte-different ones. Pass REGEN_VHDX=1 to
+# regenerate them, and commit both files when you do.
+#
+# Shape: these chains are deliberately qemu-shaped, not Hyper-V-shaped. The
+# creator application is 'qem2' (see vhd_footer below for why that is load
+# bearing) and vhd_geometry picks any exact CHS factorisation rather than the
+# sectors-per-track values from {17, 31, 63, 255} that real VHD producers and
+# qemu's own vpc geometry emit. Both are legal and both read back correctly,
+# but a later phase must not treat these images as evidence about what
+# Hyper-V writes.
+#
 # vhd-differencing.vhd is reproducible only because the patch step below pins
 # the timestamp and unique id qemu-img randomises.
 
 set -euo pipefail
 
 OUTDIR="${1:-../instar-testdata/custom/format-coverage}"
-mkdir -p "$OUTDIR"
+AUDITDIR="${2:-../instar-testdata/custom/audit}"
+mkdir -p "$OUTDIR" "$AUDITDIR"
 
 echo "Creating VHD test images in $OUTDIR..."
+echo "Creating adversarial parent-locator images in $AUDITDIR..."
 
 # --- Fixed VHD (disk_type=2) ---
 #
@@ -268,7 +291,8 @@ print(f"  Patched {path} to disk_type=4 ({os.path.getsize(path)} bytes)")
 #
 # Three chains, each with the raw image it is intended to compose to:
 #
-#   vhd-diff-parent.vhd        dynamic VHD (disk_type=3), shared by both children
+#   vhd-diff-parent.vhd        dynamic VHD (disk_type=3), shared by both
+#                              children
 #   vhd-diff-child-aligned.vhd differencing VHD, byte-aligned sector bitmap
 #   vhd-diff-child-mixed.vhd   differencing VHD, mixed sector bitmap bytes
 #   vhdx-diff-parent.vhdx      dynamic VHDX, 1 MiB blocks
@@ -280,7 +304,7 @@ print(f"  Patched {path} to disk_type=4 ({os.path.getsize(path)} bytes)")
 
 echo "  Creating differencing chains..."
 
-python3 - "$OUTDIR" <<'PYTHON_DIFF'
+python3 - "$OUTDIR" "$AUDITDIR" "${REGEN_VHDX:-0}" <<'PYTHON_DIFF'
 """Generate real VHD and VHDX differencing chains plus their compositions.
 
 Structure facts encoded here, each measured against a Hyper-V produced image
@@ -293,7 +317,9 @@ from the log2timeline/dfvfs corpus rather than taken from the spec text.  See
     (568), the parent unicode name at +64 (576) and the eight 24 byte parent
     locator entries at +576 (1088).
   * The parent unicode name is UTF-16 BIG endian.  The parent locator platform
-    data for W2ku/W2ru is UTF-16 LITTLE endian.
+    data for W2ku/W2ru is UTF-16 LITTLE endian; MacX is UTF-8 and 'Mac ' is
+    an opaque blob, so the encoding is keyed off the platform code (see
+    vhd_locator_platform_data).
   * Parent locator platform_data_space is a BYTE count, not the sector count
     the Microsoft spec wording implies.
   * Both VHD checksums are the ones complement of the sum of the structure
@@ -508,7 +534,7 @@ VHD_ADVERSARIAL_FIXTURES = [
 
 
 def marker(tag, n):
-    """A 512 byte sector whose content names its origin and its sector number."""
+    """A 512 byte sector naming its origin and its sector number."""
     stamp = ("%s-sector-%06d." % (tag, n)).encode("ascii")
     return (stamp * (SECTOR // len(stamp) + 1))[:SECTOR]
 
@@ -566,6 +592,33 @@ def vhd_footer(disk_type, size, unique_id, timestamp, data_offset=512):
     return bytes(buf)
 
 
+def vhd_locator_platform_data(platform_code, text):
+    """Encode one parent locator's platform data the way its code demands.
+
+    SPEC(VHD) does not give every platform code the same encoding, and a
+    fixture that pretends otherwise teaches a parser the wrong rule for
+    exactly the codes it has no other example of:
+
+      * W2ru / W2ku (and the deprecated Wi2r / Wi2k) carry a Windows path as
+        UTF-16.  Hyper-V writes it little endian, which is the opposite of
+        the parent unicode name at offset 576.
+      * MacX carries a UTF-8 file:// URL.
+      * 'Mac ' carries a Mac OS alias record, which is an opaque binary blob
+        and not text in any encoding.
+
+    The 'Mac ' blob below is a deliberate stand-in rather than a synthesised
+    alias record: it starts with bytes that decode as neither UTF-8 nor
+    UTF-16 so that a parser treating this field as a path is caught here,
+    and it carries the fixture's name in ASCII afterwards only so a human
+    reading a hex dump can tell which entry it is.
+    """
+    if platform_code == b"MacX":
+        return text.encode("utf-8")
+    if platform_code == b"Mac ":
+        return b"\x00\x00\x00\x00\x00\x96\x00\x02" + text.encode("ascii")
+    return text.encode("utf-16-le")
+
+
 def vhd_locator_entry(platform_code, data_space, data_length, data_offset):
     return struct.pack(">4sIIIQ", platform_code, data_space, data_length, 0,
                        data_offset)
@@ -596,7 +649,7 @@ def vhd_dynamic_header(table_offset, max_entries, block_size,
 
 
 def vhd_sector_bitmap(sector_numbers, block_index):
-    """MSB first per block sector bitmap, one 512 byte sector for 2 MiB blocks."""
+    """MSB first per block bitmap, one 512 byte sector for 2 MiB blocks."""
     nbytes = VHD_SECTORS_PER_BLOCK // 8
     nbytes = ((nbytes + SECTOR - 1) // SECTOR) * SECTOR
     bitmap = bytearray(nbytes)
@@ -609,7 +662,7 @@ def vhd_sector_bitmap(sector_numbers, block_index):
 
 
 def write_dynamic_vhd(path, content, unique_id, timestamp):
-    """A plain dynamic VHD holding content; every non-zero block is allocated."""
+    """A plain dynamic VHD; every non-zero block of content is allocated."""
     nblocks = (len(content) + VHD_BLOCK_SIZE - 1) // VHD_BLOCK_SIZE
     bat_offset = 1536
     bat_bytes = ((nblocks * 4 + SECTOR - 1) // SECTOR) * SECTOR
@@ -648,7 +701,8 @@ def write_differencing_vhd(path, child_sectors, size, unique_id, timestamp,
     """A differencing VHD whose sector bitmaps claim only child_sectors.
 
     locators is a sequence of at most eight (platform_code, path) pairs.  Each
-    gets one 512 byte sector of UTF-16LE data, laid out in order from offset
+    gets one 512 byte sector of platform data, encoded according to its
+    platform code by vhd_locator_platform_data, laid out in order from offset
     1536, and one entry in the eight entry table at absolute offset 1088.  The
     path strings are written verbatim and are never opened, stated or resolved
     by this generator.
@@ -668,7 +722,7 @@ def write_differencing_vhd(path, child_sectors, size, unique_id, timestamp,
     blobs = []
     entries = []
     for i, (platform_code, text) in enumerate(locators):
-        blob = text.encode("utf-16-le")
+        blob = vhd_locator_platform_data(platform_code, text)
         if len(blob) > SECTOR:
             raise ValueError("locator data does not fit in one sector")
         offset = loc_base + i * SECTOR
@@ -742,7 +796,15 @@ VHDX_BAT_FULLY_PRESENT = 6
 VHDX_BAT_PARTIALLY_PRESENT = 7
 VHDX_SB_PRESENT = 6
 
+# Metadata item table entry flags.  SPEC(VHDX) gives the parent locator item
+# IsUser=false, IsVirtualDisk=true, IsRequired=true, i.e. 0x6 -- the same
+# shape as the four virtual-disk items qemu-img writes (VirtualDiskSize,
+# Page83Data, LogicalSectorSize, PhysicalSectorSize).  File parameters is a
+# file-scoped item and correctly carries 0x4 alone.
+METADATA_FLAG_IS_VIRTUAL_DISK = 0x2
 METADATA_FLAG_IS_REQUIRED = 0x4
+METADATA_FLAGS_PARENT_LOCATOR = (METADATA_FLAG_IS_VIRTUAL_DISK
+                                 | METADATA_FLAG_IS_REQUIRED)
 
 
 def qemu_img(*args):
@@ -775,15 +837,38 @@ def vhdx_metadata_items(data, region_offset):
     return count, items
 
 
+def crc32c(data):
+    """CRC-32C (Castagnoli), the checksum VHDX uses for its structures.
+
+    Bitwise rather than table driven: this runs over two 4 KiB headers per
+    image, so the table would cost more to read than it saves to run.
+    Verified against the checksums qemu-img writes into both header copies.
+    """
+    crc = 0xFFFFFFFF
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            crc = (crc >> 1) ^ (0x82F63B78 if crc & 1 else 0)
+    return crc ^ 0xFFFFFFFF
+
+
 def vhdx_data_write_guid(data):
     """The DataWriteGuid of the header with the higher sequence number."""
     best = None
     for off in (0x10000, 0x20000):
-        sig, _csum, seq = struct.unpack_from("<4sIQ", data, off)
+        sig, csum, seq = struct.unpack_from("<4sIQ", data, off)
         if sig != b"head":
+            continue
+        # A torn header keeps its old sequence number but not its checksum, so
+        # check the CRC before letting a higher sequence win.
+        header = bytearray(data[off:off + 4096])
+        struct.pack_into("<I", header, 4, 0)
+        if crc32c(header) != csum:
             continue
         if best is None or seq > best[0]:
             best = (seq, uuid.UUID(bytes_le=data[off + 32:off + 48]))
+    if best is None:
+        raise ValueError("no valid VHDX header found in this image")
     return best[1]
 
 
@@ -796,6 +881,11 @@ def vhdx_parent_locator_item(parent_data_write_guid, relative_path,
     value length, all offsets relative to the start of the item.
     Keys and values are UTF-16LE and are not NUL terminated.
     """
+    # parent_linkage is rendered lowercase, which is what qemu and Python's
+    # uuid produce; Hyper-V writes braced GUIDs uppercase.  SPEC(VHDX) fixes
+    # no case, so this fixture deliberately exercises the lowercase form and
+    # a reader must compare case-insensitively -- a case-sensitive comparison
+    # calibrated against this file would pass here and fail on Hyper-V.
     pairs = [
         ("parent_linkage", "{%s}" % parent_data_write_guid),
         ("relative_path", relative_path),
@@ -851,12 +941,19 @@ def patch_vhdx_child(path, parent_absolute, parent_relative,
     entry_off = meta_off + 32 + count * 32
     data[entry_off:entry_off + 16] = META_PARENT_LOCATOR.bytes_le
     struct.pack_into("<IIII", data, entry_off + 16,
-                     item_off, len(item), METADATA_FLAG_IS_REQUIRED, 0)
+                     item_off, len(item), METADATA_FLAGS_PARENT_LOCATOR, 0)
     struct.pack_into("<H", data, meta_off + 10, count + 1)
 
     # 3. Rewrite the BAT: only the blocks the child owns stay present.
     nblocks = (IMAGE_SIZE + block_size - 1) // block_size
     chunk_ratio = (0x800000 * SECTOR) // block_size
+    # The VHDX BAT interleaves one sector-bitmap entry after every chunk_ratio
+    # payload entries.  The flat b * 8 indexing below is only correct while
+    # every block falls inside chunk 0; assert that rather than leaving a
+    # silent wrong answer for whoever grows VHDX_BLOCK_SIZE or IMAGE_SIZE.
+    assert nblocks <= chunk_ratio, (
+        "flat BAT indexing needs every block in chunk 0: %d blocks, "
+        "chunk ratio %d" % (nblocks, chunk_ratio))
     for b in range(nblocks):
         eo = bat_off + b * 8
         (entry,) = struct.unpack_from("<Q", data, eo)
@@ -883,7 +980,8 @@ def patch_vhdx_child(path, parent_absolute, parent_relative,
         sb_index = chunk_ratio
         assert (sb_index + 1) * 8 <= bat_len, "BAT region too small"
         struct.pack_into("<Q", data, bat_off + sb_index * 8,
-                         ((sb_offset // (1024 * 1024)) << 20) | VHDX_SB_PRESENT)
+                         ((sb_offset // (1024 * 1024)) << 20)
+                         | VHDX_SB_PRESENT)
 
     with open(path, "wb") as fh:
         fh.write(bytes(data))
@@ -917,10 +1015,16 @@ def vhdx_composition(block_size):
 
 def main():
     outdir = os.path.abspath(sys.argv[1])
+    auditdir = os.path.abspath(sys.argv[2])
+    regen_vhdx = sys.argv[3] not in ("", "0")
     written = []
+    audited = []
 
     def p(name):
         return os.path.join(outdir, name)
+
+    def a(name):
+        return os.path.join(auditdir, name)
 
     # ---------------- VHD ----------------
     write_dynamic_vhd(p("vhd-diff-parent.vhd"),
@@ -947,14 +1051,52 @@ def main():
     # No composed .raw sibling for these: there is no correct composition for
     # a fixture whose parent reference is hostile, and shipping one would
     # invite a test to try to resolve it.  They exist for the parse layer.
+    #
+    # These go to the audit directory, not the format-coverage one: that is
+    # where tests/manifest.json declares their path and where every other
+    # adversarial generator writes.
     for name, child_uid, parent_name, locators in VHD_ADVERSARIAL_FIXTURES:
-        write_differencing_vhd(p(name), VHD_CHILD_SECTORS_ALIGNED, IMAGE_SIZE,
+        write_differencing_vhd(a(name), VHD_CHILD_SECTORS_ALIGNED, IMAGE_SIZE,
                                uuid.UUID(child_uid).bytes, VHD_TIMESTAMP,
                                VHD_PARENT_UID, parent_name=parent_name,
                                locators=locators)
-        written.append(name)
+        audited.append(name)
 
     # ---------------- VHDX ----------------
+    #
+    # Opt in, because this half is not reproducible: qemu-img stamps fresh
+    # header, log and virtual-disk-id GUIDs on every run, so regenerating
+    # rewrites both committed LFS objects for no behavioural change.  The
+    # patch step below is also not idempotent -- it appends a parent locator
+    # metadata item -- so the guard covers the convert and the patch as one
+    # unit rather than only the convert.
+    vhdx_names = ("vhdx-diff-parent.vhdx", "vhdx-diff-child.vhdx")
+    skip_vhdx = (not regen_vhdx
+                 and all(os.path.exists(p(n)) for n in vhdx_names))
+    if skip_vhdx:
+        print("  Skipping the VHDX pair: both files exist and they are not "
+              "byte-reproducible.  Pass REGEN_VHDX=1 to rebuild them.")
+        # The composed .raw is reproducible even though the pair is not, so it
+        # is still written: it is derived from the block size this script asks
+        # qemu-img for, which the assert in vhdx_composition checks was
+        # honoured when the pair was generated.
+        block_size = VHDX_BLOCK_SIZE
+    else:
+        block_size = write_vhdx_pair(p, written)
+
+    with open(p("vhdx-diff-composed.raw"), "wb") as fh:
+        fh.write(vhdx_composition(block_size))
+    written.append("vhdx-diff-composed.raw")
+
+    for name in written:
+        print("  Created %s (%d bytes)" % (p(name), os.path.getsize(p(name))))
+    for name in audited:
+        print("  Created %s (%d bytes)" % (a(name), os.path.getsize(a(name))))
+    return 0
+
+
+def write_vhdx_pair(p, written):
+    """Convert and patch the VHDX parent/child pair; return the block size."""
     for name in ("vhdx-diff-parent.vhdx", "vhdx-diff-child.vhdx"):
         if os.path.exists(p(name)):
             os.unlink(p(name))
@@ -985,13 +1127,7 @@ def main():
         full_blocks=set(VHDX_CHILD_BLOCKS_FULL),
         child_sectors=VHDX_CHILD_SECTORS)
 
-    with open(p("vhdx-diff-composed.raw"), "wb") as fh:
-        fh.write(vhdx_composition(block_size))
-    written.append("vhdx-diff-composed.raw")
-
-    for name in written:
-        print("  Created %s (%d bytes)" % (p(name), os.path.getsize(p(name))))
-    return 0
+    return block_size
 
 
 if __name__ == "__main__":

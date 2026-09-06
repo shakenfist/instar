@@ -132,10 +132,23 @@ Maintainer-scoped token that `main` requires.
    caveat in the description, so phase 15 does not read a known
    oracle defect as an instar regression.
 4. **Fixtures are registered dark.** Every new entry gets
-   `run_in_ci: false` and `skip_qemu_img: true`. Nothing consumes
-   them until phase 3, and qemu-img's readings of them are wrong
-   by construction. Phase 8 flips `run_in_ci` for the happy-path
-   pair when there are tests to run.
+   `run_in_ci: false`. Nothing consumes them until phase 3, so
+   phase 8 flips `run_in_ci` for the happy-path pair when there
+   are tests to run.
+
+   `skip_qemu_img: true` goes only where qemu-img's reading is
+   wrong by construction, which is the nine differencing
+   children -- the two VHD children, the VHDX child and the six
+   adversarial locator fixtures -- and nothing else. It does
+   **not** go on the two parents or the three composed `.raw`
+   files. Those five are plain images, and qemu-img reads them
+   correctly: measured, `qemu-img convert` recovers exactly
+   sectors 0, 1, 2, 8, 100, 4096, 5000, 28672 and 32767 from
+   `vhd-diff-parent.vhd` and exactly sectors 0, 5, 2048, 3000,
+   7000, 10240 and 32767 from `vhdx-diff-parent.vhdx`, which are
+   precisely the sector sets the generator writes. Suppressing
+   parity on them would throw away free cross-checking of the
+   plain dynamic VHD and VHDX writers the whole chain rests on.
 5. **Leave the orphan alone, and ask.** `vhd-diff-base.vhd` looks
    deletable and this phase does not delete it: `instar-testdata`
    is shared with imago, and a fixture unreferenced from instar
@@ -144,11 +157,22 @@ Maintainer-scoped token that `main` requires.
    do later and awkward to undo.
 6. **The adversarial set comes in the same generator run.** Per
    master plan open question 6, priority 7's five images
-   (absolute `/etc/passwd`, relative `../../../etc/passwd`, UNC,
-   an over-long path, and eight mutually disagreeing locators)
-   are generated alongside the happy-path chains. They are cheap
-   once the locator writer exists, and phase 3 needs them the
-   moment it parses a locator table.
+   (absolute `/etc/passwd`, relative `../../../etc/passwd`, UNC
+   `\\attacker\share\probe`, the URL
+   `http://attacker.example/probe`, and eight mutually
+   disagreeing locators) are generated alongside the happy-path
+   chains. They are cheap once the locator writer exists, and
+   phase 3 needs them the moment it parses a locator table.
+
+   A **sixth** image is added beyond priority 7: an over-long
+   parent name filling the whole 512-byte field with no NUL
+   terminator. Priority 7 does not name it. It is here because
+   phase 5 has to pick a length bound and the boundary is
+   exactly where a reader is most likely to be wrong -- which it
+   proved to be, turning up libvhdi defect C and moving phase
+   5's rule from "refuse above 512 bytes" to "refuse at 512
+   bytes" (255 code units, not 256). Six fixtures ship, not
+   five.
 7. **The expected composition ships with the chain.** Each chain
    gets its intended composed image as a `.raw` sibling, produced
    by the generator, so phase 15 compares against a recorded
@@ -168,7 +192,7 @@ change when libvhdi is fixed, and nothing in it would say why.
 | Step | Effort | Model | Isolation | Brief for sub-agent |
 |------|--------|-------|-----------|---------------------|
 | 2a | high | opus | worktree | Extend `scripts/create-vhd-testdata.sh` (instar) with differencing-chain generation, lifting the generator from the appendix of `docs/plans/PLAN-differencing-phase-01-pin.md` — it is known-good and its structure facts are measured, so port it rather than rewriting. Keep the script's existing two fixtures byte-identical: it must remain idempotent for `vhd-fixed.vhd` and `vhd-differencing.vhd`, verified by regenerating into a temp dir and `cmp`-ing against the current files in `../instar-testdata/custom/format-coverage/`. Add: a VHD parent + byte-aligned child, a VHD parent + mixed child, a VHDX parent + child exercising PARTIALLY_PRESENT / FULLY_PRESENT / NOT_PRESENT, and the intended composed `.raw` for each chain. Structure facts are in the phase 1 plan's "The structure pin" section — parent unique id at absolute 552, parent unicode name at 576 in UTF-16BE, locator entries from 1088 with UTF-16LE platform data and a byte-count `platform_data_space`, VHDX `parent_linkage` = the parent's DataWriteGuid as a braced string. Do not invent offsets; that section is the authority. |
-| 2b | medium | opus | worktree | Add the five adversarial parent-locator fixtures from `instar-testdata/docs/plans/PLAN-extra-coverage.md` priority 7 to the same script: absolute `/etc/passwd`, relative `../../../etc/passwd`, UNC `\\\\attacker\\share\\probe`, an over-long path filling the 512-byte parent-name field, and one with eight mutually disagreeing locator entries. These are hostile *paths*, not malformed structures: each image must otherwise be a well-formed differencing VHD, so that a parser reaching the path has already passed everything else. Nothing in the generator or the fixtures may reference a real file outside the output directory. |
+| 2b | medium | opus | worktree | Add the five adversarial parent-locator fixtures from `instar-testdata/docs/plans/PLAN-extra-coverage.md` priority 7 to the same script -- absolute `/etc/passwd`, relative `../../../etc/passwd`, UNC `\\\\attacker\\share\\probe`, the URL `http://attacker.example/probe`, and one with eight mutually disagreeing locator entries -- plus a sixth beyond priority 7: an over-long path filling the 512-byte parent-name field with no NUL terminator, which is where phase 5's length bound has to be decided. These are hostile *paths*, not malformed structures: each image must otherwise be a well-formed differencing VHD, so that a parser reaching the path has already passed everything else. Nothing in the generator or the fixtures may reference a real file outside the output directory. |
 | 2c | medium | sonnet | none | Register the new fixtures in `tests/manifest.json` (instar), following the shape of the existing `vhd-differencing` entry at `:197-206`. Every entry: `run_in_ci: false`, `skip_qemu_img: true`, `generated_by: scripts/create-vhd-testdata.sh`, a description saying what the image is *for*, and for the mixed VHD chain a description that names the libvhdi sector-bitmap caveat. Do not touch the existing `vhd-differencing` entry. Add `sha256` where the neighbouring entries carry one. Update `docs/testing.md:1318`'s description of the script to cover what it now generates. |
 | 2d | medium | sonnet | none | (As executed, this opened a merge request, which was wrong for this repository -- see decision 5; the commits landed directly on `main`.) Land the fixtures in `instar-testdata`: the generated binaries into `custom/format-coverage/`, LFS-tracked (`.gitattributes` already covers `.vhd`, `.vhdx`, `.raw`). Confirm with `git lfs ls-files` that every new binary is an LFS object and not a bare blob, and that no file was committed as a 131-byte pointer by mistake. The push needs the Maintainer-scoped token, since `main` is protected. Report the branch, the PR number, and the merge commit once it lands, because the master plan's `Merged` cell for this phase records both repositories. |
 | 2e | low | sonnet | none | Close the phase: verify the definition of done item by item, set phase 2 to Complete in `docs/plans/PLAN-differencing.md` and `docs/plans/index.md`, fill the `Merged` cell with both records, and present the commits. Do not commit. |
@@ -210,13 +234,30 @@ change when libvhdi is fixed, and nothing in it would say why.
   shipped `.raw`, except for the mixed VHD chain, whose deviation
   is exactly the sectors phase 1 defect A predicts and is
   recorded as such.
-* The five priority 7 adversarial fixtures exist, and each is a
+* The five priority 7 adversarial fixtures exist -- absolute,
+  relative, UNC, URL and conflicting -- plus the over-long
+  fixture added beyond priority 7, six in total, and each is a
   structurally valid differencing VHD that differs from the
   happy-path child only in its locator paths.
+* Those six are written to `custom/audit/`, which is where
+  `tests/manifest.json` and `docs/testing.md` say they live, and
+  the generator puts them there rather than in the
+  format-coverage output directory.
+* Regeneration drift is caught by two standing mechanisms rather
+  than by a one-off `cmp`: every fixture carries a `sha256` in
+  the manifest, so `tests/base.py`'s `skip_if_hash_mismatch`
+  fires the moment a consumer appears; and a default generator
+  run is now a byte-exact no-op, because the only
+  non-reproducible outputs -- the VHDX pair -- are skipped
+  unless `REGEN_VHDX=1` is passed. Re-running the script against
+  the testdata checkout and finding `git status` clean is
+  therefore the check, and it needs no new flag.
 * `git lfs ls-files` in `instar-testdata` lists every new binary;
   no new file is a bare blob or a 131-byte pointer.
 * Every new fixture is in `tests/manifest.json` with
-  `run_in_ci: false` and `skip_qemu_img: true`.
+  `run_in_ci: false`, with `skip_qemu_img: true` on the nine
+  differencing children only, and with a `sha256` so
+  `tests/base.py`'s drift check is live for all fourteen.
 * `tests/test_check_formats.py` still passes unchanged, proving
   the existing fixture was not disturbed.
 * `git diff --name-only develop...HEAD -- src/` is empty.
