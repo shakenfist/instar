@@ -18,19 +18,16 @@ overflows, integer overflows, and other memory safety issues.
 
 ### Instar's Approach
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                        Host System                          │
-│                                                             │
-│  ┌─────────────┐     ┌─────────────────────────────────┐   │
-│  │   Instar    │     │        KVM Sandbox              │   │
-│  │   Client    │────▶│  ┌─────────────────────────┐    │   │
-│  │             │     │  │   Conversion Engine     │    │   │
-│  │ (handles    │◀────│  │   (parses formats,      │    │   │
-│  │  I/O only)  │     │  │    performs conversion) │    │   │
-│  └─────────────┘     │  └─────────────────────────┘    │   │
-│                      └─────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    subgraph host["Host system"]
+        client["Instar client<br/>(handles I/O only)"]
+        subgraph sandbox["KVM sandbox"]
+            engine["Conversion engine<br/>(parses formats,<br/>performs conversion)"]
+        end
+    end
+    client -- "raw bytes in" --> engine
+    engine -- "raw bytes out" --> client
 ```
 
 The host-side client:

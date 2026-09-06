@@ -79,6 +79,27 @@ fi
 green "PASS: make fuzz-build"
 echo
 
+# Mermaid fails at render time rather than at commit time, so a broken
+# diagram commits cleanly and passes every other check here. The script
+# renders in the upstream mermaid-cli container; do not pipe it, or the
+# pipeline reports the filter's status and every failure turns green.
+#
+# The message says "see above" rather than naming a cause, because a
+# broken diagram is only one of the ways this exits non-zero: a fence
+# mmdc cannot read is refused by name, and so is a path outside the
+# repository or one the container cannot carry, while a docker daemon
+# that is not running surfaces as the run's own status. Each of those
+# already prints what it was; asserting "a diagram does not render"
+# over the top sends a developer looking for a broken diagram that
+# does not exist.
+bold "=== wave 1a: tools/mermaid-lint.sh (render every diagram) ==="
+if ! ./tools/mermaid-lint.sh; then
+    red "FAIL: mermaid-lint (see the output above)"
+    exit 8
+fi
+green "PASS: mermaid-lint"
+echo
+
 bold "=== wave 1b: mechanical style checks ==="
 
 # 1. Long-line check: warn on Rust source lines over 120 chars in

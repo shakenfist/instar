@@ -96,10 +96,13 @@ Per-format feature detail is in
   `tools/ci/check-test-partition.py`.
 
 - **`automated_reviewer`'s `needs` list must name every job that can
-  fail a PR**, including `ci-tooling`. Two jobs are deliberately
+  fail a PR**, including `ci-tooling`. Three jobs are deliberately
   outside it, each for a stated reason in the comment above the list:
   `oslo-crossval-master` is `continue-on-error`, and `agent-context.yml`
-  is a separate workflow file, which `needs:` cannot reach.
+  and `mermaid-lint.yml` are separate workflow files, which `needs:`
+  cannot reach. Both of those are path-filtered and neither is a
+  required check, so a red result on either is visible on the pull
+  request and blocks nothing automatically.
 
 - **The call table is append-at-end and versioned.** Adding an entry
   bumps `VERSION`; never reorder or reuse an index. The entries and
@@ -114,6 +117,14 @@ Per-format feature detail is in
   whatever language is being used. Rust code is formatted by `rustfmt`
   and linted by `clippy`, both enforced by the pre-commit hooks;
   `./scripts/check-rust.sh fix` auto-fixes formatting.
+
+- **Diagrams of structure or flow are `mermaid` fences, not ASCII art**,
+  and they fail at render time rather than at commit time, so run
+  `tools/mermaid-lint.sh` before pushing. Character art whose meaning is
+  its column alignment -- file trees, memory maps, register layouts, byte
+  layouts, terminal output -- stays in a plain fence. `prototypes/*/README.md`
+  is out of scope and keeps its original ASCII as a historical record.
+  See "Diagrams" in [docs/development.md](docs/development.md).
 
 ## Adding a prototype
 

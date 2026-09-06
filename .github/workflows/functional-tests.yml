@@ -1134,12 +1134,13 @@ jobs:
     # rest of the fleet.
     #
     # Every job which can fail the PR is named here, so the gate means
-    # what the sentence above says. There are two deliberate omissions.
-    # oslo-crossval-master is continue-on-error: true and so could never
-    # gate anything. agent-context.yml's skillsaw job can fail a pull
-    # request but lives in its own workflow file, and needs: cannot cross
-    # workflow files -- see that workflow's header for why it is separate
-    # and why it is not a required check either.
+    # what the sentence above says. There are three deliberate
+    # omissions. oslo-crossval-master is continue-on-error: true and so
+    # could never gate anything. agent-context.yml's skillsaw job and
+    # mermaid-lint.yml's diagram render can each fail a pull request but
+    # live in their own workflow files, and needs: cannot cross workflow
+    # files -- see those workflows' headers for why they are separate and
+    # why neither is a required check either.
     needs:
       - ci-tooling
       - build-and-test
@@ -1191,10 +1192,10 @@ jobs:
       - snapshot-harnesses
     # Deliberately not gated to pull_request alone: workflow_dispatch
     # runs most of these jobs too, and reporting the aggregate there is
-    # useful. Two omissions are on purpose: oslo-crossval-master is
+    # useful. Three omissions are on purpose: oslo-crossval-master is
     # continue-on-error and so could never gate anything, and
-    # agent-context.yml's skillsaw job is in another workflow file, which
-    # needs: cannot reach.
+    # agent-context.yml's skillsaw job and mermaid-lint.yml's diagram
+    # render are in other workflow files, which needs: cannot reach.
     if: always() && github.event_name != 'merge_group'
     permissions:
       actions: read

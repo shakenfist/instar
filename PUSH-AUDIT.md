@@ -44,6 +44,13 @@ It performs (and exits non-zero on any failure):
   `src/fuzz` crate is outside the main workspace, so this
   catches a fuzz target drifting out of sync with a
   workspace struct change before it fails in coverage-fuzz CI)
+- `tools/mermaid-lint.sh` (renders every mermaid diagram in
+  the tree through the upstream mermaid-cli container;
+  mermaid fails at render time, so a broken diagram commits
+  cleanly and nothing else here reads one. It also refuses a
+  fence `mmdc` cannot read -- a tilde fence, or a space
+  before the language -- which GitHub renders and the
+  renderer does not, naming the file and the line)
 - mechanical style checks: lines wrapped at 120
   characters in changed Rust files, no large inline
   scripts in CI workflow steps (advisory), single
@@ -51,15 +58,17 @@ It performs (and exits non-zero on any failure):
 
 Exit codes:
 
-| Code | Meaning                          |
-|------|----------------------------------|
-| 0    | all wave 1 checks passed         |
-| 1    | pre-commit failed                |
-| 2    | rustfmt or clippy failed         |
-| 3    | `make instar` failed             |
-| 4    | binary size cap exceeded         |
-| 5    | `make test-rust` failed          |
-| 7    | `make fuzz-build` failed          |
+| Code | Meaning                        |
+|------|--------------------------------|
+| 0    | all wave 1 checks passed       |
+| 1    | pre-commit failed              |
+| 2    | rustfmt or clippy failed       |
+| 3    | `make instar` failed           |
+| 4    | binary size cap exceeded       |
+| 5    | `make test-rust` failed        |
+| 6    | could not enter the repo root  |
+| 7    | `make fuzz-build` failed       |
+| 8    | `tools/mermaid-lint.sh` failed |
 
 If wave 1 fails, fix the cause and re-run before
 spending on wave 2.
@@ -347,6 +356,36 @@ edit -- the canonical copy lives in shakenfist/development at
 - Growth in either file is itself a finding: if the diff adds
   content that belongs in `docs/`, flag it as blocking and move
   it.
+<!-- shared-block-end -->
+
+<!-- shared-block: diagram-discipline v1 -->
+Diagram discipline (shared block; do not edit -- the canonical
+copy lives in shakenfist/development at
+`templates/shared-blocks/diagram-discipline.md`):
+
+- A diagram of *structure or flow* -- components and the arrows
+  between them, an ordered exchange of messages, a state machine
+  -- is written as a fenced `mermaid` block, not drawn in ASCII.
+  GitHub renders those natively and the mkdocs sites render them
+  through `pymdownx.superfences`, so the same source is a picture
+  in both places.
+- Not every box of characters is a diagram. These stay as plain
+  code fences, because mermaid cannot express them and would lose
+  what they show: directory and file trees; memory maps, address
+  space layouts and register or bit-field diagrams, where column
+  alignment carries the meaning; wire-format and on-disk byte
+  layouts; captured terminal output; and tables. The test is
+  whether the picture is nodes and edges. Something that is a
+  table with lines drawn on it is a table.
+- Pick the diagram type that matches the claim: `flowchart` for
+  components and data flow, `sequenceDiagram` for an ordered
+  exchange between parties, `stateDiagram-v2` for a state
+  machine, `erDiagram` for data relationships. A sequence drawn
+  as a flowchart has thrown away the ordering it existed to show.
+- A new ASCII box-and-arrow diagram in the diff is a finding.
+  Converting one the diff already touches is in scope; converting
+  every other diagram in the file is not, because a sweep is its
+  own change and its own review.
 <!-- shared-block-end -->
 
 - New or changed subcommand behaviour is reflected in that
