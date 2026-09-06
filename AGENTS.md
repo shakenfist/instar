@@ -89,6 +89,15 @@ Per-format feature detail is in
   dependency generation" in
   [docs/development.md](docs/development.md).
 
+- **Devcontainer `cargo install` lines stay version-pinned and
+  `--locked`.** An unpinned install re-resolves its whole dependency
+  tree on every from-scratch image build, and a single broken upstream
+  publish then fails CI on every PR. Each pin's `# renovate:` comment
+  must stay directly above its `ARG` to remain managed, and Renovate
+  bumps a crate across both Dockerfiles in one PR — never bump one file
+  alone. See "Cargo tool pinning" in
+  [docs/development.md](docs/development.md).
+
 - **A new integration test module needs a CI partition.**
   `tools/ci/check-test-partition.sh` fails if any `test_*.py` test is run
   by no pull-request job. An orphan is a hard CI failure; deliberate

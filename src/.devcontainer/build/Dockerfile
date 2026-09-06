@@ -133,17 +133,40 @@ ENV PATH="/build/.cargo/bin:${PATH}"
 # host uid can update).
 RUN umask 0000 && rustup component add rust-src llvm-tools-preview
 
+# Cargo tool versions are PINNED, and every `cargo install` below runs
+# with --locked, for the reasons documented at length in
+# src/.devcontainer/Dockerfile: --locked stops a broken transitive
+# dependency published upstream from breaking every from-scratch image
+# build (tinyvec 1.13.0, 2026-09-03), and the pins put the tool versions
+# under Renovate's 3-day minimumReleaseAge.
+#
+# These are the same crates and the same versions the dev image installs.
+# Renovate raises one PR per crate covering every occurrence, so both
+# images move together; do not bump one file alone. Note that the
+# packageRules entry disabling this file in renovate.json is scoped to
+# the docker datasource -- the debian:bullseye base stays frozen (its
+# glibc 2.31 sets the floor of the shipped binary) while these crate
+# pins are still managed.
+
+# renovate: datasource=crate depName=cargo-binutils
+ARG CARGO_BINUTILS_VERSION=0.4.0
 # cargo-binutils provides rust-objcopy (build.sh flattens each guest
 # ELF to a flat .bin with it).
 RUN --mount=type=cache,target=/build/.cargo/registry,sharing=locked \
     --mount=type=cache,target=/build/.cargo/git,sharing=locked \
-    umask 0000 && cargo install cargo-binutils
+    umask 0000 && cargo install --locked cargo-binutils@"${CARGO_BINUTILS_VERSION}"
 
+# renovate: datasource=crate depName=cargo-deb
+ARG CARGO_DEB_VERSION=3.8.0
+# renovate: datasource=crate depName=cargo-generate-rpm
+ARG CARGO_GENERATE_RPM_VERSION=0.21.0
 # Packaging tools for `make deb` / `make rpm`. Both run with --no-build
 # against artifacts produced by `make instar`, so they only package.
 RUN --mount=type=cache,target=/build/.cargo/registry,sharing=locked \
     --mount=type=cache,target=/build/.cargo/git,sharing=locked \
-    umask 0000 && cargo install cargo-deb cargo-generate-rpm
+    umask 0000 && cargo install --locked \
+        cargo-deb@"${CARGO_DEB_VERSION}" \
+        cargo-generate-rpm@"${CARGO_GENERATE_RPM_VERSION}"
 
 # Verify installation (mirrors the dev image's final check, minus the
 # test/fuzz tools this image intentionally omits).

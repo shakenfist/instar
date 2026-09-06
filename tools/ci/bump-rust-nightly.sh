@@ -76,7 +76,7 @@ fi
 # touched one of them. The comparison lives in its own script so that
 # pre-commit and build-and-test can run it on every change rather than
 # only when this weekly bump fires.
-tools/ci/check-nightly-pins.sh
+tools/ci/check-devcontainer-pins.sh
 echo "Current pin: ${CURRENT}"
 
 # --- 2. Newest published nightly ------------------------------------------

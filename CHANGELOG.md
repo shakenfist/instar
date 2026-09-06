@@ -118,6 +118,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   alternatives, and why this one, are in
   [docs/development.md](docs/development.md).
 
+- **A broken crate published to crates.io can no longer break every
+  from-scratch devcontainer build.** Both Dockerfiles installed their
+  cargo tooling unpinned, so each image build re-resolved the whole
+  transitive dependency tree of `cargo-audit`, `cargo-fuzz`, `cargo-deb`,
+  `cargo-generate-rpm` and `cargo-binutils` to whatever was newest at
+  that moment. On 2026-09-03 `tinyvec` 1.13.0 was published in a state
+  that does not compile, and the "Build and test via devcontainer" step
+  failed on every pull request for the four hours until upstream shipped
+  1.13.2 — with nothing in the repository having changed. Each tool is
+  now installed at an `ARG`-pinned version with `cargo install --locked`,
+  and the pins are bumped by Renovate under the repo's three-day
+  `minimumReleaseAge`. `tools/ci/check-devcontainer-pins.sh` (pre-commit
+  and CI) holds all of that in place: it fails on a lost `--locked`, on a
+  hardcoded crate version, and on a pin whose `# renovate:` comment has
+  gone missing or detached — each of which would otherwise reopen the
+  hole without any error. It derives the tools it compares from what the
+  images actually install rather than from a list, and it runs the
+  `customManagers` regex as written in `renovate.json` over both
+  Dockerfiles, so neither a tool added later nor a typo in the Renovate
+  config can leave a pin silently unmanaged.
+
 - **`rebase` no longer plans a write at an arbitrary offset for an
   overlay with a corrupt backing-path pointer.** The qcow2 rebase
   planner took the overlay header's `backing_file_offset` /

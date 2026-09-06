@@ -15,15 +15,24 @@ repos:
         pass_filenames: false
         files: ^src/
 
-      # The two devcontainer images must pin the same Rust nightly.
-      # bump-rust-nightly.sh enforces this too, but only weekly; here it
-      # catches a hand-edit before it lands.
-      - id: nightly-pins
-        name: devcontainer Rust nightly pins agree
-        entry: ./tools/ci/check-nightly-pins.sh
+      # The two devcontainer images must agree on every pin they share:
+      # the Rust nightly and the versions of the cargo tools both
+      # install. bump-rust-nightly.sh enforces the nightly half too, but
+      # only weekly; here it catches a hand-edit before it lands. The
+      # same script also asserts that every `cargo install` keeps its
+      # --locked and that every pin stays matchable by the Renovate
+      # customManager, both of which fail silently in production.
+      #
+      # renovate.json and the guard's own two files are in the filter as
+      # well as the Dockerfiles: the check runs the customManager regex
+      # as it is actually written today over both images, so an edit to
+      # either half can break the pairing without touching a Dockerfile.
+      - id: devcontainer-pins
+        name: devcontainer pins agree, are --locked and Renovate-visible
+        entry: ./tools/ci/check-devcontainer-pins.sh
         language: script
         pass_filenames: false
-        files: ^src/\.devcontainer/.*Dockerfile$
+        files: ^(src/\.devcontainer/.*Dockerfile|renovate\.json|tools/ci/check-(devcontainer-pins\.sh|renovate-manager\.py))$
 
   # Lints the agent context (AGENTS.md, CLAUDE.md, .claude/ and
   # anything else an agent is handed) for malformed structure,
