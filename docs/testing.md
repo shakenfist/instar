@@ -1315,19 +1315,31 @@ and the reasoning.
 Synthetic test images that cannot be created by `qemu-img` are built
 by scripts in `scripts/`:
 
-- `create-vhd-testdata.sh` — Fixed VHD (disk_type=2) and differencing
-  VHD (disk_type=4) via Python struct packing and qemu-img patching
+- `create-vhd-testdata.sh` — Fixed VHD (disk_type=2); differencing
+  VHD (disk_type=4) as a disk_type-only type marker via qemu-img
+  patching; real VHD and VHDX differencing chains (parent, aligned
+  and mixed children, and each chain's intended composed raw image)
+  via Python struct packing against the structure pin in
+  `docs/plans/PLAN-differencing-phase-01-pin.md`; and six adversarial
+  parent-locator VHDs (absolute path, relative traversal, UNC, URL,
+  an over-long unterminated parent name, and mutually conflicting
+  locator entries) that are structurally valid and hostile only in a
+  path string
 - `create-vmdk-testdata.sh` — Binary VMDK4 with multi-extent descriptor
 - `create-luks-testdata.sh` — LUKS v1 containers with inner formats
 - `create-native-luks-testdata.py` — LUKS v1/v2 with known encrypted
   content (v1 raw, v2 Argon2id, v1 wrapping QCOW2)
 - `create-qcow2-luks-testdata.sh` — QCOW2 with LUKS encryption (crypt_method=2)
 - `create-check-testdata.sh` — QCOW2 images with specific corruptions
-Adversarial and CVE-reproducer image generation scripts live in
+
+Most adversarial and CVE-reproducer image generation scripts live in
 `instar-testdata/scripts/` (the private testdata repository), not in
-the public `instar/scripts/` directory. This includes scripts for
+the public `instar/scripts/` directory, and include scripts for
 compression bombs, circular/deep chains, integer overflow headers,
 boundary values, format confusion, and CVE reproducers.
+`create-vhd-testdata.sh` above is the one public exception: its
+adversarial parent-locator fixtures live alongside its differencing
+chains so that both share one generator and one structure pin.
 
 Generated images live in `../instar-testdata/custom/format-coverage/`
 and `../instar-testdata/custom/audit/` (adversarial images).

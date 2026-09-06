@@ -206,6 +206,94 @@
             "generated_by": "scripts/create-vhd-testdata.sh"
         },
         {
+            "id": "vhd-diff-parent",
+            "path": "custom/format-coverage/vhd-diff-parent.vhd",
+            "format": "vpc",
+            "safety": "safe",
+            "run_in_ci": false,
+            "skip_qemu_img": true,
+            "description": "Dynamic VHD (disk_type=3) parent shared by vhd-diff-child-aligned.vhd and vhd-diff-child-mixed.vhd, the base of both real VHD differencing chains",
+            "tags": ["vhd", "differencing", "differencing-chain", "format-coverage"],
+            "generated_by": "scripts/create-vhd-testdata.sh"
+        },
+        {
+            "id": "vhd-diff-child-aligned",
+            "path": "custom/format-coverage/vhd-diff-child-aligned.vhd",
+            "format": "vpc",
+            "safety": "safe",
+            "run_in_ci": false,
+            "skip_qemu_img": true,
+            "description": "Differencing VHD child of vhd-diff-parent.vhd whose sector bitmap keeps every child-owned sector in a bitmap byte of its own, with no parent-owned sector sharing that byte. No bitmap byte mixes ownership, which is what makes this chain's composition safe for content-exact assertions even under libvhdi's sector-bitmap decoder defect (docs/plans/PLAN-differencing-phase-01-pin.md, defect A)",
+            "tags": ["vhd", "differencing", "differencing-chain", "content-exact", "format-coverage"],
+            "generated_by": "scripts/create-vhd-testdata.sh"
+        },
+        {
+            "id": "vhd-diff-child-mixed",
+            "path": "custom/format-coverage/vhd-diff-child-mixed.vhd",
+            "format": "vpc",
+            "safety": "safe",
+            "run_in_ci": false,
+            "skip_qemu_img": true,
+            "description": "Differencing VHD child of vhd-diff-parent.vhd whose sector bitmap deliberately lets parent-owned and child-owned sectors share sector-bitmap bytes, as a real Hyper-V-produced differencing disk does. libvhdi's VHD sector-bitmap decoder is buggy (unmasked shift, docs/plans/PLAN-differencing-phase-01-pin.md, defect A) and mis-composes exactly sector 2 of this chain as a result: a content-exact assertion of this chain's composition against libvhdi must account for that one sector, which is a known oracle defect and not an instar regression",
+            "tags": ["vhd", "differencing", "differencing-chain", "libvhdi-defect-a", "format-coverage"],
+            "generated_by": "scripts/create-vhd-testdata.sh"
+        },
+        {
+            "id": "vhd-diff-aligned-composed",
+            "path": "custom/format-coverage/vhd-diff-aligned-composed.raw",
+            "format": "raw",
+            "safety": "safe",
+            "run_in_ci": false,
+            "skip_qemu_img": true,
+            "description": "Intended composition of vhd-diff-parent.vhd and vhd-diff-child-aligned.vhd, recorded so later phases compare against recorded intent rather than against whatever the oracle reports on the day",
+            "tags": ["vhd", "differencing", "differencing-chain", "composed", "format-coverage"],
+            "generated_by": "scripts/create-vhd-testdata.sh"
+        },
+        {
+            "id": "vhd-diff-mixed-composed",
+            "path": "custom/format-coverage/vhd-diff-mixed-composed.raw",
+            "format": "raw",
+            "safety": "safe",
+            "run_in_ci": false,
+            "skip_qemu_img": true,
+            "description": "Intended composition of vhd-diff-parent.vhd and vhd-diff-child-mixed.vhd, recorded so later phases compare against recorded intent rather than against whatever the oracle reports on the day. libvhdi's own composition of this chain diverges from this file at sector 2 because of the sector-bitmap decoder defect described on vhd-diff-child-mixed.vhd (docs/plans/PLAN-differencing-phase-01-pin.md, defect A); that divergence is expected and is not an instar regression",
+            "tags": ["vhd", "differencing", "differencing-chain", "composed", "format-coverage"],
+            "generated_by": "scripts/create-vhd-testdata.sh"
+        },
+        {
+            "id": "vhdx-diff-parent",
+            "path": "custom/format-coverage/vhdx-diff-parent.vhdx",
+            "format": "vhdx",
+            "safety": "safe",
+            "run_in_ci": false,
+            "skip_qemu_img": true,
+            "description": "Dynamic VHDX (1 MiB blocks) parent of vhdx-diff-child.vhdx. qemu-img stamps a fresh DataWriteGuid on every run and the child's parent_linkage metadata binds to that value, so this file is regenerated and shipped together with vhdx-diff-child.vhdx as a pair: shipping one without the other breaks the chain",
+            "tags": ["vhdx", "differencing", "differencing-chain", "format-coverage"],
+            "generated_by": "scripts/create-vhd-testdata.sh"
+        },
+        {
+            "id": "vhdx-diff-child",
+            "path": "custom/format-coverage/vhdx-diff-child.vhdx",
+            "format": "vhdx",
+            "safety": "safe",
+            "run_in_ci": false,
+            "skip_qemu_img": true,
+            "description": "Differencing VHDX child of vhdx-diff-parent.vhdx, exercising all three payload block states (PARTIALLY_PRESENT, FULLY_PRESENT, NOT_PRESENT). Its parent_linkage metadata binds to the parent's DataWriteGuid, which qemu-img regenerates on every run, so this file is regenerated and shipped together with vhdx-diff-parent.vhdx as a pair: shipping one without the other breaks the chain",
+            "tags": ["vhdx", "differencing", "differencing-chain", "format-coverage"],
+            "generated_by": "scripts/create-vhd-testdata.sh"
+        },
+        {
+            "id": "vhdx-diff-composed",
+            "path": "custom/format-coverage/vhdx-diff-composed.raw",
+            "format": "raw",
+            "safety": "safe",
+            "run_in_ci": false,
+            "skip_qemu_img": true,
+            "description": "Intended composition of vhdx-diff-parent.vhdx and vhdx-diff-child.vhdx, recorded so later phases compare against recorded intent rather than against whatever the oracle reports on the day",
+            "tags": ["vhdx", "differencing", "differencing-chain", "composed", "format-coverage"],
+            "generated_by": "scripts/create-vhd-testdata.sh"
+        },
+        {
             "id": "vmdk-multi-extent",
             "path": "custom/format-coverage/vmdk-multi-extent.vmdk",
             "format": "vmdk",
@@ -1300,6 +1388,72 @@
             "description": "VHDX with BAT entry pointing to offset past end of file",
             "tags": ["vhdx", "adversarial", "boundary-value", "bat-beyond-eof"],
             "generated_by": "instar-testdata/scripts/create-boundary-testdata.py"
+        },
+        {
+            "id": "vhd-diff-locator-etc-passwd",
+            "path": "custom/audit/vhd-diff-locator-etc-passwd.vhd",
+            "format": "vpc",
+            "safety": "malicious",
+            "run_in_ci": false,
+            "skip_qemu_img": true,
+            "description": "Structurally valid differencing VHD, identical to vhd-diff-child-aligned.vhd except that its parent unicode name and both parent locator entries name the absolute POSIX path /etc/passwd instead of the real parent. Exercises that a parent-locator reader must never open or resolve the path it is handed",
+            "tags": ["vhd", "differencing", "parent-locator-attack", "path-traversal"],
+            "generated_by": "scripts/create-vhd-testdata.sh"
+        },
+        {
+            "id": "vhd-diff-locator-dotdot",
+            "path": "custom/audit/vhd-diff-locator-dotdot.vhd",
+            "format": "vpc",
+            "safety": "malicious",
+            "run_in_ci": false,
+            "skip_qemu_img": true,
+            "description": "Structurally valid differencing VHD, identical to vhd-diff-child-aligned.vhd except that its parent unicode name and both parent locator entries name the relative traversal path ../../../etc/passwd instead of the real parent. Exercises that a parent-locator reader must not walk a relative path out of the directory holding the child",
+            "tags": ["vhd", "differencing", "parent-locator-attack", "path-traversal"],
+            "generated_by": "scripts/create-vhd-testdata.sh"
+        },
+        {
+            "id": "vhd-diff-locator-unc",
+            "path": "custom/audit/vhd-diff-locator-unc.vhd",
+            "format": "vpc",
+            "safety": "malicious",
+            "run_in_ci": false,
+            "skip_qemu_img": true,
+            "description": "Structurally valid differencing VHD, identical to vhd-diff-child-aligned.vhd except that its parent unicode name and both parent locator entries name the UNC path \\\\attacker\\share\\probe instead of the real parent. Exercises that a parent-locator reader must not turn a locator into a network fetch",
+            "tags": ["vhd", "differencing", "parent-locator-attack", "unc"],
+            "generated_by": "scripts/create-vhd-testdata.sh"
+        },
+        {
+            "id": "vhd-diff-locator-url",
+            "path": "custom/audit/vhd-diff-locator-url.vhd",
+            "format": "vpc",
+            "safety": "malicious",
+            "run_in_ci": false,
+            "skip_qemu_img": true,
+            "description": "Structurally valid differencing VHD, identical to vhd-diff-child-aligned.vhd except that its parent unicode name and both parent locator entries name the URL http://attacker.example/probe instead of the real parent. Exercises that a parent-locator reader must not hand the string to a URL fetcher any more than to open(2)",
+            "tags": ["vhd", "differencing", "parent-locator-attack", "url"],
+            "generated_by": "scripts/create-vhd-testdata.sh"
+        },
+        {
+            "id": "vhd-diff-locator-overlong",
+            "path": "custom/audit/vhd-diff-locator-overlong.vhd",
+            "format": "vpc",
+            "safety": "malicious",
+            "run_in_ci": false,
+            "skip_qemu_img": true,
+            "description": "Structurally valid differencing VHD, identical to vhd-diff-child-aligned.vhd except that its parent unicode name fills the entire 512-byte field at offset 576 with no NUL terminator (256 UTF-16 code units), and its locator entries carry the same over-long path. Exercises that a reader must stop at the field boundary rather than scanning past it for a terminator. This image also trips libvhdi defect C (docs/plans/PLAN-differencing-phase-01-pin.md): vhdiinfo over-reads two bytes past the unterminated name into the following locator table and reports a 257th character, so a content-exact assertion of the parent filename against libvhdi must account for that stray character",
+            "tags": ["vhd", "differencing", "parent-locator-attack", "overlong", "libvhdi-defect-c"],
+            "generated_by": "scripts/create-vhd-testdata.sh"
+        },
+        {
+            "id": "vhd-diff-locator-conflicting",
+            "path": "custom/audit/vhd-diff-locator-conflicting.vhd",
+            "format": "vpc",
+            "safety": "malicious",
+            "run_in_ci": false,
+            "skip_qemu_img": true,
+            "description": "Structurally valid differencing VHD, otherwise in the shape of vhd-diff-child-aligned.vhd, except that all eight parent locator entries are populated and mutually disagree with each other and with the parent unicode name (nine different candidate parents in total). SPEC(VHD) fixes no precedence between entries, so this exercises that a reader either selects by platform code rather than by slot order, or refuses a table where two entries share a platform code and disagree, rather than silently picking one",
+            "tags": ["vhd", "differencing", "parent-locator-attack", "conflicting-locators"],
+            "generated_by": "scripts/create-vhd-testdata.sh"
         },
         {
             "id": "polyglot-qcow2-vmdk",
