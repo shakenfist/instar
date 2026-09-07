@@ -179,6 +179,25 @@ Maintainer-scoped token that `main` requires.
    intent rather than against whatever the oracle happens to say
    that day.
 
+8. **The reproducibility claim needs no qemu-version caveat,
+   because it is not qemu-version dependent.** The second review
+   round asked for one, reasoning that a VHD footer records a
+   creator application and creator version and that
+   `vhd-fixed.vhd` and `vhd-differencing.vhd` come from
+   `qemu-img`. Measured, neither premise holds. `vhd-fixed.vhd`
+   is not a `qemu-img` product at all: it is struct-packed in
+   this script with `creator_app` `imgo`. `vhd-differencing.vhd`
+   is, but qemu's creator fields are constants of its `vpc`
+   driver rather than its own version -- `qemu` and
+   `0x00050003` -- so the patch step's pinned timestamp and
+   unique id were the only two fields that ever needed pinning.
+   Regenerating on qemu 10.0.11 reproduces both files byte for
+   byte against a checkout the review reports was generated
+   under 7.2.22. The header comment now records that as a
+   measured fact instead, which is more useful than either
+   silence or a caveat that would send a future reader looking
+   for a qemu difference that is not there.
+
 The decision most likely to be argued with is 3. Two VHD chains
 where one would do is more fixtures to maintain, and the
 byte-aligned one is artificial — no real tool produces images
@@ -238,7 +257,9 @@ change when libvhdi is fixed, and nothing in it would say why.
   relative, UNC, URL and conflicting -- plus the over-long
   fixture added beyond priority 7, six in total, and each is a
   structurally valid differencing VHD that differs from the
-  happy-path child only in its locator paths.
+  happy-path child only in its locator paths, its parent unicode
+  name, its own child unique id and the two checksums those
+  force.
 * Those six are written to `custom/audit/`, which is where
   `tests/manifest.json` and `docs/testing.md` say they live, and
   the generator puts them there rather than in the
@@ -251,13 +272,39 @@ change when libvhdi is fixed, and nothing in it would say why.
   non-reproducible outputs -- the VHDX pair -- are skipped
   unless `REGEN_VHDX=1` is passed. Re-running the script against
   the testdata checkout and finding `git status` clean is
-  therefore the check, and it needs no new flag.
+  therefore the check, and it needs no new flag. A one-argument
+  run stays entirely inside the directory it is given -- the
+  audit directory defaults to `<output-dir>/audit` rather than
+  independently of the output directory -- so a scratch dry-run
+  cannot write the adversarial six into the real checkout.
+
+  On the skip path the composed `.raw` is still written, but
+  from the shipped bytes: the block size, payload block states,
+  sector bitmap and written sectors are read back out of the
+  committed VHDX pair and asserted against the constants before
+  the composition is built. Without that, a skipped run derived
+  the composition entirely from constants nothing had checked,
+  and `vhdx_composition`'s block-size assert compared
+  `VHDX_BLOCK_SIZE` with itself.
 * `git lfs ls-files` in `instar-testdata` lists every new binary;
   no new file is a bare blob or a 131-byte pointer.
 * Every new fixture is in `tests/manifest.json` with
   `run_in_ci: false`, with `skip_qemu_img: true` on the nine
   differencing children only, and with a `sha256` so
-  `tests/base.py`'s drift check is live for all fourteen.
+  `tests/base.py`'s drift check is live for all fourteen. The two
+  pre-existing fixtures the footer pinning was done for,
+  `vhd-fixed` and `vhd-differencing`, now carry a `sha256` too:
+  they are the only two with live CI consumers, so they are the
+  two where the drift check can fire today. Adding a hash leaves
+  those entries otherwise untouched, which decision 2 requires.
+
+* The three composed `.raw` images carry
+  `unsafe_quirks_required: true`. They have no partition table --
+  sector 0 is a live `PARENT` marker in all three chains, so
+  stamping an MBR signature there would falsify the composition
+  -- and without the flag instar's secure default rejects them as
+  unknown format, which would have surfaced as a phase 8 failure
+  at the point `run_in_ci` is flipped.
 * `tests/test_check_formats.py` still passes unchanged, proving
   the existing fixture was not disturbed.
 * `git diff --name-only develop...HEAD -- src/` is empty.

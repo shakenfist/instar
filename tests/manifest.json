@@ -201,6 +201,7 @@
             "safety": "safe",
             "run_in_ci": false,
             "skip_qemu_img": true,
+            "sha256": "e68fd08d8bfebb65556410cb5710f8b285cfb8b357e2ddb37577e35a4d4e886e",
             "description": "Differencing VHD (disk_type=4) patched from dynamic for type acceptance testing",
             "tags": ["vhd", "differencing", "format-coverage"],
             "generated_by": "scripts/create-vhd-testdata.sh"
@@ -246,9 +247,10 @@
             "format": "raw",
             "safety": "safe",
             "run_in_ci": false,
+            "unsafe_quirks_required": true,
             "sha256": "b0c615abedf4885669a2f16a6010009d8d3dac89ecd11358efd2691d4e09ec40",
             "description": "Intended composition of vhd-diff-parent.vhd and vhd-diff-child-aligned.vhd, recorded so later phases compare against recorded intent rather than against whatever the oracle reports on the day",
-            "tags": ["vhd", "differencing", "differencing-chain", "composed", "format-coverage"],
+            "tags": ["vhd", "differencing", "differencing-chain", "composed", "no-partition-table", "format-coverage"],
             "generated_by": "scripts/create-vhd-testdata.sh"
         },
         {
@@ -257,9 +259,10 @@
             "format": "raw",
             "safety": "safe",
             "run_in_ci": false,
+            "unsafe_quirks_required": true,
             "sha256": "1b0f03dbe721288ad9edae3eb17add6f8f8812d6fe8efa1cd48c6fd9415536c0",
             "description": "Intended composition of vhd-diff-parent.vhd and vhd-diff-child-mixed.vhd, recorded so later phases compare against recorded intent rather than against whatever the oracle reports on the day. libvhdi's own composition of this chain diverges from this file at sector 2 because of the sector-bitmap decoder defect described on vhd-diff-child-mixed.vhd (docs/plans/PLAN-differencing-phase-01-pin.md, defect A); that divergence is expected and is not an instar regression",
-            "tags": ["vhd", "differencing", "differencing-chain", "composed", "format-coverage"],
+            "tags": ["vhd", "differencing", "differencing-chain", "composed", "no-partition-table", "format-coverage"],
             "generated_by": "scripts/create-vhd-testdata.sh"
         },
         {
@@ -291,9 +294,10 @@
             "format": "raw",
             "safety": "safe",
             "run_in_ci": false,
+            "unsafe_quirks_required": true,
             "sha256": "a126bdd6e44c12cae5dd4845ddf62267b2cc81ba832a2ecd60a28526a5efcacc",
             "description": "Intended composition of vhdx-diff-parent.vhdx and vhdx-diff-child.vhdx, recorded so later phases compare against recorded intent rather than against whatever the oracle reports on the day",
-            "tags": ["vhdx", "differencing", "differencing-chain", "composed", "format-coverage"],
+            "tags": ["vhdx", "differencing", "differencing-chain", "composed", "no-partition-table", "format-coverage"],
             "generated_by": "scripts/create-vhd-testdata.sh"
         },
         {
@@ -378,6 +382,7 @@
             "safety": "safe",
             "run_in_ci": false,
             "skip_qemu_img": true,
+            "sha256": "60fd267e9633e32a5a992367b21f2c377fb534b05063812454d2a2a66e48bd1b",
             "description": "Fixed VHD (disk_type=2) with MBR signature and 0xBE pattern at 1 MiB",
             "tags": ["vhd", "fixed"],
             "generated_by": "scripts/create-vhd-testdata.sh"
@@ -1400,7 +1405,7 @@
             "run_in_ci": false,
             "skip_qemu_img": true,
             "sha256": "5201a62a6f9299816218ee446f280cdaa3248c8007631cdf23b198b41b5b4788",
-            "description": "Structurally valid differencing VHD, identical to vhd-diff-child-aligned.vhd except that its parent unicode name and both parent locator entries name the absolute POSIX path /etc/passwd instead of the real parent. Exercises that a parent-locator reader must never open or resolve the path it is handed",
+            "description": "Structurally valid differencing VHD, in the shape of vhd-diff-child-aligned.vhd and differing from it only in its own child unique id, the two checksums that forces, and its parent unicode name and both parent locator entries, which name the absolute POSIX path /etc/passwd instead of the real parent. Exercises that a parent-locator reader must never open or resolve the path it is handed",
             "tags": ["vhd", "differencing", "parent-locator-attack", "path-traversal"],
             "generated_by": "scripts/create-vhd-testdata.sh"
         },
@@ -1412,7 +1417,7 @@
             "run_in_ci": false,
             "skip_qemu_img": true,
             "sha256": "1df03424fd5ddc01320653c2306e189739854e4b715300d119f8ca88b7e35416",
-            "description": "Structurally valid differencing VHD, identical to vhd-diff-child-aligned.vhd except that its parent unicode name and both parent locator entries name the relative traversal path ../../../etc/passwd instead of the real parent. Exercises that a parent-locator reader must not walk a relative path out of the directory holding the child",
+            "description": "Structurally valid differencing VHD, in the shape of vhd-diff-child-aligned.vhd and differing from it only in its own child unique id, the two checksums that forces, and its parent unicode name and both parent locator entries, which name the relative traversal path ../../../etc/passwd instead of the real parent. Exercises that a parent-locator reader must not walk a relative path out of the directory holding the child",
             "tags": ["vhd", "differencing", "parent-locator-attack", "path-traversal"],
             "generated_by": "scripts/create-vhd-testdata.sh"
         },
@@ -1424,7 +1429,7 @@
             "run_in_ci": false,
             "skip_qemu_img": true,
             "sha256": "dde14e14b2a56fa88d19a883d16c4ece0be52d7c094737e0ebec6c95e699cdb4",
-            "description": "Structurally valid differencing VHD, identical to vhd-diff-child-aligned.vhd except that its parent unicode name and both parent locator entries name the UNC path \\\\attacker\\share\\probe instead of the real parent. Exercises that a parent-locator reader must not turn a locator into a network fetch",
+            "description": "Structurally valid differencing VHD, in the shape of vhd-diff-child-aligned.vhd and differing from it only in its own child unique id, the two checksums that forces, and its parent unicode name and both parent locator entries, which name the UNC path \\\\attacker\\share\\probe instead of the real parent. Exercises that a parent-locator reader must not turn a locator into a network fetch",
             "tags": ["vhd", "differencing", "parent-locator-attack", "unc"],
             "generated_by": "scripts/create-vhd-testdata.sh"
         },
@@ -1436,7 +1441,7 @@
             "run_in_ci": false,
             "skip_qemu_img": true,
             "sha256": "b7a37fbc5ccb8b2acad674be73c44ad1e7788812788754b33cfdaafb1a9eb2c7",
-            "description": "Structurally valid differencing VHD, identical to vhd-diff-child-aligned.vhd except that its parent unicode name and both parent locator entries name the URL http://attacker.example/probe instead of the real parent. Exercises that a parent-locator reader must not hand the string to a URL fetcher any more than to open(2)",
+            "description": "Structurally valid differencing VHD, in the shape of vhd-diff-child-aligned.vhd and differing from it only in its own child unique id, the two checksums that forces, and its parent unicode name and both parent locator entries, which name the URL http://attacker.example/probe instead of the real parent. Exercises that a parent-locator reader must not hand the string to a URL fetcher any more than to open(2)",
             "tags": ["vhd", "differencing", "parent-locator-attack", "url"],
             "generated_by": "scripts/create-vhd-testdata.sh"
         },
@@ -1448,7 +1453,7 @@
             "run_in_ci": false,
             "skip_qemu_img": true,
             "sha256": "0b4c0ca0428873d7587bd09c0ac18e51b39ad4266a1e7145b17b001b5326fd3f",
-            "description": "Structurally valid differencing VHD, identical to vhd-diff-child-aligned.vhd except that its parent unicode name fills the entire 512-byte field at offset 576 with no NUL terminator (256 UTF-16 code units), and its locator entries carry the same over-long path. Exercises that a reader must stop at the field boundary rather than scanning past it for a terminator. This image also trips libvhdi defect C (docs/plans/PLAN-differencing-phase-01-pin.md): vhdiinfo over-reads two bytes past the unterminated name into the following locator table and reports a 257th character, so a content-exact assertion of the parent filename against libvhdi must account for that stray character",
+            "description": "Structurally valid differencing VHD, in the shape of vhd-diff-child-aligned.vhd and differing from it only in its own child unique id, the two checksums that forces, and its parent unicode name, which fills the entire 512-byte field at offset 576 with no NUL terminator (256 UTF-16 code units), and its locator entries carry the same over-long path. Exercises that a reader must stop at the field boundary rather than scanning past it for a terminator. This image also trips libvhdi defect C (docs/plans/PLAN-differencing-phase-01-pin.md): vhdiinfo over-reads two bytes past the unterminated name into the following locator table and reports a 257th character, so a content-exact assertion of the parent filename against libvhdi must account for that stray character",
             "tags": ["vhd", "differencing", "parent-locator-attack", "overlong", "libvhdi-defect-c"],
             "generated_by": "scripts/create-vhd-testdata.sh"
         },
@@ -1459,8 +1464,8 @@
             "safety": "malicious",
             "run_in_ci": false,
             "skip_qemu_img": true,
-            "sha256": "5588bd8098c5652e3180930dd92e5ee9af9a1ea962e85eed3b793091c8b626ed",
-            "description": "Structurally valid differencing VHD, otherwise in the shape of vhd-diff-child-aligned.vhd, except that all eight parent locator entries are populated and mutually disagree with each other and with the parent unicode name (nine different candidate parents in total). SPEC(VHD) fixes no precedence between entries, so this exercises that a reader either selects by platform code rather than by slot order, or refuses a table where two entries share a platform code and disagree, rather than silently picking one. It is also the only fixture carrying non-Windows platform codes, and each blob is encoded as its code requires rather than uniformly: the W2ru/W2ku/Wi2r/Wi2k entries are UTF-16LE paths, the MacX entry is a UTF-8 file:// URL, and the 'Mac ' entry is an opaque binary blob that is deliberately not valid text in any encoding, so a reader that decodes every locator the same way is caught here",
+            "sha256": "7e7dfc6d730d968bd69314d28995ce61dd3fc81c9cda657c0b435208fdb15225",
+            "description": "Structurally valid differencing VHD, otherwise in the shape of vhd-diff-child-aligned.vhd, except that all eight parent locator entries are populated and mutually disagree with each other and with the parent unicode name (nine different candidate parents in total). SPEC(VHD) fixes no precedence between entries, so this exercises that a reader either selects by platform code rather than by slot order, or refuses a table where two entries share a platform code and disagree, rather than silently picking one. It is also the only fixture carrying non-Windows platform codes, and each blob is encoded as its code requires rather than uniformly: the W2ru/W2ku/Wi2r/Wi2k entries are UTF-16LE paths, the MacX entry is a UTF-8 file:// URL, and the 'Mac ' entry is an opaque binary blob that decodes as none of UTF-8, UTF-16LE or UTF-16BE, so a reader that decodes every locator the same way is caught here whichever of the three it reaches for. It leads with an unpaired surrogate read either byte order round and has an odd byte length, so a strict decode raises on the surrogate or, failing that, on the truncated final code unit",
             "tags": ["vhd", "differencing", "parent-locator-attack", "conflicting-locators"],
             "generated_by": "scripts/create-vhd-testdata.sh"
         },

@@ -11,6 +11,14 @@
 # which is where tests/manifest.json and docs/testing.md say they live; every
 # other file goes to the output directory.
 #
+# Given one argument the audit directory becomes <output-dir>/audit, so a
+# scratch run writes everything it produces under the directory it was given
+# and never touches the real testdata checkout.  Compare such a run against
+# the committed tree with:
+#
+#   diff -r --brief scratch ../instar-testdata/custom/format-coverage
+#   diff -r --brief scratch/audit ../instar-testdata/custom/audit
+#
 # Creates:
 #   vhd-fixed.vhd         - 10 MiB fixed VHD (disk_type=2)
 #   vhd-differencing.vhd  - Differencing VHD (disk_type=4), a type marker with
@@ -62,6 +70,15 @@
 # the parent DataWriteGuid, so a child paired with a differently generated
 # parent will not resolve.
 #
+# That includes vhd-differencing.vhd, the one VHD here qemu-img creates, and
+# it holds across qemu versions rather than only within one. A VHD footer does
+# record a creator application and creator version, but qemu's are constants
+# of its vpc driver and not the qemu version: it writes 'qemu' and 0x00050003
+# on every build measured (7.2.22 and 10.0.11), so the patch step's pinned
+# timestamp and unique id are the only two fields that needed pinning.
+# vhd-fixed.vhd is not a qemu-img product at all -- it is struct packed below
+# with creator_app 'imgo' -- so it does not depend on qemu either.
+#
 # Because they are not reproducible, the VHDX pair is OPT IN: it is skipped
 # when both files already exist, so a run made to prove the VHD half is
 # idempotent does not replace 24 MiB of committed LFS objects with
@@ -81,8 +98,23 @@
 
 set -euo pipefail
 
+# The audit directory defaults WITH the output directory, not independently
+# of it.  A one-argument run is the scratch dry-run the reproducibility check
+# prescribes, and it must not send the twelve format-coverage files to the
+# scratch tree while still writing the six adversarial ones into the real
+# testdata checkout: the moment a constant in VHD_ADVERSARIAL_FIXTURES
+# changes, that would rewrite six committed LFS objects from a run nobody
+# intended to be authoritative.  So: no arguments means both real
+# destinations, one argument puts everything under that one tree, and two
+# name both explicitly.
 OUTDIR="${1:-../instar-testdata/custom/format-coverage}"
-AUDITDIR="${2:-../instar-testdata/custom/audit}"
+if [ "$#" -ge 2 ]; then
+    AUDITDIR="$2"
+elif [ "$#" -eq 1 ]; then
+    AUDITDIR="$OUTDIR/audit"
+else
+    AUDITDIR="../instar-testdata/custom/audit"
+fi
 mkdir -p "$OUTDIR" "$AUDITDIR"
 
 echo "Creating VHD test images in $OUTDIR..."
@@ -607,15 +639,32 @@ def vhd_locator_platform_data(platform_code, text):
         and not text in any encoding.
 
     The 'Mac ' blob below is a deliberate stand-in rather than a synthesised
-    alias record: it starts with bytes that decode as neither UTF-8 nor
-    UTF-16 so that a parser treating this field as a path is caught here,
-    and it carries the fixture's name in ASCII afterwards only so a human
-    reading a hex dump can tell which entry it is.
+    alias record: it decodes as none of UTF-8, UTF-16LE or UTF-16BE, so a
+    parser treating this field as a path is caught here whichever of the
+    three it reaches for.  It carries the fixture's name in ASCII afterwards
+    only so a human reading a hex dump can tell which entry it is.
+
+    Two independent things make it undecodable, because getting only UTF-8 to
+    fail would leave the likeliest wrong implementation -- a reader that
+    UTF-16 decodes every locator uniformly, since the rest of the VHD locator
+    family is UTF-16 -- sailing straight past the fixture with mojibake:
+
+      * The leading 00 d8 d8 00 is an unpaired surrogate read either way
+        round.  Little endian it is U+D800 followed by U+00D8, big endian it
+        is U+00D8 followed by U+D800 followed by U+0096; neither high
+        surrogate is followed by a low one, so a strict decode raises.
+      * The blob has an odd byte length, so even a decoder that tolerated the
+        surrogate runs out of bytes mid code unit at the end.
+
+    The bytes between are the same 00 96 00 02 as before, and 0xd8 is not a
+    valid UTF-8 continuation byte after 0x00 either, so UTF-8 still refuses
+    it at the second byte.
     """
     if platform_code == b"MacX":
         return text.encode("utf-8")
     if platform_code == b"Mac ":
-        return b"\x00\x00\x00\x00\x00\x96\x00\x02" + text.encode("ascii")
+        return (b"\x00\xd8\xd8\x00\x00\x96\x00\x02"
+                + text.encode("ascii") + b"\x00")
     return text.encode("utf-16-le")
 
 
@@ -808,8 +857,19 @@ METADATA_FLAGS_PARENT_LOCATOR = (METADATA_FLAG_IS_VIRTUAL_DISK
 
 
 def qemu_img(*args):
-    subprocess.run(["qemu-img"] + list(args), check=True,
-                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    # Captured rather than inherited so a successful run stays quiet, but
+    # re-raised with the output attached: CalledProcessError stringifies to
+    # the return code and argv alone, and the message that actually matters
+    # here ("Parameter \'block_size\' expects ...", a permissions error) is in
+    # the output.  This is the one subprocess in the script and the one place
+    # a regeneration on a different qemu build is likely to fail.
+    proc = subprocess.run(["qemu-img"] + list(args),
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if proc.returncode != 0:
+        raise SystemExit("qemu-img %s failed with status %d:\n%s"
+                         % (" ".join(args), proc.returncode,
+                            proc.stdout.decode("utf-8", "replace").rstrip()))
+    return proc.stdout
 
 
 def vhdx_regions(data):
@@ -1011,12 +1071,135 @@ def vhdx_composition(block_size):
     return bytes(data)
 
 
+def vhdx_read_shape(path):
+    """Read a VHDX back and describe the chain it actually implements.
+
+    Returns the block size and HasParent bit from the file parameters item,
+    the payload block states from the BAT, the sector numbers whose payload
+    bytes are non-zero, and -- when any block is partially present -- the
+    sector numbers the chunk sector bitmap claims for this file.
+    """
+    with open(path, "rb") as fh:
+        data = fh.read()
+    regions = vhdx_regions(data)
+    meta_off, _meta_len = regions[REGION_METADATA]
+    bat_off, _bat_len = regions[REGION_BAT]
+    _count, items = vhdx_metadata_items(data, meta_off)
+    fp = [it for it in items if it[0] == META_FILE_PARAMETERS]
+    assert len(fp) == 1, "%s: expected one file parameters item" % path
+    _guid, ioff, _ilen, _flags, _eo = fp[0]
+    block_size, fp_flags = struct.unpack_from("<II", data, meta_off + ioff)
+
+    spb = block_size // SECTOR
+    nblocks = (IMAGE_SIZE + block_size - 1) // block_size
+    chunk_ratio = (0x800000 * SECTOR) // block_size
+    assert nblocks <= chunk_ratio, (
+        "%s: flat BAT indexing needs every block in chunk 0" % path)
+
+    # Only states 6 and 7 carry a file offset.  qemu-img marks an all-zero
+    # payload block PAYLOAD_BLOCK_ZERO (2), NOT PAYLOAD_BLOCK_NOT_PRESENT (0)
+    # -- reading a payload for anything else lands on offset 0, which is the
+    # file identifier and the two headers, and reports them as written data.
+    states = {}
+    written = []
+    for b in range(nblocks):
+        (entry,) = struct.unpack_from("<Q", data, bat_off + b * 8)
+        states[b] = entry & 0x7
+        if states[b] not in (VHDX_BAT_FULLY_PRESENT,
+                             VHDX_BAT_PARTIALLY_PRESENT):
+            continue
+        base = ((entry >> 20) & 0xFFFFFFFFFFF) * 1024 * 1024
+        for i in range(spb):
+            off = base + i * SECTOR
+            if any(data[off:off + SECTOR]):
+                written.append(b * spb + i)
+
+    claimed = None
+    if VHDX_BAT_PARTIALLY_PRESENT in states.values():
+        (entry,) = struct.unpack_from("<Q", data, bat_off + chunk_ratio * 8)
+        assert entry & 0x7 == VHDX_SB_PRESENT, (
+            "%s: a block is partially present but the chunk sector bitmap "
+            "is not" % path)
+        sb_off = ((entry >> 20) & 0xFFFFFFFFFFF) * 1024 * 1024
+        bitmap = data[sb_off:sb_off + 1024 * 1024]
+        claimed = [n for n in range(IMAGE_SECTORS)
+                   if bitmap[n // 8] >> (n % 8) & 1]
+
+    return {
+        "block_size": block_size,
+        "has_parent": bool(fp_flags & 0x2),
+        "states": states,
+        "written": written,
+        "claimed": claimed,
+    }
+
+
+def vhdx_verify_shipped_pair(parent_path, child_path):
+    """Check the committed VHDX pair implements the chain the constants say.
+
+    The composed .raw is written on every run, including the runs that skip
+    regenerating the pair.  Without this, the skip path derives it entirely
+    from the constants above, nothing reads the two files it claims to
+    describe, and vhdx_composition's "qemu-img ignored the block size" assert
+    degenerates into comparing VHDX_BLOCK_SIZE with itself.  Edit one constant
+    and a default run then emits a composition of a chain the committed pair
+    does not implement -- visible in git status only to someone who reads the
+    diff rather than the exit status.
+
+    Measuring instead means the skip path asserts what the regenerating path
+    asserts, and the block size the composition uses comes off the disk.
+    Returns that measured block size.
+    """
+    child = vhdx_read_shape(child_path)
+    parent = vhdx_read_shape(parent_path)
+
+    def check(what, measured, expected):
+        if measured != expected:
+            raise SystemExit(
+                "The committed VHDX pair no longer matches the constants in "
+                "this script: %s is %r on disk, %r here.\n"
+                "Regenerate the pair with REGEN_VHDX=1 and commit both files, "
+                "or restore the constant." % (what, measured, expected))
+
+    check("the child block size", child["block_size"], VHDX_BLOCK_SIZE)
+    check("the parent block size", parent["block_size"], VHDX_BLOCK_SIZE)
+    check("the child HasParent bit", child["has_parent"], True)
+    check("the parent HasParent bit", parent["has_parent"], False)
+
+    partial = sorted(b for b, st in child["states"].items()
+                     if st == VHDX_BAT_PARTIALLY_PRESENT)
+    full = sorted(b for b, st in child["states"].items()
+                  if st == VHDX_BAT_FULLY_PRESENT)
+    check("the partially present block set", partial,
+          sorted(VHDX_CHILD_BLOCKS_PARTIAL))
+    check("the fully present block set", full, sorted(VHDX_CHILD_BLOCKS_FULL))
+
+    check("the child's written sectors", sorted(child["written"]),
+          sorted(VHDX_CHILD_SECTORS))
+    check("the parent's written sectors", sorted(parent["written"]),
+          sorted(VHDX_PARENT_SECTORS))
+
+    # The sector bitmap only governs partially present blocks; sectors in a
+    # fully present block come from the child whatever the bitmap says.
+    spb = child["block_size"] // SECTOR
+    expect_claimed = sorted(n for n in VHDX_CHILD_SECTORS
+                            if n // spb in set(VHDX_CHILD_BLOCKS_PARTIAL))
+    check("the sectors the chunk sector bitmap claims",
+          sorted(child["claimed"] or []), expect_claimed)
+
+    return child["block_size"]
+
+
 # --- driver -----------------------------------------------------------------
 
 def main():
     outdir = os.path.abspath(sys.argv[1])
     auditdir = os.path.abspath(sys.argv[2])
-    regen_vhdx = sys.argv[3] not in ("", "0")
+    # Falsey spellings are honoured: REGEN_VHDX=false meaning "yes, please
+    # rewrite 24 MiB of committed LFS objects" is the opposite of what the
+    # operator typed, and the fix costs one tuple.
+    regen_vhdx = sys.argv[3].strip().lower() not in (
+        "", "0", "false", "no", "off")
     written = []
     audited = []
 
@@ -1077,10 +1260,11 @@ def main():
         print("  Skipping the VHDX pair: both files exist and they are not "
               "byte-reproducible.  Pass REGEN_VHDX=1 to rebuild them.")
         # The composed .raw is reproducible even though the pair is not, so it
-        # is still written: it is derived from the block size this script asks
-        # qemu-img for, which the assert in vhdx_composition checks was
-        # honoured when the pair was generated.
-        block_size = VHDX_BLOCK_SIZE
+        # is still written -- but from the shipped bytes, not from the
+        # constants alone.  See vhdx_verify_shipped_pair for why.
+        block_size = vhdx_verify_shipped_pair(p("vhdx-diff-parent.vhdx"),
+                                              p("vhdx-diff-child.vhdx"))
+        print("  Verified the committed VHDX pair against the constants.")
     else:
         block_size = write_vhdx_pair(p, written)
 
