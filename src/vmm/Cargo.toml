@@ -35,7 +35,7 @@ bench = { path = "../crates/bench" }
 vhd = { path = "../crates/vhd" }
 vhdx = { path = "../crates/vhdx" }
 toml = "1.0"
-dirs = "6.0"
+dirs = "7.0"
 serde = { version = "1.0", features = ["derive"] }
 rand = "0.10"
 
