@@ -12,8 +12,8 @@
 #![allow(clippy::too_many_arguments)]
 
 use shared::{
-    le_u16, le_u32, le_u64, write_le_u16, write_le_u32, write_le_u64, AllocationSummary, CallTable,
-    MapExtent, MapExtentCoalescer, MapExtentState, MAX_SECTOR_SIZE,
+    le_u16, le_u32, le_u64, utf16_to_utf8, write_le_u16, write_le_u32, write_le_u64,
+    AllocationSummary, CallTable, MapExtent, MapExtentCoalescer, MapExtentState, MAX_SECTOR_SIZE,
 };
 
 // ============================================================================
@@ -337,6 +337,533 @@ pub fn parse_region_table(buf: &[u8]) -> Option<([VhdxRegionEntry; 2], u32)> {
 }
 
 // ============================================================================
+// VHDX parent locator metadata item
+// ============================================================================
+//
+// The layout parsed here is pinned, offset by offset, in
+// `docs/plans/PLAN-differencing-phase-01-pin.md` under "VHDX — the
+// parent locator metadata item", against `xxd` of real Hyper-V
+// images. That section is the authority; nothing here rediscovers it.
+//
+// Item layout (SPEC(VHDX) 2.6.2.6.1 and 2.6.2.6.2), all offsets
+// relative to the start of the metadata item:
+//
+//   +0   LocatorType     16 bytes, GUID in mixed-endian bytes_le form
+//   +16  Reserved         2 bytes, LE u16, MUST be 0
+//   +18  KeyValueCount    2 bytes, LE u16
+//   +20  entries          12 bytes each:
+//          +0  KeyOffset    LE u32, relative to the item start
+//          +4  ValueOffset  LE u32, relative to the item start
+//          +8  KeyLength    LE u16, bytes
+//          +10 ValueLength  LE u16, bytes
+//
+// Keys and values are UTF-16 **little** endian, so every call to
+// `utf16_to_utf8` below passes `big_endian = false`. (The VHD parent
+// name is UTF-16 big endian; that asymmetry is real and is why the
+// endianness is named at each call site.)
+
+/// Parent locator type GUID: B04AEFB7-D19E-4A81-B789-25B8E9445913.
+///
+/// SPEC(VHDX) 2.6.2.6.3 defines exactly one parent locator type and
+/// this is it. Stored, like every VHDX GUID, in mixed-endian
+/// "bytes_le" form: first three groups little-endian, last two big.
+pub const VHDX_PARENT_LOCATOR_TYPE_GUID: [u8; 16] = [
+    0xB7, 0xEF, 0x4A, 0xB0, 0x9E, 0xD1, 0x81, 0x4A, 0xB7, 0x89, 0x25, 0xB8, 0xE9, 0x44, 0x59, 0x13,
+];
+
+/// Bytes of parent locator header: type GUID, reserved, key/value count.
+pub const PARENT_LOCATOR_HEADER_SIZE: usize = 20;
+
+/// Bytes of one parent locator key/value entry.
+pub const PARENT_LOCATOR_ENTRY_SIZE: usize = 12;
+
+/// Key/value entries retained from one parent locator item.
+///
+/// **A parser resource bound, not a spec limit.** SPEC(VHDX) 2.6.2.6.1
+/// stores `KeyValueCount` as a u16 and sets no upper bound at all.
+/// Hyper-V writes five entries (`parent_linkage`,
+/// `absolute_win32_path`, `relative_path`, `volume_path`,
+/// `parent_linkage2`) and instar writes two, so this clears real images
+/// with room to spare. An item claiming more is parsed up to the limit
+/// and the locator is marked `EntryCountExceedsCapacity` rather than
+/// dropped, so a later phase knows entries went unread and can say so.
+pub const MAX_PARENT_LOCATOR_ENTRIES: usize = 8;
+
+/// Longest key, in UTF-16 source bytes, that is decoded: 32 code units.
+///
+/// **A parser resource bound, not a spec limit.** SPEC(VHDX) 2.6.2.6.2
+/// stores `KeyLength` as a u16 and constrains it no further. The
+/// longest key any known producer writes is `absolute_win32_path`, 19
+/// characters. A longer key is marked `KeyTooLong` with its raw offset
+/// and length intact.
+pub const MAX_PARENT_LOCATOR_KEY_UTF16: usize = 64;
+
+/// Longest value, in UTF-16 source bytes, that is decoded: 260 code
+/// units, Windows `MAX_PATH`.
+///
+/// **A parser resource bound, not a spec limit.** SPEC(VHDX) 2.6.2.6.2
+/// stores `ValueLength` as a u16 and fixes no path length, and a
+/// Windows extended-length path — one prefixed `\\?\` — may legitimately
+/// run to tens of thousands of characters. Such a value is marked
+/// `ValueTooLong` here, so a phase reading that defect must treat it as
+/// possibly *our* bound rather than evidence of a hostile image. The
+/// entry keeps its raw `value_offset` and `value_length`, which is
+/// what a later phase would need to re-read it into a bigger buffer.
+/// The longest measured Hyper-V value is an 88-character `volume_path`.
+pub const MAX_PARENT_LOCATOR_VALUE_UTF16: usize = 520;
+
+/// Buffer for a decoded key.
+///
+/// One UTF-16 code unit (2 source bytes) encodes to at most 3 UTF-8
+/// bytes, and a surrogate pair (4 source bytes) to exactly 4, so UTF-8
+/// output is never more than 3/2 of the UTF-16 input. A key within
+/// `MAX_PARENT_LOCATOR_KEY_UTF16` therefore always fits here, and
+/// `utf16_to_utf8` can only refuse it for being ill-formed.
+pub const MAX_PARENT_LOCATOR_KEY_UTF8: usize = MAX_PARENT_LOCATOR_KEY_UTF16 * 3 / 2;
+
+/// Buffer for a decoded value. See `MAX_PARENT_LOCATOR_KEY_UTF8` for
+/// why 3/2 of the UTF-16 cap is always enough.
+pub const MAX_PARENT_LOCATOR_VALUE_UTF8: usize = MAX_PARENT_LOCATOR_VALUE_UTF16 * 3 / 2;
+
+/// Largest parent locator item `parse_metadata` will stage into memory.
+///
+/// **A parser resource bound, not a spec limit.** The measured Hyper-V
+/// item is 674 bytes in total and instar's will be smaller, so this
+/// clears real images with room. A larger item is not parsed at all —
+/// rather than truncated, because a truncated item would report
+/// in-item offsets as out of bounds and invent defects the image does
+/// not have. The refusal is recorded as
+/// `VhdxParentLocatorState::NotStaged`, carrying the item's declared
+/// offset and length, so that "we declined to stage it" stays
+/// distinguishable from "there is no locator item".
+pub const MAX_PARENT_LOCATOR_ITEM: usize = 4096;
+
+/// The keys instar cares about, per
+/// `PLAN-differencing-phase-01-pin.md`, "VHDX — which keys instar
+/// should write".
+///
+/// `parent_linkage` is required by SPEC(VHDX) 2.6.2.6.3 and is the
+/// parent's `DataWriteGuid` rendered as a braced GUID string. At least
+/// one of the three path keys must be present.
+pub const KEY_PARENT_LINKAGE: &[u8] = b"parent_linkage";
+/// Path relative to the differencing child.
+pub const KEY_RELATIVE_PATH: &[u8] = b"relative_path";
+/// Path via a Windows volume GUID. instar never writes this one.
+pub const KEY_VOLUME_PATH: &[u8] = b"volume_path";
+/// Absolute Windows path. Note that Hyper-V's own value lacks the
+/// `\\?\` prefix SPEC(VHDX) requires, so a parser must not reject a
+/// value for missing it (pin, "Which keys Hyper-V writes").
+pub const KEY_ABSOLUTE_WIN32_PATH: &[u8] = b"absolute_win32_path";
+
+/// Why a parent locator item that the metadata table *does* list was
+/// not staged into memory and parsed.
+///
+/// Each of these is a property of the surrounding image or of a parser
+/// resource bound, not of the locator's contents, which is why they are
+/// separate from `VhdxParentLocatorDefect`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum VhdxParentLocatorNotStaged {
+    /// The declared length is below `PARENT_LOCATOR_HEADER_SIZE`, so
+    /// the item cannot even hold its own header.
+    ItemTooShort,
+    /// The declared length exceeds `MAX_PARENT_LOCATOR_ITEM`, a parser
+    /// resource bound rather than a spec limit.
+    ItemExceedsParserBound,
+    /// The item's file offset is outside the input, or the offset
+    /// arithmetic overflowed.
+    ItemOutsideInput,
+    /// The input device refused a sector read, or the sector size is
+    /// unusable.
+    ReadFailed,
+}
+
+/// What `parse_metadata` found where a parent locator item would be.
+///
+/// Three states rather than an `Option`, because "the metadata table
+/// lists no parent locator item" and "it lists one that we declined to
+/// stage" mean different things to a later phase: the first says the
+/// image is structurally broken if it also claims a parent, the second
+/// says instar hit its own limit and should say so differently. The
+/// declined case keeps the item's declared offset and length, which are
+/// the facts that explain the decision (decision 4 of
+/// `docs/plans/PLAN-differencing-phase-03-parse.md`, applied at the
+/// item level).
+//
+// The parsed variant is several KB and the others are a handful of
+// bytes, which is what `large_enum_variant` objects to. Its remedy —
+// boxing — is not available: this crate is `no_std` with no allocator,
+// and the large variant is the ordinary case for a differencing image.
+#[allow(clippy::large_enum_variant)]
+pub enum VhdxParentLocatorState {
+    /// The metadata table listed no parent locator item.
+    Absent,
+    /// The table listed one, and it was not staged. `item_offset` is
+    /// relative to the metadata region start, as the table stores it,
+    /// and `item_length` is the table's declared length.
+    NotStaged {
+        /// The metadata table entry's Offset field.
+        item_offset: u32,
+        /// The metadata table entry's Length field.
+        item_length: u32,
+        /// Why staging was declined.
+        reason: VhdxParentLocatorNotStaged,
+    },
+    /// The table listed one and it was parsed. Malformed contents are
+    /// marked inside the locator, not reported here.
+    Parsed(VhdxParentLocator),
+}
+
+impl VhdxParentLocatorState {
+    /// True only for `Absent`: the metadata table listed no item.
+    ///
+    /// Deliberately not true for `NotStaged`, which is the distinction
+    /// this type exists to make.
+    pub fn is_absent(&self) -> bool {
+        matches!(self, VhdxParentLocatorState::Absent)
+    }
+
+    /// The parsed locator, if there is one.
+    pub fn parsed(&self) -> Option<&VhdxParentLocator> {
+        match self {
+            VhdxParentLocatorState::Parsed(locator) => Some(locator),
+            _ => None,
+        }
+    }
+}
+
+/// The first structural problem found in a parent locator item or one
+/// of its entries.
+///
+/// A defect marks the offending entry; it never removes it. Phase 4
+/// has to be able to say *why* it is refusing an image, and a dropped
+/// entry is indistinguishable from an absent one (decision 4 of
+/// `docs/plans/PLAN-differencing-phase-03-parse.md`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum VhdxParentLocatorDefect {
+    /// `key_value_count` claims more entries than the item's bytes can
+    /// hold. Locator-level.
+    EntryCountExceedsItem,
+    /// `key_value_count` claims more entries than the parser retains.
+    /// Locator-level.
+    EntryCountExceedsCapacity,
+    /// `key_offset + key_length` overflows, or lands outside the item.
+    KeyOutOfBounds,
+    /// `value_offset + value_length` overflows, or lands outside the item.
+    ValueOutOfBounds,
+    /// The key is longer than `MAX_PARENT_LOCATOR_KEY_UTF16`.
+    KeyTooLong,
+    /// The value is longer than `MAX_PARENT_LOCATOR_VALUE_UTF16`, which
+    /// is a parser resource bound rather than a spec limit — a legitimate
+    /// Windows extended-length path can exceed it. The raw
+    /// `value_offset` and `value_length` are preserved for a caller that
+    /// wants to re-read it.
+    ValueTooLong,
+    /// The key is not well-formed UTF-16LE (odd length, or an unpaired
+    /// surrogate). `utf16_to_utf8` refuses rather than substituting
+    /// `U+FFFD`, so this is a refusal and not a mangled string.
+    KeyUndecodable,
+    /// The value is not well-formed UTF-16LE.
+    ValueUndecodable,
+    /// An earlier entry in the same item already used this key.
+    /// SPEC(VHDX) 2.6.2.6.2: "All keys must be unique."
+    DuplicateKey,
+}
+
+/// One key/value entry of a parent locator item.
+///
+/// The four raw fields are preserved exactly as they were read, for
+/// every entry, whether or not the entry is well formed — that is what
+/// lets a later phase report the entry it refused. `defect` records the
+/// first structural problem found, in this order: key bounds, key
+/// length, key decoding, value bounds, value length, value decoding,
+/// duplicate key. The key is resolved before the value is looked at, so
+/// that a malformed value still comes back attached to a named key.
+#[derive(Copy, Clone)]
+pub struct VhdxParentLocatorEntry {
+    /// Raw `KeyOffset`, relative to the start of the item.
+    pub key_offset: u32,
+    /// Raw `ValueOffset`, relative to the start of the item.
+    pub value_offset: u32,
+    /// Raw `KeyLength`, in bytes of UTF-16.
+    pub key_length: u16,
+    /// Raw `ValueLength`, in bytes of UTF-16.
+    pub value_length: u16,
+    /// The first structural problem found with this entry, if any.
+    pub defect: Option<VhdxParentLocatorDefect>,
+    key: [u8; MAX_PARENT_LOCATOR_KEY_UTF8],
+    key_len: usize,
+    value: [u8; MAX_PARENT_LOCATOR_VALUE_UTF8],
+    value_len: usize,
+}
+
+impl VhdxParentLocatorEntry {
+    fn new(key_offset: u32, value_offset: u32, key_length: u16, value_length: u16) -> Self {
+        VhdxParentLocatorEntry {
+            key_offset,
+            value_offset,
+            key_length,
+            value_length,
+            defect: None,
+            key: [0u8; MAX_PARENT_LOCATOR_KEY_UTF8],
+            key_len: 0,
+            value: [0u8; MAX_PARENT_LOCATOR_VALUE_UTF8],
+            value_len: 0,
+        }
+    }
+
+    /// The decoded key as UTF-8. Empty when the key could not be
+    /// decoded, in which case `defect` says why.
+    pub fn key(&self) -> &[u8] {
+        &self.key[..self.key_len]
+    }
+
+    /// The decoded value as UTF-8. Empty when the value could not be
+    /// decoded, or when decoding stopped at an earlier defect.
+    pub fn value(&self) -> &[u8] {
+        &self.value[..self.value_len]
+    }
+}
+
+/// A parsed parent locator metadata item.
+pub struct VhdxParentLocator {
+    /// The `LocatorType` GUID, bytes_le, exactly as stored. Compare it
+    /// with `is_vhdx_locator_type()`; a foreign type is reported rather
+    /// than refused, because what to do about it is policy.
+    pub locator_type: [u8; 16],
+    /// The reserved u16 at item offset +16. SPEC(VHDX) says it MUST be
+    /// zero; it is preserved rather than checked.
+    pub reserved: u16,
+    /// `KeyValueCount` as stored, which may exceed the number of
+    /// entries actually retained — compare with `entries().len()`.
+    pub key_value_count: u16,
+    /// The first item-level structural problem found, if any.
+    pub defect: Option<VhdxParentLocatorDefect>,
+    entries: [VhdxParentLocatorEntry; MAX_PARENT_LOCATOR_ENTRIES],
+    entry_count: usize,
+}
+
+impl VhdxParentLocator {
+    /// The entries retained, in the order the item lists them.
+    pub fn entries(&self) -> &[VhdxParentLocatorEntry] {
+        &self.entries[..self.entry_count]
+    }
+
+    /// True when `locator_type` is the one type SPEC(VHDX) defines.
+    pub fn is_vhdx_locator_type(&self) -> bool {
+        self.locator_type == VHDX_PARENT_LOCATOR_TYPE_GUID
+    }
+
+    /// The first entry whose decoded key matches `key` exactly.
+    ///
+    /// SPEC(VHDX) 2.6.2.6.2: "The key string is case sensitive", so
+    /// this comparison is too. Entries carrying a defect are returned
+    /// like any other; the caller inspects `defect`.
+    pub fn find(&self, key: &[u8]) -> Option<&VhdxParentLocatorEntry> {
+        self.entries().iter().find(|entry| entry.key() == key)
+    }
+
+    /// The value of a key, only when the entry carrying it is free of
+    /// defects.
+    pub fn value_of(&self, key: &[u8]) -> Option<&[u8]> {
+        let entry = self.find(key)?;
+        if entry.defect.is_some() {
+            return None;
+        }
+        Some(entry.value())
+    }
+
+    /// The `parent_linkage` value: the parent's `DataWriteGuid` as a
+    /// braced GUID string, e.g. `{f88d4d92-6fcc-408d-9bef-9b7c89f15c89}`.
+    ///
+    /// Returned exactly as the image spells it. Use `linkage_matches`
+    /// to compare it, never `==`: SPEC(VHDX) fixes no case, qemu and
+    /// libuuid render GUIDs lowercase and Hyper-V uppercases them.
+    pub fn parent_linkage(&self) -> Option<&[u8]> {
+        self.value_of(KEY_PARENT_LINKAGE)
+    }
+
+    /// The `relative_path` value, the path relative to the child.
+    pub fn relative_path(&self) -> Option<&[u8]> {
+        self.value_of(KEY_RELATIVE_PATH)
+    }
+
+    /// The `volume_path` value, a path via a Windows volume GUID.
+    pub fn volume_path(&self) -> Option<&[u8]> {
+        self.value_of(KEY_VOLUME_PATH)
+    }
+
+    /// The `absolute_win32_path` value.
+    pub fn absolute_win32_path(&self) -> Option<&[u8]> {
+        self.value_of(KEY_ABSOLUTE_WIN32_PATH)
+    }
+
+    /// Whether this item's `parent_linkage` names `expected`, compared
+    /// ASCII case-insensitively.
+    ///
+    /// Both operands are expected in the braced form SPEC(VHDX)
+    /// mandates; the braces are compared like any other character.
+    /// Case insensitivity is required because the case of a GUID string
+    /// is not fixed by the spec and differs between producers.
+    pub fn linkage_matches(&self, expected: &[u8]) -> bool {
+        match self.parent_linkage() {
+            Some(linkage) => linkage.eq_ignore_ascii_case(expected),
+            None => false,
+        }
+    }
+
+    fn note_defect(&mut self, defect: VhdxParentLocatorDefect) {
+        if self.defect.is_none() {
+            self.defect = Some(defect);
+        }
+    }
+}
+
+/// Decode one entry's key and value out of `item`, returning the first
+/// structural problem found, or `None` when the entry is well formed.
+///
+/// Every offset here comes from the image, so every one of them is
+/// summed with `checked_add` and compared against `item.len()` before
+/// it is used to index. A `u32` offset plus a `u16` length cannot
+/// actually wrap a 64-bit `usize`, so in practice it is the comparison
+/// that rejects a hostile entry — the `checked_add` is there so that
+/// the safety of the indexing does not rest on that reasoning.
+fn decode_entry_strings(
+    item: &[u8],
+    entry: &mut VhdxParentLocatorEntry,
+) -> Option<VhdxParentLocatorDefect> {
+    // The key is resolved first, so that an entry whose *value* is
+    // malformed still comes back knowing which key it belongs to —
+    // that is the difference between "this image's relative_path is
+    // out of bounds" and "something in this image is out of bounds".
+
+    // Key bounds.
+    let key_end = match (entry.key_offset as usize).checked_add(entry.key_length as usize) {
+        Some(end) if end <= item.len() => end,
+        _ => return Some(VhdxParentLocatorDefect::KeyOutOfBounds),
+    };
+
+    if entry.key_length as usize > MAX_PARENT_LOCATOR_KEY_UTF16 {
+        return Some(VhdxParentLocatorDefect::KeyTooLong);
+    }
+
+    // Safe: key_end <= item.len() was checked above, and key_offset
+    // <= key_end because key_end is their sum.
+    let key_src = &item[entry.key_offset as usize..key_end];
+    match utf16_to_utf8(key_src, false, &mut entry.key) {
+        Some(written) => entry.key_len = written,
+        None => return Some(VhdxParentLocatorDefect::KeyUndecodable),
+    }
+
+    // Value bounds, checked the same way.
+    let value_end = match (entry.value_offset as usize).checked_add(entry.value_length as usize) {
+        Some(end) if end <= item.len() => end,
+        _ => return Some(VhdxParentLocatorDefect::ValueOutOfBounds),
+    };
+
+    if entry.value_length as usize > MAX_PARENT_LOCATOR_VALUE_UTF16 {
+        return Some(VhdxParentLocatorDefect::ValueTooLong);
+    }
+
+    let value_src = &item[entry.value_offset as usize..value_end];
+    match utf16_to_utf8(value_src, false, &mut entry.value) {
+        Some(written) => entry.value_len = written,
+        None => return Some(VhdxParentLocatorDefect::ValueUndecodable),
+    }
+
+    None
+}
+
+/// Parse a parent locator metadata item from its bytes.
+///
+/// `item` is the item's own bytes, starting at the `LocatorType` GUID,
+/// because every offset inside the item is relative to that point.
+///
+/// Takes a byte slice and performs no I/O, so a fuzz target can be
+/// pointed straight at it (decision 7 of
+/// `docs/plans/PLAN-differencing-phase-03-parse.md`). This is a
+/// deliberate departure from the local precedent —
+/// `qcow2::read_backing_file` (`src/crates/qcow2/src/lib.rs:683`) does
+/// its own call-table I/O — and not a claim that qcow2 agrees; the
+/// staging read lives in `parse_metadata` instead.
+///
+/// Returns `None` only when `item` is too short to hold the parent
+/// locator header, in which case there is nothing to preserve.
+/// Everything else is parsed and, where malformed, marked.
+pub fn parse_parent_locator(item: &[u8]) -> Option<VhdxParentLocator> {
+    if item.len() < PARENT_LOCATOR_HEADER_SIZE {
+        return None;
+    }
+
+    let mut locator_type = [0u8; 16];
+    locator_type.copy_from_slice(&item[..16]);
+
+    let mut locator = VhdxParentLocator {
+        locator_type,
+        reserved: le_u16(item, 16),
+        key_value_count: le_u16(item, 18),
+        defect: None,
+        entries: [VhdxParentLocatorEntry::new(0, 0, 0, 0); MAX_PARENT_LOCATOR_ENTRIES],
+        entry_count: 0,
+    };
+
+    // How many entries the item's own bytes can hold. The subtraction
+    // cannot underflow: the length check above already established
+    // item.len() >= PARENT_LOCATOR_HEADER_SIZE.
+    let entries_that_fit = (item.len() - PARENT_LOCATOR_HEADER_SIZE) / PARENT_LOCATOR_ENTRY_SIZE;
+
+    let mut usable = locator.key_value_count as usize;
+    if usable > entries_that_fit {
+        locator.note_defect(VhdxParentLocatorDefect::EntryCountExceedsItem);
+        usable = entries_that_fit;
+    }
+    if usable > MAX_PARENT_LOCATOR_ENTRIES {
+        locator.note_defect(VhdxParentLocatorDefect::EntryCountExceedsCapacity);
+        usable = MAX_PARENT_LOCATOR_ENTRIES;
+    }
+
+    for i in 0..usable {
+        // usable <= entries_that_fit bounds this, but the arithmetic is
+        // still done with checked operations rather than trusting that
+        // reasoning to survive a later edit.
+        let entry_start = match i
+            .checked_mul(PARENT_LOCATOR_ENTRY_SIZE)
+            .and_then(|off| off.checked_add(PARENT_LOCATOR_HEADER_SIZE))
+        {
+            Some(start) => start,
+            None => break,
+        };
+        match entry_start.checked_add(PARENT_LOCATOR_ENTRY_SIZE) {
+            Some(end) if end <= item.len() => {}
+            _ => break,
+        }
+
+        let mut entry = VhdxParentLocatorEntry::new(
+            le_u32(item, entry_start),
+            le_u32(item, entry_start + 4),
+            le_u16(item, entry_start + 8),
+            le_u16(item, entry_start + 10),
+        );
+        entry.defect = decode_entry_strings(item, &mut entry);
+
+        // SPEC(VHDX) 2.6.2.6.2 requires keys to be unique. A repeat is
+        // marked on the later entry; the earlier one keeps its meaning.
+        if entry.defect.is_none() && entry.key_len > 0 {
+            for previous in locator.entries() {
+                if previous.key_len > 0 && previous.key() == entry.key() {
+                    entry.defect = Some(VhdxParentLocatorDefect::DuplicateKey);
+                    break;
+                }
+            }
+        }
+
+        locator.entries[locator.entry_count] = entry;
+        locator.entry_count += 1;
+    }
+
+    Some(locator)
+}
+
+// ============================================================================
 // VHDX metadata parsing
 // ============================================================================
 
@@ -347,6 +874,21 @@ pub struct VhdxMetadata {
     pub logical_sector_size: u32,
     pub physical_sector_size: u32,
     pub has_parent: bool,
+    /// What was found where a parent locator item would be.
+    ///
+    /// `Absent` means the metadata table listed no parent locator item
+    /// — which, on an image whose `has_parent` is set, is a broken
+    /// image. `NotStaged` means the table listed one that this parser
+    /// declined to read, and carries the item's declared offset, its
+    /// declared length and the reason. `Parsed` means it was read; any
+    /// problem with its *contents* is marked inside the locator rather
+    /// than reported here.
+    ///
+    /// Nothing consumes this yet: phase 3 of the differencing plan
+    /// parses, and phase 4 decides what to do about what it finds.
+    /// `has_parent` above still comes from the file parameters flags
+    /// and is unaffected by anything here.
+    pub parent_locator: VhdxParentLocatorState,
 }
 
 /// Parse VHDX metadata from the metadata region.
@@ -398,6 +940,7 @@ pub unsafe fn parse_metadata(
     let mut logical_ss_offset: u32 = 0;
     let mut physical_ss_offset: u32 = 0;
     let mut parent_loc_offset: u32 = 0;
+    let mut parent_loc_length: u32 = 0;
     let mut found_file_params = false;
     let mut found_virtual_size = false;
     let mut found_logical_ss = false;
@@ -431,6 +974,10 @@ pub unsafe fn parse_metadata(
             found_physical_ss = true;
         } else if guid == PARENT_LOCATOR_GUID {
             parent_loc_offset = item_offset;
+            // Metadata table entry Length, at entry offset +20
+            // (SPEC(VHDX) 2.6.1.2). The other items are fixed-size so
+            // the existing reads ignore it; the parent locator is not.
+            parent_loc_length = le_u32(&buffer, entry_start + 20);
             found_parent_loc = true;
         }
     }
@@ -514,10 +1061,32 @@ pub unsafe fn parse_metadata(
 
     let physical_sector_size = le_u32(&buffer, ps_off_in_sector);
 
-    // If parent locator is found but we don't use it, that's fine.
-    // We just note has_parent from file parameters flags.
-    let _ = parent_loc_offset;
-    let _ = found_parent_loc;
+    // Parent locator item, if the metadata table listed one. Staged
+    // through the same sector reads as every other item above and then
+    // handed to `parse_parent_locator` as a plain byte slice, so that
+    // the parser itself does no I/O. An item the parser declines to
+    // stage comes back as `NotStaged`, never as `Absent`, so that a
+    // later phase can tell a resource refusal from a missing item; a
+    // locator that is present but malformed comes back marked, not
+    // dropped.
+    //
+    // `buffer` is reused as the sector staging buffer here, which is
+    // safe because every other item has already been read out of it.
+    let parent_locator = if found_parent_loc {
+        stage_parent_locator(
+            call_table,
+            device_idx,
+            metadata_offset,
+            parent_loc_offset,
+            parent_loc_length,
+            sector_size,
+            input_capacity,
+            bytes_read,
+            &mut buffer,
+        )
+    } else {
+        VhdxParentLocatorState::Absent
+    };
 
     Some(VhdxMetadata {
         block_size,
@@ -525,7 +1094,121 @@ pub unsafe fn parse_metadata(
         logical_sector_size,
         physical_sector_size,
         has_parent,
+        parent_locator,
     })
+}
+
+/// Stage a parent locator metadata item into memory and parse it.
+///
+/// The item is read through the same `read_input_sector` call table
+/// entry every other metadata item uses, one sector at a time, and the
+/// assembled bytes are then handed to `parse_parent_locator`. Keeping
+/// the I/O here rather than in the parser is what lets the parser be a
+/// pure `&[u8] -> Option<_>` function that a fuzz target can drive.
+///
+/// Never returns `Absent`: the caller only calls this when the metadata
+/// table listed an item, so a refusal here comes back as `NotStaged`
+/// with the item's declared offset and length and the reason.
+///
+/// # Safety
+///
+/// `call_table` must be valid.
+unsafe fn stage_parent_locator(
+    call_table: &CallTable,
+    device_idx: u32,
+    metadata_offset: u64,
+    item_offset: u32,
+    item_length: u32,
+    sector_size: usize,
+    input_capacity: u64,
+    bytes_read: &mut u64,
+    buffer: &mut [u8; MAX_SECTOR_SIZE],
+) -> VhdxParentLocatorState {
+    // Every early return goes through here, so no path can lose the
+    // fact that an item was listed.
+    let declined = |reason| VhdxParentLocatorState::NotStaged {
+        item_offset,
+        item_length,
+        reason,
+    };
+
+    if sector_size == 0 || sector_size > MAX_SECTOR_SIZE {
+        return declined(VhdxParentLocatorNotStaged::ReadFailed);
+    }
+
+    let item_len = match plan_parent_locator_staging(item_length) {
+        Ok(len) => len,
+        Err(reason) => return declined(reason),
+    };
+
+    // The item's absolute file offset. Both operands come from the
+    // image, so the sum is checked.
+    let item_start = match metadata_offset.checked_add(u64::from(item_offset)) {
+        Some(start) => start,
+        None => return declined(VhdxParentLocatorNotStaged::ItemOutsideInput),
+    };
+
+    let mut item = [0u8; MAX_PARENT_LOCATOR_ITEM];
+    let mut copied = 0usize;
+    while copied < item_len {
+        let position = match item_start.checked_add(copied as u64) {
+            Some(position) => position,
+            None => return declined(VhdxParentLocatorNotStaged::ItemOutsideInput),
+        };
+        let sector = position / sector_size as u64;
+        let offset_in_sector = (position % sector_size as u64) as usize;
+
+        if sector >= input_capacity {
+            return declined(VhdxParentLocatorNotStaged::ItemOutsideInput);
+        }
+        if !(call_table.read_input_sector)(device_idx, sector, buffer.as_mut_ptr(), sector_size) {
+            return declined(VhdxParentLocatorNotStaged::ReadFailed);
+        }
+        *bytes_read += sector_size as u64;
+
+        // offset_in_sector < sector_size by construction, so the
+        // subtraction cannot underflow, and `min` bounds the copy by
+        // what is left of the item as well as by the sector.
+        let available = sector_size - offset_in_sector;
+        let remaining = item_len - copied;
+        let take = if available < remaining {
+            available
+        } else {
+            remaining
+        };
+
+        // Both ranges are within their buffers: offset_in_sector + take
+        // <= sector_size <= MAX_SECTOR_SIZE, and copied + take <=
+        // item_len <= MAX_PARENT_LOCATOR_ITEM.
+        item[copied..copied + take]
+            .copy_from_slice(&buffer[offset_in_sector..offset_in_sector + take]);
+        copied += take;
+    }
+
+    match parse_parent_locator(&item[..item_len]) {
+        Some(locator) => VhdxParentLocatorState::Parsed(locator),
+        // Unreachable: `plan_parent_locator_staging` already refused
+        // anything shorter than the header, which is the only case
+        // `parse_parent_locator` rejects. Reported rather than
+        // collapsed to `Absent` all the same.
+        None => declined(VhdxParentLocatorNotStaged::ItemTooShort),
+    }
+}
+
+/// Decide whether an item of this declared length can be staged.
+///
+/// Pure, so that the decision the staging path makes can be tested
+/// without a call table. Returns the length to stage, or the reason it
+/// was refused.
+fn plan_parent_locator_staging(item_length: u32) -> Result<usize, VhdxParentLocatorNotStaged> {
+    let item_len = item_length as usize;
+    if item_len < PARENT_LOCATOR_HEADER_SIZE {
+        return Err(VhdxParentLocatorNotStaged::ItemTooShort);
+    }
+    if item_len > MAX_PARENT_LOCATOR_ITEM {
+        return Err(VhdxParentLocatorNotStaged::ItemExceedsParserBound);
+    }
+    Ok(item_len)
 }
 
 // ============================================================================
@@ -2061,5 +2744,383 @@ mod tests {
         let entry = make_bat_entry_u64(4, 5);
         let e = classify_vhdx_bat_entry(entry, 0, 32 << 20);
         assert_eq!(e.state, MapExtentState::Hole);
+    }
+
+    // ====================================================================
+    // Parent locator metadata item tests
+    // ====================================================================
+    //
+    // All in memory: the crate is no_std and must test without
+    // instar-testdata present. The shapes are modelled on the Hyper-V
+    // item measured in PLAN-differencing-phase-01-pin.md, "VHDX — the
+    // parent locator metadata item".
+
+    /// Encode `text` as UTF-16 little endian, returning bytes written.
+    fn utf16le(text: &str, dst: &mut [u8]) -> usize {
+        let mut written = 0usize;
+        let mut units = [0u16; 2];
+        for ch in text.chars() {
+            for unit in ch.encode_utf16(&mut units) {
+                dst[written..written + 2].copy_from_slice(&unit.to_le_bytes());
+                written += 2;
+            }
+        }
+        written
+    }
+
+    /// Build a parent locator item: header, one entry per pair, then
+    /// the key and value strings laid out after the entry array.
+    /// Returns the item length.
+    fn build_locator_item(pairs: &[(&str, &str)], buf: &mut [u8]) -> usize {
+        buf[..16].copy_from_slice(&VHDX_PARENT_LOCATOR_TYPE_GUID);
+        write_le_u16(buf, 16, 0);
+        write_le_u16(buf, 18, pairs.len() as u16);
+
+        let mut data = PARENT_LOCATOR_HEADER_SIZE + pairs.len() * PARENT_LOCATOR_ENTRY_SIZE;
+        for (i, (key, value)) in pairs.iter().enumerate() {
+            let key_offset = data;
+            let key_length = utf16le(key, &mut buf[data..]);
+            data += key_length;
+            let value_offset = data;
+            let value_length = utf16le(value, &mut buf[data..]);
+            data += value_length;
+
+            let entry = PARENT_LOCATOR_HEADER_SIZE + i * PARENT_LOCATOR_ENTRY_SIZE;
+            write_le_u32(buf, entry, key_offset as u32);
+            write_le_u32(buf, entry + 4, value_offset as u32);
+            write_le_u16(buf, entry + 8, key_length as u16);
+            write_le_u16(buf, entry + 10, value_length as u16);
+        }
+        data
+    }
+
+    /// The offset of entry `i`'s 12-byte record within the item.
+    fn entry_offset(i: usize) -> usize {
+        PARENT_LOCATOR_HEADER_SIZE + i * PARENT_LOCATOR_ENTRY_SIZE
+    }
+
+    const HYPERV_LINKAGE: &str = "{f88d4d92-6fcc-408d-9bef-9b7c89f15c89}";
+
+    #[test]
+    fn parent_locator_well_formed_item() {
+        // The five keys Hyper-V writes, minus parent_linkage2, in the
+        // order the measured image lists them.
+        let mut buf = [0u8; 1024];
+        let len = build_locator_item(
+            &[
+                ("parent_linkage", HYPERV_LINKAGE),
+                (
+                    "absolute_win32_path",
+                    r"C:\Projects\dfvfs\test_data\fat-parent.vhdx",
+                ),
+                ("relative_path", r".\fat-parent.vhdx"),
+                (
+                    "volume_path",
+                    r"\\?\Volume{5e0bd954-71b2-4bff-a928-082af7ab0f8f}\fat-parent.vhdx",
+                ),
+            ],
+            &mut buf,
+        );
+
+        let locator = parse_parent_locator(&buf[..len]).unwrap();
+        assert!(locator.is_vhdx_locator_type());
+        assert_eq!(locator.reserved, 0);
+        assert_eq!(locator.key_value_count, 4);
+        assert_eq!(locator.defect, None);
+        assert_eq!(locator.entries().len(), 4);
+        for entry in locator.entries() {
+            assert_eq!(entry.defect, None);
+        }
+
+        assert_eq!(locator.parent_linkage(), Some(HYPERV_LINKAGE.as_bytes()));
+        assert_eq!(
+            locator.absolute_win32_path(),
+            Some(r"C:\Projects\dfvfs\test_data\fat-parent.vhdx".as_bytes())
+        );
+        assert_eq!(
+            locator.relative_path(),
+            Some(r".\fat-parent.vhdx".as_bytes())
+        );
+        assert_eq!(
+            locator.volume_path(),
+            Some(r"\\?\Volume{5e0bd954-71b2-4bff-a928-082af7ab0f8f}\fat-parent.vhdx".as_bytes())
+        );
+
+        // The raw fields survive alongside the decoded strings.
+        let linkage = locator.find(b"parent_linkage").unwrap();
+        assert_eq!(linkage.key_offset as usize, entry_offset(4));
+        assert_eq!(linkage.key_length, 28); // 14 characters
+        assert_eq!(linkage.value_length, 76); // 38 characters
+    }
+
+    #[test]
+    fn parent_locator_item_too_short_for_header() {
+        let buf = [0u8; PARENT_LOCATOR_HEADER_SIZE - 1];
+        assert!(parse_parent_locator(&buf).is_none());
+    }
+
+    #[test]
+    fn parent_locator_key_value_count_exceeds_item() {
+        let mut buf = [0u8; 1024];
+        let len = build_locator_item(&[("relative_path", r".\parent.vhdx")], &mut buf);
+        // Claim far more entries than the item's bytes can describe.
+        write_le_u16(&mut buf, 18, 4096);
+
+        let locator = parse_parent_locator(&buf[..len]).unwrap();
+        assert_eq!(locator.key_value_count, 4096);
+        assert_eq!(
+            locator.defect,
+            Some(VhdxParentLocatorDefect::EntryCountExceedsItem)
+        );
+        // Never more entries than the item can hold, and never more
+        // than the parser retains.
+        assert!(
+            locator.entries().len()
+                <= (len - PARENT_LOCATOR_HEADER_SIZE) / PARENT_LOCATOR_ENTRY_SIZE
+        );
+        assert!(locator.entries().len() <= MAX_PARENT_LOCATOR_ENTRIES);
+    }
+
+    #[test]
+    fn parent_locator_key_value_count_exceeds_capacity() {
+        // Nine well-formed entries: the item can hold them all, the
+        // parser retains eight and says so.
+        let mut buf = [0u8; 2048];
+        let pairs = [
+            ("k0", "v0"),
+            ("k1", "v1"),
+            ("k2", "v2"),
+            ("k3", "v3"),
+            ("k4", "v4"),
+            ("k5", "v5"),
+            ("k6", "v6"),
+            ("k7", "v7"),
+            ("k8", "v8"),
+        ];
+        let len = build_locator_item(&pairs, &mut buf);
+
+        let locator = parse_parent_locator(&buf[..len]).unwrap();
+        assert_eq!(locator.key_value_count, 9);
+        assert_eq!(
+            locator.defect,
+            Some(VhdxParentLocatorDefect::EntryCountExceedsCapacity)
+        );
+        assert_eq!(locator.entries().len(), MAX_PARENT_LOCATOR_ENTRIES);
+    }
+
+    #[test]
+    fn parent_locator_value_offset_past_region_end() {
+        let mut buf = [0u8; 1024];
+        let len = build_locator_item(&[("relative_path", r".\parent.vhdx")], &mut buf);
+        // Point the value one byte past the end of the item.
+        write_le_u32(&mut buf, entry_offset(0) + 4, len as u32);
+
+        let locator = parse_parent_locator(&buf[..len]).unwrap();
+        assert_eq!(locator.entries().len(), 1);
+        let entry = &locator.entries()[0];
+        assert_eq!(
+            entry.defect,
+            Some(VhdxParentLocatorDefect::ValueOutOfBounds)
+        );
+        // Marked, not dropped: the raw fields are still readable, and
+        // the key that did decode is still there.
+        assert_eq!(entry.value_offset as usize, len);
+        assert_eq!(entry.value_length, 26);
+        assert_eq!(entry.key(), b"relative_path");
+        assert_eq!(entry.value(), b"");
+        // ... but nothing hands the caller a value from a bad entry.
+        assert_eq!(locator.relative_path(), None);
+    }
+
+    #[test]
+    fn parent_locator_value_length_overflows_offset() {
+        let mut buf = [0u8; 1024];
+        let len = build_locator_item(&[("relative_path", r".\parent.vhdx")], &mut buf);
+        // offset + length as far out as the fields can express it. The
+        // sum is representable in a 64-bit usize, so it is the bounds
+        // comparison that refuses it; on a narrower usize the
+        // checked_add refuses it first. Either way the entry is marked
+        // and no byte outside the item is read.
+        write_le_u32(&mut buf, entry_offset(0) + 4, u32::MAX);
+        write_le_u16(&mut buf, entry_offset(0) + 10, u16::MAX);
+
+        let locator = parse_parent_locator(&buf[..len]).unwrap();
+        let entry = &locator.entries()[0];
+        assert_eq!(
+            entry.defect,
+            Some(VhdxParentLocatorDefect::ValueOutOfBounds)
+        );
+        assert_eq!(entry.value_offset, u32::MAX);
+        assert_eq!(entry.value_length, u16::MAX);
+    }
+
+    #[test]
+    fn parent_locator_duplicate_key() {
+        let mut buf = [0u8; 1024];
+        let len = build_locator_item(
+            &[
+                ("relative_path", r".\first.vhdx"),
+                ("relative_path", r".\second.vhdx"),
+            ],
+            &mut buf,
+        );
+
+        let locator = parse_parent_locator(&buf[..len]).unwrap();
+        assert_eq!(locator.entries().len(), 2);
+        // The first use of the key stands; the repeat is marked.
+        assert_eq!(locator.entries()[0].defect, None);
+        assert_eq!(
+            locator.entries()[1].defect,
+            Some(VhdxParentLocatorDefect::DuplicateKey)
+        );
+        // The duplicate keeps its decoded value, so a later phase can
+        // report what the two entries disagreed about.
+        assert_eq!(locator.entries()[1].value(), r".\second.vhdx".as_bytes());
+        // find() and value_of() resolve to the first entry.
+        assert_eq!(locator.relative_path(), Some(r".\first.vhdx".as_bytes()));
+    }
+
+    #[test]
+    fn parent_locator_key_decodes_as_nothing() {
+        let mut buf = [0u8; 1024];
+        let len = build_locator_item(&[("relative_path", r".\parent.vhdx")], &mut buf);
+        // Overwrite the first code unit of the key with an unpaired
+        // high surrogate (0xD800 little endian). utf16_to_utf8 refuses
+        // it rather than substituting U+FFFD.
+        let key_offset = le_u32(&buf, entry_offset(0)) as usize;
+        buf[key_offset] = 0x00;
+        buf[key_offset + 1] = 0xD8;
+
+        let locator = parse_parent_locator(&buf[..len]).unwrap();
+        let entry = &locator.entries()[0];
+        assert_eq!(entry.defect, Some(VhdxParentLocatorDefect::KeyUndecodable));
+        assert_eq!(entry.key(), b"");
+        assert_eq!(entry.value(), b"");
+        // An entry with no usable key is not findable, but it is still
+        // present and still carries its raw fields.
+        assert_eq!(locator.entries().len(), 1);
+        assert_eq!(entry.key_length, 26);
+        assert!(locator.find(b"relative_path").is_none());
+    }
+
+    #[test]
+    fn parent_locator_key_longer_than_parser_decodes() {
+        let mut buf = [0u8; 1024];
+        // 33 code units, one past MAX_PARENT_LOCATOR_KEY_UTF16 / 2.
+        let len = build_locator_item(&[("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "value")], &mut buf);
+
+        let locator = parse_parent_locator(&buf[..len]).unwrap();
+        let entry = &locator.entries()[0];
+        assert_eq!(entry.key_length as usize, MAX_PARENT_LOCATOR_KEY_UTF16 + 2);
+        assert_eq!(entry.defect, Some(VhdxParentLocatorDefect::KeyTooLong));
+    }
+
+    #[test]
+    fn parent_locator_linkage_compares_case_insensitively() {
+        // SPEC(VHDX) fixes no case for the braced GUID string: qemu and
+        // libuuid write it lowercase, Hyper-V uppercase.
+        let upper = "{F88D4D92-6FCC-408D-9BEF-9B7C89F15C89}";
+        let lower = HYPERV_LINKAGE;
+
+        let mut buf = [0u8; 1024];
+        let len = build_locator_item(&[("parent_linkage", upper)], &mut buf);
+        let locator = parse_parent_locator(&buf[..len]).unwrap();
+
+        // Parsed faithfully: what the image wrote is what comes back.
+        assert_eq!(locator.parent_linkage(), Some(upper.as_bytes()));
+        // Compared case-insensitively, in both directions.
+        assert!(locator.linkage_matches(lower.as_bytes()));
+        assert!(locator.linkage_matches(upper.as_bytes()));
+        // And it is a comparison, not a shrug: a different GUID, and a
+        // GUID missing its braces, both fail.
+        assert!(!locator.linkage_matches("{00000000-0000-0000-0000-000000000000}".as_bytes()));
+        assert!(!locator.linkage_matches("f88d4d92-6fcc-408d-9bef-9b7c89f15c89".as_bytes()));
+
+        let mut lower_buf = [0u8; 1024];
+        let lower_len = build_locator_item(&[("parent_linkage", lower)], &mut lower_buf);
+        let lower_locator = parse_parent_locator(&lower_buf[..lower_len]).unwrap();
+        assert!(lower_locator.linkage_matches(upper.as_bytes()));
+    }
+
+    #[test]
+    fn parent_locator_missing_linkage_matches_nothing() {
+        let mut buf = [0u8; 1024];
+        let len = build_locator_item(&[("relative_path", r".\parent.vhdx")], &mut buf);
+        let locator = parse_parent_locator(&buf[..len]).unwrap();
+        assert_eq!(locator.parent_linkage(), None);
+        assert!(!locator.linkage_matches(HYPERV_LINKAGE.as_bytes()));
+    }
+
+    #[test]
+    fn parent_locator_declined_item_is_distinguishable_from_absent() {
+        // The state `parse_metadata` records when the metadata table
+        // lists no parent locator item at all.
+        let absent = VhdxParentLocatorState::Absent;
+        assert!(absent.is_absent());
+        assert!(absent.parsed().is_none());
+
+        // The decision `stage_parent_locator` makes for a differencing
+        // image whose table *does* list an item, one byte past the
+        // parser's staging bound. This is the same function the staging
+        // path calls, so the test exercises the real decision rather
+        // than a hand-built state.
+        let over_cap = (MAX_PARENT_LOCATOR_ITEM + 1) as u32;
+        let reason = plan_parent_locator_staging(over_cap).unwrap_err();
+        assert_eq!(reason, VhdxParentLocatorNotStaged::ItemExceedsParserBound);
+
+        let declined = VhdxParentLocatorState::NotStaged {
+            // 0x10028 is where Hyper-V and instar both place the item.
+            item_offset: 0x1_0028,
+            item_length: over_cap,
+            reason,
+        };
+
+        // The two are told apart: a refusal is not an absence.
+        assert!(!declined.is_absent());
+        assert!(declined.parsed().is_none());
+
+        // And the refusal keeps the facts that explain it, so a later
+        // phase can report the length it declined and, if it wants,
+        // re-read the item with a bigger buffer.
+        match declined {
+            VhdxParentLocatorState::NotStaged {
+                item_offset,
+                item_length,
+                reason,
+            } => {
+                assert_eq!(item_offset, 0x1_0028);
+                assert_eq!(item_length, over_cap);
+                assert_eq!(reason, VhdxParentLocatorNotStaged::ItemExceedsParserBound);
+            }
+            _ => panic!("expected NotStaged"),
+        }
+
+        // The bound is a bound, not a blanket refusal: the measured
+        // Hyper-V item stages, and an item too short for its own header
+        // is refused for a different, distinguishable reason.
+        assert_eq!(plan_parent_locator_staging(674), Ok(674));
+        assert_eq!(
+            plan_parent_locator_staging((PARENT_LOCATOR_HEADER_SIZE - 1) as u32),
+            Err(VhdxParentLocatorNotStaged::ItemTooShort)
+        );
+        assert_eq!(
+            plan_parent_locator_staging(MAX_PARENT_LOCATOR_ITEM as u32),
+            Ok(MAX_PARENT_LOCATOR_ITEM)
+        );
+    }
+
+    #[test]
+    fn parent_locator_foreign_locator_type_is_reported_not_refused() {
+        let mut buf = [0u8; 1024];
+        let len = build_locator_item(&[("relative_path", r".\parent.vhdx")], &mut buf);
+        buf[0] ^= 0xFF;
+
+        let locator = parse_parent_locator(&buf[..len]).unwrap();
+        assert!(!locator.is_vhdx_locator_type());
+        assert_eq!(
+            locator.locator_type[0],
+            VHDX_PARENT_LOCATOR_TYPE_GUID[0] ^ 0xFF
+        );
+        assert_eq!(locator.relative_path(), Some(r".\parent.vhdx".as_bytes()));
     }
 }
