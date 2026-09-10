@@ -20,6 +20,21 @@
 # does land here, rotate it first -- the history scan will keep finding
 # it, and suppressing the finding does not un-publish the secret.
 #
-# No suppressions are needed today. This file exists so that the first
-# false positive can be handled with a one-line commit rather than an
-# emergency workflow edit while every PR is red.
+# The first false positive, and what this file was created for.
+#
+# Do not quote the offending source line in a comment here. The first
+# version of this entry did exactly that, and gitleaks scans this file
+# like any other -- the quoted line came straight back as a fresh
+# finding in .gitleaksignore itself, on the line the explanation sat
+# on. Describe the shape of the match instead.
+#
+# The finding is in the VHDX parent locator parser, where a bounds
+# check compares the declared length of one metadata pair name against
+# a compile-time limit. The generic-api-key rule matches an identifier
+# whose name contains one of its trigger words, then a comparison
+# operator, then a long token; it scores that token for entropy and
+# reports anything above 3.5. Here the token is the name of a public
+# constant declared a few hundred lines above the check in the same
+# file, and it scores 3.97 because it is long and mixes case classes.
+# There is no credential in that line and nothing to rotate.
+2cc288c208ce2d20c35969d51d4703f6f2be0d1b:src/crates/vhdx/src/lib.rs:generic-api-key:745
