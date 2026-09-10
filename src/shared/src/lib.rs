@@ -6374,6 +6374,32 @@ mod tests {
     }
 
     #[test]
+    fn utf16_to_utf8_four_byte_output_at_the_exact_end_of_dst() {
+        // The 4-byte encoding branch is the only one that can advance
+        // the output cursor past a 3-byte-safe check, so its boundary
+        // is tested on both sides: "ab" plus U+1F600 needs exactly 6
+        // bytes, and five is one too few.
+        let mut src = [0u8; 8];
+        src[..4].copy_from_slice(&[0x00, 0x61, 0x00, 0x62]); // "ab", BE
+        src[4..].copy_from_slice(&[0xd8, 0x3d, 0xde, 0x00]); // U+1F600
+
+        let mut exact = [0u8; 6];
+        assert_eq!(utf16_to_utf8(&src, true, &mut exact), Some(6));
+        assert_eq!(&exact, &[0x61, 0x62, 0xf0, 0x9f, 0x98, 0x80]);
+
+        // One byte short: refused outright rather than truncated to a
+        // partial code point, which would be invalid UTF-8 and would
+        // still look like a path to whatever consumed it.
+        let mut short = [0u8; 5];
+        assert_eq!(utf16_to_utf8(&src, true, &mut short), None);
+
+        // And a zero-length destination refuses the pair rather than
+        // reporting an empty success.
+        let mut empty: [u8; 0] = [];
+        assert_eq!(utf16_to_utf8(&src[4..], true, &mut empty), None);
+    }
+
+    #[test]
     fn utf16_to_utf8_stops_at_embedded_nul() {
         // "ab\0cd": decoding stops at the NUL, which is excluded from
         // the count, and the trailing "cd" is never examined.

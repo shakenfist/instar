@@ -704,7 +704,23 @@ pub enum AmbiguityReason {
 pub enum PreferredLocator {
     /// Exactly one entry wins. `slot` indexes
     /// [`VhdParentLocatorTable::entries`].
-    Found { slot: usize },
+    ///
+    /// `demoted_from` is `Some(slot)` when a *higher*-precedence entry
+    /// existed and was passed over because it carries a defect — the
+    /// lowest such slot. It is `None` in the ordinary case, including
+    /// when the winner is already the highest-precedence code present.
+    ///
+    /// The field exists because the demotion is attacker-controllable:
+    /// corrupting a `W2ru` entry's offset moves selection to the
+    /// absolute `W2ku` path, which is a different file. Without this,
+    /// a caller cannot tell that from an image that simply never had a
+    /// relative locator, and would have to re-walk `entries` to find
+    /// out. Phase 4 decides whether to refuse, warn or proceed;
+    /// this only makes sure the fact reaches it.
+    Found {
+        slot: usize,
+        demoted_from: Option<usize>,
+    },
     /// No entry carries a Windows platform code, or every entry that does
     /// is unused or malformed. The caller reads `entries` to say why —
     /// decision 4 keeps the reason on the entries rather than duplicating
@@ -778,6 +794,12 @@ impl VhdParentLocatorTable {
     /// * A parent unicode name (header `+64`) that disagrees with the
     ///   winning locator is **not** ambiguity and is not checked at all in
     ///   this phase.
+    /// * A malformed entry is not a candidate, so a table carrying a
+    ///   corrupt `W2ru` and a sound `W2ku` selects the `W2ku` — the
+    ///   absolute path rather than the relative one. That is a
+    ///   *different parent file*, chosen because an attacker corrupted
+    ///   the entry that would have won. `Found::demoted_from` reports
+    ///   it rather than leaving the caller to notice.
     pub fn preferred_locator(&self, data: Option<&VhdImageWindow<'_>>) -> PreferredLocator {
         // Best (lowest) preference rank among candidate entries.
         let mut best_rank: Option<u8> = None;
@@ -797,6 +819,22 @@ impl VhdParentLocatorTable {
             Some(rank) => rank,
             None => return PreferredLocator::NotFound,
         };
+
+        // The lowest slot carrying a *better* rank than the winner's,
+        // rejected only because of a defect. Computed before the winner
+        // is chosen because it describes the entries the winner beat,
+        // not the winner.
+        let mut demoted_from: Option<usize> = None;
+        for (slot, entry) in self.entries.iter().enumerate() {
+            if entry.is_unused() || entry.defect.is_none() {
+                continue;
+            }
+            // Slot order, so the first match is the lowest slot.
+            if matches!(entry.platform().preference(), Some(rank) if rank < best_rank) {
+                demoted_from = Some(slot);
+                break;
+            }
+        }
 
         // Winner is the lowest slot carrying the best rank; every other
         // slot with that same rank carries the same platform code, so its
@@ -837,7 +875,7 @@ impl VhdParentLocatorTable {
         }
 
         match winner {
-            Some(slot) => PreferredLocator::Found { slot },
+            Some(slot) => PreferredLocator::Found { slot, demoted_from },
             None => PreferredLocator::NotFound,
         }
     }
@@ -2291,7 +2329,10 @@ mod tests {
         // The W2ru entry past the gap still wins.
         assert_eq!(
             info.locators.preferred_locator(Some(&window(&win))),
-            PreferredLocator::Found { slot: 2 }
+            PreferredLocator::Found {
+                slot: 2,
+                demoted_from: None
+            }
         );
     }
 
@@ -2565,7 +2606,10 @@ mod tests {
         let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
         assert_eq!(
             info.locators.preferred_locator(Some(&window(&win))),
-            PreferredLocator::Found { slot: 1 }
+            PreferredLocator::Found {
+                slot: 1,
+                demoted_from: None
+            }
         );
     }
 
@@ -2581,7 +2625,10 @@ mod tests {
             let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
             assert_eq!(
                 info.locators.preferred_locator(Some(&window(&win))),
-                PreferredLocator::Found { slot: i },
+                PreferredLocator::Found {
+                    slot: i,
+                    demoted_from: None
+                },
                 "adding {:?} should win",
                 core::str::from_utf8(*code).unwrap()
             );
@@ -2610,9 +2657,17 @@ mod tests {
         put_locator(&mut buf, 0, b"W2ru", 512, 32, TEST_BOUNDS.image_len - 8);
         put_locator_path(&mut buf, &mut win, 1, b"W2ku", "C:\\p.vhd");
         let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
+        // The sound W2ku wins — but the result says so, rather than
+        // looking like an image that never carried a relative locator.
+        // Corrupting slot 0 is how an attacker steers a reader from the
+        // relative path to the absolute one, so the demotion is
+        // reported and phase 4 gets to have a policy about it.
         assert_eq!(
             info.locators.preferred_locator(Some(&window(&win))),
-            PreferredLocator::Found { slot: 1 }
+            PreferredLocator::Found {
+                slot: 1,
+                demoted_from: Some(0)
+            }
         );
         // NotFound carries no reason: the caller reads the entries.
         let mut only_bad = make_diff_header("p.vhd");
@@ -2644,7 +2699,10 @@ mod tests {
         let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
         assert_eq!(
             info.locators.preferred_locator(Some(&window(&win))),
-            PreferredLocator::Found { slot: 0 }
+            PreferredLocator::Found {
+                slot: 0,
+                demoted_from: None
+            }
         );
     }
 
@@ -2668,7 +2726,10 @@ mod tests {
         let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
         assert_eq!(
             info.locators.preferred_locator(Some(&window(&win))),
-            PreferredLocator::Found { slot: 0 }
+            PreferredLocator::Found {
+                slot: 0,
+                demoted_from: None
+            }
         );
     }
 
@@ -2771,7 +2832,10 @@ mod tests {
         let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
         assert_eq!(
             info.locators.preferred_locator(Some(&window(&win))),
-            PreferredLocator::Found { slot: 6 }
+            PreferredLocator::Found {
+                slot: 6,
+                demoted_from: None
+            }
         );
         let mut out = [0u8; 1024];
         let n = info.locators.entries[6]
@@ -3359,5 +3423,46 @@ mod tests {
             let r = chs_rounded_size(s);
             assert!(r >= s, "chs_rounded_size({s}) = {r} is less than the input");
         }
+    }
+
+    #[test]
+    fn locator_in_an_image_shorter_than_a_footer_cannot_escape() {
+        // `image_len.checked_sub(FOOTER_SIZE)` returns None when the
+        // image is shorter than one footer, so the trailing-footer
+        // overlap check is skipped outright. That branch is only safe
+        // because of what covers for it, and the cover is worth
+        // pinning: the leading footer copy spans [0, 512), which is the
+        // whole of such an image, so every byte a locator could point
+        // at is refused by one of the two checks that do run.
+        let tiny = VhdImageBounds {
+            image_len: 300,
+            header_offset: 512,
+        };
+
+        // Inside the image: caught as a footer overlap, not waved
+        // through by the skipped tail check.
+        assert_eq!(
+            locator_defect(*b"W2ru", 512, 32, 0, &tiny),
+            Some(VhdLocatorDefect::OverlapsFooter)
+        );
+        assert_eq!(
+            locator_defect(*b"W2ru", 512, 32, 260, &tiny),
+            Some(VhdLocatorDefect::OverlapsFooter)
+        );
+        // Past the image: caught before either footer check.
+        assert_eq!(
+            locator_defect(*b"W2ru", 512, 32, 512, &tiny),
+            Some(VhdLocatorDefect::DataOutsideImage)
+        );
+        // Exactly at the boundary the skip turns on: one byte more and
+        // the tail check runs again, and the verdict does not change.
+        let just_big_enough = VhdImageBounds {
+            image_len: FOOTER_SIZE as u64,
+            header_offset: 512,
+        };
+        assert_eq!(
+            locator_defect(*b"W2ru", 512, 32, 0, &just_big_enough),
+            Some(VhdLocatorDefect::OverlapsFooter)
+        );
     }
 }
