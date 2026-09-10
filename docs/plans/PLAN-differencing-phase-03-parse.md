@@ -304,6 +304,22 @@ with `1a677c77` (#552).
   before and after this phase, and the comparison is a committed
   script rather than a claim. No VHD or VHDX image gains a backing
   file line.
+* **Verbose output (`instar info -v`) is deliberately outside that
+  claim**, and the script does not compare it. Staging a VHDX
+  parent locator item costs sector reads, which land in
+  `bytes_read`, which reaches `send_complete` and the host's
+  verbose formatter but never the info text or the JSON. That is a
+  resource-accounting difference, not a behaviour change, and a
+  verbose comparison would report it as a failure. The
+  `has_parent` gate added in review narrows it further: only an
+  image that actually claims a parent pays the reads, so verbose
+  output for every other image is unchanged too.
+* Documentation of the new public surface is **deliberately held to
+  phase 10**, which the master plan makes the documentation phase.
+  Nothing user-visible changed here, so `docs/format-internals.md`
+  gaining a parent-locator section now would document an API no
+  operation calls. Recorded so a later reviewer reads the gap as a
+  decision rather than an oversight.
 * `git diff --name-only develop...HEAD -- src/operations/` is
   empty: no operation changed.
 * `VhdState::init` still accepts `DISK_TYPE_DIFFERENCING` and

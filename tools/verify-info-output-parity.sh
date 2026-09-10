@@ -39,12 +39,18 @@
 #      binary already forbids a *new* one appearing, but this is the
 #      falsifiable form of decision 6 stated directly: no VHD or VHDX image
 #      may carry that line at all, regardless of what the base binary did.
+#      Both stdout and stderr are compared, along with the exit status.
 #   5. Images absent from the local testdata checkout are skipped and
-#      counted, never treated as failures.
+#      counted, never treated as failures -- except for the handful in
+#      REQUIRED_IDS, which are the only images in the manifest carrying a
+#      parent locator. Skipping those, or comparing nothing at all, is
+#      reported as an error rather than a pass: a gate that compared no
+#      image that could have changed proves nothing.
 #
 # Exit status: 0 if every compared image matched (and no vpc/vhdx image
 # gained a backing-file line); non-zero otherwise, so this can be used as a
-# CI/review gate.
+# CI/review gate. A build failure in either tree, and a run that compared
+# nothing, both exit 2 rather than falling through to a pass.
 #
 # Requires: docker (for `make instar`), git, jq, diff. Does not require
 # sudo — /dev/kvm must be group-readable/writable by the invoking user (the
@@ -80,7 +86,18 @@ echo "  $(git log -1 --format='%h %s' "$BASE")"
 echo ""
 echo "=== Building current tree's instar ==="
 CURRENT_BINARY="$REPO_ROOT/src/target/release/instar"
-make -C "$REPO_ROOT" instar
+# Remove the binary first and check make's exit status afterwards. The
+# script runs without `set -e` (the comparison loop wants to keep going
+# after a failing image), so a failed build would otherwise fall through
+# to an existence check that a leftover artifact from an earlier run
+# satisfies -- and the script would compare two stale binaries and print
+# PASS. A false PASS is the worst thing this script can do, since its
+# whole job is to be the falsifiable form of decision 6.
+rm -f "$CURRENT_BINARY"
+if ! make -C "$REPO_ROOT" instar; then
+    echo "error: building the current tree's instar failed" >&2
+    exit 2
+fi
 if [ ! -x "$CURRENT_BINARY" ]; then
     echo "error: current instar binary not found at $CURRENT_BINARY after build" >&2
     exit 2
@@ -105,7 +122,13 @@ trap cleanup EXIT
 
 git worktree add --detach "$BASE_WORKTREE" "$BASE" >/dev/null
 BASE_BINARY="$BASE_WORKTREE/src/target/release/instar"
-make -C "$BASE_WORKTREE" instar
+# The base worktree is freshly created so nothing stale can be here, but
+# the exit status is still checked: a base build that fails silently is
+# the same false PASS as above, arriving by a different route.
+if ! make -C "$BASE_WORKTREE" instar; then
+    echo "error: building the base commit's ($BASE) instar failed" >&2
+    exit 2
+fi
 if [ ! -x "$BASE_BINARY" ]; then
     echo "error: base instar binary not found at $BASE_BINARY after build" >&2
     exit 2
@@ -119,6 +142,21 @@ SKIPPED=0
 FAILED=0
 FAILED_IDS=()
 
+# Images that must be present, not merely skipped. These are the
+# differencing fixtures phase 2 added: the parsers this script guards
+# read a parent locator, and these are the only images in the manifest
+# that have one. A run that skipped them compared nothing that could
+# have changed.
+REQUIRED_IDS=(
+    vhd-differencing
+    vhd-diff-child-aligned
+    vhd-diff-locator-conflicting
+    vhdx-diff-child
+)
+# Space-delimited so membership is a `case` glob rather than a nested
+# loop over a possibly-empty array.
+FOUND_REQUIRED=" "
+
 # id, path, format as tab-separated records.
 while IFS=$'\t' read -r img_id img_path img_format; do
     full_path="$TESTDATA_ROOT/$img_path"
@@ -130,6 +168,12 @@ while IFS=$'\t' read -r img_id img_path img_format; do
 
     COMPARED=$((COMPARED + 1))
     entry_failed=0
+
+    for required in "${REQUIRED_IDS[@]}"; do
+        if [ "$img_id" = "$required" ]; then
+            FOUND_REQUIRED+="$img_id "
+        fi
+    done
 
     for mode in human json; do
         if [ "$mode" = "human" ]; then
@@ -156,6 +200,17 @@ while IFS=$'\t' read -r img_id img_path img_format; do
         if ! cmp -s "$cur_out" "$base_out"; then
             echo "FAIL: $img_id ($mode): stdout differs"
             diff -u "$base_out" "$cur_out" | head -20 | sed 's/^/    /'
+            entry_failed=1
+        fi
+
+        # stderr as well as stdout. Nothing in the phase this script was
+        # written for can plausibly write to stderr, but the script is
+        # meant to be reused by later phases that can, and a new
+        # diagnostic line is exactly the kind of change that would
+        # otherwise slip through a stdout-only gate.
+        if ! cmp -s "$cur_out.stderr" "$base_out.stderr"; then
+            echo "FAIL: $img_id ($mode): stderr differs"
+            diff -u "$base_out.stderr" "$cur_out.stderr" | head -20 | sed 's/^/    /'
             entry_failed=1
         fi
 
@@ -191,6 +246,36 @@ if [ "$FAILED" -ne 0 ]; then
         echo "  - $id"
     done
     exit 1
+fi
+
+# A gate that compared nothing proves nothing. Zero comparisons is what a
+# fresh testdata checkout or a wrong INSTAR_TESTDATA_PATH produces, and
+# without this the script would print PASS over it. REQUIRED_IDS is the
+# same argument one level down: those images are the only ones whose
+# behaviour the parsers this script guards could change, so a run that
+# skipped them is a vacuous pass even when it compared two hundred
+# others.
+if [ "$COMPARED" -eq 0 ]; then
+    echo ""
+    echo "error: no manifest image was found under $TESTDATA_ROOT, so nothing was compared." >&2
+    echo "       Set INSTAR_TESTDATA_PATH, or fetch the testdata checkout." >&2
+    exit 2
+fi
+
+MISSING_REQUIRED=()
+for required in "${REQUIRED_IDS[@]}"; do
+    case "$FOUND_REQUIRED" in
+        *" $required "*) ;;
+        *) MISSING_REQUIRED+=("$required") ;;
+    esac
+done
+if [ "${#MISSING_REQUIRED[@]}" -ne 0 ]; then
+    echo ""
+    echo "error: these images must be present for this check to mean anything:" >&2
+    for id in "${MISSING_REQUIRED[@]}"; do
+        echo "  - $id" >&2
+    done
+    exit 2
 fi
 
 echo ""
