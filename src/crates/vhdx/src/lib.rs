@@ -7,6 +7,32 @@
 //! VHDX uses CRC-32C checksums, GUID-identified metadata, 64-bit BAT
 //! entries with interleaved sector bitmap entries, and 1MB-aligned
 //! structures. All on-disk fields are little-endian.
+//!
+//! # Parent locators are staged, and owned
+//!
+//! [`VhdxParentLocator`] owns its decoded keys and values in fixed
+//! arrays, so [`VhdxMetadata`] is several kilobytes when an image
+//! carries a parent locator. The sibling VHD crate made the opposite
+//! choice: `VhdParentInfo` borrows the undecoded parent name and
+//! decodes into a buffer the caller supplies. One phase, two answers,
+//! so the reason is worth stating rather than leaving a later reader
+//! to decide the pair is simply inconsistent.
+//!
+//! The difference is where the bytes come from. A VHD's locator fields
+//! live in a header the caller has already read, so a borrow is free
+//! and the caller keeps control of the decode cost. A VHDX's locator
+//! item lives at an arbitrary offset in the metadata region and has to
+//! be assembled from sector reads into a staging buffer that dies with
+//! the call — there is nothing left to borrow from afterwards, and
+//! `no_std` with no allocator rules out the obvious alternative of
+//! boxing it. Owning the decoded strings is what lets `parse_metadata`
+//! return a value that outlives its own scratch buffer.
+//!
+//! The cost is bounded and paid on the stack: `MAX_PARENT_LOCATOR_*`
+//! cap the item at eight entries with a 96-byte key and a 780-byte
+//! value each, roughly 7.3 KB inside a 4 MiB guest stack
+//! (`STACK_SIZE`, `src/vmm/src/main.rs`). See decision 7 of
+//! `docs/plans/PLAN-differencing-phase-03-parse.md`.
 
 #![no_std]
 #![allow(clippy::too_many_arguments)]
@@ -438,6 +464,19 @@ pub const MAX_PARENT_LOCATOR_VALUE_UTF8: usize = MAX_PARENT_LOCATOR_VALUE_UTF16 
 /// distinguishable from "there is no locator item".
 pub const MAX_PARENT_LOCATOR_ITEM: usize = 4096;
 
+/// Lowest offset, relative to the metadata region start, at which a
+/// metadata item may begin.
+///
+/// **A spec limit, not a parser resource bound**, which is why it has
+/// no "measured Hyper-V value clears it" note: SPEC(VHDX) 2.6.1.2
+/// requires the offset be at least 64 KB and that items not overlap,
+/// as recorded in `docs/plans/PLAN-differencing-phase-01-pin.md`,
+/// "The metadata table entry" — the first 64 KB of the region is
+/// reserved for the table. Hyper-V's measured parent locator sits at
+/// `0x10028`, immediately above the floor, and so does the one
+/// instar's own `build_metadata` would write.
+pub const METADATA_ITEMS_MIN_OFFSET: u32 = 0x10000;
+
 /// The keys instar cares about, per
 /// `PLAN-differencing-phase-01-pin.md`, "VHDX — which keys instar
 /// should write".
@@ -475,6 +514,26 @@ pub enum VhdxParentLocatorNotStaged {
     /// The input device refused a sector read, or the sector size is
     /// unusable.
     ReadFailed,
+    /// The item does not lie inside the metadata region the region
+    /// table declares: it starts below `METADATA_ITEMS_MIN_OFFSET`, or
+    /// it ends past the region's declared length.
+    ///
+    /// Distinct from `ItemOutsideInput`, which is about the file. An
+    /// item can be comfortably inside a large image and still be
+    /// nowhere near the metadata region — that is the shape of a
+    /// crafted table entry, and reading it would parse unrelated image
+    /// bytes as a parent locator.
+    ItemOutsideMetadataRegion,
+    /// The image does not claim a parent (`HasParent` is clear in the
+    /// file parameters item), so the listed item was not read.
+    ///
+    /// Not `Absent`: the metadata table really does list a parent
+    /// locator item, and an image carrying one while denying it has a
+    /// parent is anomalous in a way a later phase may want to report.
+    /// Recording it here rather than collapsing it keeps decision 4's
+    /// distinction intact while costing the sector reads only to
+    /// images that will actually use them.
+    ImageClaimsNoParent,
 }
 
 /// What `parse_metadata` found where a parent locator item would be.
@@ -896,6 +955,15 @@ pub struct VhdxMetadata {
 /// Reads the metadata table and locates items by GUID. Requires
 /// sector-based I/O via `call_table`.
 ///
+/// `metadata_length` is the metadata region's declared Length, from
+/// the region table entry the caller matched on `METADATA_REGION_GUID`
+/// (entry offset `+24`). It is what bounds a parent locator item: the
+/// table's own `Offset` field is image-supplied and otherwise
+/// unconstrained, so without the region's extent an item can claim to
+/// live anywhere in the file. A caller with no region length to hand
+/// should pass 0, which refuses every locator item rather than
+/// reading an unbounded one.
+///
 /// # Safety
 ///
 /// `call_table` must be valid.
@@ -903,6 +971,7 @@ pub unsafe fn parse_metadata(
     call_table: &CallTable,
     device_idx: u32,
     metadata_offset: u64,
+    metadata_length: u32,
     sector_size: usize,
     input_capacity: u64,
     bytes_read: &mut u64,
@@ -1061,31 +1130,44 @@ pub unsafe fn parse_metadata(
 
     let physical_sector_size = le_u32(&buffer, ps_off_in_sector);
 
-    // Parent locator item, if the metadata table listed one. Staged
-    // through the same sector reads as every other item above and then
-    // handed to `parse_parent_locator` as a plain byte slice, so that
-    // the parser itself does no I/O. An item the parser declines to
-    // stage comes back as `NotStaged`, never as `Absent`, so that a
-    // later phase can tell a resource refusal from a missing item; a
-    // locator that is present but malformed comes back marked, not
-    // dropped.
+    // Parent locator item, if the metadata table listed one *and* the
+    // image claims a parent. Staged through the same sector reads as
+    // every other item above and then handed to `parse_parent_locator`
+    // as a plain byte slice, so that the parser itself does no I/O. An
+    // item the parser declines to stage comes back as `NotStaged`,
+    // never as `Absent`, so that a later phase can tell a resource
+    // refusal from a missing item; a locator that is present but
+    // malformed comes back marked, not dropped.
+    //
+    // The `has_parent` gate matters twice. It keeps the extra sector
+    // reads — and so `bytes_read` — off every image that will never
+    // use them, which is all of them until phase 4. And it means an
+    // image that lists a locator item while denying it has a parent is
+    // reported as `ImageClaimsNoParent` rather than read: that
+    // combination is anomalous, and the anomaly is worth more to a
+    // later phase than the item's contents would be.
     //
     // `buffer` is reused as the sector staging buffer here, which is
     // safe because every other item has already been read out of it.
-    let parent_locator = if found_parent_loc {
-        stage_parent_locator(
+    let parent_locator = match (found_parent_loc, has_parent) {
+        (false, _) => VhdxParentLocatorState::Absent,
+        (true, false) => VhdxParentLocatorState::NotStaged {
+            item_offset: parent_loc_offset,
+            item_length: parent_loc_length,
+            reason: VhdxParentLocatorNotStaged::ImageClaimsNoParent,
+        },
+        (true, true) => stage_parent_locator(
             call_table,
             device_idx,
             metadata_offset,
             parent_loc_offset,
             parent_loc_length,
+            metadata_length,
             sector_size,
             input_capacity,
             bytes_read,
             &mut buffer,
-        )
-    } else {
-        VhdxParentLocatorState::Absent
+        ),
     };
 
     Some(VhdxMetadata {
@@ -1119,6 +1201,7 @@ unsafe fn stage_parent_locator(
     metadata_offset: u64,
     item_offset: u32,
     item_length: u32,
+    metadata_length: u32,
     sector_size: usize,
     input_capacity: u64,
     bytes_read: &mut u64,
@@ -1136,7 +1219,7 @@ unsafe fn stage_parent_locator(
         return declined(VhdxParentLocatorNotStaged::ReadFailed);
     }
 
-    let item_len = match plan_parent_locator_staging(item_length) {
+    let item_len = match plan_parent_locator_staging(item_offset, item_length, metadata_length) {
         Ok(len) => len,
         Err(reason) => return declined(reason),
     };
@@ -1195,15 +1278,47 @@ unsafe fn stage_parent_locator(
     }
 }
 
-/// Decide whether an item of this declared length can be staged.
+/// Decide whether the item a metadata table entry describes can be
+/// staged, given the metadata region it claims to live in.
 ///
 /// Pure, so that the decision the staging path makes can be tested
 /// without a call table. Returns the length to stage, or the reason it
 /// was refused.
-fn plan_parent_locator_staging(item_length: u32) -> Result<usize, VhdxParentLocatorNotStaged> {
+///
+/// `item_offset` and `metadata_length` are both relative to the
+/// metadata region start, exactly as the region table and the metadata
+/// table store them. Bounding the item against the region — rather
+/// than only against the file, which the sector loop already does — is
+/// what stops a crafted `Offset` of, say, `0x8000_0000` from making
+/// the parser read two gigabytes into the image and parse whatever it
+/// finds there as a parent locator.
+///
+/// The checks are ordered so the reported reason is the most
+/// structural one that applies. An item too short to hold its own
+/// header is malformed wherever it sits; an item outside the region is
+/// not ours to read at any length; only an item that is genuinely
+/// inside the region gets to be refused for exceeding a bound that is
+/// instar's rather than the format's.
+fn plan_parent_locator_staging(
+    item_offset: u32,
+    item_length: u32,
+    metadata_length: u32,
+) -> Result<usize, VhdxParentLocatorNotStaged> {
     let item_len = item_length as usize;
     if item_len < PARENT_LOCATOR_HEADER_SIZE {
         return Err(VhdxParentLocatorNotStaged::ItemTooShort);
+    }
+    // SPEC(VHDX) 2.6.1.2: the first 64 KB of the metadata region is
+    // the table, so no item may begin below it.
+    if item_offset < METADATA_ITEMS_MIN_OFFSET {
+        return Err(VhdxParentLocatorNotStaged::ItemOutsideMetadataRegion);
+    }
+    // Both operands are image-supplied u32s, so the sum is checked
+    // rather than reasoned about. u64 would not wrap here, but the
+    // safety of the bound should not rest on that argument.
+    match item_offset.checked_add(item_length) {
+        Some(end) if end <= metadata_length => {}
+        _ => return Err(VhdxParentLocatorNotStaged::ItemOutsideMetadataRegion),
     }
     if item_len > MAX_PARENT_LOCATOR_ITEM {
         return Err(VhdxParentLocatorNotStaged::ItemExceedsParserBound);
@@ -1481,6 +1596,10 @@ impl VhdxState {
         let mut bat_offset: u64 = 0;
         let mut bat_length: u32 = 0;
         let mut metadata_offset: u64 = 0;
+        // The metadata region's declared Length, which bounds where a
+        // metadata item may live. Read here rather than assumed,
+        // because the region table is where the image states it.
+        let mut metadata_length: u32 = 0;
         let mut found_bat = false;
         let mut found_metadata = false;
 
@@ -1499,6 +1618,7 @@ impl VhdxState {
                 found_bat = true;
             } else if guid == METADATA_REGION_GUID {
                 metadata_offset = le_u64(&rt_buffer, eoff + 16);
+                metadata_length = le_u32(&rt_buffer, eoff + 24);
                 found_metadata = true;
             }
         }
@@ -1517,6 +1637,7 @@ impl VhdxState {
             call_table,
             device_idx,
             metadata_offset,
+            metadata_length,
             sector_size,
             input_capacity,
             bytes_read,
@@ -2226,6 +2347,12 @@ pub fn calculate_bat_layout(
 // Tests
 // ============================================================================
 
+// The parent locator staging tests need a lock around the global
+// fixture their `extern "C"` reader serves from. Same reason, and the
+// same shape, as `crates/qcow2`.
+#[cfg(test)]
+extern crate std;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2909,6 +3036,106 @@ mod tests {
     }
 
     #[test]
+    fn parent_locator_key_offset_past_region_end() {
+        let mut buf = [0u8; 1024];
+        let len = build_locator_item(&[("relative_path", r".\parent.vhdx")], &mut buf);
+        // Point the key one byte past the end of the item.
+        write_le_u32(&mut buf, entry_offset(0), len as u32);
+
+        let locator = parse_parent_locator(&buf[..len]).unwrap();
+        let entry = &locator.entries()[0];
+        assert_eq!(entry.defect, Some(VhdxParentLocatorDefect::KeyOutOfBounds));
+        // The key is resolved first, so a key this broken leaves the
+        // value undecoded too — but both raw descriptors survive, which
+        // is what lets a later phase say which entry it refused.
+        assert_eq!(entry.key(), b"");
+        assert_eq!(entry.value(), b"");
+        assert_eq!(entry.key_offset as usize, len);
+        assert_eq!(entry.key_length, 26);
+        assert!(locator.find(b"relative_path").is_none());
+    }
+
+    #[test]
+    fn parent_locator_key_offset_overflows() {
+        let mut buf = [0u8; 1024];
+        let len = build_locator_item(&[("relative_path", r".\parent.vhdx")], &mut buf);
+        // key_offset + key_length wraps a u32. The parser widens to
+        // usize and uses checked_add, so this is a refusal rather than
+        // a wrap into a legal-looking in-item range.
+        write_le_u32(&mut buf, entry_offset(0), u32::MAX);
+        write_le_u16(&mut buf, entry_offset(0) + 8, 26);
+
+        let locator = parse_parent_locator(&buf[..len]).unwrap();
+        assert_eq!(
+            locator.entries()[0].defect,
+            Some(VhdxParentLocatorDefect::KeyOutOfBounds)
+        );
+    }
+
+    #[test]
+    fn parent_locator_value_longer_than_parser_decodes() {
+        let mut buf = [0u8; 4096];
+        let len = build_locator_item(&[("relative_path", r".\parent.vhdx")], &mut buf);
+        // Claim a value one code unit past the parser's bound, still
+        // inside the item so the bounds check passes and the length
+        // check is what fires.
+        let over = (MAX_PARENT_LOCATOR_VALUE_UTF16 + 2) as u16;
+        write_le_u32(&mut buf, entry_offset(0) + 4, 32);
+        write_le_u16(&mut buf, entry_offset(0) + 10, over);
+        let item_len = 32 + over as usize;
+        assert!(item_len > len);
+
+        let locator = parse_parent_locator(&buf[..item_len]).unwrap();
+        let entry = &locator.entries()[0];
+        assert_eq!(entry.defect, Some(VhdxParentLocatorDefect::ValueTooLong));
+        // A resource bound, not a verdict on the image: the key still
+        // decoded, and the raw descriptor is preserved precisely so a
+        // caller that wants the value can go and read it.
+        assert_eq!(entry.key(), b"relative_path");
+        assert_eq!(entry.value_offset, 32);
+        assert_eq!(entry.value_length, over);
+    }
+
+    #[test]
+    fn parent_locator_value_decodes_as_nothing() {
+        let mut buf = [0u8; 1024];
+        let len = build_locator_item(&[("relative_path", r".\parent.vhdx")], &mut buf);
+        // Unpaired high surrogate (0xD800 little endian) at the start
+        // of the value. Refused, not replaced with U+FFFD: a locator
+        // value becomes a path the host opens, and a substituted
+        // character manufactures a path the image never contained.
+        let value_offset = le_u32(&buf, entry_offset(0) + 4) as usize;
+        buf[value_offset] = 0x00;
+        buf[value_offset + 1] = 0xD8;
+
+        let locator = parse_parent_locator(&buf[..len]).unwrap();
+        let entry = &locator.entries()[0];
+        assert_eq!(
+            entry.defect,
+            Some(VhdxParentLocatorDefect::ValueUndecodable)
+        );
+        assert_eq!(entry.key(), b"relative_path");
+        assert_eq!(entry.value(), b"");
+        // Findable by key, but the accessor still hands back nothing.
+        assert!(locator.find(b"relative_path").is_some());
+        assert_eq!(locator.relative_path(), None);
+    }
+
+    #[test]
+    fn parent_locator_value_of_odd_length_decodes_as_nothing() {
+        let mut buf = [0u8; 1024];
+        let len = build_locator_item(&[("relative_path", r".\parent.vhdx")], &mut buf);
+        // An odd byte length cannot be UTF-16 at all.
+        write_le_u16(&mut buf, entry_offset(0) + 10, 25);
+
+        let locator = parse_parent_locator(&buf[..len]).unwrap();
+        assert_eq!(
+            locator.entries()[0].defect,
+            Some(VhdxParentLocatorDefect::ValueUndecodable)
+        );
+    }
+
+    #[test]
     fn parent_locator_value_offset_past_region_end() {
         let mut buf = [0u8; 1024];
         let len = build_locator_item(&[("relative_path", r".\parent.vhdx")], &mut buf);
@@ -3065,7 +3292,10 @@ mod tests {
         // path calls, so the test exercises the real decision rather
         // than a hand-built state.
         let over_cap = (MAX_PARENT_LOCATOR_ITEM + 1) as u32;
-        let reason = plan_parent_locator_staging(over_cap).unwrap_err();
+        // 0x10028 is where Hyper-V and instar both place the item, and
+        // 1 MiB is the metadata region every real writer declares, so
+        // only the length is on trial here.
+        let reason = plan_parent_locator_staging(0x1_0028, over_cap, 0x10_0000).unwrap_err();
         assert_eq!(reason, VhdxParentLocatorNotStaged::ItemExceedsParserBound);
 
         let declined = VhdxParentLocatorState::NotStaged {
@@ -3098,14 +3328,40 @@ mod tests {
         // The bound is a bound, not a blanket refusal: the measured
         // Hyper-V item stages, and an item too short for its own header
         // is refused for a different, distinguishable reason.
-        assert_eq!(plan_parent_locator_staging(674), Ok(674));
         assert_eq!(
-            plan_parent_locator_staging((PARENT_LOCATOR_HEADER_SIZE - 1) as u32),
+            plan_parent_locator_staging(0x1_0028, 674, 0x10_0000),
+            Ok(674)
+        );
+        assert_eq!(
+            plan_parent_locator_staging(
+                0x1_0028,
+                (PARENT_LOCATOR_HEADER_SIZE - 1) as u32,
+                0x10_0000
+            ),
             Err(VhdxParentLocatorNotStaged::ItemTooShort)
         );
         assert_eq!(
-            plan_parent_locator_staging(MAX_PARENT_LOCATOR_ITEM as u32),
+            plan_parent_locator_staging(0x1_0028, MAX_PARENT_LOCATOR_ITEM as u32, 0x10_0000),
             Ok(MAX_PARENT_LOCATOR_ITEM)
+        );
+
+        // The region bound is checked before the parser's own bound,
+        // so an item that is both outside the region and too large
+        // reports the structural problem rather than instar's limit.
+        assert_eq!(
+            plan_parent_locator_staging(0x8000_0000, over_cap, 0x10_0000),
+            Err(VhdxParentLocatorNotStaged::ItemOutsideMetadataRegion)
+        );
+        // A region large enough to contain it puts it back on trial
+        // for its length.
+        assert_eq!(
+            plan_parent_locator_staging(0x1_0028, over_cap, 0xFFFF_FFFF),
+            Err(VhdxParentLocatorNotStaged::ItemExceedsParserBound)
+        );
+        // Overflowing the end offset is a refusal, not a wrap.
+        assert_eq!(
+            plan_parent_locator_staging(0xFFFF_FFFF, 674, 0xFFFF_FFFF),
+            Err(VhdxParentLocatorNotStaged::ItemOutsideMetadataRegion)
         );
     }
 
@@ -3122,5 +3378,652 @@ mod tests {
             VHDX_PARENT_LOCATOR_TYPE_GUID[0] ^ 0xFF
         );
         assert_eq!(locator.relative_path(), Some(r".\parent.vhdx".as_bytes()));
+    }
+
+    // ====================================================================
+    // Parent locator staging: the sector-assembly path
+    // ====================================================================
+
+    /// Bytes of the metadata region the staging fixture serves.
+    ///
+    /// 64 KB of metadata table plus room for items above
+    /// `METADATA_ITEMS_MIN_OFFSET`, which is where a real item has to
+    /// start.
+    const STAGE_REGION_LEN: usize = 0x11000;
+
+    /// A whole VHDX metadata region in memory, served one sector at a
+    /// time through a `CallTable`, so the staging loop can be driven
+    /// without a device.
+    ///
+    /// The region sits at file offset 0 in this fixture, so the sector
+    /// arithmetic the test reasons about is the arithmetic the loop
+    /// does — a non-zero `metadata_offset` would only hide it.
+    struct StageFixture {
+        region: [u8; STAGE_REGION_LEN],
+        /// Sector reads to serve before the reader starts refusing.
+        /// `u32::MAX` means "never refuse".
+        reads_before_failure: u32,
+        /// Sector reads served so far.
+        reads: u32,
+    }
+
+    // The reader is an `extern "C" fn` and so closes over nothing: the
+    // fixture has to be a global, and the lock is what keeps
+    // concurrently-running tests off each other's bytes. Same shape as
+    // `crates/qcow2`'s `STREAMING_FIXTURE`.
+    static STAGE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    static mut STAGE_FIXTURE: StageFixture = StageFixture {
+        region: [0u8; STAGE_REGION_LEN],
+        reads_before_failure: u32::MAX,
+        reads: 0,
+    };
+
+    /// Serve one sector out of the fixture, refusing once the read
+    /// budget is spent.
+    ///
+    /// Every access goes through a raw pointer rather than a reference,
+    /// because a reference to a `static mut` is what `static_mut_refs`
+    /// forbids.
+    unsafe extern "C" fn stage_read_sector(
+        _device_idx: u32,
+        sector: u64,
+        out_buf: *mut u8,
+        sector_size: usize,
+    ) -> bool {
+        let served = core::ptr::addr_of_mut!(STAGE_FIXTURE.reads);
+        let budget = core::ptr::addr_of!(STAGE_FIXTURE.reads_before_failure).read();
+        if served.read() >= budget {
+            return false;
+        }
+        served.write(served.read() + 1);
+
+        let start = (sector as usize).saturating_mul(sector_size);
+        match start.checked_add(sector_size) {
+            Some(end) if end <= STAGE_REGION_LEN => {}
+            _ => return false,
+        }
+        let base = core::ptr::addr_of!(STAGE_FIXTURE.region) as *const u8;
+        core::ptr::copy_nonoverlapping(base.add(start), out_buf, sector_size);
+        true
+    }
+
+    /// Zero the fixture, place `item` at `item_offset` inside the
+    /// region, and set the read budget.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold `STAGE_LOCK` for as long as it then uses
+    /// the fixture.
+    unsafe fn install_staged_item(item: &[u8], item_offset: usize, reads_before_failure: u32) {
+        assert!(item_offset + item.len() <= STAGE_REGION_LEN);
+        let region = core::ptr::addr_of_mut!(STAGE_FIXTURE.region) as *mut u8;
+        core::ptr::write_bytes(region, 0, STAGE_REGION_LEN);
+        core::ptr::copy_nonoverlapping(item.as_ptr(), region.add(item_offset), item.len());
+        core::ptr::addr_of_mut!(STAGE_FIXTURE.reads).write(0);
+        core::ptr::addr_of_mut!(STAGE_FIXTURE.reads_before_failure).write(reads_before_failure);
+    }
+
+    /// A `CallTable` with every function pointer set to a
+    /// trivially-correct stub, so a test can override the one entry it
+    /// cares about.
+    ///
+    /// Duplicated from `crates/qcow2`'s test module rather than shared,
+    /// because the type is 40-odd `extern "C"` pointers with distinct
+    /// signatures and `shared` has no test-support surface to put it
+    /// behind. If a third crate needs one, that is the point to factor
+    /// it out.
+    fn stub_call_table() -> shared::CallTable {
+        unsafe extern "C" fn s_get_dev_count() -> u32 {
+            1
+        }
+        unsafe extern "C" fn s_read_in(_: u32, _: u64, _: *mut u8, _: usize) -> bool {
+            false
+        }
+        unsafe extern "C" fn s_in_cap(_: u32) -> u64 {
+            8
+        }
+        unsafe extern "C" fn s_in_secsz(_: u32) -> usize {
+            512
+        }
+        unsafe extern "C" fn s_write_out(_: u64, _: *const u8, _: usize) -> bool {
+            false
+        }
+        unsafe extern "C" fn s_out_cap() -> u64 {
+            0
+        }
+        unsafe extern "C" fn s_out_secsz() -> usize {
+            512
+        }
+        unsafe extern "C" fn s_prog_int() -> u32 {
+            100
+        }
+        unsafe extern "C" fn s_send_prog(_: *const u8, _: u64, _: u64, _: u32) {}
+        unsafe extern "C" fn s_send_err(_: *const u8, _: *const u8, _: u64, _: u32) {}
+        unsafe extern "C" fn s_send_complete(_: *const u8, _: u64, _: bool) {}
+        unsafe extern "C" fn s_dbg(_: *const u8) {}
+        unsafe extern "C" fn s_verb(_: *const u8) {}
+        unsafe extern "C" fn s_get_op_cfg() -> shared::ConfigResult {
+            shared::ConfigResult {
+                ptr: core::ptr::null(),
+                len: 0,
+            }
+        }
+        unsafe extern "C" fn s_get_chain_cfg() -> shared::ConfigResult {
+            shared::ConfigResult {
+                ptr: core::ptr::null(),
+                len: 0,
+            }
+        }
+        unsafe extern "C" fn s_send_info(
+            _: *const u8,
+            _: u32,
+            _: u64,
+            _: u64,
+            _: u32,
+            _: u32,
+            _: *const u8,
+            _: *const u8,
+        ) {
+        }
+        unsafe extern "C" fn s_send_info_q(
+            _: *const u8,
+            _: u32,
+            _: u64,
+            _: u64,
+            _: u32,
+            _: u32,
+            _: *const u8,
+            _: *const u8,
+            _: *const shared::Qcow2Info,
+        ) {
+        }
+        unsafe extern "C" fn s_send_info_v(
+            _: *const u8,
+            _: u32,
+            _: u64,
+            _: u64,
+            _: u32,
+            _: u32,
+            _: *const u8,
+            _: *const u8,
+            _: *const shared::VmdkInfo,
+        ) {
+        }
+        unsafe extern "C" fn s_send_info_vdi(
+            _: *const u8,
+            _: u32,
+            _: u64,
+            _: u64,
+            _: u32,
+            _: u32,
+            _: *const u8,
+            _: *const u8,
+            _: *const shared::VdiInfo,
+        ) {
+        }
+        unsafe extern "C" fn s_send_info_l(
+            _: *const u8,
+            _: u32,
+            _: u64,
+            _: u64,
+            _: u32,
+            _: u32,
+            _: *const u8,
+            _: *const u8,
+            _: *const shared::LuksInfo,
+        ) {
+        }
+        unsafe extern "C" fn s_send_check(_: *const shared::CheckResult) {}
+        unsafe extern "C" fn s_send_compare(_: *const shared::CompareResult) {}
+        unsafe extern "C" fn s_send_measure(_: *const shared::MeasureResult) {}
+        unsafe extern "C" fn s_send_create(_: *const shared::CreateResult) {}
+        unsafe extern "C" fn s_read_out(_: u64, _: *mut u8, _: usize) -> bool {
+            false
+        }
+        unsafe extern "C" fn s_send_resize(_: *const shared::ResizeResult) {}
+        unsafe extern "C" fn s_send_rebase(_: *const shared::RebaseResult) {}
+        unsafe extern "C" fn s_send_commit(_: *const shared::CommitResult) {}
+        unsafe extern "C" fn s_write_in(_: u32, _: u64, _: *const u8, _: usize) -> bool {
+            false
+        }
+        unsafe extern "C" fn s_send_map_ex(_: *const shared::MapExtentRecord) {}
+        unsafe extern "C" fn s_send_map_res(_: *const shared::MapResult) {}
+        unsafe extern "C" fn s_send_snap_ent(_: *const shared::SnapshotEntryRecord) {}
+        unsafe extern "C" fn s_send_snap_res(_: *const shared::SnapshotResult) {}
+        unsafe extern "C" fn s_fsync_in(_: u32) -> bool {
+            true
+        }
+        unsafe extern "C" fn s_send_amend(_: *const shared::AmendResult) {}
+        unsafe extern "C" fn s_send_bitmap(_: *const shared::BitmapResult) {}
+        unsafe extern "C" fn s_send_bench_start() {}
+        unsafe extern "C" fn s_send_bench_result(_: *const shared::BenchResult) {}
+        shared::CallTable {
+            magic: shared::CallTable::MAGIC,
+            version: shared::CallTable::VERSION,
+            get_input_device_count: s_get_dev_count,
+            read_input_sector: s_read_in,
+            get_input_capacity: s_in_cap,
+            get_input_sector_size: s_in_secsz,
+            write_output_sector: s_write_out,
+            get_output_capacity: s_out_cap,
+            get_output_sector_size: s_out_secsz,
+            get_progress_interval: s_prog_int,
+            send_progress: s_send_prog,
+            send_error: s_send_err,
+            send_complete: s_send_complete,
+            debug_print: s_dbg,
+            verbose_print: s_verb,
+            get_operation_config: s_get_op_cfg,
+            get_chain_config: s_get_chain_cfg,
+            send_info_result: s_send_info,
+            send_info_result_qcow2: s_send_info_q,
+            send_info_result_vmdk: s_send_info_v,
+            send_info_result_vdi: s_send_info_vdi,
+            send_info_result_luks: s_send_info_l,
+            send_check_result: s_send_check,
+            send_compare_result: s_send_compare,
+            send_measure_result: s_send_measure,
+            send_create_result: s_send_create,
+            read_output_sector: s_read_out,
+            send_resize_result: s_send_resize,
+            send_rebase_result: s_send_rebase,
+            send_commit_result: s_send_commit,
+            write_input_sector: s_write_in,
+            send_map_extent: s_send_map_ex,
+            send_map_result: s_send_map_res,
+            send_snapshot_entry: s_send_snap_ent,
+            send_snapshot_result: s_send_snap_res,
+            fsync_input: s_fsync_in,
+            send_amend_result: s_send_amend,
+            send_bitmap_result: s_send_bitmap,
+            send_bench_start: s_send_bench_start,
+            send_bench_result: s_send_bench_result,
+        }
+    }
+    /// Take the fixture lock, ignoring poisoning.
+    ///
+    /// A test that fails while holding the lock would otherwise turn
+    /// every other staging test into a `PoisonError`, hiding the one
+    /// real failure behind a screen of unrelated ones.
+    fn stage_lock() -> std::sync::MutexGuard<'static, ()> {
+        STAGE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Replace the whole fixture region and reset the read budget.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold `STAGE_LOCK` for as long as it then uses
+    /// the fixture.
+    unsafe fn install_staged_region(bytes: &[u8]) {
+        assert!(bytes.len() <= STAGE_REGION_LEN);
+        let region = core::ptr::addr_of_mut!(STAGE_FIXTURE.region) as *mut u8;
+        core::ptr::write_bytes(region, 0, STAGE_REGION_LEN);
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), region, bytes.len());
+        core::ptr::addr_of_mut!(STAGE_FIXTURE.reads).write(0);
+        core::ptr::addr_of_mut!(STAGE_FIXTURE.reads_before_failure).write(u32::MAX);
+    }
+
+    /// A call table whose only working entry is the fixture reader.
+    fn stage_call_table() -> shared::CallTable {
+        shared::CallTable {
+            read_input_sector: stage_read_sector,
+            ..stub_call_table()
+        }
+    }
+
+    /// Drive `stage_parent_locator` against the fixture.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold `STAGE_LOCK`.
+    unsafe fn stage(
+        item_offset: u32,
+        item_length: u32,
+        metadata_length: u32,
+        sector_size: usize,
+        input_capacity: u64,
+    ) -> (VhdxParentLocatorState, u64) {
+        let call_table = stage_call_table();
+        let mut buffer = [0u8; MAX_SECTOR_SIZE];
+        let mut bytes_read = 0u64;
+        let state = stage_parent_locator(
+            &call_table,
+            0,
+            0,
+            item_offset,
+            item_length,
+            metadata_length,
+            sector_size,
+            input_capacity,
+            &mut bytes_read,
+            &mut buffer,
+        );
+        (state, bytes_read)
+    }
+
+    /// The reason a `NotStaged` state carries, or a panic.
+    fn not_staged_reason(state: &VhdxParentLocatorState) -> VhdxParentLocatorNotStaged {
+        match state {
+            VhdxParentLocatorState::NotStaged { reason, .. } => *reason,
+            _ => panic!("expected NotStaged"),
+        }
+    }
+
+    #[test]
+    fn staged_item_straddling_sector_boundaries_is_assembled() {
+        let _guard = stage_lock();
+
+        // A long absolute path pads the item past 1 KB so that it
+        // covers a whole middle sector as well as two partial ones.
+        let long_path = {
+            let mut path = std::string::String::from(r"C:\vms\");
+            while path.len() < 240 {
+                path.push('a');
+            }
+            path.push_str(".vhdx");
+            path
+        };
+        let mut item = [0u8; 1024];
+        let len = build_locator_item(
+            &[
+                ("parent_linkage", HYPERV_LINKAGE),
+                ("relative_path", r".\parent.vhdx"),
+                ("absolute_win32_path", long_path.as_str()),
+            ],
+            &mut item,
+        );
+
+        // Deliberately not sector-aligned, and long enough to span
+        // three 512-byte sectors: the assembly loop's offset-in-sector
+        // arithmetic and its `available`/`remaining` minimum are the
+        // point of the test, and an aligned item exercises neither.
+        // Three sectors also means one iteration copies a whole sector,
+        // which two sectors would never reach.
+        let item_offset = METADATA_ITEMS_MIN_OFFSET as usize + 500;
+        assert!(item_offset % 512 != 0);
+        assert!((item_offset % 512) + len > 512);
+
+        let (state, bytes_read) = unsafe {
+            install_staged_item(&item[..len], item_offset, u32::MAX);
+            stage(
+                item_offset as u32,
+                len as u32,
+                0x10_0000,
+                512,
+                (STAGE_REGION_LEN / 512) as u64,
+            )
+        };
+
+        let locator = match &state {
+            VhdxParentLocatorState::Parsed(locator) => locator,
+            other => panic!("expected Parsed, got {:?}", not_staged_reason(other)),
+        };
+        assert!(locator.is_vhdx_locator_type());
+        assert_eq!(locator.parent_linkage(), Some(HYPERV_LINKAGE.as_bytes()));
+        assert_eq!(locator.relative_path(), Some(r".\parent.vhdx".as_bytes()));
+
+        // Reassembly across sectors is the claim, so the sector count
+        // is asserted rather than left implied.
+        let first = item_offset / 512;
+        let last = (item_offset + len - 1) / 512;
+        assert_eq!(bytes_read, ((last - first + 1) * 512) as u64);
+        assert!(last > first + 1, "fixture should span three sectors");
+    }
+
+    #[test]
+    fn staged_item_past_input_capacity_is_declined() {
+        let _guard = stage_lock();
+
+        let mut item = [0u8; 1024];
+        let len = build_locator_item(&[("relative_path", r".\parent.vhdx")], &mut item);
+        let item_offset = METADATA_ITEMS_MIN_OFFSET as usize;
+
+        // The item is inside the metadata region the table declares,
+        // and inside the fixture, but the device says it has only two
+        // sectors. The region bound and the device bound are different
+        // facts, and this is the one that catches a region declared
+        // larger than the image.
+        let (state, bytes_read) = unsafe {
+            install_staged_item(&item[..len], item_offset, u32::MAX);
+            stage(item_offset as u32, len as u32, 0x10_0000, 512, 2)
+        };
+
+        assert_eq!(
+            not_staged_reason(&state),
+            VhdxParentLocatorNotStaged::ItemOutsideInput
+        );
+        // Declined before any read: a refusal must not cost I/O.
+        assert_eq!(bytes_read, 0);
+    }
+
+    #[test]
+    fn staged_item_is_declined_when_a_read_fails_partway() {
+        let _guard = stage_lock();
+
+        let mut item = [0u8; 1024];
+        let len = build_locator_item(
+            &[
+                ("parent_linkage", HYPERV_LINKAGE),
+                ("relative_path", r".\parent.vhdx"),
+            ],
+            &mut item,
+        );
+        let item_offset = METADATA_ITEMS_MIN_OFFSET as usize + 500;
+
+        // One sector is served, then the device refuses. A partially
+        // assembled item must not be parsed: half an item parses to
+        // plausible-looking nonsense, which is worse than no answer.
+        let (state, bytes_read) = unsafe {
+            install_staged_item(&item[..len], item_offset, 1);
+            stage(
+                item_offset as u32,
+                len as u32,
+                0x10_0000,
+                512,
+                (STAGE_REGION_LEN / 512) as u64,
+            )
+        };
+
+        assert_eq!(
+            not_staged_reason(&state),
+            VhdxParentLocatorNotStaged::ReadFailed
+        );
+        // The one successful read is still accounted for.
+        assert_eq!(bytes_read, 512);
+    }
+
+    #[test]
+    fn staged_item_outside_the_metadata_region_is_declined() {
+        let _guard = stage_lock();
+
+        let mut item = [0u8; 1024];
+        let len = build_locator_item(&[("relative_path", r".\parent.vhdx")], &mut item);
+
+        // A crafted table entry pointing far past the region. Without
+        // the region bound this reads unrelated image bytes and parses
+        // them as a parent locator; the sector loop alone would not
+        // stop it on a large enough image.
+        let capacity = (STAGE_REGION_LEN / 512) as u64;
+        let (state, bytes_read) = unsafe {
+            install_staged_item(&item[..len], METADATA_ITEMS_MIN_OFFSET as usize, u32::MAX);
+            stage(0x8000_0000, len as u32, 0x10_0000, 512, capacity)
+        };
+        assert_eq!(
+            not_staged_reason(&state),
+            VhdxParentLocatorNotStaged::ItemOutsideMetadataRegion
+        );
+        assert_eq!(bytes_read, 0);
+
+        // And the floor: the first 64 KB of the region is the metadata
+        // table itself, so an item claiming to start inside it is
+        // refused even though those bytes are readable.
+        let (state, _) = unsafe { stage(0x8000, len as u32, 0x10_0000, 512, capacity) };
+        assert_eq!(
+            not_staged_reason(&state),
+            VhdxParentLocatorNotStaged::ItemOutsideMetadataRegion
+        );
+
+        // An item that starts legally but runs off the end of the
+        // region is refused for the same reason.
+        let (state, _) = unsafe { stage(0xF_F000, 0x2000, 0x10_0000, 512, capacity) };
+        assert_eq!(
+            not_staged_reason(&state),
+            VhdxParentLocatorNotStaged::ItemOutsideMetadataRegion
+        );
+    }
+
+    // ====================================================================
+    // parse_metadata: the parent locator gate
+    // ====================================================================
+
+    /// Build a whole metadata region: the five items `build_metadata`
+    /// writes, plus optionally a sixth table entry and item for a
+    /// parent locator, laid out the way the phase 1 pin's generator
+    /// lays out Hyper-V's.
+    fn metadata_region(has_parent: bool, with_locator: bool) -> std::vec::Vec<u8> {
+        let mut region = std::vec![0u8; STAGE_REGION_LEN];
+        build_metadata(
+            &mut region,
+            1024 * 1024,
+            64 * 1024 * 1024,
+            512,
+            512,
+            has_parent,
+        );
+
+        if with_locator {
+            let mut item = [0u8; 1024];
+            let len = build_locator_item(
+                &[
+                    ("parent_linkage", HYPERV_LINKAGE),
+                    ("relative_path", r".\parent.vhdx"),
+                ],
+                &mut item,
+            );
+            // 0x10028 is the first free byte above the five existing
+            // items, and is where Hyper-V puts its locator too.
+            let item_offset: u32 = 0x1_0028;
+            let at = item_offset as usize;
+            region[at..at + len].copy_from_slice(&item[..len]);
+
+            let e = 32 + 5 * METADATA_TABLE_ENTRY_SIZE;
+            region[e..e + 16].copy_from_slice(&PARENT_LOCATOR_GUID);
+            write_le_u32(&mut region, e + 16, item_offset);
+            write_le_u32(&mut region, e + 20, len as u32);
+            write_le_u32(&mut region, e + 24, 0x04);
+            write_le_u16(&mut region, 10, 6);
+        }
+        region
+    }
+
+    /// Parse the fixture region as metadata sitting at file offset 0.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold `STAGE_LOCK`.
+    unsafe fn parse_fixture_metadata() -> (Option<VhdxMetadata>, u64) {
+        let call_table = stage_call_table();
+        let mut bytes_read = 0u64;
+        let metadata = parse_metadata(
+            &call_table,
+            0,
+            0,
+            0x10_0000,
+            512,
+            (STAGE_REGION_LEN / 512) as u64,
+            &mut bytes_read,
+        );
+        (metadata, bytes_read)
+    }
+
+    #[test]
+    fn ordinary_image_has_no_parent_locator_and_reads_nothing_extra() {
+        let _guard = stage_lock();
+
+        let region = metadata_region(false, false);
+        let (metadata, bytes_read) = unsafe {
+            install_staged_region(&region);
+            parse_fixture_metadata()
+        };
+
+        let metadata = metadata.expect("ordinary metadata should parse");
+        assert!(!metadata.has_parent);
+        // Absent, not a stale or garbage locator: the table listed no
+        // item, which is the only thing `Absent` is allowed to mean.
+        assert!(metadata.parent_locator.is_absent());
+        assert!(metadata.parent_locator.parsed().is_none());
+
+        // The five reads this function always did — table, file
+        // parameters, virtual size, logical and physical sector size —
+        // and not one more. This is the unit-level form of the phase's
+        // no-behaviour-change claim: an image without a parent costs
+        // exactly what it cost before.
+        assert_eq!(bytes_read, 5 * 512);
+    }
+
+    #[test]
+    fn locator_item_without_has_parent_is_reported_not_read() {
+        let _guard = stage_lock();
+
+        // A metadata table listing a parent locator item while the file
+        // parameters item denies having a parent. Anomalous, and the
+        // anomaly is the interesting fact — so it comes back as a
+        // distinct refusal rather than as `Absent` (which would claim
+        // the table listed nothing) or as a parse (which would spend
+        // reads on an image that will never use the answer).
+        let region = metadata_region(false, true);
+        let (metadata, bytes_read) = unsafe {
+            install_staged_region(&region);
+            parse_fixture_metadata()
+        };
+
+        let metadata = metadata.expect("metadata should parse");
+        assert!(!metadata.has_parent);
+        assert!(!metadata.parent_locator.is_absent());
+        assert!(metadata.parent_locator.parsed().is_none());
+        match metadata.parent_locator {
+            VhdxParentLocatorState::NotStaged {
+                item_offset,
+                item_length,
+                reason,
+            } => {
+                assert_eq!(item_offset, 0x1_0028);
+                assert!(item_length > 0);
+                assert_eq!(reason, VhdxParentLocatorNotStaged::ImageClaimsNoParent);
+            }
+            _ => panic!("expected NotStaged"),
+        }
+        // Reported without reading the item.
+        assert_eq!(bytes_read, 5 * 512);
+    }
+
+    #[test]
+    fn differencing_image_parses_its_parent_locator() {
+        let _guard = stage_lock();
+
+        let region = metadata_region(true, true);
+        let (metadata, bytes_read) = unsafe {
+            install_staged_region(&region);
+            parse_fixture_metadata()
+        };
+
+        let metadata = metadata.expect("differencing metadata should parse");
+        assert!(metadata.has_parent);
+        let locator = metadata
+            .parent_locator
+            .parsed()
+            .expect("a differencing image's locator should be staged and parsed");
+        assert!(locator.is_vhdx_locator_type());
+        assert_eq!(locator.parent_linkage(), Some(HYPERV_LINKAGE.as_bytes()));
+        assert_eq!(locator.relative_path(), Some(r".\parent.vhdx".as_bytes()));
+
+        // The five metadata reads, plus whatever the item cost. The
+        // extra reads land only here, which is what the `has_parent`
+        // gate buys.
+        assert!(bytes_read > 5 * 512);
     }
 }

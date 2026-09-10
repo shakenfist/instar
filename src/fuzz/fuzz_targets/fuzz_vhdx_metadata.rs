@@ -54,11 +54,17 @@ fuzz_target!(|data: &[u8]| {
 
         // Also exercise standalone metadata parsing at various offsets
         // (metadata table can appear at different locations in VHDX)
+        // The metadata region length is passed as 1 MiB, the size every
+        // real VHDX writer uses, so that the parent locator staging path
+        // stays reachable: items are bounded against this length, and a
+        // zero here would make every locator entry out of region and
+        // fuzz nothing below that check.
         for metadata_offset in [0u64, 0x10000, 0x30000] {
             let _ = vhdx::parse_metadata(
                 &call_table,
                 0,
                 metadata_offset,
+                1024 * 1024,
                 sector_size,
                 input_capacity,
                 &mut bytes_read,

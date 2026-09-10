@@ -1464,6 +1464,10 @@ unsafe fn check_vhdx(
     let bat_offset = regions[0].file_offset;
     let bat_length = regions[0].length;
     let metadata_offset = regions[1].file_offset;
+    // The metadata region's declared Length. It bounds where a
+    // metadata item may live, which `parse_metadata` needs in order to
+    // refuse a parent locator entry pointing outside the region.
+    let metadata_length = regions[1].length;
 
     // --- Validate region table 2 (cross-check with RT1) ---
     {
@@ -1538,6 +1542,7 @@ unsafe fn check_vhdx(
         call_table,
         0,
         metadata_offset,
+        metadata_length,
         sector_size,
         input_capacity,
         &mut bytes_read,
