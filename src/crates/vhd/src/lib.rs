@@ -3,13 +3,30 @@
 //! Provides VHD footer and dynamic header parsing, BAT (Block Allocation
 //! Table) reading, and block lookup for dynamic VHD images. Fixed VHDs
 //! (disk_type=2) are treated as raw data with a trailing footer.
+//!
+//! # Parent locators do no I/O
+//!
+//! The differencing-image parsers in this module ([`VhdParentInfo`],
+//! [`VhdParentLocatorTable`]) take byte slices and never touch a
+//! [`CallTable`]. Where locator platform data lives outside the 1024-byte
+//! header, the caller reads it and hands it over as a [`VhdImageWindow`].
+//!
+//! This is a deliberate departure from the local precedent, and it is
+//! worth naming so a later reader does not conclude the module is simply
+//! inconsistent. `qcow2::read_backing_file` is the shape this module
+//! follows in one respect — the header keeps the offset and length, and a
+//! separate function produces the string — but it takes a `CallTable` and
+//! reads sectors itself. This module does not, so that phase 9 can point a
+//! coverage-guided fuzz target at [`VhdParentInfo::parse`] the way
+//! `fuzz_vhd_footer` points at [`VhdFooter::parse`]. See decision 7 of
+//! `docs/plans/PLAN-differencing-phase-03-parse.md`.
 
 #![no_std]
 #![allow(clippy::too_many_arguments)]
 
 use shared::{
-    be_u16, be_u32, be_u64, write_be_u16, write_be_u32, write_be_u64, AllocationSummary, CallTable,
-    MapExtent, MapExtentCoalescer, MapExtentState, MAX_SECTOR_SIZE,
+    be_u16, be_u32, be_u64, utf16_to_utf8, write_be_u16, write_be_u32, write_be_u64,
+    AllocationSummary, CallTable, MapExtent, MapExtentCoalescer, MapExtentState, MAX_SECTOR_SIZE,
 };
 
 // ============================================================================
@@ -71,6 +88,62 @@ pub const DYN_MAX_TABLE_ENTRIES_OFFSET: usize = 28;
 pub const DYN_BLOCK_SIZE_OFFSET: usize = 32;
 /// Dynamic header checksum offset (u32 BE).
 pub const DYN_CHECKSUM_OFFSET: usize = 36;
+
+// ----------------------------------------------------------------------------
+// Differencing-only dynamic header fields. Offsets and endiannesses are
+// pinned in docs/plans/PLAN-differencing-phase-01-pin.md, "VHD — the
+// dynamic header of a differencing child"; every row there is backed by an
+// xxd of a Hyper-V image.
+// ----------------------------------------------------------------------------
+
+/// Parent unique id offset: 16 opaque bytes, the parent footer's bytes
+/// 68..84 copied verbatim. Not byte-swapped and not a parsed UUID.
+pub const DYN_PARENT_UNIQUE_ID_OFFSET: usize = 40;
+/// Parent timestamp offset (u32 BE), seconds since 2000-01-01.
+pub const DYN_PARENT_TIMESTAMP_OFFSET: usize = 56;
+/// Parent unicode name offset. UTF-16 **BIG** endian — the opposite of the
+/// locator platform data 512 bytes further on.
+pub const DYN_PARENT_NAME_OFFSET: usize = 64;
+/// Parent unicode name field size in bytes: 256 UTF-16 code units.
+///
+/// This is the bound for *parsing*: a name filling all 512 bytes with no
+/// terminator is valid and complete, and a reader must never scan past the
+/// field looking for one (decision 3; over-reading here is libvhdi defect
+/// C). instar's own *emitter* refuses at 256 code units and accepts at
+/// most 255, so that everything instar writes keeps a terminating NUL
+/// inside the field and reads back correctly through libvhdi
+/// (PLAN-differencing-phase-01-pin.md:716). The two numbers are opposite
+/// directions of the same field, not a typo in either.
+pub const DYN_PARENT_NAME_SIZE: usize = 512;
+/// Parent locator table offset: 8 entries of 24 bytes.
+pub const DYN_PARENT_LOCATORS_OFFSET: usize = 576;
+
+/// Number of parent locator entries. Fixed at 8 by SPEC(VHD).
+pub const PARENT_LOCATOR_COUNT: usize = 8;
+/// Size of one parent locator entry in bytes.
+pub const PARENT_LOCATOR_ENTRY_SIZE: usize = 24;
+/// Size of the whole parent locator table in bytes.
+pub const PARENT_LOCATOR_TABLE_SIZE: usize = PARENT_LOCATOR_COUNT * PARENT_LOCATOR_ENTRY_SIZE;
+
+/// Locator entry: platform code offset (4 ASCII bytes, not byte-swapped).
+pub const LOC_PLATFORM_CODE_OFFSET: usize = 0;
+/// Locator entry: platform data space offset (u32 BE, a byte count).
+pub const LOC_DATA_SPACE_OFFSET: usize = 4;
+/// Locator entry: platform data length offset (u32 BE, bytes).
+pub const LOC_DATA_LENGTH_OFFSET: usize = 8;
+/// Locator entry: reserved offset (u32 BE).
+pub const LOC_RESERVED_OFFSET: usize = 12;
+/// Locator entry: platform data offset (u64 BE, absolute in the file).
+pub const LOC_DATA_OFFSET_OFFSET: usize = 16;
+
+/// Worst-case UTF-8 length of a fully populated parent unicode name.
+///
+/// 256 UTF-16 code units; the worst case is 256 code units in
+/// `U+0800..=U+FFFF` at three UTF-8 bytes each. Surrogate pairs are
+/// cheaper (two code units produce four bytes), so 768 is the tight bound.
+/// A caller passing `[0u8; MAX_PARENT_NAME_UTF8]` to
+/// [`VhdParentInfo::decode_name`] can never be refused for want of space.
+pub const MAX_PARENT_NAME_UTF8: usize = 768;
 
 // ============================================================================
 // VHD constants
@@ -213,6 +286,701 @@ impl VhdDynamicHeader {
             block_size,
             checksum,
         })
+    }
+}
+
+// ============================================================================
+// VHD parent locator parsing (differencing images)
+// ============================================================================
+//
+// Layout authority: docs/plans/PLAN-differencing-phase-01-pin.md, sections
+// "VHD — the dynamic header of a differencing child" and "VHD — the eight
+// parent locator entries". Every offset there is backed by an xxd of a
+// Hyper-V-produced image; do not rediscover them.
+
+/// Bytes the caller has read out of the image, tagged with the absolute
+/// file offset of `bytes[0]`.
+///
+/// Locator platform data lives at an absolute file offset outside the
+/// 1024-byte dynamic header, and this parser performs no I/O, so the
+/// caller reads whatever it likes — a sector, two sectors, an mmap of the
+/// whole file — and hands the bytes over tagged with where they came from.
+/// The parser, rather than the caller, then turns an offset read out of
+/// the image into a slice index: [`VhdImageWindow::slice_at`] is the only
+/// place in this module where that conversion happens.
+///
+/// The same type serves both sides of the sandbox boundary. A guest
+/// operation fills a `[u8; MAX_SECTOR_SIZE]` through the call table and
+/// wraps it; the host wraps a `pread` buffer or a whole-file mapping.
+#[derive(Debug, Clone, Copy)]
+pub struct VhdImageWindow<'a> {
+    /// Absolute file offset of `bytes[0]`.
+    pub file_offset: u64,
+    /// The bytes the caller has read.
+    pub bytes: &'a [u8],
+}
+
+impl<'a> VhdImageWindow<'a> {
+    /// The `len` bytes at absolute file offset `offset`, or `None` when
+    /// that range is not wholly inside this window.
+    ///
+    /// Every step is checked: `offset >= self.file_offset`, both the
+    /// relative start and the length convert to `usize` without
+    /// truncation, and `rel.checked_add(len)` is compared against
+    /// `bytes.len()` before any indexing.
+    pub fn slice_at(&self, offset: u64, len: u64) -> Option<&'a [u8]> {
+        if offset < self.file_offset {
+            return None;
+        }
+        let rel = usize::try_from(offset - self.file_offset).ok()?;
+        let len = usize::try_from(len).ok()?;
+        let end = rel.checked_add(len)?;
+        if end > self.bytes.len() {
+            return None;
+        }
+        Some(&self.bytes[rel..end])
+    }
+}
+
+/// The image extents a locator's platform data must not collide with.
+///
+/// A pair of bare `u64`s would be silently swappable at a call site, and
+/// both bounds here police values read out of untrusted image data.
+///
+/// **The BAT is deliberately not covered.** A locator whose platform data
+/// points into the block allocation table is not marked malformed, because
+/// the only source for the BAT's extent is `table_offset` and
+/// `max_table_entries` in the very header whose locators are being
+/// validated — using an untrusted header to validate its own contents
+/// proves nothing. Phase 11 (host-side chain walking) must not assume this
+/// parser has already refused such an image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VhdImageBounds {
+    /// Total image length in bytes.
+    pub image_len: u64,
+    /// Absolute file offset of the 1024-byte dynamic header — the
+    /// footer's `data_offset`, 512 for everything in the corpus and for
+    /// everything instar emits.
+    pub header_offset: u64,
+}
+
+/// The platform code of a parent locator entry: four ASCII bytes stored in
+/// file order and **not** byte-swapped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VhdPlatform {
+    /// Four zero bytes: the slot is unused.
+    Unused,
+    /// `W2ku` — absolute Unicode (UTF-16LE) pathname on Windows.
+    W2ku,
+    /// `W2ru` — Unicode (UTF-16LE) path relative to the differencing disk.
+    W2ru,
+    /// `Wi2k` — deprecated absolute Windows path.
+    Wi2k,
+    /// `Wi2r` — deprecated relative Windows path.
+    Wi2r,
+    /// `MacX` — a UTF-8 `file://` URL. Not decoded by this crate.
+    MacX,
+    /// `Mac ` — an opaque Mac OS alias blob. Not decoded by this crate.
+    Mac,
+    /// Any other four bytes, preserved verbatim.
+    Other([u8; 4]),
+}
+
+impl VhdPlatform {
+    /// Decode four raw platform code bytes.
+    pub fn from_code(code: [u8; 4]) -> Self {
+        match &code {
+            [0, 0, 0, 0] => VhdPlatform::Unused,
+            b"W2ku" => VhdPlatform::W2ku,
+            b"W2ru" => VhdPlatform::W2ru,
+            b"Wi2k" => VhdPlatform::Wi2k,
+            b"Wi2r" => VhdPlatform::Wi2r,
+            b"MacX" => VhdPlatform::MacX,
+            b"Mac " => VhdPlatform::Mac,
+            _ => VhdPlatform::Other(code),
+        }
+    }
+
+    /// Selection rank for [`VhdParentLocatorTable::preferred_locator`]:
+    /// `W2ru` (0) before `W2ku` (1) before `Wi2r` (2) before `Wi2k` (3).
+    /// `None` for every non-Windows code, which is never selected
+    /// (decision 5 of PLAN-differencing-phase-03-parse.md).
+    pub fn preference(self) -> Option<u8> {
+        match self {
+            VhdPlatform::W2ru => Some(0),
+            VhdPlatform::W2ku => Some(1),
+            VhdPlatform::Wi2r => Some(2),
+            VhdPlatform::Wi2k => Some(3),
+            _ => None,
+        }
+    }
+
+    /// Whether this code's platform data is a UTF-16 **little** endian
+    /// string that [`VhdParentLocator::decode_path`] will decode.
+    pub fn is_utf16le_path(self) -> bool {
+        matches!(
+            self,
+            VhdPlatform::W2ku | VhdPlatform::W2ru | VhdPlatform::Wi2k | VhdPlatform::Wi2r
+        )
+    }
+}
+
+/// Why a parent locator entry, or an attempt to decode its platform data,
+/// was refused.
+///
+/// Decision 4: a malformed entry is *marked*, not dropped, and its raw
+/// fields are preserved, so phase 4 can say why it is refusing. The first
+/// six variants are set at parse time and are purely structural; the last
+/// three arise only when a caller asks for the string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VhdLocatorDefect {
+    /// The platform code is populated but `platform_data_length` is zero:
+    /// a locator that names nothing.
+    EmptyData,
+    /// `platform_data_offset + platform_data_length` overflows `u64`.
+    OffsetOverflow,
+    /// The platform data range extends past the end of the image.
+    DataOutsideImage,
+    /// The platform data range intersects the footer, either the copy at
+    /// file offset 0 or the trailing one.
+    OverlapsFooter,
+    /// The platform data range intersects the 1024-byte dynamic header.
+    OverlapsHeader,
+    /// `platform_data_length` exceeds `platform_data_space`.
+    LengthExceedsSpace,
+    /// The caller supplied no window, or one that does not cover this
+    /// entry's platform data range. Distinguishable from a decode failure
+    /// on purpose: the caller can widen the window and retry.
+    DataNotSupplied,
+    /// The platform code is not one this crate decodes (`MacX` is UTF-8,
+    /// `Mac ` is opaque, anything else is unknown).
+    UnsupportedPlatformCode,
+    /// `shared::utf16_to_utf8` refused: an odd byte count, an unpaired
+    /// surrogate, or output that did not fit the caller's buffer.
+    Undecodable,
+}
+
+/// One parent locator entry: 24 bytes at header offset
+/// `+576 + slot * 24`.
+///
+/// Every raw field is preserved whether or not the entry validated;
+/// `defect` records the first structural problem found. All four numeric
+/// fields are big-endian in the image. `platform_code` is ASCII in file
+/// order and is **not** byte-swapped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VhdParentLocator {
+    /// Raw platform code bytes, exactly as they lie at `+0`.
+    pub platform_code: [u8; 4],
+    /// Platform data space at `+4`. A **byte** count, not the 512-byte
+    /// sector count SPEC(VHD)'s wording implies — see the pin's "Where
+    /// SPEC(VHD) and Hyper-V disagree: platform data space", where the
+    /// sector reading is shown to be arithmetically impossible on both
+    /// measured Hyper-V images.
+    pub platform_data_space: u32,
+    /// Platform data length at `+8`, in bytes, with no terminator.
+    pub platform_data_length: u32,
+    /// Reserved at `+12`. Preserved so later phases can assert that
+    /// Hyper-V writes zero here.
+    pub reserved: u32,
+    /// Platform data offset at `+16`: an absolute byte offset in the file.
+    pub platform_data_offset: u64,
+    /// The first structural defect found, or `None`.
+    pub defect: Option<VhdLocatorDefect>,
+}
+
+impl VhdParentLocator {
+    /// An all-zero, unused entry.
+    pub const EMPTY: VhdParentLocator = VhdParentLocator {
+        platform_code: [0; 4],
+        platform_data_space: 0,
+        platform_data_length: 0,
+        reserved: 0,
+        platform_data_offset: 0,
+        defect: None,
+    };
+
+    /// Parse one 24-byte entry and validate its offsets against `bounds`.
+    ///
+    /// Never returns `None` for a malformed entry: the entry comes back
+    /// with `defect` set, raw fields intact (decision 4). `None` means
+    /// only that `entry` is shorter than [`PARENT_LOCATOR_ENTRY_SIZE`].
+    pub fn parse(entry: &[u8], bounds: &VhdImageBounds) -> Option<Self> {
+        if entry.len() < PARENT_LOCATOR_ENTRY_SIZE {
+            return None;
+        }
+
+        let mut platform_code = [0u8; 4];
+        platform_code
+            .copy_from_slice(&entry[LOC_PLATFORM_CODE_OFFSET..LOC_PLATFORM_CODE_OFFSET + 4]);
+        let platform_data_space = be_u32(entry, LOC_DATA_SPACE_OFFSET);
+        let platform_data_length = be_u32(entry, LOC_DATA_LENGTH_OFFSET);
+        let reserved = be_u32(entry, LOC_RESERVED_OFFSET);
+        let platform_data_offset = be_u64(entry, LOC_DATA_OFFSET_OFFSET);
+
+        let defect = locator_defect(
+            platform_code,
+            platform_data_space,
+            platform_data_length,
+            platform_data_offset,
+            bounds,
+        );
+
+        Some(VhdParentLocator {
+            platform_code,
+            platform_data_space,
+            platform_data_length,
+            reserved,
+            platform_data_offset,
+            defect,
+        })
+    }
+
+    /// The decoded platform code.
+    pub fn platform(&self) -> VhdPlatform {
+        VhdPlatform::from_code(self.platform_code)
+    }
+
+    /// Whether the slot is empty (four zero platform code bytes).
+    ///
+    /// An unused slot is not a defect, and an unused slot appearing after
+    /// a populated one does **not** terminate the table: SPEC(VHD) defines
+    /// no sentinel, and the ordinary Hyper-V shape is two populated
+    /// entries followed by six zero slots.
+    pub fn is_unused(&self) -> bool {
+        self.platform_code == [0u8; 4]
+    }
+
+    /// Whether this entry could name the parent: populated, defect-free,
+    /// and carrying a Windows platform code.
+    pub fn is_candidate(&self) -> bool {
+        !self.is_unused() && self.defect.is_none() && self.platform().preference().is_some()
+    }
+
+    /// This entry's raw platform data bytes, trimmed at the first `0x0000`
+    /// UTF-16 code unit if there is one.
+    ///
+    /// This is what [`VhdParentLocatorTable::preferred_locator`] compares
+    /// when two entries share a platform code: equal codes share an
+    /// encoding, UTF-16 encoding is injective, and the only wrinkle — one
+    /// blob carrying a terminating NUL where the other does not — is
+    /// removed by the trim. So the comparison needs no decode and no
+    /// scratch buffer. A `0x0000` code unit is two zero bytes in either
+    /// byte order, so the trim does not depend on endianness.
+    pub fn raw_path_bytes<'a>(
+        &self,
+        data: &VhdImageWindow<'a>,
+    ) -> Result<&'a [u8], VhdLocatorDefect> {
+        if let Some(defect) = self.defect {
+            return Err(defect);
+        }
+        if self.is_unused() {
+            return Err(VhdLocatorDefect::EmptyData);
+        }
+        let bytes = data
+            .slice_at(self.platform_data_offset, self.platform_data_length as u64)
+            .ok_or(VhdLocatorDefect::DataNotSupplied)?;
+        Ok(trim_at_nul_code_unit(bytes))
+    }
+
+    /// Decode this entry's platform data into `dst` as UTF-8, returning
+    /// the number of bytes written.
+    ///
+    /// The platform data of `W2ku` / `W2ru` / `Wi2k` / `Wi2r` is UTF-16
+    /// **LITTLE** endian — the opposite of the parent unicode name field
+    /// 512 bytes earlier in the header. This is the call site that passes
+    /// `big_endian = false` to `shared::utf16_to_utf8`; the other, in
+    /// [`VhdParentInfo::decode_name`], passes `true`.
+    ///
+    /// Any other platform code is refused with `UnsupportedPlatformCode`
+    /// rather than guessed at: `MacX` platform data is UTF-8 and `Mac `
+    /// is an opaque blob, and `vhd-diff-locator-conflicting.vhd` exists in
+    /// part to catch a reader that decodes every entry the same way.
+    pub fn decode_path(
+        &self,
+        data: &VhdImageWindow<'_>,
+        dst: &mut [u8],
+    ) -> Result<usize, VhdLocatorDefect> {
+        if let Some(defect) = self.defect {
+            return Err(defect);
+        }
+        if self.is_unused() {
+            return Err(VhdLocatorDefect::EmptyData);
+        }
+        if !self.platform().is_utf16le_path() {
+            return Err(VhdLocatorDefect::UnsupportedPlatformCode);
+        }
+        let bytes = self.raw_path_bytes(data)?;
+        utf16_to_utf8(bytes, false, dst).ok_or(VhdLocatorDefect::Undecodable)
+    }
+}
+
+/// The first structural defect of a locator entry, or `None`.
+///
+/// Checked in this order: empty data, offset overflow, past end of image,
+/// footer overlap, header overlap, length beyond space. An unused slot
+/// (four zero platform code bytes) has no defect.
+///
+/// Every comparison here is on values read out of the image, so the
+/// addition uses `checked_add` and nothing is indexed.
+fn locator_defect(
+    platform_code: [u8; 4],
+    platform_data_space: u32,
+    platform_data_length: u32,
+    platform_data_offset: u64,
+    bounds: &VhdImageBounds,
+) -> Option<VhdLocatorDefect> {
+    if platform_code == [0u8; 4] {
+        return None;
+    }
+    if platform_data_length == 0 {
+        return Some(VhdLocatorDefect::EmptyData);
+    }
+
+    let start = platform_data_offset;
+    let end = match start.checked_add(platform_data_length as u64) {
+        Some(end) => end,
+        None => return Some(VhdLocatorDefect::OffsetOverflow),
+    };
+    if end > bounds.image_len {
+        return Some(VhdLocatorDefect::DataOutsideImage);
+    }
+
+    // The footer copy at file offset 0, and the trailing footer. Both are
+    // refused under one defect: a locator naming either is equally wrong.
+    if ranges_overlap(start, end, 0, FOOTER_SIZE as u64) {
+        return Some(VhdLocatorDefect::OverlapsFooter);
+    }
+    if let Some(tail_start) = bounds.image_len.checked_sub(FOOTER_SIZE as u64) {
+        if ranges_overlap(start, end, tail_start, bounds.image_len) {
+            return Some(VhdLocatorDefect::OverlapsFooter);
+        }
+    }
+
+    let header_end = bounds
+        .header_offset
+        .saturating_add(DYNAMIC_HEADER_SIZE as u64);
+    if ranges_overlap(start, end, bounds.header_offset, header_end) {
+        return Some(VhdLocatorDefect::OverlapsHeader);
+    }
+
+    if platform_data_length > platform_data_space {
+        return Some(VhdLocatorDefect::LengthExceedsSpace);
+    }
+
+    None
+}
+
+/// Whether two half-open ranges intersect.
+fn ranges_overlap(a_start: u64, a_end: u64, b_start: u64, b_end: u64) -> bool {
+    a_start < b_end && b_start < a_end
+}
+
+/// Truncate at the first `0x0000` UTF-16 code unit, if there is one.
+fn trim_at_nul_code_unit(bytes: &[u8]) -> &[u8] {
+    let mut i = 0usize;
+    while i + 2 <= bytes.len() {
+        if bytes[i] == 0 && bytes[i + 1] == 0 {
+            return &bytes[..i];
+        }
+        i += 2;
+    }
+    bytes
+}
+
+/// Why [`VhdParentLocatorTable::preferred_locator`] could not choose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AmbiguityReason {
+    /// Both entries' platform data was available and the two differ.
+    ContentsDiffer,
+    /// No window covering both entries' platform data was supplied, so
+    /// whether they agree is unknown. Conservatively ambiguous: this is a
+    /// security boundary, and "I could not check whether they agree" must
+    /// not read as "they agree".
+    ContentsUnknown,
+}
+
+/// The outcome of selecting the entry that names the parent (decision 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreferredLocator {
+    /// Exactly one entry wins. `slot` indexes
+    /// [`VhdParentLocatorTable::entries`].
+    ///
+    /// `demoted_from` is `Some(slot)` when a *higher*-precedence entry
+    /// existed and was passed over because it carries a defect — the
+    /// lowest such slot. It is `None` in the ordinary case, including
+    /// when the winner is already the highest-precedence code present.
+    ///
+    /// The field exists because the demotion is attacker-controllable:
+    /// corrupting a `W2ru` entry's offset moves selection to the
+    /// absolute `W2ku` path, which is a different file. Without this,
+    /// a caller cannot tell that from an image that simply never had a
+    /// relative locator, and would have to re-walk `entries` to find
+    /// out. Phase 4 decides whether to refuse, warn or proceed;
+    /// this only makes sure the fact reaches it.
+    Found {
+        slot: usize,
+        demoted_from: Option<usize>,
+    },
+    /// No entry carries a Windows platform code, or every entry that does
+    /// is unused or malformed. The caller reads `entries` to say why —
+    /// decision 4 keeps the reason on the entries rather than duplicating
+    /// it here.
+    NotFound,
+    /// Two entries share the winning platform code and do not agree.
+    /// `first` is the lowest-slot winner; `second` is the lowest slot
+    /// carrying the same code that disagrees with it. A third or later
+    /// conflicting duplicate is not reported.
+    Ambiguous {
+        first: usize,
+        second: usize,
+        reason: AmbiguityReason,
+    },
+}
+
+/// The eight parent locator entries, in slot order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VhdParentLocatorTable {
+    /// Slots 1..8 of SPEC(VHD), indexed 0..8.
+    pub entries: [VhdParentLocator; PARENT_LOCATOR_COUNT],
+}
+
+impl VhdParentLocatorTable {
+    /// Parse the 192-byte locator table, validating each entry's offsets
+    /// against `bounds`.
+    ///
+    /// Returns `None` only if `table` is shorter than
+    /// [`PARENT_LOCATOR_TABLE_SIZE`]. Malformed entries are marked, not
+    /// dropped.
+    pub fn parse(table: &[u8], bounds: &VhdImageBounds) -> Option<Self> {
+        if table.len() < PARENT_LOCATOR_TABLE_SIZE {
+            return None;
+        }
+        let mut entries = [VhdParentLocator::EMPTY; PARENT_LOCATOR_COUNT];
+        for (slot, entry) in entries.iter_mut().enumerate() {
+            let off = slot * PARENT_LOCATOR_ENTRY_SIZE;
+            *entry = VhdParentLocator::parse(&table[off..off + PARENT_LOCATOR_ENTRY_SIZE], bounds)?;
+        }
+        Some(VhdParentLocatorTable { entries })
+    }
+
+    /// Select the entry that names the parent: `W2ru` before `W2ku`
+    /// before `Wi2r` before `Wi2k`, never a non-Windows code, never an
+    /// unused slot, never one carrying a `defect`. Slot order is not a
+    /// tiebreaker between *different* platform codes.
+    ///
+    /// If more than one entry carries the winning code, their platform
+    /// data is compared byte-for-byte (see
+    /// [`VhdParentLocator::raw_path_bytes`]). Equal contents are not
+    /// ambiguous and yield the lowest such slot; a disagreement, or
+    /// contents that cannot be reached because `data` is `None` or too
+    /// narrow, yields `Ambiguous`.
+    ///
+    /// **This decides which entry names the parent, and nothing else.**
+    /// Whether an ambiguous table is refused, warned about, or resolved to
+    /// the relative entry is phase 4's policy.
+    ///
+    /// Two consequences worth stating, because they surprise people:
+    ///
+    /// * A table whose eight entries name eight different parents can
+    ///   still return `Found`. Ambiguity here means *two entries sharing a
+    ///   platform code disagree*, not *the entries disagree*. Precedence
+    ///   between different codes is a fact about the format, so a `W2ru`
+    ///   entry legitimately beats seven dissenting others. That is what
+    ///   `vhd-diff-locator-conflicting.vhd` exercises, and its manifest
+    ///   description explicitly permits this branch: a reader must
+    ///   "either select by platform code rather than by slot order, or
+    ///   refuse a table where two entries share a platform code and
+    ///   disagree". instar does the former.
+    /// * A parent unicode name (header `+64`) that disagrees with the
+    ///   winning locator is **not** ambiguity and is not checked at all in
+    ///   this phase.
+    /// * A malformed entry is not a candidate, so a table carrying a
+    ///   corrupt `W2ru` and a sound `W2ku` selects the `W2ku` — the
+    ///   absolute path rather than the relative one. That is a
+    ///   *different parent file*, chosen because an attacker corrupted
+    ///   the entry that would have won. `Found::demoted_from` reports
+    ///   it rather than leaving the caller to notice.
+    pub fn preferred_locator(&self, data: Option<&VhdImageWindow<'_>>) -> PreferredLocator {
+        // Best (lowest) preference rank among candidate entries.
+        let mut best_rank: Option<u8> = None;
+        for entry in self.entries.iter() {
+            if !entry.is_candidate() {
+                continue;
+            }
+            // `is_candidate` proved the rank is Some.
+            if let Some(rank) = entry.platform().preference() {
+                best_rank = Some(match best_rank {
+                    Some(current) if current <= rank => current,
+                    _ => rank,
+                });
+            }
+        }
+        let best_rank = match best_rank {
+            Some(rank) => rank,
+            None => return PreferredLocator::NotFound,
+        };
+
+        // The lowest slot carrying a *better* rank than the winner's,
+        // rejected only because of a defect. Computed before the winner
+        // is chosen because it describes the entries the winner beat,
+        // not the winner.
+        let mut demoted_from: Option<usize> = None;
+        for (slot, entry) in self.entries.iter().enumerate() {
+            if entry.is_unused() || entry.defect.is_none() {
+                continue;
+            }
+            // Slot order, so the first match is the lowest slot.
+            if matches!(entry.platform().preference(), Some(rank) if rank < best_rank) {
+                demoted_from = Some(slot);
+                break;
+            }
+        }
+
+        // Winner is the lowest slot carrying the best rank; every other
+        // slot with that same rank carries the same platform code, so its
+        // contents must agree.
+        let mut winner: Option<usize> = None;
+        for (slot, entry) in self.entries.iter().enumerate() {
+            if !entry.is_candidate() || entry.platform().preference() != Some(best_rank) {
+                continue;
+            }
+            let first = match winner {
+                None => {
+                    winner = Some(slot);
+                    continue;
+                }
+                Some(first) => first,
+            };
+
+            let reason = match data {
+                None => Some(AmbiguityReason::ContentsUnknown),
+                Some(window) => {
+                    match (
+                        self.entries[first].raw_path_bytes(window),
+                        entry.raw_path_bytes(window),
+                    ) {
+                        (Ok(a), Ok(b)) if a == b => None,
+                        (Ok(_), Ok(_)) => Some(AmbiguityReason::ContentsDiffer),
+                        _ => Some(AmbiguityReason::ContentsUnknown),
+                    }
+                }
+            };
+            if let Some(reason) = reason {
+                return PreferredLocator::Ambiguous {
+                    first,
+                    second: slot,
+                    reason,
+                };
+            }
+        }
+
+        match winner {
+            Some(slot) => PreferredLocator::Found { slot, demoted_from },
+            None => PreferredLocator::NotFound,
+        }
+    }
+}
+
+/// The parent identity of a differencing VHD: the dynamic header fields a
+/// plain dynamic VHD leaves zero.
+///
+/// A sibling of [`VhdDynamicHeader`] rather than an extension of it, for
+/// three reasons. Validating a locator offset needs the image length and
+/// the header's file offset, which `VhdDynamicHeader::parse` does not take
+/// and which its eight call sites have no reason to supply. Those call
+/// sites build the header by value on the stack — `VhdState::init` does it
+/// in a frame that already holds two `MAX_SECTOR_SIZE` buffers — and would
+/// pay for parent fields none of them read. And keeping the two apart
+/// means this phase changes nothing about how a non-differencing dynamic
+/// VHD is parsed.
+///
+/// The parent unicode name is kept **undecoded**: `name_utf16_be` borrows
+/// the 512-byte field, and a caller that wants a string calls
+/// [`VhdParentInfo::decode_name`] with its own buffer, so the 768-byte
+/// worst-case UTF-8 cost lands only in frames that ask for it.
+#[derive(Debug, Clone, Copy)]
+pub struct VhdParentInfo<'a> {
+    /// Parent unique id at `+40`: 16 opaque bytes, the parent footer's
+    /// bytes 68..84 copied verbatim. Not byte-swapped, not reformatted.
+    pub unique_id: [u8; 16],
+    /// Parent timestamp at `+56`, BE u32, seconds since 2000-01-01.
+    /// Hyper-V writes zero, and so does instar.
+    pub timestamp: u32,
+    /// The 512 raw bytes of the parent unicode name field at `+64`,
+    /// undecoded. Always exactly [`DYN_PARENT_NAME_SIZE`] long.
+    pub name_utf16_be: &'a [u8],
+    /// The eight parent locator entries at `+576`.
+    pub locators: VhdParentLocatorTable,
+}
+
+impl<'a> VhdParentInfo<'a> {
+    /// Parse the parent fields out of a 1024-byte dynamic header.
+    ///
+    /// `header` must be at least [`DYNAMIC_HEADER_SIZE`] bytes and carry
+    /// the `cxsparse` cookie — the same precondition
+    /// [`VhdDynamicHeader::parse`] enforces, so the two agree about what a
+    /// dynamic header is. `bounds` describes the image the header came
+    /// from and is used only to validate locator offsets.
+    ///
+    /// Returns `None` only for a short or non-`cxsparse` buffer. A hostile
+    /// locator table does not fail the parse; its entries come back with
+    /// `defect` set (decision 4).
+    ///
+    /// **This cannot check that the image is differencing.** `disk_type`
+    /// lives in the footer, not the header, so the caller gates on
+    /// `footer.disk_type == DISK_TYPE_DIFFERENCING`; this parses the
+    /// fields where they lie. On a plain dynamic VHD they read as zero.
+    ///
+    /// No I/O and no allocation: this is the entry point phase 9 points a
+    /// fuzz target at.
+    pub fn parse(header: &'a [u8], bounds: &VhdImageBounds) -> Option<Self> {
+        if header.len() < DYNAMIC_HEADER_SIZE {
+            return None;
+        }
+        if be_u64(header, DYN_COOKIE_OFFSET) != CXSPARSE_COOKIE {
+            return None;
+        }
+
+        // Every offset below is a compile-time constant inside a length
+        // already proven above: no arithmetic on image data happens here.
+        let mut unique_id = [0u8; 16];
+        unique_id.copy_from_slice(
+            &header[DYN_PARENT_UNIQUE_ID_OFFSET..DYN_PARENT_UNIQUE_ID_OFFSET + 16],
+        );
+        let timestamp = be_u32(header, DYN_PARENT_TIMESTAMP_OFFSET);
+        let name_utf16_be =
+            &header[DYN_PARENT_NAME_OFFSET..DYN_PARENT_NAME_OFFSET + DYN_PARENT_NAME_SIZE];
+        let locators = VhdParentLocatorTable::parse(
+            &header[DYN_PARENT_LOCATORS_OFFSET
+                ..DYN_PARENT_LOCATORS_OFFSET + PARENT_LOCATOR_TABLE_SIZE],
+            bounds,
+        )?;
+
+        Some(VhdParentInfo {
+            unique_id,
+            timestamp,
+            name_utf16_be,
+            locators,
+        })
+    }
+
+    /// Decode the parent unicode name into `dst` as UTF-8, returning the
+    /// number of bytes written.
+    ///
+    /// The name is UTF-16 **BIG** endian — the opposite of the locator
+    /// platform data. This is the call site that passes
+    /// `big_endian = true` to `shared::utf16_to_utf8`; the other, in
+    /// [`VhdParentLocator::decode_path`], passes `false`.
+    ///
+    /// The 512-byte field is the bound: the decode stops at the first
+    /// `0x0000` code unit if there is one, and otherwise consumes all 256
+    /// code units. It never looks past the field for a terminator
+    /// (decision 3 — over-reading here is libvhdi defect C, and
+    /// `vhd-diff-locator-overlong.vhd` exists to catch it).
+    ///
+    /// A `dst` of [`MAX_PARENT_NAME_UTF8`] bytes can never be too small.
+    pub fn decode_name(&self, dst: &mut [u8]) -> Option<usize> {
+        utf16_to_utf8(self.name_utf16_be, true, dst)
     }
 }
 
@@ -1253,6 +2021,856 @@ mod tests {
     }
 
     // ====================================================================
+    // Parent locator tests (differencing VHDs)
+    //
+    // In-memory only: the crate is no_std and must test without the
+    // instar-testdata repository present. The phase 2 fixtures are
+    // consumed for real by phase 8's integration tests; the adversarial
+    // shapes below reconstruct them as byte buffers.
+    // ====================================================================
+
+    use shared::write_le_u16;
+
+    /// Test image geometry: an 8192-byte image whose dynamic header sits
+    /// at 512, leaving 2048..4096 free for locator platform data.
+    const TEST_BOUNDS: VhdImageBounds = VhdImageBounds {
+        image_len: 8192,
+        header_offset: 512,
+    };
+    /// Absolute file offset of the locator-data window used by the tests.
+    const WIN_BASE: u64 = 2048;
+    /// Bytes of window reserved per locator slot.
+    const SLOT_STRIDE: usize = 128;
+
+    /// Encode `s` as UTF-16 into `dst`, returning the byte count.
+    fn enc_utf16(s: &str, big_endian: bool, dst: &mut [u8]) -> usize {
+        let mut n = 0usize;
+        let mut units = [0u16; 2];
+        for ch in s.chars() {
+            for unit in ch.encode_utf16(&mut units).iter() {
+                if big_endian {
+                    write_be_u16(dst, n, *unit);
+                } else {
+                    write_le_u16(dst, n, *unit);
+                }
+                n += 2;
+            }
+        }
+        n
+    }
+
+    /// A dynamic header carrying a parent unique id, a zero timestamp and
+    /// `name` in the UTF-16BE parent unicode name field. Locator slots are
+    /// left zero; `put_locator` populates them.
+    fn make_diff_header(name: &str) -> [u8; 1024] {
+        let mut buf = make_dynamic_header(1536, 512, DEFAULT_BLOCK_SIZE);
+        // The parent unique id from the pin's xxd of fat-differential.vhd.
+        buf[DYN_PARENT_UNIQUE_ID_OFFSET..DYN_PARENT_UNIQUE_ID_OFFSET + 16].copy_from_slice(&[
+            0x5f, 0xa2, 0x1a, 0x55, 0xf3, 0x94, 0xaa, 0x4d, 0x99, 0x58, 0x19, 0x51, 0xa6, 0x7d,
+            0x55, 0x40,
+        ]);
+        write_be_u32(&mut buf, DYN_PARENT_TIMESTAMP_OFFSET, 0);
+        let mut tmp = [0u8; DYN_PARENT_NAME_SIZE];
+        let n = enc_utf16(name, true, &mut tmp);
+        assert!(n <= DYN_PARENT_NAME_SIZE);
+        buf[DYN_PARENT_NAME_OFFSET..DYN_PARENT_NAME_OFFSET + n].copy_from_slice(&tmp[..n]);
+        buf
+    }
+
+    /// Write one locator entry into `buf`.
+    fn put_locator(
+        buf: &mut [u8; 1024],
+        slot: usize,
+        code: &[u8; 4],
+        space: u32,
+        length: u32,
+        offset: u64,
+    ) {
+        let off = DYN_PARENT_LOCATORS_OFFSET + slot * PARENT_LOCATOR_ENTRY_SIZE;
+        buf[off + LOC_PLATFORM_CODE_OFFSET..off + LOC_PLATFORM_CODE_OFFSET + 4]
+            .copy_from_slice(code);
+        write_be_u32(buf, off + LOC_DATA_SPACE_OFFSET, space);
+        write_be_u32(buf, off + LOC_DATA_LENGTH_OFFSET, length);
+        write_be_u64(buf, off + LOC_DATA_OFFSET_OFFSET, offset);
+    }
+
+    /// Write `path` as UTF-16LE into slot `slot` of the window and point a
+    /// locator entry at it.
+    fn put_locator_path(
+        buf: &mut [u8; 1024],
+        win: &mut [u8; 2048],
+        slot: usize,
+        code: &[u8; 4],
+        path: &str,
+    ) {
+        let rel = slot * SLOT_STRIDE;
+        let n = enc_utf16(path, false, &mut win[rel..rel + SLOT_STRIDE]);
+        put_locator(
+            buf,
+            slot,
+            code,
+            SLOT_STRIDE as u32,
+            n as u32,
+            WIN_BASE + rel as u64,
+        );
+    }
+
+    fn window(win: &[u8]) -> VhdImageWindow<'_> {
+        VhdImageWindow {
+            file_offset: WIN_BASE,
+            bytes: win,
+        }
+    }
+
+    // -------- parent identity fields ------------------------------------
+
+    #[test]
+    fn parent_fields_parse() {
+        let buf = make_diff_header(".\\fat-parent.vhd");
+        let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
+        assert_eq!(
+            info.unique_id,
+            [
+                0x5f, 0xa2, 0x1a, 0x55, 0xf3, 0x94, 0xaa, 0x4d, 0x99, 0x58, 0x19, 0x51, 0xa6, 0x7d,
+                0x55, 0x40
+            ]
+        );
+        assert_eq!(info.timestamp, 0);
+        assert_eq!(info.name_utf16_be.len(), DYN_PARENT_NAME_SIZE);
+        let mut out = [0u8; MAX_PARENT_NAME_UTF8];
+        let n = info.decode_name(&mut out).unwrap();
+        assert_eq!(&out[..n], b".\\fat-parent.vhd");
+    }
+
+    #[test]
+    fn parent_timestamp_is_big_endian() {
+        let mut buf = make_diff_header("p.vhd");
+        write_be_u32(&mut buf, DYN_PARENT_TIMESTAMP_OFFSET, 0x0102_0304);
+        let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
+        assert_eq!(info.timestamp, 0x0102_0304);
+        // Proof it is not being read little endian.
+        assert_eq!(
+            &buf[DYN_PARENT_TIMESTAMP_OFFSET..DYN_PARENT_TIMESTAMP_OFFSET + 4],
+            &[0x01, 0x02, 0x03, 0x04]
+        );
+    }
+
+    #[test]
+    fn parent_name_is_utf16_big_endian() {
+        // The exact leading bytes of the pin's xxd at offset 576.
+        let buf = make_diff_header("C:");
+        assert_eq!(
+            &buf[DYN_PARENT_NAME_OFFSET..DYN_PARENT_NAME_OFFSET + 4],
+            &[0x00, 0x43, 0x00, 0x3a]
+        );
+        let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
+        let mut out = [0u8; MAX_PARENT_NAME_UTF8];
+        let n = info.decode_name(&mut out).unwrap();
+        assert_eq!(&out[..n], b"C:");
+        // Decoding the same bytes little endian must NOT produce "C:".
+        // This is the swap the phase is most likely to make.
+        let mut wrong = [0u8; MAX_PARENT_NAME_UTF8];
+        let m = utf16_to_utf8(info.name_utf16_be, false, &mut wrong).unwrap();
+        assert_ne!(&wrong[..m], b"C:");
+    }
+
+    #[test]
+    fn parent_name_absolute_windows_path() {
+        let buf = make_diff_header("C:\\Projects\\dfvfs\\test_data\\fat-parent.vhd");
+        let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
+        let mut out = [0u8; MAX_PARENT_NAME_UTF8];
+        let n = info.decode_name(&mut out).unwrap();
+        assert_eq!(&out[..n], b"C:\\Projects\\dfvfs\\test_data\\fat-parent.vhd");
+    }
+
+    #[test]
+    fn parent_name_dotdot_traversal_is_parsed_not_resolved() {
+        let buf = make_diff_header("../../../etc/passwd");
+        let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
+        let mut out = [0u8; MAX_PARENT_NAME_UTF8];
+        let n = info.decode_name(&mut out).unwrap();
+        // The parser reports the string faithfully and does nothing with
+        // it. Refusing a traversal is phase 4's job, resolving it is
+        // phase 11's, and neither belongs here.
+        assert_eq!(&out[..n], b"../../../etc/passwd");
+    }
+
+    #[test]
+    fn parent_name_absolute_posix_path_is_parsed_not_opened() {
+        let buf = make_diff_header("/etc/passwd");
+        let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
+        let mut out = [0u8; MAX_PARENT_NAME_UTF8];
+        let n = info.decode_name(&mut out).unwrap();
+        assert_eq!(&out[..n], b"/etc/passwd");
+    }
+
+    #[test]
+    fn parent_name_unc_path() {
+        let buf = make_diff_header("\\\\attacker\\share\\probe");
+        let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
+        let mut out = [0u8; MAX_PARENT_NAME_UTF8];
+        let n = info.decode_name(&mut out).unwrap();
+        assert_eq!(&out[..n], b"\\\\attacker\\share\\probe");
+    }
+
+    #[test]
+    fn parent_name_url() {
+        let buf = make_diff_header("http://attacker.example/probe");
+        let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
+        let mut out = [0u8; MAX_PARENT_NAME_UTF8];
+        let n = info.decode_name(&mut out).unwrap();
+        assert_eq!(&out[..n], b"http://attacker.example/probe");
+    }
+
+    #[test]
+    fn parent_name_256_code_units_with_no_terminator() {
+        // vhd-diff-locator-overlong.vhd's shape: the field is full, there
+        // is no NUL, and the bytes immediately after it are the locator
+        // table. libvhdi defect C over-reads two bytes into that table and
+        // reports a 257th character.
+        let mut buf = make_dynamic_header(1536, 512, DEFAULT_BLOCK_SIZE);
+        for i in 0..256 {
+            write_be_u16(&mut buf, DYN_PARENT_NAME_OFFSET + i * 2, b'A' as u16);
+        }
+        // A populated locator immediately after the name field, whose
+        // first bytes would decode as further characters if read.
+        put_locator(&mut buf, 0, b"W2ru", 128, 32, WIN_BASE);
+
+        let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
+        let mut out = [0u8; MAX_PARENT_NAME_UTF8];
+        let n = info.decode_name(&mut out).unwrap();
+        assert_eq!(n, 256, "a full field is 256 code units, not 257");
+        assert!(out[..n].iter().all(|&b| b == b'A'));
+        // The borrowed field stops exactly at the locator table.
+        assert_eq!(info.name_utf16_be.len(), DYN_PARENT_NAME_SIZE);
+        assert_eq!(
+            DYN_PARENT_NAME_OFFSET + DYN_PARENT_NAME_SIZE,
+            DYN_PARENT_LOCATORS_OFFSET
+        );
+    }
+
+    #[test]
+    fn parent_name_dst_too_small_is_refused() {
+        let buf = make_diff_header("abcdefgh");
+        let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
+        let mut out = [0u8; 7];
+        assert_eq!(info.decode_name(&mut out), None);
+    }
+
+    #[test]
+    fn parent_info_parse_short_buffer_or_bad_cookie() {
+        assert!(VhdParentInfo::parse(&[0u8; 1023], &TEST_BOUNDS).is_none());
+        let mut buf = make_diff_header("p.vhd");
+        buf[0] = 0;
+        assert!(VhdParentInfo::parse(&buf, &TEST_BOUNDS).is_none());
+    }
+
+    #[test]
+    fn parent_info_parses_on_a_plain_dynamic_header() {
+        // Caller-gated: disk_type lives in the footer, so the parser
+        // cannot tell a dynamic header from a differencing one. On a
+        // plain dynamic header every parent field reads as zero.
+        let buf = make_dynamic_header(1536, 512, DEFAULT_BLOCK_SIZE);
+        let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
+        assert_eq!(info.unique_id, [0u8; 16]);
+        assert_eq!(info.timestamp, 0);
+        let mut out = [0u8; MAX_PARENT_NAME_UTF8];
+        assert_eq!(info.decode_name(&mut out), Some(0));
+        assert!(info.locators.entries.iter().all(|e| e.is_unused()));
+        assert_eq!(
+            info.locators.preferred_locator(None),
+            PreferredLocator::NotFound
+        );
+    }
+
+    // -------- locator table structure -----------------------------------
+
+    #[test]
+    fn locator_table_hyperv_shape() {
+        // Two populated entries followed by six zero slots, as both
+        // measured Hyper-V images have.
+        let mut buf = make_diff_header("C:\\Projects\\fat-parent.vhd");
+        let mut win = [0u8; 2048];
+        put_locator_path(
+            &mut buf,
+            &mut win,
+            0,
+            b"W2ku",
+            "C:\\Projects\\fat-parent.vhd",
+        );
+        put_locator_path(&mut buf, &mut win, 1, b"W2ru", ".\\fat-parent.vhd");
+
+        let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
+        let e = &info.locators.entries;
+        assert_eq!(e[0].platform(), VhdPlatform::W2ku);
+        assert_eq!(e[1].platform(), VhdPlatform::W2ru);
+        assert!(e[0].defect.is_none() && e[1].defect.is_none());
+        assert!(e[2..].iter().all(|x| x.is_unused() && x.defect.is_none()));
+        // Platform code is ASCII in file order, not byte-swapped.
+        assert_eq!(&e[0].platform_code, b"W2ku");
+        // Platform data space is a byte count, not a sector count.
+        assert_eq!(e[0].platform_data_space, SLOT_STRIDE as u32);
+    }
+
+    #[test]
+    fn locator_zero_slot_after_populated_one_does_not_end_the_table() {
+        // SPEC(VHD) defines no sentinel: a zero slot is skipped, not a
+        // terminator and not a defect. This is the common Hyper-V shape.
+        let mut buf = make_diff_header("p.vhd");
+        let mut win = [0u8; 2048];
+        put_locator_path(&mut buf, &mut win, 0, b"W2ku", "C:\\p.vhd");
+        // slot 1 left zero
+        put_locator_path(&mut buf, &mut win, 2, b"W2ru", ".\\p.vhd");
+
+        let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
+        assert!(info.locators.entries[1].is_unused());
+        assert_eq!(info.locators.entries[1].defect, None);
+        assert_eq!(info.locators.entries[2].platform(), VhdPlatform::W2ru);
+        // The W2ru entry past the gap still wins.
+        assert_eq!(
+            info.locators.preferred_locator(Some(&window(&win))),
+            PreferredLocator::Found {
+                slot: 2,
+                demoted_from: None
+            }
+        );
+    }
+
+    #[test]
+    fn locator_data_offset_past_end_of_image() {
+        let mut buf = make_diff_header("p.vhd");
+        put_locator(&mut buf, 0, b"W2ru", 512, 32, TEST_BOUNDS.image_len - 8);
+        let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
+        assert_eq!(
+            info.locators.entries[0].defect,
+            Some(VhdLocatorDefect::DataOutsideImage)
+        );
+    }
+
+    #[test]
+    fn locator_data_overlapping_head_footer_copy() {
+        let mut buf = make_diff_header("p.vhd");
+        put_locator(&mut buf, 0, b"W2ru", 512, 32, 256);
+        let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
+        assert_eq!(
+            info.locators.entries[0].defect,
+            Some(VhdLocatorDefect::OverlapsFooter)
+        );
+    }
+
+    #[test]
+    fn locator_data_overlapping_tail_footer() {
+        let mut buf = make_diff_header("p.vhd");
+        // image_len 8192, tail footer 7680..8192.
+        put_locator(&mut buf, 0, b"W2ru", 512, 32, 7680);
+        let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
+        assert_eq!(
+            info.locators.entries[0].defect,
+            Some(VhdLocatorDefect::OverlapsFooter)
+        );
+    }
+
+    #[test]
+    fn locator_data_overlapping_dynamic_header() {
+        let mut buf = make_diff_header("p.vhd");
+        // Header 512..1536; a locator claiming its own header bytes.
+        put_locator(&mut buf, 0, b"W2ru", 512, 64, 1024);
+        let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
+        assert_eq!(
+            info.locators.entries[0].defect,
+            Some(VhdLocatorDefect::OverlapsHeader)
+        );
+    }
+
+    #[test]
+    fn locator_length_exceeds_space() {
+        let mut buf = make_diff_header("p.vhd");
+        put_locator(&mut buf, 0, b"W2ru", 32, 64, WIN_BASE);
+        let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
+        assert_eq!(
+            info.locators.entries[0].defect,
+            Some(VhdLocatorDefect::LengthExceedsSpace)
+        );
+    }
+
+    #[test]
+    fn locator_offset_overflow() {
+        let mut buf = make_diff_header("p.vhd");
+        put_locator(&mut buf, 0, b"W2ru", 512, 64, u64::MAX - 8);
+        let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
+        assert_eq!(
+            info.locators.entries[0].defect,
+            Some(VhdLocatorDefect::OffsetOverflow)
+        );
+    }
+
+    #[test]
+    fn locator_populated_code_with_zero_length() {
+        let mut buf = make_diff_header("p.vhd");
+        put_locator(&mut buf, 0, b"W2ru", 512, 0, WIN_BASE);
+        let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
+        assert_eq!(
+            info.locators.entries[0].defect,
+            Some(VhdLocatorDefect::EmptyData)
+        );
+    }
+
+    #[test]
+    fn locator_malformed_entry_preserves_raw_fields() {
+        // Decision 4: marked, not dropped, and phase 4 can say why.
+        let mut buf = make_diff_header("p.vhd");
+        put_locator(&mut buf, 0, b"W2ru", 0x1234, 0x5678, 0xdead_beef);
+        let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
+        let e = &info.locators.entries[0];
+        assert!(e.defect.is_some());
+        assert_eq!(&e.platform_code, b"W2ru");
+        assert_eq!(e.platform_data_space, 0x1234);
+        assert_eq!(e.platform_data_length, 0x5678);
+        assert_eq!(e.platform_data_offset, 0xdead_beef);
+        assert!(!e.is_candidate());
+    }
+
+    #[test]
+    fn locator_reserved_field_is_preserved() {
+        let mut buf = make_diff_header("p.vhd");
+        let mut win = [0u8; 2048];
+        put_locator_path(&mut buf, &mut win, 0, b"W2ru", ".\\p.vhd");
+        let off = DYN_PARENT_LOCATORS_OFFSET + LOC_RESERVED_OFFSET;
+        write_be_u32(&mut buf, off, 0xabad_1dea);
+        let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
+        assert_eq!(info.locators.entries[0].reserved, 0xabad_1dea);
+    }
+
+    #[test]
+    fn locator_table_parse_short_buffer() {
+        assert!(VhdParentLocatorTable::parse(&[0u8; 191], &TEST_BOUNDS).is_none());
+        assert!(VhdParentLocatorTable::parse(&[0u8; 192], &TEST_BOUNDS).is_some());
+        assert!(VhdParentLocator::parse(&[0u8; 23], &TEST_BOUNDS).is_none());
+    }
+
+    // -------- decoding platform data ------------------------------------
+
+    #[test]
+    fn decode_path_is_utf16_little_endian() {
+        let mut buf = make_diff_header("p.vhd");
+        let mut win = [0u8; 2048];
+        put_locator_path(
+            &mut buf,
+            &mut win,
+            0,
+            b"W2ku",
+            "C:\\Projects\\fat-parent.vhd",
+        );
+        // The exact leading bytes of the pin's xxd at offset 4096.
+        assert_eq!(&win[..4], &[0x43, 0x00, 0x3a, 0x00]);
+
+        let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
+        let mut out = [0u8; 1024];
+        let n = info.locators.entries[0]
+            .decode_path(&window(&win), &mut out)
+            .unwrap();
+        assert_eq!(&out[..n], b"C:\\Projects\\fat-parent.vhd");
+    }
+
+    #[test]
+    fn decode_path_adversarial_shapes_are_reported_verbatim() {
+        for (slot, path) in [
+            (0usize, "/etc/passwd"),
+            (1, "../../../etc/passwd"),
+            (2, "\\\\attacker\\share\\probe"),
+            (3, "http://attacker.example/probe"),
+        ] {
+            let mut buf = make_diff_header(path);
+            let mut win = [0u8; 2048];
+            put_locator_path(&mut buf, &mut win, slot, b"W2ru", path);
+            let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
+            let mut out = [0u8; 1024];
+            let n = info.locators.entries[slot]
+                .decode_path(&window(&win), &mut out)
+                .unwrap();
+            assert_eq!(&out[..n], path.as_bytes());
+        }
+    }
+
+    #[test]
+    fn decode_path_refuses_non_windows_platform_codes() {
+        let mut buf = make_diff_header("p.vhd");
+        let mut win = [0u8; 2048];
+        put_locator_path(&mut buf, &mut win, 0, b"MacX", "file:///p.vhd");
+        put_locator_path(&mut buf, &mut win, 1, b"Mac ", "opaque");
+        put_locator_path(&mut buf, &mut win, 2, b"Xtra", "unknown");
+        let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
+        let mut out = [0u8; 1024];
+        for slot in 0..3 {
+            assert_eq!(
+                info.locators.entries[slot].decode_path(&window(&win), &mut out),
+                Err(VhdLocatorDefect::UnsupportedPlatformCode)
+            );
+        }
+        assert_eq!(info.locators.entries[0].platform(), VhdPlatform::MacX);
+        assert_eq!(info.locators.entries[1].platform(), VhdPlatform::Mac);
+        assert_eq!(
+            info.locators.entries[2].platform(),
+            VhdPlatform::Other(*b"Xtra")
+        );
+    }
+
+    #[test]
+    fn decode_path_without_a_window_is_data_not_supplied() {
+        let mut buf = make_diff_header("p.vhd");
+        let mut win = [0u8; 2048];
+        put_locator_path(&mut buf, &mut win, 0, b"W2ru", ".\\p.vhd");
+        let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
+        let mut out = [0u8; 1024];
+        // A window that does not reach the entry's data: the caller can
+        // widen it and retry, which is why this is not `Undecodable`.
+        let narrow = VhdImageWindow {
+            file_offset: WIN_BASE,
+            bytes: &win[..4],
+        };
+        assert_eq!(
+            info.locators.entries[0].decode_path(&narrow, &mut out),
+            Err(VhdLocatorDefect::DataNotSupplied)
+        );
+        let elsewhere = VhdImageWindow {
+            file_offset: 4096,
+            bytes: &win[..],
+        };
+        assert_eq!(
+            info.locators.entries[0].decode_path(&elsewhere, &mut out),
+            Err(VhdLocatorDefect::DataNotSupplied)
+        );
+    }
+
+    #[test]
+    fn decode_path_refuses_an_unpaired_surrogate() {
+        let mut buf = make_diff_header("p.vhd");
+        let mut win = [0u8; 2048];
+        // Lone high surrogate, little endian.
+        win[0] = 0x3d;
+        win[1] = 0xd8;
+        win[2] = b'a';
+        win[3] = 0x00;
+        put_locator(&mut buf, 0, b"W2ru", SLOT_STRIDE as u32, 4, WIN_BASE);
+        let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
+        let mut out = [0u8; 1024];
+        assert_eq!(
+            info.locators.entries[0].decode_path(&window(&win), &mut out),
+            Err(VhdLocatorDefect::Undecodable)
+        );
+    }
+
+    #[test]
+    fn decode_path_refuses_an_odd_length_blob() {
+        let mut buf = make_diff_header("p.vhd");
+        let mut win = [0u8; 2048];
+        let n = enc_utf16(".\\p.vhd", false, &mut win);
+        put_locator(
+            &mut buf,
+            0,
+            b"W2ru",
+            SLOT_STRIDE as u32,
+            n as u32 - 1,
+            WIN_BASE,
+        );
+        let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
+        let mut out = [0u8; 1024];
+        assert_eq!(
+            info.locators.entries[0].decode_path(&window(&win), &mut out),
+            Err(VhdLocatorDefect::Undecodable)
+        );
+    }
+
+    #[test]
+    fn decode_path_on_a_malformed_entry_reports_the_structural_defect() {
+        let mut buf = make_diff_header("p.vhd");
+        let win = [0u8; 2048];
+        put_locator(&mut buf, 0, b"W2ru", 512, 32, TEST_BOUNDS.image_len - 8);
+        let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
+        let mut out = [0u8; 1024];
+        assert_eq!(
+            info.locators.entries[0].decode_path(&window(&win), &mut out),
+            Err(VhdLocatorDefect::DataOutsideImage)
+        );
+    }
+
+    // -------- preferred_locator -----------------------------------------
+
+    #[test]
+    fn preferred_locator_prefers_w2ru_over_w2ku() {
+        let mut buf = make_diff_header("p.vhd");
+        let mut win = [0u8; 2048];
+        // W2ku first in slot order, as Hyper-V writes it.
+        put_locator_path(&mut buf, &mut win, 0, b"W2ku", "C:\\p.vhd");
+        put_locator_path(&mut buf, &mut win, 1, b"W2ru", ".\\p.vhd");
+        let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
+        assert_eq!(
+            info.locators.preferred_locator(Some(&window(&win))),
+            PreferredLocator::Found {
+                slot: 1,
+                demoted_from: None
+            }
+        );
+    }
+
+    #[test]
+    fn preferred_locator_full_precedence_order() {
+        let mut win = [0u8; 2048];
+        let codes: [&[u8; 4]; 4] = [b"Wi2k", b"Wi2r", b"W2ku", b"W2ru"];
+        // Add the codes one at a time, worst first; the newly added code
+        // must always win because it outranks everything already there.
+        let mut buf = make_diff_header("p.vhd");
+        for (i, code) in codes.iter().enumerate() {
+            put_locator_path(&mut buf, &mut win, i, code, "p.vhd");
+            let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
+            assert_eq!(
+                info.locators.preferred_locator(Some(&window(&win))),
+                PreferredLocator::Found {
+                    slot: i,
+                    demoted_from: None
+                },
+                "adding {:?} should win",
+                core::str::from_utf8(*code).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn preferred_locator_never_selects_a_non_windows_code() {
+        let mut buf = make_diff_header("p.vhd");
+        let mut win = [0u8; 2048];
+        put_locator_path(&mut buf, &mut win, 0, b"MacX", "file:///p.vhd");
+        put_locator_path(&mut buf, &mut win, 1, b"Mac ", "opaque");
+        put_locator_path(&mut buf, &mut win, 2, b"Xtra", "unknown");
+        let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
+        assert_eq!(
+            info.locators.preferred_locator(Some(&window(&win))),
+            PreferredLocator::NotFound
+        );
+    }
+
+    #[test]
+    fn preferred_locator_skips_malformed_entries() {
+        let mut buf = make_diff_header("p.vhd");
+        let mut win = [0u8; 2048];
+        // A W2ru that points past the end of the image, and a sound W2ku.
+        put_locator(&mut buf, 0, b"W2ru", 512, 32, TEST_BOUNDS.image_len - 8);
+        put_locator_path(&mut buf, &mut win, 1, b"W2ku", "C:\\p.vhd");
+        let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
+        // The sound W2ku wins — but the result says so, rather than
+        // looking like an image that never carried a relative locator.
+        // Corrupting slot 0 is how an attacker steers a reader from the
+        // relative path to the absolute one, so the demotion is
+        // reported and phase 4 gets to have a policy about it.
+        assert_eq!(
+            info.locators.preferred_locator(Some(&window(&win))),
+            PreferredLocator::Found {
+                slot: 1,
+                demoted_from: Some(0)
+            }
+        );
+        // NotFound carries no reason: the caller reads the entries.
+        let mut only_bad = make_diff_header("p.vhd");
+        put_locator(
+            &mut only_bad,
+            0,
+            b"W2ru",
+            512,
+            32,
+            TEST_BOUNDS.image_len - 8,
+        );
+        let bad = VhdParentInfo::parse(&only_bad, &TEST_BOUNDS).unwrap();
+        assert_eq!(
+            bad.locators.preferred_locator(Some(&window(&win))),
+            PreferredLocator::NotFound
+        );
+        assert_eq!(
+            bad.locators.entries[0].defect,
+            Some(VhdLocatorDefect::DataOutsideImage)
+        );
+    }
+
+    #[test]
+    fn preferred_locator_duplicate_code_that_agrees_is_not_ambiguous() {
+        let mut buf = make_diff_header("p.vhd");
+        let mut win = [0u8; 2048];
+        put_locator_path(&mut buf, &mut win, 0, b"W2ru", ".\\p.vhd");
+        put_locator_path(&mut buf, &mut win, 1, b"W2ru", ".\\p.vhd");
+        let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
+        assert_eq!(
+            info.locators.preferred_locator(Some(&window(&win))),
+            PreferredLocator::Found {
+                slot: 0,
+                demoted_from: None
+            }
+        );
+    }
+
+    #[test]
+    fn preferred_locator_duplicate_code_that_agrees_modulo_a_terminator() {
+        // One blob carries a trailing NUL code unit inside its declared
+        // length and the other does not. Trimming makes them equal.
+        let mut buf = make_diff_header("p.vhd");
+        let mut win = [0u8; 2048];
+        let n = enc_utf16(".\\p.vhd", false, &mut win[0..SLOT_STRIDE]);
+        put_locator(&mut buf, 0, b"W2ru", SLOT_STRIDE as u32, n as u32, WIN_BASE);
+        let m = enc_utf16(".\\p.vhd", false, &mut win[SLOT_STRIDE..2 * SLOT_STRIDE]);
+        put_locator(
+            &mut buf,
+            1,
+            b"W2ru",
+            SLOT_STRIDE as u32,
+            m as u32 + 2, // includes the NUL terminator
+            WIN_BASE + SLOT_STRIDE as u64,
+        );
+        let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
+        assert_eq!(
+            info.locators.preferred_locator(Some(&window(&win))),
+            PreferredLocator::Found {
+                slot: 0,
+                demoted_from: None
+            }
+        );
+    }
+
+    #[test]
+    fn preferred_locator_duplicate_code_that_disagrees_is_ambiguous() {
+        let mut buf = make_diff_header("p.vhd");
+        let mut win = [0u8; 2048];
+        put_locator_path(&mut buf, &mut win, 0, b"W2ru", ".\\p.vhd");
+        put_locator_path(&mut buf, &mut win, 1, b"W2ru", ".\\other.vhd");
+        let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
+        assert_eq!(
+            info.locators.preferred_locator(Some(&window(&win))),
+            PreferredLocator::Ambiguous {
+                first: 0,
+                second: 1,
+                reason: AmbiguityReason::ContentsDiffer,
+            }
+        );
+    }
+
+    #[test]
+    fn preferred_locator_duplicate_code_without_data_is_ambiguous_unknown() {
+        // "I could not check whether they agree" must not read as "they
+        // agree": this is a security boundary.
+        let mut buf = make_diff_header("p.vhd");
+        let mut win = [0u8; 2048];
+        put_locator_path(&mut buf, &mut win, 0, b"W2ru", ".\\p.vhd");
+        put_locator_path(&mut buf, &mut win, 1, b"W2ru", ".\\p.vhd");
+        let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
+        assert_eq!(
+            info.locators.preferred_locator(None),
+            PreferredLocator::Ambiguous {
+                first: 0,
+                second: 1,
+                reason: AmbiguityReason::ContentsUnknown,
+            }
+        );
+        // A window too narrow to reach the second entry is the same
+        // answer, not a decode failure.
+        let narrow = VhdImageWindow {
+            file_offset: WIN_BASE,
+            bytes: &win[..SLOT_STRIDE],
+        };
+        assert_eq!(
+            info.locators.preferred_locator(Some(&narrow)),
+            PreferredLocator::Ambiguous {
+                first: 0,
+                second: 1,
+                reason: AmbiguityReason::ContentsUnknown,
+            }
+        );
+    }
+
+    #[test]
+    fn preferred_locator_eight_disagreeing_entries_with_a_duplicate() {
+        // vhd-diff-locator-conflicting.vhd's shape: all eight slots
+        // populated, mutually disagreeing, with two sharing a code and
+        // each blob encoded as its own code requires.
+        let mut buf = make_diff_header(".\\name-field.vhd");
+        let mut win = [0u8; 2048];
+        put_locator_path(&mut buf, &mut win, 0, b"W2ru", ".\\one.vhd");
+        put_locator_path(&mut buf, &mut win, 1, b"W2ru", ".\\two.vhd");
+        put_locator_path(&mut buf, &mut win, 2, b"W2ku", "C:\\three.vhd");
+        put_locator_path(&mut buf, &mut win, 3, b"Wi2r", ".\\four.vhd");
+        put_locator_path(&mut buf, &mut win, 4, b"Wi2k", "C:\\five.vhd");
+        put_locator_path(&mut buf, &mut win, 5, b"MacX", "file:///six.vhd");
+        put_locator_path(&mut buf, &mut win, 6, b"Mac ", "seven");
+        put_locator_path(&mut buf, &mut win, 7, b"Xtra", "eight");
+
+        let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
+        assert!(info.locators.entries.iter().all(|e| e.defect.is_none()));
+        assert_eq!(
+            info.locators.preferred_locator(Some(&window(&win))),
+            PreferredLocator::Ambiguous {
+                first: 0,
+                second: 1,
+                reason: AmbiguityReason::ContentsDiffer,
+            }
+        );
+    }
+
+    #[test]
+    fn preferred_locator_eight_disagreeing_entries_without_a_duplicate() {
+        // Same table with the duplicate removed. Ambiguity means "two
+        // entries sharing a code disagree", NOT "the entries disagree":
+        // precedence between different codes is a fact about the format,
+        // so W2ru legitimately beats six dissenting others and the answer
+        // is confident. The parent unicode name naming a ninth candidate
+        // is not ambiguity either, and is not checked in this phase.
+        let mut buf = make_diff_header(".\\name-field.vhd");
+        let mut win = [0u8; 2048];
+        put_locator_path(&mut buf, &mut win, 0, b"W2ku", "C:\\one.vhd");
+        put_locator_path(&mut buf, &mut win, 1, b"Wi2r", ".\\two.vhd");
+        put_locator_path(&mut buf, &mut win, 2, b"Wi2k", "C:\\three.vhd");
+        put_locator_path(&mut buf, &mut win, 3, b"MacX", "file:///four.vhd");
+        put_locator_path(&mut buf, &mut win, 4, b"Mac ", "five");
+        put_locator_path(&mut buf, &mut win, 5, b"Xtra", "six");
+        put_locator_path(&mut buf, &mut win, 6, b"W2ru", ".\\seven.vhd");
+
+        let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
+        assert_eq!(
+            info.locators.preferred_locator(Some(&window(&win))),
+            PreferredLocator::Found {
+                slot: 6,
+                demoted_from: None
+            }
+        );
+        let mut out = [0u8; 1024];
+        let n = info.locators.entries[6]
+            .decode_path(&window(&win), &mut out)
+            .unwrap();
+        assert_eq!(&out[..n], b".\\seven.vhd");
+        // The name field disagrees with the winner and nothing complains.
+        let mut name = [0u8; MAX_PARENT_NAME_UTF8];
+        let m = info.decode_name(&mut name).unwrap();
+        assert_eq!(&name[..m], b".\\name-field.vhd");
+    }
+
+    // -------- window bounds ---------------------------------------------
+
+    #[test]
+    fn window_slice_at_bounds() {
+        let bytes = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let w = VhdImageWindow {
+            file_offset: 1000,
+            bytes: &bytes,
+        };
+        assert_eq!(w.slice_at(1000, 8), Some(&bytes[..]));
+        assert_eq!(w.slice_at(1004, 4), Some(&bytes[4..]));
+        assert_eq!(w.slice_at(1008, 0), Some(&bytes[8..]));
+        // Before the window.
+        assert_eq!(w.slice_at(999, 1), None);
+        // Past the end.
+        assert_eq!(w.slice_at(1004, 5), None);
+        assert_eq!(w.slice_at(1009, 0), None);
+        // Arithmetic that would overflow or truncate.
+        assert_eq!(w.slice_at(u64::MAX, 8), None);
+        assert_eq!(w.slice_at(1000, u64::MAX), None);
+    }
+
+    // ====================================================================
     // Checksum tests
     // ====================================================================
 
@@ -1805,5 +3423,46 @@ mod tests {
             let r = chs_rounded_size(s);
             assert!(r >= s, "chs_rounded_size({s}) = {r} is less than the input");
         }
+    }
+
+    #[test]
+    fn locator_in_an_image_shorter_than_a_footer_cannot_escape() {
+        // `image_len.checked_sub(FOOTER_SIZE)` returns None when the
+        // image is shorter than one footer, so the trailing-footer
+        // overlap check is skipped outright. That branch is only safe
+        // because of what covers for it, and the cover is worth
+        // pinning: the leading footer copy spans [0, 512), which is the
+        // whole of such an image, so every byte a locator could point
+        // at is refused by one of the two checks that do run.
+        let tiny = VhdImageBounds {
+            image_len: 300,
+            header_offset: 512,
+        };
+
+        // Inside the image: caught as a footer overlap, not waved
+        // through by the skipped tail check.
+        assert_eq!(
+            locator_defect(*b"W2ru", 512, 32, 0, &tiny),
+            Some(VhdLocatorDefect::OverlapsFooter)
+        );
+        assert_eq!(
+            locator_defect(*b"W2ru", 512, 32, 260, &tiny),
+            Some(VhdLocatorDefect::OverlapsFooter)
+        );
+        // Past the image: caught before either footer check.
+        assert_eq!(
+            locator_defect(*b"W2ru", 512, 32, 512, &tiny),
+            Some(VhdLocatorDefect::DataOutsideImage)
+        );
+        // Exactly at the boundary the skip turns on: one byte more and
+        // the tail check runs again, and the verdict does not change.
+        let just_big_enough = VhdImageBounds {
+            image_len: FOOTER_SIZE as u64,
+            header_offset: 512,
+        };
+        assert_eq!(
+            locator_defect(*b"W2ru", 512, 32, 0, &just_big_enough),
+            Some(VhdLocatorDefect::OverlapsFooter)
+        );
     }
 }

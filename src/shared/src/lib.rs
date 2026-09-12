@@ -161,6 +161,118 @@ pub fn write_le_u64(buf: &mut [u8], off: usize, val: u64) {
     buf[off..off + 8].copy_from_slice(&val.to_le_bytes());
 }
 
+/// Decode UTF-16 into UTF-8, writing into a caller-supplied buffer.
+///
+/// `src` holds UTF-16 code units, big endian when `big_endian` is true
+/// and little endian otherwise. Decoding stops at the first `0x0000`
+/// code unit, which is neither written nor counted, and no byte after
+/// it is examined. Returns the number of UTF-8 bytes written to `dst`.
+///
+/// Returns `None` — refusing rather than substituting `U+FFFD` or any
+/// other replacement character — when:
+///
+/// * `src` has an odd length,
+/// * a high surrogate (`0xD800..=0xDBFF`) is not followed by a low
+///   surrogate (`0xDC00..=0xDFFF`), or a low surrogate appears where a
+///   high surrogate or an ordinary code unit was expected,
+/// * the UTF-8 output does not fit in `dst`.
+///
+/// The strictness is deliberate. The first caller is the VHD/VHDX
+/// parent locator parser, and a parent locator string is a security
+/// boundary: it is resolved against an allowlist and opened by the
+/// host. A lossy decoder would manufacture a path that was not in the
+/// image and hand the allowlist something to match on that the image
+/// never contained. See decision 2 of
+/// `docs/plans/PLAN-differencing-phase-03-parse.md`.
+pub fn utf16_to_utf8(src: &[u8], big_endian: bool, dst: &mut [u8]) -> Option<usize> {
+    if !src.len().is_multiple_of(2) {
+        return None;
+    }
+
+    let unit_at = |off: usize| -> u16 {
+        if big_endian {
+            be_u16(src, off)
+        } else {
+            le_u16(src, off)
+        }
+    };
+
+    let mut i = 0usize;
+    let mut out = 0usize;
+
+    while i < src.len() {
+        let unit = unit_at(i);
+        i += 2;
+
+        // A NUL code unit terminates the string. It is not encoded,
+        // not counted, and nothing beyond it is read.
+        if unit == 0 {
+            break;
+        }
+
+        let scalar: u32 = match unit {
+            // High surrogate: must be followed by a low surrogate.
+            0xD800..=0xDBFF => {
+                // `src.len()` is even and `i` is even, so `i < src.len()`
+                // already means a whole code unit remains. No arithmetic on
+                // the cursor, so nothing here can overflow or over-read.
+                if i >= src.len() {
+                    return None;
+                }
+                let low = unit_at(i);
+                if !matches!(low, 0xDC00..=0xDFFF) {
+                    return None;
+                }
+                i += 2;
+                0x10000 + (((unit as u32 - 0xD800) << 10) | (low as u32 - 0xDC00))
+            }
+            // Low surrogate without a preceding high surrogate.
+            0xDC00..=0xDFFF => return None,
+            _ => unit as u32,
+        };
+
+        // Encode by hand rather than via char, so the no-allocation,
+        // no-panic properties are visible at the point of use.
+        if scalar < 0x80 {
+            let end = out.checked_add(1)?;
+            if end > dst.len() {
+                return None;
+            }
+            dst[out] = scalar as u8;
+            out = end;
+        } else if scalar < 0x800 {
+            let end = out.checked_add(2)?;
+            if end > dst.len() {
+                return None;
+            }
+            dst[out] = 0xC0 | (scalar >> 6) as u8;
+            dst[out + 1] = 0x80 | (scalar & 0x3F) as u8;
+            out = end;
+        } else if scalar < 0x10000 {
+            let end = out.checked_add(3)?;
+            if end > dst.len() {
+                return None;
+            }
+            dst[out] = 0xE0 | (scalar >> 12) as u8;
+            dst[out + 1] = 0x80 | ((scalar >> 6) & 0x3F) as u8;
+            dst[out + 2] = 0x80 | (scalar & 0x3F) as u8;
+            out = end;
+        } else {
+            let end = out.checked_add(4)?;
+            if end > dst.len() {
+                return None;
+            }
+            dst[out] = 0xF0 | (scalar >> 18) as u8;
+            dst[out + 1] = 0x80 | ((scalar >> 12) & 0x3F) as u8;
+            dst[out + 2] = 0x80 | ((scalar >> 6) & 0x3F) as u8;
+            dst[out + 3] = 0x80 | (scalar & 0x3F) as u8;
+            out = end;
+        }
+    }
+
+    Some(out)
+}
+
 /// Generate a sector-cached read function for a given type and endianness.
 ///
 /// All format crates (qcow2, vmdk, vhd) need to read typed values from
@@ -6155,5 +6267,197 @@ mod tests {
         assert_eq!(copy.repaired_leaks, 7);
         assert_eq!(copy.repaired_refcounts, 11);
         assert_eq!(copy.repaired_corruptions, 13);
+    }
+    // ------------------------------------------------------------------
+    // utf16_to_utf8
+    // ------------------------------------------------------------------
+
+    /// Encode an ASCII string as UTF-16 in the requested endianness.
+    fn utf16_ascii(s: &[u8], big_endian: bool, dst: &mut [u8]) -> usize {
+        for (i, &b) in s.iter().enumerate() {
+            if big_endian {
+                write_be_u16(dst, i * 2, b as u16);
+            } else {
+                write_le_u16(dst, i * 2, b as u16);
+            }
+        }
+        s.len() * 2
+    }
+
+    #[test]
+    fn utf16_to_utf8_ascii_round_trip_both_endiannesses() {
+        let mut src = [0u8; 32];
+        let mut out = [0u8; 32];
+
+        let n = utf16_ascii(b"parent.vhd", true, &mut src);
+        assert_eq!(utf16_to_utf8(&src[..n], true, &mut out), Some(10));
+        assert_eq!(&out[..10], b"parent.vhd");
+
+        let n = utf16_ascii(b"parent.vhd", false, &mut src);
+        assert_eq!(utf16_to_utf8(&src[..n], false, &mut out), Some(10));
+        assert_eq!(&out[..10], b"parent.vhd");
+    }
+
+    #[test]
+    fn utf16_to_utf8_surrogate_pair() {
+        // U+1F600 GRINNING FACE: surrogate pair D83D DE00, which
+        // encodes as the four UTF-8 bytes F0 9F 98 80.
+        let mut out = [0u8; 8];
+
+        let be = [0xd8, 0x3d, 0xde, 0x00];
+        assert_eq!(utf16_to_utf8(&be, true, &mut out), Some(4));
+        assert_eq!(&out[..4], &[0xf0, 0x9f, 0x98, 0x80]);
+
+        let le = [0x3d, 0xd8, 0x00, 0xde];
+        assert_eq!(utf16_to_utf8(&le, false, &mut out), Some(4));
+        assert_eq!(&out[..4], &[0xf0, 0x9f, 0x98, 0x80]);
+    }
+
+    #[test]
+    fn utf16_to_utf8_refuses_unpaired_high_surrogate() {
+        let mut out = [0u8; 16];
+
+        // High surrogate at the end of the input.
+        assert_eq!(utf16_to_utf8(&[0xd8, 0x3d], true, &mut out), None);
+        assert_eq!(utf16_to_utf8(&[0x3d, 0xd8], false, &mut out), None);
+
+        // High surrogate followed by an ordinary code unit ('A').
+        assert_eq!(
+            utf16_to_utf8(&[0xd8, 0x3d, 0x00, 0x41], true, &mut out),
+            None
+        );
+        assert_eq!(
+            utf16_to_utf8(&[0x3d, 0xd8, 0x41, 0x00], false, &mut out),
+            None
+        );
+
+        // High surrogate followed by another high surrogate.
+        assert_eq!(
+            utf16_to_utf8(&[0xd8, 0x3d, 0xd8, 0x3d], true, &mut out),
+            None
+        );
+    }
+
+    #[test]
+    fn utf16_to_utf8_refuses_unpaired_low_surrogate() {
+        // A low surrogate reached where a high surrogate or an
+        // ordinary code unit was expected.
+        let mut out = [0u8; 16];
+        assert_eq!(utf16_to_utf8(&[0xde, 0x00], true, &mut out), None);
+        assert_eq!(utf16_to_utf8(&[0x00, 0xde], false, &mut out), None);
+
+        // And after a valid character, so it is not just the first
+        // code unit that is checked.
+        assert_eq!(
+            utf16_to_utf8(&[0x00, 0x41, 0xde, 0x00], true, &mut out),
+            None
+        );
+    }
+
+    #[test]
+    fn utf16_to_utf8_refuses_odd_length() {
+        let mut out = [0u8; 16];
+        assert_eq!(utf16_to_utf8(&[0x00, 0x41, 0x00], true, &mut out), None);
+        assert_eq!(utf16_to_utf8(&[0x41], false, &mut out), None);
+    }
+
+    #[test]
+    fn utf16_to_utf8_refuses_output_one_byte_too_small() {
+        let mut src = [0u8; 8];
+        let n = utf16_ascii(b"abcd", false, &mut src);
+
+        let mut exact = [0u8; 4];
+        assert_eq!(utf16_to_utf8(&src[..n], false, &mut exact), Some(4));
+
+        let mut short = [0u8; 3];
+        assert_eq!(utf16_to_utf8(&src[..n], false, &mut short), None);
+    }
+
+    #[test]
+    fn utf16_to_utf8_four_byte_output_at_the_exact_end_of_dst() {
+        // The 4-byte encoding branch is the only one that can advance
+        // the output cursor past a 3-byte-safe check, so its boundary
+        // is tested on both sides: "ab" plus U+1F600 needs exactly 6
+        // bytes, and five is one too few.
+        let mut src = [0u8; 8];
+        src[..4].copy_from_slice(&[0x00, 0x61, 0x00, 0x62]); // "ab", BE
+        src[4..].copy_from_slice(&[0xd8, 0x3d, 0xde, 0x00]); // U+1F600
+
+        let mut exact = [0u8; 6];
+        assert_eq!(utf16_to_utf8(&src, true, &mut exact), Some(6));
+        assert_eq!(&exact, &[0x61, 0x62, 0xf0, 0x9f, 0x98, 0x80]);
+
+        // One byte short: refused outright rather than truncated to a
+        // partial code point, which would be invalid UTF-8 and would
+        // still look like a path to whatever consumed it.
+        let mut short = [0u8; 5];
+        assert_eq!(utf16_to_utf8(&src, true, &mut short), None);
+
+        // And a zero-length destination refuses the pair rather than
+        // reporting an empty success.
+        let mut empty: [u8; 0] = [];
+        assert_eq!(utf16_to_utf8(&src[4..], true, &mut empty), None);
+    }
+
+    #[test]
+    fn utf16_to_utf8_stops_at_embedded_nul() {
+        // "ab\0cd": decoding stops at the NUL, which is excluded from
+        // the count, and the trailing "cd" is never examined.
+        let src_be = [0x00, 0x61, 0x00, 0x62, 0x00, 0x00, 0x00, 0x63, 0x00, 0x64];
+        let mut out = [0u8; 16];
+        assert_eq!(utf16_to_utf8(&src_be, true, &mut out), Some(2));
+        assert_eq!(&out[..2], b"ab");
+
+        let src_le = [0x61, 0x00, 0x62, 0x00, 0x00, 0x00, 0x63, 0x00, 0x64, 0x00];
+        assert_eq!(utf16_to_utf8(&src_le, false, &mut out), Some(2));
+        assert_eq!(&out[..2], b"ab");
+
+        // Even garbage after the NUL — here an unpaired surrogate —
+        // is not looked at.
+        let trailing = [0x00, 0x61, 0x00, 0x00, 0xdc, 0x00];
+        assert_eq!(utf16_to_utf8(&trailing, true, &mut out), Some(1));
+    }
+
+    #[test]
+    fn utf16_to_utf8_multibyte_bmp_forms() {
+        let mut out = [0u8; 16];
+
+        // U+00E9 LATIN SMALL LETTER E WITH ACUTE -> two UTF-8 bytes.
+        assert_eq!(utf16_to_utf8(&[0x00, 0xe9], true, &mut out), Some(2));
+        assert_eq!(&out[..2], &[0xc3, 0xa9]);
+        assert_eq!(utf16_to_utf8(&[0xe9, 0x00], false, &mut out), Some(2));
+        assert_eq!(&out[..2], &[0xc3, 0xa9]);
+
+        // U+9600 UPPER HALF BLOCK -> three UTF-8 bytes.
+        assert_eq!(utf16_to_utf8(&[0x96, 0x00], true, &mut out), Some(3));
+        assert_eq!(&out[..3], &[0xe9, 0x98, 0x80]);
+        assert_eq!(utf16_to_utf8(&[0x00, 0x96], false, &mut out), Some(3));
+        assert_eq!(&out[..3], &[0xe9, 0x98, 0x80]);
+    }
+
+    #[test]
+    fn utf16_to_utf8_refuses_conflicting_fixture_mac_blob() {
+        // The 25-byte `Mac ` platform locator blob from the phase 2
+        // fixture vhd-diff-locator-conflicting.vhd. It exists to be
+        // undecodable: a lossy decoder would turn that fixture into a
+        // silent pass, so this test is what proves the decoder honours
+        // it. Refused in both endiannesses.
+        let blob = [
+            0x00, 0xd8, 0xd8, 0x00, 0x00, 0x96, 0x00, 0x02, b'c', b'o', b'n', b'f', b'l', b'i',
+            b'c', b't', b'-', b's', b'i', b'x', b'.', b'v', b'h', b'd', 0x00,
+        ];
+        assert_eq!(blob.len(), 25);
+
+        let mut out = [0u8; 64];
+        assert_eq!(utf16_to_utf8(&blob, true, &mut out), None);
+        assert_eq!(utf16_to_utf8(&blob, false, &mut out), None);
+
+        // The odd length alone would refuse it. Truncating to an even
+        // 24 bytes proves the refusal does not depend on that: read
+        // big endian the blob is U+00D8 then an unpaired high
+        // surrogate D800, and read little endian it opens with an
+        // unpaired high surrogate D800.
+        assert_eq!(utf16_to_utf8(&blob[..24], true, &mut out), None);
+        assert_eq!(utf16_to_utf8(&blob[..24], false, &mut out), None);
     }
 }

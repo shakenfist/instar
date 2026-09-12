@@ -1,4 +1,4 @@
-# gitleaks suppressions.
+# gitleaks suppressions by fingerprint.
 #
 # This repository deliberately carries key material that is not secret:
 # LUKS test passphrases in tests/manifest.json, the synthetic keys
@@ -16,10 +16,19 @@
 #
 #   <path>:<rule-id>:<line>
 #
+# A fingerprint names the commit that introduced the line, so it only
+# suits history that will not be rewritten. On a branch still in
+# review, use the allowlist in .gitleaks.toml instead: rebasing gives
+# every commit a new hash, which silently invalidates a fingerprint and
+# turns the branch red without anyone having changed it.
+#
 # Prefer fixing a real leak over suppressing it. If a credential ever
 # does land here, rotate it first -- the history scan will keep finding
 # it, and suppressing the finding does not un-publish the secret.
 #
-# No suppressions are needed today. This file exists so that the first
-# false positive can be handled with a one-line commit rather than an
-# emergency workflow edit while every PR is red.
+# Do not quote a flagged source line in a comment here. gitleaks scans
+# this file like any other, so a quoted line comes back as a fresh
+# finding at the line the explanation sits on. Describe the shape of
+# the match instead.
+#
+# There are no fingerprint suppressions at present.

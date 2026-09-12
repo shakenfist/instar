@@ -40,13 +40,20 @@ jobs:
       - name: Install gitleaks
         run: sudo apt-get update && sudo apt-get install -y gitleaks
 
-      # Findings are suppressed by fingerprint in .gitleaksignore, which
-      # documents the format and the rotate-before-suppressing rule.
-      # This repository legitimately carries LUKS test passphrases,
-      # synthetic keys from scripts/create-luks-*, and fixture UUIDs, so
-      # a false positive is a question of when rather than whether --
-      # and without an in-repo suppression path the first one turns
-      # every subsequent PR red until someone edits this workflow.
+      # Findings are suppressed in two places, both of which document
+      # the rotate-before-suppressing rule: .gitleaks.toml carries an
+      # allowlist matched against the finding itself, and
+      # .gitleaksignore carries fingerprints. Prefer the allowlist. A
+      # fingerprint names the commit that introduced the line, so
+      # rebasing a branch under review invalidates it and the finding
+      # returns red with nothing having changed. gitleaks picks up
+      # .gitleaks.toml from --source automatically; it is not passed
+      # here. This repository legitimately carries LUKS test
+      # passphrases, synthetic keys from scripts/create-luks-*, and
+      # fixture UUIDs, so a false positive is a question of when rather
+      # than whether -- and without an in-repo suppression path the
+      # first one turns every subsequent PR red until someone edits
+      # this workflow.
       # --log-opts="HEAD" scopes the scan to this branch and the
       # history behind it. Without it gitleaks scans every ref, which
       # is not what anyone means by "scan this project's history": it
