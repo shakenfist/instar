@@ -1,0 +1,58 @@
+# gitleaks configuration.
+#
+# This file exists to hold suppressions that survive a rebase.
+#
+# The other suppression path, .gitleaksignore, works by fingerprint,
+# and a fingerprint begins with the commit that introduced the line.
+# That is fine for history that has already merged and will never be
+# rewritten. On a branch still in review it is a trap: every rebase
+# gives the commit a new hash, the fingerprint stops matching, and the
+# finding returns red on a branch whose content nobody has touched. An
+# entry here is matched by content instead, and is read from the
+# working tree at scan time, so it holds across rebases, across
+# line-number drift, and across the whole history the scan reaches.
+#
+# Prefer fixing a real leak over suppressing it. If a credential ever
+# does land in this repository, rotate it first -- the history scan
+# will keep finding it, and suppressing it does not un-publish it.
+#
+# Two things about allowlist regexes are worth knowing before adding
+# one, because both were established by experiment against the pinned
+# gitleaks the CI job installs, and neither is what the obvious reading
+# of the documentation suggests:
+#
+#   * The regex is tested against the rule's whole match, not against
+#     the reported secret. A rule's match generally starts earlier in
+#     the line than the secret does -- for the rules that hunt for
+#     credentials, it starts at whatever word made the rule fire. So a
+#     pattern anchored to the secret alone never matches anything.
+#   * Because the match therefore carries surrounding source text, it
+#     moves whenever that text is reformatted. Anchoring a pattern to
+#     it buys very little and breaks on the next reformat.
+#
+# So: identify the entry by the narrowest distinctive string in the
+# match, unanchored, and rely on the string itself for the narrowing.
+# Never allowlist a path and never disable a rule; both would silently
+# cover findings nobody has looked at yet.
+#
+# Do not quote a flagged source line in a comment here. gitleaks scans
+# its own configuration like any other file, so a quoted line comes
+# back as a fresh finding at the line the explanation sits on.
+# Describe the shape of the match instead.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Identifiers that score as high-entropy but name nothing sensitive."
+regexes = [
+  # A public bounds constant in the VHDX parent locator parser, used by
+  # a check that refuses an over-long metadata pair name. The
+  # generic-api-key rule reads the identifier under test as its trigger
+  # word, then scores whatever follows the comparison operator; the
+  # constant's own name scores 3.97, over the rule's 3.5 floor, because
+  # it is long and mixes case classes. It is a compile-time limit. No
+  # credential is involved and there is nothing to rotate. The name is
+  # distinctive enough on its own, so the pattern is just the name.
+  '''MAX_PARENT_LOCATOR_KEY_UTF16''',
+]
