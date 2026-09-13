@@ -130,19 +130,45 @@ metadata, it never composes sector data, so it has no wrong answer
 to give. Its defect is an omission — it reports no parent for an
 image that has one — which phase 3 made fixable. See decision 4.
 
-**Mechanism finding 5 — a reason channel exists, and is the
-established pattern.** Both `init` functions return
-`Option<Self>`, and the chain initialiser returns `bool`, so none
-of them can say *why* today; that is the whole of #548. But the
-repository already solves this per operation: a `u32` code in the
-op's result struct in `src/shared/src/lib.rs`
-(`MapResult::ERROR_HAS_BACKING` at `:2924`) rendered host-side by
-a small table (`map_error_message` at `src/vmm/src/main.rs:15048`,
-`snapshot_error_message` at `:16112`). Phase 4 extends that
-pattern rather than inventing one. `send_error(op, device, sector,
-status)` exists on the call table (`src/core/src/main.rs:430`) but
-is used for infrastructure faults — cpu exceptions, virtio probe
-failures — not format policy, and this phase leaves it that way.
+**Mechanism finding 5 — the per-op result struct is *not* a
+usable channel, and the right precedent is issue #375.** Both
+`init` functions return `Option<Self>` and the chain initialiser
+returns `bool`, so none of them can say *why* today; that is the
+whole of #548. The obvious fix is a `u32` in the op's result
+struct, the way `MapResult::ERROR_HAS_BACKING` (`:2924`) is
+rendered by `map_error_message`
+(`src/vmm/src/main.rs:15048`). **That does not generalise, and
+this plan's first draft was wrong to assume it did.** Three of the
+five operations have nowhere to put such a code:
+
+* `convert` has no result struct at all. It reports through
+  `send_complete("convert", 0, false)` and its module header
+  states that no result message is needed. The host turns that
+  into the bare string at `src/vmm/src/main.rs:13241`.
+* `CompareResult` (`src/shared/src/lib.rs:2349`) carries a magic
+  and flags, but no error constants.
+* `CheckResult` (`:2069`) likewise has none.
+
+Adding result structs to three operations to carry one boolean
+fact would be a protocol change out of all proportion to the
+phase.
+
+The tree already solves this exact problem, for exactly this
+reason, in issue #375: when the guest IDT catches a CPU fault, a
+run loop that ends without a result must explain why instead of
+printing "guest did not return a result". The mechanism is a
+single capture in the message decoder — `last_cpu_exception` at
+`src/vmm/src/main.rs:770`, set at `:833` when a `Payload::Error`
+arrives whose `operation` field marks it — and a single formatter,
+`no_result_error` at `:789`, that prefers the captured reason and
+falls back to the generic text. `send_error(op, device, sector,
+status)` is already on the call table
+(`src/core/src/main.rs:430`), so every guest binary can raise it
+today with no protocol change.
+
+Phase 4 adds a sibling to that pair. This is op-agnostic, needs
+one host-side capture point rather than five, and works for the
+three operations that have no result struct.
 
 **Naming hazard 6.** `src/vmm/src/main.rs:18659` and the
 `MapRenderer` doc comment above it refer to "Phase 4". That is
@@ -175,13 +201,22 @@ the record shows what happened.
    undiagnosed failure that #548 exists to complain about. The
    callee is not wrong — the callers are missing a policy check.
 
-2. **One refusal code per operation, following `map`.** Rather
-   than a single global code, each op gets a constant in its own
-   result struct and a line in its own host message table, so the
-   message can name the operation the way `map:` and `snapshot:`
-   already do. This is five small additions in
-   `src/shared/src/lib.rs` and five in `src/vmm/src/main.rs`,
-   mirroring two working precedents.
+2. **One guest-side refusal signal, captured once on the host,
+   following issue #375 — not a per-op result code.** The guest
+   raises `send_error` with a reserved operation marker and a
+   status naming the format; the host decoder captures it beside
+   `last_cpu_exception`, and the failure paths render it in place
+   of their generic text. Survey finding 5 records why the
+   per-op-result-code shape, which this plan proposed in its first
+   draft, cannot work: `convert` has no result struct and
+   `CompareResult` and `CheckResult` have no error constants, so
+   three of the five operations have nowhere to put a code. The
+   message still names the operation, because the formatter takes
+   the op name as an argument exactly as `no_result_error` does.
+   `map` keeps its existing `ERROR_HAS_BACKING` and is not
+   migrated: it works, it is already covered by a test, and
+   changing it would put a working refusal at risk for
+   tidiness.
 
 3. **Make VHDX symmetric with VHD: `VhdxState::init` stops
    rejecting `has_parent`, and the entry points refuse instead.**
@@ -229,8 +264,8 @@ the record shows what happened.
 
 | Step | Effort | Model | Isolation | Brief for sub-agent |
 |------|--------|-------|-----------|---------------------|
-| 4a | medium | sonnet | none | Add one refusal constant per op to `src/shared/src/lib.rs` for convert, compare, bench, check and measure, mirroring `MapResult::ERROR_HAS_BACKING` (`:2924`) — same naming, same numbering style, and extend the existing `assert_eq!` constant-pinning tests near `:5943`. Then add the host-side message for each, mirroring `map_error_message` (`src/vmm/src/main.rs:15048`) and `snapshot_error_message` (`:16112`): a sentence naming the op, saying the source has a parent, and saying composition is deferred to PLAN-differencing phases 11-16. No behaviour change yet; nothing sets these codes in this step. Constraint: `src/shared` is `no_std`. |
-| 4b | high | opus | worktree | **Indivisible — one commit.** (i) Remove the `has_parent` rejection at `src/crates/vhdx/src/lib.rs:1647` and expose the flag on `VhdxState` so callers can test it (`has_parent` is already `pub` on the metadata at `:935`). (ii) In the generic chain-state initialiser `src/crates/qcow2/src/lib.rs:9450-9520`, refuse a differencing source in both the `ImageFormat::Vhd` arm (`:9478`, test `state.disk_type == vhd::DISK_TYPE_DIFFERENCING`) and the `ImageFormat::Vhdx` arm (`:9494`, test the new flag), threading the reason out — the function returns `bool` today, so it needs an out-parameter or a small enum return; choose the one that touches fewer callers and say which in the commit message. (iii) Do the same at `measure`'s two direct call sites (`src/operations/measure/src/main.rs:388` and `:400`). (iv) Each op sets its own 4a code. Copy the shape of `map`'s refusal at `src/operations/map/src/main.rs:459-470`. Constraints: both crates are `no_std`, panic-free, no allocator; the arms are behind the `vhd-input` and `vhdx-input` features, so check both feature combinations build. Do **not** touch `VhdState::init`. |
+| 4a | medium | sonnet | none | Build the refusal channel, following issue #375's `last_cpu_exception` pair exactly. (i) In `src/shared/src/lib.rs` add a small module of stable constants: a reserved `send_error` operation marker (a short string such as `differencing`) and one `u32` status per format (VHD, VHDX), documented as append-only the way `BenchResult`'s error codes are at `:4232`. `src/shared` is `no_std`. (ii) In `src/vmm/src/main.rs` add a `last_differencing_refusal: Option<u32>` field beside `last_cpu_exception` (`:770`, initialised `:781`), capture it in `add_byte` beside the existing capture (`:829-835`) when the `Payload::Error`'s `operation` equals the marker, and add a formatter beside `no_result_error` (`:789`) that takes the op name and renders a sentence naming the operation, saying the source is a differencing image whose parent instar cannot yet compose, and saying composition is deferred to PLAN-differencing phases 11-16. Follow the wording of `map_error_message` (`:15053`). (iii) Unit-test the formatter both ways, mirroring the two tests at `:863` and `:872`. Nothing raises the error yet — this step adds no behaviour. |
+| 4b | high | opus | worktree | **Indivisible — one commit.** (i) Remove the `has_parent` rejection at `src/crates/vhdx/src/lib.rs:1647` and expose the flag on `VhdxState` so callers can test it (`has_parent` is already `pub` on the metadata at `:935`). (ii) In the generic chain-state initialiser `src/crates/qcow2/src/lib.rs:9450-9520`, refuse a differencing source in both the `ImageFormat::Vhd` arm (`:9478`, test `state.disk_type == vhd::DISK_TYPE_DIFFERENCING`) and the `ImageFormat::Vhdx` arm (`:9494`, test the new flag), threading the reason out — the function returns `bool` today, so it needs an out-parameter or a small enum return; choose the one that touches fewer callers and say which in the commit message. (iii) Do the same at `measure`'s two direct call sites (`src/operations/measure/src/main.rs:388` and `:400`). (iv) At each refusal, call the call table's `send_error` with 4a's marker and the format's status before returning failure, so the host renders the specific message; `map`'s refusal at `src/operations/map/src/main.rs:459-470` shows the return shape, but use the 4a channel rather than a result code — `convert`, `compare` and `check` have nowhere to put one. (v) Wire the host's generic failure sites to the 4a formatter, at minimum `src/vmm/src/main.rs:13241` (convert) and `:12213` (compare). Constraints: both crates are `no_std`, panic-free, no allocator; the arms are behind the `vhd-input` and `vhdx-input` features, so check both feature combinations build. Do **not** touch `VhdState::init`. |
 | 4c | medium | sonnet | none | Teach `info` to report the parent. `info` parses the footer itself (`parse_vhd_footer`, `src/operations/info/src/main.rs:434`) and does not link the vhd crate — decide with the management session whether to add the dependency or extend the local parser, and state the choice. Report the parent name for a differencing VHD and the parent locator's linkage for a differencing VHDX, in both human and `--output json` forms, following how qcow2's backing file is already reported. Refuse nothing. |
 | 4d | high | opus | worktree | Integration tests over the phase 2 fixtures. For each of convert, compare, bench, check, measure and dd, assert a non-zero exit and the expected message on `vhd-differencing`, `vhd-diff-child-aligned` and `vhdx-diff-child`; assert `map` still refuses (regression guard on the precedent) and that `info` now reports a parent. Assert dd and convert produce the same refusal, which is the only thing recording that they share a binary. Use the existing integration harness rather than a new one. The composed goldens (`vhd-diff-aligned-composed.raw`, `vhdx-diff-composed.raw`) are phase 11-16 material — do not use them here. |
 | 4e | medium | sonnet | none | Documentation and closeout. Update `docs/format-coverage.md` (divergence notes), `docs/quirks.md` and `CHANGELOG.md` to state that differencing VHD and VHDX are refused on read with composition deferred. Close #547 and #548 with a comment naming the commit and the message a user now sees. Do not touch `docs/create.md` or the emitter docs — phases 5, 6 and 10 own those. |
@@ -278,6 +313,11 @@ Steps 4a and 4c are independent of each other. 4b depends on 4a.
   Specifically, `instar convert -O raw` on `vhd-differencing`
   produces **no output file**, where today it produces a wrong one
   and exits 0.
+* No operation gained a result struct or a new protocol message:
+  the refusal travels on the existing `send_error` channel, and
+  `git diff` touches neither `crates/guest-protocol` nor the
+  `*Result` struct definitions in `src/shared/src/lib.rs` beyond
+  the new constants module.
 * `grep -rn 'VhdState::init\|VhdxState::init' --include=*.rs src/`
   and the `ImageFormat::Vhd`/`ImageFormat::Vhdx` dispatch arms in
   `src/crates/qcow2/src/lib.rs` together enumerate every read
