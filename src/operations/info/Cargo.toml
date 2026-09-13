@@ -13,6 +13,14 @@ qcow1 = { path = "../../crates/qcow1" }
 raw = { path = "../../crates/raw" }
 vmdk = { path = "../../crates/vmdk" }
 luks = { path = "../../crates/luks", features = ["decrypt", "kdf-argon2"] }
+# Both are used only to report a differencing image's parent. VHDX reuses
+# crates/vhdx's staging/decoding pipeline (`parse_metadata`,
+# `VhdxParentLocatorState`); VHD reuses crates/vhd's `VhdDynamicHeader::parse`
+# for its `cxsparse` cookie check and its DYN_* offsets. Neither is
+# re-derived locally: an `info` that decodes a header the parser crates would
+# have rejected is exactly how untrusted bytes reach a user-facing field.
+vhd = { path = "../../crates/vhd" }
+vhdx = { path = "../../crates/vhdx" }
 
 # Argon2 crate still needed directly for Block type in memory allocation
 argon2 = { version = "0.6", default-features = false }

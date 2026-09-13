@@ -114,9 +114,9 @@ fn map_create_error(e: CreateError) -> u32 {
 }
 
 /// Recover a backing image's `virtual_size` by reading and parsing its
-/// header from input device 0. Returns `None` if the format is
-/// unrecognised or the parse fails; the caller maps `None` to
-/// `ERROR_BACKING_PARSE_FAILED`.
+/// header from input device 0. On failure returns the `CreateResult`
+/// error code the caller should report, so the reason survives the
+/// return rather than collapsing into one generic code.
 ///
 /// VHDX walks header → region table → metadata region via the
 /// vhdx crate's `VhdxState::init`, which exposes
@@ -125,37 +125,65 @@ fn map_create_error(e: CreateError) -> u32 {
 /// create scratch — safe because the planner doesn't run until
 /// after this function returns).
 ///
+/// A differencing VHD or VHDX is refused here, with its own
+/// `ERROR_BACKING_DIFFERENCING` rather than the generic
+/// `ERROR_BACKING_PARSE_FAILED`: the backing header parsed perfectly
+/// well, and telling a user a valid image is "truncated, corrupted, or an
+/// unrecognised format" is the undiagnosed failure this phase exists to
+/// stop making. Every read path in instar refuses such an image, so an
+/// overlay stacked on one would be a chain that can never be read back.
+/// Until parent composition exists
+/// (`docs/plans/PLAN-differencing.md`), failing closed at create time is
+/// the only outcome that does not hand the user a dead image. For VHDX
+/// this preserves what `VhdxState::init`'s own `has_parent` rejection used
+/// to do before that rejection moved out to the read entry points; the VHD
+/// arm never had such a guard and gains one here so the two formats agree.
+///
 /// # Safety
 ///
 /// `call_table` must be valid and input device 0 must be attached
 /// with non-zero capacity.
-unsafe fn read_backing_virtual_size(call_table: &CallTable, sector_size: usize) -> Option<u64> {
+unsafe fn read_backing_virtual_size(
+    call_table: &CallTable,
+    sector_size: usize,
+) -> Result<u64, u32> {
+    const PARSE_FAILED: u32 = CreateResult::ERROR_BACKING_PARSE_FAILED;
+    const DIFFERENCING: u32 = CreateResult::ERROR_BACKING_DIFFERENCING;
+
     let header_ptr = HEADER_BUF as *mut u8;
     if !(call_table.read_input_sector)(0, 0, header_ptr, sector_size) {
-        return None;
+        return Err(PARSE_FAILED);
     }
     let header = core::slice::from_raw_parts(header_ptr, sector_size);
     let format = detect_format_from_header(header, sector_size, false);
     let capacity = (call_table.get_input_capacity)(0);
     match format {
-        ImageFormat::Raw => capacity.checked_mul(sector_size as u64),
-        ImageFormat::Qcow2 => qcow2::QcowHeader::parse(header).map(|h| h.virtual_size),
-        ImageFormat::Vmdk4 => vmdk::Vmdk4Header::parse(header).map(|h| h.virtual_size),
+        ImageFormat::Raw => capacity.checked_mul(sector_size as u64).ok_or(PARSE_FAILED),
+        ImageFormat::Qcow2 => qcow2::QcowHeader::parse(header)
+            .map(|h| h.virtual_size)
+            .ok_or(PARSE_FAILED),
+        ImageFormat::Vmdk4 => vmdk::Vmdk4Header::parse(header)
+            .map(|h| h.virtual_size)
+            .ok_or(PARSE_FAILED),
         ImageFormat::Vhd => {
             // VHD's footer lives at the *end* of the file; read the
             // last sector and parse from there.
             if capacity == 0 {
-                return None;
+                return Err(PARSE_FAILED);
             }
             if !(call_table.read_input_sector)(0, capacity - 1, header_ptr, sector_size) {
-                return None;
+                return Err(PARSE_FAILED);
             }
             let last_sector = core::slice::from_raw_parts(header_ptr, sector_size);
-            vhd::VhdFooter::parse(last_sector).map(|f| f.current_size)
+            let footer = vhd::VhdFooter::parse(last_sector).ok_or(PARSE_FAILED)?;
+            if footer.disk_type == vhd::DISK_TYPE_DIFFERENCING {
+                return Err(DIFFERENCING);
+            }
+            Ok(footer.current_size)
         }
         ImageFormat::Vhdx => {
             if capacity == 0 {
-                return None;
+                return Err(PARSE_FAILED);
             }
             let mut bytes_read: u64 = 0;
             let state = vhdx::VhdxState::init(
@@ -166,11 +194,15 @@ unsafe fn read_backing_virtual_size(call_table: &CallTable, sector_size: usize) 
                 VHDX_CACHE_A as *mut u8,
                 VHDX_CACHE_B as *mut u8,
                 &mut bytes_read,
-            )?;
-            Some(state.virtual_disk_size)
+            )
+            .ok_or(PARSE_FAILED)?;
+            if state.has_parent {
+                return Err(DIFFERENCING);
+            }
+            Ok(state.virtual_disk_size)
         }
         // Vdi / Qcow1 / Qed / Iso / Luks: unsupported as backing.
-        _ => None,
+        _ => Err(PARSE_FAILED),
     }
 }
 
@@ -499,8 +531,10 @@ pub unsafe extern "C" fn _start() -> u64 {
         config.virtual_size
     } else if config.has_backing() {
         match read_backing_virtual_size(call_table, config.sector_size as usize) {
-            Some(vs) if vs > 0 => vs,
-            Some(_) | None => {
+            Ok(vs) if vs > 0 => vs,
+            // A zero virtual size is as unusable as a failed parse, and
+            // carries no more specific reason than that.
+            Ok(_) => {
                 send_result(
                     call_table,
                     config.target_format,
@@ -510,6 +544,11 @@ pub unsafe extern "C" fn _start() -> u64 {
                     0,
                     CreateResult::ERROR_BACKING_PARSE_FAILED,
                 );
+                (call_table.send_complete)(b"create\0".as_ptr(), 0, false);
+                return 0;
+            }
+            Err(code) => {
+                send_result(call_table, config.target_format, 0, 0, 0, 0, code);
                 (call_table.send_complete)(b"create\0".as_ptr(), 0, false);
                 return 0;
             }

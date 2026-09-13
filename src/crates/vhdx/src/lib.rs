@@ -756,6 +756,45 @@ impl VhdxParentLocator {
         self.value_of(KEY_ABSOLUTE_WIN32_PATH)
     }
 
+    /// Which path key a consumer should report or open first, answering
+    /// for VHDX the same question `VhdState::preferred_locator` answers
+    /// for VHD -- though the two shapes differ enough that this is a much
+    /// smaller decision. VHDX carries at most one locator *item*, and
+    /// that item is a flat key/value bag rather than VHD's eight
+    /// platform-typed slots, so there is no ambiguity to resolve between
+    /// competing entries -- only a choice of which of up to three path
+    /// keys is most useful when several are present.
+    ///
+    /// Preference order, highest first:
+    ///
+    /// 1. `relative_path` -- resolved against the child's own directory,
+    ///    so it is the one path here that survives moving both files
+    ///    together to a different machine or mount point. It is also
+    ///    the closest analog to what qcow2's `backing_file` header field
+    ///    usually holds, which is the shape every other format's
+    ///    `backing_file` reporting in this tree already reads as.
+    /// 2. `absolute_win32_path` -- a real filesystem path, just one
+    ///    anchored to a specific drive letter, so it is still useful to
+    ///    show even though it will not resolve if the parent moved.
+    /// 3. `volume_path` -- a path via a Windows volume GUID
+    ///    (`\\?\Volume{...}\...`). Correct only on the exact machine
+    ///    that minted the GUID, so it is the least broadly useful of the
+    ///    three and is offered only when nothing else is present.
+    ///
+    /// `parent_linkage` (the parent's `DataWriteGuid`) is deliberately
+    /// never returned here: it identifies the parent for verification,
+    /// it is not a path to it.
+    ///
+    /// Returns `None` when no path key is present -- an item that
+    /// carries only `parent_linkage`, say, or one whose path entries all
+    /// failed to decode (`value_of` already excludes entries marked
+    /// `defect`).
+    pub fn preferred_path(&self) -> Option<&[u8]> {
+        self.relative_path()
+            .or_else(|| self.absolute_win32_path())
+            .or_else(|| self.volume_path())
+    }
+
     /// Whether this item's `parent_linkage` names `expected`, compared
     /// ASCII case-insensitively.
     ///
@@ -1482,6 +1521,22 @@ pub struct VhdxState {
     pub bat_offset: u64,
     pub total_bat_entries: u32,
     pub chunk_ratio: u32,
+    /// `HasParent` from the file parameters metadata item: the image
+    /// is a differencing (parent-referencing) VHDX whose real content
+    /// lives partly in a parent file.
+    ///
+    /// `init` deliberately does **not** refuse such an image. Read
+    /// entry points test this flag and refuse with a diagnosis of
+    /// their own (see `PLAN-differencing-phase-04-read-policy.md`,
+    /// decision 3), which keeps VHDX symmetric with VHD -- whose
+    /// `VhdState::init` likewise accepts `DISK_TYPE_DIFFERENCING` and
+    /// exposes `disk_type` -- and leaves both formats initialising
+    /// successfully for the composition work in phases 11-16.
+    ///
+    /// **A consumer that composes sector data must test this.** An
+    /// image with it set reads as zeros wherever the parent holds the
+    /// data.
+    pub has_parent: bool,
     // Sector cache for BAT reads
     pub bat_cached_sector: u64,
     pub bat_cache_buf: *mut u8,
@@ -1494,8 +1549,12 @@ impl VhdxState {
     /// Initialize VHDX state by reading headers, region table, and
     /// metadata.
     ///
-    /// Returns `None` if the image is invalid, a differencing disk,
-    /// or I/O fails.
+    /// Returns `None` if the image is invalid or I/O fails.
+    ///
+    /// A differencing (parent-referencing) image initialises
+    /// successfully and reports itself through
+    /// [`VhdxState::has_parent`]; refusing it is the caller's policy
+    /// decision, not this crate's. See that field.
     ///
     /// # Safety
     ///
@@ -1643,10 +1702,14 @@ impl VhdxState {
             bytes_read,
         )?;
 
-        // Reject differencing disks
-        if metadata.has_parent {
-            return None;
-        }
+        // A differencing image is *not* refused here: `has_parent` is
+        // carried out on the returned state instead, and the read entry
+        // points refuse it by name (decision 3 of
+        // `docs/plans/PLAN-differencing-phase-04-read-policy.md`). A bare
+        // `None` here was indistinguishable from a corrupt header, which
+        // is what issue #548 complained about, and it left VHDX
+        // structurally different from VHD for the composition phases to
+        // reconcile later.
 
         // Validate sector sizes
         if metadata.logical_sector_size != 512 && metadata.logical_sector_size != 4096 {
@@ -1692,6 +1755,7 @@ impl VhdxState {
             bat_offset,
             total_bat_entries: total_bat_entries_u32,
             chunk_ratio: chunk_ratio_u32,
+            has_parent: metadata.has_parent,
             bat_cached_sector: u64::MAX,
             bat_cache_buf,
             data_cached_sector: u64::MAX,
@@ -1806,8 +1870,11 @@ impl VhdxState {
                     host_byte_offset: file_offset + intra_block_offset,
                 })
             }
-            // PARTIALLY_PRESENT requires parent — we rejected
-            // differencing disks in init, so treat as error.
+            // PARTIALLY_PRESENT resolves against the parent, which
+            // nothing can compose yet. `init` no longer refuses a
+            // differencing image (the read entry points do, on
+            // `has_parent`), so this arm is the backstop for a caller
+            // that skipped that check: fail rather than invent data.
             _ => None,
         }
     }
@@ -3276,6 +3343,72 @@ mod tests {
         let locator = parse_parent_locator(&buf[..len]).unwrap();
         assert_eq!(locator.parent_linkage(), None);
         assert!(!locator.linkage_matches(HYPERV_LINKAGE.as_bytes()));
+    }
+
+    // ------------------------------------------------------------------
+    // preferred_path() -- differencing phase 4, step 4c
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn preferred_path_prefers_relative_path() {
+        let mut buf = [0u8; 1024];
+        let len = build_locator_item(
+            &[
+                ("parent_linkage", HYPERV_LINKAGE),
+                (
+                    "absolute_win32_path",
+                    r"C:\instar-testdata\vhdx-diff-parent.vhdx",
+                ),
+                ("relative_path", r".\vhdx-diff-parent.vhdx"),
+            ],
+            &mut buf,
+        );
+        let locator = parse_parent_locator(&buf[..len]).unwrap();
+
+        assert_eq!(
+            locator.preferred_path(),
+            Some(&br".\vhdx-diff-parent.vhdx"[..])
+        );
+    }
+
+    #[test]
+    fn preferred_path_falls_back_to_absolute_win32_path() {
+        let mut buf = [0u8; 1024];
+        let len = build_locator_item(
+            &[
+                ("parent_linkage", HYPERV_LINKAGE),
+                (
+                    "absolute_win32_path",
+                    r"C:\instar-testdata\vhdx-diff-parent.vhdx",
+                ),
+            ],
+            &mut buf,
+        );
+        let locator = parse_parent_locator(&buf[..len]).unwrap();
+
+        assert_eq!(
+            locator.preferred_path(),
+            Some(&br"C:\instar-testdata\vhdx-diff-parent.vhdx"[..])
+        );
+    }
+
+    #[test]
+    fn preferred_path_falls_back_to_volume_path() {
+        let mut buf = [0u8; 1024];
+        let value = r"\\?\Volume{5e0bd954-71b2-4bff-a928-082af7ab0f8f}\vhdx-diff-parent.vhdx";
+        let len = build_locator_item(&[("volume_path", value)], &mut buf);
+        let locator = parse_parent_locator(&buf[..len]).unwrap();
+
+        assert_eq!(locator.preferred_path(), Some(value.as_bytes()));
+    }
+
+    #[test]
+    fn preferred_path_none_when_no_path_key_present() {
+        let mut buf = [0u8; 1024];
+        let len = build_locator_item(&[("parent_linkage", HYPERV_LINKAGE)], &mut buf);
+        let locator = parse_parent_locator(&buf[..len]).unwrap();
+
+        assert_eq!(locator.preferred_path(), None);
     }
 
     #[test]

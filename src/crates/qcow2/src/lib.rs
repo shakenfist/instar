@@ -9395,6 +9395,34 @@ pub struct ChainStates {
     pub dmg_states: [Option<dmg::DmgState>; MAX_CHAIN_DEVICES],
 }
 
+/// Raise the differencing-image read refusal on the call table's
+/// `send_error` channel.
+///
+/// `init_chain_states` returns a bare `bool`, so it cannot say *why* a
+/// device failed to initialise. Rather than change its signature and
+/// all five callers, the refusal is raised from inside the function on
+/// the channel the host already watches: the host's `SerialDecoder`
+/// captures an `error` message whose operation is
+/// `DifferencingRefusal::OPERATION` and renders it in place of the
+/// operation's generic failure text. See decision 2 of
+/// `docs/plans/PLAN-differencing-phase-04-read-policy.md`.
+///
+/// `status` is one of `DifferencingRefusal::STATUS_VHD` /
+/// `STATUS_VHDX`.
+///
+/// # Safety
+///
+/// `call_table` must be a valid initialised [`CallTable`].
+#[cfg(any(feature = "vhd-input", feature = "vhdx-input"))]
+unsafe fn send_differencing_refusal(call_table: &CallTable, status: u32) {
+    (call_table.send_error)(
+        shared::DifferencingRefusal::OPERATION_C.as_ptr(),
+        b"input\0".as_ptr(),
+        0,
+        status,
+    );
+}
+
 /// Initialize format-specific state for all devices in a chain.
 ///
 /// Initializes QCOW2 state for QCOW2 devices, and (when the
@@ -9487,7 +9515,21 @@ pub unsafe fn init_chain_states(
                     l2_cache_addr(dynamic_bufs_start, dev_idx),
                     bytes_read,
                 );
-                if chain_states.vhd_states[dev_idx].is_none() {
+                let Some(state) = chain_states.vhd_states[dev_idx].as_ref() else {
+                    return false;
+                };
+                // A differencing VHD's real content lives partly in its
+                // parent, which nothing here can compose. `VhdState::init`
+                // deliberately accepts `DISK_TYPE_DIFFERENCING` (map reads
+                // `disk_type` back off it, and the composition phases need
+                // the state), so the policy check belongs here: without it
+                // every unallocated block reads as zeros and the caller
+                // reports success on wrong data (issue #547).
+                if state.disk_type == vhd::DISK_TYPE_DIFFERENCING {
+                    (call_table.debug_print)(
+                        b"init_chain_states: differencing VHD source refused\n\0".as_ptr(),
+                    );
+                    send_differencing_refusal(call_table, shared::DifferencingRefusal::STATUS_VHD);
                     return false;
                 }
             }
@@ -9503,7 +9545,19 @@ pub unsafe fn init_chain_states(
                     l2_cache_addr(dynamic_bufs_start, dev_idx),
                     bytes_read,
                 );
-                if chain_states.vhdx_states[dev_idx].is_none() {
+                let Some(state) = chain_states.vhdx_states[dev_idx].as_ref() else {
+                    return false;
+                };
+                // Same policy as the VHD arm above. `VhdxState::init` used
+                // to refuse a differencing image itself, which made every
+                // failure look identical to a corrupt header (issue #548);
+                // it now reports `has_parent` and the refusal happens here,
+                // where it can say which format and why.
+                if state.has_parent {
+                    (call_table.debug_print)(
+                        b"init_chain_states: differencing VHDX source refused\n\0".as_ptr(),
+                    );
+                    send_differencing_refusal(call_table, shared::DifferencingRefusal::STATUS_VHDX);
                     return false;
                 }
             }

@@ -39,6 +39,17 @@ const VHD_MAX_CHS_SECS: u8 = 255;
 // Maximum backing file path length (QCOW2 spec allows up to 1023 bytes)
 const MAX_BACKING_FILE_LEN: usize = 1024;
 
+// VHD footer and dynamic-header offsets used only to report a differencing
+// image's parent (footer disk_type == 4). These come from `crates/vhd`
+// rather than being re-declared here: a local copy has no way to fail when
+// the crate's values move, and `info` is a `no_main` guest binary that
+// cannot run `cargo test` to catch the drift.
+use vhd::{
+    DISK_TYPE_DIFFERENCING as VHD_DISK_TYPE_DIFFERENCING,
+    DYNAMIC_HEADER_SIZE as VHD_DYNAMIC_HEADER_SIZE, DYN_PARENT_NAME_OFFSET, DYN_PARENT_NAME_SIZE,
+    FOOTER_DATA_OFFSET_OFFSET, FOOTER_DISK_TYPE_OFFSET,
+};
+
 // VHDX format constants (all offsets and values are little-endian)
 // VHDX region table is at fixed offset 192KB (0x30000)
 const VHDX_REGION_TABLE_OFFSET: u64 = 0x30000;
@@ -424,16 +435,46 @@ pub unsafe extern "C" fn _start() -> u64 {
             );
         }
         ImageFormat::Vhd => {
+            // Differencing (parent-referencing) VHD reports its parent's
+            // unicode name as `backing_file`, following how qcow2's
+            // backing file already flows through `send_info_result`.
+            // `info` composes nothing, so it reports a parent rather than
+            // refusing one (decision 4 of
+            // docs/plans/PLAN-differencing-phase-04-read-policy.md).
+            let mut backing_file_buf = [0u8; MAX_BACKING_FILE_LEN + 1];
+
             if detailed {
                 // VHD footer may be in first sector (dynamic) or last sector (fixed)
                 let vhd_cookie = u64::from_be_bytes([
                     buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6],
                     buffer[7],
                 ]);
-                if vhd_cookie == VHD_COOKIE {
+                let footer_bytes: &[u8] = if vhd_cookie == VHD_COOKIE {
                     parse_vhd_footer(&buffer, &mut result);
+                    &buffer
                 } else {
                     parse_vhd_footer(&footer_buffer, &mut result);
+                    &footer_buffer
+                };
+
+                let disk_type = u32::from_be_bytes([
+                    footer_bytes[FOOTER_DISK_TYPE_OFFSET],
+                    footer_bytes[FOOTER_DISK_TYPE_OFFSET + 1],
+                    footer_bytes[FOOTER_DISK_TYPE_OFFSET + 2],
+                    footer_bytes[FOOTER_DISK_TYPE_OFFSET + 3],
+                ]);
+
+                if disk_type == VHD_DISK_TYPE_DIFFERENCING
+                    && parse_vhd_parent_name(
+                        call_table,
+                        footer_bytes,
+                        input_sector_size,
+                        input_capacity,
+                        &mut backing_file_buf,
+                    )
+                {
+                    result.flags |= InfoResult::FLAG_HAS_BACKING_FILE;
+                    (call_table.verbose_print)(b"info: VHD has parent\n\0".as_ptr());
                 }
             }
 
@@ -444,13 +485,29 @@ pub unsafe extern "C" fn _start() -> u64 {
                 result.actual_size,
                 result.cluster_size,
                 result.flags,
-                b"\0".as_ptr(),
+                backing_file_buf.as_ptr(),
                 b"\0".as_ptr(),
             );
         }
         ImageFormat::Vhdx => {
+            // Differencing (HasParent) VHDX reports the parent locator's
+            // path as `backing_file`, mirroring the VHD arm above and how
+            // qcow2's backing file is reported. See decision 4 of
+            // docs/plans/PLAN-differencing-phase-04-read-policy.md.
+            let mut backing_file_buf = [0u8; MAX_BACKING_FILE_LEN + 1];
+
             if detailed {
                 parse_vhdx_metadata(&mut result, device_capacity, call_table);
+
+                if detect_vhdx_parent_backing_file(
+                    call_table,
+                    input_sector_size,
+                    input_capacity,
+                    &mut backing_file_buf,
+                ) {
+                    result.flags |= InfoResult::FLAG_HAS_BACKING_FILE;
+                    (call_table.verbose_print)(b"info: VHDX has parent\n\0".as_ptr());
+                }
             }
 
             (call_table.send_info_result)(
@@ -460,7 +517,7 @@ pub unsafe extern "C" fn _start() -> u64 {
                 result.actual_size,
                 result.cluster_size,
                 result.flags,
-                b"\0".as_ptr(),
+                backing_file_buf.as_ptr(),
                 b"\0".as_ptr(),
             );
         }
@@ -758,6 +815,112 @@ fn parse_vhd_footer(buffer: &[u8], result: &mut InfoResult) {
     result.cluster_size = 2 * 1024 * 1024; // 2 MiB default for VHD
 }
 
+/// Read a differencing VHD's parent unicode name and decode it into
+/// `backing_file_buf` as NUL-terminated UTF-8.
+///
+/// `footer_bytes` is the already-read footer sector (its `VHD_COOKIE` was
+/// verified by the caller); the dynamic header it points to via the
+/// `data_offset` field at footer byte 16 carries the parent unicode name
+/// at header offset 64 -- absolute file offset 576 when the header
+/// immediately follows the footer, which every VHD in the test corpus
+/// does. The name is UTF-16 **big** endian, the opposite of the parent
+/// locator platform data further into the same header (see
+/// `docs/plans/PLAN-differencing-phase-03-parse.md`).
+///
+/// The sector-spanning read below mirrors `VhdState::init`'s
+/// (`crates/vhd/src/lib.rs`) because the call table reads whole sectors and
+/// a 1024-byte header at a 512-byte-aligned offset straddles two of them.
+/// What the bytes are then handed to is the crate's own
+/// `VhdDynamicHeader::parse`, so a header `crates/vhd` would reject is not
+/// one `info` will decode a parent name out of.
+///
+/// Returns true and NUL-terminates `backing_file_buf` when a non-empty
+/// name decodes; false (leaving the buffer untouched) on any read or
+/// decode failure, so a malformed differencing image is reported without
+/// a parent line rather than refused -- `info` never refuses (decision 4).
+unsafe fn parse_vhd_parent_name(
+    call_table: &CallTable,
+    footer_bytes: &[u8],
+    sector_size: usize,
+    input_capacity: u64,
+    backing_file_buf: &mut [u8; MAX_BACKING_FILE_LEN + 1],
+) -> bool {
+    if sector_size == 0 || sector_size > MAX_SECTOR_SIZE {
+        return false;
+    }
+
+    let data_offset = u64::from_be_bytes([
+        footer_bytes[FOOTER_DATA_OFFSET_OFFSET],
+        footer_bytes[FOOTER_DATA_OFFSET_OFFSET + 1],
+        footer_bytes[FOOTER_DATA_OFFSET_OFFSET + 2],
+        footer_bytes[FOOTER_DATA_OFFSET_OFFSET + 3],
+        footer_bytes[FOOTER_DATA_OFFSET_OFFSET + 4],
+        footer_bytes[FOOTER_DATA_OFFSET_OFFSET + 5],
+        footer_bytes[FOOTER_DATA_OFFSET_OFFSET + 6],
+        footer_bytes[FOOTER_DATA_OFFSET_OFFSET + 7],
+    ]);
+
+    let actual_size = match input_capacity.checked_mul(sector_size as u64) {
+        Some(v) => v,
+        None => return false,
+    };
+    if data_offset >= actual_size {
+        return false;
+    }
+
+    let dyn_sector = data_offset / sector_size as u64;
+    let dyn_off_in_sector = (data_offset % sector_size as u64) as usize;
+
+    let mut dyn_buf = [0u8; MAX_SECTOR_SIZE];
+    if !(call_table.read_input_sector)(0, dyn_sector, dyn_buf.as_mut_ptr(), sector_size) {
+        return false;
+    }
+
+    // Dynamic header is 1024 bytes; read a second sector if it does not
+    // fit in the first one (typically true for 512-byte sectors, since
+    // the footer occupies the first 512 bytes).
+    let mut dyn_header_bytes = [0u8; VHD_DYNAMIC_HEADER_SIZE];
+    let dyn_available = sector_size - dyn_off_in_sector;
+    if dyn_available >= VHD_DYNAMIC_HEADER_SIZE {
+        dyn_header_bytes.copy_from_slice(
+            &dyn_buf[dyn_off_in_sector..dyn_off_in_sector + VHD_DYNAMIC_HEADER_SIZE],
+        );
+    } else {
+        dyn_header_bytes[..dyn_available].copy_from_slice(&dyn_buf[dyn_off_in_sector..sector_size]);
+        let next_sector = dyn_sector + 1;
+        if next_sector >= input_capacity {
+            return false;
+        }
+        if !(call_table.read_input_sector)(0, next_sector, dyn_buf.as_mut_ptr(), sector_size) {
+            return false;
+        }
+        let remaining = VHD_DYNAMIC_HEADER_SIZE - dyn_available;
+        dyn_header_bytes[dyn_available..VHD_DYNAMIC_HEADER_SIZE]
+            .copy_from_slice(&dyn_buf[..remaining]);
+    }
+
+    // Both `disk_type` and `data_offset` are image-controlled, so the bytes
+    // above are wherever a hostile footer chose to point. Refuse to read a
+    // parent name out of them unless they are actually a dynamic header:
+    // `VhdDynamicHeader::parse` returns `None` for anything without the
+    // `cxsparse` cookie, which is the same gate `crates/vhd` applies before
+    // it will trust this structure (`VhdParentInfo::parse`). Without it, an
+    // image with `disk_type = 4` and an arbitrary `data_offset` gets 512
+    // bytes of unrelated file content decoded as UTF-16BE and printed as
+    // `backing file:`.
+    if vhd::VhdDynamicHeader::parse(&dyn_header_bytes).is_none() {
+        return false;
+    }
+
+    // Decode + NUL-terminate is `shared::decode_utf16_field_nul_terminated`
+    // (differencing phase 4, step 4c review: moved out of `info` into
+    // `shared` so it runs under that crate's test suite -- `info` is a
+    // `no_main` guest binary and cannot run `cargo test` at all).
+    let name_bytes =
+        &dyn_header_bytes[DYN_PARENT_NAME_OFFSET..DYN_PARENT_NAME_OFFSET + DYN_PARENT_NAME_SIZE];
+    shared::decode_utf16_field_nul_terminated(name_bytes, true, backing_file_buf)
+}
+
 /// Parse VHDX metadata to extract virtual size and block size (cluster_size)
 ///
 /// VHDX format stores metadata in a separate region. The layout is:
@@ -921,6 +1084,151 @@ unsafe fn parse_vhdx_metadata(
     result.virtual_size = virtual_size;
 
     (call_table.verbose_print)(b"info: VHDX parsed ok\n\0".as_ptr());
+}
+
+/// Detect a differencing VHDX's parent and decode a path from its parent
+/// locator into `backing_file_buf` as NUL-terminated UTF-8.
+///
+/// Locates the metadata region the same way `parse_vhdx_metadata` above
+/// does (a region-table scan for the metadata region GUID), but then
+/// hands off to `vhdx::parse_metadata` for the metadata-table walk and
+/// the parent-locator staging/decoding, rather than re-deriving that
+/// logic locally: unlike the "standard offset" shortcut
+/// `parse_vhdx_metadata` uses for virtual_size/cluster_size, the parent
+/// locator's UTF-16LE key/value decoding and its bounds checking against
+/// the metadata region are security-sensitive and already fuzzed as part
+/// of `crates/vhdx` (differencing phase 3) -- not worth a second,
+/// divergent implementation. See
+/// `docs/plans/PLAN-differencing-phase-04-read-policy.md` decision 4.
+///
+/// This only locates the metadata region for itself; it never writes to
+/// `result`, so a failure here can never change what `info` already
+/// reports for a non-differencing VHDX.
+///
+/// Returns true (and fills `backing_file_buf`) only for an image that
+/// both claims a parent (`HasParent`) and carries a locator this parser
+/// could stage and decode a path out of. Anything short of that -- no
+/// parent, an absent or unreadable locator item, or a locator with none
+/// of `relative_path`/`absolute_win32_path`/`volume_path` set -- reports
+/// nothing, never a refusal (decision 4).
+unsafe fn detect_vhdx_parent_backing_file(
+    call_table: &CallTable,
+    sector_size: usize,
+    input_capacity: u64,
+    backing_file_buf: &mut [u8; MAX_BACKING_FILE_LEN + 1],
+) -> bool {
+    if sector_size == 0 || sector_size > MAX_SECTOR_SIZE {
+        return false;
+    }
+
+    let mut buffer = [0u8; MAX_SECTOR_SIZE];
+
+    // Step 1: region table -> metadata region's file offset and length.
+    let region_table_sector = VHDX_REGION_TABLE_OFFSET / sector_size as u64;
+    let region_table_offset_in_sector = (VHDX_REGION_TABLE_OFFSET % sector_size as u64) as usize;
+
+    if !(call_table.read_input_sector)(0, region_table_sector, buffer.as_mut_ptr(), sector_size) {
+        return false;
+    }
+
+    let region_sig = u32::from_le_bytes([
+        buffer[region_table_offset_in_sector],
+        buffer[region_table_offset_in_sector + 1],
+        buffer[region_table_offset_in_sector + 2],
+        buffer[region_table_offset_in_sector + 3],
+    ]);
+    if region_sig != VHDX_REGION_TABLE_SIG {
+        return false;
+    }
+
+    let entry_count = u32::from_le_bytes([
+        buffer[region_table_offset_in_sector + 8],
+        buffer[region_table_offset_in_sector + 9],
+        buffer[region_table_offset_in_sector + 10],
+        buffer[region_table_offset_in_sector + 11],
+    ]);
+
+    let mut metadata_region_offset: u64 = 0;
+    let mut metadata_region_length: u32 = 0;
+    let mut found_metadata = false;
+    for i in 0..entry_count.min(8) {
+        // Limit to 8 entries for safety, matching parse_vhdx_metadata above.
+        let entry_offset = region_table_offset_in_sector + 16 + (i as usize * 32);
+        if entry_offset + 32 > sector_size {
+            break;
+        }
+
+        let guid_first4 = u32::from_le_bytes([
+            buffer[entry_offset],
+            buffer[entry_offset + 1],
+            buffer[entry_offset + 2],
+            buffer[entry_offset + 3],
+        ]);
+
+        if guid_first4 == VHDX_METADATA_GUID_FIRST4 {
+            metadata_region_offset = u64::from_le_bytes([
+                buffer[entry_offset + 16],
+                buffer[entry_offset + 17],
+                buffer[entry_offset + 18],
+                buffer[entry_offset + 19],
+                buffer[entry_offset + 20],
+                buffer[entry_offset + 21],
+                buffer[entry_offset + 22],
+                buffer[entry_offset + 23],
+            ]);
+            // Region table entry Length, at entry offset +24 (SPEC(VHDX)
+            // 2.4.3). Bounds the parent locator item against the region
+            // it actually lives in; see vhdx::parse_metadata's doc comment.
+            metadata_region_length = u32::from_le_bytes([
+                buffer[entry_offset + 24],
+                buffer[entry_offset + 25],
+                buffer[entry_offset + 26],
+                buffer[entry_offset + 27],
+            ]);
+            found_metadata = true;
+            break;
+        }
+    }
+
+    if !found_metadata || metadata_region_offset == 0 {
+        return false;
+    }
+
+    // Step 2: hand off to crates/vhdx for the metadata table walk, the
+    // File Parameters HasParent flag, and the parent locator itself.
+    let mut bytes_read: u64 = 0;
+    let metadata = match vhdx::parse_metadata(
+        call_table,
+        0,
+        metadata_region_offset,
+        metadata_region_length,
+        sector_size,
+        input_capacity,
+        &mut bytes_read,
+    ) {
+        Some(m) => m,
+        None => return false,
+    };
+
+    if !metadata.has_parent {
+        return false;
+    }
+
+    let locator = match metadata.parent_locator.parsed() {
+        Some(l) => l,
+        None => return false,
+    };
+
+    // Which key to report is `VhdxParentLocator::preferred_path` (moved
+    // there in differencing phase 4 step 4c review, so the preference
+    // order is tested under crates/vhdx's own suite rather than as a
+    // free function here that could never run); copying it into a
+    // NUL-terminated buffer is `shared::write_nul_terminated`, likewise
+    // moved so it runs under `shared`'s suite.
+    match locator.preferred_path() {
+        Some(bytes) => shared::write_nul_terminated(bytes, backing_file_buf),
+        None => false,
+    }
 }
 
 /// Parse QCOW2 header and populate result and format-specific info

@@ -11,8 +11,9 @@
 //! Out of scope (single-image v1 — chain composition is deferred):
 //! - Sources with a backing file (qcow2 with `backing_file_offset
 //!   != 0`).
-//! - Sources with a parent (vhdx differencing — already rejected
-//!   by `VhdxState::init`; vhd differencing — rejected here).
+//! - Sources with a parent (vhd and vhdx differencing — both
+//!   rejected here, in the per-format arms, with
+//!   `MapResult::ERROR_HAS_BACKING`).
 //! - Multi-extent VMDK descriptors (already filtered by
 //!   `VmdkState::init`'s VMDK4 binary header parse).
 //! - LUKS source decryption.
@@ -248,7 +249,7 @@ pub unsafe extern "C" fn _start() -> u64 {
             0 // resolved after init below
         }
         ImageFormat::Vhd => 0,  // resolved after init below
-        ImageFormat::Vhdx => 0, // VhdxState::init already rejects differencing.
+        ImageFormat::Vhdx => 0, // resolved after init below
         _ => {
             return finish(
                 call_table,
@@ -520,6 +521,23 @@ pub unsafe extern "C" fn _start() -> u64 {
                     );
                 }
             };
+            // Differencing VHDX: refuse explicitly, the same way the VHD
+            // arm above does. `VhdxState::init` used to reject these
+            // itself and this arm relied on that; it now reports
+            // `has_parent` instead, so the chain readers can name the
+            // reason -- which makes the check map's own responsibility.
+            // Without it a differencing VHDX would map as though the
+            // parent's blocks were holes.
+            if state.has_parent {
+                return finish(
+                    call_table,
+                    source_format_u32,
+                    0,
+                    state.virtual_disk_size,
+                    MapResult::ERROR_HAS_BACKING,
+                    bytes_read,
+                );
+            }
             let vsize = state.virtual_disk_size;
             let (win_start, win_end) = resolve_window(vsize);
             let mut emit = |e: MapExtent| -> bool {

@@ -185,6 +185,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   tools that use an unrecognised creator app remain subject to the
   same qemu behaviour; see docs/quirks.md.
 
+- **A differencing VHD or VHDX no longer silently gives the wrong
+  answer on read (issues #547, #548).** instar cannot compose a
+  differencing image's parent yet. `convert -O raw` on a differencing
+  VHD used to exit 0 and write an image with zeros where the parent's
+  data belonged; every operation on a VHDX used to fail, but
+  undiagnosably — `compare` given the same image as both arguments
+  reported a content mismatch between a file and itself. `convert`,
+  `dd`, `compare`, `bench`, `check` and `measure` now refuse both
+  formats by name instead:
+
+  ```
+  <op>: source is a differencing <VHD|VHDX> image whose parent instar
+  cannot yet compose; composition is deferred (see PLAN-differencing.md)
+  ```
+
+  exiting 1 and leaving no output file. `map` keeps its own, older
+  refusal text and guest error code, unchanged for VHD; its VHDX arm is
+  new, because `VhdxState::init` no longer rejects a `has_parent` image
+  outright (that rejection is what accidentally protected VHDX before
+  this change), so every read entry point — `map` included — now
+  decides for itself instead of relying on that crate to fail closed
+  for the wrong reason. **If you script against `check`'s exit code,
+  note that a differencing image now exits 1 (refused) instead of 2
+  (corrupt)** — it was never corrupt, it was unsupported. `instar info`
+  is deliberately unaffected by the refusal: it now reports the parent
+  as a backing file and still exits 0, since it composes no sector data
+  and has no wrong answer to give.
+
+  `instar create -b <differencing VHD or VHDX>` is **refused** for the
+  same reason, with its own message rather than the generic
+  "backing file header could not be parsed": the header parses
+  perfectly well, the image is simply one no read path can follow. An
+  overlay stacked on such a base would be a chain that could never be
+  read back. Their plain dynamic parents are accepted as before.
+
+  On a differencing image `info` now reports
+  `backing-filename-format` as `vpc` or `vhdx` rather than the `qcow2`
+  that field defaults to when no backing format is recorded. SPEC(VHD)
+  and SPEC(VHDX) both require a parent to be the same format as its
+  child, so the format is known without a header extension to read it
+  from. Note that a reported parent is a string the image claims, not
+  a file instar has opened: parent locators are attacker-controlled
+  and can name absolute paths, traversals, UNC shares or URLs, and
+  `info` prints them without resolving or following them.
+
+  See docs/quirks.md's "VHD/VHDX differencing" section for the full
+  before/after record, including three known limitations left
+  deliberately unfixed: `info --chain` reports a one-image chain for
+  a differencing source, `info` prints an unresolvable "actual path"
+  for a VHDX parent's Windows-shaped locator, and `resize` still
+  accepts a differencing VHDX (a pre-existing, unrelated write-path
+  bug, now tracked as issue #565).
+
 ## [0.3.0] - 2026-08-02
 
 ### Fixed

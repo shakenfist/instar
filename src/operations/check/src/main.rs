@@ -36,9 +36,39 @@ use core::panic::PanicInfo;
 use shared::{
     bitmap::{BitmapContext, BitmapSetResult},
     format_detection::{detect_format_from_header, detect_vhd_footer, QCOW2_MAGIC},
-    validate_call_table, CallTable, ChainConfig, CheckConfig, CheckResult, ImageFormat,
-    CALL_TABLE_ADDR, MAX_SECTOR_SIZE,
+    validate_call_table, CallTable, ChainConfig, CheckConfig, CheckResult, DifferencingRefusal,
+    ImageFormat, CALL_TABLE_ADDR, MAX_SECTOR_SIZE,
 };
+
+/// Record that the source is a differencing image whose parent cannot
+/// be composed, and mark the check incomplete.
+///
+/// A differencing image is **not corrupt** -- it is structurally valid
+/// and merely unsupported for reading, so it must not be counted as a
+/// corruption. Before this, `check_vhdx` incremented `corruptions` and
+/// set `FLAG_HAS_CORRUPTIONS`, telling a user their intact image was
+/// damaged. `FLAG_INCOMPLETE` is the honest classification: the check
+/// stopped early because the image references content it cannot see.
+///
+/// The refusal itself travels on `send_error` (decision 2 of
+/// `docs/plans/PLAN-differencing-phase-04-read-policy.md`) because
+/// `CheckResult` has no error-code field to carry it; the host renders
+/// the captured reason and exits non-zero, which is what keeps
+/// "refused" distinguishable from "clean".
+///
+/// # Safety
+///
+/// `call_table` must be a valid initialised [`CallTable`].
+unsafe fn refuse_differencing(result: &mut CheckResult, call_table: &CallTable, status: u32) {
+    result.flags |= CheckResult::FLAG_INCOMPLETE;
+    (call_table.debug_print)(b"check: differencing source refused\n\0".as_ptr());
+    (call_table.send_error)(
+        DifferencingRefusal::OPERATION_C.as_ptr(),
+        b"input\0".as_ptr(),
+        0,
+        status,
+    );
+}
 
 // ---------------------------------------------------------------------------
 // Repair scratch layout (qcow2 --repair leaks tier)
@@ -1318,7 +1348,8 @@ unsafe fn check_vmdk(
 /// - Region table 2: cross-validation against region table 1
 /// - Metadata: table signature, required items (FileParameters,
 ///   VirtualDiskSize, LogicalSectorSize, PhysicalSectorSize)
-/// - Differencing disk detection (has_parent → unsupported)
+/// - Differencing disk detection (has_parent → refused as
+///   unsupported, not as a corruption)
 /// - BAT entries: allocated block offsets within file bounds, 1MB
 ///   alignment, overlap detection via BitmapContext
 /// - Fragmentation tracking (non-sequential block allocation)
@@ -1557,12 +1588,9 @@ unsafe fn check_vhdx(
         }
     };
 
-    // Check for differencing disk
+    // Differencing disk: unsupported for reading, but not corrupt.
     if metadata.has_parent {
-        result.corruptions += 1;
-        result.total_errors += 1;
-        result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
-        (call_table.debug_print)(b"check: VHDX differencing disk unsupported\n\0".as_ptr());
+        refuse_differencing(result, call_table, DifferencingRefusal::STATUS_VHDX);
         return bytes_read;
     }
 
@@ -1949,6 +1977,25 @@ unsafe fn check_vhd(
             }
         }
     };
+
+    // Differencing disk: unsupported for reading, but not corrupt. Its
+    // BAT describes only the blocks the child owns, so walking it and
+    // reporting "no errors" -- which is what happened before -- tells a
+    // user an image instar cannot read is fine. Refuse before the walk,
+    // matching the VHDX arm.
+    //
+    // This sits ahead of every validation below, not after them, because
+    // the host suppresses `print_check_result` once a refusal is
+    // captured: findings computed past this point would be counted and
+    // then thrown away, and the user would be told neither that the
+    // image is unreadable *nor* that it is malformed. Refusal takes
+    // precedence, so nothing is computed that cannot be reported.
+    // `disk_type == 4` is inside the valid range the check below tests,
+    // so no validity check is skipped by ordering it first.
+    if footer.disk_type == vhd::DISK_TYPE_DIFFERENCING {
+        refuse_differencing(result, call_table, DifferencingRefusal::STATUS_VHD);
+        return bytes_read;
+    }
 
     // Validate footer checksum
     let expected_cksum =
