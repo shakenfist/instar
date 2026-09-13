@@ -273,6 +273,60 @@ pub fn utf16_to_utf8(src: &[u8], big_endian: bool, dst: &mut [u8]) -> Option<usi
     Some(out)
 }
 
+/// Decode a UTF-16 field with [`utf16_to_utf8`] and NUL-terminate the
+/// result in place, as a caller building a fixed-size, NUL-terminated
+/// C-string buffer (the shape every `send_info_result*` backing-file
+/// parameter takes) needs to do after every such decode.
+///
+/// `dst`'s last byte is reserved for the terminator: the decode is
+/// bounded to `&mut dst[..dst.len() - 1]`, so a `dst` sized for "longest
+/// possible value plus one" (as every caller's buffer already is) can
+/// never truncate a value that would otherwise fit.
+///
+/// Returns `true`, with `dst[..n]` holding the value and `dst[n] = 0`,
+/// only when the decode produces at least one byte. Returns `false`,
+/// leaving `dst` untouched, both when `utf16_to_utf8` refuses the input
+/// outright (see its docs for why) and when it decodes to a valid but
+/// empty string -- an all-zero field, for instance, which is exactly
+/// what a plain (non-differencing) image's would-be parent-name field
+/// looks like. Callers that must tell those two cases apart should call
+/// `utf16_to_utf8` directly instead; every caller so far treats "nothing
+/// to report" and "malformed" the same way, which is why this wrapper
+/// collapses them.
+///
+/// `dst.is_empty()` also returns `false`: there is no room for even the
+/// terminator.
+pub fn decode_utf16_field_nul_terminated(src: &[u8], big_endian: bool, dst: &mut [u8]) -> bool {
+    if dst.is_empty() {
+        return false;
+    }
+    let bound = dst.len() - 1;
+    match utf16_to_utf8(src, big_endian, &mut dst[..bound]) {
+        Some(len) if len > 0 => {
+            dst[len] = 0;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Copy `bytes` into `dst` and NUL-terminate the result, the byte-slice
+/// counterpart to [`decode_utf16_field_nul_terminated`] for a value a
+/// caller already holds as UTF-8 (a VHDX parent locator's decoded value,
+/// for instance, rather than a raw UTF-16 field).
+///
+/// Returns `false`, leaving `dst` untouched, for an empty `bytes` (there
+/// is nothing to report) or one that would not leave room for the
+/// terminator (`bytes.len() >= dst.len()`).
+pub fn write_nul_terminated(bytes: &[u8], dst: &mut [u8]) -> bool {
+    if bytes.is_empty() || bytes.len() >= dst.len() {
+        return false;
+    }
+    dst[..bytes.len()].copy_from_slice(bytes);
+    dst[bytes.len()] = 0;
+    true
+}
+
 /// Generate a sector-cached read function for a given type and endianness.
 ///
 /// All format crates (qcow2, vmdk, vhd) need to read typed values from
@@ -6430,6 +6484,104 @@ mod tests {
 
         let mut short = [0u8; 3];
         assert_eq!(utf16_to_utf8(&src[..n], false, &mut short), None);
+    }
+
+    // ------------------------------------------------------------------
+    // decode_utf16_field_nul_terminated / write_nul_terminated
+    // (differencing phase 4, step 4c: moved out of `operations/info`
+    // so they run as part of this crate's suite -- see
+    // docs/plans/PLAN-differencing-phase-04-read-policy.md)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn decode_utf16_field_nul_terminated_decodes_and_terminates() {
+        let mut src = [0u8; 40];
+        let n = utf16_ascii(b"vhd-diff-parent.vhd", true, &mut src);
+
+        // "vhd-diff-parent.vhd" is 19 bytes; dst needs one more for the
+        // NUL terminator.
+        let mut dst = [0xffu8; 20];
+        assert!(decode_utf16_field_nul_terminated(&src[..n], true, &mut dst));
+        assert_eq!(&dst[..19], b"vhd-diff-parent.vhd");
+        assert_eq!(dst[19], 0);
+    }
+
+    #[test]
+    fn decode_utf16_field_nul_terminated_empty_field_reports_nothing() {
+        // An all-zero field (e.g. a plain, non-differencing image's
+        // would-be parent-name field) decodes to a valid but
+        // zero-length name, which this wrapper treats as "nothing to
+        // report" rather than an empty backing_file.
+        let src = [0u8; 512];
+        let mut dst = [0xffu8; 16];
+        assert!(!decode_utf16_field_nul_terminated(&src, true, &mut dst));
+        // Untouched on refusal.
+        assert_eq!(dst, [0xffu8; 16]);
+    }
+
+    #[test]
+    fn decode_utf16_field_nul_terminated_malformed_input_reports_nothing() {
+        // Unpaired high surrogate: utf16_to_utf8 refuses outright.
+        let src = [0xd8, 0x3d, 0x00, 0x00];
+        let mut dst = [0xffu8; 16];
+        assert!(!decode_utf16_field_nul_terminated(&src, true, &mut dst));
+        assert_eq!(dst, [0xffu8; 16]);
+    }
+
+    #[test]
+    fn decode_utf16_field_nul_terminated_reserves_last_byte_for_nul() {
+        // dst is exactly "value length + 1"; the bound passed to
+        // utf16_to_utf8 must be dst.len() - 1, not dst.len(), or the
+        // NUL write below would be out of bounds.
+        let mut src = [0u8; 8];
+        let n = utf16_ascii(b"abcd", true, &mut src);
+        let mut dst = [0xffu8; 5];
+        assert!(decode_utf16_field_nul_terminated(&src[..n], true, &mut dst));
+        assert_eq!(&dst[..4], b"abcd");
+        assert_eq!(dst[4], 0);
+    }
+
+    #[test]
+    fn decode_utf16_field_nul_terminated_empty_dst_reports_nothing() {
+        let mut src = [0u8; 8];
+        let n = utf16_ascii(b"a", true, &mut src);
+        let mut dst: [u8; 0] = [];
+        assert!(!decode_utf16_field_nul_terminated(
+            &src[..n],
+            true,
+            &mut dst
+        ));
+    }
+
+    #[test]
+    fn write_nul_terminated_copies_and_terminates() {
+        let mut dst = [0xffu8; 8];
+        assert!(write_nul_terminated(b"abc", &mut dst));
+        assert_eq!(&dst[..3], b"abc");
+        assert_eq!(dst[3], 0);
+    }
+
+    #[test]
+    fn write_nul_terminated_rejects_empty() {
+        let mut dst = [0xffu8; 8];
+        assert!(!write_nul_terminated(b"", &mut dst));
+        assert_eq!(dst, [0xffu8; 8]);
+    }
+
+    #[test]
+    fn write_nul_terminated_rejects_when_no_room_for_terminator() {
+        // dst is exactly bytes.len(): there is no slot left for the NUL.
+        let mut dst = [0xffu8; 3];
+        assert!(!write_nul_terminated(b"abc", &mut dst));
+        assert_eq!(dst, [0xffu8; 3]);
+    }
+
+    #[test]
+    fn write_nul_terminated_exact_fit_with_room_for_nul() {
+        let mut dst = [0xffu8; 4];
+        assert!(write_nul_terminated(b"abc", &mut dst));
+        assert_eq!(&dst[..3], b"abc");
+        assert_eq!(dst[3], 0);
     }
 
     #[test]

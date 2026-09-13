@@ -13,6 +13,13 @@ qcow1 = { path = "../../crates/qcow1" }
 raw = { path = "../../crates/raw" }
 vmdk = { path = "../../crates/vmdk" }
 luks = { path = "../../crates/luks", features = ["decrypt", "kdf-argon2"] }
+# Used only to detect a differencing VHDX's parent locator (`parse_metadata`,
+# `VhdxParentLocatorState`), reusing crates/vhdx's staging/decoding pipeline
+# rather than re-deriving it locally. `info` still does not link `crates/vhd`
+# -- the VHD side is small enough to parse locally, see
+# src/operations/info/src/main.rs's VHD_DYN_* constants. See
+# docs/plans/PLAN-differencing-phase-04-read-policy.md decision 4.
+vhdx = { path = "../../crates/vhdx" }
 
 # Argon2 crate still needed directly for Block type in memory allocation
 argon2 = { version = "0.6", default-features = false }

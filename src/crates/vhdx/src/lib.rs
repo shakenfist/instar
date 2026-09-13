@@ -756,6 +756,45 @@ impl VhdxParentLocator {
         self.value_of(KEY_ABSOLUTE_WIN32_PATH)
     }
 
+    /// Which path key a consumer should report or open first, answering
+    /// for VHDX the same question `VhdState::preferred_locator` answers
+    /// for VHD -- though the two shapes differ enough that this is a much
+    /// smaller decision. VHDX carries at most one locator *item*, and
+    /// that item is a flat key/value bag rather than VHD's eight
+    /// platform-typed slots, so there is no ambiguity to resolve between
+    /// competing entries -- only a choice of which of up to three path
+    /// keys is most useful when several are present.
+    ///
+    /// Preference order, highest first:
+    ///
+    /// 1. `relative_path` -- resolved against the child's own directory,
+    ///    so it is the one path here that survives moving both files
+    ///    together to a different machine or mount point. It is also
+    ///    the closest analog to what qcow2's `backing_file` header field
+    ///    usually holds, which is the shape every other format's
+    ///    `backing_file` reporting in this tree already reads as.
+    /// 2. `absolute_win32_path` -- a real filesystem path, just one
+    ///    anchored to a specific drive letter, so it is still useful to
+    ///    show even though it will not resolve if the parent moved.
+    /// 3. `volume_path` -- a path via a Windows volume GUID
+    ///    (`\\?\Volume{...}\...`). Correct only on the exact machine
+    ///    that minted the GUID, so it is the least broadly useful of the
+    ///    three and is offered only when nothing else is present.
+    ///
+    /// `parent_linkage` (the parent's `DataWriteGuid`) is deliberately
+    /// never returned here: it identifies the parent for verification,
+    /// it is not a path to it.
+    ///
+    /// Returns `None` when no path key is present -- an item that
+    /// carries only `parent_linkage`, say, or one whose path entries all
+    /// failed to decode (`value_of` already excludes entries marked
+    /// `defect`).
+    pub fn preferred_path(&self) -> Option<&[u8]> {
+        self.relative_path()
+            .or_else(|| self.absolute_win32_path())
+            .or_else(|| self.volume_path())
+    }
+
     /// Whether this item's `parent_linkage` names `expected`, compared
     /// ASCII case-insensitively.
     ///
@@ -3276,6 +3315,72 @@ mod tests {
         let locator = parse_parent_locator(&buf[..len]).unwrap();
         assert_eq!(locator.parent_linkage(), None);
         assert!(!locator.linkage_matches(HYPERV_LINKAGE.as_bytes()));
+    }
+
+    // ------------------------------------------------------------------
+    // preferred_path() -- differencing phase 4, step 4c
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn preferred_path_prefers_relative_path() {
+        let mut buf = [0u8; 1024];
+        let len = build_locator_item(
+            &[
+                ("parent_linkage", HYPERV_LINKAGE),
+                (
+                    "absolute_win32_path",
+                    r"C:\instar-testdata\vhdx-diff-parent.vhdx",
+                ),
+                ("relative_path", r".\vhdx-diff-parent.vhdx"),
+            ],
+            &mut buf,
+        );
+        let locator = parse_parent_locator(&buf[..len]).unwrap();
+
+        assert_eq!(
+            locator.preferred_path(),
+            Some(&br".\vhdx-diff-parent.vhdx"[..])
+        );
+    }
+
+    #[test]
+    fn preferred_path_falls_back_to_absolute_win32_path() {
+        let mut buf = [0u8; 1024];
+        let len = build_locator_item(
+            &[
+                ("parent_linkage", HYPERV_LINKAGE),
+                (
+                    "absolute_win32_path",
+                    r"C:\instar-testdata\vhdx-diff-parent.vhdx",
+                ),
+            ],
+            &mut buf,
+        );
+        let locator = parse_parent_locator(&buf[..len]).unwrap();
+
+        assert_eq!(
+            locator.preferred_path(),
+            Some(&br"C:\instar-testdata\vhdx-diff-parent.vhdx"[..])
+        );
+    }
+
+    #[test]
+    fn preferred_path_falls_back_to_volume_path() {
+        let mut buf = [0u8; 1024];
+        let value = r"\\?\Volume{5e0bd954-71b2-4bff-a928-082af7ab0f8f}\vhdx-diff-parent.vhdx";
+        let len = build_locator_item(&[("volume_path", value)], &mut buf);
+        let locator = parse_parent_locator(&buf[..len]).unwrap();
+
+        assert_eq!(locator.preferred_path(), Some(value.as_bytes()));
+    }
+
+    #[test]
+    fn preferred_path_none_when_no_path_key_present() {
+        let mut buf = [0u8; 1024];
+        let len = build_locator_item(&[("parent_linkage", HYPERV_LINKAGE)], &mut buf);
+        let locator = parse_parent_locator(&buf[..len]).unwrap();
+
+        assert_eq!(locator.preferred_path(), None);
     }
 
     #[test]
