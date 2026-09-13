@@ -3014,6 +3014,14 @@ impl DifferencingRefusal {
     /// `send_error` uses apart.
     pub const OPERATION: &'static str = "differencing";
 
+    /// The same marker as [`Self::OPERATION`], NUL-terminated, for
+    /// the call table's `send_error`, whose first argument is a
+    /// `*const u8` C string. The guest raises the refusal with this
+    /// constant rather than a bare literal so the two spellings
+    /// cannot drift apart; `differencing_marker_c_string_matches_operation`
+    /// asserts they agree.
+    pub const OPERATION_C: &'static [u8] = b"differencing\0";
+
     // Status codes are stable: only appended, never reordered.
     /// The source is a differencing VHD (`disk_type ==
     /// DISK_TYPE_DIFFERENCING`).
@@ -6043,6 +6051,30 @@ mod tests {
         // never collide.
         assert_eq!(DifferencingRefusal::OPERATION, "differencing");
         assert_ne!(DifferencingRefusal::OPERATION, "cpu-exception");
+    }
+
+    #[test]
+    fn differencing_marker_c_string_matches_operation() {
+        // The guest raises the refusal through `send_error`, which
+        // takes a C string, while the host compares the decoded
+        // protobuf `operation` field against the `&str`. If the two
+        // spellings drift the signal is raised but never captured,
+        // and the failure silently reverts to the generic text.
+        let c = DifferencingRefusal::OPERATION_C;
+        assert_eq!(
+            c.last().copied(),
+            Some(0),
+            "the C marker must be NUL-terminated"
+        );
+        assert_eq!(
+            &c[..c.len() - 1],
+            DifferencingRefusal::OPERATION.as_bytes(),
+            "the C marker must spell the same operation as OPERATION"
+        );
+        assert!(
+            !DifferencingRefusal::OPERATION.as_bytes().contains(&0),
+            "OPERATION must not embed a NUL, or the C marker truncates it"
+        );
     }
 
     #[test]

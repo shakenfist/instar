@@ -187,6 +187,43 @@ that plumbed `metadata_length` into `parse_metadata` changed
 behaviour change. That bullet is annotated rather than deleted, so
 the record shows what happened.
 
+## Found during implementation, and left alone
+
+Three things surfaced while implementing that are recorded rather
+than fixed, so a later reader sees them as decisions:
+
+1. **`resize` accepts a differencing VHDX.**
+   `src/crates/resize/src/vhdx.rs:55` guards on `opts.has_parent`,
+   but the caller hard-codes `has_parent: false`
+   (`src/operations/resize/src/main.rs:839`), so the guard has never
+   fired -- dead since `94d73b7` in May 2026. `instar resize` on a
+   differencing VHDX therefore succeeds. This is a *write* path and
+   predates the plan; `resize` never called `VhdxState::init`, so
+   phase 4 neither caused it nor fixes it. It also corrects this
+   plan's survey, which recorded "`resize` already refuses": that is
+   true for VHD only. Filed as an issue rather than folded into the
+   read-policy change.
+
+2. **`info` prints an unresolvable "actual path" for a VHDX
+   parent.** The VHDX locator path is Windows-shaped
+   (`.\vhdx-diff-parent.vhdx`), and the host renders it as a POSIX
+   path at `src/vmm/src/main.rs:1499`, producing a filename
+   containing a backslash that cannot exist. The output is honest
+   about where instar would look, and qemu-img prints the same field
+   unconditionally, but the underlying issue is path normalisation,
+   which belongs to phase 11. Suppressing the display alone would
+   paper over it. Phase 4e documents it as a known limitation.
+
+3. **`map`'s VHDX arm had to change after all.** The step plan said
+   to leave `map` alone on the strength of its VHD refusal at
+   `src/operations/map/src/main.rs:462`. That was wrong: map's VHDX
+   safety came entirely from the `VhdxState::init` rejection that
+   decision 3 removes, as its own comment recorded. Left untouched,
+   `map` would have begun emitting a differencing VHDX's parent
+   blocks as holes. The refusal was added using map's existing
+   `ERROR_HAS_BACKING`, so the precedent is preserved rather than
+   migrated.
+
 ## Decisions
 
 1. **Refuse at the shared chain initialiser and at `measure`, not

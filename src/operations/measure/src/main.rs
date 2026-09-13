@@ -27,8 +27,8 @@ use core::panic::PanicInfo;
 
 use shared::{
     format_detection::detect_format_from_header, validate_call_table, AllocationSummary, CallTable,
-    ImageFormat, MeasureConfig, MeasureResult, CALL_TABLE_ADDR, MAX_SECTOR_SIZE,
-    OPERATION_CONFIG_ADDR, SCRATCH_MEM_BASE,
+    DifferencingRefusal, ImageFormat, MeasureConfig, MeasureResult, CALL_TABLE_ADDR,
+    MAX_SECTOR_SIZE, OPERATION_CONFIG_ADDR, SCRATCH_MEM_BASE,
 };
 
 use measure::{
@@ -315,6 +315,28 @@ fn target_unit_size_for(c: &MeasureConfig) -> u64 {
 /// non-zero capacity; the function delegates to each parser
 /// crate's `*State::init` + `scan_allocation` which carry their
 /// own safety preconditions on the cache buffers passed in.
+/// Raise the differencing-image read refusal on `send_error`.
+///
+/// `detect_and_scan` reports failure as `None`, which the caller turns
+/// into `MeasureResult::ERROR_INVALID_SIZE` ("source image is
+/// unsupported format") -- true but useless. Raising the refusal first
+/// lets the host render the specific reason instead. The channel is
+/// the one described in decision 2 of
+/// `docs/plans/PLAN-differencing-phase-04-read-policy.md`.
+///
+/// # Safety
+///
+/// `call_table` must be a valid initialised [`CallTable`].
+unsafe fn refuse_differencing(call_table: &CallTable, status: u32) {
+    (call_table.debug_print)(b"measure: differencing source refused\n\0".as_ptr());
+    (call_table.send_error)(
+        DifferencingRefusal::OPERATION_C.as_ptr(),
+        b"input\0".as_ptr(),
+        0,
+        status,
+    );
+}
+
 unsafe fn detect_and_scan(
     call_table: &CallTable,
     config: &MeasureConfig,
@@ -394,6 +416,14 @@ unsafe fn detect_and_scan(
                 cache_b,
                 bytes_read,
             )?;
+            // `VhdState::init` accepts a differencing image on purpose, so
+            // the policy check is here: measuring one would count only the
+            // child's own blocks and silently under- or over-report a size
+            // for content that is not all present.
+            if state.disk_type == vhd::DISK_TYPE_DIFFERENCING {
+                refuse_differencing(call_table, DifferencingRefusal::STATUS_VHD);
+                return None;
+            }
             state.scan_allocation(call_table, sector_size, input_capacity, bytes_read)
         }
         ImageFormat::Vhdx => {
@@ -406,6 +436,13 @@ unsafe fn detect_and_scan(
                 cache_b,
                 bytes_read,
             )?;
+            // Same policy as the VHD arm. `VhdxState::init` used to refuse
+            // this itself; it now reports `has_parent` so the refusal can
+            // say which format and why.
+            if state.has_parent {
+                refuse_differencing(call_table, DifferencingRefusal::STATUS_VHDX);
+                return None;
+            }
             state.scan_allocation(call_table, sector_size, input_capacity, bytes_read)
         }
         _ => None,

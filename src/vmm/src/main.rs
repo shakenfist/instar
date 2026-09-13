@@ -775,8 +775,6 @@ struct SerialDecoder {
     /// the same issue #375 pattern: `convert`, `compare` and `check` have
     /// no result struct to carry this fact, so it travels on `send_error`
     /// instead and is captured here for a resultless run loop to explain.
-    #[allow(dead_code)]
-    // Wired into the read entry points by PLAN-differencing phase 4 step 4b.
     last_differencing_refusal: Option<u32>,
 }
 
@@ -818,7 +816,6 @@ impl SerialDecoder {
     /// operation and the format, following `map_error_message`'s
     /// wording (`:15053`) for the same fact on the `map` path;
     /// otherwise fall back to the generic message.
-    #[allow(dead_code)] // Wired into the read entry points by PLAN-differencing phase 4 step 4b.
     fn differencing_refusal_error(&self, op: &str) -> String {
         match self.last_differencing_refusal {
             Some(status) => {
@@ -2625,9 +2622,10 @@ fn discover_backing_chain(
         }
 
         // Build chain image entry
+        let image_format = ImageFormat::from_str(&info_result.format);
         let chain_image = ChainImage {
             path: current.clone(),
-            format: ImageFormat::from_str(&info_result.format),
+            format: image_format,
             virtual_size: info_result.virtual_size,
             actual_size,
             cluster_size: info_result.cluster_size,
@@ -2641,6 +2639,39 @@ fn discover_backing_chain(
         // Check for backing file
         match info_result.backing_file {
             Some(backing_path) => {
+                // A differencing VHD or VHDX parent is deliberately NOT
+                // walked. Nothing in instar can compose a VHD or VHDX chain
+                // yet -- every read entry point refuses such a source by
+                // name (PLAN-differencing phase 4) -- so resolving the
+                // parent here can only change *which* failure the user
+                // sees, never whether the read succeeds.
+                //
+                // Walking it actively makes that failure worse, in two
+                // ways. A VHDX parent locator holds a Windows-style
+                // relative path (`.\parent.vhdx`), which does not resolve
+                // on POSIX, so discovery died with "Backing file not found"
+                // before the guest ever ran. And more seriously, the
+                // outcome became contingent on the parent's presence: the
+                // same differencing image gave the typed refusal when its
+                // parent happened to sit beside it and a path error when it
+                // did not. A refusal that depends on a file instar is not
+                // going to read is not a refusal.
+                //
+                // So the chain stops here, with the parent recorded in
+                // `backing_file_raw` (so `instar info` still reports it)
+                // but not resolved, and the guest refuses the source with
+                // the same message either way. This is temporary and
+                // per-format: phase 14 lifts it operation by operation as
+                // composition lands. qcow2 and VMDK chains compose today
+                // and are untouched.
+                if matches!(image_format, ImageFormat::Vhd | ImageFormat::Vhdx) {
+                    debug!(
+                        "Differencing {} parent not walked (composition deferred): {}",
+                        info_result.format, backing_path
+                    );
+                    break;
+                }
+
                 // Validate and resolve the backing file path
                 let backing_resolved =
                     validate_backing_path(&current, &backing_path, security_config)?;
@@ -5009,6 +5040,12 @@ fn run_bench_guest(
 
     if let Some(error) = vm_error {
         return Err(error.into());
+    }
+    // A differencing source is refused inside `init_chain_states`, which
+    // then fails the run with the generic ERROR_PARSE_FAILED. Prefer the
+    // captured reason (PLAN-differencing phase 4).
+    if serial_decoder.last_differencing_refusal.is_some() {
+        return Err(serial_decoder.differencing_refusal_error("bench").into());
     }
     if !result_seen {
         return Err(serial_decoder.no_result_error("bench").into());
@@ -11470,7 +11507,13 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
                                             != 0,
                                     });
                                 }
-                                if !args.quiet || !check_passed {
+                                // A refused differencing source produced
+                                // no findings to report; the tail renders
+                                // the refusal instead, so printing a result
+                                // here would only add noise before it.
+                                if (!args.quiet || !check_passed)
+                                    && serial_decoder.last_differencing_refusal.is_none()
+                                {
                                     print_check_result(
                                         &msg,
                                         &args.input,
@@ -11562,6 +11605,15 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
     // returning Err, i.e. exit 1, regardless of any check counts).
     if let Some(error) = vm_error {
         return Err(error.into());
+    }
+
+    // A differencing source is refused rather than checked: the image is
+    // structurally fine but references content instar cannot see, so the
+    // guest marks the check incomplete rather than counting a corruption.
+    // Returning Err (exit 1) is what keeps "refused" distinct from both
+    // "clean" (exit 0) and "corrupt" (exit 2) (PLAN-differencing phase 4).
+    if serial_decoder.last_differencing_refusal.is_some() {
+        return Err(serial_decoder.differencing_refusal_error("check").into());
     }
 
     // Map the post-repair CheckResult to a qemu-img-parity process exit
@@ -12194,7 +12246,15 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
                                         result.identical && !(args.strict && size_mismatch);
                                     compare_result_received = true;
                                 }
-                                print_compare_result(&msg, &args.output, args.strict);
+                                // A differencing source makes the guest
+                                // send a default (non-identical) result, so
+                                // printing it would claim "Content mismatch
+                                // at offset 0!" for a refusal (issue #548).
+                                // The tail renders the captured reason
+                                // instead.
+                                if serial_decoder.last_differencing_refusal.is_none() {
+                                    print_compare_result(&msg, &args.output, args.strict);
+                                }
                             } else {
                                 debug!("{}", format_message(&msg));
                             }
@@ -12278,6 +12338,14 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     // Return error if VM crashed or failed
     if let Some(error) = vm_error {
         return Err(error.into());
+    }
+
+    // A differencing source is refused inside `init_chain_states`, which
+    // sends a default result the loop above suppressed. Render the
+    // captured reason rather than the generic text (PLAN-differencing
+    // phase 4, closing issue #548).
+    if serial_decoder.last_differencing_refusal.is_some() {
+        return Err(serial_decoder.differencing_refusal_error("compare").into());
     }
 
     // Return error if no result was received
@@ -13310,6 +13378,33 @@ fn execute_convert(
     }
 
     if !convert_success {
+        // A differencing source is refused inside `init_chain_states`,
+        // before a single output sector is written, and `convert` has no
+        // result struct to carry the reason -- so it travels on
+        // `send_error` and is rendered here in place of the generic text
+        // (PLAN-differencing phase 4, closing issue #547).
+        if serial_decoder.last_differencing_refusal.is_some() {
+            // Remove the output the host created up-front. Nothing was
+            // written to it, and leaving a zero-filled stub behind after
+            // refusing to compose is exactly the "success-shaped wrong
+            // answer" this refusal exists to prevent: a caller that tests
+            // for the file's existence would conclude the convert ran.
+            // Only files this run created are removed -- `--no-create`
+            // targets an image the user supplied, which is never ours to
+            // delete.
+            if !exec.no_create {
+                let _ = std::fs::remove_file(&exec.output);
+                if let Some((ref flat_path, _)) = flat_extent_path {
+                    let _ = std::fs::remove_file(flat_path);
+                }
+            }
+            let op = if exec.window.is_some() {
+                "dd"
+            } else {
+                "convert"
+            };
+            return Err(serial_decoder.differencing_refusal_error(op).into());
+        }
         return Err("convert operation failed".into());
     }
 
@@ -14594,11 +14689,18 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
                                 let target_qcow2_with_qcow2v3_source = args.target_format
                                     == "qcow2"
                                     && args.input.as_deref().is_some_and(peek_is_qcow2_v3);
-                                print_measure_result(
-                                    &msg,
-                                    &args.output,
-                                    target_qcow2_with_qcow2v3_source,
-                                );
+                                // A refused differencing source reports
+                                // ERROR_INVALID_SIZE, which renders as
+                                // "source image is unsupported format" --
+                                // true but not the reason. The tail prints
+                                // the captured reason instead.
+                                if serial_decoder.last_differencing_refusal.is_none() {
+                                    print_measure_result(
+                                        &msg,
+                                        &args.output,
+                                        target_qcow2_with_qcow2v3_source,
+                                    );
+                                }
                             } else if verbose {
                                 debug!("{}", format_message(&msg));
                             }
@@ -14681,6 +14783,13 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
 
     if let Some(error) = vm_error {
         return Err(error.into());
+    }
+
+    // A differencing source is refused before the allocation scan, which
+    // otherwise reports the generic "unsupported format" (PLAN-differencing
+    // phase 4).
+    if serial_decoder.last_differencing_refusal.is_some() {
+        return Err(serial_decoder.differencing_refusal_error("measure").into());
     }
 
     if !measure_result_seen {

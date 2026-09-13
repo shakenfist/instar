@@ -1521,6 +1521,22 @@ pub struct VhdxState {
     pub bat_offset: u64,
     pub total_bat_entries: u32,
     pub chunk_ratio: u32,
+    /// `HasParent` from the file parameters metadata item: the image
+    /// is a differencing (parent-referencing) VHDX whose real content
+    /// lives partly in a parent file.
+    ///
+    /// `init` deliberately does **not** refuse such an image. Read
+    /// entry points test this flag and refuse with a diagnosis of
+    /// their own (see `PLAN-differencing-phase-04-read-policy.md`,
+    /// decision 3), which keeps VHDX symmetric with VHD -- whose
+    /// `VhdState::init` likewise accepts `DISK_TYPE_DIFFERENCING` and
+    /// exposes `disk_type` -- and leaves both formats initialising
+    /// successfully for the composition work in phases 11-16.
+    ///
+    /// **A consumer that composes sector data must test this.** An
+    /// image with it set reads as zeros wherever the parent holds the
+    /// data.
+    pub has_parent: bool,
     // Sector cache for BAT reads
     pub bat_cached_sector: u64,
     pub bat_cache_buf: *mut u8,
@@ -1533,8 +1549,12 @@ impl VhdxState {
     /// Initialize VHDX state by reading headers, region table, and
     /// metadata.
     ///
-    /// Returns `None` if the image is invalid, a differencing disk,
-    /// or I/O fails.
+    /// Returns `None` if the image is invalid or I/O fails.
+    ///
+    /// A differencing (parent-referencing) image initialises
+    /// successfully and reports itself through
+    /// [`VhdxState::has_parent`]; refusing it is the caller's policy
+    /// decision, not this crate's. See that field.
     ///
     /// # Safety
     ///
@@ -1682,10 +1702,14 @@ impl VhdxState {
             bytes_read,
         )?;
 
-        // Reject differencing disks
-        if metadata.has_parent {
-            return None;
-        }
+        // A differencing image is *not* refused here: `has_parent` is
+        // carried out on the returned state instead, and the read entry
+        // points refuse it by name (decision 3 of
+        // `docs/plans/PLAN-differencing-phase-04-read-policy.md`). A bare
+        // `None` here was indistinguishable from a corrupt header, which
+        // is what issue #548 complained about, and it left VHDX
+        // structurally different from VHD for the composition phases to
+        // reconcile later.
 
         // Validate sector sizes
         if metadata.logical_sector_size != 512 && metadata.logical_sector_size != 4096 {
@@ -1731,6 +1755,7 @@ impl VhdxState {
             bat_offset,
             total_bat_entries: total_bat_entries_u32,
             chunk_ratio: chunk_ratio_u32,
+            has_parent: metadata.has_parent,
             bat_cached_sector: u64::MAX,
             bat_cache_buf,
             data_cached_sector: u64::MAX,
@@ -1845,8 +1870,11 @@ impl VhdxState {
                     host_byte_offset: file_offset + intra_block_offset,
                 })
             }
-            // PARTIALLY_PRESENT requires parent — we rejected
-            // differencing disks in init, so treat as error.
+            // PARTIALLY_PRESENT resolves against the parent, which
+            // nothing can compose yet. `init` no longer refuses a
+            // differencing image (the read entry points do, on
+            // `has_parent`), so this arm is the backstop for a caller
+            // that skipped that check: fail rather than invent data.
             _ => None,
         }
     }
