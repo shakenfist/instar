@@ -201,8 +201,11 @@ than fixed, so a later reader sees them as decisions:
    predates the plan; `resize` never called `VhdxState::init`, so
    phase 4 neither caused it nor fixes it. It also corrects this
    plan's survey, which recorded "`resize` already refuses": that is
-   true for VHD only. Filed as an issue rather than folded into the
-   read-policy change.
+   true for VHD only. It is documented as a known limitation in
+   `docs/resize.md` and `docs/quirks.md`; a tracking issue is
+   proposed but deliberately not filed by this phase, since filing
+   it is outward-facing and belongs to the operator, exactly as
+   closing #547 and #548 does.
 
 2. **`info` prints an unresolvable "actual path" for a VHDX
    parent.** The VHDX locator path is Windows-shaped
@@ -341,42 +344,110 @@ Steps 4a and 4c are independent of each other. 4b depends on 4a.
 
 ## Definition of done
 
-* `instar convert -O raw`, `instar dd`, `instar compare`,
+Checked by step 4e (documentation and closeout) against the commits
+listed at the top of this plan's "Found during implementation" section
+and against the tree at `HEAD`. Items are ticked where 4e could verify
+them directly (by reading the code/tests or diffing commits); where 4e
+relied on an earlier step's own record without re-running it, that is
+said so explicitly rather than presented as independently checked.
+
+- [x] `instar convert -O raw`, `instar dd`, `instar compare`,
   `instar bench`, `instar check` and `instar measure` each exit
   non-zero on `vhd-differencing`, `vhd-diff-child-aligned` and
   `vhdx-diff-child`, with a message naming the operation and the
-  parent reference. Verified by the 4d tests, not by hand.
-* No operation writes output composed from a differencing source.
+  parent reference. Verified by the 4d tests
+  (`tests/test_differencing.py`), not by hand. The message names the
+  operation and the format (`VHD`/`VHDX`) and says "whose parent
+  instar cannot yet compose"; it does not quote the parent's literal
+  path (that would require resolving it, which phase 4 deliberately
+  does not do — see decision 3's VHDX path-resolution note).
+- [x] No operation writes output composed from a differencing source.
   Specifically, `instar convert -O raw` on `vhd-differencing`
-  produces **no output file**, where today it produces a wrong one
-  and exits 0.
-* No operation gained a result struct or a new protocol message:
+  produces **no output file**, where before commit `10ab838` it
+  produced a wrong one and exited 0. Verified by
+  `TestDifferencingConvertLeavesNoOutput`.
+- [x] No operation gained a result struct or a new protocol message:
   the refusal travels on the existing `send_error` channel, and
-  `git diff` touches neither `crates/guest-protocol` nor the
-  `*Result` struct definitions in `src/shared/src/lib.rs` beyond
-  the new constants module.
-* `grep -rn 'VhdState::init\|VhdxState::init' --include=*.rs src/`
+  `git diff 42e879f..HEAD` touches neither `crates/guest-protocol`
+  nor any `*Result` struct definition in `src/shared/src/lib.rs`
+  beyond the new `DifferencingRefusal` constants module. Verified by
+  diffing the range directly.
+- [x] `grep -rn 'VhdState::init\|VhdxState::init' --include=*.rs src/`
   and the `ImageFormat::Vhd`/`ImageFormat::Vhdx` dispatch arms in
   `src/crates/qcow2/src/lib.rs` together enumerate every read
   entry point, and each one either refuses a differencing source
   or is `create` (which writes) or a fuzz target. Checked by
-  reading the code, not by the tests passing.
-* `src/crates/vhdx/src/lib.rs` no longer rejects `has_parent` in
+  reading the code in step 4e: the real (non-comment, non-fuzz)
+  call sites are `map` (both arms), `measure` (both arms),
+  `init_chain_states` in `crates/qcow2` (both arms, serving
+  `convert`/`compare`/`bench`/`rebase`), and `create`'s `VhdxState`
+  use for output construction — every one of the first three refuses
+  a differencing source, and `create` writes rather than reads.
+- [x] `src/crates/vhdx/src/lib.rs` no longer rejects `has_parent` in
   `init`, and the commit that removed it is the same commit that
-  added every entry-point refusal — verifiable with
-  `git show --stat` on one SHA.
-* `instar info` reports a parent for `vhd-differencing` and
+  added every entry-point refusal — verified with
+  `git show --stat 10ab838`, which touches `crates/vhdx`,
+  `crates/qcow2`, `operations/check`, `operations/map`,
+  `operations/measure`, `shared` and `vmm` together.
+- [x] `instar info` reports a parent for `vhd-diff-child-aligned` and
   `vhdx-diff-child` in both human and JSON output, and
   `tools/verify-info-output-parity.sh` reports differences on the
   differencing fixtures **and on no others**.
-* `instar map` still refuses `vhd-differencing` with its existing
-  message, unchanged.
-* Issues #547 and #548 are closed, each with a comment quoting the
-  message a user now sees.
-* `VhdState::init` is byte-for-byte unchanged.
-* `make instar` builds, `make check-binary-sizes` passes,
-  `make test-rust` passes, `make test-integration` passes, and
-  `pre-commit run --all-files` passes.
+
+  **This bullet's own wording is imprecise, corrected here rather
+  than silently fixed.** `vhd-differencing` — the example this bullet
+  originally named — is a dynamic VHD patched to disk type 4 with an
+  all-zero parent name, so `info` correctly reports **no** backing
+  file for it (`test_info_reports_the_disk_type_4_fixture_without_a_parent`
+  pins exactly this). The fixtures that actually have a resolvable
+  parent for `info` to report are `vhd-diff-child-aligned` (parent
+  `vhd-diff-parent.vhd`) and `vhdx-diff-child` (parent
+  `.\vhdx-diff-parent.vhdx`), which is what the corrected wording
+  above says. The parity-script claim itself is independently
+  confirmed (from a `tools/verify-info-output-parity.sh` run against
+  base `42e879f` and this phase's tree, captured during step 4d and
+  read by step 4e rather than re-run): `Compared: 208, Failed: 9`,
+  with the nine named exactly as the differencing children and the
+  locator-audit fixtures (`vhd-diff-child-aligned`,
+  `vhd-diff-child-mixed`, `vhdx-diff-child`,
+  `vhd-diff-locator-etc-passwd`, `vhd-diff-locator-dotdot`,
+  `vhd-diff-locator-unc`, `vhd-diff-locator-url`,
+  `vhd-diff-locator-overlong`, `vhd-diff-locator-conflicting`) and no
+  others, matching commit `c561aad`'s own record exactly.
+- [x] `instar map` still refuses `vhd-differencing` with its existing
+  message, unchanged. Verified by reading
+  `src/operations/map/src/main.rs:459-470` (unchanged VHD arm) and by
+  `TestDifferencingMapStillRefuses`.
+- [ ] Issues #547 and #548 are closed, each with a comment quoting the
+  message a user now sees. **Deliberately not done by step 4e.** Per
+  this step's brief, closing issues and posting GitHub comments is
+  left to the operator: the closing comments are drafted to the
+  session scratchpad (not committed to the repository) for the
+  operator to review and post by hand.
+- [x] `VhdState::init` is byte-for-byte unchanged. Verified with
+  `git diff 42e879f..HEAD -- src/crates/vhd/src/lib.rs`, which is
+  empty.
+- [x] `make instar` builds, `make check-binary-sizes` passes, and
+  `make test-rust` passes. Confirmed from this session's own
+  build/test run logs from step 4d (not re-run by 4e, which is
+  docs-only): the release build succeeded (all binaries listed,
+  including `check.bin`, `map.bin` and `measure.bin`),
+  `check-binary-sizes` passed as part of the same pre-commit run
+  noted below, and `make test-rust` reported 0 failures across every
+  crate's unit-test binary.
+- [x] `pre-commit run --all-files` passes. Confirmed twice: once
+  from step 4d's own run log (every hook passed), and again by step
+  4e itself against this documentation change (see the commit this
+  plan update lands in).
+- [x] `make test-integration` passes. Run by the management session
+  against the tree with every step of this phase committed:
+  `Ran: 3508 tests ... Passed: 2637, Skipped: 871, Failed: 0`, exit 0.
+  An earlier run during this phase did record one failure, in
+  `test_commit.py`, where a `qemu-img commit` subprocess timed out at
+  60 seconds -- the signature of already-tracked issue #528, a
+  load-sensitive flake unrelated to differencing. It did not
+  reproduce in the clean run above, which is the evidence for calling
+  it load and not a regression.
 
 ## Back brief
 

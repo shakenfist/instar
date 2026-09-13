@@ -185,6 +185,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   tools that use an unrecognised creator app remain subject to the
   same qemu behaviour; see docs/quirks.md.
 
+- **A differencing VHD or VHDX no longer silently gives the wrong
+  answer on read (issues #547, #548).** instar cannot compose a
+  differencing image's parent yet. `convert -O raw` on a differencing
+  VHD used to exit 0 and write an image with zeros where the parent's
+  data belonged; every operation on a VHDX used to fail, but
+  undiagnosably — `compare` given the same image as both arguments
+  reported a content mismatch between a file and itself. `convert`,
+  `dd`, `compare`, `bench`, `check` and `measure` now refuse both
+  formats by name instead:
+
+  ```
+  <op>: source is a differencing <VHD|VHDX> image whose parent instar
+  cannot yet compose; composition is deferred (see PLAN-differencing.md
+  phases 11-16)
+  ```
+
+  exiting 1 and leaving no output file. `map` keeps its own, older
+  refusal text and guest error code, unchanged for VHD; its VHDX arm is
+  new, because `VhdxState::init` no longer rejects a `has_parent` image
+  outright (that rejection is what accidentally protected VHDX before
+  this change), so every read entry point — `map` included — now
+  decides for itself instead of relying on that crate to fail closed
+  for the wrong reason. **If you script against `check`'s exit code,
+  note that a differencing image now exits 1 (refused) instead of 2
+  (corrupt)** — it was never corrupt, it was unsupported. `instar info`
+  is deliberately unaffected by the refusal: it now reports the parent
+  as a backing file and still exits 0, since it composes no sector data
+  and has no wrong answer to give.
+
+  See docs/quirks.md's "VHD/VHDX differencing" section for the full
+  before/after record, including three known limitations left
+  deliberately unfixed: `info --chain` reports a one-image chain for
+  a differencing source, `info` prints an unresolvable "actual path"
+  for a VHDX parent's Windows-shaped locator, and `resize` still
+  accepts a differencing VHDX (a pre-existing, unrelated write-path
+  bug).
+
 ## [0.3.0] - 2026-08-02
 
 ### Fixed
