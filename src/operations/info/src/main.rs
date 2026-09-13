@@ -39,22 +39,16 @@ const VHD_MAX_CHS_SECS: u8 = 255;
 // Maximum backing file path length (QCOW2 spec allows up to 1023 bytes)
 const MAX_BACKING_FILE_LEN: usize = 1024;
 
-// VHD dynamic-header offsets used only to report a differencing image's
-// parent (footer disk_type == 4). `info` does not link `crates/vhd` (see
-// docs/plans/PLAN-differencing-phase-04-read-policy.md decision 4 and
-// structural finding 4), so these are re-declared locally, pinned
-// identically to crates/vhd's FOOTER_DATA_OFFSET_OFFSET, FOOTER_DISK_TYPE_OFFSET,
-// DISK_TYPE_DIFFERENCING, DYNAMIC_HEADER_SIZE, DYN_PARENT_NAME_OFFSET and
-// DYN_PARENT_NAME_SIZE.
-const VHD_FOOTER_DATA_OFFSET_OFFSET: usize = 16; // Absolute file offset of the dynamic header (8 bytes BE)
-const VHD_FOOTER_DISK_TYPE_OFFSET: usize = 60; // Disk type (4 bytes BE): 2=fixed, 3=dynamic, 4=differencing
-const VHD_DISK_TYPE_DIFFERENCING: u32 = 4;
-const VHD_DYNAMIC_HEADER_SIZE: usize = 1024;
-// Parent unicode name, relative to the dynamic header start -- absolute
-// file offset 576 when the header immediately follows the footer, which
-// every VHD in the test corpus does.
-const VHD_DYN_PARENT_NAME_OFFSET: usize = 64;
-const VHD_DYN_PARENT_NAME_SIZE: usize = 512; // 256 UTF-16 code units, big-endian
+// VHD footer and dynamic-header offsets used only to report a differencing
+// image's parent (footer disk_type == 4). These come from `crates/vhd`
+// rather than being re-declared here: a local copy has no way to fail when
+// the crate's values move, and `info` is a `no_main` guest binary that
+// cannot run `cargo test` to catch the drift.
+use vhd::{
+    DISK_TYPE_DIFFERENCING as VHD_DISK_TYPE_DIFFERENCING,
+    DYNAMIC_HEADER_SIZE as VHD_DYNAMIC_HEADER_SIZE, DYN_PARENT_NAME_OFFSET, DYN_PARENT_NAME_SIZE,
+    FOOTER_DATA_OFFSET_OFFSET, FOOTER_DISK_TYPE_OFFSET,
+};
 
 // VHDX format constants (all offsets and values are little-endian)
 // VHDX region table is at fixed offset 192KB (0x30000)
@@ -464,10 +458,10 @@ pub unsafe extern "C" fn _start() -> u64 {
                 };
 
                 let disk_type = u32::from_be_bytes([
-                    footer_bytes[VHD_FOOTER_DISK_TYPE_OFFSET],
-                    footer_bytes[VHD_FOOTER_DISK_TYPE_OFFSET + 1],
-                    footer_bytes[VHD_FOOTER_DISK_TYPE_OFFSET + 2],
-                    footer_bytes[VHD_FOOTER_DISK_TYPE_OFFSET + 3],
+                    footer_bytes[FOOTER_DISK_TYPE_OFFSET],
+                    footer_bytes[FOOTER_DISK_TYPE_OFFSET + 1],
+                    footer_bytes[FOOTER_DISK_TYPE_OFFSET + 2],
+                    footer_bytes[FOOTER_DISK_TYPE_OFFSET + 3],
                 ]);
 
                 if disk_type == VHD_DISK_TYPE_DIFFERENCING
@@ -833,10 +827,12 @@ fn parse_vhd_footer(buffer: &[u8], result: &mut InfoResult) {
 /// locator platform data further into the same header (see
 /// `docs/plans/PLAN-differencing-phase-03-parse.md`).
 ///
-/// `info` does not link `crates/vhd` (structural finding 4 of
-/// `docs/plans/PLAN-differencing-phase-04-read-policy.md`), so the
-/// sector-spanning header read below mirrors `VhdState::init`'s
-/// (`crates/vhd/src/lib.rs`) rather than calling it.
+/// The sector-spanning read below mirrors `VhdState::init`'s
+/// (`crates/vhd/src/lib.rs`) because the call table reads whole sectors and
+/// a 1024-byte header at a 512-byte-aligned offset straddles two of them.
+/// What the bytes are then handed to is the crate's own
+/// `VhdDynamicHeader::parse`, so a header `crates/vhd` would reject is not
+/// one `info` will decode a parent name out of.
 ///
 /// Returns true and NUL-terminates `backing_file_buf` when a non-empty
 /// name decodes; false (leaving the buffer untouched) on any read or
@@ -854,14 +850,14 @@ unsafe fn parse_vhd_parent_name(
     }
 
     let data_offset = u64::from_be_bytes([
-        footer_bytes[VHD_FOOTER_DATA_OFFSET_OFFSET],
-        footer_bytes[VHD_FOOTER_DATA_OFFSET_OFFSET + 1],
-        footer_bytes[VHD_FOOTER_DATA_OFFSET_OFFSET + 2],
-        footer_bytes[VHD_FOOTER_DATA_OFFSET_OFFSET + 3],
-        footer_bytes[VHD_FOOTER_DATA_OFFSET_OFFSET + 4],
-        footer_bytes[VHD_FOOTER_DATA_OFFSET_OFFSET + 5],
-        footer_bytes[VHD_FOOTER_DATA_OFFSET_OFFSET + 6],
-        footer_bytes[VHD_FOOTER_DATA_OFFSET_OFFSET + 7],
+        footer_bytes[FOOTER_DATA_OFFSET_OFFSET],
+        footer_bytes[FOOTER_DATA_OFFSET_OFFSET + 1],
+        footer_bytes[FOOTER_DATA_OFFSET_OFFSET + 2],
+        footer_bytes[FOOTER_DATA_OFFSET_OFFSET + 3],
+        footer_bytes[FOOTER_DATA_OFFSET_OFFSET + 4],
+        footer_bytes[FOOTER_DATA_OFFSET_OFFSET + 5],
+        footer_bytes[FOOTER_DATA_OFFSET_OFFSET + 6],
+        footer_bytes[FOOTER_DATA_OFFSET_OFFSET + 7],
     ]);
 
     let actual_size = match input_capacity.checked_mul(sector_size as u64) {
@@ -903,12 +899,25 @@ unsafe fn parse_vhd_parent_name(
             .copy_from_slice(&dyn_buf[..remaining]);
     }
 
+    // Both `disk_type` and `data_offset` are image-controlled, so the bytes
+    // above are wherever a hostile footer chose to point. Refuse to read a
+    // parent name out of them unless they are actually a dynamic header:
+    // `VhdDynamicHeader::parse` returns `None` for anything without the
+    // `cxsparse` cookie, which is the same gate `crates/vhd` applies before
+    // it will trust this structure (`VhdParentInfo::parse`). Without it, an
+    // image with `disk_type = 4` and an arbitrary `data_offset` gets 512
+    // bytes of unrelated file content decoded as UTF-16BE and printed as
+    // `backing file:`.
+    if vhd::VhdDynamicHeader::parse(&dyn_header_bytes).is_none() {
+        return false;
+    }
+
     // Decode + NUL-terminate is `shared::decode_utf16_field_nul_terminated`
     // (differencing phase 4, step 4c review: moved out of `info` into
     // `shared` so it runs under that crate's test suite -- `info` is a
     // `no_main` guest binary and cannot run `cargo test` at all).
-    let name_bytes = &dyn_header_bytes
-        [VHD_DYN_PARENT_NAME_OFFSET..VHD_DYN_PARENT_NAME_OFFSET + VHD_DYN_PARENT_NAME_SIZE];
+    let name_bytes =
+        &dyn_header_bytes[DYN_PARENT_NAME_OFFSET..DYN_PARENT_NAME_OFFSET + DYN_PARENT_NAME_SIZE];
     shared::decode_utf16_field_nul_terminated(name_bytes, true, backing_file_buf)
 }
 

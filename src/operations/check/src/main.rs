@@ -1978,6 +1978,25 @@ unsafe fn check_vhd(
         }
     };
 
+    // Differencing disk: unsupported for reading, but not corrupt. Its
+    // BAT describes only the blocks the child owns, so walking it and
+    // reporting "no errors" -- which is what happened before -- tells a
+    // user an image instar cannot read is fine. Refuse before the walk,
+    // matching the VHDX arm.
+    //
+    // This sits ahead of every validation below, not after them, because
+    // the host suppresses `print_check_result` once a refusal is
+    // captured: findings computed past this point would be counted and
+    // then thrown away, and the user would be told neither that the
+    // image is unreadable *nor* that it is malformed. Refusal takes
+    // precedence, so nothing is computed that cannot be reported.
+    // `disk_type == 4` is inside the valid range the check below tests,
+    // so no validity check is skipped by ordering it first.
+    if footer.disk_type == vhd::DISK_TYPE_DIFFERENCING {
+        refuse_differencing(result, call_table, DifferencingRefusal::STATUS_VHD);
+        return bytes_read;
+    }
+
     // Validate footer checksum
     let expected_cksum =
         vhd::compute_checksum(&footer_buf[..vhd::FOOTER_SIZE], vhd::FOOTER_CHECKSUM_OFFSET);
@@ -1992,19 +2011,6 @@ unsafe fn check_vhd(
         result.corruptions += 1;
         result.total_errors += 1;
         (call_table.debug_print)(b"check: invalid VHD disk type\n\0".as_ptr());
-    }
-
-    // Differencing disk: unsupported for reading, but not corrupt. Its
-    // BAT describes only the blocks the child owns, so walking it and
-    // reporting "no errors" -- which is what happened before -- tells a
-    // user an image instar cannot read is fine. Refuse before the walk,
-    // matching the VHDX arm.
-    if footer.disk_type == vhd::DISK_TYPE_DIFFERENCING {
-        refuse_differencing(result, call_table, DifferencingRefusal::STATUS_VHD);
-        if result.corruptions > 0 {
-            result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
-        }
-        return bytes_read;
     }
 
     // Validate format version

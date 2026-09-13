@@ -301,20 +301,6 @@ fn target_unit_size_for(c: &MeasureConfig) -> u64 {
     }
 }
 
-/// Detect the source format from the first sector and dispatch to
-/// the matching parser's `scan_allocation`. Returns `None` if the
-/// format is unrecognised or the parser rejects the image.
-/// Detect the source format on device 0 and run the matching
-/// parser's `scan_allocation` to produce an [`AllocationSummary`].
-///
-/// # Safety
-///
-/// `call_table` must be a valid initialised [`CallTable`] — the
-/// architectural invariant established by `_start` (see its
-/// `Safety` doc). Input device 0 must be attached and have a
-/// non-zero capacity; the function delegates to each parser
-/// crate's `*State::init` + `scan_allocation` which carry their
-/// own safety preconditions on the cache buffers passed in.
 /// Raise the differencing-image read refusal on `send_error`.
 ///
 /// `detect_and_scan` reports failure as `None`, which the caller turns
@@ -337,6 +323,18 @@ unsafe fn refuse_differencing(call_table: &CallTable, status: u32) {
     );
 }
 
+/// Detect the source format on device 0 and run the matching parser's
+/// `scan_allocation` to produce an [`AllocationSummary`]. Returns `None`
+/// if the format is unrecognised or the parser rejects the image.
+///
+/// # Safety
+///
+/// `call_table` must be a valid initialised [`CallTable`] — the
+/// architectural invariant established by `_start` (see its
+/// `Safety` doc). Input device 0 must be attached and have a
+/// non-zero capacity; the function delegates to each parser
+/// crate's `*State::init` + `scan_allocation` which carry their
+/// own safety preconditions on the cache buffers passed in.
 unsafe fn detect_and_scan(
     call_table: &CallTable,
     config: &MeasureConfig,

@@ -208,11 +208,12 @@ instar cannot compose.
 
 This is a **write** path and predates
 [PLAN-differencing.md](plans/PLAN-differencing.md); `resize` never
-called `VhdxState::init`, so phase 4's read-side refusal (see
+called `VhdxState::init`, so the read-side refusal (see
 [quirks.md](quirks.md)'s "VHD/VHDX differencing" section) neither
 caused this bug nor fixes it. Closing it is call-site wiring, not
 planner logic — thread the image's real `has_parent` value into
-`VhdxResizeOpts` instead of the hard-coded `false`.
+`VhdxResizeOpts` instead of the hard-coded `false`. Tracked as
+[issue #565](https://github.com/shakenfist/instar/issues/565).
 
 ## Future work
 

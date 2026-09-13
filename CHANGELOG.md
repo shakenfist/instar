@@ -197,8 +197,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
   ```
   <op>: source is a differencing <VHD|VHDX> image whose parent instar
-  cannot yet compose; composition is deferred (see PLAN-differencing.md
-  phases 11-16)
+  cannot yet compose; composition is deferred (see PLAN-differencing.md)
   ```
 
   exiting 1 and leaving no output file. `map` keeps its own, older
@@ -214,13 +213,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   as a backing file and still exits 0, since it composes no sector data
   and has no wrong answer to give.
 
+  `instar create -b <differencing VHD or VHDX>` is **refused** for the
+  same reason, with its own message rather than the generic
+  "backing file header could not be parsed": the header parses
+  perfectly well, the image is simply one no read path can follow. An
+  overlay stacked on such a base would be a chain that could never be
+  read back. Their plain dynamic parents are accepted as before.
+
+  On a differencing image `info` now reports
+  `backing-filename-format` as `vpc` or `vhdx` rather than the `qcow2`
+  that field defaults to when no backing format is recorded. SPEC(VHD)
+  and SPEC(VHDX) both require a parent to be the same format as its
+  child, so the format is known without a header extension to read it
+  from. Note that a reported parent is a string the image claims, not
+  a file instar has opened: parent locators are attacker-controlled
+  and can name absolute paths, traversals, UNC shares or URLs, and
+  `info` prints them without resolving or following them.
+
   See docs/quirks.md's "VHD/VHDX differencing" section for the full
   before/after record, including three known limitations left
   deliberately unfixed: `info --chain` reports a one-image chain for
   a differencing source, `info` prints an unresolvable "actual path"
   for a VHDX parent's Windows-shaped locator, and `resize` still
   accepts a differencing VHDX (a pre-existing, unrelated write-path
-  bug).
+  bug, now tracked as issue #565).
 
 ## [0.3.0] - 2026-08-02
 

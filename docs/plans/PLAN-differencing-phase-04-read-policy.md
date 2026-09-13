@@ -130,6 +130,14 @@ metadata, it never composes sector data, so it has no wrong answer
 to give. Its defect is an omission — it reports no parent for an
 image that has one — which phase 3 made fixable. See decision 4.
 
+*Corrected in review:* the second sentence was read as licence to
+keep parsing the VHD side locally, and that was wrong. Not linking
+the crate meant not inheriting its validation either, which is how
+`info` came to decode a parent name out of an unvalidated
+`data_offset` (see "Found in review", item 2). `info` now links
+`crates/vhd` for 704 bytes. The first sentence still stands: `info`
+does not inherit the *refusal*, only the parsing.
+
 **Mechanism finding 5 — the per-op result struct is *not* a
 usable channel, and the right precedent is issue #375.** Both
 `init` functions return `Option<Self>` and the chain initialiser
@@ -202,10 +210,15 @@ than fixed, so a later reader sees them as decisions:
    phase 4 neither caused it nor fixes it. It also corrects this
    plan's survey, which recorded "`resize` already refuses": that is
    true for VHD only. It is documented as a known limitation in
-   `docs/resize.md` and `docs/quirks.md`; a tracking issue is
-   proposed but deliberately not filed by this phase, since filing
-   it is outward-facing and belongs to the operator, exactly as
-   closing #547 and #548 does.
+   `docs/resize.md` and `docs/quirks.md`, and filed by the operator
+   as
+   [issue #565](https://github.com/shakenfist/instar/issues/565)
+   after the phase landed for review. Reproduced there against the
+   `vhdx-diff-child` fixture: a 16 MiB child grows to 100 MiB while
+   its parent stays 16 MiB, exit 0. Differencing VHD is refused
+   (`error 6: subformat does not support resize`) and qemu-img 10.0.13
+   refuses differencing VHDX outright, so instar-on-VHDX is the only
+   accepting combination.
 
 2. **`info` prints an unresolvable "actual path" for a VHDX
    parent.** The VHDX locator path is Windows-shaped
@@ -226,6 +239,97 @@ than fixed, so a later reader sees them as decisions:
    blocks as holes. The refusal was added using map's existing
    `ERROR_HAS_BACKING`, so the precedent is preserved rather than
    migrated.
+
+## Found in review
+
+The automated reviewer on
+[PR #563](https://github.com/shakenfist/instar/pull/563) raised twelve
+items. Two were regressions this phase introduced, and are the reason
+this section exists rather than a changelog line.
+
+1. **`create -b <differencing VHDX>` started succeeding.** Removing
+   `VhdxState::init`'s blanket `has_parent` rejection -- the change
+   that lets the read entry points refuse with a reason instead of
+   failing anonymously -- also removed the only guard on `create`'s
+   `read_backing_virtual_size`, which *reads* a user-supplied image.
+   An overlay whose base every read path refuses is a chain that can
+   never be read back. Decision 3 anticipated this class of fallout
+   and the definition of done enumerated `init`'s call sites, but
+   classified `create` as "writes rather than reads" and stopped
+   there, which was wrong about this call site.
+
+   Fixed by refusing both formats in `read_backing_virtual_size`,
+   with a new `CreateResult::ERROR_BACKING_DIFFERENCING` rather than
+   the generic `ERROR_BACKING_PARSE_FAILED`: the backing header parses
+   perfectly well, and telling a user a valid image is "truncated,
+   corrupted, or an unrecognised format" is precisely the undiagnosed
+   failure #548 was filed over. The VHD arm never had a guard at all
+   and gains one here, so the two formats now agree.
+
+2. **`info` decoded a parent name without validating the dynamic
+   header.** `parse_vhd_parent_name` took `data_offset` from the
+   footer and decoded 512 bytes at header offset 64 as UTF-16BE.
+   Both `disk_type` and `data_offset` are image-controlled, so an
+   image could point `data_offset` anywhere in itself and have
+   arbitrary content printed as `backing file:` -- untrusted bytes
+   promoted into a structured, user-facing field, with none of the
+   validation `crates/vhd` applies to the same structure.
+
+   Structural finding 4 and step 4c's brief are the root cause: they
+   left `info` parsing the VHD side locally rather than linking
+   `crates/vhd`, on the grounds that the VHD side was "small enough
+   to parse locally". That reasoning was already weak once the same
+   step added a `vhdx` dependency, and it produced six re-declared
+   constants with no mechanism to catch drift -- `info` is a
+   `no_main` guest binary that cannot run `cargo test`, so nothing
+   could have failed if the crate's values moved. `info` now links `crates/vhd`, uses its
+   constants, and gates on `VhdDynamicHeader::parse` -- the crate's
+   own `cxsparse` cookie check. Measured cost: `info.bin` went from
+   148,512 to 149,216 bytes -- 704 bytes, against a 768 KB ceiling
+   the binary uses 18% of. The size argument decision 4 rested on did
+   not survive being measured.
+
+   Verified by negative control: with the cookie check compiled out,
+   an image carrying UTF-16BE text at a bogus `data_offset` reports
+   `backing file: PWNED-SECRET.vhd`; with it in, nothing. The test
+   builds that image rather than shipping it as a fixture.
+
+Two further defects were found while writing the tests for those, and
+neither was in the review:
+
+3. **`backing-filename-format` claimed a differencing VHD's parent
+   was a qcow2.** The field defaults to `"qcow2"` when no backing
+   format is recorded, which is right for a qcow2 v2 image with no
+   header extension. A differencing image records no such extension
+   either, so reporting a parent at all -- new in this phase -- put a
+   false claim in a machine-read field. SPEC(VHD) and SPEC(VHDX) both
+   require a parent to be the same format as its child, so the format
+   is known without a header extension; `vpc` / `vhdx` are now
+   reported.
+
+4. **A malformed differencing VHD fails generically, and that is
+   correct.** The refusal in `init_chain_states` reads a `VhdState`,
+   and `VhdState::init` cannot build one without a valid `cxsparse`
+   header -- so an image with a bogus `data_offset` fails as
+   malformed before its disk type is consulted. This was an
+   assumption in a test I wrote, not in the code, and it is recorded
+   here because the test now asserts the real behaviour and says why.
+   The property #547 was filed over still holds: no content is
+   written and the exit code is non-zero.
+
+The remaining ten items were documentation and test-coverage gaps:
+plan phase numbers in the user-facing refusal string and in six
+documents (AGENTS.md keeps phase numbers inside `docs/plans/`, and the
+string reaches a user of an installed .deb who has neither the plan nor
+its numbering); `refuse_differencing` inserted between `detect_and_scan`'s
+doc comment and `detect_and_scan`, orphaning an `unsafe fn`'s safety
+contract; `check_vhd` computing corruption findings past a refusal that
+suppresses them; the six adversarial parent-locator fixtures and
+`vhd-diff-child-mixed` untested; per-operation docs unwritten and
+`docs/check.md` still claiming differencing VHDs are validated;
+`check --output json` emitting no JSON on a refusal; `subTest` missing
+from every fixture loop; and a quirks.md heading still describing the
+pre-fix behaviour the body now contradicts.
 
 ## Decisions
 

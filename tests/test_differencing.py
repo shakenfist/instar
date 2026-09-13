@@ -41,6 +41,15 @@ The classes are:
   parent file existing.
 * `TestDifferencingNegativeControls` -- the plain dynamic parents of
   these chains must keep working, so the refusal is not over-broad.
+* `TestDifferencingAdversarialLocators` -- the six hostile
+  parent-locator fixtures: refused by the composing ops, reported but
+  never followed by `info`.
+* `TestDifferencingInfoValidatesTheDynamicHeader` -- `info` will not
+  decode a parent name out of a `data_offset` that does not point at a
+  `cxsparse` header.
+* `TestDifferencingCreateRefusesAsBacking` -- `create -b` fails closed
+  on a differencing base, which is what the removed `VhdxState::init`
+  rejection used to do for VHDX.
 """
 
 import json
@@ -60,14 +69,40 @@ from base import InstarTestBase
 # fixtures are real chains with a real parent beside them.
 DIFFERENCING_FIXTURES = (
     ('vhd-diff-child-aligned', 'VHD'),
+    ('vhd-diff-child-mixed', 'VHD'),
     ('vhd-differencing', 'VHD'),
     ('vhdx-diff-child', 'VHDX'),
+)
+
+# Structurally valid differencing VHDs whose parent name and locator
+# entries were built to be hostile: absolute POSIX paths, relative
+# traversal, UNC, a URL, an unterminated 512-byte name, and eight
+# mutually-contradictory locator entries. They live in
+# `custom/audit/` rather than `custom/format-coverage/` because their
+# point is what a reader must *not* do with a locator, not what a
+# differencing image looks like.
+#
+# They matter to this suite for two reasons. The composing operations
+# must refuse them like any other differencing image -- a hostile
+# locator must not become a route to a read instar would otherwise
+# decline. And `info`, which reports rather than refuses, now prints
+# these strings: the refusal has moved the attacker-shaped path from
+# "never seen" to "rendered in a user-facing field", so what is
+# rendered needs pinning.
+ADVERSARIAL_LOCATOR_FIXTURES = (
+    ('vhd-diff-locator-etc-passwd', '/etc/passwd'),
+    ('vhd-diff-locator-dotdot', '../../../etc/passwd'),
+    ('vhd-diff-locator-unc', '\\\\attacker\\share\\probe'),
+    ('vhd-diff-locator-url', 'http://attacker.example/probe'),
+    ('vhd-diff-locator-overlong', '/overlong-'),
+    ('vhd-diff-locator-conflicting', 'conflict-parent-name.vhd'),
 )
 
 # The subset with a real, resolvable parent. Used where the test needs
 # `info` to report a parent name, which `vhd-differencing` cannot do.
 DIFFERENCING_CHAIN_FIXTURES = (
     ('vhd-diff-child-aligned', 'vhd-diff-parent.vhd'),
+    ('vhd-diff-child-mixed', 'vhd-diff-parent.vhd'),
     ('vhdx-diff-child', '.\\vhdx-diff-parent.vhdx'),
 )
 
@@ -101,7 +136,7 @@ class DifferencingTestBase(InstarTestBase):
         return (
             f'{op}: source is a differencing {format_name} image whose '
             f'parent instar cannot yet compose; composition is deferred '
-            f'(see PLAN-differencing.md phases 11-16)'
+            f'(see PLAN-differencing.md)'
         )
 
     def differencing_image(self, image_id: str) -> Path:
@@ -173,56 +208,60 @@ class TestDifferencingRefusal(DifferencingTestBase):
     def test_convert_refuses(self):
         """`convert -O raw` refuses and writes nothing."""
         for image_id, format_name in DIFFERENCING_FIXTURES:
-            source = self.differencing_image(image_id)
-            with tempfile.TemporaryDirectory() as tmp:
-                out = Path(tmp) / 'out.raw'
-                stdout, stderr, rc = self.run_instar_convert(
-                    source, out, output_format='raw'
-                )
-                self.assert_refused(
-                    'convert', format_name, stdout, stderr, rc, image_id
-                )
-                self.assertFalse(
-                    out.exists(),
-                    f'{image_id}: convert must leave no output file, '
-                    f'found one of {out.stat().st_size if out.exists() else 0}'
-                    f' bytes'
-                )
+            with self.subTest(image=image_id):
+                source = self.differencing_image(image_id)
+                with tempfile.TemporaryDirectory() as tmp:
+                    out = Path(tmp) / 'out.raw'
+                    stdout, stderr, rc = self.run_instar_convert(
+                        source, out, output_format='raw'
+                    )
+                    self.assert_refused(
+                        'convert', format_name, stdout, stderr, rc, image_id
+                    )
+                    self.assertFalse(
+                        out.exists(),
+                        f'{image_id}: convert must leave no output file, '
+                        f'found one of {out.stat().st_size if out.exists() else 0}'
+                        f' bytes'
+                    )
 
     def test_dd_refuses(self):
         """`dd` refuses and writes nothing."""
         for image_id, format_name in DIFFERENCING_FIXTURES:
-            source = self.differencing_image(image_id)
-            with tempfile.TemporaryDirectory() as tmp:
-                out = Path(tmp) / 'out.raw'
-                stdout, stderr, rc = self.run_instar_dd(
-                    [f'if={source}', f'of={out}']
-                )
-                self.assert_refused(
-                    'dd', format_name, stdout, stderr, rc, image_id
-                )
-                self.assertFalse(
-                    out.exists(),
-                    f'{image_id}: dd must leave no output file'
-                )
+            with self.subTest(image=image_id):
+                source = self.differencing_image(image_id)
+                with tempfile.TemporaryDirectory() as tmp:
+                    out = Path(tmp) / 'out.raw'
+                    stdout, stderr, rc = self.run_instar_dd(
+                        [f'if={source}', f'of={out}']
+                    )
+                    self.assert_refused(
+                        'dd', format_name, stdout, stderr, rc, image_id
+                    )
+                    self.assertFalse(
+                        out.exists(),
+                        f'{image_id}: dd must leave no output file'
+                    )
 
     def test_compare_refuses(self):
         """`compare` refuses a differencing source."""
         for image_id, format_name in DIFFERENCING_FIXTURES:
-            source = self.differencing_image(image_id)
-            stdout, stderr, rc = self.run_instar_compare(source, source)
-            self.assert_refused(
-                'compare', format_name, stdout, stderr, rc, image_id
-            )
+            with self.subTest(image=image_id):
+                source = self.differencing_image(image_id)
+                stdout, stderr, rc = self.run_instar_compare(source, source)
+                self.assert_refused(
+                    'compare', format_name, stdout, stderr, rc, image_id
+                )
 
     def test_bench_refuses(self):
         """`bench` refuses a differencing source."""
         for image_id, format_name in DIFFERENCING_FIXTURES:
-            source = self.differencing_image(image_id)
-            stdout, stderr, rc = self.run_instar_bench('-c', '4', source)
-            self.assert_refused(
-                'bench', format_name, stdout, stderr, rc, image_id
-            )
+            with self.subTest(image=image_id):
+                source = self.differencing_image(image_id)
+                stdout, stderr, rc = self.run_instar_bench('-c', '4', source)
+                self.assert_refused(
+                    'bench', format_name, stdout, stderr, rc, image_id
+                )
 
     def test_check_refuses(self):
         """`check` refuses a differencing source with exit 1, not 2.
@@ -232,20 +271,22 @@ class TestDifferencingRefusal(DifferencingTestBase):
         refusal instead. `assert_refused` pins the 1.
         """
         for image_id, format_name in DIFFERENCING_FIXTURES:
-            source = self.differencing_image(image_id)
-            stdout, stderr, rc = self.run_instar_check(source)
-            self.assert_refused(
-                'check', format_name, stdout, stderr, rc, image_id
-            )
+            with self.subTest(image=image_id):
+                source = self.differencing_image(image_id)
+                stdout, stderr, rc = self.run_instar_check(source)
+                self.assert_refused(
+                    'check', format_name, stdout, stderr, rc, image_id
+                )
 
     def test_measure_refuses(self):
         """`measure` refuses a differencing source."""
         for image_id, format_name in DIFFERENCING_FIXTURES:
-            source = self.differencing_image(image_id)
-            stdout, stderr, rc = self.run_instar_measure(source)
-            self.assert_refused(
-                'measure', format_name, stdout, stderr, rc, image_id
-            )
+            with self.subTest(image=image_id):
+                source = self.differencing_image(image_id)
+                stdout, stderr, rc = self.run_instar_measure(source)
+                self.assert_refused(
+                    'measure', format_name, stdout, stderr, rc, image_id
+                )
 
     def test_compare_self_is_refused_not_mismatch(self):
         """Issue #548: an image compared with itself must not "differ".
@@ -259,22 +300,23 @@ class TestDifferencingRefusal(DifferencingTestBase):
         merely implied by the refusal assertion above.
         """
         for image_id, format_name in DIFFERENCING_FIXTURES:
-            source = self.differencing_image(image_id)
-            stdout, stderr, rc = self.run_instar_compare(source, source)
-            self.assert_refused(
-                'compare', format_name, stdout, stderr, rc, image_id
-            )
-            combined = stdout + stderr
-            self.assertNotIn(
-                'Content mismatch', combined,
-                f'{image_id}: issue #548 regression -- compare reported a '
-                f'content mismatch instead of refusing; output={combined!r}'
-            )
-            self.assertNotIn(
-                'Images are identical', combined,
-                f'{image_id}: compare must refuse, not claim a verdict; '
-                f'output={combined!r}'
-            )
+            with self.subTest(image=image_id):
+                source = self.differencing_image(image_id)
+                stdout, stderr, rc = self.run_instar_compare(source, source)
+                self.assert_refused(
+                    'compare', format_name, stdout, stderr, rc, image_id
+                )
+                combined = stdout + stderr
+                self.assertNotIn(
+                    'Content mismatch', combined,
+                    f'{image_id}: issue #548 regression -- compare reported a '
+                    f'content mismatch instead of refusing; output={combined!r}'
+                )
+                self.assertNotIn(
+                    'Images are identical', combined,
+                    f'{image_id}: compare must refuse, not claim a verdict; '
+                    f'output={combined!r}'
+                )
 
 
 class TestDifferencingConvertLeavesNoOutput(DifferencingTestBase):
@@ -291,25 +333,26 @@ class TestDifferencingConvertLeavesNoOutput(DifferencingTestBase):
     def test_convert_raw_writes_no_file(self):
         """No output file survives a refused convert, for any fixture."""
         for image_id, format_name in DIFFERENCING_FIXTURES:
-            source = self.differencing_image(image_id)
-            with tempfile.TemporaryDirectory() as tmp:
-                out = Path(tmp) / 'issue-547.raw'
-                stdout, stderr, rc = self.run_instar_convert(
-                    source, out, output_format='raw'
-                )
-                self.assertEqual(
-                    1, rc,
-                    f'{image_id}: convert exited {rc}, expected 1; '
-                    f'stderr={stderr!r}'
-                )
-                self.assertEqual(
-                    [], list(Path(tmp).iterdir()),
-                    f'{image_id}: convert left files behind in its output '
-                    f'directory: {[p.name for p in Path(tmp).iterdir()]}'
-                )
-                self.assertIn(
-                    self.expected_refusal('convert', format_name), stderr
-                )
+            with self.subTest(image=image_id):
+                source = self.differencing_image(image_id)
+                with tempfile.TemporaryDirectory() as tmp:
+                    out = Path(tmp) / 'issue-547.raw'
+                    stdout, stderr, rc = self.run_instar_convert(
+                        source, out, output_format='raw'
+                    )
+                    self.assertEqual(
+                        1, rc,
+                        f'{image_id}: convert exited {rc}, expected 1; '
+                        f'stderr={stderr!r}'
+                    )
+                    self.assertEqual(
+                        [], list(Path(tmp).iterdir()),
+                        f'{image_id}: convert left files behind in its output '
+                        f'directory: {[p.name for p in Path(tmp).iterdir()]}'
+                    )
+                    self.assertIn(
+                        self.expected_refusal('convert', format_name), stderr
+                    )
 
     def test_convert_to_qcow2_writes_no_file(self):
         """The refusal is not specific to a raw target.
@@ -321,19 +364,20 @@ class TestDifferencingConvertLeavesNoOutput(DifferencingTestBase):
         than the reader.
         """
         for image_id, format_name in DIFFERENCING_FIXTURES:
-            source = self.differencing_image(image_id)
-            with tempfile.TemporaryDirectory() as tmp:
-                out = Path(tmp) / 'out.qcow2'
-                stdout, stderr, rc = self.run_instar_convert(
-                    source, out, output_format='qcow2'
-                )
-                self.assert_refused(
-                    'convert', format_name, stdout, stderr, rc, image_id
-                )
-                self.assertEqual(
-                    [], list(Path(tmp).iterdir()),
-                    f'{image_id}: convert -O qcow2 left files behind'
-                )
+            with self.subTest(image=image_id):
+                source = self.differencing_image(image_id)
+                with tempfile.TemporaryDirectory() as tmp:
+                    out = Path(tmp) / 'out.qcow2'
+                    stdout, stderr, rc = self.run_instar_convert(
+                        source, out, output_format='qcow2'
+                    )
+                    self.assert_refused(
+                        'convert', format_name, stdout, stderr, rc, image_id
+                    )
+                    self.assertEqual(
+                        [], list(Path(tmp).iterdir()),
+                        f'{image_id}: convert -O qcow2 left files behind'
+                    )
 
 
 class TestDifferencingDdMatchesConvert(DifferencingTestBase):
@@ -353,35 +397,36 @@ class TestDifferencingDdMatchesConvert(DifferencingTestBase):
     def test_dd_and_convert_give_the_same_refusal(self):
         """Both refusals differ only in the leading operation name."""
         for image_id, _format_name in DIFFERENCING_FIXTURES:
-            source = self.differencing_image(image_id)
-            with tempfile.TemporaryDirectory() as tmp:
-                convert_out = Path(tmp) / 'convert.raw'
-                _, convert_err, convert_rc = self.run_instar_convert(
-                    source, convert_out, output_format='raw'
-                )
-                dd_out = Path(tmp) / 'dd.raw'
-                _, dd_err, dd_rc = self.run_instar_dd(
-                    [f'if={source}', f'of={dd_out}']
-                )
+            with self.subTest(image=image_id):
+                source = self.differencing_image(image_id)
+                with tempfile.TemporaryDirectory() as tmp:
+                    convert_out = Path(tmp) / 'convert.raw'
+                    _, convert_err, convert_rc = self.run_instar_convert(
+                        source, convert_out, output_format='raw'
+                    )
+                    dd_out = Path(tmp) / 'dd.raw'
+                    _, dd_err, dd_rc = self.run_instar_dd(
+                        [f'if={source}', f'of={dd_out}']
+                    )
 
-            self.assertEqual(
-                convert_rc, dd_rc,
-                f'{image_id}: convert exited {convert_rc} but dd exited '
-                f'{dd_rc}; dd shares convert\'s guest binary and must '
-                f'refuse identically'
-            )
-            convert_reason = self._refusal_reason('convert', convert_err)
-            dd_reason = self._refusal_reason('dd', dd_err)
-            self.assertEqual(
-                convert_reason, dd_reason,
-                f'{image_id}: dd and convert gave different refusals. '
-                f'convert: {convert_err!r} dd: {dd_err!r}'
-            )
-            self.assertIn(
-                'differencing', convert_reason,
-                f'{image_id}: neither op refused for the expected reason; '
-                f'convert stderr={convert_err!r}'
-            )
+                self.assertEqual(
+                    convert_rc, dd_rc,
+                    f'{image_id}: convert exited {convert_rc} but dd exited '
+                    f'{dd_rc}; dd shares convert\'s guest binary and must '
+                    f'refuse identically'
+                )
+                convert_reason = self._refusal_reason('convert', convert_err)
+                dd_reason = self._refusal_reason('dd', dd_err)
+                self.assertEqual(
+                    convert_reason, dd_reason,
+                    f'{image_id}: dd and convert gave different refusals. '
+                    f'convert: {convert_err!r} dd: {dd_err!r}'
+                )
+                self.assertIn(
+                    'differencing', convert_reason,
+                    f'{image_id}: neither op refused for the expected reason; '
+                    f'convert stderr={convert_err!r}'
+                )
 
     def _refusal_reason(self, op, stderr):
         """Strip the leading `<op>: ` from the refusal sentence.
@@ -415,23 +460,24 @@ class TestDifferencingMapStillRefuses(DifferencingTestBase):
     def test_map_refuses_with_its_own_message(self):
         """map refuses every differencing fixture, error code 3."""
         for image_id, _format_name in DIFFERENCING_FIXTURES:
-            source = self.differencing_image(image_id)
-            stdout, stderr, rc = self.run_instar_map(source)
-            self.assertEqual(
-                1, rc,
-                f'{image_id}: expected exit 1 from map, got {rc}; '
-                f'stdout={stdout[:400]!r}'
-            )
-            self.assertIn(
-                MAP_REFUSAL, stderr,
-                f'{image_id}: map must keep its own refusal wording; '
-                f'stderr={stderr!r}'
-            )
-            self.assertIn(
-                MAP_ERROR_CODE, stderr,
-                f'{image_id}: map must report guest error code 3 '
-                f'(ERROR_HAS_BACKING); stderr={stderr!r}'
-            )
+            with self.subTest(image=image_id):
+                source = self.differencing_image(image_id)
+                stdout, stderr, rc = self.run_instar_map(source)
+                self.assertEqual(
+                    1, rc,
+                    f'{image_id}: expected exit 1 from map, got {rc}; '
+                    f'stdout={stdout[:400]!r}'
+                )
+                self.assertIn(
+                    MAP_REFUSAL, stderr,
+                    f'{image_id}: map must keep its own refusal wording; '
+                    f'stderr={stderr!r}'
+                )
+                self.assertIn(
+                    MAP_ERROR_CODE, stderr,
+                    f'{image_id}: map must report guest error code 3 '
+                    f'(ERROR_HAS_BACKING); stderr={stderr!r}'
+                )
 
     def test_map_emits_no_extents_for_a_differencing_source(self):
         """map prints its header but no extent rows before refusing.
@@ -440,17 +486,18 @@ class TestDifferencingMapStillRefuses(DifferencingTestBase):
         allocation table and reported parent-owned regions as holes.
         """
         for image_id, _format_name in DIFFERENCING_FIXTURES:
-            source = self.differencing_image(image_id)
-            stdout, _stderr, _rc = self.run_instar_map(source)
-            rows = [
-                line for line in stdout.splitlines()
-                if line.strip() and not line.startswith('Offset')
-            ]
-            self.assertEqual(
-                [], rows,
-                f'{image_id}: map emitted extent rows for a differencing '
-                f'source: {rows}'
-            )
+            with self.subTest(image=image_id):
+                source = self.differencing_image(image_id)
+                stdout, _stderr, _rc = self.run_instar_map(source)
+                rows = [
+                    line for line in stdout.splitlines()
+                    if line.strip() and not line.startswith('Offset')
+                ]
+                self.assertEqual(
+                    [], rows,
+                    f'{image_id}: map emitted extent rows for a differencing '
+                    f'source: {rows}'
+                )
 
 
 class TestDifferencingInfoReports(DifferencingTestBase):
@@ -465,44 +512,46 @@ class TestDifferencingInfoReports(DifferencingTestBase):
     def test_info_human_reports_the_parent(self):
         """Human `info` exits 0 and names the backing file."""
         for image_id, parent_name in DIFFERENCING_CHAIN_FIXTURES:
-            source = self.differencing_image(image_id)
-            stdout, stderr, rc = self.run_instar_info(source)
-            self.assertEqual(
-                0, rc,
-                f'{image_id}: info must not refuse a differencing image; '
-                f'stderr={stderr!r}'
-            )
-            self.assertIn(
-                f'backing file: {parent_name}', stdout,
-                f'{image_id}: info must report the parent; stdout={stdout!r}'
-            )
-            self.assertNotIn(
-                'differencing', stdout + stderr,
-                f'{image_id}: info must report, not refuse; '
-                f'output={(stdout + stderr)!r}'
-            )
+            with self.subTest(image=image_id):
+                source = self.differencing_image(image_id)
+                stdout, stderr, rc = self.run_instar_info(source)
+                self.assertEqual(
+                    0, rc,
+                    f'{image_id}: info must not refuse a differencing image; '
+                    f'stderr={stderr!r}'
+                )
+                self.assertIn(
+                    f'backing file: {parent_name}', stdout,
+                    f'{image_id}: info must report the parent; stdout={stdout!r}'
+                )
+                self.assertNotIn(
+                    'differencing', stdout + stderr,
+                    f'{image_id}: info must report, not refuse; '
+                    f'output={(stdout + stderr)!r}'
+                )
 
     def test_info_json_reports_the_parent(self):
         """`info --output json` exits 0 and carries backing-filename."""
         for image_id, parent_name in DIFFERENCING_CHAIN_FIXTURES:
-            source = self.differencing_image(image_id)
-            stdout, stderr, rc = self.run_instar_info(
-                source, output_format='json'
-            )
-            self.assertEqual(
-                0, rc,
-                f'{image_id}: info --output json must not refuse; '
-                f'stderr={stderr!r}'
-            )
-            parsed = json.loads(stdout)
-            self.assertEqual(
-                parent_name, parsed.get('backing-filename'),
-                f'{image_id}: unexpected backing-filename in {stdout!r}'
-            )
-            self.assertIn(
-                'full-backing-filename', parsed,
-                f'{image_id}: expected a resolved parent path in {stdout!r}'
-            )
+            with self.subTest(image=image_id):
+                source = self.differencing_image(image_id)
+                stdout, stderr, rc = self.run_instar_info(
+                    source, output_format='json'
+                )
+                self.assertEqual(
+                    0, rc,
+                    f'{image_id}: info --output json must not refuse; '
+                    f'stderr={stderr!r}'
+                )
+                parsed = json.loads(stdout)
+                self.assertEqual(
+                    parent_name, parsed.get('backing-filename'),
+                    f'{image_id}: unexpected backing-filename in {stdout!r}'
+                )
+                self.assertIn(
+                    'full-backing-filename', parsed,
+                    f'{image_id}: expected a resolved parent path in {stdout!r}'
+                )
 
     def test_info_reports_the_disk_type_4_fixture_without_a_parent(self):
         """`vhd-differencing` has an all-zero parent name.
@@ -529,16 +578,17 @@ class TestDifferencingInfoReports(DifferencingTestBase):
         and should have to change this test to do so.
         """
         for image_id, _parent_name in DIFFERENCING_CHAIN_FIXTURES:
-            source = self.differencing_image(image_id)
-            stdout, stderr, rc = self.run_instar_info(source, chain=True)
-            self.assertEqual(
-                0, rc,
-                f'{image_id}: info --chain must not error; stderr={stderr!r}'
-            )
-            self.assertIn(
-                'Chain: 1 image(s)', stdout,
-                f'{image_id}: expected a one-image chain; stdout={stdout!r}'
-            )
+            with self.subTest(image=image_id):
+                source = self.differencing_image(image_id)
+                stdout, stderr, rc = self.run_instar_info(source, chain=True)
+                self.assertEqual(
+                    0, rc,
+                    f'{image_id}: info --chain must not error; stderr={stderr!r}'
+                )
+                self.assertIn(
+                    'Chain: 1 image(s)', stdout,
+                    f'{image_id}: expected a one-image chain; stdout={stdout!r}'
+                )
 
 
 class TestDifferencingParentAbsent(DifferencingTestBase):
@@ -569,38 +619,40 @@ class TestDifferencingParentAbsent(DifferencingTestBase):
     def test_convert_refuses_an_orphaned_child(self):
         """convert refuses, and does not complain about a missing parent."""
         for image_id, format_name in DIFFERENCING_FIXTURES:
-            orphan = self._orphaned_copy(image_id)
-            out = orphan.parent / 'out.raw'
-            stdout, stderr, rc = self.run_instar_convert(
-                orphan, out, output_format='raw'
-            )
-            self.assert_refused(
-                'convert', format_name, stdout, stderr, rc,
-                f'{image_id} (orphaned)'
-            )
-            self.assertNotIn(
-                'Backing file not found', stderr,
-                f'{image_id}: the refusal must not be contingent on the '
-                f'parent existing; stderr={stderr!r}'
-            )
-            self.assertFalse(
-                out.exists(),
-                f'{image_id}: orphaned convert left an output file'
-            )
+            with self.subTest(image=image_id):
+                orphan = self._orphaned_copy(image_id)
+                out = orphan.parent / 'out.raw'
+                stdout, stderr, rc = self.run_instar_convert(
+                    orphan, out, output_format='raw'
+                )
+                self.assert_refused(
+                    'convert', format_name, stdout, stderr, rc,
+                    f'{image_id} (orphaned)'
+                )
+                self.assertNotIn(
+                    'Backing file not found', stderr,
+                    f'{image_id}: the refusal must not be contingent on the '
+                    f'parent existing; stderr={stderr!r}'
+                )
+                self.assertFalse(
+                    out.exists(),
+                    f'{image_id}: orphaned convert left an output file'
+                )
 
     def test_check_refuses_an_orphaned_child(self):
         """check refuses an orphaned child for the same reason."""
         for image_id, format_name in DIFFERENCING_FIXTURES:
-            orphan = self._orphaned_copy(image_id)
-            stdout, stderr, rc = self.run_instar_check(orphan)
-            self.assert_refused(
-                'check', format_name, stdout, stderr, rc,
-                f'{image_id} (orphaned)'
-            )
-            self.assertNotIn(
-                'Backing file not found', stderr,
-                f'{image_id}: stderr={stderr!r}'
-            )
+            with self.subTest(image=image_id):
+                orphan = self._orphaned_copy(image_id)
+                stdout, stderr, rc = self.run_instar_check(orphan)
+                self.assert_refused(
+                    'check', format_name, stdout, stderr, rc,
+                    f'{image_id} (orphaned)'
+                )
+                self.assertNotIn(
+                    'Backing file not found', stderr,
+                    f'{image_id}: stderr={stderr!r}'
+                )
 
 
 class TestDifferencingNegativeControls(DifferencingTestBase):
@@ -617,90 +669,408 @@ class TestDifferencingNegativeControls(DifferencingTestBase):
     def test_convert_succeeds(self):
         """convert produces an output file and exits 0."""
         for image_id in NEGATIVE_CONTROL_FIXTURES:
-            source = self.differencing_image(image_id)
-            with tempfile.TemporaryDirectory() as tmp:
-                out = Path(tmp) / 'out.raw'
-                stdout, stderr, rc = self.run_instar_convert(
-                    source, out, output_format='raw'
-                )
-                self.assertEqual(
-                    0, rc,
-                    f'{image_id}: convert must still succeed; '
-                    f'stderr={stderr!r}'
-                )
-                self.assertTrue(
-                    out.exists() and out.stat().st_size > 0,
-                    f'{image_id}: convert produced no output'
-                )
+            with self.subTest(image=image_id):
+                source = self.differencing_image(image_id)
+                with tempfile.TemporaryDirectory() as tmp:
+                    out = Path(tmp) / 'out.raw'
+                    stdout, stderr, rc = self.run_instar_convert(
+                        source, out, output_format='raw'
+                    )
+                    self.assertEqual(
+                        0, rc,
+                        f'{image_id}: convert must still succeed; '
+                        f'stderr={stderr!r}'
+                    )
+                    self.assertTrue(
+                        out.exists() and out.stat().st_size > 0,
+                        f'{image_id}: convert produced no output'
+                    )
 
     def test_check_succeeds(self):
         """check reports a clean image and exits 0."""
         for image_id in NEGATIVE_CONTROL_FIXTURES:
-            source = self.differencing_image(image_id)
-            stdout, stderr, rc = self.run_instar_check(source)
-            self.assertEqual(
-                0, rc,
-                f'{image_id}: check must still succeed; stderr={stderr!r}'
-            )
-            self.assertIn(
-                'No errors were found', stdout,
-                f'{image_id}: stdout={stdout!r}'
-            )
+            with self.subTest(image=image_id):
+                source = self.differencing_image(image_id)
+                stdout, stderr, rc = self.run_instar_check(source)
+                self.assertEqual(
+                    0, rc,
+                    f'{image_id}: check must still succeed; stderr={stderr!r}'
+                )
+                self.assertIn(
+                    'No errors were found', stdout,
+                    f'{image_id}: stdout={stdout!r}'
+                )
 
     def test_measure_succeeds(self):
         """measure reports sizes and exits 0."""
         for image_id in NEGATIVE_CONTROL_FIXTURES:
-            source = self.differencing_image(image_id)
-            stdout, stderr, rc = self.run_instar_measure(source)
-            self.assertEqual(
-                0, rc,
-                f'{image_id}: measure must still succeed; stderr={stderr!r}'
-            )
-            self.assertIn(
-                'required size:', stdout, f'{image_id}: stdout={stdout!r}'
-            )
+            with self.subTest(image=image_id):
+                source = self.differencing_image(image_id)
+                stdout, stderr, rc = self.run_instar_measure(source)
+                self.assertEqual(
+                    0, rc,
+                    f'{image_id}: measure must still succeed; stderr={stderr!r}'
+                )
+                self.assertIn(
+                    'required size:', stdout, f'{image_id}: stdout={stdout!r}'
+                )
 
     def test_compare_self_is_identical(self):
         """compare of the parent with itself reports identical images."""
         for image_id in NEGATIVE_CONTROL_FIXTURES:
-            source = self.differencing_image(image_id)
-            stdout, stderr, rc = self.run_instar_compare(source, source)
-            self.assertEqual(
-                0, rc,
-                f'{image_id}: compare must still succeed; stderr={stderr!r}'
-            )
-            self.assertIn(
-                'Images are identical', stdout,
-                f'{image_id}: stdout={stdout!r}'
-            )
+            with self.subTest(image=image_id):
+                source = self.differencing_image(image_id)
+                stdout, stderr, rc = self.run_instar_compare(source, source)
+                self.assertEqual(
+                    0, rc,
+                    f'{image_id}: compare must still succeed; stderr={stderr!r}'
+                )
+                self.assertIn(
+                    'Images are identical', stdout,
+                    f'{image_id}: stdout={stdout!r}'
+                )
 
     def test_map_succeeds(self):
         """map emits extents and exits 0."""
         for image_id in NEGATIVE_CONTROL_FIXTURES:
-            source = self.differencing_image(image_id)
-            stdout, stderr, rc = self.run_instar_map(source)
-            self.assertEqual(
-                0, rc,
-                f'{image_id}: map must still succeed; stderr={stderr!r}'
-            )
-            rows = [
-                line for line in stdout.splitlines()
-                if line.strip() and not line.startswith('Offset')
-            ]
-            self.assertNotEqual(
-                [], rows,
-                f'{image_id}: map produced no extents; stdout={stdout!r}'
-            )
+            with self.subTest(image=image_id):
+                source = self.differencing_image(image_id)
+                stdout, stderr, rc = self.run_instar_map(source)
+                self.assertEqual(
+                    0, rc,
+                    f'{image_id}: map must still succeed; stderr={stderr!r}'
+                )
+                rows = [
+                    line for line in stdout.splitlines()
+                    if line.strip() and not line.startswith('Offset')
+                ]
+                self.assertNotEqual(
+                    [], rows,
+                    f'{image_id}: map produced no extents; stdout={stdout!r}'
+                )
 
     def test_info_reports_no_backing_file(self):
         """info shows no parent for a base disk."""
         for image_id in NEGATIVE_CONTROL_FIXTURES:
-            source = self.differencing_image(image_id)
-            stdout, stderr, rc = self.run_instar_info(source)
+            with self.subTest(image=image_id):
+                source = self.differencing_image(image_id)
+                stdout, stderr, rc = self.run_instar_info(source)
+                self.assertEqual(
+                    0, rc, f'{image_id}: info failed; stderr={stderr!r}'
+                )
+                self.assertNotIn(
+                    'backing file:', stdout,
+                    f'{image_id}: a base disk has no parent; stdout={stdout!r}'
+                )
+
+
+class TestDifferencingAdversarialLocators(DifferencingTestBase):
+    """The six hostile parent-locator fixtures.
+
+    These exist because the refusal changed what a hostile locator can
+    reach. Before it, a differencing VHD's parent name was never
+    decoded at all, so the content of these fields did not matter. Now
+    `info` decodes and prints them, and the host resolves them into an
+    "actual path" -- so the fixtures that were written to be nasty are
+    the ones that need assertions.
+
+    Two properties are pinned:
+
+    * the composing operations refuse them exactly like any other
+      differencing image, so a hostile locator is not a route to a read
+      instar would otherwise decline; and
+    * `info` *reports* the string without acting on it -- in particular
+      `--chain` stops at the one image rather than following the
+      locator to whatever it names.
+    """
+
+    def test_convert_refuses_every_locator_fixture(self):
+        """A hostile locator does not change the refusal."""
+        for image_id, _expected in ADVERSARIAL_LOCATOR_FIXTURES:
+            with self.subTest(image=image_id):
+                source = self.differencing_image(image_id)
+                with tempfile.TemporaryDirectory() as tmp:
+                    out = Path(tmp) / 'out.raw'
+                    stdout, stderr, rc = self.run_instar_convert(
+                        source, out, output_format='raw'
+                    )
+                    self.assert_refused(
+                        'convert', 'VHD', stdout, stderr, rc, image_id
+                    )
+                    self.assertFalse(
+                        out.exists(),
+                        f'{image_id}: convert must leave no output file'
+                    )
+
+    def test_check_refuses_every_locator_fixture(self):
+        """`check` refuses too, with exit 1 rather than 2."""
+        for image_id, _expected in ADVERSARIAL_LOCATOR_FIXTURES:
+            with self.subTest(image=image_id):
+                source = self.differencing_image(image_id)
+                stdout, stderr, rc = self.run_instar_check(source)
+                self.assert_refused(
+                    'check', 'VHD', stdout, stderr, rc, image_id
+                )
+
+    def test_info_reports_the_locator_without_following_it(self):
+        """`info` prints the hostile string and opens nothing.
+
+        `info --chain` is the assertion that matters. Every one of
+        these fixtures names a parent that instar must not walk to;
+        `vhd-diff-locator-etc-passwd` in particular names a path that
+        really does exist on the machine running the test, so a reader
+        that resolved-and-opened its locator would have something to
+        find. The chain must still be one image long.
+        """
+        for image_id, expected in ADVERSARIAL_LOCATOR_FIXTURES:
+            with self.subTest(image=image_id):
+                source = self.differencing_image(image_id)
+                stdout, stderr, rc = self.run_instar_info(source, chain=True)
+                self.assertEqual(
+                    0, rc,
+                    f'{image_id}: info must not refuse; stderr={stderr!r}'
+                )
+                self.assertIn(
+                    'Chain: 1 image(s)', stdout,
+                    f'{image_id}: the chain must stop at the child -- '
+                    f'instar cannot compose a parent, and these locators '
+                    f'must never be followed; stdout={stdout!r}'
+                )
+                self.assertIn(
+                    expected, stdout,
+                    f'{image_id}: expected the locator to be reported '
+                    f'verbatim; stdout={stdout!r}'
+                )
+
+    def test_info_json_names_the_parent_as_a_vhd(self):
+        """`backing-filename-format` says vpc, not qcow2.
+
+        `backing-filename-format` defaults to "qcow2" when no format is
+        recorded, which is right for a qcow2 v2 image with no
+        backing-format header extension. A differencing VHD has no such
+        extension either, but its parent is a VHD by definition --
+        SPEC(VHD) requires the parent to be the same format as the
+        child -- so the default would put a false claim in a field
+        callers parse.
+        """
+        for image_id, expected in ADVERSARIAL_LOCATOR_FIXTURES:
+            with self.subTest(image=image_id):
+                source = self.differencing_image(image_id)
+                stdout, _stderr, rc = self.run_instar_info(
+                    source, output_format='json'
+                )
+                self.assertEqual(0, rc, f'{image_id}: info must succeed')
+                data = json.loads(stdout)
+                self.assertEqual(
+                    'vpc', data.get('backing-filename-format'),
+                    f'{image_id}: a differencing VHD\'s parent is a VHD; '
+                    f'got {data.get("backing-filename-format")!r}'
+                )
+                self.assertIn(
+                    expected, data.get('backing-filename', ''),
+                    f'{image_id}: expected the locator reported verbatim '
+                    f'in JSON; got {data.get("backing-filename")!r}'
+                )
+
+
+class TestDifferencingInfoValidatesTheDynamicHeader(DifferencingTestBase):
+    """`info` will not decode a parent name out of arbitrary bytes.
+
+    A VHD footer's `disk_type` and `data_offset` are both image-
+    controlled. Without a cookie check, an image can claim
+    `disk_type = 4` and point `data_offset` at any offset in the file,
+    and `info` would decode 512 bytes from there as UTF-16BE and print
+    them as `backing file:` -- untrusted content promoted into a
+    structured, user-facing field. `crates/vhd` guards its own reads of
+    this structure with the `cxsparse` cookie, and `info` now calls
+    that same parser rather than trusting the offset.
+
+    The image is built here rather than shipped as a fixture: it is one
+    field and two checksums away from `vhd-diff-child-aligned`, and
+    building it in the test keeps the patch visible next to the
+    assertion.
+    """
+
+    FOOTER_SIZE = 512
+    FOOTER_DATA_OFFSET = 16
+    FOOTER_CHECKSUM_OFFSET = 64
+
+    def _repair_footer_checksum(self, data: bytearray, offset: int) -> None:
+        """Recompute one VHD footer's ones-complement checksum in place."""
+        data[offset + self.FOOTER_CHECKSUM_OFFSET:
+             offset + self.FOOTER_CHECKSUM_OFFSET + 4] = b'\x00\x00\x00\x00'
+        total = sum(data[offset:offset + self.FOOTER_SIZE]) & 0xffffffff
+        checksum = (~total) & 0xffffffff
+        data[offset + self.FOOTER_CHECKSUM_OFFSET:
+             offset + self.FOOTER_CHECKSUM_OFFSET + 4] = \
+            checksum.to_bytes(4, 'big')
+
+    def _build_image_with_bogus_data_offset(
+        self, destination: Path, data_offset: int, plant: bytes = b''
+    ) -> None:
+        """Copy the aligned child, repointing `data_offset` at `data_offset`.
+
+        Both footers (the copy at offset 0 and the real one at the end
+        of the file) are patched and re-checksummed, so the image stays
+        structurally valid apart from the one field under test.
+        """
+        source = self.differencing_image('vhd-diff-child-aligned')
+        data = bytearray(source.read_bytes())
+        if plant:
+            # `data_offset + 64` is where the parent unicode name lives.
+            at = data_offset + 64
+            data[at:at + len(plant)] = plant
+        for offset in (0, len(data) - self.FOOTER_SIZE):
+            data[offset + self.FOOTER_DATA_OFFSET:
+                 offset + self.FOOTER_DATA_OFFSET + 8] = \
+                data_offset.to_bytes(8, 'big')
+            self._repair_footer_checksum(data, offset)
+        destination.write_bytes(data)
+
+    def test_info_ignores_a_parent_name_outside_a_dynamic_header(self):
+        """Text reachable via a bogus `data_offset` is not a backing file."""
+        planted = 'PWNED-SECRET.vhd'.encode('utf-16-be') + b'\x00\x00'
+        with tempfile.TemporaryDirectory() as tmp:
+            image = Path(tmp) / 'bogus-data-offset.vhd'
+            # 0x1fffc0 + 64 == 0x200000, comfortably inside the image's
+            # data region and nowhere near a `cxsparse` cookie.
+            self._build_image_with_bogus_data_offset(
+                image, 0x1fffc0, plant=planted
+            )
+            stdout, stderr, rc = self.run_instar_info(image)
             self.assertEqual(
-                0, rc, f'{image_id}: info failed; stderr={stderr!r}'
+                0, rc, f'info must still succeed; stderr={stderr!r}'
             )
             self.assertNotIn(
-                'backing file:', stdout,
-                f'{image_id}: a base disk has no parent; stdout={stdout!r}'
+                'PWNED-SECRET', stdout,
+                'info decoded image content as a parent name: the '
+                'dynamic-header cookie check is not doing its job; '
+                f'stdout={stdout!r}'
             )
+            self.assertNotIn(
+                'backing file', stdout,
+                'no parent should be reported when `data_offset` does '
+                f'not point at a dynamic header; stdout={stdout!r}'
+            )
+
+    def test_the_composing_ops_do_not_read_it(self):
+        """The same image is not converted either -- it fails, and writes
+        nothing.
+
+        The message here is the *generic* "convert operation failed",
+        not the differencing refusal, and that is correct rather than a
+        gap: the differencing refusal in `init_chain_states` reads
+        `VhdState`, and `VhdState::init` cannot build one without a
+        valid `cxsparse` dynamic header. An image with a bogus
+        `data_offset` is malformed, so it fails as malformed before its
+        disk type is ever consulted.
+
+        What matters is the property #547 was filed over, and it holds:
+        no output file is produced and the exit code is non-zero. This
+        test exists so that a future change that starts *reading* such
+        an image -- composing it as though it had no parent, which is
+        the original defect -- fails here.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            image = Path(tmp) / 'bogus-data-offset.vhd'
+            self._build_image_with_bogus_data_offset(image, 0x1fffc0)
+            out = Path(tmp) / 'out.raw'
+            _stdout, stderr, rc = self.run_instar_convert(
+                image, out, output_format='raw'
+            )
+            self.assertNotEqual(
+                0, rc,
+                f'a malformed differencing VHD must not convert; '
+                f'stderr={stderr!r}'
+            )
+            # The typed refusal unlinks its output; a generic failure
+            # leaves the stub `BackingStore::open` created. Either way
+            # no sector was composed, which is the property that
+            # matters -- so assert on the content, not the inode.
+            self.assertEqual(
+                0, out.stat().st_size if out.exists() else 0,
+                'no image content may be written for an image instar '
+                'could not read'
+            )
+
+
+class TestDifferencingCreateRefusesAsBacking(DifferencingTestBase):
+    """`create -b <differencing image>` fails closed.
+
+    Removing `VhdxState::init`'s blanket `has_parent` rejection (so the
+    read entry points could refuse with a reason instead of failing
+    anonymously) also removed the only thing stopping `create` from
+    accepting a differencing VHDX as a backing file. An overlay on a
+    base every read path refuses is a chain that can never be read
+    back, so `create` now refuses both formats explicitly.
+
+    The plain dynamic parents of the same chains must keep working --
+    that is what separates "refuses a differencing base" from "refuses
+    a VHD base".
+    """
+
+    EXPECTED = (
+        'backing file is a differencing VHD or VHDX whose parent instar '
+        'cannot yet compose'
+    )
+
+    BACKING_FORMAT = {'VHD': 'vpc', 'VHDX': 'vhdx'}
+
+    def _create_overlay(self, tmp, base, backing_format):
+        """`instar create -f qcow2 -b <base> -F <fmt>` into a temp dir."""
+        instar = self.get_instar_binary()
+        overlay = Path(tmp) / 'overlay.qcow2'
+        r = subprocess.run(
+            [str(instar), 'create', '-f', 'qcow2', '-b', str(base),
+             '-F', backing_format, str(overlay)],
+            capture_output=True, text=True, timeout=60
+        )
+        return overlay, r.stdout, r.stderr, r.returncode
+
+    def test_create_refuses_a_differencing_backing_file(self):
+        """Every differencing fixture is refused as `-b`."""
+        for image_id, format_name in DIFFERENCING_FIXTURES:
+            with self.subTest(image=image_id):
+                source = self.differencing_image(image_id)
+                with tempfile.TemporaryDirectory() as tmp:
+                    base = Path(tmp) / source.name
+                    shutil.copy(source, base)
+                    overlay, stdout, stderr, rc = self._create_overlay(
+                        tmp, base, self.BACKING_FORMAT[format_name]
+                    )
+                    self.assertNotEqual(
+                        0, rc,
+                        f'{image_id}: create -b must fail; '
+                        f'stdout={stdout!r}'
+                    )
+                    self.assertIn(
+                        self.EXPECTED, stderr,
+                        f'{image_id}: expected the differencing reason, '
+                        f'not a generic parse failure; stderr={stderr!r}'
+                    )
+                    self.assertFalse(
+                        overlay.exists(),
+                        f'{image_id}: no overlay should be left behind'
+                    )
+
+    def test_create_accepts_the_plain_parents(self):
+        """The negative control: a dynamic VHD/VHDX base still works."""
+        for image_id in NEGATIVE_CONTROL_FIXTURES:
+            with self.subTest(image=image_id):
+                source = self.differencing_image(image_id)
+                fmt = 'vhdx' if image_id.startswith('vhdx') else 'vpc'
+                with tempfile.TemporaryDirectory() as tmp:
+                    base = Path(tmp) / source.name
+                    shutil.copy(source, base)
+                    overlay, stdout, stderr, rc = self._create_overlay(
+                        tmp, base, fmt
+                    )
+                    self.assertEqual(
+                        0, rc,
+                        f'{image_id}: a plain dynamic base must still be '
+                        f'accepted; stderr={stderr!r}'
+                    )
+                    self.assertTrue(
+                        overlay.exists(),
+                        f'{image_id}: overlay was not created'
+                    )

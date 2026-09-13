@@ -239,6 +239,7 @@ const CREATE_RESULT_ERROR_WRITE_FAILED: u32 = 7;
 const CREATE_RESULT_ERROR_UNSUPPORTED_FORMAT: u32 = 8;
 const CREATE_RESULT_ERROR_BACKING_FORMAT_UNSUPPORTED: u32 = 9;
 const CREATE_RESULT_ERROR_BACKING_SIZE_TOO_LARGE: u32 = 10;
+const CREATE_RESULT_ERROR_BACKING_DIFFERENCING: u32 = 11;
 
 // ResizeConfig constants (must match shared crate)
 const RESIZE_CONFIG_MAGIC: u32 = 0x52455349; // "RESI"
@@ -815,7 +816,10 @@ impl SerialDecoder {
     /// decoder captured. If the guest reported a refusal, name the
     /// operation and the format, following `map_error_message`'s
     /// wording (`:15053`) for the same fact on the `map` path;
-    /// otherwise fall back to the generic message.
+    /// otherwise fall back to the generic message. The plan is named but
+    /// its phase numbers are not: AGENTS.md keeps phase numbers inside
+    /// `docs/plans/`, and this string reaches a user of an installed .deb
+    /// who has neither the plan nor its numbering.
     fn differencing_refusal_error(&self, op: &str) -> String {
         match self.last_differencing_refusal {
             Some(status) => {
@@ -827,7 +831,7 @@ impl SerialDecoder {
                 format!(
                     "{op}: source is a differencing {format_name} image whose parent \
                      instar cannot yet compose; composition is deferred (see \
-                     PLAN-differencing.md phases 11-16)"
+                     PLAN-differencing.md)"
                 )
             }
             None => format!("{op}: guest did not return a result"),
@@ -937,7 +941,7 @@ mod guest_exception_tests {
             msg.contains("convert: source is a differencing VHD image"),
             "{msg}"
         );
-        assert!(msg.contains("PLAN-differencing.md phases 11-16"), "{msg}");
+        assert!(msg.contains("(see PLAN-differencing.md)"), "{msg}");
 
         let mut decoder = super::SerialDecoder::new();
         decoder.last_differencing_refusal = Some(shared::DifferencingRefusal::STATUS_VHDX);
@@ -1844,11 +1848,23 @@ fn print_info_result_json(
     // qemu-img emits NO "backing-filename-format" key for qcow — the
     // qcow1-backing JSON baseline confirms — so suppress it by format.
     if has_backing_file && info.format != "qcow" {
-        // Use the format from header extension if available, otherwise default to qcow2
-        let backing_format = if !info.qcow2_info.backing_format.is_empty() {
-            info.qcow2_info.backing_format.as_str()
-        } else {
-            "qcow2"
+        // Use the format from header extension if available, otherwise
+        // default to qcow2.
+        //
+        // A differencing VHD or VHDX is the exception: its "backing
+        // file" is a parent recorded in the image's own header, and
+        // SPEC(VHD)/SPEC(VHDX) both require that parent to be of the
+        // same format as the child. There is no header extension to
+        // read, so the qcow2 default would assert -- in a machine-read
+        // field -- that a .vhd's parent is a qcow2. Name the format the
+        // spec guarantees instead.
+        let backing_format = match info.format.as_str() {
+            "vpc" => "vpc",
+            "vhdx" => "vhdx",
+            _ if !info.qcow2_info.backing_format.is_empty() => {
+                info.qcow2_info.backing_format.as_str()
+            }
+            _ => "qcow2",
         };
         println!("    \"backing-filename-format\": \"{backing_format}\",");
     }
@@ -13384,14 +13400,20 @@ fn execute_convert(
         // `send_error` and is rendered here in place of the generic text
         // (PLAN-differencing phase 4, closing issue #547).
         if serial_decoder.last_differencing_refusal.is_some() {
-            // Remove the output the host created up-front. Nothing was
-            // written to it, and leaving a zero-filled stub behind after
-            // refusing to compose is exactly the "success-shaped wrong
-            // answer" this refusal exists to prevent: a caller that tests
-            // for the file's existence would conclude the convert ran.
-            // Only files this run created are removed -- `--no-create`
-            // targets an image the user supplied, which is never ours to
-            // delete.
+            // Remove the output path. Nothing was written to it, and
+            // leaving a zero-filled stub behind after refusing to compose
+            // is exactly the "success-shaped wrong answer" this refusal
+            // exists to prevent: a caller that tests for the file's
+            // existence would conclude the convert ran.
+            //
+            // `!no_create` is the test for "convert owns this path", not
+            // for "this run created the file": without `--no-create`,
+            // `BackingStore::open` has already created *or truncated* the
+            // target, so a pre-existing file's contents are gone by the
+            // time we get here either way and unlinking destroys nothing
+            // that survived. Under `--no-create` the target is an image
+            // the user supplied for us to write into, which is never ours
+            // to delete.
             if !exec.no_create {
                 let _ = std::fs::remove_file(&exec.output);
                 if let Some((ref flat_path, _)) = flat_extent_path {
@@ -17528,6 +17550,11 @@ fn create_error_detail(code: u32) -> &'static str {
              requested options (try a larger cluster size, switch to \
              a target format with greater virtual-size headroom, or \
              pass an explicit SIZE that fits)"
+        }
+        CREATE_RESULT_ERROR_BACKING_DIFFERENCING => {
+            "backing file is a differencing VHD or VHDX whose parent \
+             instar cannot yet compose; an overlay on it could not be \
+             read back (see PLAN-differencing.md)"
         }
         _ => "unknown error",
     }

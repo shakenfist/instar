@@ -1903,7 +1903,7 @@ class TestCheckVhdDifferencing(InstarTestBase):
         self.assertIn(
             'check: source is a differencing VHD image whose parent '
             'instar cannot yet compose; composition is deferred '
-            '(see PLAN-differencing.md phases 11-16)',
+            '(see PLAN-differencing.md)',
             stderr,
             f'unexpected stderr: {stderr!r}'
         )

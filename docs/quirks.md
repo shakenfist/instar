@@ -4187,7 +4187,7 @@ by this phase to state plainly that qemu does not deprecate it. QED
 detection and refusal behaviour is unchanged by this correction — it
 is a documentation-accuracy fix, not a functional one.
 
-## VHD/VHDX differencing: qemu-parity silent misread, and an asymmetry between the two formats
+## VHD/VHDX differencing: instar refuses where qemu-img silently misreads
 
 Recorded by step 1c of
 [PLAN-differencing-phase-01-pin.md](plans/PLAN-differencing-phase-01-pin.md),
@@ -4207,8 +4207,8 @@ filed as [issue #547](https://github.com/shakenfist/instar/issues/547) and
 matched qemu-img's silent VHD misread and shared VHDX's undiagnosed
 failure. Phase 4 of the differencing plan (commit `10ab838`) replaced both
 with one typed refusal at every read entry point that composes sector data,
-plus `info` reporting the parent instead of staying silent; phases 11-16
-will implement real chain composition. qemu-img's own behaviour has not
+plus `info` reporting the parent instead of staying silent; real chain
+composition remains future work in the same plan. qemu-img's own behaviour has not
 changed, which is why it is re-quoted below rather than removed: it is the
 baseline that makes instar's refusal a **deliberate divergence** rather
 than newly-matched parity. Each "Observed Behavior" subsection below
@@ -4256,7 +4256,7 @@ divergence — instar matches qemu-img's refusal to create either format,
 because it has not yet implemented the differencing emitters this plan
 adds.
 
-### The read-side asymmetry: VHD is silently mis-composed, VHDX is refused outright
+### How qemu-img reads a differencing image, and what instar used to do
 
 **Classification: closes an Unsafe Quirk** (qemu-img's side — silently
 wrong output, exit 0 — is unchanged and not deliberate policy on its part;
@@ -4398,16 +4398,14 @@ oracle pair used above, generated for this plan's phase 2):
 ```
 $ instar convert -O raw vhd-diff-child-aligned.vhd out.raw
 convert: source is a differencing VHD image whose parent instar cannot
-yet compose; composition is deferred (see PLAN-differencing.md phases
-11-16)
+yet compose; composition is deferred (see PLAN-differencing.md)
 $ echo $?
 1
 $ ls out.raw
 ls: cannot access 'out.raw': No such file or directory
 $ instar convert -O raw vhdx-diff-child.vhdx out.raw
 convert: source is a differencing VHDX image whose parent instar cannot
-yet compose; composition is deferred (see PLAN-differencing.md phases
-11-16)
+yet compose; composition is deferred (see PLAN-differencing.md)
 $ echo $?
 1
 $ instar info vhd-diff-child-aligned.vhd
@@ -4430,8 +4428,8 @@ already tested. **instar is now the stricter side of this divergence,
 not the matching one**: qemu-img 10.0.11 still does exactly what the
 "Observed Behavior" above shows — silently misreading a differencing VHD
 and generically failing to open a differencing VHDX — and has not
-changed. Composition (making both tools agree, correctly) is
-[PLAN-differencing.md](plans/PLAN-differencing.md) phases 11-16.
+changed. Composition (making both tools agree, correctly) is future work
+tracked in [PLAN-differencing.md](plans/PLAN-differencing.md).
 
 ### Per-op behaviour inside instar before phase 4
 
@@ -4488,19 +4486,19 @@ with no output file left behind:
 |----|---------------------|----------------------|
 | info | Succeeds, rc 0, **now reports the parent** as a backing file (decision 4 — `info` composes nothing, so it has no wrong answer to give) | Succeeds, rc 0, now reports the parent (with the "actual path" caveat below) |
 | map | Refuses, rc 1, same message as before: `"map: source has a backing/parent reference; chain composition is deferred (see PLAN-map.md)"`, guest error code 3 | **Newly** refuses, rc 1, the *same* message and error code — VHDX's old blanket `VhdxState::init` rejection was removed, so `map` needed its own VHDX arm added, using its existing `ERROR_HAS_BACKING` rather than the new channel |
-| check | **Newly refuses**, rc 1: `"check: source is a differencing VHD image whose parent instar cannot yet compose; composition is deferred (see PLAN-differencing.md phases 11-16)"`; the corruption exit code (2) does not apply, since the image is not corrupt | **Changed message and exit code**: same refusal sentence naming VHDX, rc 1 (was rc 2, `"1 errors were found on the image."`) |
+| check | **Newly refuses**, rc 1: `"check: source is a differencing VHD image whose parent instar cannot yet compose; composition is deferred (see PLAN-differencing.md)"`; the corruption exit code (2) does not apply, since the image is not corrupt | **Changed message and exit code**: same refusal sentence naming VHDX, rc 1 (was rc 2, `"1 errors were found on the image."`) |
 | convert | **Newly refuses**, rc 1, no longer silently composes without the parent; leaves no output file | Refuses, rc 1, now with the named sentence instead of the generic `"convert operation failed"` |
 | compare | **Newly refuses**, rc 1, no longer reports `"Images are identical."` against itself | Refuses, rc 1, now with the named sentence instead of `"Content mismatch at offset 0!"` — the string #548 was filed over |
 | dd | **Newly refuses**, rc 1, same sentence as convert (`dd` shares convert's guest binary — the only place in the tree that records this) | Refuses, rc 1, same sentence as convert |
 | bench | **Newly refuses**, rc 1, no longer runs the read benchmark | Refuses, rc 1, now with the named sentence instead of `Error: "bench: failed to parse the image"` |
 | measure | **Newly refuses**, rc 1, no longer reports a required-size estimate | Refuses, rc 1, now with the named sentence instead of `"measure: source image is unsupported format"` |
+| create `-b` | **Newly refuses**, rc 1: `"create failed: backing file is a differencing VHD or VHDX whose parent instar cannot yet compose; an overlay on it could not be read back (see PLAN-differencing.md)"` — the VHD arm never had a guard | **Newly refuses** with the same message; the old blanket `VhdxState::init` rejection used to do this implicitly, so this restores it with a reason attached rather than a generic parse failure |
 
 The refusal sentence (for every row marked with it) is:
 
 ```
 <op>: source is a differencing <VHD|VHDX> image whose parent instar cannot
-yet compose; composition is deferred (see PLAN-differencing.md phases
-11-16)
+yet compose; composition is deferred (see PLAN-differencing.md)
 ```
 
 VHD is where the fix matters most, because VHD was the format actually at
@@ -4556,7 +4554,7 @@ $ echo $?
 
 libvhdi's stance — refuse when there is no parent to compose against,
 verify identity when there is one — is the shape of the fix phase 4 shipped
-and phases 11-16 move instar toward next: a typed refusal now, and
+and the composition work moves instar toward next: a typed refusal now, and
 identity-checked composition later. It is quoted here as the contrast that
 makes plain that neither qemu-img's nor pre-phase-4 instar's behaviour was
 a reasonable "reading without a parent" default; it was simply unimplemented
@@ -4584,11 +4582,14 @@ than fixed, because none of them is this phase's job to close:
    parent.** VHDX parent locators are Windows-shaped
    (e.g. `.\vhdx-diff-parent.vhdx`), and the host renders that as a POSIX
    path, producing a filename containing a literal backslash that cannot
-   exist on the filesystem. Path normalisation is phase 11's work. See
+   exist on the filesystem. Path normalisation belongs with the composition
+   work in [PLAN-differencing.md](plans/PLAN-differencing.md). See
    [info.md](info.md#known-limitations).
 3. **`instar resize` still accepts a differencing VHDX.** This is a write
-   path, predates this plan, and `resize` never called `VhdxState::init`,
-   so phase 4 neither caused it nor fixes it. See
+   path, predates the differencing work, and `resize` never called
+   `VhdxState::init`, so the read-side refusal neither caused it nor fixes
+   it. Tracked as
+   [issue #565](https://github.com/shakenfist/instar/issues/565); see
    [resize.md](resize.md#known-limitations).
 
 ## Future Additions

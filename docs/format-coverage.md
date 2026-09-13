@@ -280,8 +280,8 @@ format, so it gets no row of its own in the tables. Every op in the
 read-side table that composes sector data — `convert`, `dd`, `compare`,
 `bench`, `check`, `measure` — refuses a differencing source by name
 instead of reading it, because instar cannot yet compose the parent's
-data into the read; composition is
-[PLAN-differencing.md](plans/PLAN-differencing.md) phases 11-16. `map`
+data into the read; composition is future work tracked in
+[PLAN-differencing.md](plans/PLAN-differencing.md). `map`
 refuses too, with its own older message and error code. `info` is the
 one exception in the table: it reports the parent as a backing file and
 does not refuse, because it composes no sector data and has no wrong
@@ -296,7 +296,7 @@ that behaviour; it refuses by name instead. On a differencing VHDX,
 qemu-img's own `info` cannot open the file at all ("Operation not
 supported"), which is the shape of undiagnosed failure issue #548 was
 filed over on the instar side before this refusal existed. See
-[quirks.md](quirks.md#vhdvhdx-differencing-qemu-parity-silent-misread-and-an-asymmetry-between-the-two-formats)
+[quirks.md](quirks.md#vhdvhdx-differencing-instar-refuses-where-qemu-img-silently-misreads)
 for the full command transcripts, the exact refusal wording, and the
 per-op record before and after the fix (commit `10ab838`).
 

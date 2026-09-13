@@ -3430,6 +3430,14 @@ impl CreateResult {
     /// host can suggest "try a larger cluster size or a different
     /// target format" rather than the generic INVALID_SIZE.
     pub const ERROR_BACKING_SIZE_TOO_LARGE: u32 = 10;
+    /// Backing image is a differencing VHD or VHDX. Instar cannot
+    /// compose a parent yet and every read path refuses such an image,
+    /// so an overlay stacked on one would be unreadable. Distinguished
+    /// from BACKING_PARSE_FAILED because the backing header parsed
+    /// perfectly well -- saying "truncated, corrupted, or an
+    /// unrecognised format" about a valid image is the same undiagnosed
+    /// failure issue #548 was filed over.
+    pub const ERROR_BACKING_DIFFERENCING: u32 = 11;
 
     /// True if magic matches.
     pub fn is_valid(&self) -> bool {

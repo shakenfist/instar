@@ -56,6 +56,21 @@ for when the rest of the tool declines to read the image. See the
 "VHD/VHDX differencing" section of [quirks.md](quirks.md) for the full
 per-op record.
 
+`backing-filename-format` reports `vpc` or `vhdx` to match the child,
+not the `qcow2` that field defaults to when no backing format is
+recorded. A differencing image records no backing-format field of its
+own, but SPEC(VHD) and SPEC(VHDX) both require a parent to be the same
+format as its child, so the format is known without one.
+
+**A reported parent is not a resolved parent.** `info` decodes the
+parent name and the parent locator entries from the image's own header
+and prints what it finds; it does not open the result, and `--chain`
+stops at the one image (see [chain-discovery.md](chain-discovery.md)).
+A parent locator is attacker-controlled data — it can name an absolute
+path, a relative traversal, a UNC share or a URL — so treat
+`backing-filename` on a differencing image as a string the image
+claims, not a file instar has validated.
+
 ## Known limitations
 
 ### VHDX parent "actual path" can contain a literal backslash
