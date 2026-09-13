@@ -1872,8 +1872,22 @@ class TestCheckVhdFixed(InstarTestBase):
 class TestCheckVhdDifferencing(InstarTestBase):
     """Tests for check operation with differencing VHD (disk_type=4)."""
 
-    def test_check_vhd_differencing_detects_vpc(self):
-        """Check detects differencing VHD as vpc/vhd format."""
+    def test_check_vhd_differencing_refused(self):
+        """Check refuses a differencing VHD rather than reporting on it.
+
+        This test previously asserted that check succeeded (exit 0,
+        zero corruptions) on a differencing VHD. That answer was only
+        correct because check was silently reading the child's
+        parent-owned sectors as zeroes. PLAN-differencing phase 4
+        replaced it with an explicit refusal: check exits 1 -- not 2,
+        which is its corruption code, because a differencing image is
+        incomplete rather than corrupt -- and names the deferral.
+
+        The refusal is pinned in detail, across every operation and
+        both formats, in tests/test_differencing.py; this test remains
+        here so the check-format matrix records the change of answer
+        at the point where the old answer lived.
+        """
         image = self.get_image('vhd-differencing')
         if not image.path.exists():
             self.skipTest(f'Test image not found: {image.path}')
@@ -1882,17 +1896,16 @@ class TestCheckVhdDifferencing(InstarTestBase):
             image.path, output_format='json'
         )
         self.assertEqual(
-            0, rc,
-            f'check should succeed for differencing VHD: {stderr}'
+            1, rc,
+            f'check should refuse a differencing VHD with exit 1: '
+            f'stdout={stdout!r} stderr={stderr!r}'
         )
-        result = json.loads(stdout)
         self.assertIn(
-            result.get('format', '').lower(), ('vpc', 'vhd'),
-            f'Expected vpc/vhd format for differencing VHD: {stdout}'
-        )
-        self.assertEqual(
-            result.get('corruptions', 0), 0,
-            f'No corruptions expected: {stdout}'
+            'check: source is a differencing VHD image whose parent '
+            'instar cannot yet compose; composition is deferred '
+            '(see PLAN-differencing.md phases 11-16)',
+            stderr,
+            f'unexpected stderr: {stderr!r}'
         )
 
     def test_info_vhd_differencing_format(self):
