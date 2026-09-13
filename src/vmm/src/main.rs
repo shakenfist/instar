@@ -768,6 +768,16 @@ struct SerialDecoder {
     /// run loop that ends without a result can say *why* (issue #375)
     /// instead of the opaque "guest did not return a result".
     last_cpu_exception: Option<(u32, u64)>,
+    /// The last differencing-image read refusal the guest reported, as
+    /// the `status` field of an `error` message whose `operation` is
+    /// `shared::DifferencingRefusal::OPERATION` (one of that type's
+    /// `STATUS_*` constants). Sibling to `last_cpu_exception`, following
+    /// the same issue #375 pattern: `convert`, `compare` and `check` have
+    /// no result struct to carry this fact, so it travels on `send_error`
+    /// instead and is captured here for a resultless run loop to explain.
+    #[allow(dead_code)]
+    // Wired into the read entry points by PLAN-differencing phase 4 step 4b.
+    last_differencing_refusal: Option<u32>,
 }
 
 /// Maximum serial decoder buffer size: frame header + max protobuf message
@@ -779,6 +789,7 @@ impl SerialDecoder {
         Self {
             buffer: VecDeque::new(),
             last_cpu_exception: None,
+            last_differencing_refusal: None,
         }
     }
 
@@ -792,6 +803,36 @@ impl SerialDecoder {
                 "{op}: guest CPU exception: {} at guest RIP 0x{rip:x}",
                 exception_name(vector)
             ),
+            None => format!("{op}: guest did not return a result"),
+        }
+    }
+
+    /// Format the terminal error for a read entry point that refused a
+    /// differencing (parent-referencing) VHD or VHDX source. Sibling to
+    /// [`Self::no_result_error`], following the same issue #375 pattern:
+    /// `convert`, `compare` and `check` have no result struct (and
+    /// `CompareResult`/`CheckResult` carry no error codes) to hold a
+    /// per-op error code, so the guest reports the refusal over
+    /// `send_error` instead and this formatter renders whatever the
+    /// decoder captured. If the guest reported a refusal, name the
+    /// operation and the format, following `map_error_message`'s
+    /// wording (`:15053`) for the same fact on the `map` path;
+    /// otherwise fall back to the generic message.
+    #[allow(dead_code)] // Wired into the read entry points by PLAN-differencing phase 4 step 4b.
+    fn differencing_refusal_error(&self, op: &str) -> String {
+        match self.last_differencing_refusal {
+            Some(status) => {
+                let format_name = match status {
+                    shared::DifferencingRefusal::STATUS_VHD => "VHD",
+                    shared::DifferencingRefusal::STATUS_VHDX => "VHDX",
+                    _ => "image",
+                };
+                format!(
+                    "{op}: source is a differencing {format_name} image whose parent \
+                     instar cannot yet compose; composition is deferred (see \
+                     PLAN-differencing.md phases 11-16)"
+                )
+            }
             None => format!("{op}: guest did not return a result"),
         }
     }
@@ -831,6 +872,8 @@ impl SerialDecoder {
             if let Some(guest_::GuestMessage_::Payload::Error(err)) = &msg.payload {
                 if err.operation == "cpu-exception" {
                     self.last_cpu_exception = Some((err.status, err.sector));
+                } else if err.operation == shared::DifferencingRefusal::OPERATION {
+                    self.last_differencing_refusal = Some(err.status);
                 }
             }
             return Some(msg);
@@ -877,6 +920,35 @@ mod guest_exception_tests {
         assert!(msg.contains("amend: guest CPU exception"), "{msg}");
         assert!(msg.contains("invalid opcode (#UD)"), "{msg}");
         assert!(msg.contains("0x300ec"), "{msg}");
+    }
+
+    #[test]
+    fn differencing_refusal_error_is_generic_without_a_refusal() {
+        let decoder = super::SerialDecoder::new();
+        assert_eq!(
+            decoder.differencing_refusal_error("convert"),
+            "convert: guest did not return a result"
+        );
+    }
+
+    #[test]
+    fn differencing_refusal_error_names_the_format_when_captured() {
+        let mut decoder = super::SerialDecoder::new();
+        decoder.last_differencing_refusal = Some(shared::DifferencingRefusal::STATUS_VHD);
+        let msg = decoder.differencing_refusal_error("convert");
+        assert!(
+            msg.contains("convert: source is a differencing VHD image"),
+            "{msg}"
+        );
+        assert!(msg.contains("PLAN-differencing.md phases 11-16"), "{msg}");
+
+        let mut decoder = super::SerialDecoder::new();
+        decoder.last_differencing_refusal = Some(shared::DifferencingRefusal::STATUS_VHDX);
+        let msg = decoder.differencing_refusal_error("compare");
+        assert!(
+            msg.contains("compare: source is a differencing VHDX image"),
+            "{msg}"
+        );
     }
 }
 

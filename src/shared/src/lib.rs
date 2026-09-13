@@ -2932,6 +2932,44 @@ impl MapResult {
 }
 
 // ============================================================================
+// Differencing-image read refusal signal
+// ============================================================================
+
+/// The `send_error` channel used to report that a read entry point
+/// refused a differencing (parent-referencing) VHD or VHDX source.
+///
+/// `convert`, `compare` and `check` have no result struct (and
+/// `CompareResult`/`CheckResult` carry no error codes), so a per-op
+/// error code cannot carry this fact. This mirrors the mechanism
+/// issue #375 built for guest CPU exceptions: the guest calls the
+/// call table's `send_error(operation, device, sector, status)`
+/// (`src/core/src/main.rs:430`) with [`DifferencingRefusal::OPERATION`]
+/// as the operation string and one of the `STATUS_*` constants as
+/// the status; the host's `SerialDecoder` captures it the same way
+/// it captures `op=cpu-exception`, and a sibling formatter renders
+/// it in place of the generic "guest did not return a result" text.
+///
+/// `map` is not migrated to this channel: it already refuses via
+/// `MapResult::ERROR_HAS_BACKING` and that path is unchanged.
+pub struct DifferencingRefusal;
+
+impl DifferencingRefusal {
+    /// Reserved `send_error` operation marker for this signal.
+    /// Distinct from every real operation name and from
+    /// `"cpu-exception"`, so the host's decoder can tell the two
+    /// `send_error` uses apart.
+    pub const OPERATION: &'static str = "differencing";
+
+    // Status codes are stable: only appended, never reordered.
+    /// The source is a differencing VHD (`disk_type ==
+    /// DISK_TYPE_DIFFERENCING`).
+    pub const STATUS_VHD: u32 = 1;
+    /// The source is a differencing VHDX (`HasParent` set on the
+    /// metadata region).
+    pub const STATUS_VHDX: u32 = 2;
+}
+
+// ============================================================================
 // Snapshot configuration and result structures
 // ============================================================================
 
@@ -5942,6 +5980,27 @@ mod tests {
         assert_eq!(MapResult::ERROR_INVALID_OPTION, 2);
         assert_eq!(MapResult::ERROR_HAS_BACKING, 3);
         assert_eq!(MapResult::ERROR_IO, 4);
+    }
+
+    #[test]
+    fn differencing_refusal_operation_marker_is_distinct_from_cpu_exception() {
+        // The host tells the two `send_error` uses apart by comparing
+        // `err.operation` against each marker string, so they must
+        // never collide.
+        assert_eq!(DifferencingRefusal::OPERATION, "differencing");
+        assert_ne!(DifferencingRefusal::OPERATION, "cpu-exception");
+    }
+
+    #[test]
+    fn differencing_refusal_status_codes_are_stable_and_distinct() {
+        // Pinned: appended only, never reordered (see the doc comment
+        // on DifferencingRefusal).
+        assert_eq!(DifferencingRefusal::STATUS_VHD, 1);
+        assert_eq!(DifferencingRefusal::STATUS_VHDX, 2);
+        assert_ne!(
+            DifferencingRefusal::STATUS_VHD,
+            DifferencingRefusal::STATUS_VHDX
+        );
     }
 
     #[test]
