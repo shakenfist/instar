@@ -140,7 +140,7 @@ directly relevant the moment instar parses a locator table.
 The host is further along than the rest of this picture
 suggests, which phase 1's survey established and which matters
 most to phase 11. `discover_backing_chain`
-(`src/vmm/src/main.rs:2416`) is not qcow2-only: it walks a chain
+(`src/vmm/src/main.rs:2501`) is not qcow2-only: it walks a chain
 with circular-reference detection, a depth limit and a path
 allowlist, and it already carries a non-qcow2 special case in the
 VMDK flat-descriptor short-circuit that resolves
@@ -271,7 +271,7 @@ Out of scope, and deliberately left to their own work:
    a host-side fact: `run_create_nonraw` resolves the typed
    backing path against the output's directory *for opening the
    file* but sends the guest `typed_backing.as_bytes()`
-   unchanged (`src/vmm/src/main.rs:16710-16769`). The guest
+   unchanged (`src/vmm/src/main.rs:16913-16963`). The guest
    therefore has one string, and writing two entries would mean
    fabricating the other -- `.\<basename>` is simply wrong
    whenever parent and child are in different directories, and a
@@ -301,7 +301,7 @@ Out of scope, and deliberately left to their own work:
    RESOLVED 2026-09-05 by phase 1's survey, and the resolution
    is a description of code that already exists rather than a
    new rule to write. `discover_backing_chain`
-   (`src/vmm/src/main.rs:2416`) is not qcow2-only: it already
+   (`src/vmm/src/main.rs:2501`) is not qcow2-only: it already
    performs circular-reference detection, depth limiting and
    allowlist checking for every chain the host walks, governed
    by `security.backing_path_allowlist` and
@@ -347,8 +347,8 @@ records `instar-testdata <sha> (#pr)` and is audited there.
 | 1. Semantics pin, oracle selection, and the doc correction | [PLAN-differencing-phase-01-pin.md](PLAN-differencing-phase-01-pin.md) | Complete | `8b81a0f` (#549) |
 | 2. Real differencing fixtures, happy-path and adversarial (instar + instar-testdata) | [PLAN-differencing-phase-02-fixtures.md](PLAN-differencing-phase-02-fixtures.md) | Complete | instar-testdata `77f5f589f0` + `623a30866f` + `3eed61bf75` (direct to `main`); instar `1a677c77` (#552) |
 | 3. Parent-locator parsing in `crates/vhd` and `crates/vhdx` | [PLAN-differencing-phase-03-parse.md](PLAN-differencing-phase-03-parse.md) | Complete | `42e879f` (#558) |
-| 4. Read-side policy: close the silent parent-ignoring read | [PLAN-differencing-phase-04-read-policy.md](PLAN-differencing-phase-04-read-policy.md) | Complete | |
-| 5. `plan_vhd` differencing emitter | PLAN-differencing-phase-05-vhd-emitter.md | Not started | |
+| 4. Read-side policy: close the silent parent-ignoring read | [PLAN-differencing-phase-04-read-policy.md](PLAN-differencing-phase-04-read-policy.md) | Complete | `f981374` (#563) |
+| 5. `plan_vhd` differencing emitter | [PLAN-differencing-phase-05-vhd-emitter.md](PLAN-differencing-phase-05-vhd-emitter.md) | Planned | |
 | 6. `plan_vhdx` differencing emitter | PLAN-differencing-phase-06-vhdx-emitter.md | Not started | |
 | 7. Guest create op and host CLI wiring | PLAN-differencing-phase-07-guest-host.md | Not started | |
 | 8. Rust unit tests and Python integration tests | PLAN-differencing-phase-08-tests.md | Not started | |
@@ -393,9 +393,10 @@ The VHDX `parent_linkage` key is the parent's DataWriteGuid,
 settled by measurement against Hyper-V bytes and confirmed
 against SPEC(VHDX) 2.6.2.6.3 and libvhdi's source. But
 `vhdx::build_header` derives the DataWriteGuid from the sequence
-number alone (`src/crates/vhdx/src/lib.rs:1341-1345`), and every
+number alone (`src/crates/vhdx/src/lib.rs:2201-2212`), and every
 instar VHDX writer passes sequence numbers 1 and 2 -- `plan_vhdx`
-at `src/crates/create/src/lib.rs:964-966` and the convert op at
+at `src/crates/create/src/lib.rs:965`
+and `:967` and the convert op at
 `src/operations/convert/src/main.rs:4469` and `:4492`. Every VHDX
 instar has ever written therefore shares one active-header
 DataWriteGuid, which makes libvhdi's parent-identity check
@@ -482,14 +483,14 @@ visible in the crates:
   granularity, not block granularity: the per-block sector bitmap
   says which sectors of an allocated block are the child's.
   `VhdState` today computes the bitmap's size only to skip past
-  it (`src/crates/vhd/src/lib.rs:664-673`, `:766`) and never
+  it (`src/crates/vhd/src/lib.rs:1432-1441`, `:1534`) and never
   reads a bit, which is right for a dynamic disk and wrong for a
   differencing one.
 * VHDX carries the equivalent in its sector-bitmap BAT entries,
   which the current walker deliberately skips
-  (`src/crates/vhdx/src/lib.rs:654`), and it treats
+  (`src/crates/vhdx/src/lib.rs:1820`), and it treats
   `PAYLOAD_BLOCK_PARTIALLY_PRESENT` as fully present data
-  (`:571`, `:581`, `:601`) -- a v1 simplification that is only
+  (`:1408`, `:1438`, `:1487`) -- a v1 simplification that is only
   safe while differencing images are rejected outright.
 
 Whether `map`'s per-extent `depth` field participates is a
@@ -499,13 +500,13 @@ depth may reasonably follow qcow2's rather than lead it.
 
 Phase 7 is the smallest of the implementation phases: the host
 already attaches the backing file as input device 0 when `-b` is
-given (`run_create_nonraw`, `src/vmm/src/main.rs:16612`), so the
+given (`run_create_nonraw`, `src/vmm/src/main.rs:16815`), so the
 guest can read the parent's footer for its unique id and
 timestamp without any new call-table primitive. That is the fact
 that makes this plan tractable, and phase 1 confirmed it still
 holds: step 1b read the same function and found that it opens the
 host-resolved parent but embeds `typed_backing.as_bytes()`
-verbatim in what the guest receives (`:16710-16769`). That single
+verbatim in what the guest receives (`:16913-16963`). That single
 typed string is also what forces the single-locator-entry answer
 in open question 3.
 
@@ -619,6 +620,15 @@ status becomes `Complete`.
   output, blocked on multi-output-device support in the call
   table, and vmdk/vpc/vhdx preallocation, blocked on a per-format
   BAT population pattern.
+* Giving created VHD and VHDX images a real identity (#566).
+  `plan_vhd` writes an all-zero footer unique id and
+  `vhdx::build_header` derives the DataWriteGuid from the sequence
+  number, so every image instar creates shares one identity and the
+  parent-identity check is vacuous for chains instar wrote end to
+  end. Deferred by decision 2 of the phase 5 plan: it needs a
+  host-side entropy source passed through the call table, which is
+  the one ABI change this plan is built to avoid. Phase 8's
+  negative identity test must therefore use a third-party parent.
 * Differencing-aware `check`, once a chain can be resolved:
   today `check` refuses VHDX differencing and validates a VHD
   differencing child as if it were dynamic.
