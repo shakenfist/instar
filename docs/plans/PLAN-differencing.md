@@ -348,7 +348,7 @@ records `instar-testdata <sha> (#pr)` and is audited there.
 | 2. Real differencing fixtures, happy-path and adversarial (instar + instar-testdata) | [PLAN-differencing-phase-02-fixtures.md](PLAN-differencing-phase-02-fixtures.md) | Complete | instar-testdata `77f5f589f0` + `623a30866f` + `3eed61bf75` (direct to `main`); instar `1a677c77` (#552) |
 | 3. Parent-locator parsing in `crates/vhd` and `crates/vhdx` | [PLAN-differencing-phase-03-parse.md](PLAN-differencing-phase-03-parse.md) | Complete | `42e879f` (#558) |
 | 4. Read-side policy: close the silent parent-ignoring read | [PLAN-differencing-phase-04-read-policy.md](PLAN-differencing-phase-04-read-policy.md) | Complete | `f981374` (#563) |
-| 5. `plan_vhd` differencing emitter | [PLAN-differencing-phase-05-vhd-emitter.md](PLAN-differencing-phase-05-vhd-emitter.md) | Planned | |
+| 5. `plan_vhd` differencing emitter | [PLAN-differencing-phase-05-vhd-emitter.md](PLAN-differencing-phase-05-vhd-emitter.md) | Implemented, not yet merged | |
 | 6. `plan_vhdx` differencing emitter | PLAN-differencing-phase-06-vhdx-emitter.md | Not started | |
 | 7. Guest create op and host CLI wiring | PLAN-differencing-phase-07-guest-host.md | Not started | |
 | 8. Rust unit tests and Python integration tests | PLAN-differencing-phase-08-tests.md | Not started | |
@@ -412,6 +412,16 @@ giving created images a real DataWriteGuid; phase 8's
 negative identity test must be built against a **third-party**
 parent either way, because an instar-created parent cannot fail
 it.
+
+Phase 8 carries one debt from phase 5, recorded here because the
+phase 5 plan is not where phase 8's planner will look. `create -f
+vpc -b` is still refused at the guest by an explicit guard that
+phase 7 removes, and that refusal has **no committed test**:
+the guard is in the guest binary and `crates/create`'s harness
+cannot reach it. Phase 5 verified it by hand against a built
+binary. Phase 8's brief must add the integration test that pins
+it, and phase 7's must not remove the guard without noticing that
+nothing would fail if it did.
 
 Phases 8 and 15 both build fixtures with partially populated
 blocks, and both must account for a libvhdi defect step 1a found

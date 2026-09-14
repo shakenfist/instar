@@ -460,7 +460,16 @@ else; both can run first. 5c depends on 5a and 5b. 5d depends on
 * `fuzz_create_emitters` builds and runs against the new path
   without tripping its `minimum_file_size` or overlap oracles.
 * `docs/create.md` is unchanged, and `create -f vpc -b` still
-  fails with the same error a user sees today.
+  fails with the same error a user sees today. **Verified by hand
+  against a binary built from this branch**, not by a committed
+  test: `create -f vpc parent.vhd 16M` succeeds and
+  `create -f vpc -b parent.vhd -F vpc child.vhd 16M` gives
+  `Error: "create failed: invalid option for target format"`,
+  exit 1, with no child file written. There is no committed test
+  for this and there cannot be one in `crates/create`: decision
+  8's guard lives in the guest binary, which that crate's harness
+  cannot reach. Permanent coverage belongs with the phase that
+  adds the Python integration tests, and its brief should say so.
 
   **This replaces a Definition-of-done item that was impossible.**
   The plan originally required that `git diff develop...HEAD`
