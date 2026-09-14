@@ -56,10 +56,13 @@ Out of scope, and each named with the phase that owns it:
 * **VHDX** — phase 6. The two emitters are independent; this one
   goes first because the VHD locator table is the simpler
   structure.
-* **The guest create op and the host CLI** — phase 7. Nothing in
-  `src/operations/create` or `src/vmm` changes here, so `-b` on a
+* **The guest create op and the host CLI** — phase 7. `-b` on a
   vpc target keeps returning `BackingFileUnsupported` to the user
-  until phase 7 lands. That is a deliberate intermediate state:
+  until phase 7 lands. Two small mechanical changes to
+  `src/operations/create` and one to `src/vmm` are unavoidable and
+  are in scope: the `VhdCreateOpts` literal, the explicit guard of
+  decision 8, and the new error code's `map_create_error` arm and
+  host message. None of them changes what a user sees. That is a deliberate intermediate state:
   the emitter is reviewable on its own, and wiring it before it is
   reviewed would mean shipping a format writer whose output
   nothing had read back.
@@ -275,22 +278,49 @@ produces no such image and `SPEC(VHD)` describes none. The
 which is the existing error with its existing meaning: this
 target format, in this subformat, does not support backing files.
 
-**6. The over-length parent path gets `BackingFileTooLong`, not a
-new variant, and the check is in `plan_vhd`.**
+**6. The over-length parent path gets its own error, and the limit
+is 255 UTF-16 code units, not 256.**
 
-The generic 1024-byte check at `crates/create/src/lib.rs:342` and
-`:520` stays where it is and keeps its meaning. `plan_vhd` adds
-its own check against what the field can actually hold, and
-returns the same `CreateError::BackingFileTooLong`. A new variant
-would have to be threaded through `map_create_error`
-(`operations/create/src/main.rs:105`) into a new `CreateResult`
-error code, and the `CreateResult` codes are append-only ABI —
-spending one on "too long, but for a format-specific reason"
-buys nothing a user can act on differently. The check is on the
-**encoded** length: 256 UTF-16 code units, which is not 256 bytes
-of UTF-8 and is not 512 bytes of UTF-8 either once any character
-outside the BMP appears. Count code units during encoding and
-fail on overflow; do not estimate from the UTF-8 length.
+**Both halves of this decision reverse what this plan originally
+said.** It was written as "reuse `BackingFileTooLong`, cap at 256",
+and implementation falsified both. The original reasoning is kept
+below each correction so the reversal can be judged rather than
+taken on trust.
+
+*The limit is 255.* The plan said 256 succeeds and 257 fails.
+Phase 1 pinned 255, with a measured reason this plan did not
+account for: a path of exactly 256 code units fills all 512 bytes
+with no room for a terminating NUL, and that is precisely the
+image that trips libvhdi defect C — the oracle reads past the
+field into the locator table and reports a parent filename with a
+stray character appended. A 512-byte-inclusive rule would have
+instar emitting output the only tool that resolves VHD parents
+misreads. `crates/vhd`'s own `DYN_PARENT_NAME_SIZE` doc comment
+already recorded the 255 emit-side bound against the 256
+parse-side bound; this plan contradicted a constant in the tree it
+was planning against. The emitter hands the encoder two bytes less
+than the field, so the cap is structural rather than a comparison
+that can be got wrong, and the last code unit is always zero.
+
+*It gets its own error.* The plan argued that a new variant costs
+an append-only `CreateResult` code and buys nothing a user can act
+on differently. That is wrong on the facts: the host renders
+`ERROR_BACKING_TOO_LONG` as **"backing file path too long (max
+1024 bytes)"** (`src/vmm/src/main.rs:17541`), so reusing it would
+tell a user that their 300-byte path exceeded a 1024-byte limit.
+That is a false statement in a diagnostic — the same class of
+misdiagnosis as #548, argued at length in phase 4's review, and
+reusing the code here would have reintroduced it one phase later.
+So: a new `CreateError::ParentNameTooLong`, a new appended
+`CreateResult::ERROR_PARENT_NAME_TOO_LONG`, a `map_create_error`
+arm and a host message that names the real limit.
+
+The check lives in `crates/vhd`'s builder rather than in
+`plan_vhd`, because that is where the encoding happens and a
+second implementation of the same limit is a second chance to
+disagree with it. Counting is done during encoding; it is never
+estimated from the UTF-8 length, which is neither 255 nor 510
+bytes once any character outside the BMP appears.
 
 **7. Both the parent unicode name and the locator entry are
 written, always.**
@@ -307,6 +337,33 @@ typed path and `W2ku` for an absolute one, slots 2 to 8 zero — so
 this decision only records that the name field is not dropped in
 favour of it.
 
+**8. The guest keeps refusing `create -f vpc -b`, by an explicit
+guard that phase 7 removes.**
+
+Forced by the same discovery as decision 6's scope correction.
+Once `plan_vhd` accepts a backing, the guest create op reaches the
+new emitter the moment a user passes `-b` on a vpc target — the
+call at `src/operations/create/src/main.rs:668` is already there
+and already forwards `backing_ref`. Letting that through would
+emit a differencing VHD whose `parent_unique_id` is whatever
+`vhd_opts_from` invented, and since the guest cannot read the
+parent's footer until phase 7, that means zero.
+
+Zero happens to be right for an instar-created parent, because
+every VHD instar writes has an all-zero footer id (#566). It is
+wrong for every third-party parent, and a child pointing at a
+Hyper-V parent with a zeroed identity is exactly the silently
+wrong output this whole plan exists to stop. So `vhd_opts_from`
+passes zeros and the guest arm refuses vpc-plus-backing before
+calling the planner, with `CreateError::BackingFileUnsupported` —
+the error and the message a user gets today, so the phase is
+invisible from outside. The guard carries a comment naming phase 7
+as the step that removes it.
+
+The alternative — leave the phase's own emitter unreachable by
+not adding the fields at all — is not available, because the
+fields are what makes the emitter testable.
+
 ## Step plan
 
 | Step | Effort | Model | Isolation | Brief for sub-agent |
@@ -314,8 +371,8 @@ favour of it.
 | 5a | medium | sonnet | none | Add a UTF-8 → UTF-16 encoder to `src/shared/src/lib.rs`, beside `utf16_to_utf8` (`:187`), with the mirror-image signature: `pub fn utf8_to_utf16(src: &str, big_endian: bool, dst: &mut [u8]) -> Option<usize>`, returning the number of **bytes** written, `None` if `dst` is too small or the encoding overflows 256 UTF-16 code units is *not* this function's business — length policy belongs to the caller, so return `None` only for a `dst` that cannot hold the result. `src/shared` is `no_std`, panic-free, no allocator: use `char::encode_utf16` via a manual surrogate split rather than anything allocating, and index `dst` with explicit bounds checks. Test it as the inverse of `utf16_to_utf8` over the same cases that function already tests (`:6441-6690`): ASCII in both endiannesses, a surrogate pair, a multi-byte BMP form, and a `dst` exactly one byte too small. Add one round-trip test per case asserting `utf16_to_utf8(utf8_to_utf16(s)) == s`. Touch nothing else. |
 | 5b | medium | sonnet | none | Expose the VHD footer timestamp. In `src/crates/vhd/src/lib.rs`, add `pub timestamp: u32` to `VhdFooter` (`:182`) and populate it in `VhdFooter::parse` (`:202`) from `FOOTER_TIMESTAMP_OFFSET` (`:48`, big-endian, seconds since 2000-01-01 00:00:00 UTC). This is additive and every existing construction site is inside `parse`, but build the whole workspace afterwards: `VhdFooter` is `pub` and struct-literal construction elsewhere would break. Add one unit test asserting the field is read from offset 24 and not from a neighbouring field, using a footer whose timestamp differs from its `original_size` and `current_size`. Do not change `build_footer` — the timestamp it writes is the creation time of the image being created, which is a different value from the parent's, and step 5c handles the parent's. |
 | 5c | high | opus | worktree | Add parent-emitting support to `src/crates/vhd/src/lib.rs`. (i) A builder for the parent half of the dynamic header. Do not change `build_dynamic_header` (`:1889`) — add a second function that takes an already-built header buffer and fills the parent fields, so the non-differencing path is byte-identical to today and the diff shows that. It writes `parent_unique_id` (16 raw bytes at `DYN_PARENT_UNIQUE_ID_OFFSET`, `:101`), `parent_timestamp` (big-endian u32 at `:103`), and the parent unicode name (UTF-16 **BIG** endian at `DYN_PARENT_NAME_OFFSET`, `:106`, field size `DYN_PARENT_NAME_SIZE` = 512 bytes = 256 code units, `:117`), zero-padded to the full field, using 5a's encoder with `big_endian = true`. (ii) A builder for one locator entry, writing into the 24 bytes at `DYN_PARENT_LOCATORS_OFFSET + slot * PARENT_LOCATOR_ENTRY_SIZE` (`:119`, `:124`): platform code as four ASCII bytes in **file order, not byte-swapped** (`:468`), `platform_data_space` and `platform_data_length` as big-endian u32 at `:131` and `:133`, `reserved` zero at `:135`, `platform_data_offset` as a big-endian u64 absolute file offset at `:137`. **`platform_data_space` is a byte count — see decision 4.** (iii) A helper that encodes the platform data itself: UTF-16 **LITTLE** endian (`:588`, the opposite of the name field), no NUL terminator (`:481`). (iv) Recompute the dynamic header checksum after the parent fields are written — `compute_checksum` (`:995`) with `DYN_CHECKSUM_OFFSET` (`:90`); a header whose checksum predates its parent fields is the defect this step is most likely to ship. Unit tests: assert each field lands at the documented offset by checking the raw bytes; assert the two endiannesses differ for the same path (decision 3); assert the checksum validates after the parent fields are written. |
-| 5d | high | opus | worktree | Teach `plan_vhd` (`src/crates/create/src/lib.rs:749`) to emit a differencing child. Replace the `BackingFileUnsupported` early return at `:767` with a split: `VhdSubformat::Fixed` plus a backing still returns it (decision 5); `Dynamic` plus a backing takes the new path. Add to `VhdCreateOpts` (`:280`) the two values the planner cannot derive — `parent_unique_id: [u8; 16]` and `parent_timestamp: u32` — following how `VmdkCreateOpts::parent_cid` (`:258-261`) already carries a parent-derived value into a planner. Layout per decision 1: head footer 0, dynamic header 512, **locator data 1536 (one sector)**, BAT 2048, tail footer after the BAT; the non-differencing layout is unchanged, BAT still at 1536. Both footers get `vhd::DISK_TYPE_DIFFERENCING` (`crates/vhd/src/lib.rs:166`) instead of `DISK_TYPE_DYNAMIC`. Pick the platform code from the typed path bytes: `W2ru` if relative, `W2ku` if it starts with `/` (open question 3 — one entry, slot 1, slots 2 to 8 left zero). Enforce the 256-code-unit limit and return `CreateError::BackingFileTooLong` on overflow, counting code units during encoding, not estimating from UTF-8 length (decision 6). The plan gains a fifth `MetadataWrite` for the locator data; `MAX_METADATA_WRITES` is 96 (`:122`) and `VHD_MAX_METADATA_SCRATCH` is 4 MiB (`:46`), so neither is near a limit, but `debug_assert_eq!(plan.minimum_file_size, total_file_size)` at the end of the Dynamic arm must still hold. |
-| 5e | high | opus | worktree | Tests, in `src/crates/create/` and `src/crates/vhd/`. The load-bearing one is **emit-then-parse**: build a differencing plan, lay its writes into a byte buffer, and read it back with the phase 3 parser — `VhdFooter::parse`, `VhdDynamicHeader::parse`, and `VhdParentInfo::parse` (`crates/vhd/src/lib.rs:936`) with a `VhdImageBounds { image_len, header_offset: 512 }`. Assert: `disk_type == 4`; the decoded parent name equals the input path; the selected locator is the expected one with `defect == None` (which is what proves the layout satisfies `locator_defect`'s four rules — survey finding 4); `platform_data_space == 512` and `platform_data_length` equal to the encoded byte count. Add a negative-control test that a locator placed at 512 instead of 1536 comes back with `OverlapsHeader`, so the round-trip test is demonstrably not vacuous. Add: a relative path yields `W2ru` and an absolute one `W2ku`; a 257-code-unit path is rejected with `BackingFileTooLong` while a 256-code-unit one succeeds; a non-BMP character costs two code units against that limit; `VhdSubformat::Fixed` plus a backing still returns `BackingFileUnsupported`; and a **byte-for-byte regression test that a non-differencing dynamic VHD is unchanged**, comparing against the bytes `plan_vhd` produces on `develop` for the same options. Extend `src/crates/create/tests/round_trip.rs` (`:284`, `:310`) rather than starting a new harness, and update `plan_vhd_rejects_backing` (`:1467`), which this phase makes wrong. |
+| 5d | high | opus | worktree | Teach `plan_vhd` (`src/crates/create/src/lib.rs:749`) to emit a differencing child. Replace the `BackingFileUnsupported` early return at `:767` with a split: `VhdSubformat::Fixed` plus a backing still returns it (decision 5); `Dynamic` plus a backing takes the new path. Add to `VhdCreateOpts` (`:280`) the two values the planner cannot derive — `parent_unique_id: [u8; 16]` and `parent_timestamp: u32` — following how `VmdkCreateOpts::parent_cid` (`:258-261`) already carries a parent-derived value into a planner. Layout per decision 1: head footer 0, dynamic header 512, **locator data 1536 (one sector)**, BAT 2048, tail footer after the BAT; the non-differencing layout is unchanged, BAT still at 1536. Both footers get `vhd::DISK_TYPE_DIFFERENCING` (`crates/vhd/src/lib.rs:166`) instead of `DISK_TYPE_DYNAMIC`. Pick the platform code from the typed path bytes: `W2ru` if relative, `W2ku` if it starts with `/` (open question 3 — one entry, slot 1, slots 2 to 8 left zero). The 255-code-unit limit is already enforced inside `crates/vhd`'s builder (step 5c) — do **not** re-implement it here; map its `VhdBuildError::ParentNameTooLong` onto a **new** `CreateError::ParentNameTooLong` (decision 6). Because `map_create_error` (`src/operations/create/src/main.rs:105`) is an exhaustive match, that variant also needs an arm there, a new appended `CreateResult::ERROR_PARENT_NAME_TOO_LONG` beside `ERROR_BACKING_DIFFERENCING` in `src/shared/src/lib.rs`, and a host message in `src/vmm/src/main.rs` beside `:17541` that names the real limit rather than 1024 bytes. Adding fields to `VhdCreateOpts` breaks seven struct-literal sites — update all of them, including `src/operations/create/src/main.rs:310` and `src/fuzz/fuzz_targets/fuzz_create_emitters.rs:175`. Per decision 8, `vhd_opts_from` passes zeros for the parent identity and the guest's `ImageFormat::Vhd` arm refuses backing-plus-vpc **before** calling the planner, with `BackingFileUnsupported`, carrying a comment naming phase 7 as the step that removes it — so user-visible behaviour is unchanged by this phase. The plan gains a fifth `MetadataWrite` for the locator data; `MAX_METADATA_WRITES` is 96 (`:122`) and `VHD_MAX_METADATA_SCRATCH` is 4 MiB (`:46`), so neither is near a limit, but `debug_assert_eq!(plan.minimum_file_size, total_file_size)` at the end of the Dynamic arm must still hold. |
+| 5e | high | opus | worktree | Tests, in `src/crates/create/` and `src/crates/vhd/`. The load-bearing one is **emit-then-parse**: build a differencing plan, lay its writes into a byte buffer, and read it back with the phase 3 parser — `VhdFooter::parse`, `VhdDynamicHeader::parse`, and `VhdParentInfo::parse` (`crates/vhd/src/lib.rs:936`) with a `VhdImageBounds { image_len, header_offset: 512 }`. Assert: `disk_type == 4`; the decoded parent name equals the input path; the selected locator is the expected one with `defect == None` (which is what proves the layout satisfies `locator_defect`'s four rules — survey finding 4); `platform_data_space == 512` and `platform_data_length` equal to the encoded byte count. Add a negative-control test that a locator placed at 512 instead of 1536 comes back with `OverlapsHeader`, so the round-trip test is demonstrably not vacuous. Add: a relative path yields `W2ru` and an absolute one `W2ku`; a 256-code-unit path is rejected while a 255-code-unit one succeeds, and a non-BMP character costs two code units against that limit (127 fit, 128 do not) — the boundary tests for this already exist in `crates/vhd` from step 5c, so what 5e adds is that `plan_vhd` surfaces the refusal as `CreateError::ParentNameTooLong` rather than swallowing or re-deriving it; `create -f vpc -b` still fails exactly as it does on develop (decision 8); `VhdSubformat::Fixed` plus a backing still returns `BackingFileUnsupported`; and a **byte-for-byte regression test that a non-differencing dynamic VHD is unchanged**, comparing against the bytes `plan_vhd` produces on `develop` for the same options. Extend `src/crates/create/tests/round_trip.rs` (`:284`, `:310`) rather than starting a new harness, and update `plan_vhd_rejects_backing` (`:1467`), which this phase makes wrong. |
 | 5f | medium | sonnet | none | Closeout. (i) Confirm `fuzz_create_emitters` (`src/fuzz/fuzz_targets/fuzz_create_emitters.rs:179-181`) still holds its oracles now that `plan_vhd` accepts a backing — build it and run it briefly against the new path; it needs no code change, but survey finding 5 means it is now reaching code it never reached before, and a `minimum_file_size` that disagrees with the writes will surface here first. (ii) Add a `CHANGELOG.md` entry for the crate-level capability, phrased so it does not promise a user-facing feature: `create -f vpc -b` still returns `BackingFileUnsupported` until phase 7. (iii) Confirm #566 (decision 2) is still open and still accurate against the tree at the end of this phase; it is already linked from the master plan's Future work, so this is a check, not a filing. (iv) Do **not** touch `docs/create.md` — its statement that vpc rejects `-b` is still true and phase 10 owns the change. |
 
 Steps 5a and 5b are independent of each other and of everything
@@ -385,9 +442,11 @@ else; both can run first. 5c depends on 5a and 5b. 5d depends on
   committed test rather than by inspection.
 * `plan_vhd` with `VhdSubformat::Fixed` and a backing returns
   `CreateError::BackingFileUnsupported`.
-* A 256-UTF-16-code-unit parent path succeeds and a 257-code-unit
-  one returns `CreateError::BackingFileTooLong`; a path containing
-  a non-BMP character reaches that limit 2 code units at a time.
+* A 255-UTF-16-code-unit parent path succeeds and a 256-code-unit
+  one is refused; a path containing a non-BMP character reaches
+  that limit 2 code units at a time (127 such characters fit, 128
+  do not). The last two bytes of the parent name field are always
+  zero, asserted directly rather than assumed.
 * `shared::utf8_to_utf16` and `shared::utf16_to_utf8` round-trip
   every case in the existing `utf16_to_utf8` test set.
 * The same parent path encodes to two different byte strings under
@@ -400,8 +459,21 @@ else; both can run first. 5c depends on 5a and 5b. 5d depends on
   is clean.
 * `fuzz_create_emitters` builds and runs against the new path
   without tripping its `minimum_file_size` or overlap oracles.
-* `docs/create.md` is unchanged, and `git diff develop...HEAD`
-  touches no file under `src/operations/` or `src/vmm/`.
+* `docs/create.md` is unchanged, and `create -f vpc -b` still
+  fails with the same error a user sees today.
+
+  **This replaces a Definition-of-done item that was impossible.**
+  The plan originally required that `git diff develop...HEAD`
+  touch no file under `src/operations/` or `src/vmm/`. It cannot:
+  `VhdCreateOpts` is built by struct literal at seven sites, two
+  of which are `src/operations/create/src/main.rs:310` and
+  `src/fuzz/fuzz_targets/fuzz_create_emitters.rs:175`, so adding
+  the parent-identity fields breaks compilation until they are
+  updated. The survey missed this by reading `plan_vhd` and not
+  its callers. What the criterion was protecting — that this phase
+  changes no user-visible behaviour — is preserved by the explicit
+  guard in decision 8 instead, and is the falsifiable thing to
+  check.
 * #566 is open, accurate, and linked from the master plan's
   Future work.
 
