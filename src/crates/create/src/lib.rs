@@ -1663,6 +1663,27 @@ mod vhd_plan_tests {
         ));
     }
 
+    /// The counterpart the `Fixed` refusal above no longer covers: a
+    /// `Dynamic` VHD with a backing reference is accepted and planned as a
+    /// differencing child. Its layout, fields and encodings are covered in
+    /// depth by `tests/round_trip.rs`; this is the one-line statement that
+    /// the two subformats now diverge here.
+    #[test]
+    fn plan_vhd_dynamic_accepts_backing() {
+        let mut opts = default_dynamic(1 << 20);
+        opts.backing = Some(BackingRef {
+            path: b"parent.vhd",
+            format: Some(ImageFormat::Vhd),
+        });
+        let mut scratch = vec![0u8; VHD_MAX_METADATA_SCRATCH];
+        let plan = plan_vhd(&opts, &mut scratch).expect("differencing plan");
+        // Five writes rather than four: the locator platform data region.
+        assert_eq!(plan.writes().len(), 5);
+        let bytes = materialise(&plan);
+        let footer = vhd::VhdFooter::parse(&bytes[bytes.len() - 512..]).expect("parse footer");
+        assert_eq!(footer.disk_type, vhd::DISK_TYPE_DIFFERENCING);
+    }
+
     #[test]
     fn plan_vhd_rejects_bad_block_size() {
         let mut opts = default_dynamic(1 << 20);
