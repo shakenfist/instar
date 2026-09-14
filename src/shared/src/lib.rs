@@ -3497,6 +3497,15 @@ impl CreateResult {
     /// unrecognised format" about a valid image is the same undiagnosed
     /// failure issue #548 was filed over.
     pub const ERROR_BACKING_DIFFERENCING: u32 = 11;
+    /// The backing path does not fit the target format's parent-name
+    /// field. VHD's parent unicode name holds 512 bytes of UTF-16 and
+    /// instar caps it at 255 code units so a terminating NUL stays
+    /// inside the field. Distinguished from ERROR_BACKING_TOO_LONG,
+    /// whose limit is the generic 1024 *bytes* of the call-table
+    /// `backing_file` field: a 300-byte ASCII path clears that and
+    /// still overflows this one, so reusing the code would report a
+    /// limit the path never came near.
+    pub const ERROR_PARENT_NAME_TOO_LONG: u32 = 12;
 
     /// True if magic matches.
     pub fn is_valid(&self) -> bool {

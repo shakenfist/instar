@@ -78,6 +78,10 @@ fuzz_target!(|data: &[u8]| {
     let virtual_size = u64::from_le_bytes(data[8..16].try_into().unwrap());
     let unit_size = u32::from_le_bytes(data[16..20].try_into().unwrap());
     let parent_cid_raw = u32::from_le_bytes(data[20..24].try_into().unwrap());
+    // Reuse the tail of the structured header as a VHD parent unique id;
+    // the fuzz header has no dedicated field and adding one would shift
+    // every existing corpus entry.
+    let vhd_parent_id: [u8; 16] = data[8..24].try_into().unwrap();
 
     let refcount_bits: u8 = match rcb_sel {
         0 => 1,
@@ -177,6 +181,12 @@ fuzz_target!(|data: &[u8]| {
                     subformat: vhd_subformat,
                     block_size: unit_size,
                     backing,
+                    // Parent identity for a differencing child. Neither
+                    // value affects the layout, but feeding structured
+                    // bytes rather than a constant keeps the emitted
+                    // header varying with the corpus.
+                    parent_unique_id: vhd_parent_id,
+                    parent_timestamp: parent_cid_raw,
                 };
                 plan_vhd(&opts, &mut scratch)
             }

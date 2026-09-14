@@ -67,6 +67,16 @@ pub enum CreateError {
     BackingFileTooLong,
     /// The target format does not support backing files.
     BackingFileUnsupported,
+    /// The parent path does not fit the target format's parent-name
+    /// field. VHD's parent unicode name is 512 bytes of UTF-16 and
+    /// instar caps it at 255 code units so the field keeps a
+    /// terminating NUL (`vhd::VhdBuildError::ParentNameTooLong`).
+    /// Distinct from [`CreateError::BackingFileTooLong`], whose limit
+    /// is the generic [`MAX_BACKING_FILE_LEN`] of 1024 *bytes*: a
+    /// 300-byte ASCII path passes that check and still overflows this
+    /// field, and reporting it as the 1024-byte limit would be a false
+    /// diagnostic.
+    ParentNameTooLong,
     /// An internal size computation overflowed.
     Overflow,
     /// The caller-supplied scratch buffer is too small for the
@@ -284,8 +294,29 @@ pub struct VhdCreateOpts<'a> {
     /// Block size in bytes. Must be a power of two in
     /// `512 KiB..=256 MiB`.
     pub block_size: u32,
-    /// Optional backing image to chain to.
+    /// Optional backing image to chain to. A `Dynamic` VHD with a
+    /// backing reference is emitted as a differencing child; a `Fixed`
+    /// one is refused (a differencing disk needs the BAT and dynamic
+    /// header a fixed VHD does not have).
     pub backing: Option<BackingRef<'a>>,
+    /// The parent footer's unique id, copied verbatim into the child's
+    /// dynamic header. Only read when `backing` is `Some` and the
+    /// subformat is `Dynamic`.
+    ///
+    /// The planner cannot derive this — it is the parent footer's bytes
+    /// `68..84` and the caller must have read them. Follows the
+    /// precedent of [`VmdkCreateOpts::parent_cid`], which carries the
+    /// same kind of parent-derived value into a planner. An all-zero id
+    /// is written as given and not second-guessed: every VHD instar
+    /// creates has an all-zero footer id (#566), so all-zero is what a
+    /// faithful child of an instar-created parent carries.
+    pub parent_unique_id: [u8; 16],
+    /// The parent footer's timestamp (seconds since 2000-01-01
+    /// 00:00:00 UTC), copied into the child's dynamic header. Read
+    /// under the same conditions as `parent_unique_id`, and equally
+    /// underivable: it is the *parent's* creation time, not the
+    /// child's.
+    pub parent_timestamp: u32,
 }
 
 /// Options for [`plan_vhdx`].
@@ -452,6 +483,29 @@ fn map_qcow2_error(e: qcow2::create::Qcow2CreateError) -> CreateError {
         qcow2::create::Qcow2CreateError::PreallocationUnsupported => {
             CreateError::PreallocationUnsupported
         }
+    }
+}
+
+/// Map a `crates/vhd` parent-emitter error onto this crate's error type.
+fn map_vhd_build_error(e: vhd::VhdBuildError) -> CreateError {
+    match e {
+        // The one variant a user can actually provoke: a path that fits
+        // MAX_BACKING_FILE_LEN's 1024 bytes but not the 512-byte parent
+        // unicode name field. It gets its own CreateError rather than
+        // reusing BackingFileTooLong, whose host message names 1024
+        // bytes and would be a false diagnostic here.
+        vhd::VhdBuildError::ParentNameTooLong => CreateError::ParentNameTooLong,
+        // The header region is always DYNAMIC_HEADER_SIZE and the
+        // locator region always one sector, so this is a planner bug
+        // rather than a user input; report it as the scratch problem it
+        // would be.
+        vhd::VhdBuildError::BufferTooSmall => CreateError::ScratchTooSmall,
+        // Unreachable from this crate: the slot is the literal 0, and
+        // the platform data length is bounded by the 255-code-unit name
+        // cap at 510 bytes against a 512-byte space. Mapped rather than
+        // unwrapped because `crates/create` is panic-free.
+        vhd::VhdBuildError::LocatorSlotOutOfRange
+        | vhd::VhdBuildError::LocatorLengthExceedsSpace => CreateError::Overflow,
     }
 }
 
@@ -736,16 +790,42 @@ fn format_u64_decimal(mut val: u64, buf: &mut [u8; 20]) -> &[u8] {
 
 /// Build a metadata plan for a VHD image (Dynamic or Fixed).
 ///
-/// Dynamic layout:
+/// Dynamic layout, no backing:
 ///
 ///   bytes 0..512:                  head footer copy
 ///   bytes 512..1536:               dynamic header
 ///   bytes 1536..1536+bat_padded:   BAT (entries = 0xFFFF_FFFF)
 ///   bytes total-512..total:        tail footer
 ///
+/// Dynamic layout, differencing child (`backing` is `Some`):
+///
+///   bytes 0..512:                  head footer copy (disk_type = 4)
+///   bytes 512..1536:               dynamic header, parent fields and
+///                                  one parent locator entry populated
+///   bytes 1536..2048:              parent locator platform data
+///                                  (one sector, UTF-16LE path)
+///   bytes 2048..2048+bat_padded:   BAT (entries = 0xFFFF_FFFF)
+///   bytes total-512..total:        tail footer (disk_type = 4)
+///
+/// The locator data sits *between* the dynamic header and the BAT so
+/// every metadata structure stays in one contiguous prefix, and because
+/// that is where both measured Hyper-V images put it. It is one sector
+/// because the most platform data this emitter can produce is a
+/// 255-code-unit path, 510 bytes of UTF-16. `vhd::locator_defect`
+/// rejects platform data overlapping the head footer (`0..512`) or the
+/// dynamic header (`512..1536`), which is what rules out the two
+/// cheaper placements.
+///
+/// **The BAT moves only for a differencing child.** A non-differencing
+/// dynamic VHD keeps its BAT at 1536 and is byte-identical to what
+/// instar wrote before differencing support existed; moving it
+/// unconditionally would change the bytes of every `create -f vpc`.
+///
 /// Fixed layout: phase 1 emits only the footer at byte
 /// `virtual_size`. The data region is left as a sparse hole; phase 6
-/// handles `preallocation=full` by writing zeros.
+/// handles `preallocation=full` by writing zeros. A `Fixed` subformat
+/// with a backing reference is refused with
+/// [`CreateError::BackingFileUnsupported`].
 pub fn plan_vhd<'a>(
     opts: &VhdCreateOpts<'_>,
     scratch: &'a mut [u8],
@@ -764,19 +844,49 @@ pub fn plan_vhd<'a>(
     if opts.virtual_size == 0 || opts.virtual_size > VHD_MAX_VIRTUAL_SIZE {
         return Err(CreateError::InvalidVirtualSize);
     }
-    if opts.backing.is_some() {
-        // Differencing VHD (DISK_TYPE_DIFFERENCING + parent locators)
-        // is deferred — too complex for phase 1.
-        return Err(CreateError::BackingFileUnsupported);
-    }
-
     const SECTOR: u64 = 512;
     const FOOTER_BYTES: usize = vhd::FOOTER_SIZE;
     const DYN_HEADER_BYTES: usize = vhd::DYNAMIC_HEADER_SIZE;
     const UUID_ZERO: [u8; 16] = [0; 16];
+    /// Bytes reserved for the parent locator platform data of a
+    /// differencing child: one sector, which is `platform_data_space`.
+    /// A byte count, not a sector count — SPEC(VHD)'s wording implies
+    /// the latter and measurement against Hyper-V's own differencing
+    /// VHDs showed it to be the former (docs/plans/PLAN-differencing.md).
+    const LOCATOR_DATA_BYTES: usize = SECTOR as usize;
 
     match opts.subformat {
         VhdSubformat::Dynamic => {
+            // A backing reference makes this a differencing child. The
+            // path is needed twice: as UTF-16BE in the dynamic header's
+            // parent unicode name, and as UTF-16LE in the locator
+            // platform data.
+            let parent_path: Option<&str> = match &opts.backing {
+                Some(b) => {
+                    if b.path.len() > MAX_BACKING_FILE_LEN {
+                        return Err(CreateError::BackingFileTooLong);
+                    }
+                    // Both destinations are UTF-16 fields, so a path
+                    // that is not valid UTF-8 cannot be represented at
+                    // all. Refuse rather than transcode lossily: a
+                    // mangled path names a different file. The host CLI
+                    // only ever supplies UTF-8 paths, so this is
+                    // reached from direct crate callers (the fuzzer)
+                    // rather than from a user.
+                    Some(
+                        core::str::from_utf8(b.path)
+                            .map_err(|_| CreateError::BackingFileUnsupported)?,
+                    )
+                }
+                None => None,
+            };
+            let differencing = parent_path.is_some();
+            let disk_type = if differencing {
+                vhd::DISK_TYPE_DIFFERENCING
+            } else {
+                vhd::DISK_TYPE_DYNAMIC
+            };
+
             if opts.block_size == 0
                 || !opts.block_size.is_power_of_two()
                 || opts.block_size < 512 * 1024
@@ -794,20 +904,29 @@ pub fn plan_vhd<'a>(
             let bat_bytes: u64 = max_table_entries as u64 * 4;
             let bat_padded: u64 = bat_bytes.div_ceil(SECTOR) * SECTOR;
 
+            // The locator data region exists only for a differencing
+            // child; a zero-length region leaves the BAT at 1536 and
+            // the scratch carving below byte-identical to the
+            // non-differencing layout, which every VHD instar has
+            // written until now and which golden comparisons pin.
+            let locator_bytes: usize = if differencing { LOCATOR_DATA_BYTES } else { 0 };
+
             let head_footer_off: u64 = 0;
             let dyn_header_off: u64 = SECTOR; // sector 1
-            let bat_off: u64 = SECTOR + DYN_HEADER_BYTES as u64;
+            let locator_data_off: u64 = SECTOR + DYN_HEADER_BYTES as u64; // 1536
+            let bat_off: u64 = locator_data_off + locator_bytes as u64;
             let tail_footer_off: u64 = bat_off + bat_padded;
             let total_file_size: u64 = tail_footer_off + FOOTER_BYTES as u64;
 
             let total_bytes_needed: usize =
-                FOOTER_BYTES * 2 + DYN_HEADER_BYTES + bat_padded as usize;
+                FOOTER_BYTES * 2 + DYN_HEADER_BYTES + locator_bytes + bat_padded as usize;
             if scratch.len() < total_bytes_needed {
                 return Err(CreateError::ScratchTooSmall);
             }
 
             let (head_footer_region, rest) = scratch.split_at_mut(FOOTER_BYTES);
             let (dyn_header_region, rest) = rest.split_at_mut(DYN_HEADER_BYTES);
+            let (locator_region, rest) = rest.split_at_mut(locator_bytes);
             let (bat_region, rest) = rest.split_at_mut(bat_padded as usize);
             let (tail_footer_region, _) = rest.split_at_mut(FOOTER_BYTES);
 
@@ -815,7 +934,7 @@ pub fn plan_vhd<'a>(
             vhd::build_footer(
                 head_footer_region,
                 opts.virtual_size,
-                vhd::DISK_TYPE_DYNAMIC,
+                disk_type,
                 dyn_header_off,
                 &UUID_ZERO,
             );
@@ -828,6 +947,48 @@ pub fn plan_vhd<'a>(
                 opts.block_size,
             );
 
+            if let Some(path) = parent_path {
+                // Parent unicode name, parent unique id and parent
+                // timestamp. The 255-UTF-16-code-unit cap lives inside
+                // this builder and is not re-checked here — a second
+                // implementation of the same limit is a second chance
+                // to disagree with it.
+                vhd::build_dynamic_header_parent(
+                    dyn_header_region,
+                    &opts.parent_unique_id,
+                    opts.parent_timestamp,
+                    path,
+                )
+                .map_err(map_vhd_build_error)?;
+
+                // Locator platform data: the same path again, UTF-16
+                // LITTLE endian this time, zero-padded to the sector.
+                locator_region.fill(0);
+                let data_len = vhd::build_parent_locator_data(path, locator_region)
+                    .map_err(map_vhd_build_error)?;
+
+                // One entry, in the first of the eight slots; the
+                // other seven stay zero. (`slot` is zero-based here;
+                // prose that numbers the slots from one calls this
+                // "slot 1".) `W2ku` names an absolute Windows-side path
+                // and `W2ru` a relative one, chosen from the path the
+                // user actually typed.
+                let platform_code: &[u8; 4] = if path.as_bytes().first() == Some(&b'/') {
+                    b"W2ku"
+                } else {
+                    b"W2ru"
+                };
+                vhd::build_parent_locator_entry(
+                    dyn_header_region,
+                    0,
+                    platform_code,
+                    LOCATOR_DATA_BYTES as u32,
+                    data_len as u32,
+                    locator_data_off,
+                )
+                .map_err(map_vhd_build_error)?;
+            }
+
             // BAT: meaningful entries are 0xFF, padding is zero.
             bat_region[..bat_bytes as usize].fill(0xFF);
             bat_region[bat_bytes as usize..bat_padded as usize].fill(0);
@@ -836,7 +997,7 @@ pub fn plan_vhd<'a>(
             vhd::build_footer(
                 tail_footer_region,
                 opts.virtual_size,
-                vhd::DISK_TYPE_DYNAMIC,
+                disk_type,
                 dyn_header_off,
                 &UUID_ZERO,
             );
@@ -850,6 +1011,12 @@ pub fn plan_vhd<'a>(
                 byte_offset: dyn_header_off,
                 bytes: dyn_header_region,
             })?;
+            if differencing {
+                plan.push(MetadataWrite {
+                    byte_offset: locator_data_off,
+                    bytes: locator_region,
+                })?;
+            }
             plan.push(MetadataWrite {
                 byte_offset: bat_off,
                 bytes: bat_region,
@@ -862,6 +1029,17 @@ pub fn plan_vhd<'a>(
             Ok(plan)
         }
         VhdSubformat::Fixed => {
+            if opts.backing.is_some() {
+                // A differencing VHD is Dynamic-only: `disk_type = 4`
+                // means "the BAT says which blocks are mine and the
+                // rest come from my parent", and a fixed VHD has
+                // neither a BAT nor a dynamic header to hold the parent
+                // locators. Hyper-V produces no such image and
+                // SPEC(VHD) describes none. This is the existing error
+                // with its existing meaning: this target format, in
+                // this subformat, does not support backing files.
+                return Err(CreateError::BackingFileUnsupported);
+            }
             if scratch.len() < FOOTER_BYTES {
                 return Err(CreateError::ScratchTooSmall);
             }
@@ -1387,6 +1565,8 @@ mod vhd_plan_tests {
             subformat: VhdSubformat::Dynamic,
             block_size: 2 * 1024 * 1024, // 2 MiB
             backing: None,
+            parent_unique_id: [0; 16],
+            parent_timestamp: 0,
         }
     }
 
@@ -1396,6 +1576,8 @@ mod vhd_plan_tests {
             subformat: VhdSubformat::Fixed,
             block_size: 0,
             backing: None,
+            parent_unique_id: [0; 16],
+            parent_timestamp: 0,
         }
     }
 
@@ -1463,9 +1645,13 @@ mod vhd_plan_tests {
         assert_eq!(entry, 0xFFFF_FFFF);
     }
 
+    /// A `Fixed` VHD still refuses a backing reference: `disk_type = 4`
+    /// needs the BAT and dynamic header a fixed image does not have.
+    /// The `Dynamic` arm now emits a differencing child instead; step
+    /// 5e covers it.
     #[test]
-    fn plan_vhd_rejects_backing() {
-        let mut opts = default_dynamic(1 << 20);
+    fn plan_vhd_fixed_rejects_backing() {
+        let mut opts = default_fixed(1 << 20);
         opts.backing = Some(BackingRef {
             path: b"parent.vhd",
             format: Some(ImageFormat::Vhd),

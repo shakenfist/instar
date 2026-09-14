@@ -101,6 +101,12 @@ fn map_create_error(e: CreateError) -> u32 {
         | CreateError::InvalidSubformat => CreateResult::ERROR_INVALID_OPTION,
         CreateError::BackingFileTooLong => CreateResult::ERROR_BACKING_TOO_LONG,
         CreateError::BackingFileUnsupported => CreateResult::ERROR_INVALID_OPTION,
+        // Its own code rather than ERROR_BACKING_TOO_LONG: that one's
+        // host message names a 1024-byte limit, and this refusal is
+        // about a 512-byte UTF-16 field that a 300-byte ASCII path can
+        // overflow. Telling a user their 300-byte path exceeded 1024
+        // bytes is a false diagnostic.
+        CreateError::ParentNameTooLong => CreateResult::ERROR_PARENT_NAME_TOO_LONG,
         CreateError::Overflow => CreateResult::ERROR_INVALID_SIZE,
         CreateError::ScratchTooSmall => CreateResult::ERROR_SCRATCH_TOO_SMALL,
         // PreallocationUnsupported reuses INVALID_OPTION until 6c
@@ -319,6 +325,14 @@ fn vhd_opts_from<'a>(
             config.block_size
         },
         backing,
+        // Zeros, because the guest has no way to read the parent's
+        // footer yet; docs/plans/PLAN-differencing.md tracks the step
+        // that gives it one. These values are never used:
+        // the `ImageFormat::Vhd` arm below refuses a vpc target with a
+        // backing file before `plan_vhd` is called, precisely so a
+        // zeroed parent identity cannot reach an image.
+        parent_unique_id: [0u8; 16],
+        parent_timestamp: 0,
     }
 }
 
@@ -660,6 +674,26 @@ pub unsafe extern "C" fn _start() -> u64 {
             }
         }
         ImageFormat::Vhd => {
+            // `plan_vhd` can now emit a differencing child, but the
+            // guest must not reach it until it can read the parent's
+            // footer -- see docs/plans/PLAN-differencing.md. Without
+            // that, `vhd_opts_from` above hands the planner an all-zero
+            // `parent_unique_id`. That happens to be correct for an
+            // instar-created parent -- every VHD instar writes has an
+            // all-zero footer id (#566) -- and is wrong for every
+            // third-party one, which would get a child claiming a parent
+            // identity its parent does not have. **Remove this guard in
+            // the same change that teaches the guest to read the
+            // parent's footer**, not before. Refusing with
+            // `BackingFileUnsupported` is exactly the error a user gets
+            // today, so the emitter is invisible from outside.
+            if backing_ref.is_some() {
+                return fail_with(
+                    call_table,
+                    config.target_format,
+                    map_create_error(CreateError::BackingFileUnsupported),
+                );
+            }
             let opts = vhd_opts_from(config, virtual_size, backing_ref);
             let unit = match opts.subformat {
                 VhdSubformat::Fixed => 0,
