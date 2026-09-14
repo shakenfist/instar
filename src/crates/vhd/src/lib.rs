@@ -184,6 +184,10 @@ pub struct VhdFooter {
     pub features: u32,
     pub format_version: u32,
     pub data_offset: u64,
+    /// Creation timestamp, in seconds since 2000-01-01 00:00:00 UTC (the
+    /// VHD epoch). This is 946684800 seconds after the Unix epoch, so a
+    /// caller that wants a Unix timestamp must add that offset.
+    pub timestamp: u32,
     pub original_size: u64,
     pub current_size: u64,
     pub cylinders: u16,
@@ -212,6 +216,7 @@ impl VhdFooter {
         let features = be_u32(buf, FOOTER_FEATURES_OFFSET);
         let format_version = be_u32(buf, FOOTER_FORMAT_VERSION_OFFSET);
         let data_offset = be_u64(buf, FOOTER_DATA_OFFSET_OFFSET);
+        let timestamp = be_u32(buf, FOOTER_TIMESTAMP_OFFSET);
         let original_size = be_u64(buf, FOOTER_ORIGINAL_SIZE_OFFSET);
         let current_size = be_u64(buf, FOOTER_CURRENT_SIZE_OFFSET);
 
@@ -230,6 +235,7 @@ impl VhdFooter {
             features,
             format_version,
             data_offset,
+            timestamp,
             original_size,
             current_size,
             cylinders,
@@ -1960,6 +1966,40 @@ mod tests {
         let footer = VhdFooter::parse(&buf).unwrap();
         assert_eq!(footer.disk_type, DISK_TYPE_FIXED);
         assert_eq!(footer.data_offset, data_off);
+    }
+
+    #[test]
+    fn footer_parse_timestamp_offset_24() {
+        // Build a footer where the timestamp, data_offset, original_size
+        // and current_size are all distinct in every byte, so that
+        // reading `timestamp` from the wrong offset (or the wrong
+        // width) produces a value that does not match any of the
+        // assertions below. A test that used equal or all-zero
+        // neighbours would pass even if `timestamp` were wired to
+        // FOOTER_ORIGINAL_SIZE_OFFSET or FOOTER_DATA_OFFSET_OFFSET by
+        // mistake.
+        let mut buf = make_footer(0x0000_0003_0000_0000, DISK_TYPE_DYNAMIC, 0);
+        write_be_u64(&mut buf, FOOTER_DATA_OFFSET_OFFSET, 0xAAAA_AAAA_BBBB_BBBB);
+        write_be_u32(&mut buf, FOOTER_TIMESTAMP_OFFSET, 0x1A2B_3C4D);
+        write_be_u64(&mut buf, FOOTER_ORIGINAL_SIZE_OFFSET, 0x1111_1111_2222_2222);
+        write_be_u64(&mut buf, FOOTER_CURRENT_SIZE_OFFSET, 0x3333_3333_4444_4444);
+
+        let footer = VhdFooter::parse(&buf).unwrap();
+
+        assert_eq!(footer.timestamp, 0x1A2B_3C4D);
+        assert_eq!(footer.original_size, 0x1111_1111_2222_2222);
+        assert_eq!(footer.current_size, 0x3333_3333_4444_4444);
+        assert_eq!(footer.data_offset, 0xAAAA_AAAA_BBBB_BBBB);
+
+        // No assert_ne! follows deliberately. Once the assert_eq!s above
+        // have pinned each field to its own literal, comparing those
+        // literals against each other is constant-true and checks
+        // nothing. What makes this test load-bearing is the choice of
+        // constants: no two of them share a 32-bit half, so a timestamp
+        // read from FOOTER_DATA_OFFSET_OFFSET, FOOTER_ORIGINAL_SIZE_OFFSET
+        // or FOOTER_CURRENT_SIZE_OFFSET -- or from the wrong half of any
+        // of them -- fails the first assertion rather than passing by
+        // coincidence.
     }
 
     #[test]
