@@ -426,6 +426,32 @@ else; both can run first. 5c depends on 5a and 5b. 5d depends on
 * **The fuzz target starts failing on unrelated PRs.** 5f runs it
   deliberately rather than waiting for the nightly to find it.
 
+  *Found in review:* this risk's mitigation, and survey finding 5,
+  both claimed `fuzz_create_emitters` carries a
+  non-overlapping-writes oracle. **It did not** — `assert_invariants`
+  checked bookkeeping, write containment, overflow and the write
+  count, and the overlap check lived only in
+  `crates/create/tests/round_trip.rs::assert_plan_invariants`. The
+  oracle has been added to the fuzz target rather than the claim
+  softened, because it now applies to all four emitters and the
+  differencing layout is exactly the kind of change that breaks it.
+
+* **The locator entry says "Windows" and holds a POSIX path.**
+  *Found in review, deliberately not fixed here — issue #570.* The
+  platform code is chosen from the typed path's first byte, so
+  `/srv/images/parent.vhd` is emitted as `W2ku`, which SPEC(VHD)
+  defines as an absolute Unicode pathname *on Windows*; measured
+  Hyper-V output writes `.\fat-parent.vhd` and `C:\Projects\...`
+  instead. A Windows reader could resolve instar's string
+  drive-relative, and a user who types a Windows path gets it
+  labelled relative. *Mitigation:* nothing user-reachable emits these
+  bytes while decision 8's guard stands, and the parent unicode name
+  field — the only one libvhdi and qemu actually read — is
+  unaffected. Settling it means reopening open question 3, which no
+  oracle in reach can arbitrate, so it is recorded in
+  `docs/quirks.md` and must be decided before the guard is removed
+  rather than inherited by the phase that removes it.
+
 ## Definition of done
 
 * `plan_vhd` with a `Dynamic` subformat and a backing reference

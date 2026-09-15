@@ -290,6 +290,19 @@ Out of scope, and deliberately left to their own work:
    `relative_path` or `absolute_win32_path`, and never
    `volume_path` (which needs a Windows volume GUID) or
    `parent_linkage2`.
+   **Reopened in part, 2026-09-15, by the review of the phase 5
+   pull request (#568).** This answer settled *which* entries to
+   emit; it did not consider that the one path string the guest is
+   handed is a POSIX path, while `W2ku` and `W2ru` are defined as
+   Windows paths and measured Hyper-V output writes
+   `.\fat-parent.vhd` and `C:\Projects\...`. The emitter as built
+   writes the typed path verbatim under those codes, so a Windows
+   reader could resolve it drive-relative. Issue #570 carries the
+   options and the evidence, and must be settled before phase 7
+   removes the guard that currently stops any user reaching the
+   emitter. The reasoning above — one entry, never a fabricated
+   second — is unaffected, as is the parent unicode name field,
+   which is the only one libvhdi and qemu read.
 4. **Does an instar-only capability need an opt-in flag?**
    RESOLVED 2026-09-05: **no flag.** instar already performs
    vmdk/vhd/vhdx `resize` and vmdk `rebase` where qemu-img

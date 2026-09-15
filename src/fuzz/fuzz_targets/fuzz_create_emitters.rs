@@ -248,6 +248,29 @@ fn assert_invariants(plan: &MetadataPlan<'_>, target_sel: u8) {
         plan.writes().len(),
         MAX_METADATA_WRITES
     );
+
+    // Invariant 5: no two writes overlap.
+    //
+    // A plan whose regions overlap silently writes one structure over
+    // another -- the failure mode a layout change introduces, where
+    // every other invariant here still holds because the bookkeeping is
+    // self-consistent. It matters most for the newest layout: a
+    // differencing VHD inserts a locator region between the dynamic
+    // header and the BAT, and getting that offset wrong lands it on one
+    // of them.
+    let mut spans: Vec<(u64, u64)> = plan
+        .writes()
+        .iter()
+        .map(|w| (w.byte_offset, w.byte_offset + w.bytes.len() as u64))
+        .collect();
+    spans.sort_unstable();
+    for pair in spans.windows(2) {
+        assert!(
+            pair[0].1 <= pair[1].0,
+            "target {}: writes overlap -- [{}, {}) and [{}, {})",
+            target_sel, pair[0].0, pair[0].1, pair[1].0, pair[1].1
+        );
+    }
 }
 
 /// Each format rounds an arbitrary input virtual_size up to its

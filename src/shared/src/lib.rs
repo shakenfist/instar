@@ -303,22 +303,34 @@ pub fn utf16_to_utf8(src: &[u8], big_endian: bool, dst: &mut [u8]) -> Option<usi
 /// exists to produce has no terminator at all. A caller that wants a
 /// NUL to end the string early must truncate `src` itself first.
 ///
-/// Returns `None` when `dst` cannot hold the full encoding; nothing
-/// beyond the point of failure is written, though bytes from `char`s
-/// already encoded before the failing one remain in `dst`, same as
-/// `utf16_to_utf8`. Whether the result overflows some length limit
-/// (VHD's parent-name and locator fields cap out at 256 UTF-16 code
-/// units) is not this function's business -- that policy belongs to
-/// the caller, which knows which field it is filling.
+/// Returns `None` when `dst` cannot hold the full encoding, **having
+/// first zeroed everything it had written**. That guarantee matters
+/// more here than symmetry with `utf16_to_utf8` would suggest: a
+/// partial encoding is a truncated path, a truncated path names a
+/// different file, and for a character outside the BMP the leftover
+/// can even be a lone high surrogate whose low half did not fit.
+/// Keeping "nothing usable was written" true of this function rather
+/// than of each caller means the next caller cannot get it wrong by
+/// not reading this paragraph.
+///
+/// Whether the result overflows some length limit is not this
+/// function's business -- that policy belongs to the caller, which
+/// knows which field it is filling. VHD's parent unicode name field
+/// physically holds 256 UTF-16 code units and instar's emitter caps
+/// itself at 255 so a terminating NUL stays inside it; both numbers
+/// are enforced by `crates/vhd`, not here.
 pub fn utf8_to_utf16(src: &str, big_endian: bool, dst: &mut [u8]) -> Option<usize> {
     let mut out = 0usize;
 
     for ch in src.chars() {
         let mut units = [0u16; 2];
         for &unit in ch.encode_utf16(&mut units).iter() {
-            let end = out.checked_add(2)?;
+            let end = match out.checked_add(2) {
+                Some(end) => end,
+                None => return utf16_encode_refuse(dst, out),
+            };
             if end > dst.len() {
-                return None;
+                return utf16_encode_refuse(dst, out);
             }
             if big_endian {
                 write_be_u16(dst, out, unit);
@@ -330,6 +342,15 @@ pub fn utf8_to_utf16(src: &str, big_endian: bool, dst: &mut [u8]) -> Option<usiz
     }
 
     Some(out)
+}
+
+/// Zero the bytes already written, then report failure.
+///
+/// Split out so the refusal reads as one decision rather than as
+/// bookkeeping repeated wherever the encoder can run out of room.
+fn utf16_encode_refuse(dst: &mut [u8], written: usize) -> Option<usize> {
+    dst[..written].fill(0);
+    None
 }
 
 /// Decode a UTF-16 field with [`utf16_to_utf8`] and NUL-terminate the

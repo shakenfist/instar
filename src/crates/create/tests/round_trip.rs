@@ -20,8 +20,8 @@
 use create::{
     plan_qcow2, plan_vhd, plan_vhdx, plan_vmdk, BackingRef, CreateError, MetadataPlan,
     MetadataWrite, Qcow2CreateOpts, VhdCreateOpts, VhdSubformat, VhdxCreateOpts, VmdkCreateOpts,
-    VmdkSubformat, QCOW2_MAX_METADATA_SCRATCH, VHDX_MAX_METADATA_SCRATCH, VHD_MAX_METADATA_SCRATCH,
-    VMDK_MAX_METADATA_SCRATCH,
+    VmdkSubformat, MAX_BACKING_FILE_LEN, QCOW2_MAX_METADATA_SCRATCH, VHDX_MAX_METADATA_SCRATCH,
+    VHD_MAX_METADATA_SCRATCH, VMDK_MAX_METADATA_SCRATCH,
 };
 use shared::ImageFormat;
 
@@ -969,4 +969,135 @@ fn vhd_non_differencing_output_matches_develop() {
         "golden line count differs",
     );
     assert_eq!(out, GOLDEN_VHD_NO_BACKING);
+}
+
+/// The differencing layout, swept across geometries rather than pinned at
+/// one.
+///
+/// Every other differencing test runs through `materialise_differencing`,
+/// which fixes 1 GiB / 2 MiB. That is fine for the field encodings, which
+/// do not depend on geometry, and useless for the layout rules, which do:
+/// the locator region sits between two structures whose sizes change with
+/// the image. The interesting extreme is the smallest image, where the BAT
+/// is a single sector and the tail footer lands at 2560 — the case closest
+/// to `locator_defect`'s `OverlapsFooter` rule, which no fixed-geometry
+/// test can approach. `assert_plan_invariants` also does real work here,
+/// because it is the overlap check.
+#[test]
+fn vhd_differencing_layout_holds_across_geometries() {
+    let sizes: &[u64] = &[1 << 20, 1 << 25, 1 << 30, 1 << 32];
+    let block_sizes: &[u32] = &[512 * 1024, 2 * 1024 * 1024, 32 * 1024 * 1024];
+    let path = "parent.vhd";
+
+    for &virtual_size in sizes {
+        for &block_size in block_sizes {
+            let opts = VhdCreateOpts {
+                virtual_size,
+                block_size,
+                ..diff_opts(path)
+            };
+            let mut scratch = vec![0u8; VHD_MAX_METADATA_SCRATCH];
+            let plan = plan_vhd(&opts, &mut scratch)
+                .unwrap_or_else(|e| panic!("vsize={virtual_size} bsize={block_size}: {e:?}"));
+            assert_plan_invariants(&plan);
+
+            let writes = plan.writes();
+            assert_eq!(writes.len(), 5, "vsize={virtual_size} bsize={block_size}");
+            assert_eq!(
+                (writes[2].byte_offset, writes[2].bytes.len()),
+                (DIFF_LOCATOR_DATA_OFF as u64, 512),
+                "locator region moved: vsize={virtual_size} bsize={block_size}"
+            );
+            assert_eq!(
+                writes[3].byte_offset, DIFF_BAT_OFF,
+                "BAT moved: vsize={virtual_size} bsize={block_size}"
+            );
+
+            // The tail footer is the structure the locator region gets
+            // closest to on a small image; prove the parser is content
+            // with the placement at every geometry, not just the roomy
+            // one.
+            let bytes = materialise(&plan);
+            let bounds = diff_bounds(&bytes);
+            let info =
+                vhd::VhdParentInfo::parse(dyn_header(&bytes), &bounds).expect("parent info parses");
+            let entry = info.locators.entries[0];
+            assert_eq!(
+                entry.defect, None,
+                "locator defective at vsize={virtual_size} bsize={block_size}"
+            );
+            assert_eq!(entry.platform_data_offset, DIFF_LOCATOR_DATA_OFF as u64);
+            assert_eq!(entry.platform_data_space, 512);
+        }
+    }
+}
+
+/// An empty backing path is refused rather than emitted.
+///
+/// Found in review. `MAX_BACKING_FILE_LEN` bounded the top end and
+/// nothing bounded the bottom, so `BackingRef { path: b"", .. }` planned
+/// a `disk_type = 4` image whose locator carried
+/// `platform_data_length == 0` — which this crate's own parser calls
+/// `VhdLocatorDefect::EmptyData`. `fuzz_create_emitters` reached it and
+/// none of its oracles looked at locator defects, so it passed silently.
+#[test]
+fn vhd_differencing_refuses_an_empty_parent_path() {
+    let opts = VhdCreateOpts {
+        backing: Some(BackingRef {
+            path: b"",
+            format: Some(ImageFormat::Vhd),
+        }),
+        ..diff_opts("unused")
+    };
+    let mut scratch = vec![0u8; VHD_MAX_METADATA_SCRATCH];
+    assert_eq!(
+        plan_vhd(&opts, &mut scratch).unwrap_err(),
+        CreateError::BackingFileUnsupported
+    );
+}
+
+/// A backing path over `MAX_BACKING_FILE_LEN` is `BackingFileTooLong`,
+/// not `ParentNameTooLong`.
+///
+/// The two limits are different facts — 1024 UTF-8 bytes the call table
+/// accepts, versus 255 UTF-16 code units the VHD field holds — and they
+/// have different host messages. A path over both must report the one the
+/// generic check owns, so the boundary between them stays visible.
+#[test]
+fn vhd_differencing_distinguishes_the_two_length_limits() {
+    let long = "a".repeat(MAX_BACKING_FILE_LEN + 1);
+    let opts = VhdCreateOpts {
+        backing: Some(BackingRef {
+            path: long.as_bytes(),
+            format: Some(ImageFormat::Vhd),
+        }),
+        ..diff_opts("unused")
+    };
+    let mut scratch = vec![0u8; VHD_MAX_METADATA_SCRATCH];
+    assert_eq!(
+        plan_vhd(&opts, &mut scratch).unwrap_err(),
+        CreateError::BackingFileTooLong
+    );
+}
+
+/// A backing path that is not valid UTF-8 cannot reach a UTF-16 field.
+///
+/// Unreachable from the CLI — the VMM's backing argument is a `String`,
+/// so clap refuses non-UTF-8 first — but `fuzz_create_emitters` feeds
+/// arbitrary bytes, and a lossy transcode here would name a different
+/// file.
+#[test]
+fn vhd_differencing_refuses_a_non_utf8_parent_path() {
+    let opts = VhdCreateOpts {
+        backing: Some(BackingRef {
+            path: &[0x66, 0x6f, 0xff, 0x6f],
+            format: Some(ImageFormat::Vhd),
+        }),
+        ..diff_opts("unused")
+    };
+    let mut scratch = vec![0u8; VHD_MAX_METADATA_SCRATCH];
+    assert_eq!(
+        plan_vhd(&opts, &mut scratch).unwrap_err(),
+        CreateError::BackingFileUnsupported
+    );
 }

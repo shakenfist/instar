@@ -1957,6 +1957,13 @@ pub enum VhdBuildError {
     /// the UTF-8 length: a character outside the BMP costs two code
     /// units, and a BMP character can cost three UTF-8 bytes.
     ParentNameTooLong,
+    /// The parent path is empty. An empty name encodes to zero bytes, so
+    /// the locator entry that describes it would carry
+    /// `platform_data_length == 0`, which [`VhdParentLocator::parse`]
+    /// marks as [`VhdLocatorDefect::EmptyData`]. Refused at emit time
+    /// for the same reason as [`Self::LocatorLengthExceedsSpace`]: this
+    /// crate does not write an image its own parser calls defective.
+    ParentNameEmpty,
     /// The locator slot is not in `0..`[`PARENT_LOCATOR_COUNT`].
     LocatorSlotOutOfRange,
     /// `platform_data_length > platform_data_space`, which
@@ -2007,12 +2014,18 @@ pub enum VhdBuildError {
 /// maps this variant onto it, rather than pre-counting code units and
 /// risking a second, disagreeing implementation of the same limit.
 ///
-/// The bound enforced is the field's capacity: 256 UTF-16 code units. Note
-/// that [`DYN_PARENT_NAME_SIZE`]'s documentation describes a stricter
-/// *emitter policy* of at most 255 code units, so that everything instar
-/// writes keeps a terminating NUL inside the field; a caller wanting that
-/// policy must apply it on top of this function, which enforces only what
-/// the field can physically hold.
+/// The bound enforced is **255** UTF-16 code units, not the 256 the
+/// field could physically hold: the encoder is handed two bytes less
+/// than [`DYN_PARENT_NAME_SIZE`], so the last code unit is always zero
+/// and a terminating NUL stays inside the field. A 256-code-unit name
+/// fills all 512 bytes with no terminator, which is the image that
+/// trips libvhdi defect C -- the oracle reads past the field into the
+/// locator table and reports a parent filename with a stray character
+/// appended. This matches the emitter policy in
+/// [`DYN_PARENT_NAME_SIZE`]'s own documentation; the 256 there is the
+/// *parse*-side bound, and the two numbers are opposite directions of
+/// the same field. **Callers must not re-check this** -- see the
+/// section above.
 ///
 /// # The checksum
 ///
@@ -2037,6 +2050,9 @@ pub fn build_dynamic_header_parent(
 ) -> Result<usize, VhdBuildError> {
     if buf.len() < DYNAMIC_HEADER_SIZE {
         return Err(VhdBuildError::BufferTooSmall);
+    }
+    if parent_name.is_empty() {
+        return Err(VhdBuildError::ParentNameEmpty);
     }
 
     // Encode into scratch first. `shared::utf8_to_utf16` leaves the bytes
@@ -2127,6 +2143,14 @@ pub fn build_parent_locator_entry(
     if platform_data_length > platform_data_space {
         return Err(VhdBuildError::LocatorLengthExceedsSpace);
     }
+    // A populated platform code with a zero data length is
+    // `VhdLocatorDefect::EmptyData` to this crate's own parser, so it is
+    // refused here rather than written. The two checks together are what
+    // make "every entry this crate emits parses defect-free" an
+    // invariant of the builder instead of a property of its callers.
+    if platform_data_length == 0 {
+        return Err(VhdBuildError::ParentNameEmpty);
+    }
 
     // slot < 8, so off + 24 <= 576 + 192 = 768, inside the length checked
     // above. No arithmetic below can leave the buffer.
@@ -2165,9 +2189,20 @@ pub fn build_parent_locator_entry(
 /// which would name a different file — can never reach an image even if
 /// the caller ignores the error.
 pub fn build_parent_locator_data(path: &str, dst: &mut [u8]) -> Result<usize, VhdBuildError> {
+    if path.is_empty() {
+        return Err(VhdBuildError::ParentNameEmpty);
+    }
     match utf8_to_utf16(path, false, dst) {
         Some(n) => Ok(n),
         None => {
+            // `shared::utf8_to_utf16` already zeroed the prefix it
+            // wrote, which is enough to guarantee no partially encoded
+            // path survives. The whole buffer is zeroed anyway, because
+            // this one is a locator sector and the caller writes all
+            // 512 bytes of it: leaving the tail as whatever the caller
+            // had there would put uninitialised scratch into an image.
+            // Kept deliberately rather than deleted as redundant --
+            // the two zeroings answer different questions.
             dst.fill(0);
             Err(VhdBuildError::BufferTooSmall)
         }
@@ -4136,6 +4171,37 @@ mod tests {
         // The last code unit is the final 'd', and nothing follows it.
         assert_eq!(&dst[n - 2..n], &[b'd', 0x00]);
         assert!(dst[n..].iter().all(|&b| b == 0xAA));
+    }
+
+    #[test]
+    fn emit_refuses_an_empty_parent_name_everywhere() {
+        // Found in review. An empty name encodes to zero bytes, so the
+        // locator describing it carries platform_data_length == 0, which
+        // this crate's own parser calls EmptyData. The invariant worth
+        // holding is that the builder never emits an entry its parser
+        // rejects -- so all three entry points refuse, not just the one
+        // a caller happens to use first.
+        let mut buf = emit_base_header();
+        let before = buf;
+        assert_eq!(
+            build_dynamic_header_parent(&mut buf, &EMIT_PARENT_ID, 0, ""),
+            Err(VhdBuildError::ParentNameEmpty)
+        );
+        assert_eq!(buf, before, "a refusal must leave the header untouched");
+
+        let mut dst = [0u8; 512];
+        assert_eq!(
+            build_parent_locator_data("", &mut dst),
+            Err(VhdBuildError::ParentNameEmpty)
+        );
+
+        // And the entry builder refuses a zero length directly, so a
+        // caller that computed one some other way cannot get past it.
+        let mut buf = emit_base_header();
+        assert_eq!(
+            build_parent_locator_entry(&mut buf, 0, b"W2ru", 512, 0, 1536),
+            Err(VhdBuildError::ParentNameEmpty)
+        );
     }
 
     #[test]

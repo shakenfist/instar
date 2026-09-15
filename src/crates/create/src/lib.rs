@@ -500,6 +500,13 @@ fn map_vhd_build_error(e: vhd::VhdBuildError) -> CreateError {
         // rather than a user input; report it as the scratch problem it
         // would be.
         vhd::VhdBuildError::BufferTooSmall => CreateError::ScratchTooSmall,
+        // An empty backing path. The generic length check above bounds
+        // the top end and nothing bounded the bottom, so `-b ""` reached
+        // the emitter and produced a locator this crate's own parser
+        // calls EmptyData. It is a bad option rather than a bad size,
+        // and the host renders BackingFileUnsupported as "invalid option
+        // for target format", which is what an empty path is.
+        vhd::VhdBuildError::ParentNameEmpty => CreateError::BackingFileUnsupported,
         // Unreachable from this crate: the slot is the literal 0, and
         // the platform data length is bounded by the 255-code-unit name
         // cap at 510 bytes against a 512-byte space. Mapped rather than
@@ -869,10 +876,22 @@ pub fn plan_vhd<'a>(
                     // Both destinations are UTF-16 fields, so a path
                     // that is not valid UTF-8 cannot be represented at
                     // all. Refuse rather than transcode lossily: a
-                    // mangled path names a different file. The host CLI
-                    // only ever supplies UTF-8 paths, so this is
-                    // reached from direct crate callers (the fuzzer)
-                    // rather than from a user.
+                    // mangled path names a different file.
+                    //
+                    // BackingFileUnsupported is accurate rather than
+                    // merely convenient here -- the host renders it as
+                    // "invalid option for target format", and a path
+                    // this target format cannot encode is exactly that.
+                    // It is not the BackingFileTooLong situation, where
+                    // the message would have named a specific wrong
+                    // number.
+                    //
+                    // **What keeps this unreachable from the CLI is that
+                    // the VMM's backing argument is a `String`, so clap
+                    // rejects non-UTF-8 before it can get here.** If
+                    // that ever becomes an `OsString`, this is the line
+                    // that needs its own error code; today only direct
+                    // crate callers (the fuzzer) reach it.
                     Some(
                         core::str::from_utf8(b.path)
                             .map_err(|_| CreateError::BackingFileUnsupported)?,
