@@ -273,6 +273,86 @@ pub fn utf16_to_utf8(src: &[u8], big_endian: bool, dst: &mut [u8]) -> Option<usi
     Some(out)
 }
 
+/// Encode UTF-8 into UTF-16, writing into a caller-supplied buffer.
+///
+/// `src` is encoded as UTF-16 code units, big endian when `big_endian`
+/// is true and little endian otherwise, written two bytes at a time to
+/// `dst`. Each `char` of `src` is split into its code unit(s) with
+/// [`char::encode_utf16`] and written by hand rather than through any
+/// allocating path, matching this crate's `no_std` contract. Returns
+/// the number of bytes written to `dst` (always even).
+///
+/// This is the mirror image of [`utf16_to_utf8`], with the same
+/// explicit, mandatory `big_endian` flag and no default, because the
+/// VHD/VHDX formats this exists for need both endiannesses at once:
+/// the differencing parent's unicode name field is UTF-16 *big*
+/// endian, while the `W2ru`/`W2ku` parent locator platform data is
+/// UTF-16 *little* endian. A future "simplification" that dropped the
+/// flag in favour of one fixed endianness would silently write a
+/// parent name or locator that no Windows reader can resolve.
+///
+/// `src` is a `&str`, so it is already known to be valid UTF-8 by
+/// construction -- there is no analogue of `utf16_to_utf8`'s malformed-
+/// input refusals here. A `src` containing an embedded NUL is encoded
+/// like any other character: `'\u{0}'` becomes the ordinary two-byte
+/// code unit `0x0000`, not a terminator and not a reason to refuse.
+/// Unlike `utf16_to_utf8`, which stops at a NUL because it is
+/// unpacking a NUL-terminated field out of a fixed-size buffer, this
+/// function has no such field to honour -- it encodes exactly the
+/// `str` it is given, in full, and the VHD locator platform data it
+/// exists to produce has no terminator at all. A caller that wants a
+/// NUL to end the string early must truncate `src` itself first.
+///
+/// Returns `None` when `dst` cannot hold the full encoding, **having
+/// first zeroed everything it had written**. That guarantee matters
+/// more here than symmetry with `utf16_to_utf8` would suggest: a
+/// partial encoding is a truncated path, a truncated path names a
+/// different file, and for a character outside the BMP the leftover
+/// can even be a lone high surrogate whose low half did not fit.
+/// Keeping "nothing usable was written" true of this function rather
+/// than of each caller means the next caller cannot get it wrong by
+/// not reading this paragraph.
+///
+/// Whether the result overflows some length limit is not this
+/// function's business -- that policy belongs to the caller, which
+/// knows which field it is filling. VHD's parent unicode name field
+/// physically holds 256 UTF-16 code units and instar's emitter caps
+/// itself at 255 so a terminating NUL stays inside it; both numbers
+/// are enforced by `crates/vhd`, not here.
+pub fn utf8_to_utf16(src: &str, big_endian: bool, dst: &mut [u8]) -> Option<usize> {
+    let mut out = 0usize;
+
+    for ch in src.chars() {
+        let mut units = [0u16; 2];
+        for &unit in ch.encode_utf16(&mut units).iter() {
+            let end = match out.checked_add(2) {
+                Some(end) => end,
+                None => return utf16_encode_refuse(dst, out),
+            };
+            if end > dst.len() {
+                return utf16_encode_refuse(dst, out);
+            }
+            if big_endian {
+                write_be_u16(dst, out, unit);
+            } else {
+                write_le_u16(dst, out, unit);
+            }
+            out = end;
+        }
+    }
+
+    Some(out)
+}
+
+/// Zero the bytes already written, then report failure.
+///
+/// Split out so the refusal reads as one decision rather than as
+/// bookkeeping repeated wherever the encoder can run out of room.
+fn utf16_encode_refuse(dst: &mut [u8], written: usize) -> Option<usize> {
+    dst[..written].fill(0);
+    None
+}
+
 /// Decode a UTF-16 field with [`utf16_to_utf8`] and NUL-terminate the
 /// result in place, as a caller building a fixed-size, NUL-terminated
 /// C-string buffer (the shape every `send_info_result*` backing-file
@@ -3438,6 +3518,15 @@ impl CreateResult {
     /// unrecognised format" about a valid image is the same undiagnosed
     /// failure issue #548 was filed over.
     pub const ERROR_BACKING_DIFFERENCING: u32 = 11;
+    /// The backing path does not fit the target format's parent-name
+    /// field. VHD's parent unicode name holds 512 bytes of UTF-16 and
+    /// instar caps it at 255 code units so a terminating NUL stays
+    /// inside the field. Distinguished from ERROR_BACKING_TOO_LONG,
+    /// whose limit is the generic 1024 *bytes* of the call-table
+    /// `backing_file` field: a 300-byte ASCII path clears that and
+    /// still overflows this one, so reusing the code would report a
+    /// limit the path never came near.
+    pub const ERROR_PARENT_NAME_TOO_LONG: u32 = 12;
 
     /// True if magic matches.
     pub fn is_valid(&self) -> bool {
@@ -6524,6 +6613,114 @@ mod tests {
 
         let mut short = [0u8; 3];
         assert_eq!(utf16_to_utf8(&src[..n], false, &mut short), None);
+    }
+
+    // ------------------------------------------------------------------
+    // utf8_to_utf16 (the inverse of utf16_to_utf8, tested as a round
+    // trip over the same cases: ASCII in both endiannesses, a
+    // surrogate pair, a multi-byte BMP form, and a dst exactly one
+    // byte too small)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn utf8_to_utf16_ascii_round_trip_both_endiannesses() {
+        let mut be = [0u8; 32];
+        let mut expected_be = [0u8; 32];
+        let n = utf16_ascii(b"parent.vhd", true, &mut expected_be);
+        assert_eq!(utf8_to_utf16("parent.vhd", true, &mut be), Some(20));
+        assert_eq!(&be[..20], &expected_be[..n]);
+
+        let mut out = [0u8; 32];
+        assert_eq!(utf16_to_utf8(&be[..20], true, &mut out), Some(10));
+        assert_eq!(&out[..10], b"parent.vhd");
+
+        let mut le = [0u8; 32];
+        let mut expected_le = [0u8; 32];
+        let n = utf16_ascii(b"parent.vhd", false, &mut expected_le);
+        assert_eq!(utf8_to_utf16("parent.vhd", false, &mut le), Some(20));
+        assert_eq!(&le[..20], &expected_le[..n]);
+
+        let mut out = [0u8; 32];
+        assert_eq!(utf16_to_utf8(&le[..20], false, &mut out), Some(10));
+        assert_eq!(&out[..10], b"parent.vhd");
+    }
+
+    #[test]
+    fn utf8_to_utf16_surrogate_pair_round_trip() {
+        // U+1F600 GRINNING FACE, as the four-byte UTF-8 sequence
+        // F0 9F 98 80, encodes as the surrogate pair D83D DE00.
+        let s = "\u{1F600}";
+        let mut be = [0u8; 8];
+        assert_eq!(utf8_to_utf16(s, true, &mut be), Some(4));
+        assert_eq!(&be[..4], &[0xd8, 0x3d, 0xde, 0x00]);
+
+        let mut le = [0u8; 8];
+        assert_eq!(utf8_to_utf16(s, false, &mut le), Some(4));
+        assert_eq!(&le[..4], &[0x3d, 0xd8, 0x00, 0xde]);
+
+        let mut out = [0u8; 8];
+        assert_eq!(utf16_to_utf8(&be[..4], true, &mut out), Some(4));
+        assert_eq!(&out[..4], s.as_bytes());
+        assert_eq!(utf16_to_utf8(&le[..4], false, &mut out), Some(4));
+        assert_eq!(&out[..4], s.as_bytes());
+    }
+
+    #[test]
+    fn utf8_to_utf16_multibyte_bmp_round_trip() {
+        // U+00E9 LATIN SMALL LETTER E WITH ACUTE and U+9600 UPPER HALF
+        // BLOCK, the same two multi-byte BMP forms utf16_to_utf8 is
+        // tested against, concatenated into one string.
+        let s = "\u{E9}\u{9600}";
+        let mut be = [0u8; 16];
+        assert_eq!(utf8_to_utf16(s, true, &mut be), Some(4));
+        assert_eq!(&be[..4], &[0x00, 0xe9, 0x96, 0x00]);
+
+        let mut le = [0u8; 16];
+        assert_eq!(utf8_to_utf16(s, false, &mut le), Some(4));
+        assert_eq!(&le[..4], &[0xe9, 0x00, 0x00, 0x96]);
+
+        let mut out = [0u8; 16];
+        assert_eq!(utf16_to_utf8(&be[..4], true, &mut out), Some(5));
+        assert_eq!(&out[..5], s.as_bytes());
+        assert_eq!(utf16_to_utf8(&le[..4], false, &mut out), Some(5));
+        assert_eq!(&out[..5], s.as_bytes());
+    }
+
+    #[test]
+    fn utf8_to_utf16_refuses_dst_one_byte_too_small() {
+        // "abcd" needs exactly 8 bytes of UTF-16; 7 is one too few.
+        let mut exact = [0u8; 8];
+        assert_eq!(utf8_to_utf16("abcd", false, &mut exact), Some(8));
+
+        let mut out = [0u8; 8];
+        assert_eq!(utf16_to_utf8(&exact, false, &mut out), Some(4));
+        assert_eq!(&out[..4], b"abcd");
+
+        let mut short = [0u8; 7];
+        assert_eq!(utf8_to_utf16("abcd", false, &mut short), None);
+    }
+
+    #[test]
+    fn utf8_to_utf16_encodes_embedded_nul_verbatim() {
+        // Unlike utf16_to_utf8, which stops decoding at a NUL code
+        // unit, utf8_to_utf16 has no field to unpack a terminator out
+        // of: it encodes every character of `src`, including
+        // '\u{0}', which becomes the ordinary two-byte code unit
+        // 0x0000 rather than ending the output early.
+        let s = "ab\u{0}cd";
+        let mut be = [0u8; 16];
+        assert_eq!(utf8_to_utf16(s, true, &mut be), Some(10));
+        assert_eq!(
+            &be[..10],
+            &[0x00, 0x61, 0x00, 0x62, 0x00, 0x00, 0x00, 0x63, 0x00, 0x64]
+        );
+
+        // utf16_to_utf8 stops at that embedded NUL, so the round trip
+        // through it is intentionally partial, not full-length: this
+        // documents the asymmetry rather than hiding it.
+        let mut out = [0u8; 16];
+        assert_eq!(utf16_to_utf8(&be[..10], true, &mut out), Some(2));
+        assert_eq!(&out[..2], b"ab");
     }
 
     // ------------------------------------------------------------------
