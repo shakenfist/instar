@@ -103,7 +103,7 @@ jobs:
     if: >-
       github.event_name == 'pull_request'
       && needs.check_paths.outputs.code_changed != 'false'
-    runs-on: [self-hosted, debian-12, s]
+    runs-on: [self-hosted, debian-13, s]
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -150,7 +150,7 @@ jobs:
   build-and-test:
     needs: check_paths
     if: needs.check_paths.outputs.code_changed != 'false'
-    runs-on: [self-hosted, debian-12, s]
+    runs-on: [self-hosted, debian-13, s]
     timeout-minutes: 30
     # These jobs had no concurrency group at all, so a superseded run
     # held its ephemeral runner to completion. github.ref is the
@@ -403,7 +403,7 @@ jobs:
     if: >-
       github.event_name != 'merge_group'
       && needs.check_paths.outputs.code_changed != 'false'
-    runs-on: [self-hosted, debian-12, xl]
+    runs-on: [self-hosted, debian-13, xl]
     timeout-minutes: 30
 
     env:
@@ -493,7 +493,7 @@ jobs:
     if: >-
       github.event_name == 'merge_group' ||
       github.event_name == 'workflow_dispatch'
-    runs-on: [self-hosted, debian-12, s]
+    runs-on: [self-hosted, debian-13, s]
     # Was 45 when this ran on `xl`, where it took 6.5 minutes. `s` is a
     # smaller machine and also builds from a colder docker cache, so the
     # budget goes up with the move: `build-and-test` does `make instar`
@@ -569,7 +569,7 @@ jobs:
       github.event_name == 'merge_group' ||
       github.event_name == 'workflow_dispatch'
     name: "Matrix: ${{ matrix.distro.name }}"
-    runs-on: [self-hosted, debian-12, xl]
+    runs-on: [self-hosted, debian-13, xl]
     # Generous on purpose: the suite is ~3250 tests at concurrency 4 in
     # a container, and a timeout firing mid-suite is indistinguishable
     # from a flaky distro in the summary. Tighten once the first runs
@@ -597,6 +597,14 @@ jobs:
       fail-fast: false
       matrix:
         distro:
+          # audit-ok: eol-distro -- Debian 12 is a SUPPORTED TARGET here,
+          # not a build platform. bookworm reached end of life on
+          # 2026-06-10, but docs/installation.md and README.md promise
+          # Debian 11 and newer, and this entry is how that promise is
+          # kept honest: it installs the shipped .deb on bookworm and
+          # runs the full suite against bookworm's own qemu-img. Remove
+          # it only together with the published support matrix, not to
+          # settle an audit finding.
           - name: 'Debian 12'
             image: 'debian:12'
             pkg_kind: 'deb'
@@ -697,7 +705,7 @@ jobs:
     if: >-
       github.event_name != 'merge_group'
       && needs.check_paths.outputs.code_changed != 'false'
-    runs-on: [self-hosted, debian-12, xl]
+    runs-on: [self-hosted, debian-13, xl]
     timeout-minutes: 45
 
     env:
@@ -881,7 +889,7 @@ jobs:
     if: >-
       github.event_name != 'merge_group'
       && needs.check_paths.outputs.code_changed != 'false'
-    runs-on: [self-hosted, debian-12, xl]
+    runs-on: [self-hosted, debian-13, xl]
     timeout-minutes: 60
 
     env:
@@ -964,7 +972,7 @@ jobs:
     if: >-
       github.event_name != 'merge_group'
       && needs.check_paths.outputs.code_changed != 'false'
-    runs-on: [self-hosted, debian-12, xl]
+    runs-on: [self-hosted, debian-13, xl]
     timeout-minutes: 90
 
     env:
@@ -1056,7 +1064,7 @@ jobs:
     if: >-
       github.event_name != 'merge_group'
       && needs.check_paths.outputs.code_changed != 'false'
-    runs-on: [self-hosted, debian-12, xl]
+    runs-on: [self-hosted, debian-13, xl]
     timeout-minutes: 30
 
     env:
@@ -1105,7 +1113,7 @@ jobs:
     if: >-
       github.event_name != 'merge_group'
       && needs.check_paths.outputs.code_changed != 'false'
-    runs-on: [self-hosted, debian-12, xl]
+    runs-on: [self-hosted, debian-13, xl]
     timeout-minutes: 30
     continue-on-error: true
 

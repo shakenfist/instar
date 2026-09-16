@@ -521,7 +521,7 @@ See `.github/workflows/` for implementation details.
 ### Self-hosted runners and Docker
 
 Almost every job in this repository runs on the self-hosted runner pool
-(`[self-hosted, debian-12, ...]`), and those runners do **not** ship
+(`[self-hosted, debian-13, ...]`), and those runners do **not** ship
 Docker. Since instar is built and tested inside the devcontainer image,
 any job that runs `docker`, `make instar`, `make test-rust`, `make lint`
 or any other container-backed Makefile target must install it first:
@@ -544,13 +544,13 @@ with `docker: command not found`, whenever the first container command is
 reached.
 
 The one exception is `mermaid-lint.yml`, which runs on
-`[self-hosted, vm, debian-12-docker, s]`. That is the fleet image that
+`[self-hosted, vm, debian-13-docker, s]`. That is the fleet image that
 ships `docker.io`, so it needs no install step -- but the label has to be
 listed in `.github/actionlint.yaml` or actionlint rejects the workflow.
 
 ### Self-hosted runners and the GitHub CLI
 
-The same applies to `gh`: the `[self-hosted, debian-12, ...]` runners do
+The same applies to `gh`: the `[self-hosted, debian-13, ...]` runners do
 not ship it either, so any job that files an issue, opens a PR or
 otherwise calls the GitHub CLI must install it first. Do not paste an
 apt block into the workflow -- call the shared installer, which is a
@@ -573,7 +573,7 @@ entirely on `gh api` and `gh pr comment`, so if those runners lacked
 passing on a `static` runner.
 
 So the rule is per runner label, not per workflow: add the installer
-step on `debian-12` (and any new pool that turns out to lack `gh`), and
+step on `debian-13` (and any new pool that turns out to lack `gh`), and
 leave the `claude-code` and `static` jobs alone.
 
 This one bites late rather than early. The `gh` call is usually the last
@@ -966,7 +966,7 @@ The self-hosted runners have no Docker preinstalled, so any job touching
 `docker` or a container-backed Makefile target needs an "Install Docker"
 step -- see "Self-hosted runners and Docker" in `docs/development.md`.
 
-The `debian-12` runners have no `gh` preinstalled either, so any job on
+The `debian-13` runners have no `gh` preinstalled either, so any job on
 those that calls the GitHub CLI needs a `tools/ci/install-gh-cli.sh`
 step -- see "Self-hosted runners and the GitHub CLI" in
 `docs/development.md`.

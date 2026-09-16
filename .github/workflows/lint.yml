@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   lint:
-    runs-on: [self-hosted, debian-12, s]
+    runs-on: [self-hosted, debian-13, s]
     timeout-minutes: 30
 
     env:

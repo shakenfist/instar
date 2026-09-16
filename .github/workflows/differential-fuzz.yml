@@ -49,7 +49,7 @@ permissions:
 
 jobs:
   differential-fuzz:
-    runs-on: [self-hosted, debian-12, xl]
+    runs-on: [self-hosted, debian-13, xl]
     timeout-minutes: 180
 
     env:

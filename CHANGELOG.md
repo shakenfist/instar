@@ -52,6 +52,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **CI runs on Debian 13 runners.** Every job moved from the `debian-12`
+  runner labels to `debian-13` (and `debian-12-docker` to
+  `debian-13-docker`); Debian 12 reached end of life on 2026-06-10. The
+  `debian:12` entry in the distro matrix is untouched and stays — that
+  is a supported *target*, not a build platform, and the published
+  support matrix still promises Debian 11 and newer.
+
 - **The weekly Rust nightly bump validates packaging before proposing a
   nightly.** It built the images, instar and the Rust test suite, but
   never built or installed a package — so it could green-light a

@@ -50,7 +50,7 @@ permissions:
 
 jobs:
   coverage-fuzz:
-    runs-on: [self-hosted, debian-12, xl]
+    runs-on: [self-hosted, debian-13, xl]
     timeout-minutes: 480
 
     env:
