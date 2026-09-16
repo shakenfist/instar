@@ -52,6 +52,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **The weekly Rust nightly bump validates packaging before proposing a
+  nightly.** It built the images, instar and the Rust test suite, but
+  never built or installed a package — so it could green-light a
+  toolchain that breaks the `.rpm`, which is exactly what happened with
+  `nightly-2026-08-17`. It now also runs `make package`, the glibc floor
+  check, and an install of each package on the oldest glibc of its
+  family, and the PR it opens lists what was actually validated.
+
 - **Pull requests now catch packaging regressions that used to reach the
   merge queue.** `package-smoke` built only the `.deb` and installed it
   on `debian:trixie` — the newest glibc in the distro matrix, where a

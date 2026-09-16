@@ -806,10 +806,23 @@ ICE'd compiling tokio inside `cargo install cargo-audit` and took out
 CI's "Build devcontainer" step). Renovate cannot bump rustup toolchain
 pins; instead the weekly `rust-nightly-bump` workflow
 (`tools/ci/bump-rust-nightly.sh`) rewrites and test-builds **both**
-images, then instar and the Rust test suite, against the newest
-published nightly and opens a bump PR only when everything passes. Do
-not un-pin the toolchain, and do not bump the pin by hand without at
-least building both images. (The lint container is separate and uses a
+images, then instar and the Rust test suite, then `make package`, the
+glibc floor check and an install of each package on the oldest glibc of
+its family, against the newest published nightly — and opens a bump PR
+only when everything passes. Do not un-pin the toolchain, and do not
+bump the pin by hand without at least building both images.
+
+**Packaging is part of a toolchain change's blast radius, which is why
+the validation goes that far.** `cargo-generate-rpm` derives the
+`.rpm`'s dependencies from the built binary's ELF, so a nightly can
+change the package without changing a line of our code, and neither
+building nor testing can see it. `nightly-2026-08-17` passed the build
+and the whole Rust suite, then produced an `.rpm` requiring
+`libc.so.6(GLIBC_2.18)[WEAK](64bit)`; nothing provides that, and all
+three RPM legs of the matrix failed before a test ran (#504). Installing
+the package is the only step that finds an unsatisfiable dependency, so
+if you add validation here, add it before the PR is opened rather than
+relying on the bump PR's own CI. (The lint container is separate and uses a
 stable `rust:` tag Renovate does manage; the dev image's Debian base is
 pinned by digest and Renovate walks it forward.)
 
