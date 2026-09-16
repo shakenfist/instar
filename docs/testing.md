@@ -1199,6 +1199,28 @@ Issues with the `security-audit` label immediately when found, by
 `instar-testdata/custom/fuzz-corpus/` after nightly runs, and restored
 by target name on the next run so coverage compounds.
 
+**The corpus push must stay cheap, and it is the step that decides
+whether a night counted.** `tools/ci/push-fuzz-corpus.sh` adds files to
+a repository it never wants to read: instar-testdata is ~12 GB with
+LFS-backed fixtures, and `custom/fuzz-corpus/` alone is ~2.7 GB across
+~560,000 entries. A plain `git clone` of that, followed by a per-file
+walk of both trees, measured **22 minutes** — against the 30 minutes of
+headroom `NIGHTLY_BUDGET_SECONDS` (450 min) leaves under the job's
+480-minute timeout, which also has to cover setup. Five of six
+scheduled runs in August were killed mid-push and threw away the corpus
+they had just spent seven hours building (#519). The script therefore
+clones with `--filter=blob:none --sparse` and reads the committed entry
+names out of `git ls-tree`, so no corpus blob is ever fetched, and
+copies only the entries `comm` says are new. If you change it, keep
+two invariants: the index must stay fully populated (a `--no-checkout`
+clone would make the commit *delete* every fixture in the repository),
+and staging must use `git add --sparse`, because the corpus paths lie
+outside the checked-out cone and plain `git add` refuses them. Both are
+asserted by `tools/ci/test-push-fuzz-corpus.sh`, which runs against
+local repositories in the `CI tooling guards` job. The step also
+carries its own 20-minute `timeout-minutes`, so a future regression
+fails loudly instead of eating the job.
+
 These rules make that reporting safe, most of them learned from a month
 of silently broken nightlies:
 

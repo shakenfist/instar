@@ -52,6 +52,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **The nightly fuzzing corpus is no longer thrown away.** Coverage-guided
+  fuzzing only deepens if the corpus it produces survives the run, and
+  five of six scheduled runs in August were killed by the job's
+  480-minute timeout while pushing it -- after the fuzzing had already
+  finished. The push took 22 minutes because it cloned all ~12 GB of
+  instar-testdata, LFS fixtures included, and then compared both corpus
+  trees a file at a time across ~560,000 entries. It now lives in
+  `tools/ci/push-fuzz-corpus.sh`, which fetches trees but no file
+  contents, reads the committed entry names out of `git ls-tree`, and
+  copies only what is new. The step carries its own 20-minute timeout so
+  a future regression fails loudly instead of quietly discarding a
+  night's work.
+
 - **The merge queue's `package-build` job no longer competes for an `xl`
   runner.** It builds a `.deb` and an `.rpm` -- a docker build and two
   packaging steps, with no VM and no test suite -- but ran on the

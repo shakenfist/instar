@@ -132,6 +132,9 @@ jobs:
       - name: Test the fuzz artifact picker
         run: tools/ci/test-pick-fuzz-artifact.sh
 
+      - name: Test the fuzz corpus pusher
+        run: tools/ci/test-push-fuzz-corpus.sh
+
       - name: Test the glibc floor check
         run: tools/ci/test-check-glibc-floor.sh
 
