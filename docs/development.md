@@ -112,6 +112,22 @@ To move the pin, change `DEBIAN_SNAPSHOT` only. Do not change
 `FROM debian:bullseye`, and do not "fix" a future apt failure by
 pointing back at `deb.debian.org`.
 
+**Both devcontainer images set `Acquire::Retries "3"`.** Pinning to a
+snapshot removed the 404 failure mode and left the transport one, and
+if anything raised it: `snapshot.debian.org` is a single origin behind
+a CDN, not the `deb.debian.org` mirror network. A fetch failure here is
+not an ordinary build failure — the release image is only built in the
+merge queue for a docs-only change, so there is no pull-request run to
+catch it, and the failure ejects the pull request from the queue
+instead (#531). The occurrence on PR #560 was one object out of 150
+dying with a TCP reset ten seconds in, after 125 MB had come down from
+the same host at 15.3 MB/s, with the next object succeeding. apt
+retries the failed object rather than the transaction, so a retry costs
+nothing on a healthy run and still fails promptly against a genuinely
+missing object. If this class of failure returns despite the retries,
+the next step is a local caching apt proxy or a BuildKit cache mount
+over `/var/cache/apt`, not a longer retry count.
+
 ##### The options that were not taken
 
 No option was free, because "move to the next Debian" is not available:

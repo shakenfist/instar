@@ -52,6 +52,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Both devcontainer images retry transient apt failures.** A single
+  package download dying mid-body took out the whole image build, and
+  because the release image is only built in the merge queue for a
+  docs-only change, that ejected the pull request from the queue rather
+  than showing up as a failed check on the PR. `Acquire::Retries "3"`
+  retries the failed object rather than the transaction, so it costs
+  nothing on a healthy run.
+
 - **The nightly fuzzing corpus is no longer thrown away.** Coverage-guided
   fuzzing only deepens if the corpus it produces survives the run, and
   five of six scheduled runs in August were killed by the job's
