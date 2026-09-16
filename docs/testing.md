@@ -466,6 +466,25 @@ the release binary is built on `debian:bullseye` (symbol floor
 package, that is a glibc-floor regression in the build image, not a
 test failure.**
 
+**Runner size is a merge-queue latency decision, not a comfort one.**
+The `xl` pool is shared across the whole Shaken Fist fleet and is the
+scarce resource in the queue; the `develop` ruleset gives a merge group
+`check_response_timeout_minutes: 360`, after which GitHub ejects the
+pull request even though nothing failed. Merge run 33799289895 spent 75
+minutes executing and 322 minutes queueing, finished green at 397, and
+lost the pull request. So a merge-queue job belongs on `xl` only if it
+actually needs a VM: `package-matrix` does, because each entry installs
+a package and runs the suite against a distro's `qemu-img`, and
+`package-build` does not, because it only builds. Putting a
+non-VM job on `xl` does not merely waste a big machine, it inserts an
+unbounded queue wait into the critical path.
+
+Two things this does not fix, both still open: the `xl` ceiling itself
+(seven matrix entries measured at no more than three concurrent), and
+the fact that a timeout eject is silent -- a green run whose pull
+request was dropped reports nothing, and the operator finds out by
+noticing the queue is empty.
+
 `can_enqueue` and `can_merge` are the two aggregate gates, and they are
 the names configured as required checks — never the individual jobs or
 matrix entries, whose names change whenever the distro list does.

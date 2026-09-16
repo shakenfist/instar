@@ -440,13 +440,34 @@ jobs:
   # Consequence worth knowing when reading a red matrix: if an entry
   # fails while *installing* the package, that is a glibc-floor
   # regression in the build image, not a test failure.
+  #
+  # Deliberately NOT on `xl`. This job runs `make instar && make package`
+  # -- a docker build and two packaging steps, with no VM, no KVM and no
+  # test suite -- which is the same class of work `build-and-test` does
+  # on `s`. It sat on `xl` only because step 4b of
+  # PLAN-distro-matrix-ci-phase-04-workflow.md told it to copy
+  # `package-smoke`'s preamble, and the runner label came along with the
+  # paste.
+  #
+  # That cost real merge-queue time, because this job is on the critical
+  # path: `package-matrix` cannot start until it finishes. In merge run
+  # 33799289895 it waited **143 minutes** for an `xl` runner and then ran
+  # for 6.5, while nothing else of ours held the pool -- the org-shared
+  # `xl` pool was busy elsewhere. That run took 397 minutes against a
+  # 360-minute `check_response_timeout_minutes` and a green pull request
+  # was ejected from the queue (#543).
   package-build:
     needs: build-and-test
     if: >-
       github.event_name == 'merge_group' ||
       github.event_name == 'workflow_dispatch'
-    runs-on: [self-hosted, debian-12, xl]
-    timeout-minutes: 45
+    runs-on: [self-hosted, debian-12, s]
+    # Was 45 when this ran on `xl`, where it took 6.5 minutes. `s` is a
+    # smaller machine and also builds from a colder docker cache, so the
+    # budget goes up with the move: `build-and-test` does `make instar`
+    # plus the whole Rust suite on `s` inside 30, and this is that build
+    # plus `make deb rpm`.
+    timeout-minutes: 60
     concurrency:
       group: >-
         ${{ github.workflow }}-package-build-${{
@@ -500,10 +521,16 @@ jobs:
   # The distro matrix: install the shared package on each distro and run
   # the FULL Python suite against that distro's own qemu-img.
   #
-  # No max-parallel. The xl runners are started on demand, so each entry
-  # gets its own VM and the entries do not contend for KVM with each
-  # other; capping the fan-out would only serialise independent VMs and
-  # multiply merge-queue latency.
+  # No max-parallel, but not for the reason originally recorded. The
+  # plan's premise was that `xl` runners start on demand, so seven
+  # entries never queue behind each other. Merge run 33799289895
+  # measured otherwise: the seven entries staggered their starts from
+  # 23:35Z to 01:44Z and never had more than three running at once, so
+  # the on-demand pool has a ceiling and this repo shares it with the
+  # rest of the fleet. `max-parallel` stays unset anyway -- the entries
+  # are already serialised by that ceiling, and capping it further would
+  # only lengthen the tail. Cross-entry KVM contention remains a
+  # non-issue, since each entry that does run has its own VM.
   package-matrix:
     needs: package-build
     if: >-

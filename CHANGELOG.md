@@ -52,6 +52,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **The merge queue's `package-build` job no longer competes for an `xl`
+  runner.** It builds a `.deb` and an `.rpm` -- a docker build and two
+  packaging steps, with no VM and no test suite -- but ran on the
+  KVM-sized `xl` pool the whole Shaken Fist fleet shares, and it sits on
+  the critical path because `package-matrix` waits for it. In one
+  measured merge run it queued for 143 minutes to do 6.5 minutes of
+  work, pushing that run to 397 minutes against a 360-minute
+  `check_response_timeout_minutes` and ejecting a pull request whose
+  every check had passed. It now runs on `s`, alongside
+  `build-and-test`, with its timeout raised from 45 to 60 minutes to
+  suit the smaller machine.
+
 - **`map --output=json` and `snapshot -l` now match the output of the
   qemu-img version being emulated, not just the newest one.** `map`
   omits `present` below qemu 6.1 and `compressed` below 8.2 rather than
