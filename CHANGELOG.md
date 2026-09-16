@@ -39,6 +39,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   host's. This is how the per-version baselines are exercised without
   installing seven qemu builds.
 
+- `create::plan_vhd` can now emit a differencing VHD — footer
+  `disk_type = 4`, a dynamic header carrying a parent's unique id,
+  timestamp and unicode name, and one populated parent locator entry
+  ([PLAN-differencing.md](docs/plans/PLAN-differencing.md)). This is
+  the crate-level emitter only, proven by instar's own VHD parser
+  reading back what it writes. Nothing reachable from the CLI changes:
+  `instar create -f vpc -b parent.vhd child.vhd` still fails with
+  "invalid option for target format", because the guest has nowhere to
+  get the parent's identity from until it can read the parent's own
+  footer.
+
 ### Changed
 
 - **`map --output=json` and `snapshot -l` now match the output of the

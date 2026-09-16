@@ -78,6 +78,8 @@ fn build_starting_vhd(
         subformat,
         block_size,
         backing: None,
+        parent_unique_id: [0; 16],
+        parent_timestamp: 0,
     };
     let mut scratch = vec![0u8; create::VHD_MAX_METADATA_SCRATCH];
     let plan = plan_vhd(&opts, &mut scratch).expect("create vhd plan");

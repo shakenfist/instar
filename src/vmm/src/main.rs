@@ -240,6 +240,7 @@ const CREATE_RESULT_ERROR_UNSUPPORTED_FORMAT: u32 = 8;
 const CREATE_RESULT_ERROR_BACKING_FORMAT_UNSUPPORTED: u32 = 9;
 const CREATE_RESULT_ERROR_BACKING_SIZE_TOO_LARGE: u32 = 10;
 const CREATE_RESULT_ERROR_BACKING_DIFFERENCING: u32 = 11;
+const CREATE_RESULT_ERROR_PARENT_NAME_TOO_LONG: u32 = 12;
 
 // ResizeConfig constants (must match shared crate)
 const RESIZE_CONFIG_MAGIC: u32 = 0x52455349; // "RESI"
@@ -17555,6 +17556,12 @@ fn create_error_detail(code: u32) -> &'static str {
             "backing file is a differencing VHD or VHDX whose parent \
              instar cannot yet compose; an overlay on it could not be \
              read back (see PLAN-differencing.md)"
+        }
+        CREATE_RESULT_ERROR_PARENT_NAME_TOO_LONG => {
+            "backing file path does not fit the target format's parent \
+             name field (VHD allows at most 255 UTF-16 code units, and \
+             a character outside the Basic Multilingual Plane costs \
+             two); use a shorter path or a relative one"
         }
         _ => "unknown error",
     }

@@ -25,7 +25,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use shared::{
-    be_u16, be_u32, be_u64, utf16_to_utf8, write_be_u16, write_be_u32, write_be_u64,
+    be_u16, be_u32, be_u64, utf16_to_utf8, utf8_to_utf16, write_be_u16, write_be_u32, write_be_u64,
     AllocationSummary, CallTable, MapExtent, MapExtentCoalescer, MapExtentState, MAX_SECTOR_SIZE,
 };
 
@@ -184,6 +184,10 @@ pub struct VhdFooter {
     pub features: u32,
     pub format_version: u32,
     pub data_offset: u64,
+    /// Creation timestamp, in seconds since 2000-01-01 00:00:00 UTC (the
+    /// VHD epoch). This is 946684800 seconds after the Unix epoch, so a
+    /// caller that wants a Unix timestamp must add that offset.
+    pub timestamp: u32,
     pub original_size: u64,
     pub current_size: u64,
     pub cylinders: u16,
@@ -212,6 +216,7 @@ impl VhdFooter {
         let features = be_u32(buf, FOOTER_FEATURES_OFFSET);
         let format_version = be_u32(buf, FOOTER_FORMAT_VERSION_OFFSET);
         let data_offset = be_u64(buf, FOOTER_DATA_OFFSET_OFFSET);
+        let timestamp = be_u32(buf, FOOTER_TIMESTAMP_OFFSET);
         let original_size = be_u64(buf, FOOTER_ORIGINAL_SIZE_OFFSET);
         let current_size = be_u64(buf, FOOTER_CURRENT_SIZE_OFFSET);
 
@@ -230,6 +235,7 @@ impl VhdFooter {
             features,
             format_version,
             data_offset,
+            timestamp,
             original_size,
             current_size,
             cylinders,
@@ -1911,6 +1917,309 @@ pub fn build_dynamic_header(
 }
 
 // ============================================================================
+// Differencing VHD (parent) emitter helpers
+// ============================================================================
+//
+// Offset authority: every field written below is cited to the parsing
+// constants at the top of this module, which phase 3 derived from an xxd
+// of a Hyper-V-produced differencing image
+// (docs/plans/PLAN-differencing-phase-01-pin.md). Nothing outside instar
+// reads most of what these functions write: libvhdi never parses the VHD
+// parent locator table at all and resolves a parent from the unicode name
+// field alone, and qemu's block/vpc.c does the same. A wrong offset or a
+// swapped endianness here therefore round-trips through instar's own
+// parser perfectly and fails only on a real Hyper-V, so the constants and
+// the comments are the specification.
+
+/// Why one of the parent-emitting builders refused.
+///
+/// The builders return a `Result` rather than writing what they can:
+/// `crates/vhd` is `no_std` and panic-free, and a *truncated* parent path
+/// names a different file, which is the failure mode this phase exists to
+/// avoid. Every variant means "nothing usable was written", not "written
+/// with a caveat".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VhdBuildError {
+    /// The destination buffer is shorter than the structure being written:
+    /// less than [`DYNAMIC_HEADER_SIZE`] for a header, or too small to hold
+    /// the encoded locator platform data.
+    BufferTooSmall,
+    /// The parent path does not fit the [`DYN_PARENT_NAME_SIZE`] parent
+    /// unicode name field — more than **255** UTF-16 code units once
+    /// encoded. Not 256: a 256-code-unit path fills all 512 bytes with no
+    /// room for a terminating NUL, which is exactly the image that trips
+    /// libvhdi defect C, so the parent filename reads back through the
+    /// oracle with a stray character borrowed from the locator table
+    /// below it (PLAN-differencing-phase-01-pin.md, "A length rule phase
+    /// 5 must add"). The parse-side bound is the full 256 — see
+    /// [`DYN_PARENT_NAME_SIZE`]; the two numbers are opposite directions
+    /// of the same field. Counted during encoding, never estimated from
+    /// the UTF-8 length: a character outside the BMP costs two code
+    /// units, and a BMP character can cost three UTF-8 bytes.
+    ParentNameTooLong,
+    /// The parent path is empty. An empty name encodes to zero bytes, so
+    /// the locator entry that describes it would carry
+    /// `platform_data_length == 0`, which [`VhdParentLocator::parse`]
+    /// marks as [`VhdLocatorDefect::EmptyData`]. Refused at emit time
+    /// for the same reason as [`Self::LocatorLengthExceedsSpace`]: this
+    /// crate does not write an image its own parser calls defective.
+    ParentNameEmpty,
+    /// The locator slot is not in `0..`[`PARENT_LOCATOR_COUNT`].
+    LocatorSlotOutOfRange,
+    /// `platform_data_length > platform_data_space`, which
+    /// [`VhdParentLocator::parse`] marks as
+    /// [`VhdLocatorDefect::LengthExceedsSpace`]. Refused at emit time so
+    /// this crate cannot write an image its own parser calls defective.
+    LocatorLengthExceedsSpace,
+}
+
+/// Fill the parent fields of an already-built dynamic header, and
+/// recompute its checksum.
+///
+/// `buf` is a dynamic header that [`build_dynamic_header`] has already
+/// written; only the differencing-only fields are touched. This is a
+/// *second* function rather than extra arguments on
+/// [`build_dynamic_header`] so that the non-differencing path stays
+/// byte-identical to what instar wrote before this phase.
+///
+/// Written, all inside the first [`DYNAMIC_HEADER_SIZE`] bytes:
+///
+/// * `parent_unique_id`: the 16 bytes at [`DYN_PARENT_UNIQUE_ID_OFFSET`]
+///   (`+40`), copied **raw**. These are the parent footer's bytes
+///   `68..84` verbatim: not byte-swapped, not a parsed or re-formatted
+///   UUID. [`VhdParentInfo::parse`] reads them back the same way.
+/// * `parent_timestamp`: big-endian `u32` at
+///   [`DYN_PARENT_TIMESTAMP_OFFSET`] (`+56`), seconds since
+///   2000-01-01 00:00:00 UTC — the parent footer's timestamp, not the
+///   child's creation time.
+/// * `parent_name`: UTF-16 **BIG** endian at [`DYN_PARENT_NAME_OFFSET`]
+///   (`+64`), zero-padded to the full [`DYN_PARENT_NAME_SIZE`] (512-byte)
+///   field. Big endian here and **little** endian in the locator platform
+///   data written by [`build_parent_locator_data`]: that is not a typo in
+///   either place, it is what the format does, and
+///   [`VhdParentInfo::decode_name`] and [`VhdParentLocator::decode_path`]
+///   are the matching halves on the read side.
+///
+/// Returns the number of bytes the name occupies before the zero padding
+/// (twice the UTF-16 code unit count), which is what a caller sizing a
+/// locator's `platform_data_length` wants.
+///
+/// # Where the length limit lives
+///
+/// Here, and only here. A path longer than the field is refused with
+/// [`VhdBuildError::ParentNameTooLong`]; the name is encoded into a
+/// scratch buffer first and copied into `buf` only on success, so a
+/// refusal leaves the header exactly as it was and no partially encoded
+/// path can ever reach an image. A caller that wants its own error code
+/// maps this variant onto it, rather than pre-counting code units and
+/// risking a second, disagreeing implementation of the same limit.
+///
+/// The bound enforced is **255** UTF-16 code units, not the 256 the
+/// field could physically hold: the encoder is handed two bytes less
+/// than [`DYN_PARENT_NAME_SIZE`], so the last code unit is always zero
+/// and a terminating NUL stays inside the field. A 256-code-unit name
+/// fills all 512 bytes with no terminator, which is the image that
+/// trips libvhdi defect C -- the oracle reads past the field into the
+/// locator table and reports a parent filename with a stray character
+/// appended. This matches the emitter policy in
+/// [`DYN_PARENT_NAME_SIZE`]'s own documentation; the 256 there is the
+/// *parse*-side bound, and the two numbers are opposite directions of
+/// the same field. **Callers must not re-check this** -- see the
+/// section above.
+///
+/// # The checksum
+///
+/// Recomputed and rewritten before returning, over exactly the first
+/// [`DYNAMIC_HEADER_SIZE`] bytes of `buf`, with
+/// [`DYN_CHECKSUM_OFFSET`] treated as zero. This function owns the
+/// checksum rather than leaving it to the caller because a header whose
+/// checksum predates its parent fields is invisible to every reader
+/// instar has: [`VhdDynamicHeader::parse`] validates the `cxsparse`
+/// cookie and not the checksum, and qemu-img validates the footer
+/// checksum only. Both this function and
+/// [`build_parent_locator_entry`] leave the header checksum-correct on
+/// return, so the two can be called in either order, any number of times.
+///
+/// Returns [`VhdBuildError::BufferTooSmall`] if `buf` is shorter than
+/// [`DYNAMIC_HEADER_SIZE`]; nothing is written in that case.
+pub fn build_dynamic_header_parent(
+    buf: &mut [u8],
+    parent_unique_id: &[u8; 16],
+    parent_timestamp: u32,
+    parent_name: &str,
+) -> Result<usize, VhdBuildError> {
+    if buf.len() < DYNAMIC_HEADER_SIZE {
+        return Err(VhdBuildError::BufferTooSmall);
+    }
+    if parent_name.is_empty() {
+        return Err(VhdBuildError::ParentNameEmpty);
+    }
+
+    // Encode into scratch first. `shared::utf8_to_utf16` leaves the bytes
+    // of the characters it did encode behind when it runs out of room, so
+    // encoding straight into the header would leave a truncated parent
+    // name — a path to a different file — in a buffer the caller is about
+    // to write to disk. The scratch starts zeroed, so the tail of the
+    // field is the required zero padding for free.
+    //
+    // The encoder is given 2 bytes less than the field, which is what
+    // caps the name at 255 code units rather than the 256 the field could
+    // physically hold. A 256-code-unit name fills all 512 bytes with no
+    // terminating NUL, and libvhdi then reads past the field into the
+    // locator table and reports a parent filename with a stray character
+    // appended. Leaving the last code unit zero costs one character of a
+    // path nobody has and makes instar's output readable by the only
+    // oracle that resolves VHD parents at all.
+    let mut name = [0u8; DYN_PARENT_NAME_SIZE];
+    let name_len = utf8_to_utf16(parent_name, true, &mut name[..DYN_PARENT_NAME_SIZE - 2])
+        .ok_or(VhdBuildError::ParentNameTooLong)?;
+
+    buf[DYN_PARENT_UNIQUE_ID_OFFSET..DYN_PARENT_UNIQUE_ID_OFFSET + 16]
+        .copy_from_slice(parent_unique_id);
+    write_be_u32(buf, DYN_PARENT_TIMESTAMP_OFFSET, parent_timestamp);
+    buf[DYN_PARENT_NAME_OFFSET..DYN_PARENT_NAME_OFFSET + DYN_PARENT_NAME_SIZE]
+        .copy_from_slice(&name);
+
+    write_dynamic_header_checksum(buf);
+    Ok(name_len)
+}
+
+/// Write one parent locator entry into a dynamic header, and recompute
+/// the header checksum.
+///
+/// `slot` is a **zero-based** index into the eight-entry table at
+/// [`DYN_PARENT_LOCATORS_OFFSET`] (`+576`); the entry occupies the
+/// [`PARENT_LOCATOR_ENTRY_SIZE`] (24) bytes at
+/// `DYN_PARENT_LOCATORS_OFFSET + slot * PARENT_LOCATOR_ENTRY_SIZE`, which
+/// is exactly where [`VhdParentLocator::parse`] reads it from. Prose that
+/// numbers the slots from one — "one entry, in slot 1" — means `slot = 0`
+/// here.
+///
+/// Written, all big-endian except the platform code:
+///
+/// * `platform_code`: the four ASCII bytes at
+///   [`LOC_PLATFORM_CODE_OFFSET`] (`+0`) in **file order**, copied
+///   verbatim and **not** byte-swapped — pass `b"W2ru"` and the image
+///   contains `57 32 72 75`. [`VhdPlatform::from_code`] matches on the
+///   bytes in that same order.
+/// * `platform_data_space`: `u32` at [`LOC_DATA_SPACE_OFFSET`] (`+4`).
+///   **A byte count.** SPEC(VHD)'s wording implies a count of 512-byte
+///   sectors; it is wrong, and phase 1 pinned it by showing the sector
+///   reading is arithmetically impossible on both measured Hyper-V
+///   images — see [`VhdParentLocator::platform_data_space`]. A one-sector
+///   region is `512`, never `1`.
+/// * `platform_data_length`: `u32` at [`LOC_DATA_LENGTH_OFFSET`] (`+8`),
+///   the encoded byte count with no terminator, as returned by
+///   [`build_parent_locator_data`].
+/// * `reserved`: zero at [`LOC_RESERVED_OFFSET`] (`+12`), written
+///   explicitly rather than relying on a pre-zeroed buffer.
+/// * `platform_data_offset`: `u64` at [`LOC_DATA_OFFSET_OFFSET`] (`+16`),
+///   an **absolute file offset**, not relative to the header and not a
+///   sector number.
+///
+/// The caller is responsible for the offset satisfying `locator_defect`'s
+/// placement rules (outside both footers, outside the dynamic header,
+/// inside the image); this function cannot check them because it is given
+/// no image bounds. It does check `platform_data_length <=
+/// platform_data_space`, the one rule that is purely local, and refuses
+/// with [`VhdBuildError::LocatorLengthExceedsSpace`].
+///
+/// Recomputes the dynamic header checksum before returning, for the
+/// reason given on [`build_dynamic_header_parent`].
+pub fn build_parent_locator_entry(
+    buf: &mut [u8],
+    slot: usize,
+    platform_code: &[u8; 4],
+    platform_data_space: u32,
+    platform_data_length: u32,
+    platform_data_offset: u64,
+) -> Result<(), VhdBuildError> {
+    if buf.len() < DYNAMIC_HEADER_SIZE {
+        return Err(VhdBuildError::BufferTooSmall);
+    }
+    if slot >= PARENT_LOCATOR_COUNT {
+        return Err(VhdBuildError::LocatorSlotOutOfRange);
+    }
+    if platform_data_length > platform_data_space {
+        return Err(VhdBuildError::LocatorLengthExceedsSpace);
+    }
+    // A populated platform code with a zero data length is
+    // `VhdLocatorDefect::EmptyData` to this crate's own parser, so it is
+    // refused here rather than written. The two checks together are what
+    // make "every entry this crate emits parses defect-free" an
+    // invariant of the builder instead of a property of its callers.
+    if platform_data_length == 0 {
+        return Err(VhdBuildError::ParentNameEmpty);
+    }
+
+    // slot < 8, so off + 24 <= 576 + 192 = 768, inside the length checked
+    // above. No arithmetic below can leave the buffer.
+    let off = DYN_PARENT_LOCATORS_OFFSET + slot * PARENT_LOCATOR_ENTRY_SIZE;
+    buf[off + LOC_PLATFORM_CODE_OFFSET..off + LOC_PLATFORM_CODE_OFFSET + 4]
+        .copy_from_slice(platform_code);
+    write_be_u32(buf, off + LOC_DATA_SPACE_OFFSET, platform_data_space);
+    write_be_u32(buf, off + LOC_DATA_LENGTH_OFFSET, platform_data_length);
+    write_be_u32(buf, off + LOC_RESERVED_OFFSET, 0);
+    write_be_u64(buf, off + LOC_DATA_OFFSET_OFFSET, platform_data_offset);
+
+    write_dynamic_header_checksum(buf);
+    Ok(())
+}
+
+/// Encode a parent path as parent locator platform data, returning the
+/// number of bytes written.
+///
+/// UTF-16 **LITTLE** endian, and with **no NUL terminator**: the length
+/// is carried by the entry's `platform_data_length`, and
+/// [`VhdParentLocator::raw_path_bytes`] trims at a `0x0000` code unit
+/// only because Hyper-V sometimes writes one, not because a reader needs
+/// it.
+///
+/// This is the opposite endianness to the parent unicode name field
+/// written by [`build_dynamic_header_parent`], 512 bytes earlier in the
+/// same header. The two are deliberately separate functions taking the
+/// flag from nowhere but their own body, so the same path encodes to two
+/// different byte strings and a future refactor that unifies them fails a
+/// test rather than silently writing a locator no Windows reader can
+/// resolve.
+///
+/// `dst` is not padded: only the encoded bytes are written, and a caller
+/// filling a wider `platform_data_space` region zeroes the remainder
+/// itself. On refusal `dst` is zeroed, so a partially encoded path —
+/// which would name a different file — can never reach an image even if
+/// the caller ignores the error.
+pub fn build_parent_locator_data(path: &str, dst: &mut [u8]) -> Result<usize, VhdBuildError> {
+    if path.is_empty() {
+        return Err(VhdBuildError::ParentNameEmpty);
+    }
+    match utf8_to_utf16(path, false, dst) {
+        Some(n) => Ok(n),
+        None => {
+            // `shared::utf8_to_utf16` already zeroed the prefix it
+            // wrote, which is enough to guarantee no partially encoded
+            // path survives. The whole buffer is zeroed anyway, because
+            // this one is a locator sector and the caller writes all
+            // 512 bytes of it: leaving the tail as whatever the caller
+            // had there would put uninitialised scratch into an image.
+            // Kept deliberately rather than deleted as redundant --
+            // the two zeroings answer different questions.
+            dst.fill(0);
+            Err(VhdBuildError::BufferTooSmall)
+        }
+    }
+}
+
+/// Recompute and rewrite a dynamic header's checksum.
+///
+/// Over exactly the first [`DYNAMIC_HEADER_SIZE`] bytes — the structure
+/// the checksum covers — which the callers have already proven are
+/// present.
+fn write_dynamic_header_checksum(buf: &mut [u8]) {
+    let checksum = compute_checksum(&buf[..DYNAMIC_HEADER_SIZE], DYN_CHECKSUM_OFFSET);
+    write_be_u32(buf, DYN_CHECKSUM_OFFSET, checksum);
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -1960,6 +2269,40 @@ mod tests {
         let footer = VhdFooter::parse(&buf).unwrap();
         assert_eq!(footer.disk_type, DISK_TYPE_FIXED);
         assert_eq!(footer.data_offset, data_off);
+    }
+
+    #[test]
+    fn footer_parse_timestamp_offset_24() {
+        // Build a footer where the timestamp, data_offset, original_size
+        // and current_size are all distinct in every byte, so that
+        // reading `timestamp` from the wrong offset (or the wrong
+        // width) produces a value that does not match any of the
+        // assertions below. A test that used equal or all-zero
+        // neighbours would pass even if `timestamp` were wired to
+        // FOOTER_ORIGINAL_SIZE_OFFSET or FOOTER_DATA_OFFSET_OFFSET by
+        // mistake.
+        let mut buf = make_footer(0x0000_0003_0000_0000, DISK_TYPE_DYNAMIC, 0);
+        write_be_u64(&mut buf, FOOTER_DATA_OFFSET_OFFSET, 0xAAAA_AAAA_BBBB_BBBB);
+        write_be_u32(&mut buf, FOOTER_TIMESTAMP_OFFSET, 0x1A2B_3C4D);
+        write_be_u64(&mut buf, FOOTER_ORIGINAL_SIZE_OFFSET, 0x1111_1111_2222_2222);
+        write_be_u64(&mut buf, FOOTER_CURRENT_SIZE_OFFSET, 0x3333_3333_4444_4444);
+
+        let footer = VhdFooter::parse(&buf).unwrap();
+
+        assert_eq!(footer.timestamp, 0x1A2B_3C4D);
+        assert_eq!(footer.original_size, 0x1111_1111_2222_2222);
+        assert_eq!(footer.current_size, 0x3333_3333_4444_4444);
+        assert_eq!(footer.data_offset, 0xAAAA_AAAA_BBBB_BBBB);
+
+        // No assert_ne! follows deliberately. Once the assert_eq!s above
+        // have pinned each field to its own literal, comparing those
+        // literals against each other is constant-true and checks
+        // nothing. What makes this test load-bearing is the choice of
+        // constants: no two of them share a 32-bit half, so a timestamp
+        // read from FOOTER_DATA_OFFSET_OFFSET, FOOTER_ORIGINAL_SIZE_OFFSET
+        // or FOOTER_CURRENT_SIZE_OFFSET -- or from the wrong half of any
+        // of them -- fails the first assertion rather than passing by
+        // coincidence.
     }
 
     #[test]
@@ -3464,5 +3807,504 @@ mod tests {
             locator_defect(*b"W2ru", 512, 32, 0, &just_big_enough),
             Some(VhdLocatorDefect::OverlapsFooter)
         );
+    }
+
+    // ====================================================================
+    // Differencing emitter tests
+    //
+    // Every assertion below reads raw bytes out of the emitted buffer.
+    // Reading the fields back with VhdParentInfo::parse would share its
+    // assumptions with the emitter -- a swapped endianness, or a field
+    // written four bytes late, would round-trip perfectly -- so the
+    // parser appears only once at the end of this section, as a
+    // complement rather than as the check.
+    // ====================================================================
+
+    /// A parent unique id of sixteen distinct, non-palindromic bytes, so
+    /// that a byte-swap, a 4-byte-group swap or a whole-field reversal
+    /// all show up.
+    const EMIT_PARENT_ID: [u8; 16] = [
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee,
+        0xff,
+    ];
+
+    /// The path used by the emitter tests. Short, and with two distinct
+    /// ASCII characters up front so the first four bytes of the name
+    /// field pin the endianness on their own.
+    const EMIT_PATH: &str = "./parent.vhd";
+
+    /// A dynamic header with `build_dynamic_header`'s output in it and
+    /// nothing else.
+    fn emit_base_header() -> [u8; 1024] {
+        let mut buf = [0u8; 1024];
+        build_dynamic_header(&mut buf, 2048, 512, DEFAULT_BLOCK_SIZE);
+        buf
+    }
+
+    /// The dynamic header checksum, worked out here rather than by
+    /// calling `compute_checksum` -- the helper the emitter itself uses,
+    /// which would agree with a broken emitter about a broken answer.
+    /// Expressed the way the spec words it: zero the checksum field, sum
+    /// every byte of the 1024-byte structure, take the one's complement.
+    fn independent_dyn_checksum(buf: &[u8; 1024]) -> u32 {
+        let mut zeroed = *buf;
+        zeroed[DYN_CHECKSUM_OFFSET..DYN_CHECKSUM_OFFSET + 4].fill(0);
+        let mut sum: u32 = 0;
+        for &b in zeroed.iter() {
+            sum = sum.wrapping_add(b as u32);
+        }
+        !sum
+    }
+
+    /// The checksum stored in a header buffer.
+    fn stored_dyn_checksum(buf: &[u8; 1024]) -> u32 {
+        be_u32(buf, DYN_CHECKSUM_OFFSET)
+    }
+
+    /// `n` ASCII characters as a `&str`, without allocating: the crate is
+    /// `no_std` and its tests must stay that way.
+    fn ascii_path(dst: &mut [u8]) -> &str {
+        dst.fill(b'a');
+        core::str::from_utf8(dst).unwrap()
+    }
+
+    /// `dst.len() / 4` copies of U+1F600 GRINNING FACE as a `&str`: four
+    /// UTF-8 bytes and **two** UTF-16 code units each, which is how a
+    /// non-BMP character spends the 256-code-unit budget twice as fast
+    /// as its UTF-8 length suggests.
+    fn non_bmp_path(dst: &mut [u8]) -> &str {
+        for chunk in dst.chunks_exact_mut(4) {
+            chunk.copy_from_slice(&[0xf0, 0x9f, 0x98, 0x80]);
+        }
+        core::str::from_utf8(dst).unwrap()
+    }
+
+    // -------- the parent half of the dynamic header ---------------------
+
+    #[test]
+    fn emit_parent_fields_land_at_documented_offsets() {
+        let base = emit_base_header();
+        let mut buf = base;
+        let n =
+            build_dynamic_header_parent(&mut buf, &EMIT_PARENT_ID, 0x1A2B_3C4D, EMIT_PATH).unwrap();
+
+        // Twelve characters, all BMP: 24 bytes before the padding.
+        assert_eq!(n, 24);
+
+        // Parent unique id at +40: sixteen raw bytes, in the order given,
+        // not byte-swapped and not reformatted as a UUID.
+        assert_eq!(
+            &buf[DYN_PARENT_UNIQUE_ID_OFFSET..DYN_PARENT_UNIQUE_ID_OFFSET + 16],
+            &EMIT_PARENT_ID[..]
+        );
+
+        // Parent timestamp at +56: big-endian u32. Written out by hand so
+        // the test does not depend on write_be_u32 being right either.
+        assert_eq!(
+            &buf[DYN_PARENT_TIMESTAMP_OFFSET..DYN_PARENT_TIMESTAMP_OFFSET + 4],
+            &[0x1A, 0x2B, 0x3C, 0x4D]
+        );
+
+        // Parent unicode name at +64: UTF-16BE, so the high byte of each
+        // ASCII code unit comes first. '.' is 0x2e, '/' is 0x2f.
+        assert_eq!(
+            &buf[DYN_PARENT_NAME_OFFSET..DYN_PARENT_NAME_OFFSET + 6],
+            &[0x00, 0x2e, 0x00, 0x2f, 0x00, 0x70]
+        );
+        // ... and the whole 512-byte field is the encoding followed by
+        // zero padding, with nothing left over from before.
+        let mut expect = [0u8; DYN_PARENT_NAME_SIZE];
+        assert_eq!(enc_utf16(EMIT_PATH, true, &mut expect), n);
+        assert_eq!(
+            &buf[DYN_PARENT_NAME_OFFSET..DYN_PARENT_NAME_OFFSET + DYN_PARENT_NAME_SIZE],
+            &expect[..]
+        );
+
+        // Nothing outside the parent fields and the checksum moved. This
+        // is what makes the second builder a second builder: the bytes
+        // build_dynamic_header wrote are exactly as it left them.
+        for i in 0..DYNAMIC_HEADER_SIZE {
+            let is_parent_field = (DYN_PARENT_UNIQUE_ID_OFFSET..DYN_PARENT_UNIQUE_ID_OFFSET + 16)
+                .contains(&i)
+                || (DYN_PARENT_TIMESTAMP_OFFSET..DYN_PARENT_TIMESTAMP_OFFSET + 4).contains(&i)
+                || (DYN_PARENT_NAME_OFFSET..DYN_PARENT_NAME_OFFSET + DYN_PARENT_NAME_SIZE)
+                    .contains(&i)
+                || (DYN_CHECKSUM_OFFSET..DYN_CHECKSUM_OFFSET + 4).contains(&i);
+            if !is_parent_field {
+                assert_eq!(
+                    buf[i], base[i],
+                    "byte {i} changed outside the parent fields"
+                );
+            }
+        }
+        // Including the locator table, which this builder never touches.
+        assert!(buf
+            [DYN_PARENT_LOCATORS_OFFSET..DYN_PARENT_LOCATORS_OFFSET + PARENT_LOCATOR_TABLE_SIZE]
+            .iter()
+            .all(|&b| b == 0));
+    }
+
+    #[test]
+    fn emit_parent_name_is_big_endian_not_little() {
+        let mut buf = emit_base_header();
+        build_dynamic_header_parent(&mut buf, &EMIT_PARENT_ID, 0, EMIT_PATH).unwrap();
+
+        let mut le = [0u8; 64];
+        let n = enc_utf16(EMIT_PATH, false, &mut le);
+        assert_ne!(
+            &buf[DYN_PARENT_NAME_OFFSET..DYN_PARENT_NAME_OFFSET + n],
+            &le[..n],
+            "the parent unicode name must not be UTF-16 little endian"
+        );
+        // The two encodings of an all-ASCII path are a byte rotation of
+        // each other, so the first byte alone decides it: BE leads with
+        // the zero high byte, LE leads with the character.
+        assert_eq!(buf[DYN_PARENT_NAME_OFFSET], 0x00);
+        assert_eq!(le[0], b'.');
+    }
+
+    #[test]
+    fn emit_name_and_locator_data_use_opposite_endiannesses() {
+        // Decision 3 of PLAN-differencing-phase-05-vhd-emitter.md: the
+        // same path encodes to two different byte strings, one for the
+        // header name field and one for the locator platform data. If a
+        // later refactor unifies the two encoders, this fails.
+        let mut buf = emit_base_header();
+        let name_len =
+            build_dynamic_header_parent(&mut buf, &EMIT_PARENT_ID, 0, EMIT_PATH).unwrap();
+
+        let mut data = [0u8; 64];
+        let data_len = build_parent_locator_data(EMIT_PATH, &mut data).unwrap();
+
+        assert_eq!(name_len, data_len);
+        let name = &buf[DYN_PARENT_NAME_OFFSET..DYN_PARENT_NAME_OFFSET + name_len];
+        assert_ne!(name, &data[..data_len]);
+
+        // And each is the encoding it is supposed to be, checked against
+        // the tests' own hand-rolled encoder.
+        let mut expect_be = [0u8; 64];
+        let mut expect_le = [0u8; 64];
+        assert_eq!(enc_utf16(EMIT_PATH, true, &mut expect_be), name_len);
+        assert_eq!(enc_utf16(EMIT_PATH, false, &mut expect_le), data_len);
+        assert_eq!(name, &expect_be[..name_len]);
+        assert_eq!(&data[..data_len], &expect_le[..data_len]);
+    }
+
+    #[test]
+    fn emit_parent_fields_refuse_an_overlong_name_untouched() {
+        // 255 UTF-16 code units is the most the emitter accepts: 510
+        // bytes, leaving the last code unit of the 512-byte field zero so
+        // a terminating NUL stays inside it.
+        let mut fits = [0u8; 255];
+        let mut buf = emit_base_header();
+        let n = build_dynamic_header_parent(&mut buf, &EMIT_PARENT_ID, 0, ascii_path(&mut fits))
+            .unwrap();
+        assert_eq!(n, DYN_PARENT_NAME_SIZE - 2);
+        // The terminator is really there, not merely assumed.
+        assert_eq!(
+            &buf[DYN_PARENT_NAME_OFFSET + DYN_PARENT_NAME_SIZE - 2
+                ..DYN_PARENT_NAME_OFFSET + DYN_PARENT_NAME_SIZE],
+            &[0u8, 0u8]
+        );
+
+        // 256 would fill all 512 bytes with no terminator -- the image
+        // that trips libvhdi defect C -- so it is refused even though the
+        // field could physically hold it, and the header is left exactly
+        // as it was: no truncated name, which would be a path to a
+        // different file.
+        let mut over = [0u8; 256];
+        let before = emit_base_header();
+        let mut buf = before;
+        assert_eq!(
+            build_dynamic_header_parent(&mut buf, &EMIT_PARENT_ID, 0, ascii_path(&mut over)),
+            Err(VhdBuildError::ParentNameTooLong)
+        );
+        assert_eq!(buf, before);
+    }
+
+    #[test]
+    fn emit_parent_fields_count_non_bmp_characters_as_two_code_units() {
+        // 127 non-BMP characters are 508 UTF-8 bytes and 254 code units,
+        // which fits under the 255-code-unit cap. 255 is odd and non-BMP
+        // characters cost two code units each, so 127 is the most that
+        // can be used and one code unit of headroom is unavoidable.
+        let mut fits = [0u8; 127 * 4];
+        let mut buf = emit_base_header();
+        let n = build_dynamic_header_parent(&mut buf, &EMIT_PARENT_ID, 0, non_bmp_path(&mut fits))
+            .unwrap();
+        assert_eq!(n, 254 * 2);
+
+        // 128 of them is 512 UTF-8 bytes -- still under any byte-based
+        // guess at the limit that used 768 -- but 256 code units, which
+        // does not fit. A limit estimated from the UTF-8 length rather
+        // than counted during encoding would get this wrong in one
+        // direction or the other.
+        let mut over = [0u8; 128 * 4];
+        let mut buf = emit_base_header();
+        assert_eq!(
+            build_dynamic_header_parent(&mut buf, &EMIT_PARENT_ID, 0, non_bmp_path(&mut over)),
+            Err(VhdBuildError::ParentNameTooLong)
+        );
+    }
+
+    #[test]
+    fn emit_parent_fields_refuse_a_short_buffer() {
+        let mut buf = [0u8; DYNAMIC_HEADER_SIZE - 1];
+        assert_eq!(
+            build_dynamic_header_parent(&mut buf, &EMIT_PARENT_ID, 0, EMIT_PATH),
+            Err(VhdBuildError::BufferTooSmall)
+        );
+        assert!(buf.iter().all(|&b| b == 0));
+    }
+
+    // -------- one locator entry -----------------------------------------
+
+    #[test]
+    fn emit_locator_entry_lands_at_documented_offsets() {
+        let mut buf = emit_base_header();
+        // Slot 2 (zero-based), so a builder that ignored `slot` or that
+        // multiplied by the wrong stride writes somewhere visible.
+        build_parent_locator_entry(&mut buf, 2, b"W2ru", 512, 24, 0x0000_0102_0304_0506).unwrap();
+
+        let off = DYN_PARENT_LOCATORS_OFFSET + 2 * PARENT_LOCATOR_ENTRY_SIZE;
+        assert_eq!(off, 576 + 48);
+        assert_eq!(
+            &buf[off..off + PARENT_LOCATOR_ENTRY_SIZE],
+            &[
+                // Platform code at +0: 'W' '2' 'r' 'u' in file order, NOT
+                // byte-swapped. A u32 written big-endian from 0x57327275
+                // would give these same four bytes; one written
+                // little-endian would give 75 72 32 57.
+                0x57, 0x32, 0x72, 0x75, //
+                // platform_data_space at +4: 512, big-endian. A byte
+                // count -- see emit_locator_data_space_is_bytes.
+                0x00, 0x00, 0x02, 0x00, //
+                // platform_data_length at +8: 24, big-endian.
+                0x00, 0x00, 0x00, 0x18, //
+                // reserved at +12: zero.
+                0x00, 0x00, 0x00, 0x00, //
+                // platform_data_offset at +16: an absolute file offset,
+                // big-endian u64.
+                0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+            ]
+        );
+
+        // Every other slot is untouched.
+        for slot in 0..PARENT_LOCATOR_COUNT {
+            if slot == 2 {
+                continue;
+            }
+            let o = DYN_PARENT_LOCATORS_OFFSET + slot * PARENT_LOCATOR_ENTRY_SIZE;
+            assert!(
+                buf[o..o + PARENT_LOCATOR_ENTRY_SIZE]
+                    .iter()
+                    .all(|&b| b == 0),
+                "slot {slot} was written"
+            );
+        }
+        // And so is the parent name field, 512 bytes earlier.
+        assert!(
+            buf[DYN_PARENT_NAME_OFFSET..DYN_PARENT_NAME_OFFSET + DYN_PARENT_NAME_SIZE]
+                .iter()
+                .all(|&b| b == 0)
+        );
+    }
+
+    #[test]
+    fn emit_locator_data_space_is_bytes_not_sectors() {
+        // Decision 4: SPEC(VHD)'s wording implies a count of 512-byte
+        // sectors and is wrong; phase 1 pinned the field as a byte count
+        // against two measured Hyper-V images. A one-sector region is
+        // 512 here, and writing 1 is the single most plausible wrong
+        // value in this phase.
+        let mut buf = emit_base_header();
+        build_parent_locator_entry(&mut buf, 0, b"W2ru", 512, 24, 2048).unwrap();
+
+        let off = DYN_PARENT_LOCATORS_OFFSET + LOC_DATA_SPACE_OFFSET;
+        assert_eq!(&buf[off..off + 4], &[0x00, 0x00, 0x02, 0x00]);
+        assert_ne!(&buf[off..off + 4], &[0x00, 0x00, 0x00, 0x01]);
+    }
+
+    #[test]
+    fn emit_locator_entry_refuses_bad_arguments() {
+        let base = emit_base_header();
+
+        // A slot past the end of the eight-entry table.
+        let mut buf = base;
+        assert_eq!(
+            build_parent_locator_entry(&mut buf, PARENT_LOCATOR_COUNT, b"W2ru", 512, 24, 2048),
+            Err(VhdBuildError::LocatorSlotOutOfRange)
+        );
+        assert_eq!(buf, base);
+
+        // Data longer than the space reserved for it: the one
+        // locator_defect rule that is decidable without image bounds.
+        let mut buf = base;
+        assert_eq!(
+            build_parent_locator_entry(&mut buf, 0, b"W2ru", 512, 513, 2048),
+            Err(VhdBuildError::LocatorLengthExceedsSpace)
+        );
+        assert_eq!(buf, base);
+
+        // A buffer too short to be a dynamic header.
+        let mut short = [0u8; DYNAMIC_HEADER_SIZE - 1];
+        assert_eq!(
+            build_parent_locator_entry(&mut short, 0, b"W2ru", 512, 24, 2048),
+            Err(VhdBuildError::BufferTooSmall)
+        );
+        assert!(short.iter().all(|&b| b == 0));
+    }
+
+    // -------- locator platform data -------------------------------------
+
+    #[test]
+    fn emit_locator_data_is_little_endian_with_no_terminator() {
+        // 0xAA fill, so anything the encoder does not write is visible:
+        // the platform data carries no NUL terminator (its length comes
+        // from platform_data_length) and this helper does not pad.
+        let mut dst = [0xAAu8; 64];
+        let n = build_parent_locator_data(EMIT_PATH, &mut dst).unwrap();
+        assert_eq!(n, EMIT_PATH.len() * 2);
+
+        // UTF-16LE: the character byte first, then the zero high byte.
+        assert_eq!(&dst[..6], &[0x2e, 0x00, 0x2f, 0x00, 0x70, 0x00]);
+        // The last code unit is the final 'd', and nothing follows it.
+        assert_eq!(&dst[n - 2..n], &[b'd', 0x00]);
+        assert!(dst[n..].iter().all(|&b| b == 0xAA));
+    }
+
+    #[test]
+    fn emit_refuses_an_empty_parent_name_everywhere() {
+        // Found in review. An empty name encodes to zero bytes, so the
+        // locator describing it carries platform_data_length == 0, which
+        // this crate's own parser calls EmptyData. The invariant worth
+        // holding is that the builder never emits an entry its parser
+        // rejects -- so all three entry points refuse, not just the one
+        // a caller happens to use first.
+        let mut buf = emit_base_header();
+        let before = buf;
+        assert_eq!(
+            build_dynamic_header_parent(&mut buf, &EMIT_PARENT_ID, 0, ""),
+            Err(VhdBuildError::ParentNameEmpty)
+        );
+        assert_eq!(buf, before, "a refusal must leave the header untouched");
+
+        let mut dst = [0u8; 512];
+        assert_eq!(
+            build_parent_locator_data("", &mut dst),
+            Err(VhdBuildError::ParentNameEmpty)
+        );
+
+        // And the entry builder refuses a zero length directly, so a
+        // caller that computed one some other way cannot get past it.
+        let mut buf = emit_base_header();
+        assert_eq!(
+            build_parent_locator_entry(&mut buf, 0, b"W2ru", 512, 0, 1536),
+            Err(VhdBuildError::ParentNameEmpty)
+        );
+    }
+
+    #[test]
+    fn emit_locator_data_refuses_a_short_buffer_and_zeroes_it() {
+        // One byte too small for the encoding.
+        let mut dst = [0xAAu8; EMIT_PATH.len() * 2 - 1];
+        assert_eq!(
+            build_parent_locator_data(EMIT_PATH, &mut dst),
+            Err(VhdBuildError::BufferTooSmall)
+        );
+        // Not a partially encoded path: that would name a different file
+        // if the caller wrote it out anyway.
+        assert!(dst.iter().all(|&b| b == 0));
+
+        // Exactly big enough still succeeds.
+        let mut exact = [0u8; EMIT_PATH.len() * 2];
+        assert_eq!(
+            build_parent_locator_data(EMIT_PATH, &mut exact),
+            Ok(EMIT_PATH.len() * 2)
+        );
+    }
+
+    // -------- the checksum ----------------------------------------------
+
+    #[test]
+    fn emit_parent_fields_recompute_the_header_checksum() {
+        let base = emit_base_header();
+        let mut buf = base;
+        build_dynamic_header_parent(&mut buf, &EMIT_PARENT_ID, 0x1A2B_3C4D, EMIT_PATH).unwrap();
+
+        // Valid, by a computation that does not call compute_checksum.
+        assert_eq!(stored_dyn_checksum(&buf), independent_dyn_checksum(&buf));
+        // And actually recomputed: the parent bytes changed the sum, so a
+        // checksum left over from build_dynamic_header would differ.
+        assert_ne!(stored_dyn_checksum(&buf), stored_dyn_checksum(&base));
+    }
+
+    #[test]
+    fn emit_locator_entry_recomputes_the_header_checksum() {
+        let base = emit_base_header();
+        let mut buf = base;
+        build_parent_locator_entry(&mut buf, 0, b"W2ru", 512, 24, 2048).unwrap();
+
+        assert_eq!(stored_dyn_checksum(&buf), independent_dyn_checksum(&buf));
+        assert_ne!(stored_dyn_checksum(&buf), stored_dyn_checksum(&base));
+    }
+
+    #[test]
+    fn emit_header_checksum_is_valid_in_either_call_order() {
+        // Both builders leave the header checksum-correct, so a caller
+        // cannot produce a stale checksum by writing the locator entry
+        // after the parent fields, or the other way round. A header with
+        // a stale checksum reads back perfectly through instar --
+        // VhdDynamicHeader::parse checks the cxsparse cookie and not the
+        // checksum -- and is rejected only by Hyper-V.
+        let mut first = emit_base_header();
+        build_dynamic_header_parent(&mut first, &EMIT_PARENT_ID, 7, EMIT_PATH).unwrap();
+        build_parent_locator_entry(&mut first, 0, b"W2ru", 512, 24, 2048).unwrap();
+
+        let mut second = emit_base_header();
+        build_parent_locator_entry(&mut second, 0, b"W2ru", 512, 24, 2048).unwrap();
+        build_dynamic_header_parent(&mut second, &EMIT_PARENT_ID, 7, EMIT_PATH).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(
+            stored_dyn_checksum(&first),
+            independent_dyn_checksum(&first)
+        );
+    }
+
+    // -------- complement: what the phase 3 parser makes of it ------------
+
+    #[test]
+    fn emit_parent_header_reads_back_through_the_parser() {
+        // Not the primary check -- the parser shares its offsets with the
+        // emitter -- but it does exercise locator_defect's placement
+        // rules, which the raw-byte assertions cannot. TEST_BOUNDS is an
+        // 8192-byte image with its header at 512 and free space at 2048.
+        let mut buf = emit_base_header();
+        build_dynamic_header_parent(&mut buf, &EMIT_PARENT_ID, 0x1A2B_3C4D, EMIT_PATH).unwrap();
+
+        let mut win = [0u8; 2048];
+        let len = build_parent_locator_data(EMIT_PATH, &mut win[..512]).unwrap();
+        build_parent_locator_entry(&mut buf, 0, b"W2ru", 512, len as u32, WIN_BASE).unwrap();
+
+        let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
+        assert_eq!(info.unique_id, EMIT_PARENT_ID);
+        assert_eq!(info.timestamp, 0x1A2B_3C4D);
+
+        let mut name = [0u8; MAX_PARENT_NAME_UTF8];
+        let n = info.decode_name(&mut name).unwrap();
+        assert_eq!(&name[..n], EMIT_PATH.as_bytes());
+
+        let entry = &info.locators.entries[0];
+        assert_eq!(entry.defect, None);
+        assert_eq!(entry.platform(), VhdPlatform::W2ru);
+        assert_eq!(entry.platform_data_space, 512);
+        assert_eq!(entry.platform_data_length, len as u32);
+        assert_eq!(entry.reserved, 0);
+        assert_eq!(entry.platform_data_offset, WIN_BASE);
+
+        let mut path = [0u8; 64];
+        let n = entry.decode_path(&window(&win), &mut path).unwrap();
+        assert_eq!(&path[..n], EMIT_PATH.as_bytes());
     }
 }
