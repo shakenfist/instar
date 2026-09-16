@@ -466,6 +466,24 @@ the release binary is built on `debian:bullseye` (symbol floor
 package, that is a glibc-floor regression in the build image, not a
 test failure.**
 
+**`package-smoke` is floor coverage, not distro coverage.** It is the
+only packaging signal a pull request gets, because `package-build` and
+the matrix run in the queue alone. It builds both packages and installs
+each on the *oldest* glibc of its family in the matrix — the `.deb` on
+`ubuntu:22.04` (2.35) and the `.rpm` on `rockylinux:9` (2.34) — so a
+package that will not install anywhere fails before enqueue instead of
+ejecting the pull request from the queue. That is the class both
+recorded misses belonged to: #488 raised the binary's floor to
+`GLIBC_2.39` via a base-image bump, and #501 bumped to a Rust nightly
+that marks glibc version needs `WEAK`, so the `.rpm` required
+`libc.so.6(GLIBC_2.18)[WEAK](64bit)` and no RPM distro could install
+it. Both passed the pull request gate. Neither could have failed here
+before: the `.rpm` was not built at all, and the `.deb` was installed
+on `debian:trixie`, the *newest* glibc in the matrix, where a floor
+regression cannot fail by construction. Keep both targets at the floor
+if the matrix distro list changes; trixie is still covered by the
+Debian 13 matrix entry.
+
 **Runner size is a merge-queue latency decision, not a comfort one.**
 The `xl` pool is shared across the whole Shaken Fist fleet and is the
 scarce resource in the queue; the `develop` ruleset gives a merge group

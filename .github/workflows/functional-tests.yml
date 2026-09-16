@@ -391,9 +391,12 @@ jobs:
   # catches packaging regressions (asset paths, runtime deps, mode
   # bits, the /usr/lib/instar/ resolver fallback) on every PR.
   #
-  # Only the .deb on debian:trixie is exercised here. Broader distro
-  # coverage (Ubuntu, Fedora, Rocky 9/10, .rpm) lives in the merge
-  # queue matrix; see docs/plans/PLAN-distro-matrix-ci.md for the
+  # One .deb and one .rpm are exercised here, each installed on the
+  # oldest glibc of its family. That is deliberately not distro
+  # coverage -- it is floor coverage, the one packaging signal a pull
+  # request cannot otherwise have. Per-distro behaviour across all
+  # seven entries stays in the merge queue matrix, which remains the
+  # acceptance gate; see docs/plans/PLAN-distro-matrix-ci.md for the
   # full design.
   package-smoke:
     needs: [check_paths, build-and-test]
@@ -421,16 +424,42 @@ jobs:
         run: |
           docker image rm -f instar-build instar-release 2>/dev/null || true
 
-      - name: Build instar and the .deb package
+      - name: Build instar and both packages
         run: |
           make instar
-          make deb
+          make package
 
-      - name: Run install smoke test on debian:trixie
+      # Both smoke targets are the OLDEST glibc of their package family
+      # in the merge-queue matrix, and that is the whole point of them.
+      # A pull request cannot see the matrix, so the one thing this job
+      # has to catch before enqueue is a package that will not install
+      # anywhere -- and both misses on record were exactly that:
+      #
+      #   #488 bumped the build image to trixie and raised the binary's
+      #        floor to GLIBC_2.39, breaking Rocky 9, Ubuntu 22.04 and
+      #        Debian 12;
+      #   #501 bumped the Rust nightly to one that marks glibc version
+      #        needs WEAK, so the .rpm required
+      #        libc.so.6(GLIBC_2.18)[WEAK](64bit), which nothing
+      #        provides, and all three RPM legs failed to install.
+      #
+      # Both passed the pull request gate and were found in the queue,
+      # where they eject the pull request and burn a full fan-out
+      # (#505). Neither could have been caught here before, because the
+      # .rpm was not built at all and debian:trixie is the NEWEST glibc
+      # in the matrix -- a floor regression cannot fail on it by
+      # definition. Debian 13 still covers trixie in the queue.
+      - name: Run install smoke test on ubuntu:22.04
         run: |
           tools/test-package-install.sh \
             src/target/debian/instar_*.deb \
-            debian:trixie
+            ubuntu:22.04
+
+      - name: Run install smoke test on rockylinux:9
+        run: |
+          tools/test-package-install.sh \
+            src/target/generate-rpm/instar-*.rpm \
+            rockylinux:9
 
   # Build the .deb and .rpm ONCE for the whole matrix below.
   #

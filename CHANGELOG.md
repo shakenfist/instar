@@ -52,6 +52,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Pull requests now catch packaging regressions that used to reach the
+  merge queue.** `package-smoke` built only the `.deb` and installed it
+  on `debian:trixie` — the newest glibc in the distro matrix, where a
+  glibc-floor regression cannot fail by construction — so a broken
+  package passed the pull request gate and was found after enqueue,
+  ejecting the pull request and burning a full matrix fan-out. It now
+  builds both packages and installs each on the oldest glibc of its
+  family: the `.deb` on `ubuntu:22.04` and the `.rpm` on
+  `rockylinux:9`. Per-distro coverage is unchanged and stays in the
+  merge queue.
+
 - **Both devcontainer images retry transient apt failures.** A single
   package download dying mid-body took out the whole image build, and
   because the release image is only built in the merge queue for a
