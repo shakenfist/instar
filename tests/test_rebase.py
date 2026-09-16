@@ -31,7 +31,6 @@ success-path tests require ``/dev/kvm`` access; the error
 paths don't.
 """
 
-import hashlib
 import json
 import shutil
 import subprocess
@@ -771,25 +770,6 @@ class TestRebaseSnapshotCow(TestRebaseSmoke):
         if shutil.which('qemu-io') is None:
             self.skipTest('system qemu-io not installed')
 
-    @staticmethod
-    def sha256(path):
-        """Return the sha256 hex digest of a file's full contents."""
-        h = hashlib.sha256()
-        with open(path, 'rb') as f:
-            for chunk in iter(lambda: f.read(1024 * 1024), b''):
-                h.update(chunk)
-        return h.hexdigest()
-
-    def _run_tool(self, argv, cwd, timeout=60):
-        """Run a qemu tool with cwd in the fixture dir; assert rc 0."""
-        r = subprocess.run(
-            argv, capture_output=True, text=True, timeout=timeout,
-            cwd=str(cwd))
-        self.assertEqual(
-            r.returncode, 0,
-            f'{argv[0]} failed: argv={argv!r} stderr={r.stderr!r}')
-        return r
-
     def _build_bases(self, fixture_dir, cluster_size=65536):
         """Create the phase-1 Q2 backing pair in `fixture_dir`.
 
@@ -1061,25 +1041,6 @@ class TestRebaseStagedL2Growth(TestRebaseSmoke):
         if shutil.which('qemu-io') is None:
             self.skipTest('system qemu-io not installed')
 
-    @staticmethod
-    def sha256(path):
-        """Return the sha256 hex digest of a file's full contents."""
-        h = hashlib.sha256()
-        with open(path, 'rb') as f:
-            for chunk in iter(lambda: f.read(1024 * 1024), b''):
-                h.update(chunk)
-        return h.hexdigest()
-
-    def _run_tool(self, argv, cwd, timeout=60):
-        """Run a qemu tool with cwd in the fixture dir; assert rc 0."""
-        r = subprocess.run(
-            argv, capture_output=True, text=True, timeout=timeout,
-            cwd=str(cwd))
-        self.assertEqual(
-            r.returncode, 0,
-            f'{argv[0]} failed: argv={argv!r} stderr={r.stderr!r}')
-        return r
-
     def _build_bases(self, fixture_dir, cluster_size):
         """Create the #422 backing pair in `fixture_dir`.
 
@@ -1246,25 +1207,6 @@ class TestRebaseOverlayClassification(TestRebaseSmoke):
             self.skipTest('system qemu-img not installed')
         if shutil.which('qemu-io') is None:
             self.skipTest('system qemu-io not installed')
-
-    @staticmethod
-    def sha256(path):
-        """Return the sha256 hex digest of a file's full contents."""
-        h = hashlib.sha256()
-        with open(path, 'rb') as f:
-            for chunk in iter(lambda: f.read(1024 * 1024), b''):
-                h.update(chunk)
-        return h.hexdigest()
-
-    def _run_tool(self, argv, cwd, timeout=60):
-        """Run a qemu tool with cwd in the fixture dir; assert rc 0."""
-        r = subprocess.run(
-            argv, capture_output=True, text=True, timeout=timeout,
-            cwd=str(cwd))
-        self.assertEqual(
-            r.returncode, 0,
-            f'{argv[0]} failed: argv={argv!r} stderr={r.stderr!r}')
-        return r
 
     @staticmethod
     def _refcount_table_entries(path):

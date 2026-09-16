@@ -20,7 +20,6 @@ paths don't.
 Cross-version round-trip baselines belong to phase 9.
 """
 
-import hashlib
 import json
 import shutil
 import subprocess
@@ -839,31 +838,6 @@ for _target, _cases in COMMIT_CASES.items():
 class TestCommitSnapshotCow(TestCommitSmoke):
     """Backing- and overlay-snapshot COW parity vs qemu (#420/#423)."""
 
-    @staticmethod
-    def sha256(path):
-        """Return the sha256 hex digest of a file's full contents."""
-        h = hashlib.sha256()
-        with open(path, 'rb') as f:
-            for chunk in iter(lambda: f.read(1024 * 1024), b''):
-                h.update(chunk)
-        return h.hexdigest()
-
-    def _require_qemu_tools(self):
-        if shutil.which('qemu-img') is None:
-            self.skipTest('system qemu-img not installed')
-        if shutil.which('qemu-io') is None:
-            self.skipTest('system qemu-io not installed')
-
-    def _run_tool(self, argv, cwd, timeout=60):
-        """Run a qemu tool with cwd in the fixture dir; assert rc 0."""
-        r = subprocess.run(
-            argv, capture_output=True, text=True, timeout=timeout,
-            cwd=str(cwd))
-        self.assertEqual(
-            r.returncode, 0,
-            f'{argv[0]} failed: argv={argv!r} stderr={r.stderr!r}')
-        return r
-
     def _build_fixture(self, fixture_dir, cluster_size=65536,
                        base_snapshot=False,
                        base_post_snapshot_write=False,
@@ -1087,31 +1061,6 @@ class TestCommitSnapshotCow(TestCommitSmoke):
 
 class TestCommitBackingClassification(TestCommitSmoke):
     """Backing-side refusals and capacity widening (phase 4)."""
-
-    @staticmethod
-    def sha256(path):
-        """Return the sha256 hex digest of a file's full contents."""
-        h = hashlib.sha256()
-        with open(path, 'rb') as f:
-            for chunk in iter(lambda: f.read(1024 * 1024), b''):
-                h.update(chunk)
-        return h.hexdigest()
-
-    def _require_qemu_tools(self):
-        if shutil.which('qemu-img') is None:
-            self.skipTest('system qemu-img not installed')
-        if shutil.which('qemu-io') is None:
-            self.skipTest('system qemu-io not installed')
-
-    def _run_tool(self, argv, cwd, timeout=60):
-        """Run a qemu tool with cwd in the fixture dir; assert rc 0."""
-        r = subprocess.run(
-            argv, capture_output=True, text=True, timeout=timeout,
-            cwd=str(cwd))
-        self.assertEqual(
-            r.returncode, 0,
-            f'{argv[0]} failed: argv={argv!r} stderr={r.stderr!r}')
-        return r
 
     @staticmethod
     def _refcount_table_entries(path):

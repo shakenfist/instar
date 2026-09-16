@@ -5,6 +5,7 @@ import json
 import os
 import re
 import resource
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -59,6 +60,17 @@ COMMAND_OUTPUT_DIRS = {
     'snapshot-list': 'snapshot-list',  # snapshot-list-human (PLAN-snapshot phase 11)
     'dd': 'dd-info',               # dd-info-json (PLAN-dd phase 7)
 }
+
+
+# Hang guard for reference qemu tool invocations (`_run_tool`). This is
+# deliberately generous: it exists to stop a wedged qemu-img from
+# blocking a stestr worker forever, not to assert how fast qemu is. The
+# distro matrix fans several 4-worker suites out onto one self-hosted
+# runner, where ~20 concurrent qemu processes routinely stretch a
+# five-second operation past a minute; a tight budget there turns host
+# contention into merge queue ejections (#528). Only lower it for a call
+# whose duration is itself under test.
+QEMU_TOOL_TIMEOUT = 300
 
 
 class InstarTestBase(testtools.TestCase):
@@ -457,6 +469,37 @@ class InstarTestBase(testtools.TestCase):
                 f'This qemu build cannot act as the differential oracle '
                 f'for these formats (RHEL-family qemu-kvm omits them).'
             )
+
+    def _require_qemu_tools(self) -> None:
+        """Skip unless both host qemu-img and qemu-io are installed."""
+        if shutil.which('qemu-img') is None:
+            self.skipTest('system qemu-img not installed')
+        if shutil.which('qemu-io') is None:
+            self.skipTest('system qemu-io not installed')
+
+    def _run_tool(self, argv, cwd, timeout: int = QEMU_TOOL_TIMEOUT):
+        """Run a qemu tool with cwd in the fixture dir; assert rc 0.
+
+        `timeout` is a hang guard, not a performance assertion --
+        see QEMU_TOOL_TIMEOUT. Callers that genuinely want to bound
+        how long a tool may take must say so explicitly.
+        """
+        r = subprocess.run(
+            argv, capture_output=True, text=True, timeout=timeout,
+            cwd=str(cwd))
+        self.assertEqual(
+            r.returncode, 0,
+            f'{argv[0]} failed: argv={argv!r} stderr={r.stderr!r}')
+        return r
+
+    @staticmethod
+    def sha256(path) -> str:
+        """Return the sha256 hex digest of a file's full contents."""
+        h = hashlib.sha256()
+        with open(path, 'rb') as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                h.update(chunk)
+        return h.hexdigest()
 
     def assert_bytes_identical(
         self, actual: bytes, expected: bytes, msg: str = ''

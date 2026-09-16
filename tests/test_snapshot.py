@@ -115,10 +115,6 @@ def _norm_date(text):
 class TestSnapshotSmoke(InstarTestBase):
     """Wiring checks and shared helper for all snapshot test classes."""
 
-    def _require_qemu_tools(self):
-        if shutil.which('qemu-img') is None:
-            self.skipTest('qemu-img not available')
-
     def _require_kvm(self):
         if not os.path.exists('/dev/kvm'):
             self.skipTest('/dev/kvm not available')
