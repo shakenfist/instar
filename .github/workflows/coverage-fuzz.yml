@@ -88,11 +88,7 @@ jobs:
           echo "Corpus push token is valid (write verified)"
 
       - name: Install Docker
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y docker.io
-          sudo systemctl start docker
-          sudo chmod 666 /var/run/docker.sock
+        run: tools/ci/install-docker.sh
 
       - name: Remove previous devcontainers, if any
         run: |

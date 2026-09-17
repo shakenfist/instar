@@ -524,24 +524,39 @@ Almost every job in this repository runs on the self-hosted runner pool
 (`[self-hosted, debian-13, ...]`), and those runners do **not** ship
 Docker. Since instar is built and tested inside the devcontainer image,
 any job that runs `docker`, `make instar`, `make test-rust`, `make lint`
-or any other container-backed Makefile target must install it first:
+or any other container-backed Makefile target must install it first. Do
+not paste an apt block into the workflow -- call the shared installer,
+after the checkout step that puts it on disk:
 
 ```yaml
     env:
       DOCKER_BUILDKIT: 1
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
       - name: Install Docker
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y docker.io
-          sudo systemctl start docker
-          sudo chmod 666 /var/run/docker.sock
+        run: tools/ci/install-docker.sh
 ```
+
+Anything else the job needs from the same apt run is passed as an
+argument, which saves a second `apt-get update`:
+`tools/ci/install-docker.sh qemu-utils`.
 
 Omitting the step does not fail at job start -- it fails part way through
 with `docker: command not found`, whenever the first container command is
 reached.
+
+The installer exists because the apt block it replaced was pasted into
+fourteen steps across six workflows, and the paste is what broke when the
+fleet moved to `debian-13`. On bookworm, `docker.io` shipped
+`/usr/bin/docker` itself; on trixie it is the daemon only, and the client
+lives in a separate `docker-cli` package that `docker.io` merely
+*Recommends* -- which the runners do not install. Four jobs failed with
+`docker: not found` seconds after a step named "Install Docker" reported
+success. `docker-cli` does not exist before trixie, so the installer
+requires a `debian-13` runner.
 
 The one exception is `mermaid-lint.yml`, which runs on
 `[self-hosted, vm, debian-13-docker, s]`. That is the fleet image that
@@ -975,6 +990,7 @@ step -- see "Self-hosted runners and the GitHub CLI" in
 
 - `scripts/differential-fuzz.py` - Differential fuzzing script (instar vs qemu-img + libyal)
 - `scripts/extract-fuzz-corpus.py` - Seeds + restores the coverage-fuzz corpus from instar-testdata
+- `tools/ci/install-docker.sh` - Installs the Docker client and daemon on a self-hosted runner, plus any extra packages passed as arguments (see "Self-hosted runners and Docker" above)
 - `tools/ci/install-gh-cli.sh` - Installs the GitHub CLI on a self-hosted runner if absent (see "Self-hosted runners and the GitHub CLI" above)
 - `tools/ci/fuzz-tier.sh` - Computes tiered nightly per-target fuzz durations
 - `tools/ci/report-fuzz-crash.sh` - Files the `security-audit` issue for a coverage-fuzz crash (bounds the log excerpt, dedups against open issues; see "Crash reporting" in `docs/testing.md`)

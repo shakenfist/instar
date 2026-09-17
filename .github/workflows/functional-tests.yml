@@ -187,11 +187,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install Docker
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y docker.io
-          sudo systemctl start docker
-          sudo chmod 666 /var/run/docker.sock
+        run: tools/ci/install-docker.sh
 
       - name: Remove previous devcontainers, if any
         run: |
@@ -414,11 +410,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install Docker and qemu-utils
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y docker.io qemu-utils
-          sudo systemctl start docker
-          sudo chmod 666 /var/run/docker.sock
+        run: tools/ci/install-docker.sh qemu-utils
 
       - name: Remove previous devcontainers, if any
         run: |
@@ -516,11 +508,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install Docker
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y docker.io
-          sudo systemctl start docker
-          sudo chmod 666 /var/run/docker.sock
+        run: tools/ci/install-docker.sh
 
       - name: Remove previous devcontainers, if any
         run: |
@@ -666,11 +654,7 @@ jobs:
           done
 
       - name: Install Docker
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y docker.io
-          sudo systemctl start docker
-          sudo chmod 666 /var/run/docker.sock
+        run: tools/ci/install-docker.sh
 
       - name: Download packages
         uses: actions/download-artifact@v8
@@ -738,11 +722,7 @@ jobs:
           done
 
       - name: Install Docker
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y docker.io
-          sudo systemctl start docker
-          sudo chmod 666 /var/run/docker.sock
+        run: tools/ci/install-docker.sh
 
       - name: Remove previous devcontainers, if any
         run: |
@@ -922,11 +902,7 @@ jobs:
           done
 
       - name: Install Docker
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y docker.io
-          sudo systemctl start docker
-          sudo chmod 666 /var/run/docker.sock
+        run: tools/ci/install-docker.sh
 
       - name: Remove previous devcontainers, if any
         run: |
@@ -1005,11 +981,7 @@ jobs:
           done
 
       - name: Install Docker
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y docker.io
-          sudo systemctl start docker
-          sudo chmod 666 /var/run/docker.sock
+        run: tools/ci/install-docker.sh
 
       - name: Remove previous devcontainers, if any
         run: |
@@ -1075,11 +1047,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install Docker
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y docker.io
-          sudo systemctl start docker
-          sudo chmod 666 /var/run/docker.sock
+        run: tools/ci/install-docker.sh
 
       - name: Remove previous devcontainers, if any
         run: |
@@ -1151,11 +1119,7 @@ jobs:
           done
 
       - name: Install Docker
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y docker.io
-          sudo systemctl start docker
-          sudo chmod 666 /var/run/docker.sock
+        run: tools/ci/install-docker.sh
 
       - name: Remove previous devcontainers, if any
         run: |

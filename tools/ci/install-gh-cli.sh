@@ -3,7 +3,7 @@
 # Install the GitHub CLI on a self-hosted runner, if it is not there
 # already.
 #
-# The [self-hosted, debian-12] runners do not ship `gh`, so any workflow
+# The [self-hosted, debian-13] runners do not ship `gh`, so any workflow
 # that files an issue or opens a PR from those runners has to install it
 # first. On 2026-08-24 the rust-nightly-bump job validated the candidate
 # nightly, committed it and pushed the branch, then died with

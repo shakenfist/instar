@@ -54,11 +54,7 @@ jobs:
       # ends with: tools/test-package-install.sh builds its fixture with
       # qemu-img on the host before handing it to the container.
       - name: Install Docker and qemu-utils
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y docker.io qemu-utils
-          sudo systemctl start docker
-          sudo chmod 666 /var/run/docker.sock
+        run: tools/ci/install-docker.sh qemu-utils
 
       # Both images. The script force-builds each with `docker build`
       # rather than through make, so a stale tag cannot hide a broken
