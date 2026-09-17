@@ -135,7 +135,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   what it always was — a guard against a wedged qemu-img blocking a
   stestr worker forever, not an assertion about how fast qemu runs. The
   budgets on the `run_instar_*` helpers, where a hang *is* a product
-  bug, are unchanged.
+  bug, are unchanged. Consolidating the tool-availability check the
+  same way needed a second helper rather than one: the shared
+  `_require_qemu_tools()` demands both `qemu-img` and `qemu-io`, and
+  the RPM legs of the distro matrix install only `qemu-img`, so classes
+  that never run `qemu-io` now take a narrower `_require_qemu_img()`
+  instead of quietly skipping there.
 
 - **The release build image builds from scratch again.** Debian 11
   reached end of life on 2026-08-31 and the `deb.debian.org` view of

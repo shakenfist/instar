@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import testtools
 
@@ -470,14 +470,28 @@ class InstarTestBase(testtools.TestCase):
                 f'for these formats (RHEL-family qemu-kvm omits them).'
             )
 
-    def _require_qemu_tools(self) -> None:
-        """Skip unless both host qemu-img and qemu-io are installed."""
+    def _require_qemu_img(self) -> None:
+        """Skip unless host qemu-img is installed.
+
+        Prefer this over `_require_qemu_tools` for a class whose tests
+        only build or inspect fixtures. Demanding qemu-io as well costs
+        real coverage where it is not packaged alongside qemu-img: the
+        RPM legs of the distro matrix install only qemu-img (see
+        tools/test-package-functional.sh), and a skipped test is
+        invisible in a green run.
+        """
         if shutil.which('qemu-img') is None:
             self.skipTest('system qemu-img not installed')
+
+    def _require_qemu_tools(self) -> None:
+        """Skip unless both host qemu-img and qemu-io are installed."""
+        self._require_qemu_img()
         if shutil.which('qemu-io') is None:
             self.skipTest('system qemu-io not installed')
 
-    def _run_tool(self, argv, cwd, timeout: int = QEMU_TOOL_TIMEOUT):
+    def _run_tool(
+        self, argv: List[str], cwd, timeout: int = QEMU_TOOL_TIMEOUT
+    ) -> subprocess.CompletedProcess:
         """Run a qemu tool with cwd in the fixture dir; assert rc 0.
 
         `timeout` is a hang guard, not a performance assertion --
@@ -493,7 +507,7 @@ class InstarTestBase(testtools.TestCase):
         return r
 
     @staticmethod
-    def sha256(path) -> str:
+    def sha256(path: Union[str, Path]) -> str:
         """Return the sha256 hex digest of a file's full contents."""
         h = hashlib.sha256()
         with open(path, 'rb') as f:

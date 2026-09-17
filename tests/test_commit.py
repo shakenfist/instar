@@ -295,8 +295,7 @@ class TestCommitSuccessPaths(TestCommitSmoke):
         That's a pre-existing info gap (tracked separately), not a
         commit gap.
         """
-        if shutil.which('qemu-img') is None:
-            self.skipTest('system qemu-img not installed')
+        self._require_qemu_img()
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             backing = td / 'base.vmdk'
@@ -354,8 +353,7 @@ class TestCommitRoundTrip(TestCommitSmoke):
         verbatim and explicit `-b base.<ext>` resolves against
         the chain entry's canonicalised basename.
         """
-        if shutil.which('qemu-img') is None:
-            self.skipTest('system qemu-img not installed')
+        self._require_qemu_img()
         if seed_spec == 'seed-64k' and shutil.which('qemu-io') is None:
             self.skipTest('system qemu-io not installed')
 

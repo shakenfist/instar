@@ -51,7 +51,6 @@ emits whichever column layout the detected version uses, so every
 profile is byte-comparable on every host.
 """
 
-import hashlib
 import json
 import os
 import re
@@ -84,15 +83,6 @@ def _snapshot_image_ids():
     for img in manifest.get('images', []):
         if 'snapshots' in img.get('tags', []):
             yield img['id']
-
-
-def _sha256_file(path):
-    """Return the SHA-256 hex digest of a file."""
-    h = hashlib.sha256()
-    with open(path, 'rb') as f:
-        for chunk in iter(lambda: f.read(65536), b''):
-            h.update(chunk)
-    return h.hexdigest()
 
 
 def _qemu_check_clean(tc, path, msg=''):
@@ -598,9 +588,9 @@ class TestSnapshotCreate(TestSnapshotSmoke):
             copy = Path(td) / 'sixteen.qcow2'
             shutil.copy2(str(src), str(copy))
 
-            before_hash = _sha256_file(copy)
+            before_hash = self.sha256(copy)
             _, stderr, rc = self.run_instar_snapshot('-c', 's17', str(copy))
-            after_hash = _sha256_file(copy)
+            after_hash = self.sha256(copy)
 
             self.assertNotEqual(rc, 0, 'expected refusal on 16-snapshot cap')
             self.assertEqual(
@@ -721,9 +711,9 @@ class TestSnapshotDelete(TestSnapshotSmoke):
             copy = Path(td) / 'nc.qcow2'
             shutil.copy2(str(src), str(copy))
 
-            before_hash = _sha256_file(copy)
+            before_hash = self.sha256(copy)
             _, _, rc = self.run_instar_snapshot('-d', '1', str(copy))
-            after_hash = _sha256_file(copy)
+            after_hash = self.sha256(copy)
 
             # -d uses name-only matching; "1" is not a snapshot name here.
             self.assertEqual(rc, 1, 'expected exit 1 for pure-ID not found')
@@ -918,15 +908,21 @@ class TestSnapshotErrorPaths(TestSnapshotSmoke):
 
     def setUp(self):
         super().setUp()
-        self._require_qemu_tools()
+        # qemu-img only. Of the tests here, all but the zstd one merely
+        # need a fixture built and then assert instar refuses it and
+        # leaves it byte-identical; none of them touch qemu-io. Gating
+        # the class on qemu-io would silently skip eighteen refusal
+        # assertions wherever it is not installed. The zstd test asks
+        # for qemu-io itself.
+        self._require_qemu_img()
 
     def _assert_refusal(self, image_path, mode_args, msg=''):
         """Assert instar refuses and image sha256 is unchanged."""
-        before = _sha256_file(image_path)
+        before = self.sha256(image_path)
         stdout, stderr, rc = self.run_instar_snapshot(
             *mode_args, str(image_path),
         )
-        after = _sha256_file(image_path)
+        after = self.sha256(image_path)
         self.assertNotEqual(
             rc, 0,
             f'expected non-zero exit for {msg}; got stdout={stdout!r}',
@@ -1059,6 +1055,7 @@ class TestSnapshotErrorPaths(TestSnapshotSmoke):
     def test_zstd_create_refused(self):
         """``-c`` on a zstd-compression qcow2: refused."""
         self._require_kvm()
+        self._require_qemu_tools()  # _build_zstd_image writes with qemu-io
         with tempfile.TemporaryDirectory() as td:
             path = _build_zstd_image(td)
             if path is None:

@@ -290,8 +290,7 @@ class TestRebaseSuccessPaths(TestRebaseSmoke):
         instar vmdk-create gap is a separate item under PLAN-create's
         vmdk follow-ups.
         """
-        if shutil.which('qemu-img') is None:
-            self.skipTest('system qemu-img not installed')
+        self._require_qemu_img()
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             old_backing = td / 'base.vmdk'
@@ -362,8 +361,7 @@ class TestRebaseRoundTrip(TestRebaseSmoke):
         new_backing_format_hint_or_None)``; passed to both rebase
         commands.
         """
-        if shutil.which('qemu-img') is None:
-            self.skipTest('system qemu-img not installed')
+        self._require_qemu_img()
 
         new_backing_name, new_backing_format = backing_pair
         with tempfile.TemporaryDirectory() as td:
@@ -765,10 +763,7 @@ class TestRebaseSnapshotCow(TestRebaseSmoke):
 
     def setUp(self):
         super().setUp()
-        if shutil.which('qemu-img') is None:
-            self.skipTest('system qemu-img not installed')
-        if shutil.which('qemu-io') is None:
-            self.skipTest('system qemu-io not installed')
+        self._require_qemu_tools()
 
     def _build_bases(self, fixture_dir, cluster_size=65536):
         """Create the phase-1 Q2 backing pair in `fixture_dir`.
@@ -1036,10 +1031,7 @@ class TestRebaseStagedL2Growth(TestRebaseSmoke):
 
     def setUp(self):
         super().setUp()
-        if shutil.which('qemu-img') is None:
-            self.skipTest('system qemu-img not installed')
-        if shutil.which('qemu-io') is None:
-            self.skipTest('system qemu-io not installed')
+        self._require_qemu_tools()
 
     def _build_bases(self, fixture_dir, cluster_size):
         """Create the #422 backing pair in `fixture_dir`.
@@ -1203,10 +1195,7 @@ class TestRebaseOverlayClassification(TestRebaseSmoke):
 
     def setUp(self):
         super().setUp()
-        if shutil.which('qemu-img') is None:
-            self.skipTest('system qemu-img not installed')
-        if shutil.which('qemu-io') is None:
-            self.skipTest('system qemu-io not installed')
+        self._require_qemu_tools()
 
     @staticmethod
     def _refcount_table_entries(path):
