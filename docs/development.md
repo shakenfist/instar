@@ -550,13 +550,24 @@ reached.
 
 The installer exists because the apt block it replaced was pasted into
 fourteen steps across six workflows, and the paste is what broke when the
-fleet moved to `debian-13`. On bookworm, `docker.io` shipped
-`/usr/bin/docker` itself; on trixie it is the daemon only, and the client
-lives in a separate `docker-cli` package that `docker.io` merely
-*Recommends* -- which the runners do not install. Four jobs failed with
-`docker: not found` seconds after a step named "Install Docker" reported
-success. `docker-cli` does not exist before trixie, so the installer
-requires a `debian-13` runner.
+fleet moved to `debian-13`. On bookworm, `docker.io` shipped one package
+that was client, daemon and builder; on trixie it is the daemon only, and
+the other two live in separate `docker-cli` and `docker-buildx` packages
+that `docker.io` merely *Recommends* -- which the runners do not install.
+Each omission has its own failure, and both arrive seconds after a step
+named "Install Docker" reported success:
+
+- Without `docker-cli` there is no `/usr/bin/docker` at all, and four
+  jobs failed with `docker: not found`.
+- Without `docker-buildx` the client is present but cannot build. Every
+  job here sets `DOCKER_BUILDKIT: 1`, and the docker 26 client
+  implements `docker build` under BuildKit by delegating to the buildx
+  plugin, so the build refuses to run -- "BuildKit is enabled but the
+  buildx component is missing or broken" -- rather than falling back to
+  the legacy builder.
+
+Neither package exists before trixie, so the installer requires a
+`debian-13` runner.
 
 The one exception is `mermaid-lint.yml`, which runs on
 `[self-hosted, vm, debian-13-docker, s]`. That is the fleet image that

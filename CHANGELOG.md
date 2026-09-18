@@ -59,11 +59,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   is a supported *target*, not a build platform, and the published
   support matrix still promises Debian 11 and newer.
 
-  Trixie splits the Docker client out of `docker.io` into a separate
-  `docker-cli` package, which `docker.io` only *Recommends*, so the
-  fourteen pasted copies of the apt block that installed Docker on a
-  runner stopped providing `/usr/bin/docker`. They are now one shared
-  `tools/ci/install-docker.sh`.
+  Trixie splits the Docker client and the BuildKit builder out of
+  `docker.io` into separate `docker-cli` and `docker-buildx` packages,
+  which `docker.io` only *Recommends*, so the fourteen pasted copies of
+  the apt block that installed Docker on a runner stopped providing
+  `/usr/bin/docker` — and, once that was restored, could no longer build
+  an image, because every one of these jobs sets `DOCKER_BUILDKIT=1` and
+  the docker 26 client delegates `docker build` to the buildx plugin.
+  They are now one shared `tools/ci/install-docker.sh`, which installs
+  all three.
 
 - **The weekly Rust nightly bump validates packaging before proposing a
   nightly.** It built the images, instar and the Rust test suite, but
