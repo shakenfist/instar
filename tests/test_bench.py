@@ -45,7 +45,6 @@ Nine test classes, all inheriting from `BenchTestBase`:
   `KNOWN_BENCH_DIVERGENCES` entry still diverges.
 """
 
-import hashlib
 import json
 import os
 import re
@@ -361,15 +360,6 @@ class BenchTestBase(InstarTestBase):
             capture_output=True, text=True, timeout=30)
         self.assertEqual(
             r.returncode, 0, f'qemu-img create vhdx failed: {r.stderr!r}')
-
-    @staticmethod
-    def sha256(path):
-        """Return the sha256 hex digest of a file's full contents."""
-        h = hashlib.sha256()
-        with open(path, 'rb') as f:
-            for chunk in iter(lambda: f.read(1024 * 1024), b''):
-                h.update(chunk)
-        return h.hexdigest()
 
     @staticmethod
     def header_line(stdout):
@@ -1352,12 +1342,6 @@ class TestBenchSnapshotCow(BenchTestBase):
     `worst_case_touched` upper-bounds the fresh COW clusters exactly
     as it bounds fresh allocations for unallocated writes).
     """
-
-    def _require_qemu_tools(self):
-        if shutil.which('qemu-img') is None:
-            self.skipTest('system qemu-img not installed')
-        if shutil.which('qemu-io') is None:
-            self.skipTest('system qemu-io not installed')
 
     def _build_snapshot_fixture(self, path, cluster_size):
         """A qcow2 whose active-view clusters are snapshot-shared.

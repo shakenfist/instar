@@ -28,7 +28,6 @@ The base fixtures carry four known data patterns written by
 0xDD at 192k (64k each).
 """
 
-import hashlib
 import json
 import shutil
 import subprocess
@@ -59,14 +58,6 @@ class _RepairTestBase(InstarTestBase):
             if shutil.which(tool) is None:
                 self.skipTest(f'{tool} not available')
 
-    @staticmethod
-    def _sha256(path: Path) -> str:
-        h = hashlib.sha256()
-        with open(path, 'rb') as f:
-            for chunk in iter(lambda: f.read(65536), b''):
-                h.update(chunk)
-        return h.hexdigest()
-
     def _make_copy(self, image_id: str) -> Path:
         """Copy a fixture into a per-test tempdir and return the copy.
 
@@ -88,11 +79,11 @@ class _RepairTestBase(InstarTestBase):
         Returns ``(copy, stdout, stderr, rc, sha_before, sha_after)``.
         """
         copy = self._make_copy(image_id)
-        sha_before = self._sha256(copy)
+        sha_before = self.sha256(copy)
         stdout, stderr, rc = self.run_instar_check(
             copy, output_format='json', repair=repair, timeout=timeout
         )
-        sha_after = self._sha256(copy)
+        sha_after = self.sha256(copy)
         return copy, stdout, stderr, rc, sha_before, sha_after
 
     def _assert_qemu_clean(self, path: Path):
@@ -372,14 +363,14 @@ class TestRepairCli(_RepairTestBase):
     def test_repair_with_chain_rejected(self):
         """--repair + --chain is rejected before touching the image."""
         copy = self._make_copy('check-qcow2-clean')
-        sha_before = self._sha256(copy)
+        sha_before = self.sha256(copy)
         _stdout, stderr, rc = self.run_instar_check(
             copy, repair='leaks', chain=True
         )
         self.assertNotEqual(rc, 0, 'combining --repair and --chain must fail')
         self.assertIn('chain', stderr.lower())
         self.assertEqual(
-            sha_before, self._sha256(copy),
+            sha_before, self.sha256(copy),
             'a rejected invocation must not modify the image'
         )
 
@@ -407,7 +398,7 @@ class TestRepairCli(_RepairTestBase):
             ['qemu-img', 'create', '-f', 'raw', str(raw), '1M'],
             capture_output=True, text=True, timeout=30
         )
-        sha_before = self._sha256(raw)
+        sha_before = self.sha256(raw)
         _stdout, _stderr, rc = self.run_instar_check(raw, repair='all')
 
         # Sane exit (not a signal / timeout) and the documented
@@ -418,7 +409,7 @@ class TestRepairCli(_RepairTestBase):
             'repair on a raw image should report not-supported (63)'
         )
         self.assertEqual(
-            sha_before, self._sha256(raw),
+            sha_before, self.sha256(raw),
             'a raw image must be left untouched'
         )
 
@@ -427,12 +418,12 @@ class TestRepairCli(_RepairTestBase):
         copy = self._make_copy('check-qcow2-refcount-zero')
 
         self.run_instar_check(copy, output_format='json', repair='all')
-        sha_first = self._sha256(copy)
+        sha_first = self.sha256(copy)
 
         _stdout, _stderr, rc = self.run_instar_check(
             copy, output_format='json', repair='all'
         )
-        sha_second = self._sha256(copy)
+        sha_second = self.sha256(copy)
 
         self.assertEqual(rc, 0, 'second repair of a clean image should exit 0')
         self.assertEqual(

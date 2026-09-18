@@ -31,7 +31,6 @@ success-path tests require ``/dev/kvm`` access; the error
 paths don't.
 """
 
-import hashlib
 import json
 import shutil
 import subprocess
@@ -291,8 +290,7 @@ class TestRebaseSuccessPaths(TestRebaseSmoke):
         instar vmdk-create gap is a separate item under PLAN-create's
         vmdk follow-ups.
         """
-        if shutil.which('qemu-img') is None:
-            self.skipTest('system qemu-img not installed')
+        self._require_qemu_img()
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             old_backing = td / 'base.vmdk'
@@ -363,8 +361,7 @@ class TestRebaseRoundTrip(TestRebaseSmoke):
         new_backing_format_hint_or_None)``; passed to both rebase
         commands.
         """
-        if shutil.which('qemu-img') is None:
-            self.skipTest('system qemu-img not installed')
+        self._require_qemu_img()
 
         new_backing_name, new_backing_format = backing_pair
         with tempfile.TemporaryDirectory() as td:
@@ -766,29 +763,7 @@ class TestRebaseSnapshotCow(TestRebaseSmoke):
 
     def setUp(self):
         super().setUp()
-        if shutil.which('qemu-img') is None:
-            self.skipTest('system qemu-img not installed')
-        if shutil.which('qemu-io') is None:
-            self.skipTest('system qemu-io not installed')
-
-    @staticmethod
-    def sha256(path):
-        """Return the sha256 hex digest of a file's full contents."""
-        h = hashlib.sha256()
-        with open(path, 'rb') as f:
-            for chunk in iter(lambda: f.read(1024 * 1024), b''):
-                h.update(chunk)
-        return h.hexdigest()
-
-    def _run_tool(self, argv, cwd, timeout=60):
-        """Run a qemu tool with cwd in the fixture dir; assert rc 0."""
-        r = subprocess.run(
-            argv, capture_output=True, text=True, timeout=timeout,
-            cwd=str(cwd))
-        self.assertEqual(
-            r.returncode, 0,
-            f'{argv[0]} failed: argv={argv!r} stderr={r.stderr!r}')
-        return r
+        self._require_qemu_tools()
 
     def _build_bases(self, fixture_dir, cluster_size=65536):
         """Create the phase-1 Q2 backing pair in `fixture_dir`.
@@ -1056,29 +1031,7 @@ class TestRebaseStagedL2Growth(TestRebaseSmoke):
 
     def setUp(self):
         super().setUp()
-        if shutil.which('qemu-img') is None:
-            self.skipTest('system qemu-img not installed')
-        if shutil.which('qemu-io') is None:
-            self.skipTest('system qemu-io not installed')
-
-    @staticmethod
-    def sha256(path):
-        """Return the sha256 hex digest of a file's full contents."""
-        h = hashlib.sha256()
-        with open(path, 'rb') as f:
-            for chunk in iter(lambda: f.read(1024 * 1024), b''):
-                h.update(chunk)
-        return h.hexdigest()
-
-    def _run_tool(self, argv, cwd, timeout=60):
-        """Run a qemu tool with cwd in the fixture dir; assert rc 0."""
-        r = subprocess.run(
-            argv, capture_output=True, text=True, timeout=timeout,
-            cwd=str(cwd))
-        self.assertEqual(
-            r.returncode, 0,
-            f'{argv[0]} failed: argv={argv!r} stderr={r.stderr!r}')
-        return r
+        self._require_qemu_tools()
 
     def _build_bases(self, fixture_dir, cluster_size):
         """Create the #422 backing pair in `fixture_dir`.
@@ -1242,29 +1195,7 @@ class TestRebaseOverlayClassification(TestRebaseSmoke):
 
     def setUp(self):
         super().setUp()
-        if shutil.which('qemu-img') is None:
-            self.skipTest('system qemu-img not installed')
-        if shutil.which('qemu-io') is None:
-            self.skipTest('system qemu-io not installed')
-
-    @staticmethod
-    def sha256(path):
-        """Return the sha256 hex digest of a file's full contents."""
-        h = hashlib.sha256()
-        with open(path, 'rb') as f:
-            for chunk in iter(lambda: f.read(1024 * 1024), b''):
-                h.update(chunk)
-        return h.hexdigest()
-
-    def _run_tool(self, argv, cwd, timeout=60):
-        """Run a qemu tool with cwd in the fixture dir; assert rc 0."""
-        r = subprocess.run(
-            argv, capture_output=True, text=True, timeout=timeout,
-            cwd=str(cwd))
-        self.assertEqual(
-            r.returncode, 0,
-            f'{argv[0]} failed: argv={argv!r} stderr={r.stderr!r}')
-        return r
+        self._require_qemu_tools()
 
     @staticmethod
     def _refcount_table_entries(path):

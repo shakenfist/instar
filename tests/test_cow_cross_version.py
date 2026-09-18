@@ -52,10 +52,7 @@ class TestCowCrossVersion(InstarTestBase):
 
     def setUp(self):
         super().setUp()
-        if shutil.which('qemu-img') is None:
-            self.skipTest('system qemu-img not installed')
-        if shutil.which('qemu-io') is None:
-            self.skipTest('system qemu-io not installed')
+        self._require_qemu_tools()
 
     # -- pinned-binary discovery ----------------------------------------
 
