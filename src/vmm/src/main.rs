@@ -241,6 +241,7 @@ const CREATE_RESULT_ERROR_BACKING_FORMAT_UNSUPPORTED: u32 = 9;
 const CREATE_RESULT_ERROR_BACKING_SIZE_TOO_LARGE: u32 = 10;
 const CREATE_RESULT_ERROR_BACKING_DIFFERENCING: u32 = 11;
 const CREATE_RESULT_ERROR_PARENT_NAME_TOO_LONG: u32 = 12;
+const CREATE_RESULT_ERROR_PARENT_FORMAT_MISMATCH: u32 = 13;
 
 // ResizeConfig constants (must match shared crate)
 const RESIZE_CONFIG_MAGIC: u32 = 0x52455349; // "RESI"
@@ -17563,6 +17564,12 @@ fn create_error_detail(code: u32) -> &'static str {
              VHDX at most 260, and a character outside the Basic \
              Multilingual Plane costs two); use a shorter path or a \
              relative one"
+        }
+        CREATE_RESULT_ERROR_PARENT_FORMAT_MISMATCH => {
+            "backing file's detected format does not match the target \
+             format's required parent (a vpc child needs a VHD parent, \
+             a vhdx child needs a VHDX parent); instar detects the \
+             parent's real format from its header, not the -F hint"
         }
         _ => "unknown error",
     }

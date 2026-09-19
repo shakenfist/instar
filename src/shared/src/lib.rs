@@ -3527,6 +3527,17 @@ impl CreateResult {
     /// still overflows this one, so reusing the code would report a
     /// limit the path never came near.
     pub const ERROR_PARENT_NAME_TOO_LONG: u32 = 12;
+    /// A differencing child's parent is not the format the child
+    /// requires: Hyper-V requires a VHD parent for a VHD child and a
+    /// VHDX parent for a VHDX child, and instar detects the parent's
+    /// real format from its header rather than trusting a `-F` hint.
+    /// Distinguished from `ERROR_BACKING_DIFFERENCING`, whose parent
+    /// parsed as the right format but was itself a differencing
+    /// image: here the parent parsed fine and is not differencing, it
+    /// is simply the wrong format, and emitting a chain no
+    /// implementation can resolve would be worse than a typed
+    /// refusal.
+    pub const ERROR_PARENT_FORMAT_MISMATCH: u32 = 13;
 
     /// True if magic matches.
     pub fn is_valid(&self) -> bool {
