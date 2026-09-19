@@ -5,11 +5,10 @@ self-hosted-runner:
   # Custom labels used by our self-hosted runners
   labels:
     - claude-code
-    - debian-12
+    - debian-13
     # Needed by mermaid-lint.yml: mmdc renders through a browser, so
     # it runs in a container, and static runners have no docker daemon.
-    - debian-12-docker
-    - debian-13
+    - debian-13-docker
     - static
     - vm
     - xs

@@ -68,6 +68,20 @@ FROM debian:bullseye
 # image's own sources are: debian:bullseye ships no ca-certificates,
 # and this is the layer that installs it. Integrity comes from the
 # Release signature, exactly as it did before.
+#
+# Acquire::Retries is set in the same layer, and matters more here than
+# it would against deb.debian.org. A transient fetch failure in this
+# image does not fail a build, it ejects a pull request from the merge
+# queue: this image is only built there for a docs-only change, so there
+# is no PR-gate run to catch it first (#531). snapshot.debian.org is a
+# single origin behind a CDN rather than the deb.debian.org mirror
+# network, so pinning to it traded the 404 failure mode away and left
+# the transport one slightly more exposed. In the occurrence on PR #560,
+# one object out of 150 died with a TCP reset 10 seconds in, after
+# 125 MB had already come down from the same host at 15.3 MB/s, and the
+# very next object succeeded. apt retries the failed object, so it does
+# not re-download the other 149; three attempts is enough for a reset
+# and still fails promptly on a genuinely missing object.
 ARG DEBIAN_SNAPSHOT=20260901T000000Z
 RUN rm -f /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources && \
     printf '%s\n' \
@@ -76,7 +90,9 @@ RUN rm -f /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources && \
     "deb http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT}/ bullseye-security main" \
     > /etc/apt/sources.list && \
     printf '%s\n' 'Acquire::Check-Valid-Until "false";' \
-    > /etc/apt/apt.conf.d/99no-check-valid-until
+    > /etc/apt/apt.conf.d/99no-check-valid-until && \
+    printf '%s\n' 'Acquire::Retries "3";' \
+    > /etc/apt/apt.conf.d/99retries
 
 # Build toolchain only:
 # - build-essential: cc/ld for linking the host `instar` VMM binary

@@ -52,6 +52,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **CI runs on Debian 13 runners.** Every job moved from the `debian-12`
+  runner labels to `debian-13` (and `debian-12-docker` to
+  `debian-13-docker`); Debian 12 reached end of life on 2026-06-10. The
+  `debian:12` entry in the distro matrix is untouched and stays — that
+  is a supported *target*, not a build platform, and the published
+  support matrix still promises Debian 11 and newer.
+
+  Trixie splits the Docker client and the BuildKit builder out of
+  `docker.io` into separate `docker-cli` and `docker-buildx` packages,
+  which `docker.io` only *Recommends*, so the fourteen pasted copies of
+  the apt block that installed Docker on a runner stopped providing
+  `/usr/bin/docker` — and, once that was restored, could no longer build
+  an image, because every one of these jobs sets `DOCKER_BUILDKIT=1` and
+  the docker 26 client delegates `docker build` to the buildx plugin.
+  They are now one shared `tools/ci/install-docker.sh`, which installs
+  all three.
+
+- **The weekly Rust nightly bump validates packaging before proposing a
+  nightly.** It built the images, instar and the Rust test suite, but
+  never built or installed a package — so it could green-light a
+  toolchain that breaks the `.rpm`, which is exactly what happened with
+  `nightly-2026-08-17`. It now also runs `make package`, the glibc floor
+  check, and an install of each package on the oldest glibc of its
+  family, and the PR it opens lists what was actually validated.
+
+- **Pull requests now catch packaging regressions that used to reach the
+  merge queue.** `package-smoke` built only the `.deb` and installed it
+  on `debian:trixie` — the newest glibc in the distro matrix, where a
+  glibc-floor regression cannot fail by construction — so a broken
+  package passed the pull request gate and was found after enqueue,
+  ejecting the pull request and burning a full matrix fan-out. It now
+  builds both packages and installs each on the oldest glibc of its
+  family: the `.deb` on `ubuntu:22.04` and the `.rpm` on
+  `rockylinux:9`. Per-distro coverage is unchanged and stays in the
+  merge queue.
+
+- **Both devcontainer images retry transient apt failures.** A single
+  package download dying mid-body took out the whole image build, and
+  because the release image is only built in the merge queue for a
+  docs-only change, that ejected the pull request from the queue rather
+  than showing up as a failed check on the PR. `Acquire::Retries "3"`
+  retries the failed object rather than the transaction, so it costs
+  nothing on a healthy run.
+
+- **The nightly fuzzing corpus is no longer thrown away.** Coverage-guided
+  fuzzing only deepens if the corpus it produces survives the run, and
+  five of six scheduled runs in August were killed by the job's
+  480-minute timeout while pushing it -- after the fuzzing had already
+  finished. The push took 22 minutes because it cloned all ~12 GB of
+  instar-testdata, LFS fixtures included, and then compared both corpus
+  trees a file at a time across ~560,000 entries. It now lives in
+  `tools/ci/push-fuzz-corpus.sh`, which fetches trees but no file
+  contents, reads the committed entry names out of `git ls-tree`, and
+  copies only what is new. The step carries its own 20-minute timeout so
+  a future regression fails loudly instead of quietly discarding a
+  night's work.
+
+- **The merge queue's `package-build` job no longer competes for an `xl`
+  runner.** It builds a `.deb` and an `.rpm` -- a docker build and two
+  packaging steps, with no VM and no test suite -- but ran on the
+  KVM-sized `xl` pool the whole Shaken Fist fleet shares, and it sits on
+  the critical path because `package-matrix` waits for it. In one
+  measured merge run it queued for 143 minutes to do 6.5 minutes of
+  work, pushing that run to 397 minutes against a 360-minute
+  `check_response_timeout_minutes` and ejecting a pull request whose
+  every check had passed. It now runs on `s`, alongside
+  `build-and-test`, with its timeout raised from 45 to 60 minutes to
+  suit the smaller machine.
+
 - **`map --output=json` and `snapshot -l` now match the output of the
   qemu-img version being emulated, not just the newest one.** `map`
   omits `present` below qemu 6.1 and `compressed` below 8.2 rather than

@@ -103,7 +103,7 @@ jobs:
     if: >-
       github.event_name == 'pull_request'
       && needs.check_paths.outputs.code_changed != 'false'
-    runs-on: [self-hosted, debian-12, s]
+    runs-on: [self-hosted, debian-13, s]
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -132,6 +132,9 @@ jobs:
       - name: Test the fuzz artifact picker
         run: tools/ci/test-pick-fuzz-artifact.sh
 
+      - name: Test the fuzz corpus pusher
+        run: tools/ci/test-push-fuzz-corpus.sh
+
       - name: Test the glibc floor check
         run: tools/ci/test-check-glibc-floor.sh
 
@@ -147,7 +150,7 @@ jobs:
   build-and-test:
     needs: check_paths
     if: needs.check_paths.outputs.code_changed != 'false'
-    runs-on: [self-hosted, debian-12, s]
+    runs-on: [self-hosted, debian-13, s]
     timeout-minutes: 30
     # These jobs had no concurrency group at all, so a superseded run
     # held its ephemeral runner to completion. github.ref is the
@@ -184,11 +187,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install Docker
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y docker.io
-          sudo systemctl start docker
-          sudo chmod 666 /var/run/docker.sock
+        run: tools/ci/install-docker.sh
 
       - name: Remove previous devcontainers, if any
         run: |
@@ -388,16 +387,19 @@ jobs:
   # catches packaging regressions (asset paths, runtime deps, mode
   # bits, the /usr/lib/instar/ resolver fallback) on every PR.
   #
-  # Only the .deb on debian:trixie is exercised here. Broader distro
-  # coverage (Ubuntu, Fedora, Rocky 9/10, .rpm) lives in the merge
-  # queue matrix; see docs/plans/PLAN-distro-matrix-ci.md for the
+  # One .deb and one .rpm are exercised here, each installed on the
+  # oldest glibc of its family. That is deliberately not distro
+  # coverage -- it is floor coverage, the one packaging signal a pull
+  # request cannot otherwise have. Per-distro behaviour across all
+  # seven entries stays in the merge queue matrix, which remains the
+  # acceptance gate; see docs/plans/PLAN-distro-matrix-ci.md for the
   # full design.
   package-smoke:
     needs: [check_paths, build-and-test]
     if: >-
       github.event_name != 'merge_group'
       && needs.check_paths.outputs.code_changed != 'false'
-    runs-on: [self-hosted, debian-12, xl]
+    runs-on: [self-hosted, debian-13, xl]
     timeout-minutes: 30
 
     env:
@@ -408,26 +410,48 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install Docker and qemu-utils
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y docker.io qemu-utils
-          sudo systemctl start docker
-          sudo chmod 666 /var/run/docker.sock
+        run: tools/ci/install-docker.sh qemu-utils
 
       - name: Remove previous devcontainers, if any
         run: |
           docker image rm -f instar-build instar-release 2>/dev/null || true
 
-      - name: Build instar and the .deb package
+      - name: Build instar and both packages
         run: |
           make instar
-          make deb
+          make package
 
-      - name: Run install smoke test on debian:trixie
+      # Both smoke targets are the OLDEST glibc of their package family
+      # in the merge-queue matrix, and that is the whole point of them.
+      # A pull request cannot see the matrix, so the one thing this job
+      # has to catch before enqueue is a package that will not install
+      # anywhere -- and both misses on record were exactly that:
+      #
+      #   #488 bumped the build image to trixie and raised the binary's
+      #        floor to GLIBC_2.39, breaking Rocky 9, Ubuntu 22.04 and
+      #        Debian 12;
+      #   #501 bumped the Rust nightly to one that marks glibc version
+      #        needs WEAK, so the .rpm required
+      #        libc.so.6(GLIBC_2.18)[WEAK](64bit), which nothing
+      #        provides, and all three RPM legs failed to install.
+      #
+      # Both passed the pull request gate and were found in the queue,
+      # where they eject the pull request and burn a full fan-out
+      # (#505). Neither could have been caught here before, because the
+      # .rpm was not built at all and debian:trixie is the NEWEST glibc
+      # in the matrix -- a floor regression cannot fail on it by
+      # definition. Debian 13 still covers trixie in the queue.
+      - name: Run install smoke test on ubuntu:22.04
         run: |
           tools/test-package-install.sh \
             src/target/debian/instar_*.deb \
-            debian:trixie
+            ubuntu:22.04
+
+      - name: Run install smoke test on rockylinux:9
+        run: |
+          tools/test-package-install.sh \
+            src/target/generate-rpm/instar-*.rpm \
+            rockylinux:9
 
   # Build the .deb and .rpm ONCE for the whole matrix below.
   #
@@ -440,13 +464,34 @@ jobs:
   # Consequence worth knowing when reading a red matrix: if an entry
   # fails while *installing* the package, that is a glibc-floor
   # regression in the build image, not a test failure.
+  #
+  # Deliberately NOT on `xl`. This job runs `make instar && make package`
+  # -- a docker build and two packaging steps, with no VM, no KVM and no
+  # test suite -- which is the same class of work `build-and-test` does
+  # on `s`. It sat on `xl` only because step 4b of
+  # PLAN-distro-matrix-ci-phase-04-workflow.md told it to copy
+  # `package-smoke`'s preamble, and the runner label came along with the
+  # paste.
+  #
+  # That cost real merge-queue time, because this job is on the critical
+  # path: `package-matrix` cannot start until it finishes. In merge run
+  # 33799289895 it waited **143 minutes** for an `xl` runner and then ran
+  # for 6.5, while nothing else of ours held the pool -- the org-shared
+  # `xl` pool was busy elsewhere. That run took 397 minutes against a
+  # 360-minute `check_response_timeout_minutes` and a green pull request
+  # was ejected from the queue (#543).
   package-build:
     needs: build-and-test
     if: >-
       github.event_name == 'merge_group' ||
       github.event_name == 'workflow_dispatch'
-    runs-on: [self-hosted, debian-12, xl]
-    timeout-minutes: 45
+    runs-on: [self-hosted, debian-13, s]
+    # Was 45 when this ran on `xl`, where it took 6.5 minutes. `s` is a
+    # smaller machine and also builds from a colder docker cache, so the
+    # budget goes up with the move: `build-and-test` does `make instar`
+    # plus the whole Rust suite on `s` inside 30, and this is that build
+    # plus `make deb rpm`.
+    timeout-minutes: 60
     concurrency:
       group: >-
         ${{ github.workflow }}-package-build-${{
@@ -463,11 +508,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install Docker
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y docker.io
-          sudo systemctl start docker
-          sudo chmod 666 /var/run/docker.sock
+        run: tools/ci/install-docker.sh
 
       - name: Remove previous devcontainers, if any
         run: |
@@ -500,17 +541,23 @@ jobs:
   # The distro matrix: install the shared package on each distro and run
   # the FULL Python suite against that distro's own qemu-img.
   #
-  # No max-parallel. The xl runners are started on demand, so each entry
-  # gets its own VM and the entries do not contend for KVM with each
-  # other; capping the fan-out would only serialise independent VMs and
-  # multiply merge-queue latency.
+  # No max-parallel, but not for the reason originally recorded. The
+  # plan's premise was that `xl` runners start on demand, so seven
+  # entries never queue behind each other. Merge run 33799289895
+  # measured otherwise: the seven entries staggered their starts from
+  # 23:35Z to 01:44Z and never had more than three running at once, so
+  # the on-demand pool has a ceiling and this repo shares it with the
+  # rest of the fleet. `max-parallel` stays unset anyway -- the entries
+  # are already serialised by that ceiling, and capping it further would
+  # only lengthen the tail. Cross-entry KVM contention remains a
+  # non-issue, since each entry that does run has its own VM.
   package-matrix:
     needs: package-build
     if: >-
       github.event_name == 'merge_group' ||
       github.event_name == 'workflow_dispatch'
     name: "Matrix: ${{ matrix.distro.name }}"
-    runs-on: [self-hosted, debian-12, xl]
+    runs-on: [self-hosted, debian-13, xl]
     # Generous on purpose: the suite is ~3250 tests at concurrency 4 in
     # a container, and a timeout firing mid-suite is indistinguishable
     # from a flaky distro in the summary. Tighten once the first runs
@@ -538,6 +585,14 @@ jobs:
       fail-fast: false
       matrix:
         distro:
+          # audit-ok: eol-distro -- Debian 12 is a SUPPORTED TARGET here,
+          # not a build platform. bookworm reached end of life on
+          # 2026-06-10, but docs/installation.md and README.md promise
+          # Debian 11 and newer, and this entry is how that promise is
+          # kept honest: it installs the shipped .deb on bookworm and
+          # runs the full suite against bookworm's own qemu-img. Remove
+          # it only together with the published support matrix, not to
+          # settle an audit finding.
           - name: 'Debian 12'
             image: 'debian:12'
             pkg_kind: 'deb'
@@ -599,11 +654,7 @@ jobs:
           done
 
       - name: Install Docker
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y docker.io
-          sudo systemctl start docker
-          sudo chmod 666 /var/run/docker.sock
+        run: ${GITHUB_WORKSPACE}/instar/tools/ci/install-docker.sh
 
       - name: Download packages
         uses: actions/download-artifact@v8
@@ -638,7 +689,7 @@ jobs:
     if: >-
       github.event_name != 'merge_group'
       && needs.check_paths.outputs.code_changed != 'false'
-    runs-on: [self-hosted, debian-12, xl]
+    runs-on: [self-hosted, debian-13, xl]
     timeout-minutes: 45
 
     env:
@@ -671,11 +722,7 @@ jobs:
           done
 
       - name: Install Docker
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y docker.io
-          sudo systemctl start docker
-          sudo chmod 666 /var/run/docker.sock
+        run: ${GITHUB_WORKSPACE}/instar/tools/ci/install-docker.sh
 
       - name: Remove previous devcontainers, if any
         run: |
@@ -822,7 +869,7 @@ jobs:
     if: >-
       github.event_name != 'merge_group'
       && needs.check_paths.outputs.code_changed != 'false'
-    runs-on: [self-hosted, debian-12, xl]
+    runs-on: [self-hosted, debian-13, xl]
     timeout-minutes: 60
 
     env:
@@ -855,11 +902,7 @@ jobs:
           done
 
       - name: Install Docker
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y docker.io
-          sudo systemctl start docker
-          sudo chmod 666 /var/run/docker.sock
+        run: ${GITHUB_WORKSPACE}/instar/tools/ci/install-docker.sh
 
       - name: Remove previous devcontainers, if any
         run: |
@@ -905,7 +948,7 @@ jobs:
     if: >-
       github.event_name != 'merge_group'
       && needs.check_paths.outputs.code_changed != 'false'
-    runs-on: [self-hosted, debian-12, xl]
+    runs-on: [self-hosted, debian-13, xl]
     timeout-minutes: 90
 
     env:
@@ -938,11 +981,7 @@ jobs:
           done
 
       - name: Install Docker
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y docker.io
-          sudo systemctl start docker
-          sudo chmod 666 /var/run/docker.sock
+        run: ${GITHUB_WORKSPACE}/instar/tools/ci/install-docker.sh
 
       - name: Remove previous devcontainers, if any
         run: |
@@ -997,7 +1036,7 @@ jobs:
     if: >-
       github.event_name != 'merge_group'
       && needs.check_paths.outputs.code_changed != 'false'
-    runs-on: [self-hosted, debian-12, xl]
+    runs-on: [self-hosted, debian-13, xl]
     timeout-minutes: 30
 
     env:
@@ -1008,11 +1047,7 @@ jobs:
         uses: actions/checkout@v7
 
       - name: Install Docker
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y docker.io
-          sudo systemctl start docker
-          sudo chmod 666 /var/run/docker.sock
+        run: tools/ci/install-docker.sh
 
       - name: Remove previous devcontainers, if any
         run: |
@@ -1046,7 +1081,7 @@ jobs:
     if: >-
       github.event_name != 'merge_group'
       && needs.check_paths.outputs.code_changed != 'false'
-    runs-on: [self-hosted, debian-12, xl]
+    runs-on: [self-hosted, debian-13, xl]
     timeout-minutes: 30
     continue-on-error: true
 
@@ -1084,11 +1119,7 @@ jobs:
           done
 
       - name: Install Docker
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y docker.io
-          sudo systemctl start docker
-          sudo chmod 666 /var/run/docker.sock
+        run: ${GITHUB_WORKSPACE}/instar/tools/ci/install-docker.sh
 
       - name: Remove previous devcontainers, if any
         run: |

@@ -15,6 +15,13 @@
 # PRs.
 FROM mcr.microsoft.com/devcontainers/base:debian@sha256:025b74bb5f7ac53edd77e01aa7188c359aab100e23a2f6220bde50bbb9fd31dd
 
+# Retry transient apt fetch failures rather than failing the image
+# build. This image is built by `build-and-test`, which runs on both the
+# pull request and the merge queue, so a reset mid-download here takes
+# out a merge group as easily as it takes out a PR run. Kept in step
+# with build/Dockerfile, which has the longer note (#531).
+RUN printf '%s\n' 'Acquire::Retries "3";' > /etc/apt/apt.conf.d/99retries
+
 # Install build dependencies and test tools
 # - protobuf-compiler: required for micropb-gen
 # - python3, python3-pip, python3-venv: for running integration tests

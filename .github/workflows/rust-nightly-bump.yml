@@ -35,7 +35,7 @@ concurrency:
 
 jobs:
   bump:
-    runs-on: [self-hosted, debian-12, xl]
+    runs-on: [self-hosted, debian-13, xl]
     timeout-minutes: 120
 
     env:
@@ -50,16 +50,21 @@ jobs:
       # The self-hosted runners do not ship docker, and the validation
       # step builds the devcontainer image, so install it here as every
       # other docker-using job in this repository does.
-      - name: Install Docker
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y docker.io
-          sudo systemctl start docker
-          sudo chmod 666 /var/run/docker.sock
+      # qemu-utils is for the package install smoke tests the validation
+      # ends with: tools/test-package-install.sh builds its fixture with
+      # qemu-img on the host before handing it to the container.
+      - name: Install Docker and qemu-utils
+        run: tools/ci/install-docker.sh qemu-utils
 
+      # Both images. The script force-builds each with `docker build`
+      # rather than through make, so a stale tag cannot hide a broken
+      # candidate either way -- but `make package` does depend on
+      # build-devcontainer, which reuses whatever image is present, so
+      # leaving a previous release image behind muddies what was
+      # actually validated.
       - name: Remove previous devcontainers, if any
         run: |
-          docker image rm -f instar-build 2>/dev/null || true
+          docker image rm -f instar-build instar-release 2>/dev/null || true
 
       # The self-hosted runners do not ship gh, and the script opens the
       # bump PR with it; installing it here is what the 2026-08-24 run
