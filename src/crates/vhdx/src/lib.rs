@@ -1634,35 +1634,13 @@ impl VhdxState {
         }
 
         // --- Read and select active header ---
-        let header1 = Self::read_header(
+        let header = Self::read_active_header(
             call_table,
             device_idx,
-            HEADER1_OFFSET,
             sector_size,
             input_capacity,
             bytes_read,
-        );
-        let header2 = Self::read_header(
-            call_table,
-            device_idx,
-            HEADER2_OFFSET,
-            sector_size,
-            input_capacity,
-            bytes_read,
-        );
-
-        let header = match (&header1, &header2) {
-            (Some(h1), Some(h2)) => {
-                if h1.sequence_number >= h2.sequence_number {
-                    h1
-                } else {
-                    h2
-                }
-            }
-            (Some(h1), None) => h1,
-            (None, Some(h2)) => h2,
-            (None, None) => return None,
-        };
+        )?;
 
         // Check for dirty log (non-zero log_guid)
         let _is_dirty = header.log_guid != [0u8; 16];
@@ -1817,6 +1795,62 @@ impl VhdxState {
             data_cached_sector: u64::MAX,
             data_cache_buf,
         })
+    }
+
+    /// Read both VHDX headers and return the active one.
+    ///
+    /// The active header is the one with the higher sequence number.
+    /// Header 1 wins a tie: the sequence number is what distinguishes
+    /// the two headers, so a tie is not a case the format describes,
+    /// and preferring header 1 is this implementation's choice rather
+    /// than a rule read off the spec. It is pinned by a test because
+    /// callers now depend on it. When only one header parses, that one
+    /// is active; when neither does, there is no header at all.
+    ///
+    /// [`VhdxState::init`] uses this, so a caller that needs the active
+    /// header's own fields — a differencing child needs its parent's
+    /// `DataWriteGuid` — gets the same header `init` used rather than a
+    /// second selection rule that can drift from it.
+    ///
+    /// # Safety
+    ///
+    /// `call_table` must be valid and `device_idx` must be attached.
+    pub unsafe fn read_active_header(
+        call_table: &CallTable,
+        device_idx: u32,
+        sector_size: usize,
+        input_capacity: u64,
+        bytes_read: &mut u64,
+    ) -> Option<VhdxHeader> {
+        let header1 = Self::read_header(
+            call_table,
+            device_idx,
+            HEADER1_OFFSET,
+            sector_size,
+            input_capacity,
+            bytes_read,
+        );
+        let header2 = Self::read_header(
+            call_table,
+            device_idx,
+            HEADER2_OFFSET,
+            sector_size,
+            input_capacity,
+            bytes_read,
+        );
+
+        match (header1, header2) {
+            (Some(h1), Some(h2)) => {
+                if h1.sequence_number >= h2.sequence_number {
+                    Some(h1)
+                } else {
+                    Some(h2)
+                }
+            }
+            (Some(h1), None) => Some(h1),
+            (None, Some(h2)) => Some(h2),
+            (None, None) => None,
+        }
     }
 
     /// Read and parse a VHDX header from a given offset.
@@ -5033,5 +5067,208 @@ mod tests {
             ),
             Ok(item_len)
         );
+    }
+
+    // ====================================================================
+    // Active-header selection
+    // ====================================================================
+
+    /// Enough of a VHDX file to hold both headers: header 2 starts at
+    /// `HEADER2_OFFSET` and is `HEADER_SIZE` long.
+    const HEADERS_REGION_LEN: usize = HEADER2_OFFSET as usize + HEADER_SIZE;
+
+    /// The two header slots of a VHDX file, served one sector at a time
+    /// through a `CallTable`, so `read_active_header` can be driven
+    /// without a device. Nothing else in the file is populated —
+    /// selection reads the headers and nothing further.
+    struct HeadersFixture {
+        region: [u8; HEADERS_REGION_LEN],
+    }
+
+    // Same shape and the same reason as `STAGE_FIXTURE`: the reader is
+    // an `extern "C" fn` and closes over nothing, so the fixture has to
+    // be a global and the lock is what keeps concurrent tests off each
+    // other's bytes.
+    static HEADERS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    static mut HEADERS_FIXTURE: HeadersFixture = HeadersFixture {
+        region: [0u8; HEADERS_REGION_LEN],
+    };
+
+    fn headers_lock() -> std::sync::MutexGuard<'static, ()> {
+        HEADERS_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Serve one sector out of the headers fixture.
+    ///
+    /// Every access goes through a raw pointer rather than a reference,
+    /// because a reference to a `static mut` is what `static_mut_refs`
+    /// forbids.
+    unsafe extern "C" fn headers_read_sector(
+        _device_idx: u32,
+        sector: u64,
+        out_buf: *mut u8,
+        sector_size: usize,
+    ) -> bool {
+        let start = (sector as usize).saturating_mul(sector_size);
+        match start.checked_add(sector_size) {
+            Some(end) if end <= HEADERS_REGION_LEN => {}
+            _ => return false,
+        }
+        let base = core::ptr::addr_of!(HEADERS_FIXTURE.region) as *const u8;
+        core::ptr::copy_nonoverlapping(base.add(start), out_buf, sector_size);
+        true
+    }
+
+    /// Zero the fixture and place each supplied header image in its
+    /// slot. A `None` slot is left as zeros, which fails
+    /// `VhdxHeader::parse`'s signature check — an unparseable header.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold `HEADERS_LOCK` for as long as it then uses
+    /// the fixture.
+    unsafe fn install_headers(header1: Option<&[u8]>, header2: Option<&[u8]>) {
+        let region = core::ptr::addr_of_mut!(HEADERS_FIXTURE.region) as *mut u8;
+        core::ptr::write_bytes(region, 0, HEADERS_REGION_LEN);
+        for (offset, image) in [
+            (HEADER1_OFFSET as usize, header1),
+            (HEADER2_OFFSET as usize, header2),
+        ] {
+            if let Some(bytes) = image {
+                assert_eq!(bytes.len(), HEADER_SIZE);
+                core::ptr::copy_nonoverlapping(bytes.as_ptr(), region.add(offset), HEADER_SIZE);
+            }
+        }
+    }
+
+    /// Run `VhdxState::read_active_header` against the fixture.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold `HEADERS_LOCK`.
+    unsafe fn read_active(sector_size: usize) -> Option<VhdxHeader> {
+        let call_table = shared::CallTable {
+            read_input_sector: headers_read_sector,
+            ..stub_call_table()
+        };
+        let mut bytes_read = 0u64;
+        VhdxState::read_active_header(
+            &call_table,
+            0,
+            sector_size,
+            (HEADERS_REGION_LEN / sector_size) as u64,
+            &mut bytes_read,
+        )
+    }
+
+    /// A header with the given sequence number, as `build_header`
+    /// writes it — including the `DataWriteGuid` it derives from that
+    /// sequence number, which is what makes the two headers in a test
+    /// distinguishable.
+    fn header_image(sequence_number: u64) -> [u8; HEADER_SIZE] {
+        let mut buf = [0u8; HEADER_SIZE];
+        build_header(&mut buf, sequence_number);
+        buf
+    }
+
+    fn guid_of(buf: &[u8]) -> [u8; 16] {
+        let mut guid = [0u8; 16];
+        guid.copy_from_slice(
+            &buf[HEADER_DATA_WRITE_GUID_OFFSET..HEADER_DATA_WRITE_GUID_OFFSET + 16],
+        );
+        guid
+    }
+
+    #[test]
+    fn active_header_is_the_higher_sequence_number() {
+        // Header 2 is the newer one, so its DataWriteGuid is the
+        // identity a differencing child of this parent must record.
+        for sector_size in [512usize, 4096] {
+            let _guard = headers_lock();
+            let h1 = header_image(1);
+            let h2 = header_image(9);
+            let active = unsafe {
+                install_headers(Some(&h1), Some(&h2));
+                read_active(sector_size)
+            }
+            .expect("both headers parse");
+            assert_eq!(active.sequence_number, 9, "sector_size {sector_size}");
+            assert_eq!(
+                active.data_write_guid,
+                guid_of(&h2),
+                "sector_size {sector_size}"
+            );
+            assert_ne!(active.data_write_guid, guid_of(&h1));
+        }
+    }
+
+    #[test]
+    fn active_header_is_header_one_when_sequence_numbers_tie() {
+        // `build_header` derives the GUID from the sequence number, so
+        // two headers with the same sequence number would be
+        // indistinguishable. Give header 2 a marker GUID and re-checksum
+        // it, so a wrong tie-break is visible rather than silent.
+        for sector_size in [512usize, 4096] {
+            let _guard = headers_lock();
+            let h1 = header_image(5);
+            let mut h2 = header_image(5);
+            let marker = [0xa5u8; 16];
+            h2[HEADER_DATA_WRITE_GUID_OFFSET..HEADER_DATA_WRITE_GUID_OFFSET + 16]
+                .copy_from_slice(&marker);
+            let checksum = compute_crc32c(&h2[..HEADER_SIZE], HEADER_CHECKSUM_OFFSET);
+            write_le_u32(&mut h2, HEADER_CHECKSUM_OFFSET, checksum);
+            assert!(VhdxHeader::parse(&h2).is_some(), "re-checksummed header 2");
+
+            let active = unsafe {
+                install_headers(Some(&h1), Some(&h2));
+                read_active(sector_size)
+            }
+            .expect("both headers parse");
+            assert_eq!(active.sequence_number, 5, "sector_size {sector_size}");
+            assert_eq!(
+                active.data_write_guid,
+                guid_of(&h1),
+                "a tie must pick header 1, sector_size {sector_size}"
+            );
+            assert_ne!(active.data_write_guid, marker);
+        }
+    }
+
+    #[test]
+    fn active_header_falls_back_to_the_one_that_parses() {
+        let h = header_image(3);
+
+        let from_header2 = {
+            let _guard = headers_lock();
+            unsafe {
+                install_headers(None, Some(&h));
+                read_active(512)
+            }
+        }
+        .expect("header 2 parses");
+        assert_eq!(from_header2.data_write_guid, guid_of(&h));
+
+        let from_header1 = {
+            let _guard = headers_lock();
+            unsafe {
+                install_headers(Some(&h), None);
+                read_active(512)
+            }
+        }
+        .expect("header 1 parses");
+        assert_eq!(from_header1.data_write_guid, guid_of(&h));
+    }
+
+    #[test]
+    fn no_active_header_when_neither_parses() {
+        let _guard = headers_lock();
+        let active = unsafe {
+            install_headers(None, None);
+            read_active(512)
+        };
+        assert!(active.is_none());
     }
 }

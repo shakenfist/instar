@@ -119,10 +119,59 @@ fn map_create_error(e: CreateError) -> u32 {
     }
 }
 
-/// Recover a backing image's `virtual_size` by reading and parsing its
-/// header from input device 0. On failure returns the `CreateResult`
-/// error code the caller should report, so the reason survives the
-/// return rather than collapsing into one generic code.
+/// How a differencing child names the parent it was written against.
+///
+/// Only VHD and VHDX record a parent identity: a VHD child stores the
+/// parent's footer `uuid` and `timestamp` in its own footer and dynamic
+/// header, and a VHDX child stores the parent's active-header
+/// `DataWriteGuid` as its `parent_linkage`. Every other format either
+/// names its parent by path alone (qcow2, raw) or by a CID read
+/// elsewhere (vmdk, via `read_vmdk_parent_cid`), so `None` is the
+/// correct answer for them rather than a missing case.
+#[derive(Clone, Copy)]
+// Read by the create arms that build the differencing planner options;
+// see docs/plans/PLAN-differencing.md. The probe only makes the
+// identity available.
+#[allow(dead_code)]
+enum ParentIdentity {
+    /// The parent carries no identity a child of it could record.
+    None,
+    /// A VHD parent's footer `uuid` and creation `timestamp`. The
+    /// timestamp is the parent's own, in the VHD epoch, exactly as the
+    /// footer stores it — a child records when its parent was made, not
+    /// when the child was.
+    Vhd { uuid: [u8; 16], timestamp: u32 },
+    /// A VHDX parent's active-header `DataWriteGuid`.
+    Vhdx { data_write_guid: [u8; 16] },
+}
+
+/// What one pass over a backing image's headers yields.
+///
+/// The probe reads those headers once and reports everything derived
+/// from them together, rather than having each caller re-read the same
+/// sectors and re-derive where a footer lives.
+struct BackingProbe {
+    /// The parent's virtual size, for a child that inherits it.
+    virtual_size: u64,
+    /// The format detected in the parent's own header — not the
+    /// `-F` hint, which is only populated when the user passes one.
+    // Read by the parent-format check; see
+    // docs/plans/PLAN-differencing.md.
+    #[allow(dead_code)]
+    format: ImageFormat,
+    /// The parent's identity, if its format records one.
+    // Read by the create arms that build the differencing planner
+    // options; see docs/plans/PLAN-differencing.md.
+    #[allow(dead_code)]
+    identity: ParentIdentity,
+}
+
+/// Probe a backing image by reading and parsing its header from input
+/// device 0: its virtual size, the format actually present in its
+/// bytes, and the identity a differencing child of it would record.
+/// On failure returns the `CreateResult` error code the caller should
+/// report, so the reason survives the return rather than collapsing
+/// into one generic code.
 ///
 /// VHDX walks header → region table → metadata region via the
 /// vhdx crate's `VhdxState::init`, which exposes
@@ -149,10 +198,7 @@ fn map_create_error(e: CreateError) -> u32 {
 ///
 /// `call_table` must be valid and input device 0 must be attached
 /// with non-zero capacity.
-unsafe fn read_backing_virtual_size(
-    call_table: &CallTable,
-    sector_size: usize,
-) -> Result<u64, u32> {
+unsafe fn probe_backing(call_table: &CallTable, sector_size: usize) -> Result<BackingProbe, u32> {
     const PARSE_FAILED: u32 = CreateResult::ERROR_BACKING_PARSE_FAILED;
     const DIFFERENCING: u32 = CreateResult::ERROR_BACKING_DIFFERENCING;
 
@@ -163,14 +209,25 @@ unsafe fn read_backing_virtual_size(
     let header = core::slice::from_raw_parts(header_ptr, sector_size);
     let format = detect_format_from_header(header, sector_size, false);
     let capacity = (call_table.get_input_capacity)(0);
-    match format {
-        ImageFormat::Raw => capacity.checked_mul(sector_size as u64).ok_or(PARSE_FAILED),
-        ImageFormat::Qcow2 => qcow2::QcowHeader::parse(header)
-            .map(|h| h.virtual_size)
-            .ok_or(PARSE_FAILED),
-        ImageFormat::Vmdk4 => vmdk::Vmdk4Header::parse(header)
-            .map(|h| h.virtual_size)
-            .ok_or(PARSE_FAILED),
+    let (virtual_size, identity) = match format {
+        ImageFormat::Raw => (
+            capacity
+                .checked_mul(sector_size as u64)
+                .ok_or(PARSE_FAILED)?,
+            ParentIdentity::None,
+        ),
+        ImageFormat::Qcow2 => (
+            qcow2::QcowHeader::parse(header)
+                .map(|h| h.virtual_size)
+                .ok_or(PARSE_FAILED)?,
+            ParentIdentity::None,
+        ),
+        ImageFormat::Vmdk4 => (
+            vmdk::Vmdk4Header::parse(header)
+                .map(|h| h.virtual_size)
+                .ok_or(PARSE_FAILED)?,
+            ParentIdentity::None,
+        ),
         ImageFormat::Vhd => {
             // VHD's footer is the last 512 bytes of the *file*; read the
             // last sector and locate it within that sector. It only
@@ -190,7 +247,13 @@ unsafe fn read_backing_virtual_size(
             if footer.disk_type == vhd::DISK_TYPE_DIFFERENCING {
                 return Err(DIFFERENCING);
             }
-            Ok(footer.current_size)
+            (
+                footer.current_size,
+                ParentIdentity::Vhd {
+                    uuid: footer.uuid,
+                    timestamp: footer.timestamp,
+                },
+            )
         }
         ImageFormat::Vhdx => {
             if capacity == 0 {
@@ -210,11 +273,35 @@ unsafe fn read_backing_virtual_size(
             if state.has_parent {
                 return Err(DIFFERENCING);
             }
-            Ok(state.virtual_disk_size)
+            // `init` selected an active header to walk the region table
+            // with but kept none of its fields, so read the pair again
+            // and select with the same rule — `read_active_header` is
+            // the rule `init` itself calls, so the two cannot disagree
+            // about which header is active. The reads cannot fail here
+            // in practice: `init` just made them successfully.
+            let active = vhdx::VhdxState::read_active_header(
+                call_table,
+                0,
+                sector_size,
+                capacity,
+                &mut bytes_read,
+            )
+            .ok_or(PARSE_FAILED)?;
+            (
+                state.virtual_disk_size,
+                ParentIdentity::Vhdx {
+                    data_write_guid: active.data_write_guid,
+                },
+            )
         }
         // Vdi / Qcow1 / Qed / Iso / Luks: unsupported as backing.
-        _ => Err(PARSE_FAILED),
-    }
+        _ => return Err(PARSE_FAILED),
+    };
+    Ok(BackingProbe {
+        virtual_size,
+        format,
+        identity,
+    })
 }
 
 /// Translate `CreateConfig` into `crates/create::Qcow2CreateOpts`.
@@ -556,8 +643,8 @@ pub unsafe extern "C" fn _start() -> u64 {
     let virtual_size: u64 = if config.virtual_size != 0 {
         config.virtual_size
     } else if config.has_backing() {
-        match read_backing_virtual_size(call_table, config.sector_size as usize) {
-            Ok(vs) if vs > 0 => vs,
+        match probe_backing(call_table, config.sector_size as usize) {
+            Ok(probe) if probe.virtual_size > 0 => probe.virtual_size,
             // A zero virtual size is as unusable as a failed parse, and
             // carries no more specific reason than that.
             Ok(_) => {

@@ -197,6 +197,31 @@ when the user passes `-F` (`src/vmm/src/main.rs:16975-16977`)
 while the guest can *detect* the parent's real format from its
 header regardless.
 
+**7. The probe only runs when no size was given, so every check on
+the parent is skippable.** Found while reviewing 7c. The call site
+reads:
+
+```rust
+let virtual_size: u64 = if config.virtual_size != 0 {
+    config.virtual_size
+} else if config.has_backing() {
+    match probe_backing(call_table, config.sector_size as usize) {
+```
+
+So `instar create -f qcow2 -b differencing.vhd -F vpc child.qcow2 64M`
+never opens the parent, and phase 4's `ERROR_BACKING_DIFFERENCING`
+refusal does not fire -- demonstrated against a `develop` binary with
+the phase 2 fixture, where the same command without the trailing
+`64M` is correctly refused. `ERROR_BACKING_PARSE_FAILED` and the
+format detection are skipped by the same path.
+
+This is pre-existing and wider than differencing, so it is filed as
+**#579**. It lands in this phase's scope regardless, because the
+parent identity must be available whenever `-b` is given and decision
+4's format check would otherwise inherit the identical hole. 7f
+restructures the call site to probe whenever `config.has_backing()`
+and to prefer an explicit size over the probed one.
+
 **Nothing else in the phase 7 section was wrong.** The claim that
 makes this plan tractable — that the host already attaches the
 parent as input device 0 whenever `-b` is given, so no call-table
@@ -333,7 +358,7 @@ a reviewer does not read a passing same-identity test as proof.
 | 7c | high | opus | none | Rework `read_backing_virtual_size` into `probe_backing` returning `Result<BackingProbe, u32>` where `BackingProbe { virtual_size: u64, format: ImageFormat, identity: ParentIdentity }` and `ParentIdentity` is an enum of `None`, `Vhd { uuid: [u8; 16], timestamp: u32 }` and `Vhdx { data_write_guid: [u8; 16] }`. The VHD arm already builds a `vhd::VhdFooter` whose `uuid` and `timestamp` fields are what is wanted (`src/crates/vhd/src/lib.rs:182-199`); the VHDX arm runs `vhdx::VhdxState::init`, which selects the active header internally (`src/crates/vhdx/src/lib.rs:1647-1658`) but does not retain it, so read header 1 and header 2 directly at `HEADER1_OFFSET`/`HEADER2_OFFSET` with `VhdxHeader::parse` (7a's field) and take the higher `sequence_number`, matching that selection rule exactly — including its tie-break, which prefers header 1 on equality. Update the single call site (`:554`). Every existing behaviour must be preserved: the differencing refusals, the raw capacity multiply, and each error code. Commit subject: "Return the parent's identity from the backing probe." |
 | 7d | medium | sonnet | none | Add `ERROR_PARENT_FORMAT_MISMATCH: u32 = 13` to `CreateResult` (`src/shared/src/lib.rs:3492-3519`, currently ending at 12), with a doc comment saying a differencing child must share its parent's format, per Hyper-V. Codes are an append-only ABI duplicated in three places with no compile-time cross-check, so also add the host-side message in `src/vmm/src/main.rs` beside the `ERROR_PARENT_NAME_TOO_LONG` arm — wording: name both the target format and the format actually detected in the parent, and say that a vpc child needs a VHD parent and a vhdx child a VHDX one. Add the `map_create_error` arm. Do not wire any caller; 7f does that. Commit subject: "Add a typed parent format mismatch error." |
 | 7e | high | opus | worktree | Implement decision 6 (read it in full first) in both emitters: `create::plan_vhd`'s platform-code selection and `create::plan_vhdx`'s path-key selection. A **relative** path is normalised for emission — `/` becomes `\`, and a leading `./` or no prefix becomes `.\` — matching the measured Hyper-V fixtures from phase 3. An **absolute POSIX** path is written verbatim under `W2ku` / `absolute_win32_path`, unchanged from today. Normalisation happens on a copy in the emitter, never to the VHD parent unicode name field, which keeps the typed bytes because that is the field qemu and libvhdi resolve through. Watch the length limits: normalisation can add two bytes (`.\`), so the 255 and 260 UTF-16 code-unit checks must run on the **normalised** string, and the existing boundary tests need their expectations rechecked rather than their numbers adjusted to fit. Isolation is a worktree because this changes bytes phases 5 and 6 pinned with golden tests; those tests must be updated deliberately and each change explained, not regenerated. Commit subject: "Emit Hyper-V path conventions for relative parents." |
-| 7f | high | opus | none | Remove the two `if backing_ref.is_some()` guards in the create op's `ImageFormat::Vhd` and `ImageFormat::Vhdx` arms (`src/operations/create/src/main.rs:697-703` and `:729-735`) and their now-stale comments. Feed 7c's identity into `vhd_opts_from` (`:311`) and `vhdx_opts_from` (`:~350`), replacing the `[0u8; 16]` placeholders at `:334-335` and `:358` and the comments above them that say the guest has no way to read a parent. Before `plan_vhd`/`plan_vhdx` runs, apply decision 4: refuse with `ERROR_PARENT_FORMAT_MISMATCH` when the probe's detected format is not VHD for a vpc target or VHDX for a vhdx target, and also when `config.backing_format` is set and disagrees with detection. Then convert `test_create_vhd_and_vhdx_reject_backing` (`tests/test_create.py:248`) per decision 7 into a round-trip test. Prove the new test can fail: neuter the identity plumbing back to zeros and confirm it fails on the identity assertion rather than on image creation, and report that result. Commit subject: "Create differencing VHD and VHDX children." |
+| 7f | high | opus | none | **First** restructure the probe call site (`src/operations/create/src/main.rs:642-650`) per survey finding 7 and #579: call `probe_backing` whenever `config.has_backing()` rather than only when `config.virtual_size == 0`, and prefer an explicit size over the probed one. Without this the identity is unavailable, and the format check of decision 4 is silently skipped, whenever the user passes a size. Then remove the two `if backing_ref.is_some()` guards in the create op's `ImageFormat::Vhd` and `ImageFormat::Vhdx` arms (`src/operations/create/src/main.rs:697-703` and `:729-735`) and their now-stale comments. Feed 7c's identity into `vhd_opts_from` (`:311`) and `vhdx_opts_from` (`:~350`), replacing the `[0u8; 16]` placeholders at `:334-335` and `:358` and the comments above them that say the guest has no way to read a parent. Before `plan_vhd`/`plan_vhdx` runs, apply decision 4: refuse with `ERROR_PARENT_FORMAT_MISMATCH` when the probe's detected format is not VHD for a vpc target or VHDX for a vhdx target, and also when `config.backing_format` is set and disagrees with detection. Then convert `test_create_vhd_and_vhdx_reject_backing` (`tests/test_create.py:248`) per decision 7 into a round-trip test. Prove the new test can fail: neuter the identity plumbing back to zeros and confirm it fails on the identity assertion rather than on image creation, and report that result. Commit subject: "Create differencing VHD and VHDX children." |
 | 7g | medium | sonnet | none | Documentation, no code. `docs/create.md`: the vpc and vhdx `backing_file` bullets now describe a supported operation, not a refusal — mirror how the qcow2 bullet reads, and state that the parent must be the same format. `docs/quirks.md`: add the decision 6 split to the VHD/VHDX differencing section — relative parents emit Hyper-V conventions, POSIX-absolute parents keep their bytes under a Windows-defined key, and why. `docs/format-coverage.md`: differencing output is a recorded divergence from qemu-img per open question 4, so add it as a note in the style of note 8. `CHANGELOG.md`: an `### Added` entry, user-facing this time — unlike phases 5 and 6, this one changes what the CLI does. Per AGENTS.md, no phase numbers in documentation: link [PLAN-differencing.md](docs/plans/PLAN-differencing.md) instead. Commit subject: "Document differencing image creation." |
 
 ## Risks and mitigations
@@ -403,6 +428,11 @@ a reviewer does not read a passing same-identity test as proof.
   both fail with the mismatch message, exit non-zero, and write no
   child. Likewise `-f vpc -b parent.vhd -F qcow2`, where the hint
   contradicts the bytes.
+* Every check reached through the probe fires **with** an explicit
+  size as well as without: `create -f qcow2 -b <differencing parent>
+  child.qcow2 64M` is refused, which it is not on `develop` today
+  (#579). Asserted by an integration test, since the op itself is not
+  in the tested workspace.
 * No `[0u8; 16]` parent-identity placeholder remains in
   `src/operations/create/src/main.rs`, and no comment there says
   the guest cannot read a parent.
