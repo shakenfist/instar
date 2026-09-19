@@ -428,17 +428,24 @@ pub const PARENT_LOCATOR_ENTRY_SIZE: usize = 12;
 /// dropped, so a later phase knows entries went unread and can say so.
 pub const MAX_PARENT_LOCATOR_ENTRIES: usize = 8;
 
-/// Longest key, in UTF-16 source bytes, that is decoded: 32 code units.
+/// Longest key that is decoded, **in UTF-16 source bytes**: 64 bytes,
+/// which is 32 code units. The `_BYTES` suffix is load-bearing — an
+/// emitter sizing a scratch buffer from this constant gets the cap it
+/// expects only because the name says bytes.
 ///
 /// **A parser resource bound, not a spec limit.** SPEC(VHDX) 2.6.2.6.2
 /// stores `KeyLength` as a u16 and constrains it no further. The
 /// longest key any known producer writes is `absolute_win32_path`, 19
 /// characters. A longer key is marked `KeyTooLong` with its raw offset
 /// and length intact.
-pub const MAX_PARENT_LOCATOR_KEY_UTF16: usize = 64;
+pub const MAX_PARENT_LOCATOR_KEY_UTF16_BYTES: usize = 64;
 
-/// Longest value, in UTF-16 source bytes, that is decoded: 260 code
-/// units, Windows `MAX_PATH`.
+/// Longest value that is decoded, **in UTF-16 source bytes**: 520
+/// bytes, which is 260 code units — Windows `MAX_PATH`. The `_BYTES`
+/// suffix is load-bearing: [`build_parent_locator`] enforces the
+/// emitter's path cap by handing the encoder a scratch buffer of
+/// exactly this many bytes, so a reader who took the old name at face
+/// value and sized it in code units would quietly double the cap.
 ///
 /// **A parser resource bound, not a spec limit.** SPEC(VHDX) 2.6.2.6.2
 /// stores `ValueLength` as a u16 and fixes no path length, and a
@@ -449,29 +456,34 @@ pub const MAX_PARENT_LOCATOR_KEY_UTF16: usize = 64;
 /// entry keeps its raw `value_offset` and `value_length`, which is
 /// what a later phase would need to re-read it into a bigger buffer.
 /// The longest measured Hyper-V value is an 88-character `volume_path`.
-pub const MAX_PARENT_LOCATOR_VALUE_UTF16: usize = 520;
+pub const MAX_PARENT_LOCATOR_VALUE_UTF16_BYTES: usize = 520;
 
 /// Buffer for a decoded key.
 ///
 /// One UTF-16 code unit (2 source bytes) encodes to at most 3 UTF-8
 /// bytes, and a surrogate pair (4 source bytes) to exactly 4, so UTF-8
 /// output is never more than 3/2 of the UTF-16 input. A key within
-/// `MAX_PARENT_LOCATOR_KEY_UTF16` therefore always fits here, and
+/// `MAX_PARENT_LOCATOR_KEY_UTF16_BYTES` therefore always fits here, and
 /// `utf16_to_utf8` can only refuse it for being ill-formed.
-pub const MAX_PARENT_LOCATOR_KEY_UTF8: usize = MAX_PARENT_LOCATOR_KEY_UTF16 * 3 / 2;
+pub const MAX_PARENT_LOCATOR_KEY_UTF8: usize = MAX_PARENT_LOCATOR_KEY_UTF16_BYTES * 3 / 2;
 
 /// Buffer for a decoded value. See `MAX_PARENT_LOCATOR_KEY_UTF8` for
 /// why 3/2 of the UTF-16 cap is always enough.
-pub const MAX_PARENT_LOCATOR_VALUE_UTF8: usize = MAX_PARENT_LOCATOR_VALUE_UTF16 * 3 / 2;
+pub const MAX_PARENT_LOCATOR_VALUE_UTF8: usize = MAX_PARENT_LOCATOR_VALUE_UTF16_BYTES * 3 / 2;
 
 /// Largest parent locator item `parse_metadata` will stage into memory.
 ///
 /// **A parser resource bound, not a spec limit.** The measured Hyper-V
-/// item is 674 bytes in total; [`build_parent_locator`]'s own tests
-/// pin its output well below that — 196 bytes for a relative path
-/// (`"parent.vhdx"`) and 232 for an absolute one
-/// (`"/srv/images/parent.vhdx"`) — so this clears real images with
-/// room. A larger item is not parsed at all —
+/// item is 674 bytes in total, and [`build_parent_locator`]'s own
+/// tests pin typical output far below that — 196 bytes for a
+/// relative path (`"parent.vhdx"`) and 232 for an absolute one
+/// (`"/srv/images/parent.vhdx"`). The number this bound has to
+/// clear, though, is the emitter's *worst* case, which is larger
+/// than Hyper-V's item: 148 bytes of header, entries and the
+/// `parent_linkage` pair, plus 38 for the `absolute_win32_path` key,
+/// plus a value at the 260-code-unit cap — 148 + 38 + 520 = **706
+/// bytes**. That is what clears 4096 with room, and it is the figure
+/// a reader needs. A larger item is not parsed at all —
 /// rather than truncated, because a truncated item would report
 /// in-item offsets as out of bounds and invent defects the image does
 /// not have. The refusal is recorded as
@@ -494,7 +506,13 @@ pub const MAX_PARENT_LOCATOR_ITEM: usize = 4096;
 pub const METADATA_ITEMS_MIN_OFFSET: u32 = 0x10000;
 
 /// Offset, relative to the metadata region start, at which
-/// [`build_parent_locator`] places the parent locator item.
+/// [`build_metadata`]'s own items currently end.
+///
+/// **Documentation and a test convenience, not the emitter's input.**
+/// [`build_parent_locator`] takes the offset as a parameter, and
+/// callers in this tree pass [`build_metadata`]'s return value, so a
+/// sixth built-in item moves the locator instead of colliding with it.
+/// This constant records what that return value is today.
 ///
 /// Not a magic number copied from Hyper-V: it is where instar's own
 /// [`build_metadata`] leaves off. That function puts item data at
@@ -640,9 +658,9 @@ pub enum VhdxParentLocatorDefect {
     KeyOutOfBounds,
     /// `value_offset + value_length` overflows, or lands outside the item.
     ValueOutOfBounds,
-    /// The key is longer than `MAX_PARENT_LOCATOR_KEY_UTF16`.
+    /// The key is longer than `MAX_PARENT_LOCATOR_KEY_UTF16_BYTES`.
     KeyTooLong,
-    /// The value is longer than `MAX_PARENT_LOCATOR_VALUE_UTF16`, which
+    /// The value is longer than `MAX_PARENT_LOCATOR_VALUE_UTF16_BYTES`, which
     /// is a parser resource bound rather than a spec limit — a legitimate
     /// Windows extended-length path can exceed it. The raw
     /// `value_offset` and `value_length` are preserved for a caller that
@@ -871,7 +889,7 @@ fn decode_entry_strings(
         _ => return Some(VhdxParentLocatorDefect::KeyOutOfBounds),
     };
 
-    if entry.key_length as usize > MAX_PARENT_LOCATOR_KEY_UTF16 {
+    if entry.key_length as usize > MAX_PARENT_LOCATOR_KEY_UTF16_BYTES {
         return Some(VhdxParentLocatorDefect::KeyTooLong);
     }
 
@@ -889,7 +907,7 @@ fn decode_entry_strings(
         _ => return Some(VhdxParentLocatorDefect::ValueOutOfBounds),
     };
 
-    if entry.value_length as usize > MAX_PARENT_LOCATOR_VALUE_UTF16 {
+    if entry.value_length as usize > MAX_PARENT_LOCATOR_VALUE_UTF16_BYTES {
         return Some(VhdxParentLocatorDefect::ValueTooLong);
     }
 
@@ -2425,7 +2443,7 @@ pub enum VhdxBuildError {
     /// [`build_parent_locator`] on why that ordering matters.
     BufferTooSmall,
     /// The path's UTF-16 encoding exceeds
-    /// [`MAX_PARENT_LOCATOR_VALUE_UTF16`], which this crate's own
+    /// [`MAX_PARENT_LOCATOR_VALUE_UTF16_BYTES`], which this crate's own
     /// parser marks [`VhdxParentLocatorDefect::ValueTooLong`]. Counted
     /// during encoding, never estimated from the UTF-8 length: a
     /// character outside the BMP costs two code units, and a BMP
@@ -2567,7 +2585,8 @@ fn write_ascii_utf16le(dst: &mut [u8], src: &[u8]) -> usize {
 ///
 /// # What it writes
 ///
-/// The item lands at [`PARENT_LOCATOR_ITEM_OFFSET`] and is registered
+/// The item lands at `item_offset` -- pass [`build_metadata`]'s return
+/// value -- and is registered
 /// by table entry index 5, at
 /// `METADATA_TABLE_HEADER_SIZE + 5 * METADATA_TABLE_ENTRY_SIZE`, with
 /// `Offset` the item offset, `Length` the item's exact byte length,
@@ -2598,6 +2617,7 @@ fn write_ascii_utf16le(dst: &mut [u8], src: &[u8]) -> usize {
 /// Returns the item's length in bytes.
 pub fn build_parent_locator(
     metadata: &mut [u8],
+    item_offset: u32,
     parent_data_write_guid: &[u8; 16],
     path_key: &[u8],
     path_value: &str,
@@ -2613,10 +2633,10 @@ pub fn build_parent_locator(
     // what enforces the length limit. Counting code units separately
     // would be a second implementation of the same rule, and the one
     // this crate's parser applies is a byte count against
-    // MAX_PARENT_LOCATOR_VALUE_UTF16 -- so the cap is enforced by
+    // MAX_PARENT_LOCATOR_VALUE_UTF16_BYTES -- so the cap is enforced by
     // handing the encoder exactly that many bytes. A character outside
     // the BMP costs two code units here because it costs two there.
-    let mut value_utf16 = [0u8; MAX_PARENT_LOCATOR_VALUE_UTF16];
+    let mut value_utf16 = [0u8; MAX_PARENT_LOCATOR_VALUE_UTF16_BYTES];
     let value_len =
         utf8_to_utf16(path_value, false, &mut value_utf16).ok_or(VhdxBuildError::PathTooLong)?;
 
@@ -2642,15 +2662,36 @@ pub fn build_parent_locator(
     let path_value_off = linkage_value_off + linkage_value_len;
     let item_len = path_value_off + value_len;
 
-    let item_start = PARENT_LOCATOR_ITEM_OFFSET as usize;
-    let item_end = item_start + item_len;
-    let table_entry_off = METADATA_TABLE_HEADER_SIZE + 5 * METADATA_TABLE_ENTRY_SIZE;
+    // Where this entry goes is read from the region rather than
+    // assumed. The table says how many items it already describes, and
+    // the caller says where item data ends -- `build_metadata` returns
+    // exactly that. Hardcoding "entry five, and the item at 0x10028"
+    // would encode "build_metadata wrote five items totalling 40
+    // bytes" in three places with no assertion, and a sixth built-in
+    // item would then be silently overwritten. That failure would not
+    // announce itself: an image whose metadata items overlap is read
+    // back as sound by this crate's own parser.
+    if metadata.len() < METADATA_TABLE_HEADER_SIZE {
+        return Err(VhdxBuildError::BufferTooSmall);
+    }
+    let entry_count = le_u16(metadata, METADATA_TABLE_ENTRY_COUNT_OFFSET) as usize;
+    let table_entry_off = METADATA_TABLE_HEADER_SIZE + entry_count * METADATA_TABLE_ENTRY_SIZE;
 
-    // Both bounds are checked before either is used. The table entry
-    // sits far below the item, so this is really one check -- it is
-    // written as two so that a later change to either offset cannot
-    // make the surviving check the wrong one.
-    if metadata.len() < item_end || metadata.len() < table_entry_off + METADATA_TABLE_ENTRY_SIZE {
+    // SPEC(VHDX) 2.6.1.2 puts item data at least 64 KB into the region;
+    // callers in this tree get the offset from `build_metadata`, which
+    // satisfies it by construction.
+    debug_assert!(item_offset >= METADATA_ITEMS_MIN_OFFSET);
+
+    let item_start = item_offset as usize;
+    let item_end = item_start + item_len;
+
+    // Every bound is checked before anything is written: the item must
+    // fit, the new table entry must fit, and the growing table must not
+    // have reached the item data it describes.
+    if metadata.len() < item_end
+        || metadata.len() < table_entry_off + METADATA_TABLE_ENTRY_SIZE
+        || table_entry_off + METADATA_TABLE_ENTRY_SIZE > item_start
+    {
         return Err(VhdxBuildError::BufferTooSmall);
     }
 
@@ -2671,16 +2712,30 @@ pub fn build_parent_locator(
     write_le_u16(item, entry_path + 8, path_key_len as u16);
     write_le_u16(item, entry_path + 10, value_len as u16);
 
-    write_ascii_utf16le(&mut item[linkage_key_off..path_key_off], KEY_PARENT_LINKAGE);
-    write_ascii_utf16le(&mut item[path_key_off..linkage_value_off], path_key);
-    write_ascii_utf16le(&mut item[linkage_value_off..path_value_off], &linkage);
+    // `write_ascii_utf16le` stops short if its destination is too
+    // small, so what it wrote is checked against what the entries
+    // above declare. The slices are exactly sized by construction and
+    // the two cannot disagree today; if they ever did, the item would
+    // declare more bytes than exist and a reader would take whatever
+    // followed -- silent truncation rather than a refusal.
+    // The calls are bound to locals first: `debug_assert_eq!` does not
+    // evaluate its arguments in a release build, so asserting on the
+    // call itself would compile the writes away.
+    let wrote_linkage_key =
+        write_ascii_utf16le(&mut item[linkage_key_off..path_key_off], KEY_PARENT_LINKAGE);
+    let wrote_path_key = write_ascii_utf16le(&mut item[path_key_off..linkage_value_off], path_key);
+    let wrote_linkage_value =
+        write_ascii_utf16le(&mut item[linkage_value_off..path_value_off], &linkage);
+    debug_assert_eq!(wrote_linkage_key, linkage_key_len);
+    debug_assert_eq!(wrote_path_key, path_key_len);
+    debug_assert_eq!(wrote_linkage_value, linkage_value_len);
     item[path_value_off..].copy_from_slice(&value_utf16[..value_len]);
 
     // Then the table entry, and only then the count: see "Ordering"
     // above.
     let e = table_entry_off;
     metadata[e..e + 16].copy_from_slice(&PARENT_LOCATOR_GUID);
-    write_le_u32(metadata, e + 16, PARENT_LOCATOR_ITEM_OFFSET);
+    write_le_u32(metadata, e + 16, item_offset);
     write_le_u32(metadata, e + 20, item_len as u32);
     // Flags: bit 2, IsRequired, and nothing else -- measured from
     // Hyper-V's own entry, whose raw bytes are in the pin. IsUser (bit
@@ -2689,7 +2744,11 @@ pub fn build_parent_locator(
     // image presents.
     write_le_u32(metadata, e + 24, 0x0000_0004);
     write_le_u32(metadata, e + 28, 0);
-    write_le_u16(metadata, METADATA_TABLE_ENTRY_COUNT_OFFSET, 6);
+    write_le_u16(
+        metadata,
+        METADATA_TABLE_ENTRY_COUNT_OFFSET,
+        (entry_count + 1) as u16,
+    );
 
     Ok(item_len)
 }
@@ -3462,7 +3521,7 @@ mod tests {
         // Claim a value one code unit past the parser's bound, still
         // inside the item so the bounds check passes and the length
         // check is what fires.
-        let over = (MAX_PARENT_LOCATOR_VALUE_UTF16 + 2) as u16;
+        let over = (MAX_PARENT_LOCATOR_VALUE_UTF16_BYTES + 2) as u16;
         write_le_u32(&mut buf, entry_offset(0) + 4, 32);
         write_le_u16(&mut buf, entry_offset(0) + 10, over);
         let item_len = 32 + over as usize;
@@ -3616,12 +3675,15 @@ mod tests {
     #[test]
     fn parent_locator_key_longer_than_parser_decodes() {
         let mut buf = [0u8; 1024];
-        // 33 code units, one past MAX_PARENT_LOCATOR_KEY_UTF16 / 2.
+        // 33 code units, one past MAX_PARENT_LOCATOR_KEY_UTF16_BYTES / 2.
         let len = build_locator_item(&[("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "value")], &mut buf);
 
         let locator = parse_parent_locator(&buf[..len]).unwrap();
         let entry = &locator.entries()[0];
-        assert_eq!(entry.key_length as usize, MAX_PARENT_LOCATOR_KEY_UTF16 + 2);
+        assert_eq!(
+            entry.key_length as usize,
+            MAX_PARENT_LOCATOR_KEY_UTF16_BYTES + 2
+        );
         assert_eq!(entry.defect, Some(VhdxParentLocatorDefect::KeyTooLong));
     }
 
@@ -4545,10 +4607,78 @@ mod tests {
     }
 
     #[test]
+    fn build_parent_locator_appends_where_the_table_says_it_ends() {
+        // The entry index, the new count and the item offset are all
+        // read rather than assumed, so that adding a sixth built-in
+        // metadata item moves the locator instead of overwriting it.
+        // A region whose table already claims three items must get the
+        // locator as entry three, and a count of four -- if any of the
+        // three were hardcoded for `build_metadata`'s five, this test
+        // reports the hardcoded value.
+        let mut region = built_metadata_region();
+        write_le_u16(&mut region, METADATA_TABLE_ENTRY_COUNT_OFFSET, 3);
+
+        let item_offset = PARENT_LOCATOR_ITEM_OFFSET + 0x200;
+        let item_len = build_parent_locator(
+            &mut region,
+            item_offset,
+            &PIN_PARENT_DATA_WRITE_GUID,
+            KEY_RELATIVE_PATH,
+            "parent.vhdx",
+        )
+        .expect("locator should build");
+
+        assert_eq!(le_u16(&region, METADATA_TABLE_ENTRY_COUNT_OFFSET), 4);
+
+        let e = METADATA_TABLE_HEADER_SIZE + 3 * METADATA_TABLE_ENTRY_SIZE;
+        assert_eq!(&region[e..e + 16], &PARENT_LOCATOR_GUID);
+        assert_eq!(le_u32(&region, e + 16), item_offset);
+        assert_eq!(le_u32(&region, e + 20) as usize, item_len);
+
+        // Entry four is whatever `build_metadata` left there -- the
+        // builder appended at the declared index and reached no
+        // further. (It is not zero: `build_metadata` writes five
+        // entries, so index four is its Virtual Disk ID entry.)
+        let pristine = built_metadata_region();
+        let e4 = METADATA_TABLE_HEADER_SIZE + 4 * METADATA_TABLE_ENTRY_SIZE;
+        assert_eq!(
+            &region[e4..e4 + METADATA_TABLE_ENTRY_SIZE],
+            &pristine[e4..e4 + METADATA_TABLE_ENTRY_SIZE]
+        );
+        let item = &region[item_offset as usize..item_offset as usize + item_len];
+        assert_eq!(&item[..16], &VHDX_PARENT_LOCATOR_TYPE_GUID);
+    }
+
+    #[test]
+    fn build_parent_locator_refuses_a_table_that_reaches_the_item() {
+        // The growing table must not run into the item data it
+        // describes. A count that puts the next entry past the item
+        // offset is refused rather than written over the item.
+        let mut region = built_metadata_region();
+        let item_offset = PARENT_LOCATOR_ITEM_OFFSET;
+        let reaches = ((item_offset as usize - METADATA_TABLE_HEADER_SIZE)
+            / METADATA_TABLE_ENTRY_SIZE) as u16;
+        write_le_u16(&mut region, METADATA_TABLE_ENTRY_COUNT_OFFSET, reaches);
+        assert_eq!(
+            build_parent_locator(
+                &mut region,
+                item_offset,
+                &PIN_PARENT_DATA_WRITE_GUID,
+                KEY_RELATIVE_PATH,
+                "parent.vhdx",
+            ),
+            Err(VhdxBuildError::BufferTooSmall)
+        );
+        // Refused before writing: the count is as it was left.
+        assert_eq!(le_u16(&region, METADATA_TABLE_ENTRY_COUNT_OFFSET), reaches);
+    }
+
+    #[test]
     fn build_parent_locator_lays_out_every_field_at_the_pinned_offset() {
         let mut region = built_metadata_region();
         let item_len = build_parent_locator(
             &mut region,
+            PARENT_LOCATOR_ITEM_OFFSET,
             &PIN_PARENT_DATA_WRITE_GUID,
             KEY_RELATIVE_PATH,
             "parent.vhdx",
@@ -4600,6 +4730,7 @@ mod tests {
 
         let item_len = build_parent_locator(
             &mut region,
+            PARENT_LOCATOR_ITEM_OFFSET,
             &PIN_PARENT_DATA_WRITE_GUID,
             KEY_RELATIVE_PATH,
             "parent.vhdx",
@@ -4628,6 +4759,7 @@ mod tests {
         let mut region = built_metadata_region();
         let item_len = build_parent_locator(
             &mut region,
+            PARENT_LOCATOR_ITEM_OFFSET,
             &PIN_PARENT_DATA_WRITE_GUID,
             KEY_RELATIVE_PATH,
             "../images/parent.vhdx",
@@ -4665,6 +4797,7 @@ mod tests {
         let mut region = built_metadata_region();
         let item_len = build_parent_locator(
             &mut region,
+            PARENT_LOCATOR_ITEM_OFFSET,
             &PIN_PARENT_DATA_WRITE_GUID,
             KEY_ABSOLUTE_WIN32_PATH,
             "/srv/images/parent.vhdx",
@@ -4701,6 +4834,7 @@ mod tests {
         assert_eq!(
             build_parent_locator(
                 &mut region,
+                PARENT_LOCATOR_ITEM_OFFSET,
                 &PIN_PARENT_DATA_WRITE_GUID,
                 KEY_VOLUME_PATH,
                 "x"
@@ -4710,6 +4844,7 @@ mod tests {
         assert_eq!(
             build_parent_locator(
                 &mut region,
+                PARENT_LOCATOR_ITEM_OFFSET,
                 &PIN_PARENT_DATA_WRITE_GUID,
                 KEY_PARENT_LINKAGE,
                 "x"
@@ -4719,6 +4854,7 @@ mod tests {
         assert_eq!(
             build_parent_locator(
                 &mut region,
+                PARENT_LOCATOR_ITEM_OFFSET,
                 &PIN_PARENT_DATA_WRITE_GUID,
                 b"relative_pat",
                 "x"
@@ -4735,6 +4871,7 @@ mod tests {
         assert_eq!(
             build_parent_locator(
                 &mut region,
+                PARENT_LOCATOR_ITEM_OFFSET,
                 &PIN_PARENT_DATA_WRITE_GUID,
                 KEY_RELATIVE_PATH,
                 ""
@@ -4746,7 +4883,7 @@ mod tests {
 
     #[test]
     fn build_parent_locator_path_limit_is_260_utf16_code_units() {
-        // 260 code units is MAX_PARENT_LOCATOR_VALUE_UTF16 (520 bytes),
+        // 260 code units is MAX_PARENT_LOCATOR_VALUE_UTF16_BYTES (520 bytes),
         // the bound this crate's own parser marks ValueTooLong past --
         // so 260 must build and parse clean, and 261 must be refused
         // rather than written and then flagged by our own reader.
@@ -4756,6 +4893,7 @@ mod tests {
         let mut region = built_metadata_region();
         let item_len = build_parent_locator(
             &mut region,
+            PARENT_LOCATOR_ITEM_OFFSET,
             &PIN_PARENT_DATA_WRITE_GUID,
             KEY_RELATIVE_PATH,
             longest,
@@ -4774,6 +4912,7 @@ mod tests {
         assert_eq!(
             build_parent_locator(
                 &mut fresh,
+                PARENT_LOCATOR_ITEM_OFFSET,
                 &PIN_PARENT_DATA_WRITE_GUID,
                 KEY_RELATIVE_PATH,
                 too_long
@@ -4802,6 +4941,7 @@ mod tests {
         let mut region = built_metadata_region();
         let item_len = build_parent_locator(
             &mut region,
+            PARENT_LOCATOR_ITEM_OFFSET,
             &PIN_PARENT_DATA_WRITE_GUID,
             KEY_RELATIVE_PATH,
             at_limit,
@@ -4813,6 +4953,7 @@ mod tests {
         assert_eq!(
             build_parent_locator(
                 &mut fresh,
+                PARENT_LOCATOR_ITEM_OFFSET,
                 &PIN_PARENT_DATA_WRITE_GUID,
                 KEY_RELATIVE_PATH,
                 over_limit
@@ -4842,6 +4983,7 @@ mod tests {
         assert_eq!(
             build_parent_locator(
                 &mut region,
+                PARENT_LOCATOR_ITEM_OFFSET,
                 &PIN_PARENT_DATA_WRITE_GUID,
                 KEY_RELATIVE_PATH,
                 "parent.vhdx"
@@ -4865,6 +5007,7 @@ mod tests {
         assert_eq!(
             build_parent_locator(
                 &mut exact,
+                PARENT_LOCATOR_ITEM_OFFSET,
                 &PIN_PARENT_DATA_WRITE_GUID,
                 KEY_RELATIVE_PATH,
                 "parent.vhdx"

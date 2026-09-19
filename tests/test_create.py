@@ -245,6 +245,34 @@ class TestCreateSmoke(InstarTestBase):
             self.assertNotEqual(rc, 0)
             self.assertIn('raw', stderr.lower())
 
+    def test_create_vhd_and_vhdx_reject_backing(self):
+        """`-f vpc|vhdx -b PARENT` is refused, and writes no child.
+
+        Both planners can build the metadata for a differencing child,
+        so the refusal a user sees lives in the create operation rather
+        than in the planner. Nothing else stands between a `-b` and an
+        image whose recorded parent identity is all zeros — an identity
+        no real parent has — so this asserts the guard rather than the
+        planner, and asserts that nothing is left behind when it fires.
+        """
+        for fmt, suffix in (('vpc', 'vhd'), ('vhdx', 'vhdx')):
+            with self.subTest(format=fmt):
+                with tempfile.TemporaryDirectory() as td:
+                    parent = Path(td) / f'parent.{suffix}'
+                    child = Path(td) / f'child.{suffix}'
+                    _, stderr, rc = self.run_instar_create(
+                        '-f', fmt, str(parent), '16M')
+                    self.assertEqual(rc, 0, f'creating the parent failed: {stderr}')
+
+                    _, stderr, rc = self.run_instar_create(
+                        '-f', fmt, '-b', str(parent), '-F', fmt, '-u',
+                        str(child), '16M')
+                    self.assertNotEqual(rc, 0)
+                    self.assertIn('invalid option for target format', stderr)
+                    self.assertFalse(
+                        child.exists(),
+                        f'{fmt} -b was refused but still wrote {child}')
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------

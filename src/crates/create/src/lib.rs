@@ -1239,7 +1239,7 @@ pub fn plan_vhdx<'a>(
     );
 
     metadata_region.fill(0);
-    vhdx::build_metadata(
+    let metadata_items_end = vhdx::build_metadata(
         metadata_region,
         opts.block_size,
         opts.virtual_size,
@@ -1252,8 +1252,10 @@ pub fn plan_vhdx<'a>(
     );
 
     if let Some(path) = parent_path {
-        // The parent locator item, appended above the five items
-        // `build_metadata` just wrote. The 260-UTF-16-code-unit cap
+        // The parent locator item, appended where `build_metadata`
+        // says its own items end rather than at a constant, so adding
+        // a built-in item cannot silently put the two on top of each
+        // other. The 260-UTF-16-code-unit cap
         // lives inside this builder and is not re-checked here — a
         // second implementation of the same limit is a second chance
         // to disagree with it.
@@ -1272,6 +1274,7 @@ pub fn plan_vhdx<'a>(
         };
         vhdx::build_parent_locator(
             metadata_region,
+            metadata_items_end as u32,
             &opts.parent_data_write_guid,
             path_key,
             path,
@@ -1974,8 +1977,9 @@ mod vhdx_plan_tests {
     /// `plan_vhdx` no longer refuses a backing reference: it emits a
     /// differencing child. The refusal a user still sees has moved
     /// into the create operation's `ImageFormat::Vhdx` arm, which
-    /// `crates/create`'s harness cannot reach — an integration test
-    /// owns that, per docs/plans/PLAN-differencing.md.
+    /// `crates/create`'s harness cannot reach: it lives in the guest
+    /// binary. `test_create_vhd_and_vhdx_reject_backing` in
+    /// `tests/test_create.py` is what covers it.
     ///
     /// What the emitted bytes actually contain is asserted in
     /// `tests/round_trip.rs`, against this crate's own VHDX parser.

@@ -72,6 +72,13 @@ Out of scope, explicitly:
 * Reading or composing a differencing VHDX. Phases 11 to 16.
 * `docs/create.md`. Its statement that vhdx rejects `backing_file`
   stays true through this phase; phase 10 owns the change.
+  **Corrected during review:** the statement was not merely stale but
+  false -- it attributed the refusal to `plan_vhdx`, which this phase
+  makes untrue, while the vpc bullet beside it had already been
+  re-attributed to the create operation when the VHD emitter landed.
+  The two sections described the same mechanism differently, so the
+  vhdx bullet was rewritten to mirror the vpc one. Phase 10 still owns
+  the wording for when the refusal is actually lifted.
 
 ## What the survey found
 
@@ -404,7 +411,8 @@ how phase 15's harness will work.
   `pre-commit run --all-files` is clean.
 * `fuzz_create_emitters` builds and runs against the new path
   without tripping its `minimum_file_size` or overlap oracles.
-* `docs/create.md` is unchanged, and `create -f vhdx -b` still
+* `docs/create.md`'s vhdx bullet attributes the refusal to the same
+  place its vpc bullet does, and `create -f vhdx -b` still
   fails with the same error a user sees today. **Verified by hand
   against a binary built from this branch**, not by a committed
   test: `create -f vhdx parent.vhdx 64M` succeeds and
