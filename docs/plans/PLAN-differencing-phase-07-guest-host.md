@@ -44,9 +44,11 @@ well-formed image that no consumer can resolve.
 * The guest's backing probe returns the parent's identity alongside
   the virtual size it already computes, rather than a second pass
   over the same sectors.
-* The VHD footer location bug the survey measured (finding 3) is
-  fixed, because this phase's identity read rides on exactly the
-  sector that bug mislocates.
+* The latent VHD footer location bug the survey measured
+  (finding 3) is fixed, because this phase's identity read rides on
+  exactly the sector that bug mislocates. It is not reachable from
+  the CLI today -- `create` is restricted to 512-byte sectors -- so
+  this is robustness, not a user-facing fix.
 * A typed error when the parent's format does not match the child's,
   resolving the master plan's open question 7.
 * Issue #570 — POSIX paths under Windows-defined locator keys — is
@@ -112,7 +114,7 @@ what `plan_vhd` needs — and discards everything but
 and keeps only `virtual_disk_size` and `has_parent`. The identity
 this phase needs is already being read and thrown away.
 
-**3. A measured, user-reachable bug on `develop` sits in the code
+**3. A measured — but latent — bug on `develop` sits in the code
 this phase must touch.** `read_backing_virtual_size`'s VHD arm
 reads the last sector and parses the footer at **offset 0 of that
 sector**:
@@ -131,9 +133,9 @@ let footer = vhd::VhdFooter::parse(last_sector).ok_or(PARSE_FAILED)?;
 A VHD footer is the last 512 bytes of the file. Those two facts
 agree only when the sector size is 512.
 
-Measured against qemu-img output on this host, with
-`create --sector-size` (default 512, user-settable and validated at
-`src/vmm/src/main.rs:10244`):
+Measured against qemu-img output on this host (`create` takes a
+`--sector-size`, and the table shows where the footer would be found
+at each value):
 
 | Parent | Size | ss | capacity | last sector starts at | footer at | bytes found |
 |--------|------|----|----------|----------------------|-----------|-------------|
@@ -142,15 +144,25 @@ Measured against qemu-img output on this host, with
 | dynamic 64G | 133632 | 4096 | 33 | 131072 | 133120 | `ffffffffffffffff` — **fails** |
 | fixed 8M | 8391168 | 4096 | 2049 | 8388608 | 8390656 | zeros — **fails** |
 
-So `instar create -f qcow2 -b big.vhd --sector-size 4096
-child.qcow2` fails today with "couldn't parse the backing header"
-for any VHD parent larger than one sector, and a small dynamic
-parent only works because a dynamic VHD carries a footer copy at
-offset 0. This is not a differencing bug and it predates this plan,
-but the parent-identity read this phase adds needs the same 512
-bytes, so it cannot be left alone. VHDX is unaffected: its headers
-live at fixed 64 KiB and 128 KiB offsets, which every legal sector
-size divides.
+**The bug is not reachable from the CLI today, and an earlier
+draft of this plan wrongly said it was.** `create` refuses any
+sector size but 512 (`src/vmm/src/main.rs:17905`, "must be 512 in
+phase 3"), a restriction `PLAN-create.md` phase 5 plans to lift.
+Running `instar create -f qcow2 -b big.vhd --sector-size 4096`
+against a binary built from `develop` returns that refusal, not a
+parse error -- checked, after the claim was written, rather than
+assumed.
+
+So this is latent rather than live: the arithmetic in the table is
+wrong today and produces a wrong answer the moment the 512-only
+restriction comes off. It still cannot be left alone, because the
+parent-identity read this phase adds needs exactly those 512 bytes
+and would inherit the same mislocation. It is fixed here as
+robustness, not as a user-facing bug fix, and 7g's changelog entry
+should not claim otherwise.
+
+VHDX is unaffected either way: its headers live at fixed 64 KiB and
+128 KiB offsets, which every legal sector size divides.
 
 **4. `VhdxHeader` drops the field this phase needs.**
 `HEADER_DATA_WRITE_GUID_OFFSET = 32` is already a public constant
@@ -317,7 +329,7 @@ a reviewer does not read a passing same-identity test as proof.
 | Step | Effort | Model | Isolation | Brief for sub-agent |
 |------|--------|-------|-----------|---------------------|
 | 7a | medium | sonnet | none | Add `pub data_write_guid: [u8; 16]` to `VhdxHeader` (`src/crates/vhdx/src/lib.rs:235`) and populate it in `VhdxHeader::parse` (`:249`) from `HEADER_DATA_WRITE_GUID_OFFSET` (`:118`, value 32), copying the `log_guid` lines at `:266-267` exactly — same 16-byte `copy_from_slice`, same ordering. The crate is `no_std` and panic-free: `parse` has already bounds-checked `buf.len() >= HEADER_SIZE` before this point, so no new check is needed. Add one unit test asserting the GUID read back from a buffer built by `build_header` (`:2250`) equals the bytes that function writes at offset 32 — `build_header` derives the DataWriteGuid from the sequence number (`:2257-2261`), so the test must not hardcode a GUID. Do not touch `VhdxState`. Commit subject: "Expose data_write_guid on VhdxHeader." |
-| 7b | high | opus | none | Fix the VHD footer mislocation in `read_backing_virtual_size` (`src/operations/create/src/main.rs:152`, VHD arm at `:174-186`). It reads the last sector and parses the footer at offset 0 of it, which is only correct when `sector_size == 512`; `get_input_capacity` is `div_ceil(size_bytes, sector_size)` (`src/vmm/src/virtio/block.rs:132`) and reads past EOF zero-pad. Replace the parse with a backward scan over the last sector in 512-byte steps, taking the **last** offset whose 8 bytes equal `vhd::VHD_COOKIE` (`conectix`) and parsing there; return `ERROR_BACKING_PARSE_FAILED` if none matches. Read decision 2 before starting. Add Rust tests covering sector sizes 512 and 4096 against both a dynamic parent (footer copy at offset 0, real footer at the tail) and a fixed one (no copy); the 4096 fixed case fails before this change and must pass after. Prove each new test can fail by mutating the scan to a forward scan and to a fixed offset 0, and report both results. Commit subject: "Locate the VHD footer independently of sector size." |
+| 7b | high | opus | none | Fix the VHD footer mislocation in `read_backing_virtual_size` (`src/operations/create/src/main.rs:152`, VHD arm at `:174-186`). It reads the last sector and parses the footer at offset 0 of it, which is only correct when `sector_size == 512`; `get_input_capacity` is `div_ceil(size_bytes, sector_size)` (`src/vmm/src/virtio/block.rs:132`) and reads past EOF zero-pad. Replace the parse with a backward scan over the last sector in 512-byte steps, taking the **last** offset whose 8 bytes equal `vhd::VHD_COOKIE` (`conectix`) and parsing there; return `ERROR_BACKING_PARSE_FAILED` if none matches. Read decision 2 and survey finding 3 before starting. Note that the bug is **latent**: `create` refuses any sector size but 512 (`src/vmm/src/main.rs:17905`), so it is not reachable from the CLI and your tests must be Rust tests exercising the scan directly, not integration tests driving the binary. Cover sector sizes 512 and 4096 against both a dynamic parent (footer copy at offset 0, real footer at the tail) and a fixed one (no copy); the 4096 fixed case must fail before this change and pass after. Prove each new test can fail by mutating the scan to a forward scan and to a fixed offset 0, and report both results. Commit subject: "Locate the VHD footer independently of sector size." |
 | 7c | high | opus | none | Rework `read_backing_virtual_size` into `probe_backing` returning `Result<BackingProbe, u32>` where `BackingProbe { virtual_size: u64, format: ImageFormat, identity: ParentIdentity }` and `ParentIdentity` is an enum of `None`, `Vhd { uuid: [u8; 16], timestamp: u32 }` and `Vhdx { data_write_guid: [u8; 16] }`. The VHD arm already builds a `vhd::VhdFooter` whose `uuid` and `timestamp` fields are what is wanted (`src/crates/vhd/src/lib.rs:182-199`); the VHDX arm runs `vhdx::VhdxState::init`, which selects the active header internally (`src/crates/vhdx/src/lib.rs:1647-1658`) but does not retain it, so read header 1 and header 2 directly at `HEADER1_OFFSET`/`HEADER2_OFFSET` with `VhdxHeader::parse` (7a's field) and take the higher `sequence_number`, matching that selection rule exactly — including its tie-break, which prefers header 1 on equality. Update the single call site (`:554`). Every existing behaviour must be preserved: the differencing refusals, the raw capacity multiply, and each error code. Commit subject: "Return the parent's identity from the backing probe." |
 | 7d | medium | sonnet | none | Add `ERROR_PARENT_FORMAT_MISMATCH: u32 = 13` to `CreateResult` (`src/shared/src/lib.rs:3492-3519`, currently ending at 12), with a doc comment saying a differencing child must share its parent's format, per Hyper-V. Codes are an append-only ABI duplicated in three places with no compile-time cross-check, so also add the host-side message in `src/vmm/src/main.rs` beside the `ERROR_PARENT_NAME_TOO_LONG` arm — wording: name both the target format and the format actually detected in the parent, and say that a vpc child needs a VHD parent and a vhdx child a VHDX one. Add the `map_create_error` arm. Do not wire any caller; 7f does that. Commit subject: "Add a typed parent format mismatch error." |
 | 7e | high | opus | worktree | Implement decision 6 (read it in full first) in both emitters: `create::plan_vhd`'s platform-code selection and `create::plan_vhdx`'s path-key selection. A **relative** path is normalised for emission — `/` becomes `\`, and a leading `./` or no prefix becomes `.\` — matching the measured Hyper-V fixtures from phase 3. An **absolute POSIX** path is written verbatim under `W2ku` / `absolute_win32_path`, unchanged from today. Normalisation happens on a copy in the emitter, never to the VHD parent unicode name field, which keeps the typed bytes because that is the field qemu and libvhdi resolve through. Watch the length limits: normalisation can add two bytes (`.\`), so the 255 and 260 UTF-16 code-unit checks must run on the **normalised** string, and the existing boundary tests need their expectations rechecked rather than their numbers adjusted to fit. Isolation is a worktree because this changes bytes phases 5 and 6 pinned with golden tests; those tests must be updated deliberately and each change explained, not regenerated. Commit subject: "Emit Hyper-V path conventions for relative parents." |
@@ -372,9 +384,11 @@ a reviewer does not read a passing same-identity test as proof.
   `vhdiinfo` on the VHDX child reports a parent locator whose
   linkage matches — the phase 6 plan's libvhdi `relative_path`
   caveat applies to the "Parent filename" line only.
-* `instar create -f qcow2 -b <64G dynamic VHD> --sector-size 4096`
-  succeeds. It fails on `develop` today (finding 3); this is the
-  falsifier for 7b and must be run at both 512 and 4096.
+* 7b's footer-location tests pass at sector sizes 512 and 4096
+  against both a dynamic and a fixed parent. The 4096 fixed case
+  fails before 7b and passes after -- that pair is the falsifier,
+  and it is a Rust test rather than a CLI invocation because
+  `create` refuses a 4096-byte sector today (finding 3).
 * `create -f vpc -b parent.vhdx` and `create -f vhdx -b parent.vhd`
   both fail with the mismatch message, exit non-zero, and write no
   child. Likewise `-f vpc -b parent.vhd -F qcow2`, where the hint
