@@ -340,6 +340,7 @@ fn sweep_vhdx_dynamic() {
                 virtual_size,
                 block_size,
                 backing: None,
+                parent_data_write_guid: [0u8; 16],
             };
             let mut scratch = vec![0u8; VHDX_MAX_METADATA_SCRATCH];
             let plan = plan_vhdx(&opts, &mut scratch).expect("plan");
@@ -1100,4 +1101,665 @@ fn vhd_differencing_refuses_a_non_utf8_parent_path() {
         plan_vhd(&opts, &mut scratch).unwrap_err(),
         CreateError::BackingFileUnsupported
     );
+}
+
+// ---------------------------------------------------------------------------
+// vhdx differencing child
+// ---------------------------------------------------------------------------
+//
+// Everything below covers `plan_vhdx` with a backing reference. The
+// per-field raw-byte assertions for `vhdx::build_parent_locator` live in
+// that crate's own unit tests; what these add is that `plan_vhdx` calls
+// it with the right arguments, that the metadata table it leaves behind
+// describes the item it actually wrote, and that a non-differencing image
+// is untouched by any of it.
+
+/// The parent `DataWriteGuid` measured from a real Hyper-V parent in
+/// `docs/plans/PLAN-differencing-phase-01-pin.md`, whose child's
+/// `parent_linkage` was measured to be [`VHDX_PARENT_LINKAGE`].
+///
+/// Used here rather than an invented constant because the bytes_le
+/// rendering reorders the first eight bytes, and a renderer that read
+/// them in stored order would still produce a plausible-looking GUID.
+/// Only the measured pair catches that.
+const VHDX_PARENT_DATA_WRITE_GUID: [u8; 16] = [
+    0x92, 0x4d, 0x8d, 0xf8, 0xcc, 0x6f, 0x8d, 0x40, 0x9b, 0xef, 0x9b, 0x7c, 0x89, 0xf1, 0x5c, 0x89,
+];
+
+/// The braced rendering of [`VHDX_PARENT_DATA_WRITE_GUID`], as measured
+/// from the child Hyper-V wrote for that parent.
+const VHDX_PARENT_LINKAGE: &[u8] = b"{f88d4d92-6fcc-408d-9bef-9b7c89f15c89}";
+
+/// A relative parent path: relative selects `relative_path`.
+const VHDX_PARENT_PATH: &str = "parent.vhdx";
+
+/// The item's exact length for [`VHDX_PARENT_PATH`] under
+/// `relative_path`, written out as the sum decision 5 of the phase plan
+/// gives: 148 fixed bytes (20 header, two 12-byte entries, a 28-byte
+/// `parent_linkage` key and a 76-byte linkage value) plus the key and
+/// the value. Spelled as arithmetic rather than as `196` so that a
+/// changed layout has to be argued with rather than re-measured.
+const VHDX_LOCATOR_ITEM_LEN: u32 = 148 + 2 * 13 + 2 * 11;
+
+fn vhdx_diff_opts(path: &str) -> VhdxCreateOpts<'_> {
+    VhdxCreateOpts {
+        virtual_size: 1 << 30,
+        block_size: 32 * 1024 * 1024,
+        backing: Some(BackingRef {
+            path: path.as_bytes(),
+            format: Some(ImageFormat::Vhdx),
+        }),
+        parent_data_write_guid: VHDX_PARENT_DATA_WRITE_GUID,
+    }
+}
+
+/// A materialised VHDX, plus the two things the file's own region table
+/// says about where its regions live.
+struct LaidOutVhdx {
+    bytes: Vec<u8>,
+    /// `(byte_offset, len)` for every write the plan pushed.
+    writes: Vec<(u64, u64)>,
+    metadata_off: usize,
+    metadata_len: usize,
+    bat_off: usize,
+    bat_len: usize,
+}
+
+impl LaidOutVhdx {
+    /// The metadata region, starting at the metadata table signature —
+    /// the frame every offset in this section is relative to.
+    fn metadata(&self) -> &[u8] {
+        &self.bytes[self.metadata_off..self.metadata_off + self.metadata_len]
+    }
+}
+
+/// Plan, check the structural invariants, lay the writes into a buffer,
+/// and read the region table back to find out where the regions are.
+///
+/// The region offsets are taken from the emitted region table rather
+/// than recomputed here, so a test asserting something "at metadata +
+/// 0x10028" is asserting it at the offset a reader would actually go to.
+fn lay_out_vhdx(opts: &VhdxCreateOpts<'_>) -> LaidOutVhdx {
+    let mut scratch = vec![0u8; VHDX_MAX_METADATA_SCRATCH];
+    let plan = plan_vhdx(opts, &mut scratch).expect("vhdx plan");
+    assert_plan_invariants(&plan);
+    let writes: Vec<(u64, u64)> = plan
+        .writes()
+        .iter()
+        .map(|w| (w.byte_offset, w.bytes.len() as u64))
+        .collect();
+    let bytes = materialise(&plan);
+
+    let rt_start = vhdx::REGION_TABLE1_OFFSET as usize;
+    let (regions, _entry_count) =
+        vhdx::parse_region_table(&bytes[rt_start..rt_start + 65536]).expect("parse region table");
+
+    LaidOutVhdx {
+        metadata_off: regions[1].file_offset as usize,
+        metadata_len: regions[1].length as usize,
+        bat_off: regions[0].file_offset as usize,
+        bat_len: regions[0].length as usize,
+        writes,
+        bytes,
+    }
+}
+
+/// One metadata table entry, read field by field out of the region.
+#[derive(Clone, Copy, Debug)]
+struct MetadataTableEntry {
+    item_id: [u8; 16],
+    offset: u32,
+    length: u32,
+    flags: u32,
+    reserved2: u32,
+}
+
+/// Walk the metadata table by hand: a 32-byte header whose LE u16 at
+/// offset 10 is the entry count, then that many 32-byte entries.
+///
+/// Deliberately not `vhdx::parse_metadata`, which wants a call table and
+/// a device to read through and which only looks at the items it needs.
+/// A hand walk is what a foreign reader does, and it is the only way to
+/// see the entries the emitter wrote as *entries* rather than as the
+/// four values instar's own consumer extracts.
+fn walk_metadata_table(region: &[u8]) -> Vec<MetadataTableEntry> {
+    assert_eq!(
+        u64::from_le_bytes(region[..8].try_into().unwrap()),
+        vhdx::METADATA_TABLE_SIGNATURE,
+        "metadata table signature",
+    );
+    let count = u16::from_le_bytes(region[10..12].try_into().unwrap()) as usize;
+    let mut entries = Vec::with_capacity(count);
+    for i in 0..count {
+        let e = vhdx::METADATA_TABLE_HEADER_SIZE + i * vhdx::METADATA_TABLE_ENTRY_SIZE;
+        let mut item_id = [0u8; 16];
+        item_id.copy_from_slice(&region[e..e + 16]);
+        entries.push(MetadataTableEntry {
+            item_id,
+            offset: u32::from_le_bytes(region[e + 16..e + 20].try_into().unwrap()),
+            length: u32::from_le_bytes(region[e + 20..e + 24].try_into().unwrap()),
+            flags: u32::from_le_bytes(region[e + 24..e + 28].try_into().unwrap()),
+            reserved2: u32::from_le_bytes(region[e + 28..e + 32].try_into().unwrap()),
+        });
+    }
+    entries
+}
+
+/// The parent locator table entry, and the bytes it *declares*.
+///
+/// The item is sliced at the entry's own `Offset` and `Length`, never at
+/// `vhdx::PARENT_LOCATOR_ITEM_OFFSET`. That is the whole point of going
+/// through the table: an entry that points somewhere the item is not is
+/// a broken image, and a test that reached past the entry to the
+/// emitter's own constant would read the item back perfectly while the
+/// entry lied about it.
+fn locator_entry_and_item(region: &[u8]) -> (MetadataTableEntry, &[u8]) {
+    let entries = walk_metadata_table(region);
+    let entry = *entries
+        .iter()
+        .find(|e| e.item_id == vhdx::PARENT_LOCATOR_GUID)
+        .expect("a parent locator entry in the metadata table");
+    let start = entry.offset as usize;
+    let end = start + entry.length as usize;
+    assert!(end <= region.len(), "locator item runs past the region");
+    (entry, &region[start..end])
+}
+
+/// Every pair of declared item ranges that overlaps.
+///
+/// SPEC(VHDX) 2.6.1.2 forbids overlapping metadata items, and nothing in
+/// this tree checks it — `vhdx::parse_metadata` reads each item at the
+/// offset its entry gives and never compares two of them. So this is the
+/// check that makes the placement assertions non-vacuous, and it is the
+/// control `vhdx_differencing_locator_misplacement_is_detected` trips.
+fn overlapping_item_ranges(entries: &[MetadataTableEntry]) -> Vec<(usize, usize)> {
+    let mut found = Vec::new();
+    for (i, a) in entries.iter().enumerate() {
+        for (j, b) in entries.iter().enumerate().skip(i + 1) {
+            let a_end = a.offset as u64 + a.length as u64;
+            let b_end = b.offset as u64 + b.length as u64;
+            if (a.offset as u64) < b_end && (b.offset as u64) < a_end {
+                found.push((i, j));
+            }
+        }
+    }
+    found
+}
+
+/// The load-bearing test: lay a differencing plan's writes into a
+/// buffer, walk the metadata table the way a foreign reader would, and
+/// read the item the table points at back with this tree's own parser.
+///
+/// It is *necessary and not sufficient* — emitter and parser share their
+/// offset constants, so this alone could pass with both halves wrong in
+/// the same direction. Three things make it more than a tautology. The
+/// table walk here is hand-written against SPEC(VHDX) 2.6.1.2's layout
+/// rather than shared with the emitter; the item is sliced at the offset
+/// and length the *entry* declares, so the entry and the item are pinned
+/// to each other; and `parent_linkage` is compared against a string
+/// measured from Hyper-V, not against anything this tree renders.
+#[test]
+fn vhdx_differencing_round_trips_through_the_parser() {
+    let laid = lay_out_vhdx(&vhdx_diff_opts(VHDX_PARENT_PATH));
+    let region = laid.metadata();
+
+    // --- the table ------------------------------------------------------
+    let entries = walk_metadata_table(region);
+    assert_eq!(entries.len(), 6, "five built-in items plus the locator");
+    assert!(
+        overlapping_item_ranges(&entries).is_empty(),
+        "metadata items must not overlap: {:?}",
+        entries,
+    );
+
+    let (entry, item) = locator_entry_and_item(region);
+    assert_eq!(
+        entry.offset,
+        vhdx::PARENT_LOCATOR_ITEM_OFFSET,
+        "the locator item goes immediately above the five built-in items",
+    );
+    assert_eq!(entry.offset, 0x10028, "and that address is 0x10028");
+    assert_eq!(entry.length, VHDX_LOCATOR_ITEM_LEN, "item length");
+    assert_eq!(entry.flags, 0x0000_0004, "IsRequired, and nothing else");
+    assert_eq!(entry.reserved2, 0);
+    // The locator is the *last* entry: appending must not have displaced
+    // an item `build_metadata` wrote.
+    assert_eq!(entries[5].item_id, vhdx::PARENT_LOCATOR_GUID);
+
+    // --- File Parameters ------------------------------------------------
+    //
+    // Read straight out of the region rather than through the table, so
+    // that a locator written over the top of File Parameters could not
+    // pass by having moved the entry too.
+    let fp_flags = u32::from_le_bytes(region[0x10004..0x10008].try_into().unwrap());
+    assert_eq!(fp_flags, 0x0000_0002, "HasParent");
+
+    // --- the item -------------------------------------------------------
+    let locator = vhdx::parse_parent_locator(item).expect("parse parent locator");
+    assert_eq!(locator.defect, None, "emitted item must be defect-free");
+    assert!(locator.is_vhdx_locator_type());
+    assert_eq!(locator.reserved, 0);
+    assert_eq!(locator.key_value_count, 2);
+    assert_eq!(locator.entries().len(), 2);
+    for e in locator.entries() {
+        assert_eq!(e.defect, None, "entry {:?} has a defect", e.key());
+    }
+
+    assert_eq!(locator.parent_linkage(), Some(VHDX_PARENT_LINKAGE));
+    assert!(locator.linkage_matches(VHDX_PARENT_LINKAGE));
+    assert_eq!(
+        locator.preferred_path(),
+        Some(VHDX_PARENT_PATH.as_bytes()),
+        "preferred_path is the path the caller gave",
+    );
+
+    // The strings are UTF-16 *little* endian with no terminator — the
+    // opposite endianness to VHD's parent name field. Checked against a
+    // hand-built expectation rather than through the parser, which would
+    // byte-swap in sympathy with an emitter that got this wrong.
+    let linkage = locator
+        .entries()
+        .iter()
+        .find(|e| e.key() == b"parent_linkage")
+        .expect("parent_linkage entry");
+    let want: Vec<u8> = VHDX_PARENT_LINKAGE.iter().flat_map(|&c| [c, 0u8]).collect();
+    let start = linkage.value_offset as usize;
+    assert_eq!(&item[start..start + want.len()], &want[..]);
+    assert_eq!(linkage.value_length as usize, want.len());
+    // Not big endian: the first code unit is '{' then a zero pad.
+    assert_eq!(&item[start..start + 2], b"{\0");
+}
+
+/// The negative control for the placement assertions above, and an
+/// honest record of which half of the check actually does the work.
+///
+/// The same emitted bytes are taken and only the locator's placement is
+/// changed: the item is moved down to `0x10000`, where the five items
+/// `build_metadata` wrote already live, and the table entry is updated
+/// to point at it. SPEC(VHDX) 2.6.1.2 forbids exactly that.
+///
+/// **The table walk catches it; the parser does not, and cannot.**
+/// `vhdx::parse_parent_locator` is handed the item's own bytes and
+/// nothing else — every offset it reads is item-relative — so it has no
+/// way to know where in the region those bytes came from or what else is
+/// there. `vhdx::parse_metadata` does see the whole region, and does not
+/// check for overlap either. That is a real gap in this tree's reader
+/// rather than something this test papers over: an image whose items
+/// overlap is read back as sound, and the item that wins is whichever
+/// one was written last. It is recorded here so that a later phase
+/// adding an overlap check knows the check was missing, not forgotten.
+#[test]
+fn vhdx_differencing_locator_misplacement_is_detected() {
+    let laid = lay_out_vhdx(&vhdx_diff_opts(VHDX_PARENT_PATH));
+    let mut region = laid.metadata().to_vec();
+
+    // Before: sound, and the item sits above the built-in items.
+    assert!(overlapping_item_ranges(&walk_metadata_table(&region)).is_empty());
+
+    let (entry, item) = locator_entry_and_item(&region);
+    let item = item.to_vec();
+    assert_eq!(entry.offset, vhdx::PARENT_LOCATOR_ITEM_OFFSET);
+
+    // Move it on top of the built-in items, entry and body together, so
+    // that the image is internally consistent and only its *placement*
+    // is wrong. The entry's Offset is the LE u32 at +16 of entry index
+    // five.
+    let dst = vhdx::METADATA_ITEMS_MIN_OFFSET as usize;
+    region[dst..dst + item.len()].copy_from_slice(&item);
+    let e = vhdx::METADATA_TABLE_HEADER_SIZE + 5 * vhdx::METADATA_TABLE_ENTRY_SIZE;
+    region[e + 16..e + 20].copy_from_slice(&(dst as u32).to_le_bytes());
+
+    // The table walk fires: the locator now overlaps all five.
+    let entries = walk_metadata_table(&region);
+    let overlaps = overlapping_item_ranges(&entries);
+    assert_eq!(
+        overlaps.len(),
+        5,
+        "a locator at 0x10000 overlaps every built-in item: {:?}",
+        overlaps,
+    );
+    assert!(overlaps.iter().all(|&(_, j)| j == 5));
+
+    // The parser does not, per this test's doc comment. Asserted rather
+    // than only described, so that the claim is checked.
+    let (moved_entry, moved_item) = locator_entry_and_item(&region);
+    assert_eq!(moved_entry.offset, dst as u32);
+    let locator = vhdx::parse_parent_locator(moved_item).expect("parse parent locator");
+    assert_eq!(
+        locator.defect, None,
+        "parse_parent_locator sees only item-relative offsets, so a \
+         misplaced item still reads as sound",
+    );
+    assert_eq!(locator.parent_linkage(), Some(VHDX_PARENT_LINKAGE));
+}
+
+/// The path key is chosen from the path the user typed, and exactly one
+/// path key is written.
+///
+/// Checked against the raw UTF-16LE key bytes as well as through the
+/// parser: `preferred_path` prefers `relative_path`, so a emitter that
+/// wrote both keys would satisfy the parser-side assertions alone.
+#[test]
+fn vhdx_differencing_path_key_follows_the_path() {
+    for (path, want_key, absolute) in [
+        ("parent.vhdx", &b"relative_path"[..], false),
+        ("../parent.vhdx", &b"relative_path"[..], false),
+        ("images/parent.vhdx", &b"relative_path"[..], false),
+        ("/srv/images/parent.vhdx", &b"absolute_win32_path"[..], true),
+    ] {
+        let laid = lay_out_vhdx(&vhdx_diff_opts(path));
+        let region = laid.metadata();
+        let (_entry, item) = locator_entry_and_item(region);
+        let locator = vhdx::parse_parent_locator(item).expect("parse parent locator");
+        assert_eq!(locator.defect, None, "{path}");
+
+        // Exactly two entries: parent_linkage and one path key.
+        assert_eq!(locator.entries().len(), 2, "{path}");
+        let keys: Vec<&[u8]> = locator.entries().iter().map(|e| e.key()).collect();
+        assert_eq!(keys, vec![&b"parent_linkage"[..], want_key], "{path}");
+
+        if absolute {
+            assert_eq!(locator.relative_path(), None, "{path}");
+            assert_eq!(
+                locator.absolute_win32_path(),
+                Some(path.as_bytes()),
+                "{path}",
+            );
+        } else {
+            assert_eq!(locator.relative_path(), Some(path.as_bytes()), "{path}");
+            assert_eq!(locator.absolute_win32_path(), None, "{path}");
+        }
+        assert_eq!(locator.volume_path(), None, "instar never writes it");
+        assert_eq!(locator.preferred_path(), Some(path.as_bytes()), "{path}");
+
+        // And the same, from the raw bytes at the offset the entry
+        // declares, so the key is not merely what the parser decoded.
+        let path_entry = locator.entries()[1];
+        let key_start = path_entry.key_offset as usize;
+        let raw: Vec<u8> = want_key.iter().flat_map(|&c| [c, 0u8]).collect();
+        assert_eq!(
+            &item[key_start..key_start + raw.len()],
+            &raw[..],
+            "{path}: raw key bytes",
+        );
+        assert_eq!(path_entry.key_length as usize, raw.len(), "{path}");
+    }
+}
+
+/// The 260-UTF-16-code-unit cap, as `plan_vhdx` surfaces it.
+///
+/// The boundary itself belongs to `vhdx::build_parent_locator` and is
+/// tested there. What this adds is that `plan_vhdx` neither re-derives
+/// the limit nor swallows the refusal: an over-length path comes back as
+/// [`CreateError::ParentNameTooLong`] and not as `BackingFileTooLong`,
+/// whose host message names a 1024-byte limit that has nothing to do
+/// with the value field that actually overflowed. 261 bytes is well
+/// under `MAX_BACKING_FILE_LEN`, so the length check it passes on the
+/// way is real.
+#[test]
+fn vhdx_differencing_parent_path_length_boundary() {
+    let fits = "a".repeat(260);
+    assert!(fits.len() < MAX_BACKING_FILE_LEN);
+    let laid = lay_out_vhdx(&vhdx_diff_opts(&fits));
+    let (entry, item) = locator_entry_and_item(laid.metadata());
+    let locator = vhdx::parse_parent_locator(item).expect("parse parent locator");
+    assert_eq!(locator.defect, None);
+    assert_eq!(locator.relative_path(), Some(fits.as_bytes()));
+    assert_eq!(entry.length, 148 + 2 * 13 + 2 * 260);
+
+    let over = "a".repeat(261);
+    assert!(over.len() < MAX_BACKING_FILE_LEN);
+    let opts = vhdx_diff_opts(&over);
+    let mut scratch = vec![0u8; VHDX_MAX_METADATA_SCRATCH];
+    assert_eq!(
+        plan_vhdx(&opts, &mut scratch).unwrap_err(),
+        CreateError::ParentNameTooLong,
+    );
+}
+
+/// A differencing child's BAT region is a hole, and the plan says so by
+/// containing no write for it at all.
+///
+/// Zero is `PAYLOAD_BLOCK_NOT_PRESENT` for every payload entry and
+/// `SB_BLOCK_NOT_PRESENT` for every sector-bitmap entry, which is what
+/// SPEC(VHDX) 2.5.1.1 says a child with no blocks of its own should say.
+/// So the correct emitter does nothing here — and "we did nothing and it
+/// is correct" is indistinguishable from "we forgot" unless a test
+/// states which one it is. Swept across geometries because the BAT's
+/// size, and so the metadata region's offset, moves with them.
+#[test]
+fn vhdx_differencing_bat_region_is_untouched() {
+    for &virtual_size in &[1u64 << 20, 1 << 30, 1 << 32, 1 << 40] {
+        for &block_size in &[1024u32 * 1024, 32 * 1024 * 1024, 256 * 1024 * 1024] {
+            let opts = VhdxCreateOpts {
+                virtual_size,
+                block_size,
+                ..vhdx_diff_opts(VHDX_PARENT_PATH)
+            };
+            let laid = lay_out_vhdx(&opts);
+            let label = format!("vsize={virtual_size} bsize={block_size}");
+
+            // No write touches the BAT region.
+            let bat_start = laid.bat_off as u64;
+            let bat_end = bat_start + laid.bat_len as u64;
+            for &(off, len) in &laid.writes {
+                assert!(
+                    off + len <= bat_start || off >= bat_end,
+                    "{label}: a write at {off}+{len} lands in the BAT region \
+                     [{bat_start}, {bat_end})",
+                );
+            }
+
+            // And the bytes there are zero, which is what a plan with no
+            // write for the region leaves behind.
+            assert!(
+                laid.bytes[laid.bat_off..laid.bat_off + laid.bat_len]
+                    .iter()
+                    .all(|&b| b == 0),
+                "{label}: BAT region is not all zero",
+            );
+
+            // The locator still landed, so this is a differencing child
+            // and not an accidentally plain image.
+            let (entry, _item) = locator_entry_and_item(laid.metadata());
+            assert_eq!(entry.offset, vhdx::PARENT_LOCATOR_ITEM_OFFSET, "{label}");
+        }
+    }
+}
+
+/// Without a backing reference the metadata region is what it always
+/// was: five entries, no locator, and the File Parameters `HasParent`
+/// bit clear.
+///
+/// The byte-for-byte case is
+/// [`vhdx_non_differencing_output_matches_develop`]; this one names the
+/// three facts that matter, so a failure says which one moved.
+#[test]
+fn vhdx_non_differencing_metadata_is_unchanged() {
+    let opts = VhdxCreateOpts {
+        virtual_size: 1 << 30,
+        block_size: 32 * 1024 * 1024,
+        backing: None,
+        // Read only when `backing` is `Some`. If it ever leaks into a
+        // plain image, the golden test's w5 hashes move too.
+        parent_data_write_guid: VHDX_PARENT_DATA_WRITE_GUID,
+    };
+    let laid = lay_out_vhdx(&opts);
+    let region = laid.metadata();
+
+    let entries = walk_metadata_table(region);
+    assert_eq!(entries.len(), 5);
+    assert!(entries
+        .iter()
+        .all(|e| e.item_id != vhdx::PARENT_LOCATOR_GUID));
+
+    let fp_flags = u32::from_le_bytes(region[0x10004..0x10008].try_into().unwrap());
+    assert_eq!(fp_flags, 0x0000_0000, "HasParent must be clear");
+
+    // Nothing was written where the locator would have gone.
+    let at = vhdx::PARENT_LOCATOR_ITEM_OFFSET as usize;
+    assert!(
+        region[at..at + 256].iter().all(|&b| b == 0),
+        "bytes above the built-in items must stay zero",
+    );
+}
+
+/// Every byte `plan_vhdx` emits for a non-differencing VHDX, as it was
+/// on `develop` at `9a80776` — the commit this phase branched from,
+/// before the differencing emitter existed.
+///
+/// **How these constants were obtained, and why they mean what they
+/// say.** They are not a transcription of the current tree's behaviour.
+/// A detached worktree was created at `9a80776`, a throwaway integration
+/// test was added there that built exactly the option matrix below and
+/// wrote this summary to a file, and `make test-rust` was run in that
+/// worktree. The text is that file's contents, pasted here unedited. So
+/// this constant is `develop`'s output by construction, and the
+/// assertion below is a real comparison between two revisions rather
+/// than a restatement of one.
+///
+/// **What it covers, and what it does not.** Each line pins a write's
+/// offset, its length, and an FNV-1a-64 hash of every byte in it — so
+/// any change to a header, the region table or the metadata region's
+/// million bytes moves a hash, including a locator item accidentally
+/// appended to an image with no parent, or a `HasParent` bit set from a
+/// stale flag. It does not describe *what* changed: a moved hash says
+/// only that the write differs, and the tests above are what say which
+/// field. Writes the plan does not contain are invisible to it, which is
+/// why [`vhdx_differencing_bat_region_is_untouched`] checks the BAT
+/// separately.
+///
+/// If a deliberate change to the non-differencing layout is ever made,
+/// regenerate this the same way — from the revision being compared
+/// against, not from the tree being changed.
+const GOLDEN_VHDX_NO_BACKING: &str = "\
+vhdx vsize=1048576 bsize=1048576 min=4194304 meta=1191936 writes=6
+  w0 off=0 len=4096 h=1537a6cf8f243b0a
+  w1 off=65536 len=4096 h=615e69c3d445c125
+  w2 off=131072 len=4096 h=db3b58eb855205b3
+  w3 off=196608 len=65536 h=25cd95f303fcd318
+  w4 off=262144 len=65536 h=25cd95f303fcd318
+  w5 off=3145728 len=1048576 h=f453e6adb1c76eb7
+vhdx vsize=1048576 bsize=33554432 min=4194304 meta=1191936 writes=6
+  w0 off=0 len=4096 h=1537a6cf8f243b0a
+  w1 off=65536 len=4096 h=615e69c3d445c125
+  w2 off=131072 len=4096 h=db3b58eb855205b3
+  w3 off=196608 len=65536 h=25cd95f303fcd318
+  w4 off=262144 len=65536 h=25cd95f303fcd318
+  w5 off=3145728 len=1048576 h=a45cd5f5e059c5b7
+vhdx vsize=1048576 bsize=268435456 min=4194304 meta=1191936 writes=6
+  w0 off=0 len=4096 h=1537a6cf8f243b0a
+  w1 off=65536 len=4096 h=615e69c3d445c125
+  w2 off=131072 len=4096 h=db3b58eb855205b3
+  w3 off=196608 len=65536 h=25cd95f303fcd318
+  w4 off=262144 len=65536 h=25cd95f303fcd318
+  w5 off=3145728 len=1048576 h=773dcb7b76224c97
+vhdx vsize=1073741824 bsize=1048576 min=4194304 meta=1191936 writes=6
+  w0 off=0 len=4096 h=1537a6cf8f243b0a
+  w1 off=65536 len=4096 h=615e69c3d445c125
+  w2 off=131072 len=4096 h=db3b58eb855205b3
+  w3 off=196608 len=65536 h=25cd95f303fcd318
+  w4 off=262144 len=65536 h=25cd95f303fcd318
+  w5 off=3145728 len=1048576 h=a7b7f7b24fef2bf7
+vhdx vsize=1073741824 bsize=33554432 min=4194304 meta=1191936 writes=6
+  w0 off=0 len=4096 h=1537a6cf8f243b0a
+  w1 off=65536 len=4096 h=615e69c3d445c125
+  w2 off=131072 len=4096 h=db3b58eb855205b3
+  w3 off=196608 len=65536 h=25cd95f303fcd318
+  w4 off=262144 len=65536 h=25cd95f303fcd318
+  w5 off=3145728 len=1048576 h=2f3d8d61f724b177
+vhdx vsize=1073741824 bsize=268435456 min=4194304 meta=1191936 writes=6
+  w0 off=0 len=4096 h=1537a6cf8f243b0a
+  w1 off=65536 len=4096 h=615e69c3d445c125
+  w2 off=131072 len=4096 h=db3b58eb855205b3
+  w3 off=196608 len=65536 h=25cd95f303fcd318
+  w4 off=262144 len=65536 h=25cd95f303fcd318
+  w5 off=3145728 len=1048576 h=4ada37caddcbc7d7
+vhdx vsize=4294967296 bsize=1048576 min=4194304 meta=1191936 writes=6
+  w0 off=0 len=4096 h=1537a6cf8f243b0a
+  w1 off=65536 len=4096 h=615e69c3d445c125
+  w2 off=131072 len=4096 h=db3b58eb855205b3
+  w3 off=196608 len=65536 h=25cd95f303fcd318
+  w4 off=262144 len=65536 h=25cd95f303fcd318
+  w5 off=3145728 len=1048576 h=da3222834184bf4b
+vhdx vsize=4294967296 bsize=33554432 min=4194304 meta=1191936 writes=6
+  w0 off=0 len=4096 h=1537a6cf8f243b0a
+  w1 off=65536 len=4096 h=615e69c3d445c125
+  w2 off=131072 len=4096 h=db3b58eb855205b3
+  w3 off=196608 len=65536 h=25cd95f303fcd318
+  w4 off=262144 len=65536 h=25cd95f303fcd318
+  w5 off=3145728 len=1048576 h=469ada16440e3f83
+vhdx vsize=4294967296 bsize=268435456 min=4194304 meta=1191936 writes=6
+  w0 off=0 len=4096 h=1537a6cf8f243b0a
+  w1 off=65536 len=4096 h=615e69c3d445c125
+  w2 off=131072 len=4096 h=db3b58eb855205b3
+  w3 off=196608 len=65536 h=25cd95f303fcd318
+  w4 off=262144 len=65536 h=25cd95f303fcd318
+  w5 off=3145728 len=1048576 h=18c37434941d7f2b
+vhdx vsize=1099511627776 bsize=1048576 min=12582912 meta=1191936 writes=6
+  w0 off=0 len=4096 h=1537a6cf8f243b0a
+  w1 off=65536 len=4096 h=615e69c3d445c125
+  w2 off=131072 len=4096 h=db3b58eb855205b3
+  w3 off=196608 len=65536 h=42e5e0b0ed731f4c
+  w4 off=262144 len=65536 h=42e5e0b0ed731f4c
+  w5 off=11534336 len=1048576 h=50b5dbdb4cf425b7
+vhdx vsize=1099511627776 bsize=33554432 min=4194304 meta=1191936 writes=6
+  w0 off=0 len=4096 h=1537a6cf8f243b0a
+  w1 off=65536 len=4096 h=615e69c3d445c125
+  w2 off=131072 len=4096 h=db3b58eb855205b3
+  w3 off=196608 len=65536 h=25cd95f303fcd318
+  w4 off=262144 len=65536 h=25cd95f303fcd318
+  w5 off=3145728 len=1048576 h=00becb237b867cb7
+vhdx vsize=1099511627776 bsize=268435456 min=4194304 meta=1191936 writes=6
+  w0 off=0 len=4096 h=1537a6cf8f243b0a
+  w1 off=65536 len=4096 h=615e69c3d445c125
+  w2 off=131072 len=4096 h=db3b58eb855205b3
+  w3 off=196608 len=65536 h=25cd95f303fcd318
+  w4 off=262144 len=65536 h=25cd95f303fcd318
+  w5 off=3145728 len=1048576 h=d39fc0a9114f0397
+";
+
+/// A non-differencing VHDX is byte-identical to what `develop` at
+/// `9a80776` produced for the same options.
+///
+/// See [`GOLDEN_VHDX_NO_BACKING`] for how the expected text was produced
+/// and for what the hashes do and do not cover.
+#[test]
+fn vhdx_non_differencing_output_matches_develop() {
+    let mut out = String::new();
+
+    let sizes: &[u64] = &[1 << 20, 1 << 30, 1 << 32, 1 << 40];
+    let block_sizes: &[u32] = &[1024 * 1024, 32 * 1024 * 1024, 256 * 1024 * 1024];
+    for &virtual_size in sizes {
+        for &block_size in block_sizes {
+            let opts = VhdxCreateOpts {
+                virtual_size,
+                block_size,
+                backing: None,
+                // Read only when `backing` is `Some`, so this must not
+                // reach the image. If it ever does, the w5 hashes move.
+                parent_data_write_guid: VHDX_PARENT_DATA_WRITE_GUID,
+            };
+            let mut scratch = vec![0u8; VHDX_MAX_METADATA_SCRATCH];
+            let plan = plan_vhdx(&opts, &mut scratch).expect("plan");
+            summarise_plan(
+                &format!("vhdx vsize={virtual_size} bsize={block_size}"),
+                &plan,
+                &mut out,
+            );
+        }
+    }
+
+    // Line by line first: the whole-string comparison below is what the
+    // test is, but its failure output is one escaped block of text, and
+    // the interesting difference is almost always a single `h=` column.
+    for (i, (got, want)) in out.lines().zip(GOLDEN_VHDX_NO_BACKING.lines()).enumerate() {
+        assert_eq!(got, want, "golden line {} differs", i + 1);
+    }
+    assert_eq!(
+        out.lines().count(),
+        GOLDEN_VHDX_NO_BACKING.lines().count(),
+        "golden line count differs",
+    );
+    assert_eq!(out, GOLDEN_VHDX_NO_BACKING);
 }

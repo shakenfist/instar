@@ -17559,9 +17559,10 @@ fn create_error_detail(code: u32) -> &'static str {
         }
         CREATE_RESULT_ERROR_PARENT_NAME_TOO_LONG => {
             "backing file path does not fit the target format's parent \
-             name field (VHD allows at most 255 UTF-16 code units, and \
-             a character outside the Basic Multilingual Plane costs \
-             two); use a shorter path or a relative one"
+             name field (VHD allows at most 255 UTF-16 code units, \
+             VHDX at most 260, and a character outside the Basic \
+             Multilingual Plane costs two); use a shorter path or a \
+             relative one"
         }
         _ => "unknown error",
     }

@@ -349,6 +349,13 @@ fn vhdx_opts_from<'a>(
             config.block_size
         },
         backing,
+        // Zeros, because the guest has no way to read the parent's
+        // active header yet; docs/plans/PLAN-differencing.md tracks the
+        // step that gives it one. This value is never used: the
+        // `ImageFormat::Vhdx` arm below refuses a vhdx target with a
+        // backing file before `plan_vhdx` is called, precisely so a
+        // zeroed parent identity cannot reach an image.
+        parent_data_write_guid: [0u8; 16],
     }
 }
 
@@ -705,6 +712,27 @@ pub unsafe extern "C" fn _start() -> u64 {
             }
         }
         ImageFormat::Vhdx => {
+            // `plan_vhdx` can now emit a differencing child, but the
+            // guest must not reach it until it can read the parent's
+            // active-header DataWriteGuid -- see
+            // docs/plans/PLAN-differencing.md. Without that,
+            // `vhdx_opts_from` above hands the planner an all-zero
+            // `parent_data_write_guid`, which would give every child a
+            // `parent_linkage` of {00000000-0000-0000-0000-000000000000}
+            // -- a claim about the parent's identity that no parent
+            // has, so composition would either refuse the pair or
+            // accept the wrong one. **Remove this guard in the same
+            // change that teaches the guest to read the parent's
+            // active header**, not before. Refusing with
+            // `BackingFileUnsupported` is exactly the error a user gets
+            // today, so the emitter is invisible from outside.
+            if backing_ref.is_some() {
+                return fail_with(
+                    call_table,
+                    config.target_format,
+                    map_create_error(CreateError::BackingFileUnsupported),
+                );
+            }
             let opts = vhdx_opts_from(config, virtual_size, backing_ref);
             let unit = opts.block_size;
             match plan_vhdx(&opts, scratch) {

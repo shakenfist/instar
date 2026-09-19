@@ -150,6 +150,21 @@ Five findings that change what this phase does:
    what 6b must build, and step 6e re-reads them against the
    shipped emitter.
 
+6. **Step 6a measured the identity claim, and it holds — with a
+   second hole beside it.** A real instar-produced VHDX carries
+   sequence 1 and 2 in its two headers; header 2 is active and its
+   `DataWriteGuid` renders as
+   `00000002-0000-0000-0200-000000000000`, exactly as `build_header`
+   predicts. The measurement also found that the Virtual Disk ID
+   metadata item is not merely constant but *computed* — it is
+   `virtual_disk_size` (LE u64) then `block_size` (LE u32) then the
+   ASCII bytes `VHDX` (`vhdx/src/lib.rs:2362-2375`) — so two
+   independently created images of the same size and block size get a
+   byte-identical Virtual Disk ID. Recorded on #566
+   (`issuecomment-5738800245`) with the raw bytes. Phase 8's negative
+   identity test must therefore use a third-party parent, as the
+   master plan already says.
+
 Nothing else in the phase 6 section was wrong. The `parent_linkage`
 = parent `DataWriteGuid` rule, the lowercase-braced rendering, the
 `0x00000004` (IsRequired only) metadata entry flags, the 20-byte

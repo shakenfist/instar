@@ -195,6 +195,12 @@ fuzz_target!(|data: &[u8]| {
                     virtual_size,
                     block_size: unit_size,
                     backing,
+                    // Parent identity for a differencing child. It does
+                    // not affect the layout, but feeding structured
+                    // bytes rather than a constant keeps the emitted
+                    // locator varying with the corpus — the same reason
+                    // the VHD arm above feeds `vhd_parent_id`.
+                    parent_data_write_guid: vhd_parent_id,
                 };
                 plan_vhdx(&opts, &mut scratch)
             }
