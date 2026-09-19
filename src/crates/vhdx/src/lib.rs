@@ -236,6 +236,7 @@ pub struct VhdxHeader {
     pub signature: u32,
     pub checksum: u32,
     pub sequence_number: u64,
+    pub data_write_guid: [u8; 16],
     pub log_guid: [u8; 16],
     pub log_length: u32,
     pub log_offset: u64,
@@ -264,6 +265,11 @@ impl VhdxHeader {
 
         let sequence_number = le_u64(buf, HEADER_SEQUENCE_NUMBER_OFFSET);
 
+        let mut data_write_guid = [0u8; 16];
+        data_write_guid.copy_from_slice(
+            &buf[HEADER_DATA_WRITE_GUID_OFFSET..HEADER_DATA_WRITE_GUID_OFFSET + 16],
+        );
+
         let mut log_guid = [0u8; 16];
         log_guid.copy_from_slice(&buf[HEADER_LOG_GUID_OFFSET..HEADER_LOG_GUID_OFFSET + 16]);
 
@@ -274,6 +280,7 @@ impl VhdxHeader {
             signature,
             checksum,
             sequence_number,
+            data_write_guid,
             log_guid,
             log_length,
             log_offset,
@@ -3003,6 +3010,18 @@ mod tests {
         // The built header should parse successfully (CRC validates)
         let hdr = VhdxHeader::parse(&buf).unwrap();
         assert_eq!(hdr.sequence_number, 1);
+    }
+
+    #[test]
+    fn header_builder_data_write_guid_matches_written_bytes() {
+        let mut buf = [0u8; HEADER_SIZE];
+        build_header(&mut buf, 7);
+        let hdr = VhdxHeader::parse(&buf).unwrap();
+        let mut expected = [0u8; 16];
+        expected.copy_from_slice(
+            &buf[HEADER_DATA_WRITE_GUID_OFFSET..HEADER_DATA_WRITE_GUID_OFFSET + 16],
+        );
+        assert_eq!(hdr.data_write_guid, expected);
     }
 
     #[test]
