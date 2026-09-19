@@ -509,10 +509,14 @@ fn map_vhd_build_error(e: vhd::VhdBuildError) -> CreateError {
         // reusing BackingFileTooLong, whose host message names 1024
         // bytes and would be a false diagnostic here.
         vhd::VhdBuildError::ParentNameTooLong => CreateError::ParentNameTooLong,
-        // The header region is always DYNAMIC_HEADER_SIZE and the
-        // locator region always one sector, so this is a planner bug
-        // rather than a user input; report it as the scratch problem it
-        // would be.
+        // The header region is always DYNAMIC_HEADER_SIZE, so through
+        // this mapping — which is `build_dynamic_header_parent`'s and
+        // `build_parent_locator_entry`'s — it is a planner bug rather
+        // than a user input; report it as the scratch problem it would
+        // be. `build_parent_locator_data` is the exception and does not
+        // come through here: its destination is one sector and its
+        // input is a user path, so `plan_vhd` maps that call's
+        // `BufferTooSmall` to `ParentNameTooLong` at the call site.
         vhd::VhdBuildError::BufferTooSmall => CreateError::ScratchTooSmall,
         // An empty backing path. The generic length check above bounds
         // the top end and nothing bounded the bottom, so `-b ""` reached
@@ -522,8 +526,8 @@ fn map_vhd_build_error(e: vhd::VhdBuildError) -> CreateError {
         // for target format", which is what an empty path is.
         vhd::VhdBuildError::ParentNameEmpty => CreateError::BackingFileUnsupported,
         // Unreachable from this crate: the slot is the literal 0, and
-        // the platform data length is bounded by the 255-code-unit name
-        // cap at 510 bytes against a 512-byte space. Mapped rather than
+        // the platform data length is whatever fit in the 512-byte
+        // locator region, against a 512-byte space. Mapped rather than
         // unwrapped because `crates/create` is panic-free.
         vhd::VhdBuildError::LocatorSlotOutOfRange
         | vhd::VhdBuildError::LocatorLengthExceedsSpace => CreateError::Overflow,
@@ -557,6 +561,78 @@ fn map_vhdx_build_error(e: vhdx::VhdxBuildError) -> CreateError {
         // because `crates/create` is panic-free.
         vhdx::VhdxBuildError::BufferTooSmall => CreateError::ScratchTooSmall,
     }
+}
+
+/// The prefix a relative parent path carries in a Windows-side parent
+/// locator: `.\`, as the measured Hyper-V fixtures write it.
+const WINDOWS_RELATIVE_PREFIX: &[u8] = br".\";
+
+/// Render a **relative** parent path into the Windows convention a
+/// parent locator is defined in: `/` becomes `\`, and the result is
+/// prefixed `.\`.
+///
+/// `parent.vhd` and `./parent.vhd` both become `.\parent.vhd` — a
+/// leading `./` is *replaced* by the prefix rather than doubled — and
+/// `sub/dir/parent.vhd` becomes `.\sub\dir\parent.vhd`.
+///
+/// # Why the emitters normalise at all
+///
+/// VHD's `W2ru` and VHDX's `relative_path` are Windows-defined keys, so
+/// a POSIX path written under them does not mean what the key says it
+/// means. A relative path is the case that *can* be written honestly:
+/// `.\parent.vhd` names the same file on both platforms and is what the
+/// Hyper-V fixtures instar's parsers were pinned against actually
+/// contain, so the writer emits the dialect the reader already has to
+/// understand rather than inventing a third one. A POSIX-*absolute*
+/// path has no honest Windows rendering — fabricating a drive letter
+/// would be worse than the divergence — so absolute paths keep their
+/// bytes and the emitters do not call this. See
+/// [PLAN-differencing.md](docs/plans/PLAN-differencing.md) and
+/// `docs/quirks.md`.
+///
+/// # Buffer sizing, and the `None` arm
+///
+/// The crate is `no_std` with no allocator, so the caller supplies the
+/// destination. The worst case is `path.len() + 2`; callers pass the
+/// per-format worst-case UTF-8 buffer for the field being written
+/// (`vhd::MAX_PARENT_NAME_UTF8`, `vhdx::MAX_PARENT_LOCATOR_VALUE_UTF8`),
+/// each of which is three bytes per code unit the field can hold. A
+/// normalised path longer than that cannot encode into the field under
+/// any mix of characters, so `None` means "too long for this format's
+/// parent path field" and callers map it to
+/// [`CreateError::ParentNameTooLong`].
+///
+/// The `from_utf8` arm is unreachable by construction: the prefix and
+/// the substituted separator are ASCII, ASCII bytes never occur inside
+/// a multi-byte UTF-8 sequence, and a leading `./` is a two-byte ASCII
+/// prefix so the tail after it starts on a character boundary. It is
+/// still checked rather than assumed because this crate is panic-free.
+fn windows_relative_parent_path<'b>(path: &str, buf: &'b mut [u8]) -> Option<&'b str> {
+    let bytes = path.as_bytes();
+    let rest: &[u8] = if bytes.starts_with(b"./") {
+        bytes.get(2..)?
+    } else {
+        bytes
+    };
+
+    let prefix_len = WINDOWS_RELATIVE_PREFIX.len();
+    let total = prefix_len.checked_add(rest.len())?;
+    if buf.len() < total {
+        return None;
+    }
+    // `buf.len() >= total >= prefix_len` is established above, so
+    // neither split can be out of range.
+    let (head, body) = buf.split_at_mut(prefix_len);
+    head.copy_from_slice(WINDOWS_RELATIVE_PREFIX);
+    let tail = body.get_mut(..rest.len())?;
+    tail.copy_from_slice(rest);
+    for b in tail.iter_mut() {
+        if *b == b'/' {
+            *b = b'\\';
+        }
+    }
+
+    core::str::from_utf8(buf.get(..total)?).ok()
 }
 
 /// Map a backing-image format hint to the ASCII bytes qemu-img writes
@@ -1015,6 +1091,12 @@ pub fn plan_vhd<'a>(
                 // this builder and is not re-checked here — a second
                 // implementation of the same limit is a second chance
                 // to disagree with it.
+                //
+                // The name field gets the path **as typed**, never the
+                // Windows-normalised form the locator below carries:
+                // this is the field qemu's `block/vpc.c` and libvhdi
+                // resolve a parent through, so normalising it would
+                // hand both oracles a path that does not name the file.
                 vhd::build_dynamic_header_parent(
                     dyn_header_region,
                     &opts.parent_unique_id,
@@ -1023,23 +1105,60 @@ pub fn plan_vhd<'a>(
                 )
                 .map_err(map_vhd_build_error)?;
 
-                // Locator platform data: the same path again, UTF-16
-                // LITTLE endian this time, zero-padded to the sector.
+                // `W2ku` names an absolute Windows-side path and `W2ru`
+                // a relative one, chosen from the path the user
+                // actually typed.
+                //
+                // The platform code decides the *bytes* as well as the
+                // code. A relative path is rewritten into the Windows
+                // convention `W2ru` is defined in — `/` to `\`, leading
+                // `.\` — which is what the Hyper-V fixtures contain; a
+                // POSIX-absolute path has no honest `W2ku` rendering
+                // and keeps its bytes. See
+                // `windows_relative_parent_path` and
+                // [PLAN-differencing.md](docs/plans/PLAN-differencing.md).
+                //
+                // This is the locator only. The parent unicode name
+                // field written just above keeps the typed bytes,
+                // because that is the field qemu's `block/vpc.c` and
+                // libvhdi resolve a parent through, and neither of them
+                // reads this table at all.
+                let mut locator_path_buf = [0u8; vhd::MAX_PARENT_NAME_UTF8];
+                let (platform_code, locator_path): (&[u8; 4], &str) =
+                    if path.as_bytes().first() == Some(&b'/') {
+                        (b"W2ku", path)
+                    } else {
+                        let normalised = windows_relative_parent_path(path, &mut locator_path_buf)
+                            .ok_or(CreateError::ParentNameTooLong)?;
+                        (b"W2ru", normalised)
+                    };
+
+                // Locator platform data: the path again, UTF-16 LITTLE
+                // endian this time, zero-padded to the sector.
                 locator_region.fill(0);
-                let data_len = vhd::build_parent_locator_data(path, locator_region)
-                    .map_err(map_vhd_build_error)?;
+                let data_len = vhd::build_parent_locator_data(locator_path, locator_region)
+                    .map_err(|e| match e {
+                        // `locator_region` is always exactly one sector,
+                        // so the builder can only run out of room here
+                        // for a path too long to emit — 256 UTF-16 code
+                        // units is what 512 bytes hold. It is the same
+                        // condition as the name field's own cap and
+                        // gets the same error; `map_vhd_build_error`
+                        // reads this variant as a planner bug because
+                        // its other caller passes a fixed-size header.
+                        //
+                        // A relative path reaches this two code units
+                        // longer than the user typed, so the emitter's
+                        // effective cap for one is two shorter than the
+                        // name field's 255.
+                        vhd::VhdBuildError::BufferTooSmall => CreateError::ParentNameTooLong,
+                        other => map_vhd_build_error(other),
+                    })?;
 
                 // One entry, in the first of the eight slots; the
                 // other seven stay zero. (`slot` is zero-based here;
                 // prose that numbers the slots from one calls this
-                // "slot 1".) `W2ku` names an absolute Windows-side path
-                // and `W2ru` a relative one, chosen from the path the
-                // user actually typed.
-                let platform_code: &[u8; 4] = if path.as_bytes().first() == Some(&b'/') {
-                    b"W2ku"
-                } else {
-                    b"W2ru"
-                };
+                // "slot 1".)
                 vhd::build_parent_locator_entry(
                     dyn_header_region,
                     0,
@@ -1262,22 +1381,36 @@ pub fn plan_vhdx<'a>(
         //
         // One path key, chosen from the path the user actually typed,
         // exactly as the VHD emitter chooses between the `W2ku` and
-        // `W2ru` platform codes. A POSIX absolute path under a key
-        // named `absolute_win32_path` is deliberate and is the subject
-        // of #570: the alternatives are omitting the path key (which
-        // SPEC(VHDX) 2.6.2.6.3 forbids) or refusing absolute paths for
-        // vhdx alone.
-        let path_key: &[u8] = if path.as_bytes().first() == Some(&b'/') {
-            vhdx::KEY_ABSOLUTE_WIN32_PATH
+        // `W2ru` platform codes — and, exactly as there, the key
+        // decides the value's bytes too. A relative path is rewritten
+        // into the Windows convention `relative_path` is defined in
+        // (`/` to `\`, leading `.\`), which is what the measured
+        // Hyper-V fixtures contain.
+        //
+        // A POSIX absolute path keeps its bytes under a key named
+        // `absolute_win32_path`. That is deliberate: there is no honest
+        // Win32 rendering of `/srv/images/parent.vhdx`, and the
+        // alternatives are omitting the path key (which SPEC(VHDX)
+        // 2.6.2.6.3 forbids), fabricating a drive letter, or refusing
+        // absolute paths for vhdx alone. What a differencing chain
+        // actually resolves through is `parent_linkage`, not either
+        // path key. See
+        // [PLAN-differencing.md](docs/plans/PLAN-differencing.md) and
+        // `docs/quirks.md`.
+        let mut locator_path_buf = [0u8; vhdx::MAX_PARENT_LOCATOR_VALUE_UTF8];
+        let (path_key, path_value): (&[u8], &str) = if path.as_bytes().first() == Some(&b'/') {
+            (vhdx::KEY_ABSOLUTE_WIN32_PATH, path)
         } else {
-            vhdx::KEY_RELATIVE_PATH
+            let normalised = windows_relative_parent_path(path, &mut locator_path_buf)
+                .ok_or(CreateError::ParentNameTooLong)?;
+            (vhdx::KEY_RELATIVE_PATH, normalised)
         };
         vhdx::build_parent_locator(
             metadata_region,
             metadata_items_end as u32,
             &opts.parent_data_write_guid,
             path_key,
-            path,
+            path_value,
         )
         .map_err(map_vhdx_build_error)?;
     }
@@ -1324,6 +1457,81 @@ pub fn plan_vhdx<'a>(
 
 #[cfg(test)]
 extern crate std;
+
+/// The Windows rendering of a relative parent path, at the level of the
+/// function rather than of an emitted image.
+///
+/// `tests/round_trip.rs` asserts the same rule against the bytes both
+/// emitters actually write; what this adds is the two things no image
+/// can show — the exact-fit and one-past-fit behaviour of the
+/// caller-supplied buffer, which is what stands in for an allocator in a
+/// `no_std` crate.
+#[cfg(test)]
+mod windows_relative_parent_path_tests {
+    use super::*;
+
+    /// Normalise into a generously sized buffer and compare.
+    fn render(path: &str) -> std::string::String {
+        let mut buf = [0u8; vhd::MAX_PARENT_NAME_UTF8];
+        let out = windows_relative_parent_path(path, &mut buf).expect("normalise");
+        std::string::String::from(out)
+    }
+
+    #[test]
+    fn a_bare_name_gains_the_prefix() {
+        assert_eq!(render("parent.vhd"), r".\parent.vhd");
+    }
+
+    #[test]
+    fn a_leading_dot_slash_is_replaced_not_doubled() {
+        assert_eq!(render("./parent.vhd"), r".\parent.vhd");
+        assert_eq!(render("./sub/parent.vhd"), r".\sub\parent.vhd");
+        // `..` is not `.`: only an exact `./` prefix is consumed.
+        assert_eq!(render("../parent.vhd"), r".\..\parent.vhd");
+        // A lone `.` is not a prefix either — there is no separator.
+        assert_eq!(render(".hidden.vhd"), r".\.hidden.vhd");
+    }
+
+    #[test]
+    fn every_separator_is_translated() {
+        assert_eq!(render("sub/dir/parent.vhd"), r".\sub\dir\parent.vhd");
+    }
+
+    /// Multi-byte characters survive: `/` is ASCII and ASCII bytes never
+    /// occur inside a UTF-8 sequence, so a byte-wise substitution cannot
+    /// corrupt one.
+    #[test]
+    fn non_ascii_characters_are_untouched() {
+        assert_eq!(render("répertoire/pärent.vhd"), r".\répertoire\pärent.vhd");
+        assert_eq!(render("\u{1F600}/x.vhd"), ".\\\u{1F600}\\x.vhd");
+    }
+
+    /// The buffer bound: exactly enough succeeds, one byte less refuses,
+    /// and a refusal is what the callers turn into
+    /// [`CreateError::ParentNameTooLong`].
+    #[test]
+    fn the_buffer_bound_is_input_length_plus_two() {
+        let path = "parent.vhd";
+        let mut exact = [0u8; 12];
+        assert_eq!(
+            windows_relative_parent_path(path, &mut exact),
+            Some(r".\parent.vhd"),
+        );
+        let mut short = [0u8; 11];
+        assert_eq!(windows_relative_parent_path(path, &mut short), None);
+    }
+
+    /// A consumed `./` gives the two bytes back, so this needs no more
+    /// room than the input.
+    #[test]
+    fn a_consumed_dot_slash_costs_nothing() {
+        let mut exact = [0u8; 12];
+        assert_eq!(
+            windows_relative_parent_path("./parent.vhd", &mut exact),
+            Some(r".\parent.vhd"),
+        );
+    }
+}
 
 #[cfg(test)]
 mod qcow2_plan_tests {
