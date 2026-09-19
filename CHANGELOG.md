@@ -61,6 +61,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   "invalid option for target format", because the guest has nowhere to
   get the parent's `DataWriteGuid` from until it can open the parent.
 
+- **`instar create -f vpc -b parent.vhd -F vpc child.vhd` and `instar
+  create -f vhdx -b parent.vhdx -F vhdx child.vhdx` now produce
+  differencing children** — reaching the emitters above from the CLI
+  for the first time, unlike the two crate-level changes above. The
+  guest reads the parent's identity off the parent itself, a VHD
+  parent's footer `uuid` and `timestamp` or a VHDX parent's
+  active-header `DataWriteGuid`, instead of being handed a placeholder.
+  A differencing child's parent must be the same format as the child:
+  format detection decides, not the `-F` hint, and a parent that
+  detects as anything else — or a hint that contradicts detection — is
+  refused with a typed `ERROR_PARENT_FORMAT_MISMATCH`
+  ([PLAN-differencing.md](docs/plans/PLAN-differencing.md)). qemu-img
+  creates neither differencing format, so there is no oracle to
+  cross-validate against; verification is instar's own parsers,
+  `vhdiinfo`, and byte-level assertions against the parent's own
+  fields.
+
+  Relative and absolute parent paths are recorded differently, settling
+  [#570](https://github.com/shakenfist/instar/issues/570): a relative
+  path is normalised into the Hyper-V convention before being written
+  to the parent locator (`/` becomes `\`, prefixed `.\`), matching the
+  measured Hyper-V fixtures; a POSIX-absolute path is kept verbatim
+  under the Windows-defined locator key, because no honest Windows-style
+  rendering of it exists and SPEC(VHDX) 2.6.2.6.3 requires at least one
+  path key. The VHD parent unicode name field always keeps the path as
+  typed regardless — that is the field qemu and libvhdi actually
+  resolve through. One consequence: a relative parent path caps two
+  code units shorter than an absolute one, because the `.\` prefix
+  comes out of the same budget — 254 vs 255 for VHD, 258 vs 260 for
+  VHDX. See the "VHD/VHDX differencing" section of
+  [docs/quirks.md](docs/quirks.md).
+
 ### Changed
 
 - **CI runs on Debian 13 runners.** Every job moved from the `debian-12`
@@ -356,6 +388,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   for a VHDX parent's Windows-shaped locator, and `resize` still
   accepts a differencing VHDX (a pre-existing, unrelated write-path
   bug, now tracked as issue #565).
+
+- **`create -b` skipped every check on the backing image when an
+  explicit size was also given.** `probe_backing` only ran when no
+  `SIZE` was passed, since its original job was inferring a missing
+  size, so `create -b <backing file> child.qcow2 64M` silently skipped
+  the differencing-parent refusal, the parse check and format
+  detection alike — the same command without the trailing size was
+  correctly refused
+  ([#579](https://github.com/shakenfist/instar/issues/579)). It now
+  runs whenever `-b` is given, size or no. One consequence reaches
+  beyond differencing: a backing image in a format the probe cannot
+  parse (vdi, qcow1, qed, iso, luks) is now refused with an explicit
+  size as well as without, where `develop` accepted it.
 
 ## [0.3.0] - 2026-08-02
 

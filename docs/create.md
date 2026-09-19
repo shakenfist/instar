@@ -56,14 +56,17 @@ The full flag surface is reported by `instar create --help`.
 | raw    | (host-only)            | No       | byte-equivalent (file size + zero-fill) |
 | qcow2  | n/a                    | Yes      | info-equivalent (modulo refcount_bits, compat, zstd) |
 | vmdk   | monolithicSparse, streamOptimized | Yes | info-equivalent |
-| vpc    | dynamic, fixed         | No       | info-equivalent (modulo CHS virtual_size rounding) |
-| vhdx   | dynamic                | No       | info-equivalent (modulo default block_size when unspecified) |
+| vpc    | dynamic, fixed         | Yes      | info-equivalent (modulo CHS virtual_size rounding) |
+| vhdx   | dynamic                | Yes      | info-equivalent (modulo default block_size when unspecified) |
 
 A "No" in the *Backing?* column means the format cannot be created
-*as a child*: `-b` / `-o backing_file` is rejected. Any of these
-formats may still be used as the **parent** of a qcow2 or vmdk
-child, which is what `tests/test_create.py`'s `test_vhdx_as_backing`
-exercises.
+*as a child* at all: `-b` / `-o backing_file` is rejected. Raw is the
+only such target — it has no metadata to record a backing reference
+in. vpc and vhdx may be used as the **parent** of a qcow2 or vmdk
+child regardless of format, which is what `tests/test_create.py`'s
+`test_vhdx_as_backing` exercises; they may now also be used as a
+**child** of a parent of their own format — see the per-format
+sections below.
 
 The "info-equivalence" contract is verified by the cross-version baseline
 matrix in `instar-testdata/expected-outputs/create-info-json/` across 80
@@ -131,41 +134,35 @@ the subformat. instar exposes `--grain-size` as an independent flag.
 
 Honoured:
 - `size`, `subformat` (dynamic|fixed)
+- `backing_file`, `backing_fmt` (alternative to `-b` / `-F`) — a VHD
+  child with a parent is a *differencing* disk (`disk_type=4` plus a
+  populated parent locator entry in the dynamic header). The guest
+  reads the parent's identity — footer `uuid` and `timestamp` — off
+  the parent itself and writes it into the child. The parent must
+  itself be a VHD: format detection decides, not the `-F` hint, and a
+  parent that detects as anything else (or a hint that contradicts
+  detection) is refused with `ERROR_PARENT_FORMAT_MISMATCH`. See
+  [Backing-file semantics](#backing-file-semantics) below and the
+  "VHD/VHDX differencing" section of [quirks.md](quirks.md).
 
 Accepted but no size effect:
 - `force_size`
-
-Rejected (future work):
-- `backing_file`, `backing_fmt` — a VHD child with a parent is a
-  *differencing* disk (`disk_type=4` plus the dynamic header's
-  parent locator table), which the create operation refuses with
-  `BackingFileUnsupported`. The refusal is in the operation rather
-  than in the planner: instar can now build the metadata for a
-  differencing VHD, but it cannot yet read the parent's identity off
-  the parent, and a child recording the wrong parent identity is
-  worse than no child at all. See
-  [PLAN-differencing.md](plans/PLAN-differencing.md) and
-  [Future work](#future-work).
 
 ### vhdx
 
 Honoured:
 - `size`, `block_size` (1 MiB..256 MiB power of two)
+- `backing_file`, `backing_fmt` — a VHDX child with a parent sets the
+  `HasParent` file-parameter bit and writes a populated parent
+  locator metadata item carrying the parent's active-header
+  `DataWriteGuid`. The parent must itself be a VHDX, checked the same
+  way as vpc above: detection decides, and a mismatch (or a
+  contradicting `-F`) is refused with `ERROR_PARENT_FORMAT_MISMATCH`.
+  See [Backing-file semantics](#backing-file-semantics) below and the
+  "VHD/VHDX differencing" section of [quirks.md](quirks.md).
 
 Accepted but no size effect:
 - `log_size`
-
-Rejected (future work):
-- `backing_file`, `backing_fmt` — a VHDX child with a parent needs
-  the `HasParent` file-parameter bit and a populated parent locator
-  metadata item, which the create operation refuses with
-  `BackingFileUnsupported`. The refusal is in the operation rather
-  than in the planner, exactly as for vpc above: instar can now build
-  the metadata for a differencing VHDX, but it cannot yet read the
-  parent's active-header `DataWriteGuid` off the parent, and a child
-  recording the wrong parent identity is worse than no child at all.
-  See [PLAN-differencing.md](plans/PLAN-differencing.md) and
-  [Future work](#future-work).
 
 ### raw
 
@@ -178,25 +175,47 @@ Rejected:
 
 ## Backing-file semantics
 
-This section describes `create` for the two target formats that
-accept a backing file: qcow2 and vmdk. vpc and vhdx reject one
-(see above), and raw has no way to record one.
+This section describes `create` for the target formats that accept a
+backing file: qcow2, vmdk, vpc and vhdx. Raw has no way to record one.
 
 The user-typed path is embedded verbatim into the new image's metadata,
 matching qemu-img: a relative path stays relative; an absolute path
-stays absolute. The host resolves the path **relative to the new
-image's directory** when opening the backing file, so the resulting
-reference is portable across moves of the parent.
+stays absolute. This holds for qcow2, vmdk, and for the VHD parent
+unicode name field, which is the field qemu and libvhdi resolve a VHD
+parent through. It does **not** hold for the vpc/vhdx *locator* path
+that records where a Hyper-V tool would look for the parent: a
+relative path is normalised into the Hyper-V convention before being
+written there (`/` becomes `\`, prefixed `.\`), while a POSIX-absolute
+path is kept verbatim under the Windows-defined locator key, because
+no honest Windows-style rendering of an absolute POSIX path exists.
+See the "VHD/VHDX differencing" section of [quirks.md](quirks.md) for
+the rationale and the resulting path-length limits. The host resolves
+the path **relative to the new image's directory** when opening the
+backing file, so the resulting reference is portable across moves of
+the parent.
 
 A backing file requires either `-F FMT` (explicit format hint) or `-u`
 (unsafe; assume raw). The hint is used as the initial format guess; if
 the backing file's first sector contradicts the hint via its magic
 bytes, auto-detection wins and the metadata records the detected
-format. Three-level chains record only the immediate parent — instar
-does not recurse to grandparents (matches qemu-img). When the backing
-size would exceed the target format's addressable range,
-`ERROR_BACKING_SIZE_TOO_LARGE` fires with an actionable
-"try a larger cluster size" hint.
+format. vpc and vhdx additionally require the parent to be their own
+format — a vpc child needs a VHD parent, a vhdx child a VHDX one — and
+refuse with `ERROR_PARENT_FORMAT_MISMATCH` otherwise, whether the
+mismatch comes from detection or from an explicit `-F` that
+contradicts it; qcow2 and vmdk are unaffected and continue to accept a
+parent of any format they can detect. Three-level chains record only
+the immediate parent — instar does not recurse to grandparents
+(matches qemu-img). When the backing size would exceed the target
+format's addressable range, `ERROR_BACKING_SIZE_TOO_LARGE` fires with
+an actionable "try a larger cluster size" hint.
+
+Every check reached through the backing probe — the differencing
+refusal below, the parse check and format detection — now runs
+whenever `-b` is given, including when an explicit `SIZE` is also
+given. Previously `create -b <parent> child 64M` skipped all three
+checks because the probe only ran to infer a missing size (#579); a
+backing image in a format the probe cannot parse (vdi, qcow1, qed,
+iso, luks) is now refused with an explicit size as well as without.
 
 A **differencing VHD or VHDX is refused as a backing file**:
 
@@ -253,6 +272,12 @@ is `KNOWN_WRITER_DIVERGENCES` in `tests/test_create.py`.
   defaults to 8 MiB; qemu-img always defaults to 32 MiB. Pass
   `-o block_size=...` (or `--block-size`) explicitly to match.
   Explicit block sizes round-trip cleanly.
+- **vpc / vhdx differencing children**: instar can create a
+  differencing VHD or VHDX (`-b` with `-f vpc` / `-f vhdx`); qemu-img
+  refuses to create either ("Backing file not supported for file
+  format 'vpc'" / `'vhdx'`), so this is an instar-only capability with
+  no qemu-img oracle to compare against. See the "VHD/VHDX
+  differencing" section of [quirks.md](quirks.md).
 
 All `-o refcount_bits=` widths (1/2/4/8/16/32/64) are now written
 correctly: `build_header` derives `refcount_order` from `refcount_bits`
@@ -271,11 +296,6 @@ through `instar check` and match `qemu-img` (instar #365).
 - Preallocation for vmdk / vpc / vhdx (each format needs its own
   BAT-population pattern plus the same host `apply_preallocation`
   post-pass that qcow2 already uses).
-- Differencing VHD (`disk_type=4` + parent locators) and
-  differencing VHDX (`HasParent` + parent locator metadata item) as
-  create targets, so `-b` works for vpc and vhdx. qemu-img creates
-  neither ("Backing file not supported for file format 'vpc'"), so
-  this is an instar-only capability with no qemu-img oracle.
 - Multi-file VMDK subformats (`monolithicFlat`, `twoGbMaxExtentSparse`,
   `twoGbMaxExtentFlat`) — needs multi-output-device support in the
   call table.
@@ -331,6 +351,13 @@ defaults from the parent):
 
 ```
 instar create -f qcow2 -b parent.qcow2 -F qcow2 child.qcow2
+```
+
+Create a differencing VHD child (the parent's identity is read off the
+parent and the virtual size defaults from it):
+
+```
+instar create -f vpc -b parent.vhd -F vpc child.vhd
 ```
 
 Create a raw image with `falloc` preallocation (reserves blocks
