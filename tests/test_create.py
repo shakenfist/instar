@@ -12,6 +12,8 @@ These tests require /dev/kvm access for the non-raw paths.
 
 import json
 import os
+import shutil
+import struct
 import subprocess
 import tempfile
 from pathlib import Path
@@ -19,19 +21,109 @@ from pathlib import Path
 from base import InstarTestBase
 from helpers.info_json import assert_info_equivalent
 
+# ----------------------------------------------------------------------
+# Differencing identity readers
+#
+# These parse the few fields a differencing child records about its
+# parent, so a round-trip test can compare the child's claim against the
+# parent's own bytes. Kept here rather than reaching for instar itself:
+# the point is to check instar's output against the format, not against
+# instar's reader.
+# ----------------------------------------------------------------------
+
+# VHD footer, big-endian, 512 bytes at the end of the file (with a copy
+# at offset 0 for dynamic and differencing disks).
+_VHD_FOOTER_SIZE = 512
+_VHD_FOOTER_DATA_OFFSET = 16
+_VHD_FOOTER_TIMESTAMP = 24
+_VHD_FOOTER_DISK_TYPE = 60
+_VHD_FOOTER_UUID = 68
+
+# VHD dynamic-disk header, big-endian, at the footer's data_offset.
+_VHD_DYN_PARENT_UUID = 40
+_VHD_DYN_PARENT_TIMESTAMP = 56
+
+# VHDX headers, little-endian, at fixed offsets.
+_VHDX_HEADER_OFFSETS = (64 * 1024, 128 * 1024)
+_VHDX_HEADER_SEQUENCE_NUMBER = 8
+_VHDX_HEADER_DATA_WRITE_GUID = 32
+
+
+def _vhd_footer_disk_type(data):
+    """The disk_type of the VHD footer at offset 0 (4 == differencing)."""
+    return struct.unpack_from('>I', data, _VHD_FOOTER_DISK_TYPE)[0]
+
+
+def _vhd_footer_identity(data):
+    """The (uuid, timestamp) a child of this VHD would record.
+
+    Read from the trailing footer, which every VHD has; the copy at
+    offset 0 exists only for dynamic and differencing disks.
+    """
+    footer = data[-_VHD_FOOTER_SIZE:]
+    uuid = footer[_VHD_FOOTER_UUID:_VHD_FOOTER_UUID + 16]
+    timestamp = struct.unpack_from('>I', footer, _VHD_FOOTER_TIMESTAMP)[0]
+    return uuid, timestamp
+
+
+def _vhd_child_parent_identity(data):
+    """The (parent uuid, parent timestamp) recorded in a VHD child."""
+    dyn_offset = struct.unpack_from('>Q', data, _VHD_FOOTER_DATA_OFFSET)[0]
+    header = data[dyn_offset:dyn_offset + 1024]
+    uuid = header[_VHD_DYN_PARENT_UUID:_VHD_DYN_PARENT_UUID + 16]
+    timestamp = struct.unpack_from(
+        '>I', header, _VHD_DYN_PARENT_TIMESTAMP)[0]
+    return uuid, timestamp
+
+
+def _vhdx_active_data_write_guid(data):
+    """The DataWriteGuid of the VHDX's active header.
+
+    The active header is the one with the higher sequence number, with
+    header 1 winning a tie -- the same rule instar's reader applies.
+    """
+    best = None
+    for offset in _VHDX_HEADER_OFFSETS:
+        if data[offset:offset + 4] != b'head':
+            continue
+        sequence = struct.unpack_from(
+            '<Q', data, offset + _VHDX_HEADER_SEQUENCE_NUMBER)[0]
+        if best is None or sequence > best[0]:
+            guid_at = offset + _VHDX_HEADER_DATA_WRITE_GUID
+            best = (sequence, data[guid_at:guid_at + 16])
+    if best is None:
+        raise AssertionError('no VHDX header found')
+    return best[1]
+
+
+def _format_guid(raw):
+    """Render 16 raw GUID bytes the way VHDX writes parent_linkage.
+
+    Mixed endian: the first three groups are little-endian, the rest
+    are byte order as stored, wrapped in braces and lower case.
+    """
+    d1, d2, d3 = struct.unpack_from('<IHH', raw, 0)
+    rest = raw[8:]
+    return '{{{:08x}-{:04x}-{:04x}-{}-{}}}'.format(
+        d1, d2, d3, rest[:2].hex(), rest[2:].hex())
+
 
 class TestCreateSmoke(InstarTestBase):
     """End-to-end smoke tests for `instar create`."""
 
-    def run_instar_create(self, *args, timeout=60):
+    def run_instar_create(self, *args, timeout=60, cwd=None):
         """Helper: invoke `instar create` with the given args.
+
+        `cwd` runs the command from a directory, so a relative `-b`
+        resolves the way a user's would.
 
         Returns (stdout, stderr, returncode).
         """
         instar = self.get_instar_binary()
         cmd = [str(instar), 'create', *[str(a) for a in args]]
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                               cwd=str(cwd) if cwd is not None else None)
             return r.stdout, r.stderr, r.returncode
         except subprocess.TimeoutExpired:
             return '', f'Timeout after {timeout}s', -1
@@ -245,33 +337,156 @@ class TestCreateSmoke(InstarTestBase):
             self.assertNotEqual(rc, 0)
             self.assertIn('raw', stderr.lower())
 
-    def test_create_vhd_and_vhdx_reject_backing(self):
-        """`-f vpc|vhdx -b PARENT` is refused, and writes no child.
+    def _copy_diff_parent(self, name, dest_dir):
+        """Copy a third-party differencing parent fixture into dest_dir.
 
-        Both planners can build the metadata for a differencing child,
-        so the refusal a user sees lives in the create operation rather
-        than in the planner. Nothing else stands between a `-b` and an
-        image whose recorded parent identity is all zeros — an identity
-        no real parent has — so this asserts the guard rather than the
-        planner, and asserts that nothing is left behind when it fires.
+        Skips the test when the fixture is absent. Copying rather than
+        referencing in place keeps the emitted parent path short and
+        relative, and keeps the test from writing beside the fixture.
         """
-        for fmt, suffix in (('vpc', 'vhd'), ('vhdx', 'vhdx')):
+        src = (self._testdata_root / 'custom' / 'format-coverage' / name)
+        if not src.exists():
+            self.skipTest(f'parent fixture not found: {src}')
+        dest = Path(dest_dir) / name
+        shutil.copyfile(src, dest)
+        return dest
+
+    def test_create_vhd_and_vhdx_differencing_round_trip(self):
+        """`-f vpc|vhdx -b PARENT` writes a child that names its parent.
+
+        Both planners could always build the metadata for a differencing
+        child; what was missing was a parent identity to put in it, so
+        the create operation refused `-b` outright. It now reads the
+        parent's identity -- a VHD parent's footer `uuid` and
+        `timestamp`, a VHDX parent's active-header `DataWriteGuid` --
+        and records it in the child. See
+        docs/plans/PLAN-differencing.md.
+
+        The parents are third-party fixtures rather than images this
+        test creates, deliberately. Every image instar writes today
+        carries the same constant identity (#566), so a child instar
+        wrote against a parent instar wrote would satisfy an identity
+        check by comparing zeros to zeros and would keep passing if the
+        plumbing were ripped out. A qemu-img-written parent has a real,
+        non-zero identity, so the comparison below can actually fail.
+        """
+        cases = (
+            ('vpc', 'vhd-diff-parent.vhd', 'child.vhd'),
+            ('vhdx', 'vhdx-diff-parent.vhdx', 'child.vhdx'),
+        )
+        for fmt, fixture, child_name in cases:
             with self.subTest(format=fmt):
                 with tempfile.TemporaryDirectory() as td:
-                    parent = Path(td) / f'parent.{suffix}'
-                    child = Path(td) / f'child.{suffix}'
-                    _, stderr, rc = self.run_instar_create(
-                        '-f', fmt, str(parent), '16M')
-                    self.assertEqual(rc, 0, f'creating the parent failed: {stderr}')
+                    parent = self._copy_diff_parent(fixture, td)
+                    child = Path(td) / child_name
 
                     _, stderr, rc = self.run_instar_create(
-                        '-f', fmt, '-b', str(parent), '-F', fmt, '-u',
-                        str(child), '16M')
+                        '-f', fmt, '-b', parent.name, '-F', fmt,
+                        str(child), cwd=td)
+                    self.assertEqual(
+                        rc, 0, f'creating the {fmt} child failed: {stderr}')
+                    self.assertTrue(child.exists(),
+                                    f'{fmt} -b exited 0 but wrote no child')
+
+                    # instar's own reader sees a child with a parent.
+                    stdout, stderr, rc = self.run_instar_info(
+                        child, output='json')
+                    self.assertEqual(rc, 0, f'info on {child} failed: {stderr}')
+                    info = json.loads(stdout)
+                    self.assertEqual(info.get('format'), fmt)
+                    self.assertEqual(info.get('backing-filename-format'), fmt)
+                    self.assertIsNotNone(
+                        info.get('backing-filename'),
+                        f'{fmt} child reports no backing file: {info!r}')
+
+                    child_bytes = child.read_bytes()
+                    parent_bytes = parent.read_bytes()
+                    if fmt == 'vpc':
+                        self.assertEqual(
+                            _vhd_footer_disk_type(child_bytes), 4,
+                            'child VHD disk_type is not differencing')
+                        want_uuid, want_ts = _vhd_footer_identity(parent_bytes)
+                        self.assertNotEqual(
+                            want_uuid, b'\x00' * 16,
+                            'parent fixture has a zero uuid, so this test '
+                            'cannot tell a real identity from the placeholder')
+                        got_uuid, got_ts = _vhd_child_parent_identity(child_bytes)
+                        self.assertEqual(
+                            got_uuid, want_uuid,
+                            'child parent_unique_id does not match the '
+                            "parent's footer uuid")
+                        self.assertEqual(
+                            got_ts, want_ts,
+                            'child parent_timestamp does not match the '
+                            "parent's footer timestamp")
+                    else:
+                        guid = _vhdx_active_data_write_guid(parent_bytes)
+                        self.assertNotEqual(
+                            guid, b'\x00' * 16,
+                            'parent fixture has a zero DataWriteGuid, so this '
+                            'test cannot tell a real identity from the '
+                            'placeholder')
+                        linkage = _format_guid(guid)
+                        self.assertIn(
+                            linkage.encode('utf-16-le'), child_bytes,
+                            f'child does not record parent_linkage {linkage}')
+
+    def test_create_vhd_and_vhdx_reject_mismatched_parent_format(self):
+        """A differencing child must be the same format as its parent.
+
+        Neither VHD nor VHDX has a way to say "my parent is some other
+        format", so a mismatch is refused rather than written as an
+        image whose parent can never be resolved. Detection decides:
+        the `-F` hint is only populated when the user passes one, and a
+        hint that the parent's bytes disprove is refused too.
+        """
+        cases = (
+            ('vpc', 'vhdx-diff-parent.vhdx', 'vhdx', 'child.vhd'),
+            ('vhdx', 'vhd-diff-parent.vhd', 'vpc', 'child.vhdx'),
+            # The bytes are a VHD and the target is vpc, but the user
+            # asserted qcow2; refuse rather than silently prefer the
+            # bytes and hide the mistake.
+            ('vpc', 'vhd-diff-parent.vhd', 'qcow2', 'child.vhd'),
+        )
+        for fmt, fixture, hint, child_name in cases:
+            with self.subTest(format=fmt, parent=fixture, hint=hint):
+                with tempfile.TemporaryDirectory() as td:
+                    parent = self._copy_diff_parent(fixture, td)
+                    child = Path(td) / child_name
+                    _, stderr, rc = self.run_instar_create(
+                        '-f', fmt, '-b', parent.name, '-F', hint,
+                        str(child), cwd=td)
                     self.assertNotEqual(rc, 0)
-                    self.assertIn('invalid option for target format', stderr)
+                    self.assertIn('required parent', stderr)
                     self.assertFalse(
                         child.exists(),
-                        f'{fmt} -b was refused but still wrote {child}')
+                        f'{fmt} mismatch was refused but still wrote {child}')
+
+    def test_create_backing_checks_run_with_explicit_size(self):
+        """An explicit SIZE does not skip the checks on the parent.
+
+        The backing probe used to run only when the virtual size had to
+        be inferred from the parent, so passing a size skipped the
+        differencing refusal, the parse check and the format detection
+        alike (#579). A differencing parent is refused either way now.
+        """
+        for args in ((), ('64M',)):
+            with self.subTest(size=args or 'inferred'):
+                with tempfile.TemporaryDirectory() as td:
+                    parent = self._copy_diff_parent(
+                        'vhd-differencing.vhd', td)
+                    child = Path(td) / 'child.qcow2'
+                    _, stderr, rc = self.run_instar_create(
+                        '-f', 'qcow2', '-b', parent.name, '-F', 'vpc',
+                        str(child), *args, cwd=td)
+                    self.assertNotEqual(
+                        rc, 0,
+                        'a differencing parent was accepted with '
+                        f'args={args!r}')
+                    self.assertIn('differencing', stderr)
+                    self.assertFalse(
+                        child.exists(),
+                        f'refused but still wrote {child}')
 
     # ------------------------------------------------------------------
     # Helpers

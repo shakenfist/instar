@@ -129,10 +129,6 @@ fn map_create_error(e: CreateError) -> u32 {
 /// elsewhere (vmdk, via `read_vmdk_parent_cid`), so `None` is the
 /// correct answer for them rather than a missing case.
 #[derive(Clone, Copy)]
-// Read by the create arms that build the differencing planner options;
-// see docs/plans/PLAN-differencing.md. The probe only makes the
-// identity available.
-#[allow(dead_code)]
 enum ParentIdentity {
     /// The parent carries no identity a child of it could record.
     None,
@@ -155,14 +151,8 @@ struct BackingProbe {
     virtual_size: u64,
     /// The format detected in the parent's own header — not the
     /// `-F` hint, which is only populated when the user passes one.
-    // Read by the parent-format check; see
-    // docs/plans/PLAN-differencing.md.
-    #[allow(dead_code)]
     format: ImageFormat,
     /// The parent's identity, if its format records one.
-    // Read by the create arms that build the differencing planner
-    // options; see docs/plans/PLAN-differencing.md.
-    #[allow(dead_code)]
     identity: ParentIdentity,
 }
 
@@ -400,11 +390,52 @@ unsafe fn read_vmdk_parent_cid(call_table: &CallTable, sector_size: usize) -> Op
     Some(info.cid)
 }
 
+/// Does the parent's detected format satisfy the child's?
+///
+/// A differencing VHD child can only name a VHD parent and a
+/// differencing VHDX child only a VHDX parent, so a mismatch there is
+/// refused with `ERROR_PARENT_FORMAT_MISMATCH` rather than written as
+/// an image whose parent can never be resolved. `detected` is the
+/// format found in the parent's own header; the `-F` hint is only
+/// consulted to catch a user who asserted a format the bytes disprove,
+/// because the hint is absent unless `-F` was passed.
+///
+/// Every other target is unconstrained: qcow2 and vmdk accept
+/// mixed-format parents and this does not change that.
+fn parent_format_matches(
+    target: ImageFormat,
+    detected: ImageFormat,
+    config: &CreateConfig,
+) -> bool {
+    let required = match target {
+        ImageFormat::Vhd => ImageFormat::Vhd,
+        ImageFormat::Vhdx => ImageFormat::Vhdx,
+        _ => return true,
+    };
+    if detected != required {
+        return false;
+    }
+    let hint = ImageFormat::from_u32(config.backing_format);
+    matches!(hint, ImageFormat::Unknown) || hint == detected
+}
+
 fn vhd_opts_from<'a>(
     config: &CreateConfig,
     virtual_size: u64,
     backing: Option<BackingRef<'a>>,
+    identity: ParentIdentity,
 ) -> VhdCreateOpts<'a> {
+    // A vpc child records its parent's own footer `uuid` and
+    // creation `timestamp`, so a reader can tell whether the parent it
+    // resolved is the parent the child was written against. The
+    // parent-format check runs before this, so a vpc target with a
+    // backing file always arrives here with a `Vhd` identity; the other
+    // arms are the no-backing case, where the planner writes no parent
+    // fields at all. See docs/plans/PLAN-differencing.md.
+    let (parent_unique_id, parent_timestamp) = match identity {
+        ParentIdentity::Vhd { uuid, timestamp } => (uuid, timestamp),
+        ParentIdentity::None | ParentIdentity::Vhdx { .. } => ([0u8; 16], 0),
+    };
     VhdCreateOpts {
         virtual_size,
         subformat: match config.vhd_subformat {
@@ -417,14 +448,8 @@ fn vhd_opts_from<'a>(
             config.block_size
         },
         backing,
-        // Zeros, because the guest has no way to read the parent's
-        // footer yet; docs/plans/PLAN-differencing.md tracks the step
-        // that gives it one. These values are never used:
-        // the `ImageFormat::Vhd` arm below refuses a vpc target with a
-        // backing file before `plan_vhd` is called, precisely so a
-        // zeroed parent identity cannot reach an image.
-        parent_unique_id: [0u8; 16],
-        parent_timestamp: 0,
+        parent_unique_id,
+        parent_timestamp,
     }
 }
 
@@ -432,7 +457,18 @@ fn vhdx_opts_from<'a>(
     config: &CreateConfig,
     virtual_size: u64,
     backing: Option<BackingRef<'a>>,
+    identity: ParentIdentity,
 ) -> VhdxCreateOpts<'a> {
+    // A vhdx child records its parent's active-header `DataWriteGuid`
+    // as its own `parent_linkage`. The parent-format check runs before
+    // this, so a vhdx target with a backing file always arrives here
+    // with a `Vhdx` identity; the other arms are the no-backing case,
+    // where the planner writes no parent metadata at all. See
+    // docs/plans/PLAN-differencing.md.
+    let parent_data_write_guid = match identity {
+        ParentIdentity::Vhdx { data_write_guid } => data_write_guid,
+        ParentIdentity::None | ParentIdentity::Vhd { .. } => [0u8; 16],
+    };
     VhdxCreateOpts {
         virtual_size,
         block_size: if config.block_size == 0 {
@@ -441,13 +477,7 @@ fn vhdx_opts_from<'a>(
             config.block_size
         },
         backing,
-        // Zeros, because the guest has no way to read the parent's
-        // active header yet; docs/plans/PLAN-differencing.md tracks the
-        // step that gives it one. This value is never used: the
-        // `ImageFormat::Vhdx` arm below refuses a vhdx target with a
-        // backing file before `plan_vhdx` is called, precisely so a
-        // zeroed parent identity cannot reach an image.
-        parent_data_write_guid: [0u8; 16],
+        parent_data_write_guid,
     }
 }
 
@@ -638,33 +668,51 @@ pub unsafe extern "C" fn _start() -> u64 {
         return 0;
     }
 
-    // Resolve virtual size: explicit non-zero wins, otherwise infer
-    // from the backing image if one is attached.
-    let virtual_size: u64 = if config.virtual_size != 0 {
-        config.virtual_size
-    } else if config.has_backing() {
+    // Probe the backing image whenever one is attached, not only when
+    // the virtual size has to be inferred from it. Every check on the
+    // parent lives in the probe -- the differencing refusal, the parse
+    // check, and the format detection the parent-format check reads --
+    // so gating the probe on a missing size let a user skip all of them
+    // by passing one. It also makes the parent's identity available to
+    // the differencing planners regardless of how the size was
+    // resolved. See docs/plans/PLAN-differencing.md.
+    let probe = if config.has_backing() {
         match probe_backing(call_table, config.sector_size as usize) {
-            Ok(probe) if probe.virtual_size > 0 => probe.virtual_size,
-            // A zero virtual size is as unusable as a failed parse, and
-            // carries no more specific reason than that.
-            Ok(_) => {
-                send_result(
-                    call_table,
-                    config.target_format,
-                    0,
-                    0,
-                    0,
-                    0,
-                    CreateResult::ERROR_BACKING_PARSE_FAILED,
-                );
-                (call_table.send_complete)(b"create\0".as_ptr(), 0, false);
-                return 0;
-            }
+            Ok(probe) => Some(probe),
             Err(code) => {
                 send_result(call_table, config.target_format, 0, 0, 0, 0, code);
                 (call_table.send_complete)(b"create\0".as_ptr(), 0, false);
                 return 0;
             }
+        }
+    } else {
+        None
+    };
+
+    // Resolve virtual size: explicit non-zero wins, otherwise infer
+    // from the backing image if one is attached.
+    let virtual_size: u64 = if config.virtual_size != 0 {
+        config.virtual_size
+    } else if let Some(probe) = probe.as_ref() {
+        if probe.virtual_size > 0 {
+            probe.virtual_size
+        } else {
+            // A zero virtual size is as unusable as a failed parse, and
+            // carries no more specific reason than that. Only checked
+            // on the inferred path: an explicit size does not depend on
+            // the probed one, so a parent that reports zero must not
+            // newly fail a create that never asked it for a size.
+            send_result(
+                call_table,
+                config.target_format,
+                0,
+                0,
+                0,
+                0,
+                CreateResult::ERROR_BACKING_PARSE_FAILED,
+            );
+            (call_table.send_complete)(b"create\0".as_ptr(), 0, false);
+            return 0;
         }
     } else {
         send_result(
@@ -738,6 +786,32 @@ pub unsafe extern "C" fn _start() -> u64 {
         None
     };
 
+    // A differencing child must be the same format as its parent:
+    // Hyper-V writes and resolves VHD parents for VHD children and
+    // VHDX parents for VHDX children, and neither child format has a
+    // way to say "my parent is some other format". Detection decides,
+    // not the `-F` hint, because the hint is only populated when the
+    // user passes one -- and when the user did pass one that the
+    // parent's bytes disprove, refuse rather than silently prefer the
+    // bytes. qcow2 and vmdk accept mixed-format parents and are
+    // untouched. See docs/plans/PLAN-differencing.md.
+    if let Some(probe) = probe.as_ref() {
+        if !parent_format_matches(target, probe.format, config) {
+            return fail_with(
+                call_table,
+                config.target_format,
+                CreateResult::ERROR_PARENT_FORMAT_MISMATCH,
+            );
+        }
+    }
+
+    // The parent's identity travels to the VHD and VHDX planners; every
+    // other target records its parent by path or by CID instead.
+    let parent_identity = match probe.as_ref() {
+        Some(probe) => probe.identity,
+        None => ParentIdentity::None,
+    };
+
     // Carve the create scratch region.
     let scratch =
         core::slice::from_raw_parts_mut(CREATE_SCRATCH as *mut u8, GUEST_CREATE_SCRATCH_LIMIT);
@@ -773,27 +847,7 @@ pub unsafe extern "C" fn _start() -> u64 {
             }
         }
         ImageFormat::Vhd => {
-            // `plan_vhd` can now emit a differencing child, but the
-            // guest must not reach it until it can read the parent's
-            // footer -- see docs/plans/PLAN-differencing.md. Without
-            // that, `vhd_opts_from` above hands the planner an all-zero
-            // `parent_unique_id`. That happens to be correct for an
-            // instar-created parent -- every VHD instar writes has an
-            // all-zero footer id (#566) -- and is wrong for every
-            // third-party one, which would get a child claiming a parent
-            // identity its parent does not have. **Remove this guard in
-            // the same change that teaches the guest to read the
-            // parent's footer**, not before. Refusing with
-            // `BackingFileUnsupported` is exactly the error a user gets
-            // today, so the emitter is invisible from outside.
-            if backing_ref.is_some() {
-                return fail_with(
-                    call_table,
-                    config.target_format,
-                    map_create_error(CreateError::BackingFileUnsupported),
-                );
-            }
-            let opts = vhd_opts_from(config, virtual_size, backing_ref);
+            let opts = vhd_opts_from(config, virtual_size, backing_ref, parent_identity);
             let unit = match opts.subformat {
                 VhdSubformat::Fixed => 0,
                 VhdSubformat::Dynamic => opts.block_size,
@@ -804,28 +858,7 @@ pub unsafe extern "C" fn _start() -> u64 {
             }
         }
         ImageFormat::Vhdx => {
-            // `plan_vhdx` can now emit a differencing child, but the
-            // guest must not reach it until it can read the parent's
-            // active-header DataWriteGuid -- see
-            // docs/plans/PLAN-differencing.md. Without that,
-            // `vhdx_opts_from` above hands the planner an all-zero
-            // `parent_data_write_guid`, which would give every child a
-            // `parent_linkage` of {00000000-0000-0000-0000-000000000000}
-            // -- a claim about the parent's identity that no parent
-            // has, so composition would either refuse the pair or
-            // accept the wrong one. **Remove this guard in the same
-            // change that teaches the guest to read the parent's
-            // active header**, not before. Refusing with
-            // `BackingFileUnsupported` is exactly the error a user gets
-            // today, so the emitter is invisible from outside.
-            if backing_ref.is_some() {
-                return fail_with(
-                    call_table,
-                    config.target_format,
-                    map_create_error(CreateError::BackingFileUnsupported),
-                );
-            }
-            let opts = vhdx_opts_from(config, virtual_size, backing_ref);
+            let opts = vhdx_opts_from(config, virtual_size, backing_ref, parent_identity);
             let unit = opts.block_size;
             match plan_vhdx(&opts, scratch) {
                 Ok(p) => (p, unit),
