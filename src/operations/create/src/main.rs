@@ -172,8 +172,13 @@ unsafe fn read_backing_virtual_size(
             .map(|h| h.virtual_size)
             .ok_or(PARSE_FAILED),
         ImageFormat::Vhd => {
-            // VHD's footer lives at the *end* of the file; read the
-            // last sector and parse from there.
+            // VHD's footer is the last 512 bytes of the *file*; read the
+            // last sector and locate it within that sector. It only
+            // starts the sector when the sector size is 512: `capacity`
+            // is `div_ceil(size_bytes, sector_size)` and reads past
+            // end-of-file zero-pad, so for a larger sector the footer
+            // sits at some 512-aligned offset inside it — which is what
+            // `vhd::find_footer_offset` scans for.
             if capacity == 0 {
                 return Err(PARSE_FAILED);
             }
@@ -181,7 +186,7 @@ unsafe fn read_backing_virtual_size(
                 return Err(PARSE_FAILED);
             }
             let last_sector = core::slice::from_raw_parts(header_ptr, sector_size);
-            let footer = vhd::VhdFooter::parse(last_sector).ok_or(PARSE_FAILED)?;
+            let footer = vhd::VhdFooter::parse_last_sector(last_sector).ok_or(PARSE_FAILED)?;
             if footer.disk_type == vhd::DISK_TYPE_DIFFERENCING {
                 return Err(DIFFERENCING);
             }

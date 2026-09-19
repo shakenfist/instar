@@ -348,8 +348,18 @@ a reviewer does not read a passing same-identity test as proof.
 * **7b's scan could mask a genuinely corrupt parent** by finding a
   stale cookie earlier in the sector. *Mitigation:* take the
   **last** match, not the first — the real footer is the final 512
-  bytes — and keep `VhdFooter::parse`'s existing checksum
-  validation, which a stray cookie will not satisfy.
+  bytes of the file, and every 512-aligned slot after it is
+  zero-padding past end-of-file, which cannot carry the cookie.
+
+  An earlier draft of this item also claimed `VhdFooter::parse`
+  validates the footer checksum and would reject a stray cookie. It
+  does not: `parse` (`src/crates/vhd/src/lib.rs:206`) checks only
+  the buffer length and the cookie, reads `checksum` into the struct
+  and never verifies it — `compute_checksum` (`:1055`) is called
+  only by the writers and by tests. **Taking the last match is the
+  only defence there is**, which is why 7b pins it with a test that
+  places three valid footers in one sector. Corrected here after 7b
+  checked the claim rather than inheriting it.
 * **7e changes bytes that phases 5 and 6 pinned with golden
   tests.** A sub-agent that regenerates a golden to match its
   output destroys the value of the test. *Mitigation:* worktree

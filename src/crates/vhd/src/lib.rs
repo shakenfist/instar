@@ -246,6 +246,60 @@ impl VhdFooter {
             uuid,
         })
     }
+
+    /// Parse the VHD footer out of a buffer holding the image's final
+    /// sector, locating it with [`find_footer_offset`] rather than
+    /// assuming it starts at the beginning of that sector.
+    ///
+    /// Returns `None` if the sector carries no footer cookie at a
+    /// 512-aligned offset, or if the footer found there does not parse.
+    pub fn parse_last_sector(last_sector: &[u8]) -> Option<Self> {
+        let offset = find_footer_offset(last_sector)?;
+        Self::parse(last_sector.get(offset..)?)
+    }
+}
+
+/// Locate the VHD footer inside a buffer holding the image's final
+/// sector.
+///
+/// A VHD's footer is the last 512 bytes of the *file*, but a guest
+/// reading through the call table sees only a sector count, and that
+/// count is rounded up — `size_bytes.div_ceil(sector_size)` in
+/// `vmm::virtio::block`, with reads past end-of-file zero-padded. The
+/// parent's exact byte size is therefore unrecoverable: a capacity of
+/// `n` says only that the size lies in `((n - 1) * ss, n * ss]`. So
+/// the footer's offset within the final sector cannot be computed, and
+/// it is zero only when the sector size is 512.
+///
+/// What is known is that a VHD's size is always a multiple of 512, so
+/// the footer begins at one of the at most `ss / 512` 512-aligned
+/// offsets inside that sector — eight of them for a 4096-byte sector.
+/// This walks those candidates from the tail and returns the **last**
+/// one carrying the `conectix` cookie.
+///
+/// Last, not first: a dynamic VHD also keeps a footer *copy* at file
+/// offset 0, which for a small image falls inside this same sector,
+/// and a fixed VHD's guest data can hold a cookie of its own. The
+/// authoritative footer is the one nearest the tail. Zero padding past
+/// end-of-file cannot produce a false match, because it is not the
+/// cookie.
+///
+/// Returns the offset within `last_sector`, or `None` if no candidate
+/// carries the cookie.
+pub fn find_footer_offset(last_sector: &[u8]) -> Option<usize> {
+    // Candidates are the 512-byte slots that fit entirely within the
+    // buffer, walked from the tail back towards the start.
+    let mut slot = last_sector.len() / FOOTER_SIZE;
+    while slot > 0 {
+        slot -= 1;
+        let offset = slot * FOOTER_SIZE;
+        if let Some(candidate) = last_sector.get(offset..offset + FOOTER_SIZE) {
+            if be_u64(candidate, FOOTER_COOKIE_OFFSET) == VHD_COOKIE {
+                return Some(offset);
+            }
+        }
+    }
+    None
 }
 
 // ============================================================================
@@ -2226,6 +2280,219 @@ fn write_dynamic_header_checksum(buf: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ====================================================================
+    // Footer location within the final sector
+    //
+    // FIXTURES: the three 84-byte constants below are the real footers
+    // qemu-img 10.0.13 wrote for
+    //
+    //   qemu-img create -f vpc -o subformat=dynamic dyn64m.vhd 64M
+    //   qemu-img create -f vpc -o subformat=fixed   fixed8m.vhd 8M
+    //   qemu-img create -f vpc -o subformat=dynamic dyn64g.vhd 64G
+    //
+    // copied out of those files at `len - 512`. Bytes 84..512 of each
+    // real footer are zero (the saved-state byte plus reserved), so the
+    // fixtures carry only the meaningful head and `sector_with_footer`
+    // supplies the zero tail. The three files are rows 1/2, 4 and 3 of
+    // the measured table in survey finding 3 of
+    // `docs/plans/PLAN-differencing-phase-07-guest-host.md`, and the
+    // sector layouts asserted below are those files' real layouts:
+    // lengths 2560, 8391168 and 133632 against a capacity of
+    // `div_ceil(len, sector_size)`.
+    // ====================================================================
+
+    const QEMU_DYNAMIC_FOOTER_HEAD: [u8; 84] = [
+        0x63, 0x6f, 0x6e, 0x65, 0x63, 0x74, 0x69, 0x78, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x32, 0x41, 0x3b, 0xc2, 0x71, 0x65,
+        0x6d, 0x75, 0x00, 0x05, 0x00, 0x03, 0x57, 0x69, 0x32, 0x6b, 0x00, 0x00, 0x00, 0x00, 0x04,
+        0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x40, 0x00, 0x03, 0xc4, 0x08, 0x11,
+        0x00, 0x00, 0x00, 0x03, 0xff, 0xff, 0xf0, 0xa3, 0xc0, 0x25, 0xd7, 0x83, 0x6f, 0x04, 0x45,
+        0x3d, 0xbf, 0x0d, 0x8f, 0x41, 0x20, 0x0a, 0x09, 0xff,
+    ];
+
+    const QEMU_FIXED_FOOTER_HEAD: [u8; 84] = [
+        0x63, 0x6f, 0x6e, 0x65, 0x63, 0x74, 0x69, 0x78, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00,
+        0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x32, 0x41, 0x3b, 0xc2, 0x71, 0x65,
+        0x6d, 0x75, 0x00, 0x05, 0x00, 0x03, 0x57, 0x69, 0x32, 0x6b, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x80, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x08, 0x00, 0x00, 0xf1, 0x04, 0x11,
+        0x00, 0x00, 0x00, 0x02, 0xff, 0xff, 0xe5, 0x0a, 0xeb, 0x3a, 0xba, 0xdd, 0xb3, 0xef, 0x42,
+        0xe4, 0x90, 0x7b, 0xfe, 0x2c, 0x63, 0x05, 0x6b, 0x6c,
+    ];
+
+    const QEMU_DYN64G_FOOTER_HEAD: [u8; 84] = [
+        0x63, 0x6f, 0x6e, 0x65, 0x63, 0x74, 0x69, 0x78, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x32, 0x41, 0x3b, 0xc2, 0x71, 0x65,
+        0x6d, 0x75, 0x00, 0x05, 0x00, 0x03, 0x57, 0x69, 0x32, 0x6b, 0x00, 0x00, 0x00, 0x10, 0x00,
+        0x0f, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x0f, 0xe0, 0x00, 0x80, 0x81, 0x10, 0xff,
+        0x00, 0x00, 0x00, 0x03, 0xff, 0xff, 0xeb, 0xae, 0xc7, 0xaa, 0x56, 0x6c, 0xe9, 0x2c, 0x4b,
+        0xc9, 0xb9, 0x51, 0x98, 0xe7, 0x49, 0xd0, 0x3b, 0x18,
+    ];
+
+    /// qemu rounds a VHD up to its CHS geometry, so the 64M/8M/64G
+    /// images above declare these `current_size` values rather than the
+    /// round numbers on the command line.
+    const QEMU_DYNAMIC_CURRENT_SIZE: u64 = 67_125_248;
+    const QEMU_FIXED_CURRENT_SIZE: u64 = 8_390_656;
+    const QEMU_DYN64G_CURRENT_SIZE: u64 = 68_720_517_120;
+
+    /// Copy a footer fixture into `sector` at `offset`, zero-padding it
+    /// out to the full 512 bytes the real footer occupies.
+    fn place_footer(sector: &mut [u8], offset: usize, head: &[u8; 84]) {
+        sector[offset..offset + head.len()].copy_from_slice(head);
+        sector[offset + head.len()..offset + FOOTER_SIZE].fill(0);
+    }
+
+    #[test]
+    fn footer_offset_dynamic_512_sector() {
+        // dyn64m.vhd is 2560 bytes; at a 512-byte sector size the
+        // capacity is 5 and the final sector is file[2048..2560], which
+        // holds the footer and nothing else. This is the only case the
+        // pre-fix offset-0 parse got right.
+        let mut sector = [0u8; 512];
+        place_footer(&mut sector, 0, &QEMU_DYNAMIC_FOOTER_HEAD);
+
+        assert_eq!(find_footer_offset(&sector), Some(0));
+        let footer = VhdFooter::parse_last_sector(&sector).expect("footer parses");
+        assert_eq!(footer.disk_type, DISK_TYPE_DYNAMIC);
+        assert_eq!(footer.current_size, QEMU_DYNAMIC_CURRENT_SIZE);
+    }
+
+    #[test]
+    fn footer_offset_dynamic_4096_sector_skips_the_offset_zero_copy() {
+        // At a 4096-byte sector size dyn64m.vhd has capacity 1, so the
+        // single sector covers file[0..4096]: footer copy at 0, dynamic
+        // header at 512, BAT at 1536, the real footer at 2048, and zero
+        // padding past end-of-file from 2560 on. The pre-fix parse found
+        // the copy at offset 0 — the right answer by luck, because a
+        // dynamic VHD's copy is byte-identical to its footer.
+        let mut sector = [0u8; 4096];
+        place_footer(&mut sector, 0, &QEMU_DYNAMIC_FOOTER_HEAD);
+        write_be_u64(&mut sector[512..], DYN_COOKIE_OFFSET, CXSPARSE_COOKIE);
+        sector[1536..2048].fill(0xff); // BAT: every block unallocated.
+        place_footer(&mut sector, 2048, &QEMU_DYNAMIC_FOOTER_HEAD);
+
+        assert_eq!(find_footer_offset(&sector), Some(2048));
+        let footer = VhdFooter::parse_last_sector(&sector).expect("footer parses");
+        assert_eq!(footer.current_size, QEMU_DYNAMIC_CURRENT_SIZE);
+    }
+
+    #[test]
+    fn footer_offset_dynamic_64g_4096_sector() {
+        // dyn64g.vhd is 133632 bytes; at a 4096-byte sector size the
+        // capacity is 33 and the final sector covers
+        // file[131072..135168]. Its footer copy is far outside that
+        // window: the sector opens with 2048 bytes of unallocated BAT
+        // and the footer sits at 2048. Row 3 of the survey table, where
+        // the pre-fix parse read `ffffffffffffffff`.
+        let mut sector = [0xffu8; 4096];
+        place_footer(&mut sector, 2048, &QEMU_DYN64G_FOOTER_HEAD);
+        sector[2560..].fill(0); // Zero padding past end-of-file.
+
+        assert!(
+            VhdFooter::parse(&sector).is_none(),
+            "fixture must reproduce the pre-fix failure at offset 0"
+        );
+        assert_eq!(find_footer_offset(&sector), Some(2048));
+        let footer = VhdFooter::parse_last_sector(&sector).expect("footer parses");
+        assert_eq!(footer.disk_type, DISK_TYPE_DYNAMIC);
+        assert_eq!(footer.current_size, QEMU_DYN64G_CURRENT_SIZE);
+    }
+
+    #[test]
+    fn footer_offset_fixed_512_sector() {
+        // fixed8m.vhd is 8391168 bytes; at a 512-byte sector size the
+        // capacity is 16389 and the final sector is the footer alone.
+        let mut sector = [0u8; 512];
+        place_footer(&mut sector, 0, &QEMU_FIXED_FOOTER_HEAD);
+
+        assert_eq!(find_footer_offset(&sector), Some(0));
+        let footer = VhdFooter::parse_last_sector(&sector).expect("footer parses");
+        assert_eq!(footer.disk_type, DISK_TYPE_FIXED);
+        assert_eq!(footer.current_size, QEMU_FIXED_CURRENT_SIZE);
+    }
+
+    #[test]
+    fn footer_offset_fixed_4096_sector() {
+        // fixed8m.vhd at a 4096-byte sector size: capacity 2049, final
+        // sector covers file[8388608..8392704], guest data runs to 2048,
+        // the footer sits at 2048, and 2560.. is padding past
+        // end-of-file. A fixed VHD has no footer copy at offset 0, so
+        // this is row 4 of the survey table — the case that fails before
+        // this change and passes after.
+        let mut sector = [0u8; 4096];
+        for (i, byte) in sector[..2048].iter_mut().enumerate() {
+            *byte = (i % 251) as u8; // Guest data, carrying no cookie.
+        }
+        place_footer(&mut sector, 2048, &QEMU_FIXED_FOOTER_HEAD);
+
+        assert!(
+            VhdFooter::parse(&sector).is_none(),
+            "fixture must reproduce the pre-fix failure at offset 0"
+        );
+        assert_eq!(find_footer_offset(&sector), Some(2048));
+        let footer = VhdFooter::parse_last_sector(&sector).expect("footer parses");
+        assert_eq!(footer.disk_type, DISK_TYPE_FIXED);
+        assert_eq!(footer.current_size, QEMU_FIXED_CURRENT_SIZE);
+    }
+
+    #[test]
+    fn footer_offset_prefers_the_last_cookie_in_the_sector() {
+        // A fixed VHD whose guest data happens to be another VHD: the
+        // embedded image's footer sits at a 512-aligned offset inside
+        // the final sector, ahead of the real one. Taking the first
+        // match would resolve the wrong image entirely.
+        let mut sector = [0u8; 4096];
+        place_footer(&mut sector, 0, &QEMU_DYNAMIC_FOOTER_HEAD);
+        place_footer(&mut sector, 1024, &QEMU_DYN64G_FOOTER_HEAD);
+        place_footer(&mut sector, 2048, &QEMU_FIXED_FOOTER_HEAD);
+
+        assert_eq!(find_footer_offset(&sector), Some(2048));
+        let footer = VhdFooter::parse_last_sector(&sector).expect("footer parses");
+        assert_eq!(footer.disk_type, DISK_TYPE_FIXED);
+        assert_eq!(footer.current_size, QEMU_FIXED_CURRENT_SIZE);
+    }
+
+    #[test]
+    fn footer_offset_at_the_end_of_the_sector() {
+        // A file whose length is a multiple of the sector size puts the
+        // footer in the sector's last 512 bytes.
+        let mut sector = [0u8; 4096];
+        place_footer(&mut sector, 3584, &QEMU_FIXED_FOOTER_HEAD);
+
+        assert_eq!(find_footer_offset(&sector), Some(3584));
+        assert!(VhdFooter::parse_last_sector(&sector).is_some());
+    }
+
+    #[test]
+    fn footer_offset_none_without_a_cookie() {
+        // Zero padding past end-of-file is not a cookie.
+        let sector = [0u8; 4096];
+        assert_eq!(find_footer_offset(&sector), None);
+        assert!(VhdFooter::parse_last_sector(&sector).is_none());
+
+        // Nor is a cookie at an offset no VHD footer can start at: a
+        // VHD's length is always a multiple of 512.
+        let mut misaligned = [0u8; 4096];
+        place_footer(&mut misaligned, 2050, &QEMU_FIXED_FOOTER_HEAD);
+        assert_eq!(find_footer_offset(&misaligned), None);
+        assert!(VhdFooter::parse_last_sector(&misaligned).is_none());
+    }
+
+    #[test]
+    fn footer_offset_needs_a_whole_512_byte_slot() {
+        // A buffer shorter than one footer holds no candidate at all.
+        let mut short = [0u8; 511];
+        short[..8].copy_from_slice(&VHD_COOKIE.to_be_bytes());
+        assert_eq!(find_footer_offset(&short), None);
+        assert!(VhdFooter::parse_last_sector(&short).is_none());
+
+        // The trailing partial slot of an odd-length buffer is not a
+        // candidate either; the footer before it still is.
+        let mut ragged = [0u8; 1000];
+        place_footer(&mut ragged, 0, &QEMU_FIXED_FOOTER_HEAD);
+        assert_eq!(find_footer_offset(&ragged), Some(0));
+    }
 
     // ====================================================================
     // VhdFooter::parse tests
