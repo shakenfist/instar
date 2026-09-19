@@ -65,6 +65,7 @@ fn build_starting_vhdx(virtual_size: u64, block_size: u32) -> Vec<u8> {
         virtual_size,
         block_size,
         backing: None,
+        parent_data_write_guid: [0u8; 16],
     };
     let mut scratch = vec![0u8; create::VHDX_MAX_METADATA_SCRATCH];
     let plan = plan_vhdx(&opts, &mut scratch).expect("create vhdx plan");

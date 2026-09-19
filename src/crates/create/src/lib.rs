@@ -327,8 +327,22 @@ pub struct VhdxCreateOpts<'a> {
     /// Block size in bytes. Must be a power of two in
     /// `1 MiB..=256 MiB`.
     pub block_size: u32,
-    /// Optional backing image to chain to.
+    /// Optional backing image to chain to. A backing reference makes
+    /// the image a differencing child: the File Parameters `HasParent`
+    /// bit is set and a parent locator metadata item is written.
     pub backing: Option<BackingRef<'a>>,
+    /// The parent's active-header `DataWriteGuid`, rendered into the
+    /// child's `parent_linkage` locator entry. Only read when `backing`
+    /// is `Some`.
+    ///
+    /// The planner cannot derive this — it is sixteen bytes of the
+    /// parent's own active header and the caller must have read them.
+    /// Follows [`VhdCreateOpts::parent_unique_id`], which carries the
+    /// same kind of parent-derived value into a planner for VHD. The
+    /// bytes are stored (and rendered) `bytes_le`, exactly as they sit
+    /// in the parent's header; see [`vhdx::render_guid_braced`]. An
+    /// all-zero GUID is written as given and not second-guessed.
+    pub parent_data_write_guid: [u8; 16],
 }
 
 /// Build a metadata plan for a qcow2 image.
@@ -513,6 +527,35 @@ fn map_vhd_build_error(e: vhd::VhdBuildError) -> CreateError {
         // unwrapped because `crates/create` is panic-free.
         vhd::VhdBuildError::LocatorSlotOutOfRange
         | vhd::VhdBuildError::LocatorLengthExceedsSpace => CreateError::Overflow,
+    }
+}
+
+/// Map a `crates/vhdx` parent-locator emitter error onto this crate's
+/// error type.
+fn map_vhdx_build_error(e: vhdx::VhdxBuildError) -> CreateError {
+    match e {
+        // A path that fits MAX_BACKING_FILE_LEN's 1024 bytes but not
+        // the 260 UTF-16 code units this crate's own VHDX parser will
+        // decode. Shares `ParentNameTooLong` with VHD rather than
+        // taking a thirteenth ABI code: "the backing path does not fit
+        // the target format's parent name field" is one condition with
+        // two limits, and the host message names both.
+        vhdx::VhdxBuildError::PathTooLong => CreateError::ParentNameTooLong,
+        // An empty backing path, and a key this emitter does not
+        // write. The key is unreachable from here — `plan_vhdx` picks
+        // one of the two the builder accepts — but both are bad
+        // options rather than bad sizes, and the host renders
+        // BackingFileUnsupported as "invalid option for target
+        // format", which is what an empty path is.
+        vhdx::VhdxBuildError::PathEmpty | vhdx::VhdxBuildError::UnknownKey => {
+            CreateError::BackingFileUnsupported
+        }
+        // The metadata region is always METADATA_REGION_LEN (1 MiB)
+        // and the largest locator item is 706 bytes, so this is a
+        // planner bug rather than a user input; report it as the
+        // scratch problem it would be. Mapped rather than unwrapped
+        // because `crates/create` is panic-free.
+        vhdx::VhdxBuildError::BufferTooSmall => CreateError::ScratchTooSmall,
     }
 }
 
@@ -1099,6 +1142,12 @@ pub fn plan_vhd<'a>(
 /// (state 0) for every BAT entry, and the log region is unused for a
 /// freshly-created clean image. minimum_file_size extends to the end
 /// of the metadata region.
+///
+/// With `opts.backing` set the image is a differencing child: the
+/// metadata region gains the File Parameters `HasParent` bit and a
+/// sixth metadata item, the parent locator. Neither changes the file
+/// layout — the locator lives inside the metadata region that was
+/// already there — so `minimum_file_size` is the same either way.
 pub fn plan_vhdx<'a>(
     opts: &VhdxCreateOpts<'_>,
     scratch: &'a mut [u8],
@@ -1113,10 +1162,28 @@ pub fn plan_vhdx<'a>(
     {
         return Err(CreateError::InvalidBlockSize);
     }
-    if opts.backing.is_some() {
-        // VHDX parent locators are deferred — too complex for phase 1.
-        return Err(CreateError::BackingFileUnsupported);
-    }
+    // The parent path, typed. Both the locator's path value and its
+    // `parent_linkage` sibling are UTF-16 fields, so a path that is not
+    // valid UTF-8 cannot be represented at all; refuse rather than
+    // transcode lossily, because a mangled path names a different file.
+    // This is the same reasoning, and the same pair of errors, as
+    // `plan_vhd`'s parent path above — including that
+    // BackingFileUnsupported ("invalid option for target format") is
+    // accurate for a path this target format cannot encode, where
+    // BackingFileTooLong would have named a specific wrong number.
+    //
+    // As for VHD, what keeps the non-UTF-8 arm unreachable from the CLI
+    // is that the VMM's backing argument is a `String`; only direct
+    // crate callers (the fuzzer) reach it.
+    let parent_path: Option<&str> = match &opts.backing {
+        Some(b) => {
+            if b.path.len() > MAX_BACKING_FILE_LEN {
+                return Err(CreateError::BackingFileTooLong);
+            }
+            Some(core::str::from_utf8(b.path).map_err(|_| CreateError::BackingFileUnsupported)?)
+        }
+        None => None,
+    };
 
     const LOGICAL_SECTOR_SIZE: u32 = 512;
     const PHYSICAL_SECTOR_SIZE: u32 = 4096;
@@ -1172,14 +1239,55 @@ pub fn plan_vhdx<'a>(
     );
 
     metadata_region.fill(0);
-    vhdx::build_metadata(
+    let metadata_items_end = vhdx::build_metadata(
         metadata_region,
         opts.block_size,
         opts.virtual_size,
         LOGICAL_SECTOR_SIZE,
         PHYSICAL_SECTOR_SIZE,
-        false,
+        // File Parameters `HasParent`. That single bit, plus the
+        // locator item appended below, is the whole of what makes this
+        // a differencing child on the metadata side.
+        parent_path.is_some(),
     );
+
+    if let Some(path) = parent_path {
+        // The parent locator item, appended where `build_metadata`
+        // says its own items end rather than at a constant, so adding
+        // a built-in item cannot silently put the two on top of each
+        // other. The 260-UTF-16-code-unit cap
+        // lives inside this builder and is not re-checked here — a
+        // second implementation of the same limit is a second chance
+        // to disagree with it.
+        //
+        // One path key, chosen from the path the user actually typed,
+        // exactly as the VHD emitter chooses between the `W2ku` and
+        // `W2ru` platform codes. A POSIX absolute path under a key
+        // named `absolute_win32_path` is deliberate and is the subject
+        // of #570: the alternatives are omitting the path key (which
+        // SPEC(VHDX) 2.6.2.6.3 forbids) or refusing absolute paths for
+        // vhdx alone.
+        let path_key: &[u8] = if path.as_bytes().first() == Some(&b'/') {
+            vhdx::KEY_ABSOLUTE_WIN32_PATH
+        } else {
+            vhdx::KEY_RELATIVE_PATH
+        };
+        vhdx::build_parent_locator(
+            metadata_region,
+            metadata_items_end as u32,
+            &opts.parent_data_write_guid,
+            path_key,
+            path,
+        )
+        .map_err(map_vhdx_build_error)?;
+    }
+
+    // The BAT region is deliberately untouched, differencing or not.
+    // It is a sparse zero hole, which is every payload entry
+    // PAYLOAD_BLOCK_NOT_PRESENT and every sector-bitmap entry
+    // SB_BLOCK_NOT_PRESENT — exactly what SPEC(VHDX) 2.5.1.1 says a
+    // differencing child with no blocks of its own should say, so
+    // there is nothing to add here rather than something forgotten.
 
     // Region table is identical at both offsets, so both writes
     // reference the same slice.
@@ -1795,6 +1903,7 @@ mod vhdx_plan_tests {
             virtual_size,
             block_size: 32 * 1024 * 1024,
             backing: None,
+            parent_data_write_guid: [0u8; 16],
         }
     }
 
@@ -1865,18 +1974,44 @@ mod vhdx_plan_tests {
         assert_eq!(rt1, rt2);
     }
 
+    /// `plan_vhdx` no longer refuses a backing reference: it emits a
+    /// differencing child. The refusal a user still sees has moved
+    /// into the create operation's `ImageFormat::Vhdx` arm, which
+    /// `crates/create`'s harness cannot reach: it lives in the guest
+    /// binary. `test_create_vhd_and_vhdx_reject_backing` in
+    /// `tests/test_create.py` is what covers it.
+    ///
+    /// What the emitted bytes actually contain is asserted in
+    /// `tests/round_trip.rs`, against this crate's own VHDX parser.
     #[test]
-    fn plan_vhdx_rejects_backing() {
-        let mut opts = default_opts(1 << 20);
-        opts.backing = Some(BackingRef {
+    fn plan_vhdx_accepts_backing() {
+        let plain = default_opts(1 << 20);
+        let mut differencing = default_opts(1 << 20);
+        differencing.backing = Some(BackingRef {
             path: b"parent.vhdx",
             format: Some(ImageFormat::Vhdx),
         });
+
         let mut scratch = vec![0u8; VHDX_MAX_METADATA_SCRATCH];
-        assert!(matches!(
-            plan_vhdx(&opts, &mut scratch),
-            Err(CreateError::BackingFileUnsupported)
-        ));
+        let plan = plan_vhdx(&differencing, &mut scratch).expect("differencing plan");
+        let (child_writes, child_min, child_meta) = (
+            plan.writes().len(),
+            plan.minimum_file_size,
+            plan.total_metadata_bytes,
+        );
+
+        let mut scratch = vec![0u8; VHDX_MAX_METADATA_SCRATCH];
+        let plan = plan_vhdx(&plain, &mut scratch).expect("plain plan");
+
+        // The locator lives inside the metadata region that was already
+        // there, so a differencing child is the same six writes, the
+        // same total, and the same file size as a plain image of the
+        // same geometry. Anything else means the emitter grew the file
+        // or added a region, which is what `minimum_file_size` would
+        // have to be re-derived for.
+        assert_eq!(child_writes, plan.writes().len(), "write count");
+        assert_eq!(child_min, plan.minimum_file_size, "minimum_file_size");
+        assert_eq!(child_meta, plan.total_metadata_bytes, "metadata bytes");
     }
 
     #[test]

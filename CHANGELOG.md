@@ -50,6 +50,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   get the parent's identity from until it can read the parent's own
   footer.
 
+- `create::plan_vhdx` can now emit a differencing VHDX — the File
+  Parameters `HasParent` bit, and a parent locator metadata item
+  carrying `parent_linkage` (the parent's `DataWriteGuid`) plus a
+  `relative_path` or `absolute_win32_path` entry
+  ([PLAN-differencing.md](docs/plans/PLAN-differencing.md)). This is
+  the crate-level emitter only, proven by instar's own VHDX parser
+  reading back what it writes. Nothing reachable from the CLI changes:
+  `instar create -f vhdx -b parent.vhdx child.vhdx` still fails with
+  "invalid option for target format", because the guest has nowhere to
+  get the parent's `DataWriteGuid` from until it can open the parent.
+
 ### Changed
 
 - **CI runs on Debian 13 runners.** Every job moved from the `debian-12`
