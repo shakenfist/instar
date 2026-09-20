@@ -223,14 +223,46 @@ Every check reached through the backing probe — the differencing
 refusal below, the parse check and format detection — now runs
 whenever `-b` is given, including when an explicit `SIZE` is also
 given. Previously `create -b <parent> child 64M` skipped all three
-checks because the probe only ran to infer a missing size (#579); a
-backing image in a format the probe cannot parse is now refused with
-an explicit size as well as without. The probe parses raw, qcow2,
-sparse VMDK, VHD (either subformat) and VHDX; everything else is
-refused, which includes vdi, qcow1, qed, iso, luks, parallels,
-bochs, cloop, the VMDK v3 header and — the one most likely to be met
-in practice — a **VMDK text descriptor**, as `monolithicFlat` and
-the other flat subformats produce.
+checks because the probe only ran to infer a missing size (#579).
+
+Running the probe always does **not** mean every backing image must
+be one the probe can size. It parses raw, qcow2, sparse VMDK, VHD
+(either subformat) and VHDX; for anything else — vdi, qcow1, qed,
+iso, luks, parallels, bochs, cloop, the VMDK v3 header, a VMDK text
+descriptor as `monolithicFlat` produces, or a block device that
+stats as zero-length — it reports the format it detected and no
+size. That is only fatal where a size is actually needed: omit
+`SIZE` and the create is refused, supply one and a qcow2 or vmdk
+child is written as before, since those record a parent by path and
+never ask it how big it is. A vpc or vhdx child is refused either
+way, by the parent-format check below, which says so in those
+terms.
+
+A differencing child **inherits its parent's virtual size**, and a
+`SIZE` that disagrees with the parent is refused with
+`ERROR_PARENT_SIZE_MISMATCH` rather than written. The child stores only
+the blocks that differ and reads every other block from the parent at
+the same offset, so a chain whose two images describe different disks
+cannot be composed. Omitting `SIZE` is the right way to ask for a
+differencing child. This bites most easily with a qemu-img-created
+parent: qemu-img rounds a VHD's virtual size up to CHS geometry and
+instar does not, so a parent qemu-img made as `64M` declares
+67,125,248 bytes and `-b parent.vhd ... 64M` is a mismatch.
+
+Two rules apply to the **parent path** a vpc or vhdx child records,
+both covered in full in the "VHD/VHDX differencing" section of
+[quirks.md](quirks.md):
+
+- A relative path containing a literal backslash is refused with
+  `ERROR_PARENT_PATH_NOT_REPRESENTABLE`. The locator holds a Windows
+  path, so instar writes `/` as `\` when filling it, and a backslash
+  already in the filename cannot be told apart from one instar
+  produced. An absolute path keeps its POSIX bytes and is not subject
+  to the rule.
+- A relative path caps two code units shorter than an absolute one,
+  because the `.\` prefix comes out of the same budget: 254 versus 255
+  for VHD, 258 versus 260 for VHDX. Over the cap is
+  `ERROR_PARENT_NAME_TOO_LONG`.
 
 A **differencing VHD or VHDX is refused as a backing file**:
 

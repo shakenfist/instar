@@ -553,9 +553,12 @@ fn map_vhdx_build_error(e: vhdx::VhdxBuildError) -> CreateError {
         // two limits, and the host message names both.
         vhdx::VhdxBuildError::PathTooLong => CreateError::ParentNameTooLong,
         // An empty backing path, and a key this emitter does not
-        // write. The key is unreachable from here — `plan_vhdx` picks
-        // one of the two the builder accepts — but both are bad
-        // options rather than bad sizes, and the host renders
+        // write. Both are unreachable from `plan_vhdx` — it picks one
+        // of the two keys the builder accepts, and an empty path is
+        // refused by `windows_relative_parent_path` before it can
+        // reach the builder as a bare `.\` prefix. Kept as defence in
+        // depth for callers that build a locator directly: both are
+        // bad options rather than bad sizes, and the host renders
         // BackingFileUnsupported as "invalid option for target
         // format", which is what an empty path is.
         vhdx::VhdxBuildError::PathEmpty | vhdx::VhdxBuildError::UnknownKey => {
@@ -643,6 +646,19 @@ fn windows_relative_parent_path<'b>(path: &str, buf: &'b mut [u8]) -> Result<&'b
     } else {
         bytes
     };
+    // A path with nothing left to name would come out as a bare `.\`,
+    // naming the containing directory rather than any file -- and
+    // because that is no longer empty,
+    // `vhdx::build_parent_locator`'s own `path_value.is_empty()` guard
+    // would not fire on it. Checked on `rest` rather than on the input
+    // so `./` is caught as well as `""`. VHD never had the hole:
+    // `build_dynamic_header_parent` sees the typed path before any
+    // normalisation and refuses it as `ParentNameEmpty`. Refused with
+    // the same `BackingFileUnsupported` that maps to, so both formats
+    // report an empty parent path identically.
+    if rest.is_empty() {
+        return Err(CreateError::BackingFileUnsupported);
+    }
 
     let prefix_len = WINDOWS_RELATIVE_PREFIX.len();
     let total = prefix_len
@@ -1578,6 +1594,21 @@ mod windows_relative_parent_path_tests {
     /// VHDX child has no second record of its parent's path to
     /// disambiguate with. The refusal is its own error, not
     /// `ParentNameTooLong`, because nothing here is too long.
+    /// An empty relative path renders as a bare prefix naming the
+    /// containing directory, which is why it is refused before the
+    /// rendering rather than by the locator builder's own empty check
+    /// -- by then it is no longer empty. Not reachable from the CLI,
+    /// where the host rejects `-b ""`, but `fuzz_create_emitters`
+    /// drives the planners directly.
+    #[test]
+    fn an_empty_path_is_refused_before_it_gains_a_prefix() {
+        assert_eq!(refuse(""), CreateError::BackingFileUnsupported);
+        // `./` is the same case: the check is on what is left after
+        // the prefix is consumed, not on the input.
+        assert_eq!(refuse("./"), CreateError::BackingFileUnsupported);
+        assert_eq!(render("./x"), r".\x");
+    }
+
     #[test]
     fn a_literal_backslash_is_refused_not_rendered() {
         assert_eq!(

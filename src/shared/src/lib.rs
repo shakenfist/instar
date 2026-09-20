@@ -3548,6 +3548,13 @@ impl CreateResult {
     /// locator. Refused rather than written, because a VHDX child has
     /// no other record of its parent's path.
     pub const ERROR_PARENT_PATH_NOT_REPRESENTABLE: u32 = 14;
+    /// A differencing child was given an explicit size that is not its
+    /// parent's. The two describe the same disk -- every block the
+    /// child marks absent is read from the parent at the same offset
+    /// -- so a child of a different size is a chain no implementation
+    /// can compose. Distinguished from ERROR_BACKING_SIZE_TOO_LARGE,
+    /// which is about a size the *target format* cannot address.
+    pub const ERROR_PARENT_SIZE_MISMATCH: u32 = 15;
 
     /// True if magic matches.
     pub fn is_valid(&self) -> bool {

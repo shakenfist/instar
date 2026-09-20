@@ -632,6 +632,177 @@ class TestCreateSmoke(InstarTestBase):
                         child.exists(),
                         f'{fmt} mismatch was refused but still wrote {child}')
 
+    def test_create_honours_an_explicit_raw_backing_hint(self):
+        """`-F raw` stops the probe second-guessing the user.
+
+        A fixed VHD has no `conectix` at offset 0, so header detection
+        calls it raw and the footer fallback reclassifies it as VHD.
+        That is what makes a fixed parent usable for a differencing
+        child -- but it must not override a user who said `-F raw`,
+        because the hint is also what the child records as its backing
+        format. Sizing the parent from a VHD footer while writing
+        `raw` into the child's metadata would have the two disagree by
+        the footer's 512 bytes.
+
+        The two readings of the same file differ, which is what makes
+        this test able to fail: the VHD reading is the footer's
+        `current_size`, the raw reading is the whole file.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            dynamic = self._copy_diff_parent('vhd-diff-parent.vhd', td)
+            parent = _fixed_vhd_from(dynamic, Path(td) / 'fixed.vhd')
+            dynamic.unlink()
+            current_size = struct.unpack_from(
+                '>Q', parent.read_bytes()[-_VHD_FOOTER_SIZE:], 48)[0]
+            file_len = parent.stat().st_size
+            self.assertEqual(
+                file_len, current_size + _VHD_FOOTER_SIZE,
+                'the two readings must differ or this test cannot fail')
+
+            def child_size(hint, name):
+                child = Path(td) / name
+                _, stderr, rc = self.run_instar_create(
+                    '-f', 'qcow2', '-b', parent.name, '-F', hint,
+                    str(child), cwd=td)
+                self.assertEqual(rc, 0, f'-F {hint} was refused: {stderr}')
+                stdout, stderr, rc = self.run_instar_info(
+                    child, output='json')
+                self.assertEqual(rc, 0, stderr)
+                return json.loads(stdout)['virtual-size']
+
+            self.assertEqual(
+                child_size('vpc', 'as-vpc.qcow2'), current_size,
+                'a vpc-hinted parent was not sized from its footer')
+            self.assertGreaterEqual(
+                child_size('raw', 'as-raw.qcow2'), file_len,
+                'a raw-hinted parent was sized from its VHD footer, so the '
+                'child records a backing format the probe disagreed with')
+
+    def test_create_differencing_refuses_a_size_that_is_not_the_parents(self):
+        """A differencing child inherits its parent's size, or is refused.
+
+        The child stores only the blocks that differ and reads every
+        other block from the parent at the same offset, so a chain
+        whose two images describe different disks cannot be composed.
+
+        The case that bites is not a deliberate mismatch: qemu-img
+        rounds a VHD's virtual size up to CHS geometry and instar does
+        not, so a parent qemu-img created as 64M declares 67,125,248
+        bytes and `-b parent.vhd ... 64M` disagrees with it by 16,384.
+        """
+        for fmt, fixture in (('vpc', 'vhd-diff-parent.vhd'),
+                             ('vhdx', 'vhdx-diff-parent.vhdx')):
+            with self.subTest(format=fmt):
+                with tempfile.TemporaryDirectory() as td:
+                    parent = self._copy_diff_parent(fixture, td)
+                    if fmt == 'vpc':
+                        parent_size, _ = None, None
+                        parent_size = struct.unpack_from(
+                            '>Q', parent.read_bytes()[-_VHD_FOOTER_SIZE:], 48)[0]
+                    else:
+                        stdout, _, rc = self.run_instar_info(
+                            parent, output='json')
+                        self.assertEqual(rc, 0)
+                        parent_size = json.loads(stdout)['virtual-size']
+
+                    # A size that is not the parent's is refused...
+                    child = Path(td) / f'wrong.{fmt}'
+                    _, stderr, rc = self.run_instar_create(
+                        '-f', fmt, '-b', parent.name, '-F', fmt,
+                        str(child), str(parent_size + 1024 * 1024), cwd=td)
+                    self.assertNotEqual(
+                        rc, 0,
+                        f'{fmt} accepted a size that is not the parent\'s')
+                    self.assertIn('same virtual size as its', stderr)
+                    self.assertFalse(child.exists())
+
+                    # ...the parent's own size is accepted...
+                    exact = Path(td) / f'exact.{fmt}'
+                    _, stderr, rc = self.run_instar_create(
+                        '-f', fmt, '-b', parent.name, '-F', fmt,
+                        str(exact), str(parent_size), cwd=td)
+                    self.assertEqual(
+                        rc, 0,
+                        f'{fmt} refused the parent\'s own size: {stderr}')
+
+                    # ...and omitting it inherits.
+                    inherited = Path(td) / f'inherit.{fmt}'
+                    _, stderr, rc = self.run_instar_create(
+                        '-f', fmt, '-b', parent.name, '-F', fmt,
+                        str(inherited), cwd=td)
+                    self.assertEqual(rc, 0, stderr)
+                    stdout, _, rc = self.run_instar_info(
+                        inherited, output='json')
+                    self.assertEqual(rc, 0)
+                    self.assertEqual(
+                        json.loads(stdout)['virtual-size'], parent_size,
+                        f'{fmt} child did not inherit the parent size')
+
+    def test_create_accepts_a_backing_image_it_cannot_size(self):
+        """An unsizeable parent is only fatal where a size is needed.
+
+        The backing probe runs whenever `-b` is given (#579), but what
+        it could not determine is not automatically an error: qcow2 and
+        vmdk record a parent by path and never ask how big it is. These
+        all worked on develop with an explicit size, and under qemu-img,
+        so refusing them would be a regression rather than a new check.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            parents = {}
+            for name, args in (
+                    ('flat.vmdk', ('-f', 'vmdk', '-o',
+                                   'subformat=monolithicFlat')),
+                    ('disk.vdi', ('-f', 'vdi',)),
+                    ('disk.qed', ('-f', 'qed',))):
+                path = Path(td) / name
+                r = subprocess.run(
+                    ['qemu-img', 'create', *args, str(path), '8M'],
+                    capture_output=True, text=True)
+                if r.returncode == 0 and path.exists():
+                    parents[name] = path
+            if not parents:
+                self.skipTest('qemu-img created none of the parent formats')
+
+            for name, parent in parents.items():
+                with self.subTest(parent=name):
+                    child = Path(td) / f'child-{name}.qcow2'
+                    _, stderr, rc = self.run_instar_create(
+                        '-f', 'qcow2', '-b', str(parent), '-u',
+                        str(child), '8M')
+                    self.assertEqual(
+                        rc, 0,
+                        f'a qcow2 child of {name} with an explicit size was '
+                        f'refused: {stderr}')
+                    self.assertTrue(child.exists())
+
+                    # Without a size there is nothing to infer, so this
+                    # one is refused -- and that is the only reason.
+                    nosize = Path(td) / f'nosize-{name}.qcow2'
+                    _, stderr, rc = self.run_instar_create(
+                        '-f', 'qcow2', '-b', str(parent), '-u', str(nosize))
+                    self.assertNotEqual(
+                        rc, 0,
+                        f'{name} yielded a size it cannot have')
+
+    def test_create_vpc_fixed_subformat_still_refuses_backing(self):
+        """A differencing child is necessarily dynamic.
+
+        Only a dynamic VHD has the header and BAT a parent reference
+        lives in. Documented in docs/create.md; this pins it now that
+        `-b` is accepted for vpc at all, and that `vhd_opts_from` runs
+        before `plan_vhd`'s Fixed arm can reach it.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            parent = self._copy_diff_parent('vhd-diff-parent.vhd', td)
+            child = Path(td) / 'child.vhd'
+            _, stderr, rc = self.run_instar_create(
+                '-f', 'vpc', '-o', 'subformat=fixed', '-b', parent.name,
+                '-F', 'vpc', str(child), cwd=td)
+            self.assertNotEqual(
+                rc, 0, 'a fixed VHD was created with a backing file')
+            self.assertIn('invalid option', stderr)
+            self.assertFalse(child.exists())
+
     def test_create_backing_checks_run_with_explicit_size(self):
         """An explicit SIZE does not skip the checks on the parent.
 

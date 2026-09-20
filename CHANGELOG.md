@@ -100,6 +100,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   parent's path to disambiguate with. See the "VHD/VHDX differencing"
   section of [docs/quirks.md](docs/quirks.md).
 
+  A differencing child **inherits its parent's virtual size**, and an
+  explicit `SIZE` that disagrees with the parent is refused with a
+  typed `ERROR_PARENT_SIZE_MISMATCH`. The child stores only the
+  blocks that differ and reads every other block from the parent at
+  the same offset, so a chain whose two images describe different
+  disks cannot be composed. The case that bites is not a deliberate
+  mismatch: qemu-img rounds a VHD's virtual size up to CHS geometry
+  and instar does not, so a parent qemu-img created as `64M` declares
+  67,125,248 bytes, and `create -f vpc -b parent.vhd -F vpc child.vhd
+  64M` — the most natural way to type it — would otherwise have
+  emitted a child declaring 67,108,864 against it.
+
   Either VHD subformat is accepted as the **parent**, fixed included:
   the parent probe reads the trailing footer rather than trusting the
   first sector, which is the only place a fixed VHD's `conectix`
@@ -411,16 +423,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   detection alike — the same command without the trailing size was
   correctly refused
   ([#579](https://github.com/shakenfist/instar/issues/579)). It now
-  runs whenever `-b` is given, size or no. One consequence reaches
-  beyond differencing: a backing image in a format the probe cannot
-  parse is now refused with an explicit size as well as without,
-  where `develop` accepted it. The probe parses raw, qcow2, sparse
-  VMDK, VHD (either subformat) and VHDX; everything else is refused,
-  which includes vdi, qcow1, qed, iso, luks, parallels, bochs, cloop,
-  the VMDK v3 header and — the one most likely to be met in practice
-  — a **VMDK text descriptor**, as `monolithicFlat` and the other
-  flat subformats produce. So `create -f qcow2 -b flat.vmdk -F vmdk
-  child.qcow2 64M` succeeded on `develop` and is refused now.
+  runs whenever `-b` is given, size or no.
+
+  Running the probe always does not mean every backing image must be
+  one it can size. It parses raw, qcow2, sparse VMDK, VHD (either
+  subformat) and VHDX; for anything else — vdi, qcow1, qed, iso,
+  luks, parallels, bochs, cloop, the VMDK v3 header, a VMDK text
+  descriptor as `monolithicFlat` produces, or a block device that
+  stats as zero-length — it reports the detected format and no size,
+  which is fatal only where a size is actually needed. So `create -f
+  qcow2 -b flat.vmdk -F vmdk child.qcow2 64M` still works, as it does
+  on `develop` and under qemu-img, while the same command without the
+  trailing size is refused for having no size to infer.
 
 ## [0.3.0] - 2026-08-02
 

@@ -152,11 +152,30 @@ enum ParentIdentity {
 /// The probe reads those headers once and reports everything derived
 /// from them together, rather than having each caller re-read the same
 /// sectors and re-derive where a footer lives.
+///
+/// Every field is *what the probe could determine*, never *what the
+/// caller needs*. That split matters because the probe now runs
+/// whenever `-b` is given (#579) rather than only when a size has to
+/// be inferred: a backing image it cannot size is not by itself an
+/// error, since the user may have supplied the size and the target may
+/// record its parent by path alone. Each consumer states its own
+/// requirement instead — the size resolution refuses a `None` only
+/// when it has to infer, and the parent-format check refuses a format
+/// that is not the one a differencing child needs. Failing as a unit
+/// here is what made `create -f qcow2 -b flat.vmdk -F vmdk child 64M`,
+/// which `develop` and qemu-img both accept, report the parent as
+/// truncated or corrupt.
 struct BackingProbe {
-    /// The parent's virtual size, for a child that inherits it.
-    virtual_size: u64,
+    /// The parent's virtual size, for a child that inherits it, or
+    /// `None` when the probe could not derive one — an unparseable
+    /// format, an unreadable header, or a device whose capacity is
+    /// zero. Only the size-inference path treats that as fatal.
+    virtual_size: Option<u64>,
     /// The format detected in the parent's own header — not the
     /// `-F` hint, which is only populated when the user passes one.
+    /// [`ImageFormat::Raw`] is `detect_format_from_header`'s catch-all
+    /// as well as a real answer, and [`ImageFormat::Unknown`] means
+    /// the header could not be read at all.
     format: ImageFormat,
     /// The parent's identity, if its format records one.
     identity: ParentIdentity,
@@ -190,17 +209,38 @@ struct BackingProbe {
 /// to do before that rejection moved out to the read entry points; the VHD
 /// arm never had such a guard and gains one here so the two formats agree.
 ///
+/// The only `Err` this returns is that differencing refusal. Anything
+/// else the probe cannot work out is reported as an absent field, for
+/// the caller that needs it to refuse: see [`BackingProbe`].
+///
 /// # Safety
 ///
-/// `call_table` must be valid and input device 0 must be attached
-/// with non-zero capacity.
-unsafe fn probe_backing(call_table: &CallTable, sector_size: usize) -> Result<BackingProbe, u32> {
-    const PARSE_FAILED: u32 = CreateResult::ERROR_BACKING_PARSE_FAILED;
+/// `call_table` must be valid and input device 0 must be attached.
+/// A zero capacity is tolerated — block and character devices stat as
+/// zero-length, so the host attaches them with no capacity, and such a
+/// parent yields a probe with no size rather than a failure.
+unsafe fn probe_backing(
+    call_table: &CallTable,
+    sector_size: usize,
+    hint: ImageFormat,
+) -> Result<BackingProbe, u32> {
     const DIFFERENCING: u32 = CreateResult::ERROR_BACKING_DIFFERENCING;
+
+    /// A parent whose format is known but whose size and identity are
+    /// not: the header named a format whose deeper structures could
+    /// not be read, or there is no parser for it. `Unknown` is the
+    /// case where even the header could not be read.
+    const fn unsized_probe(format: ImageFormat) -> BackingProbe {
+        BackingProbe {
+            virtual_size: None,
+            format,
+            identity: ParentIdentity::None,
+        }
+    }
 
     let header_ptr = HEADER_BUF as *mut u8;
     if !(call_table.read_input_sector)(0, 0, header_ptr, sector_size) {
-        return Err(PARSE_FAILED);
+        return Ok(unsized_probe(ImageFormat::Unknown));
     }
     let header = core::slice::from_raw_parts(header_ptr, sector_size);
     let mut format = detect_format_from_header(header, sector_size, false);
@@ -226,8 +266,25 @@ unsafe fn probe_backing(call_table: &CallTable, sector_size: usize) -> Result<Ba
     // paths). A failed read or a footerless file simply leaves
     // `format` alone: a raw parent stays raw, and a parent whose
     // header claimed VHD still fails below on the `None`.
+    //
+    // An explicit `-F raw` suppresses the fallback. The hint is the
+    // user asserting what the file is, and it is also what the child
+    // records as its backing format -- so sizing the parent from a VHD
+    // footer while writing `raw` into the child would have the two
+    // disagree by the footer's 512 bytes. `detect_format_from_header`
+    // returns `Raw` as its catch-all as well as its real answer, so
+    // without this the fallback would also second-guess the hint on
+    // every file it does not recognise.
+    let fallback_applies = match format {
+        // The header said VHD, so the footer is where the fields are.
+        ImageFormat::Vhd => true,
+        // The header said nothing, which a fixed VHD's does not --
+        // unless the user asserted raw, in which case they win.
+        ImageFormat::Raw => !matches!(hint, ImageFormat::Raw),
+        _ => false,
+    };
     let mut vhd_footer = None;
-    if matches!(format, ImageFormat::Raw | ImageFormat::Vhd)
+    if fallback_applies
         && capacity > 0
         && (call_table.read_input_sector)(0, capacity - 1, header_ptr, sector_size)
     {
@@ -240,33 +297,34 @@ unsafe fn probe_backing(call_table: &CallTable, sector_size: usize) -> Result<Ba
 
     let (virtual_size, identity) = match format {
         ImageFormat::Raw => (
+            // Zero capacity is a block or character device, which
+            // stats as zero-length: no size, rather than a size of
+            // zero. Overflow is likewise "no size we can state".
             capacity
                 .checked_mul(sector_size as u64)
-                .ok_or(PARSE_FAILED)?,
+                .filter(|size| *size > 0),
             ParentIdentity::None,
         ),
         ImageFormat::Qcow2 => (
-            qcow2::QcowHeader::parse(header)
-                .map(|h| h.virtual_size)
-                .ok_or(PARSE_FAILED)?,
+            qcow2::QcowHeader::parse(header).map(|h| h.virtual_size),
             ParentIdentity::None,
         ),
         ImageFormat::Vmdk4 => (
-            vmdk::Vmdk4Header::parse(header)
-                .map(|h| h.virtual_size)
-                .ok_or(PARSE_FAILED)?,
+            vmdk::Vmdk4Header::parse(header).map(|h| h.virtual_size),
             ParentIdentity::None,
         ),
         ImageFormat::Vhd => {
             // Located above, by header detection or by the footer
             // fallback. `None` here means the header claimed VHD and
-            // the footer did not agree, which is a parse failure.
-            let footer = vhd_footer.ok_or(PARSE_FAILED)?;
+            // the footer did not agree.
+            let Some(footer) = vhd_footer else {
+                return Ok(unsized_probe(format));
+            };
             if footer.disk_type == vhd::DISK_TYPE_DIFFERENCING {
                 return Err(DIFFERENCING);
             }
             (
-                footer.current_size,
+                Some(footer.current_size),
                 ParentIdentity::Vhd {
                     uuid: footer.uuid,
                     timestamp: footer.timestamp,
@@ -274,20 +332,24 @@ unsafe fn probe_backing(call_table: &CallTable, sector_size: usize) -> Result<Ba
             )
         }
         ImageFormat::Vhdx => {
-            if capacity == 0 {
-                return Err(PARSE_FAILED);
-            }
-            let mut bytes_read: u64 = 0;
-            let state = vhdx::VhdxState::init(
-                call_table,
-                0,
-                sector_size,
-                capacity,
-                VHDX_CACHE_A as *mut u8,
-                VHDX_CACHE_B as *mut u8,
-                &mut bytes_read,
-            )
-            .ok_or(PARSE_FAILED)?;
+            let state = if capacity == 0 {
+                None
+            } else {
+                let mut bytes_read: u64 = 0;
+                vhdx::VhdxState::init(
+                    call_table,
+                    0,
+                    sector_size,
+                    capacity,
+                    VHDX_CACHE_A as *mut u8,
+                    VHDX_CACHE_B as *mut u8,
+                    &mut bytes_read,
+                )
+                .map(|state| (state, bytes_read))
+            };
+            let Some((state, mut bytes_read)) = state else {
+                return Ok(unsized_probe(format));
+            };
             if state.has_parent {
                 return Err(DIFFERENCING);
             }
@@ -297,23 +359,31 @@ unsafe fn probe_backing(call_table: &CallTable, sector_size: usize) -> Result<Ba
             // the rule `init` itself calls, so the two cannot disagree
             // about which header is active. The reads cannot fail here
             // in practice: `init` just made them successfully.
-            let active = vhdx::VhdxState::read_active_header(
+            let Some(active) = vhdx::VhdxState::read_active_header(
                 call_table,
                 0,
                 sector_size,
                 capacity,
                 &mut bytes_read,
-            )
-            .ok_or(PARSE_FAILED)?;
+            ) else {
+                return Ok(unsized_probe(format));
+            };
             (
-                state.virtual_disk_size,
+                Some(state.virtual_disk_size),
                 ParentIdentity::Vhdx {
                     data_write_guid: active.data_write_guid,
                 },
             )
         }
-        // Vdi / Qcow1 / Qed / Iso / Luks: unsupported as backing.
-        _ => return Err(PARSE_FAILED),
+        // Vdi / Qcow1 / Qed / Iso / Luks / Parallels / Bochs / cloop /
+        // Vmdk3 / a VMDK text descriptor: formats the probe has no
+        // parser for. Detected, and reported with no size — refusing
+        // here would refuse every one of them as a *qcow2* or *vmdk*
+        // parent, which `develop` and qemu-img both allow, since those
+        // targets record a parent by path and never ask for its size.
+        // A vpc or vhdx child still gets a refusal, from the
+        // parent-format check, with a code that names the real reason.
+        _ => (None, ParentIdentity::None),
     };
     Ok(BackingProbe {
         virtual_size,
@@ -719,7 +789,11 @@ pub unsafe extern "C" fn _start() -> u64 {
     // the differencing planners regardless of how the size was
     // resolved. See docs/plans/PLAN-differencing.md.
     let probe = if config.has_backing() {
-        match probe_backing(call_table, config.sector_size as usize) {
+        match probe_backing(
+            call_table,
+            config.sector_size as usize,
+            ImageFormat::from_u32(config.backing_format),
+        ) {
             Ok(probe) => Some(probe),
             Err(code) => {
                 send_result(call_table, config.target_format, 0, 0, 0, 0, code);
@@ -736,14 +810,17 @@ pub unsafe extern "C" fn _start() -> u64 {
     let virtual_size: u64 = if config.virtual_size != 0 {
         config.virtual_size
     } else if let Some(probe) = probe.as_ref() {
-        if probe.virtual_size > 0 {
-            probe.virtual_size
+        if let Some(size) = probe.virtual_size.filter(|size| *size > 0) {
+            size
         } else {
-            // A zero virtual size is as unusable as a failed parse, and
-            // carries no more specific reason than that. Only checked
-            // on the inferred path: an explicit size does not depend on
-            // the probed one, so a parent that reports zero must not
-            // newly fail a create that never asked it for a size.
+            // No size, or a zero one, is as unusable as a failed
+            // parse when the size has to come from here, and carries
+            // no more specific reason than that. This is the *only*
+            // place a missing size is fatal: an explicit size does not
+            // depend on the probed one, so a parent the probe could
+            // not size must not newly fail a create that never asked
+            // it for a size (which is what it did until this check
+            // moved here from the probe).
             send_result(
                 call_table,
                 config.target_format,
@@ -838,6 +915,22 @@ pub unsafe extern "C" fn _start() -> u64 {
     // bytes. qcow2 and vmdk accept mixed-format parents and are
     // untouched. See docs/plans/PLAN-differencing.md.
     if let Some(probe) = probe.as_ref() {
+        // An unreadable header is reported as `Unknown`, which the
+        // format check below would refuse as a *mismatch* -- a wrong
+        // diagnosis for a parent that might well be the right format
+        // if it could be read. A vpc or vhdx child is the only case
+        // that must read the parent (it needs the identity), so it is
+        // the only one that turns this into a failure; qcow2 and vmdk
+        // record a parent by path and are unaffected.
+        if matches!(target, ImageFormat::Vhd | ImageFormat::Vhdx)
+            && matches!(probe.format, ImageFormat::Unknown)
+        {
+            return fail_with(
+                call_table,
+                config.target_format,
+                CreateResult::ERROR_BACKING_PARSE_FAILED,
+            );
+        }
         if !parent_format_matches(
             target,
             probe.format,
@@ -847,6 +940,34 @@ pub unsafe extern "C" fn _start() -> u64 {
                 call_table,
                 config.target_format,
                 CreateResult::ERROR_PARENT_FORMAT_MISMATCH,
+            );
+        }
+
+        // A differencing child and its parent describe the *same*
+        // disk: the child stores only the blocks that differ, and
+        // every block it marks absent is read from the parent at the
+        // same offset. A child declaring a different size is a chain
+        // no implementation can compose, so an explicit SIZE that
+        // disagrees with the parent is refused rather than written.
+        //
+        // This is not a hypothetical mismatch. instar writes
+        // `current_size` verbatim while qemu-img rounds a VHD's size
+        // up to CHS geometry, so a qemu-written "64M" parent declares
+        // 67,125,248 -- and `create -f vpc -b parent.vhd -F vpc
+        // child.vhd 64M`, the most natural way to type it, emitted a
+        // child declaring 67,108,864 against it. No size at all is
+        // the right way to ask for a differencing child; it inherits
+        // the parent's, whatever that turns out to be.
+        if matches!(target, ImageFormat::Vhd | ImageFormat::Vhdx)
+            && config.virtual_size != 0
+            && probe
+                .virtual_size
+                .is_some_and(|parent| parent != config.virtual_size)
+        {
+            return fail_with(
+                call_table,
+                config.target_format,
+                CreateResult::ERROR_PARENT_SIZE_MISMATCH,
             );
         }
     }

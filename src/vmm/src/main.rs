@@ -243,6 +243,7 @@ const CREATE_RESULT_ERROR_BACKING_DIFFERENCING: u32 = 11;
 const CREATE_RESULT_ERROR_PARENT_NAME_TOO_LONG: u32 = 12;
 const CREATE_RESULT_ERROR_PARENT_FORMAT_MISMATCH: u32 = 13;
 const CREATE_RESULT_ERROR_PARENT_PATH_NOT_REPRESENTABLE: u32 = 14;
+const CREATE_RESULT_ERROR_PARENT_SIZE_MISMATCH: u32 = 15;
 
 // ResizeConfig constants (must match shared crate)
 const RESIZE_CONFIG_MAGIC: u32 = 0x52455349; // "RESI"
@@ -17579,6 +17580,13 @@ fn create_error_detail(code: u32) -> &'static str {
              and a backslash already in the name would be read back as \
              a directory separator; rename the file or pass an \
              absolute path"
+        }
+        CREATE_RESULT_ERROR_PARENT_SIZE_MISMATCH => {
+            "a differencing child must be the same virtual size as its \
+             parent, and the SIZE given is not; omit SIZE and the child \
+             inherits the parent's size. (qemu-img rounds a VHD's size \
+             up to CHS geometry while instar does not, so a parent \
+             qemu-img created as 64M may not declare exactly 64M.)"
         }
         _ => "unknown error",
     }
