@@ -235,8 +235,28 @@ size. That is only fatal where a size is actually needed: omit
 `SIZE` and the create is refused, supply one and a qcow2 or vmdk
 child is written as before, since those record a parent by path and
 never ask it how big it is. A vpc or vhdx child is refused either
-way, by the parent-format check below, which says so in those
-terms.
+way — but with a diagnosis that distinguishes the two cases: a parent
+of the wrong format is `ERROR_PARENT_FORMAT_MISMATCH`, while a parent
+of the *right* format whose deeper structures will not parse (a VHD
+missing its trailing footer, a VHDX with an unreadable region table)
+is `ERROR_BACKING_PARSE_FAILED`, since telling the user their VHD is
+not a VHD would be both false and unactionable.
+
+`-u` is not a synonym for `-F raw` here. A fixed-subformat VHD keeps
+no copy of its footer at offset 0, so header detection alone calls one
+`raw`; instar falls back to reading the file's last sector for a VHD
+footer, as `info`, `check` and `resize` all do, and sizes the parent
+from `current_size` if it finds one. Only a literal `-F raw`
+suppresses that fallback, because that is the user asserting the file
+*is* raw — and it is also what the child records as its backing
+format, so sizing from a footer while writing `raw` would have the two
+disagree by the footer's 512 bytes. `-u` asserts nothing about the
+format (it only says "do not fail if the backing file is
+inaccessible"), so the fallback still applies: `create -f qcow2 -b
+fixed.vhd -u child.qcow2` sizes the parent from its VHD footer, while
+`-F raw` on the same file sizes it from the file length. `-u` also
+lets a fixed VHD be accepted as a vpc differencing parent without the
+user naming a format.
 
 A differencing child **inherits its parent's virtual size**, and a
 `SIZE` that disagrees with the parent is refused with

@@ -1503,8 +1503,214 @@ pub fn plan_vhdx<'a>(
     Ok(plan)
 }
 
+/// Does a differencing child of `target` accept a parent the probe
+/// detected as `detected`?
+///
+/// A differencing child must be the same format as its parent: Hyper-V
+/// writes and resolves VHD parents for VHD children and VHDX parents
+/// for VHDX children, and neither child format has a way to say "my
+/// parent is some other format". Detection decides, not the `-F` hint,
+/// because the hint is only populated when the user passes one — and
+/// when the user did pass one that the parent's bytes disprove, refuse
+/// rather than silently prefer the bytes. `hint` is
+/// [`ImageFormat::Unknown`] when `-F` was not passed, which is
+/// reachable from the CLI via `-u`.
+///
+/// Every other target is unconstrained: qcow2 and vmdk accept
+/// mixed-format parents and this does not change that.
+#[must_use]
+pub fn parent_format_matches(
+    target: ImageFormat,
+    detected: ImageFormat,
+    hint: ImageFormat,
+) -> bool {
+    let required = match target {
+        ImageFormat::Vhd => ImageFormat::Vhd,
+        ImageFormat::Vhdx => ImageFormat::Vhdx,
+        _ => return true,
+    };
+    if detected != required {
+        return false;
+    }
+    matches!(hint, ImageFormat::Unknown) || hint == detected
+}
+
+/// Should a backing file the header detected as `detected` be re-read
+/// at its last sector, looking for a VHD footer?
+///
+/// A VHD's footer is the last 512 bytes of the *file*, and a
+/// fixed-subformat VHD keeps no copy of it at offset 0, so header
+/// detection calls a fixed parent [`ImageFormat::Raw`]. Every other
+/// read path falls back to the footer before believing that — `info`,
+/// `check` and `resize` all do — so `create` has to agree, or it
+/// refuses as a non-VHD a parent `instar info` reports as `vpc`, and
+/// one instar itself writes with `-o subformat=fixed`.
+///
+/// An explicit `-F raw` suppresses the fallback. The hint is the user
+/// asserting what the file is, and it is also what the child records as
+/// its backing format — so sizing the parent from a VHD footer while
+/// writing `raw` into the child would have the two disagree by the
+/// footer's 512 bytes. Detection returns `Raw` as its catch-all as well
+/// as its real answer, so without this the fallback would second-guess
+/// the hint on every file it does not recognise.
+///
+/// Note that `-u` alone is *not* `-F raw`: it leaves the hint
+/// [`ImageFormat::Unknown`], so the fallback still applies. See
+/// `docs/create.md`.
+#[must_use]
+pub fn footer_fallback_applies(detected: ImageFormat, hint: ImageFormat) -> bool {
+    match detected {
+        // The header said VHD, so the footer is where the fields are.
+        ImageFormat::Vhd => true,
+        // The header said nothing, which a fixed VHD's does not —
+        // unless the user asserted raw, in which case they win.
+        ImageFormat::Raw => !matches!(hint, ImageFormat::Raw),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 extern crate std;
+
+/// The differencing parent-acceptance truth table.
+///
+/// These two predicates decide, for every `create -b`, whether a parent
+/// is refused and whether its bytes are re-read. They live here rather
+/// than in the operation binary because `src/operations/create` is
+/// excluded from `cargo test --workspace` (see the `--exclude create-op`
+/// line in the Makefile), so a unit test written beside them there would
+/// never run. Proving the table costs no VM round trip.
+#[cfg(test)]
+mod parent_acceptance_tests {
+    use super::*;
+
+    const EVERY_FORMAT: [ImageFormat; 6] = [
+        ImageFormat::Raw,
+        ImageFormat::Qcow2,
+        ImageFormat::Vmdk4,
+        ImageFormat::Vhd,
+        ImageFormat::Vhdx,
+        ImageFormat::Unknown,
+    ];
+
+    #[test]
+    fn a_vpc_child_takes_a_vhd_parent_and_nothing_else() {
+        for detected in EVERY_FORMAT {
+            let accepted = parent_format_matches(ImageFormat::Vhd, detected, ImageFormat::Unknown);
+            assert_eq!(
+                accepted,
+                detected == ImageFormat::Vhd,
+                "detected {detected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_vhdx_child_takes_a_vhdx_parent_and_nothing_else() {
+        for detected in EVERY_FORMAT {
+            let accepted = parent_format_matches(ImageFormat::Vhdx, detected, ImageFormat::Unknown);
+            assert_eq!(
+                accepted,
+                detected == ImageFormat::Vhdx,
+                "detected {detected:?}"
+            );
+        }
+    }
+
+    /// qcow2 and vmdk record a parent by path and never resolve it by
+    /// format, so every combination is accepted — including the ones
+    /// the vpc and vhdx rows above refuse.
+    #[test]
+    fn every_other_target_accepts_every_parent() {
+        for target in [ImageFormat::Qcow2, ImageFormat::Vmdk4, ImageFormat::Raw] {
+            for detected in EVERY_FORMAT {
+                for hint in EVERY_FORMAT {
+                    assert!(
+                        parent_format_matches(target, detected, hint),
+                        "{target:?} refused {detected:?} with hint {hint:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// An absent `-F` is not an assertion, so it cannot contradict the
+    /// bytes; a present one that does is refused rather than ignored.
+    #[test]
+    fn a_hint_the_bytes_disprove_is_refused() {
+        assert!(parent_format_matches(
+            ImageFormat::Vhd,
+            ImageFormat::Vhd,
+            ImageFormat::Unknown
+        ));
+        assert!(parent_format_matches(
+            ImageFormat::Vhd,
+            ImageFormat::Vhd,
+            ImageFormat::Vhd
+        ));
+        assert!(!parent_format_matches(
+            ImageFormat::Vhd,
+            ImageFormat::Vhd,
+            ImageFormat::Raw
+        ));
+        assert!(!parent_format_matches(
+            ImageFormat::Vhdx,
+            ImageFormat::Vhdx,
+            ImageFormat::Vhd
+        ));
+    }
+
+    /// The fallback exists for the fixed VHD that detects as `Raw`, so
+    /// that row is the one that must be true, and `-F raw` is the one
+    /// spelling that turns it off.
+    #[test]
+    fn only_an_explicit_raw_hint_suppresses_the_fallback() {
+        assert!(footer_fallback_applies(
+            ImageFormat::Raw,
+            ImageFormat::Unknown
+        ));
+        assert!(!footer_fallback_applies(ImageFormat::Raw, ImageFormat::Raw));
+        // `-u` without `-F` leaves the hint Unknown, so it does not
+        // suppress it. Documented in docs/create.md as a difference
+        // between the two spellings of "assume raw".
+        assert!(footer_fallback_applies(
+            ImageFormat::Raw,
+            ImageFormat::Unknown
+        ));
+    }
+
+    /// A header that named VHD is re-read whatever the hint says: the
+    /// footer is simply where a VHD's fields live.
+    #[test]
+    fn a_vhd_header_is_always_followed_to_its_footer() {
+        for hint in EVERY_FORMAT {
+            assert!(
+                footer_fallback_applies(ImageFormat::Vhd, hint),
+                "hint {hint:?}"
+            );
+        }
+    }
+
+    /// Every format with a parser of its own is sized from its header,
+    /// so re-reading the tail would be wasted I/O at best and a
+    /// misdetection at worst.
+    #[test]
+    fn a_recognised_non_vhd_format_is_never_re_read() {
+        for detected in [
+            ImageFormat::Qcow2,
+            ImageFormat::Vmdk4,
+            ImageFormat::Vhdx,
+            ImageFormat::Unknown,
+        ] {
+            for hint in EVERY_FORMAT {
+                assert!(
+                    !footer_fallback_applies(detected, hint),
+                    "{detected:?} re-read with hint {hint:?}"
+                );
+            }
+        }
+    }
+}
 
 /// The Windows rendering of a relative parent path, at the level of the
 /// function rather than of an emitted image.

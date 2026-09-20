@@ -119,6 +119,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   since a fixed VHD has no dynamic header to record a parent in, so
   `-o subformat=fixed` together with `-b` is still refused.
 
+  A parent of the **right** format that will not parse — a VHD whose
+  trailing footer is missing or truncated, a VHDX whose headers or
+  region table are unreadable — is now refused with
+  `ERROR_BACKING_PARSE_FAILED` rather than
+  `ERROR_PARENT_FORMAT_MISMATCH`. The old message told the user their
+  VHD parent was not a VHD, which was both false and unactionable.
+  A parent that genuinely is the wrong format still says so.
+
+  Note that `-u` is **not** a synonym for `-F raw` when sizing a
+  parent: only a literal `-F raw` suppresses the VHD footer fallback,
+  so `create -f qcow2 -b fixed.vhd -u child.qcow2` sizes the parent
+  from its footer while `-F raw` sizes it from the file length. See
+  [create.md](docs/create.md).
+
 ### Changed
 
 - **CI runs on Debian 13 runners.** Every job moved from the `debian-12`

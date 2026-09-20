@@ -571,6 +571,17 @@ class TestCreateSmoke(InstarTestBase):
                     self.assertIsNotNone(
                         json.loads(stdout).get('backing-filename'),
                         f'{fmt} child created with -u records no parent')
+                    # The relative leg of the locator split, through the
+                    # CLI. round_trip.rs pins the bytes the emitters
+                    # write, but only this path exercises the seam where
+                    # the host embeds the typed path and the guest
+                    # normalises it -- which could break without a crate
+                    # test noticing.
+                    self.assertIn(
+                        f'.\\{parent.name}'.encode('utf-16-le'),
+                        child.read_bytes(),
+                        f'a relative {fmt} parent did not reach the image as '
+                        f'.\\{parent.name}')
 
     def test_create_differencing_refuses_a_backslash_in_a_relative_parent(self):
         """A backslash a user typed cannot be told from one instar wrote.
@@ -647,6 +658,10 @@ class TestCreateSmoke(InstarTestBase):
         The two readings of the same file differ, which is what makes
         this test able to fail: the VHD reading is the footer's
         `current_size`, the raw reading is the whole file.
+
+        `-u` is checked here too, and takes the *other* answer: it
+        asserts nothing about the format, so the fallback still
+        applies. Only a literal `-F raw` suppresses it.
         """
         with tempfile.TemporaryDirectory() as td:
             dynamic = self._copy_diff_parent('vhd-diff-parent.vhd', td)
@@ -659,24 +674,37 @@ class TestCreateSmoke(InstarTestBase):
                 file_len, current_size + _VHD_FOOTER_SIZE,
                 'the two readings must differ or this test cannot fail')
 
-            def child_size(hint, name):
+            def child_size(name, *hint):
                 child = Path(td) / name
                 _, stderr, rc = self.run_instar_create(
-                    '-f', 'qcow2', '-b', parent.name, '-F', hint,
+                    '-f', 'qcow2', '-b', parent.name, *hint,
                     str(child), cwd=td)
-                self.assertEqual(rc, 0, f'-F {hint} was refused: {stderr}')
+                self.assertEqual(
+                    rc, 0, f'{" ".join(hint)} was refused: {stderr}')
                 stdout, stderr, rc = self.run_instar_info(
                     child, output='json')
                 self.assertEqual(rc, 0, stderr)
                 return json.loads(stdout)['virtual-size']
 
             self.assertEqual(
-                child_size('vpc', 'as-vpc.qcow2'), current_size,
+                child_size('as-vpc.qcow2', '-F', 'vpc'), current_size,
                 'a vpc-hinted parent was not sized from its footer')
             self.assertGreaterEqual(
-                child_size('raw', 'as-raw.qcow2'), file_len,
+                child_size('as-raw.qcow2', '-F', 'raw'), file_len,
                 'a raw-hinted parent was sized from its VHD footer, so the '
                 'child records a backing format the probe disagreed with')
+
+            # `-u` is not `-F raw`. It says "do not fail if the backing
+            # file is inaccessible" and asserts nothing about the
+            # format, so the footer fallback still applies and the
+            # parent is sized as a VHD. Pinned because the two
+            # spellings of "assume raw" behaving differently is a trap,
+            # and because documenting it (docs/create.md) without a
+            # test would leave the claim unchecked.
+            self.assertEqual(
+                child_size('as-unsafe.qcow2', '-u'), current_size,
+                '-u suppressed the footer fallback; it asserts nothing '
+                'about the format, so only -F raw should')
 
     def test_create_differencing_refuses_a_size_that_is_not_the_parents(self):
         """A differencing child inherits its parent's size, or is refused.
@@ -696,7 +724,6 @@ class TestCreateSmoke(InstarTestBase):
                 with tempfile.TemporaryDirectory() as td:
                     parent = self._copy_diff_parent(fixture, td)
                     if fmt == 'vpc':
-                        parent_size, _ = None, None
                         parent_size = struct.unpack_from(
                             '>Q', parent.read_bytes()[-_VHD_FOOTER_SIZE:], 48)[0]
                     else:
@@ -760,8 +787,16 @@ class TestCreateSmoke(InstarTestBase):
                     capture_output=True, text=True)
                 if r.returncode == 0 and path.exists():
                     parents[name] = path
-            if not parents:
-                self.skipTest('qemu-img created none of the parent formats')
+            # Keeping whichever parents qemu-img managed would let this
+            # narrow to one format and still report green, hiding a
+            # regression in the arms it stopped covering. vmdk, vdi and
+            # qed are long-standing in every qemu-img the project
+            # targets, so a missing one is news.
+            missing = sorted({'flat.vmdk', 'disk.vdi', 'disk.qed'} - set(parents))
+            self.assertEqual(
+                missing, [],
+                f'qemu-img did not create {missing}; the probe arms for those '
+                f'formats would go unexercised')
 
             for name, parent in parents.items():
                 with self.subTest(parent=name):
@@ -783,6 +818,70 @@ class TestCreateSmoke(InstarTestBase):
                     self.assertNotEqual(
                         rc, 0,
                         f'{name} yielded a size it cannot have')
+
+    def test_create_differencing_names_a_corrupt_parent_as_corrupt(self):
+        """A parent of the right format that will not parse says so.
+
+        A dynamic VHD carries a copy of its footer at offset 0, so
+        header detection still calls a footerless one `vpc` -- the
+        format is right, and only the trailing structures are gone.
+        Before this, the probe returned that format with no identity,
+        `parent_format_matches` passed it, and the refusal surfaced
+        from `vhd_opts_from` as a *format mismatch*: telling the user
+        their VHD parent is not a VHD, which is false and gives them
+        nothing to act on.
+
+        The ordering is the substance of the test. A genuinely
+        wrong-format parent must still be reported as a mismatch, so
+        the mismatch check has to run first and only a parent that
+        passed it can be diagnosed as corrupt.
+
+        Both cases carry an explicit SIZE, and that is load-bearing
+        rather than incidental. Omitting it reaches
+        `ERROR_BACKING_PARSE_FAILED` by an entirely different route --
+        a size was asked for and the probe could not supply one -- so a
+        no-size version of this test passes whether the parse-failure
+        diagnosis exists or not. Mutating the guard away is what
+        surfaced that; it is the only reason the sizes are here.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            parent = self._copy_diff_parent('vhd-diff-parent.vhd', td)
+            intact = parent.read_bytes()
+
+            # Truncating the trailing footer leaves the offset-0 copy,
+            # so the file still detects as vpc.
+            truncated = Path(td) / 'truncated.vhd'
+            truncated.write_bytes(intact[:-_VHD_FOOTER_SIZE])
+            child = Path(td) / 'child.vhd'
+            _, stderr, rc = self.run_instar_create(
+                '-f', 'vpc', '-b', truncated.name, '-F', 'vpc',
+                str(child), '16M', cwd=td)
+            self.assertNotEqual(rc, 0, 'a footerless VHD parent was accepted')
+            self.assertIn(
+                'could not be parsed', stderr,
+                f'a corrupt VHD parent was not diagnosed as corrupt: {stderr}')
+            self.assertNotIn(
+                'does not match the target format', stderr,
+                'a VHD parent was reported as not being a VHD')
+
+            # ...and the other side of the ordering: a parent that
+            # really is the wrong format still says so. `-F` is not
+            # optional here -- the CLI refuses to guess a backing
+            # format -- so the hint agrees with the bytes and the
+            # refusal comes from the target/parent rule alone.
+            qcow2_parent = Path(td) / 'parent.qcow2'
+            r = subprocess.run(
+                ['qemu-img', 'create', '-f', 'qcow2', str(qcow2_parent), '64M'],
+                capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            child2 = Path(td) / 'child2.vhd'
+            _, stderr, rc = self.run_instar_create(
+                '-f', 'vpc', '-b', qcow2_parent.name, '-F', 'qcow2',
+                str(child2), '64M', cwd=td)
+            self.assertNotEqual(rc, 0, 'a qcow2 parent was accepted for a vpc child')
+            self.assertIn(
+                'does not match the target format', stderr,
+                f'a wrong-format parent lost its mismatch diagnosis: {stderr}')
 
     def test_create_vpc_fixed_subformat_still_refuses_backing(self):
         """A differencing child is necessarily dynamic.

@@ -4316,6 +4316,18 @@ byte is copied through unchanged, and `/` is consumed into the
 normalisation rather than surviving it — and an absolute path keeps
 its POSIX bytes and is not normalised, so it is unconstrained.
 
+**A child's block size is independent of its parent's, deliberately.**
+instar gives a differencing child the same defaults as any other new
+image — 2 MiB blocks for VHD, 32 MiB for VHDX — rather than inheriting
+the parent's, and for VHDX the chunk ratio can differ too. This is
+legal and it is what Hyper-V tolerates: composition resolves a read by
+*virtual offset*, not by block index, so the two images need only agree
+on the virtual size (which instar enforces; see
+[create.md](create.md)). Recording it here because a later reader
+comparing a child to its parent would otherwise reasonably take the
+asymmetry for an oversight, and because the compose work has to handle
+it either way.
+
 **Issue #566 is not closed by this.** Every VHD instar creates still
 carries an all-zero footer unique id, so a differencing child of an
 instar-created parent records an all-zero parent identity and any

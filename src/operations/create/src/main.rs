@@ -33,8 +33,9 @@ use shared::{
 };
 
 use create::{
-    plan_qcow2, plan_vhd, plan_vhdx, plan_vmdk, BackingRef, CreateError, MetadataPlan,
-    Qcow2CreateOpts, VhdCreateOpts, VhdSubformat, VhdxCreateOpts, VmdkCreateOpts, VmdkSubformat,
+    footer_fallback_applies, parent_format_matches, plan_qcow2, plan_vhd, plan_vhdx, plan_vmdk,
+    BackingRef, CreateError, MetadataPlan, Qcow2CreateOpts, VhdCreateOpts, VhdSubformat,
+    VhdxCreateOpts, VmdkCreateOpts, VmdkSubformat,
 };
 
 // ---------------------------------------------------------------------------
@@ -242,17 +243,30 @@ unsafe fn probe_backing(
     if !(call_table.read_input_sector)(0, 0, header_ptr, sector_size) {
         return Ok(unsized_probe(ImageFormat::Unknown));
     }
-    let header = core::slice::from_raw_parts(header_ptr, sector_size);
-    let mut format = detect_format_from_header(header, sector_size, false);
+    // Everything the *header* can tell us is extracted here, inside a
+    // scope that ends before anything writes through `header_ptr`
+    // again. The footer fallback below reuses that buffer, and a
+    // `&[u8]` still live across that write would alias it -- unsound
+    // under Rust's rules whether or not the arm that reads it happens
+    // to be reachable. Ending the borrow makes the invariant
+    // structural rather than a property of which match arm runs.
+    let (mut format, header_virtual_size) = {
+        let header = core::slice::from_raw_parts(header_ptr, sector_size);
+        let format = detect_format_from_header(header, sector_size, false);
+        let virtual_size = match format {
+            ImageFormat::Qcow2 => qcow2::QcowHeader::parse(header).map(|h| h.virtual_size),
+            ImageFormat::Vmdk4 => vmdk::Vmdk4Header::parse(header).map(|h| h.virtual_size),
+            _ => None,
+        };
+        (format, virtual_size)
+    };
     let capacity = (call_table.get_input_capacity)(0);
 
-    // A VHD's footer is the last 512 bytes of the *file*, and a
-    // fixed-subformat VHD keeps no copy of it at offset 0, so header
-    // detection calls a fixed parent `Raw`. Every other read path
-    // falls back to the footer before believing that -- `info`,
-    // `check` and `resize` all do -- and create has to agree, or it
-    // refuses as a non-VHD a parent `instar info` reports as `vpc`,
-    // and one instar itself writes with `-o subformat=fixed`.
+    // Whether to look for a VHD footer in the last sector is decided
+    // by `create::footer_fallback_applies`, which carries the reasoning
+    // and is unit-tested there -- this binary is excluded from
+    // `cargo test --workspace`, so a truth table written here would
+    // never run.
     //
     // The read is hoisted out of the `Vhd` arm so both routes into it
     // share one read and one parse. It uses `vhd::find_footer_offset`
@@ -266,25 +280,8 @@ unsafe fn probe_backing(
     // paths). A failed read or a footerless file simply leaves
     // `format` alone: a raw parent stays raw, and a parent whose
     // header claimed VHD still fails below on the `None`.
-    //
-    // An explicit `-F raw` suppresses the fallback. The hint is the
-    // user asserting what the file is, and it is also what the child
-    // records as its backing format -- so sizing the parent from a VHD
-    // footer while writing `raw` into the child would have the two
-    // disagree by the footer's 512 bytes. `detect_format_from_header`
-    // returns `Raw` as its catch-all as well as its real answer, so
-    // without this the fallback would also second-guess the hint on
-    // every file it does not recognise.
-    let fallback_applies = match format {
-        // The header said VHD, so the footer is where the fields are.
-        ImageFormat::Vhd => true,
-        // The header said nothing, which a fixed VHD's does not --
-        // unless the user asserted raw, in which case they win.
-        ImageFormat::Raw => !matches!(hint, ImageFormat::Raw),
-        _ => false,
-    };
     let mut vhd_footer = None;
-    if fallback_applies
+    if footer_fallback_applies(format, hint)
         && capacity > 0
         && (call_table.read_input_sector)(0, capacity - 1, header_ptr, sector_size)
     {
@@ -305,14 +302,7 @@ unsafe fn probe_backing(
                 .filter(|size| *size > 0),
             ParentIdentity::None,
         ),
-        ImageFormat::Qcow2 => (
-            qcow2::QcowHeader::parse(header).map(|h| h.virtual_size),
-            ParentIdentity::None,
-        ),
-        ImageFormat::Vmdk4 => (
-            vmdk::Vmdk4Header::parse(header).map(|h| h.virtual_size),
-            ParentIdentity::None,
-        ),
+        ImageFormat::Qcow2 | ImageFormat::Vmdk4 => (header_virtual_size, ParentIdentity::None),
         ImageFormat::Vhd => {
             // Located above, by header detection or by the footer
             // fallback. `None` here means the header claimed VHD and
@@ -488,38 +478,15 @@ unsafe fn read_vmdk_parent_cid(call_table: &CallTable, sector_size: usize) -> Op
     Some(info.cid)
 }
 
-/// Does the parent's detected format satisfy the child's?
-///
-/// A differencing VHD child can only name a VHD parent and a
-/// differencing VHDX child only a VHDX parent, so a mismatch there is
-/// refused with `ERROR_PARENT_FORMAT_MISMATCH` rather than written as
-/// an image whose parent can never be resolved. `detected` is the
-/// format found in the parent's own header; `hint` is the `-F` value,
-/// consulted only to catch a user who asserted a format the bytes
-/// disprove, and [`ImageFormat::Unknown`] when `-F` was not passed
-/// (reachable from the CLI via `-u`, which is what makes `-F`
-/// optional).
-///
-/// Every other target is unconstrained: qcow2 and vmdk accept
-/// mixed-format parents and this does not change that.
-fn parent_format_matches(target: ImageFormat, detected: ImageFormat, hint: ImageFormat) -> bool {
-    let required = match target {
-        ImageFormat::Vhd => ImageFormat::Vhd,
-        ImageFormat::Vhdx => ImageFormat::Vhdx,
-        _ => return true,
-    };
-    if detected != required {
-        return false;
-    }
-    matches!(hint, ImageFormat::Unknown) || hint == detected
-}
-
 /// # Errors
 ///
 /// [`CreateResult::ERROR_PARENT_FORMAT_MISMATCH`] when a backing file
-/// is present but its identity is not a VHD one. `parent_format_matches`
-/// makes that unreachable, but it is checked here rather than argued
-/// for in a comment: the invariant is relied on *here*, and the failure
+/// is present but its identity is not a VHD one. The caller's
+/// format-and-identity checks make that unreachable -- a wrong format
+/// is refused as a mismatch and a right format that did not parse is
+/// refused as a parse failure, before this is reached -- but it is
+/// checked here rather than argued for in a comment: the invariant is
+/// relied on *here*, and the failure
 /// mode if a future reordering broke it is a well-formed child carrying
 /// an all-zero parent identity -- which, because every instar-written
 /// VHD shares that identity (#566), would resolve against any of them.
@@ -940,6 +907,32 @@ pub unsafe extern "C" fn _start() -> u64 {
                 call_table,
                 config.target_format,
                 CreateResult::ERROR_PARENT_FORMAT_MISMATCH,
+            );
+        }
+
+        // The parent *is* the right format and still yielded no
+        // identity, so its deeper structures did not parse: a VHD
+        // whose trailing footer is missing or truncated, or a VHDX
+        // whose headers or region table are unreadable. Without this
+        // the failure would surface from `vhd_opts_from` as a format
+        // mismatch -- telling the user their VHD parent is not a VHD,
+        // which is both false and unactionable. The order matters:
+        // the format check runs first, so a genuinely wrong-format
+        // parent keeps the mismatch diagnosis rather than being
+        // reported as corrupt.
+        //
+        // This is what makes the `(_, true)` arms of `vhd_opts_from`
+        // and `vhdx_opts_from` unreachable. They stay as a belt-and-
+        // braces refusal because the cost of being wrong there is a
+        // child carrying an all-zero parent identity (#566), not an
+        // error message.
+        if matches!(target, ImageFormat::Vhd | ImageFormat::Vhdx)
+            && matches!(probe.identity, ParentIdentity::None)
+        {
+            return fail_with(
+                call_table,
+                config.target_format,
+                CreateResult::ERROR_BACKING_PARSE_FAILED,
             );
         }
 

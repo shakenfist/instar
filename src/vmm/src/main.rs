@@ -225,25 +225,39 @@ const CREATE_CONFIG_PREALLOC_FALLOC: u32 = 2 << 4;
 const CREATE_CONFIG_PREALLOC_FULL: u32 = 3 << 4;
 const CREATE_CONFIG_MAX_BACKING_FILE: usize = 1024;
 
-// CreateResult constants (must match shared crate)
 #[allow(dead_code)]
-const CREATE_RESULT_MAGIC: u32 = 0x43524553; // "CRES"
-const CREATE_RESULT_ERROR_OK: u32 = 0;
-const CREATE_RESULT_ERROR_INVALID_OPTION: u32 = 1;
-const CREATE_RESULT_ERROR_INVALID_SIZE: u32 = 2;
-const CREATE_RESULT_ERROR_SCRATCH_TOO_SMALL: u32 = 3;
-const CREATE_RESULT_ERROR_BACKING_READ_FAILED: u32 = 4;
-const CREATE_RESULT_ERROR_BACKING_PARSE_FAILED: u32 = 5;
-const CREATE_RESULT_ERROR_BACKING_TOO_LONG: u32 = 6;
-const CREATE_RESULT_ERROR_WRITE_FAILED: u32 = 7;
-const CREATE_RESULT_ERROR_UNSUPPORTED_FORMAT: u32 = 8;
-const CREATE_RESULT_ERROR_BACKING_FORMAT_UNSUPPORTED: u32 = 9;
-const CREATE_RESULT_ERROR_BACKING_SIZE_TOO_LARGE: u32 = 10;
-const CREATE_RESULT_ERROR_BACKING_DIFFERENCING: u32 = 11;
-const CREATE_RESULT_ERROR_PARENT_NAME_TOO_LONG: u32 = 12;
-const CREATE_RESULT_ERROR_PARENT_FORMAT_MISMATCH: u32 = 13;
-const CREATE_RESULT_ERROR_PARENT_PATH_NOT_REPRESENTABLE: u32 = 14;
-const CREATE_RESULT_ERROR_PARENT_SIZE_MISMATCH: u32 = 15;
+// The create result ABI is defined once, in `shared::CreateResult`, and
+// named here so `create_error_detail` can match on it. Deriving each
+// constant from `shared` rather than repeating its literal means a code
+// that is added on one side and not the other is a build failure, not a
+// wrong error message at runtime (issue #580 tracks giving these codes a
+// payload channel; this only closes the numbering hazard).
+const CREATE_RESULT_MAGIC: u32 = shared::CreateResult::MAGIC;
+const CREATE_RESULT_ERROR_OK: u32 = shared::CreateResult::ERROR_OK;
+const CREATE_RESULT_ERROR_INVALID_OPTION: u32 = shared::CreateResult::ERROR_INVALID_OPTION;
+const CREATE_RESULT_ERROR_INVALID_SIZE: u32 = shared::CreateResult::ERROR_INVALID_SIZE;
+const CREATE_RESULT_ERROR_SCRATCH_TOO_SMALL: u32 = shared::CreateResult::ERROR_SCRATCH_TOO_SMALL;
+const CREATE_RESULT_ERROR_BACKING_READ_FAILED: u32 =
+    shared::CreateResult::ERROR_BACKING_READ_FAILED;
+const CREATE_RESULT_ERROR_BACKING_PARSE_FAILED: u32 =
+    shared::CreateResult::ERROR_BACKING_PARSE_FAILED;
+const CREATE_RESULT_ERROR_BACKING_TOO_LONG: u32 = shared::CreateResult::ERROR_BACKING_TOO_LONG;
+const CREATE_RESULT_ERROR_WRITE_FAILED: u32 = shared::CreateResult::ERROR_WRITE_FAILED;
+const CREATE_RESULT_ERROR_UNSUPPORTED_FORMAT: u32 = shared::CreateResult::ERROR_UNSUPPORTED_FORMAT;
+const CREATE_RESULT_ERROR_BACKING_FORMAT_UNSUPPORTED: u32 =
+    shared::CreateResult::ERROR_BACKING_FORMAT_UNSUPPORTED;
+const CREATE_RESULT_ERROR_BACKING_SIZE_TOO_LARGE: u32 =
+    shared::CreateResult::ERROR_BACKING_SIZE_TOO_LARGE;
+const CREATE_RESULT_ERROR_BACKING_DIFFERENCING: u32 =
+    shared::CreateResult::ERROR_BACKING_DIFFERENCING;
+const CREATE_RESULT_ERROR_PARENT_NAME_TOO_LONG: u32 =
+    shared::CreateResult::ERROR_PARENT_NAME_TOO_LONG;
+const CREATE_RESULT_ERROR_PARENT_FORMAT_MISMATCH: u32 =
+    shared::CreateResult::ERROR_PARENT_FORMAT_MISMATCH;
+const CREATE_RESULT_ERROR_PARENT_PATH_NOT_REPRESENTABLE: u32 =
+    shared::CreateResult::ERROR_PARENT_PATH_NOT_REPRESENTABLE;
+const CREATE_RESULT_ERROR_PARENT_SIZE_MISMATCH: u32 =
+    shared::CreateResult::ERROR_PARENT_SIZE_MISMATCH;
 
 // ResizeConfig constants (must match shared crate)
 const RESIZE_CONFIG_MAGIC: u32 = 0x52455349; // "RESI"
