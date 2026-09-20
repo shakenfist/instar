@@ -774,25 +774,33 @@ class TestCreateSmoke(InstarTestBase):
         all worked on develop with an explicit size, and under qemu-img,
         so refusing them would be a regression rather than a new check.
         """
+        # vmdk and vdi are in every qemu-img the project targets, but
+        # qed is not: the RHEL-family builds omit that driver, so the
+        # arm is asked for only where the host can drive it. This is a
+        # capability check and not a version one -- Rocky 9, Rocky 10
+        # and Fedora all ship qemu-img 10.1.0 and only Fedora has qed.
+        wanted = [
+            ('flat.vmdk', ('-f', 'vmdk', '-o',
+                           'subformat=monolithicFlat')),
+            ('disk.vdi', ('-f', 'vdi',)),
+        ]
+        if self.qemu_img_supports_format('qed'):
+            wanted.append(('disk.qed', ('-f', 'qed',)))
+
         with tempfile.TemporaryDirectory() as td:
             parents = {}
-            for name, args in (
-                    ('flat.vmdk', ('-f', 'vmdk', '-o',
-                                   'subformat=monolithicFlat')),
-                    ('disk.vdi', ('-f', 'vdi',)),
-                    ('disk.qed', ('-f', 'qed',))):
+            for name, args in wanted:
                 path = Path(td) / name
                 r = subprocess.run(
                     ['qemu-img', 'create', *args, str(path), '8M'],
                     capture_output=True, text=True)
                 if r.returncode == 0 and path.exists():
                     parents[name] = path
-            # Keeping whichever parents qemu-img managed would let this
-            # narrow to one format and still report green, hiding a
-            # regression in the arms it stopped covering. vmdk, vdi and
-            # qed are long-standing in every qemu-img the project
-            # targets, so a missing one is news.
-            missing = sorted({'flat.vmdk', 'disk.vdi', 'disk.qed'} - set(parents))
+            # Whatever survived the capability check is then required in
+            # full. Keeping whichever parents qemu-img happened to manage
+            # would let this narrow to one format and still report green,
+            # hiding a regression in the arms it stopped covering.
+            missing = sorted({n for n, _ in wanted} - set(parents))
             self.assertEqual(
                 missing, [],
                 f'qemu-img did not create {missing}; the probe arms for those '
