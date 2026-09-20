@@ -3538,6 +3538,16 @@ impl CreateResult {
     /// implementation can resolve would be worse than a typed
     /// refusal.
     pub const ERROR_PARENT_FORMAT_MISMATCH: u32 = 13;
+    /// A relative backing path cannot be rendered into a parent
+    /// locator without changing which file it names. The locator keys
+    /// VHD and VHDX define (`W2ru`, `relative_path`) are Windows
+    /// paths, so instar rewrites `/` to `\` when it fills them -- and
+    /// a literal `\` already in a POSIX filename is indistinguishable
+    /// from one that rewrite produced. `a\b.vhd` (one file) and
+    /// `a/b.vhd` (a file in a subdirectory) would emit the same
+    /// locator. Refused rather than written, because a VHDX child has
+    /// no other record of its parent's path.
+    pub const ERROR_PARENT_PATH_NOT_REPRESENTABLE: u32 = 14;
 
     /// True if magic matches.
     pub fn is_valid(&self) -> bool {

@@ -4299,6 +4299,23 @@ and a relative VHD path caps at 254 typed code units versus 255 for an
 absolute one. VHDX has a single 260-code-unit cap on the emitted
 string, so a relative VHDX path caps at 258 versus 260 absolute.
 
+A second consequence: **a relative parent path containing a literal
+backslash is refused.** The normalisation is what gives `\` its
+meaning in the emitted string, so a `\` the user typed cannot be told
+apart from one the normalisation produced — `a\b.vhd` (one file, a
+legal POSIX name) and `a/b.vhd` (`b.vhd` inside `a/`) would emit the
+same locator, and a reader resolving it opens the wrong file in
+exactly one of the two cases without being able to tell which. VHD
+would survive that, because the parent unicode name field keeps the
+typed bytes and that is the field qemu's `block/vpc.c` and libvhdi
+resolve through, but VHDX has no equivalent field: the locator is its
+only record of the path. Both formats therefore refuse, with
+`ERROR_PARENT_PATH_NOT_REPRESENTABLE`, so the rule is one rule rather
+than two. `\` is the only character with this property — every other
+byte is copied through unchanged, and `/` is consumed into the
+normalisation rather than surviving it — and an absolute path keeps
+its POSIX bytes and is not normalised, so it is unconstrained.
+
 **Issue #566 is not closed by this.** Every VHD instar creates still
 carries an all-zero footer unique id, so a differencing child of an
 instar-created parent records an all-zero parent identity and any

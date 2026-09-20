@@ -77,6 +77,13 @@ pub enum CreateError {
     /// field, and reporting it as the 1024-byte limit would be a false
     /// diagnostic.
     ParentNameTooLong,
+    /// A **relative** parent path cannot be rendered into the Windows
+    /// convention a parent locator is defined in without changing
+    /// which file it names: it already contains a literal `\`, which
+    /// is a legal POSIX filename character but is also the separator
+    /// the rendering itself produces from `/`. See
+    /// [`windows_relative_parent_path`].
+    ParentPathNotRepresentable,
     /// An internal size computation overflowed.
     Overflow,
     /// The caller-supplied scratch buffer is too small for the
@@ -598,33 +605,59 @@ const WINDOWS_RELATIVE_PREFIX: &[u8] = br".\";
 /// (`vhd::MAX_PARENT_NAME_UTF8`, `vhdx::MAX_PARENT_LOCATOR_VALUE_UTF8`),
 /// each of which is three bytes per code unit the field can hold. A
 /// normalised path longer than that cannot encode into the field under
-/// any mix of characters, so `None` means "too long for this format's
-/// parent path field" and callers map it to
-/// [`CreateError::ParentNameTooLong`].
+/// any mix of characters, so a buffer too small for the result is
+/// [`CreateError::ParentNameTooLong`]. Callers propagate whichever
+/// error comes back rather than mapping one themselves.
 ///
 /// The `from_utf8` arm is unreachable by construction: the prefix and
 /// the substituted separator are ASCII, ASCII bytes never occur inside
 /// a multi-byte UTF-8 sequence, and a leading `./` is a two-byte ASCII
 /// prefix so the tail after it starts on a character boundary. It is
 /// still checked rather than assumed because this crate is panic-free.
-fn windows_relative_parent_path<'b>(path: &str, buf: &'b mut [u8]) -> Option<&'b str> {
+///
+/// # Why a literal backslash is refused
+///
+/// The rendering is what gives `\` its meaning here, so a `\` the user
+/// typed is indistinguishable from one the rendering produced:
+/// `a\b.vhd` (one file, a legal POSIX name) and `a/b.vhd` (`b.vhd`
+/// inside `a/`) both render to `.\a\b.vhd`. A reader resolving that
+/// locator opens the wrong file in exactly one of those two cases and
+/// cannot tell which one it is in. VHD would survive it -- the parent
+/// unicode name field keeps the typed bytes, and that is the field
+/// qemu's `block/vpc.c` and libvhdi resolve a parent through -- but
+/// VHDX has no equivalent field, so the locator is its only record of
+/// the path. Both formats refuse, so this is one rule rather than two.
+///
+/// `\` is the only character with that property: every other byte is
+/// copied through unchanged, so nothing else can be mistaken for
+/// something the rendering introduced, and `/` is consumed *into* the
+/// rendering rather than surviving it. An absolute path keeps its
+/// POSIX bytes and never reaches this function, so it is unconstrained.
+fn windows_relative_parent_path<'b>(path: &str, buf: &'b mut [u8]) -> Result<&'b str, CreateError> {
     let bytes = path.as_bytes();
+    if bytes.contains(&b'\\') {
+        return Err(CreateError::ParentPathNotRepresentable);
+    }
     let rest: &[u8] = if bytes.starts_with(b"./") {
-        bytes.get(2..)?
+        bytes.get(2..).ok_or(CreateError::ParentNameTooLong)?
     } else {
         bytes
     };
 
     let prefix_len = WINDOWS_RELATIVE_PREFIX.len();
-    let total = prefix_len.checked_add(rest.len())?;
+    let total = prefix_len
+        .checked_add(rest.len())
+        .ok_or(CreateError::ParentNameTooLong)?;
     if buf.len() < total {
-        return None;
+        return Err(CreateError::ParentNameTooLong);
     }
     // `buf.len() >= total >= prefix_len` is established above, so
     // neither split can be out of range.
     let (head, body) = buf.split_at_mut(prefix_len);
     head.copy_from_slice(WINDOWS_RELATIVE_PREFIX);
-    let tail = body.get_mut(..rest.len())?;
+    let tail = body
+        .get_mut(..rest.len())
+        .ok_or(CreateError::ParentNameTooLong)?;
     tail.copy_from_slice(rest);
     for b in tail.iter_mut() {
         if *b == b'/' {
@@ -632,7 +665,8 @@ fn windows_relative_parent_path<'b>(path: &str, buf: &'b mut [u8]) -> Option<&'b
         }
     }
 
-    core::str::from_utf8(buf.get(..total)?).ok()
+    core::str::from_utf8(buf.get(..total).ok_or(CreateError::ParentNameTooLong)?)
+        .map_err(|_| CreateError::ParentNameTooLong)
 }
 
 /// Map a backing-image format hint to the ASCII bytes qemu-img writes
@@ -1128,8 +1162,7 @@ pub fn plan_vhd<'a>(
                     if path.as_bytes().first() == Some(&b'/') {
                         (b"W2ku", path)
                     } else {
-                        let normalised = windows_relative_parent_path(path, &mut locator_path_buf)
-                            .ok_or(CreateError::ParentNameTooLong)?;
+                        let normalised = windows_relative_parent_path(path, &mut locator_path_buf)?;
                         (b"W2ru", normalised)
                     };
 
@@ -1401,8 +1434,7 @@ pub fn plan_vhdx<'a>(
         let (path_key, path_value): (&[u8], &str) = if path.as_bytes().first() == Some(&b'/') {
             (vhdx::KEY_ABSOLUTE_WIN32_PATH, path)
         } else {
-            let normalised = windows_relative_parent_path(path, &mut locator_path_buf)
-                .ok_or(CreateError::ParentNameTooLong)?;
+            let normalised = windows_relative_parent_path(path, &mut locator_path_buf)?;
             (vhdx::KEY_RELATIVE_PATH, normalised)
         };
         vhdx::build_parent_locator(
@@ -1477,6 +1509,12 @@ mod windows_relative_parent_path_tests {
         std::string::String::from(out)
     }
 
+    /// Normalise and return the refusal, for the paths that have one.
+    fn refuse(path: &str) -> CreateError {
+        let mut buf = [0u8; vhd::MAX_PARENT_NAME_UTF8];
+        windows_relative_parent_path(path, &mut buf).expect_err("should refuse")
+    }
+
     #[test]
     fn a_bare_name_gains_the_prefix() {
         assert_eq!(render("parent.vhd"), r".\parent.vhd");
@@ -1506,19 +1544,21 @@ mod windows_relative_parent_path_tests {
         assert_eq!(render("\u{1F600}/x.vhd"), ".\\\u{1F600}\\x.vhd");
     }
 
-    /// The buffer bound: exactly enough succeeds, one byte less refuses,
-    /// and a refusal is what the callers turn into
-    /// [`CreateError::ParentNameTooLong`].
+    /// The buffer bound: exactly enough succeeds, one byte less refuses
+    /// as [`CreateError::ParentNameTooLong`].
     #[test]
     fn the_buffer_bound_is_input_length_plus_two() {
         let path = "parent.vhd";
         let mut exact = [0u8; 12];
         assert_eq!(
             windows_relative_parent_path(path, &mut exact),
-            Some(r".\parent.vhd"),
+            Ok(r".\parent.vhd"),
         );
         let mut short = [0u8; 11];
-        assert_eq!(windows_relative_parent_path(path, &mut short), None);
+        assert_eq!(
+            windows_relative_parent_path(path, &mut short),
+            Err(CreateError::ParentNameTooLong),
+        );
     }
 
     /// A consumed `./` gives the two bytes back, so this needs no more
@@ -1528,8 +1568,54 @@ mod windows_relative_parent_path_tests {
         let mut exact = [0u8; 12];
         assert_eq!(
             windows_relative_parent_path("./parent.vhd", &mut exact),
-            Some(r".\parent.vhd"),
+            Ok(r".\parent.vhd"),
         );
+    }
+
+    /// A literal backslash is refused rather than rendered, because
+    /// the rendering is what makes a backslash mean "separator": the
+    /// two paths below would otherwise emit the same locator, and a
+    /// VHDX child has no second record of its parent's path to
+    /// disambiguate with. The refusal is its own error, not
+    /// `ParentNameTooLong`, because nothing here is too long.
+    #[test]
+    fn a_literal_backslash_is_refused_not_rendered() {
+        assert_eq!(
+            render("a/b.vhd"),
+            r".\a\b.vhd",
+            "the separator case is the one the refusal protects",
+        );
+        assert_eq!(refuse(r"a\b.vhd"), CreateError::ParentPathNotRepresentable);
+        // Anywhere in the path, not just between components.
+        assert_eq!(
+            refuse(r"back\slash.vhd"),
+            CreateError::ParentPathNotRepresentable
+        );
+        assert_eq!(
+            refuse(r".\parent.vhd"),
+            CreateError::ParentPathNotRepresentable
+        );
+        assert_eq!(
+            refuse(r"sub/dir\parent.vhd"),
+            CreateError::ParentPathNotRepresentable
+        );
+        assert_eq!(
+            refuse("trailing.vhd\\"),
+            CreateError::ParentPathNotRepresentable
+        );
+    }
+
+    /// Every *other* byte survives, so the refusal is as narrow as the
+    /// ambiguity that motivates it. A colon, a drive-letter-shaped
+    /// prefix and a `..` component are all Windows-meaningful in some
+    /// reading, but none of them is produced by the rendering, so none
+    /// of them can be confused with something instar introduced.
+    #[test]
+    fn only_backslash_is_refused() {
+        assert_eq!(render("c:parent.vhd"), r".\c:parent.vhd");
+        assert_eq!(render("../parent.vhd"), r".\..\parent.vhd");
+        assert_eq!(render("a*b?.vhd"), r".\a*b?.vhd");
+        assert_eq!(render("\u{1F600}.vhd"), ".\\\u{1F600}.vhd");
     }
 }
 

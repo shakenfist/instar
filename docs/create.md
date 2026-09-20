@@ -56,7 +56,7 @@ The full flag surface is reported by `instar create --help`.
 | raw    | (host-only)            | No       | byte-equivalent (file size + zero-fill) |
 | qcow2  | n/a                    | Yes      | info-equivalent (modulo refcount_bits, compat, zstd) |
 | vmdk   | monolithicSparse, streamOptimized | Yes | info-equivalent |
-| vpc    | dynamic, fixed         | Yes      | info-equivalent (modulo CHS virtual_size rounding) |
+| vpc    | dynamic, fixed         | Yes (dynamic only) | info-equivalent (modulo CHS virtual_size rounding) |
 | vhdx   | dynamic                | Yes      | info-equivalent (modulo default block_size when unspecified) |
 
 A "No" in the *Backing?* column means the format cannot be created
@@ -66,7 +66,11 @@ in. vpc and vhdx may be used as the **parent** of a qcow2 or vmdk
 child regardless of format, which is what `tests/test_create.py`'s
 `test_vhdx_as_backing` exercises; they may now also be used as a
 **child** of a parent of their own format — see the per-format
-sections below.
+sections below. vpc's "Yes" is qualified because a differencing VHD
+is necessarily `subformat=dynamic`: only a dynamic disk has the
+header and BAT a parent reference lives in, so `-o subformat=fixed`
+together with `-b` is refused. A fixed VHD is fine as the **parent**
+of a differencing child.
 
 The "info-equivalence" contract is verified by the cross-version baseline
 matrix in `instar-testdata/expected-outputs/create-info-json/` across 80
@@ -141,8 +145,14 @@ Honoured:
   the parent itself and writes it into the child. The parent must
   itself be a VHD: format detection decides, not the `-F` hint, and a
   parent that detects as anything else (or a hint that contradicts
-  detection) is refused with `ERROR_PARENT_FORMAT_MISMATCH`. See
-  [Backing-file semantics](#backing-file-semantics) below and the
+  detection) is refused with `ERROR_PARENT_FORMAT_MISMATCH`. Either
+  subformat of VHD is acceptable as the parent — a fixed VHD carries
+  its `conectix` cookie only in the trailing footer, and the parent
+  probe reads the footer rather than trusting the first sector. The
+  *child*, though, is necessarily dynamic: `subformat=fixed` with a
+  backing file is refused ("invalid option for target format"),
+  because a fixed VHD has no dynamic header to record a parent in.
+  See [Backing-file semantics](#backing-file-semantics) below and the
   "VHD/VHDX differencing" section of [quirks.md](quirks.md).
 
 Accepted but no size effect:
@@ -214,8 +224,13 @@ refusal below, the parse check and format detection — now runs
 whenever `-b` is given, including when an explicit `SIZE` is also
 given. Previously `create -b <parent> child 64M` skipped all three
 checks because the probe only ran to infer a missing size (#579); a
-backing image in a format the probe cannot parse (vdi, qcow1, qed,
-iso, luks) is now refused with an explicit size as well as without.
+backing image in a format the probe cannot parse is now refused with
+an explicit size as well as without. The probe parses raw, qcow2,
+sparse VMDK, VHD (either subformat) and VHDX; everything else is
+refused, which includes vdi, qcow1, qed, iso, luks, parallels,
+bochs, cloop, the VMDK v3 header and — the one most likely to be met
+in practice — a **VMDK text descriptor**, as `monolithicFlat` and
+the other flat subformats produce.
 
 A **differencing VHD or VHDX is refused as a backing file**:
 

@@ -76,6 +76,36 @@ def _vhd_child_parent_identity(data):
     return uuid, timestamp
 
 
+def _fixed_vhd_from(dynamic_path, dest):
+    """Write a fixed-subformat VHD carrying a dynamic fixture's identity.
+
+    A fixed VHD is `current_size` bytes of data followed by the
+    512-byte footer, with `disk_type` 2 and `data_offset` all-ones --
+    and, crucially, *no* copy of the footer at offset 0. That is what
+    makes header-only format detection call it raw.
+
+    Built from a fixture's own footer rather than by instar so the
+    identity is a real third-party one: every VHD instar writes today
+    carries the same constant identity (#566), so a child of an
+    instar-written parent would satisfy an identity check by comparing
+    zeros to zeros.
+    """
+    footer = bytearray(Path(dynamic_path).read_bytes()[-_VHD_FOOTER_SIZE:])
+    current_size = struct.unpack_from('>Q', footer, 48)[0]
+    struct.pack_into('>Q', footer, _VHD_FOOTER_DATA_OFFSET, 0xFFFFFFFFFFFFFFFF)
+    struct.pack_into('>I', footer, _VHD_FOOTER_DISK_TYPE, 2)
+    # Checksum is the ones' complement of the byte sum with the
+    # checksum field zeroed. instar's reader does not validate it, but
+    # a fixture that would fail a validating reader is not a fixture.
+    struct.pack_into('>I', footer, 64, 0)
+    struct.pack_into('>I', footer, 64, (~sum(footer)) & 0xFFFFFFFF)
+    with open(dest, 'wb') as f:
+        f.truncate(current_size)
+        f.seek(current_size)
+        f.write(bytes(footer))
+    return Path(dest)
+
+
 def _vhdx_active_data_write_guid(data):
     """The DataWriteGuid of the VHDX's active header.
 
@@ -340,13 +370,22 @@ class TestCreateSmoke(InstarTestBase):
     def _copy_diff_parent(self, name, dest_dir):
         """Copy a third-party differencing parent fixture into dest_dir.
 
-        Skips the test when the fixture is absent. Copying rather than
-        referencing in place keeps the emitted parent path short and
-        relative, and keeps the test from writing beside the fixture.
+        Copying rather than referencing in place keeps the emitted
+        parent path short and relative, and keeps the test from writing
+        beside the fixture.
+
+        An absent fixture fails rather than skips. Every end-to-end
+        proof that this feature works at all goes through this helper,
+        so a skip here would turn the feature's only integration
+        coverage green while testing nothing. A missing testdata
+        checkout needs no branch of its own: `InstarTestBase._load_manifest`
+        already raises in `setUpClass` (tests/base.py), so no test in
+        this class runs without one.
         """
         src = (self._testdata_root / 'custom' / 'format-coverage' / name)
-        if not src.exists():
-            self.skipTest(f'parent fixture not found: {src}')
+        self.assertTrue(
+            src.exists(),
+            f'testdata is present but the parent fixture is not: {src}')
         dest = Path(dest_dir) / name
         shutil.copyfile(src, dest)
         return dest
@@ -430,6 +469,137 @@ class TestCreateSmoke(InstarTestBase):
                         self.assertIn(
                             linkage.encode('utf-16-le'), child_bytes,
                             f'child does not record parent_linkage {linkage}')
+
+    def test_create_vhd_differencing_from_a_fixed_parent(self):
+        """A fixed-subformat VHD is a valid differencing parent.
+
+        A fixed VHD carries the `conectix` cookie only in its trailing
+        footer, so detecting its format from the first sector alone
+        calls it raw -- and a vpc child then gets refused for having a
+        non-VHD parent, even though `instar info` reports the same file
+        as vpc and instar itself writes fixed VHDs with `-o
+        subformat=fixed`. Hyper-V accepts a fixed parent. The probe now
+        falls back to the footer, as info, check and resize already do.
+
+        The child is necessarily dynamic: only a dynamic VHD has the
+        header and BAT a differencing disk needs. The *parent* is the
+        fixed one.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            dynamic = self._copy_diff_parent('vhd-diff-parent.vhd', td)
+            parent = _fixed_vhd_from(dynamic, Path(td) / 'fixed-parent.vhd')
+            dynamic.unlink()
+
+            # The premise: the first sector says nothing, the footer
+            # says VHD. Without the fallback there is nothing to find.
+            self.assertNotEqual(
+                parent.read_bytes()[:8], b'conectix',
+                'a fixed VHD must not carry a footer copy at offset 0, '
+                'or this test is not exercising the fallback')
+            stdout, stderr, rc = self.run_instar_info(parent, output='json')
+            self.assertEqual(rc, 0, f'info on the fixed parent failed: {stderr}')
+            self.assertEqual(
+                json.loads(stdout).get('format'), 'vpc',
+                'instar info does not call this parent vpc, so create '
+                'refusing it would not be an inconsistency')
+
+            child = Path(td) / 'child.vhd'
+            _, stderr, rc = self.run_instar_create(
+                '-f', 'vpc', '-b', parent.name, '-F', 'vpc',
+                str(child), cwd=td)
+            self.assertEqual(
+                rc, 0, f'a fixed VHD parent was refused: {stderr}')
+
+            child_bytes = child.read_bytes()
+            self.assertEqual(
+                _vhd_footer_disk_type(child_bytes), 4,
+                'child VHD disk_type is not differencing')
+            want_uuid, want_ts = _vhd_footer_identity(parent.read_bytes())
+            self.assertNotEqual(
+                want_uuid, b'\x00' * 16,
+                'the fixed parent has a zero uuid, so this test cannot '
+                'tell a real identity from the placeholder')
+            self.assertEqual(
+                _vhd_child_parent_identity(child_bytes), (want_uuid, want_ts),
+                "child does not record the fixed parent's identity")
+
+    def test_create_differencing_absolute_parent_and_absent_hint(self):
+        """Two CLI routes the crate-level tests cannot reach.
+
+        The locator's absolute-vs-relative split is pinned byte-wise in
+        the create crate, but nothing drove it through the CLI: an
+        absolute `-b` must keep its POSIX bytes rather than being
+        rendered into the Windows convention a relative one gets.
+
+        And `parent_format_matches` accepts a parent whose format the
+        user did not assert, which from the CLI means `-u` in place of
+        `-F` -- the only way to omit `-F` at all.
+        """
+        cases = (('vpc', 'vhd-diff-parent.vhd'), ('vhdx', 'vhdx-diff-parent.vhdx'))
+        for fmt, fixture in cases:
+            with self.subTest(format=fmt, path='absolute'):
+                with tempfile.TemporaryDirectory() as td:
+                    parent = self._copy_diff_parent(fixture, td)
+                    child = Path(td) / f'child-abs.{fmt}'
+                    _, stderr, rc = self.run_instar_create(
+                        '-f', fmt, '-b', str(parent), '-F', fmt, str(child))
+                    self.assertEqual(
+                        rc, 0, f'an absolute {fmt} parent was refused: {stderr}')
+                    child_bytes = child.read_bytes()
+                    self.assertIn(
+                        str(parent).encode('utf-16-le'), child_bytes,
+                        'the absolute parent path is not recorded verbatim')
+                    self.assertNotIn(
+                        str(parent).replace('/', '\\').encode('utf-16-le'),
+                        child_bytes,
+                        'an absolute path was rendered into the Windows '
+                        'convention; only relative paths are')
+
+            with self.subTest(format=fmt, hint='absent'):
+                with tempfile.TemporaryDirectory() as td:
+                    parent = self._copy_diff_parent(fixture, td)
+                    child = Path(td) / f'child-u.{fmt}'
+                    _, stderr, rc = self.run_instar_create(
+                        '-f', fmt, '-b', parent.name, '-u',
+                        str(child), cwd=td)
+                    self.assertEqual(
+                        rc, 0,
+                        f'-u without -F was refused for {fmt}: {stderr}')
+                    stdout, stderr, rc = self.run_instar_info(
+                        child, output='json')
+                    self.assertEqual(rc, 0, f'info on {child} failed: {stderr}')
+                    self.assertIsNotNone(
+                        json.loads(stdout).get('backing-filename'),
+                        f'{fmt} child created with -u records no parent')
+
+    def test_create_differencing_refuses_a_backslash_in_a_relative_parent(self):
+        """A backslash a user typed cannot be told from one instar wrote.
+
+        A parent locator holds a Windows path, so instar renders `/` as
+        `\\` when it fills one. A `\\` already in a POSIX filename is
+        then indistinguishable from a separator: `a\\b.vhd` (one file)
+        and `a/b.vhd` (a file in a subdirectory) would emit the same
+        locator, and a VHDX child has no other record of its parent's
+        path to disambiguate with. Refused rather than written.
+        """
+        cases = (('vpc', 'vhd-diff-parent.vhd'), ('vhdx', 'vhdx-diff-parent.vhdx'))
+        for fmt, fixture in cases:
+            with self.subTest(format=fmt):
+                with tempfile.TemporaryDirectory() as td:
+                    parent = self._copy_diff_parent(fixture, td)
+                    odd = parent.with_name('back\\slash-' + parent.name)
+                    parent.rename(odd)
+                    child = Path(td) / f'child.{fmt}'
+                    _, stderr, rc = self.run_instar_create(
+                        '-f', fmt, '-b', odd.name, '-F', fmt,
+                        str(child), cwd=td)
+                    self.assertNotEqual(
+                        rc, 0,
+                        f'{fmt} accepted a backslash in a relative parent')
+                    self.assertIn('backslash', stderr)
+                    self.assertFalse(
+                        child.exists(),
+                        f'{fmt} refused the parent but still wrote {child}')
 
     def test_create_vhd_and_vhdx_reject_mismatched_parent_format(self):
         """A differencing child must be the same format as its parent.

@@ -107,6 +107,12 @@ fn map_create_error(e: CreateError) -> u32 {
         // overflow. Telling a user their 300-byte path exceeded 1024
         // bytes is a false diagnostic.
         CreateError::ParentNameTooLong => CreateResult::ERROR_PARENT_NAME_TOO_LONG,
+        // Also its own code: nothing about this path is too long, and
+        // the fix a user needs (rename the file, or give an absolute
+        // path) is not the fix ERROR_PARENT_NAME_TOO_LONG suggests.
+        CreateError::ParentPathNotRepresentable => {
+            CreateResult::ERROR_PARENT_PATH_NOT_REPRESENTABLE
+        }
         CreateError::Overflow => CreateResult::ERROR_INVALID_SIZE,
         CreateError::ScratchTooSmall => CreateResult::ERROR_SCRATCH_TOO_SMALL,
         // PreallocationUnsupported reuses INVALID_OPTION until 6c
@@ -197,8 +203,41 @@ unsafe fn probe_backing(call_table: &CallTable, sector_size: usize) -> Result<Ba
         return Err(PARSE_FAILED);
     }
     let header = core::slice::from_raw_parts(header_ptr, sector_size);
-    let format = detect_format_from_header(header, sector_size, false);
+    let mut format = detect_format_from_header(header, sector_size, false);
     let capacity = (call_table.get_input_capacity)(0);
+
+    // A VHD's footer is the last 512 bytes of the *file*, and a
+    // fixed-subformat VHD keeps no copy of it at offset 0, so header
+    // detection calls a fixed parent `Raw`. Every other read path
+    // falls back to the footer before believing that -- `info`,
+    // `check` and `resize` all do -- and create has to agree, or it
+    // refuses as a non-VHD a parent `instar info` reports as `vpc`,
+    // and one instar itself writes with `-o subformat=fixed`.
+    //
+    // The read is hoisted out of the `Vhd` arm so both routes into it
+    // share one read and one parse. It uses `vhd::find_footer_offset`
+    // (via `parse_last_sector`) rather than
+    // `shared::format_detection::detect_vhd_footer`, because the
+    // latter only looks at offset 0 of the buffer: `capacity` is
+    // `div_ceil(size_bytes, sector_size)` and reads past end-of-file
+    // zero-pad, so above a 512-byte sector the footer sits at some
+    // 512-aligned offset *inside* the last sector rather than at its
+    // start (issue #578, which is the same defect on those other
+    // paths). A failed read or a footerless file simply leaves
+    // `format` alone: a raw parent stays raw, and a parent whose
+    // header claimed VHD still fails below on the `None`.
+    let mut vhd_footer = None;
+    if matches!(format, ImageFormat::Raw | ImageFormat::Vhd)
+        && capacity > 0
+        && (call_table.read_input_sector)(0, capacity - 1, header_ptr, sector_size)
+    {
+        let last_sector = core::slice::from_raw_parts(header_ptr, sector_size);
+        vhd_footer = vhd::VhdFooter::parse_last_sector(last_sector);
+        if vhd_footer.is_some() {
+            format = ImageFormat::Vhd;
+        }
+    }
+
     let (virtual_size, identity) = match format {
         ImageFormat::Raw => (
             capacity
@@ -219,21 +258,10 @@ unsafe fn probe_backing(call_table: &CallTable, sector_size: usize) -> Result<Ba
             ParentIdentity::None,
         ),
         ImageFormat::Vhd => {
-            // VHD's footer is the last 512 bytes of the *file*; read the
-            // last sector and locate it within that sector. It only
-            // starts the sector when the sector size is 512: `capacity`
-            // is `div_ceil(size_bytes, sector_size)` and reads past
-            // end-of-file zero-pad, so for a larger sector the footer
-            // sits at some 512-aligned offset inside it — which is what
-            // `vhd::find_footer_offset` scans for.
-            if capacity == 0 {
-                return Err(PARSE_FAILED);
-            }
-            if !(call_table.read_input_sector)(0, capacity - 1, header_ptr, sector_size) {
-                return Err(PARSE_FAILED);
-            }
-            let last_sector = core::slice::from_raw_parts(header_ptr, sector_size);
-            let footer = vhd::VhdFooter::parse_last_sector(last_sector).ok_or(PARSE_FAILED)?;
+            // Located above, by header detection or by the footer
+            // fallback. `None` here means the header claimed VHD and
+            // the footer did not agree, which is a parse failure.
+            let footer = vhd_footer.ok_or(PARSE_FAILED)?;
             if footer.disk_type == vhd::DISK_TYPE_DIFFERENCING {
                 return Err(DIFFERENCING);
             }
@@ -396,17 +424,15 @@ unsafe fn read_vmdk_parent_cid(call_table: &CallTable, sector_size: usize) -> Op
 /// differencing VHDX child only a VHDX parent, so a mismatch there is
 /// refused with `ERROR_PARENT_FORMAT_MISMATCH` rather than written as
 /// an image whose parent can never be resolved. `detected` is the
-/// format found in the parent's own header; the `-F` hint is only
-/// consulted to catch a user who asserted a format the bytes disprove,
-/// because the hint is absent unless `-F` was passed.
+/// format found in the parent's own header; `hint` is the `-F` value,
+/// consulted only to catch a user who asserted a format the bytes
+/// disprove, and [`ImageFormat::Unknown`] when `-F` was not passed
+/// (reachable from the CLI via `-u`, which is what makes `-F`
+/// optional).
 ///
 /// Every other target is unconstrained: qcow2 and vmdk accept
 /// mixed-format parents and this does not change that.
-fn parent_format_matches(
-    target: ImageFormat,
-    detected: ImageFormat,
-    config: &CreateConfig,
-) -> bool {
+fn parent_format_matches(target: ImageFormat, detected: ImageFormat, hint: ImageFormat) -> bool {
     let required = match target {
         ImageFormat::Vhd => ImageFormat::Vhd,
         ImageFormat::Vhdx => ImageFormat::Vhdx,
@@ -415,28 +441,37 @@ fn parent_format_matches(
     if detected != required {
         return false;
     }
-    let hint = ImageFormat::from_u32(config.backing_format);
     matches!(hint, ImageFormat::Unknown) || hint == detected
 }
 
+/// # Errors
+///
+/// [`CreateResult::ERROR_PARENT_FORMAT_MISMATCH`] when a backing file
+/// is present but its identity is not a VHD one. `parent_format_matches`
+/// makes that unreachable, but it is checked here rather than argued
+/// for in a comment: the invariant is relied on *here*, and the failure
+/// mode if a future reordering broke it is a well-formed child carrying
+/// an all-zero parent identity -- which, because every instar-written
+/// VHD shares that identity (#566), would resolve against any of them.
+/// That silent-wrong-output hazard is the one this phase exists to
+/// close, so it fails loudly instead.
 fn vhd_opts_from<'a>(
     config: &CreateConfig,
     virtual_size: u64,
     backing: Option<BackingRef<'a>>,
     identity: ParentIdentity,
-) -> VhdCreateOpts<'a> {
+) -> Result<VhdCreateOpts<'a>, u32> {
     // A vpc child records its parent's own footer `uuid` and
     // creation `timestamp`, so a reader can tell whether the parent it
-    // resolved is the parent the child was written against. The
-    // parent-format check runs before this, so a vpc target with a
-    // backing file always arrives here with a `Vhd` identity; the other
-    // arms are the no-backing case, where the planner writes no parent
-    // fields at all. See docs/plans/PLAN-differencing.md.
-    let (parent_unique_id, parent_timestamp) = match identity {
-        ParentIdentity::Vhd { uuid, timestamp } => (uuid, timestamp),
-        ParentIdentity::None | ParentIdentity::Vhdx { .. } => ([0u8; 16], 0),
+    // resolved is the parent the child was written against. With no
+    // backing file the planner writes no parent fields at all, so the
+    // zeroes below are never read. See docs/plans/PLAN-differencing.md.
+    let (parent_unique_id, parent_timestamp) = match (identity, backing.is_some()) {
+        (ParentIdentity::Vhd { uuid, timestamp }, _) => (uuid, timestamp),
+        (_, false) => ([0u8; 16], 0),
+        (_, true) => return Err(CreateResult::ERROR_PARENT_FORMAT_MISMATCH),
     };
-    VhdCreateOpts {
+    Ok(VhdCreateOpts {
         virtual_size,
         subformat: match config.vhd_subformat {
             1 => VhdSubformat::Fixed,
@@ -450,26 +485,30 @@ fn vhd_opts_from<'a>(
         backing,
         parent_unique_id,
         parent_timestamp,
-    }
+    })
 }
 
+/// # Errors
+///
+/// As [`vhd_opts_from`]: a backing file whose identity is not a VHDX
+/// one is [`CreateResult::ERROR_PARENT_FORMAT_MISMATCH`] rather than a
+/// silent zero `parent_linkage`.
 fn vhdx_opts_from<'a>(
     config: &CreateConfig,
     virtual_size: u64,
     backing: Option<BackingRef<'a>>,
     identity: ParentIdentity,
-) -> VhdxCreateOpts<'a> {
+) -> Result<VhdxCreateOpts<'a>, u32> {
     // A vhdx child records its parent's active-header `DataWriteGuid`
-    // as its own `parent_linkage`. The parent-format check runs before
-    // this, so a vhdx target with a backing file always arrives here
-    // with a `Vhdx` identity; the other arms are the no-backing case,
-    // where the planner writes no parent metadata at all. See
-    // docs/plans/PLAN-differencing.md.
-    let parent_data_write_guid = match identity {
-        ParentIdentity::Vhdx { data_write_guid } => data_write_guid,
-        ParentIdentity::None | ParentIdentity::Vhd { .. } => [0u8; 16],
+    // as its own `parent_linkage`. With no backing file the planner
+    // writes no parent metadata at all, so the zeroes below are never
+    // read. See docs/plans/PLAN-differencing.md.
+    let parent_data_write_guid = match (identity, backing.is_some()) {
+        (ParentIdentity::Vhdx { data_write_guid }, _) => data_write_guid,
+        (_, false) => [0u8; 16],
+        (_, true) => return Err(CreateResult::ERROR_PARENT_FORMAT_MISMATCH),
     };
-    VhdxCreateOpts {
+    Ok(VhdxCreateOpts {
         virtual_size,
         block_size: if config.block_size == 0 {
             32 * 1024 * 1024
@@ -478,7 +517,7 @@ fn vhdx_opts_from<'a>(
         },
         backing,
         parent_data_write_guid,
-    }
+    })
 }
 
 /// Pre-flight check: can the target format address `virtual_size`
@@ -620,8 +659,11 @@ unsafe fn write_plan(call_table: &CallTable, plan: &MetadataPlan<'_>) -> Option<
 /// - Written a populated [`CreateConfig`] at
 ///   [`OPERATION_CONFIG_ADDR`].
 /// - For non-raw targets, attached an output device.
-/// - When `CreateConfig.virtual_size == 0` and a backing reference
-///   is present, attached the backing file as input device 0.
+/// - Whenever a backing reference is present, attached the backing
+///   file as input device 0. (Until #579 this was only required when
+///   `CreateConfig.virtual_size == 0`; the probe now runs whenever
+///   `-b` was given, so it dereferences the device regardless of how
+///   the virtual size was resolved.)
 ///
 /// These invariants hold by construction of the host-side VMM
 /// (phase 3 wires `run_create`); no other caller is architecturally
@@ -796,7 +838,11 @@ pub unsafe extern "C" fn _start() -> u64 {
     // bytes. qcow2 and vmdk accept mixed-format parents and are
     // untouched. See docs/plans/PLAN-differencing.md.
     if let Some(probe) = probe.as_ref() {
-        if !parent_format_matches(target, probe.format, config) {
+        if !parent_format_matches(
+            target,
+            probe.format,
+            ImageFormat::from_u32(config.backing_format),
+        ) {
             return fail_with(
                 call_table,
                 config.target_format,
@@ -847,7 +893,10 @@ pub unsafe extern "C" fn _start() -> u64 {
             }
         }
         ImageFormat::Vhd => {
-            let opts = vhd_opts_from(config, virtual_size, backing_ref, parent_identity);
+            let opts = match vhd_opts_from(config, virtual_size, backing_ref, parent_identity) {
+                Ok(o) => o,
+                Err(code) => return fail_with(call_table, config.target_format, code),
+            };
             let unit = match opts.subformat {
                 VhdSubformat::Fixed => 0,
                 VhdSubformat::Dynamic => opts.block_size,
@@ -858,7 +907,10 @@ pub unsafe extern "C" fn _start() -> u64 {
             }
         }
         ImageFormat::Vhdx => {
-            let opts = vhdx_opts_from(config, virtual_size, backing_ref, parent_identity);
+            let opts = match vhdx_opts_from(config, virtual_size, backing_ref, parent_identity) {
+                Ok(o) => o,
+                Err(code) => return fail_with(call_table, config.target_format, code),
+            };
             let unit = opts.block_size;
             match plan_vhdx(&opts, scratch) {
                 Ok(p) => (p, unit),

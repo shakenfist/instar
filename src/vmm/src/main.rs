@@ -242,6 +242,7 @@ const CREATE_RESULT_ERROR_BACKING_SIZE_TOO_LARGE: u32 = 10;
 const CREATE_RESULT_ERROR_BACKING_DIFFERENCING: u32 = 11;
 const CREATE_RESULT_ERROR_PARENT_NAME_TOO_LONG: u32 = 12;
 const CREATE_RESULT_ERROR_PARENT_FORMAT_MISMATCH: u32 = 13;
+const CREATE_RESULT_ERROR_PARENT_PATH_NOT_REPRESENTABLE: u32 = 14;
 
 // ResizeConfig constants (must match shared crate)
 const RESIZE_CONFIG_MAGIC: u32 = 0x52455349; // "RESI"
@@ -17570,6 +17571,14 @@ fn create_error_detail(code: u32) -> &'static str {
              format's required parent (a vpc child needs a VHD parent, \
              a vhdx child needs a VHDX parent); instar detects the \
              parent's real format from its header, not the -F hint"
+        }
+        CREATE_RESULT_ERROR_PARENT_PATH_NOT_REPRESENTABLE => {
+            "a relative backing path containing a literal backslash \
+             cannot be recorded in a VHD or VHDX parent locator: those \
+             keys hold Windows paths, so instar writes '/' as '\\', \
+             and a backslash already in the name would be read back as \
+             a directory separator; rename the file or pass an \
+             absolute path"
         }
         _ => "unknown error",
     }
