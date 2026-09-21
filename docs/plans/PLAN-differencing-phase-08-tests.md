@@ -104,6 +104,238 @@ carry a note that phase 7 discharged it, in the style the plan
 already uses for phase 5's debt at `:432`. No other factual claim in
 the phase 8 material was wrong.
 
+## Coverage audit
+
+Step 8a. Audited against the worktree at `1010ff4`; no test was added
+or changed to produce it.
+
+The path audited is `instar create -f {vpc,vhdx} -b PARENT [-F FMT]
+CHILD [SIZE]`. **Sector size is deliberately absent**: `create`
+refuses every value but 512 at the host
+(`validate_create_args`, `src/vmm/src/main.rs:17957`), so it is not a
+CLI dimension at all and its coverage is a Rust-only question that
+phase 7's step 7b already owns.
+
+Three states are used:
+
+* **CLI** — a committed Python test drives the case through the real
+  binary.
+* **Rust** — only `crates/create` covers it, at the planner
+  (`tests/round_trip.rs`) or function (`src/lib.rs`) level.
+* **—** — nothing covers it.
+
+Two facts about the run count are worth stating once. Every test in
+`tests/test_create.py`'s `TestCreateSmoke` — which is where all of the
+differencing create tests live — is inherited by
+`TestCreateBaselineMatrix`, `TestCreateCrossValidation` and
+`TestCreateRoundTripCheck`, so each of the names below runs **four**
+times per integration run. And `src/operations/create` is excluded
+from `cargo test --workspace`, so `probe_backing` itself has no unit
+test anywhere; every parent-format row is covered either through the
+CLI or through the `parent_format_matches` / `footer_fallback_applies`
+predicates that the operation calls.
+
+### Combinations judged absurd, and why
+
+* **Parent path shape × parent format.** The parent-format refusal
+  (`src/operations/create/src/main.rs:910`) runs *before* the path is
+  ever rendered — rendering happens inside `plan_vhd` / `plan_vhdx`,
+  which a mismatched parent never reaches. So the path dimension only
+  needs crossing with the child format, not with the parent's.
+* **Parent path shape × `-F` hint, and × SIZE.** Same argument: the
+  hint is consumed by the format check and the size by the size check,
+  both upstream of any path rendering.
+* **A fixed-subformat *child*.** `-f vpc -o subformat=fixed -b` is
+  refused at the host before any of these dimensions apply
+  (`test_create_vpc_fixed_subformat_still_refuses_backing`, plus
+  `round_trip.rs:vhd_fixed_with_backing_is_refused`), so it is one
+  cell and not a factor in the cross-product.
+* **`-F` values outside {raw, qcow2, vmdk, vpc, vhdx}.** Rejected by
+  `create_backing_format_code` before anything else; one cell, not a
+  dimension.
+
+### Child format against parent format
+
+| Parent | vpc child | vhdx child |
+|---|---|---|
+| VHD dynamic | **CLI** `test_create.py:test_create_vhd_and_vhdx_differencing_round_trip` (+ `round_trip.rs:vhd_differencing_round_trips_through_the_parser`) | **CLI** `test_create.py:test_create_vhd_and_vhdx_reject_mismatched_parent_format` (crossed pair, refused) |
+| VHD fixed | **CLI** `test_create.py:test_create_vhd_differencing_from_a_fixed_parent` | **—** |
+| VHD differencing | **—** | **—** |
+| VHDX dynamic | **CLI** `test_create.py:test_create_vhd_and_vhdx_reject_mismatched_parent_format` (crossed pair, refused) | **CLI** `test_create.py:test_create_vhd_and_vhdx_differencing_round_trip` (+ `round_trip.rs:vhdx_differencing_round_trips_through_the_parser`) |
+| VHDX differencing | **—** | **—** |
+
+The `VHD fixed` / vhdx-child cell is not wholly unreasoned: the footer
+fallback promotes the parent to `Vhd` whatever the target is, so it
+lands in the same `detected != required` comparison as the VHD-dynamic
+crossed pair, which `lib.rs:a_vhdx_child_takes_a_vhdx_parent_and_nothing_else`
+covers as a predicate.
+
+The four differencing-parent cells are the only ones in this table
+with no test at any level. `create` refuses a differencing parent in
+`probe_backing` (`src/operations/create/src/main.rs:313` for VHD,
+`:339` for VHDX), and that refusal *is* tested — but only with a
+**qcow2** child, by
+`test_differencing.py:test_create_refuses_a_differencing_backing_file`
+and `test_create.py:test_create_backing_checks_run_with_explicit_size`.
+
+### Parent formats the probe does not accept as a vpc/vhdx parent
+
+`probe_backing` has explicit arms for `Raw`, `Qcow2 | Vmdk4`, `Vhd` and
+`Vhdx`, and a catch-all `_` arm (no size, no identity) covering `Vdi`,
+`Qcow1`, `Qed`, `Iso`, `Luks`, `Parallels`, `Bochs`, `Cloop`, `Dmg`,
+`Vmdk3` and a VMDK text descriptor. `Unknown` means the header could
+not be read at all and is handled separately, at
+`src/operations/create/src/main.rs:902`.
+
+| Parent format | vpc child | vhdx child |
+|---|---|---|
+| raw | **Rust** `lib.rs:a_vpc_child_takes_a_vhd_parent_and_nothing_else` | **Rust** `lib.rs:a_vhdx_child_takes_a_vhdx_parent_and_nothing_else` |
+| qcow2 | **CLI** `test_create.py:test_create_differencing_names_a_corrupt_parent_as_corrupt` (second half) | **Rust** `lib.rs:a_vhdx_child_takes_a_vhdx_parent_and_nothing_else` |
+| vmdk | **Rust** `lib.rs:a_vpc_child_takes_a_vhd_parent_and_nothing_else` | **Rust** `lib.rs:a_vhdx_child_takes_a_vhdx_parent_and_nothing_else` |
+| vdi | **—** | **—** |
+| qcow1 | **—** | **—** |
+| qed | **—** | **—** |
+| iso | **—** | **—** |
+| luks | **—** | **—** |
+| header unreadable (`Unknown`) | **—** | **—** |
+
+Two qualifications. The five `—` formats are not in the predicate
+tests' `EVERY_FORMAT` array, but the refusal they would hit is a single
+format-agnostic `detected != required` comparison
+(`lib.rs:parent_format_matches`) that the three rows above them do
+exercise, and any parent that slipped past it would be refused
+immediately afterwards by the `ParentIdentity::None` check. The
+`Unknown` row appears to be unreachable from the CLI: a short or empty
+backing file reads back as zeros through `BackingStore::read_at`
+rather than failing, so `detect_format_from_header` returns its `Raw`
+catch-all instead. The *other* route to the same
+`ERROR_BACKING_PARSE_FAILED` — right format, unparseable structures —
+is covered by
+`test_create.py:test_create_differencing_names_a_corrupt_parent_as_corrupt`.
+
+### Parent path shape
+
+The caps differ by format and by relative-versus-absolute, because a
+relative path is emitted two UTF-16 code units longer than it was
+typed (the `.\` prefix) while an absolute one keeps its bytes. VHD's
+binding limit is the 512-byte locator sector, so 254 typed code units
+relative and 255 absolute; VHDX's is
+`MAX_PARENT_LOCATOR_VALUE_UTF16_BYTES` at 260 code units, so 258
+relative and 260 absolute. `docs/quirks.md` and the two
+`*_length_boundary` tests carry the arithmetic.
+
+| Shape | vpc child | vhdx child |
+|---|---|---|
+| relative bare (`parent.vhd`) | **CLI** `test_create.py:test_create_vhd_and_vhdx_differencing_round_trip`, and the locator bytes in `test_create.py:test_create_differencing_absolute_parent_and_absent_hint` | **CLI** same two |
+| relative with a subdirectory (`sub/parent.vhd`) | **CLI** `test_create.py:test_create_differencing_relative_parent_in_a_subdirectory` | **CLI** same |
+| `./`-prefixed | **Rust** `round_trip.rs:vhd_differencing_relative_locator_paths_are_windows_rendered`, `lib.rs:a_leading_dot_slash_is_replaced_not_doubled` | **Rust** `round_trip.rs:vhdx_differencing_path_key_follows_the_path` |
+| repeated separators (`sub//parent.vhd`) | **Rust** `lib.rs:repeated_separators_and_dot_components_collapse` only — no emitter-level case | **Rust** same, and same caveat |
+| POSIX absolute | **CLI** `test_create.py:test_create_differencing_absolute_parent_and_absent_hint` | **CLI** same |
+| containing a backslash | **CLI** `test_create.py:test_create_differencing_refuses_a_backslash_in_a_relative_parent` | **CLI** same |
+| empty | **Rust** `round_trip.rs:vhd_differencing_refuses_an_empty_parent_path`, `lib.rs:an_empty_path_is_refused_before_it_gains_a_prefix` | **Rust** `lib.rs:an_empty_path_is_refused_before_it_gains_a_prefix` only (no `plan_vhdx` case) |
+| relative at the cap | **Rust** `round_trip.rs:vhd_differencing_parent_name_length_boundary` (254) | **Rust** `round_trip.rs:vhdx_differencing_parent_path_length_boundary` (258) |
+| relative one over the cap | **Rust** same test (255 refused) | **Rust** same test (259 refused) |
+| absolute at the cap | **Rust** `round_trip.rs:vhd_differencing_absolute_path_length_boundary` (255) | **Rust** `round_trip.rs:vhdx_differencing_absolute_path_length_boundary` (260) |
+| absolute one over the cap | **Rust** same test (256 refused) | **Rust** same test (261 refused) |
+| non-BMP characters (two code units each) | **Rust** `round_trip.rs:vhd_differencing_non_bmp_characters_cost_two_code_units` | **Rust** `vhdx` crate's `build_parent_locator_counts_a_non_bmp_character_as_two_code_units` — the builder, not `plan_vhdx` |
+| over `MAX_BACKING_FILE_LEN` (1024 bytes) | **Rust** `round_trip.rs:vhd_differencing_distinguishes_the_two_length_limits` | **—** |
+
+The empty case is host-refused before the emitter can see it: without
+`-u` the `is_file()` check at `src/vmm/src/main.rs:16962` rejects it
+(an empty relative `-b` resolves to the output's own directory), and
+with `-u` the probe's unreadable-header arm catches it. That chain is
+read from the code rather than measured, and is the one reachability
+claim in this audit that has not been run.
+
+The host's *own* 1024-byte check
+(`src/vmm/src/main.rs:16982`) is untested from the CLI in either
+direction; it is a strictly larger bound than either emitter's, so for
+vpc and vhdx it can only ever be reached after the emitter has already
+refused.
+
+### `-F` hint
+
+| Hint | vpc child | vhdx child |
+|---|---|---|
+| absent (which from the CLI means `-u`; `-b` without `-F` and without `-u` is refused at `src/vmm/src/main.rs:18082`) | **CLI** `test_create.py:test_create_differencing_absolute_parent_and_absent_hint` | **CLI** same |
+| agreeing with detection | **CLI** `test_create.py:test_create_vhd_and_vhdx_differencing_round_trip` | **CLI** same |
+| contradicting detection | **CLI** `test_create.py:test_create_vhd_and_vhdx_reject_mismatched_parent_format` (`-F qcow2` over a VHD parent) | **Rust** `lib.rs:a_hint_the_bytes_disprove_is_refused` |
+
+`-F raw` deserves its own note: it is the one hint that suppresses the
+VHD footer fallback, and
+`test_create.py:test_create_honours_an_explicit_raw_backing_hint`
+drives it through the CLI — but with a **qcow2** child, so the
+composed "a fixed VHD parent under `-F raw` is refused for a vpc
+child" behaviour exists only as the two predicates
+`footer_fallback_applies` and `parent_format_matches` tested
+separately.
+
+### SIZE argument
+
+| SIZE | vpc child | vhdx child |
+|---|---|---|
+| absent (inherit the parent's) | **CLI** `test_create.py:test_create_differencing_refuses_a_size_that_is_not_the_parents` | **CLI** same |
+| correct (equals the parent's) | **CLI** same test | **CLI** same test |
+| wrong | **CLI** same test | **CLI** same test |
+
+### Totals
+
+66 cells enumerated: **25 CLI**, **24 Rust-only**, **17 with no
+coverage at all**.
+
+### The cells with no coverage, and whether a wrong answer there is visible
+
+| Cell | Would a wrong answer be visible? |
+|---|---|
+| VHD differencing parent → vpc child | **No.** Nothing asserts a vpc child is refused a differencing parent, so an emitter that accepted one would write a structurally valid differencing VHD naming a parent that is itself differencing — a chain instar cannot compose, and no existing test looks at it. The guard is shared with the tested qcow2-child path, so only a *target-specific* regression slips through, but that is exactly the shape of regression this path has had before. |
+| VHDX differencing parent → vhdx child | **No**, identically, and with one extra edge: the VHDX refusal is a separate arm (`state.has_parent`) from the VHD one, so the two are not one guard sharing one test. |
+| VHD differencing parent → vhdx child | Yes — refused by the format mismatch even if the differencing guard failed, and that mismatch is CLI-tested for a VHD parent. |
+| VHDX differencing parent → vpc child | Yes, for the same reason with the formats swapped. |
+| vdi / qcow1 / qed / iso / luks parent → vpc child (5 cells) | Yes. Accepting one would need `detected == Vhd`, which those formats cannot produce; and the `ParentIdentity::None` check immediately downstream refuses any parent that yields no identity, so no child could be written. |
+| vdi / qcow1 / qed / iso / luks parent → vhdx child (5 cells) | Yes, same argument. |
+| header unreadable (`Unknown`) → vpc child | Yes, and the cell looks unreachable from the CLI in any case: a short backing file reads back as zeros rather than failing, so detection returns `Raw`. |
+| header unreadable (`Unknown`) → vhdx child | Yes, same. |
+| over-`MAX_BACKING_FILE_LEN` path → vhdx child | Yes. The only thing at stake is *which* refusal message is printed (`BackingFileTooLong` versus `ParentNameTooLong`); no image is produced either way, and `plan_vhdx` already refuses at 258/260 code units, far below 1024. |
+
+So of the seventeen, **two qualify under decision 4** — a differencing
+VHD parent for a vpc child, and a differencing VHDX parent for a vhdx
+child. Both are reachable from the CLI, both would let a wrong answer
+through unnoticed, and both are one `subTest` on an existing fixture.
+Step 8d decides whether to spend them.
+
+### Assertions that are weaker than they read
+
+Not gaps in the cross-product, but found while reading the tests and
+relevant to what 8b and 8d should lean on:
+
+* `test_create_vhd_and_vhdx_differencing_round_trip` proves the VHDX
+  `parent_linkage` with `assertIn(linkage.encode('utf-16-le'),
+  child_bytes)` — a **whole-file substring search**. It would pass if
+  the GUID were written under the wrong key, in a stray second locator
+  item, or anywhere else in the file. The VHD arm of the same test is
+  structural by comparison (it walks `data_offset` to the dynamic
+  header). This is precisely the assertion step 8b's `vhdiinfo`
+  cross-check replaces with a parsed one.
+* The same test's VHDX arm never asserts the File Parameters
+  `HasParent` bit through the CLI, where the VHD arm does assert
+  `disk_type == 4`. `round_trip.rs:vhdx_differencing_round_trips_through_the_parser`
+  pins `HasParent`, but against a plan built from a constant GUID, not
+  from a parent's bytes.
+* The locator assertions in
+  `test_create_differencing_relative_parent_in_a_subdirectory` and in
+  the `-u` leg of `test_create_differencing_absolute_parent_and_absent_hint`
+  are whole-file substring searches too. They have real teeth — the
+  Windows-rendered bytes appear nowhere else — but they would pass
+  with the locator in the wrong slot or carrying the wrong platform
+  code. `round_trip.rs:vhd_differencing_platform_code_follows_the_path`
+  covers the code itself, so the composite risk is low.
+* `test_create_differencing_refuses_a_size_that_is_not_the_parents`
+  asserts only `rc == 0` on its "the parent's own size is accepted"
+  leg. An emitter that accepted the size and then wrote a *different*
+  one into the child would pass. The "omitted" leg does check the
+  resulting virtual size, so the property is covered by its neighbour
+  rather than by the leg that names it.
+
 ## Decisions
 
 1. **The oracle split is structural here, content in phase 15.**
