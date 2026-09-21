@@ -3527,6 +3527,34 @@ impl CreateResult {
     /// still overflows this one, so reusing the code would report a
     /// limit the path never came near.
     pub const ERROR_PARENT_NAME_TOO_LONG: u32 = 12;
+    /// A differencing child's parent is not the format the child
+    /// requires: Hyper-V requires a VHD parent for a VHD child and a
+    /// VHDX parent for a VHDX child, and instar detects the parent's
+    /// real format from its header rather than trusting a `-F` hint.
+    /// Distinguished from `ERROR_BACKING_DIFFERENCING`, whose parent
+    /// parsed as the right format but was itself a differencing
+    /// image: here the parent parsed fine and is not differencing, it
+    /// is simply the wrong format, and emitting a chain no
+    /// implementation can resolve would be worse than a typed
+    /// refusal.
+    pub const ERROR_PARENT_FORMAT_MISMATCH: u32 = 13;
+    /// A relative backing path cannot be rendered into a parent
+    /// locator without changing which file it names. The locator keys
+    /// VHD and VHDX define (`W2ru`, `relative_path`) are Windows
+    /// paths, so instar rewrites `/` to `\` when it fills them -- and
+    /// a literal `\` already in a POSIX filename is indistinguishable
+    /// from one that rewrite produced. `a\b.vhd` (one file) and
+    /// `a/b.vhd` (a file in a subdirectory) would emit the same
+    /// locator. Refused rather than written, because a VHDX child has
+    /// no other record of its parent's path.
+    pub const ERROR_PARENT_PATH_NOT_REPRESENTABLE: u32 = 14;
+    /// A differencing child was given an explicit size that is not its
+    /// parent's. The two describe the same disk -- every block the
+    /// child marks absent is read from the parent at the same offset
+    /// -- so a child of a different size is a chain no implementation
+    /// can compose. Distinguished from ERROR_BACKING_SIZE_TOO_LARGE,
+    /// which is about a size the *target format* cannot address.
+    pub const ERROR_PARENT_SIZE_MISMATCH: u32 = 15;
 
     /// True if magic matches.
     pub fn is_valid(&self) -> bool {

@@ -61,6 +61,98 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   "invalid option for target format", because the guest has nowhere to
   get the parent's `DataWriteGuid` from until it can open the parent.
 
+- **`instar create -f vpc -b parent.vhd -F vpc child.vhd` and `instar
+  create -f vhdx -b parent.vhdx -F vhdx child.vhdx` now produce
+  differencing children** — reaching the emitters above from the CLI
+  for the first time, unlike the two crate-level changes above. The
+  guest reads the parent's identity off the parent itself, a VHD
+  parent's footer `uuid` and `timestamp` or a VHDX parent's
+  active-header `DataWriteGuid`, instead of being handed a placeholder.
+  A differencing child's parent must be the same format as the child:
+  format detection decides, not the `-F` hint, and a parent that
+  detects as anything else — or a hint that contradicts detection — is
+  refused with a typed `ERROR_PARENT_FORMAT_MISMATCH`
+  ([PLAN-differencing.md](docs/plans/PLAN-differencing.md)). qemu-img
+  creates neither differencing format, so there is no oracle to
+  cross-validate against; verification is instar's own parsers,
+  `vhdiinfo`, and byte-level assertions against the parent's own
+  fields.
+
+  Relative and absolute parent paths are recorded differently, settling
+  [#570](https://github.com/shakenfist/instar/issues/570): a relative
+  path is normalised into the Hyper-V convention before being written
+  to the parent locator (`/` becomes `\`, prefixed `.\`), matching the
+  measured Hyper-V fixtures; a POSIX-absolute path is kept verbatim
+  under the Windows-defined locator key, because no honest Windows-style
+  rendering of it exists and SPEC(VHDX) 2.6.2.6.3 requires at least one
+  path key. The VHD parent unicode name field always keeps the path as
+  typed regardless — that is the field qemu and libvhdi actually
+  resolve through. One consequence: a relative parent path caps two
+  code units shorter than an absolute one, because the `.\` prefix
+  comes out of the same budget — 254 vs 255 for VHD, 258 vs 260 for
+  VHDX. A second consequence: **a relative parent path containing a
+  literal backslash is refused**, with a typed
+  `ERROR_PARENT_PATH_NOT_REPRESENTABLE`. The normalisation is what
+  gives `\` its meaning in the emitted string, so a backslash the user
+  typed is indistinguishable from one the normalisation produced —
+  `a\b.vhd` (one file) and `a/b.vhd` (a file in a subdirectory) would
+  emit the same locator, and a VHDX child has no second record of its
+  parent's path to disambiguate with. See the "VHD/VHDX differencing"
+  section of [docs/quirks.md](docs/quirks.md).
+
+  A differencing child **inherits its parent's virtual size**, and an
+  explicit `SIZE` that disagrees with the parent is refused with a
+  typed `ERROR_PARENT_SIZE_MISMATCH`. The child stores only the
+  blocks that differ and reads every other block from the parent at
+  the same offset, so a chain whose two images describe different
+  disks cannot be composed. The case that bites is not a deliberate
+  mismatch: qemu-img rounds a VHD's virtual size up to CHS geometry
+  and instar does not, so a parent qemu-img created as `64M` declares
+  67,125,248 bytes, and `create -f vpc -b parent.vhd -F vpc child.vhd
+  64M` — the most natural way to type it — would otherwise have
+  emitted a child declaring 67,108,864 against it.
+
+  Either VHD subformat is accepted as the **parent**, fixed included:
+  the parent probe reads the trailing footer rather than trusting the
+  first sector, which is the only place a fixed VHD's `conectix`
+  cookie appears. The **child** is necessarily `subformat=dynamic`,
+  since a fixed VHD has no dynamic header to record a parent in, so
+  `-o subformat=fixed` together with `-b` is still refused.
+
+  A parent of the **right** format that will not parse — a VHD whose
+  trailing footer is missing or truncated, a VHDX whose headers or
+  region table are unreadable — is now refused with
+  `ERROR_BACKING_PARSE_FAILED` rather than
+  `ERROR_PARENT_FORMAT_MISMATCH`. The old message told the user their
+  VHD parent was not a VHD, which was both false and unactionable.
+  A parent that genuinely is the wrong format still says so.
+
+  Note that `-u` is **not** a synonym for `-F raw` when sizing a
+  parent: `-u` asserts nothing about the format, so it leaves the VHD
+  footer fallback in place, and `create -f qcow2 -b fixed.vhd -u
+  child.qcow2` sizes the parent from its footer while `-F raw` sizes it
+  from the file length. Any `-F` that positively asserts a format
+  suppresses the fallback (`-F vpc` excepted, since it agrees with it),
+  so untrusted tail bytes that happen to begin with `conectix` cannot
+  re-classify a parent the user declared. See
+  [create.md](docs/create.md).
+
+  A relative parent path is rewritten into a POSIX-*equivalent* form
+  rather than kept byte for byte: redundant leading `./` components and
+  repeated separators are collapsed before `/` is mapped to `\`, so
+  `-b ./sub//parent.vhdx` emits `.\sub\parent.vhdx` and a path that
+  collapses to nothing is refused. For VHDX that is visible on the way
+  back out, since the locator is the only record of the path.
+
+  `instar info` reports a differencing child's parent path in POSIX
+  convention for both formats. A VHD child's already was, being read
+  from the parent unicode name field; a VHDX child's is read from the
+  locator, so the `relative_path` key is rendered back — the leading
+  `.\` dropped, `\` mapped to `/` — and `create -f vhdx -b
+  parent.vhdx` followed by `info child.vhdx` reports `parent.vhdx`
+  rather than the unopenable `.\parent.vhdx`. The two absolute locator
+  keys are reported verbatim.
+
 ### Changed
 
 - **CI runs on Debian 13 runners.** Every job moved from the `debian-12`
@@ -356,6 +448,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   for a VHDX parent's Windows-shaped locator, and `resize` still
   accepts a differencing VHDX (a pre-existing, unrelated write-path
   bug, now tracked as issue #565).
+
+- **`create -b` skipped every check on the backing image when an
+  explicit size was also given.** `probe_backing` only ran when no
+  `SIZE` was passed, since its original job was inferring a missing
+  size, so `create -b <backing file> child.qcow2 64M` silently skipped
+  the differencing-parent refusal, the parse check and format
+  detection alike — the same command without the trailing size was
+  correctly refused
+  ([#579](https://github.com/shakenfist/instar/issues/579)). It now
+  runs whenever `-b` is given, size or no.
+
+  Running the probe always does not mean every backing image must be
+  one it can size. It parses raw, qcow2, sparse VMDK, VHD (either
+  subformat) and VHDX; for anything else — vdi, qcow1, qed, iso,
+  luks, parallels, bochs, cloop, the VMDK v3 header, a VMDK text
+  descriptor as `monolithicFlat` produces, or a block device that
+  stats as zero-length — it reports the detected format and no size,
+  which is fatal only where a size is actually needed. So `create -f
+  qcow2 -b flat.vmdk -F vmdk child.qcow2 64M` still works, as it does
+  on `develop` and under qemu-img, while the same command without the
+  trailing size is refused for having no size to infer.
 
 ## [0.3.0] - 2026-08-02
 

@@ -1225,8 +1225,27 @@ unsafe fn detect_vhdx_parent_backing_file(
     // free function here that could never run); copying it into a
     // NUL-terminated buffer is `shared::write_nul_terminated`, likewise
     // moved so it runs under `shared`'s suite.
-    match locator.preferred_path() {
-        Some(bytes) => shared::write_nul_terminated(bytes, backing_file_buf),
+    //
+    // The `relative_path` key holds a *Windows* relative path, so its
+    // bytes are rendered back into POSIX convention before they are
+    // reported. Without this a child created by `create -f vhdx -b
+    // parent.vhdx` reports `.\parent.vhdx` -- a path no POSIX resolver
+    // can open, and not what the user typed -- while the VHD arm above
+    // reports `parent.vhdx`, because VHD's parent *unicode name* field
+    // keeps the path as typed and only VHD's locator entries carry the
+    // Windows convention. The two formats agreeing here is asserted by
+    // `test_create_vhd_and_vhdx_differencing_round_trip`. The other two
+    // path keys are absolute and are reported verbatim; see
+    // `preferred_path_with_convention`.
+    match locator.preferred_path_with_convention() {
+        Some((bytes, true)) => {
+            let mut posix = [0u8; vhdx::MAX_PARENT_LOCATOR_VALUE_UTF8];
+            match vhdx::posix_relative_path(bytes, &mut posix) {
+                Some(rendered) => shared::write_nul_terminated(rendered, backing_file_buf),
+                None => false,
+            }
+        }
+        Some((bytes, false)) => shared::write_nul_terminated(bytes, backing_file_buf),
         None => false,
     }
 }

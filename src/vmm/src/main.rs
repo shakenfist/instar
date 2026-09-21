@@ -225,22 +225,39 @@ const CREATE_CONFIG_PREALLOC_FALLOC: u32 = 2 << 4;
 const CREATE_CONFIG_PREALLOC_FULL: u32 = 3 << 4;
 const CREATE_CONFIG_MAX_BACKING_FILE: usize = 1024;
 
-// CreateResult constants (must match shared crate)
 #[allow(dead_code)]
-const CREATE_RESULT_MAGIC: u32 = 0x43524553; // "CRES"
-const CREATE_RESULT_ERROR_OK: u32 = 0;
-const CREATE_RESULT_ERROR_INVALID_OPTION: u32 = 1;
-const CREATE_RESULT_ERROR_INVALID_SIZE: u32 = 2;
-const CREATE_RESULT_ERROR_SCRATCH_TOO_SMALL: u32 = 3;
-const CREATE_RESULT_ERROR_BACKING_READ_FAILED: u32 = 4;
-const CREATE_RESULT_ERROR_BACKING_PARSE_FAILED: u32 = 5;
-const CREATE_RESULT_ERROR_BACKING_TOO_LONG: u32 = 6;
-const CREATE_RESULT_ERROR_WRITE_FAILED: u32 = 7;
-const CREATE_RESULT_ERROR_UNSUPPORTED_FORMAT: u32 = 8;
-const CREATE_RESULT_ERROR_BACKING_FORMAT_UNSUPPORTED: u32 = 9;
-const CREATE_RESULT_ERROR_BACKING_SIZE_TOO_LARGE: u32 = 10;
-const CREATE_RESULT_ERROR_BACKING_DIFFERENCING: u32 = 11;
-const CREATE_RESULT_ERROR_PARENT_NAME_TOO_LONG: u32 = 12;
+// The create result ABI is defined once, in `shared::CreateResult`, and
+// named here so `create_error_detail` can match on it. Deriving each
+// constant from `shared` rather than repeating its literal means a code
+// that is added on one side and not the other is a build failure, not a
+// wrong error message at runtime (issue #580 tracks giving these codes a
+// payload channel; this only closes the numbering hazard).
+const CREATE_RESULT_MAGIC: u32 = shared::CreateResult::MAGIC;
+const CREATE_RESULT_ERROR_OK: u32 = shared::CreateResult::ERROR_OK;
+const CREATE_RESULT_ERROR_INVALID_OPTION: u32 = shared::CreateResult::ERROR_INVALID_OPTION;
+const CREATE_RESULT_ERROR_INVALID_SIZE: u32 = shared::CreateResult::ERROR_INVALID_SIZE;
+const CREATE_RESULT_ERROR_SCRATCH_TOO_SMALL: u32 = shared::CreateResult::ERROR_SCRATCH_TOO_SMALL;
+const CREATE_RESULT_ERROR_BACKING_READ_FAILED: u32 =
+    shared::CreateResult::ERROR_BACKING_READ_FAILED;
+const CREATE_RESULT_ERROR_BACKING_PARSE_FAILED: u32 =
+    shared::CreateResult::ERROR_BACKING_PARSE_FAILED;
+const CREATE_RESULT_ERROR_BACKING_TOO_LONG: u32 = shared::CreateResult::ERROR_BACKING_TOO_LONG;
+const CREATE_RESULT_ERROR_WRITE_FAILED: u32 = shared::CreateResult::ERROR_WRITE_FAILED;
+const CREATE_RESULT_ERROR_UNSUPPORTED_FORMAT: u32 = shared::CreateResult::ERROR_UNSUPPORTED_FORMAT;
+const CREATE_RESULT_ERROR_BACKING_FORMAT_UNSUPPORTED: u32 =
+    shared::CreateResult::ERROR_BACKING_FORMAT_UNSUPPORTED;
+const CREATE_RESULT_ERROR_BACKING_SIZE_TOO_LARGE: u32 =
+    shared::CreateResult::ERROR_BACKING_SIZE_TOO_LARGE;
+const CREATE_RESULT_ERROR_BACKING_DIFFERENCING: u32 =
+    shared::CreateResult::ERROR_BACKING_DIFFERENCING;
+const CREATE_RESULT_ERROR_PARENT_NAME_TOO_LONG: u32 =
+    shared::CreateResult::ERROR_PARENT_NAME_TOO_LONG;
+const CREATE_RESULT_ERROR_PARENT_FORMAT_MISMATCH: u32 =
+    shared::CreateResult::ERROR_PARENT_FORMAT_MISMATCH;
+const CREATE_RESULT_ERROR_PARENT_PATH_NOT_REPRESENTABLE: u32 =
+    shared::CreateResult::ERROR_PARENT_PATH_NOT_REPRESENTABLE;
+const CREATE_RESULT_ERROR_PARENT_SIZE_MISMATCH: u32 =
+    shared::CreateResult::ERROR_PARENT_SIZE_MISMATCH;
 
 // ResizeConfig constants (must match shared crate)
 const RESIZE_CONFIG_MAGIC: u32 = 0x52455349; // "RESI"
@@ -17536,8 +17553,14 @@ fn create_error_detail(code: u32) -> &'static str {
         }
         CREATE_RESULT_ERROR_BACKING_READ_FAILED => "failed to read backing file header",
         CREATE_RESULT_ERROR_BACKING_PARSE_FAILED => {
-            "backing file header could not be parsed \
-             (file may be truncated, corrupted, or an unrecognised format)"
+            // Not "header": this code also covers a parent whose header
+            // parsed perfectly and whose deeper structures did not -- a
+            // VHD missing its trailing footer, a VHDX with an
+            // unreadable region table -- which is the case the
+            // identity guard in the create op reports through here.
+            "backing file could not be parsed (its header, footer or \
+             metadata region may be truncated, corrupted, or an \
+             unrecognised format)"
         }
         CREATE_RESULT_ERROR_BACKING_TOO_LONG => "backing file path too long (max 1024 bytes)",
         CREATE_RESULT_ERROR_WRITE_FAILED => "write to output device failed",
@@ -17558,11 +17581,40 @@ fn create_error_detail(code: u32) -> &'static str {
              read back (see PLAN-differencing.md)"
         }
         CREATE_RESULT_ERROR_PARENT_NAME_TOO_LONG => {
+            // A relative path caps two code units shorter than an
+            // absolute one, because the `.\` a relative parent locator
+            // carries comes out of the same budget. Saying only the
+            // absolute figure gets the common case wrong by exactly
+            // two, and the old "or a relative one" advice pointed at
+            // the tighter limit.
             "backing file path does not fit the target format's parent \
-             name field (VHD allows at most 255 UTF-16 code units, \
-             VHDX at most 260, and a character outside the Basic \
-             Multilingual Plane costs two); use a shorter path or a \
-             relative one"
+             name field (VHD allows 255 UTF-16 code units for an \
+             absolute path and 254 for a relative one, VHDX 260 and \
+             258; the `.\\` prefix a relative parent locator carries \
+             costs two, and a character outside the Basic Multilingual \
+             Plane costs two); use a shorter path, or an absolute one \
+             for the two extra code units"
+        }
+        CREATE_RESULT_ERROR_PARENT_FORMAT_MISMATCH => {
+            "backing file's detected format does not match the target \
+             format's required parent (a vpc child needs a VHD parent, \
+             a vhdx child needs a VHDX parent); instar detects the \
+             parent's real format from its header, not the -F hint"
+        }
+        CREATE_RESULT_ERROR_PARENT_PATH_NOT_REPRESENTABLE => {
+            "a relative backing path containing a literal backslash \
+             cannot be recorded in a VHD or VHDX parent locator: those \
+             keys hold Windows paths, so instar writes '/' as '\\', \
+             and a backslash already in the name would be read back as \
+             a directory separator; rename the file or pass an \
+             absolute path"
+        }
+        CREATE_RESULT_ERROR_PARENT_SIZE_MISMATCH => {
+            "a differencing child must be the same virtual size as its \
+             parent, and the SIZE given is not; omit SIZE and the child \
+             inherits the parent's size. (qemu-img rounds a VHD's size \
+             up to CHS geometry while instar does not, so a parent \
+             qemu-img created as 64M may not declare exactly 64M.)"
         }
         _ => "unknown error",
     }
@@ -18778,6 +18830,75 @@ mod amend_o_option_parser_tests {
     fn missing_value_is_error() {
         let err = parse_amend_o_options(&opts(&["compat"])).unwrap_err();
         assert!(err.to_string().contains("missing a value"), "{err}");
+    }
+}
+
+/// The text of the create operation's error details.
+///
+/// These strings are the whole of what a user gets: the codes carry no
+/// payload (#580), so a message that states a wrong number or names the
+/// wrong structure is the entire diagnosis being wrong. Two of them
+/// said something this branch made false, and neither had a test --
+/// which is why they survived three review rounds.
+#[cfg(test)]
+mod create_error_detail_tests {
+    use super::*;
+
+    #[test]
+    fn the_name_too_long_message_states_both_caps() {
+        let detail = create_error_detail(CREATE_RESULT_ERROR_PARENT_NAME_TOO_LONG);
+        // A relative parent path caps two code units shorter than an
+        // absolute one, because the `.\` prefix comes out of the same
+        // budget. Quoting only 255/260 gets the *common* case -- a
+        // relative path -- wrong by exactly two.
+        for figure in ["255", "254", "260", "258"] {
+            assert!(
+                detail.contains(figure),
+                "the name-too-long message does not state {figure}: {detail}"
+            );
+        }
+        // The old advice pointed at the tighter limit.
+        assert!(
+            !detail.contains("use a shorter path or a relative one"),
+            "the message still advises a relative path, which is the \
+             tighter limit: {detail}"
+        );
+    }
+
+    #[test]
+    fn the_parse_failed_message_is_not_limited_to_the_header() {
+        let detail = create_error_detail(CREATE_RESULT_ERROR_BACKING_PARSE_FAILED);
+        // This code now also covers a parent whose header parsed
+        // perfectly and whose footer or metadata region did not -- the
+        // case the create op's identity guard reports through here.
+        // Saying "header could not be parsed" for it is false in
+        // exactly the way the format-mismatch message it replaced was.
+        assert!(
+            !detail.contains("header could not be parsed"),
+            "the parse-failure message still blames the header alone: {detail}"
+        );
+        for structure in ["header", "footer", "metadata"] {
+            assert!(
+                detail.contains(structure),
+                "the parse-failure message does not mention {structure}: {detail}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_create_result_code_has_a_detail() {
+        // A code added on one side and not the other would otherwise
+        // surface as a generic fallback at runtime.
+        for code in [
+            CREATE_RESULT_ERROR_BACKING_PARSE_FAILED,
+            CREATE_RESULT_ERROR_PARENT_NAME_TOO_LONG,
+            CREATE_RESULT_ERROR_PARENT_FORMAT_MISMATCH,
+            CREATE_RESULT_ERROR_PARENT_PATH_NOT_REPRESENTABLE,
+            CREATE_RESULT_ERROR_PARENT_SIZE_MISMATCH,
+        ] {
+            let detail = create_error_detail(code);
+            assert!(!detail.is_empty(), "code {code} has an empty detail");
+        }
     }
 }
 

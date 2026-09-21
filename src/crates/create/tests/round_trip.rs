@@ -391,6 +391,17 @@ const DIFF_PARENT_TIMESTAMP: u32 = 0x1A2B_3C4D;
 /// A relative parent path: relative selects the `W2ru` platform code.
 const DIFF_PARENT_PATH: &str = "parent.vhd";
 
+/// [`DIFF_PARENT_PATH`] as the **locator** carries it.
+///
+/// `W2ru` is a Windows-defined platform code, so a relative path is
+/// emitted in the Windows convention the measured Hyper-V fixtures use:
+/// separators flipped and a leading `.\`
+/// ([PLAN-differencing.md](docs/plans/PLAN-differencing.md)). The parent
+/// unicode name field 1024 bytes earlier keeps [`DIFF_PARENT_PATH`]
+/// itself — the tests below assert both, because the two fields
+/// deliberately disagree now.
+const DIFF_PARENT_PATH_EMITTED: &str = r".\parent.vhd";
+
 /// Absolute file offsets of a differencing child's metadata, per decision
 /// 1 of the phase plan. Written as literals rather than derived from the
 /// planner, so a layout change has to edit them.
@@ -536,7 +547,7 @@ fn vhd_differencing_round_trips_through_the_parser() {
     assert_eq!(entry.platform_data_space, 512);
     assert_eq!(
         entry.platform_data_length,
-        (DIFF_PARENT_PATH.len() * 2) as u32,
+        (DIFF_PARENT_PATH_EMITTED.len() * 2) as u32,
         "an all-BMP path is two bytes per character, with no terminator",
     );
     assert_eq!(entry.reserved, 0);
@@ -555,7 +566,7 @@ fn vhd_differencing_round_trips_through_the_parser() {
     let n = entry
         .decode_path(&window, &mut path)
         .expect("decode locator path");
-    assert_eq!(&path[..n], DIFF_PARENT_PATH.as_bytes());
+    assert_eq!(&path[..n], DIFF_PARENT_PATH_EMITTED.as_bytes());
 
     // --- the two endiannesses, against raw bytes --------------------------
     //
@@ -565,24 +576,28 @@ fn vhd_differencing_round_trips_through_the_parser() {
     // one encoder for both would still round-trip through instar's own
     // parser if the parser were wrong in the same direction. These compare
     // against bytes written out by hand.
+    //
+    // The two fields also carry *different paths* now: the name field is
+    // the path as typed and the locator is the Windows rendering, so the
+    // first characters differ as well as their byte order.
     let name_field = DIFF_DYN_HEADER_OFF + 64;
     assert_eq!(
         &bytes[name_field..name_field + 6],
-        // 'p' 'a' 'r', high byte first.
+        // 'p' 'a' 'r', high byte first — the typed path, not `.\p`.
         &[0x00, b'p', 0x00, b'a', 0x00, b'r'],
-        "the parent unicode name must be UTF-16 big endian",
+        "the parent unicode name must be UTF-16 big endian, and as typed",
     );
     assert_eq!(
         &bytes[DIFF_LOCATOR_DATA_OFF..DIFF_LOCATOR_DATA_OFF + 6],
-        // The same three characters, low byte first.
-        &[b'p', 0x00, b'a', 0x00, b'r', 0x00],
+        // '.' '\' 'p', low byte first.
+        &[b'.', 0x00, b'\\', 0x00, b'p', 0x00],
         "the locator platform data must be UTF-16 little endian",
     );
 
     // The locator data region is one sector, and the bytes past the path
     // are zero padding rather than anything left over.
     assert!(
-        bytes[DIFF_LOCATOR_DATA_OFF + DIFF_PARENT_PATH.len() * 2..DIFF_BAT_OFF as usize]
+        bytes[DIFF_LOCATOR_DATA_OFF + DIFF_PARENT_PATH_EMITTED.len() * 2..DIFF_BAT_OFF as usize]
             .iter()
             .all(|&b| b == 0),
         "the tail of the locator sector is not zero padded",
@@ -661,7 +676,72 @@ fn vhd_differencing_platform_code_follows_the_path() {
     assert_eq!(&nested[code_off..code_off + 4], b"W2ru");
 }
 
-/// The 255-UTF-16-code-unit cap, as `plan_vhd` surfaces it.
+/// The locator path of a materialised differencing child, decoded.
+fn locator_path(bytes: &[u8]) -> Vec<u8> {
+    let bounds = diff_bounds(bytes);
+    let info = vhd::VhdParentInfo::parse(dyn_header(bytes), &bounds).expect("parse parent info");
+    let window = vhd::VhdImageWindow {
+        file_offset: 0,
+        bytes,
+    };
+    let mut out = [0u8; vhd::MAX_PARENT_NAME_UTF8];
+    let n = info.locators.entries[0]
+        .decode_path(&window, &mut out)
+        .expect("decode locator path");
+    out[..n].to_vec()
+}
+
+/// The parent unicode name of a materialised differencing child, decoded.
+fn parent_unicode_name(bytes: &[u8]) -> Vec<u8> {
+    let bounds = diff_bounds(bytes);
+    let info = vhd::VhdParentInfo::parse(dyn_header(bytes), &bounds).expect("parse parent info");
+    let mut out = [0u8; vhd::MAX_PARENT_NAME_UTF8];
+    let n = info.decode_name(&mut out).expect("decode parent name");
+    out[..n].to_vec()
+}
+
+/// The path *bytes* the `W2ru` locator carries, for every shape of
+/// relative input — and the `W2ku` one, which is not normalised.
+///
+/// `W2ru` is a Windows-defined platform code, so a relative path goes
+/// out in the Windows convention the phase 3 Hyper-V fixtures use: `/`
+/// becomes `\` and the result is prefixed `.\`, with a leading `./`
+/// replaced by that prefix rather than doubled. A POSIX-absolute path
+/// has no honest `W2ku` rendering, so it keeps its bytes — see
+/// [PLAN-differencing.md](docs/plans/PLAN-differencing.md).
+///
+/// Every case also asserts the parent unicode name is untouched. That
+/// field is the one qemu's `block/vpc.c` and libvhdi actually resolve a
+/// parent through, and normalising it would break both oracles; an
+/// emitter that normalised once and used the result for both fields
+/// would pass every locator assertion here.
+#[test]
+fn vhd_differencing_relative_locator_paths_are_windows_rendered() {
+    for (typed, emitted) in [
+        ("parent.vhd", r".\parent.vhd"),
+        ("./parent.vhd", r".\parent.vhd"),
+        ("sub/dir/parent.vhd", r".\sub\dir\parent.vhd"),
+        ("../parent.vhd", r".\..\parent.vhd"),
+        ("./sub/parent.vhd", r".\sub\parent.vhd"),
+        // Absolute: verbatim, forward slashes and all.
+        ("/srv/images/parent.vhd", "/srv/images/parent.vhd"),
+        ("/parent.vhd", "/parent.vhd"),
+    ] {
+        let bytes = materialise_differencing(typed);
+        assert_eq!(
+            locator_path(&bytes),
+            emitted.as_bytes(),
+            "locator path for {typed:?}",
+        );
+        assert_eq!(
+            parent_unicode_name(&bytes),
+            typed.as_bytes(),
+            "the parent unicode name must stay as typed for {typed:?}",
+        );
+    }
+}
+
+/// The length cap on a *relative* parent path, as `plan_vhd` surfaces it.
 ///
 /// The boundary itself is `crates/vhd`'s and is tested there against the
 /// builder. What this adds is that `plan_vhd` neither re-derives the limit
@@ -669,11 +749,67 @@ fn vhd_differencing_platform_code_follows_the_path() {
 /// [`CreateError::ParentNameTooLong`] and not as `BackingFileTooLong`,
 /// whose host message names a 1024-byte limit that has nothing to do with
 /// the 512-byte field that actually overflowed.
+///
+/// # Why the boundary is 254 and not 255
+///
+/// Two fields carry the path and they now hold different strings, so
+/// there are two caps and the smaller one binds:
+///
+/// * the parent unicode name field takes the path **as typed** and stops
+///   at 255 UTF-16 code units, leaving a terminating NUL inside its 512
+///   bytes;
+/// * the locator platform data takes the path **normalised** — two code
+///   units longer for a bare relative name — into a one-sector region,
+///   which holds 256 code units and needs no terminator because
+///   `platform_data_length` delimits it.
+///
+/// So a relative path of 254 typed code units emits a 256-code-unit
+/// locator that exactly fills the sector, and 255 no longer fits.
+/// [`vhd_differencing_absolute_path_length_boundary`] is the same
+/// boundary for an absolute path, which is not normalised and so still
+/// stops at the name field's 255.
 #[test]
 fn vhd_differencing_parent_name_length_boundary() {
+    // 254 typed code units, `.\` and 508 bytes in the name field; 256
+    // code units and all 512 bytes of the locator sector.
+    let fits = "a".repeat(254);
+    let bytes = materialise_differencing(&fits);
+    let bounds = diff_bounds(&bytes);
+    let info = vhd::VhdParentInfo::parse(dyn_header(&bytes), &bounds).expect("parse parent info");
+    let mut name = [0u8; vhd::MAX_PARENT_NAME_UTF8];
+    let n = info.decode_name(&mut name).expect("decode parent name");
+    assert_eq!(&name[..n], fits.as_bytes(), "the name field is as typed");
+    assert_eq!(info.locators.entries[0].platform_data_length, 512);
+    // A full sector is still a sound entry: the locator's length is
+    // declared, not terminated, and 512 is exactly its declared space.
+    assert_eq!(info.locators.entries[0].platform_data_space, 512);
+    assert_eq!(info.locators.entries[0].defect, None);
+
+    // 255 fits the name field and overflows the locator sector once
+    // normalised. It is the same condition — a path too long for the
+    // format's parent path fields — so it is the same error.
+    let over = "a".repeat(255);
+    let opts = diff_opts(&over);
+    let mut scratch = vec![0u8; VHD_MAX_METADATA_SCRATCH];
+    assert_eq!(
+        plan_vhd(&opts, &mut scratch).err(),
+        Some(CreateError::ParentNameTooLong),
+    );
+}
+
+/// An absolute path is emitted verbatim, so its cap is the parent
+/// unicode name field's 255 UTF-16 code units, unchanged.
+///
+/// The companion to [`vhd_differencing_parent_name_length_boundary`]:
+/// the two limits differ by exactly the two code units normalisation
+/// adds, and a test that only exercised the relative case could not tell
+/// a changed limit from a changed normalisation.
+#[test]
+fn vhd_differencing_absolute_path_length_boundary() {
     // 255 code units is 510 bytes, leaving the last code unit of the
-    // 512-byte field zero so a terminating NUL stays inside it.
-    let fits = "a".repeat(255);
+    // 512-byte name field zero so a terminating NUL stays inside it.
+    let fits = format!("/{}", "a".repeat(254));
+    assert_eq!(fits.len(), 255);
     let bytes = materialise_differencing(&fits);
     let bounds = diff_bounds(&bytes);
     let info = vhd::VhdParentInfo::parse(dyn_header(&bytes), &bounds).expect("parse parent info");
@@ -682,10 +818,10 @@ fn vhd_differencing_parent_name_length_boundary() {
     assert_eq!(&name[..n], fits.as_bytes());
     assert_eq!(info.locators.entries[0].platform_data_length, 510);
 
-    // 256 would fill all 512 bytes with no terminator — libvhdi then reads
-    // past the field into the locator table and appends a stray character
-    // to the parent filename it reports.
-    let over = "a".repeat(256);
+    // 256 would fill all 512 bytes of the name field with no terminator
+    // — libvhdi then reads past the field into the locator table and
+    // appends a stray character to the parent filename it reports.
+    let over = format!("/{}", "a".repeat(255));
     let opts = diff_opts(&over);
     let mut scratch = vec![0u8; VHD_MAX_METADATA_SCRATCH];
     assert_eq!(
@@ -712,9 +848,12 @@ fn vhd_differencing_non_bmp_characters_cost_two_code_units() {
     let mut name = [0u8; vhd::MAX_PARENT_NAME_UTF8];
     let n = info.decode_name(&mut name).expect("decode parent name");
     assert_eq!(&name[..n], fits.as_bytes());
-    // 127 surrogate pairs is 254 code units, 508 bytes: one code unit of
-    // headroom is unavoidable because 255 is odd.
-    assert_eq!(info.locators.entries[0].platform_data_length, 508);
+    // 127 surrogate pairs is 254 code units in the name field. The
+    // locator carries `.\` as well, so it is 256 code units and 512
+    // bytes — the odd code unit the name field leaves spare is exactly
+    // what the two-character prefix needs, which is why 127 is still the
+    // largest emoji count that fits.
+    assert_eq!(info.locators.entries[0].platform_data_length, 512);
 
     let over = "\u{1F600}".repeat(128);
     assert_eq!(over.len(), 512);
@@ -740,7 +879,11 @@ fn vhd_differencing_parent_name_field_always_ends_in_a_nul() {
         "p.vhd".to_string(),
         "parent.vhd".to_string(),
         "/srv/images/parent.vhd".to_string(),
-        "a".repeat(255),
+        // The longest relative path the emitter now accepts (the
+        // locator's 256 code units less the two `.\` adds), and the
+        // longest absolute one (the name field's own 255).
+        "a".repeat(254),
+        format!("/{}", "a".repeat(254)),
         "\u{1F600}".repeat(127),
     ] {
         let bytes = materialise_differencing(&path);
@@ -1133,13 +1276,22 @@ const VHDX_PARENT_LINKAGE: &[u8] = b"{f88d4d92-6fcc-408d-9bef-9b7c89f15c89}";
 /// A relative parent path: relative selects `relative_path`.
 const VHDX_PARENT_PATH: &str = "parent.vhdx";
 
+/// [`VHDX_PARENT_PATH`] as the `relative_path` value carries it.
+///
+/// `relative_path` is as Windows-defined as VHD's `W2ru`, so a relative
+/// path is emitted in the Windows convention the measured Hyper-V
+/// fixtures use — see
+/// [PLAN-differencing.md](docs/plans/PLAN-differencing.md).
+const VHDX_PARENT_PATH_EMITTED: &str = r".\parent.vhdx";
+
 /// The item's exact length for [`VHDX_PARENT_PATH`] under
 /// `relative_path`, written out as the sum decision 5 of the phase plan
 /// gives: 148 fixed bytes (20 header, two 12-byte entries, a 28-byte
 /// `parent_linkage` key and a 76-byte linkage value) plus the key and
-/// the value. Spelled as arithmetic rather than as `196` so that a
-/// changed layout has to be argued with rather than re-measured.
-const VHDX_LOCATOR_ITEM_LEN: u32 = 148 + 2 * 13 + 2 * 11;
+/// the *emitted* value, which is two code units longer than the typed
+/// one. Spelled as arithmetic rather than as `200` so that a changed
+/// layout has to be argued with rather than re-measured.
+const VHDX_LOCATOR_ITEM_LEN: u32 = 148 + 2 * 13 + 2 * 13;
 
 fn vhdx_diff_opts(path: &str) -> VhdxCreateOpts<'_> {
     VhdxCreateOpts {
@@ -1349,8 +1501,9 @@ fn vhdx_differencing_round_trips_through_the_parser() {
     assert!(locator.linkage_matches(VHDX_PARENT_LINKAGE));
     assert_eq!(
         locator.preferred_path(),
-        Some(VHDX_PARENT_PATH.as_bytes()),
-        "preferred_path is the path the caller gave",
+        Some(VHDX_PARENT_PATH_EMITTED.as_bytes()),
+        "preferred_path is the caller's path, in the Windows convention \
+         `relative_path` is defined in",
     );
 
     // The strings are UTF-16 *little* endian with no terminator — the
@@ -1433,19 +1586,58 @@ fn vhdx_differencing_locator_misplacement_is_detected() {
     assert_eq!(locator.parent_linkage(), Some(VHDX_PARENT_LINKAGE));
 }
 
-/// The path key is chosen from the path the user typed, and exactly one
-/// path key is written.
+/// The path key is chosen from the path the user typed, exactly one path
+/// key is written, and the key decides the value's bytes.
+///
+/// A relative path goes out in the Windows convention `relative_path` is
+/// defined in — `/` to `\`, leading `.\`, a leading `./` replaced rather
+/// than doubled — matching the phase 3 Hyper-V fixtures. A
+/// POSIX-absolute path has no honest `absolute_win32_path` rendering and
+/// keeps its bytes; see
+/// [PLAN-differencing.md](docs/plans/PLAN-differencing.md).
 ///
 /// Checked against the raw UTF-16LE key bytes as well as through the
 /// parser: `preferred_path` prefers `relative_path`, so a emitter that
 /// wrote both keys would satisfy the parser-side assertions alone.
 #[test]
 fn vhdx_differencing_path_key_follows_the_path() {
-    for (path, want_key, absolute) in [
-        ("parent.vhdx", &b"relative_path"[..], false),
-        ("../parent.vhdx", &b"relative_path"[..], false),
-        ("images/parent.vhdx", &b"relative_path"[..], false),
-        ("/srv/images/parent.vhdx", &b"absolute_win32_path"[..], true),
+    for (path, emitted, want_key, absolute) in [
+        (
+            "parent.vhdx",
+            r".\parent.vhdx",
+            &b"relative_path"[..],
+            false,
+        ),
+        (
+            "./parent.vhdx",
+            r".\parent.vhdx",
+            &b"relative_path"[..],
+            false,
+        ),
+        (
+            "../parent.vhdx",
+            r".\..\parent.vhdx",
+            &b"relative_path"[..],
+            false,
+        ),
+        (
+            "images/parent.vhdx",
+            r".\images\parent.vhdx",
+            &b"relative_path"[..],
+            false,
+        ),
+        (
+            "sub/dir/parent.vhdx",
+            r".\sub\dir\parent.vhdx",
+            &b"relative_path"[..],
+            false,
+        ),
+        (
+            "/srv/images/parent.vhdx",
+            "/srv/images/parent.vhdx",
+            &b"absolute_win32_path"[..],
+            true,
+        ),
     ] {
         let laid = lay_out_vhdx(&vhdx_diff_opts(path));
         let region = laid.metadata();
@@ -1462,15 +1654,15 @@ fn vhdx_differencing_path_key_follows_the_path() {
             assert_eq!(locator.relative_path(), None, "{path}");
             assert_eq!(
                 locator.absolute_win32_path(),
-                Some(path.as_bytes()),
+                Some(emitted.as_bytes()),
                 "{path}",
             );
         } else {
-            assert_eq!(locator.relative_path(), Some(path.as_bytes()), "{path}");
+            assert_eq!(locator.relative_path(), Some(emitted.as_bytes()), "{path}");
             assert_eq!(locator.absolute_win32_path(), None, "{path}");
         }
         assert_eq!(locator.volume_path(), None, "instar never writes it");
-        assert_eq!(locator.preferred_path(), Some(path.as_bytes()), "{path}");
+        assert_eq!(locator.preferred_path(), Some(emitted.as_bytes()), "{path}");
 
         // And the same, from the raw bytes at the offset the entry
         // declares, so the key is not merely what the parser decoded.
@@ -1496,19 +1688,56 @@ fn vhdx_differencing_path_key_follows_the_path() {
 /// with the value field that actually overflowed. 261 bytes is well
 /// under `MAX_BACKING_FILE_LEN`, so the length check it passes on the
 /// way is real.
+///
+/// # Why the relative boundary is 258 and not 260
+///
+/// The cap is 260 code units on the string that is **emitted**, and a
+/// relative path is emitted two code units longer than it was typed. So
+/// 258 typed characters fill the field exactly and 259 overflow it —
+/// which is the whole point of normalising before the length check
+/// rather than after. `vhdx_differencing_absolute_path_length_boundary`
+/// pins the unnormalised case at the unchanged 260.
 #[test]
 fn vhdx_differencing_parent_path_length_boundary() {
-    let fits = "a".repeat(260);
+    let fits = "a".repeat(258);
     assert!(fits.len() < MAX_BACKING_FILE_LEN);
     let laid = lay_out_vhdx(&vhdx_diff_opts(&fits));
     let (entry, item) = locator_entry_and_item(laid.metadata());
     let locator = vhdx::parse_parent_locator(item).expect("parse parent locator");
     assert_eq!(locator.defect, None);
-    assert_eq!(locator.relative_path(), Some(fits.as_bytes()));
+    let emitted = format!(r".\{fits}");
+    assert_eq!(locator.relative_path(), Some(emitted.as_bytes()));
     assert_eq!(entry.length, 148 + 2 * 13 + 2 * 260);
 
-    let over = "a".repeat(261);
+    let over = "a".repeat(259);
     assert!(over.len() < MAX_BACKING_FILE_LEN);
+    let opts = vhdx_diff_opts(&over);
+    let mut scratch = vec![0u8; VHDX_MAX_METADATA_SCRATCH];
+    assert_eq!(
+        plan_vhdx(&opts, &mut scratch).unwrap_err(),
+        CreateError::ParentNameTooLong,
+    );
+}
+
+/// An absolute path is emitted verbatim, so its cap is
+/// `vhdx::build_parent_locator`'s unchanged 260 UTF-16 code units.
+///
+/// The companion to [`vhdx_differencing_parent_path_length_boundary`]:
+/// the two limits differ by exactly the two code units normalisation
+/// adds, and a test that only exercised the relative case could not tell
+/// a changed limit from a changed normalisation.
+#[test]
+fn vhdx_differencing_absolute_path_length_boundary() {
+    let fits = format!("/{}", "a".repeat(259));
+    assert_eq!(fits.len(), 260);
+    let laid = lay_out_vhdx(&vhdx_diff_opts(&fits));
+    let (entry, item) = locator_entry_and_item(laid.metadata());
+    let locator = vhdx::parse_parent_locator(item).expect("parse parent locator");
+    assert_eq!(locator.defect, None);
+    assert_eq!(locator.absolute_win32_path(), Some(fits.as_bytes()));
+    assert_eq!(entry.length, 148 + 2 * 19 + 2 * 260);
+
+    let over = format!("/{}", "a".repeat(260));
     let opts = vhdx_diff_opts(&over);
     let mut scratch = vec![0u8; VHDX_MAX_METADATA_SCRATCH];
     assert_eq!(
