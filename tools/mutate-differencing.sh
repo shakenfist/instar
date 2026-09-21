@@ -398,6 +398,13 @@ FIXED_PARENT='test_create.TestCreateSmoke.test_create_vhd_differencing_from_a_fi
 DIFF_BACKING='test_differencing.TestDifferencingCreateRefusesAsBacking'
 DIFF_BACKING="${DIFF_BACKING}.test_create_refuses_a_differencing_backing_file"
 
+# The same-format-child leg: a vpc child offered a differencing VHD
+# parent, and a vhdx child offered a differencing VHDX parent, which
+# DIFF_BACKING above never exercises (it always requests a qcow2
+# child).
+DIFF_BACKING_SAME_FMT='test_differencing.TestDifferencingCreateRefusesAsBacking'
+DIFF_BACKING_SAME_FMT="${DIFF_BACKING_SAME_FMT}.test_create_refuses_a_differencing_backing_file_for_a_same_format_child"
+
 integration_case 'create-op-vhd-parent-identity' "${CREATE_OP}" \
     '        (ParentIdentity::Vhd { uuid, timestamp }, true) => (uuid, timestamp),' \
     '        (ParentIdentity::Vhd { .. }, true) => ([0u8; 16], 0),' \
@@ -434,6 +441,20 @@ integration_case 'create-op-vhdx-differencing-refusal' "${CREATE_OP}" \
     '            if state.has_parent {' \
     '            if state.has_parent && capacity == 0 {' \
     "${DIFF_BACKING}"
+
+# The same two arms again, but caught by the same-format-child leg
+# rather than the qcow2-child one above, so a target-specific
+# regression in either arm cannot hide behind a child format that
+# happens not to trip it.
+integration_case 'create-op-vhd-differencing-refusal-vpc-child' "${CREATE_OP}" \
+    '            if footer.disk_type == vhd::DISK_TYPE_DIFFERENCING {' \
+    '            if footer.disk_type == vhd::DISK_TYPE_FIXED {' \
+    "${DIFF_BACKING_SAME_FMT}"
+
+integration_case 'create-op-vhdx-differencing-refusal-vhdx-child' "${CREATE_OP}" \
+    '            if state.has_parent {' \
+    '            if state.has_parent && capacity == 0 {' \
+    "${DIFF_BACKING_SAME_FMT}"
 
 # The backing probe reads the parent's LAST sector, which is the only
 # place a fixed VHD keeps its footer.

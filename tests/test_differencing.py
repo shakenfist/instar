@@ -1027,12 +1027,16 @@ class TestDifferencingCreateRefusesAsBacking(DifferencingTestBase):
 
     BACKING_FORMAT = {'VHD': 'vpc', 'VHDX': 'vhdx'}
 
-    def _create_overlay(self, tmp, base, backing_format):
-        """`instar create -f qcow2 -b <base> -F <fmt>` into a temp dir."""
+    # Extension per child format, so the overlay's name matches what it
+    # actually is rather than always reading `overlay.qcow2`.
+    CHILD_EXTENSION = {'qcow2': 'qcow2', 'vpc': 'vhd', 'vhdx': 'vhdx'}
+
+    def _create_overlay(self, tmp, base, backing_format, child_format='qcow2'):
+        """`instar create -f <child_format> -b <base> -F <fmt>` into a temp dir."""
         instar = self.get_instar_binary()
-        overlay = Path(tmp) / 'overlay.qcow2'
+        overlay = Path(tmp) / f'overlay.{self.CHILD_EXTENSION[child_format]}'
         r = subprocess.run(
-            [str(instar), 'create', '-f', 'qcow2', '-b', str(base),
+            [str(instar), 'create', '-f', child_format, '-b', str(base),
              '-F', backing_format, str(overlay)],
             capture_output=True, text=True, timeout=60
         )
@@ -1062,6 +1066,52 @@ class TestDifferencingCreateRefusesAsBacking(DifferencingTestBase):
                     self.assertFalse(
                         overlay.exists(),
                         f'{image_id}: no overlay should be left behind'
+                    )
+
+    # Format instar would give the child if it were foolish enough to
+    # accept the same-format differencing parent above it. VHD's arm of
+    # `probe_backing` (main.rs:313) and VHDX's (main.rs:343) are separate
+    # code paths, and the test above always requests a qcow2 child, so
+    # neither arm is exercised with a child in its own native format.
+    SAME_FORMAT_CHILD = {'VHD': 'vpc', 'VHDX': 'vhdx'}
+
+    def test_create_refuses_a_differencing_backing_file_for_a_same_format_child(self):
+        """A same-format child is refused a differencing parent too.
+
+        `test_create_refuses_a_differencing_backing_file` above proves the
+        refusal fires, but only into a qcow2 child, for every fixture. That
+        leaves a distinct, reachable input unexercised: a vpc child offered
+        a differencing VHD parent, and a vhdx child offered a differencing
+        VHDX parent. A child accepted here would itself be a structurally
+        valid differencing image naming a parent that is itself
+        differencing -- a chain instar cannot compose -- and nothing else
+        in the suite looks at that shape.
+        """
+        for image_id, format_name in DIFFERENCING_FIXTURES:
+            child_format = self.SAME_FORMAT_CHILD[format_name]
+            with self.subTest(image=image_id, child_format=child_format):
+                source = self.differencing_image(image_id)
+                with tempfile.TemporaryDirectory() as tmp:
+                    base = Path(tmp) / source.name
+                    shutil.copy(source, base)
+                    overlay, stdout, stderr, rc = self._create_overlay(
+                        tmp, base, self.BACKING_FORMAT[format_name],
+                        child_format=child_format,
+                    )
+                    self.assertNotEqual(
+                        0, rc,
+                        f'{image_id}: create -b must fail for a '
+                        f'{child_format} child too; stdout={stdout!r}'
+                    )
+                    self.assertIn(
+                        self.EXPECTED, stderr,
+                        f'{image_id}: expected the differencing reason, '
+                        f'not a generic parse failure; stderr={stderr!r}'
+                    )
+                    self.assertFalse(
+                        overlay.exists(),
+                        f'{image_id}: no {child_format} overlay should be '
+                        f'left behind'
                     )
 
     def test_create_accepts_the_plain_parents(self):

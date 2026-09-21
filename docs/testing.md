@@ -1452,12 +1452,12 @@ name says it guards. See
 [PLAN-differencing.md](plans/PLAN-differencing.md) for the path being
 guarded.
 
-There are **20 cases**: fourteen mutate a library crate (`create`,
+There are **22 cases**: fourteen mutate a library crate (`create`,
 `vhd`, `vhdx`) and are caught by a Rust unit or round-trip test, and
-six mutate the `create` guest operation and are caught by a Python
+eight mutate the `create` guest operation and are caught by a Python
 integration test. `src/operations/create` is excluded from `cargo test
 --workspace`, so a unit test written beside that code would never run
-— those six have to go through the real binary, which means `make
+— those eight have to go through the real binary, which means `make
 instar` before the test and again after the source is restored.
 
 ```bash
