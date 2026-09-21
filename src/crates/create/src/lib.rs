@@ -641,11 +641,34 @@ fn windows_relative_parent_path<'b>(path: &str, buf: &'b mut [u8]) -> Result<&'b
     if bytes.contains(&b'\\') {
         return Err(CreateError::ParentPathNotRepresentable);
     }
-    let rest: &[u8] = if bytes.starts_with(b"./") {
-        bytes.get(2..).ok_or(CreateError::ParentNameTooLong)?
-    } else {
-        bytes
-    };
+    // Consume every leading `./`, and any separator run one of them
+    // exposes. `.//parent.vhd` and `././parent.vhd` are legal POSIX
+    // spellings of `./parent.vhd`, and consuming only the first two
+    // bytes left the remainder starting with `/` -- which the
+    // substitution below turned into a second backslash, so the
+    // locator read back on Windows as the UNC-ish `.\\parent.vhd`
+    // rather than a sibling file.
+    //
+    // A separator is only consumed once a `./` has been, so a path that
+    // begins with one keeps it. Both callers already refuse to reach
+    // here with a POSIX-absolute path -- they pick the `W2ku` /
+    // `absolute_win32_path` key for those instead -- but the function
+    // does not depend on their doing so.
+    let mut rest: &[u8] = bytes;
+    let mut consumed_dot_slash = false;
+    loop {
+        if let Some(tail) = rest.strip_prefix(b"./") {
+            rest = tail;
+            consumed_dot_slash = true;
+        } else if consumed_dot_slash {
+            match rest.strip_prefix(b"/") {
+                Some(tail) => rest = tail,
+                None => break,
+            }
+        } else {
+            break;
+        }
+    }
     // A path with nothing left to name would come out as a bare `.\`,
     // naming the containing directory rather than any file -- and
     // because that is no longer empty,
@@ -661,26 +684,44 @@ fn windows_relative_parent_path<'b>(path: &str, buf: &'b mut [u8]) -> Result<&'b
     }
 
     let prefix_len = WINDOWS_RELATIVE_PREFIX.len();
-    let total = prefix_len
+    // An upper bound: collapsing separators below can only shorten the
+    // result, so a buffer that fits this fits whatever is written.
+    let longest_possible = prefix_len
         .checked_add(rest.len())
         .ok_or(CreateError::ParentNameTooLong)?;
-    if buf.len() < total {
+    if buf.len() < longest_possible {
         return Err(CreateError::ParentNameTooLong);
     }
-    // `buf.len() >= total >= prefix_len` is established above, so
-    // neither split can be out of range.
+    // `buf.len() >= longest_possible >= prefix_len` is established
+    // above, so neither split can be out of range.
     let (head, body) = buf.split_at_mut(prefix_len);
     head.copy_from_slice(WINDOWS_RELATIVE_PREFIX);
     let tail = body
         .get_mut(..rest.len())
         .ok_or(CreateError::ParentNameTooLong)?;
-    tail.copy_from_slice(rest);
-    for b in tail.iter_mut() {
-        if *b == b'/' {
-            *b = b'\\';
+    // Substitute, collapsing interior separator runs as the leading one
+    // was collapsed above: `sub//parent.vhd` is `sub/parent.vhd` on
+    // POSIX and must not read back as `sub\\parent.vhd` on Windows.
+    // Collapsing only shortens, so the cap checked against `total`
+    // above still holds and `written` is the real length.
+    let mut written = 0usize;
+    let mut previous_was_separator = false;
+    for byte in rest.iter() {
+        let is_separator = *byte == b'/';
+        if is_separator && previous_was_separator {
+            continue;
         }
+        previous_was_separator = is_separator;
+        let slot = tail
+            .get_mut(written)
+            .ok_or(CreateError::ParentNameTooLong)?;
+        *slot = if is_separator { b'\\' } else { *byte };
+        written += 1;
     }
 
+    let total = prefix_len
+        .checked_add(written)
+        .ok_or(CreateError::ParentNameTooLong)?;
     core::str::from_utf8(buf.get(..total).ok_or(CreateError::ParentNameTooLong)?)
         .map_err(|_| CreateError::ParentNameTooLong)
 }
@@ -1546,25 +1587,29 @@ pub fn parent_format_matches(
 /// refuses as a non-VHD a parent `instar info` reports as `vpc`, and
 /// one instar itself writes with `-o subformat=fixed`.
 ///
-/// An explicit `-F raw` suppresses the fallback. The hint is the user
-/// asserting what the file is, and it is also what the child records as
-/// its backing format — so sizing the parent from a VHD footer while
-/// writing `raw` into the child would have the two disagree by the
-/// footer's 512 bytes. Detection returns `Raw` as its catch-all as well
-/// as its real answer, so without this the fallback would second-guess
-/// the hint on every file it does not recognise.
+/// Any hint that positively asserts a non-VHD format suppresses the
+/// fallback, `-F raw` included. The hint is the user asserting what the
+/// file is, and it is also what the child records as its backing
+/// format — so sizing the parent from a VHD footer while writing `raw`
+/// into the child would have the two disagree by the footer's 512
+/// bytes. Detection returns `Raw` as its catch-all as well as its real
+/// answer, so without this the fallback would second-guess the hint on
+/// every file it does not recognise: a genuinely raw parent whose last
+/// 512 bytes happen to begin with `conectix` — image-derived, untrusted
+/// bytes — would be sized from those bytes even under `-F qcow2`.
 ///
-/// Note that `-u` alone is *not* `-F raw`: it leaves the hint
-/// [`ImageFormat::Unknown`], so the fallback still applies. See
-/// `docs/create.md`.
+/// Only [`ImageFormat::Unknown`] (no hint) and [`ImageFormat::Vhd`]
+/// (`-F vpc`, which agrees with the fallback) let it run. Note that
+/// `-u` alone is *not* `-F raw`: it leaves the hint `Unknown`, so the
+/// fallback still applies. See `docs/create.md`.
 #[must_use]
 pub fn footer_fallback_applies(detected: ImageFormat, hint: ImageFormat) -> bool {
     match detected {
         // The header said VHD, so the footer is where the fields are.
         ImageFormat::Vhd => true,
         // The header said nothing, which a fixed VHD's does not —
-        // unless the user asserted raw, in which case they win.
-        ImageFormat::Raw => !matches!(hint, ImageFormat::Raw),
+        // unless the user asserted some format, in which case they win.
+        ImageFormat::Raw => matches!(hint, ImageFormat::Unknown | ImageFormat::Vhd),
         _ => false,
     }
 }
@@ -1664,19 +1709,43 @@ mod parent_acceptance_tests {
     /// that row is the one that must be true, and `-F raw` is the one
     /// spelling that turns it off.
     #[test]
-    fn only_an_explicit_raw_hint_suppresses_the_fallback() {
+    fn a_hint_that_contradicts_vhd_suppresses_the_fallback() {
+        // Detection returns `Raw` for anything it does not recognise,
+        // so this arm decides what happens to every unrecognised file.
+        // Only "no hint" and "the user said vpc" may follow it to the
+        // footer; a positively asserted qcow2/vmdk/vhdx/raw parent is
+        // taken at the user's word, so untrusted tail bytes that happen
+        // to start with `conectix` cannot re-classify it.
+        assert!(footer_fallback_applies(
+            ImageFormat::Raw,
+            ImageFormat::Unknown
+        ));
+        assert!(footer_fallback_applies(ImageFormat::Raw, ImageFormat::Vhd));
+        for hint in [
+            ImageFormat::Raw,
+            ImageFormat::Qcow2,
+            ImageFormat::Vmdk4,
+            ImageFormat::Vhdx,
+        ] {
+            assert!(
+                !footer_fallback_applies(ImageFormat::Raw, hint),
+                "hint {hint:?} did not suppress the fallback"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bare_unsafe_flag_still_follows_the_footer() {
+        // `-u` without `-F` leaves the hint Unknown, so it does not
+        // suppress the fallback -- unlike `-F raw`, which does.
+        // Documented in docs/create.md as the difference between the
+        // two spellings of "assume raw", and measured through the CLI
+        // by `test_create_honours_an_explicit_raw_backing_hint`.
         assert!(footer_fallback_applies(
             ImageFormat::Raw,
             ImageFormat::Unknown
         ));
         assert!(!footer_fallback_applies(ImageFormat::Raw, ImageFormat::Raw));
-        // `-u` without `-F` leaves the hint Unknown, so it does not
-        // suppress it. Documented in docs/create.md as a difference
-        // between the two spellings of "assume raw".
-        assert!(footer_fallback_applies(
-            ImageFormat::Raw,
-            ImageFormat::Unknown
-        ));
     }
 
     /// A header that named VHD is re-read whatever the hint says: the
@@ -1750,6 +1819,40 @@ mod windows_relative_parent_path_tests {
         assert_eq!(render("../parent.vhd"), r".\..\parent.vhd");
         // A lone `.` is not a prefix either — there is no separator.
         assert_eq!(render(".hidden.vhd"), r".\.hidden.vhd");
+    }
+
+    #[test]
+    fn repeated_separators_and_dot_components_collapse() {
+        // All four are the same file as `./parent.vhd` on POSIX, so all
+        // four must emit the same locator. Consuming only one `./` left
+        // `.\\parent.vhd`, which a Windows reader takes as a UNC-ish
+        // root rather than a sibling file.
+        for spelling in [
+            "./parent.vhd",
+            ".//parent.vhd",
+            "././parent.vhd",
+            ".///parent.vhd",
+        ] {
+            assert_eq!(render(spelling), r".\parent.vhd", "{spelling}");
+        }
+        // Interior runs collapse for the same reason.
+        assert_eq!(render("sub//parent.vhd"), r".\sub\parent.vhd");
+        assert_eq!(render(".//sub///parent.vhd"), r".\sub\parent.vhd");
+        // A path that is nothing but separators and dots names no file.
+        assert!(matches!(refuse(".//"), CreateError::BackingFileUnsupported));
+    }
+
+    #[test]
+    fn a_relative_path_that_is_only_dots_is_refused() {
+        // `rest` empties out, so the bare `.\` that would otherwise be
+        // emitted -- naming the containing directory rather than any
+        // file -- never reaches `build_parent_locator`.
+        for spelling in ["./", ".//", "././"] {
+            assert!(
+                matches!(refuse(spelling), CreateError::BackingFileUnsupported),
+                "{spelling}"
+            );
+        }
     }
 
     #[test]

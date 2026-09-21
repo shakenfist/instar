@@ -851,6 +851,33 @@ impl VhdxParentLocator {
             .or_else(|| self.volume_path())
     }
 
+    /// `preferred_path`, together with whether the value came from the
+    /// `relative_path` key.
+    ///
+    /// The flag matters because the three keys do not share a path
+    /// convention. `relative_path` is defined to hold a *Windows*
+    /// relative path -- `\` separators and a leading `.\` -- so its
+    /// bytes are not openable by a POSIX resolver and are not what the
+    /// user typed. `absolute_win32_path` and `volume_path` are reported
+    /// verbatim: instar writes a POSIX absolute path under the former
+    /// unchanged (there is no honest Win32 rendering of
+    /// `/srv/images/parent.vhdx`), and rewriting a genuine Windows
+    /// absolute path's separators would turn `C:\x\p.vhdx` into
+    /// something that is neither a Win32 path nor a POSIX one.
+    ///
+    /// Callers that report a path to a user want
+    /// [`posix_relative_path`] applied to the value when this returns
+    /// `true`. See the `info` operation's VHDX arm.
+    #[must_use]
+    pub fn preferred_path_with_convention(&self) -> Option<(&[u8], bool)> {
+        if let Some(relative) = self.relative_path() {
+            return Some((relative, true));
+        }
+        self.absolute_win32_path()
+            .or_else(|| self.volume_path())
+            .map(|path| (path, false))
+    }
+
     /// Whether this item's `parent_linkage` names `expected`, compared
     /// ASCII case-insensitively.
     ///
@@ -943,6 +970,45 @@ fn decode_entry_strings(
 /// Returns `None` only when `item` is too short to hold the parent
 /// locator header, in which case there is nothing to preserve.
 /// Everything else is parsed and, where malformed, marked.
+/// Render a `relative_path` parent-locator value in POSIX convention.
+///
+/// The inverse of the normalisation `crates/create` applies when it
+/// emits the key: a leading `.\` is dropped and every `\` becomes `/`.
+/// `.\parent.vhdx` reads back as `parent.vhdx`, and `..\sub\p.vhdx` as
+/// `../sub/p.vhdx`, which is both what the user typed and something a
+/// POSIX resolver can open.
+///
+/// Apply this **only** to a value that came from the `relative_path`
+/// key -- [`VhdxParentLocator::preferred_path_with_convention`] says
+/// which. The other two path keys hold absolute paths whose separators
+/// must not be rewritten.
+///
+/// The rendering never grows: it drops two leading bytes and
+/// substitutes the rest one for one. `out` must still be at least
+/// `value.len()` bytes; `None` is returned when it is shorter, or when
+/// `value` is empty or renders empty (a bare `.\`, which names a
+/// directory rather than a file and is refused on the write side too).
+///
+/// Runs of separators are **not** collapsed here. The emitter collapses
+/// them before writing, so instar's own images never contain one; a
+/// third-party image that does is passed through as the producer wrote
+/// it rather than being silently reinterpreted on read.
+#[must_use]
+pub fn posix_relative_path<'a>(value: &[u8], out: &'a mut [u8]) -> Option<&'a [u8]> {
+    let body = match value.strip_prefix(br".\") {
+        Some(rest) => rest,
+        None => value,
+    };
+    if body.is_empty() {
+        return None;
+    }
+    let dst = out.get_mut(..body.len())?;
+    for (slot, byte) in dst.iter_mut().zip(body.iter()) {
+        *slot = if *byte == b'\\' { b'/' } else { *byte };
+    }
+    Some(dst)
+}
+
 pub fn parse_parent_locator(item: &[u8]) -> Option<VhdxParentLocator> {
     if item.len() < PARENT_LOCATOR_HEADER_SIZE {
         return None;
@@ -3840,6 +3906,105 @@ mod tests {
         let locator = parse_parent_locator(&buf[..len]).unwrap();
 
         assert_eq!(locator.preferred_path(), None);
+    }
+
+    // ================================================================
+    // preferred_path_with_convention() and posix_relative_path()
+    //
+    // The read side of the `.\` normalisation `crates/create` applies
+    // when it emits `relative_path`. `info` is a `no_main` guest binary
+    // and cannot run `cargo test`, so the rendering lives here.
+    // ================================================================
+
+    #[test]
+    fn only_the_relative_key_is_flagged_as_windows_convention() {
+        let mut buf = [0u8; 1024];
+        let len = build_locator_item(&[("relative_path", r".\vhdx-diff-parent.vhdx")], &mut buf);
+        let locator = parse_parent_locator(&buf[..len]).unwrap();
+        assert_eq!(
+            locator.preferred_path_with_convention(),
+            Some((&br".\vhdx-diff-parent.vhdx"[..], true))
+        );
+
+        // The two absolute keys are reported verbatim. Rewriting their
+        // separators would turn a real Win32 path into something that
+        // is neither Win32 nor POSIX, and instar's own absolute key
+        // already holds POSIX bytes that need no rewriting.
+        let mut buf = [0u8; 1024];
+        let len = build_locator_item(
+            &[("absolute_win32_path", r"C:\images\parent.vhdx")],
+            &mut buf,
+        );
+        let locator = parse_parent_locator(&buf[..len]).unwrap();
+        assert_eq!(
+            locator.preferred_path_with_convention(),
+            Some((&br"C:\images\parent.vhdx"[..], false))
+        );
+
+        let mut buf = [0u8; 1024];
+        let len = build_locator_item(
+            &[("volume_path", r"\\?\Volume{deadbeef}\parent.vhdx")],
+            &mut buf,
+        );
+        let locator = parse_parent_locator(&buf[..len]).unwrap();
+        assert_eq!(
+            locator.preferred_path_with_convention(),
+            Some((&br"\\?\Volume{deadbeef}\parent.vhdx"[..], false))
+        );
+
+        let mut buf = [0u8; 1024];
+        let len = build_locator_item(&[("parent_linkage", HYPERV_LINKAGE)], &mut buf);
+        let locator = parse_parent_locator(&buf[..len]).unwrap();
+        assert_eq!(locator.preferred_path_with_convention(), None);
+    }
+
+    #[test]
+    fn posix_relative_path_undoes_the_windows_rendering() {
+        let mut out = [0u8; 256];
+        // The shape instar itself writes, and the shape a Hyper-V child
+        // carries: both read back as something a POSIX resolver opens.
+        assert_eq!(
+            posix_relative_path(br".\parent.vhdx", &mut out),
+            Some(&b"parent.vhdx"[..])
+        );
+        let mut out = [0u8; 256];
+        assert_eq!(
+            posix_relative_path(br".\sub\parent.vhdx", &mut out),
+            Some(&b"sub/parent.vhdx"[..])
+        );
+        let mut out = [0u8; 256];
+        assert_eq!(
+            posix_relative_path(br"..\sub\parent.vhdx", &mut out),
+            Some(&b"../sub/parent.vhdx"[..])
+        );
+        // A value with no `.\` prefix still has its separators mapped.
+        let mut out = [0u8; 256];
+        assert_eq!(
+            posix_relative_path(br"sub\parent.vhdx", &mut out),
+            Some(&b"sub/parent.vhdx"[..])
+        );
+    }
+
+    #[test]
+    fn posix_relative_path_refuses_what_names_no_file() {
+        // A bare `.\` names the containing directory. The write side
+        // refuses to emit one; the read side refuses to report one.
+        let mut out = [0u8; 256];
+        assert_eq!(posix_relative_path(br".\", &mut out), None);
+        let mut out = [0u8; 256];
+        assert_eq!(posix_relative_path(b"", &mut out), None);
+
+        // Too small an output buffer is a refusal, not a truncation:
+        // reporting half a path would be worse than reporting none.
+        let mut out = [0u8; 4];
+        assert_eq!(posix_relative_path(br".\parent.vhdx", &mut out), None);
+
+        // Exactly big enough is enough -- the rendering never grows.
+        let mut out = [0u8; 11];
+        assert_eq!(
+            posix_relative_path(br".\parent.vhdx", &mut out),
+            Some(&b"parent.vhdx"[..])
+        );
     }
 
     #[test]

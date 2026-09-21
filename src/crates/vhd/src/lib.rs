@@ -286,6 +286,28 @@ impl VhdFooter {
 ///
 /// Returns the offset within `last_sector`, or `None` if no candidate
 /// carries the cookie.
+///
+/// # A file whose length is not a multiple of 512
+///
+/// The 512-multiple rule above is what makes the candidate set
+/// complete, and it is a property of the format rather than of any
+/// particular file. A truncated or corrupt VHD can have a length that
+/// is not a multiple of 512, and then the real footer begins at an
+/// offset this scan never tests: it falls through to whatever earlier
+/// candidate matches, which for a small dynamic VHD read at a
+/// 4096-byte sector size is the footer *copy* at file offset 0. The
+/// identity and size then come from the copy rather than from the
+/// authoritative footer, with no signal that they did.
+///
+/// This is deliberately **out of scope here**. Distinguishing the two
+/// needs the parent's exact byte size, which is precisely what the
+/// call-table capacity cannot supply (see above) — so the check
+/// belongs to a caller that has the size by some other route, not to
+/// this function. It is also unreachable from `create` today, which
+/// accepts only 512-byte sectors and so has a single candidate.
+/// `a_non_aligned_length_falls_back_to_the_offset_zero_copy` pins the
+/// current behaviour so that it stays a decision rather than becoming
+/// an oversight when the sector-size restriction lifts.
 pub fn find_footer_offset(last_sector: &[u8]) -> Option<usize> {
     // Candidates are the 512-byte slots that fit entirely within the
     // buffer, walked from the tail back towards the start.
@@ -2492,6 +2514,43 @@ mod tests {
         let mut ragged = [0u8; 1000];
         place_footer(&mut ragged, 0, &QEMU_FIXED_FOOTER_HEAD);
         assert_eq!(find_footer_offset(&ragged), Some(0));
+    }
+
+    #[test]
+    fn a_non_aligned_length_falls_back_to_the_offset_zero_copy() {
+        // A dynamic VHD small enough that its offset-0 footer copy and
+        // its real trailing footer share one 4096-byte sector, then
+        // truncated by two bytes so the file length is no longer a
+        // multiple of 512. The real footer now starts at 3582, which
+        // is not one of the eight candidate slots, so the scan returns
+        // the *copy* at offset 0 instead -- reporting the parent
+        // identity and size from a copy rather than from the
+        // authoritative footer, with nothing to say it did.
+        //
+        // Pinned rather than fixed: separating the two needs the
+        // parent's exact byte size, which the call-table capacity
+        // cannot supply, so the check belongs to a caller that has the
+        // size by another route. Unreachable from `create` today,
+        // which is 512-only and therefore has a single candidate. See
+        // `find_footer_offset`'s doc comment.
+        let mut truncated = [0u8; 4096];
+        place_footer(&mut truncated, 0, &QEMU_FIXED_FOOTER_HEAD);
+        place_footer(&mut truncated, 3582, &QEMU_FIXED_FOOTER_HEAD);
+        assert_eq!(
+            find_footer_offset(&truncated),
+            Some(0),
+            "a footer at a non-512-aligned offset is not a candidate, so \
+             the scan falls through to the offset-0 copy"
+        );
+
+        // The same image untruncated -- the footer on its aligned slot
+        // -- is found where it really is. This pair is what makes the
+        // assertion above a statement about alignment rather than
+        // about the scan direction.
+        let mut aligned = [0u8; 4096];
+        place_footer(&mut aligned, 0, &QEMU_FIXED_FOOTER_HEAD);
+        place_footer(&mut aligned, 3584, &QEMU_FIXED_FOOTER_HEAD);
+        assert_eq!(find_footer_offset(&aligned), Some(3584));
     }
 
     // ====================================================================

@@ -100,10 +100,21 @@ ADVERSARIAL_LOCATOR_FIXTURES = (
 
 # The subset with a real, resolvable parent. Used where the test needs
 # `info` to report a parent name, which `vhd-differencing` cannot do.
+#
+# All three are bare POSIX names. The VHDX entry used to read
+# `.\\vhdx-diff-parent.vhdx`, the raw contents of the locator's
+# `relative_path` key -- a genuine Hyper-V child records its parent in
+# the Windows convention, and `info` reported those bytes unchanged.
+# This table was where the asymmetry showed: the same column held bare
+# names for VHD, whose parent *unicode name* field keeps the path as
+# typed, and a Windows path for VHDX, which has no such field. `info`
+# now renders the relative key back into POSIX convention, so
+# `full-backing-filename` resolves instead of yielding
+# `<dir>/.\\vhdx-diff-parent.vhdx`, which opens nothing.
 DIFFERENCING_CHAIN_FIXTURES = (
     ('vhd-diff-child-aligned', 'vhd-diff-parent.vhd'),
     ('vhd-diff-child-mixed', 'vhd-diff-parent.vhd'),
-    ('vhdx-diff-child', '.\\vhdx-diff-parent.vhdx'),
+    ('vhdx-diff-child', 'vhdx-diff-parent.vhdx'),
 )
 
 # The plain dynamic base disks of the two real chains. These are NOT

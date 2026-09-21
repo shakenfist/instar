@@ -205,7 +205,11 @@ backing file, so the resulting reference is portable across moves of
 the parent.
 
 A backing file requires either `-F FMT` (explicit format hint) or `-u`
-(unsafe; assume raw). The hint is used as the initial format guess; if
+(unsafe; skip the accessibility check). `-u` is **not** a shorthand for
+`-F raw` — it asserts nothing about the format at all. See
+[`-u` is not `-F raw`](#-u-is-not-f-raw) below, which is the difference
+that decides how a fixed VHD parent is sized. The hint is used as the
+initial format guess; if
 the backing file's first sector contradicts the hint via its magic
 bytes, auto-detection wins and the metadata records the detected
 format. vpc and vhdx additionally require the parent to be their own
@@ -242,15 +246,22 @@ missing its trailing footer, a VHDX with an unreadable region table)
 is `ERROR_BACKING_PARSE_FAILED`, since telling the user their VHD is
 not a VHD would be both false and unactionable.
 
+### `-u` is not `-F raw`
+
 `-u` is not a synonym for `-F raw` here. A fixed-subformat VHD keeps
 no copy of its footer at offset 0, so header detection alone calls one
 `raw`; instar falls back to reading the file's last sector for a VHD
 footer, as `info`, `check` and `resize` all do, and sizes the parent
-from `current_size` if it finds one. Only a literal `-F raw`
-suppresses that fallback, because that is the user asserting the file
-*is* raw — and it is also what the child records as its backing
-format, so sizing from a footer while writing `raw` would have the two
-disagree by the footer's 512 bytes. `-u` asserts nothing about the
+from `current_size` if it finds one. Any `-F` that positively asserts
+a format suppresses that fallback — `-F raw` included, and `-F vpc`
+excepted because it agrees with it — because that is the user
+asserting what the file is, and it is also what the child records as
+its backing format, so sizing from a footer while writing `raw` would
+have the two disagree by the footer's 512 bytes. Detection reports
+`raw` for anything it does not recognise as well as for a genuinely
+raw file, so without this rule a raw parent whose last 512 bytes
+happen to begin with `conectix` would be sized from those bytes even
+under `-F qcow2`. `-u` asserts nothing about the
 format (it only says "do not fail if the backing file is
 inaccessible"), so the fallback still applies: `create -f qcow2 -b
 fixed.vhd -u child.qcow2` sizes the parent from its VHD footer, while

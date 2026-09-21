@@ -4316,6 +4316,25 @@ byte is copied through unchanged, and `/` is consumed into the
 normalisation rather than surviving it — and an absolute path keeps
 its POSIX bytes and is not normalised, so it is unconstrained.
 
+**`instar info` reports a parent path in POSIX convention, whichever
+format it came from.** The normalisation above is a property of what is
+*written*, not of what instar reports back. A VHD child's parent is
+read from the parent unicode name field, which keeps the typed bytes,
+so it reported the typed path already. A VHDX child's parent is read
+from the locator, so `info` renders the `relative_path` key back --
+dropping the leading `.\` and mapping `\` to `/` -- and the two formats
+agree: `create -f vhdx -b parent.vhdx` then `info child.vhdx` reports
+`parent.vhdx`, not `.\parent.vhdx`. Rendering back matters beyond
+symmetry, because `backing-filename` is a machine-read JSON field and
+`.\parent.vhdx` is a path no POSIX resolver can open. The other two
+locator keys hold absolute paths and are reported verbatim: instar
+writes a POSIX absolute path under `absolute_win32_path` unchanged, and
+rewriting a genuine Windows absolute path's separators would produce
+something that is neither a Win32 path nor a POSIX one. A genuine
+Hyper-V child benefits by the same rule, which is the read half of what
+[PLAN-differencing.md](plans/PLAN-differencing.md) decision 6 assigns
+to the composition phases.
+
 **A child's block size is independent of its parent's, deliberately.**
 instar gives a differencing child the same defaults as any other new
 image — 2 MiB blocks for VHD, 32 MiB for VHDX — rather than inheriting

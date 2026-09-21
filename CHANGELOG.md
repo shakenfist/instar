@@ -128,10 +128,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   A parent that genuinely is the wrong format still says so.
 
   Note that `-u` is **not** a synonym for `-F raw` when sizing a
-  parent: only a literal `-F raw` suppresses the VHD footer fallback,
-  so `create -f qcow2 -b fixed.vhd -u child.qcow2` sizes the parent
-  from its footer while `-F raw` sizes it from the file length. See
+  parent: `-u` asserts nothing about the format, so it leaves the VHD
+  footer fallback in place, and `create -f qcow2 -b fixed.vhd -u
+  child.qcow2` sizes the parent from its footer while `-F raw` sizes it
+  from the file length. Any `-F` that positively asserts a format
+  suppresses the fallback (`-F vpc` excepted, since it agrees with it),
+  so untrusted tail bytes that happen to begin with `conectix` cannot
+  re-classify a parent the user declared. See
   [create.md](docs/create.md).
+
+  `instar info` reports a differencing child's parent path in POSIX
+  convention for both formats. A VHD child's already was, being read
+  from the parent unicode name field; a VHDX child's is read from the
+  locator, so the `relative_path` key is rendered back — the leading
+  `.\` dropped, `\` mapped to `/` — and `create -f vhdx -b
+  parent.vhdx` followed by `info child.vhdx` reports `parent.vhdx`
+  rather than the unopenable `.\parent.vhdx`. The two absolute locator
+  keys are reported verbatim.
 
 ### Changed
 

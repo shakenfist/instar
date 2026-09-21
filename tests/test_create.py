@@ -434,9 +434,21 @@ class TestCreateSmoke(InstarTestBase):
                     info = json.loads(stdout)
                     self.assertEqual(info.get('format'), fmt)
                     self.assertEqual(info.get('backing-filename-format'), fmt)
-                    self.assertIsNotNone(
-                        info.get('backing-filename'),
-                        f'{fmt} child reports no backing file: {info!r}')
+                    # The exact string, not merely that one exists.
+                    # `-b parent.name` was typed relative, so both
+                    # formats must report it back as typed. VHD did
+                    # already -- info reads its parent *unicode name*
+                    # field, which the emitter keeps verbatim -- while
+                    # VHDX has no such field and info reads the parent
+                    # locator, whose `relative_path` key holds the
+                    # Windows rendering `.\\parent.vhdx`. Asserting
+                    # only that a backing filename existed is what let
+                    # `info` report an unopenable path on the VHDX side
+                    # while this test stayed green.
+                    self.assertEqual(
+                        info.get('backing-filename'), parent.name,
+                        f'{fmt} child reports a backing filename that is '
+                        f'not what -b was given: {info!r}')
 
                     child_bytes = child.read_bytes()
                     parent_bytes = parent.read_bytes()
@@ -554,6 +566,17 @@ class TestCreateSmoke(InstarTestBase):
                         child_bytes,
                         'an absolute path was rendered into the Windows '
                         'convention; only relative paths are')
+                    # And it reads back verbatim. A VHDX absolute parent
+                    # lands under `absolute_win32_path`, the key info
+                    # reports without rewriting separators -- the other
+                    # branch of the rendering the relative case exercises.
+                    stdout, stderr, rc = self.run_instar_info(
+                        child, output='json')
+                    self.assertEqual(rc, 0, f'info on {child} failed: {stderr}')
+                    self.assertEqual(
+                        json.loads(stdout).get('backing-filename'),
+                        str(parent),
+                        f'an absolute {fmt} parent is not reported verbatim')
 
             with self.subTest(format=fmt, hint='absent'):
                 with tempfile.TemporaryDirectory() as td:
@@ -568,9 +591,11 @@ class TestCreateSmoke(InstarTestBase):
                     stdout, stderr, rc = self.run_instar_info(
                         child, output='json')
                     self.assertEqual(rc, 0, f'info on {child} failed: {stderr}')
-                    self.assertIsNotNone(
+                    self.assertEqual(
                         json.loads(stdout).get('backing-filename'),
-                        f'{fmt} child created with -u records no parent')
+                        parent.name,
+                        f'{fmt} child created with -u reports a backing '
+                        f'filename that is not what -b was given')
                     # The relative leg of the locator split, through the
                     # CLI. round_trip.rs pins the bytes the emitters
                     # write, but only this path exercises the seam where
@@ -868,6 +893,15 @@ class TestCreateSmoke(InstarTestBase):
             self.assertIn(
                 'could not be parsed', stderr,
                 f'a corrupt VHD parent was not diagnosed as corrupt: {stderr}')
+            # Named honestly, too. This parent's *header* parsed
+            # perfectly -- it is the trailing footer that is gone -- so
+            # a message blaming the header is false in the same way the
+            # format-mismatch one it replaced was. Asserting only the
+            # substring above passes on either wording.
+            self.assertIn(
+                'footer', stderr,
+                f'the parse failure blames the header alone, but this '
+                f'parent lost its footer: {stderr}')
             self.assertNotIn(
                 'does not match the target format', stderr,
                 'a VHD parent was reported as not being a VHD')
