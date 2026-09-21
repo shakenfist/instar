@@ -363,7 +363,7 @@ records `instar-testdata <sha> (#pr)` and is audited there.
 | 4. Read-side policy: close the silent parent-ignoring read | [PLAN-differencing-phase-04-read-policy.md](PLAN-differencing-phase-04-read-policy.md) | Complete | `f981374` (#563) |
 | 5. `plan_vhd` differencing emitter | [PLAN-differencing-phase-05-vhd-emitter.md](PLAN-differencing-phase-05-vhd-emitter.md) | Complete | `9a80776` (#568) |
 | 6. `plan_vhdx` differencing emitter | [PLAN-differencing-phase-06-vhdx-emitter.md](PLAN-differencing-phase-06-vhdx-emitter.md) | Complete | `882d098` (#577) |
-| 7. Guest create op and host CLI wiring | [PLAN-differencing-phase-07-guest-host.md](PLAN-differencing-phase-07-guest-host.md) | Planned | |
+| 7. Guest create op and host CLI wiring | [PLAN-differencing-phase-07-guest-host.md](PLAN-differencing-phase-07-guest-host.md) | Complete | `99d7d24` (#581) |
 | 8. Rust unit tests and Python integration tests | PLAN-differencing-phase-08-tests.md | Not started | |
 | 9. Coverage fuzzing of the locator parsers | PLAN-differencing-phase-09-fuzz.md | Not started | |
 | 10. Documentation | PLAN-differencing-phase-10-docs.md | Not started | |
