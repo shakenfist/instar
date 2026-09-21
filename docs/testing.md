@@ -1043,7 +1043,10 @@ comparison layers:
 This closes the gap where VMDK/VHD/VHDX had no differential reference
 for `check` validation (qemu-img check only supports QCOW2), and
 provides a third independent opinion for QCOW2. libyal tools are
-optional — the fuzzer degrades gracefully when they are unavailable.
+optional here — the fuzzer degrades gracefully when they are
+unavailable. That is not true of every use of libvhdi in this suite;
+see the differencing oracle cross-check below, which CI treats as
+mandatory.
 
 ### Running locally
 
@@ -1439,6 +1442,39 @@ by hand in interactive sessions. A workflow once attempted the fix
 itself; it was retired after an audit found its safety boundary
 unsound. See `docs/plans/PLAN-fuzz-autofix.md` for the history
 and the reasoning.
+
+## Differencing oracle cross-check
+
+`tests/test_differencing.py`'s `TestDifferencingLibvhdiOracle`
+runs `vhdiinfo` against a differencing VHD or VHDX child that `instar
+create` wrote through the real CLI. It exists because `qemu-img`
+cannot serve as the oracle for this output — it reads a differencing
+image as though the parent were absent, surfacing no parent at all —
+so `vhdiinfo` is the only external cross-check of the parent linkage
+instar wrote, and this suite is the only place anything other than
+instar's own parser reads a differencing image instar wrote.
+
+The assertions are structural only, per
+[PLAN-differencing.md](plans/PLAN-differencing.md): the disk type, the
+parent filename for VHD, and the parent identifier for both formats,
+each compared against what `vhdiinfo` reports for the parent itself
+rather than a hardcoded GUID. No composed content is read. One
+limitation is recorded rather than worked around: `vhdiinfo` prints no
+`Parent filename` line for a VHDX, with or without `-v`, so the VHDX
+parent locator's path key cannot be checked through this tool — the
+Rust round-trip test pins it instead
+(`src/crates/create/tests/round_trip.rs`).
+
+The suite runs inside the `instar-build` devcontainer, which installs
+`libvhdi-utils`, so locally these tests skip when `vhdiinfo` is absent
+(`_require_vhdiinfo` in `tests/base.py`), the same bargain
+`_require_qemu_img` strikes. In CI that same absence is a failure
+instead: `INSTAR_REQUIRE_LIBVHDI=1` is set on the integration job's
+test step and passed through by the `Makefile` to the container,
+because a skipped test and a passing test look identical in a green
+run and `stestr` does not name skipped tests in its output — parsing
+the log could not have caught it. Removing `libvhdi-utils` from the
+devcontainer turns that job red instead of leaving it quietly green.
 
 ## Mutation harness for the differencing tests
 
