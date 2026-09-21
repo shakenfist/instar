@@ -4311,10 +4311,21 @@ typed bytes and that is the field qemu's `block/vpc.c` and libvhdi
 resolve through, but VHDX has no equivalent field: the locator is its
 only record of the path. Both formats therefore refuse, with
 `ERROR_PARENT_PATH_NOT_REPRESENTABLE`, so the rule is one rule rather
-than two. `\` is the only character with this property — every other
-byte is copied through unchanged, and `/` is consumed into the
-normalisation rather than surviving it — and an absolute path keeps
-its POSIX bytes and is not normalised, so it is unconstrained.
+than two. `\` is the only character that is *refused* on this account — and an
+absolute path keeps its POSIX bytes and is not normalised, so it is
+unconstrained.
+
+The rewrite is POSIX-equivalent rather than byte-for-byte. Beyond
+mapping `/` to `\`, redundant leading `./` components and repeated
+separators are collapsed, so `./sub//parent.vhdx` and
+`.././/sub/parent.vhdx` both emit `.\sub\parent.vhdx`; a path that
+collapses to nothing at all (`./`, `.//`) is refused with
+`ERROR_INVALID_OPTION`, since a bare `.\` names the containing
+directory rather than a file. The consequence for VHDX is
+visible to users, because the locator is the string `info` reports
+back: `create -f vhdx -b ./sub//parent.vhdx` then `info` reports
+`sub/parent.vhdx`. That path resolves to the same file, but it is not
+the one that was typed.
 
 **`instar info` reports a parent path in POSIX convention, whichever
 format it came from.** The normalisation above is a property of what is

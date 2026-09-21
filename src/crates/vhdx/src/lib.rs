@@ -846,9 +846,12 @@ impl VhdxParentLocator {
     /// failed to decode (`value_of` already excludes entries marked
     /// `defect`).
     pub fn preferred_path(&self) -> Option<&[u8]> {
-        self.relative_path()
-            .or_else(|| self.absolute_win32_path())
-            .or_else(|| self.volume_path())
+        // Derived from `preferred_path_with_convention` rather than
+        // repeating the chain: the two have different callers now
+        // (`crates/create`'s round-trip tests use this one, `info` the
+        // other), so a preference order written twice is one that can
+        // change in one place only.
+        self.preferred_path_with_convention().map(|(path, _)| path)
     }
 
     /// `preferred_path`, together with whether the value came from the
@@ -954,22 +957,6 @@ fn decode_entry_strings(
     None
 }
 
-/// Parse a parent locator metadata item from its bytes.
-///
-/// `item` is the item's own bytes, starting at the `LocatorType` GUID,
-/// because every offset inside the item is relative to that point.
-///
-/// Takes a byte slice and performs no I/O, so a fuzz target can be
-/// pointed straight at it (decision 7 of
-/// `docs/plans/PLAN-differencing-phase-03-parse.md`). This is a
-/// deliberate departure from the local precedent —
-/// `qcow2::read_backing_file` (`src/crates/qcow2/src/lib.rs:683`) does
-/// its own call-table I/O — and not a claim that qcow2 agrees; the
-/// staging read lives in `parse_metadata` instead.
-///
-/// Returns `None` only when `item` is too short to hold the parent
-/// locator header, in which case there is nothing to preserve.
-/// Everything else is parsed and, where malformed, marked.
 /// Render a `relative_path` parent-locator value in POSIX convention.
 ///
 /// The inverse of the normalisation `crates/create` applies when it
@@ -1009,6 +996,22 @@ pub fn posix_relative_path<'a>(value: &[u8], out: &'a mut [u8]) -> Option<&'a [u
     Some(dst)
 }
 
+/// Parse a parent locator metadata item from its bytes.
+///
+/// `item` is the item's own bytes, starting at the `LocatorType` GUID,
+/// because every offset inside the item is relative to that point.
+///
+/// Takes a byte slice and performs no I/O, so a fuzz target can be
+/// pointed straight at it (decision 7 of
+/// `docs/plans/PLAN-differencing-phase-03-parse.md`). This is a
+/// deliberate departure from the local precedent —
+/// `qcow2::read_backing_file` (`src/crates/qcow2/src/lib.rs:683`) does
+/// its own call-table I/O — and not a claim that qcow2 agrees; the
+/// staging read lives in `parse_metadata` instead.
+///
+/// Returns `None` only when `item` is too short to hold the parent
+/// locator header, in which case there is nothing to preserve.
+/// Everything else is parsed and, where malformed, marked.
 pub fn parse_parent_locator(item: &[u8]) -> Option<VhdxParentLocator> {
     if item.len() < PARENT_LOCATOR_HEADER_SIZE {
         return None;

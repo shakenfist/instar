@@ -503,8 +503,15 @@ fn vhd_opts_from<'a>(
     // resolved is the parent the child was written against. With no
     // backing file the planner writes no parent fields at all, so the
     // zeroes below are never read. See docs/plans/PLAN-differencing.md.
+    // Matched on both dimensions. An identity present with no backing
+    // ref cannot happen -- `probe` is `Some` exactly when
+    // `config.has_backing()`, which is exactly when `backing_ref` is
+    // `Some` -- but spelling the first arm `_` would have written a
+    // real parent's uuid into an image with no parent if that ever
+    // stopped being true. The `(_, false)` arm carries the no-parent
+    // case alone.
     let (parent_unique_id, parent_timestamp) = match (identity, backing.is_some()) {
-        (ParentIdentity::Vhd { uuid, timestamp }, _) => (uuid, timestamp),
+        (ParentIdentity::Vhd { uuid, timestamp }, true) => (uuid, timestamp),
         (_, false) => ([0u8; 16], 0),
         (_, true) => return Err(CreateResult::ERROR_PARENT_FORMAT_MISMATCH),
     };
@@ -540,8 +547,10 @@ fn vhdx_opts_from<'a>(
     // as its own `parent_linkage`. With no backing file the planner
     // writes no parent metadata at all, so the zeroes below are never
     // read. See docs/plans/PLAN-differencing.md.
+    // Matched on both dimensions, for the reason given in
+    // `vhd_opts_from`.
     let parent_data_write_guid = match (identity, backing.is_some()) {
-        (ParentIdentity::Vhdx { data_write_guid }, _) => data_write_guid,
+        (ParentIdentity::Vhdx { data_write_guid }, true) => data_write_guid,
         (_, false) => [0u8; 16],
         (_, true) => return Err(CreateResult::ERROR_PARENT_FORMAT_MISMATCH),
     };

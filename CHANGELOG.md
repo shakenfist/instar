@@ -137,6 +137,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   re-classify a parent the user declared. See
   [create.md](docs/create.md).
 
+  A relative parent path is rewritten into a POSIX-*equivalent* form
+  rather than kept byte for byte: redundant leading `./` components and
+  repeated separators are collapsed before `/` is mapped to `\`, so
+  `-b ./sub//parent.vhdx` emits `.\sub\parent.vhdx` and a path that
+  collapses to nothing is refused. For VHDX that is visible on the way
+  back out, since the locator is the only record of the path.
+
   `instar info` reports a differencing child's parent path in POSIX
   convention for both formats. A VHD child's already was, being read
   from the parent unicode name field; a VHDX child's is read from the

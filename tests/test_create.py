@@ -535,6 +535,74 @@ class TestCreateSmoke(InstarTestBase):
                 _vhd_child_parent_identity(child_bytes), (want_uuid, want_ts),
                 "child does not record the fixed parent's identity")
 
+    def test_create_differencing_relative_parent_in_a_subdirectory(self):
+        """A relative parent with a separator, write and read.
+
+        Every other CLI test passes a bare filename as the relative
+        `-b`, so the separator substitution itself was only ever
+        exercised at the crate level. The two halves live in different
+        crates and run in different guest binaries -- `crates/create`
+        renders `/` to `\\` on the way in, `crates/vhdx` renders it
+        back on the way out for `info` -- and nothing proved they
+        compose until a path had a separator in it to compose over.
+
+        `full-backing-filename` is the assertion that matters. It is
+        resolved against the child's own directory, so it is only
+        correct if the reported path is the POSIX one; the Windows
+        rendering would resolve to `<dir>/.\\sub\\parent.vhdx`, which
+        names nothing.
+        """
+        cases = (
+            ('vpc', 'vhd-diff-parent.vhd', 'child.vhd'),
+            ('vhdx', 'vhdx-diff-parent.vhdx', 'child.vhdx'),
+        )
+        for fmt, fixture, child_name in cases:
+            with self.subTest(format=fmt):
+                with tempfile.TemporaryDirectory() as td:
+                    sub = Path(td) / 'sub'
+                    sub.mkdir()
+                    parent = self._copy_diff_parent(fixture, str(sub))
+                    child = Path(td) / child_name
+                    typed = f'sub/{parent.name}'
+
+                    _, stderr, rc = self.run_instar_create(
+                        '-f', fmt, '-b', typed, '-F', fmt,
+                        str(child), cwd=td)
+                    self.assertEqual(
+                        rc, 0,
+                        f'a {fmt} parent in a subdirectory was refused: '
+                        f'{stderr}')
+
+                    # Written in the Windows convention...
+                    self.assertIn(
+                        f'.\\sub\\{parent.name}'.encode('utf-16-le'),
+                        child.read_bytes(),
+                        f'a nested relative {fmt} parent did not reach the '
+                        f'image as .\\sub\\{parent.name}')
+
+                    # ...and reported back in the POSIX one.
+                    stdout, stderr, rc = self.run_instar_info(
+                        child, output='json')
+                    self.assertEqual(
+                        rc, 0, f'info on {child} failed: {stderr}')
+                    info = json.loads(stdout)
+                    self.assertEqual(
+                        info.get('backing-filename'), typed,
+                        f'{fmt} child does not report the parent path as '
+                        f'typed: {info!r}')
+                    resolved = info.get('full-backing-filename')
+                    self.assertIsNotNone(
+                        resolved,
+                        f'{fmt} child reports no resolved parent path')
+                    self.assertTrue(
+                        Path(resolved).exists(),
+                        f'the resolved parent path does not exist, so the '
+                        f'reported path is not openable: {resolved!r}')
+                    self.assertEqual(
+                        Path(resolved).resolve(), parent.resolve(),
+                        f'the resolved parent path is not the parent: '
+                        f'{resolved!r}')
+
     def test_create_differencing_absolute_parent_and_absent_hint(self):
         """Two CLI routes the crate-level tests cannot reach.
 

@@ -269,6 +269,16 @@ fixed.vhd -u child.qcow2` sizes the parent from its VHD footer, while
 lets a fixed VHD be accepted as a vpc differencing parent without the
 user naming a format.
 
+A relative parent path is rewritten into a POSIX-*equivalent* form
+rather than kept byte-for-byte: redundant leading `./` components and
+repeated separators are collapsed before `/` is mapped to `\\`, so
+`-b ./sub//parent.vhdx` emits the locator `.\\sub\\parent.vhdx`, and a
+path that collapses to nothing (`./`) is refused. For vhdx this is
+user-visible on the way back out, because the locator is the only
+record of the path and so is what `info` reports: the child above
+reports `sub/parent.vhdx`. A VHD child reports the path exactly as
+typed, since `info` reads its parent unicode name field instead.
+
 A differencing child **inherits its parent's virtual size**, and a
 `SIZE` that disagrees with the parent is refused with
 `ERROR_PARENT_SIZE_MISMATCH` rather than written. The child stores only

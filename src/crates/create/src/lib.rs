@@ -1602,6 +1602,14 @@ pub fn parent_format_matches(
 /// (`-F vpc`, which agrees with the fallback) let it run. Note that
 /// `-u` alone is *not* `-F raw`: it leaves the hint `Unknown`, so the
 /// fallback still applies. See `docs/create.md`.
+///
+/// What the fallback promotes is not otherwise validated: `VhdFooter`
+/// checks the cookie and not the checksum, so under `-u` a file whose
+/// last sector merely begins with `conectix` is accepted and its
+/// identity fields copied into the child. Issue #583 tracks that. It
+/// is deliberately not narrowed here, because the point of this
+/// predicate is to agree with `info`, `check` and `resize`, which
+/// reach a footer through the same lenient parse.
 #[must_use]
 pub fn footer_fallback_applies(detected: ImageFormat, hint: ImageFormat) -> bool {
     match detected {
