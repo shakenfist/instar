@@ -1440,6 +1440,66 @@ itself; it was retired after an audit found its safety boundary
 unsound. See `docs/plans/PLAN-fuzz-autofix.md` for the history
 and the reasoning.
 
+## Mutation harness for the differencing tests
+
+`tools/mutate-differencing.sh` answers one question about the
+differencing output path (`instar create -f {vpc,vhdx} -b PARENT`):
+**can the tests that guard it actually fail?** It is not a coverage
+tool and it measures nothing. Each case breaks one specific behaviour
+in `src/` and requires one named test to notice; a test that still
+passes against a deliberately broken emitter is not guarding what its
+name says it guards. See
+[PLAN-differencing.md](plans/PLAN-differencing.md) for the path being
+guarded.
+
+There are **20 cases**: fourteen mutate a library crate (`create`,
+`vhd`, `vhdx`) and are caught by a Rust unit or round-trip test, and
+six mutate the `create` guest operation and are caught by a Python
+integration test. `src/operations/create` is excluded from `cargo test
+--workspace`, so a unit test written beside that code would never run
+— those six have to go through the real binary, which means `make
+instar` before the test and again after the source is restored.
+
+```bash
+tools/mutate-differencing.sh          # every case, about 75 seconds
+tools/mutate-differencing.sh --list   # the case names, run nothing
+tools/mutate-differencing.sh NAME...  # only the named cases
+```
+
+The verdicts are the point of the script:
+
+| Verdict | Meaning |
+|---|---|
+| `PASS` | The mutation applied and the named test failed. The test guards the property. |
+| `FAIL` | The mutation applied and the test still passed. The test does not guard the property. |
+| `BROKEN` | The mutation could not be applied, or the test never ran — a wrong package name, a build error, a filter that matched no test, or a skip. |
+
+`BROKEN` exists because the interesting failure mode of a mutation
+harness is not a test that fails to fire, it is a mutation that never
+lands. A substitution matching nothing leaves the code unchanged, the
+test then passes for the ordinary reason, and a naive harness scores a
+pass it has not earned. Every edit therefore goes through
+`tools/replace-once.py`, a **literal** find-and-replace — no regex, no
+`sed`, no escaping rules — that exits non-zero unless the search string
+occurs exactly once in the target file. The script exits non-zero if
+any case is `FAIL` or `BROKEN`.
+
+Originals are copied to a `mktemp -d` directory outside the repository
+before each edit and copied back afterwards, including on interrupt.
+Restoring with `git checkout <path>` is deliberately avoided: it
+discards uncommitted work. After a run, `git status --short` should be
+unchanged and the `instar` binary rebuilt from clean source.
+
+Two properties in this area are deliberately **not** mutation-tested.
+The `(_, true) => ERROR_PARENT_FORMAT_MISMATCH` arms of
+`vhd_opts_from` and `vhdx_opts_from` are unreachable by construction —
+the operation refuses a wrong-format parent, and then a format-right
+but identity-less parent, before either arm can be reached — so no
+single substitution in them changes observable behaviour. And a
+fixed-subformat `vpc` child with `-b` is refused on the host before the
+emitter sees it, so it is a host-argument case rather than an emitter
+one.
+
 ## Related Documentation
 
 - [Format Coverage](format-coverage.md) - Comparison with oslo.utils format_inspector
