@@ -57,6 +57,10 @@
 #   tools/mutate-differencing.sh NAME...      # only the named cases
 #   tools/mutate-differencing.sh --allow-dirty-src   # run over a dirty src/
 #
+# The four oracle-* cases need `vhdiinfo` on PATH (Debian:
+# libvhdi-utils); the tests they name skip without it, which the
+# harness scores as BROKEN.
+#
 # Exits non-zero if any case is FAIL or BROKEN.
 
 set -uo pipefail
@@ -359,6 +363,16 @@ if [ "${LIST_ONLY}" = 'no' ] && [ ! -x "${REPO_ROOT}/tests/.venv/bin/python" ]; 
     echo 'tests/.venv is missing; run make test-venv first' >&2
     exit 2
 fi
+# Not fatal, but worth saying once rather than four times: the oracle
+# cases name tests that skip without libvhdi, and a skipped test scores
+# BROKEN here, which reads like a harness fault rather than a missing
+# package.
+if [ "${LIST_ONLY}" = 'no' ] && ! command -v vhdiinfo >/dev/null 2>&1; then
+    echo 'warning: vhdiinfo is not on PATH (Debian: libvhdi-utils).' >&2
+    echo '         The oracle-* cases will report BROKEN: the tests they name' >&2
+    echo '         skip without it rather than running.' >&2
+    echo >&2
+fi
 
 report_leftover_backups() {
     # Print the restore command for every backup an earlier run left
@@ -581,6 +595,80 @@ integration_case 'create-op-footer-reads-the-last-sector' "${CREATE_OP}" \
     '        && (call_table.read_input_sector)(0, capacity - 1, header_ptr, sector_size)' \
     '        && (call_table.read_input_sector)(0, 0, header_ptr, sector_size)' \
     "${FIXED_PARENT}"
+
+# ---------------------------------------------------------------------
+# The libvhdi oracle cross-check.
+#
+# These four are the only cases whose test reads instar's output with a
+# parser instar did not write, so they are the only ones that can catch
+# a field written consistently into the wrong place. They need
+# `vhdiinfo` on PATH (Debian: libvhdi-utils); without it the tests skip
+# and the harness reports BROKEN, which is the honest verdict -- the
+# mutation applied and nothing looked at it.
+# ---------------------------------------------------------------------
+
+ORACLE_VHD='test_differencing.TestDifferencingLibvhdiOracle'
+ORACLE_VHD="${ORACLE_VHD}.test_libvhdi_reads_a_vhd_child_as_naming_its_parent"
+ORACLE_VHDX='test_differencing.TestDifferencingLibvhdiOracle'
+ORACLE_VHDX="${ORACLE_VHDX}.test_libvhdi_reads_a_vhdx_child_as_naming_its_parent"
+
+# The same two identity mutations as the round-trip cases above, but
+# caught by the oracle rather than by instar reading its own bytes
+# back. The point is not redundancy: the round-trip test compares the
+# child's parent-identity fields against the parent's, both read by
+# hand-rolled struct reads written from the same understanding of the
+# format that produced them, so a field placed consistently wrong
+# agrees with itself. libvhdi has no such loop to close.
+integration_case 'oracle-vhd-parent-identity' "${CREATE_OP}" \
+    '        (ParentIdentity::Vhd { uuid, timestamp }, true) => (uuid, timestamp),' \
+    '        (ParentIdentity::Vhd { .. }, true) => ([0u8; 16], 0),' \
+    "${ORACLE_VHD}"
+
+integration_case 'oracle-vhdx-parent-identity' "${CREATE_OP}" \
+    '        (ParentIdentity::Vhdx { data_write_guid }, true) => data_write_guid,' \
+    '        (ParentIdentity::Vhdx { .. }, true) => [0u8; 16],' \
+    "${ORACLE_VHDX}"
+
+# The parent unicode name keeps the path AS TYPED, which is the field
+# libvhdi (and qemu's block/vpc.c) resolve a VHD parent through. This
+# mutation strips the directory from it, leaving the locator table
+# untouched -- the shape of the defect round 4 of #581's review found,
+# where producer and consumer disagreed about typed versus rendered.
+# A bare parent name cannot see it, so only the subdirectory leg of the
+# oracle test fires: that leg is why the test carries two path shapes.
+#
+# The call site is assembled line by line rather than written inline:
+# replace-once takes a literal, and a six-line literal on one argument
+# line is unreadable. Every fragment here must match the source byte
+# for byte, indentation included, or replace-once reports BROKEN.
+NAME_CALL_HEAD=$'                vhd::build_dynamic_header_parent(\n'
+NAME_CALL_HEAD+=$'                    dyn_header_region,\n'
+NAME_CALL_HEAD+=$'                    &opts.parent_unique_id,\n'
+NAME_CALL_HEAD+=$'                    opts.parent_timestamp,\n'
+
+NAME_CALL_SEARCH="${NAME_CALL_HEAD}"
+NAME_CALL_SEARCH+=$'                    path,\n'
+NAME_CALL_SEARCH+=$'                )'
+
+NAME_CALL_REPLACE="${NAME_CALL_HEAD}"
+NAME_CALL_REPLACE+=$'                    match path.rfind(\'/\') {\n'
+NAME_CALL_REPLACE+=$'                        Some(index) => &path[index + 1..],\n'
+NAME_CALL_REPLACE+=$'                        None => path,\n'
+NAME_CALL_REPLACE+=$'                    },\n'
+NAME_CALL_REPLACE+=$'                )'
+
+integration_case 'oracle-vhd-parent-name-keeps-its-directory' "${CREATE_LIB}" \
+    "${NAME_CALL_SEARCH}" "${NAME_CALL_REPLACE}" "${ORACLE_VHD}"
+
+# The VHDX File Parameters `HasParent` bit. `round_trip.rs` pins it
+# against a plan built from a constant GUID, and nothing in the Python
+# suite asserted it at all before the oracle did -- the round-trip
+# test's VHD arm checks `disk_type == 4` and its VHDX arm has no
+# equivalent. libvhdi reads the bit back as "Disk type: Differential".
+integration_case 'oracle-vhdx-has-parent-bit' "${CREATE_LIB}" \
+    '        parent_path.is_some(),' \
+    '        false,' \
+    "${ORACLE_VHDX}"
 
 # ---------------------------------------------------------------------
 # Totals

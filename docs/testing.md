@@ -1452,16 +1452,24 @@ name says it guards. See
 [PLAN-differencing.md](plans/PLAN-differencing.md) for the path being
 guarded.
 
-There are **22 cases**: fourteen mutate a library crate (`create`,
+There are **26 cases**: fourteen mutate a library crate (`create`,
 `vhd`, `vhdx`) and are caught by a Rust unit or round-trip test, and
-eight mutate the `create` guest operation and are caught by a Python
-integration test. `src/operations/create` is excluded from `cargo test
---workspace`, so a unit test written beside that code would never run
-— those eight have to go through the real binary, which means `make
-instar` before the test and again after the source is restored.
+twelve are caught by a Python integration test through the real
+binary. Ten of those twelve mutate the `create` guest operation, which
+is excluded from `cargo test --workspace`, so a unit test written
+beside that code would never run; the other two mutate the `create`
+crate but break something only an external parser can see. Going
+through the real binary means `make instar` before the test and again
+after the source is restored.
+
+Four of the integration cases (`oracle-*`) name the libvhdi
+cross-check in `tests/test_differencing.py`, which skips without
+`vhdiinfo` on `PATH` (Debian: `libvhdi-utils`). A skipped test scores
+`BROKEN`, not `PASS`, so the harness needs that package installed to
+report a clean run; it warns once up front when it is missing.
 
 ```bash
-tools/mutate-differencing.sh          # every case, about 90 seconds
+tools/mutate-differencing.sh          # every case, about two minutes
 tools/mutate-differencing.sh --list   # the case names, run nothing
 tools/mutate-differencing.sh NAME...  # only the named cases
 ```

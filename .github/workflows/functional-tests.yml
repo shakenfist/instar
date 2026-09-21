@@ -740,7 +740,21 @@ jobs:
             exit ${build_exit_code}
           fi
 
+      # INSTAR_REQUIRE_LIBVHDI makes the libvhdi oracle cross-check a
+      # hard requirement here rather than an environment-dependent
+      # skip. The suite runs inside the instar-build devcontainer,
+      # which installs libvhdi-utils (src/.devcontainer/Dockerfile), so
+      # vhdiinfo is present and the check must actually run; a skipped
+      # test and a passing test look identical in a green run, and this
+      # repository has shipped a green workflow that ran nothing
+      # before. Deleting libvhdi-utils from that image turns these
+      # tests red instead of quietly green. The Makefile target passes
+      # the variable through to the container; see
+      # tests/base.py:_require_vhdiinfo and
+      # tests/test_differencing.py:TestDifferencingLibvhdiOracle.
       - name: Run core integration tests
+        env:
+          INSTAR_REQUIRE_LIBVHDI: '1'
         run: |
           cd ${GITHUB_WORKSPACE}/instar
           set +e

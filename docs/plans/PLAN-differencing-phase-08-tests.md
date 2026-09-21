@@ -368,13 +368,19 @@ relevant to what 8b and 8d should lean on:
    creates these images through the real CLI, which is the artefact
    worth checking.
 
-   The cost is one apt package on the integration runner. That is
-   cheap and low-risk here specifically: those jobs run on
-   `[self-hosted, debian-13, xl]`, and Debian 13 packages
-   `libvhdi-utils` at `20240509-2+b1` — the same distribution and
-   version the devcontainer already installs, so the oracle behaves
-   identically in both environments and no second version's defects
-   need characterising.
+   **Corrected during execution: the cost is zero packages, not one.**
+   This decision originally said the check cost one apt package on the
+   integration runner, reasoning from the apt step at
+   `.github/workflows/functional-tests.yml:114-118`. That step belongs
+   to the `ci-tooling` job, which never runs the Python suite — it runs
+   the test-partition check and the fuzz-tool self-tests.
+   `integration-core` runs `make test-container-core`, which runs the
+   suite **inside the `instar-build` devcontainer**, and that image
+   already installs `libvhdi-utils` (`src/.devcontainer/Dockerfile:39`)
+   at the same `20240509` build Debian 13 packages. So the oracle is
+   already present where the suite actually runs, and adding the
+   package to that apt step would have installed it on a machine that
+   never opens an image.
 
 3. **Skip, do not fail, when the oracle is absent.** The suite must
    still pass on a developer machine without `libvhdi-utils`, so the
@@ -385,10 +391,13 @@ relevant to what 8b and 8d should lean on:
 
    The trap it creates is the one this repository has been bitten by
    before: a skipped test and a passing test look identical in a
-   green run. So the skip must be *visible* — step 8b adds an
-   assertion in CI that these tests actually ran, in the job where
-   the package is installed, so a silently-skipping oracle is a CI
-   failure rather than a green tick.
+   green run. So the skip must be *visible*. Implemented as an
+   environment variable rather than output parsing:
+   `INSTAR_REQUIRE_LIBVHDI` turns the skip into a failure,
+   `integration-core` sets it, and the Makefile passes it into the
+   container. stestr does not name skipped tests in its output, so
+   grepping the teed log could not have worked. Deleting
+   `libvhdi-utils` from the devcontainer is what turns the job red.
 
 4. **The audit caps at what it can justify.** Step 8a audits the
    input space and 8d spends the findings, but a tests phase can
