@@ -28,10 +28,22 @@
 # find-and-replace that exits non-zero unless the search string occurs
 # exactly once. No regex, no sed, no escaping rules to get wrong.
 #
-# The original file is copied to a scratch directory OUTSIDE the
-# repository before each edit and copied back afterwards, including on
-# interrupt. Restoring with `git checkout <path>` is deliberately
-# avoided: it silently discards uncommitted work.
+# The original file is copied into .mutation-backups/ (gitignored)
+# before each edit and copied back afterwards, including on interrupt.
+# Restoring with `git checkout <path>` is deliberately avoided: it
+# silently discards uncommitted work.
+#
+# That backup deliberately lives inside the repository rather than in a
+# `mktemp -d`, because a `mktemp -d` dies with the process: a `kill -9`
+# mid-case used to leave mutated source in the tree with the only copy
+# of the original already gone. A mutation is a small, deliberate,
+# COMPILING change -- pre-commit passes on it, `cargo build` passes on
+# it -- so nothing downstream would stop someone committing it. Hence
+# the second line of defence: this script refuses to start when `src/`
+# has uncommitted modifications, so an interrupted run is caught at the
+# next invocation instead of at some later commit. Pass
+# --allow-dirty-src when you are deliberately working on `src/` and
+# know what the modifications are.
 #
 # Cases that mutate a guest operation (src/operations/) need `make
 # instar` to rebuild and re-embed the operation binary before an
@@ -43,6 +55,7 @@
 #   tools/mutate-differencing.sh              # every case
 #   tools/mutate-differencing.sh --list       # names only, run nothing
 #   tools/mutate-differencing.sh NAME...      # only the named cases
+#   tools/mutate-differencing.sh --allow-dirty-src   # run over a dirty src/
 #
 # Exits non-zero if any case is FAIL or BROKEN.
 
@@ -51,6 +64,14 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HELPER="${REPO_ROOT}/tools/replace-once.py"
 SCRATCH="$(mktemp -d)"
+
+# The repository root as git sees it. This may be a worktree, so ask
+# git rather than assuming REPO_ROOT is a clone.
+GIT_ROOT="$(git -C "${REPO_ROOT}" rev-parse --show-toplevel 2>/dev/null || echo "${REPO_ROOT}")"
+
+# Per-case backups of the mutated file. Inside the repository and
+# gitignored, so that they outlive a `kill -9` and can be found again.
+BACKUP_DIR="${GIT_ROOT}/.mutation-backups"
 
 PASS_COUNT=0
 FAIL_COUNT=0
@@ -61,14 +82,45 @@ TOTAL_COUNT=0
 # mutation is outstanding, which is what makes the trap idempotent.
 RESTORE_TO=''
 RESTORE_FROM=''
+RESTORE_RELATIVE=''
 # Whether any case has rebuilt the instar binary from mutated source.
 BINARY_DIRTY='no'
 
 LIST_ONLY='no'
+ALLOW_DIRTY_SRC='no'
 SELECTED=()
 
 rebuild_instar() {
     make -C "${REPO_ROOT}" instar >"${SCRATCH}/build.log" 2>&1
+}
+
+backup_path_for() {
+    # backup_path_for RELATIVE -- where the pristine copy of a source
+    # file is kept. The relative path is encoded into the file name (`/`
+    # becomes `%`) so that one leftover file names both the backup and
+    # the thing it restores, with no sidecar to get out of step with it.
+    printf '%s/%s.orig\n' "${BACKUP_DIR}" "${1//\//%}"
+}
+
+leftover_backups() {
+    # Print "RELATIVE<tab>BACKUP" for each backup an earlier run left
+    # behind. Silent when there are none.
+    local backup base
+    [ -d "${BACKUP_DIR}" ] || return 0
+    for backup in "${BACKUP_DIR}"/*.orig; do
+        [ -f "${backup}" ] || continue
+        base="$(basename -- "${backup}" .orig)"
+        printf '%s\t%s\n' "${base//%//}" "${backup}"
+    done
+}
+
+discard_backup() {
+    # discard_backup RELATIVE -- the file is back to its original
+    # contents, so the copy has no further job to do.
+    local backup
+    backup="$(backup_path_for "$1")"
+    rm -f -- "${backup}"
+    rmdir -- "${BACKUP_DIR}" 2>/dev/null || true
 }
 
 # shellcheck disable=SC2329  # invoked by the EXIT trap below.
@@ -77,6 +129,7 @@ cleanup() {
     if [ -n "${RESTORE_TO}" ] && [ -f "${RESTORE_FROM}" ]; then
         echo "restoring ${RESTORE_TO}"
         cp -- "${RESTORE_FROM}" "${RESTORE_TO}"
+        discard_backup "${RESTORE_RELATIVE}"
         RESTORE_TO=''
     fi
     if [ "${BINARY_DIRTY}" = 'yes' ]; then
@@ -91,10 +144,11 @@ trap cleanup EXIT
 trap 'exit 130' INT TERM
 
 usage() {
-    echo 'usage: tools/mutate-differencing.sh [--list] [CASE-NAME...]'
+    echo 'usage: tools/mutate-differencing.sh [--list] [--allow-dirty-src] [CASE-NAME...]'
     echo
-    echo '  --list   print the case names and what each runs, then stop'
-    echo '  NAME...  run only the named cases (default: all of them)'
+    echo '  --list              print the case names and what each runs, then stop'
+    echo '  --allow-dirty-src   run even though src/ has uncommitted modifications'
+    echo '  NAME...             run only the named cases (default: all of them)'
     echo
     echo 'Each case breaks one behaviour in src/ and requires one named'
     echo 'test to fail. PASS means the test caught it; FAIL means it did'
@@ -140,12 +194,13 @@ apply_mutation() {
         return 1
     fi
 
-    RESTORE_FROM="${SCRATCH}/${name}.orig"
-    if ! cp -- "${target}" "${RESTORE_FROM}"; then
+    RESTORE_FROM="$(backup_path_for "${relative}")"
+    if ! mkdir -p -- "${BACKUP_DIR}" || ! cp -- "${target}" "${RESTORE_FROM}"; then
         record BROKEN "${name}" "could not copy ${relative} aside"
         return 1
     fi
     RESTORE_TO="${target}"
+    RESTORE_RELATIVE="${relative}"
 
     if ! python3 "${HELPER}" "${target}" "${search}" "${replace}" \
             >"${SCRATCH}/${name}.mutate.log" 2>&1; then
@@ -159,6 +214,7 @@ apply_mutation() {
 restore_mutation() {
     if [ -n "${RESTORE_TO}" ]; then
         cp -- "${RESTORE_FROM}" "${RESTORE_TO}"
+        discard_backup "${RESTORE_RELATIVE}"
         RESTORE_TO=''
     fi
 }
@@ -287,6 +343,7 @@ integration_case() {
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --list) LIST_ONLY='yes' ;;
+        --allow-dirty-src) ALLOW_DIRTY_SRC='yes' ;;
         -h|--help) usage; exit 0 ;;
         -*) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
         *) SELECTED+=("$1") ;;
@@ -301,6 +358,68 @@ fi
 if [ "${LIST_ONLY}" = 'no' ] && [ ! -x "${REPO_ROOT}/tests/.venv/bin/python" ]; then
     echo 'tests/.venv is missing; run make test-venv first' >&2
     exit 2
+fi
+
+report_leftover_backups() {
+    # Print the restore command for every backup an earlier run left
+    # behind. Returns 0 if it printed anything.
+    local relative backup printed='no'
+    while IFS=$'\t' read -r relative backup; do
+        [ -n "${relative}" ] || continue
+        printed='yes'
+        echo "  a pristine copy of ${relative} was kept by an earlier run; restore it with:" >&2
+        echo "    cp -- ${backup} ${GIT_ROOT}/${relative}" >&2
+    done < <(leftover_backups)
+    [ "${printed}" = 'yes' ]
+}
+
+check_src_is_clean() {
+    # A mutation is a small, deliberate, COMPILING change: pre-commit
+    # and cargo build both pass on mutated source, so a run that was
+    # killed before its trap could fire leaves a tree that nothing else
+    # in the workflow would object to. Refuse to start on top of that,
+    # so the damage is visible here rather than in a later commit.
+    local dirty
+    dirty="$(git -C "${GIT_ROOT}" status --porcelain -- src/)"
+    if [ -z "${dirty}" ]; then
+        if report_leftover_backups; then
+            echo '  src/ is clean, so those copies are stale; they will be reused or replaced.' >&2
+            echo >&2
+        fi
+        return 0
+    fi
+
+    if [ "${ALLOW_DIRTY_SRC}" = 'yes' ]; then
+        echo 'warning: src/ has uncommitted modifications and --allow-dirty-src was given.' >&2
+        echo "${dirty}" >&2
+        echo >&2
+        return 0
+    fi
+
+    echo 'refusing to start: src/ has uncommitted modifications.' >&2
+    echo >&2
+    echo "${dirty}" >&2
+    echo >&2
+    echo 'This harness mutates src/ and restores it afterwards. If an earlier run was' >&2
+    echo 'killed (rather than interrupted with Ctrl-C) it can leave its mutation applied,' >&2
+    echo 'and a mutation still compiles, so nothing else in the workflow would catch it.' >&2
+    echo 'Running now would back up the mutated file as if it were the original.' >&2
+    echo >&2
+    echo 'Inspect what changed with:' >&2
+    echo "    git -C ${GIT_ROOT} diff -- src/" >&2
+    echo 'Then restore it:' >&2
+    if ! report_leftover_backups; then
+        echo "  no backup was kept; discard the modifications with:" >&2
+        echo "    git -C ${GIT_ROOT} checkout -- src/" >&2
+    fi
+    echo >&2
+    echo 'If the modifications are your own work in progress and you want them mutated' >&2
+    echo 'on top of, re-run with --allow-dirty-src.' >&2
+    exit 2
+}
+
+if [ "${LIST_ONLY}" = 'no' ]; then
+    check_src_is_clean
 fi
 
 # ---------------------------------------------------------------------

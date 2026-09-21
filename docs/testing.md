@@ -1461,7 +1461,7 @@ integration test. `src/operations/create` is excluded from `cargo test
 instar` before the test and again after the source is restored.
 
 ```bash
-tools/mutate-differencing.sh          # every case, about 75 seconds
+tools/mutate-differencing.sh          # every case, about 90 seconds
 tools/mutate-differencing.sh --list   # the case names, run nothing
 tools/mutate-differencing.sh NAME...  # only the named cases
 ```
@@ -1484,11 +1484,24 @@ pass it has not earned. Every edit therefore goes through
 occurs exactly once in the target file. The script exits non-zero if
 any case is `FAIL` or `BROKEN`.
 
-Originals are copied to a `mktemp -d` directory outside the repository
-before each edit and copied back afterwards, including on interrupt.
-Restoring with `git checkout <path>` is deliberately avoided: it
-discards uncommitted work. After a run, `git status --short` should be
-unchanged and the `instar` binary rebuilt from clean source.
+Originals are copied into `.mutation-backups/` (gitignored) before each
+edit and copied back afterwards, including on interrupt. Restoring with
+`git checkout <path>` is deliberately avoided: it discards uncommitted
+work. After a run, `git status --short` should be unchanged and the
+`instar` binary rebuilt from clean source.
+
+The backup lives inside the repository rather than in a `mktemp -d`
+because a `mktemp -d` dies with the process: a run that is **killed**
+rather than interrupted leaves its mutation applied with nothing to
+restore from. Since a mutation is a small change that still compiles,
+`pre-commit` and `cargo build` both pass on it and nothing downstream
+would notice. So the script also **refuses to start when `src/` has
+uncommitted modifications**, listing what changed and printing the
+exact command to put it back — the surviving backup where there is one,
+`git checkout -- src/` otherwise. That turns a killed run into a
+refusal at the next invocation instead of a surprise at some later
+commit. Pass `--allow-dirty-src` when the modifications are your own
+work in progress and you want the harness to mutate on top of them.
 
 Two properties in this area are deliberately **not** mutation-tested.
 The `(_, true) => ERROR_PARENT_FORMAT_MISMATCH` arms of
