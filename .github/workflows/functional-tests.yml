@@ -35,7 +35,13 @@ permissions:
 # argument, not just a cost one: every matrix entry runs the *full*
 # Python suite against the installed package on its own distro, using
 # that distro's qemu-img as the oracle. So the queue's coverage is a
-# superset of the PR integration jobs, on seven distros instead of one.
+# superset of the PR integration jobs, on seven distros instead of one,
+# with one exception: the libvhdi differencing oracle. Those two tests
+# need `vhdiinfo`, which the devcontainer installs and the per-distro
+# package containers do not, so they skip in the queue and are
+# mandatory only on `integration-core` below. They assert nothing about
+# packaging, so this costs nothing -- but the superset claim above is
+# otherwise exact and worth keeping that way.
 # Re-running the PR jobs in the queue would buy a second copy of a
 # strictly weaker signal. build-and-test is the deliberate exception --
 # it runs in both as the cheap fast-fail, and package-build needs it.

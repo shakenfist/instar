@@ -1260,6 +1260,26 @@ class TestDifferencingLibvhdiOracle(DifferencingTestBase):
             )
         return fields
 
+    # libvhdi 20240509 prints GUIDs bare, lowercase and hyphenated.
+    # A release that rendered them braced or uppercase would silently
+    # disable the placeholder guard below, because an assertNotEqual
+    # against a literal it can never match always passes -- so the
+    # shape is asserted rather than assumed, and the comparison is
+    # made on a normalised form.
+    GUID_RE = re.compile(
+        r'^\{?[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\}?$')
+
+    def _guid(self, value, label: str) -> str:
+        """Normalise a GUID `vhdiinfo` printed, asserting it is one."""
+        self.assertIsNotNone(
+            value, f'vhdiinfo reported no {label}, so there is nothing to compare')
+        self.assertRegex(
+            value, self.GUID_RE,
+            f'vhdiinfo rendered {label} as {value!r}, which is not a GUID this '
+            f'test knows how to compare; the zero-identity guard would not fire'
+        )
+        return value.strip('{}').lower()
+
     def _stage_parent(self, image_id: str, workdir, subdirectory=None):
         """Copy a parent fixture under *workdir*; return (path, typed name).
 
@@ -1363,7 +1383,8 @@ class TestDifferencingLibvhdiOracle(DifferencingTestBase):
                     # fixture is regenerated.
                     parent_fields = self._vhdiinfo(
                         parent, required=(self.IDENTIFIER,))
-                    want_identity = parent_fields.get(self.IDENTIFIER)
+                    want_identity = self._guid(
+                        parent_fields.get(self.IDENTIFIER), self.IDENTIFIER)
                     self.assertNotEqual(
                         self.ZERO_GUID, want_identity,
                         'the parent fixture has a zero identifier, so this '
@@ -1382,7 +1403,9 @@ class TestDifferencingLibvhdiOracle(DifferencingTestBase):
                         f'{fields!r}'
                     )
                     self.assertEqual(
-                        want_identity, fields.get(self.PARENT_IDENTIFIER),
+                        want_identity,
+                        self._guid(fields.get(self.PARENT_IDENTIFIER),
+                                   self.PARENT_IDENTIFIER),
                         f'libvhdi reads a parent identity that is not the '
                         f'parent\'s own: {fields!r}'
                     )
@@ -1430,7 +1453,8 @@ class TestDifferencingLibvhdiOracle(DifferencingTestBase):
 
             parent_fields = self._vhdiinfo(
                 parent, required=(self.IDENTIFIER,))
-            want_identity = parent_fields.get(self.IDENTIFIER)
+            want_identity = self._guid(
+                parent_fields.get(self.IDENTIFIER), self.IDENTIFIER)
             self.assertNotEqual(
                 self.ZERO_GUID, want_identity,
                 'the parent fixture has a zero DataWriteGuid, so this test '
@@ -1451,7 +1475,9 @@ class TestDifferencingLibvhdiOracle(DifferencingTestBase):
                 f'libvhdi does not read the child as differencing: {fields!r}'
             )
             self.assertEqual(
-                want_identity, fields.get(self.PARENT_IDENTIFIER),
+                want_identity,
+                self._guid(fields.get(self.PARENT_IDENTIFIER),
+                           self.PARENT_IDENTIFIER),
                 f'libvhdi reads a parent linkage that is not the parent\'s '
                 f'active-header DataWriteGuid: {fields!r}'
             )

@@ -1504,14 +1504,14 @@ cross-check in `tests/test_differencing.py`, which skips without
 `BROKEN`, not `PASS`, so the harness needs that package installed to
 report a clean run; it warns once up front when it is missing.
 
-A full run took **2m44s and 3m35s** on two measured runs of this tree,
-with `vhdiinfo` present and all 26 cases passing — so budget three to
-four minutes, and expect the spread, which is cargo and docker layer
-caching. Those are observations: an earlier "about two minutes" here
-was a guess, and an understated figure invites the reader to assume a
-run has hung. Most of the time is the 24 `make instar` rebuilds the
-integration cases need; the 21 baselines add test runs but no
-rebuilds.
+A full run took **2m32s, 2m44s and 3m35s** on three measured runs of
+this tree, with `vhdiinfo` present and all 26 cases passing — so
+budget three to four minutes and expect the spread, which is cargo and
+docker layer caching. Those are observations: an earlier "about two
+minutes" here was a guess, and an understated figure invites the
+reader to assume a run has hung. Most of the time is the 24 `make
+instar` rebuilds the integration cases need; the 21 baselines add test
+runs but no rebuilds.
 
 ```bash
 tools/mutate-differencing.sh          # every case, three to four minutes
@@ -1530,7 +1530,7 @@ trusted.
 | Guard | Answers | Cost |
 |---|---|---|
 | `--self-test` | does the verdict classifier classify correctly? | milliseconds |
-| `--check-patterns` | does every mutation still have exactly one place to land, and is the case count still 26? | a few seconds |
+| `--check-patterns` | does every mutation still have exactly one place to land, and do the case count here and in the script still agree? | a few seconds |
 | `tools/ci/test-replace-once.sh` | does the literal replace helper still refuse zero and multiple matches? | milliseconds |
 
 None of them needs docker, a venv, testdata or a build.
@@ -1543,9 +1543,16 @@ no run of the harness itself would have revealed.
 `--check-patterns` exists because the 26 search strings are pinned to
 `src/` byte for byte, indentation included. A `rustfmt` change that
 moves a space turns a case `BROKEN`, and without this nothing would
-say so until someone spent the full run. It also asserts the case
-count against the figure quoted above, so the two cannot drift apart
-by hand.
+say so until someone spent the full run. It reports `LANDS` and
+`DRIFT` rather than `PASS` and `BROKEN`, because it applies no
+mutation and runs no test and those words are defined above as facts
+about a run that did both.
+
+It also reads the case count out of *this page* and compares it with
+the script's own constant, so the two cannot drift apart. That is a
+recent correction: the check previously compared the script against
+itself while the documentation claimed otherwise, which is the exact
+species of unverified claim the rest of this section is about.
 
 The verdicts are the point of the script:
 

@@ -110,6 +110,8 @@ TOTAL_COUNT=0
 RESTORE_TO=''
 RESTORE_FROM=''
 RESTORE_RELATIVE=''
+# Set when a copy back failed, so the run cannot exit 0 over a mutated tree.
+RESTORE_FAILED='no'
 # Whether any case has rebuilt the instar binary from mutated source.
 BINARY_DIRTY='no'
 
@@ -159,9 +161,7 @@ cleanup() {
     local status=$?
     if [ -n "${RESTORE_TO}" ] && [ -f "${RESTORE_FROM}" ]; then
         echo "restoring ${RESTORE_TO}"
-        cp -- "${RESTORE_FROM}" "${RESTORE_TO}"
-        discard_backup "${RESTORE_RELATIVE}"
-        RESTORE_TO=''
+        restore_mutation
     fi
     if [ "${BINARY_DIRTY}" = 'yes' ]; then
         echo 'rebuilding instar from restored source'
@@ -169,6 +169,11 @@ cleanup() {
         BINARY_DIRTY='no'
     fi
     rm -rf -- "${SCRATCH}"
+    # A run that left mutated source behind cannot report success, even
+    # if every case passed before the restore failed.
+    if [ "${RESTORE_FAILED}" = 'yes' ] && [ "${status}" -eq 0 ]; then
+        status=1
+    fi
     exit "${status}"
 }
 trap cleanup EXIT
@@ -274,6 +279,7 @@ apply_mutation() {
     if ! python3 "${HELPER}" "${target}" "${search}" "${replace}" \
             >"${SCRATCH}/${name}.mutate.log" 2>&1; then
         record BROKEN "${name}" "$(tail -n 2 "${SCRATCH}/${name}.mutate.log" | tr '\n' ' ')"
+        keep_log "${SCRATCH}/${name}.mutate.log" "${name}-mutate"
         restore_mutation
         return 1
     fi
@@ -281,10 +287,22 @@ apply_mutation() {
 }
 
 restore_mutation() {
+    # The backup is discarded only if the copy back actually worked.
+    # Discarding it unconditionally threw away the one pristine copy at
+    # the exact moment it was needed -- a full disk or a read-only
+    # mount would leave the tree mutated with nothing to restore from,
+    # which is the scenario this directory exists to survive.
     if [ -n "${RESTORE_TO}" ]; then
-        cp -- "${RESTORE_FROM}" "${RESTORE_TO}"
-        discard_backup "${RESTORE_RELATIVE}"
-        RESTORE_TO=''
+        if cp -- "${RESTORE_FROM}" "${RESTORE_TO}"; then
+            discard_backup "${RESTORE_RELATIVE}"
+            RESTORE_TO=''
+        else
+            RESTORE_FAILED='yes'
+            echo >&2
+            echo "RESTORE FAILED: ${RESTORE_TO} still holds a mutation." >&2
+            echo "  the pristine copy is kept at ${RESTORE_FROM}" >&2
+            echo "  restore it with: cp -- ${RESTORE_FROM} ${RESTORE_TO}" >&2
+        fi
     fi
 }
 
@@ -388,7 +406,18 @@ rust_baseline_ok() {
         local log="${SCRATCH}/baseline-${package}-${test_name}.log"
         "${REPO_ROOT}/tools/cargo-in-container.sh" test --release \
             -p "${package}" "$@" -- "${test_name}" >"${log}" 2>&1
-        if grep -qE '^test result: ok\. [1-9][0-9]* passed' "${log}"; then
+        # cargo treats the filter as a substring, so a name that is a
+        # prefix of another test would run both and the case could then
+        # be scored on the wrong test's failure. Requiring the baseline
+        # to have run exactly ONE test -- summed across every test
+        # binary in the package, since a filter can match in more than
+        # one -- closes that without depending on --exact, which needs
+        # the full module path and so matches nothing at all for the
+        # unit tests nested in `mod tests`.
+        local passed failed
+        passed="$(awk '/^test result: ok\. [0-9]+ passed/ {sum += $4} END {print sum + 0}' "${log}")"
+        failed="$(grep -cE '^test result: FAILED' "${log}")"
+        if [ "${passed}" = '1' ] && [ "${failed}" = '0' ]; then
             BASELINE_VERDICT["${key}"]='ok'
         else
             BASELINE_VERDICT["${key}"]='bad'
@@ -596,10 +625,31 @@ EXPECTED_CASES=26
 check_case_count() {
     # Only meaningful for a whole run; a selection is expected to be short.
     [ "${#SELECTED[@]}" -eq 0 ] || return 0
-    [ "${TOTAL_COUNT}" -eq "${EXPECTED_CASES}" ] && return 0
-    echo >&2
-    echo "case count is ${TOTAL_COUNT}, expected ${EXPECTED_CASES}." >&2
-    echo 'Update EXPECTED_CASES here and the figure in docs/testing.md together.' >&2
+
+    # The figure is read out of the document rather than promised to
+    # match it by a comment. A branch whose argument is that a claim
+    # should be derivable cannot leave its own claim hand-maintained.
+    local documented bad='no'
+    documented="$(grep -oE 'There are \*\*[0-9]+ cases\*\*' \
+        "${REPO_ROOT}/docs/testing.md" 2>/dev/null | grep -oE '[0-9]+' | head -1)"
+
+    if [ "${TOTAL_COUNT}" -ne "${EXPECTED_CASES}" ]; then
+        echo >&2
+        echo "case count is ${TOTAL_COUNT}, but EXPECTED_CASES says ${EXPECTED_CASES}." >&2
+        bad='yes'
+    fi
+    if [ -z "${documented}" ]; then
+        echo >&2
+        echo 'docs/testing.md no longer states the case count in the form' >&2
+        echo '"There are **N cases**", so it cannot be checked against.' >&2
+        bad='yes'
+    elif [ "${documented}" -ne "${EXPECTED_CASES}" ]; then
+        echo >&2
+        echo "docs/testing.md says ${documented} cases, EXPECTED_CASES says ${EXPECTED_CASES}." >&2
+        bad='yes'
+    fi
+    [ "${bad}" = 'no' ] && return 0
+    echo 'Update EXPECTED_CASES and docs/testing.md together.' >&2
     return 1
 }
 
@@ -622,10 +672,17 @@ except OSError as exc:
 else:
     print(text.count(os.environ["SEARCH"]))
 ' "${REPO_ROOT}/${relative}")"
+    # PASS and BROKEN are defined as facts about a mutation that was
+    # applied and a test that ran, and neither happens here. A script
+    # whose central argument is that a verdict word means exactly one
+    # thing should not overload its own vocabulary.
     if [ "${count}" = '1' ]; then
-        record PASS "${name}" "${relative}: one place to land"
+        PASS_COUNT=$((PASS_COUNT + 1))
+        printf '%-6s %-48s %s\n' 'LANDS' "${name}" "${relative}"
     else
-        record BROKEN "${name}" "${relative}: ${count} places to land, expected 1"
+        BROKEN_COUNT=$((BROKEN_COUNT + 1))
+        printf '%-6s %-48s %s\n' 'DRIFT' "${name}" \
+            "${relative}: ${count} places to land, expected 1"
     fi
 }
 
@@ -753,6 +810,10 @@ check_src_is_clean() {
     exit 2
 }
 
+if [ "${CHECK_PATTERNS}" = 'yes' ]; then
+    echo 'pattern check: no mutation is applied and no test is run.'
+    echo
+fi
 if [ "${LIST_ONLY}" = 'no' ] && [ "${CHECK_PATTERNS}" = 'no' ]; then
     check_src_is_clean
     # Stale logs from an earlier run must not be mistaken for this one's.
@@ -1005,13 +1066,19 @@ if [ "${LIST_ONLY}" = 'yes' ]; then
 fi
 
 echo
-echo "${TOTAL_COUNT} cases: ${PASS_COUNT} PASS, ${FAIL_COUNT} FAIL, ${BROKEN_COUNT} BROKEN"
+if [ "${CHECK_PATTERNS}" = 'yes' ]; then
+    echo "${TOTAL_COUNT} patterns: ${PASS_COUNT} land, ${BROKEN_COUNT} drifted"
+else
+    echo "${TOTAL_COUNT} cases: ${PASS_COUNT} PASS, ${FAIL_COUNT} FAIL, ${BROKEN_COUNT} BROKEN"
+fi
 
 check_selection_matched || exit 2
 check_case_count || exit 1
 
 if [ "${FAIL_COUNT}" -ne 0 ] || [ "${BROKEN_COUNT}" -ne 0 ]; then
-    echo "the log of each case above that did not pass is kept under ${LOG_DIR}"
+    if [ "${CHECK_PATTERNS}" = 'no' ]; then
+        echo "the log of each case above that did not pass is kept under ${LOG_DIR}"
+    fi
     exit 1
 fi
 exit 0

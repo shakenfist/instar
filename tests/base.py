@@ -525,9 +525,9 @@ class InstarTestBase(testtools.TestCase):
             self.fail(
                 f'{self.REQUIRE_LIBVHDI_ENV} is set, so this environment has '
                 f'declared libvhdi mandatory, but vhdiinfo is not on PATH. '
-                f'Install libvhdi-utils (Debian 13: 20240509-2+b1) or unset '
-                f'{self.REQUIRE_LIBVHDI_ENV}. Skipping here would hide the '
-                f'only external cross-check of differencing output.'
+                f'Install libvhdi-utils (Debian 13 ships 20240509 or newer) '
+                f'or unset {self.REQUIRE_LIBVHDI_ENV}. Skipping here would '
+                f'hide the only external cross-check of differencing output.'
             )
         self.skipTest(
             'libvhdi-utils is not installed, so vhdiinfo cannot act as the '
