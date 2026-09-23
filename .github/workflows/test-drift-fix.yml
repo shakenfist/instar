@@ -215,6 +215,13 @@ jobs:
       - name: Run initial tests
         id: initial_test
         continue-on-error: true
+        env:
+          # Matches integration-core in functional-tests.yml: the libvhdi
+          # oracle is the only external cross-check of differencing
+          # output, and it skips rather than fails when vhdiinfo is
+          # absent. A drift-fix run that verified a fix with the oracle
+          # skipped could green-light a change the oracle would reject.
+          INSTAR_REQUIRE_LIBVHDI: '1'
         run: |
           cd ${GITHUB_WORKSPACE}/instar
 
@@ -540,6 +547,12 @@ jobs:
         continue-on-error: true
         env:
           DOCKER_BUILDKIT: 1
+          # Matches integration-core in functional-tests.yml: the libvhdi
+          # oracle is the only external cross-check of differencing
+          # output, and it skips rather than fails when vhdiinfo is
+          # absent. A drift-fix run that verified a fix with the oracle
+          # skipped could green-light a change the oracle would reject.
+          INSTAR_REQUIRE_LIBVHDI: '1'
         run: |
           cd ${GITHUB_WORKSPACE}/instar
 

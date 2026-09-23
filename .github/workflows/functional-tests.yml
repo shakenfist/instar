@@ -152,6 +152,18 @@ jobs:
       - name: Test the mutation harness verdicts
         run: tools/mutate-differencing.sh --self-test
 
+      # The 26 search strings are pinned to src/ byte for byte,
+      # indentation included, so a reformat of the emitter turns cases
+      # BROKEN with nothing to notice until someone spends the full
+      # docker-and-testdata run. This counts the occurrences without
+      # mutating, building or running anything, and also asserts the
+      # case count docs/testing.md quotes.
+      - name: Check the mutation patterns still land
+        run: tools/mutate-differencing.sh --check-patterns
+
+      - name: Test the literal replace helper
+        run: tools/ci/test-replace-once.sh
+
       - name: Test the inline-script audit check
         run: tools/audit/test-inline-script-check.sh
 

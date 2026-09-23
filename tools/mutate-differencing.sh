@@ -65,6 +65,7 @@
 #   tools/mutate-differencing.sh --list       # names only, run nothing
 #   tools/mutate-differencing.sh NAME...      # only the named cases
 #   tools/mutate-differencing.sh --self-test  # check the verdict classifier
+#   tools/mutate-differencing.sh --check-patterns  # do the mutations still land?
 #   tools/mutate-differencing.sh --allow-dirty-src   # run over a dirty src/
 #
 # The four oracle-* cases need `vhdiinfo` on PATH (Debian:
@@ -87,6 +88,13 @@ GIT_ROOT="$(git -C "${REPO_ROOT}" rev-parse --show-toplevel 2>/dev/null || echo 
 # gitignored, so that they outlive a `kill -9` and can be found again.
 BACKUP_DIR="${GIT_ROOT}/.mutation-backups"
 
+# Logs of cases that did not pass. SCRATCH dies with the process, and
+# the one moment the cargo or unittest output is actually wanted is
+# when something went wrong, so those are copied somewhere that
+# survives. Cleared at the start of each run: a stale log read as a
+# current one is worse than no log.
+LOG_DIR="${BACKUP_DIR}/logs"
+
 # Where the integration tests look for their images. Resolved exactly as
 # tests/base.py:_load_manifest resolves it, so the preflight below fails
 # for the same reason the tests would.
@@ -108,7 +116,10 @@ BINARY_DIRTY='no'
 LIST_ONLY='no'
 ALLOW_DIRTY_SRC='no'
 SELF_TEST='no'
+CHECK_PATTERNS='no'
 SELECTED=()
+# Names from SELECTED that matched a real case; see check_selection_matched.
+declare -A MATCHED
 
 rebuild_instar() {
     make -C "${REPO_ROOT}" instar >"${SCRATCH}/build.log" 2>&1
@@ -164,17 +175,28 @@ trap cleanup EXIT
 trap 'exit 130' INT TERM
 
 usage() {
-    echo 'usage: tools/mutate-differencing.sh [--list] [--self-test] [--allow-dirty-src] [CASE-NAME...]'
+    echo 'usage: tools/mutate-differencing.sh [--list] [--self-test] [--check-patterns] [--allow-dirty-src] [CASE-NAME...]'
     echo
     echo '  --list              print the case names and what each runs, then stop'
     echo '  --self-test         check the verdict classifier against synthetic'
     echo '                      logs and stop; needs no docker, venv or testdata'
+    echo '  --check-patterns    check every mutation still has exactly one place'
+    echo '                      to land, and stop; mutates and builds nothing'
     echo '  --allow-dirty-src   run even though src/ has uncommitted modifications'
     echo '  NAME...             run only the named cases (default: all of them)'
     echo
     echo 'Each case breaks one behaviour in src/ and requires one named'
     echo 'test to fail. PASS means the test caught it; FAIL means it did'
     echo 'not; BROKEN means the case proved nothing.'
+}
+
+keep_log() {
+    # keep_log SOURCE NAME -- preserve a log for a case that did not pass.
+    local source="$1" name="$2"
+    [ -f "${source}" ] || return 0
+    mkdir -p "${LOG_DIR}" 2>/dev/null || return 0
+    cp -- "${source}" "${LOG_DIR}/${name}.log" 2>/dev/null || return 0
+    printf '       log: %s\n' "${LOG_DIR}/${name}.log"
 }
 
 record() {
@@ -185,20 +207,45 @@ record() {
         FAIL) FAIL_COUNT=$((FAIL_COUNT + 1)) ;;
         *) BROKEN_COUNT=$((BROKEN_COUNT + 1)) ;;
     esac
-    printf '%-6s %-38s %s\n' "${verdict}" "${name}" "${detail}"
+    printf '%-6s %-48s %s\n' "${verdict}" "${name}" "${detail}"
+    if [ "${verdict}" != 'PASS' ]; then
+        keep_log "${SCRATCH}/${name}.log" "${name}"
+    fi
 }
 
 wanted() {
     # wanted NAME -- is this case selected on the command line?
+    #
+    # Matches are recorded so the totals block can refuse a selection
+    # that named nothing. Without that, a mistyped or renamed case ran
+    # no cases and the script printed `0 cases: 0 PASS, 0 FAIL, 0
+    # BROKEN` and exited 0 -- a clean bill of health for work never
+    # done, which is the failure this script exists to refuse.
     local name="$1" candidate
     if [ "${#SELECTED[@]}" -eq 0 ]; then
         return 0
     fi
     for candidate in "${SELECTED[@]}"; do
         if [ "${candidate}" = "${name}" ]; then
+            MATCHED["${name}"]=1
             return 0
         fi
     done
+    return 1
+}
+
+check_selection_matched() {
+    # Every name given on the command line has to correspond to a case.
+    local candidate missing=()
+    [ "${#SELECTED[@]}" -eq 0 ] && return 0
+    for candidate in "${SELECTED[@]}"; do
+        [ -n "${MATCHED[${candidate}]+set}" ] || missing+=("${candidate}")
+    done
+    [ "${#missing[@]}" -eq 0 ] && return 0
+    echo >&2
+    echo "no such case: ${missing[*]}" >&2
+    echo 'Run --list for the case names. Nothing was run for those arguments,' >&2
+    echo 'so this is a failure rather than an empty pass.' >&2
     return 1
 }
 
@@ -388,12 +435,17 @@ rust_case() {
     wanted "${name}" || return 0
     TOTAL_COUNT=$((TOTAL_COUNT + 1))
     if [ "${LIST_ONLY}" = 'yes' ]; then
-        printf '%-38s rust %s :: %s\n' "${name}" "${package}" "${test_name}"
+        printf '%-48s rust %s :: %s\n' "${name}" "${package}" "${test_name}"
+        return 0
+    fi
+    if [ "${CHECK_PATTERNS}" = 'yes' ]; then
+        check_pattern "${name}" "${relative}" "${search}"
         return 0
     fi
 
     if ! rust_baseline_ok "${package}" "${test_name}" "$@"; then
         record BROKEN "${name}" "${test_name}: does not pass against unmutated source"
+        keep_log "${SCRATCH}/baseline-${package}-${test_name}.log" "${name}-baseline"
         return 0
     fi
 
@@ -422,12 +474,17 @@ integration_case() {
     wanted "${name}" || return 0
     TOTAL_COUNT=$((TOTAL_COUNT + 1))
     if [ "${LIST_ONLY}" = 'yes' ]; then
-        printf '%-38s integration %s\n' "${name}" "${target}"
+        printf '%-48s integration %s\n' "${name}" "${target}"
+        return 0
+    fi
+    if [ "${CHECK_PATTERNS}" = 'yes' ]; then
+        check_pattern "${name}" "${relative}" "${search}"
         return 0
     fi
 
     if ! python_baseline_ok "${target}"; then
         record BROKEN "${name}" "${target##*.}: does not pass against unmutated source"
+        keep_log "${SCRATCH}/baseline-${target}.log" "${name}-baseline"
         return 0
     fi
 
@@ -530,6 +587,48 @@ self_test() {
     return 0
 }
 
+# The number of cases. docs/testing.md quotes this figure and the
+# phase's definition of done asks the two to stay in step, which until
+# now was a promise kept by hand. Asserting it makes the drift a
+# failure instead of a documentation bug nobody reads.
+EXPECTED_CASES=26
+
+check_case_count() {
+    # Only meaningful for a whole run; a selection is expected to be short.
+    [ "${#SELECTED[@]}" -eq 0 ] || return 0
+    [ "${TOTAL_COUNT}" -eq "${EXPECTED_CASES}" ] && return 0
+    echo >&2
+    echo "case count is ${TOTAL_COUNT}, expected ${EXPECTED_CASES}." >&2
+    echo 'Update EXPECTED_CASES here and the figure in docs/testing.md together.' >&2
+    return 1
+}
+
+check_pattern() {
+    # check_pattern NAME RELATIVE SEARCH -- does this mutation still have
+    # exactly one place to land?
+    #
+    # The search strings are pinned to src/ byte for byte, indentation
+    # included, so a reformat or a refactor of the emitter turns cases
+    # BROKEN. Without this, nothing would notice until someone spent the
+    # full docker-and-testdata run -- and a harness that has rotted
+    # quietly is worse than no harness, because its green is trusted.
+    local name="$1" relative="$2" search="$3" count
+    count="$(SEARCH="${search}" python3 -c '
+import os, sys
+try:
+    text = open(sys.argv[1], encoding="utf-8").read()
+except OSError as exc:
+    print("unreadable (%s)" % exc)
+else:
+    print(text.count(os.environ["SEARCH"]))
+' "${REPO_ROOT}/${relative}")"
+    if [ "${count}" = '1' ]; then
+        record PASS "${name}" "${relative}: one place to land"
+    else
+        record BROKEN "${name}" "${relative}: ${count} places to land, expected 1"
+    fi
+}
+
 # ---------------------------------------------------------------------
 # Argument handling
 # ---------------------------------------------------------------------
@@ -538,6 +637,7 @@ while [ "$#" -gt 0 ]; do
     case "$1" in
         --list) LIST_ONLY='yes' ;;
         --self-test) SELF_TEST='yes' ;;
+        --check-patterns) CHECK_PATTERNS='yes' ;;
         --allow-dirty-src) ALLOW_DIRTY_SRC='yes' ;;
         -h|--help) usage; exit 0 ;;
         -*) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -550,7 +650,7 @@ if [ "${SELF_TEST}" = 'yes' ]; then
     self_test
     exit $?
 fi
-if [ ! -x "${REPO_ROOT}/tools/cargo-in-container.sh" ]; then
+if [ "${CHECK_PATTERNS}" = 'no' ] && [ ! -x "${REPO_ROOT}/tools/cargo-in-container.sh" ]; then
     echo 'tools/cargo-in-container.sh is missing or not executable' >&2
     exit 2
 fi
@@ -569,7 +669,8 @@ if [ "${REPO_ROOT}" != "${GIT_ROOT}" ]; then
     echo 'script. They have to be the same tree.' >&2
     exit 2
 fi
-if [ "${LIST_ONLY}" = 'no' ] && [ ! -d "${TESTDATA_PATH}" ]; then
+if [ "${LIST_ONLY}" = 'no' ] && [ "${CHECK_PATTERNS}" = 'no' ] \
+   && [ ! -d "${TESTDATA_PATH}" ]; then
     echo "testdata not found at ${TESTDATA_PATH}" >&2
     echo 'The integration cases load tests/manifest.json against a testdata checkout;' >&2
     echo 'without it setUpClass raises and unittest reports FAILED (errors=1), which' >&2
@@ -577,7 +678,8 @@ if [ "${LIST_ONLY}" = 'no' ] && [ ! -d "${TESTDATA_PATH}" ]; then
     echo 'instar-testdata beside this checkout.' >&2
     exit 2
 fi
-if [ "${LIST_ONLY}" = 'no' ] && [ ! -x "${REPO_ROOT}/tests/.venv/bin/python" ]; then
+if [ "${LIST_ONLY}" = 'no' ] && [ "${CHECK_PATTERNS}" = 'no' ] \
+   && [ ! -x "${REPO_ROOT}/tests/.venv/bin/python" ]; then
     echo 'tests/.venv is missing; run make test-venv first' >&2
     exit 2
 fi
@@ -585,7 +687,8 @@ fi
 # cases name tests that skip without libvhdi, and a skipped test scores
 # BROKEN here, which reads like a harness fault rather than a missing
 # package.
-if [ "${LIST_ONLY}" = 'no' ] && ! command -v vhdiinfo >/dev/null 2>&1; then
+if [ "${LIST_ONLY}" = 'no' ] && [ "${CHECK_PATTERNS}" = 'no' ] \
+   && ! command -v vhdiinfo >/dev/null 2>&1; then
     echo 'warning: vhdiinfo is not on PATH (Debian: libvhdi-utils).' >&2
     echo '         The oracle-* cases will report BROKEN: the tests they name' >&2
     echo '         skip without it rather than running.' >&2
@@ -650,8 +753,10 @@ check_src_is_clean() {
     exit 2
 }
 
-if [ "${LIST_ONLY}" = 'no' ]; then
+if [ "${LIST_ONLY}" = 'no' ] && [ "${CHECK_PATTERNS}" = 'no' ]; then
     check_src_is_clean
+    # Stale logs from an earlier run must not be mistaken for this one's.
+    rm -rf -- "${LOG_DIR}"
 fi
 
 # ---------------------------------------------------------------------
@@ -894,14 +999,19 @@ integration_case 'oracle-vhdx-has-parent-bit' "${CREATE_LIB}" \
 
 if [ "${LIST_ONLY}" = 'yes' ]; then
     echo "${TOTAL_COUNT} cases"
+    check_selection_matched || exit 2
+    check_case_count || exit 1
     exit 0
 fi
 
 echo
 echo "${TOTAL_COUNT} cases: ${PASS_COUNT} PASS, ${FAIL_COUNT} FAIL, ${BROKEN_COUNT} BROKEN"
 
+check_selection_matched || exit 2
+check_case_count || exit 1
+
 if [ "${FAIL_COUNT}" -ne 0 ] || [ "${BROKEN_COUNT}" -ne 0 ]; then
-    echo 'logs from this run are deleted on exit; re-run a single case by name to keep looking'
+    echo "the log of each case above that did not pass is kept under ${LOG_DIR}"
     exit 1
 fi
 exit 0

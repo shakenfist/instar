@@ -1211,8 +1211,18 @@ class TestDifferencingLibvhdiOracle(DifferencingTestBase):
     # carry no value and must not be parsed as fields.
     FIELD_RE = re.compile(r'^\s+(\S.*?)\s*:\s*(.*)$')
 
-    def _vhdiinfo(self, path: Path) -> dict:
-        """Parse `vhdiinfo PATH` into a {label: value} mapping."""
+    def _vhdiinfo(self, path: Path, required=()) -> dict:
+        """Parse `vhdiinfo PATH` into a {label: value} mapping.
+
+        *required* names labels the caller is about to assert on. They
+        are checked here rather than at the call site because
+        `fields.get(MISSING)` is `None`, and `None` compares equal to
+        `None`: a libvhdi release that renamed `Parent identifier`
+        would turn both identity assertions into a comparison of two
+        absent values and keep passing. An oracle whose whole claim is
+        that it is not a closed loop cannot afford to go vacuous
+        quietly.
+        """
         r = subprocess.run(
             ['vhdiinfo', str(path)], capture_output=True, text=True, timeout=60
         )
@@ -1242,10 +1252,12 @@ class TestDifferencingLibvhdiOracle(DifferencingTestBase):
         # A parse that silently produced nothing would make every
         # assertion below vacuous, so prove the output was understood
         # before trusting any of it.
-        self.assertIn(
-            self.DISK_TYPE, fields,
-            f'vhdiinfo output was not understood for {path}: {r.stdout!r}'
-        )
+        for label in (self.DISK_TYPE, *required):
+            self.assertIn(
+                label, fields,
+                f'vhdiinfo did not report {label!r} for {path}, so an '
+                f'assertion on it would compare None with None: {r.stdout!r}'
+            )
         return fields
 
     def _stage_parent(self, image_id: str, workdir, subdirectory=None):
@@ -1349,7 +1361,8 @@ class TestDifferencingLibvhdiOracle(DifferencingTestBase):
                     # constant here would pin the fixture rather than
                     # the emitter, and would go stale the day the
                     # fixture is regenerated.
-                    parent_fields = self._vhdiinfo(parent)
+                    parent_fields = self._vhdiinfo(
+                        parent, required=(self.IDENTIFIER,))
                     want_identity = parent_fields.get(self.IDENTIFIER)
                     self.assertNotEqual(
                         self.ZERO_GUID, want_identity,
@@ -1359,7 +1372,9 @@ class TestDifferencingLibvhdiOracle(DifferencingTestBase):
                     )
 
                     child = self._create_child(td, 'vpc', typed, 'child.vhd')
-                    fields = self._vhdiinfo(child)
+                    fields = self._vhdiinfo(
+                        child,
+                        required=(self.PARENT_IDENTIFIER, self.PARENT_FILENAME))
 
                     self.assertEqual(
                         self.DIFFERENTIAL, fields.get(self.DISK_TYPE),
@@ -1413,7 +1428,8 @@ class TestDifferencingLibvhdiOracle(DifferencingTestBase):
         with tempfile.TemporaryDirectory() as td:
             parent, typed = self._stage_parent('vhdx-diff-parent', td)
 
-            parent_fields = self._vhdiinfo(parent)
+            parent_fields = self._vhdiinfo(
+                parent, required=(self.IDENTIFIER,))
             want_identity = parent_fields.get(self.IDENTIFIER)
             self.assertNotEqual(
                 self.ZERO_GUID, want_identity,
@@ -1423,7 +1439,8 @@ class TestDifferencingLibvhdiOracle(DifferencingTestBase):
             )
 
             child = self._create_child(td, 'vhdx', typed, 'child.vhdx')
-            fields = self._vhdiinfo(child)
+            fields = self._vhdiinfo(
+                child, required=(self.PARENT_IDENTIFIER,))
 
             # The File Parameters `HasParent` bit, seen from outside.
             # Nothing else in the Python suite asserts it: the round

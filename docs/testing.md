@@ -1504,27 +1504,48 @@ cross-check in `tests/test_differencing.py`, which skips without
 `BROKEN`, not `PASS`, so the harness needs that package installed to
 report a clean run; it warns once up front when it is missing.
 
-A full run took **3m35s** measured on a devcontainer build of this
-tree, with `vhdiinfo` present and all 26 cases passing. That figure is
-observed rather than estimated: an earlier "about two minutes" here was
-a guess, and an understated one invites the reader to assume a run has
-hung. Most of it is the 24 `make instar` rebuilds the integration cases
-need; the 21 baselines add test runs but no rebuilds.
+A full run took **2m44s and 3m35s** on two measured runs of this tree,
+with `vhdiinfo` present and all 26 cases passing — so budget three to
+four minutes, and expect the spread, which is cargo and docker layer
+caching. Those are observations: an earlier "about two minutes" here
+was a guess, and an understated figure invites the reader to assume a
+run has hung. Most of the time is the 24 `make instar` rebuilds the
+integration cases need; the 21 baselines add test runs but no
+rebuilds.
 
 ```bash
-tools/mutate-differencing.sh          # every case, about three and a half minutes
+tools/mutate-differencing.sh          # every case, three to four minutes
 tools/mutate-differencing.sh --list   # the case names, run nothing
 tools/mutate-differencing.sh NAME...  # only the named cases
-tools/mutate-differencing.sh --self-test   # check the verdict classifier
+tools/mutate-differencing.sh --self-test        # check the verdict classifier
+tools/mutate-differencing.sh --check-patterns  # do the mutations still land?
 ```
 
-`--self-test` checks the verdict classifier against synthetic logs and
-exits. It needs no docker, venv or testdata, takes milliseconds, and
-runs as a step of the `ci-tooling` job. It exists because the
-classifier is the one part of the harness nothing else checks —
-everything else here is checked *by* it — and it shipped misreading
-`FAILED (errors=1)` as a caught mutation, which no run of the harness
-itself would have revealed.
+Three things run in the `ci-tooling` job, because a full run needs
+docker, testdata and `/dev/kvm` and so never runs on a pull request —
+which would leave the harness free to rot unnoticed, and a harness
+that has rotted quietly is worse than none, because its green is
+trusted.
+
+| Guard | Answers | Cost |
+|---|---|---|
+| `--self-test` | does the verdict classifier classify correctly? | milliseconds |
+| `--check-patterns` | does every mutation still have exactly one place to land, and is the case count still 26? | a few seconds |
+| `tools/ci/test-replace-once.sh` | does the literal replace helper still refuse zero and multiple matches? | milliseconds |
+
+None of them needs docker, a venv, testdata or a build.
+
+`--self-test` exists because the classifier is the one part of the
+harness nothing else checks — everything else is checked *by* it — and
+it shipped misreading `FAILED (errors=1)` as a caught mutation, which
+no run of the harness itself would have revealed.
+
+`--check-patterns` exists because the 26 search strings are pinned to
+`src/` byte for byte, indentation included. A `rustfmt` change that
+moves a space turns a case `BROKEN`, and without this nothing would
+say so until someone spent the full run. It also asserts the case
+count against the figure quoted above, so the two cannot drift apart
+by hand.
 
 The verdicts are the point of the script:
 
@@ -1564,6 +1585,17 @@ the harness closes each:
   without testdata at all.
 
 The script exits non-zero if any case is `FAIL` or `BROKEN`.
+
+The log of any case that does not pass is kept under
+`.mutation-backups/logs/` and named in the report, because the scratch
+directory dies with the process and the one moment the `cargo` or
+`unittest` output is wanted is when something went wrong. Those logs
+are cleared at the start of each run, so a stale one cannot be read as
+current.
+
+Naming a case that does not exist is an error rather than an empty
+pass: a mistyped name used to run nothing and report `0 cases: 0 PASS,
+0 FAIL, 0 BROKEN` with exit 0.
 
 Originals are copied into `.mutation-backups/` (gitignored) before each
 edit and copied back afterwards, including on interrupt. Restoring with
