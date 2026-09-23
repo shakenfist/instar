@@ -585,15 +585,16 @@ jobs:
       fail-fast: false
       matrix:
         distro:
-          # audit-ok: eol-distro -- Debian 12 is a SUPPORTED TARGET here,
-          # not a build platform. bookworm reached end of life on
-          # 2026-06-10, but docs/installation.md and README.md promise
-          # Debian 11 and newer, and this entry is how that promise is
-          # kept honest: it installs the shipped .deb on bookworm and
-          # runs the full suite against bookworm's own qemu-img. Remove
-          # it only together with the published support matrix, not to
-          # settle an audit finding.
+          # Debian 12 is a SUPPORTED TARGET here, not a build platform.
+          # bookworm reached end of life on 2026-06-10, but
+          # docs/installation.md and README.md promise Debian 11 and
+          # newer, and this entry is how that promise is kept honest:
+          # it installs the shipped .deb on bookworm and runs the full
+          # suite against bookworm's own qemu-img. Remove it only
+          # together with the published support matrix, not to settle
+          # an audit finding.
           - name: 'Debian 12'
+            # audit-ok: eol-distro -- supported target, see the note above
             image: 'debian:12'
             pkg_kind: 'deb'
             allow_failure: false
