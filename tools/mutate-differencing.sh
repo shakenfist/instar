@@ -16,13 +16,22 @@
 #             guards the property.
 #   FAIL   -- the mutation applied and the named test still passed.
 #             The test does not guard the property.
-#   BROKEN -- the mutation could not be applied (the search string is
-#             absent, or present more than once), or the test command
-#             did not run (wrong package name, build error, zero tests
-#             matched, test skipped). A mutation that cannot be applied
-#             is NEVER scored as a PASS; earlier hand-rolled harnesses
-#             did exactly that and reported success for code they had
-#             never changed.
+#   BROKEN -- the case proved nothing, for one of four reasons: the
+#             mutation could not be applied (the search string is absent,
+#             or present more than once); the test command did not run
+#             (wrong package name, build error, zero tests matched); the
+#             test skipped; or the test does not pass against unmutated
+#             source in the first place, so its failure cannot be
+#             attributed to the mutation.
+#
+#             A case that proved nothing is NEVER scored as a PASS.
+#             Earlier hand-rolled harnesses did exactly that and
+#             reported success for code they had never changed, and this
+#             script shipped with a narrower version of the same bug: it
+#             read unittest's `FAILED (errors=1)` -- setUpClass raising
+#             because the testdata checkout was missing -- as a caught
+#             mutation, so a run with no testdata scored PASS for every
+#             integration case without evaluating one assertion.
 #
 # Every edit goes through tools/replace-once.py, which is a literal
 # find-and-replace that exits non-zero unless the search string occurs
@@ -55,6 +64,7 @@
 #   tools/mutate-differencing.sh              # every case
 #   tools/mutate-differencing.sh --list       # names only, run nothing
 #   tools/mutate-differencing.sh NAME...      # only the named cases
+#   tools/mutate-differencing.sh --self-test  # check the verdict classifier
 #   tools/mutate-differencing.sh --allow-dirty-src   # run over a dirty src/
 #
 # The four oracle-* cases need `vhdiinfo` on PATH (Debian:
@@ -77,6 +87,11 @@ GIT_ROOT="$(git -C "${REPO_ROOT}" rev-parse --show-toplevel 2>/dev/null || echo 
 # gitignored, so that they outlive a `kill -9` and can be found again.
 BACKUP_DIR="${GIT_ROOT}/.mutation-backups"
 
+# Where the integration tests look for their images. Resolved exactly as
+# tests/base.py:_load_manifest resolves it, so the preflight below fails
+# for the same reason the tests would.
+TESTDATA_PATH="${INSTAR_TESTDATA_PATH:-$(dirname "${REPO_ROOT}")/instar-testdata}"
+
 PASS_COUNT=0
 FAIL_COUNT=0
 BROKEN_COUNT=0
@@ -92,6 +107,7 @@ BINARY_DIRTY='no'
 
 LIST_ONLY='no'
 ALLOW_DIRTY_SRC='no'
+SELF_TEST='no'
 SELECTED=()
 
 rebuild_instar() {
@@ -148,15 +164,17 @@ trap cleanup EXIT
 trap 'exit 130' INT TERM
 
 usage() {
-    echo 'usage: tools/mutate-differencing.sh [--list] [--allow-dirty-src] [CASE-NAME...]'
+    echo 'usage: tools/mutate-differencing.sh [--list] [--self-test] [--allow-dirty-src] [CASE-NAME...]'
     echo
     echo '  --list              print the case names and what each runs, then stop'
+    echo '  --self-test         check the verdict classifier against synthetic'
+    echo '                      logs and stop; needs no docker, venv or testdata'
     echo '  --allow-dirty-src   run even though src/ has uncommitted modifications'
     echo '  NAME...             run only the named cases (default: all of them)'
     echo
     echo 'Each case breaks one behaviour in src/ and requires one named'
     echo 'test to fail. PASS means the test caught it; FAIL means it did'
-    echo 'not; BROKEN means the mutation or the test never ran at all.'
+    echo 'not; BROKEN means the case proved nothing.'
 }
 
 record() {
@@ -247,7 +265,21 @@ rust_verdict() {
 
 python_verdict() {
     # python_verdict LOGFILE -- classify a `python -m unittest` run.
-    local log="$1"
+    #
+    # The order here is load-bearing, and one ordering used to be wrong.
+    # unittest reports an exception raised outside an assertion as
+    # `FAILED (errors=1)` -- setUpClass blowing up, an import error,
+    # InstarTestBase._load_manifest raising because the testdata
+    # checkout is absent (tests/base.py). That is the same `^FAILED (`
+    # line a caught mutation produces, so matching on the word FAILED
+    # alone scored PASS for a run in which no assertion was ever
+    # evaluated: precisely the unearned pass this script exists to
+    # refuse. A genuine catch always surfaces as `failures=`.
+    #
+    # `skipped=` is tested after `failures=` so that a run which caught
+    # the mutation and skipped something else -- `FAILED (failures=1,
+    # skipped=1)` -- is scored on the catch rather than on the skip.
+    local log="$1" summary
     if ! grep -qE '^Ran [0-9]+ test' "${log}"; then
         echo 'BROKEN the test command did not run'
         return
@@ -256,19 +288,92 @@ python_verdict() {
         echo 'BROKEN no test matched the name'
         return
     fi
-    if grep -qE 'skipped=' "${log}"; then
-        echo 'BROKEN the test skipped'
-        return
+    summary="$(grep -E '^(OK|FAILED)\b' "${log}" | tail -1)"
+    case "${summary}" in
+        '')
+            echo 'BROKEN the outcome could not be read from the test output' ;;
+        *errors=*)
+            echo 'BROKEN the test errored instead of failing; no assertion ran' ;;
+        FAILED*failures=*)
+            echo 'PASS the test failed, as required' ;;
+        *skipped=*)
+            echo 'BROKEN the test skipped' ;;
+        OK*)
+            echo 'FAIL the test still passed against mutated code' ;;
+        *)
+            echo 'BROKEN the outcome could not be read from the test output' ;;
+    esac
+}
+
+# A mutation case proves something only if the test it names passes
+# against unmutated source. A test that is already red -- broken on
+# develop, or red for an environmental reason that fails rather than
+# skips -- fails again with the mutation applied and scores PASS
+# without the mutation having anything to do with it. That is the same
+# false confidence as a mutation that never applied, which
+# replace-once.py closes; this closes the other half.
+#
+# Baselines are run lazily and cached per target, so a run selecting
+# one case pays for one baseline, and the 21 distinct targets behind
+# the 26 cases are each measured once.
+declare -A BASELINE_VERDICT
+
+# 'yes' once the instar binary is known to be built from unmutated
+# source, so the integration baselines do not each force a rebuild.
+CLEAN_BINARY='no'
+
+ensure_clean_binary() {
+    # The integration cases exercise the real binary, so a baseline has
+    # to run against one built from clean source.
+    [ "${CLEAN_BINARY}" = 'yes' ] && return 0
+    rebuild_instar || return 1
+    CLEAN_BINARY='yes'
+}
+
+rust_baseline_ok() {
+    # rust_baseline_ok PACKAGE TEST [CARGO_ARGS...] -- does this test
+    # pass against unmutated source? Cached; call only while the tree is
+    # clean.
+    local package="$1" test_name="$2"
+    shift 2
+    local key="rust|${package}|${test_name}|$*"
+    if [ -z "${BASELINE_VERDICT[${key}]+set}" ]; then
+        local log="${SCRATCH}/baseline-${package}-${test_name}.log"
+        "${REPO_ROOT}/tools/cargo-in-container.sh" test --release \
+            -p "${package}" "$@" -- "${test_name}" >"${log}" 2>&1
+        if grep -qE '^test result: ok\. [1-9][0-9]* passed' "${log}"; then
+            BASELINE_VERDICT["${key}"]='ok'
+        else
+            BASELINE_VERDICT["${key}"]='bad'
+        fi
     fi
-    if grep -qE '^FAILED \(' "${log}"; then
-        echo 'PASS the test failed, as required'
-        return
+    [ "${BASELINE_VERDICT[${key}]}" = 'ok' ]
+}
+
+python_baseline_ok() {
+    # python_baseline_ok TARGET -- does this test pass against
+    # unmutated source, without skipping? Cached; call only while the
+    # tree is clean.
+    local target="$1"
+    local key="py|${target}"
+    if [ -z "${BASELINE_VERDICT[${key}]+set}" ]; then
+        local log="${SCRATCH}/baseline-${target}.log"
+        if ! ensure_clean_binary; then
+            BASELINE_VERDICT["${key}"]='bad'
+        else
+            (cd "${REPO_ROOT}/tests" && .venv/bin/python -m unittest "${target}") \
+                >"${log}" 2>&1
+            # `OK` and nothing else: a baseline that skipped measures
+            # nothing, and is the state the oracle cases land in when
+            # vhdiinfo is missing.
+            if grep -qE '^OK$' "${log}"; then
+                BASELINE_VERDICT["${key}"]='ok'
+            else
+                BASELINE_VERDICT["${key}"]='bad'
+            fi
+        fi
     fi
-    if grep -qE '^OK' "${log}"; then
-        echo 'FAIL the test still passed against mutated code'
-        return
-    fi
-    echo 'BROKEN the outcome could not be read from the test output'
+    [ "${BASELINE_VERDICT[${key}]}" = 'ok' ]
 }
 
 rust_case() {
@@ -284,6 +389,11 @@ rust_case() {
     TOTAL_COUNT=$((TOTAL_COUNT + 1))
     if [ "${LIST_ONLY}" = 'yes' ]; then
         printf '%-38s rust %s :: %s\n' "${name}" "${package}" "${test_name}"
+        return 0
+    fi
+
+    if ! rust_baseline_ok "${package}" "${test_name}" "$@"; then
+        record BROKEN "${name}" "${test_name}: does not pass against unmutated source"
         return 0
     fi
 
@@ -316,13 +426,21 @@ integration_case() {
         return 0
     fi
 
+    if ! python_baseline_ok "${target}"; then
+        record BROKEN "${name}" "${target##*.}: does not pass against unmutated source"
+        return 0
+    fi
+
     apply_mutation "${name}" "${relative}" "${search}" "${replace}" || return 0
 
     BINARY_DIRTY='yes'
+    CLEAN_BINARY='no'
     if ! rebuild_instar; then
         record BROKEN "${name}" "make instar failed against the mutated source"
         restore_mutation
-        rebuild_instar || true
+        if rebuild_instar; then
+            CLEAN_BINARY='yes'
+        fi
         BINARY_DIRTY='no'
         return 0
     fi
@@ -332,12 +450,84 @@ integration_case() {
         >"${log}" 2>&1
 
     restore_mutation
-    rebuild_instar || true
+    if rebuild_instar; then
+        CLEAN_BINARY='yes'
+    fi
     BINARY_DIRTY='no'
 
     local verdict
     verdict="$(python_verdict "${log}")"
     record "${verdict%% *}" "${name}" "${target##*.}: ${verdict#* }"
+}
+
+self_test() {
+    # The verdict functions are the harness's own logic, and they are
+    # the part with no test above them: every other check here is
+    # performed BY them. One of them shipped a bug -- `FAILED (errors=1)`
+    # read as a caught mutation -- that no amount of running the harness
+    # would have surfaced, because the environment it misreads is the
+    # one nobody runs it in. So they are checked against synthetic logs,
+    # in milliseconds, with no docker, no venv and no testdata.
+    local failures=0
+    local log="${SCRATCH}/self-test.log"
+
+    assert_verdict() {
+        # assert_verdict VERDICT_FN EXPECTED DESCRIPTION -- the log is already
+        # written to ${log}.
+        local fn="$1" expected="$2" description="$3" got
+        got="$("${fn}" "${log}")"
+        if [ "${got%% *}" != "${expected}" ]; then
+            printf 'self-test FAIL: %s\n  wanted %s, got %s\n' \
+                "${description}" "${expected}" "${got}" >&2
+            failures=$((failures + 1))
+        fi
+    }
+
+    printf 'Ran 1 test in 0.1s\n\nFAILED (failures=1)\n' >"${log}"
+    assert_verdict python_verdict PASS 'python: a caught mutation'
+
+    printf 'Ran 2 tests in 0.1s\n\nFAILED (failures=1, skipped=1)\n' >"${log}"
+    assert_verdict python_verdict PASS 'python: caught, with an unrelated skip'
+
+    printf 'Ran 1 test in 0.1s\n\nFAILED (errors=1)\n' >"${log}"
+    assert_verdict python_verdict BROKEN 'python: setUpClass raised; no assertion ran'
+
+    printf 'Ran 1 test in 0.1s\n\nFAILED (errors=1, failures=1)\n' >"${log}"
+    assert_verdict python_verdict BROKEN 'python: an error alongside a failure is not trusted'
+
+    printf 'Ran 1 test in 0.1s\n\nOK\n' >"${log}"
+    assert_verdict python_verdict FAIL 'python: the test did not notice the mutation'
+
+    printf 'Ran 1 test in 0.1s\n\nOK (skipped=1)\n' >"${log}"
+    assert_verdict python_verdict BROKEN 'python: the test skipped'
+
+    printf 'Ran 0 tests in 0.0s\n\nOK\n' >"${log}"
+    assert_verdict python_verdict BROKEN 'python: the name matched nothing'
+
+    : >"${log}"
+    assert_verdict python_verdict BROKEN 'python: the command did not run'
+
+    printf 'test result: FAILED. 0 passed; 1 failed\n' >"${log}"
+    assert_verdict rust_verdict PASS 'rust: a caught mutation'
+
+    printf 'test result: ok. 1 passed; 0 failed\n' >"${log}"
+    assert_verdict rust_verdict FAIL 'rust: the test did not notice the mutation'
+
+    printf 'test result: ok. 0 passed; 0 failed\n' >"${log}"
+    assert_verdict rust_verdict BROKEN 'rust: the filter matched nothing'
+
+    printf 'error: package ID specification vmm did not match any packages\n' >"${log}"
+    assert_verdict rust_verdict BROKEN 'rust: wrong package name'
+
+    : >"${log}"
+    assert_verdict rust_verdict BROKEN 'rust: the build failed'
+
+    if [ "${failures}" -ne 0 ]; then
+        echo "self-test: ${failures} verdict(s) misclassified" >&2
+        return 1
+    fi
+    echo 'self-test: verdict classification is correct'
+    return 0
 }
 
 # ---------------------------------------------------------------------
@@ -347,6 +537,7 @@ integration_case() {
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --list) LIST_ONLY='yes' ;;
+        --self-test) SELF_TEST='yes' ;;
         --allow-dirty-src) ALLOW_DIRTY_SRC='yes' ;;
         -h|--help) usage; exit 0 ;;
         -*) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -355,8 +546,35 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 
+if [ "${SELF_TEST}" = 'yes' ]; then
+    self_test
+    exit $?
+fi
 if [ ! -x "${REPO_ROOT}/tools/cargo-in-container.sh" ]; then
     echo 'tools/cargo-in-container.sh is missing or not executable' >&2
+    exit 2
+fi
+# REPO_ROOT is derived from this script's own location; GIT_ROOT is what
+# git says. They are the same directory for a clone and for a worktree,
+# and everything here assumes it: mutations are written under REPO_ROOT
+# while the dirty-source check, the backups and the printed restore
+# command all use GIT_ROOT. If they ever diverge -- a symlinked tools/,
+# a submodule, a stray .git -- the safety check would be inspecting one
+# tree while the script mutated another, so refuse rather than guess.
+if [ "${REPO_ROOT}" != "${GIT_ROOT}" ]; then
+    echo 'refusing to start: the script'"'"'s root and git'"'"'s root disagree.' >&2
+    echo "    script: ${REPO_ROOT}" >&2
+    echo "    git:    ${GIT_ROOT}" >&2
+    echo 'The dirty-source check and the backups follow git; the mutations follow the' >&2
+    echo 'script. They have to be the same tree.' >&2
+    exit 2
+fi
+if [ "${LIST_ONLY}" = 'no' ] && [ ! -d "${TESTDATA_PATH}" ]; then
+    echo "testdata not found at ${TESTDATA_PATH}" >&2
+    echo 'The integration cases load tests/manifest.json against a testdata checkout;' >&2
+    echo 'without it setUpClass raises and unittest reports FAILED (errors=1), which' >&2
+    echo 'looks like a caught mutation but is not. Set INSTAR_TESTDATA_PATH or put' >&2
+    echo 'instar-testdata beside this checkout.' >&2
     exit 2
 fi
 if [ "${LIST_ONLY}" = 'no' ] && [ ! -x "${REPO_ROOT}/tests/.venv/bin/python" ]; then

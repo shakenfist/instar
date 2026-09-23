@@ -1504,11 +1504,27 @@ cross-check in `tests/test_differencing.py`, which skips without
 `BROKEN`, not `PASS`, so the harness needs that package installed to
 report a clean run; it warns once up front when it is missing.
 
+A full run took **3m35s** measured on a devcontainer build of this
+tree, with `vhdiinfo` present and all 26 cases passing. That figure is
+observed rather than estimated: an earlier "about two minutes" here was
+a guess, and an understated one invites the reader to assume a run has
+hung. Most of it is the 24 `make instar` rebuilds the integration cases
+need; the 21 baselines add test runs but no rebuilds.
+
 ```bash
-tools/mutate-differencing.sh          # every case, about two minutes
+tools/mutate-differencing.sh          # every case, about three and a half minutes
 tools/mutate-differencing.sh --list   # the case names, run nothing
 tools/mutate-differencing.sh NAME...  # only the named cases
+tools/mutate-differencing.sh --self-test   # check the verdict classifier
 ```
+
+`--self-test` checks the verdict classifier against synthetic logs and
+exits. It needs no docker, venv or testdata, takes milliseconds, and
+runs as a step of the `ci-tooling` job. It exists because the
+classifier is the one part of the harness nothing else checks —
+everything else here is checked *by* it — and it shipped misreading
+`FAILED (errors=1)` as a caught mutation, which no run of the harness
+itself would have revealed.
 
 The verdicts are the point of the script:
 
@@ -1516,17 +1532,38 @@ The verdicts are the point of the script:
 |---|---|
 | `PASS` | The mutation applied and the named test failed. The test guards the property. |
 | `FAIL` | The mutation applied and the test still passed. The test does not guard the property. |
-| `BROKEN` | The mutation could not be applied, or the test never ran — a wrong package name, a build error, a filter that matched no test, or a skip. |
+| `BROKEN` | The case proved nothing: the mutation could not be applied, the test never ran (a wrong package name, a build error, a filter that matched no test), the test skipped, or the test does not pass against unmutated source. |
 
 `BROKEN` exists because the interesting failure mode of a mutation
-harness is not a test that fails to fire, it is a mutation that never
-lands. A substitution matching nothing leaves the code unchanged, the
-test then passes for the ordinary reason, and a naive harness scores a
-pass it has not earned. Every edit therefore goes through
-`tools/replace-once.py`, a **literal** find-and-replace — no regex, no
-`sed`, no escaping rules — that exits non-zero unless the search string
-occurs exactly once in the target file. The script exits non-zero if
-any case is `FAIL` or `BROKEN`.
+harness is not a test that fails to fire, it is a case that scores a
+pass without having earned it. There are three ways that happens, and
+the harness closes each:
+
+* **The mutation never lands.** A substitution matching nothing leaves
+  the code unchanged, the test passes for the ordinary reason, and a
+  naive harness calls that a pass. Every edit therefore goes through
+  `tools/replace-once.py`, a **literal** find-and-replace — no regex,
+  no `sed`, no escaping rules — that exits non-zero unless the search
+  string occurs exactly once in the target file.
+* **The test was already red.** A test broken on `develop`, or red for
+  an environmental reason, fails again with the mutation applied and
+  the failure gets credited to the mutation. Each named test is
+  therefore run once against unmutated source first, and a case whose
+  baseline does not pass is `BROKEN` rather than `PASS`. Baselines are
+  cached per target: the 26 cases name 21 distinct targets (14 Rust,
+  7 integration), so that is 21 extra test runs and no extra rebuilds
+  — the integration baselines reuse the clean binary each case
+  restores anyway.
+* **The test errored rather than failed.** `unittest` reports an
+  exception raised outside an assertion as `FAILED (errors=1)` — the
+  same `FAILED` line a caught mutation produces. Matching on the word
+  alone meant a missing testdata checkout, which makes `setUpClass`
+  raise, scored `PASS` for every integration case without one
+  assertion being evaluated. A genuine catch always says `failures=`,
+  so `errors=` is now `BROKEN`, and the script refuses to start
+  without testdata at all.
+
+The script exits non-zero if any case is `FAIL` or `BROKEN`.
 
 Originals are copied into `.mutation-backups/` (gitignored) before each
 edit and copied back afterwards, including on interrupt. Restoring with

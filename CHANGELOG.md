@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **The differencing tests can be proved to fail.**
+  `tools/mutate-differencing.sh` is a committed falsification harness:
+  26 cases, each breaking one specific behaviour in the differencing
+  create path and demanding that one named test notices. It scores
+  BROKEN -- never PASS -- when a mutation did not apply, when the test
+  skipped, or when the test does not pass against unmutated source, so
+  a case that proved nothing cannot be read as evidence. Evidence of
+  this kind had been rebuilt by hand and discarded three times over
+  earlier phases.
+
+- **libvhdi is now a required external oracle in CI.** The integration
+  suite cross-checks differencing VHD and VHDX output with `vhdiinfo`,
+  an independent parser, rather than only with instar reading back what
+  instar wrote. Because a skipped oracle is indistinguishable from a
+  passing one, `INSTAR_REQUIRE_LIBVHDI` turns a missing `vhdiinfo` into
+  a failure, and `integration-core` sets it.
+
 - **Documentation diagrams are rendered pictures.** Fourteen
   box-and-arrow diagrams in `ARCHITECTURE.md` and `docs/` are now
   `mermaid` fences, which GitHub renders natively, instead of ASCII art.

@@ -1223,8 +1223,22 @@ class TestDifferencingLibvhdiOracle(DifferencingTestBase):
         fields = {}
         for line in r.stdout.splitlines():
             match = self.FIELD_RE.match(line)
-            if match:
-                fields[match.group(1)] = match.group(2)
+            if not match:
+                continue
+            label, value = match.group(1), match.group(2)
+            # Plain assignment would let a repeated label overwrite an
+            # earlier one with no signal, so a second section or a new
+            # field under an indented sub-heading would quietly change
+            # what every assertion below reads. The vacuous-parse guard
+            # underneath is the same concern approached from the other
+            # end: there, nothing was understood; here, two things were
+            # and the parser cannot say which one counts.
+            self.assertNotIn(
+                label, fields,
+                f'vhdiinfo printed {label!r} more than once for {path}, so '
+                f'the parser cannot tell which value to assert on: {r.stdout!r}'
+            )
+            fields[label] = value
         # A parse that silently produced nothing would make every
         # assertion below vacuous, so prove the output was understood
         # before trusting any of it.
@@ -1304,17 +1318,32 @@ class TestDifferencingLibvhdiOracle(DifferencingTestBase):
         a subdirectory can, because `sub/parent.vhd` renders to
         `.\\sub\\parent.vhd` and the separator changes too.
 
+        The third shape is absolute, which takes the other branch of
+        the rendering entirely: an absolute path keeps its POSIX bytes
+        and never gains the `.\\` prefix. `test_create.py` covers that
+        shape today with a whole-file substring search and an `instar
+        info` round-trip -- but the round-trip is instar reading what
+        instar wrote, which is the assertion strength this oracle
+        exists to improve on.
+
         libvhdi never parses the VHD locator table at all, so nothing
         here asserts anything about it. The locator's own structure is
         pinned by `src/crates/create/tests/round_trip.rs`.
         """
         self._require_vhdiinfo()
-        for subdirectory in (None, 'sub'):
-            shape = 'bare' if subdirectory is None else 'subdirectory'
+        for shape in ('bare', 'subdirectory', 'absolute'):
+            subdirectory = 'sub' if shape == 'subdirectory' else None
             with self.subTest(parent_path=shape):
                 with tempfile.TemporaryDirectory() as td:
                     parent, typed = self._stage_parent(
                         'vhd-diff-parent', td, subdirectory)
+                    if shape == 'absolute':
+                        # What -b is given, and so what the parent
+                        # unicode name must hold verbatim. FIELD_RE
+                        # splits on the first colon, which a POSIX
+                        # absolute path does not contain, so the value
+                        # comes back whole.
+                        typed = str(parent)
 
                     # Derived from the parent, never hardcoded: a
                     # constant here would pin the fixture rather than
