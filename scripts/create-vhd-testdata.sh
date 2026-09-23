@@ -43,7 +43,8 @@
 # and six adversarial parent-locator fixtures, written to the AUDIT
 # directory, each a well-formed differencing VHD that differs from
 # vhd-diff-child-aligned.vhd only in its parent unicode name and locator table
-# (instar-testdata docs/plans/PLAN-extra-coverage.md priority 7):
+# (priority 7 of instar-testdata's extra coverage plan,
+# https://gitlab.home.stillhq.com/private/instar-testdata/-/blob/main/docs/plans/PLAN-extra-coverage.md):
 #
 #   vhd-diff-locator-etc-passwd.vhd  - absolute /etc/passwd
 #   vhd-diff-locator-dotdot.vhd      - relative ../../../etc/passwd
@@ -460,11 +461,14 @@ VHD_HAPPY_LOCATORS = [
 
 # --- adversarial parent locator fixtures ------------------------------------
 #
-# instar-testdata/docs/plans/PLAN-extra-coverage.md priority 7.  Each of these
-# is the byte-aligned child with nothing changed but the parent unicode name
-# and the parent locator table: the same footer, the same dynamic header
-# geometry, the same BAT, the same allocated blocks and correct checksums
-# throughout.  A parser that reaches the hostile path has therefore already
+# Priority 7 of instar-testdata's extra coverage plan:
+#
+# https://gitlab.home.stillhq.com/private/instar-testdata/-/blob/main/docs/plans/PLAN-extra-coverage.md
+#
+# Each of these is the byte-aligned child with nothing changed but the
+# parent unicode name and the parent locator table: the same footer, the
+# same dynamic header geometry, the same BAT, the same allocated blocks
+# and correct checksums throughout.  A parser that reaches the hostile path has therefore already
 # passed every structural test, which is the entire point -- an image that
 # fails at the header proves nothing about locator handling.
 #
