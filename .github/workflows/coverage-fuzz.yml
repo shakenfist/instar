@@ -121,11 +121,11 @@ jobs:
             DURATION=${INPUT_DURATION}
             TARGETS=${INPUT_TARGETS}
 
-            # Count targets (default 32 if all)
+            # Count targets (default: every target in src/fuzz/Cargo.toml)
             if [ -n "$TARGETS" ]; then
               N_TARGETS=$(echo "$TARGETS" | tr ',' '\n' | wc -l)
             else
-              N_TARGETS=32
+              N_TARGETS=$(tools/ci/count-fuzz-targets.sh)
             fi
 
             # Cap duration so total fits in 450 min (30 min headroom)

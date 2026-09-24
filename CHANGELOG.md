@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Coverage-guided fuzzing of the VHD and VHDX parent-locator read
+  paths (40→42 targets).** Both were previously unreached: measurement
+  showed `VhdParentInfo::parse`, `VhdParentLocatorTable::parse`,
+  `VhdParentLocator::parse`, `locator_defect`, `preferred_locator`,
+  `decode_name`, `parse_parent_locator` and its nine helpers all at
+  0.00% region coverage, while the targets already running covered
+  unrelated code in the same crates well (`VhdState::init` 89.26%,
+  `parse_metadata` 33.91%). `fuzz_vhd_parent` is buffer-based — these
+  parsers do no I/O by construction — and drives `VhdParentInfo::parse`
+  over the eight-entry parent locator table, asserting that selection
+  never returns a defective, unused or non-Windows entry, that a
+  disagreeing duplicate resolves to ambiguous rather than to a winner,
+  and that no offset reachable from an entry escapes the bounds it was
+  validated against. `fuzz_vhdx_parent` hands `parse_parent_locator`
+  its item bytes directly, because libFuzzer cannot synthesise a valid
+  region table, metadata table and in-item offset past the 64 KB floor
+  by chance, and asserts that every offset and length reachable from a
+  returned locator lies inside the item it came from, that the locator
+  type comes from the item's GUID rather than a parser-set field, and
+  that linkage comparison is case-insensitive. Coverage after: 86.67%-
+  100% for the VHD functions, 75%-100% for the VHDX functions.
+
 - **The differencing tests can be proved to fail.**
   `tools/mutate-differencing.sh` is a committed falsification harness:
   26 cases, each breaking one specific behaviour in the differencing
