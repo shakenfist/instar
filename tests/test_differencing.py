@@ -50,9 +50,13 @@ The classes are:
 * `TestDifferencingCreateRefusesAsBacking` -- `create -b` fails closed
   on a differencing base, which is what the removed `VhdxState::init`
   rejection used to do for VHDX.
+* `TestDifferencingLibvhdiOracle` -- the only place an independent
+  parser reads a differencing child instar wrote and is asked whether
+  it names the intended parent.
 """
 
 import json
+import re
 import shutil
 import subprocess
 import tempfile
@@ -1027,12 +1031,16 @@ class TestDifferencingCreateRefusesAsBacking(DifferencingTestBase):
 
     BACKING_FORMAT = {'VHD': 'vpc', 'VHDX': 'vhdx'}
 
-    def _create_overlay(self, tmp, base, backing_format):
-        """`instar create -f qcow2 -b <base> -F <fmt>` into a temp dir."""
+    # Extension per child format, so the overlay's name matches what it
+    # actually is rather than always reading `overlay.qcow2`.
+    CHILD_EXTENSION = {'qcow2': 'qcow2', 'vpc': 'vhd', 'vhdx': 'vhdx'}
+
+    def _create_overlay(self, tmp, base, backing_format, child_format='qcow2'):
+        """`instar create -f <child_format> -b <base> -F <fmt>` into a temp dir."""
         instar = self.get_instar_binary()
-        overlay = Path(tmp) / 'overlay.qcow2'
+        overlay = Path(tmp) / f'overlay.{self.CHILD_EXTENSION[child_format]}'
         r = subprocess.run(
-            [str(instar), 'create', '-f', 'qcow2', '-b', str(base),
+            [str(instar), 'create', '-f', child_format, '-b', str(base),
              '-F', backing_format, str(overlay)],
             capture_output=True, text=True, timeout=60
         )
@@ -1064,6 +1072,52 @@ class TestDifferencingCreateRefusesAsBacking(DifferencingTestBase):
                         f'{image_id}: no overlay should be left behind'
                     )
 
+    # Format instar would give the child if it were foolish enough to
+    # accept the same-format differencing parent above it. VHD's arm of
+    # `probe_backing` (main.rs:313) and VHDX's (main.rs:343) are separate
+    # code paths, and the test above always requests a qcow2 child, so
+    # neither arm is exercised with a child in its own native format.
+    SAME_FORMAT_CHILD = {'VHD': 'vpc', 'VHDX': 'vhdx'}
+
+    def test_create_refuses_a_differencing_backing_file_for_a_same_format_child(self):
+        """A same-format child is refused a differencing parent too.
+
+        `test_create_refuses_a_differencing_backing_file` above proves the
+        refusal fires, but only into a qcow2 child, for every fixture. That
+        leaves a distinct, reachable input unexercised: a vpc child offered
+        a differencing VHD parent, and a vhdx child offered a differencing
+        VHDX parent. A child accepted here would itself be a structurally
+        valid differencing image naming a parent that is itself
+        differencing -- a chain instar cannot compose -- and nothing else
+        in the suite looks at that shape.
+        """
+        for image_id, format_name in DIFFERENCING_FIXTURES:
+            child_format = self.SAME_FORMAT_CHILD[format_name]
+            with self.subTest(image=image_id, child_format=child_format):
+                source = self.differencing_image(image_id)
+                with tempfile.TemporaryDirectory() as tmp:
+                    base = Path(tmp) / source.name
+                    shutil.copy(source, base)
+                    overlay, stdout, stderr, rc = self._create_overlay(
+                        tmp, base, self.BACKING_FORMAT[format_name],
+                        child_format=child_format,
+                    )
+                    self.assertNotEqual(
+                        0, rc,
+                        f'{image_id}: create -b must fail for a '
+                        f'{child_format} child too; stdout={stdout!r}'
+                    )
+                    self.assertIn(
+                        self.EXPECTED, stderr,
+                        f'{image_id}: expected the differencing reason, '
+                        f'not a generic parse failure; stderr={stderr!r}'
+                    )
+                    self.assertFalse(
+                        overlay.exists(),
+                        f'{image_id}: no {child_format} overlay should be '
+                        f'left behind'
+                    )
+
     def test_create_accepts_the_plain_parents(self):
         """The negative control: a dynamic VHD/VHDX base still works."""
         for image_id in NEGATIVE_CONTROL_FIXTURES:
@@ -1085,3 +1139,345 @@ class TestDifferencingCreateRefusesAsBacking(DifferencingTestBase):
                         overlay.exists(),
                         f'{image_id}: overlay was not created'
                     )
+
+
+class TestDifferencingLibvhdiOracle(DifferencingTestBase):
+    """An independent parser agrees a child instar wrote names its parent.
+
+    Everything else in this suite and in `test_create.py` checks
+    instar's differencing output with instar's own reader, or with
+    hand-rolled struct reads written from the same understanding of the
+    specification that produced the bytes. That is a closed loop: a
+    field written into the wrong offset, or under the wrong key, is
+    read back from the wrong offset and agrees with itself.
+
+    libvhdi is the external oracle PLAN-differencing.md picked for
+    exactly this, because qemu-img cannot serve: qemu-img reads a
+    differencing child as though the parent were absent, so it has no
+    opinion about which parent the child names. `vhdiinfo` does, and it
+    resolves a VHD parent through the *parent unicode name* field and a
+    VHDX parent through the parent identity, which are the two things
+    the emitter has to get right.
+
+    Scope, deliberately narrow (PLAN-differencing.md decision 1):
+    **structure only**. Nothing here reads composed image content --
+    whether instar assembles a chain the way libvhdi does is phase 15's
+    question and cannot be asked before instar can compose at all. The
+    split also falls on a real seam: the fields below never reach
+    libvhdi's VHD sector-bitmap decoder, which is where the known
+    oracle defect (defect A, see tests/manifest.json on
+    `vhd-diff-child-mixed.vhd`) lives.
+
+    Not used here: the `vhd-diff-locator-overlong.vhd` fixture, whose
+    parent unicode name fills all 512 bytes with no NUL terminator.
+    `vhdiinfo` over-reads two bytes past the field into the locator
+    table and reports a 257th character (libvhdi defect C, recorded
+    against that fixture in tests/manifest.json). That is an oracle
+    defect, so the fixture is not a valid input for an oracle
+    cross-check -- an assertion built on it would be asserting
+    libvhdi's bug. It is exercised elsewhere in this file, where the
+    reader under test is instar's.
+
+    The parents are third-party fixtures rather than images instar
+    wrote. Every image instar writes today carries the same constant
+    identity (#566), so a child instar wrote against a parent instar
+    wrote would satisfy an identity check by comparing zeros to zeros
+    and would keep passing with the plumbing ripped out. The parent's
+    expected identity is read back out of `vhdiinfo` on the parent
+    rather than hardcoded, so these tests pin the emitter's behaviour
+    and not the fixture's bytes.
+    """
+
+    # Field labels exactly as `vhdiinfo 20240509` prints them -- the
+    # Debian 13 build (libvhdi-utils 20240509-2+b1) that
+    # src/.devcontainer/Dockerfile installs, and so the build CI runs.
+    # Measured, not remembered; the raw output is in the commit that
+    # added this class.
+    DISK_TYPE = 'Disk type'
+    IDENTIFIER = 'Identifier'
+    PARENT_IDENTIFIER = 'Parent identifier'
+    PARENT_FILENAME = 'Parent filename'
+
+    # The value `Disk type` takes for a differencing image of either
+    # format. libvhdi calls it "Differential"; SPEC(VHD) calls the same
+    # thing a differencing disk.
+    DIFFERENTIAL = 'Differential'
+
+    ZERO_GUID = '00000000-0000-0000-0000-000000000000'
+
+    # `vhdiinfo` prints one field per line as a tab-indented label, a
+    # colon, and the value. Lines at column zero are the version banner
+    # and the "Virtual Hard Disk image information:" heading, which
+    # carry no value and must not be parsed as fields.
+    FIELD_RE = re.compile(r'^\s+(\S.*?)\s*:\s*(.*)$')
+
+    def _vhdiinfo(self, path: Path, required=()) -> dict:
+        """Parse `vhdiinfo PATH` into a {label: value} mapping.
+
+        *required* names labels the caller is about to assert on. They
+        are checked here rather than at the call site because
+        `fields.get(MISSING)` is `None`, and `None` compares equal to
+        `None`: a libvhdi release that renamed `Parent identifier`
+        would turn both identity assertions into a comparison of two
+        absent values and keep passing. An oracle whose whole claim is
+        that it is not a closed loop cannot afford to go vacuous
+        quietly.
+        """
+        r = subprocess.run(
+            ['vhdiinfo', str(path)], capture_output=True, text=True, timeout=60
+        )
+        self.assertEqual(
+            0, r.returncode,
+            f'vhdiinfo failed on {path}: stdout={r.stdout!r} stderr={r.stderr!r}'
+        )
+        fields = {}
+        for line in r.stdout.splitlines():
+            match = self.FIELD_RE.match(line)
+            if not match:
+                continue
+            label, value = match.group(1), match.group(2)
+            # Plain assignment would let a repeated label overwrite an
+            # earlier one with no signal, so a second section or a new
+            # field under an indented sub-heading would quietly change
+            # what every assertion below reads. The vacuous-parse guard
+            # underneath is the same concern approached from the other
+            # end: there, nothing was understood; here, two things were
+            # and the parser cannot say which one counts.
+            self.assertNotIn(
+                label, fields,
+                f'vhdiinfo printed {label!r} more than once for {path}, so '
+                f'the parser cannot tell which value to assert on: {r.stdout!r}'
+            )
+            fields[label] = value
+        # A parse that silently produced nothing would make every
+        # assertion below vacuous, so prove the output was understood
+        # before trusting any of it.
+        for label in (self.DISK_TYPE, *required):
+            self.assertIn(
+                label, fields,
+                f'vhdiinfo did not report {label!r} for {path}, so an '
+                f'assertion on it would compare None with None: {r.stdout!r}'
+            )
+        return fields
+
+    # libvhdi 20240509 prints GUIDs bare, lowercase and hyphenated.
+    # A release that rendered them braced or uppercase would silently
+    # disable the placeholder guard below, because an assertNotEqual
+    # against a literal it can never match always passes -- so the
+    # shape is asserted rather than assumed, and the comparison is
+    # made on a normalised form.
+    GUID_RE = re.compile(
+        r'^\{?[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\}?$')
+
+    def _guid(self, value, label: str) -> str:
+        """Normalise a GUID `vhdiinfo` printed, asserting it is one."""
+        self.assertIsNotNone(
+            value, f'vhdiinfo reported no {label}, so there is nothing to compare')
+        self.assertRegex(
+            value, self.GUID_RE,
+            f'vhdiinfo rendered {label} as {value!r}, which is not a GUID this '
+            f'test knows how to compare; the zero-identity guard would not fire'
+        )
+        return value.strip('{}').lower()
+
+    def _stage_parent(self, image_id: str, workdir, subdirectory=None):
+        """Copy a parent fixture under *workdir*; return (path, typed name).
+
+        Copying rather than referencing in place keeps the emitted
+        parent path short and relative, and keeps the test from writing
+        beside the fixture. The typed name is what goes to `-b`, which
+        for the VHD arm is also what `vhdiinfo` must read back.
+
+        An absent fixture fails rather than skips: these are the only
+        automated runs of the oracle against instar's own output, so a
+        skip here would turn that coverage green while checking
+        nothing. `InstarTestBase._load_manifest` already raises in
+        `setUpClass` when there is no testdata checkout at all, so this
+        covers only a checkout missing this one file.
+        """
+        source = self.get_image(image_id).path
+        self.assertTrue(
+            source.exists(),
+            f'testdata is present but the parent fixture is not: {source}'
+        )
+        destination_dir = Path(workdir)
+        if subdirectory is not None:
+            destination_dir = destination_dir / subdirectory
+            destination_dir.mkdir(parents=True)
+        destination = destination_dir / source.name
+        shutil.copyfile(source, destination)
+        typed = source.name
+        if subdirectory is not None:
+            typed = f'{subdirectory}/{source.name}'
+        return destination, typed
+
+    def _create_child(self, workdir, fmt: str, typed_parent: str, child_name: str) -> Path:
+        """`instar create -f FMT -b TYPED -F FMT CHILD`, run from *workdir*.
+
+        `-F` is not optional: `create -b` refuses to guess a backing
+        format and demands either `-F` or `-u`. Running from *workdir*
+        makes the relative `-b` resolve the way a user's would, which
+        is also what keeps the emitted parent path relative.
+        """
+        instar = self.get_instar_binary()
+        r = subprocess.run(
+            [str(instar), 'create', '-f', fmt, '-b', typed_parent, '-F', fmt,
+             child_name],
+            capture_output=True, text=True, timeout=60, cwd=str(workdir)
+        )
+        self.assertEqual(
+            0, r.returncode,
+            f'creating the {fmt} child failed: stdout={r.stdout!r} '
+            f'stderr={r.stderr!r}'
+        )
+        child = Path(workdir) / child_name
+        self.assertTrue(
+            child.exists(), f'create -f {fmt} exited 0 but wrote no child'
+        )
+        return child
+
+    def test_libvhdi_reads_a_vhd_child_as_naming_its_parent(self):
+        """`vhdiinfo` on a VHD child reports the parent instar was given.
+
+        Two path shapes, because the distinction between them is what
+        phase 7 got wrong once and what round 4 of #581's review found.
+        The `Parent filename` libvhdi reports comes from the dynamic
+        header's *parent unicode name*, which keeps the path **as
+        typed** -- it is emphatically not the `.\\`-prefixed, backslash
+        separated rendering that goes into the parent locator table.
+        A bare name cannot tell those two apart (`parent.vhd` renders
+        to `.\\parent.vhd`, which merely gains a prefix); a name inside
+        a subdirectory can, because `sub/parent.vhd` renders to
+        `.\\sub\\parent.vhd` and the separator changes too.
+
+        The third shape is absolute, which takes the other branch of
+        the rendering entirely: an absolute path keeps its POSIX bytes
+        and never gains the `.\\` prefix. `test_create.py` covers that
+        shape today with a whole-file substring search and an `instar
+        info` round-trip -- but the round-trip is instar reading what
+        instar wrote, which is the assertion strength this oracle
+        exists to improve on.
+
+        libvhdi never parses the VHD locator table at all, so nothing
+        here asserts anything about it. The locator's own structure is
+        pinned by `src/crates/create/tests/round_trip.rs`.
+        """
+        self._require_vhdiinfo()
+        for shape in ('bare', 'subdirectory', 'absolute'):
+            subdirectory = 'sub' if shape == 'subdirectory' else None
+            with self.subTest(parent_path=shape):
+                with tempfile.TemporaryDirectory() as td:
+                    parent, typed = self._stage_parent(
+                        'vhd-diff-parent', td, subdirectory)
+                    if shape == 'absolute':
+                        # What -b is given, and so what the parent
+                        # unicode name must hold verbatim. FIELD_RE
+                        # splits on the first colon, which a POSIX
+                        # absolute path does not contain, so the value
+                        # comes back whole.
+                        typed = str(parent)
+
+                    # Derived from the parent, never hardcoded: a
+                    # constant here would pin the fixture rather than
+                    # the emitter, and would go stale the day the
+                    # fixture is regenerated.
+                    parent_fields = self._vhdiinfo(
+                        parent, required=(self.IDENTIFIER,))
+                    want_identity = self._guid(
+                        parent_fields.get(self.IDENTIFIER), self.IDENTIFIER)
+                    self.assertNotEqual(
+                        self.ZERO_GUID, want_identity,
+                        'the parent fixture has a zero identifier, so this '
+                        'test cannot tell a real identity from the '
+                        'placeholder instar writes for #566'
+                    )
+
+                    child = self._create_child(td, 'vpc', typed, 'child.vhd')
+                    fields = self._vhdiinfo(
+                        child,
+                        required=(self.PARENT_IDENTIFIER, self.PARENT_FILENAME))
+
+                    self.assertEqual(
+                        self.DIFFERENTIAL, fields.get(self.DISK_TYPE),
+                        f'libvhdi does not read the child as differencing: '
+                        f'{fields!r}'
+                    )
+                    self.assertEqual(
+                        want_identity,
+                        self._guid(fields.get(self.PARENT_IDENTIFIER),
+                                   self.PARENT_IDENTIFIER),
+                        f'libvhdi reads a parent identity that is not the '
+                        f'parent\'s own: {fields!r}'
+                    )
+                    self.assertEqual(
+                        typed, fields.get(self.PARENT_FILENAME),
+                        f'libvhdi reads a parent filename that is not the '
+                        f'path -b was given ({typed!r}): {fields!r}'
+                    )
+
+    def test_libvhdi_reads_a_vhdx_child_as_naming_its_parent(self):
+        """`vhdiinfo` on a VHDX child reports the parent's linkage GUID.
+
+        This is the assertion that replaces a much weaker one.
+        `test_create.py:test_create_vhd_and_vhdx_differencing_round_trip`
+        proves the VHDX linkage with a whole-file substring search for
+        the GUID's UTF-16 bytes, which would pass with the GUID written
+        under the wrong key, in a stray second locator item, or
+        anywhere else in the file at all. A parser that has to locate
+        the metadata region, find the parent locator item and read the
+        entry cannot be satisfied that way. That test is left alone;
+        this one is independent coverage beside it, not a rewrite of
+        it.
+
+        What libvhdi calls a VHDX's `Identifier` is the **active**
+        header's `DataWriteGuid` -- the two headers carry different
+        GUIDs and the one with the higher sequence number wins -- and
+        the child's `Parent identifier` is its `parent_linkage`. Asking
+        the oracle for the parent's own `Identifier` rather than
+        reading the parent's header bytes here means this test does not
+        contain a second implementation of "which header is active" to
+        disagree with the first.
+
+        Only one path shape, unlike the VHD arm above: `vhdiinfo`
+        prints **no** `Parent filename` line for a VHDX, with or
+        without `-v` -- measured against 20240509, which has no such
+        field for this format. So there is no oracle-visible path to
+        vary, and an assertion written against that line would be an
+        assertion against a line that does not exist. The VHDX parent
+        locator's path key is pinned structurally instead, by
+        `src/crates/create/tests/round_trip.rs:vhdx_differencing_path_key_follows_the_path`.
+        """
+        self._require_vhdiinfo()
+        with tempfile.TemporaryDirectory() as td:
+            parent, typed = self._stage_parent('vhdx-diff-parent', td)
+
+            parent_fields = self._vhdiinfo(
+                parent, required=(self.IDENTIFIER,))
+            want_identity = self._guid(
+                parent_fields.get(self.IDENTIFIER), self.IDENTIFIER)
+            self.assertNotEqual(
+                self.ZERO_GUID, want_identity,
+                'the parent fixture has a zero DataWriteGuid, so this test '
+                'cannot tell a real identity from the placeholder instar '
+                'writes for #566'
+            )
+
+            child = self._create_child(td, 'vhdx', typed, 'child.vhdx')
+            fields = self._vhdiinfo(
+                child, required=(self.PARENT_IDENTIFIER,))
+
+            # The File Parameters `HasParent` bit, seen from outside.
+            # Nothing else in the Python suite asserts it: the round
+            # trip test's VHDX arm never checks it, where its VHD arm
+            # does assert disk_type == 4.
+            self.assertEqual(
+                self.DIFFERENTIAL, fields.get(self.DISK_TYPE),
+                f'libvhdi does not read the child as differencing: {fields!r}'
+            )
+            self.assertEqual(
+                want_identity,
+                self._guid(fields.get(self.PARENT_IDENTIFIER),
+                           self.PARENT_IDENTIFIER),
+                f'libvhdi reads a parent linkage that is not the parent\'s '
+                f'active-header DataWriteGuid: {fields!r}'
+            )

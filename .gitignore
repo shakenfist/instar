@@ -21,3 +21,7 @@
 /PLAN-*.md
 __pycache__/
 fuzz-logs/
+
+# Pristine copies kept by tools/mutate-differencing.sh so that a killed
+# run leaves something to restore from.
+/.mutation-backups/

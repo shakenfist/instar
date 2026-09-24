@@ -35,7 +35,13 @@ permissions:
 # argument, not just a cost one: every matrix entry runs the *full*
 # Python suite against the installed package on its own distro, using
 # that distro's qemu-img as the oracle. So the queue's coverage is a
-# superset of the PR integration jobs, on seven distros instead of one.
+# superset of the PR integration jobs, on seven distros instead of one,
+# with one exception: the libvhdi differencing oracle. Those two tests
+# need `vhdiinfo`, which the devcontainer installs and the per-distro
+# package containers do not, so they skip in the queue and are
+# mandatory only on `integration-core` below. They assert nothing about
+# packaging, so this costs nothing -- but the superset claim above is
+# otherwise exact and worth keeping that way.
 # Re-running the PR jobs in the queue would buy a second copy of a
 # strictly weaker signal. build-and-test is the deliberate exception --
 # it runs in both as the cheap fast-fail, and package-build needs it.
@@ -143,6 +149,26 @@ jobs:
 
       - name: Test the Claude result parser
         run: tools/ci/test-claude-result.sh
+
+      # The mutation harness classifies every case it runs, so nothing
+      # else checks the classifier itself. It shipped reading unittest's
+      # `FAILED (errors=1)` as a caught mutation, which no run of the
+      # harness would have revealed. --self-test needs no docker, venv
+      # or testdata and takes milliseconds.
+      - name: Test the mutation harness verdicts
+        run: tools/mutate-differencing.sh --self-test
+
+      # The 26 search strings are pinned to src/ byte for byte,
+      # indentation included, so a reformat of the emitter turns cases
+      # BROKEN with nothing to notice until someone spends the full
+      # docker-and-testdata run. This counts the occurrences without
+      # mutating, building or running anything, and also asserts the
+      # case count docs/testing.md quotes.
+      - name: Check the mutation patterns still land
+        run: tools/mutate-differencing.sh --check-patterns
+
+      - name: Test the literal replace helper
+        run: tools/ci/test-replace-once.sh
 
       - name: Test the inline-script audit check
         run: tools/audit/test-inline-script-check.sh
@@ -741,7 +767,21 @@ jobs:
             exit ${build_exit_code}
           fi
 
+      # INSTAR_REQUIRE_LIBVHDI makes the libvhdi oracle cross-check a
+      # hard requirement here rather than an environment-dependent
+      # skip. The suite runs inside the instar-build devcontainer,
+      # which installs libvhdi-utils (src/.devcontainer/Dockerfile), so
+      # vhdiinfo is present and the check must actually run; a skipped
+      # test and a passing test look identical in a green run, and this
+      # repository has shipped a green workflow that ran nothing
+      # before. Deleting libvhdi-utils from that image turns these
+      # tests red instead of quietly green. The Makefile target passes
+      # the variable through to the container; see
+      # tests/base.py:_require_vhdiinfo and
+      # tests/test_differencing.py:TestDifferencingLibvhdiOracle.
       - name: Run core integration tests
+        env:
+          INSTAR_REQUIRE_LIBVHDI: '1'
         run: |
           cd ${GITHUB_WORKSPACE}/instar
           set +e

@@ -489,6 +489,51 @@ class InstarTestBase(testtools.TestCase):
         if shutil.which('qemu-io') is None:
             self.skipTest('system qemu-io not installed')
 
+    # Set by CI in the job where libvhdi-utils is installed. See
+    # `_require_vhdiinfo` below and .github/workflows/functional-tests.yml.
+    REQUIRE_LIBVHDI_ENV = 'INSTAR_REQUIRE_LIBVHDI'
+
+    def _require_vhdiinfo(self) -> None:
+        """Skip unless libvhdi's `vhdiinfo` is installed -- unless CI says not to.
+
+        libvhdi is the external oracle for differencing VHD and VHDX
+        output: qemu-img reads a differencing child as though the
+        parent were absent, so it cannot say whether a child names the
+        parent instar meant it to name. `vhdiinfo` can, and it is an
+        independent implementation, which is the whole point of using
+        it. See docs/plans/PLAN-differencing.md.
+
+        It is packaged as `libvhdi-utils` and is not installed
+        everywhere, so a developer machine without it skips rather than
+        fails -- the same bargain `_require_qemu_img` strikes.
+
+        The trap that bargain sets is that a skipped test and a passing
+        test look identical in a green run, and this repository has
+        shipped a green workflow that ran nothing before. So the skip
+        is conditional: an environment that sets
+        `INSTAR_REQUIRE_LIBVHDI` has declared that the oracle is
+        installed and must be used, and a missing tool there is a
+        failure rather than a skip. The integration job that runs this
+        suite inside the devcontainer sets it, because the devcontainer
+        installs libvhdi-utils (src/.devcontainer/Dockerfile); deleting
+        the package from that image turns the job red instead of
+        leaving it quietly green.
+        """
+        if shutil.which('vhdiinfo') is not None:
+            return
+        if os.environ.get(self.REQUIRE_LIBVHDI_ENV):
+            self.fail(
+                f'{self.REQUIRE_LIBVHDI_ENV} is set, so this environment has '
+                f'declared libvhdi mandatory, but vhdiinfo is not on PATH. '
+                f'Install libvhdi-utils (Debian 13 ships 20240509 or newer) '
+                f'or unset {self.REQUIRE_LIBVHDI_ENV}. Skipping here would '
+                f'hide the only external cross-check of differencing output.'
+            )
+        self.skipTest(
+            'libvhdi-utils is not installed, so vhdiinfo cannot act as the '
+            'differencing oracle on this host'
+        )
+
     def _run_tool(
         self, argv: List[str], cwd, timeout: int = QEMU_TOOL_TIMEOUT
     ) -> subprocess.CompletedProcess:

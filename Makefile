@@ -610,6 +610,11 @@ test-integration: instar test-venv
 
 # Run tests inside the devcontainer for consistent environment
 # This ensures consistent glibc, paths, and other system dependencies
+#
+# INSTAR_REQUIRE_LIBVHDI is passed through without a value, so it is set
+# inside the container only when the caller set it. CI sets it, which
+# turns a silently-skipping libvhdi oracle into a failure instead of an
+# invisible skip; see tests/base.py:_require_vhdiinfo.
 test-container: instar-devcontainer instar
 	@echo "Running tests inside container..."
 	@if [ ! -d "$(TESTDATA_PATH)" ]; then \
@@ -623,6 +628,7 @@ test-container: instar-devcontainer instar
 		--group-add "$$(stat -c '%g' /dev/kvm)" \
 		-e HOME=/build \
 		-e INSTAR_TESTDATA_PATH=/testdata \
+		-e INSTAR_REQUIRE_LIBVHDI \
 		-v "$(CURDIR):/workspace" \
 		-v "$(TESTDATA_PATH):/testdata:ro" \
 		-w "/workspace" \
@@ -640,6 +646,11 @@ test-container: instar-devcontainer instar
 
 # Run core integration tests inside container (info, check, security, version, oslo-crossval)
 # Excludes convert and compare tests which are split into separate targets
+#
+# INSTAR_REQUIRE_LIBVHDI is passed through without a value, so it is set
+# inside the container only when the caller set it. CI sets it, which
+# turns a silently-skipping libvhdi oracle into a failure instead of an
+# invisible skip; see tests/base.py:_require_vhdiinfo.
 test-container-core: instar-devcontainer instar
 	@echo "Running core integration tests inside container..."
 	@if [ ! -d "$(TESTDATA_PATH)" ]; then \
@@ -653,6 +664,7 @@ test-container-core: instar-devcontainer instar
 		--group-add "$$(stat -c '%g' /dev/kvm)" \
 		-e HOME=/build \
 		-e INSTAR_TESTDATA_PATH=/testdata \
+		-e INSTAR_REQUIRE_LIBVHDI \
 		-v "$(CURDIR):/workspace" \
 		-v "$(TESTDATA_PATH):/testdata:ro" \
 		-w "/workspace" \
