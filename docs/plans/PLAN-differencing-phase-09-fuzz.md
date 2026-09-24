@@ -135,14 +135,34 @@ including the six adversarial locator images:
 custom/audit/vhd-diff-locator-{dotdot,etc-passwd,overlong,unc,url,conflicting}.vhd
 ```
 
-all typed `vpc`, plus `vhdx-diff-{parent,child}` typed `vhdx`. So
-`scripts/extract-fuzz-corpus.py` already copies them into
-`fuzz_vhd_footer`, `fuzz_vhd_bat`, `fuzz_vhdx_header`,
-`fuzz_vhdx_metadata` and `fuzz_format_detect`. Seeding is driven by
-the manifest, not by a directory walk (`:516-535`), and routing is by
-detected format through `FORMAT_TO_TARGETS` (`:27-38`). A new target
-therefore gets these fixtures **only** by being added to that map —
-there is no fallback.
+all typed `vpc`, plus `vhdx-diff-{parent,child}` typed `vhdx`.
+Seeding is driven by the manifest, not by a directory walk
+(`:516-535`), and routing is by detected format through
+`FORMAT_TO_TARGETS` (`:27-38`). A new target therefore gets these
+fixtures **only** by being added to that map — there is no fallback.
+
+**Corrected during execution — this paragraph originally claimed the
+six adversarial fixtures were already seeded into four targets, and
+that was wrong.** Step 9b checked the corpus rather than the manifest
+and found none of them in any target directory. They are 4,198,912
+bytes (4,201,984 for `conflicting`) against a `MAX_SEED_SIZE` of
+4,194,304 (`scripts/extract-fuzz-corpus.py:55`), and `copy_seed`
+refuses any untruncated file above it (`:68`). They miss by about
+4.5 KB of footer and header overhead on a 10 MiB nominal disk.
+Confirmed independently by content hash and by
+`find src/fuzz/corpus -type f -size +4190k` returning nothing.
+
+The class is wider than these six: **43 of the 208 manifest fixtures,
+21%, are dropped this way**, across luks, qcow2, raw, vhdx, vmdk and
+vpc, and nothing reports which — `copy_seed` returns `False` and the
+caller counts it as `skipped` alongside genuinely absent files. Filed
+as [#593](https://github.com/shakenfist/instar/issues/593). Step 9d
+takes the part this phase needs, per decision 10; the rest is out of
+scope.
+
+The lesson is the one this plan lineage keeps relearning: membership
+in the manifest was checked, membership in the corpus was inferred.
+Grep for the thing itself.
 
 **5. Every consumer of these parsers outside the crates is a test.**
 `VhdParentInfo::parse`, `decode_name`, `preferred_locator` and
@@ -325,6 +345,35 @@ target since those lists drifted apart in the workflow's duration
 cap, and a guard written now costs one step, where discovering the
 omission later costs a nightly run that measured nothing.
 
+**10. Step 9d builds a reshaping seed extractor, not a bigger cap.**
+Survey finding 4's correction leaves the six adversarial fixtures
+unreachable by any amount of routing. Three fixes were available:
+raise `MAX_SEED_SIZE`, add a `HEADER_ONLY_TARGETS` truncation, or
+emit a seed in the shape the target actually consumes. The third is
+right and the other two are not.
+
+Raising the cap fixes these six and leaves the other 37 dropped
+fixtures for someone else to rediscover; it is also a global change
+made for a local reason. A truncation is closer but still wrong: the
+target treats `data[..1024]` as the dynamic header, and a real VHD
+puts the `cxsparse` cookie at `data_offset`, not at zero, so a
+header-prefix copy of a whole image is not a valid input to this
+target at all — it would sit in the corpus looking like coverage and
+contributing none. (The 9b brief asserted the opposite, that the
+locator data would be cut off by truncation; that was wrong in its
+own way — `data_offset` is 512 in all six and the platform data lies
+in 1536..5632, so any truncation at or above 8 KiB keeps the whole
+structure. Both statements were reasoning about the file rather than
+about the target's input shape.)
+
+So 9d follows `extract_snapshot_parse_seed`, which sets exactly this
+precedent for qcow2 snapshot tables: read the footer's `data_offset`,
+emit the 1024-byte dynamic header followed by the platform-data
+region. A few KB rather than 4 MiB, in the target's own input shape,
+and independent of the cap. The wider defect is filed as
+[#593](https://github.com/shakenfist/instar/issues/593) and is not
+fixed here.
+
 ## Step plan
 
 | Step | Effort | Model | Isolation | Brief for sub-agent |
@@ -361,8 +410,12 @@ omission later costs a nightly run that measured nothing.
   makes `fuzz_vhd_parent` fail within 60 seconds. Run, not reasoned
   about; the output is in the commit message.
 * After `python3 scripts/extract-fuzz-corpus.py --testdata
-  ../instar-testdata`, all six `custom/audit/vhd-diff-locator-*.vhd`
-  fixtures are present in `src/fuzz/corpus/fuzz_vhd_parent/`.
+  ../instar-testdata`, the locator structure of all six
+  `custom/audit/vhd-diff-locator-*.vhd` fixtures is present in
+  `src/fuzz/corpus/fuzz_vhd_parent/` — as reshaped seeds, not whole
+  images, which the 4 MiB `MAX_SEED_SIZE` refuses. Each seed round
+  trips: parsing it with `VhdParentInfo::parse` yields the same
+  platform codes and paths as parsing the fixture it came from.
 * `tools/ci/fuzz-tier.sh is-fast fuzz_vhd_parent` exits 0.
 * The VHDX question is answered with a number: either a measured
   non-zero hit count for `parse_parent_locator` recorded in a comment,
