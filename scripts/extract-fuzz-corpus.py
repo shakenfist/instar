@@ -54,6 +54,12 @@ HEADER_ONLY_TARGETS = {
 # Max seed file size (4MB) - skip larger files for full-image targets
 MAX_SEED_SIZE = 4 * 1024 * 1024
 
+# VHD/VPC footer and dynamic header sizes (src/crates/vhd/src/lib.rs
+# FOOTER_SIZE, DYNAMIC_HEADER_SIZE), used by the fuzz_vhd_parent seed
+# builders below.
+FOOTER_SIZE = 512
+DYNAMIC_HEADER_SIZE = 1024
+
 
 def sha256_hex(data):
     return hashlib.sha256(data).hexdigest()[:16]
@@ -218,6 +224,200 @@ def extract_snapshot_parse_seed(src_path, dest_dir):
         with open(dest_path, 'wb') as f:
             f.write(seed)
     return True
+
+
+# fuzz_vhd_parent's input shape (src/fuzz/fuzz_targets/fuzz_vhd_parent.rs):
+# data[..1024] is fed to VhdParentInfo::parse verbatim as the dynamic
+# header, and data[1024..] ("tail") both selects the VhdImageBounds /
+# VhdImageWindow the target synthesises and stands in for the window's
+# bytes. Byte 0 of the tail is a selector; the low two bits pick
+# header_offset, the next two pick image_len, and bits 4-5 pick the
+# window's file_offset. All zero selects the "realistic" arms: a
+# 512-byte header_offset, a >=1MB image_len, and a window file_offset of
+# header_offset + DYNAMIC_HEADER_SIZE (1536) -- so tail[0] is reserved
+# for the seed, not for platform data, and reserving the first
+# VHD_PARENT_TAIL_RESERVED bytes keeps clear of it and of the two
+# conditional u64 reads at tail[1..9] and tail[9..17].
+#
+# A whole-image copy puts the cxsparse cookie at data_offset (512 in
+# every fixture), not at 0, so it is not a valid input to this target at
+# all (decision 10 of PLAN-differencing-phase-09-fuzz.md) -- both
+# functions below emit the header-plus-tail shape instead.
+VHD_PARENT_TAIL_RESERVED = 32
+
+# VHD dynamic header field offsets used below (src/crates/vhd/src/lib.rs).
+VHD_DYN_PARENT_UNIQUE_ID_OFFSET = 40
+VHD_DYN_PARENT_NAME_OFFSET = 64
+VHD_DYN_PARENT_LOCATORS_OFFSET = 576
+VHD_PARENT_LOCATOR_ENTRY_SIZE = 24
+VHD_PARENT_LOCATOR_COUNT = 8
+# LOC_DATA_SPACE_OFFSET / LOC_DATA_LENGTH_OFFSET / LOC_DATA_OFFSET_OFFSET,
+# relative to one 24-byte locator entry.
+VHD_LOC_DATA_SPACE_OFFSET = 4
+VHD_LOC_DATA_LENGTH_OFFSET = 8
+VHD_LOC_DATA_OFFSET_OFFSET = 16
+
+
+def extract_vhd_parent_seed(src_path, dest_dir):
+    """Differencing-parent-aware seed extraction for fuzz_vhd_parent.
+
+    Reads the footer (last sector) for data_offset, then the 1024-byte
+    dynamic header at data_offset, and relocates each populated locator
+    entry's platform data into a compact tail: window file_offset 1536,
+    a VHD_PARENT_TAIL_RESERVED-byte control prefix, then the platform
+    data itself, copied as one contiguous, clamped region so entries
+    that originally overlapped or were byte-identical (as
+    vhd-diff-locator-conflicting.vhd deliberately is) still do after the
+    move -- only the header's platform_data_offset fields are patched,
+    never platform_data_length or platform_data_space.
+    """
+    try:
+        size = os.path.getsize(src_path)
+        if size < FOOTER_SIZE:
+            return False
+        with open(src_path, 'rb') as f:
+            f.seek(size - FOOTER_SIZE)
+            footer = f.read(FOOTER_SIZE)
+            if len(footer) < FOOTER_SIZE or footer[0:8] != b'conectix':
+                return False
+            data_offset = int.from_bytes(footer[16:24], 'big')
+            disk_type = int.from_bytes(footer[60:64], 'big')
+            if disk_type != 4:  # DISK_TYPE_DIFFERENCING
+                return False
+            if data_offset == 0 or data_offset + DYNAMIC_HEADER_SIZE > size:
+                return False
+            f.seek(data_offset)
+            header = bytearray(f.read(DYNAMIC_HEADER_SIZE))
+            if len(header) < DYNAMIC_HEADER_SIZE or header[0:8] != b'cxsparse':
+                return False
+
+            entries = []
+            region_start = None
+            region_end = None
+            for slot in range(VHD_PARENT_LOCATOR_COUNT):
+                off = VHD_DYN_PARENT_LOCATORS_OFFSET + slot * VHD_PARENT_LOCATOR_ENTRY_SIZE
+                if header[off:off + 4] == b'\x00\x00\x00\x00':
+                    continue
+                data_length = int.from_bytes(
+                    header[off + VHD_LOC_DATA_LENGTH_OFFSET:off + VHD_LOC_DATA_LENGTH_OFFSET + 4], 'big')
+                if data_length == 0:
+                    continue
+                data_off = int.from_bytes(
+                    header[off + VHD_LOC_DATA_OFFSET_OFFSET:off + VHD_LOC_DATA_OFFSET_OFFSET + 8], 'big')
+                entries.append((off, data_off, data_length))
+                region_start = data_off if region_start is None else min(region_start, data_off)
+                end = data_off + data_length
+                region_end = end if region_end is None else max(region_end, end)
+
+            if not entries:
+                return False
+
+            region_len = min(region_end - region_start, 65536)
+            f.seek(region_start)
+            region = f.read(region_len)
+    except (OSError, IOError):
+        return False
+
+    reserved = VHD_PARENT_TAIL_RESERVED
+    tail = bytearray(reserved + len(region))
+    tail[0] = 0x00  # selects the realistic header_offset/image_len/window arms
+    tail[reserved:reserved + len(region)] = region
+
+    # Window file_offset under the selector above is
+    # FOOTER_SIZE + DYNAMIC_HEADER_SIZE = 1536; the relocated data lives
+    # at 1536 + reserved, keeping each entry's offset from region_start.
+    window_file_offset = FOOTER_SIZE + DYNAMIC_HEADER_SIZE
+    for off, data_off, _data_length in entries:
+        new_offset = window_file_offset + reserved + (data_off - region_start)
+        header[off + VHD_LOC_DATA_OFFSET_OFFSET:off + VHD_LOC_DATA_OFFSET_OFFSET + 8] = \
+            new_offset.to_bytes(8, 'big')
+
+    seed = bytes(header) + bytes(tail)
+    os.makedirs(dest_dir, exist_ok=True)
+    name = 'vhdparent_' + sha256_hex(seed)
+    dest_path = os.path.join(dest_dir, name)
+    if not os.path.exists(dest_path):
+        with open(dest_path, 'wb') as f:
+            f.write(seed)
+    return True
+
+
+def build_minimal_vhd_parent_seed():
+    """A hand-built differencing seed for fuzz_vhd_parent's own input
+    shape: a 1024-byte cxsparse dynamic header followed by its
+    control/window tail, not a real VHD file's byte layout (see
+    extract_vhd_parent_seed's docstring for why a footer-prefixed copy
+    would not be a valid input to this target at all). The image-level
+    facts this models -- disk_type=4 (DISK_TYPE_DIFFERENCING) and
+    data_offset=512 -- live in a VHD footer, which this target never
+    reads, so they are not encoded in the returned bytes.
+
+    Offsets are the crate's own constants
+    (src/crates/vhd/src/lib.rs): DYN_PARENT_UNIQUE_ID_OFFSET (+40),
+    DYN_PARENT_NAME_OFFSET (+64), DYN_PARENT_LOCATORS_OFFSET (+576),
+    PARENT_LOCATOR_ENTRY_SIZE (24).
+    """
+    header = bytearray(DYNAMIC_HEADER_SIZE)
+    header[0:8] = b'cxsparse'  # DYN_COOKIE_OFFSET
+    header[8:16] = (0xffffffffffffffff).to_bytes(8, 'big')  # DYN_DATA_OFFSET_OFFSET, unused
+    header[VHD_DYN_PARENT_UNIQUE_ID_OFFSET:VHD_DYN_PARENT_UNIQUE_ID_OFFSET + 16] = bytes(range(1, 17))
+    name = 'parent.vhd'.encode('utf-16-be')
+    header[VHD_DYN_PARENT_NAME_OFFSET:VHD_DYN_PARENT_NAME_OFFSET + len(name)] = name
+
+    # One populated W2ru (relative-path) locator naming a plausible
+    # sibling file, placed in the tail's relocated platform-data region.
+    path = '..\\parent.vhd'.encode('utf-16-le')
+    reserved = VHD_PARENT_TAIL_RESERVED
+    window_file_offset = FOOTER_SIZE + DYNAMIC_HEADER_SIZE
+    entry_off = VHD_DYN_PARENT_LOCATORS_OFFSET
+    header[entry_off:entry_off + 4] = b'W2ru'
+    header[entry_off + VHD_LOC_DATA_SPACE_OFFSET:entry_off + VHD_LOC_DATA_SPACE_OFFSET + 4] = \
+        len(path).to_bytes(4, 'big')
+    header[entry_off + VHD_LOC_DATA_LENGTH_OFFSET:entry_off + VHD_LOC_DATA_LENGTH_OFFSET + 4] = \
+        len(path).to_bytes(4, 'big')
+    header[entry_off + VHD_LOC_DATA_OFFSET_OFFSET:entry_off + VHD_LOC_DATA_OFFSET_OFFSET + 8] = \
+        (window_file_offset + reserved).to_bytes(8, 'big')
+
+    tail = bytearray(reserved + len(path))
+    tail[0] = 0x00  # selects the realistic bounds/window arms, per extract_vhd_parent_seed
+    tail[reserved:reserved + len(path)] = path
+    return bytes(header) + bytes(tail)
+
+
+def build_minimal_vhdx_parent_seed():
+    """A hand-built parent-locator metadata item for fuzz_vhdx_parent.
+
+    fuzz_vhdx_parent's input is the item's own bytes, unwrapped -- no
+    region table or metadata table, per the target's own docstring
+    (`fuzz_vhdx_metadata` measured 0% coverage of `parse_parent_locator`
+    after synthesising those). Layout mirrors `build_locator_item` in
+    the vhdx crate's own tests (src/crates/vhdx/src/lib.rs:3465): a
+    20-byte header (type GUID, reserved, key/value count), then one
+    12-byte entry per pair, then the UTF-16LE key and value strings.
+    """
+    guid = bytes([
+        0xB7, 0xEF, 0x4A, 0xB0, 0x9E, 0xD1, 0x81, 0x4A,
+        0xB7, 0x89, 0x25, 0xB8, 0xE9, 0x44, 0x59, 0x13,
+    ])  # VHDX_PARENT_LOCATOR_TYPE_GUID
+    header_size = 20  # PARENT_LOCATOR_HEADER_SIZE
+    entry_size = 12  # PARENT_LOCATOR_ENTRY_SIZE
+    key = 'relative_path'.encode('utf-16-le')
+    value = r'.\parent.vhdx'.encode('utf-16-le')
+
+    buf = bytearray(header_size + entry_size + len(key) + len(value))
+    buf[0:16] = guid
+    buf[16:18] = (0).to_bytes(2, 'little')  # reserved
+    buf[18:20] = (1).to_bytes(2, 'little')  # key_value_count
+
+    key_offset = header_size + entry_size
+    value_offset = key_offset + len(key)
+    buf[header_size:header_size + 4] = key_offset.to_bytes(4, 'little')
+    buf[header_size + 4:header_size + 8] = value_offset.to_bytes(4, 'little')
+    buf[header_size + 8:header_size + 10] = len(key).to_bytes(2, 'little')
+    buf[header_size + 10:header_size + 12] = len(value).to_bytes(2, 'little')
+    buf[key_offset:key_offset + len(key)] = key
+    buf[value_offset:value_offset + len(value)] = value
+    return bytes(buf)
 
 
 def build_snapshot_refcount_seed(op):
@@ -422,6 +622,15 @@ def create_minimal_seeds(corpus_base):
         with open(os.path.join(dest, 'minimal_vhd_footer'), 'wb') as f:
             f.write(bytes(vhd_footer))
 
+    # fuzz_vhd_parent: the vhd_footer above is too short to be this
+    # target's own input shape (it treats data[..1024] as the dynamic
+    # header, not a footer), so a run with no testdata would otherwise
+    # start cold on exactly the differencing structure this phase fuzzes.
+    dest = os.path.join(corpus_base, 'fuzz_vhd_parent')
+    os.makedirs(dest, exist_ok=True)
+    with open(os.path.join(dest, 'minimal_differencing'), 'wb') as f:
+        f.write(build_minimal_vhd_parent_seed())
+
     # VHDX minimal file identifier
     vhdx_header = bytearray(65536)
     vhdx_header[0:8] = b'vhdxfile'  # signature
@@ -430,6 +639,13 @@ def create_minimal_seeds(corpus_base):
         os.makedirs(dest, exist_ok=True)
         with open(os.path.join(dest, 'minimal_vhdx'), 'wb') as f:
             f.write(bytes(vhdx_header))
+
+    # fuzz_vhdx_parent: same reasoning as fuzz_vhd_parent above -- the
+    # minimal_vhdx file identifier is not a parent locator item.
+    dest = os.path.join(corpus_base, 'fuzz_vhdx_parent')
+    os.makedirs(dest, exist_ok=True)
+    with open(os.path.join(dest, 'minimal_differencing'), 'wb') as f:
+        f.write(build_minimal_vhdx_parent_seed())
 
     # RAW with MBR signature
     mbr = bytearray(512)
@@ -543,6 +759,16 @@ def main():
             if extract_snapshot_parse_seed(src_path, dest):
                 copied += 1
 
+        # Differencing VHD/VPC fixtures additionally get a relocated
+        # header+locator seed for fuzz_vhd_parent (same reasoning as the
+        # snapshot case above): a whole-image copy puts the cxsparse
+        # cookie at data_offset, not at 0, so it is not a valid input to
+        # this target at all.
+        if fmt in ('vpc', 'vhd'):
+            dest = os.path.join(corpus_base, 'fuzz_vhd_parent')
+            if extract_vhd_parent_seed(src_path, dest):
+                copied += 1
+
     # Also scan for images not in the manifest (custom/audit/ etc.)
     for root, dirs, files in os.walk(args.testdata):
         # The per-target corpus pushed by prior nightly runs is restored
@@ -551,6 +777,13 @@ def main():
         # not recognizable image formats and would be dropped).
         if os.path.basename(root) == 'custom' and 'fuzz-corpus' in dirs:
             dirs.remove('fuzz-corpus')
+        # Never scan the git directory. The LFS object store holds every
+        # historical version of every fixture, so walking it seeds the
+        # corpus with superseded fixtures -- a fixture deliberately
+        # changed in testdata comes back as an extra seed, and the count
+        # grows with history rather than with the fixture set.
+        if '.git' in dirs:
+            dirs.remove('.git')
         for name in files:
             src_path = os.path.join(root, name)
             # os.walk lists a dangling symlink as a file, and getsize
@@ -588,6 +821,11 @@ def main():
             if fmt == 'qcow2':
                 dest = os.path.join(corpus_base, 'fuzz_snapshot_parse')
                 if extract_snapshot_parse_seed(src_path, dest):
+                    copied += 1
+
+            if fmt in ('vpc', 'vhd'):
+                dest = os.path.join(corpus_base, 'fuzz_vhd_parent')
+                if extract_vhd_parent_seed(src_path, dest):
                     copied += 1
 
     # Restore the per-target corpus accumulated by prior nightly runs so
