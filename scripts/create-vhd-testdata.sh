@@ -42,9 +42,7 @@
 #
 # and six adversarial parent-locator fixtures, written to the AUDIT
 # directory, each a well-formed differencing VHD that differs from
-# vhd-diff-child-aligned.vhd only in its parent unicode name and locator table
-# (priority 7 of instar-testdata's extra coverage plan,
-# https://gitlab.home.stillhq.com/private/instar-testdata/-/blob/main/docs/plans/PLAN-extra-coverage.md):
+# vhd-diff-child-aligned.vhd only in its parent unicode name and locator table:
 #
 #   vhd-diff-locator-etc-passwd.vhd  - absolute /etc/passwd
 #   vhd-diff-locator-dotdot.vhd      - relative ../../../etc/passwd
@@ -53,11 +51,10 @@
 #   vhd-diff-locator-overlong.vhd    - a name filling the whole 512-byte field
 #   vhd-diff-locator-conflicting.vhd - eight mutually disagreeing locators
 #
-# Priority 7 names these vhd-diff-parent-etc-passwd.vhd, -dotdot, -unc, -url
-# and -conflicting. They are named vhd-diff-locator-* here because they are
-# differencing CHILDREN with a hostile parent reference, and a set of children
-# matching vhd-diff-parent* would trap anyone globbing for the real parent,
-# vhd-diff-parent.vhd. The over-long fixture has no counterpart in priority 7.
+# They are named vhd-diff-locator-* rather than vhd-diff-parent-* because
+# they are differencing CHILDREN with a hostile parent reference, and a set of
+# children matching vhd-diff-parent* would trap anyone globbing for the real
+# parent, vhd-diff-parent.vhd.
 #
 # Those six carry hostile path strings as DATA. This script writes them and
 # never opens, stats or resolves any of them, and they have no composed .raw
@@ -91,8 +88,8 @@
 # bearing) and vhd_geometry picks any exact CHS factorisation rather than the
 # sectors-per-track values from {17, 31, 63, 255} that real VHD producers and
 # qemu's own vpc geometry emit. Both are legal and both read back correctly,
-# but a later phase must not treat these images as evidence about what
-# Hyper-V writes.
+# but nothing should treat these images as evidence about what Hyper-V
+# writes.
 #
 # vhd-differencing.vhd is reproducible only because the patch step below pins
 # the timestamp and unique id qemu-img randomises.
@@ -332,8 +329,8 @@ print(f"  Patched {path} to disk_type=4 ({os.path.getsize(path)} bytes)")
 #   vhdx-diff-child.vhdx       differencing VHDX
 #
 # The structure facts encoded below were measured against Hyper-V produced
-# images in docs/plans/PLAN-differencing-phase-01-pin.md; that plan section is
-# the authority on every byte offset used here.
+# images rather than taken from the spec text; the generator's docstring lists
+# every byte offset it relies on.
 
 echo "  Creating differencing chains..."
 
@@ -341,8 +338,7 @@ python3 - "$OUTDIR" "$AUDITDIR" "${REGEN_VHDX:-0}" <<'PYTHON_DIFF'
 """Generate real VHD and VHDX differencing chains plus their compositions.
 
 Structure facts encoded here, each measured against a Hyper-V produced image
-from the log2timeline/dfvfs corpus rather than taken from the spec text.  See
-"The structure pin" in docs/plans/PLAN-differencing-phase-01-pin.md.
+from the log2timeline/dfvfs corpus rather than taken from the spec text.
 
   * VHD footer disk type is at offset 60, 4 == differencing.
   * The VHD dynamic header sits at footer.data_offset (512 here); the parent
@@ -411,8 +407,8 @@ VHD_TIMESTAMP = 1757030400 - VHD_EPOCH
 # bitmap byte with parent owned sectors, which is what a real differencing disk
 # looks like and what the parser must survive.
 #
-# The parent sector list is the union of the two per chain lists in the phase 1
-# appendix, so that one parent file serves both children and each child still
+# The parent sector list is the union of the sectors each chain needs from
+# its parent, so that one parent file serves both children and each child still
 # has a sector the parent also owns (8 for aligned, 1 for mixed) where the
 # child must win.  Sector 1 is invisible to the aligned child (no bitmap bit is
 # set in the byte covering sectors 0 to 7) and sector 8 is invisible to the
@@ -460,10 +456,6 @@ VHD_HAPPY_LOCATORS = [
 ]
 
 # --- adversarial parent locator fixtures ------------------------------------
-#
-# Priority 7 of instar-testdata's extra coverage plan:
-#
-# https://gitlab.home.stillhq.com/private/instar-testdata/-/blob/main/docs/plans/PLAN-extra-coverage.md
 #
 # Each of these is the byte-aligned child with nothing changed but the
 # parent unicode name and the parent locator table: the same footer, the
