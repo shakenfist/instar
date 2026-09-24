@@ -576,6 +576,30 @@ fuzz-run: instar-devcontainer
 		"$(INSTAR_DEV_IMAGE)" \
 		bash -c "cargo fuzz run $(FUZZ_TARGET) -- -max_total_time=$(FUZZ_DURATION)"
 
+# Produce a per-function coverage report for one fuzz target against
+# its current corpus. Used to answer "does this target actually reach
+# the code it claims to fuzz?" -- a target that runs clean while
+# reaching nothing looks identical to one that found no bug.
+# Usage: make fuzz-coverage FUZZ_TARGET=fuzz_vhd_bat
+#        make fuzz-coverage FUZZ_TARGET=fuzz_vhd_bat FUZZ_COVERAGE_FILTER=locator
+FUZZ_COVERAGE_FILTER ?=
+fuzz-coverage: instar-devcontainer
+	@if [ -z "$(FUZZ_TARGET)" ]; then \
+		echo "Error: FUZZ_TARGET=<name> is required"; \
+		exit 1; \
+	fi
+	@echo "Generating coverage for $(FUZZ_TARGET)..."
+	docker run --rm \
+		-u "$(shell id -u):$(shell id -g)" \
+		-e HOME=/build \
+		-e CARGO_HOME=/build/.cargo \
+		-v "$(CURDIR):/workspace" \
+		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/registry:/build/.cargo/registry" \
+		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/git:/build/.cargo/git" \
+		-w "/workspace/src/fuzz" \
+		"$(INSTAR_DEV_IMAGE)" \
+		bash -c '/workspace/tools/fuzz-coverage.sh $(FUZZ_TARGET) "$(FUZZ_COVERAGE_FILTER)"'
+
 # Run the seven snapshot shell harnesses (tools/snapshot-*.sh):
 # live byte-parity verification of `instar snapshot` against
 # qemu-img — 241 assertions across the create/delete/apply

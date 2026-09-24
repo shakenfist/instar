@@ -553,7 +553,15 @@ def main():
             dirs.remove('fuzz-corpus')
         for name in files:
             src_path = os.path.join(root, name)
-            if os.path.getsize(src_path) == 0:
+            # os.walk lists a dangling symlink as a file, and getsize
+            # follows it: the vendored qemu-sources trees carry a handful
+            # of licence symlinks whose targets are not checked out, and
+            # an unguarded getsize aborts the whole scan on the first one.
+            # Skip it the same way an unreadable file is skipped below.
+            try:
+                if os.path.getsize(src_path) == 0:
+                    continue
+            except OSError:
                 continue
 
             # Read first 8 bytes to detect format
