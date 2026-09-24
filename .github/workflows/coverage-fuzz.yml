@@ -206,6 +206,7 @@ jobs:
               fuzz_vmdk_grain
               fuzz_vhd_footer
               fuzz_vhd_bat
+              fuzz_vhd_parent
               fuzz_vhdx_header
               fuzz_vhdx_metadata
               fuzz_raw_partition
