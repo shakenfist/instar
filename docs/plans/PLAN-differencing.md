@@ -350,8 +350,8 @@ Each phase gets its own detailed plan file before implementation
 begins; this table is the tracking source of truth. The `Merged`
 column records what put each phase on `develop` -- the merge
 commit of its pull request, or a `first..last` range for a phase
-that landed directly -- because phase 11 audits the union of
-those ranges, and `git diff develop...HEAD` is empty once the
+that landed directly -- because the push-audit phase runs
+`PUSH-AUDIT.md` over the union of those ranges, and `git diff develop...HEAD` is empty once the
 phases have landed. A phase that lands in `instar-testdata`
 records `instar-testdata <sha> (#pr)` and is audited there.
 

@@ -232,6 +232,19 @@ copy lives in shakenfist/development at
   length.
 <!-- shared-block-end -->
 
+!!! note "In this project"
+
+    instar does not track per-file human review, so the first bullet's
+    repeated-review cost does not apply here; the length thresholds
+    still do. Apply them to files the diff touches, not to the tree.
+    Several files are already far past 1,500 lines --
+    `src/vmm/src/main.rs`, `src/crates/qcow2/src/lib.rs`,
+    `src/shared/src/lib.rs`, the `vhd` and `vhdx` crates' `lib.rs`,
+    and `src/operations/convert/src/main.rs` among them -- so their
+    length alone is not a new finding. Raise one only when the diff
+    grows it materially, or adds to it something that already has a
+    seam of its own.
+
 <!-- shared-block: python-version-discipline v1 -->
 Python version and typing (shared block; do not edit -- the
 canonical copy lives in shakenfist/development at

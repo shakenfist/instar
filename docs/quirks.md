@@ -4207,7 +4207,7 @@ was a live correctness defect, not a deliberate scope decision, when it was
 filed as [issue #547](https://github.com/shakenfist/instar/issues/547) and
 [issue #548](https://github.com/shakenfist/instar/issues/548): instar
 matched qemu-img's silent VHD misread and shared VHDX's undiagnosed
-failure. Commit `10ab838`, part of the differencing plan, replaced both
+failure. Commit `10ab838` (#563), part of the differencing plan, replaced both
 with one typed refusal at every read entry point that composes sector data,
 plus `info` reporting the parent instead of staying silent; real chain
 composition remains future work in the same plan. qemu-img's own behaviour has not
