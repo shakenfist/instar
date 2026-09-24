@@ -209,6 +209,7 @@ jobs:
               fuzz_vhd_parent
               fuzz_vhdx_header
               fuzz_vhdx_metadata
+              fuzz_vhdx_parent
               fuzz_raw_partition
               fuzz_luks_header
               fuzz_measure_calc

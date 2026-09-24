@@ -35,7 +35,7 @@ FORMAT_TO_TARGETS = {
     'vmdk': ['fuzz_vmdk_header', 'fuzz_vmdk_grain'],
     'vpc': ['fuzz_vhd_footer', 'fuzz_vhd_bat', 'fuzz_vhd_parent'],
     'vhd': ['fuzz_vhd_footer', 'fuzz_vhd_bat', 'fuzz_vhd_parent'],
-    'vhdx': ['fuzz_vhdx_header', 'fuzz_vhdx_metadata'],
+    'vhdx': ['fuzz_vhdx_header', 'fuzz_vhdx_metadata', 'fuzz_vhdx_parent'],
     'raw': ['fuzz_raw_partition'],
     'luks': ['fuzz_luks_header'],
 }
