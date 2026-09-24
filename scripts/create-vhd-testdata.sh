@@ -468,9 +468,10 @@ VHD_HAPPY_LOCATORS = [
 # Each of these is the byte-aligned child with nothing changed but the
 # parent unicode name and the parent locator table: the same footer, the
 # same dynamic header geometry, the same BAT, the same allocated blocks
-# and correct checksums throughout.  A parser that reaches the hostile path has therefore already
-# passed every structural test, which is the entire point -- an image that
-# fails at the header proves nothing about locator handling.
+# and correct checksums throughout.  A parser that reaches the hostile
+# path has therefore already passed every structural test, which is the
+# entire point -- an image that fails at the header proves nothing about
+# locator handling.
 #
 # THESE STRINGS ARE DATA.  This generator writes them and never opens, stats,
 # resolves or otherwise touches them, and the fixtures must stay safe to hand

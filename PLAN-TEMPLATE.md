@@ -216,6 +216,17 @@ branches are open at once, each closes out only the phase it
 directly follows.
 <!-- shared-block-end -->
 
+!!! note "In this project"
+
+    instar does not track per-file human review: there is no
+    `REVIEWS.md`, no `prune-reviews` workflow and no
+    `docs/code-review-tracking.md`, so the third rule has nothing to
+    act on here until that tracking arrives. The first two rules
+    apply as written to the `Phase | Plan | Status | Merged` table
+    each master plan carries: the next phase's first commit sets the
+    finished phase's `Status` and `Merged` cells and its row in
+    `docs/plans/index.md`, and the push-audit phase closes itself out.
+
 <!-- shared-block: plan-status-vocabulary v1 -->
 Plan status vocabulary (shared block; do not edit -- the canonical
 copy lives in shakenfist/development at
