@@ -178,6 +178,15 @@ jobs:
       - name: Check the fuzz target registration lists
         run: tools/ci/check-fuzz-targets.sh
 
+      - name: Test the fuzz target registration guard
+        run: tools/ci/test-check-fuzz-targets.sh
+
+      # The corpus seed builders run unattended in the nightly fuzz job,
+      # over adversarial fixtures chosen to be hostile. One that makes a
+      # builder raise seeds nothing for any target, not just its own.
+      - name: Test the fuzz corpus seed builders
+        run: python3 -m unittest discover -s tools/ci -t tools/ci -v
+
       - name: Test the inline-script audit check
         run: tools/audit/test-inline-script-check.sh
 

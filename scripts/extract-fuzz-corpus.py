@@ -33,9 +33,14 @@ FORMAT_TO_TARGETS = {
         'fuzz_snapshot_parse',
     ],
     'vmdk': ['fuzz_vmdk_header', 'fuzz_vmdk_grain'],
-    'vpc': ['fuzz_vhd_footer', 'fuzz_vhd_bat', 'fuzz_vhd_parent'],
-    'vhd': ['fuzz_vhd_footer', 'fuzz_vhd_bat', 'fuzz_vhd_parent'],
-    'vhdx': ['fuzz_vhdx_header', 'fuzz_vhdx_metadata', 'fuzz_vhdx_parent'],
+    # fuzz_vhd_parent and fuzz_vhdx_parent are deliberately absent: they
+    # read a relocated dynamic header and a single metadata item, not a
+    # whole image, so a whole-image seed is refused at their first cookie
+    # or GUID check. They are seeded by extract_vhd_parent_seed and by
+    # the build_minimal_*_parent_seed builders instead.
+    'vpc': ['fuzz_vhd_footer', 'fuzz_vhd_bat'],
+    'vhd': ['fuzz_vhd_footer', 'fuzz_vhd_bat'],
+    'vhdx': ['fuzz_vhdx_header', 'fuzz_vhdx_metadata'],
     'raw': ['fuzz_raw_partition'],
     'luks': ['fuzz_luks_header'],
 }
@@ -241,8 +246,10 @@ def extract_snapshot_parse_seed(src_path, dest_dir):
 #
 # A whole-image copy puts the cxsparse cookie at data_offset (512 in
 # every fixture), not at 0, so it is not a valid input to this target at
-# all (decision 10 of PLAN-differencing-phase-09-fuzz.md) -- both
-# functions below emit the header-plus-tail shape instead.
+# all. That is why neither parent target appears in FORMAT_TO_TARGETS:
+# whole-image seeds would be refused at the cookie check on every run,
+# while still setting libFuzzer's unit size from their multi-megabyte
+# length. Both functions below emit the header-plus-tail shape instead.
 VHD_PARENT_TAIL_RESERVED = 32
 
 # VHD dynamic header field offsets used below (src/crates/vhd/src/lib.rs).
@@ -291,6 +298,19 @@ def extract_vhd_parent_seed(src_path, dest_dir):
             if len(header) < DYNAMIC_HEADER_SIZE or header[0:8] != b'cxsparse':
                 return False
 
+            # An entry is only relocatable if the data it points at is
+            # really in the file. The adversarial fixtures this runs over
+            # carry offsets that deliberately are not -- past the end of
+            # the image, or overlapping the footer -- and treating those
+            # like the rest goes wrong twice. Seeking to an offset at or
+            # above 2**63 raises ValueError ('cannot fit int into an
+            # offset-sized integer'), which is not an OSError, so it
+            # escapes the handler below and aborts the whole seeding run
+            # rather than skipping one fixture. And relocating one
+            # rewrites it to a valid in-window offset, quietly repairing
+            # the defect the fixture exists to carry. In-range entries
+            # move together; out-of-range entries keep their original
+            # offset verbatim.
             entries = []
             region_start = None
             region_end = None
@@ -304,7 +324,10 @@ def extract_vhd_parent_seed(src_path, dest_dir):
                     continue
                 data_off = int.from_bytes(
                     header[off + VHD_LOC_DATA_OFFSET_OFFSET:off + VHD_LOC_DATA_OFFSET_OFFSET + 8], 'big')
-                entries.append((off, data_off, data_length))
+                in_file = data_off + data_length <= size
+                entries.append((off, data_off, data_length, in_file))
+                if not in_file:
+                    continue
                 region_start = data_off if region_start is None else min(region_start, data_off)
                 end = data_off + data_length
                 region_end = end if region_end is None else max(region_end, end)
@@ -312,10 +335,17 @@ def extract_vhd_parent_seed(src_path, dest_dir):
             if not entries:
                 return False
 
-            region_len = min(region_end - region_start, 65536)
-            f.seek(region_start)
-            region = f.read(region_len)
-    except (OSError, IOError):
+            # Every entry may be out of range, leaving no platform data
+            # to carry: the seed is then the header plus a bare control
+            # prefix, which is still worth emitting because it is
+            # precisely the shape the locator_defect path reads.
+            if region_start is None:
+                region = b''
+            else:
+                region_len = min(region_end - region_start, 65536)
+                f.seek(region_start)
+                region = f.read(region_len)
+    except (OSError, ValueError, OverflowError):
         return False
 
     reserved = VHD_PARENT_TAIL_RESERVED
@@ -326,8 +356,15 @@ def extract_vhd_parent_seed(src_path, dest_dir):
     # Window file_offset under the selector above is
     # FOOTER_SIZE + DYNAMIC_HEADER_SIZE = 1536; the relocated data lives
     # at 1536 + reserved, keeping each entry's offset from region_start.
+    # The 65536-byte clamp above and a short read can each leave a
+    # nominally in-file entry outside the bytes actually carried, so the
+    # relocation is gated on the region as read rather than as computed.
     window_file_offset = FOOTER_SIZE + DYNAMIC_HEADER_SIZE
-    for off, data_off, _data_length in entries:
+    for off, data_off, data_length, in_file in entries:
+        if not in_file:
+            continue
+        if data_off + data_length > region_start + len(region):
+            continue
         new_offset = window_file_offset + reserved + (data_off - region_start)
         header[off + VHD_LOC_DATA_OFFSET_OFFSET:off + VHD_LOC_DATA_OFFSET_OFFSET + 8] = \
             new_offset.to_bytes(8, 'big')

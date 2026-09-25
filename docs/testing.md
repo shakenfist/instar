@@ -1249,6 +1249,23 @@ cargo fuzz tmin fuzz_qcow2_header artifacts/fuzz_qcow2_header/<crash>
 cargo fuzz coverage fuzz_qcow2_header
 ```
 
+Per-function coverage — which functions a target actually reached, not
+just a total — comes from `make fuzz-coverage`, which runs the same
+coverage build inside the devcontainer and renders the report with
+`llvm-cov`:
+
+```bash
+make fuzz-coverage FUZZ_TARGET=fuzz_vhd_parent
+make fuzz-coverage FUZZ_TARGET=fuzz_vhd_parent FUZZ_COVERAGE_FILTER=locator
+```
+
+A filter narrows the report to matching function names across every
+crate; `FUZZ_COVERAGE_SOURCES` narrows the files. This exists because a
+target that runs clean while reaching none of the code it claims to fuzz
+looks, from the outside, exactly like a target that found no bug. It
+does not use `cargo cov` to render: cargo-fuzz 0.12 passes
+`--no-default-features` to a clap parser that rejects it and panics.
+
 ### Corpus seeding
 
 The seed corpus is extracted from `instar-testdata` using:
@@ -1302,6 +1319,20 @@ across multiple CI jobs instead.** Sharding only adds real throughput
 if the self-hosted runner pool has spare physical cores during the
 nightly window, since each libFuzzer target pins a core — confirm core
 availability before adding jobs.
+
+#### Keeping the registration lists honest
+
+Adding a target means editing several places by hand, and the
+`TARGETS=(...)` array in `coverage-fuzz.yml` is the one that fails
+silently: a target missing from it is never fuzzed in CI at all, while
+its row in the table above keeps claiming it is.
+`tools/ci/check-fuzz-targets.sh` fails the `ci-tooling` job unless the
+`.rs` basenames, the `[[bin]]` names in `src/fuzz/Cargo.toml` and that
+array name exactly the same set. `FAST_TIER` in `fuzz-tier.sh` is
+checked as a subset rather than for equality, since an unlisted target
+legitimately defaults to the deep tier. The guard needs no docker, no
+cargo and no testdata, and `tools/ci/test-check-fuzz-targets.sh` proves
+it still fails when one list loses an entry.
 
 #### Crash reporting
 

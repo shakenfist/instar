@@ -325,6 +325,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **A hostile parent-locator offset no longer aborts the nightly fuzz
+  corpus seeding.** `extract_vhd_parent_seed` read
+  `platform_data_offset` straight out of the image and seeked to it. An
+  offset at or above 2**63 -- which is exactly what the adversarial
+  differencing fixtures carry, and what the unmanifested scan feeds it
+  from every VHD under testdata -- makes `f.seek` raise `ValueError`,
+  not an `OSError`, so it escaped the handler and took the whole
+  `Seed corpus from testdata` step down: no target got seeded, not just
+  the one whose fixture was hostile. Out-of-range entries are now left
+  where they are rather than relocated, which also stops the reshape
+  quietly repairing the defect the fixture exists to carry, and
+  `tools/ci/test_extract_fuzz_corpus.py` pins both behaviours. Whole
+  images are also no longer routed into the two parent-locator targets:
+  they are refused at the first cookie or GUID check, reaching 46
+  coverage points against 270 for the reshaped seeds, while setting
+  libFuzzer's unit size from their multi-megabyte length.
+
 - **Host contention in the merge queue no longer ejects green pull
   requests.** The slowest test in the suite,
   `TestCommitSnapshotCow.test_overlay_internal_snapshots_cow`, ran the

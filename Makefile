@@ -15,7 +15,7 @@
         instar instar-devcontainer build-devcontainer clean-instar run-instar check-binary-sizes \
         metadata audit deb rpm package \
         test-venv test test-rust test-integration test-ci test-malicious test-report clean-tests \
-        fuzz-build fuzz-run snapshot-harnesses \
+        fuzz-build fuzz-run fuzz-coverage snapshot-harnesses \
         test-container test-container-core test-container-convert-qcow2 test-container-convert-vhd \
         clean-cargo-cache release check-version
 
@@ -582,7 +582,10 @@ fuzz-run: instar-devcontainer
 # reaching nothing looks identical to one that found no bug.
 # Usage: make fuzz-coverage FUZZ_TARGET=fuzz_vhd_bat
 #        make fuzz-coverage FUZZ_TARGET=fuzz_vhd_bat FUZZ_COVERAGE_FILTER=locator
+# A filter reports per-function counts across every crate; narrow that
+# with FUZZ_COVERAGE_SOURCES if the report is too wide to read.
 FUZZ_COVERAGE_FILTER ?=
+FUZZ_COVERAGE_SOURCES ?=
 fuzz-coverage: instar-devcontainer
 	@if [ -z "$(FUZZ_TARGET)" ]; then \
 		echo "Error: FUZZ_TARGET=<name> is required"; \
@@ -598,7 +601,7 @@ fuzz-coverage: instar-devcontainer
 		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/git:/build/.cargo/git" \
 		-w "/workspace/src/fuzz" \
 		"$(INSTAR_DEV_IMAGE)" \
-		bash -c '/workspace/tools/fuzz-coverage.sh $(FUZZ_TARGET) "$(FUZZ_COVERAGE_FILTER)"'
+		bash -c '/workspace/tools/fuzz-coverage.sh $(FUZZ_TARGET) "$(FUZZ_COVERAGE_FILTER)" $(FUZZ_COVERAGE_SOURCES)'
 
 # Run the seven snapshot shell harnesses (tools/snapshot-*.sh):
 # live byte-parity verification of `instar snapshot` against

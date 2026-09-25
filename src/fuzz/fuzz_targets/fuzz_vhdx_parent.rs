@@ -129,7 +129,11 @@ fn check_item_level(locator: &VhdxParentLocator, item: &[u8]) {
         item[..16] == VHDX_PARENT_LOCATOR_TYPE_GUID,
         "is_vhdx_locator_type disagrees with the GUID in the item bytes"
     );
-    assert_eq!(&locator.locator_type[..], &item[..16], "locator_type does not match the item bytes");
+    assert_eq!(
+        &locator.locator_type[..],
+        &item[..16],
+        "locator_type does not match the item bytes"
+    );
 
     // The item-level defect field is only ever set for one of these two
     // reasons; an entry-level defect never ends up here.
@@ -176,7 +180,8 @@ fn check_entry_bounds(entry: &VhdxParentLocatorEntry, item_len: usize) {
         let end = (entry.key_offset as usize).checked_add(entry.key_length as usize);
         assert!(
             matches!(end, Some(e) if e <= item_len),
-            "entry key [{}, +{}) escapes a {item_len}-byte item without KeyOutOfBounds (defect: {:?})",
+            "entry key [{}, +{}) escapes the {item_len}-byte item, \
+             defect {:?} rather than KeyOutOfBounds",
             entry.key_offset,
             entry.key_length,
             entry.defect,
@@ -187,8 +192,10 @@ fn check_entry_bounds(entry: &VhdxParentLocatorEntry, item_len: usize) {
 
     // Value bounds are only ever reached once the key resolved far
     // enough for decode_entry_strings to get past it.
-    let value_bounds_checked =
-        !matches!(entry.defect, Some(KeyOutOfBounds) | Some(KeyTooLong) | Some(KeyUndecodable) | Some(ValueOutOfBounds));
+    let value_bounds_checked = !matches!(
+        entry.defect,
+        Some(KeyOutOfBounds) | Some(KeyTooLong) | Some(KeyUndecodable) | Some(ValueOutOfBounds)
+    );
     if value_bounds_checked {
         let end = (entry.value_offset as usize).checked_add(entry.value_length as usize);
         assert!(
@@ -203,13 +210,22 @@ fn check_entry_bounds(entry: &VhdxParentLocatorEntry, item_len: usize) {
     // A key/value that decode_entry_strings never reached, or that it
     // reached and rejected, never produces a non-empty decoded string —
     // key() and value() only hold what actually decoded.
-    let key_decoded = !matches!(entry.defect, Some(KeyOutOfBounds) | Some(KeyTooLong) | Some(KeyUndecodable));
+    let key_decoded =
+        !matches!(entry.defect, Some(KeyOutOfBounds) | Some(KeyTooLong) | Some(KeyUndecodable));
     if !key_decoded {
-        assert!(entry.key().is_empty(), "entry.key() non-empty despite defect {:?}", entry.defect);
+        assert!(
+            entry.key().is_empty(),
+            "entry.key() non-empty despite defect {:?}",
+            entry.defect
+        );
     }
     let value_decoded = matches!(entry.defect, None | Some(VhdxParentLocatorDefect::DuplicateKey));
     if !value_decoded {
-        assert!(entry.value().is_empty(), "entry.value() non-empty despite defect {:?}", entry.defect);
+        assert!(
+            entry.value().is_empty(),
+            "entry.value() non-empty despite defect {:?}",
+            entry.defect
+        );
     }
 
     assert!(entry.key().len() <= MAX_PARENT_LOCATOR_KEY_UTF8, "decoded key exceeds its own buffer");
@@ -236,9 +252,21 @@ fn check_entry_bounds(entry: &VhdxParentLocatorEntry, item_len: usize) {
 /// carries survives the round trip through `find()`, and `value_of()`
 /// — which exists to hand a caller a usable value — refuses it.
 fn check_declined_distinguishable_from_absent(locator: &VhdxParentLocator) {
-    let probe: &[u8] = b"__fuzz_vhdx_parent_probe_key_never_written__";
+    // 0xFF, not a distinctive spelling. libFuzzer intercepts
+    // memcmp-style comparisons and feeds the operands into its
+    // auto-dictionary, so a merely improbable literal is exactly the
+    // kind of constant it is built to learn -- and a match would fire an
+    // assertion that says nothing about the parser. Keys come back as
+    // UTF-8 written by `utf16_to_utf8`, whose widest lead byte is 0xF4
+    // and whose continuation bytes are all 0x80..=0xBF, so a probe
+    // carrying 0xFF cannot be matched however well the corpus is
+    // mutated: this probe is absent by construction rather than by luck.
+    let probe: &[u8] = b"\xffnever written\xff";
     assert!(locator.find(probe).is_none(), "find() matched a key that was never written");
-    assert!(locator.value_of(probe).is_none(), "value_of() matched a key that was never written");
+    assert!(
+        locator.value_of(probe).is_none(),
+        "value_of() matched a key that was never written"
+    );
 
     for (i, entry) in locator.entries().iter().enumerate() {
         let Some(defect) = entry.defect else { continue };
@@ -276,7 +304,10 @@ fn check_declined_distinguishable_from_absent(locator: &VhdxParentLocator) {
 fn check_linkage(locator: &VhdxParentLocator) {
     match locator.parent_linkage() {
         None => {
-            assert!(!locator.linkage_matches(b""), "linkage_matches matched with no linkage present");
+            assert!(
+                !locator.linkage_matches(b""),
+                "linkage_matches matched with no linkage present"
+            );
             assert!(
                 !locator.linkage_matches(b"{00000000-0000-0000-0000-000000000000}"),
                 "linkage_matches matched with no linkage present"
@@ -330,7 +361,8 @@ fn check_preferred_path(locator: &VhdxParentLocator) {
         .or_else(|| volume.map(|p| (p, false)));
     assert_eq!(
         with_convention, expected,
-        "preferred_path_with_convention did not follow relative_path > absolute_win32_path > volume_path"
+        "preferred_path_with_convention ignored the documented \
+         relative > absolute_win32 > volume order"
     );
 }
 

@@ -13,12 +13,20 @@
 # panics, so llvm-cov is invoked directly against the instrumented
 # binary cargo-fuzz builds under target/<triple>/coverage/.
 #
-# Usage: tools/fuzz-coverage.sh <target> [name-filter-regex]
+# A name filter switches the report to per-function counts, which needs
+# the source files those functions live in. Those default to every crate
+# rather than to the pair this was first written for: the filter is a
+# regex over function names, so pointing it at one crate while asking
+# about another produces an empty report and no indication why.
+#
+# Usage: tools/fuzz-coverage.sh <target> [name-filter-regex] [source...]
 
 set -euo pipefail
 
-TARGET="${1:?usage: fuzz-coverage.sh <target> [name-filter-regex]}"
+TARGET="${1:?usage: fuzz-coverage.sh <target> [name-filter-regex] [source...]}"
 FILTER="${2:-}"
+shift $(($# > 2 ? 2 : $#))
+SOURCES=("$@")
 
 cargo fuzz coverage "${TARGET}"
 
@@ -48,12 +56,16 @@ ARGS=(report "${BINARY}"
       "--instr-profile=${PROFDATA}"
       --ignore-filename-regex='/build/|/registry/|/rustc/')
 if [ -n "${FILTER}" ]; then
-  ARGS=(report "${BINARY}"
-        "--instr-profile=${PROFDATA}"
-        --ignore-filename-regex='/build/|/registry/|/rustc/'
-        --show-functions
-        "--name-regex=${FILTER}"
-        ../crates/vhd/src/lib.rs ../crates/vhdx/src/lib.rs)
+  if [ "${#SOURCES[@]}" -eq 0 ]; then
+    # Relative to the working directory make(1) uses for this script,
+    # which is /workspace/src/fuzz.
+    mapfile -t SOURCES < <(compgen -G '../crates/*/src/lib.rs' || true)
+  fi
+  if [ "${#SOURCES[@]}" -eq 0 ]; then
+    echo "no crate sources found for the filtered report" >&2
+    exit 1
+  fi
+  ARGS+=(--show-functions "--name-regex=${FILTER}" "${SOURCES[@]}")
 fi
 
 "${LLVM_COV}" "${ARGS[@]}"

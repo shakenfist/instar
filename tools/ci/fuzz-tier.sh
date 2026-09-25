@@ -31,6 +31,13 @@ set -euo pipefail
 # sync with src/fuzz/Cargo.toml as targets are added. Parser/format
 # targets that consume raw image bytes (including fuzz_map_iter, which
 # parses an image before walking its extents) are deliberately deep.
+#
+# fuzz_vhd_parent and fuzz_vhdx_parent are the exception, and are listed
+# below on purpose: neither takes a whole image. One reads a fixed
+# 1024-byte dynamic header plus a short synthesised window, the other a
+# single metadata item, so both saturate like the planner targets rather
+# than like a format parser. Do not copy their placement for a target
+# that opens an image.
 FAST_TIER=(
   fuzz_dd_window
   fuzz_chs_rounded_size
