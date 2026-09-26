@@ -232,8 +232,12 @@ Nothing else the master plan claims about this phase was wrong.
 
 ## Definition of done
 
-* `git grep -nE 'PLAN-[a-z] work[a-z]'` returns nothing across the
-  whole tree.
+* `git grep -nE 'PLAN-[a-z] work[a-z]'` returns nothing outside
+  `docs/plans/` and `tools/ci/`. Those two are exempt and the
+  criterion was wrong to omit them, which 10b found: the phase 9 and
+  phase 10 plan files quote the corrupted phrases verbatim as examples
+  of the bug, and the guard's own tests plant them on purpose, so a
+  whole-tree form of this criterion can never be satisfied.
 * `tools/ci/check-doc-phrases.sh` exits 0 on the tree, and exits
   non-zero naming the file and line when a corrupted phrase is planted.
   Demonstrated, not claimed, with the output in the commit message.
@@ -255,6 +259,10 @@ Nothing else the master plan claims about this phase was wrong.
 * No line carrying a "Measured <date>" marker is changed without a
   fresh measurement recorded in the commit message.
 * `docs/index.md` is unchanged, because no page was created.
+* `docs/info.md` states the narrowed parent-path limitation and points
+  at `docs/quirks.md` for the full account. It was added to scope
+  during 10e: the stale claim lived on both pages, and fixing one
+  would have left the two halves of one fact disagreeing.
 * `make lint`, `make test-rust` and `pre-commit run --all-files` are
   clean.
 

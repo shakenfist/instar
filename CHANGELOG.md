@@ -31,6 +31,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   that linkage comparison is case-insensitive. Coverage after: 86.67%-
   100% for the VHD functions, 75%-100% for the VHDX functions.
 
+- **The differencing documentation says the same thing on every
+  page.** The cross-cutting documentation pass for differencing VHD
+  and VHDX found that the per-phase pages were already current --
+  `create.md`, `format-coverage.md`, `quirks.md` and `resize.md` each
+  documented their own phase's work as it landed -- so this was a
+  reconciliation rather than an authoring pass. Four facts were
+  stated differently on two pages and are now stated once:
+  `info` does not refuse a differencing source, so "every read path
+  refuses" became "every read path that composes sector data";
+  backing-file references on vpc and vhdx are an instar-only
+  capability, not a match for qemu-img's permission set, which
+  refuses `-b` on both; `create` has five documented writer
+  divergences, not four; and the VHDX parent-path limitation is
+  narrower than recorded -- a relative locator now renders back into
+  POSIX and resolves, while an absolute Win32 key, a volume-GUID key
+  and a VHD parent unicode name are still reported verbatim, in
+  either format rather than only VHDX. `ARCHITECTURE.md` gained two
+  sentences distinguishing a differencing child from a backing-file
+  reference, and `docs/guest-architecture.md` gained the emit path
+  and now frames refusal as uniform policy rather than a `map`
+  quirk. Two historical `CHANGELOG` claims the feature had made
+  false are annotated in place rather than rewritten.
+
+- **A text corruption across the documentation is repaired and
+  guarded.** A bad automated replace had spliced the word "work"
+  into plan filenames named in prose, so a sentence naming
+  `PLAN-map` ended up naming `PLAN-m` with the rest of the filename
+  stranded after the word. Seventeen instances across five pages are
+  repaired, on top of the seven an earlier pass had fixed in
+  `docs/testing.md`, and `tools/ci/check-doc-phrases.sh` now fails
+  the `ci-tooling` job on any recurrence outside `docs/plans/` and
+  `tools/ci/`, which legitimately quote the pattern.
+
 - **The differencing tests can be proved to fail.**
   `tools/mutate-differencing.sh` is a committed falsification harness:
   26 cases, each breaking one specific behaviour in the differencing
