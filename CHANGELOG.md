@@ -1952,7 +1952,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (`monolithicFlat`, `twoGbMaxExtent*`), differencing VHD /
   VHDX as the *output* target, and `--sector-size > 512`
   remain deferred to future work (see PLAN-create.md's
-  Future-work section).
+  Future-work section). (correction: `create -b` now emits
+  differencing VHD and VHDX; see the Unreleased entries for
+  `create::plan_vhd` and `create::plan_vhdx`.)
 
 - **New `instar measure` subcommand.** Predicts the file size
   required to convert an image (or a hypothetical `--size N`
@@ -2312,6 +2314,9 @@ First public release.
     multi-extent input, flat-in-backing-chain via
     parentFileNameHint)
   - VHD (fixed, dynamic, differencing with backing chains)
+    (correction: a differencing VHD is parsed, not composed —
+    the ops that compose sector data refuse it. See the
+    "VHD/VHDX differencing" section of docs/quirks.md)
   - VHDX (dynamic, with CRC-32C validation)
   - LUKS v1/v2 containers (PBKDF2 and Argon2id KDF,
     AES-XTS decryption, inner format detection)
