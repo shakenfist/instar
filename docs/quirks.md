@@ -4218,7 +4218,10 @@ records qemu-img's unchanged behaviour; each "instar Behavior" is split
 into a "(before commit `10ab838`)" and a "(since commit `10ab838`)" pair
 recording what changed. A "Known limitations of the refusal" subsection
 near the end of this section records what that commit deliberately left
-unfixed.
+unfixed. The `file:line` citations throughout this section are as of
+commit `10ab838` and the code it changed; they are a record of where
+the behaviour lived when it was measured, not a current index, and
+several have since moved.
 
 ### qemu-img creates neither differencing VHD nor differencing VHDX; instar now creates both
 
@@ -4695,12 +4698,27 @@ rather than fixed, because none of them was that change's job to close:
    change which failure a user sees. The composition work in
    [PLAN-differencing.md](plans/PLAN-differencing.md) lifts this per
    operation as it lands. See [chain-discovery.md](chain-discovery.md#known-limitations).
-2. **`instar info` prints an unresolvable "actual path" for a VHDX
-   parent.** VHDX parent locators are Windows-shaped
-   (e.g. `.\vhdx-diff-parent.vhdx`), and the host renders that as a POSIX
-   path, producing a filename containing a literal backslash that cannot
-   exist on the filesystem. Path normalisation belongs with the composition
-   work in [PLAN-differencing.md](plans/PLAN-differencing.md). See
+2. **`instar info` prints an unresolvable "actual path" for a parent
+   recorded in Windows convention — in either format.** The host's
+   "actual path" resolution treats any string that is not POSIX-absolute
+   as relative and joins it onto the image's directory, so a parent name
+   carrying backslashes becomes a single literal filename that cannot
+   exist on the filesystem. This was originally recorded as a VHDX-only
+   limitation, on the strength of an instar-created child reporting
+   `.\vhdx-diff-parent.vhdx`; that particular case is now closed. `info`
+   renders the VHDX `relative_path` locator key back into POSIX
+   convention — see "**`instar info` reports a parent path in POSIX
+   convention, whichever format it came from.**" above — so a relative
+   VHDX locator reports and resolves correctly today. What remains open
+   is every parent string that is *already* in Windows convention and so
+   is reported verbatim: a VHDX `absolute_win32_path` or `volume_path`
+   locator key, and a VHD parent unicode name, which is never normalised
+   in either direction. The adversarial fixture `vhd-diff-locator-unc`
+   is the concrete case — a VHD whose parent name is
+   `\\attacker\share\probe`, reported exactly as stored
+   (`tests/test_differencing.py:98`) and then joined onto the image
+   directory. Path normalisation belongs with the composition work in
+   [PLAN-differencing.md](plans/PLAN-differencing.md). See
    [info.md](info.md#known-limitations).
 3. **`instar resize` still accepts a differencing VHDX.** This is a write
    path, predates the differencing work, and `resize` never called

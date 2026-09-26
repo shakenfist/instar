@@ -501,9 +501,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   before/after record, including three known limitations left
   deliberately unfixed: `info --chain` reports a one-image chain for
   a differencing source, `info` prints an unresolvable "actual path"
-  for a VHDX parent's Windows-shaped locator, and `resize` still
-  accepts a differencing VHDX (a pre-existing, unrelated write-path
-  bug, now tracked as issue #565).
+  for a parent recorded in Windows convention — a VHD parent unicode
+  name, or a VHDX `absolute_win32_path` or `volume_path` locator key,
+  in either format and not just VHDX (a relative VHDX locator is
+  rendered back into POSIX convention and resolves; see the entry on
+  parent-path reporting above) — and `resize` still accepts a
+  differencing VHDX (a pre-existing, unrelated write-path bug, now
+  tracked as issue #565).
 
 - **`create -b` skipped every check on the backing image when an
   explicit size was also given.** `probe_backing` only ran when no
