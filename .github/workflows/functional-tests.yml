@@ -170,6 +170,23 @@ jobs:
       - name: Test the literal replace helper
         run: tools/ci/test-replace-once.sh
 
+      # A new fuzz target has to be added to fuzz_targets/, Cargo.toml's
+      # [[bin]] list and coverage-fuzz.yml's TARGETS array by hand, and a
+      # target missing from that last one is never fuzzed in CI at all
+      # -- silently, while docs/testing.md keeps a row claiming it is.
+      # Pure text parsing: no docker, no cargo, no testdata.
+      - name: Check the fuzz target registration lists
+        run: tools/ci/check-fuzz-targets.sh
+
+      - name: Test the fuzz target registration guard
+        run: tools/ci/test-check-fuzz-targets.sh
+
+      # The corpus seed builders run unattended in the nightly fuzz job,
+      # over adversarial fixtures chosen to be hostile. One that makes a
+      # builder raise seeds nothing for any target, not just its own.
+      - name: Test the fuzz corpus seed builders
+        run: python3 -m unittest discover -s tools/ci -t tools/ci -v
+
       - name: Test the inline-script audit check
         run: tools/audit/test-inline-script-check.sh
 

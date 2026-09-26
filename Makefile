@@ -15,7 +15,7 @@
         instar instar-devcontainer build-devcontainer clean-instar run-instar check-binary-sizes \
         metadata audit deb rpm package \
         test-venv test test-rust test-integration test-ci test-malicious test-report clean-tests \
-        fuzz-build fuzz-run snapshot-harnesses \
+        fuzz-build fuzz-run fuzz-coverage snapshot-harnesses \
         test-container test-container-core test-container-convert-qcow2 test-container-convert-vhd \
         clean-cargo-cache release check-version
 
@@ -575,6 +575,33 @@ fuzz-run: instar-devcontainer
 		-w "/workspace/src/fuzz" \
 		"$(INSTAR_DEV_IMAGE)" \
 		bash -c "cargo fuzz run $(FUZZ_TARGET) -- -max_total_time=$(FUZZ_DURATION)"
+
+# Produce a per-function coverage report for one fuzz target against
+# its current corpus. Used to answer "does this target actually reach
+# the code it claims to fuzz?" -- a target that runs clean while
+# reaching nothing looks identical to one that found no bug.
+# Usage: make fuzz-coverage FUZZ_TARGET=fuzz_vhd_bat
+#        make fuzz-coverage FUZZ_TARGET=fuzz_vhd_bat FUZZ_COVERAGE_FILTER=locator
+# A filter reports per-function counts across every crate; narrow that
+# with FUZZ_COVERAGE_SOURCES if the report is too wide to read.
+FUZZ_COVERAGE_FILTER ?=
+FUZZ_COVERAGE_SOURCES ?=
+fuzz-coverage: instar-devcontainer
+	@if [ -z "$(FUZZ_TARGET)" ]; then \
+		echo "Error: FUZZ_TARGET=<name> is required"; \
+		exit 1; \
+	fi
+	@echo "Generating coverage for $(FUZZ_TARGET)..."
+	docker run --rm \
+		-u "$(shell id -u):$(shell id -g)" \
+		-e HOME=/build \
+		-e CARGO_HOME=/build/.cargo \
+		-v "$(CURDIR):/workspace" \
+		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/registry:/build/.cargo/registry" \
+		-v "$(CURDIR)/$(CARGO_CACHE_DIR)/git:/build/.cargo/git" \
+		-w "/workspace/src/fuzz" \
+		"$(INSTAR_DEV_IMAGE)" \
+		bash -c '/workspace/tools/fuzz-coverage.sh $(FUZZ_TARGET) "$(FUZZ_COVERAGE_FILTER)" $(FUZZ_COVERAGE_SOURCES)'
 
 # Run the seven snapshot shell harnesses (tools/snapshot-*.sh):
 # live byte-parity verification of `instar snapshot` against

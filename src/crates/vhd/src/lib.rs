@@ -16,10 +16,9 @@
 //! inconsistent. `qcow2::read_backing_file` is the shape this module
 //! follows in one respect — the header keeps the offset and length, and a
 //! separate function produces the string — but it takes a `CallTable` and
-//! reads sectors itself. This module does not, so that phase 9 can point a
-//! coverage-guided fuzz target at [`VhdParentInfo::parse`] the way
-//! `fuzz_vhd_footer` points at [`VhdFooter::parse`]. See decision 7 of
-//! `docs/plans/PLAN-differencing-phase-03-parse.md`.
+//! reads sectors itself. This module does not, so that `fuzz_vhd_parent`
+//! can drive [`VhdParentInfo::parse`] from a buffer the way
+//! `fuzz_vhd_footer` drives [`VhdFooter::parse`].
 
 #![no_std]
 #![allow(clippy::too_many_arguments)]
@@ -1013,8 +1012,8 @@ impl<'a> VhdParentInfo<'a> {
     /// `footer.disk_type == DISK_TYPE_DIFFERENCING`; this parses the
     /// fields where they lie. On a plain dynamic VHD they read as zero.
     ///
-    /// No I/O and no allocation: this is the entry point phase 9 points a
-    /// fuzz target at.
+    /// No I/O and no allocation: this is the entry point `fuzz_vhd_parent`
+    /// drives, handing it a buffer and a synthesised [`VhdImageBounds`].
     pub fn parse(header: &'a [u8], bounds: &VhdImageBounds) -> Option<Self> {
         if header.len() < DYNAMIC_HEADER_SIZE {
             return None;

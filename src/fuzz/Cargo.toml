@@ -63,8 +63,20 @@ doc = false
 test = false
 
 [[bin]]
+name = "fuzz_vhd_parent"
+path = "fuzz_targets/fuzz_vhd_parent.rs"
+doc = false
+test = false
+
+[[bin]]
 name = "fuzz_vhdx_header"
 path = "fuzz_targets/fuzz_vhdx_header.rs"
+doc = false
+test = false
+
+[[bin]]
+name = "fuzz_vhdx_parent"
+path = "fuzz_targets/fuzz_vhdx_parent.rs"
 doc = false
 test = false
 

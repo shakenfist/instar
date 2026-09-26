@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Coverage-guided fuzzing of the VHD and VHDX parent-locator read
+  paths (40→42 targets).** Both were previously unreached: measurement
+  showed `VhdParentInfo::parse`, `VhdParentLocatorTable::parse`,
+  `VhdParentLocator::parse`, `locator_defect`, `preferred_locator`,
+  `decode_name`, `parse_parent_locator` and its nine helpers all at
+  0.00% region coverage, while the targets already running covered
+  unrelated code in the same crates well (`VhdState::init` 89.26%,
+  `parse_metadata` 33.91%). `fuzz_vhd_parent` is buffer-based — these
+  parsers do no I/O by construction — and drives `VhdParentInfo::parse`
+  over the eight-entry parent locator table, asserting that selection
+  never returns a defective, unused or non-Windows entry, that a
+  disagreeing duplicate resolves to ambiguous rather than to a winner,
+  and that no offset reachable from an entry escapes the bounds it was
+  validated against. `fuzz_vhdx_parent` hands `parse_parent_locator`
+  its item bytes directly, because libFuzzer cannot synthesise a valid
+  region table, metadata table and in-item offset past the 64 KB floor
+  by chance, and asserts that every offset and length reachable from a
+  returned locator lies inside the item it came from, that the locator
+  type comes from the item's GUID rather than a parser-set field, and
+  that linkage comparison is case-insensitive. Coverage after: 86.67%-
+  100% for the VHD functions, 75%-100% for the VHDX functions.
+
 - **The differencing tests can be proved to fail.**
   `tools/mutate-differencing.sh` is a committed falsification harness:
   26 cases, each breaking one specific behaviour in the differencing
@@ -302,6 +324,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   fixed by hand.
 
 ### Fixed
+
+- **A hostile parent-locator offset no longer aborts the nightly fuzz
+  corpus seeding.** `extract_vhd_parent_seed` read
+  `platform_data_offset` straight out of the image and seeked to it. An
+  offset at or above 2**63 -- which is exactly what the adversarial
+  differencing fixtures carry, and what the unmanifested scan feeds it
+  from every VHD under testdata -- makes `f.seek` raise `ValueError`,
+  not an `OSError`, so it escaped the handler and took the whole
+  `Seed corpus from testdata` step down: no target got seeded, not just
+  the one whose fixture was hostile. Out-of-range entries are now left
+  where they are rather than relocated, which also stops the reshape
+  quietly repairing the defect the fixture exists to carry, and
+  `tools/ci/test_extract_fuzz_corpus.py` pins both behaviours. Whole
+  images are also no longer routed into the two parent-locator targets:
+  they are refused at the first cookie or GUID check, reaching 46
+  coverage points against 270 for the reshaped seeds, while setting
+  libFuzzer's unit size from their multi-megabyte length.
 
 - **Host contention in the merge queue no longer ejects green pull
   requests.** The slowest test in the suite,
