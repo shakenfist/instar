@@ -42,7 +42,14 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${REPO_ROOT}"
 
-PATTERN='PLAN-[a-z] work[a-z]'
+# Candidates, not verdicts. The splice can land at any offset -- the
+# survey happened to find only one-letter cases, but "PLAN-di
+# workfferencing" is the same bug and a pattern pinned to the observed
+# shape would let it spread exactly as the original did. So match
+# broadly and decide per hit below. -I keeps a binary file's "Binary
+# file X matches" line out of the results, which would otherwise be
+# reported as a hit with no line number.
+PATTERN='PLAN-[A-Za-z0-9-]+ work[A-Za-z0-9._-]*'
 
 FAILURES=0
 
@@ -52,18 +59,38 @@ FAILURES=0
 # against a corruption nobody notices must not have a silent-success
 # path of its own.
 set +e
-HITS="$(git grep -nE "${PATTERN}" -- ':!docs/plans/**' ':!tools/ci/**')"
+HITS="$(git grep -nIoE "${PATTERN}" -- ':!docs/plans/**' ':!tools/ci/**')"
 GREP_STATUS=$?
 set -e
 if [ "${GREP_STATUS}" -gt 1 ]; then
     echo "ERROR: git grep failed (exit ${GREP_STATUS}); not a git checkout?" >&2
     exit 2
 fi
+
+# A candidate is corruption when rejoining the text either side of
+# " work" names a plan file that actually exists: "PLAN-m workap"
+# rejoins to PLAN-map, which is real, whereas "PLAN-differencing
+# workflow" rejoins to PLAN-differencingflow, which is not. That test is
+# exact where a list of English words that may follow "work" would be a
+# guess, and it is the same reconstruction a human does when repairing
+# one of these by hand.
 if [ "${GREP_STATUS}" -eq 0 ]; then
     while IFS= read -r hit; do
         [ -n "${hit}" ] || continue
-        echo "ERROR: mangled plan-filename phrase: ${hit}" >&2
-        FAILURES=$((FAILURES + 1))
+        match="${hit##*:}"
+        prefix="${match#PLAN-}"
+        prefix="${prefix%% work*}"
+        suffix="${match#* work}"
+        # Trailing markup or sentence punctuation is not part of a name.
+        suffix="$(printf '%s' "${suffix}" | sed 's/[^A-Za-z0-9._-]*$//; s/[.,;:]*$//')"
+        [ -n "${suffix}" ] || continue
+        candidate="PLAN-${prefix}${suffix}"
+        candidate="${candidate%.md}"
+        if [ -f "docs/plans/${candidate}.md" ]; then
+            echo "ERROR: mangled plan-filename phrase: ${hit}" >&2
+            echo "       rejoins to docs/plans/${candidate}.md, which exists" >&2
+            FAILURES=$((FAILURES + 1))
+        fi
     done <<< "${HITS}"
 fi
 

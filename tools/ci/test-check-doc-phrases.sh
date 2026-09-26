@@ -37,6 +37,18 @@ build_tree() {
     mkdir -p "${dir}/tools/ci" "${dir}/docs/plans"
     cp "${CHECK}" "${dir}/tools/ci/check-doc-phrases.sh"
 
+    # The guard decides a candidate is corruption by rejoining it and
+    # asking whether that names a real plan file, so the fixture needs
+    # plans to rejoin to. These are the ones the cases below reference;
+    # deliberately NOT PLAN-differencingflow.md or the like, because a
+    # legitimate "PLAN-differencing workflow" must rejoin to nothing.
+    local plan
+    for plan in PLAN-map PLAN-commit PLAN-differencing PLAN-snapshot \
+                PLAN-format-coverage PLAN-qcow2-write-infrastructure \
+                PLAN-distro-matrix-ci; do
+        echo "# ${plan}" > "${dir}/docs/plans/${plan}.md"
+    done
+
     git -C "${dir}" init -q
     git -C "${dir}" config user.email "test@example.com"
     git -C "${dir}" config user.name "Test"
@@ -153,6 +165,37 @@ cat > "${TREE}/tools/ci/test-something.sh" <<'EOF'
 EOF
 commit_tree "${TREE}"
 expect_pass 'a fixture inside tools/ci/ does not trip the guard' "${TREE}"
+
+start 'the splice is caught at any offset, not just after one letter'
+# The survey happened to find only one-letter splices. Pinning the
+# guard to that shape would let the same bad replace spread from a
+# different offset exactly as the original did, so each of these
+# rejoins to a real plan file and must be caught.
+for SPLICE in 'the PLAN-di workfferencing work is done' \
+              'the PLAN-m workap work is done' \
+              'see the PLAN-format-coverag worke work' \
+              'the PLAN-qcow2-write-infrastructur worke work'; do
+    TREE="${WORK}/offset-$(echo "${SPLICE}" | md5sum | cut -c1-8)"
+    build_tree "${TREE}"
+    printf '# Quirks\n\n%s\n' "${SPLICE}" > "${TREE}/docs/quirks.md"
+    commit_tree "${TREE}"
+    expect_fail "caught: ${SPLICE}" "${TREE}" 'quirks.md'
+done
+
+start 'a legitimate plan name before "work" is not a splice'
+# These rejoin to plan files that do not exist, which is how the guard
+# tells a real English continuation from a spliced filename without
+# guessing at a list of words that may follow "work".
+for OK in 'the PLAN-differencing workflow is documented' \
+          'the PLAN-map work is documented' \
+          'the PLAN-snapshot workaround is documented' \
+          'the PLAN-distro-matrix-ci workflow is documented'; do
+    TREE="${WORK}/ok-$(echo "${OK}" | md5sum | cut -c1-8)"
+    build_tree "${TREE}"
+    printf '# Quirks\n\n%s\n' "${OK}" > "${TREE}/docs/quirks.md"
+    commit_tree "${TREE}"
+    expect_pass "not a splice: ${OK}" "${TREE}"
+done
 
 start 'a git failure is an error, not a clean tree'
 # The whole point of the guard is to catch something nobody notices, so

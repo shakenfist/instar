@@ -4334,9 +4334,12 @@ back: `create -f vhdx -b ./sub//parent.vhdx` then `info` reports
 `sub/parent.vhdx`. That path resolves to the same file, but it is not
 the one that was typed.
 
-**`instar info` reports a parent path in POSIX convention, whichever
-format it came from.** The normalisation above is a property of what is
-*written*, not of what instar reports back. A VHD child's parent is
+**`instar info` reports a parent path in POSIX convention where the
+stored form permits it, whichever format it came from.** A parent
+already recorded in Windows convention is reported verbatim; see
+limitation 2 under "Known limitations of the refusal" below. The
+normalisation above is a property of what is *written*, not of what
+instar reports back. A VHD child's parent is
 read from the parent unicode name field, which keeps the typed bytes,
 so it reported the typed path already. A VHDX child's parent is read
 from the locator, so `info` renders the `relative_path` key back --
@@ -4710,7 +4713,7 @@ rather than fixed, because none of them was that change's job to close:
    `.\vhdx-diff-parent.vhdx`; that particular case is now closed. `info`
    renders the VHDX `relative_path` locator key back into POSIX
    convention — see "**`instar info` reports a parent path in POSIX
-   convention, whichever format it came from.**" above — so a relative
+   convention where the stored form permits it**" above — so a relative
    VHDX locator reports and resolves correctly today. What remains open
    is every parent string that is *already* in Windows convention and so
    is reported verbatim: a VHDX `absolute_win32_path` or `volume_path`
