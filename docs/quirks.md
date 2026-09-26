@@ -4218,10 +4218,12 @@ records qemu-img's unchanged behaviour; each "instar Behavior" is split
 into a "(before commit `10ab838`)" and a "(since commit `10ab838`)" pair
 recording what changed. A "Known limitations of the refusal" subsection
 near the end of this section records what that commit deliberately left
-unfixed. The `file:line` citations throughout this section are as of
+unfixed. The `file:line` citations in the before/after pairs above are as of
 commit `10ab838` and the code it changed; they are a record of where
 the behaviour lived when it was measured, not a current index, and
-several have since moved.
+several have since moved. The "Known limitations" subsection is
+maintained against the tree as it stands and cites symbol names rather
+than line numbers, so it does not carry that caveat.
 
 ### qemu-img creates neither differencing VHD nor differencing VHDX; instar now creates both
 
@@ -4716,7 +4718,8 @@ rather than fixed, because none of them was that change's job to close:
    in either direction. The adversarial fixture `vhd-diff-locator-unc`
    is the concrete case — a VHD whose parent name is
    `\\attacker\share\probe`, reported exactly as stored
-   (`tests/test_differencing.py:98`) and then joined onto the image
+   (`ADVERSARIAL_LOCATOR_FIXTURES` in `tests/test_differencing.py`) and
+   then joined onto the image
    directory. Path normalisation belongs with the composition work in
    [PLAN-differencing.md](plans/PLAN-differencing.md). See
    [info.md](info.md#known-limitations).

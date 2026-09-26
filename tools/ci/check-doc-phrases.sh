@@ -46,10 +46,20 @@ PATTERN='PLAN-[a-z] work[a-z]'
 
 FAILURES=0
 
-# git grep exits 1 when nothing matches, which is not itself an error
-# here, so do not let `set -e` treat it as one.
-HITS=""
-if HITS="$(git grep -nE "${PATTERN}" -- ':!docs/plans/**' ':!tools/ci/**')"; then
+# git grep exits 1 when nothing matches, which is not an error here, but
+# anything above 1 is: run outside a checkout it exits 128, and an `if`
+# around the assignment would read that as "clean" and pass. A guard
+# against a corruption nobody notices must not have a silent-success
+# path of its own.
+set +e
+HITS="$(git grep -nE "${PATTERN}" -- ':!docs/plans/**' ':!tools/ci/**')"
+GREP_STATUS=$?
+set -e
+if [ "${GREP_STATUS}" -gt 1 ]; then
+    echo "ERROR: git grep failed (exit ${GREP_STATUS}); not a git checkout?" >&2
+    exit 2
+fi
+if [ "${GREP_STATUS}" -eq 0 ]; then
     while IFS= read -r hit; do
         [ -n "${hit}" ] || continue
         echo "ERROR: mangled plan-filename phrase: ${hit}" >&2

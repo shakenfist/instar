@@ -154,6 +154,29 @@ EOF
 commit_tree "${TREE}"
 expect_pass 'a fixture inside tools/ci/ does not trip the guard' "${TREE}"
 
+start 'a git failure is an error, not a clean tree'
+# The whole point of the guard is to catch something nobody notices, so
+# it must not have a silent-success path of its own. Outside a checkout
+# git grep exits 128, and an `if` around the assignment would read that
+# as "no matches" and pass.
+TREE="${WORK}/not-a-repo"
+mkdir -p "${TREE}/tools/ci"
+cp "${CHECK}" "${TREE}/tools/ci/check-doc-phrases.sh"
+STATUS=0
+run_check "${TREE}" || STATUS=$?
+if [ "${STATUS}" -eq 2 ]; then
+    ok 'running outside a git checkout exits 2'
+elif [ "${STATUS}" -eq 0 ]; then
+    fail 'running outside a git checkout passed as clean'
+else
+    fail "running outside a git checkout exited ${STATUS}, expected 2"
+fi
+if grep -q 'git grep failed' "${WORK}/err"; then
+    ok 'the error names the git failure'
+else
+    fail "the error does not name the git failure: $(cat "${WORK}/err")"
+fi
+
 start 'no false positive on legitimate strings'
 TREE="${WORK}/no-false-positive"
 build_tree "${TREE}"
