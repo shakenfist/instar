@@ -181,6 +181,17 @@ jobs:
       - name: Test the fuzz target registration guard
         run: tools/ci/test-check-fuzz-targets.sh
 
+      # A bad automated replace once spliced the word "work" into plan
+      # filenames named in doc prose, and the result reads like a typo
+      # rather than a break -- phase 9 fixed seven instances, and 17
+      # more had already spread before anything looked. Pure text
+      # parsing: no docker, no cargo, no testdata.
+      - name: Check for mangled plan-filename phrases
+        run: tools/ci/check-doc-phrases.sh
+
+      - name: Test the mangled plan-filename phrase guard
+        run: tools/ci/test-check-doc-phrases.sh
+
       # The corpus seed builders run unattended in the nightly fuzz job,
       # over adversarial fixtures chosen to be hostile. One that makes a
       # builder raise seeds nothing for any target, not just its own.

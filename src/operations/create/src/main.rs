@@ -201,8 +201,9 @@ struct BackingProbe {
 /// `ERROR_BACKING_PARSE_FAILED`: the backing header parsed perfectly
 /// well, and telling a user a valid image is "truncated, corrupted, or an
 /// unrecognised format" is the undiagnosed failure this phase exists to
-/// stop making. Every read path in instar refuses such an image, so an
-/// overlay stacked on one would be a chain that can never be read back.
+/// stop making. Every read path in instar that composes sector data
+/// refuses such an image, so an overlay stacked on one would be a chain
+/// that can never be read back.
 /// Until parent composition exists
 /// (`docs/plans/PLAN-differencing.md`), failing closed at create time is
 /// the only outcome that does not hand the user a dead image. For VHDX

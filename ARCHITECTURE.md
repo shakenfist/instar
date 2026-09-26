@@ -125,8 +125,13 @@ Measurable target formats are raw, qcow2, vmdk and vpc (VHD), plus vhdx
 where qemu-img has no `measure` implementation at all. Creatable target
 formats are raw, qcow2, vmdk (monolithicSparse and streamOptimized), vpc
 (dynamic and fixed) and vhdx (dynamic). Backing-file references are
-supported on qcow2, vmdk, vpc and vhdx, matching qemu-img's permission
-set.
+supported on qcow2, vmdk, vpc and vhdx. qemu-img permits them only on
+qcow2 and vmdk, so vpc and vhdx are an instar-only capability.
+A differencing VHD (`disk_type=4`) or VHDX (`HasParent` set) child
+is not the same thing as a backing-file reference: instar emits one from
+`create -b`, but refuses to compose one on read rather than merging the
+parent's sectors into the result. Composition is deferred, and tracked
+in [docs/plans/PLAN-differencing.md](docs/plans/PLAN-differencing.md).
 
 Per-format feature detail is in
 [docs/format-internals.md](docs/format-internals.md); the parity matrix

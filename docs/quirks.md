@@ -2400,7 +2400,7 @@ the two tools' `leaks` tiers have deliberately different scope.
 
 **Classification: Safe behaviour** (qemu-parity, not a divergence).
 
-Since the PLAN-q workcow2-write-infrastructure, writes into a
+Since the PLAN-qcow2-write-infrastructure work, writes into a
 snapshot-bearing qcow2 image **copy-on-write** the shared clusters
 instead of refusing (the phase-2 interim gates) or corrupting them.
 This cross-cutting change lifts the snapshot caveats from `commit`
@@ -2506,7 +2506,7 @@ snapshot-bearing iterations (0 divergences) by `scripts/cow-soak.py`;
 
 ## Parallels, Bochs, cloop and DMG detection
 
-The PLAN-f workormat-coverage.md` added content-based detection and
+The `PLAN-format-coverage.md` work added content-based detection and
 info parity for Parallels, Bochs, cloop, and DMG. The five entries below
 record the deliberate divergences this introduced, plus the closure of a
 pre-existing consumer defect the phase surfaced along the way. See
@@ -2741,7 +2741,7 @@ probe either; see the format-coverage sections below.
 
 ## VDI convert-from (read path)
 
-The PLAN-f workormat-coverage.md` graduated VDI (VirtualBox Disk
+The `PLAN-format-coverage.md` work graduated VDI (VirtualBox Disk
 Image) from detect + info only to a full read format for convert,
 compare, and dd, via a new `src/crates/vdi/` parser crate wired into
 the qcow2 crate's chain reader (the same pattern VHD and VHDX use).
@@ -2898,7 +2898,7 @@ version-stable enough to pin).
 
 ## Parallels convert-from (read path)
 
-The PLAN-f workormat-coverage.md` graduated Parallels from detect +
+The `PLAN-format-coverage.md` work graduated Parallels from detect +
 info only to a full read format for convert, compare, dd, and bench,
 via a new `src/crates/parallels/` parser crate wired into the qcow2
 crate's chain reader (the same pattern VDI, VHD, and VHDX use). Both
@@ -3149,7 +3149,7 @@ needed no rewrite. Pinned by the `parallels-huge-tracks` fixture
 
 ## QCOW1 convert-from (read path)
 
-The PLAN-f workormat-coverage.md` graduated QCOW1 ("qcow", qemu's
+The `PLAN-format-coverage.md` work graduated QCOW1 ("qcow", qemu's
 original deprecated format, magic `QFI\xfb` + version 1) from a
 misdetected-as-QCOW2 dead end to a full read format for convert,
 compare, dd, and bench, via a new `src/crates/qcow1/` parser crate
@@ -3545,7 +3545,7 @@ instar regression.
 
 ## DMG convert-from (read path)
 
-The PLAN-f workormat-coverage.md` graduated DMG (Apple UDIF,
+The `PLAN-format-coverage.md` work graduated DMG (Apple UDIF,
 detect + info only now) to a full read format for convert,
 compare, dd, and bench, via a new `src/crates/dmg/` parser crate
 wired into the qcow2 crate's chain reader (the same pattern VDI,
@@ -4037,7 +4037,7 @@ per-operation cap, per `make check-binary-sizes`).
 
 ## QED read-refusal as policy
 
-The PLAN-f workormat-coverage.md` resolved the master plan's Open
+The `PLAN-format-coverage.md` work resolved the master plan's Open
 question 1 — does QED get a read path, like VDI/Parallels/QCOW1/DMG in
 earlier work, or a principled, documented, fully-tested refusal? — by
 choosing refusal as deliberate policy, not a read path. Step 6a added
@@ -4218,7 +4218,10 @@ records qemu-img's unchanged behaviour; each "instar Behavior" is split
 into a "(before commit `10ab838`)" and a "(since commit `10ab838`)" pair
 recording what changed. A "Known limitations of the refusal" subsection
 near the end of this section records what that commit deliberately left
-unfixed.
+unfixed. The `file:line` citations throughout this section are as of
+commit `10ab838` and the code it changed; they are a record of where
+the behaviour lived when it was measured, not a current index, and
+several have since moved.
 
 ### qemu-img creates neither differencing VHD nor differencing VHDX; instar now creates both
 
@@ -4695,12 +4698,27 @@ rather than fixed, because none of them was that change's job to close:
    change which failure a user sees. The composition work in
    [PLAN-differencing.md](plans/PLAN-differencing.md) lifts this per
    operation as it lands. See [chain-discovery.md](chain-discovery.md#known-limitations).
-2. **`instar info` prints an unresolvable "actual path" for a VHDX
-   parent.** VHDX parent locators are Windows-shaped
-   (e.g. `.\vhdx-diff-parent.vhdx`), and the host renders that as a POSIX
-   path, producing a filename containing a literal backslash that cannot
-   exist on the filesystem. Path normalisation belongs with the composition
-   work in [PLAN-differencing.md](plans/PLAN-differencing.md). See
+2. **`instar info` prints an unresolvable "actual path" for a parent
+   recorded in Windows convention — in either format.** The host's
+   "actual path" resolution treats any string that is not POSIX-absolute
+   as relative and joins it onto the image's directory, so a parent name
+   carrying backslashes becomes a single literal filename that cannot
+   exist on the filesystem. This was originally recorded as a VHDX-only
+   limitation, on the strength of an instar-created child reporting
+   `.\vhdx-diff-parent.vhdx`; that particular case is now closed. `info`
+   renders the VHDX `relative_path` locator key back into POSIX
+   convention — see "**`instar info` reports a parent path in POSIX
+   convention, whichever format it came from.**" above — so a relative
+   VHDX locator reports and resolves correctly today. What remains open
+   is every parent string that is *already* in Windows convention and so
+   is reported verbatim: a VHDX `absolute_win32_path` or `volume_path`
+   locator key, and a VHD parent unicode name, which is never normalised
+   in either direction. The adversarial fixture `vhd-diff-locator-unc`
+   is the concrete case — a VHD whose parent name is
+   `\\attacker\share\probe`, reported exactly as stored
+   (`tests/test_differencing.py:98`) and then joined onto the image
+   directory. Path normalisation belongs with the composition work in
+   [PLAN-differencing.md](plans/PLAN-differencing.md). See
    [info.md](info.md#known-limitations).
 3. **`instar resize` still accepts a differencing VHDX.** This is a write
    path, predates the differencing work, and `resize` never called
