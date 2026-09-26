@@ -554,21 +554,21 @@ provides a modular architecture with:
  disks; vhdx differencing is already rejected by
  `VhdxState::init`; vmdk multi-extent layouts fail the
  binary-header parse naturally), and dispatches to the matching
- per-format `<Format>State::map_extents` walker from the PLAN-m workap. Streams one `MapExtentRecord` per coalesced extent
+ per-format `<Format>State::map_extents` walker from the PLAN-map work. Streams one `MapExtentRecord` per coalesced extent
  through the call table's `send_map_extent` function pointer,
  followed by a `MapResult` summary through `send_map_result`.
  The emit closure clips each extent against the configured
  window (with file-offset adjustment for front-trimmed Data
  extents) and signals walker abort once the window is
  exhausted. Single-image v1; chain composition is a follow-up.
- Binary builds at ~28 KiB / 384 KiB (7%). Host CLI (the PLAN-m workap) wires `instar map [-f FMT] [--output={human,json}]
+ Binary builds at ~28 KiB / 384 KiB (7%). Host CLI (the PLAN-map work) wires `instar map [-f FMT] [--output={human,json}]
  [--start-offset=OFFSET] [--max-length=LEN] [--sector-size=N]
  FILENAME`: `run_map` in `src/vmm/src/main.rs` parses args
  (refusing `--image-opts`, VMDK monolithicFlat sources via
  `peek_is_vmdk_descriptor`, and `--start-offset >= file_size`
  on the host before launching the guest), writes `MapConfig`
  per-field at `OPERATION_CONFIG_ADDR`, attaches the source
- read-only as input device 0, and runs the vCPU loop. The PLAN-m workap ships the streaming `MapRenderer<'a, W: Write>`
+ read-only as input device 0, and runs the vCPU loop. The PLAN-map work ships the streaming `MapRenderer<'a, W: Write>`
  that writes each extent to stdout (via a `BufWriter` over
  `stdout().lock()`) as the `MapExtentMessage` arrives in the
  vCPU loop; host memory stays O(1) regardless of how
@@ -733,15 +733,15 @@ provides a modular architecture with:
  subcommand. `MeasureConfig` and `MeasureResult` structs carry
  options and results across OPERATION_CONFIG_ADDR and the
  `send_measure_result` CallTable callback (CallTable VERSION 14).
- The PLAN-c workreate.md` adds `CreateConfig` / `CreateResult` /
+ The `PLAN-create.md` work adds `CreateConfig` / `CreateResult` /
  `GUEST_CREATE_SCRATCH_LIMIT` here and a new `send_create_result`
  CallTable function pointer (appended at the end of the struct so
- existing operation binaries keep working unchanged). The PLAN-r workesize.md` adds `ResizeConfig` / `ResizeResult` plus two
+ existing operation binaries keep working unchanged). The `PLAN-resize.md` work adds `ResizeConfig` / `ResizeResult` plus two
  more CallTable function pointers: `read_output_sector` (lets a
  guest read from the same device it writes to — the first
  in-place-mutation primitive, reusable by `rebase` / `commit`
  / snapshot-delete) and `send_resize_result`. Same
- append-at-end discipline. The PLAN-s worknapshot.md` adds
+ append-at-end discipline. The `PLAN-snapshot.md` work adds
  `SnapshotConfig` (magic `b"SNAP"`, carrying the mode, the
  snapshot name/needle argument, and the create-mode
  `date_sec`/`date_nsec` wall-clock fields) / `SnapshotResult` /

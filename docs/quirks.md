@@ -2400,7 +2400,7 @@ the two tools' `leaks` tiers have deliberately different scope.
 
 **Classification: Safe behaviour** (qemu-parity, not a divergence).
 
-Since the PLAN-q workcow2-write-infrastructure, writes into a
+Since the PLAN-qcow2-write-infrastructure work, writes into a
 snapshot-bearing qcow2 image **copy-on-write** the shared clusters
 instead of refusing (the phase-2 interim gates) or corrupting them.
 This cross-cutting change lifts the snapshot caveats from `commit`
@@ -2506,7 +2506,7 @@ snapshot-bearing iterations (0 divergences) by `scripts/cow-soak.py`;
 
 ## Parallels, Bochs, cloop and DMG detection
 
-The PLAN-f workormat-coverage.md` added content-based detection and
+The `PLAN-format-coverage.md` work added content-based detection and
 info parity for Parallels, Bochs, cloop, and DMG. The five entries below
 record the deliberate divergences this introduced, plus the closure of a
 pre-existing consumer defect the phase surfaced along the way. See
@@ -2741,7 +2741,7 @@ probe either; see the format-coverage sections below.
 
 ## VDI convert-from (read path)
 
-The PLAN-f workormat-coverage.md` graduated VDI (VirtualBox Disk
+The `PLAN-format-coverage.md` work graduated VDI (VirtualBox Disk
 Image) from detect + info only to a full read format for convert,
 compare, and dd, via a new `src/crates/vdi/` parser crate wired into
 the qcow2 crate's chain reader (the same pattern VHD and VHDX use).
@@ -2898,7 +2898,7 @@ version-stable enough to pin).
 
 ## Parallels convert-from (read path)
 
-The PLAN-f workormat-coverage.md` graduated Parallels from detect +
+The `PLAN-format-coverage.md` work graduated Parallels from detect +
 info only to a full read format for convert, compare, dd, and bench,
 via a new `src/crates/parallels/` parser crate wired into the qcow2
 crate's chain reader (the same pattern VDI, VHD, and VHDX use). Both
@@ -3149,7 +3149,7 @@ needed no rewrite. Pinned by the `parallels-huge-tracks` fixture
 
 ## QCOW1 convert-from (read path)
 
-The PLAN-f workormat-coverage.md` graduated QCOW1 ("qcow", qemu's
+The `PLAN-format-coverage.md` work graduated QCOW1 ("qcow", qemu's
 original deprecated format, magic `QFI\xfb` + version 1) from a
 misdetected-as-QCOW2 dead end to a full read format for convert,
 compare, dd, and bench, via a new `src/crates/qcow1/` parser crate
@@ -3545,7 +3545,7 @@ instar regression.
 
 ## DMG convert-from (read path)
 
-The PLAN-f workormat-coverage.md` graduated DMG (Apple UDIF,
+The `PLAN-format-coverage.md` work graduated DMG (Apple UDIF,
 detect + info only now) to a full read format for convert,
 compare, dd, and bench, via a new `src/crates/dmg/` parser crate
 wired into the qcow2 crate's chain reader (the same pattern VDI,
@@ -4037,7 +4037,7 @@ per-operation cap, per `make check-binary-sizes`).
 
 ## QED read-refusal as policy
 
-The PLAN-f workormat-coverage.md` resolved the master plan's Open
+The `PLAN-format-coverage.md` work resolved the master plan's Open
 question 1 — does QED get a read path, like VDI/Parallels/QCOW1/DMG in
 earlier work, or a principled, documented, fully-tested refusal? — by
 choosing refusal as deliberate policy, not a read path. Step 6a added
