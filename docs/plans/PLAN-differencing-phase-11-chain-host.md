@@ -392,10 +392,20 @@ each other.
   `ADVERSARIAL_LOCATOR_FIXTURES` reports a one-image chain, exits 0,
   **and** writes a stderr reason, and the reason is the correct one for
   that fixture — `vhd-diff-locator-etc-passwd` is outside the allowlist,
-  `vhd-diff-locator-unc` is a Windows absolute path, and `dotdot`, `url`,
+  `vhd-diff-locator-unc` is a Windows absolute path, and `url`,
   `overlong` and `conflicting` are each not found. The second half
   is the part that matters: a one-image chain alone does not distinguish
   "correctly refused" from "silently failed to resolve".
+
+  Corrected after CI: `dotdot` gives either "not found" or "outside the
+  allowlist", and which one is a property of the host rather than of
+  instar. `../../../` resolves relative to the fixture's own directory,
+  so it reaches a real `/etc/passwd` only where the testdata tree sits
+  within three levels of the root, as CI's `/testdata/` mount does;
+  every development clone is deeper and stops at "not found" first,
+  because resolution canonicalises before the allowlist is consulted.
+  Both are refusals the walk classified and named, so the test accepts
+  either for that fixture and only that fixture.
 * `instar info --chain` on a differencing child whose parent has been
   moved away reports a one-image chain and exits 0.
 * Every one of the nine composing call sites in F6 passes the composing

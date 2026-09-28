@@ -102,7 +102,7 @@ ADVERSARIAL_LOCATOR_FIXTURES = (
     ('vhd-diff-locator-conflicting', 'conflict-parent-name.vhd'),
 )
 
-# The stderr reason the reporting walk gives for each fixture above,
+# The stderr reasons the reporting walk may give for each fixture above,
 # from `UnresolvedParent::describe` (`src/vmm/src/main.rs`). A one-image
 # chain alone cannot tell "the allowlist correctly rejected this" apart
 # from "resolution silently failed", and these six fixtures do not all
@@ -114,19 +114,34 @@ ADVERSARIAL_LOCATOR_FIXTURES = (
 #   family exists to exercise.
 # * the UNC path is classified as a Windows absolute path before the
 #   allowlist is even consulted.
-# * the traversal, URL, overlong and conflicting-name fixtures all name
-#   something that plain path resolution never finds beside the child, so
-#   they end at "was not found" rather than at the allowlist.
+# * the URL, overlong and conflicting-name fixtures all name something
+#   that plain path resolution never finds beside the child, so they end
+#   at "was not found" rather than at the allowlist.
+# * the traversal fixture gives either, and which one is a fact about the
+#   host rather than about instar. `../../../` is resolved relative to the
+#   fixture's own directory, so it reaches a real `/etc/passwd` -- and the
+#   allowlist -- only where the testdata tree sits within three levels of
+#   the root, as CI's `/testdata/` mount does. A deeper checkout, which is
+#   every development clone, traverses to a path that does not exist and
+#   stops at "was not found" first, because resolution canonicalises
+#   before the allowlist is consulted. Both are refusals the walk
+#   classified and named, which is the whole point of pinning them, so
+#   the values here are tuples and the traversal fixture carries both.
 ADVERSARIAL_LOCATOR_REASONS = {
-    'vhd-diff-locator-etc-passwd': "parent '/etc/passwd' is outside the backing file allowlist",
-    'vhd-diff-locator-dotdot': "parent '../../../etc/passwd' was not found",
+    'vhd-diff-locator-etc-passwd': (
+        "parent '/etc/passwd' is outside the backing file allowlist",
+    ),
+    'vhd-diff-locator-dotdot': (
+        "parent '../../../etc/passwd' was not found",
+        "parent '../../../etc/passwd' is outside the backing file allowlist",
+    ),
     'vhd-diff-locator-unc': (
         "parent '\\\\attacker\\share\\probe' is a Windows absolute path and cannot be "
-        "resolved on this host"
+        "resolved on this host",
     ),
-    'vhd-diff-locator-url': "parent 'http://attacker.example/probe' was not found",
-    'vhd-diff-locator-overlong': 'was not found',
-    'vhd-diff-locator-conflicting': "parent 'conflict-parent-name.vhd' was not found",
+    'vhd-diff-locator-url': ("parent 'http://attacker.example/probe' was not found",),
+    'vhd-diff-locator-overlong': ('was not found',),
+    'vhd-diff-locator-conflicting': ("parent 'conflict-parent-name.vhd' was not found",),
 }
 
 # The subset with a real, resolvable parent. Used where the test needs
@@ -1009,9 +1024,10 @@ class TestDifferencingAdversarialLocators(DifferencingTestBase):
         one-image chain by itself does not distinguish "the allowlist
         correctly rejected this" from "resolution silently failed", which
         is exactly the same shape of bug either way. So this test also
-        pins the stderr reason the reporting walk gives for each
-        fixture (`ADVERSARIAL_LOCATOR_REASONS`): the chain stays one image
-        long *for the right reason*, not by accident.
+        pins the stderr reason the reporting walk gives for each fixture
+        against `ADVERSARIAL_LOCATOR_REASONS`, whose comment explains why
+        one of the six admits two reasons: the chain stays one image long
+        *for the right reason*, not by accident.
         """
         for image_id, expected in ADVERSARIAL_LOCATOR_FIXTURES:
             with self.subTest(image=image_id):
@@ -1032,13 +1048,14 @@ class TestDifferencingAdversarialLocators(DifferencingTestBase):
                     f'{image_id}: expected the locator to be reported '
                     f'verbatim; stdout={stdout!r}'
                 )
-                expected_reason = ADVERSARIAL_LOCATOR_REASONS[image_id]
-                self.assertIn(
-                    expected_reason, stderr,
-                    f'{image_id}: expected the reason {expected_reason!r} on '
-                    f'stderr -- a one-image chain alone cannot show the '
-                    f'allowlist (or the classifier) did the rejecting rather '
-                    f'than resolution silently failing; stderr={stderr!r}'
+                expected_reasons = ADVERSARIAL_LOCATOR_REASONS[image_id]
+                self.assertTrue(
+                    any(reason in stderr for reason in expected_reasons),
+                    f'{image_id}: expected one of the reasons '
+                    f'{expected_reasons!r} on stderr -- a one-image chain '
+                    f'alone cannot show the allowlist (or the classifier) '
+                    f'did the rejecting rather than resolution silently '
+                    f'failing; stderr={stderr!r}'
                 )
 
     def test_info_json_names_the_parent_as_a_vhd(self):
