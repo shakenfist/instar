@@ -3121,6 +3121,50 @@ fn print_backing_chain(chain: &BackingChain) {
     }
 }
 
+/// Print the backing chain as a JSON array, one object per chain
+/// member, matching the shape of `qemu-img info --backing-chain
+/// --output json`.
+///
+/// Key names mirror the non-chain `--output json` path's object (see
+/// the `filename`, `format`, `virtual-size`, `actual-size` and
+/// `cluster-size` keys built above) so the two JSON forms of this tool
+/// agree on what the same field means. `backing-filename` reuses that
+/// same key from the non-chain path too, and carries the unresolved
+/// reference exactly as the image's own header reports it -- the
+/// resolved path, when the walk followed it, is the next element's
+/// `filename` instead.
+fn print_backing_chain_json(chain: &BackingChain) {
+    if chain.images().is_empty() {
+        println!("[]");
+        return;
+    }
+    let mut objects: Vec<String> = Vec::with_capacity(chain.images().len());
+    for image in chain.images() {
+        let mut fields = vec![
+            format!(
+                "        \"filename\": \"{}\"",
+                json_escape(&image.path.display().to_string())
+            ),
+            format!("        \"format\": \"{}\"", image.format),
+            format!("        \"virtual-size\": {}", image.virtual_size),
+            format!("        \"actual-size\": {}", image.actual_size),
+        ];
+        if image.cluster_size > 0 {
+            fields.push(format!("        \"cluster-size\": {}", image.cluster_size));
+        }
+        if let Some(backing) = &image.backing_file_raw {
+            fields.push(format!(
+                "        \"backing-filename\": \"{}\"",
+                json_escape(backing)
+            ));
+        }
+        objects.push(format!("    {{\n{}\n    }}", fields.join(",\n")));
+    }
+    println!("[");
+    println!("{}", objects.join(",\n"));
+    println!("]");
+}
+
 /// Write device info entries for a single backing chain to guest memory.
 ///
 /// Writes ChainDeviceInfo entries starting at `devices_base + start_idx * 32`.
@@ -10652,7 +10696,11 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
             ChainUse::Report,
         ) {
             Ok(chain) => {
-                print_backing_chain(&chain);
+                if args.output == "json" {
+                    print_backing_chain_json(&chain);
+                } else {
+                    print_backing_chain(&chain);
+                }
                 return Ok(());
             }
             Err(e) => {
