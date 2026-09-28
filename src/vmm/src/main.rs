@@ -971,6 +971,196 @@ mod guest_exception_tests {
     }
 }
 
+#[cfg(test)]
+mod differencing_parent_classification_tests {
+    //! Tests for the classification helpers a reporting caller uses to
+    //! walk a differencing VHD/VHDX parent without opening a KVM guest:
+    //! `is_windows_absolute_reference`, `resolve_reported_parent`, and
+    //! the `UnresolvedParent` reasons they produce. `ChainUse` itself is
+    //! exercised only at the enum level here -- `discover_backing_chain`
+    //! launches a guest, so the gate it selects is left to the Python
+    //! integration tests.
+    use super::*;
+    use tempfile::TempDir;
+
+    fn default_security_config() -> config::SecurityConfig {
+        config::SecurityConfig::default()
+    }
+
+    // --- ChainUse -----------------------------------------------------
+
+    #[test]
+    fn chain_use_variants_are_copy_and_distinct() {
+        let compose = ChainUse::Compose;
+        let report = ChainUse::Report;
+        // `Copy`: reading `compose` again after this binding must not
+        // be a move.
+        let compose_again = compose;
+        assert_eq!(compose, compose_again);
+        assert_ne!(compose, report);
+    }
+
+    // --- is_windows_absolute_reference ---------------------------------
+
+    #[test]
+    fn windows_absolute_reference_true_cases() {
+        assert!(is_windows_absolute_reference(r"C:\images\parent.vhdx"));
+        assert!(is_windows_absolute_reference(r"z:\p.vhdx"));
+        assert!(is_windows_absolute_reference(
+            r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\p.vhdx"
+        ));
+        assert!(is_windows_absolute_reference(r"\\server\share\p.vhdx"));
+        // Boundary: the shortest possible drive-letter root.
+        assert!(is_windows_absolute_reference(r"C:\"));
+    }
+
+    #[test]
+    fn windows_absolute_reference_false_cases() {
+        assert!(!is_windows_absolute_reference("parent.vhdx"));
+        assert!(!is_windows_absolute_reference("../sub/parent.vhdx"));
+        assert!(!is_windows_absolute_reference("/abs/parent.vhdx"));
+        assert!(!is_windows_absolute_reference(""));
+        assert!(!is_windows_absolute_reference("C:"));
+        assert!(!is_windows_absolute_reference("C:/unix/style"));
+        // Shorter than three bytes: nothing at index 2 to check.
+        assert!(!is_windows_absolute_reference("C"));
+        assert!(!is_windows_absolute_reference("ab"));
+        // A digit is not a drive letter.
+        assert!(!is_windows_absolute_reference(r"1:\foo"));
+        // Two letters before the colon is not a single-letter drive.
+        assert!(!is_windows_absolute_reference(r"CC:\foo"));
+        // A semicolon is not a colon.
+        assert!(!is_windows_absolute_reference(r"C;\foo"));
+        // The check is byte-based, not character-based: a non-ASCII
+        // lead byte must not be mistaken for a drive letter.
+        assert!(!is_windows_absolute_reference("\u{e9}:\\foo"));
+    }
+
+    // --- resolve_reported_parent: Windows-absolute classification ------
+
+    #[test]
+    fn windows_absolute_parent_is_classified_not_missing() {
+        let tmp = TempDir::new().unwrap();
+        let child = tmp.path().join("child.vhdx");
+        std::fs::write(&child, b"").unwrap();
+        let config = default_security_config();
+
+        // The reference cannot exist on this host and is not under any
+        // allowlist entry either; if either of those checks ran first
+        // the result would be NotFound or OutsideAllowlist instead.
+        let result = resolve_reported_parent(&child, r"C:\images\parent.vhdx", &config, 0, &[]);
+
+        assert_eq!(result, Err(UnresolvedParent::WindowsAbsolutePath));
+    }
+
+    #[test]
+    fn windows_check_precedes_depth_and_filesystem_checks() {
+        let tmp = TempDir::new().unwrap();
+        let child = tmp.path().join("child.vhdx");
+        std::fs::write(&child, b"").unwrap();
+        // A depth limit that fails immediately: if the depth check ran
+        // before the Windows check, this would report TooDeep instead.
+        let config = config::SecurityConfig {
+            max_chain_depth: Some(0),
+            ..Default::default()
+        };
+
+        let result = resolve_reported_parent(&child, r"C:\images\parent.vhdx", &config, 0, &[]);
+
+        assert_eq!(result, Err(UnresolvedParent::WindowsAbsolutePath));
+    }
+
+    // --- resolve_reported_parent: each other reason --------------------
+
+    #[test]
+    fn parent_outside_allowlist_is_classified_as_such() {
+        let child_dir = TempDir::new().unwrap();
+        let other_dir = TempDir::new().unwrap();
+        let child = child_dir.path().join("child.vhdx");
+        std::fs::write(&child, b"").unwrap();
+        // Exists, but under `other_dir`, not the child's own directory
+        // -- the only entry the default allowlist grants.
+        let outside = other_dir.path().join("parent.vhdx");
+        std::fs::write(&outside, b"").unwrap();
+        let config = default_security_config();
+
+        let result = resolve_reported_parent(&child, outside.to_str().unwrap(), &config, 0, &[]);
+
+        assert_eq!(result, Err(UnresolvedParent::OutsideAllowlist));
+    }
+
+    #[test]
+    fn missing_parent_is_classified_not_found() {
+        let tmp = TempDir::new().unwrap();
+        let child = tmp.path().join("child.vhdx");
+        std::fs::write(&child, b"").unwrap();
+        let config = default_security_config();
+
+        let result = resolve_reported_parent(&child, "does-not-exist.vhdx", &config, 0, &[]);
+
+        assert_eq!(result, Err(UnresolvedParent::NotFound));
+    }
+
+    #[test]
+    fn depth_at_the_limit_is_classified_too_deep() {
+        let tmp = TempDir::new().unwrap();
+        let child = tmp.path().join("child.vhdx");
+        std::fs::write(&child, b"").unwrap();
+        let config = config::SecurityConfig {
+            max_chain_depth: Some(1),
+            ..Default::default()
+        };
+
+        // depth_after_child already at the limit: the next hop would
+        // exceed it. The reference need not exist -- the depth check
+        // runs before any filesystem access.
+        let result = resolve_reported_parent(&child, "parent.vhdx", &config, 1, &[]);
+
+        assert_eq!(result, Err(UnresolvedParent::TooDeep));
+    }
+
+    #[test]
+    fn already_seen_parent_is_classified_circular() {
+        let tmp = TempDir::new().unwrap();
+        let child = tmp.path().join("child.vhdx");
+        std::fs::write(&child, b"").unwrap();
+        let parent = tmp.path().join("parent.vhdx");
+        std::fs::write(&parent, b"").unwrap();
+        let config = default_security_config();
+        let seen = vec![parent.canonicalize().unwrap()];
+
+        let result = resolve_reported_parent(&child, "parent.vhdx", &config, 0, &seen);
+
+        assert_eq!(result, Err(UnresolvedParent::Circular));
+    }
+
+    // --- UnresolvedParent::describe -------------------------------------
+
+    #[test]
+    fn describe_strings_are_distinct_and_nonempty() {
+        let variants = [
+            UnresolvedParent::WindowsAbsolutePath,
+            UnresolvedParent::OutsideAllowlist,
+            UnresolvedParent::NotFound,
+            UnresolvedParent::TooDeep,
+            UnresolvedParent::Circular,
+            UnresolvedParent::Unresolvable,
+        ];
+        let descriptions: Vec<&'static str> = variants.iter().map(|v| v.describe()).collect();
+
+        for d in &descriptions {
+            assert!(!d.is_empty());
+        }
+
+        let unique: std::collections::HashSet<&str> = descriptions.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            descriptions.len(),
+            "describe() strings must be distinct: {descriptions:?}"
+        );
+    }
+}
+
 /// Serial transmitter for sending config to guest
 struct SerialTransmitter {
     buffer: Vec<u8>,
@@ -2501,6 +2691,130 @@ fn execute_info_operation(
     captured_result.ok_or_else(|| "No info result received from guest".into())
 }
 
+/// What the caller will do with the chain it asks for.
+///
+/// A differencing VHD or VHDX parent is resolved only for
+/// `Report`. `Compose` callers get the child alone, so their
+/// refusal cannot depend on whether the parent exists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChainUse {
+    /// The caller goes on to attach the chain as virtio devices and
+    /// launch a guest.
+    Compose,
+    /// The caller only prints the chain and returns.
+    Report,
+}
+
+/// Why a reporting walk could not resolve a differencing parent.
+///
+/// A reporting caller prints the chain and returns; it opens nothing
+/// beyond what it has already listed. So an unresolvable parent ends
+/// the listing rather than failing the command, and the reason is
+/// named on stderr so a user with a broken chain learns which of these
+/// happened. A composing caller never constructs one of these: it
+/// propagates every error instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnresolvedParent {
+    /// The reference is a Windows absolute path -- a drive-letter path
+    /// or a `\\`-rooted UNC or volume path. VHDX reports the
+    /// `absolute_win32_path` and `volume_path` locator keys verbatim,
+    /// by design, and there is no correct way to turn one into a host
+    /// path: a drive letter names a volume this host has no mapping
+    /// for. Rewriting one into POSIX convention would invent a host
+    /// path and then hand that invention to the allowlist check, so
+    /// the walk stops instead.
+    WindowsAbsolutePath,
+    /// The reference resolved to a path outside the backing file
+    /// allowlist. The check ran and rejected it; nothing was opened.
+    OutsideAllowlist,
+    /// The reference names no file on this host.
+    NotFound,
+    /// Following the reference would exceed the maximum chain depth.
+    TooDeep,
+    /// The reference points back at an image already in the chain.
+    Circular,
+    /// The reference names something that could not be resolved for
+    /// any other reason -- a permission error on a path component, say.
+    Unresolvable,
+}
+
+impl UnresolvedParent {
+    /// The stderr phrasing for this reason.
+    ///
+    /// Each one is distinct, because callers and tests need to tell
+    /// them apart: a chain that stopped because the allowlist rejected
+    /// the parent and a chain that stopped because resolution quietly
+    /// failed produce the same one-image listing, and only the reason
+    /// says which happened.
+    fn describe(self) -> &'static str {
+        match self {
+            UnresolvedParent::WindowsAbsolutePath => {
+                "is a Windows absolute path and cannot be resolved on this host"
+            }
+            UnresolvedParent::OutsideAllowlist => "is outside the backing file allowlist",
+            UnresolvedParent::NotFound => "was not found",
+            UnresolvedParent::TooDeep => "would exceed the maximum backing chain depth",
+            UnresolvedParent::Circular => "is already in the chain (circular reference)",
+            UnresolvedParent::Unresolvable => "could not be resolved",
+        }
+    }
+}
+
+/// Is this parent reference a Windows absolute path?
+///
+/// True for a drive-letter path (`C:\images\parent.vhdx`, the VHDX
+/// `absolute_win32_path` locator key) and for anything rooted at `\\`
+/// (`\\?\Volume{GUID}\...`, the `volume_path` key, and plain UNC
+/// shares). Both keys reach the host verbatim, in Windows convention,
+/// because that is what the image says and `info` prints what the
+/// image says.
+///
+/// This is a *classification*, never a conversion. The caller uses the
+/// answer to stop walking, and builds no host path from the value. The
+/// VHDX `relative_path` key does not arrive in Windows convention at
+/// all -- the guest renders it into POSIX before reporting it -- so a
+/// `.\parent.vhdx` locator reaches the host as `parent.vhdx` and
+/// resolves like any other relative name.
+fn is_windows_absolute_reference(reference: &str) -> bool {
+    if reference.starts_with(r"\\") {
+        return true;
+    }
+    let bytes = reference.as_bytes();
+    bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\'
+}
+
+/// Resolve a differencing parent for a caller that only reports the
+/// chain, classifying each failure rather than propagating it.
+///
+/// `depth_after_child` is the chain length with the child already
+/// pushed, which is exactly what the next iteration's depth check
+/// would see; checking it here turns the walk's own limit into a
+/// termination reason instead of an error.
+fn resolve_reported_parent(
+    child: &Path,
+    reference: &str,
+    security_config: &config::SecurityConfig,
+    depth_after_child: usize,
+    seen_paths: &[std::path::PathBuf],
+) -> Result<std::path::PathBuf, UnresolvedParent> {
+    if is_windows_absolute_reference(reference) {
+        return Err(UnresolvedParent::WindowsAbsolutePath);
+    }
+    if check_chain_depth(depth_after_child, security_config).is_err() {
+        return Err(UnresolvedParent::TooDeep);
+    }
+    let resolved =
+        validate_backing_path(child, reference, security_config).map_err(|e| match e {
+            ChainError::BackingFileNotAllowed { .. } => UnresolvedParent::OutsideAllowlist,
+            ChainError::BackingFileNotFound(_) => UnresolvedParent::NotFound,
+            _ => UnresolvedParent::Unresolvable,
+        })?;
+    if check_circular_reference(&resolved, seen_paths).is_err() {
+        return Err(UnresolvedParent::Circular);
+    }
+    Ok(resolved)
+}
+
 /// Discover the complete backing file chain for an image.
 ///
 /// This function iteratively runs the sandboxed info operation to discover
@@ -2512,6 +2826,7 @@ fn execute_info_operation(
 /// * `top_image` - Path to the top-level image
 /// * `sector_size` - Sector size for virtio-block devices
 /// * `security_config` - Security configuration with path allowlist
+/// * `chain_use` - What the caller will do with the discovered chain
 ///
 /// # Returns
 ///
@@ -2520,6 +2835,7 @@ fn discover_backing_chain(
     top_image: &Path,
     sector_size: u32,
     security_config: &config::SecurityConfig,
+    chain_use: ChainUse,
 ) -> Result<BackingChain, ChainError> {
     let mut chain = BackingChain::new();
     let mut seen_paths: Vec<std::path::PathBuf> = Vec::new();
@@ -2673,43 +2989,91 @@ fn discover_backing_chain(
         // Check for backing file
         match info_result.backing_file {
             Some(backing_path) => {
-                // A differencing VHD or VHDX parent is deliberately NOT
-                // walked. Nothing in instar can compose a VHD or VHDX chain
-                // yet -- every read entry point refuses such a source by
-                // name (PLAN-differencing phase 4) -- so resolving the
-                // parent here can only change *which* failure the user
-                // sees, never whether the read succeeds.
+                // A differencing VHD or VHDX parent is walked only for a
+                // caller that is going to report the chain. A caller that
+                // composes one -- attaches every chain member as a virtio
+                // device and launches a guest -- stops here instead, with
+                // the parent left in `backing_file_raw` so it is still
+                // reported but never resolved.
                 //
-                // Walking it actively makes that failure worse, in two
-                // ways. A VHDX parent locator holds a Windows-style
-                // relative path (`.\parent.vhdx`), which does not resolve
-                // on POSIX, so discovery died with "Backing file not found"
-                // before the guest ever ran. And more seriously, the
-                // outcome became contingent on the parent's presence: the
-                // same differencing image gave the typed refusal when its
+                // Nothing in instar can compose a VHD or VHDX chain yet:
+                // every read entry point refuses such a source by name,
+                // before any parent matters. Resolving the parent for
+                // those callers could only change *which* failure the user
+                // sees, never whether the read succeeds -- and it would
+                // make that failure worse, because the outcome would become
+                // contingent on the parent's presence. The same
+                // differencing image would give the typed refusal when its
                 // parent happened to sit beside it and a path error when it
                 // did not. A refusal that depends on a file instar is not
-                // going to read is not a refusal.
+                // going to read is not a refusal, so a composing caller
+                // must never resolve a parent it will not read.
                 //
-                // So the chain stops here, with the parent recorded in
-                // `backing_file_raw` (so `instar info` still reports it)
-                // but not resolved, and the guest refuses the source with
-                // the same message either way. This is temporary and
-                // per-format: phase 14 lifts it operation by operation as
-                // composition lands. qcow2 and VMDK chains compose today
-                // and are untouched.
-                if matches!(image_format, ImageFormat::Vhd | ImageFormat::Vhdx) {
-                    debug!(
-                        "Differencing {} parent not walked (composition deferred): {}",
-                        info_result.format, backing_path
-                    );
-                    break;
-                }
+                // A reporting caller has no refusal to make contingent, so
+                // it resolves the parent under the same allowlist and depth
+                // rules qcow2 and VMDK chains already take -- but it treats
+                // a failure as the end of the listing rather than as an
+                // error. `info` reports and refuses nothing, so a missing,
+                // disallowed, too-deep or unresolvable parent must not turn
+                // a listing into a non-zero exit; the walk stops at the last
+                // image it did resolve, the unresolved reference stays in
+                // that image's `backing_file_raw` so it is still printed,
+                // and the reason goes to stderr. Nothing is weakened by
+                // this: the allowlist check still runs and still rejects,
+                // and no rejected path is ever opened.
+                //
+                // The fail-soft is confined to VHD and VHDX. A qcow2 or
+                // VMDK chain still errors on an unresolvable parent for
+                // every caller, reporting ones included, because those
+                // formats compose: a listing that quietly stopped short
+                // would disagree with what the very next `convert` of the
+                // same image does, and the error is the older, tested
+                // behaviour of both `info --chain` and every operation
+                // beside it.
+                let differencing_vhd = matches!(image_format, ImageFormat::Vhd | ImageFormat::Vhdx);
 
-                // Validate and resolve the backing file path
-                let backing_resolved =
-                    validate_backing_path(&current, &backing_path, security_config)?;
-                current = backing_resolved;
+                match (chain_use, differencing_vhd) {
+                    // Composing caller, differencing VHD or VHDX: the
+                    // parent is recorded but never resolved.
+                    (ChainUse::Compose, true) => {
+                        debug!(
+                            "Differencing {} parent not walked (composition deferred): {}",
+                            info_result.format, backing_path
+                        );
+                        break;
+                    }
+                    // Reporting caller, differencing VHD or VHDX: resolve
+                    // it, and end the listing rather than the command if
+                    // that cannot be done.
+                    (ChainUse::Report, true) => {
+                        match resolve_reported_parent(
+                            &current,
+                            &backing_path,
+                            security_config,
+                            chain.len(),
+                            &seen_paths,
+                        ) {
+                            Ok(backing_resolved) => current = backing_resolved,
+                            Err(reason) => {
+                                eprintln!(
+                                    "instar: backing chain stops at {}: parent '{}' {}",
+                                    current.display(),
+                                    backing_path,
+                                    reason.describe()
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    // Every other format, for every caller: unchanged.
+                    // Validate and resolve the backing file path, and
+                    // propagate any error.
+                    (_, false) => {
+                        let backing_resolved =
+                            validate_backing_path(&current, &backing_path, security_config)?;
+                        current = backing_resolved;
+                    }
+                }
             }
             None => {
                 // No backing file - end of chain
@@ -4615,6 +4979,7 @@ fn run_bench(args: &BenchArgs, verbose: bool) -> Result<(), Box<dyn std::error::
         Path::new(&invocation.filename),
         sector_size,
         &security_config,
+        ChainUse::Compose,
     )
     .map_err(|e| {
         format!(
@@ -6468,8 +6833,13 @@ fn run_rebase(args: RebaseArgs, verbose: bool) -> Result<(), Box<dyn std::error:
     let security_config = config::SecurityConfig::default();
     let sector_size = 512u32;
 
-    let old_chain_full = discover_backing_chain(overlay_path, sector_size, &security_config)
-        .map_err(|e| -> Box<dyn std::error::Error> { format!("rebase: {e}").into() })?;
+    let old_chain_full = discover_backing_chain(
+        overlay_path,
+        sector_size,
+        &security_config,
+        ChainUse::Compose,
+    )
+    .map_err(|e| -> Box<dyn std::error::Error> { format!("rebase: {e}").into() })?;
     let old_chain_images = old_chain_full.images();
     let old_chain_parent_count = if old_chain_images.is_empty() {
         0
@@ -6480,7 +6850,7 @@ fn run_rebase(args: RebaseArgs, verbose: bool) -> Result<(), Box<dyn std::error:
     // Discover the new chain (only if not detaching).
     let new_chain_full = if let Some(ref p) = resolved_new_backing {
         Some(
-            discover_backing_chain(p, sector_size, &security_config)
+            discover_backing_chain(p, sector_size, &security_config, ChainUse::Compose)
                 .map_err(|e| -> Box<dyn std::error::Error> { format!("rebase: {e}").into() })?,
         )
     } else {
@@ -6825,9 +7195,13 @@ fn run_commit(args: CommitArgs, verbose: bool) -> Result<(), Box<dyn std::error:
     // mode something to consume.
     let security_config = config::SecurityConfig::default();
     let sector_size = 512u32;
-    let backing_chain_full =
-        discover_backing_chain(&resolved_backing_path, sector_size, &security_config)
-            .map_err(|e| -> Box<dyn std::error::Error> { format!("commit: {e}").into() })?;
+    let backing_chain_full = discover_backing_chain(
+        &resolved_backing_path,
+        sector_size,
+        &security_config,
+        ChainUse::Compose,
+    )
+    .map_err(|e| -> Box<dyn std::error::Error> { format!("commit: {e}").into() })?;
     let backing_chain_images = backing_chain_full.images();
     let backing_parents = if backing_chain_images.is_empty() {
         BackingChain::new()
@@ -10271,7 +10645,12 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
         let input_path = Path::new(&args.input);
         let security_config = config::load_config().config.security;
 
-        match discover_backing_chain(input_path, args.sector_size, &security_config) {
+        match discover_backing_chain(
+            input_path,
+            args.sector_size,
+            &security_config,
+            ChainUse::Report,
+        ) {
             Ok(chain) => {
                 print_backing_chain(&chain);
                 return Ok(());
@@ -11209,7 +11588,12 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
     let force_chain_for_descriptor = peek_is_vmdk_descriptor(input_path).unwrap_or(false);
     let chain = if args.chain || force_chain_for_descriptor {
         let security_config = config::load_config().config.security;
-        match discover_backing_chain(input_path, args.sector_size, &security_config) {
+        match discover_backing_chain(
+            input_path,
+            args.sector_size,
+            &security_config,
+            ChainUse::Compose,
+        ) {
             Ok(chain) => {
                 if verbose {
                     print_backing_chain(&chain);
@@ -11949,18 +12333,26 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
 
     // Discover backing chains for both images (includes format detection)
     let security_config = config::load_config().config.security;
-    let chain1 =
-        discover_backing_chain(Path::new(&args.image1), args.sector_size, &security_config)
-            .map_err(|e| match &e {
-                ChainError::UnsupportedInputFormat(_) => format!("compare: {e}"),
-                _ => format!("error discovering backing chain for {}: {}", args.image1, e),
-            })?;
-    let chain2 =
-        discover_backing_chain(Path::new(&args.image2), args.sector_size, &security_config)
-            .map_err(|e| match &e {
-                ChainError::UnsupportedInputFormat(_) => format!("compare: {e}"),
-                _ => format!("error discovering backing chain for {}: {}", args.image2, e),
-            })?;
+    let chain1 = discover_backing_chain(
+        Path::new(&args.image1),
+        args.sector_size,
+        &security_config,
+        ChainUse::Compose,
+    )
+    .map_err(|e| match &e {
+        ChainError::UnsupportedInputFormat(_) => format!("compare: {e}"),
+        _ => format!("error discovering backing chain for {}: {}", args.image1, e),
+    })?;
+    let chain2 = discover_backing_chain(
+        Path::new(&args.image2),
+        args.sector_size,
+        &security_config,
+        ChainUse::Compose,
+    )
+    .map_err(|e| match &e {
+        ChainError::UnsupportedInputFormat(_) => format!("compare: {e}"),
+        _ => format!("error discovering backing chain for {}: {}", args.image2, e),
+    })?;
 
     if verbose {
         debug!("Image 1 chain ({} image(s)):", chain1.len());
@@ -12789,14 +13181,19 @@ fn execute_convert(
 
     // Discover input backing chain
     let security_config = config::load_config().config.security;
-    let chain = discover_backing_chain(Path::new(&exec.input), exec.sector_size, &security_config)
-        .map_err(|e| match &e {
-            // `execute_convert` is shared by convert and dd, but dd runs
-            // its own chain discovery first (and refuses there with a
-            // `dd:` prefix), so a refusal reaching this point is convert's.
-            ChainError::UnsupportedInputFormat(_) => format!("convert: {e}"),
-            _ => format!("error discovering backing chain for {}: {}", exec.input, e),
-        })?;
+    let chain = discover_backing_chain(
+        Path::new(&exec.input),
+        exec.sector_size,
+        &security_config,
+        ChainUse::Compose,
+    )
+    .map_err(|e| match &e {
+        // `execute_convert` is shared by convert and dd, but dd runs
+        // its own chain discovery first (and refuses there with a
+        // `dd:` prefix), so a refusal reaching this point is convert's.
+        ChainError::UnsupportedInputFormat(_) => format!("convert: {e}"),
+        _ => format!("error discovering backing chain for {}: {}", exec.input, e),
+    })?;
 
     if verbose {
         debug!("Input chain ({} image(s)):", chain.len());
@@ -14215,14 +14612,19 @@ fn run_dd(args: DdArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>>
         );
     }
     let security_config = config::load_config().config.security;
-    let chain = discover_backing_chain(Path::new(&parsed.input), sector_size, &security_config)
-        .map_err(|e| match &e {
-            ChainError::UnsupportedInputFormat(_) => format!("dd: {e}"),
-            _ => format!(
-                "error discovering backing chain for {}: {}",
-                parsed.input, e
-            ),
-        })?;
+    let chain = discover_backing_chain(
+        Path::new(&parsed.input),
+        sector_size,
+        &security_config,
+        ChainUse::Compose,
+    )
+    .map_err(|e| match &e {
+        ChainError::UnsupportedInputFormat(_) => format!("dd: {e}"),
+        _ => format!(
+            "error discovering backing chain for {}: {}",
+            parsed.input, e
+        ),
+    })?;
     let virtual_size = chain.images()[0].virtual_size;
 
     let win = compute_dd_window(virtual_size, parsed.bs, parsed.count, parsed.skip);
