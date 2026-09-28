@@ -61,9 +61,13 @@ see `TestDifferencingParentAbsent` (`tests/test_differencing.py:609`).
   3.
 * The read-side rows of `docs/format-coverage.md` and the compose
   sections of `docs/chain-config.md`, which stay with phase 16.
-* Three defects the survey found. None is this phase's to fix and each
-  is recorded under *What the survey found* with an issue: the silent
-  chain-device truncation, #565, and #566.
+* Four defects, none of them this phase's to fix. Two were found by
+  this survey and filed during it: the silent chain-device truncation
+  (#601) and the VHD locator-table resolution gap (#602). Two were
+  already open and are recorded here because composition depends on
+  them: #565, where `resize` grows a differencing VHDX without its
+  parent, and #566, which makes parent identity vacuous for any chain
+  instar wrote end to end -- see decision 5.
 
 ## What the survey found
 
@@ -209,7 +213,7 @@ bodies, where `execute_convert` does (`:12809`). There is also a second
 `MAX_CHAIN_DEVICES` defined locally in the VMM (`:331`) shadowing
 `shared::MAX_CHAIN_DEVICES` (`src/shared/src/lib.rs:4725`); both are 16
 today. **Pre-existing, affects qcow2 and VMDK now, and out of scope.**
-File it (step 11f) rather than fixing it here.
+File it (step 11f, #601) rather than fixing it here.
 
 **F11. The tests that pin the current boundary already exist and say
 so.** `test_info_chain_stops_at_a_vhd_parent`
@@ -297,7 +301,7 @@ unchecked.
 the VHD spec's designated mechanism and `W2ru` is what Windows actually
 writes, so a third-party child with an empty unicode name and a valid
 locator will resolve under Hyper-V and not under instar. That is a
-genuine gap. It is recorded as future work with an issue (step 11f)
+genuine gap. It is recorded as future work with an issue (step 11f, #602)
 rather than guessed at here, and the fixtures to settle it already exist
 in `instar-testdata/custom/audit/`.
 
@@ -359,12 +363,13 @@ each other.
 
 | Step | Effort | Model | Isolation | Brief for sub-agent |
 |------|--------|-------|-----------|---------------------|
-| 11a | high | opus | none | Replace the VHD/VHDX gate with a walk policy. Add a two-variant enum (decision 1 -- name the variants for what the caller does with the chain, e.g. one for callers that go on to attach devices and launch a guest, one for callers that only report) and a parameter for it on `discover_backing_chain` (`src/vmm/src/main.rs:2519`). At `:2701-2707`, keep the existing `break` for the composing variant and fall through to `validate_backing_path` for the reporting variant. Update all ten call sites listed in F6: only `run_info`'s `--chain` branch (`:10274`) passes the reporting variant; the other nine pass composing, including `run_check` (`:11212`), which composes despite being a `--chain` flag -- it opens devices at `:11336` and writes the chain config at `:11347`. Rewrite the gate's comment: its first rationale is false since `7733730` (see F4) and it cites a plan phase, which this repo does not allow in landed code (issue #592, and `~/.claude/CLAUDE.md`) -- state the invariant instead of citing where it was decided. Do not implement decision 2's fail-soft behaviour yet; this step only moves the decision point, and `validate_backing_path` errors are still propagated. The tree must build and the whole Python suite must pass unchanged after this step, because no reachable behaviour has changed yet: the reporting variant's new path is only taken for VHD/VHDX, and `run_info` still errors on an unresolvable parent exactly as `run_check` would have. Note that `tests/test_differencing.py:586` will now fail for the two resolvable fixtures -- that is expected and 11d updates it; say so in the commit message rather than editing the test here. |
+| 11a | high | opus | none | Replace the VHD/VHDX gate with a walk policy. Add a two-variant enum (decision 1 -- name the variants for what the caller does with the chain, e.g. one for callers that go on to attach devices and launch a guest, one for callers that only report) and a parameter for it on `discover_backing_chain` (`src/vmm/src/main.rs:2519`). At `:2701-2707`, keep the existing `break` for the composing variant and fall through to `validate_backing_path` for the reporting variant. Update all ten call sites listed in F6: only `run_info`'s `--chain` branch (`:10274`) passes the reporting variant; the other nine pass composing, including `run_check` (`:11212`), which composes despite being a `--chain` flag -- it opens devices at `:11336` and writes the chain config at `:11347`. Rewrite the gate's comment: its first rationale is false since `7733730` (see F4) and it cites a plan phase, which this repo does not allow in landed code (issue #592, and `~/.claude/CLAUDE.md`) -- state the invariant instead of citing where it was decided. Do not implement decision 2's fail-soft behaviour yet; this step only moves the decision point, and `validate_backing_path` errors are still propagated. The tree must build and the whole Python suite must pass unchanged after this step, because no reachable behaviour has changed yet: the reporting variant's new path is only taken for VHD/VHDX, and `run_info` still errors on an unresolvable parent exactly as `run_check` would have. Note that `tests/test_differencing.py:586` will now fail for the three resolvable fixtures -- that is expected and 11d updates it; say so in the commit message rather than editing the test here. |
 | 11b | high | opus | none | Make the reporting walk fail-soft, per decisions 2 and 4. In `discover_backing_chain`, under the reporting variant only, convert every `ChainError` arising from resolving a *VHD or VHDX* parent into a terminated walk that returns `Ok`: emit one `eprintln!` line naming the image, the unresolved reference and the reason, then `break`. The reasons to distinguish, because 11d asserts on them: file absent, outside the allowlist, depth limit reached, and a Windows absolute path. The last needs detecting on the host -- a value with a drive-letter prefix (`X:\`) or a `\\` prefix is `absolute_win32_path` or `volume_path` (F4, `src/operations/info/src/main.rs:1232-1249` explains which key produces which convention) and must be reported as such, never rewritten into a POSIX path (decision 4). Composing callers keep propagating every error unchanged -- this is the only thing standing between the tree and a contingent refusal, so keep the two paths textually obvious rather than clever. VHD resolves from the unicode name that `info` already reports in `backing_file`; there is no locator-table path to add (decision 3, F8). Nothing about the allowlist or depth defaults changes (decision 6). |
 | 11c | medium | sonnet | none | Rust unit tests for 11a and 11b in `src/vmm/src/main.rs`'s existing test module (find it near the existing `differencing_refusal_error_*` tests at `:945`). Cover: the policy enum selects the gate or the walk; a Windows-absolute value is classified as such rather than as a missing file; and the reason strings are distinct. Where a test would need a real KVM guest to run `execute_info_operation`, test the classification helper 11b introduced directly instead of the whole walk -- factor it out as a small pure function taking the reference string if 11b has not already. `make test-rust` must be clean; note the worktree target-ownership trap in `AGENTS.md` if cargo complains about `src/target`. |
 | 11d | medium | sonnet | none | Python integration tests in `tests/test_differencing.py`. Update `test_info_chain_stops_at_a_vhd_parent` (`:586`) to assert a two-image chain for the resolvable fixtures, renaming it for what it now asserts, and keep its docstring's habit of saying which phase owns the boundary. The fixtures are in `DIFFERENCING_CHAIN_FIXTURES`; the resolvable ones sit beside their parents in `instar-testdata/custom/format-coverage/` (`vhd-diff-child-aligned.vhd` -> `vhd-diff-parent.vhd`, `vhdx-diff-child.vhdx` -> `vhdx-diff-parent.vhdx`). Leave `test_info_reports_the_locator_without_following_it` (`:830`) asserting one image and add to it an assertion on the stderr reason, so it passes for the allowlist reason rather than passing by accident (F7, and the definition of done). Add: an orphaned child still lists one image and exits 0; and every composing operation is byte-for-byte unchanged -- extend or cite `TestDifferencingParentAbsent` (`:609`) rather than writing a new class, since it already encodes the invariant. Run the suite with `python3 -m pytest tests/test_differencing.py` or the repo's usual runner; the full suite is expected zero-fail on healthy testdata. |
 | 11e | medium | sonnet | none | Decision 7: give `info --chain` a JSON form. `InfoArgs.output` is declared at `src/vmm/src/main.rs:3617-3619`; the `--chain` branch at `:10269-10282` ignores it. Add a JSON printer beside `print_backing_chain` (`:2724`) and select on `args.output`. Match `qemu-img info --backing-chain --output json`: a top-level array, one object per chain member, keys for the resolved filename, format, virtual size, actual size, cluster size where non-zero, and the unresolved backing reference where there is one. Reuse the existing `json_escape` helper (`:17899`, tested at `:20191`) rather than adding a JSON dependency -- the VMM hand-rolls its JSON elsewhere. Add an integration test asserting the output parses with `json.loads` and has one element per chain member. Keep the human form byte-identical; a test that diffs it against the current output is worth more than one that reads it. |
-| 11f | low | haiku | none | Housekeeping. (1) File three issues: the silent chain-device truncation from F10 (name `write_chain_config` at `src/vmm/src/main.rs:3041-3050`, the two unguarded callers `run_check` and `run_bench_guest`, the duplicate `MAX_CHAIN_DEVICES` at `:331` versus `src/shared/src/lib.rs:4725`, and that it affects qcow2 and VMDK today); the VHD locator-table resolution gap from decision 3; and the `--output json` gap from F9 if 11e was dropped. (2) Add a `CHANGELOG.md` entry for the walked chain and the JSON form. (3) Amend this plan's *What the survey found* with anything later steps discovered, and tick the definition of done. Do not add plan references to any source file or comment. |
+| 11f | low | haiku | none | Housekeeping. (1) File two issues: the silent chain-device truncation from F10 (#601, name `write_chain_config` at `src/vmm/src/main.rs:3041-3050`, the two unguarded callers `run_check` and `run_bench_guest`, the duplicate `MAX_CHAIN_DEVICES` at `:331` versus `src/shared/src/lib.rs:4725`, and that it affects qcow2 and VMDK today); and the VHD locator-table resolution gap from decision 3 (#602). (2) Add a `CHANGELOG.md` entry for the walked chain and the JSON form. (3) Amend this plan's *What the survey found* with anything later steps discovered, and record the issue numbers. Do not add plan references to any source file or comment. |
+| 11g | medium | sonnet | none | Rewrite `docs/chain-discovery.md`'s backing-file-support table and its Known limitations section: delete the rationale about Windows-path incompatibility that `vhdx::posix_relative_path` falsified (F4), keeping the one about refusals not becoming contingent on a parent file existing; correct `docs/info.md`'s claim at `:67-68` that `--chain` stops at one image. |
 
 ## Risks and mitigations
 
@@ -385,7 +390,10 @@ each other.
   the commit message, not asserted.
 * `instar info --chain` on each of the six fixtures in
   `ADVERSARIAL_LOCATOR_FIXTURES` reports a one-image chain, exits 0,
-  **and** writes a stderr reason naming the allowlist. The second half
+  **and** writes a stderr reason, and the reason is the correct one for
+  that fixture — `vhd-diff-locator-etc-passwd` is outside the allowlist,
+  `vhd-diff-locator-unc` is a Windows absolute path, and `dotdot`, `url`,
+  `overlong` and `conflicting` are each not found. The second half
   is the part that matters: a one-image chain alone does not distinguish
   "correctly refused" from "silently failed to resolve".
 * `instar info --chain` on a differencing child whose parent has been

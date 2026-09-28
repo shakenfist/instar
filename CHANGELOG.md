@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`instar info --chain` walks differencing VHD and VHDX parent chains.**
+  It previously stopped at the child and reported the parent reference
+  without following it. Now it walks the chain and reports each
+  parent it resolves, up to the depth limit. When a parent cannot be
+  resolved — the file is absent, the path is outside the allowlist, the
+  depth limit is reached, or the path is a Windows absolute path — the
+  walk ends at the last image it did resolve, a reason is printed to
+  stderr, and the command still exits 0. No operation that reads image
+  data changed: `convert`, `dd`, `compare`, `bench`, `check`, `measure`
+  and `map` still refuse a differencing source, and still refuse it
+  identically whether or not the parent file is present.
+
+- **`instar info --chain --output json` now produces JSON.** It
+  previously ignored the `--output` flag and printed human text. The JSON
+  form is an array of objects, matching `qemu-img info --backing-chain
+  --output json`.
+
 - **Coverage-guided fuzzing of the VHD and VHDX parent-locator read
   paths (40→42 targets).** Both were previously unreached: measurement
   showed `VhdParentInfo::parse`, `VhdParentLocatorTable::parse`,
