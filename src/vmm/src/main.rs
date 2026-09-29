@@ -3030,6 +3030,15 @@ fn discover_backing_chain(
                 // same image does, and the error is the older, tested
                 // behaviour of both `info --chain` and every operation
                 // beside it.
+                //
+                // It is confined per *hop*, not per chain, because the
+                // test below reads the format of the image being examined
+                // -- the one whose header named this parent. So a VHD
+                // parent that has a differencing parent of its own keeps
+                // failing soft, and a qcow2 reached through a VHD link
+                // reverts to hard errors from that point on. A chain is
+                // therefore not uniformly soft or hard; each step takes
+                // the policy of the image it is leaving.
                 let differencing_vhd = matches!(image_format, ImageFormat::Vhd | ImageFormat::Vhdx);
 
                 match (chain_use, differencing_vhd) {
@@ -3132,7 +3141,17 @@ fn print_backing_chain(chain: &BackingChain) {
 /// same key from the non-chain path too, and carries the unresolved
 /// reference exactly as the image's own header reports it -- the
 /// resolved path, when the walk followed it, is the next element's
-/// `filename` instead.
+/// `filename` instead. That key on the *last* element means the
+/// listing is truncated: the walk stopped before resolving it, and the
+/// reason went to stderr. A chain that ran to its end finishes on a
+/// member whose header names no parent, and that member has no such
+/// key.
+///
+/// Escaping goes through `json_escape`, not `json_escape_string`: this
+/// printer emits attacker-controlled parent references taken from
+/// image headers, and only `json_escape` escapes the whole C0 range,
+/// so a name carrying a control character cannot break the array it is
+/// rendered into.
 fn print_backing_chain_json(chain: &BackingChain) {
     if chain.images().is_empty() {
         println!("[]");

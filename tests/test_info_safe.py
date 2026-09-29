@@ -11,6 +11,8 @@ qemu-img does not need to be installed.
 
 import json
 import os
+import shutil
+import tempfile
 from pathlib import Path
 
 import testscenarios
@@ -248,6 +250,62 @@ class TestInfoChainJsonOutput(InstarTestBase):
         chain = json.loads(stdout)
         self.assertEqual('vhd-diff-parent.vhd', chain[0]['backing-filename'])
         self.assertNotIn('backing-filename', chain[1])
+
+    def test_chain_json_truncated_listing_keeps_backing_filename(self):
+        """A truncated chain's last element still names its parent.
+
+        The key is what tells a complete listing from a truncated one.
+        A chain that ran to its end finishes on a member whose header
+        names no parent, so that member has no `backing-filename`; a
+        walk that stopped early leaves the unresolved reference on the
+        last element it did list. A reader that assumed the last
+        element is always resolved would take this one-element array
+        for a standalone image rather than an orphaned child, which is
+        the opposite conclusion.
+        """
+        source = self._chain_image('vhd-diff-child-aligned')
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        orphan = Path(tmp) / Path(source).name
+        shutil.copy2(source, orphan)
+
+        stdout, stderr, rc = self.run_instar_info(
+            orphan, chain=True, output_format='json'
+        )
+        self.assertEqual(0, rc, f'a missing parent must not error; stderr={stderr!r}')
+        chain = json.loads(stdout)
+        self.assertEqual(1, len(chain), f'expected a truncated one-element chain; got {chain!r}')
+        self.assertEqual(
+            'vhd-diff-parent.vhd', chain[0]['backing-filename'],
+            f'the unresolved reference must survive on the last element: {chain!r}'
+        )
+        self.assertIn(
+            'was not found', stderr,
+            f'a truncated listing must say why on stderr; stderr={stderr!r}'
+        )
+
+    def test_chain_json_is_valid_for_a_hostile_parent_reference(self):
+        """A hostile reference round-trips as JSON, escaped not rewritten.
+
+        `vhd-diff-locator-unc` names a UNC path. Its backslashes are the
+        characters most likely to produce invalid JSON if the reference
+        were interpolated rather than escaped, so this asserts the array
+        parses at all and that the value survives byte for byte --
+        neither mangled by escaping nor rewritten into a POSIX path,
+        which is what makes the reported value usable as evidence about
+        the image.
+        """
+        source = self._chain_image('vhd-diff-locator-unc')
+        stdout, stderr, rc = self.run_instar_info(
+            source, chain=True, output_format='json'
+        )
+        self.assertEqual(0, rc, f'info must not refuse; stderr={stderr!r}')
+        chain = json.loads(stdout)
+        self.assertEqual(1, len(chain), f'the walk must not follow it; got {chain!r}')
+        self.assertEqual(
+            '\\\\attacker\\share\\probe', chain[0]['backing-filename'],
+            f'the UNC reference must round-trip verbatim: {chain!r}'
+        )
 
     def test_chain_human_output_is_unchanged(self):
         """`info --chain` with no `--output` renders the pinned human text.

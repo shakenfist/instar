@@ -67,15 +67,21 @@ see `TestDifferencingParentAbsent` (`tests/test_differencing.py:609`).
   already open and are recorded here because composition depends on
   them: #565, where `resize` grows a differencing VHDX without its
   parent, and #566, which makes parent identity vacuous for any chain
-  instar wrote end to end -- see decision 5. Two more came out of the
-  review round on the pull request: #608, that the walk never checks a
-  resolved parent is the same format as its child and that errors past
-  the differencing link are not fail-soft, and #609, that image-derived
-  path strings reach the terminal unescaped in the human output forms
-  (the JSON forms escape them). #608's boundary is documented in
-  `docs/chain-discovery.md` rather than left implicit; #609 is wider
-  than this change, since the older stdout printer carries the same
-  strings.
+  instar wrote end to end -- see decision 5. Four more came out of the
+  review rounds on the pull request. Round 1: #608, that the walk never
+  checks a resolved parent is the same format as its child and that
+  errors past the differencing link are not fail-soft, and #609, that
+  image-derived path strings reach the terminal unescaped in the human
+  output forms (the JSON forms escape them). Round 2: #611, that
+  resolution probes an absolute reference before the allowlist is
+  consulted, so the stderr reason distinguishes whether an
+  attacker-chosen host path exists -- pre-existing for qcow2, but now
+  reachable from a command that exits 0; and #612, that the file carries
+  two JSON escape helpers of which only one escapes the C0 range.
+  #608's and #611's boundaries are both documented in
+  `docs/chain-discovery.md` rather than left implicit. #609 and #611 are
+  each wider than this change: the older stdout printer carries the same
+  strings, and `resolve_backing_path` is shared with qcow2 and VMDK.
 
 ## What the survey found
 
@@ -440,8 +446,9 @@ each other.
 * The two issues 11f asks for are filed, with numbers recorded in
   this plan: #601 (chain devices past `MAX_CHAIN_DEVICES` dropped with
   only a debug log) and #602 (differencing VHD parent resolution
-  ignores the locator table). The review round on the pull request
-  added two more, #608 and #609, recorded in *What the survey found*.
+  ignores the locator table). The review rounds on the pull request
+  added four more -- #608 and #609 in round 1, #611 and #612 in round
+  2 -- recorded in *What the survey found*.
 * `make lint`, `make test-rust`, the full Python suite, and
   `pre-commit run --all-files` are clean.
 

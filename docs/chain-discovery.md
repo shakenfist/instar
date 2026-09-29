@@ -59,9 +59,17 @@ array, one object per member, top image first. Key names match the
 non-chain `--output json` form: `filename`, `format`, `virtual-size`,
 `actual-size`, `cluster-size` (omitted when the format has none, as
 for raw) and `backing-filename` (the unresolved reference from that
-image's own header; omitted on the last member, which has nothing
-left to resolve). The resolved path of a followed backing file is the
-next element's `filename`, not repeated on the referencing element.
+image's own header, present on every member whose header names a
+parent). The resolved path of a followed backing file is the next
+element's `filename`, not repeated on the referencing element.
+
+`backing-filename` on the **last** element therefore means the listing
+is truncated: the walk stopped before resolving that reference, and
+the reason is on stderr. A complete chain ends on a member whose
+header names no parent, and that member has no `backing-filename`
+key. A script that treats the last element as necessarily resolved
+will read a truncated chain as a complete one — check for the key, or
+check the exit path's stderr, rather than assuming.
 
 ```
 $ instar info --chain --output json top.qcow2
@@ -272,6 +280,19 @@ Windows-absolute-path reason, never a "not found" one. A relative VHDX
 locator does not have this problem: it arrives already rendered into
 POSIX convention (`vhdx-diff-parent.vhdx`, not `.\vhdx-diff-parent.vhdx`)
 before the host ever sees it, and resolves like any other relative name.
+
+One caveat about the reasons themselves. For an *absolute* reference,
+resolution probes the filesystem before the allowlist is consulted, so
+"was not found" and "is outside the backing file allowlist" distinguish
+whether an attacker-chosen absolute host path exists. Only existence
+leaks, never content, and the allowlist still rejects — no path outside
+it is ever opened. A qcow2 chain naming an absolute backing file has
+always drawn the same distinction; what is new is that `info --chain`
+now prints it while exiting 0, so it no longer takes a failing command
+to carry the answer. If you run `instar info --chain` over untrusted
+images in a service and return its stderr to whoever supplied them,
+that is the line to withhold. Tracked as
+[issue #611](https://github.com/shakenfist/instar/issues/611).
 
 The fail-soft covers *resolving* the parent reference, and nothing
 beyond it. Once a parent resolves, it is read like any other chain

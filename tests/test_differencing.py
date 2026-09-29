@@ -825,6 +825,23 @@ class TestDifferencingParentAbsent(DifferencingTestBase):
             with self.subTest(image=image_id):
                 present = self.differencing_image(image_id)
                 orphan = self._orphaned_copy(image_id)
+
+                def anonymise(text, source, workdir):
+                    """Mask the paths that differ by construction, not by behaviour.
+
+                    The two runs necessarily read a different file and
+                    write into a different scratch directory, so an
+                    operation that named either would differ here for a
+                    reason that has nothing to do with the parent. Nothing
+                    prints them today, which is why this started as a raw
+                    comparison; masking keeps the diff strict about the
+                    invariant rather than about paths, so an operation that
+                    later names its input or its output does not turn this
+                    into a false failure. Both are masked, not just the
+                    input, because the output directory has exactly the
+                    same property.
+                    """
+                    return text.replace(str(source), '<SRC>').replace(str(workdir), '<WORKDIR>')
                 for op in composing_ops:
                     with self.subTest(image=image_id, op=op):
                         with tempfile.TemporaryDirectory() as tmp_present:
@@ -841,13 +858,15 @@ class TestDifferencingParentAbsent(DifferencingTestBase):
                                     f'the parent went missing: {p_rc} -> {a_rc}'
                                 )
                                 self.assertEqual(
-                                    p_stdout, a_stdout,
+                                    anonymise(p_stdout, present, tmp_present),
+                                    anonymise(a_stdout, orphan, tmp_orphan),
                                     f'{image_id}/{op}: stdout changed when '
                                     f'the parent went missing; present='
                                     f'{p_stdout!r} absent={a_stdout!r}'
                                 )
                                 self.assertEqual(
-                                    p_stderr, a_stderr,
+                                    anonymise(p_stderr, present, tmp_present),
+                                    anonymise(a_stderr, orphan, tmp_orphan),
                                     f'{image_id}/{op}: stderr changed when '
                                     f'the parent went missing; present='
                                     f'{p_stderr!r} absent={a_stderr!r}'
