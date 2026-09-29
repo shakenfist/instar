@@ -188,10 +188,22 @@ class TestInfoChainJsonOutput(InstarTestBase):
         a qcow2 chain: every format `discover_backing_chain` walks, not
         only the two formats this phase newly resolves a parent for.
         """
-        cases = ('vhd-diff-child-aligned', 'vhdx-diff-child', 'sf-vda')
-        for image_id in cases:
+        # The qcow2 case needs both members present. A qcow2 chain is
+        # not fail-soft, so a tree holding only the top image gives a
+        # non-zero exit rather than the skip a partial checkout should
+        # get; the VHD and VHDX children are self-describing and need
+        # no companion entry here because their parents sit beside them
+        # under the same manifest id prefix.
+        cases = (
+            ('vhd-diff-child-aligned', ()),
+            ('vhdx-diff-child', ()),
+            ('sf-vda', ('sf-vda-backing',)),
+        )
+        for image_id, companions in cases:
             with self.subTest(image=image_id):
                 source = self._chain_image(image_id)
+                for companion in companions:
+                    self._chain_image(companion)
                 stdout, stderr, rc = self.run_instar_info(
                     source, chain=True, output_format='json'
                 )
@@ -208,7 +220,11 @@ class TestInfoChainJsonOutput(InstarTestBase):
                     2, len(chain),
                     f'{image_id}: expected a two-element chain; got {chain!r}'
                 )
-                self.assertEqual(str(source), chain[0]['filename'])
+                # Chain discovery canonicalises, so the manifest path is
+                # only equal to the reported one where no component of it
+                # is a symlink. `test_chain_human_output_is_unchanged`
+                # resolves for the same reason.
+                self.assertEqual(str(Path(source).resolve()), chain[0]['filename'])
                 for member in chain:
                     for key in ('filename', 'format', 'virtual-size', 'actual-size'):
                         self.assertIn(

@@ -273,6 +273,29 @@ locator does not have this problem: it arrives already rendered into
 POSIX convention (`vhdx-diff-parent.vhdx`, not `.\vhdx-diff-parent.vhdx`)
 before the host ever sees it, and resolves like any other relative name.
 
+The fail-soft covers *resolving* the parent reference, and nothing
+beyond it. Once a parent resolves, it is read like any other chain
+member and the ordinary rules apply, so a malformed cross-format chain
+— a VHD or VHDX child naming a parent that is not itself a VHD or VHDX
+— can still end in a non-zero exit:
+
+| Resolved parent | `info --chain` |
+|---|---|
+| a VHD or VHDX, as the format requires | lists it, exits 0 |
+| an unidentifiable file | lists it as `unknown`, exits 0 |
+| a self-contained qcow2 | lists it as `qcow2`, exits 0 |
+| a qcow2 whose own backing file is missing | **exits non-zero** |
+| a detected-but-unsupported format such as qed | **exits non-zero** |
+
+The last two are the pre-existing rules for those formats reached at any
+chain position, not a new behaviour: a qcow2 chain is not fail-soft, and
+a detected-but-unsupported format is refused wherever it appears. Note
+also that instar does not check that a resolved parent has the same
+format as its child, though the VHD and VHDX specifications require it —
+so the third row lists a qcow2 as a VHD's parent without complaint.
+Tracked as
+[issue #608](https://github.com/shakenfist/instar/issues/608).
+
 `instar info` reports and refuses nothing (see [info.md](info.md)), so
 `info --chain` exiting non-zero because a parent happened to be absent
 would be a worse regression than the one-image listing it replaces.
@@ -289,11 +312,21 @@ resolve a parent it will not go on to read — if it did, the same
 differencing image would give a typed refusal when its parent happened
 to sit beside it and a path error when it did not, and a refusal that
 depends on a file instar is not going to read is not a refusal. That is
-exactly why `info --chain` walks and nothing else does. The `convert`,
-`dd`, `compare`, `bench`, `check`, `commit` and `rebase` operations
-refuse a differencing source outright regardless of whether its parent
-exists or resolves — see the "VHD/VHDX differencing" section of
-[quirks.md](quirks.md) for the full per-op record. The composition work
+exactly why `info --chain` walks and nothing else does.
+
+Two different lists appear in this document and in the changelog, and
+they are not the same set. The *composing callers* — the operations that
+call `discover_backing_chain` with the composing policy — are `convert`,
+`dd`, `compare`, `bench`, `check`, `commit` and `rebase`. The operations
+that *refuse a differencing source* are `convert`, `dd`, `compare`,
+`bench`, `check`, `measure` and `map`. The overlap is not total in either
+direction: `measure` and `map` refuse without walking a chain, and
+`commit` and `rebase` reject a VHD or VHDX source before any parent is
+considered, because neither operation supports those formats at all
+(`commit` and `rebase` are qcow2 and VMDK only) — so their refusal is not
+a differencing refusal and would stand even for a VHD with no parent. See
+the "VHD/VHDX differencing" section of [quirks.md](quirks.md) for the
+full per-op record. The composition work
 in [PLAN-differencing.md](plans/PLAN-differencing.md) lifts each
 operation's restriction as real chain composition lands, one operation
 at a time.

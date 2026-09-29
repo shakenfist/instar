@@ -61,13 +61,21 @@ see `TestDifferencingParentAbsent` (`tests/test_differencing.py:609`).
   3.
 * The read-side rows of `docs/format-coverage.md` and the compose
   sections of `docs/chain-config.md`, which stay with phase 16.
-* Four defects, none of them this phase's to fix. Two were found by
+* Six defects, none of them this phase's to fix. Two were found by
   this survey and filed during it: the silent chain-device truncation
   (#601) and the VHD locator-table resolution gap (#602). Two were
   already open and are recorded here because composition depends on
   them: #565, where `resize` grows a differencing VHDX without its
   parent, and #566, which makes parent identity vacuous for any chain
-  instar wrote end to end -- see decision 5.
+  instar wrote end to end -- see decision 5. Two more came out of the
+  review round on the pull request: #608, that the walk never checks a
+  resolved parent is the same format as its child and that errors past
+  the differencing link are not fail-soft, and #609, that image-derived
+  path strings reach the terminal unescaped in the human output forms
+  (the JSON forms escape them). #608's boundary is documented in
+  `docs/chain-discovery.md` rather than left implicit; #609 is wider
+  than this change, since the older stdout printer carries the same
+  strings.
 
 ## What the survey found
 
@@ -429,7 +437,11 @@ each other.
 * No source file or comment added by this phase cites a plan phase,
   step or decision number, and the gate comment rewritten by 11a no
   longer does either.
-* Three issues filed per 11f, with numbers recorded in this plan.
+* The two issues 11f asks for are filed, with numbers recorded in
+  this plan: #601 (chain devices past `MAX_CHAIN_DEVICES` dropped with
+  only a debug log) and #602 (differencing VHD parent resolution
+  ignores the locator table). The review round on the pull request
+  added two more, #608 and #609, recorded in *What the survey found*.
 * `make lint`, `make test-rust`, the full Python suite, and
   `pre-commit run --all-files` are clean.
 
