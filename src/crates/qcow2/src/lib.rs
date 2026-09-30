@@ -7899,12 +7899,262 @@ pub unsafe fn decrypt_cluster_aes_xts(
     }
 }
 
+/// What a differencing VHD chunk's sector bitmap says about the chunk as
+/// a whole, decided before any payload byte is read.
+#[cfg(feature = "vhd-input")]
+enum VhdChunkOwnership {
+    /// Every sector the chunk touches belongs to this file, so the chunk
+    /// is served exactly as a plain dynamic VHD's would be.
+    AllChild,
+    /// No sector the chunk touches belongs to this file.
+    AllParent,
+    /// Ownership changes part way through the chunk.
+    Mixed,
+}
+
+/// One run of equally-owned sectors, clipped to the part of a chunk that
+/// is still to be served.
+#[cfg(feature = "vhd-input")]
+struct VhdOwnershipRun {
+    /// `true` when the run's data lives in this file, `false` when it
+    /// must come from the parent image.
+    child_owned: bool,
+    /// Bytes of the chunk this run covers.
+    bytes: u64,
+    /// 512-byte sectors to advance the walk by.
+    sectors: u32,
+}
+
+/// Read the next run of equally-owned sectors covering a differencing
+/// VHD chunk.
+///
+/// `sector` is the block-relative index of the 512-byte sector the
+/// unserved span starts in, `sector_byte` the offset within that sector
+/// (non-zero only for a chunk that does not start on a 512-byte
+/// boundary), and `remaining` the chunk's unserved bytes.
+///
+/// Returns `None` when the block's bitmap cannot describe the span --
+/// including a block whose bitmap is zero bytes long, and a chunk
+/// reaching past the end of the block the bitmap belongs to. A caller
+/// must treat that as a failed read: an undescribed sector has no owner,
+/// and inventing one is how a differencing image comes to read as
+/// silently wrong data.
+///
+/// # Safety
+///
+/// `call_table` must be valid, and `state`'s cache buffers must still be
+/// valid.
+#[cfg(feature = "vhd-input")]
+unsafe fn next_vhd_ownership_run(
+    call_table: &CallTable,
+    state: &mut VhdState,
+    bitmap_host_offset: u64,
+    sector: u32,
+    sector_byte: u64,
+    remaining: u64,
+    sector_size: usize,
+    input_capacity: u64,
+    bytes_read: &mut u64,
+) -> Option<VhdOwnershipRun> {
+    // Ownership bits count 512-byte sectors, which is the unit VHD
+    // addresses bitmaps in whatever the device's own sector size is.
+    // Converting between the two belongs to the VHD state, and is
+    // deliberately not repeated here.
+    let wanted = u32::try_from(sector_byte.checked_add(remaining)?.div_ceil(512)).ok()?;
+    let run = state.read_sector_bitmap_run(
+        call_table,
+        bitmap_host_offset,
+        sector,
+        wanted,
+        sector_size,
+        input_capacity,
+        bytes_read,
+    )?;
+    // The run begins `sector_byte` into its first sector, so it covers
+    // that much less of the chunk than its sector count suggests.
+    let run_bytes = (run.sectors as u64)
+        .checked_mul(512)?
+        .checked_sub(sector_byte)?;
+    Some(VhdOwnershipRun {
+        child_owned: run.child_owned,
+        bytes: run_bytes.min(remaining),
+        sectors: run.sectors,
+    })
+}
+
+/// Decide whether a differencing VHD chunk is wholly this file's,
+/// wholly its parent's, or a mixture of the two.
+///
+/// Classifying before any payload I/O is what keeps the two whole-block
+/// cases -- which is what a real differencing image is almost entirely
+/// made of -- down to a single read each.
+///
+/// # Safety
+///
+/// As [`next_vhd_ownership_run`].
+#[cfg(feature = "vhd-input")]
+unsafe fn classify_vhd_chunk_ownership(
+    call_table: &CallTable,
+    state: &mut VhdState,
+    bitmap_host_offset: u64,
+    first_sector: u32,
+    first_sector_byte: u64,
+    chunk_size: u64,
+    sector_size: usize,
+    input_capacity: u64,
+    bytes_read: &mut u64,
+) -> Option<VhdChunkOwnership> {
+    let mut sector = first_sector;
+    let mut sector_byte = first_sector_byte;
+    let mut served: u64 = 0;
+    let mut any_child = false;
+    let mut any_parent = false;
+
+    while served < chunk_size {
+        let run = next_vhd_ownership_run(
+            call_table,
+            state,
+            bitmap_host_offset,
+            sector,
+            sector_byte,
+            chunk_size.checked_sub(served)?,
+            sector_size,
+            input_capacity,
+            bytes_read,
+        )?;
+        if run.child_owned {
+            any_child = true;
+        } else {
+            any_parent = true;
+        }
+        served = served.checked_add(run.bytes)?;
+        sector = sector.checked_add(run.sectors)?;
+        sector_byte = 0;
+    }
+
+    Some(if any_child && any_parent {
+        VhdChunkOwnership::Mixed
+    } else if any_parent {
+        VhdChunkOwnership::AllParent
+    } else {
+        // A zero-length chunk describes no sector and lands here too,
+        // which is right: the unchanged path it falls through to serves
+        // such a chunk exactly as it always has.
+        VhdChunkOwnership::AllChild
+    })
+}
+
+/// Overwrite the runs of a chunk this file owns, in a buffer already
+/// filled from the parent image.
+///
+/// `host_byte_offset` is the payload offset the chunk's first byte lives
+/// at, as `block_lookup` reports it. A block's payload is contiguous, so
+/// a run sits as far into the payload as it does into the chunk.
+///
+/// # Safety
+///
+/// As [`next_vhd_ownership_run`]. `buf` must point to at least
+/// `chunk_size` writable bytes, and `scratch` to at least `sector_size`.
+#[cfg(feature = "vhd-input")]
+unsafe fn read_vhd_child_runs(
+    call_table: &CallTable,
+    state: &mut VhdState,
+    device_idx: u32,
+    bitmap_host_offset: u64,
+    host_byte_offset: u64,
+    first_sector: u32,
+    first_sector_byte: u64,
+    buf: *mut u8,
+    chunk_size: u64,
+    sector_size: usize,
+    scratch: *mut u8,
+    input_capacity: u64,
+    bytes_read: &mut u64,
+) -> bool {
+    let mut sector = first_sector;
+    let mut sector_byte = first_sector_byte;
+    let mut served: u64 = 0;
+
+    while served < chunk_size {
+        let remaining = match chunk_size.checked_sub(served) {
+            Some(r) => r,
+            None => return false,
+        };
+        let run = match next_vhd_ownership_run(
+            call_table,
+            state,
+            bitmap_host_offset,
+            sector,
+            sector_byte,
+            remaining,
+            sector_size,
+            input_capacity,
+            bytes_read,
+        ) {
+            Some(r) => r,
+            None => return false,
+        };
+
+        if run.child_owned {
+            let run_host = match host_byte_offset.checked_add(served) {
+                Some(o) => o,
+                None => return false,
+            };
+            // Same sub-sector handling a whole-chunk read needs, applied
+            // per run: VHD payload starts on a 512-byte boundary, which
+            // is part way into a sector when the device's sectors are
+            // larger, and a run can start part way into one again.
+            let intra_sector = (run_host % sector_size as u64) as usize;
+            let served_run = if intra_sector == 0 {
+                read_cluster_sectors(
+                    call_table,
+                    device_idx,
+                    run_host,
+                    buf.add(served as usize),
+                    run.bytes,
+                    sector_size,
+                    bytes_read,
+                )
+            } else {
+                read_offset_sectors(
+                    call_table,
+                    device_idx,
+                    run_host,
+                    buf.add(served as usize),
+                    run.bytes,
+                    sector_size,
+                    scratch,
+                    bytes_read,
+                )
+            };
+            if !served_run {
+                return false;
+            }
+        }
+
+        served = match served.checked_add(run.bytes) {
+            Some(s) => s,
+            None => return false,
+        };
+        sector = match sector.checked_add(run.sectors) {
+            Some(s) => s,
+            None => return false,
+        };
+        sector_byte = 0;
+    }
+    true
+}
+
 /// Read one cluster's worth of virtual data by walking a backing chain.
 ///
 /// For each device in the chain (starting from the top):
 /// - QCOW2: perform L1/L2 lookup. If unallocated, try next device.
 /// - VMDK (with `vmdk-input` feature): perform GD/GT grain lookup.
 ///   If unallocated, try next device.
+/// - VHD (with `vhd-input` feature): perform BAT block lookup. If
+///   unallocated, try next device. A differencing child also consults the
+///   block's sector bitmap, and descends for the runs of 512-byte sectors
+///   the bitmap leaves to the parent image.
 /// - Raw/other: read sectors directly (base of chain).
 ///
 /// If all devices have the cluster unallocated, fills with zeros.
@@ -8503,11 +8753,163 @@ pub unsafe fn read_chain_virtual_cluster(
                     );
                 }
 
+                // A differencing child's *allocated* block is only
+                // partly its own: the block's leading sector bitmap
+                // decides, per 512-byte sector, whether the data is here
+                // or in the parent image. Nothing else about this arm
+                // differs between the two disk types, so the flag is
+                // captured here and consulted only in the Allocated case
+                // below.
+                let is_differencing = state.disk_type == vhd::DISK_TYPE_DIFFERENCING;
+
                 match state.block_lookup(call_table, virtual_offset, sector_size, cap, bytes_read) {
                     Some(BlockLookup::Unallocated) => {
                         continue;
                     }
                     Some(BlockLookup::Allocated { host_byte_offset }) => {
+                        if is_differencing {
+                            // Where the block's sector bitmap lives, and
+                            // which of the block's 512-byte sectors this
+                            // chunk starts in.
+                            let (bitmap_host_offset, first_sector) = {
+                                let state = match &mut chain_states.vhd_states[dev_idx] {
+                                    Some(s) => s,
+                                    None => return false,
+                                };
+                                match state.differencing_block_lookup(
+                                    call_table,
+                                    virtual_offset,
+                                    sector_size,
+                                    cap,
+                                    bytes_read,
+                                ) {
+                                    Some(vhd::DifferencingBlockLookup::Allocated {
+                                        bitmap_host_offset,
+                                        sector_in_block,
+                                        ..
+                                    }) => (bitmap_host_offset, sector_in_block),
+                                    // The BAT said allocated a moment
+                                    // ago, so Unallocated here would mean
+                                    // two reads of one entry disagreed,
+                                    // and None means the block carries no
+                                    // bitmap to consult. Neither answer
+                                    // names an owner, so neither may be
+                                    // read as one.
+                                    _ => return false,
+                                }
+                            };
+                            // Offset within the chunk's first 512-byte
+                            // sector. Those sectors are the bitmap's own
+                            // granule, not the device's.
+                            let first_sector_byte = virtual_offset % 512;
+
+                            let ownership = {
+                                let state = match &mut chain_states.vhd_states[dev_idx] {
+                                    Some(s) => s,
+                                    None => return false,
+                                };
+                                match classify_vhd_chunk_ownership(
+                                    call_table,
+                                    state,
+                                    bitmap_host_offset,
+                                    first_sector,
+                                    first_sector_byte,
+                                    chunk_size,
+                                    sector_size,
+                                    cap,
+                                    bytes_read,
+                                ) {
+                                    Some(o) => o,
+                                    None => return false,
+                                }
+                            };
+
+                            let remaining = chain_len - dev_offset - 1;
+                            match ownership {
+                                // Wholly this file's, which is the common
+                                // case: fall through to the read a plain
+                                // dynamic VHD performs, unchanged.
+                                VhdChunkOwnership::AllChild => {}
+                                VhdChunkOwnership::AllParent => {
+                                    if remaining > 0 {
+                                        return read_chain_virtual_cluster(
+                                            call_table,
+                                            chain_start + dev_offset + 1,
+                                            remaining,
+                                            virtual_offset,
+                                            buf,
+                                            chunk_size,
+                                            sector_size,
+                                            chain_config,
+                                            chain_states,
+                                            compressed_buf,
+                                            staging_buf,
+                                            staging_cluster_offset,
+                                            aes_key,
+                                            luks_key,
+                                            luks_sector_size,
+                                            bytes_read,
+                                        );
+                                    }
+                                    // Bottom of chain: zero
+                                    core::ptr::write_bytes(buf, 0, chunk_size as usize);
+                                    return true;
+                                }
+                                VhdChunkOwnership::Mixed => {
+                                    // Fill the whole chunk from the
+                                    // parent first, then overwrite the
+                                    // runs this file owns. That descends
+                                    // once per chunk rather than once per
+                                    // run, and it leaves the chain below
+                                    // to decide -- including to zero-fill
+                                    // -- whatever it cannot serve.
+                                    if remaining > 0 {
+                                        if !read_chain_virtual_cluster(
+                                            call_table,
+                                            chain_start + dev_offset + 1,
+                                            remaining,
+                                            virtual_offset,
+                                            buf,
+                                            chunk_size,
+                                            sector_size,
+                                            chain_config,
+                                            chain_states,
+                                            compressed_buf,
+                                            staging_buf,
+                                            staging_cluster_offset,
+                                            aes_key,
+                                            luks_key,
+                                            luks_sector_size,
+                                            bytes_read,
+                                        ) {
+                                            return false;
+                                        }
+                                    } else {
+                                        core::ptr::write_bytes(buf, 0, chunk_size as usize);
+                                    }
+                                    let state = match &mut chain_states.vhd_states[dev_idx] {
+                                        Some(s) => s,
+                                        None => return false,
+                                    };
+                                    return read_vhd_child_runs(
+                                        call_table,
+                                        state,
+                                        dev_idx as u32,
+                                        bitmap_host_offset,
+                                        host_byte_offset,
+                                        first_sector,
+                                        first_sector_byte,
+                                        buf,
+                                        chunk_size,
+                                        sector_size,
+                                        compressed_buf,
+                                        cap,
+                                        bytes_read,
+                                    );
+                                }
+                            }
+                        }
+
                         // host_byte_offset already includes the
                         // intra-block offset from block_lookup().
                         // VHD data may start mid-sector when the
