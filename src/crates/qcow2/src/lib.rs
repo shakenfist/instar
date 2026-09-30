@@ -8758,12 +8758,22 @@ pub unsafe fn read_chain_virtual_cluster(
                 // decides, per 512-byte sector, whether the data is here
                 // or in the parent image. Nothing else about this arm
                 // differs between the two disk types, so the flag is
-                // captured here and consulted only in the Allocated case
+                // captured here and consulted in both of the block cases
                 // below.
                 let is_differencing = state.disk_type == vhd::DISK_TYPE_DIFFERENCING;
 
                 match state.block_lookup(call_table, virtual_offset, sector_size, cap, bytes_read) {
                     Some(BlockLookup::Unallocated) => {
+                        // An absent block is wholly the parent's for a
+                        // differencing child, so descending is right
+                        // while a device still follows. At the bottom of
+                        // the chain the loop's zero-fill tail would
+                        // report success on the child's own zeros, which
+                        // is the same wrong read the parent-owned cases
+                        // below refuse, so fail here too.
+                        if is_differencing && dev_offset + 1 >= chain_len {
+                            return false;
+                        }
                         continue;
                     }
                     Some(BlockLookup::Allocated { host_byte_offset }) => {
@@ -8851,9 +8861,17 @@ pub unsafe fn read_chain_virtual_cluster(
                                             bytes_read,
                                         );
                                     }
-                                    // Bottom of chain: zero
-                                    core::ptr::write_bytes(buf, 0, chunk_size as usize);
-                                    return true;
+                                    // No device behind the child, so a
+                                    // parent-owned chunk has nowhere to
+                                    // come from. Zero-filling here would
+                                    // hand the child's own zeros back as
+                                    // though they were the parent's data
+                                    // and report success on it (issue
+                                    // #547), so the read fails instead.
+                                    // The bottom of a differencing chain
+                                    // is a broken image, not the implied
+                                    // zero layer a qcow2 chain ends in.
+                                    return false;
                                 }
                                 VhdChunkOwnership::Mixed => {
                                     // Fill the whole chunk from the
@@ -8885,7 +8903,12 @@ pub unsafe fn read_chain_virtual_cluster(
                                             return false;
                                         }
                                     } else {
-                                        core::ptr::write_bytes(buf, 0, chunk_size as usize);
+                                        // Same as the wholly parent-owned
+                                        // case above: the parent's share
+                                        // of a mixed chunk cannot be
+                                        // served, and zeros would be
+                                        // wrong data reported as success.
+                                        return false;
                                     }
                                     let state = match &mut chain_states.vhd_states[dev_idx] {
                                         Some(s) => s,
@@ -9928,13 +9951,24 @@ pub unsafe fn init_chain_states(
                 let Some(state) = chain_states.vhd_states[dev_idx].as_ref() else {
                     return false;
                 };
-                // A differencing VHD's real content lives partly in its
-                // parent, which nothing here can compose. `VhdState::init`
-                // deliberately accepts `DISK_TYPE_DIFFERENCING` (map reads
-                // `disk_type` back off it, and the composition phases need
-                // the state), so the policy check belongs here: without it
-                // every unallocated block reads as zeros and the caller
-                // reports success on wrong data (issue #547).
+                // A differencing child's content is split between it
+                // and its parent. The chain reader can compose the two
+                // when a parent device sits behind the child, but
+                // nothing here can tell whether the device that follows
+                // this one belongs to the same chain: `device_count`
+                // says how many entries of `devices` are valid, not how
+                // long this device's chain is, and an operation reading
+                // two chains at once packs both into that one array. So
+                // every differencing child is refused here, and the
+                // reader fails closed rather than composing against a
+                // parent that may not be one. Were it not refused, a
+                // parent-owned sector would read back as this child's
+                // own zeros and the caller would report success on
+                // wrong data (issue #547). The refusal cannot live in
+                // `VhdState::init`, which deliberately accepts
+                // `DISK_TYPE_DIFFERENCING`: map reads `disk_type` back
+                // off the state, and the chain reader needs the state to
+                // consult a block's sector bitmap.
                 if state.disk_type == vhd::DISK_TYPE_DIFFERENCING {
                     (call_table.debug_print)(
                         b"init_chain_states: differencing VHD source refused\n\0".as_ptr(),
