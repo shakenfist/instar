@@ -1321,6 +1321,129 @@ pub enum BlockLookup {
     Allocated { host_byte_offset: u64 },
 }
 
+/// Result of looking up a virtual offset in a differencing VHD's BAT.
+///
+/// A differencing child's allocated block is only *partly* the child's:
+/// the block's leading sector bitmap says, per 512-byte sector, whether
+/// that sector's data lives in this file or in the parent image. A chain
+/// reader therefore needs the bitmap's location as well as the payload's,
+/// which is why this is a separate result type from [`BlockLookup`] --
+/// every other reader of a VHD in this tree serves a single image, where
+/// the bitmap carries nothing it must act on, and should not be made to
+/// handle a case it cannot see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DifferencingBlockLookup {
+    /// The block is not allocated, which in a differencing image means
+    /// the whole block's data lives in the parent.
+    Unallocated,
+    /// The block is allocated, and its sector bitmap decides each
+    /// sector's owner.
+    Allocated {
+        /// Host byte offset of the payload byte holding the looked-up
+        /// virtual offset: exactly what [`BlockLookup::Allocated`]
+        /// reports for the same offset.
+        host_byte_offset: u64,
+        /// Host byte offset of this block's sector bitmap, which is the
+        /// BAT entry's absolute 512-byte sector number times 512. The
+        /// payload begins `block_data_offset` bytes later, which is the
+        /// distance `host_byte_offset` has already skipped.
+        bitmap_host_offset: u64,
+        /// Index of the looked-up offset's 512-byte sector within the
+        /// block, which is the bitmap bit index that describes it.
+        sector_in_block: u32,
+    },
+}
+
+/// A run of consecutive 512-byte sectors within one block that share an
+/// owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SectorOwnershipRun {
+    /// `true` when this file holds the run's data, `false` when the run
+    /// must be read from the parent image.
+    pub child_owned: bool,
+    /// Length of the run in 512-byte sectors, counted from the first
+    /// sector asked about. Never zero.
+    pub sectors: u32,
+}
+
+/// Test one sector's ownership bit in a differencing VHD's per-block
+/// sector bitmap.
+///
+/// The bitmap is most-significant-bit first: sector `i` of the block is
+/// bit `7 - (i % 8)` of bitmap byte `i / 8`.
+///
+/// `sector_in_block` counts 512-byte sectors, which is the unit VHD
+/// addresses bitmaps and BAT entries in, whatever the device's own
+/// sector size happens to be.
+pub fn sector_bit_is_child_owned(bitmap_byte: u8, sector_in_block: u32) -> bool {
+    let bit = 7 - (sector_in_block % 8);
+    // A SET bit means this file -- the differencing child -- holds the
+    // sector's data; a CLEAR bit means the sector must be read from the
+    // parent image. This is the VHD specification's polarity, and it is
+    // asserted here rather than inferred from an image, because a block
+    // that happens to be wholly one or wholly the other cannot tell the
+    // two polarities apart.
+    (bitmap_byte >> bit) & 1 == 1
+}
+
+/// Coalesce the maximal run of equally-owned sectors starting at
+/// `first_sector`, fetching sector-bitmap bytes through `fetch_byte`.
+///
+/// `fetch_byte` is handed a byte index within the block's sector bitmap
+/// and returns that byte, or `None` if it could not be read. It is
+/// called once per bitmap byte the run touches rather than once per
+/// sector, so a run of 128 sectors costs 16 fetches.
+///
+/// The run is clamped to `sector_count` and to `sectors_per_block`, so a
+/// caller serving a chunk larger than a block may ask for more sectors
+/// than the block holds. Returns `None` when the request names no sector
+/// the bitmap can describe, and when a fetch fails.
+fn coalesce_ownership_run<F: FnMut(u32) -> Option<u8>>(
+    first_sector: u32,
+    sector_count: u32,
+    sectors_per_block: u32,
+    bitmap_bytes: u32,
+    mut fetch_byte: F,
+) -> Option<SectorOwnershipRun> {
+    if sector_count == 0 || bitmap_bytes == 0 || first_sector >= sectors_per_block {
+        return None;
+    }
+    // Never describe more sectors than the block has, however many were
+    // asked for: a caller's chunk can be larger than a VHD block.
+    let wanted = sector_count.min(sectors_per_block.checked_sub(first_sector)?);
+
+    let mut byte_index = first_sector / 8;
+    if byte_index >= bitmap_bytes {
+        // A bitmap too short for the block it precedes. Refuse rather
+        // than read a byte of payload as if it described ownership.
+        return None;
+    }
+    let mut bitmap_byte = fetch_byte(byte_index)?;
+    let child_owned = sector_bit_is_child_owned(bitmap_byte, first_sector);
+
+    let mut sectors: u32 = 1;
+    while sectors < wanted {
+        let sector = first_sector.checked_add(sectors)?;
+        let sector_byte_index = sector / 8;
+        if sector_byte_index != byte_index {
+            if sector_byte_index >= bitmap_bytes {
+                break;
+            }
+            bitmap_byte = fetch_byte(sector_byte_index)?;
+            byte_index = sector_byte_index;
+        }
+        if sector_bit_is_child_owned(bitmap_byte, sector) != child_owned {
+            break;
+        }
+        sectors = sectors.checked_add(1)?;
+    }
+
+    Some(SectorOwnershipRun {
+        child_owned,
+        sectors,
+    })
+}
+
 // ============================================================================
 // VHD state for BAT I/O
 // ============================================================================
@@ -1340,7 +1463,8 @@ pub struct VhdState {
     // Sector cache for BAT reads
     pub bat_cached_sector: u64,
     pub bat_cache_buf: *mut u8,
-    // Sector cache for data reads (reused for sector bitmap skip)
+    // Sector cache for data reads, also used by the differencing
+    // sector-bitmap reader
     pub data_cached_sector: u64,
     pub data_cache_buf: *mut u8,
 }
@@ -1624,6 +1748,155 @@ impl VhdState {
         })
     }
 
+    /// Number of 512-byte sectors in one block, which is the number of
+    /// ownership bits a block's sector bitmap carries.
+    ///
+    /// VHD addresses BAT entries and sector bitmaps in 512-byte sectors,
+    /// whatever the device's sector size is, so this is deliberately not
+    /// a function of `sector_size`.
+    pub fn sectors_per_block(&self) -> u32 {
+        self.block_size / 512
+    }
+
+    /// Look up a virtual byte offset the way [`Self::block_lookup`]
+    /// does, and additionally report where the containing block's sector
+    /// bitmap lives.
+    ///
+    /// Only a differencing image needs this. In a plain dynamic VHD
+    /// every sector of an allocated block belongs to that file, so the
+    /// bitmap says nothing a reader must act on, and
+    /// [`Self::block_lookup`] stays what the single-image readers use.
+    ///
+    /// Returns `None` for a fixed VHD (which has neither a BAT nor
+    /// sector bitmaps), for a block whose bitmap is zero bytes long, and
+    /// on I/O failure.
+    ///
+    /// # Safety
+    ///
+    /// `call_table` must be valid. Cache buffers must still be valid.
+    pub unsafe fn differencing_block_lookup(
+        &mut self,
+        call_table: &CallTable,
+        virtual_offset: u64,
+        sector_size: usize,
+        input_capacity: u64,
+        bytes_read: &mut u64,
+    ) -> Option<DifferencingBlockLookup> {
+        if self.is_fixed() {
+            return None;
+        }
+        // A zero-length sector bitmap cannot describe an owner.
+        if self.block_data_offset == 0 {
+            return None;
+        }
+
+        let block_size = self.block_size as u64;
+        let block_idx = virtual_offset.checked_div(block_size)?;
+
+        if block_idx >= self.max_table_entries as u64 {
+            return Some(DifferencingBlockLookup::Unallocated);
+        }
+
+        // Read BAT entry (u32 BE at table_offset + block_idx * 4)
+        let bat_byte_offset = self.table_offset.checked_add(block_idx.checked_mul(4)?)?;
+
+        let bat_entry = read_u32_be_cached(
+            call_table,
+            self.device_idx,
+            bat_byte_offset,
+            sector_size,
+            input_capacity,
+            &mut self.bat_cached_sector,
+            self.bat_cache_buf,
+            bytes_read,
+        )?;
+
+        if bat_entry == BAT_UNALLOCATED {
+            return Some(DifferencingBlockLookup::Unallocated);
+        }
+
+        // BAT entry is the absolute sector number (512-byte sectors) of
+        // the block's sector bitmap. Data follows the bitmap.
+        let bitmap_host_offset = (bat_entry as u64).checked_mul(512)?;
+        let data_start = bitmap_host_offset.checked_add(self.block_data_offset as u64)?;
+
+        // Offset within the block, and the 512-byte sector it lands in.
+        let intra_block_offset = virtual_offset.checked_rem(block_size)?;
+        let host_byte_offset = data_start.checked_add(intra_block_offset)?;
+        let sector_in_block = u32::try_from(intra_block_offset / 512).ok()?;
+
+        Some(DifferencingBlockLookup::Allocated {
+            host_byte_offset,
+            bitmap_host_offset,
+            sector_in_block,
+        })
+    }
+
+    /// Report which of a block's 512-byte sectors this file owns.
+    ///
+    /// `bitmap_host_offset` is the offset
+    /// [`Self::differencing_block_lookup`] reported for the block.
+    /// `first_sector` and `sector_count` name a range of sector indices
+    /// *within that block*. The answer covers `first_sector` and as many
+    /// following sectors as share its owner, stopping at `sector_count`,
+    /// at the end of the block, or where ownership changes -- so a
+    /// caller placing a whole chunk loops, asking about the first sector
+    /// it has not yet served.
+    ///
+    /// Bitmap bytes are read through the per-device data sector cache,
+    /// which costs no memory this state does not already hold and leaves
+    /// the BAT cache alone: the BAT and the bitmaps sit in different
+    /// regions of the file and serving one chunk touches both.
+    ///
+    /// Returns `None` for a fixed VHD, for a block with no sector
+    /// bitmap, for a `first_sector` at or past the end of the block, for
+    /// a zero `sector_count`, and on I/O failure.
+    ///
+    /// # Safety
+    ///
+    /// `call_table` must be valid. `data_cache_buf` must still point to
+    /// at least `sector_size` writable bytes.
+    pub unsafe fn read_sector_bitmap_run(
+        &mut self,
+        call_table: &CallTable,
+        bitmap_host_offset: u64,
+        first_sector: u32,
+        sector_count: u32,
+        sector_size: usize,
+        input_capacity: u64,
+        bytes_read: &mut u64,
+    ) -> Option<SectorOwnershipRun> {
+        if self.is_fixed() {
+            return None;
+        }
+
+        let sectors_per_block = self.sectors_per_block();
+        let bitmap_bytes = self.block_data_offset;
+        let device_idx = self.device_idx;
+        let cache_buf = self.data_cache_buf;
+        let cached_sector = &mut self.data_cached_sector;
+
+        coalesce_ownership_run(
+            first_sector,
+            sector_count,
+            sectors_per_block,
+            bitmap_bytes,
+            |byte_index| {
+                let byte_offset = bitmap_host_offset.checked_add(byte_index as u64)?;
+                read_u8_cached(
+                    call_table,
+                    device_idx,
+                    byte_offset,
+                    sector_size,
+                    input_capacity,
+                    cached_sector,
+                    cache_buf,
+                    bytes_read,
+                )
+            },
+        )
+    }
+
     /// Walk the BAT and produce an `AllocationSummary`.
     ///
     /// For Fixed VHDs (no BAT), `allocated_bytes == virtual_size`.
@@ -1887,6 +2160,7 @@ impl VhdState {
 // ============================================================================
 
 shared::cached_read!(read_u32_be_cached, u32, be, 4);
+shared::cached_read!(read_u8_cached, u8, be, 1);
 
 // ============================================================================
 // VHD footer/header builder helpers (for output)
@@ -4631,5 +4905,261 @@ mod tests {
         let mut path = [0u8; 64];
         let n = entry.decode_path(&window(&win), &mut path).unwrap();
         assert_eq!(&path[..n], EMIT_PATH.as_bytes());
+    }
+
+    // ====================================================================
+    // Differencing sector-bitmap ownership
+    //
+    // These cover the pure halves of the bitmap reader: the bit test and
+    // the run coalescer. `differencing_block_lookup` and
+    // `read_sector_bitmap_run` need a call table to reach a device, and
+    // this crate's tests mock none; the chain-walking tests in the qcow2
+    // crate drive those two through its mock call table.
+    // ====================================================================
+
+    /// Coalesce a run over an in-memory bitmap, also reporting how many
+    /// bitmap bytes were fetched.
+    fn run_over(
+        bitmap: &[u8],
+        first_sector: u32,
+        sector_count: u32,
+        sectors_per_block: u32,
+    ) -> (Option<SectorOwnershipRun>, usize) {
+        let mut fetches = 0usize;
+        let run = coalesce_ownership_run(
+            first_sector,
+            sector_count,
+            sectors_per_block,
+            bitmap.len() as u32,
+            |byte_index| {
+                fetches += 1;
+                bitmap.get(byte_index as usize).copied()
+            },
+        );
+        (run, fetches)
+    }
+
+    /// A `VhdState` with no device behind it, for the arithmetic-only
+    /// accessors. The cache pointers are never dereferenced because no
+    /// I/O is performed.
+    fn bitmapless_state(block_size: u32) -> VhdState {
+        VhdState {
+            device_idx: 0,
+            disk_type: DISK_TYPE_DIFFERENCING,
+            block_size,
+            block_data_offset: 512,
+            max_table_entries: 4,
+            table_offset: 1536,
+            current_size: 4 * block_size as u64,
+            bat_cached_sector: u64::MAX,
+            bat_cache_buf: core::ptr::null_mut(),
+            data_cached_sector: u64::MAX,
+            data_cache_buf: core::ptr::null_mut(),
+        }
+    }
+
+    #[test]
+    fn sector_bitmap_is_most_significant_bit_first() {
+        for sector in 0..8u32 {
+            assert_eq!(sector_bit_is_child_owned(0x80, sector), sector == 0);
+            assert_eq!(sector_bit_is_child_owned(0x01, sector), sector == 7);
+        }
+        // 0x0F describes the block's sectors 4..8, not 0..4.
+        for sector in 0..8u32 {
+            assert_eq!(sector_bit_is_child_owned(0x0F, sector), sector >= 4);
+        }
+    }
+
+    #[test]
+    fn sector_bitmap_set_bit_means_child_and_clear_means_parent() {
+        for sector in 0..8u32 {
+            assert!(sector_bit_is_child_owned(0xFF, sector));
+            assert!(!sector_bit_is_child_owned(0x00, sector));
+        }
+    }
+
+    #[test]
+    fn sector_bitmap_bit_index_repeats_every_eight_sectors() {
+        // The byte is the caller's choice; the helper only picks the bit
+        // within it, so sector 8 tests the same bit as sector 0.
+        assert!(sector_bit_is_child_owned(0x80, 8));
+        assert!(sector_bit_is_child_owned(0x80, 4096));
+        assert!(!sector_bit_is_child_owned(0x80, 9));
+    }
+
+    #[test]
+    fn ownership_run_all_ones_covers_the_whole_request() {
+        let bitmap = [0xFFu8; 512];
+        let (run, fetches) = run_over(&bitmap, 0, 128, 4096);
+        assert_eq!(
+            run,
+            Some(SectorOwnershipRun {
+                child_owned: true,
+                sectors: 128,
+            })
+        );
+        // One fetch per bitmap byte the run touches, not one per sector.
+        assert_eq!(fetches, 16);
+    }
+
+    #[test]
+    fn ownership_run_all_zeros_covers_the_whole_request() {
+        let bitmap = [0x00u8; 512];
+        let (run, fetches) = run_over(&bitmap, 0, 128, 4096);
+        assert_eq!(
+            run,
+            Some(SectorOwnershipRun {
+                child_owned: false,
+                sectors: 128,
+            })
+        );
+        assert_eq!(fetches, 16);
+    }
+
+    #[test]
+    fn ownership_run_stops_where_ownership_changes() {
+        let mut bitmap = [0x00u8; 512];
+        bitmap[0] = 0xF0;
+        let (run, _) = run_over(&bitmap, 0, 128, 4096);
+        assert_eq!(
+            run,
+            Some(SectorOwnershipRun {
+                child_owned: true,
+                sectors: 4,
+            })
+        );
+    }
+
+    #[test]
+    fn ownership_run_crosses_a_bitmap_byte_boundary() {
+        let mut bitmap = [0x00u8; 512];
+        bitmap[0] = 0xF0;
+        bitmap[2] = 0xFF;
+        // Sectors 4..8 are the parent's (low nibble of byte 0) and so is
+        // all of byte 1, so the run is 12 sectors long and ends where
+        // byte 2 hands ownership back to the child.
+        let (run, _) = run_over(&bitmap, 4, 128, 4096);
+        assert_eq!(
+            run,
+            Some(SectorOwnershipRun {
+                child_owned: false,
+                sectors: 12,
+            })
+        );
+    }
+
+    #[test]
+    fn ownership_run_may_start_part_way_through_a_byte() {
+        let mut bitmap = [0x00u8; 512];
+        bitmap[0] = 0x1F;
+        bitmap[1] = 0xFF;
+        // Sectors 3..8 are the child's, and byte 1 continues the run for
+        // eight more.
+        let (run, _) = run_over(&bitmap, 3, 128, 4096);
+        assert_eq!(
+            run,
+            Some(SectorOwnershipRun {
+                child_owned: true,
+                sectors: 13,
+            })
+        );
+    }
+
+    #[test]
+    fn ownership_run_of_a_single_sector() {
+        let bitmap = [0xFFu8; 512];
+        let (run, fetches) = run_over(&bitmap, 7, 1, 4096);
+        assert_eq!(
+            run,
+            Some(SectorOwnershipRun {
+                child_owned: true,
+                sectors: 1,
+            })
+        );
+        assert_eq!(fetches, 1);
+    }
+
+    #[test]
+    fn ownership_run_is_clamped_to_the_blocks_own_sectors() {
+        let bitmap = [0xFFu8; 512];
+        // A chunk can be larger than a block; the run must stop at the
+        // block's last sector rather than describing the next block's.
+        let (run, _) = run_over(&bitmap, 0, 128, 4);
+        assert_eq!(
+            run,
+            Some(SectorOwnershipRun {
+                child_owned: true,
+                sectors: 4,
+            })
+        );
+        let (run, _) = run_over(&bitmap, 3, 128, 4);
+        assert_eq!(
+            run,
+            Some(SectorOwnershipRun {
+                child_owned: true,
+                sectors: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn ownership_run_refuses_a_request_outside_the_block() {
+        let bitmap = [0xFFu8; 512];
+        assert_eq!(run_over(&bitmap, 4, 1, 4).0, None);
+        assert_eq!(run_over(&bitmap, 0, 0, 4).0, None);
+        assert_eq!(run_over(&bitmap, 0, 1, 0).0, None);
+    }
+
+    #[test]
+    fn ownership_run_refuses_a_block_without_a_bitmap() {
+        assert_eq!(run_over(&[], 0, 1, 4096).0, None);
+    }
+
+    #[test]
+    fn ownership_run_refuses_to_read_past_a_short_bitmap() {
+        // A one-byte bitmap describes only the block's first eight
+        // sectors. Asking about a later sector is refused rather than
+        // answered from the payload that follows the bitmap.
+        assert_eq!(run_over(&[0xFF], 8, 1, 4096).0, None);
+        let (run, fetches) = run_over(&[0xFF], 0, 128, 4096);
+        assert_eq!(
+            run,
+            Some(SectorOwnershipRun {
+                child_owned: true,
+                sectors: 8,
+            })
+        );
+        assert_eq!(fetches, 1);
+    }
+
+    #[test]
+    fn ownership_run_propagates_a_fetch_failure() {
+        assert_eq!(coalesce_ownership_run(0, 128, 4096, 512, |_| None), None);
+        // A failure part way through a run fails the whole run rather
+        // than returning the sectors read so far.
+        let mut calls = 0usize;
+        let run = coalesce_ownership_run(0, 128, 4096, 512, |_| {
+            calls += 1;
+            if calls > 1 {
+                None
+            } else {
+                Some(0xFF)
+            }
+        });
+        assert_eq!(run, None);
+    }
+
+    #[test]
+    fn sectors_per_block_counts_512_byte_sectors() {
+        // Bitmap bits count 512-byte sectors whatever the device's
+        // sector size is, so these do not vary with it.
+        assert_eq!(bitmapless_state(2 * 1024 * 1024).sectors_per_block(), 4096);
+        assert_eq!(bitmapless_state(512 * 1024).sectors_per_block(), 1024);
+        assert_eq!(bitmapless_state(65536).sectors_per_block(), 128);
+        assert_eq!(bitmapless_state(512).sectors_per_block(), 1);
+        // A crafted block smaller than a sector describes no sector, and
+        // the coalescer refuses such a block rather than dividing by it.
+        assert_eq!(bitmapless_state(256).sectors_per_block(), 0);
+        assert_eq!(run_over(&[0xFFu8; 512], 0, 1, 0).0, None);
     }
 }
