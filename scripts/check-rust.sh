@@ -122,7 +122,7 @@ if [ -d "$PROJECT_ROOT/src" ]; then
     fi
 
     # Feature-gated code (the luks crypto paths, qcow2 create, and the
-    # qcow2 chain-reader arms for vdi/parallels/qcow1/dmg input) is
+    # qcow2 chain-reader arms for vdi/parallels/qcow1/dmg/vhd input) is
     # invisible to the workspace clippy run above, which uses default
     # features only. Lint it explicitly, mirroring the Makefile's
     # test-rust feature matrix.
@@ -131,13 +131,13 @@ if [ -d "$PROJECT_ROOT/src" ]; then
         run_in_docker "src" cargo clippy --fix --allow-dirty --allow-staged --allow-no-vcs \
             -p luks --features "decrypt,encrypt" || FAILED=1
         run_in_docker "src" cargo clippy --fix --allow-dirty --allow-staged --allow-no-vcs \
-            -p qcow2 --features "create,vdi-input,parallels-input,qcow1-input,dmg-input" || FAILED=1
+            -p qcow2 --features "create,vdi-input,parallels-input,qcow1-input,dmg-input,vhd-input" || FAILED=1
     else
         run_in_docker "src" cargo clippy \
             -p luks --features "decrypt,encrypt" \
             -- -D warnings || FAILED=1
         run_in_docker "src" cargo clippy \
-            -p qcow2 --features "create,vdi-input,parallels-input,qcow1-input,dmg-input" \
+            -p qcow2 --features "create,vdi-input,parallels-input,qcow1-input,dmg-input,vhd-input" \
             -- -D warnings || FAILED=1
     fi
 

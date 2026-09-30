@@ -9815,6 +9815,11 @@ pub struct ChainStates {
 /// # Safety
 ///
 /// `call_table` must be a valid initialised [`CallTable`].
+// The call table's string arguments are `*const u8`, so a NUL-terminated
+// byte string is the exact type they take. A `c"..."` literal yields
+// `*const c_char` and would need an `as *const u8` cast at every call
+// site, which is why every guest operation passes `b"...\0".as_ptr()`.
+#[allow(clippy::manual_c_str_literals)]
 #[cfg(any(feature = "vhd-input", feature = "vhdx-input"))]
 unsafe fn send_differencing_refusal(call_table: &CallTable, status: u32) {
     (call_table.send_error)(
@@ -9841,6 +9846,9 @@ unsafe fn send_differencing_refusal(call_table: &CallTable, status: u32) {
 /// Same requirements as `init_chain_qcow2_states`: valid `call_table`,
 /// valid `chain_config`, `device_count <= MAX_CHAIN_DEVICES`, and
 /// sufficient memory at `dynamic_bufs_start`.
+// Same reason as `send_differencing_refusal` above: `debug_print` takes a
+// `*const u8`.
+#[allow(clippy::manual_c_str_literals)]
 pub unsafe fn init_chain_states(
     call_table: &CallTable,
     chain_config: &ChainConfig,
