@@ -6930,6 +6930,721 @@ mod tests {
     }
 
     // ========================================================================
+    // VHD chain-reader arm (read_chain_virtual_cluster ImageFormat::Vhd),
+    // differencing composition path.
+    //
+    // Devices are dispatched by device_idx exactly as the qcow1 mock above
+    // does, so a differencing child can be built over a distinguishable
+    // backing device. `init_chain_states` refuses every differencing VHD
+    // unconditionally, so the read-path tests build per-device state
+    // directly with `VhdState::init` -- the same bypass the qcow1 harness
+    // above uses for its own init-independent reads -- and drive
+    // `read_chain_virtual_cluster` straight. Only the init-refusal test
+    // goes through `init_chain_states` itself.
+    // ========================================================================
+
+    #[cfg(feature = "vhd-input")]
+    const VHD_MAX_DEVS: usize = 2;
+    #[cfg(feature = "vhd-input")]
+    static VHD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    #[cfg(feature = "vhd-input")]
+    static mut VHD_IMAGES: [*const u8; VHD_MAX_DEVS] = [core::ptr::null(); VHD_MAX_DEVS];
+    #[cfg(feature = "vhd-input")]
+    static mut VHD_LENS: [usize; VHD_MAX_DEVS] = [0; VHD_MAX_DEVS];
+    #[cfg(feature = "vhd-input")]
+    static mut VHD_SSZ: usize = 512;
+
+    /// Differencing child byte at absolute host offset `o`.
+    #[cfg(feature = "vhd-input")]
+    fn vhd_child_byte(o: u64) -> u8 {
+        (o % 251) as u8
+    }
+    /// Parent (backing) device byte at virtual offset `o`; a distinct
+    /// period and a +1 bias so a wrong-device read cannot silently match
+    /// the child's pattern.
+    #[cfg(feature = "vhd-input")]
+    fn vhd_parent_byte(o: u64) -> u8 {
+        ((o % 241) as u8).wrapping_add(1)
+    }
+
+    /// Per-device mock: fails any sector at/beyond the device length so a
+    /// read the arm fails to clamp surfaces as an error, not fabricated
+    /// bytes.
+    #[cfg(feature = "vhd-input")]
+    unsafe extern "C" fn vhd_read_sector(
+        device_idx: u32,
+        sector: u64,
+        out_buf: *mut u8,
+        sector_size: usize,
+    ) -> bool {
+        let d = device_idx as usize;
+        if d >= VHD_MAX_DEVS {
+            return false;
+        }
+        let imgs = core::ptr::addr_of!(VHD_IMAGES) as *const *const u8;
+        let lens = core::ptr::addr_of!(VHD_LENS) as *const usize;
+        let ptr = *imgs.add(d);
+        let len = *lens.add(d);
+        if ptr.is_null() {
+            return false;
+        }
+        let start = match (sector as usize).checked_mul(sector_size) {
+            Some(s) => s,
+            None => return false,
+        };
+        if start + sector_size > len {
+            return false;
+        }
+        core::ptr::copy_nonoverlapping(ptr.add(start), out_buf, sector_size);
+        true
+    }
+
+    #[cfg(feature = "vhd-input")]
+    unsafe extern "C" fn vhd_capacity(device_idx: u32) -> u64 {
+        let d = device_idx as usize;
+        if d >= VHD_MAX_DEVS {
+            return 0;
+        }
+        let lens = core::ptr::addr_of!(VHD_LENS) as *const usize;
+        (*lens.add(d) / VHD_SSZ) as u64
+    }
+
+    #[cfg(feature = "vhd-input")]
+    unsafe extern "C" fn vhd_ssz(_device_idx: u32) -> usize {
+        VHD_SSZ
+    }
+
+    #[cfg(feature = "vhd-input")]
+    fn vhd_call_table() -> shared::CallTable {
+        shared::CallTable {
+            read_input_sector: vhd_read_sector,
+            get_input_capacity: vhd_capacity,
+            get_input_sector_size: vhd_ssz,
+            ..stub_call_table()
+        }
+    }
+
+    #[cfg(feature = "vhd-input")]
+    fn vhd_put_u32(img: &mut [u8], off: usize, val: u32) {
+        img[off..off + 4].copy_from_slice(&val.to_be_bytes());
+    }
+    #[cfg(feature = "vhd-input")]
+    fn vhd_put_u64(img: &mut [u8], off: usize, val: u64) {
+        img[off..off + 8].copy_from_slice(&val.to_be_bytes());
+    }
+
+    /// A device in the mock chain: its raw bytes and its detected format.
+    #[cfg(feature = "vhd-input")]
+    struct VhdDevice {
+        bytes: std::vec::Vec<u8>,
+        format: ImageFormat,
+    }
+
+    /// Build a single-block dynamic or differencing VHD image: footer +
+    /// dynamic header + one-entry BAT whose block's sector bitmap is
+    /// `bitmap` (zero-padded to the mandatory 512-byte minimum every
+    /// block size used here rounds up to) and whose payload is filled
+    /// with the child's byte pattern. Single-block only.
+    #[cfg(feature = "vhd-input")]
+    fn build_vhd_differencing_single_block(
+        disk_type: u32,
+        block_size: u32,
+        bitmap: &[u8],
+    ) -> std::vec::Vec<u8> {
+        let table_offset = 1536u64; // 512 (footer) + 1024 (dynamic header)
+        let bat_sector: u32 = 8; // host offset 4096, well past header+BAT
+        let bitmap_off = (bat_sector as u64 * 512) as usize;
+        let payload_off = bitmap_off + 512;
+        let total_len = payload_off + block_size as usize;
+
+        let mut img = std::vec![0u8; total_len];
+        vhd_put_u64(&mut img, vhd::FOOTER_COOKIE_OFFSET, vhd::VHD_COOKIE);
+        vhd_put_u64(&mut img, vhd::FOOTER_DATA_OFFSET_OFFSET, 512);
+        vhd_put_u64(&mut img, vhd::FOOTER_CURRENT_SIZE_OFFSET, block_size as u64);
+        vhd_put_u32(&mut img, vhd::FOOTER_DISK_TYPE_OFFSET, disk_type);
+
+        let dyn_off = 512usize;
+        vhd_put_u64(
+            &mut img,
+            dyn_off + vhd::DYN_COOKIE_OFFSET,
+            vhd::CXSPARSE_COOKIE,
+        );
+        vhd_put_u64(
+            &mut img,
+            dyn_off + vhd::DYN_TABLE_OFFSET_OFFSET,
+            table_offset,
+        );
+        vhd_put_u32(&mut img, dyn_off + vhd::DYN_MAX_TABLE_ENTRIES_OFFSET, 1);
+        vhd_put_u32(&mut img, dyn_off + vhd::DYN_BLOCK_SIZE_OFFSET, block_size);
+
+        vhd_put_u32(&mut img, table_offset as usize, bat_sector);
+
+        img[bitmap_off..bitmap_off + bitmap.len()].copy_from_slice(bitmap);
+
+        for i in 0..block_size as u64 {
+            img[payload_off + i as usize] = vhd_child_byte(payload_off as u64 + i);
+        }
+        img
+    }
+
+    /// A single-entry differencing (or dynamic) VHD whose one block is
+    /// unallocated: BAT_UNALLOCATED, no bitmap or payload region at all.
+    #[cfg(feature = "vhd-input")]
+    fn build_vhd_unallocated_block(disk_type: u32, block_size: u32) -> std::vec::Vec<u8> {
+        let table_offset = 1536u64;
+        let total_len = ((table_offset as usize + 4 + 511) & !511).max(2048);
+        let mut img = std::vec![0u8; total_len];
+        vhd_put_u64(&mut img, vhd::FOOTER_COOKIE_OFFSET, vhd::VHD_COOKIE);
+        vhd_put_u64(&mut img, vhd::FOOTER_DATA_OFFSET_OFFSET, 512);
+        vhd_put_u64(&mut img, vhd::FOOTER_CURRENT_SIZE_OFFSET, block_size as u64);
+        vhd_put_u32(&mut img, vhd::FOOTER_DISK_TYPE_OFFSET, disk_type);
+        let dyn_off = 512usize;
+        vhd_put_u64(
+            &mut img,
+            dyn_off + vhd::DYN_COOKIE_OFFSET,
+            vhd::CXSPARSE_COOKIE,
+        );
+        vhd_put_u64(
+            &mut img,
+            dyn_off + vhd::DYN_TABLE_OFFSET_OFFSET,
+            table_offset,
+        );
+        vhd_put_u32(&mut img, dyn_off + vhd::DYN_MAX_TABLE_ENTRIES_OFFSET, 1);
+        vhd_put_u32(&mut img, dyn_off + vhd::DYN_BLOCK_SIZE_OFFSET, block_size);
+        vhd_put_u32(&mut img, table_offset as usize, vhd::BAT_UNALLOCATED);
+        img
+    }
+
+    /// A two-block *non-differencing* dynamic VHD: block 0 allocated
+    /// (child pattern), block 1 unallocated. Used by the regression
+    /// guard, which must see both cases behave exactly as they did
+    /// before the differencing arm existed.
+    #[cfg(feature = "vhd-input")]
+    fn build_vhd_dynamic_two_block(block_size: u32) -> std::vec::Vec<u8> {
+        let table_offset = 1536u64;
+        let bat_sector0: u32 = 8;
+        let bitmap0_off = (bat_sector0 as u64 * 512) as usize;
+        let payload0_off = bitmap0_off + 512;
+        let total_len = payload0_off + block_size as usize;
+
+        let mut img = std::vec![0u8; total_len];
+        vhd_put_u64(&mut img, vhd::FOOTER_COOKIE_OFFSET, vhd::VHD_COOKIE);
+        vhd_put_u64(&mut img, vhd::FOOTER_DATA_OFFSET_OFFSET, 512);
+        vhd_put_u64(
+            &mut img,
+            vhd::FOOTER_CURRENT_SIZE_OFFSET,
+            2 * block_size as u64,
+        );
+        vhd_put_u32(
+            &mut img,
+            vhd::FOOTER_DISK_TYPE_OFFSET,
+            vhd::DISK_TYPE_DYNAMIC,
+        );
+        let dyn_off = 512usize;
+        vhd_put_u64(
+            &mut img,
+            dyn_off + vhd::DYN_COOKIE_OFFSET,
+            vhd::CXSPARSE_COOKIE,
+        );
+        vhd_put_u64(
+            &mut img,
+            dyn_off + vhd::DYN_TABLE_OFFSET_OFFSET,
+            table_offset,
+        );
+        vhd_put_u32(&mut img, dyn_off + vhd::DYN_MAX_TABLE_ENTRIES_OFFSET, 2);
+        vhd_put_u32(&mut img, dyn_off + vhd::DYN_BLOCK_SIZE_OFFSET, block_size);
+        vhd_put_u32(&mut img, table_offset as usize, bat_sector0);
+        vhd_put_u32(&mut img, table_offset as usize + 4, vhd::BAT_UNALLOCATED);
+        for i in 0..block_size as u64 {
+            img[payload0_off + i as usize] = vhd_child_byte(payload0_off as u64 + i);
+        }
+        img
+    }
+
+    /// A raw backing device of `len` bytes, filled with the parent's byte
+    /// pattern keyed on virtual (= host, for a raw device) offset.
+    #[cfg(feature = "vhd-input")]
+    fn build_vhd_parent_raw(len: usize) -> std::vec::Vec<u8> {
+        let mut img = std::vec![0u8; len];
+        for (i, b) in img.iter_mut().enumerate() {
+            *b = vhd_parent_byte(i as u64);
+        }
+        img
+    }
+
+    /// Init per-device VHD state directly (bypassing `init_chain_states`,
+    /// which refuses every differencing child regardless of chain shape)
+    /// and run one span through `read_chain_virtual_cluster`. Returns
+    /// whether the read succeeded and the output buffer, sentinel-filled
+    /// beforehand so a false return that leaves the buffer untouched is
+    /// visibly wrong rather than a coincidental match.
+    #[cfg(feature = "vhd-input")]
+    fn run_vhd_chain_read(
+        devices: &[VhdDevice],
+        sector_size: usize,
+        virtual_offset: u64,
+        chunk_size: u64,
+    ) -> (bool, std::vec::Vec<u8>) {
+        let _guard = VHD_LOCK.lock().unwrap();
+        assert!(devices.len() <= VHD_MAX_DEVS);
+
+        unsafe {
+            VHD_SSZ = sector_size;
+            let imgs = core::ptr::addr_of_mut!(VHD_IMAGES) as *mut *const u8;
+            let lens = core::ptr::addr_of_mut!(VHD_LENS) as *mut usize;
+            for i in 0..VHD_MAX_DEVS {
+                if i < devices.len() {
+                    *imgs.add(i) = devices[i].bytes.as_ptr();
+                    *lens.add(i) = devices[i].bytes.len();
+                } else {
+                    *imgs.add(i) = core::ptr::null();
+                    *lens.add(i) = 0;
+                }
+            }
+        }
+        let call_table = vhd_call_table();
+
+        // Two cache buffers (BAT + data) per device, kept alive for the
+        // read.
+        let mut caches: std::vec::Vec<std::vec::Vec<u8>> = std::vec::Vec::new();
+        for _ in 0..devices.len() {
+            caches.push(std::vec![0u8; MAX_SECTOR_SIZE]);
+            caches.push(std::vec![0u8; MAX_SECTOR_SIZE]);
+        }
+
+        let mut chain_states = ChainStates::default();
+        let mut chain_config = ChainConfig::new();
+        chain_config.magic = ChainConfig::MAGIC;
+        chain_config.version = ChainConfig::VERSION;
+        chain_config.device_count = devices.len() as u32;
+
+        let mut bytes_read = 0u64;
+        for (i, d) in devices.iter().enumerate() {
+            chain_config.devices[i].format = d.format as u32;
+            chain_config.devices[i].data_device_idx = 0;
+            if matches!(d.format, ImageFormat::Vhd) {
+                let cap = unsafe { (call_table.get_input_capacity)(i as u32) };
+                let bat_buf = caches[i * 2].as_mut_ptr();
+                let data_buf = caches[i * 2 + 1].as_mut_ptr();
+                chain_states.vhd_states[i] = unsafe {
+                    VhdState::init(
+                        &call_table,
+                        i as u32,
+                        sector_size,
+                        cap,
+                        bat_buf,
+                        data_buf,
+                        &mut bytes_read,
+                    )
+                };
+                assert!(
+                    chain_states.vhd_states[i].is_some(),
+                    "VhdState::init should succeed for a valid synthetic header (device {i})"
+                );
+            }
+        }
+
+        let mut compressed_buf = std::vec![0u8; COMPRESSED_BUF_SIZE];
+        let mut staging_buf = std::vec![0u8; MAX_CLUSTER_SIZE];
+        let mut staging_cluster_offset = u64::MAX;
+
+        let mut out = std::vec![0xAAu8; chunk_size as usize];
+        let ok = unsafe {
+            read_chain_virtual_cluster(
+                &call_table,
+                0,
+                devices.len(),
+                virtual_offset,
+                out.as_mut_ptr(),
+                chunk_size,
+                sector_size,
+                &chain_config,
+                &mut chain_states,
+                compressed_buf.as_mut_ptr(),
+                staging_buf.as_mut_ptr(),
+                &mut staging_cluster_offset,
+                None,
+                None,
+                0,
+                &mut bytes_read,
+            )
+        };
+        unsafe {
+            let imgs = core::ptr::addr_of_mut!(VHD_IMAGES) as *mut *const u8;
+            for i in 0..VHD_MAX_DEVS {
+                *imgs.add(i) = core::ptr::null();
+            }
+        }
+        (ok, out)
+    }
+
+    // (a) THE REGRESSION GUARD, written before any of the composing arm
+    // was read in detail: a non-differencing dynamic VHD over a backing
+    // device must read exactly as the pre-existing arm always has --
+    // allocated served from the child, unallocated descending to the
+    // backing device. `is_differencing` is false throughout, so neither
+    // branch this phase added is ever taken.
+    #[cfg(feature = "vhd-input")]
+    #[test]
+    fn vhd_arm_dynamic_regression_matches_pre_phase_reads() {
+        let block_size = 4096u32;
+        let child = build_vhd_dynamic_two_block(block_size);
+        let parent = build_vhd_parent_raw(2 * block_size as usize);
+        let devices = [
+            VhdDevice {
+                bytes: child,
+                format: ImageFormat::Vhd,
+            },
+            VhdDevice {
+                bytes: parent,
+                format: ImageFormat::Raw,
+            },
+        ];
+
+        let (ok, out) = run_vhd_chain_read(&devices, 512, 0, block_size as u64);
+        assert!(ok, "allocated dynamic-VHD block must read");
+        let payload_off = 8u64 * 512 + 512;
+        let want: std::vec::Vec<u8> = (0..block_size as u64)
+            .map(|i| vhd_child_byte(payload_off + i))
+            .collect();
+        assert_eq!(
+            out, want,
+            "allocated block must read from the child, unchanged by this phase"
+        );
+
+        let (ok, out) = run_vhd_chain_read(&devices, 512, block_size as u64, block_size as u64);
+        assert!(ok, "unallocated dynamic-VHD block must descend to backing");
+        let want: std::vec::Vec<u8> = (0..block_size as u64)
+            .map(|i| vhd_parent_byte(block_size as u64 + i))
+            .collect();
+        assert_eq!(
+            out, want,
+            "unallocated block must read from the backing device, unchanged by this phase"
+        );
+    }
+
+    // (b) An allocated block whose sector bitmap is all-zero reads wholly
+    // from the parent.
+    #[cfg(feature = "vhd-input")]
+    #[test]
+    fn vhd_arm_allocated_block_all_zero_bitmap_reads_wholly_from_parent() {
+        let block_size = 4096u32;
+        let child =
+            build_vhd_differencing_single_block(vhd::DISK_TYPE_DIFFERENCING, block_size, &[0x00]);
+        let parent = build_vhd_parent_raw(block_size as usize);
+        let devices = [
+            VhdDevice {
+                bytes: child,
+                format: ImageFormat::Vhd,
+            },
+            VhdDevice {
+                bytes: parent,
+                format: ImageFormat::Raw,
+            },
+        ];
+        let (ok, out) = run_vhd_chain_read(&devices, 512, 0, block_size as u64);
+        assert!(
+            ok,
+            "an all-parent-owned block must read successfully with a parent present"
+        );
+        let want: std::vec::Vec<u8> = (0..block_size as u64).map(vhd_parent_byte).collect();
+        assert_eq!(
+            out, want,
+            "an all-zero bitmap must read wholly from the parent"
+        );
+    }
+
+    // (c) All-ones reads wholly from the child.
+    #[cfg(feature = "vhd-input")]
+    #[test]
+    fn vhd_arm_allocated_block_all_ones_bitmap_reads_wholly_from_child() {
+        let block_size = 4096u32;
+        let child =
+            build_vhd_differencing_single_block(vhd::DISK_TYPE_DIFFERENCING, block_size, &[0xFF]);
+        let parent = build_vhd_parent_raw(block_size as usize);
+        let devices = [
+            VhdDevice {
+                bytes: child,
+                format: ImageFormat::Vhd,
+            },
+            VhdDevice {
+                bytes: parent,
+                format: ImageFormat::Raw,
+            },
+        ];
+        let (ok, out) = run_vhd_chain_read(&devices, 512, 0, block_size as u64);
+        assert!(ok);
+        let payload_off = 8u64 * 512 + 512;
+        let want: std::vec::Vec<u8> = (0..block_size as u64)
+            .map(|i| vhd_child_byte(payload_off + i))
+            .collect();
+        assert_eq!(
+            out, want,
+            "an all-ones bitmap must read wholly from the child"
+        );
+    }
+
+    // (d) THE POLARITY PIN. A mixed bitmap reads each sector from the
+    // right device. The child and parent byte patterns use different
+    // moduli specifically so that negating sector_bit_is_child_owned's
+    // bit test corrupts at least one half of the buffer rather than
+    // producing a coincidentally-matching read.
+    #[cfg(feature = "vhd-input")]
+    #[test]
+    fn vhd_arm_mixed_bitmap_reads_each_sector_from_the_right_device() {
+        let block_size = 4096u32;
+        // 0xF0: sectors 0..4 (bytes 0..2048) are the child's, sectors
+        // 4..8 (bytes 2048..4096) are the parent's.
+        let child =
+            build_vhd_differencing_single_block(vhd::DISK_TYPE_DIFFERENCING, block_size, &[0xF0]);
+        let parent = build_vhd_parent_raw(block_size as usize);
+        let devices = [
+            VhdDevice {
+                bytes: child,
+                format: ImageFormat::Vhd,
+            },
+            VhdDevice {
+                bytes: parent,
+                format: ImageFormat::Raw,
+            },
+        ];
+        let (ok, out) = run_vhd_chain_read(&devices, 512, 0, block_size as u64);
+        assert!(ok);
+        let payload_off = 8u64 * 512 + 512;
+        let mut want = std::vec::Vec::with_capacity(block_size as usize);
+        for i in 0..2048u64 {
+            want.push(vhd_child_byte(payload_off + i));
+        }
+        for i in 2048..block_size as u64 {
+            want.push(vhd_parent_byte(i));
+        }
+        assert_eq!(
+            out, want,
+            "a mixed bitmap must serve the child-owned sectors from the child \
+             and the rest from the parent"
+        );
+    }
+
+    // (e) An unallocated block still descends to the parent when a device
+    // follows.
+    #[cfg(feature = "vhd-input")]
+    #[test]
+    fn vhd_arm_unallocated_block_descends_to_parent_when_a_device_follows() {
+        let block_size = 4096u32;
+        let child = build_vhd_unallocated_block(vhd::DISK_TYPE_DIFFERENCING, block_size);
+        let parent = build_vhd_parent_raw(block_size as usize);
+        let devices = [
+            VhdDevice {
+                bytes: child,
+                format: ImageFormat::Vhd,
+            },
+            VhdDevice {
+                bytes: parent,
+                format: ImageFormat::Raw,
+            },
+        ];
+        let (ok, out) = run_vhd_chain_read(&devices, 512, 0, block_size as u64);
+        assert!(
+            ok,
+            "an unallocated differencing block must still descend when a parent follows"
+        );
+        let want: std::vec::Vec<u8> = (0..block_size as u64).map(vhd_parent_byte).collect();
+        assert_eq!(out, want);
+    }
+
+    // (f) A differencing child with no following device still fails at
+    // init_chain_states, regardless of where in the device array it
+    // sits -- the refusal is unconditional (12c's correction of the
+    // original plan, which would have made this position-dependent and
+    // unsafe for a multi-chain operation).
+    #[cfg(feature = "vhd-input")]
+    #[test]
+    fn vhd_differencing_child_with_no_following_device_fails_at_init() {
+        let _guard = VHD_LOCK.lock().unwrap();
+        let block_size = 4096u32;
+        let img = build_vhd_unallocated_block(vhd::DISK_TYPE_DIFFERENCING, block_size);
+        unsafe {
+            VHD_SSZ = 512;
+            let imgs = core::ptr::addr_of_mut!(VHD_IMAGES) as *mut *const u8;
+            let lens = core::ptr::addr_of_mut!(VHD_LENS) as *mut usize;
+            *imgs = img.as_ptr();
+            *lens = img.len();
+        }
+        let call_table = vhd_call_table();
+
+        let mut chain_states = ChainStates::default();
+        let mut chain_config = ChainConfig::new();
+        chain_config.magic = ChainConfig::MAGIC;
+        chain_config.version = ChainConfig::VERSION;
+        chain_config.device_count = 1;
+        chain_config.devices[0].format = ImageFormat::Vhd as u32;
+
+        let mut cache = std::vec![0u8; 2 * MAX_SECTOR_SIZE];
+        let dynamic_bufs_start = cache.as_mut_ptr() as usize;
+        let mut bytes_read = 0u64;
+        let ok = unsafe {
+            init_chain_states(
+                &call_table,
+                &chain_config,
+                &mut chain_states,
+                1,
+                512,
+                dynamic_bufs_start,
+                0,
+                0,
+                &mut bytes_read,
+            )
+        };
+        unsafe {
+            let imgs = core::ptr::addr_of_mut!(VHD_IMAGES) as *mut *const u8;
+            *imgs = core::ptr::null();
+        }
+        let _ = &cache;
+        assert!(
+            !ok,
+            "a differencing VHD with no following device must fail chain init"
+        );
+    }
+
+    // (g) A wholly parent-owned chunk with no device behind the child
+    // fails the read rather than zero-filling.
+    #[cfg(feature = "vhd-input")]
+    #[test]
+    fn vhd_arm_all_parent_owned_chunk_fails_without_a_following_device() {
+        let block_size = 4096u32;
+        let child =
+            build_vhd_differencing_single_block(vhd::DISK_TYPE_DIFFERENCING, block_size, &[0x00]);
+        let devices = [VhdDevice {
+            bytes: child,
+            format: ImageFormat::Vhd,
+        }];
+        let (ok, _out) = run_vhd_chain_read(&devices, 512, 0, block_size as u64);
+        assert!(
+            !ok,
+            "a wholly parent-owned chunk with no parent device behind the child \
+             must fail the read, not zero-fill"
+        );
+    }
+
+    // (h) An unallocated block with no device behind the child also
+    // fails -- a separate code path from (g), reached straight off
+    // block_lookup's Unallocated arm rather than through the sector
+    // bitmap.
+    #[cfg(feature = "vhd-input")]
+    #[test]
+    fn vhd_arm_unallocated_block_fails_without_a_following_device() {
+        let block_size = 4096u32;
+        let child = build_vhd_unallocated_block(vhd::DISK_TYPE_DIFFERENCING, block_size);
+        let devices = [VhdDevice {
+            bytes: child,
+            format: ImageFormat::Vhd,
+        }];
+        let (ok, _out) = run_vhd_chain_read(&devices, 512, 0, block_size as u64);
+        assert!(
+            !ok,
+            "an unallocated block with no parent device behind the child must fail the read"
+        );
+    }
+
+    // (i) A mixed chunk's parent-owned share also fails without a
+    // following device -- the third leaking path 12c closed, reached
+    // through the Mixed arm's own bottom-of-chain branch rather than
+    // (g)'s or (h)'s.
+    #[cfg(feature = "vhd-input")]
+    #[test]
+    fn vhd_arm_mixed_chunk_fails_without_a_following_device() {
+        let block_size = 4096u32;
+        let child =
+            build_vhd_differencing_single_block(vhd::DISK_TYPE_DIFFERENCING, block_size, &[0xF0]);
+        let devices = [VhdDevice {
+            bytes: child,
+            format: ImageFormat::Vhd,
+        }];
+        let (ok, _out) = run_vhd_chain_read(&devices, 512, 0, block_size as u64);
+        assert!(
+            !ok,
+            "a mixed chunk's parent-owned share must fail the read with no \
+             parent device behind the child"
+        );
+    }
+
+    // (j) A chunk starting part way through a 512-byte sector is split at
+    // the right sector rather than the chunk's own start.
+    #[cfg(feature = "vhd-input")]
+    #[test]
+    fn vhd_arm_chunk_starting_part_way_through_a_sector() {
+        let block_size = 4096u32;
+        let child =
+            build_vhd_differencing_single_block(vhd::DISK_TYPE_DIFFERENCING, block_size, &[0xF0]);
+        let parent = build_vhd_parent_raw(block_size as usize);
+        let devices = [
+            VhdDevice {
+                bytes: child,
+                format: ImageFormat::Vhd,
+            },
+            VhdDevice {
+                bytes: parent,
+                format: ImageFormat::Raw,
+            },
+        ];
+        let start = 100u64; // part way through sector 0, which is child-owned
+        let chunk = block_size as u64 - start;
+        let (ok, out) = run_vhd_chain_read(&devices, 512, start, chunk);
+        assert!(ok);
+        let payload_off = 8u64 * 512 + 512;
+        let mut want = std::vec::Vec::with_capacity(chunk as usize);
+        for i in start..2048u64 {
+            want.push(vhd_child_byte(payload_off + i));
+        }
+        for i in 2048..block_size as u64 {
+            want.push(vhd_parent_byte(i));
+        }
+        assert_eq!(
+            out, want,
+            "a chunk starting mid-sector must still split at the right sector"
+        );
+    }
+
+    // (k) A chunk starting part way through a block -- not at sector 0 of
+    // the block, and spanning an ownership change -- resolves the
+    // block-relative first_sector correctly.
+    #[cfg(feature = "vhd-input")]
+    #[test]
+    fn vhd_arm_chunk_starting_part_way_through_a_block() {
+        let block_size = 4096u32;
+        // 0x0F: sectors 0..4 are the parent's, sectors 4..8 the child's.
+        let child =
+            build_vhd_differencing_single_block(vhd::DISK_TYPE_DIFFERENCING, block_size, &[0x0F]);
+        let parent = build_vhd_parent_raw(block_size as usize);
+        let devices = [
+            VhdDevice {
+                bytes: child,
+                format: ImageFormat::Vhd,
+            },
+            VhdDevice {
+                bytes: parent,
+                format: ImageFormat::Raw,
+            },
+        ];
+        let start = 1536u64; // sector 3 (parent-owned), mid-block
+        let chunk = 2048u64; // through sector 6, crossing into the child's run
+        let (ok, out) = run_vhd_chain_read(&devices, 512, start, chunk);
+        assert!(ok);
+        let payload_off = 8u64 * 512 + 512;
+        let mut want = std::vec::Vec::with_capacity(chunk as usize);
+        for i in start..2048u64 {
+            want.push(vhd_parent_byte(i));
+        }
+        for i in 2048..start + chunk {
+            want.push(vhd_child_byte(payload_off + i));
+        }
+        assert_eq!(
+            out, want,
+            "a chunk starting part way through a block must resolve first_sector correctly"
+        );
+    }
+
+    // ========================================================================
     // DMG chain-reader arm (read_chain_virtual_cluster ImageFormat::Dmg)
     //
     // Synthetic UDIF images ([data fork][xml plist w/ one mish][koly]) are
