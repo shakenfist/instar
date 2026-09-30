@@ -14,9 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   without following it. Now it walks the chain and reports each
   parent it resolves, up to the depth limit. When a parent cannot be
   resolved — the file is absent, the path is outside the allowlist, the
-  depth limit is reached, or the path is a Windows absolute path — the
-  walk ends at the last image it did resolve, a reason is printed to
-  stderr, and the command still exits 0. No operation that reads image
+  depth limit is reached, the path is a Windows absolute path, the
+  reference points back at an image already in the chain, or resolution
+  fails for any other reason, such as a permission error on a path
+  component — the walk ends at the last image it did resolve, a reason
+  is printed to stderr, and the command still exits 0. No operation that reads image
   data changed: `convert`, `dd`, `compare`, `bench`, `check`, `measure`
   and `map` still refuse a differencing source, and still refuse it
   identically whether or not the parent file is present.

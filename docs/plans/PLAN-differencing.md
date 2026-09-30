@@ -367,7 +367,7 @@ records `instar-testdata <sha> (#pr)` and is audited there.
 | 8. Rust unit tests and Python integration tests | [PLAN-differencing-phase-08-tests.md](PLAN-differencing-phase-08-tests.md) | Complete | `c416abd` (#588) |
 | 9. Coverage fuzzing of the locator parsers | [PLAN-differencing-phase-09-fuzz.md](PLAN-differencing-phase-09-fuzz.md) | Complete | `044ad77` (#594) |
 | 10. Documentation | [PLAN-differencing-phase-10-docs.md](PLAN-differencing-phase-10-docs.md) | Complete | `036252f` (#598) |
-| 11. Composition: host chain discovery and `info --chain` | [PLAN-differencing-phase-11-chain-host.md](PLAN-differencing-phase-11-chain-host.md) | Planned | |
+| 11. Composition: host chain discovery and `info --chain` | [PLAN-differencing-phase-11-chain-host.md](PLAN-differencing-phase-11-chain-host.md) | Complete | `c66f8b2` (#603) |
 | 12. Composition: guest VHD sector-bitmap read path | PLAN-differencing-phase-12-vhd-compose.md | Not started | |
 | 13. Composition: guest VHDX sector-bitmap read path | PLAN-differencing-phase-13-vhdx-compose.md | Not started | |
 | 14. Composition: per-op rollout, replacing phase 4's refusals | PLAN-differencing-phase-14-op-rollout.md | Not started | |
