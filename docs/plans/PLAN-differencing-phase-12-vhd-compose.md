@@ -38,9 +38,13 @@ specify one for this phase.
   (`src/crates/qcow2/src/lib.rs:8486`) so that, for a differencing
   child, parent-owned sector runs descend to the next chain device
   instead of being served from the child.
-* Lifting the phase 4 refusal at `init_chain_states`
-  (`src/crates/qcow2/src/lib.rs:9528`) **conditionally**: only when a
-  parent device actually follows the child in the chain.
+* Making the composing read fail closed when a parent-owned sector has
+  no parent device behind it, so the new path cannot produce wrong data
+  before a later phase wires it up. This was planned as a conditional
+  lift of the phase 4 refusal at `init_chain_states`, which turned out
+  to be unsafe; the refusal stays unconditional and the guard lives in
+  the reader instead. Corrected decision 5 says why, and F11 records
+  what made the planned condition wrong.
 * Rust unit tests in the qcow2 crate's existing mock-chain harness.
 * A `CHANGELOG.md` entry, and the plan bookkeeping this phase owns.
 
@@ -167,6 +171,59 @@ The two "specifics phases 12 and 13 must confront" are both accurate,
 the sequencing rationale holds, and the libvhdi caveat is correctly
 aimed at phases 8 and 15 rather than here.
 
+The findings below were made executing the plan above, not planning
+it, and are added here rather than left to be inferred from commit
+messages.
+
+**F11. `device_count` counts a flat device array shared by both
+chains, not one chain's length, which is what made decision 5's
+original condition unsafe.** `compare` reads two images at once and
+packs both chains into a single `devices` array: it computes
+`image1_device_count` and `image2_device_count` separately and passes
+their sum as `total_devices` (`src/operations/compare/src/main.rs:107-119`),
+then calls `init_chain_states` with that sum as `device_count`
+(`:215-224`). A differencing VHD child at array index 0, compared
+against one unrelated image at index 1, gives `device_count == 2`: the
+proposed `dev_idx + 1 >= device_count` reads as "a device follows",
+but that device is not this chain's parent. `init_chain_states` has no
+way to see the split point between the two chains -- only the callers
+that built the array do. Decision 5 is corrected in place above rather
+than silently rewritten; see there for the fix.
+
+**F12. The qcow2 crate's feature-gated chain-reader arms, including
+VHD, were invisible to `make lint` and `make test-rust`.** Both
+targets name the gated features explicitly to reach code behind
+`#[cfg(feature = ...)]`, and the list had covered `vdi-input`,
+`parallels-input`, `qcow1-input` and `dmg-input` since those arms
+landed, but never `vhd-input` or `vhdx-input` (`Makefile`'s
+`test-rust` target, `scripts/check-rust.sh`'s two `cargo clippy`
+invocations). The VHD arm -- 12a and 12b's entire subject -- had
+therefore never been compiled by either target; only `convert`,
+`compare` and `bench` reach it, and both targets exclude those
+binaries. Found by 12b's implementer while verifying its own work, not
+anticipated by this plan; fixed by 12b′ below. `vhdx-input` is still
+absent from both lists, and phase 13 will need the same fix.
+
+**F13. The composing VHD arm refuses a chunk that reaches past a
+block's last described sector; the pre-existing non-differencing path
+beside it does not.** `classify_vhd_chunk_ownership`
+(`src/crates/qcow2/src/lib.rs:8711`) fails the read rather than guess
+at ownership past the bitmap's described range. The asymmetry is a
+defect in the *older*, non-differencing path, not something 12b
+introduced -- it is stricter, not wrong -- so it is left alone and
+filed as issue #613 rather than fixed as a side effect of this phase.
+
+**F14. `block_size` is validated only as a non-zero power of two, and
+a crafted 256-byte block reaches the sector-bitmap reader with zero
+sectors and a zero-length bitmap.** `VhdState::init`
+(`src/crates/vhd/src/lib.rs:1614-1618`) checks non-zero and
+power-of-two, nothing more; `sectors_per_block = block_size / 512`
+truncates to 0 for any `block_size` under 512, and the bitmap-size
+formula at `:1635-1636` then yields 0 bytes. Found while building 12a;
+both new entry points refuse this case explicitly rather than dividing
+by zero or reading a payload byte as an ownership bit, and it is not
+filed as an issue because both callers already handle it correctly.
+
 ## Decisions
 
 **1. Ownership is resolved per chunk, not per block, and the bitmap is
@@ -212,16 +269,40 @@ to be wholly child-owned cannot tell the two polarities apart. State
 the polarity in a comment at the point of use, and let 12d's
 mixed-ownership test be what fails if it is inverted.
 
-**5. The phase 4 refusal is lifted only when a parent device actually
-follows the child.** `init_chain_states` keeps refusing a differencing
-VHD that is the last device in the chain, because composing against a
-parent that is not there is exactly the silently-wrong read issue #547
-is about. Concretely: refuse when `dev_idx + 1 >= device_count`.
+**5. The refusal stays unconditional; the chain-boundary guard lives
+in the reader, not in `init_chain_states`.** `init_chain_states`
+continues to refuse every differencing VHD outright, with no
+condition attached -- it has no way to tell a chain boundary from a
+flat device-array boundary (see below). The guard this decision
+originally wanted instead lives in `read_chain_virtual_cluster`'s VHD
+arm, which is passed its own chain's start index and length and fails
+the read -- rather than zero-filling -- whenever a parent-owned sector
+has no parent device behind it within that chain. The shape that would
+give `init_chain_states` those chain-relative bounds, so a refusal
+could be lifted safely, is filed as issue #614; it is what a later
+phase needs before any refusal can move.
+
+**The condition originally proposed here was wrong, and is kept below
+rather than deleted because the reasoning matters to phase 14.** It
+read "refuse when `dev_idx + 1 >= device_count`". `device_count`
+counts the valid entries of a flat device array, not the length of one
+chain, and an operation that reads two images at once packs both
+chains into that single array -- `compare` does exactly this
+(`src/operations/compare/src/main.rs:119`, `:215`), reading each
+chain back relative to its own start and length. For `instar compare
+diff.vhd base.qcow2`, the differencing child sits at index 0 with
+`device_count == 2`: the proposed condition would have lifted the
+refusal for a child with no parent behind it at all, and every
+parent-owned sector would have read back as the child's own zeros --
+reported as success, which is exactly the defect issue #547 describes.
+12c's implementer found this by inspection before committing anything
+against the condition, and reported it rather than committing the
+planned code and hoping review would catch it.
 
 This preserves every existing test and every current user-visible
 behaviour: with phase 14 unbuilt, no composing operation ever builds a
 chain longer than one device for a VHD, so the refusal fires exactly as
-it does today. The lift is dormant until phase 14 wakes it.
+it does today, unconditionally, as it always has.
 
 **6. A differencing child whose parent device is present but whose
 parent is the wrong disk is not this phase's problem.** Size and
@@ -252,14 +333,21 @@ the chain arm when `disk_type == DISK_TYPE_DIFFERENCING`.
 
 ## Step plan
 
-Each step is one commit. 12b depends on 12a; 12c depends on 12b; 12d
-depends on all three. 12e is independent.
+Each step is one commit. 12b depends on 12a; 12b′ depends on 12b; 12c
+depends on 12b′; 12d depends on all four. 12e is independent.
+
+12b′ is not in this list because the plan did not anticipate it: 12b's
+implementer found, while verifying its own work, that the arm it had
+just written was not reachable by `make lint` or `make test-rust` at
+all (see "What the survey found", F12). It is recorded here so the
+step table matches what actually happened.
 
 | Step | Effort | Model | Isolation | Brief for sub-agent |
 |------|--------|-------|-----------|---------------------|
 | 12a | high | opus | none | Add a sector-bitmap reader to `src/crates/vhd/src/lib.rs`. Add a sibling of `block_lookup` (`:1574`) that, for an allocated block, returns both the data offset it returns today **and** the host byte offset of that block's sector bitmap -- which is `bat_entry * 512`, the bitmap being what `block_data_offset` (`:1522`) currently skips past. Do not change `BlockLookup` or `block_lookup` (decision 8). Add a second function that, given the bitmap's host offset and a range of sector indices within the block, reads the covering bitmap bytes through the existing `data_cached_sector` / `data_cache_buf` pair (`:1344-1345`, currently allocated and read by nothing -- see F6 and decision 3) and reports ownership per sector. A set bit means the child owns the sector (decision 4); say so in a comment where the bit is tested. Bitmap size is `(sectors_per_block.div_ceil(8) + 511) & !511` as computed at `:1513-1516`; reuse that rather than recomputing it. This is `no_std` and `no_main` guest code: no allocation, no panicking paths, `checked_*` arithmetic throughout, matching the surrounding style. Unit-test the pure parts in the vhd crate's own test module. |
 | 12b | high | opus | none | Teach the `ImageFormat::Vhd` arm of `read_chain_virtual_cluster` (`src/crates/qcow2/src/lib.rs:8486`) to compose. Leave the fixed-VHD and `BlockLookup::Unallocated` paths exactly as they are -- `continue` is already correct for a differencing child's unallocated block (F3). In the `Allocated` case, when `state.disk_type == vhd::DISK_TYPE_DIFFERENCING`, use 12a's lookup to get the bitmap, walk the chunk's sectors, coalesce maximal runs of equal ownership, and serve each run: child-owned from this device at the data offset it already computes, parent-owned by recursing into `read_chain_virtual_cluster` with `chain_start + dev_offset + 1`, `chain_len - dev_offset - 1`, the run's own virtual offset and `buf.add(run_buf_off)`. **Model this on the extended-L2 subcluster path in the same function at `:8106-8130`** (decision 2, F5) -- same recursion arguments, same `remaining > 0` guard, same zero-fill when nothing remains. Non-differencing dynamic VHDs must take a textually unchanged path: this is the property 12d's first test pins. Preserve the existing sub-sector handling (`intra_sector != 0` → `read_offset_sectors`) for each run rather than assuming runs are sector-aligned in host space. |
-| 12c | medium | opus | none | Relax the phase 4 refusal at `src/crates/qcow2/src/lib.rs:9528` per decision 5: refuse a differencing VHD only when no device follows it in the chain (`dev_idx + 1 >= device_count`). Leave the VHDX twin at `:9556` untouched -- that is phase 13. Rewrite the comment: it currently says "which nothing here can compose", which 12b makes false, and it must now state the surviving invariant (a differencing child with no parent device still reads as silently wrong data, which is what issue #547 is about) without citing a plan phase or step number, which this repo does not allow in landed code. Verify by inspection and say so in the commit message that no current caller can reach the lifted branch, because no host path builds a composing VHD chain (F8). |
+| 12b′ | medium | opus | none | Unplanned, discovered by 12b's implementer while verifying its own work. The qcow2 crate's chain-reader arms are feature-gated, and the workspace `make lint` and `make test-rust` targets use default features, so both name the gated features explicitly to reach them -- a list that has covered `vdi-input`, `parallels-input`, `qcow1-input` and `dmg-input` since those arms landed, but never `vhd-input` or `vhdx-input`. The VHD arm has therefore never been compiled by either target: it reaches a compiler only through `convert`, `compare` and `bench`, which both exclude. Add `vhd-input` to the feature list in `Makefile`'s `test-rust` target and to both `cargo clippy` invocations in `scripts/check-rust.sh`. Demonstrate the fix by injecting a type error into the VHD arm and confirming `make test-rust` then fails to build where it previously passed. Fix any clippy findings the newly-visible code surfaces. Leave `vhdx-input` out of both lists: the VHDX arm is what phase 13 is about to rewrite, and linting it now would be linting code that is about to change; phase 13 will need this same fix. |
+| 12c | medium | opus | none | Relax the phase 4 refusal at `src/crates/qcow2/src/lib.rs:9528` per decision 5: refuse a differencing VHD only when no device follows it in the chain (`dev_idx + 1 >= device_count`). Leave the VHDX twin at `:9556` untouched -- that is phase 13. Rewrite the comment: it currently says "which nothing here can compose", which 12b makes false, and it must now state the surviving invariant (a differencing child with no parent device still reads as silently wrong data, which is what issue #547 is about) without citing a plan phase or step number, which this repo does not allow in landed code. Verify by inspection and say so in the commit message that no current caller can reach the lifted branch, because no host path builds a composing VHD chain (F8). This step's actual outcome diverged from its brief -- see the corrected decision 5 above and commit `a6a49d93`. |
 | 12d | medium | sonnet | none | Rust unit tests for 12a-12c in the qcow2 crate's mock-chain harness. There are no `vhd_arm_*` tests today; `q1_arm_unallocated_descends_to_backing` (`:6591`) and `q1_arm_mixed_chunk_allocated_and_backing` (`:6621`) are the exemplars to copy, including how they build the synthetic devices. Cover, at minimum: a non-differencing dynamic VHD over a backing device reads identically before and after this phase (the regression guard -- write it first); an allocated block whose bitmap is all-zero reads wholly from the parent; all-ones reads wholly from the child; a mixed bitmap reads each sector from the right device, with the two devices carrying distinguishable bytes so an inverted polarity fails rather than passes (decision 4); an unallocated block still descends; and a differencing child with no following device still fails at `init_chain_states`. Build the chains synthetically -- do not add a fixture (decision 7). `make test-rust` must be clean; see `AGENTS.md` on the worktree target-ownership trap if cargo complains about `src/target`. |
 | 12e | low | haiku | none | Housekeeping. Add a `CHANGELOG.md` entry stating that the guest can compose a differencing VHD against its parent and that no operation exposes it yet, so it is not a user-visible change. Amend this plan's *What the survey found* with anything 12a-12d discovered, and record any issue numbers filed. Do not add plan references to any source file or comment. |
 
@@ -269,7 +357,7 @@ depends on all three. 12e is independent.
 |---|---|
 | The bitmap bit polarity is inverted, and every test still passes because the fixtures are wholly child-owned | Decision 4 states the polarity, 12a's brief repeats it, and 12d's mixed-ownership test uses distinguishable bytes on the two devices specifically so an inversion fails. The management session checks that this test would fail if the bit test were negated -- reading the test is not the check; negating the bit and watching it fail is. |
 | A non-differencing dynamic VHD's read path changes as collateral | 12b's brief requires the non-differencing path be textually unchanged, and 12d writes that regression test *first*. The whole Rust suite is expected zero-fail throughout. |
-| The refusal lift makes a differencing VHD with an absent parent read as zeros -- issue #547 reopened by the phase meant to close it | Decision 5 ties the lift to a following device, 12c implements exactly that condition, and 12d tests the no-parent case still refuses. This is the one failure mode that would be silent in production, so it gets a test rather than an argument. |
+| The refusal lift makes a differencing VHD with an absent parent read as zeros -- issue #547 reopened by the phase meant to close it | Materialised during 12c as a variant of this exact risk: the originally planned condition (a following device implies a parent) was itself unsafe, for the `device_count` reason in F11. The refusal stays unconditional instead (decision 5, as corrected), and the reader's three parent-owned read paths fail closed rather than zero-fill when no parent device backs them. 12d tests both halves. This remains the one failure mode that would be silent in production, so it gets a test rather than an argument. |
 | Scope creeps into phase 14 because composition is untestable end to end and that feels wrong | Decision 7 says so explicitly and the definition of done words its coverage claim to match. No step touches `src/vmm/` or `src/operations/`. |
 | Guest memory grows and a large-cluster or many-device chain regresses | Decision 3 reuses buffers that already exist; the change adds no per-device allocation. 12a's brief names the constraint. The guest-op memory traps in `AGENTS.md` (`.bss` overflow, staging only the populated prefix) are worth re-reading before 12a starts. |
 | Run coalescing has an off-by-one at a block or chunk boundary | 12d covers a chunk that starts mid-block and one that spans a block boundary, following `pls_arm_chunk_starting_at_cluster_boundary` (`:6232`) and `q1_arm_small_cluster_walk` (`:6747`) as the local precedent for those cases. |
@@ -279,7 +367,8 @@ depends on all three. 12e is independent.
 * `src/crates/vhd/src/lib.rs` contains a function that reads sector
   bitmap bytes, and `grep -c 'data_cache_buf' src/crates/vhd/src/lib.rs`
   returns more than the 8 occurrences it returns today -- that is, the
-  allocated-but-unused cache identified in F6 is now used.
+  allocated-but-unused cache identified in F6 is now used. **Met**: the
+  count is 11 after this phase (`c249f158`).
 * A differencing VHD child over a parent device, with a block whose
   sector bitmap is mixed, reads each sector from the correct device.
   Demonstrated by a unit test that fails when the ownership bit test is
@@ -289,11 +378,23 @@ depends on all three. 12e is independent.
   byte-identical output to `develop` at `c66f8b25`. This is the phase's
   regression invariant; state the two captured outputs in 12d's commit
   message.
-* `init_chain_states` still refuses a differencing VHD that is the last
-  device in its chain, and a unit test asserts it.
+* `init_chain_states` refuses a differencing VHD, and a unit test
+  asserts it. **This item assumed decision 5's original, conditional
+  form of the refusal; that form was wrong (F11) and was not built.**
+  What is actually done instead: the refusal is unconditional --
+  `init_chain_states` refuses every differencing VHD regardless of
+  chain position, exactly as before this phase -- and the
+  chain-boundary check decision 5 wanted lives in the reader instead,
+  which fails the read (rather than zero-filling) on any of the three
+  paths that could otherwise serve a parent-owned sector with no parent
+  device behind the child. 12d's unit tests assert both halves: the
+  unconditional refusal, and each of the three reader paths failing
+  closed.
 * `make test-rust` passes with zero failures, and the count is stated.
-  The Python integration suite is unchanged and still passes -- it must
-  be, since no command's output changes.
+  **Met**: the qcow2 crate goes from 215 to 226 tests and the whole
+  suite from 2366 to 2377 (`ed4f2669`). The Python integration suite is
+  unchanged and still passes -- it must be, since no command's output
+  changes.
 * No test in this phase depends on a testdata fixture. Coverage is
   crate-level by decision 7, and the definition of done says so rather
   than leaving the absence to be read as an oversight.

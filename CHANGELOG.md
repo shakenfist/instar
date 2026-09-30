@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **The guest chain walker can compose a differencing VHD's allocated
+  block against its parent.** It previously served an allocated block
+  entirely from the child; it now reads the block's per-sector bitmap
+  and serves each 512-byte sector from whichever device owns it,
+  recursing into the parent for the sectors the child does not own. An
+  unallocated block already descended to the parent correctly and is
+  unchanged. This is a crate-level change only: `init_chain_states`
+  still refuses every differencing VHD unconditionally, and only one
+  call site resolves a differencing parent at all, `instar info
+  --chain`'s reporting path. No operation reaches the composing path
+  yet — `instar convert`, `dd`, `compare`, `bench`, `check`, `measure`
+  and `map` still refuse a differencing source exactly as before — so
+  this is not a user-visible change.
+
 - **`instar info --chain` walks differencing VHD and VHDX parent chains.**
   It previously stopped at the child and reported the parent reference
   without following it. Now it walks the chain and reports each

@@ -508,14 +508,28 @@ rather than left as one phase to be split later, the way
   subcluster path (`:8106-8130`) already demonstrates the shape:
   coalesce runs from a bitmap and recurse into the backing chain
   for the sub-ranges this device does not own. The phase 4
-  refusal these phases relax is a single `if` in
+  refusal these phases were expected to relax is a single `if` in
   `init_chain_states` (`:9528` for VHD, `:9556` for VHDX), not a
-  guard inside either parser crate.
+  guard inside either parser crate. **Falsified by phase 12's
+  execution**: the planned condition -- lift the refusal when
+  another device follows the child -- is unsafe, because
+  `init_chain_states`'s `device_count` counts a flat, possibly
+  multi-chain device array (`compare` packs two chains into one),
+  not the length of the child's own chain. Phase 12 built the
+  composing arm but left the refusal unconditional; the guard
+  moved into the reader, which already knows its own chain's
+  bounds. What relaxing the refusal per operation actually needs
+  is filed as issue #614, and it is a phase 14 precondition, not
+  solved by phases 12 or 13 alone.
 * **Phase 14, rollout.** Turning the refusals into composition
   across `convert`, `compare`, `dd`, `bench`, `map`, `measure`
   and `check`. Mechanical once 11 to 13 land, but it is the
   phase that changes what users see, and it wants its own review
-  rather than being tacked onto a guest phase.
+  rather than being tacked onto a guest phase. Needs issue #614
+  settled first: per-operation composition means lifting
+  `init_chain_states`'s refusal, and phase 12 found that doing so
+  safely requires knowing a device's own chain boundary, which
+  `device_count` alone does not give it.
 * **Phase 15, tests and fuzz.** Cross-validation against the
   phase 1 oracle for chains instar wrote and chains it did not,
   plus coverage fuzzing of the compose path. Its harness drives
