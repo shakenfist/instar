@@ -102,6 +102,48 @@ ADVERSARIAL_LOCATOR_FIXTURES = (
     ('vhd-diff-locator-conflicting', 'conflict-parent-name.vhd'),
 )
 
+# The stderr reasons the reporting walk may give for each fixture above,
+# from `UnresolvedParent::describe` (`src/vmm/src/main.rs`). A one-image
+# chain alone cannot tell "the allowlist correctly rejected this" apart
+# from "resolution silently failed", and these six fixtures do not all
+# fail for the same reason -- measured directly against the built binary,
+# not assumed:
+#
+# * `/etc/passwd` is an absolute POSIX path, so it is classified and
+#   rejected as outside the allowlist -- the property this whole fixture
+#   family exists to exercise.
+# * the UNC path is classified as a Windows absolute path before the
+#   allowlist is even consulted.
+# * the URL, overlong and conflicting-name fixtures all name something
+#   that plain path resolution never finds beside the child, so they end
+#   at "was not found" rather than at the allowlist.
+# * the traversal fixture gives either, and which one is a fact about the
+#   host rather than about instar. `../../../` is resolved relative to the
+#   fixture's own directory, so it reaches a real `/etc/passwd` -- and the
+#   allowlist -- only where the testdata tree sits within three levels of
+#   the root, as CI's `/testdata/` mount does. A deeper checkout, which is
+#   every development clone, traverses to a path that does not exist and
+#   stops at "was not found" first, because resolution canonicalises
+#   before the allowlist is consulted. Both are refusals the walk
+#   classified and named, which is the whole point of pinning them, so
+#   the values here are tuples and the traversal fixture carries both.
+ADVERSARIAL_LOCATOR_REASONS = {
+    'vhd-diff-locator-etc-passwd': (
+        "parent '/etc/passwd' is outside the backing file allowlist",
+    ),
+    'vhd-diff-locator-dotdot': (
+        "parent '../../../etc/passwd' was not found",
+        "parent '../../../etc/passwd' is outside the backing file allowlist",
+    ),
+    'vhd-diff-locator-unc': (
+        "parent '\\\\attacker\\share\\probe' is a Windows absolute path and cannot be "
+        "resolved on this host",
+    ),
+    'vhd-diff-locator-url': ("parent 'http://attacker.example/probe' was not found",),
+    'vhd-diff-locator-overlong': ('was not found',),
+    'vhd-diff-locator-conflicting': ("parent 'conflict-parent-name.vhd' was not found",),
+}
+
 # The subset with a real, resolvable parent. Used where the test needs
 # `info` to report a parent name, which `vhd-differencing` cannot do.
 #
@@ -583,16 +625,24 @@ class TestDifferencingInfoReports(DifferencingTestBase):
         )
         self.assertIn('file format: vpc', stdout, f'stdout={stdout!r}')
 
-    def test_info_chain_stops_at_a_vhd_parent(self):
-        """`info --chain` reports a 1-image chain and exits 0.
+    def test_info_chain_walks_a_resolvable_vhd_or_vhdx_parent(self):
+        """`info --chain` walks a resolvable VHD or VHDX parent.
 
-        Host-side chain discovery stops at a VHD or VHDX parent --
-        walking it is phase 11's business -- so the chain listing has
-        one entry, annotated with the parent reference it did not
-        follow. This pins the current boundary; phase 11 will change it
-        and should have to change this test to do so.
+        Host-side chain discovery used to stop at any VHD or VHDX parent,
+        annotated but never opened. That gate is now a walk
+        policy (`ChainUse`, `src/vmm/src/main.rs`): only `run_info`'s
+        `--chain` branch passes `ChainUse::Report`, so it is the sole
+        caller that resolves a differencing parent, while every composing
+        operation still passes `ChainUse::Compose` and refuses identically
+        -- see `TestDifferencingParentAbsent` for that half of the
+        invariant. All three fixtures below name a parent that sits beside
+        them, so the chain now has two entries, and `[1]` must be the
+        parent resolved to an absolute path: a relative path there would
+        mean the walk happened to find the file rather than resolving it
+        against a known directory, which is not the guarantee this test
+        exists to pin.
         """
-        for image_id, _parent_name in DIFFERENCING_CHAIN_FIXTURES:
+        for image_id, parent_name in DIFFERENCING_CHAIN_FIXTURES:
             with self.subTest(image=image_id):
                 source = self.differencing_image(image_id)
                 stdout, stderr, rc = self.run_instar_info(source, chain=True)
@@ -601,8 +651,35 @@ class TestDifferencingInfoReports(DifferencingTestBase):
                     f'{image_id}: info --chain must not error; stderr={stderr!r}'
                 )
                 self.assertIn(
-                    'Chain: 1 image(s)', stdout,
-                    f'{image_id}: expected a one-image chain; stdout={stdout!r}'
+                    'Chain: 2 image(s)', stdout,
+                    f'{image_id}: expected a two-image chain now the parent '
+                    f'is resolved; stdout={stdout!r}'
+                )
+                parent_lines = [
+                    line for line in stdout.splitlines()
+                    if line.startswith('  [1] ')
+                ]
+                self.assertEqual(
+                    1, len(parent_lines),
+                    f'{image_id}: expected exactly one [1] chain entry; '
+                    f'stdout={stdout!r}'
+                )
+                match = re.match(r'^  \[1\] (\S+) ', parent_lines[0])
+                self.assertIsNotNone(
+                    match,
+                    f'{image_id}: could not parse the [1] entry path from '
+                    f'{parent_lines[0]!r}'
+                )
+                parent_path = Path(match.group(1))
+                self.assertTrue(
+                    parent_path.is_absolute(),
+                    f'{image_id}: expected [1] to be an absolute path, got '
+                    f'{parent_path}; stdout={stdout!r}'
+                )
+                self.assertEqual(
+                    parent_name, parent_path.name,
+                    f'{image_id}: expected [1] to resolve to {parent_name!r}, '
+                    f'got {parent_path}'
                 )
 
 
@@ -668,6 +745,132 @@ class TestDifferencingParentAbsent(DifferencingTestBase):
                     'Backing file not found', stderr,
                     f'{image_id}: stderr={stderr!r}'
                 )
+
+    def test_info_chain_reports_one_image_for_an_orphaned_child(self):
+        """`info --chain` on an orphaned child stays a one-image chain, rc 0.
+
+        This is the walking caller's half of the same invariant the two
+        tests above pin for the refusing callers: the reporting walk
+        (`ChainUse::Report`) must not depend on the parent existing either.
+        An unresolvable parent -- for whatever reason --
+        ends the listing without erroring, so an orphaned child's own
+        directory listing is empty of everything but the child, and the
+        walk stops with a "was not found" reason rather than failing the
+        command. Both real chains are covered, VHD and VHDX.
+        """
+        for image_id, parent_name in DIFFERENCING_CHAIN_FIXTURES:
+            with self.subTest(image=image_id):
+                orphan = self._orphaned_copy(image_id)
+                stdout, stderr, rc = self.run_instar_info(orphan, chain=True)
+                self.assertEqual(
+                    0, rc,
+                    f'{image_id}: info --chain on an orphaned child must '
+                    f'not error; stderr={stderr!r}'
+                )
+                self.assertIn(
+                    'Chain: 1 image(s)', stdout,
+                    f'{image_id}: expected a one-image chain once the '
+                    f'parent is gone; stdout={stdout!r}'
+                )
+                expected_reason = f"parent '{parent_name}' was not found"
+                self.assertIn(
+                    expected_reason, stderr,
+                    f'{image_id}: expected {expected_reason!r} on stderr; '
+                    f'stderr={stderr!r}'
+                )
+
+    def _run_composing_op(self, op, source, tmp_dir):
+        """Run one composing operation against `source`.
+
+        Returns (stdout, stderr, rc). `tmp_dir` is scratch space for the
+        two operations that write an output file (`convert`, `dd`); the
+        others ignore it.
+        """
+        out = Path(tmp_dir) / 'out.raw'
+        if op == 'convert':
+            return self.run_instar_convert(source, out, output_format='raw')
+        if op == 'dd':
+            return self.run_instar_dd([f'if={source}', f'of={out}'])
+        if op == 'compare':
+            return self.run_instar_compare(source, source)
+        if op == 'bench':
+            return self.run_instar_bench('-c', '4', source)
+        if op == 'check':
+            return self.run_instar_check(source)
+        if op == 'measure':
+            return self.run_instar_measure(source)
+        if op == 'map':
+            return self.run_instar_map(source)
+        raise ValueError(f'unknown composing op {op!r}')
+
+    def test_composing_operations_are_unchanged_by_parent_presence(self):
+        """Every composing operation is byte-for-byte unchanged either way.
+
+        This is the central invariant of the walk policy: a policy
+        that only `run_info`'s `--chain` branch selects cannot make a
+        composing operation's refusal contingent on the parent, because
+        none of the other nine `discover_backing_chain` call sites ever
+        resolves a VHD or VHDX parent -- they keep passing
+        `ChainUse::Compose` and propagating every error unchanged. The two
+        tests above, and `TestDifferencingRefusal`, only assert that both
+        runs happen to contain the same fixed refusal sentence, which
+        would still pass if a path leaked into some *other* part of the
+        output. Diffing stdout, stderr and exit code exactly, for every
+        composing operation, against the same fixture with and without its
+        real parent, is the test that would actually fail if that
+        boundary were ever crossed.
+        """
+        composing_ops = ('convert', 'dd', 'compare', 'bench', 'check', 'measure', 'map')
+        for image_id, _parent_name in DIFFERENCING_CHAIN_FIXTURES:
+            with self.subTest(image=image_id):
+                present = self.differencing_image(image_id)
+                orphan = self._orphaned_copy(image_id)
+
+                def anonymise(text, source, workdir):
+                    """Mask the paths that differ by construction, not by behaviour.
+
+                    The two runs necessarily read a different file and
+                    write into a different scratch directory, so an
+                    operation that named either would differ here for a
+                    reason that has nothing to do with the parent. Nothing
+                    prints them today, which is why this started as a raw
+                    comparison; masking keeps the diff strict about the
+                    invariant rather than about paths, so an operation that
+                    later names its input or its output does not turn this
+                    into a false failure. Both are masked, not just the
+                    input, because the output directory has exactly the
+                    same property.
+                    """
+                    return text.replace(str(source), '<SRC>').replace(str(workdir), '<WORKDIR>')
+                for op in composing_ops:
+                    with self.subTest(image=image_id, op=op):
+                        with tempfile.TemporaryDirectory() as tmp_present:
+                            with tempfile.TemporaryDirectory() as tmp_orphan:
+                                p_stdout, p_stderr, p_rc = self._run_composing_op(
+                                    op, present, tmp_present
+                                )
+                                a_stdout, a_stderr, a_rc = self._run_composing_op(
+                                    op, orphan, tmp_orphan
+                                )
+                                self.assertEqual(
+                                    p_rc, a_rc,
+                                    f'{image_id}/{op}: exit code changed when '
+                                    f'the parent went missing: {p_rc} -> {a_rc}'
+                                )
+                                self.assertEqual(
+                                    anonymise(p_stdout, present, tmp_present),
+                                    anonymise(a_stdout, orphan, tmp_orphan),
+                                    f'{image_id}/{op}: stdout changed when '
+                                    f'the parent went missing; present='
+                                    f'{p_stdout!r} absent={a_stdout!r}'
+                                )
+                                self.assertEqual(
+                                    anonymise(p_stderr, present, tmp_present),
+                                    anonymise(a_stderr, orphan, tmp_orphan),
+                                    f'{image_id}/{op}: stderr changed when '
+                                    f'the parent went missing; present='
+                                    f'{p_stderr!r} absent={a_stderr!r}'
+                                )
 
 
 class TestDifferencingNegativeControls(DifferencingTestBase):
@@ -835,7 +1038,15 @@ class TestDifferencingAdversarialLocators(DifferencingTestBase):
         `vhd-diff-locator-etc-passwd` in particular names a path that
         really does exist on the machine running the test, so a reader
         that resolved-and-opened its locator would have something to
-        find. The chain must still be one image long.
+        find. The chain must still be one image long -- that is the
+        security property and the walk must not weaken it -- but a
+        one-image chain by itself does not distinguish "the allowlist
+        correctly rejected this" from "resolution silently failed", which
+        is exactly the same shape of bug either way. So this test also
+        pins the stderr reason the reporting walk gives for each fixture
+        against `ADVERSARIAL_LOCATOR_REASONS`, whose comment explains why
+        one of the six admits two reasons: the chain stays one image long
+        *for the right reason*, not by accident.
         """
         for image_id, expected in ADVERSARIAL_LOCATOR_FIXTURES:
             with self.subTest(image=image_id):
@@ -855,6 +1066,15 @@ class TestDifferencingAdversarialLocators(DifferencingTestBase):
                     expected, stdout,
                     f'{image_id}: expected the locator to be reported '
                     f'verbatim; stdout={stdout!r}'
+                )
+                expected_reasons = ADVERSARIAL_LOCATOR_REASONS[image_id]
+                self.assertTrue(
+                    any(reason in stderr for reason in expected_reasons),
+                    f'{image_id}: expected one of the reasons '
+                    f'{expected_reasons!r} on stderr -- a one-image chain '
+                    f'alone cannot show the allowlist (or the classifier) '
+                    f'did the rejecting rather than resolution silently '
+                    f'failing; stderr={stderr!r}'
                 )
 
     def test_info_json_names_the_parent_as_a_vhd(self):
