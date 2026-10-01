@@ -202,7 +202,8 @@ therefore never been compiled by either target; only `convert`,
 `compare` and `bench` reach it, and both targets exclude those
 binaries. Found by 12b's implementer while verifying its own work, not
 anticipated by this plan; fixed by 12b′ below. `vhdx-input` is still
-absent from both lists, and phase 13 will need the same fix.
+absent from both lists, and phase 13 will need the same fix. Tracked as
+issue #616, so the deferral does not rest on this plan being reread.
 
 **F13. The composing VHD arm refuses a chunk that reaches past a
 block's last described sector; the pre-existing non-differencing path

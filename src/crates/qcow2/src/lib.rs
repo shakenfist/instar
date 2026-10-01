@@ -6953,6 +6953,12 @@ mod tests {
     static mut VHD_LENS: [usize; VHD_MAX_DEVS] = [0; VHD_MAX_DEVS];
     #[cfg(feature = "vhd-input")]
     static mut VHD_SSZ: usize = 512;
+    #[cfg(feature = "vhd-input")]
+    static mut VHD_ERR_OP: [u8; 32] = [0; 32];
+    #[cfg(feature = "vhd-input")]
+    static mut VHD_ERR_STATUS: u32 = 0;
+    #[cfg(feature = "vhd-input")]
+    static mut VHD_ERR_CALLS: u32 = 0;
 
     /// Differencing child byte at absolute host offset `o`.
     #[cfg(feature = "vhd-input")]
@@ -7025,12 +7031,61 @@ mod tests {
         VHD_SSZ
     }
 
+    /// Record what `send_error` was called with.
+    ///
+    /// `init_chain_states` returns a bare `bool`, so this channel
+    /// carries the only evidence of *why* a device was rejected. A test
+    /// that asserts the return value alone passes for any init failure,
+    /// including a broken fixture, which is exactly the failure the
+    /// differencing refusal must not be confused with.
+    #[cfg(feature = "vhd-input")]
+    unsafe extern "C" fn vhd_send_err(op: *const u8, _sub: *const u8, _off: u64, status: u32) {
+        VHD_ERR_CALLS += 1;
+        VHD_ERR_STATUS = status;
+        let dst = core::ptr::addr_of_mut!(VHD_ERR_OP) as *mut u8;
+        core::ptr::write_bytes(dst, 0, 32);
+        for i in 0..31 {
+            let b = *op.add(i);
+            *dst.add(i) = b;
+            if b == 0 {
+                break;
+            }
+        }
+    }
+
+    #[cfg(feature = "vhd-input")]
+    fn vhd_reset_errors() {
+        unsafe {
+            VHD_ERR_CALLS = 0;
+            VHD_ERR_STATUS = 0;
+            let dst = core::ptr::addr_of_mut!(VHD_ERR_OP) as *mut u8;
+            core::ptr::write_bytes(dst, 0, 32);
+        }
+    }
+
+    /// How many times `send_error` was called since the last reset, the
+    /// operation marker of the last call, and its status.
+    #[cfg(feature = "vhd-input")]
+    fn vhd_last_error() -> (u32, std::string::String, u32) {
+        unsafe {
+            let src = core::ptr::addr_of!(VHD_ERR_OP) as *const u8;
+            let mut n = 0usize;
+            while n < 32 && *src.add(n) != 0 {
+                n += 1;
+            }
+            let op =
+                core::str::from_utf8(core::slice::from_raw_parts(src, n)).unwrap_or("<not utf-8>");
+            (VHD_ERR_CALLS, std::string::String::from(op), VHD_ERR_STATUS)
+        }
+    }
+
     #[cfg(feature = "vhd-input")]
     fn vhd_call_table() -> shared::CallTable {
         shared::CallTable {
             read_input_sector: vhd_read_sector,
             get_input_capacity: vhd_capacity,
             get_input_sector_size: vhd_ssz,
+            send_error: vhd_send_err,
             ..stub_call_table()
         }
     }
@@ -7244,7 +7299,13 @@ mod tests {
         virtual_offset: u64,
         chunk_size: u64,
     ) -> (bool, std::vec::Vec<u8>) {
-        let _guard = VHD_LOCK.lock().unwrap();
+        // The mock's device table is process-wide mutable state, so one
+        // test at a time. Recovering the poisoned guard rather than
+        // unwrapping it matters because the asserts below run while it
+        // is held: unwrapping would turn the first genuine failure into
+        // a PoisonError in every later test, hiding the one that
+        // actually broke.
+        let _guard = VHD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         assert!(devices.len() <= VHD_MAX_DEVS);
 
         unsafe {
@@ -7379,6 +7440,24 @@ mod tests {
         assert_eq!(
             out, want,
             "unallocated block must read from the backing device, unchanged by this phase"
+        );
+
+        // And with nothing behind it. The guard this phase added to the
+        // unallocated case fires only for a differencing child; a lone
+        // dynamic VHD must still zero-fill, which is what reading every
+        // sparse dynamic image depends on. `run_vhd_chain_read`
+        // sentinel-fills the output, so an all-zero result is the arm's
+        // work rather than an untouched buffer.
+        let lone = [VhdDevice {
+            bytes: build_vhd_unallocated_block(vhd::DISK_TYPE_DYNAMIC, block_size),
+            format: ImageFormat::Vhd,
+        }];
+        let (ok, out) = run_vhd_chain_read(&lone, 512, 0, block_size as u64);
+        assert!(ok, "a lone dynamic VHD's unallocated block must still read");
+        assert_eq!(
+            out,
+            std::vec![0u8; block_size as usize],
+            "a lone dynamic VHD's unallocated block must zero-fill rather than fail"
         );
     }
 
@@ -7526,17 +7605,36 @@ mod tests {
     // child's zeros (issue #547).
     #[cfg(feature = "vhd-input")]
     #[test]
-    fn vhd_differencing_child_is_refused_at_init_whatever_follows_it() {
-        for (device_count, label) in [
-            (1u32, "a lone differencing device"),
+    fn vhd_init_refuses_a_differencing_child_and_admits_a_dynamic_one() {
+        for (disk_type, device_count, refused, label) in [
             (
+                vhd::DISK_TYPE_DIFFERENCING,
+                1u32,
+                true,
+                "a lone differencing device",
+            ),
+            (
+                vhd::DISK_TYPE_DIFFERENCING,
                 2u32,
+                true,
                 "a differencing device at index 0 of a two-device array",
             ),
+            // The controls. One header field differs from the cases
+            // above and nothing else does, so an assertion that passes
+            // because the synthetic footer, the hand-built cache or a
+            // stub call-table entry is broken -- rather than because
+            // the refusal fired -- cannot pass here.
+            (vhd::DISK_TYPE_DYNAMIC, 1u32, false, "a lone dynamic device"),
+            (
+                vhd::DISK_TYPE_DYNAMIC,
+                2u32,
+                false,
+                "a dynamic device at index 0 of a two-device array",
+            ),
         ] {
-            let _guard = VHD_LOCK.lock().unwrap();
+            let _guard = VHD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let block_size = 4096u32;
-            let img = build_vhd_unallocated_block(vhd::DISK_TYPE_DIFFERENCING, block_size);
+            let img = build_vhd_unallocated_block(disk_type, block_size);
             // The follower is a second, unrelated raw device, exactly as
             // a two-image operation lays its arguments out. It is not
             // this child's parent, which is the whole point.
@@ -7565,6 +7663,7 @@ mod tests {
             let mut cache = std::vec![0u8; 4 * MAX_SECTOR_SIZE];
             let dynamic_bufs_start = cache.as_mut_ptr() as usize;
             let mut bytes_read = 0u64;
+            vhd_reset_errors();
             let ok = unsafe {
                 init_chain_states(
                     &call_table,
@@ -7584,7 +7683,35 @@ mod tests {
                 *imgs.add(1) = core::ptr::null();
             }
             let _ = &cache;
-            assert!(!ok, "a differencing VHD must fail chain init: {label}");
+            let (calls, op, status) = vhd_last_error();
+            if refused {
+                assert!(!ok, "a differencing VHD must fail chain init: {label}");
+                // Why it failed, not just that it did. `init_chain_states`
+                // returns a bare bool, so without this the assertion
+                // above is satisfied by any init failure at all.
+                assert_eq!(
+                    calls, 1,
+                    "the refusal must be raised on send_error exactly once: {label}"
+                );
+                assert_eq!(
+                    op,
+                    shared::DifferencingRefusal::OPERATION,
+                    "init must fail by raising the differencing refusal, not for \
+                     some unrelated reason: {label}"
+                );
+                assert_eq!(
+                    status,
+                    shared::DifferencingRefusal::STATUS_VHD,
+                    "the refusal must name VHD rather than VHDX: {label}"
+                );
+            } else {
+                assert!(
+                    ok,
+                    "the same harness must initialise a non-differencing VHD, or \
+                     the refusal assertions prove nothing: {label}"
+                );
+                assert_eq!(calls, 0, "a dynamic VHD must raise no refusal: {label}");
+            }
         }
     }
 
@@ -7890,9 +8017,11 @@ mod tests {
     #[cfg(feature = "vhd-input")]
     #[test]
     fn vhd_arm_ownership_run_crossing_a_bitmap_byte() {
-        let block_size = 8192u32; // 16 sectors, so a two-byte bitmap
-                                  // 0x0F, 0xF0: sectors 0..4 parent, 4..12 child, 12..16 parent.
-                                  // The child's run spans the byte boundary at sector 8.
+        // 8192 bytes is 16 sectors, so a two-byte bitmap. 0x0F, 0xF0
+        // gives sectors 0..4 to the parent, 4..12 to the child and
+        // 12..16 to the parent, so the child's run spans the byte
+        // boundary at sector 8.
+        let block_size = 8192u32;
         let child = build_vhd_differencing_blocks(
             vhd::DISK_TYPE_DIFFERENCING,
             block_size,
@@ -7934,38 +8063,50 @@ mod tests {
     // (p) A chunk reaching past the block its bitmap describes is
     // refused. Every other fixture here is a single block, so nothing
     // exercised the crossing case through the arm. A bitmap describes
-    // its own block
-    // only, so the sectors past the boundary have no owner here, and
-    // inventing one is the failure mode this phase exists to prevent.
+    // its own block only, so the sectors past the boundary have no
+    // owner here, and inventing one is the failure mode this phase
+    // exists to prevent.
+    //
+    // Both ownership shapes of the described prefix are driven, because
+    // they refuse by different routes. An all-parent prefix is refused
+    // while the chunk is still being classified; a mixed one classifies
+    // and is refused by the second walk that fills the child's runs.
+    // Only the first case is reached if classification ever stops as
+    // soon as it has seen both a child run and a parent run.
     #[cfg(feature = "vhd-input")]
     #[test]
     fn vhd_arm_chunk_crossing_a_block_boundary_is_refused() {
         let block_size = 4096u32;
-        let child = build_vhd_differencing_blocks(
-            vhd::DISK_TYPE_DIFFERENCING,
-            block_size,
-            8,
-            512,
-            &[Some(&[0xF0]), Some(&[0x0F])],
-        );
-        let parent = build_vhd_parent_raw(2 * block_size as usize);
-        let devices = [
-            VhdDevice {
-                bytes: child,
-                format: ImageFormat::Vhd,
-            },
-            VhdDevice {
-                bytes: parent,
-                format: ImageFormat::Raw,
-            },
-        ];
-        // Starts in block 0's second half and runs into block 1.
-        let (ok, _out) = run_vhd_chain_read(&devices, 512, 2048, block_size as u64);
-        assert!(
-            !ok,
-            "a chunk reaching past the end of the block its bitmap describes \
-             must be refused, not served from the next block's sectors"
-        );
+        for (block0, label) in [
+            (0xF0u8, "a prefix wholly the parent's"),
+            (0x0Au8, "a prefix mixed between child and parent"),
+        ] {
+            let child = build_vhd_differencing_blocks(
+                vhd::DISK_TYPE_DIFFERENCING,
+                block_size,
+                8,
+                512,
+                &[Some(&[block0]), Some(&[0x0F])],
+            );
+            let parent = build_vhd_parent_raw(2 * block_size as usize);
+            let devices = [
+                VhdDevice {
+                    bytes: child,
+                    format: ImageFormat::Vhd,
+                },
+                VhdDevice {
+                    bytes: parent,
+                    format: ImageFormat::Raw,
+                },
+            ];
+            // Starts in block 0's second half and runs into block 1.
+            let (ok, _out) = run_vhd_chain_read(&devices, 512, 2048, block_size as u64);
+            assert!(
+                !ok,
+                "a chunk reaching past the end of the block its bitmap describes \
+                 must be refused, not served from the next block's sectors: {label}"
+            );
+        }
     }
 
     // (q) A chunk wholly inside the second block of a multi-block
@@ -9098,6 +9239,17 @@ unsafe fn classify_vhd_chunk_ownership(
     let mut any_child = false;
     let mut any_parent = false;
 
+    // The walk runs to the end of the chunk even once both answers are
+    // in, because it is not only a classification. A stretch of the
+    // chunk the bitmap cannot describe -- a chunk reaching past the
+    // block its bitmap covers -- makes `next_vhd_ownership_run` fail,
+    // and that failure is what refuses the read instead of inventing an
+    // owner for those sectors. `read_vhd_child_runs` walks the same
+    // runs again and would refuse such a chunk by itself, so stopping
+    // here once `any_child && any_parent` would not change an answer
+    // today; it would leave one check where there are two, to save work
+    // bounded by the chunk's bitmap bytes -- 16 per 64 KiB chunk, all
+    // served from the per-device sector cache rather than a device read.
     while served < chunk_size {
         let run = next_vhd_ownership_run(
             call_table,
@@ -9242,6 +9394,22 @@ unsafe fn read_vhd_child_runs(
         sector_byte = 0;
     }
     true
+}
+
+/// How many devices sit behind `chain_start + dev_offset` in a chain of
+/// `chain_len`.
+///
+/// `None` means the caller's device offset was not inside the chain,
+/// which the walk's own loop bound makes impossible. It is returned
+/// rather than asserted because every caller uses the answer to decide
+/// whether a sector the current device does not hold has anywhere to
+/// come from, and all three run in guest binaries built in release,
+/// where a `debug_assert` is absent and a wrapping subtraction would
+/// hand back a chain length of nearly `usize::MAX` and recurse into
+/// devices that do not exist.
+#[inline]
+fn devices_behind(chain_len: usize, dev_offset: usize) -> Option<usize> {
+    chain_len.checked_sub(dev_offset)?.checked_sub(1)
 }
 
 /// Read one cluster's worth of virtual data by walking a backing chain.
@@ -9454,7 +9622,10 @@ pub unsafe fn read_chain_virtual_cluster(
                                 } else {
                                     // UNALLOC: recurse into backing chain
                                     let buf_off = (i * sc_size) as usize;
-                                    let remaining = chain_len - dev_offset - 1;
+                                    let remaining = match devices_behind(chain_len, dev_offset) {
+                                        Some(r) => r,
+                                        None => return false,
+                                    };
                                     if remaining > 0 {
                                         if !read_chain_virtual_cluster(
                                             call_table,
@@ -9542,7 +9713,10 @@ pub unsafe fn read_chain_virtual_cluster(
                                 if is_zero || (!is_alloc && host_offset == 0) {
                                     core::ptr::write_bytes(buf.add(buf_off), 0, sc_size as usize);
                                 } else if !is_alloc {
-                                    let remaining = chain_len - dev_offset - 1;
+                                    let remaining = match devices_behind(chain_len, dev_offset) {
+                                        Some(r) => r,
+                                        None => return false,
+                                    };
                                     if remaining > 0 {
                                         if !read_chain_virtual_cluster(
                                             call_table,
@@ -9933,16 +10107,15 @@ pub unsafe fn read_chain_virtual_cluster(
                                 }
                             };
 
-                            // Devices still behind this one. The
-                            // loop bounds dev_offset below
-                            // chain_len, so neither subtraction
-                            // can wrap. The value decides whether
-                            // a parent-owned sector has anywhere
-                            // to come from, so the invariant it
-                            // rests on is asserted rather than
-                            // left to the reader.
-                            debug_assert!(dev_offset < chain_len);
-                            let remaining = chain_len - dev_offset - 1;
+                            // Devices still behind this one. The value
+                            // decides whether a parent-owned sector has
+                            // anywhere to come from, so it fails closed
+                            // rather than wrapping if the loop bound
+                            // ever stops holding.
+                            let remaining = match devices_behind(chain_len, dev_offset) {
+                                Some(r) => r,
+                                None => return false,
+                            };
                             match ownership {
                                 // Wholly this file's, which is the common
                                 // case: fall through to the read a plain
