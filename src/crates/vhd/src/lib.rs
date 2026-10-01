@@ -4942,7 +4942,7 @@ mod tests {
     /// A `VhdState` with no device behind it, for the arithmetic-only
     /// accessors. The cache pointers are never dereferenced because no
     /// I/O is performed.
-    fn bitmapless_state(block_size: u32) -> VhdState {
+    fn arithmetic_only_state(block_size: u32) -> VhdState {
         VhdState {
             device_idx: 0,
             disk_type: DISK_TYPE_DIFFERENCING,
@@ -5153,13 +5153,16 @@ mod tests {
     fn sectors_per_block_counts_512_byte_sectors() {
         // Bitmap bits count 512-byte sectors whatever the device's
         // sector size is, so these do not vary with it.
-        assert_eq!(bitmapless_state(2 * 1024 * 1024).sectors_per_block(), 4096);
-        assert_eq!(bitmapless_state(512 * 1024).sectors_per_block(), 1024);
-        assert_eq!(bitmapless_state(65536).sectors_per_block(), 128);
-        assert_eq!(bitmapless_state(512).sectors_per_block(), 1);
+        assert_eq!(
+            arithmetic_only_state(2 * 1024 * 1024).sectors_per_block(),
+            4096
+        );
+        assert_eq!(arithmetic_only_state(512 * 1024).sectors_per_block(), 1024);
+        assert_eq!(arithmetic_only_state(65536).sectors_per_block(), 128);
+        assert_eq!(arithmetic_only_state(512).sectors_per_block(), 1);
         // A crafted block smaller than a sector describes no sector, and
         // the coalescer refuses such a block rather than dividing by it.
-        assert_eq!(bitmapless_state(256).sectors_per_block(), 0);
+        assert_eq!(arithmetic_only_state(256).sectors_per_block(), 0);
         assert_eq!(run_over(&[0xFFu8; 512], 0, 1, 0).0, None);
     }
 }
