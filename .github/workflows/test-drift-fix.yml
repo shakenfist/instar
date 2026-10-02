@@ -53,6 +53,10 @@ on:
         required: false
         default: '50'
         type: string
+    secrets:
+      GITLAB_TESTDATA_TOKEN:
+        description: 'Read access to the instar-testdata GitLab repository, used by Prepare instar-testdata.'
+        required: false
   schedule:
     # Run weekly on Monday at 6am UTC
     - cron: '0 6 * * 1'
@@ -142,7 +146,7 @@ jobs:
         id: prior_failures
         if: env.IS_PR_RUN == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           echo "Fetching failure details from PR #${PR_NUMBER}..."
 
@@ -245,7 +249,7 @@ jobs:
           steps.initial_test.outputs.tests_passed == 'true' &&
           steps.prior_failures.outputs.has_prior_failures != 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           echo "All tests pass and no new images found. Nothing to do."
           if [ "${IS_PR_RUN}" == "true" ]; then
@@ -641,7 +645,7 @@ jobs:
           env.IS_PR_RUN == 'true' &&
           steps.verify.outputs.fix_succeeded == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           cd ${GITHUB_WORKSPACE}/instar
           git push origin ${PR_REF}
@@ -658,7 +662,7 @@ jobs:
           steps.verify.outputs.fix_succeeded == 'true' &&
           inputs.dry_run != true
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           cd ${GITHUB_WORKSPACE}/instar
 
@@ -708,7 +712,7 @@ jobs:
           (steps.claude_fix.outputs.claude_available != 'true' ||
            steps.verify.outputs.fix_succeeded == 'false')
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           TEST_OUTPUT=$(tail -c 2000 ${GITHUB_WORKSPACE}/test-output.txt 2>/dev/null || echo "See workflow logs for details.")
 

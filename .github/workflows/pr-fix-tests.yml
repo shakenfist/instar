@@ -47,4 +47,5 @@ jobs:
       ref: ${{ needs.trigger-fix.outputs.pr_ref }}
       pr_number: ${{ needs.trigger-fix.outputs.pr_number }}
       max_turns: '50'
-    secrets: inherit
+    secrets:
+      GITLAB_TESTDATA_TOKEN: ${{ secrets.GITLAB_TESTDATA_TOKEN }}
