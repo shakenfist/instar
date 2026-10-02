@@ -2858,8 +2858,10 @@ pub unsafe fn read_cluster_sectors(
 ///
 /// # Safety
 ///
-/// `buf` must point to at least `max(chunk_size, sector_size)` writable
-/// bytes.  `scratch` must point to at least `sector_size` writable bytes.
+/// `buf` must point to at least `chunk_size` writable bytes: partial
+/// sectors at either end go through `scratch`, so nothing past
+/// `chunk_size` is written. `scratch` must point to at least
+/// `sector_size` writable bytes.
 /// `call_table` must be valid.
 #[cfg(any(
     feature = "vhd-input",
@@ -7231,8 +7233,9 @@ mod tests {
 
     /// A two-block *non-differencing* dynamic VHD: block 0 allocated
     /// (child pattern), block 1 unallocated. Used by the regression
-    /// guard, which must see both cases behave exactly as they did
-    /// before the differencing arm existed.
+    /// guard, which must see both cases read the way a plain dynamic
+    /// VHD always has: allocated from the child, unallocated from the
+    /// backing device.
     #[cfg(feature = "vhd-input")]
     fn build_vhd_dynamic_two_block(block_size: u32) -> std::vec::Vec<u8> {
         let table_offset = 1536u64;
@@ -7398,15 +7401,15 @@ mod tests {
         (ok, out)
     }
 
-    // (a) THE REGRESSION GUARD, written before any of the composing arm
-    // was read in detail: a non-differencing dynamic VHD over a backing
-    // device must read exactly as the pre-existing arm always has --
+    // (a) THE REGRESSION GUARD: a non-differencing dynamic VHD over a
+    // backing device must read as a plain dynamic VHD always has --
     // allocated served from the child, unallocated descending to the
     // backing device. `is_differencing` is false throughout, so neither
-    // branch this phase added is ever taken.
+    // the sector-bitmap composition nor the differencing child's
+    // bottom-of-chain refusal is ever reached.
     #[cfg(feature = "vhd-input")]
     #[test]
-    fn vhd_arm_dynamic_regression_matches_pre_phase_reads() {
+    fn vhd_arm_dynamic_reads_as_a_plain_dynamic_vhd() {
         let block_size = 4096u32;
         let child = build_vhd_dynamic_two_block(block_size);
         let parent = build_vhd_parent_raw(2 * block_size as usize);
@@ -7429,7 +7432,7 @@ mod tests {
             .collect();
         assert_eq!(
             out, want,
-            "allocated block must read from the child, unchanged by this phase"
+            "allocated block must read from the child, as a plain dynamic VHD always has"
         );
 
         let (ok, out) = run_vhd_chain_read(&devices, 512, block_size as u64, block_size as u64);
@@ -7439,10 +7442,10 @@ mod tests {
             .collect();
         assert_eq!(
             out, want,
-            "unallocated block must read from the backing device, unchanged by this phase"
+            "unallocated block must read from the backing device, as a plain dynamic VHD always has"
         );
 
-        // And with nothing behind it. The guard this phase added to the
+        // And with nothing behind it. The bottom-of-chain guard on the
         // unallocated case fires only for a differencing child; a lone
         // dynamic VHD must still zero-fill, which is what reading every
         // sparse dynamic image depends on. `run_vhd_chain_read`
@@ -7756,9 +7759,10 @@ mod tests {
     }
 
     // (i) A mixed chunk's parent-owned share also fails without a
-    // following device -- the third leaking path 12c closed, reached
-    // through the Mixed arm's own bottom-of-chain branch rather than
-    // (g)'s or (h)'s.
+    // following device -- the Mixed arm's bottom-of-chain guard, the
+    // third route by which a parent-owned sector could otherwise be
+    // zero-filled, reached through its own branch rather than (g)'s or
+    // (h)'s.
     #[cfg(feature = "vhd-input")]
     #[test]
     fn vhd_arm_mixed_chunk_fails_without_a_following_device() {
@@ -7855,54 +7859,66 @@ mod tests {
 
     // (l) A 4096-byte device sector. Every test above runs at 512, so
     // none of them exercises the arithmetic that converts between the
-    // bitmap's fixed 512-byte granule and a larger device sector. The
-    // fixture places the first block's bitmap at host offset 4608 --
-    // 512 bytes into device sector 1 -- so the bitmap byte fetch and the
-    // payload reads are both misaligned against the device's sectors,
-    // and an offset mistake in either returns the wrong bytes while
-    // still reporting success.
+    // bitmap's fixed 512-byte granule and a larger device sector.
+    //
+    // Two placements, because a child run shorter than a device sector
+    // has two shapes. With the first block's bitmap at sector 9 (host
+    // offset 4608, 512 bytes into device sector 1) the bitmap byte fetch
+    // and the payload reads are both misaligned against the device's
+    // sectors, and an offset mistake in either returns the wrong bytes
+    // while still reporting success. With it at sector 7 the payload
+    // lands at host offset 4096, so the child's 2048-byte run starts on
+    // a device sector boundary and ends part way through that sector.
     #[cfg(feature = "vhd-input")]
     #[test]
     fn vhd_arm_mixed_bitmap_on_a_large_sector_device() {
         let block_size = 4096u32;
-        let child = build_vhd_differencing_blocks(
-            vhd::DISK_TYPE_DIFFERENCING,
-            block_size,
-            9,
-            4096,
-            &[Some(&[0xF0])],
-        );
-        let parent = build_vhd_parent_raw(block_size as usize);
-        let devices = [
-            VhdDevice {
-                bytes: child,
-                format: ImageFormat::Vhd,
-            },
-            VhdDevice {
-                bytes: parent,
-                format: ImageFormat::Raw,
-            },
-        ];
-        let (ok, out) = run_vhd_chain_read(&devices, 4096, 0, block_size as u64);
-        assert!(ok, "a 4096-byte-sector differencing device must compose");
-        let payload_off = 9u64 * 512 + 512;
-        assert_eq!(
-            payload_off % 4096,
-            1024,
-            "payload must be mid device sector"
-        );
-        let mut want = std::vec::Vec::with_capacity(block_size as usize);
-        for i in 0..2048u64 {
-            want.push(vhd_child_byte(payload_off + i));
+        for (first_bat_sector, payload_intra_sector, label) in [
+            (9u32, 1024u64, "a payload part way into a device sector"),
+            (7u32, 0u64, "a payload on a device sector boundary"),
+        ] {
+            let child = build_vhd_differencing_blocks(
+                vhd::DISK_TYPE_DIFFERENCING,
+                block_size,
+                first_bat_sector,
+                4096,
+                &[Some(&[0xF0])],
+            );
+            let parent = build_vhd_parent_raw(block_size as usize);
+            let devices = [
+                VhdDevice {
+                    bytes: child,
+                    format: ImageFormat::Vhd,
+                },
+                VhdDevice {
+                    bytes: parent,
+                    format: ImageFormat::Raw,
+                },
+            ];
+            let (ok, out) = run_vhd_chain_read(&devices, 4096, 0, block_size as u64);
+            assert!(
+                ok,
+                "a 4096-byte-sector differencing device must compose: {label}"
+            );
+            let payload_off = first_bat_sector as u64 * 512 + 512;
+            assert_eq!(
+                payload_off % 4096,
+                payload_intra_sector,
+                "fixture placement: {label}"
+            );
+            let mut want = std::vec::Vec::with_capacity(block_size as usize);
+            for i in 0..2048u64 {
+                want.push(vhd_child_byte(payload_off + i));
+            }
+            for i in 2048..block_size as u64 {
+                want.push(vhd_parent_byte(i));
+            }
+            assert_eq!(
+                out, want,
+                "a 4096-byte-sector device must resolve the same ownership as a \
+                 512-byte-sector one: {label}"
+            );
         }
-        for i in 2048..block_size as u64 {
-            want.push(vhd_parent_byte(i));
-        }
-        assert_eq!(
-            out, want,
-            "a 4096-byte-sector device must resolve the same ownership as a \
-             512-byte-sector one"
-        );
     }
 
     // (m) A differencing child over a differencing child over a raw
@@ -8064,15 +8080,19 @@ mod tests {
     // refused. Every other fixture here is a single block, so nothing
     // exercised the crossing case through the arm. A bitmap describes
     // its own block only, so the sectors past the boundary have no
-    // owner here, and inventing one is the failure mode this phase
-    // exists to prevent.
+    // owner here, and inventing one is exactly the silent wrong read
+    // the composition must never produce.
     //
-    // Both ownership shapes of the described prefix are driven, because
-    // they refuse by different routes. An all-parent prefix is refused
-    // while the chunk is still being classified; a mixed one classifies
-    // and is refused by the second walk that fills the child's runs.
-    // Only the first case is reached if classification ever stops as
-    // soon as it has seen both a child run and a parent run.
+    // All three ownership shapes of the described prefix are driven,
+    // because they refuse by different routes. An all-parent or
+    // all-child prefix is refused while the chunk is still being
+    // classified -- the all-child one being the shape that would
+    // otherwise fall through to a plain AllChild read and be served
+    // from the next block's bitmap and payload bytes. A mixed prefix
+    // classifies and is refused by the second walk that fills the
+    // child's runs. Only the uniform cases are reached if
+    // classification ever stops as soon as it has seen both a child run
+    // and a parent run.
     #[cfg(feature = "vhd-input")]
     #[test]
     fn vhd_arm_chunk_crossing_a_block_boundary_is_refused() {
@@ -8080,6 +8100,7 @@ mod tests {
         for (block0, label) in [
             (0xF0u8, "a prefix wholly the parent's"),
             (0x0Au8, "a prefix mixed between child and parent"),
+            (0xFFu8, "a prefix wholly the child's"),
         ] {
             let child = build_vhd_differencing_blocks(
                 vhd::DISK_TYPE_DIFFERENCING,
@@ -9340,45 +9361,32 @@ unsafe fn read_vhd_child_runs(
                 Some(o) => o,
                 None => return false,
             };
-            // Same sub-sector handling a whole-chunk read needs, applied
-            // per run: VHD payload starts on a 512-byte boundary, which
-            // is part way into a sector when the device's sectors are
-            // larger, and a run can start part way into one again.
+            // Sub-sector handling, applied per run: VHD payload starts on
+            // a 512-byte boundary, which is part way into a sector when
+            // the device's sectors are larger, and a run can start or end
+            // part way into one again, aligned or not.
             //
-            // Both arms return the same bytes -- read_cluster_sectors is
-            // byte-accurate for an arbitrary offset too. The split is
-            // about where the partial-sector scratch lives, not about
-            // correctness: read_cluster_sectors puts a MAX_SECTOR_SIZE
-            // (64 KiB) buffer on the stack, and this is a per-run call
-            // inside a chain walker that recurses once per device, on a
-            // 4 MiB guest stack. read_offset_sectors takes the caller's
-            // scratch instead. No host test can tell the two apart, so
-            // the reason is recorded here rather than left to a reader
-            // to rediscover.
-            let intra_sector = (run_host % sector_size as u64) as usize;
-            let served_run = if intra_sector == 0 {
-                read_cluster_sectors(
-                    call_table,
-                    device_idx,
-                    run_host,
-                    buf.add(served as usize),
-                    run.bytes,
-                    sector_size,
-                    bytes_read,
-                )
-            } else {
-                read_offset_sectors(
-                    call_table,
-                    device_idx,
-                    run_host,
-                    buf.add(served as usize),
-                    run.bytes,
-                    sector_size,
-                    scratch,
-                    bytes_read,
-                )
-            };
-            if !served_run {
+            // Always read_offset_sectors, never read_cluster_sectors,
+            // even for an aligned run. Both are byte-accurate at any
+            // offset; the difference is where the partial-sector scratch
+            // lives. read_cluster_sectors puts a MAX_SECTOR_SIZE (64 KiB)
+            // buffer on the stack whenever a run is not a whole number of
+            // sectors -- an aligned 2 KiB run on a 4 KiB-sector device,
+            // say -- and this is a per-run call inside a chain walker
+            // that recurses once per device, on a 4 MiB guest stack.
+            // read_offset_sectors takes the caller's scratch instead. No
+            // host test can tell the two apart, so the reason is recorded
+            // here rather than left to a reader to rediscover.
+            if !read_offset_sectors(
+                call_table,
+                device_idx,
+                run_host,
+                buf.add(served as usize),
+                run.bytes,
+                sector_size,
+                scratch,
+                bytes_read,
+            ) {
                 return false;
             }
         }
