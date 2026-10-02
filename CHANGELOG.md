@@ -375,6 +375,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **CI apt steps wait for the dpkg lock instead of failing.** A runner
+  that was still running its own apt job when a CI step began made that
+  step's `apt-get` fail at once with `Could not get lock
+  /var/lib/dpkg/lock-frontend`. This failed `integration-convert-vhd` on
+  #617, a change that never touched it. Every `apt-get` in CI now passes
+  `-o DPkg::Lock::Timeout=300` and waits up to five minutes for the
+  lock.
+
 - **A hostile parent-locator offset no longer aborts the nightly fuzz
   corpus seeding.** `extract_vhd_parent_seed` read
   `platform_data_offset` straight out of the image and seeked to it. An

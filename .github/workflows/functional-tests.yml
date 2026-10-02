@@ -119,11 +119,11 @@ jobs:
 
       - name: Ensure Python venv support
         run: |
-          sudo apt-get update
-          sudo apt-get install -y python3 python3-venv python3-pip
+          sudo apt-get -o DPkg::Lock::Timeout=300 update
+          sudo apt-get -o DPkg::Lock::Timeout=300 install -y python3 python3-venv python3-pip
 
       - name: Ensure jq is available
-        run: command -v jq || sudo apt-get install -y jq
+        run: command -v jq || sudo apt-get -o DPkg::Lock::Timeout=300 install -y jq
 
       - name: Check CI test partition
         run: tools/ci/check-test-partition.sh

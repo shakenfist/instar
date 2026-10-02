@@ -30,7 +30,11 @@ sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
 echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
     | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
 
-sudo apt-get update
-sudo apt-get install -y gh
+# Wait for any apt job the freshly booted runner is still running, as
+# install-docker.sh explains.
+apt_get="sudo apt-get -o DPkg::Lock::Timeout=300"
+
+${apt_get} update
+${apt_get} install -y gh
 
 echo "gh installed: $(gh --version | head -1)"

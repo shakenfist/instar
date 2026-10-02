@@ -573,6 +573,15 @@ named "Install Docker" reported success:
 Neither package exists before trixie, so the installer requires a
 `debian-13` runner.
 
+A runner can still be running its own apt job (an unattended upgrade,
+say) when a job's first step arrives. By default `apt-get` does not wait
+for the dpkg lock -- it fails at once with `Could not get lock
+/var/lib/dpkg/lock-frontend`, which failed `integration-convert-vhd`
+on a PR that never touched it. Every
+`apt-get` in CI therefore passes `-o DPkg::Lock::Timeout=300`, and so
+should any new one: five minutes is far longer than the competing job
+takes, and short enough that a genuinely wedged apt still fails the step.
+
 The one exception is `mermaid-lint.yml`, which runs on
 `[self-hosted, vm, debian-13-docker, s]`. That is the fleet image that
 ships `docker.io`, so it needs no install step -- but the label has to be
