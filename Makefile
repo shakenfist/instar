@@ -533,7 +533,7 @@ test-rust: instar-devcontainer
 			--exclude bench-op && \
 		cargo test --release -p luks --features "decrypt,encrypt" && \
 		cargo test --release -p qcow2 --features create && \
-		cargo test --release -p qcow2 --features "create,vdi-input,parallels-input,qcow1-input,dmg-input,vhd-input" && \
+		cargo test --release -p qcow2 --features "create,vdi-input,parallels-input,qcow1-input,dmg-input,vhd-input,vhdx-input" && \
 		cargo test --release -p create'
 
 # Build all coverage-guided fuzz targets via cargo-fuzz inside the

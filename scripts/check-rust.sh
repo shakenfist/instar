@@ -131,13 +131,13 @@ if [ -d "$PROJECT_ROOT/src" ]; then
         run_in_docker "src" cargo clippy --fix --allow-dirty --allow-staged --allow-no-vcs \
             -p luks --features "decrypt,encrypt" || FAILED=1
         run_in_docker "src" cargo clippy --fix --allow-dirty --allow-staged --allow-no-vcs \
-            -p qcow2 --features "create,vdi-input,parallels-input,qcow1-input,dmg-input,vhd-input" || FAILED=1
+            -p qcow2 --features "create,vdi-input,parallels-input,qcow1-input,dmg-input,vhd-input,vhdx-input" || FAILED=1
     else
         run_in_docker "src" cargo clippy \
             -p luks --features "decrypt,encrypt" \
             -- -D warnings || FAILED=1
         run_in_docker "src" cargo clippy \
-            -p qcow2 --features "create,vdi-input,parallels-input,qcow1-input,dmg-input,vhd-input" \
+            -p qcow2 --features "create,vdi-input,parallels-input,qcow1-input,dmg-input,vhd-input,vhdx-input" \
             -- -D warnings || FAILED=1
     fi
 
