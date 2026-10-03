@@ -119,11 +119,11 @@ jobs:
 
       - name: Ensure Python venv support
         run: |
-          sudo apt-get -o DPkg::Lock::Timeout=300 update
-          sudo apt-get -o DPkg::Lock::Timeout=300 install -y python3 python3-venv python3-pip
+          tools/ci/apt-get.sh update
+          tools/ci/apt-get.sh install -y python3 python3-venv python3-pip
 
       - name: Ensure jq is available
-        run: command -v jq || sudo apt-get -o DPkg::Lock::Timeout=300 install -y jq
+        run: command -v jq || tools/ci/apt-get.sh install -y jq
 
       - name: Check CI test partition
         run: tools/ci/check-test-partition.sh
@@ -169,6 +169,9 @@ jobs:
 
       - name: Test the literal replace helper
         run: tools/ci/test-replace-once.sh
+
+      - name: Test the apt lock wrapper
+        run: tools/ci/test-apt-get.sh
 
       # A new fuzz target has to be added to fuzz_targets/, Cargo.toml's
       # [[bin]] list and coverage-fuzz.yml's TARGETS array by hand, and a

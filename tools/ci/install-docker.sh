@@ -35,19 +35,13 @@
 # passed as arguments, which saves a second `apt-get update`:
 #
 #   tools/ci/install-docker.sh qemu-utils
-#
-# A freshly booted runner can still be running its own apt job (an
-# unattended upgrade, say) when the first step arrives, and apt-get
-# fails at once with "Could not get lock /var/lib/dpkg/lock-frontend"
-# unless told to wait. Five minutes is far longer than that job takes,
-# and short enough that a genuinely wedged apt still fails the step.
 
 set -e
 
-apt_get="sudo apt-get -o DPkg::Lock::Timeout=300"
+apt_get="$(dirname "$0")/apt-get.sh"
 
-${apt_get} update
-${apt_get} install -y docker.io docker-cli docker-buildx "$@"
+"${apt_get}" update
+"${apt_get}" install -y docker.io docker-cli docker-buildx "$@"
 sudo systemctl start docker
 sudo chmod 666 /var/run/docker.sock
 

@@ -39,8 +39,8 @@ jobs:
 
       - name: Install gitleaks
         run: |
-          sudo apt-get -o DPkg::Lock::Timeout=300 update
-          sudo apt-get -o DPkg::Lock::Timeout=300 install -y gitleaks
+          tools/ci/apt-get.sh update
+          tools/ci/apt-get.sh install -y gitleaks
 
       # Findings are suppressed in two places, both of which document
       # the rotate-before-suppressing rule: .gitleaks.toml carries an
