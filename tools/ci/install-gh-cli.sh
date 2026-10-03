@@ -30,7 +30,9 @@ sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
 echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
     | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null
 
-sudo apt-get update
-sudo apt-get install -y gh
+apt_get="$(dirname "$0")/apt-get.sh"
+
+"${apt_get}" update
+"${apt_get}" install -y gh
 
 echo "gh installed: $(gh --version | head -1)"

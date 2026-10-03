@@ -38,8 +38,10 @@
 
 set -e
 
-sudo apt-get update
-sudo apt-get install -y docker.io docker-cli docker-buildx "$@"
+apt_get="$(dirname "$0")/apt-get.sh"
+
+"${apt_get}" update
+"${apt_get}" install -y docker.io docker-cli docker-buildx "$@"
 sudo systemctl start docker
 sudo chmod 666 /var/run/docker.sock
 
