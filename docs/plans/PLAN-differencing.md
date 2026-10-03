@@ -368,7 +368,7 @@ records `instar-testdata <sha> (#pr)` and is audited there.
 | 9. Coverage fuzzing of the locator parsers | [PLAN-differencing-phase-09-fuzz.md](PLAN-differencing-phase-09-fuzz.md) | Complete | `044ad77` (#594) |
 | 10. Documentation | [PLAN-differencing-phase-10-docs.md](PLAN-differencing-phase-10-docs.md) | Complete | `036252f` (#598) |
 | 11. Composition: host chain discovery and `info --chain` | [PLAN-differencing-phase-11-chain-host.md](PLAN-differencing-phase-11-chain-host.md) | Complete | `c66f8b2` (#603) |
-| 12. Composition: guest VHD sector-bitmap read path | [PLAN-differencing-phase-12-vhd-compose.md](PLAN-differencing-phase-12-vhd-compose.md) | In progress | |
+| 12. Composition: guest VHD sector-bitmap read path | [PLAN-differencing-phase-12-vhd-compose.md](PLAN-differencing-phase-12-vhd-compose.md) | Complete | `b4ae7fc` (#615) |
 | 13. Composition: guest VHDX sector-bitmap read path | PLAN-differencing-phase-13-vhdx-compose.md | Not started | |
 | 14. Composition: per-op rollout, replacing phase 4's refusals | PLAN-differencing-phase-14-op-rollout.md | Not started | |
 | 15. Composition: integration tests and fuzz | PLAN-differencing-phase-15-compose-tests.md | Not started | |
