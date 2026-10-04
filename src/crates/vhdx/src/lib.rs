@@ -1649,9 +1649,15 @@ pub(crate) fn count_allocated_in_bat_chunk(
 /// Result of looking up a virtual offset in the VHDX BAT.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VhdxBlockLookup {
-    /// Block is not present (reads as zero).
+    /// Block is not present in this file. An image with no parent
+    /// has nowhere else to look and reads it as zero; a differencing
+    /// child means the block's data lives in its parent, which is the
+    /// opposite answer. A caller that can compose a chain must not
+    /// conflate this with `Zero`.
     NotPresent,
-    /// Block is explicitly zeroed.
+    /// Block is explicitly zeroed. Unlike `NotPresent` this is an
+    /// answer about the data rather than about this file, so a parent
+    /// image must not be consulted for it.
     Zero,
     /// Block is allocated at the given host byte offset.
     Present { host_byte_offset: u64 },

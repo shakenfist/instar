@@ -9411,8 +9411,9 @@ unsafe fn read_vhd_child_runs(
 /// which the walk's own loop bound makes impossible. It is returned
 /// rather than asserted because every caller uses the answer to decide
 /// whether a sector the current device does not hold has anywhere to
-/// come from, and all three run in guest binaries built in release,
-/// where a `debug_assert` is absent and a wrapping subtraction would
+/// come from, and every one of them runs in guest binaries built in
+/// release, where a `debug_assert` is absent and a wrapping subtraction
+/// would
 /// hand back a chain length of nearly `usize::MAX` and recurse into
 /// devices that do not exist.
 #[inline]
@@ -10271,9 +10272,47 @@ pub unsafe fn read_chain_virtual_cluster(
                     Some(s) => s,
                     None => return false,
                 };
+
+                // "Not present" and "zero" are the same answer for an
+                // image with no parent, and opposite answers for a
+                // differencing child, so the flag that tells the two
+                // kinds of image apart is captured here and consulted
+                // below.
+                let has_parent = state.has_parent;
+
                 match state.block_lookup(call_table, virtual_offset, sector_size, cap, bytes_read) {
-                    Some(VhdxBlockLookup::NotPresent) | Some(VhdxBlockLookup::Zero) => {
+                    Some(VhdxBlockLookup::NotPresent) => {
+                        // Absent, not zero: a differencing child means
+                        // the block's data lives in its parent, so
+                        // descending is right while a device still
+                        // follows. At the bottom of such a chain the
+                        // loop's zero-fill tail would hand back the
+                        // child's own zeros as though they were the
+                        // parent's data and report success on it
+                        // (issue #547), so the read fails instead. An
+                        // image with no parent never has a device
+                        // behind it and so always descends to that
+                        // tail, exactly as it did before.
+                        if has_parent {
+                            let remaining = match devices_behind(chain_len, dev_offset) {
+                                Some(r) => r,
+                                None => return false,
+                            };
+                            if remaining == 0 {
+                                return false;
+                            }
+                        }
                         continue;
+                    }
+                    Some(VhdxBlockLookup::Zero) => {
+                        // An answer about the data rather than about
+                        // this file: the block is zeros, and a parent
+                        // that holds something else at this offset
+                        // must not be consulted. For an image with no
+                        // parent this is the same zero-fill the walk's
+                        // tail would have produced.
+                        core::ptr::write_bytes(buf, 0, chunk_size as usize);
+                        return true;
                     }
                     Some(VhdxBlockLookup::Present { host_byte_offset }) => {
                         return read_cluster_sectors(
