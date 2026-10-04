@@ -158,12 +158,14 @@ jobs:
       - name: Test the mutation harness verdicts
         run: tools/mutate-differencing.sh --self-test
 
-      # The 57 search strings are pinned to src/ byte for byte,
+      # Every search string is pinned to src/ byte for byte,
       # indentation included, so a reformat of the emitter turns cases
       # BROKEN with nothing to notice until someone spends the full
       # docker-and-testdata run. This counts the occurrences without
       # mutating, building or running anything, and also asserts the
-      # case count docs/testing.md quotes.
+      # case, reader and survivor counts docs/testing.md quotes. The
+      # numbers deliberately do not appear here: a count in a comment
+      # is one more place to go stale, which is what it did.
       - name: Check the mutation patterns still land
         run: tools/mutate-differencing.sh --check-patterns
 

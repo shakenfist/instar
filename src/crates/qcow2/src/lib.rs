@@ -9410,6 +9410,193 @@ mod tests {
         );
     }
 
+    // No block of any kind lives in the first megabyte of a VHDX file:
+    // that is the file identifier, the two headers and the two region
+    // tables. A BAT entry carries its state in the low bits and its
+    // offset in the rest, so a zeroed or truncated entry whose state
+    // bits still read as present names offset 0 -- and the bytes found
+    // there would be served as payload, or read as a statement about
+    // which sectors the child owns. All three states that carry an
+    // offset are driven, because each reaches the check by its own
+    // path and a fix applied to one proves nothing about the others.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_arm_block_at_file_offset_zero_is_refused() {
+        let child_sectors = [0u32..2048];
+        let chunk_ratio = vhdx_chunk_ratio(512);
+        // Payload block 0 is BAT entry 0; the group's bitmap entry is
+        // the one after its chunk_ratio payload entries.
+        let payload_entry = VHDX_FIX_BAT_OFFSET as usize;
+        let sb_entry = (VHDX_FIX_BAT_OFFSET + chunk_ratio * 8) as usize;
+        for (block_state, zeroed_entry, label) in [
+            (
+                VhdxBlockState::FullyPresent,
+                payload_entry,
+                "a fully present payload block",
+            ),
+            (
+                VhdxBlockState::PartiallyPresent,
+                payload_entry,
+                "a partially present payload block",
+            ),
+            (
+                VhdxBlockState::PartiallyPresent,
+                sb_entry,
+                "a present sector bitmap",
+            ),
+        ] {
+            let fixture = build_vhdx_image(
+                512,
+                true,
+                1,
+                &[(0, block_state)],
+                &[VhdxGroupBitmap {
+                    group: 0,
+                    state: vhdx::SB_BLOCK_PRESENT,
+                    child_sectors: &child_sectors,
+                }],
+            );
+            let mut bytes = fixture.bytes;
+            // Keep the state bits, clear the offset. The entry still
+            // says "present"; it just says it about offset zero.
+            let entry =
+                u64::from_le_bytes(bytes[zeroed_entry..zeroed_entry + 8].try_into().unwrap());
+            let rewritten = entry & !vhdx::BAT_ENTRY_OFFSET_MASK;
+            bytes[zeroed_entry..zeroed_entry + 8].copy_from_slice(&rewritten.to_le_bytes());
+            let devices = vhdx_chain_with_parent(bytes, 2 * 1024 * 1024);
+            let (ok, _out) = run_vhdx_chain_read(&devices, 512, 0, VHDX_CHUNK);
+            assert!(
+                !ok,
+                "no VHDX block begins inside the headers, so an entry naming \
+                 offset zero must fail the read rather than serve what is \
+                 there: {label}"
+            );
+        }
+
+        // The control: the same fixtures, offsets left alone, read.
+        for (block_state, label) in [
+            (
+                VhdxBlockState::FullyPresent,
+                "a fully present payload block",
+            ),
+            (
+                VhdxBlockState::PartiallyPresent,
+                "a partially present payload block",
+            ),
+        ] {
+            let fixture = build_vhdx_image(
+                512,
+                true,
+                1,
+                &[(0, block_state)],
+                &[VhdxGroupBitmap {
+                    group: 0,
+                    state: vhdx::SB_BLOCK_PRESENT,
+                    child_sectors: &child_sectors,
+                }],
+            );
+            let devices = vhdx_chain_with_parent(fixture.bytes, 2 * 1024 * 1024);
+            let (ok, _out) = run_vhdx_chain_read(&devices, 512, 0, VHDX_CHUNK);
+            assert!(
+                ok,
+                "the same fixture with a real offset must read, or the \
+                 refusals above prove only that the fixture is broken: {label}"
+            );
+        }
+    }
+
+    // A differencing child over a differencing VHDX parent over a raw
+    // device. Every other composing test here puts a raw device behind
+    // the child, so the Mixed arm always recursed into a format that is
+    // not VHDX and never re-entered this arm one level down. The arm
+    // re-borrows `chain_states.vhdx_states[dev_idx]` after that
+    // recursion, and with a two-device chain an index pinned to zero is
+    // indistinguishable from the right one. The VHD side already pins
+    // this; the VHDX side had no evidence for it.
+    //
+    // The two VHDX devices are built so their payload blocks sit at
+    // different host offsets -- the middle one allocates a block ahead
+    // of the one under test, which pushes it along -- because the
+    // child byte pattern is keyed on absolute host offset. Without
+    // that, a read from the wrong device would return the right bytes
+    // by coincidence.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_arm_composes_a_differencing_child_over_a_differencing_parent() {
+        let top_sectors = [1u32..4, 9..14];
+        let mid_sectors = [4u32..9, 20..40];
+        let top = build_vhdx_image(
+            512,
+            true,
+            1,
+            &[(0, VhdxBlockState::PartiallyPresent)],
+            &[VhdxGroupBitmap {
+                group: 0,
+                state: vhdx::SB_BLOCK_PRESENT,
+                child_sectors: &top_sectors,
+            }],
+        );
+        // Block 1 is listed first, so it takes the first payload region
+        // and block 0 lands one block further into the file than the
+        // top device's does.
+        let middle = build_vhdx_image(
+            512,
+            true,
+            1,
+            &[
+                (1, VhdxBlockState::FullyPresent),
+                (0, VhdxBlockState::PartiallyPresent),
+            ],
+            &[VhdxGroupBitmap {
+                group: 0,
+                state: vhdx::SB_BLOCK_PRESENT,
+                child_sectors: &mid_sectors,
+            }],
+        );
+        let top_payload = top.block_offsets[0];
+        let mid_payload = middle.block_offsets[1];
+        assert_ne!(
+            top_payload, mid_payload,
+            "the two devices must hold their block at different host \
+             offsets, or a read from the wrong one cannot be seen"
+        );
+        let devices = [
+            VhdxDevice {
+                bytes: top.bytes,
+                format: ImageFormat::Vhdx,
+            },
+            VhdxDevice {
+                bytes: middle.bytes,
+                format: ImageFormat::Vhdx,
+            },
+            VhdxDevice {
+                bytes: build_vhdx_parent_raw(2 * 1024 * 1024),
+                format: ImageFormat::Raw,
+            },
+        ];
+        let (ok, out) = run_vhdx_chain_read(&devices, 512, 0, VHDX_CHUNK);
+        assert!(ok, "a three-device differencing chain must compose");
+
+        // Derived from the two sector lists, not from the walk: the
+        // first device in the chain that claims a sector serves it.
+        let mut want = std::vec::Vec::with_capacity(VHDX_CHUNK as usize);
+        for v in 0..VHDX_CHUNK {
+            let sector = (v / 512) as u32;
+            if top_sectors.iter().any(|r| r.contains(&sector)) {
+                want.push(vhdx_child_byte(top_payload + v));
+            } else if mid_sectors.iter().any(|r| r.contains(&sector)) {
+                want.push(vhdx_child_byte(mid_payload + v));
+            } else {
+                want.push(vhdx_parent_byte(v));
+            }
+        }
+        assert_eq!(
+            out, want,
+            "each logical sector must come from the first device in the \
+             chain whose bitmap claims it"
+        );
+    }
+
     // A chunk reaching past the end of the payload block its bitmap bits
     // describe. The next block's payload need not follow this one in the
     // file and its sectors are described by bits this lookup never

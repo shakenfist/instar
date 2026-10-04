@@ -227,6 +227,23 @@ pub const SB_BLOCK_PRESENT: u64 = 6;
 /// describes one whole chunk with nothing left over.
 pub const SB_BLOCK_SIZE: u32 = 1024 * 1024;
 
+/// Lowest file offset at which any VHDX block may begin.
+///
+/// The first megabyte of a VHDX file is fixed structure: the file
+/// identifier at 0, the two headers at 64 KiB and 128 KiB, the two
+/// region tables at 192 KiB and 256 KiB, and reserved space to 1 MiB.
+/// Payload blocks, sector bitmap blocks, the BAT and the metadata
+/// region all live above it, and the spec requires every one of them
+/// to be megabyte-aligned.
+///
+/// A BAT entry is a state in its low bits and an offset in the rest,
+/// so a zeroed or truncated entry that still carries a present state
+/// names offset 0 -- the file identifier. Reading a block from there
+/// answers a question about ownership with bytes that describe
+/// nothing of the kind. Refusing the offset costs one comparison and
+/// turns that into a failed read (issue #547).
+pub const MIN_BLOCK_FILE_OFFSET: u64 = 1024 * 1024;
+
 /// Mask for extracting the file offset from a BAT entry (bits 20-63).
 /// The offset is in units of 1 MB.
 pub const BAT_ENTRY_OFFSET_MASK: u64 = 0xFFFF_FFFF_FFF0_0000;
@@ -2282,9 +2299,12 @@ impl VhdxState {
             }
             PAYLOAD_BLOCK_ZERO => Some(VhdxBlockLookup::Zero),
             PAYLOAD_BLOCK_FULLY_PRESENT => {
+                if file_offset < MIN_BLOCK_FILE_OFFSET {
+                    return None;
+                }
                 let intra_block_offset = virtual_offset % self.block_size as u64;
                 Some(VhdxBlockLookup::Present {
-                    host_byte_offset: file_offset + intra_block_offset,
+                    host_byte_offset: file_offset.checked_add(intra_block_offset)?,
                 })
             }
             PAYLOAD_BLOCK_PARTIALLY_PRESENT => {
@@ -2305,6 +2325,9 @@ impl VhdxState {
                 // `init_chain_states` fires on `has_parent`, which is
                 // exactly what this image denies having.
                 if !self.has_parent {
+                    return None;
+                }
+                if file_offset < MIN_BLOCK_FILE_OFFSET {
                     return None;
                 }
                 let intra_block_offset = virtual_offset % self.block_size as u64;
@@ -2332,6 +2355,16 @@ impl VhdxState {
         let sectors = u64::from(self.chunk_ratio)
             .checked_mul(u64::from(self.block_size))?
             .checked_div(u64::from(self.logical_sector_size))?;
+        // A group of no sectors is as degenerate as a zero sector size,
+        // and saying so here rather than returning Some(0) matters: a
+        // zero is a number every bounds check downstream accepts, so it
+        // reads as a legitimate answer about a tiny group rather than
+        // as "this geometry makes no sense". The coalescer would refuse
+        // such a group anyway, by a route far enough from here that the
+        // reason would not be obvious to anyone reading this.
+        if sectors == 0 {
+            return None;
+        }
         u32::try_from(sectors).ok()
     }
 
@@ -2395,6 +2428,15 @@ impl VhdxState {
         // branch were a separate guard when nothing can reach the
         // second through it.
         if state != SB_BLOCK_PRESENT {
+            return None;
+        }
+        // And a present entry still has to name a plausible place. The
+        // offset mask keeps the low twenty bits clear, so the only
+        // value below the first megabyte is zero -- a zeroed or
+        // truncated entry whose state bits happen to read as present.
+        // The file identifier lives there, and its bytes would be
+        // served as an answer about which sectors the child owns.
+        if file_offset < MIN_BLOCK_FILE_OFFSET {
             return None;
         }
 
@@ -6286,6 +6328,8 @@ mod tests {
         assert_eq!(state.sectors_per_chunk_group(), None);
         let mut state = arithmetic_only_state(2 * 1024 * 1024, 512);
         state.chunk_ratio = 0;
-        assert_eq!(state.sectors_per_chunk_group(), Some(0));
+        // A group spanning no sectors describes nothing, so it is
+        // refused here rather than passed on as a group of size zero.
+        assert_eq!(state.sectors_per_chunk_group(), None);
     }
 }

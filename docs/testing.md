@@ -1557,7 +1557,7 @@ deliberately broken emitter is not guarding what its name says it
 guards. See [PLAN-differencing.md](plans/PLAN-differencing.md) for the
 path being guarded.
 
-There are **57 cases**, in two groups.
+There are **62 cases**, in two groups.
 
 Twenty-six cover the writer. Fourteen mutate a library crate
 (`create`, `vhd`, `vhdx`) and are caught by a Rust unit or round-trip
@@ -1569,7 +1569,7 @@ crate but break something only an external parser can see. Going
 through the real binary means `make instar` before the test and again
 after the source is restored.
 
-The other thirty-one cover the reader — the VHD and VHDX arms of
+The other **36 reader cases** cover the reader — the VHD and VHDX arms of
 `read_chain_virtual_cluster`, the sector-bitmap helpers in the `vhd`
 and `vhdx` crates, and the differencing refusals in
 `init_chain_states`. Most of them name a test in the `qcow2`
@@ -1591,7 +1591,7 @@ That is not a weak arm test; it is where the property lives. Each of
 the three says so at the case, and each was established by watching
 the case fail while it named an arm test.
 
-One reader case is a **survivor**: `rust_survivor_case` asserts that a
+**1 survivor case** is among them: `rust_survivor_case` asserts that a
 mutation is *not* caught, with the reason recorded at the case.
 `vhd-read-classify-stops-at-the-first-mixed-verdict` applies an early
 exit a review suggested for `classify_vhd_chunk_ownership`; it
@@ -1613,11 +1613,11 @@ cross-check in `tests/test_differencing.py`, which skips without
 `BROKEN`, not `PASS`, so the harness needs that package installed to
 report a clean run; it warns once up front when it is missing.
 
-A full 57-case run took **4m43s** on a warm tree with `vhdiinfo`
-present and everything passing; an earlier run of the same tree took
-9m38s because it also had to build a docker image. Before the reader
-cases existed the 26 writer cases alone took 2m32s, 2m44s and 3m35s
-on three measured runs. Those are observations rather than estimates:
+A full run took **4m59s** on a warm tree with `vhdiinfo` present and
+everything passing, and 4m43s when it held 57 cases; an earlier run
+of the same tree took 9m38s because it also had to build a docker
+image. Before the reader cases existed the 26 writer cases alone took
+2m32s, 2m44s and 3m35s on three measured runs. Those are observations rather than estimates:
 an earlier "about two minutes" here was a guess, and an understated
 figure invites the reader to assume a run has hung. Expect a spread,
 which is cargo and docker layer caching. The writer cases are
@@ -1648,7 +1648,7 @@ trusted.
 | Guard | Answers | Cost |
 |---|---|---|
 | `--self-test` | does the verdict classifier classify correctly? | milliseconds |
-| `--check-patterns` | does every mutation still have exactly one place to land, and do the case count here and in the script still agree? | a few seconds |
+| `--check-patterns` | does every mutation still have exactly one place to land, and do the case, reader and survivor counts here and in the script still agree? | a few seconds |
 | `tools/ci/test-replace-once.sh` | does the literal replace helper still refuse zero and multiple matches? | milliseconds |
 
 None of them needs docker, a venv, testdata or a build.
@@ -1658,7 +1658,7 @@ harness nothing else checks — everything else is checked *by* it — and
 it shipped misreading `FAILED (errors=1)` as a caught mutation, which
 no run of the harness itself would have revealed.
 
-`--check-patterns` exists because the 58 search strings are pinned to
+`--check-patterns` exists because every search string is pinned to
 `src/` byte for byte, indentation included. A `rustfmt` change that
 moves a space turns a case `BROKEN`, and without this nothing would
 say so until someone spent the full run. It reports `LANDS` and
@@ -1696,8 +1696,8 @@ the harness closes each:
   the failure gets credited to the mutation. Each named test is
   therefore run once against unmutated source first, and a case whose
   baseline does not pass is `BROKEN` rather than `PASS`. Baselines are
-  cached per target: the 57 cases name 47 distinct targets (40 Rust,
-  7 integration), so that is 47 extra test runs and no extra rebuilds
+  cached per target: the 62 cases name 50 distinct targets (43 Rust,
+  7 integration), so that is 50 extra test runs and no extra rebuilds
   — the integration baselines reuse the clean binary each case
   restores anyway.
 * **The test errored rather than failed.** `unittest` reports an

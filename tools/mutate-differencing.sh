@@ -495,10 +495,12 @@ rust_survivor_case() {
     # rust_survivor_case NAME FILE SEARCH REPLACE PACKAGE TEST [CARGO_ARGS...]
     #
     # A mutation that is EXPECTED to survive, with the reason recorded
-    # at the case. Two of these exist, and both are here rather than
-    # deleted because a surviving mutation is a real result about the
-    # tests and the next person to find it should read the reason
-    # instead of concluding the test is weak.
+    # at the case. These are here rather than deleted because a
+    # surviving mutation is a real result about the tests, and the next
+    # person to find it should read the reason instead of concluding
+    # the test is weak. check_case_count asserts how many there are
+    # against docs/testing.md, so the prose cannot drift from the
+    # script.
     #
     # The verdict is therefore inverted: surviving is SURVIVOR and
     # scores as a pass, and being killed is FAIL -- not because
@@ -680,7 +682,7 @@ self_test() {
 # phase's definition of done asks the two to stay in step, which until
 # now was a promise kept by hand. Asserting it makes the drift a
 # failure instead of a documentation bug nobody reads.
-EXPECTED_CASES=57
+EXPECTED_CASES=62
 
 check_case_count() {
     # Only meaningful for a whole run; a selection is expected to be short.
@@ -692,6 +694,31 @@ check_case_count() {
     local documented bad='no'
     documented="$(grep -oE 'There are \*\*[0-9]+ cases\*\*' \
         "${REPO_ROOT}/docs/testing.md" 2>/dev/null | grep -oE '[0-9]+' | head -1)"
+
+    # The reader and survivor counts are quoted in prose too, and three
+    # review items in one round were that prose going stale against the
+    # script. Derive both from the source of truth -- the case list in
+    # this file -- and make docs/testing.md state them in a form that
+    # can be checked, rather than trusting anyone to update two places.
+    local reader_actual survivor_actual reader_doc survivor_doc
+    reader_actual="$(grep -cE "^rust_(survivor_)?case '(vhd|vhdx)-read-" "${BASH_SOURCE[0]}")"
+    survivor_actual="$(grep -cE '^rust_survivor_case ' "${BASH_SOURCE[0]}")"
+    reader_doc="$(grep -oE '\*\*[0-9]+ reader cases\*\*' \
+        "${REPO_ROOT}/docs/testing.md" 2>/dev/null | grep -oE '[0-9]+' | head -1)"
+    survivor_doc="$(grep -oE '\*\*[0-9]+ survivor cases?\*\*' \
+        "${REPO_ROOT}/docs/testing.md" 2>/dev/null | grep -oE '[0-9]+' | head -1)"
+    if [ "${reader_doc:-x}" != "${reader_actual}" ]; then
+        echo >&2
+        echo "docs/testing.md says '${reader_doc:-no}' reader cases;" >&2
+        echo "this script defines ${reader_actual}." >&2
+        bad='yes'
+    fi
+    if [ "${survivor_doc:-x}" != "${survivor_actual}" ]; then
+        echo >&2
+        echo "docs/testing.md says '${survivor_doc:-no}' survivor cases;" >&2
+        echo "this script defines ${survivor_actual}." >&2
+        bad='yes'
+    fi
 
     if [ "${TOTAL_COUNT}" -ne "${EXPECTED_CASES}" ]; then
         echo >&2
@@ -1349,6 +1376,73 @@ rust_case 'vhdx-read-mixed-chunk-zero-fills-the-parent-share' "${QCOW2_LIB}" \
                                 core::ptr::write_bytes(buf, 0, chunk_size as usize);' \
     qcow2 'vhdx_arm_mixed_chunk_fails_without_a_following_device' \
     --features "${QCOW2_FEATURES}"
+
+# --- VHDX: no block begins inside the headers ------------------------
+
+rust_case 'vhdx-read-sb-offset-zero-accepted' "${VHDX_READ_LIB}" \
+    '        if file_offset < MIN_BLOCK_FILE_OFFSET {
+            return None;
+        }' \
+    '        if false { // MUTATED
+            return None;
+        }' \
+    qcow2 'vhdx_arm_block_at_file_offset_zero_is_refused' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'vhdx-read-full-payload-offset-zero-accepted' "${VHDX_READ_LIB}" \
+    '                if file_offset < MIN_BLOCK_FILE_OFFSET {
+                    return None;
+                }
+                let intra_block_offset = virtual_offset % self.block_size as u64;
+                Some(VhdxBlockLookup::Present {' \
+    '                if false { // MUTATED
+                    return None;
+                }
+                let intra_block_offset = virtual_offset % self.block_size as u64;
+                Some(VhdxBlockLookup::Present {' \
+    qcow2 'vhdx_arm_block_at_file_offset_zero_is_refused' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'vhdx-read-partial-payload-offset-zero-accepted' "${VHDX_READ_LIB}" \
+    '                if file_offset < MIN_BLOCK_FILE_OFFSET {
+                    return None;
+                }
+                let intra_block_offset = virtual_offset % self.block_size as u64;
+                Some(VhdxBlockLookup::PartiallyPresent {' \
+    '                if false { // MUTATED
+                    return None;
+                }
+                let intra_block_offset = virtual_offset % self.block_size as u64;
+                Some(VhdxBlockLookup::PartiallyPresent {' \
+    qcow2 'vhdx_arm_block_at_file_offset_zero_is_refused' \
+    --features "${QCOW2_FEATURES}"
+
+# --- VHDX: the device a mixed chunk resumes on -----------------------
+
+rust_case 'vhdx-read-mixed-arm-pins-device-zero' "${QCOW2_LIB}" \
+    '                            let state = match &mut chain_states.vhdx_states[dev_idx] {
+                                Some(s) => s,
+                                None => return false,
+                            };
+                            // compressed_buf becomes the sub-sector' \
+    '                            let state = match &mut chain_states.vhdx_states[0] { // MUTATED
+                                Some(s) => s,
+                                None => return false,
+                            };
+                            // compressed_buf becomes the sub-sector' \
+    qcow2 'vhdx_arm_composes_a_differencing_child_over_a_differencing_parent' \
+    --features "${QCOW2_FEATURES}"
+
+# --- VHDX: a chunk group of no sectors is not a small group ----------
+
+rust_case 'vhdx-read-zero-sector-group-allowed' "${VHDX_READ_LIB}" \
+    '        if sectors == 0 {
+            return None;
+        }' \
+    '        if false { // MUTATED
+            return None;
+        }' \
+    vhdx 'sectors_per_chunk_group_refuses_a_degenerate_geometry'
 
 # ---------------------------------------------------------------------
 # The create guest operation. Caught through the real binary only.

@@ -32,9 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   two had previously been treated as the same case. An image that
   claims no parent may not say a block is partially present at all,
   and such a block is refused rather than composed against whatever
-  device follows. This is a crate-level change only: `init_chain_states` still refuses every
-  differencing VHDX unconditionally, so no operation reaches the
-  composing path — this is not a user-visible change.
+  device follows, and no block of any kind may begin inside the
+  first megabyte, which is where the file identifier and headers
+  live. This is a crate-level change only: `init_chain_states` still
+  refuses every differencing VHDX unconditionally, so no operation
+  reaches the composing path — this is not a user-visible change.
 
 - **`instar info --chain` walks differencing VHD and VHDX parent chains.**
   It previously stopped at the child and reported the parent reference
@@ -112,8 +114,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - **The differencing tests can be proved to fail.**
   `tools/mutate-differencing.sh` is a committed falsification harness:
-  57 cases, each breaking one specific behaviour in differencing
-  support -- 26 in the create path and 31 in the guest chain walker
+  62 cases, each breaking one specific behaviour in differencing
+  support -- 26 in the create path and 36 in the guest chain walker
   that reads a differencing image back -- and demanding that one
   named test notices. It scores
   BROKEN -- never PASS -- when a mutation did not apply, when the test
