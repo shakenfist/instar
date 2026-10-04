@@ -29,8 +29,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   logical sector from whichever file owns it, recursing into the
   parent for the sectors the child does not own. An absent block
   descends to the parent; an explicitly zeroed block does not — the
-  two had previously been treated as the same case. This is a
-  crate-level change only: `init_chain_states` still refuses every
+  two had previously been treated as the same case. An image that
+  claims no parent may not say a block is partially present at all,
+  and such a block is refused rather than composed against whatever
+  device follows. This is a crate-level change only: `init_chain_states` still refuses every
   differencing VHDX unconditionally, so no operation reaches the
   composing path — this is not a user-visible change.
 
@@ -110,8 +112,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - **The differencing tests can be proved to fail.**
   `tools/mutate-differencing.sh` is a committed falsification harness:
-  26 cases, each breaking one specific behaviour in the differencing
-  create path and demanding that one named test notices. It scores
+  57 cases, each breaking one specific behaviour in differencing
+  support -- 26 in the create path and 31 in the guest chain walker
+  that reads a differencing image back -- and demanding that one
+  named test notices. It scores
   BROKEN -- never PASS -- when a mutation did not apply, when the test
   skipped, or when the test does not pass against unmutated source, so
   a case that proved nothing cannot be read as evidence. Evidence of

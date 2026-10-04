@@ -9188,6 +9188,11 @@ mod tests {
         let child_sectors = [1u32..4, 9..14];
         for (state, should_read, label) in [
             (vhdx::SB_BLOCK_NOT_PRESENT, false, "an absent sector bitmap"),
+            // 3 is undefined for a sector bitmap entry. The fixture
+            // gives it no bitmap region, so this case pins the state
+            // check and the absent offset together; the test below
+            // separates them.
+            (3, false, "an undefined sector bitmap state"),
             (vhdx::SB_BLOCK_PRESENT, true, "a present sector bitmap"),
         ] {
             let fixture = build_vhdx_image(
@@ -9209,6 +9214,200 @@ mod tests {
                  that says which sectors are whose is present: {label}"
             );
         }
+    }
+
+    // Every state but 0 and 6 is undefined for a sector bitmap entry,
+    // and an undefined one must refuse the block rather than read
+    // whatever lies at the offset it carries. The fixture builder only
+    // lays down a bitmap region for SB_BLOCK_PRESENT, so each case here
+    // is built present and then has its state rewritten in place: the
+    // entry keeps a real, correct, fully child-owned bitmap and differs
+    // from the passing control in nothing but the four state bits. That
+    // separates the state check from the absent-offset case in the loop
+    // above, which an implementation could pass by rejecting offset
+    // zero alone.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_arm_sector_bitmap_in_an_undefined_state_fails_the_read() {
+        let child_sectors = [0u32..2048];
+        let chunk_ratio = vhdx_chunk_ratio(512);
+        // A group is chunk_ratio payload entries then its one bitmap
+        // entry, spelled out here rather than taken from the crate.
+        let sb_byte = (VHDX_FIX_BAT_OFFSET + chunk_ratio * 8) as usize;
+        for state in [0u64, 1, 2, 3, 4, 5, 7, 8, 15] {
+            let fixture = build_vhdx_image(
+                512,
+                true,
+                1,
+                &[(0, VhdxBlockState::PartiallyPresent)],
+                &[VhdxGroupBitmap {
+                    group: 0,
+                    state: vhdx::SB_BLOCK_PRESENT,
+                    child_sectors: &child_sectors,
+                }],
+            );
+            let mut bytes = fixture.bytes;
+            // The low three bits are the state and bit 3 is reserved;
+            // keep the offset and replace all four.
+            let entry = u64::from_le_bytes(bytes[sb_byte..sb_byte + 8].try_into().unwrap());
+            let rewritten = (entry & !0xFu64) | state;
+            bytes[sb_byte..sb_byte + 8].copy_from_slice(&rewritten.to_le_bytes());
+            let devices = vhdx_chain_with_parent(bytes, 2 * 1024 * 1024);
+            let (ok, _out) = run_vhdx_chain_read(&devices, 512, 0, VHDX_CHUNK);
+            assert!(
+                !ok,
+                "sector bitmap state {state} is not SB_BLOCK_PRESENT, so the \
+                 block it describes must be refused even though a usable \
+                 bitmap sits at the offset the entry carries"
+            );
+        }
+
+        // The control, through the same rewrite path: state 6 with the
+        // same bitmap reads. Without it, a lookup broken so that no
+        // bitmap resolves at all would satisfy every assertion above.
+        let fixture = build_vhdx_image(
+            512,
+            true,
+            1,
+            &[(0, VhdxBlockState::PartiallyPresent)],
+            &[VhdxGroupBitmap {
+                group: 0,
+                state: vhdx::SB_BLOCK_PRESENT,
+                child_sectors: &child_sectors,
+            }],
+        );
+        let mut bytes = fixture.bytes;
+        let entry = u64::from_le_bytes(bytes[sb_byte..sb_byte + 8].try_into().unwrap());
+        let rewritten = (entry & !0xFu64) | vhdx::SB_BLOCK_PRESENT;
+        bytes[sb_byte..sb_byte + 8].copy_from_slice(&rewritten.to_le_bytes());
+        let devices = vhdx_chain_with_parent(bytes, 2 * 1024 * 1024);
+        let (ok, _out) = run_vhdx_chain_read(&devices, 512, 0, VHDX_CHUNK);
+        assert!(
+            ok,
+            "the same fixture in SB_BLOCK_PRESENT must read, or the \
+             refusals above prove only that the fixture is broken"
+        );
+    }
+
+    // A partially present block in an image that says it has no parent.
+    // Nothing upstream stops such an image: the differencing refusal in
+    // `init_chain_states` fires on `has_parent`, which is exactly what
+    // this image denies having, so the arm is reached and would compose
+    // the block against whatever device happens to follow it. There is
+    // no parent to compose against and no bitmap the image is entitled
+    // to consult, so the state is as undefined for it as a reserved one
+    // and the read must fail -- as it did before this format arm
+    // existed, when the state fell through to the lookup's catch-all.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_arm_partially_present_without_a_parent_is_refused() {
+        let child_sectors = [0u32..2048];
+        // HasParent clear, but a bitmap entry written anyway, present
+        // and claiming the whole chunk for the child -- the crafted
+        // shape, not one a writer produces. Its BAT index is inside the
+        // entry count an image with no parent declares, so a bound that
+        // is the only thing standing between this image and a composed
+        // read would not stop it.
+        for (has_parent, should_read, label) in [
+            (false, false, "an image claiming no parent"),
+            (true, true, "the same image claiming one"),
+        ] {
+            let fixture = build_vhdx_image(
+                512,
+                has_parent,
+                1,
+                &[(0, VhdxBlockState::PartiallyPresent)],
+                &[VhdxGroupBitmap {
+                    group: 0,
+                    state: vhdx::SB_BLOCK_PRESENT,
+                    child_sectors: &child_sectors,
+                }],
+            );
+            let devices = vhdx_chain_with_parent(fixture.bytes, 2 * 1024 * 1024);
+            let (ok, _out) = run_vhdx_chain_read(&devices, 512, 0, VHDX_CHUNK);
+            assert_eq!(
+                ok, should_read,
+                "only an image that claims a parent may say a block is \
+                 partially present: {label}"
+            );
+        }
+    }
+
+    // A mixed chunk read at an offset that is not a multiple of the
+    // image's logical sector size. The arm has to subtract the part of
+    // the first logical sector that precedes the read before it can ask
+    // whose that sector is, and then serve a short leading run; an arm
+    // that assumed the read began on a sector boundary would be off by
+    // that many bytes for the whole chunk. 4096-byte logical sectors
+    // over a 512-byte device make the offset legal for the device and
+    // still inside the image's first sector.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_arm_mixed_chunk_at_an_unaligned_virtual_offset() {
+        let child_sectors = [1u32..4, 9..14];
+        let fixture = build_vhdx_image(
+            4096,
+            true,
+            1,
+            &[(0, VhdxBlockState::PartiallyPresent)],
+            &[VhdxGroupBitmap {
+                group: 0,
+                state: vhdx::SB_BLOCK_PRESENT,
+                child_sectors: &child_sectors,
+            }],
+        );
+        let payload = fixture.block_offsets[0];
+        let devices = vhdx_chain_with_parent(fixture.bytes, 2 * 1024 * 1024);
+        // Five device sectors in: logical sector 0, byte 2560 of it.
+        let offset = 5 * 512u64;
+        let (ok, out) = run_vhdx_chain_read(&devices, 512, offset, VHDX_CHUNK);
+        assert!(ok, "a mixed chunk must read from part way into a sector");
+        assert_eq!(
+            out,
+            vhdx_expected(offset, VHDX_CHUNK, payload, 4096, &child_sectors),
+            "a read beginning part way through a logical sector must still \
+             serve every byte from the device its sector's bit names"
+        );
+    }
+
+    // The reverse mismatch: 512-byte logical sectors read through a
+    // 4096-byte device sector, so a change of owner can fall in the
+    // middle of a device sector and a child-owned run can begin and end
+    // part way through one. This is the shape the arm needs scratch
+    // space for, since it cannot read a device sector straight into the
+    // caller's buffer when only part of that sector belongs there.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_arm_mixed_chunk_through_a_four_kilobyte_device_sector() {
+        // Each range begins and ends inside a device sector: sectors
+        // 1..4 are bytes 512..2048 of device sector 0, and 9..14 are
+        // bytes 512..3072 of device sector 1.
+        let child_sectors = [1u32..4, 9..14, 70..133];
+        let fixture = build_vhdx_image(
+            512,
+            true,
+            1,
+            &[(0, VhdxBlockState::PartiallyPresent)],
+            &[VhdxGroupBitmap {
+                group: 0,
+                state: vhdx::SB_BLOCK_PRESENT,
+                child_sectors: &child_sectors,
+            }],
+        );
+        let payload = fixture.block_offsets[0];
+        let devices = vhdx_chain_with_parent(fixture.bytes, 2 * 1024 * 1024);
+        let (ok, out) = run_vhdx_chain_read(&devices, 4096, 0, VHDX_CHUNK);
+        assert!(
+            ok,
+            "a mixed chunk must read through a device whose sectors are \
+             larger than the image's"
+        );
+        assert_eq!(
+            out,
+            vhdx_expected(0, VHDX_CHUNK, payload, 512, &child_sectors),
+            "ownership changing part way through a device sector must not \
+             drag the rest of that sector with it"
+        );
     }
 
     // A chunk reaching past the end of the payload block its bitmap bits
@@ -11021,9 +11220,8 @@ unsafe fn read_vhdx_child_runs(
 /// whether a sector the current device does not hold has anywhere to
 /// come from, and every one of them runs in guest binaries built in
 /// release, where a `debug_assert` is absent and a wrapping subtraction
-/// would
-/// hand back a chain length of nearly `usize::MAX` and recurse into
-/// devices that do not exist.
+/// would hand back a chain length of nearly `usize::MAX` and recurse
+/// into devices that do not exist.
 #[inline]
 fn devices_behind(chain_len: usize, dev_offset: usize) -> Option<usize> {
     chain_len.checked_sub(dev_offset)?.checked_sub(1)

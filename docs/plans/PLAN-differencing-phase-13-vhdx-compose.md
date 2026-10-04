@@ -254,6 +254,58 @@ walk past a BAT region a writer still sizes by the shorter rule --
 the writer-side half of this same defect, left in place as issue
 #623 (see Scope, above).
 
+**F12. A parentless image could reach the composing arm, and the
+answer it got there was invented.** Found by review round 1 on the
+phase's pull request, not by this plan or by any step of it.
+`block_lookup` returned `PartiallyPresent` for BAT state 7 whatever
+`has_parent` said, and the arm composed it without rechecking. Nothing
+upstream stops such an image: the differencing refusal in
+`init_chain_states` fires on `has_parent`, which is exactly what the
+image denies having, and `sb_bat_entry_bound` falls back to
+`total_bat_entries` for it, which is wide enough to resolve the first
+group's bitmap entry. So a crafted image with `HasParent` clear, a
+state-7 payload entry and a present bitmap got a composed read where
+before this phase existed it got a failure -- state 7 had no arm at
+all and fell through the lookup's catch-all. That is the shape issue
+#547 is about: inventing an answer for a malformed image. The doc
+comment written in 13c asserted the opposite ("One that has not
+cannot resolve the bitmap either, so it still fails rather than
+inventing data"), which made it the wrong kind of wrong -- a claim a
+reader would rely on. Fixed by refusing state 7 in `block_lookup`
+when `has_parent` is clear, which is where the refusal belongs
+because the crate is the authority on what each state means for each
+kind of image.
+
+**F13. The phase's mutation evidence was not reproducible from the
+tree, and neither was phase 12's.** Also from review round 1. Phase
+12's and phase 13's commit messages both describe mutations "kept in
+a runnable script", and `tools/mutate-differencing.sh` is that script
+by name -- but its 26 cases all mutate the *writer*, and the reader
+mutations for both phases lived only in a session scratchpad. The
+claim was therefore unfalsifiable by anyone reading the repository.
+Corrected by committing 32 reader cases to that harness in `13h`
+below, which covers phase 12's VHD set as well as phase 13's VHDX
+one: the gap was the same gap, and fixing only this phase's half
+would have left the next phase's review to find the other.
+
+**F14. Two properties were pinned by the wrong test, and one guard
+was not a guard.** Found by the first full run of the harness once
+the reader cases were in it, which is the point of putting them
+there. Three cases named an arm test that did not kill their
+mutation. Two were a mapping error: a coalescer that never advances
+its bitmap byte, and a block-end guard admitting one sector too
+many, are both invisible at the arm, because the arm re-enters the
+coalescer once per ownership run with a correct starting byte and
+refuses an over-long chunk by a second route. Those properties are
+the crate's, so the cases now name the `vhd` and `vhdx` tests that do
+pin them. The third was not a mapping error: `sector_bitmap_lookup`
+checked `state == SB_BLOCK_NOT_PRESENT` and then
+`state != SB_BLOCK_PRESENT`, and nothing can reach the second
+through the first, so removing the earlier branch changed no
+behaviour and no test could kill it. It read as two guards where
+there was one. Collapsed into a single comparison whose comment
+carries both reasons.
+
 ## Decisions
 
 1. **Mirror phase 12's three-part shape rather than inventing one.**
@@ -336,6 +388,7 @@ the writer-side half of this same defect, left in place as issue
 | 13d | high | opus | none | Crate-level tests in the qcow2 crate's test module. There is no VHDX harness there at all (F2), so build one: a VHDX sibling of `run_vhd_chain_read` and a fixture builder that takes the logical sector size, the per-block payload states, and an explicit list of child-owned sector indices (decision 8 -- build the general builder first; phase 12 paid two review rounds for not doing so). The mock device must refuse a read at any sector size but its own, as the VHD mock does, or a whole class of sector-size mistake is invisible. Cover, at minimum: an all-child and an all-parent `PARTIALLY_PRESENT` block; a mixed one; the same mixed case at `logical_sector_size` 4096; a run crossing a bitmap byte boundary; a block that is not the first in its chunk group, so the SB interleave arithmetic is exercised; `Zero` versus `NotPresent` giving different answers for a child with a parent behind it; each of the three fail-closed paths at the bottom of a chain; a `PARTIALLY_PRESENT` block with `SB_BLOCK_NOT_PRESENT`; and a chunk crossing a block boundary. Add a regression test proving decision 3's identical-behaviour claim for a non-differencing VHDX, comparing against `develop` at `758ffba8`. Prove each test by mutation rather than by reading it, keep the mutations in a runnable script, and state the count in the commit message -- phase 12 ended at fifteen and two of its survivors were real findings. The bit-order mutation (`i % 8` to `7 - i % 8`) and the sector-unit mutation (`logical_sector_size` to a literal 512) are the two that matter most. |
 | 13e | medium | sonnet | none | Bookkeeping. `CHANGELOG.md`: a sibling of the phase 12 entry at `:12` saying the guest chain walker composes a differencing VHDX, and that no operation reaches it yet because `init_chain_states` still refuses every differencing VHDX. Record what the survey found at its source in `docs/plans/PLAN-differencing.md` if 13b-13d falsify anything this plan claims. Confirm `docs/map.md:238`'s VHDX partial-present limitation note is still true -- `map` is a different consumer and this phase does not change it -- and leave it alone if so. Do not touch `docs/` otherwise: phase 16 owns the documentation, and phase 14 owns the user-visible change. |
 | 13f | high | opus | none | Unplanned, added during execution after 13d found that a differencing image's sector-bitmap BAT entries were unreachable for any block count that is not an exact multiple of chunk_ratio, including the project's own 16 MiB `vhdx-diff-child.vhdx` fixture (F11, above). `VhdxState::init` sized `total_bat_entries` the way an image with no parent is sized -- one entry per payload block plus one per group -- while a differencing image's BAT is padded to whole groups of `chunk_ratio + 1` entries, so the last group's sector-bitmap entry, and every entry in a disk smaller than one group, sat past the bound `sector_bitmap_lookup` checked itself against. Add a separate bound, `sb_bat_entry_bound`, computed by the padded rule when `has_parent` is set and capped by what the declared BAT region holds; leave `total_bat_entries` at the shorter count, because `scan_allocation` and `map_extents` size their whole-BAT walks by it and widening it would walk those past a region a writer still sizes by the shorter rule. Do not touch the writer side (`calculate_bat_layout`, `src/crates/vhdx/src/lib.rs:3301`) -- that is issue #623, out of scope here (see Scope, above). Add crate-level tests of the entry-count arithmetic and a compose test at the project's own 16 MiB geometry; confirm the compose test fails without the fix and add a mutation reverting the count. Built as `ec005d57`. |
+| 13h | high | opus | none | Unplanned, added in response to review round 1 on the phase's pull request. Three things, and the third is the systemic one. Refuse `PAYLOAD_BLOCK_PARTIALLY_PRESENT` in `block_lookup` when `has_parent` is clear, so a crafted parentless image cannot reach the composing arm and get an invented answer (F12, above). Separate the sector-bitmap state check from the absent-offset case with a test that rewrites a *present* entry's state in place, keeping a usable bitmap at the offset the entry carries, so the test cannot pass by rejecting offset zero alone; and cover the two sub-sector shapes the arm is written for but no test drove -- a read beginning part way through a logical sector, and a 512-byte-logical-sector image read through a 4096-byte device sector. Then commit the reader mutations to `tools/mutate-differencing.sh` (F13, above): 32 cases covering phase 12's VHD arm as well as this phase's VHDX one, each naming the one qcow2 test that must kill it and running with the full input-format feature list, plus a `rust_survivor_case` type for the one mutation documented as *not* caught -- it asserts survival and fails if the mutation is ever killed, because that would mean the recorded reason has gone stale. Update `EXPECTED_CASES` and `docs/testing.md` together, which the harness checks for itself. Then run the harness and act on what it says: the first full run returned four cases the named test did not kill, which became F14 above -- three re-pointed at the crate test that does pin the property, and one guard collapsed because it turned out not to be one. Final state 57 cases, 56 killed and one surviving as documented, in 4m43s on a warm tree. Built as `13h`. |
 
 ## Risks and mitigations
 

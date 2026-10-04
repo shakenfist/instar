@@ -158,7 +158,7 @@ jobs:
       - name: Test the mutation harness verdicts
         run: tools/mutate-differencing.sh --self-test
 
-      # The 26 search strings are pinned to src/ byte for byte,
+      # The 57 search strings are pinned to src/ byte for byte,
       # indentation included, so a reformat of the emitter turns cases
       # BROKEN with nothing to notice until someone spends the full
       # docker-and-testdata run. This counts the occurrences without

@@ -2293,9 +2293,20 @@ impl VhdxState {
                 // which of the block's sectors are its own. Report
                 // where the block sits and how much of it follows,
                 // and leave the composing to a caller that has a
-                // parent to compose against. One that has not cannot
-                // resolve the bitmap either, so it still fails rather
-                // than inventing data.
+                // parent to compose against.
+                //
+                // An image claiming no parent has no parent to compose
+                // against and no bitmap it is entitled to consult, so
+                // this state is as undefined for it as state 4 is:
+                // refuse the block rather than serving whichever of
+                // its sectors a crafted bitmap happens to claim. The
+                // refusal has to live here because nothing upstream
+                // stops such an image -- the differencing refusal in
+                // `init_chain_states` fires on `has_parent`, which is
+                // exactly what this image denies having.
+                if !self.has_parent {
+                    return None;
+                }
                 let intra_block_offset = virtual_offset % self.block_size as u64;
                 Some(VhdxBlockLookup::PartiallyPresent {
                     host_byte_offset: file_offset.checked_add(intra_block_offset)?,
@@ -2373,13 +2384,16 @@ impl VhdxState {
 
         let state = bat_entry & BAT_ENTRY_STATE_MASK;
         let file_offset = bat_entry & BAT_ENTRY_OFFSET_MASK;
-        // An image that promised a partially present payload block
-        // and then withheld the bitmap saying which of its sectors it
-        // holds. There is no safe guess to make, so fail the read.
-        if state == SB_BLOCK_NOT_PRESENT {
-            return None;
-        }
-        // Every other value is undefined for a sector bitmap entry.
+        // SB_BLOCK_PRESENT is the only state in which a sector
+        // bitmap entry can be read. SB_BLOCK_NOT_PRESENT is the case a
+        // real image reaches -- it promised a partially present
+        // payload block and then withheld the bitmap saying which of
+        // its sectors it holds -- and every remaining value is
+        // undefined for this kind of entry. Neither leaves a safe
+        // guess to make, so both fail the read, and one comparison
+        // covers them: splitting it in two reads as though the first
+        // branch were a separate guard when nothing can reach the
+        // second through it.
         if state != SB_BLOCK_PRESENT {
             return None;
         }

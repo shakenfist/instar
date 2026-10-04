@@ -536,6 +536,20 @@ rather than left as one phase to be split later, the way
   `init_chain_states`'s refusal, and phase 12 found that doing so
   safely requires knowing a device's own chain boundary, which
   `device_count` alone does not give it.
+
+  It also needs issue #623 settled first, and for the same kind of
+  reason. Phase 13 found that a differencing VHDX pads its BAT out
+  to whole chunk groups where a dynamic one does not, and that the
+  writer's `calculate_bat_layout` sizes the region by the shorter
+  dynamic rule. The phase 13 reader reaches the padded entries but
+  caps itself at the declared region, deliberately, so that the
+  differencing images that load today keep loading. The consequence
+  is that lifting the refusal before #623 lands ships a reader which
+  cannot resolve the sector bitmaps of images instar itself wrote
+  whenever that region is sized exactly -- a silent read failure on
+  our own output, which is the worst shape this gap could take.
+  Treat both issues as gates on phase 14's first step rather than as
+  work the phase can absorb.
 * **Phase 15, tests and fuzz.** Cross-validation against the
   phase 1 oracle for chains instar wrote and chains it did not,
   plus coverage fuzzing of the compose path. Its harness drives
