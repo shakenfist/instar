@@ -8221,6 +8221,12 @@ mod tests {
     static mut VHDX_LENS: [usize; VHDX_MAX_DEVS] = [0; VHDX_MAX_DEVS];
     #[cfg(feature = "vhdx-input")]
     static mut VHDX_SSZ: usize = 512;
+    #[cfg(feature = "vhdx-input")]
+    static mut VHDX_ERR_OP: [u8; 32] = [0; 32];
+    #[cfg(feature = "vhdx-input")]
+    static mut VHDX_ERR_STATUS: u32 = 0;
+    #[cfg(feature = "vhdx-input")]
+    static mut VHDX_ERR_CALLS: u32 = 0;
 
     /// The block size every fixture uses: the format's 1 MiB minimum,
     /// which is also the sector bitmap block size.
@@ -8311,12 +8317,69 @@ mod tests {
         VHDX_SSZ
     }
 
+    /// Record what `send_error` was called with.
+    ///
+    /// `init_chain_states` returns a bare `bool`, so this channel
+    /// carries the only evidence of *why* a device was rejected. A test
+    /// that asserts the return value alone passes for any init failure,
+    /// including a broken fixture, which is exactly the failure the
+    /// differencing refusal must not be confused with.
+    ///
+    /// Deliberately its own statics rather than the VHD recorder's: the
+    /// two harnesses serialise on different mutexes, so a shared
+    /// recorder would let a VHD test and a VHDX test race for it.
+    #[cfg(feature = "vhdx-input")]
+    unsafe extern "C" fn vhdx_send_err(op: *const u8, _sub: *const u8, _off: u64, status: u32) {
+        VHDX_ERR_CALLS += 1;
+        VHDX_ERR_STATUS = status;
+        let dst = core::ptr::addr_of_mut!(VHDX_ERR_OP) as *mut u8;
+        core::ptr::write_bytes(dst, 0, 32);
+        for i in 0..31 {
+            let b = *op.add(i);
+            *dst.add(i) = b;
+            if b == 0 {
+                break;
+            }
+        }
+    }
+
+    #[cfg(feature = "vhdx-input")]
+    fn vhdx_reset_errors() {
+        unsafe {
+            VHDX_ERR_CALLS = 0;
+            VHDX_ERR_STATUS = 0;
+            let dst = core::ptr::addr_of_mut!(VHDX_ERR_OP) as *mut u8;
+            core::ptr::write_bytes(dst, 0, 32);
+        }
+    }
+
+    /// How many times `send_error` was called since the last reset, the
+    /// operation marker of the last call, and its status.
+    #[cfg(feature = "vhdx-input")]
+    fn vhdx_last_error() -> (u32, std::string::String, u32) {
+        unsafe {
+            let src = core::ptr::addr_of!(VHDX_ERR_OP) as *const u8;
+            let mut n = 0usize;
+            while n < 32 && *src.add(n) != 0 {
+                n += 1;
+            }
+            let op =
+                core::str::from_utf8(core::slice::from_raw_parts(src, n)).unwrap_or("<not utf-8>");
+            (
+                VHDX_ERR_CALLS,
+                std::string::String::from(op),
+                VHDX_ERR_STATUS,
+            )
+        }
+    }
+
     #[cfg(feature = "vhdx-input")]
     fn vhdx_call_table() -> shared::CallTable {
         shared::CallTable {
             read_input_sector: vhdx_read_sector,
             get_input_capacity: vhdx_capacity,
             get_input_sector_size: vhdx_ssz,
+            send_error: vhdx_send_err,
             ..stub_call_table()
         }
     }
@@ -9315,6 +9378,143 @@ mod tests {
         0xeb05_052e_a5b6_2325,
         0xeb05_052e_a5b6_2325,
     ];
+
+    // Everything the composing arm above does is unreachable in a
+    // shipped binary, and that claim rests entirely on this: a
+    // differencing VHDX never gets past `init_chain_states`, so no
+    // operation ever reaches the arm. Nothing else pins it.
+    //
+    // Three things are asserted, because the first alone is worth
+    // little. `init_chain_states` returns a bare `bool`, so "it
+    // returned false" is satisfied by a mistyped header, a mis-sized
+    // cache or a stub call-table entry that happens to fail -- the
+    // refusal would read as proven while never having fired. The
+    // operation marker and status say it fired, and say which format
+    // it named; the dynamic controls say the fixture, the cache and
+    // the mock are sound, so the refusal assertions are measuring the
+    // refusal and not a broken harness.
+    //
+    // The device-count dimension rules out a narrower refusal. A
+    // tempting form, `state.has_parent && dev_idx + 1 >= device_count`,
+    // refuses a lone child and admits one with a device behind it, and
+    // a single-device test cannot tell it from the unconditional rule.
+    // It is unsafe: `device_count` bounds a flat array, not a chain --
+    // `compare diff.vhdx base.raw` packs two independent chains into
+    // one array -- so a differencing child at index 0 with
+    // `device_count` 2 has no parent behind it at all, and that form
+    // would have composed it against an unrelated image (issue #614).
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_init_refuses_a_differencing_child_and_admits_a_dynamic_one() {
+        for (has_parent, device_count, refused, label) in [
+            (true, 1u32, true, "a lone differencing device"),
+            (
+                true,
+                2u32,
+                true,
+                "a differencing device at index 0 of a two-device array",
+            ),
+            // The controls. One metadata flag differs from the cases
+            // above and nothing else does, so an assertion that passes
+            // because the synthetic image, the hand-built cache or a
+            // stub call-table entry is broken -- rather than because
+            // the refusal fired -- cannot pass here.
+            (false, 1u32, false, "a lone dynamic device"),
+            (
+                false,
+                2u32,
+                false,
+                "a dynamic device at index 0 of a two-device array",
+            ),
+        ] {
+            let _guard = VHDX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let fixture = build_vhdx_image(
+                512,
+                has_parent,
+                1,
+                &[(0, VhdxBlockState::FullyPresent)],
+                &[],
+            );
+            let img = fixture.bytes;
+            // The follower is a second, unrelated raw device, exactly as
+            // a two-image operation lays its arguments out. It is not
+            // this child's parent, which is the whole point.
+            let follower = build_vhdx_parent_raw(2 * 1024 * 1024);
+            unsafe {
+                VHDX_SSZ = 512;
+                let imgs = core::ptr::addr_of_mut!(VHDX_IMAGES) as *mut *const u8;
+                let lens = core::ptr::addr_of_mut!(VHDX_LENS) as *mut usize;
+                *imgs = img.as_ptr();
+                *lens = img.len();
+                *imgs.add(1) = follower.as_ptr();
+                *lens.add(1) = follower.len();
+            }
+            let call_table = vhdx_call_table();
+
+            let mut chain_states = ChainStates::default();
+            let mut chain_config = ChainConfig::new();
+            chain_config.magic = ChainConfig::MAGIC;
+            chain_config.version = ChainConfig::VERSION;
+            chain_config.device_count = device_count;
+            chain_config.devices[0].format = ImageFormat::Vhdx as u32;
+            if device_count > 1 {
+                chain_config.devices[1].format = ImageFormat::Raw as u32;
+            }
+
+            let mut cache = std::vec![0u8; 4 * MAX_SECTOR_SIZE];
+            let dynamic_bufs_start = cache.as_mut_ptr() as usize;
+            let mut bytes_read = 0u64;
+            vhdx_reset_errors();
+            let ok = unsafe {
+                init_chain_states(
+                    &call_table,
+                    &chain_config,
+                    &mut chain_states,
+                    device_count as usize,
+                    512,
+                    dynamic_bufs_start,
+                    0,
+                    0,
+                    &mut bytes_read,
+                )
+            };
+            unsafe {
+                let imgs = core::ptr::addr_of_mut!(VHDX_IMAGES) as *mut *const u8;
+                *imgs = core::ptr::null();
+                *imgs.add(1) = core::ptr::null();
+            }
+            let _ = &cache;
+            let (calls, op, status) = vhdx_last_error();
+            if refused {
+                assert!(!ok, "a differencing VHDX must fail chain init: {label}");
+                // Why it failed, not just that it did. `init_chain_states`
+                // returns a bare bool, so without this the assertion
+                // above is satisfied by any init failure at all.
+                assert_eq!(
+                    calls, 1,
+                    "the refusal must be raised on send_error exactly once: {label}"
+                );
+                assert_eq!(
+                    op,
+                    shared::DifferencingRefusal::OPERATION,
+                    "init must fail by raising the differencing refusal, not for \
+                     some unrelated reason: {label}"
+                );
+                assert_eq!(
+                    status,
+                    shared::DifferencingRefusal::STATUS_VHDX,
+                    "the refusal must name VHDX rather than VHD: {label}"
+                );
+            } else {
+                assert!(
+                    ok,
+                    "the same harness must initialise a VHDX with no parent, or \
+                     the refusal assertions prove nothing: {label}"
+                );
+                assert_eq!(calls, 0, "a dynamic VHDX must raise no refusal: {label}");
+            }
+        }
+    }
 
     // ========================================================================
     // DMG chain-reader arm (read_chain_virtual_cluster ImageFormat::Dmg)
