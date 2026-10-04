@@ -1175,7 +1175,7 @@ rust_case 'vhd-read-refusal-names-vhdx' "${QCOW2_LIB}" \
     qcow2 'vhd_init_refuses_a_differencing_child_and_admits_a_dynamic_one' \
     --features "${QCOW2_FEATURES}"
 
-# --- VHD: the two documented survivors -------------------------------
+# --- VHD: the documented survivor ------------------------------------
 
 rust_survivor_case 'vhd-read-classify-stops-at-the-first-mixed-verdict' "${QCOW2_LIB}" \
     '        let run = next_vhd_ownership_run(

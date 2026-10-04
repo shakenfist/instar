@@ -552,7 +552,12 @@ rather than left as one phase to be split later, the way
   work the phase can absorb.
 * **Phase 15, tests and fuzz.** Cross-validation against the
   phase 1 oracle for chains instar wrote and chains it did not,
-  plus coverage fuzzing of the compose path. Its harness drives
+  plus coverage fuzzing of the compose path. Phase 13 left it one
+  specific gap to close: every multi-group and partial-group VHDX
+  compose test runs at 512-byte logical sectors, where `chunk_ratio`
+  is 4096. At 4096-byte sectors it is 32768, so the padded BAT bound
+  and the chunk-group stride are arithmetic nothing drives at the
+  larger geometry. Its harness drives
   the `python3-libvhdi` binding with an explicit `set_parent()`
   rather than a CLI export, and its VHD fixtures are subject to
   the sector-bitmap caveat above. Phase 9 fuzzes the locator

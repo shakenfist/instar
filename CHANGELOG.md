@@ -32,9 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   two had previously been treated as the same case. An image that
   claims no parent may not say a block is partially present at all,
   and such a block is refused rather than composed against whatever
-  device follows, and no block of any kind may begin inside the
-  first megabyte, which is where the file identifier and headers
-  live. This is a crate-level change only: `init_chain_states` still
+  device follows. The chain walker also refuses a BAT entry naming
+  file offset zero, where the file identifier and headers live,
+  rather than reading a block from there; the whole-BAT walks behind
+  `info` and `map` are unchanged. This is a crate-level change only:
+  `init_chain_states` still
   refuses every differencing VHDX unconditionally, so no operation
   reaches the composing path — this is not a user-visible change.
 

@@ -1582,14 +1582,17 @@ here pins the arm that calls it. Running one named test in one package
 is what keeps them separate, since `make test-rust` stops at the first
 failing crate and would otherwise never reach the arm.
 
-Three name a `vhd` or `vhdx` test instead, because the property is
-genuinely the crate's and not the arm's. The arm calls the ownership
-coalescer once per run, each time with a correct starting byte, so a
-coalescer that stops at a bitmap byte boundary serves the same bytes
-in two runs instead of one and no arm test can see the difference.
-That is not a weak arm test; it is where the property lives. Each of
-the three says so at the case, and each was established by watching
-the case fail while it named an arm test.
+Some name a `vhd` or `vhdx` test instead, because the property is
+genuinely the crate's and not the arm's — `--list` shows which, so
+the number is deliberately not written here. The arm calls the
+ownership coalescer once per run, each time with a correct starting
+byte, so a coalescer that stops at a bitmap byte boundary serves the
+same bytes in two runs instead of one and no arm test can see the
+difference. The same goes for a chunk group of no sectors, which is a
+property of the state's geometry rather than of any read. That is not
+a weak arm test; it is where the property lives. Each such case says
+so where it is defined, and each was established by watching the case
+fail while it named an arm test.
 
 **1 survivor case** is among them: `rust_survivor_case` asserts that a
 mutation is *not* caught, with the reason recorded at the case.
