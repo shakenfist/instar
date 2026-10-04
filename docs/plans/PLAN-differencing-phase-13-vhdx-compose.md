@@ -71,6 +71,15 @@ specify one for this phase.
 * Integration tests and fuzzing (phases 15), documentation (phase 16).
 * `PAYLOAD_BLOCK_UNDEFINED` / `UNMAPPED` semantics beyond what the
   current code already does. They are not differencing-specific.
+* `vhdx::calculate_bat_layout`'s writer-side BAT entry count
+  (`src/crates/vhdx/src/lib.rs:3301`), used by `create`, `convert`,
+  `measure` and `resize`. It sizes a differencing image's BAT by the
+  same shorter rule 13f's reader-side fix works around rather than
+  widens (see F10/F11 below), so every differencing VHDX instar
+  writes still has unreachable sector-bitmap entries past the first
+  partial chunk group. Fixing it changes the on-disk layout of every
+  such image and needs each of its four callers checked on its own.
+  Tracked as issue #623, deliberately not fixed here.
 
 ## What the survey found
 
@@ -196,6 +205,55 @@ marks the rest as pre-phase-12. No later step needs to redo this.
 
 Nothing else the master plan says about phase 13 was found to be false.
 
+The findings below were made executing the plan above, not planning
+it, and are added here rather than left to be inferred from commit
+messages.
+
+**F10. The risk list's claim that the `NotPresent`/`Zero` split
+"should not" change non-differencing reads (below, "Risks and
+mitigations") is wrong, in exactly one case that is unreachable
+rather than harmful.** 13c makes `Zero` zero-fill and return
+immediately, where before the split it fell through to `continue`
+with `NotPresent` and reached the walk's zero-fill tail by the same
+route. `cc0989a0`'s regression guard compares five reads of a
+parentless image against `758ffba8` and finds four identical, with
+the third -- an explicitly zeroed block *with a device behind it* --
+changed: it used to descend into that device and now reads as
+zeros directly. No chain a host builds can produce this shape, since
+a parentless image has no backing file to put behind it, so the
+difference cannot reach a real read today. The guard drives the case
+anyway, to pin the new answer rather than leave it untested, and that
+is what shows the risk list's claim to be false rather than merely
+unproven.
+
+**F11. A differencing VHDX's sector-bitmap BAT entries are
+unreachable whenever its block count is not a whole number of chunk
+groups, and the master plan does not anticipate this at all.**
+`VhdxState::init` sized `total_bat_entries` by the rule for an image
+with no parent -- one entry per payload block plus one per group --
+and `sector_bitmap_lookup` bounded itself by that same count. A
+differencing image's BAT is actually padded to whole groups of
+`chunk_ratio + 1` entries, because a group's sector-bitmap entry sits
+at the end of the group whether or not every payload entry ahead of
+it is backed by virtual disk. Any differencing image whose block
+count is not a whole number of groups therefore had at least one
+unreachable bitmap entry, and one smaller than a single group -- 4
+GiB at the common 1 MiB block / 512-byte sector geometry -- had none
+reachable at all. The project's own 16 MiB `vhdx-diff-child.vhdx`
+fixture is the second case, so this blocked the phase's own
+deliverable: the composing reader built in 13c could not have read
+instar's real fixture. Found by 13d's implementer noticing that
+every fixture it had managed to get working used a whole number of
+chunk groups, not by anything in this plan. Fixed in `ec005d57` by
+adding a separate bound, `sb_bat_entry_bound`, computed by the padded
+rule for a differencing image and capped by what the declared BAT
+region holds. `total_bat_entries` itself is deliberately left at the
+shorter count, because it also sizes the whole-BAT walks in
+`scan_allocation` and `map_extents`; widening it would make those
+walk past a BAT region a writer still sizes by the shorter rule --
+the writer-side half of this same defect, left in place as issue
+#623 (see Scope, above).
+
 ## Decisions
 
 1. **Mirror phase 12's three-part shape rather than inventing one.**
@@ -277,6 +335,7 @@ Nothing else the master plan says about phase 13 was found to be false.
 | 13c | high | opus | none | Teach the VHDX arm of `read_chain_virtual_cluster` (`src/crates/qcow2/src/lib.rs:10269`) to compose. Two separable changes; make them two commits if it reads better. First, split the `NotPresent | Zero` arm (F3, decision 3): `Zero` zero-fills `chunk_size` bytes and returns true, `NotPresent` continues to the next device, and for a child whose `has_parent` is set with no device behind it, `NotPresent` fails closed via `devices_behind()` (`:9419`, decision 4). Fix `VhdxBlockLookup::NotPresent`'s doc comment, which says "(reads as zero)". Second, add the `PARTIALLY_PRESENT` case: `block_lookup` (`src/crates/vhdx/src/lib.rs:1984`) returns `None` for state 7 today, so it needs a new `VhdxBlockLookup` variant carrying the block's file offset; classify the chunk with 13b's reader, serve an all-child chunk with the existing single read, fill an all-parent chunk by recursing into the chain, and for a mixed chunk fill from the parent and then overwrite the child's runs. Refuse a chunk reaching past the block boundary (decision 6). **Read every child run through `read_offset_sectors` with the caller's scratch, never `read_cluster_sectors`** -- phase 12's third review round removed exactly that branch because the aligned path still put a 64 KiB buffer on the guest stack whenever a run was not a whole number of device sectors (F9); `read_vhd_child_runs` on `develop` is the correct model, `ed4f2669`'s version is not. |
 | 13d | high | opus | none | Crate-level tests in the qcow2 crate's test module. There is no VHDX harness there at all (F2), so build one: a VHDX sibling of `run_vhd_chain_read` and a fixture builder that takes the logical sector size, the per-block payload states, and an explicit list of child-owned sector indices (decision 8 -- build the general builder first; phase 12 paid two review rounds for not doing so). The mock device must refuse a read at any sector size but its own, as the VHD mock does, or a whole class of sector-size mistake is invisible. Cover, at minimum: an all-child and an all-parent `PARTIALLY_PRESENT` block; a mixed one; the same mixed case at `logical_sector_size` 4096; a run crossing a bitmap byte boundary; a block that is not the first in its chunk group, so the SB interleave arithmetic is exercised; `Zero` versus `NotPresent` giving different answers for a child with a parent behind it; each of the three fail-closed paths at the bottom of a chain; a `PARTIALLY_PRESENT` block with `SB_BLOCK_NOT_PRESENT`; and a chunk crossing a block boundary. Add a regression test proving decision 3's identical-behaviour claim for a non-differencing VHDX, comparing against `develop` at `758ffba8`. Prove each test by mutation rather than by reading it, keep the mutations in a runnable script, and state the count in the commit message -- phase 12 ended at fifteen and two of its survivors were real findings. The bit-order mutation (`i % 8` to `7 - i % 8`) and the sector-unit mutation (`logical_sector_size` to a literal 512) are the two that matter most. |
 | 13e | medium | sonnet | none | Bookkeeping. `CHANGELOG.md`: a sibling of the phase 12 entry at `:12` saying the guest chain walker composes a differencing VHDX, and that no operation reaches it yet because `init_chain_states` still refuses every differencing VHDX. Record what the survey found at its source in `docs/plans/PLAN-differencing.md` if 13b-13d falsify anything this plan claims. Confirm `docs/map.md:238`'s VHDX partial-present limitation note is still true -- `map` is a different consumer and this phase does not change it -- and leave it alone if so. Do not touch `docs/` otherwise: phase 16 owns the documentation, and phase 14 owns the user-visible change. |
+| 13f | high | opus | none | Unplanned, added during execution after 13d found that a differencing image's sector-bitmap BAT entries were unreachable for any block count that is not an exact multiple of chunk_ratio, including the project's own 16 MiB `vhdx-diff-child.vhdx` fixture (F11, above). `VhdxState::init` sized `total_bat_entries` the way an image with no parent is sized -- one entry per payload block plus one per group -- while a differencing image's BAT is padded to whole groups of `chunk_ratio + 1` entries, so the last group's sector-bitmap entry, and every entry in a disk smaller than one group, sat past the bound `sector_bitmap_lookup` checked itself against. Add a separate bound, `sb_bat_entry_bound`, computed by the padded rule when `has_parent` is set and capped by what the declared BAT region holds; leave `total_bat_entries` at the shorter count, because `scan_allocation` and `map_extents` size their whole-BAT walks by it and widening it would walk those past a region a writer still sizes by the shorter rule. Do not touch the writer side (`calculate_bat_layout`, `src/crates/vhdx/src/lib.rs:3301`) -- that is issue #623, out of scope here (see Scope, above). Add crate-level tests of the entry-count arithmetic and a compose test at the project's own 16 MiB geometry; confirm the compose test fails without the fix and add a mutation reverting the count. Built as `ec005d57`. |
 
 ## Risks and mitigations
 

@@ -2051,12 +2051,11 @@ impl VhdxState {
 
         // A differencing image is *not* refused here: `has_parent` is
         // carried out on the returned state instead, and the read entry
-        // points refuse it by name (decision 3 of
-        // `docs/plans/PLAN-differencing-phase-04-read-policy.md`). A bare
-        // `None` here was indistinguishable from a corrupt header, which
-        // is what issue #548 complained about, and it left VHDX
-        // structurally different from VHD for the composition phases to
-        // reconcile later.
+        // points refuse it by name, where the refusal can say which
+        // format it is naming. A bare `None` here was indistinguishable
+        // from a corrupt header, which is what issue #548 complained
+        // about, and it left VHDX structurally different from VHD for
+        // the composition work that followed.
 
         // Validate sector sizes
         if metadata.logical_sector_size != 512 && metadata.logical_sector_size != 4096 {
