@@ -8200,17 +8200,15 @@ mod tests {
     // order are spelled out in the builder rather than taken from the vhdx
     // crate, so that a fixture cannot move with the code it is checking.
     //
-    // Every fixture's virtual disk is a whole number of chunk groups, which
-    // at a 1 MiB block size is 4 GiB per group for 512-byte logical sectors
-    // and 32 GiB for 4096-byte ones. That costs nothing -- it is metadata,
-    // and the file holds only the blocks a fixture allocates -- but it is
-    // not a free choice. `VhdxState::init` sizes the BAT the way an image
-    // with no parent is sized, one entry per payload block plus one per
-    // group, while a differencing image's BAT is padded out to whole groups
-    // of `chunk_ratio + 1` entries. For a virtual size that is not a whole
-    // number of groups, the final group's sector bitmap entry then lies past
-    // the entry count `sector_bitmap_lookup` bounds itself by, and every
-    // partially present block in that group fails to read.
+    // Most fixtures give their virtual disk a whole number of chunk
+    // groups, which at a 1 MiB block size is 4 GiB per group for 512-byte
+    // logical sectors and 32 GiB for 4096-byte ones. That costs nothing --
+    // it is metadata, and the file holds only the blocks a fixture
+    // allocates. It is not a requirement, though: `build_vhdx_image_blocks`
+    // takes a payload block count instead, for the partial final group a
+    // real small differencing image has, where the group's sector bitmap
+    // entry still sits at the group's end and so past the last payload
+    // block the disk defines.
     // ========================================================================
 
     #[cfg(feature = "vhdx-input")]
@@ -8394,12 +8392,39 @@ mod tests {
         blocks: &[(u64, VhdxBlockState)],
         bitmaps: &[VhdxGroupBitmap<'_>],
     ) -> VhdxFixture {
+        let payload_blocks = group_count * vhdx_chunk_ratio(logical_sector_size);
+        build_vhdx_image_blocks(
+            logical_sector_size,
+            has_parent,
+            payload_blocks,
+            blocks,
+            bitmaps,
+        )
+    }
+
+    /// `build_vhdx_image` with the virtual disk given as a payload block
+    /// count, so a fixture can stop part way through a chunk group the
+    /// way a small real image does.
+    #[cfg(feature = "vhdx-input")]
+    fn build_vhdx_image_blocks(
+        logical_sector_size: u32,
+        has_parent: bool,
+        payload_blocks: u64,
+        blocks: &[(u64, VhdxBlockState)],
+        bitmaps: &[VhdxGroupBitmap<'_>],
+    ) -> VhdxFixture {
         let chunk_ratio = vhdx_chunk_ratio(logical_sector_size);
         let block_size = u64::from(VHDX_FIX_BLOCK_SIZE);
-        let virtual_disk_size = group_count * chunk_ratio * block_size;
-        // The BAT as `VhdxState::init` counts it: one entry per payload
-        // block, plus one sector bitmap entry per group.
-        let total_bat_entries = group_count * chunk_ratio + group_count;
+        let virtual_disk_size = payload_blocks * block_size;
+        // A differencing BAT is whole groups of chunk_ratio + 1 entries;
+        // one with no parent stops at the last entry it needs. Spelled
+        // out here rather than taken from the crate under test.
+        let group_count = payload_blocks.div_ceil(chunk_ratio);
+        let total_bat_entries = if has_parent {
+            group_count * (chunk_ratio + 1)
+        } else {
+            payload_blocks + group_count
+        };
         assert!(
             total_bat_entries * 8 <= u64::from(VHDX_FIX_BAT_LENGTH),
             "the fixture BAT region cannot hold {total_bat_entries} entries"
@@ -8787,6 +8812,49 @@ mod tests {
             vhdx_expected(0, VHDX_CHUNK, payload, 512, &child_sectors),
             "each logical sector of a mixed chunk must be served from the \
              device its bitmap bit names"
+        );
+    }
+
+    // The shape of a real small differencing image, and of the project's
+    // own VHDX differencing fixture: a 16 MiB disk, which at a 1 MiB
+    // block size and 512-byte logical sectors is sixteen payload blocks
+    // and so a small fraction of one 4096-block chunk group. The group's
+    // sector bitmap entry sits at BAT entry 4096 regardless, far past
+    // the seventeen entries an image with no parent would need, so a
+    // reader that bounds the bitmap lookup by that shorter count cannot
+    // resolve the ownership of any block in this image at all.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_arm_mixed_block_in_a_partial_chunk_group() {
+        // Block 5 begins at virtual 5 MiB, which is the chunk group's
+        // sector 10240; the ranges are asymmetric within their bitmap
+        // bytes for the same reason the whole-group mixed case above
+        // makes them so.
+        let child_sectors = [10241u32..10244, 10249..10254, 10310..10373];
+        let fixture = build_vhdx_image_blocks(
+            512,
+            true,
+            16,
+            &[(5, VhdxBlockState::PartiallyPresent)],
+            &[VhdxGroupBitmap {
+                group: 0,
+                state: vhdx::SB_BLOCK_PRESENT,
+                child_sectors: &child_sectors,
+            }],
+        );
+        let payload = fixture.block_offsets[0];
+        let devices = vhdx_chain_with_parent(fixture.bytes, 16 * 1024 * 1024);
+        let offset = 5 * u64::from(VHDX_FIX_BLOCK_SIZE);
+        let (ok, out) = run_vhdx_chain_read(&devices, 512, offset, VHDX_CHUNK);
+        assert!(
+            ok,
+            "a mixed chunk in a disk shorter than one chunk group must read"
+        );
+        assert_eq!(
+            out,
+            vhdx_expected(offset, VHDX_CHUNK, payload, 512, &child_sectors),
+            "a partial final chunk group's sector bitmap must still be \
+             reachable, so each sector comes from the device its bit names"
         );
     }
 

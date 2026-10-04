@@ -1753,6 +1753,30 @@ pub fn sb_bat_index(block_index: u64, chunk_ratio: u32) -> Option<u64> {
         .checked_add(chunk_ratio)
 }
 
+/// BAT entry count a differencing VHDX's BAT is padded out to.
+///
+/// A differencing image reserves whole groups of `chunk_ratio + 1`
+/// entries, because a group's sector bitmap entry sits at the end of
+/// the group whether or not every payload entry ahead of it is backed
+/// by virtual disk. An image with no parent stops at the last entry it
+/// actually needs, which is the shorter count `calculate_bat_layout`
+/// returns.
+///
+/// The difference only ever matters to a reader resolving a sector
+/// bitmap: the writer side still sizes every BAT it emits by the
+/// shorter rule, which is issue #623.
+///
+/// Returns `None` for a degenerate chunk ratio and on overflow.
+pub fn differencing_bat_entry_count(total_payload_blocks: u64, chunk_ratio: u32) -> Option<u64> {
+    let chunk_ratio = u64::from(chunk_ratio);
+    if chunk_ratio == 0 {
+        return None;
+    }
+    total_payload_blocks
+        .div_ceil(chunk_ratio)
+        .checked_mul(chunk_ratio.checked_add(1)?)
+}
+
 /// Index of the logical sector holding `virtual_offset`, counted from
 /// the first byte of the chunk that offset falls in.
 ///
@@ -1848,6 +1872,24 @@ pub struct VhdxState {
     pub bat_offset: u64,
     pub total_bat_entries: u32,
     pub chunk_ratio: u32,
+    /// BAT entry count the sector bitmap lookup bounds itself by.
+    ///
+    /// A differencing VHDX pads its BAT out to whole groups of
+    /// `chunk_ratio + 1` entries, so the bitmap entry of a group that
+    /// the virtual disk only partly fills still sits at the end of
+    /// that group. `total_bat_entries` counts one entry per payload
+    /// block plus one per group, which is how an image with no parent
+    /// is sized and is shorter: bounding the lookup by it puts the
+    /// last group's bitmap entry out of reach, and puts every bitmap
+    /// entry out of reach in a disk smaller than one group.
+    ///
+    /// Capped by what the declared BAT region can hold, so a lookup
+    /// still cannot read past the region. `total_bat_entries` keeps
+    /// the shorter count because it also sizes the whole-BAT walks in
+    /// `scan_allocation` and `map_extents`, which must not run off
+    /// the end of a region a writer sized by that same rule -- and
+    /// instar's writer does, which is issue #623.
+    pub sb_bat_entry_bound: u32,
     /// `HasParent` from the file parameters metadata item: the image
     /// is a differencing (parent-referencing) VHDX whose real content
     /// lives partly in a parent file.
@@ -2052,6 +2094,20 @@ impl VhdxState {
             return None;
         }
 
+        // Only a differencing image pads its BAT, so only one needs
+        // the longer bound. The cap keeps a crafted geometry from
+        // reaching past the BAT region, and the region size check
+        // above deliberately stays on the shorter count: tightening
+        // it would refuse differencing images that load today,
+        // including any instar wrote itself (issue #623).
+        let sb_bat_entry_bound = if metadata.has_parent {
+            let padded = differencing_bat_entry_count(total_blocks, chunk_ratio_u32)?;
+            let region_entries = u64::from(bat_length) / 8;
+            u32::try_from(padded.min(region_entries)).ok()?
+        } else {
+            total_bat_entries_u32
+        };
+
         Some(VhdxState {
             device_idx,
             block_size: metadata.block_size,
@@ -2060,6 +2116,7 @@ impl VhdxState {
             bat_offset,
             total_bat_entries: total_bat_entries_u32,
             chunk_ratio: chunk_ratio_u32,
+            sb_bat_entry_bound,
             has_parent: metadata.has_parent,
             bat_cached_sector: u64::MAX,
             bat_cache_buf,
@@ -2296,7 +2353,10 @@ impl VhdxState {
     ) -> Option<SectorBitmapLookup> {
         let block_index = virtual_offset.checked_div(u64::from(self.block_size))?;
         let sb_index = sb_bat_index(block_index, self.chunk_ratio)?;
-        if sb_index >= u64::from(self.total_bat_entries) {
+        // The differencing count, not `total_bat_entries`: a group's
+        // bitmap entry sits at the end of the group even when the
+        // virtual disk stops part way through it.
+        if sb_index >= u64::from(self.sb_bat_entry_bound) {
             return None;
         }
 
@@ -5842,6 +5902,10 @@ mod tests {
             logical_sector_size,
             bat_offset: 3 * 1024 * 1024,
             total_bat_entries: 16,
+            // 16 blocks of this size are a fraction of one chunk
+            // group, so the group's bitmap entry is the last entry a
+            // differencing BAT of this geometry holds.
+            sb_bat_entry_bound: chunk_ratio as u32 + 1,
             chunk_ratio: chunk_ratio as u32,
             has_parent: true,
             bat_cached_sector: u64::MAX,
@@ -6068,6 +6132,44 @@ mod tests {
             }
         });
         assert_eq!(run, None);
+    }
+
+    #[test]
+    fn a_differencing_bat_holds_its_last_groups_sector_bitmap() {
+        // At the common geometry -- 1 MiB blocks and 512-byte logical
+        // sectors -- a chunk group is 4096 payload blocks, so 4 GiB of
+        // virtual disk. `dynamic` is the entry count an image with no
+        // parent needs: one per payload block plus one per group. A
+        // differencing image pads to whole groups instead, because the
+        // group's bitmap entry sits at the end of the group however
+        // little of the group the disk fills.
+        for (blocks, dynamic, last_sb) in [
+            // A 16 MiB disk: a fraction of one group, and the shape of
+            // the project's own differencing fixture.
+            (16u64, 17u64, 4096u64),
+            // 4 GiB: exactly one group.
+            (4096, 4097, 4096),
+            // 8 GiB: exactly two.
+            (8192, 8194, 8193),
+        ] {
+            let padded = differencing_bat_entry_count(blocks, 4096).unwrap();
+            let sb = sb_bat_index(blocks - 1, 4096).unwrap();
+            assert_eq!(sb, last_sb, "last bitmap entry of a {blocks}-block disk");
+            assert!(
+                sb < padded,
+                "a {blocks}-block differencing BAT of {padded} entries must \
+                 reach its last bitmap entry at {sb}"
+            );
+            // And the point of the padding: under the shorter rule the
+            // entry is only reachable when the disk happens to end on a
+            // group boundary.
+            assert_eq!(
+                sb < dynamic,
+                blocks % 4096 == 0,
+                "the dynamic count of {dynamic} entries reaches entry {sb} \
+                 only for a whole number of groups"
+            );
+        }
     }
 
     #[test]
