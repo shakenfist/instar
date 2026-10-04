@@ -209,11 +209,12 @@ record() {
     local verdict="$1" name="$2" detail="$3"
     case "${verdict}" in
         PASS) PASS_COUNT=$((PASS_COUNT + 1)) ;;
+        SURVIVOR) PASS_COUNT=$((PASS_COUNT + 1)) ;;
         FAIL) FAIL_COUNT=$((FAIL_COUNT + 1)) ;;
         *) BROKEN_COUNT=$((BROKEN_COUNT + 1)) ;;
     esac
-    printf '%-6s %-48s %s\n' "${verdict}" "${name}" "${detail}"
-    if [ "${verdict}" != 'PASS' ]; then
+    printf '%-8s %-48s %s\n' "${verdict}" "${name}" "${detail}"
+    if [ "${verdict}" != 'PASS' ] && [ "${verdict}" != 'SURVIVOR' ]; then
         keep_log "${SCRATCH}/${name}.log" "${name}"
     fi
 }
@@ -490,6 +491,67 @@ rust_case() {
     record "${verdict%% *}" "${name}" "${test_name}: ${verdict#* }"
 }
 
+rust_survivor_case() {
+    # rust_survivor_case NAME FILE SEARCH REPLACE PACKAGE TEST [CARGO_ARGS...]
+    #
+    # A mutation that is EXPECTED to survive, with the reason recorded
+    # at the case. These are here rather than deleted because a
+    # surviving mutation is a real result about the tests, and the next
+    # person to find it should read the reason instead of concluding
+    # the test is weak. check_case_count asserts how many there are
+    # against docs/testing.md, so the prose cannot drift from the
+    # script.
+    #
+    # The verdict is therefore inverted: surviving is SURVIVOR and
+    # scores as a pass, and being killed is FAIL -- not because
+    # catching a bug is bad, but because it means the documented reason
+    # no longer holds and the comment is now lying. Either the test set
+    # grew a check the comment does not know about, or the code moved.
+    # Read the case, confirm which, and then either promote it to a
+    # rust_case or rewrite the reason.
+    local name="$1" relative="$2" search="$3" replace="$4" package="$5" test_name="$6"
+    shift 6
+    wanted "${name}" || return 0
+    TOTAL_COUNT=$((TOTAL_COUNT + 1))
+    if [ "${LIST_ONLY}" = 'yes' ]; then
+        printf '%-48s rust %s :: %s (survivor)\n' "${name}" "${package}" "${test_name}"
+        return 0
+    fi
+    if [ "${CHECK_PATTERNS}" = 'yes' ]; then
+        check_pattern "${name}" "${relative}" "${search}"
+        return 0
+    fi
+
+    if ! rust_baseline_ok "${package}" "${test_name}" "$@"; then
+        record BROKEN "${name}" "${test_name}: does not pass against unmutated source"
+        keep_log "${SCRATCH}/baseline-${package}-${test_name}.log" "${name}-baseline"
+        return 0
+    fi
+
+    apply_mutation "${name}" "${relative}" "${search}" "${replace}" || return 0
+
+    local log="${SCRATCH}/${name}.log"
+    "${REPO_ROOT}/tools/cargo-in-container.sh" test --release \
+        -p "${package}" "$@" -- "${test_name}" >"${log}" 2>&1
+
+    restore_mutation
+    local verdict
+    verdict="$(rust_verdict "${log}")"
+    case "${verdict%% *}" in
+        FAIL)
+            # The mutation survived, which is what this case asserts.
+            record SURVIVOR "${name}" "${test_name}: survived, as documented"
+            ;;
+        PASS)
+            record FAIL "${name}" \
+                "${test_name}: killed a mutation documented as surviving; the reason at this case is stale"
+            ;;
+        *)
+            record "${verdict%% *}" "${name}" "${test_name}: ${verdict#* }"
+            ;;
+    esac
+}
+
 integration_case() {
     # integration_case NAME FILE SEARCH REPLACE UNITTEST_TARGET
     #
@@ -620,7 +682,7 @@ self_test() {
 # phase's definition of done asks the two to stay in step, which until
 # now was a promise kept by hand. Asserting it makes the drift a
 # failure instead of a documentation bug nobody reads.
-EXPECTED_CASES=26
+EXPECTED_CASES=62
 
 check_case_count() {
     # Only meaningful for a whole run; a selection is expected to be short.
@@ -632,6 +694,31 @@ check_case_count() {
     local documented bad='no'
     documented="$(grep -oE 'There are \*\*[0-9]+ cases\*\*' \
         "${REPO_ROOT}/docs/testing.md" 2>/dev/null | grep -oE '[0-9]+' | head -1)"
+
+    # The reader and survivor counts are quoted in prose too, and three
+    # review items in one round were that prose going stale against the
+    # script. Derive both from the source of truth -- the case list in
+    # this file -- and make docs/testing.md state them in a form that
+    # can be checked, rather than trusting anyone to update two places.
+    local reader_actual survivor_actual reader_doc survivor_doc
+    reader_actual="$(grep -cE "^rust_(survivor_)?case '(vhd|vhdx)-read-" "${BASH_SOURCE[0]}")"
+    survivor_actual="$(grep -cE '^rust_survivor_case ' "${BASH_SOURCE[0]}")"
+    reader_doc="$(grep -oE '\*\*[0-9]+ reader cases\*\*' \
+        "${REPO_ROOT}/docs/testing.md" 2>/dev/null | grep -oE '[0-9]+' | head -1)"
+    survivor_doc="$(grep -oE '\*\*[0-9]+ survivor cases?\*\*' \
+        "${REPO_ROOT}/docs/testing.md" 2>/dev/null | grep -oE '[0-9]+' | head -1)"
+    if [ "${reader_doc:-x}" != "${reader_actual}" ]; then
+        echo >&2
+        echo "docs/testing.md says '${reader_doc:-no}' reader cases;" >&2
+        echo "this script defines ${reader_actual}." >&2
+        bad='yes'
+    fi
+    if [ "${survivor_doc:-x}" != "${survivor_actual}" ]; then
+        echo >&2
+        echo "docs/testing.md says '${survivor_doc:-no}' survivor cases;" >&2
+        echo "this script defines ${survivor_actual}." >&2
+        bad='yes'
+    fi
 
     if [ "${TOTAL_COUNT}" -ne "${EXPECTED_CASES}" ]; then
         echo >&2
@@ -903,6 +990,459 @@ rust_case 'vhdx-relative-key-convention' "${VHDX_LIB}" \
     '            return Some((relative, true));' \
     '            return Some((relative, false));' \
     vhdx 'only_the_relative_key_is_flagged_as_windows_convention'
+
+# ---------------------------------------------------------------------
+# The guest chain walker: composing a differencing VHD or VHDX against
+# the device behind it. Everything above this point mutates the code
+# that *writes* a differencing image; these mutate the code that reads
+# one back.
+#
+# All of them name a test in the qcow2 crate, because that is where the
+# chain walker lives, and all of them need the full input-format feature
+# set -- the arms are behind `vhd-input` and `vhdx-input`, so a run
+# without them compiles the mutation away and reports a pass nobody
+# earned. QCOW2_FEATURES carries that list; it is the same one the
+# Makefile and scripts/check-rust.sh use.
+#
+# Several of these mutations also break a unit test in the `vhd` or
+# `vhdx` crate, which is deliberate duplication: the crate test pins the
+# helper and the case here pins the arm that calls it, and the two fail
+# independently. Running one named test in one package is what keeps
+# them separate, since `make test-rust` stops at the first failing crate
+# and would never reach the arm.
+# ---------------------------------------------------------------------
+
+QCOW2_LIB='src/crates/qcow2/src/lib.rs'
+VHD_LIB='src/crates/vhd/src/lib.rs'
+VHDX_READ_LIB='src/crates/vhdx/src/lib.rs'
+QCOW2_FEATURES='create,vdi-input,parallels-input,qcow1-input,dmg-input,vhd-input,vhdx-input'
+
+# --- VHD: the sector bitmap and its polarity -------------------------
+
+rust_case 'vhd-read-classify-all-child-as-all-parent' "${QCOW2_LIB}" \
+    '        VhdChunkOwnership::AllChild
+    })' \
+    '        VhdChunkOwnership::AllParent // MUTATED
+    })' \
+    qcow2 'vhd_arm_allocated_block_all_ones_bitmap_reads_wholly_from_child' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'vhd-read-bitmap-polarity' "${VHD_LIB}" \
+    '    (bitmap_byte >> bit) & 1 == 1
+}' \
+    '    (bitmap_byte >> bit) & 1 == 0 // MUTATED
+}' \
+    qcow2 'vhd_arm_mixed_bitmap_reads_each_sector_from_the_right_device' \
+    --features "${QCOW2_FEATURES}"
+
+# Named against the vhd crate rather than the arm, deliberately. The
+# arm calls the coalescer once per ownership run, each time with a
+# correct starting byte, so a coalescer that stops at a byte boundary
+# serves the same bytes in two runs instead of one and no arm test can
+# see it. The run length is the crate's property, so the crate's test
+# is the one that guards it. Established by this case failing when it
+# named vhd_arm_ownership_run_crossing_a_bitmap_byte.
+rust_case 'vhd-read-bitmap-byte-never-advances' "${VHD_LIB}" \
+    '        let sector_byte_index = sector / 8;' \
+    '        let sector_byte_index = byte_index; // MUTATED' \
+    vhd 'ownership_run_crosses_a_bitmap_byte_boundary'
+
+# Also the crate's property rather than the arm's: the arm refuses a
+# chunk reaching past its block by a second route, so admitting
+# first_sector == sectors_per_block here does not change what the arm
+# returns. Established the same way.
+rust_case 'vhd-read-block-end-guard-off-by-one' "${VHD_LIB}" \
+    '    if sector_count == 0 || bitmap_bytes == 0 || first_sector >= sectors_per_block {' \
+    '    if sector_count == 0 || bitmap_bytes == 0 || first_sector > sectors_per_block { // MUTATED' \
+    vhd 'ownership_run_refuses_a_request_outside_the_block'
+
+rust_case 'vhd-read-bat-entry-always-block-zero' "${VHD_LIB}" \
+    '            return Some(DifferencingBlockLookup::Unallocated);
+        }
+
+        // Read BAT entry (u32 BE at table_offset + block_idx * 4)
+        let bat_byte_offset = self.table_offset.checked_add(block_idx.checked_mul(4)?)?;' \
+    '            return Some(DifferencingBlockLookup::Unallocated);
+        }
+
+        // MUTATED
+        let bat_byte_offset = self.table_offset;' \
+    qcow2 'vhd_arm_second_block_resolves_its_own_bat_entry_and_bitmap' \
+    --features "${QCOW2_FEATURES}"
+
+# --- VHD: failing closed at the bottom of a chain --------------------
+
+rust_case 'vhd-read-unallocated-drops-the-guard' "${QCOW2_LIB}" \
+    '                        if is_differencing && dev_offset + 1 >= chain_len {
+                            return false;
+                        }
+                        continue;' \
+    '                        // MUTATED
+                        continue;' \
+    qcow2 'vhd_arm_unallocated_block_fails_without_a_following_device' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'vhd-read-unallocated-guard-ignores-disk-type' "${QCOW2_LIB}" \
+    '                        if is_differencing && dev_offset + 1 >= chain_len {' \
+    '                        if dev_offset + 1 >= chain_len { // MUTATED' \
+    qcow2 'vhd_arm_dynamic_reads_as_a_plain_dynamic_vhd' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'vhd-read-all-parent-chunk-zero-fills' "${QCOW2_LIB}" \
+    '                                    // is a broken image, not the implied
+                                    // zero layer a qcow2 chain ends in.
+                                    return false;' \
+    '                                    // MUTATED
+                                    core::ptr::write_bytes(buf, 0, chunk_size as usize);
+                                    return true;' \
+    qcow2 'vhd_arm_all_parent_owned_chunk_fails_without_a_following_device' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'vhd-read-classify-swallows-an-undescribed-run' "${QCOW2_LIB}" \
+    '        let run = next_vhd_ownership_run(
+            call_table,
+            state,
+            bitmap_host_offset,
+            sector,
+            sector_byte,
+            chunk_size.checked_sub(served)?,
+            sector_size,
+            input_capacity,
+            bytes_read,
+        )?;' \
+    '        let run = match next_vhd_ownership_run(
+            call_table,
+            state,
+            bitmap_host_offset,
+            sector,
+            sector_byte,
+            chunk_size.checked_sub(served)?,
+            sector_size,
+            input_capacity,
+            bytes_read,
+        ) {
+            Some(r) => r,
+            None => break, // MUTATED
+        };' \
+    qcow2 'vhd_arm_chunk_crossing_a_block_boundary_is_refused' \
+    --features "${QCOW2_FEATURES}"
+
+# --- VHD: the device a run is read from, and in what unit ------------
+
+rust_case 'vhd-read-mixed-arm-pins-device-zero' "${QCOW2_LIB}" \
+    '                                    let state = match &mut chain_states.vhd_states[dev_idx] {' \
+    '                                    let state = match &mut chain_states.vhd_states[0] { // MUTATED' \
+    qcow2 'vhd_arm_composes_a_differencing_child_over_a_differencing_parent' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'vhd-read-runs-addressed-in-512-byte-sectors' "${QCOW2_LIB}" \
+    '            // here rather than left to a reader to rediscover.
+            if !read_offset_sectors(
+                call_table,
+                device_idx,
+                run_host,
+                buf.add(served as usize),
+                run.bytes,
+                sector_size,
+                scratch,
+                bytes_read,
+            ) {' \
+    '            // here rather than left to a reader to rediscover.
+            if !read_offset_sectors(
+                call_table,
+                device_idx,
+                run_host,
+                buf.add(served as usize),
+                run.bytes,
+                512, // MUTATED
+                scratch,
+                bytes_read,
+            ) {' \
+    qcow2 'vhd_arm_mixed_bitmap_on_a_large_sector_device' \
+    --features "${QCOW2_FEATURES}"
+
+# --- VHD: the refusal in init_chain_states ---------------------------
+
+rust_case 'vhd-read-refusal-conditional-on-device-count' "${QCOW2_LIB}" \
+    '            if state.disk_type == vhd::DISK_TYPE_DIFFERENCING {' \
+    '            if state.disk_type == vhd::DISK_TYPE_DIFFERENCING && dev_idx + 1 >= device_count { // MUTATED' \
+    qcow2 'vhd_init_refuses_a_differencing_child_and_admits_a_dynamic_one' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'vhd-read-refusal-names-vhdx' "${QCOW2_LIB}" \
+    'send_differencing_refusal(call_table, shared::DifferencingRefusal::STATUS_VHD);' \
+    'send_differencing_refusal(call_table, shared::DifferencingRefusal::STATUS_VHDX); // MUTATED' \
+    qcow2 'vhd_init_refuses_a_differencing_child_and_admits_a_dynamic_one' \
+    --features "${QCOW2_FEATURES}"
+
+# --- VHD: the documented survivor ------------------------------------
+
+rust_survivor_case 'vhd-read-classify-stops-at-the-first-mixed-verdict' "${QCOW2_LIB}" \
+    '        let run = next_vhd_ownership_run(
+            call_table,
+            state,
+            bitmap_host_offset,
+            sector,
+            sector_byte,
+            chunk_size.checked_sub(served)?,
+            sector_size,
+            input_capacity,
+            bytes_read,
+        )?;
+        if run.child_owned {
+            any_child = true;
+        } else {
+            any_parent = true;
+        }
+        served = served.checked_add(run.bytes)?;' \
+    '        let run = next_vhd_ownership_run(
+            call_table,
+            state,
+            bitmap_host_offset,
+            sector,
+            sector_byte,
+            chunk_size.checked_sub(served)?,
+            sector_size,
+            input_capacity,
+            bytes_read,
+        )?;
+        if run.child_owned {
+            any_child = true;
+        } else {
+            any_parent = true;
+        }
+        if any_child && any_parent {
+            break; // MUTATED
+        }
+        served = served.checked_add(run.bytes)?;' \
+    qcow2 'vhd_arm_chunk_crossing_a_block_boundary_is_refused' \
+    --features "${QCOW2_FEATURES}"
+
+# --- VHDX: the sector bitmap, which is where it differs from VHD -----
+
+rust_case 'vhdx-read-bitmap-is-most-significant-bit-first' "${VHDX_READ_LIB}" \
+    '    let bit = sector_in_group % 8;' \
+    '    let bit = 7 - (sector_in_group % 8); // MUTATED' \
+    qcow2 'vhdx_arm_mixed_block_reads_each_sector_from_the_right_device' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'vhdx-read-bitmap-granule-is-512' "${QCOW2_LIB}" \
+    '    let logical_sector_size = u64::from(state.logical_sector_size);
+    // Round the span up to whole sectors.' \
+    '    let logical_sector_size = 512u64; // MUTATED
+    let _ = state.logical_sector_size;
+    // Round the span up to whole sectors.' \
+    qcow2 'vhdx_arm_mixed_block_at_a_four_kilobyte_logical_sector_size' \
+    --features "${QCOW2_FEATURES}"
+
+# The VHDX coalescer has the same shape and the same answer: the arm
+# re-enters it per run, so the within-call byte advance is the crate's
+# property.
+rust_case 'vhdx-read-bitmap-byte-never-advances' "${VHDX_READ_LIB}" \
+    '        let sector_byte_index = sector / 8;' \
+    '        let sector_byte_index = byte_index; // MUTATED' \
+    vhdx 'ownership_run_crosses_a_bitmap_byte_boundary'
+
+rust_case 'vhdx-read-bits-numbered-from-the-block' "${VHDX_READ_LIB}" \
+    '    let group_first_byte = group.checked_mul(chunk_ratio)?.checked_mul(block_size)?;' \
+    '    let group_first_byte = virtual_offset.checked_div(block_size)?.checked_mul(block_size)?; // MUTATED' \
+    qcow2 'vhdx_arm_block_later_in_a_chunk_group_uses_its_own_bitmap_bits' \
+    --features "${QCOW2_FEATURES}"
+
+# --- VHDX: finding the sector bitmap entry in an interleaved BAT -----
+
+rust_case 'vhdx-read-sb-index-drops-the-chunk-ratio-term' "${VHDX_READ_LIB}" \
+    '    group
+        .checked_mul(chunk_ratio.checked_add(1)?)?
+        .checked_add(chunk_ratio)' \
+    '    // MUTATED
+    group.checked_mul(chunk_ratio.checked_add(1)?)' \
+    qcow2 'vhdx_arm_mixed_block_reads_each_sector_from_the_right_device' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'vhdx-read-sb-index-drops-the-group-stride' "${VHDX_READ_LIB}" \
+    '        .checked_mul(chunk_ratio.checked_add(1)?)?' \
+    '        .checked_mul(1)? // MUTATED' \
+    qcow2 'vhdx_arm_block_in_the_second_chunk_group_finds_its_own_bitmap' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'vhdx-read-differencing-bat-sized-as-dynamic' "${VHDX_READ_LIB}" \
+    '        let sb_bat_entry_bound = if metadata.has_parent {' \
+    '        let sb_bat_entry_bound = if false {  // MUTATED' \
+    qcow2 'vhdx_arm_mixed_block_in_a_partial_chunk_group' \
+    --features "${QCOW2_FEATURES}"
+
+# --- VHDX: which sector bitmap states may be used --------------------
+
+rust_case 'vhdx-read-sb-accepts-any-state-at-all' "${VHDX_READ_LIB}" \
+    '        if state != SB_BLOCK_PRESENT {
+            return None;
+        }' \
+    '        if false { // MUTATED
+            return None;
+        }' \
+    qcow2 'vhdx_arm_sector_bitmap_in_an_undefined_state_fails_the_read' \
+    --features "${QCOW2_FEATURES}"
+
+# --- VHDX: absent, zero, and the block boundary ----------------------
+
+rust_case 'vhdx-read-zero-merged-into-not-present' "${QCOW2_LIB}" \
+    '                        core::ptr::write_bytes(buf, 0, chunk_size as usize);
+                        return true;
+                    }
+                    Some(VhdxBlockLookup::Present { host_byte_offset }) => (host_byte_offset, None),' \
+    '                        continue; // MUTATED
+                    }
+                    Some(VhdxBlockLookup::Present { host_byte_offset }) => (host_byte_offset, None),' \
+    qcow2 'vhdx_arm_zero_and_absent_blocks_differ_for_a_differencing_child' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'vhdx-read-block-boundary-cap-removed' "${QCOW2_LIB}" \
+    '                    if chunk_size > block_bytes_remaining {
+                        return false;
+                    }' \
+    '                    let _ = block_bytes_remaining; // MUTATED' \
+    qcow2 'vhdx_arm_chunk_reaching_past_its_payload_block_is_refused' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'vhdx-read-partially-present-without-a-parent' "${VHDX_READ_LIB}" \
+    '                if !self.has_parent {
+                    return None;
+                }' \
+    '                if false { // MUTATED
+                    return None;
+                }' \
+    qcow2 'vhdx_arm_partially_present_without_a_parent_is_refused' \
+    --features "${QCOW2_FEATURES}"
+
+# --- VHDX: failing closed at the bottom of a chain -------------------
+
+rust_case 'vhdx-read-absent-block-drops-the-guard' "${QCOW2_LIB}" \
+    '                        if has_parent {
+                            let remaining = match devices_behind(chain_len, dev_offset) {
+                                Some(r) => r,
+                                None => return false,
+                            };
+                            if remaining == 0 {
+                                return false;
+                            }
+                        }
+                        continue;' \
+    '                        // MUTATED
+                        continue;' \
+    qcow2 'vhdx_arm_absent_block_fails_without_a_following_device' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'vhdx-read-all-parent-chunk-zero-fills' "${QCOW2_LIB}" \
+    '                            // not the implied zero layer a qcow2 chain
+                            // ends in.
+                            return false;' \
+    '                            // MUTATED
+                            core::ptr::write_bytes(buf, 0, chunk_size as usize);
+                            return true;' \
+    qcow2 'vhdx_arm_all_parent_owned_chunk_fails_without_a_following_device' \
+    --features "${QCOW2_FEATURES}"
+
+# --- VHDX: reading from part way into a sector -----------------------
+
+rust_case 'vhdx-read-run-ignores-the-leading-sector-byte' "${QCOW2_LIB}" \
+    '    let run_bytes = u64::from(run.sectors)
+        .checked_mul(logical_sector_size)?
+        .checked_sub(sector_byte)?;' \
+    '    let run_bytes = u64::from(run.sectors).checked_mul(logical_sector_size)?; // MUTATED' \
+    qcow2 'vhdx_arm_mixed_chunk_at_an_unaligned_virtual_offset' \
+    --features "${QCOW2_FEATURES}"
+
+# --- VHDX: the refusal in init_chain_states --------------------------
+
+rust_case 'vhdx-read-refusal-names-vhd' "${QCOW2_LIB}" \
+    'send_differencing_refusal(call_table, shared::DifferencingRefusal::STATUS_VHDX);' \
+    'send_differencing_refusal(call_table, shared::DifferencingRefusal::STATUS_VHD); // MUTATED' \
+    qcow2 'vhdx_init_refuses_a_differencing_child_and_admits_a_dynamic_one' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'vhdx-read-refusal-conditional-on-device-count' "${QCOW2_LIB}" \
+    '                if state.has_parent {' \
+    '                if state.has_parent && dev_idx + 1 >= device_count { // MUTATED' \
+    qcow2 'vhdx_init_refuses_a_differencing_child_and_admits_a_dynamic_one' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'vhdx-read-mixed-chunk-zero-fills-the-parent-share' "${QCOW2_LIB}" \
+    '                                // chunk cannot be served, and zeros
+                                // would be wrong data reported as
+                                // success.
+                                return false;' \
+    '                                // MUTATED
+                                core::ptr::write_bytes(buf, 0, chunk_size as usize);' \
+    qcow2 'vhdx_arm_mixed_chunk_fails_without_a_following_device' \
+    --features "${QCOW2_FEATURES}"
+
+# --- VHDX: no block begins inside the headers ------------------------
+
+rust_case 'vhdx-read-sb-offset-zero-accepted' "${VHDX_READ_LIB}" \
+    '        if file_offset < MIN_BLOCK_FILE_OFFSET {
+            return None;
+        }' \
+    '        if false { // MUTATED
+            return None;
+        }' \
+    qcow2 'vhdx_arm_block_at_file_offset_zero_is_refused' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'vhdx-read-full-payload-offset-zero-accepted' "${VHDX_READ_LIB}" \
+    '                if file_offset < MIN_BLOCK_FILE_OFFSET {
+                    return None;
+                }
+                let intra_block_offset = virtual_offset % self.block_size as u64;
+                Some(VhdxBlockLookup::Present {' \
+    '                if false { // MUTATED
+                    return None;
+                }
+                let intra_block_offset = virtual_offset % self.block_size as u64;
+                Some(VhdxBlockLookup::Present {' \
+    qcow2 'vhdx_arm_block_at_file_offset_zero_is_refused' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'vhdx-read-partial-payload-offset-zero-accepted' "${VHDX_READ_LIB}" \
+    '                if file_offset < MIN_BLOCK_FILE_OFFSET {
+                    return None;
+                }
+                let intra_block_offset = virtual_offset % self.block_size as u64;
+                Some(VhdxBlockLookup::PartiallyPresent {' \
+    '                if false { // MUTATED
+                    return None;
+                }
+                let intra_block_offset = virtual_offset % self.block_size as u64;
+                Some(VhdxBlockLookup::PartiallyPresent {' \
+    qcow2 'vhdx_arm_block_at_file_offset_zero_is_refused' \
+    --features "${QCOW2_FEATURES}"
+
+# --- VHDX: the device a mixed chunk resumes on -----------------------
+
+rust_case 'vhdx-read-mixed-arm-pins-device-zero' "${QCOW2_LIB}" \
+    '                            let state = match &mut chain_states.vhdx_states[dev_idx] {
+                                Some(s) => s,
+                                None => return false,
+                            };
+                            // compressed_buf becomes the sub-sector' \
+    '                            let state = match &mut chain_states.vhdx_states[0] { // MUTATED
+                                Some(s) => s,
+                                None => return false,
+                            };
+                            // compressed_buf becomes the sub-sector' \
+    qcow2 'vhdx_arm_composes_a_differencing_child_over_a_differencing_parent' \
+    --features "${QCOW2_FEATURES}"
+
+# --- VHDX: a chunk group of no sectors is not a small group ----------
+
+rust_case 'vhdx-read-zero-sector-group-allowed' "${VHDX_READ_LIB}" \
+    '        if sectors == 0 {
+            return None;
+        }' \
+    '        if false { // MUTATED
+            return None;
+        }' \
+    vhdx 'sectors_per_chunk_group_refuses_a_degenerate_geometry'
 
 # ---------------------------------------------------------------------
 # The create guest operation. Caught through the real binary only.

@@ -23,6 +23,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and `map` still refuse a differencing source exactly as before — so
   this is not a user-visible change.
 
+- **The guest chain walker can compose a differencing VHDX's partially
+  present block against its parent.** It previously failed the read
+  outright; it now reads the block's sector bitmap and serves each
+  logical sector from whichever file owns it, recursing into the
+  parent for the sectors the child does not own. An absent block
+  descends to the parent; an explicitly zeroed block does not — the
+  two had previously been treated as the same case. An image that
+  claims no parent may not say a block is partially present at all,
+  and such a block is refused rather than composed against whatever
+  device follows. The chain walker also refuses a BAT entry naming
+  file offset zero, where the file identifier and headers live,
+  rather than reading a block from there; the whole-BAT walks behind
+  `info` and `map` are unchanged. This is a crate-level change only:
+  `init_chain_states` still
+  refuses every differencing VHDX unconditionally, so no operation
+  reaches the composing path — this is not a user-visible change.
+
 - **`instar info --chain` walks differencing VHD and VHDX parent chains.**
   It previously stopped at the child and reported the parent reference
   without following it. Now it walks the chain and reports each
@@ -99,8 +116,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - **The differencing tests can be proved to fail.**
   `tools/mutate-differencing.sh` is a committed falsification harness:
-  26 cases, each breaking one specific behaviour in the differencing
-  create path and demanding that one named test notices. It scores
+  62 cases, each breaking one specific behaviour in differencing
+  support -- 26 in the create path and 36 in the guest chain walker
+  that reads a differencing image back -- and demanding that one
+  named test notices. It scores
   BROKEN -- never PASS -- when a mutation did not apply, when the test
   skipped, or when the test does not pass against unmutated source, so
   a case that proved nothing cannot be read as evidence. Evidence of

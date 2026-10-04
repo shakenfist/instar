@@ -206,6 +206,44 @@ pub const PAYLOAD_BLOCK_FULLY_PRESENT: u64 = 6;
 /// Block partially present (differencing disk only).
 pub const PAYLOAD_BLOCK_PARTIALLY_PRESENT: u64 = 7;
 
+// Sector bitmap BAT entry states. The sector bitmap entries are
+// interleaved into the same BAT as the payload entries, but they
+// carry their own, much smaller, set of legal states.
+/// Sector bitmap block not present.
+///
+/// Legal only while no payload block the entry covers is
+/// `PAYLOAD_BLOCK_PARTIALLY_PRESENT`, because such a block has no
+/// other way to say which of its sectors this file holds.
+pub const SB_BLOCK_NOT_PRESENT: u64 = 0;
+/// Sector bitmap block present, with the bitmap at the entry's file
+/// offset.
+pub const SB_BLOCK_PRESENT: u64 = 6;
+
+/// Size of a sector bitmap block, which the format fixes at 1 MiB.
+///
+/// 2^20 bytes is 2^23 bits, and a chunk covers `chunk_ratio *
+/// block_size / logical_sector_size` sectors, which the definition of
+/// `chunk_ratio` makes exactly 2^23. One bitmap block therefore
+/// describes one whole chunk with nothing left over.
+pub const SB_BLOCK_SIZE: u32 = 1024 * 1024;
+
+/// Lowest file offset at which any VHDX block may begin.
+///
+/// The first megabyte of a VHDX file is fixed structure: the file
+/// identifier at 0, the two headers at 64 KiB and 128 KiB, the two
+/// region tables at 192 KiB and 256 KiB, and reserved space to 1 MiB.
+/// Payload blocks, sector bitmap blocks, the BAT and the metadata
+/// region all live above it, and the spec requires every one of them
+/// to be megabyte-aligned.
+///
+/// A BAT entry is a state in its low bits and an offset in the rest,
+/// so a zeroed or truncated entry that still carries a present state
+/// names offset 0 -- the file identifier. Reading a block from there
+/// answers a question about ownership with bytes that describe
+/// nothing of the kind. Refusing the offset costs one comparison and
+/// turns that into a failed read (issue #547).
+pub const MIN_BLOCK_FILE_OFFSET: u64 = 1024 * 1024;
+
 /// Mask for extracting the file offset from a BAT entry (bits 20-63).
 /// The offset is in units of 1 MB.
 pub const BAT_ENTRY_OFFSET_MASK: u64 = 0xFFFF_FFFF_FFF0_0000;
@@ -226,6 +264,9 @@ pub const MB_ALIGN: u64 = 1024 * 1024;
 // ============================================================================
 
 shared::cached_read!(read_u64_le_cached, u64, le, 8);
+// Sector bitmaps are read a byte at a time: the ownership coalescer
+// touches one bitmap byte per eight sectors, not one per sector.
+shared::cached_read!(read_u8_cached, u8, be, 1);
 
 // ============================================================================
 // VHDX header parsing
@@ -1625,12 +1666,214 @@ pub(crate) fn count_allocated_in_bat_chunk(
 /// Result of looking up a virtual offset in the VHDX BAT.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VhdxBlockLookup {
-    /// Block is not present (reads as zero).
+    /// Block is not present in this file. An image with no parent
+    /// has nowhere else to look and reads it as zero; a differencing
+    /// child means the block's data lives in its parent, which is the
+    /// opposite answer. A caller that can compose a chain must not
+    /// conflate this with `Zero`.
     NotPresent,
-    /// Block is explicitly zeroed.
+    /// Block is explicitly zeroed. Unlike `NotPresent` this is an
+    /// answer about the data rather than about this file, so a parent
+    /// image must not be consulted for it.
     Zero,
-    /// Block is allocated at the given host byte offset.
+    /// Block is allocated at the given host byte offset, and every
+    /// sector of it belongs to this file.
     Present { host_byte_offset: u64 },
+    /// Block is allocated but shared with the parent image: the
+    /// chunk's sector bitmap decides, per logical sector, which of
+    /// the two holds the data. Only a differencing child may say
+    /// this.
+    PartiallyPresent {
+        /// Host byte offset the looked-up virtual offset lives at,
+        /// exactly as `Present` reports it.
+        host_byte_offset: u64,
+        /// Bytes of this payload block that begin at
+        /// `host_byte_offset`. A read may not run past them: the next
+        /// block's payload need not follow this one in the file, and
+        /// the sectors beyond the block are described by bitmap bits
+        /// this lookup did not resolve.
+        block_bytes_remaining: u64,
+    },
+}
+
+// ============================================================================
+// Sector bitmaps (differencing images)
+// ============================================================================
+
+/// Where a chunk's sector bitmap lives, and which bit of it describes
+/// a particular virtual offset.
+///
+/// This is the VHDX answer to the same question
+/// `vhd::DifferencingBlockLookup` answers, but the two differ in what
+/// a bitmap covers. A VHD bitmap sits immediately in front of its one
+/// block and its bits are numbered from that block's start. A VHDX
+/// bitmap is a block of its own, shared by every payload block in the
+/// chunk, so bit numbering restarts at the *chunk's* start and not the
+/// block's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SectorBitmapLookup {
+    /// Host byte offset of the chunk's 1 MiB sector bitmap block.
+    pub bitmap_host_offset: u64,
+    /// Index, in logical sectors counted from the first byte the chunk
+    /// covers, of the looked-up virtual offset. This is the bit index
+    /// within the bitmap block that describes it.
+    pub sector_in_group: u32,
+}
+
+/// A run of consecutive logical sectors within one chunk that share an
+/// owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SectorOwnershipRun {
+    /// `true` when this file holds the run's data, `false` when the run
+    /// must be read from the parent image.
+    pub child_owned: bool,
+    /// Length of the run in logical sectors, counted from the first
+    /// sector asked about. Never zero.
+    pub sectors: u32,
+}
+
+/// Test one sector's ownership bit in a differencing VHDX's sector
+/// bitmap.
+///
+/// The bitmap is least-significant-bit first: sector `i` of the chunk
+/// is bit `i % 8` of bitmap byte `i / 8`. That is the opposite of VHD,
+/// which numbers from the most significant bit, and the difference is
+/// invisible to any bitmap byte that reads the same both ways -- which
+/// is why it is asserted by test against an asymmetric byte rather
+/// than inferred from an image.
+///
+/// `sector_in_group` counts `logical_sector_size` sectors, which is
+/// either 512 or 4096 and is a property of the image rather than of
+/// the device it is being read from. VHD's equivalent always counts
+/// 512-byte sectors; VHDX's does not.
+pub fn sector_bit_is_child_owned(bitmap_byte: u8, sector_in_group: u32) -> bool {
+    let bit = sector_in_group % 8;
+    // A SET bit means this file -- the differencing child -- holds the
+    // sector's data; a CLEAR bit means the sector must be read from the
+    // parent image. Same polarity as VHD.
+    (bitmap_byte >> bit) & 1 == 1
+}
+
+/// BAT index of the sector bitmap entry that describes payload block
+/// `block_index`.
+///
+/// The BAT is repeating groups of `chunk_ratio` payload entries
+/// followed by the single sector bitmap entry that covers all of them,
+/// so a group occupies `chunk_ratio + 1` entries and its bitmap entry
+/// is the last of them. Returns `None` for a zero `chunk_ratio` and on
+/// overflow.
+pub fn sb_bat_index(block_index: u64, chunk_ratio: u32) -> Option<u64> {
+    let chunk_ratio = u64::from(chunk_ratio);
+    let group = block_index.checked_div(chunk_ratio)?;
+    group
+        .checked_mul(chunk_ratio.checked_add(1)?)?
+        .checked_add(chunk_ratio)
+}
+
+/// BAT entry count a differencing VHDX's BAT is padded out to.
+///
+/// A differencing image reserves whole groups of `chunk_ratio + 1`
+/// entries, because a group's sector bitmap entry sits at the end of
+/// the group whether or not every payload entry ahead of it is backed
+/// by virtual disk. An image with no parent stops at the last entry it
+/// actually needs, which is the shorter count `calculate_bat_layout`
+/// returns.
+///
+/// The difference only ever matters to a reader resolving a sector
+/// bitmap: the writer side still sizes every BAT it emits by the
+/// shorter rule, which is issue #623.
+///
+/// Returns `None` for a degenerate chunk ratio and on overflow.
+pub fn differencing_bat_entry_count(total_payload_blocks: u64, chunk_ratio: u32) -> Option<u64> {
+    let chunk_ratio = u64::from(chunk_ratio);
+    if chunk_ratio == 0 {
+        return None;
+    }
+    total_payload_blocks
+        .div_ceil(chunk_ratio)
+        .checked_mul(chunk_ratio.checked_add(1)?)
+}
+
+/// Index of the logical sector holding `virtual_offset`, counted from
+/// the first byte of the chunk that offset falls in.
+///
+/// Bitmap bits are numbered across the whole chunk, so the index a
+/// caller needs is relative to the chunk's first payload block and not
+/// to the block the offset itself lands in.
+///
+/// Returns `None` for a degenerate geometry and on overflow.
+pub fn sector_in_chunk_group(
+    virtual_offset: u64,
+    block_size: u32,
+    chunk_ratio: u32,
+    logical_sector_size: u32,
+) -> Option<u32> {
+    let block_size = u64::from(block_size);
+    let chunk_ratio = u64::from(chunk_ratio);
+    let group = virtual_offset
+        .checked_div(block_size)?
+        .checked_div(chunk_ratio)?;
+    let group_first_byte = group.checked_mul(chunk_ratio)?.checked_mul(block_size)?;
+    let offset_in_group = virtual_offset.checked_sub(group_first_byte)?;
+    u32::try_from(offset_in_group.checked_div(u64::from(logical_sector_size))?).ok()
+}
+
+/// Coalesce the maximal run of equally-owned sectors starting at
+/// `first_sector`, fetching sector-bitmap bytes through `fetch_byte`.
+///
+/// `fetch_byte` is handed a byte index within the chunk's sector
+/// bitmap block and returns that byte, or `None` if it could not be
+/// read. It is called once per bitmap byte the run touches rather than
+/// once per sector, so a run of 128 sectors costs 16 fetches.
+///
+/// The run is clamped to `sector_count` and to `sectors_per_group`, so
+/// a caller serving a chunk of its own may ask for more sectors than
+/// the bitmap describes. Returns `None` when the request names no
+/// sector the bitmap can describe, and when a fetch fails.
+fn coalesce_ownership_run<F: FnMut(u32) -> Option<u8>>(
+    first_sector: u32,
+    sector_count: u32,
+    sectors_per_group: u32,
+    bitmap_bytes: u32,
+    mut fetch_byte: F,
+) -> Option<SectorOwnershipRun> {
+    if sector_count == 0 || bitmap_bytes == 0 || first_sector >= sectors_per_group {
+        return None;
+    }
+    // Never describe more sectors than the chunk covers, however many
+    // were asked for.
+    let wanted = sector_count.min(sectors_per_group.checked_sub(first_sector)?);
+
+    let mut byte_index = first_sector / 8;
+    if byte_index >= bitmap_bytes {
+        // A bitmap too short for the chunk it describes. Refuse rather
+        // than read whatever follows it as if it were ownership bits.
+        return None;
+    }
+    let mut bitmap_byte = fetch_byte(byte_index)?;
+    let child_owned = sector_bit_is_child_owned(bitmap_byte, first_sector);
+
+    let mut sectors: u32 = 1;
+    while sectors < wanted {
+        let sector = first_sector.checked_add(sectors)?;
+        let sector_byte_index = sector / 8;
+        if sector_byte_index != byte_index {
+            if sector_byte_index >= bitmap_bytes {
+                break;
+            }
+            bitmap_byte = fetch_byte(sector_byte_index)?;
+            byte_index = sector_byte_index;
+        }
+        if sector_bit_is_child_owned(bitmap_byte, sector) != child_owned {
+            break;
+        }
+        sectors = sectors.checked_add(1)?;
+    }
+
+    Some(SectorOwnershipRun {
+        child_owned,
+        sectors,
+    })
 }
 
 // ============================================================================
@@ -1646,6 +1889,24 @@ pub struct VhdxState {
     pub bat_offset: u64,
     pub total_bat_entries: u32,
     pub chunk_ratio: u32,
+    /// BAT entry count the sector bitmap lookup bounds itself by.
+    ///
+    /// A differencing VHDX pads its BAT out to whole groups of
+    /// `chunk_ratio + 1` entries, so the bitmap entry of a group that
+    /// the virtual disk only partly fills still sits at the end of
+    /// that group. `total_bat_entries` counts one entry per payload
+    /// block plus one per group, which is how an image with no parent
+    /// is sized and is shorter: bounding the lookup by it puts the
+    /// last group's bitmap entry out of reach, and puts every bitmap
+    /// entry out of reach in a disk smaller than one group.
+    ///
+    /// Capped by what the declared BAT region can hold, so a lookup
+    /// still cannot read past the region. `total_bat_entries` keeps
+    /// the shorter count because it also sizes the whole-BAT walks in
+    /// `scan_allocation` and `map_extents`, which must not run off
+    /// the end of a region a writer sized by that same rule -- and
+    /// instar's writer does, which is issue #623.
+    pub sb_bat_entry_bound: u32,
     /// `HasParent` from the file parameters metadata item: the image
     /// is a differencing (parent-referencing) VHDX whose real content
     /// lives partly in a parent file.
@@ -1807,12 +2068,11 @@ impl VhdxState {
 
         // A differencing image is *not* refused here: `has_parent` is
         // carried out on the returned state instead, and the read entry
-        // points refuse it by name (decision 3 of
-        // `docs/plans/PLAN-differencing-phase-04-read-policy.md`). A bare
-        // `None` here was indistinguishable from a corrupt header, which
-        // is what issue #548 complained about, and it left VHDX
-        // structurally different from VHD for the composition phases to
-        // reconcile later.
+        // points refuse it by name, where the refusal can say which
+        // format it is naming. A bare `None` here was indistinguishable
+        // from a corrupt header, which is what issue #548 complained
+        // about, and it left VHDX structurally different from VHD for
+        // the composition work that followed.
 
         // Validate sector sizes
         if metadata.logical_sector_size != 512 && metadata.logical_sector_size != 4096 {
@@ -1850,6 +2110,20 @@ impl VhdxState {
             return None;
         }
 
+        // Only a differencing image pads its BAT, so only one needs
+        // the longer bound. The cap keeps a crafted geometry from
+        // reaching past the BAT region, and the region size check
+        // above deliberately stays on the shorter count: tightening
+        // it would refuse differencing images that load today,
+        // including any instar wrote itself (issue #623).
+        let sb_bat_entry_bound = if metadata.has_parent {
+            let padded = differencing_bat_entry_count(total_blocks, chunk_ratio_u32)?;
+            let region_entries = u64::from(bat_length) / 8;
+            u32::try_from(padded.min(region_entries)).ok()?
+        } else {
+            total_bat_entries_u32
+        };
+
         Some(VhdxState {
             device_idx,
             block_size: metadata.block_size,
@@ -1858,6 +2132,7 @@ impl VhdxState {
             bat_offset,
             total_bat_entries: total_bat_entries_u32,
             chunk_ratio: chunk_ratio_u32,
+            sb_bat_entry_bound,
             has_parent: metadata.has_parent,
             bat_cached_sector: u64::MAX,
             bat_cache_buf,
@@ -2024,18 +2299,220 @@ impl VhdxState {
             }
             PAYLOAD_BLOCK_ZERO => Some(VhdxBlockLookup::Zero),
             PAYLOAD_BLOCK_FULLY_PRESENT => {
+                if file_offset < MIN_BLOCK_FILE_OFFSET {
+                    return None;
+                }
                 let intra_block_offset = virtual_offset % self.block_size as u64;
                 Some(VhdxBlockLookup::Present {
-                    host_byte_offset: file_offset + intra_block_offset,
+                    host_byte_offset: file_offset.checked_add(intra_block_offset)?,
                 })
             }
-            // PARTIALLY_PRESENT resolves against the parent, which
-            // nothing can compose yet. `init` no longer refuses a
-            // differencing image (the read entry points do, on
-            // `has_parent`), so this arm is the backstop for a caller
-            // that skipped that check: fail rather than invent data.
+            PAYLOAD_BLOCK_PARTIALLY_PRESENT => {
+                // Only a differencing child may use this state, and
+                // the chunk's sector bitmap -- not the BAT -- says
+                // which of the block's sectors are its own. Report
+                // where the block sits and how much of it follows,
+                // and leave the composing to a caller that has a
+                // parent to compose against.
+                //
+                // An image claiming no parent has no parent to compose
+                // against and no bitmap it is entitled to consult, so
+                // this state is as undefined for it as state 4 is:
+                // refuse the block rather than serving whichever of
+                // its sectors a crafted bitmap happens to claim. The
+                // refusal has to live here because nothing upstream
+                // stops such an image -- the differencing refusal in
+                // `init_chain_states` fires on `has_parent`, which is
+                // exactly what this image denies having.
+                if !self.has_parent {
+                    return None;
+                }
+                if file_offset < MIN_BLOCK_FILE_OFFSET {
+                    return None;
+                }
+                let intra_block_offset = virtual_offset % self.block_size as u64;
+                Some(VhdxBlockLookup::PartiallyPresent {
+                    host_byte_offset: file_offset.checked_add(intra_block_offset)?,
+                    block_bytes_remaining: u64::from(self.block_size)
+                        .checked_sub(intra_block_offset)?,
+                })
+            }
+            // Every remaining state is undefined for a payload entry.
             _ => None,
         }
+    }
+
+    /// Number of logical sectors one chunk -- and so one sector bitmap
+    /// block -- covers.
+    ///
+    /// The definition of `chunk_ratio` makes this exactly 2^23 for any
+    /// valid image, but it is computed rather than assumed so that a
+    /// crafted geometry produces a small answer instead of a bitmap
+    /// read that runs off the end of the block.
+    ///
+    /// Returns `None` for a degenerate geometry and on overflow.
+    pub fn sectors_per_chunk_group(&self) -> Option<u32> {
+        let sectors = u64::from(self.chunk_ratio)
+            .checked_mul(u64::from(self.block_size))?
+            .checked_div(u64::from(self.logical_sector_size))?;
+        // A group of no sectors is as degenerate as a zero sector size,
+        // and saying so here rather than returning Some(0) matters: a
+        // zero is a number every bounds check downstream accepts, so it
+        // reads as a legitimate answer about a tiny group rather than
+        // as "this geometry makes no sense". The coalescer would refuse
+        // such a group anyway, by a route far enough from here that the
+        // reason would not be obvious to anyone reading this.
+        if sectors == 0 {
+            return None;
+        }
+        u32::try_from(sectors).ok()
+    }
+
+    /// Resolve the sector bitmap that describes a given virtual byte
+    /// offset.
+    ///
+    /// Only a differencing image needs this: in a plain dynamic VHDX
+    /// every sector of a present block belongs to that file, no block
+    /// is ever `PAYLOAD_BLOCK_PARTIALLY_PRESENT`, and so no sector
+    /// bitmap block is written at all.
+    ///
+    /// Returns `None` when the chunk's sector bitmap entry is missing
+    /// or unreadable. `SB_BLOCK_NOT_PRESENT` is included in that: the
+    /// format permits it only while no payload block in the chunk is
+    /// partially present, and a caller only reaches here because one
+    /// is. Treating it as "all parent" or "all child" would be a guess
+    /// about data, so a malformed image fails the read instead.
+    ///
+    /// # Safety
+    ///
+    /// `call_table` must be valid. Cache buffers must still be valid.
+    pub unsafe fn sector_bitmap_lookup(
+        &mut self,
+        call_table: &CallTable,
+        virtual_offset: u64,
+        sector_size: usize,
+        input_capacity: u64,
+        bytes_read: &mut u64,
+    ) -> Option<SectorBitmapLookup> {
+        let block_index = virtual_offset.checked_div(u64::from(self.block_size))?;
+        let sb_index = sb_bat_index(block_index, self.chunk_ratio)?;
+        // The differencing count, not `total_bat_entries`: a group's
+        // bitmap entry sits at the end of the group even when the
+        // virtual disk stops part way through it.
+        if sb_index >= u64::from(self.sb_bat_entry_bound) {
+            return None;
+        }
+
+        let bat_byte_offset = self.bat_offset.checked_add(sb_index.checked_mul(8)?)?;
+        let bat_entry = read_u64_le_cached(
+            call_table,
+            self.device_idx,
+            bat_byte_offset,
+            sector_size,
+            input_capacity,
+            &mut self.bat_cached_sector,
+            self.bat_cache_buf,
+            bytes_read,
+        )?;
+
+        let state = bat_entry & BAT_ENTRY_STATE_MASK;
+        let file_offset = bat_entry & BAT_ENTRY_OFFSET_MASK;
+        // SB_BLOCK_PRESENT is the only state in which a sector
+        // bitmap entry can be read. SB_BLOCK_NOT_PRESENT is the case a
+        // real image reaches -- it promised a partially present
+        // payload block and then withheld the bitmap saying which of
+        // its sectors it holds -- and every remaining value is
+        // undefined for this kind of entry. Neither leaves a safe
+        // guess to make, so both fail the read, and one comparison
+        // covers them: splitting it in two reads as though the first
+        // branch were a separate guard when nothing can reach the
+        // second through it.
+        if state != SB_BLOCK_PRESENT {
+            return None;
+        }
+        // And a present entry still has to name a plausible place. The
+        // offset mask keeps the low twenty bits clear, so the only
+        // value below the first megabyte is zero -- a zeroed or
+        // truncated entry whose state bits happen to read as present.
+        // The file identifier lives there, and its bytes would be
+        // served as an answer about which sectors the child owns.
+        if file_offset < MIN_BLOCK_FILE_OFFSET {
+            return None;
+        }
+
+        let sector_in_group = sector_in_chunk_group(
+            virtual_offset,
+            self.block_size,
+            self.chunk_ratio,
+            self.logical_sector_size,
+        )?;
+
+        Some(SectorBitmapLookup {
+            bitmap_host_offset: file_offset,
+            sector_in_group,
+        })
+    }
+
+    /// Report which of a chunk's logical sectors this file owns.
+    ///
+    /// `bitmap_host_offset` is the offset
+    /// [`Self::sector_bitmap_lookup`] reported. `first_sector` and
+    /// `sector_count` name a range of sector indices *within the
+    /// chunk*, numbered the way `sector_in_group` is. The answer
+    /// covers `first_sector` and as many following sectors as share
+    /// its owner, stopping at `sector_count`, at the end of the
+    /// chunk's coverage, or where ownership changes -- so a caller
+    /// placing a whole chunk of its own loops, asking about the first
+    /// sector it has not yet served.
+    ///
+    /// Bitmap bytes are read through the per-device data sector cache,
+    /// which costs no memory this state does not already hold and
+    /// leaves the BAT cache alone: the BAT and the bitmap blocks sit in
+    /// different regions of the file and serving one chunk touches
+    /// both.
+    ///
+    /// Returns `None` for a degenerate geometry, for a `first_sector`
+    /// at or past the end of the chunk's coverage, for a zero
+    /// `sector_count`, and on I/O failure.
+    ///
+    /// # Safety
+    ///
+    /// `call_table` must be valid. `data_cache_buf` must still point to
+    /// at least `sector_size` writable bytes.
+    pub unsafe fn read_sector_bitmap_run(
+        &mut self,
+        call_table: &CallTable,
+        bitmap_host_offset: u64,
+        first_sector: u32,
+        sector_count: u32,
+        sector_size: usize,
+        input_capacity: u64,
+        bytes_read: &mut u64,
+    ) -> Option<SectorOwnershipRun> {
+        let sectors_per_group = self.sectors_per_chunk_group()?;
+        let device_idx = self.device_idx;
+        let cache_buf = self.data_cache_buf;
+        let cached_sector = &mut self.data_cached_sector;
+
+        coalesce_ownership_run(
+            first_sector,
+            sector_count,
+            sectors_per_group,
+            SB_BLOCK_SIZE,
+            |byte_index| {
+                let byte_offset = bitmap_host_offset.checked_add(u64::from(byte_index))?;
+                read_u8_cached(
+                    call_table,
+                    device_idx,
+                    byte_offset,
+                    sector_size,
+                    input_capacity,
+                    cached_sector,
+                    cache_buf,
+                    bytes_read,
+                )
+            },
+        )
     }
 
     /// Walk the BAT and produce an `AllocationSummary`.
@@ -5438,5 +5915,421 @@ mod tests {
             read_active(512)
         };
         assert!(active.is_none());
+    }
+
+    // ====================================================================
+    // Sector bitmap tests
+    // ====================================================================
+
+    /// Drive the coalescer over an in-memory bitmap, reporting how many
+    /// byte fetches it needed.
+    fn run_over(
+        bitmap: &[u8],
+        first_sector: u32,
+        sector_count: u32,
+        sectors_per_group: u32,
+    ) -> (Option<SectorOwnershipRun>, usize) {
+        let mut fetches = 0usize;
+        let run = coalesce_ownership_run(
+            first_sector,
+            sector_count,
+            sectors_per_group,
+            bitmap.len() as u32,
+            |byte_index| {
+                fetches += 1;
+                bitmap.get(byte_index as usize).copied()
+            },
+        );
+        (run, fetches)
+    }
+
+    /// A `VhdxState` with no device behind it, for the arithmetic-only
+    /// accessors. The cache pointers are never dereferenced because no
+    /// I/O is performed.
+    fn arithmetic_only_state(block_size: u32, logical_sector_size: u32) -> VhdxState {
+        // The definition `init` uses, so the geometry under test is one
+        // a real image could have.
+        let chunk_ratio = ((1u64 << 23) * logical_sector_size as u64) / block_size as u64;
+        VhdxState {
+            device_idx: 0,
+            block_size,
+            virtual_disk_size: 16 * 1024 * 1024,
+            logical_sector_size,
+            bat_offset: 3 * 1024 * 1024,
+            total_bat_entries: 16,
+            // 16 blocks of this size are a fraction of one chunk
+            // group, so the group's bitmap entry is the last entry a
+            // differencing BAT of this geometry holds.
+            sb_bat_entry_bound: chunk_ratio as u32 + 1,
+            chunk_ratio: chunk_ratio as u32,
+            has_parent: true,
+            bat_cached_sector: u64::MAX,
+            bat_cache_buf: core::ptr::null_mut(),
+            data_cached_sector: u64::MAX,
+            data_cache_buf: core::ptr::null_mut(),
+        }
+    }
+
+    #[test]
+    fn sector_bitmap_is_least_significant_bit_first() {
+        // The property that separates VHDX from VHD. Under VHD's
+        // most-significant-bit-first order these two assertions would
+        // be exactly swapped.
+        assert!(sector_bit_is_child_owned(0x01, 0));
+        assert!(!sector_bit_is_child_owned(0x01, 7));
+        assert!(sector_bit_is_child_owned(0x80, 7));
+        assert!(!sector_bit_is_child_owned(0x80, 0));
+
+        for sector in 0..8u32 {
+            assert_eq!(sector_bit_is_child_owned(0x01, sector), sector == 0);
+            assert_eq!(sector_bit_is_child_owned(0x80, sector), sector == 7);
+        }
+        // 0x0F describes the chunk's sectors 0..4, not 4..8.
+        for sector in 0..8u32 {
+            assert_eq!(sector_bit_is_child_owned(0x0F, sector), sector < 4);
+        }
+    }
+
+    #[test]
+    fn sector_bitmap_set_bit_means_child_and_clear_means_parent() {
+        for sector in 0..8u32 {
+            assert!(sector_bit_is_child_owned(0xFF, sector));
+            assert!(!sector_bit_is_child_owned(0x00, sector));
+        }
+    }
+
+    #[test]
+    fn sector_bitmap_bit_index_repeats_every_eight_sectors() {
+        // The byte is the caller's choice; the helper only picks the
+        // bit within it, so sector 8 tests the same bit as sector 0.
+        assert!(sector_bit_is_child_owned(0x01, 8));
+        assert!(sector_bit_is_child_owned(0x01, 8_388_600));
+        assert!(!sector_bit_is_child_owned(0x01, 9));
+    }
+
+    #[test]
+    fn ownership_run_all_ones_covers_the_whole_request() {
+        let bitmap = [0xFFu8; 512];
+        let (run, fetches) = run_over(&bitmap, 0, 128, 4096);
+        assert_eq!(
+            run,
+            Some(SectorOwnershipRun {
+                child_owned: true,
+                sectors: 128,
+            })
+        );
+        // One fetch per bitmap byte the run touches, not one per
+        // sector.
+        assert_eq!(fetches, 16);
+    }
+
+    #[test]
+    fn ownership_run_all_zeros_covers_the_whole_request() {
+        let bitmap = [0x00u8; 512];
+        let (run, fetches) = run_over(&bitmap, 0, 128, 4096);
+        assert_eq!(
+            run,
+            Some(SectorOwnershipRun {
+                child_owned: false,
+                sectors: 128,
+            })
+        );
+        assert_eq!(fetches, 16);
+    }
+
+    #[test]
+    fn ownership_run_stops_where_ownership_changes() {
+        let mut bitmap = [0x00u8; 512];
+        // 0x0F is asymmetric: read most significant bit first it would
+        // describe sectors 4..8 instead, and this run would be zero
+        // sectors long rather than four.
+        bitmap[0] = 0x0F;
+        let (run, _) = run_over(&bitmap, 0, 128, 4096);
+        assert_eq!(
+            run,
+            Some(SectorOwnershipRun {
+                child_owned: true,
+                sectors: 4,
+            })
+        );
+    }
+
+    #[test]
+    fn ownership_run_crosses_a_bitmap_byte_boundary() {
+        let mut bitmap = [0x00u8; 512];
+        bitmap[0] = 0x0F;
+        bitmap[2] = 0xFF;
+        // Sectors 4..8 are the parent's (the high nibble of byte 0) and
+        // so is all of byte 1, so the run is 12 sectors long and ends
+        // where byte 2 hands ownership back to the child.
+        let (run, _) = run_over(&bitmap, 4, 128, 4096);
+        assert_eq!(
+            run,
+            Some(SectorOwnershipRun {
+                child_owned: false,
+                sectors: 12,
+            })
+        );
+    }
+
+    #[test]
+    fn ownership_run_may_start_and_end_part_way_through_a_byte() {
+        let mut bitmap = [0x00u8; 512];
+        // Sectors 3..8 are the child's, and byte 1 continues the run
+        // for two more before handing it back.
+        bitmap[0] = 0xF8;
+        bitmap[1] = 0x03;
+        let (run, fetches) = run_over(&bitmap, 3, 128, 4096);
+        assert_eq!(
+            run,
+            Some(SectorOwnershipRun {
+                child_owned: true,
+                sectors: 7,
+            })
+        );
+        assert_eq!(fetches, 2);
+        // The sectors either side of that run belong to the parent.
+        assert_eq!(
+            run_over(&bitmap, 0, 128, 4096).0,
+            Some(SectorOwnershipRun {
+                child_owned: false,
+                sectors: 3,
+            })
+        );
+        assert_eq!(
+            run_over(&bitmap, 10, 128, 4096).0,
+            Some(SectorOwnershipRun {
+                child_owned: false,
+                sectors: 128,
+            })
+        );
+    }
+
+    #[test]
+    fn ownership_run_of_a_single_sector() {
+        let bitmap = [0xFFu8; 512];
+        let (run, fetches) = run_over(&bitmap, 7, 1, 4096);
+        assert_eq!(
+            run,
+            Some(SectorOwnershipRun {
+                child_owned: true,
+                sectors: 1,
+            })
+        );
+        assert_eq!(fetches, 1);
+    }
+
+    #[test]
+    fn ownership_run_is_clamped_to_the_chunks_own_sectors() {
+        let bitmap = [0xFFu8; 512];
+        // A caller's chunk can ask for more sectors than the bitmap
+        // covers; the run must stop at the chunk's last sector.
+        let (run, _) = run_over(&bitmap, 0, 128, 4);
+        assert_eq!(
+            run,
+            Some(SectorOwnershipRun {
+                child_owned: true,
+                sectors: 4,
+            })
+        );
+        let (run, _) = run_over(&bitmap, 3, 128, 4);
+        assert_eq!(
+            run,
+            Some(SectorOwnershipRun {
+                child_owned: true,
+                sectors: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn ownership_run_refuses_a_request_outside_the_chunk() {
+        let bitmap = [0xFFu8; 512];
+        assert_eq!(run_over(&bitmap, 4, 1, 4).0, None);
+        assert_eq!(run_over(&bitmap, 0, 0, 4).0, None);
+        assert_eq!(run_over(&bitmap, 0, 1, 0).0, None);
+    }
+
+    #[test]
+    fn ownership_run_refuses_a_chunk_without_a_bitmap() {
+        assert_eq!(run_over(&[], 0, 1, 4096).0, None);
+    }
+
+    #[test]
+    fn ownership_run_refuses_to_read_past_a_short_bitmap() {
+        // A one-byte bitmap describes only the first eight sectors.
+        // Asking about a later one is refused rather than answered
+        // from whatever follows the bitmap.
+        assert_eq!(run_over(&[0xFF], 8, 1, 4096).0, None);
+        let (run, fetches) = run_over(&[0xFF], 0, 128, 4096);
+        assert_eq!(
+            run,
+            Some(SectorOwnershipRun {
+                child_owned: true,
+                sectors: 8,
+            })
+        );
+        assert_eq!(fetches, 1);
+    }
+
+    #[test]
+    fn ownership_run_propagates_a_fetch_failure() {
+        assert_eq!(coalesce_ownership_run(0, 128, 4096, 512, |_| None), None);
+        // A failure part way through a run fails the whole run rather
+        // than returning the sectors read so far.
+        let mut calls = 0usize;
+        let run = coalesce_ownership_run(0, 128, 4096, 512, |_| {
+            calls += 1;
+            if calls > 1 {
+                None
+            } else {
+                Some(0xFF)
+            }
+        });
+        assert_eq!(run, None);
+    }
+
+    #[test]
+    fn a_differencing_bat_holds_its_last_groups_sector_bitmap() {
+        // At the common geometry -- 1 MiB blocks and 512-byte logical
+        // sectors -- a chunk group is 4096 payload blocks, so 4 GiB of
+        // virtual disk. `dynamic` is the entry count an image with no
+        // parent needs: one per payload block plus one per group. A
+        // differencing image pads to whole groups instead, because the
+        // group's bitmap entry sits at the end of the group however
+        // little of the group the disk fills.
+        for (blocks, dynamic, last_sb) in [
+            // A 16 MiB disk: a fraction of one group, and the shape of
+            // the project's own differencing fixture.
+            (16u64, 17u64, 4096u64),
+            // 4 GiB: exactly one group.
+            (4096, 4097, 4096),
+            // 8 GiB: exactly two.
+            (8192, 8194, 8193),
+        ] {
+            let padded = differencing_bat_entry_count(blocks, 4096).unwrap();
+            let sb = sb_bat_index(blocks - 1, 4096).unwrap();
+            assert_eq!(sb, last_sb, "last bitmap entry of a {blocks}-block disk");
+            assert!(
+                sb < padded,
+                "a {blocks}-block differencing BAT of {padded} entries must \
+                 reach its last bitmap entry at {sb}"
+            );
+            // And the point of the padding: under the shorter rule the
+            // entry is only reachable when the disk happens to end on a
+            // group boundary.
+            assert_eq!(
+                sb < dynamic,
+                blocks % 4096 == 0,
+                "the dynamic count of {dynamic} entries reaches entry {sb} \
+                 only for a whole number of groups"
+            );
+        }
+    }
+
+    #[test]
+    fn sb_bat_index_lands_at_the_end_of_its_own_group() {
+        // The first group is BAT 0..4095 plus its bitmap entry at
+        // 4096; the second is 4097..8192 plus its bitmap entry at
+        // 8193. Block 5000 sits at 4097 + 904 = 5001, so its bitmap
+        // entry is 8193 and not, as the payload-side arithmetic alone
+        // would suggest, something near 5001.
+        assert_eq!(sb_bat_index(5000, 4096), Some(8193));
+        assert_eq!(sb_bat_index(0, 4096), Some(4096));
+        assert_eq!(sb_bat_index(4095, 4096), Some(4096));
+        assert_eq!(sb_bat_index(4096, 4096), Some(8193));
+        assert_eq!(sb_bat_index(8191, 4096), Some(8193));
+        assert_eq!(sb_bat_index(8192, 4096), Some(12290));
+        // A one-block chunk still interleaves one bitmap entry per
+        // payload entry.
+        assert_eq!(sb_bat_index(0, 1), Some(1));
+        assert_eq!(sb_bat_index(1, 1), Some(3));
+        assert_eq!(sb_bat_index(2, 1), Some(5));
+    }
+
+    #[test]
+    fn sb_bat_index_refuses_a_degenerate_chunk_ratio() {
+        assert_eq!(sb_bat_index(0, 0), None);
+        assert_eq!(sb_bat_index(u64::MAX, 1), None);
+    }
+
+    #[test]
+    fn sector_in_chunk_group_is_relative_to_the_group() {
+        // 1 MiB blocks with 512 byte sectors give chunk_ratio 4096, so
+        // a group covers 4096 MiB and block 5000 is 904 MiB into the
+        // second group.
+        let block_size = 1024 * 1024;
+        let offset = 5000u64 * 1024 * 1024;
+        assert_eq!(
+            sector_in_chunk_group(offset, block_size, 4096, 512),
+            Some(904 * 1024 * 1024 / 512)
+        );
+        // The first group starts the numbering again at zero.
+        assert_eq!(sector_in_chunk_group(0, block_size, 4096, 512), Some(0));
+        assert_eq!(sector_in_chunk_group(512, block_size, 4096, 512), Some(1));
+        assert_eq!(
+            sector_in_chunk_group(4096 * 1024 * 1024, block_size, 4096, 512),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn sector_in_chunk_group_counts_the_images_own_sector_size() {
+        // Unlike VHD, which always counts 512 byte sectors, VHDX
+        // counts logical_sector_size, so the same byte offset is a
+        // different bit index in a 4096 byte sector image.
+        let block_size = 32 * 1024 * 1024;
+        assert_eq!(sector_in_chunk_group(8192, block_size, 1024, 4096), Some(2));
+        assert_eq!(sector_in_chunk_group(8192, block_size, 2048, 512), Some(16));
+        // A 4096 byte sector image's second group begins at
+        // 1024 * 32 MiB.
+        let group_bytes = 1024u64 * 32 * 1024 * 1024;
+        assert_eq!(
+            sector_in_chunk_group(group_bytes + 4096, block_size, 1024, 4096),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn sector_in_chunk_group_refuses_a_degenerate_geometry() {
+        assert_eq!(sector_in_chunk_group(0, 0, 4096, 512), None);
+        assert_eq!(sector_in_chunk_group(0, 1024 * 1024, 0, 512), None);
+        assert_eq!(sector_in_chunk_group(0, 1024 * 1024, 4096, 0), None);
+    }
+
+    #[test]
+    fn a_chunk_covers_exactly_one_bitmap_blocks_worth_of_sectors() {
+        // 2^20 bitmap bytes is 2^23 bits, and the definition of
+        // chunk_ratio makes a chunk 2^23 sectors however large the
+        // blocks and the sectors are. Both legal sector sizes.
+        assert_eq!(
+            arithmetic_only_state(2 * 1024 * 1024, 512).sectors_per_chunk_group(),
+            Some(1 << 23)
+        );
+        assert_eq!(
+            arithmetic_only_state(32 * 1024 * 1024, 512).sectors_per_chunk_group(),
+            Some(1 << 23)
+        );
+        assert_eq!(
+            arithmetic_only_state(32 * 1024 * 1024, 4096).sectors_per_chunk_group(),
+            Some(1 << 23)
+        );
+        assert_eq!(
+            arithmetic_only_state(1024 * 1024, 4096).sectors_per_chunk_group(),
+            Some(1 << 23)
+        );
+        assert_eq!(u64::from(SB_BLOCK_SIZE) * 8, 1 << 23);
+    }
+
+    #[test]
+    fn sectors_per_chunk_group_refuses_a_degenerate_geometry() {
+        let mut state = arithmetic_only_state(2 * 1024 * 1024, 512);
+        state.logical_sector_size = 0;
+        assert_eq!(state.sectors_per_chunk_group(), None);
+        let mut state = arithmetic_only_state(2 * 1024 * 1024, 512);
+        state.chunk_ratio = 0;
+        // A group spanning no sectors describes nothing, so it is
+        // refused here rather than passed on as a group of size zero.
+        assert_eq!(state.sectors_per_chunk_group(), None);
     }
 }
