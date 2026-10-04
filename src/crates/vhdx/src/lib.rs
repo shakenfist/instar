@@ -1659,8 +1659,24 @@ pub enum VhdxBlockLookup {
     /// answer about the data rather than about this file, so a parent
     /// image must not be consulted for it.
     Zero,
-    /// Block is allocated at the given host byte offset.
+    /// Block is allocated at the given host byte offset, and every
+    /// sector of it belongs to this file.
     Present { host_byte_offset: u64 },
+    /// Block is allocated but shared with the parent image: the
+    /// chunk's sector bitmap decides, per logical sector, which of
+    /// the two holds the data. Only a differencing child may say
+    /// this.
+    PartiallyPresent {
+        /// Host byte offset the looked-up virtual offset lives at,
+        /// exactly as `Present` reports it.
+        host_byte_offset: u64,
+        /// Bytes of this payload block that begin at
+        /// `host_byte_offset`. A read may not run past them: the next
+        /// block's payload need not follow this one in the file, and
+        /// the sectors beyond the block are described by bitmap bits
+        /// this lookup did not resolve.
+        block_bytes_remaining: u64,
+    },
 }
 
 // ============================================================================
@@ -2215,11 +2231,23 @@ impl VhdxState {
                     host_byte_offset: file_offset + intra_block_offset,
                 })
             }
-            // PARTIALLY_PRESENT resolves against the parent, which
-            // nothing can compose yet. `init` no longer refuses a
-            // differencing image (the read entry points do, on
-            // `has_parent`), so this arm is the backstop for a caller
-            // that skipped that check: fail rather than invent data.
+            PAYLOAD_BLOCK_PARTIALLY_PRESENT => {
+                // Only a differencing child may use this state, and
+                // the chunk's sector bitmap -- not the BAT -- says
+                // which of the block's sectors are its own. Report
+                // where the block sits and how much of it follows,
+                // and leave the composing to a caller that has a
+                // parent to compose against. One that has not cannot
+                // resolve the bitmap either, so it still fails rather
+                // than inventing data.
+                let intra_block_offset = virtual_offset % self.block_size as u64;
+                Some(VhdxBlockLookup::PartiallyPresent {
+                    host_byte_offset: file_offset.checked_add(intra_block_offset)?,
+                    block_bytes_remaining: u64::from(self.block_size)
+                        .checked_sub(intra_block_offset)?,
+                })
+            }
+            // Every remaining state is undefined for a payload entry.
             _ => None,
         }
     }
