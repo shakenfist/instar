@@ -2865,6 +2865,7 @@ pub unsafe fn read_cluster_sectors(
 /// `call_table` must be valid.
 #[cfg(any(
     feature = "vhd-input",
+    feature = "vhdx-input",
     feature = "vdi-input",
     feature = "parallels-input",
     feature = "qcow1-input",
@@ -8180,6 +8181,1342 @@ mod tests {
     }
 
     // ========================================================================
+    // VHDX chain-reader arm (read_chain_virtual_cluster ImageFormat::Vhdx),
+    // differencing composition path.
+    //
+    // Shaped after the VHD harness above -- a per-device mock dispatched on
+    // device_idx, two deliberately different byte patterns, and per-device
+    // state built directly with `VhdxState::init`, because
+    // `init_chain_states` refuses every differencing VHDX whatever follows
+    // it -- and differing from it wherever the format does.
+    //
+    // A VHDX payload block and a sector bitmap block are both 1 MiB-aligned
+    // regions, because a BAT entry has no room to say anything finer, so a
+    // fixture is a run of uniform 1 MiB regions rather than VHD's 512-byte
+    // ones and every fixture uses the format's 1 MiB minimum block size. A
+    // bitmap block describes a whole chunk group rather than one block, so
+    // ownership is given as group-relative logical sector ranges and the
+    // builder turns them into bits. Both BAT index formulas and the bit
+    // order are spelled out in the builder rather than taken from the vhdx
+    // crate, so that a fixture cannot move with the code it is checking.
+    //
+    // Most fixtures give their virtual disk a whole number of chunk
+    // groups, which at a 1 MiB block size is 4 GiB per group for 512-byte
+    // logical sectors and 32 GiB for 4096-byte ones. That costs nothing --
+    // it is metadata, and the file holds only the blocks a fixture
+    // allocates. It is not a requirement, though: `build_vhdx_image_blocks`
+    // takes a payload block count instead, for the partial final group a
+    // real small differencing image has, where the group's sector bitmap
+    // entry still sits at the group's end and so past the last payload
+    // block the disk defines.
+    // ========================================================================
+
+    #[cfg(feature = "vhdx-input")]
+    const VHDX_MAX_DEVS: usize = 3;
+    #[cfg(feature = "vhdx-input")]
+    static VHDX_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    #[cfg(feature = "vhdx-input")]
+    static mut VHDX_IMAGES: [*const u8; VHDX_MAX_DEVS] = [core::ptr::null(); VHDX_MAX_DEVS];
+    #[cfg(feature = "vhdx-input")]
+    static mut VHDX_LENS: [usize; VHDX_MAX_DEVS] = [0; VHDX_MAX_DEVS];
+    #[cfg(feature = "vhdx-input")]
+    static mut VHDX_SSZ: usize = 512;
+    #[cfg(feature = "vhdx-input")]
+    static mut VHDX_ERR_OP: [u8; 32] = [0; 32];
+    #[cfg(feature = "vhdx-input")]
+    static mut VHDX_ERR_STATUS: u32 = 0;
+    #[cfg(feature = "vhdx-input")]
+    static mut VHDX_ERR_CALLS: u32 = 0;
+
+    /// The block size every fixture uses: the format's 1 MiB minimum,
+    /// which is also the sector bitmap block size.
+    #[cfg(feature = "vhdx-input")]
+    const VHDX_FIX_BLOCK_SIZE: u32 = 1024 * 1024;
+    #[cfg(feature = "vhdx-input")]
+    const VHDX_FIX_METADATA_OFFSET: u64 = 0x10_0000;
+    #[cfg(feature = "vhdx-input")]
+    const VHDX_FIX_METADATA_LENGTH: u32 = 0x10_0000;
+    #[cfg(feature = "vhdx-input")]
+    const VHDX_FIX_BAT_OFFSET: u64 = 0x20_0000;
+    /// 1 MiB of BAT is 131072 entries, which covers the largest BAT any
+    /// fixture here declares -- 32769 entries, for an image with
+    /// 4096-byte logical sectors.
+    #[cfg(feature = "vhdx-input")]
+    const VHDX_FIX_BAT_LENGTH: u32 = 0x10_0000;
+    /// Where the first payload or sector bitmap block is placed; they
+    /// follow one another at the block size from here.
+    #[cfg(feature = "vhdx-input")]
+    const VHDX_FIX_FIRST_BLOCK: u64 = 0x30_0000;
+
+    /// Differencing child byte at absolute host offset `o`.
+    #[cfg(feature = "vhdx-input")]
+    fn vhdx_child_byte(o: u64) -> u8 {
+        (o % 251) as u8
+    }
+    /// Parent (backing) device byte at virtual offset `o`; a distinct
+    /// period and a +1 bias so a wrong-device read cannot silently match
+    /// the child's pattern.
+    #[cfg(feature = "vhdx-input")]
+    fn vhdx_parent_byte(o: u64) -> u8 {
+        ((o % 241) as u8).wrapping_add(1)
+    }
+
+    /// Per-device mock: fails any sector at/beyond the device length so a
+    /// read the arm fails to clamp surfaces as an error, not fabricated
+    /// bytes.
+    ///
+    /// It also refuses a read at any size but the device's own, for the
+    /// same reason the VHD mock above does: without that, the mock
+    /// derives its byte offset from `sector * sector_size` and lands on
+    /// the right bytes even when told the wrong size, which hides every
+    /// sector-size mistake from every test.
+    #[cfg(feature = "vhdx-input")]
+    unsafe extern "C" fn vhdx_read_sector(
+        device_idx: u32,
+        sector: u64,
+        out_buf: *mut u8,
+        sector_size: usize,
+    ) -> bool {
+        let d = device_idx as usize;
+        if d >= VHDX_MAX_DEVS {
+            return false;
+        }
+        if sector_size != VHDX_SSZ {
+            return false;
+        }
+        let imgs = core::ptr::addr_of!(VHDX_IMAGES) as *const *const u8;
+        let lens = core::ptr::addr_of!(VHDX_LENS) as *const usize;
+        let ptr = *imgs.add(d);
+        let len = *lens.add(d);
+        if ptr.is_null() {
+            return false;
+        }
+        let start = match (sector as usize).checked_mul(sector_size) {
+            Some(s) => s,
+            None => return false,
+        };
+        if start + sector_size > len {
+            return false;
+        }
+        core::ptr::copy_nonoverlapping(ptr.add(start), out_buf, sector_size);
+        true
+    }
+
+    #[cfg(feature = "vhdx-input")]
+    unsafe extern "C" fn vhdx_capacity(device_idx: u32) -> u64 {
+        let d = device_idx as usize;
+        if d >= VHDX_MAX_DEVS {
+            return 0;
+        }
+        let lens = core::ptr::addr_of!(VHDX_LENS) as *const usize;
+        (*lens.add(d) / VHDX_SSZ) as u64
+    }
+
+    #[cfg(feature = "vhdx-input")]
+    unsafe extern "C" fn vhdx_ssz(_device_idx: u32) -> usize {
+        VHDX_SSZ
+    }
+
+    /// Record what `send_error` was called with.
+    ///
+    /// `init_chain_states` returns a bare `bool`, so this channel
+    /// carries the only evidence of *why* a device was rejected. A test
+    /// that asserts the return value alone passes for any init failure,
+    /// including a broken fixture, which is exactly the failure the
+    /// differencing refusal must not be confused with.
+    ///
+    /// Deliberately its own statics rather than the VHD recorder's: the
+    /// two harnesses serialise on different mutexes, so a shared
+    /// recorder would let a VHD test and a VHDX test race for it.
+    #[cfg(feature = "vhdx-input")]
+    unsafe extern "C" fn vhdx_send_err(op: *const u8, _sub: *const u8, _off: u64, status: u32) {
+        VHDX_ERR_CALLS += 1;
+        VHDX_ERR_STATUS = status;
+        let dst = core::ptr::addr_of_mut!(VHDX_ERR_OP) as *mut u8;
+        core::ptr::write_bytes(dst, 0, 32);
+        for i in 0..31 {
+            let b = *op.add(i);
+            *dst.add(i) = b;
+            if b == 0 {
+                break;
+            }
+        }
+    }
+
+    #[cfg(feature = "vhdx-input")]
+    fn vhdx_reset_errors() {
+        unsafe {
+            VHDX_ERR_CALLS = 0;
+            VHDX_ERR_STATUS = 0;
+            let dst = core::ptr::addr_of_mut!(VHDX_ERR_OP) as *mut u8;
+            core::ptr::write_bytes(dst, 0, 32);
+        }
+    }
+
+    /// How many times `send_error` was called since the last reset, the
+    /// operation marker of the last call, and its status.
+    #[cfg(feature = "vhdx-input")]
+    fn vhdx_last_error() -> (u32, std::string::String, u32) {
+        unsafe {
+            let src = core::ptr::addr_of!(VHDX_ERR_OP) as *const u8;
+            let mut n = 0usize;
+            while n < 32 && *src.add(n) != 0 {
+                n += 1;
+            }
+            let op =
+                core::str::from_utf8(core::slice::from_raw_parts(src, n)).unwrap_or("<not utf-8>");
+            (
+                VHDX_ERR_CALLS,
+                std::string::String::from(op),
+                VHDX_ERR_STATUS,
+            )
+        }
+    }
+
+    #[cfg(feature = "vhdx-input")]
+    fn vhdx_call_table() -> shared::CallTable {
+        shared::CallTable {
+            read_input_sector: vhdx_read_sector,
+            get_input_capacity: vhdx_capacity,
+            get_input_sector_size: vhdx_ssz,
+            send_error: vhdx_send_err,
+            ..stub_call_table()
+        }
+    }
+
+    #[cfg(feature = "vhdx-input")]
+    fn vhdx_put_u64(img: &mut [u8], off: usize, val: u64) {
+        img[off..off + 8].copy_from_slice(&val.to_le_bytes());
+    }
+
+    /// What a fixture's BAT says about one payload block.
+    #[cfg(feature = "vhdx-input")]
+    #[derive(Clone, Copy)]
+    enum VhdxBlockState {
+        NotPresent,
+        Zero,
+        FullyPresent,
+        PartiallyPresent,
+    }
+
+    /// One chunk group's sector bitmap.
+    #[cfg(feature = "vhdx-input")]
+    struct VhdxGroupBitmap<'a> {
+        /// Index of the chunk group the bitmap describes.
+        group: u64,
+        /// `SB_BLOCK_PRESENT` or `SB_BLOCK_NOT_PRESENT`.
+        state: u64,
+        /// Logical sectors the child owns, numbered from the group's
+        /// first byte rather than the block's. Given as ranges so a
+        /// fixture can cross bitmap byte boundaries without
+        /// hand-assembling the bytes, which is how every VHDX fixture
+        /// here ends up with more than one bitmap byte in play.
+        child_sectors: &'a [core::ops::Range<u32>],
+    }
+
+    /// A built fixture: its bytes, and where each requested block's
+    /// payload landed.
+    #[cfg(feature = "vhdx-input")]
+    struct VhdxFixture {
+        bytes: std::vec::Vec<u8>,
+        /// Host byte offset of the payload of each entry of the `blocks`
+        /// argument, in order; zero for a block with no payload.
+        block_offsets: std::vec::Vec<u64>,
+    }
+
+    /// A device in the mock chain: its raw bytes and its detected format.
+    #[cfg(feature = "vhdx-input")]
+    struct VhdxDevice {
+        bytes: std::vec::Vec<u8>,
+        format: ImageFormat,
+    }
+
+    /// Payload blocks one chunk group holds, from the format's own
+    /// definition of `chunk_ratio` at the fixtures' block size.
+    #[cfg(feature = "vhdx-input")]
+    fn vhdx_chunk_ratio(logical_sector_size: u32) -> u64 {
+        (1u64 << 23) * u64::from(logical_sector_size) / u64::from(VHDX_FIX_BLOCK_SIZE)
+    }
+
+    /// Build a VHDX whose BAT says `blocks` and whose sector bitmap
+    /// blocks say `bitmaps`.
+    ///
+    /// `group_count` sets the virtual disk size to that many whole chunk
+    /// groups. `blocks` names payload blocks by index, so a fixture can
+    /// place one anywhere in the disk without materialising the blocks
+    /// before it; an allocated one gets a 1 MiB payload region filled
+    /// with the child's byte pattern. `bitmaps` names chunk groups the
+    /// same way.
+    #[cfg(feature = "vhdx-input")]
+    fn build_vhdx_image(
+        logical_sector_size: u32,
+        has_parent: bool,
+        group_count: u64,
+        blocks: &[(u64, VhdxBlockState)],
+        bitmaps: &[VhdxGroupBitmap<'_>],
+    ) -> VhdxFixture {
+        let payload_blocks = group_count * vhdx_chunk_ratio(logical_sector_size);
+        build_vhdx_image_blocks(
+            logical_sector_size,
+            has_parent,
+            payload_blocks,
+            blocks,
+            bitmaps,
+        )
+    }
+
+    /// `build_vhdx_image` with the virtual disk given as a payload block
+    /// count, so a fixture can stop part way through a chunk group the
+    /// way a small real image does.
+    #[cfg(feature = "vhdx-input")]
+    fn build_vhdx_image_blocks(
+        logical_sector_size: u32,
+        has_parent: bool,
+        payload_blocks: u64,
+        blocks: &[(u64, VhdxBlockState)],
+        bitmaps: &[VhdxGroupBitmap<'_>],
+    ) -> VhdxFixture {
+        let chunk_ratio = vhdx_chunk_ratio(logical_sector_size);
+        let block_size = u64::from(VHDX_FIX_BLOCK_SIZE);
+        let virtual_disk_size = payload_blocks * block_size;
+        // A differencing BAT is whole groups of chunk_ratio + 1 entries;
+        // one with no parent stops at the last entry it needs. Spelled
+        // out here rather than taken from the crate under test.
+        let group_count = payload_blocks.div_ceil(chunk_ratio);
+        let total_bat_entries = if has_parent {
+            group_count * (chunk_ratio + 1)
+        } else {
+            payload_blocks + group_count
+        };
+        assert!(
+            total_bat_entries * 8 <= u64::from(VHDX_FIX_BAT_LENGTH),
+            "the fixture BAT region cannot hold {total_bat_entries} entries"
+        );
+
+        let payload_regions = blocks
+            .iter()
+            .filter(|(_, s)| {
+                matches!(
+                    s,
+                    VhdxBlockState::FullyPresent | VhdxBlockState::PartiallyPresent
+                )
+            })
+            .count();
+        let bitmap_regions = bitmaps
+            .iter()
+            .filter(|b| b.state == vhdx::SB_BLOCK_PRESENT)
+            .count();
+        let total_len = VHDX_FIX_FIRST_BLOCK as usize
+            + (payload_regions + bitmap_regions) * block_size as usize;
+        let mut img = std::vec![0u8; total_len];
+
+        vhdx::build_file_identifier(&mut img[..0x1_0000]);
+        vhdx::build_header(&mut img[0x1_0000..0x1_1000], 2);
+        vhdx::build_header(&mut img[0x2_0000..0x2_1000], 1);
+        vhdx::build_region_table(
+            &mut img[0x3_0000..0x4_0000],
+            VHDX_FIX_BAT_OFFSET,
+            VHDX_FIX_BAT_LENGTH,
+            VHDX_FIX_METADATA_OFFSET,
+            VHDX_FIX_METADATA_LENGTH,
+        );
+        vhdx::build_metadata(
+            &mut img[VHDX_FIX_METADATA_OFFSET as usize..],
+            VHDX_FIX_BLOCK_SIZE,
+            virtual_disk_size,
+            logical_sector_size,
+            logical_sector_size,
+            has_parent,
+        );
+
+        let mut next_region = VHDX_FIX_FIRST_BLOCK;
+        let mut block_offsets = std::vec::Vec::with_capacity(blocks.len());
+        for (block_index, state) in blocks {
+            // A payload block's own BAT index is its block index plus
+            // the sector bitmap entry that ends each whole group before
+            // it.
+            let bat_index = block_index + block_index / chunk_ratio;
+            let entry = match state {
+                VhdxBlockState::NotPresent => {
+                    block_offsets.push(0);
+                    vhdx::build_bat_entry(vhdx::PAYLOAD_BLOCK_NOT_PRESENT, 0)
+                }
+                VhdxBlockState::Zero => {
+                    block_offsets.push(0);
+                    vhdx::build_bat_entry(vhdx::PAYLOAD_BLOCK_ZERO, 0)
+                }
+                VhdxBlockState::FullyPresent | VhdxBlockState::PartiallyPresent => {
+                    let payload = next_region;
+                    next_region += block_size;
+                    for i in 0..block_size {
+                        img[(payload + i) as usize] = vhdx_child_byte(payload + i);
+                    }
+                    block_offsets.push(payload);
+                    let payload_state = match state {
+                        VhdxBlockState::FullyPresent => vhdx::PAYLOAD_BLOCK_FULLY_PRESENT,
+                        _ => vhdx::PAYLOAD_BLOCK_PARTIALLY_PRESENT,
+                    };
+                    vhdx::build_bat_entry(payload_state, payload)
+                }
+            };
+            vhdx_put_u64(
+                &mut img,
+                (VHDX_FIX_BAT_OFFSET + bat_index * 8) as usize,
+                entry,
+            );
+        }
+
+        for bitmap in bitmaps {
+            // A group is chunk_ratio payload entries followed by the one
+            // sector bitmap entry that covers all of them.
+            let sb_index = bitmap.group * (chunk_ratio + 1) + chunk_ratio;
+            let entry = if bitmap.state == vhdx::SB_BLOCK_PRESENT {
+                let base = next_region;
+                next_region += block_size;
+                for range in bitmap.child_sectors {
+                    for sector in range.clone() {
+                        // Least significant bit first, the opposite of
+                        // VHD. Written out rather than taken from the
+                        // crate's own bit test, which would move with it.
+                        img[base as usize + sector as usize / 8] |= 1 << (sector % 8);
+                    }
+                }
+                vhdx::build_bat_entry(vhdx::SB_BLOCK_PRESENT, base)
+            } else {
+                vhdx::build_bat_entry(bitmap.state, 0)
+            };
+            vhdx_put_u64(
+                &mut img,
+                (VHDX_FIX_BAT_OFFSET + sb_index * 8) as usize,
+                entry,
+            );
+        }
+
+        VhdxFixture {
+            bytes: img,
+            block_offsets,
+        }
+    }
+
+    /// A raw backing device of `len` bytes, filled with the parent's byte
+    /// pattern keyed on virtual (= host, for a raw device) offset.
+    #[cfg(feature = "vhdx-input")]
+    fn build_vhdx_parent_raw(len: usize) -> std::vec::Vec<u8> {
+        let mut img = std::vec![0u8; len];
+        for (i, b) in img.iter_mut().enumerate() {
+            *b = vhdx_parent_byte(i as u64);
+        }
+        img
+    }
+
+    /// The bytes a composed read must return: the child's payload
+    /// wherever the chunk group's bitmap gives the logical sector to the
+    /// child, and the backing device's otherwise. Derived from the same
+    /// sector ranges the fixture was built from, through the format's
+    /// definitions rather than the code under test.
+    #[cfg(feature = "vhdx-input")]
+    fn vhdx_expected(
+        virtual_offset: u64,
+        len: u64,
+        payload_host_base: u64,
+        logical_sector_size: u32,
+        child_sectors: &[core::ops::Range<u32>],
+    ) -> std::vec::Vec<u8> {
+        let lss = u64::from(logical_sector_size);
+        // A chunk group covers 2^23 logical sectors whatever the block
+        // size, which is what makes bitmap bits group-relative.
+        let group_bytes = (1u64 << 23) * lss;
+        let block_size = u64::from(VHDX_FIX_BLOCK_SIZE);
+        let mut want = std::vec::Vec::with_capacity(len as usize);
+        for i in 0..len {
+            let v = virtual_offset + i;
+            let sector = ((v % group_bytes) / lss) as u32;
+            if child_sectors.iter().any(|r| r.contains(&sector)) {
+                want.push(vhdx_child_byte(payload_host_base + v % block_size));
+            } else {
+                want.push(vhdx_parent_byte(v));
+            }
+        }
+        want
+    }
+
+    /// Init per-device VHDX state directly (bypassing `init_chain_states`,
+    /// which refuses every differencing child regardless of chain shape)
+    /// and run one span through `read_chain_virtual_cluster`. Returns
+    /// whether the read succeeded and the output buffer, sentinel-filled
+    /// beforehand so a false return that leaves the buffer untouched is
+    /// visibly wrong rather than a coincidental match.
+    #[cfg(feature = "vhdx-input")]
+    fn run_vhdx_chain_read(
+        devices: &[VhdxDevice],
+        sector_size: usize,
+        virtual_offset: u64,
+        chunk_size: u64,
+    ) -> (bool, std::vec::Vec<u8>) {
+        // The mock's device table is process-wide mutable state, so one
+        // test at a time. Recovering the poisoned guard rather than
+        // unwrapping it matters because the asserts below run while it
+        // is held: unwrapping would turn the first genuine failure into
+        // a PoisonError in every later test, hiding the one that
+        // actually broke.
+        let _guard = VHDX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(devices.len() <= VHDX_MAX_DEVS);
+
+        unsafe {
+            VHDX_SSZ = sector_size;
+            let imgs = core::ptr::addr_of_mut!(VHDX_IMAGES) as *mut *const u8;
+            let lens = core::ptr::addr_of_mut!(VHDX_LENS) as *mut usize;
+            for i in 0..VHDX_MAX_DEVS {
+                if i < devices.len() {
+                    *imgs.add(i) = devices[i].bytes.as_ptr();
+                    *lens.add(i) = devices[i].bytes.len();
+                } else {
+                    *imgs.add(i) = core::ptr::null();
+                    *lens.add(i) = 0;
+                }
+            }
+        }
+        let call_table = vhdx_call_table();
+
+        // Two cache buffers (BAT + data) per device, kept alive for the
+        // read.
+        let mut caches: std::vec::Vec<std::vec::Vec<u8>> = std::vec::Vec::new();
+        for _ in 0..devices.len() {
+            caches.push(std::vec![0u8; MAX_SECTOR_SIZE]);
+            caches.push(std::vec![0u8; MAX_SECTOR_SIZE]);
+        }
+
+        let mut chain_states = ChainStates::default();
+        let mut chain_config = ChainConfig::new();
+        chain_config.magic = ChainConfig::MAGIC;
+        chain_config.version = ChainConfig::VERSION;
+        chain_config.device_count = devices.len() as u32;
+
+        let mut bytes_read = 0u64;
+        for (i, d) in devices.iter().enumerate() {
+            chain_config.devices[i].format = d.format as u32;
+            chain_config.devices[i].data_device_idx = 0;
+            if matches!(d.format, ImageFormat::Vhdx) {
+                let cap = unsafe { (call_table.get_input_capacity)(i as u32) };
+                let bat_buf = caches[i * 2].as_mut_ptr();
+                let data_buf = caches[i * 2 + 1].as_mut_ptr();
+                chain_states.vhdx_states[i] = unsafe {
+                    VhdxState::init(
+                        &call_table,
+                        i as u32,
+                        sector_size,
+                        cap,
+                        bat_buf,
+                        data_buf,
+                        &mut bytes_read,
+                    )
+                };
+                assert!(
+                    chain_states.vhdx_states[i].is_some(),
+                    "VhdxState::init should succeed for a valid synthetic image (device {i})"
+                );
+            }
+        }
+
+        let mut compressed_buf = std::vec![0u8; COMPRESSED_BUF_SIZE];
+        let mut staging_buf = std::vec![0u8; MAX_CLUSTER_SIZE];
+        let mut staging_cluster_offset = u64::MAX;
+
+        let mut out = std::vec![0xAAu8; chunk_size as usize];
+        let ok = unsafe {
+            read_chain_virtual_cluster(
+                &call_table,
+                0,
+                devices.len(),
+                virtual_offset,
+                out.as_mut_ptr(),
+                chunk_size,
+                sector_size,
+                &chain_config,
+                &mut chain_states,
+                compressed_buf.as_mut_ptr(),
+                staging_buf.as_mut_ptr(),
+                &mut staging_cluster_offset,
+                None,
+                None,
+                0,
+                &mut bytes_read,
+            )
+        };
+        unsafe {
+            let imgs = core::ptr::addr_of_mut!(VHDX_IMAGES) as *mut *const u8;
+            for i in 0..VHDX_MAX_DEVS {
+                *imgs.add(i) = core::ptr::null();
+            }
+        }
+        (ok, out)
+    }
+
+    /// The chunk size every composing test reads: 64 KiB, which is 128
+    /// logical sectors and so sixteen bitmap bytes at a 512-byte logical
+    /// sector size.
+    #[cfg(feature = "vhdx-input")]
+    const VHDX_CHUNK: u64 = 64 * 1024;
+
+    /// A differencing child and a raw backing device, the shape most of
+    /// the composing tests below drive.
+    #[cfg(feature = "vhdx-input")]
+    fn vhdx_chain_with_parent(child: std::vec::Vec<u8>, parent_len: usize) -> [VhdxDevice; 2] {
+        [
+            VhdxDevice {
+                bytes: child,
+                format: ImageFormat::Vhdx,
+            },
+            VhdxDevice {
+                bytes: build_vhdx_parent_raw(parent_len),
+                format: ImageFormat::Raw,
+            },
+        ]
+    }
+
+    /// A lone differencing child with nothing behind it.
+    #[cfg(feature = "vhdx-input")]
+    fn vhdx_chain_alone(child: std::vec::Vec<u8>) -> [VhdxDevice; 1] {
+        [VhdxDevice {
+            bytes: child,
+            format: ImageFormat::Vhdx,
+        }]
+    }
+
+    // A partially present block whose bitmap gives every sector to the
+    // child reads entirely from the child's payload. Were this to fail,
+    // the composition would be serving the parent for sectors the child
+    // holds, losing every write the child ever made.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_arm_wholly_child_owned_block_reads_from_the_child() {
+        let child_sectors = [0u32..2048];
+        let fixture = build_vhdx_image(
+            512,
+            true,
+            1,
+            &[(0, VhdxBlockState::PartiallyPresent)],
+            &[VhdxGroupBitmap {
+                group: 0,
+                state: vhdx::SB_BLOCK_PRESENT,
+                child_sectors: &child_sectors,
+            }],
+        );
+        let payload = fixture.block_offsets[0];
+        let devices = vhdx_chain_with_parent(fixture.bytes, 2 * 1024 * 1024);
+        let (ok, out) = run_vhdx_chain_read(&devices, 512, 0, VHDX_CHUNK);
+        assert!(ok, "a wholly child-owned chunk must read");
+        assert_eq!(
+            out,
+            vhdx_expected(0, VHDX_CHUNK, payload, 512, &child_sectors),
+            "every sector the bitmap gives to the child must come from the \
+             child's own payload"
+        );
+    }
+
+    // The mirror image: a partially present block whose bitmap gives no
+    // sector to the child reads entirely from the device behind it. Were
+    // this to fail, the child's payload -- which for such a block holds
+    // nothing the image ever wrote -- would be served as data.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_arm_wholly_parent_owned_block_reads_from_the_parent() {
+        let child_sectors: [core::ops::Range<u32>; 0] = [];
+        let fixture = build_vhdx_image(
+            512,
+            true,
+            1,
+            &[(0, VhdxBlockState::PartiallyPresent)],
+            &[VhdxGroupBitmap {
+                group: 0,
+                state: vhdx::SB_BLOCK_PRESENT,
+                child_sectors: &child_sectors,
+            }],
+        );
+        let payload = fixture.block_offsets[0];
+        let devices = vhdx_chain_with_parent(fixture.bytes, 2 * 1024 * 1024);
+        let (ok, out) = run_vhdx_chain_read(&devices, 512, 0, VHDX_CHUNK);
+        assert!(ok, "a wholly parent-owned chunk must read");
+        assert_eq!(
+            out,
+            vhdx_expected(0, VHDX_CHUNK, payload, 512, &child_sectors),
+            "a chunk the bitmap leaves wholly to the parent must come from \
+             the device behind the child"
+        );
+    }
+
+    // A bitmap that changes owner part way through the chunk. The ranges
+    // are deliberately asymmetric within their bitmap bytes: a bit order
+    // read from the wrong end would select a different set of sectors
+    // and the comparison would fail, which is the whole point, because
+    // VHDX numbers bitmap bits from the least significant bit and VHD
+    // from the most.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_arm_mixed_block_reads_each_sector_from_the_right_device() {
+        let child_sectors = [1u32..4, 9..14, 70..133];
+        let fixture = build_vhdx_image(
+            512,
+            true,
+            1,
+            &[(0, VhdxBlockState::PartiallyPresent)],
+            &[VhdxGroupBitmap {
+                group: 0,
+                state: vhdx::SB_BLOCK_PRESENT,
+                child_sectors: &child_sectors,
+            }],
+        );
+        let payload = fixture.block_offsets[0];
+        let devices = vhdx_chain_with_parent(fixture.bytes, 2 * 1024 * 1024);
+        let (ok, out) = run_vhdx_chain_read(&devices, 512, 0, VHDX_CHUNK);
+        assert!(ok, "a mixed chunk must read");
+        assert_eq!(
+            out,
+            vhdx_expected(0, VHDX_CHUNK, payload, 512, &child_sectors),
+            "each logical sector of a mixed chunk must be served from the \
+             device its bitmap bit names"
+        );
+    }
+
+    // The shape of a real small differencing image, and of the project's
+    // own VHDX differencing fixture: a 16 MiB disk, which at a 1 MiB
+    // block size and 512-byte logical sectors is sixteen payload blocks
+    // and so a small fraction of one 4096-block chunk group. The group's
+    // sector bitmap entry sits at BAT entry 4096 regardless, far past
+    // the seventeen entries an image with no parent would need, so a
+    // reader that bounds the bitmap lookup by that shorter count cannot
+    // resolve the ownership of any block in this image at all.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_arm_mixed_block_in_a_partial_chunk_group() {
+        // Block 5 begins at virtual 5 MiB, which is the chunk group's
+        // sector 10240; the ranges are asymmetric within their bitmap
+        // bytes for the same reason the whole-group mixed case above
+        // makes them so.
+        let child_sectors = [10241u32..10244, 10249..10254, 10310..10373];
+        let fixture = build_vhdx_image_blocks(
+            512,
+            true,
+            16,
+            &[(5, VhdxBlockState::PartiallyPresent)],
+            &[VhdxGroupBitmap {
+                group: 0,
+                state: vhdx::SB_BLOCK_PRESENT,
+                child_sectors: &child_sectors,
+            }],
+        );
+        let payload = fixture.block_offsets[0];
+        let devices = vhdx_chain_with_parent(fixture.bytes, 16 * 1024 * 1024);
+        let offset = 5 * u64::from(VHDX_FIX_BLOCK_SIZE);
+        let (ok, out) = run_vhdx_chain_read(&devices, 512, offset, VHDX_CHUNK);
+        assert!(
+            ok,
+            "a mixed chunk in a disk shorter than one chunk group must read"
+        );
+        assert_eq!(
+            out,
+            vhdx_expected(offset, VHDX_CHUNK, payload, 512, &child_sectors),
+            "a partial final chunk group's sector bitmap must still be \
+             reachable, so each sector comes from the device its bit names"
+        );
+    }
+
+    // The same mixed case on an image whose logical sectors are 4096
+    // bytes, read through a device whose sectors are 512. The bitmap's
+    // granule is the image's logical sector and not the device's, so
+    // every bit here describes eight times as much data as it does
+    // above; measuring the bitmap in device sectors instead would hand
+    // back a different set of bytes.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_arm_mixed_block_at_a_four_kilobyte_logical_sector_size() {
+        let child_sectors = [1u32..4, 9..14];
+        let fixture = build_vhdx_image(
+            4096,
+            true,
+            1,
+            &[(0, VhdxBlockState::PartiallyPresent)],
+            &[VhdxGroupBitmap {
+                group: 0,
+                state: vhdx::SB_BLOCK_PRESENT,
+                child_sectors: &child_sectors,
+            }],
+        );
+        let payload = fixture.block_offsets[0];
+        let devices = vhdx_chain_with_parent(fixture.bytes, 2 * 1024 * 1024);
+        let (ok, out) = run_vhdx_chain_read(&devices, 512, 0, VHDX_CHUNK);
+        assert!(ok, "a mixed chunk with 4096-byte logical sectors must read");
+        assert_eq!(
+            out,
+            vhdx_expected(0, VHDX_CHUNK, payload, 4096, &child_sectors),
+            "ownership must be measured in the image's own logical sectors, \
+             not the device's"
+        );
+    }
+
+    // An ownership run that starts in one bitmap byte and ends in the
+    // next. A coalescer that never advances past its first bitmap byte
+    // ends the run at sector 8 and serves the rest from the wrong
+    // device.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_arm_ownership_run_crossing_a_bitmap_byte_boundary() {
+        // Sectors 5..12: bits 5, 6 and 7 of the first bitmap byte and
+        // bits 0..4 of the second.
+        let child_sectors = [5u32..12];
+        let fixture = build_vhdx_image(
+            512,
+            true,
+            1,
+            &[(0, VhdxBlockState::PartiallyPresent)],
+            &[VhdxGroupBitmap {
+                group: 0,
+                state: vhdx::SB_BLOCK_PRESENT,
+                child_sectors: &child_sectors,
+            }],
+        );
+        let payload = fixture.block_offsets[0];
+        let devices = vhdx_chain_with_parent(fixture.bytes, 2 * 1024 * 1024);
+        let (ok, out) = run_vhdx_chain_read(&devices, 512, 0, VHDX_CHUNK);
+        assert!(
+            ok,
+            "a chunk whose ownership run spans two bitmap bytes must read"
+        );
+        assert_eq!(
+            out,
+            vhdx_expected(0, VHDX_CHUNK, payload, 512, &child_sectors),
+            "an ownership run spanning two bitmap bytes must be served as one \
+             run from the right device"
+        );
+    }
+
+    // A block that is not the first of its chunk group. VHDX numbers
+    // bitmap bits from the group's first byte rather than the block's,
+    // so block 1's sectors are described by bits 2048 onwards. Reading
+    // this block against bits 0 onwards would answer with block 0's
+    // ownership, which this fixture makes wholly the child's so that the
+    // mistake is visible in every byte of the chunk.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_arm_block_later_in_a_chunk_group_uses_its_own_bitmap_bits() {
+        let child_sectors = [0u32..2048, 2049..2052, 2057..2062];
+        let fixture = build_vhdx_image(
+            512,
+            true,
+            1,
+            &[
+                (0, VhdxBlockState::PartiallyPresent),
+                (1, VhdxBlockState::PartiallyPresent),
+            ],
+            &[VhdxGroupBitmap {
+                group: 0,
+                state: vhdx::SB_BLOCK_PRESENT,
+                child_sectors: &child_sectors,
+            }],
+        );
+        let payload = fixture.block_offsets[1];
+        let devices = vhdx_chain_with_parent(fixture.bytes, 4 * 1024 * 1024);
+        let block_size = u64::from(VHDX_FIX_BLOCK_SIZE);
+        let (ok, out) = run_vhdx_chain_read(&devices, 512, block_size, VHDX_CHUNK);
+        assert!(ok, "a block later in its chunk group must read");
+        assert_eq!(
+            out,
+            vhdx_expected(block_size, VHDX_CHUNK, payload, 512, &child_sectors),
+            "a block's ownership must be read from the bitmap bits numbered \
+             across its chunk group, not from the group's first bits"
+        );
+    }
+
+    // A block in the second chunk group. Its sector bitmap entry is not
+    // the one the first group's is, and the only thing that distinguishes
+    // the two is the group stride of chunk_ratio + 1 entries: without the
+    // stride, the lookup lands on a payload entry instead and the read
+    // fails. Nothing behind the child, because the block sits 4 GiB into
+    // the virtual disk and no mock backing device reaches that far; the
+    // chunk is wholly the child's, which needs no parent.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_arm_block_in_the_second_chunk_group_finds_its_own_bitmap() {
+        let child_sectors = [0u32..128];
+        let chunk_ratio = vhdx_chunk_ratio(512);
+        let fixture = build_vhdx_image(
+            512,
+            true,
+            2,
+            &[(chunk_ratio, VhdxBlockState::PartiallyPresent)],
+            &[VhdxGroupBitmap {
+                group: 1,
+                state: vhdx::SB_BLOCK_PRESENT,
+                child_sectors: &child_sectors,
+            }],
+        );
+        let payload = fixture.block_offsets[0];
+        let devices = vhdx_chain_alone(fixture.bytes);
+        let group_bytes = chunk_ratio * u64::from(VHDX_FIX_BLOCK_SIZE);
+        let (ok, out) = run_vhdx_chain_read(&devices, 512, group_bytes, VHDX_CHUNK);
+        assert!(
+            ok,
+            "a block in the second chunk group must find its sector bitmap"
+        );
+        assert_eq!(
+            out,
+            vhdx_expected(group_bytes, VHDX_CHUNK, payload, 512, &child_sectors),
+            "a chunk group's sector bitmap entry must be found at the group's \
+             own stride through the BAT"
+        );
+    }
+
+    // "Absent" and "explicitly zero" are opposite answers for a
+    // differencing child: an absent block's data lives in the parent, a
+    // zeroed one's is zeros and the parent must not be consulted. If
+    // these two ever give the same answer again, one of the two kinds of
+    // block reads as the other's data.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_arm_zero_and_absent_blocks_differ_for_a_differencing_child() {
+        let fixture = build_vhdx_image(
+            512,
+            true,
+            1,
+            &[(0, VhdxBlockState::Zero), (1, VhdxBlockState::NotPresent)],
+            &[],
+        );
+        let devices = vhdx_chain_with_parent(fixture.bytes, 4 * 1024 * 1024);
+        let block_size = u64::from(VHDX_FIX_BLOCK_SIZE);
+
+        let (ok, out) = run_vhdx_chain_read(&devices, 512, 0, VHDX_CHUNK);
+        assert!(ok, "an explicitly zeroed block must read");
+        assert_eq!(
+            out,
+            std::vec![0u8; VHDX_CHUNK as usize],
+            "an explicitly zeroed block is an answer about the data: it must \
+             read as zeros and not consult the parent"
+        );
+
+        let (ok, out) = run_vhdx_chain_read(&devices, 512, block_size, VHDX_CHUNK);
+        assert!(ok, "an absent block must read");
+        let want: std::vec::Vec<u8> = (0..VHDX_CHUNK)
+            .map(|i| vhdx_parent_byte(block_size + i))
+            .collect();
+        assert_eq!(
+            out, want,
+            "an absent block of a differencing child holds the parent's data, \
+             not zeros"
+        );
+    }
+
+    // Bottom of a differencing chain, absent block. The walk's shared
+    // zero-fill tail would report success on the child's own zeros as
+    // though they were the parent's data; a differencing child with
+    // nothing behind it is a broken image and must fail instead.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_arm_absent_block_fails_without_a_following_device() {
+        let fixture = build_vhdx_image(512, true, 1, &[(0, VhdxBlockState::NotPresent)], &[]);
+        let devices = vhdx_chain_alone(fixture.bytes);
+        let (ok, _out) = run_vhdx_chain_read(&devices, 512, 0, VHDX_CHUNK);
+        assert!(
+            !ok,
+            "an absent block of a differencing child with nothing behind it \
+             has nowhere to read from and must fail, not zero-fill"
+        );
+    }
+
+    // Bottom of a differencing chain, wholly parent-owned chunk. Same
+    // reasoning: zeros here would be wrong data reported as success.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_arm_all_parent_owned_chunk_fails_without_a_following_device() {
+        let child_sectors: [core::ops::Range<u32>; 0] = [];
+        let fixture = build_vhdx_image(
+            512,
+            true,
+            1,
+            &[(0, VhdxBlockState::PartiallyPresent)],
+            &[VhdxGroupBitmap {
+                group: 0,
+                state: vhdx::SB_BLOCK_PRESENT,
+                child_sectors: &child_sectors,
+            }],
+        );
+        let devices = vhdx_chain_alone(fixture.bytes);
+        let (ok, _out) = run_vhdx_chain_read(&devices, 512, 0, VHDX_CHUNK);
+        assert!(
+            !ok,
+            "a chunk the bitmap leaves wholly to the parent must fail when no \
+             device follows the child"
+        );
+    }
+
+    // Bottom of a differencing chain, mixed chunk. The child's own runs
+    // could be served, but the parent's could not, and a partly-filled
+    // buffer returned as success is the same wrong read.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_arm_mixed_chunk_fails_without_a_following_device() {
+        let child_sectors = [1u32..4, 9..14];
+        let fixture = build_vhdx_image(
+            512,
+            true,
+            1,
+            &[(0, VhdxBlockState::PartiallyPresent)],
+            &[VhdxGroupBitmap {
+                group: 0,
+                state: vhdx::SB_BLOCK_PRESENT,
+                child_sectors: &child_sectors,
+            }],
+        );
+        let devices = vhdx_chain_alone(fixture.bytes);
+        let (ok, _out) = run_vhdx_chain_read(&devices, 512, 0, VHDX_CHUNK);
+        assert!(
+            !ok,
+            "a mixed chunk must fail when the parent's share of it has no \
+             device to come from"
+        );
+    }
+
+    // A partially present block whose chunk group's sector bitmap entry
+    // says the bitmap is not present. The image has promised a block
+    // shared with its parent and then withheld the only thing that says
+    // which sectors are whose, so there is no safe guess in either
+    // direction. The same fixture with the bitmap present reads, which
+    // is what shows the refusal is the bitmap state and not a broken
+    // fixture.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_arm_absent_sector_bitmap_fails_the_read() {
+        let child_sectors = [1u32..4, 9..14];
+        for (state, should_read, label) in [
+            (vhdx::SB_BLOCK_NOT_PRESENT, false, "an absent sector bitmap"),
+            (vhdx::SB_BLOCK_PRESENT, true, "a present sector bitmap"),
+        ] {
+            let fixture = build_vhdx_image(
+                512,
+                true,
+                1,
+                &[(0, VhdxBlockState::PartiallyPresent)],
+                &[VhdxGroupBitmap {
+                    group: 0,
+                    state,
+                    child_sectors: &child_sectors,
+                }],
+            );
+            let devices = vhdx_chain_with_parent(fixture.bytes, 2 * 1024 * 1024);
+            let (ok, _out) = run_vhdx_chain_read(&devices, 512, 0, VHDX_CHUNK);
+            assert_eq!(
+                ok, should_read,
+                "a partially present block is readable only when the bitmap \
+                 that says which sectors are whose is present: {label}"
+            );
+        }
+    }
+
+    // A chunk reaching past the end of the payload block its bitmap bits
+    // describe. The next block's payload need not follow this one in the
+    // file and its sectors are described by bits this lookup never
+    // resolved, so the tail has neither a stated owner nor a contiguous
+    // source. The chunk that ends exactly at the block boundary must
+    // still read, which is what keeps the cap from being off by one.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_arm_chunk_reaching_past_its_payload_block_is_refused() {
+        let child_sectors = [0u32..4096];
+        let fixture = build_vhdx_image(
+            512,
+            true,
+            1,
+            &[
+                (0, VhdxBlockState::PartiallyPresent),
+                (1, VhdxBlockState::PartiallyPresent),
+            ],
+            &[VhdxGroupBitmap {
+                group: 0,
+                state: vhdx::SB_BLOCK_PRESENT,
+                child_sectors: &child_sectors,
+            }],
+        );
+        let payload = fixture.block_offsets[0];
+        let devices = vhdx_chain_with_parent(fixture.bytes, 4 * 1024 * 1024);
+        let block_size = u64::from(VHDX_FIX_BLOCK_SIZE);
+
+        let flush = block_size - VHDX_CHUNK;
+        let (ok, out) = run_vhdx_chain_read(&devices, 512, flush, VHDX_CHUNK);
+        assert!(ok, "a chunk ending exactly at the block boundary must read");
+        assert_eq!(
+            out,
+            vhdx_expected(flush, VHDX_CHUNK, payload, 512, &child_sectors),
+            "a chunk ending exactly at the block boundary is wholly described \
+             by that block's bitmap bits and must be served from it"
+        );
+
+        let straddling = block_size - VHDX_CHUNK / 2;
+        let (ok, _out) = run_vhdx_chain_read(&devices, 512, straddling, VHDX_CHUNK);
+        assert!(
+            !ok,
+            "a chunk reaching past the end of the payload block its bitmap \
+             describes must be refused, not served from the next block"
+        );
+    }
+
+    /// FNV-1a over a read's bytes, so the regression guard below can
+    /// state what it saw in one line rather than in 64 KiB of them.
+    #[cfg(feature = "vhdx-input")]
+    fn vhdx_fnv1a(bytes: &[u8]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in bytes {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+
+    // THE REGRESSION GUARD: an image with no parent must read exactly as
+    // it did before "absent" and "explicitly zero" became different
+    // answers. For such an image they are the same answer, because it
+    // has no parent to consult, and the arm must not have acquired a new
+    // opinion about either.
+    //
+    // The digests are the byte-for-byte record, so that the comparison
+    // against a build made before the split is a single line rather than
+    // five buffers. Four of the five reads are identical across that
+    // change. The third is not: an explicitly zeroed block with a device
+    // behind it used to descend to that device and now reads as zeros.
+    // No chain a host builds can ask for it -- an image with no parent
+    // has no backing file to put behind it -- and it is driven here to
+    // pin the new answer rather than leave it untested.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_arm_parentless_image_reads_as_a_plain_dynamic_vhdx() {
+        let fixture = build_vhdx_image(
+            512,
+            false,
+            1,
+            &[
+                (0, VhdxBlockState::FullyPresent),
+                (1, VhdxBlockState::NotPresent),
+                (2, VhdxBlockState::Zero),
+            ],
+            &[],
+        );
+        let payload = fixture.block_offsets[0];
+        let block_size = u64::from(VHDX_FIX_BLOCK_SIZE);
+        let devices = vhdx_chain_with_parent(fixture.bytes.clone(), 4 * 1024 * 1024);
+        let lone = vhdx_chain_alone(fixture.bytes);
+        let mut digests = [0u64; 5];
+
+        let (ok, out) = run_vhdx_chain_read(&devices, 512, 0, VHDX_CHUNK);
+        assert!(ok, "a fully present block must read");
+        let want: std::vec::Vec<u8> = (0..VHDX_CHUNK)
+            .map(|i| vhdx_child_byte(payload + i))
+            .collect();
+        assert_eq!(
+            out, want,
+            "a fully present block must be served from the image's own payload"
+        );
+        digests[0] = vhdx_fnv1a(&out);
+
+        let (ok, out) = run_vhdx_chain_read(&devices, 512, block_size, VHDX_CHUNK);
+        assert!(ok, "an absent block must descend when a device follows");
+        let want: std::vec::Vec<u8> = (0..VHDX_CHUNK)
+            .map(|i| vhdx_parent_byte(block_size + i))
+            .collect();
+        assert_eq!(
+            out, want,
+            "an absent block must be served from the device behind it"
+        );
+        digests[1] = vhdx_fnv1a(&out);
+
+        let (ok, out) = run_vhdx_chain_read(&devices, 512, 2 * block_size, VHDX_CHUNK);
+        assert!(ok, "an explicitly zeroed block must read");
+        assert_eq!(
+            out,
+            std::vec![0u8; VHDX_CHUNK as usize],
+            "an explicitly zeroed block reads as zeros"
+        );
+        digests[2] = vhdx_fnv1a(&out);
+
+        let (ok, out) = run_vhdx_chain_read(&lone, 512, block_size, VHDX_CHUNK);
+        assert!(
+            ok,
+            "a lone image's absent block must zero-fill rather than fail"
+        );
+        assert_eq!(
+            out,
+            std::vec![0u8; VHDX_CHUNK as usize],
+            "an image with no parent has nothing behind it, so an absent block \
+             is zeros and must not fail the read"
+        );
+        digests[3] = vhdx_fnv1a(&out);
+
+        let (ok, out) = run_vhdx_chain_read(&lone, 512, 2 * block_size, VHDX_CHUNK);
+        assert!(ok, "a lone image's zeroed block must read");
+        assert_eq!(
+            out,
+            std::vec![0u8; VHDX_CHUNK as usize],
+            "an explicitly zeroed block of a lone image reads as zeros"
+        );
+        digests[4] = vhdx_fnv1a(&out);
+
+        assert_eq!(
+            digests[..],
+            VHDX_PARENTLESS_READS[..],
+            "a parentless image's reads must be byte-for-byte what they were \
+             before absent and zero became different answers"
+        );
+    }
+
+    /// FNV-1a digests of the five reads the regression guard above makes,
+    /// in order, as captured from a build made before "absent" and
+    /// "explicitly zero" became different answers. Only the third --
+    /// an explicitly zeroed block with a device behind it -- was
+    /// recaptured afterwards; see the test.
+    #[cfg(feature = "vhdx-input")]
+    const VHDX_PARENTLESS_READS: [u64; 5] = [
+        0x401b_a8f1_a2e6_544c,
+        0x5959_4483_6920_9f05,
+        0xeb05_052e_a5b6_2325,
+        0xeb05_052e_a5b6_2325,
+        0xeb05_052e_a5b6_2325,
+    ];
+
+    // Everything the composing arm above does is unreachable in a
+    // shipped binary, and that claim rests entirely on this: a
+    // differencing VHDX never gets past `init_chain_states`, so no
+    // operation ever reaches the arm. Nothing else pins it.
+    //
+    // Three things are asserted, because the first alone is worth
+    // little. `init_chain_states` returns a bare `bool`, so "it
+    // returned false" is satisfied by a mistyped header, a mis-sized
+    // cache or a stub call-table entry that happens to fail -- the
+    // refusal would read as proven while never having fired. The
+    // operation marker and status say it fired, and say which format
+    // it named; the dynamic controls say the fixture, the cache and
+    // the mock are sound, so the refusal assertions are measuring the
+    // refusal and not a broken harness.
+    //
+    // The device-count dimension rules out a narrower refusal. A
+    // tempting form, `state.has_parent && dev_idx + 1 >= device_count`,
+    // refuses a lone child and admits one with a device behind it, and
+    // a single-device test cannot tell it from the unconditional rule.
+    // It is unsafe: `device_count` bounds a flat array, not a chain --
+    // `compare diff.vhdx base.raw` packs two independent chains into
+    // one array -- so a differencing child at index 0 with
+    // `device_count` 2 has no parent behind it at all, and that form
+    // would have composed it against an unrelated image (issue #614).
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_init_refuses_a_differencing_child_and_admits_a_dynamic_one() {
+        for (has_parent, device_count, refused, label) in [
+            (true, 1u32, true, "a lone differencing device"),
+            (
+                true,
+                2u32,
+                true,
+                "a differencing device at index 0 of a two-device array",
+            ),
+            // The controls. One metadata flag differs from the cases
+            // above and nothing else does, so an assertion that passes
+            // because the synthetic image, the hand-built cache or a
+            // stub call-table entry is broken -- rather than because
+            // the refusal fired -- cannot pass here.
+            (false, 1u32, false, "a lone dynamic device"),
+            (
+                false,
+                2u32,
+                false,
+                "a dynamic device at index 0 of a two-device array",
+            ),
+        ] {
+            let _guard = VHDX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let fixture = build_vhdx_image(
+                512,
+                has_parent,
+                1,
+                &[(0, VhdxBlockState::FullyPresent)],
+                &[],
+            );
+            let img = fixture.bytes;
+            // The follower is a second, unrelated raw device, exactly as
+            // a two-image operation lays its arguments out. It is not
+            // this child's parent, which is the whole point.
+            let follower = build_vhdx_parent_raw(2 * 1024 * 1024);
+            unsafe {
+                VHDX_SSZ = 512;
+                let imgs = core::ptr::addr_of_mut!(VHDX_IMAGES) as *mut *const u8;
+                let lens = core::ptr::addr_of_mut!(VHDX_LENS) as *mut usize;
+                *imgs = img.as_ptr();
+                *lens = img.len();
+                *imgs.add(1) = follower.as_ptr();
+                *lens.add(1) = follower.len();
+            }
+            let call_table = vhdx_call_table();
+
+            let mut chain_states = ChainStates::default();
+            let mut chain_config = ChainConfig::new();
+            chain_config.magic = ChainConfig::MAGIC;
+            chain_config.version = ChainConfig::VERSION;
+            chain_config.device_count = device_count;
+            chain_config.devices[0].format = ImageFormat::Vhdx as u32;
+            if device_count > 1 {
+                chain_config.devices[1].format = ImageFormat::Raw as u32;
+            }
+
+            let mut cache = std::vec![0u8; 4 * MAX_SECTOR_SIZE];
+            let dynamic_bufs_start = cache.as_mut_ptr() as usize;
+            let mut bytes_read = 0u64;
+            vhdx_reset_errors();
+            let ok = unsafe {
+                init_chain_states(
+                    &call_table,
+                    &chain_config,
+                    &mut chain_states,
+                    device_count as usize,
+                    512,
+                    dynamic_bufs_start,
+                    0,
+                    0,
+                    &mut bytes_read,
+                )
+            };
+            unsafe {
+                let imgs = core::ptr::addr_of_mut!(VHDX_IMAGES) as *mut *const u8;
+                *imgs = core::ptr::null();
+                *imgs.add(1) = core::ptr::null();
+            }
+            let _ = &cache;
+            let (calls, op, status) = vhdx_last_error();
+            if refused {
+                assert!(!ok, "a differencing VHDX must fail chain init: {label}");
+                // Why it failed, not just that it did. `init_chain_states`
+                // returns a bare bool, so without this the assertion
+                // above is satisfied by any init failure at all.
+                assert_eq!(
+                    calls, 1,
+                    "the refusal must be raised on send_error exactly once: {label}"
+                );
+                assert_eq!(
+                    op,
+                    shared::DifferencingRefusal::OPERATION,
+                    "init must fail by raising the differencing refusal, not for \
+                     some unrelated reason: {label}"
+                );
+                assert_eq!(
+                    status,
+                    shared::DifferencingRefusal::STATUS_VHDX,
+                    "the refusal must name VHDX rather than VHD: {label}"
+                );
+            } else {
+                assert!(
+                    ok,
+                    "the same harness must initialise a VHDX with no parent, or \
+                     the refusal assertions prove nothing: {label}"
+                );
+                assert_eq!(calls, 0, "a dynamic VHDX must raise no refusal: {label}");
+            }
+        }
+    }
+
+    // ========================================================================
     // DMG chain-reader arm (read_chain_virtual_cluster ImageFormat::Dmg)
     //
     // Synthetic UDIF images ([data fork][xml plist w/ one mish][koly]) are
@@ -9404,6 +10741,277 @@ unsafe fn read_vhd_child_runs(
     true
 }
 
+/// What a differencing VHDX chunk's sector bitmap says about the chunk
+/// as a whole, decided before any payload byte is read.
+#[cfg(feature = "vhdx-input")]
+enum VhdxChunkOwnership {
+    /// Every sector the chunk touches belongs to this file, so the
+    /// chunk is served exactly as a fully present block's would be.
+    AllChild,
+    /// No sector the chunk touches belongs to this file.
+    AllParent,
+    /// Ownership changes part way through the chunk.
+    Mixed,
+}
+
+/// One run of equally-owned sectors, clipped to the part of a chunk
+/// that is still to be served.
+#[cfg(feature = "vhdx-input")]
+struct VhdxOwnershipRun {
+    /// `true` when the run's data lives in this file, `false` when it
+    /// must come from the parent image.
+    child_owned: bool,
+    /// Bytes of the chunk this run covers.
+    bytes: u64,
+    /// Logical sectors to advance the walk by.
+    sectors: u32,
+}
+
+/// Read the next run of equally-owned sectors covering a differencing
+/// VHDX chunk.
+///
+/// `sector` is the index, within the chunk group the bitmap describes,
+/// of the logical sector the unserved span starts in; `sector_byte` is
+/// the offset within that sector, non-zero only for a chunk that does
+/// not start on a logical sector boundary; and `remaining` is the
+/// chunk's unserved bytes.
+///
+/// Returns `None` when the sector bitmap cannot describe the span,
+/// including a chunk reaching past the sectors the bitmap block
+/// covers. A caller must treat that as a failed read: an undescribed
+/// sector has no owner, and inventing one is how a differencing image
+/// comes to read as silently wrong data.
+///
+/// # Safety
+///
+/// `call_table` must be valid, and `state`'s cache buffers must still
+/// be valid.
+#[cfg(feature = "vhdx-input")]
+unsafe fn next_vhdx_ownership_run(
+    call_table: &CallTable,
+    state: &mut VhdxState,
+    bitmap_host_offset: u64,
+    sector: u32,
+    sector_byte: u64,
+    remaining: u64,
+    sector_size: usize,
+    input_capacity: u64,
+    bytes_read: &mut u64,
+) -> Option<VhdxOwnershipRun> {
+    // Ownership bits count the image's own logical sectors -- 512 or
+    // 4096 bytes, a property of the image and not of the device it is
+    // read from, which is where VHDX parts company with VHD's fixed
+    // 512. That size lives on the VHDX state and is read from there
+    // rather than repeated here.
+    let logical_sector_size = u64::from(state.logical_sector_size);
+    // Round the span up to whole sectors. A zero sector size makes
+    // the subtraction fail rather than the division trap.
+    let wanted = u32::try_from(
+        sector_byte
+            .checked_add(remaining)?
+            .checked_add(logical_sector_size.checked_sub(1)?)?
+            .checked_div(logical_sector_size)?,
+    )
+    .ok()?;
+    let run = state.read_sector_bitmap_run(
+        call_table,
+        bitmap_host_offset,
+        sector,
+        wanted,
+        sector_size,
+        input_capacity,
+        bytes_read,
+    )?;
+    // The run begins `sector_byte` into its first sector, so it covers
+    // that much less of the chunk than its sector count suggests.
+    let run_bytes = u64::from(run.sectors)
+        .checked_mul(logical_sector_size)?
+        .checked_sub(sector_byte)?;
+    Some(VhdxOwnershipRun {
+        child_owned: run.child_owned,
+        bytes: run_bytes.min(remaining),
+        sectors: run.sectors,
+    })
+}
+
+/// Decide whether a differencing VHDX chunk is wholly this file's,
+/// wholly its parent's, or a mixture of the two.
+///
+/// Classifying before any payload I/O is what keeps the two whole-chunk
+/// cases -- which is what a real differencing image is almost entirely
+/// made of -- down to a single read each.
+///
+/// # Safety
+///
+/// As [`next_vhdx_ownership_run`].
+#[cfg(feature = "vhdx-input")]
+unsafe fn classify_vhdx_chunk_ownership(
+    call_table: &CallTable,
+    state: &mut VhdxState,
+    bitmap_host_offset: u64,
+    first_sector: u32,
+    first_sector_byte: u64,
+    chunk_size: u64,
+    sector_size: usize,
+    input_capacity: u64,
+    bytes_read: &mut u64,
+) -> Option<VhdxChunkOwnership> {
+    let mut sector = first_sector;
+    let mut sector_byte = first_sector_byte;
+    let mut served: u64 = 0;
+    let mut any_child = false;
+    let mut any_parent = false;
+
+    // The walk runs to the end of the chunk even once both answers are
+    // in, because it is not only a classification. A stretch of the
+    // chunk the bitmap cannot describe makes `next_vhdx_ownership_run`
+    // fail, and that failure is what refuses the read instead of
+    // inventing an owner for those sectors. `read_vhdx_child_runs`
+    // walks the same runs again and would refuse such a chunk by
+    // itself, so stopping here once `any_child && any_parent` would
+    // not change an answer today; it would leave one check where there
+    // are two, to save work bounded by the chunk's bitmap bytes -- 16
+    // per 64 KiB chunk of 512-byte sectors, all served from the
+    // per-device sector cache rather than a device read.
+    while served < chunk_size {
+        let run = next_vhdx_ownership_run(
+            call_table,
+            state,
+            bitmap_host_offset,
+            sector,
+            sector_byte,
+            chunk_size.checked_sub(served)?,
+            sector_size,
+            input_capacity,
+            bytes_read,
+        )?;
+        if run.child_owned {
+            any_child = true;
+        } else {
+            any_parent = true;
+        }
+        served = served.checked_add(run.bytes)?;
+        sector = sector.checked_add(run.sectors)?;
+        sector_byte = 0;
+    }
+
+    Some(if any_child && any_parent {
+        VhdxChunkOwnership::Mixed
+    } else if any_parent {
+        VhdxChunkOwnership::AllParent
+    } else {
+        // A zero-length chunk describes no sector and lands here too,
+        // which is right: the unchanged path it falls through to
+        // serves such a chunk exactly as it always has.
+        VhdxChunkOwnership::AllChild
+    })
+}
+
+/// Overwrite the runs of a chunk this file owns, in a buffer already
+/// filled from the parent image.
+///
+/// `host_byte_offset` is the payload offset the chunk's first byte
+/// lives at, as `block_lookup` reports it. A payload block is
+/// contiguous, and the caller has already refused a chunk that reaches
+/// past the end of one, so a run sits as far into the payload as it
+/// does into the chunk.
+///
+/// # Safety
+///
+/// As [`next_vhdx_ownership_run`]. `buf` must point to at least
+/// `chunk_size` writable bytes, and `scratch` to at least
+/// `sector_size`.
+#[cfg(feature = "vhdx-input")]
+unsafe fn read_vhdx_child_runs(
+    call_table: &CallTable,
+    state: &mut VhdxState,
+    device_idx: u32,
+    bitmap_host_offset: u64,
+    host_byte_offset: u64,
+    first_sector: u32,
+    first_sector_byte: u64,
+    buf: *mut u8,
+    chunk_size: u64,
+    sector_size: usize,
+    scratch: *mut u8,
+    input_capacity: u64,
+    bytes_read: &mut u64,
+) -> bool {
+    let mut sector = first_sector;
+    let mut sector_byte = first_sector_byte;
+    let mut served: u64 = 0;
+
+    while served < chunk_size {
+        let remaining = match chunk_size.checked_sub(served) {
+            Some(r) => r,
+            None => return false,
+        };
+        let run = match next_vhdx_ownership_run(
+            call_table,
+            state,
+            bitmap_host_offset,
+            sector,
+            sector_byte,
+            remaining,
+            sector_size,
+            input_capacity,
+            bytes_read,
+        ) {
+            Some(r) => r,
+            None => return false,
+        };
+
+        if run.child_owned {
+            let run_host = match host_byte_offset.checked_add(served) {
+                Some(o) => o,
+                None => return false,
+            };
+            // Sub-sector handling, applied per run: a VHDX payload
+            // block starts on a 1 MiB boundary, but a run inside it
+            // can start or end part way into a device sector whenever
+            // the image's logical sectors are smaller than the
+            // device's.
+            //
+            // Always read_offset_sectors, never read_cluster_sectors,
+            // even for an aligned run. Both are byte-accurate at any
+            // offset; the difference is where the partial-sector
+            // scratch lives. read_cluster_sectors puts a
+            // MAX_SECTOR_SIZE (64 KiB) buffer on the stack whenever a
+            // run is not a whole number of device sectors -- an
+            // aligned 2 KiB run on a 4 KiB-sector device, say -- and
+            // this is a per-run call inside a chain walker that
+            // recurses once per device, on a 4 MiB guest stack.
+            // read_offset_sectors takes the caller's scratch instead,
+            // and writes no more than `run.bytes`. No host test can
+            // tell the two apart, so the reason is recorded here
+            // rather than left to a reader to rediscover.
+            if !read_offset_sectors(
+                call_table,
+                device_idx,
+                run_host,
+                buf.add(served as usize),
+                run.bytes,
+                sector_size,
+                scratch,
+                bytes_read,
+            ) {
+                return false;
+            }
+        }
+
+        served = match served.checked_add(run.bytes) {
+            Some(s) => s,
+            None => return false,
+        };
+        sector = match sector.checked_add(run.sectors) {
+            Some(s) => s,
+            None => return false,
+        };
+        sector_byte = 0;
+    }
+    true
+}
+
 /// How many devices sit behind `chain_start + dev_offset` in a chain of
 /// `chain_len`.
 ///
@@ -9411,8 +11019,9 @@ unsafe fn read_vhd_child_runs(
 /// which the walk's own loop bound makes impossible. It is returned
 /// rather than asserted because every caller uses the answer to decide
 /// whether a sector the current device does not hold has anywhere to
-/// come from, and all three run in guest binaries built in release,
-/// where a `debug_assert` is absent and a wrapping subtraction would
+/// come from, and every one of them runs in guest binaries built in
+/// release, where a `debug_assert` is absent and a wrapping subtraction
+/// would
 /// hand back a chain length of nearly `usize::MAX` and recurse into
 /// devices that do not exist.
 #[inline]
@@ -9430,6 +11039,12 @@ fn devices_behind(chain_len: usize, dev_offset: usize) -> Option<usize> {
 ///   unallocated, try next device. A differencing child also consults the
 ///   block's sector bitmap, and descends for the runs of 512-byte sectors
 ///   the bitmap leaves to the parent image.
+/// - VHDX (with `vhdx-input` feature): perform BAT block lookup. An
+///   absent block tries the next device; an explicitly zeroed one does
+///   not, because that is an answer about the data. A differencing
+///   child also consults the chunk's sector bitmap for a partially
+///   present block, and descends for the runs of logical sectors the
+///   bitmap leaves to the parent image.
 /// - Raw/other: read sectors directly (base of chain).
 ///
 /// If all devices have the cluster unallocated, fills with zeros.
@@ -10271,23 +11886,254 @@ pub unsafe fn read_chain_virtual_cluster(
                     Some(s) => s,
                     None => return false,
                 };
-                match state.block_lookup(call_table, virtual_offset, sector_size, cap, bytes_read) {
-                    Some(VhdxBlockLookup::NotPresent) | Some(VhdxBlockLookup::Zero) => {
+
+                // "Not present" and "zero" are the same answer for an
+                // image with no parent, and opposite answers for a
+                // differencing child, so the flag that tells the two
+                // kinds of image apart is captured here and consulted
+                // below.
+                let has_parent = state.has_parent;
+                // The bitmap's granule is the image's logical sector,
+                // 512 or 4096 bytes, and not the device's.
+                let logical_sector_size = u64::from(state.logical_sector_size);
+
+                let lookup =
+                    state.block_lookup(call_table, virtual_offset, sector_size, cap, bytes_read);
+                // A partially present block is shared with the parent
+                // and must be composed before anything is read;
+                // `None` here is a block that is wholly this file's.
+                let (host_byte_offset, partial_block_bytes) = match lookup {
+                    Some(VhdxBlockLookup::NotPresent) => {
+                        // Absent, not zero: a differencing child means
+                        // the block's data lives in its parent, so
+                        // descending is right while a device still
+                        // follows. At the bottom of such a chain the
+                        // loop's zero-fill tail would hand back the
+                        // child's own zeros as though they were the
+                        // parent's data and report success on it
+                        // (issue #547), so the read fails instead. An
+                        // image with no parent never has a device
+                        // behind it and so always descends to that
+                        // tail, exactly as it did before.
+                        if has_parent {
+                            let remaining = match devices_behind(chain_len, dev_offset) {
+                                Some(r) => r,
+                                None => return false,
+                            };
+                            if remaining == 0 {
+                                return false;
+                            }
+                        }
                         continue;
                     }
-                    Some(VhdxBlockLookup::Present { host_byte_offset }) => {
-                        return read_cluster_sectors(
+                    Some(VhdxBlockLookup::Zero) => {
+                        // An answer about the data rather than about
+                        // this file: the block is zeros, and a parent
+                        // that holds something else at this offset
+                        // must not be consulted. For an image with no
+                        // parent this is the same zero-fill the walk's
+                        // tail would have produced.
+                        core::ptr::write_bytes(buf, 0, chunk_size as usize);
+                        return true;
+                    }
+                    Some(VhdxBlockLookup::Present { host_byte_offset }) => (host_byte_offset, None),
+                    Some(VhdxBlockLookup::PartiallyPresent {
+                        host_byte_offset,
+                        block_bytes_remaining,
+                    }) => (host_byte_offset, Some(block_bytes_remaining)),
+                    None => return false,
+                };
+
+                if let Some(block_bytes_remaining) = partial_block_bytes {
+                    // The bitmap bits resolved below describe sectors
+                    // of the one payload block this chunk starts in,
+                    // and the next block's payload need not follow it
+                    // in the file. A chunk reaching past the block
+                    // end therefore has neither a stated owner nor a
+                    // contiguous source for its tail, so refuse it
+                    // rather than read whatever happens to sit there.
+                    // The wholly present path below is not capped the
+                    // same way; issue #613 tracks that, and fixing it
+                    // is that issue's work rather than this path's.
+                    if chunk_size > block_bytes_remaining {
+                        return false;
+                    }
+
+                    // Where the chunk's sector bitmap lives, and which
+                    // of the chunk group's logical sectors this chunk
+                    // starts in. VHDX numbers bitmap bits across the
+                    // whole chunk group rather than from the block.
+                    let (bitmap_host_offset, first_sector) = {
+                        let state = match &mut chain_states.vhdx_states[dev_idx] {
+                            Some(s) => s,
+                            None => return false,
+                        };
+                        match state.sector_bitmap_lookup(
                             call_table,
-                            dev_idx as u32,
-                            host_byte_offset,
-                            buf,
+                            virtual_offset,
+                            sector_size,
+                            cap,
+                            bytes_read,
+                        ) {
+                            Some(l) => (l.bitmap_host_offset, l.sector_in_group),
+                            // The BAT promised a partially present
+                            // block and then withheld, or malformed,
+                            // the bitmap that says which of its
+                            // sectors are this file's. Nothing names
+                            // an owner, so nothing may be read as
+                            // one.
+                            None => return false,
+                        }
+                    };
+                    // Offset within the chunk's first logical sector.
+                    let first_sector_byte = match virtual_offset.checked_rem(logical_sector_size) {
+                        Some(b) => b,
+                        None => return false,
+                    };
+
+                    let ownership = {
+                        let state = match &mut chain_states.vhdx_states[dev_idx] {
+                            Some(s) => s,
+                            None => return false,
+                        };
+                        match classify_vhdx_chunk_ownership(
+                            call_table,
+                            state,
+                            bitmap_host_offset,
+                            first_sector,
+                            first_sector_byte,
                             chunk_size,
                             sector_size,
+                            cap,
                             bytes_read,
-                        );
+                        ) {
+                            Some(o) => o,
+                            None => return false,
+                        }
+                    };
+
+                    // Devices still behind this one. The value decides
+                    // whether a parent-owned sector has anywhere to
+                    // come from, so it fails closed rather than
+                    // wrapping if the loop bound ever stops holding.
+                    let remaining = match devices_behind(chain_len, dev_offset) {
+                        Some(r) => r,
+                        None => return false,
+                    };
+                    match ownership {
+                        // Wholly this file's: fall through to the read
+                        // a fully present block performs, unchanged.
+                        VhdxChunkOwnership::AllChild => {}
+                        VhdxChunkOwnership::AllParent => {
+                            if remaining > 0 {
+                                return read_chain_virtual_cluster(
+                                    call_table,
+                                    chain_start + dev_offset + 1,
+                                    remaining,
+                                    virtual_offset,
+                                    buf,
+                                    chunk_size,
+                                    sector_size,
+                                    chain_config,
+                                    chain_states,
+                                    compressed_buf,
+                                    staging_buf,
+                                    staging_cluster_offset,
+                                    aes_key,
+                                    luks_key,
+                                    luks_sector_size,
+                                    bytes_read,
+                                );
+                            }
+                            // No device behind the child, so a
+                            // parent-owned chunk has nowhere to come
+                            // from. Zero-filling here would hand the
+                            // child's own zeros back as though they
+                            // were the parent's data and report
+                            // success on it (issue #547), so the read
+                            // fails instead. The bottom of a
+                            // differencing chain is a broken image,
+                            // not the implied zero layer a qcow2 chain
+                            // ends in.
+                            return false;
+                        }
+                        VhdxChunkOwnership::Mixed => {
+                            // Fill the whole chunk from the parent
+                            // first, then overwrite the runs this file
+                            // owns. That descends once per chunk
+                            // rather than once per run, and it leaves
+                            // the chain below to decide -- including
+                            // to zero-fill -- whatever it cannot
+                            // serve.
+                            if remaining > 0 {
+                                if !read_chain_virtual_cluster(
+                                    call_table,
+                                    chain_start + dev_offset + 1,
+                                    remaining,
+                                    virtual_offset,
+                                    buf,
+                                    chunk_size,
+                                    sector_size,
+                                    chain_config,
+                                    chain_states,
+                                    compressed_buf,
+                                    staging_buf,
+                                    staging_cluster_offset,
+                                    aes_key,
+                                    luks_key,
+                                    luks_sector_size,
+                                    bytes_read,
+                                ) {
+                                    return false;
+                                }
+                            } else {
+                                // Same as the wholly parent-owned case
+                                // above: the parent's share of a mixed
+                                // chunk cannot be served, and zeros
+                                // would be wrong data reported as
+                                // success.
+                                return false;
+                            }
+                            let state = match &mut chain_states.vhdx_states[dev_idx] {
+                                Some(s) => s,
+                                None => return false,
+                            };
+                            // compressed_buf becomes the sub-sector
+                            // scratch here. The parent fill above has
+                            // finished with it -- its output is
+                            // already in buf -- so the reuse is safe
+                            // only in this order. Filling from the
+                            // parent after this call would both undo
+                            // the child's runs and clobber the scratch
+                            // mid-read.
+                            return read_vhdx_child_runs(
+                                call_table,
+                                state,
+                                dev_idx as u32,
+                                bitmap_host_offset,
+                                host_byte_offset,
+                                first_sector,
+                                first_sector_byte,
+                                buf,
+                                chunk_size,
+                                sector_size,
+                                compressed_buf,
+                                cap,
+                                bytes_read,
+                            );
+                        }
                     }
-                    None => return false,
                 }
+
+                return read_cluster_sectors(
+                    call_table,
+                    dev_idx as u32,
+                    host_byte_offset,
+                    buf,
+                    chunk_size,
+                    sector_size,
+                    bytes_read,
+                );
             }
             #[cfg(feature = "vdi-input")]
             ImageFormat::Vdi => {

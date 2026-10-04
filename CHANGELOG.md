@@ -23,6 +23,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and `map` still refuse a differencing source exactly as before — so
   this is not a user-visible change.
 
+- **The guest chain walker can compose a differencing VHDX's partially
+  present block against its parent.** It previously failed the read
+  outright; it now reads the block's sector bitmap and serves each
+  logical sector from whichever file owns it, recursing into the
+  parent for the sectors the child does not own. An absent block
+  descends to the parent; an explicitly zeroed block does not — the
+  two had previously been treated as the same case. This is a
+  crate-level change only: `init_chain_states` still refuses every
+  differencing VHDX unconditionally, so no operation reaches the
+  composing path — this is not a user-visible change.
+
 - **`instar info --chain` walks differencing VHD and VHDX parent chains.**
   It previously stopped at the child and reported the parent reference
   without following it. Now it walks the chain and reports each

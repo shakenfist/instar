@@ -368,8 +368,8 @@ records `instar-testdata <sha> (#pr)` and is audited there.
 | 9. Coverage fuzzing of the locator parsers | [PLAN-differencing-phase-09-fuzz.md](PLAN-differencing-phase-09-fuzz.md) | Complete | `044ad77` (#594) |
 | 10. Documentation | [PLAN-differencing-phase-10-docs.md](PLAN-differencing-phase-10-docs.md) | Complete | `036252f` (#598) |
 | 11. Composition: host chain discovery and `info --chain` | [PLAN-differencing-phase-11-chain-host.md](PLAN-differencing-phase-11-chain-host.md) | Complete | `c66f8b2` (#603) |
-| 12. Composition: guest VHD sector-bitmap read path | [PLAN-differencing-phase-12-vhd-compose.md](PLAN-differencing-phase-12-vhd-compose.md) | In progress | |
-| 13. Composition: guest VHDX sector-bitmap read path | PLAN-differencing-phase-13-vhdx-compose.md | Not started | |
+| 12. Composition: guest VHD sector-bitmap read path | [PLAN-differencing-phase-12-vhd-compose.md](PLAN-differencing-phase-12-vhd-compose.md) | Complete | `b4ae7fc` (#615) |
+| 13. Composition: guest VHDX sector-bitmap read path | [PLAN-differencing-phase-13-vhdx-compose.md](PLAN-differencing-phase-13-vhdx-compose.md) | In progress | |
 | 14. Composition: per-op rollout, replacing phase 4's refusals | PLAN-differencing-phase-14-op-rollout.md | Not started | |
 | 15. Composition: integration tests and fuzz | PLAN-differencing-phase-15-compose-tests.md | Not started | |
 | 16. Composition: documentation | PLAN-differencing-phase-16-compose-docs.md | Not started | |
@@ -500,7 +500,10 @@ rather than left as one phase to be split later, the way
   2026-09-30**, which found the guest chain walker already built
   and already carrying a VHD arm: `read_chain_virtual_cluster`
   (`src/crates/qcow2/src/lib.rs:7930`) dispatches per format at
-  `:8486`, `ChainStates` already holds `vhd_states` (`:9385`),
+  `:8486`, `ChainStates` already holds `vhd_states` (`:9385`)
+  -- every line number in this bullet is as it stood before phase
+  12, which added about 2,800 lines to that file; the two a phase
+  13 reader follows are corrected at the end of the bullet --
   and an unallocated BAT entry already descends to the next
   device -- which is the correct reading for a differencing
   child's wholly-parent-owned block. What is missing is the
@@ -510,7 +513,10 @@ rather than left as one phase to be split later, the way
   for the sub-ranges this device does not own. The phase 4
   refusal these phases were expected to relax is a single `if` in
   `init_chain_states` (`:9528` for VHD, `:9556` for VHDX), not a
-  guard inside either parser crate. **Falsified by phase 12's
+  guard inside either parser crate. **Post-phase-12 locations**,
+  for phase 13: the VHDX refusal is
+  `src/crates/qcow2/src/lib.rs:11298`, and the VHDX arm of
+  `read_chain_virtual_cluster` is `:10269`. **Falsified by phase 12's
   execution**: the planned condition -- lift the refusal when
   another device follows the child -- is unsafe, because
   `init_chain_states`'s `device_count` counts a flat, possibly
