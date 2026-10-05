@@ -23,9 +23,9 @@ shared::bump_allocator!();
 
 use shared::{
     is_all_zeros_ptr, should_report_progress, validate_call_table, verify_sector_sizes, CallTable,
-    ChainConfig, ConvertConfig, ImageFormat, ALLOC_HEAP_BASE, ARGON2_MEM_BASE, CALL_TABLE_ADDR,
-    CHAIN_CONFIG_ADDR, COMPRESSED_BUF_SIZE, MAX_CHAIN_DEVICES, MAX_CLUSTER_SIZE, MAX_SECTOR_SIZE,
-    OPERATION_CONFIG_ADDR, SCRATCH_MEM_BASE, SCRATCH_MEM_SIZE,
+    ChainConfig, ChainSegment, ConvertConfig, ImageFormat, ALLOC_HEAP_BASE, ARGON2_MEM_BASE,
+    CALL_TABLE_ADDR, CHAIN_CONFIG_ADDR, COMPRESSED_BUF_SIZE, MAX_CHAIN_DEVICES, MAX_CLUSTER_SIZE,
+    MAX_SECTOR_SIZE, OPERATION_CONFIG_ADDR, SCRATCH_MEM_BASE, SCRATCH_MEM_SIZE,
 };
 
 // LUKS key derivation is now in the luks crate
@@ -1008,12 +1008,22 @@ unsafe fn convert_luks_wrapped_qcow2(
     let orig_format = chain_config.devices[0].format;
     let orig_virtual_size = chain_config.devices[0].virtual_size;
     let orig_cluster_size = chain_config.devices[0].cluster_size;
+    let orig_segment_count = chain_config.segment_count;
+    let orig_segment = chain_config.segments[0];
 
     // Temporarily modify device 0 to look like QCOW2
     let chain_config_mut = &mut *(CHAIN_CONFIG_ADDR as *mut ChainConfig);
     chain_config_mut.devices[0].format = ImageFormat::Qcow2 as u32;
     chain_config_mut.devices[0].virtual_size = inner_virtual_size;
     chain_config_mut.devices[0].cluster_size = 1u32 << cluster_bits;
+    // The inner image is read as a one-device chain, so the
+    // segmentation must describe exactly that one slot. The host's
+    // segmentation describes the whole device array, which chain init
+    // would refuse against a device count of 1 -- and rightly: a
+    // segment naming devices the walk is not given is not a
+    // description of the walk.
+    chain_config_mut.segment_count = 1;
+    chain_config_mut.segments[0] = ChainSegment { first: 0, count: 1 };
 
     // Initialize QCOW2 chain states using the wrapped call table
     let mut chain_states = qcow2::ChainStates::default();
@@ -1036,6 +1046,8 @@ unsafe fn convert_luks_wrapped_qcow2(
         chain_config_mut.devices[0].format = orig_format;
         chain_config_mut.devices[0].virtual_size = orig_virtual_size;
         chain_config_mut.devices[0].cluster_size = orig_cluster_size;
+        chain_config_mut.segment_count = orig_segment_count;
+        chain_config_mut.segments[0] = orig_segment;
         (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
         return *bytes_read;
     }
@@ -1048,6 +1060,8 @@ unsafe fn convert_luks_wrapped_qcow2(
             chain_config_mut.devices[0].format = orig_format;
             chain_config_mut.devices[0].virtual_size = orig_virtual_size;
             chain_config_mut.devices[0].cluster_size = orig_cluster_size;
+            chain_config_mut.segment_count = orig_segment_count;
+            chain_config_mut.segments[0] = orig_segment;
             (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
             return *bytes_read;
         }
@@ -1200,6 +1214,8 @@ unsafe fn convert_luks_wrapped_qcow2(
     chain_config_mut.devices[0].format = orig_format;
     chain_config_mut.devices[0].virtual_size = orig_virtual_size;
     chain_config_mut.devices[0].cluster_size = orig_cluster_size;
+    chain_config_mut.segment_count = orig_segment_count;
+    chain_config_mut.segments[0] = orig_segment;
 
     result
 }

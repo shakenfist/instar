@@ -4724,6 +4724,77 @@ impl CommitResult {
 /// Maximum number of devices in a backing chain.
 pub const MAX_CHAIN_DEVICES: usize = 16;
 
+/// Maximum number of independent backing chains a single
+/// [`ChainConfig`] can describe. Equal to [`MAX_CHAIN_DEVICES`]
+/// because the degenerate case is one chain per device.
+pub const MAX_CHAIN_SEGMENTS: usize = MAX_CHAIN_DEVICES;
+
+/// One independent backing chain inside a [`ChainConfig`]'s device
+/// array.
+///
+/// The pair is exactly the `chain_start` / `chain_len` arguments the
+/// guest hands its chain reader for the slots in this range: the
+/// devices at `first .. first + count` are one chain, `first` is its
+/// top image, and no device outside the range is behind any device
+/// inside it. An external data file inserted into the middle of a
+/// chain's device run belongs to the chain it was inserted into, so
+/// it is covered by that chain's segment and counts as a device
+/// behind the image above it, which is what the reader's own
+/// arithmetic already assumes.
+///
+/// `device_count` alone cannot carry this: it bounds a flat array,
+/// and an operation reading two images at once packs both chains
+/// into that one array.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct ChainSegment {
+    /// Index in [`ChainConfig::devices`] of this chain's top image.
+    pub first: u32,
+
+    /// Number of devices in this chain, counting the top image.
+    /// Never zero in a config the guest accepts.
+    pub count: u32,
+}
+
+impl ChainSegment {
+    /// Create an empty segment.
+    pub const fn new() -> Self {
+        Self { first: 0, count: 0 }
+    }
+
+    /// True if `segments` tiles `[0, device_count)` exactly: at least
+    /// one segment, none of them empty, in ascending order, with no
+    /// gap and no overlap.
+    ///
+    /// Both halves of the ABI check against this one rule — the host
+    /// before it writes the config, the guest before it walks the
+    /// device array — so a segmentation the host considers sound
+    /// cannot be one the guest refuses.
+    ///
+    /// An empty slice is unsound rather than "one chain spanning
+    /// everything". That matters: all-zero segmentation is what a
+    /// host that never learned about segments leaves behind, so
+    /// treating it as a default would compose a differencing child
+    /// against whatever happened to follow it in the array, silently
+    /// and undetectably.
+    pub fn covers(segments: &[Self], device_count: usize) -> bool {
+        if segments.is_empty() {
+            return false;
+        }
+        let mut next = 0usize;
+        for seg in segments {
+            if seg.count == 0 || seg.first as usize != next {
+                return false;
+            }
+            next = match next.checked_add(seg.count as usize) {
+                Some(end) => end,
+                None => return false,
+            };
+        }
+        next == device_count
+    }
+}
+
 /// Information about a single device in the backing chain.
 ///
 /// This structure provides metadata about each image in the chain,
@@ -4807,9 +4878,15 @@ impl ChainDeviceInfo {
 /// - Device 0: top/primary image
 /// - Devices 1..N-1: backing files in order (closer to base = higher index)
 ///
+/// An operation that reads two images at once (`compare`, or `rebase`
+/// with a new backing chain) packs both chains into the one array, so
+/// `device_count` is a bound on the array and says nothing about how
+/// long any one device's chain is. `segments` is what says that; see
+/// [`ChainSegment`] and [`ChainConfig::segment_of`].
+///
 /// # Size and ConfigResult.len
 ///
-/// The actual struct size is 528 bytes, but `CHAIN_CONFIG_MAX_SIZE` is 1024
+/// The actual struct size is 720 bytes, but `CHAIN_CONFIG_MAX_SIZE` is 1024
 /// to allow room for future growth. Guest code should use `device_count`
 /// to determine how many device entries are valid, not `ConfigResult.len`.
 #[repr(C)]
@@ -4821,22 +4898,32 @@ pub struct ChainConfig {
     /// Number of devices in the chain (1 = no backing files)
     pub device_count: u32,
 
-    /// Structure version for future extensibility (currently 1)
+    /// Structure version for future extensibility (currently 3)
     pub version: u32,
 
-    /// Reserved for future use (flags, etc.)
-    pub _reserved: u32,
+    /// Number of valid entries in `segments`. Never zero in a config
+    /// the guest accepts: a host that has not stated the segmentation
+    /// has not described the chain.
+    pub segment_count: u32,
 
     /// Device information array (only first device_count entries are valid)
     pub devices: [ChainDeviceInfo; MAX_CHAIN_DEVICES],
+
+    /// The independent chains the device array holds, in device order
+    /// (only the first `segment_count` entries are valid). Together
+    /// they tile `[0, device_count)` exactly.
+    pub segments: [ChainSegment; MAX_CHAIN_SEGMENTS],
+
+    /// Reserved for future use (flags, etc.)
+    pub _reserved: [u8; 64],
 }
 
 impl ChainConfig {
     /// Magic value for chain config
     pub const MAGIC: u32 = 0x4348414E; // "CHAN"
 
-    /// Current structure version (2 = data_device_idx field)
-    pub const VERSION: u32 = 2;
+    /// Current structure version (3 = segment_count / segments fields)
+    pub const VERSION: u32 = 3;
 
     /// Create a new empty chain config
     pub const fn new() -> Self {
@@ -4844,14 +4931,75 @@ impl ChainConfig {
             magic: Self::MAGIC,
             device_count: 0,
             version: Self::VERSION,
-            _reserved: 0,
+            segment_count: 0,
             devices: [ChainDeviceInfo::new(); MAX_CHAIN_DEVICES],
+            segments: [ChainSegment::new(); MAX_CHAIN_SEGMENTS],
+            _reserved: [0; 64],
         }
     }
 
-    /// Check if config is valid (correct magic and has at least one device)
+    /// Create a config whose `device_count` devices form one chain:
+    /// device 0 is the top image and each following device is behind
+    /// the one before it. This is every operation that reads a single
+    /// image and its ancestors.
+    pub const fn single_chain(device_count: u32) -> Self {
+        let mut config = Self::new();
+        config.device_count = device_count;
+        config.segment_count = 1;
+        config.segments[0] = ChainSegment {
+            first: 0,
+            count: device_count,
+        };
+        config
+    }
+
+    /// Check if config is valid (correct magic, a version this build
+    /// understands, and at least one device).
+    ///
+    /// The version check is the whole of the skew defence. Operation
+    /// binaries are separate files the host loads at run time, so a
+    /// guest built against one layout can be handed a config written
+    /// in another; without this, a field added at an offset the guest
+    /// reads as something else is a silent misparse rather than a
+    /// refusal. Every guest reader gates on `is_valid`, so putting it
+    /// here covers all of them.
     pub fn is_valid(&self) -> bool {
-        self.magic == Self::MAGIC && self.device_count > 0
+        self.magic == Self::MAGIC && self.version == Self::VERSION && self.device_count > 0
+    }
+
+    /// The chain the device at `dev_idx` belongs to, or `None` if no
+    /// declared segment covers it.
+    ///
+    /// The returned pair is what the chain reader is handed for this
+    /// device, so a caller asking "how many devices are behind me"
+    /// through `count` and a chain-relative offset asks the identical
+    /// question the reader answers.
+    pub fn segment_of(&self, dev_idx: usize) -> Option<ChainSegment> {
+        let declared = (self.segment_count as usize).min(MAX_CHAIN_SEGMENTS);
+        for seg in &self.segments[..declared] {
+            let first = seg.first as usize;
+            if seg.count > 0 && dev_idx >= first && dev_idx - first < seg.count as usize {
+                return Some(*seg);
+            }
+        }
+        None
+    }
+
+    /// True if the declared segmentation tiles `[0, device_count)`
+    /// exactly, where `device_count` is the number of device slots
+    /// the caller is about to walk.
+    ///
+    /// Callers pass their own device count rather than reading
+    /// `self.device_count`, because an operation may walk a prefix of
+    /// the array (the LUKS-wrapped inner image in `convert`), and a
+    /// segmentation that covers the whole array would not describe
+    /// the prefix.
+    pub fn segmentation_covers(&self, device_count: usize) -> bool {
+        let declared = self.segment_count as usize;
+        if declared == 0 || declared > MAX_CHAIN_SEGMENTS {
+            return false;
+        }
+        ChainSegment::covers(&self.segments[..declared], device_count)
     }
 
     /// Get the number of devices in the chain
@@ -6935,5 +7083,145 @@ mod tests {
         // unpaired high surrogate D800.
         assert_eq!(utf16_to_utf8(&blob[..24], true, &mut out), None);
         assert_eq!(utf16_to_utf8(&blob[..24], false, &mut out), None);
+    }
+
+    #[test]
+    fn chain_config_layout_is_what_the_host_writes_by_hand() {
+        // The host writes these offsets one field at a time with
+        // `guest_mem.write_obj` rather than copying a struct, so the
+        // layout is an ABI and not an implementation detail. Measured
+        // rather than recomputed from the field list: an arithmetic
+        // comment cannot catch a reordered field or inserted padding.
+        assert_eq!(core::mem::size_of::<ChainSegment>(), 8);
+        assert_eq!(core::mem::align_of::<ChainSegment>(), 4);
+        assert_eq!(core::mem::size_of::<ChainDeviceInfo>(), 32);
+        assert_eq!(core::mem::size_of::<ChainConfig>(), 720);
+        assert_eq!(core::mem::align_of::<ChainConfig>(), 8);
+        assert!(
+            core::mem::size_of::<ChainConfig>() <= CHAIN_CONFIG_MAX_SIZE,
+            "ChainConfig is {} bytes, past the {} reserved at CHAIN_CONFIG_ADDR",
+            core::mem::size_of::<ChainConfig>(),
+            CHAIN_CONFIG_MAX_SIZE
+        );
+
+        let config = ChainConfig::new();
+        let base = &config as *const ChainConfig as usize;
+        let offset_of = |field: *const u8| field as usize - base;
+        assert_eq!(offset_of(&config.magic as *const u32 as *const u8), 0);
+        assert_eq!(
+            offset_of(&config.device_count as *const u32 as *const u8),
+            4
+        );
+        assert_eq!(offset_of(&config.version as *const u32 as *const u8), 8);
+        assert_eq!(
+            offset_of(&config.segment_count as *const u32 as *const u8),
+            12
+        );
+        assert_eq!(offset_of(config.devices.as_ptr() as *const u8), 16);
+        assert_eq!(offset_of(config.segments.as_ptr() as *const u8), 528);
+        assert_eq!(offset_of(config._reserved.as_ptr()), 656);
+    }
+
+    #[test]
+    fn chain_config_rejects_a_version_it_does_not_know() {
+        // Operation binaries are separate files loaded at run time, so
+        // a guest can be handed a config written by a host of another
+        // vintage. That must refuse, not misparse.
+        let mut config = ChainConfig::single_chain(1);
+        assert!(config.is_valid());
+        config.version = ChainConfig::VERSION - 1;
+        assert!(!config.is_valid(), "an older layout must not validate");
+        config.version = ChainConfig::VERSION + 1;
+        assert!(!config.is_valid(), "a newer layout must not validate");
+        config.version = ChainConfig::VERSION;
+        config.magic = 0;
+        assert!(!config.is_valid());
+    }
+
+    #[test]
+    fn single_chain_declares_one_chain_over_every_device() {
+        let config = ChainConfig::single_chain(3);
+        assert!(config.is_valid());
+        assert_eq!(config.segment_count, 1);
+        assert!(config.segmentation_covers(3));
+        for dev_idx in 0..3 {
+            let seg = config.segment_of(dev_idx).expect("device is in a chain");
+            assert_eq!((seg.first, seg.count), (0, 3));
+        }
+        assert!(config.segment_of(3).is_none());
+    }
+
+    #[test]
+    fn segment_of_tells_two_packed_chains_apart() {
+        // What `compare diff.vhdx base.raw` lays out: two unrelated
+        // images in one device array. Device 0 has nothing behind it
+        // even though device 1 exists.
+        let mut config = ChainConfig::new();
+        config.device_count = 3;
+        config.segment_count = 2;
+        config.segments[0] = ChainSegment { first: 0, count: 1 };
+        config.segments[1] = ChainSegment { first: 1, count: 2 };
+        assert!(config.segmentation_covers(3));
+
+        let first = config.segment_of(0).expect("device 0 is in a chain");
+        assert_eq!((first.first, first.count), (0, 1));
+        for dev_idx in 1..3 {
+            let seg = config.segment_of(dev_idx).expect("device is in a chain");
+            assert_eq!((seg.first, seg.count), (1, 2));
+        }
+        assert!(config.segment_of(3).is_none());
+    }
+
+    #[test]
+    fn segmentation_covers_refuses_everything_that_is_not_an_exact_tiling() {
+        let mut config = ChainConfig::new();
+        config.device_count = 2;
+
+        // An unset segmentation. This is the state a host that never
+        // learned about segments leaves behind, and the reason the
+        // field is not allowed to mean "one chain spanning
+        // everything": that reading would compose a differencing
+        // child against whatever followed it.
+        assert!(
+            !config.segmentation_covers(2),
+            "segment_count 0 must never read as a default"
+        );
+
+        // Short of the device count.
+        config.segment_count = 1;
+        config.segments[0] = ChainSegment { first: 0, count: 1 };
+        assert!(!config.segmentation_covers(2));
+
+        // Past the device count.
+        config.segments[0] = ChainSegment { first: 0, count: 3 };
+        assert!(!config.segmentation_covers(2));
+
+        // Right total, but the first chain does not start at device 0.
+        config.segments[0] = ChainSegment { first: 1, count: 2 };
+        assert!(!config.segmentation_covers(2));
+
+        // A gap, an overlap, out of order, and an empty segment.
+        config.segment_count = 2;
+        config.segments[0] = ChainSegment { first: 0, count: 1 };
+        config.segments[1] = ChainSegment { first: 2, count: 1 };
+        assert!(!config.segmentation_covers(3), "a gap must be refused");
+        config.segments[1] = ChainSegment { first: 0, count: 2 };
+        assert!(!config.segmentation_covers(3), "an overlap must be refused");
+        config.segments[0] = ChainSegment { first: 1, count: 1 };
+        config.segments[1] = ChainSegment { first: 0, count: 1 };
+        assert!(
+            !config.segmentation_covers(2),
+            "out of order must be refused"
+        );
+        config.segments[0] = ChainSegment { first: 0, count: 0 };
+        config.segments[1] = ChainSegment { first: 0, count: 2 };
+        assert!(
+            !config.segmentation_covers(2),
+            "an empty segment must be refused"
+        );
+
+        // More segments than the array holds.
+        config.segment_count = MAX_CHAIN_SEGMENTS as u32 + 1;
+        assert!(!config.segmentation_covers(2));
     }
 }

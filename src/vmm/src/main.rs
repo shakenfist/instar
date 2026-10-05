@@ -326,7 +326,7 @@ const CHECK_RESULT_FLAG_REPAIR_INCOMPLETE: u32 = 1 << 8;
 #[allow(dead_code)]
 const CHAIN_CONFIG_MAGIC: u32 = 0x4348414E; // "CHAN"
 #[allow(dead_code)]
-const CHAIN_CONFIG_VERSION: u32 = 2;
+const CHAIN_CONFIG_VERSION: u32 = 3;
 #[allow(dead_code)]
 const MAX_CHAIN_DEVICES: usize = 16;
 
@@ -3430,12 +3430,90 @@ fn open_chain_devices_rw(
     Ok(idx - start_idx)
 }
 
-/// Write a ChainConfig structure to guest memory at CHAIN_CONFIG_ADDR.
+/// Write the `ChainConfig` header and segmentation to guest memory at
+/// CHAIN_CONFIG_ADDR.
+///
+/// The device entries themselves are written separately, by one or more
+/// `write_chain_device_entries` calls, because an operation reading two
+/// images packs two chains into the one array. `segments` describes
+/// what those calls laid out: one `(first, count)` pair per independent
+/// chain, in device order, which is exactly what the guest hands its
+/// chain reader. They must tile `[0, device_count)` exactly, and that
+/// is checked here as well as in the guest — the host has a real error
+/// channel, so a segmentation bug should surface as a message rather
+/// than as a guest that declines to start.
+fn write_chain_config_header(
+    guest_mem: &GuestMemoryMmap,
+    device_count: usize,
+    segments: &[shared::ChainSegment],
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Layout matches shared::ChainConfig exactly:
+    // - magic: u32 (offset 0)
+    // - device_count: u32 (offset 4)
+    // - version: u32 (offset 8)
+    // - segment_count: u32 (offset 12)
+    // - devices: [ChainDeviceInfo; 16] (offset 16)
+    // - segments: [ChainSegment; 16] (offset 528)
+    // - _reserved: [u8; 64] (offset 656)
+    //
+    // ChainDeviceInfo layout (32 bytes each):
+    // - format: u32 (offset 0)
+    // - flags: u32 (offset 4)
+    // - virtual_size: u64 (offset 8)
+    // - actual_size: u64 (offset 16)
+    // - cluster_size: u32 (offset 24)
+    // - data_device_idx: u32 (offset 28)
+    //
+    // ChainSegment layout (8 bytes each):
+    // - first: u32 (offset 0)
+    // - count: u32 (offset 4)
+    if segments.len() > shared::MAX_CHAIN_SEGMENTS {
+        return Err(format!(
+            "chain config describes {} chains, more than the {} the config holds",
+            segments.len(),
+            shared::MAX_CHAIN_SEGMENTS
+        )
+        .into());
+    }
+    if !shared::ChainSegment::covers(segments, device_count) {
+        return Err(format!(
+            "chain config segmentation {:?} does not cover its {device_count} devices exactly",
+            segments
+                .iter()
+                .map(|s| (s.first, s.count))
+                .collect::<Vec<_>>()
+        )
+        .into());
+    }
+
+    guest_mem.write_obj(CHAIN_CONFIG_MAGIC, GuestAddress(CHAIN_CONFIG_ADDR))?;
+    guest_mem.write_obj(device_count as u32, GuestAddress(CHAIN_CONFIG_ADDR + 4))?;
+    guest_mem.write_obj(CHAIN_CONFIG_VERSION, GuestAddress(CHAIN_CONFIG_ADDR + 8))?;
+    guest_mem.write_obj(segments.len() as u32, GuestAddress(CHAIN_CONFIG_ADDR + 12))?;
+
+    let segments_base = CHAIN_CONFIG_ADDR + 528;
+    for (i, seg) in segments.iter().enumerate() {
+        let seg_offset = segments_base + (i as u64 * 8);
+        guest_mem.write_obj(seg.first, GuestAddress(seg_offset))?;
+        guest_mem.write_obj(seg.count, GuestAddress(seg_offset + 4))?;
+    }
+
+    Ok(())
+}
+
+/// Write a ChainConfig structure to guest memory at CHAIN_CONFIG_ADDR
+/// for an operation whose devices form a single backing chain.
 ///
 /// This populates the chain config with metadata about all devices in the
 /// backing chain, allowing guest operations to understand the chain structure
 /// without parsing image headers. If the chain has an external data file,
 /// it is inserted as device 1 between the top image and the backing chain.
+///
+/// An operation that attaches two unrelated images (`compare`, or
+/// `rebase` with a new backing chain) must not use this: the guest
+/// would be told that the second image is behind the first. Those
+/// callers write their device entries themselves and declare one
+/// segment per chain.
 ///
 /// # Arguments
 ///
@@ -3449,24 +3527,6 @@ fn write_chain_config(
     guest_mem: &GuestMemoryMmap,
     chain: &BackingChain,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Build the ChainConfig structure
-    // Layout matches shared::ChainConfig exactly:
-    // - magic: u32 (offset 0)
-    // - device_count: u32 (offset 4)
-    // - version: u32 (offset 8)
-    // - _reserved: u32 (offset 12)
-    // - devices: [ChainDeviceInfo; 16] (offset 16)
-    //
-    // ChainDeviceInfo layout (32 bytes each):
-    // - format: u32 (offset 0)
-    // - flags: u32 (offset 4)
-    // - virtual_size: u64 (offset 8)
-    // - actual_size: u64 (offset 16)
-    // - cluster_size: u32 (offset 24)
-    // - data_device_idx: u32 (offset 28)
-
-    let device_count = chain.total_devices().min(MAX_CHAIN_DEVICES);
-
     if chain.total_devices() > MAX_CHAIN_DEVICES {
         debug!(
             "Chain truncated: {} devices exceeds maximum of {}, only first {} will be passed",
@@ -3476,17 +3536,24 @@ fn write_chain_config(
         );
     }
 
-    // Write header
-    guest_mem.write_obj(CHAIN_CONFIG_MAGIC, GuestAddress(CHAIN_CONFIG_ADDR))?;
-    guest_mem.write_obj(device_count as u32, GuestAddress(CHAIN_CONFIG_ADDR + 4))?;
-    guest_mem.write_obj(CHAIN_CONFIG_VERSION, GuestAddress(CHAIN_CONFIG_ADDR + 8))?;
-    guest_mem.write_obj(0u32, GuestAddress(CHAIN_CONFIG_ADDR + 12))?; // reserved
-
-    // Write device entries (handles data file insertion)
+    // Write device entries (handles data file insertion) before the
+    // header, so `device_count` and the segment are the count of slots
+    // actually written rather than a separately derived figure. The
+    // entry writer inserts a slot per external data file and stops at
+    // MAX_CHAIN_DEVICES, so a count taken from the chain can name
+    // slots the guest was never given.
     let devices_base = CHAIN_CONFIG_ADDR + 16;
-    write_chain_device_entries(guest_mem, chain, devices_base, 0)?;
+    let device_count = write_chain_device_entries(guest_mem, chain, devices_base, 0)?;
 
-    debug!("Wrote chain config at 0x{CHAIN_CONFIG_ADDR:x} ({device_count} devices)");
+    // One chain, every device in it: device 0 is the top image and
+    // each following slot is behind the one before it.
+    let segments = [shared::ChainSegment {
+        first: 0,
+        count: device_count as u32,
+    }];
+    write_chain_config_header(guest_mem, device_count, &segments)?;
+
+    debug!("Wrote chain config at 0x{CHAIN_CONFIG_ADDR:x} ({device_count} devices, 1 chain)");
 
     Ok(())
 }
@@ -10053,20 +10120,47 @@ fn run_rebase_guest(
 
     // --- Write the combined chain config at CHAIN_CONFIG_ADDR ----------
     // The guest's safe-mode runner indexes `chain_config.devices[]`
-    // by input device slot; concatenate the old chain and the new
+    // by input device slot; lay the old chain down and then the new
     // chain in the same order they were attached so slot N in the
     // guest matches `devices[N]`. Unsafe mode ignores chain config.
-    let mut combined_chain = BackingChain::new();
-    for img in old_chain_parents.images() {
-        combined_chain.push(img.clone());
-    }
-    if let Some(chain) = new_chain {
-        for img in chain.images() {
-            combined_chain.push(img.clone());
+    //
+    // These are two independent chains, not one: the new backing
+    // chain is not behind the old one. They get a segment each, so
+    // the guest is never told that the first device of the new chain
+    // is a parent of the last device of the old one. The entries are
+    // written here rather than through `write_chain_config`, which
+    // takes a single chain and so cannot describe this.
+    let devices_base = CHAIN_CONFIG_ADDR + 16;
+    let mut segments: Vec<shared::ChainSegment> = Vec::new();
+    let mut written = 0usize;
+    for chain in [Some(old_chain_parents), new_chain].into_iter().flatten() {
+        let count = write_chain_device_entries(&guest_mem, chain, devices_base, written)?;
+        // A detach with no parents, or a rebase onto a chain with
+        // nothing to attach, contributes no devices. An empty segment
+        // would be a chain with no top image, so skip it rather than
+        // declare one.
+        if count > 0 {
+            segments.push(shared::ChainSegment {
+                first: written as u32,
+                count: count as u32,
+            });
+            written += count;
         }
     }
-    if combined_chain.total_devices() > 0 {
-        write_chain_config(&guest_mem, &combined_chain)?;
+    // The guest derives its own device count from the RebaseConfig
+    // chain extents written above, not from `device_count`, so the two
+    // must agree or its segmentation check will refuse a sound config.
+    debug_assert_eq!(
+        written,
+        old_chain_input_devices + new_chain_input_devices,
+        "chain config device count must match the RebaseConfig chain extents"
+    );
+    if written > 0 {
+        write_chain_config_header(&guest_mem, written, &segments)?;
+        debug!(
+            "Wrote chain config at 0x{CHAIN_CONFIG_ADDR:x} ({written} devices, {} chains)",
+            segments.len()
+        );
     }
 
     let guest_mem = Arc::new(guest_mem);
@@ -12580,21 +12674,37 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     // Write ChainConfig with format metadata for all chain images
     // Devices are laid out: [chain1 devices...] [chain2 devices...]
     // Each chain may include an external data file device after its top image.
-    guest_mem.write_obj(CHAIN_CONFIG_MAGIC, GuestAddress(CHAIN_CONFIG_ADDR))?;
-    guest_mem.write_obj(total_devices as u32, GuestAddress(CHAIN_CONFIG_ADDR + 4))?;
-    guest_mem.write_obj(CHAIN_CONFIG_VERSION, GuestAddress(CHAIN_CONFIG_ADDR + 8))?;
-    guest_mem.write_obj(0u32, GuestAddress(CHAIN_CONFIG_ADDR + 12))?; // reserved
-
+    //
+    // The two chains are independent — image2 is not behind image1 —
+    // so each gets its own segment. Both the device count and the
+    // segment bounds come from what `write_chain_device_entries`
+    // reports it wrote, not from `total_devices()`: the entry writer
+    // inserts a slot per external data file and stops at
+    // MAX_CHAIN_DEVICES, so a segment derived from the chain itself
+    // can name slots the guest was never given.
     let devices_base = CHAIN_CONFIG_ADDR + 16;
     let chain1_written = write_chain_device_entries(&guest_mem, &chain1, devices_base, 0)?;
-    write_chain_device_entries(&guest_mem, &chain2, devices_base, chain1_written)?;
+    let chain2_written =
+        write_chain_device_entries(&guest_mem, &chain2, devices_base, chain1_written)?;
+
+    let segments = [
+        shared::ChainSegment {
+            first: 0,
+            count: chain1_written as u32,
+        },
+        shared::ChainSegment {
+            first: chain1_written as u32,
+            count: chain2_written as u32,
+        },
+    ];
+    write_chain_config_header(&guest_mem, chain1_written + chain2_written, &segments)?;
 
     debug!(
         "Wrote chain config at 0x{:x}: device_count={}, chain1={}, chain2={}",
         CHAIN_CONFIG_ADDR,
-        total_devices,
-        chain1.total_devices(),
-        chain2.total_devices()
+        chain1_written + chain2_written,
+        chain1_written,
+        chain2_written
     );
 
     // Create device set for managing virtio-block devices

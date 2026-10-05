@@ -1557,7 +1557,7 @@ deliberately broken emitter is not guarding what its name says it
 guards. See [PLAN-differencing.md](plans/PLAN-differencing.md) for the
 path being guarded.
 
-There are **63 cases**, in two groups.
+There are **65 cases**, in two groups.
 
 Twenty-seven cover the writer. Fifteen mutate a library crate
 (`create`, `vhd`, `vhdx`) and are caught by a Rust unit or round-trip
@@ -1569,7 +1569,7 @@ crate but break something only an external parser can see. Going
 through the real binary means `make instar` before the test and again
 after the source is restored.
 
-The other **36 reader cases** cover the reader — the VHD and VHDX arms of
+The other **38 reader cases** cover the reader — the VHD and VHDX arms of
 `read_chain_virtual_cluster`, the sector-bitmap helpers in the `vhd`
 and `vhdx` crates, and the differencing refusals in
 `init_chain_states`. Most of them name a test in the `qcow2`

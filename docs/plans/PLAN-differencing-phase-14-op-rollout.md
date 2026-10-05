@@ -80,6 +80,19 @@ this phase.
 * Cross-validation against the phase 1 oracle, and coverage fuzzing
   of the compose path. That is phase 16 (the current phase 15),
   including the 4096-byte logical sector gap phase 13 left it.
+* Issue #626, raised by 14a and filed rather than acted on: a
+  claim that instar's *non-differencing* BAT entry count may
+  over-declare by one entry against SPEC(VHDX) and qemu's
+  `vhdx_calc_bat_entries` whenever `total_blocks` is an exact
+  multiple of `chunk_ratio`. It is out of scope because it was
+  not measurable from the evidence to hand -- the megabyte
+  rounding of the BAT region makes a writer's intended entry
+  count unobservable from the file it produced -- and because
+  instar over-declares rather than under-declares, which is the
+  safe direction on the writer side. The read side is a
+  looseness rather than a defect, since `VhdxState::init`'s
+  bound is additionally capped by the declared region. The issue
+  records the geometry that would settle it.
 * The ~20 other `PLAN-*.md` citations in comments across
   `src/operations/` and `src/shared/`. Pre-existing, not created by
   this phase, and a tree-wide sweep does not belong in a phase that
@@ -153,12 +166,24 @@ Callers: `src/crates/create/src/lib.rs:1404`,
 `src/operations/create/src/main.rs:654`,
 `src/crates/measure/src/lib.rs:1025`,
 `src/crates/resize/src/vhdx.rs:85`, and
-`src/operations/convert/src/main.rs:4394`. Fixing it therefore
-changes `measure`'s predicted file size and `resize`'s target
-layout for a differencing VHDX, and changes the bytes instar
-writes. That is wider than "the writer side" as the master plan's
-gate paragraph (`:537`) implies, and it is why 14a is its own step
-with its own risk entry.
+`src/operations/convert/src/main.rs:4394`. That is wider than
+"the writer side" as the master plan's gate paragraph (`:537`)
+implies, and it is why 14a is its own step with its own risk entry.
+
+**Partly falsified by 14a's execution.** Two predictions in the
+paragraph above were wrong, and both are recorded here rather than
+silently fixed because a later step would otherwise rely on them.
+`measure` cannot predict a differencing VHDX at all -- `VhdxOpts`
+carries no parent field and `MeasureConfig` no backing field, so
+there is no route to ask it and nothing about its output could
+change; its call site passes `false` and says why. And the bytes
+`create -f vhdx -b` writes do not change at any geometry the suite
+already used: the BAT region is rounded up to a megabyte and the
+two rules differ by at most `chunk_ratio - 1` entries, so both
+counts land in the same region. No test expectation moved. That
+rounding is also why the defect survived -- it is visible only
+where the shortfall escapes the megabyte -- so 14a's tests pick
+such a geometry deliberately.
 
 **F5. #614 has an in-tree precedent for its fix.** `ChainConfig`
 (`src/shared/src/lib.rs:4817`) is a flat `[ChainDeviceInfo; 16]`
@@ -173,6 +198,23 @@ already takes `chain_start` and `chain_len`, so the *reader* knows
 its own chain's bounds; only `init_chain_states` does not. The fix
 is to put the segmentation where the chain is described rather than
 deriving it a fourth time. See decision 4.
+
+**Corrected by the 14b design gate**, which read the tree rather
+than this finding and found three things wrong with it. Six host
+paths write a `ChainConfig`, not four: `run_commit_guest`
+(`src/vmm/src/main.rs:10461`) and `run_check` (`:11798`) also do,
+and `check` reads one (`src/operations/check/src/main.rs:293`,
+`:422`) without ever calling `init_chain_states`, so tightening
+`ChainConfig::is_valid` reaches two operations this phase does not
+otherwise touch. `init_chain_states` has five call sites, not four
+-- `convert` calls it twice, and the second
+(`src/operations/convert/src/main.rs:1007`) mutates device 0 in
+place for the LUKS inner image with `device_count` 1 and restores
+it afterwards, so it must override and restore the segmentation
+too. And `is_valid` (`src/shared/src/lib.rs:4853`) already checks
+`device_count > 0` as well as magic, which is what makes
+`segment_count == 0` an unreachable state rather than merely an
+unusual one.
 
 **F6. The user-visible refusal message cites a plan file.**
 `src/vmm/src/main.rs:852` renders "composition is deferred (see
@@ -286,8 +328,8 @@ cannot resolve the sector bitmaps of images instar itself wrote.
 
 | Step | Effort | Model | Isolation | Brief for sub-agent |
 |---|---|---|---|---|
-| 14a | high | opus | none | Fix issue #623. Give `vhdx::calculate_bat_layout` (`src/crates/vhdx/src/lib.rs:3357`) a required `has_parent: bool` parameter and size the BAT by the differencing rule when it is set: a differencing VHDX BAT is padded to whole chunk groups, `ceil(total_blocks / chunk_ratio) * (chunk_ratio + 1)` entries, where a dynamic one takes `total_blocks + ceil(total_blocks / chunk_ratio)`. Update all five consumers to pass their actual intent: `src/crates/create/src/lib.rs:1404`, `src/operations/create/src/main.rs:654`, `src/crates/measure/src/lib.rs:1025`, `src/crates/resize/src/vhdx.rs:85`, `src/operations/convert/src/main.rs:4394`. Do not add a defaulted parameter or a sibling function (decision 7). Three consequences to handle rather than discover: `measure`'s predicted size for a differencing VHDX changes, so its expectation changes with it; `resize` must be checked for whether it accepts a differencing VHDX at all before its call site is given a `true` branch; and the bytes `create -f vhdx -b` writes change, so any golden fixture or round-trip expectation over that output changes too -- find them with `make test-rust` and the `tests/test_create.py` and `tests/test_differencing.py` suites rather than by reading. The phase 13 reader deliberately caps itself at the declared BAT region (`sb_bat_entry_bound`, added in `ec005d57`); once the writer is right, confirm that cap no longer truncates instar's own output, and say in the commit message which image geometry you checked it at. Add a mutation to `tools/mutate-differencing.sh` reverting the padded rule. Closes #623 -- use the `Fixes` keyword in the pull request body, not only the commit message. |
-| 14b | high | opus | none | Fix issue #614. `init_chain_states` (`src/crates/qcow2/src/lib.rs:13404`) receives only `device_count`, a bound on a flat array that may hold several independent chains -- `compare diff.vhdx base.raw` packs two -- so it cannot tell a differencing child with a real parent behind it from one followed by an unrelated image. Extend `ChainConfig` (`src/shared/src/lib.rs:4817`) to carry the segmentation and bump `ChainConfig::VERSION` to 3, following the `(first, count)` field shape `CommitConfig.backing_chain_first` / `backing_chain_count` (`:4563`) already ships; a `_reserved` word is available. Do not add a parameter to `init_chain_states` instead (decision 4). Populate it on the host for all four callers -- `run_bench` (`src/vmm/src/main.rs:5045`), `run_rebase` (`:6903`, `:6916`), `run_compare` (`:12407`, `:12417`), `execute_convert` (`:13255`) -- and assert in the guest that a chain's segment bounds agree with `device_count`. No refusal is lifted in this step: the deliverable is that `init_chain_states` *could* make the per-chain judgement, proved by a test that builds a two-chain array with a differencing child at index 0 and asserts the function sees chain length 1 for it. The existing `vhdx_init_refuses_a_differencing_child_and_admits_a_dynamic_one` (`src/crates/qcow2/src/lib.rs:9795`) documents the hazard in its comment and is the test to extend. Closes #614. |
+| 14a | high | opus | none | Fix issue #623. Give `vhdx::calculate_bat_layout` (`src/crates/vhdx/src/lib.rs:3357`) a required `has_parent: bool` parameter and size the BAT by the differencing rule when it is set: a differencing VHDX BAT is padded to whole chunk groups, `ceil(total_blocks / chunk_ratio) * (chunk_ratio + 1)` entries, where a dynamic one takes `total_blocks + ceil(total_blocks / chunk_ratio)`. Update all five consumers to pass their actual intent: `src/crates/create/src/lib.rs:1404`, `src/operations/create/src/main.rs:654`, `src/crates/measure/src/lib.rs:1025`, `src/crates/resize/src/vhdx.rs:85`, `src/operations/convert/src/main.rs:4394`. Do not add a defaulted parameter or a sibling function (decision 7). Three consequences to handle rather than discover: `measure`'s predicted size for a differencing VHDX changes, so its expectation changes with it; `resize` must be checked for whether it accepts a differencing VHDX at all before its call site is given a `true` branch; and the bytes `create -f vhdx -b` writes change, so any golden fixture or round-trip expectation over that output changes too -- find them with `make test-rust` and the `tests/test_create.py` and `tests/test_differencing.py` suites rather than by reading. The phase 13 reader deliberately caps itself at the declared BAT region (`sb_bat_entry_bound`, added in `ec005d57`); once the writer is right, confirm that cap no longer truncates instar's own output, and say in the commit message which image geometry you checked it at. Add a mutation to `tools/mutate-differencing.sh` reverting the padded rule. Closes #623 -- use the `Fixes` keyword in the pull request body, not only the commit message. Built as `6d8ee05d`. |
+| 14b | high | opus | none | Fix issue #614. `init_chain_states` (`src/crates/qcow2/src/lib.rs:13404`) receives only `device_count`, a bound on a flat array that may hold several independent chains -- `compare diff.vhdx base.raw` packs two -- so it cannot tell a differencing child with a real parent behind it from one followed by an unrelated image. Extend `ChainConfig` (`src/shared/src/lib.rs:4817`) to carry the segmentation and bump `ChainConfig::VERSION` to 3, following the `(first, count)` field shape `CommitConfig.backing_chain_first` / `backing_chain_count` (`:4563`) already ships; a `_reserved` word is available. Do not add a parameter to `init_chain_states` instead (decision 4). Populate it on the host for every caller that writes a `ChainConfig` -- and note that the four line numbers this row originally gave for `run_rebase` and `run_compare` were their argument-parsing functions, not their config writers; the writers are `run_rebase_guest` (`src/vmm/src/main.rs:10120`) and `run_compare` (`:12674`), and `run_commit_guest` (`:10461`) and `run_check` (`:11798`) write one too -- and assert in the guest that a chain's segment bounds agree with `device_count`. No refusal is lifted in this step: the deliverable is that `init_chain_states` *could* make the per-chain judgement, proved by a test that builds a two-chain array with a differencing child at index 0 and asserts the function sees chain length 1 for it. The existing `vhdx_init_refuses_a_differencing_child_and_admits_a_dynamic_one` (`src/crates/qcow2/src/lib.rs:9795`) documents the hazard in its comment and is the test to extend. Closes #614. |
 | 14c | medium | sonnet | none | Fix issue #625. Phase 13 added `vhdx::MIN_BLOCK_FILE_OFFSET` so a zeroed or truncated BAT entry cannot name file offset 0, but an entry naming any offset inside the BAT or metadata region of a small image is still accepted, and `block_lookup` / `sector_bitmap_lookup` will read a block from there. Bound a payload or sector-bitmap block's file offset below by the end of the last declared region rather than by a 1 MiB constant: `VhdxState` already parses the region table at init, so the bound is derivable from what the image declares about itself. Refuse, do not clamp -- an image whose BAT names a block inside its own metadata is malformed, and the phase 12 and 13 arms both fail closed rather than guess. Add crate tests for an offset inside the BAT region, inside the metadata region, and immediately after the last region as a positive control, plus mutations in `tools/mutate-differencing.sh`. This is a bound check, not a behaviour change: no image instar writes names such an offset, and the test that proves it is the existing compose suite still passing. Closes #625. |
 | 14d | high | opus | none | The host-side composability gate. `discover_backing_chain` (`src/vmm/src/main.rs`, the match at `:3044`) refuses to resolve a differencing VHD or VHDX parent for every `ChainUse::Compose` caller. Replace the caller-kind test with an explicit per-call capability argument (decision 5) -- not a third `ChainUse` variant -- so each of the ten call sites states whether its operation can compose a differencing chain. Set it true for `run_bench` (`:5045`), `run_rebase` (`:6903`, `:6916`), `run_compare` (`:12407`, `:12417`), `execute_convert` (`:13255`) and `run_dd` (`:14686`); false for `run_commit` (`:7265`) and `run_check` (`:11662`); `run_info` (`:10715`) stays `Report` and is untouched. Rewrite the comment at `:2989-3010` rather than deleting it: its argument -- that a refusal must never become contingent on whether a parent file happens to exist -- is still exactly right for the callers that still refuse, and is the invariant phase 4 established and phase 11 preserved. State in the commit message which call sites you set each way and why, because that list is the phase's actual policy. No guest change in this step; the refusals are still in `init_chain_states`, so every operation still fails, and the proof of this step is that the host now resolves the parent and the guest still declines it. |
 | 14e | high | opus | none | Lift the refusal for `convert`, and `dd` with it. Remove the VHD (`src/crates/qcow2/src/lib.rs:13501`) and VHDX (`:13529`) refusals from `init_chain_states`, replacing them with the per-chain judgement 14b made possible: a differencing child with no device behind it *in its own chain* must still be refused, because composing it would read parent-owned sectors from nothing. That is the condition phase 12 proved unsafe to write against `device_count` and 14b makes safe to write against the segmentation. Keep the typed refusal and its status codes (`shared::DifferencingRefusal`) for that case -- it is now a narrower refusal, not a deleted one. Rewrite the host message at `src/vmm/src/main.rs:841-857` per decision 8: name the operation, say that the source's parent could not be composed and why, and drop the `PLAN-differencing.md` citation (F6). Verify with a Python integration test that converts a real differencing VHD and a real differencing VHDX to raw and compares the whole output byte-for-byte against the same chain flattened by the phase 1 oracle or by `instar` reading the parent directly -- a whole-file comparison, not a spot check. Both formats, and a chain of depth 3 for at least one of them. |
