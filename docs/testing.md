@@ -1557,9 +1557,9 @@ deliberately broken emitter is not guarding what its name says it
 guards. See [PLAN-differencing.md](plans/PLAN-differencing.md) for the
 path being guarded.
 
-There are **62 cases**, in two groups.
+There are **63 cases**, in two groups.
 
-Twenty-six cover the writer. Fourteen mutate a library crate
+Twenty-seven cover the writer. Fifteen mutate a library crate
 (`create`, `vhd`, `vhdx`) and are caught by a Rust unit or round-trip
 test; twelve are caught by a Python integration test through the real
 binary. Ten of those twelve mutate the `create` guest operation, which

@@ -82,10 +82,20 @@ pub(crate) fn plan_grow<'a>(
         return Err(ResizeError::Overflow);
     }
 
+    // has_parent = false, and not `opts.has_parent`: the
+    // `UnsupportedSubformat` refusal above declines every differencing
+    // image before any layout is computed, so there is no parent-bearing
+    // image to size for. Sizing one by the padded rule here would also
+    // not be enough on its own -- `decide_action` below compares against
+    // `current_total_bat_entries`, which the host derives by the
+    // no-parent rule, and the relocated BAT carries none of the sector
+    // bitmap blocks a grown child needs -- so the refusal is the thing
+    // to revisit first, not this argument.
     let (target_total_bat_entries, _chunk_ratio, _payload_blocks) = calculate_bat_layout(
         opts.new_virtual_size,
         opts.block_size,
         opts.logical_sector_size,
+        false,
     )
     .ok_or(ResizeError::InvalidNewVirtualSize)?;
 

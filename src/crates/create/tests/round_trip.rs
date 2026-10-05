@@ -1796,6 +1796,133 @@ fn vhdx_differencing_bat_region_is_untouched() {
     }
 }
 
+/// Logical sectors a chunk group spans, and so the BAT entry count one
+/// group occupies, written out from the format's own definitions rather
+/// than taken from the crate whose sizing is under test here.
+fn chunk_ratio_of(block_size: u32, logical_sector_size: u32) -> u64 {
+    (1u64 << 23) * u64::from(logical_sector_size) / u64::from(block_size)
+}
+
+/// A differencing child's BAT region holds every entry of every chunk
+/// group its virtual disk reaches into, bitmap entries included.
+///
+/// A group's sector bitmap entry is the **last** of the group's
+/// `chunk_ratio + 1` entries, so it sits past the last payload entry
+/// the virtual disk defines whenever the disk stops part way through a
+/// group — which is every geometry whose block count is not an exact
+/// multiple of `chunk_ratio`. An emitter that sized the region by the
+/// no-parent rule (one entry per payload block, plus one per group)
+/// leaves those bitmap entries outside the region the region table
+/// declares, and a reader that honours the declaration cannot reach
+/// them: the child's own sectors become unresolvable.
+///
+/// Swept across both the block-size range and both logical sector
+/// sizes `init` accepts, because `chunk_ratio` is a function of both
+/// and it is `chunk_ratio` that decides how far the two rules diverge.
+/// The virtual sizes deliberately include ones that are *not* a whole
+/// number of groups: at an exact multiple the two rules agree and the
+/// test would pass either way.
+#[test]
+fn vhdx_differencing_bat_region_holds_every_padded_entry() {
+    const LOGICAL_SECTOR_SIZE: u32 = 512;
+    for &block_size in &[1024u32 * 1024, 4 * 1024 * 1024, 32 * 1024 * 1024] {
+        let chunk_ratio = chunk_ratio_of(block_size, LOGICAL_SECTOR_SIZE);
+        for &blocks in &[1u64, 3, chunk_ratio - 1, chunk_ratio, chunk_ratio + 1] {
+            let virtual_size = blocks * u64::from(block_size);
+            let opts = VhdxCreateOpts {
+                virtual_size,
+                block_size,
+                ..vhdx_diff_opts(VHDX_PARENT_PATH)
+            };
+            let laid = lay_out_vhdx(&opts);
+            let label = format!("bsize={block_size} blocks={blocks}");
+
+            // The region table's own declaration, not the planner's
+            // intermediate: this is what a foreign reader sees.
+            let declared_entries = laid.bat_len as u64 / 8;
+            let groups = blocks.div_ceil(chunk_ratio);
+            let padded = groups * (chunk_ratio + 1);
+            assert!(
+                declared_entries >= padded,
+                "{label}: the BAT region declares {declared_entries} entries, \
+                 short of the {padded} a differencing BAT of this geometry has",
+            );
+
+            // And specifically: the last payload block's group bitmap
+            // entry is inside the declaration.
+            let last_group = (blocks - 1) / chunk_ratio;
+            let last_sb_index = last_group * (chunk_ratio + 1) + chunk_ratio;
+            assert!(
+                last_sb_index < declared_entries,
+                "{label}: the last group's bitmap entry is at BAT index \
+                 {last_sb_index}, outside the declared {declared_entries}",
+            );
+        }
+    }
+}
+
+/// The geometry at which the no-parent rule's shortfall is not absorbed
+/// by the 1 MiB region rounding, with the numbers written out.
+///
+/// Everywhere else the shortfall — at most `chunk_ratio - 1` entries —
+/// disappears into the padding `round_up(entries * 8, 1 MiB)` adds, so a
+/// sweep of convenient sizes cannot tell a correctly sized region from a
+/// short one. Here it can: 126 977 blocks of 1 MiB need 127 009 entries
+/// by the no-parent rule, which is 1 016 072 bytes and rounds to exactly
+/// one 1 MiB region holding 131 072 entries, while the differencing rule
+/// needs 131 104 — 32 entries more than that region can hold. The last
+/// group's bitmap entry is at BAT index 131 103, inside the padded count
+/// and outside the rounded no-parent one.
+///
+/// This is the case `VhdxState::init`'s `min(padded, region_entries)`
+/// cap would otherwise truncate, making instar unable to resolve the
+/// sector bitmaps of an image instar itself wrote.
+#[test]
+fn vhdx_differencing_bat_region_covers_the_last_group_bitmap() {
+    const BLOCK_SIZE: u32 = 1024 * 1024;
+    const BLOCKS: u64 = 126_977;
+    let virtual_size = BLOCKS * u64::from(BLOCK_SIZE);
+
+    let child = lay_out_vhdx(&VhdxCreateOpts {
+        virtual_size,
+        block_size: BLOCK_SIZE,
+        ..vhdx_diff_opts(VHDX_PARENT_PATH)
+    });
+    assert_eq!(child.bat_len, 2 * 1024 * 1024);
+    let declared_entries = child.bat_len as u64 / 8;
+    assert_eq!(declared_entries, 262_144);
+
+    // What `init` bounds a sector bitmap lookup by, built the way
+    // `init` builds it: the padded count, capped by the declaration.
+    let chunk_ratio = chunk_ratio_of(BLOCK_SIZE, 512);
+    assert_eq!(chunk_ratio, 4096);
+    let padded = BLOCKS.div_ceil(chunk_ratio) * (chunk_ratio + 1);
+    assert_eq!(padded, 131_104);
+    let bound = padded.min(declared_entries);
+    assert_eq!(bound, 131_104);
+    assert_eq!(
+        vhdx::sb_bat_index(BLOCKS - 1, chunk_ratio as u32),
+        Some(131_103)
+    );
+    assert!(131_103 < bound);
+
+    // The same disk with no parent keeps the shorter region, so this
+    // test is measuring the rule and not the geometry.
+    let plain = lay_out_vhdx(&VhdxCreateOpts {
+        virtual_size,
+        block_size: BLOCK_SIZE,
+        backing: None,
+        parent_data_write_guid: [0u8; 16],
+    });
+    assert_eq!(plain.bat_len, 1024 * 1024);
+    assert!(131_103 >= plain.bat_len as u64 / 8);
+
+    // And the child's metadata region moved with its BAT, so the file
+    // the planner describes is self-consistent rather than overlapping.
+    assert_eq!(child.metadata_off, child.bat_off + child.bat_len);
+    assert_eq!(plain.metadata_off, plain.bat_off + plain.bat_len);
+}
+
 /// Without a backing reference the metadata region is what it always
 /// was: five entries, no locator, and the File Parameters `HasParent`
 /// bit clear.

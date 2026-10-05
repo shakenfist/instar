@@ -410,6 +410,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`instar create -f vhdx -b PARENT` sizes the child's BAT by the
+  differencing rule.** A VHDX block allocation table interleaves one
+  sector-bitmap entry after every `chunk_ratio` payload entries, with
+  the bitmap entry last in its group, so a differencing image reserves
+  whole groups of `chunk_ratio + 1` entries where an image with no
+  parent stops at the last entry its virtual disk needs. instar sized
+  both by the no-parent rule, which leaves the final group's bitmap
+  entry — the one saying which sectors of the disk's last blocks the
+  child owns — outside the BAT region the child's own region table
+  declares. The two counts differ by at most `chunk_ratio - 1`
+  entries, and the BAT region is rounded up to a whole megabyte, so
+  the shortfall only escaped the rounding at some geometries; where it
+  did, instar and any other conforming reader could not resolve those
+  sectors. A plain dynamic VHDX is unaffected, and `convert`'s VHDX
+  output, which never has a parent, is byte-identical. Fixes #623.
+
 - **CI apt steps wait for apt's locks instead of failing.** A runner
   that was still running its own apt job when a CI step began made that
   step's `apt-get` fail at once with `Could not get lock

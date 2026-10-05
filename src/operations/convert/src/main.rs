@@ -4390,19 +4390,29 @@ unsafe fn convert_to_vhdx(
     let logical_sector_size: u32 = 512;
     let physical_sector_size: u32 = 4096;
 
-    let (total_bat_entries, chunk_ratio, total_payload_blocks) =
-        match vhdx::calculate_bat_layout(declared_size, block_size as u32, logical_sector_size) {
-            Some(v) => v,
-            None => {
-                (call_table.send_error)(
-                    b"convert\0".as_ptr(),
-                    b"VHDX BAT layout overflow\0".as_ptr(),
-                    0,
-                    1,
-                );
-                return 1;
-            }
-        };
+    // has_parent = false: this writer flattens its input into a
+    // self-contained dynamic VHDX. It emits no parent locator and
+    // leaves `HasParent` clear in the File Parameters item below, so
+    // the BAT it sizes must be the no-parent one -- a padded BAT here
+    // would declare a region holding sector bitmap entries that
+    // nothing ever writes or reads.
+    let (total_bat_entries, chunk_ratio, total_payload_blocks) = match vhdx::calculate_bat_layout(
+        declared_size,
+        block_size as u32,
+        logical_sector_size,
+        false,
+    ) {
+        Some(v) => v,
+        None => {
+            (call_table.send_error)(
+                b"convert\0".as_ptr(),
+                b"VHDX BAT layout overflow\0".as_ptr(),
+                0,
+                1,
+            );
+            return 1;
+        }
+    };
 
     // Layout offsets (all 1MB-aligned per VHDX spec)
     let file_id_offset: u64 = 0; // 64KB

@@ -1000,10 +1000,12 @@ impl Default for VhdxOpts {
 /// ```
 ///
 /// `total_payload_blocks` and `total_bat_entries` come from
-/// `vhdx::calculate_bat_layout(virtual_size, block_size, 512)`.
+/// `vhdx::calculate_bat_layout(virtual_size, block_size, 512, false)`.
 /// `total_bat_entries` already accounts for the chunk-ratio interleaving
 /// (one sector-bitmap BAT entry every `chunk_ratio` payload entries) so
-/// no manual interleaving is needed here.
+/// no manual interleaving is needed here. The `false` is "no parent":
+/// see the call site for why a differencing target is not a shape
+/// `measure` can be asked for.
 pub fn measure_vhdx(s: &AllocationSummary, opts: &VhdxOpts) -> MeasureResult {
     // ---- Validate options. -------------------------------------------------
     // block_size: power of two in [1 MiB, 256 MiB].
@@ -1021,8 +1023,15 @@ pub fn measure_vhdx(s: &AllocationSummary, opts: &VhdxOpts) -> MeasureResult {
 
     // ---- BAT layout via the writer's helper. ------------------------------
     // logical_sector_size = 512 (instar's writer hard-codes 512 for VHDX).
+    // has_parent = false: `measure` predicts the size of a self-contained
+    // image. `VhdxOpts` carries no parent, nothing on the wire to the guest
+    // offers one, and a differencing target is not a shape `measure` can be
+    // asked for -- so the padded BAT rule has no caller here. A differencing
+    // target would also need a parent locator in the metadata region and a
+    // predicted size for it, neither of which this function computes, so the
+    // option is the thing to add first if that ever changes.
     let (total_bat_entries, _chunk_ratio, total_payload_blocks) =
-        vhdx::calculate_bat_layout(s.virtual_size, opts.block_size, 512)
+        vhdx::calculate_bat_layout(s.virtual_size, opts.block_size, 512, false)
             .ok_or(MeasureError::Overflow)?;
 
     let total_bat_entries = total_bat_entries as u64;
@@ -2831,8 +2840,8 @@ mod tests {
     //   payload_start   = fixed_pre_bat + bat_region + metadata_region
     //
     // total_bat_entries / total_payload_blocks come from
-    // `vhdx::calculate_bat_layout(virtual_size, block_size, 512)`, which is
-    // the same helper the writer uses, so the two cannot drift.
+    // `vhdx::calculate_bat_layout(virtual_size, block_size, 512, false)`,
+    // which is the same helper the writer uses, so the two cannot drift.
 
     #[test]
     fn vhdx_1gib_32mib_block_empty() {

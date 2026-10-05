@@ -1776,12 +1776,12 @@ pub fn sb_bat_index(block_index: u64, chunk_ratio: u32) -> Option<u64> {
 /// entries, because a group's sector bitmap entry sits at the end of
 /// the group whether or not every payload entry ahead of it is backed
 /// by virtual disk. An image with no parent stops at the last entry it
-/// actually needs, which is the shorter count `calculate_bat_layout`
-/// returns.
+/// actually needs, which is the shorter count
+/// `calculate_bat_layout(.., false)` returns.
 ///
-/// The difference only ever matters to a reader resolving a sector
-/// bitmap: the writer side still sizes every BAT it emits by the
-/// shorter rule, which is issue #623.
+/// This is the rule `calculate_bat_layout` applies when its
+/// `has_parent` argument is set, and the only place it is written
+/// down; a reader resolving a sector bitmap bounds itself by it.
 ///
 /// Returns `None` for a degenerate chunk ratio and on overflow.
 pub fn differencing_bat_entry_count(total_payload_blocks: u64, chunk_ratio: u32) -> Option<u64> {
@@ -1904,8 +1904,7 @@ pub struct VhdxState {
     /// still cannot read past the region. `total_bat_entries` keeps
     /// the shorter count because it also sizes the whole-BAT walks in
     /// `scan_allocation` and `map_extents`, which must not run off
-    /// the end of a region a writer sized by that same rule -- and
-    /// instar's writer does, which is issue #623.
+    /// the end of a region a writer sized by that same rule.
     pub sb_bat_entry_bound: u32,
     /// `HasParent` from the file parameters metadata item: the image
     /// is a differencing (parent-referencing) VHDX whose real content
@@ -2115,7 +2114,8 @@ impl VhdxState {
         // reaching past the BAT region, and the region size check
         // above deliberately stays on the shorter count: tightening
         // it would refuse differencing images that load today,
-        // including any instar wrote itself (issue #623).
+        // including the ones instar wrote before it sized a
+        // differencing BAT by the padded rule.
         let sb_bat_entry_bound = if metadata.has_parent {
             let padded = differencing_bat_entry_count(total_blocks, chunk_ratio_u32)?;
             let region_entries = u64::from(bat_length) / 8;
@@ -3354,21 +3354,47 @@ pub fn build_bat_entry(state: u64, file_offset: u64) -> u64 {
 /// Returns `(total_bat_entries, chunk_ratio, total_payload_blocks)`.
 /// Returns `None` if the layout overflows u32 (e.g. extreme
 /// virtual_disk_size from a malicious image).
+///
+/// `has_parent` selects between the format's two BAT sizing rules, and
+/// is required rather than defaulted because the two differ by up to
+/// `chunk_ratio - 1` entries and a caller that guessed would emit a
+/// region a conforming reader refuses:
+///
+/// * An image with no parent stops at the last entry it needs, which
+///   is one entry per payload block plus the sector bitmap entry that
+///   ends each group those blocks reach into.
+/// * A differencing image reserves whole groups of `chunk_ratio + 1`
+///   entries, because a group's bitmap entry sits at the end of the
+///   group whether or not every payload entry ahead of it is backed by
+///   virtual disk. [`differencing_bat_entry_count`] is that rule, and
+///   the one place it is written down.
+///
+/// A degenerate `chunk_ratio` of zero yields `None` for a differencing
+/// image: with no group size there is no group to pad out to, and
+/// guessing one would size a region by arithmetic the format does not
+/// define. The no-parent rule has no group to reserve and so keeps
+/// counting payload blocks alone.
 pub fn calculate_bat_layout(
     virtual_disk_size: u64,
     block_size: u32,
     logical_sector_size: u32,
+    has_parent: bool,
 ) -> Option<(u32, u32, u32)> {
     let total_blocks_u64 = virtual_disk_size.div_ceil(block_size as u64);
     let chunk_ratio_u64 = (1u64 << 23) * logical_sector_size as u64 / block_size as u64;
     let total_blocks = u32::try_from(total_blocks_u64).ok()?;
     let chunk_ratio = u32::try_from(chunk_ratio_u64).ok()?;
-    let sb_entries = if chunk_ratio > 0 {
-        total_blocks.div_ceil(chunk_ratio)
+    let total_bat_entries = if has_parent {
+        let padded = differencing_bat_entry_count(total_blocks_u64, chunk_ratio)?;
+        u32::try_from(padded).ok()?
     } else {
-        0
+        let sb_entries = if chunk_ratio > 0 {
+            total_blocks.div_ceil(chunk_ratio)
+        } else {
+            0
+        };
+        total_blocks.checked_add(sb_entries)?
     };
-    let total_bat_entries = total_blocks.checked_add(sb_entries)?;
     Some((total_bat_entries, chunk_ratio, total_blocks))
 }
 
@@ -3521,47 +3547,121 @@ mod tests {
     #[test]
     fn bat_layout_1gb_32mb_blocks() {
         let (total, chunk_ratio, payload_blocks) =
-            calculate_bat_layout(1024 * 1024 * 1024, DEFAULT_BLOCK_SIZE, 512).unwrap();
+            calculate_bat_layout(1024 * 1024 * 1024, DEFAULT_BLOCK_SIZE, 512, false).unwrap();
         assert_eq!(payload_blocks, 32); // 1GB / 32MB
         assert_eq!(chunk_ratio, 128); // (2^23 * 512) / 32MB
                                       // SB entries = ceil(32/128) = 1
         assert_eq!(total, 33);
+
+        // The same disk as a differencing child: one whole group of
+        // 128 payload entries plus its bitmap entry, 96 of whose
+        // payload entries the 1 GiB virtual disk never reaches.
+        let (total, chunk_ratio, payload_blocks) =
+            calculate_bat_layout(1024 * 1024 * 1024, DEFAULT_BLOCK_SIZE, 512, true).unwrap();
+        assert_eq!(payload_blocks, 32);
+        assert_eq!(chunk_ratio, 128);
+        assert_eq!(total, 129);
     }
 
     #[test]
     fn bat_layout_4gb_32mb_blocks() {
         let (total, chunk_ratio, payload_blocks) =
-            calculate_bat_layout(4u64 * 1024 * 1024 * 1024, DEFAULT_BLOCK_SIZE, 512).unwrap();
+            calculate_bat_layout(4u64 * 1024 * 1024 * 1024, DEFAULT_BLOCK_SIZE, 512, false)
+                .unwrap();
         assert_eq!(payload_blocks, 128);
         assert_eq!(chunk_ratio, 128);
         // 128 payload + ceil(128/128)=1 SB
+        assert_eq!(total, 129);
+
+        // The one geometry where the two rules agree: the virtual disk
+        // is an exact whole number of chunk groups, so the no-parent
+        // count has nothing left to pad. A test that only used a
+        // geometry like this could not tell the rules apart, which is
+        // why the cases above and below do not.
+        let (total, _chunk_ratio, _payload_blocks) =
+            calculate_bat_layout(4u64 * 1024 * 1024 * 1024, DEFAULT_BLOCK_SIZE, 512, true).unwrap();
         assert_eq!(total, 129);
     }
 
     #[test]
     fn bat_layout_256mb_1mb_blocks() {
         let (total, chunk_ratio, payload_blocks) =
-            calculate_bat_layout(256 * 1024 * 1024, 1024 * 1024, 512).unwrap();
+            calculate_bat_layout(256 * 1024 * 1024, 1024 * 1024, 512, false).unwrap();
         assert_eq!(payload_blocks, 256);
         assert_eq!(chunk_ratio, 4096); // (2^23 * 512) / 1MB
                                        // SB entries = ceil(256/4096) = 1
         assert_eq!(total, 257);
+
+        // A disk smaller than one group still reserves the whole
+        // group: 4096 payload entries and the bitmap entry at their
+        // end, which is BAT index 4096 and so out of reach of the
+        // 257-entry no-parent count.
+        let (total, _chunk_ratio, _payload_blocks) =
+            calculate_bat_layout(256 * 1024 * 1024, 1024 * 1024, 512, true).unwrap();
+        assert_eq!(total, 4097);
+        assert_eq!(sb_bat_index(0, 4096), Some(4096));
+    }
+
+    /// The padded count is what `differencing_bat_entry_count` says,
+    /// not an independent third derivation.
+    ///
+    /// Swept across both logical sector sizes and the whole block-size
+    /// range, because `chunk_ratio` is a function of both and the two
+    /// rules diverge by up to `chunk_ratio - 1` entries.
+    #[test]
+    fn bat_layout_differencing_count_matches_the_padded_rule() {
+        // Not a whole number of chunk groups at every block size, which
+        // is the case the two rules disagree about.
+        const SIZES: [u64; 5] = [1 << 20, 1 << 30, (1 << 30) + (1 << 20), 1 << 32, 1 << 40];
+        for &lss in &[512u32, 4096] {
+            for bs_log in 20..=28u32 {
+                let block_size = 1u32 << bs_log;
+                for &virtual_size in &SIZES {
+                    let (total, chunk_ratio, payload_blocks) =
+                        calculate_bat_layout(virtual_size, block_size, lss, true).unwrap();
+                    assert_eq!(
+                        u64::from(total),
+                        differencing_bat_entry_count(u64::from(payload_blocks), chunk_ratio)
+                            .unwrap(),
+                        "lss={lss} bs={block_size} vsize={virtual_size}",
+                    );
+                    // And the last payload block's own group bitmap
+                    // entry is inside the count, which is the whole
+                    // point of padding it.
+                    let last = u64::from(payload_blocks) - 1;
+                    assert!(
+                        sb_bat_index(last, chunk_ratio).unwrap() < u64::from(total),
+                        "lss={lss} bs={block_size} vsize={virtual_size}: the last \
+                         group's bitmap entry is past the BAT",
+                    );
+                }
+            }
+        }
     }
 
     #[test]
     fn bat_layout_overflow_returns_none() {
         // Extreme virtual_disk_size that would overflow u32
-        assert!(calculate_bat_layout(u64::MAX, 1024 * 1024, 512).is_none());
+        assert!(calculate_bat_layout(u64::MAX, 1024 * 1024, 512, false).is_none());
+        assert!(calculate_bat_layout(u64::MAX, 1024 * 1024, 512, true).is_none());
         // Large enough to overflow u32 total_blocks with 1MB blocks:
         // 1 << 53 bytes / 1MB = 1 << 33 blocks > u32::MAX
-        assert!(calculate_bat_layout(1u64 << 53, 1024 * 1024, 512).is_none());
+        assert!(calculate_bat_layout(1u64 << 53, 1024 * 1024, 512, false).is_none());
+        assert!(calculate_bat_layout(1u64 << 53, 1024 * 1024, 512, true).is_none());
     }
 
     #[test]
     fn bat_layout_large_but_valid() {
         // 1 PiB (1 << 50) with 1MB blocks = 1 << 30 blocks,
         // fits in u32 — should succeed
-        assert!(calculate_bat_layout(1u64 << 50, 1024 * 1024, 512).is_some());
+        assert!(calculate_bat_layout(1u64 << 50, 1024 * 1024, 512, false).is_some());
+        // And so does the padded count at that size: 1 << 18 groups of
+        // 4097 entries is 1_074_003_968, the same number the no-parent
+        // rule reaches because 1 << 30 blocks is a whole number of
+        // groups.
+        let (total, _chunk_ratio, _payload_blocks) =
+            calculate_bat_layout(1u64 << 50, 1024 * 1024, 512, true).unwrap();
+        assert_eq!(total, 1_074_003_968);
     }
 
     // ====================================================================

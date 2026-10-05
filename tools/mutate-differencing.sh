@@ -682,7 +682,7 @@ self_test() {
 # phase's definition of done asks the two to stay in step, which until
 # now was a promise kept by hand. Asserting it makes the drift a
 # failure instead of a documentation bug nobody reads.
-EXPECTED_CASES=62
+EXPECTED_CASES=63
 
 check_case_count() {
     # Only meaningful for a whole run; a selection is expected to be short.
@@ -990,6 +990,17 @@ rust_case 'vhdx-relative-key-convention' "${VHDX_LIB}" \
     '            return Some((relative, true));' \
     '            return Some((relative, false));' \
     vhdx 'only_the_relative_key_is_flagged_as_windows_convention'
+
+# How large a BAT the emitter declares for a differencing child. The
+# mutation sizes it by the no-parent rule, which is what instar did
+# before: one entry per payload block plus one per chunk group, rather
+# than whole groups of chunk_ratio + 1 entries. At most geometries the
+# shortfall vanishes into the 1 MiB region rounding, which is why the
+# named test is the one that picks a geometry where it does not.
+rust_case 'vhdx-write-differencing-bat-sized-as-dynamic' "${VHDX_LIB}" \
+    '    let total_bat_entries = if has_parent {' \
+    '    let total_bat_entries = if false {  // MUTATED' \
+    create 'vhdx_differencing_bat_region_covers_the_last_group_bitmap'
 
 # ---------------------------------------------------------------------
 # The guest chain walker: composing a differencing VHD or VHDX against
@@ -1589,9 +1600,15 @@ integration_case 'oracle-vhd-parent-name-keeps-its-directory' "${CREATE_LIB}" \
 # suite asserted it at all before the oracle did -- the round-trip
 # test's VHD arm checks `disk_type == 4` and its VHDX arm has no
 # equivalent. libvhdi reads the bit back as "Disk type: Differential".
+# The trailing `);` is part of the needle: `parent_path.is_some()` is
+# now the argument to two calls -- this one, and the BAT sizing in
+# `plan_vhdx` -- and only `build_metadata`'s ends the statement. The BAT
+# sizing has its own case, `vhdx-write-differencing-bat-sized-as-dynamic`.
 integration_case 'oracle-vhdx-has-parent-bit' "${CREATE_LIB}" \
-    '        parent_path.is_some(),' \
-    '        false,' \
+    '        parent_path.is_some(),
+    );' \
+    '        false,
+    );' \
     "${ORACLE_VHDX}"
 
 # ---------------------------------------------------------------------

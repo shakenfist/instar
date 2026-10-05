@@ -644,14 +644,23 @@ fn target_can_address(target: ImageFormat, virtual_size: u64, config: &CreateCon
         // VHDX: defer to the parser crate's authoritative computation.
         // calculate_bat_layout returns None when either total_blocks or
         // chunk_ratio overflows u32, which is precisely the ceiling we
-        // need to enforce.
+        // need to enforce. A differencing child's BAT is padded out to
+        // whole chunk groups and so needs more entries than a plain
+        // image of the same virtual size, which is why the backing
+        // file is part of the question rather than ignored here: the
+        // ceiling this gate enforces has to be the one `plan_vhdx`
+        // will size against. Today that is always the padded rule,
+        // because the only caller runs in the backing-derived path --
+        // but it is read off the config rather than hard-coded, so a
+        // second caller cannot be silently wrong.
         ImageFormat::Vhdx => {
             let block_size: u32 = if config.block_size == 0 {
                 32 * 1024 * 1024
             } else {
                 config.block_size
             };
-            vhdx::calculate_bat_layout(virtual_size, block_size, 512).is_some()
+            vhdx::calculate_bat_layout(virtual_size, block_size, 512, config.has_backing())
+                .is_some()
         }
         // Any other target was already rejected by validate_create_args
         // / parse_create_o_options; treat as not addressable so we
