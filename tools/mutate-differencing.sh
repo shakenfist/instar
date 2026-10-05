@@ -682,7 +682,7 @@ self_test() {
 # phase's definition of done asks the two to stay in step, which until
 # now was a promise kept by hand. Asserting it makes the drift a
 # failure instead of a documentation bug nobody reads.
-EXPECTED_CASES=80
+EXPECTED_CASES=86
 
 check_case_count() {
     # Only meaningful for a whole run; a selection is expected to be short.
@@ -1788,6 +1788,55 @@ integration_case 'rebase-differencing-refusal-call-site-removed' "${VMM_MAIN}" \
 
 /// Map a u32 image-format code (as stored in CommitConfig and' \
     "${REBASE_REFUSAL}"
+
+# ---------------------------------------------------------------------
+# The other half of the policy: map, measure and check still refuse a
+# differencing source, each in its own code rather than through
+# `init_chain_states`. Nothing above lifts these six guards -- they are
+# what stops a later phase doing so by accident, by making the deletion
+# visible as a failing, named test rather than a silent behaviour
+# change. Each operation has one guard per format: a VHD arm testing
+# the footer's disk type, and a VHDX arm testing the metadata's
+# `has_parent` flag (map and measure read `VhdxState::has_parent`
+# directly; check reads it off the metadata it already parsed).
+# ---------------------------------------------------------------------
+
+MAP_OP='src/operations/map/src/main.rs'
+MEASURE_OP='src/operations/measure/src/main.rs'
+CHECK_OP='src/operations/check/src/main.rs'
+MAP_REFUSES='test_differencing.TestDifferencingMapStillRefuses.test_map_refuses_with_its_own_message'
+MEASURE_REFUSES='test_differencing.TestDifferencingRefusal.test_measure_refuses_every_differencing_source'
+CHECK_REFUSES='test_differencing.TestDifferencingRefusal.test_check_refuses_every_differencing_source'
+
+integration_case 'map-vhd-refusal-removed' "${MAP_OP}" \
+    '            if state.disk_type == vhd::DISK_TYPE_DIFFERENCING {' \
+    '            if state.disk_type == vhd::DISK_TYPE_DIFFERENCING && false { // MUTATED' \
+    "${MAP_REFUSES}"
+
+integration_case 'map-vhdx-refusal-removed' "${MAP_OP}" \
+    '            if state.has_parent {' \
+    '            if state.has_parent && false { // MUTATED' \
+    "${MAP_REFUSES}"
+
+integration_case 'measure-vhd-refusal-removed' "${MEASURE_OP}" \
+    '            if state.disk_type == vhd::DISK_TYPE_DIFFERENCING {' \
+    '            if state.disk_type == vhd::DISK_TYPE_DIFFERENCING && false { // MUTATED' \
+    "${MEASURE_REFUSES}"
+
+integration_case 'measure-vhdx-refusal-removed' "${MEASURE_OP}" \
+    '            if state.has_parent {' \
+    '            if state.has_parent && false { // MUTATED' \
+    "${MEASURE_REFUSES}"
+
+integration_case 'check-vhd-refusal-removed' "${CHECK_OP}" \
+    '    if footer.disk_type == vhd::DISK_TYPE_DIFFERENCING {' \
+    '    if footer.disk_type == vhd::DISK_TYPE_DIFFERENCING && false { // MUTATED' \
+    "${CHECK_REFUSES}"
+
+integration_case 'check-vhdx-refusal-removed' "${CHECK_OP}" \
+    '    if metadata.has_parent {' \
+    '    if metadata.has_parent && false { // MUTATED' \
+    "${CHECK_REFUSES}"
 
 # ---------------------------------------------------------------------
 # The create guest operation. Caught through the real binary only.

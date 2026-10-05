@@ -1557,7 +1557,7 @@ deliberately broken emitter is not guarding what its name says it
 guards. See [PLAN-differencing.md](plans/PLAN-differencing.md) for the
 path being guarded.
 
-There are **80 cases**, in four groups.
+There are **86 cases**, in five groups.
 
 Twenty-seven cover the writer. Fifteen mutate a library crate
 (`create`, `vhd`, `vhdx`) and are caught by a Rust unit or round-trip
@@ -1619,6 +1619,24 @@ generic "the overlay's header could not be parsed" instead of naming
 the format. All five run through the real binary, caught by
 `TestDifferencingBenchComposes` and `TestDifferencingRebaseThroughChain`
 in `tests/test_differencing.py`.
+
+The final **six guard `map`, `measure` and `check`**, which read
+through none of the machinery above: each reads its source on its own
+and declines a differencing one outright, so composing it is not a
+guest change those operations can inherit. Each has one case per
+format — a VHD arm testing the footer's disk type, a VHDX arm testing
+the metadata's `has_parent` flag — and every case disables its guard
+with an added `&& false` rather than deleting it, so the mutation is a
+one-line, easily reviewed change to a condition that already compiles.
+All six run through the real binary and are caught by the existing
+refusal test for that operation in `tests/test_differencing.py`
+(`TestDifferencingMapStillRefuses`, and `TestDifferencingRefusal`'s
+`measure` and `check` tests), which already iterates every differencing
+fixture rather than one. These six exist so that a later change lifting
+one of these three operations' refusals — the way this phase lifted
+`convert`, `dd`, `compare`, `bench` and `rebase` — cannot happen by
+accident: removing a guard here must fail a named test before it can
+land.
 
 Most of the reader cases name a test in the `qcow2` crate and run it
 with the full input-format feature list, because the

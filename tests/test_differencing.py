@@ -73,6 +73,10 @@ The classes are:
   differencing child at the head of the *second* chain.
 * `TestDifferencingRefusal` -- what each operation does with a
   differencing source it cannot compose.
+* `TestDifferencingNonComposingRefusalPolicy` -- the boundary this phase
+  draws, asserted on its own terms: `map`, `measure` and `check` must
+  each still refuse, each naming itself rather than instar generally,
+  and `check` must refuse the same way with or without `--chain`.
 * `TestDifferencingConvertLeavesNoOutput` -- issue #547's core.
 * `TestDifferencingDdMatchesConvert` -- the only record in the tree
   that `dd` and `convert` share a guest binary.
@@ -334,6 +338,42 @@ MAP_ERROR_CODE = 'map: guest reported error code 3'
 
 class DifferencingTestBase(InstarTestBase):
     """Shared fixture handling and runners for the differencing suite."""
+
+    #: Operation names that compose a differencing source today. Used by
+    #: `assert_refusal_names_itself_not_instar` to check that a
+    #: non-composing refusal never mentions one of these as though the
+    #: limitation it describes were general rather than specific to the
+    #: operation that refused.
+    COMPOSING_OP_NAMES = ('convert', 'dd', 'compare', 'bench', 'rebase')
+
+    def assert_refusal_names_itself_not_instar(self, op: str, message: str) -> None:
+        """Assert `message` names `op` and never reads as a claim about
+        every operation in the tool.
+
+        Shared by every non-composing operation's refusal, including
+        `map`'s own, older wording, so the two properties a refusal must
+        keep -- naming its own operation, and never implying a blanket
+        incapacity -- are defined once rather than once per operation.
+        """
+        self.assertTrue(
+            message.startswith(f'{op}: '),
+            f'{op}: message does not open by naming its own operation: '
+            f'{message!r}'
+        )
+        self.assertNotIn(
+            'instar', message.lower(),
+            f'{op}: message generalises to instar rather than naming '
+            f'{op}: {message!r}'
+        )
+        for other in self.COMPOSING_OP_NAMES:
+            if other == op:
+                continue
+            self.assertIsNone(
+                re.search(rf'\b{other}\b', message, re.IGNORECASE),
+                f'{op}: message mentions {other!r}, which would make the '
+                f'limitation sound general rather than specific to {op}: '
+                f'{message!r}'
+            )
 
     def expected_refusal(self, op: str, format_name: str) -> str:
         """The refusal sentence for an operation that does compose.
@@ -1592,6 +1632,89 @@ class TestDifferencingRefusal(DifferencingTestBase):
                 )
 
 
+class TestDifferencingNonComposingRefusalPolicy(DifferencingTestBase):
+    """The boundary this suite exists to hold: `map`, `measure` and `check`
+    still refuse a differencing source, and their messages hold up both
+    halves of the policy at once.
+
+    `test_check_refuses_every_differencing_source` and
+    `test_measure_refuses_every_differencing_source` above already pin the
+    exact sentence `expected_non_composing_refusal` renders, so the tests
+    here are not duplicating that: they name the two properties that
+    sentence has to keep -- naming its own operation, and never reading as
+    a claim about every operation -- independently of its exact wording.
+    `map` keeps its own, older sentence, which is pinned verbatim in
+    `TestDifferencingMapStillRefuses` below and is due to be reworded, so
+    its test here checks the same two properties without pinning text that
+    is about to change.
+
+    A reader told only "composition is not supported" has no way to tell
+    whether that is true of the command they just typed or of every
+    command in the tool. That is exactly the contradiction a user who has
+    just run a successful `convert` would meet in a refused `map`, so every
+    message here must name its own operation and must not use `instar`'s
+    own name, or another operation's name, as though the limitation
+    applied generally.
+    """
+
+    def test_check_and_measure_name_themselves_rather_than_instar(self):
+        """`check` and `measure` each refuse by their own name, not instar's."""
+        self.assertTrue(
+            DIFFERENCING_FIXTURES, 'DIFFERENCING_FIXTURES must not be empty'
+        )
+        runners = {
+            'check': self.run_instar_check,
+            'measure': self.run_instar_measure,
+        }
+        for op, runner in runners.items():
+            for image_id, format_name in DIFFERENCING_FIXTURES:
+                with self.subTest(op=op, image=image_id):
+                    source = self.differencing_image(image_id)
+                    _stdout, stderr, rc = runner(source)
+                    self.assertEqual(
+                        1, rc,
+                        f'{op}/{image_id}: expected exit 1, got {rc}; '
+                        f'stderr={stderr!r}'
+                    )
+                    message = self.expected_non_composing_refusal(op, format_name)
+                    self.assertIn(
+                        message, stderr,
+                        f'{op}/{image_id}: refusal message not found; '
+                        f'stderr={stderr!r}'
+                    )
+                    self.assert_refusal_names_itself_not_instar(op, message)
+
+    def test_check_refuses_identically_with_and_without_the_chain_flag(self):
+        """`--chain` must not change what `check` decides.
+
+        `check`'s own chain-discovery call states that it cannot compose a
+        differencing parent, so passing `--chain` must not let the host
+        resolve one it is never going to validate. Every chain fixture
+        here has its real parent sitting beside it, which is the one case
+        where chain discovery has something to resolve, so a gate that
+        only behaved differently with `--chain` present would be invisible
+        without this comparison.
+        """
+        self.assertTrue(
+            DIFFERENCING_CHAIN_FIXTURES, 'DIFFERENCING_CHAIN_FIXTURES must not be empty'
+        )
+        for image_id, _parent_name in DIFFERENCING_CHAIN_FIXTURES:
+            with self.subTest(image=image_id):
+                source = self.differencing_image(image_id)
+                plain = self.run_instar_check(source, chain=False)
+                chained = self.run_instar_check(source, chain=True)
+                self.assertEqual(
+                    plain, chained,
+                    f'{image_id}: check --chain disagreed with check without '
+                    f'it; plain={plain!r} chained={chained!r}'
+                )
+                _stdout, stderr, rc = plain
+                self.assertEqual(
+                    1, rc,
+                    f'{image_id}: expected exit 1, got {rc}; stderr={stderr!r}'
+                )
+
+
 class TestDifferencingConvertLeavesNoOutput(DifferencingTestBase):
     """Issue #547: `convert -O raw` produced a wrong file and exited 0.
 
@@ -1776,6 +1899,31 @@ class TestDifferencingMapStillRefuses(DifferencingTestBase):
                     f'{image_id}: map emitted extent rows for a differencing '
                     f'source: {rows}'
                 )
+
+    def test_map_refusal_names_itself_rather_than_instar(self):
+        """map's own wording still names map and does not read as a claim
+        about every operation in the tool.
+
+        `test_map_refuses_with_its_own_message` above pins `MAP_REFUSAL`
+        verbatim, including its citation of a planning document that is
+        due to be dropped from the rendered text. That citation's removal
+        is a wording change, not a policy change, so this test is written
+        against the two properties the wording has to keep rather than
+        against the sentence itself: it must still pass once the sentence
+        is reworded, and should only fail if a rewording drops one of the
+        two properties.
+        """
+        self.assertTrue(DIFFERENCING_FIXTURES, 'DIFFERENCING_FIXTURES must not be empty')
+        for image_id, _format_name in DIFFERENCING_FIXTURES:
+            with self.subTest(image=image_id):
+                source = self.differencing_image(image_id)
+                _stdout, stderr, rc = self.run_instar_map(source)
+                self.assertEqual(
+                    1, rc,
+                    f'{image_id}: expected exit 1 from map, got {rc}; '
+                    f'stderr={stderr!r}'
+                )
+                self.assert_refusal_names_itself_not_instar('map', stderr)
 
 
 class TestDifferencingInfoReports(DifferencingTestBase):
