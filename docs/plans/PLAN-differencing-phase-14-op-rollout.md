@@ -1,0 +1,422 @@
+# Differencing phase 14: composition rollout across the chain-walker operations
+
+## Prompt
+
+Plan phase 14 of `PLAN-differencing.md`: turn the phase 4 refusal
+into composition for the operations that already read through the
+guest chain walker, so that `instar convert`, `dd`, `compare`,
+`bench` and `rebase` read a differencing VHD or VHDX against its
+parent instead of declining the source by name.
+
+Phases 11 to 13 built the machinery and none of it is reachable from
+a user command. The host resolves a chain (`c66f8b2`, #603), the
+guest composes a differencing VHD block (`b4ae7fc`, #615) and a
+differencing VHDX chunk (`d677823c`, #624) -- and every read entry
+point still refuses such a source before any of that runs. This is
+the phase that changes what a user sees, which is why the master
+plan gives it its own review rather than tacking it onto a guest
+phase.
+
+The phase plan is the deliverable; implementation is a separate ask.
+
+## Planning effort
+
+**High.** The diff is mostly deletions of `if` statements, which is
+exactly what makes it dangerous: the phase's real content is
+deciding *when* each deletion is safe, and three of the four
+preconditions were discovered rather than planned. Two are filed
+issues this phase must settle before it deletes anything (#623,
+#614), one is a reachability change this phase creates (#625), and
+the fourth is a host-side gate whose 40-line justifying comment
+stops being true halfway through the phase.
+
+A wrong answer here is silently wrong user data from a command that
+previously failed loudly, which is a strictly worse failure than the
+refusal it replaces.
+
+Review effort: **high**. The master plan does not specify one for
+this phase.
+
+## Scope
+
+**In scope.**
+
+* Issue #623: `vhdx::calculate_bat_layout` sizes a differencing
+  VHDX BAT by the dynamic rule, omitting the chunk-group padding.
+  A gate, per the master plan.
+* Issue #614: `init_chain_states` cannot tell chain boundaries
+  apart from its device count. A gate, per the master plan.
+* Issue #625: the VHDX chain walker accepts a block offset that
+  overlaps the BAT or metadata region. In scope here because
+  lifting the refusal is the change that makes it reachable from a
+  user command -- see decision 3.
+* The host-side composability gate at `src/vmm/src/main.rs:3047`,
+  which today refuses to resolve a differencing parent for *any*
+  composing caller.
+* Lifting the `init_chain_states` refusals (`src/crates/qcow2/src/lib.rs:13501`
+  for VHD, `:13529` for VHDX) for the operations that read through
+  the chain walker: `convert`, `compare`, `bench`, `rebase`, and
+  `dd` by inheritance.
+* Python integration tests proving each of those operations reads a
+  real differencing chain correctly, and that the operations this
+  phase does not cover still refuse.
+* Removing the `PLAN-differencing.md` citation from the
+  user-visible refusal message (`src/vmm/src/main.rs:852`).
+* `docs/` and `CHANGELOG.md` for the behaviour change.
+
+**Out of scope.**
+
+* `map`, `measure` and `check`. The master plan lists all three as
+  phase 14 work; the survey found they do not use the chain walker
+  at all and composing in them means building chain support rather
+  than lifting a refusal -- see F1 and decision 1. They become
+  phase 15, and the current phases 15 to 17 renumber to 16 to 18.
+* `commit`. It is a composing caller on the host
+  (`src/vmm/src/main.rs:7265`) but its guest op reads through its
+  own `backing_chain_first` / `backing_chain_count` slots rather
+  than `init_chain_states`, so it is neither refused today nor
+  lifted here. Recorded because the survey found it and a reader
+  will otherwise wonder.
+* Cross-validation against the phase 1 oracle, and coverage fuzzing
+  of the compose path. That is phase 16 (the current phase 15),
+  including the 4096-byte logical sector gap phase 13 left it.
+* The ~20 other `PLAN-*.md` citations in comments across
+  `src/operations/` and `src/shared/`. Pre-existing, not created by
+  this phase, and a tree-wide sweep does not belong in a phase that
+  changes read behaviour. File an issue.
+
+## What the survey found
+
+Surveyed against `d677823c` on 2026-10-05. The master plan's phase
+14 bullet (`docs/plans/PLAN-differencing.md:530`) describes the
+phase as "turning the refusals into composition across `convert`,
+`compare`, `dd`, `bench`, `map`, `measure` and `check`" and calls it
+"mechanical once 11 to 13 land". Six findings, five of which
+contradict that sentence. The master plan's bullet and the
+`index.md` row are corrected in this phase's planning commit.
+
+**F1. Three of the seven named operations do not use the chain
+walker, and one of the walker's consumers is not named.** The
+refusal the phase 12 bullet called "a single `if` in
+`init_chain_states`" is one of four independent families:
+
+| Operation | Chain walker | Refusal site | What a lift means |
+|---|---|---|---|
+| `convert` | yes | `init_chain_states` | lift, plus the host gate |
+| `dd` | via `convert` | inherits | host only, no guest change |
+| `compare` | yes | `init_chain_states` | lift; the op that needs #614 |
+| `bench` | yes | `init_chain_states` | lift |
+| `rebase` | yes, `src/operations/rebase/src/main.rs:1201` | `init_chain_states` | **absent from the master plan's list** |
+| `check` | partial: `validate_chain` walks members | own, `:1593` / `:1996` | validates members independently; composes nothing |
+| `measure` | no `ChainConfig` at all | own, `:422` / `:441` | build chain support it lacks |
+| `map` | no `ChainConfig` at all | own, `:463` / `:531` | ditto, and `src/shared/src/lib.rs:833` defers it to `PLAN-map.md` |
+
+`rebase` matters most of the four corrections: it reads through
+`init_chain_states`, so lifting the refusal there changes `rebase`
+whether this phase plans for it or not. Leaving it unnamed would
+have shipped an unplanned behaviour change.
+
+`grep -c qcow2::init_chain_states src/operations/*/src/main.rs`
+reproduces the first column; `grep -c ChainConfig` the second.
+
+**F2. `dd` is not a separate operation.** `run_dd`
+(`src/vmm/src/main.rs:14629`) ends in `execute_convert` (`:14732`),
+so there is no `src/operations/dd` and no guest-op work for it. It
+does take its own `discover_backing_chain` with `ChainUse::Compose`
+at `:14686`, so it needs the host half and nothing else.
+
+**F3. The host gate is per-caller-kind, and the rollout is
+per-operation.** `src/vmm/src/main.rs:3047` holds
+
+```rust
+(ChainUse::Compose, true) => { debug!(...); break; }
+```
+
+which records a differencing parent and never resolves it, for
+every composing caller. Its justifying comment (`:2989-3010`)
+argues that resolving a parent instar will not read would make the
+refusal contingent on the parent's presence -- sound reasoning,
+resting on the premise "Nothing in instar can compose a VHD or VHDX
+chain yet: every read entry point refuses such a source by name".
+This phase makes that premise false for five operations and leaves
+it true for three, so the gate cannot stay a property of
+`ChainUse`: it has two variants (`:2700`), nine `Compose` call
+sites and one `Report` (`run_info`, `:10715`). See decision 5.
+
+**F4. #623's blast radius is five consumers, not the writer.**
+`calculate_bat_layout` (`src/crates/vhdx/src/lib.rs:3357`) takes
+`(virtual_disk_size, block_size, logical_sector_size)` and no
+`has_parent`, so it always sizes by the dynamic rule
+`total_blocks + ceil(total_blocks / chunk_ratio)`. The
+differencing rule is `ceil(total_blocks / chunk_ratio) * (chunk_ratio + 1)`.
+Callers: `src/crates/create/src/lib.rs:1404`,
+`src/operations/create/src/main.rs:654`,
+`src/crates/measure/src/lib.rs:1025`,
+`src/crates/resize/src/vhdx.rs:85`, and
+`src/operations/convert/src/main.rs:4394`. Fixing it therefore
+changes `measure`'s predicted file size and `resize`'s target
+layout for a differencing VHDX, and changes the bytes instar
+writes. That is wider than "the writer side" as the master plan's
+gate paragraph (`:537`) implies, and it is why 14a is its own step
+with its own risk entry.
+
+**F5. #614 has an in-tree precedent for its fix.** `ChainConfig`
+(`src/shared/src/lib.rs:4817`) is a flat `[ChainDeviceInfo; 16]`
+with a `device_count` and nothing describing segmentation, which is
+the whole of #614. But the information exists twice already, in
+per-operation configs: `CompareConfig.image1_device_count` /
+`image2_device_count` (`:2376`, `:2381`), and
+`CommitConfig.backing_chain_first` / `backing_chain_count`
+(`:4563`, `:4566`) -- a literal `(start, len)` segment descriptor
+already on the wire. And `read_chain_virtual_cluster` (`:11455`)
+already takes `chain_start` and `chain_len`, so the *reader* knows
+its own chain's bounds; only `init_chain_states` does not. The fix
+is to put the segmentation where the chain is described rather than
+deriving it a fourth time. See decision 4.
+
+**F6. The user-visible refusal message cites a plan file.**
+`src/vmm/src/main.rs:852` renders "composition is deferred (see
+PLAN-differencing.md)" into the error a user reads. This phase
+rewrites that message anyway, since it stops being the answer for
+five operations, so the citation goes with it.
+
+One thing the survey confirmed rather than contradicted: the master
+plan is right that both gates must be settled before any refusal is
+lifted, and right about why. Lifting before #623 ships a reader that
+cannot resolve the sector bitmaps of images instar itself wrote.
+
+## Decisions
+
+1. **Phase 14 covers the chain-walker operations only; `map`,
+   `measure` and `check` become phase 15.** Decided with Michael on
+   2026-10-05 after the survey. The two groups are different work:
+   one deletes guards from a code path that already composes, the
+   other builds chain plumbing in operations that have never had
+   any, and `map`'s belongs to a different master plan. Mixing them
+   would produce a phase whose review could not be scoped. The
+   current phases 15, 16 and 17 renumber to 16, 17 and 18.
+
+2. **Both gates are steps of this phase, 14a and 14b, before any
+   refusal is lifted.** #614 on its own ships nothing a user can
+   observe, so a separate gate phase would have no testable
+   deliverable and no way to demonstrate the thing it enables. Put
+   adjacent to the lift they gate, each is verifiable by the lift
+   failing without it.
+
+3. **Issue #625 is in scope, and it is this phase that makes it
+   urgent.** Phase 13 added a `MIN_BLOCK_FILE_OFFSET` floor so a
+   zeroed BAT entry cannot name offset 0, but an entry naming 2 MiB
+   -- inside the BAT or metadata region of a small image -- is still
+   accepted. While every read entry point refuses a differencing
+   source, that path is reachable only from crate tests. Lifting the
+   refusal makes it reachable from `instar convert` on an untrusted
+   image, which turns a latent bound check into a reachable one.
+   Fixing it in the phase that creates the reachability is cheaper
+   than filing it forward, and a reviewer should not have to
+   reconstruct that argument.
+
+4. **#614 is fixed by giving `ChainConfig` the segmentation, at
+   version 3 -- not by adding a parameter to `init_chain_states`.**
+   The alternative is to pass a segment list from each of the four
+   call sites, derived from each operation's own config. That works
+   and is a smaller diff, and it is the wrong shape: it asks four
+   operations to compute the same fact consistently, when
+   `ChainConfig` is the struct whose entire job is describing the
+   chain. `ChainConfig` has a `version` (currently 2, for
+   `data_device_idx`) and a `_reserved` word, so the extension is
+   routine, and `CommitConfig`'s `(first, count)` pair is the
+   in-tree precedent for the field shape. Making the answer
+   derivable once is also what stops a fifth consumer getting it
+   wrong later.
+
+   **This is the decision most likely to be argued with**, because
+   it is a guest/host ABI change in a phase whose point is deleting
+   `if` statements, and because the per-operation alternative would
+   let 14b be a two-line change in `compare` alone. Three things
+   decide it. `compare` is not the only op with a multi-chain
+   future -- a `convert` with a differencing source and a
+   differencing output chain has the same shape. The reader already
+   carries `chain_start`/`chain_len`, so the asymmetry being fixed
+   is that `init_chain_states` was handed less than its sibling, not
+   that nobody knew. And a wrong answer composes a child against an
+   unrelated image, which the refusal currently prevents and no test
+   that uses a single chain can detect -- exactly the defect class
+   phase 12 found by writing the two-device case.
+
+5. **The host gate becomes a per-call capability, not a third
+   `ChainUse` variant.** `ChainUse` distinguishes "will attach and
+   launch" from "will print"; whether a *particular* operation can
+   compose a differencing VHD is orthogonal to that, and encoding it
+   as `ChainUse::ComposeDifferencing` would make the enum mean two
+   things at once and leave nine call sites to audit for which they
+   meant. Add a separate argument carrying the composability, so a
+   call site states its capability explicitly and a reader can
+   enumerate the five that say yes. The comment at `:2989` is
+   rewritten to argue the surviving case rather than deleted: the
+   reasoning is still correct for the operations that still refuse.
+
+6. **Rollout order is `convert` (with `dd`), then `compare`, then
+   `bench` and `rebase`.** `convert` first because it is the
+   operation a user reaches for, it has the most read paths
+   (`read_chain_virtual_cluster` ten times in
+   `src/operations/convert/src/main.rs`), and an integration test
+   for it is a whole-file byte comparison -- the cheapest strong
+   proof available. `compare` second because it is the op that
+   exercises 14b: it is the one that packs two chains into one
+   array. `bench` and `rebase` last and together: both are single
+   additional call sites once the first two are right.
+
+7. **`calculate_bat_layout` gains a required parameter, not a
+   defaulted one or a second function.** Every one of the five
+   consumers must state whether it is sizing a differencing image,
+   and the compiler should refuse the ones that do not. A
+   `calculate_bat_layout_differencing` sibling would let a consumer
+   keep calling the old name and be silently wrong, which is the
+   failure #623 already is.
+
+8. **A half-lifted tree must say so.** After this phase, `convert`,
+   `dd`, `compare`, `bench` and `rebase` compose a differencing
+   source and `map`, `measure` and `check` refuse it. The refusal
+   message must name the operation and not imply that instar cannot
+   compose at all -- a user who has just run a successful `convert`
+   and then a refused `map` needs the message to explain the
+   difference rather than contradict their last command.
+
+## Step plan
+
+| Step | Effort | Model | Isolation | Brief for sub-agent |
+|---|---|---|---|---|
+| 14a | high | opus | none | Fix issue #623. Give `vhdx::calculate_bat_layout` (`src/crates/vhdx/src/lib.rs:3357`) a required `has_parent: bool` parameter and size the BAT by the differencing rule when it is set: a differencing VHDX BAT is padded to whole chunk groups, `ceil(total_blocks / chunk_ratio) * (chunk_ratio + 1)` entries, where a dynamic one takes `total_blocks + ceil(total_blocks / chunk_ratio)`. Update all five consumers to pass their actual intent: `src/crates/create/src/lib.rs:1404`, `src/operations/create/src/main.rs:654`, `src/crates/measure/src/lib.rs:1025`, `src/crates/resize/src/vhdx.rs:85`, `src/operations/convert/src/main.rs:4394`. Do not add a defaulted parameter or a sibling function (decision 7). Three consequences to handle rather than discover: `measure`'s predicted size for a differencing VHDX changes, so its expectation changes with it; `resize` must be checked for whether it accepts a differencing VHDX at all before its call site is given a `true` branch; and the bytes `create -f vhdx -b` writes change, so any golden fixture or round-trip expectation over that output changes too -- find them with `make test-rust` and the `tests/test_create.py` and `tests/test_differencing.py` suites rather than by reading. The phase 13 reader deliberately caps itself at the declared BAT region (`sb_bat_entry_bound`, added in `ec005d57`); once the writer is right, confirm that cap no longer truncates instar's own output, and say in the commit message which image geometry you checked it at. Add a mutation to `tools/mutate-differencing.sh` reverting the padded rule. Closes #623 -- use the `Fixes` keyword in the pull request body, not only the commit message. |
+| 14b | high | opus | none | Fix issue #614. `init_chain_states` (`src/crates/qcow2/src/lib.rs:13404`) receives only `device_count`, a bound on a flat array that may hold several independent chains -- `compare diff.vhdx base.raw` packs two -- so it cannot tell a differencing child with a real parent behind it from one followed by an unrelated image. Extend `ChainConfig` (`src/shared/src/lib.rs:4817`) to carry the segmentation and bump `ChainConfig::VERSION` to 3, following the `(first, count)` field shape `CommitConfig.backing_chain_first` / `backing_chain_count` (`:4563`) already ships; a `_reserved` word is available. Do not add a parameter to `init_chain_states` instead (decision 4). Populate it on the host for all four callers -- `run_bench` (`src/vmm/src/main.rs:5045`), `run_rebase` (`:6903`, `:6916`), `run_compare` (`:12407`, `:12417`), `execute_convert` (`:13255`) -- and assert in the guest that a chain's segment bounds agree with `device_count`. No refusal is lifted in this step: the deliverable is that `init_chain_states` *could* make the per-chain judgement, proved by a test that builds a two-chain array with a differencing child at index 0 and asserts the function sees chain length 1 for it. The existing `vhdx_init_refuses_a_differencing_child_and_admits_a_dynamic_one` (`src/crates/qcow2/src/lib.rs:9795`) documents the hazard in its comment and is the test to extend. Closes #614. |
+| 14c | medium | sonnet | none | Fix issue #625. Phase 13 added `vhdx::MIN_BLOCK_FILE_OFFSET` so a zeroed or truncated BAT entry cannot name file offset 0, but an entry naming any offset inside the BAT or metadata region of a small image is still accepted, and `block_lookup` / `sector_bitmap_lookup` will read a block from there. Bound a payload or sector-bitmap block's file offset below by the end of the last declared region rather than by a 1 MiB constant: `VhdxState` already parses the region table at init, so the bound is derivable from what the image declares about itself. Refuse, do not clamp -- an image whose BAT names a block inside its own metadata is malformed, and the phase 12 and 13 arms both fail closed rather than guess. Add crate tests for an offset inside the BAT region, inside the metadata region, and immediately after the last region as a positive control, plus mutations in `tools/mutate-differencing.sh`. This is a bound check, not a behaviour change: no image instar writes names such an offset, and the test that proves it is the existing compose suite still passing. Closes #625. |
+| 14d | high | opus | none | The host-side composability gate. `discover_backing_chain` (`src/vmm/src/main.rs`, the match at `:3044`) refuses to resolve a differencing VHD or VHDX parent for every `ChainUse::Compose` caller. Replace the caller-kind test with an explicit per-call capability argument (decision 5) -- not a third `ChainUse` variant -- so each of the ten call sites states whether its operation can compose a differencing chain. Set it true for `run_bench` (`:5045`), `run_rebase` (`:6903`, `:6916`), `run_compare` (`:12407`, `:12417`), `execute_convert` (`:13255`) and `run_dd` (`:14686`); false for `run_commit` (`:7265`) and `run_check` (`:11662`); `run_info` (`:10715`) stays `Report` and is untouched. Rewrite the comment at `:2989-3010` rather than deleting it: its argument -- that a refusal must never become contingent on whether a parent file happens to exist -- is still exactly right for the callers that still refuse, and is the invariant phase 4 established and phase 11 preserved. State in the commit message which call sites you set each way and why, because that list is the phase's actual policy. No guest change in this step; the refusals are still in `init_chain_states`, so every operation still fails, and the proof of this step is that the host now resolves the parent and the guest still declines it. |
+| 14e | high | opus | none | Lift the refusal for `convert`, and `dd` with it. Remove the VHD (`src/crates/qcow2/src/lib.rs:13501`) and VHDX (`:13529`) refusals from `init_chain_states`, replacing them with the per-chain judgement 14b made possible: a differencing child with no device behind it *in its own chain* must still be refused, because composing it would read parent-owned sectors from nothing. That is the condition phase 12 proved unsafe to write against `device_count` and 14b makes safe to write against the segmentation. Keep the typed refusal and its status codes (`shared::DifferencingRefusal`) for that case -- it is now a narrower refusal, not a deleted one. Rewrite the host message at `src/vmm/src/main.rs:841-857` per decision 8: name the operation, say that the source's parent could not be composed and why, and drop the `PLAN-differencing.md` citation (F6). Verify with a Python integration test that converts a real differencing VHD and a real differencing VHDX to raw and compares the whole output byte-for-byte against the same chain flattened by the phase 1 oracle or by `instar` reading the parent directly -- a whole-file comparison, not a spot check. Both formats, and a chain of depth 3 for at least one of them. |
+| 14f | high | opus | none | Lift for `compare`, which is the operation 14b exists for. `compare` packs two independent chains into one device array (`CompareConfig.image1_device_count` / `image2_device_count`, `src/shared/src/lib.rs:2376`) and calls `init_chain_states` once with the total (`src/operations/compare/src/main.rs:215`). The tests that matter are the ones a single-chain test cannot fail: a differencing child as image1 against a raw image2, where the old `dev_idx + 1 >= device_count` form would have composed the child against image2; and both images differencing children of different parents. Assert the comparison verdict, not just that the command exits 0 -- a wrongly composed read can still produce "identical" if both sides are wrong the same way, so one test must compare a differencing chain against its own correctly flattened output and a second must compare it against a deliberately different image and expect a difference at a known offset. |
+| 14g | medium | sonnet | none | Lift for `bench` and `rebase`. Both read through `init_chain_states` and need no new guest logic once 14e is in: `src/operations/bench/src/main.rs:1395` and `src/operations/rebase/src/main.rs:1201`. `rebase` is the one the master plan did not name (F1), so it needs the most care in testing rather than the least: rebasing a differencing VHD or VHDX child onto a new parent reads the old chain and writes a new one, so a test must assert the rebased image's contents, not merely that the operation completed. For `bench`, a differencing source should produce a throughput number rather than an error, and the test should assert the byte count it reports matches the virtual size -- a composed read that silently served zeros would otherwise pass. |
+| 14h | medium | sonnet | none | Integration-test the boundary this phase draws. Add tests asserting that `map`, `measure` and `check` *still* refuse a differencing source, with their own refusal messages, and that each message satisfies decision 8 -- names its operation and does not claim instar cannot compose. This is the test that stops phase 15 silently inheriting a half-lifted tree, and the test that would have caught `rebase` being missing from the master plan's list. Put them in `tests/test_differencing.py` beside the composition tests, so the two halves of the policy are read together. Also add a case per operation to `tools/mutate-differencing.sh` that re-asserts the refusal, so a future phase cannot lift one of the three by accident. |
+| 14i | low | sonnet | none | Documentation and changelog. `CHANGELOG.md`: the five operations that now compose a differencing VHD or VHDX, the three that still refuse, and the three issues closed. `docs/convert.md`, `docs/compare.md`, `docs/bench.md`, `docs/rebase.md` and `docs/dd.md` each gain or lose a differencing limitation -- check what each currently claims rather than assuming, since phase 4 wrote those limitations and some are now false. `docs/map.md:238`'s VHDX partial-present entry and `docs/measure.md` stay as they are and should be checked to confirm they still read as a limitation rather than a plan. `docs/chain-discovery.md` describes the host walk and now needs the per-call capability (decision 5). Do not update `ARCHITECTURE.md` -- no component or data path changes -- and do not update `AGENTS.md` unless 14b's `ChainConfig` version bump creates a convention an agent could not infer, in which case one line about the version is the whole change. |
+
+## Risks and mitigations
+
+* **14a changes bytes instar already writes.** Fixing the BAT
+  sizing changes the output of `create -f vhdx -b` and the size
+  `measure` predicts for it. A round-trip or golden expectation
+  that encodes the old size will fail, and the failure will look
+  like a regression. *Mitigation*: 14a's brief requires finding
+  them by running the suites, and the management session reviews
+  the list of changed expectations as a list -- each one must be
+  explained as "the old number was the bug", not adjusted to
+  match.
+
+* **14b is a guest/host ABI change.** A version-3 `ChainConfig`
+  read by a guest binary built against version 2, or the reverse,
+  is a silent misparse rather than an error. *Mitigation*: the
+  version field exists and `is_valid` already checks magic;
+  14b must make the guest refuse a version it does not know,
+  and a test must assert the refusal. The management session
+  checks that both halves of the tree are rebuilt before any
+  integration test is believed -- a stale `instar-release` image
+  has produced a false result in this project before.
+
+* **A half-lifted tree is a new user-visible inconsistency.**
+  Five operations compose, three refuse, and a user will hit both
+  in one session. *Mitigation*: decision 8 and step 14h, which
+  tests the refusal messages rather than only the refusals.
+
+* **The lift's correctness is invisible to a test that uses one
+  chain.** The defect #614 describes -- composing a child against
+  an unrelated image -- produces plausible output. *Mitigation*:
+  14f's two-chain cases are the specific test, and the
+  `tools/mutate-differencing.sh` entries from 14b and 14f must
+  kill a mutation that reverts the segmentation. The harness
+  verdict, not the suite passing, is the evidence.
+
+* **Phase 15's scope is now defined by this phase's omission.**
+  If 14h's boundary tests are weak, phase 15 inherits an unclear
+  starting point. *Mitigation*: 14h is a step rather than a line
+  in 14i's brief, precisely so it is reviewed on its own.
+
+## Definition of done
+
+* `instar convert` writes byte-identical output for a differencing
+  VHD chain and for the same data flattened into a single image.
+  Both outputs are in 14e's commit message, with the command that
+  produced them. Same for VHDX.
+* `instar compare` of a differencing child against its own
+  correctly flattened output reports identical, and against a
+  deliberately different image reports a difference at the
+  expected offset. Both assertions are in `tests/test_differencing.py`.
+* `instar map`, `instar measure` and `instar check` each still
+  refuse a differencing source, and each refusal message names its
+  own operation. Falsifiable: a test asserts the message text, not
+  just the exit code.
+* No user-visible string contains `PLAN-`. Falsifiable:
+  `grep -rn 'PLAN-[a-z0-9-]*\.md' --include=*.rs src/ | grep -v '^\s*//'`
+  returns nothing from `format!`, `println!`, `eprintln!` or a
+  `&str` constant.
+* `vhdx::calculate_bat_layout` cannot be called without stating
+  `has_parent`. Falsifiable: it takes four parameters, and
+  `grep -c 'calculate_bat_layout(' src/` finds the same five
+  consumers it finds today.
+* A differencing VHDX written by `instar create -f vhdx -b` and
+  read back by `instar convert` resolves every sector bitmap --
+  that is, the phase 13 `sb_bat_entry_bound` cap no longer
+  truncates instar's own output. Falsifiable: the geometry and the
+  before/after entry counts are in 14a's commit message.
+* `init_chain_states` refuses a differencing child that has no
+  device behind it *in its own chain*, and admits one that does,
+  with a two-chain array distinguishing them. Both are asserted by
+  tests, and a mutation reverting the segmentation kills one of
+  them.
+* `tools/mutate-differencing.sh` case count has grown, the new
+  count is derived by `check_case_count` rather than written in
+  prose, and `docs/testing.md` agrees with it. Every new case is
+  PASS or a documented SURVIVOR; no BROKEN.
+* `make test-rust` passes with zero failures and the count is
+  stated, against the 2427 phase 13 measured.
+* `pre-commit run --all-files` is clean.
+* No source file or comment added by this phase cites a plan
+  phase, step or decision number. Falsifiable:
+  `git diff d677823c..HEAD -- 'src/*' | grep '^+' | grep -iE 'PLAN-[a-z0-9-]+\.md|decision [0-9]|phase 1[0-9]|14[a-i]'`
+  is empty.
+* `CHANGELOG.md` names which operations compose and which refuse.
+
+## Back brief
+
+Before implementation starts, confirm:
+
+1. **The step order and the gate placement.** 14a to 14c settle
+   three issues before 14d touches a policy and 14e deletes a
+   guard. Nothing user-visible changes until 14e.
+
+2. **A gate on 14b's wire format, before any code is written.**
+   The `ChainConfig` version-3 field shape is cheap to propose and
+   expensive to redo: it is read by five guest operations and
+   written by four host paths, and getting the shape wrong means
+   redoing 14b, 14e, 14f and 14g. The implementer of 14b must
+   bring the exact struct definition -- field names, types,
+   offsets, and what the guest asserts about them -- to the
+   management session before editing. Decision 4 settles that the
+   segmentation goes in `ChainConfig`; it does not settle whether
+   that is a per-device chain id, a per-chain `(first, count)`
+   table, or a `chain_start` on each `ChainDeviceInfo`.
+
+3. **That the two gates really are gates.** If 14a or 14b turns
+   out to be larger than planned -- 14a's five consumers are the
+   likeliest source of that -- the phase stops and reports rather
+   than lifting a refusal onto an unsettled gate. The master plan
+   is explicit that lifting before #623 ships a reader that cannot
+   read instar's own output.
+
+4. **Model and effort.** 14a, 14b, 14d, 14e and 14f are opus at
+   high effort: each decides a policy or a wire format rather than
+   implementing one. 14c, 14g and 14h are sonnet at medium with
+   the briefs above. 14i is low. No step wants `fable`; none of
+   them has defeated opus.
+
+5. **The standing warning.** This repository's history is that
+   agents assert plausible-but-wrong format and tool
+   capabilities. Every claim about what a VHDX BAT contains at a
+   given geometry must be measured against a built image, not
+   reasoned about -- phase 13 found its largest defect (`ec005d57`)
+   exactly where the arithmetic looked obviously right.
