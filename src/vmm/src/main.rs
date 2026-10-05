@@ -973,13 +973,15 @@ mod guest_exception_tests {
 
 #[cfg(test)]
 mod differencing_parent_classification_tests {
-    //! Tests for the classification helpers a reporting caller uses to
-    //! walk a differencing VHD/VHDX parent without opening a KVM guest:
+    //! Tests for the classification helpers that decide how one hop of
+    //! a walk treats a differencing VHD/VHDX parent, all of them
+    //! exercised without opening a KVM guest: `classify_parent_walk`,
     //! `is_windows_absolute_reference`, `resolve_reported_parent`, and
-    //! the `UnresolvedParent` reasons they produce. `ChainUse` itself is
-    //! exercised only at the enum level here -- `discover_backing_chain`
-    //! launches a guest, so the gate it selects is left to the Python
-    //! integration tests.
+    //! the `UnresolvedParent` reasons they produce.
+    //! `discover_backing_chain` itself runs the sandboxed info
+    //! operation once per chain member, so what it does with each
+    //! classification -- and whether a composed read then succeeds --
+    //! is left to the Python integration tests.
     use super::*;
     use tempfile::TempDir;
 
@@ -998,6 +1000,78 @@ mod differencing_parent_classification_tests {
         let compose_again = compose;
         assert_eq!(compose, compose_again);
         assert_ne!(compose, report);
+    }
+
+    // --- classify_parent_walk -----------------------------------------
+
+    #[test]
+    fn a_composing_caller_resolves_a_differencing_parent_only_when_it_composes() {
+        // Two callers that both attach devices and launch a guest take
+        // opposite answers on the same hop. That is the whole point of
+        // carrying the capability per call: `ChainUse` cannot tell them
+        // apart, and before it existed both were refused the parent.
+        assert_eq!(
+            classify_parent_walk(ChainUse::Compose, DifferencingComposition::Supported, true),
+            ParentWalk::Resolve
+        );
+        assert_eq!(
+            classify_parent_walk(
+                ChainUse::Compose,
+                DifferencingComposition::Unsupported,
+                true
+            ),
+            ParentWalk::RecordWithoutResolving
+        );
+    }
+
+    #[test]
+    fn a_supported_differencing_hop_resolves_exactly_as_a_qcow2_hop_does() {
+        // `Supported` must not invent a third kind of resolution: a
+        // composing caller that can read the parent takes the same hard
+        // Resolve a qcow2 or VMDK hop has always taken, so a missing
+        // parent is an error rather than a silently short chain.
+        assert_eq!(
+            classify_parent_walk(ChainUse::Compose, DifferencingComposition::Supported, true),
+            classify_parent_walk(ChainUse::Compose, DifferencingComposition::Supported, false)
+        );
+    }
+
+    #[test]
+    fn the_capability_is_inert_off_a_vhd_family_hop() {
+        // `Unsupported` must not stop a qcow2 or VMDK walk short. The
+        // policy is per hop, so a non-VHD-family hop resolves for every
+        // caller and every capability.
+        for composition in [
+            DifferencingComposition::Supported,
+            DifferencingComposition::Unsupported,
+        ] {
+            assert_eq!(
+                classify_parent_walk(ChainUse::Compose, composition, false),
+                ParentWalk::Resolve
+            );
+            assert_eq!(
+                classify_parent_walk(ChainUse::Report, composition, false),
+                ParentWalk::Resolve
+            );
+        }
+    }
+
+    #[test]
+    fn a_reporting_caller_ignores_the_composition_capability() {
+        // Why `run_info` can state `Unsupported` honestly -- it composes
+        // nothing -- and still resolve the parent: a reporting caller
+        // refuses nothing, so it has no refusal to make contingent on
+        // the parent's presence, and the capability never reaches the
+        // decision.
+        for composition in [
+            DifferencingComposition::Supported,
+            DifferencingComposition::Unsupported,
+        ] {
+            assert_eq!(
+                classify_parent_walk(ChainUse::Report, composition, true),
+                ParentWalk::ResolveOrEndListing
+            );
+        }
     }
 
     // --- is_windows_absolute_reference ---------------------------------
@@ -2693,9 +2767,10 @@ fn execute_info_operation(
 
 /// What the caller will do with the chain it asks for.
 ///
-/// A differencing VHD or VHDX parent is resolved only for
-/// `Report`. `Compose` callers get the child alone, so their
-/// refusal cannot depend on whether the parent exists.
+/// This says nothing about differencing VHD or VHDX parents. Whether
+/// one of those is resolved is decided per call, by the
+/// [`DifferencingComposition`] argument beside this one: two callers
+/// that both attach devices and launch a guest can disagree about it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChainUse {
     /// The caller goes on to attach the chain as virtio devices and
@@ -2703,6 +2778,40 @@ enum ChainUse {
     Compose,
     /// The caller only prints the chain and returns.
     Report,
+}
+
+/// Whether the operation behind a call can read a differencing VHD or
+/// VHDX child against its parent.
+///
+/// Composition arrived one operation at a time rather than all at
+/// once, so this is a property of the *call* and not of [`ChainUse`].
+/// Stating it at each call site is what keeps the set of operations
+/// that compose enumerable by reading the call sites, instead of
+/// inferred from a caller's kind and then audited image by image.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DifferencingComposition {
+    /// The operation reads a differencing child against its parent, so
+    /// the parent is data it needs and is resolved like any other
+    /// backing file.
+    Supported,
+    /// The operation does not: either it refuses such a source by name
+    /// before any parent matters, or it composes nothing at all. The
+    /// parent must not be resolved.
+    Unsupported,
+}
+
+/// What the walk does with the parent reference it has just read out
+/// of an image's header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ParentWalk {
+    /// Resolve the parent under the allowlist and depth rules and
+    /// carry on from it; a failure is an error.
+    Resolve,
+    /// Resolve it by the same rules, but treat a failure as the end of
+    /// the listing rather than as an error.
+    ResolveOrEndListing,
+    /// Leave the reference recorded but unresolved, and stop the walk.
+    RecordWithoutResolving,
 }
 
 /// Why a reporting walk could not resolve a differencing parent.
@@ -2815,6 +2924,34 @@ fn resolve_reported_parent(
     Ok(resolved)
 }
 
+/// Decide what one hop of the walk does with the parent it just found.
+///
+/// `leaving_vhd_family` is true when the image whose header named this
+/// parent is itself a VHD or VHDX. It is split out of
+/// `discover_backing_chain` so the policy can be asserted without a
+/// KVM guest -- that function runs the sandboxed info operation once
+/// per chain member. The reasoning behind each answer is at the call
+/// site, where the alternatives are visible together.
+fn classify_parent_walk(
+    chain_use: ChainUse,
+    differencing_composition: DifferencingComposition,
+    leaving_vhd_family: bool,
+) -> ParentWalk {
+    if !leaving_vhd_family {
+        return ParentWalk::Resolve;
+    }
+    match chain_use {
+        // A reporting caller resolves the parent whatever the operation
+        // behind it could do with one, because it has no refusal to
+        // make contingent on the parent's presence.
+        ChainUse::Report => ParentWalk::ResolveOrEndListing,
+        ChainUse::Compose => match differencing_composition {
+            DifferencingComposition::Supported => ParentWalk::Resolve,
+            DifferencingComposition::Unsupported => ParentWalk::RecordWithoutResolving,
+        },
+    }
+}
+
 /// Discover the complete backing file chain for an image.
 ///
 /// This function iteratively runs the sandboxed info operation to discover
@@ -2827,6 +2964,8 @@ fn resolve_reported_parent(
 /// * `sector_size` - Sector size for virtio-block devices
 /// * `security_config` - Security configuration with path allowlist
 /// * `chain_use` - What the caller will do with the discovered chain
+/// * `differencing_composition` - Whether the calling operation can
+///   read a differencing VHD or VHDX child against its parent
 ///
 /// # Returns
 ///
@@ -2836,6 +2975,7 @@ fn discover_backing_chain(
     sector_size: u32,
     security_config: &config::SecurityConfig,
     chain_use: ChainUse,
+    differencing_composition: DifferencingComposition,
 ) -> Result<BackingChain, ChainError> {
     let mut chain = BackingChain::new();
     let mut seen_paths: Vec<std::path::PathBuf> = Vec::new();
@@ -2989,25 +3129,48 @@ fn discover_backing_chain(
         // Check for backing file
         match info_result.backing_file {
             Some(backing_path) => {
-                // A differencing VHD or VHDX parent is walked only for a
-                // caller that is going to report the chain. A caller that
-                // composes one -- attaches every chain member as a virtio
-                // device and launches a guest -- stops here instead, with
-                // the parent left in `backing_file_raw` so it is still
-                // reported but never resolved.
+                // A differencing VHD or VHDX parent is resolved only for
+                // a caller that is going to read it. Three things decide
+                // that: whether this caller reports the chain or composes
+                // it, whether the hop being taken leaves a VHD-family
+                // image, and -- for a composing caller -- whether the
+                // operation behind the call can read a differencing child
+                // against its parent at all.
                 //
-                // Nothing in instar can compose a VHD or VHDX chain yet:
-                // every read entry point refuses such a source by name,
-                // before any parent matters. Resolving the parent for
-                // those callers could only change *which* failure the user
+                // That third input is why the same gate now answers
+                // differently for different commands, and it is why the
+                // capability is stated at each call site rather than read
+                // off the caller's kind. `convert` (and `dd` through it),
+                // `compare`, `bench` and `rebase` read a differencing
+                // child through the guest chain walker, so they state
+                // `DifferencingComposition::Supported` and their parent is
+                // resolved under the same allowlist and depth rules a
+                // qcow2 or VMDK chain has always taken. What the guest
+                // then makes of the chain is the guest's decision; this
+                // gate only settles whether the parent reaches it.
+                //
+                // `commit` and `check` state `Unsupported`. `check`'s
+                // guest op refuses a differencing source by name before
+                // any parent matters, and `commit`'s guest ignores the
+                // ancestor slots the host populates for it altogether, so
+                // neither of them would ever open the parent. Their
+                // reference stays in `backing_file_raw` -- so it is still
+                // reported -- and is never resolved.
+                //
+                // The argument for that second group is the invariant this
+                // gate exists to hold, and nothing here weakens it. For an
+                // operation that is not going to read the parent,
+                // resolving it could only change *which* failure the user
                 // sees, never whether the read succeeds -- and it would
                 // make that failure worse, because the outcome would become
                 // contingent on the parent's presence. The same
                 // differencing image would give the typed refusal when its
                 // parent happened to sit beside it and a path error when it
                 // did not. A refusal that depends on a file instar is not
-                // going to read is not a refusal, so a composing caller
-                // must never resolve a parent it will not read.
+                // going to read is not a refusal, so an operation that will
+                // not read the parent must never resolve it -- and the only
+                // way to know which operations those are is for each call
+                // to say which it is.
                 //
                 // A reporting caller has no refusal to make contingent, so
                 // it resolves the parent under the same allowlist and depth
@@ -3022,14 +3185,22 @@ fn discover_backing_chain(
                 // this: the allowlist check still runs and still rejects,
                 // and no rejected path is ever opened.
                 //
-                // The fail-soft is confined to VHD and VHDX. A qcow2 or
-                // VMDK chain still errors on an unresolvable parent for
-                // every caller, reporting ones included, because those
-                // formats compose: a listing that quietly stopped short
-                // would disagree with what the very next `convert` of the
-                // same image does, and the error is the older, tested
-                // behaviour of both `info --chain` and every operation
-                // beside it.
+                // The fail-soft is confined to a reporting caller's VHD
+                // and VHDX hops. A qcow2 or VMDK chain still errors on an
+                // unresolvable parent for every caller, reporting ones
+                // included, because those formats compose: a listing that
+                // quietly stopped short would disagree with what the very
+                // next `convert` of the same image does, and the error is
+                // the older, tested behaviour of both `info --chain` and
+                // every operation beside it. Now that a `convert` of a
+                // differencing VHD or VHDX resolves its parent, that
+                // disagreement does exist for them too -- `info --chain`
+                // ends the listing where a `convert` of the same image
+                // errors on the unresolvable reference. It is left that way
+                // on purpose: `info` must not turn a listing into a
+                // non-zero exit, and the listing still prints the
+                // reference it could not follow, so a user sees the same
+                // broken link either way.
                 //
                 // It is confined per *hop*, not per chain, because the
                 // test below reads the format of the image being examined
@@ -3039,14 +3210,18 @@ fn discover_backing_chain(
                 // reverts to hard errors from that point on. A chain is
                 // therefore not uniformly soft or hard; each step takes
                 // the policy of the image it is leaving.
-                let differencing_vhd = matches!(image_format, ImageFormat::Vhd | ImageFormat::Vhdx);
+                let leaving_vhd_family =
+                    matches!(image_format, ImageFormat::Vhd | ImageFormat::Vhdx);
 
-                match (chain_use, differencing_vhd) {
-                    // Composing caller, differencing VHD or VHDX: the
-                    // parent is recorded but never resolved.
-                    (ChainUse::Compose, true) => {
+                match classify_parent_walk(chain_use, differencing_composition, leaving_vhd_family)
+                {
+                    // A composing caller whose operation does not read a
+                    // differencing parent: the reference is recorded but
+                    // never resolved.
+                    ParentWalk::RecordWithoutResolving => {
                         debug!(
-                            "Differencing {} parent not walked (composition deferred): {}",
+                            "Differencing {} parent recorded but not resolved \
+                             (this operation does not compose a differencing chain): {}",
                             info_result.format, backing_path
                         );
                         break;
@@ -3054,7 +3229,7 @@ fn discover_backing_chain(
                     // Reporting caller, differencing VHD or VHDX: resolve
                     // it, and end the listing rather than the command if
                     // that cannot be done.
-                    (ChainUse::Report, true) => {
+                    ParentWalk::ResolveOrEndListing => {
                         match resolve_reported_parent(
                             &current,
                             &backing_path,
@@ -3074,10 +3249,11 @@ fn discover_backing_chain(
                             }
                         }
                     }
-                    // Every other format, for every caller: unchanged.
-                    // Validate and resolve the backing file path, and
-                    // propagate any error.
-                    (_, false) => {
+                    // Every hop that leaves a non-VHD-family image, and
+                    // every VHD or VHDX hop taken by an operation that
+                    // composes one: validate and resolve the backing file
+                    // path, and propagate any error.
+                    ParentWalk::Resolve => {
                         let backing_resolved =
                             validate_backing_path(&current, &backing_path, security_config)?;
                         current = backing_resolved;
@@ -5110,6 +5286,7 @@ fn run_bench(args: &BenchArgs, verbose: bool) -> Result<(), Box<dyn std::error::
         sector_size,
         &security_config,
         ChainUse::Compose,
+        DifferencingComposition::Supported,
     )
     .map_err(|e| {
         format!(
@@ -6968,6 +7145,7 @@ fn run_rebase(args: RebaseArgs, verbose: bool) -> Result<(), Box<dyn std::error:
         sector_size,
         &security_config,
         ChainUse::Compose,
+        DifferencingComposition::Supported,
     )
     .map_err(|e| -> Box<dyn std::error::Error> { format!("rebase: {e}").into() })?;
     let old_chain_images = old_chain_full.images();
@@ -6980,8 +7158,14 @@ fn run_rebase(args: RebaseArgs, verbose: bool) -> Result<(), Box<dyn std::error:
     // Discover the new chain (only if not detaching).
     let new_chain_full = if let Some(ref p) = resolved_new_backing {
         Some(
-            discover_backing_chain(p, sector_size, &security_config, ChainUse::Compose)
-                .map_err(|e| -> Box<dyn std::error::Error> { format!("rebase: {e}").into() })?,
+            discover_backing_chain(
+                p,
+                sector_size,
+                &security_config,
+                ChainUse::Compose,
+                DifferencingComposition::Supported,
+            )
+            .map_err(|e| -> Box<dyn std::error::Error> { format!("rebase: {e}").into() })?,
         )
     } else {
         None
@@ -7325,11 +7509,17 @@ fn run_commit(args: CommitArgs, verbose: bool) -> Result<(), Box<dyn std::error:
     // mode something to consume.
     let security_config = config::SecurityConfig::default();
     let sector_size = 512u32;
+    // `commit`'s guest reads the overlay and the backing and ignores
+    // the ancestor slots the host populates here, so a differencing
+    // parent is nothing it would ever open. Resolving one could only
+    // turn a command that works today into a path error whenever the
+    // parent is absent.
     let backing_chain_full = discover_backing_chain(
         &resolved_backing_path,
         sector_size,
         &security_config,
         ChainUse::Compose,
+        DifferencingComposition::Unsupported,
     )
     .map_err(|e| -> Box<dyn std::error::Error> { format!("commit: {e}").into() })?;
     let backing_chain_images = backing_chain_full.images();
@@ -10802,11 +10992,16 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
         let input_path = Path::new(&args.input);
         let security_config = config::load_config().config.security;
 
+        // `info` composes nothing, so it states no composition
+        // capability; `ChainUse::Report` is what decides that it
+        // resolves a differencing parent, and fails soft when it
+        // cannot.
         match discover_backing_chain(
             input_path,
             args.sector_size,
             &security_config,
             ChainUse::Report,
+            DifferencingComposition::Unsupported,
         ) {
             Ok(chain) => {
                 if args.output == "json" {
@@ -11749,11 +11944,15 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
     let force_chain_for_descriptor = peek_is_vmdk_descriptor(input_path).unwrap_or(false);
     let chain = if args.chain || force_chain_for_descriptor {
         let security_config = config::load_config().config.security;
+        // `check` refuses a differencing VHD or VHDX source by name,
+        // with its own typed refusal, so it must not resolve a parent
+        // it is never going to validate.
         match discover_backing_chain(
             input_path,
             args.sector_size,
             &security_config,
             ChainUse::Compose,
+            DifferencingComposition::Unsupported,
         ) {
             Ok(chain) => {
                 if verbose {
@@ -12499,6 +12698,7 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         args.sector_size,
         &security_config,
         ChainUse::Compose,
+        DifferencingComposition::Supported,
     )
     .map_err(|e| match &e {
         ChainError::UnsupportedInputFormat(_) => format!("compare: {e}"),
@@ -12509,6 +12709,7 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         args.sector_size,
         &security_config,
         ChainUse::Compose,
+        DifferencingComposition::Supported,
     )
     .map_err(|e| match &e {
         ChainError::UnsupportedInputFormat(_) => format!("compare: {e}"),
@@ -13363,6 +13564,7 @@ fn execute_convert(
         exec.sector_size,
         &security_config,
         ChainUse::Compose,
+        DifferencingComposition::Supported,
     )
     .map_err(|e| match &e {
         // `execute_convert` is shared by convert and dd, but dd runs
@@ -14794,6 +14996,7 @@ fn run_dd(args: DdArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>>
         sector_size,
         &security_config,
         ChainUse::Compose,
+        DifferencingComposition::Supported,
     )
     .map_err(|e| match &e {
         ChainError::UnsupportedInputFormat(_) => format!("dd: {e}"),

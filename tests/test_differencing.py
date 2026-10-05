@@ -144,6 +144,37 @@ ADVERSARIAL_LOCATOR_REASONS = {
     'vhd-diff-locator-conflicting': ("parent 'conflict-parent-name.vhd' was not found",),
 }
 
+# The errors the *composing* walk gives for the same six fixtures.
+# `convert` resolves a differencing parent now, so a hostile locator is
+# declined by `validate_backing_path` during chain discovery rather than
+# by the guest -- one step earlier, before any device is attached. These
+# strings are the allowlist's and the filesystem's, measured against the
+# built binary rather than assumed.
+#
+# Only `/etc/passwd` reaches the allowlist: it is the one locator that
+# names a path which really exists, and resolution canonicalises before
+# the allowlist is consulted, so everything else stops at "not found"
+# first. The traversal fixture carries both for exactly the reason the
+# reporting table above explains -- whether `../../../etc/passwd` lands
+# on a real file is a fact about where the testdata tree sits, not about
+# instar. The UNC fixture is "not found" rather than classified: the
+# Windows-absolute classifier belongs to the reporting walk, and a
+# composing walk simply joins the reference to the child's directory and
+# finds nothing, which refuses just as firmly.
+COMPOSING_LOCATOR_REASONS = {
+    'vhd-diff-locator-etc-passwd': (
+        "Backing file '/etc/passwd' is outside allowed paths",
+    ),
+    'vhd-diff-locator-dotdot': (
+        'Backing file not found',
+        'is outside allowed paths',
+    ),
+    'vhd-diff-locator-unc': ('Backing file not found',),
+    'vhd-diff-locator-url': ('Backing file not found',),
+    'vhd-diff-locator-overlong': ('Backing file not found',),
+    'vhd-diff-locator-conflicting': ('Backing file not found',),
+}
+
 # The subset with a real, resolvable parent. Used where the test needs
 # `info` to report a parent name, which `vhd-differencing` cannot do.
 #
@@ -161,6 +192,19 @@ DIFFERENCING_CHAIN_FIXTURES = (
     ('vhd-diff-child-aligned', 'vhd-diff-parent.vhd'),
     ('vhd-diff-child-mixed', 'vhd-diff-parent.vhd'),
     ('vhdx-diff-child', 'vhdx-diff-parent.vhdx'),
+)
+
+# The differencing fixtures with no parent reference at all -- a disk
+# type of 4 and an empty parent name. Derived from the two tables above
+# rather than written out, so a fixture added to either cannot quietly
+# fall out of both. These are the images for which the walk has nothing
+# to resolve whatever an operation's composition capability says, so
+# they are the ones that still get the typed refusal when they stand
+# alone in an empty directory.
+PARENTLESS_DIFFERENCING_FIXTURES = tuple(
+    (image_id, format_name)
+    for image_id, format_name in DIFFERENCING_FIXTURES
+    if image_id not in {i for i, _ in DIFFERENCING_CHAIN_FIXTURES}
 )
 
 # The plain dynamic base disks of the two real chains. These are NOT
@@ -684,15 +728,30 @@ class TestDifferencingInfoReports(DifferencingTestBase):
 
 
 class TestDifferencingParentAbsent(DifferencingTestBase):
-    """The refusal does not depend on the parent file existing.
+    """What each operation does when the parent is not beside the child.
 
-    The host walks the backing chain before the guest runs, so the
-    natural failure for an orphaned child is "Backing file not found"
-    -- a different, more alarming error that says nothing about
-    composition being deferred. Step 4b changed `discover_backing_chain`
-    so that a VHD or VHDX parent reference is recorded without being
-    resolved, which makes the refusal unconditional. Copying the child
-    alone into an empty directory is the only way to exercise that.
+    The host walks the backing chain before the guest runs, and whether
+    that walk resolves a differencing parent is a capability each call
+    site states for itself rather than a property of every composing
+    caller. So there are two halves to pin here, and the whole value of
+    this class is that they are pinned against the same fixture.
+
+    An operation that is going to refuse a differencing source by name
+    must not resolve the parent: `check`, `measure` and `map` behave
+    byte-for-byte identically whether the parent is there or not,
+    because resolving a file they will never read could only replace
+    one error with a different, more alarming one -- and would make
+    their refusal contingent on a file's presence, which is the one
+    thing a refusal must not be.
+
+    An operation that is going to read the parent must resolve it, and
+    an absent parent is then a real error that has to be named:
+    `convert`, `dd`, `compare` and `bench` report "Backing file not
+    found" and the parent's name. That is not the invariant weakening;
+    it is the invariant applying to a different set of operations.
+
+    Copying the child alone into an empty directory is the only way to
+    exercise either half.
     """
 
     def _orphaned_copy(self, image_id):
@@ -708,9 +767,55 @@ class TestDifferencingParentAbsent(DifferencingTestBase):
         )
         return target
 
-    def test_convert_refuses_an_orphaned_child(self):
-        """convert refuses, and does not complain about a missing parent."""
-        for image_id, format_name in DIFFERENCING_FIXTURES:
+    def test_convert_names_an_absent_parent_it_meant_to_read(self):
+        """convert reports the missing parent, and writes nothing.
+
+        `convert` resolves a differencing parent because it is going to
+        read it, so an orphaned child fails in the host chain walk with
+        the parent named. The alarming-sounding error is the correct one
+        here: the file convert needed really is missing, and the only
+        alternative -- declining the source by name and saying nothing
+        about the parent -- would hide which file the user has to go and
+        find.
+        """
+        for image_id, parent_name in DIFFERENCING_CHAIN_FIXTURES:
+            with self.subTest(image=image_id):
+                orphan = self._orphaned_copy(image_id)
+                out = orphan.parent / 'out.raw'
+                stdout, stderr, rc = self.run_instar_convert(
+                    orphan, out, output_format='raw'
+                )
+                self.assertEqual(
+                    1, rc,
+                    f'{image_id}: expected exit 1 for an orphaned child; '
+                    f'stdout={stdout[:400]!r} stderr={stderr[:400]!r}'
+                )
+                self.assertIn(
+                    'Backing file not found', stderr,
+                    f'{image_id}: convert must say the parent is missing '
+                    f'rather than decline the source by name; '
+                    f'stderr={stderr!r}'
+                )
+                self.assertIn(
+                    parent_name, stderr,
+                    f'{image_id}: the error must name the parent the user '
+                    f'has to find; stderr={stderr!r}'
+                )
+                self.assertFalse(
+                    out.exists(),
+                    f'{image_id}: orphaned convert left an output file'
+                )
+
+    def test_convert_refuses_a_child_with_no_parent_reference(self):
+        """A differencing flag with no parent name is still refused by name.
+
+        The complement of the test above, and the part of the original
+        unconditional-refusal assertion that survives unchanged: there
+        is no reference here for the walk to resolve, so the capability
+        never comes into it and the typed refusal is the only possible
+        answer whether the child stands alone or not.
+        """
+        for image_id, format_name in PARENTLESS_DIFFERENCING_FIXTURES:
             with self.subTest(image=image_id):
                 orphan = self._orphaned_copy(image_id)
                 out = orphan.parent / 'out.raw'
@@ -723,8 +828,8 @@ class TestDifferencingParentAbsent(DifferencingTestBase):
                 )
                 self.assertNotIn(
                     'Backing file not found', stderr,
-                    f'{image_id}: the refusal must not be contingent on the '
-                    f'parent existing; stderr={stderr!r}'
+                    f'{image_id}: there is no parent reference to miss; '
+                    f'stderr={stderr!r}'
                 )
                 self.assertFalse(
                     out.exists(),
@@ -779,8 +884,8 @@ class TestDifferencingParentAbsent(DifferencingTestBase):
                     f'stderr={stderr!r}'
                 )
 
-    def _run_composing_op(self, op, source, tmp_dir):
-        """Run one composing operation against `source`.
+    def _run_op(self, op, source, tmp_dir):
+        """Run one chain-walking operation against `source`.
 
         Returns (stdout, stderr, rc). `tmp_dir` is scratch space for the
         two operations that write an output file (`convert`, `dd`); the
@@ -803,24 +908,32 @@ class TestDifferencingParentAbsent(DifferencingTestBase):
             return self.run_instar_map(source)
         raise ValueError(f'unknown composing op {op!r}')
 
-    def test_composing_operations_are_unchanged_by_parent_presence(self):
-        """Every composing operation is byte-for-byte unchanged either way.
+    def test_refusing_operations_are_unchanged_by_parent_presence(self):
+        """`check`, `measure` and `map` are byte-for-byte unchanged either way.
 
-        This is the central invariant of the walk policy: a policy
-        that only `run_info`'s `--chain` branch selects cannot make a
-        composing operation's refusal contingent on the parent, because
-        none of the other nine `discover_backing_chain` call sites ever
-        resolves a VHD or VHDX parent -- they keep passing
-        `ChainUse::Compose` and propagating every error unchanged. The two
-        tests above, and `TestDifferencingRefusal`, only assert that both
-        runs happen to contain the same fixed refusal sentence, which
+        This is the surviving half of the walk policy's central
+        invariant, and the half that still carries the whole argument.
+        These three refuse a differencing source by name before any
+        parent matters, so their `discover_backing_chain` calls state
+        that they cannot compose one and the parent is recorded without
+        being resolved. If that ever changed, the same image would give
+        the typed refusal when its parent happened to sit beside it and
+        a path error when it did not -- a refusal contingent on a file
+        instar was never going to read, which is no refusal at all.
+
+        `TestDifferencingRefusal` and the orphan tests above only assert
+        that both runs contain the same fixed refusal sentence, which
         would still pass if a path leaked into some *other* part of the
-        output. Diffing stdout, stderr and exit code exactly, for every
-        composing operation, against the same fixture with and without its
-        real parent, is the test that would actually fail if that
-        boundary were ever crossed.
+        output. Diffing stdout, stderr and exit code exactly, against
+        the same fixture with and without its real parent, is the test
+        that would actually fail if the boundary were crossed. The four
+        operations that now resolve the parent on purpose are covered by
+        the test below instead; `measure` and `map` are here because
+        they refuse without walking a chain at all, so the invariant is
+        trivially true for them and a future chain-aware `measure` would
+        be caught by it.
         """
-        composing_ops = ('convert', 'dd', 'compare', 'bench', 'check', 'measure', 'map')
+        refusing_ops = ('check', 'measure', 'map')
         for image_id, _parent_name in DIFFERENCING_CHAIN_FIXTURES:
             with self.subTest(image=image_id):
                 present = self.differencing_image(image_id)
@@ -842,14 +955,14 @@ class TestDifferencingParentAbsent(DifferencingTestBase):
                     same property.
                     """
                     return text.replace(str(source), '<SRC>').replace(str(workdir), '<WORKDIR>')
-                for op in composing_ops:
+                for op in refusing_ops:
                     with self.subTest(image=image_id, op=op):
                         with tempfile.TemporaryDirectory() as tmp_present:
                             with tempfile.TemporaryDirectory() as tmp_orphan:
-                                p_stdout, p_stderr, p_rc = self._run_composing_op(
+                                p_stdout, p_stderr, p_rc = self._run_op(
                                     op, present, tmp_present
                                 )
-                                a_stdout, a_stderr, a_rc = self._run_composing_op(
+                                a_stdout, a_stderr, a_rc = self._run_op(
                                     op, orphan, tmp_orphan
                                 )
                                 self.assertEqual(
@@ -871,6 +984,64 @@ class TestDifferencingParentAbsent(DifferencingTestBase):
                                     f'the parent went missing; present='
                                     f'{p_stderr!r} absent={a_stderr!r}'
                                 )
+
+    def test_resolving_operations_report_the_absent_parent(self):
+        """`convert`, `dd`, `compare` and `bench` do depend on the parent.
+
+        The other half of the policy, and the assertion that the host
+        now resolves a differencing parent for the operations that read
+        through the guest chain walker. Each of these four states that
+        it can compose a differencing chain, so the walk resolves the
+        parent for them exactly as it does for a qcow2 backing file:
+        with the parent beside the child the walk succeeds and the
+        refusal arrives from the guest, and with the parent gone the
+        walk itself fails and names the file.
+
+        Asserting both directions is what makes this a test of the gate
+        rather than of an error string. An operation that still refused
+        to resolve would produce the same output in both runs, which is
+        what the test above *requires* of `check` -- so the two tests
+        fail in opposite directions if a capability is ever set the
+        wrong way round at a call site.
+        """
+        resolving_ops = ('convert', 'dd', 'compare', 'bench')
+        for image_id, parent_name in DIFFERENCING_CHAIN_FIXTURES:
+            with self.subTest(image=image_id):
+                present = self.differencing_image(image_id)
+                orphan = self._orphaned_copy(image_id)
+                for op in resolving_ops:
+                    with self.subTest(image=image_id, op=op):
+                        with tempfile.TemporaryDirectory() as tmp_present:
+                            with tempfile.TemporaryDirectory() as tmp_orphan:
+                                p_stdout, p_stderr, p_rc = self._run_op(
+                                    op, present, tmp_present
+                                )
+                                a_stdout, a_stderr, a_rc = self._run_op(
+                                    op, orphan, tmp_orphan
+                                )
+                        self.assertEqual(
+                            1, a_rc,
+                            f'{image_id}/{op}: expected exit 1 with the '
+                            f'parent absent; stdout={a_stdout[:400]!r} '
+                            f'stderr={a_stderr[:400]!r}'
+                        )
+                        self.assertIn(
+                            'Backing file not found', a_stderr,
+                            f'{image_id}/{op}: the walk must report the '
+                            f'parent it could not resolve; '
+                            f'stderr={a_stderr!r}'
+                        )
+                        self.assertIn(
+                            parent_name, a_stderr,
+                            f'{image_id}/{op}: the error must name the '
+                            f'parent; stderr={a_stderr!r}'
+                        )
+                        self.assertNotIn(
+                            'Backing file not found', p_stderr,
+                            f'{image_id}/{op}: with the parent present '
+                            f'the walk must resolve it and leave the '
+                            f'refusal to the guest; stderr={p_stderr!r}'
+                        )
 
 
 class TestDifferencingNegativeControls(DifferencingTestBase):
@@ -994,16 +1165,33 @@ class TestDifferencingAdversarialLocators(DifferencingTestBase):
 
     Two properties are pinned:
 
-    * the composing operations refuse them exactly like any other
-      differencing image, so a hostile locator is not a route to a read
-      instar would otherwise decline; and
+    * every operation declines them, so a hostile locator is not a
+      route to a read instar would otherwise decline -- `check`
+      declines the source by name without the locator being resolved
+      at all, and `convert`, which does resolve a differencing parent,
+      has the locator declined by the allowlist or the filesystem
+      during chain discovery, one step before any device is attached;
+      and
     * `info` *reports* the string without acting on it -- in particular
       `--chain` stops at the one image rather than following the
       locator to whatever it names.
     """
 
     def test_convert_refuses_every_locator_fixture(self):
-        """A hostile locator does not change the refusal."""
+        """A hostile locator is declined by the walk, never followed.
+
+        `convert` resolves a differencing parent now, so these six are
+        refused one step earlier than they used to be: by
+        `validate_backing_path` during chain discovery, before a device
+        is attached and before the guest runs. What the fixtures exist
+        to prove is unchanged -- none of them becomes a route to a read
+        instar would otherwise decline -- but the message is the walk's
+        rather than the guest's, so the reason is pinned per fixture
+        the way the reporting walk's already is. A one-line "it failed"
+        assertion would not distinguish the allowlist rejecting
+        `/etc/passwd` from resolution quietly going wrong, which is the
+        same shape of bug either way.
+        """
         for image_id, _expected in ADVERSARIAL_LOCATOR_FIXTURES:
             with self.subTest(image=image_id):
                 source = self.differencing_image(image_id)
@@ -1012,8 +1200,19 @@ class TestDifferencingAdversarialLocators(DifferencingTestBase):
                     stdout, stderr, rc = self.run_instar_convert(
                         source, out, output_format='raw'
                     )
-                    self.assert_refused(
-                        'convert', 'VHD', stdout, stderr, rc, image_id
+                    self.assertEqual(
+                        1, rc,
+                        f'{image_id}: expected exit 1; '
+                        f'stdout={stdout[:400]!r} stderr={stderr[:400]!r}'
+                    )
+                    expected_reasons = COMPOSING_LOCATOR_REASONS[image_id]
+                    self.assertTrue(
+                        any(reason in stderr for reason in expected_reasons),
+                        f'{image_id}: expected one of the reasons '
+                        f'{expected_reasons!r} on stderr -- a bare failure '
+                        f'cannot show the allowlist (or plain path '
+                        f'resolution) did the declining rather than '
+                        f'something going wrong later; stderr={stderr!r}'
                     )
                     self.assertFalse(
                         out.exists(),
