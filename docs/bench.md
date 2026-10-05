@@ -577,17 +577,23 @@ divergence registry, see `KNOWN_BENCH_DIVERGENCES` at the top of
 ## Differencing images
 
 A differencing VHD (footer disk type 4) or VHDX (`HasParent` set) stores
-only the sectors that differ from a parent image. instar cannot compose a
-parent yet, so `bench` refuses such a source by name and exits 1 rather than
-benchmarking reads that silently skip the parent's blocks:
+only the sectors that differ from a parent image. `bench` composes such a
+source against its parent, so a benchmark run against a differencing
+chain reads every sector the virtual size covers — parent-owned sectors
+included — rather than silently skipping them.
+
+If the source's own chain has no parent to read, `bench` still refuses
+it:
 
 ```
-bench: source is a differencing <VHD|VHDX> image whose parent instar cannot
-yet compose; composition is deferred (see PLAN-differencing.md)
+bench: source is a differencing <VHD|VHDX> image with no parent in the
+chain bench was given, so the sectors it leaves to its parent could not
+be composed
 ```
 
-`instar info` is the exception — it reports the parent as a backing file
-instead of refusing. See the "VHD/VHDX differencing" section of
-[quirks.md](quirks.md) for the per-operation record, and
-[PLAN-differencing.md](plans/PLAN-differencing.md) for the composition
-work that will lift the refusal.
+and exits 1. A parent reference that cannot be resolved — the file is
+missing, or outside the backing file allowlist — is refused the same
+way, during chain discovery.
+
+See the "VHD/VHDX differencing" section of [quirks.md](quirks.md) for the
+per-operation record.

@@ -1311,14 +1311,14 @@ class TestCreateOOptions(InstarTestBase):
             self.assertIn('qcow2', stderr)
 
     def test_o_encrypt_key_errors_with_future_work(self):
-        """`-o encrypt.cipher=aes` returns the deferred message."""
+        """`-o encrypt.cipher=aes` returns the not-implemented message."""
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / 'foo.qcow2'
             _, stderr, rc = self.run_instar_create(
                 '-f', 'qcow2', '-o', 'encrypt.cipher=aes', str(path), '16M')
             self.assertNotEqual(rc, 0)
             self.assertIn('encrypt', stderr)
-            self.assertIn('deferred', stderr)
+            self.assertIn('not implemented', stderr)
 
 
 
@@ -1602,7 +1602,7 @@ class TestCreatePreallocation(InstarTestBase):
             _, stderr, rc = self.run_instar_create(
                 '-f', 'vmdk', '-o', 'preallocation=metadata', str(path), '4M')
             self.assertNotEqual(rc, 0)
-            self.assertIn('non-qcow2 preallocation is future work', stderr)
+            self.assertIn('preallocation is implemented for raw and qcow2 only', stderr)
 
 
 # ----------------------------------------------------------------------

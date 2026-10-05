@@ -59,6 +59,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   form is an array of objects, matching `qemu-img info --backing-chain
   --output json`.
 
+- **`instar convert`, `dd`, `compare`, `bench` and `rebase` now compose
+  a differencing VHD or VHDX source against its parent, instead of
+  refusing it.** This lifts the phase 4 refusal (below) for the five
+  operations that read through the guest chain walker, using the VHD
+  and VHDX block composition added above. `convert -O raw` on a
+  differencing VHD or VHDX produces the same bytes as the same chain
+  flattened by hand, verified byte-for-byte against both formats and a
+  depth-3 chain. `compare` descends each side of a two-image comparison
+  through its own chain rather than conflating the two into one array.
+  `rebase` composes a differencing image only when one sits in the
+  *backing chain* it reads through — it already refuses any overlay
+  that is not qcow2 or vmdk, so a differencing image was never
+  acceptable as the image being rebased and still is not. A
+  differencing child with no parent anywhere in its own chain is still
+  refused, with the same typed refusal as before — composing it would
+  mean reading parent-owned sectors from nothing — but the refusal is
+  now conditional on that rather than unconditional.
+
+  `map`, `measure` and `check` are unchanged: each still refuses a
+  differencing source outright, with its own message naming its own
+  operation, so a refusal from one of them does not read as a claim
+  that instar cannot compose a chain at all.
+
+  Closes #623 (the differencing VHDX BAT layout defect fixed above,
+  which composition would otherwise have made reachable from an
+  untrusted image), #614 (`init_chain_states` could not tell where one
+  chain ended and the next began, which blocked `compare`'s two-chain
+  case), and #625 (a BAT entry naming an offset inside the metadata
+  region of a small image, latent until this phase made it reachable
+  from `instar convert` on an untrusted source).
+
 - **Coverage-guided fuzzing of the VHD and VHDX parent-locator read
   paths (40→42 targets).** Both were previously unreached: measurement
   showed `VhdParentInfo::parse`, `VhdParentLocatorTable::parse`,
@@ -585,7 +616,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   outright (that rejection is what accidentally protected VHDX before
   this change), so every read entry point — `map` included — now
   decides for itself instead of relying on that crate to fail closed
-  for the wrong reason. **If you script against `check`'s exit code,
+  for the wrong reason. A later phase (see "Added" above) teaches
+  `convert`, `dd`, `compare`, `bench` and `rebase` to compose such a
+  source instead of refusing it; `map`, `measure` and `check` keep
+  refusing. **If you script against `check`'s exit code,
   note that a differencing image now exits 1 (refused) instead of 2
   (corrupt)** — it was never corrupt, it was unsupported. `instar info`
   is deliberately unaffected by the refusal: it now reports the parent

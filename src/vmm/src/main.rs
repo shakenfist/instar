@@ -14804,8 +14804,7 @@ fn parse_create_o_options(
                 ("qcow2", "data_file") | ("qcow2", "data_file_raw") => {
                     return Err(format!(
                         "create: -o key '{}' is not yet supported \
-                         (external data files are deferred — see \
-                         PLAN-convert-followups.md and PLAN-create.md future work)",
+                         (external data files are not implemented)",
                         key
                     )
                     .into());
@@ -14813,7 +14812,7 @@ fn parse_create_o_options(
                 ("qcow2", k) if k.starts_with("encrypt.") => {
                     return Err(format!(
                         "create: -o key '{}' is not yet supported \
-                         (encrypted create is deferred — see PLAN-create.md future work)",
+                         (encrypted qcow2 creation is not implemented)",
                         k
                     )
                     .into());
@@ -14869,7 +14868,7 @@ fn parse_create_o_options(
                     "dynamic" => { /* default */ }
                     "fixed" => {
                         return Err("create: -O vhdx -o subformat=fixed is not yet supported \
-                                    (vhdx-fixed lands in phase 5 of PLAN-create.md)"
+                                    (only the dynamic vhdx subformat is implemented)"
                             .into())
                     }
                     _ => {
@@ -14894,7 +14893,7 @@ fn parse_create_o_options(
                     "metadata" | "falloc" | "full" => {
                         return Err(format!(
                             "create: -o preallocation={} is not yet supported for {} \
-                             (non-qcow2 preallocation is future work — see PLAN-create.md)",
+                             (preallocation is implemented for raw and qcow2 only)",
                             value, target
                         )
                         .into())
@@ -16143,8 +16142,8 @@ fn map_error_message(error: u32) -> Option<&'static str> {
         MAP_RESULT_ERROR_INVALID_SOURCE => Some("map: source format unrecognised"),
         MAP_RESULT_ERROR_INVALID_OPTION => Some("map: invalid config"),
         MAP_RESULT_ERROR_HAS_BACKING => Some(
-            "map: source has a backing/parent reference; \
-             chain composition is deferred (see PLAN-map.md)",
+            "map: source has a backing/parent reference; map reads an \
+             image on its own rather than composing a parent into it",
         ),
         MAP_RESULT_ERROR_IO => Some("map: I/O failure walking the source"),
         _ => Some("map: unknown error"),
@@ -18447,9 +18446,8 @@ fn create_error_detail(code: u32) -> &'static str {
              pass an explicit SIZE that fits)"
         }
         CREATE_RESULT_ERROR_BACKING_DIFFERENCING => {
-            "backing file is a differencing VHD or VHDX whose parent \
-             instar cannot yet compose; an overlay on it could not be \
-             read back (see PLAN-differencing.md)"
+            "backing file is a differencing VHD or VHDX; create does \
+             not support stacking a backing file on one"
         }
         CREATE_RESULT_ERROR_PARENT_NAME_TOO_LONG => {
             // A relative path caps two code units shorter than an
@@ -18827,9 +18825,8 @@ fn validate_create_args(args: &CreateArgs) -> Result<(), Box<dyn std::error::Err
     // writes.
     if args.sector_size != 512 {
         return Err(format!(
-            "create: --sector-size must be 512 in phase 3 \
-             (larger sector sizes are deferred — see PLAN-create.md \
-             phase 5; got {})",
+            "create: --sector-size must be 512 \
+             (larger sector sizes are not yet implemented; got {})",
             args.sector_size
         )
         .into());
@@ -18888,8 +18885,8 @@ fn validate_create_args(args: &CreateArgs) -> Result<(), Box<dyn std::error::Err
             }
             if args.subformat == "monolithicFlat" {
                 return Err("create: vmdk monolithicFlat is not yet supported \
-                            (multi-file subformats land in phase 5 of \
-                            PLAN-create.md; use instar convert -O vmdk for now)"
+                            (multi-file subformats are not implemented; \
+                            use instar convert -O vmdk for now)"
                     .into());
             }
         }
@@ -18932,7 +18929,7 @@ fn validate_create_args(args: &CreateArgs) -> Result<(), Box<dyn std::error::Err
         ("vmdk" | "vpc" | "vhdx", mode @ ("metadata" | "falloc" | "full")) => {
             return Err(format!(
                 "create: --preallocation={} is not yet supported for {} \
-                 (non-qcow2 preallocation is future work — see PLAN-create.md)",
+                 (preallocation is implemented for raw and qcow2 only)",
                 mode, args.target_format
             )
             .into());
@@ -19328,21 +19325,21 @@ mod create_option_tests {
     }
 
     #[test]
-    fn encrypt_keys_return_deferred_error() {
+    fn encrypt_keys_return_not_implemented_error() {
         let err = parse_create_o_options("qcow2", &s("encrypt.cipher=aes"))
             .unwrap_err()
             .to_string();
         assert!(err.contains("encrypt"));
-        assert!(err.contains("deferred"));
+        assert!(err.contains("not implemented"));
     }
 
     #[test]
-    fn data_file_returns_deferred_error() {
+    fn data_file_returns_not_implemented_error() {
         let err = parse_create_o_options("qcow2", &s("data_file=ext.bin"))
             .unwrap_err()
             .to_string();
         assert!(err.contains("data_file"));
-        assert!(err.contains("deferred"));
+        assert!(err.contains("not implemented"));
     }
 
     #[test]
@@ -19382,7 +19379,7 @@ mod create_option_tests {
         let err = parse_create_o_options("vmdk", &s("preallocation=metadata"))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("non-qcow2 preallocation is future work"));
+        assert!(err.contains("preallocation is implemented for raw and qcow2 only"));
     }
 
     #[test]
@@ -19954,10 +19951,14 @@ mod map_renderer_tests {
     }
 
     #[test]
-    fn error_has_backing_mentions_chain_followup() {
+    fn error_has_backing_explains_why_it_refuses() {
         let msg = map_error_message(MAP_RESULT_ERROR_HAS_BACKING)
             .expect("has-backing error must have message");
-        assert!(msg.contains("chain") || msg.contains("PLAN-map"));
+        assert!(msg.contains("composing a parent"));
+        assert!(
+            !msg.contains("PLAN-"),
+            "no user-visible string may cite a plan file: {msg}"
+        );
     }
 
     // ================================================================

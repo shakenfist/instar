@@ -330,8 +330,8 @@ CHAIN_PROBE_SECTORS = {
 # otherwise have let map emit a differencing VHDX's parent blocks as
 # holes.
 MAP_REFUSAL = (
-    'map: source has a backing/parent reference; chain composition is '
-    'deferred (see PLAN-map.md)'
+    'map: source has a backing/parent reference; map reads an image '
+    'on its own rather than composing a parent into it'
 )
 MAP_ERROR_CODE = 'map: guest reported error code 3'
 
@@ -2770,8 +2770,8 @@ class TestDifferencingCreateRefusesAsBacking(DifferencingTestBase):
     """
 
     EXPECTED = (
-        'backing file is a differencing VHD or VHDX whose parent instar '
-        'cannot yet compose'
+        'backing file is a differencing VHD or VHDX; create does not '
+        'support stacking a backing file on one'
     )
 
     BACKING_FORMAT = {'VHD': 'vpc', 'VHDX': 'vhdx'}
