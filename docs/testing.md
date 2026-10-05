@@ -1557,7 +1557,7 @@ deliberately broken emitter is not guarding what its name says it
 guards. See [PLAN-differencing.md](plans/PLAN-differencing.md) for the
 path being guarded.
 
-There are **70 cases**, in two groups.
+There are **75 cases**, in three groups.
 
 Twenty-seven cover the writer. Fifteen mutate a library crate
 (`create`, `vhd`, `vhdx`) and are caught by a Rust unit or round-trip
@@ -1577,6 +1577,29 @@ Eight of them are on that judgement alone, four per format: widening
 it back to an unconditional refusal, removing it, deriving it from the
 device-array bound instead of the chain segmentation, and naming the
 wrong format in the refusal it raises.
+
+Five more cover the one thing only `compare` does: packing two
+independent backing chains into the single device array the guest
+walks, with one `ChainSegment` per chain and image2's first device
+derived by adding the two chain lengths. Two mutate the host's
+segmentation, collapsing both chains into one segment and giving each
+segment the other chain's length. One reads image2 from image1's chain
+start. One asks "is there a parent behind me" with a device's array
+index instead of its offset within its own chain, which is identical
+for the chain that begins at index 0 and wrong for the other. The
+fifth reverts `init_chain_states`' per-chain judgement to the
+array-bound form the segmentation replaced — the same clause two of
+the reader cases mutate, caught here as a wrong verdict on the command
+line rather than inside the crate, because that is the form issue #614
+was reported in.
+
+All five are caught by `TestDifferencingCompareTwoChains` in
+`tests/test_differencing.py`, through the real binary: the host half is
+unreachable from a guest unit test, and the wrong answers are verdicts
+rather than errors — "identical", or a difference at an offset other
+than the one that was altered — so an integration test that reads the
+verdict is what has to notice. None of them can be caught by a
+single-chain test.
 
 Most of the reader cases name a test in the `qcow2` crate and run it
 with the full input-format feature list, because the
@@ -1632,7 +1655,9 @@ figure invites the reader to assume a run has hung. Expect a spread,
 which is cargo and docker layer caching. The writer cases are
 dominated by the 24 `make instar` rebuilds their integration tests
 need; the reader cases need no rebuild but each recompiles the
-`qcow2` crate in release with the full feature list.
+`qcow2` crate in release with the full feature list. The five compare
+cases are integration cases too, so they add ten more rebuilds: four
+of them together measured 1m51s on a warm tree.
 
 Both devcontainer images must already exist, because
 `tools/cargo-in-container.sh` and the integration cases run them

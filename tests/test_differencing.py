@@ -56,6 +56,11 @@ The classes are:
 * `TestDifferencingDepthThree` -- the same, through a chain three
   images deep, so the composing arm descends past a device that is
   neither the top of the chain nor the bottom.
+* `TestDifferencingCompareTwoChains` -- the only operation that packs
+  two chains into one device array, and the properties no single-chain
+  test can be wrong about: a child composed against image2 rather than
+  its own parent, a difference reported at a known offset, and a
+  differencing child at the head of the *second* chain.
 * `TestDifferencingRefusal` -- what each operation does with a
   differencing source it cannot compose.
 * `TestDifferencingConvertLeavesNoOutput` -- issue #547's core.
@@ -281,6 +286,30 @@ CHAIN_FIXTURE_FORMAT = {
 # DIFFERENCING_CHAIN_FIXTURES so the two cannot disagree.
 CHAIN_FIXTURE_PARENT = dict(DIFFERENCING_CHAIN_FIXTURES)
 
+# Two probe sectors per chain, as (a sector the parent owns and the
+# child leaves to it, a sector both own where the child must win).
+#
+# These are the sectors `TestDifferencingCompareTwoChains` alters, and
+# they are what makes an altered byte attributable. A difference at the
+# first says a parent-owned sector really was read from the parent; the
+# absence of one at the second says the child's bitmap bit beat its
+# parent's copy of the same sector. Every test that uses them first
+# asserts the recorded composition says `PARENT-sector-NNNNNN` and
+# `CHILD-sector-NNNNNN` at the two offsets, so a regenerated fixture
+# with a different content plan fails loudly rather than quietly
+# testing nothing.
+#
+# `vhd-diff-child-mixed`'s pair is the interesting one: sectors 1, 2
+# and 3 share a single sector-bitmap byte, 1 and 3 belonging to the
+# child and 2 to its parent, so a reader whose bit arithmetic is nearly
+# right reports a difference at the wrong offset here rather than none
+# at all.
+CHAIN_PROBE_SECTORS = {
+    'vhd-diff-child-aligned': (100, 8),
+    'vhd-diff-child-mixed': (2, 1),
+    'vhdx-diff-child': (2048, 5),
+}
+
 # `map` refuses with its own, older text and its own error code. It
 # predates this phase for VHD; the VHDX arm was added in step 4b
 # because removing `VhdxState::init`'s `has_parent` rejection would
@@ -384,6 +413,13 @@ class DifferencingTestBase(InstarTestBase):
             self.skipTest(f'fixture not available: {image.path}')
         return image.path
 
+    def composed_golden(self, golden_id: str) -> Path:
+        """Resolve a `*-composed.raw` fixture, skipping if it is absent."""
+        image = self.get_image(golden_id)
+        if not image.path.exists():
+            self.skipTest(f'fixture not available: {image.path}')
+        return image.path
+
     def run_instar_measure(self, *args, timeout=60):
         """Invoke `instar measure`. Returns (stdout, stderr, rc)."""
         return self._run_instar('measure', args, timeout)
@@ -468,19 +504,12 @@ class TestDifferencingComposition(DifferencingTestBase):
     paths.
     """
 
-    def _composed_golden(self, golden_id):
-        """Resolve a `*-composed.raw` fixture, skipping if absent."""
-        image = self.get_image(golden_id)
-        if not image.path.exists():
-            self.skipTest(f'fixture not available: {image.path}')
-        return image.path
-
     def test_convert_matches_the_recorded_composition(self):
         """`convert -O raw` of each chain equals its recorded composition."""
         for image_id, golden_id, _format_name in COMPOSED_CHAIN_FIXTURES:
             with self.subTest(image=image_id):
                 source = self.differencing_image(image_id)
-                golden = self._composed_golden(golden_id)
+                golden = self.composed_golden(golden_id)
                 with tempfile.TemporaryDirectory() as tmp:
                     out = Path(tmp) / 'composed.raw'
                     stdout, stderr, rc = self.run_instar_convert(
@@ -503,7 +532,7 @@ class TestDifferencingComposition(DifferencingTestBase):
         for image_id, golden_id, _format_name in COMPOSED_CHAIN_FIXTURES:
             with self.subTest(image=image_id):
                 source = self.differencing_image(image_id)
-                golden = self._composed_golden(golden_id)
+                golden = self.composed_golden(golden_id)
                 with tempfile.TemporaryDirectory() as tmp:
                     out = Path(tmp) / 'composed.raw'
                     stdout, stderr, rc = self.run_instar_dd(
@@ -536,7 +565,7 @@ class TestDifferencingComposition(DifferencingTestBase):
         for image_id, golden_id, _format_name in COMPOSED_CHAIN_FIXTURES:
             with self.subTest(image=image_id):
                 source = self.differencing_image(image_id)
-                golden = self._composed_golden(golden_id)
+                golden = self.composed_golden(golden_id)
                 with tempfile.TemporaryDirectory() as tmp:
                     out = Path(tmp) / 'composed.qcow2'
                     stdout, stderr, rc = self.run_instar_convert(
@@ -573,7 +602,7 @@ class TestDifferencingComposition(DifferencingTestBase):
         for image_id, golden_id, _format_name in COMPOSED_CHAIN_FIXTURES:
             with self.subTest(image=image_id):
                 source = self.differencing_image(image_id)
-                golden = self._composed_golden(golden_id)
+                golden = self.composed_golden(golden_id)
                 stdout, stderr, rc = self.run_instar_compare(source, golden)
                 self.assertEqual(
                     0, rc,
@@ -713,6 +742,419 @@ class TestDifferencingDepthThree(DifferencingTestBase):
                     expected = self._expected(tmp, golden.path)
                     self.assert_bytes_identical(
                         out, expected, f'{image_id} (depth 3)'
+                    )
+
+
+class TestDifferencingCompareTwoChains(DifferencingTestBase):
+    """`compare` composes two independent chains out of one device array.
+
+    `compare` is the only operation that reads two images at once, and
+    it does it by packing both backing chains into the single device
+    array the guest is handed: `CompareConfig.image1_device_count` and
+    `image2_device_count` say how long each chain is, the guest derives
+    image2's first device by adding the two, and the host writes one
+    `ChainSegment` per chain. Nothing in a single-chain test can be
+    wrong about any of that, which is why these cases are here and not
+    folded into `TestDifferencingComposition`.
+
+    Three distinct ways to get it wrong, and the case that catches each:
+
+    * Taking "a device follows in the array" for "a parent follows in
+      my chain". The rule the guest used to be tempted by,
+      `dev_idx + 1 >= device_count`, admits a differencing child at
+      index 0 of a two-device array whose own chain is one image long,
+      and composes it against image2 -- an unrelated file (issue #614).
+      `test_compare_refuses_a_child_against_the_image2_that_would_look_
+      identical` picks the one image2 for which that wrong read reports
+      "Images are identical", so the test cannot pass by the wrong
+      answer merely looking wrong.
+    * Reading image2 from the wrong place in the array, or giving one
+      chain the other's bounds. Every case here asserts a verdict, and
+      the ones that expect a difference assert the offset of it, so a
+      read served from the wrong device is a wrong offset rather than
+      an exit code that happens to be non-zero.
+    * Asking "is there a parent behind me" with an array-absolute
+      offset instead of a chain-relative one. That is invisible for
+      chain 1, whose segment begins at 0, and wrong for chain 2.
+      `test_compare_two_differencing_chains_are_identical` is the case
+      where image2 is itself a differencing child, so it is the only
+      one that can see it.
+
+    A verdict and not an exit code, throughout. A composition that is
+    wrong on both sides in the same way still reports "identical", so
+    the expectations here are the recorded `*-composed.raw` fixtures
+    and offsets derived from the generator's own sector plan -- never
+    another instar read of the same chain.
+    """
+
+    SECTOR = 512
+
+    # The byte written over a probe sector. Not 0x00, which an
+    # unallocated sector also reads as, and not 0xff, which is what an
+    # all-ones sector bitmap byte would be: a difference reported for
+    # this byte cannot be a hole or a bitmap read back as data.
+    PATCH_BYTE = 0x7e
+
+    def _require_qemu_io(self):
+        if shutil.which('qemu-io') is None:
+            self.skipTest('qemu-io is required to alter a parent in place')
+
+    def _probe_offsets(self, image_id, golden):
+        """The two probe offsets for a chain, checked against its golden.
+
+        Returns (parent-owned offset, jointly-owned offset). The
+        recorded composition names the owner of every sector it holds
+        in the sector's own first bytes, so the table's claim about
+        each probe is asserted here rather than trusted: a fixture
+        regenerated from a different content plan fails with the
+        offset it disagreed at.
+        """
+        parent_sector, child_sector = CHAIN_PROBE_SECTORS[image_id]
+        data = golden.read_bytes()
+        self.assertEqual(
+            IMAGE_VIRTUAL_SIZE, len(data),
+            f'{image_id}: the recorded composition is '
+            f'{len(data)} bytes, not the size these probes assume'
+        )
+        probes = (
+            (parent_sector, f'PARENT-sector-{parent_sector:06d}'.encode()),
+            (child_sector, f'CHILD-sector-{child_sector:06d}'.encode()),
+        )
+        for sector, marker in probes:
+            offset = sector * self.SECTOR
+            self.assertEqual(
+                marker, data[offset:offset + len(marker)],
+                f'{image_id}: the recorded composition does not hold '
+                f'{marker!r} at offset {offset}, so this probe sector no '
+                f'longer means what CHAIN_PROBE_SECTORS says it does'
+            )
+        return parent_sector * self.SECTOR, child_sector * self.SECTOR
+
+    def _patch_parent_sector(self, chain_dir, image_id, offset, context):
+        """Overwrite one sector of the parent beside the child in `chain_dir`.
+
+        Written through `qemu-io` rather than into the file's bytes
+        because the parents are dynamic images: the sector's home has
+        to be found through a BAT, and a block may have to be
+        allocated for it. The parents are plain dynamic VHD and VHDX,
+        which is the one thing in these chains qemu reads correctly --
+        its VPC driver would read a differencing child as dynamic and
+        its VHDX driver refuses one outright, so neither child is ever
+        handed to it.
+        """
+        parent = Path(chain_dir) / CHAIN_FIXTURE_PARENT[image_id]
+        parent_format = (
+            'vhdx' if parent.suffix == '.vhdx' else 'vpc'
+        )
+        argv = [
+            'qemu-io', '-f', parent_format, '-c',
+            f'write -P 0x{self.PATCH_BYTE:02x} {offset} {self.SECTOR}',
+            str(parent),
+        ]
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=120)
+        self.assertEqual(
+            0, r.returncode,
+            f'{context}: qemu-io could not write offset {offset} of '
+            f'{parent.name}; stdout={r.stdout!r} stderr={r.stderr!r}'
+        )
+
+    def assert_compare_identical(self, image1, image2, context):
+        """`compare` reports the two images identical, and says so."""
+        stdout, stderr, rc = self.run_instar_compare(image1, image2)
+        self.assertEqual(
+            0, rc,
+            f'{context}: compare must report identical; '
+            f'stdout={stdout!r} stderr={stderr!r}'
+        )
+        self.assertIn(
+            'Images are identical', stdout,
+            f'{context}: stdout={stdout!r}'
+        )
+
+    def assert_compare_differs_at(self, image1, image2, offset, context):
+        """`compare` reports a first difference at exactly `offset`.
+
+        Both output formats, because they are two renderings of the
+        same number and a test that reads only one cannot tell a
+        formatting change from a read served off the wrong device.
+        """
+        stdout, stderr, rc = self.run_instar_compare(image1, image2)
+        self.assertEqual(
+            1, rc,
+            f'{context}: compare must report a difference; '
+            f'stdout={stdout!r} stderr={stderr!r}'
+        )
+        self.assertIn(
+            f'Content mismatch at offset {offset}!', stdout,
+            f'{context}: compare reported a difference somewhere other '
+            f'than offset {offset}; stdout={stdout!r}'
+        )
+        stdout, stderr, rc = self.run_instar_compare(
+            image1, image2, output_format='json'
+        )
+        self.assertEqual(
+            1, rc,
+            f'{context} (json): stdout={stdout!r} stderr={stderr!r}'
+        )
+        report = json.loads(stdout)
+        self.assertFalse(
+            report['identical'],
+            f'{context} (json): report={report!r}'
+        )
+        self.assertEqual(
+            offset, report['first-mismatch-offset'],
+            f'{context} (json): report={report!r}'
+        )
+
+    def assert_chain_is_two_images(self, image, context):
+        """Pin that this side of the comparison really is a two-image chain.
+
+        Without it the four-device claim these tests rest on is an
+        assumption. A chain that silently resolved to one image would
+        make the test below a two-device case asserting nothing new.
+        """
+        stdout, _stderr, rc = self.run_instar_info(image, chain=True)
+        self.assertEqual(0, rc, f'{context}: stdout={stdout!r}')
+        self.assertIn(
+            'Chain: 2 image(s)', stdout,
+            f'{context}: this side is not a two-image chain, so the '
+            f'comparison is not the four-device case; stdout={stdout!r}'
+        )
+
+    def test_compare_refuses_a_child_against_the_image2_that_would_look_identical(self):
+        """Issue #614, stated so that the wrong answer is "identical".
+
+        A differencing child at index 0 of a two-device array whose own
+        chain holds no parent. `device_count` says a device follows;
+        the segmentation says nothing follows in this child's chain, and
+        the segmentation is right -- the device that follows is image2.
+
+        image2 here is not an arbitrary unrelated file. It is qemu's
+        reading of the child itself, which its VPC driver decodes as a
+        dynamic VHD: every allocated block's bytes verbatim, the sector
+        bitmap ignored, holes elsewhere. That is precisely the file a
+        reader composing this child against image2 would agree with at
+        every byte -- child-owned sectors from the child, parent-owned
+        sectors read out of image2, which holds the child's own bytes
+        there, and holes from image2 for the unallocated blocks. So the
+        wrong read does not merely produce a wrong verdict here, it
+        produces the right-looking one, and the refusal is the only
+        answer distinguishable from it.
+
+        VHD only, and deliberately so: the construction needs a reader
+        that will decode a parent-referencing child as though it had no
+        parent, and qemu's VPC driver is the only one that does. Its
+        VHDX driver refuses such an image outright, so there is no
+        VHDX file to build this side of the comparison out of. The
+        format-blind half of the property -- that every parentless
+        differencing fixture is refused rather than composed against
+        image2 -- is `TestDifferencingRefusal.test_compare_does_not_
+        compose_a_child_against_an_unrelated_image`.
+        """
+        if shutil.which('qemu-img') is None:
+            self.skipTest('qemu-img is required to build the adversarial image2')
+        vhd_fixtures = [
+            (image_id, format_name)
+            for image_id, format_name in PARENTLESS_DIFFERENCING_FIXTURES
+            if format_name == 'VHD'
+        ]
+        self.assertTrue(
+            vhd_fixtures,
+            'no parentless differencing VHD fixture is left, so this test '
+            'exercises nothing'
+        )
+        for image_id, format_name in vhd_fixtures:
+            with self.subTest(image=image_id):
+                source = self.differencing_image(image_id)
+                with tempfile.TemporaryDirectory() as tmp:
+                    other = Path(tmp) / 'reads-back-as-the-child.raw'
+                    r = subprocess.run(
+                        ['qemu-img', 'convert', '-f', 'vpc', '-O', 'raw',
+                         str(source), str(other)],
+                        capture_output=True, text=True, timeout=120
+                    )
+                    self.assertEqual(
+                        0, r.returncode,
+                        f'{image_id}: qemu-img could not flatten the child; '
+                        f'stdout={r.stdout!r} stderr={r.stderr!r}'
+                    )
+                    flattened = other.read_bytes()
+                    self.assertNotEqual(
+                        bytes(len(flattened)), flattened,
+                        f'{image_id}: the adversarial image2 is all zeros, so '
+                        f'a wrong composition would no longer match it and '
+                        f'this test proves nothing'
+                    )
+                    stdout, stderr, rc = self.run_instar_compare(source, other)
+                self.assert_refused(
+                    'compare', format_name, stdout, stderr, rc,
+                    f'{image_id} against an image2 a wrong composition '
+                    f'would match'
+                )
+                combined = stdout + stderr
+                self.assertNotIn(
+                    'Images are identical', combined,
+                    f'{image_id}: compare composed the child against image2 '
+                    f'and reported the wrong answer as success; '
+                    f'output={combined!r}'
+                )
+                self.assertNotIn(
+                    'Content mismatch', combined,
+                    f'{image_id}: compare reached a verdict against an '
+                    f'image it should not have read; output={combined!r}'
+                )
+
+    def test_compare_reports_the_offset_of_one_altered_parent_owned_sector(self):
+        """A difference at a known offset, not merely a difference.
+
+        The second side is the recorded composition with a single
+        parent-owned sector overwritten, so the offset `compare`
+        reports is the offset of a sector whose content the chain can
+        only have taken from the parent. An exit code cannot say that;
+        a reader that served the child's zeros for its parent's sectors
+        would differ from the golden somewhere too, just not here.
+
+        For `vhd-diff-child-mixed` the sector is 2, which shares its
+        sector-bitmap byte with the child's own sectors 1 and 3, so the
+        offset reported here is the one a nearly-correct bit shift gets
+        wrong.
+        """
+        for image_id, golden_id, _format_name in COMPOSED_CHAIN_FIXTURES:
+            with self.subTest(image=image_id):
+                source = self.differencing_image(image_id)
+                golden = self.composed_golden(golden_id)
+                parent_offset, _child_offset = self._probe_offsets(
+                    image_id, golden
+                )
+                with tempfile.TemporaryDirectory() as tmp:
+                    altered = Path(tmp) / 'altered.raw'
+                    data = bytearray(golden.read_bytes())
+                    end = parent_offset + self.SECTOR
+                    data[parent_offset:end] = bytes(
+                        [self.PATCH_BYTE] * self.SECTOR
+                    )
+                    altered.write_bytes(bytes(data))
+                    self.assert_compare_differs_at(
+                        source, altered, parent_offset,
+                        f'{image_id} against its composition with the '
+                        f'parent-owned sector at {parent_offset} overwritten'
+                    )
+
+    def test_compare_two_differencing_chains_are_identical(self):
+        """Four devices, two chains, both of them differencing.
+
+        Each child is copied beside its own copy of the parent in a
+        directory of its own, so the host resolves two independent
+        two-image chains and writes a segment for each. Nothing else in
+        this suite puts a differencing child at the head of a *second*
+        chain, and a chain beginning at index 0 is the one position at
+        which an array-absolute device offset and a chain-relative one
+        agree, so this is the only case that can tell them apart.
+
+        The two chains hold the same content, so the verdict must be
+        identical -- and the two cases below, which alter one parent,
+        are what stop that verdict being reachable by a read that
+        served neither chain's data.
+        """
+        for image_id, _golden_id, _format_name in COMPOSED_CHAIN_FIXTURES:
+            with self.subTest(image=image_id):
+                with tempfile.TemporaryDirectory() as tmp:
+                    first_dir = Path(tmp) / 'chain-one'
+                    second_dir = Path(tmp) / 'chain-two'
+                    first_dir.mkdir()
+                    second_dir.mkdir()
+                    first = self.chain_copy(image_id, first_dir)
+                    second = self.chain_copy(image_id, second_dir)
+                    self.assert_chain_is_two_images(
+                        first, f'{image_id}: image1'
+                    )
+                    self.assert_chain_is_two_images(
+                        second, f'{image_id}: image2'
+                    )
+                    self.assert_compare_identical(
+                        first, second,
+                        f'{image_id} against a separate copy of the same '
+                        f'chain'
+                    )
+
+    def test_compare_reads_each_chain_against_its_own_parent(self):
+        """Two differencing children of genuinely different parents.
+
+        The two chains start as copies of one another and then one
+        parent -- image2's -- has a single parent-owned sector
+        overwritten. The children are untouched and byte-identical, so
+        the only thing that can make the comparison differ is each
+        chain descending into its own parent file, and the offset of
+        the difference says which sector it descended for.
+
+        This is the case that fails if image2's chain is read from the
+        wrong index in the device array: reading image2 from image1's
+        chain start compares a chain with itself and reports identical,
+        and reading it one device low compares the composition against a
+        parent alone, which differs at a different offset.
+        """
+        self._require_qemu_io()
+        for image_id, golden_id, _format_name in COMPOSED_CHAIN_FIXTURES:
+            with self.subTest(image=image_id):
+                golden = self.composed_golden(golden_id)
+                parent_offset, _child_offset = self._probe_offsets(
+                    image_id, golden
+                )
+                with tempfile.TemporaryDirectory() as tmp:
+                    first_dir = Path(tmp) / 'chain-one'
+                    second_dir = Path(tmp) / 'chain-two'
+                    first_dir.mkdir()
+                    second_dir.mkdir()
+                    first = self.chain_copy(image_id, first_dir)
+                    second = self.chain_copy(image_id, second_dir)
+                    self._patch_parent_sector(
+                        second_dir, image_id, parent_offset, image_id
+                    )
+                    self.assert_chain_is_two_images(
+                        second, f'{image_id}: image2 after its parent changed'
+                    )
+                    self.assert_compare_differs_at(
+                        first, second, parent_offset,
+                        f'{image_id} against the same chain over a parent '
+                        f'altered at {parent_offset}'
+                    )
+
+    def test_compare_two_chains_let_each_child_outrank_its_own_parent(self):
+        """The same four devices, altered where the child wins instead.
+
+        The altered sector is one both the child and its parent hold.
+        The child's sector bitmap claims it, so the parent's copy is
+        never read and overwriting it must change nothing -- which is
+        the complement of the case above: there the parent's byte was
+        the answer, here it is unreachable.
+
+        For `vhd-diff-child-mixed` that sector is 1, in the same
+        sector-bitmap byte as the parent-owned sector 2 the previous
+        test alters. One byte of bitmap, two sectors, two opposite
+        verdicts, and a reader that resolves the byte with an unmasked
+        shift gets one of them wrong.
+        """
+        self._require_qemu_io()
+        for image_id, golden_id, _format_name in COMPOSED_CHAIN_FIXTURES:
+            with self.subTest(image=image_id):
+                golden = self.composed_golden(golden_id)
+                _parent_offset, child_offset = self._probe_offsets(
+                    image_id, golden
+                )
+                with tempfile.TemporaryDirectory() as tmp:
+                    first_dir = Path(tmp) / 'chain-one'
+                    second_dir = Path(tmp) / 'chain-two'
+                    first_dir.mkdir()
+                    second_dir.mkdir()
+                    first = self.chain_copy(image_id, first_dir)
+                    second = self.chain_copy(image_id, second_dir)
+                    self._patch_parent_sector(
+                        second_dir, image_id, child_offset, image_id
+                    )
+                    self.assert_compare_identical(
+                        first, second,
+                        f'{image_id} against the same chain over a parent '
+                        f'altered at {child_offset}, which the child owns'
                     )
 
 

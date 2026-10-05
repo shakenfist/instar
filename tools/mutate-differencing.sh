@@ -682,7 +682,7 @@ self_test() {
 # phase's definition of done asks the two to stay in step, which until
 # now was a promise kept by hand. Asserting it makes the drift a
 # failure instead of a documentation bug nobody reads.
-EXPECTED_CASES=70
+EXPECTED_CASES=75
 
 check_case_count() {
     # Only meaningful for a whole run; a selection is expected to be short.
@@ -1563,6 +1563,131 @@ rust_case 'vhdx-read-zero-sector-group-allowed' "${VHDX_READ_LIB}" \
             return None;
         }' \
     vhdx 'sectors_per_chunk_group_refuses_a_degenerate_geometry'
+
+# ---------------------------------------------------------------------
+# Two chains in one device array, which is `compare` alone.
+#
+# `compare` is the only operation that reads two images at once, and it
+# does it by packing both backing chains into the single device array
+# the guest walks: the host writes one `ChainSegment` per chain, and the
+# guest derives image2's first device by adding the two chain lengths.
+# Every case below breaks one piece of that arithmetic, and each needs a
+# test with a differencing child in a *second* chain to notice -- index
+# 0 is the one position at which an array-absolute device offset and a
+# chain-relative one agree, so a single-chain test cannot fail for any
+# of these reasons.
+#
+# They are integration cases rather than unit ones because two of them
+# mutate the host's segmentation, which no guest unit test can reach,
+# and because the property being asserted is a user-visible verdict:
+# the wrong answers here are "identical" and "a difference at some
+# other offset", both of which exit in a way a weaker test accepts.
+# ---------------------------------------------------------------------
+
+COMPARE_OP='src/operations/compare/src/main.rs'
+VMM_MAIN='src/vmm/src/main.rs'
+TWO_CHAINS='test_differencing.TestDifferencingCompareTwoChains'
+TWO_CHAINS_OWN_PARENT="${TWO_CHAINS}.test_compare_reads_each_chain_against_its_own_parent"
+TWO_CHAINS_LOOKALIKE="${TWO_CHAINS}"
+TWO_CHAINS_LOOKALIKE+='.test_compare_refuses_a_child_against_the_image2_that_would_look_identical'
+TWO_CHAINS_OFFSET="${TWO_CHAINS}"
+TWO_CHAINS_OFFSET+='.test_compare_reports_the_offset_of_one_altered_parent_owned_sector'
+TWO_CHAINS_IDENTICAL="${TWO_CHAINS}.test_compare_two_differencing_chains_are_identical"
+
+# image2 read from image1's chain start. The two chains then are the
+# same chain, so every comparison reports "identical" -- the one wrong
+# verdict that looks like success. The named test alters one chain's
+# parent and expects a difference at that sector's offset, so it is the
+# case this cannot slip past.
+integration_case 'compare-op-image2-read-starts-at-image1' "${COMPARE_OP}" \
+    '            image2_start,
+            image2_device_count,
+            virtual_offset,
+            buf2,' \
+    '            0, // MUTATED
+            image2_device_count,
+            virtual_offset,
+            buf2,' \
+    "${TWO_CHAINS_OWN_PARENT}"
+
+# The host declares one segment spanning both chains instead of one per
+# chain. `ChainSegment::covers` still accepts it -- it tiles the array
+# exactly -- so nothing refuses the config; what changes is that a
+# differencing child at index 0 of a two-device array now has the
+# *other image* counted as the device behind it, which is issue #614
+# exactly. The named test is the one whose image2 a wrongly composed
+# read agrees with byte for byte, so the mutation's answer there is
+# "identical" rather than anything that looks like a failure.
+integration_case 'compare-host-segments-collapsed-into-one' "${VMM_MAIN}" \
+    '    let segments = [
+        shared::ChainSegment {
+            first: 0,
+            count: chain1_written as u32,
+        },
+        shared::ChainSegment {
+            first: chain1_written as u32,
+            count: chain2_written as u32,
+        },
+    ];' \
+    '    // MUTATED
+    let segments = [shared::ChainSegment {
+        first: 0,
+        count: (chain1_written + chain2_written) as u32,
+    }];' \
+    "${TWO_CHAINS_LOOKALIKE}"
+
+# Each segment keeps its position but takes the other chain's length.
+# The segmentation still tiles the array, so the host writes it and the
+# guest accepts it; it is simply wrong whenever the two chains are
+# different lengths. The named test compares a two-image chain against
+# a one-image raw file, so image1's segment shrinks to one device and
+# its differencing child is refused instead of composed.
+integration_case 'compare-host-segments-sized-from-the-other-chain' "${VMM_MAIN}" \
+    '    let segments = [
+        shared::ChainSegment {
+            first: 0,
+            count: chain1_written as u32,
+        },
+        shared::ChainSegment {
+            first: chain1_written as u32,
+            count: chain2_written as u32,
+        },
+    ];' \
+    '    let segments = [
+        shared::ChainSegment {
+            first: 0,
+            count: chain2_written as u32, // MUTATED
+        },
+        shared::ChainSegment {
+            first: chain2_written as u32,
+            count: chain1_written as u32,
+        },
+    ];' \
+    "${TWO_CHAINS_OFFSET}"
+
+# The segmentation reverted to the array bound, caught where a user
+# would meet it rather than in a unit test. `vhd-read-segmentation-
+# reverted-to-device-count` already kills this clause from inside the
+# `qcow2` crate; this case asserts the same revert is visible as a
+# wrong answer from the command line, because that is the form issue
+# #614 was reported in. The named test is the one whose image2 a child
+# composed against "the next device in the array" matches byte for
+# byte, so the mutation's verdict there is "identical".
+integration_case 'compare-read-vhd-refusal-reverted-to-device-count' "${QCOW2_LIB}" \
+    '                    && !parent_in_chain(chain_config, dev_idx)' \
+    '                    && dev_idx + 1 >= device_count // MUTATED' \
+    "${TWO_CHAINS_LOOKALIKE}"
+
+# "Is there a parent behind me" asked with the device's array index
+# rather than its offset within its own chain. Identical for chain 1,
+# whose segment begins at 0, and wrong for chain 2: its child is told
+# nothing is behind it and is refused. Only a test whose image2 is
+# itself a differencing child can see this, which is why it is the one
+# named.
+integration_case 'compare-read-parent-in-chain-offset-is-array-absolute' "${QCOW2_LIB}" \
+    '            devices_behind(seg.count as usize, dev_idx - seg.first as usize).unwrap_or(0) > 0' \
+    '            devices_behind(seg.count as usize, dev_idx).unwrap_or(0) > 0 // MUTATED' \
+    "${TWO_CHAINS_IDENTICAL}"
 
 # ---------------------------------------------------------------------
 # The create guest operation. Caught through the real binary only.
