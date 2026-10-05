@@ -227,23 +227,6 @@ pub const SB_BLOCK_PRESENT: u64 = 6;
 /// describes one whole chunk with nothing left over.
 pub const SB_BLOCK_SIZE: u32 = 1024 * 1024;
 
-/// Lowest file offset at which any VHDX block may begin.
-///
-/// The first megabyte of a VHDX file is fixed structure: the file
-/// identifier at 0, the two headers at 64 KiB and 128 KiB, the two
-/// region tables at 192 KiB and 256 KiB, and reserved space to 1 MiB.
-/// Payload blocks, sector bitmap blocks, the BAT and the metadata
-/// region all live above it, and the spec requires every one of them
-/// to be megabyte-aligned.
-///
-/// A BAT entry is a state in its low bits and an offset in the rest,
-/// so a zeroed or truncated entry that still carries a present state
-/// names offset 0 -- the file identifier. Reading a block from there
-/// answers a question about ownership with bytes that describe
-/// nothing of the kind. Refusing the offset costs one comparison and
-/// turns that into a failed read (issue #547).
-pub const MIN_BLOCK_FILE_OFFSET: u64 = 1024 * 1024;
-
 /// Mask for extracting the file offset from a BAT entry (bits 20-63).
 /// The offset is in units of 1 MB.
 pub const BAT_ENTRY_OFFSET_MASK: u64 = 0xFFFF_FFFF_FFF0_0000;
@@ -1876,6 +1859,27 @@ fn coalesce_ownership_run<F: FnMut(u32) -> Option<u8>>(
     })
 }
 
+/// Whether half-open byte range `[offset, offset + len)` intersects
+/// `[region_offset, region_offset + region_len)`.
+///
+/// Standard half-open interval overlap: the ranges intersect iff
+/// `offset < region_end && region_offset < end`. Either sum can
+/// overflow for a crafted offset or length -- both come from an
+/// untrusted BAT entry or region table -- and an end this cannot
+/// compute is not one this function can prove clear of the region,
+/// so overflow counts as overlap rather than being waved through.
+fn ranges_overlap(offset: u64, len: u64, region_offset: u64, region_len: u32) -> bool {
+    let end = match offset.checked_add(len) {
+        Some(e) => e,
+        None => return true,
+    };
+    let region_end = match region_offset.checked_add(u64::from(region_len)) {
+        Some(e) => e,
+        None => return true,
+    };
+    offset < region_end && region_offset < end
+}
+
 // ============================================================================
 // VHDX state for BAT I/O
 // ============================================================================
@@ -1906,6 +1910,23 @@ pub struct VhdxState {
     /// `scan_allocation` and `map_extents`, which must not run off
     /// the end of a region a writer sized by that same rule.
     pub sb_bat_entry_bound: u32,
+    /// `(file_offset, length)` of every entry this image's region
+    /// table declares, recognised or not, up to the same eight-entry
+    /// cap `init` itself scans (`entry_count.min(8)`).
+    ///
+    /// A payload or sector bitmap block must not overlap any of
+    /// these: an entry naming a block inside the BAT or metadata
+    /// region is just as malformed as one naming the file identifier,
+    /// and an unrecognised region is just as real a structure as
+    /// those two (issue #625). SPEC(VHDX) does not require a region
+    /// to precede the blocks it coexists with, so this has to be an
+    /// overlap test against each declared range rather than a single
+    /// low-water mark: a region a writer legally placed after every
+    /// block would otherwise raise the mark past them and refuse a
+    /// well-formed image. See [`VhdxState::block_overlaps_a_declared_region`].
+    pub regions: [(u64, u32); 8],
+    /// How many of [`Self::regions`] are populated, from the front.
+    pub region_count: u32,
     /// `HasParent` from the file parameters metadata item: the image
     /// is a differencing (parent-referencing) VHDX whose real content
     /// lives partly in a parent file.
@@ -2024,6 +2045,14 @@ impl VhdxState {
         let mut metadata_length: u32 = 0;
         let mut found_bat = false;
         let mut found_metadata = false;
+        // Every entry the table carries, recognised or not, for the
+        // overlap test `block_lookup` and `sector_bitmap_lookup` run
+        // against a candidate block's byte range. `entry_count.min(8)`
+        // below already caps how many entries this scan ever looks
+        // at, so the array is sized to match exactly rather than
+        // picked to be "big enough".
+        let mut regions: [(u64, u32); 8] = [(0, 0); 8];
+        let mut region_count: u32 = 0;
 
         for i in 0..entry_count.min(8) {
             let eoff = rt_off + REGION_TABLE_HEADER_SIZE + (i as usize * REGION_TABLE_ENTRY_SIZE);
@@ -2034,13 +2063,18 @@ impl VhdxState {
             let mut guid = [0u8; 16];
             guid.copy_from_slice(&rt_buffer[eoff..eoff + 16]);
 
+            let entry_offset = le_u64(&rt_buffer, eoff + 16);
+            let entry_length = le_u32(&rt_buffer, eoff + 24);
+            regions[region_count as usize] = (entry_offset, entry_length);
+            region_count += 1;
+
             if guid == BAT_REGION_GUID {
-                bat_offset = le_u64(&rt_buffer, eoff + 16);
-                bat_length = le_u32(&rt_buffer, eoff + 24);
+                bat_offset = entry_offset;
+                bat_length = entry_length;
                 found_bat = true;
             } else if guid == METADATA_REGION_GUID {
-                metadata_offset = le_u64(&rt_buffer, eoff + 16);
-                metadata_length = le_u32(&rt_buffer, eoff + 24);
+                metadata_offset = entry_offset;
+                metadata_length = entry_length;
                 found_metadata = true;
             }
         }
@@ -2133,6 +2167,8 @@ impl VhdxState {
             total_bat_entries: total_bat_entries_u32,
             chunk_ratio: chunk_ratio_u32,
             sb_bat_entry_bound,
+            regions,
+            region_count,
             has_parent: metadata.has_parent,
             bat_cached_sector: u64::MAX,
             bat_cache_buf,
@@ -2248,6 +2284,21 @@ impl VhdxState {
         VhdxHeader::parse(&header_buf)
     }
 
+    /// Whether a block's byte range `[offset, offset + len)` overlaps
+    /// any region [`Self::regions`] declares.
+    ///
+    /// One helper for all three call sites -- `block_lookup`'s two
+    /// payload arms and `sector_bitmap_lookup` -- so they cannot
+    /// drift onto different definitions of "overlap" from each
+    /// other.
+    fn block_overlaps_a_declared_region(&self, offset: u64, len: u64) -> bool {
+        self.regions[..self.region_count as usize]
+            .iter()
+            .any(|&(region_offset, region_length)| {
+                ranges_overlap(offset, len, region_offset, region_length)
+            })
+    }
+
     /// Look up the host location for a given virtual byte offset.
     ///
     /// Reads the BAT entry for the containing block, accounting for
@@ -2299,7 +2350,17 @@ impl VhdxState {
             }
             PAYLOAD_BLOCK_ZERO => Some(VhdxBlockLookup::Zero),
             PAYLOAD_BLOCK_FULLY_PRESENT => {
-                if file_offset < MIN_BLOCK_FILE_OFFSET {
+                // A BAT entry's offset is always a whole megabyte (the
+                // mask clears the low 20 bits), so the only value a
+                // zeroed or truncated entry that still reads as
+                // present can name is exactly zero -- the file
+                // identifier, which is fixed structure rather than a
+                // region table entry, so the overlap test below would
+                // not catch it on its own (issue #547).
+                if file_offset == 0 {
+                    return None;
+                }
+                if self.block_overlaps_a_declared_region(file_offset, u64::from(self.block_size)) {
                     return None;
                 }
                 let intra_block_offset = virtual_offset % self.block_size as u64;
@@ -2327,7 +2388,14 @@ impl VhdxState {
                 if !self.has_parent {
                     return None;
                 }
-                if file_offset < MIN_BLOCK_FILE_OFFSET {
+                // Same reasoning as the fully present arm above: a
+                // zeroed or truncated entry names offset zero, which
+                // is not a region table entry and so would not be
+                // caught by the overlap test alone (issue #547).
+                if file_offset == 0 {
+                    return None;
+                }
+                if self.block_overlaps_a_declared_region(file_offset, u64::from(self.block_size)) {
                     return None;
                 }
                 let intra_block_offset = virtual_offset % self.block_size as u64;
@@ -2430,13 +2498,20 @@ impl VhdxState {
         if state != SB_BLOCK_PRESENT {
             return None;
         }
-        // And a present entry still has to name a plausible place. The
-        // offset mask keeps the low twenty bits clear, so the only
-        // value below the first megabyte is zero -- a zeroed or
-        // truncated entry whose state bits happen to read as present.
-        // The file identifier lives there, and its bytes would be
-        // served as an answer about which sectors the child owns.
-        if file_offset < MIN_BLOCK_FILE_OFFSET {
+        // And a present entry still has to name a plausible place. A
+        // zeroed or truncated entry whose state bits happen to read
+        // as present names offset zero -- the file identifier, not a
+        // region table entry, so the overlap test below would not
+        // catch it on its own (issue #547).
+        if file_offset == 0 {
+            return None;
+        }
+        // And it must not land inside the BAT or metadata region
+        // itself, or any other region the image declares, which a
+        // fixed 1 MiB floor could not tell from real bitmap data
+        // (issue #625). A sector bitmap block is `SB_BLOCK_SIZE`
+        // bytes, not `self.block_size`.
+        if self.block_overlaps_a_declared_region(file_offset, u64::from(SB_BLOCK_SIZE)) {
             return None;
         }
 
@@ -6062,6 +6137,10 @@ mod tests {
             // differencing BAT of this geometry holds.
             sb_bat_entry_bound: chunk_ratio as u32 + 1,
             chunk_ratio: chunk_ratio as u32,
+            // Unused by the arithmetic-only accessors this state is
+            // built for.
+            regions: [(0, 0); 8],
+            region_count: 0,
             has_parent: true,
             bat_cached_sector: u64::MAX,
             bat_cache_buf: core::ptr::null_mut(),

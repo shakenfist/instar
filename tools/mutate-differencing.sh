@@ -682,7 +682,7 @@ self_test() {
 # phase's definition of done asks the two to stay in step, which until
 # now was a promise kept by hand. Asserting it makes the drift a
 # failure instead of a documentation bug nobody reads.
-EXPECTED_CASES=65
+EXPECTED_CASES=68
 
 check_case_count() {
     # Only meaningful for a whole run; a selection is expected to be short.
@@ -1418,9 +1418,17 @@ rust_case 'vhdx-read-mixed-chunk-zero-fills-the-parent-share' "${QCOW2_LIB}" \
     --features "${QCOW2_FEATURES}"
 
 # --- VHDX: no block begins inside the headers ------------------------
+#
+# Offset zero is its own guard, independent of the overlap test below:
+# the file identifier and headers are fixed structure, not region
+# table entries, so a region table a writer never touches would leave
+# nothing for the overlap test to catch there. Each case mutates only
+# the zero check, leaving the overlap check beside it intact, so a
+# mutation that silently relied on the other guard to cover for it
+# would still be caught.
 
 rust_case 'vhdx-read-sb-offset-zero-accepted' "${VHDX_READ_LIB}" \
-    '        if file_offset < MIN_BLOCK_FILE_OFFSET {
+    '        if file_offset == 0 {
             return None;
         }' \
     '        if false { // MUTATED
@@ -1430,12 +1438,18 @@ rust_case 'vhdx-read-sb-offset-zero-accepted' "${VHDX_READ_LIB}" \
     --features "${QCOW2_FEATURES}"
 
 rust_case 'vhdx-read-full-payload-offset-zero-accepted' "${VHDX_READ_LIB}" \
-    '                if file_offset < MIN_BLOCK_FILE_OFFSET {
+    '                if file_offset == 0 {
+                    return None;
+                }
+                if self.block_overlaps_a_declared_region(file_offset, u64::from(self.block_size)) {
                     return None;
                 }
                 let intra_block_offset = virtual_offset % self.block_size as u64;
                 Some(VhdxBlockLookup::Present {' \
     '                if false { // MUTATED
+                    return None;
+                }
+                if self.block_overlaps_a_declared_region(file_offset, u64::from(self.block_size)) {
                     return None;
                 }
                 let intra_block_offset = virtual_offset % self.block_size as u64;
@@ -1444,7 +1458,61 @@ rust_case 'vhdx-read-full-payload-offset-zero-accepted' "${VHDX_READ_LIB}" \
     --features "${QCOW2_FEATURES}"
 
 rust_case 'vhdx-read-partial-payload-offset-zero-accepted' "${VHDX_READ_LIB}" \
-    '                if file_offset < MIN_BLOCK_FILE_OFFSET {
+    '                if file_offset == 0 {
+                    return None;
+                }
+                if self.block_overlaps_a_declared_region(file_offset, u64::from(self.block_size)) {
+                    return None;
+                }
+                let intra_block_offset = virtual_offset % self.block_size as u64;
+                Some(VhdxBlockLookup::PartiallyPresent {' \
+    '                if false { // MUTATED
+                    return None;
+                }
+                if self.block_overlaps_a_declared_region(file_offset, u64::from(self.block_size)) {
+                    return None;
+                }
+                let intra_block_offset = virtual_offset % self.block_size as u64;
+                Some(VhdxBlockLookup::PartiallyPresent {' \
+    qcow2 'vhdx_arm_block_at_file_offset_zero_is_refused' \
+    --features "${QCOW2_FEATURES}"
+
+# --- VHDX: no block begins inside the BAT or metadata region ---------
+#
+# A low-water mark fixed at 1 MiB could not catch this one: an offset
+# inside the BAT or metadata region of a small image is still above
+# 1 MiB. The check is now an overlap test against every region the
+# image declares, which SPEC(VHDX) does not promise precedes the
+# blocks it coexists with -- see the trailing-region case below for
+# the layout that makes that matter. Each case here mutates only the
+# overlap check, leaving the offset-zero guard beside it intact.
+
+rust_case 'vhdx-read-sb-offset-inside-region-accepted' "${VHDX_READ_LIB}" \
+    '        if self.block_overlaps_a_declared_region(file_offset, u64::from(SB_BLOCK_SIZE)) {
+            return None;
+        }' \
+    '        if false { // MUTATED
+            return None;
+        }' \
+    qcow2 'vhdx_arm_block_inside_a_declared_region_is_refused' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'vhdx-read-full-payload-offset-inside-region-accepted' "${VHDX_READ_LIB}" \
+    '                if self.block_overlaps_a_declared_region(file_offset, u64::from(self.block_size)) {
+                    return None;
+                }
+                let intra_block_offset = virtual_offset % self.block_size as u64;
+                Some(VhdxBlockLookup::Present {' \
+    '                if false { // MUTATED
+                    return None;
+                }
+                let intra_block_offset = virtual_offset % self.block_size as u64;
+                Some(VhdxBlockLookup::Present {' \
+    qcow2 'vhdx_arm_block_inside_a_declared_region_is_refused' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'vhdx-read-partial-payload-offset-inside-region-accepted' "${VHDX_READ_LIB}" \
+    '                if self.block_overlaps_a_declared_region(file_offset, u64::from(self.block_size)) {
                     return None;
                 }
                 let intra_block_offset = virtual_offset % self.block_size as u64;
@@ -1454,7 +1522,7 @@ rust_case 'vhdx-read-partial-payload-offset-zero-accepted' "${VHDX_READ_LIB}" \
                 }
                 let intra_block_offset = virtual_offset % self.block_size as u64;
                 Some(VhdxBlockLookup::PartiallyPresent {' \
-    qcow2 'vhdx_arm_block_at_file_offset_zero_is_refused' \
+    qcow2 'vhdx_arm_block_inside_a_declared_region_is_refused' \
     --features "${QCOW2_FEATURES}"
 
 # --- VHDX: the device a mixed chunk resumes on -----------------------

@@ -9597,6 +9597,179 @@ mod tests {
         }
     }
 
+    // An offset above the first megabyte is not automatically a real
+    // block: the fixture's own BAT region sits at 2 MiB and its
+    // metadata region at 1 MiB, both well clear of the headers but
+    // still not payload. A floor fixed at 1 MiB cannot tell a block
+    // that starts there from one that starts at the file identifier;
+    // only the region table the image declares can, which is what
+    // `VhdxState::min_block_file_offset` is for (issue #625). As
+    // above, all three states that carry an offset are driven.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_arm_block_inside_a_declared_region_is_refused() {
+        let child_sectors = [0u32..2048];
+        let chunk_ratio = vhdx_chunk_ratio(512);
+        let payload_entry = VHDX_FIX_BAT_OFFSET as usize;
+        let sb_entry = (VHDX_FIX_BAT_OFFSET + chunk_ratio * 8) as usize;
+
+        for (block_state, rewritten_entry, label) in [
+            (
+                VhdxBlockState::FullyPresent,
+                payload_entry,
+                "a fully present payload block",
+            ),
+            (
+                VhdxBlockState::PartiallyPresent,
+                payload_entry,
+                "a partially present payload block",
+            ),
+            (
+                VhdxBlockState::PartiallyPresent,
+                sb_entry,
+                "a present sector bitmap",
+            ),
+        ] {
+            for (region_offset, region_label) in [
+                (VHDX_FIX_METADATA_OFFSET, "the metadata region"),
+                (VHDX_FIX_BAT_OFFSET, "the BAT region"),
+            ] {
+                let fixture = build_vhdx_image(
+                    512,
+                    true,
+                    1,
+                    &[(0, block_state)],
+                    &[VhdxGroupBitmap {
+                        group: 0,
+                        state: vhdx::SB_BLOCK_PRESENT,
+                        child_sectors: &child_sectors,
+                    }],
+                );
+                let mut bytes = fixture.bytes;
+                // Keep the state bits, point the offset at the other
+                // region instead.
+                let entry = u64::from_le_bytes(
+                    bytes[rewritten_entry..rewritten_entry + 8]
+                        .try_into()
+                        .unwrap(),
+                );
+                let state = entry & vhdx::BAT_ENTRY_STATE_MASK;
+                let rewritten = vhdx::build_bat_entry(state, region_offset);
+                bytes[rewritten_entry..rewritten_entry + 8]
+                    .copy_from_slice(&rewritten.to_le_bytes());
+                let devices = vhdx_chain_with_parent(bytes, 2 * 1024 * 1024);
+                let (ok, _out) = run_vhdx_chain_read(&devices, 512, 0, VHDX_CHUNK);
+                assert!(
+                    !ok,
+                    "an entry naming an offset inside {region_label} must fail \
+                     the read rather than serve that region's own bytes as \
+                     data: {label}"
+                );
+            }
+        }
+
+        // The control: the same fixtures, with the payload entry
+        // renamed to the first byte past every declared region --
+        // where `build_vhdx_image` already places its first block --
+        // must still read.
+        for (block_state, label) in [
+            (
+                VhdxBlockState::FullyPresent,
+                "a fully present payload block",
+            ),
+            (
+                VhdxBlockState::PartiallyPresent,
+                "a partially present payload block",
+            ),
+        ] {
+            let fixture = build_vhdx_image(
+                512,
+                true,
+                1,
+                &[(0, block_state)],
+                &[VhdxGroupBitmap {
+                    group: 0,
+                    state: vhdx::SB_BLOCK_PRESENT,
+                    child_sectors: &child_sectors,
+                }],
+            );
+            let mut bytes = fixture.bytes;
+            let entry =
+                u64::from_le_bytes(bytes[payload_entry..payload_entry + 8].try_into().unwrap());
+            let state = entry & vhdx::BAT_ENTRY_STATE_MASK;
+            let rewritten = vhdx::build_bat_entry(state, VHDX_FIX_FIRST_BLOCK);
+            bytes[payload_entry..payload_entry + 8].copy_from_slice(&rewritten.to_le_bytes());
+            let devices = vhdx_chain_with_parent(bytes, 2 * 1024 * 1024);
+            let (ok, _out) = run_vhdx_chain_read(&devices, 512, 0, VHDX_CHUNK);
+            assert!(
+                ok,
+                "an offset immediately past every declared region must still \
+                 read, or the refusals above prove only that the fixture is \
+                 broken: {label}"
+            );
+        }
+    }
+
+    // SPEC(VHDX) does not require a region to precede the blocks it
+    // coexists with, so a region table entry naming a byte range
+    // entirely *after* every block this image uses must not refuse
+    // them. This is the layout a low-water-mark bound gets wrong: it
+    // would have raised the mark past both blocks here and refused
+    // the read, even though neither block overlaps anything. The
+    // fixture declares a third region -- one this reader does not
+    // recognise -- immediately past the end of the file the other
+    // two tests above never touch, which is also well past both
+    // blocks this fixture allocates.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_arm_block_before_a_trailing_region_is_not_refused() {
+        let child_sectors = [0u32..2048];
+        let fixture = build_vhdx_image(
+            512,
+            true,
+            1,
+            &[(0, VhdxBlockState::PartiallyPresent)],
+            &[VhdxGroupBitmap {
+                group: 0,
+                state: vhdx::SB_BLOCK_PRESENT,
+                child_sectors: &child_sectors,
+            }],
+        );
+        let payload = fixture.block_offsets[0];
+        let mut bytes = fixture.bytes;
+
+        // A third region table entry, past the end of every byte the
+        // fixture otherwise writes -- so past the payload block and
+        // its sector bitmap block too. Nothing reads an unrecognised
+        // region's own bytes, so it needs no backing data, only the
+        // declaration.
+        let trailing_region_offset = bytes.len() as u64;
+        let trailing_region_length: u32 = 0x1000;
+        let rt1_base = vhdx::REGION_TABLE1_OFFSET as usize;
+        let entry_count_off = rt1_base + vhdx::REGION_TABLE_ENTRY_COUNT_OFFSET;
+        bytes[entry_count_off..entry_count_off + 4].copy_from_slice(&3u32.to_le_bytes());
+        let entry2_off =
+            rt1_base + vhdx::REGION_TABLE_HEADER_SIZE + 2 * vhdx::REGION_TABLE_ENTRY_SIZE;
+        bytes[entry2_off..entry2_off + 16].copy_from_slice(&[0xAAu8; 16]);
+        bytes[entry2_off + 16..entry2_off + 24]
+            .copy_from_slice(&trailing_region_offset.to_le_bytes());
+        bytes[entry2_off + 24..entry2_off + 28]
+            .copy_from_slice(&trailing_region_length.to_le_bytes());
+
+        let devices = vhdx_chain_with_parent(bytes, 2 * 1024 * 1024);
+        let (ok, out) = run_vhdx_chain_read(&devices, 512, 0, VHDX_CHUNK);
+        assert!(
+            ok,
+            "a region declared entirely after every block this image uses \
+             must not refuse them"
+        );
+        assert_eq!(
+            out,
+            vhdx_expected(0, VHDX_CHUNK, payload, 512, &child_sectors),
+            "the read must still compose correctly once the block is accepted"
+        );
+    }
+
     // A differencing child over a differencing VHDX parent over a raw
     // device. Every other composing test here puts a raw device behind
     // the child, so the Mixed arm always recursed into a format that is
