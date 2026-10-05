@@ -682,7 +682,7 @@ self_test() {
 # phase's definition of done asks the two to stay in step, which until
 # now was a promise kept by hand. Asserting it makes the drift a
 # failure instead of a documentation bug nobody reads.
-EXPECTED_CASES=68
+EXPECTED_CASES=70
 
 check_case_count() {
     # Only meaningful for a whole run; a selection is expected to be short.
@@ -1172,35 +1172,45 @@ rust_case 'vhd-read-runs-addressed-in-512-byte-sectors' "${QCOW2_LIB}" \
     qcow2 'vhd_arm_mixed_bitmap_on_a_large_sector_device' \
     --features "${QCOW2_FEATURES}"
 
-# --- VHD: the refusal in init_chain_states ---------------------------
+# --- VHD: the narrowed refusal in init_chain_states ------------------
+#
+# The refusal is no longer unconditional: a differencing child with a
+# device behind it in its own chain composes, and only one with nothing
+# behind it is refused. Three ways to get that condition wrong, each
+# mutating the same clause and each killed by a different case of the
+# one named test -- widening it back refuses a chain that should
+# compose, removing it admits a child with nothing to compose against,
+# and deriving it from the array bound admits a child whose chain is
+# one device long inside an array of two.
 
-rust_case 'vhd-read-refusal-conditional-on-device-count' "${QCOW2_LIB}" \
-    '            if state.disk_type == vhd::DISK_TYPE_DIFFERENCING {' \
-    '            if state.disk_type == vhd::DISK_TYPE_DIFFERENCING && dev_idx + 1 >= device_count { // MUTATED' \
-    qcow2 'vhd_init_refuses_a_differencing_child_and_admits_a_dynamic_one' \
+rust_case 'vhd-read-refusal-widened-to-unconditional' "${QCOW2_LIB}" \
+    '                    && !parent_in_chain(chain_config, dev_idx)' \
+    '                    && true // MUTATED' \
+    qcow2 'vhd_init_refuses_a_differencing_child_with_no_parent_in_its_own_chain' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'vhd-read-refusal-removed' "${QCOW2_LIB}" \
+    '                    && !parent_in_chain(chain_config, dev_idx)' \
+    '                    && false // MUTATED' \
+    qcow2 'vhd_init_refuses_a_differencing_child_with_no_parent_in_its_own_chain' \
     --features "${QCOW2_FEATURES}"
 
 rust_case 'vhd-read-refusal-names-vhdx' "${QCOW2_LIB}" \
     'send_differencing_refusal(call_table, shared::DifferencingRefusal::STATUS_VHD);' \
     'send_differencing_refusal(call_table, shared::DifferencingRefusal::STATUS_VHDX); // MUTATED' \
-    qcow2 'vhd_init_refuses_a_differencing_child_and_admits_a_dynamic_one' \
+    qcow2 'vhd_init_refuses_a_differencing_child_with_no_parent_in_its_own_chain' \
     --features "${QCOW2_FEATURES}"
 
 # Reverts the per-chain judgement to the array-bound form the
-# segmentation replaced. Both forms refuse, so only the diagnostic can
-# tell them apart, and that is the point: the test's two-chain case
-# declares device 1 as its own chain, so the segmentation says no
-# parent is behind device 0 while `dev_idx + 1 < device_count` says one
-# is. A reader that believed the latter would compose the child against
-# an unrelated image.
+# segmentation replaced. The test's two-chain case declares device 1 as
+# its own chain, so the segmentation says no parent is behind device 0
+# while `dev_idx + 1 >= device_count` says one is -- and a reader that
+# believed the latter would compose the child against an unrelated
+# image rather than refusing it.
 rust_case 'vhd-read-segmentation-reverted-to-device-count' "${QCOW2_LIB}" \
-    '                    if parent_in_chain(chain_config, dev_idx) {
-                        (call_table.debug_print)(
-                            b"init_chain_states: differencing VHD source refused (parent in chain)\n\0"' \
-    '                    if dev_idx + 1 < device_count { // MUTATED
-                        (call_table.debug_print)(
-                            b"init_chain_states: differencing VHD source refused (parent in chain)\n\0"' \
-    qcow2 'vhd_init_refuses_a_differencing_child_and_admits_a_dynamic_one' \
+    '                    && !parent_in_chain(chain_config, dev_idx)' \
+    '                    && dev_idx + 1 >= device_count // MUTATED' \
+    qcow2 'vhd_init_refuses_a_differencing_child_with_no_parent_in_its_own_chain' \
     --features "${QCOW2_FEATURES}"
 
 # --- VHD: the documented survivor ------------------------------------
@@ -1381,30 +1391,32 @@ rust_case 'vhdx-read-run-ignores-the-leading-sector-byte' "${QCOW2_LIB}" \
     qcow2 'vhdx_arm_mixed_chunk_at_an_unaligned_virtual_offset' \
     --features "${QCOW2_FEATURES}"
 
-# --- VHDX: the refusal in init_chain_states --------------------------
+# --- VHDX: the narrowed refusal in init_chain_states -----------------
+#
+# The VHDX twins of the four VHD cases above; see the reasoning there.
 
 rust_case 'vhdx-read-refusal-names-vhd' "${QCOW2_LIB}" \
     'send_differencing_refusal(call_table, shared::DifferencingRefusal::STATUS_VHDX);' \
     'send_differencing_refusal(call_table, shared::DifferencingRefusal::STATUS_VHD); // MUTATED' \
-    qcow2 'vhdx_init_refuses_a_differencing_child_and_admits_a_dynamic_one' \
+    qcow2 'vhdx_init_refuses_a_differencing_child_with_no_parent_in_its_own_chain' \
     --features "${QCOW2_FEATURES}"
 
-rust_case 'vhdx-read-refusal-conditional-on-device-count' "${QCOW2_LIB}" \
-    '                if state.has_parent {' \
-    '                if state.has_parent && dev_idx + 1 >= device_count { // MUTATED' \
-    qcow2 'vhdx_init_refuses_a_differencing_child_and_admits_a_dynamic_one' \
+rust_case 'vhdx-read-refusal-widened-to-unconditional' "${QCOW2_LIB}" \
+    '                if state.has_parent && !parent_in_chain(chain_config, dev_idx) {' \
+    '                if state.has_parent && true { // MUTATED' \
+    qcow2 'vhdx_init_refuses_a_differencing_child_with_no_parent_in_its_own_chain' \
     --features "${QCOW2_FEATURES}"
 
-# The VHDX twin of 'vhd-read-segmentation-reverted-to-device-count';
-# see the reasoning there.
+rust_case 'vhdx-read-refusal-removed' "${QCOW2_LIB}" \
+    '                if state.has_parent && !parent_in_chain(chain_config, dev_idx) {' \
+    '                if state.has_parent && false { // MUTATED' \
+    qcow2 'vhdx_init_refuses_a_differencing_child_with_no_parent_in_its_own_chain' \
+    --features "${QCOW2_FEATURES}"
+
 rust_case 'vhdx-read-segmentation-reverted-to-device-count' "${QCOW2_LIB}" \
-    '                    if parent_in_chain(chain_config, dev_idx) {
-                        (call_table.debug_print)(
-                            b"init_chain_states: differencing VHDX source refused (parent in chain)\n\0"' \
-    '                    if dev_idx + 1 < device_count { // MUTATED
-                        (call_table.debug_print)(
-                            b"init_chain_states: differencing VHDX source refused (parent in chain)\n\0"' \
-    qcow2 'vhdx_init_refuses_a_differencing_child_and_admits_a_dynamic_one' \
+    '                if state.has_parent && !parent_in_chain(chain_config, dev_idx) {' \
+    '                if state.has_parent && dev_idx + 1 >= device_count { // MUTATED' \
+    qcow2 'vhdx_init_refuses_a_differencing_child_with_no_parent_in_its_own_chain' \
     --features "${QCOW2_FEATURES}"
 
 rust_case 'vhdx-read-mixed-chunk-zero-fills-the-parent-share' "${QCOW2_LIB}" \

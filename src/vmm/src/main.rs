@@ -831,14 +831,22 @@ impl SerialDecoder {
     /// `CompareResult`/`CheckResult` carry no error codes) to hold a
     /// per-op error code, so the guest reports the refusal over
     /// `send_error` instead and this formatter renders whatever the
-    /// decoder captured. If the guest reported a refusal, name the
-    /// operation and the format, following `map_error_message`'s
-    /// wording (`:15053`) for the same fact on the `map` path;
-    /// otherwise fall back to the generic message. The plan is named but
-    /// its phase numbers are not: AGENTS.md keeps phase numbers inside
-    /// `docs/plans/`, and this string reaches a user of an installed .deb
-    /// who has neither the plan nor its numbering.
-    fn differencing_refusal_error(&self, op: &str) -> String {
+    /// decoder captured. Without a captured refusal, fall back to the
+    /// generic message.
+    ///
+    /// `composition` is why there are two sentences rather than one.
+    /// Some operations read a differencing child against its parent and
+    /// reach this formatter only when the chain they were given has no
+    /// parent in it; others compose nothing and decline such a source
+    /// however complete the chain is. One message cannot be honest for
+    /// both: told "no parent is in the chain" by an operation that was
+    /// never going to read one, a user whose previous command converted
+    /// the same image successfully would go looking for a missing file
+    /// that is sitting right there. So each caller states the same
+    /// capability here as it states to [`discover_backing_chain`] --
+    /// `measure`, which walks no chain at all, has only this one to
+    /// state -- and the operation is named either way.
+    fn differencing_refusal_error(&self, op: &str, composition: DifferencingComposition) -> String {
         match self.last_differencing_refusal {
             Some(status) => {
                 let format_name = match status {
@@ -846,11 +854,19 @@ impl SerialDecoder {
                     shared::DifferencingRefusal::STATUS_VHDX => "VHDX",
                     _ => "image",
                 };
-                format!(
-                    "{op}: source is a differencing {format_name} image whose parent \
-                     instar cannot yet compose; composition is deferred (see \
-                     PLAN-differencing.md)"
-                )
+                match composition {
+                    DifferencingComposition::Supported => format!(
+                        "{op}: source is a differencing {format_name} image with no \
+                         parent in the chain {op} was given, so the sectors it leaves \
+                         to its parent could not be composed"
+                    ),
+                    DifferencingComposition::Unsupported => format!(
+                        "{op}: source is a differencing {format_name} image, and {op} \
+                         reads an image on its own rather than composing a parent \
+                         into it, so the sectors it leaves to its parent could not \
+                         be composed"
+                    ),
+                }
             }
             None => format!("{op}: guest did not return a result"),
         }
@@ -944,30 +960,84 @@ mod guest_exception_tests {
     #[test]
     fn differencing_refusal_error_is_generic_without_a_refusal() {
         let decoder = super::SerialDecoder::new();
-        assert_eq!(
-            decoder.differencing_refusal_error("convert"),
-            "convert: guest did not return a result"
-        );
+        for composition in [
+            super::DifferencingComposition::Supported,
+            super::DifferencingComposition::Unsupported,
+        ] {
+            assert_eq!(
+                decoder.differencing_refusal_error("convert", composition),
+                "convert: guest did not return a result"
+            );
+        }
     }
 
     #[test]
     fn differencing_refusal_error_names_the_format_when_captured() {
         let mut decoder = super::SerialDecoder::new();
         decoder.last_differencing_refusal = Some(shared::DifferencingRefusal::STATUS_VHD);
-        let msg = decoder.differencing_refusal_error("convert");
+        let msg = decoder
+            .differencing_refusal_error("convert", super::DifferencingComposition::Supported);
         assert!(
             msg.contains("convert: source is a differencing VHD image"),
             "{msg}"
         );
-        assert!(msg.contains("(see PLAN-differencing.md)"), "{msg}");
 
         let mut decoder = super::SerialDecoder::new();
         decoder.last_differencing_refusal = Some(shared::DifferencingRefusal::STATUS_VHDX);
-        let msg = decoder.differencing_refusal_error("compare");
+        let msg = decoder
+            .differencing_refusal_error("compare", super::DifferencingComposition::Supported);
         assert!(
             msg.contains("compare: source is a differencing VHDX image"),
             "{msg}"
         );
+    }
+
+    /// The two halves of a half-lifted tree must not contradict each
+    /// other. An operation that composes reaches this formatter only
+    /// when the chain it was handed held no parent, and must say so; an
+    /// operation that composes nothing must say that instead, or a user
+    /// whose `convert` of the same image has just succeeded is sent
+    /// looking for a file that is not missing. Neither may claim instar
+    /// cannot compose such a chain, and neither may cite a plan.
+    #[test]
+    fn differencing_refusal_error_distinguishes_the_two_halves_of_the_policy() {
+        let mut decoder = super::SerialDecoder::new();
+        decoder.last_differencing_refusal = Some(shared::DifferencingRefusal::STATUS_VHD);
+
+        let composing = decoder
+            .differencing_refusal_error("convert", super::DifferencingComposition::Supported);
+        assert!(
+            composing.contains("no parent in the chain convert was given"),
+            "{composing}"
+        );
+
+        let refusing = decoder
+            .differencing_refusal_error("check", super::DifferencingComposition::Unsupported);
+        assert!(
+            refusing.contains("check reads an image on its own"),
+            "{refusing}"
+        );
+        assert!(
+            !refusing.contains("no parent in the chain"),
+            "an operation that never resolves a parent must not blame the \
+             chain for lacking one: {refusing}"
+        );
+
+        for msg in [&composing, &refusing] {
+            assert!(
+                msg.starts_with("convert: ") || msg.starts_with("check: "),
+                "{msg}"
+            );
+            assert!(
+                !msg.contains("PLAN-"),
+                "no user-visible string may cite a plan file: {msg}"
+            );
+            assert!(
+                !msg.contains("instar cannot"),
+                "the message must not claim instar cannot compose a chain it \
+                 does compose: {msg}"
+            );
+        }
     }
 }
 
@@ -5751,7 +5821,9 @@ fn run_bench_guest(
     // then fails the run with the generic ERROR_PARSE_FAILED. Prefer the
     // captured reason (PLAN-differencing phase 4).
     if serial_decoder.last_differencing_refusal.is_some() {
-        return Err(serial_decoder.differencing_refusal_error("bench").into());
+        return Err(serial_decoder
+            .differencing_refusal_error("bench", DifferencingComposition::Supported)
+            .into());
     }
     if !result_seen {
         return Err(serial_decoder.no_result_error("bench").into());
@@ -12391,7 +12463,9 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
     // Returning Err (exit 1) is what keeps "refused" distinct from both
     // "clean" (exit 0) and "corrupt" (exit 2) (PLAN-differencing phase 4).
     if serial_decoder.last_differencing_refusal.is_some() {
-        return Err(serial_decoder.differencing_refusal_error("check").into());
+        return Err(serial_decoder
+            .differencing_refusal_error("check", DifferencingComposition::Unsupported)
+            .into());
     }
 
     // Map the post-repair CheckResult to a qemu-img-parity process exit
@@ -13149,7 +13223,9 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     // captured reason rather than the generic text (PLAN-differencing
     // phase 4, closing issue #548).
     if serial_decoder.last_differencing_refusal.is_some() {
-        return Err(serial_decoder.differencing_refusal_error("compare").into());
+        return Err(serial_decoder
+            .differencing_refusal_error("compare", DifferencingComposition::Supported)
+            .into());
     }
 
     // Return error if no result was received
@@ -14219,7 +14295,9 @@ fn execute_convert(
             } else {
                 "convert"
             };
-            return Err(serial_decoder.differencing_refusal_error(op).into());
+            return Err(serial_decoder
+                .differencing_refusal_error(op, DifferencingComposition::Supported)
+                .into());
         }
         return Err("convert operation failed".into());
     }
@@ -15611,7 +15689,9 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     // otherwise reports the generic "unsupported format" (PLAN-differencing
     // phase 4).
     if serial_decoder.last_differencing_refusal.is_some() {
-        return Err(serial_decoder.differencing_refusal_error("measure").into());
+        return Err(serial_decoder
+            .differencing_refusal_error("measure", DifferencingComposition::Unsupported)
+            .into());
     }
 
     if !measure_result_seen {

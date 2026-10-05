@@ -6917,12 +6917,12 @@ mod tests {
     //
     // Devices are dispatched by device_idx exactly as the qcow1 mock above
     // does, so a differencing child can be built over a distinguishable
-    // backing device. `init_chain_states` refuses every differencing VHD
-    // unconditionally, so the read-path tests build per-device state
-    // directly with `VhdState::init` -- the same bypass the qcow1 harness
-    // above uses for its own init-independent reads -- and drive
-    // `read_chain_virtual_cluster` straight. Only the init-refusal test
-    // goes through `init_chain_states` itself.
+    // backing device. The read-path tests build per-device state directly
+    // with `VhdState::init` -- the same bypass the qcow1 harness above uses
+    // for its own init-independent reads -- and drive
+    // `read_chain_virtual_cluster` straight, so a fixture need not satisfy
+    // the chain config `init_chain_states` checks to be read. Only the
+    // init-judgement test goes through `init_chain_states` itself.
     // ========================================================================
 
     #[cfg(feature = "vhd-input")]
@@ -7304,8 +7304,8 @@ mod tests {
         img
     }
 
-    /// Init per-device VHD state directly (bypassing `init_chain_states`,
-    /// which refuses every differencing child regardless of chain shape)
+    /// Init per-device VHD state directly (bypassing the chain config
+    /// `init_chain_states` requires, which these fixtures do not carry)
     /// and run one span through `read_chain_virtual_cluster`. Returns
     /// whether the read succeeded and the output buffer, sentinel-filled
     /// beforehand so a false return that leaves the buffer untouched is
@@ -7605,43 +7605,38 @@ mod tests {
         assert_eq!(out, want);
     }
 
-    // (f) A differencing child is refused at init whatever follows it in
-    // the device array. Asserting that for a lone device is not enough:
-    // a tempting narrower rule, `dev_idx + 1 >= device_count`, refuses
-    // that case too, so a single-device test cannot tell the
-    // unconditional refusal from a position-dependent one.
+    // (f) A differencing child is admitted at init when a device sits
+    // behind it in its own chain, and refused when none does. Asserting
+    // either for a lone device is not enough: `dev_idx + 1 >=
+    // device_count` refuses that case too, so a single-device test
+    // cannot tell the per-chain rule from the array-bound one.
     //
-    // The second and third cases are the shape that rules the narrower
-    // form out, and they are the same two devices: `device_count`
-    // bounds a flat array, not a chain, so whether device 1 is device
-    // 0's parent is a question only the config's segmentation answers.
-    // Declared as one chain the child has a parent behind it; declared
-    // as two -- which is how `compare diff.vhd base.raw` lays its
-    // arguments out -- it has none, and `dev_idx + 1 >= device_count`
-    // would have admitted it and read every parent-owned sector as the
-    // child's zeros (issues #547, #614). The refusal is the same in
-    // both; what differs is the judgement the diagnostic reports, and
-    // asserting that is what shows the per-chain answer is reaching
-    // `init_chain_states` rather than being derived from the array
-    // bound.
+    // The second and third cases are the shape that separates them,
+    // and they are the same two devices: `device_count` bounds a flat
+    // array, not a chain, so whether device 1 is device 0's parent is
+    // a question only the config's segmentation answers. Declared as
+    // one chain the child has a parent behind it and composes;
+    // declared as two -- which is how `compare diff.vhd base.raw` lays
+    // its arguments out -- it has none and is refused, where
+    // `dev_idx + 1 >= device_count` would have admitted it and read
+    // every parent-owned sector out of an unrelated image (issues
+    // #547, #614).
     #[cfg(feature = "vhd-input")]
     #[test]
-    fn vhd_init_refuses_a_differencing_child_and_admits_a_dynamic_one() {
-        for (disk_type, device_count, segments, refused, parent_behind, label) in [
+    fn vhd_init_refuses_a_differencing_child_with_no_parent_in_its_own_chain() {
+        for (disk_type, device_count, segments, refused, label) in [
             (
                 vhd::DISK_TYPE_DIFFERENCING,
                 1u32,
                 &[(0u32, 1u32)][..],
                 true,
-                false,
                 "a lone differencing device",
             ),
             (
                 vhd::DISK_TYPE_DIFFERENCING,
                 2u32,
                 &[(0, 2)][..],
-                true,
-                true,
+                false,
                 "a differencing device at index 0 of a one-chain two-device array",
             ),
             (
@@ -7649,7 +7644,6 @@ mod tests {
                 2u32,
                 &[(0, 1), (1, 1)][..],
                 true,
-                false,
                 "a differencing device at index 0 of a two-chain two-device array",
             ),
             // The controls. One header field differs from the cases
@@ -7662,14 +7656,12 @@ mod tests {
                 1u32,
                 &[(0, 1)][..],
                 false,
-                false,
                 "a lone dynamic device",
             ),
             (
                 vhd::DISK_TYPE_DYNAMIC,
                 2u32,
                 &[(0, 2)][..],
-                false,
                 false,
                 "a dynamic device at index 0 of a two-device array",
             ),
@@ -7755,26 +7747,34 @@ mod tests {
                     shared::DifferencingRefusal::STATUS_VHD,
                     "the refusal must name VHD rather than VHDX: {label}"
                 );
-                // The per-chain judgement, which is the only thing the
-                // two two-device cases differ in. A rule derived from
-                // `device_count` would answer them identically.
-                let want = if parent_behind {
-                    "(parent in chain)"
-                } else {
-                    "(no parent in chain)"
-                };
+                // The reason, which is the whole of the narrowing: a
+                // child is refused for having no parent in its own
+                // chain and for nothing else.
                 let msg = vhd_last_debug();
                 assert!(
-                    msg.contains(want),
-                    "the refusal must report {want} for {label}, said {msg:?}"
+                    msg.contains("(no parent in chain)"),
+                    "the refusal must say no parent is in the chain for {label}, \
+                     said {msg:?}"
                 );
             } else {
                 assert!(
                     ok,
-                    "the same harness must initialise a non-differencing VHD, or \
-                     the refusal assertions prove nothing: {label}"
+                    "chain init must succeed, or the refusal assertions prove \
+                     nothing: {label}"
                 );
-                assert_eq!(calls, 0, "a dynamic VHD must raise no refusal: {label}");
+                assert_eq!(calls, 0, "an admitted VHD must raise no refusal: {label}");
+                // An admitted differencing child must be admitted *as*
+                // one: the state the reader will consult has to carry
+                // the differencing disk type, or the composing arm it
+                // unlocks is never reached and this case would pass
+                // while proving nothing about the lift.
+                let state = chain_states.vhd_states[0]
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("no VHD state recorded for {label}"));
+                assert_eq!(
+                    state.disk_type, disk_type,
+                    "the recorded state must carry the fixture's disk type: {label}"
+                );
             }
         }
     }
@@ -8246,9 +8246,9 @@ mod tests {
     //
     // Shaped after the VHD harness above -- a per-device mock dispatched on
     // device_idx, two deliberately different byte patterns, and per-device
-    // state built directly with `VhdxState::init`, because
-    // `init_chain_states` refuses every differencing VHDX whatever follows
-    // it -- and differing from it wherever the format does.
+    // state built directly with `VhdxState::init`, bypassing the chain
+    // config `init_chain_states` wants -- and differing from it wherever
+    // the format does.
     //
     // A VHDX payload block and a sector bitmap block are both 1 MiB-aligned
     // regions, because a BAT entry has no room to say anything finer, so a
@@ -8735,8 +8735,8 @@ mod tests {
         want
     }
 
-    /// Init per-device VHDX state directly (bypassing `init_chain_states`,
-    /// which refuses every differencing child regardless of chain shape)
+    /// Init per-device VHDX state directly (bypassing the chain config
+    /// `init_chain_states` requires, which these fixtures do not carry)
     /// and run one span through `read_chain_virtual_cluster`. Returns
     /// whether the read succeeded and the output buffer, sentinel-filled
     /// beforehand so a false return that leaves the buffer untouched is
@@ -10030,58 +10030,49 @@ mod tests {
         0xeb05_052e_a5b6_2325,
     ];
 
-    // Everything the composing arm above does is unreachable in a
-    // shipped binary, and that claim rests entirely on this: a
-    // differencing VHDX never gets past `init_chain_states`, so no
-    // operation ever reaches the arm. Nothing else pins it.
+    // What reaches the composing arm above, and what never does. A
+    // differencing VHDX is admitted by `init_chain_states` when a
+    // device sits behind it in its own chain and refused when none
+    // does, so this is the test that says which operations can reach
+    // the arm at all. Nothing else pins it.
     //
-    // Three things are asserted, because the first alone is worth
-    // little. `init_chain_states` returns a bare `bool`, so "it
-    // returned false" is satisfied by a mistyped header, a mis-sized
-    // cache or a stub call-table entry that happens to fail -- the
-    // refusal would read as proven while never having fired. The
-    // operation marker and status say it fired, and say which format
-    // it named; the dynamic controls say the fixture, the cache and
-    // the mock are sound, so the refusal assertions are measuring the
-    // refusal and not a broken harness.
+    // Three things are asserted of a refusal, because the first alone
+    // is worth little. `init_chain_states` returns a bare `bool`, so
+    // "it returned false" is satisfied by a mistyped header, a
+    // mis-sized cache or a stub call-table entry that happens to fail
+    // -- the refusal would read as proven while never having fired.
+    // The operation marker and status say it fired, and say which
+    // format it named; the dynamic controls say the fixture, the cache
+    // and the mock are sound, so the refusal assertions are measuring
+    // the refusal and not a broken harness.
     //
-    // The segmentation dimension rules out a narrower refusal. A
-    // tempting form, `state.has_parent && dev_idx + 1 >= device_count`,
-    // refuses a lone child and admits one with a device behind it, and
-    // a single-device test cannot tell it from the unconditional rule.
-    // It is unsafe: `device_count` bounds a flat array, not a chain --
-    // `compare diff.vhdx base.raw` packs two independent chains into
-    // one array -- so a differencing child at index 0 with
-    // `device_count` 2 may have no parent behind it at all, and that
-    // form would have composed it against an unrelated image (issue
-    // #614). Only the config's declared segmentation separates the two,
-    // which is why the same two devices appear twice below, once as one
-    // chain and once as two.
-    //
-    // That pair is also what proves the per-chain judgement reaches
-    // `init_chain_states` at all. Both are refused, so the return value
-    // cannot distinguish them; the refusal's own diagnostic reports
-    // whether a parent sits behind the child in its own chain, and the
-    // two-chain case must say it does not -- that is the function
-    // seeing a chain of length 1 for a device in an array of 2.
+    // The segmentation dimension is what the judgement rests on, and
+    // the same two devices appear twice below for it: once declared as
+    // one chain, where the child has a parent behind it and is
+    // admitted, and once as two, which is how `compare diff.vhdx
+    // base.raw` lays its arguments out, where it has none and is
+    // refused. `device_count` is 2 in both, so a rule derived from it
+    // -- `state.has_parent && dev_idx + 1 >= device_count` is the
+    // tempting form -- answers them identically and would compose the
+    // child against an unrelated image (issue #614). Only the config's
+    // declared segmentation separates them, and a single-device test
+    // cannot tell the two rules apart at all.
     #[cfg(feature = "vhdx-input")]
     #[test]
-    fn vhdx_init_refuses_a_differencing_child_and_admits_a_dynamic_one() {
-        for (has_parent, device_count, segments, refused, parent_behind, label) in [
+    fn vhdx_init_refuses_a_differencing_child_with_no_parent_in_its_own_chain() {
+        for (has_parent, device_count, segments, refused, label) in [
             (
                 true,
                 1u32,
                 &[(0u32, 1u32)][..],
                 true,
-                false,
                 "a lone differencing device",
             ),
             (
                 true,
                 2u32,
                 &[(0, 2)][..],
-                true,
-                true,
+                false,
                 "a differencing device at index 0 of a one-chain two-device array",
             ),
             (
@@ -10089,7 +10080,6 @@ mod tests {
                 2u32,
                 &[(0, 1), (1, 1)][..],
                 true,
-                false,
                 "a differencing device at index 0 of a two-chain two-device array",
             ),
             // The controls. One metadata flag differs from the cases
@@ -10097,19 +10087,11 @@ mod tests {
             // because the synthetic image, the hand-built cache or a
             // stub call-table entry is broken -- rather than because
             // the refusal fired -- cannot pass here.
-            (
-                false,
-                1u32,
-                &[(0, 1)][..],
-                false,
-                false,
-                "a lone dynamic device",
-            ),
+            (false, 1u32, &[(0, 1)][..], false, "a lone dynamic device"),
             (
                 false,
                 2u32,
                 &[(0, 2)][..],
-                false,
                 false,
                 "a dynamic device at index 0 of a two-device array",
             ),
@@ -10201,26 +10183,34 @@ mod tests {
                     shared::DifferencingRefusal::STATUS_VHDX,
                     "the refusal must name VHDX rather than VHD: {label}"
                 );
-                // The per-chain judgement, which is the only thing the
-                // two two-device cases differ in. A rule derived from
-                // `device_count` would answer them identically.
-                let want = if parent_behind {
-                    "(parent in chain)"
-                } else {
-                    "(no parent in chain)"
-                };
+                // The reason, which is the whole of the narrowing: a
+                // child is refused for having no parent in its own
+                // chain and for nothing else.
                 let msg = vhdx_last_debug();
                 assert!(
-                    msg.contains(want),
-                    "the refusal must report {want} for {label}, said {msg:?}"
+                    msg.contains("(no parent in chain)"),
+                    "the refusal must say no parent is in the chain for {label}, \
+                     said {msg:?}"
                 );
             } else {
                 assert!(
                     ok,
-                    "the same harness must initialise a VHDX with no parent, or \
-                     the refusal assertions prove nothing: {label}"
+                    "chain init must succeed, or the refusal assertions prove \
+                     nothing: {label}"
                 );
-                assert_eq!(calls, 0, "a dynamic VHDX must raise no refusal: {label}");
+                assert_eq!(calls, 0, "an admitted VHDX must raise no refusal: {label}");
+                // An admitted differencing child must be admitted *as*
+                // one: the state the reader will consult has to still
+                // report `has_parent`, or the composing arm it unlocks
+                // is never reached and this case would pass while
+                // proving nothing about the lift.
+                let state = chain_states.vhdx_states[0]
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("no VHDX state recorded for {label}"));
+                assert_eq!(
+                    state.has_parent, has_parent,
+                    "the recorded state must carry the fixture's parent flag: {label}"
+                );
             }
         }
     }
@@ -13983,43 +13973,41 @@ pub unsafe fn init_chain_states(
                     return false;
                 };
                 // A differencing child's content is split between it
-                // and its parent. The chain reader can compose the two
-                // when a parent device sits behind the child in its own
-                // chain, and the config's segmentation says which
-                // devices those are: `segment_of` gives this device's
-                // chain and `devices_behind` counts what follows it
-                // there, asked with the chain-relative offset the
-                // reader itself uses so the two cannot answer
-                // differently. `device_count` cannot answer it -- it
-                // bounds a flat array an operation reading two images
-                // packs both chains into, so the slot after a child can
-                // be an unrelated image (issue #614).
+                // and its parent, and the chain reader composes the
+                // two: it consults each block's sector bitmap and
+                // descends for the runs of sectors the bitmap leaves
+                // to the parent. That needs a device behind the child
+                // *in its own chain*, and the config's segmentation is
+                // what says whether there is one -- `segment_of` gives
+                // this device's chain and `devices_behind` counts what
+                // follows it there, asked with the chain-relative
+                // offset the reader itself uses so the two cannot
+                // answer differently. `device_count` cannot answer it:
+                // it bounds a flat array an operation reading two
+                // images packs both chains into, so the slot after a
+                // child can be an unrelated image, and composing
+                // against that is a wrong read reported as success
+                // (issue #614).
                 //
-                // Composing is still refused for every differencing
-                // child, so the reader fails closed rather than
-                // composing against a parent that may not be one. Were
-                // it not refused, a parent-owned sector would read back
-                // as this child's own zeros and the caller would report
-                // success on wrong data (issue #547). The diagnostic
-                // names which of the two cases it saw, so a child with
-                // a real parent behind it can be told from a lone one.
-                // The refusal cannot live in `VhdState::init`, which
+                // With nothing behind it in its own chain the child is
+                // still refused, which is the narrower refusal this
+                // check now is. Every sector its bitmap assigns to the
+                // parent would have to come from somewhere, and
+                // serving the child's own zeros for them is wrong data
+                // the caller reports success on (issue #547).
+                //
+                // The check cannot live in `VhdState::init`, which
                 // deliberately accepts `DISK_TYPE_DIFFERENCING`: map
                 // reads `disk_type` back off the state, and the chain
                 // reader needs the state to consult a block's sector
                 // bitmap.
-                if state.disk_type == vhd::DISK_TYPE_DIFFERENCING {
-                    if parent_in_chain(chain_config, dev_idx) {
-                        (call_table.debug_print)(
-                            b"init_chain_states: differencing VHD source refused (parent in chain)\n\0"
-                                .as_ptr(),
-                        );
-                    } else {
-                        (call_table.debug_print)(
-                            b"init_chain_states: differencing VHD source refused (no parent in chain)\n\0"
-                                .as_ptr(),
-                        );
-                    }
+                if state.disk_type == vhd::DISK_TYPE_DIFFERENCING
+                    && !parent_in_chain(chain_config, dev_idx)
+                {
+                    (call_table.debug_print)(
+                        b"init_chain_states: differencing VHD source refused (no parent in chain)\n\0"
+                            .as_ptr(),
+                    );
                     send_differencing_refusal(call_table, shared::DifferencingRefusal::STATUS_VHD);
                     return false;
                 }
@@ -14039,25 +14027,18 @@ pub unsafe fn init_chain_states(
                 let Some(state) = chain_states.vhdx_states[dev_idx].as_ref() else {
                     return false;
                 };
-                // Same policy as the VHD arm above, including the
-                // per-chain question the diagnostic reports.
-                // `VhdxState::init` used to refuse a differencing image
-                // itself, which made every failure look identical to a
-                // corrupt header (issue #548); it now reports
-                // `has_parent` and the refusal happens here, where it
-                // can say which format and why.
-                if state.has_parent {
-                    if parent_in_chain(chain_config, dev_idx) {
-                        (call_table.debug_print)(
-                            b"init_chain_states: differencing VHDX source refused (parent in chain)\n\0"
-                                .as_ptr(),
-                        );
-                    } else {
-                        (call_table.debug_print)(
-                            b"init_chain_states: differencing VHDX source refused (no parent in chain)\n\0"
-                                .as_ptr(),
-                        );
-                    }
+                // Same policy as the VHD arm above: composed when a
+                // device sits behind the child in its own chain,
+                // refused when none does. `VhdxState::init` used to
+                // refuse a differencing image itself, which made every
+                // failure look identical to a corrupt header (issue
+                // #548); it now reports `has_parent` and the judgement
+                // happens here, where it can say which format and why.
+                if state.has_parent && !parent_in_chain(chain_config, dev_idx) {
+                    (call_table.debug_print)(
+                        b"init_chain_states: differencing VHDX source refused (no parent in chain)\n\0"
+                            .as_ptr(),
+                    );
                     send_differencing_refusal(call_table, shared::DifferencingRefusal::STATUS_VHDX);
                     return false;
                 }

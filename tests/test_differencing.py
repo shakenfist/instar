@@ -1,49 +1,76 @@
-"""Integration tests for PLAN-differencing phase 4's read-side refusal.
+"""Integration tests for reading a differencing VHD or VHDX chain.
 
 A differencing image is one whose content lives partly in a parent
-file. instar cannot compose a parent yet -- composition is phases 11
-to 16 of PLAN-differencing.md -- so every operation that would compose
-sector data refuses a differencing VHD or VHDX by name instead of
-returning a wrong answer.
+file. instar composes such a chain for the operations that read
+through the guest chain walker -- `convert`, `dd`, `compare`, `bench`
+and `rebase` -- and declines it for the ones that do not: `map`,
+`measure` and `check` read one image on its own and refuse a
+differencing source by name rather than returning a wrong answer.
 
-These tests pin that refusal. They exist because two of the three
-things they assert used to be defects:
+So this suite has two halves, and they are here together on purpose.
+A user meets both in one session, and the policy only makes sense read
+whole.
+
+**What now composes.** `instar convert` of each real chain is compared
+with the recorded composition of that chain, byte for byte over the
+whole file. The expectation is not instar's: the three
+`*-composed.raw` fixtures were written by
+`scripts/create-vhd-testdata.sh` out of the same sector patterns it
+wrote into the parents and children, so nothing in the read path under
+test contributed a byte of them.
+
+**What is still refused, and why that is narrower than it was.** The
+guest refuses a differencing child only when its own chain holds no
+device behind it, which is the case where the sectors the child leaves
+to its parent have nowhere to come from. The fixtures with a parent
+reference and a parent beside them compose; `vhd-differencing`, whose
+disk type says differencing and whose parent name is empty, has no
+parent to compose and is refused by name. So does a child whose chain
+is one image long inside a device array holding two -- which is
+exactly how `compare child.vhd other.raw` lays its arguments out, and
+why composing against "the next device in the array" would read an
+unrelated image as the parent (issue #614).
+
+Two of the properties asserted here used to be defects, and the
+assertions are shaped by them:
 
 * `instar convert -O raw` on a differencing VHD exited 0 and wrote a
   file composed as though the parent's sectors were zero (issue #547).
-  The tests below assert both the non-zero exit *and* the absence of
-  the output file, because "exits non-zero" alone would have passed
-  while a partial file was still left on disk.
+  That is why the refusal tests assert the non-zero exit *and* the
+  absence of the output file, and why the composition tests compare
+  the whole file rather than a prefix: zeros in place of a parent's
+  sectors are invisible to a spot check at offset 0.
 * `instar compare` on a differencing VHDX reported "Content mismatch
   at offset 0!" -- an undiagnosed generic failure with no hint that a
   parent was involved (issue #548). `test_compare_self_is_refused_not_
-  mismatch` asserts that string never comes back.
-
-Deliberately *not* asserted here: composition. The composed goldens
-(`vhd-diff-aligned-composed.raw`, `vhd-diff-mixed-composed.raw`,
-`vhdx-diff-composed.raw`) are phase 11-16 material; using them here
-would assert behaviour that does not exist.
+  mismatch` asserts that string never comes back for a source that is
+  refused.
 
 The classes are:
 
-* `DifferencingTestBase` -- fixture table, the expected message, and
-  the per-op runners this suite needs beyond the ones in `base.py`.
-* `TestDifferencingRefusal` -- one test per composing operation
-  (convert, dd, compare, bench, check, measure) over every
-  differencing fixture.
+* `DifferencingTestBase` -- fixture tables, the two expected refusal
+  messages, and the per-op runners this suite needs beyond the ones in
+  `base.py`.
+* `TestDifferencingComposition` -- `convert` and `dd` read each real
+  chain and produce the recorded composition exactly.
+* `TestDifferencingDepthThree` -- the same, through a chain three
+  images deep, so the composing arm descends past a device that is
+  neither the top of the chain nor the bottom.
+* `TestDifferencingRefusal` -- what each operation does with a
+  differencing source it cannot compose.
 * `TestDifferencingConvertLeavesNoOutput` -- issue #547's core.
 * `TestDifferencingDdMatchesConvert` -- the only record in the tree
   that `dd` and `convert` share a guest binary.
 * `TestDifferencingMapStillRefuses` -- regression guard on map's own,
   older refusal.
 * `TestDifferencingInfoReports` -- `info` reports, it does not refuse.
-* `TestDifferencingParentAbsent` -- the refusal does not depend on the
-  parent file existing.
+* `TestDifferencingParentAbsent` -- which operations depend on the
+  parent file existing, and which are unchanged by it.
 * `TestDifferencingNegativeControls` -- the plain dynamic parents of
   these chains must keep working, so the refusal is not over-broad.
 * `TestDifferencingAdversarialLocators` -- the six hostile
-  parent-locator fixtures: refused by the composing ops, reported but
-  never followed by `info`.
+  parent-locator fixtures: declined during chain discovery, reported
+  but never followed by `info`.
 * `TestDifferencingInfoValidatesTheDynamicHeader` -- `info` will not
   decode a parent name out of a `data_offset` that does not point at a
   `cxsparse` header.
@@ -66,11 +93,12 @@ from base import InstarTestBase
 
 
 # Every differencing fixture, with the format name that must appear in
-# the refusal message. `vhd-differencing` is a dynamic VHD patched to
-# disk type 4 whose parent name field is all zeroes, so `info` reports
-# no backing file for it; it is still a differencing image and the
-# composing operations must still refuse it. The two `*-diff-child-*`
-# fixtures are real chains with a real parent beside them.
+# a refusal message naming it. `vhd-differencing` is a dynamic VHD
+# patched to disk type 4 whose parent name field is all zeroes, so
+# `info` reports no backing file for it and no walk can resolve one:
+# it is the fixture every operation still refuses. The two
+# `*-diff-child-*` fixtures are real chains with a real parent beside
+# them, which the composing operations now read.
 DIFFERENCING_FIXTURES = (
     ('vhd-diff-child-aligned', 'VHD'),
     ('vhd-diff-child-mixed', 'VHD'),
@@ -211,6 +239,48 @@ PARENTLESS_DIFFERENCING_FIXTURES = tuple(
 # differencing and must keep working normally.
 NEGATIVE_CONTROL_FIXTURES = ('vhd-diff-parent', 'vhdx-diff-parent')
 
+# The virtual size every image in these chains declares, and so the
+# size of each recorded composition. Asserted against the golden
+# wherever it is used rather than trusted, so a regenerated fixture of
+# a different size fails loudly instead of yielding a short
+# expectation.
+IMAGE_VIRTUAL_SIZE = 16 * 1024 * 1024
+
+# Each real chain and the raw image it composes to, as (child fixture,
+# composed fixture, format name).
+#
+# The composed `.raw` fixtures are the expectation for every
+# whole-file assertion below, and they are usable as one because
+# nothing in instar produced them.
+# `scripts/create-vhd-testdata.sh` writes the parents and children
+# from per-sector byte patterns and writes the composition from the
+# same patterns and the same ownership tables, in Python, in the same
+# run. The libvhdi oracle did not contribute either, which matters
+# most for `vhd-diff-child-mixed`: libvhdi decodes a VHD per-block
+# sector bitmap with an unmasked shift, so its composition of that
+# chain is wrong at sector 2, where a parent-owned and a child-owned
+# sector share a bitmap byte. A recorded expectation is not exposed to
+# that defect, and `vhd-diff-child-mixed` is the fixture that makes
+# mixed-ownership bytes the interesting case rather than an untested
+# one.
+COMPOSED_CHAIN_FIXTURES = (
+    ('vhd-diff-child-aligned', 'vhd-diff-aligned-composed', 'VHD'),
+    ('vhd-diff-child-mixed', 'vhd-diff-mixed-composed', 'VHD'),
+    ('vhdx-diff-child', 'vhdx-diff-composed', 'VHDX'),
+)
+
+# The format name `instar create`/`qemu-img` use for each child, keyed
+# by the fixture id, for the places a test has to name it explicitly.
+CHAIN_FIXTURE_FORMAT = {
+    'vhd-diff-child-aligned': 'vpc',
+    'vhd-diff-child-mixed': 'vpc',
+    'vhdx-diff-child': 'vhdx',
+}
+
+# The parent each chain child resolves to, by fixture id. Derived from
+# DIFFERENCING_CHAIN_FIXTURES so the two cannot disagree.
+CHAIN_FIXTURE_PARENT = dict(DIFFERENCING_CHAIN_FIXTURES)
+
 # `map` refuses with its own, older text and its own error code. It
 # predates this phase for VHD; the VHDX arm was added in step 4b
 # because removing `VhdxState::init`'s `has_parent` rejection would
@@ -227,18 +297,85 @@ class DifferencingTestBase(InstarTestBase):
     """Shared fixture handling and runners for the differencing suite."""
 
     def expected_refusal(self, op: str, format_name: str) -> str:
-        """The exact refusal sentence for one operation and format.
+        """The refusal sentence for an operation that does compose.
 
         Rendered by `differencing_refusal_error` in
-        `src/vmm/src/main.rs`. The wording is user-visible and is
-        asserted verbatim: a reworded message is a behaviour change
-        that should surface here rather than pass silently.
+        `src/vmm/src/main.rs`. An operation that reads a differencing
+        child against its parent reaches this message only when the
+        chain it was given held no parent to read, so the sentence
+        says that rather than anything about instar's abilities. The
+        wording is user-visible and is asserted verbatim: a reworded
+        message is a behaviour change that should surface here rather
+        than pass silently.
         """
         return (
-            f'{op}: source is a differencing {format_name} image whose '
-            f'parent instar cannot yet compose; composition is deferred '
-            f'(see PLAN-differencing.md)'
+            f'{op}: source is a differencing {format_name} image with no '
+            f'parent in the chain {op} was given, so the sectors it leaves '
+            f'to its parent could not be composed'
         )
+
+    def expected_non_composing_refusal(self, op: str, format_name: str) -> str:
+        """The refusal sentence for an operation that composes nothing.
+
+        `check` and `measure` decline a differencing source however
+        complete its chain is, so their message must not blame the
+        chain for a parent they were never going to resolve. A user
+        whose `convert` of the same image has just succeeded would
+        otherwise be told the parent is missing when it is sitting
+        beside the child.
+        """
+        return (
+            f'{op}: source is a differencing {format_name} image, and {op} '
+            f'reads an image on its own rather than composing a parent into '
+            f'it, so the sectors it leaves to its parent could not be '
+            f'composed'
+        )
+
+    def assert_bytes_identical(self, produced, expected, context):
+        """Compare two files in full, naming the first differing byte.
+
+        The whole file, not a prefix and not a digest. A composition
+        defect appears wherever one sector's ownership was decided
+        wrongly, and zeros served in place of a parent's sectors are
+        exactly what a spot check at offset 0 misses -- which is the
+        shape issue #547 shipped in.
+        """
+        got = produced.read_bytes()
+        want = expected.read_bytes()
+        self.assertEqual(
+            len(want), len(got),
+            f'{context}: produced {len(got)} bytes, expected {len(want)}'
+        )
+        if got == want:
+            return
+        first = next(i for i in range(len(got)) if got[i] != want[i])
+        differing = sum(1 for i in range(len(got)) if got[i] != want[i])
+        self.fail(
+            f'{context}: output differs from the recorded composition in '
+            f'{differing} of {len(want)} bytes, first at offset {first} '
+            f'(0x{first:x}): produced 0x{got[first]:02x}, expected '
+            f'0x{want[first]:02x}'
+        )
+
+    def chain_copy(self, image_id, target_dir):
+        """Copy one chain child and its parent into `target_dir`.
+
+        Both keep their fixture basenames, which is what lets the host
+        walk resolve the parent reference the child carries. Returns
+        the copied child's path.
+        """
+        child = self.differencing_image(image_id)
+        parent_name = CHAIN_FIXTURE_PARENT[image_id]
+        parent = self.differencing_image(Path(parent_name).stem)
+        self.assertEqual(
+            parent_name, parent.name,
+            f'{image_id}: the parent fixture id does not resolve to the '
+            f'basename the child names'
+        )
+        target = Path(target_dir) / child.name
+        shutil.copy2(child, target)
+        shutil.copy2(parent, Path(target_dir) / parent.name)
+        return target
 
     def differencing_image(self, image_id: str) -> Path:
         """Resolve a differencing fixture, skipping if it is absent."""
@@ -275,16 +412,26 @@ class DifferencingTestBase(InstarTestBase):
         except subprocess.TimeoutExpired:
             return '', f'Timeout after {timeout}s', -1
 
-    def assert_refused(self, op, format_name, stdout, stderr, rc, context):
-        """Assert one run refused with the phase 4 message.
+    def assert_refused(self, op, format_name, stdout, stderr, rc, context,
+                       composing=True):
+        """Assert one run refused with the message its half of the policy uses.
+
+        `composing` picks the sentence: the composing operations say
+        the chain held no parent, the non-composing ones say they read
+        an image on its own. Asserting the wrong one is a real failure,
+        not a cosmetic one -- the two messages send a user to different
+        places.
 
         Exit code 1 is asserted exactly, not merely as non-zero. For
         `check` in particular that matters: exit 2 means corruption,
-        and step 4b deliberately classified a differencing source away
+        and a differencing source was deliberately classified away
         from corruption, so a future 2 here would be a regression even
         though it is non-zero.
         """
-        expected = self.expected_refusal(op, format_name)
+        expected = (
+            self.expected_refusal(op, format_name) if composing
+            else self.expected_non_composing_refusal(op, format_name)
+        )
         self.assertEqual(
             1, rc,
             f'{context}: expected exit 1, got {rc}; '
@@ -297,18 +444,301 @@ class DifferencingTestBase(InstarTestBase):
         )
 
 
-class TestDifferencingRefusal(DifferencingTestBase):
-    """Every composing operation refuses every differencing fixture.
+class TestDifferencingComposition(DifferencingTestBase):
+    """`convert` and `dd` read a real differencing chain correctly.
 
-    One test per operation, each iterating the fixture table so a
-    failure names the fixture that broke. The operation names in the
-    assertions are the names the user typed, which is what the host
-    formatter is handed.
+    The assertion is the whole output file against the chain's
+    recorded composition, byte for byte. A digest would do as well for
+    the pass case and much worse for the failure case, which is the
+    one that matters here: a composition defect is a run of sectors
+    taken from the wrong image, and a test that can say "first
+    differing byte at 0x2a00" names the sector whose ownership was
+    decided wrongly.
+
+    Both formats and all three chains, including
+    `vhd-diff-child-mixed`, whose sector bitmap deliberately puts
+    parent-owned and child-owned sectors in the same bitmap byte. That
+    is the chain a reader using an unmasked shift gets wrong, and the
+    only one of the three where the bit arithmetic is load-bearing.
+
+    `dd` is here beside `convert` because it has no guest binary of
+    its own -- `run_dd` ends in `execute_convert` -- so composing is
+    something it inherits rather than implements. Asserting it
+    separately is what would catch the two being given different read
+    paths.
     """
 
-    def test_convert_refuses(self):
+    def _composed_golden(self, golden_id):
+        """Resolve a `*-composed.raw` fixture, skipping if absent."""
+        image = self.get_image(golden_id)
+        if not image.path.exists():
+            self.skipTest(f'fixture not available: {image.path}')
+        return image.path
+
+    def test_convert_matches_the_recorded_composition(self):
+        """`convert -O raw` of each chain equals its recorded composition."""
+        for image_id, golden_id, _format_name in COMPOSED_CHAIN_FIXTURES:
+            with self.subTest(image=image_id):
+                source = self.differencing_image(image_id)
+                golden = self._composed_golden(golden_id)
+                with tempfile.TemporaryDirectory() as tmp:
+                    out = Path(tmp) / 'composed.raw'
+                    stdout, stderr, rc = self.run_instar_convert(
+                        source, out, output_format='raw'
+                    )
+                    self.assertEqual(
+                        0, rc,
+                        f'{image_id}: convert must compose a chain whose '
+                        f'parent is beside it; stdout={stdout[:400]!r} '
+                        f'stderr={stderr[:400]!r}'
+                    )
+                    self.assertTrue(
+                        out.exists(),
+                        f'{image_id}: convert exited 0 and wrote nothing'
+                    )
+                    self.assert_bytes_identical(out, golden, image_id)
+
+    def test_dd_matches_the_recorded_composition(self):
+        """`dd` composes identically to `convert`."""
+        for image_id, golden_id, _format_name in COMPOSED_CHAIN_FIXTURES:
+            with self.subTest(image=image_id):
+                source = self.differencing_image(image_id)
+                golden = self._composed_golden(golden_id)
+                with tempfile.TemporaryDirectory() as tmp:
+                    out = Path(tmp) / 'composed.raw'
+                    stdout, stderr, rc = self.run_instar_dd(
+                        [f'if={source}', f'of={out}']
+                    )
+                    self.assertEqual(
+                        0, rc,
+                        f'{image_id}: dd must compose a chain whose parent '
+                        f'is beside it; stdout={stdout[:400]!r} '
+                        f'stderr={stderr[:400]!r}'
+                    )
+                    self.assert_bytes_identical(out, golden, f'{image_id} (dd)')
+
+    def test_convert_to_qcow2_composes_the_same_content(self):
+        """The composition is the reader's, not the raw writer's.
+
+        `convert -O raw` and `convert -O qcow2` share the source-side
+        chain walk and differ only in what they write, so a qcow2
+        target must carry the same virtual content. If this ever
+        diverges from the raw case, composition has been attached to
+        the writer rather than to the reader -- the same mistake the
+        refused `-O qcow2` test was written to catch from the other
+        side.
+
+        The verdict comes from `instar compare` rather than from
+        bytes, because a qcow2 file is not expected to be
+        byte-identical to a raw one; what must be identical is the
+        content, and `compare` reads both through the guest.
+        """
+        for image_id, golden_id, _format_name in COMPOSED_CHAIN_FIXTURES:
+            with self.subTest(image=image_id):
+                source = self.differencing_image(image_id)
+                golden = self._composed_golden(golden_id)
+                with tempfile.TemporaryDirectory() as tmp:
+                    out = Path(tmp) / 'composed.qcow2'
+                    stdout, stderr, rc = self.run_instar_convert(
+                        source, out, output_format='qcow2'
+                    )
+                    self.assertEqual(
+                        0, rc,
+                        f'{image_id}: convert -O qcow2 must compose; '
+                        f'stdout={stdout[:400]!r} stderr={stderr[:400]!r}'
+                    )
+                    c_stdout, c_stderr, c_rc = self.run_instar_compare(
+                        out, golden
+                    )
+                self.assertEqual(
+                    0, c_rc,
+                    f'{image_id}: the qcow2 output does not match the '
+                    f'recorded composition; stdout={c_stdout!r} '
+                    f'stderr={c_stderr!r}'
+                )
+                self.assertIn(
+                    'Images are identical', c_stdout,
+                    f'{image_id}: stdout={c_stdout!r}'
+                )
+
+    def test_compare_against_the_recorded_composition_is_identical(self):
+        """`compare` composes the child and finds no difference.
+
+        The composing half of `compare`, stated against an expectation
+        nothing in instar produced. A wrongly composed read can still
+        report "identical" when both sides are wrong the same way, so
+        the second side here is the recorded `.raw` rather than
+        another copy of the chain.
+        """
+        for image_id, golden_id, _format_name in COMPOSED_CHAIN_FIXTURES:
+            with self.subTest(image=image_id):
+                source = self.differencing_image(image_id)
+                golden = self._composed_golden(golden_id)
+                stdout, stderr, rc = self.run_instar_compare(source, golden)
+                self.assertEqual(
+                    0, rc,
+                    f'{image_id}: compare against the recorded composition '
+                    f'must report identical; stdout={stdout!r} '
+                    f'stderr={stderr!r}'
+                )
+                self.assertIn(
+                    'Images are identical', stdout,
+                    f'{image_id}: stdout={stdout!r}'
+                )
+
+
+class TestDifferencingDepthThree(DifferencingTestBase):
+    """A chain three images deep, with the differencing child in the middle.
+
+    Both real fixtures are two images, so nothing else in the suite
+    makes the chain reader descend twice: for a differencing child at
+    index 0 whose parent is at index 1, "descend to the next device"
+    and "descend to the last device" are the same instruction. Stacking
+    a qcow2 overlay on the child moves the differencing device to index
+    1 of a three-device chain, so the VHD and VHDX composing arms
+    recurse with a chain-relative offset into a device that is neither
+    the top of the chain nor the bottom of it.
+
+    The overlay is built with `qemu-img`, not `instar create -b`, which
+    refuses a differencing backing file (see
+    `TestDifferencingCreateRefusesAsBacking`). It is created
+    standalone, written into, and then given its backing reference with
+    `qemu-img rebase -u` -- the `-u` matters, because qemu's own
+    readers cannot open either child: its VHDX driver refuses a
+    parent-referencing image outright and its VPC driver would read a
+    differencing VHD as though it were dynamic. Neither contributes to
+    the expectation: the overlay owns exactly one cluster, written with
+    a single repeated byte, and the expected file is the recorded
+    composition with that one cluster overwritten.
+
+    The overlay owning a cluster is what makes this more than a
+    pass-through test -- a reader that ignored the top of the chain
+    would otherwise produce the recorded composition and pass.
+    """
+
+    # A cluster-aligned region of the overlay's own, well inside the
+    # image and clear of offset 0, so that neither a reader starting
+    # one device too low nor one that confuses "unallocated" with
+    # "zero" at the start of the image can pass by coincidence.
+    OVERLAY_OFFSET = 0x100000
+    OVERLAY_LENGTH = 0x10000
+    OVERLAY_BYTE = 0x5a
+
+    def _require_qemu_tools(self):
+        for tool in ('qemu-img', 'qemu-io'):
+            if shutil.which(tool) is None:
+                self.skipTest(f'{tool} is required to build a depth-3 chain')
+
+    def _run(self, argv, context):
+        """Run one qemu tool, failing the test if it does not exit 0."""
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=120)
+        self.assertEqual(
+            0, r.returncode,
+            f'{context}: {argv[0]} exited {r.returncode}; '
+            f'stdout={r.stdout!r} stderr={r.stderr!r}'
+        )
+        return r
+
+    def _build_overlay(self, tmp, child, child_format, context):
+        """Create a qcow2 overlay over `child` holding one cluster of its own."""
+        overlay = Path(tmp) / 'overlay.qcow2'
+        self._run(
+            ['qemu-img', 'create', '-f', 'qcow2', str(overlay),
+             str(IMAGE_VIRTUAL_SIZE)],
+            f'{context}: creating the overlay'
+        )
+        self._run(
+            ['qemu-io', '-c',
+             f'write -P 0x{self.OVERLAY_BYTE:02x} '
+             f'0x{self.OVERLAY_OFFSET:x} 0x{self.OVERLAY_LENGTH:x}',
+             str(overlay)],
+            f'{context}: writing the overlay\'s own cluster'
+        )
+        self._run(
+            ['qemu-img', 'rebase', '-u', '-b', child.name,
+             '-F', child_format, str(overlay)],
+            f'{context}: attaching the overlay to the chain'
+        )
+        return overlay
+
+    def _expected(self, tmp, golden):
+        """The recorded composition with the overlay's own cluster patched in."""
+        expected = Path(tmp) / 'expected.raw'
+        data = bytearray(golden.read_bytes())
+        self.assertEqual(
+            IMAGE_VIRTUAL_SIZE, len(data),
+            'the recorded composition is not the size this test assumes'
+        )
+        end = self.OVERLAY_OFFSET + self.OVERLAY_LENGTH
+        data[self.OVERLAY_OFFSET:end] = bytes(
+            [self.OVERLAY_BYTE] * self.OVERLAY_LENGTH
+        )
+        expected.write_bytes(bytes(data))
+        return expected
+
+    def test_convert_composes_a_three_image_chain(self):
+        """A qcow2 over a differencing child over its parent, read in full."""
+        self._require_qemu_tools()
+        for image_id, golden_id, _format_name in COMPOSED_CHAIN_FIXTURES:
+            with self.subTest(image=image_id):
+                golden = self.get_image(golden_id)
+                if not golden.path.exists():
+                    self.skipTest(f'fixture not available: {golden.path}')
+                with tempfile.TemporaryDirectory() as tmp:
+                    child = self.chain_copy(image_id, tmp)
+                    overlay = self._build_overlay(
+                        tmp, child, CHAIN_FIXTURE_FORMAT[image_id], image_id
+                    )
+                    chain_stdout, _, chain_rc = self.run_instar_info(
+                        overlay, chain=True
+                    )
+                    self.assertEqual(0, chain_rc, chain_stdout)
+                    self.assertIn(
+                        'Chain: 3 image(s)', chain_stdout,
+                        f'{image_id}: the fixture is not three images deep, '
+                        f'so this test is not testing what it says; '
+                        f'stdout={chain_stdout!r}'
+                    )
+
+                    out = Path(tmp) / 'composed.raw'
+                    stdout, stderr, rc = self.run_instar_convert(
+                        overlay, out, output_format='raw'
+                    )
+                    self.assertEqual(
+                        0, rc,
+                        f'{image_id}: convert must compose a three-image '
+                        f'chain; stdout={stdout[:400]!r} '
+                        f'stderr={stderr[:400]!r}'
+                    )
+                    expected = self._expected(tmp, golden.path)
+                    self.assert_bytes_identical(
+                        out, expected, f'{image_id} (depth 3)'
+                    )
+
+
+class TestDifferencingRefusal(DifferencingTestBase):
+    """What each operation does with a differencing source.
+
+    One test per operation, each iterating the fixture table that
+    applies to it so a failure names the fixture that broke. The
+    operation names in the assertions are the names the user typed,
+    which is what the host formatter is handed.
+
+    The composing operations iterate
+    `PARENTLESS_DIFFERENCING_FIXTURES` -- the differencing images with
+    no parent reference for a walk to resolve, and so the only ones
+    they still refuse. Their behaviour on the real chains is
+    `TestDifferencingComposition`'s, and the two tables together cover
+    `DIFFERENCING_FIXTURES` exactly, by construction rather than by
+    hand.
+
+    `check` and `measure` iterate the whole table, because they refuse
+    every differencing source whatever its chain holds.
+    """
+
+    def test_convert_refuses_a_source_with_no_parent_to_compose(self):
         """`convert -O raw` refuses and writes nothing."""
-        for image_id, format_name in DIFFERENCING_FIXTURES:
+        for image_id, format_name in PARENTLESS_DIFFERENCING_FIXTURES:
             with self.subTest(image=image_id):
                 source = self.differencing_image(image_id)
                 with tempfile.TemporaryDirectory() as tmp:
@@ -326,9 +756,9 @@ class TestDifferencingRefusal(DifferencingTestBase):
                         f' bytes'
                     )
 
-    def test_dd_refuses(self):
+    def test_dd_refuses_a_source_with_no_parent_to_compose(self):
         """`dd` refuses and writes nothing."""
-        for image_id, format_name in DIFFERENCING_FIXTURES:
+        for image_id, format_name in PARENTLESS_DIFFERENCING_FIXTURES:
             with self.subTest(image=image_id):
                 source = self.differencing_image(image_id)
                 with tempfile.TemporaryDirectory() as tmp:
@@ -344,9 +774,9 @@ class TestDifferencingRefusal(DifferencingTestBase):
                         f'{image_id}: dd must leave no output file'
                     )
 
-    def test_compare_refuses(self):
-        """`compare` refuses a differencing source."""
-        for image_id, format_name in DIFFERENCING_FIXTURES:
+    def test_compare_refuses_a_source_with_no_parent_to_compose(self):
+        """`compare` refuses a differencing source it cannot compose."""
+        for image_id, format_name in PARENTLESS_DIFFERENCING_FIXTURES:
             with self.subTest(image=image_id):
                 source = self.differencing_image(image_id)
                 stdout, stderr, rc = self.run_instar_compare(source, source)
@@ -354,9 +784,9 @@ class TestDifferencingRefusal(DifferencingTestBase):
                     'compare', format_name, stdout, stderr, rc, image_id
                 )
 
-    def test_bench_refuses(self):
-        """`bench` refuses a differencing source."""
-        for image_id, format_name in DIFFERENCING_FIXTURES:
+    def test_bench_refuses_a_source_with_no_parent_to_compose(self):
+        """`bench` refuses a differencing source it cannot compose."""
+        for image_id, format_name in PARENTLESS_DIFFERENCING_FIXTURES:
             with self.subTest(image=image_id):
                 source = self.differencing_image(image_id)
                 stdout, stderr, rc = self.run_instar_bench('-c', '4', source)
@@ -364,11 +794,17 @@ class TestDifferencingRefusal(DifferencingTestBase):
                     'bench', format_name, stdout, stderr, rc, image_id
                 )
 
-    def test_check_refuses(self):
+    def test_check_refuses_every_differencing_source(self):
         """`check` refuses a differencing source with exit 1, not 2.
 
+        Every fixture, including the two with their parents beside
+        them: `check` validates chain members independently and
+        composes nothing, so a complete chain makes no difference to
+        it. Its message says so, which is what
+        `composing=False` pins.
+
         Exit 2 is check's corruption code. A differencing source is
-        not corrupt -- it is incomplete -- so step 4b reports it as a
+        not corrupt -- it is incomplete -- so it is reported as a
         refusal instead. `assert_refused` pins the 1.
         """
         for image_id, format_name in DIFFERENCING_FIXTURES:
@@ -376,17 +812,66 @@ class TestDifferencingRefusal(DifferencingTestBase):
                 source = self.differencing_image(image_id)
                 stdout, stderr, rc = self.run_instar_check(source)
                 self.assert_refused(
-                    'check', format_name, stdout, stderr, rc, image_id
+                    'check', format_name, stdout, stderr, rc, image_id,
+                    composing=False
                 )
 
-    def test_measure_refuses(self):
-        """`measure` refuses a differencing source."""
+    def test_measure_refuses_every_differencing_source(self):
+        """`measure` refuses a differencing source.
+
+        Every fixture, for the same reason as `check`: `measure` has
+        no chain plumbing at all, so there is no chain for a parent to
+        be missing from.
+        """
         for image_id, format_name in DIFFERENCING_FIXTURES:
             with self.subTest(image=image_id):
                 source = self.differencing_image(image_id)
                 stdout, stderr, rc = self.run_instar_measure(source)
                 self.assert_refused(
-                    'measure', format_name, stdout, stderr, rc, image_id
+                    'measure', format_name, stdout, stderr, rc, image_id,
+                    composing=False
+                )
+
+    def test_compare_does_not_compose_a_child_against_an_unrelated_image(self):
+        """Issue #614: a second image is not a parent.
+
+        `compare` packs two independent chains into one device array,
+        so a differencing child at index 0 of a two-device array may
+        have nothing behind it in its own chain. The rule the guest
+        used to be tempted by -- "a parent follows if another device
+        follows" -- would admit this and read every parent-owned
+        sector out of `image2`, reporting a verdict on data that came
+        from the wrong file. No single-chain test can fail that way,
+        which is why this one exists.
+
+        The source is the fixture with no parent reference, because it
+        is the only differencing image whose chain the host walk
+        genuinely leaves one device long: a child with a resolvable
+        parent gets a two-device chain of its own and composes.
+        """
+        for image_id, format_name in PARENTLESS_DIFFERENCING_FIXTURES:
+            with self.subTest(image=image_id):
+                source = self.differencing_image(image_id)
+                with tempfile.TemporaryDirectory() as tmp:
+                    other = Path(tmp) / 'unrelated.raw'
+                    other.write_bytes(b'\xa5' * (2 * 1024 * 1024))
+                    stdout, stderr, rc = self.run_instar_compare(
+                        source, other
+                    )
+                self.assert_refused(
+                    'compare', format_name, stdout, stderr, rc,
+                    f'{image_id} against an unrelated second image'
+                )
+                combined = stdout + stderr
+                self.assertNotIn(
+                    'Images are identical', combined,
+                    f'{image_id}: compare reached a verdict against an '
+                    f'unrelated image; output={combined!r}'
+                )
+                self.assertNotIn(
+                    'Content mismatch', combined,
+                    f'{image_id}: compare reached a verdict against an '
+                    f'unrelated image; output={combined!r}'
                 )
 
     def test_compare_self_is_refused_not_mismatch(self):
@@ -400,7 +885,7 @@ class TestDifferencingRefusal(DifferencingTestBase):
         come back, so its absence is asserted explicitly rather than
         merely implied by the refusal assertion above.
         """
-        for image_id, format_name in DIFFERENCING_FIXTURES:
+        for image_id, format_name in PARENTLESS_DIFFERENCING_FIXTURES:
             with self.subTest(image=image_id):
                 source = self.differencing_image(image_id)
                 stdout, stderr, rc = self.run_instar_compare(source, source)
@@ -433,7 +918,7 @@ class TestDifferencingConvertLeavesNoOutput(DifferencingTestBase):
 
     def test_convert_raw_writes_no_file(self):
         """No output file survives a refused convert, for any fixture."""
-        for image_id, format_name in DIFFERENCING_FIXTURES:
+        for image_id, format_name in PARENTLESS_DIFFERENCING_FIXTURES:
             with self.subTest(image=image_id):
                 source = self.differencing_image(image_id)
                 with tempfile.TemporaryDirectory() as tmp:
@@ -464,7 +949,7 @@ class TestDifferencingConvertLeavesNoOutput(DifferencingTestBase):
         raw case, the refusal has been attached to the writer rather
         than the reader.
         """
-        for image_id, format_name in DIFFERENCING_FIXTURES:
+        for image_id, format_name in PARENTLESS_DIFFERENCING_FIXTURES:
             with self.subTest(image=image_id):
                 source = self.differencing_image(image_id)
                 with tempfile.TemporaryDirectory() as tmp:
@@ -497,7 +982,7 @@ class TestDifferencingDdMatchesConvert(DifferencingTestBase):
 
     def test_dd_and_convert_give_the_same_refusal(self):
         """Both refusals differ only in the leading operation name."""
-        for image_id, _format_name in DIFFERENCING_FIXTURES:
+        for image_id, _format_name in PARENTLESS_DIFFERENCING_FIXTURES:
             with self.subTest(image=image_id):
                 source = self.differencing_image(image_id)
                 with tempfile.TemporaryDirectory() as tmp:
@@ -530,11 +1015,15 @@ class TestDifferencingDdMatchesConvert(DifferencingTestBase):
                 )
 
     def _refusal_reason(self, op, stderr):
-        """Strip the leading `<op>: ` from the refusal sentence.
+        """The refusal sentence with every mention of the operation masked.
 
-        Returns the remainder of the first line mentioning the
-        operation, so two operations' messages can be compared for the
-        part that must agree.
+        The message names the operation more than once -- it leads
+        with it and then says what that operation did -- so stripping
+        only the leading `<op>: ` would leave two sentences that
+        differ in the body and compare unequal for a reason that is
+        not a divergence. Masking every occurrence keeps this an
+        assertion about the reason the two gave rather than about
+        their names.
         """
         marker = f'{op}: '
         index = stderr.find(marker)
@@ -542,7 +1031,8 @@ class TestDifferencingDdMatchesConvert(DifferencingTestBase):
             -1, index,
             f'expected a message beginning {marker!r} in {stderr!r}'
         )
-        return stderr[index + len(marker):].strip().rstrip('"')
+        sentence = stderr[index + len(marker):].strip().rstrip('"')
+        return sentence.replace(op, '<op>')
 
 
 class TestDifferencingMapStillRefuses(DifferencingTestBase):
@@ -844,7 +1334,7 @@ class TestDifferencingParentAbsent(DifferencingTestBase):
                 stdout, stderr, rc = self.run_instar_check(orphan)
                 self.assert_refused(
                     'check', format_name, stdout, stderr, rc,
-                    f'{image_id} (orphaned)'
+                    f'{image_id} (orphaned)', composing=False
                 )
                 self.assertNotIn(
                     'Backing file not found', stderr,
@@ -1226,7 +1716,8 @@ class TestDifferencingAdversarialLocators(DifferencingTestBase):
                 source = self.differencing_image(image_id)
                 stdout, stderr, rc = self.run_instar_check(source)
                 self.assert_refused(
-                    'check', 'VHD', stdout, stderr, rc, image_id
+                    'check', 'VHD', stdout, stderr, rc, image_id,
+                    composing=False
                 )
 
     def test_info_reports_the_locator_without_following_it(self):
