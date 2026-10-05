@@ -56,6 +56,16 @@ The classes are:
 * `TestDifferencingDepthThree` -- the same, through a chain three
   images deep, so the composing arm descends past a device that is
   neither the top of the chain nor the bottom.
+* `TestDifferencingBenchComposes` -- `bench` reads across the full
+  declared virtual size of a real chain and across its validated
+  parent- and child-owned probe sectors, since `bench` reports a
+  throughput number regardless of whether the bytes underneath it
+  were composed correctly.
+* `TestDifferencingRebaseThroughChain` -- a differencing VHD or VHDX
+  sitting in the backing chain of a qcow2 overlay `rebase` detaches,
+  asserted against the detached overlay's own content, and the typed
+  refusal `rebase` renders for a parentless differencing member of
+  that chain.
 * `TestDifferencingCompareTwoChains` -- the only operation that packs
   two chains into one device array, and the properties no single-chain
   test can be wrong about: a child composed against image2 rather than
@@ -743,6 +753,241 @@ class TestDifferencingDepthThree(DifferencingTestBase):
                     self.assert_bytes_identical(
                         out, expected, f'{image_id} (depth 3)'
                     )
+
+
+class TestDifferencingBenchComposes(DifferencingTestBase):
+    """`bench` reads a real differencing chain across its full extent.
+
+    `bench` does not verify the content it reads -- it reports a
+    throughput number whether the bytes it got back were composed
+    correctly or were the child's own zeros served in their place.
+    Exit code and a parsed JSON blob are therefore not enough: this
+    class pins two properties the brief's own byte-count check
+    reduces to, since `bench`'s JSON ``count`` / ``buffer-size`` are
+    plain echoes of the arguments and prove nothing about the read
+    underneath them.
+
+    The first is range: `-o`/`-s`/`-c` are chosen so a single,
+    non-wrapping request lands on the last byte of the chain's
+    declared virtual size (`IMAGE_VIRTUAL_SIZE`, asserted elsewhere
+    against the fixture table). If composing silently truncated the
+    chain to something shorter -- the class of defect the guest-side
+    bound already catches as a read error rather than wrong data --
+    this request goes out of bounds and bench fails instead of
+    quietly succeeding on a short chain.
+
+    The second is composition itself: a request anchored exactly on
+    one of `CHAIN_PROBE_SECTORS`'s validated parent-owned sectors
+    must succeed. Those sectors are the ones the fixture never
+    places in the child's own payload, so a reader that never
+    actually descended to the parent -- composing nothing and just
+    reading the child's own (unallocated) extent -- has no sectors
+    there to serve and would error exactly where this test reads.
+    """
+
+    BENCH_BUFSIZE = 4096
+
+    def test_bench_reads_to_the_end_of_the_full_virtual_size(self):
+        """A single request at (virtual_size - bufsize) must succeed."""
+        for image_id, _golden_id, format_name in COMPOSED_CHAIN_FIXTURES:
+            with self.subTest(image=image_id):
+                source = self.differencing_image(image_id)
+                offset = IMAGE_VIRTUAL_SIZE - self.BENCH_BUFSIZE
+                stdout, stderr, rc = self.run_instar_bench(
+                    '-c', '1', '-s', str(self.BENCH_BUFSIZE),
+                    '-o', str(offset), '--output', 'json', source
+                )
+                self.assertEqual(
+                    0, rc,
+                    f'{image_id}: bench must read the final '
+                    f'{self.BENCH_BUFSIZE} bytes of the full composed '
+                    f'chain; stdout={stdout[:400]!r} stderr={stderr[:400]!r}'
+                )
+                data = json.loads(stdout)
+                self.assertEqual(data['count'], 1)
+                self.assertEqual(data['buffer-size'], self.BENCH_BUFSIZE)
+                self.assertEqual(data['offset'], offset)
+                self.assertGreater(
+                    data['bytes-per-second'], 0,
+                    f'{image_id}: a completed read must report a positive rate'
+                )
+
+    def test_bench_reads_a_parent_owned_sector_without_error(self):
+        """A probe read anchored on a validated parent-owned sector.
+
+        Paired with the child-owned sector from the same table, so a
+        failure here points specifically at the parent-descending
+        half of composition rather than at reading the chain at all.
+        """
+        for image_id, _golden_id, format_name in COMPOSED_CHAIN_FIXTURES:
+            parent_sector, child_sector = CHAIN_PROBE_SECTORS[image_id]
+            for label, sector in (('parent', parent_sector), ('child', child_sector)):
+                with self.subTest(image=image_id, owner=label):
+                    source = self.differencing_image(image_id)
+                    offset = sector * 512
+                    stdout, stderr, rc = self.run_instar_bench(
+                        '-c', '1', '-s', '512', '-o', str(offset),
+                        '--output', 'json', source
+                    )
+                    self.assertEqual(
+                        0, rc,
+                        f'{image_id}: bench must read the {label}-owned '
+                        f'sector {sector} without error; '
+                        f'stdout={stdout[:400]!r} stderr={stderr[:400]!r}'
+                    )
+                    data = json.loads(stdout)
+                    self.assertEqual(data['offset'], offset)
+
+
+class TestDifferencingRebaseThroughChain(DifferencingTestBase):
+    """`rebase` composes a differencing VHD or VHDX in a backing chain.
+
+    `rebase` itself only accepts a qcow2 or vmdk overlay as the file
+    being rebased, so "rebasing a differencing VHD or VHDX child" is
+    not a thing this tool does. What is testable, and what this class
+    covers, is a differencing VHD or VHDX child sitting *behind* a
+    qcow2 overlay in that overlay's own backing chain: a safe-mode
+    detach reads the whole old chain and copies every byte the
+    overlay does not already own into the overlay itself, so a
+    wrongly composed differencing member shows up directly in the
+    detached overlay's content.
+
+    The overlay is built the way `TestDifferencingDepthThree` builds
+    its three-image chain: created and written to standalone, then
+    given its backing reference with `qemu-img rebase -u`, because
+    `instar create -b` refuses a differencing backing file and
+    because qemu's own VPC/VHDX readers cannot open either
+    differencing fixture directly. Detaching (`-b ''`, safe mode, no
+    `-u`) is the rebase target rather than a new backing: it is the
+    one mode that reads the whole old chain and writes every sector
+    back into the overlay, so the resulting, now-standalone overlay's
+    content is the strongest assertion available here -- the same
+    whole-file comparison `TestDifferencingComposition` uses for
+    `convert`, with the overlay's own written cluster patched into
+    the expectation the way `TestDifferencingDepthThree` does.
+    """
+
+    OVERLAY_OFFSET = 0x100000
+    OVERLAY_LENGTH = 0x10000
+    OVERLAY_BYTE = 0x5a
+
+    def _require_qemu_tools(self):
+        for tool in ('qemu-img', 'qemu-io'):
+            if shutil.which(tool) is None:
+                self.skipTest(f'{tool} is required to build the overlay chain')
+
+    def _run(self, argv, context):
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=120)
+        self.assertEqual(
+            0, r.returncode,
+            f'{context}: {argv[0]} exited {r.returncode}; '
+            f'stdout={r.stdout!r} stderr={r.stderr!r}'
+        )
+        return r
+
+    def _build_overlay(self, tmp, child, child_format, context):
+        """Create a qcow2 overlay holding one cluster of its own, backed
+        by `child`."""
+        overlay = Path(tmp) / 'overlay.qcow2'
+        self._run(
+            ['qemu-img', 'create', '-f', 'qcow2', str(overlay),
+             str(IMAGE_VIRTUAL_SIZE)],
+            f'{context}: creating the overlay'
+        )
+        self._run(
+            ['qemu-io', '-c',
+             f'write -P 0x{self.OVERLAY_BYTE:02x} '
+             f'0x{self.OVERLAY_OFFSET:x} 0x{self.OVERLAY_LENGTH:x}',
+             str(overlay)],
+            f'{context}: writing the overlay\'s own cluster'
+        )
+        self._run(
+            ['qemu-img', 'rebase', '-u', '-b', child.name,
+             '-F', child_format, str(overlay)],
+            f'{context}: attaching the differencing child as backing'
+        )
+        return overlay
+
+    def _expected(self, tmp, golden):
+        """The recorded composition with the overlay's own cluster patched in."""
+        expected = Path(tmp) / 'expected.raw'
+        data = bytearray(golden.read_bytes())
+        self.assertEqual(
+            IMAGE_VIRTUAL_SIZE, len(data),
+            'the recorded composition is not the size this test assumes'
+        )
+        end = self.OVERLAY_OFFSET + self.OVERLAY_LENGTH
+        data[self.OVERLAY_OFFSET:end] = bytes(
+            [self.OVERLAY_BYTE] * self.OVERLAY_LENGTH
+        )
+        expected.write_bytes(bytes(data))
+        return expected
+
+    def test_rebase_detach_composes_the_differencing_backing_chain(self):
+        """Detaching a qcow2 overlay copies the whole composed chain in."""
+        self._require_qemu_tools()
+        for image_id, golden_id, _format_name in COMPOSED_CHAIN_FIXTURES:
+            with self.subTest(image=image_id):
+                golden = self.composed_golden(golden_id)
+                with tempfile.TemporaryDirectory() as tmp:
+                    child = self.chain_copy(image_id, tmp)
+                    overlay = self._build_overlay(
+                        tmp, child, CHAIN_FIXTURE_FORMAT[image_id], image_id
+                    )
+                    stdout, stderr, rc = self.run_instar_rebase(overlay, '-b', '')
+                    self.assertEqual(
+                        0, rc,
+                        f'{image_id}: rebase must compose the differencing '
+                        f'backing chain when detaching; '
+                        f'stdout={stdout[:400]!r} stderr={stderr[:400]!r}'
+                    )
+
+                    out = Path(tmp) / 'flattened.raw'
+                    c_stdout, c_stderr, c_rc = self.run_instar_convert(
+                        overlay, out, output_format='raw'
+                    )
+                    self.assertEqual(
+                        0, c_rc,
+                        f'{image_id}: reading the detached, now-standalone '
+                        f'overlay back failed; stdout={c_stdout[:400]!r} '
+                        f'stderr={c_stderr[:400]!r}'
+                    )
+                    expected = self._expected(tmp, golden)
+                    self.assert_bytes_identical(
+                        out, expected, f'{image_id} (rebase detach)'
+                    )
+
+    def test_rebase_old_chain_refusal_is_the_typed_message(self):
+        """A parentless differencing VHD in the old chain names itself.
+
+        `rebase` had no `differencing_refusal_error` call site: a
+        refusal reaching it rendered as the generic
+        ``the overlay's header could not be parsed`` instead of the
+        typed sentence `convert`/`dd`/`compare`/`bench` already use.
+        This pins the fixed rendering.
+        """
+        self._require_qemu_tools()
+        source = self.differencing_image('vhd-differencing')
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / source.name
+            shutil.copy2(source, target)
+            overlay = Path(tmp) / 'overlay.qcow2'
+            self._run(
+                ['qemu-img', 'create', '-f', 'qcow2', str(overlay),
+                 str(IMAGE_VIRTUAL_SIZE)],
+                'building the refusal overlay'
+            )
+            self._run(
+                ['qemu-img', 'rebase', '-u', '-b', target.name, '-F', 'vpc',
+                 str(overlay)],
+                'attaching the parentless differencing VHD'
+            )
+            stdout, stderr, rc = self.run_instar_rebase(overlay, '-b', '')
+            self.assertEqual(
+                1, rc,
+                f'stdout={stdout[:400]!r} stderr={stderr[:400]!r}'
+            )
+            self.assertIn(self.expected_refusal('rebase', 'VHD'), stderr)
 
 
 class TestDifferencingCompareTwoChains(DifferencingTestBase):

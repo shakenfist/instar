@@ -1761,12 +1761,16 @@ unsafe fn read_input_byte_range(
 /// "everywhere unallocated reads as zeros" identically on both
 /// chains).
 ///
-/// v1 supports qcow2 and raw chain members. vmdk / vhd / vhdx
-/// chain members force the call to return `false`: the qcow2
-/// crate's chain reader is not built with their feature flags
-/// in the rebase binary, so it would silently misread their
-/// data as raw sectors. Phase 3 future-work tracks promotion
-/// to a shared crate that handles the full chain-member set.
+/// v1 supports qcow2, raw, vhd and vhdx chain members: the
+/// rebase binary enables `vhd-input` / `vhdx-input`, so the
+/// shared chain reader composes a differencing VHD or VHDX the
+/// same way `convert` and `bench` do. A vmdk chain member still
+/// forces the call to return `false`, because `vmdk-input` is
+/// not enabled here and without it the qcow2 crate's chain
+/// reader falls through to `read_raw_sectors` for an
+/// unrecognised format, which would silently misread vmdk data
+/// as raw sectors. Future work tracks promotion to a shared
+/// crate that handles the full chain-member set.
 ///
 /// # Safety
 ///
@@ -1794,30 +1798,45 @@ unsafe fn read_chain_cluster(
         return true;
     }
 
-    // Pre-flight: every chain member must be a format the
-    // chain reader can handle in this build. Without the
-    // `vmdk-input` / `vhd-input` / `vhdx-input` features the
-    // qcow2 crate falls through to `read_raw_sectors` for
-    // unrecognised formats, which is wrong for any image
-    // whose data isn't laid out at the guest-virtual offset.
+    // Pre-flight: every chain member must be a format the chain
+    // reader can handle in this build. `#[cfg(feature = ...)]`
+    // here would check this *crate's* own feature table, not
+    // qcow2's -- rebase-op declares no such features itself, so
+    // the qcow2 dependency features below are unconditional for
+    // this binary. Without a format's `-input` feature on that
+    // dependency the qcow2 crate falls through to
+    // `read_raw_sectors` for that format, which is wrong for any
+    // image whose data isn't laid out at the guest-virtual
+    // offset; this allowlist is what rebase-op's own Cargo.toml
+    // feature list (`vhd-input`, `vhdx-input`, alongside the
+    // qcow2/raw case that needed no feature at all) actually
+    // supports.
     for i in 0..chain_count {
         let idx = (chain_first + i) as usize;
         if idx >= MAX_CHAIN_DEVICES {
             return false;
         }
         match chain_config.devices[idx].detected_format() {
-            ImageFormat::Qcow2 | ImageFormat::Raw => {}
+            ImageFormat::Qcow2 | ImageFormat::Raw | ImageFormat::Vhd | ImageFormat::Vhdx => {}
             _ => return false,
         }
     }
 
-    // `compressed_buf` and `staging_buf` are gated behind the
-    // `decompress` / `vmdk-decompress` features, neither of
-    // which the rebase binary enables. They are formally
-    // required by the function signature but never touched in
-    // this build; passing a stable in-scratch pointer keeps
-    // the call defined.
-    let dummy_buf = CHAIN_CACHES as *mut u8;
+    // `compressed_buf` and `staging_buf` are unused for the
+    // qcow2-decompress / vmdk-decompress paths, neither of which
+    // this binary enables, but a differencing VHD chunk's
+    // "mixed ownership" arm (`read_vhd_child_runs` ->
+    // `read_offset_sectors`) genuinely writes through
+    // `compressed_buf` as its sub-sector bounce buffer -- that
+    // parameter is reused for an unrelated purpose once a VHD
+    // chain member is in play, not dead for this build the way
+    // it is for qcow2/raw. It must therefore point at scratch no
+    // device's cache lives in: `CHAIN_CACHES` aliased the first
+    // device's own L1/BAT cache slot, so that chunk's read
+    // clobbered the cached sector mid-lookup. `PLANNER_SCRATCH`
+    // is genuinely free here (handed to `init_chain_states` only
+    // as the DMG-device scratch, and this chain has none).
+    let dummy_buf = PLANNER_SCRATCH as *mut u8;
     let mut staging_cluster_offset = u64::MAX;
     let mut bytes_read: u64 = 0;
     qcow2::read_chain_virtual_cluster(

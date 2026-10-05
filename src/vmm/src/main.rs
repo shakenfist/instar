@@ -10601,6 +10601,15 @@ fn run_rebase_guest(
     if let Some(error) = vm_error {
         return Err(error.into());
     }
+    // A differencing source in the old or new chain is refused inside
+    // `init_chain_states`, which then fails the run with the generic
+    // ERROR_PARSE_FAILED. Prefer the captured reason, matching convert,
+    // dd, compare and bench.
+    if serial_decoder.last_differencing_refusal.is_some() {
+        return Err(serial_decoder
+            .differencing_refusal_error("rebase", DifferencingComposition::Supported)
+            .into());
+    }
     if !result_seen {
         return Err(serial_decoder.no_result_error("rebase").into());
     }

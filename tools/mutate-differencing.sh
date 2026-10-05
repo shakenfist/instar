@@ -682,7 +682,7 @@ self_test() {
 # phase's definition of done asks the two to stay in step, which until
 # now was a promise kept by hand. Asserting it makes the drift a
 # failure instead of a documentation bug nobody reads.
-EXPECTED_CASES=75
+EXPECTED_CASES=80
 
 check_case_count() {
     # Only meaningful for a whole run; a selection is expected to be short.
@@ -1688,6 +1688,106 @@ integration_case 'compare-read-parent-in-chain-offset-is-array-absolute' "${QCOW
     '            devices_behind(seg.count as usize, dev_idx - seg.first as usize).unwrap_or(0) > 0' \
     '            devices_behind(seg.count as usize, dev_idx).unwrap_or(0) > 0 // MUTATED' \
     "${TWO_CHAINS_IDENTICAL}"
+
+# ---------------------------------------------------------------------
+# bench and rebase. Both read through the shared chain walker with no
+# guest code of their own to mutate; the properties worth falsifying
+# are the host-side capability flag (bench), the two places rebase's
+# own build had to grow to reach that walker at all (the Cargo.toml
+# feature list and the chain-reader's format allowlist), and the
+# typed refusal rendering rebase gained alongside them.
+# ---------------------------------------------------------------------
+
+VMM_MAIN='src/vmm/src/main.rs'
+REBASE_OP='src/operations/rebase/src/main.rs'
+REBASE_CARGO='src/operations/rebase/Cargo.toml'
+BENCH_COMPOSES='test_differencing.TestDifferencingBenchComposes'
+BENCH_END="${BENCH_COMPOSES}.test_bench_reads_to_the_end_of_the_full_virtual_size"
+REBASE_COMPOSES='test_differencing.TestDifferencingRebaseThroughChain'
+REBASE_DETACH="${REBASE_COMPOSES}.test_rebase_detach_composes_the_differencing_backing_chain"
+REBASE_REFUSAL="${REBASE_COMPOSES}.test_rebase_old_chain_refusal_is_the_typed_message"
+
+# `run_bench`'s own discovery call reverted to `Unsupported`: a
+# differencing source refuses in the host walk before the guest ever
+# runs, so the full-virtual-size range probe sees a refusal rather
+# than a reading.
+integration_case 'bench-host-capability-reverted-to-unsupported' "${VMM_MAIN}" \
+    '    let chain = discover_backing_chain(
+        Path::new(&invocation.filename),
+        sector_size,
+        &security_config,
+        ChainUse::Compose,
+        DifferencingComposition::Supported,
+    )' \
+    '    let chain = discover_backing_chain(
+        Path::new(&invocation.filename),
+        sector_size,
+        &security_config,
+        ChainUse::Compose,
+        DifferencingComposition::Unsupported, // MUTATED
+    )' \
+    "${BENCH_END}"
+
+# rebase's own Cargo.toml never gained the `vhd-input` / `vhdx-input`
+# features: the host still resolves and attaches the differencing
+# parent (rebase's capability to compose one is set host-side), but
+# the qcow2 crate's VHD arm is not compiled into this binary, so
+# `init_chain_states` cannot recognise the format at all. Caught
+# through the real binary, so `make instar` after the Cargo.toml edit
+# is load-bearing.
+integration_case 'rebase-cargo-missing-vhd-vhdx-features' "${REBASE_CARGO}" \
+    'qcow2 = { path = "../../crates/qcow2", features = ["create", "vhd-input", "vhdx-input", "vdi-input", "parallels-input", "qcow1-input", "dmg-input"] }' \
+    'qcow2 = { path = "../../crates/qcow2", features = ["create", "vdi-input", "parallels-input", "qcow1-input", "dmg-input"] } # MUTATED' \
+    "${REBASE_DETACH}"
+
+# The chain reader's own format allowlist narrowed back to qcow2/raw.
+# The qcow2 crate's VHD/VHDX composing arm is compiled in (the
+# Cargo.toml features above are intact), but `read_chain_cluster`'s
+# pre-flight loop refuses the format name before ever calling it, so
+# the differencing child in the old chain is declined rather than
+# read.
+integration_case 'rebase-read-chain-cluster-vhd-vhdx-disallowed' "${REBASE_OP}" \
+    '            ImageFormat::Qcow2 | ImageFormat::Raw | ImageFormat::Vhd | ImageFormat::Vhdx => {}' \
+    '            ImageFormat::Qcow2 | ImageFormat::Raw => {} // MUTATED' \
+    "${REBASE_DETACH}"
+
+# `compressed_buf`/`staging_buf` pointed back at `CHAIN_CACHES`,
+# aliasing the first chain device's own L1/BAT cache slot. A
+# differencing VHD chunk's mixed-ownership arm genuinely writes
+# through that parameter as its sub-sector bounce buffer, so the
+# alias corrupts the cached sector mid-lookup -- the actual defect
+# this step found and fixed, now pinned by the test that caught it.
+integration_case 'rebase-dummy-buf-aliases-chain-caches' "${REBASE_OP}" \
+    '    let dummy_buf = PLANNER_SCRATCH as *mut u8;' \
+    '    let dummy_buf = CHAIN_CACHES as *mut u8; // MUTATED' \
+    "${REBASE_DETACH}"
+
+# The new `differencing_refusal_error` call site removed from
+# `run_rebase_guest`: a differencing refusal in the old or new chain
+# still fails the run, but renders the pre-existing generic
+# ERROR_PARSE_FAILED text ("the overlay's header could not be
+# parsed") instead of naming the format and the reason.
+integration_case 'rebase-differencing-refusal-call-site-removed' "${VMM_MAIN}" \
+    '    if serial_decoder.last_differencing_refusal.is_some() {
+        return Err(serial_decoder
+            .differencing_refusal_error("rebase", DifferencingComposition::Supported)
+            .into());
+    }
+    if !result_seen {
+        return Err(serial_decoder.no_result_error("rebase").into());
+    }
+    Ok(harvested)
+}
+
+/// Map a u32 image-format code (as stored in CommitConfig and' \
+    '    if !result_seen { // MUTATED: differencing_refusal_error call site removed
+        return Err(serial_decoder.no_result_error("rebase").into());
+    }
+    Ok(harvested)
+}
+
+/// Map a u32 image-format code (as stored in CommitConfig and' \
+    "${REBASE_REFUSAL}"
 
 # ---------------------------------------------------------------------
 # The create guest operation. Caught through the real binary only.

@@ -1557,7 +1557,7 @@ deliberately broken emitter is not guarding what its name says it
 guards. See [PLAN-differencing.md](plans/PLAN-differencing.md) for the
 path being guarded.
 
-There are **75 cases**, in three groups.
+There are **80 cases**, in four groups.
 
 Twenty-seven cover the writer. Fifteen mutate a library crate
 (`create`, `vhd`, `vhdx`) and are caught by a Rust unit or round-trip
@@ -1600,6 +1600,25 @@ rather than errors — "identical", or a difference at an offset other
 than the one that was altered — so an integration test that reads the
 verdict is what has to notice. None of them can be caught by a
 single-chain test.
+
+The remaining **five cover `bench` and `rebase`**, the two operations
+that read through the shared chain walker with no guest code of their
+own to mutate. One reverts `run_bench`'s own host-side discovery call
+to `DifferencingComposition::Unsupported`, caught by the test that
+reads to the end of a chain's full declared virtual size. The other
+four are `rebase`'s: its Cargo.toml never gaining the `vhd-input` /
+`vhdx-input` features, its own chain reader's format allowlist
+narrowed back to qcow2/raw, `compressed_buf`/`staging_buf` pointed
+back at `CHAIN_CACHES` — aliasing the first chain device's own L1/BAT
+cache slot, which a differencing VHD chunk's mixed-ownership arm
+genuinely writes through, corrupting the cached sector mid-lookup, the
+actual defect this pass of cases found — and the new
+`differencing_refusal_error` call site in `run_rebase_guest` removed,
+so a differencing refusal in the chain renders the pre-existing
+generic "the overlay's header could not be parsed" instead of naming
+the format. All five run through the real binary, caught by
+`TestDifferencingBenchComposes` and `TestDifferencingRebaseThroughChain`
+in `tests/test_differencing.py`.
 
 Most of the reader cases name a test in the `qcow2` crate and run it
 with the full input-format feature list, because the
