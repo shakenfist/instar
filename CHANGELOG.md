@@ -15,13 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and serves each 512-byte sector from whichever device owns it,
   recursing into the parent for the sectors the child does not own. An
   unallocated block already descended to the parent correctly and is
-  unchanged. This is a crate-level change only: `init_chain_states`
-  still refuses every differencing VHD unconditionally, and only one
-  call site resolves a differencing parent at all, `instar info
-  --chain`'s reporting path. No operation reaches the composing path
-  yet — `instar convert`, `dd`, `compare`, `bench`, `check`, `measure`
-  and `map` still refuse a differencing source exactly as before — so
-  this is not a user-visible change.
+  unchanged. This was a crate-level change when made: nothing
+  reached the composing path, because `init_chain_states` refused
+  every differencing VHD unconditionally. The composition rollout
+  below now reaches it from `convert`, `dd`, `compare`, `bench` and
+  `rebase`.
 
 - **The guest chain walker can compose a differencing VHDX's partially
   present block against its parent.** It previously failed the read
@@ -35,10 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   device follows. The chain walker also refuses a BAT entry naming
   file offset zero, where the file identifier and headers live,
   rather than reading a block from there; the whole-BAT walks behind
-  `info` and `map` are unchanged. This is a crate-level change only:
-  `init_chain_states` still
-  refuses every differencing VHDX unconditionally, so no operation
-  reaches the composing path — this is not a user-visible change.
+  `info` and `map` are unchanged. This was a crate-level change when made:
+  `init_chain_states` refused every differencing VHDX
+  unconditionally, so no operation reached the composing path. The
+  composition rollout below now reaches it.
 
 - **`instar info --chain` walks differencing VHD and VHDX parent chains.**
   It previously stopped at the child and reported the parent reference
@@ -49,10 +47,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   reference points back at an image already in the chain, or resolution
   fails for any other reason, such as a permission error on a path
   component — the walk ends at the last image it did resolve, a reason is
-  printed to stderr, and the command still exits 0. No operation that
-  reads image data changed: `convert`, `dd`, `compare`, `bench`, `check`,
-  `measure` and `map` still refuse a differencing source, and still
-  refuse it identically whether or not the parent file is present.
+  printed to stderr, and the command still exits 0. This change read
+  chains without reading image data; the composition rollout below is
+  what taught five operations to read one. `map`, `measure` and
+  `check` still refuse a differencing source, and still refuse it
+  identically whether or not the parent file is present.
 
 - **`instar info --chain --output json` now produces JSON.** It
   previously ignored the `--output` flag and printed human text. The JSON
