@@ -320,8 +320,8 @@ are accepted normally.
 
 Note that `convert`, `dd`, `compare`, `bench` and `rebase` do compose a
 differencing VHD or VHDX against its parent elsewhere in instar, so an
-overlay created outside instar on such a base, or by a future version of
-`create`, is readable through those operations today — this refusal is
+overlay created outside instar on such a base — with `qemu-img rebase -u`,
+for example — is readable through those operations today; this refusal is
 `create`'s own restriction on what it will build, not a statement that
 instar cannot read the result. See the "VHD/VHDX differencing" section
 of [quirks.md](quirks.md).

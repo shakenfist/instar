@@ -816,13 +816,17 @@ class TestDifferencingBenchComposes(DifferencingTestBase):
     this request goes out of bounds and bench fails instead of
     quietly succeeding on a short chain.
 
-    The second is composition itself: a request anchored exactly on
-    one of `CHAIN_PROBE_SECTORS`'s validated parent-owned sectors
-    must succeed. Those sectors are the ones the fixture never
-    places in the child's own payload, so a reader that never
-    actually descended to the parent -- composing nothing and just
-    reading the child's own (unallocated) extent -- has no sectors
-    there to serve and would error exactly where this test reads.
+    The second is that a request anchored exactly on one of
+    `CHAIN_PROBE_SECTORS`'s validated parent-owned sectors succeeds.
+    That is all it is: a successful read, not a correct one. A reader
+    that ignored the sector bitmap would hand back the child's own
+    bytes, or zeros for a block it never allocated, and report no
+    error -- and `bench` would not notice, because it never looks at
+    the content. Content correctness for `bench` rests on it sharing
+    the chain walker that `TestDifferencingComposition`'s whole-file
+    `convert` comparisons pin byte for byte; what this class adds is
+    that `bench`'s own request path reaches that walker over the
+    whole declared extent, including the parts only the parent owns.
     """
 
     BENCH_BUFSIZE = 4096
@@ -995,6 +999,81 @@ class TestDifferencingRebaseThroughChain(DifferencingTestBase):
                     expected = self._expected(tmp, golden)
                     self.assert_bytes_identical(
                         out, expected, f'{image_id} (rebase detach)'
+                    )
+
+    def test_rebase_onto_a_new_backing_keeps_the_two_chains_apart(self):
+        """A rebase with both an old and a new chain writes two segments.
+
+        Every other rebase test here detaches (`-b \'\'`), which leaves
+        `run_rebase_guest` with one chain and so one `ChainSegment`.
+        Giving `-b` a real target is the only way to reach the
+        two-segment config: the old chain the overlay is being moved
+        off and the new chain it is being moved onto are written into
+        one device array, and the segments are what stop the guest
+        reading the first device of the new chain as the parent of the
+        last device of the old one.
+
+        The old chain is the differencing child and its parent, so
+        safe mode has to compose it to know what the overlay must keep.
+        The new backing holds the recorded composition itself, which
+        means a correct rebase finds the two chains already agree and
+        writes nothing -- and a rebase that composed the old chain
+        wrongly finds a difference that is not there and writes those
+        wrong bytes into the overlay, where the content comparison
+        catches them.
+
+        The new backing is qcow2 rather than the raw file the golden
+        already is, because safe-mode rebase onto a raw backing fails
+        with the generic unparseable-header error regardless of what
+        the old chain holds -- issue #632, which predates the
+        composition rollout and is not what this test is about.
+        """
+        self._require_qemu_tools()
+        for image_id, golden_id, _format_name in COMPOSED_CHAIN_FIXTURES:
+            with self.subTest(image=image_id):
+                golden = self.composed_golden(golden_id)
+                with tempfile.TemporaryDirectory() as tmp:
+                    child = self.chain_copy(image_id, tmp)
+                    overlay = self._build_overlay(
+                        tmp, child, CHAIN_FIXTURE_FORMAT[image_id], image_id
+                    )
+                    # Named, not pathed, and deliberately shorter than
+                    # either fixture's own filename: safe-mode rebase
+                    # writes the new reference into the overlay's
+                    # existing backing-filename slot and refuses a
+                    # path that does not fit (`rebase` error 8), which
+                    # an absolute path under a temporary directory
+                    # never does.
+                    new_backing = Path(tmp) / 'nb.qcow2'
+                    self._run(
+                        ['qemu-img', 'convert', '-f', 'raw', '-O', 'qcow2',
+                         str(golden), str(new_backing)],
+                        f'{image_id}: building the new backing'
+                    )
+
+                    stdout, stderr, rc = self.run_instar_rebase(
+                        overlay, '-b', new_backing.name, '-F', 'qcow2'
+                    )
+                    self.assertEqual(
+                        0, rc,
+                        f'{image_id}: rebase must accept an old chain and a '
+                        f'new chain in one device array; '
+                        f'stdout={stdout[:400]!r} stderr={stderr[:400]!r}'
+                    )
+
+                    out = Path(tmp) / 'rebased.raw'
+                    c_stdout, c_stderr, c_rc = self.run_instar_convert(
+                        overlay, out, output_format='raw'
+                    )
+                    self.assertEqual(
+                        0, c_rc,
+                        f'{image_id}: reading the rebased overlay back '
+                        f'failed; stdout={c_stdout[:400]!r} '
+                        f'stderr={c_stderr[:400]!r}'
+                    )
+                    expected = self._expected(tmp, golden)
+                    self.assert_bytes_identical(
+                        out, expected, f'{image_id} (rebase onto a new chain)'
                     )
 
     def test_rebase_old_chain_refusal_is_the_typed_message(self):
@@ -2318,9 +2397,10 @@ class TestDifferencingParentAbsent(DifferencingTestBase):
         through the guest chain walker. Each of these four states that
         it can compose a differencing chain, so the walk resolves the
         parent for them exactly as it does for a qcow2 backing file:
-        with the parent beside the child the walk succeeds and the
-        refusal arrives from the guest, and with the parent gone the
-        walk itself fails and names the file.
+        with the parent beside the child the walk succeeds and so does
+        the operation, composing the chain rather than refusing it;
+        with the parent gone the walk itself fails and names the file
+        it could not find.
 
         Asserting both directions is what makes this a test of the gate
         rather than of an error string. An operation that still refused
@@ -2361,11 +2441,18 @@ class TestDifferencingParentAbsent(DifferencingTestBase):
                             f'{image_id}/{op}: the error must name the '
                             f'parent; stderr={a_stderr!r}'
                         )
+                        self.assertEqual(
+                            0, p_rc,
+                            f'{image_id}/{op}: with the parent present '
+                            f'the operation must compose the chain and '
+                            f'succeed; stdout={p_stdout[:400]!r} '
+                            f'stderr={p_stderr[:400]!r}'
+                        )
                         self.assertNotIn(
                             'Backing file not found', p_stderr,
                             f'{image_id}/{op}: with the parent present '
-                            f'the walk must resolve it and leave the '
-                            f'refusal to the guest; stderr={p_stderr!r}'
+                            f'the walk must resolve it rather than '
+                            f'reporting it missing; stderr={p_stderr!r}'
                         )
 
 

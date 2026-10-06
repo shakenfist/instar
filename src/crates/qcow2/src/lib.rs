@@ -9710,6 +9710,58 @@ mod tests {
         }
     }
 
+    // The overlap test lives in `block_lookup`'s fully present arm,
+    // which runs whatever the image says about a parent, so it is not
+    // a differencing rule -- it tightens every VHDX read instar does.
+    // The cases above all drive a differencing child, which would
+    // leave the plain dynamic path free to lose the refusal without
+    // a test noticing. This is that path: no parent, no chain behind
+    // it, nothing but an ordinary dynamic image whose BAT points at
+    // its own structure.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_arm_dynamic_block_inside_a_declared_region_is_refused() {
+        let payload_entry = VHDX_FIX_BAT_OFFSET as usize;
+
+        for (region_offset, region_label) in [
+            (VHDX_FIX_METADATA_OFFSET, "the metadata region"),
+            (VHDX_FIX_BAT_OFFSET, "the BAT region"),
+        ] {
+            let fixture =
+                build_vhdx_image(512, false, 1, &[(0, VhdxBlockState::FullyPresent)], &[]);
+            let mut bytes = fixture.bytes;
+            let entry =
+                u64::from_le_bytes(bytes[payload_entry..payload_entry + 8].try_into().unwrap());
+            let state = entry & vhdx::BAT_ENTRY_STATE_MASK;
+            let rewritten = vhdx::build_bat_entry(state, region_offset);
+            bytes[payload_entry..payload_entry + 8].copy_from_slice(&rewritten.to_le_bytes());
+            let lone = vhdx_chain_alone(bytes);
+            let (ok, _out) = run_vhdx_chain_read(&lone, 512, 0, VHDX_CHUNK);
+            assert!(
+                !ok,
+                "a dynamic image with no parent whose BAT entry names an \
+                 offset inside {region_label} must fail the read rather \
+                 than serve that region's own bytes as payload"
+            );
+        }
+
+        // The control, so the refusals above are the overlap test
+        // rather than a fixture a parentless chain cannot read at
+        // all: the same image, untouched, reads its own payload.
+        let fixture = build_vhdx_image(512, false, 1, &[(0, VhdxBlockState::FullyPresent)], &[]);
+        let payload = fixture.block_offsets[0];
+        let lone = vhdx_chain_alone(fixture.bytes);
+        let (ok, out) = run_vhdx_chain_read(&lone, 512, 0, VHDX_CHUNK);
+        assert!(ok, "an untouched dynamic image must still read");
+        let want: std::vec::Vec<u8> = (0..VHDX_CHUNK)
+            .map(|i| vhdx_child_byte(payload + i))
+            .collect();
+        assert_eq!(
+            out, want,
+            "the control must be served from the image's own payload"
+        );
+    }
+
     // SPEC(VHDX) does not require a region to precede the blocks it
     // coexists with, so a region table entry naming a byte range
     // entirely *after* every block this image uses must not refuse

@@ -356,8 +356,9 @@ resolves their parent unconditionally regardless.
 This is no longer "discovery, not composition" for every caller: `convert`,
 `dd`, `compare`, `bench` and `rebase` read a resolved VHD or VHDX
 parent's sector data, exactly like any other chain member. The invariant
-that survives is the one decision 5 of the differencing work established:
-an operation must never resolve a parent it will not go on to read. An
+that survives is the one the differencing work established at the
+outset: an operation must never resolve a parent it will not go on to
+read. An
 operation that cannot compose a differencing source refuses it before the
 parent's presence or absence could change the answer — resolving the
 parent only to discard the result would make the same differencing image

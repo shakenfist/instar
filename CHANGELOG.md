@@ -60,7 +60,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - **`instar convert`, `dd`, `compare`, `bench` and `rebase` now compose
   a differencing VHD or VHDX source against its parent, instead of
-  refusing it.** This lifts the phase 4 refusal (below) for the five
+  refusing it.** This lifts the blanket differencing refusal (below)
+  for the five
   operations that read through the guest chain walker, using the VHD
   and VHDX block composition added above. `convert -O raw` on a
   differencing VHD or VHDX produces the same bytes as the same chain
@@ -85,9 +86,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   which composition would otherwise have made reachable from an
   untrusted image), #614 (`init_chain_states` could not tell where one
   chain ended and the next began, which blocked `compare`'s two-chain
-  case), and #625 (a BAT entry naming an offset inside the metadata
-  region of a small image, latent until this phase made it reachable
-  from `instar convert` on an untrusted source).
+  case), and #625 (a BAT entry naming an offset inside a region the
+  image itself declares; see the region-overlap entry under *Changed*,
+  which tightens every VHDX read, not only a differencing one).
 
 - **Coverage-guided fuzzing of the VHD and VHDX parent-locator read
   paths (40→42 targets).** Both were previously unreached: measurement
@@ -308,6 +309,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   keys are reported verbatim.
 
 ### Changed
+
+- **Every VHDX read refuses a payload block that overlaps a region the
+  image declares.** A VHDX region table names where the BAT, the
+  metadata region and any other region the writer declared live. A BAT
+  entry whose block runs into one of those is describing payload data
+  on top of the image's own structure, which no conforming writer
+  emits; instar previously only refused a block below a fixed 1 MiB
+  floor, which could not tell real payload from the BAT of a small
+  image. Blocks are now checked against the declared region table
+  instead, and the same test guards the sector-bitmap blocks a
+  differencing child reads.
+
+  This is a behaviour change for plain dynamic VHDX too, not only for
+  the differencing images it was found on: the check runs in
+  `block_lookup` whatever the image says about a parent, so it reaches
+  `convert`, `dd`, `compare`, `bench` and `map`. A well-formed image is
+  unaffected — the region table and the payload cannot legally overlap
+  — but a malformed or hostile one that instar used to read now fails
+  the read instead. A region entry whose own `offset + length`
+  overflows is treated as overlapping everything, so such an image
+  becomes unreadable in its entirety; that is deliberate, because an
+  image that cannot say where its own regions end cannot be used to
+  bound anything. Fixes #625.
 
 - **CI runs on Debian 13 runners.** Every job moved from the `debian-12`
   runner labels to `debian-13` (and `debian-12-docker` to

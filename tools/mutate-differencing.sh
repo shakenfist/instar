@@ -682,7 +682,7 @@ self_test() {
 # phase's definition of done asks the two to stay in step, which until
 # now was a promise kept by hand. Asserting it makes the drift a
 # failure instead of a documentation bug nobody reads.
-EXPECTED_CASES=86
+EXPECTED_CASES=88
 
 check_case_count() {
     # Only meaningful for a whole run; a selection is expected to be short.
@@ -1537,6 +1537,28 @@ rust_case 'vhdx-read-partial-payload-offset-inside-region-accepted' "${VHDX_READ
     qcow2 'vhdx_arm_block_inside_a_declared_region_is_refused' \
     --features "${QCOW2_FEATURES}"
 
+# The overlap check narrowed back to differencing images only. Every
+# case above drives a differencing child, so all three still pass: it
+# is the plain dynamic read -- the one the fix quietly tightened, and
+# the one a reader of the issue would not expect to be affected --
+# that this catches.
+
+rust_case 'vhdx-read-overlap-check-gated-on-has-parent' "${VHDX_READ_LIB}" \
+    '                if self.block_overlaps_a_declared_region(file_offset, u64::from(self.block_size)) {
+                    return None;
+                }
+                let intra_block_offset = virtual_offset % self.block_size as u64;
+                Some(VhdxBlockLookup::Present {' \
+    '                if self.has_parent // MUTATED
+                    && self.block_overlaps_a_declared_region(file_offset, u64::from(self.block_size))
+                {
+                    return None;
+                }
+                let intra_block_offset = virtual_offset % self.block_size as u64;
+                Some(VhdxBlockLookup::Present {' \
+    qcow2 'vhdx_arm_dynamic_block_inside_a_declared_region_is_refused' \
+    --features "${QCOW2_FEATURES}"
+
 # --- VHDX: the device a mixed chunk resumes on -----------------------
 
 rust_case 'vhdx-read-mixed-arm-pins-device-zero' "${QCOW2_LIB}" \
@@ -1698,7 +1720,6 @@ integration_case 'compare-read-parent-in-chain-offset-is-array-absolute' "${QCOW
 # typed refusal rendering rebase gained alongside them.
 # ---------------------------------------------------------------------
 
-VMM_MAIN='src/vmm/src/main.rs'
 REBASE_OP='src/operations/rebase/src/main.rs'
 REBASE_CARGO='src/operations/rebase/Cargo.toml'
 BENCH_COMPOSES='test_differencing.TestDifferencingBenchComposes'
@@ -1706,6 +1727,7 @@ BENCH_END="${BENCH_COMPOSES}.test_bench_reads_to_the_end_of_the_full_virtual_siz
 REBASE_COMPOSES='test_differencing.TestDifferencingRebaseThroughChain'
 REBASE_DETACH="${REBASE_COMPOSES}.test_rebase_detach_composes_the_differencing_backing_chain"
 REBASE_REFUSAL="${REBASE_COMPOSES}.test_rebase_old_chain_refusal_is_the_typed_message"
+REBASE_TWO_CHAINS="${REBASE_COMPOSES}.test_rebase_onto_a_new_backing_keeps_the_two_chains_apart"
 
 # `run_bench`'s own discovery call reverted to `Unsupported`: a
 # differencing source refuses in the host walk before the guest ever
@@ -1761,6 +1783,27 @@ integration_case 'rebase-dummy-buf-aliases-chain-caches' "${REBASE_OP}" \
     '    let dummy_buf = PLANNER_SCRATCH as *mut u8;' \
     '    let dummy_buf = CHAIN_CACHES as *mut u8; // MUTATED' \
     "${REBASE_DETACH}"
+
+# Only the first chain gets a segment, so a rebase carrying both an
+# old and a new chain stops accounting for the second chain's devices
+# -- the host's own device-count check catches it before the config is
+# written, which is the check that replaced a `debug_assert_eq!` that
+# would have compiled to nothing in the shipping build. A detach has
+# one chain and is unaffected, which is the point: the detach cases
+# above keep passing and only the two-chain test fails, so it is that
+# test, not them, that reaches the multi-segment path at all.
+integration_case 'rebase-second-chain-gets-no-segment' "${VMM_MAIN}" \
+    '        if count > 0 {
+            segments.push(shared::ChainSegment {
+                first: written as u32,
+                count: count as u32,
+            });' \
+    '        if count > 0 && segments.is_empty() { // MUTATED
+            segments.push(shared::ChainSegment {
+                first: written as u32,
+                count: count as u32,
+            });' \
+    "${REBASE_TWO_CHAINS}"
 
 # The new `differencing_refusal_error` call site removed from
 # `run_rebase_guest`: a differencing refusal in the old or new chain

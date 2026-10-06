@@ -1205,15 +1205,26 @@ unsafe fn run_qcow2_safe(call_table: &CallTable, config: &RebaseConfig) -> Rebas
             device_count,
             sector_size,
             CHAIN_CACHES,
-            // Per-device DMG chunk-table scratch. rebase's chain reader
-            // (`read_chain_over_range`) only serves qcow2/raw devices and
-            // refuses every other format, so a DMG device in a rebase
-            // chain is refused at READ time and its chunk table is never
-            // consulted. We still hand init_chain_states a valid,
-            // init-time-free region (the `-u`/vmdk PLANNER_SCRATCH carve,
-            // unused on the safe-mode qcow2 path that reaches here) so the
-            // DMG init has somewhere to stage; DMG_REQUIRED_SCRATCH
-            // (≈3.25 MiB) fits within PLANNER_SCRATCH_LIMIT (4 MiB).
+            // Per-device DMG chunk-table scratch. rebase's chain
+            // reader (`read_chain_cluster`) serves qcow2, raw, VHD and
+            // VHDX devices and refuses every other format, so a DMG
+            // device in a rebase chain is refused at READ time and the
+            // chunk table staged for it here is never consulted. We
+            // still hand init_chain_states a valid region to stage
+            // into: the `-u`/vmdk PLANNER_SCRATCH carve, which no
+            // planner touches on the safe-mode path that reaches here.
+            // DMG_REQUIRED_SCRATCH (≈3.25 MiB) fits within
+            // PLANNER_SCRATCH_LIMIT (4 MiB).
+            //
+            // PLANNER_SCRATCH is not exclusively ours, though: the
+            // same carve is `read_chain_cluster`'s `compressed_buf`
+            // bounce buffer, which a differencing VHD chunk with
+            // mixed sector ownership genuinely writes through. The
+            // two can share it only because the read-time allowlist
+            // refuses DMG, so nothing ever reads back the chunk table
+            // a read would overwrite. Widening that allowlist to DMG
+            // would make this an aliasing bug, and the two uses would
+            // have to be given separate carves.
             PLANNER_SCRATCH,
             qcow2::DMG_REQUIRED_SCRATCH,
             &mut bytes_read,

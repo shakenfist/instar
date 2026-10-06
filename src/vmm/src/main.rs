@@ -10412,11 +10412,20 @@ fn run_rebase_guest(
     // The guest derives its own device count from the RebaseConfig
     // chain extents written above, not from `device_count`, so the two
     // must agree or its segmentation check will refuse a sound config.
-    debug_assert_eq!(
-        written,
-        old_chain_input_devices + new_chain_input_devices,
-        "chain config device count must match the RebaseConfig chain extents"
-    );
+    // A real error rather than a debug assertion: a release build is
+    // what ships, and without this the guest refuses the segmentation
+    // and the user sees a generic failure with no clue that the host
+    // built it wrong. `write_chain_config_header` reports a bad
+    // segmentation the same way.
+    let expected_devices = old_chain_input_devices + new_chain_input_devices;
+    if written != expected_devices {
+        return Err(format!(
+            "chain config describes {written} devices but the RebaseConfig \
+             chain extents describe {expected_devices} \
+             ({old_chain_input_devices} old + {new_chain_input_devices} new)"
+        )
+        .into());
+    }
     if written > 0 {
         write_chain_config_header(&guest_mem, written, &segments)?;
         debug!(
