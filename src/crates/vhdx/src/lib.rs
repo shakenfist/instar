@@ -1868,7 +1868,19 @@ fn coalesce_ownership_run<F: FnMut(u32) -> Option<u8>>(
 /// untrusted BAT entry or region table -- and an end this cannot
 /// compute is not one this function can prove clear of the region,
 /// so overflow counts as overlap rather than being waved through.
+///
+/// An empty range intersects nothing, and is answered before either
+/// sum is formed. Without that, a region entry declaring zero length
+/// would still refuse any block whose range strictly contains its
+/// offset -- `offset < region_offset < end` with `region_end ==
+/// region_offset` -- while one declared at or below the block's start
+/// was waved through. A region naming no bytes can hide nothing, so
+/// the inconsistency bought no safety; `init` does not reject a
+/// zero-length entry, so it is reachable from a hostile image.
 fn ranges_overlap(offset: u64, len: u64, region_offset: u64, region_len: u32) -> bool {
+    if len == 0 || region_len == 0 {
+        return false;
+    }
     let end = match offset.checked_add(len) {
         Some(e) => e,
         None => return true,

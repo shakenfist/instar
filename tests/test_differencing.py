@@ -388,8 +388,8 @@ class DifferencingTestBase(InstarTestBase):
         than pass silently.
         """
         return (
-            f'{op}: source is a differencing {format_name} image with no '
-            f'parent in the chain {op} was given, so the sectors it leaves '
+            f'{op}: a differencing {format_name} image in the chain {op} '
+            f'was given has no parent behind it, so the sectors it leaves '
             f'to its parent could not be composed'
         )
 

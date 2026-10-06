@@ -39,8 +39,9 @@ use rebase::{
 };
 use shared::{
     format_detection::detect_format_from_header, validate_call_table, CallTable, ChainConfig,
-    ImageFormat, RebaseConfig, RebaseResult, CALL_TABLE_ADDR, CHAIN_CONFIG_ADDR, MAX_CHAIN_DEVICES,
-    MAX_SECTOR_SIZE, OPERATION_CONFIG_ADDR, SCRATCH_MEM_BASE,
+    ImageFormat, RebaseConfig, RebaseResult, CALL_TABLE_ADDR, CHAIN_CONFIG_ADDR,
+    COMPRESSED_BUF_SIZE, MAX_CHAIN_DEVICES, MAX_CLUSTER_SIZE, MAX_SECTOR_SIZE,
+    OPERATION_CONFIG_ADDR, SCRATCH_MEM_BASE,
 };
 
 // ---------------------------------------------------------------------------
@@ -171,6 +172,39 @@ const EXISTING_STATE_LIMIT: usize = 4 * 1024 * 1024;
 const PLANNER_SCRATCH: usize = EXISTING_STATE + EXISTING_STATE_LIMIT;
 const PLANNER_SCRATCH_LIMIT: usize = 4 * 1024 * 1024;
 
+/// The two bounce buffers `read_chain_cluster` hands
+/// `read_chain_virtual_cluster`. A carve of their own, above both of
+/// the carves above, so neither aliases anything: not each other, not
+/// a device's L1/BAT cache, not the DMG chunk-table scratch, and not
+/// the safe-mode ladder.
+///
+/// `compressed_buf` and `staging_buf` are separate parameters with
+/// separate lifetimes, and a differencing VHD chunk's mixed-ownership
+/// arm writes through `compressed_buf` as a sub-sector bounce buffer
+/// while `staging_buf` may hold a cluster. They happened not to
+/// collide while one pointer served both, because no arm in this
+/// build uses both at once -- but that is a property of call ordering
+/// inside the `qcow2` crate, invisible from here and not ours to
+/// keep. Two addresses cost 4 MiB of otherwise unused scratch and
+/// need no such argument.
+///
+/// Sized by the callee's documented contract: `compressed_buf` needs
+/// `COMPRESSED_BUF_SIZE`, `staging_buf` needs `MAX_CLUSTER_SIZE`.
+/// They do not both fit inside `PLANNER_SCRATCH_LIMIT`, which is 64
+/// KiB short of the pair.
+///
+/// No test holds this separation, and that is not an oversight: a
+/// mutation pointing `staging_buf` back at `compressed_buf` was run
+/// against the differencing rebase suite and survived, which is the
+/// same thing as saying no behaviour distinguishes the two layouts
+/// today. What holds it is the two constants and the asserts below,
+/// checked when this compiles rather than when something runs. Do
+/// not collapse them back on the grounds that nothing fails.
+const CHAIN_READ_COMPRESSED: usize = PLANNER_SCRATCH + PLANNER_SCRATCH_LIMIT;
+const CHAIN_READ_COMPRESSED_LIMIT: usize = COMPRESSED_BUF_SIZE;
+const CHAIN_READ_STAGING: usize = CHAIN_READ_COMPRESSED + CHAIN_READ_COMPRESSED_LIMIT;
+const CHAIN_READ_STAGING_LIMIT: usize = MAX_CLUSTER_SIZE;
+
 // Compile-time checks: both carves fit below the allocator
 // heap (which sits at the top of scratch), and the step buffer
 // is aligned for `[Step; N]`.
@@ -181,6 +215,14 @@ const _: () = assert!(
 const _: () = assert!(
     PLANNER_SCRATCH + PLANNER_SCRATCH_LIMIT <= shared::ALLOC_HEAP_BASE,
     "rebase unsafe/vmdk scratch carve overlaps the allocator heap"
+);
+const _: () = assert!(
+    CHAIN_READ_STAGING + CHAIN_READ_STAGING_LIMIT <= shared::ALLOC_HEAP_BASE,
+    "rebase chain-read bounce buffers overlap the allocator heap"
+);
+const _: () = assert!(
+    CHAIN_READ_COMPRESSED >= PLANNER_SCRATCH + PLANNER_SCRATCH_LIMIT,
+    "chain-read bounce buffers must start above the unsafe/vmdk carve"
 );
 // The DMG chunk-table init scratch overlays the PLANNER_SCRATCH carve
 // (see the init_chain_states call); it must fit within that carve.
@@ -1216,15 +1258,15 @@ unsafe fn run_qcow2_safe(call_table: &CallTable, config: &RebaseConfig) -> Rebas
             // DMG_REQUIRED_SCRATCH (≈3.25 MiB) fits within
             // PLANNER_SCRATCH_LIMIT (4 MiB).
             //
-            // PLANNER_SCRATCH is not exclusively ours, though: the
-            // same carve is `read_chain_cluster`'s `compressed_buf`
-            // bounce buffer, which a differencing VHD chunk with
-            // mixed sector ownership genuinely writes through. The
-            // two can share it only because the read-time allowlist
-            // refuses DMG, so nothing ever reads back the chunk table
-            // a read would overwrite. Widening that allowlist to DMG
-            // would make this an aliasing bug, and the two uses would
-            // have to be given separate carves.
+            // This is now the carve's only use on the read path.
+            // `read_chain_cluster`'s two bounce buffers used to be
+            // taken from it as well, which was safe only because the
+            // allowlist refuses DMG -- nothing ever read back a chunk
+            // table a read had overwritten. They have their own carve
+            // (`CHAIN_READ_COMPRESSED`), so widening the allowlist to
+            // DMG no longer turns that into an aliasing bug; it would
+            // only mean the chunk table staged here is consulted, as
+            // init_chain_states already intends.
             PLANNER_SCRATCH,
             qcow2::DMG_REQUIRED_SCRATCH,
             &mut bytes_read,
@@ -1844,10 +1886,13 @@ unsafe fn read_chain_cluster(
     // it is for qcow2/raw. It must therefore point at scratch no
     // device's cache lives in: `CHAIN_CACHES` aliased the first
     // device's own L1/BAT cache slot, so that chunk's read
-    // clobbered the cached sector mid-lookup. `PLANNER_SCRATCH`
-    // is genuinely free here (handed to `init_chain_states` only
-    // as the DMG-device scratch, and this chain has none).
-    let dummy_buf = PLANNER_SCRATCH as *mut u8;
+    // clobbered the cached sector mid-lookup.
+    //
+    // Each gets its own address rather than sharing one. See the
+    // `CHAIN_READ_COMPRESSED` carve for why a shared pointer was
+    // only safe by accident of call ordering in another crate.
+    let compressed_buf = CHAIN_READ_COMPRESSED as *mut u8;
+    let staging_buf = CHAIN_READ_STAGING as *mut u8;
     let mut staging_cluster_offset = u64::MAX;
     let mut bytes_read: u64 = 0;
     qcow2::read_chain_virtual_cluster(
@@ -1860,8 +1905,8 @@ unsafe fn read_chain_cluster(
         sector_size,
         chain_config,
         chain_states,
-        dummy_buf,
-        dummy_buf,
+        compressed_buf,
+        staging_buf,
         &mut staging_cluster_offset,
         None,
         None,

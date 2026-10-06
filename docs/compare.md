@@ -48,9 +48,9 @@ it, rather than reporting a content difference it cannot actually
 account for:
 
 ```
-compare: source is a differencing <VHD|VHDX> image with no parent in the
-chain compare was given, so the sectors it leaves to its parent could not
-be composed
+compare: a differencing <VHD|VHDX> image in the chain compare was given
+has no parent behind it, so the sectors it leaves to its parent could
+not be composed
 ```
 
 and exits 1. A parent reference that cannot be resolved — the file is

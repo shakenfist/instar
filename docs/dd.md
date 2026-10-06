@@ -331,9 +331,9 @@ whichever image in the chain owns each sector.
 If the source's own chain has no parent to read, `dd` still refuses it:
 
 ```
-dd: source is a differencing <VHD|VHDX> image with no parent in the
-chain dd was given, so the sectors it leaves to its parent could not
-be composed
+dd: a differencing <VHD|VHDX> image in the chain dd was given has no
+parent behind it, so the sectors it leaves to its parent could not be
+composed
 ```
 
 and exits 1 with no output file left behind. A parent reference that

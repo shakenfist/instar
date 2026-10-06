@@ -103,9 +103,9 @@ with an empty or absent parent reference — `convert` still refuses it,
 rather than composing from nothing:
 
 ```
-convert: source is a differencing <VHD|VHDX> image with no parent in the
-chain convert was given, so the sectors it leaves to its parent could not
-be composed
+convert: a differencing <VHD|VHDX> image in the chain convert was given
+has no parent behind it, so the sectors it leaves to its parent could
+not be composed
 ```
 
 and exits 1 with no output file left behind. If the chain names a parent

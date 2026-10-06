@@ -352,7 +352,7 @@ cannot resolve the sector bitmaps of images instar itself wrote.
 | 14d | high | opus | none | The host-side composability gate. `discover_backing_chain` (`src/vmm/src/main.rs`, the match at `:3044`) refuses to resolve a differencing VHD or VHDX parent for every `ChainUse::Compose` caller. Replace the caller-kind test with an explicit per-call capability argument (decision 5) -- not a third `ChainUse` variant -- so each of the ten call sites states whether its operation can compose a differencing chain. Set it true for `run_bench` (`:5045`), `run_rebase` (`:6903`, `:6916`), `run_compare` (`:12407`, `:12417`), `execute_convert` (`:13255`) and `run_dd` (`:14686`); false for `run_commit` (`:7265`) and `run_check` (`:11662`); `run_info` (`:10715`) stays `Report` and is untouched. Rewrite the comment at `:2989-3010` rather than deleting it: its argument -- that a refusal must never become contingent on whether a parent file happens to exist -- is still exactly right for the callers that still refuse, and is the invariant phase 4 established and phase 11 preserved. State in the commit message which call sites you set each way and why, because that list is the phase's actual policy. No guest change in this step; the refusals are still in `init_chain_states`, so every operation still fails, and the proof of this step is that the host now resolves the parent and the guest still declines it. **Corrected by execution.** This row's claim that nothing user-visible changes is false. Resolving a parent means failing when it is missing or outside the allowlist, so `convert`, `dd`, `compare` and `bench` now fail in the host walk for an orphaned parent instead of reaching the guest's typed refusal; the step is invisible only for a well-formed chain whose parent is present. Three integration tests asserted the old caller-kind scoping and were rewritten along the new policy boundary rather than relaxed, and the six hostile-locator fixtures are now declined by path resolution and the allowlist during discovery, with a per-fixture reason table measured against the built binary and an assertion that no output file is produced. One consequence 14e must close: between these two steps a differencing source fails one way with its parent present and another way without, which is the contingent refusal phase 4 ruled out. Built as `185df853`. |
 | 14e | high | opus | none | Lift the refusal for `convert`, and `dd` with it. Remove the VHD (`src/crates/qcow2/src/lib.rs:13501`) and VHDX (`:13529`) refusals from `init_chain_states`, replacing them with the per-chain judgement 14b made possible: a differencing child with no device behind it *in its own chain* must still be refused, because composing it would read parent-owned sectors from nothing. That is the condition phase 12 proved unsafe to write against `device_count` and 14b makes safe to write against the segmentation. Keep the typed refusal and its status codes (`shared::DifferencingRefusal`) for that case -- it is now a narrower refusal, not a deleted one. Rewrite the host message at `src/vmm/src/main.rs:841-857` per decision 8: name the operation, say that the source's parent could not be composed and why, and drop the `PLAN-differencing.md` citation (F6). Verify with a Python integration test that converts a real differencing VHD and a real differencing VHDX to raw and compares the whole output byte-for-byte against the same chain flattened by the phase 1 oracle or by `instar` reading the parent directly -- a whole-file comparison, not a spot check. Both formats, and a chain of depth 3 for at least one of them. **Execution notes.** No depth-3 fixture exists and `create -b` refuses to stack a child on a child, so the test builds one with `qemu-img rebase -u`. The expectation came from the recorded `*-composed.raw` fixtures rather than the phase 1 oracle, which is absent on the development host and is in any case the wrong reference for the mixed-bitmap VHD child. Built as `42a23cc1`. |
 | 14f | high | opus | none | Lift for `compare`, which is the operation 14b exists for. `compare` packs two independent chains into one device array (`CompareConfig.image1_device_count` / `image2_device_count`, `src/shared/src/lib.rs:2376`) and calls `init_chain_states` once with the total (`src/operations/compare/src/main.rs:215`). The tests that matter are the ones a single-chain test cannot fail: a differencing child as image1 against a raw image2, where the old `dev_idx + 1 >= device_count` form would have composed the child against image2; and both images differencing children of different parents. Assert the comparison verdict, not just that the command exits 0 -- a wrongly composed read can still produce "identical" if both sides are wrong the same way, so one test must compare a differencing chain against its own correctly flattened output and a second must compare it against a deliberately different image and expect a difference at a known offset. **No production change**: 14e's lift already covered `compare`, so this step is the proof rather than the change. Five tests, including the one the brief's point 3 really asked for -- image2 set to qemu's own flattening of the same child, the one file a reader that composed the child against image2 would call identical -- and a four-device, two-chain case built by copying each parent into its own directory and altering one, so the children stay byte-identical and only per-chain descent can move the verdict. Execution found that collapsing the segmentation does not by itself produce silent wrong data, because `read_chain_virtual_cluster`'s own `chain_len` bound refuses the descent, which is why each test pins an exact message or an exact offset rather than a non-zero exit. Built as `969ac5de`. |
-| 14g | medium | sonnet | none | Lift for `bench` and `rebase`. Both read through `init_chain_states` and need no new guest logic once 14e is in: `src/operations/bench/src/main.rs:1395` and `src/operations/rebase/src/main.rs:1201`. `rebase` is the one the master plan did not name (F1), so it needs the most care in testing rather than the least. **Re-scoped by 14e's execution**: `rebase` refuses any overlay that is not qcow2 or vmdk (`src/vmm/src/main.rs:7138`, `rebase: format 'Vhd' does not support rebase`), so "rebasing a differencing VHD or VHDX child" is not a thing this tool does and the brief as first written is untestable. What is testable, and what this step must cover, is a differencing VHD or VHDX sitting in the *backing chain* of a qcow2 overlay being rebased -- the chain is read, so the composition matters, and the test must assert the rebased image's contents rather than that the command completed. 14e also found `rebase` has no `differencing_refusal_error` call site, so a guest refusal reaching it renders a generic message; this step decides whether to add one. **Execution found three production defects in `rebase`, so this step did carry code after all.** The operation's `Cargo.toml` never requested `vhd-input`/`vhdx-input` from its `qcow2` dependency, so the host attached a differencing parent to a binary with no VHD parser; `read_chain_cluster`'s own format allowlist, separate from the crate features, still refused VHD and VHDX once that was fixed; and `dummy_buf` pointed at `CHAIN_CACHES`, the first chain device's own L1/BAT cache slot. That last was documented as safe because `compressed_buf` is never touched in this build -- true for qcow2 and raw, false the moment a VHD chain member exists, because a differencing VHD chunk's mixed-ownership arm uses it as a sub-sector bounce buffer, so the read clobbered the cached BAT sector mid-lookup. It was unreachable before this phase and the first two fixes armed it. `PLANNER_SCRATCH` replaces it, free here because the planner's use of that region is on the mutually exclusive `-u` path. The refusal call site was added. `bench --output json` has no raw byte-count field -- `count` and `buffer-size` echo the arguments rather than measuring -- so the byte-count assertion the plan asked for -- whose point was that a composed read silently serving zeros would otherwise pass -- does not exist, and position probes at each fixture's validated parent-owned and child-owned sectors stand in for it. Built as `c46eef81`. |
+| 14g | medium | sonnet | none | Lift for `bench` and `rebase`. Both read through `init_chain_states` and need no new guest logic once 14e is in: `src/operations/bench/src/main.rs:1395` and `src/operations/rebase/src/main.rs:1201`. `rebase` is the one the master plan did not name (F1), so it needs the most care in testing rather than the least. **Re-scoped by 14e's execution**: `rebase` refuses any overlay that is not qcow2 or vmdk (`src/vmm/src/main.rs:7138`, `rebase: format 'Vhd' does not support rebase`), so "rebasing a differencing VHD or VHDX child" is not a thing this tool does and the brief as first written is untestable. What is testable, and what this step must cover, is a differencing VHD or VHDX sitting in the *backing chain* of a qcow2 overlay being rebased -- the chain is read, so the composition matters, and the test must assert the rebased image's contents rather than that the command completed. 14e also found `rebase` has no `differencing_refusal_error` call site, so a guest refusal reaching it renders a generic message; this step decides whether to add one. **Execution found three production defects in `rebase`, so this step did carry code after all.** The operation's `Cargo.toml` never requested `vhd-input`/`vhdx-input` from its `qcow2` dependency, so the host attached a differencing parent to a binary with no VHD parser; `read_chain_cluster`'s own format allowlist, separate from the crate features, still refused VHD and VHDX once that was fixed; and `dummy_buf` pointed at `CHAIN_CACHES`, the first chain device's own L1/BAT cache slot. That last was documented as safe because `compressed_buf` is never touched in this build -- true for qcow2 and raw, false the moment a VHD chain member exists, because a differencing VHD chunk's mixed-ownership arm uses it as a sub-sector bounce buffer, so the read clobbered the cached BAT sector mid-lookup. It was unreachable before this phase and the first two fixes armed it. A carve of their own replaces it (`CHAIN_READ_COMPRESSED`): review round 3 noted the first fix had handed the same pointer to both `compressed_buf` and `staging_buf`, which was safe only by the order in which the `qcow2` crate happens to touch them, so the two now have separate addresses that alias nothing. The refusal call site was added. `bench --output json` has no raw byte-count field -- `count` and `buffer-size` echo the arguments rather than measuring -- so the byte-count assertion the plan asked for -- whose point was that a composed read silently serving zeros would otherwise pass -- does not exist, and position probes at each fixture's validated parent-owned and child-owned sectors stand in for it. Built as `c46eef81`. |
 | 14h | medium | sonnet | none | Integration-test the boundary this phase draws. Add tests asserting that `map`, `measure` and `check` *still* refuse a differencing source, with their own refusal messages, and that each message satisfies decision 8 -- names its operation and does not claim instar cannot compose. This is the test that stops phase 15 silently inheriting a half-lifted tree, and the test that would have caught `rebase` being missing from the master plan's list. Put them in `tests/test_differencing.py` beside the composition tests, so the two halves of the policy are read together. Also add a case per operation to `tools/mutate-differencing.sh` that re-asserts the refusal, so a future phase cannot lift one of the three by accident. **Execution note.** The tests assert decision 8's two properties -- the message names its own operation, and never reads as a claim about every operation -- rather than pinning `map`'s sentence verbatim, because 14i rewords it; the verbatim pin stays in the older test. `check` is asserted both with and without `--chain`, since it walks a chain only when asked and a gate that differed under the flag would otherwise be invisible. No production change. Built as `416046bd`. |
 | 14i | low | sonnet | none | Documentation and changelog. `CHANGELOG.md`: the five operations that now compose a differencing VHD or VHDX, the three that still refuse, and the three issues closed. `docs/convert.md`, `docs/compare.md`, `docs/bench.md`, `docs/rebase.md` and `docs/dd.md` each gain or lose a differencing limitation -- check what each currently claims rather than assuming, since phase 4 wrote those limitations and some are now false. `docs/map.md:238`'s VHDX partial-present entry and `docs/measure.md` stay as they are and should be checked to confirm they still read as a limitation rather than a plan. `docs/chain-discovery.md` describes the host walk and now needs the per-call capability (decision 5). Do not update `ARCHITECTURE.md` -- no component or data path changes -- and do not update `AGENTS.md` unless 14b's `ChainConfig` version bump creates a convention an agent could not infer, in which case one line about the version is the whole change. **Execution notes.** Nine user-visible plan citations, not the eight the Definition of done counted: the `create --sector-size` message spans a non-quoted continuation line that the criterion's own grep misses. Four files beyond the named list -- `docs/create.md`, `docs/guest-architecture.md`, `docs/format-coverage.md` and `docs/info.md` -- asserted that nothing in instar composes a differencing source, which is false for five operations, and were corrected. `docs/quirks.md`'s claim that `info --chain` reports a one-image chain was already false before this phase began, which is drift from phase 11 or 13 rather than anything 14a to 14h did. `AGENTS.md` was left alone: the `ChainConfig` version bump uses an already-documented versioned-struct pattern and is not a new convention. Built as `b0ba64b8`. |
 
@@ -603,3 +603,92 @@ Declined, with the reason:
   comment at the config write now names the guard that makes the two
   sources agree, since the guard is 90 lines above and a reader at the
   write cannot see it.
+
+## Review round 3
+
+Six items: one `fix`, one `document`, four `consider`. Five taken, one
+declined and filed. The round's shape changed: where rounds 1 and 2
+found claims the plan or the changelog got wrong, this one found two
+genuine defects in code the earlier rounds had added.
+
+* **The overlap check never reached `map` or `measure`** (issue #634).
+  `CHANGELOG.md` said it reached "`convert`, `dd`, `compare`, `bench`
+  and `map`", which was wrong twice: `map` walks the BAT through
+  `classify_vhdx_bat_entry` in `map_extents` and applies no overlap
+  test, and `rebase` -- which does reach it -- was missing from the
+  list. `measure` is in the same position as `map` via
+  `scan_allocation`. There are exactly three callers of
+  `block_overlaps_a_declared_region`, all inside `block_lookup` and
+  `sector_bitmap_lookup`, so the reach is enumerable rather than
+  argued. Both documents now say which operations apply the rule and
+  that two do not, and the divergence -- `convert` refusing an image
+  `map` still reports as data -- is filed rather than closed here,
+  because changing `map`'s output for a malformed image is a
+  behaviour change to an operation this phase deliberately leaves
+  non-composing. Phase 15 revisits all three readers.
+
+* **`ranges_overlap` refused on an empty region, inconsistently.**
+  With `region_len == 0` the predicate reduced to `offset <
+  region_offset < end`: a zero-length entry at or below a block's
+  start was waved through, one whose offset fell strictly inside the
+  block refused it. A region naming no bytes can hide nothing, so the
+  refusal bought no safety, and `init` does not reject a zero-length
+  entry, so a hostile image can reach it. Empty ranges are now
+  answered before either sum is formed. This also falsified a comment
+  round 2 added, which claimed a zero-length region "intersects
+  nothing" -- true only of the offset-0 entries that comment's own
+  fixture carried.
+
+* **The two chain-read bounce buffers shared one address.** Round 1
+  moved them off `CHAIN_CACHES`, which was the real defect, but
+  handed `read_chain_virtual_cluster` the same pointer for
+  `compressed_buf` and `staging_buf`. Those are separate parameters
+  with separate lifetimes; sharing was safe only because no arm of
+  the chain reader uses both at once, which is a property of call
+  ordering inside the `qcow2` crate and invisible from `rebase`. They
+  have their own carve now (`CHAIN_READ_COMPRESSED`,
+  `CHAIN_READ_STAGING`), above every other carve, aliasing nothing --
+  not each other, not a device's cache, not the DMG chunk-table
+  scratch. They do not both fit inside `PLANNER_SCRATCH_LIMIT`, which
+  is 64 KiB short of `COMPRESSED_BUF_SIZE + MAX_CLUSTER_SIZE`, so
+  reusing that carve was not an option. Two static asserts hold the
+  new carve below the allocator heap and above the carve it follows.
+
+  No mutation case guards the separation, and the attempt to add one
+  is the reason why: a case pointing `staging_buf` back at
+  `compressed_buf` was written, run, and came back FAIL -- the
+  differencing rebase suite still passed against it. That is the same
+  statement the review made, measured rather than argued: no current
+  behaviour distinguishes the two layouts, which is exactly why this
+  was a latent hazard and not a bug. The case was dropped rather than
+  shipped as a permanent FAIL, since the harness has no survivor
+  variant for integration cases and building one to hold a single
+  comment is not worth the machinery. What holds the separation is
+  the two constants and the static asserts, checked at compile time;
+  the carve's doc comment records that a mutation survives it, so the
+  next reader does not collapse them back on the grounds that nothing
+  fails. The one case this round did add -- the empty-region answer --
+  takes the harness from 90 to 91.
+
+* **The composing refusal said "source".** For `rebase` the
+  differencing image is never the source -- the overlay must be qcow2
+  or vmdk -- so the sentence was wrong every time `rebase` rendered
+  it, and wrong for a `convert` or `compare` of a qcow2 overlay whose
+  backing is a parentless differencing image. It now says "a
+  differencing {fmt} image in the chain {op} was given has no parent
+  behind it", which holds whether the differencing image is the
+  source or a backing member. The non-composing arm keeps "source",
+  and that is not an oversight: `validate_chain` never runs the
+  VHD/VHDX validators that hold `refuse_differencing`, so `map`,
+  `measure` and `check` only ever refuse the image the user named.
+
+Declined, with the reason:
+
+* **An integration fixture for a parentless differencing VHDX**
+  (issue #635). The gap is real -- the narrowed refusal is only driven
+  end to end for VHD -- but it is a fixture gap, not a test gap.
+  `qemu-img` will not create a differencing VHDX, `instar create -b`
+  refuses a differencing backing file, and copying `vhdx-diff-child`
+  without its parent exercises the unresolvable-parent path instead.
+  It needs a hand-built image in `instar-testdata`, the same family as
+  #631, and the two are blocked on the same thing.

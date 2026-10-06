@@ -310,24 +310,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- **Every VHDX read refuses a payload block that overlaps a region the
-  image declares.** A VHDX region table names where the BAT, the
-  metadata region and any other region the writer declared live. A BAT
-  entry whose block runs into one of those is describing payload data
-  on top of the image's own structure, which no conforming writer
-  emits; instar previously only refused a block below a fixed 1 MiB
-  floor, which could not tell real payload from the BAT of a small
-  image. Blocks are now checked against the declared region table
-  instead — its first eight entries, which is the same cap the region
-  scan uses to locate the BAT and the metadata region, so neither of
-  those can be declared outside the checked set without the image
+- **Every VHDX read through the chain walker refuses a payload block
+  that overlaps a region the image declares.** A VHDX region table names
+  where the BAT, the metadata region and any other region the writer
+  declared live. A BAT entry whose block runs into one of those is
+  describing payload data on top of the image's own structure, which no
+  conforming writer emits; instar previously only refused a block below
+  a fixed 1 MiB floor, which could not tell real payload from the BAT of
+  a small image. Blocks are now checked against the declared region
+  table instead — its first eight entries, which is the same cap the
+  region scan uses to locate the BAT and the metadata region, so neither
+  of those can be declared outside the checked set without the image
   failing to open — and the same test guards the sector-bitmap blocks a
   differencing child reads.
 
   This is a behaviour change for plain dynamic VHDX too, not only for
   the differencing images it was found on: the check runs in
   `block_lookup` whatever the image says about a parent, so it reaches
-  `convert`, `dd`, `compare`, `bench` and `map`. A well-formed image is
+  `convert`, `dd`, `compare`, `bench` and `rebase` — every operation
+  that reads VHDX payload through the guest chain walker. It does not
+  reach `map` or `measure`, which classify BAT entries through
+  `classify_vhdx_bat_entry` in `map_extents` and `scan_allocation` and
+  run no overlap test, so a malformed image `convert` now refuses is
+  still mapped as data by `map` (issue #634). A well-formed image is
   unaffected — the region table and the payload cannot legally overlap
   — but a malformed or hostile one that instar used to read now fails
   the read instead. A region entry whose own `offset + length`

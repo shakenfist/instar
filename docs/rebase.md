@@ -167,9 +167,9 @@ refuses the detach with the same typed message the other composing
 operations use:
 
 ```
-rebase: source is a differencing <VHD|VHDX> image with no parent in the
-chain rebase was given, so the sectors it leaves to its parent could not
-be composed
+rebase: a differencing <VHD|VHDX> image in the chain rebase was given
+has no parent behind it, so the sectors it leaves to its parent could
+not be composed
 ```
 
 ## Known divergences from `qemu-img rebase`

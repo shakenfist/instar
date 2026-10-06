@@ -588,9 +588,9 @@ If the source's own chain has no parent to read, `bench` still refuses
 it:
 
 ```
-bench: source is a differencing <VHD|VHDX> image with no parent in the
-chain bench was given, so the sectors it leaves to its parent could not
-be composed
+bench: a differencing <VHD|VHDX> image in the chain bench was given has
+no parent behind it, so the sectors it leaves to its parent could not be
+composed
 ```
 
 and exits 1. A parent reference that cannot be resolved — the file is

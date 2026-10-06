@@ -9842,9 +9842,12 @@ mod tests {
         let eighth = rt1_base + vhdx::REGION_TABLE_HEADER_SIZE + 7 * vhdx::REGION_TABLE_ENTRY_SIZE;
 
         // Entries 2 to 6 stay as the fixture leaves them: all-zero
-        // GUID, offset 0, length 0. A zero-length region is a half-open
-        // range that intersects nothing, so they neither refuse a block
-        // themselves nor stop the scan reaching the eighth entry.
+        // GUID, offset 0, length 0. A zero-length region intersects
+        // nothing, so they neither refuse a block themselves nor stop
+        // the scan reaching the eighth entry --
+        // `vhdx_zero_length_region_inside_a_block_does_not_refuse_it`
+        // below is what holds that, and holds it for an offset inside
+        // the block rather than only for offset 0.
         let fixture = build_vhdx_image(512, false, 1, &[(0, VhdxBlockState::FullyPresent)], &[]);
         let payload = fixture.block_offsets[0];
         let mut bytes = fixture.bytes;
@@ -9886,6 +9889,54 @@ mod tests {
         assert_eq!(
             out, want,
             "the control must be served from the image's own payload"
+        );
+    }
+
+    // A region entry declaring zero length names no bytes, so it
+    // cannot be overlapped. The offset matters: the old predicate
+    // reduced to `offset < region_offset < end` for an empty region,
+    // which waved through an entry at or below the block's start and
+    // refused one whose offset fell strictly inside the block. A
+    // region that names nothing can hide nothing, so refusing on it
+    // bought no safety and contradicted the documented half-open
+    // semantics. `init` does not reject a zero-length entry, so this
+    // is reachable from a hostile image rather than hypothetical.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_zero_length_region_inside_a_block_does_not_refuse_it() {
+        let fixture = build_vhdx_image(512, false, 1, &[(0, VhdxBlockState::FullyPresent)], &[]);
+        let payload = fixture.block_offsets[0];
+        let mut bytes = fixture.bytes;
+
+        // A third, unrecognised region entry of length zero, declared
+        // strictly inside the payload block this read wants -- the one
+        // position the old predicate got wrong.
+        let inside = payload + 4096;
+        assert!(
+            inside > payload && inside < payload + u64::from(VHDX_FIX_BLOCK_SIZE),
+            "the probe offset must fall strictly inside the payload block"
+        );
+        let rt1_base = vhdx::REGION_TABLE1_OFFSET as usize;
+        let entry_count_off = rt1_base + vhdx::REGION_TABLE_ENTRY_COUNT_OFFSET;
+        bytes[entry_count_off..entry_count_off + 4].copy_from_slice(&3u32.to_le_bytes());
+        let third = rt1_base + vhdx::REGION_TABLE_HEADER_SIZE + 2 * vhdx::REGION_TABLE_ENTRY_SIZE;
+        bytes[third..third + 16].copy_from_slice(&[0xCCu8; 16]);
+        bytes[third + 16..third + 24].copy_from_slice(&inside.to_le_bytes());
+        bytes[third + 24..third + 28].copy_from_slice(&0u32.to_le_bytes());
+
+        let lone = vhdx_chain_alone(bytes);
+        let (ok, out) = run_vhdx_chain_read(&lone, 512, 0, VHDX_CHUNK);
+        assert!(
+            ok,
+            "a region declaring zero length names no bytes and must not \
+             refuse the block its offset falls inside"
+        );
+        let want: std::vec::Vec<u8> = (0..VHDX_CHUNK)
+            .map(|i| vhdx_child_byte(payload + i))
+            .collect();
+        assert_eq!(
+            out, want,
+            "the block must still be served from the image's own payload"
         );
     }
 

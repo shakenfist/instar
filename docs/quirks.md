@@ -4663,9 +4663,9 @@ The refusal sentence these five now use when their own chain has no
 parent to read (measured against the built binary):
 
 ```
-<op>: source is a differencing <VHD|VHDX> image with no parent in the
-chain <op> was given, so the sectors it leaves to its parent could not
-be composed
+<op>: a differencing <VHD|VHDX> image in the chain <op> was given has no
+parent behind it, so the sectors it leaves to its parent could not be
+composed
 ```
 
 `map`, `measure` and `check` go on refusing every differencing source

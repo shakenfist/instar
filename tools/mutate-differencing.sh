@@ -682,7 +682,7 @@ self_test() {
 # phase's definition of done asks the two to stay in step, which until
 # now was a promise kept by hand. Asserting it makes the drift a
 # failure instead of a documentation bug nobody reads.
-EXPECTED_CASES=90
+EXPECTED_CASES=91
 
 check_case_count() {
     # Only meaningful for a whole run; a selection is expected to be short.
@@ -1597,6 +1597,23 @@ rust_case 'vhdx-read-overlap-replaced-by-a-high-water-mark' "${VHDX_READ_LIB}" \
     qcow2 'vhdx_arm_block_before_a_trailing_region_is_not_refused' \
     --features "${QCOW2_FEATURES}"
 
+# A region declaring zero length names no bytes, so it overlaps
+# nothing. Dropping the early answer restores a predicate that reduced
+# to `offset < region_offset < end` for an empty region: it waved
+# through an entry at or below the block's start and refused one whose
+# offset fell strictly inside the block. Every case above keeps passing,
+# because the only zero-length entries they carry sit at offset 0.
+
+rust_case 'vhdx-read-empty-region-not-answered-early' "${VHDX_READ_LIB}" \
+    '    if len == 0 || region_len == 0 {
+        return false;
+    }' \
+    '    if false { // MUTATED: empty ranges no longer answered early
+        return false;
+    }' \
+    qcow2 'vhdx_zero_length_region_inside_a_block_does_not_refuse_it' \
+    --features "${QCOW2_FEATURES}"
+
 # --- VHDX: the device a mixed chunk resumes on -----------------------
 
 rust_case 'vhdx-read-mixed-arm-pins-device-zero' "${QCOW2_LIB}" \
@@ -1811,15 +1828,15 @@ integration_case 'rebase-read-chain-cluster-vhd-vhdx-disallowed' "${REBASE_OP}" 
     '            ImageFormat::Qcow2 | ImageFormat::Raw => {} // MUTATED' \
     "${REBASE_DETACH}"
 
-# `compressed_buf`/`staging_buf` pointed back at `CHAIN_CACHES`,
-# aliasing the first chain device's own L1/BAT cache slot. A
-# differencing VHD chunk's mixed-ownership arm genuinely writes
-# through that parameter as its sub-sector bounce buffer, so the
-# alias corrupts the cached sector mid-lookup -- the actual defect
-# this step found and fixed, now pinned by the test that caught it.
-integration_case 'rebase-dummy-buf-aliases-chain-caches' "${REBASE_OP}" \
-    '    let dummy_buf = PLANNER_SCRATCH as *mut u8;' \
-    '    let dummy_buf = CHAIN_CACHES as *mut u8; // MUTATED' \
+# `compressed_buf` pointed back at `CHAIN_CACHES`, aliasing the first
+# chain device's own L1/BAT cache slot. A differencing VHD chunk's
+# mixed-ownership arm genuinely writes through that parameter as its
+# sub-sector bounce buffer, so the alias corrupts the cached sector
+# mid-lookup -- the actual defect this step found and fixed, now
+# pinned by the test that caught it.
+integration_case 'rebase-compressed-buf-aliases-chain-caches' "${REBASE_OP}" \
+    '    let compressed_buf = CHAIN_READ_COMPRESSED as *mut u8;' \
+    '    let compressed_buf = CHAIN_CACHES as *mut u8; // MUTATED' \
     "${REBASE_DETACH}"
 
 # Only the first chain gets a segment, so a rebase carrying both an

@@ -226,11 +226,25 @@ config for the common case of one chain over `n` devices.
 
 ## Per-Operation Usage
 
-| Operation | How it uses chain config |
-|-----------|------------------------|
-| **convert** | Reads each device's format to select the appropriate chain reader (QCOW2 cluster lookup, VMDK grain lookup, or raw sector read). Walks the chain to flatten backing files into a standalone output image. |
-| **compare** | Reads format for both comparison sides. For QCOW2/VMDK images, walks the backing chain to resolve unallocated clusters/grains before comparing virtual content. Supports multi-level chains on both sides. |
-| **check --chain** | Validates each backing image's format consistency, virtual size, and header integrity (QCOW2 magic, version, table bounds). Reports chain errors separately from primary image errors. |
+The `Segments` column is how many `ChainSegment` entries the host writes.
+One segment means every device is behind the one before it; two means the
+operation attached two unrelated chains, and the guest must not treat the
+first device of the second as a parent of the last device of the first.
+
+| Operation | Segments | How it uses chain config |
+|-----------|----------|------------------------|
+| **convert** / **dd** | 1 | Reads each device's format to select the appropriate chain reader (QCOW2 cluster lookup, VMDK grain lookup, VHD or VHDX BAT lookup, or raw sector read). Walks the chain to flatten backing files into a standalone output image. `dd` shares convert's guest binary and so its chain handling. |
+| **compare** | 2 | Reads format for both comparison sides, one segment each. Walks each side's own backing chain to resolve unallocated clusters, grains or blocks before comparing virtual content. Supports multi-level chains on both sides. |
+| **rebase** | 1 or 2 | A detach (`-b ''`) attaches the old chain's parents only, so one segment. A rebase onto a new backing (`-b NEW`) attaches the old chain and the new one, which are unrelated, so two. The overlay itself is the output device, not an input. |
+| **bench** | 1 | Reads the source's chain so a benchmarked read resolves through it rather than against the top image alone. |
+| **commit** | 1 | Attaches the backing chain's parents behind the overlay; the backing being committed into is the output device. |
+| **check --chain** | 1 | Validates each backing image's format consistency, virtual size, and header integrity (QCOW2 magic, version, table bounds). Reports chain errors separately from primary image errors. |
+
+The chain walkers that `convert`, `dd`, `compare`, `bench` and `rebase`
+share also compose a differencing VHD or VHDX member against its parent,
+descending for the sectors the member's bitmap leaves to the parent.
+`map`, `measure` and `check` read an image on its own and refuse a
+differencing source by name instead.
 
 ## Format-Specific Notes
 

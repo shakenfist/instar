@@ -855,9 +855,19 @@ impl SerialDecoder {
                     _ => "image",
                 };
                 match composition {
+                    // "in the chain {op} was given" rather than
+                    // "source is": for `rebase` the differencing image
+                    // is never the source, because the overlay must be
+                    // qcow2 or vmdk, so this fires only for a member of
+                    // the old or new backing chain. The same holds for
+                    // a `convert` or `compare` of a qcow2 overlay whose
+                    // backing is a parentless differencing image. The
+                    // source is in the chain it was given, so this
+                    // wording stays true when the source *is* the
+                    // differencing image.
                     DifferencingComposition::Supported => format!(
-                        "{op}: source is a differencing {format_name} image with no \
-                         parent in the chain {op} was given, so the sectors it leaves \
+                        "{op}: a differencing {format_name} image in the chain {op} \
+                         was given has no parent behind it, so the sectors it leaves \
                          to its parent could not be composed"
                     ),
                     DifferencingComposition::Unsupported => format!(
@@ -977,19 +987,13 @@ mod guest_exception_tests {
         decoder.last_differencing_refusal = Some(shared::DifferencingRefusal::STATUS_VHD);
         let msg = decoder
             .differencing_refusal_error("convert", super::DifferencingComposition::Supported);
-        assert!(
-            msg.contains("convert: source is a differencing VHD image"),
-            "{msg}"
-        );
+        assert!(msg.contains("convert: a differencing VHD image"), "{msg}");
 
         let mut decoder = super::SerialDecoder::new();
         decoder.last_differencing_refusal = Some(shared::DifferencingRefusal::STATUS_VHDX);
         let msg = decoder
             .differencing_refusal_error("compare", super::DifferencingComposition::Supported);
-        assert!(
-            msg.contains("compare: source is a differencing VHDX image"),
-            "{msg}"
-        );
+        assert!(msg.contains("compare: a differencing VHDX image"), "{msg}");
     }
 
     /// The two halves of a half-lifted tree must not contradict each
@@ -1007,7 +1011,7 @@ mod guest_exception_tests {
         let composing = decoder
             .differencing_refusal_error("convert", super::DifferencingComposition::Supported);
         assert!(
-            composing.contains("no parent in the chain convert was given"),
+            composing.contains("in the chain convert was given has no parent behind it"),
             "{composing}"
         );
 
@@ -1018,7 +1022,7 @@ mod guest_exception_tests {
             "{refusing}"
         );
         assert!(
-            !refusing.contains("no parent in the chain"),
+            !refusing.contains("chain"),
             "an operation that never resolves a parent must not blame the \
              chain for lacking one: {refusing}"
         );
