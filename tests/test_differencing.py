@@ -833,7 +833,7 @@ class TestDifferencingBenchComposes(DifferencingTestBase):
 
     def test_bench_reads_to_the_end_of_the_full_virtual_size(self):
         """A single request at (virtual_size - bufsize) must succeed."""
-        for image_id, _golden_id, format_name in COMPOSED_CHAIN_FIXTURES:
+        for image_id, _golden_id, _format_name in COMPOSED_CHAIN_FIXTURES:
             with self.subTest(image=image_id):
                 source = self.differencing_image(image_id)
                 offset = IMAGE_VIRTUAL_SIZE - self.BENCH_BUFSIZE
@@ -863,7 +863,7 @@ class TestDifferencingBenchComposes(DifferencingTestBase):
         failure here points specifically at the parent-descending
         half of composition rather than at reading the chain at all.
         """
-        for image_id, _golden_id, format_name in COMPOSED_CHAIN_FIXTURES:
+        for image_id, _golden_id, _format_name in COMPOSED_CHAIN_FIXTURES:
             parent_sector, child_sector = CHAIN_PROBE_SECTORS[image_id]
             for label, sector in (('parent', parent_sector), ('child', child_sector)):
                 with self.subTest(image=image_id, owner=label):
@@ -1722,10 +1722,11 @@ class TestDifferencingNonComposingRefusalPolicy(DifferencingTestBase):
     here are not duplicating that: they name the two properties that
     sentence has to keep -- naming its own operation, and never reading as
     a claim about every operation -- independently of its exact wording.
-    `map` keeps its own, older sentence, which is pinned verbatim in
-    `TestDifferencingMapStillRefuses` below and is due to be reworded, so
-    its test here checks the same two properties without pinning text that
-    is about to change.
+    `map` keeps its own, separate sentence rather than the one
+    `expected_non_composing_refusal` renders, and that sentence is pinned
+    verbatim in `TestDifferencingMapStillRefuses` below. Its test here
+    checks the same two properties rather than the wording, so a
+    rewording of `map`'s sentence cannot quietly drop one of them.
 
     A reader told only "composition is not supported" has no way to tell
     whether that is true of the command they just typed or of every
@@ -1984,13 +1985,14 @@ class TestDifferencingMapStillRefuses(DifferencingTestBase):
         about every operation in the tool.
 
         `test_map_refuses_with_its_own_message` above pins `MAP_REFUSAL`
-        verbatim, including its citation of a planning document that is
-        due to be dropped from the rendered text. That citation's removal
-        is a wording change, not a policy change, so this test is written
-        against the two properties the wording has to keep rather than
-        against the sentence itself: it must still pass once the sentence
-        is reworded, and should only fail if a rewording drops one of the
-        two properties.
+        verbatim. This test is written against the two properties that
+        sentence has to keep rather than against the sentence itself, so
+        a rewording -- a wording change, not a policy change -- passes
+        here and fails only if it drops one of the two properties.
+
+        That separation earned its keep when `map`'s sentence was
+        reworded to stop citing a planning document: the verbatim pin
+        above had to be updated and this test did not.
         """
         self.assertTrue(DIFFERENCING_FIXTURES, 'DIFFERENCING_FIXTURES must not be empty')
         for image_id, _format_name in DIFFERENCING_FIXTURES:

@@ -682,7 +682,7 @@ self_test() {
 # phase's definition of done asks the two to stay in step, which until
 # now was a promise kept by hand. Asserting it makes the drift a
 # failure instead of a documentation bug nobody reads.
-EXPECTED_CASES=88
+EXPECTED_CASES=90
 
 check_case_count() {
     # Only meaningful for a whole run; a selection is expected to be short.
@@ -1559,6 +1559,44 @@ rust_case 'vhdx-read-overlap-check-gated-on-has-parent' "${VHDX_READ_LIB}" \
     qcow2 'vhdx_arm_dynamic_block_inside_a_declared_region_is_refused' \
     --features "${QCOW2_FEATURES}"
 
+# "Any entry in the region table" is any of the first eight, and the
+# two entries every fixture writes both sit at the front -- so the
+# claim rested on entries no test had ever moved. Stopping the scan
+# after the BAT and metadata entries leaves every case above passing.
+
+rust_case 'vhdx-read-region-scan-stops-before-the-eighth-entry' "${VHDX_READ_LIB}" \
+    '        let mut region_count: u32 = 0;
+
+        for i in 0..entry_count.min(8) {' \
+    '        let mut region_count: u32 = 0;
+
+        for i in 0..entry_count.min(2) { // MUTATED: scan stops after BAT + metadata' \
+    qcow2 'vhdx_overlap_check_covers_the_eighth_region_table_entry' \
+    --features "${QCOW2_FEATURES}"
+
+# The regression the overlap test exists to prevent, which none of the
+# cases above can catch: a bound that refuses everything below the end
+# of the highest region. Every "inside a region" case still passes
+# under it, because a block inside a region is also below that mark.
+# Only a region declared *after* the blocks tells the two apart.
+
+rust_case 'vhdx-read-overlap-replaced-by-a-high-water-mark' "${VHDX_READ_LIB}" \
+    '        self.regions[..self.region_count as usize]
+            .iter()
+            .any(|&(region_offset, region_length)| {
+                ranges_overlap(offset, len, region_offset, region_length)
+            })' \
+    '        // MUTATED: overlap test replaced by a high-water mark
+        let _ = len;
+        let mark = self.regions[..self.region_count as usize]
+            .iter()
+            .map(|&(region_offset, region_length)| region_offset + u64::from(region_length))
+            .max()
+            .unwrap_or(0);
+        offset < mark' \
+    qcow2 'vhdx_arm_block_before_a_trailing_region_is_not_refused' \
+    --features "${QCOW2_FEATURES}"
+
 # --- VHDX: the device a mixed chunk resumes on -----------------------
 
 rust_case 'vhdx-read-mixed-arm-pins-device-zero' "${QCOW2_LIB}" \
@@ -1810,26 +1848,17 @@ integration_case 'rebase-second-chain-gets-no-segment' "${VMM_MAIN}" \
 # still fails the run, but renders the pre-existing generic
 # ERROR_PARSE_FAILED text ("the overlay's header could not be
 # parsed") instead of naming the format and the reason.
+# The needle is the refusal block alone. It used to run on through the
+# end of the function and into the next one's doc comment, which made
+# the case BROKEN whenever that unrelated comment was edited. The
+# `("rebase", ...)` argument pair is what makes this unique.
 integration_case 'rebase-differencing-refusal-call-site-removed' "${VMM_MAIN}" \
     '    if serial_decoder.last_differencing_refusal.is_some() {
         return Err(serial_decoder
             .differencing_refusal_error("rebase", DifferencingComposition::Supported)
             .into());
-    }
-    if !result_seen {
-        return Err(serial_decoder.no_result_error("rebase").into());
-    }
-    Ok(harvested)
-}
-
-/// Map a u32 image-format code (as stored in CommitConfig and' \
-    '    if !result_seen { // MUTATED: differencing_refusal_error call site removed
-        return Err(serial_decoder.no_result_error("rebase").into());
-    }
-    Ok(harvested)
-}
-
-/// Map a u32 image-format code (as stored in CommitConfig and' \
+    }' \
+    '    // MUTATED: differencing_refusal_error call site removed' \
     "${REBASE_REFUSAL}"
 
 # ---------------------------------------------------------------------

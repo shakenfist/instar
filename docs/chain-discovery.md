@@ -242,9 +242,10 @@ The chain discovery infrastructure is used by the following operations:
   or parent-owned sectors, producing a standalone output image with no
   backing dependencies.
 - **`instar bench`** / **`instar rebase`** - Also resolve a differencing VHD
-  or VHDX parent in the chain they read, so a benchmark or a rebase detach
-  reads every sector the virtual size covers rather than silently skipping
-  the ones the top image leaves to its parent.
+  or VHDX parent in the chain they read, so the sectors the top image
+  leaves to its parent are served from the parent rather than silently
+  skipped. A rebase detach covers the whole virtual size; a benchmark
+  covers only the offsets it was asked to read.
 
 ## Known limitations
 

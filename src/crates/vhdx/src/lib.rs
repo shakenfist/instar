@@ -1914,6 +1914,15 @@ pub struct VhdxState {
     /// table declares, recognised or not, up to the same eight-entry
     /// cap `init` itself scans (`entry_count.min(8)`).
     ///
+    /// SPEC(VHDX) allows a region table up to 2047 entries, so that cap
+    /// leaves later entries out of the overlap test. It is not a place
+    /// to hide a region this reader relies on: the same scan is what
+    /// sets `found_bat` and `found_metadata`, and `init` returns `None`
+    /// when either is missing, so an image declaring the BAT or the
+    /// metadata region past the eighth entry does not open. What a
+    /// longer table can keep out of the test is an *unrecognised*
+    /// region, whose bytes nothing here reads as structure.
+    ///
     /// A payload or sector bitmap block must not overlap any of
     /// these: an entry naming a block inside the BAT or metadata
     /// region is just as malformed as one naming the file identifier,

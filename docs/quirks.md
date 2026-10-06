@@ -4656,7 +4656,7 @@ crates had already gained. `info`, `create -b`, `map`, `measure` and
 | convert | Succeeds, rc 0; output is byte-identical to the chain flattened by hand | Refuses, rc 1, no output file |
 | dd | Succeeds, rc 0 (shares convert's guest binary) | Refuses, rc 1, same sentence as convert |
 | compare | Succeeds, rc 0, each side composed against its own chain | Refuses, rc 1, same sentence as convert |
-| bench | Succeeds, rc 0, reads every sector the virtual size covers | Refuses, rc 1, same sentence as convert |
+| bench | Succeeds, rc 0; a benchmarked read of a parent-owned sector is served from the parent, not skipped or zero-filled | Refuses, rc 1, same sentence as convert |
 | rebase | Composes a differencing source only if one sits in the backing chain being read (never as the overlay itself — `rebase` already refuses any overlay that is not qcow2 or vmdk) | Refuses, rc 1, same sentence as convert |
 
 The refusal sentence these five now use when their own chain has no

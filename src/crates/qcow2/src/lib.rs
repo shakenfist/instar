@@ -9822,6 +9822,73 @@ mod tests {
         );
     }
 
+    // The overlap test covers every entry the region scan reads, not
+    // only the BAT and metadata entries every writer emits. The scan
+    // stops at eight, which is what the docs now say and what this
+    // pins: a region declared in the eighth entry is as real to the
+    // check as one declared in the first. Without it, "any entry in
+    // the region table" rested on the two entries a fixture always
+    // writes, both of which sit at the front.
+    //
+    // Patching entries in place needs no checksum fixup:
+    // `VhdxState::init` deliberately skips the region table's CRC-32C
+    // and validates entry contents instead, leaving the full CRC to
+    // the `check` operation.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_overlap_check_covers_the_eighth_region_table_entry() {
+        let rt1_base = vhdx::REGION_TABLE1_OFFSET as usize;
+        let entry_count_off = rt1_base + vhdx::REGION_TABLE_ENTRY_COUNT_OFFSET;
+        let eighth = rt1_base + vhdx::REGION_TABLE_HEADER_SIZE + 7 * vhdx::REGION_TABLE_ENTRY_SIZE;
+
+        // Entries 2 to 6 stay as the fixture leaves them: all-zero
+        // GUID, offset 0, length 0. A zero-length region is a half-open
+        // range that intersects nothing, so they neither refuse a block
+        // themselves nor stop the scan reaching the eighth entry.
+        let fixture = build_vhdx_image(512, false, 1, &[(0, VhdxBlockState::FullyPresent)], &[]);
+        let payload = fixture.block_offsets[0];
+        let mut bytes = fixture.bytes;
+        bytes[entry_count_off..entry_count_off + 4].copy_from_slice(&8u32.to_le_bytes());
+        bytes[eighth..eighth + 16].copy_from_slice(&[0xBBu8; 16]);
+        bytes[eighth + 16..eighth + 24].copy_from_slice(&payload.to_le_bytes());
+        bytes[eighth + 24..eighth + 28].copy_from_slice(&VHDX_FIX_BLOCK_SIZE.to_le_bytes());
+        let lone = vhdx_chain_alone(bytes);
+        let (ok, _out) = run_vhdx_chain_read(&lone, 512, 0, VHDX_CHUNK);
+        assert!(
+            !ok,
+            "a payload block overlapping the region declared in the eighth \
+             region table entry must be refused, the same as one overlapping \
+             the first"
+        );
+
+        // The control, so the refusal above is that entry's range and
+        // not the mere presence of six more entries: the same
+        // eight-entry table, with the eighth region declared past the
+        // end of the file instead of over the payload, still reads.
+        let fixture = build_vhdx_image(512, false, 1, &[(0, VhdxBlockState::FullyPresent)], &[]);
+        let payload = fixture.block_offsets[0];
+        let mut bytes = fixture.bytes;
+        let past_the_end = bytes.len() as u64;
+        bytes[entry_count_off..entry_count_off + 4].copy_from_slice(&8u32.to_le_bytes());
+        bytes[eighth..eighth + 16].copy_from_slice(&[0xBBu8; 16]);
+        bytes[eighth + 16..eighth + 24].copy_from_slice(&past_the_end.to_le_bytes());
+        bytes[eighth + 24..eighth + 28].copy_from_slice(&VHDX_FIX_BLOCK_SIZE.to_le_bytes());
+        let lone = vhdx_chain_alone(bytes);
+        let (ok, out) = run_vhdx_chain_read(&lone, 512, 0, VHDX_CHUNK);
+        assert!(
+            ok,
+            "an eight-entry region table whose eighth region clears every \
+             block must still read"
+        );
+        let want: std::vec::Vec<u8> = (0..VHDX_CHUNK)
+            .map(|i| vhdx_child_byte(payload + i))
+            .collect();
+        assert_eq!(
+            out, want,
+            "the control must be served from the image's own payload"
+        );
+    }
+
     // A differencing child over a differencing VHDX parent over a raw
     // device. Every other composing test here puts a raw device behind
     // the child, so the Mixed arm always recursed into a format that is

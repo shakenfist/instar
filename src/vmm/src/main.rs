@@ -12903,6 +12903,19 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     }
     guest_mem.write_obj(COMPARE_CONFIG_MAGIC, GuestAddress(OPERATION_CONFIG_ADDR))?;
     guest_mem.write_obj(compare_flags, GuestAddress(OPERATION_CONFIG_ADDR + 4))?;
+    // These two counts come from `total_devices()`, while the
+    // ChainConfig segments further down come from what the entry
+    // writer reports it wrote. The two cannot disagree: truncation in
+    // the entry writer is the only thing that would separate them, and
+    // the combined-depth check above has already refused anything that
+    // would truncate, naming both chain depths and the limit.
+    // `total_devices()` counts exactly the slots that writer emits --
+    // one per image plus one per external data file.
+    //
+    // Deriving these from the written counts instead would be a
+    // regression rather than a tightening: it would turn that refusal
+    // into a silently truncated comparison, which is the one answer
+    // `compare` must never give.
     guest_mem.write_obj(
         chain1.total_devices() as u32,
         GuestAddress(OPERATION_CONFIG_ADDR + 8),

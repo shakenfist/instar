@@ -578,9 +578,11 @@ divergence registry, see `KNOWN_BENCH_DIVERGENCES` at the top of
 
 A differencing VHD (footer disk type 4) or VHDX (`HasParent` set) stores
 only the sectors that differ from a parent image. `bench` composes such a
-source against its parent, so a benchmark run against a differencing
-chain reads every sector the virtual size covers — parent-owned sectors
-included — rather than silently skipping them.
+source against its parent, so a read of a parent-owned sector is served
+from the parent rather than silently skipped or zero-filled. `bench`
+reads the offsets and counts it was asked for, not the whole virtual
+size: composition changes what a benchmarked read returns, not how much
+of the image a benchmark covers.
 
 If the source's own chain has no parent to read, `bench` still refuses
 it:

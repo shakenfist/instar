@@ -133,7 +133,16 @@ range overlaps any entry in the region table — the BAT region, the
 metadata region, or anything else the writer declared, recognised by
 instar or not. A conforming writer never places payload on top of the
 structures the image declares, so this costs a well-formed image
-nothing; a malformed one is refused rather than read. A BAT entry
+nothing; a malformed one is refused rather than read.
+
+"Any entry" is any of the first eight, which is the same cap the region
+scan itself uses; SPEC(VHDX) permits up to 2047 entries, and an image
+declaring more has only its first eight checked. That cap is not
+somewhere an image can hide a region instar relies on, because the same
+scan is what locates the BAT and the metadata region: declare either
+past the eighth entry and the image does not open at all. What a longer
+table can keep out of the overlap test is an unrecognised region, whose
+bytes instar never reads as structure. A BAT entry
 naming file offset 0 is refused separately, because the file
 identifier that lives there is fixed structure rather than a region
 table entry and so overlaps nothing. A region entry whose

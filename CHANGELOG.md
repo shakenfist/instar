@@ -318,7 +318,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   emits; instar previously only refused a block below a fixed 1 MiB
   floor, which could not tell real payload from the BAT of a small
   image. Blocks are now checked against the declared region table
-  instead, and the same test guards the sector-bitmap blocks a
+  instead — its first eight entries, which is the same cap the region
+  scan uses to locate the BAT and the metadata region, so neither of
+  those can be declared outside the checked set without the image
+  failing to open — and the same test guards the sector-bitmap blocks a
   differencing child reads.
 
   This is a behaviour change for plain dynamic VHDX too, not only for
