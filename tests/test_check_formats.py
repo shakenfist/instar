@@ -1878,12 +1878,15 @@ class TestCheckVhdDifferencing(InstarTestBase):
         This test previously asserted that check succeeded (exit 0,
         zero corruptions) on a differencing VHD. That answer was only
         correct because check was silently reading the child's
-        parent-owned sectors as zeroes. PLAN-differencing phase 4
-        replaced it with an explicit refusal: check exits 1 -- not 2,
-        which is its corruption code, because a differencing image is
-        incomplete rather than corrupt -- and names the deferral.
+        parent-owned sectors as zeroes. It is now an explicit refusal:
+        check exits 1 -- not 2, which is its corruption code, because
+        a differencing image is incomplete rather than corrupt -- and
+        says that it reads an image on its own rather than composing a
+        parent into it. That wording matters: the operations that do
+        compose such a chain read it successfully, so a message
+        blaming the chain for a missing parent would contradict them.
 
-        The refusal is pinned in detail, across every operation and
+        The policy is pinned in detail, across every operation and
         both formats, in tests/test_differencing.py; this test remains
         here so the check-format matrix records the change of answer
         at the point where the old answer lived.
@@ -1901,9 +1904,9 @@ class TestCheckVhdDifferencing(InstarTestBase):
             f'stdout={stdout!r} stderr={stderr!r}'
         )
         self.assertIn(
-            'check: source is a differencing VHD image whose parent '
-            'instar cannot yet compose; composition is deferred '
-            '(see PLAN-differencing.md)',
+            'check: source is a differencing VHD image, and check reads an '
+            'image on its own rather than composing a parent into it, so '
+            'the sectors it leaves to its parent could not be composed',
             stderr,
             f'unexpected stderr: {stderr!r}'
         )

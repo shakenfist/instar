@@ -682,7 +682,7 @@ self_test() {
 # phase's definition of done asks the two to stay in step, which until
 # now was a promise kept by hand. Asserting it makes the drift a
 # failure instead of a documentation bug nobody reads.
-EXPECTED_CASES=62
+EXPECTED_CASES=91
 
 check_case_count() {
     # Only meaningful for a whole run; a selection is expected to be short.
@@ -991,6 +991,17 @@ rust_case 'vhdx-relative-key-convention' "${VHDX_LIB}" \
     '            return Some((relative, false));' \
     vhdx 'only_the_relative_key_is_flagged_as_windows_convention'
 
+# How large a BAT the emitter declares for a differencing child. The
+# mutation sizes it by the no-parent rule, which is what instar did
+# before: one entry per payload block plus one per chunk group, rather
+# than whole groups of chunk_ratio + 1 entries. At most geometries the
+# shortfall vanishes into the 1 MiB region rounding, which is why the
+# named test is the one that picks a geometry where it does not.
+rust_case 'vhdx-write-differencing-bat-sized-as-dynamic' "${VHDX_LIB}" \
+    '    let total_bat_entries = if has_parent {' \
+    '    let total_bat_entries = if false {  // MUTATED' \
+    create 'vhdx_differencing_bat_region_covers_the_last_group_bitmap'
+
 # ---------------------------------------------------------------------
 # The guest chain walker: composing a differencing VHD or VHDX against
 # the device behind it. Everything above this point mutates the code
@@ -1161,18 +1172,45 @@ rust_case 'vhd-read-runs-addressed-in-512-byte-sectors' "${QCOW2_LIB}" \
     qcow2 'vhd_arm_mixed_bitmap_on_a_large_sector_device' \
     --features "${QCOW2_FEATURES}"
 
-# --- VHD: the refusal in init_chain_states ---------------------------
+# --- VHD: the narrowed refusal in init_chain_states ------------------
+#
+# The refusal is no longer unconditional: a differencing child with a
+# device behind it in its own chain composes, and only one with nothing
+# behind it is refused. Three ways to get that condition wrong, each
+# mutating the same clause and each killed by a different case of the
+# one named test -- widening it back refuses a chain that should
+# compose, removing it admits a child with nothing to compose against,
+# and deriving it from the array bound admits a child whose chain is
+# one device long inside an array of two.
 
-rust_case 'vhd-read-refusal-conditional-on-device-count' "${QCOW2_LIB}" \
-    '            if state.disk_type == vhd::DISK_TYPE_DIFFERENCING {' \
-    '            if state.disk_type == vhd::DISK_TYPE_DIFFERENCING && dev_idx + 1 >= device_count { // MUTATED' \
-    qcow2 'vhd_init_refuses_a_differencing_child_and_admits_a_dynamic_one' \
+rust_case 'vhd-read-refusal-widened-to-unconditional' "${QCOW2_LIB}" \
+    '                    && !parent_in_chain(chain_config, dev_idx)' \
+    '                    && true // MUTATED' \
+    qcow2 'vhd_init_refuses_a_differencing_child_with_no_parent_in_its_own_chain' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'vhd-read-refusal-removed' "${QCOW2_LIB}" \
+    '                    && !parent_in_chain(chain_config, dev_idx)' \
+    '                    && false // MUTATED' \
+    qcow2 'vhd_init_refuses_a_differencing_child_with_no_parent_in_its_own_chain' \
     --features "${QCOW2_FEATURES}"
 
 rust_case 'vhd-read-refusal-names-vhdx' "${QCOW2_LIB}" \
     'send_differencing_refusal(call_table, shared::DifferencingRefusal::STATUS_VHD);' \
     'send_differencing_refusal(call_table, shared::DifferencingRefusal::STATUS_VHDX); // MUTATED' \
-    qcow2 'vhd_init_refuses_a_differencing_child_and_admits_a_dynamic_one' \
+    qcow2 'vhd_init_refuses_a_differencing_child_with_no_parent_in_its_own_chain' \
+    --features "${QCOW2_FEATURES}"
+
+# Reverts the per-chain judgement to the array-bound form the
+# segmentation replaced. The test's two-chain case declares device 1 as
+# its own chain, so the segmentation says no parent is behind device 0
+# while `dev_idx + 1 >= device_count` says one is -- and a reader that
+# believed the latter would compose the child against an unrelated
+# image rather than refusing it.
+rust_case 'vhd-read-segmentation-reverted-to-device-count' "${QCOW2_LIB}" \
+    '                    && !parent_in_chain(chain_config, dev_idx)' \
+    '                    && dev_idx + 1 >= device_count // MUTATED' \
+    qcow2 'vhd_init_refuses_a_differencing_child_with_no_parent_in_its_own_chain' \
     --features "${QCOW2_FEATURES}"
 
 # --- VHD: the documented survivor ------------------------------------
@@ -1353,18 +1391,32 @@ rust_case 'vhdx-read-run-ignores-the-leading-sector-byte' "${QCOW2_LIB}" \
     qcow2 'vhdx_arm_mixed_chunk_at_an_unaligned_virtual_offset' \
     --features "${QCOW2_FEATURES}"
 
-# --- VHDX: the refusal in init_chain_states --------------------------
+# --- VHDX: the narrowed refusal in init_chain_states -----------------
+#
+# The VHDX twins of the four VHD cases above; see the reasoning there.
 
 rust_case 'vhdx-read-refusal-names-vhd' "${QCOW2_LIB}" \
     'send_differencing_refusal(call_table, shared::DifferencingRefusal::STATUS_VHDX);' \
     'send_differencing_refusal(call_table, shared::DifferencingRefusal::STATUS_VHD); // MUTATED' \
-    qcow2 'vhdx_init_refuses_a_differencing_child_and_admits_a_dynamic_one' \
+    qcow2 'vhdx_init_refuses_a_differencing_child_with_no_parent_in_its_own_chain' \
     --features "${QCOW2_FEATURES}"
 
-rust_case 'vhdx-read-refusal-conditional-on-device-count' "${QCOW2_LIB}" \
-    '                if state.has_parent {' \
+rust_case 'vhdx-read-refusal-widened-to-unconditional' "${QCOW2_LIB}" \
+    '                if state.has_parent && !parent_in_chain(chain_config, dev_idx) {' \
+    '                if state.has_parent && true { // MUTATED' \
+    qcow2 'vhdx_init_refuses_a_differencing_child_with_no_parent_in_its_own_chain' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'vhdx-read-refusal-removed' "${QCOW2_LIB}" \
+    '                if state.has_parent && !parent_in_chain(chain_config, dev_idx) {' \
+    '                if state.has_parent && false { // MUTATED' \
+    qcow2 'vhdx_init_refuses_a_differencing_child_with_no_parent_in_its_own_chain' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'vhdx-read-segmentation-reverted-to-device-count' "${QCOW2_LIB}" \
+    '                if state.has_parent && !parent_in_chain(chain_config, dev_idx) {' \
     '                if state.has_parent && dev_idx + 1 >= device_count { // MUTATED' \
-    qcow2 'vhdx_init_refuses_a_differencing_child_and_admits_a_dynamic_one' \
+    qcow2 'vhdx_init_refuses_a_differencing_child_with_no_parent_in_its_own_chain' \
     --features "${QCOW2_FEATURES}"
 
 rust_case 'vhdx-read-mixed-chunk-zero-fills-the-parent-share' "${QCOW2_LIB}" \
@@ -1378,9 +1430,17 @@ rust_case 'vhdx-read-mixed-chunk-zero-fills-the-parent-share' "${QCOW2_LIB}" \
     --features "${QCOW2_FEATURES}"
 
 # --- VHDX: no block begins inside the headers ------------------------
+#
+# Offset zero is its own guard, independent of the overlap test below:
+# the file identifier and headers are fixed structure, not region
+# table entries, so a region table a writer never touches would leave
+# nothing for the overlap test to catch there. Each case mutates only
+# the zero check, leaving the overlap check beside it intact, so a
+# mutation that silently relied on the other guard to cover for it
+# would still be caught.
 
 rust_case 'vhdx-read-sb-offset-zero-accepted' "${VHDX_READ_LIB}" \
-    '        if file_offset < MIN_BLOCK_FILE_OFFSET {
+    '        if file_offset == 0 {
             return None;
         }' \
     '        if false { // MUTATED
@@ -1390,12 +1450,18 @@ rust_case 'vhdx-read-sb-offset-zero-accepted' "${VHDX_READ_LIB}" \
     --features "${QCOW2_FEATURES}"
 
 rust_case 'vhdx-read-full-payload-offset-zero-accepted' "${VHDX_READ_LIB}" \
-    '                if file_offset < MIN_BLOCK_FILE_OFFSET {
+    '                if file_offset == 0 {
+                    return None;
+                }
+                if self.block_overlaps_a_declared_region(file_offset, u64::from(self.block_size)) {
                     return None;
                 }
                 let intra_block_offset = virtual_offset % self.block_size as u64;
                 Some(VhdxBlockLookup::Present {' \
     '                if false { // MUTATED
+                    return None;
+                }
+                if self.block_overlaps_a_declared_region(file_offset, u64::from(self.block_size)) {
                     return None;
                 }
                 let intra_block_offset = virtual_offset % self.block_size as u64;
@@ -1404,7 +1470,61 @@ rust_case 'vhdx-read-full-payload-offset-zero-accepted' "${VHDX_READ_LIB}" \
     --features "${QCOW2_FEATURES}"
 
 rust_case 'vhdx-read-partial-payload-offset-zero-accepted' "${VHDX_READ_LIB}" \
-    '                if file_offset < MIN_BLOCK_FILE_OFFSET {
+    '                if file_offset == 0 {
+                    return None;
+                }
+                if self.block_overlaps_a_declared_region(file_offset, u64::from(self.block_size)) {
+                    return None;
+                }
+                let intra_block_offset = virtual_offset % self.block_size as u64;
+                Some(VhdxBlockLookup::PartiallyPresent {' \
+    '                if false { // MUTATED
+                    return None;
+                }
+                if self.block_overlaps_a_declared_region(file_offset, u64::from(self.block_size)) {
+                    return None;
+                }
+                let intra_block_offset = virtual_offset % self.block_size as u64;
+                Some(VhdxBlockLookup::PartiallyPresent {' \
+    qcow2 'vhdx_arm_block_at_file_offset_zero_is_refused' \
+    --features "${QCOW2_FEATURES}"
+
+# --- VHDX: no block begins inside the BAT or metadata region ---------
+#
+# A low-water mark fixed at 1 MiB could not catch this one: an offset
+# inside the BAT or metadata region of a small image is still above
+# 1 MiB. The check is now an overlap test against every region the
+# image declares, which SPEC(VHDX) does not promise precedes the
+# blocks it coexists with -- see the trailing-region case below for
+# the layout that makes that matter. Each case here mutates only the
+# overlap check, leaving the offset-zero guard beside it intact.
+
+rust_case 'vhdx-read-sb-offset-inside-region-accepted' "${VHDX_READ_LIB}" \
+    '        if self.block_overlaps_a_declared_region(file_offset, u64::from(SB_BLOCK_SIZE)) {
+            return None;
+        }' \
+    '        if false { // MUTATED
+            return None;
+        }' \
+    qcow2 'vhdx_arm_block_inside_a_declared_region_is_refused' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'vhdx-read-full-payload-offset-inside-region-accepted' "${VHDX_READ_LIB}" \
+    '                if self.block_overlaps_a_declared_region(file_offset, u64::from(self.block_size)) {
+                    return None;
+                }
+                let intra_block_offset = virtual_offset % self.block_size as u64;
+                Some(VhdxBlockLookup::Present {' \
+    '                if false { // MUTATED
+                    return None;
+                }
+                let intra_block_offset = virtual_offset % self.block_size as u64;
+                Some(VhdxBlockLookup::Present {' \
+    qcow2 'vhdx_arm_block_inside_a_declared_region_is_refused' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'vhdx-read-partial-payload-offset-inside-region-accepted' "${VHDX_READ_LIB}" \
+    '                if self.block_overlaps_a_declared_region(file_offset, u64::from(self.block_size)) {
                     return None;
                 }
                 let intra_block_offset = virtual_offset % self.block_size as u64;
@@ -1414,7 +1534,84 @@ rust_case 'vhdx-read-partial-payload-offset-zero-accepted' "${VHDX_READ_LIB}" \
                 }
                 let intra_block_offset = virtual_offset % self.block_size as u64;
                 Some(VhdxBlockLookup::PartiallyPresent {' \
-    qcow2 'vhdx_arm_block_at_file_offset_zero_is_refused' \
+    qcow2 'vhdx_arm_block_inside_a_declared_region_is_refused' \
+    --features "${QCOW2_FEATURES}"
+
+# The overlap check narrowed back to differencing images only. Every
+# case above drives a differencing child, so all three still pass: it
+# is the plain dynamic read -- the one the fix quietly tightened, and
+# the one a reader of the issue would not expect to be affected --
+# that this catches.
+
+rust_case 'vhdx-read-overlap-check-gated-on-has-parent' "${VHDX_READ_LIB}" \
+    '                if self.block_overlaps_a_declared_region(file_offset, u64::from(self.block_size)) {
+                    return None;
+                }
+                let intra_block_offset = virtual_offset % self.block_size as u64;
+                Some(VhdxBlockLookup::Present {' \
+    '                if self.has_parent // MUTATED
+                    && self.block_overlaps_a_declared_region(file_offset, u64::from(self.block_size))
+                {
+                    return None;
+                }
+                let intra_block_offset = virtual_offset % self.block_size as u64;
+                Some(VhdxBlockLookup::Present {' \
+    qcow2 'vhdx_arm_dynamic_block_inside_a_declared_region_is_refused' \
+    --features "${QCOW2_FEATURES}"
+
+# "Any entry in the region table" is any of the first eight, and the
+# two entries every fixture writes both sit at the front -- so the
+# claim rested on entries no test had ever moved. Stopping the scan
+# after the BAT and metadata entries leaves every case above passing.
+
+rust_case 'vhdx-read-region-scan-stops-before-the-eighth-entry' "${VHDX_READ_LIB}" \
+    '        let mut region_count: u32 = 0;
+
+        for i in 0..entry_count.min(8) {' \
+    '        let mut region_count: u32 = 0;
+
+        for i in 0..entry_count.min(2) { // MUTATED: scan stops after BAT + metadata' \
+    qcow2 'vhdx_overlap_check_covers_the_eighth_region_table_entry' \
+    --features "${QCOW2_FEATURES}"
+
+# The regression the overlap test exists to prevent, which none of the
+# cases above can catch: a bound that refuses everything below the end
+# of the highest region. Every "inside a region" case still passes
+# under it, because a block inside a region is also below that mark.
+# Only a region declared *after* the blocks tells the two apart.
+
+rust_case 'vhdx-read-overlap-replaced-by-a-high-water-mark' "${VHDX_READ_LIB}" \
+    '        self.regions[..self.region_count as usize]
+            .iter()
+            .any(|&(region_offset, region_length)| {
+                ranges_overlap(offset, len, region_offset, region_length)
+            })' \
+    '        // MUTATED: overlap test replaced by a high-water mark
+        let _ = len;
+        let mark = self.regions[..self.region_count as usize]
+            .iter()
+            .map(|&(region_offset, region_length)| region_offset + u64::from(region_length))
+            .max()
+            .unwrap_or(0);
+        offset < mark' \
+    qcow2 'vhdx_arm_block_before_a_trailing_region_is_not_refused' \
+    --features "${QCOW2_FEATURES}"
+
+# A region declaring zero length names no bytes, so it overlaps
+# nothing. Dropping the early answer restores a predicate that reduced
+# to `offset < region_offset < end` for an empty region: it waved
+# through an entry at or below the block's start and refused one whose
+# offset fell strictly inside the block. Every case above keeps passing,
+# because the only zero-length entries they carry sit at offset 0.
+
+rust_case 'vhdx-read-empty-region-not-answered-early' "${VHDX_READ_LIB}" \
+    '    if len == 0 || region_len == 0 {
+        return false;
+    }' \
+    '    if false { // MUTATED: empty ranges no longer answered early
+        return false;
+    }' \
+    qcow2 'vhdx_zero_length_region_inside_a_block_does_not_refuse_it' \
     --features "${QCOW2_FEATURES}"
 
 # --- VHDX: the device a mixed chunk resumes on -----------------------
@@ -1443,6 +1640,292 @@ rust_case 'vhdx-read-zero-sector-group-allowed' "${VHDX_READ_LIB}" \
             return None;
         }' \
     vhdx 'sectors_per_chunk_group_refuses_a_degenerate_geometry'
+
+# ---------------------------------------------------------------------
+# Two chains in one device array, which is `compare` alone.
+#
+# `compare` is the only operation that reads two images at once, and it
+# does it by packing both backing chains into the single device array
+# the guest walks: the host writes one `ChainSegment` per chain, and the
+# guest derives image2's first device by adding the two chain lengths.
+# Every case below breaks one piece of that arithmetic, and each needs a
+# test with a differencing child in a *second* chain to notice -- index
+# 0 is the one position at which an array-absolute device offset and a
+# chain-relative one agree, so a single-chain test cannot fail for any
+# of these reasons.
+#
+# They are integration cases rather than unit ones because two of them
+# mutate the host's segmentation, which no guest unit test can reach,
+# and because the property being asserted is a user-visible verdict:
+# the wrong answers here are "identical" and "a difference at some
+# other offset", both of which exit in a way a weaker test accepts.
+# ---------------------------------------------------------------------
+
+COMPARE_OP='src/operations/compare/src/main.rs'
+VMM_MAIN='src/vmm/src/main.rs'
+TWO_CHAINS='test_differencing.TestDifferencingCompareTwoChains'
+TWO_CHAINS_OWN_PARENT="${TWO_CHAINS}.test_compare_reads_each_chain_against_its_own_parent"
+TWO_CHAINS_LOOKALIKE="${TWO_CHAINS}"
+TWO_CHAINS_LOOKALIKE+='.test_compare_refuses_a_child_against_the_image2_that_would_look_identical'
+TWO_CHAINS_OFFSET="${TWO_CHAINS}"
+TWO_CHAINS_OFFSET+='.test_compare_reports_the_offset_of_one_altered_parent_owned_sector'
+TWO_CHAINS_IDENTICAL="${TWO_CHAINS}.test_compare_two_differencing_chains_are_identical"
+
+# image2 read from image1's chain start. The two chains then are the
+# same chain, so every comparison reports "identical" -- the one wrong
+# verdict that looks like success. The named test alters one chain's
+# parent and expects a difference at that sector's offset, so it is the
+# case this cannot slip past.
+integration_case 'compare-op-image2-read-starts-at-image1' "${COMPARE_OP}" \
+    '            image2_start,
+            image2_device_count,
+            virtual_offset,
+            buf2,' \
+    '            0, // MUTATED
+            image2_device_count,
+            virtual_offset,
+            buf2,' \
+    "${TWO_CHAINS_OWN_PARENT}"
+
+# The host declares one segment spanning both chains instead of one per
+# chain. `ChainSegment::covers` still accepts it -- it tiles the array
+# exactly -- so nothing refuses the config; what changes is that a
+# differencing child at index 0 of a two-device array now has the
+# *other image* counted as the device behind it, which is issue #614
+# exactly. The named test is the one whose image2 a wrongly composed
+# read agrees with byte for byte, so the mutation's answer there is
+# "identical" rather than anything that looks like a failure.
+integration_case 'compare-host-segments-collapsed-into-one' "${VMM_MAIN}" \
+    '    let segments = [
+        shared::ChainSegment {
+            first: 0,
+            count: chain1_written as u32,
+        },
+        shared::ChainSegment {
+            first: chain1_written as u32,
+            count: chain2_written as u32,
+        },
+    ];' \
+    '    // MUTATED
+    let segments = [shared::ChainSegment {
+        first: 0,
+        count: (chain1_written + chain2_written) as u32,
+    }];' \
+    "${TWO_CHAINS_LOOKALIKE}"
+
+# Each segment keeps its position but takes the other chain's length.
+# The segmentation still tiles the array, so the host writes it and the
+# guest accepts it; it is simply wrong whenever the two chains are
+# different lengths. The named test compares a two-image chain against
+# a one-image raw file, so image1's segment shrinks to one device and
+# its differencing child is refused instead of composed.
+integration_case 'compare-host-segments-sized-from-the-other-chain' "${VMM_MAIN}" \
+    '    let segments = [
+        shared::ChainSegment {
+            first: 0,
+            count: chain1_written as u32,
+        },
+        shared::ChainSegment {
+            first: chain1_written as u32,
+            count: chain2_written as u32,
+        },
+    ];' \
+    '    let segments = [
+        shared::ChainSegment {
+            first: 0,
+            count: chain2_written as u32, // MUTATED
+        },
+        shared::ChainSegment {
+            first: chain2_written as u32,
+            count: chain1_written as u32,
+        },
+    ];' \
+    "${TWO_CHAINS_OFFSET}"
+
+# The segmentation reverted to the array bound, caught where a user
+# would meet it rather than in a unit test. `vhd-read-segmentation-
+# reverted-to-device-count` already kills this clause from inside the
+# `qcow2` crate; this case asserts the same revert is visible as a
+# wrong answer from the command line, because that is the form issue
+# #614 was reported in. The named test is the one whose image2 a child
+# composed against "the next device in the array" matches byte for
+# byte, so the mutation's verdict there is "identical".
+integration_case 'compare-read-vhd-refusal-reverted-to-device-count' "${QCOW2_LIB}" \
+    '                    && !parent_in_chain(chain_config, dev_idx)' \
+    '                    && dev_idx + 1 >= device_count // MUTATED' \
+    "${TWO_CHAINS_LOOKALIKE}"
+
+# "Is there a parent behind me" asked with the device's array index
+# rather than its offset within its own chain. Identical for chain 1,
+# whose segment begins at 0, and wrong for chain 2: its child is told
+# nothing is behind it and is refused. Only a test whose image2 is
+# itself a differencing child can see this, which is why it is the one
+# named.
+integration_case 'compare-read-parent-in-chain-offset-is-array-absolute' "${QCOW2_LIB}" \
+    '            devices_behind(seg.count as usize, dev_idx - seg.first as usize).unwrap_or(0) > 0' \
+    '            devices_behind(seg.count as usize, dev_idx).unwrap_or(0) > 0 // MUTATED' \
+    "${TWO_CHAINS_IDENTICAL}"
+
+# ---------------------------------------------------------------------
+# bench and rebase. Both read through the shared chain walker with no
+# guest code of their own to mutate; the properties worth falsifying
+# are the host-side capability flag (bench), the two places rebase's
+# own build had to grow to reach that walker at all (the Cargo.toml
+# feature list and the chain-reader's format allowlist), and the
+# typed refusal rendering rebase gained alongside them.
+# ---------------------------------------------------------------------
+
+REBASE_OP='src/operations/rebase/src/main.rs'
+REBASE_CARGO='src/operations/rebase/Cargo.toml'
+BENCH_COMPOSES='test_differencing.TestDifferencingBenchComposes'
+BENCH_END="${BENCH_COMPOSES}.test_bench_reads_to_the_end_of_the_full_virtual_size"
+REBASE_COMPOSES='test_differencing.TestDifferencingRebaseThroughChain'
+REBASE_DETACH="${REBASE_COMPOSES}.test_rebase_detach_composes_the_differencing_backing_chain"
+REBASE_REFUSAL="${REBASE_COMPOSES}.test_rebase_old_chain_refusal_is_the_typed_message"
+REBASE_TWO_CHAINS="${REBASE_COMPOSES}.test_rebase_onto_a_new_backing_keeps_the_two_chains_apart"
+
+# `run_bench`'s own discovery call reverted to `Unsupported`: a
+# differencing source refuses in the host walk before the guest ever
+# runs, so the full-virtual-size range probe sees a refusal rather
+# than a reading.
+integration_case 'bench-host-capability-reverted-to-unsupported' "${VMM_MAIN}" \
+    '    let chain = discover_backing_chain(
+        Path::new(&invocation.filename),
+        sector_size,
+        &security_config,
+        ChainUse::Compose,
+        DifferencingComposition::Supported,
+    )' \
+    '    let chain = discover_backing_chain(
+        Path::new(&invocation.filename),
+        sector_size,
+        &security_config,
+        ChainUse::Compose,
+        DifferencingComposition::Unsupported, // MUTATED
+    )' \
+    "${BENCH_END}"
+
+# rebase's own Cargo.toml never gained the `vhd-input` / `vhdx-input`
+# features: the host still resolves and attaches the differencing
+# parent (rebase's capability to compose one is set host-side), but
+# the qcow2 crate's VHD arm is not compiled into this binary, so
+# `init_chain_states` cannot recognise the format at all. Caught
+# through the real binary, so `make instar` after the Cargo.toml edit
+# is load-bearing.
+integration_case 'rebase-cargo-missing-vhd-vhdx-features' "${REBASE_CARGO}" \
+    'qcow2 = { path = "../../crates/qcow2", features = ["create", "vhd-input", "vhdx-input", "vdi-input", "parallels-input", "qcow1-input", "dmg-input"] }' \
+    'qcow2 = { path = "../../crates/qcow2", features = ["create", "vdi-input", "parallels-input", "qcow1-input", "dmg-input"] } # MUTATED' \
+    "${REBASE_DETACH}"
+
+# The chain reader's own format allowlist narrowed back to qcow2/raw.
+# The qcow2 crate's VHD/VHDX composing arm is compiled in (the
+# Cargo.toml features above are intact), but `read_chain_cluster`'s
+# pre-flight loop refuses the format name before ever calling it, so
+# the differencing child in the old chain is declined rather than
+# read.
+integration_case 'rebase-read-chain-cluster-vhd-vhdx-disallowed' "${REBASE_OP}" \
+    '            ImageFormat::Qcow2 | ImageFormat::Raw | ImageFormat::Vhd | ImageFormat::Vhdx => {}' \
+    '            ImageFormat::Qcow2 | ImageFormat::Raw => {} // MUTATED' \
+    "${REBASE_DETACH}"
+
+# `compressed_buf` pointed back at `CHAIN_CACHES`, aliasing the first
+# chain device's own L1/BAT cache slot. A differencing VHD chunk's
+# mixed-ownership arm genuinely writes through that parameter as its
+# sub-sector bounce buffer, so the alias corrupts the cached sector
+# mid-lookup -- the actual defect this step found and fixed, now
+# pinned by the test that caught it.
+integration_case 'rebase-compressed-buf-aliases-chain-caches' "${REBASE_OP}" \
+    '    let compressed_buf = CHAIN_READ_COMPRESSED as *mut u8;' \
+    '    let compressed_buf = CHAIN_CACHES as *mut u8; // MUTATED' \
+    "${REBASE_DETACH}"
+
+# Only the first chain gets a segment, so a rebase carrying both an
+# old and a new chain stops accounting for the second chain's devices
+# -- the host's own device-count check catches it before the config is
+# written, which is the check that replaced a `debug_assert_eq!` that
+# would have compiled to nothing in the shipping build. A detach has
+# one chain and is unaffected, which is the point: the detach cases
+# above keep passing and only the two-chain test fails, so it is that
+# test, not them, that reaches the multi-segment path at all.
+integration_case 'rebase-second-chain-gets-no-segment' "${VMM_MAIN}" \
+    '        if count > 0 {
+            segments.push(shared::ChainSegment {
+                first: written as u32,
+                count: count as u32,
+            });' \
+    '        if count > 0 && segments.is_empty() { // MUTATED
+            segments.push(shared::ChainSegment {
+                first: written as u32,
+                count: count as u32,
+            });' \
+    "${REBASE_TWO_CHAINS}"
+
+# The new `differencing_refusal_error` call site removed from
+# `run_rebase_guest`: a differencing refusal in the old or new chain
+# still fails the run, but renders the pre-existing generic
+# ERROR_PARSE_FAILED text ("the overlay's header could not be
+# parsed") instead of naming the format and the reason.
+# The needle is the refusal block alone. It used to run on through the
+# end of the function and into the next one's doc comment, which made
+# the case BROKEN whenever that unrelated comment was edited. The
+# `("rebase", ...)` argument pair is what makes this unique.
+integration_case 'rebase-differencing-refusal-call-site-removed' "${VMM_MAIN}" \
+    '    if serial_decoder.last_differencing_refusal.is_some() {
+        return Err(serial_decoder
+            .differencing_refusal_error("rebase", DifferencingComposition::Supported)
+            .into());
+    }' \
+    '    // MUTATED: differencing_refusal_error call site removed' \
+    "${REBASE_REFUSAL}"
+
+# ---------------------------------------------------------------------
+# The other half of the policy: map, measure and check still refuse a
+# differencing source, each in its own code rather than through
+# `init_chain_states`. Nothing above lifts these six guards -- they are
+# what stops a later phase doing so by accident, by making the deletion
+# visible as a failing, named test rather than a silent behaviour
+# change. Each operation has one guard per format: a VHD arm testing
+# the footer's disk type, and a VHDX arm testing the metadata's
+# `has_parent` flag (map and measure read `VhdxState::has_parent`
+# directly; check reads it off the metadata it already parsed).
+# ---------------------------------------------------------------------
+
+MAP_OP='src/operations/map/src/main.rs'
+MEASURE_OP='src/operations/measure/src/main.rs'
+CHECK_OP='src/operations/check/src/main.rs'
+MAP_REFUSES='test_differencing.TestDifferencingMapStillRefuses.test_map_refuses_with_its_own_message'
+MEASURE_REFUSES='test_differencing.TestDifferencingRefusal.test_measure_refuses_every_differencing_source'
+CHECK_REFUSES='test_differencing.TestDifferencingRefusal.test_check_refuses_every_differencing_source'
+
+integration_case 'map-vhd-refusal-removed' "${MAP_OP}" \
+    '            if state.disk_type == vhd::DISK_TYPE_DIFFERENCING {' \
+    '            if state.disk_type == vhd::DISK_TYPE_DIFFERENCING && false { // MUTATED' \
+    "${MAP_REFUSES}"
+
+integration_case 'map-vhdx-refusal-removed' "${MAP_OP}" \
+    '            if state.has_parent {' \
+    '            if state.has_parent && false { // MUTATED' \
+    "${MAP_REFUSES}"
+
+integration_case 'measure-vhd-refusal-removed' "${MEASURE_OP}" \
+    '            if state.disk_type == vhd::DISK_TYPE_DIFFERENCING {' \
+    '            if state.disk_type == vhd::DISK_TYPE_DIFFERENCING && false { // MUTATED' \
+    "${MEASURE_REFUSES}"
+
+integration_case 'measure-vhdx-refusal-removed' "${MEASURE_OP}" \
+    '            if state.has_parent {' \
+    '            if state.has_parent && false { // MUTATED' \
+    "${MEASURE_REFUSES}"
+
+integration_case 'check-vhd-refusal-removed' "${CHECK_OP}" \
+    '    if footer.disk_type == vhd::DISK_TYPE_DIFFERENCING {' \
+    '    if footer.disk_type == vhd::DISK_TYPE_DIFFERENCING && false { // MUTATED' \
+    "${CHECK_REFUSES}"
+
+integration_case 'check-vhdx-refusal-removed' "${CHECK_OP}" \
+    '    if metadata.has_parent {' \
+    '    if metadata.has_parent && false { // MUTATED' \
+    "${CHECK_REFUSES}"
 
 # ---------------------------------------------------------------------
 # The create guest operation. Caught through the real binary only.
@@ -1589,9 +2072,15 @@ integration_case 'oracle-vhd-parent-name-keeps-its-directory' "${CREATE_LIB}" \
 # suite asserted it at all before the oracle did -- the round-trip
 # test's VHD arm checks `disk_type == 4` and its VHDX arm has no
 # equivalent. libvhdi reads the bit back as "Disk type: Differential".
+# The trailing `);` is part of the needle: `parent_path.is_some()` is
+# now the argument to two calls -- this one, and the BAT sizing in
+# `plan_vhdx` -- and only `build_metadata`'s ends the statement. The BAT
+# sizing has its own case, `vhdx-write-differencing-bat-sized-as-dynamic`.
 integration_case 'oracle-vhdx-has-parent-bit' "${CREATE_LIB}" \
-    '        parent_path.is_some(),' \
-    '        false,' \
+    '        parent_path.is_some(),
+    );' \
+    '        false,
+    );' \
     "${ORACLE_VHDX}"
 
 # ---------------------------------------------------------------------

@@ -126,6 +126,40 @@ def _vhdx_active_data_write_guid(data):
     return best[1]
 
 
+# VHDX region table: two copies, 64 KiB apart, each a 16-byte header
+# ('regi', checksum, entry count, reserved) followed by 32-byte entries
+# of (GUID, file offset u64, length u32, required u32).
+_VHDX_REGION_TABLE_OFFSETS = (192 * 1024, 256 * 1024)
+_VHDX_REGION_TABLE_HEADER_SIZE = 16
+_VHDX_REGION_TABLE_ENTRY_SIZE = 32
+# 2DC27766-F623-4200-9D64-115E9BFD4A08, stored mixed-endian: the first
+# three groups little-endian, the last eight bytes as written.
+_VHDX_BAT_REGION_GUID = (struct.pack('<IHH', 0x2DC27766, 0xF623, 0x4200)
+                         + bytes.fromhex('9D64115E9BFD4A08'))
+
+
+def _vhdx_bat_region(data):
+    """The (file_offset, length) the VHDX's region table gives the BAT.
+
+    Read from the first region table copy, which is the one instar
+    writes first and the one a reader consults first. Parsed here rather
+    than asked of `instar info`, which reports no region geometry at
+    all: the point is what the file declares about itself.
+    """
+    for table in _VHDX_REGION_TABLE_OFFSETS:
+        if data[table:table + 4] != b'regi':
+            continue
+        count = struct.unpack_from('<I', data, table + 8)[0]
+        for i in range(count):
+            at = table + _VHDX_REGION_TABLE_HEADER_SIZE + \
+                i * _VHDX_REGION_TABLE_ENTRY_SIZE
+            if data[at:at + 16] != _VHDX_BAT_REGION_GUID:
+                continue
+            offset, length = struct.unpack_from('<QI', data, at + 16)
+            return offset, length
+    raise AssertionError('no BAT region entry in either region table')
+
+
 def _format_guid(raw):
     """Render 16 raw GUID bytes the way VHDX writes parent_linkage.
 
@@ -481,6 +515,84 @@ class TestCreateSmoke(InstarTestBase):
                         self.assertIn(
                             linkage.encode('utf-16-le'), child_bytes,
                             f'child does not record parent_linkage {linkage}')
+
+    def test_create_vhdx_differencing_bat_region_holds_the_padded_bat(self):
+        """A differencing VHDX child declares a BAT padded to whole groups.
+
+        A VHDX BAT interleaves one sector-bitmap entry after every
+        `chunk_ratio` payload entries, and that bitmap entry comes
+        *last* in its group. A differencing image therefore reserves
+        whole groups of `chunk_ratio + 1` entries, where an image with
+        no parent stops at the last entry its virtual disk needs. instar
+        sized both by the no-parent rule (issue #623), so the last
+        group's bitmap entry -- the one describing which sectors of the
+        disk's final blocks the child owns -- fell outside the BAT
+        region the child's own region table declared.
+
+        The geometry is chosen so the shortfall is visible. The two
+        rules differ by at most `chunk_ratio - 1` entries and the BAT
+        region is rounded up to a whole megabyte, so at most sizes the
+        difference is absorbed by the rounding and a test would pass
+        either way. At 126 977 blocks of 1 MiB the no-parent rule needs
+        127 009 entries, which is 1 016 072 bytes and rounds to exactly
+        one 1 MiB region of 131 072 entries, while the differencing rule
+        needs 131 104 -- 32 more than that region holds. The final
+        group's bitmap entry sits at BAT index 131 103.
+
+        126 GiB of virtual disk costs nothing here: neither image
+        allocates a payload block, so both files are a handful of
+        megabytes of metadata.
+
+        The parent is written by instar too, unlike the identity round
+        trip above. Nothing about a parent's identity is under test, and
+        no third-party fixture has this geometry.
+        """
+        block_size = 1024 * 1024
+        blocks = 126977
+        chunk_ratio = (1 << 23) * 512 // block_size
+        self.assertEqual(4096, chunk_ratio)
+        size = f'{blocks}M'
+
+        with tempfile.TemporaryDirectory() as td:
+            parent = Path(td) / 'parent.vhdx'
+            _, stderr, rc = self.run_instar_create(
+                '-f', 'vhdx', '-o', 'block_size=1M', str(parent), size)
+            self.assertEqual(rc, 0, f'creating the parent failed: {stderr}')
+
+            child = Path(td) / 'child.vhdx'
+            _, stderr, rc = self.run_instar_create(
+                '-f', 'vhdx', '-o', 'block_size=1M', '-b', parent.name,
+                '-F', 'vhdx', str(child), cwd=td)
+            self.assertEqual(rc, 0, f'creating the child failed: {stderr}')
+
+            _, child_len = _vhdx_bat_region(child.read_bytes())
+            _, parent_len = _vhdx_bat_region(parent.read_bytes())
+
+        # The child's own declaration must cover the padded count, and
+        # the parent's -- no parent of its own -- must not have grown.
+        padded = -(-blocks // chunk_ratio) * (chunk_ratio + 1)
+        self.assertEqual(131104, padded)
+        self.assertGreaterEqual(
+            child_len // 8, padded,
+            f'the child declares a BAT region of {child_len} bytes, which '
+            f'holds {child_len // 8} entries, short of the {padded} a '
+            f'differencing BAT of this geometry has')
+        self.assertEqual(
+            1024 * 1024, parent_len,
+            'the parent is not differencing and must keep the shorter '
+            'region, or this test is measuring the geometry rather than '
+            'the rule')
+
+        # And the entry a reader actually needs: the bitmap entry of
+        # the group the last payload block falls in.
+        last_sb_index = ((blocks - 1) // chunk_ratio) * (chunk_ratio + 1) \
+            + chunk_ratio
+        self.assertEqual(131103, last_sb_index)
+        self.assertLess(
+            last_sb_index, child_len // 8,
+            f'the last group\'s sector bitmap entry is at BAT index '
+            f'{last_sb_index}, outside the {child_len // 8} entries the '
+            f'child declares')
 
     def test_create_vhd_differencing_from_a_fixed_parent(self):
         """A fixed-subformat VHD is a valid differencing parent.
@@ -1199,14 +1311,14 @@ class TestCreateOOptions(InstarTestBase):
             self.assertIn('qcow2', stderr)
 
     def test_o_encrypt_key_errors_with_future_work(self):
-        """`-o encrypt.cipher=aes` returns the deferred message."""
+        """`-o encrypt.cipher=aes` returns the not-implemented message."""
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / 'foo.qcow2'
             _, stderr, rc = self.run_instar_create(
                 '-f', 'qcow2', '-o', 'encrypt.cipher=aes', str(path), '16M')
             self.assertNotEqual(rc, 0)
             self.assertIn('encrypt', stderr)
-            self.assertIn('deferred', stderr)
+            self.assertIn('not implemented', stderr)
 
 
 
@@ -1490,7 +1602,7 @@ class TestCreatePreallocation(InstarTestBase):
             _, stderr, rc = self.run_instar_create(
                 '-f', 'vmdk', '-o', 'preallocation=metadata', str(path), '4M')
             self.assertNotEqual(rc, 0)
-            self.assertIn('non-qcow2 preallocation is future work', stderr)
+            self.assertIn('preallocation is implemented for raw and qcow2 only', stderr)
 
 
 # ----------------------------------------------------------------------

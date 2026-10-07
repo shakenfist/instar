@@ -326,7 +326,7 @@ const CHECK_RESULT_FLAG_REPAIR_INCOMPLETE: u32 = 1 << 8;
 #[allow(dead_code)]
 const CHAIN_CONFIG_MAGIC: u32 = 0x4348414E; // "CHAN"
 #[allow(dead_code)]
-const CHAIN_CONFIG_VERSION: u32 = 2;
+const CHAIN_CONFIG_VERSION: u32 = 3;
 #[allow(dead_code)]
 const MAX_CHAIN_DEVICES: usize = 16;
 
@@ -831,14 +831,22 @@ impl SerialDecoder {
     /// `CompareResult`/`CheckResult` carry no error codes) to hold a
     /// per-op error code, so the guest reports the refusal over
     /// `send_error` instead and this formatter renders whatever the
-    /// decoder captured. If the guest reported a refusal, name the
-    /// operation and the format, following `map_error_message`'s
-    /// wording (`:15053`) for the same fact on the `map` path;
-    /// otherwise fall back to the generic message. The plan is named but
-    /// its phase numbers are not: AGENTS.md keeps phase numbers inside
-    /// `docs/plans/`, and this string reaches a user of an installed .deb
-    /// who has neither the plan nor its numbering.
-    fn differencing_refusal_error(&self, op: &str) -> String {
+    /// decoder captured. Without a captured refusal, fall back to the
+    /// generic message.
+    ///
+    /// `composition` is why there are two sentences rather than one.
+    /// Some operations read a differencing child against its parent and
+    /// reach this formatter only when the chain they were given has no
+    /// parent in it; others compose nothing and decline such a source
+    /// however complete the chain is. One message cannot be honest for
+    /// both: told "no parent is in the chain" by an operation that was
+    /// never going to read one, a user whose previous command converted
+    /// the same image successfully would go looking for a missing file
+    /// that is sitting right there. So each caller states the same
+    /// capability here as it states to [`discover_backing_chain`] --
+    /// `measure`, which walks no chain at all, has only this one to
+    /// state -- and the operation is named either way.
+    fn differencing_refusal_error(&self, op: &str, composition: DifferencingComposition) -> String {
         match self.last_differencing_refusal {
             Some(status) => {
                 let format_name = match status {
@@ -846,11 +854,29 @@ impl SerialDecoder {
                     shared::DifferencingRefusal::STATUS_VHDX => "VHDX",
                     _ => "image",
                 };
-                format!(
-                    "{op}: source is a differencing {format_name} image whose parent \
-                     instar cannot yet compose; composition is deferred (see \
-                     PLAN-differencing.md)"
-                )
+                match composition {
+                    // "in the chain {op} was given" rather than
+                    // "source is": for `rebase` the differencing image
+                    // is never the source, because the overlay must be
+                    // qcow2 or vmdk, so this fires only for a member of
+                    // the old or new backing chain. The same holds for
+                    // a `convert` or `compare` of a qcow2 overlay whose
+                    // backing is a parentless differencing image. The
+                    // source is in the chain it was given, so this
+                    // wording stays true when the source *is* the
+                    // differencing image.
+                    DifferencingComposition::Supported => format!(
+                        "{op}: a differencing {format_name} image in the chain {op} \
+                         was given has no parent behind it, so the sectors it leaves \
+                         to its parent could not be composed"
+                    ),
+                    DifferencingComposition::Unsupported => format!(
+                        "{op}: source is a differencing {format_name} image, and {op} \
+                         reads an image on its own rather than composing a parent \
+                         into it, so the sectors it leaves to its parent could not \
+                         be composed"
+                    ),
+                }
             }
             None => format!("{op}: guest did not return a result"),
         }
@@ -944,42 +970,92 @@ mod guest_exception_tests {
     #[test]
     fn differencing_refusal_error_is_generic_without_a_refusal() {
         let decoder = super::SerialDecoder::new();
-        assert_eq!(
-            decoder.differencing_refusal_error("convert"),
-            "convert: guest did not return a result"
-        );
+        for composition in [
+            super::DifferencingComposition::Supported,
+            super::DifferencingComposition::Unsupported,
+        ] {
+            assert_eq!(
+                decoder.differencing_refusal_error("convert", composition),
+                "convert: guest did not return a result"
+            );
+        }
     }
 
     #[test]
     fn differencing_refusal_error_names_the_format_when_captured() {
         let mut decoder = super::SerialDecoder::new();
         decoder.last_differencing_refusal = Some(shared::DifferencingRefusal::STATUS_VHD);
-        let msg = decoder.differencing_refusal_error("convert");
-        assert!(
-            msg.contains("convert: source is a differencing VHD image"),
-            "{msg}"
-        );
-        assert!(msg.contains("(see PLAN-differencing.md)"), "{msg}");
+        let msg = decoder
+            .differencing_refusal_error("convert", super::DifferencingComposition::Supported);
+        assert!(msg.contains("convert: a differencing VHD image"), "{msg}");
 
         let mut decoder = super::SerialDecoder::new();
         decoder.last_differencing_refusal = Some(shared::DifferencingRefusal::STATUS_VHDX);
-        let msg = decoder.differencing_refusal_error("compare");
+        let msg = decoder
+            .differencing_refusal_error("compare", super::DifferencingComposition::Supported);
+        assert!(msg.contains("compare: a differencing VHDX image"), "{msg}");
+    }
+
+    /// The two halves of a half-lifted tree must not contradict each
+    /// other. An operation that composes reaches this formatter only
+    /// when the chain it was handed held no parent, and must say so; an
+    /// operation that composes nothing must say that instead, or a user
+    /// whose `convert` of the same image has just succeeded is sent
+    /// looking for a file that is not missing. Neither may claim instar
+    /// cannot compose such a chain, and neither may cite a plan.
+    #[test]
+    fn differencing_refusal_error_distinguishes_the_two_halves_of_the_policy() {
+        let mut decoder = super::SerialDecoder::new();
+        decoder.last_differencing_refusal = Some(shared::DifferencingRefusal::STATUS_VHD);
+
+        let composing = decoder
+            .differencing_refusal_error("convert", super::DifferencingComposition::Supported);
         assert!(
-            msg.contains("compare: source is a differencing VHDX image"),
-            "{msg}"
+            composing.contains("in the chain convert was given has no parent behind it"),
+            "{composing}"
         );
+
+        let refusing = decoder
+            .differencing_refusal_error("check", super::DifferencingComposition::Unsupported);
+        assert!(
+            refusing.contains("check reads an image on its own"),
+            "{refusing}"
+        );
+        assert!(
+            !refusing.contains("chain"),
+            "an operation that never resolves a parent must not blame the \
+             chain for lacking one: {refusing}"
+        );
+
+        for msg in [&composing, &refusing] {
+            assert!(
+                msg.starts_with("convert: ") || msg.starts_with("check: "),
+                "{msg}"
+            );
+            assert!(
+                !msg.contains("PLAN-"),
+                "no user-visible string may cite a plan file: {msg}"
+            );
+            assert!(
+                !msg.contains("instar cannot"),
+                "the message must not claim instar cannot compose a chain it \
+                 does compose: {msg}"
+            );
+        }
     }
 }
 
 #[cfg(test)]
 mod differencing_parent_classification_tests {
-    //! Tests for the classification helpers a reporting caller uses to
-    //! walk a differencing VHD/VHDX parent without opening a KVM guest:
+    //! Tests for the classification helpers that decide how one hop of
+    //! a walk treats a differencing VHD/VHDX parent, all of them
+    //! exercised without opening a KVM guest: `classify_parent_walk`,
     //! `is_windows_absolute_reference`, `resolve_reported_parent`, and
-    //! the `UnresolvedParent` reasons they produce. `ChainUse` itself is
-    //! exercised only at the enum level here -- `discover_backing_chain`
-    //! launches a guest, so the gate it selects is left to the Python
-    //! integration tests.
+    //! the `UnresolvedParent` reasons they produce.
+    //! `discover_backing_chain` itself runs the sandboxed info
+    //! operation once per chain member, so what it does with each
+    //! classification -- and whether a composed read then succeeds --
+    //! is left to the Python integration tests.
     use super::*;
     use tempfile::TempDir;
 
@@ -998,6 +1074,78 @@ mod differencing_parent_classification_tests {
         let compose_again = compose;
         assert_eq!(compose, compose_again);
         assert_ne!(compose, report);
+    }
+
+    // --- classify_parent_walk -----------------------------------------
+
+    #[test]
+    fn a_composing_caller_resolves_a_differencing_parent_only_when_it_composes() {
+        // Two callers that both attach devices and launch a guest take
+        // opposite answers on the same hop. That is the whole point of
+        // carrying the capability per call: `ChainUse` cannot tell them
+        // apart, and before it existed both were refused the parent.
+        assert_eq!(
+            classify_parent_walk(ChainUse::Compose, DifferencingComposition::Supported, true),
+            ParentWalk::Resolve
+        );
+        assert_eq!(
+            classify_parent_walk(
+                ChainUse::Compose,
+                DifferencingComposition::Unsupported,
+                true
+            ),
+            ParentWalk::RecordWithoutResolving
+        );
+    }
+
+    #[test]
+    fn a_supported_differencing_hop_resolves_exactly_as_a_qcow2_hop_does() {
+        // `Supported` must not invent a third kind of resolution: a
+        // composing caller that can read the parent takes the same hard
+        // Resolve a qcow2 or VMDK hop has always taken, so a missing
+        // parent is an error rather than a silently short chain.
+        assert_eq!(
+            classify_parent_walk(ChainUse::Compose, DifferencingComposition::Supported, true),
+            classify_parent_walk(ChainUse::Compose, DifferencingComposition::Supported, false)
+        );
+    }
+
+    #[test]
+    fn the_capability_is_inert_off_a_vhd_family_hop() {
+        // `Unsupported` must not stop a qcow2 or VMDK walk short. The
+        // policy is per hop, so a non-VHD-family hop resolves for every
+        // caller and every capability.
+        for composition in [
+            DifferencingComposition::Supported,
+            DifferencingComposition::Unsupported,
+        ] {
+            assert_eq!(
+                classify_parent_walk(ChainUse::Compose, composition, false),
+                ParentWalk::Resolve
+            );
+            assert_eq!(
+                classify_parent_walk(ChainUse::Report, composition, false),
+                ParentWalk::Resolve
+            );
+        }
+    }
+
+    #[test]
+    fn a_reporting_caller_ignores_the_composition_capability() {
+        // Why `run_info` can state `Unsupported` honestly -- it composes
+        // nothing -- and still resolve the parent: a reporting caller
+        // refuses nothing, so it has no refusal to make contingent on
+        // the parent's presence, and the capability never reaches the
+        // decision.
+        for composition in [
+            DifferencingComposition::Supported,
+            DifferencingComposition::Unsupported,
+        ] {
+            assert_eq!(
+                classify_parent_walk(ChainUse::Report, composition, true),
+                ParentWalk::ResolveOrEndListing
+            );
+        }
     }
 
     // --- is_windows_absolute_reference ---------------------------------
@@ -2693,9 +2841,10 @@ fn execute_info_operation(
 
 /// What the caller will do with the chain it asks for.
 ///
-/// A differencing VHD or VHDX parent is resolved only for
-/// `Report`. `Compose` callers get the child alone, so their
-/// refusal cannot depend on whether the parent exists.
+/// This says nothing about differencing VHD or VHDX parents. Whether
+/// one of those is resolved is decided per call, by the
+/// [`DifferencingComposition`] argument beside this one: two callers
+/// that both attach devices and launch a guest can disagree about it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChainUse {
     /// The caller goes on to attach the chain as virtio devices and
@@ -2703,6 +2852,40 @@ enum ChainUse {
     Compose,
     /// The caller only prints the chain and returns.
     Report,
+}
+
+/// Whether the operation behind a call can read a differencing VHD or
+/// VHDX child against its parent.
+///
+/// Composition arrived one operation at a time rather than all at
+/// once, so this is a property of the *call* and not of [`ChainUse`].
+/// Stating it at each call site is what keeps the set of operations
+/// that compose enumerable by reading the call sites, instead of
+/// inferred from a caller's kind and then audited image by image.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DifferencingComposition {
+    /// The operation reads a differencing child against its parent, so
+    /// the parent is data it needs and is resolved like any other
+    /// backing file.
+    Supported,
+    /// The operation does not: either it refuses such a source by name
+    /// before any parent matters, or it composes nothing at all. The
+    /// parent must not be resolved.
+    Unsupported,
+}
+
+/// What the walk does with the parent reference it has just read out
+/// of an image's header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ParentWalk {
+    /// Resolve the parent under the allowlist and depth rules and
+    /// carry on from it; a failure is an error.
+    Resolve,
+    /// Resolve it by the same rules, but treat a failure as the end of
+    /// the listing rather than as an error.
+    ResolveOrEndListing,
+    /// Leave the reference recorded but unresolved, and stop the walk.
+    RecordWithoutResolving,
 }
 
 /// Why a reporting walk could not resolve a differencing parent.
@@ -2815,6 +2998,34 @@ fn resolve_reported_parent(
     Ok(resolved)
 }
 
+/// Decide what one hop of the walk does with the parent it just found.
+///
+/// `leaving_vhd_family` is true when the image whose header named this
+/// parent is itself a VHD or VHDX. It is split out of
+/// `discover_backing_chain` so the policy can be asserted without a
+/// KVM guest -- that function runs the sandboxed info operation once
+/// per chain member. The reasoning behind each answer is at the call
+/// site, where the alternatives are visible together.
+fn classify_parent_walk(
+    chain_use: ChainUse,
+    differencing_composition: DifferencingComposition,
+    leaving_vhd_family: bool,
+) -> ParentWalk {
+    if !leaving_vhd_family {
+        return ParentWalk::Resolve;
+    }
+    match chain_use {
+        // A reporting caller resolves the parent whatever the operation
+        // behind it could do with one, because it has no refusal to
+        // make contingent on the parent's presence.
+        ChainUse::Report => ParentWalk::ResolveOrEndListing,
+        ChainUse::Compose => match differencing_composition {
+            DifferencingComposition::Supported => ParentWalk::Resolve,
+            DifferencingComposition::Unsupported => ParentWalk::RecordWithoutResolving,
+        },
+    }
+}
+
 /// Discover the complete backing file chain for an image.
 ///
 /// This function iteratively runs the sandboxed info operation to discover
@@ -2827,6 +3038,8 @@ fn resolve_reported_parent(
 /// * `sector_size` - Sector size for virtio-block devices
 /// * `security_config` - Security configuration with path allowlist
 /// * `chain_use` - What the caller will do with the discovered chain
+/// * `differencing_composition` - Whether the calling operation can
+///   read a differencing VHD or VHDX child against its parent
 ///
 /// # Returns
 ///
@@ -2836,6 +3049,7 @@ fn discover_backing_chain(
     sector_size: u32,
     security_config: &config::SecurityConfig,
     chain_use: ChainUse,
+    differencing_composition: DifferencingComposition,
 ) -> Result<BackingChain, ChainError> {
     let mut chain = BackingChain::new();
     let mut seen_paths: Vec<std::path::PathBuf> = Vec::new();
@@ -2989,25 +3203,48 @@ fn discover_backing_chain(
         // Check for backing file
         match info_result.backing_file {
             Some(backing_path) => {
-                // A differencing VHD or VHDX parent is walked only for a
-                // caller that is going to report the chain. A caller that
-                // composes one -- attaches every chain member as a virtio
-                // device and launches a guest -- stops here instead, with
-                // the parent left in `backing_file_raw` so it is still
-                // reported but never resolved.
+                // A differencing VHD or VHDX parent is resolved only for
+                // a caller that is going to read it. Three things decide
+                // that: whether this caller reports the chain or composes
+                // it, whether the hop being taken leaves a VHD-family
+                // image, and -- for a composing caller -- whether the
+                // operation behind the call can read a differencing child
+                // against its parent at all.
                 //
-                // Nothing in instar can compose a VHD or VHDX chain yet:
-                // every read entry point refuses such a source by name,
-                // before any parent matters. Resolving the parent for
-                // those callers could only change *which* failure the user
+                // That third input is why the same gate now answers
+                // differently for different commands, and it is why the
+                // capability is stated at each call site rather than read
+                // off the caller's kind. `convert` (and `dd` through it),
+                // `compare`, `bench` and `rebase` read a differencing
+                // child through the guest chain walker, so they state
+                // `DifferencingComposition::Supported` and their parent is
+                // resolved under the same allowlist and depth rules a
+                // qcow2 or VMDK chain has always taken. What the guest
+                // then makes of the chain is the guest's decision; this
+                // gate only settles whether the parent reaches it.
+                //
+                // `commit` and `check` state `Unsupported`. `check`'s
+                // guest op refuses a differencing source by name before
+                // any parent matters, and `commit`'s guest ignores the
+                // ancestor slots the host populates for it altogether, so
+                // neither of them would ever open the parent. Their
+                // reference stays in `backing_file_raw` -- so it is still
+                // reported -- and is never resolved.
+                //
+                // The argument for that second group is the invariant this
+                // gate exists to hold, and nothing here weakens it. For an
+                // operation that is not going to read the parent,
+                // resolving it could only change *which* failure the user
                 // sees, never whether the read succeeds -- and it would
                 // make that failure worse, because the outcome would become
                 // contingent on the parent's presence. The same
                 // differencing image would give the typed refusal when its
                 // parent happened to sit beside it and a path error when it
                 // did not. A refusal that depends on a file instar is not
-                // going to read is not a refusal, so a composing caller
-                // must never resolve a parent it will not read.
+                // going to read is not a refusal, so an operation that will
+                // not read the parent must never resolve it -- and the only
+                // way to know which operations those are is for each call
+                // to say which it is.
                 //
                 // A reporting caller has no refusal to make contingent, so
                 // it resolves the parent under the same allowlist and depth
@@ -3022,14 +3259,22 @@ fn discover_backing_chain(
                 // this: the allowlist check still runs and still rejects,
                 // and no rejected path is ever opened.
                 //
-                // The fail-soft is confined to VHD and VHDX. A qcow2 or
-                // VMDK chain still errors on an unresolvable parent for
-                // every caller, reporting ones included, because those
-                // formats compose: a listing that quietly stopped short
-                // would disagree with what the very next `convert` of the
-                // same image does, and the error is the older, tested
-                // behaviour of both `info --chain` and every operation
-                // beside it.
+                // The fail-soft is confined to a reporting caller's VHD
+                // and VHDX hops. A qcow2 or VMDK chain still errors on an
+                // unresolvable parent for every caller, reporting ones
+                // included, because those formats compose: a listing that
+                // quietly stopped short would disagree with what the very
+                // next `convert` of the same image does, and the error is
+                // the older, tested behaviour of both `info --chain` and
+                // every operation beside it. Now that a `convert` of a
+                // differencing VHD or VHDX resolves its parent, that
+                // disagreement does exist for them too -- `info --chain`
+                // ends the listing where a `convert` of the same image
+                // errors on the unresolvable reference. It is left that way
+                // on purpose: `info` must not turn a listing into a
+                // non-zero exit, and the listing still prints the
+                // reference it could not follow, so a user sees the same
+                // broken link either way.
                 //
                 // It is confined per *hop*, not per chain, because the
                 // test below reads the format of the image being examined
@@ -3039,14 +3284,18 @@ fn discover_backing_chain(
                 // reverts to hard errors from that point on. A chain is
                 // therefore not uniformly soft or hard; each step takes
                 // the policy of the image it is leaving.
-                let differencing_vhd = matches!(image_format, ImageFormat::Vhd | ImageFormat::Vhdx);
+                let leaving_vhd_family =
+                    matches!(image_format, ImageFormat::Vhd | ImageFormat::Vhdx);
 
-                match (chain_use, differencing_vhd) {
-                    // Composing caller, differencing VHD or VHDX: the
-                    // parent is recorded but never resolved.
-                    (ChainUse::Compose, true) => {
+                match classify_parent_walk(chain_use, differencing_composition, leaving_vhd_family)
+                {
+                    // A composing caller whose operation does not read a
+                    // differencing parent: the reference is recorded but
+                    // never resolved.
+                    ParentWalk::RecordWithoutResolving => {
                         debug!(
-                            "Differencing {} parent not walked (composition deferred): {}",
+                            "Differencing {} parent recorded but not resolved \
+                             (this operation does not compose a differencing chain): {}",
                             info_result.format, backing_path
                         );
                         break;
@@ -3054,7 +3303,7 @@ fn discover_backing_chain(
                     // Reporting caller, differencing VHD or VHDX: resolve
                     // it, and end the listing rather than the command if
                     // that cannot be done.
-                    (ChainUse::Report, true) => {
+                    ParentWalk::ResolveOrEndListing => {
                         match resolve_reported_parent(
                             &current,
                             &backing_path,
@@ -3074,10 +3323,11 @@ fn discover_backing_chain(
                             }
                         }
                     }
-                    // Every other format, for every caller: unchanged.
-                    // Validate and resolve the backing file path, and
-                    // propagate any error.
-                    (_, false) => {
+                    // Every hop that leaves a non-VHD-family image, and
+                    // every VHD or VHDX hop taken by an operation that
+                    // composes one: validate and resolve the backing file
+                    // path, and propagate any error.
+                    ParentWalk::Resolve => {
                         let backing_resolved =
                             validate_backing_path(&current, &backing_path, security_config)?;
                         current = backing_resolved;
@@ -3430,12 +3680,90 @@ fn open_chain_devices_rw(
     Ok(idx - start_idx)
 }
 
-/// Write a ChainConfig structure to guest memory at CHAIN_CONFIG_ADDR.
+/// Write the `ChainConfig` header and segmentation to guest memory at
+/// CHAIN_CONFIG_ADDR.
+///
+/// The device entries themselves are written separately, by one or more
+/// `write_chain_device_entries` calls, because an operation reading two
+/// images packs two chains into the one array. `segments` describes
+/// what those calls laid out: one `(first, count)` pair per independent
+/// chain, in device order, which is exactly what the guest hands its
+/// chain reader. They must tile `[0, device_count)` exactly, and that
+/// is checked here as well as in the guest — the host has a real error
+/// channel, so a segmentation bug should surface as a message rather
+/// than as a guest that declines to start.
+fn write_chain_config_header(
+    guest_mem: &GuestMemoryMmap,
+    device_count: usize,
+    segments: &[shared::ChainSegment],
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Layout matches shared::ChainConfig exactly:
+    // - magic: u32 (offset 0)
+    // - device_count: u32 (offset 4)
+    // - version: u32 (offset 8)
+    // - segment_count: u32 (offset 12)
+    // - devices: [ChainDeviceInfo; 16] (offset 16)
+    // - segments: [ChainSegment; 16] (offset 528)
+    // - _reserved: [u8; 64] (offset 656)
+    //
+    // ChainDeviceInfo layout (32 bytes each):
+    // - format: u32 (offset 0)
+    // - flags: u32 (offset 4)
+    // - virtual_size: u64 (offset 8)
+    // - actual_size: u64 (offset 16)
+    // - cluster_size: u32 (offset 24)
+    // - data_device_idx: u32 (offset 28)
+    //
+    // ChainSegment layout (8 bytes each):
+    // - first: u32 (offset 0)
+    // - count: u32 (offset 4)
+    if segments.len() > shared::MAX_CHAIN_SEGMENTS {
+        return Err(format!(
+            "chain config describes {} chains, more than the {} the config holds",
+            segments.len(),
+            shared::MAX_CHAIN_SEGMENTS
+        )
+        .into());
+    }
+    if !shared::ChainSegment::covers(segments, device_count) {
+        return Err(format!(
+            "chain config segmentation {:?} does not cover its {device_count} devices exactly",
+            segments
+                .iter()
+                .map(|s| (s.first, s.count))
+                .collect::<Vec<_>>()
+        )
+        .into());
+    }
+
+    guest_mem.write_obj(CHAIN_CONFIG_MAGIC, GuestAddress(CHAIN_CONFIG_ADDR))?;
+    guest_mem.write_obj(device_count as u32, GuestAddress(CHAIN_CONFIG_ADDR + 4))?;
+    guest_mem.write_obj(CHAIN_CONFIG_VERSION, GuestAddress(CHAIN_CONFIG_ADDR + 8))?;
+    guest_mem.write_obj(segments.len() as u32, GuestAddress(CHAIN_CONFIG_ADDR + 12))?;
+
+    let segments_base = CHAIN_CONFIG_ADDR + 528;
+    for (i, seg) in segments.iter().enumerate() {
+        let seg_offset = segments_base + (i as u64 * 8);
+        guest_mem.write_obj(seg.first, GuestAddress(seg_offset))?;
+        guest_mem.write_obj(seg.count, GuestAddress(seg_offset + 4))?;
+    }
+
+    Ok(())
+}
+
+/// Write a ChainConfig structure to guest memory at CHAIN_CONFIG_ADDR
+/// for an operation whose devices form a single backing chain.
 ///
 /// This populates the chain config with metadata about all devices in the
 /// backing chain, allowing guest operations to understand the chain structure
 /// without parsing image headers. If the chain has an external data file,
 /// it is inserted as device 1 between the top image and the backing chain.
+///
+/// An operation that attaches two unrelated images (`compare`, or
+/// `rebase` with a new backing chain) must not use this: the guest
+/// would be told that the second image is behind the first. Those
+/// callers write their device entries themselves and declare one
+/// segment per chain.
 ///
 /// # Arguments
 ///
@@ -3449,24 +3777,6 @@ fn write_chain_config(
     guest_mem: &GuestMemoryMmap,
     chain: &BackingChain,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Build the ChainConfig structure
-    // Layout matches shared::ChainConfig exactly:
-    // - magic: u32 (offset 0)
-    // - device_count: u32 (offset 4)
-    // - version: u32 (offset 8)
-    // - _reserved: u32 (offset 12)
-    // - devices: [ChainDeviceInfo; 16] (offset 16)
-    //
-    // ChainDeviceInfo layout (32 bytes each):
-    // - format: u32 (offset 0)
-    // - flags: u32 (offset 4)
-    // - virtual_size: u64 (offset 8)
-    // - actual_size: u64 (offset 16)
-    // - cluster_size: u32 (offset 24)
-    // - data_device_idx: u32 (offset 28)
-
-    let device_count = chain.total_devices().min(MAX_CHAIN_DEVICES);
-
     if chain.total_devices() > MAX_CHAIN_DEVICES {
         debug!(
             "Chain truncated: {} devices exceeds maximum of {}, only first {} will be passed",
@@ -3476,17 +3786,24 @@ fn write_chain_config(
         );
     }
 
-    // Write header
-    guest_mem.write_obj(CHAIN_CONFIG_MAGIC, GuestAddress(CHAIN_CONFIG_ADDR))?;
-    guest_mem.write_obj(device_count as u32, GuestAddress(CHAIN_CONFIG_ADDR + 4))?;
-    guest_mem.write_obj(CHAIN_CONFIG_VERSION, GuestAddress(CHAIN_CONFIG_ADDR + 8))?;
-    guest_mem.write_obj(0u32, GuestAddress(CHAIN_CONFIG_ADDR + 12))?; // reserved
-
-    // Write device entries (handles data file insertion)
+    // Write device entries (handles data file insertion) before the
+    // header, so `device_count` and the segment are the count of slots
+    // actually written rather than a separately derived figure. The
+    // entry writer inserts a slot per external data file and stops at
+    // MAX_CHAIN_DEVICES, so a count taken from the chain can name
+    // slots the guest was never given.
     let devices_base = CHAIN_CONFIG_ADDR + 16;
-    write_chain_device_entries(guest_mem, chain, devices_base, 0)?;
+    let device_count = write_chain_device_entries(guest_mem, chain, devices_base, 0)?;
 
-    debug!("Wrote chain config at 0x{CHAIN_CONFIG_ADDR:x} ({device_count} devices)");
+    // One chain, every device in it: device 0 is the top image and
+    // each following slot is behind the one before it.
+    let segments = [shared::ChainSegment {
+        first: 0,
+        count: device_count as u32,
+    }];
+    write_chain_config_header(guest_mem, device_count, &segments)?;
+
+    debug!("Wrote chain config at 0x{CHAIN_CONFIG_ADDR:x} ({device_count} devices, 1 chain)");
 
     Ok(())
 }
@@ -5043,6 +5360,7 @@ fn run_bench(args: &BenchArgs, verbose: bool) -> Result<(), Box<dyn std::error::
         sector_size,
         &security_config,
         ChainUse::Compose,
+        DifferencingComposition::Supported,
     )
     .map_err(|e| {
         format!(
@@ -5507,7 +5825,9 @@ fn run_bench_guest(
     // then fails the run with the generic ERROR_PARSE_FAILED. Prefer the
     // captured reason (PLAN-differencing phase 4).
     if serial_decoder.last_differencing_refusal.is_some() {
-        return Err(serial_decoder.differencing_refusal_error("bench").into());
+        return Err(serial_decoder
+            .differencing_refusal_error("bench", DifferencingComposition::Supported)
+            .into());
     }
     if !result_seen {
         return Err(serial_decoder.no_result_error("bench").into());
@@ -6901,6 +7221,7 @@ fn run_rebase(args: RebaseArgs, verbose: bool) -> Result<(), Box<dyn std::error:
         sector_size,
         &security_config,
         ChainUse::Compose,
+        DifferencingComposition::Supported,
     )
     .map_err(|e| -> Box<dyn std::error::Error> { format!("rebase: {e}").into() })?;
     let old_chain_images = old_chain_full.images();
@@ -6913,8 +7234,14 @@ fn run_rebase(args: RebaseArgs, verbose: bool) -> Result<(), Box<dyn std::error:
     // Discover the new chain (only if not detaching).
     let new_chain_full = if let Some(ref p) = resolved_new_backing {
         Some(
-            discover_backing_chain(p, sector_size, &security_config, ChainUse::Compose)
-                .map_err(|e| -> Box<dyn std::error::Error> { format!("rebase: {e}").into() })?,
+            discover_backing_chain(
+                p,
+                sector_size,
+                &security_config,
+                ChainUse::Compose,
+                DifferencingComposition::Supported,
+            )
+            .map_err(|e| -> Box<dyn std::error::Error> { format!("rebase: {e}").into() })?,
         )
     } else {
         None
@@ -7258,11 +7585,17 @@ fn run_commit(args: CommitArgs, verbose: bool) -> Result<(), Box<dyn std::error:
     // mode something to consume.
     let security_config = config::SecurityConfig::default();
     let sector_size = 512u32;
+    // `commit`'s guest reads the overlay and the backing and ignores
+    // the ancestor slots the host populates here, so a differencing
+    // parent is nothing it would ever open. Resolving one could only
+    // turn a command that works today into a path error whenever the
+    // parent is absent.
     let backing_chain_full = discover_backing_chain(
         &resolved_backing_path,
         sector_size,
         &security_config,
         ChainUse::Compose,
+        DifferencingComposition::Unsupported,
     )
     .map_err(|e| -> Box<dyn std::error::Error> { format!("commit: {e}").into() })?;
     let backing_chain_images = backing_chain_full.images();
@@ -10053,20 +10386,56 @@ fn run_rebase_guest(
 
     // --- Write the combined chain config at CHAIN_CONFIG_ADDR ----------
     // The guest's safe-mode runner indexes `chain_config.devices[]`
-    // by input device slot; concatenate the old chain and the new
+    // by input device slot; lay the old chain down and then the new
     // chain in the same order they were attached so slot N in the
     // guest matches `devices[N]`. Unsafe mode ignores chain config.
-    let mut combined_chain = BackingChain::new();
-    for img in old_chain_parents.images() {
-        combined_chain.push(img.clone());
-    }
-    if let Some(chain) = new_chain {
-        for img in chain.images() {
-            combined_chain.push(img.clone());
+    //
+    // These are two independent chains, not one: the new backing
+    // chain is not behind the old one. They get a segment each, so
+    // the guest is never told that the first device of the new chain
+    // is a parent of the last device of the old one. The entries are
+    // written here rather than through `write_chain_config`, which
+    // takes a single chain and so cannot describe this.
+    let devices_base = CHAIN_CONFIG_ADDR + 16;
+    let mut segments: Vec<shared::ChainSegment> = Vec::new();
+    let mut written = 0usize;
+    for chain in [Some(old_chain_parents), new_chain].into_iter().flatten() {
+        let count = write_chain_device_entries(&guest_mem, chain, devices_base, written)?;
+        // A detach with no parents, or a rebase onto a chain with
+        // nothing to attach, contributes no devices. An empty segment
+        // would be a chain with no top image, so skip it rather than
+        // declare one.
+        if count > 0 {
+            segments.push(shared::ChainSegment {
+                first: written as u32,
+                count: count as u32,
+            });
+            written += count;
         }
     }
-    if combined_chain.total_devices() > 0 {
-        write_chain_config(&guest_mem, &combined_chain)?;
+    // The guest derives its own device count from the RebaseConfig
+    // chain extents written above, not from `device_count`, so the two
+    // must agree or its segmentation check will refuse a sound config.
+    // A real error rather than a debug assertion: a release build is
+    // what ships, and without this the guest refuses the segmentation
+    // and the user sees a generic failure with no clue that the host
+    // built it wrong. `write_chain_config_header` reports a bad
+    // segmentation the same way.
+    let expected_devices = old_chain_input_devices + new_chain_input_devices;
+    if written != expected_devices {
+        return Err(format!(
+            "chain config describes {written} devices but the RebaseConfig \
+             chain extents describe {expected_devices} \
+             ({old_chain_input_devices} old + {new_chain_input_devices} new)"
+        )
+        .into());
+    }
+    if written > 0 {
+        write_chain_config_header(&guest_mem, written, &segments)?;
+        debug!(
+            "Wrote chain config at 0x{CHAIN_CONFIG_ADDR:x} ({written} devices, {} chains)",
+            segments.len()
+        );
     }
 
     let guest_mem = Arc::new(guest_mem);
@@ -10244,6 +10613,15 @@ fn run_rebase_guest(
 
     if let Some(error) = vm_error {
         return Err(error.into());
+    }
+    // A differencing source in the old or new chain is refused inside
+    // `init_chain_states`, which then fails the run with the generic
+    // ERROR_PARSE_FAILED. Prefer the captured reason, matching convert,
+    // dd, compare and bench.
+    if serial_decoder.last_differencing_refusal.is_some() {
+        return Err(serial_decoder
+            .differencing_refusal_error("rebase", DifferencingComposition::Supported)
+            .into());
     }
     if !result_seen {
         return Err(serial_decoder.no_result_error("rebase").into());
@@ -10708,11 +11086,16 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
         let input_path = Path::new(&args.input);
         let security_config = config::load_config().config.security;
 
+        // `info` composes nothing, so it states no composition
+        // capability; `ChainUse::Report` is what decides that it
+        // resolves a differencing parent, and fails soft when it
+        // cannot.
         match discover_backing_chain(
             input_path,
             args.sector_size,
             &security_config,
             ChainUse::Report,
+            DifferencingComposition::Unsupported,
         ) {
             Ok(chain) => {
                 if args.output == "json" {
@@ -11655,11 +12038,15 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
     let force_chain_for_descriptor = peek_is_vmdk_descriptor(input_path).unwrap_or(false);
     let chain = if args.chain || force_chain_for_descriptor {
         let security_config = config::load_config().config.security;
+        // `check` refuses a differencing VHD or VHDX source by name,
+        // with its own typed refusal, so it must not resolve a parent
+        // it is never going to validate.
         match discover_backing_chain(
             input_path,
             args.sector_size,
             &security_config,
             ChainUse::Compose,
+            DifferencingComposition::Unsupported,
         ) {
             Ok(chain) => {
                 if verbose {
@@ -12098,7 +12485,9 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
     // Returning Err (exit 1) is what keeps "refused" distinct from both
     // "clean" (exit 0) and "corrupt" (exit 2) (PLAN-differencing phase 4).
     if serial_decoder.last_differencing_refusal.is_some() {
-        return Err(serial_decoder.differencing_refusal_error("check").into());
+        return Err(serial_decoder
+            .differencing_refusal_error("check", DifferencingComposition::Unsupported)
+            .into());
     }
 
     // Map the post-repair CheckResult to a qemu-img-parity process exit
@@ -12405,6 +12794,7 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         args.sector_size,
         &security_config,
         ChainUse::Compose,
+        DifferencingComposition::Supported,
     )
     .map_err(|e| match &e {
         ChainError::UnsupportedInputFormat(_) => format!("compare: {e}"),
@@ -12415,6 +12805,7 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         args.sector_size,
         &security_config,
         ChainUse::Compose,
+        DifferencingComposition::Supported,
     )
     .map_err(|e| match &e {
         ChainError::UnsupportedInputFormat(_) => format!("compare: {e}"),
@@ -12516,6 +12907,19 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     }
     guest_mem.write_obj(COMPARE_CONFIG_MAGIC, GuestAddress(OPERATION_CONFIG_ADDR))?;
     guest_mem.write_obj(compare_flags, GuestAddress(OPERATION_CONFIG_ADDR + 4))?;
+    // These two counts come from `total_devices()`, while the
+    // ChainConfig segments further down come from what the entry
+    // writer reports it wrote. The two cannot disagree: truncation in
+    // the entry writer is the only thing that would separate them, and
+    // the combined-depth check above has already refused anything that
+    // would truncate, naming both chain depths and the limit.
+    // `total_devices()` counts exactly the slots that writer emits --
+    // one per image plus one per external data file.
+    //
+    // Deriving these from the written counts instead would be a
+    // regression rather than a tightening: it would turn that refusal
+    // into a silently truncated comparison, which is the one answer
+    // `compare` must never give.
     guest_mem.write_obj(
         chain1.total_devices() as u32,
         GuestAddress(OPERATION_CONFIG_ADDR + 8),
@@ -12580,21 +12984,37 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     // Write ChainConfig with format metadata for all chain images
     // Devices are laid out: [chain1 devices...] [chain2 devices...]
     // Each chain may include an external data file device after its top image.
-    guest_mem.write_obj(CHAIN_CONFIG_MAGIC, GuestAddress(CHAIN_CONFIG_ADDR))?;
-    guest_mem.write_obj(total_devices as u32, GuestAddress(CHAIN_CONFIG_ADDR + 4))?;
-    guest_mem.write_obj(CHAIN_CONFIG_VERSION, GuestAddress(CHAIN_CONFIG_ADDR + 8))?;
-    guest_mem.write_obj(0u32, GuestAddress(CHAIN_CONFIG_ADDR + 12))?; // reserved
-
+    //
+    // The two chains are independent — image2 is not behind image1 —
+    // so each gets its own segment. Both the device count and the
+    // segment bounds come from what `write_chain_device_entries`
+    // reports it wrote, not from `total_devices()`: the entry writer
+    // inserts a slot per external data file and stops at
+    // MAX_CHAIN_DEVICES, so a segment derived from the chain itself
+    // can name slots the guest was never given.
     let devices_base = CHAIN_CONFIG_ADDR + 16;
     let chain1_written = write_chain_device_entries(&guest_mem, &chain1, devices_base, 0)?;
-    write_chain_device_entries(&guest_mem, &chain2, devices_base, chain1_written)?;
+    let chain2_written =
+        write_chain_device_entries(&guest_mem, &chain2, devices_base, chain1_written)?;
+
+    let segments = [
+        shared::ChainSegment {
+            first: 0,
+            count: chain1_written as u32,
+        },
+        shared::ChainSegment {
+            first: chain1_written as u32,
+            count: chain2_written as u32,
+        },
+    ];
+    write_chain_config_header(&guest_mem, chain1_written + chain2_written, &segments)?;
 
     debug!(
         "Wrote chain config at 0x{:x}: device_count={}, chain1={}, chain2={}",
         CHAIN_CONFIG_ADDR,
-        total_devices,
-        chain1.total_devices(),
-        chain2.total_devices()
+        chain1_written + chain2_written,
+        chain1_written,
+        chain2_written
     );
 
     // Create device set for managing virtio-block devices
@@ -12838,7 +13258,9 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     // captured reason rather than the generic text (PLAN-differencing
     // phase 4, closing issue #548).
     if serial_decoder.last_differencing_refusal.is_some() {
-        return Err(serial_decoder.differencing_refusal_error("compare").into());
+        return Err(serial_decoder
+            .differencing_refusal_error("compare", DifferencingComposition::Supported)
+            .into());
     }
 
     // Return error if no result was received
@@ -13253,6 +13675,7 @@ fn execute_convert(
         exec.sector_size,
         &security_config,
         ChainUse::Compose,
+        DifferencingComposition::Supported,
     )
     .map_err(|e| match &e {
         // `execute_convert` is shared by convert and dd, but dd runs
@@ -13907,7 +14330,9 @@ fn execute_convert(
             } else {
                 "convert"
             };
-            return Err(serial_decoder.differencing_refusal_error(op).into());
+            return Err(serial_decoder
+                .differencing_refusal_error(op, DifferencingComposition::Supported)
+                .into());
         }
         return Err("convert operation failed".into());
     }
@@ -14405,8 +14830,7 @@ fn parse_create_o_options(
                 ("qcow2", "data_file") | ("qcow2", "data_file_raw") => {
                     return Err(format!(
                         "create: -o key '{}' is not yet supported \
-                         (external data files are deferred — see \
-                         PLAN-convert-followups.md and PLAN-create.md future work)",
+                         (external data files are not implemented)",
                         key
                     )
                     .into());
@@ -14414,7 +14838,7 @@ fn parse_create_o_options(
                 ("qcow2", k) if k.starts_with("encrypt.") => {
                     return Err(format!(
                         "create: -o key '{}' is not yet supported \
-                         (encrypted create is deferred — see PLAN-create.md future work)",
+                         (encrypted qcow2 creation is not implemented)",
                         k
                     )
                     .into());
@@ -14470,7 +14894,7 @@ fn parse_create_o_options(
                     "dynamic" => { /* default */ }
                     "fixed" => {
                         return Err("create: -O vhdx -o subformat=fixed is not yet supported \
-                                    (vhdx-fixed lands in phase 5 of PLAN-create.md)"
+                                    (only the dynamic vhdx subformat is implemented)"
                             .into())
                     }
                     _ => {
@@ -14495,7 +14919,7 @@ fn parse_create_o_options(
                     "metadata" | "falloc" | "full" => {
                         return Err(format!(
                             "create: -o preallocation={} is not yet supported for {} \
-                             (non-qcow2 preallocation is future work — see PLAN-create.md)",
+                             (preallocation is implemented for raw and qcow2 only)",
                             value, target
                         )
                         .into())
@@ -14684,6 +15108,7 @@ fn run_dd(args: DdArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>>
         sector_size,
         &security_config,
         ChainUse::Compose,
+        DifferencingComposition::Supported,
     )
     .map_err(|e| match &e {
         ChainError::UnsupportedInputFormat(_) => format!("dd: {e}"),
@@ -15298,7 +15723,9 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     // otherwise reports the generic "unsupported format" (PLAN-differencing
     // phase 4).
     if serial_decoder.last_differencing_refusal.is_some() {
-        return Err(serial_decoder.differencing_refusal_error("measure").into());
+        return Err(serial_decoder
+            .differencing_refusal_error("measure", DifferencingComposition::Unsupported)
+            .into());
     }
 
     if !measure_result_seen {
@@ -15741,8 +16168,8 @@ fn map_error_message(error: u32) -> Option<&'static str> {
         MAP_RESULT_ERROR_INVALID_SOURCE => Some("map: source format unrecognised"),
         MAP_RESULT_ERROR_INVALID_OPTION => Some("map: invalid config"),
         MAP_RESULT_ERROR_HAS_BACKING => Some(
-            "map: source has a backing/parent reference; \
-             chain composition is deferred (see PLAN-map.md)",
+            "map: source has a backing/parent reference; map reads an \
+             image on its own rather than composing a parent into it",
         ),
         MAP_RESULT_ERROR_IO => Some("map: I/O failure walking the source"),
         _ => Some("map: unknown error"),
@@ -18045,9 +18472,8 @@ fn create_error_detail(code: u32) -> &'static str {
              pass an explicit SIZE that fits)"
         }
         CREATE_RESULT_ERROR_BACKING_DIFFERENCING => {
-            "backing file is a differencing VHD or VHDX whose parent \
-             instar cannot yet compose; an overlay on it could not be \
-             read back (see PLAN-differencing.md)"
+            "backing file is a differencing VHD or VHDX; create does \
+             not support stacking a backing file on one"
         }
         CREATE_RESULT_ERROR_PARENT_NAME_TOO_LONG => {
             // A relative path caps two code units shorter than an
@@ -18425,9 +18851,8 @@ fn validate_create_args(args: &CreateArgs) -> Result<(), Box<dyn std::error::Err
     // writes.
     if args.sector_size != 512 {
         return Err(format!(
-            "create: --sector-size must be 512 in phase 3 \
-             (larger sector sizes are deferred — see PLAN-create.md \
-             phase 5; got {})",
+            "create: --sector-size must be 512 \
+             (larger sector sizes are not yet implemented; got {})",
             args.sector_size
         )
         .into());
@@ -18486,8 +18911,8 @@ fn validate_create_args(args: &CreateArgs) -> Result<(), Box<dyn std::error::Err
             }
             if args.subformat == "monolithicFlat" {
                 return Err("create: vmdk monolithicFlat is not yet supported \
-                            (multi-file subformats land in phase 5 of \
-                            PLAN-create.md; use instar convert -O vmdk for now)"
+                            (multi-file subformats are not implemented; \
+                            use instar convert -O vmdk for now)"
                     .into());
             }
         }
@@ -18530,7 +18955,7 @@ fn validate_create_args(args: &CreateArgs) -> Result<(), Box<dyn std::error::Err
         ("vmdk" | "vpc" | "vhdx", mode @ ("metadata" | "falloc" | "full")) => {
             return Err(format!(
                 "create: --preallocation={} is not yet supported for {} \
-                 (non-qcow2 preallocation is future work — see PLAN-create.md)",
+                 (preallocation is implemented for raw and qcow2 only)",
                 mode, args.target_format
             )
             .into());
@@ -18926,21 +19351,21 @@ mod create_option_tests {
     }
 
     #[test]
-    fn encrypt_keys_return_deferred_error() {
+    fn encrypt_keys_return_not_implemented_error() {
         let err = parse_create_o_options("qcow2", &s("encrypt.cipher=aes"))
             .unwrap_err()
             .to_string();
         assert!(err.contains("encrypt"));
-        assert!(err.contains("deferred"));
+        assert!(err.contains("not implemented"));
     }
 
     #[test]
-    fn data_file_returns_deferred_error() {
+    fn data_file_returns_not_implemented_error() {
         let err = parse_create_o_options("qcow2", &s("data_file=ext.bin"))
             .unwrap_err()
             .to_string();
         assert!(err.contains("data_file"));
-        assert!(err.contains("deferred"));
+        assert!(err.contains("not implemented"));
     }
 
     #[test]
@@ -18980,7 +19405,7 @@ mod create_option_tests {
         let err = parse_create_o_options("vmdk", &s("preallocation=metadata"))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("non-qcow2 preallocation is future work"));
+        assert!(err.contains("preallocation is implemented for raw and qcow2 only"));
     }
 
     #[test]
@@ -19552,10 +19977,14 @@ mod map_renderer_tests {
     }
 
     #[test]
-    fn error_has_backing_mentions_chain_followup() {
+    fn error_has_backing_explains_why_it_refuses() {
         let msg = map_error_message(MAP_RESULT_ERROR_HAS_BACKING)
             .expect("has-backing error must have message");
-        assert!(msg.contains("chain") || msg.contains("PLAN-map"));
+        assert!(msg.contains("composing a parent"));
+        assert!(
+            !msg.contains("PLAN-"),
+            "no user-visible string may cite a plan file: {msg}"
+        );
     }
 
     // ================================================================

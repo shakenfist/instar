@@ -227,23 +227,6 @@ pub const SB_BLOCK_PRESENT: u64 = 6;
 /// describes one whole chunk with nothing left over.
 pub const SB_BLOCK_SIZE: u32 = 1024 * 1024;
 
-/// Lowest file offset at which any VHDX block may begin.
-///
-/// The first megabyte of a VHDX file is fixed structure: the file
-/// identifier at 0, the two headers at 64 KiB and 128 KiB, the two
-/// region tables at 192 KiB and 256 KiB, and reserved space to 1 MiB.
-/// Payload blocks, sector bitmap blocks, the BAT and the metadata
-/// region all live above it, and the spec requires every one of them
-/// to be megabyte-aligned.
-///
-/// A BAT entry is a state in its low bits and an offset in the rest,
-/// so a zeroed or truncated entry that still carries a present state
-/// names offset 0 -- the file identifier. Reading a block from there
-/// answers a question about ownership with bytes that describe
-/// nothing of the kind. Refusing the offset costs one comparison and
-/// turns that into a failed read (issue #547).
-pub const MIN_BLOCK_FILE_OFFSET: u64 = 1024 * 1024;
-
 /// Mask for extracting the file offset from a BAT entry (bits 20-63).
 /// The offset is in units of 1 MB.
 pub const BAT_ENTRY_OFFSET_MASK: u64 = 0xFFFF_FFFF_FFF0_0000;
@@ -1776,12 +1759,12 @@ pub fn sb_bat_index(block_index: u64, chunk_ratio: u32) -> Option<u64> {
 /// entries, because a group's sector bitmap entry sits at the end of
 /// the group whether or not every payload entry ahead of it is backed
 /// by virtual disk. An image with no parent stops at the last entry it
-/// actually needs, which is the shorter count `calculate_bat_layout`
-/// returns.
+/// actually needs, which is the shorter count
+/// `calculate_bat_layout(.., false)` returns.
 ///
-/// The difference only ever matters to a reader resolving a sector
-/// bitmap: the writer side still sizes every BAT it emits by the
-/// shorter rule, which is issue #623.
+/// This is the rule `calculate_bat_layout` applies when its
+/// `has_parent` argument is set, and the only place it is written
+/// down; a reader resolving a sector bitmap bounds itself by it.
 ///
 /// Returns `None` for a degenerate chunk ratio and on overflow.
 pub fn differencing_bat_entry_count(total_payload_blocks: u64, chunk_ratio: u32) -> Option<u64> {
@@ -1876,6 +1859,39 @@ fn coalesce_ownership_run<F: FnMut(u32) -> Option<u8>>(
     })
 }
 
+/// Whether half-open byte range `[offset, offset + len)` intersects
+/// `[region_offset, region_offset + region_len)`.
+///
+/// Standard half-open interval overlap: the ranges intersect iff
+/// `offset < region_end && region_offset < end`. Either sum can
+/// overflow for a crafted offset or length -- both come from an
+/// untrusted BAT entry or region table -- and an end this cannot
+/// compute is not one this function can prove clear of the region,
+/// so overflow counts as overlap rather than being waved through.
+///
+/// An empty range intersects nothing, and is answered before either
+/// sum is formed. Without that, a region entry declaring zero length
+/// would still refuse any block whose range strictly contains its
+/// offset -- `offset < region_offset < end` with `region_end ==
+/// region_offset` -- while one declared at or below the block's start
+/// was waved through. A region naming no bytes can hide nothing, so
+/// the inconsistency bought no safety; `init` does not reject a
+/// zero-length entry, so it is reachable from a hostile image.
+fn ranges_overlap(offset: u64, len: u64, region_offset: u64, region_len: u32) -> bool {
+    if len == 0 || region_len == 0 {
+        return false;
+    }
+    let end = match offset.checked_add(len) {
+        Some(e) => e,
+        None => return true,
+    };
+    let region_end = match region_offset.checked_add(u64::from(region_len)) {
+        Some(e) => e,
+        None => return true,
+    };
+    offset < region_end && region_offset < end
+}
+
 // ============================================================================
 // VHDX state for BAT I/O
 // ============================================================================
@@ -1904,9 +1920,34 @@ pub struct VhdxState {
     /// still cannot read past the region. `total_bat_entries` keeps
     /// the shorter count because it also sizes the whole-BAT walks in
     /// `scan_allocation` and `map_extents`, which must not run off
-    /// the end of a region a writer sized by that same rule -- and
-    /// instar's writer does, which is issue #623.
+    /// the end of a region a writer sized by that same rule.
     pub sb_bat_entry_bound: u32,
+    /// `(file_offset, length)` of every entry this image's region
+    /// table declares, recognised or not, up to the same eight-entry
+    /// cap `init` itself scans (`entry_count.min(8)`).
+    ///
+    /// SPEC(VHDX) allows a region table up to 2047 entries, so that cap
+    /// leaves later entries out of the overlap test. It is not a place
+    /// to hide a region this reader relies on: the same scan is what
+    /// sets `found_bat` and `found_metadata`, and `init` returns `None`
+    /// when either is missing, so an image declaring the BAT or the
+    /// metadata region past the eighth entry does not open. What a
+    /// longer table can keep out of the test is an *unrecognised*
+    /// region, whose bytes nothing here reads as structure.
+    ///
+    /// A payload or sector bitmap block must not overlap any of
+    /// these: an entry naming a block inside the BAT or metadata
+    /// region is just as malformed as one naming the file identifier,
+    /// and an unrecognised region is just as real a structure as
+    /// those two (issue #625). SPEC(VHDX) does not require a region
+    /// to precede the blocks it coexists with, so this has to be an
+    /// overlap test against each declared range rather than a single
+    /// low-water mark: a region a writer legally placed after every
+    /// block would otherwise raise the mark past them and refuse a
+    /// well-formed image. See [`VhdxState::block_overlaps_a_declared_region`].
+    pub regions: [(u64, u32); 8],
+    /// How many of [`Self::regions`] are populated, from the front.
+    pub region_count: u32,
     /// `HasParent` from the file parameters metadata item: the image
     /// is a differencing (parent-referencing) VHDX whose real content
     /// lives partly in a parent file.
@@ -2025,6 +2066,14 @@ impl VhdxState {
         let mut metadata_length: u32 = 0;
         let mut found_bat = false;
         let mut found_metadata = false;
+        // Every entry the table carries, recognised or not, for the
+        // overlap test `block_lookup` and `sector_bitmap_lookup` run
+        // against a candidate block's byte range. `entry_count.min(8)`
+        // below already caps how many entries this scan ever looks
+        // at, so the array is sized to match exactly rather than
+        // picked to be "big enough".
+        let mut regions: [(u64, u32); 8] = [(0, 0); 8];
+        let mut region_count: u32 = 0;
 
         for i in 0..entry_count.min(8) {
             let eoff = rt_off + REGION_TABLE_HEADER_SIZE + (i as usize * REGION_TABLE_ENTRY_SIZE);
@@ -2035,13 +2084,18 @@ impl VhdxState {
             let mut guid = [0u8; 16];
             guid.copy_from_slice(&rt_buffer[eoff..eoff + 16]);
 
+            let entry_offset = le_u64(&rt_buffer, eoff + 16);
+            let entry_length = le_u32(&rt_buffer, eoff + 24);
+            regions[region_count as usize] = (entry_offset, entry_length);
+            region_count += 1;
+
             if guid == BAT_REGION_GUID {
-                bat_offset = le_u64(&rt_buffer, eoff + 16);
-                bat_length = le_u32(&rt_buffer, eoff + 24);
+                bat_offset = entry_offset;
+                bat_length = entry_length;
                 found_bat = true;
             } else if guid == METADATA_REGION_GUID {
-                metadata_offset = le_u64(&rt_buffer, eoff + 16);
-                metadata_length = le_u32(&rt_buffer, eoff + 24);
+                metadata_offset = entry_offset;
+                metadata_length = entry_length;
                 found_metadata = true;
             }
         }
@@ -2115,7 +2169,8 @@ impl VhdxState {
         // reaching past the BAT region, and the region size check
         // above deliberately stays on the shorter count: tightening
         // it would refuse differencing images that load today,
-        // including any instar wrote itself (issue #623).
+        // including the ones instar wrote before it sized a
+        // differencing BAT by the padded rule.
         let sb_bat_entry_bound = if metadata.has_parent {
             let padded = differencing_bat_entry_count(total_blocks, chunk_ratio_u32)?;
             let region_entries = u64::from(bat_length) / 8;
@@ -2133,6 +2188,8 @@ impl VhdxState {
             total_bat_entries: total_bat_entries_u32,
             chunk_ratio: chunk_ratio_u32,
             sb_bat_entry_bound,
+            regions,
+            region_count,
             has_parent: metadata.has_parent,
             bat_cached_sector: u64::MAX,
             bat_cache_buf,
@@ -2248,6 +2305,21 @@ impl VhdxState {
         VhdxHeader::parse(&header_buf)
     }
 
+    /// Whether a block's byte range `[offset, offset + len)` overlaps
+    /// any region [`Self::regions`] declares.
+    ///
+    /// One helper for all three call sites -- `block_lookup`'s two
+    /// payload arms and `sector_bitmap_lookup` -- so they cannot
+    /// drift onto different definitions of "overlap" from each
+    /// other.
+    fn block_overlaps_a_declared_region(&self, offset: u64, len: u64) -> bool {
+        self.regions[..self.region_count as usize]
+            .iter()
+            .any(|&(region_offset, region_length)| {
+                ranges_overlap(offset, len, region_offset, region_length)
+            })
+    }
+
     /// Look up the host location for a given virtual byte offset.
     ///
     /// Reads the BAT entry for the containing block, accounting for
@@ -2299,7 +2371,17 @@ impl VhdxState {
             }
             PAYLOAD_BLOCK_ZERO => Some(VhdxBlockLookup::Zero),
             PAYLOAD_BLOCK_FULLY_PRESENT => {
-                if file_offset < MIN_BLOCK_FILE_OFFSET {
+                // A BAT entry's offset is always a whole megabyte (the
+                // mask clears the low 20 bits), so the only value a
+                // zeroed or truncated entry that still reads as
+                // present can name is exactly zero -- the file
+                // identifier, which is fixed structure rather than a
+                // region table entry, so the overlap test below would
+                // not catch it on its own (issue #547).
+                if file_offset == 0 {
+                    return None;
+                }
+                if self.block_overlaps_a_declared_region(file_offset, u64::from(self.block_size)) {
                     return None;
                 }
                 let intra_block_offset = virtual_offset % self.block_size as u64;
@@ -2327,7 +2409,14 @@ impl VhdxState {
                 if !self.has_parent {
                     return None;
                 }
-                if file_offset < MIN_BLOCK_FILE_OFFSET {
+                // Same reasoning as the fully present arm above: a
+                // zeroed or truncated entry names offset zero, which
+                // is not a region table entry and so would not be
+                // caught by the overlap test alone (issue #547).
+                if file_offset == 0 {
+                    return None;
+                }
+                if self.block_overlaps_a_declared_region(file_offset, u64::from(self.block_size)) {
                     return None;
                 }
                 let intra_block_offset = virtual_offset % self.block_size as u64;
@@ -2430,13 +2519,20 @@ impl VhdxState {
         if state != SB_BLOCK_PRESENT {
             return None;
         }
-        // And a present entry still has to name a plausible place. The
-        // offset mask keeps the low twenty bits clear, so the only
-        // value below the first megabyte is zero -- a zeroed or
-        // truncated entry whose state bits happen to read as present.
-        // The file identifier lives there, and its bytes would be
-        // served as an answer about which sectors the child owns.
-        if file_offset < MIN_BLOCK_FILE_OFFSET {
+        // And a present entry still has to name a plausible place. A
+        // zeroed or truncated entry whose state bits happen to read
+        // as present names offset zero -- the file identifier, not a
+        // region table entry, so the overlap test below would not
+        // catch it on its own (issue #547).
+        if file_offset == 0 {
+            return None;
+        }
+        // And it must not land inside the BAT or metadata region
+        // itself, or any other region the image declares, which a
+        // fixed 1 MiB floor could not tell from real bitmap data
+        // (issue #625). A sector bitmap block is `SB_BLOCK_SIZE`
+        // bytes, not `self.block_size`.
+        if self.block_overlaps_a_declared_region(file_offset, u64::from(SB_BLOCK_SIZE)) {
             return None;
         }
 
@@ -3354,21 +3450,47 @@ pub fn build_bat_entry(state: u64, file_offset: u64) -> u64 {
 /// Returns `(total_bat_entries, chunk_ratio, total_payload_blocks)`.
 /// Returns `None` if the layout overflows u32 (e.g. extreme
 /// virtual_disk_size from a malicious image).
+///
+/// `has_parent` selects between the format's two BAT sizing rules, and
+/// is required rather than defaulted because the two differ by up to
+/// `chunk_ratio - 1` entries and a caller that guessed would emit a
+/// region a conforming reader refuses:
+///
+/// * An image with no parent stops at the last entry it needs, which
+///   is one entry per payload block plus the sector bitmap entry that
+///   ends each group those blocks reach into.
+/// * A differencing image reserves whole groups of `chunk_ratio + 1`
+///   entries, because a group's bitmap entry sits at the end of the
+///   group whether or not every payload entry ahead of it is backed by
+///   virtual disk. [`differencing_bat_entry_count`] is that rule, and
+///   the one place it is written down.
+///
+/// A degenerate `chunk_ratio` of zero yields `None` for a differencing
+/// image: with no group size there is no group to pad out to, and
+/// guessing one would size a region by arithmetic the format does not
+/// define. The no-parent rule has no group to reserve and so keeps
+/// counting payload blocks alone.
 pub fn calculate_bat_layout(
     virtual_disk_size: u64,
     block_size: u32,
     logical_sector_size: u32,
+    has_parent: bool,
 ) -> Option<(u32, u32, u32)> {
     let total_blocks_u64 = virtual_disk_size.div_ceil(block_size as u64);
     let chunk_ratio_u64 = (1u64 << 23) * logical_sector_size as u64 / block_size as u64;
     let total_blocks = u32::try_from(total_blocks_u64).ok()?;
     let chunk_ratio = u32::try_from(chunk_ratio_u64).ok()?;
-    let sb_entries = if chunk_ratio > 0 {
-        total_blocks.div_ceil(chunk_ratio)
+    let total_bat_entries = if has_parent {
+        let padded = differencing_bat_entry_count(total_blocks_u64, chunk_ratio)?;
+        u32::try_from(padded).ok()?
     } else {
-        0
+        let sb_entries = if chunk_ratio > 0 {
+            total_blocks.div_ceil(chunk_ratio)
+        } else {
+            0
+        };
+        total_blocks.checked_add(sb_entries)?
     };
-    let total_bat_entries = total_blocks.checked_add(sb_entries)?;
     Some((total_bat_entries, chunk_ratio, total_blocks))
 }
 
@@ -3521,47 +3643,121 @@ mod tests {
     #[test]
     fn bat_layout_1gb_32mb_blocks() {
         let (total, chunk_ratio, payload_blocks) =
-            calculate_bat_layout(1024 * 1024 * 1024, DEFAULT_BLOCK_SIZE, 512).unwrap();
+            calculate_bat_layout(1024 * 1024 * 1024, DEFAULT_BLOCK_SIZE, 512, false).unwrap();
         assert_eq!(payload_blocks, 32); // 1GB / 32MB
         assert_eq!(chunk_ratio, 128); // (2^23 * 512) / 32MB
                                       // SB entries = ceil(32/128) = 1
         assert_eq!(total, 33);
+
+        // The same disk as a differencing child: one whole group of
+        // 128 payload entries plus its bitmap entry, 96 of whose
+        // payload entries the 1 GiB virtual disk never reaches.
+        let (total, chunk_ratio, payload_blocks) =
+            calculate_bat_layout(1024 * 1024 * 1024, DEFAULT_BLOCK_SIZE, 512, true).unwrap();
+        assert_eq!(payload_blocks, 32);
+        assert_eq!(chunk_ratio, 128);
+        assert_eq!(total, 129);
     }
 
     #[test]
     fn bat_layout_4gb_32mb_blocks() {
         let (total, chunk_ratio, payload_blocks) =
-            calculate_bat_layout(4u64 * 1024 * 1024 * 1024, DEFAULT_BLOCK_SIZE, 512).unwrap();
+            calculate_bat_layout(4u64 * 1024 * 1024 * 1024, DEFAULT_BLOCK_SIZE, 512, false)
+                .unwrap();
         assert_eq!(payload_blocks, 128);
         assert_eq!(chunk_ratio, 128);
         // 128 payload + ceil(128/128)=1 SB
+        assert_eq!(total, 129);
+
+        // The one geometry where the two rules agree: the virtual disk
+        // is an exact whole number of chunk groups, so the no-parent
+        // count has nothing left to pad. A test that only used a
+        // geometry like this could not tell the rules apart, which is
+        // why the cases above and below do not.
+        let (total, _chunk_ratio, _payload_blocks) =
+            calculate_bat_layout(4u64 * 1024 * 1024 * 1024, DEFAULT_BLOCK_SIZE, 512, true).unwrap();
         assert_eq!(total, 129);
     }
 
     #[test]
     fn bat_layout_256mb_1mb_blocks() {
         let (total, chunk_ratio, payload_blocks) =
-            calculate_bat_layout(256 * 1024 * 1024, 1024 * 1024, 512).unwrap();
+            calculate_bat_layout(256 * 1024 * 1024, 1024 * 1024, 512, false).unwrap();
         assert_eq!(payload_blocks, 256);
         assert_eq!(chunk_ratio, 4096); // (2^23 * 512) / 1MB
                                        // SB entries = ceil(256/4096) = 1
         assert_eq!(total, 257);
+
+        // A disk smaller than one group still reserves the whole
+        // group: 4096 payload entries and the bitmap entry at their
+        // end, which is BAT index 4096 and so out of reach of the
+        // 257-entry no-parent count.
+        let (total, _chunk_ratio, _payload_blocks) =
+            calculate_bat_layout(256 * 1024 * 1024, 1024 * 1024, 512, true).unwrap();
+        assert_eq!(total, 4097);
+        assert_eq!(sb_bat_index(0, 4096), Some(4096));
+    }
+
+    /// The padded count is what `differencing_bat_entry_count` says,
+    /// not an independent third derivation.
+    ///
+    /// Swept across both logical sector sizes and the whole block-size
+    /// range, because `chunk_ratio` is a function of both and the two
+    /// rules diverge by up to `chunk_ratio - 1` entries.
+    #[test]
+    fn bat_layout_differencing_count_matches_the_padded_rule() {
+        // Not a whole number of chunk groups at every block size, which
+        // is the case the two rules disagree about.
+        const SIZES: [u64; 5] = [1 << 20, 1 << 30, (1 << 30) + (1 << 20), 1 << 32, 1 << 40];
+        for &lss in &[512u32, 4096] {
+            for bs_log in 20..=28u32 {
+                let block_size = 1u32 << bs_log;
+                for &virtual_size in &SIZES {
+                    let (total, chunk_ratio, payload_blocks) =
+                        calculate_bat_layout(virtual_size, block_size, lss, true).unwrap();
+                    assert_eq!(
+                        u64::from(total),
+                        differencing_bat_entry_count(u64::from(payload_blocks), chunk_ratio)
+                            .unwrap(),
+                        "lss={lss} bs={block_size} vsize={virtual_size}",
+                    );
+                    // And the last payload block's own group bitmap
+                    // entry is inside the count, which is the whole
+                    // point of padding it.
+                    let last = u64::from(payload_blocks) - 1;
+                    assert!(
+                        sb_bat_index(last, chunk_ratio).unwrap() < u64::from(total),
+                        "lss={lss} bs={block_size} vsize={virtual_size}: the last \
+                         group's bitmap entry is past the BAT",
+                    );
+                }
+            }
+        }
     }
 
     #[test]
     fn bat_layout_overflow_returns_none() {
         // Extreme virtual_disk_size that would overflow u32
-        assert!(calculate_bat_layout(u64::MAX, 1024 * 1024, 512).is_none());
+        assert!(calculate_bat_layout(u64::MAX, 1024 * 1024, 512, false).is_none());
+        assert!(calculate_bat_layout(u64::MAX, 1024 * 1024, 512, true).is_none());
         // Large enough to overflow u32 total_blocks with 1MB blocks:
         // 1 << 53 bytes / 1MB = 1 << 33 blocks > u32::MAX
-        assert!(calculate_bat_layout(1u64 << 53, 1024 * 1024, 512).is_none());
+        assert!(calculate_bat_layout(1u64 << 53, 1024 * 1024, 512, false).is_none());
+        assert!(calculate_bat_layout(1u64 << 53, 1024 * 1024, 512, true).is_none());
     }
 
     #[test]
     fn bat_layout_large_but_valid() {
         // 1 PiB (1 << 50) with 1MB blocks = 1 << 30 blocks,
         // fits in u32 — should succeed
-        assert!(calculate_bat_layout(1u64 << 50, 1024 * 1024, 512).is_some());
+        assert!(calculate_bat_layout(1u64 << 50, 1024 * 1024, 512, false).is_some());
+        // And so does the padded count at that size: 1 << 18 groups of
+        // 4097 entries is 1_074_003_968, the same number the no-parent
+        // rule reaches because 1 << 30 blocks is a whole number of
+        // groups.
+        let (total, _chunk_ratio, _payload_blocks) =
+            calculate_bat_layout(1u64 << 50, 1024 * 1024, 512, true).unwrap();
+        assert_eq!(total, 1_074_003_968);
     }
 
     // ====================================================================
@@ -5962,6 +6158,10 @@ mod tests {
             // differencing BAT of this geometry holds.
             sb_bat_entry_bound: chunk_ratio as u32 + 1,
             chunk_ratio: chunk_ratio as u32,
+            // Unused by the arithmetic-only accessors this state is
+            // built for.
+            regions: [(0, 0); 8],
+            region_count: 0,
             has_parent: true,
             bat_cached_sector: u64::MAX,
             bat_cache_buf: core::ptr::null_mut(),

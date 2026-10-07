@@ -5396,10 +5396,7 @@ mod tests {
         let mut chain_states = ChainStates::default();
         chain_states.qcow2_states[0] = Some(state);
 
-        let mut chain_config = ChainConfig::new();
-        chain_config.magic = ChainConfig::MAGIC;
-        chain_config.version = ChainConfig::VERSION;
-        chain_config.device_count = 1;
+        let mut chain_config = ChainConfig::single_chain(1);
         chain_config.devices[0].format = ImageFormat::Qcow2 as u32;
         chain_config.devices[0].cluster_size = Z432_SSZ as u32;
         chain_config.devices[0].data_device_idx = 0;
@@ -5605,10 +5602,7 @@ mod tests {
         let mut chain_states = ChainStates::default();
         chain_states.vdi_states[0] = Some(state);
 
-        let mut chain_config = ChainConfig::new();
-        chain_config.magic = ChainConfig::MAGIC;
-        chain_config.version = ChainConfig::VERSION;
-        chain_config.device_count = 1;
+        let mut chain_config = ChainConfig::single_chain(1);
         chain_config.devices[0].format = ImageFormat::Vdi as u32;
         chain_config.devices[0].cluster_size = VDI_TEST_SSZ as u32;
         chain_config.devices[0].data_device_idx = 0;
@@ -5788,10 +5782,7 @@ mod tests {
         let call_table = vdi_call_table();
 
         let mut chain_states = ChainStates::default();
-        let mut chain_config = ChainConfig::new();
-        chain_config.magic = ChainConfig::MAGIC;
-        chain_config.version = ChainConfig::VERSION;
-        chain_config.device_count = 1;
+        let mut chain_config = ChainConfig::single_chain(1);
         chain_config.devices[0].format = ImageFormat::Vdi as u32;
 
         let mut cache = std::vec![0u8; 2 * MAX_SECTOR_SIZE];
@@ -6037,10 +6028,7 @@ mod tests {
         let mut chain_states = ChainStates::default();
         chain_states.parallels_states[0] = Some(state);
 
-        let mut chain_config = ChainConfig::new();
-        chain_config.magic = ChainConfig::MAGIC;
-        chain_config.version = ChainConfig::VERSION;
-        chain_config.device_count = 1;
+        let mut chain_config = ChainConfig::single_chain(1);
         chain_config.devices[0].format = ImageFormat::Parallels as u32;
         chain_config.devices[0].cluster_size = info_cluster_size;
         chain_config.devices[0].data_device_idx = 0;
@@ -6264,10 +6252,7 @@ mod tests {
         let call_table = pls_call_table();
 
         let mut chain_states = ChainStates::default();
-        let mut chain_config = ChainConfig::new();
-        chain_config.magic = ChainConfig::MAGIC;
-        chain_config.version = ChainConfig::VERSION;
-        chain_config.device_count = 1;
+        let mut chain_config = ChainConfig::single_chain(1);
         chain_config.devices[0].format = ImageFormat::Parallels as u32;
 
         let mut cache = std::vec![0u8; 2 * MAX_SECTOR_SIZE];
@@ -6521,10 +6506,7 @@ mod tests {
         }
 
         let mut chain_states = ChainStates::default();
-        let mut chain_config = ChainConfig::new();
-        chain_config.magic = ChainConfig::MAGIC;
-        chain_config.version = ChainConfig::VERSION;
-        chain_config.device_count = devices.len() as u32;
+        let mut chain_config = ChainConfig::single_chain(devices.len() as u32);
 
         let mut bytes_read = 0u64;
         for (i, d) in devices.iter().enumerate() {
@@ -6897,10 +6879,7 @@ mod tests {
         let call_table = q1_call_table();
 
         let mut chain_states = ChainStates::default();
-        let mut chain_config = ChainConfig::new();
-        chain_config.magic = ChainConfig::MAGIC;
-        chain_config.version = ChainConfig::VERSION;
-        chain_config.device_count = 1;
+        let mut chain_config = ChainConfig::single_chain(1);
         chain_config.devices[0].format = ImageFormat::Qcow1 as u32;
 
         let mut cache = std::vec![0u8; 2 * MAX_SECTOR_SIZE];
@@ -6938,12 +6917,12 @@ mod tests {
     //
     // Devices are dispatched by device_idx exactly as the qcow1 mock above
     // does, so a differencing child can be built over a distinguishable
-    // backing device. `init_chain_states` refuses every differencing VHD
-    // unconditionally, so the read-path tests build per-device state
-    // directly with `VhdState::init` -- the same bypass the qcow1 harness
-    // above uses for its own init-independent reads -- and drive
-    // `read_chain_virtual_cluster` straight. Only the init-refusal test
-    // goes through `init_chain_states` itself.
+    // backing device. The read-path tests build per-device state directly
+    // with `VhdState::init` -- the same bypass the qcow1 harness above uses
+    // for its own init-independent reads -- and drive
+    // `read_chain_virtual_cluster` straight, so a fixture need not satisfy
+    // the chain config `init_chain_states` checks to be read. Only the
+    // init-judgement test goes through `init_chain_states` itself.
     // ========================================================================
 
     #[cfg(feature = "vhd-input")]
@@ -6962,6 +6941,14 @@ mod tests {
     static mut VHD_ERR_STATUS: u32 = 0;
     #[cfg(feature = "vhd-input")]
     static mut VHD_ERR_CALLS: u32 = 0;
+    /// The last message the refusal path handed `debug_print`,
+    /// null-stripped. The refusal now says whether the child it
+    /// refused had a parent behind it in its own chain, which is the
+    /// only place that per-chain judgement is observable from outside.
+    #[cfg(feature = "vhd-input")]
+    static mut VHD_DBG_BUF: [u8; 160] = [0u8; 160];
+    #[cfg(feature = "vhd-input")]
+    static mut VHD_DBG_LEN: usize = 0;
 
     /// Differencing child byte at absolute host offset `o`.
     #[cfg(feature = "vhd-input")]
@@ -7063,6 +7050,9 @@ mod tests {
             VHD_ERR_STATUS = 0;
             let dst = core::ptr::addr_of_mut!(VHD_ERR_OP) as *mut u8;
             core::ptr::write_bytes(dst, 0, 32);
+            let dbg = core::ptr::addr_of_mut!(VHD_DBG_BUF) as *mut u8;
+            core::ptr::write_bytes(dbg, 0, 160);
+            VHD_DBG_LEN = 0;
         }
     }
 
@@ -7083,12 +7073,36 @@ mod tests {
     }
 
     #[cfg(feature = "vhd-input")]
+    unsafe extern "C" fn vhd_dbg(msg: *const u8) {
+        let mut n = 0usize;
+        while n < 159 && *msg.add(n) != 0 {
+            n += 1;
+        }
+        let dst = core::ptr::addr_of_mut!(VHD_DBG_BUF) as *mut u8;
+        core::ptr::write_bytes(dst, 0, 160);
+        core::ptr::copy_nonoverlapping(msg, dst, n);
+        VHD_DBG_LEN = n;
+    }
+
+    /// The last `debug_print` message since the last reset.
+    #[cfg(feature = "vhd-input")]
+    fn vhd_last_debug() -> std::string::String {
+        unsafe {
+            let n = VHD_DBG_LEN;
+            let src = core::ptr::addr_of!(VHD_DBG_BUF) as *const u8;
+            let slice = core::slice::from_raw_parts(src, n);
+            std::string::String::from_utf8_lossy(slice).into_owned()
+        }
+    }
+
+    #[cfg(feature = "vhd-input")]
     fn vhd_call_table() -> shared::CallTable {
         shared::CallTable {
             read_input_sector: vhd_read_sector,
             get_input_capacity: vhd_capacity,
             get_input_sector_size: vhd_ssz,
             send_error: vhd_send_err,
+            debug_print: vhd_dbg,
             ..stub_call_table()
         }
     }
@@ -7290,8 +7304,8 @@ mod tests {
         img
     }
 
-    /// Init per-device VHD state directly (bypassing `init_chain_states`,
-    /// which refuses every differencing child regardless of chain shape)
+    /// Init per-device VHD state directly (bypassing the chain config
+    /// `init_chain_states` requires, which these fixtures do not carry)
     /// and run one span through `read_chain_virtual_cluster`. Returns
     /// whether the read succeeded and the output buffer, sentinel-filled
     /// beforehand so a false return that leaves the buffer untouched is
@@ -7337,10 +7351,7 @@ mod tests {
         }
 
         let mut chain_states = ChainStates::default();
-        let mut chain_config = ChainConfig::new();
-        chain_config.magic = ChainConfig::MAGIC;
-        chain_config.version = ChainConfig::VERSION;
-        chain_config.device_count = devices.len() as u32;
+        let mut chain_config = ChainConfig::single_chain(devices.len() as u32);
 
         let mut bytes_read = 0u64;
         for (i, d) in devices.iter().enumerate() {
@@ -7594,44 +7605,63 @@ mod tests {
         assert_eq!(out, want);
     }
 
-    // (f) A differencing child is refused at init whatever follows it in
-    // the device array. Asserting that for a lone device is not enough:
-    // a tempting narrower rule, `dev_idx + 1 >= device_count`, refuses
-    // that case too, so a single-device test cannot tell the
-    // unconditional refusal from a position-dependent one.
+    // (f) A differencing child is admitted at init when a device sits
+    // behind it in its own chain, and refused when none does. Asserting
+    // either for a lone device is not enough: `dev_idx + 1 >=
+    // device_count` refuses that case too, so a single-device test
+    // cannot tell the per-chain rule from the array-bound one.
     //
-    // The second case is the shape that rules the narrower form out.
-    // `device_count` bounds a flat array, not a chain: `compare
-    // diff.vhd base.raw` packs two independent chains into one array,
-    // so a differencing child at index 0 with `device_count` 2 has no
-    // parent behind it at all, and `dev_idx + 1 >= device_count` would
-    // have admitted it and read every parent-owned sector as the
-    // child's zeros (issue #547).
+    // The second and third cases are the shape that separates them,
+    // and they are the same two devices: `device_count` bounds a flat
+    // array, not a chain, so whether device 1 is device 0's parent is
+    // a question only the config's segmentation answers. Declared as
+    // one chain the child has a parent behind it and composes;
+    // declared as two -- which is how `compare diff.vhd base.raw` lays
+    // its arguments out -- it has none and is refused, where
+    // `dev_idx + 1 >= device_count` would have admitted it and read
+    // every parent-owned sector out of an unrelated image (issues
+    // #547, #614).
     #[cfg(feature = "vhd-input")]
     #[test]
-    fn vhd_init_refuses_a_differencing_child_and_admits_a_dynamic_one() {
-        for (disk_type, device_count, refused, label) in [
+    fn vhd_init_refuses_a_differencing_child_with_no_parent_in_its_own_chain() {
+        for (disk_type, device_count, segments, refused, label) in [
             (
                 vhd::DISK_TYPE_DIFFERENCING,
                 1u32,
+                &[(0u32, 1u32)][..],
                 true,
                 "a lone differencing device",
             ),
             (
                 vhd::DISK_TYPE_DIFFERENCING,
                 2u32,
+                &[(0, 2)][..],
+                false,
+                "a differencing device at index 0 of a one-chain two-device array",
+            ),
+            (
+                vhd::DISK_TYPE_DIFFERENCING,
+                2u32,
+                &[(0, 1), (1, 1)][..],
                 true,
-                "a differencing device at index 0 of a two-device array",
+                "a differencing device at index 0 of a two-chain two-device array",
             ),
             // The controls. One header field differs from the cases
             // above and nothing else does, so an assertion that passes
             // because the synthetic footer, the hand-built cache or a
             // stub call-table entry is broken -- rather than because
             // the refusal fired -- cannot pass here.
-            (vhd::DISK_TYPE_DYNAMIC, 1u32, false, "a lone dynamic device"),
+            (
+                vhd::DISK_TYPE_DYNAMIC,
+                1u32,
+                &[(0, 1)][..],
+                false,
+                "a lone dynamic device",
+            ),
             (
                 vhd::DISK_TYPE_DYNAMIC,
                 2u32,
+                &[(0, 2)][..],
                 false,
                 "a dynamic device at index 0 of a two-device array",
             ),
@@ -7639,9 +7669,10 @@ mod tests {
             let _guard = VHD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let block_size = 4096u32;
             let img = build_vhd_unallocated_block(disk_type, block_size);
-            // The follower is a second, unrelated raw device, exactly as
-            // a two-image operation lays its arguments out. It is not
-            // this child's parent, which is the whole point.
+            // The follower is a second raw device, exactly as a
+            // two-image operation lays its arguments out. Whether it is
+            // this child's parent is the segmentation's to say, which
+            // is the whole point.
             let follower = build_vhd_parent_raw(block_size as usize);
             unsafe {
                 VHD_SSZ = 512;
@@ -7655,10 +7686,18 @@ mod tests {
             let call_table = vhd_call_table();
 
             let mut chain_states = ChainStates::default();
+            // Built by hand rather than with `single_chain`: the
+            // segmentation is the variable under test here, so it is
+            // spelt out per case.
             let mut chain_config = ChainConfig::new();
-            chain_config.magic = ChainConfig::MAGIC;
-            chain_config.version = ChainConfig::VERSION;
             chain_config.device_count = device_count;
+            chain_config.segment_count = segments.len() as u32;
+            for (i, (first, count)) in segments.iter().enumerate() {
+                chain_config.segments[i] = shared::ChainSegment {
+                    first: *first,
+                    count: *count,
+                };
+            }
             chain_config.devices[0].format = ImageFormat::Vhd as u32;
             if device_count > 1 {
                 chain_config.devices[1].format = ImageFormat::Raw as u32;
@@ -7708,13 +7747,34 @@ mod tests {
                     shared::DifferencingRefusal::STATUS_VHD,
                     "the refusal must name VHD rather than VHDX: {label}"
                 );
+                // The reason, which is the whole of the narrowing: a
+                // child is refused for having no parent in its own
+                // chain and for nothing else.
+                let msg = vhd_last_debug();
+                assert!(
+                    msg.contains("(no parent in chain)"),
+                    "the refusal must say no parent is in the chain for {label}, \
+                     said {msg:?}"
+                );
             } else {
                 assert!(
                     ok,
-                    "the same harness must initialise a non-differencing VHD, or \
-                     the refusal assertions prove nothing: {label}"
+                    "chain init must succeed, or the refusal assertions prove \
+                     nothing: {label}"
                 );
-                assert_eq!(calls, 0, "a dynamic VHD must raise no refusal: {label}");
+                assert_eq!(calls, 0, "an admitted VHD must raise no refusal: {label}");
+                // An admitted differencing child must be admitted *as*
+                // one: the state the reader will consult has to carry
+                // the differencing disk type, or the composing arm it
+                // unlocks is never reached and this case would pass
+                // while proving nothing about the lift.
+                let state = chain_states.vhd_states[0]
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("no VHD state recorded for {label}"));
+                assert_eq!(
+                    state.disk_type, disk_type,
+                    "the recorded state must carry the fixture's disk type: {label}"
+                );
             }
         }
     }
@@ -8186,9 +8246,9 @@ mod tests {
     //
     // Shaped after the VHD harness above -- a per-device mock dispatched on
     // device_idx, two deliberately different byte patterns, and per-device
-    // state built directly with `VhdxState::init`, because
-    // `init_chain_states` refuses every differencing VHDX whatever follows
-    // it -- and differing from it wherever the format does.
+    // state built directly with `VhdxState::init`, bypassing the chain
+    // config `init_chain_states` wants -- and differing from it wherever
+    // the format does.
     //
     // A VHDX payload block and a sector bitmap block are both 1 MiB-aligned
     // regions, because a BAT entry has no room to say anything finer, so a
@@ -8227,6 +8287,14 @@ mod tests {
     static mut VHDX_ERR_STATUS: u32 = 0;
     #[cfg(feature = "vhdx-input")]
     static mut VHDX_ERR_CALLS: u32 = 0;
+    /// The last message the refusal path handed `debug_print`,
+    /// null-stripped. The refusal now says whether the child it
+    /// refused had a parent behind it in its own chain, which is the
+    /// only place that per-chain judgement is observable from outside.
+    #[cfg(feature = "vhdx-input")]
+    static mut VHDX_DBG_BUF: [u8; 160] = [0u8; 160];
+    #[cfg(feature = "vhdx-input")]
+    static mut VHDX_DBG_LEN: usize = 0;
 
     /// The block size every fixture uses: the format's 1 MiB minimum,
     /// which is also the sector bitmap block size.
@@ -8350,6 +8418,9 @@ mod tests {
             VHDX_ERR_STATUS = 0;
             let dst = core::ptr::addr_of_mut!(VHDX_ERR_OP) as *mut u8;
             core::ptr::write_bytes(dst, 0, 32);
+            let dbg = core::ptr::addr_of_mut!(VHDX_DBG_BUF) as *mut u8;
+            core::ptr::write_bytes(dbg, 0, 160);
+            VHDX_DBG_LEN = 0;
         }
     }
 
@@ -8374,12 +8445,36 @@ mod tests {
     }
 
     #[cfg(feature = "vhdx-input")]
+    unsafe extern "C" fn vhdx_dbg(msg: *const u8) {
+        let mut n = 0usize;
+        while n < 159 && *msg.add(n) != 0 {
+            n += 1;
+        }
+        let dst = core::ptr::addr_of_mut!(VHDX_DBG_BUF) as *mut u8;
+        core::ptr::write_bytes(dst, 0, 160);
+        core::ptr::copy_nonoverlapping(msg, dst, n);
+        VHDX_DBG_LEN = n;
+    }
+
+    /// The last `debug_print` message since the last reset.
+    #[cfg(feature = "vhdx-input")]
+    fn vhdx_last_debug() -> std::string::String {
+        unsafe {
+            let n = VHDX_DBG_LEN;
+            let src = core::ptr::addr_of!(VHDX_DBG_BUF) as *const u8;
+            let slice = core::slice::from_raw_parts(src, n);
+            std::string::String::from_utf8_lossy(slice).into_owned()
+        }
+    }
+
+    #[cfg(feature = "vhdx-input")]
     fn vhdx_call_table() -> shared::CallTable {
         shared::CallTable {
             read_input_sector: vhdx_read_sector,
             get_input_capacity: vhdx_capacity,
             get_input_sector_size: vhdx_ssz,
             send_error: vhdx_send_err,
+            debug_print: vhdx_dbg,
             ..stub_call_table()
         }
     }
@@ -8640,8 +8735,8 @@ mod tests {
         want
     }
 
-    /// Init per-device VHDX state directly (bypassing `init_chain_states`,
-    /// which refuses every differencing child regardless of chain shape)
+    /// Init per-device VHDX state directly (bypassing the chain config
+    /// `init_chain_states` requires, which these fixtures do not carry)
     /// and run one span through `read_chain_virtual_cluster`. Returns
     /// whether the read succeeded and the output buffer, sentinel-filled
     /// beforehand so a false return that leaves the buffer untouched is
@@ -8687,10 +8782,7 @@ mod tests {
         }
 
         let mut chain_states = ChainStates::default();
-        let mut chain_config = ChainConfig::new();
-        chain_config.magic = ChainConfig::MAGIC;
-        chain_config.version = ChainConfig::VERSION;
-        chain_config.device_count = devices.len() as u32;
+        let mut chain_config = ChainConfig::single_chain(devices.len() as u32);
 
         let mut bytes_read = 0u64;
         for (i, d) in devices.iter().enumerate() {
@@ -9505,6 +9597,349 @@ mod tests {
         }
     }
 
+    // An offset above the first megabyte is not automatically a real
+    // block: the fixture's own BAT region sits at 2 MiB and its
+    // metadata region at 1 MiB, both well clear of the headers but
+    // still not payload. A floor fixed at 1 MiB cannot tell a block
+    // that starts there from one that starts at the file identifier;
+    // only the region table the image declares can, which is what
+    // `VhdxState::min_block_file_offset` is for (issue #625). As
+    // above, all three states that carry an offset are driven.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_arm_block_inside_a_declared_region_is_refused() {
+        let child_sectors = [0u32..2048];
+        let chunk_ratio = vhdx_chunk_ratio(512);
+        let payload_entry = VHDX_FIX_BAT_OFFSET as usize;
+        let sb_entry = (VHDX_FIX_BAT_OFFSET + chunk_ratio * 8) as usize;
+
+        for (block_state, rewritten_entry, label) in [
+            (
+                VhdxBlockState::FullyPresent,
+                payload_entry,
+                "a fully present payload block",
+            ),
+            (
+                VhdxBlockState::PartiallyPresent,
+                payload_entry,
+                "a partially present payload block",
+            ),
+            (
+                VhdxBlockState::PartiallyPresent,
+                sb_entry,
+                "a present sector bitmap",
+            ),
+        ] {
+            for (region_offset, region_label) in [
+                (VHDX_FIX_METADATA_OFFSET, "the metadata region"),
+                (VHDX_FIX_BAT_OFFSET, "the BAT region"),
+            ] {
+                let fixture = build_vhdx_image(
+                    512,
+                    true,
+                    1,
+                    &[(0, block_state)],
+                    &[VhdxGroupBitmap {
+                        group: 0,
+                        state: vhdx::SB_BLOCK_PRESENT,
+                        child_sectors: &child_sectors,
+                    }],
+                );
+                let mut bytes = fixture.bytes;
+                // Keep the state bits, point the offset at the other
+                // region instead.
+                let entry = u64::from_le_bytes(
+                    bytes[rewritten_entry..rewritten_entry + 8]
+                        .try_into()
+                        .unwrap(),
+                );
+                let state = entry & vhdx::BAT_ENTRY_STATE_MASK;
+                let rewritten = vhdx::build_bat_entry(state, region_offset);
+                bytes[rewritten_entry..rewritten_entry + 8]
+                    .copy_from_slice(&rewritten.to_le_bytes());
+                let devices = vhdx_chain_with_parent(bytes, 2 * 1024 * 1024);
+                let (ok, _out) = run_vhdx_chain_read(&devices, 512, 0, VHDX_CHUNK);
+                assert!(
+                    !ok,
+                    "an entry naming an offset inside {region_label} must fail \
+                     the read rather than serve that region's own bytes as \
+                     data: {label}"
+                );
+            }
+        }
+
+        // The control: the same fixtures, with the payload entry
+        // renamed to the first byte past every declared region --
+        // where `build_vhdx_image` already places its first block --
+        // must still read.
+        for (block_state, label) in [
+            (
+                VhdxBlockState::FullyPresent,
+                "a fully present payload block",
+            ),
+            (
+                VhdxBlockState::PartiallyPresent,
+                "a partially present payload block",
+            ),
+        ] {
+            let fixture = build_vhdx_image(
+                512,
+                true,
+                1,
+                &[(0, block_state)],
+                &[VhdxGroupBitmap {
+                    group: 0,
+                    state: vhdx::SB_BLOCK_PRESENT,
+                    child_sectors: &child_sectors,
+                }],
+            );
+            let mut bytes = fixture.bytes;
+            let entry =
+                u64::from_le_bytes(bytes[payload_entry..payload_entry + 8].try_into().unwrap());
+            let state = entry & vhdx::BAT_ENTRY_STATE_MASK;
+            let rewritten = vhdx::build_bat_entry(state, VHDX_FIX_FIRST_BLOCK);
+            bytes[payload_entry..payload_entry + 8].copy_from_slice(&rewritten.to_le_bytes());
+            let devices = vhdx_chain_with_parent(bytes, 2 * 1024 * 1024);
+            let (ok, _out) = run_vhdx_chain_read(&devices, 512, 0, VHDX_CHUNK);
+            assert!(
+                ok,
+                "an offset immediately past every declared region must still \
+                 read, or the refusals above prove only that the fixture is \
+                 broken: {label}"
+            );
+        }
+    }
+
+    // The overlap test lives in `block_lookup`'s fully present arm,
+    // which runs whatever the image says about a parent, so it is not
+    // a differencing rule -- it tightens every VHDX read instar does.
+    // The cases above all drive a differencing child, which would
+    // leave the plain dynamic path free to lose the refusal without
+    // a test noticing. This is that path: no parent, no chain behind
+    // it, nothing but an ordinary dynamic image whose BAT points at
+    // its own structure.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_arm_dynamic_block_inside_a_declared_region_is_refused() {
+        let payload_entry = VHDX_FIX_BAT_OFFSET as usize;
+
+        for (region_offset, region_label) in [
+            (VHDX_FIX_METADATA_OFFSET, "the metadata region"),
+            (VHDX_FIX_BAT_OFFSET, "the BAT region"),
+        ] {
+            let fixture =
+                build_vhdx_image(512, false, 1, &[(0, VhdxBlockState::FullyPresent)], &[]);
+            let mut bytes = fixture.bytes;
+            let entry =
+                u64::from_le_bytes(bytes[payload_entry..payload_entry + 8].try_into().unwrap());
+            let state = entry & vhdx::BAT_ENTRY_STATE_MASK;
+            let rewritten = vhdx::build_bat_entry(state, region_offset);
+            bytes[payload_entry..payload_entry + 8].copy_from_slice(&rewritten.to_le_bytes());
+            let lone = vhdx_chain_alone(bytes);
+            let (ok, _out) = run_vhdx_chain_read(&lone, 512, 0, VHDX_CHUNK);
+            assert!(
+                !ok,
+                "a dynamic image with no parent whose BAT entry names an \
+                 offset inside {region_label} must fail the read rather \
+                 than serve that region's own bytes as payload"
+            );
+        }
+
+        // The control, so the refusals above are the overlap test
+        // rather than a fixture a parentless chain cannot read at
+        // all: the same image, untouched, reads its own payload.
+        let fixture = build_vhdx_image(512, false, 1, &[(0, VhdxBlockState::FullyPresent)], &[]);
+        let payload = fixture.block_offsets[0];
+        let lone = vhdx_chain_alone(fixture.bytes);
+        let (ok, out) = run_vhdx_chain_read(&lone, 512, 0, VHDX_CHUNK);
+        assert!(ok, "an untouched dynamic image must still read");
+        let want: std::vec::Vec<u8> = (0..VHDX_CHUNK)
+            .map(|i| vhdx_child_byte(payload + i))
+            .collect();
+        assert_eq!(
+            out, want,
+            "the control must be served from the image's own payload"
+        );
+    }
+
+    // SPEC(VHDX) does not require a region to precede the blocks it
+    // coexists with, so a region table entry naming a byte range
+    // entirely *after* every block this image uses must not refuse
+    // them. This is the layout a low-water-mark bound gets wrong: it
+    // would have raised the mark past both blocks here and refused
+    // the read, even though neither block overlaps anything. The
+    // fixture declares a third region -- one this reader does not
+    // recognise -- immediately past the end of the file the other
+    // two tests above never touch, which is also well past both
+    // blocks this fixture allocates.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_arm_block_before_a_trailing_region_is_not_refused() {
+        let child_sectors = [0u32..2048];
+        let fixture = build_vhdx_image(
+            512,
+            true,
+            1,
+            &[(0, VhdxBlockState::PartiallyPresent)],
+            &[VhdxGroupBitmap {
+                group: 0,
+                state: vhdx::SB_BLOCK_PRESENT,
+                child_sectors: &child_sectors,
+            }],
+        );
+        let payload = fixture.block_offsets[0];
+        let mut bytes = fixture.bytes;
+
+        // A third region table entry, past the end of every byte the
+        // fixture otherwise writes -- so past the payload block and
+        // its sector bitmap block too. Nothing reads an unrecognised
+        // region's own bytes, so it needs no backing data, only the
+        // declaration.
+        let trailing_region_offset = bytes.len() as u64;
+        let trailing_region_length: u32 = 0x1000;
+        let rt1_base = vhdx::REGION_TABLE1_OFFSET as usize;
+        let entry_count_off = rt1_base + vhdx::REGION_TABLE_ENTRY_COUNT_OFFSET;
+        bytes[entry_count_off..entry_count_off + 4].copy_from_slice(&3u32.to_le_bytes());
+        let entry2_off =
+            rt1_base + vhdx::REGION_TABLE_HEADER_SIZE + 2 * vhdx::REGION_TABLE_ENTRY_SIZE;
+        bytes[entry2_off..entry2_off + 16].copy_from_slice(&[0xAAu8; 16]);
+        bytes[entry2_off + 16..entry2_off + 24]
+            .copy_from_slice(&trailing_region_offset.to_le_bytes());
+        bytes[entry2_off + 24..entry2_off + 28]
+            .copy_from_slice(&trailing_region_length.to_le_bytes());
+
+        let devices = vhdx_chain_with_parent(bytes, 2 * 1024 * 1024);
+        let (ok, out) = run_vhdx_chain_read(&devices, 512, 0, VHDX_CHUNK);
+        assert!(
+            ok,
+            "a region declared entirely after every block this image uses \
+             must not refuse them"
+        );
+        assert_eq!(
+            out,
+            vhdx_expected(0, VHDX_CHUNK, payload, 512, &child_sectors),
+            "the read must still compose correctly once the block is accepted"
+        );
+    }
+
+    // The overlap test covers every entry the region scan reads, not
+    // only the BAT and metadata entries every writer emits. The scan
+    // stops at eight, which is what the docs now say and what this
+    // pins: a region declared in the eighth entry is as real to the
+    // check as one declared in the first. Without it, "any entry in
+    // the region table" rested on the two entries a fixture always
+    // writes, both of which sit at the front.
+    //
+    // Patching entries in place needs no checksum fixup:
+    // `VhdxState::init` deliberately skips the region table's CRC-32C
+    // and validates entry contents instead, leaving the full CRC to
+    // the `check` operation.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_overlap_check_covers_the_eighth_region_table_entry() {
+        let rt1_base = vhdx::REGION_TABLE1_OFFSET as usize;
+        let entry_count_off = rt1_base + vhdx::REGION_TABLE_ENTRY_COUNT_OFFSET;
+        let eighth = rt1_base + vhdx::REGION_TABLE_HEADER_SIZE + 7 * vhdx::REGION_TABLE_ENTRY_SIZE;
+
+        // Entries 2 to 6 stay as the fixture leaves them: all-zero
+        // GUID, offset 0, length 0. A zero-length region intersects
+        // nothing, so they neither refuse a block themselves nor stop
+        // the scan reaching the eighth entry --
+        // `vhdx_zero_length_region_inside_a_block_does_not_refuse_it`
+        // below is what holds that, and holds it for an offset inside
+        // the block rather than only for offset 0.
+        let fixture = build_vhdx_image(512, false, 1, &[(0, VhdxBlockState::FullyPresent)], &[]);
+        let payload = fixture.block_offsets[0];
+        let mut bytes = fixture.bytes;
+        bytes[entry_count_off..entry_count_off + 4].copy_from_slice(&8u32.to_le_bytes());
+        bytes[eighth..eighth + 16].copy_from_slice(&[0xBBu8; 16]);
+        bytes[eighth + 16..eighth + 24].copy_from_slice(&payload.to_le_bytes());
+        bytes[eighth + 24..eighth + 28].copy_from_slice(&VHDX_FIX_BLOCK_SIZE.to_le_bytes());
+        let lone = vhdx_chain_alone(bytes);
+        let (ok, _out) = run_vhdx_chain_read(&lone, 512, 0, VHDX_CHUNK);
+        assert!(
+            !ok,
+            "a payload block overlapping the region declared in the eighth \
+             region table entry must be refused, the same as one overlapping \
+             the first"
+        );
+
+        // The control, so the refusal above is that entry's range and
+        // not the mere presence of six more entries: the same
+        // eight-entry table, with the eighth region declared past the
+        // end of the file instead of over the payload, still reads.
+        let fixture = build_vhdx_image(512, false, 1, &[(0, VhdxBlockState::FullyPresent)], &[]);
+        let payload = fixture.block_offsets[0];
+        let mut bytes = fixture.bytes;
+        let past_the_end = bytes.len() as u64;
+        bytes[entry_count_off..entry_count_off + 4].copy_from_slice(&8u32.to_le_bytes());
+        bytes[eighth..eighth + 16].copy_from_slice(&[0xBBu8; 16]);
+        bytes[eighth + 16..eighth + 24].copy_from_slice(&past_the_end.to_le_bytes());
+        bytes[eighth + 24..eighth + 28].copy_from_slice(&VHDX_FIX_BLOCK_SIZE.to_le_bytes());
+        let lone = vhdx_chain_alone(bytes);
+        let (ok, out) = run_vhdx_chain_read(&lone, 512, 0, VHDX_CHUNK);
+        assert!(
+            ok,
+            "an eight-entry region table whose eighth region clears every \
+             block must still read"
+        );
+        let want: std::vec::Vec<u8> = (0..VHDX_CHUNK)
+            .map(|i| vhdx_child_byte(payload + i))
+            .collect();
+        assert_eq!(
+            out, want,
+            "the control must be served from the image's own payload"
+        );
+    }
+
+    // A region entry declaring zero length names no bytes, so it
+    // cannot be overlapped. The offset matters: the old predicate
+    // reduced to `offset < region_offset < end` for an empty region,
+    // which waved through an entry at or below the block's start and
+    // refused one whose offset fell strictly inside the block. A
+    // region that names nothing can hide nothing, so refusing on it
+    // bought no safety and contradicted the documented half-open
+    // semantics. `init` does not reject a zero-length entry, so this
+    // is reachable from a hostile image rather than hypothetical.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_zero_length_region_inside_a_block_does_not_refuse_it() {
+        let fixture = build_vhdx_image(512, false, 1, &[(0, VhdxBlockState::FullyPresent)], &[]);
+        let payload = fixture.block_offsets[0];
+        let mut bytes = fixture.bytes;
+
+        // A third, unrecognised region entry of length zero, declared
+        // strictly inside the payload block this read wants -- the one
+        // position the old predicate got wrong.
+        let inside = payload + 4096;
+        assert!(
+            inside > payload && inside < payload + u64::from(VHDX_FIX_BLOCK_SIZE),
+            "the probe offset must fall strictly inside the payload block"
+        );
+        let rt1_base = vhdx::REGION_TABLE1_OFFSET as usize;
+        let entry_count_off = rt1_base + vhdx::REGION_TABLE_ENTRY_COUNT_OFFSET;
+        bytes[entry_count_off..entry_count_off + 4].copy_from_slice(&3u32.to_le_bytes());
+        let third = rt1_base + vhdx::REGION_TABLE_HEADER_SIZE + 2 * vhdx::REGION_TABLE_ENTRY_SIZE;
+        bytes[third..third + 16].copy_from_slice(&[0xCCu8; 16]);
+        bytes[third + 16..third + 24].copy_from_slice(&inside.to_le_bytes());
+        bytes[third + 24..third + 28].copy_from_slice(&0u32.to_le_bytes());
+
+        let lone = vhdx_chain_alone(bytes);
+        let (ok, out) = run_vhdx_chain_read(&lone, 512, 0, VHDX_CHUNK);
+        assert!(
+            ok,
+            "a region declaring zero length names no bytes and must not \
+             refuse the block its offset falls inside"
+        );
+        let want: std::vec::Vec<u8> = (0..VHDX_CHUNK)
+            .map(|i| vhdx_child_byte(payload + i))
+            .collect();
+        assert_eq!(
+            out, want,
+            "the block must still be served from the image's own payload"
+        );
+    }
+
     // A differencing child over a differencing VHDX parent over a raw
     // device. Every other composing test here puts a raw device behind
     // the child, so the Mixed arm always recursed into a format that is
@@ -9765,50 +10200,68 @@ mod tests {
         0xeb05_052e_a5b6_2325,
     ];
 
-    // Everything the composing arm above does is unreachable in a
-    // shipped binary, and that claim rests entirely on this: a
-    // differencing VHDX never gets past `init_chain_states`, so no
-    // operation ever reaches the arm. Nothing else pins it.
+    // What reaches the composing arm above, and what never does. A
+    // differencing VHDX is admitted by `init_chain_states` when a
+    // device sits behind it in its own chain and refused when none
+    // does, so this is the test that says which operations can reach
+    // the arm at all. Nothing else pins it.
     //
-    // Three things are asserted, because the first alone is worth
-    // little. `init_chain_states` returns a bare `bool`, so "it
-    // returned false" is satisfied by a mistyped header, a mis-sized
-    // cache or a stub call-table entry that happens to fail -- the
-    // refusal would read as proven while never having fired. The
-    // operation marker and status say it fired, and say which format
-    // it named; the dynamic controls say the fixture, the cache and
-    // the mock are sound, so the refusal assertions are measuring the
-    // refusal and not a broken harness.
+    // Three things are asserted of a refusal, because the first alone
+    // is worth little. `init_chain_states` returns a bare `bool`, so
+    // "it returned false" is satisfied by a mistyped header, a
+    // mis-sized cache or a stub call-table entry that happens to fail
+    // -- the refusal would read as proven while never having fired.
+    // The operation marker and status say it fired, and say which
+    // format it named; the dynamic controls say the fixture, the cache
+    // and the mock are sound, so the refusal assertions are measuring
+    // the refusal and not a broken harness.
     //
-    // The device-count dimension rules out a narrower refusal. A
-    // tempting form, `state.has_parent && dev_idx + 1 >= device_count`,
-    // refuses a lone child and admits one with a device behind it, and
-    // a single-device test cannot tell it from the unconditional rule.
-    // It is unsafe: `device_count` bounds a flat array, not a chain --
-    // `compare diff.vhdx base.raw` packs two independent chains into
-    // one array -- so a differencing child at index 0 with
-    // `device_count` 2 has no parent behind it at all, and that form
-    // would have composed it against an unrelated image (issue #614).
+    // The segmentation dimension is what the judgement rests on, and
+    // the same two devices appear twice below for it: once declared as
+    // one chain, where the child has a parent behind it and is
+    // admitted, and once as two, which is how `compare diff.vhdx
+    // base.raw` lays its arguments out, where it has none and is
+    // refused. `device_count` is 2 in both, so a rule derived from it
+    // -- `state.has_parent && dev_idx + 1 >= device_count` is the
+    // tempting form -- answers them identically and would compose the
+    // child against an unrelated image (issue #614). Only the config's
+    // declared segmentation separates them, and a single-device test
+    // cannot tell the two rules apart at all.
     #[cfg(feature = "vhdx-input")]
     #[test]
-    fn vhdx_init_refuses_a_differencing_child_and_admits_a_dynamic_one() {
-        for (has_parent, device_count, refused, label) in [
-            (true, 1u32, true, "a lone differencing device"),
+    fn vhdx_init_refuses_a_differencing_child_with_no_parent_in_its_own_chain() {
+        for (has_parent, device_count, segments, refused, label) in [
+            (
+                true,
+                1u32,
+                &[(0u32, 1u32)][..],
+                true,
+                "a lone differencing device",
+            ),
             (
                 true,
                 2u32,
+                &[(0, 2)][..],
+                false,
+                "a differencing device at index 0 of a one-chain two-device array",
+            ),
+            (
                 true,
-                "a differencing device at index 0 of a two-device array",
+                2u32,
+                &[(0, 1), (1, 1)][..],
+                true,
+                "a differencing device at index 0 of a two-chain two-device array",
             ),
             // The controls. One metadata flag differs from the cases
             // above and nothing else does, so an assertion that passes
             // because the synthetic image, the hand-built cache or a
             // stub call-table entry is broken -- rather than because
             // the refusal fired -- cannot pass here.
-            (false, 1u32, false, "a lone dynamic device"),
+            (false, 1u32, &[(0, 1)][..], false, "a lone dynamic device"),
             (
                 false,
                 2u32,
+                &[(0, 2)][..],
                 false,
                 "a dynamic device at index 0 of a two-device array",
             ),
@@ -9822,9 +10275,10 @@ mod tests {
                 &[],
             );
             let img = fixture.bytes;
-            // The follower is a second, unrelated raw device, exactly as
-            // a two-image operation lays its arguments out. It is not
-            // this child's parent, which is the whole point.
+            // The follower is a second raw device, exactly as a
+            // two-image operation lays its arguments out. Whether it is
+            // this child's parent is the segmentation's to say, which
+            // is the whole point.
             let follower = build_vhdx_parent_raw(2 * 1024 * 1024);
             unsafe {
                 VHDX_SSZ = 512;
@@ -9838,10 +10292,18 @@ mod tests {
             let call_table = vhdx_call_table();
 
             let mut chain_states = ChainStates::default();
+            // Built by hand rather than with `single_chain`: the
+            // segmentation is the variable under test here, so it is
+            // spelt out per case.
             let mut chain_config = ChainConfig::new();
-            chain_config.magic = ChainConfig::MAGIC;
-            chain_config.version = ChainConfig::VERSION;
             chain_config.device_count = device_count;
+            chain_config.segment_count = segments.len() as u32;
+            for (i, (first, count)) in segments.iter().enumerate() {
+                chain_config.segments[i] = shared::ChainSegment {
+                    first: *first,
+                    count: *count,
+                };
+            }
             chain_config.devices[0].format = ImageFormat::Vhdx as u32;
             if device_count > 1 {
                 chain_config.devices[1].format = ImageFormat::Raw as u32;
@@ -9891,13 +10353,34 @@ mod tests {
                     shared::DifferencingRefusal::STATUS_VHDX,
                     "the refusal must name VHDX rather than VHD: {label}"
                 );
+                // The reason, which is the whole of the narrowing: a
+                // child is refused for having no parent in its own
+                // chain and for nothing else.
+                let msg = vhdx_last_debug();
+                assert!(
+                    msg.contains("(no parent in chain)"),
+                    "the refusal must say no parent is in the chain for {label}, \
+                     said {msg:?}"
+                );
             } else {
                 assert!(
                     ok,
-                    "the same harness must initialise a VHDX with no parent, or \
-                     the refusal assertions prove nothing: {label}"
+                    "chain init must succeed, or the refusal assertions prove \
+                     nothing: {label}"
                 );
-                assert_eq!(calls, 0, "a dynamic VHDX must raise no refusal: {label}");
+                assert_eq!(calls, 0, "an admitted VHDX must raise no refusal: {label}");
+                // An admitted differencing child must be admitted *as*
+                // one: the state the reader will consult has to still
+                // report `has_parent`, or the composing arm it unlocks
+                // is never reached and this case would pass while
+                // proving nothing about the lift.
+                let state = chain_states.vhdx_states[0]
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("no VHDX state recorded for {label}"));
+                assert_eq!(
+                    state.has_parent, has_parent,
+                    "the recorded state must carry the fixture's parent flag: {label}"
+                );
             }
         }
     }
@@ -10111,10 +10594,7 @@ mod tests {
         .expect("DmgState::init should succeed for a valid image");
         let mut cs = ChainStates::default();
         cs.dmg_states[0] = Some(state);
-        let mut cc = ChainConfig::new();
-        cc.magic = ChainConfig::MAGIC;
-        cc.version = ChainConfig::VERSION;
-        cc.device_count = 1;
+        let mut cc = ChainConfig::single_chain(1);
         cc.devices[0].format = ImageFormat::Dmg as u32;
         let mut comp = std::vec![0u8; COMPRESSED_BUF_SIZE];
         let mut stg = std::vec![0u8; MAX_CLUSTER_SIZE];
@@ -10225,10 +10705,7 @@ mod tests {
         .expect("init");
         let mut cs = ChainStates::default();
         cs.dmg_states[0] = Some(state);
-        let mut cc = ChainConfig::new();
-        cc.magic = ChainConfig::MAGIC;
-        cc.version = ChainConfig::VERSION;
-        cc.device_count = 1;
+        let mut cc = ChainConfig::single_chain(1);
         cc.devices[0].format = ImageFormat::Dmg as u32;
         let mut comp = std::vec![0u8; COMPRESSED_BUF_SIZE];
         let mut stg = std::vec![0u8; MAX_CLUSTER_SIZE];
@@ -10389,10 +10866,7 @@ mod tests {
         unsafe { DMG_DBG_LEN = 0 };
 
         let mut cs = ChainStates::default();
-        let mut cc = ChainConfig::new();
-        cc.magic = ChainConfig::MAGIC;
-        cc.version = ChainConfig::VERSION;
-        cc.device_count = formats.len() as u32;
+        let mut cc = ChainConfig::single_chain(formats.len() as u32);
         for (i, f) in formats.iter().enumerate() {
             cc.devices[i].format = *f as u32;
         }
@@ -10493,6 +10967,155 @@ mod tests {
             "a second DMG must refuse when only one slot is reserved"
         );
         assert_eq!(m1, "dmg: too many dmg devices for scratch\n");
+    }
+
+    // ========================================================================
+    // The chain config's segmentation gate in init_chain_states
+    //
+    // Raw devices need no per-device state, so the only thing that can
+    // decide these cases is the segmentation check itself. They are
+    // deliberately not feature-gated: the gate runs before the first
+    // format arm, so it is the one part of chain init every build has.
+    // ========================================================================
+
+    static SEG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static mut SEG_DBG_BUF: [u8; 160] = [0u8; 160];
+    static mut SEG_DBG_LEN: usize = 0;
+    static mut SEG_ERR_CALLS: u32 = 0;
+
+    unsafe extern "C" fn seg_dbg(msg: *const u8) {
+        let mut n = 0usize;
+        while n < 159 && *msg.add(n) != 0 {
+            n += 1;
+        }
+        let dst = core::ptr::addr_of_mut!(SEG_DBG_BUF) as *mut u8;
+        core::ptr::write_bytes(dst, 0, 160);
+        core::ptr::copy_nonoverlapping(msg, dst, n);
+        SEG_DBG_LEN = n;
+    }
+
+    unsafe extern "C" fn seg_send_err(_: *const u8, _: *const u8, _: u64, _: u32) {
+        SEG_ERR_CALLS += 1;
+    }
+
+    /// Run chain init over `device_count` raw devices with the given
+    /// segmentation, and report whether it succeeded, how many typed
+    /// errors it raised, and what it said.
+    fn run_seg_init(
+        device_count: u32,
+        segment_count: u32,
+        segments: &[(u32, u32)],
+    ) -> (bool, u32, std::string::String) {
+        let _guard = SEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let call_table = shared::CallTable {
+            send_error: seg_send_err,
+            debug_print: seg_dbg,
+            ..stub_call_table()
+        };
+
+        let mut chain_config = ChainConfig::new();
+        chain_config.device_count = device_count;
+        chain_config.segment_count = segment_count;
+        for (i, (first, count)) in segments.iter().enumerate() {
+            chain_config.segments[i] = shared::ChainSegment {
+                first: *first,
+                count: *count,
+            };
+        }
+        for dev_idx in 0..device_count as usize {
+            chain_config.devices[dev_idx].format = ImageFormat::Raw as u32;
+        }
+
+        let mut chain_states = ChainStates::default();
+        let mut cache = std::vec![0u8; 2 * MAX_SECTOR_SIZE * MAX_CHAIN_DEVICES];
+        let dynamic_bufs_start = cache.as_mut_ptr() as usize;
+        let mut bytes_read = 0u64;
+        unsafe {
+            SEG_ERR_CALLS = 0;
+            SEG_DBG_LEN = 0;
+        }
+        let ok = unsafe {
+            init_chain_states(
+                &call_table,
+                &chain_config,
+                &mut chain_states,
+                device_count as usize,
+                512,
+                dynamic_bufs_start,
+                0,
+                0,
+                &mut bytes_read,
+            )
+        };
+        let _ = &cache;
+        let (calls, msg) = unsafe {
+            let n = SEG_DBG_LEN;
+            let src = core::ptr::addr_of!(SEG_DBG_BUF) as *const u8;
+            let slice = core::slice::from_raw_parts(src, n);
+            (
+                SEG_ERR_CALLS,
+                std::string::String::from_utf8_lossy(slice).into_owned(),
+            )
+        };
+        (ok, calls, msg)
+    }
+
+    #[test]
+    fn init_chain_states_refuses_a_config_whose_segments_do_not_cover_the_devices() {
+        // The control: a sound segmentation over the same devices, so a
+        // refusal below cannot be the harness failing for some other
+        // reason.
+        let (ok, calls, msg) = run_seg_init(2, 1, &[(0, 2)]);
+        assert!(
+            ok,
+            "a sound one-chain segmentation must initialise: {msg:?}"
+        );
+        assert_eq!(calls, 0);
+        let (ok, calls, msg) = run_seg_init(2, 2, &[(0, 1), (1, 1)]);
+        assert!(
+            ok,
+            "a sound two-chain segmentation must initialise: {msg:?}"
+        );
+        assert_eq!(calls, 0);
+
+        // An unstated segmentation. This is the all-zero state a host
+        // that does not know about segments leaves behind, and it is
+        // the reason the field cannot have a default meaning: read as
+        // "one chain spanning everything" it would quietly make every
+        // device a parent of the one before it.
+        let (ok, calls, msg) = run_seg_init(2, 0, &[]);
+        assert!(!ok, "segment_count 0 must not initialise");
+        assert!(
+            msg.contains("segments do not cover"),
+            "the refusal must say why, said {msg:?}"
+        );
+        // Not a typed differencing refusal: this is instar disagreeing
+        // with itself about the config, not a property of the image,
+        // and those status codes mean the source is differencing.
+        assert_eq!(
+            calls, 0,
+            "a malformed config must not raise the differencing refusal"
+        );
+
+        // Short of the devices, past them, overlapping, out of order.
+        for (segment_count, segments, label) in [
+            (
+                1u32,
+                &[(0u32, 1u32)][..],
+                "a segmentation short of the devices",
+            ),
+            (1, &[(0, 3)][..], "a segmentation past the devices"),
+            (2, &[(0, 1), (0, 1)][..], "an overlapping segmentation"),
+            (2, &[(1, 1), (0, 1)][..], "an out-of-order segmentation"),
+        ] {
+            let (ok, calls, msg) = run_seg_init(2, segment_count, segments);
+            assert!(!ok, "{label} must not initialise");
+            assert!(
+                msg.contains("segments do not cover"),
+                "{label} must say why, said {msg:?}"
+            );
+            assert_eq!(calls, 0, "{label} must not raise the differencing refusal");
+        }
     }
 }
 
@@ -11412,6 +12035,25 @@ unsafe fn read_vhdx_child_runs(
 #[inline]
 fn devices_behind(chain_len: usize, dev_offset: usize) -> Option<usize> {
     chain_len.checked_sub(dev_offset)?.checked_sub(1)
+}
+
+/// Whether the device at `dev_idx` has at least one device behind it
+/// *in its own chain*, according to the config's declared
+/// segmentation.
+///
+/// The question is put to [`devices_behind`] through a chain-relative
+/// offset, which is exactly how `read_chain_virtual_cluster` puts it,
+/// so a device this reports a parent for is one the reader would
+/// actually descend into. A device no segment covers has no parent:
+/// the walk cannot name one.
+#[cfg(any(feature = "vhd-input", feature = "vhdx-input"))]
+fn parent_in_chain(chain_config: &ChainConfig, dev_idx: usize) -> bool {
+    match chain_config.segment_of(dev_idx) {
+        Some(seg) => {
+            devices_behind(seg.count as usize, dev_idx - seg.first as usize).unwrap_or(0) > 0
+        }
+        None => false,
+    }
 }
 
 /// Read one cluster's worth of virtual data by walking a backing chain.
@@ -13428,6 +14070,26 @@ pub unsafe fn init_chain_states(
     let _ = (dmg_scratch_base, dmg_scratch_len);
     #[cfg(feature = "dmg-input")]
     let mut dmg_slot: usize = 0;
+    // The segmentation is the only thing in the config that says
+    // which devices form a chain. `device_count` bounds a flat array
+    // that an operation reading two images packs both chains into, so
+    // a device's parent is the next slot in its own segment and not
+    // simply the next slot. Refuse a config whose segments do not
+    // tile `[0, device_count)` exactly: there is no legal encoding
+    // meaning "the host did not say", so an unstated segmentation is
+    // detectable here instead of being guessed at by every device
+    // arm below.
+    //
+    // This is a plain failure rather than one of the typed
+    // differencing refusal codes. Those say something about the
+    // user's image; this says the host and the guest disagree about
+    // the config, which is ours to fix.
+    if !chain_config.segmentation_covers(device_count) {
+        (call_table.debug_print)(
+            b"init_chain_states: chain config segments do not cover the devices\n\0".as_ptr(),
+        );
+        return false;
+    }
     for dev_idx in 0..device_count {
         let dev_info = &chain_config.devices[dev_idx];
         let format = dev_info.detected_format();
@@ -13481,26 +14143,40 @@ pub unsafe fn init_chain_states(
                     return false;
                 };
                 // A differencing child's content is split between it
-                // and its parent. The chain reader can compose the two
-                // when a parent device sits behind the child, but
-                // nothing here can tell whether the device that follows
-                // this one belongs to the same chain: `device_count`
-                // says how many entries of `devices` are valid, not how
-                // long this device's chain is, and an operation reading
-                // two chains at once packs both into that one array. So
-                // every differencing child is refused here, and the
-                // reader fails closed rather than composing against a
-                // parent that may not be one. Were it not refused, a
-                // parent-owned sector would read back as this child's
-                // own zeros and the caller would report success on
-                // wrong data (issue #547). The refusal cannot live in
-                // `VhdState::init`, which deliberately accepts
-                // `DISK_TYPE_DIFFERENCING`: map reads `disk_type` back
-                // off the state, and the chain reader needs the state to
-                // consult a block's sector bitmap.
-                if state.disk_type == vhd::DISK_TYPE_DIFFERENCING {
+                // and its parent, and the chain reader composes the
+                // two: it consults each block's sector bitmap and
+                // descends for the runs of sectors the bitmap leaves
+                // to the parent. That needs a device behind the child
+                // *in its own chain*, and the config's segmentation is
+                // what says whether there is one -- `segment_of` gives
+                // this device's chain and `devices_behind` counts what
+                // follows it there, asked with the chain-relative
+                // offset the reader itself uses so the two cannot
+                // answer differently. `device_count` cannot answer it:
+                // it bounds a flat array an operation reading two
+                // images packs both chains into, so the slot after a
+                // child can be an unrelated image, and composing
+                // against that is a wrong read reported as success
+                // (issue #614).
+                //
+                // With nothing behind it in its own chain the child is
+                // still refused, which is the narrower refusal this
+                // check now is. Every sector its bitmap assigns to the
+                // parent would have to come from somewhere, and
+                // serving the child's own zeros for them is wrong data
+                // the caller reports success on (issue #547).
+                //
+                // The check cannot live in `VhdState::init`, which
+                // deliberately accepts `DISK_TYPE_DIFFERENCING`: map
+                // reads `disk_type` back off the state, and the chain
+                // reader needs the state to consult a block's sector
+                // bitmap.
+                if state.disk_type == vhd::DISK_TYPE_DIFFERENCING
+                    && !parent_in_chain(chain_config, dev_idx)
+                {
                     (call_table.debug_print)(
-                        b"init_chain_states: differencing VHD source refused\n\0".as_ptr(),
+                        b"init_chain_states: differencing VHD source refused (no parent in chain)\n\0"
+                            .as_ptr(),
                     );
                     send_differencing_refusal(call_table, shared::DifferencingRefusal::STATUS_VHD);
                     return false;
@@ -13521,14 +14197,17 @@ pub unsafe fn init_chain_states(
                 let Some(state) = chain_states.vhdx_states[dev_idx].as_ref() else {
                     return false;
                 };
-                // Same policy as the VHD arm above. `VhdxState::init` used
-                // to refuse a differencing image itself, which made every
-                // failure look identical to a corrupt header (issue #548);
-                // it now reports `has_parent` and the refusal happens here,
-                // where it can say which format and why.
-                if state.has_parent {
+                // Same policy as the VHD arm above: composed when a
+                // device sits behind the child in its own chain,
+                // refused when none does. `VhdxState::init` used to
+                // refuse a differencing image itself, which made every
+                // failure look identical to a corrupt header (issue
+                // #548); it now reports `has_parent` and the judgement
+                // happens here, where it can say which format and why.
+                if state.has_parent && !parent_in_chain(chain_config, dev_idx) {
                     (call_table.debug_print)(
-                        b"init_chain_states: differencing VHDX source refused\n\0".as_ptr(),
+                        b"init_chain_states: differencing VHDX source refused (no parent in chain)\n\0"
+                            .as_ptr(),
                     );
                     send_differencing_refusal(call_table, shared::DifferencingRefusal::STATUS_VHDX);
                     return false;

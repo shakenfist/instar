@@ -15,13 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and serves each 512-byte sector from whichever device owns it,
   recursing into the parent for the sectors the child does not own. An
   unallocated block already descended to the parent correctly and is
-  unchanged. This is a crate-level change only: `init_chain_states`
-  still refuses every differencing VHD unconditionally, and only one
-  call site resolves a differencing parent at all, `instar info
-  --chain`'s reporting path. No operation reaches the composing path
-  yet — `instar convert`, `dd`, `compare`, `bench`, `check`, `measure`
-  and `map` still refuse a differencing source exactly as before — so
-  this is not a user-visible change.
+  unchanged. This was a crate-level change when made: nothing
+  reached the composing path, because `init_chain_states` refused
+  every differencing VHD unconditionally. The composition rollout
+  below now reaches it from `convert`, `dd`, `compare`, `bench` and
+  `rebase`.
 
 - **The guest chain walker can compose a differencing VHDX's partially
   present block against its parent.** It previously failed the read
@@ -35,10 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   device follows. The chain walker also refuses a BAT entry naming
   file offset zero, where the file identifier and headers live,
   rather than reading a block from there; the whole-BAT walks behind
-  `info` and `map` are unchanged. This is a crate-level change only:
-  `init_chain_states` still
-  refuses every differencing VHDX unconditionally, so no operation
-  reaches the composing path — this is not a user-visible change.
+  `info` and `map` are unchanged. This was a crate-level change when made:
+  `init_chain_states` refused every differencing VHDX
+  unconditionally, so no operation reached the composing path. The
+  composition rollout below now reaches it.
 
 - **`instar info --chain` walks differencing VHD and VHDX parent chains.**
   It previously stopped at the child and reported the parent reference
@@ -49,15 +47,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   reference points back at an image already in the chain, or resolution
   fails for any other reason, such as a permission error on a path
   component — the walk ends at the last image it did resolve, a reason is
-  printed to stderr, and the command still exits 0. No operation that
-  reads image data changed: `convert`, `dd`, `compare`, `bench`, `check`,
-  `measure` and `map` still refuse a differencing source, and still
-  refuse it identically whether or not the parent file is present.
+  printed to stderr, and the command still exits 0. This change read
+  chains without reading image data; the composition rollout below is
+  what taught five operations to read one. `map`, `measure` and
+  `check` still refuse a differencing source, and still refuse it
+  identically whether or not the parent file is present.
 
 - **`instar info --chain --output json` now produces JSON.** It
   previously ignored the `--output` flag and printed human text. The JSON
   form is an array of objects, matching `qemu-img info --backing-chain
   --output json`.
+
+- **`instar convert`, `dd`, `compare`, `bench` and `rebase` now compose
+  a differencing VHD or VHDX source against its parent, instead of
+  refusing it.** This lifts the blanket differencing refusal (below)
+  for the five
+  operations that read through the guest chain walker, using the VHD
+  and VHDX block composition added above. `convert -O raw` on a
+  differencing VHD or VHDX produces the same bytes as the same chain
+  flattened by hand, verified byte-for-byte against both formats and a
+  depth-3 chain. `compare` descends each side of a two-image comparison
+  through its own chain rather than conflating the two into one array.
+  `rebase` composes a differencing image only when one sits in the
+  *backing chain* it reads through — it already refuses any overlay
+  that is not qcow2 or vmdk, so a differencing image was never
+  acceptable as the image being rebased and still is not. A
+  differencing child with no parent anywhere in its own chain is still
+  refused, with the same typed refusal as before — composing it would
+  mean reading parent-owned sectors from nothing — but the refusal is
+  now conditional on that rather than unconditional.
+
+  `map`, `measure` and `check` are unchanged: each still refuses a
+  differencing source outright, with its own message naming its own
+  operation, so a refusal from one of them does not read as a claim
+  that instar cannot compose a chain at all.
+
+  Closes #623 (the differencing VHDX BAT layout defect fixed above,
+  which composition would otherwise have made reachable from an
+  untrusted image), #614 (`init_chain_states` could not tell where one
+  chain ended and the next began, which blocked `compare`'s two-chain
+  case), and #625 (a BAT entry naming an offset inside a region the
+  image itself declares; see the region-overlap entry under *Changed*,
+  which tightens every VHDX read, not only a differencing one).
 
 - **Coverage-guided fuzzing of the VHD and VHDX parent-locator read
   paths (40→42 targets).** Both were previously unreached: measurement
@@ -279,6 +310,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Every VHDX read through the chain walker refuses a payload block
+  that overlaps a region the image declares.** A VHDX region table names
+  where the BAT, the metadata region and any other region the writer
+  declared live. A BAT entry whose block runs into one of those is
+  describing payload data on top of the image's own structure, which no
+  conforming writer emits; instar previously only refused a block below
+  a fixed 1 MiB floor, which could not tell real payload from the BAT of
+  a small image. Blocks are now checked against the declared region
+  table instead — its first eight entries, which is the same cap the
+  region scan uses to locate the BAT and the metadata region, so neither
+  of those can be declared outside the checked set without the image
+  failing to open — and the same test guards the sector-bitmap blocks a
+  differencing child reads.
+
+  This is a behaviour change for plain dynamic VHDX too, not only for
+  the differencing images it was found on: the check runs in
+  `block_lookup` whatever the image says about a parent, so it reaches
+  `convert`, `dd`, `compare`, `bench` and `rebase` — every operation
+  that reads VHDX payload through the guest chain walker. It does not
+  reach `map` or `measure`, which classify BAT entries through
+  `classify_vhdx_bat_entry` in `map_extents` and `scan_allocation` and
+  run no overlap test, so a malformed image `convert` now refuses is
+  still mapped as data by `map` (issue #634). A well-formed image is
+  unaffected — the region table and the payload cannot legally overlap
+  — but a malformed or hostile one that instar used to read now fails
+  the read instead. A region entry whose own `offset + length`
+  overflows is treated as overlapping everything, so such an image
+  becomes unreadable in its entirety; that is deliberate, because an
+  image that cannot say where its own regions end cannot be used to
+  bound anything. Fixes #625.
+
 - **CI runs on Debian 13 runners.** Every job moved from the `debian-12`
   runner labels to `debian-13` (and `debian-12-docker` to
   `debian-13-docker`); Debian 12 reached end of life on 2026-06-10. The
@@ -409,6 +471,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   fixed by hand.
 
 ### Fixed
+
+- **`instar create -f vhdx -b PARENT` sizes the child's BAT by the
+  differencing rule.** A VHDX block allocation table interleaves one
+  sector-bitmap entry after every `chunk_ratio` payload entries, with
+  the bitmap entry last in its group, so a differencing image reserves
+  whole groups of `chunk_ratio + 1` entries where an image with no
+  parent stops at the last entry its virtual disk needs. instar sized
+  both by the no-parent rule, which leaves the final group's bitmap
+  entry — the one saying which sectors of the disk's last blocks the
+  child owns — outside the BAT region the child's own region table
+  declares. The two counts differ by at most `chunk_ratio - 1`
+  entries, and the BAT region is rounded up to a whole megabyte, so
+  the shortfall only escaped the rounding at some geometries; where it
+  did, instar and any other conforming reader could not resolve those
+  sectors. A plain dynamic VHDX is unaffected, and `convert`'s VHDX
+  output, which never has a parent, is byte-identical. Fixes #623.
 
 - **CI apt steps wait for apt's locks instead of failing.** A runner
   that was still running its own apt job when a CI step began made that
@@ -569,7 +647,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   outright (that rejection is what accidentally protected VHDX before
   this change), so every read entry point — `map` included — now
   decides for itself instead of relying on that crate to fail closed
-  for the wrong reason. **If you script against `check`'s exit code,
+  for the wrong reason. A later phase (see "Added" above) teaches
+  `convert`, `dd`, `compare`, `bench` and `rebase` to compose such a
+  source instead of refusing it; `map`, `measure` and `check` keep
+  refusing. **If you script against `check`'s exit code,
   note that a differencing image now exits 1 (refused) instead of 2
   (corrupt)** — it was never corrupt, it was unsupported. `instar info`
   is deliberately unaffected by the refusal: it now reports the parent

@@ -1107,9 +1107,9 @@ mod tests {
     // Tests for shared::ChainConfig and shared::ChainDeviceInfo structures
     mod chain_config_tests {
         use shared::{
-            ChainConfig, ChainDeviceInfo, ImageFormat as SharedImageFormat, InfoResult,
-            CALL_TABLE_ADDR, CHAIN_CONFIG_ADDR, MAX_CHAIN_DEVICES, OPERATION_CONFIG_ADDR,
-            OPERATION_LOAD_ADDR, VMM_PARAMS_ADDR, VQ_BASE_START,
+            ChainConfig, ChainDeviceInfo, ChainSegment, ImageFormat as SharedImageFormat,
+            InfoResult, CALL_TABLE_ADDR, CHAIN_CONFIG_ADDR, MAX_CHAIN_DEVICES,
+            OPERATION_CONFIG_ADDR, OPERATION_LOAD_ADDR, VMM_PARAMS_ADDR, VQ_BASE_START,
         };
 
         #[test]
@@ -1242,8 +1242,12 @@ mod tests {
             // ChainDeviceInfo: 4 + 4 + 8 + 8 + 4 + 4 = 32 bytes
             assert_eq!(core::mem::size_of::<ChainDeviceInfo>(), 32);
 
-            // ChainConfig: 4 + 4 + 8 + (16 * 32) = 528 bytes
-            assert_eq!(core::mem::size_of::<ChainConfig>(), 528);
+            // ChainSegment: 4 + 4 = 8 bytes
+            assert_eq!(core::mem::size_of::<ChainSegment>(), 8);
+
+            // ChainConfig: 16 header + (16 * 32) devices
+            // + (16 * 8) segments + 64 reserved = 720 bytes
+            assert_eq!(core::mem::size_of::<ChainConfig>(), 720);
         }
 
         #[test]

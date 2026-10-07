@@ -1400,9 +1400,18 @@ pub fn plan_vhdx<'a>(
     const REGION_TABLE_LEN: usize = 65536;
     const METADATA_REGION_LEN: usize = 1024 * 1024;
 
-    let (total_bat_entries, _chunk_ratio, _payload_blocks) =
-        vhdx::calculate_bat_layout(opts.virtual_size, opts.block_size, LOGICAL_SECTOR_SIZE)
-            .ok_or(CreateError::Overflow)?;
+    // A child pads its BAT out to whole chunk groups; an image with no
+    // parent stops at the last entry it needs. `parent_path` is the
+    // typed form of `opts.backing` decided above, so the BAT is sized
+    // by the same fact the File Parameters `HasParent` bit and the
+    // parent locator are written from, and the three cannot disagree.
+    let (total_bat_entries, _chunk_ratio, _payload_blocks) = vhdx::calculate_bat_layout(
+        opts.virtual_size,
+        opts.block_size,
+        LOGICAL_SECTOR_SIZE,
+        parent_path.is_some(),
+    )
+    .ok_or(CreateError::Overflow)?;
     let bat_size_bytes: u64 = total_bat_entries as u64 * 8;
     let bat_region_size: u64 = bat_size_bytes.div_ceil(vhdx::MB_ALIGN) * vhdx::MB_ALIGN;
 
