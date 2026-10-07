@@ -11,8 +11,11 @@ use resize::{
     plan_resize_vhdx, Preallocation, ResizeAction, ResizeError, ResizePatch, ResizePlan,
     VhdxResizeOpts, QCOW2_MAX_RESIZE_SCRATCH,
 };
-use shared::{le_u64, write_le_u64};
-use vhdx::{parse_region_table, VhdxHeader, HEADER1_OFFSET, HEADER2_OFFSET, REGION_TABLE1_OFFSET};
+use shared::{le_u32, le_u64, write_le_u32, write_le_u64};
+use vhdx::{
+    parse_metadata_region, parse_region_table, VhdxHeader, HEADER1_OFFSET, HEADER2_OFFSET,
+    REGION_TABLE1_OFFSET,
+};
 
 const VHDX_SCRATCH: usize = QCOW2_MAX_RESIZE_SCRATCH;
 
@@ -103,14 +106,16 @@ fn opts_from_image<'a>(
     // each entry is 8 bytes.
     let current_total_bat_entries = (bat_entry.length / 8) as u32;
 
-    // Decode VirtualDiskSize from the metadata region.
-    let vds_off = metadata_entry.file_offset as usize + 0x10008;
-    let current_virtual_size = le_u64(bytes, vds_off);
+    let metadata = parse_metadata_region(
+        &bytes[metadata_entry.file_offset as usize
+            ..metadata_entry.file_offset as usize + metadata_entry.length as usize],
+    )
+    .expect("metadata region");
 
     VhdxResizeOpts {
-        current_virtual_size,
+        current_virtual_size: metadata.virtual_disk_size,
         new_virtual_size,
-        block_size: 32 * 1024 * 1024, // create::plan_vhdx requires us to pass; default test val
+        block_size: metadata.block_size,
         preallocation: Preallocation::Off,
         allow_shrink,
         existing_active_header,
@@ -124,9 +129,10 @@ fn opts_from_image<'a>(
         current_total_bat_entries,
         current_metadata_offset: metadata_entry.file_offset,
         current_metadata_length: metadata_entry.length,
-        logical_sector_size: 512,
-        physical_sector_size: 4096,
-        has_parent: false,
+        virtual_disk_size_item_offset: metadata.virtual_disk_size_offset,
+        logical_sector_size: metadata.logical_sector_size,
+        physical_sector_size: metadata.physical_sector_size,
+        has_parent: metadata.has_parent,
         current_file_size: bytes.len() as u64,
     }
 }
@@ -162,9 +168,59 @@ fn metadata_only_grow_when_bat_fits() {
 
     // VirtualDiskSize updated.
     let region_table = parse_region_table(&file[REGION_TABLE1_OFFSET as usize..]).expect("rt");
-    let metadata_off = region_table.0[1].file_offset as usize;
-    let post_vds = le_u64(&file, metadata_off + 0x10008);
-    assert_eq!(post_vds, 2u64 << 30);
+    let metadata = &region_table.0[1];
+    let metadata_bytes = &file
+        [metadata.file_offset as usize..metadata.file_offset as usize + metadata.length as usize];
+    let post = parse_metadata_region(metadata_bytes).expect("metadata");
+    assert_eq!(post.virtual_disk_size, 2u64 << 30);
+}
+
+/// The metadata region of an image, as a mutable slice.
+fn metadata_region_mut(bytes: &mut [u8]) -> &mut [u8] {
+    let (entries, _count) =
+        parse_region_table(&bytes[REGION_TABLE1_OFFSET as usize..]).expect("region table");
+    let start = entries[1].file_offset as usize;
+    let end = start + entries[1].length as usize;
+    &mut bytes[start..end]
+}
+
+/// Metadata table entry 1 is Virtual Disk Size in the layout
+/// `vhdx::build_metadata` writes.
+const VDS_TABLE_ENTRY: usize = 32 + 32;
+
+#[test]
+fn writes_virtual_disk_size_where_the_metadata_table_puts_it() {
+    // SPEC(VHDX) fixes no position for metadata items. Move the
+    // Virtual Disk Size item and leave a decoy at the offset instar's
+    // own writer uses: resize must follow the table to the real one
+    // and leave the decoy alone.
+    let mut bytes = build_starting_vhdx(1u64 << 30, 32 * 1024 * 1024);
+    let region = metadata_region_mut(&mut bytes);
+    write_le_u32(region, VDS_TABLE_ENTRY + 16, 0x10100);
+    write_le_u64(region, 0x10100, 1u64 << 30);
+    write_le_u64(region, 0x10008, 0xdead_beef);
+
+    let opts = opts_from_image(&bytes, 2u64 << 30, false);
+    let mut scratch = vec![0u8; VHDX_SCRATCH];
+    let plan = plan_resize_vhdx(&opts, &mut scratch).expect("plan");
+    let mut file = bytes.clone();
+    apply_resize(&mut file, &plan);
+
+    let region = metadata_region_mut(&mut file);
+    assert_eq!(le_u64(region, 0x10100), 2u64 << 30);
+    assert_eq!(le_u64(region, 0x10008), 0xdead_beef);
+}
+
+#[test]
+fn rejects_virtual_disk_size_item_outside_the_metadata_region() {
+    let bytes = build_starting_vhdx(1u64 << 30, 32 * 1024 * 1024);
+    let mut opts = opts_from_image(&bytes, 2u64 << 30, false);
+    opts.virtual_disk_size_item_offset = opts.current_metadata_length - 4;
+    let mut scratch = vec![0u8; VHDX_SCRATCH];
+    assert_eq!(
+        plan_resize_vhdx(&opts, &mut scratch).unwrap_err(),
+        ResizeError::HeaderMismatch
+    );
 }
 
 #[test]
@@ -282,6 +338,26 @@ fn rejects_differencing_image() {
     let bytes = build_starting_vhdx(1u64 << 30, 32 * 1024 * 1024);
     let mut opts = opts_from_image(&bytes, 2u64 << 30, false);
     opts.has_parent = true;
+    let mut scratch = vec![0u8; VHDX_SCRATCH];
+    assert_eq!(
+        plan_resize_vhdx(&opts, &mut scratch).unwrap_err(),
+        ResizeError::UnsupportedSubformat
+    );
+}
+
+#[test]
+fn rejects_an_image_whose_metadata_says_it_has_a_parent() {
+    // Unlike `rejects_differencing_image`, which sets the option
+    // directly, this sets the File Parameters HasParent bit in the
+    // image and lets the metadata parser carry it to the planner.
+    let mut bytes = build_starting_vhdx(1u64 << 30, 32 * 1024 * 1024);
+    let region = metadata_region_mut(&mut bytes);
+    // File Parameters is item 0 at 0x10000; flags follow block size.
+    let flags = le_u32(region, 0x10004);
+    write_le_u32(region, 0x10004, flags | 2);
+
+    let opts = opts_from_image(&bytes, 2u64 << 30, false);
+    assert!(opts.has_parent);
     let mut scratch = vec![0u8; VHDX_SCRATCH];
     assert_eq!(
         plan_resize_vhdx(&opts, &mut scratch).unwrap_err(),

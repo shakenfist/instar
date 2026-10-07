@@ -7892,21 +7892,17 @@ fn probe_vhdx_virtual_size(
     file.read_exact(&mut rt)?;
     let (entries, _count) =
         vhdx::parse_region_table(&rt).ok_or("resize: vhdx region table invalid")?;
-    // entries[1] is the metadata region per the create-crate
-    // layout convention.
+    // parse_region_table returns the BAT entry first and the
+    // metadata entry second, whatever order the table lists them in.
     let metadata = &entries[1];
     // `metadata.length` is an attacker-controlled u32 from the region
     // table; a crafted VHDX could set it near u32::MAX and force a ~4 GiB
-    // host allocation here (issue #446). The VirtualDiskSize field we need
-    // sits in the first 64 KiB of the region, and legitimate metadata
-    // regions are 1 MiB (what instar and Hyper-V write), so bound the read
-    // to a sane maximum and validate it lies within the file before
-    // allocating.
-    const VDS_REL_OFFSET: usize = 0x10008;
+    // host allocation here (issue #446). The items we need sit near the
+    // front of the region, and legitimate metadata regions are 1 MiB
+    // (what instar, qemu and Hyper-V write), so bound the read to a
+    // sane maximum and validate it lies within the file before
+    // allocating. An item past the bytes read is refused by the parser.
     const MAX_VHDX_METADATA_PROBE: u64 = 1 << 20; // 1 MiB
-    if (metadata.length as u64) < VDS_REL_OFFSET as u64 + 8 {
-        return Err("resize: vhdx metadata too short".into());
-    }
     let read_len = (metadata.length as u64).min(MAX_VHDX_METADATA_PROBE);
     let region_end = metadata
         .file_offset
@@ -7918,11 +7914,8 @@ fn probe_vhdx_virtual_size(
     let mut meta = vec![0u8; read_len as usize];
     file.seek(SeekFrom::Start(metadata.file_offset))?;
     file.read_exact(&mut meta)?;
-    // VirtualDiskSize lives at relative offset 0x10008 in the metadata
-    // region as a u64 LE; `read_len >= VDS_REL_OFFSET + 8` is guaranteed
-    // by the length check above.
-    let vds = shared::le_u64(&meta, VDS_REL_OFFSET);
-    Ok(vds)
+    let items = vhdx::parse_metadata_region(&meta).ok_or("resize: vhdx metadata invalid")?;
+    Ok(items.virtual_disk_size)
 }
 
 /// Host-side raw resize: `set_len` to the new size, optional

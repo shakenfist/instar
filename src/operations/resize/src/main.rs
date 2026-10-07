@@ -30,8 +30,8 @@ use resize::{
 use shared::{
     be_u64,
     format_detection::{detect_format_from_header, detect_vhd_footer},
-    le_u32, le_u64, validate_call_table, CallTable, ImageFormat, ResizeConfig, ResizeResult,
-    CALL_TABLE_ADDR, MAX_SECTOR_SIZE, OPERATION_CONFIG_ADDR, SCRATCH_MEM_BASE,
+    validate_call_table, CallTable, ImageFormat, ResizeConfig, ResizeResult, CALL_TABLE_ADDR,
+    MAX_SECTOR_SIZE, OPERATION_CONFIG_ADDR, SCRATCH_MEM_BASE,
 };
 
 // ---------------------------------------------------------------------------
@@ -781,22 +781,26 @@ unsafe fn run_vhdx(
     let bat_entry = &entries[0];
     let metadata_entry = &entries[1];
 
-    // Read the metadata region (1 MiB) so we can decode
-    // VirtualDiskSize directly.
+    // Stage the metadata region, up to the 1 MiB slot reserved for
+    // it. Its length comes from the image, and the items this op
+    // reads sit near the front of a region that is 1 MiB in every
+    // producer we know of; an item past what is staged is refused by
+    // the parser rather than read.
+    let metadata_len = (metadata_entry.length as usize).min(bat_off - metadata_off);
     if !read_byte_range(
         call_table,
         sector_size,
         metadata_entry.file_offset,
         state_base.add(metadata_off),
-        metadata_entry.length as usize,
+        metadata_len,
     ) {
         return err_result(config, ResizeResult::ERROR_READ_FAILED);
     }
-    let metadata_slice =
-        core::slice::from_raw_parts(state_base.add(metadata_off), metadata_entry.length as usize);
-    let _stored_vds = le_u64(metadata_slice, 0x10008);
-    // (We trust the planner's HeaderMismatch check; no extra
-    // validation here.)
+    let metadata_slice = core::slice::from_raw_parts(state_base.add(metadata_off), metadata_len);
+    let metadata = match vhdx::parse_metadata_region(metadata_slice) {
+        Some(m) => m,
+        None => return err_result(config, ResizeResult::ERROR_PARSE_FAILED),
+    };
 
     // Read the BAT region.
     let bat_len = bat_entry.length as usize;
@@ -815,13 +819,10 @@ unsafe fn run_vhdx(
     let bat_slice = core::slice::from_raw_parts(state_base.add(bat_off), bat_len);
     let current_total_bat_entries = (bat_len / 8) as u32;
 
-    // Read block_size from the FileParameters metadata item.
-    let block_size = le_u32(metadata_slice, 0x10000);
-
     let opts = VhdxResizeOpts {
         current_virtual_size: config.current_virtual_size,
         new_virtual_size: config.new_virtual_size,
-        block_size,
+        block_size: metadata.block_size,
         preallocation: map_prealloc(config.flags),
         allow_shrink: config.allow_shrink(),
         existing_active_header: active_bytes,
@@ -834,9 +835,10 @@ unsafe fn run_vhdx(
         current_total_bat_entries,
         current_metadata_offset: metadata_entry.file_offset,
         current_metadata_length: metadata_entry.length,
-        logical_sector_size: 512,
-        physical_sector_size: 4096,
-        has_parent: false,
+        virtual_disk_size_item_offset: metadata.virtual_disk_size_offset,
+        logical_sector_size: metadata.logical_sector_size,
+        physical_sector_size: metadata.physical_sector_size,
+        has_parent: metadata.has_parent,
         current_file_size: file_size_before,
     };
 

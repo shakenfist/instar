@@ -1138,6 +1138,149 @@ pub struct VhdxMetadata {
     pub parent_locator: VhdxParentLocatorState,
 }
 
+/// File Parameters flags bit 1: the image is a differencing image
+/// (SPEC(VHDX) 2.6.2.1).
+const FILE_PARAMETERS_HAS_PARENT: u32 = 1 << 1;
+
+/// Block size rule from SPEC(VHDX) 2.6.2.1: a power of two between
+/// 1 MiB and 256 MiB inclusive.
+fn is_valid_metadata_block_size(block_size: u32) -> bool {
+    block_size.is_power_of_two() && (1024 * 1024..=256 * 1024 * 1024).contains(&block_size)
+}
+
+/// Where a metadata table says each item this crate reads lives, as
+/// offsets relative to the start of the metadata region.
+struct MetadataItemLocations {
+    file_parameters: u32,
+    virtual_disk_size: u32,
+    logical_sector_size: u32,
+    physical_sector_size: u32,
+    /// Offset and declared length. The other items are fixed-size, so
+    /// their table entry Length is not needed; the parent locator's is.
+    parent_locator: Option<(u32, u32)>,
+}
+
+/// Scan a metadata table for the items this crate reads, by GUID.
+///
+/// `table` starts at the table header. Entries that would run past the
+/// end of `table` are not scanned, and at most 32 are. Returns `None`
+/// if the signature is wrong, the entry count exceeds the spec limit,
+/// or any of the four required items is not listed.
+fn locate_metadata_items(table: &[u8]) -> Option<MetadataItemLocations> {
+    if table.len() < METADATA_TABLE_HEADER_SIZE || le_u64(table, 0) != METADATA_TABLE_SIGNATURE {
+        return None;
+    }
+    let entry_count = le_u16(table, METADATA_TABLE_ENTRY_COUNT_OFFSET);
+    if entry_count > MAX_METADATA_TABLE_ENTRIES {
+        return None;
+    }
+
+    let mut file_parameters = None;
+    let mut virtual_disk_size = None;
+    let mut logical_sector_size = None;
+    let mut physical_sector_size = None;
+    let mut parent_locator = None;
+
+    for i in 0..entry_count.min(32) as usize {
+        let entry_start = METADATA_TABLE_HEADER_SIZE + i * METADATA_TABLE_ENTRY_SIZE;
+        if entry_start + METADATA_TABLE_ENTRY_SIZE > table.len() {
+            break;
+        }
+
+        let guid = &table[entry_start..entry_start + 16];
+        let item_offset = le_u32(table, entry_start + 16);
+
+        if guid == FILE_PARAMETERS_GUID {
+            file_parameters = Some(item_offset);
+        } else if guid == VIRTUAL_DISK_SIZE_GUID {
+            virtual_disk_size = Some(item_offset);
+        } else if guid == LOGICAL_SECTOR_SIZE_GUID {
+            logical_sector_size = Some(item_offset);
+        } else if guid == PHYSICAL_SECTOR_SIZE_GUID {
+            physical_sector_size = Some(item_offset);
+        } else if guid == PARENT_LOCATOR_GUID {
+            // Metadata table entry Length, at entry offset +20
+            // (SPEC(VHDX) 2.6.1.2).
+            parent_locator = Some((item_offset, le_u32(table, entry_start + 20)));
+        }
+    }
+
+    Some(MetadataItemLocations {
+        file_parameters: file_parameters?,
+        virtual_disk_size: virtual_disk_size?,
+        logical_sector_size: logical_sector_size?,
+        physical_sector_size: physical_sector_size?,
+        parent_locator,
+    })
+}
+
+/// The fixed-size metadata items of a VHDX, read from a metadata
+/// region already in memory, with where each one lives.
+///
+/// For a caller that rewrites an image in place: the `*_offset` fields
+/// are where the metadata table says each item is, relative to the
+/// start of the metadata region, so an item can be updated where it
+/// actually is. SPEC(VHDX) 2.6.1.2 fixes no order or position for
+/// items, so a writer that assumes one rewrites whatever another
+/// producer put there.
+pub struct VhdxMetadataItems {
+    pub block_size: u32,
+    pub has_parent: bool,
+    pub virtual_disk_size: u64,
+    pub virtual_disk_size_offset: u32,
+    pub logical_sector_size: u32,
+    pub physical_sector_size: u32,
+}
+
+/// Parse the fixed-size metadata items from a staged metadata region.
+///
+/// `region` starts at the metadata region's first byte; it may be
+/// shorter than the region's declared length, and an item that does
+/// not fit inside it is refused rather than read. Items are located by
+/// GUID through the metadata table, and one placed below
+/// [`METADATA_ITEMS_MIN_OFFSET`] -- inside the table itself -- is
+/// refused, so that a caller writing to an item cannot be steered into
+/// rewriting the table.
+///
+/// Refuses (returns `None`) a block size outside the SPEC(VHDX)
+/// 2.6.2.1 rule, and a logical or physical sector size other than the
+/// 512 or 4096 that 2.6.2.4 and 2.6.2.5 allow. Unlike
+/// [`parse_metadata`], it does not stage the parent locator: a caller
+/// needing it has the region in hand and can pass the item to
+/// [`parse_parent_locator`].
+pub fn parse_metadata_region(region: &[u8]) -> Option<VhdxMetadataItems> {
+    let items = locate_metadata_items(region)?;
+
+    let item = |offset: u32, len: usize| -> Option<usize> {
+        let start = offset as usize;
+        (offset >= METADATA_ITEMS_MIN_OFFSET && start.checked_add(len)? <= region.len())
+            .then_some(start)
+    };
+
+    let fp = item(items.file_parameters, 8)?;
+    let block_size = le_u32(region, fp);
+    let has_parent = le_u32(region, fp + 4) & FILE_PARAMETERS_HAS_PARENT != 0;
+    if !is_valid_metadata_block_size(block_size) {
+        return None;
+    }
+
+    let virtual_disk_size = le_u64(region, item(items.virtual_disk_size, 8)?);
+    let logical_sector_size = le_u32(region, item(items.logical_sector_size, 4)?);
+    let physical_sector_size = le_u32(region, item(items.physical_sector_size, 4)?);
+    if !matches!(logical_sector_size, 512 | 4096) || !matches!(physical_sector_size, 512 | 4096) {
+        return None;
+    }
+
+    Some(VhdxMetadataItems {
+        block_size,
+        has_parent,
+        virtual_disk_size,
+        virtual_disk_size_offset: items.virtual_disk_size,
+        logical_sector_size,
+        physical_sector_size,
+    })
+}
+
 /// Parse VHDX metadata from the metadata region.
 ///
 /// Reads the metadata table and locates items by GUID. Requires
@@ -1178,75 +1321,18 @@ pub unsafe fn parse_metadata(
     }
     *bytes_read += sector_size as u64;
 
-    // Verify metadata table signature
-    let sig = le_u64(&buffer, table_off_in_sector);
-    if sig != METADATA_TABLE_SIGNATURE {
-        return None;
-    }
-
-    // Entry count at offset 10 (u16 LE)
-    let entry_count = le_u16(&buffer, table_off_in_sector + 10);
-    if entry_count > MAX_METADATA_TABLE_ENTRIES {
-        return None;
-    }
-
-    // Parse entries (each 32 bytes, starting at offset 32 in the table)
-    // Track item offsets and lengths within the metadata region
-    let mut file_params_offset: u32 = 0;
-    let mut virtual_size_offset: u32 = 0;
-    let mut logical_ss_offset: u32 = 0;
-    let mut physical_ss_offset: u32 = 0;
-    let mut parent_loc_offset: u32 = 0;
-    let mut parent_loc_length: u32 = 0;
-    let mut found_file_params = false;
-    let mut found_virtual_size = false;
-    let mut found_logical_ss = false;
-    let mut found_physical_ss = false;
-    let mut found_parent_loc = false;
-
-    for i in 0..entry_count.min(32) {
-        let entry_start = table_off_in_sector + 32 + (i as usize * METADATA_TABLE_ENTRY_SIZE);
-        if entry_start + METADATA_TABLE_ENTRY_SIZE > sector_size {
-            // Entry crosses sector boundary; for simplicity, read
-            // next sector if needed. Typically the metadata table
-            // fits in one sector (32 + 32*entries < 4096 for <127 entries).
-            break;
-        }
-
-        let mut guid = [0u8; 16];
-        guid.copy_from_slice(&buffer[entry_start..entry_start + 16]);
-        let item_offset = le_u32(&buffer, entry_start + 16);
-
-        if guid == FILE_PARAMETERS_GUID {
-            file_params_offset = item_offset;
-            found_file_params = true;
-        } else if guid == VIRTUAL_DISK_SIZE_GUID {
-            virtual_size_offset = item_offset;
-            found_virtual_size = true;
-        } else if guid == LOGICAL_SECTOR_SIZE_GUID {
-            logical_ss_offset = item_offset;
-            found_logical_ss = true;
-        } else if guid == PHYSICAL_SECTOR_SIZE_GUID {
-            physical_ss_offset = item_offset;
-            found_physical_ss = true;
-        } else if guid == PARENT_LOCATOR_GUID {
-            parent_loc_offset = item_offset;
-            // Metadata table entry Length, at entry offset +20
-            // (SPEC(VHDX) 2.6.1.2). The other items are fixed-size so
-            // the existing reads ignore it; the parent locator is not.
-            parent_loc_length = le_u32(&buffer, entry_start + 20);
-            found_parent_loc = true;
-        }
-    }
-
-    // File Parameters and Virtual Disk Size are required
-    if !found_file_params || !found_virtual_size {
-        return None;
-    }
-    // Logical and physical sector sizes are required
-    if !found_logical_ss || !found_physical_ss {
-        return None;
-    }
+    // The table is read from this one sector only: an entry that
+    // crosses into the next is not scanned. A table normally fits
+    // (32 + 32 * entries < 4096 for fewer than 127 entries).
+    let items = locate_metadata_items(&buffer[table_off_in_sector..sector_size])?;
+    let file_params_offset = items.file_parameters;
+    let virtual_size_offset = items.virtual_disk_size;
+    let logical_ss_offset = items.logical_sector_size;
+    let physical_ss_offset = items.physical_sector_size;
+    let (found_parent_loc, parent_loc_offset, parent_loc_length) = match items.parent_locator {
+        Some((offset, length)) => (true, offset, length),
+        None => (false, 0, 0),
+    };
 
     // Read File Parameters item (8 bytes: u32 block_size + u32 flags)
     let fp_abs_offset = metadata_offset + file_params_offset as u64;
@@ -1262,14 +1348,8 @@ pub unsafe fn parse_metadata(
     *bytes_read += sector_size as u64;
 
     let block_size = le_u32(&buffer, fp_off_in_sector);
-    let fp_flags = le_u32(&buffer, fp_off_in_sector + 4);
-    let has_parent = (fp_flags & 2) != 0; // Bit 1: HasParent
-
-    // Validate block size: must be power of 2, 1MB..=256MB
-    if block_size == 0
-        || (block_size & (block_size - 1)) != 0
-        || !(1024 * 1024..=256 * 1024 * 1024).contains(&block_size)
-    {
+    let has_parent = le_u32(&buffer, fp_off_in_sector + 4) & FILE_PARAMETERS_HAS_PARENT != 0;
+    if !is_valid_metadata_block_size(block_size) {
         return None;
     }
 
@@ -5343,6 +5423,93 @@ mod tests {
             &mut bytes_read,
         );
         (metadata, bytes_read)
+    }
+
+    #[test]
+    fn metadata_region_reads_the_items_build_metadata_writes() {
+        let items = parse_metadata_region(&metadata_region(false, false)).unwrap();
+        assert_eq!(items.block_size, 1024 * 1024);
+        assert!(!items.has_parent);
+        assert_eq!(items.virtual_disk_size, 64 * 1024 * 1024);
+        assert_eq!(items.virtual_disk_size_offset, 0x10008);
+        assert_eq!(items.logical_sector_size, 512);
+        assert_eq!(items.physical_sector_size, 512);
+    }
+
+    #[test]
+    fn metadata_region_reports_has_parent() {
+        let items = parse_metadata_region(&metadata_region(true, true)).unwrap();
+        assert!(items.has_parent);
+    }
+
+    /// SPEC(VHDX) 2.6.1.2 fixes no order for items, so the parser must
+    /// follow the table rather than assume `build_metadata`'s layout.
+    #[test]
+    fn metadata_region_follows_the_table_to_a_moved_item() {
+        let mut region = metadata_region(false, false);
+        // The Virtual Disk Size entry is table entry 1. Move its item
+        // past the others and plant a decoy at the old offset.
+        let e = METADATA_TABLE_HEADER_SIZE + METADATA_TABLE_ENTRY_SIZE;
+        write_le_u32(&mut region, e + 16, 0x10100);
+        write_le_u64(&mut region, 0x10100, 3 * 1024 * 1024);
+        write_le_u64(&mut region, 0x10008, 0xdead_beef);
+
+        let items = parse_metadata_region(&region).unwrap();
+        assert_eq!(items.virtual_disk_size, 3 * 1024 * 1024);
+        assert_eq!(items.virtual_disk_size_offset, 0x10100);
+    }
+
+    #[test]
+    fn metadata_region_refuses_an_item_past_the_staged_bytes() {
+        let region = metadata_region(false, false);
+        assert!(parse_metadata_region(&region[..0x10010]).is_none());
+    }
+
+    #[test]
+    fn metadata_region_refuses_an_item_inside_the_table() {
+        let mut region = metadata_region(false, false);
+        let e = METADATA_TABLE_HEADER_SIZE + METADATA_TABLE_ENTRY_SIZE;
+        write_le_u32(&mut region, e + 16, 0x100);
+        assert!(parse_metadata_region(&region).is_none());
+    }
+
+    #[test]
+    fn metadata_region_refuses_a_missing_required_item() {
+        let mut region = metadata_region(false, false);
+        // Overwrite the Logical Sector Size entry's GUID.
+        let e = METADATA_TABLE_HEADER_SIZE + 2 * METADATA_TABLE_ENTRY_SIZE;
+        region[e..e + 16].fill(0);
+        assert!(parse_metadata_region(&region).is_none());
+    }
+
+    #[test]
+    fn metadata_region_refuses_an_out_of_spec_sector_size() {
+        for bad in [0u32, 1024, 8192] {
+            let mut region = std::vec![0u8; STAGE_REGION_LEN];
+            build_metadata(&mut region, 1024 * 1024, 64 * 1024 * 1024, bad, 512, false);
+            assert!(parse_metadata_region(&region).is_none(), "logical {bad}");
+
+            let mut region = std::vec![0u8; STAGE_REGION_LEN];
+            build_metadata(&mut region, 1024 * 1024, 64 * 1024 * 1024, 512, bad, false);
+            assert!(parse_metadata_region(&region).is_none(), "physical {bad}");
+        }
+    }
+
+    #[test]
+    fn metadata_region_accepts_4k_sectors() {
+        let mut region = std::vec![0u8; STAGE_REGION_LEN];
+        build_metadata(&mut region, 32 * 1024 * 1024, 1 << 30, 4096, 4096, false);
+        let items = parse_metadata_region(&region).unwrap();
+        assert_eq!(items.logical_sector_size, 4096);
+        assert_eq!(items.physical_sector_size, 4096);
+        assert_eq!(items.block_size, 32 * 1024 * 1024);
+    }
+
+    #[test]
+    fn metadata_region_refuses_a_bad_signature() {
+        let mut region = metadata_region(false, false);
+        region[0] ^= 0xff;
+        assert!(parse_metadata_region(&region).is_none());
     }
 
     #[test]

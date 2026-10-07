@@ -764,6 +764,50 @@ class TestResizeErrorPaths(TestResizeSmoke):
             )
             self.assertIn('backing', stderr.lower())
 
+    def _assert_differencing_vhdx_refused(self, child):
+        """Resize `child` and assert it is refused and left untouched."""
+        before = child.read_bytes()
+        _, stderr, rc = self.run_instar_resize(str(child), '100M')
+        self.assertNotEqual(rc, 0, f'stderr: {stderr!r}')
+        self.assertIn('subformat does not support resize', stderr)
+        self.assert_bytes_identical(
+            child.read_bytes(), before,
+            'a refused resize must not touch the differencing child',
+        )
+
+    def test_differencing_vhdx_refused(self):
+        """resize refuses a qemu-img differencing VHDX (issue #565).
+
+        Growing the child alone would leave it claiming sectors its
+        parent cannot describe; qemu-img refuses too. The guard in the
+        resize planner existed but the guest op never told it the image
+        had a parent, so this used to exit 0 and rewrite the child.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            child = self._copy_fixture('vhdx-diff-child', td, '.vhdx')
+            self._assert_differencing_vhdx_refused(child)
+
+    def test_instar_created_differencing_vhdx_refused(self):
+        """resize refuses a differencing VHDX instar itself wrote."""
+        with tempfile.TemporaryDirectory() as td:
+            parent = Path(td) / 'parent.vhdx'
+            child = Path(td) / 'child.vhdx'
+            _, stderr, rc = self.run_instar_create(
+                '-f', 'vhdx', str(parent), '16M')
+            self.assertEqual(rc, 0, f'stderr: {stderr!r}')
+            _, stderr, rc = self.run_instar_create(
+                '-f', 'vhdx', '-b', 'parent.vhdx', '-F', 'vhdx', str(child))
+            self.assertEqual(rc, 0, f'stderr: {stderr!r}')
+            self._assert_differencing_vhdx_refused(child)
+
+    def test_differencing_vhdx_parent_still_resizes(self):
+        """The plain dynamic parent of the fixture chain still grows,
+        so the refusal is not over-broad."""
+        with tempfile.TemporaryDirectory() as td:
+            parent = self._copy_fixture('vhdx-diff-parent', td, '.vhdx')
+            _, stderr, rc = self.run_instar_resize(str(parent), '100M')
+            self.assertEqual(rc, 0, f'stderr: {stderr!r}')
+
     # ----------- Phase-1 format-coverage: new-format refusals -----------
     #
     # `probe_resize_target` (main.rs) header-probes the target with

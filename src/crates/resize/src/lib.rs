@@ -547,6 +547,11 @@ pub struct VhdxResizeOpts<'a> {
     pub current_metadata_offset: u64,
     /// Current metadata region's length (typically 1 MiB).
     pub current_metadata_length: u32,
+    /// Offset of the `VirtualDiskSize` item relative to the
+    /// metadata region, as the metadata table records it. The
+    /// planner rewrites the item here; SPEC(VHDX) 2.6.1.2 fixes
+    /// no position for it, so it must not be assumed.
+    pub virtual_disk_size_item_offset: u32,
     /// `logical_sector_size` from the existing metadata.
     pub logical_sector_size: u32,
     /// `physical_sector_size` from the existing metadata.
