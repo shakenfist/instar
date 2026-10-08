@@ -12509,11 +12509,14 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
         return Err(error.into());
     }
 
-    // A differencing source is refused rather than checked: the image is
-    // structurally fine but references content instar cannot see, so the
-    // guest marks the check incomplete rather than counting a corruption.
-    // Returning Err (exit 1) is what keeps "refused" distinct from both
-    // "clean" (exit 0) and "corrupt" (exit 2) (PLAN-differencing phase 4).
+    // A differencing source is refused rather than checked: check
+    // validates the structure of one image, and a differencing child's
+    // own structure is almost always intact while the image as a whole
+    // is unusable without its parent, so a clean verdict would present
+    // that partial view as though it were whole. The guest marks the
+    // check incomplete rather than counting a corruption. Returning Err
+    // (exit 1) is what keeps "refused" distinct from both "clean"
+    // (exit 0) and "corrupt" (exit 2).
     if serial_decoder.last_differencing_refusal.is_some() {
         return Err(serial_decoder
             .differencing_refusal_error("check", DifferencingComposition::Unsupported)

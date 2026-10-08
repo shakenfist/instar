@@ -3546,9 +3546,13 @@ impl CreateResult {
     /// host can suggest "try a larger cluster size or a different
     /// target format" rather than the generic INVALID_SIZE.
     pub const ERROR_BACKING_SIZE_TOO_LARGE: u32 = 10;
-    /// Backing image is a differencing VHD or VHDX. Instar cannot
-    /// compose a parent yet and every read path refuses such an image,
-    /// so an overlay stacked on one would be unreadable. Distinguished
+    /// Backing image is a differencing VHD or VHDX. `create` refuses
+    /// to stack an overlay on one. That is no longer because the
+    /// result would be unreadable -- `convert`, `dd`, `compare`,
+    /// `bench` and `rebase` all compose a differencing VHD or VHDX
+    /// against its parent now -- so the refusal and the reason it
+    /// gives have come apart, which is issue #628 rather than
+    /// something this code settles. Distinguished
     /// from BACKING_PARSE_FAILED because the backing header parsed
     /// perfectly well -- saying "truncated, corrupted, or an
     /// unrecognised format" about a valid image is the same undiagnosed

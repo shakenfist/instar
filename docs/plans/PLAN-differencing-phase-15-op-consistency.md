@@ -310,11 +310,30 @@ is stripped: zero non-comment `PLAN-*.md` references in `src/`.
   opening KVM, each naming its own operation. Falsifiable: a test
   asserts the message text for both, and
   `grep -c 'exceeds the' src/vmm/src/main.rs` has grown by two.
-* No comment in `src/` asserts that instar cannot read or compose a
-  differencing image. Falsifiable, with the path prefix stripped so
-  the filter can actually match:
-  `grep -rn 'differencing' --include=*.rs src/ | sed 's/^[^:]*:[0-9]*://' | grep -iE 'cannot (read|compose)|does not compose'`
-  returns nothing.
+* No comment in `src/` claims that **instar** cannot read or compose a
+  differencing image. Falsifiable by a script rather than a grep:
+  `python3 tools/check-no-capability-claims.py`, exit 0 and no output.
+  Its own docstring records why it is not a grep -- the sentences wrap
+  mid-phrase, and a line-granular grep missed the one in
+  `src/shared/src/lib.rs` reading "Instar cannot / compose a parent
+  yet" across a line break. The script is verified by mutation, not
+  only by passing: restoring that wrapped claim makes it exit 1 and
+  name the line.
+
+  The criterion is about the **global** claim, not about any
+  per-operation statement. "This operation does not compose a
+  differencing chain" is true of `check`, `measure` and `commit` and
+  must survive, as must a comment or test that *forbids* the global
+  claim. An earlier draft of this criterion was a grep that matched
+  both, and the first implementation attempt duly reworded a true,
+  clear debug message into worse English to satisfy it. Code is not
+  bent to fit a check; a check that flags true statements is the thing
+  that is wrong.
+
+  Not wired into `pre-commit` or CI. It is a tool the way
+  `tools/mutate-differencing.sh` is, and a future contributor gets it
+  only by running it.
+
 * `commit` succeeds over a backing whose ancestor is a differencing
   VHD, and still succeeds when that differencing ancestor's own
   parent is absent. Both asserted in `tests/test_differencing.py`,

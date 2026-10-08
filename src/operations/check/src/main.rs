@@ -41,21 +41,24 @@ use shared::{
     ImageFormat, CALL_TABLE_ADDR, MAX_SECTOR_SIZE,
 };
 
-/// Record that the source is a differencing image whose parent cannot
-/// be composed, and mark the check incomplete.
+/// Record that the source is a differencing image, and mark the check
+/// incomplete rather than clean or corrupt.
 ///
-/// A differencing image is **not corrupt** -- it is structurally valid
-/// and merely unsupported for reading, so it must not be counted as a
-/// corruption. Before this, `check_vhdx` incremented `corruptions` and
-/// set `FLAG_HAS_CORRUPTIONS`, telling a user their intact image was
-/// damaged. `FLAG_INCOMPLETE` is the honest classification: the check
-/// stopped early because the image references content it cannot see.
+/// A differencing image is **not corrupt** -- it is structurally
+/// valid. But `check` validates the structure of one image, and a
+/// differencing child's own structure is almost always intact while
+/// the image as a whole is unusable without a parent this operation
+/// does not open. Before this, `check_vhdx` incremented `corruptions`
+/// and set `FLAG_HAS_CORRUPTIONS`, telling a user their intact image
+/// was damaged; and even "no errors" would have described only the
+/// child's own blocks as though they were the whole image.
+/// `FLAG_INCOMPLETE` is the honest classification: the check stopped
+/// short of a verdict it cannot give completely.
 ///
-/// The refusal itself travels on `send_error` (decision 2 of
-/// `docs/plans/PLAN-differencing-phase-04-read-policy.md`) because
-/// `CheckResult` has no error-code field to carry it; the host renders
-/// the captured reason and exits non-zero, which is what keeps
-/// "refused" distinguishable from "clean".
+/// The refusal itself travels on `send_error` because `CheckResult`
+/// has no error-code field to carry it; the host renders the captured
+/// reason and exits non-zero, which is what keeps "refused"
+/// distinguishable from "clean".
 ///
 /// # Safety
 ///
@@ -1629,7 +1632,12 @@ unsafe fn check_vhdx(
         }
     };
 
-    // Differencing disk: unsupported for reading, but not corrupt.
+    // Differencing disk: not corrupt, but refused rather than checked.
+    // check validates one image's structure, and a child's BAT
+    // describes only the blocks it owns -- a clean verdict here would
+    // describe that partial view as though it covered the whole
+    // image, which is exactly what check exists to catch rather than
+    // produce.
     if metadata.has_parent {
         refuse_differencing(result, call_table, DifferencingRefusal::STATUS_VHDX);
         return bytes_read;
@@ -2088,17 +2096,20 @@ unsafe fn check_vhd(
         }
     };
 
-    // Differencing disk: unsupported for reading, but not corrupt. Its
-    // BAT describes only the blocks the child owns, so walking it and
-    // reporting "no errors" -- which is what happened before -- tells a
-    // user an image instar cannot read is fine. Refuse before the walk,
-    // matching the VHDX arm.
+    // Differencing disk: not corrupt, but refused rather than checked.
+    // Its BAT describes only the blocks the child owns, so walking it
+    // and reporting "no errors" -- which is what happened before --
+    // presents that partial view as though it were the whole image:
+    // check validates one image's structure, and a child's own
+    // structure is almost always intact while the image as a whole is
+    // unusable without a parent this operation does not open. Refuse
+    // before the walk, matching the VHDX arm.
     //
     // This sits ahead of every validation below, not after them, because
     // the host suppresses `print_check_result` once a refusal is
     // captured: findings computed past this point would be counted and
     // then thrown away, and the user would be told neither that the
-    // image is unreadable *nor* that it is malformed. Refusal takes
+    // image was refused *nor* that it is malformed. Refusal takes
     // precedence, so nothing is computed that cannot be reported.
     // `disk_type == 4` is inside the valid range the check below tests,
     // so no validity check is skipped by ordering it first.
