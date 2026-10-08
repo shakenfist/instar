@@ -682,7 +682,7 @@ self_test() {
 # phase's definition of done asks the two to stay in step, which until
 # now was a promise kept by hand. Asserting it makes the drift a
 # failure instead of a documentation bug nobody reads.
-EXPECTED_CASES=98
+EXPECTED_CASES=100
 
 check_case_count() {
     # Only meaningful for a whole run; a selection is expected to be short.
@@ -2069,6 +2069,39 @@ integration_case 'check-vhdx-region-test-replaced-by-a-high-water-mark' "${CHECK
     '                        // MUTATED: overlap test replaced by a high-water mark
                         file_offset < region_offset + u64::from(region_length)' \
     "${CHECK_BLOCK_TRAILING}"
+
+# ---------------------------------------------------------------------
+# bench and check attaching an over-deep chain. Issue #633: every other
+# operation that attaches a backing chain (convert/dd, commit, rebase,
+# compare) refuses one whose device count exceeds MAX_CHAIN_DEVICES
+# before KVM opens; bench and check did not, and reached
+# `DeviceSet::add_device`'s own defensive assert with KVM and the VM
+# already created, panicking instead of failing cleanly. Caught through
+# the real binary: the guard is host CLI code in a function with no
+# `#[cfg(test)]` module of its own, so the test fixture's device count
+# (not merely its backing-pointer depth) has to come from the command
+# line.
+# ---------------------------------------------------------------------
+
+DEVICE_COUNT_TESTS='test_adversarial.TestAdversarialChainDeviceCount'
+BENCH_DEVICE_COUNT="${DEVICE_COUNT_TESTS}.test_bench_chain_device_count_17_refused"
+CHECK_DEVICE_COUNT="${DEVICE_COUNT_TESTS}.test_check_chain_device_count_17_refused"
+
+integration_case 'bench-chain-device-count-guard-removed' "${VMM_MAIN}" \
+    '    let chain_device_count = chain.total_devices();
+    if chain_device_count > MAX_CHAIN_DEVICES {' \
+    '    let chain_device_count = chain.total_devices();
+    if false {
+        // MUTATED: bench no longer refuses an over-deep chain' \
+    "${BENCH_DEVICE_COUNT}"
+
+integration_case 'check-chain-device-count-guard-removed' "${VMM_MAIN}" \
+    '    if let Some(chain_device_count) = chain.as_ref().map(|c| c.total_devices()) {
+        if chain_device_count > MAX_CHAIN_DEVICES {' \
+    '    if let Some(chain_device_count) = chain.as_ref().map(|c| c.total_devices()) {
+        if false {
+            // MUTATED: check no longer refuses an over-deep chain' \
+    "${CHECK_DEVICE_COUNT}"
 
 # ---------------------------------------------------------------------
 # The create guest operation. Caught through the real binary only.

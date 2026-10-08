@@ -10,6 +10,7 @@ adversarial testing strategy, and for where the images these tests need are
 allowed to live.
 """
 
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -210,6 +211,153 @@ class TestAdversarialDeepChain(InstarTestBase):
             0, rc,
             'Chain depth 17 check should be rejected'
         )
+
+
+class TestAdversarialChainDeviceCount(InstarTestBase):
+    """`bench` and `check` must refuse a chain whose device count --
+    not merely its backing-pointer depth -- exceeds the 16-device
+    virtqueue budget (issue #633).
+
+    `qcow2-chain-depth-16`/`-17` above only vary backing-pointer
+    depth, and a depth-17 chain is already caught by a separate,
+    pre-existing control: `discover_backing_chain`'s own
+    `security.max_chain_depth` (also defaulting to 16) refuses the
+    17th backing hop before any operation-specific code runs, with
+    its own "Backing chain depth 17 exceeds maximum of 16" message.
+    That generic refusal fires identically whether or not the guard
+    this class is pinning exists, so it cannot be used to prove the
+    guard is doing anything.
+
+    The gap this class targets only opens when a chain's *device*
+    count outruns its *image* count: a qcow2 top image with an
+    external data file (`-o data_file=`) contributes two devices --
+    itself and the data file -- for one backing-pointer hop. Stacking
+    15 (or 16) plain backing levels under such a top image keeps the
+    pointer depth at 16 (or 17), under (or at) the generic cap, while
+    the device count the chain attaches is 16 (or 17). Before the
+    guard was added, that shape reached `DeviceSet::add_device`'s own
+    defensive assert with the device set already past its budget,
+    which panics (exit 101) with KVM and the VM already created
+    rather than failing cleanly -- confirmed by building this fixture
+    against a pre-guard binary.
+    """
+
+    def _build_chain_with_data_file(self, tmp_dir, backing_levels,
+                                     size='16M'):
+        """Build a qcow2 chain of `backing_levels` images topped by one
+        more image that also carries an external data file.
+
+        Returns the path to the top image. Total images discovered is
+        `backing_levels + 1`; total devices (what `chain.total_devices()`
+        counts) is `backing_levels + 2`, because the top image's data
+        file is a second device for that one hop. Backing references
+        are written as bare relative filenames and every file lives in
+        `tmp_dir`, matching the default `SecurityConfig` allowlist
+        (same directory as the referencing image).
+        """
+        tmp_dir = Path(tmp_dir)
+        prev_name = 'level0.qcow2'
+        r = subprocess.run(
+            ['qemu-img', 'create', '-f', 'qcow2',
+             str(tmp_dir / prev_name), size],
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(
+            r.returncode, 0, f'qemu-img create base failed: {r.stderr!r}')
+
+        for i in range(1, backing_levels):
+            cur_name = f'level{i}.qcow2'
+            r = subprocess.run(
+                ['qemu-img', 'create', '-f', 'qcow2',
+                 '-b', prev_name, '-F', 'qcow2', cur_name, size],
+                cwd=str(tmp_dir), capture_output=True, text=True,
+                timeout=30,
+            )
+            self.assertEqual(
+                r.returncode, 0,
+                f'qemu-img create {cur_name} failed: {r.stderr!r}')
+            prev_name = cur_name
+
+        top = tmp_dir / 'top.qcow2'
+        r = subprocess.run(
+            ['qemu-img', 'create', '-f', 'qcow2',
+             '-o', 'data_file=top-data.raw',
+             '-b', prev_name, '-F', 'qcow2', 'top.qcow2', size],
+            cwd=str(tmp_dir), capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(
+            r.returncode, 0, f'qemu-img create top failed: {r.stderr!r}')
+        return top
+
+    def test_bench_chain_device_count_16_succeeds(self):
+        """16 total devices (15 images + 1 data file) is the positive
+        control: still at the limit, must still run clean."""
+        self._require_qemu_img()
+        with tempfile.TemporaryDirectory() as tmp:
+            top = self._build_chain_with_data_file(tmp, backing_levels=14)
+            stdout, stderr, rc = self.run_adversarial(
+                [str(self.get_instar_binary()), 'bench',
+                 '-c', '4', '-s', '4096', str(top)],
+                timeout=30,
+            )
+            self.assertEqual(
+                0, rc,
+                f'16-device chain bench should succeed: {stdout!r} {stderr!r}'
+            )
+
+    def test_bench_chain_device_count_17_refused(self):
+        """17 total devices (16 images + 1 data file) must be refused
+        by bench's own message, before KVM opens."""
+        self._require_qemu_img()
+        with tempfile.TemporaryDirectory() as tmp:
+            top = self._build_chain_with_data_file(tmp, backing_levels=15)
+            stdout, stderr, rc = self.run_adversarial(
+                [str(self.get_instar_binary()), 'bench',
+                 '-c', '4', '-s', '4096', str(top)],
+                timeout=30,
+            )
+            self.assertNotEqual(0, rc, '17-device chain bench should fail')
+            self.assertIn(
+                'bench: chain depth 17 exceeds maximum of 16 devices',
+                stdout + stderr,
+                f'expected the device-count refusal, got: '
+                f'{stdout!r} {stderr!r}'
+            )
+
+    def test_check_chain_device_count_16_succeeds(self):
+        """16 total devices (15 images + 1 data file) is the positive
+        control: still at the limit, must still run clean."""
+        self._require_qemu_img()
+        with tempfile.TemporaryDirectory() as tmp:
+            top = self._build_chain_with_data_file(tmp, backing_levels=14)
+            stdout, stderr, rc = self.run_adversarial(
+                [str(self.get_instar_binary()), 'check', '--chain',
+                 str(top)],
+                timeout=30,
+            )
+            self.assertEqual(
+                0, rc,
+                f'16-device chain check should succeed: {stdout!r} {stderr!r}'
+            )
+
+    def test_check_chain_device_count_17_refused(self):
+        """17 total devices (16 images + 1 data file) must be refused
+        by check's own message, before KVM opens."""
+        self._require_qemu_img()
+        with tempfile.TemporaryDirectory() as tmp:
+            top = self._build_chain_with_data_file(tmp, backing_levels=15)
+            stdout, stderr, rc = self.run_adversarial(
+                [str(self.get_instar_binary()), 'check', '--chain',
+                 str(top)],
+                timeout=30,
+            )
+            self.assertNotEqual(0, rc, '17-device chain check should fail')
+            self.assertIn(
+                'check: chain depth 17 exceeds maximum of 16 devices',
+                stdout + stderr,
+                f'expected the device-count refusal, got: '
+                f'{stdout!r} {stderr!r}'
+            )
 
 
 class TestAdversarialIntegerOverflow(InstarTestBase):

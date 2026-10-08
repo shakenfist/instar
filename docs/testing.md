@@ -1557,7 +1557,7 @@ deliberately broken emitter is not guarding what its name says it
 guards. See [PLAN-differencing.md](plans/PLAN-differencing.md) for the
 path being guarded.
 
-There are **98 cases**, in five groups.
+There are **100 cases**, in six groups.
 
 Twenty-seven cover the writer. Fifteen mutate a library crate
 (`create`, `vhd`, `vhdx`) and are caught by a Rust unit or round-trip
@@ -1680,6 +1680,25 @@ which SPEC(VHDX) permits -- tells the two apart. All three are
 `integration_case`, because the arm lives in a `no_std` guest binary
 with no test harness to drive it and the only observable verdict is
 the real command's exit code.
+
+The final **two guard `bench` and `check`'s own chain-device-count
+check** (issue #633). Every other operation that attaches a backing
+chain -- `convert`/`dd`, `commit`, `rebase`, `compare` -- refuses one
+whose device count exceeds `MAX_CHAIN_DEVICES` (16) before KVM opens;
+`bench` and `check` did not, and reaching `DeviceSet::add_device` with
+the device set already past that budget trips its own defensive
+`assert!`, panicking with KVM and the VM already created rather than
+failing cleanly. A plain backing chain cannot exercise this: a 17-image
+chain is already refused by `discover_backing_chain`'s own, unrelated
+`security.max_chain_depth` control (also defaulting to 16) before
+either operation's code runs. The fixture has to make the chain's
+*device* count exceed 16 while its *image* count does not, which a
+qcow2 top image carrying an external data file (`-o data_file=`) does:
+it contributes two devices for one backing-pointer hop. Both cases
+disable the guard with `if false` and are caught, through the real
+binary, by `TestAdversarialChainDeviceCount` in `tests/test_adversarial.py`
+-- the same test module that builds the fixture, since no static
+`instar-testdata` image has this shape.
 
 Most of the reader cases name a test in the `qcow2` crate and run it
 with the full input-format feature list, because the

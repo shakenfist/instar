@@ -5371,6 +5371,23 @@ fn run_bench(args: &BenchArgs, verbose: bool) -> Result<(), Box<dyn std::error::
         )
     })?;
 
+    // Refuse an over-deep chain before run_bench_guest ever opens KVM.
+    // bench attaches every discovered device read-only and no output
+    // device, so unlike convert there is no extra slot to reserve — the
+    // chain's own device count is the whole budget. Without this guard,
+    // write_chain_config truncates a longer chain to MAX_CHAIN_DEVICES at
+    // a debug! log and continues, so the guest would be told about fewer
+    // devices than actually got opened, or — past 16 — the omitted
+    // device's virtqueue would land on DMA_POOL_BASE (src/shared/src/lib.rs's
+    // VQ_BASE_START..DMA_POOL_BASE assertion is sized for exactly 16).
+    let chain_device_count = chain.total_devices();
+    if chain_device_count > MAX_CHAIN_DEVICES {
+        return Err(format!(
+            "bench: chain depth {chain_device_count} exceeds maximum of {MAX_CHAIN_DEVICES} devices"
+        )
+        .into());
+    }
+
     // The discovered top-of-chain format is authoritative (§2).
     let top_format = chain.images()[0].format;
     let top_format_name = top_format.to_string();
@@ -12056,6 +12073,24 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
     } else {
         None
     };
+
+    // Refuse an over-deep chain before KVM is opened below. check attaches
+    // every discovered device read-only and no output device, so the
+    // chain's own device count is the whole budget. Without this guard,
+    // write_chain_config truncates a longer chain to MAX_CHAIN_DEVICES at
+    // a debug! log and continues, so the guest would be told about fewer
+    // devices than open_chain_devices actually opened, or — past 16 — the
+    // omitted device's virtqueue would land on DMA_POOL_BASE
+    // (src/shared/src/lib.rs's VQ_BASE_START..DMA_POOL_BASE assertion is
+    // sized for exactly 16).
+    if let Some(chain_device_count) = chain.as_ref().map(|c| c.total_devices()) {
+        if chain_device_count > MAX_CHAIN_DEVICES {
+            return Err(format!(
+                "check: chain depth {chain_device_count} exceeds maximum of {MAX_CHAIN_DEVICES} devices"
+            )
+            .into());
+        }
+    }
 
     // Get input file metadata
     let input_metadata = std::fs::metadata(&args.input)?;
