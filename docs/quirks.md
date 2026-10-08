@@ -4584,8 +4584,8 @@ choice on top of it.
 | Op | VHD (differencing) | VHDX (differencing) |
 |----|---------------------|----------------------|
 | info | Succeeds, rc 0, no parent mentioned | Succeeds, rc 0, no parent mentioned (`info` does not route through `VhdxState::init`'s rejection) |
-| map | **Refuses**, rc 1: `"map: source has a backing/parent reference; chain composition is deferred (see PLAN-map.md)"` (`finish()` in `src/operations/map/src/main.rs`) | Refuses, rc 1: `"map: source format unrecognised"` — a generic message, because `VhdxState::init` already returned `None` before map's own differencing check ever runs |
-| check | **Does not refuse.** rc 0, `"No errors were found on the image."` — validates the child as an ordinary dynamic disk | **Refuses**, rc 2: `"1 errors were found on the image."` (debug trace: `"check: VHDX differencing disk unsupported"`, `check_vhdx()` in `src/operations/check/src/main.rs`) |
+| map | **Refuses**, rc 1: `"map: source has a backing/parent reference; chain composition is deferred (see PLAN-map.md)"` (the `DISK_TYPE_DIFFERENCING` check in the `ImageFormat::Vhd` arm of `_start()` in `src/operations/map/src/main.rs` returns `MapResult::ERROR_HAS_BACKING`, and the host's `map_error_message()` in `src/vmm/src/main.rs` renders it; that message now ends "map reads an image on its own rather than composing a parent into it") | Refuses, rc 1: `"map: source format unrecognised"` — a generic message, because `VhdxState::init` already returned `None` before map's own differencing check ever runs |
+| check | **Does not refuse.** rc 0, `"No errors were found on the image."` — validates the child as an ordinary dynamic disk | **Refuses**, rc 2: `"1 errors were found on the image."` (debug trace before `10ab838`: `"check: VHDX differencing disk unsupported"`, from `check_vhdx()` in `src/operations/check/src/main.rs`; today `check_vhdx()` calls `refuse_differencing()`, which traces `"check: differencing source refused"`) |
 | convert | Does not refuse. rc 0, silently composes without the parent (shown above) | Refuses, rc 1: `Error: "convert operation failed"` |
 | compare | Does not refuse. rc 0, `"Images are identical."` when compared against itself | Refuses, rc 1: `"Content mismatch at offset 0!"` even comparing the file against itself, because both reads fail to parse and the comparison falls through to raw bytes |
 | dd | Does not refuse. rc 0, copies silently | Refuses, rc 1: `Error: "convert operation failed"` |
@@ -4607,9 +4607,10 @@ into any op's state at all.
 
 #### instar Behavior (before commit `10ab838`)
 
-`map`'s VHD-specific refusal (in `finish()` in
-`src/operations/map/src/main.rs`) and `check`'s VHDX-specific refusal (in
-`check_vhdx()` in `src/operations/check/src/main.rs`) were the only two
+`map`'s VHD-specific refusal (the `DISK_TYPE_DIFFERENCING` check in the
+`ImageFormat::Vhd` arm of `_start()` in `src/operations/map/src/main.rs`)
+and `check`'s VHDX-specific refusal (in `check_vhdx()` in
+`src/operations/check/src/main.rs`) were the only two
 op-level, differencing-aware checks that existed; every other op's VHDX
 failure was an accident of `VhdxState::init`'s blanket rejection rather
 than a deliberate per-op decision, and every other op's VHD behaviour was
