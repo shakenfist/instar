@@ -10092,6 +10092,35 @@ mod tests {
         })
     }
 
+    /// Point the payload BAT entry for payload block `payload_index`
+    /// at `offset`, keeping its state bits, and hand back the image.
+    ///
+    /// The BAT interleaves one sector-bitmap entry after every
+    /// `chunk_ratio` payload entries, so the global entry index of a
+    /// payload block is its own index plus the number of whole groups
+    /// before it. That arithmetic is spelled out here rather than
+    /// taken from `for_each_payload_bat_entry`: a fixture that located
+    /// its entry with the walker under test would keep patching
+    /// whatever entry the walker thought was next, and a test for the
+    /// walker's group arithmetic would hold under every mutation of
+    /// it.
+    #[cfg(feature = "vhdx-input")]
+    fn vhdx_repoint_payload_block(
+        mut bytes: std::vec::Vec<u8>,
+        logical_sector_size: u32,
+        payload_index: u64,
+        offset: u64,
+    ) -> std::vec::Vec<u8> {
+        let chunk_ratio = vhdx_chunk_ratio(logical_sector_size);
+        let entry_index = payload_index + payload_index / chunk_ratio;
+        let entry_off = VHDX_FIX_BAT_OFFSET as usize + entry_index as usize * 8;
+        let entry = u64::from_le_bytes(bytes[entry_off..entry_off + 8].try_into().unwrap());
+        let state = entry & vhdx::BAT_ENTRY_STATE_MASK;
+        let rewritten = vhdx::build_bat_entry(state, offset);
+        bytes[entry_off..entry_off + 8].copy_from_slice(&rewritten.to_le_bytes());
+        bytes
+    }
+
     /// Point the fixture's first payload BAT entry at `offset`,
     /// keeping its state bits, and hand back the image.
     #[cfg(feature = "vhdx-input")]
@@ -10321,6 +10350,216 @@ mod tests {
             summary.allocated_bytes,
             u64::from(VHDX_FIX_BLOCK_SIZE),
             "the one allocated block must still be counted"
+        );
+    }
+
+    // The malformed block is the last payload entry of the first chunk
+    // group, not the first entry of the BAT.
+    //
+    // Every case above patches payload block 0, which both walks reach
+    // on their first cached BAT sector and before any group arithmetic
+    // has had to do anything. A guard applied only to the first entry
+    // examined -- or a walk whose running indices drift as it refills
+    // the sector cache -- would pass all of them. Payload block 4095
+    // is 64 cached sectors into the BAT at this sector size, so
+    // reaching it at all means the payload/sector-bitmap bookkeeping
+    // in `for_each_payload_bat_entry` and `map_extents` held across
+    // every refill.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_map_and_measure_refuse_a_late_block_inside_a_region() {
+        let chunk_ratio = vhdx_chunk_ratio(512);
+        let payload_index = chunk_ratio - 1;
+        let fixture = build_vhdx_image(
+            512,
+            false,
+            1,
+            &[(payload_index, VhdxBlockState::FullyPresent)],
+            &[],
+        );
+        // The premise: this entry is genuinely past the first BAT
+        // sector, so the test is about a walk that had to get there.
+        assert!(
+            payload_index * 8 > 512,
+            "payload block {payload_index} must sit past the first cached              BAT sector for this test to say anything"
+        );
+        let bytes =
+            vhdx_repoint_payload_block(fixture.bytes, 512, payload_index, VHDX_FIX_METADATA_OFFSET);
+        let walks = run_vhdx_bat_walks(&bytes, 512);
+        assert!(
+            walks.extents.is_none(),
+            "map must refuse a block inside the metadata region wherever              in the BAT it is declared, not only in the first entry: {:?}",
+            walks.extents.as_ref().map(|e| e.len())
+        );
+        assert!(
+            walks.map_block_table_malformed,
+            "the map walk must record WHY it refused a late block"
+        );
+        assert!(
+            walks.summary.is_none(),
+            "measure must refuse the same late block rather than count              it: {:?}",
+            walks.summary.as_ref().map(|s| s.allocated_bytes)
+        );
+        assert!(
+            walks.scan_block_table_malformed,
+            "the scan walk must record WHY it refused a late block"
+        );
+    }
+
+    // The malformed block is in the second chunk group, past a
+    // sector-bitmap entry.
+    //
+    // The walk has to traverse the slot that ends the first group to
+    // reach this entry at all, so a guard reachable only within one
+    // chunk group fails here. It is deliberately *not* the test for
+    // the group arithmetic itself: disabling the bitmap-slot skip in
+    // `for_each_payload_bat_entry` leaves this test passing, because a
+    // walk that miscounts payload entries still reaches this one and
+    // still refuses it. A refusal test cannot see a miscount, only
+    // whether something refused -- which is what
+    // `vhdx_scan_counts_a_block_in_each_chunk_group` below is for.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_map_and_measure_refuse_a_block_in_the_second_chunk_group() {
+        let chunk_ratio = vhdx_chunk_ratio(512);
+        let payload_index = chunk_ratio;
+        let fixture = build_vhdx_image(
+            512,
+            false,
+            2,
+            &[(payload_index, VhdxBlockState::FullyPresent)],
+            &[],
+        );
+        let bytes =
+            vhdx_repoint_payload_block(fixture.bytes, 512, payload_index, VHDX_FIX_METADATA_OFFSET);
+        let walks = run_vhdx_bat_walks(&bytes, 512);
+        assert!(
+            walks.extents.is_none(),
+            "map must refuse a malformed block in the second chunk group,              which it can only find by skipping the first group's              sector-bitmap entry: {:?}",
+            walks.extents.as_ref().map(|e| e.len())
+        );
+        assert!(
+            walks.map_block_table_malformed,
+            "the map walk must record WHY it refused a second-group block"
+        );
+        assert!(
+            walks.summary.is_none(),
+            "measure must refuse the same block: {:?}",
+            walks.summary.as_ref().map(|s| s.allocated_bytes)
+        );
+        assert!(
+            walks.scan_block_table_malformed,
+            "the scan walk must record WHY it refused a second-group block"
+        );
+    }
+
+    // The group arithmetic itself: one present block in each chunk
+    // group, counted.
+    //
+    // This is the test the refusal cases above cannot be. Every one of
+    // them asserts that a malformed image is refused, and a walk whose
+    // payload bookkeeping has drifted still refuses it -- it reaches
+    // the bad entry by a wrong route and answers correctly anyway.
+    // What a drifted count changes is where the walk *stops*: a walk
+    // that counted the interleaved sector-bitmap slots as payload
+    // entries would hit its `payload_seen >= total_payload_blocks` cap
+    // one slot early per group, and the last payload block of a
+    // two-group BAT -- which lives at global entry index 8192, past
+    // two bitmap slots -- would never be visited. So the allocated
+    // count is the observable: two present blocks, declared at the
+    // first and last payload index of a two-group image, must both be
+    // counted. Measured against that mutation, this test fails and
+    // the refusal tests do not.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_scan_counts_a_block_in_each_chunk_group() {
+        let chunk_ratio = vhdx_chunk_ratio(512);
+        let last = chunk_ratio * 2 - 1;
+        let fixture = build_vhdx_image(
+            512,
+            false,
+            2,
+            &[
+                (0, VhdxBlockState::FullyPresent),
+                (last, VhdxBlockState::FullyPresent),
+            ],
+            &[],
+        );
+        let walks = run_vhdx_bat_walks(&fixture.bytes, 512);
+        assert!(
+            !walks.scan_block_table_malformed,
+            "nothing about this image is malformed"
+        );
+        let summary = walks
+            .summary
+            .expect("a well-formed two-group image must not refuse the scan walk");
+        assert_eq!(
+            summary.allocated_bytes,
+            2 * u64::from(VHDX_FIX_BLOCK_SIZE),
+            "both present blocks must be counted; a walk that treats the \
+             interleaved sector-bitmap slots as payload entries stops \
+             before the last payload index and reports one"
+        );
+
+        // The same drift is visible to the map walk as a virtual
+        // offset, which keeps its own copy of this arithmetic rather
+        // than sharing the helper, so the two have to be pinned apart.
+        let extents = walks
+            .extents
+            .expect("a well-formed two-group image must not refuse the map walk");
+        let data: std::vec::Vec<(u64, u64)> = extents
+            .iter()
+            .filter(|e| matches!(e.state, MapExtentState::Data { .. }))
+            .map(|e| (e.start, e.length))
+            .collect();
+        assert_eq!(
+            data,
+            std::vec![
+                (0, u64::from(VHDX_FIX_BLOCK_SIZE)),
+                (
+                    last * u64::from(VHDX_FIX_BLOCK_SIZE),
+                    u64::from(VHDX_FIX_BLOCK_SIZE)
+                ),
+            ],
+            "each present block must be reported at the virtual offset its \
+             payload index gives it"
+        );
+    }
+
+    // A PARTIALLY_PRESENT block inside a declared region.
+    //
+    // Both walks classify a partially present entry exactly as they
+    // classify a fully present one -- `classify_vhdx_bat_entry` maps
+    // both to `MapExtentState::Data`, and `scan_allocation` counts
+    // both -- so both guards are live on that state and nothing above
+    // exercises it. The state only occurs in a differencing image,
+    // which `map` and `measure` refuse before either walk runs today;
+    // the guard has to be in place anyway, because the refusal is what
+    // issue #643 is about lifting, and a lift must not be the change
+    // that reintroduces this.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_map_and_measure_refuse_a_partially_present_block_inside_a_region() {
+        let fixture = build_vhdx_image(512, true, 1, &[(0, VhdxBlockState::PartiallyPresent)], &[]);
+        let bytes = vhdx_repoint_first_payload_block(fixture.bytes, VHDX_FIX_METADATA_OFFSET);
+        let walks = run_vhdx_bat_walks(&bytes, 512);
+        assert!(
+            walks.extents.is_none(),
+            "map must refuse a partially present block inside the metadata              region, which it describes as data just as it does a fully              present one: {:?}",
+            walks.extents
+        );
+        assert!(
+            walks.map_block_table_malformed,
+            "the map walk must record WHY it refused a partially present              block"
+        );
+        assert!(
+            walks.summary.is_none(),
+            "measure must refuse the same block rather than count it: {:?}",
+            walks.summary.as_ref().map(|s| s.allocated_bytes)
+        );
+        assert!(
+            walks.scan_block_table_malformed,
+            "the scan walk must record WHY it refused a partially present              block"
         );
     }
 

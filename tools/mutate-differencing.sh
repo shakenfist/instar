@@ -682,7 +682,7 @@ self_test() {
 # phase's definition of done asks the two to stay in step, which until
 # now was a promise kept by hand. Asserting it makes the drift a
 # failure instead of a documentation bug nobody reads.
-EXPECTED_CASES=101
+EXPECTED_CASES=102
 
 check_case_count() {
     # Only meaningful for a whole run; a selection is expected to be short.
@@ -719,6 +719,39 @@ check_case_count() {
         echo "this script defines ${survivor_actual}." >&2
         bad='yes'
     fi
+
+    # The group counts in the prose went stale the same way: one review
+    # round found two groups both described as "the final" N, because
+    # a group had been appended without the earlier paragraph being
+    # reread. Derive each group from the case names, which are the
+    # thing that actually changes when a case is added, and require
+    # the document to state it in a checkable form. The sub-counts the
+    # prose takes by subtraction ("the other seven", "the last three")
+    # cannot drift silently either: any case added to those groups
+    # moves one of the figures checked here.
+    local group_doc group_actual label pattern
+    for spec in \
+        "14 cases guard:^(integration_case '(map|measure|check)-(vhd|vhdx)-refusal-removed'|rust_case 'vhdx-(map-extent|scan-block)-offset-|rust_case 'vhdx-bat-walk-|integration_case 'check-vhdx-(block|region)-)" \
+        "refusal cases:^integration_case '(map|measure|check)-(vhd|vhdx)-refusal-removed'" \
+        "device-count cases:^integration_case '(bench|check)-chain-device-count-guard-removed'"
+    do
+        label="${spec%%:*}"
+        pattern="${spec#*:}"
+        group_actual="$(grep -cE "${pattern}" "${BASH_SOURCE[0]}")"
+        if [ "${label}" = '14 cases guard' ]; then
+            group_doc="$(grep -oE '\*\*[0-9]+ cases guard' \
+                "${REPO_ROOT}/docs/testing.md" 2>/dev/null | grep -oE '[0-9]+' | head -1)"
+        else
+            group_doc="$(grep -oE "\*\*[0-9]+ ${label}\*\*" \
+                "${REPO_ROOT}/docs/testing.md" 2>/dev/null | grep -oE '[0-9]+' | head -1)"
+        fi
+        if [ "${group_doc:-x}" != "${group_actual}" ]; then
+            echo >&2
+            echo "docs/testing.md says '${group_doc:-no}' ${label};" >&2
+            echo "this script defines ${group_actual}." >&2
+            bad='yes'
+        fi
+    done
 
     if [ "${TOTAL_COUNT}" -ne "${EXPECTED_CASES}" ]; then
         echo >&2
@@ -2041,6 +2074,28 @@ rust_case 'vhdx-scan-block-offset-zero-accepted' "${VHDX_READ_LIB}" \
                         return false;
                     }' \
     qcow2 'vhdx_measure_refuses_a_present_block_at_file_offset_zero' \
+    --features "${QCOW2_FEATURES}"
+
+# One more on the shared walk itself rather than on either guard.
+#
+# All four cases above are refusal cases, and a refusal case cannot see
+# a miscount: measured, disabling the sector-bitmap skip in
+# `for_each_payload_bat_entry` leaves every one of them passing,
+# because a walk whose payload bookkeeping has drifted still reaches
+# the malformed entry and still refuses it. What drifts is where the
+# walk stops -- the `payload_seen >= total_payload_blocks` cap arrives
+# one slot early per chunk group -- so the observable is a count, on a
+# well-formed image, of blocks declared either side of a group
+# boundary. This case is the reason that test exists.
+
+rust_case 'vhdx-bat-walk-counts-the-bitmap-slots' "${VHDX_READ_LIB}" \
+    '        let slot_in_group = i % group;
+        if slot_in_group >= chunk_ratio as u64 {' \
+    '        let slot_in_group = i % group;
+        if false {
+            // MUTATED: the shared walk no longer skips bitmap slots
+            let _ = slot_in_group;' \
+    qcow2 'vhdx_scan_counts_a_block_in_each_chunk_group' \
     --features "${QCOW2_FEATURES}"
 
 # The fourth answer, which for a long time was no answer at all.

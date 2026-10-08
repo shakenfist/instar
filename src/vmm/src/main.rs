@@ -5374,12 +5374,15 @@ fn run_bench(args: &BenchArgs, verbose: bool) -> Result<(), Box<dyn std::error::
     // Refuse an over-deep chain before run_bench_guest ever opens KVM.
     // bench attaches every discovered device read-only and no output
     // device, so unlike convert there is no extra slot to reserve — the
-    // chain's own device count is the whole budget. Without this guard,
-    // write_chain_config truncates a longer chain to MAX_CHAIN_DEVICES at
-    // a debug! log and continues, so the guest would be told about fewer
-    // devices than actually got opened, or — past 16 — the omitted
-    // device's virtqueue would land on DMA_POOL_BASE (src/shared/src/lib.rs's
-    // VQ_BASE_START..DMA_POOL_BASE assertion is sized for exactly 16).
+    // chain's own device count is the whole budget. Measured against a
+    // pre-guard binary, a 17-device chain did not corrupt anything: the
+    // 17th device hit DeviceSet::add_device's own defensive assert and
+    // panicked with exit 101, after KVM and the VM had already been
+    // created. What this guard closes is therefore an unhandled crash
+    // mid-launch, not a memory-safety hole. The assert it keeps the
+    // user from ever reaching exists because src/shared/src/lib.rs
+    // sizes VQ_BASE_START..DMA_POOL_BASE for exactly 16 virtqueues, so
+    // a 17th would land on the DMA pool.
     let chain_device_count = chain.total_devices();
     if chain_device_count > MAX_CHAIN_DEVICES {
         return Err(format!(
@@ -12076,13 +12079,15 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
 
     // Refuse an over-deep chain before KVM is opened below. check attaches
     // every discovered device read-only and no output device, so the
-    // chain's own device count is the whole budget. Without this guard,
-    // write_chain_config truncates a longer chain to MAX_CHAIN_DEVICES at
-    // a debug! log and continues, so the guest would be told about fewer
-    // devices than open_chain_devices actually opened, or — past 16 — the
-    // omitted device's virtqueue would land on DMA_POOL_BASE
-    // (src/shared/src/lib.rs's VQ_BASE_START..DMA_POOL_BASE assertion is
-    // sized for exactly 16).
+    // chain's own device count is the whole budget. Measured against a
+    // pre-guard binary, a 17-device chain did not corrupt anything: the
+    // 17th device hit DeviceSet::add_device's own defensive assert and
+    // panicked with exit 101, after KVM and the VM had already been
+    // created. What this guard closes is therefore an unhandled crash
+    // mid-launch, not a memory-safety hole. The assert it keeps the
+    // user from ever reaching exists because src/shared/src/lib.rs
+    // sizes VQ_BASE_START..DMA_POOL_BASE for exactly 16 virtqueues, so
+    // a 17th would land on the DMA pool.
     if let Some(chain_device_count) = chain.as_ref().map(|c| c.total_devices()) {
         if chain_device_count > MAX_CHAIN_DEVICES {
             return Err(format!(

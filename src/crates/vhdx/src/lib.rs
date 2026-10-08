@@ -1689,7 +1689,13 @@ pub fn classify_vhdx_bat_entry(
 ///
 /// `visit` receives the raw little-endian-decoded entry and returns
 /// `false` to abandon the walk, which is how a caller refuses an image
-/// part-way through a chunk rather than finishing the chunk first.
+/// part-way through a chunk rather than finishing the chunk first. The
+/// payload count returned after such a stop *includes* the entry that
+/// abandoned it, because the entry was visited; a caller that stops
+/// early and then keeps counting would be one block ahead. Every
+/// caller that returns `false` today discards the count along with the
+/// image, so nothing depends on it, but a future one that resumed from
+/// the returned index would have to subtract that entry.
 ///
 /// `chunk_ratio == 0` is invalid; the walk visits nothing in that case
 /// rather than dividing by zero.

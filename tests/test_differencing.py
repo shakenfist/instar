@@ -2310,7 +2310,20 @@ class TestVhdxBlockOffsetsNamingTheImagesOwnStructure(DifferencingTestBase):
                     )
 
     def test_check_agrees_with_the_chain_flag(self):
-        """`--chain` does not change what `check` decides about a block."""
+        """`--chain` does not change what `check` decides about a block.
+
+        The whole `(stdout, stderr, rc)` tuple is compared, not just
+        the verdict line, deliberately: these are single-image
+        sources, so there is no chain for the flag to report on and
+        the two runs have nothing legitimate to differ about. A
+        narrower assertion would pass while `--chain` reported a
+        different error count or named a different ground for the same
+        exit code, which is the divergence worth catching. If `--chain`
+        ever grows an unconditional summary line this test will need
+        the verdict line picked out instead -- that is a one-line
+        change made knowingly, rather than coverage given up in
+        advance.
+        """
         self._require_qemu_img()
         with tempfile.TemporaryDirectory() as tmp:
             base = self._base_image(Path(tmp))
@@ -3348,8 +3361,8 @@ class TestDifferencingAdversarialLocators(DifferencingTestBase):
                 self.assertIn(
                     'Chain: 1 image(s)', stdout,
                     f'{image_id}: the chain must stop at the child -- '
-                    f'instar cannot compose a parent, and these locators '
-                    f'must never be followed; stdout={stdout!r}'
+                    f'these locators point outside the allowlist and must '
+                    f'never be followed; stdout={stdout!r}'
                 )
                 self.assertIn(
                     expected, stdout,

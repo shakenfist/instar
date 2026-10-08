@@ -1557,7 +1557,7 @@ deliberately broken emitter is not guarding what its name says it
 guards. See [PLAN-differencing.md](plans/PLAN-differencing.md) for the
 path being guarded.
 
-There are **101 cases**, in seven groups.
+There are **102 cases**, in seven groups.
 
 Twenty-seven cover the writer. Fifteen mutate a library crate
 (`create`, `vhd`, `vhdx`) and are caught by a Rust unit or round-trip
@@ -1636,15 +1636,16 @@ differencing VHD or VHDX with its own parent absent — so the mutated
 walk fails during host-side chain discovery, before KVM is even opened,
 where the unmutated walk never tried to resolve that file at all.
 
-The final **thirteen guard `map`, `measure` and `check`**, which read
-through none of the machinery above: each reads its source on its own
-and declines a differencing one outright, so composing it is not a
-guest change those operations can inherit. Six of them guard the
-refusals, with one case per operation per format — a VHD arm testing the footer's disk type, a VHDX arm testing
-the metadata's `has_parent` flag — and every case disables its guard
-with an added `&& false` rather than deleting it, so the mutation is a
-one-line, easily reviewed change to a condition that already compiles.
-All six run through the real binary and are caught by the existing
+**14 cases guard `map`, `measure` and `check`**, which read through
+none of the machinery above: each reads its source on its own and
+declines a differencing one outright, so composing it is not a guest
+change those operations can inherit. **6 refusal cases** are the first
+of them, one per operation per format — a VHD arm testing the footer's
+disk type, a VHDX arm testing the metadata's `has_parent` flag — and
+every case disables its guard with an added `&& false` rather than
+deleting it, so the mutation is a one-line, easily reviewed change to a
+condition that already compiles. All six run through the real binary
+and are caught by the existing
 refusal test for that operation in `tests/test_differencing.py`
 (`TestDifferencingMapStillRefuses`, and `TestDifferencingRefusal`'s
 `measure` and `check` tests), which already iterates every differencing
@@ -1654,7 +1655,7 @@ one of these three operations' refusals — the way this phase lifted
 accident: removing a guard here must fail a named test before it can
 land.
 
-The other seven guard the one place these operations were not merely
+The other eight guard the one place these operations were not merely
 non-composing but were answering differently from the readers. `map`
 and `measure` never call `block_lookup`: each walks the whole BAT once,
 through `VhdxState::map_extents` and `VhdxState::scan_allocation`
@@ -1677,6 +1678,20 @@ hand-patched BAT entry no image in `instar-testdata` carries. Each
 reverts one call site only, so the verdict names the walk and the guard
 that was lost.
 
+A fifth is on the shared walk rather than on either guard, and exists
+because those four cannot cover it. A refusal case cannot see a
+miscount: disabling the sector-bitmap skip in
+`for_each_payload_bat_entry` -- the arithmetic both the scanner and
+the allocation counter go through -- leaves all four passing, because
+a walk whose payload bookkeeping has drifted still reaches the
+malformed entry and still refuses it. What a drift changes is where
+the walk stops, since the "all payload blocks seen" cap then arrives
+one slot early per chunk group. So this case is caught by a count
+taken from a **well-formed** two-group image with a block declared
+either side of the group boundary, which reports one block instead of
+two under the mutation. It is the only case in this group whose
+fixture is not malformed.
+
 The last three are `check`'s, which was the fourth answer to the same
 question and for a long time gave none: it builds no `VhdxState` and
 runs its own file identifier, header CRC-32C, region table 1+2
@@ -1695,8 +1710,9 @@ which SPEC(VHDX) permits -- tells the two apart. All three are
 with no test harness to drive it and the only observable verdict is
 the real command's exit code.
 
-The final **two guard `bench` and `check`'s own chain-device-count
-check** (issue #633). Every other operation that attaches a backing
+The last group is **2 device-count cases**, guarding `bench` and
+`check`'s own chain-device-count check (issue #633). Every other
+operation that attaches a backing
 chain -- `convert`/`dd`, `commit`, `rebase`, `compare` -- refuses one
 whose device count exceeds `MAX_CHAIN_DEVICES` (16) before KVM opens;
 `bench` and `check` did not, and reaching `DeviceSet::add_device` with

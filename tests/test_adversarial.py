@@ -298,7 +298,13 @@ class TestAdversarialChainDeviceCount(InstarTestBase):
             stdout, stderr, rc = self.run_adversarial(
                 [str(self.get_instar_binary()), 'bench',
                  '-c', '4', '-s', '4096', str(top)],
-                timeout=30,
+                # Chain discovery launches the info guest once per
+                # image and the run then boots 16 devices, so this is
+                # the slowest shape in the class. The refusal tests
+                # below keep the tighter bound on purpose: they answer
+                # before KVM opens, and a refusal that took a minute
+                # would itself be worth failing on.
+                timeout=120,
             )
             self.assertEqual(
                 0, rc,
@@ -333,7 +339,13 @@ class TestAdversarialChainDeviceCount(InstarTestBase):
             stdout, stderr, rc = self.run_adversarial(
                 [str(self.get_instar_binary()), 'check', '--chain',
                  str(top)],
-                timeout=30,
+                # Chain discovery launches the info guest once per
+                # image and the run then boots 16 devices, so this is
+                # the slowest shape in the class. The refusal tests
+                # below keep the tighter bound on purpose: they answer
+                # before KVM opens, and a refusal that took a minute
+                # would itself be worth failing on.
+                timeout=120,
             )
             self.assertEqual(
                 0, rc,
