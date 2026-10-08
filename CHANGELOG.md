@@ -472,6 +472,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`instar info` finds a VHDX's virtual size and block size through
+  the metadata table** (#640). It read both at fixed offsets: File
+  Parameters at the start of the metadata items area, with Virtual
+  Disk Size straight after it. That is where qemu and instar's own
+  `create` put them, but SPEC(VHDX) gives metadata items no fixed
+  order or position, so an image laid out any other way was reported
+  with the wrong virtual size and cluster size, and `info` still exited
+  0. Both now come from the same `vhdx::parse_metadata` call that
+  already found the parent locator, so the block size is also validated
+  before it is reported. Metadata that parse rejects is reported the way
+  an unreadable region table always was: the file's size as the virtual
+  size and no cluster size.
+
 - **`instar create -f vhdx -b PARENT` sizes the child's BAT by the
   differencing rule.** A VHDX block allocation table interleaves one
   sector-bitmap entry after every `chunk_ratio` payload entries, with
