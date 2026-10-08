@@ -28,9 +28,6 @@ pub(crate) enum VhdxGrowAction {
 
 /// Region table size in bytes (one full 64 KiB sector-region).
 const REGION_TABLE_REGION_SIZE: usize = 64 * 1024;
-/// Byte offset within the metadata region where the
-/// `VirtualDiskSize` u64 lives.
-const VIRTUAL_DISK_SIZE_ITEM_OFFSET: u64 = 0x10008;
 /// 1-MiB alignment for the BAT region (matches `plan_vhdx`).
 const ONE_MIB: u64 = 1 << 20;
 
@@ -128,6 +125,18 @@ fn is_valid_active_header_offset(offset: u64) -> bool {
     offset == HEADER1_OFFSET || offset == HEADER2_OFFSET
 }
 
+/// File offset of the `VirtualDiskSize` item, refusing one that does
+/// not sit wholly inside the metadata region.
+fn virtual_disk_size_file_offset(opts: &VhdxResizeOpts<'_>) -> Result<u64, ResizeError> {
+    let item = opts.virtual_disk_size_item_offset as u64;
+    if item + 8 > opts.current_metadata_length as u64 {
+        return Err(ResizeError::HeaderMismatch);
+    }
+    opts.current_metadata_offset
+        .checked_add(item)
+        .ok_or(ResizeError::Overflow)
+}
+
 /// Check that the active header's `log_guid` is all-zero
 /// (clean image, no pending log entries to replay).
 fn is_clean_log(header_bytes: &[u8]) -> bool {
@@ -185,7 +194,7 @@ fn plan_metadata_and_headers<'a>(
     }
 
     let inactive_offset = inactive_header_offset(opts.current_active_header_offset);
-    let vds_file_off = opts.current_metadata_offset + VIRTUAL_DISK_SIZE_ITEM_OFFSET;
+    let vds_file_off = virtual_disk_size_file_offset(opts)?;
 
     let mut plan = ResizePlan::new(ResizeAction::Grow, opts.current_file_size);
 
@@ -297,7 +306,7 @@ fn plan_bat_grow_relocate<'a>(
     }
 
     let inactive_offset = inactive_header_offset(opts.current_active_header_offset);
-    let vds_file_off = opts.current_metadata_offset + VIRTUAL_DISK_SIZE_ITEM_OFFSET;
+    let vds_file_off = virtual_disk_size_file_offset(opts)?;
 
     let mut plan = ResizePlan::new(ResizeAction::Grow, total_file_size);
 

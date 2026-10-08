@@ -309,6 +309,11 @@ fuzz_target!(|data: &[u8]| {
                     .min(4096),
                     current_metadata_offset: 2 * 1024 * 1024,
                     current_metadata_length: 1024 * 1024,
+                    // Up to twice the metadata region, so about half
+                    // the draws land outside it and must be refused.
+                    virtual_disk_size_item_offset: u32::from_le_bytes(
+                        data[28..32].try_into().unwrap(),
+                    ) % (2 * 1024 * 1024),
                     logical_sector_size: 512,
                     physical_sector_size: 4096,
                     has_parent: flags & 0b1000_0000 != 0,

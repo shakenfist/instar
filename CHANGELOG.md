@@ -488,6 +488,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   sectors. A plain dynamic VHDX is unaffected, and `convert`'s VHDX
   output, which never has a parent, is byte-identical. Fixes #623.
 
+- **`instar resize` refuses a differencing VHDX instead of growing the
+  child alone.** It used to exit 0 and rewrite the child to claim a
+  virtual size its parent cannot describe; qemu-img refuses the same
+  request. The planner's refusal had never been reachable because the
+  guest op passed it a hard-coded "no parent". It is now refused with
+  "subformat does not support resize", as a differencing VHD already
+  was, and the file is left untouched (#565). Along the way, VHDX
+  resize stopped assuming where metadata items live: it now finds the
+  block size, sector sizes and VirtualDiskSize through the metadata
+  table, as SPEC(VHDX) requires, and rewrites VirtualDiskSize where the
+  table says it is. Before, it read and wrote them at the offsets qemu
+  and instar happen to use, so an image laid out differently would have
+  had 8 unrelated metadata bytes overwritten, and it sized the BAT of a
+  4 KiB-logical-sector image as though its sectors were 512 bytes. The
+  guest also no longer stages more of the
+  metadata region than the 1 MiB it reserves for it, whatever length
+  the region table claims.
+
 - **CI apt steps wait for apt's locks instead of failing.** A runner
   that was still running its own apt job when a CI step began made that
   step's `apt-get` fail at once with `Could not get lock
