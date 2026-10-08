@@ -158,77 +158,63 @@ ADVERSARIAL_LOCATOR_FIXTURES = (
     ('vhd-diff-locator-conflicting', 'conflict-parent-name.vhd'),
 )
 
-# The stderr reasons the reporting walk may give for each fixture above,
+# The stderr reason the reporting walk gives for each fixture above,
 # from `UnresolvedParent::describe` (`src/vmm/src/main.rs`). A one-image
 # chain alone cannot tell "the allowlist correctly rejected this" apart
 # from "resolution silently failed", and these six fixtures do not all
 # fail for the same reason -- measured directly against the built binary,
 # not assumed:
 #
-# * `/etc/passwd` is an absolute POSIX path, so it is classified and
-#   rejected as outside the allowlist -- the property this whole fixture
-#   family exists to exercise.
+# * `/etc/passwd`, the overlong `/overlong-...` name and the `../../../`
+#   traversal are all outside the backing allowlist (the child's own
+#   directory), so each is refused as such. Whether the path they name
+#   exists on the host plays no part: an absolute reference outside the
+#   allowlist is never probed, and a `..` escape is judged from its
+#   spelling before anything is looked at. An image must not be able to
+#   learn whether a host path exists from the reason it is given.
 # * the UNC path is classified as a Windows absolute path before the
 #   allowlist is even consulted.
-# * the URL, overlong and conflicting-name fixtures all name something
-#   that plain path resolution never finds beside the child, so they end
-#   at "was not found" rather than at the allowlist.
-# * the traversal fixture gives either, and which one is a fact about the
-#   host rather than about instar. `../../../` is resolved relative to the
-#   fixture's own directory, so it reaches a real `/etc/passwd` -- and the
-#   allowlist -- only where the testdata tree sits within three levels of
-#   the root, as CI's `/testdata/` mount does. A deeper checkout, which is
-#   every development clone, traverses to a path that does not exist and
-#   stops at "was not found" first, because resolution canonicalises
-#   before the allowlist is consulted. Both are refusals the walk
-#   classified and named, which is the whole point of pinning them, so
-#   the values here are tuples and the traversal fixture carries both.
+# * the URL and conflicting-name fixtures name something that plain path
+#   resolution never finds beside the child, so they end at "was not
+#   found" -- inside the allowlist, where that is a fact about the
+#   image's own directory.
+#
+# So there is exactly one answer per fixture, whatever the host and
+# wherever the testdata tree sits.
 ADVERSARIAL_LOCATOR_REASONS = {
-    'vhd-diff-locator-etc-passwd': (
-        "parent '/etc/passwd' is outside the backing file allowlist",
-    ),
-    'vhd-diff-locator-dotdot': (
-        "parent '../../../etc/passwd' was not found",
-        "parent '../../../etc/passwd' is outside the backing file allowlist",
-    ),
+    'vhd-diff-locator-etc-passwd': "parent '/etc/passwd' is outside the backing file allowlist",
+    'vhd-diff-locator-dotdot': "parent '../../../etc/passwd' is outside the backing file allowlist",
     'vhd-diff-locator-unc': (
         "parent '\\\\attacker\\share\\probe' is a Windows absolute path and cannot be "
-        "resolved on this host",
+        "resolved on this host"
     ),
-    'vhd-diff-locator-url': ("parent 'http://attacker.example/probe' was not found",),
-    'vhd-diff-locator-overlong': ('was not found',),
-    'vhd-diff-locator-conflicting': ("parent 'conflict-parent-name.vhd' was not found",),
+    'vhd-diff-locator-url': "parent 'http://attacker.example/probe' was not found",
+    'vhd-diff-locator-overlong': 'is outside the backing file allowlist',
+    'vhd-diff-locator-conflicting': "parent 'conflict-parent-name.vhd' was not found",
 }
 
-# The errors the *composing* walk gives for the same six fixtures.
+# The error the *composing* walk gives for the same six fixtures.
 # `convert` resolves a differencing parent now, so a hostile locator is
 # declined by `validate_backing_path` during chain discovery rather than
 # by the guest -- one step earlier, before any device is attached. These
 # strings are the allowlist's and the filesystem's, measured against the
 # built binary rather than assumed.
 #
-# Only `/etc/passwd` reaches the allowlist: it is the one locator that
-# names a path which really exists, and resolution canonicalises before
-# the allowlist is consulted, so everything else stops at "not found"
-# first. The traversal fixture carries both for exactly the reason the
-# reporting table above explains -- whether `../../../etc/passwd` lands
-# on a real file is a fact about where the testdata tree sits, not about
-# instar. The UNC fixture is "not found" rather than classified: the
-# Windows-absolute classifier belongs to the reporting walk, and a
-# composing walk simply joins the reference to the child's directory and
-# finds nothing, which refuses just as firmly.
+# As in the reporting walk there is one answer per fixture, independent
+# of the host. The three that are absolute or `..`-escaping references
+# (`/etc/passwd`, the traversal and the overlong name) are outside the
+# allowlist and are refused before the filesystem is consulted. The rest
+# are "not found" inside the allowlist. The UNC fixture is "not found"
+# rather than classified: the Windows-absolute classifier belongs to the
+# reporting walk, and a composing walk simply joins the reference to the
+# child's directory and finds nothing, which refuses just as firmly.
 COMPOSING_LOCATOR_REASONS = {
-    'vhd-diff-locator-etc-passwd': (
-        "Backing file '/etc/passwd' is outside allowed paths",
-    ),
-    'vhd-diff-locator-dotdot': (
-        'Backing file not found',
-        'is outside allowed paths',
-    ),
-    'vhd-diff-locator-unc': ('Backing file not found',),
-    'vhd-diff-locator-url': ('Backing file not found',),
-    'vhd-diff-locator-overlong': ('Backing file not found',),
-    'vhd-diff-locator-conflicting': ('Backing file not found',),
+    'vhd-diff-locator-etc-passwd': "Backing file '/etc/passwd' is outside allowed paths",
+    'vhd-diff-locator-dotdot': 'is outside allowed paths',
+    'vhd-diff-locator-unc': 'Backing file not found',
+    'vhd-diff-locator-url': 'Backing file not found',
+    'vhd-diff-locator-overlong': 'is outside allowed paths',
+    'vhd-diff-locator-conflicting': 'Backing file not found',
 }
 
 # The subset with a real, resolvable parent. Used where the test needs
@@ -3307,11 +3293,11 @@ class TestDifferencingAdversarialLocators(DifferencingTestBase):
                         f'{image_id}: expected exit 1; '
                         f'stdout={stdout[:400]!r} stderr={stderr[:400]!r}'
                     )
-                    expected_reasons = COMPOSING_LOCATOR_REASONS[image_id]
-                    self.assertTrue(
-                        any(reason in stderr for reason in expected_reasons),
-                        f'{image_id}: expected one of the reasons '
-                        f'{expected_reasons!r} on stderr -- a bare failure '
+                    expected_reason = COMPOSING_LOCATOR_REASONS[image_id]
+                    self.assertIn(
+                        expected_reason, stderr,
+                        f'{image_id}: expected the reason '
+                        f'{expected_reason!r} on stderr -- a bare failure '
                         f'cannot show the allowlist (or plain path '
                         f'resolution) did the declining rather than '
                         f'something going wrong later; stderr={stderr!r}'
@@ -3346,9 +3332,9 @@ class TestDifferencingAdversarialLocators(DifferencingTestBase):
         correctly rejected this" from "resolution silently failed", which
         is exactly the same shape of bug either way. So this test also
         pins the stderr reason the reporting walk gives for each fixture
-        against `ADVERSARIAL_LOCATOR_REASONS`, whose comment explains why
-        one of the six admits two reasons: the chain stays one image long
-        *for the right reason*, not by accident.
+        against `ADVERSARIAL_LOCATOR_REASONS`, whose comment explains
+        why each fixture ends where it does: the chain stays one image
+        long *for the right reason*, not by accident.
         """
         for image_id, expected in ADVERSARIAL_LOCATOR_FIXTURES:
             with self.subTest(image=image_id):
@@ -3369,11 +3355,11 @@ class TestDifferencingAdversarialLocators(DifferencingTestBase):
                     f'{image_id}: expected the locator to be reported '
                     f'verbatim; stdout={stdout!r}'
                 )
-                expected_reasons = ADVERSARIAL_LOCATOR_REASONS[image_id]
-                self.assertTrue(
-                    any(reason in stderr for reason in expected_reasons),
-                    f'{image_id}: expected one of the reasons '
-                    f'{expected_reasons!r} on stderr -- a one-image chain '
+                expected_reason = ADVERSARIAL_LOCATOR_REASONS[image_id]
+                self.assertIn(
+                    expected_reason, stderr,
+                    f'{image_id}: expected the reason '
+                    f'{expected_reason!r} on stderr -- a one-image chain '
                     f'alone cannot show the allowlist (or the classifier) '
                     f'did the rejecting rather than resolution silently '
                     f'failing; stderr={stderr!r}'
