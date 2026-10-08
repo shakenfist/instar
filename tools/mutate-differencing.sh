@@ -682,7 +682,7 @@ self_test() {
 # phase's definition of done asks the two to stay in step, which until
 # now was a promise kept by hand. Asserting it makes the drift a
 # failure instead of a documentation bug nobody reads.
-EXPECTED_CASES=91
+EXPECTED_CASES=95
 
 check_case_count() {
     # Only meaningful for a whole run; a selection is expected to be short.
@@ -1926,6 +1926,92 @@ integration_case 'check-vhdx-refusal-removed' "${CHECK_OP}" \
     '    if metadata.has_parent {' \
     '    if metadata.has_parent && false { // MUTATED' \
     "${CHECK_REFUSES}"
+
+# Four more on the same three operations, and the one place they are not
+# merely non-composing but were answering differently from the readers.
+# `map` and `measure` do not go through `block_lookup` at all: each
+# walks the whole BAT once, through `VhdxState::map_extents` and
+# `VhdxState::scan_allocation`. Until `block_lookup`'s two guards
+# reached both walks, `map` reported a payload block declared inside
+# the metadata region -- or at file offset zero, where the headers live
+# -- as data living at that offset, and `measure` counted its bytes,
+# while `convert` refused to read that same block (issue #634, and
+# #547 for the offset-zero half).
+#
+# Two cases per walk, one per guard, because neither guard subsumes
+# the other: a block at offset zero does not overlap a declared region
+# in this geometry, and a block inside a region has a non-zero offset.
+# A single case per walk would have let either guard be deleted
+# silently.
+#
+# These are `rust_case` rather than `integration_case` because the
+# walks are crate functions a unit test can drive directly, and because
+# the fixture is a hand-patched BAT entry that no image in
+# instar-testdata carries. Each case reverts one call site only, so the
+# other three keep passing and the verdict names the walk and the guard
+# that was lost.
+
+rust_case 'vhdx-map-extent-offset-inside-region-accepted' "${VHDX_READ_LIB}" \
+    '                    if self.block_overlaps_a_declared_region(file_offset, block_size) {
+                        self.block_table_malformed = true;
+                        return None;
+                    }' \
+    '                    if false {
+                        // MUTATED: map no longer applies the overlap test
+                        self.block_table_malformed = true;
+                        return None;
+                    }' \
+    qcow2 'vhdx_map_and_measure_refuse_a_block_inside_the_metadata_region' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'vhdx-scan-block-offset-inside-region-accepted' "${VHDX_READ_LIB}" \
+    '                    if self.block_overlaps_a_declared_region(file_offset, block_size) {
+                        malformed = true;
+                        return false;
+                    }' \
+    '                    let _ = block_size;
+                    if false {
+                        // MUTATED: measure no longer applies the overlap test
+                        malformed = true;
+                        return false;
+                    }' \
+    qcow2 'vhdx_map_and_measure_refuse_a_block_inside_the_bat_region' \
+    --features "${QCOW2_FEATURES}"
+
+# The other guard of the pair, one case per walk. The overlap test
+# cannot stand in for this one: in the fixture geometry a 1 MiB block
+# at offset zero ends exactly where the first declared region begins,
+# so the two touch without overlapping and the overlap test returns
+# false -- which is why dropping this guard leaves all four cases above
+# passing. The two tests named here assert that independence directly,
+# recomputing the overlap from the image's own region table rather than
+# from the predicate under test.
+
+rust_case 'vhdx-map-extent-offset-zero-accepted' "${VHDX_READ_LIB}" \
+    '                    if file_offset == 0 {
+                        self.block_table_malformed = true;
+                        return None;
+                    }' \
+    '                    if false {
+                        // MUTATED: map no longer refuses a present block at offset zero
+                        self.block_table_malformed = true;
+                        return None;
+                    }' \
+    qcow2 'vhdx_map_refuses_a_present_block_at_file_offset_zero' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'vhdx-scan-block-offset-zero-accepted' "${VHDX_READ_LIB}" \
+    '                    if file_offset == 0 {
+                        malformed = true;
+                        return false;
+                    }' \
+    '                    if false {
+                        // MUTATED: measure no longer refuses a present block at offset zero
+                        malformed = true;
+                        return false;
+                    }' \
+    qcow2 'vhdx_measure_refuses_a_present_block_at_file_offset_zero' \
+    --features "${QCOW2_FEATURES}"
 
 # ---------------------------------------------------------------------
 # The create guest operation. Caught through the real binary only.

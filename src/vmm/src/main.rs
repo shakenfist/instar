@@ -152,6 +152,7 @@ const MEASURE_RESULT_ERROR_OVERFLOW: u32 = 1;
 const MEASURE_RESULT_ERROR_INVALID_OPTION: u32 = 2;
 #[allow(dead_code)]
 const MEASURE_RESULT_ERROR_INVALID_SIZE: u32 = 3;
+const MEASURE_RESULT_ERROR_MALFORMED_BLOCK_TABLE: u32 = 4;
 
 // MapConfig constants (must match shared::MapConfig)
 const MAP_CONFIG_MAGIC: u32 = 0x4D41505F; // "MAP_"
@@ -170,6 +171,7 @@ const MAP_RESULT_ERROR_INVALID_SOURCE: u32 = 1;
 const MAP_RESULT_ERROR_INVALID_OPTION: u32 = 2;
 const MAP_RESULT_ERROR_HAS_BACKING: u32 = 3;
 const MAP_RESULT_ERROR_IO: u32 = 4;
+const MAP_RESULT_ERROR_MALFORMED_BLOCK_TABLE: u32 = 5;
 
 // SnapshotConfig constants (must match shared::SnapshotConfig)
 const SNAPSHOT_CONFIG_MAGIC: u32 = 0x534E4150; // "SNAP"
@@ -12702,6 +12704,20 @@ fn print_measure_result(
                 MEASURE_RESULT_ERROR_OVERFLOW => "measure: overflow computing target size",
                 MEASURE_RESULT_ERROR_INVALID_OPTION => "measure: invalid option for target format",
                 MEASURE_RESULT_ERROR_INVALID_SIZE => "measure: source image is unsupported format",
+                // Not "unsupported format": the format was recognised
+                // and the allocation scan walked the block table far
+                // enough to find it naming a block the reader refuses
+                // to read. The image is malformed, not foreign. The
+                // same code is spelled out again in `run_measure`,
+                // which renders the failure the process exits on while
+                // this renders the one printed as the result arrives;
+                // both are reachable and both used to say "unknown
+                // error" for a code only one of them knew about.
+                MEASURE_RESULT_ERROR_MALFORMED_BLOCK_TABLE => {
+                    "measure: source block table names a block inside the image's own \
+                     structure (at file offset zero, or overlapping a region the image \
+                     declares); the format is recognised, the image is malformed"
+                }
                 _ => "measure: unknown error",
             };
             eprintln!("{}", msg);
@@ -15730,6 +15746,16 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
             MEASURE_RESULT_ERROR_OVERFLOW => "overflow computing target size",
             MEASURE_RESULT_ERROR_INVALID_OPTION => "invalid option for target format",
             MEASURE_RESULT_ERROR_INVALID_SIZE => "source image is unsupported format",
+            // Not "unsupported format": the format was recognised and
+            // the allocation scan walked the block table far enough to
+            // find it naming a block the reader refuses to read. The
+            // image is malformed, not foreign.
+            MEASURE_RESULT_ERROR_MALFORMED_BLOCK_TABLE => {
+                "source block table names a block inside the image's own \
+                 structure (at file offset zero, or overlapping a region the \
+                 image declares); the format is recognised, the image is \
+                 malformed"
+            }
             _ => "unknown error",
         };
         return Err(format!("measure failed: {}", detail).into());
@@ -16165,6 +16191,24 @@ fn map_error_message(error: u32) -> Option<&'static str> {
              image on its own rather than composing a parent into it",
         ),
         MAP_RESULT_ERROR_IO => Some("map: I/O failure walking the source"),
+        // Deliberately says neither "unrecognised" nor "I/O": the
+        // format was recognised and the headers parsed, which is the
+        // only reason the walk got far enough to find the
+        // contradiction, and nothing failed to read -- what was read
+        // disagrees with itself. Either of the other two messages
+        // would send the user hunting a problem that is not there.
+        //
+        // One code covers both grounds the walk refuses on, so the
+        // message names both rather than asserting the one that
+        // happens to be more common: a block at offset zero does not
+        // overlap any declared region, and claiming it did would be a
+        // false statement about the user's image.
+        MAP_RESULT_ERROR_MALFORMED_BLOCK_TABLE => Some(
+            "map: source block table names a block inside the image's own \
+             structure (at file offset zero, or overlapping a region the \
+             image declares); the format is recognised, the image is \
+             malformed",
+        ),
         _ => Some("map: unknown error"),
     }
 }
@@ -19940,6 +19984,7 @@ mod map_renderer_tests {
             MAP_RESULT_ERROR_INVALID_OPTION,
             MAP_RESULT_ERROR_HAS_BACKING,
             MAP_RESULT_ERROR_IO,
+            MAP_RESULT_ERROR_MALFORMED_BLOCK_TABLE,
         ];
         let messages: Vec<&'static str> = codes
             .iter()
@@ -19967,6 +20012,30 @@ mod map_renderer_tests {
     fn error_unknown_returns_generic_message() {
         let msg = map_error_message(999).expect("unknown error returns Some");
         assert!(msg.contains("unknown"));
+    }
+
+    // A recognised image with a malformed block table must not be
+    // described as an unrecognised format or as an I/O failure. Both
+    // of those codes already existed and either would have been the
+    // cheap thing to reuse, and both would have sent the user
+    // looking in the wrong place: at their format tooling, or at
+    // their disk.
+    #[test]
+    fn error_malformed_block_table_blames_the_image_not_the_format() {
+        let msg = map_error_message(MAP_RESULT_ERROR_MALFORMED_BLOCK_TABLE)
+            .expect("malformed-block-table error must have message");
+        assert!(
+            msg.contains("malformed"),
+            "the message must say the image is malformed: {msg}"
+        );
+        assert!(
+            msg.contains("recognised") && !msg.contains("unrecognised"),
+            "the message must say the format IS recognised: {msg}"
+        );
+        assert!(
+            !msg.contains("I/O"),
+            "nothing failed to read; saying so points at the disk: {msg}"
+        );
     }
 
     #[test]

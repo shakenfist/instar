@@ -1557,7 +1557,7 @@ deliberately broken emitter is not guarding what its name says it
 guards. See [PLAN-differencing.md](plans/PLAN-differencing.md) for the
 path being guarded.
 
-There are **91 cases**, in five groups.
+There are **95 cases**, in five groups.
 
 Twenty-seven cover the writer. Fifteen mutate a library crate
 (`create`, `vhd`, `vhdx`) and are caught by a Rust unit or round-trip
@@ -1622,11 +1622,11 @@ reach. All six run through the real binary, caught by
 `TestDifferencingBenchComposes` and `TestDifferencingRebaseThroughChain`
 in `tests/test_differencing.py`.
 
-The final **six guard `map`, `measure` and `check`**, which read
+The final **ten guard `map`, `measure` and `check`**, which read
 through none of the machinery above: each reads its source on its own
 and declines a differencing one outright, so composing it is not a
-guest change those operations can inherit. Each has one case per
-format — a VHD arm testing the footer's disk type, a VHDX arm testing
+guest change those operations can inherit. Six of them guard the
+refusals, with one case per operation per format — a VHD arm testing the footer's disk type, a VHDX arm testing
 the metadata's `has_parent` flag — and every case disables its guard
 with an added `&& false` rather than deleting it, so the mutation is a
 one-line, easily reviewed change to a condition that already compiles.
@@ -1639,6 +1639,29 @@ one of these three operations' refusals — the way this phase lifted
 `convert`, `dd`, `compare`, `bench` and `rebase` — cannot happen by
 accident: removing a guard here must fail a named test before it can
 land.
+
+The other four guard the one place these operations were not merely
+non-composing but were answering differently from the readers. `map`
+and `measure` never call `block_lookup`: each walks the whole BAT once,
+through `VhdxState::map_extents` and `VhdxState::scan_allocation`
+respectively. `block_lookup` refuses a present payload block on two
+independent grounds — a file offset of zero, which is where the
+headers live, and a byte range overlapping a region the image declares
+— and until both reached both walks, `map` reported such a block as
+data living at that offset and `measure` counted its bytes, while
+`convert` refused to read it.
+
+That is two cases per walk, one per guard, because neither guard
+subsumes the other: in the fixture geometry a block at offset zero ends
+exactly where the first declared region begins, so it touches without
+overlapping and the overlap test does not catch it, while a block
+inside a region has a perfectly non-zero offset. One case per walk
+would have let either guard be deleted silently. All four are
+`rust_case` rather than `integration_case` because the walks are crate
+functions a unit test can drive directly, and because the fixture is a
+hand-patched BAT entry no image in `instar-testdata` carries. Each
+reverts one call site only, so the verdict names the walk and the guard
+that was lost.
 
 Most of the reader cases name a test in the `qcow2` crate and run it
 with the full input-format feature list, because the

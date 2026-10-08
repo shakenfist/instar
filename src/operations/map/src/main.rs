@@ -556,6 +556,16 @@ pub unsafe extern "C" fn _start() -> u64 {
                 &mut emit,
             ) {
                 Some(()) => MapResult::ERROR_OK,
+                // The walker answers every failure with `None`, so it
+                // reports which kind through the state it walked with.
+                // Without this the one failure that is not an I/O
+                // failure -- a BAT entry naming a present payload
+                // block at file offset zero or overlapping a region
+                // the image declares, the two conditions the chain
+                // readers refuse a read on -- would be rendered as
+                // "I/O failure walking the source" and send the user
+                // looking at their disk instead of at their image.
+                None if state.block_table_malformed => MapResult::ERROR_MALFORMED_BLOCK_TABLE,
                 None => MapResult::ERROR_IO,
             };
             return finish(

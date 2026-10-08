@@ -2911,6 +2911,23 @@ impl MeasureResult {
     pub const ERROR_OVERFLOW: u32 = 1;
     pub const ERROR_INVALID_OPTION: u32 = 2;
     pub const ERROR_INVALID_SIZE: u32 = 3;
+    /// The source's format was recognised and its headers parsed, but
+    /// its block table describes a block the reader will not read --
+    /// a VHDX BAT entry whose present payload block sits at file
+    /// offset zero, where the headers live, or whose byte range
+    /// overlaps a region the image itself declares.
+    ///
+    /// One code for both grounds: the two are separate checks, but
+    /// the user's situation and remedy are identical, and the host's
+    /// message names both rather than asserting whichever one it
+    /// cannot tell apart from here.
+    ///
+    /// Distinct from [`Self::ERROR_INVALID_SIZE`], which the host
+    /// renders as "unsupported format": the format here is supported
+    /// and understood, which is how the walk got far enough to find
+    /// the contradiction. Reusing that code would send the user
+    /// looking for a format problem that does not exist.
+    pub const ERROR_MALFORMED_BLOCK_TABLE: u32 = 4;
 
     /// True if magic matches.
     pub fn is_valid(&self) -> bool {
@@ -3058,6 +3075,25 @@ impl MapResult {
     pub const ERROR_HAS_BACKING: u32 = 3;
     /// I/O failure during walk.
     pub const ERROR_IO: u32 = 4;
+    /// The source's format was recognised and its headers parsed, but
+    /// its block table describes a block the reader will not read --
+    /// a VHDX BAT entry whose present payload block sits at file
+    /// offset zero, where the headers live, or whose byte range
+    /// overlaps a region the image itself declares.
+    ///
+    /// One code for both grounds: the two are separate checks, but
+    /// the user's situation and remedy are identical, and the host's
+    /// message names both rather than asserting whichever one it
+    /// cannot tell apart from here.
+    ///
+    /// Distinct from [`Self::ERROR_INVALID_SOURCE`], which the host
+    /// renders as "source format unrecognised": the format here is
+    /// recognised, which is how the walk got far enough to find the
+    /// contradiction. It is equally not [`Self::ERROR_IO`] -- nothing
+    /// failed to read; what was read disagrees with itself -- and the
+    /// difference matters because one of those is a bad device and
+    /// the other is a bad image.
+    pub const ERROR_MALFORMED_BLOCK_TABLE: u32 = 5;
 
     /// True if magic matches.
     pub fn is_valid(&self) -> bool {
@@ -6315,6 +6351,20 @@ mod tests {
         assert_eq!(MapResult::ERROR_INVALID_OPTION, 2);
         assert_eq!(MapResult::ERROR_HAS_BACKING, 3);
         assert_eq!(MapResult::ERROR_IO, 4);
+        assert_eq!(MapResult::ERROR_MALFORMED_BLOCK_TABLE, 5);
+    }
+
+    #[test]
+    fn measure_result_error_codes_have_expected_values() {
+        // The guest sends these in a `MeasureResult` the host decodes
+        // by value, and the host carries its own copy of the
+        // constants, so a renumbering here silently retitles an error
+        // over there.
+        assert_eq!(MeasureResult::ERROR_OK, 0);
+        assert_eq!(MeasureResult::ERROR_OVERFLOW, 1);
+        assert_eq!(MeasureResult::ERROR_INVALID_OPTION, 2);
+        assert_eq!(MeasureResult::ERROR_INVALID_SIZE, 3);
+        assert_eq!(MeasureResult::ERROR_MALFORMED_BLOCK_TABLE, 4);
     }
 
     #[test]
