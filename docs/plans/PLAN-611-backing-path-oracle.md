@@ -1,6 +1,6 @@
 # PLAN-611: Backing-path resolution must not answer questions about the host
 
-## Status: Not started
+## Status: In progress
 
 ## Prompt
 
@@ -181,6 +181,16 @@ whether or not the target exists. Other errors from `canonicalize`
 directory outside the allowlist that cannot be read gives no third
 answer.
 
+As built, D4 is a component-by-component walk rather than
+`canonicalize` plus an ancestor walk. The ancestor walk still leaked:
+a link inside the image directory to a *missing* directory outside
+answers "not found" until that directory appears. The walk checks
+each symlink target before following it, so it never probes an
+image-chosen name outside the allowlist. The lexically normalised
+candidate drives only the pre-gate, the fallback decision and the
+error text; the walk follows the reference as written, so `..`
+after a symlink lands where the kernel and qemu-img put it.
+
 **D5. Errors print the reference, not the resolution.**
 `BackingFileNotAllowed` and `BackingFileNotFound` carry the
 lexically normalised candidate, never the canonical path, so a
@@ -241,6 +251,13 @@ fixes from the audit. Every commit passes `pre-commit run
 
 ### Future work
 
+* `rebase` builds its chain with `SecurityConfig::default()` rather
+  than the loaded configuration, so an operator's
+  `backing-path-allowlist` is ignored there. It is stricter, not
+  looser, so it is a consistency fix, not a security one.
+* The fallback's stderr line prints the image-chosen reference
+  unescaped, the same class as #609.
+
 * #609: image-derived path strings reach the terminal unescaped in
   `info` human output. It is the same audience (a service returning
   stderr) and the natural next fix.
@@ -249,6 +266,23 @@ fixes from the audit. Every commit passes `pre-commit run
 
 * #611, broadened to relative references and symlink targets as
   described in Situation.
+
+### Push audit
+
+Run on 2026-10-08 over `f8d71948..cc66c364`. Wave 1 was clean, and
+the five CLI tests fail on the develop binary. Findings and what was
+done with them:
+
+| Finding | Disposition |
+|---------|-------------|
+| `commit` without `-b` opens the overlay's recorded backing for writing without consulting the allowlist (pre-existing) | Fixed in this branch, at the operator's direction |
+| `..` after a symlink in the image path or an allowlist entry made a lexical-only entry the walk honoured | Fixed: the image directory is canonicalised, and entries spelled with `..` keep only their canonical form |
+| `sub/link/../x` resolved differently from qemu-img and develop | Fixed: the walk follows the reference as written |
+| Comments overstated "never looks outside the allowlist" | Fixed: it is never an image-chosen path |
+| Fallback test assumed a symlink-free `TMPDIR` | Fixed |
+| No CLI test for a symlink escape | Added |
+| Fallback line prints the reference unescaped | Declined here: the #609 class, recorded under Future work |
+| `chain.rs` is past 1,500 lines | Declined: splitting the resolver out is a refactor for its own PR |
 
 ### Back brief
 

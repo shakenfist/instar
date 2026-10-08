@@ -335,11 +335,16 @@ class TestBackingPathOracle(InstarTestBase):
         results = []
         for present in (True, False):
             with tempfile.TemporaryDirectory() as tmp:
-                child, image_dir, reference = make_layout(Path(tmp), present)
+                # instar reports paths with the image's directory
+                # canonicalised, so the layout is built under the
+                # resolved root: a TMPDIR reached through a symlink would
+                # otherwise print paths the masking does not recognise.
+                root = Path(tmp).resolve()
+                child, image_dir, reference = make_layout(root, present)
                 stdout, stderr, rc = runner(child)
                 results.append((
-                    self.masked(stdout, tmp, image_dir, reference),
-                    self.masked(stderr, tmp, image_dir, reference),
+                    self.masked(stdout, root, image_dir, reference),
+                    self.masked(stderr, root, image_dir, reference),
                     rc,
                 ))
         return results
@@ -359,6 +364,18 @@ class TestBackingPathOracle(InstarTestBase):
             (root / 'secret.raw').write_bytes(b'\0' * 4096)
         image_dir = root / 'images'
         reference = '../secret.raw'
+        return self.make_child(image_dir, reference), image_dir, reference
+
+    def symlink_layout(self, root, present):
+        """A symlink inside the image's directory that leads out of it."""
+        outside = root / 'outside'
+        outside.mkdir()
+        if present:
+            (outside / 'secret.raw').write_bytes(b'\0' * 4096)
+        image_dir = root / 'images'
+        image_dir.mkdir()
+        (image_dir / 'link').symlink_to(outside)
+        reference = 'link/secret.raw'
         return self.make_child(image_dir, reference), image_dir, reference
 
     def assert_same_refusal(self, results, what):
@@ -427,6 +444,23 @@ class TestBackingPathOracle(InstarTestBase):
             'convert, relative reference'
         )
 
+    def test_symlink_escape_is_not_an_oracle(self):
+        """A symlink out of the image's directory refuses alike either way.
+
+        The link itself is inside the allowlist, so the reference passes
+        the check made on its spelling. Following the link would then
+        look at the target, so the refusal has to come from the link's
+        target being outside, not from whether the file there exists,
+        and must not print where the link points.
+        """
+        results = self.run_pair(self.info_chain, self.symlink_layout)
+        self.assert_same_refusal(results, 'info --chain, symlink escape')
+        for _, stderr, _ in results:
+            self.assertNotIn(
+                '<ROOT>/outside', stderr,
+                f'the refusal names the symlink target; stderr={stderr!r}'
+            )
+
     def test_absolute_reference_falls_back_to_name_beside_image(self):
         """An image built elsewhere still works if its base sits beside it.
 
@@ -436,7 +470,9 @@ class TestBackingPathOracle(InstarTestBase):
         """
         reference = '/nonexistent-dir-xyz/base.raw'
         with tempfile.TemporaryDirectory() as tmp:
-            image_dir = Path(tmp)
+            # instar reports the physical path it resolved, so compare
+            # against the resolved directory in case TMPDIR is a symlink.
+            image_dir = Path(tmp).resolve()
             subprocess.run(
                 ['qemu-img', 'create', '-f', 'raw', str(image_dir / 'base.raw'), '1M'],
                 capture_output=True, check=True

@@ -826,8 +826,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   including when an absolute reference inside the allowlist is missing,
   where it used to happen silently. A reference spelled outside the
   allowlist that would only reach it through a symlink outside the
-  allowlist is now refused. Applies to qcow2 backing and external data
-  files, VMDK flat extents, and VHD and VHDX parent locators. Closes
+  allowlist is now refused. `$IMAGE_DIR` now matches the image's
+  directory with symlinks resolved, and the directory as spelled on the
+  command line only when that spelling has no `..`; a `..` after a
+  symlink is still applied to the link's target, as the kernel and
+  qemu-img apply it. Applies to qcow2 backing
+  and external data files, VMDK flat extents, and VHD and VHDX parent
+  locators. Closes
   [#611](https://github.com/shakenfist/instar/issues/611).
 
 ## [0.3.0] - 2026-08-02

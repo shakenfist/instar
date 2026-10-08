@@ -123,10 +123,18 @@ A reference is checked in this order:
 1. Its spelling is normalised (`.` and `..` components are resolved
    lexically) and compared with the allowlist before anything on disk is
    looked at. A relative `../` escape is "outside allowed paths" whether
-   or not its target exists.
-2. Symlinks are then resolved one at a time. A link that leads outside
-   the allowlist is refused as outside, and the error names the
-   reference as spelled and normalised, never the link's target.
+   or not its target exists. A relative reference is joined to the
+   image's directory with its symlinks resolved. `$IMAGE_DIR` matches
+   that resolved directory and also the directory as you spelled it on
+   the command line, unless your spelling contains `..`, so absolute
+   references written through a symlinked image directory still work.
+2. The reference as written is then resolved one component at a time,
+   so symlinks are followed and a `..` after a symlink applies to the
+   link's target, just as the kernel and qemu-img apply it. Any step
+   that would leave the allowlist, whether through a link or a `..`, is
+   refused as outside before the path it leads to is looked at, and the
+   error names the reference as spelled and normalised, never the
+   link's target.
 3. An absolute reference outside the allowlist is never probed. Instar
    instead tries the file of the same name beside the image, for images
    built on another host, and announces it on stderr:
