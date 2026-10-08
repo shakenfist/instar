@@ -2011,7 +2011,21 @@ fn coalesce_ownership_run<F: FnMut(u32) -> Option<u8>>(
 /// was waved through. A region naming no bytes can hide nothing, so
 /// the inconsistency bought no safety; `init` does not reject a
 /// zero-length entry, so it is reachable from a hostile image.
-fn ranges_overlap(offset: u64, len: u64, region_offset: u64, region_len: u32) -> bool {
+///
+/// Public because the `check` operation needs the same arithmetic.
+/// `check` does not build a [`VhdxState`] -- it has its own region
+/// table, metadata and BAT validation, reading the full 64 KiB of both
+/// region tables where the reader reads one sector of the first -- but
+/// a payload block whose bytes are the image's own structure is as
+/// malformed when `check` walks the BAT as when `block_lookup` does.
+/// The two kept separate copies of this test until `check` had none at
+/// all: it reported "No errors were found" and exit 0 on an image
+/// whose first payload block was repointed into the metadata region,
+/// which `convert` refused to read. Sharing the predicate rather than
+/// the sweep is deliberate: the overflow and empty-range rules above
+/// are where two copies would drift, and the sweep over an operation's
+/// own region array is three lines that cannot.
+pub fn ranges_overlap(offset: u64, len: u64, region_offset: u64, region_len: u32) -> bool {
     if len == 0 || region_len == 0 {
         return false;
     }

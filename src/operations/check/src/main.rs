@@ -15,8 +15,9 @@
 //! footer copy consistency.
 //!
 //! **VHDX:** File identifier, dual header CRC-32C, region table 1+2
-//! cross-validation, metadata parsing, BAT walk, overlap detection,
-//! fragmentation, dirty log detection.
+//! cross-validation, metadata parsing, BAT walk, block offsets clear
+//! of the image's own structure, overlap detection, fragmentation,
+//! dirty log detection.
 //!
 //! When `--chain` is enabled, the operation also validates the backing
 //! chain: format consistency, virtual size consistency across layers,
@@ -1352,6 +1353,10 @@ unsafe fn check_vmdk(
 ///   unsupported, not as a corruption)
 /// - BAT entries: allocated block offsets within file bounds, 1MB
 ///   alignment, overlap detection via BitmapContext
+/// - Allocated block offsets must not name the image's own structure:
+///   not file offset zero, and not overlapping any region the region
+///   table declares, which is the same pair of tests the chain-walking
+///   readers apply before they read a block
 /// - Fragmentation tracking (non-sequential block allocation)
 unsafe fn check_vhdx(
     result: &mut CheckResult,
@@ -1480,7 +1485,7 @@ unsafe fn check_vhdx(
     }
 
     let rt_slice = core::slice::from_raw_parts(rt_buf, 65536);
-    let (regions, _entry_count) = match vhdx::parse_region_table(rt_slice) {
+    let (regions, entry_count) = match vhdx::parse_region_table(rt_slice) {
         Some(r) => r,
         None => {
             result.corruptions += 1;
@@ -1490,6 +1495,42 @@ unsafe fn check_vhdx(
             return bytes_read;
         }
     };
+
+    // Every entry the region table declares as `(file_offset,
+    // length)`, recognised or not, for the test the BAT walk below
+    // runs against each allocated block's byte range.
+    //
+    // `parse_region_table` hands back only the two entries it
+    // recognises, and that is not enough: a block landing inside an
+    // unrecognised region is as malformed as one inside the BAT or the
+    // metadata, and an unrecognised region's bytes are just as much
+    // this image's structure. `entry_count.min(8)` is the cap
+    // `VhdxState::init` applies to the same scan, so the reader and
+    // `check` test a block against the same set of regions rather than
+    // two different ones; SPEC(VHDX) allows up to 2047 entries, and
+    // what a longer table can keep out of the test is an unrecognised
+    // region only -- `parse_region_table` returns `None` when the BAT
+    // or metadata entry is not among the first eight.
+    //
+    // Copied onto the stack here rather than read from `rt_slice`
+    // where it is needed: `rt_slice` points at `SCRATCH_MEM_BASE`,
+    // which `BitmapContext::init_in_scratch` below overwrites before
+    // the BAT walk starts. Eight `(u64, u32)` pairs is 128 bytes of a
+    // 4 MiB guest stack, and no scratch at all, which is the budget
+    // this operation is tight on.
+    let mut declared_regions: [(u64, u32); 8] = [(0, 0); 8];
+    let mut declared_region_count: usize = 0;
+    for i in 0..entry_count.min(8) as usize {
+        let eoff = vhdx::REGION_TABLE_HEADER_SIZE + i * vhdx::REGION_TABLE_ENTRY_SIZE;
+        if eoff + vhdx::REGION_TABLE_ENTRY_SIZE > rt_slice.len() {
+            break;
+        }
+        declared_regions[declared_region_count] = (
+            shared::le_u64(rt_slice, eoff + 16),
+            shared::le_u32(rt_slice, eoff + 24),
+        );
+        declared_region_count += 1;
+    }
 
     // regions[0] = BAT, regions[1] = Metadata
     let bat_offset = regions[0].file_offset;
@@ -1729,6 +1770,75 @@ unsafe fn check_vhdx(
                     result.total_errors += 1;
                     (call_table.debug_print)(
                         b"check: VHDX block offset out of bounds\n\0".as_ptr(),
+                    );
+                    payload_block_idx += 1;
+                    continue;
+                }
+
+                // A block's own bytes must not be the image's own
+                // structure. Two separate statements rather than one,
+                // because they catch different things and either can
+                // be lost without the other noticing.
+                //
+                // Offset zero is where the file identifier and the
+                // headers live. A BAT entry's offset is always a whole
+                // megabyte, so zero is exactly what a zeroed or
+                // truncated entry that still reads as present names --
+                // and in the layouts qemu-img writes, a 1 MiB block
+                // there ends precisely where the first declared region
+                // begins, so the two touch without overlapping and the
+                // region test below provably cannot catch it.
+                //
+                // Overlapping a declared region means the block's
+                // bytes are the BAT's, the metadata's, or those of a
+                // region this build does not recognise. SPEC(VHDX)
+                // does not require a region to precede the blocks it
+                // coexists with, so this has to be an overlap test
+                // against each declared range rather than a low-water
+                // mark: a region a writer legally declared after every
+                // block would otherwise refuse a well-formed image.
+                //
+                // Both are counted corruptions rather than a refusal.
+                // The chain-walking readers answer such a block by
+                // failing the read, which is right for them -- there
+                // is nothing to hand back -- but reporting a malformed
+                // image is what this operation is for, so it says so
+                // and exits 2. Measured before these two existed, on
+                // an image whose first payload BAT entry was repointed
+                // at the metadata region, at the BAT region, and at
+                // offset zero: `convert` failed, `map` and `measure`
+                // refused by name, and `check` printed "No errors were
+                // found on the image." and exited 0 for all three. A
+                // clean verdict on an image no reader will open is the
+                // one answer this operation must never give.
+                //
+                // `continue` rather than falling through, matching the
+                // out-of-bounds arm above: once the offset is known to
+                // name structure, feeding it to the fragmentation,
+                // alignment and overlap-bitmap statistics below only
+                // adds noise about an offset the image should not have
+                // named at all.
+                if file_offset == 0 {
+                    result.corruptions += 1;
+                    result.total_errors += 1;
+                    (call_table.debug_print)(b"check: VHDX block at file offset zero\n\0".as_ptr());
+                    payload_block_idx += 1;
+                    continue;
+                }
+                if declared_regions[..declared_region_count].iter().any(
+                    |&(region_offset, region_length)| {
+                        vhdx::ranges_overlap(
+                            file_offset,
+                            block_size as u64,
+                            region_offset,
+                            region_length,
+                        )
+                    },
+                ) {
+                    result.corruptions += 1;
+                    result.total_errors += 1;
+                    (call_table.debug_print)(
+                        b"check: VHDX block inside a declared region\n\0".as_ptr(),
                     );
                     payload_block_idx += 1;
                     continue;

@@ -1557,7 +1557,7 @@ deliberately broken emitter is not guarding what its name says it
 guards. See [PLAN-differencing.md](plans/PLAN-differencing.md) for the
 path being guarded.
 
-There are **95 cases**, in five groups.
+There are **98 cases**, in five groups.
 
 Twenty-seven cover the writer. Fifteen mutate a library crate
 (`create`, `vhd`, `vhdx`) and are caught by a Rust unit or round-trip
@@ -1622,7 +1622,7 @@ reach. All six run through the real binary, caught by
 `TestDifferencingBenchComposes` and `TestDifferencingRebaseThroughChain`
 in `tests/test_differencing.py`.
 
-The final **ten guard `map`, `measure` and `check`**, which read
+The final **thirteen guard `map`, `measure` and `check`**, which read
 through none of the machinery above: each reads its source on its own
 and declines a differencing one outright, so composing it is not a
 guest change those operations can inherit. Six of them guard the
@@ -1640,7 +1640,7 @@ one of these three operations' refusals — the way this phase lifted
 accident: removing a guard here must fail a named test before it can
 land.
 
-The other four guard the one place these operations were not merely
+The other seven guard the one place these operations were not merely
 non-composing but were answering differently from the readers. `map`
 and `measure` never call `block_lookup`: each walks the whole BAT once,
 through `VhdxState::map_extents` and `VhdxState::scan_allocation`
@@ -1662,6 +1662,24 @@ functions a unit test can drive directly, and because the fixture is a
 hand-patched BAT entry no image in `instar-testdata` carries. Each
 reverts one call site only, so the verdict names the walk and the guard
 that was lost.
+
+The last three are `check`'s, which was the fourth answer to the same
+question and for a long time gave none: it builds no `VhdxState` and
+runs its own file identifier, header CRC-32C, region table 1+2
+cross-validation, metadata and BAT validation, so neither reader guard
+reached it. Measured at the CLI before it had them, an image whose
+first payload BAT entry was repointed at the metadata region, at the
+BAT region or at file offset zero was refused by `convert`, `map` and
+`measure` and reported by `check` as "No errors were found on the
+image." with exit 0. Two of the three cases are one per guard, for the
+reason above. The third is the one no "inside a region" case can
+catch: an overlap test degraded into a high-water mark refuses every
+block below the highest region's end, which leaves every malformed
+case passing, and only a region declared *after* the blocks --
+which SPEC(VHDX) permits -- tells the two apart. All three are
+`integration_case`, because the arm lives in a `no_std` guest binary
+with no test harness to drive it and the only observable verdict is
+the real command's exit code.
 
 Most of the reader cases name a test in the `qcow2` crate and run it
 with the full input-format feature list, because the

@@ -77,6 +77,10 @@ The classes are:
   draws, asserted on its own terms: `map`, `measure` and `check` must
   each still refuse, each naming itself rather than instar generally,
   and `check` must refuse the same way with or without `--chain`.
+* `TestVhdxBlockOffsetsNamingTheImagesOwnStructure` -- the
+  op-consistency half: one VHDX whose BAT names a block inside the
+  image's own structure, and the one answer `convert`, `map`,
+  `measure` and `check` must give about it.
 * `TestDifferencingConvertLeavesNoOutput` -- issue #547's core.
 * `TestDifferencingDdMatchesConvert` -- the only record in the tree
   that `dd` and `convert` share a guest binary.
@@ -1793,6 +1797,473 @@ class TestDifferencingNonComposingRefusalPolicy(DifferencingTestBase):
                     1, rc,
                     f'{image_id}: expected exit 1, got {rc}; stderr={stderr!r}'
                 )
+
+
+class TestVhdxBlockOffsetsNamingTheImagesOwnStructure(DifferencingTestBase):
+    """One malformed VHDX, four operations, one answer.
+
+    This is the op-consistency half of this suite rather than the
+    differencing half, and it is here because it is the same question:
+    does every operation that reads a VHDX agree about what a valid
+    payload block is? The chain-walking readers behind `convert`, `dd`,
+    `compare`, `bench` and `rebase` refuse a payload block on two
+    independent grounds -- its file offset is zero, where the file
+    identifier and the headers live, or its byte range overlaps a
+    region the image's own region table declares. `map` and `measure`
+    walk the whole BAT instead of looking a block up, and they applied
+    neither test until recently (issue #634). `check` has its own,
+    entirely separate VHDX validation and applied neither either.
+
+    Measured at the CLI before `check` gained them: on an image whose
+    first payload BAT entry was repointed at the metadata region, at
+    the BAT region, or at offset zero, `convert` exited 1, `map` and
+    `measure` refused by name with exit 1, and `check` printed "No
+    errors were found on the image." and exited 0 for all three. A
+    clean verdict on an image no reader will open is the one answer
+    `check` must never give, so the two tests are now counted
+    corruptions there -- exit 2, which is `check`'s code for "this
+    image is damaged", not the readers' exit 1 for "I cannot read
+    this".
+
+    The fixtures are built here rather than shipped. `qemu-img convert
+    -O vhdx -o block_size=1M` lays the BAT region at 0x200000 and the
+    metadata region at 0x300000 with the payload starting at 0x800000,
+    and each malformed image is that image with one 8-byte BAT entry
+    rewritten. The test asserts that geometry from the image's own
+    region table rather than assuming it, because every one of these
+    offsets is only malformed relative to what the image declares.
+
+    Two controls, and the second is the one that matters:
+
+    * The untouched image, so the tests are not passing because a
+      guard refuses everything.
+    * An extra, unrecognised region declared at EOF, past every
+      payload block. SPEC(VHDX) does not require a region to precede
+      the blocks it coexists with, so an implementation that replaced
+      the overlap test with a high-water mark would still pass all
+      three malformed cases -- a block inside a region is also below
+      the highest region's end -- and would refuse this well-formed
+      image. Only this control tells the two apart.
+
+    A region-table edit needs its CRC-32C recomputed and a BAT entry
+    edit does not, which is why only the trailing-region control
+    carries a checksum fixup: the readers' `VhdxState::init`
+    deliberately skips the region table CRC, but `check` validates it,
+    and a fixture that broke it would be measuring "check rejects a bad
+    checksum" instead of anything about block offsets.
+    """
+
+    REGION_TABLE_OFFSETS = (0x30000, 0x40000)
+    REGION_TABLE_LENGTH = 0x10000
+    REGION_TABLE_CHECKSUM_OFFSET = 4
+    REGION_TABLE_ENTRY_COUNT_OFFSET = 8
+    REGION_TABLE_HEADER_SIZE = 16
+    REGION_TABLE_ENTRY_SIZE = 32
+    BAT_REGION_GUID = bytes.fromhex('6677c22d23f600429d64115e9bfd4a08')
+    METADATA_REGION_GUID = bytes.fromhex('06a27c8b90479a4bb8fe575f050f886e')
+
+    BAT_ENTRY_STATE_MASK = 0x7
+    BAT_ENTRY_OFFSET_MASK = 0xfffffffffff00000
+    PAYLOAD_BLOCK_FULLY_PRESENT = 6
+
+    # The geometry `-o block_size=1M` produces, asserted rather than
+    # trusted: if a future qemu-img lays these out differently, the
+    # fixtures stop being malformed and the tests must say so loudly
+    # instead of passing on a clean image.
+    BLOCK_SIZE = 0x100000
+    EXPECTED_BAT_REGION_OFFSET = 0x200000
+    EXPECTED_METADATA_REGION_OFFSET = 0x300000
+    SOURCE_SIZE = 4 * 0x100000
+
+    def _require_qemu_img(self):
+        if shutil.which('qemu-img') is None:
+            self.skipTest('qemu-img is required to build a VHDX fixture')
+
+    @staticmethod
+    def _crc32c(data: bytes, checksum_offset: int) -> int:
+        """CRC-32C (Castagnoli) over `data`, treating the checksum as zero.
+
+        Written out rather than imported: `zlib.crc32` is CRC-32 with a
+        different polynomial, and no CRC-32C lives in the standard
+        library. The polynomial is the bit-reversed 0x1edc6f41 the VHDX
+        specification names.
+        """
+        crc = 0xffffffff
+        for i, byte in enumerate(data):
+            if checksum_offset <= i < checksum_offset + 4:
+                byte = 0
+            crc ^= byte
+            for _ in range(8):
+                crc = (crc >> 1) ^ 0x82f63b78 if crc & 1 else crc >> 1
+        return crc ^ 0xffffffff
+
+    def _declared_regions(self, data: bytes, table_offset: int):
+        """Every `(guid, file_offset, length)` one region table declares."""
+        signature = data[table_offset:table_offset + 4]
+        self.assertEqual(
+            b'regi', signature,
+            f'no region table signature at {table_offset:#x}: {signature!r}'
+        )
+        stored = int.from_bytes(
+            data[table_offset + self.REGION_TABLE_CHECKSUM_OFFSET:
+                 table_offset + self.REGION_TABLE_CHECKSUM_OFFSET + 4],
+            'little'
+        )
+        computed = self._crc32c(
+            data[table_offset:table_offset + self.REGION_TABLE_LENGTH],
+            self.REGION_TABLE_CHECKSUM_OFFSET
+        )
+        self.assertEqual(
+            computed, stored,
+            f'region table at {table_offset:#x} has a stale CRC-32C '
+            f'({stored:#010x} stored, {computed:#010x} computed): `check` '
+            f'validates it, so this fixture would measure the checksum '
+            f'rather than the block offset under test'
+        )
+        count = int.from_bytes(
+            data[table_offset + self.REGION_TABLE_ENTRY_COUNT_OFFSET:
+                 table_offset + self.REGION_TABLE_ENTRY_COUNT_OFFSET + 4],
+            'little'
+        )
+        regions = []
+        for i in range(count):
+            at = (table_offset + self.REGION_TABLE_HEADER_SIZE
+                  + i * self.REGION_TABLE_ENTRY_SIZE)
+            regions.append((
+                bytes(data[at:at + 16]),
+                int.from_bytes(data[at + 16:at + 24], 'little'),
+                int.from_bytes(data[at + 24:at + 28], 'little'),
+            ))
+        return regions
+
+    def _base_image(self, tmp: Path) -> Path:
+        """A plain 4 MiB VHDX with 1 MiB blocks, geometry asserted."""
+        source = tmp / 'source.raw'
+        source.write_bytes(bytes(range(256)) * (self.SOURCE_SIZE // 256))
+        image = tmp / 'clean.vhdx'
+        run = subprocess.run(
+            ['qemu-img', 'convert', '-f', 'raw', '-O', 'vhdx',
+             '-o', 'block_size=1M', str(source), str(image)],
+            capture_output=True, text=True, timeout=120
+        )
+        self.assertEqual(
+            0, run.returncode,
+            f'qemu-img could not build the VHDX fixture: '
+            f'stdout={run.stdout!r} stderr={run.stderr!r}'
+        )
+        data = image.read_bytes()
+        for table_offset in self.REGION_TABLE_OFFSETS:
+            regions = dict(
+                (guid, (offset, length))
+                for guid, offset, length in self._declared_regions(
+                    data, table_offset
+                )
+            )
+            self.assertEqual(
+                self.EXPECTED_BAT_REGION_OFFSET,
+                regions.get(self.BAT_REGION_GUID, (None, None))[0],
+                f'the BAT region is not where this test places its '
+                f'fixtures (table at {table_offset:#x})'
+            )
+            self.assertEqual(
+                self.EXPECTED_METADATA_REGION_OFFSET,
+                regions.get(self.METADATA_REGION_GUID, (None, None))[0],
+                f'the metadata region is not where this test places its '
+                f'fixtures (table at {table_offset:#x})'
+            )
+        self.assertEqual(
+            self.PAYLOAD_BLOCK_FULLY_PRESENT,
+            self._first_bat_entry(data) & self.BAT_ENTRY_STATE_MASK,
+            'the first payload BAT entry is not fully present, so '
+            'repointing it would not exercise an allocated block'
+        )
+        return image
+
+    def _first_bat_entry(self, data: bytes) -> int:
+        """The image's first payload BAT entry, as a u64."""
+        at = self.EXPECTED_BAT_REGION_OFFSET
+        return int.from_bytes(data[at:at + 8], 'little')
+
+    def _repointed(self, base: Path, name: str, offset: int) -> Path:
+        """`base` with its first payload BAT entry moved to `offset`.
+
+        Only the BAT entry changes, so neither region table is touched
+        and neither CRC-32C needs recomputing -- which `_declared_regions`
+        re-asserts for every fixture this class builds.
+        """
+        data = bytearray(base.read_bytes())
+        at = self.EXPECTED_BAT_REGION_OFFSET
+        state = self._first_bat_entry(data) & self.BAT_ENTRY_STATE_MASK
+        entry = (offset & self.BAT_ENTRY_OFFSET_MASK) | state
+        data[at:at + 8] = entry.to_bytes(8, 'little')
+        target = base.parent / name
+        target.write_bytes(bytes(data))
+        return target
+
+    def _with_trailing_region(self, base: Path, name: str) -> Path:
+        """`base` with an extra unrecognised region declared at EOF.
+
+        Both region tables gain the entry and both CRC-32Cs are
+        recomputed, because `check` reads all 64 KiB of each and
+        cross-validates them. Nothing reads an unrecognised region's
+        bytes, so the declaration needs no backing data.
+        """
+        data = bytearray(base.read_bytes())
+        eof = len(data)
+        for table_offset in self.REGION_TABLE_OFFSETS:
+            count_at = table_offset + self.REGION_TABLE_ENTRY_COUNT_OFFSET
+            count = int.from_bytes(data[count_at:count_at + 4], 'little')
+            at = (table_offset + self.REGION_TABLE_HEADER_SIZE
+                  + count * self.REGION_TABLE_ENTRY_SIZE)
+            data[at:at + 16] = bytes([0xad] * 16)
+            data[at + 16:at + 24] = eof.to_bytes(8, 'little')
+            data[at + 24:at + 28] = (0x1000).to_bytes(4, 'little')
+            data[at + 28:at + 32] = (0).to_bytes(4, 'little')
+            data[count_at:count_at + 4] = (count + 1).to_bytes(4, 'little')
+            checksum_at = table_offset + self.REGION_TABLE_CHECKSUM_OFFSET
+            data[checksum_at:checksum_at + 4] = b'\x00\x00\x00\x00'
+            checksum = self._crc32c(
+                bytes(data[table_offset:table_offset
+                           + self.REGION_TABLE_LENGTH]),
+                self.REGION_TABLE_CHECKSUM_OFFSET
+            )
+            data[checksum_at:checksum_at + 4] = checksum.to_bytes(4, 'little')
+        target = base.parent / name
+        target.write_bytes(bytes(data))
+        return target
+
+    def _block_overlaps_a_declared_region(self, image: Path, offset: int) -> bool:
+        """Whether a block at `offset` overlaps a region `image` declares.
+
+        Recomputed from the image's own bytes rather than inferred from
+        what instar said, so the offset-zero test can assert its own
+        premise -- that the overlap test cannot be what refused it.
+        """
+        data = image.read_bytes()
+        end = offset + self.BLOCK_SIZE
+        return any(
+            length != 0 and offset < region_offset + length
+            and region_offset < end
+            for _guid, region_offset, length in self._declared_regions(
+                data, self.REGION_TABLE_OFFSETS[0]
+            )
+        )
+
+    def _all_five(self, image: Path, tmp: Path):
+        """Run the five commands that read a VHDX BAT over one image.
+
+        `check` twice, with and without `--chain`: it walks a chain only
+        when asked, so a gate that behaved differently under the flag
+        would otherwise be invisible.
+        """
+        output = tmp / f'{image.stem}-out.raw'
+        results = {
+            'convert': self.run_instar_convert(
+                image, output, output_format='raw'
+            ),
+            'map': self.run_instar_map(image),
+            'measure': self.run_instar_measure(image, '-O', 'raw'),
+            'check': self.run_instar_check(image),
+            'check --chain': self.run_instar_check(image, chain=True),
+        }
+        if output.exists():
+            output.unlink()
+        return results
+
+    MALFORMED_CASES = (
+        ('inside the metadata region', 'in-metadata.vhdx', 0x300000),
+        ('inside the BAT region', 'in-bat.vhdx', 0x200000),
+        ('at file offset zero', 'at-zero.vhdx', 0x000000),
+    )
+
+    def test_check_counts_a_block_naming_the_images_own_structure(self):
+        """`check` reports each malformed image as corrupt, exit 2.
+
+        Exit 2 exactly, not merely non-zero: 1 is a failed operation and
+        63 is an unsupported format, and either would mean `check` had
+        stopped rather than reported. The count is asserted too, because
+        "errors were found" with a zero count is what a flag set without
+        a counted corruption looks like.
+        """
+        self._require_qemu_img()
+        with tempfile.TemporaryDirectory() as tmp:
+            base = self._base_image(Path(tmp))
+            for description, name, offset in self.MALFORMED_CASES:
+                with self.subTest(block=description):
+                    image = self._repointed(base, name, offset)
+                    stdout, stderr, rc = self.run_instar_check(image)
+                    self.assertEqual(
+                        2, rc,
+                        f'a payload block {description} must be reported '
+                        f'as a corruption (exit 2), not refused and not '
+                        f'waved through; stdout={stdout!r} '
+                        f'stderr={stderr!r}'
+                    )
+                    self.assertRegex(
+                        stdout, r'\b1 errors were found',
+                        f'a payload block {description} must be counted; '
+                        f'stdout={stdout!r}'
+                    )
+
+    def test_check_agrees_with_the_chain_flag(self):
+        """`--chain` does not change what `check` decides about a block."""
+        self._require_qemu_img()
+        with tempfile.TemporaryDirectory() as tmp:
+            base = self._base_image(Path(tmp))
+            for description, name, offset in self.MALFORMED_CASES:
+                with self.subTest(block=description):
+                    image = self._repointed(base, name, offset)
+                    plain = self.run_instar_check(image, chain=False)
+                    chained = self.run_instar_check(image, chain=True)
+                    self.assertEqual(
+                        plain, chained,
+                        f'check --chain disagreed with check about a block '
+                        f'{description}; plain={plain!r} '
+                        f'chained={chained!r}'
+                    )
+
+    def test_offset_zero_is_caught_by_its_own_guard(self):
+        """The overlap test provably cannot be what refuses offset zero.
+
+        A 1 MiB block at offset zero ends exactly where the first
+        declared region begins, so the two touch without overlapping.
+        Without this premise asserted from the image's own region table,
+        the offset-zero case would be the overlap case under a different
+        name, and deleting the zero guard would leave every test here
+        passing.
+        """
+        self._require_qemu_img()
+        with tempfile.TemporaryDirectory() as tmp:
+            base = self._base_image(Path(tmp))
+            image = self._repointed(base, 'at-zero.vhdx', 0)
+            self.assertFalse(
+                self._block_overlaps_a_declared_region(image, 0),
+                'a block at offset zero overlaps a declared region in '
+                'this fixture, so this class no longer has independent '
+                'coverage of the two guards'
+            )
+            for offset in (self.EXPECTED_BAT_REGION_OFFSET,
+                           self.EXPECTED_METADATA_REGION_OFFSET):
+                self.assertTrue(
+                    self._block_overlaps_a_declared_region(image, offset),
+                    f'a block at {offset:#x} must overlap a declared '
+                    f'region, or the other two cases are not the overlap '
+                    f'test either'
+                )
+
+    def test_every_operation_refuses_each_malformed_image(self):
+        """The four-way answer, asserted as one answer.
+
+        `convert`, `map` and `measure` fail the read with exit 1 and
+        `check` reports a corruption with exit 2. The codes differ on
+        purpose and both are asserted: a reader has nothing to hand
+        back, while reporting a malformed image is what `check` is for.
+        What must never differ is whether the image is accepted.
+        """
+        self._require_qemu_img()
+        with tempfile.TemporaryDirectory() as tmp:
+            base = self._base_image(Path(tmp))
+            expected = {
+                'convert': 1, 'map': 1, 'measure': 1,
+                'check': 2, 'check --chain': 2,
+            }
+            for description, name, offset in self.MALFORMED_CASES:
+                image = self._repointed(base, name, offset)
+                results = self._all_five(image, Path(tmp))
+                for op, (stdout, stderr, rc) in results.items():
+                    with self.subTest(block=description, op=op):
+                        self.assertEqual(
+                            expected[op], rc,
+                            f'{op} on a block {description}: expected exit '
+                            f'{expected[op]}, got {rc}; stdout={stdout!r} '
+                            f'stderr={stderr!r}'
+                        )
+
+    def test_map_and_measure_name_the_malformed_block_table(self):
+        """Their message must not send a user hunting a format problem.
+
+        The format was recognised and the image parsed far enough to
+        walk its BAT, so "unrecognised" or "unsupported format" would be
+        false. These two have their own error codes for exactly that
+        reason, and this pins what the codes render as.
+        """
+        self._require_qemu_img()
+        with tempfile.TemporaryDirectory() as tmp:
+            base = self._base_image(Path(tmp))
+            for description, name, offset in self.MALFORMED_CASES:
+                image = self._repointed(base, name, offset)
+                for op, runner, args in (
+                    ('map', self.run_instar_map, ()),
+                    ('measure', self.run_instar_measure, ('-O', 'raw')),
+                ):
+                    with self.subTest(block=description, op=op):
+                        stdout, stderr, _rc = runner(image, *args)
+                        combined = stdout + stderr
+                        self.assertIn(
+                            'the format is recognised, the image is '
+                            'malformed', combined,
+                            f'{op} on a block {description} must say the '
+                            f'block table is malformed; '
+                            f'stdout={stdout!r} stderr={stderr!r}'
+                        )
+                        for wrong in ('unrecognised', 'unsupported format'):
+                            self.assertNotIn(
+                                wrong, combined,
+                                f'{op} on a block {description} must not '
+                                f'claim {wrong!r}; stdout={stdout!r} '
+                                f'stderr={stderr!r}'
+                            )
+
+    def test_every_operation_accepts_the_untouched_image(self):
+        """The negative control: nothing here refuses a well-formed image."""
+        self._require_qemu_img()
+        with tempfile.TemporaryDirectory() as tmp:
+            base = self._base_image(Path(tmp))
+            for op, (stdout, stderr, rc) in self._all_five(
+                base, Path(tmp)
+            ).items():
+                with self.subTest(op=op):
+                    self.assertEqual(
+                        0, rc,
+                        f'{op} refused a plain VHDX qemu-img just wrote; '
+                        f'stdout={stdout!r} stderr={stderr!r}'
+                    )
+
+    def test_every_operation_accepts_a_region_declared_after_the_blocks(self):
+        """The control that separates an overlap test from a high-water mark.
+
+        An unrecognised region declared at EOF, past every payload
+        block, is legal: SPEC(VHDX) does not require a region to precede
+        the blocks it coexists with. An implementation that refused
+        everything below the highest region's end would pass all three
+        malformed cases above and fail here, and `check` in particular
+        has no other test that could tell the difference.
+        """
+        self._require_qemu_img()
+        with tempfile.TemporaryDirectory() as tmp:
+            base = self._base_image(Path(tmp))
+            image = self._with_trailing_region(base, 'trailing-region.vhdx')
+            data = image.read_bytes()
+            trailing = self._declared_regions(
+                data, self.REGION_TABLE_OFFSETS[0]
+            )[-1]
+            self.assertGreater(
+                trailing[1],
+                self._first_bat_entry(data) & self.BAT_ENTRY_OFFSET_MASK,
+                'the trailing region must be declared past the payload '
+                'block under test, or it is not this control'
+            )
+            for op, (stdout, stderr, rc) in self._all_five(
+                image, Path(tmp)
+            ).items():
+                with self.subTest(op=op):
+                    self.assertEqual(
+                        0, rc,
+                        f'{op} refused an image whose only oddity is a '
+                        f'region declared after every block, which is a '
+                        f'high-water mark rather than an overlap test; '
+                        f'stdout={stdout!r} stderr={stderr!r}'
+                    )
 
 
 class TestDifferencingConvertLeavesNoOutput(DifferencingTestBase):

@@ -682,7 +682,7 @@ self_test() {
 # phase's definition of done asks the two to stay in step, which until
 # now was a promise kept by hand. Asserting it makes the drift a
 # failure instead of a documentation bug nobody reads.
-EXPECTED_CASES=95
+EXPECTED_CASES=98
 
 check_case_count() {
     # Only meaningful for a whole run; a selection is expected to be short.
@@ -2012,6 +2012,63 @@ rust_case 'vhdx-scan-block-offset-zero-accepted' "${VHDX_READ_LIB}" \
                     }' \
     qcow2 'vhdx_measure_refuses_a_present_block_at_file_offset_zero' \
     --features "${QCOW2_FEATURES}"
+
+# The fourth answer, which for a long time was no answer at all.
+# `check` builds no `VhdxState`: it has its own file identifier, dual
+# header CRC-32C, region table 1+2 cross-validation, metadata parsing
+# and BAT walk, so none of the reader guards above reach it. Measured
+# at the CLI before it had the pair: on an image whose first payload
+# BAT entry was repointed at the metadata region, at the BAT region or
+# at file offset zero, `convert` exited 1 and `map` and `measure`
+# refused by name, while `check` printed "No errors were found on the
+# image." and exited 0 for all three.
+#
+# `integration_case` rather than `rust_case`: the arm lives in a
+# `no_std` guest binary with no `std` test harness to drive it, so the
+# only way to observe the verdict is the exit code of the real command.
+#
+# Three cases. Two are one per guard, for the same reason the two walks
+# get one each -- a block at offset zero does not overlap a declared
+# region in this geometry and a block inside one has a non-zero offset,
+# so a single case would let either be deleted silently. The third is
+# the one no "inside a region" case can catch: an overlap test
+# degraded into a high-water mark, which refuses every block below the
+# highest region's end. Every malformed case still passes under it, and
+# only a region declared *after* the blocks -- which SPEC(VHDX) allows
+# -- tells the two apart.
+
+CHECK_BLOCK_TESTS='test_differencing.TestVhdxBlockOffsetsNamingTheImagesOwnStructure'
+CHECK_BLOCK_COUNTED="${CHECK_BLOCK_TESTS}.test_check_counts_a_block_naming_the_images_own_structure"
+CHECK_BLOCK_TRAILING="${CHECK_BLOCK_TESTS}"
+CHECK_BLOCK_TRAILING="${CHECK_BLOCK_TRAILING}.test_every_operation_accepts_a_region_declared_after_the_blocks"
+
+integration_case 'check-vhdx-block-offset-zero-not-counted' "${CHECK_OP}" \
+    '                if file_offset == 0 {' \
+    '                if file_offset == 0 && false { // MUTATED' \
+    "${CHECK_BLOCK_COUNTED}"
+
+integration_case 'check-vhdx-block-inside-a-region-not-counted' "${CHECK_OP}" \
+    '                        vhdx::ranges_overlap(
+                            file_offset,
+                            block_size as u64,
+                            region_offset,
+                            region_length,
+                        )' \
+    '                        // MUTATED: check no longer tests a block against the regions
+                        let _ = (file_offset, region_offset, region_length);
+                        false' \
+    "${CHECK_BLOCK_COUNTED}"
+
+integration_case 'check-vhdx-region-test-replaced-by-a-high-water-mark' "${CHECK_OP}" \
+    '                        vhdx::ranges_overlap(
+                            file_offset,
+                            block_size as u64,
+                            region_offset,
+                            region_length,
+                        )' \
+    '                        // MUTATED: overlap test replaced by a high-water mark
+                        file_offset < region_offset + u64::from(region_length)' \
+    "${CHECK_BLOCK_TRAILING}"
 
 # ---------------------------------------------------------------------
 # The create guest operation. Caught through the real binary only.
