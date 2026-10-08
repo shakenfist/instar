@@ -11,6 +11,7 @@ import json
 import subprocess
 import tempfile
 import time
+from pathlib import Path
 
 import testtools
 
@@ -288,6 +289,167 @@ class TestBackingChainSecurity(InstarTestBase):
             or 'not found' in combined_output,
             f'Expected path allowlist error: {stdout}{stderr}'
         )
+
+
+class TestBackingPathOracle(InstarTestBase):
+    """A backing reference must not let an image probe the host filesystem.
+
+    A backing reference is image data. If instar gave a different answer
+    depending on whether a path outside the backing allowlist exists, an
+    image could ask "does this host path exist?" and read the reply from
+    the refusal. `info --chain` prints the reason on stderr and can still
+    exit 0, so a service that returns stderr to an uploader would hand
+    over the answer. These tests build each pair of images at runtime,
+    identical except that the path the reference names is present in one
+    host layout and absent in the other, and require the refusals to be
+    byte-identical once the reference and the directory are masked.
+    """
+
+    def make_child(self, directory, reference):
+        """Create `directory/child.qcow2` with the given backing reference."""
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        child = directory / 'child.qcow2'
+        subprocess.run(
+            ['qemu-img', 'create', '-f', 'qcow2', '-u', '-F', 'raw',
+             '-b', reference, str(child), '1M'],
+            capture_output=True, check=True
+        )
+        return child
+
+    def masked(self, text, root, image_dir, reference):
+        """Replace the per-layout strings with placeholders.
+
+        A refusal of a relative reference names the path it resolves to,
+        which is under the temp root, so the root is masked as well.
+        """
+        return (text.replace(str(image_dir), '<DIR>').replace(reference, '<REF>')
+                .replace(str(root), '<ROOT>'))
+
+    def run_pair(self, runner, make_layout):
+        """Run `runner(child)` on a layout with the target present and absent.
+
+        `make_layout(root, present)` returns (child, image_dir, reference).
+        Returns the masked (stdout, stderr, rc) for each layout.
+        """
+        results = []
+        for present in (True, False):
+            with tempfile.TemporaryDirectory() as tmp:
+                child, image_dir, reference = make_layout(Path(tmp), present)
+                stdout, stderr, rc = runner(child)
+                results.append((
+                    self.masked(stdout, tmp, image_dir, reference),
+                    self.masked(stderr, tmp, image_dir, reference),
+                    rc,
+                ))
+        return results
+
+    def absolute_layout(self, root, present):
+        """An absolute reference to a file outside the image's directory."""
+        target = root / 'outside' / 'secret.raw'
+        if present:
+            target.parent.mkdir()
+            target.write_bytes(b'\0' * 4096)
+        image_dir = root / 'images'
+        return self.make_child(image_dir, str(target)), image_dir, str(target)
+
+    def relative_layout(self, root, present):
+        """A `../` reference that leaves the image's directory."""
+        if present:
+            (root / 'secret.raw').write_bytes(b'\0' * 4096)
+        image_dir = root / 'images'
+        reference = '../secret.raw'
+        return self.make_child(image_dir, reference), image_dir, reference
+
+    def assert_same_refusal(self, results, what):
+        (out_present, err_present, rc_present), (out_absent, err_absent, rc_absent) = results
+        self.assertEqual(
+            rc_present, rc_absent,
+            f'{what}: exit status depends on whether the target exists'
+        )
+        self.assertEqual(
+            out_present, out_absent,
+            f'{what}: stdout depends on whether the target exists'
+        )
+        self.assertEqual(
+            err_present, err_absent,
+            f'{what}: stderr depends on whether the target exists'
+        )
+        self.assertIn(
+            'outside', err_present.lower(),
+            f'{what}: expected an allowlist refusal; stderr={err_present!r}'
+        )
+        self.assertNotIn(
+            'not found', err_present.lower(),
+            f'{what}: a missing target must not be reported differently; '
+            f'stderr={err_present!r}'
+        )
+
+    def info_chain(self, child):
+        return self.run_instar_info(child, chain=True)
+
+    def convert_raw(self, child):
+        with tempfile.TemporaryDirectory() as out_dir:
+            return self.run_instar_convert(
+                child, Path(out_dir) / 'out.raw', output_format='raw'
+            )
+
+    def test_absolute_reference_outside_allowlist_is_not_an_oracle(self):
+        """Present and absent absolute targets outside the allowlist look alike."""
+        self.assert_same_refusal(
+            self.run_pair(self.info_chain, self.absolute_layout),
+            'info --chain, absolute reference'
+        )
+
+    def test_relative_escape_is_not_an_oracle(self):
+        """Present and absent `../` targets outside the allowlist look alike."""
+        self.assert_same_refusal(
+            self.run_pair(self.info_chain, self.relative_layout),
+            'info --chain, relative reference'
+        )
+
+    def test_composing_walk_absolute_reference_is_not_an_oracle(self):
+        """`convert` gives the same refusal whether or not the target exists.
+
+        The composing walk resolves references through the same code as
+        `info --chain` but reports them differently and exits non-zero,
+        so the invariant is checked there as well.
+        """
+        self.assert_same_refusal(
+            self.run_pair(self.convert_raw, self.absolute_layout),
+            'convert, absolute reference'
+        )
+
+    def test_composing_walk_relative_escape_is_not_an_oracle(self):
+        """`convert` gives the same refusal for present and absent `../` targets."""
+        self.assert_same_refusal(
+            self.run_pair(self.convert_raw, self.relative_layout),
+            'convert, relative reference'
+        )
+
+    def test_absolute_reference_falls_back_to_name_beside_image(self):
+        """An image built elsewhere still works if its base sits beside it.
+
+        The absolute path is never probed; the file name is tried beside
+        the image instead, and the substitution is announced on stderr so
+        the operator can see the reference was not honoured literally.
+        """
+        reference = '/nonexistent-dir-xyz/base.raw'
+        with tempfile.TemporaryDirectory() as tmp:
+            image_dir = Path(tmp)
+            subprocess.run(
+                ['qemu-img', 'create', '-f', 'raw', str(image_dir / 'base.raw'), '1M'],
+                capture_output=True, check=True
+            )
+            child = self.make_child(image_dir, reference)
+            stdout, stderr, rc = self.run_instar_info(child, chain=True)
+            self.assertEqual(0, rc, f'stdout={stdout!r} stderr={stderr!r}')
+            self.assertIn(
+                f"instar: using 'base.raw' beside the image in place of '{reference}'",
+                stderr
+            )
+            self.assertIn('Chain: 2 image(s)', stdout)
+            self.assertIn(str(image_dir / 'base.raw'), stdout)
 
 
 class TestRawFormatValidation(InstarTestBase):
