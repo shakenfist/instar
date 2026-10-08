@@ -58,14 +58,6 @@ const VHDX_REGION_TABLE_SIG: u32 = 0x69676572;
 // VHDX metadata region GUID: 8b7ca206-4790-4b9a-b8fe-575f050f886e
 // First 4 bytes in little-endian: 0x8b7ca206
 const VHDX_METADATA_GUID_FIRST4: u32 = 0x8b7ca206;
-// VHDX metadata table signature "metadata"
-const VHDX_METADATA_TABLE_SIG: u64 = 0x617461646174656d;
-// Standard metadata item offsets (relative to metadata region)
-// These are defined by the VHDX spec and consistent across implementations
-const VHDX_METADATA_ITEM_OFFSET: u64 = 0x10000; // File Parameters start here
-                                                // Within metadata items:
-                                                // - Offset 0: Block Size (4 bytes LE)
-                                                // - Offset 8: Virtual Disk Size (8 bytes LE)
 
 // VDI header offsets (all little-endian)
 // Note: VDI_SIGNATURE_OFFSET is in shared::format_detection
@@ -497,12 +489,12 @@ pub unsafe extern "C" fn _start() -> u64 {
             let mut backing_file_buf = [0u8; MAX_BACKING_FILE_LEN + 1];
 
             if detailed {
-                parse_vhdx_metadata(&mut result, device_capacity, call_table);
-
-                if detect_vhdx_parent_backing_file(
+                if parse_vhdx_metadata(
+                    &mut result,
                     call_table,
                     input_sector_size,
                     input_capacity,
+                    device_capacity,
                     &mut backing_file_buf,
                 ) {
                     result.flags |= InfoResult::FLAG_HAS_BACKING_FILE;
@@ -921,34 +913,23 @@ unsafe fn parse_vhd_parent_name(
     shared::decode_utf16_field_nul_terminated(name_bytes, true, backing_file_buf)
 }
 
-/// Parse VHDX metadata to extract virtual size and block size (cluster_size)
+/// Find the VHDX metadata region's file offset and declared length.
 ///
-/// VHDX format stores metadata in a separate region. The layout is:
-/// - Region Table at 0x30000 (192KB) - contains region entries with GUIDs and offsets
-/// - Metadata Region (offset from region table) - contains metadata table and items
-/// - Metadata items include File Parameters (block size) and Virtual Disk Size
-unsafe fn parse_vhdx_metadata(
-    result: &mut InfoResult,
-    device_capacity: u64,
+/// Scans the region table at 0x30000 for the metadata region GUID. The
+/// length is the region table entry's Length (entry offset `+24`,
+/// SPEC(VHDX) 2.4.3), which `vhdx::parse_metadata` uses to bound the
+/// parent locator item; see its doc comment.
+unsafe fn locate_vhdx_metadata_region(
     call_table: &CallTable,
-) {
-    let input_sector_size = (call_table.get_input_sector_size)(0);
+    sector_size: usize,
+) -> Option<(u64, u32)> {
     let mut buffer = [0u8; MAX_SECTOR_SIZE];
 
-    // Step 1: Read region table at offset 0x30000 to find metadata region offset
-    let region_table_sector = VHDX_REGION_TABLE_OFFSET / input_sector_size as u64;
-    let region_table_offset_in_sector =
-        (VHDX_REGION_TABLE_OFFSET % input_sector_size as u64) as usize;
+    let region_table_sector = VHDX_REGION_TABLE_OFFSET / sector_size as u64;
+    let region_table_offset_in_sector = (VHDX_REGION_TABLE_OFFSET % sector_size as u64) as usize;
 
-    if !(call_table.read_input_sector)(
-        0,
-        region_table_sector,
-        buffer.as_mut_ptr(),
-        input_sector_size,
-    ) {
-        // Failed to read region table, fall back to actual size
-        result.virtual_size = device_capacity;
-        return;
+    if !(call_table.read_input_sector)(0, region_table_sector, buffer.as_mut_ptr(), sector_size) {
+        return None;
     }
 
     // Verify region table signature "regi" (0x69676572 in little-endian)
@@ -960,8 +941,7 @@ unsafe fn parse_vhdx_metadata(
     ]);
     if region_sig != VHDX_REGION_TABLE_SIG {
         (call_table.debug_print)(b"info: VHDX bad region sig\n\0".as_ptr());
-        result.virtual_size = device_capacity;
-        return;
+        return None;
     }
 
     // Entry count at offset 8 (little-endian u32)
@@ -974,185 +954,8 @@ unsafe fn parse_vhdx_metadata(
 
     // Search for metadata region entry (GUID starts with 0x8b7ca206)
     // Each entry is 32 bytes starting at offset 16
-    let mut metadata_region_offset: u64 = 0;
     for i in 0..entry_count.min(8) {
         // Limit to 8 entries for safety
-        let entry_offset = region_table_offset_in_sector + 16 + (i as usize * 32);
-        if entry_offset + 32 > input_sector_size {
-            break;
-        }
-
-        // Check first 4 bytes of GUID (little-endian)
-        let guid_first4 = u32::from_le_bytes([
-            buffer[entry_offset],
-            buffer[entry_offset + 1],
-            buffer[entry_offset + 2],
-            buffer[entry_offset + 3],
-        ]);
-
-        if guid_first4 == VHDX_METADATA_GUID_FIRST4 {
-            // Found metadata region - get file offset at entry offset + 16
-            metadata_region_offset = u64::from_le_bytes([
-                buffer[entry_offset + 16],
-                buffer[entry_offset + 17],
-                buffer[entry_offset + 18],
-                buffer[entry_offset + 19],
-                buffer[entry_offset + 20],
-                buffer[entry_offset + 21],
-                buffer[entry_offset + 22],
-                buffer[entry_offset + 23],
-            ]);
-            break;
-        }
-    }
-
-    if metadata_region_offset == 0 {
-        (call_table.debug_print)(b"info: VHDX no metadata region\n\0".as_ptr());
-        result.virtual_size = device_capacity;
-        return;
-    }
-
-    // Step 2: Read metadata table to verify and locate items
-    let metadata_table_sector = metadata_region_offset / input_sector_size as u64;
-    let metadata_table_offset_in_sector =
-        (metadata_region_offset % input_sector_size as u64) as usize;
-
-    if !(call_table.read_input_sector)(
-        0,
-        metadata_table_sector,
-        buffer.as_mut_ptr(),
-        input_sector_size,
-    ) {
-        result.virtual_size = device_capacity;
-        return;
-    }
-
-    // Verify metadata table signature "metadata" (0x617461646174656d in little-endian)
-    let metadata_sig = u64::from_le_bytes([
-        buffer[metadata_table_offset_in_sector],
-        buffer[metadata_table_offset_in_sector + 1],
-        buffer[metadata_table_offset_in_sector + 2],
-        buffer[metadata_table_offset_in_sector + 3],
-        buffer[metadata_table_offset_in_sector + 4],
-        buffer[metadata_table_offset_in_sector + 5],
-        buffer[metadata_table_offset_in_sector + 6],
-        buffer[metadata_table_offset_in_sector + 7],
-    ]);
-    if metadata_sig != VHDX_METADATA_TABLE_SIG {
-        (call_table.debug_print)(b"info: VHDX bad metadata sig\n\0".as_ptr());
-        result.virtual_size = device_capacity;
-        return;
-    }
-
-    // Step 3: Read metadata items at standard offset (metadata_region + 0x10000)
-    // The File Parameters and Virtual Disk Size items are at fixed offsets in the items area
-    let metadata_items_offset = metadata_region_offset + VHDX_METADATA_ITEM_OFFSET;
-    let metadata_items_sector = metadata_items_offset / input_sector_size as u64;
-    let metadata_items_offset_in_sector =
-        (metadata_items_offset % input_sector_size as u64) as usize;
-
-    if !(call_table.read_input_sector)(
-        0,
-        metadata_items_sector,
-        buffer.as_mut_ptr(),
-        input_sector_size,
-    ) {
-        result.virtual_size = device_capacity;
-        return;
-    }
-
-    // File Parameters: Block Size at offset 0 (little-endian u32)
-    let block_size = u32::from_le_bytes([
-        buffer[metadata_items_offset_in_sector],
-        buffer[metadata_items_offset_in_sector + 1],
-        buffer[metadata_items_offset_in_sector + 2],
-        buffer[metadata_items_offset_in_sector + 3],
-    ]);
-    result.cluster_size = block_size;
-
-    // Virtual Disk Size at offset 8 (little-endian u64)
-    let virtual_size = u64::from_le_bytes([
-        buffer[metadata_items_offset_in_sector + 8],
-        buffer[metadata_items_offset_in_sector + 9],
-        buffer[metadata_items_offset_in_sector + 10],
-        buffer[metadata_items_offset_in_sector + 11],
-        buffer[metadata_items_offset_in_sector + 12],
-        buffer[metadata_items_offset_in_sector + 13],
-        buffer[metadata_items_offset_in_sector + 14],
-        buffer[metadata_items_offset_in_sector + 15],
-    ]);
-    result.virtual_size = virtual_size;
-
-    (call_table.verbose_print)(b"info: VHDX parsed ok\n\0".as_ptr());
-}
-
-/// Detect a differencing VHDX's parent and decode a path from its parent
-/// locator into `backing_file_buf` as NUL-terminated UTF-8.
-///
-/// Locates the metadata region the same way `parse_vhdx_metadata` above
-/// does (a region-table scan for the metadata region GUID), but then
-/// hands off to `vhdx::parse_metadata` for the metadata-table walk and
-/// the parent-locator staging/decoding, rather than re-deriving that
-/// logic locally: unlike the "standard offset" shortcut
-/// `parse_vhdx_metadata` uses for virtual_size/cluster_size, the parent
-/// locator's UTF-16LE key/value decoding and its bounds checking against
-/// the metadata region are security-sensitive and already fuzzed as part
-/// of `crates/vhdx` (differencing phase 3) -- not worth a second,
-/// divergent implementation. See
-/// `docs/plans/PLAN-differencing-phase-04-read-policy.md` decision 4.
-///
-/// This only locates the metadata region for itself; it never writes to
-/// `result`, so a failure here can never change what `info` already
-/// reports for a non-differencing VHDX.
-///
-/// Returns true (and fills `backing_file_buf`) only for an image that
-/// both claims a parent (`HasParent`) and carries a locator this parser
-/// could stage and decode a path out of. Anything short of that -- no
-/// parent, an absent or unreadable locator item, or a locator with none
-/// of `relative_path`/`absolute_win32_path`/`volume_path` set -- reports
-/// nothing, never a refusal (decision 4).
-unsafe fn detect_vhdx_parent_backing_file(
-    call_table: &CallTable,
-    sector_size: usize,
-    input_capacity: u64,
-    backing_file_buf: &mut [u8; MAX_BACKING_FILE_LEN + 1],
-) -> bool {
-    if sector_size == 0 || sector_size > MAX_SECTOR_SIZE {
-        return false;
-    }
-
-    let mut buffer = [0u8; MAX_SECTOR_SIZE];
-
-    // Step 1: region table -> metadata region's file offset and length.
-    let region_table_sector = VHDX_REGION_TABLE_OFFSET / sector_size as u64;
-    let region_table_offset_in_sector = (VHDX_REGION_TABLE_OFFSET % sector_size as u64) as usize;
-
-    if !(call_table.read_input_sector)(0, region_table_sector, buffer.as_mut_ptr(), sector_size) {
-        return false;
-    }
-
-    let region_sig = u32::from_le_bytes([
-        buffer[region_table_offset_in_sector],
-        buffer[region_table_offset_in_sector + 1],
-        buffer[region_table_offset_in_sector + 2],
-        buffer[region_table_offset_in_sector + 3],
-    ]);
-    if region_sig != VHDX_REGION_TABLE_SIG {
-        return false;
-    }
-
-    let entry_count = u32::from_le_bytes([
-        buffer[region_table_offset_in_sector + 8],
-        buffer[region_table_offset_in_sector + 9],
-        buffer[region_table_offset_in_sector + 10],
-        buffer[region_table_offset_in_sector + 11],
-    ]);
-
-    let mut metadata_region_offset: u64 = 0;
-    let mut metadata_region_length: u32 = 0;
-    let mut found_metadata = false;
-    for i in 0..entry_count.min(8) {
-        // Limit to 8 entries for safety, matching parse_vhdx_metadata above.
         let entry_offset = region_table_offset_in_sector + 16 + (i as usize * 32);
         if entry_offset + 32 > sector_size {
             break;
@@ -1164,38 +967,81 @@ unsafe fn detect_vhdx_parent_backing_file(
             buffer[entry_offset + 2],
             buffer[entry_offset + 3],
         ]);
+        if guid_first4 != VHDX_METADATA_GUID_FIRST4 {
+            continue;
+        }
 
-        if guid_first4 == VHDX_METADATA_GUID_FIRST4 {
-            metadata_region_offset = u64::from_le_bytes([
-                buffer[entry_offset + 16],
-                buffer[entry_offset + 17],
-                buffer[entry_offset + 18],
-                buffer[entry_offset + 19],
-                buffer[entry_offset + 20],
-                buffer[entry_offset + 21],
-                buffer[entry_offset + 22],
-                buffer[entry_offset + 23],
-            ]);
-            // Region table entry Length, at entry offset +24 (SPEC(VHDX)
-            // 2.4.3). Bounds the parent locator item against the region
-            // it actually lives in; see vhdx::parse_metadata's doc comment.
-            metadata_region_length = u32::from_le_bytes([
-                buffer[entry_offset + 24],
-                buffer[entry_offset + 25],
-                buffer[entry_offset + 26],
-                buffer[entry_offset + 27],
-            ]);
-            found_metadata = true;
+        let metadata_region_offset = u64::from_le_bytes([
+            buffer[entry_offset + 16],
+            buffer[entry_offset + 17],
+            buffer[entry_offset + 18],
+            buffer[entry_offset + 19],
+            buffer[entry_offset + 20],
+            buffer[entry_offset + 21],
+            buffer[entry_offset + 22],
+            buffer[entry_offset + 23],
+        ]);
+        let metadata_region_length = u32::from_le_bytes([
+            buffer[entry_offset + 24],
+            buffer[entry_offset + 25],
+            buffer[entry_offset + 26],
+            buffer[entry_offset + 27],
+        ]);
+        if metadata_region_offset == 0 {
             break;
         }
+        return Some((metadata_region_offset, metadata_region_length));
     }
 
-    if !found_metadata || metadata_region_offset == 0 {
+    (call_table.debug_print)(b"info: VHDX no metadata region\n\0".as_ptr());
+    None
+}
+
+/// Parse VHDX metadata into `result` (virtual size and block size as
+/// `cluster_size`), and report the image's parent if it has one.
+///
+/// Every item is read through `vhdx::parse_metadata`, which finds it
+/// by GUID in the metadata table. SPEC(VHDX) 2.6.1.2 gives metadata
+/// items no fixed order or position, so reading them at the offsets
+/// qemu and instar's own `create` happen to use would report the wrong
+/// size, without any error, for an image laid out any other way. The
+/// same parser validates the block size, so a nonsensical one is never
+/// reported.
+///
+/// Metadata that cannot be located or parsed leaves `cluster_size` at
+/// 0 and reports the device capacity as the virtual size.
+///
+/// Returns true (and fills `backing_file_buf`) only for an image that
+/// both claims a parent (`HasParent`) and carries a locator the parser
+/// could stage and decode a path out of. Anything short of that -- no
+/// parent, an absent or unreadable locator item, or a locator with none
+/// of `relative_path`/`absolute_win32_path`/`volume_path` set -- reports
+/// no parent, never a refusal. The locator's UTF-16LE key/value
+/// decoding and its bounds checking against the metadata region are
+/// security-sensitive and fuzzed as part of `crates/vhdx`, which is why
+/// none of it is re-derived here.
+unsafe fn parse_vhdx_metadata(
+    result: &mut InfoResult,
+    call_table: &CallTable,
+    sector_size: usize,
+    input_capacity: u64,
+    device_capacity: u64,
+    backing_file_buf: &mut [u8; MAX_BACKING_FILE_LEN + 1],
+) -> bool {
+    if sector_size == 0 || sector_size > MAX_SECTOR_SIZE {
+        result.virtual_size = device_capacity;
         return false;
     }
 
-    // Step 2: hand off to crates/vhdx for the metadata table walk, the
-    // File Parameters HasParent flag, and the parent locator itself.
+    let (metadata_region_offset, metadata_region_length) =
+        match locate_vhdx_metadata_region(call_table, sector_size) {
+            Some(region) => region,
+            None => {
+                result.virtual_size = device_capacity;
+                return false;
+            }
+        };
+
     let mut bytes_read: u64 = 0;
     let metadata = match vhdx::parse_metadata(
         call_table,
@@ -1207,8 +1053,16 @@ unsafe fn detect_vhdx_parent_backing_file(
         &mut bytes_read,
     ) {
         Some(m) => m,
-        None => return false,
+        None => {
+            (call_table.debug_print)(b"info: VHDX metadata invalid\n\0".as_ptr());
+            result.virtual_size = device_capacity;
+            return false;
+        }
     };
+
+    result.cluster_size = metadata.block_size;
+    result.virtual_size = metadata.virtual_disk_size;
+    (call_table.verbose_print)(b"info: VHDX parsed ok\n\0".as_ptr());
 
     if !metadata.has_parent {
         return false;

@@ -12,6 +12,8 @@ qemu-img does not need to be installed.
 import json
 import os
 import shutil
+import struct
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -346,3 +348,139 @@ class TestInfoChainJsonOutput(InstarTestBase):
             '      cluster size: 2097152 bytes\n'
         )
         self.assertEqual(expected, stdout)
+
+
+# VHDX region table at 192 KiB: a 16-byte header ('regi', checksum,
+# entry count, reserved) then 32-byte entries of (GUID, file offset
+# u64, length u32, required u32). The metadata table at the start of
+# the metadata region: a 32-byte header ('metadata', reserved, entry
+# count u16 at +10) then 32-byte entries of (item GUID, offset u32
+# relative to the region, length u32, flags u32, reserved).
+_VHDX_REGION_TABLE_OFFSET = 192 * 1024
+_VHDX_TABLE_HEADER_SIZE = 16
+_VHDX_METADATA_TABLE_HEADER_SIZE = 32
+_VHDX_TABLE_ENTRY_SIZE = 32
+# GUIDs stored mixed-endian: the first three groups little-endian, the
+# last eight bytes as written.
+_VHDX_METADATA_REGION_GUID = (struct.pack('<IHH', 0x8B7CA206, 0x4790, 0x4B9A)
+                              + bytes.fromhex('B8FE575F050F886E'))
+_VHDX_FILE_PARAMETERS_GUID = (struct.pack('<IHH', 0xCAA16737, 0xFA36, 0x4D43)
+                              + bytes.fromhex('B3B633F0AA44E76B'))
+_VHDX_VIRTUAL_DISK_SIZE_GUID = (struct.pack('<IHH', 0x2FA54224, 0xCD1B, 0x4876)
+                                + bytes.fromhex('B2115DBED83BF4B8'))
+
+
+def _vhdx_swap_file_parameters_and_virtual_disk_size(path):
+    """Swap where the File Parameters and Virtual Disk Size items live.
+
+    Both items are 8 bytes, so swapping their contents and the offsets
+    their metadata table entries give leaves a valid image: SPEC(VHDX)
+    2.6.1.2 places no order on metadata items, and the metadata table
+    carries no checksum. A reader that walks the table sees the same
+    image as before; one that assumes File Parameters sits first, with
+    Virtual Disk Size straight after it, reads each item as the other.
+    """
+    data = bytearray(Path(path).read_bytes())
+
+    table = _VHDX_REGION_TABLE_OFFSET
+    if data[table:table + 4] != b'regi':
+        raise AssertionError('no VHDX region table')
+    region = None
+    for i in range(struct.unpack_from('<I', data, table + 8)[0]):
+        at = table + _VHDX_TABLE_HEADER_SIZE + i * _VHDX_TABLE_ENTRY_SIZE
+        if data[at:at + 16] == _VHDX_METADATA_REGION_GUID:
+            region = struct.unpack_from('<Q', data, at + 16)[0]
+            break
+    if region is None:
+        raise AssertionError('no metadata region entry in the region table')
+    if data[region:region + 8] != b'metadata':
+        raise AssertionError('no VHDX metadata table')
+
+    entries = {}
+    for i in range(struct.unpack_from('<H', data, region + 10)[0]):
+        at = region + _VHDX_METADATA_TABLE_HEADER_SIZE + i * _VHDX_TABLE_ENTRY_SIZE
+        entries[bytes(data[at:at + 16])] = at
+    fp_entry = entries[_VHDX_FILE_PARAMETERS_GUID]
+    vds_entry = entries[_VHDX_VIRTUAL_DISK_SIZE_GUID]
+
+    fp_offset = struct.unpack_from('<I', data, fp_entry + 16)[0]
+    vds_offset = struct.unpack_from('<I', data, vds_entry + 16)[0]
+    fp_item = bytes(data[region + fp_offset:region + fp_offset + 8])
+    vds_item = bytes(data[region + vds_offset:region + vds_offset + 8])
+
+    data[region + fp_offset:region + fp_offset + 8] = vds_item
+    data[region + vds_offset:region + vds_offset + 8] = fp_item
+    struct.pack_into('<I', data, fp_entry + 16, vds_offset)
+    struct.pack_into('<I', data, vds_entry + 16, fp_offset)
+    Path(path).write_bytes(bytes(data))
+
+
+class TestInfoVhdxMetadataLayout(InstarTestBase):
+    """`info` finds VHDX metadata items through the metadata table.
+
+    SPEC(VHDX) 2.6.1.2 gives metadata items no fixed order or position.
+    qemu and instar's own `create` both put File Parameters first with
+    Virtual Disk Size straight after it, which is why reading them at
+    those fixed offsets went unnoticed: every fixture uses that layout.
+    These tests move the items, so a fixed-offset reader reports the
+    block size as the virtual size and the other way round, and exits 0.
+    """
+
+    VIRTUAL_SIZE = 100 * 1024 * 1024
+
+    def _create(self, *args, cwd):
+        instar = self.get_instar_binary()
+        r = subprocess.run([str(instar), 'create', *args], capture_output=True,
+                           text=True, timeout=60, cwd=cwd)
+        self.assertEqual(0, r.returncode, f'create {args} failed: {r.stderr}')
+
+    def _info_json(self, path):
+        stdout, stderr, rc = self.run_instar_info(path, output_format='json')
+        self.assertEqual(0, rc, f'info on {path} failed: stderr={stderr!r}')
+        return json.loads(stdout)
+
+    def test_moved_items_report_the_same_sizes(self):
+        """Swapping the two items changes nothing `info` reports."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'moved.vhdx'
+            self._create('-f', 'vhdx', str(path), str(self.VIRTUAL_SIZE), cwd=td)
+            before = self._info_json(path)
+            self.assertEqual(self.VIRTUAL_SIZE, before['virtual-size'])
+
+            _vhdx_swap_file_parameters_and_virtual_disk_size(path)
+            after = self._info_json(path)
+            self.assertEqual(self.VIRTUAL_SIZE, after['virtual-size'])
+            self.assertEqual(before['cluster-size'], after['cluster-size'])
+
+    def test_moved_items_match_qemu_img(self):
+        """qemu-img walks the metadata table too, and agrees."""
+        self._require_qemu_img()
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'moved.vhdx'
+            self._create('-f', 'vhdx', str(path), str(self.VIRTUAL_SIZE), cwd=td)
+            _vhdx_swap_file_parameters_and_virtual_disk_size(path)
+
+            r = subprocess.run(['qemu-img', 'info', '--output', 'json', str(path)],
+                               capture_output=True, text=True, timeout=30)
+            self.assertEqual(0, r.returncode, f'qemu-img info failed: {r.stderr}')
+            qemu = json.loads(r.stdout)
+            ours = self._info_json(path)
+            for key in ('virtual-size', 'cluster-size'):
+                self.assertEqual(qemu[key], ours[key], f'{key} differs from qemu-img')
+
+    def test_moved_items_in_a_differencing_child(self):
+        """A child with moved items still reports its size and parent.
+
+        The parent reference and the sizes come from one metadata parse,
+        so this pins that moving the items breaks neither.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            self._create('-f', 'vhdx', 'parent.vhdx', str(self.VIRTUAL_SIZE), cwd=td)
+            self._create('-f', 'vhdx', '-b', 'parent.vhdx', '-F', 'vhdx',
+                         'child.vhdx', cwd=td)
+            child = Path(td) / 'child.vhdx'
+            _vhdx_swap_file_parameters_and_virtual_disk_size(child)
+
+            info = self._info_json(child)
+            self.assertEqual(self.VIRTUAL_SIZE, info['virtual-size'])
+            self.assertEqual('parent.vhdx', info.get('backing-filename'))
