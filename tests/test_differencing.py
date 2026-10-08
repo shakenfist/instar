@@ -81,6 +81,11 @@ The classes are:
   op-consistency half: one VHDX whose BAT names a block inside the
   image's own structure, and the one answer `convert`, `map`,
   `measure` and `check` must give about it.
+* `TestDifferencingCommitDoesNotOpenTheAncestor` -- `commit` never
+  resolves a differencing parent sitting further back in the
+  backing's own chain: committing through one gives the right
+  content, and still succeeds when that parent is missing
+  altogether.
 * `TestDifferencingConvertLeavesNoOutput` -- issue #547's core.
 * `TestDifferencingDdMatchesConvert` -- the only record in the tree
   that `dd` and `convert` share a guest binary.
@@ -1799,6 +1804,205 @@ class TestDifferencingNonComposingRefusalPolicy(DifferencingTestBase):
                 )
 
 
+class TestDifferencingCommitDoesNotOpenTheAncestor(DifferencingTestBase):
+    """`commit` never resolves a differencing parent further back in the
+    backing's own chain. That was settled in the code and its comment
+    when the composing operations were rolled out, and shipped with no
+    test at all.
+
+    `run_commit` passes `DifferencingComposition::Unsupported` to the
+    host's chain walk when it discovers the backing's own ancestors,
+    under a comment saying the guest reads only the overlay (input slot
+    0) and the backing (the output device) and ignores whatever ancestor
+    devices the host attaches beyond those -- confirmed on the guest side
+    too: every `read_input_byte_range` / `write_input_byte_range` call in
+    `src/operations/commit/src/main.rs` passes device index 0, and
+    nothing in the file ever reads `config.backing_chain_first` or
+    `config.backing_chain_count`. So a differencing parent is never data
+    `commit` would read, and resolving one could only turn a command that
+    works today into a path error the day its own parent happens to be
+    missing.
+
+    `commit` itself refuses any overlay that is not qcow2 or vmdk, and
+    the backing being committed into is the operation's output, so a
+    differencing VHD or VHDX can only ever appear *behind* the backing --
+    as the backing's own parent, which is the chain position attached
+    here. Getting a real differencing fixture into that position needs
+    the same move `TestDifferencingRebaseThroughChain` uses: `instar
+    create -b` refuses a differencing base directly, and qemu's own
+    VPC/VHDX readers cannot open either differencing fixture well enough
+    to validate one as a target of their own `-b`, so the backing is
+    built standalone and then given the reference with an unsafe `-u`
+    rebase, which writes the pointer without opening what it names.
+    """
+
+    #: One cluster the overlay owns outright, away from either fixture's
+    #: own probe sectors, so the patched expectation cannot collide with
+    #: content the chain already varies by position.
+    OVERLAY_OFFSET = 0x200000
+    OVERLAY_LENGTH = 0x10000
+    OVERLAY_BYTE = 0x5a
+
+    def _build_chain(self, tmp, image_id, with_grandparent):
+        """Build `overlay.qcow2` -> `mid.qcow2` -> the differencing
+        fixture named by `image_id` [-> its own parent].
+
+        `with_grandparent` selects whether the differencing fixture's own
+        parent is copied in beside it. Returns `(overlay, mid)`.
+
+        The differencing fixture is attached to `mid` as the very last
+        step, after the overlay's own cluster is written. qemu's VPC and
+        VHDX drivers cannot open a differencing child at all (an open,
+        not merely a read, since even `-u`'s own target needs to open
+        cleanly): writing through `overlay -> mid` with `qemu-io` opens
+        both devices in the chain, so that write has to happen while
+        `mid` is still backing-less and only gains the differencing
+        parent afterwards, via an unsafe `-u` rebase that writes the
+        reference without opening what it names.
+        """
+        tmp = Path(tmp)
+
+        mid = tmp / 'mid.qcow2'
+        self._run_tool(
+            ['qemu-img', 'create', '-f', 'qcow2', str(mid),
+             str(IMAGE_VIRTUAL_SIZE)],
+            tmp,
+        )
+
+        overlay = tmp / 'overlay.qcow2'
+        instar = self.get_instar_binary()
+        r = subprocess.run(
+            [str(instar), 'create', '-f', 'qcow2', '-b', mid.name, '-F',
+             'qcow2', str(overlay), str(IMAGE_VIRTUAL_SIZE)],
+            capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(
+            0, r.returncode,
+            f'{image_id}: building the overlay: {r.stderr!r}'
+        )
+
+        self._run_tool(
+            ['qemu-io', '-c',
+             f'write -P 0x{self.OVERLAY_BYTE:02x} '
+             f'0x{self.OVERLAY_OFFSET:x} 0x{self.OVERLAY_LENGTH:x}',
+             str(overlay)],
+            tmp,
+        )
+
+        if with_grandparent:
+            child = self.chain_copy(image_id, tmp)
+        else:
+            source = self.differencing_image(image_id)
+            child = tmp / source.name
+            shutil.copy2(source, child)
+
+        self._run_tool(
+            ['qemu-img', 'rebase', '-u', '-b', child.name, '-F',
+             CHAIN_FIXTURE_FORMAT[image_id], str(mid)],
+            tmp,
+        )
+        return overlay, mid
+
+    def test_commit_through_a_differencing_ancestor_matches_the_recorded_composition(self):
+        """Committing into a backing whose own parent is a real
+        differencing chain writes the right bytes into that backing.
+
+        An exit-code assertion alone would pass just as well if the
+        ancestor had been resolved and silently composed into the
+        commit, which is exactly the thing the `Unsupported` decision
+        rules out -- so this reads the backing back through its own
+        composition and compares the whole file to the recorded
+        composition with the overlay's committed cluster patched in,
+        the same whole-file standard `TestDifferencingComposition` and
+        `TestDifferencingRebaseThroughChain` hold the reader to.
+        """
+        self._require_qemu_tools()
+        for image_id, golden_id, _format_name in COMPOSED_CHAIN_FIXTURES:
+            with self.subTest(image=image_id):
+                golden = self.composed_golden(golden_id)
+                with tempfile.TemporaryDirectory() as tmp:
+                    overlay, mid = self._build_chain(
+                        tmp, image_id, with_grandparent=True
+                    )
+                    stdout, stderr, rc = self.run_instar_commit(overlay)
+                    self.assertEqual(
+                        0, rc,
+                        f'{image_id}: commit must succeed with a '
+                        f'differencing ancestor further back in the '
+                        f'chain; stdout={stdout[:400]!r} '
+                        f'stderr={stderr[:400]!r}'
+                    )
+                    self.assertIn(
+                        'Image committed.', stdout,
+                        f'{image_id}: stdout={stdout!r}'
+                    )
+
+                    out = Path(tmp) / 'flattened.raw'
+                    c_stdout, c_stderr, c_rc = self.run_instar_convert(
+                        mid, out, output_format='raw'
+                    )
+                    self.assertEqual(
+                        0, c_rc,
+                        f'{image_id}: reading the committed-into backing '
+                        f'back failed; stdout={c_stdout[:400]!r} '
+                        f'stderr={c_stderr[:400]!r}'
+                    )
+
+                    expected = Path(tmp) / 'expected.raw'
+                    data = bytearray(golden.read_bytes())
+                    self.assertEqual(
+                        IMAGE_VIRTUAL_SIZE, len(data),
+                        'the recorded composition is not the size this '
+                        'test assumes'
+                    )
+                    end = self.OVERLAY_OFFSET + self.OVERLAY_LENGTH
+                    data[self.OVERLAY_OFFSET:end] = bytes(
+                        [self.OVERLAY_BYTE] * self.OVERLAY_LENGTH
+                    )
+                    expected.write_bytes(bytes(data))
+
+                    self.assert_bytes_identical(
+                        out, expected,
+                        f'{image_id} (commit through a differencing '
+                        f'ancestor)'
+                    )
+
+    def test_commit_succeeds_when_the_differencing_ancestors_parent_is_absent(self):
+        """Commit still succeeds when the differencing ancestor's own
+        parent cannot be found anywhere.
+
+        This is the specific property the `Unsupported` decision buys:
+        the host's chain walk stops at the differencing ancestor itself
+        without ever trying to resolve what is behind it, so whether
+        that file exists cannot affect commit at all. A regression to
+        `DifferencingComposition::Supported` would make the walk try to
+        resolve it, turning this into a path error during host-side
+        chain discovery, before KVM is even opened -- which is what
+        `tools/mutate-differencing.sh`'s
+        `commit-host-capability-reverted-to-supported` case flips to
+        confirm this test would actually notice.
+        """
+        self._require_qemu_tools()
+        for image_id, _golden_id, _format_name in COMPOSED_CHAIN_FIXTURES:
+            with self.subTest(image=image_id):
+                with tempfile.TemporaryDirectory() as tmp:
+                    overlay, _mid = self._build_chain(
+                        tmp, image_id, with_grandparent=False
+                    )
+                    stdout, stderr, rc = self.run_instar_commit(overlay)
+                    self.assertEqual(
+                        0, rc,
+                        f'{image_id}: commit must succeed even though '
+                        f'the differencing ancestor\'s own parent is '
+                        f'absent, since commit never opens it; '
+                        f'stdout={stdout[:400]!r} stderr={stderr[:400]!r}'
+                    )
+                    self.assertIn(
+                        'Image committed.', stdout,
+                        f'{image_id}: stdout={stdout!r}'
+                    )
+
+
 class TestVhdxBlockOffsetsNamingTheImagesOwnStructure(DifferencingTestBase):
     """One malformed VHDX, four operations, one answer.
 
@@ -2484,7 +2688,7 @@ class TestDifferencingInfoReports(DifferencingTestBase):
     `info` composes nothing, so it has no wrong answer to give, and
     refusing would remove the only way to inspect an image the rest of
     the tool declines to read -- which is precisely when a user needs
-    it. Decision 4 of the phase plan.
+    it.
     """
 
     def test_info_human_reports_the_parent(self):
@@ -3456,18 +3660,18 @@ class TestDifferencingLibvhdiOracle(DifferencingTestBase):
     field written into the wrong offset, or under the wrong key, is
     read back from the wrong offset and agrees with itself.
 
-    libvhdi is the external oracle PLAN-differencing.md picked for
-    exactly this, because qemu-img cannot serve: qemu-img reads a
+    libvhdi is the external oracle picked for exactly this, because
+    qemu-img cannot serve: qemu-img reads a
     differencing child as though the parent were absent, so it has no
     opinion about which parent the child names. `vhdiinfo` does, and it
     resolves a VHD parent through the *parent unicode name* field and a
     VHDX parent through the parent identity, which are the two things
     the emitter has to get right.
 
-    Scope, deliberately narrow (PLAN-differencing.md decision 1):
-    **structure only**. Nothing here reads composed image content --
-    whether instar assembles a chain the way libvhdi does is phase 15's
-    question and cannot be asked before instar can compose at all. The
+    Scope, deliberately narrow: **structure only**. Nothing here reads
+    composed image content -- whether instar assembles a chain the way
+    libvhdi does is a separate question, and one that could not be
+    asked at all until instar could compose a chain. The
     split also falls on a real seam: the fields below never reach
     libvhdi's VHD sector-bitmap decoder, which is where the known
     oracle defect (defect A, see tests/manifest.json on

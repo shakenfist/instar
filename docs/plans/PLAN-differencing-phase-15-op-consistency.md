@@ -346,11 +346,32 @@ is stripped: zero non-comment `PLAN-*.md` references in `src/`.
 * `make test-rust` passes with zero failures and the count is
   stated, against the 2450 phase 14 measured.
 * `pre-commit run --all-files` is clean.
-* No source file or comment added by this phase cites a plan phase,
-  step or decision number, and no user-visible string contains
-  `PLAN-`. Falsifiable, with the prefix stripped:
-  `git diff 7fef1321..HEAD -- 'src/*' | grep '^+' | grep -iE 'PLAN-[a-z0-9-]+\.md|decision [0-9]|phase 1[0-9]|15[a-f]'`
-  is empty.
+* Nothing this phase adds cites a plan file, phase, step or decision
+  number, and no user-visible string contains `PLAN-`. The check spans
+  `tests/` and `tools/` as well as `src/`: an earlier draft of this
+  criterion covered only `src/`, and a test docstring added by 15e
+  duly cited "phase 14" where the criterion could not see it.
+
+  ```
+  git diff 7fef1321..HEAD -- 'src/*' 'tests/*' 'tools/*' \
+    | grep '^+' \
+    | grep -iE 'PLAN-[a-z0-9-]+\.md|decision [0-9]|phase 1[0-9]|\b15[a-f]\b'
+  ```
+
+  The step-letter alternative needs its word boundaries: without
+  them it matches `15e9` inside the BAT region GUID a 15b test
+  spells out in hex.
+
+  is empty. `docs/plans/` is deliberately out of scope -- plan files
+  cite each other by design.
+
+* `tests/test_differencing.py` cites no plan file, phase or decision
+  number at all, not merely none added by this phase. Falsifiable:
+  `grep -cE 'Decision [0-9]|decision [0-9]|PLAN-[a-z0-9-]+\.md|phase 1[0-9]|phase plan' tests/test_differencing.py`
+  returns 0. Four such references predated this phase, one of which --
+  "whether instar assembles a chain the way libvhdi does is phase 15's
+  question" -- this phase's own rescoping made false, so correcting
+  them is this phase's business rather than tidying.
 * `docs/quirks.md` states the five-compose / three-report boundary
   with a reason per operation, and #641, #642 and #643 are linked
   from the pages that describe the limitation they would close.

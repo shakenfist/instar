@@ -682,7 +682,7 @@ self_test() {
 # phase's definition of done asks the two to stay in step, which until
 # now was a promise kept by hand. Asserting it makes the drift a
 # failure instead of a documentation bug nobody reads.
-EXPECTED_CASES=100
+EXPECTED_CASES=101
 
 check_case_count() {
     # Only meaningful for a whole run; a selection is expected to be short.
@@ -1877,6 +1877,36 @@ integration_case 'rebase-differencing-refusal-call-site-removed' "${VMM_MAIN}" \
     }' \
     '    // MUTATED: differencing_refusal_error call site removed' \
     "${REBASE_REFUSAL}"
+
+# commit's own discovery call, for its backing's own ancestor chain,
+# reverted the other way: `Unsupported` is the one that is correct here
+# (commit's guest reads only the overlay and the backing and ignores
+# whatever ancestor devices the host attaches beyond those), and
+# flipping it to `Supported` makes the host try to resolve a
+# differencing ancestor's own parent instead of recording it
+# unresolved. The fixture that notices has that parent missing on
+# purpose, so the mutated walk fails during host-side chain discovery,
+# before KVM is even opened, where the unmutated walk never looked for
+# it at all.
+COMMIT_ANCESTOR='test_differencing.TestDifferencingCommitDoesNotOpenTheAncestor'
+COMMIT_ANCESTOR_ABSENT="${COMMIT_ANCESTOR}.test_commit_succeeds_when_the_differencing_ancestors_parent_is_absent"
+
+integration_case 'commit-host-capability-reverted-to-supported' "${VMM_MAIN}" \
+    '    let backing_chain_full = discover_backing_chain(
+        &resolved_backing_path,
+        sector_size,
+        &security_config,
+        ChainUse::Compose,
+        DifferencingComposition::Unsupported,
+    )' \
+    '    let backing_chain_full = discover_backing_chain(
+        &resolved_backing_path,
+        sector_size,
+        &security_config,
+        ChainUse::Compose,
+        DifferencingComposition::Supported, // MUTATED
+    )' \
+    "${COMMIT_ANCESTOR_ABSENT}"
 
 # ---------------------------------------------------------------------
 # The other half of the policy: map, measure and check still refuse a

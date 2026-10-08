@@ -1557,7 +1557,7 @@ deliberately broken emitter is not guarding what its name says it
 guards. See [PLAN-differencing.md](plans/PLAN-differencing.md) for the
 path being guarded.
 
-There are **100 cases**, in six groups.
+There are **101 cases**, in seven groups.
 
 Twenty-seven cover the writer. Fifteen mutate a library crate
 (`create`, `vhd`, `vhdx`) and are caught by a Rust unit or round-trip
@@ -1621,6 +1621,20 @@ which only a rebase given a real `-b` target rather than a detach can
 reach. All six run through the real binary, caught by
 `TestDifferencingBenchComposes` and `TestDifferencingRebaseThroughChain`
 in `tests/test_differencing.py`.
+
+**One case covers `commit`**, which reads through no shared chain
+walker at all — its guest reads only the overlay and the backing it is
+committed into, and the host never lets a differencing parent further
+back in the backing's own chain reach it. The case reverts the
+direction the other six go: `run_commit`'s own discovery call is
+correct at `Unsupported`, and the mutation flips it to `Supported`, so
+the host tries to resolve a differencing ancestor's own parent instead
+of leaving it unresolved. The fixture that notices has that parent
+missing on purpose — `TestDifferencingCommitDoesNotOpenTheAncestor`
+builds a qcow2 overlay over a qcow2 backing whose own backing is a real
+differencing VHD or VHDX with its own parent absent — so the mutated
+walk fails during host-side chain discovery, before KVM is even opened,
+where the unmutated walk never tried to resolve that file at all.
 
 The final **thirteen guard `map`, `measure` and `check`**, which read
 through none of the machinery above: each reads its source on its own
