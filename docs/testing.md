@@ -1800,6 +1800,14 @@ trusted.
 
 None of them needs docker, a venv, testdata or a build.
 
+`tools/check-no-capability-claims.py` is a related but separate tool,
+not one of the three above: it reads `src/`'s comment blocks and
+fails, naming the line, if any claims instar cannot read or compose a
+differencing image — a claim that was true when earlier phases wrote
+it and became false once five operations learned to compose one. It
+is not wired into `pre-commit` or CI; a contributor gets it only by
+running it, the same as this harness.
+
 `--self-test` exists because the classifier is the one part of the
 harness nothing else checks — everything else is checked *by* it — and
 it shipped misreading `FAILED (errors=1)` as a caught mutation, which

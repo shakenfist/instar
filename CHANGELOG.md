@@ -485,6 +485,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   an unreadable region table always was: the file's size as the virtual
   size and no cluster size.
 
+- **`instar map` and `instar measure` now refuse a VHDX whose block
+  table names a payload block inside the image's own structure,
+  where they previously reported or counted that block as ordinary
+  data.** This is a behaviour change, not a fix for a path nothing
+  reached: `map`'s whole-BAT walk and `measure`'s allocation scan
+  never applied the overlap test the guest chain walker already
+  enforces on `convert`, `dd`, `compare`, `bench` and `rebase`, so
+  one image could be data to `map`, allocated bytes to `measure` and
+  unreadable to `convert` all at once.
+  Measured on a VHDX whose first payload BAT entry was repointed to
+  file offset zero — where the file identifier and headers live —
+  `map` exited 0 and reported a megabyte of data at offset 0, as
+  though the user's bytes lived inside the image's own headers, and
+  `measure` counted that megabyte as allocated, while `convert`
+  already refused to read it. The same test now also catches a
+  block whose byte range overlaps any region the image's region
+  table declares, such as the BAT or metadata region. Both
+  operations now refuse with a new error code apiece
+  (`MAP_RESULT_ERROR_MALFORMED_BLOCK_TABLE`,
+  `MEASURE_RESULT_ERROR_MALFORMED_BLOCK_TABLE`) rather than reusing
+  the existing "format unrecognised" / "unsupported format" codes,
+  because the format is recognised and the image parsed far enough
+  to walk its BAT — only the block table disagrees with the image's
+  own declared regions. A block declared immediately past the last
+  region in the table is unaffected and still maps and measures
+  normally. Closes
+  [#634](https://github.com/shakenfist/instar/issues/634).
+  Composing a backing chain in `map` and `measure` is unrelated and
+  is not this fix — see
+  [#641](https://github.com/shakenfist/instar/issues/641) and
+  [#642](https://github.com/shakenfist/instar/issues/642).
+
+- **`instar check` no longer reports "No errors were found on the
+  image." for a VHDX whose block table names a payload block inside
+  the image's own structure.** `check` carries its own region-table
+  and BAT validation, built before the readers' overlap test
+  existed, and never cross-checked a payload block's file offset
+  against the regions it had just parsed itself — a block repointed
+  into the BAT region, the metadata region, or file offset zero
+  claimed an overlap-bitmap slot nothing else held and came back
+  clean. Measured before the fix, on the same three malformed
+  images the entry above now makes `map` and `measure` refuse, and
+  that `convert` already refused: `check` printed `"No errors were
+  found on the image."` and exited 0 for all three, with or without
+  `--chain` — a clean verdict on an image no other reader will open.
+  Both grounds are now counted corruptions rather than waved
+  through: `check` reports `"1 errors were found on the image."` and
+  exits 2. Part of
+  [#634](https://github.com/shakenfist/instar/issues/634), the same
+  op-consistency question the entry above answers for `map` and
+  `measure`.
+
+- **`instar bench` and `instar check` now refuse a backing chain
+  whose device count exceeds the 16-device limit before opening
+  KVM**, instead of reaching `vmm_config_chain` with an uncapped
+  count. Every other attaching operation — `convert`/`dd`, `commit`,
+  `rebase` and `compare` — already refused up front; these two did
+  not. A plain over-deep chain does not reach this code at all,
+  because `discover_backing_chain`'s own, unrelated
+  `security.max_chain_depth` (also 16) already refuses a 17th
+  backing hop first; the gap only opens where a chain's *device*
+  count exceeds its *image* count, which a qcow2 top image carrying
+  an external data file does by contributing two devices for one
+  backing hop. Measured against a pre-fix binary with exactly that
+  shape (15 plain backing images plus such a top image: 16 images,
+  17 devices), neither operation silently corrupted guest memory —
+  both hit `DeviceSet::add_device`'s own defensive `assert!` and
+  panicked with exit 101, after KVM and the VM had already been
+  created. So this closes an unhandled crash mid-launch, not a data
+  corruption: both operations now refuse cleanly, naming the
+  operation and the device count, before KVM opens. Closes
+  [#633](https://github.com/shakenfist/instar/issues/633).
+
 - **`instar create -f vhdx -b PARENT` sizes the child's BAT by the
   differencing rule.** A VHDX block allocation table interleaves one
   sector-bitmap entry after every `chunk_ratio` payload entries, with
