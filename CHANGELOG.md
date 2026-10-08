@@ -811,6 +811,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   on `develop` and under qemu-img, while the same command without the
   trailing size is refused for having no size to infer.
 
+### Security
+
+- **Resolving a backing reference no longer reveals whether a path
+  outside the backing-path allowlist exists.** A reference is now
+  normalised and checked against the allowlist before the filesystem is
+  consulted, and symlinks are followed one at a time and refused if they
+  leave the allowlist, so a relative `../` escape is "outside allowed
+  paths" whether or not its target exists. An absolute reference outside
+  the allowlist is never probed; instar falls back to the file of the
+  same name beside the image, or reports "outside allowed paths" where it
+  previously said "not found". The fallback is now announced on stderr
+  (`instar: using '<name>' beside the image in place of '<reference>'`),
+  including when an absolute reference inside the allowlist is missing,
+  where it used to happen silently. A reference spelled outside the
+  allowlist that would only reach it through a symlink outside the
+  allowlist is now refused. Applies to qcow2 backing and external data
+  files, VMDK flat extents, and VHD and VHDX parent locators. Closes
+  [#611](https://github.com/shakenfist/instar/issues/611).
+
 ## [0.3.0] - 2026-08-02
 
 ### Fixed

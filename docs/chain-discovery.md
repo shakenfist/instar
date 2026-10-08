@@ -118,6 +118,24 @@ instar info --chain malicious.qcow2
 # Error: Backing file '/etc/passwd' is outside allowed paths: ["/path/to/images"]
 ```
 
+A reference is checked in this order:
+
+1. Its spelling is normalised (`.` and `..` components are resolved
+   lexically) and compared with the allowlist before anything on disk is
+   looked at. A relative `../` escape is "outside allowed paths" whether
+   or not its target exists.
+2. Symlinks are then resolved one at a time. A link that leads outside
+   the allowlist is refused as outside, and the error names the
+   reference as spelled and normalised, never the link's target.
+3. An absolute reference outside the allowlist is never probed. Instar
+   instead tries the file of the same name beside the image, for images
+   built on another host, and announces it on stderr:
+   `instar: using '<name>' beside the image in place of '<reference>'`.
+   The same line appears when an absolute reference inside the allowlist
+   is missing and the fallback is used. If there is no such file, the
+   result is "outside allowed paths", even if the absolute path does not
+   exist.
+
 ### Configuration
 
 The allowlist can be configured via the config file:
@@ -308,17 +326,14 @@ locator does not have this problem: it arrives already rendered into
 POSIX convention (`vhdx-diff-parent.vhdx`, not `.\vhdx-diff-parent.vhdx`)
 before the host ever sees it, and resolves like any other relative name.
 
-One caveat about the reasons themselves. For an *absolute* reference,
-resolution probes the filesystem before the allowlist is consulted, so
-"was not found" and "is outside the backing file allowlist" distinguish
-whether an attacker-chosen absolute host path exists. Only existence
-leaks, never content, and the allowlist still rejects — no path outside
-it is ever opened. A qcow2 chain naming an absolute backing file has
-always drawn the same distinction; what is new is that `info --chain`
-now prints it while exiting 0, so it no longer takes a failing command
-to carry the answer. If you run `instar info --chain` over untrusted
-images in a service and return its stderr to whoever supplied them,
-that is the line to withhold. Tracked as
+Resolving a reference answers only from filesystem state inside the
+allowlist. Whether a path outside it exists changes neither the result
+nor the message, so the reasons above reveal nothing about the rest of
+the host and are safe to return to whoever supplied the image. The
+trade-off is that a reference spelled outside the allowlist which would
+only reach it through a symlink outside the allowlist is refused (or
+takes the same-name fallback described under Path Validation), because
+proving otherwise would mean probing outside the allowlist. See
 [issue #611](https://github.com/shakenfist/instar/issues/611).
 
 The fail-soft covers *resolving* the parent reference, and nothing
