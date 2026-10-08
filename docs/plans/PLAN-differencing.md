@@ -370,7 +370,7 @@ records `instar-testdata <sha> (#pr)` and is audited there.
 | 11. Composition: host chain discovery and `info --chain` | [PLAN-differencing-phase-11-chain-host.md](PLAN-differencing-phase-11-chain-host.md) | Complete | `c66f8b2` (#603) |
 | 12. Composition: guest VHD sector-bitmap read path | [PLAN-differencing-phase-12-vhd-compose.md](PLAN-differencing-phase-12-vhd-compose.md) | Complete | `b4ae7fc` (#615) |
 | 13. Composition: guest VHDX sector-bitmap read path | [PLAN-differencing-phase-13-vhdx-compose.md](PLAN-differencing-phase-13-vhdx-compose.md) | Complete | `d677823c` (#624) |
-| 14. Composition: rollout across the chain-walker operations | [PLAN-differencing-phase-14-op-rollout.md](PLAN-differencing-phase-14-op-rollout.md) | In progress | |
+| 14. Composition: rollout across the chain-walker operations | [PLAN-differencing-phase-14-op-rollout.md](PLAN-differencing-phase-14-op-rollout.md) | Complete | `7fef1321` (#630) |
 | 15. Composition: chain support for `map`, `measure` and `check` | PLAN-differencing-phase-15-single-image-ops.md | Not started | |
 | 16. Composition: integration tests and fuzz | PLAN-differencing-phase-16-compose-tests.md | Not started | |
 | 17. Composition: documentation | PLAN-differencing-phase-17-compose-docs.md | Not started | |
