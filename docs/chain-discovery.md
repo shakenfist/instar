@@ -252,8 +252,9 @@ The chain discovery infrastructure is used by the following operations:
   resolved — `check` refuses a differencing source outright, so it has
   nothing to validate through one.
 - **`instar commit`** - Discovers the backing chain to merge an overlay into
-  its parent. A differencing VHD or VHDX parent is recorded but not
-  resolved, for the same reason as `check`.
+  its parent, and resolves the overlay's recorded parent, the image it
+  writes into, through the same path validation. A differencing VHD or VHDX
+  parent is recorded but not resolved, for the same reason as `check`.
 - **`instar compare`** - Automatically discovers backing chains for both images
   being compared, resolving a differencing VHD or VHDX parent in either
   chain as well as a qcow2 or vmdk one. All chain images are loaded as

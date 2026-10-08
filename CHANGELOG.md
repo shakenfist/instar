@@ -832,7 +832,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   symlink is still applied to the link's target, as the kernel and
   qemu-img apply it. Applies to qcow2 backing
   and external data files, VMDK flat extents, and VHD and VHDX parent
-  locators. Closes
+  locators. `instar commit` now resolves the overlay's recorded backing
+  file through the same allowlist, from the configured
+  `backing-path-allowlist` rather than the built-in default, and refuses
+  one outside it instead of committing into it. Closes
   [#611](https://github.com/shakenfist/instar/issues/611).
 
 ## [0.3.0] - 2026-08-02

@@ -46,13 +46,26 @@ the overlay's recorded backing-file pointer and uses that.
 Relative paths in the recorded pointer resolve against the
 overlay's parent directory.
 
+The recorded pointer is image data, so it is validated against
+`backing-path-allowlist` (`$IMAGE_DIR` by default) exactly as
+every other chain operation validates a backing reference; see
+[Chain discovery](chain-discovery.md#path-validation). A
+pointer outside the allowlist is refused before anything is
+opened, with the same message whether or not the file it names
+exists, so an overlay cannot choose which host file a commit
+writes into.
+
 When `-b BASE` is supplied, the host resolves it relative to
 the overlay's parent directory and compares the resolved path
-to the overlay's recorded backing-file pointer. If they don't
-match, instar refuses with `commit through an intermediate
-layer is not yet supported (the overlay's immediate parent is
-X)` — intermediate-image commit is deferred to a future
-release (see Future work).
+to the overlay's recorded backing-file pointer, itself resolved
+through the allowlist as above. If they don't match, instar
+refuses with `commit through an intermediate layer is not yet
+supported (the overlay's immediate parent is X)`, where `X` is
+the pointer as the overlay records it — intermediate-image
+commit is deferred to a future release (see Future work). If
+the recorded pointer cannot be resolved, for example because it
+is outside the allowlist, instar refuses with `the overlay's
+recorded parent 'X' could not be resolved`.
 
 This matches `qemu-img commit`'s implicit `-b` behaviour and
 makes the explicit-`-b` form a self-documenting safety

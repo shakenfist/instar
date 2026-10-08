@@ -20,6 +20,7 @@ paths don't.
 Cross-version round-trip baselines belong to phase 9.
 """
 
+import hashlib
 import json
 import shutil
 import subprocess
@@ -180,6 +181,178 @@ class TestCommitErrorPaths(TestCommitSmoke):
             self.assert_bytes_identical(
                 overlay.read_bytes(), before,
                 'a refused commit must not touch the qed overlay')
+
+
+class TestCommitBackingAllowlist(TestCommitSmoke):
+    """The overlay's recorded backing is resolved inside the allowlist.
+
+    Commit opens the backing for writing, and the overlay's recorded
+    backing reference is image data. It must be resolved like every other
+    chain operation resolves one, through ``backing-path-allowlist``
+    (``$IMAGE_DIR`` by default): an overlay naming a file outside it must
+    not get that file written, and the refusal must not depend on whether
+    the file exists. Each layout is built at runtime with ``qemu-img
+    create -u`` under a resolved temp root, so a TMPDIR reached through a
+    symlink does not change the paths instar prints.
+    """
+
+    def _create_qcow2(self, path, *args):
+        """Create a 1M qcow2 at `path` with ``qemu-img create``."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        r = subprocess.run(
+            ['qemu-img', 'create', '-f', 'qcow2', *args, str(path), '1M'],
+            capture_output=True, text=True, timeout=30)
+        self.assertEqual(
+            r.returncode, 0, f'qemu-img create failed: {r.stderr!r}')
+        return path
+
+    def _create_overlay(self, image_dir, reference):
+        """Create `image_dir/overlay.qcow2` recording `reference`, unchecked."""
+        return self._create_qcow2(
+            image_dir / 'overlay.qcow2', '-u', '-F', 'qcow2', '-b', reference)
+
+    @staticmethod
+    def _digest(path):
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
+    @staticmethod
+    def _masked(text, root, image_dir, reference):
+        """Replace the per-layout strings with placeholders."""
+        return (text.replace(str(image_dir), '<DIR>')
+                .replace(reference, '<REF>')
+                .replace(str(root), '<ROOT>'))
+
+    def test_recorded_backing_outside_allowlist_not_written(self):
+        """A recorded backing outside the allowlist is refused, unwritten."""
+        self._require_qemu_img()
+        for spelling in ('absolute', 'relative'):
+            with self.subTest(spelling=spelling), \
+                    tempfile.TemporaryDirectory() as td:
+                root = Path(td).resolve()
+                image_dir = root / 'images'
+                victim = self._create_qcow2(root / 'outside' / 'victim.qcow2')
+                if spelling == 'absolute':
+                    reference = str(victim)
+                else:
+                    reference = '../outside/victim.qcow2'
+                overlay = self._create_overlay(image_dir, reference)
+                if shutil.which('qemu-io') is not None:
+                    # Give the commit something to write, so a commit
+                    # that reached the victim would visibly change it.
+                    r = subprocess.run(
+                        ['qemu-io', '-f', 'qcow2',
+                         '-c', 'write -P 0xab 0 64k', str(overlay)],
+                        capture_output=True, text=True, timeout=30)
+                    self.assertEqual(
+                        r.returncode, 0, f'qemu-io seed failed: {r.stderr!r}')
+                before = self._digest(victim)
+
+                _, stderr, rc = self.run_instar_commit(overlay)
+                self.assertNotEqual(
+                    rc, 0,
+                    f'expected a backing outside the allowlist to be refused; '
+                    f'stderr={stderr!r}')
+                self.assertIn(
+                    'outside allowed paths', stderr,
+                    f'expected an allowlist refusal; stderr={stderr!r}')
+                self.assertEqual(
+                    self._digest(victim), before,
+                    'a refused commit must not write the file the overlay names')
+
+    def _run_present_absent(self, extra_args):
+        """Commit an overlay naming an outside file, present and absent.
+
+        Returns the masked (stdout, stderr, rc) for each layout.
+        """
+        results = []
+        for present in (True, False):
+            with tempfile.TemporaryDirectory() as td:
+                root = Path(td).resolve()
+                image_dir = root / 'images'
+                target = root / 'outside' / 'target.qcow2'
+                if present:
+                    self._create_qcow2(target)
+                reference = str(target)
+                overlay = self._create_overlay(image_dir, reference)
+                base = self._create_qcow2(image_dir / 'base.qcow2')
+                args = [a.replace('{BASE}', str(base)) for a in extra_args]
+                stdout, stderr, rc = self.run_instar_commit(overlay, *args)
+                results.append((
+                    self._masked(stdout, root, image_dir, reference),
+                    self._masked(stderr, root, image_dir, reference),
+                    rc,
+                ))
+        return results
+
+    def _assert_same_refusal(self, results, what):
+        (out_p, err_p, rc_p), (out_a, err_a, rc_a) = results
+        self.assertNotEqual(rc_p, 0, f'{what}: expected a refusal; stderr={err_p!r}')
+        self.assertEqual(rc_p, rc_a, f'{what}: exit status depends on whether the target exists')
+        self.assertEqual(out_p, out_a, f'{what}: stdout depends on whether the target exists')
+        self.assertEqual(err_p, err_a, f'{what}: stderr depends on whether the target exists')
+        self.assertIn(
+            'outside allowed paths', err_p,
+            f'{what}: expected an allowlist refusal; stderr={err_p!r}')
+
+    def test_implicit_refusal_independent_of_target_existence(self):
+        """Without `-b`, the refusal is the same whether the target exists."""
+        self._require_qemu_img()
+        self._assert_same_refusal(self._run_present_absent([]), 'implicit -b')
+
+    def test_explicit_refusal_independent_of_target_existence(self):
+        """With `-b`, the recorded parent's refusal is the same either way."""
+        self._require_qemu_img()
+        self._assert_same_refusal(
+            self._run_present_absent(['-b', '{BASE}']), 'explicit -b')
+
+    def test_explicit_base_naming_absolute_recorded_parent_commits(self):
+        """`-b` naming an absolute recorded parent inside the allowlist works."""
+        self._require_qemu_img()
+        with tempfile.TemporaryDirectory() as td:
+            image_dir = Path(td).resolve() / 'images'
+            base = self._create_qcow2(image_dir / 'base.qcow2')
+            overlay = self._create_overlay(image_dir, str(base))
+            for extra in ([], ['-b', str(base)], ['-b', 'base.qcow2']):
+                with self.subTest(args=extra):
+                    stdout, stderr, rc = self.run_instar_commit(overlay, *extra)
+                    self.assertEqual(rc, 0, f'commit failed: stderr={stderr!r}')
+                    self.assertIn('Image committed.', stdout,
+                                  f'unexpected stdout: {stdout!r}')
+
+    def test_explicit_base_does_not_reveal_recorded_parent_target(self):
+        """With `-b`, a recorded parent outside the allowlist is never resolved.
+
+        The recorded reference runs through a symlink to a directory
+        outside the allowlist. The refusal may quote the reference as the
+        overlay records it, but must not name where the symlink leads: a
+        canonicalised image-derived path would disclose the host layout.
+        """
+        self._require_qemu_img()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            image_dir = root / 'images'
+            hidden = root / 'hidden-target-dir'
+            victim = self._create_qcow2(hidden / 'victim.qcow2')
+            (root / 'linkdir').symlink_to(hidden)
+            reference = str(root / 'linkdir' / 'victim.qcow2')
+            overlay = self._create_overlay(image_dir, reference)
+            base = self._create_qcow2(image_dir / 'base.qcow2')
+            before = self._digest(victim)
+
+            _, stderr, rc = self.run_instar_commit(overlay, '-b', str(base))
+            self.assertNotEqual(
+                rc, 0, f'expected the recorded parent to be refused; stderr={stderr!r}')
+            self.assertIn(
+                "the overlay's recorded parent", stderr,
+                f'unexpected stderr: {stderr!r}')
+            self.assertIn(
+                'outside allowed paths', stderr,
+                f'expected an allowlist refusal; stderr={stderr!r}')
+            self.assertNotIn(
+                'hidden-target-dir', stderr,
+                f'the refusal must not name a canonicalised recorded parent; '
+                f'stderr={stderr!r}')
+            self.assertEqual(self._digest(victim), before)
 
 
 # ----------------------------------------------------------------------
