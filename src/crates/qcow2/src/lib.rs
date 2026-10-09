@@ -10381,14 +10381,16 @@ mod tests {
         // sector, so the test is about a walk that had to get there.
         assert!(
             payload_index * 8 > 512,
-            "payload block {payload_index} must sit past the first cached              BAT sector for this test to say anything"
+            "payload block {payload_index} must sit past the first cached BAT sector for this \
+             test to say anything"
         );
         let bytes =
             vhdx_repoint_payload_block(fixture.bytes, 512, payload_index, VHDX_FIX_METADATA_OFFSET);
         let walks = run_vhdx_bat_walks(&bytes, 512);
         assert!(
             walks.extents.is_none(),
-            "map must refuse a block inside the metadata region wherever              in the BAT it is declared, not only in the first entry: {:?}",
+            "map must refuse a block inside the metadata region wherever in the BAT it is \
+             declared, not only in the first entry: {:?}",
             walks.extents.as_ref().map(|e| e.len())
         );
         assert!(
@@ -10397,7 +10399,7 @@ mod tests {
         );
         assert!(
             walks.summary.is_none(),
-            "measure must refuse the same late block rather than count              it: {:?}",
+            "measure must refuse the same late block rather than count it: {:?}",
             walks.summary.as_ref().map(|s| s.allocated_bytes)
         );
         assert!(
@@ -10435,7 +10437,8 @@ mod tests {
         let walks = run_vhdx_bat_walks(&bytes, 512);
         assert!(
             walks.extents.is_none(),
-            "map must refuse a malformed block in the second chunk group,              which it can only find by skipping the first group's              sector-bitmap entry: {:?}",
+            "map must refuse a malformed block in the second chunk group, which it can only \
+             find by skipping the first group's sector-bitmap entry: {:?}",
             walks.extents.as_ref().map(|e| e.len())
         );
         assert!(
@@ -10526,6 +10529,50 @@ mod tests {
         );
     }
 
+    // The same refusal on a 4K-logical-sector image.
+    //
+    // Every other case here uses 512-byte sectors, and the sector size
+    // is not a detail these walks are indifferent to: `chunk_ratio` is
+    // derived from it, so it sets how many payload entries sit between
+    // the interleaved sector-bitmap slots, and it is also the size of
+    // the BAT reads the walks cache. A guard that happened to depend on
+    // either -- a bound computed from the cached sector rather than the
+    // entry, say -- would hold at one sector size and not the other.
+    // The assertion below pins that the two geometries really do
+    // differ, so this is not the 512-byte case under another name.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_map_and_measure_refuse_a_block_inside_a_region_at_4k_sectors() {
+        assert_ne!(
+            vhdx_chunk_ratio(4096),
+            vhdx_chunk_ratio(512),
+            "the point of this case is a different chunk ratio; if the two \
+             agree it duplicates the 512-byte test"
+        );
+        let fixture = build_vhdx_image(4096, false, 1, &[(0, VhdxBlockState::FullyPresent)], &[]);
+        let bytes = vhdx_repoint_first_payload_block(fixture.bytes, VHDX_FIX_METADATA_OFFSET);
+        let walks = run_vhdx_bat_walks(&bytes, 4096);
+        assert!(
+            walks.extents.is_none(),
+            "map must refuse a block inside the metadata region at 4K \
+             sectors too: {:?}",
+            walks.extents
+        );
+        assert!(
+            walks.map_block_table_malformed,
+            "the map walk must record WHY it refused at 4K sectors"
+        );
+        assert!(
+            walks.summary.is_none(),
+            "measure must refuse the same block at 4K sectors: {:?}",
+            walks.summary.as_ref().map(|s| s.allocated_bytes)
+        );
+        assert!(
+            walks.scan_block_table_malformed,
+            "the scan walk must record WHY it refused at 4K sectors"
+        );
+    }
+
     // A PARTIALLY_PRESENT block inside a declared region.
     //
     // Both walks classify a partially present entry exactly as they
@@ -10545,12 +10592,13 @@ mod tests {
         let walks = run_vhdx_bat_walks(&bytes, 512);
         assert!(
             walks.extents.is_none(),
-            "map must refuse a partially present block inside the metadata              region, which it describes as data just as it does a fully              present one: {:?}",
+            "map must refuse a partially present block inside the metadata region, which it \
+             describes as data just as it does a fully present one: {:?}",
             walks.extents
         );
         assert!(
             walks.map_block_table_malformed,
-            "the map walk must record WHY it refused a partially present              block"
+            "the map walk must record WHY it refused a partially present block"
         );
         assert!(
             walks.summary.is_none(),
@@ -10559,7 +10607,7 @@ mod tests {
         );
         assert!(
             walks.scan_block_table_malformed,
-            "the scan walk must record WHY it refused a partially present              block"
+            "the scan walk must record WHY it refused a partially present block"
         );
     }
 

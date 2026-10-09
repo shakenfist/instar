@@ -1817,12 +1817,49 @@ trusted.
 None of them needs docker, a venv, testdata or a build.
 
 `tools/check-no-capability-claims.py` is a related but separate tool,
-not one of the three above: it reads `src/`'s comment blocks and
-fails, naming the line, if any claims instar cannot read or compose a
-differencing image — a claim that was true when earlier phases wrote
-it and became false once five operations learned to compose one. It
-is not wired into `pre-commit` or CI; a contributor gets it only by
-running it, the same as this harness.
+not one of the three above: it fails, naming the line, if anything in
+the tree says instar cannot read or compose a differencing image — a
+claim that was true when earlier phases wrote it and became false once
+five operations learned to compose one. It is not wired into
+`pre-commit` or CI; a contributor gets it only by running it, the same
+as this harness.
+
+It reads whole paragraphs — runs of non-blank lines, flattened —
+across `src/**/*.rs`, `tests/**/*.py` and top-level `docs/*.md`, so
+Rust comments and block comments, Python docstrings, assertion
+messages and Markdown prose all fall out of one pass. That breadth is
+not incidental. A line-granular grep missed a claim in
+`src/shared/src/lib.rs` that wrapped mid-phrase, and a
+comment-granular version of the script then missed a second one in a
+`tests/` assertion message, which is why it reads string literals and
+prose rather than comments alone. Expect it to flag a docs page or a
+test message, not only a `//` comment.
+
+Two trees are excluded on purpose: `docs/plans/` records what was true
+when each phase was planned and prescribes the sweeps that made it
+false, and `CHANGELOG.md` entries were true for the release they
+describe. Editing either to satisfy the script would falsify a record.
+The pattern is anchored on what a claim says instar cannot act *on*
+rather than on the verb, because that is what decides whether the
+claim is false. An unscoped claim naming a differencing image or a
+parent as the thing instar cannot read or compose is flagged; a scoped
+one that happens to use the same words is not — "a chain instar cannot
+compose", said of a differencing image whose own parent is itself
+differencing, is still true and stays clean, as does a statement about
+any unsupported source. The script's own docstring and `--self-test`
+carry the specimens; this page deliberately does not spell the flagged
+form out, because a page containing it verbatim is indistinguishable,
+to anyone skimming, from a page making the claim — and the checker
+reads this page too.
+
+`--self-test` pins ten checks: nine claim forms it must flag or clear,
+each one that actually appeared in this repository, and one that the
+scan reads files at all from a working directory other than the
+repository root. That last one exists because the script globbed
+relative to the current directory and reported a clean tree, exit 0,
+having read nothing, whenever it was run from anywhere else. It now
+resolves the repository from its own path and refuses to report a
+clean tree on a scan that matched almost no files.
 
 `--self-test` exists because the classifier is the one part of the
 harness nothing else checks — everything else is checked *by* it — and

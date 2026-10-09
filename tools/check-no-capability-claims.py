@@ -50,6 +50,18 @@ GLOBS = ('src/**/*.rs', 'tests/**/*.py', 'docs/*.md')
 # This file quotes the pattern it searches for, so it would always
 # match itself.
 EXCLUDED = ('tools/check-no-capability-claims.py',)
+# Resolved from this file rather than the working directory. Globbed
+# relative to `.`, every pattern matched nothing when the script was
+# run from anywhere but the repository root -- from `tools/`, or from
+# CI with a different cwd -- and it reported a clean tree having read
+# no files at all. A checker that is trusted without being read must
+# not have a silent pass in it.
+REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+# The floor below which an empty scan is a broken checker rather than a
+# clean tree. Deliberately far under the real count (hundreds) so it
+# needs no maintenance, while still catching a glob that has stopped
+# matching.
+MIN_FILES_SCANNED = 20
 
 
 def paragraphs(text):
@@ -125,10 +137,36 @@ def self_test():
             bad += 1
         else:
             print(f'ok   {"flags" if expected else "clears"}: {description}')
+    # The pattern cases above are all this used to check, and a pattern
+    # that works proves nothing if the scan never reaches a file. Run
+    # the real glob from a directory that is not the repository root,
+    # which is exactly the shape that made this script report a clean
+    # tree having read nothing.
+    import os
+    import tempfile
+    with tempfile.TemporaryDirectory() as elsewhere:
+        here = os.getcwd()
+        try:
+            os.chdir(elsewhere)
+            found = sum(
+                1
+                for glob in GLOBS
+                for path in REPO_ROOT.glob(glob)
+                if path.relative_to(REPO_ROOT).as_posix() not in EXCLUDED
+            )
+        finally:
+            os.chdir(here)
+    if found < MIN_FILES_SCANNED:
+        print(f'FAIL the scan reads only {found} file(s) from a working '
+              f'directory other than the repository root')
+        bad += 1
+    else:
+        print(f'ok   reads {found} files regardless of working directory')
+
     if bad:
-        print(f'{bad} of {len(SELF_TEST_CASES)} self-test cases failed')
+        print(f'{bad} of {len(SELF_TEST_CASES) + 1} self-test checks failed')
         return 1
-    print(f'{len(SELF_TEST_CASES)} self-test cases pass')
+    print(f'{len(SELF_TEST_CASES) + 1} self-test checks pass')
     return 0
 
 
@@ -143,19 +181,27 @@ def main():
         return self_test()
 
     hits = []
+    scanned = 0
     for glob in GLOBS:
-        for path in sorted(pathlib.Path('.').glob(glob)):
-            if str(path) in EXCLUDED:
+        for path in sorted(REPO_ROOT.glob(glob)):
+            relative = path.relative_to(REPO_ROOT).as_posix()
+            if relative in EXCLUDED:
                 continue
+            scanned += 1
             for lineno, claim in claims_in(path.read_text()):
-                hits.append(f'{path}:{lineno}: {claim!r}')
+                hits.append(f'{relative}:{lineno}: {claim!r}')
     for hit in hits:
         print(hit)
     if hits:
         print(f'{len(hits)} claim(s) that instar cannot read or compose a '
               f'differencing image')
         return 1
-    print('nothing claims instar cannot read or compose a differencing image')
+    if scanned < MIN_FILES_SCANNED:
+        print(f'only {scanned} file(s) matched {GLOBS} under {REPO_ROOT}; '
+              f'refusing to report a clean tree on a scan that read nothing')
+        return 2
+    print(f'nothing in {scanned} files claims instar cannot read or compose '
+          f'a differencing image')
     return 0
 
 

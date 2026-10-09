@@ -1769,6 +1769,17 @@ unsafe fn check_vhdx(
                 // Unallocated or zero; no host offset to validate
             }
             vhdx::PAYLOAD_BLOCK_FULLY_PRESENT => {
+                // Counted before it is validated, so a block the
+                // checks below reject is still in the allocation and
+                // fragmentation percentages. That matches the
+                // out-of-bounds arm, which has always counted first,
+                // and the consistency is the point: these are
+                // informational statistics about what the BAT claims,
+                // on an image this function is about to report as
+                // corrupt and exit 2 over. Moving the increment below
+                // the checks for the two structural grounds only
+                // would make the stats disagree with the
+                // longest-standing arm about what "allocated" means.
                 allocated_blocks += 1;
 
                 // Validate offset is within file bounds

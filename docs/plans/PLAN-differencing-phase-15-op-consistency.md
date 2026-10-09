@@ -310,15 +310,25 @@ is stripped: zero non-comment `PLAN-*.md` references in `src/`.
   opening KVM, each naming its own operation. Falsifiable: a test
   asserts the message text for both, and
   `grep -c 'exceeds the' src/vmm/src/main.rs` has grown by two.
-* No comment in `src/` claims that **instar** cannot read or compose a
-  differencing image. Falsifiable by a script rather than a grep:
-  `python3 tools/check-no-capability-claims.py`, exit 0 and no output.
+* Nothing in `src/`, `tests/` or the top level of `docs/` claims that
+  **instar** cannot read or compose a differencing image. Falsifiable
+  by a script rather than a grep:
+  `python3 tools/check-no-capability-claims.py`, exit 0.
   Its own docstring records why it is not a grep -- the sentences wrap
   mid-phrase, and a line-granular grep missed the one in
   `src/shared/src/lib.rs` reading "Instar cannot / compose a parent
   yet" across a line break. The script is verified by mutation, not
   only by passing: restoring that wrapped claim makes it exit 1 and
   name the line.
+
+  **Widened during review.** As first written this criterion said "no
+  comment in `src/`", and the script read only `//` comments there. The
+  first review round asked whether that was enough; widening it to
+  paragraphs across `src/`, `tests/` and `docs/` immediately found a
+  live claim in a `tests/test_differencing.py` assertion message, which
+  the comment-granular form could not see. The criterion is recorded in
+  its widened form because the narrow one was satisfiable while the
+  claim it exists to prevent was still in the tree.
 
   The criterion is about the **global** claim, not about any
   per-operation statement. "This operation does not compose a

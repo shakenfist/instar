@@ -726,25 +726,30 @@ check_case_count() {
     # reread. Derive each group from the case names, which are the
     # thing that actually changes when a case is added, and require
     # the document to state it in a checkable form. The sub-counts the
-    # prose takes by subtraction ("the other seven", "the last three")
+    # prose takes by subtraction ("the other eight", "the last three")
     # cannot drift silently either: any case added to those groups
     # moves one of the figures checked here.
-    local group_doc group_actual label pattern
+    #
+    # Three "##"-separated fields per group: the name used in the error
+    # message, the pattern matching the case names, and the regex that
+    # finds the figure in the document. No field carries the number
+    # itself. The first version of this loop put "14 cases guard" in
+    # the label and then branched on that literal to pick a different
+    # document regex, so the label named the very figure the check was
+    # meant to derive and editing the label broke the branch.
+    local group_doc group_actual label pattern doc_pattern spec
     for spec in \
-        "14 cases guard:^(integration_case '(map|measure|check)-(vhd|vhdx)-refusal-removed'|rust_case 'vhdx-(map-extent|scan-block)-offset-|rust_case 'vhdx-bat-walk-|integration_case 'check-vhdx-(block|region)-)" \
-        "refusal cases:^integration_case '(map|measure|check)-(vhd|vhdx)-refusal-removed'" \
-        "device-count cases:^integration_case '(bench|check)-chain-device-count-guard-removed'"
+        "cases guarding map, measure and check##^(integration_case '(map|measure|check)-(vhd|vhdx)-refusal-removed'|rust_case 'vhdx-(map-extent|scan-block)-offset-|rust_case 'vhdx-bat-walk-|integration_case 'check-vhdx-(block|region)-)##\\*\\*[0-9]+ cases guard" \
+        "refusal cases##^integration_case '(map|measure|check)-(vhd|vhdx)-refusal-removed'##\\*\\*[0-9]+ refusal cases\\*\\*" \
+        "device-count cases##^integration_case '(bench|check)-chain-device-count-guard-removed'##\\*\\*[0-9]+ device-count cases\\*\\*"
     do
-        label="${spec%%:*}"
-        pattern="${spec#*:}"
+        label="${spec%%##*}"
+        pattern="${spec#*##}"
+        pattern="${pattern%##*}"
+        doc_pattern="${spec##*##}"
         group_actual="$(grep -cE "${pattern}" "${BASH_SOURCE[0]}")"
-        if [ "${label}" = '14 cases guard' ]; then
-            group_doc="$(grep -oE '\*\*[0-9]+ cases guard' \
-                "${REPO_ROOT}/docs/testing.md" 2>/dev/null | grep -oE '[0-9]+' | head -1)"
-        else
-            group_doc="$(grep -oE "\*\*[0-9]+ ${label}\*\*" \
-                "${REPO_ROOT}/docs/testing.md" 2>/dev/null | grep -oE '[0-9]+' | head -1)"
-        fi
+        group_doc="$(grep -oE "${doc_pattern}" \
+            "${REPO_ROOT}/docs/testing.md" 2>/dev/null | grep -oE '[0-9]+' | head -1)"
         if [ "${group_doc:-x}" != "${group_actual}" ]; then
             echo >&2
             echo "docs/testing.md says '${group_doc:-no}' ${label};" >&2
