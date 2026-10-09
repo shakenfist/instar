@@ -1,6 +1,6 @@
 # PLAN-611: Backing-path resolution must not answer questions about the host
 
-## Status: In progress
+## Status: Complete
 
 ## Prompt
 
@@ -256,7 +256,15 @@ fixes from the audit. Every commit passes `pre-commit run
   `backing-path-allowlist` is ignored there. It is stricter, not
   looser, so it is a consistency fix, not a security one.
 * The fallback's stderr line prints the image-chosen reference
-  unescaped, the same class as #609.
+  unescaped, the same class as #609. When that is escaped, consider
+  returning the substitution to the caller instead of printing it
+  inside the resolver, so a walk that resolves a reference twice
+  cannot announce it twice.
+* The resolver returns a symlink-free path that is opened later by
+  path, so someone able to write inside the allowlist could swap a
+  component for a symlink between the two. The canonicalise-then-check
+  code it replaced had the same gap. Opening with `O_NOFOLLOW`, or
+  `openat2` with `RESOLVE_BENEATH`, would close it.
 
 * #609: image-derived path strings reach the terminal unescaped in
   `info` human output. It is the same audience (a service returning
@@ -283,6 +291,17 @@ done with them:
 | No CLI test for a symlink escape | Added |
 | Fallback line prints the reference unescaped | Declined here: the #609 class, recorded under Future work |
 | `chain.rs` is past 1,500 lines | Declined: splitting the resolver out is a refactor for its own PR |
+
+The PR review (shakenfist/instar#648) found that commit, now resolving
+the recorded backing through `validate_backing_path`, also took the
+same-name file beside the overlay in place of a recorded backing it
+could not use, so an overlay could still pick a file to be written:
+any namesake of its reference. Commit's write target now goes through
+`validate_backing_write_target`, which refuses instead and asks for
+`-b`. The same review pointed out that the default allowlist refused
+`-b` naming a parent in another directory; a recorded reference
+spelled exactly as `-b`, with no `..`, now matches without being
+looked at.
 
 ### Back brief
 

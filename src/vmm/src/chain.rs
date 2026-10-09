@@ -382,6 +382,31 @@ fn lexical_backing_candidate(parent_dir: &Path, reference: &str) -> PathBuf {
     normalize_lexically(&parent_dir.join(reference))
 }
 
+/// Whether `reference`, read from `parent_image`, names `path`, judged
+/// from the two spellings alone.
+///
+/// Nothing is looked at, so the answer is the same whatever is on the
+/// host, and no allowlist is needed to keep it from being an oracle.
+/// It is yes only when neither spelling contains `..`. Without one, a
+/// spelling names the file at that path whatever symlinks lie along
+/// it, so two equal spellings name the same file; with one, a symlink
+/// before the `..` can send a spelling somewhere its text does not
+/// say. A no means only that the spellings alone cannot tell.
+pub fn reference_spells_path(parent_image: &Path, reference: &str, path: &Path) -> bool {
+    let (Ok(parent_image), Ok(path)) =
+        (std::path::absolute(parent_image), std::path::absolute(path))
+    else {
+        return false;
+    };
+    let Some(parent_dir) = parent_image.parent() else {
+        return false;
+    };
+    // `join` replaces the base outright when the reference is absolute.
+    let named = parent_dir.join(reference);
+    let has_parent_dir = |p: &Path| p.components().any(|c| c == Component::ParentDir);
+    !has_parent_dir(&named) && !has_parent_dir(&path) && named == path
+}
+
 /// The backing-file allowlist, with every entry in both of its
 /// spellings.
 ///
@@ -584,6 +609,20 @@ fn walk_within_allowlist(path: &Path, forms: &AllowlistForms) -> Walk {
     }
 }
 
+/// Whether an absolute reference that cannot be used as written may be
+/// replaced by its file name beside the image.
+///
+/// The substitute keeps images built on another host working for
+/// anything that only reads them. A write target must be refused
+/// instead: the substitute is any file that happens to share the
+/// reference's name, and writing into it would let an image choose an
+/// unrelated file to change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileNameFallback {
+    Allowed,
+    Refused,
+}
+
 /// Resolve a backing reference read from `parent_image` and check it
 /// against `allowlist`.
 ///
@@ -600,7 +639,8 @@ fn walk_within_allowlist(path: &Path, forms: &AllowlistForms) -> Walk {
 /// 2. An absolute reference outside is never probed. It goes straight
 ///    to the reference's file name beside `parent_image`, which keeps
 ///    images built on another host working; that path faces the same
-///    checks, and using it is announced on stderr.
+///    checks, and using it is announced on stderr. With
+///    `FileNameFallback::Refused` it is refused instead.
 /// 3. A candidate inside is walked component by component, in its
 ///    spelling as written so that `..` follows the symlinks before it as
 ///    the kernel's does, refusing any step that leads out. An absolute
@@ -638,6 +678,7 @@ fn resolve_backing_path(
     backing_path: &str,
     allowlist: &[PathBuf],
     extra_spellings: &[PathBuf],
+    fallback: FileNameFallback,
 ) -> Result<PathBuf, ChainError> {
     let entries: Vec<PathBuf> = allowlist.iter().chain(extra_spellings).cloned().collect();
     let forms = AllowlistForms::new(&entries);
@@ -668,7 +709,7 @@ fn resolve_backing_path(
     }
 
     let reference = Path::new(backing_path);
-    if !reference.is_absolute() {
+    if !reference.is_absolute() || fallback == FileNameFallback::Refused {
         return Err(if inside {
             ChainError::BackingFileNotFound(candidate)
         } else {
@@ -714,10 +755,46 @@ fn resolve_backing_path(
 /// is a `PathResolutionError`. `$IMAGE_DIR` is that canonical
 /// directory, and is also matched as the caller spelled it, unless
 /// that spelling contains `..`.
+///
+/// An absolute reference that cannot be used as written may resolve to
+/// its file name beside the image; see `FileNameFallback`. A file the
+/// caller will write into goes through `validate_backing_write_target`
+/// instead.
 pub fn validate_backing_path(
     parent_image: &Path,
     backing_path: &str,
     security_config: &SecurityConfig,
+) -> Result<PathBuf, ChainError> {
+    validate_reference(
+        parent_image,
+        backing_path,
+        security_config,
+        FileNameFallback::Allowed,
+    )
+}
+
+/// Validate a reference read from `parent_image` that names a file the
+/// caller will write into, as `validate_backing_path` does, but never
+/// substitute the reference's file name beside the image: a reference
+/// that cannot be used as written is refused.
+pub fn validate_backing_write_target(
+    parent_image: &Path,
+    backing_path: &str,
+    security_config: &SecurityConfig,
+) -> Result<PathBuf, ChainError> {
+    validate_reference(
+        parent_image,
+        backing_path,
+        security_config,
+        FileNameFallback::Refused,
+    )
+}
+
+fn validate_reference(
+    parent_image: &Path,
+    backing_path: &str,
+    security_config: &SecurityConfig,
+    fallback: FileNameFallback,
 ) -> Result<PathBuf, ChainError> {
     // The image's directory is canonicalised, so that both `$IMAGE_DIR`
     // and the base relative references are joined to are physical paths
@@ -773,6 +850,7 @@ pub fn validate_backing_path(
         backing_path,
         &allowlist,
         &extra_spellings,
+        fallback,
     )
 }
 
@@ -1213,6 +1291,89 @@ mod tests {
             }
             other => panic!("expected BackingFileNotAllowed, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn write_target_never_falls_back_to_file_name() {
+        // A write target is refused where a read would take the file of
+        // the same name beside the image, both for a reference outside
+        // the allowlist and for one inside it that is missing, and the
+        // refusal is the one a read gives with no such file there.
+        let l = layout();
+        let decoy = l.images.join("base.qcow2");
+        std::fs::write(&decoy, b"").unwrap();
+        let cfg = default_security_config();
+
+        let outside = l.outside.join("base.qcow2");
+        let outside = outside.to_str().unwrap();
+        assert_eq!(
+            validate_backing_path(&l.parent, outside, &cfg).unwrap(),
+            decoy.canonicalize().unwrap()
+        );
+        match validate_backing_write_target(&l.parent, outside, &cfg) {
+            Err(ChainError::BackingFileNotAllowed { path, .. }) => {
+                assert_eq!(path, PathBuf::from(outside))
+            }
+            other => panic!("expected BackingFileNotAllowed, got {other:?}"),
+        }
+
+        let missing = l.images.join("sub").join("base.qcow2");
+        let missing = missing.to_str().unwrap();
+        assert_eq!(
+            validate_backing_path(&l.parent, missing, &cfg).unwrap(),
+            decoy.canonicalize().unwrap()
+        );
+        match validate_backing_write_target(&l.parent, missing, &cfg) {
+            Err(ChainError::BackingFileNotFound(path)) => {
+                assert_eq!(path, PathBuf::from(missing))
+            }
+            other => panic!("expected BackingFileNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_target_resolves_references_usable_as_written() {
+        let l = layout();
+        let base = l.images.join("base.qcow2");
+        std::fs::write(&base, b"").unwrap();
+        let cfg = default_security_config();
+        for reference in ["base.qcow2", base.to_str().unwrap()] {
+            assert_eq!(
+                validate_backing_write_target(&l.parent, reference, &cfg).unwrap(),
+                base.canonicalize().unwrap(),
+                "{reference}"
+            );
+        }
+    }
+
+    #[test]
+    fn reference_spells_path_cases() {
+        let parent = Path::new("/vms/overlays/top.qcow2");
+        let base = Path::new("/vms/bases/base.qcow2");
+        assert!(reference_spells_path(parent, "/vms/bases/base.qcow2", base));
+        assert!(reference_spells_path(
+            parent,
+            "/vms/./bases//base.qcow2",
+            base
+        ));
+        assert!(reference_spells_path(
+            parent,
+            "base.qcow2",
+            Path::new("/vms/overlays/base.qcow2")
+        ));
+        assert!(!reference_spells_path(
+            parent,
+            "/vms/bases/other.qcow2",
+            base
+        ));
+        // A `..` in either spelling could follow a symlink, so the
+        // spellings alone cannot tell.
+        assert!(!reference_spells_path(parent, "../bases/base.qcow2", base));
+        assert!(!reference_spells_path(
+            parent,
+            "/vms/bases/base.qcow2",
+            Path::new("/vms/overlays/../bases/base.qcow2")
+        ));
     }
 
     // ====================================================================

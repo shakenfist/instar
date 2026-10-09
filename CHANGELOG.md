@@ -835,8 +835,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   locators. `instar commit` now resolves the overlay's recorded backing
   file through the same allowlist, from the configured
   `backing-path-allowlist` rather than the built-in default, and refuses
-  one outside it instead of committing into it. Closes
-  [#611](https://github.com/shakenfist/instar/issues/611).
+  one outside it instead of committing into it. It never takes the
+  same-name file beside the overlay in place of a recorded backing it
+  cannot use, since that file is only a namesake; it refuses and asks
+  for `-b`. **An overlay whose parent is in another directory, which an
+  implicit commit used to write into, is now refused under the default
+  `$IMAGE_DIR` allowlist**: name the parent with `-b`, which matches a
+  recorded parent spelled the same way without consulting the
+  allowlist, or add its directory to `backing-path-allowlist`. See
+  [Commit](https://github.com/shakenfist/instar/blob/develop/docs/commit.md#overlays-whose-parent-is-in-another-directory).
+  Closes [#611](https://github.com/shakenfist/instar/issues/611).
 
 ## [0.3.0] - 2026-08-02
 

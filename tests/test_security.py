@@ -451,15 +451,17 @@ class TestBackingPathOracle(InstarTestBase):
         the check made on its spelling. Following the link would then
         look at the target, so the refusal has to come from the link's
         target being outside, not from whether the file there exists,
-        and must not print where the link points.
+        and must not print where the link points. Both walks are checked.
         """
-        results = self.run_pair(self.info_chain, self.symlink_layout)
-        self.assert_same_refusal(results, 'info --chain, symlink escape')
-        for _, stderr, _ in results:
-            self.assertNotIn(
-                '<ROOT>/outside', stderr,
-                f'the refusal names the symlink target; stderr={stderr!r}'
-            )
+        for what, runner in (('info --chain', self.info_chain), ('convert', self.convert_raw)):
+            with self.subTest(walk=what):
+                results = self.run_pair(runner, self.symlink_layout)
+                self.assert_same_refusal(results, f'{what}, symlink escape')
+                for _, stderr, _ in results:
+                    self.assertNotIn(
+                        '<ROOT>/outside', stderr,
+                        f'the refusal names the symlink target; stderr={stderr!r}'
+                    )
 
     def test_absolute_reference_falls_back_to_name_beside_image(self):
         """An image built elsewhere still works if its base sits beside it.
@@ -486,6 +488,14 @@ class TestBackingPathOracle(InstarTestBase):
             )
             self.assertIn('Chain: 2 image(s)', stdout)
             self.assertIn(str(image_dir / 'base.raw'), stdout)
+
+            # The composing walk takes the same substitute.
+            stdout, stderr, rc = self.convert_raw(child)
+            self.assertEqual(0, rc, f'stdout={stdout!r} stderr={stderr!r}')
+            self.assertIn(
+                f"instar: using 'base.raw' beside the image in place of '{reference}'",
+                stderr
+            )
 
 
 class TestRawFormatValidation(InstarTestBase):

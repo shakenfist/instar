@@ -142,7 +142,8 @@ A reference is checked in this order:
    The same line appears when an absolute reference inside the allowlist
    is missing and the fallback is used. If there is no such file, the
    result is "outside allowed paths", even if the absolute path does not
-   exist.
+   exist. `instar commit` never uses the fallback for the file it writes
+   into; see [Commit](commit.md#-b-resolution).
 
 ### Configuration
 

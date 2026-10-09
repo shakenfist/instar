@@ -211,6 +211,26 @@ class TestCommitBackingAllowlist(TestCommitSmoke):
         return self._create_qcow2(
             image_dir / 'overlay.qcow2', '-u', '-F', 'qcow2', '-b', reference)
 
+    def _seed_overlay(self, overlay):
+        """Give a commit something to write, when qemu-io is available.
+
+        A commit that reached the wrong file would then visibly change
+        it. The overlay is opened without its backing, which may be
+        deliberately missing.
+        """
+        if shutil.which('qemu-io') is None:
+            return
+        spec = json.dumps({
+            'driver': 'qcow2',
+            'file': {'driver': 'file', 'filename': str(overlay)},
+            'backing': None,
+        })
+        r = subprocess.run(
+            ['qemu-io', '-c', 'write -P 0xab 0 64k', f'json:{spec}'],
+            capture_output=True, text=True, timeout=30)
+        self.assertEqual(
+            r.returncode, 0, f'qemu-io seed failed: {r.stderr!r}')
+
     @staticmethod
     def _digest(path):
         return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -236,15 +256,7 @@ class TestCommitBackingAllowlist(TestCommitSmoke):
                 else:
                     reference = '../outside/victim.qcow2'
                 overlay = self._create_overlay(image_dir, reference)
-                if shutil.which('qemu-io') is not None:
-                    # Give the commit something to write, so a commit
-                    # that reached the victim would visibly change it.
-                    r = subprocess.run(
-                        ['qemu-io', '-f', 'qcow2',
-                         '-c', 'write -P 0xab 0 64k', str(overlay)],
-                        capture_output=True, text=True, timeout=30)
-                    self.assertEqual(
-                        r.returncode, 0, f'qemu-io seed failed: {r.stderr!r}')
+                self._seed_overlay(overlay)
                 before = self._digest(victim)
 
                 _, stderr, rc = self.run_instar_commit(overlay)
@@ -353,6 +365,88 @@ class TestCommitBackingAllowlist(TestCommitSmoke):
                 f'the refusal must not name a canonicalised recorded parent; '
                 f'stderr={stderr!r}')
             self.assertEqual(self._digest(victim), before)
+
+    def test_recorded_backing_never_falls_back_to_same_name(self):
+        """A file sharing the recorded backing's name is not written.
+
+        A read of this overlay would take ``base.qcow2`` beside it in
+        place of a recorded absolute backing that cannot be used, but
+        that file is only a namesake, so commit refuses rather than
+        writing into it, and says to name the target with `-b`. Once the
+        operator does name it, commit uses it.
+        """
+        self._require_qemu_img()
+        for where in ('outside', 'missing inside'):
+            with self.subTest(where=where), \
+                    tempfile.TemporaryDirectory() as td:
+                root = Path(td).resolve()
+                image_dir = root / 'images'
+                if where == 'outside':
+                    recorded = root / 'bases' / 'base.qcow2'
+                else:
+                    recorded = image_dir / 'sub' / 'base.qcow2'
+                namesake = self._create_qcow2(image_dir / 'base.qcow2')
+                overlay = self._create_overlay(image_dir, str(recorded))
+                self._seed_overlay(overlay)
+                before = self._digest(namesake)
+
+                _, stderr, rc = self.run_instar_commit(overlay)
+                self.assertNotEqual(
+                    rc, 0,
+                    f'expected the recorded backing to be refused; '
+                    f'stderr={stderr!r}')
+                self.assertIn(
+                    'pass -b BASE', stderr,
+                    f'expected the refusal to point at -b; stderr={stderr!r}')
+                self.assertNotIn(
+                    'beside the image', stderr,
+                    f'commit must not take the namesake; stderr={stderr!r}')
+                self.assertEqual(
+                    self._digest(namesake), before,
+                    'a refused commit must not write the namesake')
+
+                stdout, stderr, rc = self.run_instar_commit(
+                    overlay, '-b', str(namesake))
+                self.assertEqual(
+                    rc, 0, f'commit with -b failed: stderr={stderr!r}')
+                self.assertIn('Image committed.', stdout,
+                              f'unexpected stdout: {stdout!r}')
+
+    def test_explicit_base_outside_allowlist_commits(self):
+        """`-b` naming a recorded parent in another directory commits.
+
+        The parent is outside the default allowlist, so the overlay alone
+        cannot reach it. The operator naming it with `-b`, in the
+        spelling the overlay records or through a symlink to that
+        directory, is enough: the two spellings are compared without
+        looking at the parent.
+        """
+        self._require_qemu_img()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td).resolve()
+            image_dir = root / 'images'
+            base = self._create_qcow2(root / 'bases' / 'base.qcow2')
+            (root / 'bases-link').symlink_to(root / 'bases')
+            overlay = self._create_overlay(image_dir, str(base))
+
+            _, stderr, rc = self.run_instar_commit(overlay)
+            self.assertNotEqual(
+                rc, 0, f'expected an implicit commit to be refused; '
+                f'stderr={stderr!r}')
+            self.assertIn(
+                'outside allowed paths', stderr,
+                f'expected an allowlist refusal; stderr={stderr!r}')
+
+            for spelling, supplied in (
+                    ('as recorded', base),
+                    ('via symlink', root / 'bases-link' / 'base.qcow2')):
+                with self.subTest(spelling=spelling):
+                    stdout, stderr, rc = self.run_instar_commit(
+                        overlay, '-b', str(supplied))
+                    self.assertEqual(
+                        rc, 0, f'commit with -b failed: stderr={stderr!r}')
+                    self.assertIn('Image committed.', stdout,
+                                  f'unexpected stdout: {stdout!r}')
 
 
 # ----------------------------------------------------------------------

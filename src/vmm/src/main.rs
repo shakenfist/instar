@@ -50,8 +50,9 @@ use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 use backing::BackingStore;
 use chain::{
     check_chain_depth, check_circular_reference, peek_is_qcow2_v3, peek_is_vmdk_descriptor,
-    resolve_vmdk_flat_descriptor, validate_backing_path, BackingChain, ChainError, ChainImage,
-    ExternalDataFile, ImageFormat, InfoOperationResult,
+    reference_spells_path, resolve_vmdk_flat_descriptor, validate_backing_path,
+    validate_backing_write_target, BackingChain, ChainError, ChainImage, ExternalDataFile,
+    ImageFormat, InfoOperationResult,
 };
 use io_thread::{DeviceRole, IoDevice};
 use ioevent::IoEvent;
@@ -7481,7 +7482,11 @@ fn run_commit(args: CommitArgs, verbose: bool) -> Result<(), Box<dyn std::error:
     // overlay choose which host file gets written, and a refusal that
     // depended on whether the named file exists would tell the overlay
     // what is on the host. Relative references resolve against the
-    // overlay's directory, as qemu-img resolves them.
+    // overlay's directory, as qemu-img resolves them. Unlike a read,
+    // a reference that cannot be used as written does not fall back to
+    // its file name beside the overlay: that would be whatever file
+    // shares the name, and commit would write into it. The operator
+    // names such a file with -b instead.
     let recorded_backing = overlay_probe
         .backing_file_raw
         .as_deref()
@@ -7513,11 +7518,17 @@ fn run_commit(args: CommitArgs, verbose: bool) -> Result<(), Box<dyn std::error:
             }
             supplied.clone()
         }
-        (None, Some(raw)) => validate_backing_path(overlay_path, raw, &security_config).map_err(
-            |e| -> Box<dyn std::error::Error> {
-                format!("commit: cannot use the overlay's backing file '{raw}': {e}").into()
-            },
-        )?,
+        (None, Some(raw)) => validate_backing_write_target(overlay_path, raw, &security_config)
+            .map_err(|e| -> Box<dyn std::error::Error> {
+                let hint = match &e {
+                    ChainError::BackingFileNotAllowed { .. }
+                    | ChainError::BackingFileNotFound(_) => {
+                        "; pass -b BASE to name the file to commit into"
+                    }
+                    _ => "",
+                };
+                format!("commit: cannot use the overlay's backing file '{raw}': {e}{hint}").into()
+            })?,
         (None, None) => {
             return Err("commit: overlay has no recorded backing file; \
                         pass -b BASE to name one"
@@ -7583,13 +7594,22 @@ fn run_commit(args: CommitArgs, verbose: bool) -> Result<(), Box<dyn std::error:
     // If -b was supplied, verify it names the overlay's immediate
     // parent; committing through an intermediate image is not
     // supported. The supplied path is operator input and is canonicalised so
-    // symlinks / `..` don't produce false negatives; the recorded parent
-    // is image data, resolved through the allowlist exactly as the
-    // implicit form resolves it, and only its reference as recorded is
-    // ever printed -- never a host path derived from it.
+    // symlinks / `..` don't produce false negatives. The recorded parent
+    // is image data. A recorded reference spelled exactly as the
+    // supplied path, in either its given or its canonical form, is the
+    // parent without anything being looked at; that keeps a parent in
+    // a directory outside the allowlist committable when the operator
+    // names it. Otherwise the reference is resolved through the
+    // allowlist, as a read resolves it, file-name fallback included,
+    // since the file written is the one the operator named. Only the
+    // reference as recorded is ever printed -- never a host path
+    // derived from it.
     if let Some(supplied) = &explicit_base {
         let canonical_supplied = supplied.canonicalize().unwrap_or_else(|_| supplied.clone());
         match recorded_backing {
+            Some(raw)
+                if reference_spells_path(overlay_path, raw, supplied)
+                    || reference_spells_path(overlay_path, raw, &canonical_supplied) => {}
             Some(raw) => {
                 let recorded = validate_backing_path(overlay_path, raw, &security_config).map_err(
                     |e| -> Box<dyn std::error::Error> {
