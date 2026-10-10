@@ -812,6 +812,13 @@ jobs:
       # the variable through to the container; see
       # tests/base.py:_require_vhdiinfo and
       # tests/test_differencing.py:TestDifferencingLibvhdiOracle.
+      #
+      # The same variable covers the binding half of the oracle, which
+      # reads composed content rather than structure: python3-libvhdi
+      # in the same image, tests/base.py:_require_pyvhdi, and
+      # tests/test_differencing.py:TestDifferencingOracleComposes.
+      # The two come from one upstream release, so one switch decides
+      # both.
       - name: Run core integration tests
         env:
           INSTAR_REQUIRE_LIBVHDI: '1'

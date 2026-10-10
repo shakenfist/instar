@@ -108,6 +108,10 @@ The classes are:
 * `TestDifferencingLibvhdiOracle` -- the only place an independent
   parser reads a differencing child instar wrote and is asked whether
   it names the intended parent.
+* `TestDifferencingOracleComposes` -- the same parser reading composed
+  content rather than structure: three readers compose each real
+  chain and agree, with one pinned exception where libvhdi's sector
+  bitmap decoder is known to be wrong.
 """
 
 import json
@@ -3669,12 +3673,13 @@ class TestDifferencingLibvhdiOracle(DifferencingTestBase):
 
     Scope, deliberately narrow: **structure only**. Nothing here reads
     composed image content -- whether instar assembles a chain the way
-    libvhdi does is a separate question, and one that could not be
-    asked at all until instar could compose a chain. The
-    split also falls on a real seam: the fields below never reach
-    libvhdi's VHD sector-bitmap decoder, which is where the known
-    oracle defect (defect A, see tests/manifest.json on
-    `vhd-diff-child-mixed.vhd`) lives.
+    libvhdi does is `TestDifferencingOracleComposes`'s question, asked
+    with the same parser over the same chains. The split falls on a
+    real seam: the fields below never reach libvhdi's VHD
+    sector-bitmap decoder, which is where the known oracle defect
+    (defect A, see tests/manifest.json on `vhd-diff-child-mixed.vhd`)
+    lives, so a defect that forces an exception there cannot reach an
+    assertion here.
 
     Not used here: the `vhd-diff-locator-overlong.vhd` fixture, whose
     parent unicode name fills all 512 bytes with no NUL terminator.
@@ -3989,3 +3994,244 @@ class TestDifferencingLibvhdiOracle(DifferencingTestBase):
                 f'libvhdi reads a parent linkage that is not the parent\'s '
                 f'active-header DataWriteGuid: {fields!r}'
             )
+
+
+class TestDifferencingOracleComposes(DifferencingTestBase):
+    """Three readers compose each real chain, and they agree.
+
+    `TestDifferencingLibvhdiOracle` asks libvhdi a question about
+    *structure*: does a child instar wrote name the parent it was
+    told to name. This class asks the other half, and the one that
+    could not be asked until instar could compose a chain at all:
+    given a child and its parent, do independent readers produce the
+    same bytes?
+
+    Three of them, and the third is the point. The recorded
+    `*-composed.raw` goldens and `instar convert -O raw` are compared
+    everywhere in this file already, and both are checked here too so
+    that a disagreement can be attributed rather than merely noticed.
+    What is new is libvhdi reading the same two files through
+    `set_parent`, which shares no code and no author with either: a
+    sector whose ownership the goldens and instar both got wrong the
+    same way -- the generator and the reader built from one reading of
+    the specification -- would pass every other test in this file and
+    fail here.
+
+    libvhdi cannot compose by accident. A differencing child opened
+    without a parent fails every read rather than serving the child's
+    own blocks or zeros for the sectors it does not own, and
+    `set_parent` checks the parent's recorded identity against the
+    child's before accepting it. So an oracle that had quietly stopped
+    composing would raise, not agree; the test below asserts the first
+    of those directly rather than leaving it as a claim.
+
+    **The one pinned exception.** libvhdi decodes a VHD per-block
+    sector bitmap with an unmasked shift, so once a higher bit in a
+    bitmap byte is set, every later sector that byte covers reads as
+    present in the child (defect A, recorded against
+    `vhd-diff-child-mixed.vhd` in tests/manifest.json).
+    `vhd-diff-child-mixed` is the fixture built to put parent-owned
+    and child-owned sectors in one bitmap byte, and sector 2 is where
+    that lands: libvhdi reads it out of the child's block, which was
+    never written there, so it returns **zeros** -- not the child's
+    data, which is what a reader of the defect would expect to find.
+    `vhd-diff-child-aligned` is the fixture built to keep ownership
+    out of shared bitmap bytes, and libvhdi agrees with it on all
+    16777216 bytes. That contrast is the control: the fault is
+    libvhdi's decoder and not this harness, nor the generator, nor
+    instar.
+
+    The exception is asserted positively, in both directions. That
+    sector must differ, and the oracle's bytes there must be exactly
+    512 zeros, while the golden and instar must both hold the
+    parent's pattern. Allowing the sector to agree would be the easy
+    shape and the wrong one: it would make this class insensitive to
+    the defect widening, and it would keep quiet on the day the defect
+    is fixed upstream, when the right outcome is a red test and one
+    table entry deleted with a clear conscience.
+    """
+
+    #: Where libvhdi's composition is known to be wrong, as fixture id
+    #: to sector index. Every other chain must agree exactly, and a
+    #: chain listed here must disagree at exactly the sector named --
+    #: both are asserted, so this table cannot drift into permission
+    #: for an unrelated difference.
+    ORACLE_DEFECT_SECTORS = {
+        'vhd-diff-child-mixed': 2,
+    }
+
+    #: The unit the compositions are compared in. Sector-wise rather
+    #: than byte-wise because a composition defect is a whole sector
+    #: taken from the wrong image, and because 16 MiB of Python
+    #: byte-at-a-time comparison costs seconds where this costs
+    #: milliseconds.
+    SECTOR_SIZE = 512
+
+    def _oracle_composition(self, image_id: str) -> bytes:
+        """Compose one real chain with libvhdi; return every byte.
+
+        The child and its parent are read where they sit, not copied.
+        `set_parent` is given the parent explicitly, so nothing here
+        depends on libvhdi resolving the path the child records -- the
+        resolution behaviour is the other oracle class's subject, and
+        keeping it out of this one means a locator defect cannot be
+        mistaken for a composition defect.
+        """
+        child = self.differencing_image(image_id)
+        parent_name = CHAIN_FIXTURE_PARENT[image_id]
+        parent = self.differencing_image(Path(parent_name).stem)
+        return self.compose_with_pyvhdi(child, parent)
+
+    def _differing_sectors(self, got: bytes, want: bytes, context: str) -> list:
+        """Sector indexes at which two compositions of one chain differ."""
+        self.assertEqual(
+            len(want), len(got),
+            f'{context}: compared {len(got)} bytes against {len(want)}'
+        )
+        self.assertEqual(
+            0, len(got) % self.SECTOR_SIZE,
+            f'{context}: {len(got)} bytes is not a whole number of '
+            f'{self.SECTOR_SIZE}-byte sectors, so a sector-wise comparison '
+            f'would skip the tail'
+        )
+        if got == want:
+            return []
+        return [
+            sector for sector in range(len(got) // self.SECTOR_SIZE)
+            if got[sector * self.SECTOR_SIZE:(sector + 1) * self.SECTOR_SIZE]
+            != want[sector * self.SECTOR_SIZE:(sector + 1) * self.SECTOR_SIZE]
+        ]
+
+    def _sector(self, data: bytes, sector: int) -> bytes:
+        """One sector out of a composition."""
+        return data[sector * self.SECTOR_SIZE:(sector + 1) * self.SECTOR_SIZE]
+
+    def _assert_three_readers_agree(self, image_id: str, golden_id: str) -> None:
+        """Compare golden, instar and libvhdi over one chain."""
+        golden = self.composed_golden(golden_id).read_bytes()
+        oracle = self._oracle_composition(image_id)
+
+        # The length comes from what libvhdi reports as the media size,
+        # compared with the recorded composition rather than with a
+        # constant. A chain regenerated at another virtual size stays
+        # testable; a chain whose two readers disagree about how big it
+        # is fails here rather than in a short comparison further down.
+        self.assertEqual(
+            len(golden), len(oracle),
+            f'{image_id}: libvhdi reports a media size of {len(oracle)} '
+            f'bytes where the recorded composition is {len(golden)}'
+        )
+
+        source = self.differencing_image(image_id)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / 'composed.raw'
+            stdout, stderr, rc = self.run_instar_convert(
+                source, out, output_format='raw'
+            )
+            self.assertEqual(
+                0, rc,
+                f'{image_id}: convert must compose a chain whose parent is '
+                f'beside it; stdout={stdout[:400]!r} stderr={stderr[:400]!r}'
+            )
+            self.assertTrue(
+                out.exists(),
+                f'{image_id}: convert exited 0 and wrote nothing'
+            )
+            produced = out.read_bytes()
+
+        self.assertEqual(
+            [], self._differing_sectors(produced, golden, image_id),
+            f'{image_id}: instar disagrees with the recorded composition, so '
+            f'the oracle comparison below would be measuring two faults at '
+            f'once'
+        )
+
+        defect_sector = self.ORACLE_DEFECT_SECTORS.get(image_id)
+        expected = [] if defect_sector is None else [defect_sector]
+        for label, other in (('the recorded composition', golden),
+                             ('instar', produced)):
+            self.assertEqual(
+                expected,
+                self._differing_sectors(oracle, other, image_id),
+                f'{image_id}: libvhdi and {label} differ at a set of sectors '
+                f'that is not the known one. An empty result where a sector '
+                f'was expected means libvhdi now composes this chain '
+                f'correctly and the exception should be deleted; anything '
+                f'else is a real disagreement between two independent '
+                f'readers.'
+            )
+
+        if defect_sector is None:
+            return
+
+        # The shape of the exception, not merely its position. libvhdi
+        # reads this sector out of the child's block, which the
+        # generator never wrote, so what comes back is zeros rather
+        # than the child's data for some other sector.
+        self.assertEqual(
+            bytes(self.SECTOR_SIZE), self._sector(oracle, defect_sector),
+            f'{image_id}: libvhdi mis-composes sector {defect_sector} as '
+            f'expected, but with something other than zeros, so its decoder '
+            f'is now wrong in a way this exception does not describe'
+        )
+        pattern = f'PARENT-sector-{defect_sector:06d}'.encode()
+        for label, data in (('the recorded composition', golden),
+                            ('instar', produced)):
+            self.assertTrue(
+                self._sector(data, defect_sector).startswith(pattern),
+                f'{image_id}: {label} does not hold {pattern!r} at sector '
+                f'{defect_sector}, so this chain no longer leaves that '
+                f'sector to its parent and the exception is pinned to the '
+                f'wrong place'
+            )
+
+    def test_three_readers_compose_each_chain_identically(self):
+        """Golden, instar and libvhdi agree on every real chain.
+
+        One `convert` per chain, and one libvhdi composition per
+        chain, compared whole. The oracle read is 16 MiB in a single
+        call and costs under a tenth of a second, so nothing here
+        trades coverage for time.
+        """
+        for image_id, golden_id, _format_name in COMPOSED_CHAIN_FIXTURES:
+            with self.subTest(image=image_id):
+                self._assert_three_readers_agree(image_id, golden_id)
+
+    def test_the_oracle_cannot_compose_without_being_given_a_parent(self):
+        """A differencing child libvhdi opens alone fails every read.
+
+        The guard that keeps the comparison above from going vacuous.
+        If `set_parent` were ignored -- a renamed method, a binding
+        that took its argument by value, an upstream change of
+        semantics -- libvhdi would have to serve something for the
+        sectors the child leaves to its parent, and if that something
+        were zeros then a composition of a chain whose parent-owned
+        sectors happened to be zero would still match.
+
+        It is not: libvhdi refuses the read outright, at the
+        parent-owned probe sector of each chain. That is also the
+        contrast worth recording, because serving zeros in place of an
+        absent parent is exactly the shape instar shipped in issue
+        #547.
+        """
+        pyvhdi = self._require_pyvhdi()
+        for image_id, _golden_id, _format_name in COMPOSED_CHAIN_FIXTURES:
+            with self.subTest(image=image_id):
+                parent_owned, _child_owned = CHAIN_PROBE_SECTORS[image_id]
+                child = self.differencing_image(image_id)
+                handle = pyvhdi.file()
+                handle.open(str(child), 'r')
+                try:
+                    with self.assertRaises(
+                        OSError,
+                        msg=f'{image_id}: libvhdi served a parent-owned '
+                            f'sector from a child with no parent set, so a '
+                            f'composition it reports cannot be trusted to '
+                            f'have involved the parent at all'
+                    ):
+                        handle.read_buffer_at_offset(
+                            self.SECTOR_SIZE,
+                            parent_owned * self.SECTOR_SIZE
+                        )
+                finally:
+                    handle.close()

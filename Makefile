@@ -491,10 +491,16 @@ VENV_DIR := $(TESTS_DIR)/.venv
 TESTDATA_PATH ?= $(CURDIR)/../instar-testdata
 
 # Create virtual environment for tests
+#
+# --system-site-packages because one of the suite's dependencies is not
+# installable from PyPI: libvhdi's pyvhdi binding ships only as the
+# distribution package python3-libvhdi, into dist-packages, and an
+# isolated venv cannot see it. The differencing suite uses it as the
+# external oracle for composed content; see tests/base.py.
 test-venv:
 	@echo "Creating Python virtual environment for tests..."
 	@if [ ! -d "$(VENV_DIR)" ]; then \
-		$(PYTHON) -m venv $(VENV_DIR); \
+		$(PYTHON) -m venv --system-site-packages $(VENV_DIR); \
 	fi
 	@$(VENV_DIR)/bin/pip install -q -r $(TESTS_DIR)/requirements.txt
 	@echo "Virtual environment ready at $(VENV_DIR)"
@@ -642,6 +648,11 @@ test-integration: instar test-venv
 # inside the container only when the caller set it. CI sets it, which
 # turns a silently-skipping libvhdi oracle into a failure instead of an
 # invisible skip; see tests/base.py:_require_vhdiinfo.
+#
+# The venv is built with --system-site-packages for the other half of
+# that oracle: python3-libvhdi installs the pyvhdi binding into the
+# image's dist-packages, and an isolated venv would not see it, so the
+# suite would report the package missing on an image that has it.
 test-container: instar-devcontainer instar
 	@echo "Running tests inside container..."
 	@if [ ! -d "$(TESTDATA_PATH)" ]; then \
@@ -662,7 +673,7 @@ test-container: instar-devcontainer instar
 		"$(INSTAR_DEV_IMAGE)" \
 		bash -c '\
 			echo "Setting up test environment..."; \
-			python3 -m venv /build/test-venv && \
+			python3 -m venv --system-site-packages /build/test-venv && \
 			/build/test-venv/bin/pip install -q -r tests/requirements.txt && \
 			echo "Running tests (excluding test_info_malicious)..."; \
 			cd tests && \
@@ -678,6 +689,11 @@ test-container: instar-devcontainer instar
 # inside the container only when the caller set it. CI sets it, which
 # turns a silently-skipping libvhdi oracle into a failure instead of an
 # invisible skip; see tests/base.py:_require_vhdiinfo.
+#
+# The venv is built with --system-site-packages for the other half of
+# that oracle: python3-libvhdi installs the pyvhdi binding into the
+# image's dist-packages, and an isolated venv would not see it, so the
+# suite would report the package missing on an image that has it.
 test-container-core: instar-devcontainer instar
 	@echo "Running core integration tests inside container..."
 	@if [ ! -d "$(TESTDATA_PATH)" ]; then \
@@ -698,7 +714,7 @@ test-container-core: instar-devcontainer instar
 		"$(INSTAR_DEV_IMAGE)" \
 		bash -c '\
 			echo "Setting up test environment..."; \
-			python3 -m venv /build/test-venv && \
+			python3 -m venv --system-site-packages /build/test-venv && \
 			/build/test-venv/bin/pip install -q -r tests/requirements.txt && \
 			echo "Running core tests (excluding convert, compare, malicious)..."; \
 			cd tests && \
