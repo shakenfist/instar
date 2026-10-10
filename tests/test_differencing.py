@@ -112,6 +112,11 @@ The classes are:
   content rather than structure: three readers compose each real
   chain and agree, with one pinned exception where libvhdi's sector
   bitmap decoder is known to be wrong.
+* `TestDifferencingCreatedChildComposes` -- the write-then-read loop
+  over instar's own output: a child `create -b` wrote composes to
+  exactly its parent's content, read back by instar and by libvhdi,
+  with a second pinned exception where libvhdi ignores a chunk whose
+  sector bitmap is absent.
 """
 
 import json
@@ -345,6 +350,19 @@ class DifferencingTestBase(InstarTestBase):
     #: operation that refused.
     COMPOSING_OP_NAMES = ('convert', 'dd', 'compare', 'bench', 'rebase')
 
+    #: The unit the compositions are compared in. Sector-wise rather
+    #: than byte-wise because a composition defect is a whole sector
+    #: taken from the wrong image, and because 16 MiB of Python
+    #: byte-at-a-time comparison costs seconds where this costs
+    #: milliseconds.
+    SECTOR_SIZE = 512
+
+    #: The all-zero GUID, which is what every identity field of an
+    #: image instar writes holds today (#566). Asserted against
+    #: wherever an identity comparison would otherwise be able to
+    #: pass by comparing zeros with zeros.
+    ZERO_GUID = '00000000-0000-0000-0000-000000000000'
+
     def assert_refusal_names_itself_not_instar(self, op: str, message: str) -> None:
         """Assert `message` names `op` and never reads as a claim about
         every operation in the tool.
@@ -468,6 +486,86 @@ class DifferencingTestBase(InstarTestBase):
         if not image.path.exists():
             self.skipTest(f'fixture not available: {image.path}')
         return image.path
+
+    def _differing_sectors(self, got: bytes, want: bytes, context: str) -> list:
+        """Sector indexes at which two compositions of one chain differ."""
+        self.assertEqual(
+            len(want), len(got),
+            f'{context}: compared {len(got)} bytes against {len(want)}'
+        )
+        self.assertEqual(
+            0, len(got) % self.SECTOR_SIZE,
+            f'{context}: {len(got)} bytes is not a whole number of '
+            f'{self.SECTOR_SIZE}-byte sectors, so a sector-wise comparison '
+            f'would skip the tail'
+        )
+        if got == want:
+            return []
+        return [
+            sector for sector in range(len(got) // self.SECTOR_SIZE)
+            if got[sector * self.SECTOR_SIZE:(sector + 1) * self.SECTOR_SIZE]
+            != want[sector * self.SECTOR_SIZE:(sector + 1) * self.SECTOR_SIZE]
+        ]
+
+    def _sector(self, data: bytes, sector: int) -> bytes:
+        """One sector out of a composition."""
+        return data[sector * self.SECTOR_SIZE:(sector + 1) * self.SECTOR_SIZE]
+
+    def _stage_parent(self, image_id: str, workdir, subdirectory=None):
+        """Copy a parent fixture under *workdir*; return (path, typed name).
+
+        Copying rather than referencing in place keeps the emitted
+        parent path short and relative, and keeps the test from writing
+        beside the fixture. The typed name is what goes to `-b`, which
+        for the VHD arm is also what `vhdiinfo` must read back.
+
+        An absent fixture fails rather than skips: these are the only
+        automated runs of the oracle against instar's own output, so a
+        skip here would turn that coverage green while checking
+        nothing. `InstarTestBase._load_manifest` already raises in
+        `setUpClass` when there is no testdata checkout at all, so this
+        covers only a checkout missing this one file.
+        """
+        source = self.get_image(image_id).path
+        self.assertTrue(
+            source.exists(),
+            f'testdata is present but the parent fixture is not: {source}'
+        )
+        destination_dir = Path(workdir)
+        if subdirectory is not None:
+            destination_dir = destination_dir / subdirectory
+            destination_dir.mkdir(parents=True)
+        destination = destination_dir / source.name
+        shutil.copyfile(source, destination)
+        typed = source.name
+        if subdirectory is not None:
+            typed = f'{subdirectory}/{source.name}'
+        return destination, typed
+
+    def _create_child(self, workdir, fmt: str, typed_parent: str, child_name: str) -> Path:
+        """`instar create -f FMT -b TYPED -F FMT CHILD`, run from *workdir*.
+
+        `-F` is not optional: `create -b` refuses to guess a backing
+        format and demands either `-F` or `-u`. Running from *workdir*
+        makes the relative `-b` resolve the way a user's would, which
+        is also what keeps the emitted parent path relative.
+        """
+        instar = self.get_instar_binary()
+        r = subprocess.run(
+            [str(instar), 'create', '-f', fmt, '-b', typed_parent, '-F', fmt,
+             child_name],
+            capture_output=True, text=True, timeout=60, cwd=str(workdir)
+        )
+        self.assertEqual(
+            0, r.returncode,
+            f'creating the {fmt} child failed: stdout={r.stdout!r} '
+            f'stderr={r.stderr!r}'
+        )
+        child = Path(workdir) / child_name
+        self.assertTrue(
+            child.exists(), f'create -f {fmt} exited 0 but wrote no child'
+        )
+        return child
 
     def run_instar_measure(self, *args, timeout=60):
         """Invoke `instar measure`. Returns (stdout, stderr, rc)."""
@@ -3716,8 +3814,6 @@ class TestDifferencingLibvhdiOracle(DifferencingTestBase):
     # thing a differencing disk.
     DIFFERENTIAL = 'Differential'
 
-    ZERO_GUID = '00000000-0000-0000-0000-000000000000'
-
     # `vhdiinfo` prints one field per line as a tab-indented label, a
     # colon, and the value. Lines at column zero are the version banner
     # and the "Virtual Hard Disk image information:" heading, which
@@ -3792,62 +3888,6 @@ class TestDifferencingLibvhdiOracle(DifferencingTestBase):
             f'test knows how to compare; the zero-identity guard would not fire'
         )
         return value.strip('{}').lower()
-
-    def _stage_parent(self, image_id: str, workdir, subdirectory=None):
-        """Copy a parent fixture under *workdir*; return (path, typed name).
-
-        Copying rather than referencing in place keeps the emitted
-        parent path short and relative, and keeps the test from writing
-        beside the fixture. The typed name is what goes to `-b`, which
-        for the VHD arm is also what `vhdiinfo` must read back.
-
-        An absent fixture fails rather than skips: these are the only
-        automated runs of the oracle against instar's own output, so a
-        skip here would turn that coverage green while checking
-        nothing. `InstarTestBase._load_manifest` already raises in
-        `setUpClass` when there is no testdata checkout at all, so this
-        covers only a checkout missing this one file.
-        """
-        source = self.get_image(image_id).path
-        self.assertTrue(
-            source.exists(),
-            f'testdata is present but the parent fixture is not: {source}'
-        )
-        destination_dir = Path(workdir)
-        if subdirectory is not None:
-            destination_dir = destination_dir / subdirectory
-            destination_dir.mkdir(parents=True)
-        destination = destination_dir / source.name
-        shutil.copyfile(source, destination)
-        typed = source.name
-        if subdirectory is not None:
-            typed = f'{subdirectory}/{source.name}'
-        return destination, typed
-
-    def _create_child(self, workdir, fmt: str, typed_parent: str, child_name: str) -> Path:
-        """`instar create -f FMT -b TYPED -F FMT CHILD`, run from *workdir*.
-
-        `-F` is not optional: `create -b` refuses to guess a backing
-        format and demands either `-F` or `-u`. Running from *workdir*
-        makes the relative `-b` resolve the way a user's would, which
-        is also what keeps the emitted parent path relative.
-        """
-        instar = self.get_instar_binary()
-        r = subprocess.run(
-            [str(instar), 'create', '-f', fmt, '-b', typed_parent, '-F', fmt,
-             child_name],
-            capture_output=True, text=True, timeout=60, cwd=str(workdir)
-        )
-        self.assertEqual(
-            0, r.returncode,
-            f'creating the {fmt} child failed: stdout={r.stdout!r} '
-            f'stderr={r.stderr!r}'
-        )
-        child = Path(workdir) / child_name
-        self.assertTrue(
-            child.exists(), f'create -f {fmt} exited 0 but wrote no child'
-        )
-        return child
 
     def test_libvhdi_reads_a_vhd_child_as_naming_its_parent(self):
         """`vhdiinfo` on a VHD child reports the parent instar was given.
@@ -4060,13 +4100,6 @@ class TestDifferencingOracleComposes(DifferencingTestBase):
         'vhd-diff-child-mixed': 2,
     }
 
-    #: The unit the compositions are compared in. Sector-wise rather
-    #: than byte-wise because a composition defect is a whole sector
-    #: taken from the wrong image, and because 16 MiB of Python
-    #: byte-at-a-time comparison costs seconds where this costs
-    #: milliseconds.
-    SECTOR_SIZE = 512
-
     def _oracle_composition(self, image_id: str) -> bytes:
         """Compose one real chain with libvhdi; return every byte.
 
@@ -4081,30 +4114,6 @@ class TestDifferencingOracleComposes(DifferencingTestBase):
         parent_name = CHAIN_FIXTURE_PARENT[image_id]
         parent = self.differencing_image(Path(parent_name).stem)
         return self.compose_with_pyvhdi(child, parent)
-
-    def _differing_sectors(self, got: bytes, want: bytes, context: str) -> list:
-        """Sector indexes at which two compositions of one chain differ."""
-        self.assertEqual(
-            len(want), len(got),
-            f'{context}: compared {len(got)} bytes against {len(want)}'
-        )
-        self.assertEqual(
-            0, len(got) % self.SECTOR_SIZE,
-            f'{context}: {len(got)} bytes is not a whole number of '
-            f'{self.SECTOR_SIZE}-byte sectors, so a sector-wise comparison '
-            f'would skip the tail'
-        )
-        if got == want:
-            return []
-        return [
-            sector for sector in range(len(got) // self.SECTOR_SIZE)
-            if got[sector * self.SECTOR_SIZE:(sector + 1) * self.SECTOR_SIZE]
-            != want[sector * self.SECTOR_SIZE:(sector + 1) * self.SECTOR_SIZE]
-        ]
-
-    def _sector(self, data: bytes, sector: int) -> bytes:
-        """One sector out of a composition."""
-        return data[sector * self.SECTOR_SIZE:(sector + 1) * self.SECTOR_SIZE]
 
     def _assert_three_readers_agree(self, image_id: str, golden_id: str) -> None:
         """Compare golden, instar and libvhdi over one chain."""
@@ -4235,3 +4244,345 @@ class TestDifferencingOracleComposes(DifferencingTestBase):
                         )
                 finally:
                     handle.close()
+
+
+class TestDifferencingCreatedChildComposes(DifferencingTestBase):
+    """A child `create -b` wrote reads back as its parent's content.
+
+    The write-then-read loop over instar's own differencing output,
+    which nothing else in the tree closes. `test_create.py` asserts
+    what a created child *records* about its parent -- the identity
+    fields, the backing filename, the disk type -- and never reads a
+    byte through it, while every composition this file checks is of a
+    chain `scripts/create-vhd-testdata.sh` wrote. So a child instar's
+    own emitters produced had never been handed to a reader at all,
+    which is the one case here where a disagreement indicts the
+    writer rather than the reader.
+
+    The expectation needs no new fixture and no golden. A freshly
+    created child allocates nothing -- every VHD BAT entry is
+    `0xffffffff`, and every VHDX BAT entry is zero, payload and
+    sector bitmap alike -- so the child owns no sector and the chain
+    composes to exactly its parent's own content. `convert -O raw` of
+    the parent alone is therefore the expectation, and it is produced
+    by the same reader rather than recorded, which is why libvhdi
+    reading the same two files is what makes this a cross-check and
+    not a tautology. The parent's composition is asserted to hold
+    something other than zeros first: two readers agreeing on 16 MiB
+    of nothing would agree whatever either of them did.
+
+    The parents are the third-party fixtures, for the reason
+    `TestDifferencingLibvhdiOracle` gives: every image instar writes
+    carries the same constant identity (#566), so a child instar
+    wrote against a parent instar wrote would satisfy libvhdi's
+    identity check by comparing zeros to zeros. The identity is
+    asserted non-zero before the acceptance is read as meaning
+    anything.
+
+    **libvhdi reads the padded differencing BAT.** A differencing
+    VHDX reserves its BAT in whole chunk groups of `chunk_ratio + 1`
+    entries where an image with no parent stops at the last entry its
+    virtual disk needs (issue #623), so instar's differencing BAT is
+    longer than any third-party reader has been shown one. Measured
+    rather than assumed, and it is read without complaint: libvhdi
+    accepts the child, reports the parent's 16 MiB media size, and
+    returns every byte of it. The same holds at both of instar's
+    block sizes -- the 32 MiB default and `block_size=1M`, which puts
+    the padding in a different place -- and the two compositions come
+    back byte-identical.
+
+    **Defect D: libvhdi ignores `SB_BLOCK_NOT_PRESENT`.** What it
+    does not read correctly is the *absence* of a sector bitmap. A
+    chunk whose sector-bitmap BAT entry is not present is legal while
+    no payload block in that chunk is partially present, and it is
+    the only thing a child with nothing written in it can say.
+    libvhdi composes such a chunk as though the bitmap lay at file
+    offset zero: it takes the child's own file identifier as a
+    megabyte of bitmap, so every sector whose bit happens to be set
+    in `vhdxfile` and the UTF-16 creator string after it reads as
+    owned by the child, and is then served out of the child's file at
+    the same offset as the virtual sector. 56 of this child's 32768
+    sectors are claimed that way. Two of them show: virtual sector 5,
+    where the parent holds its pattern and the child's file holds
+    zeros, and virtual sector 128, where the child's file holds its
+    own VHDX header and the parent holds zeros. The rest are zeros on
+    both sides and invisible, which is why this is asserted against
+    the whole predicted composition rather than against the two
+    sectors that happen to differ today.
+
+    The control that makes it libvhdi's defect and not instar's:
+    appending a megabyte of zeros to the child and pointing the
+    chunk's sector-bitmap entry at it with `SB_BLOCK_PRESENT` -- the
+    only change, and a bitmap of zeros says exactly what an absent
+    one says -- makes libvhdi compose the chain to the parent's
+    content exactly. Neither the BAT padding nor the block size nor
+    the parent is involved; the ignored state is.
+
+    instar never makes the same mistake, by two separate guards, and
+    it is worth being exact about which one does the work here.
+    `sector_bitmap_lookup` fails any entry whose state is not
+    `SB_BLOCK_PRESENT` rather than dereferencing it, which is
+    precisely the step libvhdi takes and instar does not; and
+    separately it refuses a *present* entry naming offset zero,
+    because a zeroed or truncated entry whose state bits happen to
+    read as present can only name offset zero, and the file
+    identifier there is not a sector bitmap (issue #547). The second
+    guard is the one that was written against a crafted image before
+    anything was known to produce one, and it is not the one that
+    saves instar on this child: a child that allocates nothing has
+    every payload block not present, so the composing reader descends
+    to the parent and never asks about a bitmap at all.
+
+    Not asserted, and worth knowing before someone goes looking for
+    it: `get_parent_filename()` returns `None` for this VHDX child.
+    instar writes a single parent-locator key, `relative_path` for
+    the relative path `-b` was given, and libvhdi looks that key up
+    with the wrong length and never matches it (defect B). Path
+    resolution is the other oracle class's subject, `set_parent` is
+    handed the parent explicitly here, and pinning a second upstream
+    defect in a test about composed content would make this class
+    fail for a reason that is not its own.
+    """
+
+    #: The `create -f` formats whose freshly created child libvhdi
+    #: mis-composes, with the shape of the error asserted positively
+    #: below so that an upstream fix turns this class red rather than
+    #: quiet. VHD is absent deliberately: a created VHD child
+    #: allocates no block at all, so libvhdi never reaches a sector
+    #: bitmap for it and composes the chain exactly.
+    ORACLE_ABSENT_BITMAP_FORMATS = ('vhdx',)
+
+    #: Each case as (`create -f` format, parent fixture id, child
+    #: basename). The parent is staged beside the child and named to
+    #: `-b` relatively, which is both how a user writes it and what
+    #: keeps the recorded parent path short.
+    CREATED_CHILD_CASES = (
+        ('vpc', 'vhd-diff-parent', 'child.vhd'),
+        ('vhdx', 'vhdx-diff-parent', 'child.vhdx'),
+    )
+
+    #: libvhdi's numeric disk type for a differencing image of either
+    #: format; `vhdiinfo` prints the same value as `Differential`.
+    DIFFERENTIAL_DISK_TYPE = 4
+
+    def _create_chain(self, workdir, fmt: str, parent_id: str, child_name: str):
+        """Stage a third-party parent and create a child against it.
+
+        Returns (child, parent) as paths inside *workdir*.
+        """
+        parent, typed = self._stage_parent(parent_id, workdir)
+        child = self._create_child(workdir, fmt, typed, child_name)
+        return child, parent
+
+    def _instar_composition(self, source: Path, outdir, label: str) -> bytes:
+        """`convert -O raw` of one image; return every byte of it.
+
+        The output goes somewhere other than the directory holding the
+        chain. A raw file written beside the child is harmless to the
+        walk today, and it is one fewer thing for a future reader of a
+        failure to have to rule out.
+        """
+        out = Path(outdir) / f'{label}.raw'
+        stdout, stderr, rc = self.run_instar_convert(
+            source, out, output_format='raw'
+        )
+        self.assertEqual(
+            0, rc,
+            f'{label}: convert of {source.name} failed; '
+            f'stdout={stdout[:400]!r} stderr={stderr[:400]!r}'
+        )
+        self.assertTrue(
+            out.exists(), f'{label}: convert exited 0 and wrote nothing'
+        )
+        return out.read_bytes()
+
+    def _composition_libvhdi_reads_without_a_bitmap(
+        self, child: Path, parent_composition: bytes
+    ) -> bytes:
+        """Defect D's composition, written out rather than described.
+
+        The class docstring says what libvhdi does with a chunk whose
+        sector-bitmap entry is not present; this produces the bytes
+        that follow from it, so the assertion can be an equality over
+        the whole 16 MiB rather than a list of the sectors that
+        happen to be visibly wrong in this chain. A defect that
+        widened, narrowed or moved would stop matching.
+
+        The bitmap is the child's file from offset zero, one bit per
+        sector, least significant bit first; a sector whose bit is
+        set comes from the child's file at the virtual sector's own
+        offset, and every other sector from the parent.
+        """
+        child_bytes = child.read_bytes()
+        sectors = len(parent_composition) // self.SECTOR_SIZE
+        self.assertGreater(
+            len(child_bytes), sectors // 8,
+            f'{child.name} is too short to hold the bitmap bits this model '
+            f'reads out of it, so the model does not describe this child'
+        )
+        composed = bytearray()
+        for sector in range(sectors):
+            if child_bytes[sector // 8] >> (sector % 8) & 1:
+                end = (sector + 1) * self.SECTOR_SIZE
+                self.assertLessEqual(
+                    end, len(child_bytes),
+                    f'{child.name}: the model claims sector {sector} for the '
+                    f'child, which lies past the end of its file -- what '
+                    f'libvhdi reads there has not been measured'
+                )
+                composed += self._sector(child_bytes, sector)
+            else:
+                composed += self._sector(parent_composition, sector)
+        return bytes(composed)
+
+    def test_three_readers_compose_a_created_child(self):
+        """A created child, its parent alone, and libvhdi.
+
+        One `create -b`, two `convert -O raw` runs and one libvhdi
+        composition per format. The child owns nothing, so the first
+        two must be identical; libvhdi must agree for VHD and must
+        disagree in exactly defect D's shape for VHDX.
+        """
+        for fmt, parent_id, child_name in self.CREATED_CHILD_CASES:
+            with self.subTest(format=fmt):
+                with tempfile.TemporaryDirectory() as td:
+                    child, parent = self._create_chain(
+                        td, fmt, parent_id, child_name)
+                    with tempfile.TemporaryDirectory() as outdir:
+                        through_child = self._instar_composition(
+                            child, outdir, f'{fmt}-child')
+                        parent_only = self._instar_composition(
+                            parent, outdir, f'{fmt}-parent')
+
+                    self.assertEqual(
+                        IMAGE_VIRTUAL_SIZE, len(parent_only),
+                        f'{fmt}: the parent fixture no longer declares '
+                        f'{IMAGE_VIRTUAL_SIZE} bytes, so every length '
+                        f'compared below has moved'
+                    )
+                    # Two readers agreeing on 16 MiB of zeros would
+                    # agree whatever either of them did with a parent.
+                    self.assertTrue(
+                        any(parent_only),
+                        f'{fmt}: the parent composes to nothing but zeros, so '
+                        f'the comparisons below cannot tell a composed chain '
+                        f'from an ignored parent'
+                    )
+                    self.assertEqual(
+                        [], self._differing_sectors(
+                            through_child, parent_only, fmt),
+                        f'{fmt}: instar reads its own freshly created child '
+                        f'as something other than its parent, though the '
+                        f'child allocates no block and owns no sector'
+                    )
+
+                    # Last, and deliberately: instar's own two answers
+                    # are compared first so that a writer defect is
+                    # named as one rather than surfacing as an
+                    # exception out of the oracle, which would be two
+                    # faults measured at once.
+                    oracle = self.compose_with_pyvhdi(child, parent)
+
+                    if fmt not in self.ORACLE_ABSENT_BITMAP_FORMATS:
+                        self.assertEqual(
+                            [], self._differing_sectors(
+                                oracle, parent_only, fmt),
+                            f'{fmt}: libvhdi composes a child instar created '
+                            f'as something other than its parent'
+                        )
+                        continue
+
+                    predicted = self._composition_libvhdi_reads_without_a_bitmap(
+                        child, parent_only)
+                    visible = self._differing_sectors(
+                        predicted, parent_only, fmt)
+                    self.assertNotEqual(
+                        [], visible,
+                        f'{fmt}: defect D predicts a composition identical to '
+                        f'the parent for this child, so this case no longer '
+                        f'demonstrates anything and the exception is pinned '
+                        f'to the wrong chain'
+                    )
+                    self.assertEqual(
+                        [], self._differing_sectors(oracle, predicted, fmt),
+                        f'{fmt}: libvhdi composes this child in some way '
+                        f'other than by reading a sector bitmap from file '
+                        f'offset zero. An agreement with the parent means '
+                        f'the defect is fixed upstream and this exception '
+                        f'should be deleted; anything else is a '
+                        f'disagreement between two readers that nobody has '
+                        f'accounted for'
+                    )
+                    self.assertEqual(
+                        visible, self._differing_sectors(
+                            oracle, through_child, fmt),
+                        f'{fmt}: libvhdi and instar differ at a set of '
+                        f'sectors that is not the one defect D accounts for'
+                    )
+
+    def test_the_oracle_accepts_a_created_child_and_its_identity(self):
+        """libvhdi takes instar's child, and the identity it recorded.
+
+        The measurement the comparison above rests on, asserted on its
+        own so that a refusal reads as a refusal rather than as an
+        error raised somewhere inside a composition. libvhdi checks
+        the parent handed to `set_parent` against the identity the
+        child records -- a VHD parent's footer `uuid`, a VHDX
+        parent's active-header `DataWriteGuid` -- and instar copies
+        that identity out of the parent when it writes the child, so
+        this is the emitter's identity work read back by something
+        that did not write it.
+
+        The parent's identity is asserted non-zero first. Every image
+        instar writes carries the same constant identity (#566), so
+        against a parent instar wrote this check would compare zeros
+        with zeros and would keep passing with the identity plumbing
+        removed.
+        """
+        pyvhdi = self._require_pyvhdi()
+        for fmt, parent_id, child_name in self.CREATED_CHILD_CASES:
+            with self.subTest(format=fmt):
+                with tempfile.TemporaryDirectory() as td:
+                    child, parent = self._create_chain(
+                        td, fmt, parent_id, child_name)
+                    child_file = pyvhdi.file()
+                    child_file.open(str(child), 'r')
+                    parent_file = pyvhdi.file()
+                    parent_file.open(str(parent), 'r')
+                    try:
+                        self.assertEqual(
+                            self.DIFFERENTIAL_DISK_TYPE,
+                            child_file.get_disk_type(),
+                            f'{fmt}: libvhdi does not read the created child '
+                            f'as a differencing image at all'
+                        )
+                        identity = parent_file.get_identifier()
+                        self.assertNotEqual(
+                            self.ZERO_GUID, identity,
+                            f'{fmt}: the parent fixture has a zero identity, '
+                            f'so libvhdi accepting it proves nothing about '
+                            f'what instar recorded'
+                        )
+                        self.assertEqual(
+                            identity, child_file.get_parent_identifier(),
+                            f'{fmt}: the identity instar recorded in the '
+                            f'child is not the one libvhdi reads out of the '
+                            f'parent'
+                        )
+                        try:
+                            child_file.set_parent(parent_file)
+                        except OSError as exc:
+                            self.fail(
+                                f'{fmt}: libvhdi refused the parent of a '
+                                f'child instar created ({exc}), so it cannot '
+                                f'be asked what the chain composes to'
+                            )
+                        self.assertEqual(
+                            IMAGE_VIRTUAL_SIZE, child_file.get_media_size(),
+                            f'{fmt}: libvhdi reads the composed chain as a '
+                            f'different size from the parent `create -b` '
+                            f'sized it against'
+                        )
+                    finally:
+                        parent_file.close()
+                        child_file.close()

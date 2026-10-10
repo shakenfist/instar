@@ -420,9 +420,28 @@ redo this.
   that fails if that sector agrees, and a `grep -c` of the exception
   returning 1.
 * A child instar created with `create -b` composes to exactly the
-  parent's own content under all three readers, for both formats, and
-  the commit message records whether libvhdi accepted instar's
-  differencing VHDX BAT padding.
+  parent's own content for both formats under instar's own reader,
+  and under libvhdi for VHD. **Corrected by measurement in 16b**: the
+  "all three readers, for both formats" this bullet originally asked
+  for is not achievable, and the reason is a fourth libvhdi defect.
+  libvhdi ignores a VHDX chunk whose sector-bitmap BAT entry is
+  `SB_BLOCK_NOT_PRESENT` -- the only thing a child with nothing
+  written in it can say -- and reads the bitmap from file offset zero
+  instead, taking the child's own file identifier for a megabyte of
+  bitmap and then serving the sectors it claims out of the child's
+  file at the virtual sector's own offset. 56 of the created child's
+  32768 sectors are claimed that way and two of them differ visibly.
+  Recorded as defect D in the new test class's docstring, with the
+  control that attributes it: allocating a zeroed sector bitmap block
+  and pointing the entry at it, changing nothing else, makes libvhdi
+  compose the chain exactly. So the exception is pinned in decision
+  2's shape, against the whole composition the defect predicts rather
+  than against the two sectors that happen to show today. libvhdi
+  *did* accept instar's differencing VHDX BAT padding (#623) and the
+  parent identity instar records, at both the 32 MiB default block
+  size and `block_size=1M`. Falsifiable: a simulated upstream fix
+  turns the pin red, and the register that carries the exception
+  fails in both directions if it names the wrong format.
 * `instar-testdata` holds `vhdx-differencing`, and
   `PARENTLESS_DIFFERENCING_FIXTURES` has two entries rather than one.
   Falsifiable: the VHDX empty-chain refusal is asserted at the CLI for
