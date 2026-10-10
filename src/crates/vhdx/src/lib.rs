@@ -1676,6 +1676,79 @@ pub fn classify_vhdx_bat_entry(
     }
 }
 
+/// Hand every payload-block BAT entry in `bat_bytes` to `visit`, in
+/// BAT order, skipping the interleaved sector-bitmap entries and
+/// stopping once `total_payload_blocks` payload entries have been
+/// visited.
+///
+/// `start_entry_index` is the global BAT entry index (counting both
+/// payload and sector-bitmap slots) of the first u64 in `bat_bytes`;
+/// `payload_seen_in` is the number of payload entries already visited
+/// before this chunk. Returns the payload count after this chunk, so
+/// the caller can thread it into the next one.
+///
+/// `visit` receives the raw little-endian-decoded entry and returns
+/// `false` to abandon the walk, which is how a caller refuses an image
+/// part-way through a chunk rather than finishing the chunk first. The
+/// payload count returned after such a stop *includes* the entry that
+/// abandoned it, because the entry was visited; a caller that stops
+/// early and then keeps counting would be one block ahead. Every
+/// caller that returns `false` today discards the count along with the
+/// image, so nothing depends on it, but a future one that resumed from
+/// the returned index would have to subtract that entry.
+///
+/// `chunk_ratio == 0` is invalid; the walk visits nothing in that case
+/// rather than dividing by zero.
+///
+/// Both [`count_allocated_in_bat_chunk`] and
+/// [`VhdxState::scan_allocation`] go through here rather than each
+/// rotating the group arithmetic for themselves. That arithmetic --
+/// one sector-bitmap slot after every `chunk_ratio` payload slots,
+/// carried across cached-sector boundaries by the two running indices
+/// -- is the part of a BAT walk that is easy to get subtly wrong, and
+/// a second copy of it in the scanner would be free to drift from the
+/// counter it is supposed to agree with. The scanner needs a seam
+/// here because it has to see each present block's file offset to
+/// refuse one that overlaps a declared region, which a function
+/// returning only a count cannot show it.
+pub(crate) fn for_each_payload_bat_entry(
+    bat_bytes: &[u8],
+    chunk_ratio: u32,
+    total_payload_blocks: u32,
+    start_entry_index: u64,
+    payload_seen_in: u64,
+    mut visit: impl FnMut(u64) -> bool,
+) -> u64 {
+    if chunk_ratio == 0 {
+        return payload_seen_in;
+    }
+    let group = chunk_ratio as u64 + 1;
+    let total_payload = total_payload_blocks as u64;
+    let mut payload_seen = payload_seen_in;
+    for (offset, chunk) in bat_bytes.chunks_exact(8).enumerate() {
+        let i = start_entry_index + offset as u64;
+        let slot_in_group = i % group;
+        if slot_in_group >= chunk_ratio as u64 {
+            // Sector-bitmap entry — skip.
+            continue;
+        }
+        // Payload-block entry.
+        if payload_seen >= total_payload {
+            // Cap reached; the rest of the BAT is unused tail. Once
+            // capped we will never visit again.
+            break;
+        }
+        payload_seen += 1;
+        let entry = u64::from_le_bytes([
+            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+        ]);
+        if !visit(entry) {
+            break;
+        }
+    }
+    payload_seen
+}
+
 /// Incremental variant of `count_allocated_in_bat` for chunked BAT
 /// walks across multiple cached sector reads.
 ///
@@ -1691,34 +1764,21 @@ pub(crate) fn count_allocated_in_bat_chunk(
     start_entry_index: u64,
     payload_seen_in: u64,
 ) -> (u64, u64) {
-    if chunk_ratio == 0 {
-        return (0, payload_seen_in);
-    }
-    let group = chunk_ratio as u64 + 1;
-    let total_payload = total_payload_blocks as u64;
     let mut count: u64 = 0;
-    let mut payload_seen = payload_seen_in;
-    for (offset, chunk) in bat_bytes.chunks_exact(8).enumerate() {
-        let i = start_entry_index + offset as u64;
-        let slot_in_group = i % group;
-        if slot_in_group < chunk_ratio as u64 {
-            // Payload-block entry.
-            if payload_seen >= total_payload {
-                // Cap reached; the rest of the BAT is unused tail.
-                // Once capped we will never count again.
-                break;
-            }
-            payload_seen += 1;
-            let entry = u64::from_le_bytes([
-                chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
-            ]);
+    let payload_seen = for_each_payload_bat_entry(
+        bat_bytes,
+        chunk_ratio,
+        total_payload_blocks,
+        start_entry_index,
+        payload_seen_in,
+        |entry| {
             let state = entry & BAT_ENTRY_STATE_MASK;
             if state == PAYLOAD_BLOCK_FULLY_PRESENT || state == PAYLOAD_BLOCK_PARTIALLY_PRESENT {
                 count += 1;
             }
-        }
-        // slot_in_group == chunk_ratio: sector-bitmap entry — skip.
-    }
+            true
+        },
+    );
     (count, payload_seen)
 }
 
@@ -1957,7 +2017,21 @@ fn coalesce_ownership_run<F: FnMut(u32) -> Option<u8>>(
 /// was waved through. A region naming no bytes can hide nothing, so
 /// the inconsistency bought no safety; `init` does not reject a
 /// zero-length entry, so it is reachable from a hostile image.
-fn ranges_overlap(offset: u64, len: u64, region_offset: u64, region_len: u32) -> bool {
+///
+/// Public because the `check` operation needs the same arithmetic.
+/// `check` does not build a [`VhdxState`] -- it has its own region
+/// table, metadata and BAT validation, reading the full 64 KiB of both
+/// region tables where the reader reads one sector of the first -- but
+/// a payload block whose bytes are the image's own structure is as
+/// malformed when `check` walks the BAT as when `block_lookup` does.
+/// The two kept separate copies of this test until `check` had none at
+/// all: it reported "No errors were found" and exit 0 on an image
+/// whose first payload block was repointed into the metadata region,
+/// which `convert` refused to read. Sharing the predicate rather than
+/// the sweep is deliberate: the overflow and empty-range rules above
+/// are where two copies would drift, and the sweep over an operation's
+/// own region array is three lines that cannot.
+pub fn ranges_overlap(offset: u64, len: u64, region_offset: u64, region_len: u32) -> bool {
     if len == 0 || region_len == 0 {
         return false;
     }
@@ -2044,6 +2118,32 @@ pub struct VhdxState {
     /// image with it set reads as zeros wherever the parent holds the
     /// data.
     pub has_parent: bool,
+    /// Set by a whole-BAT walk ([`Self::map_extents`],
+    /// [`Self::scan_allocation`]) that refused this image because a
+    /// present payload block names a file offset no read would
+    /// accept: either exactly zero, which is the file identifier and
+    /// the headers, or a range overlapping a region the image itself
+    /// declares. Those are the two conditions
+    /// [`Self::block_lookup`] refuses a single read on, and the walks
+    /// apply both.
+    ///
+    /// Both walks already answer every failure with `None`, and an
+    /// I/O failure and a malformed block table are not the same news
+    /// for the user: one is a bad device or a truncated file, the
+    /// other is an image whose own metadata contradicts itself. The
+    /// flag is how a caller tells them apart without either walk
+    /// growing a second return channel, so `map` and `measure` can
+    /// each report a malformed block table instead of the "I/O
+    /// failure" or "unsupported format" their generic `None` paths
+    /// render -- both of which send a user hunting a problem that is
+    /// not there.
+    ///
+    /// Only the two whole-BAT walks set it. `block_lookup` and
+    /// `sector_bitmap_lookup` refuse the same condition, but their
+    /// callers compose a chain read and report a read failure with
+    /// its own diagnosis, so nothing downstream of them would read
+    /// this.
+    pub block_table_malformed: bool,
     // Sector cache for BAT reads
     pub bat_cached_sector: u64,
     pub bat_cache_buf: *mut u8,
@@ -2271,6 +2371,7 @@ impl VhdxState {
             regions,
             region_count,
             has_parent: metadata.has_parent,
+            block_table_malformed: false,
             bat_cached_sector: u64::MAX,
             bat_cache_buf,
             data_cached_sector: u64::MAX,
@@ -2388,10 +2489,18 @@ impl VhdxState {
     /// Whether a block's byte range `[offset, offset + len)` overlaps
     /// any region [`Self::regions`] declares.
     ///
-    /// One helper for all three call sites -- `block_lookup`'s two
-    /// payload arms and `sector_bitmap_lookup` -- so they cannot
+    /// One helper for all five call sites -- `block_lookup`'s two
+    /// payload arms, `sector_bitmap_lookup`, and the two whole-BAT
+    /// walks `map_extents` and `scan_allocation` -- so they cannot
     /// drift onto different definitions of "overlap" from each
     /// other.
+    ///
+    /// The two walks matter as much as the three lookups: without
+    /// them `instar map` reported a block at an offset inside the
+    /// metadata region as data at that offset, and `instar measure`
+    /// counted its bytes, while `instar convert` refused to read the
+    /// same block. Three answers to one question about one image
+    /// (issue #634).
     fn block_overlaps_a_declared_region(&self, offset: u64, len: u64) -> bool {
         self.regions[..self.region_count as usize]
             .iter()
@@ -2801,13 +2910,66 @@ impl VhdxState {
             let aligned_len = meaningful_len - (meaningful_len % 8);
             let aligned = &meaningful[..aligned_len];
 
-            let (chunk_count, new_payload_seen) = count_allocated_in_bat_chunk(
+            // Count this chunk's present payload blocks, refusing the
+            // image outright if any of them names a file offset the
+            // read paths will not read. The counter this walk replaced
+            // saw only entry states and never formed a file offset, so
+            // `measure` used to answer with a size that counted a
+            // block `convert` refuses to read.
+            //
+            // Both of `block_lookup`'s guards are applied, and applied
+            // as two separate tests for the reason its own comment
+            // gives: neither subsumes the other. A block at offset
+            // zero sits on the file identifier and the headers, which
+            // are fixed structure rather than region table entries, so
+            // the overlap test cannot see it -- and a block whose range
+            // ends exactly where the first declared region begins
+            // touches without overlapping, which is precisely the
+            // geometry an offset of zero produces. Conversely a block
+            // inside a declared region has a perfectly non-zero
+            // offset. Killing either test must therefore fail a test
+            // of its own.
+            //
+            // Refusing rather than skipping the block is deliberate:
+            // a skipped block would be reported as a smaller required
+            // size, which reads as "this image is sparse" when what
+            // is true is "this image's block table contradicts the
+            // rest of the image". The read paths refuse the identical
+            // conditions, and an operation that answers where the
+            // reader refuses is the inconsistency this closes.
+            let block_size = u64::from(self.block_size);
+            let mut chunk_count: u64 = 0;
+            let mut malformed = false;
+            let new_payload_seen = for_each_payload_bat_entry(
                 aligned,
                 self.chunk_ratio,
                 total_payload_blocks,
                 entry_index,
                 payload_seen,
+                |entry| {
+                    let state = entry & BAT_ENTRY_STATE_MASK;
+                    if state != PAYLOAD_BLOCK_FULLY_PRESENT
+                        && state != PAYLOAD_BLOCK_PARTIALLY_PRESENT
+                    {
+                        return true;
+                    }
+                    let file_offset = entry & BAT_ENTRY_OFFSET_MASK;
+                    if file_offset == 0 {
+                        malformed = true;
+                        return false;
+                    }
+                    if self.block_overlaps_a_declared_region(file_offset, block_size) {
+                        malformed = true;
+                        return false;
+                    }
+                    chunk_count += 1;
+                    true
+                },
             );
+            if malformed {
+                self.block_table_malformed = true;
+                return None;
+            }
             allocated_blocks += chunk_count;
             // Advance the global entry index by the number of complete
             // entries we processed.
@@ -2959,6 +3121,47 @@ impl VhdxState {
                 ]);
 
                 let mut ext = classify_vhdx_bat_entry(entry, block_virt, block_size);
+                // An extent that carries a file offset is about to tell
+                // the user where this block's bytes live, so the offset
+                // has to be one a read would accept. Both of the
+                // offsets `block_lookup` refuses are refused here, as
+                // two separate tests because neither subsumes the
+                // other.
+                //
+                // Offset zero: a BAT entry's offset is always a whole
+                // megabyte (the mask clears the low 20 bits), so the
+                // only value a zeroed or truncated entry that still
+                // reads as present can name is exactly zero -- the file
+                // identifier and the headers, which are fixed structure
+                // rather than region table entries. The overlap test
+                // cannot see them, and a block starting at zero ends
+                // exactly where the first declared region begins, which
+                // touches without overlapping. Reporting it would hand
+                // the user offset 0 as the location of their data.
+                //
+                // Inside a declared region: the block's bytes are the
+                // BAT's or the metadata's, and `block_lookup` refuses
+                // them, so `convert` would fail on the very block `map`
+                // is about to name a location for.
+                //
+                // Refusing the image rather than emitting the block as a
+                // hole is the point either way. Reporting it unallocated
+                // would make `map` claim this image is sparse where it
+                // is actually malformed, and the user would never learn
+                // that anything was wrong with it. The length tested is
+                // the whole block, not the visible remainder, because
+                // the block occupies its full size in the file whatever
+                // the virtual disk size cuts off.
+                if let MapExtentState::Data { file_offset } = ext.state {
+                    if file_offset == 0 {
+                        self.block_table_malformed = true;
+                        return None;
+                    }
+                    if self.block_overlaps_a_declared_region(file_offset, block_size) {
+                        self.block_table_malformed = true;
+                        return None;
+                    }
+                }
                 if ext.length > block_visible {
                     ext.length = block_visible;
                 }
@@ -6330,6 +6533,7 @@ mod tests {
             regions: [(0, 0); 8],
             region_count: 0,
             has_parent: true,
+            block_table_malformed: false,
             bat_cached_sector: u64::MAX,
             bat_cache_buf: core::ptr::null_mut(),
             data_cached_sector: u64::MAX,

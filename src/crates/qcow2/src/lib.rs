@@ -9603,8 +9603,9 @@ mod tests {
     // still not payload. A floor fixed at 1 MiB cannot tell a block
     // that starts there from one that starts at the file identifier;
     // only the region table the image declares can, which is what
-    // `VhdxState::min_block_file_offset` is for (issue #625). As
-    // above, all three states that carry an offset are driven.
+    // `VhdxState::block_overlaps_a_declared_region` tests each block
+    // against (issue #625). As above, all three states that carry an
+    // offset are driven.
     #[cfg(feature = "vhdx-input")]
     #[test]
     fn vhdx_arm_block_inside_a_declared_region_is_refused() {
@@ -9937,6 +9938,676 @@ mod tests {
         assert_eq!(
             out, want,
             "the block must still be served from the image's own payload"
+        );
+    }
+
+    // ---- map and measure: the same overlap test the readers apply ----
+    //
+    // `map` and `measure` do not read a byte of payload, so they do not
+    // go through `block_lookup` or `read_chain_virtual_cluster` at all:
+    // each walks the whole BAT once, through `VhdxState::map_extents`
+    // and `VhdxState::scan_allocation` respectively. Those two walks
+    // used to classify a BAT entry from its state bits alone, which
+    // left `map` reporting a block at an offset inside the metadata
+    // region as data living at that offset, and `measure` counting its
+    // bytes, while `convert` refused to read the very same block
+    // (issue #634). Three answers to one question about one image.
+    //
+    // The fixtures below claim no parent. That is the point: these two
+    // walks never see a differencing image -- both operations refuse
+    // one before walking -- so a refusal gated on `has_parent` would
+    // leave them exactly as wrong as they were, and the tightening
+    // these tests pin reaches every VHDX image instar maps or measures.
+
+    /// What the two whole-BAT walks said about one image.
+    ///
+    /// The `block_table_malformed` flags are part of the outcome
+    /// rather than an implementation detail: both walks answer every
+    /// failure with `None`, and the flag is the only thing that tells
+    /// `map` and `measure` to report a malformed block table instead
+    /// of "I/O failure walking the source" and "source image is
+    /// unsupported format". A refusal that forgot to set it would
+    /// still refuse, and would still describe the image wrongly.
+    #[cfg(feature = "vhdx-input")]
+    struct VhdxBatWalks {
+        /// Every extent `map_extents` emitted, or `None` if it refused.
+        extents: Option<std::vec::Vec<MapExtent>>,
+        /// `VhdxState::block_table_malformed` after the map walk.
+        map_block_table_malformed: bool,
+        /// `scan_allocation`'s summary, or `None` if it refused.
+        summary: Option<AllocationSummary>,
+        /// `VhdxState::block_table_malformed` after the scan walk.
+        scan_block_table_malformed: bool,
+    }
+
+    /// Init `VhdxState` against a one-device mock -- the same mock
+    /// `run_vhdx_chain_read` drives, and the same process-wide device
+    /// table, so the same lock and the same deliberate poisoned-guard
+    /// recovery -- and run both whole-BAT walks over it.
+    ///
+    /// Each walk gets its own freshly initialised state and its own
+    /// cache buffers, so neither the BAT sector cache one walk
+    /// invalidates nor the refusal flag it sets can colour the other's
+    /// answer.
+    #[cfg(feature = "vhdx-input")]
+    fn run_vhdx_bat_walks(bytes: &[u8], sector_size: usize) -> VhdxBatWalks {
+        let _guard = VHDX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        unsafe {
+            VHDX_SSZ = sector_size;
+            let imgs = core::ptr::addr_of_mut!(VHDX_IMAGES) as *mut *const u8;
+            let lens = core::ptr::addr_of_mut!(VHDX_LENS) as *mut usize;
+            for i in 0..VHDX_MAX_DEVS {
+                *imgs.add(i) = core::ptr::null();
+                *lens.add(i) = 0;
+            }
+            *imgs = bytes.as_ptr();
+            *lens = bytes.len();
+        }
+        let call_table = vhdx_call_table();
+        let cap = unsafe { (call_table.get_input_capacity)(0) };
+        let mut bytes_read = 0u64;
+
+        let mut map_bat = std::vec![0u8; MAX_SECTOR_SIZE];
+        let mut map_data = std::vec![0u8; MAX_SECTOR_SIZE];
+        let mut map_state = unsafe {
+            VhdxState::init(
+                &call_table,
+                0,
+                sector_size,
+                cap,
+                map_bat.as_mut_ptr(),
+                map_data.as_mut_ptr(),
+                &mut bytes_read,
+            )
+        }
+        .expect("VhdxState::init must succeed for a valid synthetic image");
+        let mut collected: std::vec::Vec<MapExtent> = std::vec::Vec::new();
+        let map_ok = {
+            let mut emit = |e: MapExtent| -> bool {
+                collected.push(e);
+                true
+            };
+            unsafe {
+                map_state.map_extents(&call_table, sector_size, cap, &mut bytes_read, &mut emit)
+            }
+        };
+
+        let mut scan_bat = std::vec![0u8; MAX_SECTOR_SIZE];
+        let mut scan_data = std::vec![0u8; MAX_SECTOR_SIZE];
+        let mut scan_state = unsafe {
+            VhdxState::init(
+                &call_table,
+                0,
+                sector_size,
+                cap,
+                scan_bat.as_mut_ptr(),
+                scan_data.as_mut_ptr(),
+                &mut bytes_read,
+            )
+        }
+        .expect("VhdxState::init must succeed for a valid synthetic image");
+        let summary =
+            unsafe { scan_state.scan_allocation(&call_table, sector_size, cap, &mut bytes_read) };
+
+        unsafe {
+            let imgs = core::ptr::addr_of_mut!(VHDX_IMAGES) as *mut *const u8;
+            for i in 0..VHDX_MAX_DEVS {
+                *imgs.add(i) = core::ptr::null();
+            }
+        }
+
+        VhdxBatWalks {
+            extents: map_ok.map(|()| collected),
+            map_block_table_malformed: map_state.block_table_malformed,
+            summary,
+            scan_block_table_malformed: scan_state.block_table_malformed,
+        }
+    }
+
+    /// Whether a `VHDX_FIX_BLOCK_SIZE` block at `offset` intersects
+    /// any region the image's own region table declares, recomputed
+    /// here from the image bytes.
+    ///
+    /// Deliberately not routed through the predicate under test: a
+    /// premise assertion that leaned on `block_overlaps_a_declared_region`
+    /// would keep holding under every mutation of it, which is exactly
+    /// the situation it exists to rule out. It reads the same first
+    /// eight entries `VhdxState::init` scans, and treats a zero-length
+    /// region as naming no bytes, because that is what the format says
+    /// rather than what the code says.
+    #[cfg(feature = "vhdx-input")]
+    fn vhdx_fixture_block_overlaps_a_region(bytes: &[u8], offset: u64) -> bool {
+        let rt1_base = vhdx::REGION_TABLE1_OFFSET as usize;
+        let count_off = rt1_base + vhdx::REGION_TABLE_ENTRY_COUNT_OFFSET;
+        let count = u32::from_le_bytes(bytes[count_off..count_off + 4].try_into().unwrap());
+        let end = offset + u64::from(VHDX_FIX_BLOCK_SIZE);
+        (0..count.min(8) as usize).any(|i| {
+            let e = rt1_base + vhdx::REGION_TABLE_HEADER_SIZE + i * vhdx::REGION_TABLE_ENTRY_SIZE;
+            let region_offset = u64::from_le_bytes(bytes[e + 16..e + 24].try_into().unwrap());
+            let region_length = u32::from_le_bytes(bytes[e + 24..e + 28].try_into().unwrap());
+            region_length != 0
+                && offset < region_offset + u64::from(region_length)
+                && region_offset < end
+        })
+    }
+
+    /// Point the payload BAT entry for payload block `payload_index`
+    /// at `offset`, keeping its state bits, and hand back the image.
+    ///
+    /// The BAT interleaves one sector-bitmap entry after every
+    /// `chunk_ratio` payload entries, so the global entry index of a
+    /// payload block is its own index plus the number of whole groups
+    /// before it. That arithmetic is spelled out here rather than
+    /// taken from `for_each_payload_bat_entry`: a fixture that located
+    /// its entry with the walker under test would keep patching
+    /// whatever entry the walker thought was next, and a test for the
+    /// walker's group arithmetic would hold under every mutation of
+    /// it.
+    #[cfg(feature = "vhdx-input")]
+    fn vhdx_repoint_payload_block(
+        mut bytes: std::vec::Vec<u8>,
+        logical_sector_size: u32,
+        payload_index: u64,
+        offset: u64,
+    ) -> std::vec::Vec<u8> {
+        let chunk_ratio = vhdx_chunk_ratio(logical_sector_size);
+        let entry_index = payload_index + payload_index / chunk_ratio;
+        let entry_off = VHDX_FIX_BAT_OFFSET as usize + entry_index as usize * 8;
+        let entry = u64::from_le_bytes(bytes[entry_off..entry_off + 8].try_into().unwrap());
+        let state = entry & vhdx::BAT_ENTRY_STATE_MASK;
+        let rewritten = vhdx::build_bat_entry(state, offset);
+        bytes[entry_off..entry_off + 8].copy_from_slice(&rewritten.to_le_bytes());
+        bytes
+    }
+
+    /// Point the fixture's first payload BAT entry at `offset`,
+    /// keeping its state bits, and hand back the image.
+    #[cfg(feature = "vhdx-input")]
+    fn vhdx_repoint_first_payload_block(
+        mut bytes: std::vec::Vec<u8>,
+        offset: u64,
+    ) -> std::vec::Vec<u8> {
+        let entry_off = VHDX_FIX_BAT_OFFSET as usize;
+        let entry = u64::from_le_bytes(bytes[entry_off..entry_off + 8].try_into().unwrap());
+        let state = entry & vhdx::BAT_ENTRY_STATE_MASK;
+        let rewritten = vhdx::build_bat_entry(state, offset);
+        bytes[entry_off..entry_off + 8].copy_from_slice(&rewritten.to_le_bytes());
+        bytes
+    }
+
+    // A payload block declared inside the metadata region. `map` must
+    // not report a location `convert` refuses to read, and `measure`
+    // must not count bytes that are the image's own metadata. The
+    // metadata region is the more pointed of the two cases: it sits
+    // above the first megabyte, so a floor fixed at 1 MiB -- the shape
+    // this check started as -- cannot tell this block from a real one.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_map_and_measure_refuse_a_block_inside_the_metadata_region() {
+        let fixture = build_vhdx_image(512, false, 1, &[(0, VhdxBlockState::FullyPresent)], &[]);
+        let bytes = vhdx_repoint_first_payload_block(fixture.bytes, VHDX_FIX_METADATA_OFFSET);
+        let walks = run_vhdx_bat_walks(&bytes, 512);
+        assert!(
+            walks.extents.is_none(),
+            "map must refuse an image whose BAT names a block inside the \
+             metadata region rather than report that block as data living \
+             there: {:?}",
+            walks.extents
+        );
+        assert!(
+            walks.map_block_table_malformed,
+            "the map walk must record WHY it refused, or the operation \
+             reports its refusal as an I/O failure"
+        );
+        assert!(
+            walks.summary.is_none(),
+            "measure must refuse the same image rather than count a block \
+             the reader will not read: {:?}",
+            walks.summary.as_ref().map(|s| s.allocated_bytes)
+        );
+        assert!(
+            walks.scan_block_table_malformed,
+            "the scan walk must record WHY it refused, or the operation \
+             reports its refusal as an unsupported format"
+        );
+    }
+
+    // The same, against the BAT region. A block inside the table that
+    // describes it is as malformed as one inside the metadata, and
+    // keeping both cases means neither region's entry can be the only
+    // one the walk consults.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_map_and_measure_refuse_a_block_inside_the_bat_region() {
+        let fixture = build_vhdx_image(512, false, 1, &[(0, VhdxBlockState::FullyPresent)], &[]);
+        let bytes = vhdx_repoint_first_payload_block(fixture.bytes, VHDX_FIX_BAT_OFFSET);
+        let walks = run_vhdx_bat_walks(&bytes, 512);
+        assert!(
+            walks.extents.is_none(),
+            "map must refuse an image whose BAT names a block inside the \
+             BAT region: {:?}",
+            walks.extents
+        );
+        assert!(
+            walks.map_block_table_malformed,
+            "the map walk must record why it refused"
+        );
+        assert!(
+            walks.summary.is_none(),
+            "measure must refuse an image whose BAT names a block inside \
+             the BAT region: {:?}",
+            walks.summary.as_ref().map(|s| s.allocated_bytes)
+        );
+        assert!(
+            walks.scan_block_table_malformed,
+            "the scan walk must record why it refused"
+        );
+    }
+
+    // The other guard the reader arms carry, and the half the overlap
+    // test provably cannot cover: a BAT entry marked present whose
+    // offset is zero. A BAT entry's offset is always a whole megabyte,
+    // so zero is exactly what a zeroed or truncated entry that still
+    // reads as present names -- and it names the file identifier and
+    // the headers, which are fixed structure rather than region table
+    // entries. In this fixture's geometry a 1 MiB block at zero
+    // occupies [0, 0x10_0000) and the first declared region starts at
+    // 0x10_0000, so the two touch without overlapping and the overlap
+    // test returns false. Before this guard reached the walks, `map`
+    // reported such a block as data at offset 0 while `convert`
+    // refused to read it (issue #547, reached through the other guard
+    // of issue #634).
+    //
+    // Driven once per walk rather than once for both, so that
+    // disabling the guard in one walk fails a test naming that walk
+    // instead of a test that cannot say which of the two lost it.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_map_refuses_a_present_block_at_file_offset_zero() {
+        let fixture = build_vhdx_image(512, false, 1, &[(0, VhdxBlockState::FullyPresent)], &[]);
+        let bytes = vhdx_repoint_first_payload_block(fixture.bytes, 0);
+        let walks = run_vhdx_bat_walks(&bytes, 512);
+        // The premise, measured rather than assumed: the overlap test
+        // alone does not catch this, so the refusal below is this
+        // guard and not the other one.
+        assert!(
+            !vhdx_fixture_block_overlaps_a_region(&bytes, 0),
+            "a block at offset zero must NOT overlap a declared region \
+             in this fixture, or this test is really the overlap test \
+             wearing a different name"
+        );
+        assert!(
+            walks.extents.is_none(),
+            "map must refuse a present block at offset zero rather than \
+             report the file identifier as the location of the user's \
+             data: {:?}",
+            walks.extents
+        );
+        assert!(
+            walks.map_block_table_malformed,
+            "the map walk must record WHY it refused, or the operation \
+             reports its refusal as an I/O failure"
+        );
+    }
+
+    // The same guard in the other walk. `measure` counting a block at
+    // offset zero adds a megabyte of headers to the size it predicts,
+    // for a block the reader will not read.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_measure_refuses_a_present_block_at_file_offset_zero() {
+        let fixture = build_vhdx_image(512, false, 1, &[(0, VhdxBlockState::FullyPresent)], &[]);
+        let bytes = vhdx_repoint_first_payload_block(fixture.bytes, 0);
+        let walks = run_vhdx_bat_walks(&bytes, 512);
+        assert!(
+            !vhdx_fixture_block_overlaps_a_region(&bytes, 0),
+            "a block at offset zero must NOT overlap a declared region \
+             in this fixture, or this test is really the overlap test \
+             wearing a different name"
+        );
+        assert!(
+            walks.summary.is_none(),
+            "measure must refuse a present block at offset zero rather \
+             than count the headers as allocated payload: {:?}",
+            walks.summary.as_ref().map(|s| s.allocated_bytes)
+        );
+        assert!(
+            walks.scan_block_table_malformed,
+            "the scan walk must record WHY it refused, or the operation \
+             reports its refusal as an unsupported format"
+        );
+    }
+
+    // The control that separates an overlap test from a high-water
+    // mark, and the most important of the three: SPEC(VHDX) does not
+    // require a region to precede the blocks it coexists with, so a
+    // region declared entirely *after* every block must not refuse
+    // them. A bound that refused everything below the end of the
+    // highest region would pass both cases above -- a block inside a
+    // region is also below that mark -- and fail here, refusing a
+    // perfectly well-formed image that `convert` reads happily.
+    //
+    // Patching the region table in place needs no checksum fixup:
+    // `VhdxState::init` deliberately skips the region table's CRC-32C
+    // and validates entry contents instead, leaving the full CRC to
+    // the `check` operation. The trailing region is unrecognised, and
+    // nothing reads an unrecognised region's own bytes, so it needs
+    // only the declaration and no backing data.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_map_and_measure_accept_a_block_before_a_trailing_region() {
+        let fixture = build_vhdx_image(512, false, 1, &[(0, VhdxBlockState::FullyPresent)], &[]);
+        let payload = fixture.block_offsets[0];
+        let mut bytes = fixture.bytes;
+        let trailing_region_offset = bytes.len() as u64;
+        assert!(
+            trailing_region_offset > payload,
+            "the trailing region must be declared past the block under test"
+        );
+        let rt1_base = vhdx::REGION_TABLE1_OFFSET as usize;
+        let entry_count_off = rt1_base + vhdx::REGION_TABLE_ENTRY_COUNT_OFFSET;
+        bytes[entry_count_off..entry_count_off + 4].copy_from_slice(&3u32.to_le_bytes());
+        let third = rt1_base + vhdx::REGION_TABLE_HEADER_SIZE + 2 * vhdx::REGION_TABLE_ENTRY_SIZE;
+        bytes[third..third + 16].copy_from_slice(&[0xADu8; 16]);
+        bytes[third + 16..third + 24].copy_from_slice(&trailing_region_offset.to_le_bytes());
+        bytes[third + 24..third + 28].copy_from_slice(&0x1000u32.to_le_bytes());
+
+        let walks = run_vhdx_bat_walks(&bytes, 512);
+
+        let extents = walks
+            .extents
+            .expect("a region declared after every block must not refuse the map walk");
+        assert!(
+            !walks.map_block_table_malformed,
+            "nothing about this image is malformed"
+        );
+        // The block is still described as data, and still at the
+        // offset the image gave: a refusal is not the only wrong
+        // answer available here -- reporting it as a hole would also
+        // "pass" an is_some() check while telling the user the image
+        // is sparse.
+        assert_eq!(
+            extents.first().map(|e| (e.start, e.length, e.state)),
+            Some((
+                0,
+                u64::from(VHDX_FIX_BLOCK_SIZE),
+                MapExtentState::Data {
+                    file_offset: payload
+                }
+            )),
+            "the first extent must be the payload block, at its own offset"
+        );
+
+        let summary = walks
+            .summary
+            .expect("a region declared after every block must not refuse the scan walk");
+        assert!(
+            !walks.scan_block_table_malformed,
+            "nothing about this image is malformed"
+        );
+        assert_eq!(
+            summary.allocated_bytes,
+            u64::from(VHDX_FIX_BLOCK_SIZE),
+            "the one allocated block must still be counted"
+        );
+    }
+
+    // The malformed block is the last payload entry of the first chunk
+    // group, not the first entry of the BAT.
+    //
+    // Every case above patches payload block 0, which both walks reach
+    // on their first cached BAT sector and before any group arithmetic
+    // has had to do anything. A guard applied only to the first entry
+    // examined -- or a walk whose running indices drift as it refills
+    // the sector cache -- would pass all of them. Payload block 4095
+    // is 64 cached sectors into the BAT at this sector size, so
+    // reaching it at all means the payload/sector-bitmap bookkeeping
+    // in `for_each_payload_bat_entry` and `map_extents` held across
+    // every refill.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_map_and_measure_refuse_a_late_block_inside_a_region() {
+        let chunk_ratio = vhdx_chunk_ratio(512);
+        let payload_index = chunk_ratio - 1;
+        let fixture = build_vhdx_image(
+            512,
+            false,
+            1,
+            &[(payload_index, VhdxBlockState::FullyPresent)],
+            &[],
+        );
+        // The premise: this entry is genuinely past the first BAT
+        // sector, so the test is about a walk that had to get there.
+        assert!(
+            payload_index * 8 > 512,
+            "payload block {payload_index} must sit past the first cached BAT sector for this \
+             test to say anything"
+        );
+        let bytes =
+            vhdx_repoint_payload_block(fixture.bytes, 512, payload_index, VHDX_FIX_METADATA_OFFSET);
+        let walks = run_vhdx_bat_walks(&bytes, 512);
+        assert!(
+            walks.extents.is_none(),
+            "map must refuse a block inside the metadata region wherever in the BAT it is \
+             declared, not only in the first entry: {:?}",
+            walks.extents.as_ref().map(|e| e.len())
+        );
+        assert!(
+            walks.map_block_table_malformed,
+            "the map walk must record WHY it refused a late block"
+        );
+        assert!(
+            walks.summary.is_none(),
+            "measure must refuse the same late block rather than count it: {:?}",
+            walks.summary.as_ref().map(|s| s.allocated_bytes)
+        );
+        assert!(
+            walks.scan_block_table_malformed,
+            "the scan walk must record WHY it refused a late block"
+        );
+    }
+
+    // The malformed block is in the second chunk group, past a
+    // sector-bitmap entry.
+    //
+    // The walk has to traverse the slot that ends the first group to
+    // reach this entry at all, so a guard reachable only within one
+    // chunk group fails here. It is deliberately *not* the test for
+    // the group arithmetic itself: disabling the bitmap-slot skip in
+    // `for_each_payload_bat_entry` leaves this test passing, because a
+    // walk that miscounts payload entries still reaches this one and
+    // still refuses it. A refusal test cannot see a miscount, only
+    // whether something refused -- which is what
+    // `vhdx_scan_counts_a_block_in_each_chunk_group` below is for.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_map_and_measure_refuse_a_block_in_the_second_chunk_group() {
+        let chunk_ratio = vhdx_chunk_ratio(512);
+        let payload_index = chunk_ratio;
+        let fixture = build_vhdx_image(
+            512,
+            false,
+            2,
+            &[(payload_index, VhdxBlockState::FullyPresent)],
+            &[],
+        );
+        let bytes =
+            vhdx_repoint_payload_block(fixture.bytes, 512, payload_index, VHDX_FIX_METADATA_OFFSET);
+        let walks = run_vhdx_bat_walks(&bytes, 512);
+        assert!(
+            walks.extents.is_none(),
+            "map must refuse a malformed block in the second chunk group, which it can only \
+             find by skipping the first group's sector-bitmap entry: {:?}",
+            walks.extents.as_ref().map(|e| e.len())
+        );
+        assert!(
+            walks.map_block_table_malformed,
+            "the map walk must record WHY it refused a second-group block"
+        );
+        assert!(
+            walks.summary.is_none(),
+            "measure must refuse the same block: {:?}",
+            walks.summary.as_ref().map(|s| s.allocated_bytes)
+        );
+        assert!(
+            walks.scan_block_table_malformed,
+            "the scan walk must record WHY it refused a second-group block"
+        );
+    }
+
+    // The group arithmetic itself: one present block in each chunk
+    // group, counted.
+    //
+    // This is the test the refusal cases above cannot be. Every one of
+    // them asserts that a malformed image is refused, and a walk whose
+    // payload bookkeeping has drifted still refuses it -- it reaches
+    // the bad entry by a wrong route and answers correctly anyway.
+    // What a drifted count changes is where the walk *stops*: a walk
+    // that counted the interleaved sector-bitmap slots as payload
+    // entries would hit its `payload_seen >= total_payload_blocks` cap
+    // one slot early per group, and the last payload block of a
+    // two-group BAT -- which lives at global entry index 8192, past
+    // two bitmap slots -- would never be visited. So the allocated
+    // count is the observable: two present blocks, declared at the
+    // first and last payload index of a two-group image, must both be
+    // counted. Measured against that mutation, this test fails and
+    // the refusal tests do not.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_scan_counts_a_block_in_each_chunk_group() {
+        let chunk_ratio = vhdx_chunk_ratio(512);
+        let last = chunk_ratio * 2 - 1;
+        let fixture = build_vhdx_image(
+            512,
+            false,
+            2,
+            &[
+                (0, VhdxBlockState::FullyPresent),
+                (last, VhdxBlockState::FullyPresent),
+            ],
+            &[],
+        );
+        let walks = run_vhdx_bat_walks(&fixture.bytes, 512);
+        assert!(
+            !walks.scan_block_table_malformed,
+            "nothing about this image is malformed"
+        );
+        let summary = walks
+            .summary
+            .expect("a well-formed two-group image must not refuse the scan walk");
+        assert_eq!(
+            summary.allocated_bytes,
+            2 * u64::from(VHDX_FIX_BLOCK_SIZE),
+            "both present blocks must be counted; a walk that treats the \
+             interleaved sector-bitmap slots as payload entries stops \
+             before the last payload index and reports one"
+        );
+
+        // The same drift is visible to the map walk as a virtual
+        // offset, which keeps its own copy of this arithmetic rather
+        // than sharing the helper, so the two have to be pinned apart.
+        let extents = walks
+            .extents
+            .expect("a well-formed two-group image must not refuse the map walk");
+        let data: std::vec::Vec<(u64, u64)> = extents
+            .iter()
+            .filter(|e| matches!(e.state, MapExtentState::Data { .. }))
+            .map(|e| (e.start, e.length))
+            .collect();
+        assert_eq!(
+            data,
+            std::vec![
+                (0, u64::from(VHDX_FIX_BLOCK_SIZE)),
+                (
+                    last * u64::from(VHDX_FIX_BLOCK_SIZE),
+                    u64::from(VHDX_FIX_BLOCK_SIZE)
+                ),
+            ],
+            "each present block must be reported at the virtual offset its \
+             payload index gives it"
+        );
+    }
+
+    // The same refusal on a 4K-logical-sector image.
+    //
+    // Every other case here uses 512-byte sectors, and the sector size
+    // is not a detail these walks are indifferent to: `chunk_ratio` is
+    // derived from it, so it sets how many payload entries sit between
+    // the interleaved sector-bitmap slots, and it is also the size of
+    // the BAT reads the walks cache. A guard that happened to depend on
+    // either -- a bound computed from the cached sector rather than the
+    // entry, say -- would hold at one sector size and not the other.
+    // The assertion below pins that the two geometries really do
+    // differ, so this is not the 512-byte case under another name.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_map_and_measure_refuse_a_block_inside_a_region_at_4k_sectors() {
+        assert_ne!(
+            vhdx_chunk_ratio(4096),
+            vhdx_chunk_ratio(512),
+            "the point of this case is a different chunk ratio; if the two \
+             agree it duplicates the 512-byte test"
+        );
+        let fixture = build_vhdx_image(4096, false, 1, &[(0, VhdxBlockState::FullyPresent)], &[]);
+        let bytes = vhdx_repoint_first_payload_block(fixture.bytes, VHDX_FIX_METADATA_OFFSET);
+        let walks = run_vhdx_bat_walks(&bytes, 4096);
+        assert!(
+            walks.extents.is_none(),
+            "map must refuse a block inside the metadata region at 4K \
+             sectors too: {:?}",
+            walks.extents
+        );
+        assert!(
+            walks.map_block_table_malformed,
+            "the map walk must record WHY it refused at 4K sectors"
+        );
+        assert!(
+            walks.summary.is_none(),
+            "measure must refuse the same block at 4K sectors: {:?}",
+            walks.summary.as_ref().map(|s| s.allocated_bytes)
+        );
+        assert!(
+            walks.scan_block_table_malformed,
+            "the scan walk must record WHY it refused at 4K sectors"
+        );
+    }
+
+    // A PARTIALLY_PRESENT block inside a declared region.
+    //
+    // Both walks classify a partially present entry exactly as they
+    // classify a fully present one -- `classify_vhdx_bat_entry` maps
+    // both to `MapExtentState::Data`, and `scan_allocation` counts
+    // both -- so both guards are live on that state and nothing above
+    // exercises it. The state only occurs in a differencing image,
+    // which `map` and `measure` refuse before either walk runs today;
+    // the guard has to be in place anyway, because the refusal is what
+    // issue #643 is about lifting, and a lift must not be the change
+    // that reintroduces this.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_map_and_measure_refuse_a_partially_present_block_inside_a_region() {
+        let fixture = build_vhdx_image(512, true, 1, &[(0, VhdxBlockState::PartiallyPresent)], &[]);
+        let bytes = vhdx_repoint_first_payload_block(fixture.bytes, VHDX_FIX_METADATA_OFFSET);
+        let walks = run_vhdx_bat_walks(&bytes, 512);
+        assert!(
+            walks.extents.is_none(),
+            "map must refuse a partially present block inside the metadata region, which it \
+             describes as data just as it does a fully present one: {:?}",
+            walks.extents
+        );
+        assert!(
+            walks.map_block_table_malformed,
+            "the map walk must record WHY it refused a partially present block"
+        );
+        assert!(
+            walks.summary.is_none(),
+            "measure must refuse the same block rather than count it: {:?}",
+            walks.summary.as_ref().map(|s| s.allocated_bytes)
+        );
+        assert!(
+            walks.scan_block_table_malformed,
+            "the scan walk must record WHY it refused a partially present block"
         );
     }
 

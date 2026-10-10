@@ -152,6 +152,7 @@ const MEASURE_RESULT_ERROR_OVERFLOW: u32 = 1;
 const MEASURE_RESULT_ERROR_INVALID_OPTION: u32 = 2;
 #[allow(dead_code)]
 const MEASURE_RESULT_ERROR_INVALID_SIZE: u32 = 3;
+const MEASURE_RESULT_ERROR_MALFORMED_BLOCK_TABLE: u32 = 4;
 
 // MapConfig constants (must match shared::MapConfig)
 const MAP_CONFIG_MAGIC: u32 = 0x4D41505F; // "MAP_"
@@ -170,6 +171,7 @@ const MAP_RESULT_ERROR_INVALID_SOURCE: u32 = 1;
 const MAP_RESULT_ERROR_INVALID_OPTION: u32 = 2;
 const MAP_RESULT_ERROR_HAS_BACKING: u32 = 3;
 const MAP_RESULT_ERROR_IO: u32 = 4;
+const MAP_RESULT_ERROR_MALFORMED_BLOCK_TABLE: u32 = 5;
 
 // SnapshotConfig constants (must match shared::SnapshotConfig)
 const SNAPSHOT_CONFIG_MAGIC: u32 = 0x534E4150; // "SNAP"
@@ -5368,6 +5370,26 @@ fn run_bench(args: &BenchArgs, verbose: bool) -> Result<(), Box<dyn std::error::
             invocation.filename, e
         )
     })?;
+
+    // Refuse an over-deep chain before run_bench_guest ever opens KVM.
+    // bench attaches every discovered device read-only and no output
+    // device, so unlike convert there is no extra slot to reserve — the
+    // chain's own device count is the whole budget. Measured against a
+    // pre-guard binary, a 17-device chain did not corrupt anything: the
+    // 17th device hit DeviceSet::add_device's own defensive assert and
+    // panicked with exit 101, after KVM and the VM had already been
+    // created. What this guard closes is therefore an unhandled crash
+    // mid-launch, not a memory-safety hole. The assert it keeps the
+    // user from ever reaching exists because src/shared/src/lib.rs
+    // sizes VQ_BASE_START..DMA_POOL_BASE for exactly 16 virtqueues, so
+    // a 17th would land on the DMA pool.
+    let chain_device_count = chain.total_devices();
+    if chain_device_count > MAX_CHAIN_DEVICES {
+        return Err(format!(
+            "bench: chain depth {chain_device_count} exceeds maximum of {MAX_CHAIN_DEVICES} devices"
+        )
+        .into());
+    }
 
     // The discovered top-of-chain format is authoritative (§2).
     let top_format = chain.images()[0].format;
@@ -12055,6 +12077,26 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
         None
     };
 
+    // Refuse an over-deep chain before KVM is opened below. check attaches
+    // every discovered device read-only and no output device, so the
+    // chain's own device count is the whole budget. Measured against a
+    // pre-guard binary, a 17-device chain did not corrupt anything: the
+    // 17th device hit DeviceSet::add_device's own defensive assert and
+    // panicked with exit 101, after KVM and the VM had already been
+    // created. What this guard closes is therefore an unhandled crash
+    // mid-launch, not a memory-safety hole. The assert it keeps the
+    // user from ever reaching exists because src/shared/src/lib.rs
+    // sizes VQ_BASE_START..DMA_POOL_BASE for exactly 16 virtqueues, so
+    // a 17th would land on the DMA pool.
+    if let Some(chain_device_count) = chain.as_ref().map(|c| c.total_devices()) {
+        if chain_device_count > MAX_CHAIN_DEVICES {
+            return Err(format!(
+                "check: chain depth {chain_device_count} exceeds maximum of {MAX_CHAIN_DEVICES} devices"
+            )
+            .into());
+        }
+    }
+
     // Get input file metadata
     let input_metadata = std::fs::metadata(&args.input)?;
     let input_size = input_metadata.len();
@@ -12472,11 +12514,14 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
         return Err(error.into());
     }
 
-    // A differencing source is refused rather than checked: the image is
-    // structurally fine but references content instar cannot see, so the
-    // guest marks the check incomplete rather than counting a corruption.
-    // Returning Err (exit 1) is what keeps "refused" distinct from both
-    // "clean" (exit 0) and "corrupt" (exit 2) (PLAN-differencing phase 4).
+    // A differencing source is refused rather than checked: check
+    // validates the structure of one image, and a differencing child's
+    // own structure is almost always intact while the image as a whole
+    // is unusable without its parent, so a clean verdict would present
+    // that partial view as though it were whole. The guest marks the
+    // check incomplete rather than counting a corruption. Returning Err
+    // (exit 1) is what keeps "refused" distinct from both "clean"
+    // (exit 0) and "corrupt" (exit 2).
     if serial_decoder.last_differencing_refusal.is_some() {
         return Err(serial_decoder
             .differencing_refusal_error("check", DifferencingComposition::Unsupported)
@@ -12702,6 +12747,20 @@ fn print_measure_result(
                 MEASURE_RESULT_ERROR_OVERFLOW => "measure: overflow computing target size",
                 MEASURE_RESULT_ERROR_INVALID_OPTION => "measure: invalid option for target format",
                 MEASURE_RESULT_ERROR_INVALID_SIZE => "measure: source image is unsupported format",
+                // Not "unsupported format": the format was recognised
+                // and the allocation scan walked the block table far
+                // enough to find it naming a block the reader refuses
+                // to read. The image is malformed, not foreign. The
+                // same code is spelled out again in `run_measure`,
+                // which renders the failure the process exits on while
+                // this renders the one printed as the result arrives;
+                // both are reachable and both used to say "unknown
+                // error" for a code only one of them knew about.
+                MEASURE_RESULT_ERROR_MALFORMED_BLOCK_TABLE => {
+                    "measure: source block table names a block inside the image's own \
+                     structure (at file offset zero, or overlapping a region the image \
+                     declares); the format is recognised, the image is malformed"
+                }
                 _ => "measure: unknown error",
             };
             eprintln!("{}", msg);
@@ -15730,6 +15789,16 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
             MEASURE_RESULT_ERROR_OVERFLOW => "overflow computing target size",
             MEASURE_RESULT_ERROR_INVALID_OPTION => "invalid option for target format",
             MEASURE_RESULT_ERROR_INVALID_SIZE => "source image is unsupported format",
+            // Not "unsupported format": the format was recognised and
+            // the allocation scan walked the block table far enough to
+            // find it naming a block the reader refuses to read. The
+            // image is malformed, not foreign.
+            MEASURE_RESULT_ERROR_MALFORMED_BLOCK_TABLE => {
+                "source block table names a block inside the image's own \
+                 structure (at file offset zero, or overlapping a region the \
+                 image declares); the format is recognised, the image is \
+                 malformed"
+            }
             _ => "unknown error",
         };
         return Err(format!("measure failed: {}", detail).into());
@@ -16165,6 +16234,24 @@ fn map_error_message(error: u32) -> Option<&'static str> {
              image on its own rather than composing a parent into it",
         ),
         MAP_RESULT_ERROR_IO => Some("map: I/O failure walking the source"),
+        // Deliberately says neither "unrecognised" nor "I/O": the
+        // format was recognised and the headers parsed, which is the
+        // only reason the walk got far enough to find the
+        // contradiction, and nothing failed to read -- what was read
+        // disagrees with itself. Either of the other two messages
+        // would send the user hunting a problem that is not there.
+        //
+        // One code covers both grounds the walk refuses on, so the
+        // message names both rather than asserting the one that
+        // happens to be more common: a block at offset zero does not
+        // overlap any declared region, and claiming it did would be a
+        // false statement about the user's image.
+        MAP_RESULT_ERROR_MALFORMED_BLOCK_TABLE => Some(
+            "map: source block table names a block inside the image's own \
+             structure (at file offset zero, or overlapping a region the \
+             image declares); the format is recognised, the image is \
+             malformed",
+        ),
         _ => Some("map: unknown error"),
     }
 }
@@ -19940,6 +20027,7 @@ mod map_renderer_tests {
             MAP_RESULT_ERROR_INVALID_OPTION,
             MAP_RESULT_ERROR_HAS_BACKING,
             MAP_RESULT_ERROR_IO,
+            MAP_RESULT_ERROR_MALFORMED_BLOCK_TABLE,
         ];
         let messages: Vec<&'static str> = codes
             .iter()
@@ -19967,6 +20055,30 @@ mod map_renderer_tests {
     fn error_unknown_returns_generic_message() {
         let msg = map_error_message(999).expect("unknown error returns Some");
         assert!(msg.contains("unknown"));
+    }
+
+    // A recognised image with a malformed block table must not be
+    // described as an unrecognised format or as an I/O failure. Both
+    // of those codes already existed and either would have been the
+    // cheap thing to reuse, and both would have sent the user
+    // looking in the wrong place: at their format tooling, or at
+    // their disk.
+    #[test]
+    fn error_malformed_block_table_blames_the_image_not_the_format() {
+        let msg = map_error_message(MAP_RESULT_ERROR_MALFORMED_BLOCK_TABLE)
+            .expect("malformed-block-table error must have message");
+        assert!(
+            msg.contains("malformed"),
+            "the message must say the image is malformed: {msg}"
+        );
+        assert!(
+            msg.contains("recognised") && !msg.contains("unrecognised"),
+            "the message must say the format IS recognised: {msg}"
+        );
+        assert!(
+            !msg.contains("I/O"),
+            "nothing failed to read; saying so points at the disk: {msg}"
+        );
     }
 
     #[test]

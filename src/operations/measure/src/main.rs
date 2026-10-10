@@ -115,6 +115,11 @@ pub unsafe extern "C" fn _start() -> u64 {
     // a fragmented source would be collapsed into one contiguous run
     // and under-count required data clusters (bug #286).
     let target_unit_size = target_unit_size_for(config);
+    // Which failure `detect_and_scan` reports if it returns `None`.
+    // Almost every way the scan can fail really is "this is not an
+    // image measure can read", which is what `ERROR_INVALID_SIZE`
+    // renders; the one that is not overwrites this.
+    let mut scan_error = MeasureResult::ERROR_INVALID_SIZE;
     let summary = if config.virtual_size_override != 0 {
         AllocationSummary {
             virtual_size: config.virtual_size_override,
@@ -122,15 +127,16 @@ pub unsafe extern "C" fn _start() -> u64 {
             target_units_with_data: 0,
         }
     } else {
-        match detect_and_scan(call_table, config, target_unit_size, &mut bytes_read) {
+        match detect_and_scan(
+            call_table,
+            config,
+            target_unit_size,
+            &mut bytes_read,
+            &mut scan_error,
+        ) {
             Some(s) => s,
             None => {
-                send_result(
-                    call_table,
-                    config.target_format,
-                    0,
-                    Err(MeasureError::InvalidSize),
-                );
+                send_error_result(call_table, config.target_format, scan_error);
                 (call_table.send_complete)(b"measure\0".as_ptr(), bytes_read, false);
                 return bytes_read;
             }
@@ -193,23 +199,46 @@ unsafe fn send_result(
     unit: u32,
     out: Result<MeasureOutput, MeasureError>,
 ) {
-    let result = match out {
-        Ok(o) => MeasureResult {
-            magic: MeasureResult::MAGIC,
-            target_format: target,
-            required: o.required,
-            fully_allocated: o.fully_allocated,
-            resolved_unit_size: unit,
-            error: MeasureResult::ERROR_OK,
-        },
-        Err(e) => MeasureResult {
-            magic: MeasureResult::MAGIC,
-            target_format: target,
-            required: 0,
-            fully_allocated: 0,
-            resolved_unit_size: 0,
-            error: map_error(e),
-        },
+    match out {
+        Ok(o) => {
+            let result = MeasureResult {
+                magic: MeasureResult::MAGIC,
+                target_format: target,
+                required: o.required,
+                fully_allocated: o.fully_allocated,
+                resolved_unit_size: unit,
+                error: MeasureResult::ERROR_OK,
+            };
+            (call_table.send_measure_result)(&result);
+        }
+        Err(e) => send_error_result(call_table, target, map_error(e)),
+    }
+}
+
+/// Emit a failing [`MeasureResult`] carrying `error` verbatim.
+///
+/// [`send_result`] covers every failure the size calculator itself
+/// produces, which is what [`MeasureError`] enumerates. A scan can
+/// fail for a reason the calculator never sees -- an unreadable
+/// source, or one whose block table contradicts its own region table
+/// -- and those codes have no `MeasureError` to be mapped from, so
+/// they arrive here directly rather than being forced through an
+/// enum that would have to grow a variant no `measure_*` function can
+/// return.
+///
+/// # Safety
+///
+/// `call_table` must be a valid initialised [`CallTable`] -- the
+/// architectural invariant established by `_start` (see its
+/// `Safety` doc).
+unsafe fn send_error_result(call_table: &CallTable, target: u32, error: u32) {
+    let result = MeasureResult {
+        magic: MeasureResult::MAGIC,
+        target_format: target,
+        required: 0,
+        fully_allocated: 0,
+        resolved_unit_size: 0,
+        error,
     };
     (call_table.send_measure_result)(&result);
 }
@@ -327,6 +356,12 @@ unsafe fn refuse_differencing(call_table: &CallTable, status: u32) {
 /// `scan_allocation` to produce an [`AllocationSummary`]. Returns `None`
 /// if the format is unrecognised or the parser rejects the image.
 ///
+/// On `None`, `scan_error` names the [`MeasureResult`] error code to
+/// report. The caller sets it to `ERROR_INVALID_SIZE` beforehand,
+/// which covers every failure that genuinely means "this is not an
+/// image measure can read"; an arm overwrites it only where that
+/// would be a lie about a recognised image.
+///
 /// # Safety
 ///
 /// `call_table` must be a valid initialised [`CallTable`] — the
@@ -340,6 +375,7 @@ unsafe fn detect_and_scan(
     config: &MeasureConfig,
     target_unit_size: u64,
     bytes_read: &mut u64,
+    scan_error: &mut u32,
 ) -> Option<AllocationSummary> {
     let sector_size = config.sector_size as usize;
     let input_capacity = (call_table.get_input_capacity)(0);
@@ -441,7 +477,21 @@ unsafe fn detect_and_scan(
                 refuse_differencing(call_table, DifferencingRefusal::STATUS_VHDX);
                 return None;
             }
-            state.scan_allocation(call_table, sector_size, input_capacity, bytes_read)
+            let summary =
+                state.scan_allocation(call_table, sector_size, input_capacity, bytes_read);
+            // The BAT walk refuses an image whose present payload
+            // block sits at file offset zero or overlaps a region the
+            // image declares, which are the two conditions the chain
+            // readers refuse a read on: without this, `measure`
+            // reported a size that counted a block `convert` will not
+            // read. Say which failure it was, or the default
+            // `ERROR_INVALID_SIZE` tells the user their format is
+            // unsupported when it is understood well enough to have
+            // found the contradiction.
+            if summary.is_none() && state.block_table_malformed {
+                *scan_error = MeasureResult::ERROR_MALFORMED_BLOCK_TABLE;
+            }
+            summary
         }
         _ => None,
     }

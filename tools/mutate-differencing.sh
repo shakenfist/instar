@@ -682,7 +682,7 @@ self_test() {
 # phase's definition of done asks the two to stay in step, which until
 # now was a promise kept by hand. Asserting it makes the drift a
 # failure instead of a documentation bug nobody reads.
-EXPECTED_CASES=91
+EXPECTED_CASES=102
 
 check_case_count() {
     # Only meaningful for a whole run; a selection is expected to be short.
@@ -719,6 +719,44 @@ check_case_count() {
         echo "this script defines ${survivor_actual}." >&2
         bad='yes'
     fi
+
+    # The group counts in the prose went stale the same way: one review
+    # round found two groups both described as "the final" N, because
+    # a group had been appended without the earlier paragraph being
+    # reread. Derive each group from the case names, which are the
+    # thing that actually changes when a case is added, and require
+    # the document to state it in a checkable form. The sub-counts the
+    # prose takes by subtraction ("the other eight", "the last three")
+    # cannot drift silently either: any case added to those groups
+    # moves one of the figures checked here.
+    #
+    # Three "##"-separated fields per group: the name used in the error
+    # message, the pattern matching the case names, and the regex that
+    # finds the figure in the document. No field carries the number
+    # itself. The first version of this loop put "14 cases guard" in
+    # the label and then branched on that literal to pick a different
+    # document regex, so the label named the very figure the check was
+    # meant to derive and editing the label broke the branch.
+    local group_doc group_actual label pattern doc_pattern spec
+    for spec in \
+        "cases guarding map, measure and check##^(integration_case '(map|measure|check)-(vhd|vhdx)-refusal-removed'|rust_case 'vhdx-(map-extent|scan-block)-offset-|rust_case 'vhdx-bat-walk-|integration_case 'check-vhdx-(block|region)-)##\\*\\*[0-9]+ cases guard" \
+        "refusal cases##^integration_case '(map|measure|check)-(vhd|vhdx)-refusal-removed'##\\*\\*[0-9]+ refusal cases\\*\\*" \
+        "device-count cases##^integration_case '(bench|check)-chain-device-count-guard-removed'##\\*\\*[0-9]+ device-count cases\\*\\*"
+    do
+        label="${spec%%##*}"
+        pattern="${spec#*##}"
+        pattern="${pattern%##*}"
+        doc_pattern="${spec##*##}"
+        group_actual="$(grep -cE "${pattern}" "${BASH_SOURCE[0]}")"
+        group_doc="$(grep -oE "${doc_pattern}" \
+            "${REPO_ROOT}/docs/testing.md" 2>/dev/null | grep -oE '[0-9]+' | head -1)"
+        if [ "${group_doc:-x}" != "${group_actual}" ]; then
+            echo >&2
+            echo "docs/testing.md says '${group_doc:-no}' ${label};" >&2
+            echo "this script defines ${group_actual}." >&2
+            bad='yes'
+        fi
+    done
 
     if [ "${TOTAL_COUNT}" -ne "${EXPECTED_CASES}" ]; then
         echo >&2
@@ -1878,6 +1916,36 @@ integration_case 'rebase-differencing-refusal-call-site-removed' "${VMM_MAIN}" \
     '    // MUTATED: differencing_refusal_error call site removed' \
     "${REBASE_REFUSAL}"
 
+# commit's own discovery call, for its backing's own ancestor chain,
+# reverted the other way: `Unsupported` is the one that is correct here
+# (commit's guest reads only the overlay and the backing and ignores
+# whatever ancestor devices the host attaches beyond those), and
+# flipping it to `Supported` makes the host try to resolve a
+# differencing ancestor's own parent instead of recording it
+# unresolved. The fixture that notices has that parent missing on
+# purpose, so the mutated walk fails during host-side chain discovery,
+# before KVM is even opened, where the unmutated walk never looked for
+# it at all.
+COMMIT_ANCESTOR='test_differencing.TestDifferencingCommitDoesNotOpenTheAncestor'
+COMMIT_ANCESTOR_ABSENT="${COMMIT_ANCESTOR}.test_commit_succeeds_when_the_differencing_ancestors_parent_is_absent"
+
+integration_case 'commit-host-capability-reverted-to-supported' "${VMM_MAIN}" \
+    '    let backing_chain_full = discover_backing_chain(
+        &resolved_backing_path,
+        sector_size,
+        &security_config,
+        ChainUse::Compose,
+        DifferencingComposition::Unsupported,
+    )' \
+    '    let backing_chain_full = discover_backing_chain(
+        &resolved_backing_path,
+        sector_size,
+        &security_config,
+        ChainUse::Compose,
+        DifferencingComposition::Supported, // MUTATED
+    )' \
+    "${COMMIT_ANCESTOR_ABSENT}"
+
 # ---------------------------------------------------------------------
 # The other half of the policy: map, measure and check still refuse a
 # differencing source, each in its own code rather than through
@@ -1926,6 +1994,204 @@ integration_case 'check-vhdx-refusal-removed' "${CHECK_OP}" \
     '    if metadata.has_parent {' \
     '    if metadata.has_parent && false { // MUTATED' \
     "${CHECK_REFUSES}"
+
+# Four more on the same three operations, and the one place they are not
+# merely non-composing but were answering differently from the readers.
+# `map` and `measure` do not go through `block_lookup` at all: each
+# walks the whole BAT once, through `VhdxState::map_extents` and
+# `VhdxState::scan_allocation`. Until `block_lookup`'s two guards
+# reached both walks, `map` reported a payload block declared inside
+# the metadata region -- or at file offset zero, where the headers live
+# -- as data living at that offset, and `measure` counted its bytes,
+# while `convert` refused to read that same block (issue #634, and
+# #547 for the offset-zero half).
+#
+# Two cases per walk, one per guard, because neither guard subsumes
+# the other: a block at offset zero does not overlap a declared region
+# in this geometry, and a block inside a region has a non-zero offset.
+# A single case per walk would have let either guard be deleted
+# silently.
+#
+# These are `rust_case` rather than `integration_case` because the
+# walks are crate functions a unit test can drive directly, and because
+# the fixture is a hand-patched BAT entry that no image in
+# instar-testdata carries. Each case reverts one call site only, so the
+# other three keep passing and the verdict names the walk and the guard
+# that was lost.
+
+rust_case 'vhdx-map-extent-offset-inside-region-accepted' "${VHDX_READ_LIB}" \
+    '                    if self.block_overlaps_a_declared_region(file_offset, block_size) {
+                        self.block_table_malformed = true;
+                        return None;
+                    }' \
+    '                    if false {
+                        // MUTATED: map no longer applies the overlap test
+                        self.block_table_malformed = true;
+                        return None;
+                    }' \
+    qcow2 'vhdx_map_and_measure_refuse_a_block_inside_the_metadata_region' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'vhdx-scan-block-offset-inside-region-accepted' "${VHDX_READ_LIB}" \
+    '                    if self.block_overlaps_a_declared_region(file_offset, block_size) {
+                        malformed = true;
+                        return false;
+                    }' \
+    '                    let _ = block_size;
+                    if false {
+                        // MUTATED: measure no longer applies the overlap test
+                        malformed = true;
+                        return false;
+                    }' \
+    qcow2 'vhdx_map_and_measure_refuse_a_block_inside_the_bat_region' \
+    --features "${QCOW2_FEATURES}"
+
+# The other guard of the pair, one case per walk. The overlap test
+# cannot stand in for this one: in the fixture geometry a 1 MiB block
+# at offset zero ends exactly where the first declared region begins,
+# so the two touch without overlapping and the overlap test returns
+# false -- which is why dropping this guard leaves all four cases above
+# passing. The two tests named here assert that independence directly,
+# recomputing the overlap from the image's own region table rather than
+# from the predicate under test.
+
+rust_case 'vhdx-map-extent-offset-zero-accepted' "${VHDX_READ_LIB}" \
+    '                    if file_offset == 0 {
+                        self.block_table_malformed = true;
+                        return None;
+                    }' \
+    '                    if false {
+                        // MUTATED: map no longer refuses a present block at offset zero
+                        self.block_table_malformed = true;
+                        return None;
+                    }' \
+    qcow2 'vhdx_map_refuses_a_present_block_at_file_offset_zero' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'vhdx-scan-block-offset-zero-accepted' "${VHDX_READ_LIB}" \
+    '                    if file_offset == 0 {
+                        malformed = true;
+                        return false;
+                    }' \
+    '                    if false {
+                        // MUTATED: measure no longer refuses a present block at offset zero
+                        malformed = true;
+                        return false;
+                    }' \
+    qcow2 'vhdx_measure_refuses_a_present_block_at_file_offset_zero' \
+    --features "${QCOW2_FEATURES}"
+
+# One more on the shared walk itself rather than on either guard.
+#
+# All four cases above are refusal cases, and a refusal case cannot see
+# a miscount: measured, disabling the sector-bitmap skip in
+# `for_each_payload_bat_entry` leaves every one of them passing,
+# because a walk whose payload bookkeeping has drifted still reaches
+# the malformed entry and still refuses it. What drifts is where the
+# walk stops -- the `payload_seen >= total_payload_blocks` cap arrives
+# one slot early per chunk group -- so the observable is a count, on a
+# well-formed image, of blocks declared either side of a group
+# boundary. This case is the reason that test exists.
+
+rust_case 'vhdx-bat-walk-counts-the-bitmap-slots' "${VHDX_READ_LIB}" \
+    '        let slot_in_group = i % group;
+        if slot_in_group >= chunk_ratio as u64 {' \
+    '        let slot_in_group = i % group;
+        if false {
+            // MUTATED: the shared walk no longer skips bitmap slots
+            let _ = slot_in_group;' \
+    qcow2 'vhdx_scan_counts_a_block_in_each_chunk_group' \
+    --features "${QCOW2_FEATURES}"
+
+# The fourth answer, which for a long time was no answer at all.
+# `check` builds no `VhdxState`: it has its own file identifier, dual
+# header CRC-32C, region table 1+2 cross-validation, metadata parsing
+# and BAT walk, so none of the reader guards above reach it. Measured
+# at the CLI before it had the pair: on an image whose first payload
+# BAT entry was repointed at the metadata region, at the BAT region or
+# at file offset zero, `convert` exited 1 and `map` and `measure`
+# refused by name, while `check` printed "No errors were found on the
+# image." and exited 0 for all three.
+#
+# `integration_case` rather than `rust_case`: the arm lives in a
+# `no_std` guest binary with no `std` test harness to drive it, so the
+# only way to observe the verdict is the exit code of the real command.
+#
+# Three cases. Two are one per guard, for the same reason the two walks
+# get one each -- a block at offset zero does not overlap a declared
+# region in this geometry and a block inside one has a non-zero offset,
+# so a single case would let either be deleted silently. The third is
+# the one no "inside a region" case can catch: an overlap test
+# degraded into a high-water mark, which refuses every block below the
+# highest region's end. Every malformed case still passes under it, and
+# only a region declared *after* the blocks -- which SPEC(VHDX) allows
+# -- tells the two apart.
+
+CHECK_BLOCK_TESTS='test_differencing.TestVhdxBlockOffsetsNamingTheImagesOwnStructure'
+CHECK_BLOCK_COUNTED="${CHECK_BLOCK_TESTS}.test_check_counts_a_block_naming_the_images_own_structure"
+CHECK_BLOCK_TRAILING="${CHECK_BLOCK_TESTS}"
+CHECK_BLOCK_TRAILING="${CHECK_BLOCK_TRAILING}.test_every_operation_accepts_a_region_declared_after_the_blocks"
+
+integration_case 'check-vhdx-block-offset-zero-not-counted' "${CHECK_OP}" \
+    '                if file_offset == 0 {' \
+    '                if file_offset == 0 && false { // MUTATED' \
+    "${CHECK_BLOCK_COUNTED}"
+
+integration_case 'check-vhdx-block-inside-a-region-not-counted' "${CHECK_OP}" \
+    '                        vhdx::ranges_overlap(
+                            file_offset,
+                            block_size as u64,
+                            region_offset,
+                            region_length,
+                        )' \
+    '                        // MUTATED: check no longer tests a block against the regions
+                        let _ = (file_offset, region_offset, region_length);
+                        false' \
+    "${CHECK_BLOCK_COUNTED}"
+
+integration_case 'check-vhdx-region-test-replaced-by-a-high-water-mark' "${CHECK_OP}" \
+    '                        vhdx::ranges_overlap(
+                            file_offset,
+                            block_size as u64,
+                            region_offset,
+                            region_length,
+                        )' \
+    '                        // MUTATED: overlap test replaced by a high-water mark
+                        file_offset < region_offset + u64::from(region_length)' \
+    "${CHECK_BLOCK_TRAILING}"
+
+# ---------------------------------------------------------------------
+# bench and check attaching an over-deep chain. Issue #633: every other
+# operation that attaches a backing chain (convert/dd, commit, rebase,
+# compare) refuses one whose device count exceeds MAX_CHAIN_DEVICES
+# before KVM opens; bench and check did not, and reached
+# `DeviceSet::add_device`'s own defensive assert with KVM and the VM
+# already created, panicking instead of failing cleanly. Caught through
+# the real binary: the guard is host CLI code in a function with no
+# `#[cfg(test)]` module of its own, so the test fixture's device count
+# (not merely its backing-pointer depth) has to come from the command
+# line.
+# ---------------------------------------------------------------------
+
+DEVICE_COUNT_TESTS='test_adversarial.TestAdversarialChainDeviceCount'
+BENCH_DEVICE_COUNT="${DEVICE_COUNT_TESTS}.test_bench_chain_device_count_17_refused"
+CHECK_DEVICE_COUNT="${DEVICE_COUNT_TESTS}.test_check_chain_device_count_17_refused"
+
+integration_case 'bench-chain-device-count-guard-removed' "${VMM_MAIN}" \
+    '    let chain_device_count = chain.total_devices();
+    if chain_device_count > MAX_CHAIN_DEVICES {' \
+    '    let chain_device_count = chain.total_devices();
+    if false {
+        // MUTATED: bench no longer refuses an over-deep chain' \
+    "${BENCH_DEVICE_COUNT}"
+
+integration_case 'check-chain-device-count-guard-removed' "${VMM_MAIN}" \
+    '    if let Some(chain_device_count) = chain.as_ref().map(|c| c.total_devices()) {
+        if chain_device_count > MAX_CHAIN_DEVICES {' \
+    '    if let Some(chain_device_count) = chain.as_ref().map(|c| c.total_devices()) {
+        if false {
+            // MUTATED: check no longer refuses an over-deep chain' \
+    "${CHECK_DEVICE_COUNT}"
 
 # ---------------------------------------------------------------------
 # The create guest operation. Caught through the real binary only.
