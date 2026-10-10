@@ -309,7 +309,21 @@ is stripped: zero non-comment `PLAN-*.md` references in `src/`.
 * `instar check` and `instar bench` refuse a 17-image chain before
   opening KVM, each naming its own operation. Falsifiable: a test
   asserts the message text for both, and
-  `grep -c 'exceeds the' src/vmm/src/main.rs` has grown by two.
+  `grep -c 'exceeds maximum of' src/vmm/src/main.rs` has grown by
+  two, from 3 to 5.
+
+  **Search string corrected at close-out.** As written this criterion
+  grepped for `exceeds the`, which neither guard 15c added says: both
+  render "chain depth {n} exceeds maximum of {max} devices", matching
+  the `convert`/`dd` and `compare` guards rather than the `rebase` and
+  `commit` ones that do say "exceeds the {n}-device limit". The
+  `exceeds the` count was 5 before the phase and 5 after, so the
+  criterion as phrased could not have been met by any wording 15c
+  plausibly chose. Both guards exist, both refuse before KVM opens and
+  both name their own operation (`src/vmm/src/main.rs:5389` for
+  `bench`, `:12094` for `check`), and the corrected string does grow
+  by two -- so what was wrong here was the probe, not the work it was
+  measuring.
 * Nothing in `src/`, `tests/` or the top level of `docs/` claims that
   **instar** cannot read or compose a differencing image. Falsifiable
   by a script rather than a grep:
