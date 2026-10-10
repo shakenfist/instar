@@ -9,12 +9,17 @@
 //!
 //! Backing file paths are **untrusted data** read from image headers by the
 //! sandboxed guest operation. This module:
-//! - Canonicalizes all paths to prevent `../` traversal attacks
-//! - Validates paths against an allowlist of directories
+//! - Checks each path against an allowlist of directories from its
+//!   lexically normalised spelling before touching the filesystem, so
+//!   `../` traversal is refused without probing where it leads
+//! - Resolves symlinks and `..` one component at a time, as the kernel
+//!   would, never looking at an image-chosen path outside the
+//!   allowlist, so a refusal never depends on (or prints) what lies
+//!   outside it
 //! - Enforces a maximum chain depth to prevent infinite loops
 //! - Does NOT parse image formats on the host
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::config::{get_backing_allowlist, get_max_chain_depth, SecurityConfig};
 use shared::format_detection::VMDK_DESCRIPTOR_MAGIC;
@@ -330,117 +335,523 @@ pub struct InfoOperationResult {
     pub external_data_file: Option<String>,
 }
 
-/// Resolve a backing file path relative to the parent image.
+/// The most symbolic links one resolution follows. It matches Linux's
+/// own limit (`MAXSYMLINKS`), past which the kernel answers `ELOOP`.
+const MAX_SYMLINK_HOPS: u32 = 40;
+
+/// Normalise a path without touching the filesystem.
 ///
-/// Backing file paths can be:
-/// - Absolute paths (start with `/`)
-/// - Relative paths (resolved relative to the parent image's directory)
+/// `.` components are dropped and `..` removes the component before
+/// it. At the root `..` is clamped, as the kernel does, so `/..` is
+/// `/`. A relative path keeps any leading `..` it cannot resolve.
 ///
-/// For portability, when an absolute path doesn't exist, we fall back to
-/// resolving just the filename relative to the parent image's directory.
-/// This handles images created on different machines where the absolute
-/// path may not match the current filesystem layout.
+/// This is not the kernel's answer when the component before a `..`
+/// is a symlink, so the result only ever decides things that must be
+/// settled before the filesystem is looked at: whether a backing
+/// reference is worth walking at all, and what an error names. Where
+/// a reference actually leads is decided by `walk_within_allowlist`,
+/// which resolves `..` physically, after the symlinks before it.
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => out.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => match out.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                Some(Component::RootDir) | Some(Component::Prefix(_)) => {}
+                _ => out.push(".."),
+            },
+            Component::Normal(name) => out.push(name),
+        }
+    }
+    out
+}
+
+/// The path a backing reference names, built without touching the
+/// filesystem: the reference itself when it is absolute, otherwise
+/// the reference joined to `parent_dir`, normalised either way.
+/// `parent_dir` must already be absolute.
 ///
-/// # Resolution strategy
+/// This is the spelling the allowlist pre-check judges and errors
+/// print. It is never itself walked; see `normalize_lexically`.
+fn lexical_backing_candidate(parent_dir: &Path, reference: &str) -> PathBuf {
+    // `join` replaces the base outright when the reference is absolute.
+    normalize_lexically(&parent_dir.join(reference))
+}
+
+/// Whether `reference`, read from `parent_image`, names `path`, judged
+/// from the two spellings alone.
 ///
-/// 1. If relative: resolve relative to parent image's directory
-/// 2. If absolute and exists: use the absolute path
-/// 3. If absolute and doesn't exist: fall back to filename-only resolution
-///    relative to parent image's directory (for portability)
-/// 4. Canonicalize the result to prevent traversal attacks
+/// Nothing is looked at, so the answer is the same whatever is on the
+/// host, and no allowlist is needed to keep it from being an oracle.
+/// It is yes only when neither spelling contains `..`. Without one, a
+/// spelling names the file at that path whatever symlinks lie along
+/// it, so two equal spellings name the same file; with one, a symlink
+/// before the `..` can send a spelling somewhere its text does not
+/// say. A no means only that the spellings alone cannot tell.
+pub fn reference_spells_path(parent_image: &Path, reference: &str, path: &Path) -> bool {
+    let (Ok(parent_image), Ok(path)) =
+        (std::path::absolute(parent_image), std::path::absolute(path))
+    else {
+        return false;
+    };
+    let Some(parent_dir) = parent_image.parent() else {
+        return false;
+    };
+    // `join` replaces the base outright when the reference is absolute.
+    let named = parent_dir.join(reference);
+    let has_parent_dir = |p: &Path| p.components().any(|c| c == Component::ParentDir);
+    !has_parent_dir(&named) && !has_parent_dir(&path) && named == path
+}
+
+/// The backing-file allowlist, with every entry in both of its
+/// spellings.
 ///
-/// # Security
+/// Entries are operator configuration rather than image data, so
+/// canonicalising them answers nothing an image could ask. The
+/// canonical spelling is what the physical path a resolution ends at
+/// is compared with, and is the final word.
 ///
-/// This function only resolves paths - security allowlist validation happens
-/// in `validate_backing_path()` which calls this function. The allowlist is
-/// always checked regardless of which resolution strategy succeeded.
-pub fn resolve_backing_path(
+/// The lexical spelling is kept for one case: an operator-configured
+/// entry spelled through a symlink, such as `/srv/images` where `/srv`
+/// links elsewhere. Images built there carry absolute references in
+/// that same spelling, and without it they would be judged outside
+/// the allowlist and sent to the file-name fallback, which only finds
+/// a base sitting directly beside the image. The same goes for the
+/// operator's spelling of the image's directory, which
+/// `validate_backing_path` adds beside the canonical `$IMAGE_DIR`.
+/// Relative references never need it, since they are joined to the
+/// canonical directory.
+///
+/// A lexical spelling is only kept when it names the same place as
+/// the entry. Without `..` it does: symlinks along it are resolved
+/// wherever they lead. A `..` after a symlink is where the two part,
+/// because the kernel applies it to the symlink's target, so
+/// `/e/link/../b` with `link -> /e/x/y` is `/e/x/b`, while its lexical
+/// form `/e/b` is some other directory, one the walk would then treat
+/// as allowlisted. An entry spelled with `..` is matched in its
+/// canonical form alone.
+struct AllowlistForms {
+    lexical: Vec<PathBuf>,
+    canonical: Vec<PathBuf>,
+}
+
+impl AllowlistForms {
+    fn new(allowlist: &[PathBuf]) -> Self {
+        let lexical = allowlist
+            .iter()
+            .filter_map(|entry| std::path::absolute(entry).ok())
+            .filter(|entry| {
+                !entry
+                    .components()
+                    .any(|component| component == Component::ParentDir)
+            })
+            .map(|entry| normalize_lexically(&entry))
+            .collect();
+        let canonical = allowlist
+            .iter()
+            .filter_map(|entry| entry.canonicalize().ok())
+            .collect();
+        AllowlistForms { lexical, canonical }
+    }
+
+    fn entries(&self) -> impl Iterator<Item = &PathBuf> {
+        self.lexical.iter().chain(self.canonical.iter())
+    }
+
+    /// Whether `path` is under an entry, judged from its spelling alone.
+    ///
+    /// The path is normalised here rather than trusted to arrive
+    /// normalised: `Path::starts_with` compares components without
+    /// resolving `..`, so `/imgs/../etc/x` "starts with" `/imgs`. A
+    /// relative path is never allowed, because what it names depends on
+    /// the working directory.
+    fn lexically_allows(&self, path: &Path) -> bool {
+        if !path.is_absolute() {
+            return false;
+        }
+        let path = normalize_lexically(path);
+        self.entries().any(|entry| path.starts_with(entry))
+    }
+
+    /// Whether a resolution may look at the path `path`, which is a
+    /// symlink-free directory with one more name added: it is under an
+    /// entry, or it is one of the directories leading to an entry,
+    /// which are operator configuration too.
+    ///
+    /// Being under a lexical spelling is as good as being under the
+    /// canonical one here. If `path` is under a lexical entry and is not
+    /// the entry itself, the entry is a prefix of the symlink-free
+    /// directory, so it has no symlinks and, having no `..` either, is
+    /// its own canonical form.
+    fn may_probe(&self, path: &Path) -> bool {
+        self.entries()
+            .any(|entry| path.starts_with(entry) || entry.starts_with(path))
+    }
+
+    /// Whether a symlink-free physical path is under an entry's
+    /// canonical form, which is the final word on where a file is.
+    fn physically_allows(&self, path: &Path) -> bool {
+        self.canonical.iter().any(|entry| path.starts_with(entry))
+    }
+}
+
+/// One component still to be walked by `walk_within_allowlist`.
+enum WalkStep {
+    Into(std::ffi::OsString),
+    Up,
+}
+
+/// Push `path`'s components onto `pending` so that the first of them
+/// is popped first.
+fn push_walk_steps(pending: &mut Vec<WalkStep>, path: &Path) {
+    for component in path.components().rev() {
+        match component {
+            Component::Normal(name) => pending.push(WalkStep::Into(name.to_os_string())),
+            Component::ParentDir => pending.push(WalkStep::Up),
+            Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
+        }
+    }
+}
+
+/// How a walk of a path whose spelling passed the lexical check ended.
+#[derive(Debug, PartialEq)]
+enum Walk {
+    /// The physical path: absolute, symlink-free and allowlisted.
+    Found(PathBuf),
+    /// A component inside the allowlist is missing or unreadable.
+    Missing,
+    /// The path leads out of the allowlist, by a symlink or a `..`.
+    Escapes,
+    /// More than `MAX_SYMLINK_HOPS` symlinks were followed. They were
+    /// all inside the allowlist or on the operator-configured
+    /// directories leading to an entry, never an image-chosen path
+    /// outside it.
+    Loop,
+}
+
+/// Resolve the absolute path `path` to a physical path as
+/// `canonicalize` would, but one component at a time, and never look
+/// at an image-chosen path outside the allowlist.
+///
+/// `canonicalize` follows a symlink wherever it points, so whether it
+/// succeeds can depend on a path outside the allowlist. With a link to
+/// `/etc` inside the image directory, `link/shadow` would canonicalise
+/// and `link/nosuch` would not, and a link to a missing directory
+/// outside would turn into one that resolves when that directory
+/// appears. Walking by hand lets each name be checked before it is
+/// looked at: a name that would leave the allowlist, reached through a
+/// symlink's target or a `..`, ends the walk as `Escapes`, unprobed, so
+/// the result depends only on what is inside the allowlist. The only
+/// paths outside it that are looked at are the directories leading to
+/// each entry, which the operator chose, not the image. Every failure
+/// to read a component -- missing, permission denied, not a directory
+/// -- is `Missing`, so no error kind becomes a third answer either.
+///
+/// `..` is applied to the physical directory reached so far, after any
+/// symlinks before it have been followed, as the kernel applies it. So
+/// `path` is walked as spelled, not lexically normalised first:
+/// normalising would turn `link/../x` into `x` beside `link`, where the
+/// kernel, and qemu-img, open `x` beside the link's target.
+fn walk_within_allowlist(path: &Path, forms: &AllowlistForms) -> Walk {
+    debug_assert!(path.is_absolute(), "{}", path.display());
+    let mut pending = Vec::new();
+    push_walk_steps(&mut pending, path);
+    let mut physical = PathBuf::from("/");
+    let mut hops = 0;
+
+    while let Some(step) = pending.pop() {
+        let name = match step {
+            WalkStep::Into(name) => name,
+            WalkStep::Up => {
+                // `physical` contains no symlinks, so dropping its last
+                // component is exactly what the kernel does with `..`.
+                physical.pop();
+                continue;
+            }
+        };
+        let next = physical.join(name);
+        if !forms.may_probe(&next) {
+            return Walk::Escapes;
+        }
+        let is_symlink = match std::fs::symlink_metadata(&next) {
+            Ok(meta) => meta.file_type().is_symlink(),
+            Err(_) => return Walk::Missing,
+        };
+        if !is_symlink {
+            physical = next;
+            continue;
+        }
+
+        hops += 1;
+        if hops > MAX_SYMLINK_HOPS {
+            return Walk::Loop;
+        }
+        let target = match std::fs::read_link(&next) {
+            Ok(target) => target,
+            Err(_) => return Walk::Missing,
+        };
+        // A relative target continues from the link's own directory,
+        // which is where `physical` still points.
+        if target.is_absolute() {
+            physical = PathBuf::from("/");
+        }
+        push_walk_steps(&mut pending, &target);
+    }
+
+    if forms.physically_allows(&physical) {
+        Walk::Found(physical)
+    } else {
+        Walk::Escapes
+    }
+}
+
+/// Whether an absolute reference that cannot be used as written may be
+/// replaced by its file name beside the image.
+///
+/// The substitute keeps images built on another host working for
+/// anything that only reads them. A write target must be refused
+/// instead: the substitute is any file that happens to share the
+/// reference's name, and writing into it would let an image choose an
+/// unrelated file to change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileNameFallback {
+    Allowed,
+    Refused,
+}
+
+/// Resolve a backing reference read from `parent_image` and check it
+/// against `allowlist`.
+///
+/// The reference is image data. If resolving it answered differently
+/// depending on whether some host path outside the allowlist exists,
+/// an image could ask about any path on the host and read the answer
+/// from the refusal -- which `info --chain` prints while still exiting
+/// zero. So the result, the path returned or the error and what it
+/// prints, depends only on the filesystem inside the allowlist:
+///
+/// 1. The candidate path is built and checked against the allowlist
+///    from its lexically normalised spelling alone, before anything is
+///    looked at. A relative reference outside is refused there.
+/// 2. An absolute reference outside is never probed. It goes straight
+///    to the reference's file name beside `parent_image`, which keeps
+///    images built on another host working; that path faces the same
+///    checks, and using it is announced on stderr. With
+///    `FileNameFallback::Refused` it is refused instead.
+/// 3. A candidate inside is walked component by component, in its
+///    spelling as written so that `..` follows the symlinks before it as
+///    the kernel's does, refusing any step that leads out. An absolute
+///    reference that is inside but missing falls back to its file name
+///    in the same way.
+///
+/// Errors carry the lexical candidate rather than any physical path,
+/// so a symlink's target is never printed.
+///
+/// `parent_image` must be absolute, and its directory symlink-free, so
+/// that the lexical candidate built on it means what it says.
+///
+/// Walking the spelling as written rather than the candidate that
+/// passed step 1 cannot make the walk probe an image-chosen name
+/// outside the allowlist, because the pre-check is not what keeps the
+/// walk in. Every filesystem access the walk makes is to a path that
+/// `AllowlistForms::may_probe` admitted first, and a `..` only pops a
+/// component off the physical path, looking at nothing. So whichever
+/// way the spelling's `..` and symlinks land, each probe is under an
+/// entry or is one of the operator's directories leading to one, and
+/// the end of the walk must still pass `physically_allows`. The
+/// pre-check only decides whether a walk is worth starting and whether
+/// an absolute reference goes to the fallback, from nothing but the
+/// reference's spelling, so it cannot add an answer either. A reference
+/// that passes it can still be refused by the walk: with `up -> ..` in
+/// the image directory, `up/sibling` is lexically inside, but its walk
+/// reaches the parent of the image directory and is refused there
+/// before `sibling` is looked at.
+///
+/// `extra_spellings` are further operator-given spellings of entries
+/// already in `allowlist`. They take part in the checks but are not
+/// printed, since `allowlist` already names the same directories.
+fn resolve_backing_path(
     parent_image: &Path,
     backing_path: &str,
+    allowlist: &[PathBuf],
+    extra_spellings: &[PathBuf],
+    fallback: FileNameFallback,
 ) -> Result<PathBuf, ChainError> {
-    let backing = Path::new(backing_path);
+    let entries: Vec<PathBuf> = allowlist.iter().chain(extra_spellings).cloned().collect();
+    let forms = AllowlistForms::new(&entries);
     let parent_dir = parent_image
         .parent()
         .ok_or_else(|| ChainError::PathResolutionError("no parent directory".to_string()))?;
-
-    let resolved = if backing.is_absolute() {
-        // For absolute paths: try the path directly first, then fall back
-        // to filename-only resolution for portability
-        if backing.exists() {
-            backing.to_path_buf()
-        } else {
-            // Absolute path doesn't exist - try filename only, relative to
-            // parent image's directory. This handles images created on other
-            // machines with different filesystem layouts.
-            if let Some(filename) = backing.file_name() {
-                let fallback = parent_dir.join(filename);
-                if fallback.exists() {
-                    fallback
-                } else {
-                    // Neither the absolute path nor the filename fallback exist
-                    return Err(ChainError::BackingFileNotFound(backing.to_path_buf()));
-                }
-            } else {
-                return Err(ChainError::BackingFileNotFound(backing.to_path_buf()));
-            }
-        }
-    } else {
-        // Relative path: resolve relative to parent image's directory
-        parent_dir.join(backing)
+    let candidate = lexical_backing_candidate(parent_dir, backing_path);
+    // `join` replaces the base outright when the reference is absolute.
+    let as_written = parent_dir.join(backing_path);
+    let not_allowed = |path: PathBuf| ChainError::BackingFileNotAllowed {
+        path,
+        allowed: allowlist.to_vec(),
     };
 
-    // Canonicalize to resolve symlinks and `..` components
-    resolved.canonicalize().map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            ChainError::BackingFileNotFound(resolved)
-        } else {
-            ChainError::PathResolutionError(format!("{}: {}", resolved.display(), e))
+    let inside = forms.lexically_allows(&candidate);
+    if inside {
+        match walk_within_allowlist(&as_written, &forms) {
+            Walk::Found(resolved) => return Ok(resolved),
+            Walk::Escapes => return Err(not_allowed(candidate)),
+            Walk::Loop => {
+                return Err(ChainError::PathResolutionError(format!(
+                    "{}: too many levels of symbolic links",
+                    candidate.display()
+                )))
+            }
+            Walk::Missing => {}
         }
+    }
+
+    let reference = Path::new(backing_path);
+    if !reference.is_absolute() || fallback == FileNameFallback::Refused {
+        return Err(if inside {
+            ChainError::BackingFileNotFound(candidate)
+        } else {
+            not_allowed(candidate)
+        });
+    }
+
+    // An absolute reference that is missing, or that was never looked
+    // at because it is outside the allowlist: try its file name beside
+    // the image, for images built on a host with another layout. Any
+    // failure here reports the reference itself, so whether a file of
+    // that name sits beside the image is not a separate answer.
+    if let Some(name) = reference.file_name() {
+        // A file name has no `..` or `/`, so this spelling is already
+        // normal.
+        let fallback = parent_dir.join(name);
+        if forms.lexically_allows(&fallback) {
+            if let Walk::Found(resolved) = walk_within_allowlist(&fallback, &forms) {
+                eprintln!(
+                    "instar: using '{}' beside the image in place of '{}'",
+                    name.to_string_lossy(),
+                    backing_path
+                );
+                return Ok(resolved);
+            }
+        }
+    }
+
+    Err(if inside {
+        ChainError::BackingFileNotFound(candidate)
+    } else {
+        not_allowed(candidate)
     })
 }
 
-/// Check if a path is within the allowlist.
-pub fn is_path_allowed(path: &Path, allowlist: &[PathBuf]) -> bool {
-    // Try to canonicalize for comparison
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-
-    allowlist.iter().any(|allowed| {
-        let allowed_canonical = allowed.canonicalize().unwrap_or_else(|_| allowed.clone());
-        canonical.starts_with(&allowed_canonical)
-    })
-}
-
-/// Validate a backing file path and return the validated path if allowed.
+/// Validate a backing file reference read from `parent_image`, and
+/// return the physical path of the file it names if that is allowed.
 ///
-/// This function:
-/// 1. Resolves the path relative to the parent image
-/// 2. Canonicalizes it to prevent traversal attacks
-/// 3. Checks it against the security allowlist
-/// 4. Verifies the file exists
+/// `backing_path` is untrusted image data. See `resolve_backing_path`
+/// for the order checks run in and why it matters. `parent_image` is
+/// trusted: the operator's input, or a path this function returned.
+/// Its directory is canonicalised before use, and a failure to do so
+/// is a `PathResolutionError`. `$IMAGE_DIR` is that canonical
+/// directory, and is also matched as the caller spelled it, unless
+/// that spelling contains `..`.
+///
+/// An absolute reference that cannot be used as written may resolve to
+/// its file name beside the image; see `FileNameFallback`. A file the
+/// caller will write into goes through `validate_backing_write_target`
+/// instead.
 pub fn validate_backing_path(
     parent_image: &Path,
     backing_path: &str,
     security_config: &SecurityConfig,
 ) -> Result<PathBuf, ChainError> {
-    let allowlist = get_backing_allowlist(security_config, parent_image);
+    validate_reference(
+        parent_image,
+        backing_path,
+        security_config,
+        FileNameFallback::Allowed,
+    )
+}
 
-    // Resolve and canonicalize the path
-    let resolved = resolve_backing_path(parent_image, backing_path)?;
+/// Validate a reference read from `parent_image` that names a file the
+/// caller will write into, as `validate_backing_path` does, but never
+/// substitute the reference's file name beside the image: a reference
+/// that cannot be used as written is refused.
+pub fn validate_backing_write_target(
+    parent_image: &Path,
+    backing_path: &str,
+    security_config: &SecurityConfig,
+) -> Result<PathBuf, ChainError> {
+    validate_reference(
+        parent_image,
+        backing_path,
+        security_config,
+        FileNameFallback::Refused,
+    )
+}
 
-    // Check against allowlist
-    if !is_path_allowed(&resolved, &allowlist) {
-        return Err(ChainError::BackingFileNotAllowed {
-            path: resolved,
-            allowed: allowlist,
-        });
-    }
+fn validate_reference(
+    parent_image: &Path,
+    backing_path: &str,
+    security_config: &SecurityConfig,
+    fallback: FileNameFallback,
+) -> Result<PathBuf, ChainError> {
+    // The image's directory is canonicalised, so that both `$IMAGE_DIR`
+    // and the base relative references are joined to are physical paths
+    // whose lexical form means what it says. As spelled, a `..` after a
+    // symlink (`a/link/../b`) names one directory to the kernel and
+    // another to a lexical comparison, and the walk would then probe
+    // image-chosen names under the wrong one. Probing this directory is
+    // safe: `parent_image` is the operator's input, or a path an earlier
+    // resolution already validated, never a name the image chose.
+    //
+    // Only the directory is canonicalised, not the image's own file
+    // name. A top image that is itself a symlink keeps the directory it
+    // was named in, so relative references are found beside the link,
+    // as qemu-img finds them.
+    let resolution_error = |e: std::io::Error| {
+        ChainError::PathResolutionError(format!("{}: {}", parent_image.display(), e))
+    };
+    let spelled_parent = std::path::absolute(parent_image).map_err(resolution_error)?;
+    let canonical_parent = match (spelled_parent.parent(), spelled_parent.file_name()) {
+        (Some(dir), Some(name)) => dir.canonicalize().map_err(resolution_error)?.join(name),
+        _ => {
+            return Err(resolution_error(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "not a path to a file",
+            )))
+        }
+    };
+    let allowlist = get_backing_allowlist(security_config, &canonical_parent);
 
-    // Verify the file exists (canonicalize already does this, but be explicit)
-    if !resolved.exists() {
-        return Err(ChainError::BackingFileNotFound(resolved));
-    }
+    // `$IMAGE_DIR` is also matched in the operator's own spelling of the
+    // image's directory, when that differs from the canonical one and
+    // has no `..`. An image built in a directory reached through a
+    // symlink carries absolute references in that spelling, including
+    // ones into its subdirectories, which the file-name fallback cannot
+    // find. A spelling without `..` names the same directory as the
+    // canonical form, so it admits nothing the canonical form does not;
+    // one with `..` might not, and is left out.
+    let spelled_allowlist = get_backing_allowlist(security_config, &spelled_parent);
+    let extra_spellings: Vec<PathBuf> = spelled_allowlist
+        .into_iter()
+        .zip(&allowlist)
+        .filter(|(spelled, canonical)| spelled != *canonical)
+        .map(|(spelled, _)| spelled)
+        .filter(|spelled| {
+            !spelled
+                .components()
+                .any(|component| component == Component::ParentDir)
+        })
+        .collect();
 
-    Ok(resolved)
+    resolve_backing_path(
+        &canonical_parent,
+        backing_path,
+        &allowlist,
+        &extra_spellings,
+        fallback,
+    )
 }
 
 /// Maximum bytes of descriptor text the VMM will read from disk
@@ -719,21 +1130,31 @@ mod tests {
         let backing = tmp.path().join("images/base.qcow2");
         std::fs::write(&backing, b"").unwrap();
 
-        let resolved = resolve_backing_path(&parent, "base.qcow2").unwrap();
+        let resolved =
+            validate_backing_path(&parent, "base.qcow2", &default_security_config()).unwrap();
         assert_eq!(resolved, backing.canonicalize().unwrap());
     }
 
     #[test]
     fn test_resolve_absolute_backing_path() {
+        // The reference is spelled physically: one spelled through a
+        // symlinked temporary directory is outside the allowlist as
+        // written, since the image's directory is canonicalised.
         let tmp = TempDir::new().unwrap();
-        let parent = tmp.path().join("top.qcow2");
+        let root = tmp.path().canonicalize().unwrap();
+        let parent = root.join("top.qcow2");
         std::fs::write(&parent, b"").unwrap();
 
-        let backing = tmp.path().join("other/base.qcow2");
+        let backing = root.join("other/base.qcow2");
         std::fs::create_dir_all(backing.parent().unwrap()).unwrap();
         std::fs::write(&backing, b"").unwrap();
 
-        let resolved = resolve_backing_path(&parent, backing.to_str().unwrap()).unwrap();
+        let resolved = validate_backing_path(
+            &parent,
+            backing.to_str().unwrap(),
+            &default_security_config(),
+        )
+        .unwrap();
         assert_eq!(resolved, backing.canonicalize().unwrap());
     }
 
@@ -743,7 +1164,8 @@ mod tests {
         let parent = tmp.path().join("top.qcow2");
         std::fs::write(&parent, b"").unwrap();
 
-        let result = resolve_backing_path(&parent, "nonexistent.qcow2");
+        let result =
+            validate_backing_path(&parent, "nonexistent.qcow2", &default_security_config());
         assert!(matches!(result, Err(ChainError::BackingFileNotFound(_))));
     }
 
@@ -765,61 +1187,640 @@ mod tests {
 
         // Use a non-existent absolute path that has the same filename
         let nonexistent_absolute = "/some/other/machine/path/base.qcow2";
-        let resolved = resolve_backing_path(&parent, nonexistent_absolute).unwrap();
+        let resolved =
+            validate_backing_path(&parent, nonexistent_absolute, &default_security_config())
+                .unwrap();
 
         // Should fall back to finding base.qcow2 in the parent's directory
         assert_eq!(resolved, backing.canonicalize().unwrap());
     }
 
     #[test]
-    fn test_absolute_path_no_fallback_when_exists() {
-        // When the absolute path exists, it should be used directly
-        // (no fallback to filename)
+    fn test_absolute_path_inside_allowlist_used_when_exists() {
+        // An absolute reference inside the allowlist is used as named,
+        // even with a file of the same name beside the image.
         let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
 
         // Create parent image
-        let parent = tmp.path().join("top.qcow2");
+        let parent = root.join("top.qcow2");
         std::fs::write(&parent, b"").unwrap();
 
-        // Create backing file at absolute path
-        let other_dir = tmp.path().join("other");
+        // Create backing file at an absolute path under the image dir
+        let other_dir = root.join("other");
         std::fs::create_dir_all(&other_dir).unwrap();
         let backing_absolute = other_dir.join("base.qcow2");
         std::fs::write(&backing_absolute, b"absolute").unwrap();
 
         // Also create a file with same name in parent's directory
-        let backing_local = tmp.path().join("base.qcow2");
+        let backing_local = root.join("base.qcow2");
         std::fs::write(&backing_local, b"local").unwrap();
 
         // Should use the absolute path, not the local file
-        let resolved = resolve_backing_path(&parent, backing_absolute.to_str().unwrap()).unwrap();
+        let resolved = validate_backing_path(
+            &parent,
+            backing_absolute.to_str().unwrap(),
+            &default_security_config(),
+        )
+        .unwrap();
         assert_eq!(resolved, backing_absolute.canonicalize().unwrap());
     }
 
     #[test]
+    fn test_absolute_path_outside_allowlist_uses_local_file() {
+        // An absolute reference outside the allowlist is never looked
+        // at, even when it exists: the file of the same name beside the
+        // image is used instead.
+        let tmp = TempDir::new().unwrap();
+        let images = tmp.path().join("images");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&images).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let parent = images.join("top.qcow2");
+        std::fs::write(&parent, b"").unwrap();
+        let backing_local = images.join("base.qcow2");
+        std::fs::write(&backing_local, b"local").unwrap();
+        let backing_outside = outside.join("base.qcow2");
+        std::fs::write(&backing_outside, b"outside").unwrap();
+
+        let resolved = validate_backing_path(
+            &parent,
+            backing_outside.to_str().unwrap(),
+            &default_security_config(),
+        )
+        .unwrap();
+        assert_eq!(resolved, backing_local.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn test_absolute_path_inside_allowlist_missing_falls_back() {
+        let tmp = TempDir::new().unwrap();
+        let parent = tmp.path().join("top.qcow2");
+        std::fs::write(&parent, b"").unwrap();
+        let backing_local = tmp.path().join("base.qcow2");
+        std::fs::write(&backing_local, b"").unwrap();
+        let missing = tmp.path().join("moved/base.qcow2");
+
+        let resolved = validate_backing_path(
+            &parent,
+            missing.to_str().unwrap(),
+            &default_security_config(),
+        )
+        .unwrap();
+        assert_eq!(resolved, backing_local.canonicalize().unwrap());
+    }
+
+    #[test]
     fn test_absolute_path_fallback_not_found() {
-        // When absolute path doesn't exist and filename fallback also doesn't
-        // exist, should return BackingFileNotFound
+        // An absolute reference outside the allowlist with no file of
+        // its name beside the image is refused as outside the
+        // allowlist. It used to answer "not found", but that was only
+        // true when the path happened not to exist on this host.
         let tmp = TempDir::new().unwrap();
         let parent = tmp.path().join("top.qcow2");
         std::fs::write(&parent, b"").unwrap();
 
-        let result = resolve_backing_path(&parent, "/nonexistent/path/base.qcow2");
-        assert!(matches!(result, Err(ChainError::BackingFileNotFound(_))));
+        let result = validate_backing_path(
+            &parent,
+            "/nonexistent/path/base.qcow2",
+            &default_security_config(),
+        );
+        match result {
+            Err(ChainError::BackingFileNotAllowed { path, .. }) => {
+                assert_eq!(path, PathBuf::from("/nonexistent/path/base.qcow2"))
+            }
+            other => panic!("expected BackingFileNotAllowed, got {other:?}"),
+        }
     }
 
     #[test]
-    fn test_is_path_allowed() {
+    fn write_target_never_falls_back_to_file_name() {
+        // A write target is refused where a read would take the file of
+        // the same name beside the image, both for a reference outside
+        // the allowlist and for one inside it that is missing, and the
+        // refusal is the one a read gives with no such file there.
+        let l = layout();
+        let decoy = l.images.join("base.qcow2");
+        std::fs::write(&decoy, b"").unwrap();
+        let cfg = default_security_config();
+
+        let outside = l.outside.join("base.qcow2");
+        let outside = outside.to_str().unwrap();
+        assert_eq!(
+            validate_backing_path(&l.parent, outside, &cfg).unwrap(),
+            decoy.canonicalize().unwrap()
+        );
+        match validate_backing_write_target(&l.parent, outside, &cfg) {
+            Err(ChainError::BackingFileNotAllowed { path, .. }) => {
+                assert_eq!(path, PathBuf::from(outside))
+            }
+            other => panic!("expected BackingFileNotAllowed, got {other:?}"),
+        }
+
+        let missing = l.images.join("sub").join("base.qcow2");
+        let missing = missing.to_str().unwrap();
+        assert_eq!(
+            validate_backing_path(&l.parent, missing, &cfg).unwrap(),
+            decoy.canonicalize().unwrap()
+        );
+        match validate_backing_write_target(&l.parent, missing, &cfg) {
+            Err(ChainError::BackingFileNotFound(path)) => {
+                assert_eq!(path, PathBuf::from(missing))
+            }
+            other => panic!("expected BackingFileNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_target_resolves_references_usable_as_written() {
+        let l = layout();
+        let base = l.images.join("base.qcow2");
+        std::fs::write(&base, b"").unwrap();
+        let cfg = default_security_config();
+        for reference in ["base.qcow2", base.to_str().unwrap()] {
+            assert_eq!(
+                validate_backing_write_target(&l.parent, reference, &cfg).unwrap(),
+                base.canonicalize().unwrap(),
+                "{reference}"
+            );
+        }
+    }
+
+    #[test]
+    fn reference_spells_path_cases() {
+        let parent = Path::new("/vms/overlays/top.qcow2");
+        let base = Path::new("/vms/bases/base.qcow2");
+        assert!(reference_spells_path(parent, "/vms/bases/base.qcow2", base));
+        assert!(reference_spells_path(
+            parent,
+            "/vms/./bases//base.qcow2",
+            base
+        ));
+        assert!(reference_spells_path(
+            parent,
+            "base.qcow2",
+            Path::new("/vms/overlays/base.qcow2")
+        ));
+        assert!(!reference_spells_path(
+            parent,
+            "/vms/bases/other.qcow2",
+            base
+        ));
+        // A `..` in either spelling could follow a symlink, so the
+        // spellings alone cannot tell.
+        assert!(!reference_spells_path(parent, "../bases/base.qcow2", base));
+        assert!(!reference_spells_path(
+            parent,
+            "/vms/bases/base.qcow2",
+            Path::new("/vms/overlays/../bases/base.qcow2")
+        ));
+    }
+
+    // ====================================================================
+    // Backing resolution never depends on what is outside the allowlist
+    // ====================================================================
+
+    /// The observable outcome of a resolution: the path, or the error
+    /// variant and exactly what it prints.
+    fn outcome(result: &Result<PathBuf, ChainError>) -> String {
+        match result {
+            Ok(path) => format!("Ok({})", path.display()),
+            Err(e) => format!("Err({:?}: {e})", std::mem::discriminant(e)),
+        }
+    }
+
+    /// An image directory and a sibling directory outside the default
+    /// `$IMAGE_DIR` allowlist.
+    struct Layout {
+        _tmp: TempDir,
+        images: PathBuf,
+        outside: PathBuf,
+        parent: PathBuf,
+    }
+
+    fn layout() -> Layout {
         let tmp = TempDir::new().unwrap();
-        let allowed = vec![tmp.path().to_path_buf()];
+        let images = tmp.path().join("images");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&images).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let parent = images.join("top.qcow2");
+        std::fs::write(&parent, b"").unwrap();
+        Layout {
+            _tmp: tmp,
+            images,
+            outside,
+            parent,
+        }
+    }
 
-        let inside = tmp.path().join("test.qcow2");
-        std::fs::write(&inside, b"").unwrap();
-        assert!(is_path_allowed(&inside, &allowed));
+    /// Resolve `reference` with `target` absent, then present, and
+    /// return both outcomes.
+    fn resolve_absent_then_present(
+        parent: &Path,
+        reference: &str,
+        target: &Path,
+    ) -> (String, String) {
+        let cfg = default_security_config();
+        assert!(!target.exists());
+        let absent = outcome(&validate_backing_path(parent, reference, &cfg));
+        std::fs::write(target, b"secret").unwrap();
+        let present = outcome(&validate_backing_path(parent, reference, &cfg));
+        (absent, present)
+    }
 
-        // Path outside allowed directory
-        let outside = PathBuf::from("/etc/passwd");
-        assert!(!is_path_allowed(&outside, &allowed));
+    #[test]
+    fn invariant_absolute_reference_outside() {
+        let l = layout();
+        let target = l.outside.join("secret.qcow2");
+        let (absent, present) =
+            resolve_absent_then_present(&l.parent, target.to_str().unwrap(), &target);
+        assert_eq!(absent, present);
+        assert!(absent.contains("is outside allowed paths"), "{absent}");
+    }
+
+    #[test]
+    fn invariant_relative_dotdot_escape() {
+        let l = layout();
+        let target = l.outside.join("secret.qcow2");
+        let (absent, present) =
+            resolve_absent_then_present(&l.parent, "../outside/secret.qcow2", &target);
+        assert_eq!(absent, present);
+        assert!(absent.contains("is outside allowed paths"), "{absent}");
+    }
+
+    #[test]
+    fn invariant_symlink_inside_allowlist_escape() {
+        let l = layout();
+        std::os::unix::fs::symlink(&l.outside, l.images.join("link")).unwrap();
+        let target = l.outside.join("secret.qcow2");
+        let (absent, present) =
+            resolve_absent_then_present(&l.parent, "link/secret.qcow2", &target);
+        assert_eq!(absent, present);
+        assert!(absent.contains("is outside allowed paths"), "{absent}");
+        // The error names the reference, never where the link points.
+        assert!(!absent.contains("outside/secret"), "{absent}");
+    }
+
+    #[test]
+    fn invariant_symlink_to_missing_directory_outside() {
+        // A link whose target directory is absent does not resolve, and
+        // `canonicalize` would then report the reference missing; once
+        // the directory appears it would report it outside. The answer
+        // must not change when the outside directory appears.
+        let l = layout();
+        let target_dir = l.outside.join("dir");
+        std::os::unix::fs::symlink(&target_dir, l.images.join("link")).unwrap();
+        let cfg = default_security_config();
+        let absent = outcome(&validate_backing_path(&l.parent, "link/secret.qcow2", &cfg));
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let present = outcome(&validate_backing_path(&l.parent, "link/secret.qcow2", &cfg));
+        assert_eq!(absent, present);
+        assert!(absent.contains("is outside allowed paths"), "{absent}");
+        assert!(!absent.contains("outside/dir"), "{absent}");
+    }
+
+    #[test]
+    fn invariant_absolute_reference_with_basename_fallback() {
+        let l = layout();
+        let local = l.images.join("secret.qcow2");
+        std::fs::write(&local, b"local").unwrap();
+        let target = l.outside.join("secret.qcow2");
+        let (absent, present) =
+            resolve_absent_then_present(&l.parent, target.to_str().unwrap(), &target);
+        assert_eq!(absent, present);
+        assert_eq!(
+            absent,
+            format!("Ok({})", local.canonicalize().unwrap().display())
+        );
+    }
+
+    #[test]
+    fn symlink_loop_inside_allowlist_is_an_error() {
+        let l = layout();
+        std::os::unix::fs::symlink("loop", l.images.join("loop")).unwrap();
+        let result = validate_backing_path(&l.parent, "loop", &default_security_config());
+        assert!(
+            matches!(result, Err(ChainError::PathResolutionError(_))),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn symlink_inside_allowlist_to_inside_resolves() {
+        let l = layout();
+        let base = l.images.join("base.qcow2");
+        std::fs::write(&base, b"").unwrap();
+        std::fs::create_dir_all(l.images.join("sub")).unwrap();
+        std::os::unix::fs::symlink("../base.qcow2", l.images.join("sub/link")).unwrap();
+
+        let resolved =
+            validate_backing_path(&l.parent, "sub/link", &default_security_config()).unwrap();
+        assert_eq!(resolved, base.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn symlinked_image_dir_resolves_its_own_children() {
+        // The image is named through a symlinked directory. Relative
+        // references and absolute references in either spelling must
+        // all still resolve.
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let via = tmp.path().join("via");
+        std::os::unix::fs::symlink(&real, &via).unwrap();
+        std::fs::write(real.join("top.qcow2"), b"").unwrap();
+        let base = real.join("base.qcow2");
+        std::fs::write(&base, b"").unwrap();
+        let parent = via.join("top.qcow2");
+        let cfg = default_security_config();
+        let expected = base.canonicalize().unwrap();
+
+        for reference in [
+            "base.qcow2".to_string(),
+            via.join("base.qcow2").display().to_string(),
+            real.join("base.qcow2").display().to_string(),
+        ] {
+            let resolved = validate_backing_path(&parent, &reference, &cfg).unwrap();
+            assert_eq!(resolved, expected, "reference {reference}");
+        }
+    }
+
+    #[test]
+    fn symlinked_image_dir_resolves_absolute_reference_into_subdirectory() {
+        // An image built in a directory reached through a symlink names
+        // its base by an absolute path in that spelling, here in a
+        // subdirectory. It resolves as named, not through the file-name
+        // fallback: a file of the same name beside the image, which the
+        // fallback would pick, is not chosen.
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().canonicalize().unwrap().join("real");
+        std::fs::create_dir_all(real.join("sub")).unwrap();
+        let via = tmp.path().canonicalize().unwrap().join("via");
+        std::os::unix::fs::symlink(&real, &via).unwrap();
+        std::fs::write(real.join("top.qcow2"), b"").unwrap();
+        std::fs::write(real.join("base.qcow2"), b"beside").unwrap();
+        let base = real.join("sub/base.qcow2");
+        std::fs::write(&base, b"sub").unwrap();
+
+        let reference = via.join("sub/base.qcow2").display().to_string();
+        let resolved = validate_backing_path(
+            &via.join("top.qcow2"),
+            &reference,
+            &default_security_config(),
+        )
+        .unwrap();
+        assert_eq!(resolved, base);
+
+        // Only the operator's spelling is added. With the image named
+        // through the real directory, nobody spelled `via`, so the same
+        // reference is outside the allowlist as written and takes the
+        // fallback to the file beside the image.
+        let resolved = validate_backing_path(
+            &real.join("top.qcow2"),
+            &reference,
+            &default_security_config(),
+        )
+        .unwrap();
+        assert_eq!(resolved, real.join("base.qcow2"));
+    }
+
+    // ====================================================================
+    // `..` after a symlink
+    // ====================================================================
+
+    /// A tree where `a/link -> x/y`, so `a/link/../b` is `x/b` to the
+    /// kernel but `a/b` lexically. Both `a/b` and `x/b` exist.
+    struct DotDotLayout {
+        _tmp: TempDir,
+        root: PathBuf,
+        /// `root/a/link/../b`, spelled through the link.
+        via_link: PathBuf,
+        /// `root/x/b`: where `via_link` really is.
+        real: PathBuf,
+        /// `root/a/b`: where `via_link` is lexically.
+        lexical: PathBuf,
+    }
+
+    fn dotdot_layout() -> DotDotLayout {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("x/y")).unwrap();
+        std::fs::create_dir_all(root.join("x/b")).unwrap();
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        std::os::unix::fs::symlink(root.join("x/y"), root.join("a/link")).unwrap();
+        DotDotLayout {
+            via_link: root.join("a/link/../b"),
+            real: root.join("x/b"),
+            lexical: root.join("a/b"),
+            root,
+            _tmp: tmp,
+        }
+    }
+
+    #[test]
+    fn allowlist_entry_with_dotdot_keeps_only_its_canonical_form() {
+        let l = dotdot_layout();
+        let forms = AllowlistForms::new(std::slice::from_ref(&l.via_link));
+        assert!(forms.lexical.is_empty(), "{:?}", forms.lexical);
+        assert!(forms.lexically_allows(&l.real.join("f")));
+        assert!(!forms.lexically_allows(&l.lexical.join("f")));
+        assert!(!forms.may_probe(&l.lexical.join("f")));
+    }
+
+    #[test]
+    fn allowlist_entry_with_dotdot_after_symlink_is_not_an_oracle() {
+        // An operator entry spelled `a/link/../b` must not make the
+        // lexical directory `a/b` allowlisted, or names under it could
+        // be probed and a refusal would differ from a "not found".
+        let l = dotdot_layout();
+        let parent = l.real.join("top.qcow2");
+        std::fs::write(&parent, b"").unwrap();
+        let cfg = SecurityConfig {
+            backing_path_allowlist: Some(vec![l.via_link.display().to_string()]),
+            ..Default::default()
+        };
+        let target = l.lexical.join("probe");
+        for reference in [target.display().to_string(), "../../a/b/probe".to_string()] {
+            let absent = outcome(&validate_backing_path(&parent, &reference, &cfg));
+            std::fs::write(&target, b"secret").unwrap();
+            let present = outcome(&validate_backing_path(&parent, &reference, &cfg));
+            std::fs::remove_file(&target).unwrap();
+            assert_eq!(absent, present, "reference {reference}");
+            assert!(absent.contains("is outside allowed paths"), "{absent}");
+        }
+    }
+
+    #[test]
+    fn image_path_with_dotdot_after_symlink_resolves_where_the_kernel_does() {
+        // The image is named `a/link/../b/top.qcow2`, which the kernel
+        // opens as `x/b/top.qcow2`. Its relative references belong
+        // beside that, and `a/b` is not its directory.
+        let l = dotdot_layout();
+        std::fs::write(l.real.join("top.qcow2"), b"").unwrap();
+        let base = l.real.join("base.qcow2");
+        std::fs::write(&base, b"").unwrap();
+        let parent = l.via_link.join("top.qcow2");
+        let cfg = default_security_config();
+
+        let resolved = validate_backing_path(&parent, "base.qcow2", &cfg).unwrap();
+        assert_eq!(resolved, base);
+
+        // Nor can names under the lexical directory be probed.
+        let target = l.lexical.join("probe");
+        let reference = target.display().to_string();
+        let (absent, present) = resolve_absent_then_present(&parent, &reference, &target);
+        assert_eq!(absent, present);
+        assert!(absent.contains("is outside allowed paths"), "{absent}");
+    }
+
+    #[test]
+    fn descriptor_named_with_dotdot_after_symlink_finds_its_extent() {
+        let l = dotdot_layout();
+        let flat = l.real.join("foo-flat.vmdk");
+        std::fs::write(
+            l.real.join("foo.vmdk"),
+            make_flat_descriptor("foo-flat.vmdk", 1),
+        )
+        .unwrap();
+        std::fs::write(&flat, vec![0u8; 512]).unwrap();
+
+        let resolved =
+            resolve_vmdk_flat_descriptor(&l.via_link.join("foo.vmdk"), &default_security_config())
+                .unwrap();
+        assert_eq!(resolved.flat_extents[0].flat_path, flat);
+    }
+
+    #[test]
+    fn dotdot_after_symlink_in_reference_follows_the_kernel() {
+        // `sub/link -> deep/dir`, so `sub/link/../x.raw` is `deep/x.raw`
+        // to the kernel and to qemu-img. A file of that name in `sub`
+        // must not be chosen instead.
+        let l = layout();
+        std::fs::create_dir_all(l.images.join("deep/dir")).unwrap();
+        std::fs::create_dir_all(l.images.join("sub")).unwrap();
+        std::os::unix::fs::symlink("../deep/dir", l.images.join("sub/link")).unwrap();
+        std::fs::write(l.images.join("deep/x.raw"), b"deep").unwrap();
+        std::fs::write(l.images.join("sub/x.raw"), b"sub").unwrap();
+        let reference = "sub/link/../x.raw";
+        let kernel = l.images.join(reference).canonicalize().unwrap();
+        assert!(kernel.ends_with("deep/x.raw"));
+
+        let resolved =
+            validate_backing_path(&l.parent, reference, &default_security_config()).unwrap();
+        assert_eq!(resolved, kernel);
+    }
+
+    #[test]
+    fn dotdot_after_symlink_missing_reports_the_reference() {
+        // When the kernel's answer is missing, the error names the
+        // reference's lexical spelling, not the physical path.
+        let l = layout();
+        std::fs::create_dir_all(l.images.join("deep/dir")).unwrap();
+        std::fs::create_dir_all(l.images.join("sub")).unwrap();
+        std::os::unix::fs::symlink("../deep/dir", l.images.join("sub/link")).unwrap();
+        std::fs::write(l.images.join("sub/x.raw"), b"sub").unwrap();
+
+        let result =
+            validate_backing_path(&l.parent, "sub/link/../x.raw", &default_security_config());
+        match result {
+            Err(ChainError::BackingFileNotFound(path)) => {
+                assert_eq!(path, l.images.canonicalize().unwrap().join("sub/x.raw"))
+            }
+            other => panic!("expected BackingFileNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn symlink_to_parent_of_image_dir_is_not_an_oracle() {
+        // `up -> ..` leads from the image directory to its parent, so
+        // `up/<name>` is lexically inside the allowlist but physically
+        // a sibling of the image directory. The walk must stop at the
+        // sibling without looking at it.
+        let l = layout();
+        std::os::unix::fs::symlink("..", l.images.join("up")).unwrap();
+        let sibling = l.outside.parent().unwrap().join("sibling.qcow2");
+        let secret = l.outside.join("secret.qcow2");
+        for (reference, target) in [
+            ("up/sibling.qcow2", &sibling),
+            ("up/outside/secret.qcow2", &secret),
+        ] {
+            let (absent, present) = resolve_absent_then_present(&l.parent, reference, target);
+            assert_eq!(absent, present, "reference {reference}");
+            assert!(absent.contains("is outside allowed paths"), "{absent}");
+            assert!(absent.contains(&format!("images/{reference}")), "{absent}");
+        }
+    }
+
+    // ====================================================================
+    // Lexical normalisation and the lexical allowlist check
+    // ====================================================================
+
+    #[test]
+    fn normalize_lexically_cases() {
+        let cases = [
+            ("/..", "/"),
+            ("/../../etc/x", "/etc/x"),
+            ("/a/./b/.", "/a/b"),
+            ("/a/b/", "/a/b"),
+            ("/a/b/../../..", "/"),
+            ("a/b/../../..", ".."),
+            ("a/./b/../c", "a/c"),
+            ("/imgs/../etc/x", "/etc/x"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                normalize_lexically(Path::new(input)),
+                PathBuf::from(expected),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn lexical_backing_candidate_cases() {
+        let dir = Path::new("/imgs/sub");
+        assert_eq!(
+            lexical_backing_candidate(dir, "base"),
+            PathBuf::from("/imgs/sub/base")
+        );
+        assert_eq!(
+            lexical_backing_candidate(dir, "../base"),
+            PathBuf::from("/imgs/base")
+        );
+        assert_eq!(
+            lexical_backing_candidate(dir, "../../../etc/x"),
+            PathBuf::from("/etc/x")
+        );
+        assert_eq!(
+            lexical_backing_candidate(dir, "/abs/./x"),
+            PathBuf::from("/abs/x")
+        );
+    }
+
+    #[test]
+    fn lexically_allows_resolves_dotdot_before_comparing() {
+        // `/imgs` need not exist: only the spelling is compared.
+        let forms = AllowlistForms::new(&[PathBuf::from("/imgs")]);
+        assert!(!forms.lexically_allows(Path::new("/imgs/../etc/x")));
+        assert!(forms.lexically_allows(Path::new("/imgs/a/../b")));
+        assert!(forms.lexically_allows(Path::new("/imgs")));
+        assert!(!forms.lexically_allows(Path::new("/imgsx/a")));
+        assert!(!forms.lexically_allows(Path::new("imgs/a")));
+    }
+
+    #[test]
+    fn lexically_allows_matches_both_spellings_of_an_entry() {
+        let tmp = TempDir::new().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let via = tmp.path().join("via");
+        std::os::unix::fs::symlink(&real, &via).unwrap();
+
+        let forms = AllowlistForms::new(&[via.clone()]);
+        assert!(forms.lexically_allows(&via.join("x")));
+        assert!(forms.lexically_allows(&real.canonicalize().unwrap().join("x")));
+        assert!(!forms.lexically_allows(&tmp.path().join("other/x")));
     }
 
     #[test]

@@ -811,6 +811,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   on `develop` and under qemu-img, while the same command without the
   trailing size is refused for having no size to infer.
 
+### Security
+
+- **Resolving a backing reference no longer reveals whether a path
+  outside the backing-path allowlist exists.** A reference is now
+  normalised and checked against the allowlist before the filesystem is
+  consulted, and symlinks are followed one at a time and refused if they
+  leave the allowlist, so a relative `../` escape is "outside allowed
+  paths" whether or not its target exists. An absolute reference outside
+  the allowlist is never probed; instar falls back to the file of the
+  same name beside the image, or reports "outside allowed paths" where it
+  previously said "not found". The fallback is now announced on stderr
+  (`instar: using '<name>' beside the image in place of '<reference>'`),
+  including when an absolute reference inside the allowlist is missing,
+  where it used to happen silently. A reference spelled outside the
+  allowlist that would only reach it through a symlink outside the
+  allowlist is now refused. `$IMAGE_DIR` now matches the image's
+  directory with symlinks resolved, and the directory as spelled on the
+  command line only when that spelling has no `..`; a `..` after a
+  symlink is still applied to the link's target, as the kernel and
+  qemu-img apply it. Applies to qcow2 backing
+  and external data files, VMDK flat extents, and VHD and VHDX parent
+  locators. `instar commit` now resolves the overlay's recorded backing
+  file through the same allowlist, from the configured
+  `backing-path-allowlist` rather than the built-in default, and refuses
+  one outside it instead of committing into it. It never takes the
+  same-name file beside the overlay in place of a recorded backing it
+  cannot use, since that file is only a namesake; it refuses and asks
+  for `-b`. **An overlay whose parent is in another directory, which an
+  implicit commit used to write into, is now refused under the default
+  `$IMAGE_DIR` allowlist**: name the parent with `-b`, which matches a
+  recorded parent spelled the same way without consulting the
+  allowlist, or add its directory to `backing-path-allowlist`. See
+  [Commit](https://github.com/shakenfist/instar/blob/develop/docs/commit.md#overlays-whose-parent-is-in-another-directory).
+  Closes [#611](https://github.com/shakenfist/instar/issues/611).
+
 ## [0.3.0] - 2026-08-02
 
 ### Fixed

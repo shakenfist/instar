@@ -50,8 +50,9 @@ use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 use backing::BackingStore;
 use chain::{
     check_chain_depth, check_circular_reference, peek_is_qcow2_v3, peek_is_vmdk_descriptor,
-    resolve_vmdk_flat_descriptor, validate_backing_path, BackingChain, ChainError, ChainImage,
-    ExternalDataFile, ImageFormat, InfoOperationResult,
+    reference_spells_path, resolve_vmdk_flat_descriptor, validate_backing_path,
+    validate_backing_write_target, BackingChain, ChainError, ChainImage, ExternalDataFile,
+    ImageFormat, InfoOperationResult,
 };
 use io_thread::{DeviceRole, IoDevice};
 use ioevent::IoEvent;
@@ -7470,39 +7471,70 @@ fn run_commit(args: CommitArgs, verbose: bool) -> Result<(), Box<dyn std::error:
 
     let overlay_probe = probe_commit_target(overlay_path, args.format.as_deref(), "overlay")?;
 
-    // Resolve the backing path. -b BASE wins; otherwise fall
-    // back to the overlay's recorded backing-file pointer.
-    // Relative paths resolve against the overlay's parent
-    // directory to match qemu-img semantics.
-    let overlay_parent = overlay_path.parent().unwrap_or_else(|| Path::new("."));
-    let resolve_relative = |raw: &str| -> std::path::PathBuf {
-        let p = Path::new(raw);
+    // The backing allowlist is operator configuration, loaded the same
+    // way every other chain operation loads it.
+    let security_config = config::load_config().config.security;
+
+    // The overlay's recorded backing reference is image data. It is
+    // resolved only by `validate_backing_path`, which answers from
+    // inside the backing allowlist alone: commit opens the backing for
+    // writing, so a reference that escaped the allowlist would let an
+    // overlay choose which host file gets written, and a refusal that
+    // depended on whether the named file exists would tell the overlay
+    // what is on the host. Relative references resolve against the
+    // overlay's directory, as qemu-img resolves them. Unlike a read,
+    // a reference that cannot be used as written does not fall back to
+    // its file name beside the overlay: that would be whatever file
+    // shares the name, and commit would write into it. The operator
+    // names such a file with -b instead.
+    let recorded_backing = overlay_probe
+        .backing_file_raw
+        .as_deref()
+        .filter(|s| !s.is_empty());
+
+    // -b BASE wins when given. It is the operator's own input rather
+    // than image data, so it is resolved as written: absolute as-is,
+    // relative against the overlay's directory, matching qemu-img.
+    let explicit_base = args.base.as_deref().map(|base| {
+        let p = Path::new(base);
         if p.is_absolute() {
             p.to_path_buf()
         } else {
-            overlay_parent.join(p)
+            overlay_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(p)
+        }
+    });
+
+    let resolved_backing_path = match (&explicit_base, recorded_backing) {
+        (Some(supplied), _) => {
+            if !supplied.exists() {
+                return Err(format!(
+                    "commit: backing file '{}' does not exist",
+                    supplied.display()
+                )
+                .into());
+            }
+            supplied.clone()
+        }
+        (None, Some(raw)) => validate_backing_write_target(overlay_path, raw, &security_config)
+            .map_err(|e| -> Box<dyn std::error::Error> {
+                let hint = match &e {
+                    ChainError::BackingFileNotAllowed { .. }
+                    | ChainError::BackingFileNotFound(_) => {
+                        "; pass -b BASE to name the file to commit into"
+                    }
+                    _ => "",
+                };
+                format!("commit: cannot use the overlay's backing file '{raw}': {e}{hint}").into()
+            })?,
+        (None, None) => {
+            return Err("commit: overlay has no recorded backing file; \
+                        pass -b BASE to name one"
+                .into());
         }
     };
-
-    let (resolved_backing_path, base_was_explicit) = match &args.base {
-        Some(base) => (resolve_relative(base), true),
-        None => match overlay_probe.backing_file_raw.as_deref() {
-            Some(b) if !b.is_empty() => (resolve_relative(b), false),
-            _ => {
-                return Err("commit: overlay has no recorded backing file; \
-                            pass -b BASE to name one"
-                    .into());
-            }
-        },
-    };
-
-    if !resolved_backing_path.exists() {
-        return Err(format!(
-            "commit: backing file '{}' does not exist",
-            resolved_backing_path.display()
-        )
-        .into());
-    }
 
     // Backing-writability pre-check. We need O_RDWR for the
     // commit's data and metadata writes; surface a clearer
@@ -7559,28 +7591,39 @@ fn run_commit(args: CommitArgs, verbose: bool) -> Result<(), Box<dyn std::error:
         .into());
     }
 
-    // If -b was supplied, verify it names the overlay's
-    // immediate parent. Intermediate-image commits are
-    // deferred per the master plan; the comparison
-    // canonicalises both sides so symlinks / `..` don't
-    // produce false negatives.
-    if base_was_explicit {
-        let canonical_supplied = resolved_backing_path
-            .canonicalize()
-            .unwrap_or_else(|_| resolved_backing_path.clone());
-        let recorded_parent = overlay_probe
-            .backing_file_raw
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .map(resolve_relative);
-        match recorded_parent {
-            Some(recorded) => {
-                let canonical_recorded = recorded.canonicalize().unwrap_or(recorded);
-                if canonical_supplied != canonical_recorded {
+    // If -b was supplied, verify it names the overlay's immediate
+    // parent; committing through an intermediate image is not
+    // supported. The supplied path is operator input and is canonicalised so
+    // symlinks / `..` don't produce false negatives. The recorded parent
+    // is image data. A recorded reference spelled exactly as the
+    // supplied path, in either its given or its canonical form, is the
+    // parent without anything being looked at; that keeps a parent in
+    // a directory outside the allowlist committable when the operator
+    // names it. Otherwise the reference is resolved through the
+    // allowlist, as a read resolves it, file-name fallback included,
+    // since the file written is the one the operator named. Only the
+    // reference as recorded is ever printed -- never a host path
+    // derived from it.
+    if let Some(supplied) = &explicit_base {
+        let canonical_supplied = supplied.canonicalize().unwrap_or_else(|_| supplied.clone());
+        match recorded_backing {
+            Some(raw)
+                if reference_spells_path(overlay_path, raw, supplied)
+                    || reference_spells_path(overlay_path, raw, &canonical_supplied) => {}
+            Some(raw) => {
+                let recorded = validate_backing_path(overlay_path, raw, &security_config).map_err(
+                    |e| -> Box<dyn std::error::Error> {
+                        format!(
+                            "commit: the overlay's recorded parent '{raw}' could not be \
+                             resolved: {e}"
+                        )
+                        .into()
+                    },
+                )?;
+                if canonical_supplied != recorded {
                     return Err(format!(
                         "commit: commit through an intermediate layer is not yet \
-                         supported (the overlay's immediate parent is '{}')",
-                        canonical_recorded.display(),
+                         supported (the overlay's immediate parent is '{raw}')",
                     )
                     .into());
                 }
@@ -7605,7 +7648,6 @@ fn run_commit(args: CommitArgs, verbose: bool) -> Result<(), Box<dyn std::error:
     // The v1 guest ignores these slots; populating them gives
     // the future "skip when chain already provides this data"
     // mode something to consume.
-    let security_config = config::SecurityConfig::default();
     let sector_size = 512u32;
     // `commit`'s guest reads the overlay and the backing and ignores
     // the ancestor slots the host populates here, so a differencing
