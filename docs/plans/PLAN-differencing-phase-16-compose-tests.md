@@ -483,7 +483,8 @@ redo this.
   ```
   git diff f14554cf..HEAD -- 'src/*' 'tests/*' 'tools/*' 'scripts/*' \
     | grep '^+' \
-    | grep -iE 'PLAN-[a-z0-9-]+\.md|decision [0-9]|phase 1[0-9]|\b16[a-g]\b'
+    | grep -iE 'PLAN-[a-z0-9-]+\.md|decision [0-9]|phase [0-9]+|this phase'\
+                '|step [0-9]+[a-g]\b|\b16[a-g]\b'
   ```
 
   is empty. `docs/plans/` is out of scope — plan files cite each other
@@ -491,6 +492,27 @@ redo this.
   repository has around 58 files carrying such references already,
   `tests/test_create.py:436` among them, and sweeping them is a
   separate job (the fleet's `plan-references-in-code` block).
+
+  **The pattern was widened during 16c**, and the reason matters more
+  than the edit. As first written it matched `phase 1[0-9]` and no
+  step-letter form at all, which is how phase 15 could assert that
+  `tests/test_differencing.py` "cites no plan file, phase or decision
+  number at all, not merely none added by this phase" while six
+  references sat in it — "step 4b" twice, "phase 4", "phase 7" and
+  two bare "this phase". Single-digit phases and step letters were
+  invisible to it. That is the same failure as phase 15's
+  `exceeds the` probe, found twice in one phase, so the lesson is
+  about how a probe gets written rather than about either grep: a
+  check built from the instances in front of you matches those and
+  stops.
+
+* `tests/test_differencing.py` carries no plan coordinate of any
+  form, swept as a class rather than instance by instance.
+  Falsifiable with the widened pattern above over the whole file
+  rather than over the diff. The eleven other test files and two
+  tools scripts carrying the same forms — around 54 occurrences,
+  `tests/test_rebase.py` with 12 and `tests/test_commit.py` with 8 —
+  stay out of scope, counted here so the remaining job has a size.
 
 ## Back brief
 

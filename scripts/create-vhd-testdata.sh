@@ -20,10 +20,15 @@
 #   diff -r --brief scratch/audit ../instar-testdata/custom/audit
 #
 # Creates:
-#   vhd-fixed.vhd         - 10 MiB fixed VHD (disk_type=2)
-#   vhd-differencing.vhd  - Differencing VHD (disk_type=4), a type marker with
-#                           no parent: qemu-img cannot create a differencing
-#                           VHD, so a dynamic one is patched
+#   vhd-fixed.vhd           - 10 MiB fixed VHD (disk_type=2)
+#   vhd-differencing.vhd    - Differencing VHD (disk_type=4), a type marker
+#                             with no parent: qemu-img cannot create a
+#                             differencing VHD, so a dynamic one is patched
+#   vhdx-differencing.vhdx  - Differencing VHDX (HasParent set), the VHDX
+#                             analogue: qemu-img cannot create a
+#                             differencing VHDX either, so a dynamic one is
+#                             patched the same way, with no parent locator
+#                             item added
 #
 # and three real differencing chains, each with the raw image it is intended
 # to compose to:
@@ -61,12 +66,16 @@
 # sibling because there is no correct composition for a hostile parent
 # reference.
 #
-# Reproducibility: every file here is byte-reproducible except the two VHDX
+# Reproducibility: every file here is byte-reproducible except three VHDX
 # files, where qemu-img generates fresh header, log and virtual-disk-id GUIDs
-# that this script does not rewrite. The two VHDX files must therefore be
-# regenerated and shipped as a pair: the child parent_linkage value binds to
-# the parent DataWriteGuid, so a child paired with a differently generated
-# parent will not resolve.
+# that this script does not rewrite. Two of them, the real parent/child pair,
+# must therefore be regenerated and shipped together: the child
+# parent_linkage value binds to the parent DataWriteGuid, so a child paired
+# with a differently generated parent will not resolve. The third,
+# vhdx-differencing.vhdx, is not paired with anything -- it carries no
+# parent_linkage at all -- but it is still a fresh qemu-img product each run,
+# so it gets its own independent skip-if-exists guard below rather than
+# riding along with the pair's.
 #
 # That includes vhd-differencing.vhd, the one VHD here qemu-img creates, and
 # it holds across qemu versions rather than only within one. A VHD footer does
@@ -82,6 +91,11 @@
 # idempotent does not replace 24 MiB of committed LFS objects with
 # functionally identical but byte-different ones. Pass REGEN_VHDX=1 to
 # regenerate them, and commit both files when you do.
+#
+# vhdx-differencing.vhdx is opt in the same way and under the same
+# REGEN_VHDX switch, but independently: it is skipped when it already
+# exists regardless of whether the pair above was just regenerated, and
+# regenerating it never touches the pair's files.
 #
 # Shape: these chains are deliberately qemu-shaped, not Hyper-V-shaped. The
 # creator application is 'qem2' (see vhd_footer below for why that is load
@@ -971,6 +985,23 @@ def vhdx_sector_bitmap_block(sector_numbers):
     return bytes(bitmap)
 
 
+def vhdx_set_has_parent(data, meta_off, items):
+    """Set the HasParent bit in a VHDX's file parameters item, in place.
+
+    Shared by the real differencing child below, which also gets a
+    parent locator item appended, and by the parentless marker fixture
+    further down, which does not: both need exactly this bit flipped in
+    exactly this structure and nothing else. Returns the block size the
+    file parameters item already declared.
+    """
+    fp = [it for it in items if it[0] == META_FILE_PARAMETERS]
+    assert len(fp) == 1, "expected exactly one file parameters item"
+    _guid, ioff, _ilen, _flags, _eo = fp[0]
+    block_size, fp_flags = struct.unpack_from("<II", data, meta_off + ioff)
+    struct.pack_into("<II", data, meta_off + ioff, block_size, fp_flags | 0x2)
+    return block_size
+
+
 def patch_vhdx_child(path, parent_absolute, parent_relative,
                      parent_data_write_guid, partial_blocks, full_blocks,
                      child_sectors):
@@ -982,11 +1013,7 @@ def patch_vhdx_child(path, parent_absolute, parent_relative,
     count, items = vhdx_metadata_items(data, meta_off)
 
     # 1. Set the HasParent bit in the file parameters item.
-    fp = [it for it in items if it[0] == META_FILE_PARAMETERS]
-    assert len(fp) == 1, "expected exactly one file parameters item"
-    _guid, ioff, ilen, _flags, _eo = fp[0]
-    block_size, fp_flags = struct.unpack_from("<II", data, meta_off + ioff)
-    struct.pack_into("<II", data, meta_off + ioff, block_size, fp_flags | 0x2)
+    block_size = vhdx_set_has_parent(data, meta_off, items)
 
     # 2. Append a parent locator item after the last item data.
     end = max(ioff + ilen for _g, ioff, ilen, _f, _e in items)
@@ -1043,6 +1070,33 @@ def patch_vhdx_child(path, parent_absolute, parent_relative,
     with open(path, "wb") as fh:
         fh.write(bytes(data))
     return block_size, chunk_ratio
+
+
+def write_vhdx_differencing(path):
+    """Create the parentless differencing VHDX marker fixture.
+
+    The VHDX analogue of the patched vhd-differencing.vhd above:
+    qemu-img cannot create a differencing VHDX either, so an ordinary
+    dynamic VHDX is created and then has its HasParent bit patched on
+    alone. Unlike vhdx-diff-child.vhdx, no parent locator metadata item
+    is added -- the metadata table lists nothing for the parser to
+    stage, so this image claims a parent with no reference to one. That
+    is the one VHDX shape nothing else here produces, and it is the
+    point of the fixture: a chain with nothing behind it for a walk to
+    resolve, as distinct from an orphaned copy of the real child, whose
+    parent locator still names a file that is merely missing.
+    """
+    opts = "block_size=%d,log_size=1M" % VHDX_BLOCK_SIZE
+    qemu_img("create", "-f", "vhdx", "-o", opts, path,
+             "%dM" % (IMAGE_SIZE // (1024 * 1024)))
+    with open(path, "rb") as fh:
+        data = bytearray(fh.read())
+    regions = vhdx_regions(data)
+    meta_off, _meta_len = regions[REGION_METADATA]
+    _count, items = vhdx_metadata_items(data, meta_off)
+    vhdx_set_has_parent(data, meta_off, items)
+    with open(path, "wb") as fh:
+        fh.write(bytes(data))
 
 
 def vhdx_composition(block_size):
@@ -1187,6 +1241,27 @@ def vhdx_verify_shipped_pair(parent_path, child_path):
     return child["block_size"]
 
 
+def verify_vhdx_differencing(path):
+    """Check the parentless VHDX marker still has the shape its name promises.
+
+    Read back with vhdx_read_shape rather than trusted from the write
+    step in write_vhdx_differencing, for the same reason
+    vhdx_verify_shipped_pair re-reads the real pair: a change to
+    vhdx_set_has_parent, or a qemu-img version that writes an unwritten
+    dynamic VHDX differently, is caught here instead of surfacing first
+    as a test failure in tests/test_differencing.py.
+    """
+    shape = vhdx_read_shape(path)
+    if not shape["has_parent"]:
+        raise SystemExit(
+            "%s: HasParent bit is clear; the patch step did not take"
+            % path)
+    if shape["written"]:
+        raise SystemExit(
+            "%s: expected no allocated payload block, found data at "
+            "sector(s) %r" % (path, shape["written"]))
+
+
 # --- driver -----------------------------------------------------------------
 
 def main():
@@ -1268,6 +1343,21 @@ def main():
     with open(p("vhdx-diff-composed.raw"), "wb") as fh:
         fh.write(vhdx_composition(block_size))
     written.append("vhdx-diff-composed.raw")
+
+    # ---------------- VHDX parentless marker ----------------
+    #
+    # Opt in for the same reason as the pair above -- qemu-img stamps fresh
+    # GUIDs on every create -- but guarded independently: this file carries
+    # no parent_linkage and is not shipped as half of anything, so whether
+    # the pair above was just regenerated has no bearing on it.
+    vhdx_differencing_name = "vhdx-differencing.vhdx"
+    if not regen_vhdx and os.path.exists(p(vhdx_differencing_name)):
+        print("  Skipping vhdx-differencing.vhdx: it exists and is not "
+              "byte-reproducible.  Pass REGEN_VHDX=1 to rebuild it.")
+    else:
+        write_vhdx_differencing(p(vhdx_differencing_name))
+        written.append(vhdx_differencing_name)
+    verify_vhdx_differencing(p(vhdx_differencing_name))
 
     for name in written:
         print("  Created %s (%d bytes)" % (p(name), os.path.getsize(p(name))))

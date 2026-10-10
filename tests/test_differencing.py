@@ -73,8 +73,8 @@ The classes are:
   differencing child at the head of the *second* chain.
 * `TestDifferencingRefusal` -- what each operation does with a
   differencing source it cannot compose.
-* `TestDifferencingNonComposingRefusalPolicy` -- the boundary this phase
-  draws, asserted on its own terms: `map`, `measure` and `check` must
+* `TestDifferencingNonComposingRefusalPolicy` -- the compose/report
+  boundary, asserted on its own terms: `map`, `measure` and `check` must
   each still refuse, each naming itself rather than instar generally,
   and `check` must refuse the same way with or without `--chain`.
 * `TestVhdxBlockOffsetsNamingTheImagesOwnStructure` -- the
@@ -131,9 +131,11 @@ from base import InstarTestBase
 
 # Every differencing fixture, with the format name that must appear in
 # a refusal message naming it. `vhd-differencing` is a dynamic VHD
-# patched to disk type 4 whose parent name field is all zeroes, so
-# `info` reports no backing file for it and no walk can resolve one:
-# it is the fixture every operation still refuses. The two
+# patched to disk type 4 whose parent name field is all zeroes, and
+# `vhdx-differencing` is its VHDX counterpart: a dynamic VHDX patched
+# to set HasParent with no parent locator metadata item added. Neither
+# gives `info` a backing file to report, and no walk can resolve one
+# for either: they are the fixtures every operation still refuses. The
 # `*-diff-child-*` fixtures are real chains with a real parent beside
 # them, which the composing operations now read.
 DIFFERENCING_FIXTURES = (
@@ -141,6 +143,7 @@ DIFFERENCING_FIXTURES = (
     ('vhd-diff-child-mixed', 'VHD'),
     ('vhd-differencing', 'VHD'),
     ('vhdx-diff-child', 'VHDX'),
+    ('vhdx-differencing', 'VHDX'),
 )
 
 # Structurally valid differencing VHDs whose parent name and locator
@@ -227,7 +230,8 @@ COMPOSING_LOCATOR_REASONS = {
 }
 
 # The subset with a real, resolvable parent. Used where the test needs
-# `info` to report a parent name, which `vhd-differencing` cannot do.
+# `info` to report a parent name, which neither `vhd-differencing` nor
+# `vhdx-differencing` can do.
 #
 # All three are bare POSIX names. The VHDX entry used to read
 # `.\\vhdx-diff-parent.vhdx`, the raw contents of the locator's
@@ -245,13 +249,13 @@ DIFFERENCING_CHAIN_FIXTURES = (
     ('vhdx-diff-child', 'vhdx-diff-parent.vhdx'),
 )
 
-# The differencing fixtures with no parent reference at all -- a disk
-# type of 4 and an empty parent name. Derived from the two tables above
-# rather than written out, so a fixture added to either cannot quietly
-# fall out of both. These are the images for which the walk has nothing
-# to resolve whatever an operation's composition capability says, so
-# they are the ones that still get the typed refusal when they stand
-# alone in an empty directory.
+# The differencing fixtures with no parent reference at all -- HasParent
+# (or disk type 4) set with no usable parent locator. Derived from the
+# two tables above rather than written out, so a fixture added to
+# either cannot quietly fall out of both. These are the images for
+# which the walk has nothing to resolve whatever an operation's
+# composition capability says, so they are the ones that still get the
+# typed refusal when they stand alone in an empty directory.
 PARENTLESS_DIFFERENCING_FIXTURES = tuple(
     (image_id, format_name)
     for image_id, format_name in DIFFERENCING_FIXTURES
@@ -329,8 +333,8 @@ CHAIN_PROBE_SECTORS = {
 }
 
 # `map` refuses with its own, older text and its own error code. It
-# predates this phase for VHD; the VHDX arm was added in step 4b
-# because removing `VhdxState::init`'s `has_parent` rejection would
+# predates composition for VHD; the VHDX arm was added alongside
+# it, because removing `VhdxState::init`'s `has_parent` rejection would
 # otherwise have let map emit a differencing VHDX's parent blocks as
 # holes.
 MAP_REFUSAL = (
@@ -1780,8 +1784,9 @@ class TestDifferencingRefusal(DifferencingTestBase):
     def test_compare_self_is_refused_not_mismatch(self):
         """Issue #548: an image compared with itself must not "differ".
 
-        Before phase 4 a differencing source reached sector
-        composition, read the parent's sectors as zeroes on both sides
+        Before the read-side refusal landed, a differencing source
+        reached sector composition, read the parent's sectors as
+        zeroes on both sides
         of the comparison for VHD and failed opaquely for VHDX. The
         VHDX case surfaced as "Content mismatch at offset 0!", which
         told the user nothing about the parent. That string must never
@@ -2704,14 +2709,14 @@ class TestDifferencingDdMatchesConvert(DifferencingTestBase):
 class TestDifferencingMapStillRefuses(DifferencingTestBase):
     """`map` keeps its own, older refusal.
 
-    `map` was refusing a differencing VHD before this phase, with
-    different wording and its own guest error code, and step 4b left
-    that precedent in place rather than migrating it. Its VHDX arm,
-    however, is new: map's VHDX safety came entirely from the
-    `VhdxState::init` rejection that step 4b removed, so without the
+    `map` was refusing a differencing VHD before any of this, with
+    different wording and its own guest error code, and the rollout
+    left that precedent in place rather than migrating it. Its VHDX
+    arm, however, is new: map's VHDX safety came entirely from the
+    `VhdxState::init` rejection the rollout removed, so without the
     added arm map would have started emitting a differencing VHDX's
-    parent blocks as holes -- a silent wrong answer of exactly the
-    kind this phase exists to stop. Both arms are pinned here.
+    parent blocks as holes -- the silent wrong answer the whole
+    refusal policy exists to stop. Both arms are pinned here.
     """
 
     def test_map_refuses_with_its_own_message(self):
@@ -2836,20 +2841,35 @@ class TestDifferencingInfoReports(DifferencingTestBase):
                     f'{image_id}: expected a resolved parent path in {stdout!r}'
                 )
 
-    def test_info_reports_the_disk_type_4_fixture_without_a_parent(self):
-        """`vhd-differencing` has an all-zero parent name.
+    def test_info_reports_a_parentless_differencing_image(self):
+        """A differencing image with no parent reference still reports.
 
-        It is a dynamic VHD patched to disk type 4, so it is refused by
-        the composing operations but has no parent name for `info` to
-        report. `info` must still exit 0 and identify the format rather
-        than treating the empty name as an error.
+        Both of these declare themselves differencing and name no
+        parent: `vhd-differencing` is a dynamic VHD patched to disk
+        type 4 with an all-zero parent name, and `vhdx-differencing` is
+        a dynamic VHDX with the `HasParent` flag set and no parent
+        locator item at all. The composing operations refuse both, and
+        `info` must do the opposite -- exit 0 and identify the format
+        -- rather than treating a missing parent reference as an error.
+
+        Parameterised over the derived table rather than naming one
+        fixture, because the two formats arrive at the same state by
+        different routes and an `info` that handled only the VHD one
+        would have passed a test written against VHD alone.
         """
-        source = self.differencing_image('vhd-differencing')
-        stdout, stderr, rc = self.run_instar_info(source)
-        self.assertEqual(
-            0, rc, f'info must not refuse vhd-differencing; stderr={stderr!r}'
-        )
-        self.assertIn('file format: vpc', stdout, f'stdout={stdout!r}')
+        formats = {'VHD': 'vpc', 'VHDX': 'vhdx'}
+        for image_id, format_name in PARENTLESS_DIFFERENCING_FIXTURES:
+            with self.subTest(image=image_id):
+                source = self.differencing_image(image_id)
+                stdout, stderr, rc = self.run_instar_info(source)
+                self.assertEqual(
+                    0, rc,
+                    f'info must not refuse {image_id}; stderr={stderr!r}'
+                )
+                self.assertIn(
+                    f'file format: {formats[format_name]}', stdout,
+                    f'{image_id}: stdout={stdout!r}'
+                )
 
     def test_info_chain_walks_a_resolvable_vhd_or_vhdx_parent(self):
         """`info --chain` walks a resolvable VHD or VHDX parent.
@@ -3893,7 +3913,8 @@ class TestDifferencingLibvhdiOracle(DifferencingTestBase):
         """`vhdiinfo` on a VHD child reports the parent instar was given.
 
         Two path shapes, because the distinction between them is what
-        phase 7 got wrong once and what round 4 of #581's review found.
+        the create-side wiring got wrong once, and what round 4 of
+        #581's review found.
         The `Parent filename` libvhdi reports comes from the dynamic
         header's *parent unicode name*, which keeps the path **as
         typed** -- it is emphatically not the `.\\`-prefixed, backslash

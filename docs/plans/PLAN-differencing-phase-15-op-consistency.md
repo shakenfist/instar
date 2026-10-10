@@ -392,7 +392,17 @@ is stripped: zero non-comment `PLAN-*.md` references in `src/`.
 * `tests/test_differencing.py` cites no plan file, phase or decision
   number at all, not merely none added by this phase. Falsifiable:
   `grep -cE 'Decision [0-9]|decision [0-9]|PLAN-[a-z0-9-]+\.md|phase 1[0-9]|phase plan' tests/test_differencing.py`
-  returns 0. Four such references predated this phase, one of which --
+  returns 0.
+
+  **This probe was too narrow, found during phase 16.** It returns 0,
+  and six plan coordinates were in the file the whole time: "step 4b"
+  twice, "phase 4", "phase 7" and two bare "this phase". `phase 1[0-9]`
+  matches phases 10 to 19 only, and no alternative covered a step
+  letter. The criterion's claim -- "at all, not merely none added by
+  this phase" -- was therefore never tested. Phase 16 swept the file
+  for the whole class and widened the pattern in its own definition of
+  done; the figure of four pre-existing references this criterion
+  mentions was itself an undercount for the same reason. Four such references predated this phase, one of which --
   "whether instar assembles a chain the way libvhdi does is phase 15's
   question" -- this phase's own rescoping made false, so correcting
   them is this phase's business rather than tidying.

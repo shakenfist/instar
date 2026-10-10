@@ -266,6 +266,18 @@
             "generated_by": "scripts/create-vhd-testdata.sh"
         },
         {
+            "id": "vhdx-differencing",
+            "path": "custom/format-coverage/vhdx-differencing.vhdx",
+            "format": "vhdx",
+            "safety": "safe",
+            "run_in_ci": false,
+            "skip_qemu_img": true,
+            "sha256": "eaff97484a93cb913d29b0de95d864a420af14c0c88ab8d639755d74391d69bb",
+            "description": "Differencing VHDX (HasParent set) patched from a dynamic VHDX for type acceptance testing, the VHDX analogue of vhd-differencing. No parent locator metadata item is present, so info reports no backing file and the composing operations refuse it as a chain with nothing behind it",
+            "tags": ["vhdx", "differencing", "format-coverage"],
+            "generated_by": "scripts/create-vhd-testdata.sh"
+        },
+        {
             "id": "vhdx-diff-parent",
             "path": "custom/format-coverage/vhdx-diff-parent.vhdx",
             "format": "vhdx",
