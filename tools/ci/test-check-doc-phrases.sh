@@ -39,9 +39,10 @@ build_tree() {
 
     # The guard decides a candidate is corruption by rejoining it and
     # asking whether that names a real plan file, so the fixture needs
-    # plans to rejoin to. These are the ones the cases below reference;
-    # deliberately NOT PLAN-differencingflow.md or the like, because a
-    # legitimate "PLAN-differencing workflow" must rejoin to nothing.
+    # plans to rejoin to. These are the ones the cases below reference,
+    # and deliberately not what a legitimate "PLAN-differencing workflow"
+    # would rejoin to (PLAN-differencingflow.md; audit-ok: plan-reference),
+    # because that phrase must rejoin to nothing.
     local plan
     for plan in PLAN-map PLAN-commit PLAN-differencing PLAN-snapshot \
                 PLAN-format-coverage PLAN-qcow2-write-infrastructure \
@@ -139,7 +140,7 @@ fi
 start 'docs/plans/ is exempt because it quotes the corruption as an example'
 TREE="${WORK}/plans-exempt"
 build_tree "${TREE}"
-cat > "${TREE}/docs/plans/PLAN-example.md" <<'EOF'
+cat > "${TREE}/docs/plans/PLAN-example.md" <<'EOF'  # audit-ok: plan-reference
 Phase 9 found phrases such as "the PLAN-s worknapshot" and repaired them.
 EOF
 commit_tree "${TREE}"
