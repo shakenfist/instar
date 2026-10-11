@@ -22,6 +22,7 @@
 use std::path::{Component, Path, PathBuf};
 
 use crate::config::{get_backing_allowlist, get_max_chain_depth, SecurityConfig};
+use crate::escape::terminal_safe;
 use shared::format_detection::VMDK_DESCRIPTOR_MAGIC;
 
 /// Image format detected by the sandboxed info operation
@@ -730,8 +731,8 @@ fn resolve_backing_path(
             if let Walk::Found(resolved) = walk_within_allowlist(&fallback, &forms) {
                 eprintln!(
                     "instar: using '{}' beside the image in place of '{}'",
-                    name.to_string_lossy(),
-                    backing_path
+                    terminal_safe(&name.to_string_lossy()),
+                    terminal_safe(backing_path)
                 );
                 return Ok(resolved);
             }

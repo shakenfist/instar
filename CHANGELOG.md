@@ -813,6 +813,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+- **Text read from an image can no longer drive the terminal it is
+  printed on.** Backing file names, external data file paths, VMDK
+  create types and extent file names, snapshot IDs and tags, and the
+  paths resolved from them used to reach stdout and stderr byte for
+  byte, so a crafted image could send escape sequences to the user's
+  terminal or forge whole lines of output, such as a fake "No errors
+  were found on the image." from `instar info`. Human output now escapes control
+  characters and Unicode bidi controls (`\u{1b}`, `\n`) in every such
+  string, in `info`, `info --chain`, `snapshot -l`, `check`, the stderr
+  backing-reference notices and `--verbose` guest output. Backslashes
+  are not escaped, so Windows and UNC parent paths print unchanged, and
+  output for an ordinary image is unchanged. JSON output still carries
+  the exact value. See
+  [Output formats](https://github.com/shakenfist/instar/blob/develop/docs/output-formats.md#text-read-from-an-image).
+  Closes [#609](https://github.com/shakenfist/instar/issues/609).
+
+- **`info --output json` no longer emits a document that does not parse
+  for a hostile VMDK create type.** `create-type`, `format`, `compat`,
+  `compression-type` and `backing-filename-format` were interpolated
+  without escaping; a create type ending in a backslash or carrying a
+  control character produced invalid JSON. Every JSON printer now uses
+  one escaper, replacing three near-duplicates that differed in which
+  characters they escaped; it also escapes DEL, the C1 range and the
+  bidi controls. Closes
+  [#612](https://github.com/shakenfist/instar/issues/612).
+
 - **Resolving a backing reference no longer reveals whether a path
   outside the backing-path allowlist exists.** A reference is now
   normalised and checked against the allowlist before the filesystem is
