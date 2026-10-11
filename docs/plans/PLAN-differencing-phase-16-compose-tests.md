@@ -552,6 +552,32 @@ redo this.
   offset and byte than the original reproducer, so it is a readily
   reachable class rather than one fragile input. Nightly runs are
   far longer than that.
+* Sweeping #650's class found a **third** defect in the same place,
+  filed as #654, and the decision was taken to land this phase
+  without fixing it. An extended-L2 subcluster with neither its
+  allocation bit nor its zero bit set is defined to read from the
+  backing file; both arms zero-fill it instead when the host offset is
+  zero. It is reachable on well-formed images -- it is the entry shape
+  qemu writes when zeroing part of an unallocated cluster over a
+  backing file -- so it is a silent wrong answer in ordinary use, and
+  measured rather than reasoned about: against a backing device
+  serving `0xBB` everywhere, subclusters 1..31 come back as zeros in
+  the narrow arm at a 256-byte sector and in the wide arm at 512.
+
+  The review that found it described it as a wide-arm defect and
+  suggested making the wide arm match the narrow one. That mechanism
+  is wrong: both arms carry the identical condition, so the literal
+  suggestion would have fixed half the defect and introduced the
+  asymmetry it was meant to remove. The correction is recorded on
+  #654 so the next reader does not apply it.
+
+  Out of scope here deliberately, and the reason is the systemic one
+  rather than the convenient one: #650, #653 and #654 are three
+  branches each misinterpreting a host offset of zero in a different
+  direction, so the durable fix is one classification step feeding
+  both arms -- the subcluster types qcow2 defines -- with a test per
+  type per arm. Two of three patched piecemeal inside a test-and-
+  tooling phase would be worse than one change that does it once.
 * Sweeping #650's class rather than only testing the reported
   instance found a second, unfixed call site and it is filed as #653:
   the extended-L2 lookup's all-alloc/no-zero shortcut reaches the
