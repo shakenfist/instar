@@ -1557,7 +1557,7 @@ deliberately broken emitter is not guarding what its name says it
 guards. See [PLAN-differencing.md](plans/PLAN-differencing.md) for the
 path being guarded.
 
-There are **102 cases**, in seven groups.
+There are **103 cases**, in seven groups.
 
 Twenty-seven cover the writer. Fifteen mutate a library crate
 (`create`, `vhd`, `vhdx`) and are caught by a Rust unit or round-trip
@@ -1636,7 +1636,7 @@ differencing VHD or VHDX with its own parent absent — so the mutated
 walk fails during host-side chain discovery, before KVM is even opened,
 where the unmutated walk never tried to resolve that file at all.
 
-**14 cases guard `map`, `measure` and `check`**, which read through
+**15 cases guard `map`, `measure` and `check`**, which read through
 none of the machinery above: each reads its source on its own and
 declines a differencing one outright, so composing it is not a guest
 change those operations can inherit. **6 refusal cases** are the first

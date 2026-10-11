@@ -470,7 +470,20 @@ redo this.
   asserts an allocation count or an extent offset rather than a
   refusal — so a walk that miscounts chunk groups at the larger ratio
   fails something. The 512-byte equivalent of that case is
-  `vhdx_scan_counts_a_block_in_each_chunk_group`.
+  `vhdx_scan_counts_a_block_in_each_chunk_group`. **Met at exactly
+  6, with one deliberate shortfall against this step's brief.** The
+  brief asked for a `has_parent = true` variant of each of the three
+  shapes and only two carry one, because the third would have been a
+  byte-for-byte duplicate: the reader computes `total_bat_entries`
+  unconditionally as payload blocks plus one bitmap entry per group
+  (`src/crates/vhdx/src/lib.rs:2333`), and the whole-group padding a
+  differencing BAT gets is applied only by `calculate_bat_layout`,
+  whose every caller is a writer or sizing path — `create`,
+  `convert`, `measure`, `resize` — and no reader walk. `has_parent`
+  reaches the reader through `sb_bat_entry_bound` alone, which only
+  `sector_bitmap_lookup` reads, and both differencing 4K cases go
+  through that lookup. The asymmetry is deliberate and documented at
+  `src/crates/vhdx/src/lib.rs:2062`.
 * `fuzz_chain_compose` exists, appears in both
   `src/fuzz/Cargo.toml` and `.github/workflows/coverage-fuzz.yml`, and
   runs for 60 seconds without a crash. Falsifiable:

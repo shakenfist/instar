@@ -682,7 +682,7 @@ self_test() {
 # phase's definition of done asks the two to stay in step, which until
 # now was a promise kept by hand. Asserting it makes the drift a
 # failure instead of a documentation bug nobody reads.
-EXPECTED_CASES=102
+EXPECTED_CASES=103
 
 check_case_count() {
     # Only meaningful for a whole run; a selection is expected to be short.
@@ -2101,6 +2101,24 @@ rust_case 'vhdx-bat-walk-counts-the-bitmap-slots' "${VHDX_READ_LIB}" \
             // MUTATED: the shared walk no longer skips bitmap slots
             let _ = slot_in_group;' \
     qcow2 'vhdx_scan_counts_a_block_in_each_chunk_group' \
+    --features "${QCOW2_FEATURES}"
+
+# The same case at 4096-byte logical sectors, against the 4K sibling
+# test. `for_each_payload_bat_entry` takes chunk_ratio as a runtime
+# argument rather than a sector-size-specific constant, so the search
+# string above is the same line and the same mutation; only the test
+# it is measured against -- and so the chunk_ratio value the drifted
+# walk trips over -- differs. Kept as its own case rather than folded
+# into the one above because a case names exactly one test, and the
+# 4K test is the one that pins this stride.
+rust_case 'vhdx-bat-walk-counts-the-bitmap-slots-at-4k-sectors' "${VHDX_READ_LIB}" \
+    '        let slot_in_group = i % group;
+        if slot_in_group >= chunk_ratio as u64 {' \
+    '        let slot_in_group = i % group;
+        if false {
+            // MUTATED: the shared walk no longer skips bitmap slots
+            let _ = slot_in_group;' \
+    qcow2 'vhdx_scan_counts_a_block_in_each_chunk_group_at_4k_sectors' \
     --features "${QCOW2_FEATURES}"
 
 # The fourth answer, which for a long time was no answer at all.
