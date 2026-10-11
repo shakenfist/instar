@@ -514,8 +514,9 @@ redo this.
 * `tools/mutate-differencing.sh --check-patterns` reports every
   pattern landing, `--self-test` passes, `EXPECTED_CASES` has grown,
   and `docs/testing.md` agrees with the script's own figures rather
-  than with a hand-maintained number. **Met at 103, grown by one
-  rather than by several, and that is the right number.** The step
+  than with a hand-maintained number. **Met at 105: 103 when the
+  phase first closed, grown by one rather than by several, and then
+  by two more for #650 in response to the review of #652.** The step
   that closed the phase added no cases and the reason is checkable:
   of the four fixture and test steps, three touched no `src/` at
   all and the fourth touched only an apt line in the devcontainer,
@@ -523,17 +524,62 @@ redo this.
   added tests over behaviour the existing cases already guard.
   Only the 4K crate step and #650 changed behaviour, and the
   former brought its own case.
-* #650 has no committed deterministic regression test, because the
-  qcow2 crate's tests have no mock call table and the fuzz corpus
-  is not committed. So the guard was measured rather than assumed:
-  with the fix reverted and a **completely empty corpus**,
+* #650 has a committed deterministic regression test, and the fuzz
+  guard was measured rather than assumed.
+
+  **This criterion originally said it had no such test, "because the
+  qcow2 crate's tests have no mock call table". That reason was
+  wrong, and the review of #652 said so.** The crate has five --
+  `stub_call_table`, `read_test_call_table`, `z432_call_table` and the
+  two chain-read harnesses -- and calls `read_chain_virtual_cluster`
+  directly from more than seven test sites. The #432 fixture beside it
+  is the same shape this needed: a static in-memory image, a lock, a
+  hand-built `Qcow2State` and a sentinel-prefilled chain read. What
+  was actually true is the narrower claim that the *fuzz corpus* is
+  not committed, which says nothing about whether a crate test could
+  be written. Two were, and they are in `src/crates/qcow2/src/lib.rs`
+  (`extended_l2_wide_path_zeroes_an_alloc_bit_at_host_zero`, plus a
+  vacuity guard on the lookup that feeds it), at 8192-byte clusters
+  and 512-byte sectors so the geometry selects the wide arm. Both are
+  pinned by mutation cases
+  (`qcow2-wide-subcluster-alloc-at-host-zero-unfilled` and
+  `qcow2-wide-subcluster-lookup-loses-the-bitmap`), which is what
+  takes the case count from 103 to 105.
+* The fuzz guard was measured as well, and the measurement stands on
+  its own: with the fix reverted and a **completely empty corpus**,
   `fuzz_chain_compose` rediscovers it in 65 seconds wall clock,
   including the container start -- and at a different virtual
   offset and byte than the original reproducer, so it is a readily
   reachable class rather than one fragile input. Nightly runs are
   far longer than that.
+* Sweeping #650's class rather than only testing the reported
+  instance found a second, unfixed call site and it is filed as #653:
+  the extended-L2 lookup's all-alloc/no-zero shortcut reaches the
+  plain `Standard` arm, which has no host-offset guard, so a zero host
+  offset there is read as a payload offset and the image's own header
+  is served as guest payload under exit 0. Measured, not reasoned
+  about: `buf[512..520]` came back as the fixture's own L1 entry.
+  Deliberately not fixed here -- the fix has to choose between
+  zero-filling and refusing, which is the question already open on
+  #650, and both sites want one answer rather than two patches.
+* The two `instar-testdata` commits this phase's fixtures come from
+  are recorded here, because the master plan's convention is that a
+  phase landing in that repository records `instar-testdata <sha>
+  (#pr)` and the `Merged` cell cannot be written by the phase itself:
+  `e711f7d983` (the parentless differencing VHDX,
+  `vhdx-differencing.vhdx`) and `6eb12b3643` (the three-level VHD and
+  VHDX chains and their composed goldens). Both are on `main`.
+  `tools/ci/prepare-testdata.sh` checks out `origin/main` at depth 1
+  rather than a pinned revision, so any CI run after those pushes has
+  the fixtures; there is nothing to bump, and a pin would be the thing
+  that could go stale.
 * `make test-rust` passes with zero failures and the count is stated,
-  against the 2474 phase 15 measured.
+  against the 2474 phase 15 measured. **2509 passed, 0 failed.** The
+  criterion asked for the figure to be stated and the first pass of
+  this definition of done did not actually state it, which the review
+  of #652 is the reason it now does. 2503 of those were the phase as
+  it first closed; the review round added two tests, which the
+  feature-combination matrix runs three times each.
 * `pre-commit run --all-files` is clean, and the full integration
   suite passes with `INSTAR_REQUIRE_LIBVHDI=1` set.
 * Nothing this phase adds cites a plan file, phase, step or decision

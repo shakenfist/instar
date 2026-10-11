@@ -497,8 +497,22 @@ TESTDATA_PATH ?= $(CURDIR)/../instar-testdata
 # distribution package python3-libvhdi, into dist-packages, and an
 # isolated venv cannot see it. The differencing suite uses it as the
 # external oracle for composed content; see tests/base.py.
+# A venv that predates the --system-site-packages flag above is
+# isolated, so pyvhdi is invisible in it and the oracle classes skip
+# instead of running -- a green suite that measured nothing, which is
+# the failure mode the oracle exists to remove. Recreate such a venv
+# rather than warning about it: a warning scrolls past, and the whole
+# venv is rebuilt from requirements.txt on the next line anyway. The
+# container targets always build a fresh venv, so CI never takes this
+# branch.
 test-venv:
 	@echo "Creating Python virtual environment for tests..."
+	@if [ -d "$(VENV_DIR)" ] && ! grep -q \
+		    '^include-system-site-packages = true' "$(VENV_DIR)/pyvenv.cfg" 2>/dev/null; then \
+		echo "  $(VENV_DIR) was built without --system-site-packages; recreating it"; \
+		echo "  so the libvhdi oracle (python3-libvhdi) is visible to the suite."; \
+		rm -rf "$(VENV_DIR)"; \
+	fi
 	@if [ ! -d "$(VENV_DIR)" ]; then \
 		$(PYTHON) -m venv --system-site-packages $(VENV_DIR); \
 	fi

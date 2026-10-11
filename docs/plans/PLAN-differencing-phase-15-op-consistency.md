@@ -402,8 +402,10 @@ is stripped: zero non-comment `PLAN-*.md` references in `src/`.
   this phase" -- was therefore never tested. Phase 16 swept the file
   for the whole class and widened the pattern in its own definition of
   done; the figure of four pre-existing references this criterion
-  mentions was itself an undercount for the same reason. Four such references predated this phase, one of which --
-  "whether instar assembles a chain the way libvhdi does is phase 15's
+  mentions was itself an undercount for the same reason.
+
+  Four such references predated this phase, one of which -- "whether
+  instar assembles a chain the way libvhdi does is phase 15's
   question" -- this phase's own rescoping made false, so correcting
   them is this phase's business rather than tidying.
 * `docs/quirks.md` states the five-compose / three-report boundary

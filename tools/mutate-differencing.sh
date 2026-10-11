@@ -682,7 +682,7 @@ self_test() {
 # phase's definition of done asks the two to stay in step, which until
 # now was a promise kept by hand. Asserting it makes the drift a
 # failure instead of a documentation bug nobody reads.
-EXPECTED_CASES=103
+EXPECTED_CASES=105
 
 check_case_count() {
     # Only meaningful for a whole run; a selection is expected to be short.
@@ -1678,6 +1678,45 @@ rust_case 'vhdx-read-zero-sector-group-allowed' "${VHDX_READ_LIB}" \
             return None;
         }' \
     vhdx 'sectors_per_chunk_group_refuses_a_degenerate_geometry'
+
+# --- qcow2: a subcluster allocated at host offset zero ---------------
+#
+# Not a differencing-format case, but the same class of wrong answer
+# and found by the chain-compose fuzz target: a span the reader never
+# wrote, returned under success (#650). The first case
+# removes the arm that fixed it. The second is the vacuity guard, and
+# is the one that matters more than it looks: it reverts the lookup
+# that classifies the entry, so that if the classification ever moves,
+# the first case stops being a test of the fill loop and starts being
+# a test of a read that never reaches it -- which would pass.
+
+# The search text spans a comment containing an apostrophe, which a
+# single-quoted shell string cannot hold directly: '\'' closes the
+# quote, emits a literal quote and reopens it. The first case in this
+# file to need it -- the alternative was rewording a comment in
+# production code so a test harness could quote it, which is the wrong
+# way round.
+rust_case 'qcow2-wide-subcluster-alloc-at-host-zero-unfilled' "${QCOW2_LIB}" \
+    '                                } else if host_offset == 0 {
+                                    // Alloc set while the L2 entry names
+                                    // offset zero: malformed, and the chunk
+                                    // read above was skipped for exactly
+                                    // that reason, so nothing has written
+                                    // this subcluster.  Zero-fill rather
+                                    // than report success over whatever the
+                                    // caller'\''s buffer already held.  The
+                                    // narrow path defends the same case.
+                                    core::ptr::write_bytes(buf.add(buf_off), 0, sc_size as usize);
+                                }' \
+    '                                } // MUTATED: the #650 arm removed' \
+    qcow2 'extended_l2_wide_path_zeroes_an_alloc_bit_at_host_zero' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'qcow2-wide-subcluster-lookup-loses-the-bitmap' "${QCOW2_LIB}" \
+    '                Some(ClusterLookup::StandardSubclusters(0, bitmap))' \
+    '                Some(ClusterLookup::Unallocated) // MUTATED' \
+    qcow2 'extended_l2_alloc_bit_at_host_zero_is_standard_subclusters' \
+    --features "${QCOW2_FEATURES}"
 
 # ---------------------------------------------------------------------
 # Two chains in one device array, which is `compare` alone.

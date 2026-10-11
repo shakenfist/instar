@@ -29,7 +29,10 @@
 //! 2. A device that failed to initialise is not read through. The
 //!    reader has no state for such a device and cannot look a cluster up
 //!    in it; serving the device's own zeros instead is a wrong answer
-//!    reported as a right one.
+//!    reported as a right one. Checked at every depth the target
+//!    builds, not only at the top of the chain: a stateless device
+//!    *behind* the child is the shape a read reaches only by
+//!    descending, and so the one a top-of-chain check cannot see.
 //! 3. A refusal does not look like a successful read of zeros. This is
 //!    the shape of issue #547, where a differencing child whose parent
 //!    was never resolved composed against nothing and wrote the child's
@@ -256,6 +259,19 @@ fuzz_target!(|data: &[u8]| {
         // about an offset, so it is made once.
         let refusal_required = needs_state(formats[0]) && states.qcow2_states[0].is_none();
 
+        // Invariant 2 at depth. `refusal_required` covers the top of
+        // the chain, where the reader meets a stateless device on its
+        // first iteration and has nowhere else to answer from. A
+        // stateless device *behind* the child is the harder shape, and
+        // the one closest to #547: the child answers every byte it
+        // holds, and only a descent reaches the device that never
+        // resolved. The reader refuses when it descends into one, so a
+        // composed read that reports success cannot have descended --
+        // and must therefore agree with the child alone over every
+        // byte, not merely over the non-zero ones invariant 4 checks.
+        let stateless_behind = (1..DEVICE_COUNT)
+            .any(|dev| needs_state(formats[dev]) && states.qcow2_states[dev].is_none());
+
         for offset in plan.offsets(body) {
             let composed = unsafe {
                 read_twice(
@@ -319,6 +335,13 @@ fuzz_target!(|data: &[u8]| {
                     )
                 };
                 if composed && child_ok {
+                    if stateless_behind {
+                        check_no_descent(
+                            &scratch.read_a[..plan.chunk as usize],
+                            &scratch.child_only[..plan.chunk as usize],
+                            offset,
+                        );
+                    }
                     check_child_bytes_survive(
                         &scratch.read_a[..plan.chunk as usize],
                         &scratch.child_only[..plan.chunk as usize],
@@ -601,6 +624,32 @@ unsafe fn read_once(
         SECTOR_SIZE as u64,
         bytes_read,
     )
+}
+
+/// Invariant 2, at a device behind the child: a composed read that
+/// succeeded while a device behind the child has no state never
+/// descended, so it produced exactly what the child alone produced.
+///
+/// Stronger than [`check_child_bytes_survive`], which permits the
+/// chain to supply a byte the child alone read as zero -- the very
+/// thing a descent into a stateless device would have to do. It is
+/// sound only because both buffers are owed every byte, which is why
+/// the caller checks `full_fill_owed` first.
+fn check_no_descent(composed: &[u8], child_only: &[u8], offset: u64) {
+    if let Some((i, (&c, &own))) = composed
+        .iter()
+        .zip(child_only.iter())
+        .enumerate()
+        .find(|(_, (&c, &own))| c != own)
+    {
+        panic!(
+            "byte {i} of the span at virtual offset {offset} reads as {own:#04x} \
+             from the child alone but {c:#04x} through the chain, while a device \
+             behind the child has no state: the read either descended into a \
+             device it cannot look a cluster up in, or reported success for a \
+             span it did not serve"
+        );
+    }
 }
 
 /// Invariant 4: a device behind the child never overrides a byte the

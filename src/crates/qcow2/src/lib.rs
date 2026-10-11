@@ -5457,6 +5457,225 @@ mod tests {
     }
 
     // ====================================================================
+    // Extended-L2 wide I/O path: alloc bit set at host offset zero (#650)
+    // ====================================================================
+    //
+    // An extended-L2 entry can name host offset 0 while the subcluster
+    // allocation bitmap claims a subcluster is allocated. There is no
+    // host cluster to read, so the chunk read is skipped -- and before
+    // the fix the wide path matched no fill arm for such a subcluster
+    // and left the caller's buffer untouched under a `true` return,
+    // handing back whatever the caller had there. The narrow path
+    // already zero-filled it. `fuzz_chain_compose` found this with a
+    // dual-sentinel fill check, which is not a committed regression
+    // test; these two are.
+
+    // Byte size of the in-memory qcow2 image the #650 mock serves.
+    const W650_IMG_LEN: usize = 8192;
+
+    // Serialize tests touching the W650 globals (extern "C" callbacks
+    // can only close over 'static state; mirrors Z432_LOCK above).
+    static W650_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static mut W650_IMG: [u8; W650_IMG_LEN] = [0u8; W650_IMG_LEN];
+    static mut W650_CAP_SECTORS: u64 = 0;
+
+    // 512-byte sectors over 8192-byte clusters put the subcluster at
+    // 8192 / 32 = 256 bytes, so `sector_size > sc_size` and the
+    // StandardSubclusters arm takes the WIDE path. That relationship is
+    // the whole point of the fixture: at the default 64 KiB cluster the
+    // subcluster would be 2048 bytes and the narrow path -- which has
+    // defended this case since I2 -- would run instead.
+    const W650_SSZ: usize = 512;
+    const W650_CLUSTER: u64 = 8192;
+    const W650_SC_SIZE: u64 = W650_CLUSTER / 32;
+
+    // Subcluster 3 is marked allocated with no host cluster behind it:
+    // the malformed subcluster. Subcluster 0 carries a zero bit, which
+    // is what makes `cluster_lookup` resolve an all-zero L2 entry to
+    // StandardSubclusters at all rather than to Unallocated, and so is
+    // load-bearing rather than decoration.
+    const W650_BAD_SC: u32 = 3;
+    const W650_ZERO_SC: u32 = 0;
+    const W650_BITMAP: u64 = (1u64 << (32 + W650_ZERO_SC)) | (1u64 << W650_BAD_SC);
+
+    unsafe extern "C" fn w650_read_sector(
+        _device_idx: u32,
+        sector: u64,
+        out_buf: *mut u8,
+        sector_size: usize,
+    ) -> bool {
+        let start = (sector as usize).saturating_mul(sector_size);
+        if start + sector_size > W650_IMG_LEN {
+            return false;
+        }
+        let base = core::ptr::addr_of!(W650_IMG) as *const u8;
+        core::ptr::copy_nonoverlapping(base.add(start), out_buf, sector_size);
+        true
+    }
+
+    unsafe extern "C" fn w650_capacity(_device_idx: u32) -> u64 {
+        W650_CAP_SECTORS
+    }
+
+    fn w650_call_table() -> shared::CallTable {
+        shared::CallTable {
+            read_input_sector: w650_read_sector,
+            get_input_capacity: w650_capacity,
+            ..stub_call_table()
+        }
+    }
+
+    /// Build the in-memory extended-L2 fixture into `W650_IMG` and set
+    /// the served capacity. Layout (cluster_size = 8192, 16-byte L2
+    /// entries):
+    ///   - L1 table at 512: L1[0] -> L2 table at 1024.
+    ///   - L2 table at 1024: entry[0] host offset field = 0 (@1024),
+    ///     subcluster bitmap = W650_BITMAP (@1032).
+    ///
+    /// Everything outside the two tables is 0xDD, so a mutation that
+    /// dropped the `host_offset != 0` guard and read the chunk from
+    /// file offset zero returns recognisable bytes rather than the
+    /// zeros the fixture asserts.
+    unsafe fn w650_build_image() {
+        let mut img = [0xDDu8; W650_IMG_LEN];
+        let mut put = |off: usize, v: u64| {
+            img[off..off + 8].copy_from_slice(&v.to_be_bytes());
+        };
+        put(512, 1024 | OFLAG_COPIED);
+        put(1024, 0);
+        put(1032, W650_BITMAP);
+        let dst = core::ptr::addr_of_mut!(W650_IMG) as *mut u8;
+        core::ptr::copy_nonoverlapping(img.as_ptr(), dst, W650_IMG_LEN);
+        W650_CAP_SECTORS = (W650_IMG_LEN / W650_SSZ) as u64;
+    }
+
+    /// Construct a `Qcow2State` matching the #650 fixture geometry. The
+    /// caller owns the two cache buffers (each >= MAX_SECTOR_SIZE).
+    fn w650_state(l1_cache: &mut [u8], l2_cache: &mut [u8]) -> Qcow2State {
+        Qcow2State {
+            device_idx: 0,
+            cluster_size: W650_CLUSTER,
+            cluster_bits: 13,
+            l1_size: 1,
+            l1_table_offset: 512,
+            incompatible_features: INCOMPAT_EXTENDED_L2,
+            compression_type: 0,
+            crypt_method: 0,
+            luks_ext_offset: 0,
+            luks_ext_len: 0,
+            extended_l2: true,
+            l1_cached_sector: u64::MAX,
+            l1_cache_buf: l1_cache.as_mut_ptr(),
+            l2_cached_sector: u64::MAX,
+            l2_cache_buf: l2_cache.as_mut_ptr(),
+        }
+    }
+
+    #[test]
+    fn extended_l2_alloc_bit_at_host_zero_is_standard_subclusters() {
+        // Vacuity guard for the chain-read test below: if the lookup
+        // stops resolving this entry to StandardSubclusters(0, bitmap)
+        // then the read never reaches the subcluster fill loop, and a
+        // green chain-read test would prove nothing about either path.
+        let _guard = W650_LOCK.lock().unwrap();
+        unsafe {
+            w650_build_image();
+        }
+        let call_table = w650_call_table();
+        let mut l1_cache = std::vec![0u8; MAX_SECTOR_SIZE];
+        let mut l2_cache = std::vec![0u8; MAX_SECTOR_SIZE];
+        let mut state = w650_state(&mut l1_cache, &mut l2_cache);
+        let cap = (W650_IMG_LEN / W650_SSZ) as u64;
+        let mut bytes_read = 0u64;
+
+        let v = unsafe { state.cluster_lookup(&call_table, 0, W650_SSZ, cap, &mut bytes_read) };
+        assert!(
+            matches!(v, Some(ClusterLookup::StandardSubclusters(0, b)) if b == W650_BITMAP),
+            "an all-zero extended-L2 entry with a zero bit set must resolve to \
+             StandardSubclusters(0, W650_BITMAP); it did not, so the chain-read test \
+             below no longer reaches the subcluster fill loop"
+        );
+
+        // And the geometry really does select the wide path.
+        assert!(
+            W650_SSZ as u64 > W650_SC_SIZE,
+            "fixture must have sector_size > subcluster size to take the wide I/O path"
+        );
+    }
+
+    #[test]
+    fn extended_l2_wide_path_zeroes_an_alloc_bit_at_host_zero() {
+        let _guard = W650_LOCK.lock().unwrap();
+        unsafe {
+            w650_build_image();
+        }
+        let call_table = w650_call_table();
+        let mut l1_cache = std::vec![0u8; MAX_SECTOR_SIZE];
+        let mut l2_cache = std::vec![0u8; MAX_SECTOR_SIZE];
+        let state = w650_state(&mut l1_cache, &mut l2_cache);
+
+        let mut chain_states = ChainStates::default();
+        chain_states.qcow2_states[0] = Some(state);
+
+        let mut chain_config = ChainConfig::single_chain(1);
+        chain_config.devices[0].format = ImageFormat::Qcow2 as u32;
+        chain_config.devices[0].cluster_size = W650_CLUSTER as u32;
+        chain_config.devices[0].data_device_idx = 0;
+
+        let mut compressed_buf = std::vec![0u8; MAX_SECTOR_SIZE];
+        let mut staging_buf = std::vec![0u8; MAX_SECTOR_SIZE];
+        let mut staging_cluster_offset = u64::MAX;
+
+        // Prefill with a sentinel the image cannot produce, so a
+        // subcluster the reader never wrote is distinguishable from one
+        // it deliberately zeroed. This is the dual-sentinel idea from
+        // `fuzz_chain_compose` reduced to a single known fixture.
+        let mut buf = std::vec![0xAAu8; W650_CLUSTER as usize];
+        let mut bytes_read = 0u64;
+        let ok = unsafe {
+            read_chain_virtual_cluster(
+                &call_table,
+                0,
+                1,
+                0,
+                buf.as_mut_ptr(),
+                W650_CLUSTER,
+                W650_SSZ,
+                &chain_config,
+                &mut chain_states,
+                compressed_buf.as_mut_ptr(),
+                staging_buf.as_mut_ptr(),
+                &mut staging_cluster_offset,
+                None,
+                None,
+                0,
+                &mut bytes_read,
+            )
+        };
+        assert!(ok, "read_chain_virtual_cluster returned false");
+
+        // The malformed subcluster first and by name, because it is the
+        // one the fix is about and a whole-buffer assertion alone would
+        // not say which subcluster failed.
+        let bad = (W650_BAD_SC as u64 * W650_SC_SIZE) as usize;
+        let bad_end = bad + W650_SC_SIZE as usize;
+        assert!(
+            buf[bad..bad_end].iter().all(|&b| b == 0),
+            "subcluster {W650_BAD_SC} is marked allocated at host offset 0: it must be \
+             zero-filled, not left as the caller's buffer contents, got {:02x?}",
+            &buf[bad..bad + 16]
+        );
+
+        // Every other subcluster is a zero bit or unallocated at the
+        // bottom of the chain, so the whole cluster reads as zeros.
+        assert!(
+            buf.iter().all(|&b| b == 0),
+            "the whole cluster must read as zeros; first non-zero byte at {}",
+            buf.iter().position(|&b| b != 0).unwrap_or(0)
+        );
+    }
+
+    // ====================================================================
     // VDI chain-reader arm (read_chain_virtual_cluster ImageFormat::Vdi)
     // ====================================================================
     //

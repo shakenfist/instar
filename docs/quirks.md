@@ -4842,6 +4842,64 @@ rather than fixed, because none of them was that change's job to close:
    refuses a differencing VHD
    ([issue #565](https://github.com/shakenfist/instar/issues/565)).
 
+## Malformed qcow2 subcluster: instar zero-fills where qemu-img errors
+
+**Classification: neither a safe nor an unsafe quirk in the sense above
+— a divergence from qemu-img that no flag controls, recorded because
+the direction it diverges in is the permissive one.**
+
+### Observed Behavior
+
+An extended-L2 qcow2 image can carry an L2 entry whose host offset
+field is zero while its subcluster allocation bitmap marks a subcluster
+allocated. The two statements contradict each other: there is no host
+cluster to read the subcluster from. qemu treats such an entry as an
+invalid subcluster and fails the read with `EIO`. instar zero-fills the
+subcluster and reports the read as successful, so an operation reading
+through it — `convert`, `dd`, `compare`, `bench` — exits 0 with zeros
+where the image claimed data.
+
+Only genuinely corrupt or hostile images contain this shape; no
+qcow2 writer produces it. The sector-bitmap readers for VHD and VHDX
+refuse their analogous contradictions (see "VHD/VHDX differencing"
+above), which is why this one is worth recording rather than leaving
+implicit.
+
+### instar Behavior
+
+Both arms of the extended-L2 read path zero-fill it. The narrow arm
+(device sector size at or below the subcluster size) has done so since
+it was written; the wide arm did not, and left the caller's buffer
+untouched under a `true` return —
+[issue #650](https://github.com/shakenfist/instar/issues/650), found by
+the `fuzz_chain_compose` fuzz target and fixed by making the wide arm
+match the narrow one. Zeroing the subcluster was the conservative half
+of that fix: it makes the two arms agree and removes the uninitialised
+read, without changing what a caller sees for an image that was already
+being accepted.
+
+### Open Question
+
+Whether *refusing* is the better answer for both arms, matching qemu,
+is deliberately left open on #650. It is a user-visible behaviour
+change — an image that converts today would stop converting — and the
+project's own philosophy of failing closed on contradictory metadata
+points towards it, so it is a decision to take on its own merits rather
+than inside a consistency fix. Until it is taken, this page is the
+record that the permissive answer is deliberate and not an oversight.
+
+The decision has a second call site to cover. Sweeping this class
+turned up
+[issue #653](https://github.com/shakenfist/instar/issues/653): an
+extended-L2 entry with every allocation bit set and no zero bits takes
+a shortcut to the plain `Standard` arm, which has no host-offset guard
+at all, so a host offset of zero there is read as a payload offset and
+the image's own header bytes are served as guest data. That is a
+defect rather than a policy — the classic non-extended branch three
+lines away already resolves a zero host offset to `Unallocated` — but
+the fix picks the same answer this question is about, so the two
+belong together.
+
 ## Future Additions
 
 Additional quirks will be documented here as they are discovered during

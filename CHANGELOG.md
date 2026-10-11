@@ -546,7 +546,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   clusters below 16 KiB reach the wide path, and only malformed ones
   reach this case; a well-formed image of any cluster size is
   unaffected. Found by the new `fuzz_chain_compose` target on its
-  first run against unmodified code.
+  first run against unmodified code, and now also pinned by a
+  deterministic crate test and two mutation cases. Note that
+  zero-filling is where instar diverges from qemu, which fails such a
+  read with `EIO`; that divergence is now recorded in
+  `docs/quirks.md`, and whether both paths should refuse instead is
+  open on #650.
 
 - **`instar info` finds a VHDX's virtual size and block size through
   the metadata table** (#640). It read both at fixed offsets: File
