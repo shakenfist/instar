@@ -493,7 +493,24 @@ redo this.
   constructor. Falsifiable: a 300-second run reports non-zero region
   coverage on `read_chain_virtual_cluster` — the same bar
   `fuzz_vhdx_parent`'s docstring sets for itself, and the reason it
-  exists as a separate target.
+  exists as a separate target. **Met, at 84.03% of 313 regions
+  against 0.00% of 309 for `fuzz_qcow2_l1l2`, which is the best any
+  existing target manages — none reach the compose path at all.**
+  And the target earned its place on its first clean run: it found
+  a live defect in unmodified code, #650, where the wide-I/O path
+  returned success over bytes it never wrote. That is #547's family
+  in a new place, which is precisely what the brief hoped this
+  target might catch, so the fix landed inside this phase rather
+  than being deferred. It is the one user-visible behaviour change
+  here, and the only reason this phase is not test-and-tooling
+  alone. The dual-sentinel check is what made it visible: the same
+  span is read twice from different prefills and the two must
+  agree, because a single sentinel cannot distinguish an unwritten
+  byte from one an image could legitimately contain.
+* Three fuzz target lists remain hand-maintained and unchecked
+  against each other, which this step verified by hand at 43 each
+  and deliberately did not automate — filed as #651 rather than
+  absorbed, since the plan did not scope it.
 * `tools/mutate-differencing.sh --check-patterns` reports every
   pattern landing, `--self-test` passes, `EXPECTED_CASES` has grown,
   and `docs/testing.md` agrees with the script's own figures rather

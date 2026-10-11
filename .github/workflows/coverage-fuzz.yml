@@ -239,6 +239,7 @@ jobs:
               fuzz_qcow1_table
               fuzz_dmg_table
               fuzz_dmg_chunk
+              fuzz_chain_compose
             )
           fi
 

@@ -8,14 +8,36 @@ use std::cell::RefCell;
 
 thread_local! {
     static FUZZ_DATA: RefCell<Vec<u8>> = RefCell::new(Vec::new());
+
+    /// Per-device buffers for the opt-in multi-device mode.
+    ///
+    /// Empty is the only state the single-device targets ever see, and
+    /// every device mock below tests it first and falls through to
+    /// `FUZZ_DATA` unchanged. A target that never calls
+    /// [`set_fuzz_devices`] therefore cannot tell this list exists:
+    /// that is what keeps one input device, backed by the single
+    /// buffer, the default for the targets that assume it.
+    static FUZZ_DEVICES: RefCell<Vec<Vec<u8>>> = RefCell::new(Vec::new());
 }
 
 const SECTOR_SIZE: usize = 512;
 
+/// A buffer of `len` bytes, measured in whole sectors (rounded up).
+fn sectors_for(len: usize) -> u64 {
+    (len as u64 + SECTOR_SIZE as u64 - 1) / SECTOR_SIZE as u64
+}
+
 /// Store fuzz input for the current iteration.
 ///
 /// Must be called before `build_call_table()` or `input_capacity()`.
+///
+/// This installs single-device mode: one input device, backed by
+/// `data`. Any per-device buffers a previous iteration installed with
+/// [`set_fuzz_devices`] are dropped, so what the mocks answer depends
+/// on this iteration's calls and not on the iteration before it. A
+/// target that wants both calls them in this order.
 pub fn set_fuzz_input(data: &[u8]) {
+    FUZZ_DEVICES.with(|d| d.borrow_mut().clear());
     FUZZ_DATA.with(|f| {
         let mut input = f.borrow_mut();
         input.clear();
@@ -23,12 +45,32 @@ pub fn set_fuzz_input(data: &[u8]) {
     });
 }
 
+/// Store one buffer per input device for the current iteration,
+/// turning on multi-device mode.
+///
+/// `devices[0]` is device 0, and so on: the indices are the call
+/// table's `device_idx`, which for a backing chain means device 0 is
+/// the top image and each following device sits behind it. Reads of a
+/// device index past the end of `devices` fail the way a read past the
+/// end of a device's bytes does — zero-filled buffer, `false` return —
+/// rather than aliasing another device's bytes.
+///
+/// Opt-in on purpose. Every other target is written against one input
+/// device holding the whole fuzz input, and a target that silently
+/// became two-device would still pass while reaching less code than
+/// it did before. Passing an empty slice returns the mocks to that
+/// single-device default.
+pub fn set_fuzz_devices(devices: &[&[u8]]) {
+    FUZZ_DEVICES.with(|d| {
+        let mut installed = d.borrow_mut();
+        installed.clear();
+        installed.extend(devices.iter().map(|dev| dev.to_vec()));
+    });
+}
+
 /// Return the fuzz input size in sectors (rounded up).
 pub fn input_capacity() -> u64 {
-    FUZZ_DATA.with(|f| {
-        let data = f.borrow();
-        (data.len() as u64 + SECTOR_SIZE as u64 - 1) / SECTOR_SIZE as u64
-    })
+    FUZZ_DATA.with(|f| sectors_for(f.borrow().len()))
 }
 
 /// Return the raw fuzz input size in bytes.
@@ -104,46 +146,95 @@ pub fn build_call_table() -> shared::CallTable {
 // ---------------------------------------------------------------------------
 
 unsafe extern "C" fn mock_get_input_device_count() -> u32 {
-    1
+    FUZZ_DEVICES.with(|d| {
+        let count = d.borrow().len();
+        if count == 0 {
+            1
+        } else {
+            count as u32
+        }
+    })
+}
+
+/// Serve one sector-sized read out of `data`.
+///
+/// The whole of the read mock's behaviour, in one place, so the
+/// single-device and multi-device paths cannot drift: both hand it a
+/// `&[u8]` and nothing else. Lifting it out of
+/// `mock_read_input_sector` is the only change the single-device path
+/// has seen — the body below is the one that was inline there.
+///
+/// # Safety
+///
+/// `buffer` must point to at least `len` writable bytes.
+unsafe fn serve_sector(data: &[u8], sector: u64, buffer: *mut u8, len: usize) -> bool {
+    let sector_usize = sector as usize;
+    let offset = match sector_usize.checked_mul(len) {
+        Some(o) => o,
+        None => {
+            std::ptr::write_bytes(buffer, 0, len);
+            return false;
+        }
+    };
+    if offset >= data.len() {
+        std::ptr::write_bytes(buffer, 0, len);
+        return false;
+    }
+    let available = data.len() - offset;
+    let copy_len = available.min(len);
+    std::ptr::copy_nonoverlapping(data.as_ptr().add(offset), buffer, copy_len);
+    if copy_len < len {
+        std::ptr::write_bytes(buffer.add(copy_len), 0, len - copy_len);
+    }
+    true
 }
 
 unsafe extern "C" fn mock_read_input_sector(
-    _device_idx: u32,
+    device_idx: u32,
     sector: u64,
     buffer: *mut u8,
     len: usize,
 ) -> bool {
-    FUZZ_DATA.with(|f| {
-        let data = f.borrow();
-        let sector_usize = sector as usize;
-        let offset = match sector_usize.checked_mul(len) {
-            Some(o) => o,
+    FUZZ_DEVICES.with(|d| {
+        let devices = d.borrow();
+        if devices.is_empty() {
+            return FUZZ_DATA.with(|f| serve_sector(&f.borrow(), sector, buffer, len));
+        }
+        match devices.get(device_idx as usize) {
+            Some(device) => serve_sector(device, sector, buffer, len),
+            // A device index the harness never installed holds no
+            // bytes at all, which is a harder failure than reading
+            // past the end of one that does. Answering with another
+            // device's bytes would be the worst possible mock for a
+            // chain reader, whose whole job is to attribute data to
+            // the right device.
             None => {
                 std::ptr::write_bytes(buffer, 0, len);
-                return false;
+                false
             }
-        };
-        if offset >= data.len() {
-            std::ptr::write_bytes(buffer, 0, len);
-            return false;
         }
-        let available = data.len() - offset;
-        let copy_len = available.min(len);
-        std::ptr::copy_nonoverlapping(data.as_ptr().add(offset), buffer, copy_len);
-        if copy_len < len {
-            std::ptr::write_bytes(buffer.add(copy_len), 0, len - copy_len);
-        }
-        true
     })
 }
 
-unsafe extern "C" fn mock_get_input_capacity(_device_idx: u32) -> u64 {
-    FUZZ_DATA.with(|f| {
-        let data = f.borrow();
-        (data.len() as u64 + SECTOR_SIZE as u64 - 1) / SECTOR_SIZE as u64
+unsafe extern "C" fn mock_get_input_capacity(device_idx: u32) -> u64 {
+    FUZZ_DEVICES.with(|d| {
+        let devices = d.borrow();
+        if devices.is_empty() {
+            return FUZZ_DATA.with(|f| sectors_for(f.borrow().len()));
+        }
+        // Zero sectors for an uninstalled index, matching the read
+        // mock's refusal for the same index.
+        devices
+            .get(device_idx as usize)
+            .map_or(0, |device| sectors_for(device.len()))
     })
 }
 
+// Every device reads in 512-byte sectors, in both modes: the sector
+// size is a property of the mock rather than of the buffer behind a
+// device, so there is nothing per-device to answer. The same goes for
+// `mock_write_input_sector` and `mock_fsync_input` below, which refuse
+// and succeed respectively whatever device they are asked about.
 unsafe extern "C" fn mock_get_input_sector_size(_device_idx: u32) -> usize {
     SECTOR_SIZE
 }
@@ -482,6 +573,111 @@ mod tests {
     fn device_count_is_one() {
         let got = unsafe { mock_get_input_device_count() };
         assert_eq!(got, 1);
+    }
+
+    // -- set_fuzz_devices --
+
+    /// Helper: read a sector of a given device via the mock and return
+    /// (success, buffer).
+    fn read_device_sector(device_idx: u32, sector: u64, len: usize) -> (bool, Vec<u8>) {
+        let mut buf = vec![0xFFu8; len];
+        let ok = unsafe { mock_read_input_sector(device_idx, sector, buf.as_mut_ptr(), len) };
+        (ok, buf)
+    }
+
+    /// The default every target that never calls `set_fuzz_devices`
+    /// gets: one device, the single buffer, whatever index is asked
+    /// about. Asserted for a non-zero index too, because the old mock
+    /// ignored the index entirely and a per-device lookup is the one
+    /// way that could have changed.
+    #[test]
+    fn devices_default_to_the_single_buffer() {
+        let data: Vec<u8> = (0..512).map(|i| (i & 0xFF) as u8).collect();
+        set_fuzz_input(&data);
+
+        assert_eq!(unsafe { mock_get_input_device_count() }, 1);
+        assert_eq!(unsafe { mock_get_input_capacity(0) }, 1);
+        assert_eq!(unsafe { mock_get_input_capacity(7) }, 1);
+
+        let (ok, buf) = read_device_sector(0, 0, 512);
+        assert!(ok);
+        assert_eq!(buf, data);
+
+        let (ok, buf) = read_device_sector(7, 0, 512);
+        assert!(
+            ok,
+            "a non-zero device index must still read the single buffer"
+        );
+        assert_eq!(buf, data);
+    }
+
+    #[test]
+    fn devices_are_served_per_index() {
+        let child = vec![0xC1u8; 512];
+        let parent = vec![0xA2u8; 1024];
+        set_fuzz_devices(&[&child, &parent]);
+
+        assert_eq!(unsafe { mock_get_input_device_count() }, 2);
+        assert_eq!(unsafe { mock_get_input_capacity(0) }, 1);
+        assert_eq!(unsafe { mock_get_input_capacity(1) }, 2);
+
+        let (ok, buf) = read_device_sector(0, 0, 512);
+        assert!(ok);
+        assert!(
+            buf.iter().all(|&b| b == 0xC1),
+            "device 0 served other bytes"
+        );
+
+        let (ok, buf) = read_device_sector(1, 1, 512);
+        assert!(ok);
+        assert!(
+            buf.iter().all(|&b| b == 0xA2),
+            "device 1 served other bytes"
+        );
+
+        // Device 0 ends after one sector; device 1 does not. Each
+        // device's end is its own.
+        let (ok, buf) = read_device_sector(0, 1, 512);
+        assert!(!ok, "device 0's second sector does not exist");
+        assert!(buf.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn uninstalled_device_index_refuses() {
+        let only = vec![0xABu8; 512];
+        set_fuzz_devices(&[&only]);
+
+        assert_eq!(unsafe { mock_get_input_device_count() }, 1);
+        assert_eq!(unsafe { mock_get_input_capacity(1) }, 0);
+
+        let (ok, buf) = read_device_sector(1, 0, 512);
+        assert!(!ok, "a device index that was never installed must refuse");
+        assert!(buf.iter().all(|&b| b == 0), "a refused read must zero-fill");
+    }
+
+    #[test]
+    fn empty_device_list_restores_the_default() {
+        set_fuzz_devices(&[&[0u8; 512][..], &[0u8; 512][..]]);
+        assert_eq!(unsafe { mock_get_input_device_count() }, 2);
+
+        set_fuzz_devices(&[]);
+        assert_eq!(unsafe { mock_get_input_device_count() }, 1);
+    }
+
+    #[test]
+    fn set_fuzz_input_turns_multi_device_mode_off() {
+        set_fuzz_devices(&[&[0xAAu8; 512][..], &[0xBBu8; 512][..]]);
+        assert_eq!(unsafe { mock_get_input_device_count() }, 2);
+
+        let single = vec![0x5Au8; 512];
+        set_fuzz_input(&single);
+        assert_eq!(unsafe { mock_get_input_device_count() }, 1);
+        let (ok, buf) = read_device_sector(1, 0, 512);
+        assert!(
+            ok,
+            "after set_fuzz_input every index reads the single buffer"
+        );
+        assert_eq!(buf, single);
     }
 
     // -- mock_write_output_sector --

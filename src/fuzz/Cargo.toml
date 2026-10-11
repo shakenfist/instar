@@ -299,3 +299,11 @@ name = "fuzz_qcow2_write_growth"
 path = "fuzz_targets/fuzz_qcow2_write_growth.rs"
 doc = false
 test = false
+
+# backing-chain compose target
+
+[[bin]]
+name = "fuzz_chain_compose"
+path = "fuzz_targets/fuzz_chain_compose.rs"
+doc = false
+test = false

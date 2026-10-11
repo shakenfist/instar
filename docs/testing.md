@@ -1097,7 +1097,7 @@ differential fuzzing cannot reach.
 
 ### Fuzz targets
 
-42 targets across the parser and planner crates, organized in
+43 targets across the parser and planner crates, organized in
 `src/fuzz/`:
 
 | Target | Crate | Type |
@@ -1144,6 +1144,7 @@ differential fuzzing cannot reach.
 | `fuzz_bench_schedule` | bench | Buffer-based |
 | `fuzz_qcow2_write` | qcow2-write | Sim harness |
 | `fuzz_qcow2_write_growth` | qcow2-write | Buffer-based |
+| `fuzz_chain_compose` | qcow2 | CallTable (multi-device) |
 
 **Buffer-based** targets call parser functions that take `&[u8]`
 directly (e.g. `QcowHeader::parse(data)`). **CallTable** targets
@@ -1229,6 +1230,48 @@ debug builds on out-of-envelope petabyte-scale geometry; in release it
 returns `GrowthOverflow` gracefully, and production only passes bounded
 geometry — softening that guard to always return overflow is a recorded
 follow-up, not a bug.)
+
+`fuzz_chain_compose` is the only multi-device target, and the only one
+that reaches `read_chain_virtual_cluster` — the backing-chain compose
+path. Every other CallTable target serves one input device, so the
+chain walk (the loop over devices, the descent into the device behind
+one that does not hold a cluster, and the zero-fill at the bottom of a
+chain) was unreachable rather than merely unexplored:
+`fuzz_qcow2_l1l2`, which covers `cluster_lookup` at 93.67%, measured
+0.00% region coverage on `read_chain_virtual_cluster`.
+
+It opts the mock CallTable into a multi-device mode with
+`instar_fuzz::set_fuzz_devices(&[child, parent])`, which installs one
+buffer per device index. The mode is opt-in, and a target that never
+calls it sees one input device backed by the single `set_fuzz_input`
+buffer exactly as before — the default every other target depends on.
+`set_fuzz_input` turns the mode back off, so a target using both calls
+them in that order.
+
+The target builds a `ChainConfig` as a Rust struct rather than
+decoding one from bytes (`init_chain_states` and
+`read_chain_virtual_cluster` both take `&ChainConfig` directly, so the
+serialised form the host writes to guest memory is not on the path
+under test), varies the declared segmentation across the three shapes
+`init_chain_states` distinguishes — one chain of two, two chains of
+one, and a segmentation that tiles nothing — and asserts four
+invariants rather than the absence of a panic:
+
+1. A read that reports success filled the whole buffer. Checked by
+   reading the same span twice from two different sentinel prefills
+   and requiring the results to agree: a byte the reader never wrote
+   keeps whichever sentinel it started from, which no single sentinel
+   could prove because any byte value is one an image could
+   legitimately contain.
+2. `init_chain_states` reporting success never leaves a device the
+   reader needs state for uninitialised.
+3. A device with no state refuses rather than serving its own zeros.
+   This is the shape of a differencing child composed against a parent
+   that was never resolved, which exits 0 with the parent's data
+   replaced by zeros.
+4. A device behind the child never overrides a byte the child holds,
+   checked by comparing the composed read against the same span read
+   as the child alone.
 
 ### Running locally
 
