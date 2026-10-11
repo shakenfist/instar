@@ -4818,7 +4818,14 @@ class TestDifferencingCreatedChildComposes(DifferencingTestBase):
                         f'{fmt}: defect D predicts a composition identical to '
                         f'the parent for this child, so this case no longer '
                         f'demonstrates anything and the exception is pinned '
-                        f'to the wrong chain'
+                        f'to the wrong chain. Before concluding that, check '
+                        f'whether the header bytes this model reads as '
+                        f'bitmap bits have changed: they are the file '
+                        f'identifier and creator string instar writes, so a '
+                        f'new creator string or a moved header field can '
+                        f'leave only zero-valued sectors under the set bits '
+                        f'and empty this list without the defect having '
+                        f'moved at all'
                     )
                     self.assertEqual(
                         [], self._differing_sectors(oracle, predicted, fmt),

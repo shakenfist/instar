@@ -4900,6 +4900,19 @@ lines away already resolves a zero host offset to `Unallocated` — but
 the fix picks the same answer this question is about, so the two
 belong together.
 
+And a third,
+[issue #654](https://github.com/shakenfist/instar/issues/654): a
+subcluster with neither its allocation bit nor its zero bit set is
+defined to read from the backing file, and both arms zero-fill it
+instead when the host offset is zero. Unlike the two above, that one
+is reachable on **well-formed** images — it is the entry shape qemu
+writes when zeroing part of an unallocated cluster in an image with a
+backing file — so it is a silent wrong answer in ordinary use rather
+than only on corrupt input. All three turn on what a host offset of
+zero means for a subcluster, which is the argument on #654 for
+classifying each subcluster once into the types qcow2 defines instead
+of interpreting that offset separately in each branch.
+
 ## Future Additions
 
 Additional quirks will be documented here as they are discovered during

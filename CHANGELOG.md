@@ -26,17 +26,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `INSTAR_REQUIRE_LIBVHDI` variable, the same one `vhdiinfo` uses,
   because both packages come from the same upstream release.
 
-  The cross-check found one libvhdi defect already known from phase 1
-  (an unmasked shift in its VHD per-block sector bitmap decoder, pinned
-  against `vhd-diff-child-mixed` sector 2) and one new one: libvhdi
-  ignores a VHDX sector-bitmap BAT entry's `SB_BLOCK_NOT_PRESENT`
-  state and reads the bitmap from file offset zero instead, which a
-  freshly created, wholly unallocated VHDX child is the only fixture
-  to expose. Both are asserted positively, so an upstream fix turns
-  the exception red rather than leaving it silently permissive. The
-  three-level chains add no exception: `set_parent` chains cleanly to
-  that depth, in either order, and still refuses a chain given only
-  in part.
+  The cross-check found one libvhdi defect already recorded against
+  `vhd-diff-child-mixed` in `tests/manifest.json` (an unmasked shift in
+  its VHD per-block sector bitmap decoder, pinned at sector 2) and one
+  new one: libvhdi ignores a VHDX sector-bitmap BAT entry's
+  `SB_BLOCK_NOT_PRESENT` state and reads the bitmap from file offset
+  zero instead, which a freshly created, wholly unallocated VHDX child
+  is the only fixture to expose. Both are asserted positively, so an
+  upstream fix turns the exception red rather than leaving it silently
+  permissive. The three-level chains add no exception: `set_parent`
+  chains cleanly to that depth, in either order, and still refuses a
+  chain given only in part.
 
 - **Two fixture-coverage gaps `create-vhd-testdata.sh` left open are
   closed.** `vhdx-differencing` is a parentless VHDX with the
@@ -544,14 +544,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   bytes are now zero-filled defensively, matching what the narrow-I/O
   path has always done for the same malformed entry. Only images with
   clusters below 16 KiB reach the wide path, and only malformed ones
-  reach this case; a well-formed image of any cluster size is
-  unaffected. Found by the new `fuzz_chain_compose` target on its
-  first run against unmodified code, and now also pinned by a
-  deterministic crate test and two mutation cases. Note that
-  zero-filling is where instar diverges from qemu, which fails such a
-  read with `EIO`; that divergence is now recorded in
-  `docs/quirks.md`, and whether both paths should refuse instead is
-  open on #650.
+  reach this case, so a well-formed image is unaffected by it. That is
+  not a claim that subcluster reads are now correct in general: #654,
+  a separate and still-open defect in both paths, zero-fills an
+  unallocated subcluster that should be read from the backing file,
+  and does reach well-formed images with a backing chain. Found by the
+  new `fuzz_chain_compose` target on its first run against unmodified
+  code, and now also pinned by a deterministic crate test and two
+  mutation cases. Note that zero-filling is where instar diverges from
+  qemu, which fails such a read with `EIO`; that divergence is now
+  recorded in `docs/quirks.md`, and whether both paths should refuse
+  instead is open on #650.
 
 - **`instar info` finds a VHDX's virtual size and block size through
   the metadata table** (#640). It read both at fixed offsets: File

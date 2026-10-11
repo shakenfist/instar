@@ -586,14 +586,23 @@ redo this.
   number, and no user-visible string contains `PLAN-`:
 
   ```
-  git diff f14554cf..HEAD -- 'src/*' 'tests/*' 'tools/*' 'scripts/*' \
+  git diff "$(git merge-base origin/develop HEAD)"..HEAD -- . ':!docs/plans' \
     | grep '^+' \
     | grep -iE 'PLAN-[a-z0-9-]+\.md|decision [0-9]|phase [0-9]+|this phase'\
                 '|step [0-9]+[a-g]\b|\b16[a-g]\b'
   ```
 
-  is empty. `docs/plans/` is out of scope — plan files cite each other
-  by design. Note that this is a diff-scoped check by necessity: the
+  is empty. Only `docs/plans/` is excluded — plan files cite each
+  other by design. The probe first listed the paths it covered
+  (`src`, `tests`, `tools`, `scripts`), and the review of #652 found a
+  phase number in `CHANGELOG.md`, which that list could not see and
+  which users read. Excluding the one directory that may cite plans,
+  rather than enumerating the ones that may not, covers `docs/` and
+  the `Makefile` as well and cannot miss a path added later. The base
+  is the merge base rather than `f14554cf` for the same reason: once
+  the branch is rebased, a fixed base also diffs in other pull
+  requests' changes, and the probe stops being empty for reasons that
+  are not this phase's. Note that this is a diff-scoped check by necessity: the
   repository has around 58 files carrying such references already,
   `tests/test_create.py:436` among them, and sweeping them is a
   separate job (the fleet's `plan-references-in-code` block).

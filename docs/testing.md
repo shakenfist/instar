@@ -377,7 +377,10 @@ Tests verifying instar's security properties:
 ### Make Targets
 
 ```bash
-# Create Python virtual environment (first time only)
+# Create Python virtual environment (first time only). The venv sees
+# system site-packages so the libvhdi oracle (python3-libvhdi) is
+# importable; an older isolated venv is deleted and rebuilt from
+# tests/requirements.txt, so anything installed into it by hand is lost.
 make test-venv
 
 # Run safe tests (default, suitable for development)
