@@ -244,8 +244,9 @@ for a name that contains one of the characters above, so the output for
 every ordinary image is byte-identical to qemu-img's.
 
 The same rule applies to `info --chain`, `snapshot -l`, `check`, the
-stderr notices about a backing reference, and the guest messages and
-debug lines printed with `--verbose`. Error messages that end a command
+stderr notices about a backing reference, and every guest message and
+debug line printed with `--verbose`: the logger escapes each record as a
+whole, so this holds for lines added later too. Error messages that end a command
 are printed with the same escaping by the Rust runtime.
 
 **JSON output** always carries the exact value, so a script reading

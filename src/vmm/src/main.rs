@@ -1356,16 +1356,14 @@ impl SerialTransmitter {
 /// Debug output buffer - collects characters until newline, then prints.
 /// Truncates lines longer than MAX_DEBUG_LINE to prevent unbounded growth.
 struct DebugBuffer {
-    line: String,
+    line: Vec<u8>,
 }
 
 const MAX_DEBUG_LINE: usize = 4096;
 
 impl DebugBuffer {
     fn new() -> Self {
-        Self {
-            line: String::new(),
-        }
+        Self { line: Vec::new() }
     }
 
     /// Add a byte; if it's a newline, return the complete line.
@@ -1374,17 +1372,45 @@ impl DebugBuffer {
     /// The guest writes these bytes while parsing an untrusted image, so
     /// the line is returned through `terminal_safe`: every caller only
     /// logs it, and none of them can then forward a control character.
+    /// The bytes are decoded as UTF-8 first, so non-ASCII text the guest
+    /// prints reads as itself rather than as escaped C1 characters.
     fn add_byte(&mut self, byte: u8) -> Option<String> {
         if byte == b'\n' || self.line.len() >= MAX_DEBUG_LINE {
             if byte != b'\n' {
-                self.line.push(byte as char);
+                self.line.push(byte);
             }
             let result = std::mem::take(&mut self.line);
-            Some(terminal_safe(&result).into_owned())
+            Some(terminal_safe(&String::from_utf8_lossy(&result)).into_owned())
         } else {
-            self.line.push(byte as char);
+            self.line.push(byte);
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod debug_buffer_tests {
+    use super::DebugBuffer;
+
+    fn feed(bytes: &[u8]) -> Vec<String> {
+        let mut buffer = DebugBuffer::new();
+        bytes.iter().filter_map(|b| buffer.add_byte(*b)).collect()
+    }
+
+    #[test]
+    fn utf8_text_reads_as_itself() {
+        assert_eq!(
+            feed("caf\u{e9} \u{4e2d}.vhd\n".as_bytes()),
+            ["caf\u{e9} \u{4e2d}.vhd"]
+        );
+    }
+
+    #[test]
+    fn control_characters_are_escaped() {
+        assert_eq!(feed(b"a\x1b[2Jb\rc\n"), ["a\\u{1b}[2Jb\\rc"]);
+        // A raw C1 byte is not valid UTF-8, so it decodes to U+FFFD
+        // rather than to the single-byte CSI it would be as Latin-1.
+        assert_eq!(feed(b"x\x9by\n"), ["x\u{fffd}y"]);
     }
 }
 
@@ -3091,7 +3117,7 @@ fn discover_backing_chain(
             let resolved = resolve_vmdk_flat_descriptor(&current, security_config)?;
             debug!(
                 "VMDK descriptor resolved: {} -> {} extent(s) ({} bytes virtual)",
-                current.display(),
+                terminal_safe_path(&current),
                 resolved.flat_extents.len(),
                 resolved.virtual_size
             );
@@ -3189,8 +3215,8 @@ fn discover_backing_chain(
                     .unwrap_or(0);
                 debug!(
                     "External data file validated: {} -> {}",
-                    data_path,
-                    data_resolved.display()
+                    terminal_safe(data_path),
+                    terminal_safe_path(&data_resolved)
                 );
                 data_files.push(ExternalDataFile {
                     path: data_resolved,
@@ -3310,7 +3336,8 @@ fn discover_backing_chain(
                         debug!(
                             "Differencing {} parent recorded but not resolved \
                              (this operation does not compose a differencing chain): {}",
-                            info_result.format, backing_path
+                            terminal_safe(&info_result.format),
+                            terminal_safe(&backing_path)
                         );
                         break;
                     }
@@ -3549,7 +3576,7 @@ fn open_chain_devices(
             label,
             idx,
             mmio,
-            image.path.display()
+            terminal_safe_path(&image.path)
         );
         let device = Arc::new(Mutex::new(device));
         device_set.add_device(Arc::clone(&device), true);
@@ -3575,7 +3602,7 @@ fn open_chain_devices(
                 label,
                 idx,
                 mmio,
-                data_file.path.display()
+                terminal_safe_path(&data_file.path)
             );
             let device = Arc::new(Mutex::new(device));
             device_set.add_device(Arc::clone(&device), true);
@@ -3657,7 +3684,7 @@ fn open_chain_devices_rw(
             idx,
             mmio,
             if is_rw { "rw" } else { "ro" },
-            image.path.display()
+            terminal_safe_path(&image.path)
         );
         let device = Arc::new(Mutex::new(device));
         device_set.add_device(Arc::clone(&device), true);
@@ -3683,7 +3710,7 @@ fn open_chain_devices_rw(
                 idx,
                 mmio,
                 if is_rw { "rw" } else { "ro" },
-                data_file.path.display()
+                terminal_safe_path(&data_file.path)
             );
             let device = Arc::new(Mutex::new(device));
             device_set.add_device(Arc::clone(&device), true);
@@ -7079,6 +7106,11 @@ struct ConfigArgs {
     validate: bool,
 }
 
+// Returning the error, rather than printing it, is what escapes a fatal
+// error message: the runtime prints it with `{:?}`, and a `String`'s Debug
+// form escapes control characters, so a backing name quoted in the error
+// cannot drive the terminal. Printing it with `{}` before exiting would
+// lose that; docs/output-formats.md relies on it.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // This is exactly what `Cli::parse()` does internally, but keeping
     // the `ArgMatches` around lets `run_bitmap` recover the CLI order of
@@ -7089,13 +7121,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     let verbose = cli.verbose;
 
-    // Initialize logger based on --verbose flag
+    // Initialize logger based on --verbose flag. Every record is escaped
+    // on its way out, since debug lines interpolate image-derived text.
     if verbose {
-        env_logger::Builder::new()
-            .filter_level(log::LevelFilter::Debug)
-            .format_target(false)
-            .format_timestamp(None)
-            .init();
+        escape::init_verbose_logger();
     }
 
     match cli.command {
@@ -17545,8 +17574,8 @@ impl<'a, W: std::io::Write> SnapshotRenderer<'a, W> {
                     (10usize, 16usize)
                 };
                 // Both columns are read from the image's snapshot table,
-                // so they are escaped first and padded by the width of
-                // what is actually printed.
+                // so they are escaped first and padded by the byte
+                // length of what is actually printed, as above.
                 let id = terminal_safe(&entry.id);
                 let name = terminal_safe(&entry.name);
                 let id_pad = " ".repeat(id_width.saturating_sub(id.len()));

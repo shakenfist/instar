@@ -588,6 +588,42 @@ class TestImageDerivedTextEscaping(InstarTestBase):
         self.assertEqual(0, rc, f'stderr={stderr!r}')
         self.assertEqual(_HOSTILE_NAME, json.loads(stdout)[0]['name'])
 
+    def test_verbose_stderr_escapes_chain_device_paths(self):
+        """--verbose debug lines name each chain device by its path.
+
+        The backing image's path is resolved from the overlay's header,
+        so the host's own debug lines print image data too, not only the
+        guest's.
+        """
+        overlay = self._overlay_with_hostile_backing()
+        # The exit status is not the point: check reports the raw backing
+        # under a qcow2 overlay as a chain format mismatch.
+        _, stderr, _ = self._instar('--verbose', 'check', '--chain', overlay)
+        self._assert_terminal_safe(stderr, 'check --chain --verbose stderr')
+        self.assertIn(f'/{_HOSTILE_NAME_ESCAPED}\n', stderr)
+
+    def test_verbose_stderr_escapes_unresolved_differencing_parent(self):
+        """A differencing parent check does not resolve is still logged.
+
+        check refuses to compose a differencing chain, so the parent
+        name is only recorded, and never reaches a path check that could
+        reject it before it is printed.
+        """
+        fixture = (self._testdata_root / 'custom' / 'format-coverage' / 'vhd-diff-parent.vhd')
+        self.assertTrue(fixture.exists(), f'parent fixture missing: {fixture}')
+        shutil.copyfile(fixture, self.tmp / _HOSTILE_NAME)
+        child = self.tmp / 'child.vhd'
+        result = subprocess.run(
+            [str(self.get_instar_binary()), 'create', '-f', 'vpc', '-b', _HOSTILE_NAME, '-F', 'vpc', child.name],
+            capture_output=True, text=True, timeout=60, cwd=self.tmp
+        )
+        self.assertEqual(0, result.returncode, f'create failed: {result.stderr!r}')
+
+        _, stderr, _ = self._instar('--verbose', 'check', '--chain', child)
+        self._assert_terminal_safe(stderr, 'check --chain --verbose stderr')
+        self.assertIn(f'parent recorded but not resolved (this operation does not compose a differencing '
+                      f'chain): {_HOSTILE_NAME_ESCAPED}\n', stderr)
+
     def test_vmdk_create_type_is_escaped_and_keeps_json_valid(self):
         """A create type ending in a backslash used to break the JSON.
 

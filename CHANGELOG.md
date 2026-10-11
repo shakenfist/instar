@@ -822,7 +822,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   were found on the image." from `instar info`. Human output now escapes control
   characters and Unicode bidi controls (`\u{1b}`, `\n`) in every such
   string, in `info`, `info --chain`, `snapshot -l`, `check`, the stderr
-  backing-reference notices and `--verbose` guest output. Backslashes
+  backing-reference notices and every `--verbose` debug line, which the
+  logger escapes as a whole. Backslashes
   are not escaped, so Windows and UNC parent paths print unchanged, and
   output for an ordinary image is unchanged. JSON output still carries
   the exact value. See

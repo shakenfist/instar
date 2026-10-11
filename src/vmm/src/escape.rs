@@ -14,6 +14,11 @@
 //!
 //! * [`terminal_safe`] for human output on stdout and stderr.
 //! * [`json_escape`] for the contents of a JSON string literal.
+//!
+//! Log records are the exception to picking: `--verbose` installs
+//! [`EscapingLogger`], which passes every record through
+//! [`terminal_safe`] on its way out, so a `debug!` call never needs to
+//! escape its own arguments.
 
 use std::borrow::Cow;
 use std::fmt::Write;
@@ -100,9 +105,68 @@ pub fn json_escape(s: &str) -> String {
     out
 }
 
+/// A logger that escapes every record before the inner logger formats it.
+///
+/// `debug!` lines interpolate image-derived values -- recorded parent
+/// names, data file references, paths resolved from them, and every
+/// line the guest prints -- and there are too many of them to trust each
+/// call site to escape its own arguments. Escaping the finished message
+/// here covers all of them, including ones not written yet.
+pub struct EscapingLogger<L: log::Log> {
+    inner: L,
+}
+
+impl<L: log::Log> EscapingLogger<L> {
+    pub fn new(inner: L) -> Self {
+        Self { inner }
+    }
+}
+
+impl<L: log::Log> log::Log for EscapingLogger<L> {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        self.inner.enabled(metadata)
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if !self.inner.enabled(record.metadata()) {
+            return;
+        }
+        let message = record.args().to_string();
+        let safe = terminal_safe(&message);
+        self.inner.log(
+            &log::Record::builder()
+                .args(format_args!("{safe}"))
+                .metadata(record.metadata().clone())
+                .module_path(record.module_path())
+                .file(record.file())
+                .line(record.line())
+                .build(),
+        );
+    }
+
+    fn flush(&self) {
+        self.inner.flush();
+    }
+}
+
+/// Install the `--verbose` logger: env_logger at debug level, with every
+/// record escaped by [`EscapingLogger`].
+pub fn init_verbose_logger() {
+    let inner = env_logger::Builder::new()
+        .filter_level(log::LevelFilter::Debug)
+        .format_target(false)
+        .format_timestamp(None)
+        .build();
+    let max_level = inner.filter();
+    if log::set_boxed_logger(Box::new(EscapingLogger::new(inner))).is_ok() {
+        log::set_max_level(max_level);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     #[test]
     fn terminal_safe_borrows_plain_text() {
@@ -144,6 +208,43 @@ mod tests {
             terminal_safe_path(Path::new("/tmp/a\x1bb")),
             "/tmp/a\\u{1b}b"
         );
+    }
+
+    struct CapturingLogger(Mutex<Vec<String>>);
+
+    impl log::Log for CapturingLogger {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            metadata.level() <= log::Level::Debug
+        }
+        fn log(&self, record: &log::Record<'_>) {
+            self.0.lock().unwrap().push(record.args().to_string());
+        }
+        fn flush(&self) {}
+    }
+
+    fn log_through_escaping_logger(level: log::Level, message: &str) -> Vec<String> {
+        use log::Log;
+        let logger = EscapingLogger::new(CapturingLogger(Mutex::new(Vec::new())));
+        logger.log(
+            &log::Record::builder()
+                .args(format_args!("parent: {message}"))
+                .level(level)
+                .build(),
+        );
+        logger.inner.0.into_inner().unwrap()
+    }
+
+    #[test]
+    fn escaping_logger_escapes_interpolated_arguments() {
+        assert_eq!(
+            log_through_escaping_logger(log::Level::Debug, "p\x1b[2J\nforged"),
+            vec!["parent: p\\u{1b}[2J\\nforged".to_string()]
+        );
+    }
+
+    #[test]
+    fn escaping_logger_respects_inner_filter() {
+        assert!(log_through_escaping_logger(log::Level::Trace, "x").is_empty());
     }
 
     #[test]
