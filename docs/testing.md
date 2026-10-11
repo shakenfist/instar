@@ -1569,11 +1569,12 @@ The assertions are structural only, per
 [PLAN-differencing.md](plans/PLAN-differencing.md): the disk type, the
 parent filename for VHD, and the parent identifier for both formats,
 each compared against what `vhdiinfo` reports for the parent itself
-rather than a hardcoded GUID. No composed content is read. One
-limitation is recorded rather than worked around: `vhdiinfo` prints no
-`Parent filename` line for a VHDX, with or without `-v`, so the VHDX
-parent locator's path key cannot be checked through this tool — the
-Rust round-trip test pins it instead
+rather than a hardcoded GUID. No composed content is read by this
+class — that is the data oracle's job, below. One limitation is
+recorded rather than worked around: `vhdiinfo` prints no `Parent
+filename` line for a VHDX, with or without `-v`, so the VHDX parent
+locator's path key cannot be checked through this tool — the Rust
+round-trip test pins it instead
 (`src/crates/create/tests/round_trip.rs`).
 
 The suite runs inside the `instar-build` devcontainer, which installs
@@ -1586,6 +1587,74 @@ because a skipped test and a passing test look identical in a green
 run and `stestr` does not name skipped tests in its output — parsing
 the log could not have caught it. Removing `libvhdi-utils` from the
 devcontainer turns that job red instead of leaving it quietly green.
+
+### The data oracle: composed content, not just structure
+
+`vhdiinfo` has no way to answer "what does this chain compose to" —
+`libvhdi-utils` ships exactly two binaries, `vhdiinfo` and
+`vhdimount`, a FUSE mount that is a worse thing to put in an
+integration suite's path than a Python import. The `pyvhdi` binding
+(package `python3-libvhdi`, installed in
+`src/.devcontainer/Dockerfile` beside `libvhdi-utils` because both
+come from the same upstream release) can: `pyvhdi.file.set_parent()`
+stacks a parent behind a child so the pair reads as one image, making
+libvhdi a second, independent reader of composed *bytes*.
+`tests/base.py`'s `_require_pyvhdi` is modelled on
+`_require_vhdiinfo` and honours the same `INSTAR_REQUIRE_LIBVHDI`
+variable rather than a second one, so there is still one switch and
+one place to look.
+
+Two test classes in `tests/test_differencing.py` use it:
+
+- **`TestDifferencingOracleComposes`** drives every real chain the
+  project has — two formats, two and three images deep — through
+  `set_parent` and compares the result, byte for byte, against both
+  the recorded `*-composed.raw` golden and `instar convert -O raw`,
+  three independent readers of the same bytes. `set_parent` chains
+  cleanly to three levels, in either order, and still refuses a chain
+  given only in part, so the depth-three chains add no new exception
+  beyond the one below.
+- **`TestDifferencingCreatedChildComposes`** closes a different gap:
+  nothing previously read a byte back through a child
+  `instar create -f {vpc,vhdx} -b PARENT` itself wrote, only its
+  recorded identity fields. A freshly created child allocates
+  nothing, so all three readers must agree with the parent's own
+  content exactly — the one case here where a disagreement would
+  indict the writer rather than the reader. A created VHD child
+  composes exactly; a created VHDX child does not, for a reason that
+  is libvhdi's rather than instar's (defect D, below).
+
+**The one pinned exception.** libvhdi decodes a VHD per-block sector
+bitmap with an unmasked shift, so once a higher bit in a bitmap byte
+is set, every later sector that byte covers reads as present in the
+child. `vhd-diff-child-mixed` is the fixture built to put parent-owned
+and child-owned sectors in one bitmap byte, and sector 2 is where that
+lands: libvhdi returns 512 **zero** bytes there, not the child's data
+and not the parent's — it is reading the child's own (unwritten)
+block, not merely using the wrong source. `vhd-diff-child-aligned` is
+the fixture built to keep ownership out of shared bitmap bytes, and
+libvhdi agrees with it on all 16,777,216 bytes, which is the control
+that pins the fault on libvhdi's decoder rather than on the harness,
+the generator, or instar. The test asserts the exception positively,
+in both directions — that sector must differ, and the oracle's bytes
+there must be exactly zero — so a disagreement anywhere else fails
+loudly and an upstream fix turns this one test red rather than quietly
+passing.
+
+**Four libvhdi defects have been measured against this project's
+fixtures in total**, recorded in `tests/manifest.json` and in the
+docstrings of `TestDifferencingLibvhdiOracle`,
+`TestDifferencingOracleComposes` and
+`TestDifferencingCreatedChildComposes` in `tests/test_differencing.py`.
+None is an instar defect — each is isolated from instar's own reader
+and from the fixture generator by a control described at its source:
+
+| Defect | What libvhdi gets wrong |
+|---|---|
+| A | Decodes a VHD per-block sector bitmap with an unmasked shift, so a higher set bit makes every later sector in that byte read as present in the child (`vhd-diff-child-mixed`, sector 2, above) |
+| B | Looks up a VHDX parent locator's `relative_path` key with the wrong length, so `get_parent_filename()` returns `None` for a VHDX child instar wrote — instar writes that one key for the relative path `-b` was given, and the lookup never matches it |
+| C | Over-reads two bytes past an unterminated 512-byte parent unicode name into the following locator table, reporting a 257th character (`vhd-diff-locator-overlong`) |
+| D | Ignores a sector-bitmap BAT entry's `SB_BLOCK_NOT_PRESENT` state and reads the bitmap from file offset zero instead, misreading 56 of a freshly created, wholly unallocated VHDX child's 32768 sectors |
 
 ## Mutation harness for the differencing tests
 

@@ -514,7 +514,24 @@ redo this.
 * `tools/mutate-differencing.sh --check-patterns` reports every
   pattern landing, `--self-test` passes, `EXPECTED_CASES` has grown,
   and `docs/testing.md` agrees with the script's own figures rather
-  than with a hand-maintained number.
+  than with a hand-maintained number. **Met at 103, grown by one
+  rather than by several, and that is the right number.** The step
+  that closed the phase added no cases and the reason is checkable:
+  of the four fixture and test steps, three touched no `src/` at
+  all and the fourth touched only an apt line in the devcontainer,
+  so they added no instar behaviour a mutation could pin -- they
+  added tests over behaviour the existing cases already guard.
+  Only the 4K crate step and #650 changed behaviour, and the
+  former brought its own case.
+* #650 has no committed deterministic regression test, because the
+  qcow2 crate's tests have no mock call table and the fuzz corpus
+  is not committed. So the guard was measured rather than assumed:
+  with the fix reverted and a **completely empty corpus**,
+  `fuzz_chain_compose` rediscovers it in 65 seconds wall clock,
+  including the container start -- and at a different virtual
+  offset and byte than the original reproducer, so it is a readily
+  reachable class rather than one fragile input. Nightly runs are
+  far longer than that.
 * `make test-rust` passes with zero failures and the count is stated,
   against the 2474 phase 15 measured.
 * `pre-commit run --all-files` is clean, and the full integration
