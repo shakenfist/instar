@@ -13306,6 +13306,16 @@ pub unsafe fn read_chain_virtual_cluster(
                                             sc_size as usize,
                                         );
                                     }
+                                } else if host_offset == 0 {
+                                    // Alloc set while the L2 entry names
+                                    // offset zero: malformed, and the chunk
+                                    // read above was skipped for exactly
+                                    // that reason, so nothing has written
+                                    // this subcluster.  Zero-fill rather
+                                    // than report success over whatever the
+                                    // caller's buffer already held.  The
+                                    // narrow path defends the same case.
+                                    core::ptr::write_bytes(buf.add(buf_off), 0, sc_size as usize);
                                 }
                                 // Allocated subclusters: already read above
                             }

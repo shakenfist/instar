@@ -472,6 +472,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **A composed read of a malformed qcow2 subcluster no longer reports
+  success without writing the bytes** (#650). Where a subcluster's
+  allocation bit was set while its L2 entry named host offset zero,
+  the wide-I/O path of the chain walker skipped the payload read, as
+  it should, and then fell through every arm of its fill loop without
+  zeroing those bytes -- and returned success. The caller kept
+  whatever its buffer already held and was told the read worked, which
+  is the same silent wrong answer as #547 in a different place. The
+  bytes are now zero-filled defensively, matching what the narrow-I/O
+  path has always done for the same malformed entry. Only images with
+  clusters below 16 KiB reach the wide path, and only malformed ones
+  reach this case; a well-formed image of any cluster size is
+  unaffected. Found by the new `fuzz_chain_compose` target on its
+  first run against unmodified code.
+
 - **`instar info` finds a VHDX's virtual size and block size through
   the metadata table** (#640). It read both at fixed offsets: File
   Parameters at the start of the metadata items area, with Virtual
