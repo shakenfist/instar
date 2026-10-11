@@ -600,23 +600,32 @@ class InstarTestBase(testtools.TestCase):
         return pyvhdi
 
     def compose_with_pyvhdi(
-        self, child: Union[str, Path], parent: Union[str, Path]
+        self, child: Union[str, Path], *ancestors: Union[str, Path]
     ) -> bytes:
         """Compose a differencing chain with libvhdi; return every byte of it.
 
-        *child* is a differencing VHD or VHDX and *parent* is the image
-        it names. libvhdi will not guess the second from the first --
-        a child opened on its own has no parent and every read through
-        it fails -- so the caller supplies both and this stacks them.
+        *child* is a differencing VHD or VHDX and *ancestors* are the
+        images behind it, nearest first: one for an ordinary chain, two
+        where the image the child names is itself differencing. libvhdi
+        will not guess any of them from the child -- a child opened on
+        its own has no parent and every read through it fails -- so the
+        caller supplies the whole chain and this stacks it.
+
+        `set_parent` chains to any depth and in any order; what it will
+        not do is let a level be missing. Measured against a
+        three-image chain: with the middle image attached and the base
+        disk left off, a read of a base-owned sector fails with
+        "missing parent file" while a read of a sector the top of the
+        chain owns still succeeds. So an incompletely stacked chain
+        cannot return a plausible-looking buffer here.
 
         libvhdi refuses to read a differencing child with no parent set
-        rather than serving zeros for the sectors it does not own, so
-        a `set_parent` that silently did nothing could not leave this
-        helper returning a plausible-looking buffer. It also checks the
-        parent's identity against the one the child records, so the
-        pair handed in cannot be mismatched without an exception.
-        Between them those two properties are why no further guard is
-        needed here against an oracle that quietly composed nothing.
+        rather than serving zeros for the sectors it does not own, and
+        it checks each parent's identity against the one the image
+        above records, so neither a `set_parent` that silently did
+        nothing nor a mismatched chain can go unnoticed. Between them
+        those two properties are why no further guard is needed here
+        against an oracle that quietly composed nothing.
 
         The whole media size comes back in one read. That is 16 MiB for
         the fixtures in this tree and it takes well under a tenth of a
@@ -627,28 +636,33 @@ class InstarTestBase(testtools.TestCase):
         would silently shorten every comparison built on it.
         """
         pyvhdi = self._require_pyvhdi()
-        child_file = pyvhdi.file()
+        self.assertTrue(
+            ancestors,
+            f'compose_with_pyvhdi was given {child} with no ancestors, and a '
+            f'differencing child read on its own composes nothing'
+        )
+        handles = []
         try:
-            child_file.open(str(child), 'r')
-            parent_file = pyvhdi.file()
-            try:
-                parent_file.open(str(parent), 'r')
-                child_file.set_parent(parent_file)
-                size = child_file.get_media_size()
-                self.assertGreater(
-                    size, 0,
-                    f'libvhdi reports a zero media size for {child}, so there '
-                    f'is no composition to compare'
-                )
-                data = child_file.read_buffer_at_offset(size, 0)
-            finally:
-                # Before the child, and before returning: a read
-                # through the child after its parent is closed fails
-                # inside libvhdi rather than falling back to the
-                # child's own blocks.
-                parent_file.close()
+            for image in (child,) + ancestors:
+                handle = pyvhdi.file()
+                handle.open(str(image), 'r')
+                handles.append(handle)
+            for upper, lower in zip(handles, handles[1:]):
+                upper.set_parent(lower)
+            size = handles[0].get_media_size()
+            self.assertGreater(
+                size, 0,
+                f'libvhdi reports a zero media size for {child}, so there '
+                f'is no composition to compare'
+            )
+            data = handles[0].read_buffer_at_offset(size, 0)
         finally:
-            child_file.close()
+            # Deepest first, and all of them before returning: a read
+            # through an image after its parent is closed fails inside
+            # libvhdi rather than falling back to that image's own
+            # blocks.
+            for handle in reversed(handles):
+                handle.close()
         self.assertEqual(
             size, len(data),
             f'libvhdi returned {len(data)} bytes for {child} where it '

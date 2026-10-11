@@ -332,6 +332,72 @@ CHAIN_PROBE_SECTORS = {
     'vhdx-diff-child': (2048, 5),
 }
 
+# The two chains that are three differencing images deep, in
+# COMPOSED_CHAIN_FIXTURES' shape so the two tables concatenate.
+#
+# Separate from that table rather than folded into it because almost
+# every consumer of it assumes a chain of exactly two images:
+# `chain_copy` copies a child and one parent, and
+# `TestDifferencingCompareTwoChains` asserts a two-image chain by name.
+# A grandchild in that table would be read through helpers that cannot
+# carry its grandparent, which would fail for the harness's reasons
+# rather than the reader's.
+GRANDCHILD_CHAIN_FIXTURES = (
+    ('vhd-diff-grandchild', 'vhd-diff-grandchild-composed', 'VHD'),
+    ('vhdx-diff-grandchild', 'vhdx-diff-grandchild-composed', 'VHDX'),
+)
+
+# Every ancestor of each differencing child, nearest first, by fixture
+# id. The two-image chains are derived from DIFFERENCING_CHAIN_FIXTURES
+# so the two cannot disagree; the grandchildren name both of theirs,
+# and the nearer of the two being differencing itself is the point of
+# the fixture.
+CHAIN_FIXTURE_ANCESTORS = {
+    **{image_id: (parent_name,)
+       for image_id, parent_name in DIFFERENCING_CHAIN_FIXTURES},
+    'vhd-diff-grandchild': ('vhd-diff-child-aligned.vhd',
+                            'vhd-diff-parent.vhd'),
+    'vhdx-diff-grandchild': ('vhdx-diff-child.vhdx',
+                             'vhdx-diff-parent.vhdx'),
+}
+
+# What each level of the two three-deep chains owns, as fixture id to
+# (sector, owning level) pairs. The level names are the tags the
+# generator stamps into every sector it writes: `PARENT` for the base
+# disk, `CHILD` for the differencing image in the middle, `GRAND` for
+# the one on top.
+#
+# This is `CHAIN_PROBE_SECTORS`'s property at depth three. A reader
+# that never descends serves nothing for the CHILD and PARENT sectors;
+# one that descends once and stops still serves nothing for the PARENT
+# ones. The GRAND entries include sectors an ancestor wrote as well --
+# 8 and 100 for VHD, 5 for VHDX -- so a reader that let a lower level
+# win is caught here too.
+GRANDCHILD_PROBE_SECTORS = {
+    'vhd-diff-grandchild': (
+        (0, 'PARENT'), (4096, 'PARENT'), (32767, 'PARENT'),
+        (200, 'CHILD'), (8192, 'CHILD'), (9000, 'CHILD'),
+        (8, 'GRAND'), (100, 'GRAND'), (16384, 'GRAND'),
+    ),
+    'vhdx-diff-grandchild': (
+        (0, 'PARENT'), (2048, 'PARENT'), (32767, 'PARENT'),
+        (1, 'CHILD'), (6144, 'CHILD'), (6200, 'CHILD'),
+        (5, 'GRAND'), (100, 'GRAND'), (10300, 'GRAND'),
+    ),
+}
+
+# Sectors the base disk wrote that a fully-present block above it
+# shadows to zero: 7000 under the middle child's block 3, 10240 under
+# the grandchild's block 5. Composing them from the base disk is the
+# mistake a reader makes by treating "this level never wrote here" as
+# "ask the level below", and these are the only sectors in either
+# golden where the right answer is zero at a sector some image holds
+# data for. VHD has no block state that can shadow a parent, so the
+# VHD chain has no entry.
+GRANDCHILD_SHADOWED_SECTORS = {
+    'vhdx-diff-grandchild': (7000, 10240),
+}
+
 # `map` refuses with its own, older text and its own error code. It
 # predates composition for VHD; the VHDX arm was added alongside
 # it, because removing `VhdxState::init`'s `has_parent` rejection would
@@ -893,6 +959,144 @@ class TestDifferencingDepthThree(DifferencingTestBase):
                     expected = self._expected(tmp, golden.path)
                     self.assert_bytes_identical(
                         out, expected, f'{image_id} (depth 3)'
+                    )
+
+
+class TestDifferencingDepthThreeAllDifferencing(DifferencingTestBase):
+    """A three-image chain whose top two images are both differencing.
+
+    `TestDifferencingDepthThree` above stacks a qcow2 overlay on a
+    differencing child, which moves the differencing device off both
+    ends of a three-device chain. What it does not do is make the
+    reader compose one differencing level against another: the overlay
+    owns a single cluster and defers every other cluster to one
+    composing read at index 1. Here the top two images each carry a
+    sector bitmap of their own, so resolving one sector can take two
+    descents, and the second descent starts from a device that is
+    itself incomplete.
+
+    That is the path `qcow2`'s own
+    `vhd_arm_composes_a_differencing_child_over_a_differencing_parent`
+    and its VHDX counterpart cover with synthetic fixtures, and
+    nothing drove it through the CLI until these two chains existed.
+    The fixtures are the expensive half: `qemu-img create -o help`
+    offers no parent option for `vpc` or for `vhdx`, so it cannot
+    author a differencing image of either format at any depth, and its
+    readers cannot check one either -- the `vpc` driver reads a
+    differencing VHD as though it were dynamic and the `vhdx` driver
+    refuses a parent-referencing image outright. The generator
+    therefore writes the VHD half byte by byte and patches the VHDX
+    half after converting a dynamic image, and both grandchild
+    fixtures carry `skip_qemu_img`.
+
+    The expectation is each chain's recorded
+    `*-grandchild-composed.raw` golden, whole. The first test is what
+    keeps the second from going vacuous: it asserts the golden really
+    does leave sectors to all three levels, so a reader that stopped
+    descending early cannot produce it by coincidence.
+    """
+
+    def test_the_recorded_composition_spreads_ownership_over_three_levels(self):
+        """Every level of each chain owns a sector in that chain's golden.
+
+        Read out of the golden rather than taken on trust from the
+        generator's tables. A regenerated fixture with a different
+        content plan fails here, loudly, instead of quietly leaving the
+        `convert` test below comparing against a composition that only
+        ever needed one descent.
+        """
+        for image_id, golden_id, _format_name in GRANDCHILD_CHAIN_FIXTURES:
+            with self.subTest(image=image_id):
+                golden = self.composed_golden(golden_id).read_bytes()
+                self.assertEqual(
+                    IMAGE_VIRTUAL_SIZE, len(golden),
+                    f'{golden_id}: the recorded composition is '
+                    f'{len(golden)} bytes, not the size this chain declares'
+                )
+                owners = set()
+                for sector, owner in GRANDCHILD_PROBE_SECTORS[image_id]:
+                    pattern = f'{owner}-sector-{sector:06d}'.encode()
+                    self.assertTrue(
+                        self._sector(golden, sector).startswith(pattern),
+                        f'{image_id}: the recorded composition does not hold '
+                        f'{pattern!r} at sector {sector}, so ownership is no '
+                        f'longer spread the way this class assumes and a '
+                        f'reader that stopped descending early could still '
+                        f'produce it'
+                    )
+                    owners.add(owner)
+                self.assertEqual(
+                    {'PARENT', 'CHILD', 'GRAND'}, owners,
+                    f'{image_id}: the probe table does not name all three '
+                    f'levels, so it cannot show that all three are read'
+                )
+                for sector in GRANDCHILD_SHADOWED_SECTORS.get(image_id, ()):
+                    self.assertEqual(
+                        bytes(self.SECTOR_SIZE),
+                        self._sector(golden, sector),
+                        f'{image_id}: sector {sector} is written in the base '
+                        f'disk and shadowed by a fully-present block above '
+                        f'it, so the recorded composition must hold zeros '
+                        f'there rather than the base disk\'s data'
+                    )
+
+    def test_convert_composes_a_chain_of_three_differencing_images(self):
+        """`convert -O raw` over each grandchild equals its golden.
+
+        The chain listing comes first and is asserted rather than
+        printed: three images, and a parent reference recorded against
+        each of the top two. A fixture whose middle image had lost its
+        own parent reference would still convert, to something a
+        two-level reader could produce, and this is what separates the
+        two cases.
+        """
+        for image_id, golden_id, _format_name in GRANDCHILD_CHAIN_FIXTURES:
+            with self.subTest(image=image_id):
+                source = self.differencing_image(image_id)
+                golden = self.composed_golden(golden_id)
+                for ancestor in CHAIN_FIXTURE_ANCESTORS[image_id]:
+                    self.differencing_image(Path(ancestor).stem)
+
+                chain_stdout, chain_stderr, chain_rc = self.run_instar_info(
+                    source, chain=True
+                )
+                self.assertEqual(
+                    0, chain_rc,
+                    f'{image_id}: info --chain must walk a resolvable '
+                    f'chain; stdout={chain_stdout!r} stderr={chain_stderr!r}'
+                )
+                self.assertIn(
+                    'Chain: 3 image(s)', chain_stdout,
+                    f'{image_id}: the fixture is not three images deep, so '
+                    f'this test is not testing what it says; '
+                    f'stdout={chain_stdout!r}'
+                )
+                for ancestor in CHAIN_FIXTURE_ANCESTORS[image_id]:
+                    self.assertIn(
+                        f'-> {ancestor}', chain_stdout,
+                        f'{image_id}: the chain listing does not record '
+                        f'{ancestor} as the parent of the image above it, so '
+                        f'this is not a chain of two differencing images '
+                        f'over a base disk; stdout={chain_stdout!r}'
+                    )
+
+                with tempfile.TemporaryDirectory() as tmp:
+                    out = Path(tmp) / 'composed.raw'
+                    stdout, stderr, rc = self.run_instar_convert(
+                        source, out, output_format='raw'
+                    )
+                    self.assertEqual(
+                        0, rc,
+                        f'{image_id}: convert must compose a chain of three '
+                        f'differencing images; stdout={stdout[:400]!r} '
+                        f'stderr={stderr[:400]!r}'
+                    )
+                    self.assertTrue(
+                        out.exists(),
+                        f'{image_id}: convert exited 0 and wrote nothing'
+                    )
+                    self.assert_bytes_identical(
+                        out, golden, f'{image_id} (depth 3, all differencing)'
                     )
 
 
@@ -4086,6 +4290,18 @@ class TestDifferencingOracleComposes(DifferencingTestBase):
     composing would raise, not agree; the test below asserts the first
     of those directly rather than leaving it as a claim.
 
+    The two chains that are three differencing images deep are here as
+    well, which is the question only a third level can ask: does
+    `set_parent` chain, or does it only stack one image on another?
+    Measured, it chains, to either depth and in either order -- and it
+    still refuses a level that is missing, so the depth-three
+    comparison cannot pass without libvhdi having descended twice.
+    Both chains agree with their golden and with instar on every one
+    of 16777216 bytes, so neither adds an exception to the table
+    below; what they add is a reading of the same bytes by an
+    implementation that shares nothing with the generator or the
+    reader.
+
     **The one pinned exception.** libvhdi decodes a VHD per-block
     sector bitmap with an unmasked shift, so once a higher bit in a
     bitmap byte is set, every later sector that byte covers reads as
@@ -4124,17 +4340,19 @@ class TestDifferencingOracleComposes(DifferencingTestBase):
     def _oracle_composition(self, image_id: str) -> bytes:
         """Compose one real chain with libvhdi; return every byte.
 
-        The child and its parent are read where they sit, not copied.
-        `set_parent` is given the parent explicitly, so nothing here
-        depends on libvhdi resolving the path the child records -- the
-        resolution behaviour is the other oracle class's subject, and
-        keeping it out of this one means a locator defect cannot be
-        mistaken for a composition defect.
+        The child and its ancestors are read where they sit, not
+        copied. Each `set_parent` is given its image explicitly, so
+        nothing here depends on libvhdi resolving the paths the chain
+        records -- the resolution behaviour is the other oracle class's
+        subject, and keeping it out of this one means a locator defect
+        cannot be mistaken for a composition defect.
         """
         child = self.differencing_image(image_id)
-        parent_name = CHAIN_FIXTURE_PARENT[image_id]
-        parent = self.differencing_image(Path(parent_name).stem)
-        return self.compose_with_pyvhdi(child, parent)
+        ancestors = [
+            self.differencing_image(Path(name).stem)
+            for name in CHAIN_FIXTURE_ANCESTORS[image_id]
+        ]
+        return self.compose_with_pyvhdi(child, *ancestors)
 
     def _assert_three_readers_agree(self, image_id: str, golden_id: str) -> None:
         """Compare golden, instar and libvhdi over one chain."""
@@ -4222,8 +4440,15 @@ class TestDifferencingOracleComposes(DifferencingTestBase):
         chain, compared whole. The oracle read is 16 MiB in a single
         call and costs under a tenth of a second, so nothing here
         trades coverage for time.
+
+        The three-deep chains are driven by the same helper as the
+        two-deep ones. Nothing in it is depth-aware: the ancestors come
+        from one table and the comparison is the same, which is what
+        makes "libvhdi agrees at depth three as well" a result rather
+        than a separately-written assertion.
         """
-        for image_id, golden_id, _format_name in COMPOSED_CHAIN_FIXTURES:
+        for image_id, golden_id, _format_name in (COMPOSED_CHAIN_FIXTURES
+                                                  + GRANDCHILD_CHAIN_FIXTURES):
             with self.subTest(image=image_id):
                 self._assert_three_readers_agree(image_id, golden_id)
 
@@ -4265,6 +4490,77 @@ class TestDifferencingOracleComposes(DifferencingTestBase):
                         )
                 finally:
                     handle.close()
+
+    def test_the_oracle_refuses_a_three_deep_chain_given_only_in_part(self):
+        """A grandchild stacked on its nearest ancestor and no further.
+
+        The guard the depth-three half of the comparison above needs.
+        `set_parent` chains, so a harness that attached the middle
+        image and forgot the base disk would leave libvhdi reading a
+        two-image chain, and if that served zeros where the base disk
+        holds data the comparison would be measuring instar against a
+        shorter chain than the one instar read.
+
+        It serves nothing. With the middle image attached and the base
+        disk left off, a read of a base-owned sector fails outright,
+        while a sector the grandchild owns itself still reads -- so the
+        refusal is specific to the sectors that need the missing level
+        rather than a handle that has stopped working. With nothing
+        attached at all, even the grandchild's own sector is refused,
+        which is the two-image property restated one level up.
+        """
+        pyvhdi = self._require_pyvhdi()
+        for image_id, _golden_id, _format_name in GRANDCHILD_CHAIN_FIXTURES:
+            with self.subTest(image=image_id):
+                probes = GRANDCHILD_PROBE_SECTORS[image_id]
+                base_owned = next(sector for sector, owner in probes
+                                  if owner == 'PARENT')
+                own = next(sector for sector, owner in probes
+                           if owner == 'GRAND')
+                nearest = Path(CHAIN_FIXTURE_ANCESTORS[image_id][0]).stem
+
+                handles = [pyvhdi.file()]
+                handles[0].open(str(self.differencing_image(image_id)), 'r')
+                try:
+                    with self.assertRaises(
+                        OSError,
+                        msg=f'{image_id}: libvhdi served sector {own} from a '
+                            f'differencing image with no ancestor attached '
+                            f'at all'
+                    ):
+                        handles[0].read_buffer_at_offset(
+                            self.SECTOR_SIZE, own * self.SECTOR_SIZE
+                        )
+
+                    middle = pyvhdi.file()
+                    handles.append(middle)
+                    middle.open(str(self.differencing_image(nearest)), 'r')
+                    handles[0].set_parent(middle)
+
+                    with self.assertRaises(
+                        OSError,
+                        msg=f'{image_id}: libvhdi served the base-owned '
+                            f'sector {base_owned} from a chain missing its '
+                            f'base disk, so a composition it reports cannot '
+                            f'be trusted to have descended twice'
+                    ):
+                        handles[0].read_buffer_at_offset(
+                            self.SECTOR_SIZE, base_owned * self.SECTOR_SIZE
+                        )
+
+                    pattern = f'GRAND-sector-{own:06d}'.encode()
+                    self.assertTrue(
+                        handles[0].read_buffer_at_offset(
+                            self.SECTOR_SIZE, own * self.SECTOR_SIZE
+                        ).startswith(pattern),
+                        f'{image_id}: libvhdi does not read {pattern!r} from '
+                        f'the grandchild\'s own block with one ancestor '
+                        f'attached, so the refusal above says nothing about '
+                        f'the missing level'
+                    )
+                finally:
+                    for handle in reversed(handles):
+                        handle.close()
 
 
 class TestDifferencingCreatedChildComposes(DifferencingTestBase):

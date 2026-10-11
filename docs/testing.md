@@ -1971,10 +1971,12 @@ Synthetic test images that cannot be created by `qemu-img` are built
 by scripts in `scripts/`:
 
 - `create-vhd-testdata.sh` — Fixed VHD (disk_type=2); differencing
-  VHD (disk_type=4) as a disk_type-only type marker via qemu-img
-  patching; real VHD and VHDX differencing chains (parent, aligned
-  and mixed children, and each chain's intended composed raw image)
-  via Python struct packing against the structure pin in
+  VHD (disk_type=4) and differencing VHDX (HasParent) as type-only
+  markers with no parent reference, via qemu-img patching; real VHD
+  and VHDX differencing chains (parent, aligned and mixed children, a
+  third differencing level over one child per format, and each
+  chain's intended composed raw image) via Python struct packing
+  against the structure pin in
   `docs/plans/PLAN-differencing-phase-01-pin.md`; and six adversarial
   parent-locator VHDs (absolute path, relative traversal, UNC, URL,
   an over-long unterminated parent name, and mutually conflicting
@@ -1985,12 +1987,17 @@ by scripts in `scripts/`:
   in `custom/format-coverage/`. Given one argument the audit
   directory becomes `<output-dir>/audit`, so a scratch run writes
   everything under the directory it was given rather than sending
-  twelve files to the scratch tree and six into the real testdata
-  checkout. Every file it writes is
-  byte-reproducible except the VHDX parent/child pair, where
-  `qemu-img` stamps fresh GUIDs on each run; that pair is therefore
-  skipped when both files already exist, and rebuilding it needs
-  `REGEN_VHDX=1` and a commit of both files together
+  sixteen files to the scratch tree and six into the real testdata
+  checkout. Every file it writes is byte-reproducible except the four
+  VHDX ones, where `qemu-img` stamps fresh GUIDs on each run; each is
+  therefore skipped when it already exists, and rebuilding any of
+  them needs `REGEN_VHDX=1`. The parent, the child and the
+  grandchild must be committed together when they are rebuilt: each
+  of the upper two records the DataWriteGuid of the one below it, so
+  a regenerated parent invalidates both images above it. The
+  generator re-checks both of those links on every run, including the
+  runs that rebuild nothing, so a half-finished regeneration fails
+  there rather than in the test suite
 - `create-vmdk-testdata.sh` — Binary VMDK4 with multi-extent descriptor
 - `create-luks-testdata.sh` — LUKS v1 containers with inner formats
 - `create-native-luks-testdata.py` — LUKS v1/v2 with known encrypted

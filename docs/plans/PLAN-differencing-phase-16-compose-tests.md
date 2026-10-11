@@ -452,7 +452,19 @@ redo this.
   not produced by instar. Falsifiable: `generated_by` in
   `tests/manifest.json` names the generator for each, and a mutation
   that stops the reader descending past the first parent fails the new
-  test.
+  test. **Measured in 16d, where the step was written to allow for the
+  opposite**: libvhdi chains three levels cleanly. `set_parent` is
+  order independent, validates identity at each link, refuses rather
+  than invents when a chain is only partly stacked, and agrees with
+  both new goldens on all 16777216 bytes -- 0 differing sectors, so no
+  fourth pinned exception and no new defect letter. The two mutations
+  that pin the new coverage behave differently and both matter: a
+  reader that stops after one level fails closed (`convert` exits 1),
+  while one that skips the middle level returns rc 0 and 512 wrong
+  bytes at sector 200, which only the golden catches. The grandchild's
+  parent is deliberately the *aligned* child rather than the mixed
+  one, so the one defect already pinned in the tree cannot reach the
+  three-level comparison.
 * `grep -c 'build_vhdx_image\(4096\|build_vhdx_image_blocks(4096'
   src/crates/qcow2/src/lib.rs` is at least 6, and at least one 4K case
   asserts an allocation count or an extent offset rather than a
