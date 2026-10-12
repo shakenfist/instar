@@ -534,6 +534,142 @@ class InstarTestBase(testtools.TestCase):
             'differencing oracle on this host'
         )
 
+    def _require_pyvhdi(self):
+        """Return libvhdi's `pyvhdi` module -- unless CI says not to skip.
+
+        `vhdiinfo` answers questions about a differencing child's
+        *structure*: which parent it names, and under which identity.
+        It cannot say what the chain composes to, because the packaged
+        libvhdi tools hold no exporter -- `vhdiinfo` and `vhdimount`
+        are the only two binaries in `libvhdi-utils`, and a FUSE mount
+        is not something to put in the path of an integration suite.
+        The Python binding can: `pyvhdi.file.set_parent` stacks a
+        parent behind a child so the pair reads as one image, which
+        makes libvhdi an independent reader of composed *content* and
+        not only of metadata.
+
+        The import is inside the method rather than at module scope on
+        purpose. A host without the binding must still be able to
+        collect the test modules that call this; an ImportError at
+        import time would take every test in such a module with it,
+        including the ones that never touch the oracle.
+
+        The module is returned rather than imported again at the call
+        site, so the package name appears in exactly one place and a
+        caller cannot accidentally use the oracle without having
+        passed this gate.
+
+        The binding ships as `python3-libvhdi`, a separate binary
+        package built from the same source as `libvhdi-utils`, and it
+        installs into the distribution's `dist-packages`. A virtual
+        environment only sees it if it was created with
+        `--system-site-packages`, which is why the Makefile's
+        container test targets pass that flag: without it the module
+        is missing inside the venv even on a host where apt installed
+        it, and the message below would send a reader to reinstall a
+        package that is already there.
+
+        The skip-versus-fail bargain, and the variable that decides
+        it, are `_require_vhdiinfo`'s. Sharing them is deliberate --
+        the tools and the binding come from one upstream release and
+        one Debian source package, so an environment that has declared
+        libvhdi mandatory has declared both halves of it mandatory. A
+        second variable would let the content half of the oracle fall
+        silent while the structural half stayed loud, which is the
+        failure mode the variable exists to prevent.
+        """
+        try:
+            import pyvhdi
+        except ImportError as exc:
+            if os.environ.get(self.REQUIRE_LIBVHDI_ENV):
+                self.fail(
+                    f'{self.REQUIRE_LIBVHDI_ENV} is set, so this environment '
+                    f'has declared libvhdi mandatory, but the pyvhdi module '
+                    f'cannot be imported ({exc}). Install python3-libvhdi '
+                    f'(Debian 13 ships 20240509 or newer) and create the test '
+                    f'virtualenv with --system-site-packages so it can see a '
+                    f'distribution package, or unset '
+                    f'{self.REQUIRE_LIBVHDI_ENV}. Skipping here would hide the '
+                    f'only external check of what a differencing chain '
+                    f'composes to.'
+                )
+            self.skipTest(
+                'python3-libvhdi is not installed, so pyvhdi cannot act as '
+                'the composition oracle on this host'
+            )
+        return pyvhdi
+
+    def compose_with_pyvhdi(
+        self, child: Union[str, Path], *ancestors: Union[str, Path]
+    ) -> bytes:
+        """Compose a differencing chain with libvhdi; return every byte of it.
+
+        *child* is a differencing VHD or VHDX and *ancestors* are the
+        images behind it, nearest first: one for an ordinary chain, two
+        where the image the child names is itself differencing. libvhdi
+        will not guess any of them from the child -- a child opened on
+        its own has no parent and every read through it fails -- so the
+        caller supplies the whole chain and this stacks it.
+
+        `set_parent` chains to any depth and in any order; what it will
+        not do is let a level be missing. Measured against a
+        three-image chain: with the middle image attached and the base
+        disk left off, a read of a base-owned sector fails with
+        "missing parent file" while a read of a sector the top of the
+        chain owns still succeeds. So an incompletely stacked chain
+        cannot return a plausible-looking buffer here.
+
+        libvhdi refuses to read a differencing child with no parent set
+        rather than serving zeros for the sectors it does not own, and
+        it checks each parent's identity against the one the image
+        above records, so neither a `set_parent` that silently did
+        nothing nor a mismatched chain can go unnoticed. Between them
+        those two properties are why no further guard is needed here
+        against an oracle that quietly composed nothing.
+
+        The whole media size comes back in one read. That is 16 MiB for
+        the fixtures in this tree and it takes well under a tenth of a
+        second, so there is nothing to gain by reading in windows and a
+        partial read would be a coverage hole rather than an
+        optimisation. The returned length is asserted against the media
+        size for the same reason: a short read that went unnoticed
+        would silently shorten every comparison built on it.
+        """
+        pyvhdi = self._require_pyvhdi()
+        self.assertTrue(
+            ancestors,
+            f'compose_with_pyvhdi was given {child} with no ancestors, and a '
+            f'differencing child read on its own composes nothing'
+        )
+        handles = []
+        try:
+            for image in (child,) + ancestors:
+                handle = pyvhdi.file()
+                handle.open(str(image), 'r')
+                handles.append(handle)
+            for upper, lower in zip(handles, handles[1:]):
+                upper.set_parent(lower)
+            size = handles[0].get_media_size()
+            self.assertGreater(
+                size, 0,
+                f'libvhdi reports a zero media size for {child}, so there '
+                f'is no composition to compare'
+            )
+            data = handles[0].read_buffer_at_offset(size, 0)
+        finally:
+            # Deepest first, and all of them before returning: a read
+            # through an image after its parent is closed fails inside
+            # libvhdi rather than falling back to that image's own
+            # blocks.
+            for handle in reversed(handles):
+                handle.close()
+        self.assertEqual(
+            size, len(data),
+            f'libvhdi returned {len(data)} bytes for {child} where it '
+            f'reports a media size of {size}'
+        )
+        return data
+
     def _run_tool(
         self, argv: List[str], cwd, timeout: int = QEMU_TOOL_TIMEOUT
     ) -> subprocess.CompletedProcess:

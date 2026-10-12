@@ -5457,6 +5457,225 @@ mod tests {
     }
 
     // ====================================================================
+    // Extended-L2 wide I/O path: alloc bit set at host offset zero (#650)
+    // ====================================================================
+    //
+    // An extended-L2 entry can name host offset 0 while the subcluster
+    // allocation bitmap claims a subcluster is allocated. There is no
+    // host cluster to read, so the chunk read is skipped -- and before
+    // the fix the wide path matched no fill arm for such a subcluster
+    // and left the caller's buffer untouched under a `true` return,
+    // handing back whatever the caller had there. The narrow path
+    // already zero-filled it. `fuzz_chain_compose` found this with a
+    // dual-sentinel fill check, which is not a committed regression
+    // test; these two are.
+
+    // Byte size of the in-memory qcow2 image the #650 mock serves.
+    const W650_IMG_LEN: usize = 8192;
+
+    // Serialize tests touching the W650 globals (extern "C" callbacks
+    // can only close over 'static state; mirrors Z432_LOCK above).
+    static W650_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static mut W650_IMG: [u8; W650_IMG_LEN] = [0u8; W650_IMG_LEN];
+    static mut W650_CAP_SECTORS: u64 = 0;
+
+    // 512-byte sectors over 8192-byte clusters put the subcluster at
+    // 8192 / 32 = 256 bytes, so `sector_size > sc_size` and the
+    // StandardSubclusters arm takes the WIDE path. That relationship is
+    // the whole point of the fixture: at the default 64 KiB cluster the
+    // subcluster would be 2048 bytes and the narrow path -- which has
+    // defended this case since I2 -- would run instead.
+    const W650_SSZ: usize = 512;
+    const W650_CLUSTER: u64 = 8192;
+    const W650_SC_SIZE: u64 = W650_CLUSTER / 32;
+
+    // Subcluster 3 is marked allocated with no host cluster behind it:
+    // the malformed subcluster. Subcluster 0 carries a zero bit, which
+    // is what makes `cluster_lookup` resolve an all-zero L2 entry to
+    // StandardSubclusters at all rather than to Unallocated, and so is
+    // load-bearing rather than decoration.
+    const W650_BAD_SC: u32 = 3;
+    const W650_ZERO_SC: u32 = 0;
+    const W650_BITMAP: u64 = (1u64 << (32 + W650_ZERO_SC)) | (1u64 << W650_BAD_SC);
+
+    unsafe extern "C" fn w650_read_sector(
+        _device_idx: u32,
+        sector: u64,
+        out_buf: *mut u8,
+        sector_size: usize,
+    ) -> bool {
+        let start = (sector as usize).saturating_mul(sector_size);
+        if start + sector_size > W650_IMG_LEN {
+            return false;
+        }
+        let base = core::ptr::addr_of!(W650_IMG) as *const u8;
+        core::ptr::copy_nonoverlapping(base.add(start), out_buf, sector_size);
+        true
+    }
+
+    unsafe extern "C" fn w650_capacity(_device_idx: u32) -> u64 {
+        W650_CAP_SECTORS
+    }
+
+    fn w650_call_table() -> shared::CallTable {
+        shared::CallTable {
+            read_input_sector: w650_read_sector,
+            get_input_capacity: w650_capacity,
+            ..stub_call_table()
+        }
+    }
+
+    /// Build the in-memory extended-L2 fixture into `W650_IMG` and set
+    /// the served capacity. Layout (cluster_size = 8192, 16-byte L2
+    /// entries):
+    ///   - L1 table at 512: L1[0] -> L2 table at 1024.
+    ///   - L2 table at 1024: entry[0] host offset field = 0 (@1024),
+    ///     subcluster bitmap = W650_BITMAP (@1032).
+    ///
+    /// Everything outside the two tables is 0xDD, so a mutation that
+    /// dropped the `host_offset != 0` guard and read the chunk from
+    /// file offset zero returns recognisable bytes rather than the
+    /// zeros the fixture asserts.
+    unsafe fn w650_build_image() {
+        let mut img = [0xDDu8; W650_IMG_LEN];
+        let mut put = |off: usize, v: u64| {
+            img[off..off + 8].copy_from_slice(&v.to_be_bytes());
+        };
+        put(512, 1024 | OFLAG_COPIED);
+        put(1024, 0);
+        put(1032, W650_BITMAP);
+        let dst = core::ptr::addr_of_mut!(W650_IMG) as *mut u8;
+        core::ptr::copy_nonoverlapping(img.as_ptr(), dst, W650_IMG_LEN);
+        W650_CAP_SECTORS = (W650_IMG_LEN / W650_SSZ) as u64;
+    }
+
+    /// Construct a `Qcow2State` matching the #650 fixture geometry. The
+    /// caller owns the two cache buffers (each >= MAX_SECTOR_SIZE).
+    fn w650_state(l1_cache: &mut [u8], l2_cache: &mut [u8]) -> Qcow2State {
+        Qcow2State {
+            device_idx: 0,
+            cluster_size: W650_CLUSTER,
+            cluster_bits: 13,
+            l1_size: 1,
+            l1_table_offset: 512,
+            incompatible_features: INCOMPAT_EXTENDED_L2,
+            compression_type: 0,
+            crypt_method: 0,
+            luks_ext_offset: 0,
+            luks_ext_len: 0,
+            extended_l2: true,
+            l1_cached_sector: u64::MAX,
+            l1_cache_buf: l1_cache.as_mut_ptr(),
+            l2_cached_sector: u64::MAX,
+            l2_cache_buf: l2_cache.as_mut_ptr(),
+        }
+    }
+
+    #[test]
+    fn extended_l2_alloc_bit_at_host_zero_is_standard_subclusters() {
+        // Vacuity guard for the chain-read test below: if the lookup
+        // stops resolving this entry to StandardSubclusters(0, bitmap)
+        // then the read never reaches the subcluster fill loop, and a
+        // green chain-read test would prove nothing about either path.
+        let _guard = W650_LOCK.lock().unwrap();
+        unsafe {
+            w650_build_image();
+        }
+        let call_table = w650_call_table();
+        let mut l1_cache = std::vec![0u8; MAX_SECTOR_SIZE];
+        let mut l2_cache = std::vec![0u8; MAX_SECTOR_SIZE];
+        let mut state = w650_state(&mut l1_cache, &mut l2_cache);
+        let cap = (W650_IMG_LEN / W650_SSZ) as u64;
+        let mut bytes_read = 0u64;
+
+        let v = unsafe { state.cluster_lookup(&call_table, 0, W650_SSZ, cap, &mut bytes_read) };
+        assert!(
+            matches!(v, Some(ClusterLookup::StandardSubclusters(0, b)) if b == W650_BITMAP),
+            "an all-zero extended-L2 entry with a zero bit set must resolve to \
+             StandardSubclusters(0, W650_BITMAP); it did not, so the chain-read test \
+             below no longer reaches the subcluster fill loop"
+        );
+
+        // And the geometry really does select the wide path.
+        assert!(
+            W650_SSZ as u64 > W650_SC_SIZE,
+            "fixture must have sector_size > subcluster size to take the wide I/O path"
+        );
+    }
+
+    #[test]
+    fn extended_l2_wide_path_zeroes_an_alloc_bit_at_host_zero() {
+        let _guard = W650_LOCK.lock().unwrap();
+        unsafe {
+            w650_build_image();
+        }
+        let call_table = w650_call_table();
+        let mut l1_cache = std::vec![0u8; MAX_SECTOR_SIZE];
+        let mut l2_cache = std::vec![0u8; MAX_SECTOR_SIZE];
+        let state = w650_state(&mut l1_cache, &mut l2_cache);
+
+        let mut chain_states = ChainStates::default();
+        chain_states.qcow2_states[0] = Some(state);
+
+        let mut chain_config = ChainConfig::single_chain(1);
+        chain_config.devices[0].format = ImageFormat::Qcow2 as u32;
+        chain_config.devices[0].cluster_size = W650_CLUSTER as u32;
+        chain_config.devices[0].data_device_idx = 0;
+
+        let mut compressed_buf = std::vec![0u8; MAX_SECTOR_SIZE];
+        let mut staging_buf = std::vec![0u8; MAX_SECTOR_SIZE];
+        let mut staging_cluster_offset = u64::MAX;
+
+        // Prefill with a sentinel the image cannot produce, so a
+        // subcluster the reader never wrote is distinguishable from one
+        // it deliberately zeroed. This is the dual-sentinel idea from
+        // `fuzz_chain_compose` reduced to a single known fixture.
+        let mut buf = std::vec![0xAAu8; W650_CLUSTER as usize];
+        let mut bytes_read = 0u64;
+        let ok = unsafe {
+            read_chain_virtual_cluster(
+                &call_table,
+                0,
+                1,
+                0,
+                buf.as_mut_ptr(),
+                W650_CLUSTER,
+                W650_SSZ,
+                &chain_config,
+                &mut chain_states,
+                compressed_buf.as_mut_ptr(),
+                staging_buf.as_mut_ptr(),
+                &mut staging_cluster_offset,
+                None,
+                None,
+                0,
+                &mut bytes_read,
+            )
+        };
+        assert!(ok, "read_chain_virtual_cluster returned false");
+
+        // The malformed subcluster first and by name, because it is the
+        // one the fix is about and a whole-buffer assertion alone would
+        // not say which subcluster failed.
+        let bad = (W650_BAD_SC as u64 * W650_SC_SIZE) as usize;
+        let bad_end = bad + W650_SC_SIZE as usize;
+        assert!(
+            buf[bad..bad_end].iter().all(|&b| b == 0),
+            "subcluster {W650_BAD_SC} is marked allocated at host offset 0: it must be \
+             zero-filled, not left as the caller's buffer contents, got {:02x?}",
+            &buf[bad..bad + 16]
+        );
+
+        // Every other subcluster is a zero bit or unallocated at the
+        // bottom of the chain, so the whole cluster reads as zeros.
+        assert!(
+            buf.iter().all(|&b| b == 0),
+            "the whole cluster must read as zeros; first non-zero byte at {}",
+            buf.iter().position(|&b| b != 0).unwrap_or(0)
+        );
+    }
+
+    // ====================================================================
     // VDI chain-reader arm (read_chain_virtual_cluster ImageFormat::Vdi)
     // ====================================================================
     //
@@ -9013,6 +9232,44 @@ mod tests {
         );
     }
 
+    // The same partial-final-group case at 4096-byte logical sectors.
+    // Sixteen payload blocks is still a small fraction of one chunk
+    // group, but block 5's own bitmap bits now start at a different
+    // sector index: 5 * (block_size / logical_sector_size) = 5 * 256 =
+    // 1280, against 5 * 2048 = 10240 at 512-byte sectors. The group's
+    // sector bitmap entry still sits at BAT entry chunk_ratio(4096) =
+    // 32768 regardless, far past this image's seventeen real entries,
+    // so this exercises the same far-past-the-declared-count bitmap
+    // reach as the 512-byte case above, at the sector size that
+    // changes the stride.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_arm_mixed_block_in_a_partial_chunk_group_at_4k_sectors() {
+        let child_sectors = [1281u32..1284, 1289..1294, 1350..1373];
+        let blocks = [(5, VhdxBlockState::PartiallyPresent)];
+        let bitmaps = [VhdxGroupBitmap {
+            group: 0,
+            state: vhdx::SB_BLOCK_PRESENT,
+            child_sectors: &child_sectors,
+        }];
+        let fixture = build_vhdx_image_blocks(4096, true, 16, &blocks, &bitmaps);
+        let payload = fixture.block_offsets[0];
+        let devices = vhdx_chain_with_parent(fixture.bytes, 16 * 1024 * 1024);
+        let offset = 5 * u64::from(VHDX_FIX_BLOCK_SIZE);
+        let (ok, out) = run_vhdx_chain_read(&devices, 512, offset, VHDX_CHUNK);
+        assert!(
+            ok,
+            "a mixed chunk in a disk shorter than one chunk group must read at 4096-byte \
+             sectors too"
+        );
+        assert_eq!(
+            out,
+            vhdx_expected(offset, VHDX_CHUNK, payload, 4096, &child_sectors),
+            "a partial final chunk group's sector bitmap must still be reachable at this \
+             sector size too, so each sector comes from the device its bit names"
+        );
+    }
+
     // The same mixed case on an image whose logical sectors are 4096
     // bytes, read through a device whose sectors are 512. The bitmap's
     // granule is the image's logical sector and not the device's, so
@@ -9155,6 +9412,42 @@ mod tests {
             vhdx_expected(group_bytes, VHDX_CHUNK, payload, 512, &child_sectors),
             "a chunk group's sector bitmap entry must be found at the group's \
              own stride through the BAT"
+        );
+    }
+
+    // The same second-chunk-group case at 4096-byte logical sectors.
+    // chunk_ratio(4096) is 32768 against 4096 at 512-byte sectors, so
+    // the group's own sector bitmap entry sits eight times further
+    // into the BAT and the block this test reads sits 32 GiB rather
+    // than 4 GiB into the virtual disk -- still far enough that no
+    // mock backing device reaches it, so the chunk is wholly the
+    // child's.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_arm_block_in_the_second_chunk_group_finds_its_own_bitmap_at_4k_sectors() {
+        let child_sectors = [0u32..128];
+        let chunk_ratio = vhdx_chunk_ratio(4096);
+        let blocks = [(chunk_ratio, VhdxBlockState::PartiallyPresent)];
+        let bitmaps = [VhdxGroupBitmap {
+            group: 1,
+            state: vhdx::SB_BLOCK_PRESENT,
+            child_sectors: &child_sectors,
+        }];
+        let fixture = build_vhdx_image(4096, true, 2, &blocks, &bitmaps);
+        let payload = fixture.block_offsets[0];
+        let devices = vhdx_chain_alone(fixture.bytes);
+        let group_bytes = chunk_ratio * u64::from(VHDX_FIX_BLOCK_SIZE);
+        let (ok, out) = run_vhdx_chain_read(&devices, 512, group_bytes, VHDX_CHUNK);
+        assert!(
+            ok,
+            "a block in the second chunk group must find its sector bitmap at 4096-byte \
+             sectors too"
+        );
+        assert_eq!(
+            out,
+            vhdx_expected(group_bytes, VHDX_CHUNK, payload, 4096, &child_sectors),
+            "a chunk group's sector bitmap entry must be found at the group's own stride \
+             through the BAT at this sector size too"
         );
     }
 
@@ -10456,6 +10749,48 @@ mod tests {
         );
     }
 
+    // The same second-chunk-group refusal at 4096-byte logical
+    // sectors. chunk_ratio(4096) is 32768, so the malformed entry
+    // sits at global BAT index 32769 rather than 4097 -- the walk has
+    // to skip eight times as many payload slots to get there, and a
+    // bound computed from the cached sector rather than the entry
+    // would be exercised differently at this stride.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_map_and_measure_refuse_a_block_in_the_second_chunk_group_at_4k_sectors() {
+        let chunk_ratio = vhdx_chunk_ratio(4096);
+        let payload_index = chunk_ratio;
+        let blocks = [(payload_index, VhdxBlockState::FullyPresent)];
+        let fixture = build_vhdx_image(4096, false, 2, &blocks, &[]);
+        let bytes = vhdx_repoint_payload_block(
+            fixture.bytes,
+            4096,
+            payload_index,
+            VHDX_FIX_METADATA_OFFSET,
+        );
+        let walks = run_vhdx_bat_walks(&bytes, 4096);
+        assert!(
+            walks.extents.is_none(),
+            "map must refuse a malformed block in the second chunk group at 4096-byte \
+             sectors, which it can only find by skipping the first group's sector-bitmap \
+             entry: {:?}",
+            walks.extents.as_ref().map(|e| e.len())
+        );
+        assert!(
+            walks.map_block_table_malformed,
+            "the map walk must record WHY it refused a second-group block at 4096-byte sectors"
+        );
+        assert!(
+            walks.summary.is_none(),
+            "measure must refuse the same block at 4096-byte sectors: {:?}",
+            walks.summary.as_ref().map(|s| s.allocated_bytes)
+        );
+        assert!(
+            walks.scan_block_table_malformed,
+            "the scan walk must record WHY it refused a second-group block at 4096-byte sectors"
+        );
+    }
+
     // The group arithmetic itself: one present block in each chunk
     // group, counted.
     //
@@ -10528,6 +10863,130 @@ mod tests {
              payload index gives it"
         );
     }
+
+    // The same group arithmetic at 4096-byte logical sectors: one
+    // present block in each of a two-group image's groups, counted
+    // and located. chunk_ratio(4096) is 32768, so the last payload
+    // index here is 65535 -- global BAT entry 65536, past two
+    // sector-bitmap slots -- which a walk that miscounted the
+    // interleaved slots at this stride would still never reach, for
+    // the same reason the 512-byte case above never reaches entry
+    // 8192 under that mutation.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_scan_counts_a_block_in_each_chunk_group_at_4k_sectors() {
+        let chunk_ratio = vhdx_chunk_ratio(4096);
+        let last = chunk_ratio * 2 - 1;
+        let blocks = [
+            (0, VhdxBlockState::FullyPresent),
+            (last, VhdxBlockState::FullyPresent),
+        ];
+        let fixture = build_vhdx_image(4096, false, 2, &blocks, &[]);
+        let walks = run_vhdx_bat_walks(&fixture.bytes, 4096);
+        assert!(
+            !walks.scan_block_table_malformed,
+            "nothing about this image is malformed"
+        );
+        let summary = walks.summary.expect(
+            "a well-formed two-group image must not refuse the scan walk at 4096-byte sectors",
+        );
+        assert_eq!(
+            summary.allocated_bytes,
+            2 * u64::from(VHDX_FIX_BLOCK_SIZE),
+            "both present blocks must be counted at 4096-byte sectors too; a walk that \
+             treats the interleaved sector-bitmap slots as payload entries stops before \
+             the last payload index and reports one"
+        );
+
+        let extents = walks.extents.expect(
+            "a well-formed two-group image must not refuse the map walk at 4096-byte sectors",
+        );
+        let data: std::vec::Vec<(u64, u64)> = extents
+            .iter()
+            .filter(|e| matches!(e.state, MapExtentState::Data { .. }))
+            .map(|e| (e.start, e.length))
+            .collect();
+        assert_eq!(
+            data,
+            std::vec![
+                (0, u64::from(VHDX_FIX_BLOCK_SIZE)),
+                (
+                    last * u64::from(VHDX_FIX_BLOCK_SIZE),
+                    u64::from(VHDX_FIX_BLOCK_SIZE)
+                ),
+            ],
+            "each present block must be reported at the virtual offset its payload index \
+             gives it, at 4096-byte sectors too"
+        );
+    }
+
+    // A partial final chunk group at 4096-byte logical sectors: the
+    // virtual disk stops sixteen payload blocks into the second group
+    // rather than filling it, so the group this walk reaches is not a
+    // whole chunk_ratio of payload entries. One present block in each
+    // of the two groups, counted and located exactly as the
+    // whole-group case above -- this is the shape
+    // `build_vhdx_image_blocks` exists for, rather than
+    // `build_vhdx_image`'s whole-group count, and nothing above
+    // exercises a group the virtual disk does not fill.
+    #[cfg(feature = "vhdx-input")]
+    #[test]
+    fn vhdx_scan_counts_a_partial_final_chunk_group_at_4k_sectors() {
+        let chunk_ratio = vhdx_chunk_ratio(4096);
+        let last = chunk_ratio + 15;
+        let blocks = [
+            (0, VhdxBlockState::FullyPresent),
+            (last, VhdxBlockState::FullyPresent),
+        ];
+        let fixture = build_vhdx_image_blocks(4096, false, chunk_ratio + 16, &blocks, &[]);
+        let walks = run_vhdx_bat_walks(&fixture.bytes, 4096);
+        assert!(
+            !walks.scan_block_table_malformed,
+            "nothing about this image is malformed"
+        );
+        let summary = walks
+            .summary
+            .expect("a well-formed partial-final-group image must not refuse the scan walk");
+        assert_eq!(
+            summary.allocated_bytes,
+            2 * u64::from(VHDX_FIX_BLOCK_SIZE),
+            "both present blocks must be counted even though the virtual disk stops part \
+             way through the second group"
+        );
+
+        let extents = walks
+            .extents
+            .expect("a well-formed partial-final-group image must not refuse the map walk");
+        let data: std::vec::Vec<(u64, u64)> = extents
+            .iter()
+            .filter(|e| matches!(e.state, MapExtentState::Data { .. }))
+            .map(|e| (e.start, e.length))
+            .collect();
+        assert_eq!(
+            data,
+            std::vec![
+                (0, u64::from(VHDX_FIX_BLOCK_SIZE)),
+                (
+                    last * u64::from(VHDX_FIX_BLOCK_SIZE),
+                    u64::from(VHDX_FIX_BLOCK_SIZE)
+                ),
+            ],
+            "each present block must be reported at the virtual offset its payload index \
+             gives it, even in a group the virtual disk does not fill"
+        );
+    }
+
+    // The differencing variant of the case above does not exist: read
+    // against `VhdxState::init`, `total_bat_entries` -- the field
+    // `scan_allocation` and `map_extents` size their walk bounds from
+    // -- is computed as `total_blocks + sb_entries` unconditionally,
+    // with no `has_parent` branch at all. `has_parent` only changes
+    // `sb_bat_entry_bound`, which only `sector_bitmap_lookup` reads --
+    // exercised by the block_lookup/sector_bitmap_lookup cases above,
+    // which are differencing fixtures for exactly that reason. A
+    // `has_parent = true` copy of the case above would build a
+    // differently-flagged fixture that walks identically, which is a
+    // redundant test rather than a new one.
 
     // The same refusal on a 4K-logical-sector image.
     //
@@ -13066,6 +13525,16 @@ pub unsafe fn read_chain_virtual_cluster(
                                             sc_size as usize,
                                         );
                                     }
+                                } else if host_offset == 0 {
+                                    // Alloc set while the L2 entry names
+                                    // offset zero: malformed, and the chunk
+                                    // read above was skipped for exactly
+                                    // that reason, so nothing has written
+                                    // this subcluster.  Zero-fill rather
+                                    // than report success over whatever the
+                                    // caller's buffer already held.  The
+                                    // narrow path defends the same case.
+                                    core::ptr::write_bytes(buf.add(buf_off), 0, sc_size as usize);
                                 }
                                 // Allocated subclusters: already read above
                             }

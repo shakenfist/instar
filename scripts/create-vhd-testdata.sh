@@ -20,10 +20,15 @@
 #   diff -r --brief scratch/audit ../instar-testdata/custom/audit
 #
 # Creates:
-#   vhd-fixed.vhd         - 10 MiB fixed VHD (disk_type=2)
-#   vhd-differencing.vhd  - Differencing VHD (disk_type=4), a type marker with
-#                           no parent: qemu-img cannot create a differencing
-#                           VHD, so a dynamic one is patched
+#   vhd-fixed.vhd           - 10 MiB fixed VHD (disk_type=2)
+#   vhd-differencing.vhd    - Differencing VHD (disk_type=4), a type marker
+#                             with no parent: qemu-img cannot create a
+#                             differencing VHD, so a dynamic one is patched
+#   vhdx-differencing.vhdx  - Differencing VHDX (HasParent set), the VHDX
+#                             analogue: qemu-img cannot create a
+#                             differencing VHDX either, so a dynamic one is
+#                             patched the same way, with no parent locator
+#                             item added
 #
 # and three real differencing chains, each with the raw image it is intended
 # to compose to:
@@ -39,6 +44,21 @@
 #   vhdx-diff-child.vhdx           - differencing child exercising all three
 #                                    payload block states
 #   vhdx-diff-composed.raw         - the composition of those two
+#
+# and a third differencing level on one chain per format, so that a reader
+# has to descend twice through images that both leave sectors to a parent:
+#
+#   vhd-diff-grandchild.vhd              - differencing child of
+#                                          vhd-diff-child-aligned.vhd
+#   vhd-diff-grandchild-composed.raw     - the composition of all three
+#   vhdx-diff-grandchild.vhdx            - differencing child of
+#                                          vhdx-diff-child.vhdx
+#   vhdx-diff-grandchild-composed.raw    - the composition of all three
+#
+# The VHD grandchild sits on the ALIGNED child rather than the mixed one:
+# the mixed child shares a sector bitmap byte between owners on purpose, and
+# a third level over it would make every divergence a question about
+# libvhdi's bitmap decoder rather than about the reader under test.
 #
 # and six adversarial parent-locator fixtures, written to the AUDIT
 # directory, each a well-formed differencing VHD that differs from
@@ -61,12 +81,21 @@
 # sibling because there is no correct composition for a hostile parent
 # reference.
 #
-# Reproducibility: every file here is byte-reproducible except the two VHDX
+# Reproducibility: every file here is byte-reproducible except four VHDX
 # files, where qemu-img generates fresh header, log and virtual-disk-id GUIDs
-# that this script does not rewrite. The two VHDX files must therefore be
-# regenerated and shipped as a pair: the child parent_linkage value binds to
-# the parent DataWriteGuid, so a child paired with a differently generated
-# parent will not resolve.
+# that this script does not rewrite. Two of them, the real parent/child pair,
+# must therefore be regenerated and shipped together: the child
+# parent_linkage value binds to the parent DataWriteGuid, so a child paired
+# with a differently generated parent will not resolve. The third,
+# vhdx-diff-grandchild.vhdx, binds the same way to the child's
+# DataWriteGuid and so must be shipped with the pair as well -- but it gets
+# its own guard rather than riding along with the pair's, because it binds
+# to the child as that file sits on disk and so can be built correctly
+# against a pair that is already committed. The fourth,
+# vhdx-differencing.vhdx, is not paired with anything -- it carries no
+# parent_linkage at all -- but it is still a fresh qemu-img product each run,
+# so it gets its own independent skip-if-exists guard below rather than
+# riding along with the pair's.
 #
 # That includes vhd-differencing.vhd, the one VHD here qemu-img creates, and
 # it holds across qemu versions rather than only within one. A VHD footer does
@@ -81,7 +110,20 @@
 # when both files already exist, so a run made to prove the VHD half is
 # idempotent does not replace 24 MiB of committed LFS objects with
 # functionally identical but byte-different ones. Pass REGEN_VHDX=1 to
-# regenerate them, and commit both files when you do.
+# regenerate them, and commit both files when you do -- together with
+# vhdx-diff-grandchild.vhdx, whose parent_linkage binds to the child
+# this regenerates.
+#
+# vhdx-differencing.vhdx is opt in the same way and under the same
+# REGEN_VHDX switch, but independently: it is skipped when it already
+# exists regardless of whether the pair above was just regenerated, and
+# regenerating it never touches the pair's files.
+#
+# vhdx-diff-grandchild.vhdx is opt in and independently guarded too, but it
+# is not independent of the pair's contents: a REGEN_VHDX run rebuilds the
+# pair and then rebinds the grandchild to the new child, and every run --
+# including the ones that rebuild nothing -- re-checks both identity links
+# and fails if they no longer agree.
 #
 # Shape: these chains are deliberately qemu-shaped, not Hyper-V-shaped. The
 # creator application is 'qem2' (see vhd_footer below for why that is load
@@ -98,7 +140,7 @@ set -euo pipefail
 
 # The audit directory defaults WITH the output directory, not independently
 # of it.  A one-argument run is the scratch dry-run the reproducibility check
-# prescribes, and it must not send the twelve format-coverage files to the
+# prescribes, and it must not send the sixteen format-coverage files to the
 # scratch tree while still writing the six adversarial ones into the real
 # testdata checkout: the moment a constant in VHD_ADVERSARIAL_FIXTURES
 # changes, that would rewrite six committed LFS objects from a run nobody
@@ -418,6 +460,38 @@ VHD_PARENT_SECTORS = [0, 1, 2, 8, 100, 4096, 5000, 28672, 32767]
 VHD_CHILD_SECTORS_ALIGNED = [8, 200, 8192, 9000]
 VHD_CHILD_SECTORS_MIXED = [1, 3, 200, 8192, 9000]
 
+# A third level on top of the aligned child, so that one VHD chain here is
+# three differencing images deep.  Its parent is the ALIGNED child and not
+# the mixed one for the reason the paragraph above gives: the mixed child
+# shares a bitmap byte between owners on purpose, so a third level stacked
+# on it would turn every divergence into a question about libvhdi's decoder
+# rather than about the reader under test.
+#
+# Ownership is spread over all three levels, so a reader that stops
+# descending produces visibly wrong bytes rather than the right ones by
+# luck.  The grandchild read alone loses every CHILD and PARENT sector; read
+# over the child and no further it still loses every PARENT one.
+#
+# Every sector the grandchild claims sits in a bitmap byte in which no
+# ancestor owns a different sector, so defect A cannot mask a divergence at
+# this level either.  The byte covering a sector is (sector % 4096) // 8
+# within its own block:
+#
+#   8      block 0, byte 1    covers 8..15        every level owns this one,
+#                                                 and the top must win
+#   100    block 0, byte 12   covers 96..103      the grandparent owns it and
+#                                                 the child leaves it alone
+#   4200   block 1, byte 13   covers 4200..4207   a block the child never
+#                                                 allocated
+#   16384  block 4, byte 0    covers 16384..16391 a block no ancestor
+#                                                 allocated at all
+#   30000  block 7, byte 166  covers 30000..30007 the grandparent's last
+#                                                 block
+#
+# No ancestor owns any other sector in those five ranges.  Rather than trust
+# that, verify_vhd_grandchild re-derives it from the three files on disk.
+VHD_GRANDCHILD_SECTORS = [8, 100, 4200, 16384, 30000]
+
 # VHDX: 1 MiB blocks, so block b covers sectors [b * 2048, (b + 1) * 2048).
 #   block 0  PAYLOAD_BLOCK_PARTIALLY_PRESENT + a real sector bitmap block
 #   block 3  PAYLOAD_BLOCK_FULLY_PRESENT     (shadows the parent completely)
@@ -427,12 +501,25 @@ VHDX_CHILD_SECTORS = [1, 5, 6144, 6200]
 VHDX_CHILD_BLOCKS_PARTIAL = [0]
 VHDX_CHILD_BLOCKS_FULL = [3]
 
+# The VHDX third level, the analogue of VHD_GRANDCHILD_SECTORS above.
+#   block 0  PARTIALLY_PRESENT claiming 5 and 100.  Sector 0 still comes
+#            from the grandparent and sector 1 from the child, so resolving
+#            this one block takes two descents.
+#   block 5  FULLY_PRESENT, which shadows the grandparent's sector 10240 to
+#            zero the way the child's block 3 shadows sector 7000.
+#   others   NOT_PRESENT, so blocks 1, 3 and 15 are resolved below: 3 by the
+#            child and 1 and 15 by the grandparent.
+VHDX_GRANDCHILD_SECTORS = [5, 100, 10300]
+VHDX_GRANDCHILD_BLOCKS_PARTIAL = [0]
+VHDX_GRANDCHILD_BLOCKS_FULL = [5]
+
 # Synthetic identifiers, so that the fixtures are reproducible and obviously
 # not a real disk.  The VHD parent unique id is what a child repeats at
 # absolute offset 552 and what libvhdi enforces when a parent is attached.
 VHD_PARENT_UID = uuid.UUID("11111111-2222-3333-4444-555555555555").bytes
 VHD_CHILD_ALIGNED_UID = uuid.UUID("66666666-7777-8888-9999-aaaaaaaaaaaa").bytes
 VHD_CHILD_MIXED_UID = uuid.UUID("bbbbbbbb-cccc-dddd-eeee-ffffffffffff").bytes
+VHD_GRANDCHILD_UID = uuid.UUID("99999999-aaaa-bbbb-cccc-dddddddddddd").bytes
 
 # The locator paths are fabricated and reference nothing on any real
 # filesystem.  The parent unicode name carries the relative path a resolver
@@ -441,6 +528,14 @@ VHD_CHILD_MIXED_UID = uuid.UUID("bbbbbbbb-cccc-dddd-eeee-ffffffffffff").bytes
 VHD_PARENT_BASENAME = "vhd-diff-parent.vhd"
 VHDX_PARENT_RELATIVE = ".\\vhdx-diff-parent.vhdx"
 VHDX_PARENT_ABSOLUTE = "C:\\instar-testdata\\vhdx-diff-parent.vhdx"
+
+# What the grandchild of each chain names as its parent: the differencing
+# child, not the base disk.  A reader that followed these to the bottom in
+# one step would skip the middle of the chain, which is the whole point of
+# the fixtures they describe.
+VHD_CHILD_ALIGNED_BASENAME = "vhd-diff-child-aligned.vhd"
+VHDX_CHILD_RELATIVE = ".\\vhdx-diff-child.vhdx"
+VHDX_CHILD_ABSOLUTE = "C:\\instar-testdata\\vhdx-diff-child.vhdx"
 
 # Two entries on purpose, which is what Hyper-V writes.  instar's own emitter
 # is specified to write exactly ONE entry, whichever platform code describes
@@ -453,6 +548,12 @@ VHDX_PARENT_ABSOLUTE = "C:\\instar-testdata\\vhdx-diff-parent.vhdx"
 VHD_HAPPY_LOCATORS = [
     (b"W2ru", ".\\vhd-diff-parent.vhd"),
     (b"W2ku", "C:\\instar-testdata\\vhd-diff-parent.vhd"),
+]
+
+# The same two flavours again, naming the aligned child.
+VHD_GRANDCHILD_LOCATORS = [
+    (b"W2ru", ".\\vhd-diff-child-aligned.vhd"),
+    (b"W2ku", "C:\\instar-testdata\\vhd-diff-child-aligned.vhd"),
 ]
 
 # --- adversarial parent locator fixtures ------------------------------------
@@ -743,8 +844,15 @@ def write_dynamic_vhd(path, content, unique_id, timestamp):
 
 
 def write_differencing_vhd(path, child_sectors, size, unique_id, timestamp,
-                           parent_uid, parent_name, locators):
+                           parent_uid, parent_name, locators, tag="CHILD"):
     """A differencing VHD whose sector bitmaps claim only child_sectors.
+
+    tag names this level in the sectors it writes, so a composition says
+    which file each of its sectors came from.  It is a parameter rather
+    than a constant because one chain here is three differencing levels
+    deep, and a grandchild stamped CHILD like its own parent would make
+    the composition unattributable at exactly the sectors the third level
+    exists to own.
 
     locators is a sequence of at most eight (platform_code, path) pairs.  Each
     gets one 512 byte sector of platform data, encoded according to its
@@ -790,7 +898,7 @@ def write_differencing_vhd(path, child_sectors, size, unique_id, timestamp,
         first = b * VHD_SECTORS_PER_BLOCK
         for n in touched[b]:
             i = n - first
-            payload[i * SECTOR:(i + 1) * SECTOR] = marker("CHILD", n)
+            payload[i * SECTOR:(i + 1) * SECTOR] = marker(tag, n)
         bat[b] = cursor // SECTOR
         blocks.append((cursor,
                        vhd_sector_bitmap(touched[b], b) + bytes(payload)))
@@ -821,12 +929,198 @@ def write_differencing_vhd(path, child_sectors, size, unique_id, timestamp,
         fh.write(footer)
 
 
+def vhd_chain_composition(levels, size=IMAGE_SIZE):
+    """The raw image a correct reader must produce for a whole VHD chain.
+
+    levels runs from the base disk upwards, each a (tag, sectors) pair.
+    A VHD differencing child serves exactly the sectors its own bitmaps
+    claim and leaves every other sector to its parent whatever its block
+    allocation table says, so overlaying each level's sectors in turn is
+    the entire composition rule: VHD has no fully-present block state to
+    shadow an ancestor's data with zeros the way VHDX does.
+    """
+    data = bytearray(size)
+    for tag, sectors in levels:
+        for n in sectors:
+            data[n * SECTOR:(n + 1) * SECTOR] = marker(tag, n)
+    return bytes(data)
+
+
 def vhd_composition(parent_sectors, child_sectors, size=IMAGE_SIZE):
     """The raw image a correct reader must produce for parent + child."""
-    data = bytearray(build_raw(parent_sectors, "PARENT", size))
-    for n in child_sectors:
-        data[n * SECTOR:(n + 1) * SECTOR] = marker("CHILD", n)
-    return bytes(data)
+    return vhd_chain_composition(
+        [("PARENT", parent_sectors), ("CHILD", child_sectors)], size)
+
+
+def vhd_read_shape(path):
+    """Read a VHD back and describe the chain level it implements.
+
+    The VHD counterpart of vhdx_read_shape further down: the disk type,
+    the block size, the parent identity and name a differencing child
+    records, the sectors its per-block bitmaps claim for itself, and the
+    sectors whose payload bytes are non-zero.  A dynamic VHD has every
+    bitmap byte set to 0xff, so for one of those "claimed" is every
+    sector of every allocated block and "written" is the set worth
+    looking at; for a differencing VHD the two agree.
+    """
+    with open(path, "rb") as fh:
+        data = fh.read()
+    footer = len(data) - SECTOR
+    assert data[footer:footer + 8] == b"conectix", "%s: no VHD footer" % path
+    (disk_type,) = struct.unpack_from(">I", data, footer + 60)
+    (header_offset,) = struct.unpack_from(">Q", data, footer + 16)
+    assert data[header_offset:header_offset + 8] == b"cxsparse", (
+        "%s: footer data offset does not name a dynamic header" % path)
+    table_offset, _version, max_entries, block_size = struct.unpack_from(
+        ">QIII", data, header_offset + 16)
+    parent_uid = bytes(data[header_offset + 40:header_offset + 56])
+    parent_name = data[
+        header_offset + 64:header_offset + 576].decode("utf-16-be").rstrip(
+            "\x00")
+
+    spb = block_size // SECTOR
+    bitmap_bytes = ((spb // 8 + SECTOR - 1) // SECTOR) * SECTOR
+    bat = struct.unpack_from(">%dI" % max_entries, data, table_offset)
+
+    allocated = []
+    claimed = []
+    written = []
+    for b, entry in enumerate(bat):
+        if entry == 0xFFFFFFFF:
+            continue
+        allocated.append(b)
+        base = entry * SECTOR
+        bitmap = data[base:base + bitmap_bytes]
+        payload = base + bitmap_bytes
+        for i in range(spb):
+            n = b * spb + i
+            if bitmap[i // 8] >> (7 - i % 8) & 1:
+                claimed.append(n)
+            off = payload + i * SECTOR
+            if any(data[off:off + SECTOR]):
+                written.append(n)
+
+    return {
+        "disk_type": disk_type,
+        "block_size": block_size,
+        "parent_uid": parent_uid,
+        "parent_name": parent_name,
+        "allocated": allocated,
+        "claimed": claimed,
+        "written": written,
+    }
+
+
+def vhd_bitmap_byte_conflicts(claimed, ancestors_own,
+                              block_size=VHD_BLOCK_SIZE):
+    """Sectors at which a defective bitmap decoder could hide a divergence.
+
+    libvhdi decodes a VHD per-block sector bitmap with an unmasked shift
+    (defect A), so once a bit is set in a bitmap byte the sectors that
+    byte covers after it read as present in this file too.  Where this
+    file is the only owner anywhere in the byte that is invisible: the
+    sectors it wrongly claims are zero here and unowned below, which is
+    what the composition says anyway.  Where an ancestor owns one of
+    them, the defect serves zeros in place of the ancestor's data, and a
+    fixture built that way measures libvhdi's decoder rather than the
+    reader under test.
+
+    Returns every ancestor-owned sector sharing a bitmap byte with a
+    sector this level claims and not claimed by this level itself.  The
+    position within the byte is deliberately not considered: a fixture
+    wants the property to hold outright, not to hold as long as the
+    defect keeps its current direction.
+    """
+    spb = block_size // SECTOR
+    # A bitmap belongs to one block, so sector // 8 only names a bitmap
+    # byte while no byte straddles a block boundary.
+    assert spb % 8 == 0, "a %d sector block splits a bitmap byte" % spb
+    claimed = set(claimed)
+    busy = {n // 8 for n in claimed}
+    return sorted(n for n in set(ancestors_own) - claimed if n // 8 in busy)
+
+
+def verify_vhd_grandchild(grandchild_path, child_path, parent_path):
+    """Check the committed VHD chain really is three differencing levels.
+
+    Read back out of the three files rather than trusted from the write
+    steps, for the reason vhdx_verify_shipped_pair gives below: the
+    composed .raw beside them is derived from the constants in this
+    script and the images are not, so something has to compare the two.
+
+    Four things are checked that a composed .raw cannot be:
+
+      * the identity chain.  The grandchild records the child's unique
+        id and the child records the parent's.  A reader validates each
+        link separately, so the composition is only defined if both
+        hold, and this is the only place the two are checked together.
+      * the parent names, which are what a resolver follows.  A
+        grandchild naming the base disk would collapse the chain to two
+        levels and still compose to something.
+      * the ownership spread.  Each level must own a sector that
+        survives into the composition, or a reader that stopped
+        descending early would produce the right bytes anyway and the
+        fixture would prove nothing.
+      * the bitmap byte separation, at both differencing levels.
+    """
+    grandchild = vhd_read_shape(grandchild_path)
+    child = vhd_read_shape(child_path)
+    parent = vhd_read_shape(parent_path)
+
+    def check(what, measured, expected):
+        if measured != expected:
+            raise SystemExit(
+                "The committed VHD chain no longer matches the constants in "
+                "this script: %s is %r on disk, %r here." % (
+                    what, measured, expected))
+
+    check("the grandchild's disk type", grandchild["disk_type"],
+          VHD_DISK_TYPE_DIFFERENCING)
+    check("the child's disk type", child["disk_type"],
+          VHD_DISK_TYPE_DIFFERENCING)
+    check("the parent's disk type", parent["disk_type"],
+          VHD_DISK_TYPE_DYNAMIC)
+
+    check("the grandchild's parent identity", grandchild["parent_uid"],
+          VHD_CHILD_ALIGNED_UID)
+    check("the child's parent identity", child["parent_uid"], VHD_PARENT_UID)
+    check("the grandchild's parent name", grandchild["parent_name"],
+          VHD_CHILD_ALIGNED_BASENAME)
+    check("the child's parent name", child["parent_name"],
+          VHD_PARENT_BASENAME)
+
+    check("the sectors the grandchild claims", grandchild["claimed"],
+          sorted(VHD_GRANDCHILD_SECTORS))
+    check("the sectors the child claims", child["claimed"],
+          sorted(VHD_CHILD_SECTORS_ALIGNED))
+    check("the sectors the parent wrote", parent["written"],
+          sorted(VHD_PARENT_SECTORS))
+
+    levels = (("PARENT", VHD_PARENT_SECTORS),
+              ("CHILD", VHD_CHILD_SECTORS_ALIGNED),
+              ("GRAND", VHD_GRANDCHILD_SECTORS))
+    composed = vhd_chain_composition(levels)
+    for tag, sectors in levels:
+        if not any(composed[n * SECTOR:(n + 1) * SECTOR] == marker(tag, n)
+                   for n in sectors):
+            raise SystemExit(
+                "%s owns no sector that survives into the composition of "
+                "the three level VHD chain, so a reader that stopped "
+                "descending early would produce the right bytes anyway"
+                % tag)
+
+    for upper, upper_claimed, lower_owned in (
+            ("grandchild", grandchild["claimed"],
+             set(child["claimed"]) | set(parent["written"])),
+            ("child", child["claimed"], set(parent["written"]))):
+        conflicts = vhd_bitmap_byte_conflicts(upper_claimed, lower_owned)
+        if conflicts:
+            raise SystemExit(
+                "The %s shares a sector bitmap byte with sector(s) %r that "
+                "an ancestor owns, so libvhdi's unmasked shift would serve "
+                "zeros there and the oracle would disagree with this chain "
+                "for its own reasons rather than the reader's."
+                % (upper, conflicts))
 
 
 # --- VHDX -------------------------------------------------------------------
@@ -963,12 +1257,66 @@ def vhdx_parent_locator_item(parent_data_write_guid, relative_path,
     return bytes(header) + bytes(entries) + bytes(blob)
 
 
+def vhdx_parent_locator_values(path):
+    """The key/value pairs of a VHDX's parent locator metadata item.
+
+    The reader for what vhdx_parent_locator_item writes, and the only
+    way to check a committed child against the parent it is shipped
+    with: parent_linkage carries the parent's DataWriteGuid, which
+    qemu-img stamps afresh on every create, so a child and a parent
+    generated in different runs do not resolve even though both files
+    are individually well formed.
+
+    Returns None where the file carries no parent locator item at all,
+    which is what the parentless marker fixture looks like.
+    """
+    with open(path, "rb") as fh:
+        data = fh.read()
+    regions = vhdx_regions(data)
+    meta_off, _meta_len = regions[REGION_METADATA]
+    _count, items = vhdx_metadata_items(data, meta_off)
+    found = [it for it in items if it[0] == META_PARENT_LOCATOR]
+    if not found:
+        return None
+    _guid, ioff, _ilen, _flags, _eo = found[0]
+    base = meta_off + ioff
+    locator_type = uuid.UUID(bytes_le=bytes(data[base:base + 16]))
+    assert locator_type == PARENT_LOCATOR_TYPE, (
+        "%s: unknown parent locator type %s" % (path, locator_type))
+    (pairs,) = struct.unpack_from("<H", data, base + 18)
+    values = {}
+    for i in range(pairs):
+        koff, voff, klen, vlen = struct.unpack_from(
+            "<IIHH", data, base + 20 + i * 12)
+        key = bytes(data[base + koff:base + koff + klen])
+        value = bytes(data[base + voff:base + voff + vlen])
+        values[key.decode("utf-16-le")] = value.decode("utf-16-le")
+    return values
+
+
 def vhdx_sector_bitmap_block(sector_numbers):
     """A 1 MiB VHDX sector bitmap block; least significant bit first."""
     bitmap = bytearray(1024 * 1024)
     for n in sector_numbers:
         bitmap[n // 8] |= 1 << (n % 8)
     return bytes(bitmap)
+
+
+def vhdx_set_has_parent(data, meta_off, items):
+    """Set the HasParent bit in a VHDX's file parameters item, in place.
+
+    Shared by the real differencing child below, which also gets a
+    parent locator item appended, and by the parentless marker fixture
+    further down, which does not: both need exactly this bit flipped in
+    exactly this structure and nothing else. Returns the block size the
+    file parameters item already declared.
+    """
+    fp = [it for it in items if it[0] == META_FILE_PARAMETERS]
+    assert len(fp) == 1, "expected exactly one file parameters item"
+    _guid, ioff, _ilen, _flags, _eo = fp[0]
+    block_size, fp_flags = struct.unpack_from("<II", data, meta_off + ioff)
+    struct.pack_into("<II", data, meta_off + ioff, block_size, fp_flags | 0x2)
+    return block_size
 
 
 def patch_vhdx_child(path, parent_absolute, parent_relative,
@@ -982,11 +1330,7 @@ def patch_vhdx_child(path, parent_absolute, parent_relative,
     count, items = vhdx_metadata_items(data, meta_off)
 
     # 1. Set the HasParent bit in the file parameters item.
-    fp = [it for it in items if it[0] == META_FILE_PARAMETERS]
-    assert len(fp) == 1, "expected exactly one file parameters item"
-    _guid, ioff, ilen, _flags, _eo = fp[0]
-    block_size, fp_flags = struct.unpack_from("<II", data, meta_off + ioff)
-    struct.pack_into("<II", data, meta_off + ioff, block_size, fp_flags | 0x2)
+    block_size = vhdx_set_has_parent(data, meta_off, items)
 
     # 2. Append a parent locator item after the last item data.
     end = max(ioff + ilen for _g, ioff, ilen, _f, _e in items)
@@ -1045,27 +1389,203 @@ def patch_vhdx_child(path, parent_absolute, parent_relative,
     return block_size, chunk_ratio
 
 
-def vhdx_composition(block_size):
-    """The raw image a correct reader must produce for parent + child."""
-    data = bytearray(IMAGE_SIZE)
+def write_vhdx_differencing(path):
+    """Create the parentless differencing VHDX marker fixture.
+
+    The VHDX analogue of the patched vhd-differencing.vhd above:
+    qemu-img cannot create a differencing VHDX either, so an ordinary
+    dynamic VHDX is created and then has its HasParent bit patched on
+    alone. Unlike vhdx-diff-child.vhdx, no parent locator metadata item
+    is added -- the metadata table lists nothing for the parser to
+    stage, so this image claims a parent with no reference to one. That
+    is the one VHDX shape nothing else here produces, and it is the
+    point of the fixture: a chain with nothing behind it for a walk to
+    resolve, as distinct from an orphaned copy of the real child, whose
+    parent locator still names a file that is merely missing.
+    """
+    opts = "block_size=%d,log_size=1M" % VHDX_BLOCK_SIZE
+    qemu_img("create", "-f", "vhdx", "-o", opts, path,
+             "%dM" % (IMAGE_SIZE // (1024 * 1024)))
+    with open(path, "rb") as fh:
+        data = bytearray(fh.read())
+    regions = vhdx_regions(data)
+    meta_off, _meta_len = regions[REGION_METADATA]
+    _count, items = vhdx_metadata_items(data, meta_off)
+    vhdx_set_has_parent(data, meta_off, items)
+    with open(path, "wb") as fh:
+        fh.write(bytes(data))
+
+
+def vhdx_chain_composition(levels, block_size):
+    """The raw image a correct reader must produce for a whole VHDX chain.
+
+    levels runs from the top of the chain downwards; the last entry is
+    the base disk and carries None for both block sets.  Each entry is
+    (tag, sectors, partially present blocks, fully present blocks).
+
+    Unlike VHD, where a sector bitmap alone decides ownership, a VHDX
+    payload block state can end the descent for a whole block:
+
+      * fully present serves the block from this file even where the
+        file never wrote it, so an ancestor's data there is shadowed to
+        zero rather than composed through;
+      * partially present defers to the sector bitmap, sector by sector;
+      * not present defers the whole block to the next level down.
+    """
     spb = block_size // SECTOR
     assert spb == VHDX_SECTORS_PER_BLOCK, "qemu-img ignored the block size"
+    data = bytearray(IMAGE_SIZE)
     for n in range(IMAGE_SECTORS):
         b = n // spb
-        if b in VHDX_CHILD_BLOCKS_FULL:
-            # Fully present: the whole block comes from the child file, which
-            # is zero everywhere the child did not write, so the parent is
-            # shadowed even where it holds data.
-            if n in VHDX_CHILD_SECTORS:
-                data[n * SECTOR:(n + 1) * SECTOR] = marker("CHILD", n)
-        elif b in VHDX_CHILD_BLOCKS_PARTIAL:
-            if n in VHDX_CHILD_SECTORS:
-                data[n * SECTOR:(n + 1) * SECTOR] = marker("CHILD", n)
-            elif n in VHDX_PARENT_SECTORS:
-                data[n * SECTOR:(n + 1) * SECTOR] = marker("PARENT", n)
-        elif n in VHDX_PARENT_SECTORS:
-            data[n * SECTOR:(n + 1) * SECTOR] = marker("PARENT", n)
+        for tag, sectors, partial, full in levels:
+            base_disk = partial is None and full is None
+            if base_disk or b in full or (b in partial and n in sectors):
+                if n in sectors:
+                    data[n * SECTOR:(n + 1) * SECTOR] = marker(tag, n)
+                break
     return bytes(data)
+
+
+def write_vhdx_grandchild(path, child_path):
+    """Create the VHDX grandchild over the differencing child on disk.
+
+    The parent_linkage value is read out of child_path as it sits in the
+    output directory, never derived from a value a regeneration would
+    have produced.  This file is guarded independently of the pair, so
+    the ordinary case is a tree whose pair is already committed and
+    whose grandchild is missing: binding to the committed child's
+    DataWriteGuid is what makes that case resolve, and a grandchild
+    bound to anything else is a well formed image that opens nothing.
+
+    Not idempotent, and not byte-reproducible, for both of the reasons
+    the pair is not: qemu-img stamps fresh GUIDs on every create, and
+    patch_vhdx_child appends a metadata item.  The caller's guard
+    covers the create and the patch as one unit.
+    """
+    if os.path.exists(path):
+        os.unlink(path)
+    with tempfile.TemporaryDirectory() as tmp:
+        grandchild_src = os.path.join(tmp, "grandchild.raw")
+        with open(grandchild_src, "wb") as fh:
+            fh.write(build_raw(VHDX_GRANDCHILD_SECTORS, "GRAND"))
+        opts = "block_size=%d,log_size=1M" % VHDX_BLOCK_SIZE
+        qemu_img("convert", "-f", "raw", "-O", "vhdx", "-o", opts,
+                 grandchild_src, path)
+
+    with open(child_path, "rb") as fh:
+        child_dwg = vhdx_data_write_guid(fh.read())
+    patch_vhdx_child(path,
+                     parent_absolute=VHDX_CHILD_ABSOLUTE,
+                     parent_relative=VHDX_CHILD_RELATIVE,
+                     parent_data_write_guid=child_dwg,
+                     partial_blocks=set(VHDX_GRANDCHILD_BLOCKS_PARTIAL),
+                     full_blocks=set(VHDX_GRANDCHILD_BLOCKS_FULL),
+                     child_sectors=VHDX_GRANDCHILD_SECTORS)
+
+
+def vhdx_check_parent_link(upper, lower, upper_path, lower_path):
+    """Check one differencing link: upper's parent_linkage names lower.
+
+    The linkage is read out of the file that records it and compared
+    with the identity of the file it names, so a chain whose two halves
+    have drifted apart fails here rather than surfacing later as an
+    unresolvable parent in tests/test_differencing.py.  SPEC(VHDX)
+    fixes no case for a braced GUID string, so the comparison is case
+    insensitive -- see vhdx_parent_locator_item.
+    """
+    values = vhdx_parent_locator_values(upper_path)
+    if values is None:
+        raise SystemExit(
+            "%s: the %s carries no parent locator item, so it names no "
+            "%s to compose with" % (upper_path, upper, lower))
+    with open(lower_path, "rb") as fh:
+        expected = "{%s}" % vhdx_data_write_guid(fh.read())
+    linkage = values.get("parent_linkage", "")
+    if linkage.lower() != expected.lower():
+        raise SystemExit(
+            "The committed VHDX chain is broken: the %s's parent_linkage "
+            "is %r but the %s beside it has DataWriteGuid %r. Regenerate "
+            "with REGEN_VHDX=1 and commit all three files."
+            % (upper, linkage, lower, expected))
+
+
+def vhdx_verify_shipped_grandchild(grandchild_path, child_path, parent_path):
+    """Check the committed VHDX chain really is three levels, and linked.
+
+    Runs on every run, including the ones that skip regenerating
+    anything, for vhdx_verify_shipped_pair's reason and one more of its
+    own: the grandchild's parent_linkage binds to a GUID that a
+    regeneration of the pair changes.  A grandchild left behind by a
+    REGEN_VHDX run that rebuilt the pair and did not rebuild it would
+    be a well formed differencing VHDX naming a parent whose identity
+    no longer matches, and nothing else in this script would notice.
+
+    Both links are checked, not only the grandchild's: a three level
+    chain resolves only if the grandchild binds to the child and the
+    child binds to the parent, and the composed .raw written beside
+    them assumes both.  Returns the measured block size.
+    """
+    grandchild = vhdx_read_shape(grandchild_path)
+
+    def check(what, measured, expected):
+        if measured != expected:
+            raise SystemExit(
+                "The committed VHDX chain no longer matches the constants in "
+                "this script: %s is %r on disk, %r here.\n"
+                "Regenerate with REGEN_VHDX=1 and commit all three files, "
+                "or restore the constant." % (what, measured, expected))
+
+    check("the grandchild's block size", grandchild["block_size"],
+          VHDX_BLOCK_SIZE)
+    check("the grandchild's HasParent bit", grandchild["has_parent"], True)
+
+    partial = sorted(b for b, st in grandchild["states"].items()
+                     if st == VHDX_BAT_PARTIALLY_PRESENT)
+    full = sorted(b for b, st in grandchild["states"].items()
+                  if st == VHDX_BAT_FULLY_PRESENT)
+    check("the grandchild's partially present block set", partial,
+          sorted(VHDX_GRANDCHILD_BLOCKS_PARTIAL))
+    check("the grandchild's fully present block set", full,
+          sorted(VHDX_GRANDCHILD_BLOCKS_FULL))
+    check("the grandchild's written sectors",
+          sorted(grandchild["written"]), sorted(VHDX_GRANDCHILD_SECTORS))
+
+    spb = grandchild["block_size"] // SECTOR
+    expect_claimed = sorted(n for n in VHDX_GRANDCHILD_SECTORS
+                            if n // spb in set(VHDX_GRANDCHILD_BLOCKS_PARTIAL))
+    check("the sectors the grandchild's chunk sector bitmap claims",
+          sorted(grandchild["claimed"] or []), expect_claimed)
+
+    # Both identity links, each read out of the file that records it and
+    # compared with the file it names.
+    vhdx_check_parent_link("grandchild", "child", grandchild_path, child_path)
+    vhdx_check_parent_link("child", "parent", child_path, parent_path)
+
+    check("the grandchild's relative_path",
+          vhdx_parent_locator_values(grandchild_path).get("relative_path"),
+          VHDX_CHILD_RELATIVE)
+
+    return grandchild["block_size"]
+
+
+def vhdx_composition(block_size):
+    """The raw image a correct reader must produce for parent + child."""
+    return vhdx_chain_composition(
+        [("CHILD", VHDX_CHILD_SECTORS, VHDX_CHILD_BLOCKS_PARTIAL,
+          VHDX_CHILD_BLOCKS_FULL),
+         ("PARENT", VHDX_PARENT_SECTORS, None, None)],
+        block_size)
+
+
+def vhdx_grandchild_composition(block_size):
+    """The raw image a correct reader must produce for all three levels."""
+    return vhdx_chain_composition(
+        [("GRAND", VHDX_GRANDCHILD_SECTORS, VHDX_GRANDCHILD_BLOCKS_PARTIAL,
+          VHDX_GRANDCHILD_BLOCKS_FULL),
+         ("CHILD", VHDX_CHILD_SECTORS, VHDX_CHILD_BLOCKS_PARTIAL,
+          VHDX_CHILD_BLOCKS_FULL),
+         ("PARENT", VHDX_PARENT_SECTORS, None, None)],
+        block_size)
 
 
 def vhdx_read_shape(path):
@@ -1155,7 +1675,8 @@ def vhdx_verify_shipped_pair(parent_path, child_path):
             raise SystemExit(
                 "The committed VHDX pair no longer matches the constants in "
                 "this script: %s is %r on disk, %r here.\n"
-                "Regenerate the pair with REGEN_VHDX=1 and commit both files, "
+                "Regenerate the pair with REGEN_VHDX=1 and commit both files "
+                "along with vhdx-diff-grandchild.vhdx, "
                 "or restore the constant." % (what, measured, expected))
 
     check("the child block size", child["block_size"], VHDX_BLOCK_SIZE)
@@ -1184,7 +1705,35 @@ def vhdx_verify_shipped_pair(parent_path, child_path):
     check("the sectors the chunk sector bitmap claims",
           sorted(child["claimed"] or []), expect_claimed)
 
+    # The pair's own identity link, which went unchecked here until a
+    # parent locator reader existed to check it with.  Every shape above
+    # can be right while the child names an identity the parent no
+    # longer carries, and the composed .raw written beside them assumes
+    # the link resolves.
+    vhdx_check_parent_link("child", "parent", child_path, parent_path)
+
     return child["block_size"]
+
+
+def verify_vhdx_differencing(path):
+    """Check the parentless VHDX marker still has the shape its name promises.
+
+    Read back with vhdx_read_shape rather than trusted from the write
+    step in write_vhdx_differencing, for the same reason
+    vhdx_verify_shipped_pair re-reads the real pair: a change to
+    vhdx_set_has_parent, or a qemu-img version that writes an unwritten
+    dynamic VHDX differently, is caught here instead of surfacing first
+    as a test failure in tests/test_differencing.py.
+    """
+    shape = vhdx_read_shape(path)
+    if not shape["has_parent"]:
+        raise SystemExit(
+            "%s: HasParent bit is clear; the patch step did not take"
+            % path)
+    if shape["written"]:
+        raise SystemExit(
+            "%s: expected no allocated payload block, found data at "
+            "sector(s) %r" % (path, shape["written"]))
 
 
 # --- driver -----------------------------------------------------------------
@@ -1225,6 +1774,30 @@ def main():
         with open(p(composed), "wb") as fh:
             fh.write(vhd_composition(VHD_PARENT_SECTORS, sectors))
         written.append(composed)
+
+    # ------- the VHD third level -------
+    #
+    # Written on every run like the rest of the VHD half: struct packed
+    # here with a pinned timestamp and a fixed unique id, so it is byte
+    # reproducible and needs no opt-in guard.
+    write_differencing_vhd(p("vhd-diff-grandchild.vhd"),
+                           VHD_GRANDCHILD_SECTORS, IMAGE_SIZE,
+                           VHD_GRANDCHILD_UID, VHD_TIMESTAMP,
+                           VHD_CHILD_ALIGNED_UID,
+                           parent_name=VHD_CHILD_ALIGNED_BASENAME,
+                           locators=VHD_GRANDCHILD_LOCATORS,
+                           tag="GRAND")
+    written.append("vhd-diff-grandchild.vhd")
+    with open(p("vhd-diff-grandchild-composed.raw"), "wb") as fh:
+        fh.write(vhd_chain_composition(
+            [("PARENT", VHD_PARENT_SECTORS),
+             ("CHILD", VHD_CHILD_SECTORS_ALIGNED),
+             ("GRAND", VHD_GRANDCHILD_SECTORS)]))
+    written.append("vhd-diff-grandchild-composed.raw")
+    verify_vhd_grandchild(p("vhd-diff-grandchild.vhd"),
+                          p("vhd-diff-child-aligned.vhd"),
+                          p("vhd-diff-parent.vhd"))
+    print("  Verified the three level VHD chain against the constants.")
 
     # ------- adversarial parent locators -------
     #
@@ -1268,6 +1841,50 @@ def main():
     with open(p("vhdx-diff-composed.raw"), "wb") as fh:
         fh.write(vhdx_composition(block_size))
     written.append("vhdx-diff-composed.raw")
+
+    # ---------------- VHDX third level ----------------
+    #
+    # Opt in for the pair's reason -- qemu-img stamps fresh GUIDs on every
+    # create -- but guarded independently of it, because the common case is
+    # a tree whose pair is already committed and whose grandchild is not
+    # there yet.  write_vhdx_grandchild binds parent_linkage to whatever
+    # DataWriteGuid the child on disk actually carries, so that case
+    # produces a chain that resolves rather than one bound to a value only
+    # a regeneration would have written.  A REGEN_VHDX run rebuilds the
+    # pair and the grandchild together, in that order, so the grandchild
+    # binds to the new child; and the verify below re-checks both links on
+    # every run, so a grandchild left behind by a half-finished
+    # regeneration fails here rather than in the test suite.
+    grandchild_name = "vhdx-diff-grandchild.vhdx"
+    if not regen_vhdx and os.path.exists(p(grandchild_name)):
+        print("  Skipping vhdx-diff-grandchild.vhdx: it exists and is not "
+              "byte-reproducible.  Pass REGEN_VHDX=1 to rebuild it.")
+    else:
+        write_vhdx_grandchild(p(grandchild_name), p("vhdx-diff-child.vhdx"))
+        written.append(grandchild_name)
+    grandchild_block_size = vhdx_verify_shipped_grandchild(
+        p(grandchild_name), p("vhdx-diff-child.vhdx"),
+        p("vhdx-diff-parent.vhdx"))
+    print("  Verified the three level VHDX chain against the constants.")
+
+    with open(p("vhdx-diff-grandchild-composed.raw"), "wb") as fh:
+        fh.write(vhdx_grandchild_composition(grandchild_block_size))
+    written.append("vhdx-diff-grandchild-composed.raw")
+
+    # ---------------- VHDX parentless marker ----------------
+    #
+    # Opt in for the same reason as the pair above -- qemu-img stamps fresh
+    # GUIDs on every create -- but guarded independently: this file carries
+    # no parent_linkage and is not shipped as half of anything, so whether
+    # the pair above was just regenerated has no bearing on it.
+    vhdx_differencing_name = "vhdx-differencing.vhdx"
+    if not regen_vhdx and os.path.exists(p(vhdx_differencing_name)):
+        print("  Skipping vhdx-differencing.vhdx: it exists and is not "
+              "byte-reproducible.  Pass REGEN_VHDX=1 to rebuild it.")
+    else:
+        write_vhdx_differencing(p(vhdx_differencing_name))
+        written.append(vhdx_differencing_name)
+    verify_vhdx_differencing(p(vhdx_differencing_name))
 
     for name in written:
         print("  Created %s (%d bytes)" % (p(name), os.path.getsize(p(name))))

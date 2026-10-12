@@ -242,6 +242,18 @@
             "generated_by": "scripts/create-vhd-testdata.sh"
         },
         {
+            "id": "vhd-diff-grandchild",
+            "path": "custom/format-coverage/vhd-diff-grandchild.vhd",
+            "format": "vpc",
+            "safety": "safe",
+            "run_in_ci": false,
+            "skip_qemu_img": true,
+            "sha256": "424b7aaf21467ce1cc949ca45c2b3d03a6f2adfc68aea3d321ba0fb6ac8eba6d",
+            "description": "Differencing VHD child of vhd-diff-child-aligned.vhd, which is itself a differencing child, so this is the top of a chain three differencing images deep. Ownership is spread over all three levels -- it claims 8, 100, 4200, 16384 and 30000, the aligned child keeps 200, 8192 and 9000, and the base disk keeps 0, 1, 2, 4096, 5000, 28672 and 32767 -- so a reader that stops descending after one level produces visibly wrong bytes rather than the right ones by coincidence. Its parent is the aligned child and not the mixed one because every sector it claims sits in a sector bitmap byte no ancestor owns another sector in, which is what keeps the chain's composition exact under libvhdi's bitmap decoder defect. skip_qemu_img because qemu-img's vpc driver reads a differencing VHD as though it were dynamic and composes nothing",
+            "tags": ["vhd", "differencing", "differencing-chain", "content-exact", "format-coverage"],
+            "generated_by": "scripts/create-vhd-testdata.sh"
+        },
+        {
             "id": "vhd-diff-aligned-composed",
             "path": "custom/format-coverage/vhd-diff-aligned-composed.raw",
             "format": "raw",
@@ -266,13 +278,37 @@
             "generated_by": "scripts/create-vhd-testdata.sh"
         },
         {
+            "id": "vhd-diff-grandchild-composed",
+            "path": "custom/format-coverage/vhd-diff-grandchild-composed.raw",
+            "format": "raw",
+            "safety": "safe",
+            "run_in_ci": false,
+            "unsafe_quirks_required": true,
+            "sha256": "90d593ef542872dd8e64a651ae5eeb6ddcd91b7edcf6f5c07b4278b8517452ea",
+            "description": "Intended composition of vhd-diff-parent.vhd, vhd-diff-child-aligned.vhd and vhd-diff-grandchild.vhd, the whole three-level chain, recorded so a reader is compared against recorded intent rather than against whatever the oracle reports on the day. Every sector carries the name of the level that owns it, so a reader that stopped descending early is caught at the sector rather than only in a byte count",
+            "tags": ["vhd", "differencing", "differencing-chain", "composed", "no-partition-table", "format-coverage"],
+            "generated_by": "scripts/create-vhd-testdata.sh"
+        },
+        {
+            "id": "vhdx-differencing",
+            "path": "custom/format-coverage/vhdx-differencing.vhdx",
+            "format": "vhdx",
+            "safety": "safe",
+            "run_in_ci": false,
+            "skip_qemu_img": true,
+            "sha256": "eaff97484a93cb913d29b0de95d864a420af14c0c88ab8d639755d74391d69bb",
+            "description": "Differencing VHDX (HasParent set) patched from a dynamic VHDX for type acceptance testing, the VHDX analogue of vhd-differencing. No parent locator metadata item is present, so info reports no backing file and the composing operations refuse it as a chain with nothing behind it",
+            "tags": ["vhdx", "differencing", "format-coverage"],
+            "generated_by": "scripts/create-vhd-testdata.sh"
+        },
+        {
             "id": "vhdx-diff-parent",
             "path": "custom/format-coverage/vhdx-diff-parent.vhdx",
             "format": "vhdx",
             "safety": "safe",
             "run_in_ci": false,
             "sha256": "31ec2e02ece4c55db0fe901836afa35334c7492c0739b365ad6f6dec6d761d1b",
-            "description": "Dynamic VHDX (1 MiB blocks) parent of vhdx-diff-child.vhdx. qemu-img stamps a fresh DataWriteGuid on every run and the child's parent_linkage metadata binds to that value, so this file is regenerated and shipped together with vhdx-diff-child.vhdx as a pair: shipping one without the other breaks the chain",
+            "description": "Dynamic VHDX (1 MiB blocks) parent of vhdx-diff-child.vhdx. qemu-img stamps a fresh DataWriteGuid on every run and the child's parent_linkage metadata binds to that value, so this file is regenerated and shipped together with vhdx-diff-child.vhdx and vhdx-diff-grandchild.vhdx, each of which binds to the one below it: shipping any of the three without the others breaks the chain",
             "tags": ["vhdx", "differencing", "differencing-chain", "format-coverage"],
             "generated_by": "scripts/create-vhd-testdata.sh"
         },
@@ -284,7 +320,19 @@
             "run_in_ci": false,
             "skip_qemu_img": true,
             "sha256": "a146022cb0c0848034b222e0c20f9c29133b6203920f96c6787b0c949f55341a",
-            "description": "Differencing VHDX child of vhdx-diff-parent.vhdx, exercising all three payload block states (PARTIALLY_PRESENT, FULLY_PRESENT, NOT_PRESENT). Its parent_linkage metadata binds to the parent's DataWriteGuid, which qemu-img regenerates on every run, so this file is regenerated and shipped together with vhdx-diff-parent.vhdx as a pair: shipping one without the other breaks the chain. The parent_linkage GUID is rendered lowercase, which is what qemu and libuuid produce while Hyper-V writes braced GUIDs uppercase; SPEC(VHDX) fixes no case, so this fixture deliberately exercises the lowercase form and a reader must compare it case-insensitively",
+            "description": "Differencing VHDX child of vhdx-diff-parent.vhdx, exercising all three payload block states (PARTIALLY_PRESENT, FULLY_PRESENT, NOT_PRESENT). Its parent_linkage metadata binds to the parent's DataWriteGuid, which qemu-img regenerates on every run, so this file is regenerated and shipped together with vhdx-diff-parent.vhdx and with vhdx-diff-grandchild.vhdx, which binds to this file in turn: shipping any of the three without the others breaks the chain. The parent_linkage GUID is rendered lowercase, which is what qemu and libuuid produce while Hyper-V writes braced GUIDs uppercase; SPEC(VHDX) fixes no case, so this fixture deliberately exercises the lowercase form and a reader must compare it case-insensitively",
+            "tags": ["vhdx", "differencing", "differencing-chain", "format-coverage"],
+            "generated_by": "scripts/create-vhd-testdata.sh"
+        },
+        {
+            "id": "vhdx-diff-grandchild",
+            "path": "custom/format-coverage/vhdx-diff-grandchild.vhdx",
+            "format": "vhdx",
+            "safety": "safe",
+            "run_in_ci": false,
+            "skip_qemu_img": true,
+            "sha256": "4fb4fd540f2639eed66168887104bab8e9e2983b571cc31bd44ad81cde66ee11",
+            "description": "Differencing VHDX child of vhdx-diff-child.vhdx, which is itself a differencing child, so this is the top of a chain three differencing images deep. Its block 0 is PARTIALLY_PRESENT claiming sectors 5 and 100, which leaves sector 0 to the base disk and sector 1 to the middle child and so needs two descents to resolve one block; its block 5 is FULLY_PRESENT, which shadows the base disk's sector 10240 to zero. Its parent_linkage metadata binds to vhdx-diff-child.vhdx's DataWriteGuid, which qemu-img regenerates on every run, so all three files are shipped together: shipping this one against a regenerated pair breaks the chain. skip_qemu_img because qemu-img's vhdx driver refuses to open a parent-referencing image at all",
             "tags": ["vhdx", "differencing", "differencing-chain", "format-coverage"],
             "generated_by": "scripts/create-vhd-testdata.sh"
         },
@@ -297,6 +345,18 @@
             "unsafe_quirks_required": true,
             "sha256": "a126bdd6e44c12cae5dd4845ddf62267b2cc81ba832a2ecd60a28526a5efcacc",
             "description": "Intended composition of vhdx-diff-parent.vhdx and vhdx-diff-child.vhdx, recorded so later phases compare against recorded intent rather than against whatever the oracle reports on the day",
+            "tags": ["vhdx", "differencing", "differencing-chain", "composed", "no-partition-table", "format-coverage"],
+            "generated_by": "scripts/create-vhd-testdata.sh"
+        },
+        {
+            "id": "vhdx-diff-grandchild-composed",
+            "path": "custom/format-coverage/vhdx-diff-grandchild-composed.raw",
+            "format": "raw",
+            "safety": "safe",
+            "run_in_ci": false,
+            "unsafe_quirks_required": true,
+            "sha256": "9da2957d3d3b779e0ab9751e93efb232d7dd182ef456bdd34499d13c9ef077fa",
+            "description": "Intended composition of vhdx-diff-parent.vhdx, vhdx-diff-child.vhdx and vhdx-diff-grandchild.vhdx, the whole three-level chain, recorded so a reader is compared against recorded intent rather than against whatever the oracle reports on the day. Sectors 7000 and 10240 are zero in it on purpose: each is written in the base disk and shadowed by a FULLY_PRESENT block above it, one at each differencing level",
             "tags": ["vhdx", "differencing", "differencing-chain", "composed", "no-partition-table", "format-coverage"],
             "generated_by": "scripts/create-vhd-testdata.sh"
         },

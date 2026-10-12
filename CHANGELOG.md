@@ -9,6 +9,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **A `pyvhdi` data oracle cross-validates every real differencing
+  chain's composed bytes, not just its parent linkage.**
+  `TestDifferencingLibvhdiOracle` already checked that `vhdiinfo`
+  reads a child instar wrote as naming the right parent, but nothing
+  compared a composed byte — `libvhdi-utils` ships no CLI that can.
+  `TestDifferencingOracleComposes` now drives the `python3-libvhdi`
+  binding through `set_parent()` over every real VHD and VHDX
+  differencing chain this project has, two and three images deep, and
+  compares the result against the recorded `*-composed.raw` golden and
+  `instar convert -O raw`, three independent readers of the same
+  bytes. `TestDifferencingCreatedChildComposes` closes a second,
+  previously untested loop: a child `instar create -b` itself wrote,
+  read back rather than only inspected for its recorded identity. The
+  oracle is mandatory in CI through the existing
+  `INSTAR_REQUIRE_LIBVHDI` variable, the same one `vhdiinfo` uses,
+  because both packages come from the same upstream release.
+
+  The cross-check found one libvhdi defect already recorded against
+  `vhd-diff-child-mixed` in `tests/manifest.json` (an unmasked shift in
+  its VHD per-block sector bitmap decoder, pinned at sector 2) and one
+  new one: libvhdi ignores a VHDX sector-bitmap BAT entry's
+  `SB_BLOCK_NOT_PRESENT` state and reads the bitmap from file offset
+  zero instead, which a freshly created, wholly unallocated VHDX child
+  is the only fixture to expose. Both are asserted positively, so an
+  upstream fix turns the exception red rather than leaving it silently
+  permissive. The three-level chains add no exception: `set_parent`
+  chains cleanly to that depth, in either order, and still refuses a
+  chain given only in part.
+
+- **Two fixture-coverage gaps `create-vhd-testdata.sh` left open are
+  closed.** `vhdx-differencing` is a parentless VHDX with the
+  `HasParent` file-parameters flag set and no usable parent locator,
+  the VHDX half of a matrix that previously had only a VHD equivalent
+  (#635); `convert`, `compare`, `bench`, `check` and `measure` each
+  refuse it with their own message, and the refusal is confirmed to be
+  the empty-chain path rather than the unresolvable-parent one.
+  `vhd-diff-grandchild.vhd` and `vhdx-diff-grandchild.vhdx` each name
+  the project's existing differencing child as their own parent,
+  making both real chains three differencing images deep, with
+  ownership spread across all three levels so a reader that stops
+  descending early produces visibly wrong bytes rather than passing by
+  coincidence (#631). Both ship with their own recorded
+  `*-composed.raw` goldens and a new
+  `TestDifferencingDepthThreeAllDifferencing` class.
+
+- **`fuzz_chain_compose` is the first fuzz target to reach the
+  backing-chain compose path.** Every other `CallTable` fuzz target
+  serves a single input device, so `read_chain_virtual_cluster`'s
+  descent into a parent device was fuzzed nowhere; the closest
+  existing target, `fuzz_qcow2_l1l2`, measured 0.00% region coverage
+  on it, against 84.03% for the new target. The shared fuzz harness
+  gains an opt-in multi-device mode (`set_fuzz_devices`), with default
+  single-device behaviour unchanged by construction so the 42 targets
+  already depending on it keep their present coverage. The target
+  asserts invariants rather than merely surviving: a composed read
+  reporting success fills its whole buffer, a device with no state
+  refuses rather than serving its own zeros, and a device behind the
+  child never overrides a byte the child holds. The first of those
+  found a live defect in unmodified code on its first run (see
+  *Fixed*, #650).
+
 - **The guest chain walker can compose a differencing VHD's allocated
   block against its parent.** It previously served an allocated block
   entirely from the child; it now reads the block's per-sector bitmap
@@ -471,6 +532,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   fixed by hand.
 
 ### Fixed
+
+- **A composed read of a malformed qcow2 subcluster no longer reports
+  success without writing the bytes** (#650). Where a subcluster's
+  allocation bit was set while its L2 entry named host offset zero,
+  the wide-I/O path of the chain walker skipped the payload read, as
+  it should, and then fell through every arm of its fill loop without
+  zeroing those bytes -- and returned success. The caller kept
+  whatever its buffer already held and was told the read worked, which
+  is the same silent wrong answer as #547 in a different place. The
+  bytes are now zero-filled defensively, matching what the narrow-I/O
+  path has always done for the same malformed entry. Only images with
+  clusters below 16 KiB reach the wide path, and only malformed ones
+  reach this case, so a well-formed image is unaffected by it. That is
+  not a claim that subcluster reads are now correct in general: #654,
+  a separate and still-open defect in both paths, zero-fills an
+  unallocated subcluster that should be read from the backing file,
+  and does reach well-formed images with a backing chain. Found by the
+  new `fuzz_chain_compose` target on its first run against unmodified
+  code, and now also pinned by a deterministic crate test and two
+  mutation cases. Note that zero-filling is where instar diverges from
+  qemu, which fails such a read with `EIO`; that divergence is now
+  recorded in `docs/quirks.md`, and whether both paths should refuse
+  instead is open on #650.
 
 - **`instar info` finds a VHDX's virtual size and block size through
   the metadata table** (#640). It read both at fixed offsets: File

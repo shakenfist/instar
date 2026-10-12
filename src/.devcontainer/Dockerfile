@@ -28,6 +28,12 @@ RUN printf '%s\n' 'Acquire::Retries "3";' > /etc/apt/apt.conf.d/99retries
 # - qemu-utils: provides qemu-img and qemu-io for compare/convert tests
 # - libqcow-utils, libvhdi-utils, libvmdk-utils: libyal forensic parsers
 #   for differential fuzzing (independent QCOW2/VHD/VHDX/VMDK reference)
+# - python3-libvhdi: the same libvhdi release as a Python binding.
+#   libvhdi-utils ships only vhdiinfo and vhdimount, neither of which can
+#   export a composed differencing chain, so the integration suite reads
+#   composed bytes out of the binding instead. It installs into the
+#   distribution's dist-packages, so the test venv the Makefile builds
+#   is created with --system-site-packages to see it.
 # - wget: for downloading gh CLI keyring
 # - rpm: provides /usr/lib/rpm/find-requires so `make rpm` here
 #   generates the same dependencies as the release build image. Without
@@ -40,6 +46,7 @@ RUN apt-get update && apt-get install -y \
     libvmdk-utils \
     protobuf-compiler \
     python3 \
+    python3-libvhdi \
     python3-pip \
     python3-venv \
     qemu-utils \
