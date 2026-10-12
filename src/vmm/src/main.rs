@@ -23,6 +23,7 @@ mod backing;
 mod chain;
 mod config;
 mod error;
+mod escape;
 mod io_thread;
 mod ioevent;
 mod kvm_stats;
@@ -54,6 +55,7 @@ use chain::{
     validate_backing_write_target, BackingChain, ChainError, ChainImage, ExternalDataFile,
     ImageFormat, InfoOperationResult,
 };
+use escape::{json_escape, terminal_safe, terminal_safe_path};
 use io_thread::{DeviceRole, IoDevice};
 use ioevent::IoEvent;
 use stats::VmmStats;
@@ -1354,35 +1356,69 @@ impl SerialTransmitter {
 /// Debug output buffer - collects characters until newline, then prints.
 /// Truncates lines longer than MAX_DEBUG_LINE to prevent unbounded growth.
 struct DebugBuffer {
-    line: String,
+    line: Vec<u8>,
 }
 
 const MAX_DEBUG_LINE: usize = 4096;
 
 impl DebugBuffer {
     fn new() -> Self {
-        Self {
-            line: String::new(),
-        }
+        Self { line: Vec::new() }
     }
 
     /// Add a byte; if it's a newline, return the complete line.
     /// Lines exceeding MAX_DEBUG_LINE are forcibly flushed.
+    ///
+    /// The guest writes these bytes while parsing an untrusted image, so
+    /// the line is returned through `terminal_safe`: every caller only
+    /// logs it, and none of them can then forward a control character.
+    /// The bytes are decoded as UTF-8 first, so non-ASCII text the guest
+    /// prints reads as itself rather than as escaped C1 characters.
     fn add_byte(&mut self, byte: u8) -> Option<String> {
         if byte == b'\n' || self.line.len() >= MAX_DEBUG_LINE {
             if byte != b'\n' {
-                self.line.push(byte as char);
+                self.line.push(byte);
             }
             let result = std::mem::take(&mut self.line);
-            Some(result)
+            Some(terminal_safe(&String::from_utf8_lossy(&result)).into_owned())
         } else {
-            self.line.push(byte as char);
+            self.line.push(byte);
             None
         }
     }
 }
 
-/// Format a guest message for display
+#[cfg(test)]
+mod debug_buffer_tests {
+    use super::DebugBuffer;
+
+    fn feed(bytes: &[u8]) -> Vec<String> {
+        let mut buffer = DebugBuffer::new();
+        bytes.iter().filter_map(|b| buffer.add_byte(*b)).collect()
+    }
+
+    #[test]
+    fn utf8_text_reads_as_itself() {
+        assert_eq!(
+            feed("caf\u{e9} \u{4e2d}.vhd\n".as_bytes()),
+            ["caf\u{e9} \u{4e2d}.vhd"]
+        );
+    }
+
+    #[test]
+    fn control_characters_are_escaped() {
+        assert_eq!(feed(b"a\x1b[2Jb\rc\n"), ["a\\u{1b}[2Jb\\rc"]);
+        // A raw C1 byte is not valid UTF-8, so it decodes to U+FFFD
+        // rather than to the single-byte CSI it would be as Latin-1.
+        assert_eq!(feed(b"x\x9by\n"), ["x\u{fffd}y"]);
+    }
+}
+
+/// Format a guest message for display.
+///
+/// The record is a single line, and every string field in it came from
+/// the guest, so the finished line goes through `terminal_safe` as a
+/// whole rather than field by field.
 fn format_message(msg: &guest_::GuestMessage) -> String {
     let level = match msg.level {
         l if l == guest_::Level::Debug => "DEBUG",
@@ -1580,7 +1616,7 @@ fn format_message(msg: &guest_::GuestMessage) -> String {
         None => "empty payload".to_string(),
     };
 
-    format!("[{level}] {payload_str}")
+    format!("[{level}] {}", terminal_safe(&payload_str))
 }
 
 /// Format a byte size as human-readable string
@@ -1784,11 +1820,15 @@ fn print_info_result(
             return;
         }
 
+        // Every string below that came from the guest is image data, or
+        // was produced by parsing image data, so it goes through
+        // terminal_safe() before it reaches the terminal.
+
         // Line 1: image path
-        println!("image: {abs_path}");
+        println!("image: {}", terminal_safe(&abs_path));
 
         // Line 2: file format
-        println!("file format: {}", info.format);
+        println!("file format: {}", terminal_safe(&info.format));
 
         // qemu_compat is the opposite of ignore_quirks
         let qemu_compat = !ignore_quirks;
@@ -1859,13 +1899,20 @@ fn print_info_result(
                     .join(backing_file_str)
                     .to_string_lossy()
                     .to_string();
-                println!("backing file: {backing_file_str} (actual path: {actual_path})");
+                println!(
+                    "backing file: {} (actual path: {})",
+                    terminal_safe(backing_file_str),
+                    terminal_safe(&actual_path)
+                );
             } else {
-                println!("backing file: {backing_file_str}");
+                println!("backing file: {}", terminal_safe(backing_file_str));
             }
             // Show backing file format if available
             if !info.qcow2_info.backing_format.is_empty() {
-                println!("backing file format: {}", info.qcow2_info.backing_format);
+                println!(
+                    "backing file format: {}",
+                    terminal_safe(&info.qcow2_info.backing_format)
+                );
             }
         }
 
@@ -1873,7 +1920,7 @@ fn print_info_result(
         if info.flags & INFO_RESULT_FLAG_HAS_EXTERNAL_DATA != 0
             && !info.external_data_file.is_empty()
         {
-            println!("data file: {}", info.external_data_file.as_str());
+            println!("data file: {}", terminal_safe(&info.external_data_file));
         }
 
         // Format specific information (QCOW2)
@@ -1887,7 +1934,7 @@ fn print_info_result(
                 info.qcow2_info.compat.as_str()
             };
             let is_v3 = compat == "1.1";
-            println!("    compat: {compat}");
+            println!("    compat: {}", terminal_safe(compat));
 
             // compression type (always shown)
             let compression = if info.qcow2_info.compression_type.is_empty() {
@@ -1895,7 +1942,7 @@ fn print_info_result(
             } else {
                 info.qcow2_info.compression_type.as_str()
             };
-            println!("    compression type: {compression}");
+            println!("    compression type: {}", terminal_safe(compression));
 
             // lazy refcounts (only for v3/1.1 compat)
             if is_v3 {
@@ -1931,7 +1978,10 @@ fn print_info_result(
             println!("Format specific information:");
             println!("    cid: {}", info.vmdk_info.cid);
             println!("    parent cid: {}", info.vmdk_info.parent_cid);
-            println!("    create type: {}", info.vmdk_info.create_type.as_str());
+            println!(
+                "    create type: {}",
+                terminal_safe(&info.vmdk_info.create_type)
+            );
 
             // Extents section.
             //
@@ -1950,7 +2000,7 @@ fn print_info_result(
                     println!("            virtual size: {}", extent.extent_size);
                     println!(
                         "            filename: {}",
-                        extent.flat_path.to_string_lossy()
+                        terminal_safe_path(&extent.flat_path)
                     );
                     println!("            format: FLAT");
                 }
@@ -1961,7 +2011,7 @@ fn print_info_result(
                     println!("            compressed: true");
                 }
                 println!("            virtual size: {}", info.virtual_size);
-                println!("            filename: {abs_path}");
+                println!("            filename: {}", terminal_safe(&abs_path));
                 println!("            cluster size: {}", info.cluster_size);
                 // qemu-img outputs "format: " with trailing space for empty format
                 print!("            format: ");
@@ -1984,7 +2034,7 @@ fn print_info_result(
             println!("    blocks in image: {}", info.vdi_info.blocks_in_image);
             println!("    blocks allocated: {}", info.vdi_info.blocks_allocated);
             if !info.vdi_info.uuid.is_empty() {
-                println!("    uuid: {}", info.vdi_info.uuid.as_str());
+                println!("    uuid: {}", terminal_safe(&info.vdi_info.uuid));
             }
         }
 
@@ -2003,7 +2053,7 @@ fn print_info_result(
             if let Some(resolved) = vmdk_flat {
                 for (i, extent) in resolved.flat_extents.iter().enumerate() {
                     println!("Child node '/extents.{i}':");
-                    println!("    filename: {}", extent.flat_path.to_string_lossy());
+                    println!("    filename: {}", terminal_safe_path(&extent.flat_path));
                     println!("    protocol type: file");
                     println!(
                         "    file length: {} ({} bytes)",
@@ -2049,7 +2099,7 @@ fn print_info_result(
                 child_file_length
             };
             println!("Child node '/file':");
-            println!("    filename: {abs_path}");
+            println!("    filename: {}", terminal_safe(&abs_path));
             println!("    protocol type: file");
             println!(
                 "    file length: {} ({} bytes)",
@@ -2156,7 +2206,7 @@ fn print_info_result_json(
                 println!("                \"virtual-size\": {},", extent.extent_size);
                 println!(
                     "                \"filename\": \"{}\",",
-                    escape_json_string(&extent_path)
+                    json_escape(&extent_path)
                 );
                 println!("                \"format\": \"file\",");
                 println!("                \"actual-size\": {extent_disk},");
@@ -2187,7 +2237,7 @@ fn print_info_result_json(
         println!("                \"virtual-size\": {descriptor_vsize},");
         println!(
             "                \"filename\": \"{}\",",
-            escape_json_string(abs_path)
+            json_escape(abs_path)
         );
         println!("                \"format\": \"file\",");
         println!("                \"actual-size\": {disk_size},");
@@ -2225,11 +2275,14 @@ fn print_info_result_json(
             }
             _ => "qcow2",
         };
-        println!("    \"backing-filename-format\": \"{backing_format}\",");
+        println!(
+            "    \"backing-filename-format\": \"{}\",",
+            json_escape(backing_format)
+        );
     }
 
     println!("    \"virtual-size\": {effective_virtual_size},");
-    println!("    \"filename\": \"{}\",", escape_json_string(abs_path));
+    println!("    \"filename\": \"{}\",", json_escape(abs_path));
 
     // parallels carries a real cluster_size internally (tracks × 512, set
     // by the info op so the chain reader chunks on cluster boundaries),
@@ -2239,7 +2292,7 @@ fn print_info_result_json(
         println!("    \"cluster-size\": {},", info.cluster_size);
     }
 
-    println!("    \"format\": \"{}\",", info.format);
+    println!("    \"format\": \"{}\",", json_escape(&info.format));
 
     // qemu-img omits the top-level "dirty-flag" entirely for the
     // detection-and-info-only drivers (parallels, bochs, cloop, dmg): those
@@ -2283,14 +2336,17 @@ fn print_info_result_json(
         };
         let is_v3 = compat == "1.1";
 
-        println!("            \"compat\": \"{compat}\",");
+        println!("            \"compat\": \"{}\",", json_escape(compat));
 
         let compression = if info.qcow2_info.compression_type.is_empty() {
             "zlib"
         } else {
             info.qcow2_info.compression_type.as_str()
         };
-        println!("            \"compression-type\": \"{compression}\",");
+        println!(
+            "            \"compression-type\": \"{}\",",
+            json_escape(compression)
+        );
 
         if is_v3 {
             println!(
@@ -2318,7 +2374,7 @@ fn print_info_result_json(
                 );
                 println!(
                     "            \"data-file\": \"{}\"",
-                    escape_json_string(info.external_data_file.as_str())
+                    json_escape(info.external_data_file.as_str())
                 );
             } else {
                 println!(
@@ -2341,7 +2397,7 @@ fn print_info_result_json(
         println!("            \"parent-cid\": {},", info.vmdk_info.parent_cid);
         println!(
             "            \"create-type\": \"{}\",",
-            info.vmdk_info.create_type.as_str()
+            json_escape(&info.vmdk_info.create_type)
         );
         println!("            \"extents\": [");
         if let Some(resolved) = vmdk_flat {
@@ -2359,7 +2415,7 @@ fn print_info_result_json(
                 );
                 println!(
                     "                    \"filename\": \"{}\",",
-                    escape_json_string(&extent.flat_path.to_string_lossy())
+                    json_escape(&extent.flat_path.to_string_lossy())
                 );
                 println!("                    \"format\": \"FLAT\"");
             }
@@ -2377,7 +2433,7 @@ fn print_info_result_json(
             );
             println!(
                 "                    \"filename\": \"{}\",",
-                escape_json_string(abs_path)
+                json_escape(abs_path)
             );
             println!(
                 "                    \"cluster-size\": {},",
@@ -2414,7 +2470,7 @@ fn print_info_result_json(
         );
         println!(
             "            \"uuid\": \"{}\"",
-            escape_json_string(info.vdi_info.uuid.as_str())
+            json_escape(info.vdi_info.uuid.as_str())
         );
         println!("        }}");
         println!("    }},");
@@ -2427,21 +2483,21 @@ fn print_info_result_json(
         if !info.luks_info.cipher.is_empty() {
             println!(
                 "            \"cipher\": \"{}\",",
-                escape_json_string(info.luks_info.cipher.as_str())
+                json_escape(info.luks_info.cipher.as_str())
             );
             println!(
                 "            \"cipher-mode\": \"{}\",",
-                escape_json_string(info.luks_info.cipher_mode.as_str())
+                json_escape(info.luks_info.cipher_mode.as_str())
             );
             println!(
                 "            \"hash\": \"{}\",",
-                escape_json_string(info.luks_info.hash.as_str())
+                json_escape(info.luks_info.hash.as_str())
             );
         }
         if !info.luks_info.uuid.is_empty() {
             println!(
                 "            \"uuid\": \"{}\",",
-                escape_json_string(info.luks_info.uuid.as_str())
+                json_escape(info.luks_info.uuid.as_str())
             );
         }
         if info.luks_info.payload_offset > 0 {
@@ -2464,7 +2520,7 @@ fn print_info_result_json(
             );
             println!(
                 "            \"inner-format\": \"{}\",",
-                escape_json_string(info.luks_info.inner_format.as_str())
+                json_escape(info.luks_info.inner_format.as_str())
             );
             println!(
                 "            \"inner-virtual-size\": {}",
@@ -2499,11 +2555,11 @@ fn print_info_result_json(
         };
         println!(
             "    \"full-backing-filename\": \"{}\",",
-            escape_json_string(&full_backing_filename)
+            json_escape(&full_backing_filename)
         );
         println!(
             "    \"backing-filename\": \"{}\",",
-            escape_json_string(backing_file_str)
+            json_escape(backing_file_str)
         );
     }
 
@@ -2521,25 +2577,6 @@ fn print_info_result_json(
         println!("    \"dirty-flag\": {dirty_flag}");
     }
     println!("}}");
-}
-
-/// Escape a string for JSON output
-fn escape_json_string(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '"' => result.push_str("\\\""),
-            '\\' => result.push_str("\\\\"),
-            '\n' => result.push_str("\\n"),
-            '\r' => result.push_str("\\r"),
-            '\t' => result.push_str("\\t"),
-            c if c.is_control() => {
-                result.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            c => result.push(c),
-        }
-    }
-    result
 }
 
 /// Get the directory containing the instar guest binaries (.bin files).
@@ -3080,7 +3117,7 @@ fn discover_backing_chain(
             let resolved = resolve_vmdk_flat_descriptor(&current, security_config)?;
             debug!(
                 "VMDK descriptor resolved: {} -> {} extent(s) ({} bytes virtual)",
-                current.display(),
+                terminal_safe_path(&current),
                 resolved.flat_extents.len(),
                 resolved.virtual_size
             );
@@ -3178,8 +3215,8 @@ fn discover_backing_chain(
                     .unwrap_or(0);
                 debug!(
                     "External data file validated: {} -> {}",
-                    data_path,
-                    data_resolved.display()
+                    terminal_safe(data_path),
+                    terminal_safe_path(&data_resolved)
                 );
                 data_files.push(ExternalDataFile {
                     path: data_resolved,
@@ -3299,7 +3336,8 @@ fn discover_backing_chain(
                         debug!(
                             "Differencing {} parent recorded but not resolved \
                              (this operation does not compose a differencing chain): {}",
-                            info_result.format, backing_path
+                            terminal_safe(&info_result.format),
+                            terminal_safe(&backing_path)
                         );
                         break;
                     }
@@ -3318,8 +3356,8 @@ fn discover_backing_chain(
                             Err(reason) => {
                                 eprintln!(
                                     "instar: backing chain stops at {}: parent '{}' {}",
-                                    current.display(),
-                                    backing_path,
+                                    terminal_safe_path(&current),
+                                    terminal_safe(&backing_path),
                                     reason.describe()
                                 );
                                 break;
@@ -3352,18 +3390,21 @@ fn print_backing_chain(chain: &BackingChain) {
     println!("Chain: {} image(s)", chain.len());
     for image in chain.images() {
         for data_file in &image.external_data_files {
-            println!("  External data file: {}", data_file.path.display());
+            println!(
+                "  External data file: {}",
+                terminal_safe_path(&data_file.path)
+            );
         }
     }
     for (i, image) in chain.images().iter().enumerate() {
         let backing_info = match &image.backing_file_raw {
-            Some(bf) => format!(" -> {bf}"),
+            Some(bf) => format!(" -> {}", terminal_safe(bf)),
             None => String::new(),
         };
         println!(
             "  [{}] {} ({}){}",
             i,
-            image.path.display(),
+            terminal_safe_path(&image.path),
             image.format,
             backing_info
         );
@@ -3400,10 +3441,9 @@ fn print_backing_chain(chain: &BackingChain) {
 /// member whose header names no parent, and that member has no such
 /// key.
 ///
-/// Escaping goes through `json_escape`, not `json_escape_string`: this
-/// printer emits attacker-controlled parent references taken from
-/// image headers, and only `json_escape` escapes the whole C0 range,
-/// so a name carrying a control character cannot break the array it is
+/// Every string goes through `json_escape`: this printer emits
+/// attacker-controlled parent references taken from image headers, and
+/// a name carrying a control character must not break the array it is
 /// rendered into.
 fn print_backing_chain_json(chain: &BackingChain) {
     if chain.images().is_empty() {
@@ -3536,7 +3576,7 @@ fn open_chain_devices(
             label,
             idx,
             mmio,
-            image.path.display()
+            terminal_safe_path(&image.path)
         );
         let device = Arc::new(Mutex::new(device));
         device_set.add_device(Arc::clone(&device), true);
@@ -3562,7 +3602,7 @@ fn open_chain_devices(
                 label,
                 idx,
                 mmio,
-                data_file.path.display()
+                terminal_safe_path(&data_file.path)
             );
             let device = Arc::new(Mutex::new(device));
             device_set.add_device(Arc::clone(&device), true);
@@ -3644,7 +3684,7 @@ fn open_chain_devices_rw(
             idx,
             mmio,
             if is_rw { "rw" } else { "ro" },
-            image.path.display()
+            terminal_safe_path(&image.path)
         );
         let device = Arc::new(Mutex::new(device));
         device_set.add_device(Arc::clone(&device), true);
@@ -3670,7 +3710,7 @@ fn open_chain_devices_rw(
                 idx,
                 mmio,
                 if is_rw { "rw" } else { "ro" },
-                data_file.path.display()
+                terminal_safe_path(&data_file.path)
             );
             let device = Arc::new(Mutex::new(device));
             device_set.add_device(Arc::clone(&device), true);
@@ -5229,12 +5269,8 @@ fn render_bench_json(
 
     let mut out = String::new();
     let _ = writeln!(out, "{{");
-    let _ = writeln!(
-        out,
-        "    \"filename\": \"{}\",",
-        escape_json_string(filename)
-    );
-    let _ = writeln!(out, "    \"format\": \"{}\",", escape_json_string(format));
+    let _ = writeln!(out, "    \"filename\": \"{}\",", json_escape(filename));
+    let _ = writeln!(out, "    \"format\": \"{}\",", json_escape(format));
     let _ = writeln!(out, "    \"count\": {},", params.count);
     let _ = writeln!(out, "    \"depth\": {},", params.depth);
     let _ = writeln!(out, "    \"effective-depth\": 1,");
@@ -6858,7 +6894,7 @@ mod bench_render_tests {
              \x20   \"requests-per-second\": {:.2},\n\
              \x20   \"bytes-per-second\": {:.2}\n\
              }}",
-            escape_json_string(filename),
+            json_escape(filename),
             expected_rps,
             expected_bps,
         );
@@ -7070,6 +7106,11 @@ struct ConfigArgs {
     validate: bool,
 }
 
+// Returning the error, rather than printing it, is what escapes a fatal
+// error message: the runtime prints it with `{:?}`, and a `String`'s Debug
+// form escapes control characters, so a backing name quoted in the error
+// cannot drive the terminal. Printing it with `{}` before exiting would
+// lose that; docs/output-formats.md relies on it.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // This is exactly what `Cli::parse()` does internally, but keeping
     // the `ArgMatches` around lets `run_bitmap` recover the CLI order of
@@ -7080,13 +7121,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     let verbose = cli.verbose;
 
-    // Initialize logger based on --verbose flag
+    // Initialize logger based on --verbose flag. Every record is escaped
+    // on its way out, since debug lines interpolate image-derived text.
     if verbose {
-        env_logger::Builder::new()
-            .filter_level(log::LevelFilter::Debug)
-            .format_target(false)
-            .format_timestamp(None)
-            .init();
+        escape::init_verbose_logger();
     }
 
     match cli.command {
@@ -8074,7 +8112,7 @@ fn render_resize_success(
             "{{\n  \"filename\": \"{}\",\n  \"format\": \"{}\",\n  \
              \"action\": \"{}\",\n  \"old_virtual_size\": {},\n  \
              \"new_virtual_size\": {},\n  \"new_file_size\": {}\n}}",
-            json_escape_string(&args.filename),
+            json_escape(&args.filename),
             image_format_name(format),
             action,
             old_size,
@@ -8154,7 +8192,7 @@ fn render_rebase_success(
                 "{{\n  \"overlay\": \"{}\",\n  \"overlay_format\": \"{}\",\n  \
                  \"mode\": \"{}\",\n  \"clusters_copied\": {},\n  \
                  \"bytes_copied\": {},\n  \"detached\": true\n}}",
-                json_escape_string(&args.filename),
+                json_escape(&args.filename),
                 image_format_name(overlay_format),
                 mode_str,
                 clusters_copied,
@@ -8165,12 +8203,12 @@ fn render_rebase_success(
                 "{{\n  \"overlay\": \"{}\",\n  \"overlay_format\": \"{}\",\n  \
                  \"mode\": \"{}\",\n  \"clusters_copied\": {},\n  \
                  \"bytes_copied\": {},\n  \"new_backing\": \"{}\"\n}}",
-                json_escape_string(&args.filename),
+                json_escape(&args.filename),
                 image_format_name(overlay_format),
                 mode_str,
                 clusters_copied,
                 bytes_copied,
-                json_escape_string(&args.backing),
+                json_escape(&args.backing),
             );
         }
     } else if is_detach {
@@ -8281,9 +8319,9 @@ fn render_commit_success(
              \"backing\": \"{}\",\n  \"backing_format\": \"{}\",\n  \
              \"clusters_committed\": {},\n  \"bytes_committed\": {},\n  \
              \"overlay_clusters_cleared\": {}\n}}",
-            json_escape_string(&args.filename),
+            json_escape(&args.filename),
             image_format_name(overlay_format),
-            json_escape_string(backing_path),
+            json_escape(backing_path),
             image_format_name(backing_format),
             clusters_committed,
             bytes_committed,
@@ -9470,7 +9508,7 @@ fn render_amend_success(
             "{{\n  \"filename\": \"{}\",\n  \"format\": \"{}\",\n  \
              \"action\": \"{}\",\n  \"compat\": \"{}\",\n  \
              \"lazy_refcounts\": \"{}\"\n}}",
-            json_escape_string(&args.filename),
+            json_escape(&args.filename),
             image_format_name(target_format),
             action_str,
             compat_str,
@@ -12633,7 +12671,7 @@ fn print_check_result(
         if not_supported {
             println!(
                 "This image format ({}) does not support checks",
-                result.format
+                terminal_safe(&result.format)
             );
             return;
         }
@@ -12721,11 +12759,8 @@ fn print_check_result_json(
     let is_corrupt = (result.flags & CHECK_RESULT_FLAG_CORRUPT_BIT) != 0;
 
     println!("{{");
-    println!("    \"filename\": \"{}\",", escape_json_string(filename));
-    println!(
-        "    \"format\": \"{}\",",
-        escape_json_string(&result.format)
-    );
+    println!("    \"filename\": \"{}\",", json_escape(filename));
+    println!("    \"format\": \"{}\",", json_escape(&result.format));
     println!("    \"check-errors\": {},", result.total_errors);
     if !unsafe_quirks || result.corruptions > 0 {
         println!("    \"corruptions\": {},", result.corruptions);
@@ -17538,34 +17573,25 @@ impl<'a, W: std::io::Write> SnapshotRenderer<'a, W> {
                 } else {
                     (10usize, 16usize)
                 };
-                let id_pad = " ".repeat(id_width.saturating_sub(entry.id.len()));
-                let tag_pad = " ".repeat(tag_width.saturating_sub(entry.name.len()));
+                // Both columns are read from the image's snapshot table,
+                // so they are escaped first and padded by the byte
+                // length of what is actually printed, as above.
+                let id = terminal_safe(&entry.id);
+                let name = terminal_safe(&entry.name);
+                let id_pad = " ".repeat(id_width.saturating_sub(id.len()));
+                let tag_pad = " ".repeat(tag_width.saturating_sub(name.len()));
 
                 if modern {
                     writeln!(
                         self.writer,
                         "{}{} {}{} {:>8} {:>19} {:>15} {:>10}",
-                        entry.id,
-                        id_pad,
-                        entry.name,
-                        tag_pad,
-                        vm_size_str,
-                        date_str,
-                        clock_str,
-                        icount_str
+                        id, id_pad, name, tag_pad, vm_size_str, date_str, clock_str, icount_str
                     )
                 } else {
                     writeln!(
                         self.writer,
                         "{}{}{}{}{:>9}{:>20}{:>13}{:>11}",
-                        entry.id,
-                        id_pad,
-                        entry.name,
-                        tag_pad,
-                        vm_size_str,
-                        date_str,
-                        clock_str,
-                        icount_str
+                        id, id_pad, name, tag_pad, vm_size_str, date_str, clock_str, icount_str
                     )
                 }
             }
@@ -17711,28 +17737,6 @@ fn format_qemu_snapshot_date_local(date_sec: u64) -> String {
     }
     // `strftime`'s return value excludes the trailing nul.
     String::from_utf8_lossy(&buf[..written]).into_owned()
-}
-
-/// Minimal JSON string escaping for the snapshot renderer's
-/// instar-extension JSON output. qcow2 snapshot IDs are decimal
-/// strings (no escapes needed); names are user-supplied UTF-8
-/// and require escaping of `"`, `\`, and the C0 control range.
-fn json_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\x08' => out.push_str("\\b"),
-            '\x0C' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out
 }
 
 /// Entry point for the `create` subcommand.
@@ -18921,7 +18925,7 @@ fn render_create_success_json(
     file_size_after: u64,
     resolved_unit_size: u32,
 ) {
-    let escaped = json_escape_string(&args.filename);
+    let escaped = json_escape(&args.filename);
     println!("{{");
     println!("    \"filename\": \"{}\",", escaped);
     println!("    \"format\": \"{}\",", args.target_format);
@@ -18933,22 +18937,6 @@ fn render_create_success_json(
     println!("    \"file_size_after\": {},", file_size_after);
     println!("    \"resolved_unit_size\": {}", resolved_unit_size);
     println!("}}");
-}
-
-/// Minimal JSON-string escaping for `"` and `\`. Filenames may
-/// contain either; the rest of the renderer assumes ASCII-safe
-/// values for the other fields (numeric or controlled strings).
-fn json_escape_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out
 }
 
 /// Host-side defensive validation of `CreateArgs`. The guest
@@ -20718,6 +20706,32 @@ Offset          Length          Mapped to       File
     }
 
     #[test]
+    fn snapshot_human_escapes_hostile_tag() {
+        // A snapshot tag is image data: ESC must not reach the
+        // terminal, a newline must not start a forged row, and the
+        // padding is measured on the escaped text so the columns
+        // after the tag still line up.
+        let e = snap("1\x1b", "a\x1b[2J\nb", 0, 0, 0, 0, 0, 0);
+        let text = String::from_utf8(render_snapshot_human(&[e])).unwrap();
+        assert!(!text.contains('\x1b'), "raw ESC in: {text:?}");
+        assert_eq!(text.lines().count(), 3, "forged row in: {text:?}");
+        assert!(
+            text.contains("1\\u{1b} a\\u{1b}[2J\\nb         0 B"),
+            "row: {text:?}"
+        );
+    }
+
+    #[test]
+    fn snapshot_json_escapes_hostile_tag() {
+        let e = snap("1", "a\x1b\"\u{202e}b", 0, 0, 0, 0, 0, 0);
+        let text = String::from_utf8(render_snapshot_json(&[e])).unwrap();
+        assert!(
+            text.contains("\"name\": \"a\\u001b\\\"\\u202eb\""),
+            "json: {text:?}"
+        );
+    }
+
+    #[test]
     fn snapshot_human_pre_9_0_header_byte_exact() {
         // Captured from instar-testdata's static qemu-img builds:
         // every version from 6.0.0 through 8.2.2 emits this header,
@@ -21225,17 +21239,6 @@ Offset          Length          Mapped to       File
             "expected file-not-found after D2 dispatch, got: {}",
             msg
         );
-    }
-
-    // --- json_escape ----------------------------------------------
-
-    #[test]
-    fn snapshot_json_escape_basic() {
-        assert_eq!(json_escape("abc"), "abc");
-        assert_eq!(json_escape("a\"b"), "a\\\"b");
-        assert_eq!(json_escape("a\\b"), "a\\\\b");
-        assert_eq!(json_escape("a\nb"), "a\\nb");
-        assert_eq!(json_escape("\x07"), "\\u0007");
     }
 }
 

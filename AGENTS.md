@@ -122,6 +122,12 @@ Per-format feature detail is in
   arithmetic on image-derived values exist for a reason; a future reader
   needs to know which invariant a check is protecting.
 
+- **Every string the guest reports is untrusted when printed.** Pass it
+  through `escape::terminal_safe` (or `terminal_safe_path`) for human
+  output and `escape::json_escape` inside a JSON string, never `{}`
+  directly, and do not add another escaper. See "Text Read From an
+  Image" in [docs/output-formats.md](docs/output-formats.md).
+
 - **Prefer clarity over cleverness**, and follow the conventions of
   whatever language is being used. Rust code is formatted by `rustfmt`
   and linted by `clippy`, both enforced by the pre-commit hooks;

@@ -8,6 +8,7 @@ that known qemu-img CVEs are mitigated by instar's architecture.
 """
 
 import json
+import shutil
 import subprocess
 import tempfile
 import time
@@ -496,6 +497,161 @@ class TestBackingPathOracle(InstarTestBase):
                 f"instar: using 'base.raw' beside the image in place of '{reference}'",
                 stderr
             )
+
+
+# A name built to attack the terminal it is printed on: ESC sequences
+# that clear the screen and recolour text, then a newline that starts a
+# forged line of check output.
+_HOSTILE_NAME = 'p\x1b[2J\x1b[31m\nNo errors were found on the image.'
+_HOSTILE_NAME_ESCAPED = 'p\\u{1b}[2J\\u{1b}[31m\\nNo errors were found on the image.'
+
+
+class TestImageDerivedTextEscaping(InstarTestBase):
+    """Strings read from an image cannot drive the user's terminal.
+
+    A backing file name, a snapshot tag and a VMDK create type are all
+    image data. Human output escapes the control characters in them,
+    so ESC never reaches the terminal and a newline cannot forge an
+    output line; JSON output carries the exact value, escaped so the
+    document still parses. The images are built here with instar
+    itself, so these tests need neither qemu-img nor new fixtures.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def _instar(self, *args):
+        result = subprocess.run(
+            [str(self.get_instar_binary()), *[str(a) for a in args]],
+            capture_output=True, text=True, timeout=60
+        )
+        return result.stdout, result.stderr, result.returncode
+
+    def _assert_terminal_safe(self, text, what):
+        self.assertNotIn('\x1b', text, f'raw ESC in {what}: {text!r}')
+        for line in text.splitlines():
+            self.assertFalse(
+                line.startswith('No errors were found on the image.'),
+                f'forged line in {what}: {text!r}'
+            )
+
+    def _overlay_with_hostile_backing(self):
+        # create -b opens the backing even with -u, so give it a real
+        # file to open: Linux allows ESC and newline in a file name.
+        (self.tmp / _HOSTILE_NAME).write_bytes(b'\0' * 1024 * 1024)
+        overlay = self.tmp / 'overlay.qcow2'
+        _, stderr, rc = self._instar(
+            'create', '-f', 'qcow2', '-u', '-F', 'raw', '-b', _HOSTILE_NAME,
+            overlay, '1M'
+        )
+        self.assertEqual(0, rc, f'create failed: {stderr!r}')
+        return overlay
+
+    def test_info_human_escapes_backing_file_name(self):
+        overlay = self._overlay_with_hostile_backing()
+        stdout, stderr, rc = self.run_instar_info(overlay)
+        self.assertEqual(0, rc, f'stderr={stderr!r}')
+        self._assert_terminal_safe(stdout, 'info')
+        self.assertIn(f'backing file: {_HOSTILE_NAME_ESCAPED} (actual path: ', stdout)
+
+    def test_info_json_round_trips_backing_file_name(self):
+        overlay = self._overlay_with_hostile_backing()
+        stdout, stderr, rc = self.run_instar_info(overlay, output_format='json')
+        self.assertEqual(0, rc, f'stderr={stderr!r}')
+        self._assert_terminal_safe(stdout, 'info --output json')
+        self.assertEqual(_HOSTILE_NAME, json.loads(stdout)['backing-filename'])
+
+    def test_info_chain_human_escapes_backing_file_name(self):
+        overlay = self._overlay_with_hostile_backing()
+        stdout, stderr, rc = self.run_instar_info(overlay, chain=True)
+        self.assertEqual(0, rc, f'stderr={stderr!r}')
+        self._assert_terminal_safe(stdout, 'info --chain')
+        self._assert_terminal_safe(stderr, 'info --chain stderr')
+        self.assertIn(f'(qcow2) -> {_HOSTILE_NAME_ESCAPED}\n', stdout)
+
+    def test_snapshot_list_escapes_tag(self):
+        image = self.tmp / 'snap.qcow2'
+        _, stderr, rc = self._instar('create', '-f', 'qcow2', image, '1M')
+        self.assertEqual(0, rc, f'create failed: {stderr!r}')
+        _, stderr, rc = self.run_instar_snapshot('-c', _HOSTILE_NAME, image)
+        self.assertEqual(0, rc, f'snapshot -c failed: {stderr!r}')
+
+        stdout, stderr, rc = self.run_instar_snapshot('-l', image)
+        self.assertEqual(0, rc, f'stderr={stderr!r}')
+        self._assert_terminal_safe(stdout, 'snapshot -l')
+        self.assertEqual(3, len(stdout.splitlines()), f'forged row: {stdout!r}')
+        self.assertIn(_HOSTILE_NAME_ESCAPED, stdout)
+
+        stdout, stderr, rc = self.run_instar_snapshot('-l', '--output', 'json', image)
+        self.assertEqual(0, rc, f'stderr={stderr!r}')
+        self.assertEqual(_HOSTILE_NAME, json.loads(stdout)[0]['name'])
+
+    def test_verbose_stderr_escapes_chain_device_paths(self):
+        """--verbose debug lines name each chain device by its path.
+
+        The backing image's path is resolved from the overlay's header,
+        so the host's own debug lines print image data too, not only the
+        guest's.
+        """
+        overlay = self._overlay_with_hostile_backing()
+        # The exit status is not the point: check reports the raw backing
+        # under a qcow2 overlay as a chain format mismatch.
+        _, stderr, _ = self._instar('--verbose', 'check', '--chain', overlay)
+        self._assert_terminal_safe(stderr, 'check --chain --verbose stderr')
+        self.assertIn(f'/{_HOSTILE_NAME_ESCAPED}\n', stderr)
+
+    def test_verbose_stderr_escapes_unresolved_differencing_parent(self):
+        """A differencing parent check does not resolve is still logged.
+
+        check refuses to compose a differencing chain, so the parent
+        name is only recorded, and never reaches a path check that could
+        reject it before it is printed.
+        """
+        fixture = (self._testdata_root / 'custom' / 'format-coverage' / 'vhd-diff-parent.vhd')
+        self.assertTrue(fixture.exists(), f'parent fixture missing: {fixture}')
+        shutil.copyfile(fixture, self.tmp / _HOSTILE_NAME)
+        child = self.tmp / 'child.vhd'
+        result = subprocess.run(
+            [str(self.get_instar_binary()), 'create', '-f', 'vpc', '-b', _HOSTILE_NAME, '-F', 'vpc', child.name],
+            capture_output=True, text=True, timeout=60, cwd=self.tmp
+        )
+        self.assertEqual(0, result.returncode, f'create failed: {result.stderr!r}')
+
+        _, stderr, _ = self._instar('--verbose', 'check', '--chain', child)
+        self._assert_terminal_safe(stderr, 'check --chain --verbose stderr')
+        self.assertIn(f'parent recorded but not resolved (this operation does not compose a differencing '
+                      f'chain): {_HOSTILE_NAME_ESCAPED}\n', stderr)
+
+    def test_vmdk_create_type_is_escaped_and_keeps_json_valid(self):
+        """A create type ending in a backslash used to break the JSON.
+
+        The descriptor value is interpolated between quotes, so a
+        trailing backslash escaped the closing quote and the document
+        no longer parsed; a control character made it invalid too.
+        """
+        image = self.tmp / 'hostile.vmdk'
+        _, stderr, rc = self._instar('create', '-f', 'vmdk', image, '1M')
+        self.assertEqual(0, rc, f'create failed: {stderr!r}')
+        old = b'createType="monolithicSparse"'
+        new = b'createType="mono\x1b[2Jxxxxxxx\\"'
+        self.assertEqual(len(old), len(new))
+        data = image.read_bytes()
+        self.assertIn(old, data)
+        image.write_bytes(data.replace(old, new, 1))
+
+        stdout, stderr, rc = self.run_instar_info(image)
+        self.assertEqual(0, rc, f'stderr={stderr!r}')
+        self._assert_terminal_safe(stdout, 'info')
+        self.assertIn('    create type: mono\\u{1b}[2Jxxxxxxx\\\n', stdout)
+
+        stdout, stderr, rc = self.run_instar_info(image, output_format='json')
+        self.assertEqual(0, rc, f'stderr={stderr!r}')
+        self.assertEqual(
+            'mono\x1b[2Jxxxxxxx\\',
+            json.loads(stdout)['format-specific']['data']['create-type']
+        )
 
 
 class TestRawFormatValidation(InstarTestBase):
