@@ -563,6 +563,46 @@ Commits: the plan; then one per step. Every commit passes
   not only sizes. A label pool with no runners also queues jobs
   silently rather than failing, which on a merge gate looks exactly
   like this issue.
+* **Run the docs-only path filter in the merge queue too.** The
+  `check_paths` job runs `dorny/paths-filter` only
+  `if: github.event_name == 'pull_request'`
+  (`.github/workflows/functional-tests.yml:74,78`), and everything else
+  falls back to `code_changed=true`. The comment at `:61-65` records
+  that as deliberate -- "the safe direction, and cheap to revisit if it
+  proves annoying" -- so this is taking up the invitation, not fixing an
+  oversight.
+
+  It is annoying now, and measurably. #659 was documentation only: the
+  `pull_request` run skipped `build-and-test` and the whole matrix, and
+  the merge group then ran all of it, spending the full fan-out
+  verifying code the change did not touch. That is not merely wasted
+  `xl` time, it is the 360-minute deadline being spent on a change that
+  cannot fail the suite -- the exact exposure this plan exists to
+  shorten, arriving from a direction none of the five steps covers.
+
+  The shape: give the filter step a `base` of
+  `github.event.merge_group.base_sha` on a `merge_group` event so it
+  diffs the group against what the group is being merged into. That is
+  the right granularity rather than a convenient one -- a merge group
+  can hold several pull requests, and `base_sha..head_sha` computes
+  "docs only" over the whole group, which is what the gate needs to be
+  true of. Verify the action's input names before writing it; this is
+  from its documentation, not from a run.
+
+  Two things to check rather than assume. The aggregate must still
+  report success with the matrix skipped -- the `pull_request` path
+  already proves it does for a docs-only change, and `can_merge` at
+  `functional-tests.yml:1335` depends on the `package-matrix` job key
+  rather than the per-entry names, so the skip shape is the one already
+  in use. And confirm a label pool with no runners is not how a
+  mis-specified filter fails, because that queues silently rather than
+  erroring, which on a merge gate is indistinguishable from this issue.
+
+  Independent of steps 1 to 5 and of private-ci#144: it changes no leg
+  durations and needs no fleet behaviour, so it can land whenever. It is
+  worth noting that it does nothing for a code change, which is every
+  merge group this plan's measurements came from -- it removes a class
+  of run rather than shortening the path.
 * **Cancel an ejected merge group's run once its PR is re-queued.**
   Run 38206699440 held `xl` runners for 58 minutes past the ejection
   for a result nothing could use. Belongs to whatever watches the
