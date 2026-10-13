@@ -42,6 +42,11 @@ WAVE2="${SCRIPT_DIR}/wave2-mechanical.sh"
 
 cd "$REPO_ROOT" || exit 1
 
+# Same idiom as test-inline-script-check.sh: one work directory, removed
+# on any exit, so nothing is left in /tmp and no path is predictable.
+WORK="$(mktemp -d)"
+trap 'rm -rf "${WORK}"' EXIT
+
 FAILURES=0
 
 start() { echo "--- $1"; }
@@ -58,9 +63,15 @@ expect_names() {
     else
         fail "$name"
         echo "      expected:" >&2
-        echo "${expected:-<nothing>}" | sed 's/^/        /' >&2
+        # ${var//pat/repl} cannot anchor "start of each line" the way
+        # sed's ^ does -- bash pattern matching has no multiline mode,
+        # so it would only ever touch the first line. sed is correct
+        # here, not just familiar.
+        # shellcheck disable=SC2001
+        sed 's/^/        /' <<< "${expected:-<nothing>}" >&2
         echo "      actual:" >&2
-        echo "${actual:-<nothing>}" | sed 's/^/        /' >&2
+        # shellcheck disable=SC2001  # see the multi-line note above
+        sed 's/^/        /' <<< "${actual:-<nothing>}" >&2
     fi
 }
 
@@ -70,11 +81,12 @@ expect_names() {
 expect_refused() {
     local name="$1" expected_rc="$2"
     shift 2
-    local out err rc
-    out="$("$WAVE2" "$@" 2>/tmp/audit-scope-test-err.$$)"
+    local err rc
+    # stdout is discarded, not inspected -- only the exit code and
+    # stderr (the "naming the problem" message) matter here.
+    "$WAVE2" "$@" >/dev/null 2>"${WORK}/stderr"
     rc=$?
-    err="$(cat /tmp/audit-scope-test-err.$$)"
-    rm -f /tmp/audit-scope-test-err.$$
+    err="$(cat "${WORK}/stderr")"
     if [ "$rc" -ne "$expected_rc" ]; then
         fail "$name (exit $rc, want $expected_rc)"
         return
@@ -92,6 +104,7 @@ actual="$(
     # shellcheck source=tools/audit/audit-scope.sh
     source "$LIB"
     audit_scope_init
+    # shellcheck disable=SC2119  # no pathspec: whole-scope, by design
     audit_scope_names_all | sort -u
 )"
 expect_names "default scope == develop...HEAD" "$expected" "$actual"
@@ -102,6 +115,7 @@ actual="$(
     # shellcheck source=tools/audit/audit-scope.sh
     source "$LIB"
     audit_scope_init --range '60e4381c^1..60e4381c'
+    # shellcheck disable=SC2119  # no pathspec: whole-scope, by design
     audit_scope_names_all | sort -u
 )"
 expect_names "--range 60e4381c^1..60e4381c" "$expected" "$actual"
@@ -113,20 +127,21 @@ else
 fi
 
 start "--commits-file of one merge resolves to its first-parent diff"
-cfile="$(mktemp)"
+cfile="$(mktemp -p "${WORK}")"
 printf '# one phase merge\n60e4381c\n' > "$cfile"
 expected="$(git diff --name-only '60e4381c^1' '60e4381c' | sort -u)"
 actual="$(
     # shellcheck source=tools/audit/audit-scope.sh
     source "$LIB"
     audit_scope_init --commits-file "$cfile"
+    # shellcheck disable=SC2119  # no pathspec: whole-scope, by design
     audit_scope_names_all | sort -u
 )"
 rm -f "$cfile"
 expect_names "--commits-file (single merge)" "$expected" "$actual"
 
 start "--commits-file of two merges resolves to the union of their first-parent diffs"
-cfile="$(mktemp)"
+cfile="$(mktemp -p "${WORK}")"
 cat > "$cfile" <<'EOF'
 # two phase merges; blank lines and comments are ignored
 
@@ -139,6 +154,7 @@ actual="$(
     # shellcheck source=tools/audit/audit-scope.sh
     source "$LIB"
     audit_scope_init --commits-file "$cfile"
+    # shellcheck disable=SC2119  # no pathspec: whole-scope, by design
     audit_scope_names_all | sort -u
 )"
 rm -f "$cfile"
@@ -180,11 +196,12 @@ if [ "$rc" -eq 0 ] \
     ok "implicit empty scope warns, sets skip, and does not exit"
 else
     fail "implicit empty scope was not handled as expected (subshell rc=$rc)"
-    echo "$output" | sed 's/^/      /' >&2
+    # shellcheck disable=SC2001  # see the multi-line note in expect_names above
+    sed 's/^/      /' <<< "$output" >&2
 fi
 
 start "both options together are refused"
-cfile="$(mktemp)"
+cfile="$(mktemp -p "${WORK}")"
 printf '60e4381c\n' > "$cfile"
 expect_refused "--range + --commits-file together are refused with exit 9" 9 \
     --range 'HEAD..HEAD' --commits-file "$cfile"

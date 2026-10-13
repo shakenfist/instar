@@ -221,6 +221,22 @@ audit_scope_init() {
 }
 
 # audit_scope_count -- number of distinct files in the whole scope.
+#
+# This is the only call, anywhere in this file, to one of the four
+# scope-reading functions with no pathspec. A single-file lint sees
+# that call and concludes (SC2119/SC2120) that audit_scope_names_all
+# never needs arguments at all -- it has no visibility into
+# wave1.sh, wave2-mechanical.sh or test-audit-scope.sh, which are the
+# files that actually call it (and the other three functions below)
+# with pathspecs. That is a false positive: the optional-PATHSPEC
+# signature documented above is deliberate, so both findings are
+# disabled with a reason rather than restructured.
+# audit_scope_names_null, audit_scope_names_added and audit_scope_diff
+# have no internal caller in this file at all, so the lint has no
+# zero-arg call site to reason from here and raises nothing for them
+# -- the asymmetry is this one caller, not a difference in the
+# functions' shapes.
+# shellcheck disable=SC2119  # no pathspec: whole-scope, by design
 audit_scope_count() {
     audit_scope_names_all | grep -c .
 }
@@ -263,6 +279,7 @@ audit_scope_names_null() {
     fi
 }
 
+# shellcheck disable=SC2120  # called with pathspecs from wave1.sh/wave2-mechanical.sh/test-audit-scope.sh; audit_scope_count's zero-arg call above is this file's only caller
 audit_scope_names_all() {
     if [[ "$AUDIT_SCOPE_MODE" == "commits" ]]; then
         local sha
