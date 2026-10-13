@@ -69,6 +69,7 @@ Exit codes:
 | 6    | could not enter the repo root  |
 | 7    | `make fuzz-build` failed       |
 | 8    | `tools/mermaid-lint.sh` failed |
+| 9    | could not resolve a usable audit scope (bad `--range`/`--commits-file`, or an explicitly-given `--range`/`--commits-file` resolved to zero files -- the implicit `develop...HEAD` default resolving to zero files is not an error) |
 
 If wave 1 fails, fix the cause and re-run before
 spending on wave 2.

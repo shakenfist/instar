@@ -11,14 +11,35 @@
 # documentation alignment, security analysis) stays as a wave 2
 # sub-agent.
 #
-# Usage: tools/audit/wave1.sh
+# Usage: tools/audit/wave1.sh [--range REV..REV | --commits-file PATH]
 # Run from the worktree root.
+#
+# The mechanical style checks in wave 1b (long lines in changed Rust
+# files, adversarial fixtures added in the wrong repo) are scoped to
+# a set of files, which defaults to `git diff develop...HEAD` -- i.e.
+# ordinary pre-push use is unchanged. --range and --commits-file
+# (mutually exclusive) override that scope; see audit-scope.sh for
+# what each means and how a --commits-file union resolves "added".
+# The resolved file count is printed before any check runs. The
+# script exits 9 if --range/--commits-file was given and resolves to
+# zero files, or if the options are misused -- an EXPLICIT scope that
+# is empty means the caller got it wrong. The implicit default
+# resolving to zero files is not an error (it means "no changes
+# against develop", which is the ordinary state right after a push):
+# wave 1b's two scoped checks are skipped with a warning and every
+# other wave 1 check (pre-commit, the build, the test suite) still
+# runs.
 
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT" || exit 6
+
+# shellcheck source=tools/audit/audit-scope.sh
+source "$SCRIPT_DIR/audit-scope.sh"
+audit_scope_init "$@"
+audit_scope_report
 
 red() { printf '\033[31m%s\033[0m\n' "$*"; }
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -103,13 +124,16 @@ echo
 bold "=== wave 1b: mechanical style checks ==="
 
 # 1. Long-line check: warn on Rust source lines over 120 chars in
-#    changed files relative to develop. Non-fatal -- purely
-#    informational. Skip if develop is not a known ref (e.g. shallow
-#    clone in CI).
-if git rev-parse --verify develop >/dev/null 2>&1; then
+#    changed files relative to the resolved audit scope (default:
+#    develop...HEAD). Non-fatal -- purely informational. Skipped when
+#    AUDIT_SCOPE_SKIP_SCOPED is set: the default scope's `develop` is
+#    not a known ref (e.g. shallow clone in CI), or the default scope
+#    resolved to zero files (nothing merits a warning here, since
+#    audit_scope_report already printed one).
+if [[ "$AUDIT_SCOPE_SKIP_SCOPED" -eq 0 ]]; then
     # -z / -0: NUL-delimited so filenames with spaces or special
     # characters survive the xargs split.
-    LONG_LINES=$(git diff develop...HEAD -z --name-only -- '*.rs' \
+    LONG_LINES=$(audit_scope_names_null '*.rs' \
         | xargs -r -0 awk 'length > 120 {print FILENAME":"NR": "length" chars"}' \
         2>/dev/null || true)
     if [[ -n "$LONG_LINES" ]]; then
@@ -136,8 +160,12 @@ fi
 # 3. Adversarial / CVE fixture check: any new test asset committed
 #    under src/, tests/, or scripts/ that looks like a malicious
 #    image probably belongs in shakenfist/instar-testdata, not here.
-if git rev-parse --verify develop >/dev/null 2>&1; then
-    BADPLACE=$(git diff develop...HEAD --name-only --diff-filter=A \
+#    "Added" is the union across the resolved scope: a file added in
+#    one commit of a --commits-file counts as added even if a later
+#    commit in the same union modified it.
+if [[ "$AUDIT_SCOPE_SKIP_SCOPED" -eq 0 ]]; then
+    # shellcheck disable=SC2119  # no pathspec: whole-scope, by design
+    BADPLACE=$(audit_scope_names_added \
         | grep -E '^(src|tests|scripts)/.*(adversarial|malicious|cve|exploit)' \
         || true)
     if [[ -n "$BADPLACE" ]]; then
