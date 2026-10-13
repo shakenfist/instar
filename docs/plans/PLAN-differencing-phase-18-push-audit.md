@@ -337,6 +337,145 @@ materialised scope size, and wait. Four high-effort opus agents over a
 55,000-line patch is the expensive part of this phase and it is cheap
 to spend it on the wrong scope.
 
+## Audit findings
+
+Wave 1 exited 0 over the 103-file scope: pre-commit, rustfmt/clippy,
+`make instar`, `make check-binary-sizes`, `make test-rust` (2,522 tests
+across 78 binaries, 0 failures), `make fuzz-build` and `mermaid-lint` all
+passed, and wave 1b's two scope-dependent checks found no long lines and no
+adversarial fixture committed to the wrong repository. One advisory: 51
+oversized inline `run:` blocks, 35 of them in the four workflows the scope
+touched. It took three attempts -- the first two were killed by host memory
+pressure from a concurrent full-system backup, mid-`make instar` and
+mid-devcontainer-build respectively. Those were environment failures, not
+findings; the third ran clean.
+
+Wave 2 mechanical exited 0 and reported 16 TODO/FIXME hits, 325 new
+`#[test]` functions, 171 added lines containing `unsafe`, 256 added
+`.unwrap()`/`.expect()`, and zero host-side `unsafe`, zero
+`#[allow(dead_code)]` and zero misplaced adversarial fixtures.
+
+### Fixed in this phase
+
+Defects this plan introduced, all of them documentation or comments that
+are wrong today. Each was verified in the tree by the management session
+before being fixed.
+
+| Finding | Site | What was wrong |
+|---|---|---|
+| CHANGELOG contradicts itself | `CHANGELOG.md` `[Unreleased]` | Two entries said "Nothing reachable from the CLI changes: `instar create -f vpc -b parent.vhd child.vhd` still fails with \"invalid option for target format\"" while a third in the same section said that command now produces differencing children. Written at phases 5 and 6, where they were true; falsified by phase 7, which wired the CLI; never revisited. All three would have shipped in one release's notes. The interim claims are removed -- a release note should describe what ships, not a superseded intermediate state. |
+| Live plan citations | `CHANGELOG.md:261,273,291` | Three markdown links to this plan as the source for built work, the only three `[PLAN-` citations in the file. Removed, reasoning inlined. Phase 17 excluded `CHANGELOG.md` from its sweep wholesale, justified by `:829`'s verbatim quote of a past release's error message -- a blanket exclusion earned by one hit, concealing four others. `:829` is untouched; it is correct as history. |
+| Falsified refusal rationale | `src/operations/create/src/main.rs:204-209` | Said "Every read path in instar that composes sector data refuses such an image" and "Until parent composition exists (`docs/plans/PLAN-differencing.md`)". Five operations compose, and composition exists -- it is what this plan built. Phase 10 wrote the block; phases 12 and 13 falsified it without touching the file. Replaced with the operative reason, verified: this function records exactly one parent reference and has no notion of a chain behind it, so an overlay on a differencing image would be a two-level chain instar has never authored. A bare "this phase" reference in the same block also went. |
+| Falsified refusal rationale | `src/operations/map/src/main.rs:460-462` | Said "the chain follow-up will lift this restriction". The chain follow-up is phases 11 to 17 and it settled the opposite. The VHDX sibling arm 70 lines below was corrected by phase 4 in the same diff; this arm was not, and phase 15 touched the file again without catching it. Now mirrors the sibling and names issue #641. |
+| False for VHD | `docs/info.md:77-79` | Claimed `info` "decodes the parent name **and the parent locator entries**". True for VHDX; false for VHD, where no read path consults the locator table at all. Corrected, and the underlying behaviour filed as #661. |
+| Stale fuzz-target counts | `docs/testing.md:1357`, `docs/development.md:790`, `docs/security-audits.md:466` | 42, 40 and 40 against an actual 43. The tiering arithmetic at `:1357` computed a sharding threshold from a count one short; recomputed. `docs/testing.md:1427`'s "21 of the 40" is a dated incident narrative and correctly left. |
+| Stale guard-group breakdown | `docs/testing.md:1773,1796,1807` | Prose said 6 + 4 + 1 + 3 = 14 where CI enforces 15. Measured: the shared-walk sub-group has two cases, not one -- phase 16 added `vhdx-bat-walk-counts-the-bitmap-slots-at-4k-sectors`, bumped the two figures CI forced, and left the three it did not. The script's own comment at `:736` records that an earlier version said "14 cases guard". |
+| Hand-maintained derived numbers | `docs/testing.md:2041` | "the 62 cases name 50 distinct targets (43 Rust, 7 integration)" against 105 cases. Rather than substitute another hand-computed figure, the sentence no longer restates derived numbers -- three independent attempts at the distinct-target count during this audit produced 84, 82 and 94, which is the argument for not writing it down. |
+| Overstated claim | `docs/plans/index.md:42` | Said the harness's "case counts are now derived from the script rather than written in prose". The totals are, and CI enforces them; the sub-group breakdown was prose and drifted again. Qualified at source. |
+
+Two one-line fixes to pre-existing code were taken as well, because both
+are instances of the defect this phase was convened over -- a check that
+reports success having examined nothing:
+
+| Finding | Site | Fix |
+|---|---|---|
+| CI canary misses the audit fixtures | `tools/ci/prepare-testdata.sh` | The differencing locator fixtures are the only automated proof that the path-traversal references are refused, and `tests/test_differencing.py:546-551` skips rather than fails when a fixture is absent. A partial testdata checkout removed that proof with CI still green. `custom/audit/vhd-diff-locator-dotdot.vhd` added to the canary list. |
+| False PASS on an empty comparison | `tools/verify-info-output-parity.sh:78` | `BASE="$(git merge-base origin/develop HEAD)"` with no `BASE != HEAD` guard, so on `develop` it built the same tree twice and printed `PASS: instar info output is byte-identical`. Guard added and proven: on `develop` the merge-base is HEAD, so it now exits 2. |
+
+### Filed
+
+| Issue | Finding |
+|---|---|
+| [#660](https://github.com/shakenfist/instar/issues/660) | TOCTOU between backing-path validation and backing-file open. MEDIUM. The mechanism predates the plan; phase 14 took the commands reaching it on VHD-family input from zero to five. |
+| [#661](https://github.com/shakenfist/instar/issues/661) | instar's VHD read path never consults the parent locator table. Fail-closed, so not a vulnerability, but it means the `-conflicting` fixture does not test its own question, a legitimate differencing VHD with a blank name reads as parentless, and ~400 lines of hardened parser plus a fuzz target guard code nothing ships. |
+| [#662](https://github.com/shakenfist/instar/issues/662) | VHDX locator `LocatorType` GUID and locator-level defect both unchecked; `VhdState::block_lookup` lacks the VHDX offset-zero and region-overlap guards. |
+| [#663](https://github.com/shakenfist/instar/issues/663) | Four checks documented as guards that run nowhere or cannot fail, including `integration-core` having no `Ran: N` floor. |
+| [#664](https://github.com/shakenfist/instar/issues/664) | `fuzz_chain_compose` cannot reach the VHD or VHDX compose arms, so the plan's central new code is fuzzed by nothing. |
+| [#665](https://github.com/shakenfist/instar/issues/665) | ~720 lines of compose logic duplicated across four layers with no cross-reference NOTE, and nothing pairing a guest refusal raiser with its host renderer. |
+
+### Negative results worth recording
+
+A push audit that reports only findings does not tell a reader which ground
+was covered. These were measured, not read.
+
+* **The refusal invariant holds.** Phase 4 established that a refusal must
+  never depend on whether the parent file happens to exist, because the
+  opposite leaks filesystem existence to whoever supplied the image. Each
+  refusal site was run twice over the same image, once with the named
+  parent absent and once with a real parent planted at exactly the path the
+  image names: `check`, `measure` and `map` gave byte-identical messages and
+  rc=1 both times.
+* **No filesystem-existence oracle.** Four crafted VHDs naming an existing
+  file, a missing file, an existing directory and a missing directory all
+  produced identical reasons. An out-of-allowlist absolute reference is
+  never probed; a `..` escape is judged from its spelling.
+* **Every `VhdState::init` / `VhdxState::init` caller refuses or composes.**
+  This is the check phase 14 made necessary by removing `VhdxState::init`'s
+  own rejection. All callers enumerated and, where reachable, executed. None
+  forgot.
+* **Chain depth and cycles: one choke point, guarded.** All 11 walks go
+  through `discover_backing_chain`, which runs the circular and depth checks
+  before each hop. Measured with a self-referencing VHD, a two-image cycle
+  and a 41-deep chain. No bypass found.
+* **No unbounded allocation from a length field**, and the padded BAT bound
+  is correct including its off-by-one: for `g` groups the last bitmap entry
+  sits at `padded - 1` and the check is `>=`.
+* **Terminal and bidi injection neutralised** in the parent field this plan
+  made user-visible.
+* **The libvhdi oracle hazard is real but cheap.** With the oracle present
+  and `INSTAR_REQUIRE_LIBVHDI=1`: `Ran: 1273, Passed 1257, Skipped 16,
+  Failed 0`, and zero differencing skips. Only 7 of ~100 differencing tests
+  touch the oracle, and primary assurance is the recorded `*-composed.raw`
+  goldens, which are oracle-independent. CI sets the variable on the right
+  job.
+* **Three deliberate mutations were all caught**, including one to a
+  parent-owned payload sector inside `vhd-diff-parent.vhd`, which proves
+  instar genuinely sources those bytes from the parent -- the direct inverse
+  of issue #547.
+* **No dead code.** All 84 public items the plan added were checked for uses
+  outside their defining file; the 21 with none are measured byte-offset
+  constants used by their own layout tests.
+* **The production `unsafe` surface of this entire plan is seven function
+  signatures.** Of the 171 added lines containing `unsafe`, none is under
+  `src/vmm/**`, 51 are `#[cfg(test)]` mock call tables, 20 are fuzz
+  harness, and 19 of the apparent qcow2 total are a diff-alignment artifact
+  blame-verified to pre-plan commits.
+
+### Corrections the sub-agents made to this plan's own briefs
+
+Recorded because a brief that states a wrong premise costs more than one
+that states none.
+
+1. The `unsafe` count in step 3a's brief, 77 lines in qcow2, was inflated
+   by Myers diff alignment; the net figure is 58.
+2. Step 3b's brief said the mutation harness "grew from 26 to 62 cases". 62
+   is the phase-13 value, taken from the master plan's prose without
+   checking; the sequence is 26, 62, 91, 102, 105.
+3. Steps 3a and 3d were both told `discover_backing_chain` lives in
+   `src/vmm/src/chain.rs`. It is at `src/vmm/src/main.rs:3087`; `chain.rs`'s
+   only in-scope change is a `size_of::<ChainConfig>()` test assertion.
+4. Step 3d's brief said issue #625 was still open. It is closed, along with
+   #547, #548, #614, #633 and #565. Of the issues this plan handed over,
+   only #658 and the six filed above are open.
+5. Wave 2c reported that phase 17's "exactly nine hits" no longer held,
+   giving fifteen. Phase 17's definition of done excludes `docs/plans/`,
+   `CHANGELOG.md` and `docs/development.md` by name; with those exclusions
+   the grep returns exactly nine, verified. The agent had excluded only
+   `docs/plans/`. It pointed at the right file for the wrong reason.
+
+### Coverage this audit did not have
+
+* Wave 1's 2,522 tests are entirely `make test-rust`, which excludes the
+  `no_main` guest binaries by explicit list. `wave1.sh` has no integration
+  step, so the only execution of this plan's Python in the audit is wave
+  2b's own 1,273-test run.
+* The mutation harness's 105 verdicts were not executed -- only proven to
+  all still land, with the classifier self-tested. A full run needs docker,
+  testdata and `/dev/kvm` together, and CI never runs it either.
+* `make test-rust` DOES run the feature-gated qcow2 create tests; the
+  Makefile chains `cargo test --release -p qcow2 --features create`. An
+  earlier statement in this session that they were skipped was wrong.
+
 ## Deferred work
 
 * **The remaining `PLAN-*` citations in `src/`.** `01153800` removed
@@ -350,3 +489,20 @@ to spend it on the wrong scope.
   `docs/`, which is a documentation task rather than a comment edit.
   Out of scope here; the fleet block is `plan-references-in-code`
   (development#176).
+
+  The audit widened this task twice. A `PLAN-` string match does not see
+  the sibling class: `grep -rniE '(^|[^-[:alnum:]])phase [0-9]+[a-z]?\b'
+  src/ --include=*.rs --include=*.toml | grep -v 'PLAN-'` returns 364 bare
+  numbered-phase comments, so the cleanup as originally scoped would report
+  done with those left. And one of them is user-visible rather than a
+  comment: `src/vmm/src/main.rs:7034` ships CLI help reading "Phase 3 only
+  supports 512 ... phase 5 may relax this".
+* **The 4096-byte-sector VHDX limitation is recorded only in plan files.**
+  It is live and true -- `instar create --help` still says only 512 is
+  supported, and no test claims otherwise, so nothing quietly tests it with
+  a 512-byte image. The crate-level substitute is genuinely closed, with
+  six tests at 4096 and a mutation case naming the two-chunk-group walk.
+  But `grep -rn "4096-byte\|4K-sector" docs/*.md` finds only an unrelated
+  mention, and a user-facing limitation living in `PLAN-differencing.md`
+  and a phase-16 plan file is the wrong home for it under this project's
+  own documentation discipline.

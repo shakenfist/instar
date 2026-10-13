@@ -257,25 +257,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - `create::plan_vhd` can now emit a differencing VHD — footer
   `disk_type = 4`, a dynamic header carrying a parent's unique id,
-  timestamp and unicode name, and one populated parent locator entry
-  ([PLAN-differencing.md](docs/plans/PLAN-differencing.md)). This is
-  the crate-level emitter only, proven by instar's own VHD parser
-  reading back what it writes. Nothing reachable from the CLI changes:
-  `instar create -f vpc -b parent.vhd child.vhd` still fails with
-  "invalid option for target format", because the guest has nowhere to
-  get the parent's identity from until it can read the parent's own
-  footer.
+  timestamp and unicode name, and one populated parent locator entry.
+  The emitter reads the parent's identity out of the parent's own
+  footer, which is why it needs the parent open rather than just named.
+  Proven by instar's own VHD parser reading back what it writes; see
+  the CLI entry below for what this makes reachable.
 
 - `create::plan_vhdx` can now emit a differencing VHDX — the File
   Parameters `HasParent` bit, and a parent locator metadata item
   carrying `parent_linkage` (the parent's `DataWriteGuid`) plus a
-  `relative_path` or `absolute_win32_path` entry
-  ([PLAN-differencing.md](docs/plans/PLAN-differencing.md)). This is
-  the crate-level emitter only, proven by instar's own VHDX parser
-  reading back what it writes. Nothing reachable from the CLI changes:
-  `instar create -f vhdx -b parent.vhdx child.vhdx` still fails with
-  "invalid option for target format", because the guest has nowhere to
-  get the parent's `DataWriteGuid` from until it can open the parent.
+  `relative_path` or `absolute_win32_path` entry. The `parent_linkage`
+  value is the parent's own `DataWriteGuid`, so the emitter needs the
+  parent open rather than just named. Proven by instar's own VHDX
+  parser reading back what it writes; see the CLI entry below for what
+  this makes reachable.
 
 - **`instar create -f vpc -b parent.vhd -F vpc child.vhd` and `instar
   create -f vhdx -b parent.vhdx -F vhdx child.vhdx` now produce
@@ -287,8 +282,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   A differencing child's parent must be the same format as the child:
   format detection decides, not the `-F` hint, and a parent that
   detects as anything else — or a hint that contradicts detection — is
-  refused with a typed `ERROR_PARENT_FORMAT_MISMATCH`
-  ([PLAN-differencing.md](docs/plans/PLAN-differencing.md)). qemu-img
+  refused with a typed `ERROR_PARENT_FORMAT_MISMATCH`. qemu-img
   creates neither differencing format, so there is no oracle to
   cross-validate against; verification is instar's own parsers,
   `vhdiinfo`, and byte-level assertions against the parent's own

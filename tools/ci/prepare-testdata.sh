@@ -79,9 +79,15 @@ git lfs pull
 # We require at least one canary to exist and every present canary to be
 # non-pointer, so a silent LFS miss becomes a clear infra failure here
 # instead of 200+ "file format: unknown" test failures downstream.
+# custom/audit/ is canaried too: the differencing locator fixtures are
+# the only automated proof that the path-traversal references are
+# refused, and the tests that use them skip rather than fail when a
+# fixture is absent, so a partial checkout would remove that proof with
+# CI still green.
 canaries=(
     "custom/security/qcow2-backing-textfile.qcow2"
     "custom/raw/zeros-1mb.raw"
+    "custom/audit/vhd-diff-locator-dotdot.vhd"
 )
 found_canary=0
 for rel in "${canaries[@]}"; do

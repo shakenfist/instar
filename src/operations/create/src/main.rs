@@ -200,13 +200,15 @@ struct BackingProbe {
 /// `ERROR_BACKING_DIFFERENCING` rather than the generic
 /// `ERROR_BACKING_PARSE_FAILED`: the backing header parsed perfectly
 /// well, and telling a user a valid image is "truncated, corrupted, or an
-/// unrecognised format" is the undiagnosed failure this phase exists to
-/// stop making. Every read path in instar that composes sector data
-/// refuses such an image, so an overlay stacked on one would be a chain
-/// that can never be read back.
-/// Until parent composition exists
-/// (`docs/plans/PLAN-differencing.md`), failing closed at create time is
-/// the only outcome that does not hand the user a dead image. For VHDX
+/// unrecognised format" is the undiagnosed failure this refusal exists
+/// to stop making. The reason is not that such a chain could never be read
+/// back: `convert`, `dd`, `compare`, `bench` and `rebase` all compose a
+/// differencing child against its parent at sector granularity. It is
+/// that this function records exactly one parent reference, taken from
+/// the backing image's own header, and nothing here has any notion of a
+/// chain behind that parent — so an overlay on a differencing image
+/// would be a two-level chain instar has never authored. Failing closed
+/// at create time beats emitting one and discovering that later. For VHDX
 /// this preserves what `VhdxState::init`'s own `has_parent` rejection used
 /// to do before that rejection moved out to the read entry points; the VHD
 /// arm never had such a guard and gains one here so the two formats agree.
