@@ -25,9 +25,9 @@ and in Decision 3's refusal to rewrite history.
 
 ## Scope
 
-**In scope.** Four corrections, each a statement in the tree that is
-false today, plus the master-plan correction already made in this
-phase's planning commit:
+**In scope.** Corrections, each a statement in the tree that is false
+today, plus the master-plan correction already made in this phase's
+planning commit. The survey found four; execution found two more:
 
 * `ARCHITECTURE.md`'s claim that instar refuses to compose a
   differencing child on read.
@@ -37,6 +37,12 @@ phase's planning commit:
   differencing sub-state refuses three of those operations.
 * `docs/info.md`'s deferral of a known limitation to a plan whose work
   is now finished.
+
+Step 5, added during execution, extends that to the rest of the class
+rather than the reported instances: the live plan pointers in
+`docs/quirks.md` and `docs/testing.md`, and `docs/guest-architecture.md`'s
+claim that `VhdxState::init` already rejects a differencing VHDX. See
+"The sweep was under-scoped" below.
 
 **Out of scope.**
 
@@ -121,6 +127,24 @@ compose\|composition deferred\|deferred and tracked\|does not
 compose\|no composition' *.md docs/*.md` excluding `docs/plans/`
 returns those two lines and nothing else, so the class has exactly one
 member outside the changelog.
+
+**The sweep was under-scoped, found during execution.** That grep and
+the one in the Definition of done below were run against the files
+this survey was already considering, and their exclusion lists say so:
+`docs/quirks.md` holds five verbatim quotes of error messages instar
+emitted at commit `10ab838`, framed "at the time of this record", plus
+a provenance block citing the phase-01 structure pin, and
+`docs/testing.md` holds one more provenance citation. Those stay, for
+Decision 3's reason exactly. But four live pointers were hiding behind
+them -- `docs/quirks.md:4356` assigning path handling to "the
+composition phases" in the present tense, `docs/quirks.md:4836`
+deferring the *same* limitation as `docs/info.md` to the finished
+plan, and two in `docs/testing.md` -- and a fifth false statement in a
+file no phrase in the list could reach: `docs/guest-architecture.md`
+said "vhdx differencing is already rejected by `VhdxState::init`",
+which phase 14 falsified and which contradicts the next sentence of
+its own paragraph. Step 5 fixes those; the exclusion lists below now
+name what stays and why.
 
 ### `chain-config.md`'s VHD section is future tense for a built thing
 
@@ -236,6 +260,8 @@ phase 14 took and what is left.
 | 3 | low | sonnet | none | `docs/format-coverage.md:115-116` (D5). Mark the `check`, `map` and `measure` cells on the `vhd / vpc` and `vhdx` read-side rows with a note, following the file's existing `✓‡ N` / `R‡ N` idiom and numbering, and add the note text pointing at the "VHD/VHDX differencing (parent composition)" section at `:282`. Read that section first and keep the wording consistent with it. Check whether the In-place ops and Output side tables (`:136-137`, `:160-161`) need the same marker; `rebase` composes and `commit` does not, so decide by reading the section rather than by symmetry. Change nothing else in this file -- the compose section is current and must not be churned. |
 | 4 | medium | sonnet | none | `docs/info.md:112-117` (D4). First measure: build a differencing VHDX whose parent locator is a Windows-convention path and run `instar info` on it, and do the same for a VHD unicode parent name, to see whether the "actual path" output described there still reproduces. If it does, file an issue with the transcript and replace the plan-file link with the issue reference, keeping the explanation; the paragraph about `backing file:` being correct in every case stays either way. If it no longer reproduces, delete the limitation and say in the commit message which phase fixed it. Do not leave the plan link in place: phase 17 is the last documentation phase, so a pointer to a finished plan has no later owner. |
 
+| 5 | medium | opus | none | Added during execution, after the Definition of done's two greps failed for a reason the survey had not seen. Sweep the class rather than the four reported instances. Fix the live pointers at `docs/quirks.md:4356` (assigns path handling to "the composition phases", which are complete) and `docs/testing.md:1572` and `:1672` (send a reader to the plan to understand the current suite and the guarded path), retarget `docs/quirks.md:4836` at the issue step 4 filed so the two pages describing one limitation agree, and correct `docs/guest-architecture.md:585`, which claims `VhdxState::init` already rejects a differencing VHDX -- it reports `has_parent` instead (`src/crates/vhdx/src/lib.rs:2303-2309`), which is why `map` needed its own arm, as the very next sentence says. Leave every historical record alone: the five quoted error messages in `docs/quirks.md` and the two provenance citations are correct as history, and editing them is the one documentation error that cannot be caught by reading the tree. |
+
 Commits: the phase 16 close-out and this plan (already made); then one
 per step. Every commit passes `pre-commit run --all-files`.
 
@@ -253,8 +279,9 @@ per step. Every commit passes `pre-commit run --all-files`.
 
 Falsifiable, in the order a reviewer can check them:
 
-* `grep -rn 'refuses to compose\|composition deferred\|deferred and tracked\|does not compose\|no composition' *.md docs/*.md`, excluding `docs/plans/` and `CHANGELOG.md`, returns nothing.
-* `grep -rn 'PLAN-differencing' *.md docs/*.md`, excluding `docs/plans/`, `CHANGELOG.md` and `docs/development.md` (whose two hits describe the doc-phrase guard's own test strings), returns nothing: no landed page points a reader at this plan for behaviour that exists.
+* `grep -rn 'refuses to compose\|composition deferred\|deferred and tracked\|does not compose\|no composition' *.md docs/*.md`, excluding `docs/plans/`, `CHANGELOG.md` and `docs/quirks.md`, returns nothing. `docs/quirks.md` is excluded for Decision 3's reason and no other: its five hits are inside verbatim quotes of error messages instar emitted at commit `10ab838`, under a heading that says so and in a section that states the behaviour "at the time of this record".
+* `grep -rn 'PLAN-differencing' *.md docs/*.md`, excluding `docs/plans/`, `CHANGELOG.md` and `docs/development.md` (whose two hits describe the doc-phrase guard's own test strings), returns exactly nine hits, all provenance or quoted history: `docs/quirks.md:4193`, `:4194` and `:4200` (a block recorded by step 1c of the phase-01 pin), `docs/testing.md:2114` (fixtures packed against that pin), and the five quoted error messages above. No landed page points a reader at this plan for behaviour that exists.
+* `grep -rn 'already rejected by' docs/guest-architecture.md` returns nothing, and no landed page says `VhdxState::init` refuses a differencing image.
 * `docs/chain-config.md` contains no heading with "(future)" in it, and has a VHDX section.
 * The `check`, `map` and `measure` cells of the `vhd / vpc` and `vhdx` read-side rows in `docs/format-coverage.md` carry a note, and that note's text does not contradict the section at `:282`.
 * `docs/info.md` either carries no Windows-path limitation, or carries one with a GitHub issue reference and no plan-file link.
