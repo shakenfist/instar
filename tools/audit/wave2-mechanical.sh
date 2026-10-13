@@ -145,10 +145,15 @@ echo
 
 bold "=== wave 2d: guest-side unsafe blocks added (sandboxed, lower risk) ==="
 if [[ "$AUDIT_SCOPE_SKIP_SCOPED" -eq 0 ]]; then
+    # src/fuzz is named explicitly: it sits outside the main cargo
+    # workspace (which is why make fuzz-build is its own wave 1 step),
+    # so it is easy to leave out of a path list and nothing else here
+    # would report an unsafe block added under it.
     GUEST_UNSAFE=$(audit_scope_diff \
             'src/core/**/*.rs' \
             'src/operations/**/*.rs' \
             'src/crates/**/*.rs' \
+            'src/fuzz/**/*.rs' \
             'src/shared/**/*.rs' \
         | grep -nE '^\+.*\bunsafe\b' \
         || true)
