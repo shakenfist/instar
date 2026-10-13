@@ -130,13 +130,16 @@ permits backing references only on qcow2 and vmdk -- it refuses `-b`
 for vpc and vhdx -- so those two are an instar-only capability.
 A differencing VHD (`disk_type=4`) or VHDX (`HasParent` set) child
 is not the same thing as a backing-file reference: instar emits one from
-`create -b`, but refuses to compose one on read rather than merging the
-parent's sectors into the result, a composition deferred and tracked in
-[docs/plans/PLAN-differencing.md](docs/plans/PLAN-differencing.md).
+`create -b`, and on read `convert`, `dd`, `compare`, `bench` and
+`rebase` compose it against its parent at sector granularity, while
+`check`, `map` and `measure` refuse a differencing source by name and
+`info` reports the parent without composing it.
+[docs/chain-discovery.md](docs/chain-discovery.md) describes the
+capability.
 
 Per-format feature detail is in
 [docs/format-internals.md](docs/format-internals.md); the parity matrix
-against qemu-img is in
+against qemu-img and the per-operation matrix are both in
 [docs/format-coverage.md](docs/format-coverage.md); documented writer
 divergences are in [docs/quirks.md](docs/quirks.md).
 
