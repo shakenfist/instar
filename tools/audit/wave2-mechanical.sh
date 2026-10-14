@@ -74,7 +74,12 @@ show_capped() {
     printf '%s\n' "$content" | head -n "$cap"
 }
 
-bold "=== wave 2a: TODO / FIXME / HACK in changed files ==="
+# Deliberately whole-file, not added-lines: a TODO already sitting in
+# a file this work touched is worth a reader's attention, and the
+# diff-scoped checks below cover what was added. What was wrong was
+# the heading, which implied every hit was new -- over a 103-file
+# union most of them predate the plan.
+bold "=== wave 2a: TODO / FIXME / HACK anywhere in touched files (not only added lines) ==="
 if [[ "$AUDIT_SCOPE_SKIP_SCOPED" -eq 0 ]]; then
     # NUL-delimited and filtered to files still on disk: the old
     # pipeline split on whitespace (so a path with a space became two

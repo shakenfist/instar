@@ -137,6 +137,24 @@ unresolved scope, and is covered by four cases in
 `test-audit-scope.sh` including a comparison against the recipe it
 replaced.
 
+A fourth round then found the same shape again, in the tests
+themselves. Every history-dependent case -- the line-attribution
+check the file's own header called decisive, the `scope-patch.sh`
+union and truncation comparisons, and the only end-to-end run of a
+valid `--commits-file` through a wave script -- took a SKIP branch in
+the `ci-tooling` job, which checks out at `fetch-depth: 1`. CI
+therefore never ran any of them, and a SKIP that always fires is a
+pass standing in for a check that never happened: this phase's
+headline defect, inside the tests written to prevent it. Every case is
+now built on a generated fixture repository, the scripts that resolve
+their own repository root are copied into it, and no suite has a SKIP
+branch left. The same round also found that the line-attribution awk
+cut any path at its first space (`f2 with space.rs` became `f2`) and
+read an added line whose content began with `++ ` as a file header,
+dropping it and attributing everything after it to an invented path --
+both wrong-but-plausible locations of exactly the kind it was written
+to stop reporting, and neither covered by its fixtures.
+
 ### The union of merge ranges exists, and is complete
 
 Unlike the fuzz-autofix precedent, which had no range to audit and

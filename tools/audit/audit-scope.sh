@@ -55,28 +55,12 @@
 # and a message naming the problem -- there is no sane way to keep
 # running with an ambiguous scope.
 #
-# An EXPLICIT scope (--range or --commits-file) that resolves to zero
-# files is treated the same way: the caller asserted a scope and got
-# it wrong, so audit_scope_report exits 9 for that too -- that is not
-# a finding, it is a broken invocation. The IMPLICIT default
-# (develop...HEAD, no option given) is different: an empty result
-# there legitimately means "no changes against develop" -- the
-# ordinary state right after a push, or on a branch whose own work
-# has already merged -- and failing the whole pre-push gate over that
-# would block the unscoped checks (pre-commit, the build, the test
-# suite) that do not care about the diff at all. So in that one case
-# audit_scope_report prints a warning instead of exiting, and the
-# diff-scoped checks skip themselves exactly as they do when `develop`
-# itself does not resolve (next paragraph) -- both are surfaced to
-# callers via AUDIT_SCOPE_SKIP_SCOPED.
-#
-# The other case that does NOT exit is the one this script inherits
-# from both callers' original guards: if no option is given and
-# `develop` does not resolve (e.g. a shallow clone in CI), the
-# default scope is left unresolved and audit_scope_report says so
-# without erroring. Checks that need the scope skip themselves via
-# AUDIT_SCOPE_SKIP_SCOPED, exactly as they skipped themselves before
-# this file existed.
+# An empty or unresolvable scope has two outcomes, and which one
+# applies turns on who asserted the scope. Both are implemented and
+# argued for above audit_scope_init and audit_scope_report rather than
+# restated here: in summary, an empty EXPLICIT scope exits 9, while an
+# empty or unresolvable implicit default warns, sets
+# AUDIT_SCOPE_SKIP_SCOPED and lets the unscoped checks run.
 #
 # After a successful audit_scope_init, six functions read the
 # resolved scope. Each takes zero or more PATHSPEC arguments; an
@@ -120,6 +104,37 @@
 # non-empty rule above.
 
 AUDIT_SCOPE_EXIT_CODE=9
+
+# _audit_scope_git_diff -- git diff, with every setting that would change the
+# shape of what the readers below parse pinned to its default.
+#
+# A user's or system's git config is not under this library's control,
+# and several settings silently change diff output rather than failing:
+# `color.diff = always` wraps every line in ANSI escapes, so a `^+`
+# grep matches nothing and the awk sees no markers; `diff.external` or
+# a textconv driver replaces the patch with something else entirely;
+# `diff.noprefix` or `diff.mnemonicPrefix` changes the `a/` and `b/`
+# the awk strips, so paths come out mangled. Each of those makes the
+# audit report less than it examined without raising an error --
+# the failure mode this whole library exists to remove -- and each is
+# a one-flag fix, so they are all pinned here rather than trusted.
+#
+# core.quotePath=false keeps a non-ASCII path readable instead of
+# C-quoted; a path with an embedded tab or newline stays quoted, which
+# diff-added-lines.awk reports as-is.
+# The flags go immediately after the subcommand, never at the end: a
+# caller's last arguments are pathspecs behind a `--`, and anything
+# after that separator is a path, not an option.
+_audit_scope_git_diff() {
+    git \
+        -c color.ui=never \
+        -c color.diff=never \
+        -c diff.external= \
+        -c diff.noprefix=false \
+        -c diff.mnemonicPrefix=false \
+        -c core.quotePath=false \
+        diff --no-color --no-ext-diff --no-textconv "$@"
+}
 
 _audit_scope_die() {
     echo "audit scope error: $*" >&2
@@ -198,7 +213,7 @@ audit_scope_init() {
             *) _audit_scope_die "--range must look like REV..REV or REV...REV, got: $range_given" ;;
         esac
         local range_err
-        if ! range_err="$(git diff --name-only "$range_given" 2>&1 >/dev/null)"; then
+        if ! range_err="$(_audit_scope_git_diff --name-only "$range_given" 2>&1 >/dev/null)"; then
             _audit_scope_die "--range does not resolve ($range_given): ${range_err}"
         fi
         AUDIT_SCOPE_MODE="range"
@@ -320,10 +335,10 @@ audit_scope_names_null() {
     if [[ "$AUDIT_SCOPE_MODE" == "commits" ]]; then
         local sha
         for sha in "${AUDIT_SCOPE_COMMITS[@]}"; do
-            git diff -z --name-only "${sha}^1" "$sha" -- "$@"
+            _audit_scope_git_diff -z --name-only "${sha}^1" "$sha" -- "$@"
         done | sort -z -u
     else
-        git diff -z --name-only "$AUDIT_SCOPE_RANGE" -- "$@"
+        _audit_scope_git_diff -z --name-only "$AUDIT_SCOPE_RANGE" -- "$@"
     fi
 }
 
@@ -343,16 +358,16 @@ audit_scope_names_all() {
         local sha
         for sha in "${AUDIT_SCOPE_COMMITS[@]}"; do
             if [[ $# -gt 0 ]]; then
-                git diff --name-only "${sha}^1" "$sha" -- "$@"
+                _audit_scope_git_diff --name-only "${sha}^1" "$sha" -- "$@"
             else
-                git diff --name-only "${sha}^1" "$sha"
+                _audit_scope_git_diff --name-only "${sha}^1" "$sha"
             fi
         done | sort -u
     else
         if [[ $# -gt 0 ]]; then
-            git diff --name-only "$AUDIT_SCOPE_RANGE" -- "$@"
+            _audit_scope_git_diff --name-only "$AUDIT_SCOPE_RANGE" -- "$@"
         else
-            git diff --name-only "$AUDIT_SCOPE_RANGE"
+            _audit_scope_git_diff --name-only "$AUDIT_SCOPE_RANGE"
         fi
     fi
 }
@@ -387,16 +402,16 @@ audit_scope_names_added() {
         local sha
         for sha in "${AUDIT_SCOPE_COMMITS[@]}"; do
             if [[ $# -gt 0 ]]; then
-                git diff --name-only --diff-filter=A "${sha}^1" "$sha" -- "$@"
+                _audit_scope_git_diff --name-only --diff-filter=A "${sha}^1" "$sha" -- "$@"
             else
-                git diff --name-only --diff-filter=A "${sha}^1" "$sha"
+                _audit_scope_git_diff --name-only --diff-filter=A "${sha}^1" "$sha"
             fi
         done | sort -u
     else
         if [[ $# -gt 0 ]]; then
-            git diff --name-only --diff-filter=A "$AUDIT_SCOPE_RANGE" -- "$@"
+            _audit_scope_git_diff --name-only --diff-filter=A "$AUDIT_SCOPE_RANGE" -- "$@"
         else
-            git diff --name-only --diff-filter=A "$AUDIT_SCOPE_RANGE"
+            _audit_scope_git_diff --name-only --diff-filter=A "$AUDIT_SCOPE_RANGE"
         fi
     fi
 }
@@ -406,16 +421,16 @@ audit_scope_diff() {
         local sha
         for sha in "${AUDIT_SCOPE_COMMITS[@]}"; do
             if [[ $# -gt 0 ]]; then
-                git diff "${sha}^1" "$sha" -- "$@"
+                _audit_scope_git_diff "${sha}^1" "$sha" -- "$@"
             else
-                git diff "${sha}^1" "$sha"
+                _audit_scope_git_diff "${sha}^1" "$sha"
             fi
         done
     else
         if [[ $# -gt 0 ]]; then
-            git diff "$AUDIT_SCOPE_RANGE" -- "$@"
+            _audit_scope_git_diff "$AUDIT_SCOPE_RANGE" -- "$@"
         else
-            git diff "$AUDIT_SCOPE_RANGE"
+            _audit_scope_git_diff "$AUDIT_SCOPE_RANGE"
         fi
     fi
 }

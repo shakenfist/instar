@@ -117,6 +117,24 @@ build_fixture() {
     [ -n "${M1}" ] && [ -n "${M2}" ] && [ "${M1}" != "${M2}" ]
 }
 
+# install_tools_into DIR -- put a copy of the audit tooling at
+# DIR/tools/audit, so a script that derives its repository root from
+# its own location runs against DIR instead of this checkout.
+#
+# This is what lets the cases below be hermetic. They used to run
+# against this repository's real history and take a SKIP branch in the
+# ci-tooling job, which checks out at fetch-depth 1 -- so the scope-patch
+# recipe check and the end-to-end script path were never exercised by
+# CI at all, and a SKIP stood in for a pass. That is the same defect
+# this phase exists to fix, so it does not get to live in the phase's
+# own tests.
+install_tools_into() {
+    local dir="$1"
+    mkdir -p "${dir}/tools/audit"
+    cp "$LIB" "$SCOPE_PATCH" "$WAVE2" "${SCRIPT_DIR}/diff-added-lines.awk" \
+        "${dir}/tools/audit/"
+}
+
 # expect_names NAME EXPECTED ACTUAL -- compare two newline-delimited
 # (already sorted) name lists in full, so a spurious extra or missing
 # file fails as loudly as a wrong count.
@@ -251,8 +269,13 @@ actual="$(in_fixture "audit_scope_init --commits-file '${cfile}'; audit_scope_na
 expect_names "--commits-file (single merge)" "$expected" "$actual"
 
 start "--commits-file of two merges resolves to the union of their first-parent diffs"
-cfile="${WORK}/two.txt"
-cat > "$cfile" <<EOF
+# TWO_CFILE, not cfile: the refusal cases further down reuse $cfile as
+# a scratch name, and every case above here that needs the union would
+# then silently resolve whatever they left in it. That has already
+# caused two failures while writing this file, which is a good enough
+# reason for the union to own a name of its own.
+TWO_CFILE="${WORK}/two.txt"
+cat > "$TWO_CFILE" <<EOF
 # two phase merges; blank lines and comments are ignored
 
 ${M1}
@@ -263,7 +286,7 @@ expected="$( {
     git -C "${FIX}" diff --name-only "${M1}^1" "${M1}"
     git -C "${FIX}" diff --name-only "${M2}^1" "${M2}"
 } | sort -u)"
-actual="$(in_fixture "audit_scope_init --commits-file '${cfile}'; audit_scope_names_all | sort -u")"
+actual="$(in_fixture "audit_scope_init --commits-file '${TWO_CFILE}'; audit_scope_names_all | sort -u")"
 expect_names "--commits-file (union of two merges)" "$expected" "$actual"
 # The union must be strictly larger than either side, or the test would
 # pass just as well against a resolver that ignored the second commit.
@@ -280,7 +303,7 @@ expected="$( {
     git -C "${FIX}" diff --name-only "${M1}^1" "${M1}" -- '*.rs'
     git -C "${FIX}" diff --name-only "${M2}^1" "${M2}" -- '*.rs'
 } | sort -u)"
-actual="$(in_fixture "audit_scope_init --commits-file '${cfile}'; audit_scope_names_all '*.rs' | sort -u")"
+actual="$(in_fixture "audit_scope_init --commits-file '${TWO_CFILE}'; audit_scope_names_all '*.rs' | sort -u")"
 expect_names "names_all '*.rs' in commits mode" "$expected" "$actual"
 if ! grep -q 'doc.md' <<< "$actual" && grep -q 'f1.rs' <<< "$actual"; then
     ok "the pathspec excluded doc.md and kept f1.rs"
@@ -293,7 +316,7 @@ expected="$( {
     git -C "${FIX}" diff --name-only --diff-filter=A "${M1}^1" "${M1}"
     git -C "${FIX}" diff --name-only --diff-filter=A "${M2}^1" "${M2}"
 } | sort -u)"
-actual="$(in_fixture "audit_scope_init --commits-file '${cfile}'; audit_scope_names_added | sort -u")"
+actual="$(in_fixture "audit_scope_init --commits-file '${TWO_CFILE}'; audit_scope_names_added | sort -u")"
 expect_names "names_added in commits mode" "$expected" "$actual"
 if ! grep -qx 'a.rs' <<< "$actual"; then
     ok "a modified file (a.rs) is not reported as added"
@@ -302,7 +325,7 @@ else
 fi
 
 start "audit_scope_diff produces a patch for the whole union"
-patch="$(in_fixture "audit_scope_init --commits-file '${cfile}'; audit_scope_diff")"
+patch="$(in_fixture "audit_scope_init --commits-file '${TWO_CFILE}'; audit_scope_diff")"
 if grep -q 'f1.rs' <<< "$patch" && grep -q 'f3.rs' <<< "$patch"; then
     ok "the patch covers files from both merges"
 else
@@ -317,7 +340,7 @@ expected="$( {
     git -C "${FIX}" diff "${M1}^1" "${M1}"
     git -C "${FIX}" diff "${M2}^1" "${M2}"
 } )"
-actual="$(in_fixture "audit_scope_init --commits-file '${cfile}'; audit_scope_diff")"
+actual="$(in_fixture "audit_scope_init --commits-file '${TWO_CFILE}'; audit_scope_diff")"
 if [ "$actual" = "$expected" ]; then
     ok "the patch is exactly both first-parent diffs, concatenated in order"
 else
@@ -342,52 +365,51 @@ start "scope-patch.sh writes the whole union, not one commit of it"
 # merge -- truncated the file on each run and left only the last
 # merge: an audit reading a subset and reporting cleanly on it.
 #
-# scope-patch.sh resolves its own repository root, like both wave
-# scripts, so this case runs against this checkout rather than the
-# fixture, and needs two real merges with parents.
-mapfile -t real_merges < <(git log --format=%H --merges --first-parent develop -2 2>/dev/null)
-usable=1
-for m in "${real_merges[@]+"${real_merges[@]}"}"; do
-    git rev-parse --verify "${m}^1" >/dev/null 2>&1 || usable=0
-done
-if [ "${#real_merges[@]}" -lt 2 ] || [ "$usable" -eq 0 ]; then
-    echo "    SKIP: fewer than two usable merge commits in this clone"
+# Run against the fixture, via a copy of the tooling installed inside
+# it, so this does not depend on history that CI does not fetch.
+install_tools_into "${FIX}"
+FIX_SCOPE_PATCH="${FIX}/tools/audit/scope-patch.sh"
+patchfile="${WORK}/scope.patch"
+"${FIX_SCOPE_PATCH}" --commits-file "$TWO_CFILE" > "$patchfile" 2>/dev/null
+rc=$?
+if [ "$rc" -ne 0 ]; then
+    fail "scope-patch.sh exited ${rc}"
 else
-    real_cfile="${WORK}/real-two.txt"
-    printf '%s\n%s\n' "${real_merges[0]}" "${real_merges[1]}" > "$real_cfile"
-    patchfile="${WORK}/scope.patch"
-    "${SCOPE_PATCH}" --commits-file "$real_cfile" > "$patchfile" 2>/dev/null
-    rc=$?
-    if [ "$rc" -ne 0 ]; then
-        fail "scope-patch.sh exited ${rc}"
+    expected="$( {
+        git -C "${FIX}" diff "${M1}^1" "${M1}"
+        git -C "${FIX}" diff "${M2}^1" "${M2}"
+    } )"
+    actual="$(grep -v '^# commit ' "$patchfile")"
+    markers="$(grep -c '^# commit ' "$patchfile")"
+    if [ "$actual" = "$expected" ] && [ "$markers" -eq 2 ]; then
+        ok "the patch is both first-parent diffs in full, with one marker each"
     else
-        # The patch must equal the concatenation of both first-parent
-        # diffs, once the per-commit marker lines are removed.
-        expected="$( {
-            git diff "${real_merges[0]}^1" "${real_merges[0]}"
-            git diff "${real_merges[1]}^1" "${real_merges[1]}"
-        } )"
-        actual="$(grep -v '^# commit ' "$patchfile")"
-        markers="$(grep -c '^# commit ' "$patchfile")"
-        if [ "$actual" = "$expected" ] && [ "$markers" -eq 2 ]; then
-            ok "the patch is both first-parent diffs in full, with one marker each"
-        else
-            fail "the patch is not the full union (markers=${markers}, $(grep -c . <<< "$actual") vs $(grep -c . <<< "$expected") lines)"
-        fi
-        # The truncating recipe, for comparison: it must be strictly
-        # smaller, or this case is not measuring anything.
-        git diff "${real_merges[0]}^1" "${real_merges[0]}" > "${WORK}/bad.patch"
-        git diff "${real_merges[1]}^1" "${real_merges[1]}" > "${WORK}/bad.patch"
-        if [ "$(wc -l < "${WORK}/bad.patch")" -lt "$(wc -l < "$patchfile")" ]; then
-            ok "the hand-rolled recipe is smaller, as the runbook now warns"
-        else
-            fail "the hand-rolled recipe was not smaller; the runbook's warning may be wrong"
-        fi
+        fail "the patch is not the full union (markers=${markers}, $(grep -c . <<< "$actual") vs $(grep -c . <<< "$expected") lines)"
+    fi
+    # The truncating recipe, for comparison: it must be strictly
+    # smaller, or this case is not measuring anything.
+    (cd "${FIX}" && git diff "${M1}^1" "${M1}" > "${WORK}/bad.patch")
+    (cd "${FIX}" && git diff "${M2}^1" "${M2}" > "${WORK}/bad.patch")
+    if [ "$(wc -l < "${WORK}/bad.patch")" -lt "$(wc -l < "$patchfile")" ]; then
+        ok "the hand-rolled recipe is smaller, as the runbook now warns"
+    else
+        fail "the hand-rolled recipe was not smaller; the runbook's warning may be wrong"
     fi
 fi
 
+start "scope-patch.sh keeps the banner off stdout"
+# stdout is redirected into scope.patch, so a human-readable line
+# landing there would corrupt the patch the judgment agents read.
+out="$("${FIX_SCOPE_PATCH}" --commits-file "$TWO_CFILE" 2>/dev/null | grep -c '^audit scope:')"
+err="$("${FIX_SCOPE_PATCH}" --commits-file "$TWO_CFILE" 2>&1 >/dev/null | grep -c '^audit scope:')"
+if [ "$out" -eq 0 ] && [ "$err" -ge 1 ]; then
+    ok "the banner is on stderr and the patch on stdout is clean"
+else
+    fail "the banner leaked into the patch (stdout=${out}, stderr=${err})"
+fi
+
 start "scope-patch.sh refuses an empty explicit scope rather than writing nothing"
-if "${SCOPE_PATCH}" --range 'HEAD..HEAD' >/dev/null 2>&1; then
+if "${FIX_SCOPE_PATCH}" --range 'HEAD..HEAD' >/dev/null 2>&1; then
     fail "scope-patch.sh exited 0 for an empty explicit scope"
 else
     ok "an empty explicit scope is refused instead of producing an empty patch"
@@ -406,8 +428,7 @@ start "scope-patch.sh refuses an UNRESOLVED implicit scope"
 # the only way to point it at such a clone is to put a copy of the
 # library beside a copy of the script inside one.
 FAKE="${WORK}/fake"
-mkdir -p "${FAKE}/tools/audit"
-cp "$LIB" "$SCOPE_PATCH" "${FAKE}/tools/audit/"
+install_tools_into "${FAKE}"
 (
     cd "${FAKE}" || exit 1
     git init -q -b not-develop .
@@ -439,24 +460,9 @@ else
     fi
 fi
 
-start "scope-patch.sh keeps the banner off stdout"
-# stdout is redirected into scope.patch, so a human-readable line
-# landing there would corrupt the patch the judgment agents read.
-if [ "${#real_merges[@]}" -ge 2 ] && [ "$usable" -eq 1 ]; then
-    out="$("${SCOPE_PATCH}" --commits-file "${WORK}/real-two.txt" 2>/dev/null | grep -c '^audit scope:')"
-    err="$("${SCOPE_PATCH}" --commits-file "${WORK}/real-two.txt" 2>&1 >/dev/null | grep -c '^audit scope:')"
-    if [ "$out" -eq 0 ] && [ "$err" -ge 1 ]; then
-        ok "the banner is on stderr and the patch on stdout is clean"
-    else
-        fail "the banner leaked into the patch (stdout=${out}, stderr=${err})"
-    fi
-else
-    echo "    SKIP: needs the two real merges above"
-fi
-
 start "a path deleted by an audited commit is in the scope but not fed to content checks"
-all="$(in_fixture "audit_scope_init --commits-file '${cfile}'; audit_scope_names_all | sort -u")"
-existing="$(in_fixture "audit_scope_init --commits-file '${cfile}'; audit_scope_names_existing | sort -u")"
+all="$(in_fixture "audit_scope_init --commits-file '${TWO_CFILE}'; audit_scope_names_all | sort -u")"
+existing="$(in_fixture "audit_scope_init --commits-file '${TWO_CFILE}'; audit_scope_names_existing | sort -u")"
 if grep -qx 'keep.txt' <<< "$all"; then
     ok "names_all keeps the deleted keep.txt, so the reported scope is the true one"
 else
@@ -474,15 +480,54 @@ else
 fi
 
 start "the report names how many scoped files are no longer on disk"
-output="$(in_fixture "audit_scope_init --commits-file '${cfile}'; audit_scope_report")"
+output="$(in_fixture "audit_scope_init --commits-file '${TWO_CFILE}'; audit_scope_report")"
 if [[ "$output" == *"1 no longer on disk"* ]]; then
     ok "the banner says one file is gone, so a smaller content-check count is explained"
 else
     fail "the banner did not mention the deleted file: ${output}"
 fi
 
+start "a hostile git diff config does not change what the readers see"
+# color.diff=always wraps every diff line in ANSI escapes, which makes
+# a `^+` grep match nothing and leaves the awk with no markers to
+# read; diff.noprefix drops the a//b/ prefixes the awk strips. Neither
+# fails -- the audit would simply report less than it examined. The
+# library pins both, so setting them in the fixture must change
+# nothing at all.
+before_names="$(in_fixture "audit_scope_init --commits-file '${TWO_CFILE}'; audit_scope_names_all | sort -u")"
+before_diff="$(in_fixture "audit_scope_init --commits-file '${TWO_CFILE}'; audit_scope_diff")"
+git -C "${FIX}" config color.diff always
+git -C "${FIX}" config color.ui always
+git -C "${FIX}" config diff.noprefix true
+git -C "${FIX}" config diff.mnemonicPrefix true
+after_names="$(in_fixture "audit_scope_init --commits-file '${TWO_CFILE}'; audit_scope_names_all | sort -u")"
+after_diff="$(in_fixture "audit_scope_init --commits-file '${TWO_CFILE}'; audit_scope_diff")"
+if [ "$after_names" = "$before_names" ]; then
+    ok "the name readers are unaffected by color.diff and diff.noprefix"
+else
+    fail "the name readers changed under a hostile git config"
+fi
+if [ "$after_diff" = "$before_diff" ]; then
+    ok "the patch is unaffected by color.diff and diff.noprefix"
+else
+    fail "the patch changed under a hostile git config"
+    printf '%s\n' "$after_diff" | head -4 | cat -v | sed 's/^/      /' >&2
+fi
+# And the attribution the content checks depend on must still resolve
+# real paths rather than escape-wrapped ones.
+attributed="$(printf '%s\n' "$after_diff" | awk -f "${SCRIPT_DIR}/diff-added-lines.awk" | head -1)"
+if [[ "$attributed" == *".rs:"* || "$attributed" == *".md:"* || "$attributed" == *".txt:"* ]]; then
+    ok "line attribution still names a real path under that config"
+else
+    fail "line attribution broke under a hostile git config: ${attributed}"
+fi
+git -C "${FIX}" config --unset color.diff
+git -C "${FIX}" config --unset color.ui
+git -C "${FIX}" config --unset diff.noprefix
+git -C "${FIX}" config --unset diff.mnemonicPrefix
+
 start "a filename containing a space survives the NUL-delimited reader"
-names="$(in_fixture "audit_scope_init --commits-file '${cfile}'; audit_scope_names_existing_null '*.rs' | tr '\\0' '\\n' | sort -u")"
+names="$(in_fixture "audit_scope_init --commits-file '${TWO_CFILE}'; audit_scope_names_existing_null '*.rs' | tr '\\0' '\\n' | sort -u")"
 if grep -qxF "${SPACED}" <<< "$names"; then
     ok "'${SPACED}' came back as one path"
 else
@@ -633,30 +678,28 @@ for script_path in "$WAVE1" "$WAVE2"; do
 done
 
 start "wave2-mechanical.sh runs a VALID --commits-file end to end"
-# Every other script-level case is a refusal, so nothing here proved
+# Every other script-level case is a refusal, so nothing else proved
 # the option works through a real script rather than only through the
 # library. wave2-mechanical.sh is the one that is safe to run: it only
-# greps, and never exits non-zero on a finding. Run against this
-# checkout, over a scope of one real merge.
-real_merge="$(git log --format=%H --merges --first-parent develop -1 2>/dev/null)"
-if [ -z "$real_merge" ] || ! git rev-parse --verify "${real_merge}^1" >/dev/null 2>&1; then
-    echo "    SKIP: no merge commit with a parent in this clone"
+# greps, and never exits non-zero on a finding.
+#
+# Run against the fixture through the installed copy, so this is not
+# one more case that skips in the shallow CI checkout. The fixture's
+# scope includes a deleted path and a filename with a space, so this
+# exercises the readers the content checks use as well.
+out="$("${FIX}/tools/audit/wave2-mechanical.sh" --commits-file "$TWO_CFILE" 2>&1)"
+rc=$?
+if [ "$rc" -eq 0 ] \
+    && [[ "$out" == *"audit scope: "* ]] \
+    && [[ "$out" != *"audit scope: 0 files"* ]] \
+    && [[ "$out" == *"1 no longer on disk"* ]] \
+    && [[ "$out" == *"wave 2a"* ]] \
+    && [[ "$out" == *"wave 2d"* ]]; then
+    ok "a valid --commits-file resolves a non-empty scope and every section runs"
 else
-    e2e_cfile="${WORK}/real-one.txt"
-    printf '%s\n' "$real_merge" > "$e2e_cfile"
-    out="$("$WAVE2" --commits-file "$e2e_cfile" 2>&1)"
-    rc=$?
-    if [ "$rc" -eq 0 ] \
-        && [[ "$out" == *"audit scope: "* ]] \
-        && [[ "$out" != *"audit scope: 0 files"* ]] \
-        && [[ "$out" == *"wave 2a"* ]] \
-        && [[ "$out" == *"wave 2d"* ]]; then
-        ok "a valid --commits-file resolves a non-empty scope and every section runs"
-    else
-        fail "wave2-mechanical.sh did not complete over a valid --commits-file (rc=$rc)"
-        # shellcheck disable=SC2001  # see the multi-line note in expect_names above
-        sed 's/^/      /' <<< "$out" | head -20 >&2
-    fi
+    fail "wave2-mechanical.sh did not complete over a valid --commits-file (rc=$rc)"
+    # shellcheck disable=SC2001  # see the multi-line note in expect_names above
+    sed 's/^/      /' <<< "$out" | head -20 >&2
 fi
 
 echo

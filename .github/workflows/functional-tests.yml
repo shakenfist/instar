@@ -220,7 +220,11 @@ jobs:
       # checks report. It replaced a grep -n over the concatenated diff
       # stream, whose numbers were positions in a temporary artefact.
       # A wrong-but-plausible line number cannot be spotted by reading,
-      # so the test checks a real commit's hits against the files.
+      # so the test generates a commit and checks every hit it reports
+      # against the files on disk. The commit is generated rather than
+      # taken from history because this job checks out at depth 1,
+      # where a history-dependent case would skip -- and a skip that
+      # always fires is a pass standing in for a check that never ran.
       - name: Test the diff line attribution
         run: tools/audit/test-diff-added-lines.sh
 

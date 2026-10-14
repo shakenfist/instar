@@ -61,7 +61,11 @@ fi
 if [[ "$AUDIT_SCOPE_MODE" == "commits" ]]; then
     for sha in "${AUDIT_SCOPE_COMMITS[@]}"; do
         git log -1 --format='# commit %H %s' "$sha"
-        git diff "${sha}^1" "$sha" -- "${PATHSPECS[@]+"${PATHSPECS[@]}"}"
+        # The library's wrapper, not a bare `git diff`: a user's
+        # color.diff, diff.external or diff.noprefix setting would
+        # otherwise change the shape of the patch every judgment agent
+        # reads. See _audit_scope_git_diff in audit-scope.sh.
+        _audit_scope_git_diff "${sha}^1" "$sha" -- "${PATHSPECS[@]+"${PATHSPECS[@]}"}"
     done
 else
     audit_scope_diff "${PATHSPECS[@]+"${PATHSPECS[@]}"}"
