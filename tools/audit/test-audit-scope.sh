@@ -50,6 +50,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIB="${SCRIPT_DIR}/audit-scope.sh"
 WAVE1="${SCRIPT_DIR}/wave1.sh"
 WAVE2="${SCRIPT_DIR}/wave2-mechanical.sh"
+SCOPE_PATCH="${SCRIPT_DIR}/scope-patch.sh"
 
 # Same idiom as test-inline-script-check.sh: one work directory, removed
 # on any exit, so nothing is left in /tmp and no path is predictable.
@@ -308,6 +309,151 @@ else
     fail "the patch did not cover both merges ($(wc -l <<< "$patch") lines)"
 fi
 
+start "audit_scope_diff emits every commit's patch, in commits-file order"
+# The earlier case only grepped for two file names, which a resolver
+# that emitted one commit twice would also satisfy. Compare the whole
+# output against the concatenation, byte for byte, and check the order.
+expected="$( {
+    git -C "${FIX}" diff "${M1}^1" "${M1}"
+    git -C "${FIX}" diff "${M2}^1" "${M2}"
+} )"
+actual="$(in_fixture "audit_scope_init --commits-file '${cfile}'; audit_scope_diff")"
+if [ "$actual" = "$expected" ]; then
+    ok "the patch is exactly both first-parent diffs, concatenated in order"
+else
+    fail "the patch is not the ordered concatenation of both diffs"
+    echo "      expected $(grep -c . <<< "$expected") lines, got $(grep -c . <<< "$actual")" >&2
+fi
+# Reversing the commits file must reverse the output, or order is not
+# being honoured at all.
+rcfile="${WORK}/two-reversed.txt"
+printf '%s\n%s\n' "${M2}" "${M1}" > "$rcfile"
+reversed="$(in_fixture "audit_scope_init --commits-file '${rcfile}'; audit_scope_diff")"
+if [ "$reversed" != "$actual" ] && [ "$(grep -c . <<< "$reversed")" -eq "$(grep -c . <<< "$actual")" ]; then
+    ok "reversing the commits file reverses the patch, same total size"
+else
+    fail "the commits-file order does not affect the patch order"
+fi
+
+start "scope-patch.sh writes the whole union, not one commit of it"
+# This is the recipe PUSH-AUDIT.md hands the management session, and
+# all four judgment briefs read what it produces. The recipe it
+# replaced -- `git diff <merge>^1 <merge> > scope.patch`, run once per
+# merge -- truncated the file on each run and left only the last
+# merge: an audit reading a subset and reporting cleanly on it.
+#
+# scope-patch.sh resolves its own repository root, like both wave
+# scripts, so this case runs against this checkout rather than the
+# fixture, and needs two real merges with parents.
+mapfile -t real_merges < <(git log --format=%H --merges --first-parent develop -2 2>/dev/null)
+usable=1
+for m in "${real_merges[@]+"${real_merges[@]}"}"; do
+    git rev-parse --verify "${m}^1" >/dev/null 2>&1 || usable=0
+done
+if [ "${#real_merges[@]}" -lt 2 ] || [ "$usable" -eq 0 ]; then
+    echo "    SKIP: fewer than two usable merge commits in this clone"
+else
+    real_cfile="${WORK}/real-two.txt"
+    printf '%s\n%s\n' "${real_merges[0]}" "${real_merges[1]}" > "$real_cfile"
+    patchfile="${WORK}/scope.patch"
+    "${SCOPE_PATCH}" --commits-file "$real_cfile" > "$patchfile" 2>/dev/null
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        fail "scope-patch.sh exited ${rc}"
+    else
+        # The patch must equal the concatenation of both first-parent
+        # diffs, once the per-commit marker lines are removed.
+        expected="$( {
+            git diff "${real_merges[0]}^1" "${real_merges[0]}"
+            git diff "${real_merges[1]}^1" "${real_merges[1]}"
+        } )"
+        actual="$(grep -v '^# commit ' "$patchfile")"
+        markers="$(grep -c '^# commit ' "$patchfile")"
+        if [ "$actual" = "$expected" ] && [ "$markers" -eq 2 ]; then
+            ok "the patch is both first-parent diffs in full, with one marker each"
+        else
+            fail "the patch is not the full union (markers=${markers}, $(grep -c . <<< "$actual") vs $(grep -c . <<< "$expected") lines)"
+        fi
+        # The truncating recipe, for comparison: it must be strictly
+        # smaller, or this case is not measuring anything.
+        git diff "${real_merges[0]}^1" "${real_merges[0]}" > "${WORK}/bad.patch"
+        git diff "${real_merges[1]}^1" "${real_merges[1]}" > "${WORK}/bad.patch"
+        if [ "$(wc -l < "${WORK}/bad.patch")" -lt "$(wc -l < "$patchfile")" ]; then
+            ok "the hand-rolled recipe is smaller, as the runbook now warns"
+        else
+            fail "the hand-rolled recipe was not smaller; the runbook's warning may be wrong"
+        fi
+    fi
+fi
+
+start "scope-patch.sh refuses an empty explicit scope rather than writing nothing"
+if "${SCOPE_PATCH}" --range 'HEAD..HEAD' >/dev/null 2>&1; then
+    fail "scope-patch.sh exited 0 for an empty explicit scope"
+else
+    ok "an empty explicit scope is refused instead of producing an empty patch"
+fi
+
+start "scope-patch.sh refuses an UNRESOLVED implicit scope"
+# This is the case the script's own SKIP_SCOPED guard exists for. An
+# empty *explicit* scope never reaches it, because audit_scope_report
+# refuses that one level earlier -- a mutation run proved the guard
+# unreachable by that route. What does reach it is a clone where
+# `develop` does not resolve at all: the banner says "unresolved",
+# report returns 0, and without the guard the script would emit a
+# diff for a range git cannot evaluate.
+#
+# scope-patch.sh derives its repository root from its own location, so
+# the only way to point it at such a clone is to put a copy of the
+# library beside a copy of the script inside one.
+FAKE="${WORK}/fake"
+mkdir -p "${FAKE}/tools/audit"
+cp "$LIB" "$SCOPE_PATCH" "${FAKE}/tools/audit/"
+(
+    cd "${FAKE}" || exit 1
+    git init -q -b not-develop .
+    git config user.email 'test@example.com'
+    git config user.name 'Audit Scope Test'
+    printf 'x\n' > x.txt
+    git add -A
+    git commit -q -m 'only commit, and no develop branch'
+) || fail "could not build the no-develop fixture"
+if git -C "${FAKE}" rev-parse --verify develop >/dev/null 2>&1; then
+    fail "the no-develop fixture has a develop branch after all"
+else
+    patch_out="$("${FAKE}/tools/audit/scope-patch.sh" 2>"${WORK}/fake-err")"
+    rc=$?
+    # The exit code and the empty stdout are necessary but not
+    # sufficient: without the guard the script reaches `git diff
+    # develop...HEAD`, which also fails and also prints nothing. What
+    # the guard buys is the script saying why, in its own words,
+    # instead of leaving a raw git error for the reader to interpret.
+    # A mutation run established that, by surviving an assertion that
+    # checked only the code and the empty output.
+    if [ "$rc" -eq 9 ] && [ -z "$patch_out" ] \
+        && grep -q 'refusing to write a patch' "${WORK}/fake-err"; then
+        ok "an unresolved scope is refused with exit 9 and a message saying so"
+    else
+        fail "an unresolved scope was not explicitly refused (rc=${rc}, $(printf '%s' "$patch_out" | wc -l) lines of patch)"
+        # shellcheck disable=SC2001  # see the multi-line note in expect_names above
+        sed 's/^/      /' "${WORK}/fake-err" >&2
+    fi
+fi
+
+start "scope-patch.sh keeps the banner off stdout"
+# stdout is redirected into scope.patch, so a human-readable line
+# landing there would corrupt the patch the judgment agents read.
+if [ "${#real_merges[@]}" -ge 2 ] && [ "$usable" -eq 1 ]; then
+    out="$("${SCOPE_PATCH}" --commits-file "${WORK}/real-two.txt" 2>/dev/null | grep -c '^audit scope:')"
+    err="$("${SCOPE_PATCH}" --commits-file "${WORK}/real-two.txt" 2>&1 >/dev/null | grep -c '^audit scope:')"
+    if [ "$out" -eq 0 ] && [ "$err" -ge 1 ]; then
+        ok "the banner is on stderr and the patch on stdout is clean"
+    else
+        fail "the banner leaked into the patch (stdout=${out}, stderr=${err})"
+    fi
+else
+    echo "    SKIP: needs the two real merges above"
+fi
+
 start "a path deleted by an audited commit is in the scope but not fed to content checks"
 all="$(in_fixture "audit_scope_init --commits-file '${cfile}'; audit_scope_names_all | sort -u")"
 existing="$(in_fixture "audit_scope_init --commits-file '${cfile}'; audit_scope_names_existing | sort -u")"
@@ -485,6 +631,33 @@ for script_path in "$WAVE1" "$WAVE2"; do
     expect_refused "$script_path" \
         "${script_name}: an unknown option is refused with exit 9" 9 --nonsense
 done
+
+start "wave2-mechanical.sh runs a VALID --commits-file end to end"
+# Every other script-level case is a refusal, so nothing here proved
+# the option works through a real script rather than only through the
+# library. wave2-mechanical.sh is the one that is safe to run: it only
+# greps, and never exits non-zero on a finding. Run against this
+# checkout, over a scope of one real merge.
+real_merge="$(git log --format=%H --merges --first-parent develop -1 2>/dev/null)"
+if [ -z "$real_merge" ] || ! git rev-parse --verify "${real_merge}^1" >/dev/null 2>&1; then
+    echo "    SKIP: no merge commit with a parent in this clone"
+else
+    e2e_cfile="${WORK}/real-one.txt"
+    printf '%s\n' "$real_merge" > "$e2e_cfile"
+    out="$("$WAVE2" --commits-file "$e2e_cfile" 2>&1)"
+    rc=$?
+    if [ "$rc" -eq 0 ] \
+        && [[ "$out" == *"audit scope: "* ]] \
+        && [[ "$out" != *"audit scope: 0 files"* ]] \
+        && [[ "$out" == *"wave 2a"* ]] \
+        && [[ "$out" == *"wave 2d"* ]]; then
+        ok "a valid --commits-file resolves a non-empty scope and every section runs"
+    else
+        fail "wave2-mechanical.sh did not complete over a valid --commits-file (rc=$rc)"
+        # shellcheck disable=SC2001  # see the multi-line note in expect_names above
+        sed 's/^/      /' <<< "$out" | head -20 >&2
+    fi
+fi
 
 echo
 if [ "$FAILURES" -ne 0 ]; then

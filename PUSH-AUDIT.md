@@ -69,10 +69,19 @@ once as a patch file and hand that to the judgment agents,
 rather than having each of them recompute it:
 
 ```
-tools/audit/wave1.sh --commits-file commits.txt
-# or audit_scope_diff, from the library
-git diff <merge>^1 <merge> > scope.patch
+tools/audit/scope-patch.sh --commits-file commits.txt > scope.patch
 ```
+
+Use that script rather than assembling the patch by hand.
+`git diff <merge>^1 <merge> > scope.patch` covers one merge,
+and run once per merge the `>` truncates, so only the last
+one survives -- an audit reading a subset of the work and
+reporting cleanly on it. Measured on a two-merge scope: the
+union is 7733 lines and the hand-rolled version produced
+4261 of them, with nothing to say it had. The script prints
+the resolved file count to stderr so the patch on stdout
+stays clean, and refuses to write anything for an
+unresolved or empty scope.
 
 ## Wave 1: Mechanical checks
 

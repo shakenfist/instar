@@ -124,6 +124,19 @@ why, and each of the five briefs tells its sub-agent to read the
 patch the management session hands it rather than recomputing a diff
 of its own.
 
+That fix then needed a third round, because the recipe it pointed the
+briefs at was itself wrong: `git diff <merge>^1 <merge> > scope.patch`
+covers one merge, and run once per merge the `>` truncates, so only
+the last survives. Measured on a two-merge scope, the union is 7,733
+lines and the hand-rolled recipe produced 4,261 of them with nothing
+to say it had -- the same subset-read defect as the original finding,
+reintroduced one layer out by the fix for it. The recipe is now
+`tools/audit/scope-patch.sh`, which uses the library, writes the
+banner to stderr so the patch on stdout stays clean, refuses an
+unresolved scope, and is covered by four cases in
+`test-audit-scope.sh` including a comparison against the recipe it
+replaced.
+
 ### The union of merge ranges exists, and is complete
 
 Unlike the fuzz-autofix precedent, which had no range to audit and

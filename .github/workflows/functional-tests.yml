@@ -216,6 +216,14 @@ jobs:
       - name: Test the audit scope library
         run: tools/audit/test-audit-scope.sh
 
+      # The file:line attribution wave 2's unsafe, unwrap and dead-code
+      # checks report. It replaced a grep -n over the concatenated diff
+      # stream, whose numbers were positions in a temporary artefact.
+      # A wrong-but-plausible line number cannot be spotted by reading,
+      # so the test checks a real commit's hits against the files.
+      - name: Test the diff line attribution
+        run: tools/audit/test-diff-added-lines.sh
+
       # The testdata fixture guard. Every test that reads these three
       # fixtures skips rather than fails when its file is absent, so a
       # partial checkout used to shrink the suite with CI still green.

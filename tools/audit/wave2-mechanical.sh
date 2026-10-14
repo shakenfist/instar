@@ -34,10 +34,24 @@ audit_scope_report
 
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }
 
+# diff_added_lines -- read a unified diff on stdin and print each ADDED
+# line as "<path>:<line>: <content>". The awk program is a separate
+# file so tools/audit/test-diff-added-lines.sh can exercise it against
+# fixtures; it documents why a stream offset was the wrong thing to
+# report and what the line number means for a multi-commit union.
+diff_added_lines() {
+    awk -f "$SCRIPT_DIR/diff-added-lines.awk"
+}
+
 # show_capped CAP CONTENT -- print CONTENT (one hit per line) capped
-# at CAP lines, preceded by a line naming the true total whenever
-# CONTENT holds at least one line. Prints nothing at all when CONTENT
-# is empty, same as before this existed.
+# at CAP lines, preceded by a line naming the true total; or "(none)"
+# when CONTENT is empty.
+#
+# It printed nothing at all for empty content when it was introduced,
+# which left two of the four sections below showing only their hint
+# line while the other two said "(none)" explicitly. In an audit whose
+# whole purpose is telling "nothing found" apart from "nothing
+# examined", every section has to state its result.
 #
 # This is the fix for the sibling defect PLAN-fuzz-autofix-phase-02
 # recorded at a smaller scale (PLAN-fuzz-autofix-phase-02-push-audit.md:178-181):
@@ -49,6 +63,7 @@ show_capped() {
     local cap="$1" content="$2" total
     total="$(printf '%s\n' "$content" | grep -c .)"
     if [[ "$total" -eq 0 ]]; then
+        echo "(none)"
         return 0
     fi
     if [[ "$total" -gt "$cap" ]]; then
@@ -82,10 +97,13 @@ echo
 bold "=== wave 2a: new #[allow(dead_code)] in changed files ==="
 if [[ "$AUDIT_SCOPE_SKIP_SCOPED" -eq 0 ]]; then
     DEAD_CODE=$(audit_scope_diff '*.rs' \
-        | grep -E '^\+.*allow\(dead_code\)' \
+        | diff_added_lines \
+        | grep -E 'allow\(dead_code\)' \
         || true)
     show_capped 20 "$DEAD_CODE"
-    echo "(if any of the above were added in this branch, consider whether the dead code can be deleted instead)"
+    if [[ -n "$DEAD_CODE" ]]; then
+        echo "(if any of the above were added in this branch, consider whether the dead code can be deleted instead)"
+    fi
 fi
 echo
 
@@ -134,13 +152,12 @@ echo
 bold "=== wave 2d: VMM unsafe blocks added (host-side, higher risk) ==="
 if [[ "$AUDIT_SCOPE_SKIP_SCOPED" -eq 0 ]]; then
     VMM_UNSAFE=$(audit_scope_diff 'src/vmm/**/*.rs' \
-        | grep -nE '^\+.*\bunsafe\b' \
+        | diff_added_lines \
+        | grep -E '\bunsafe\b' \
         || true)
+    show_capped 10 "$VMM_UNSAFE"
     if [[ -n "$VMM_UNSAFE" ]]; then
-        show_capped 10 "$VMM_UNSAFE"
         echo "(VMM unsafe blocks bypass the KVM sandbox; each must have a // SAFETY: comment)"
-    else
-        echo "(none)"
     fi
 fi
 echo
@@ -157,23 +174,23 @@ if [[ "$AUDIT_SCOPE_SKIP_SCOPED" -eq 0 ]]; then
             'src/crates/**/*.rs' \
             'src/fuzz/**/*.rs' \
             'src/shared/**/*.rs' \
-        | grep -nE '^\+.*\bunsafe\b' \
+        | diff_added_lines \
+        | grep -E '\bunsafe\b' \
         || true)
-    if [[ -n "$GUEST_UNSAFE" ]]; then
-        show_capped 10 "$GUEST_UNSAFE"
-    else
-        echo "(none)"
-    fi
+    show_capped 10 "$GUEST_UNSAFE"
 fi
 echo
 
 bold "=== wave 2d: new .unwrap() / .expect() in changed code ==="
 if [[ "$AUDIT_SCOPE_SKIP_SCOPED" -eq 0 ]]; then
     UNWRAP=$(audit_scope_diff '*.rs' \
-        | grep -nE '^\+.*\.(unwrap|expect)\s*\(' \
+        | diff_added_lines \
+        | grep -E '\.(unwrap|expect)\s*\(' \
         || true)
     show_capped 20 "$UNWRAP"
-    echo "(review each: are they panic-safe given the inputs? unwrap in VMM I/O paths is a denial-of-service risk)"
+    if [[ -n "$UNWRAP" ]]; then
+        echo "(review each: are they panic-safe given the inputs? unwrap in VMM I/O paths is a denial-of-service risk)"
+    fi
 fi
 echo
 

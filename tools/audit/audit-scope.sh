@@ -78,7 +78,7 @@
 # AUDIT_SCOPE_SKIP_SCOPED, exactly as they skipped themselves before
 # this file existed.
 #
-# After a successful audit_scope_init, four functions read the
+# After a successful audit_scope_init, six functions read the
 # resolved scope. Each takes zero or more PATHSPEC arguments; an
 # empty pathspec list means "no path restriction". In default/range
 # mode every one of these is a single `git diff` call with the same
@@ -100,10 +100,23 @@
 #       Concatenated `git diff` content (unified diff, additions and
 #       removals), for checks that grep added lines rather than file
 #       names.
+#   audit_scope_names_existing [PATHSPEC...]
+#       As audit_scope_names_all, less the paths that are not regular
+#       files in the worktree now.
+#   audit_scope_names_existing_null [PATHSPEC...]
+#       The same, NUL-delimited.
 #
-# audit_scope_count prints the number of distinct files in the whole
-# scope (no path restriction); audit_scope_report prints the
-# "audit scope: N files (...)" banner from it and enforces the
+# **A check that opens the files must use one of the two `_existing`
+# readers.** The scope legitimately names paths that are not there --
+# a file deleted by an audited commit, or by a later commit outside
+# the scope -- and handing those to grep or awk produces an error per
+# path. The two checks that did that silenced it with 2>/dev/null,
+# which silenced every other error those tools could raise along with
+# it. The plain `names_*` readers are for counting and for filtering
+# names, not for reading content.
+#
+# audit_scope_report prints the "audit scope: N files (...)" banner,
+# naming how many of those files are not on disk, and enforces the
 # non-empty rule above.
 
 AUDIT_SCOPE_EXIT_CODE=9
@@ -246,27 +259,6 @@ audit_scope_init() {
     AUDIT_SCOPE_DESC="develop...HEAD"
 }
 
-# audit_scope_count -- number of distinct files in the whole scope.
-#
-# This is the only call, anywhere in this file, to one of the four
-# scope-reading functions with no pathspec. A single-file lint sees
-# that call and concludes (SC2119/SC2120) that audit_scope_names_all
-# never needs arguments at all -- it has no visibility into
-# wave1.sh, wave2-mechanical.sh or test-audit-scope.sh, which are the
-# files that actually call it (and the other three functions below)
-# with pathspecs. That is a false positive: the optional-PATHSPEC
-# signature documented above is deliberate, so both findings are
-# disabled with a reason rather than restructured.
-# audit_scope_names_null, audit_scope_names_added and audit_scope_diff
-# have no internal caller in this file at all, so the lint has no
-# zero-arg call site to reason from here and raises nothing for them
-# -- the asymmetry is this one caller, not a difference in the
-# functions' shapes.
-# shellcheck disable=SC2119  # no pathspec: whole-scope, by design
-audit_scope_count() {
-    audit_scope_names_all | grep -c .
-}
-
 # audit_scope_report -- print the scope banner; call once, before any
 # check runs.
 #
@@ -289,16 +281,32 @@ audit_scope_report() {
     local names count deleted name
     names="$(audit_scope_names_all)"
     count="$(printf '%s' "$names" | grep -c . || true)"
+    # -e for "gone", then -f for "readable as a file": a path that
+    # exists but is not a regular file (a submodule gitlink, a symlink
+    # to a directory) is excluded from the content checks just as a
+    # deleted one is, but it has not been deleted, and reporting it as
+    # such would be the banner telling a small lie about the tree.
     deleted=0
+    local nonregular=0
     while IFS= read -r name; do
         [[ -z "$name" ]] && continue
-        [[ -f "$name" ]] || deleted=$((deleted + 1))
+        if [[ ! -e "$name" ]]; then
+            deleted=$((deleted + 1))
+        elif [[ ! -f "$name" ]]; then
+            nonregular=$((nonregular + 1))
+        fi
     done <<< "$names"
+    local note="" unreadable=$((deleted + nonregular))
     if [[ "$deleted" -gt 0 ]]; then
-        echo "audit scope: ${count} files (${AUDIT_SCOPE_DESC}); ${deleted} no longer on disk, so content checks read ${count} minus ${deleted}"
-    else
-        echo "audit scope: ${count} files (${AUDIT_SCOPE_DESC})"
+        note="; ${deleted} no longer on disk"
     fi
+    if [[ "$nonregular" -gt 0 ]]; then
+        note="${note:+${note},}${note:-;} ${nonregular} not a regular file"
+    fi
+    if [[ -n "$note" ]]; then
+        note="${note}, so content checks read ${count} minus ${unreadable}"
+    fi
+    echo "audit scope: ${count} files (${AUDIT_SCOPE_DESC})${note}"
     if [[ "$count" -eq 0 ]]; then
         if [[ "$AUDIT_SCOPE_EXPLICIT" -eq 1 ]]; then
             _audit_scope_die "resolved file set is empty for ${AUDIT_SCOPE_DESC} -- nothing to audit"
@@ -319,7 +327,17 @@ audit_scope_names_null() {
     fi
 }
 
-# shellcheck disable=SC2120  # called with pathspecs from wave1.sh/wave2-mechanical.sh/test-audit-scope.sh; audit_scope_count's zero-arg call above is this file's only caller
+# The optional-PATHSPEC signature documented in the header is
+# deliberate, but a single-file lint cannot see it: the only in-file
+# call is audit_scope_report's zero-arg one, from which shellcheck
+# concludes this function never needs arguments (SC2120) and that the
+# call should pass "$@" (SC2119). The callers that pass pathspecs are
+# wave1.sh, wave2-mechanical.sh and test-audit-scope.sh, which it has
+# no visibility into. The other readers have no in-file caller at all,
+# so there is no zero-arg call site for the lint to reason from and it
+# raises nothing for them -- the asymmetry is the one caller, not a
+# difference in the functions' shapes.
+# shellcheck disable=SC2120  # see above; pathspec callers are in the wave scripts
 audit_scope_names_all() {
     if [[ "$AUDIT_SCOPE_MODE" == "commits" ]]; then
         local sha
