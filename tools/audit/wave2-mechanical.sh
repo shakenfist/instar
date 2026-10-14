@@ -65,8 +65,14 @@ show_capped() {
 
 bold "=== wave 2a: TODO / FIXME / HACK in changed files ==="
 if [[ "$AUDIT_SCOPE_SKIP_SCOPED" -eq 0 ]]; then
-    HITS=$(audit_scope_names_all \
-        | xargs -r grep -nH -E '\b(TODO|FIXME|HACK|XXX)\b' 2>/dev/null \
+    # NUL-delimited and filtered to files still on disk: the old
+    # pipeline split on whitespace (so a path with a space became two
+    # unreadable paths) and sent deleted paths to grep, then discarded
+    # grep's complaint -- and every other error it could raise -- with
+    # 2>/dev/null.
+    # shellcheck disable=SC2119  # no pathspec: whole-scope, by design
+    HITS=$(audit_scope_names_existing_null \
+        | xargs -r -0 grep -nH -E '\b(TODO|FIXME|HACK|XXX)\b' \
         | grep -v 'docs/plans/' \
         || true)
     if [[ -n "$HITS" ]]; then

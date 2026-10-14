@@ -171,6 +171,15 @@ audit_scope_init() {
     fi
 
     if [[ -n "$range_given" ]]; then
+        # A value beginning with "-" is parsed by git as an option, not
+        # a revision, so `--range --output=/tmp/x..y` would reach
+        # `git diff` as a real option and write a file. Nothing
+        # legitimate starts with "-", so refuse rather than try to
+        # escape it; `git diff -- <path>` separators do not help, since
+        # the problem value sits where git expects a revision.
+        case "$range_given" in
+            -*) _audit_scope_die "--range must not start with '-' (it would be read as a git option): $range_given" ;;
+        esac
         case "$range_given" in
             *..*) ;;
             *) _audit_scope_die "--range must look like REV..REV or REV...REV, got: $range_given" ;;
@@ -195,6 +204,12 @@ audit_scope_init() {
             line="$(_audit_scope_trim "$line")"
             [[ -z "$line" ]] && continue
             sha="$line"
+            # Same reasoning as --range above: a commit named in the
+            # file is interpolated into `git diff` where a revision is
+            # expected, so an option-shaped entry must not get there.
+            case "$sha" in
+                -*) _audit_scope_die "commit must not start with '-' (it would be read as a git option): $sha (from $commits_file)" ;;
+            esac
             git rev-parse --verify "${sha}^{commit}" >/dev/null 2>&1 \
                 || _audit_scope_die "commit does not resolve: $sha (from $commits_file)"
             git rev-parse --verify "${sha}^1" >/dev/null 2>&1 \
@@ -258,7 +273,13 @@ audit_scope_report() {
     fi
     local count
     count="$(audit_scope_count)"
-    echo "audit scope: ${count} files (${AUDIT_SCOPE_DESC})"
+    local deleted
+    deleted="$(audit_scope_deleted_count)"
+    if [[ "$deleted" -gt 0 ]]; then
+        echo "audit scope: ${count} files (${AUDIT_SCOPE_DESC}); ${deleted} no longer on disk, so content checks read ${count} minus ${deleted}"
+    else
+        echo "audit scope: ${count} files (${AUDIT_SCOPE_DESC})"
+    fi
     if [[ "$count" -eq 0 ]]; then
         if [[ "$AUDIT_SCOPE_EXPLICIT" -eq 1 ]]; then
             _audit_scope_die "resolved file set is empty for ${AUDIT_SCOPE_DESC} -- nothing to audit"
@@ -297,6 +318,42 @@ audit_scope_names_all() {
             git diff --name-only "$AUDIT_SCOPE_RANGE"
         fi
     fi
+}
+
+# The scope is "every file the audited commits touched", which
+# deliberately includes files they deleted -- that is the honest count
+# of what was changed, and audit_scope_report keeps reporting it. A
+# check that opens files cannot use that list directly, though: in
+# commits mode a path deleted by one of the audited commits, or by a
+# later commit outside the scope, no longer exists in the worktree.
+# Feeding it to grep or awk produced a "No such file or directory" that
+# the callers then silenced with 2>/dev/null -- which also silenced
+# every other error those tools could raise. These two readers filter
+# to what is actually on disk so the silencing is unnecessary, and the
+# errors that remain are real.
+audit_scope_names_existing() {
+    local name
+    while IFS= read -r name; do
+        [[ -f "$name" ]] && printf '%s\n' "$name"
+    done < <(audit_scope_names_all "$@")
+}
+
+audit_scope_names_existing_null() {
+    local name
+    while IFS= read -r -d '' name; do
+        [[ -f "$name" ]] && printf '%s\0' "$name"
+    done < <(audit_scope_names_null "$@")
+}
+
+# audit_scope_deleted_count -- how many files in the scope are not on
+# disk, so audit_scope_report can say so rather than leaving a reader to
+# wonder why a check saw fewer files than the banner named.
+audit_scope_deleted_count() {
+    local name count=0
+    while IFS= read -r name; do
+        [[ -f "$name" ]] || count=$((count + 1))
+    done < <(audit_scope_names_all)
+    echo "$count"
 }
 
 audit_scope_names_added() {

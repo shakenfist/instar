@@ -12,35 +12,43 @@
 # docs/plans/PLAN-differencing-phase-18-push-audit.md, "The audit
 # scripts would have audited nothing".
 #
-# These tests run against this repository's own real history rather
-# than a synthetic fixture repo, because the --commits-file mode's
-# whole point is resolving a merge commit's first-parent diff, and a
-# fixture history built just for the test would not exercise that in
-# a way a reader could independently sanity-check. 60e4381c and
-# d7a4973f are two real phase-merge commits already on develop; their
-# file counts (10 and 20) are asserted against `git diff --name-only
-# <sha>^1 <sha>` as the oracle, not hand-counted, so they do not need
-# to be re-verified by hand if history is rewritten upstream of them.
-# Nothing here depends on network access, and the "default" case
-# depends on `develop` resolving to *something* in this repo (true by
-# construction, since it is the base branch), not on its content.
+# Every case builds its own throwaway repository under $WORK and runs
+# the resolver there. An earlier version asserted against this
+# repository's real history and two hard-coded merge SHAs, which
+# cannot work in CI: the ci-tooling job checks out at depth 1, so the
+# merges are not present and neither is a merge-base for
+# `develop...HEAD`. A fixture repository makes the test hermetic
+# (runnable in a shallow clone, a fork, or a rewritten history),
+# removes the hand-maintained file counts, and still exercises the
+# real thing -- `git merge --no-ff` produces a genuine merge commit,
+# so first-parent resolution is tested against git rather than against
+# a simulation of it. Oracles are computed by running git in the
+# fixture repository, never written down.
+#
+# Three fixture details are load-bearing:
+#   * one path contains a space, so a reader that splits on whitespace
+#     fails instead of silently reading two nonexistent files;
+#   * one merge deletes a file, so the scope legitimately names a path
+#     that is not on disk -- the case that used to reach grep and awk
+#     as an error and get discarded with 2>/dev/null;
+#   * `develop` is a real branch, so the default (no-option) scope is
+#     the same `develop...HEAD` expression the scripts use in anger.
 #
 # Library-level cases run the resolver in a command-substitution
 # subshell so a deliberate `exit 9` inside it (an invalid invocation)
-# only ends that subshell, not this test script. Script-level cases
-# invoke wave2-mechanical.sh itself as a child process, which isolates
-# the same way for free; they never reach wave1.sh's build steps,
-# because every case here is designed to be refused, or to resolve,
-# before any check runs -- this script must not trigger a build.
+# only ends that subshell, not this test script. The script-level
+# cases at the end invoke wave2-mechanical.sh itself, which resolves
+# its own repository root and so runs against this checkout rather
+# than the fixture; they prove the *script* refuses a bad scope before
+# running any check, and every one of them is refused during argument
+# parsing or on an empty explicit range, so none needs history and
+# none triggers a build.
 
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 LIB="${SCRIPT_DIR}/audit-scope.sh"
 WAVE2="${SCRIPT_DIR}/wave2-mechanical.sh"
-
-cd "$REPO_ROOT" || exit 1
 
 # Same idiom as test-inline-script-check.sh: one work directory, removed
 # on any exit, so nothing is left in /tmp and no path is predictable.
@@ -52,6 +60,60 @@ FAILURES=0
 start() { echo "--- $1"; }
 ok() { echo "    ok: $1"; }
 fail() { echo "    FAIL: $1" >&2; FAILURES=$((FAILURES + 1)); }
+
+SPACED='f2 with space.rs'
+
+# build_fixture DIR -- a repository with a develop branch, two real
+# merge commits and a working branch. Sets M1 and M2 to the merge SHAs.
+build_fixture() {
+    local dir="$1"
+    mkdir -p "${dir}"
+    (
+        cd "${dir}" || exit 1
+        git init -q -b develop .
+        git config user.email 'test@example.com'
+        git config user.name 'Audit Scope Test'
+        git config commit.gpgsign false
+        printf 'base\n' > a.rs
+        printf 'base\n' > b.rs
+        printf 'keep\n' > keep.txt
+        printf 'doc\n' > doc.md
+        git add -A
+        git commit -q -m 'base'
+
+        # Merge 1: two added Rust files (one with a space in its name)
+        # and one modified.
+        git checkout -q -b feat-a
+        printf 'one\n' > f1.rs
+        printf 'two\n' > "${SPACED}"
+        printf 'changed\n' >> a.rs
+        git add -A
+        git commit -q -m 'feat a'
+        git checkout -q develop
+        git merge -q --no-ff -m 'merge feat a' feat-a
+
+        # Merge 2: one added, one modified, one DELETED -- the deleted
+        # path is why the scope can name a file that is not on disk.
+        git checkout -q -b feat-b
+        printf 'three\n' > f3.rs
+        printf 'changed\n' >> b.rs
+        git rm -q keep.txt
+        git add -A
+        git commit -q -m 'feat b'
+        git checkout -q develop
+        git merge -q --no-ff -m 'merge feat b' feat-b
+
+        # A working branch, so the default develop...HEAD scope is
+        # non-empty and has a real merge-base.
+        git checkout -q -b work
+        printf 'work\n' > w1.rs
+        git add -A
+        git commit -q -m 'work in progress'
+    ) || return 1
+    M1="$(git -C "${dir}" log --format=%H --merges --first-parent develop | tail -1)"
+    M2="$(git -C "${dir}" log --format=%H --merges --first-parent develop | head -1)"
+    [ -n "${M1}" ] && [ -n "${M2}" ] && [ "${M1}" != "${M2}" ]
+}
 
 # expect_names NAME EXPECTED ACTUAL -- compare two newline-delimited
 # (already sorted) name lists in full, so a spurious extra or missing
@@ -75,9 +137,60 @@ expect_names() {
     fi
 }
 
-# expect_refused NAME EXPECTED_EXIT -- run wave2-mechanical.sh with
-# the given args, which must exit non-zero with EXPECTED_EXIT and
-# print something on stderr naming the problem.
+# in_fixture CODE... -- run CODE with the library sourced, inside the
+# fixture repository, in a subshell. Echoes its stdout; the caller sees
+# the subshell's exit status in $?.
+in_fixture() {
+    (
+        cd "${FIX}" || exit 1
+        # shellcheck source=tools/audit/audit-scope.sh
+        source "$LIB"
+        eval "$*"
+    )
+}
+
+# expect_lib_refused NAME EXPECTED_EXIT WANT_ERR INIT_ARGS... --
+# audit_scope_init (or audit_scope_report) must end the subshell with
+# EXPECTED_EXIT and print WANT_ERR on stderr.
+#
+# WANT_ERR is required rather than optional because several of these
+# invocations are refused by more than one rule: with the mutual
+# exclusion of --range and --commits-file removed, for instance,
+# `--range HEAD..HEAD --commits-file f` still exits 9, because the
+# range branch resolves to an empty explicit scope. An exit-code-only
+# assertion cannot tell those apart, and a mutation run proved it does
+# not: deleting the mutual-exclusion check left this test passing.
+expect_lib_refused() {
+    local case_name="$1" want_rc="$2" want_err="$3"
+    shift 3
+    local rc err
+    (
+        cd "${FIX}" || exit 1
+        # shellcheck source=tools/audit/audit-scope.sh
+        source "$LIB"
+        audit_scope_init "$@"
+        audit_scope_report
+    ) >/dev/null 2>"${WORK}/stderr"
+    rc=$?
+    err="$(cat "${WORK}/stderr")"
+    if [ "$rc" -ne "$want_rc" ]; then
+        fail "$case_name (exit $rc, want $want_rc)"
+        # shellcheck disable=SC2001  # see the multi-line note in expect_names
+        sed 's/^/      /' <<< "$err" >&2
+        return
+    fi
+    if [[ "$err" != *"$want_err"* ]]; then
+        fail "$case_name (exit code matched but stderr did not mention '${want_err}')"
+        # shellcheck disable=SC2001  # see the multi-line note in expect_names
+        sed 's/^/      /' <<< "$err" >&2
+        return
+    fi
+    ok "$case_name"
+}
+
+# expect_refused NAME EXPECTED_EXIT -- run wave2-mechanical.sh with the
+# given args, which must exit non-zero with EXPECTED_EXIT and print
+# something on stderr naming the problem.
 expect_refused() {
     local name="$1" expected_rc="$2"
     shift 2
@@ -98,96 +211,150 @@ expect_refused() {
     ok "$name"
 }
 
+FIX="${WORK}/fixture"
+M1=""
+M2=""
+start "fixture repository builds, with two real merge commits"
+if build_fixture "${FIX}"; then
+    ok "fixture built (merges ${M1:0:8} and ${M2:0:8})"
+else
+    fail "could not build the fixture repository -- nothing below can run"
+    echo "1 failure(s)" >&2
+    exit 1
+fi
+
 start "default (no option) matches git diff --name-only develop...HEAD"
-expected="$(git diff --name-only develop...HEAD | sort -u)"
-actual="$(
-    # shellcheck source=tools/audit/audit-scope.sh
-    source "$LIB"
-    audit_scope_init
-    # shellcheck disable=SC2119  # no pathspec: whole-scope, by design
-    audit_scope_names_all | sort -u
-)"
+expected="$(git -C "${FIX}" diff --name-only develop...HEAD | sort -u)"
+actual="$(in_fixture 'audit_scope_init; audit_scope_names_all | sort -u')"
 expect_names "default scope == develop...HEAD" "$expected" "$actual"
 
 start "explicit --range selects the right files"
-expected="$(git diff --name-only '60e4381c^1..60e4381c' | sort -u)"
-actual="$(
-    # shellcheck source=tools/audit/audit-scope.sh
-    source "$LIB"
-    audit_scope_init --range '60e4381c^1..60e4381c'
-    # shellcheck disable=SC2119  # no pathspec: whole-scope, by design
-    audit_scope_names_all | sort -u
-)"
-expect_names "--range 60e4381c^1..60e4381c" "$expected" "$actual"
-count="$(echo "$expected" | grep -c .)"
-if [ "$count" -eq 10 ]; then
-    ok "60e4381c first-parent diff is 10 files, as the plan records"
-else
-    fail "60e4381c first-parent diff is $count files, expected 10"
-fi
+expected="$(git -C "${FIX}" diff --name-only "${M1}^1..${M1}" | sort -u)"
+actual="$(in_fixture "audit_scope_init --range '${M1}^1..${M1}'; audit_scope_names_all | sort -u")"
+expect_names "--range <merge>^1..<merge>" "$expected" "$actual"
 
 start "--commits-file of one merge resolves to its first-parent diff"
-cfile="$(mktemp -p "${WORK}")"
-printf '# one phase merge\n60e4381c\n' > "$cfile"
-expected="$(git diff --name-only '60e4381c^1' '60e4381c' | sort -u)"
-actual="$(
-    # shellcheck source=tools/audit/audit-scope.sh
-    source "$LIB"
-    audit_scope_init --commits-file "$cfile"
-    # shellcheck disable=SC2119  # no pathspec: whole-scope, by design
-    audit_scope_names_all | sort -u
-)"
-rm -f "$cfile"
+cfile="${WORK}/one.txt"
+printf '# one phase merge\n%s\n' "${M1}" > "$cfile"
+expected="$(git -C "${FIX}" diff --name-only "${M1}^1" "${M1}" | sort -u)"
+actual="$(in_fixture "audit_scope_init --commits-file '${cfile}'; audit_scope_names_all | sort -u")"
 expect_names "--commits-file (single merge)" "$expected" "$actual"
 
 start "--commits-file of two merges resolves to the union of their first-parent diffs"
-cfile="$(mktemp -p "${WORK}")"
-cat > "$cfile" <<'EOF'
+cfile="${WORK}/two.txt"
+cat > "$cfile" <<EOF
 # two phase merges; blank lines and comments are ignored
 
-60e4381c
+${M1}
 
-d7a4973f
+${M2}
 EOF
-expected="$( { git diff --name-only '60e4381c^1' '60e4381c'; git diff --name-only 'd7a4973f^1' 'd7a4973f'; } | sort -u)"
-actual="$(
-    # shellcheck source=tools/audit/audit-scope.sh
-    source "$LIB"
-    audit_scope_init --commits-file "$cfile"
-    # shellcheck disable=SC2119  # no pathspec: whole-scope, by design
-    audit_scope_names_all | sort -u
-)"
-rm -f "$cfile"
+expected="$( {
+    git -C "${FIX}" diff --name-only "${M1}^1" "${M1}"
+    git -C "${FIX}" diff --name-only "${M2}^1" "${M2}"
+} | sort -u)"
+actual="$(in_fixture "audit_scope_init --commits-file '${cfile}'; audit_scope_names_all | sort -u")"
 expect_names "--commits-file (union of two merges)" "$expected" "$actual"
-count="$(echo "$expected" | grep -c .)"
-if [ "$count" -eq 26 ]; then
-    ok "union of 60e4381c (10) and d7a4973f (20) is 26 distinct files"
+# The union must be strictly larger than either side, or the test would
+# pass just as well against a resolver that ignored the second commit.
+one="$(git -C "${FIX}" diff --name-only "${M1}^1" "${M1}" | grep -c .)"
+both="$(echo "$expected" | grep -c .)"
+if [ "$both" -gt "$one" ]; then
+    ok "the union (${both}) is larger than the first merge alone (${one})"
 else
-    fail "union is $count files, expected 26"
+    fail "the union is ${both} files and the first merge alone is ${one}; the second commit cannot be contributing"
+fi
+
+start "a pathspec filters the union (commits mode)"
+expected="$( {
+    git -C "${FIX}" diff --name-only "${M1}^1" "${M1}" -- '*.rs'
+    git -C "${FIX}" diff --name-only "${M2}^1" "${M2}" -- '*.rs'
+} | sort -u)"
+actual="$(in_fixture "audit_scope_init --commits-file '${cfile}'; audit_scope_names_all '*.rs' | sort -u")"
+expect_names "names_all '*.rs' in commits mode" "$expected" "$actual"
+if ! grep -q 'doc.md' <<< "$actual" && grep -q 'f1.rs' <<< "$actual"; then
+    ok "the pathspec excluded doc.md and kept f1.rs"
+else
+    fail "the pathspec did not filter: ${actual//$'\n'/, }"
+fi
+
+start "names_added reports only added files (commits mode)"
+expected="$( {
+    git -C "${FIX}" diff --name-only --diff-filter=A "${M1}^1" "${M1}"
+    git -C "${FIX}" diff --name-only --diff-filter=A "${M2}^1" "${M2}"
+} | sort -u)"
+actual="$(in_fixture "audit_scope_init --commits-file '${cfile}'; audit_scope_names_added | sort -u")"
+expect_names "names_added in commits mode" "$expected" "$actual"
+if ! grep -qx 'a.rs' <<< "$actual"; then
+    ok "a modified file (a.rs) is not reported as added"
+else
+    fail "names_added included the merely-modified a.rs"
+fi
+
+start "audit_scope_diff produces a patch for the whole union"
+patch="$(in_fixture "audit_scope_init --commits-file '${cfile}'; audit_scope_diff")"
+if grep -q 'f1.rs' <<< "$patch" && grep -q 'f3.rs' <<< "$patch"; then
+    ok "the patch covers files from both merges"
+else
+    fail "the patch did not cover both merges ($(wc -l <<< "$patch") lines)"
+fi
+
+start "a path deleted by an audited commit is in the scope but not fed to content checks"
+all="$(in_fixture "audit_scope_init --commits-file '${cfile}'; audit_scope_names_all | sort -u")"
+existing="$(in_fixture "audit_scope_init --commits-file '${cfile}'; audit_scope_names_existing | sort -u")"
+if grep -qx 'keep.txt' <<< "$all"; then
+    ok "names_all keeps the deleted keep.txt, so the reported scope is the true one"
+else
+    fail "names_all dropped the deleted keep.txt; the scope count would understate what changed"
+fi
+if ! grep -qx 'keep.txt' <<< "$existing"; then
+    ok "names_existing drops keep.txt, so no check is handed a path that is not there"
+else
+    fail "names_existing returned the deleted keep.txt"
+fi
+if [ -n "$existing" ] && [ "$(grep -c . <<< "$existing")" -eq "$(( $(grep -c . <<< "$all") - 1 ))" ]; then
+    ok "names_existing drops exactly the one deleted path"
+else
+    fail "names_existing dropped the wrong number of paths"
+fi
+
+start "the report names how many scoped files are no longer on disk"
+output="$(in_fixture "audit_scope_init --commits-file '${cfile}'; audit_scope_report")"
+if [[ "$output" == *"1 no longer on disk"* ]]; then
+    ok "the banner says one file is gone, so a smaller content-check count is explained"
+else
+    fail "the banner did not mention the deleted file: ${output}"
+fi
+
+start "a filename containing a space survives the NUL-delimited reader"
+names="$(in_fixture "audit_scope_init --commits-file '${cfile}'; audit_scope_names_existing_null '*.rs' | tr '\\0' '\\n' | sort -u")"
+if grep -qxF "${SPACED}" <<< "$names"; then
+    ok "'${SPACED}' came back as one path"
+else
+    fail "'${SPACED}' was lost or split: ${names//$'\n'/, }"
 fi
 
 start "an empty EXPLICIT resolved set is refused"
-expect_refused "empty --range is refused with exit 9" 9 --range 'HEAD..HEAD'
+expect_lib_refused "empty --range is refused with exit 9" 9 'nothing to audit' \
+    --range 'HEAD..HEAD'
 
 start "an empty IMPLICIT (default) scope warns and continues, exit 0"
-# Force the resolved range empty (HEAD...HEAD) after an ordinary
-# no-option init, the way the reviewer's own repro did, since this
-# repo's real develop...HEAD is not guaranteed to be empty and must
-# not be made to be for a test. An implicit empty scope must NOT
-# refuse -- unlike the explicit case above, nothing here asserted a
-# scope and got it wrong; it legitimately means "no changes against
-# develop", and wave1.sh's unscoped checks (pre-commit, the build,
-# the test suite) must still run.
+# An implicit empty scope must NOT refuse -- unlike the explicit case
+# above, nothing here asserted a scope and got it wrong; it
+# legitimately means "no changes against develop", and wave1.sh's
+# unscoped checks (pre-commit, the build, the test suite) must still
+# run. Checked out on develop itself, develop...HEAD is empty for real.
 output="$(
+    cd "${FIX}" && git checkout -q develop || exit 1
     # shellcheck source=tools/audit/audit-scope.sh
     source "$LIB"
     audit_scope_init
-    AUDIT_SCOPE_RANGE='HEAD...HEAD'
     audit_scope_report
     echo "exit_code_was:$?"
     echo "skip_scoped_was:${AUDIT_SCOPE_SKIP_SCOPED}"
 )"
 rc=$?
+git -C "${FIX}" checkout -q work
 if [ "$rc" -eq 0 ] \
     && [[ "$output" == *"audit scope: 0 files"* ]] \
     && [[ "$output" == *"WARNING: nothing to audit"* ]] \
@@ -200,19 +367,62 @@ else
     sed 's/^/      /' <<< "$output" >&2
 fi
 
+start "an option-shaped revision is refused rather than handed to git"
+# --output=PATH is a real `git diff` option, so an unchecked value
+# reaching git writes the diff to PATH. Pointing it at a path that does
+# not exist turns "was it refused?" into something observable: the file
+# must still not exist afterwards.
+PWNED="${WORK}/written-by-git"
+expect_lib_refused "--range starting with '-' is refused with exit 9" 9 \
+    "must not start with" --range "--output=${PWNED}..HEAD"
+cfile="${WORK}/dash.txt"
+printf -- '--output=%s\n' "${PWNED}" > "$cfile"
+expect_lib_refused "a commits-file entry starting with '-' is refused with exit 9" 9 \
+    "must not start with" --commits-file "$cfile"
+# Glob, not an exact path: git treats the whole --output=VALUE as the
+# file name, so `--output=P..HEAD` writes "P..HEAD" rather than "P" --
+# which is how an earlier version of this assertion managed to pass
+# against a build with the guard removed.
+written=("${PWNED}"*)
+if [ ! -e "${written[0]}" ]; then
+    ok "git wrote no file, so the value never reached it as an option"
+else
+    fail "git wrote ${written[0]}: the option-shaped value reached git after all"
+fi
+
 start "both options together are refused"
-cfile="$(mktemp -p "${WORK}")"
-printf '60e4381c\n' > "$cfile"
-expect_refused "--range + --commits-file together are refused with exit 9" 9 \
-    --range 'HEAD..HEAD' --commits-file "$cfile"
-rm -f "$cfile"
+cfile="${WORK}/both.txt"
+printf '%s\n' "${M1}" > "$cfile"
+expect_lib_refused "--range + --commits-file together are refused with exit 9" 9 \
+    "mutually exclusive" --range 'HEAD..HEAD' --commits-file "$cfile"
 
 start "a missing --commits-file is refused"
-expect_refused "nonexistent --commits-file is refused with exit 9" 9 \
-    --commits-file "/nonexistent/$$-audit-scope-test.txt"
+expect_lib_refused "nonexistent --commits-file is refused with exit 9" 9 \
+    "not found" --commits-file "${WORK}/no-such-file.txt"
 
 start "an unparseable --range is refused"
-expect_refused "--range with no '..' is refused with exit 9" 9 --range 'notarange'
+expect_lib_refused "--range with no '..' is refused with exit 9" 9 \
+    "must look like REV..REV" --range 'notarange'
+
+start "an unresolvable commit in --commits-file is refused"
+cfile="${WORK}/bogus.txt"
+printf '%s\n' 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef' > "$cfile"
+expect_lib_refused "a commit that does not resolve is refused with exit 9" 9 \
+    "does not resolve" --commits-file "$cfile"
+
+# Script level: the same refusals must stop wave2-mechanical.sh itself
+# before it runs a single check. These run against this checkout (the
+# script resolves its own repository root), and every one is refused
+# during argument parsing or on an empty explicit range, so none needs
+# history beyond HEAD and none starts any work.
+start "wave2-mechanical.sh refuses a bad scope before running any check"
+expect_refused "script: empty --range is refused with exit 9" 9 --range 'HEAD..HEAD'
+expect_refused "script: --range with no '..' is refused with exit 9" 9 --range 'notarange'
+expect_refused "script: nonexistent --commits-file is refused with exit 9" 9 \
+    --commits-file "${WORK}/no-such-file.txt"
+expect_refused "script: both options together are refused with exit 9" 9 \
+    --range 'HEAD..HEAD' --commits-file "${WORK}/both.txt"
+expect_refused "script: an unknown option is refused with exit 9" 9 --nonsense
 
 echo
 if [ "$FAILURES" -ne 0 ]; then

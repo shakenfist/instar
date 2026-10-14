@@ -28,6 +28,11 @@
 
 set -euo pipefail
 
+# Resolved before anything changes directory: this script cd's into the
+# testdata clone, so a relative $0 would not survive to the fixture
+# check below.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 TESTDATA_CACHE="${TESTDATA_CACHE:-/srv/ci/cached/instar-testdata}"
 REPO_HOST='gitlab.home.stillhq.com'
 REPO_PATH='private/instar-testdata.git'
@@ -74,41 +79,15 @@ fi
 git lfs install --local
 git lfs pull
 
-# Guard: prove the fixtures are real images, not LFS pointer files. A
-# git-LFS pointer begins with the literal "version https://git-lfs...".
-# We require at least one canary to exist and every present canary to be
-# non-pointer, so a silent LFS miss becomes a clear infra failure here
-# instead of 200+ "file format: unknown" test failures downstream.
-# custom/audit/ is canaried too: the differencing locator fixtures are
-# the only automated proof that the path-traversal references are
-# refused, and the tests that use them skip rather than fail when a
-# fixture is absent, so a partial checkout would remove that proof with
-# CI still green.
-canaries=(
-    "custom/security/qcow2-backing-textfile.qcow2"
-    "custom/raw/zeros-1mb.raw"
-    "custom/audit/vhd-diff-locator-dotdot.vhd"
-)
-found_canary=0
-for rel in "${canaries[@]}"; do
-    path="${TESTDATA_PATH}/${rel}"
-    [ -f "${path}" ] || continue
-    found_canary=1
-    if head -c 64 "${path}" | grep -q 'git-lfs.github.com/spec'; then
-        echo "::error::testdata LFS not materialised: ${rel} is still a" \
-             "git-LFS pointer file. This is an infrastructure problem" \
-             "(git-lfs pull did not fetch objects), NOT a test/instar" \
-             "regression. Fix LFS auth/availability on the runner and" \
-             "re-run; do not modify instar code to match this output." >&2
-        exit 1
-    fi
-done
-
-if [ "${found_canary}" -eq 0 ]; then
-    echo "::error::none of the expected testdata canary fixtures were" \
-         "found under ${TESTDATA_PATH}; the checkout looks incomplete." >&2
-    exit 1
-fi
+# Guard: prove the fixtures the suite cannot do without are present and
+# materialised. The check is a separate script because
+# tools/test-package-functional.sh needs the same guarantee, and because
+# a guard this load-bearing deserves tests of its own -- see
+# tools/ci/test-check-testdata-fixtures.sh. It fails on a missing
+# fixture, not only on an un-materialised LFS pointer: every test that
+# reads these skips rather than fails when its file is absent, so a
+# partial or renamed checkout would quietly shrink the suite.
+"${SCRIPT_DIR}/check-testdata-fixtures.sh" "${TESTDATA_PATH}" --annotate
 
 echo "testdata ready at ${TESTDATA_PATH} (LFS materialised, canary verified)"
 if [ -n "${GITHUB_ENV:-}" ]; then

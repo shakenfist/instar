@@ -303,6 +303,14 @@ Falsifiable, in the order a reviewer can check them:
   tools/audit/wave2-mechanical.sh` is unchanged in meaning: the
   expression survives only as the default, and `tools/audit/test-audit-scope.sh`
   passes.
+* `tools/audit/test-audit-scope.sh` runs in CI, not only by hand. Added
+  after the first review round pointed out that nothing invoked it:
+  a test nothing runs guards nothing, which is the same defect as the
+  one this phase exists to fix, one level up. It is a step in the
+  `ci-tooling` job beside `test-inline-script-check.sh`, and it builds
+  its own fixture repository so it needs no history at that job's
+  `fetch-depth: 1` — which is also what retired the two hard-coded
+  merge SHAs it used to assert against.
 * The materialised `scope.patch` is within 1% of 54,821 patch lines
   over 103 distinct files, and contains `1a677c77` and `01153800`.
 * `tools/audit/wave1.sh` exits 0 over that scope, or every non-zero
@@ -379,7 +387,7 @@ reports success having examined nothing:
 
 | Finding | Site | Fix |
 |---|---|---|
-| CI canary misses the audit fixtures | `tools/ci/prepare-testdata.sh` | The differencing locator fixtures are the only automated proof that the path-traversal references are refused, and `tests/test_differencing.py:546-551` skips rather than fails when a fixture is absent. A partial testdata checkout removed that proof with CI still green. `custom/audit/vhd-diff-locator-dotdot.vhd` added to the canary list. |
+| CI canary misses the audit fixtures | `tools/ci/prepare-testdata.sh`, `tools/test-package-functional.sh` | The differencing locator fixtures are the only automated proof that the path-traversal references are refused, and `tests/test_differencing.py:546-551` skips rather than fails when a fixture is absent, so a partial testdata checkout removed that proof with CI still green. Adding the fixture to the canary list did **not** fix this, as the first review round pointed out: both canary loops skipped an absent file and failed only when every canary was missing, so the new entry checked pointer-ness and nothing else. The guard is now `tools/ci/check-testdata-fixtures.sh`, called by both scripts, which requires every listed fixture to exist as well as to be materialised -- and that applies to the two pre-existing canaries too, whose consumers (`tests/base.py` `get_adversarial_image`, `tests/test_security.py:38-40`) skip on absence in exactly the same way. `tools/ci/test-check-testdata-fixtures.sh` covers it, including the missing-fixture case that used to pass. |
 | False PASS on an empty comparison | `tools/verify-info-output-parity.sh:78` | `BASE="$(git merge-base origin/develop HEAD)"` with no `BASE != HEAD` guard, so on `develop` it built the same tree twice and printed `PASS: instar info output is byte-identical`. Guard added and proven: on `develop` the merge-base is HEAD, so it now exits 2. |
 
 ### Filed

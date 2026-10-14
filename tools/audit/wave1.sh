@@ -133,9 +133,21 @@ bold "=== wave 1b: mechanical style checks ==="
 if [[ "$AUDIT_SCOPE_SKIP_SCOPED" -eq 0 ]]; then
     # -z / -0: NUL-delimited so filenames with spaces or special
     # characters survive the xargs split.
-    LONG_LINES=$(audit_scope_names_null '*.rs' \
-        | xargs -r -0 awk 'length > 120 {print FILENAME":"NR": "length" chars"}' \
-        2>/dev/null || true)
+    #
+    # FNR, not NR: awk is handed every file at once, and NR counts
+    # across the whole input, so every file after the first reported a
+    # cumulative line number. That was wrong from the start and is
+    # wrong more often now, since a --commits-file scope passes dozens
+    # of files in one invocation; the same NR/FNR defect was already
+    # fixed once in inline-script-check.awk. xargs may also split a
+    # long list into several awk runs, which resets NR but never FNR.
+    #
+    # names_existing_null, not names_null: a scope can name a file that
+    # was deleted, and awk's error for it used to be discarded by a
+    # 2>/dev/null that discarded every other error with it.
+    LONG_LINES=$(audit_scope_names_existing_null '*.rs' \
+        | xargs -r -0 awk 'length > 120 {print FILENAME":"FNR": "length" chars"}' \
+        || true)
     if [[ -n "$LONG_LINES" ]]; then
         echo "ADVISORY: lines over 120 chars in changed Rust files:"
         echo "$LONG_LINES" | head -20
