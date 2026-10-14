@@ -6,24 +6,20 @@
 # need agents (waves 2a-judgment, 2b, 2c, 2d).
 #
 # Reports findings as plain text; never exits non-zero on a finding,
-# only if the script itself failed, the options are misused, or an
-# EXPLICIT scope (--range/--commits-file) resolves to zero files
-# (exit 9 either way) -- the caller asserted that scope and got it
-# wrong, which is not a finding, it is a broken invocation. The
-# implicit default (develop...HEAD) resolving to zero files is not an
-# error: a warning is printed and every check below is skipped, same
-# as when `develop` does not resolve at all -- there is nothing to
-# scan either way. Read the output and decide what to fix.
+# only if the script itself failed or the scope was misused (exit 9).
+# A broken invocation is not a finding. Read the output and decide
+# what to fix.
 #
 # Usage: tools/audit/wave2-mechanical.sh [--range REV..REV | --commits-file PATH]
 # Run from the worktree root.
 #
-# Every check below is scoped to a set of files, which defaults to
-# `git diff develop...HEAD` -- i.e. ordinary pre-push use is
-# unchanged. --range and --commits-file (mutually exclusive) override
-# that scope; see audit-scope.sh for what each means and how a
-# --commits-file union resolves "added". The resolved file count is
-# printed before any check runs.
+# Every check below is scoped to a set of files that audit-scope.sh
+# resolves. That file is the authority on what --range and
+# --commits-file mean, on the default, and on when an empty scope is
+# an error; it is not restated here, because three copies of one
+# policy drift. The resolved file count is printed before any check
+# runs, and every check below is skipped when the scope is unresolved
+# or legitimately empty.
 
 set -u
 

@@ -21,8 +21,14 @@
 # time, not silently reduce the suite.
 #
 # usage: check-testdata-fixtures.sh TESTDATA_PATH [--annotate]
+#        check-testdata-fixtures.sh --list
 #
 #   --annotate prefixes failures with ::error:: for GitHub Actions.
+#   --list     prints the required fixtures, one per line, and exits.
+#              tools/ci/test-check-testdata-fixtures.sh drives every
+#              case off this rather than parsing the array out of this
+#              file, so reformatting the array cannot quietly shrink
+#              what the test covers.
 #
 # Exits 0 when every fixture is present and real, 1 otherwise.
 
@@ -31,7 +37,9 @@ set -uo pipefail
 # The fixtures whose absence would silently shrink the suite. Each must
 # have a matching entry in tests/manifest.json; tools/ci/test-check-
 # testdata-fixtures.sh asserts that, so a typo here fails in the test
-# rather than by breaking every CI job against a correct checkout.
+# rather than by breaking every CI job against a correct checkout. That
+# test reads this list through --list, so the layout here is free to
+# change.
 REQUIRED_FIXTURES=(
     "custom/security/qcow2-backing-textfile.qcow2"
     "custom/raw/zeros-1mb.raw"
@@ -43,6 +51,10 @@ TESTDATA_PATH=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
+        --list)
+            printf '%s\n' "${REQUIRED_FIXTURES[@]}"
+            exit 0
+            ;;
         --annotate)
             ANNOTATE=1
             shift
@@ -63,7 +75,7 @@ while [ $# -gt 0 ]; do
 done
 
 if [ -z "${TESTDATA_PATH}" ]; then
-    echo "usage: $0 TESTDATA_PATH [--annotate]" >&2
+    echo "usage: $0 TESTDATA_PATH [--annotate] | $0 --list" >&2
     exit 1
 fi
 

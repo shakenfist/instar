@@ -112,6 +112,18 @@ The wave 2 judgment briefs in `PUSH-AUDIT.md` carry the same
 expression in prose (2a's says "the diff (`git diff develop...HEAD`)"),
 so they mislead a sub-agent in the same direction.
 
+This survey finding was then under-acted on: the first implementation
+added the exit-code row to the runbook's table and left all five
+briefs saying `git diff develop...HEAD`, which the second review round
+caught. Fixing the scripts without fixing the runbook they are
+documented in would have left the next push-audit phase reading the
+wrong scope from the prose while the scripts resolved the right one.
+`PUSH-AUDIT.md` now defines the audit scope once, under *The audit
+scope*, says that a push-audit phase must pass `--commits-file` and
+why, and each of the five briefs tells its sub-agent to read the
+patch the management session hands it rather than recomputing a diff
+of its own.
+
 ### The union of merge ranges exists, and is complete
 
 Unlike the fuzz-autofix precedent, which had no range to audit and

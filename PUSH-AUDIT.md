@@ -22,6 +22,58 @@ parallel.
 The management session reviews all findings, fixes any
 issues, and confirms the push.
 
+### The audit scope
+
+Every check below that reads changed files -- in both
+scripts, and in all four judgment briefs -- works over one
+resolved set of files called the *audit scope*.
+`tools/audit/audit-scope.sh` resolves it, both scripts
+print the resolved file count before running anything, and
+both take the same two options:
+
+```
+# default scope: git diff develop...HEAD
+tools/audit/wave1.sh
+
+# an explicit range
+tools/audit/wave1.sh --range REV..REV
+
+# one commit per line; # comments and blanks ignored
+tools/audit/wave1.sh --commits-file FILE
+```
+
+**For an ordinary pre-push audit, use the default.** It is
+`git diff develop...HEAD`, which is what the branch is
+about to push.
+
+**For a push-audit phase, you must pass `--commits-file`.**
+A push audit reviews the accumulated work of every phase in
+a plan, and those phases have already merged, so
+`develop...HEAD` covers only what the audit branch itself
+adds -- a handful of files, or nothing at all for a branch
+with no commits of its own. Either reads as a clean audit.
+List the plan's phase merge commits one per line and the
+library unions each one's first-parent diff, which is the
+set the audit is actually for. Mind the plan's `Merged`
+cells: one can name several commits, or commits in more
+than one repository.
+
+An explicitly-given scope that resolves to zero files is an
+error (exit 9) -- you asserted a scope and got it wrong. The
+default resolving to zero files is not, because it
+legitimately means "no changes against develop", and the
+unscoped checks must still run.
+
+The management session should materialise the resolved scope
+once as a patch file and hand that to the judgment agents,
+rather than having each of them recompute it:
+
+```
+tools/audit/wave1.sh --commits-file commits.txt
+# or audit_scope_diff, from the library
+git diff <merge>^1 <merge> > scope.patch
+```
+
 ## Wave 1: Mechanical checks
 
 Run the consolidated script (one approval):
@@ -86,7 +138,10 @@ style questions need a sub-agent to read code:
 
 **Brief for sub-agent (only if wave 1 passes):**
 
-Check `git diff develop...HEAD` for adherence to project
+Check the audit scope -- the patch the management session gives
+you (`scope.patch`), **not** a `git diff develop...HEAD`
+you run yourself, which on a push-audit branch covers
+only what the audit branch adds -- for adherence to project
 conventions in `AGENTS.md`:
 
 - Call table boundary discipline: any new host-side
@@ -157,8 +212,11 @@ already extracted TODO/FIXME comments, new
 `#[allow(dead_code)]`, `unsafe{}` blocks, and unwrap/
 expect lists.  Take that report as input.
 
-Add the judgment-level review on the diff
-(`git diff develop...HEAD`):
+Add the judgment-level review over the audit scope -- the
+patch the management session gives you (`scope.patch`),
+**not** a `git diff develop...HEAD` you run yourself, which
+on a push-audit branch covers only what the audit branch
+adds:
 
 - **Duplicated code:** Are there significant blocks of
   duplicated logic that the mechanical scan can't see?
@@ -337,7 +395,10 @@ fix before push) or advisory (can address later).
 
 **Brief for sub-agent:**
 
-Review the diff (`git diff develop...HEAD`) for test
+Review the audit scope -- the patch the management session gives
+you (`scope.patch`), **not** a `git diff develop...HEAD`
+you run yourself, which on a push-audit branch covers
+only what the audit branch adds -- for test
 coverage:
 
 - Does every new public function or significant code
@@ -403,7 +464,10 @@ Report findings as a bullet list grouped by file.
 **Brief for sub-agent:**
 
 Check that documentation matches the current code state.
-Read the diff (`git diff develop...HEAD`) and verify:
+Read the audit scope -- the patch the management session gives
+you (`scope.patch`), **not** a `git diff develop...HEAD`
+you run yourself, which on a push-audit branch covers
+only what the audit branch adds -- and verify:
 
 <!-- shared-block: readme-discipline v1 -->
 README discipline (shared block; do not edit -- the canonical
@@ -539,7 +603,10 @@ gaps found" is a valid answer.
 
 **Brief for sub-agent:**
 
-Security review of the diff (`git diff develop...HEAD`).
+Security review of the audit scope -- the patch the management session gives
+you (`scope.patch`), **not** a `git diff develop...HEAD`
+you run yourself, which on a push-audit branch covers
+only what the audit branch adds.
 This requires careful judgment — read the actual code,
 not just the diff summary.
 

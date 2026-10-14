@@ -48,6 +48,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIB="${SCRIPT_DIR}/audit-scope.sh"
+WAVE1="${SCRIPT_DIR}/wave1.sh"
 WAVE2="${SCRIPT_DIR}/wave2-mechanical.sh"
 
 # Same idiom as test-inline-script-check.sh: one work directory, removed
@@ -188,16 +189,24 @@ expect_lib_refused() {
     ok "$case_name"
 }
 
-# expect_refused NAME EXPECTED_EXIT -- run wave2-mechanical.sh with the
-# given args, which must exit non-zero with EXPECTED_EXIT and print
-# something on stderr naming the problem.
+# expect_refused SCRIPT NAME EXPECTED_EXIT -- run SCRIPT with the given
+# args, which must exit non-zero with EXPECTED_EXIT and print something
+# on stderr naming the problem.
+#
+# Both wave scripts are driven, not just one: they parse their options
+# through the same library but call it from their own preamble, and the
+# point of a script-level case is to catch those two preambles drifting
+# apart. Every case here is refused during argument parsing or on an
+# empty explicit range -- before wave1.sh reaches pre-commit or
+# wave2-mechanical.sh reaches its first grep -- so neither starts any
+# work.
 expect_refused() {
-    local name="$1" expected_rc="$2"
-    shift 2
+    local script="$1" name="$2" expected_rc="$3"
+    shift 3
     local err rc
     # stdout is discarded, not inspected -- only the exit code and
     # stderr (the "naming the problem" message) matter here.
-    "$WAVE2" "$@" >/dev/null 2>"${WORK}/stderr"
+    "$script" "$@" >/dev/null 2>"${WORK}/stderr"
     rc=$?
     err="$(cat "${WORK}/stderr")"
     if [ "$rc" -ne "$expected_rc" ]; then
@@ -410,19 +419,72 @@ printf '%s\n' 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef' > "$cfile"
 expect_lib_refused "a commit that does not resolve is refused with exit 9" 9 \
     "does not resolve" --commits-file "$cfile"
 
-# Script level: the same refusals must stop wave2-mechanical.sh itself
-# before it runs a single check. These run against this checkout (the
-# script resolves its own repository root), and every one is refused
-# during argument parsing or on an empty explicit range, so none needs
-# history beyond HEAD and none starts any work.
-start "wave2-mechanical.sh refuses a bad scope before running any check"
-expect_refused "script: empty --range is refused with exit 9" 9 --range 'HEAD..HEAD'
-expect_refused "script: --range with no '..' is refused with exit 9" 9 --range 'notarange'
-expect_refused "script: nonexistent --commits-file is refused with exit 9" 9 \
-    --commits-file "${WORK}/no-such-file.txt"
-expect_refused "script: both options together are refused with exit 9" 9 \
-    --range 'HEAD..HEAD' --commits-file "${WORK}/both.txt"
-expect_refused "script: an unknown option is refused with exit 9" 9 --nonsense
+start "a root commit in --commits-file is refused (it has no parent to diff)"
+cfile="${WORK}/root.txt"
+git -C "${FIX}" rev-list --max-parents=0 develop > "$cfile"
+expect_lib_refused "a root commit is refused with exit 9" 9 \
+    "no parent to diff against" --commits-file "$cfile"
+
+start "develop resolving without a merge-base is 'unresolved', not 'nothing to audit'"
+# A shallow clone can have the develop ref without its history, and
+# then `git diff develop...HEAD` fails ("no merge base", exit 128)
+# rather than returning an empty set. Reported as zero files that would
+# read as a clean audit. An orphan branch reproduces it exactly: the
+# ref resolves, the merge-base does not.
+ORPHAN="${WORK}/orphan"
+(
+    cp -a "${FIX}" "${ORPHAN}"
+    cd "${ORPHAN}" || exit 1
+    git checkout -q --orphan unrelated
+    git rm -q -rf . >/dev/null 2>&1
+    printf 'unrelated\n' > u.rs
+    git add -A
+    git commit -q -m 'unrelated root'
+) || fail "could not build the orphan fixture"
+if git -C "${ORPHAN}" rev-parse --verify develop >/dev/null 2>&1 \
+    && ! git -C "${ORPHAN}" merge-base develop HEAD >/dev/null 2>&1; then
+    ok "the fixture has the shape: develop resolves, merge-base does not"
+else
+    fail "the orphan fixture does not reproduce the no-merge-base case"
+fi
+output="$(
+    cd "${ORPHAN}" || exit 1
+    # shellcheck source=tools/audit/audit-scope.sh
+    source "$LIB"
+    audit_scope_init
+    audit_scope_report
+    echo "skip_scoped_was:${AUDIT_SCOPE_SKIP_SCOPED}"
+)"
+rc=$?
+if [ "$rc" -eq 0 ] \
+    && [[ "$output" == *"unresolved"* ]] \
+    && [[ "$output" != *"nothing to audit"* ]] \
+    && [[ "$output" == *"skip_scoped_was:1"* ]]; then
+    ok "the banner says unresolved rather than reporting an empty audit"
+else
+    fail "a failing develop...HEAD was not reported as unresolved (rc=$rc)"
+    # shellcheck disable=SC2001  # see the multi-line note in expect_names above
+    sed 's/^/      /' <<< "$output" >&2
+fi
+
+# Script level: the same refusals must stop each wave script itself
+# before it runs a single check.
+for script_path in "$WAVE1" "$WAVE2"; do
+    script_name="$(basename "$script_path")"
+    start "${script_name} refuses a bad scope before running any check"
+    expect_refused "$script_path" \
+        "${script_name}: empty --range is refused with exit 9" 9 --range 'HEAD..HEAD'
+    expect_refused "$script_path" \
+        "${script_name}: --range with no '..' is refused with exit 9" 9 --range 'notarange'
+    expect_refused "$script_path" \
+        "${script_name}: nonexistent --commits-file is refused with exit 9" 9 \
+        --commits-file "${WORK}/no-such-file.txt"
+    expect_refused "$script_path" \
+        "${script_name}: both options together are refused with exit 9" 9 \
+        --range 'HEAD..HEAD' --commits-file "${WORK}/both.txt"
+    expect_refused "$script_path" \
+        "${script_name}: an unknown option is refused with exit 9" 9 --nonsense
+done
 
 echo
 if [ "$FAILURES" -ne 0 ]; then

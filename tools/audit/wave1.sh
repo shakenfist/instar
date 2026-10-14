@@ -15,20 +15,17 @@
 # Run from the worktree root.
 #
 # The mechanical style checks in wave 1b (long lines in changed Rust
-# files, adversarial fixtures added in the wrong repo) are scoped to
-# a set of files, which defaults to `git diff develop...HEAD` -- i.e.
-# ordinary pre-push use is unchanged. --range and --commits-file
-# (mutually exclusive) override that scope; see audit-scope.sh for
-# what each means and how a --commits-file union resolves "added".
-# The resolved file count is printed before any check runs. The
-# script exits 9 if --range/--commits-file was given and resolves to
-# zero files, or if the options are misused -- an EXPLICIT scope that
-# is empty means the caller got it wrong. The implicit default
-# resolving to zero files is not an error (it means "no changes
-# against develop", which is the ordinary state right after a push):
-# wave 1b's two scoped checks are skipped with a warning and every
-# other wave 1 check (pre-commit, the build, the test suite) still
-# runs.
+# files, adversarial fixtures added in the wrong repo) are scoped to a
+# set of files that audit-scope.sh resolves. That file is the authority
+# on what --range and --commits-file mean, on the default, and on when
+# an empty scope is an error; it is not restated here, because three
+# copies of one policy drift.
+#
+# What is specific to this script: a misused or empty explicit scope
+# exits 9 before any check runs, so a wrong invocation costs nothing.
+# An unresolved or legitimately empty default skips wave 1b's two
+# scoped checks with a warning and leaves every other wave 1 check --
+# pre-commit, the build, the test suite -- running.
 
 set -u
 

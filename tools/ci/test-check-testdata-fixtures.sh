@@ -34,11 +34,14 @@ fail() { echo "    FAIL: $1" >&2; FAILURES=$((FAILURES + 1)); }
 
 LFS_HEADER='version https://git-lfs.github.com/spec/v1'
 
-# The list the check enforces, read from the check itself so the two
-# cannot drift. Printed one per line.
+# The list the check enforces, asked of the check itself so the two
+# cannot drift. An earlier version parsed the array out of the source
+# with a sed range, which depended on each entry being double-quoted on
+# its own line: reformatting the array would have returned fewer
+# entries and quietly shrunk every generated case below. --list cannot
+# be wrong about its own array.
 required() {
-    sed -n '/^REQUIRED_FIXTURES=(/,/^)/p' "${CHECK}" \
-        | sed -n 's/^ *"\(.*\)"$/\1/p'
+    "${CHECK}" --list
 }
 
 # populate DIR [--omit REL] [--pointer REL] -- build a testdata tree

@@ -229,7 +229,18 @@ audit_scope_init() {
     # clone) -- every scoped check used to skip itself silently in
     # that case, and nothing here is allowed to turn that into a hard
     # failure for ordinary pre-push use.
-    if ! git rev-parse --verify develop >/dev/null 2>&1; then
+    #
+    # The ref resolving is not enough on its own. In a shallow clone
+    # the `develop` ref can exist while its history does not, and then
+    # `git diff develop...HEAD` fails ("fatal: develop...HEAD: no
+    # merge base", exit 128) rather than returning an empty set. The
+    # readers below would report zero files for that, and
+    # audit_scope_report would print "nothing to audit" -- a git
+    # failure rendered as a clean result, which is the exact defect
+    # this library exists to stop. So require the merge-base too, and
+    # treat its absence as "unresolved" rather than as "empty".
+    if ! git rev-parse --verify develop >/dev/null 2>&1 \
+        || ! git merge-base develop HEAD >/dev/null 2>&1; then
         AUDIT_SCOPE_SKIP_SCOPED=1
     fi
     AUDIT_SCOPE_DESC="develop...HEAD"
@@ -271,10 +282,18 @@ audit_scope_report() {
         echo "audit scope: unresolved (develop ref not found; diff-scoped checks will be skipped)"
         return 0
     fi
-    local count
-    count="$(audit_scope_count)"
-    local deleted
-    deleted="$(audit_scope_deleted_count)"
+    # One listing, two numbers. In commits mode each listing is a
+    # git diff per audited commit, so asking twice doubled that for no
+    # reason -- and, more to the point, left the total and the deleted
+    # tally free to disagree if the worktree changed between them.
+    local names count deleted name
+    names="$(audit_scope_names_all)"
+    count="$(printf '%s' "$names" | grep -c . || true)"
+    deleted=0
+    while IFS= read -r name; do
+        [[ -z "$name" ]] && continue
+        [[ -f "$name" ]] || deleted=$((deleted + 1))
+    done <<< "$names"
     if [[ "$deleted" -gt 0 ]]; then
         echo "audit scope: ${count} files (${AUDIT_SCOPE_DESC}); ${deleted} no longer on disk, so content checks read ${count} minus ${deleted}"
     else
@@ -343,17 +362,6 @@ audit_scope_names_existing_null() {
     while IFS= read -r -d '' name; do
         [[ -f "$name" ]] && printf '%s\0' "$name"
     done < <(audit_scope_names_null "$@")
-}
-
-# audit_scope_deleted_count -- how many files in the scope are not on
-# disk, so audit_scope_report can say so rather than leaving a reader to
-# wonder why a check saw fewer files than the banner named.
-audit_scope_deleted_count() {
-    local name count=0
-    while IFS= read -r name; do
-        [[ -f "$name" ]] || count=$((count + 1))
-    done < <(audit_scope_names_all)
-    echo "$count"
 }
 
 audit_scope_names_added() {

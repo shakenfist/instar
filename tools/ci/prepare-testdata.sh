@@ -89,7 +89,7 @@ git lfs pull
 # partial or renamed checkout would quietly shrink the suite.
 "${SCRIPT_DIR}/check-testdata-fixtures.sh" "${TESTDATA_PATH}" --annotate
 
-echo "testdata ready at ${TESTDATA_PATH} (LFS materialised, canary verified)"
+echo "testdata ready at ${TESTDATA_PATH} (LFS materialised, required fixtures verified)"
 if [ -n "${GITHUB_ENV:-}" ]; then
     echo "TESTDATA_PATH=${TESTDATA_PATH}" >> "${GITHUB_ENV}"
 fi
