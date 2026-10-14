@@ -157,27 +157,13 @@ if [ ! -d "$TESTDATA_PATH" ]; then
 fi
 TESTDATA_PATH=$(realpath "$TESTDATA_PATH")
 
-# Canary: refuse to run against un-materialised git-LFS pointer files.
-# A pointer begins with the literal "version https://git-lfs...". This
-# turns a silent LFS miss into a clear infrastructure error here rather
-# than 200+ "file format: unknown" failures inside the container.
-canary_ok=0
-for rel in "custom/security/qcow2-backing-textfile.qcow2" "custom/raw/zeros-1mb.raw"; do
-    path="$TESTDATA_PATH/$rel"
-    [ -f "$path" ] || continue
-    canary_ok=1
-    if head -c 64 "$path" | grep -q 'git-lfs.github.com/spec'; then
-        echo "Error: testdata LFS not materialised: $rel is still a git-LFS" >&2
-        echo "pointer file. This is an infrastructure problem (run" >&2
-        echo "tools/ci/prepare-testdata.sh), NOT an instar regression." >&2
-        exit 1
-    fi
-done
-if [ "$canary_ok" -eq 0 ]; then
-    echo "Error: no testdata canary fixture found under $TESTDATA_PATH;" >&2
-    echo "the checkout looks incomplete." >&2
-    exit 1
-fi
+# Refuse to run against an incomplete or un-materialised testdata
+# checkout. The same check runs in tools/ci/prepare-testdata.sh; it
+# lives in one script so the two cannot disagree about which fixtures
+# matter, and it fails on an absent fixture as well as on a git-LFS
+# pointer, because the tests that read these skip rather than fail when
+# the file is missing.
+"$REPO_ROOT/tools/ci/check-testdata-fixtures.sh" "$TESTDATA_PATH"
 
 # Test selection. The malicious-image tests are never run in the matrix;
 # test_bench is a large (80+) benchmark set with no differential-oracle

@@ -206,6 +206,34 @@ jobs:
       - name: Test the inline-script audit check
         run: tools/audit/test-inline-script-check.sh
 
+      # The audit scripts' file scope. Before the differencing push
+      # audit, every diff-scoped check in both waves computed its file
+      # set from `git diff develop...HEAD`, which on a push-audit branch
+      # covers only what the branch itself adds -- nothing, for a branch
+      # with no commits of its own, which reads as a clean audit. The
+      # test builds its own fixture repository, so it needs no history
+      # and runs at this job's fetch-depth of 1.
+      - name: Test the audit scope library
+        run: tools/audit/test-audit-scope.sh
+
+      # The file:line attribution wave 2's unsafe, unwrap and dead-code
+      # checks report. It replaced a grep -n over the concatenated diff
+      # stream, whose numbers were positions in a temporary artefact.
+      # A wrong-but-plausible line number cannot be spotted by reading,
+      # so the test generates a commit and checks every hit it reports
+      # against the files on disk. The commit is generated rather than
+      # taken from history because this job checks out at depth 1,
+      # where a history-dependent case would skip -- and a skip that
+      # always fires is a pass standing in for a check that never ran.
+      - name: Test the diff line attribution
+        run: tools/audit/test-diff-added-lines.sh
+
+      # The testdata fixture guard. Every test that reads these three
+      # fixtures skips rather than fails when its file is absent, so a
+      # partial checkout used to shrink the suite with CI still green.
+      - name: Test the testdata fixture check
+        run: tools/ci/test-check-testdata-fixtures.sh
+
   build-and-test:
     needs: check_paths
     if: needs.check_paths.outputs.code_changed != 'false'

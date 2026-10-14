@@ -80,6 +80,17 @@ if [ -z "$BASE" ]; then
     echo "error: could not compute merge-base with origin/develop" >&2
     exit 2
 fi
+# On develop the merge-base IS HEAD, so without this the script builds
+# the same tree twice, finds it byte-identical, and prints PASS having
+# compared nothing -- a green result that proves the opposite of what it
+# claims. Comparing a commit with itself is a broken invocation, not a
+# pass.
+if [ "$BASE" = "$(git rev-parse HEAD)" ]; then
+    echo "error: merge-base with origin/develop is HEAD itself, so there" >&2
+    echo "       is nothing to compare. Run this from a branch that has" >&2
+    echo "       commits origin/develop does not." >&2
+    exit 2
+fi
 echo "Base commit (git merge-base origin/develop HEAD): $BASE"
 echo "  $(git log -1 --format='%h %s' "$BASE")"
 

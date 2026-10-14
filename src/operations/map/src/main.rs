@@ -457,9 +457,14 @@ pub unsafe extern "C" fn _start() -> u64 {
                     );
                 }
             };
-            // Differencing VHDs: refuse explicitly. VhdState::init
-            // accepts both Dynamic and Differencing; the chain
-            // follow-up will lift this restriction.
+            // Differencing VHDs: refuse explicitly, the same way the
+            // VHDX arm below does. `VhdState::init` accepts both Dynamic
+            // and Differencing, which makes the check map's own
+            // responsibility. The refusal is settled rather than
+            // pending: map composes nothing for any format, and the
+            // qcow2-chain parity that would change that is issue #641.
+            // Without it a differencing VHD would map as though the
+            // parent's blocks were holes.
             if state.disk_type == vhd::DISK_TYPE_DIFFERENCING {
                 return finish(
                     call_table,

@@ -5,11 +5,21 @@
 # parts (missed abstractions, doc accuracy, security analysis) still
 # need agents (waves 2a-judgment, 2b, 2c, 2d).
 #
-# Reports findings as plain text; never exits non-zero unless the
-# script itself failed. Read the output and decide what to fix.
+# Reports findings as plain text; never exits non-zero on a finding,
+# only if the script itself failed or the scope was misused (exit 9).
+# A broken invocation is not a finding. Read the output and decide
+# what to fix.
 #
-# Usage: tools/audit/wave2-mechanical.sh
+# Usage: tools/audit/wave2-mechanical.sh [--range REV..REV | --commits-file PATH]
 # Run from the worktree root.
+#
+# Every check below is scoped to a set of files that audit-scope.sh
+# resolves. That file is the authority on what --range and
+# --commits-file mean, on the default, and on when an empty scope is
+# an error; it is not restated here, because three copies of one
+# policy drift. The resolved file count is printed before any check
+# runs, and every check below is skipped when the scope is unresolved
+# or legitimately empty.
 
 set -u
 
@@ -17,12 +27,68 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$REPO_ROOT" || exit 1
 
+# shellcheck source=tools/audit/audit-scope.sh
+source "$SCRIPT_DIR/audit-scope.sh"
+audit_scope_init "$@"
+audit_scope_report
+
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }
 
-bold "=== wave 2a: TODO / FIXME / HACK in changed files ==="
-if git rev-parse --verify develop >/dev/null 2>&1; then
-    HITS=$(git diff develop...HEAD --name-only \
-        | xargs -r grep -nH -E '\b(TODO|FIXME|HACK|XXX)\b' 2>/dev/null \
+# diff_added_lines -- read a unified diff on stdin and print each ADDED
+# line as "<path>:<line>: <content>". The awk program is a separate
+# file so tools/audit/test-diff-added-lines.sh can exercise it against
+# fixtures; it documents why a stream offset was the wrong thing to
+# report and what the line number means for a multi-commit union.
+diff_added_lines() {
+    awk -f "$SCRIPT_DIR/diff-added-lines.awk"
+}
+
+# show_capped CAP CONTENT -- print CONTENT (one hit per line) capped
+# at CAP lines, preceded by a line naming the true total; or "(none)"
+# when CONTENT is empty.
+#
+# It printed nothing at all for empty content when it was introduced,
+# which left two of the four sections below showing only their hint
+# line while the other two said "(none)" explicitly. In an audit whose
+# whole purpose is telling "nothing found" apart from "nothing
+# examined", every section has to state its result.
+#
+# This is the fix for the sibling defect PLAN-fuzz-autofix-phase-02
+# recorded at a smaller scale (PLAN-fuzz-autofix-phase-02-push-audit.md:178-181):
+# a bare `head -N` silently hides everything past the cap, which at
+# this plan's 55,000-line union is far more likely to bite than the
+# precedent's. It does not change which lines are shown or the cap,
+# only whether a reader can tell the list was cut.
+show_capped() {
+    local cap="$1" content="$2" total
+    total="$(printf '%s\n' "$content" | grep -c .)"
+    if [[ "$total" -eq 0 ]]; then
+        echo "(none)"
+        return 0
+    fi
+    if [[ "$total" -gt "$cap" ]]; then
+        echo "showing first ${cap} of ${total}:"
+    else
+        echo "${total} hit(s):"
+    fi
+    printf '%s\n' "$content" | head -n "$cap"
+}
+
+# Deliberately whole-file, not added-lines: a TODO already sitting in
+# a file this work touched is worth a reader's attention, and the
+# diff-scoped checks below cover what was added. What was wrong was
+# the heading, which implied every hit was new -- over a 103-file
+# union most of them predate the plan.
+bold "=== wave 2a: TODO / FIXME / HACK anywhere in touched files (not only added lines) ==="
+if [[ "$AUDIT_SCOPE_SKIP_SCOPED" -eq 0 ]]; then
+    # NUL-delimited and filtered to files still on disk: the old
+    # pipeline split on whitespace (so a path with a space became two
+    # unreadable paths) and sent deleted paths to grep, then discarded
+    # grep's complaint -- and every other error it could raise -- with
+    # 2>/dev/null.
+    # shellcheck disable=SC2119  # no pathspec: whole-scope, by design
+    HITS=$(audit_scope_names_existing_null \
+        | xargs -r -0 grep -nH -E '\b(TODO|FIXME|HACK|XXX)\b' \
         | grep -v 'docs/plans/' \
         || true)
     if [[ -n "$HITS" ]]; then
@@ -34,28 +100,32 @@ fi
 echo
 
 bold "=== wave 2a: new #[allow(dead_code)] in changed files ==="
-if git rev-parse --verify develop >/dev/null 2>&1; then
-    git diff develop...HEAD -- '*.rs' \
-        | grep -E '^\+.*allow\(dead_code\)' \
-        | head -20
-    echo "(if any of the above were added in this branch, consider whether the dead code can be deleted instead)"
+if [[ "$AUDIT_SCOPE_SKIP_SCOPED" -eq 0 ]]; then
+    DEAD_CODE=$(audit_scope_diff '*.rs' \
+        | diff_added_lines \
+        | grep -E 'allow\(dead_code\)' \
+        || true)
+    show_capped 20 "$DEAD_CODE"
+    if [[ -n "$DEAD_CODE" ]]; then
+        echo "(if any of the above were added in this branch, consider whether the dead code can be deleted instead)"
+    fi
 fi
 echo
 
 bold "=== wave 2b: new test count in changed files ==="
-if git rev-parse --verify develop >/dev/null 2>&1; then
-    NEW_TESTS=$(git diff develop...HEAD -- '*.rs' \
+if [[ "$AUDIT_SCOPE_SKIP_SCOPED" -eq 0 ]]; then
+    NEW_TESTS=$(audit_scope_diff '*.rs' \
         | grep -cE '^\+\s*#\[test\]' \
         || true)
     echo "new #[test] functions: $NEW_TESTS"
-    NEW_RS=$(git diff develop...HEAD --name-only -- '*.rs' | wc -l)
+    NEW_RS=$(audit_scope_names_all '*.rs' | wc -l)
     echo "rust files changed: $NEW_RS"
 fi
 echo
 
 bold "=== wave 2c: doc files touched in changed set ==="
-if git rev-parse --verify develop >/dev/null 2>&1; then
-    DOCS=$(git diff develop...HEAD --name-only \
+if [[ "$AUDIT_SCOPE_SKIP_SCOPED" -eq 0 ]]; then
+    DOCS=$(audit_scope_names_all \
         | grep -E '^(README\.md|ARCHITECTURE\.md|AGENTS\.md|CHANGELOG\.md|docs/)' \
         || true)
     if [[ -n "$DOCS" ]]; then
@@ -85,49 +155,54 @@ fi
 echo
 
 bold "=== wave 2d: VMM unsafe blocks added (host-side, higher risk) ==="
-if git rev-parse --verify develop >/dev/null 2>&1; then
-    VMM_UNSAFE=$(git diff develop...HEAD -- 'src/vmm/**/*.rs' \
-        | grep -nE '^\+.*\bunsafe\b' \
+if [[ "$AUDIT_SCOPE_SKIP_SCOPED" -eq 0 ]]; then
+    VMM_UNSAFE=$(audit_scope_diff 'src/vmm/**/*.rs' \
+        | diff_added_lines \
+        | grep -E '\bunsafe\b' \
         || true)
+    show_capped 10 "$VMM_UNSAFE"
     if [[ -n "$VMM_UNSAFE" ]]; then
-        echo "$VMM_UNSAFE" | head -10
         echo "(VMM unsafe blocks bypass the KVM sandbox; each must have a // SAFETY: comment)"
-    else
-        echo "(none)"
     fi
 fi
 echo
 
 bold "=== wave 2d: guest-side unsafe blocks added (sandboxed, lower risk) ==="
-if git rev-parse --verify develop >/dev/null 2>&1; then
-    GUEST_UNSAFE=$(git diff develop...HEAD -- \
+if [[ "$AUDIT_SCOPE_SKIP_SCOPED" -eq 0 ]]; then
+    # src/fuzz is named explicitly: it sits outside the main cargo
+    # workspace (which is why make fuzz-build is its own wave 1 step),
+    # so it is easy to leave out of a path list and nothing else here
+    # would report an unsafe block added under it.
+    GUEST_UNSAFE=$(audit_scope_diff \
             'src/core/**/*.rs' \
             'src/operations/**/*.rs' \
             'src/crates/**/*.rs' \
+            'src/fuzz/**/*.rs' \
             'src/shared/**/*.rs' \
-        | grep -nE '^\+.*\bunsafe\b' \
+        | diff_added_lines \
+        | grep -E '\bunsafe\b' \
         || true)
-    if [[ -n "$GUEST_UNSAFE" ]]; then
-        echo "$GUEST_UNSAFE" | head -10
-    else
-        echo "(none)"
-    fi
+    show_capped 10 "$GUEST_UNSAFE"
 fi
 echo
 
 bold "=== wave 2d: new .unwrap() / .expect() in changed code ==="
-if git rev-parse --verify develop >/dev/null 2>&1; then
-    git diff develop...HEAD -- '*.rs' \
-        | grep -nE '^\+.*\.(unwrap|expect)\s*\(' \
-        | head -20 \
-        || echo "(none)"
-    echo "(review each: are they panic-safe given the inputs? unwrap in VMM I/O paths is a denial-of-service risk)"
+if [[ "$AUDIT_SCOPE_SKIP_SCOPED" -eq 0 ]]; then
+    UNWRAP=$(audit_scope_diff '*.rs' \
+        | diff_added_lines \
+        | grep -E '\.(unwrap|expect)\s*\(' \
+        || true)
+    show_capped 20 "$UNWRAP"
+    if [[ -n "$UNWRAP" ]]; then
+        echo "(review each: are they panic-safe given the inputs? unwrap in VMM I/O paths is a denial-of-service risk)"
+    fi
 fi
 echo
 
 bold "=== wave 2d: adversarial / CVE fixtures added under src/tests/scripts ==="
-if git rev-parse --verify develop >/dev/null 2>&1; then
-    BADPLACE=$(git diff develop...HEAD --name-only --diff-filter=A \
+if [[ "$AUDIT_SCOPE_SKIP_SCOPED" -eq 0 ]]; then
+    # shellcheck disable=SC2119  # no pathspec: whole-scope, by design
+    BADPLACE=$(audit_scope_names_added \
         | grep -E '^(src|tests|scripts)/.*(adversarial|malicious|cve|exploit)' \
         || true)
     if [[ -n "$BADPLACE" ]]; then

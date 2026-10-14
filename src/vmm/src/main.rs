@@ -5882,7 +5882,7 @@ fn run_bench_guest(
     }
     // A differencing source is refused inside `init_chain_states`, which
     // then fails the run with the generic ERROR_PARSE_FAILED. Prefer the
-    // captured reason (PLAN-differencing phase 4).
+    // captured reason, which names the format and the operation.
     if serial_decoder.last_differencing_refusal.is_some() {
         return Err(serial_decoder
             .differencing_refusal_error("bench", DifferencingComposition::Supported)
@@ -13384,8 +13384,9 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
 
     // A differencing source is refused inside `init_chain_states`, which
     // sends a default result the loop above suppressed. Render the
-    // captured reason rather than the generic text (PLAN-differencing
-    // phase 4, closing issue #548).
+    // captured reason rather than the generic text: reporting
+    // "Content mismatch at offset 0!" for an image it declined to read
+    // is what issue #548 was filed over.
     if serial_decoder.last_differencing_refusal.is_some() {
         return Err(serial_decoder
             .differencing_refusal_error("compare", DifferencingComposition::Supported)
@@ -14431,8 +14432,9 @@ fn execute_convert(
         // A differencing source is refused inside `init_chain_states`,
         // before a single output sector is written, and `convert` has no
         // result struct to carry the reason -- so it travels on
-        // `send_error` and is rendered here in place of the generic text
-        // (PLAN-differencing phase 4, closing issue #547).
+        // `send_error` and is rendered here in place of the generic
+        // "convert operation failed", which is what issue #547 was
+        // filed over.
         if serial_decoder.last_differencing_refusal.is_some() {
             // Remove the output path. Nothing was written to it, and
             // leaving a zero-filled stub behind after refusing to compose
@@ -15849,8 +15851,9 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     }
 
     // A differencing source is refused before the allocation scan, which
-    // otherwise reports the generic "unsupported format" (PLAN-differencing
-    // phase 4).
+    // otherwise reports the generic "unsupported format". `measure` walks
+    // no chain, so the refusal is unconditional rather than a missing
+    // parent.
     if serial_decoder.last_differencing_refusal.is_some() {
         return Err(serial_decoder
             .differencing_refusal_error("measure", DifferencingComposition::Unsupported)
