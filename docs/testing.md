@@ -652,6 +652,34 @@ reason. Run it locally with:
 tools/ci/check-test-partition.sh
 ```
 
+The same guard checks a **second partition**: the merge-queue distro
+matrix and the nightly matrix, which between them must run everything
+an unselected matrix entry used to run. It asserts the two halves cover
+that baseline, that they do not overlap, that each half is actually
+invoked by a workflow job, and that the two workflows' distro lists
+agree entry for entry — those lists are deliberately copies, because
+their entries carry comments and an audit marker a shared file could
+not hold, so this check is the only thing keeping them in step.
+
+Nothing there is restated in the guard. A matrix leg does not invoke a
+Makefile target; it calls `tools/ci/run-matrix-entry.sh` with a
+`MATRIX_SET` of `queue`, `nightly` or `all`, so the guard reads the
+`MATRIX_SET` out of each workflow job (or its absence, which means that
+script's own default), the set-to-target mapping out of the script, the
+selector out of the named Makefile target, and the baseline exclusions
+out of `tools/test-package-functional.sh`. A renamed target or a
+typo'd `MATRIX_SET` is therefore a parse failure rather than a quietly
+different selection.
+
+One limit worth knowing when reading its output: `stestr list`
+collapses a parameterised test to its bare id, so the figure it reports
+is smaller than a run's (2378 against 3675 when last measured). Every
+selector bar one is prefix-style, and a variant's id begins with its
+bare id, so claiming the bare id claims every variant. The nightly's
+selector is `$`-anchored instead, which means a future parameterised
+variant of one of the six moved tests would stay on the merge gate
+rather than move to the nightly — the safe direction.
+
 Its own logic is unit-tested (stdlib only, no venv) via:
 
 ```bash

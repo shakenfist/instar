@@ -691,6 +691,18 @@ Commits: the plan; then one per step. Every commit passes
   child, and a `while` loop reports only its last command. The shared
   script takes the `&&`, adds the failure propagation neither form had,
   and its self-test asserts that an image survives a failed copy.
+* **The partition guard was discovering a prose comment as a CI job**,
+  and the comment was one this branch added two commits earlier. The
+  timing-seed explanation in `functional-tests.yml` contains the words
+  `"stestr run"`, which the guard's job discovery matched as an inline
+  invocation; it then read the following prose as that job's selectors,
+  giving it the bare words `so`, `already`, `recorded` and `in`. Those
+  match a large slice of the suite, so the guard would have reported a
+  genuinely orphaned test as claimed. Discovery now ignores matches
+  inside YAML comments, with a regression test whose fixture carries
+  the same shape of prose. Worth recording for how it was found: not by
+  reading the guard, but by extending it and watching what it claimed
+  to see.
 * Otherwise none directly. #543 is not closed by this change.
 
 ### Back brief

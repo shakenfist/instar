@@ -99,6 +99,14 @@ jobs:
   # exclude-list were ever refactored into an include-list. See
   # tools/ci/check-test-partition.py.
   #
+  # It also checks the merge-queue matrix against the nightly one: the
+  # two halves of that split must cover everything an unselected matrix
+  # entry used to run, must not overlap, and must agree on the distro
+  # list each of them copies. Those are the assertions that run on a
+  # pull request for the benefit of jobs that do not -- the matrix runs
+  # only in a merge group, where a selector that quietly stopped
+  # claiming a module would just make the gate faster.
+  #
   # The coverage-fuzz helpers only run when a target actually crashes,
   # so nothing else here exercises them -- which is how they managed to
   # break every nightly fuzz run for a month. See "Crash reporting" in
