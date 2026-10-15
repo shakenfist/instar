@@ -1,6 +1,6 @@
 # PLAN-543: Cut the merge queue's critical path
 
-## Status: Not started
+## Status: In progress
 
 ## Prompt
 

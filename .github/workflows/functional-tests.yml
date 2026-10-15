@@ -175,6 +175,30 @@ jobs:
       - name: Test the apt lock wrapper
         run: tools/ci/test-apt-get.sh
 
+      # tools/test-package-functional.sh seeds stestr's per-run
+      # repository with a committed timing file before "stestr run", so
+      # the scheduler can bin-pack workers by measured duration instead
+      # of splitting every test round-robin. Without it, one matrix
+      # leg put 1424s of VirtualPC conversion tests on a single worker
+      # out of 5967s total execute time, so that worker ran 2197s wall
+      # while the lightest ran 913s -- and a leg's wall time is its
+      # slowest worker's wall time. The test builds its own throwaway
+      # venv from tests/requirements.txt, so it needs no docker or
+      # testdata.
+      - name: Test the stestr timing seed
+        run: tools/ci/test-seed-stestr-timing.sh
+
+      # tests/stestr-timing.subunit (the file the step above seeds
+      # from) is derived, not hand-maintained: this generator reads
+      # the per-test durations a real "stestr run" already recorded in
+      # its own repository and re-emits them as a fresh subunit v2
+      # stream. The test runs a real (tiny, toy) suite to produce a
+      # real repository to derive from, so it is checking the
+      # generator against stestr's own recorded numbers, not a value
+      # this test invents.
+      - name: Test the stestr timing generator
+        run: tools/ci/test-generate-stestr-timing.sh
+
       # A new fuzz target has to be added to fuzz_targets/, Cargo.toml's
       # [[bin]] list and coverage-fuzz.yml's TARGETS array by hand, and a
       # target missing from that last one is never fuzzed in CI at all

@@ -53,6 +53,15 @@
 #   read-only, so no root-owned .stestr/ artefacts leak into the host
 #   worktree.
 #
+#   Before "stestr run", tools/ci/seed-stestr-timing.sh loads
+#   tests/stestr-timing.txt (a committed, machine-derived list of
+#   per-test durations) into the fresh .stestr repository, so
+#   the scheduler bin-packs workers by measured duration instead of
+#   distributing every test round-robin. Without it, one matrix leg put
+#   1424s of VirtualPC conversion tests on a single worker out of 5967s
+#   total execute time, so that worker ran 2197s wall while the
+#   lightest ran 913s. See tools/ci/seed-stestr-timing.sh for why.
+#
 # This is the per-matrix-entry functional runner. It is separate from
 # tools/test-package-install.sh, which stays the fast packaging smoke
 # check (file layout, --help, info/create/map).
@@ -261,6 +270,16 @@ cd /tmp/instar-tests
 "$PYBIN" -m venv /tmp/test-venv
 /tmp/test-venv/bin/pip install -q --upgrade pip
 /tmp/test-venv/bin/pip install -q -r requirements.txt
+
+echo ""
+echo "--- Seeding stestr timing data ---"
+# See tools/ci/seed-stestr-timing.sh for why: a repository created fresh
+# in every container has no durations to bin-pack from, which is what
+# puts several minutes of VHD conversion tests on one worker while the
+# others idle. The timing file travels with the tests/ tree (copied
+# above), and a missing one is not an error -- the scheduler just
+# partitions blind, as it always has.
+/workspace/tools/ci/seed-stestr-timing.sh /tmp/test-venv/bin/stestr stestr-timing.txt
 
 echo ""
 echo "--- Running suite ---"
