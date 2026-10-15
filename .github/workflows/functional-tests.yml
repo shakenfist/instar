@@ -32,16 +32,40 @@ permissions:
 #
 # The merge queue runs `package-build` + `package-matrix` (and the
 # `can_merge` gate), and NOT the PR integration jobs. That is a coverage
-# argument, not just a cost one: every matrix entry runs the *full*
-# Python suite against the installed package on its own distro, using
-# that distro's qemu-img as the oracle. So the queue's coverage is a
+# argument, not just a cost one: every matrix entry runs the Python
+# suite against the installed package on its own distro, using that
+# distro's qemu-img as the oracle. So the queue's coverage is a
 # superset of the PR integration jobs, on seven distros instead of one,
-# with one exception: the libvhdi differencing oracle. Those two tests
-# need `vhdiinfo`, which the devcontainer installs and the per-distro
+# with two exceptions.
+#
+# The first: the libvhdi differencing oracle. Those two tests need
+# `vhdiinfo`, which the devcontainer installs and the per-distro
 # package containers do not, so they skip in the queue and are
 # mandatory only on `integration-core` below. They assert nothing about
-# packaging, so this costs nothing -- but the superset claim above is
-# otherwise exact and worth keeping that way.
+# packaging, so this costs nothing.
+#
+# The second is bigger, and it is why "every matrix entry" above no
+# longer says "the full suite": six VHD conversion tests -- the Hyper-V
+# and VirtualPC roundtrip, to-raw and compare cases -- do not run on
+# the matrix at all. They were half the suite's execute time and all of
+# its stestr worker imbalance, and what they mostly measure is a
+# distro's qemu-img rather than the change under test. They run once a
+# night across all seven distros instead, in
+# .github/workflows/nightly-matrix.yml, not on every merge. If you are
+# here to "fix" this by putting them back on the gate: they already run
+# on every pull request through `integration-convert-vhd` on debian-13
+# (against the in-tree build, not the installed package), so an
+# instar-side regression is still caught at PR time regardless of this
+# split, and the distro axis the matrix adds for them moves only when a
+# distro ships a new qemu, which a nightly catches within a day rather
+# than within a merge. `tools/ci/check-test-partition.py` is what keeps
+# the queue and nightly selections exact complements of what a matrix
+# entry used to run; the six are named by test id in the Makefile's
+# `test-container-matrix-queue` / `test-container-matrix-nightly`
+# targets.
+#
+# Apart from those two exceptions, the superset claim above is exact
+# and worth keeping that way.
 # Re-running the PR jobs in the queue would buy a second copy of a
 # strictly weaker signal. build-and-test is the deliberate exception --
 # it runs in both as the cheap fast-fail, and package-build needs it.
@@ -689,7 +713,9 @@ jobs:
           retention-days: 7
 
   # The distro matrix: install the shared package on each distro and run
-  # the FULL Python suite against that distro's own qemu-img.
+  # the Python suite against that distro's own qemu-img -- the queue
+  # half of it, which is everything except the six heavy VHD conversion
+  # tests the nightly workflow runs instead. See the exceptions above.
   #
   # No max-parallel, but not for the reason originally recorded. The
   # plan's premise was that `xl` runners start on demand, so seven

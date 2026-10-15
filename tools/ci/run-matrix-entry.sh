@@ -3,8 +3,10 @@
 #
 # This is the merge-queue counterpart to running
 # tools/test-package-functional.sh by hand: it resolves the right
-# package out of the shared build artifact, runs the full suite in the
-# distro container, and writes the entry's row into the job summary.
+# package out of the shared build artifact, runs the half of the suite
+# MATRIX_SET names in the distro container, and writes the entry's row
+# into the job summary. It ran the whole suite until the suite was
+# split; "all" is still how you ask for that.
 # It exists so the workflow step stays a single call rather than a
 # tee/exit-code/parse pipeline embedded in YAML.
 #

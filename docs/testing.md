@@ -459,6 +459,40 @@ MATRIX_SELECT='test_map\.' \
 makes the run partial, and a partial run must not be able to report as
 a green matrix entry. The wrapper prints a warning whenever it is set.
 
+**The wrapper call above still reproduces a merge-queue entry exactly
+— what it runs by default does not.** The matrix suite is now split in
+two, and `run-matrix-entry.sh` reads `MATRIX_SET` to pick which half:
+`queue` (the default, and what the command above runs — this is the
+half that gates a merge), `nightly` (the six heavy VHD conversion
+tests that do not), or `all` (the whole suite, both halves together,
+which is what every matrix entry ran before the split). To reproduce
+the nightly's selection on one distro instead:
+
+```bash
+PACKAGE_DIR=src/target/debian \
+TESTDATA_PATH=../instar-testdata \
+MATRIX_SET=nightly \
+    tools/ci/run-matrix-entry.sh 'Debian 12' debian:12 deb
+```
+
+The nightly itself runs in its own workflow,
+`.github/workflows/nightly-matrix.yml`, once a night across all seven
+distros, plus one further Debian-13-only leg that runs the whole suite
+(`MATRIX_SET=all`) to refresh `tests/stestr-timing.txt`, since no other
+job executes the whole suite in one stestr repository any more. See
+"CI job layout and the partition guard" below for the two Makefile
+targets that define the split and the guard that keeps the queue and
+nightly selections exact complements of what a matrix entry used to
+run.
+
+Measured before this split: per-distro matrix-leg suite medians ranged
+30 to 38 minutes, and every distro's own maximum exceeded the
+*slowest* distro's median -- host contention moved a leg's duration
+more than the distro did. That is the baseline a later reader should
+compare this split's own measurement against, to check whether the
+spread is still this narrow; a fresh measurement is being taken on
+#543 and is not included here.
+
 **Classify before you attribute.** Running two matrix containers at
 once — or any other heavy job on the host — starves the suite, and the
 resulting failures do not look like resource problems. The large
@@ -509,11 +543,17 @@ event, and the split is deliberate:
 
 The merge queue does **not** re-run the PR integration jobs. That is a
 coverage argument rather than a cost one: each matrix entry runs the
-*full* Python suite against the installed package on its own distro,
-against that distro's `qemu-img`, so the queue's coverage is a superset
-of the PR jobs on seven distros instead of one. `build-and-test` is the
-deliberate exception — it stays in both as the cheap fast-fail, and
-`package-build` depends on it.
+Python suite against the installed package on its own distro, against
+that distro's `qemu-img`, so the queue's coverage is a superset of the
+PR jobs on seven distros instead of one, with two exceptions — the
+libvhdi differencing oracle, and the six heavy VHD conversion tests
+that moved to a nightly cross-distro run instead of gating every
+merge. See "What runs where, and why" at the top of
+`functional-tests.yml` for both, and "Running against an installed
+package" above for where the moved tests run and at what cadence.
+`build-and-test` is the deliberate exception to the split itself — it
+stays in both as the cheap fast-fail, and `package-build` depends on
+it.
 
 `package-build` builds one `.deb` and one `.rpm` and uploads them as a
 single artifact that all seven entries consume. This works only because
@@ -2264,9 +2304,12 @@ the per-distro table.
 `tools/test-package-functional.sh <package> <distro-image>` runs the
 full suite against the **installed** `.deb`/`.rpm` inside a target-distro
 container, using that distro's own `qemu-img` as the oracle (tests from
-the tree, binary from the package via `INSTAR_BINARY_PATH`). It is the
-per-entry runner for the distro-matrix CI and the first check to surface
-version-specific output-format parity gaps that host-only CI cannot. It
+the tree, binary from the package via `INSTAR_BINARY_PATH`). Run by hand like
+that it selects nothing, so it really is the whole suite; the
+distro-matrix CI reaches the same script through
+`tools/ci/run-matrix-entry.sh`, which passes the half of the split that
+entry is for. It is the first check to surface version-specific
+output-format parity gaps that host-only CI cannot. It
 is distinct from `tools/test-package-install.sh` (fast packaging smoke)
 and is driven across seven distros by the `package-matrix` job, which
 runs **only** in the merge queue and on `workflow_dispatch` — never on a
