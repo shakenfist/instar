@@ -17,6 +17,7 @@
         test-venv test test-rust test-integration test-ci test-malicious test-report clean-tests \
         fuzz-build fuzz-run fuzz-coverage snapshot-harnesses \
         test-container test-container-core test-container-convert-qcow2 test-container-convert-vhd \
+        test-container-matrix-queue test-container-matrix-nightly \
         clean-cargo-cache release check-version
 
 # Default target
@@ -77,6 +78,8 @@ help:
 	@echo "  test-container-core  Run core tests (info, check, security) inside container"
 	@echo "  test-container-convert-qcow2  Run QCOW2/VMDK/RAW convert tests inside container"
 	@echo "  test-container-convert-vhd    Run VHD/VHDX convert tests inside container"
+	@echo "  test-container-matrix-queue   Run the merge-queue matrix selection inside container"
+	@echo "  test-container-matrix-nightly Run the nightly matrix selection inside container"
 	@echo "  test-ci              Run CI-suitable tests (safe + caution)"
 	@echo "  test-malicious       Run all tests including malicious images"
 	@echo "  snapshot-harnesses   Run the seven snapshot shell harnesses (needs /dev/kvm)"
@@ -794,6 +797,117 @@ test-container-convert-vhd: instar-devcontainer instar
 			/build/test-venv/bin/stestr run \
 				--concurrency 4 \
 				"test_convert\.TestConvert.*Vhd" \
+		'
+
+# The merge-queue / nightly split of the distro matrix.
+#
+# These two targets are the one place that split is defined. The two
+# selections are exact complements of what a matrix entry runs today,
+# and tools/ci/check-test-partition.py reads both regexes out of the
+# recipes below rather than keeping its own copy, so the halves cannot
+# drift apart without the guard noticing.
+# tools/ci/run-matrix-entry.sh lifts the selector out of the recipe for
+# the same reason, which is why the regexes are written out here
+# literally instead of through a make variable.
+#
+# Six VHD conversion tests do not gate a merge. They are half the
+# matrix suite's execute time and all of its stestr worker imbalance:
+# one worker drew the three VirtualPC cases and ran 2197 seconds while
+# another finished in 913 and idled. They already run on every pull
+# request through the convert-vhd job, so an instar-side regression is
+# still caught at pull-request time; what this gives up is only the
+# distro axis, and that axis moves when a distro ships a new qemu, not
+# when instar changes, so a nightly run across all seven distros is
+# still a finer cadence than the signal. The six:
+#
+#   test_convert.TestConvertVhdToQcow2Roundtrip.test_hyperv_vhd_qcow2_roundtrip
+#   test_convert.TestConvertVhdToQcow2Roundtrip.test_virtualpc_vhd_qcow2_roundtrip
+#   test_convert.TestConvertVhdToRaw.test_convert_hyperv_dynamic_vhd
+#   test_convert.TestConvertVhdToRaw.test_convert_virtualpc_vhd
+#   test_convert.TestConvertVhdCompare.test_compare_hyperv_vhd_vs_raw
+#   test_convert.TestConvertVhdCompare.test_compare_virtualpc_vhd_vs_raw
+#
+# They are named by test id rather than by class deliberately. All
+# three of those classes also hold sub-second fixed and zero-filled
+# cases -- test_convert_vhd_fixed, test_convert_vhd_d2v_zerofilled and
+# test_compare_vhd_d2v_zerofilled_vs_raw -- which stay on the gate and
+# which a class-level selector would move off it for no gain.
+#
+# A literal "$" in a recipe is written "$$" so make passes it through;
+# both regexes anchor the test id with "$" to keep a future test whose
+# name merely starts with one of the six out of the selection.
+#
+# The --exclude-regex mirrors what tools/test-package-functional.sh
+# excludes from the matrix run itself (the malicious-image tests, and
+# the benchmark set, which has no differential-oracle value), so this
+# target reproduces a matrix entry's selection exactly rather than
+# approximately.
+#
+# INSTAR_REQUIRE_LIBVHDI and --system-site-packages are here for the
+# same reason as in test-container-core: the queue selection includes
+# the differencing tests whose oracle is libvhdi, and an isolated venv
+# would not see the image's pyvhdi binding, so the suite would report
+# the package missing on an image that has it.
+test-container-matrix-queue: instar-devcontainer instar
+	@echo "Running the merge-queue matrix selection inside container..."
+	@if [ ! -d "$(TESTDATA_PATH)" ]; then \
+		echo "Error: Test data not found at $(TESTDATA_PATH)"; \
+		echo "Set INSTAR_TESTDATA_PATH or ensure instar-testdata is a sibling directory."; \
+		exit 1; \
+	fi
+	docker run --rm \
+		--device=/dev/kvm \
+		-u "$(shell id -u):$(shell id -g)" \
+		--group-add "$$(stat -c '%g' /dev/kvm)" \
+		-e HOME=/build \
+		-e INSTAR_TESTDATA_PATH=/testdata \
+		-e INSTAR_REQUIRE_LIBVHDI \
+		-v "$(CURDIR):/workspace" \
+		-v "$(TESTDATA_PATH):/testdata:ro" \
+		-w "/workspace" \
+		"$(INSTAR_DEV_IMAGE)" \
+		bash -c '\
+			echo "Setting up test environment..."; \
+			python3 -m venv --system-site-packages /build/test-venv && \
+			/build/test-venv/bin/pip install -q -r tests/requirements.txt && \
+			echo "Running the merge-queue selection..."; \
+			cd tests && \
+			/build/test-venv/bin/stestr run \
+				--exclude-regex "(test_info_malicious|test_bench)" \
+				--concurrency 4 \
+				"^(?!(?:test_convert\.TestConvertVhdToQcow2Roundtrip\.test_hyperv_vhd_qcow2_roundtrip|test_convert\.TestConvertVhdToQcow2Roundtrip\.test_virtualpc_vhd_qcow2_roundtrip|test_convert\.TestConvertVhdToRaw\.test_convert_hyperv_dynamic_vhd|test_convert\.TestConvertVhdToRaw\.test_convert_virtualpc_vhd|test_convert\.TestConvertVhdCompare\.test_compare_hyperv_vhd_vs_raw|test_convert\.TestConvertVhdCompare\.test_compare_virtualpc_vhd_vs_raw)$$)" \
+		'
+
+# The nightly half of the split above: the six heavy VHD conversion
+# tests, named by test id, run across all seven distros once a day
+# instead of on every merge. See test-container-matrix-queue for the
+# argument and for why the regexes are literal here.
+test-container-matrix-nightly: instar-devcontainer instar
+	@echo "Running the nightly matrix selection inside container..."
+	@if [ ! -d "$(TESTDATA_PATH)" ]; then \
+		echo "Error: Test data not found at $(TESTDATA_PATH)"; \
+		echo "Set INSTAR_TESTDATA_PATH or ensure instar-testdata is a sibling directory."; \
+		exit 1; \
+	fi
+	docker run --rm \
+		--device=/dev/kvm \
+		-u "$(shell id -u):$(shell id -g)" \
+		--group-add "$$(stat -c '%g' /dev/kvm)" \
+		-e HOME=/build \
+		-e INSTAR_TESTDATA_PATH=/testdata \
+		-v "$(CURDIR):/workspace" \
+		-v "$(TESTDATA_PATH):/testdata:ro" \
+		-w "/workspace" \
+		"$(INSTAR_DEV_IMAGE)" \
+		bash -c '\
+			echo "Setting up test environment..."; \
+			python3 -m venv /build/test-venv && \
+			/build/test-venv/bin/pip install -q -r tests/requirements.txt && \
+			echo "Running the nightly selection..."; \
+			cd tests && \
+			/build/test-venv/bin/stestr run \
+				--concurrency 4 \
+				"^(?:test_convert\.TestConvertVhdToQcow2Roundtrip\.test_hyperv_vhd_qcow2_roundtrip|test_convert\.TestConvertVhdToQcow2Roundtrip\.test_virtualpc_vhd_qcow2_roundtrip|test_convert\.TestConvertVhdToRaw\.test_convert_hyperv_dynamic_vhd|test_convert\.TestConvertVhdToRaw\.test_convert_virtualpc_vhd|test_convert\.TestConvertVhdCompare\.test_compare_hyperv_vhd_vs_raw|test_convert\.TestConvertVhdCompare\.test_compare_virtualpc_vhd_vs_raw)$$" \
 		'
 
 # Run CI-suitable tests (safe + caution)

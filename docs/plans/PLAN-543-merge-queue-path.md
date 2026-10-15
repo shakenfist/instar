@@ -612,6 +612,29 @@ Commits: the plan; then one per step. Every commit passes
   run. `package-build` needs `build-and-test` only for its
   devcontainer image; whether that dependency is real is worth
   checking separately.
+* **The libvhdi oracle is not required on the matrix path, and this
+  plan does not change that.** `INSTAR_REQUIRE_LIBVHDI: '1'` is set
+  only for `integration-core` (`functional-tests.yml:865`), which runs
+  `make test-container-core` on a pull request. The matrix reaches the
+  suite through `tools/ci/run-matrix-entry.sh` into
+  `tools/test-package-functional.sh`, and neither sets or forwards the
+  variable, so every libvhdi cross-check on a merge-queue leg skips
+  silently and the leg still reports zero failures. Found while
+  checking what the step 2 selectors keep on the gate; left alone
+  deliberately, because requiring the oracle changes *what* is tested
+  and this plan's mission is to change only *when*. It is the same
+  shape as the defect this plan exists to fix, so it is worth its own
+  issue rather than a footnote.
+* **The length floor is a lower bound, not a count.** Step 2's fix
+  derives it from `stestr list`, which enumerates only statically
+  discoverable ids: measured on this tree, a listing of the suite
+  minus `test_info_malicious` gives 2378 against a run's 3675, because
+  roughly 1300 cases are built at load time. The floor therefore
+  catches gross truncation and not a partial loss. The nightly from
+  step 3 is the one job that executes the whole set, so it can publish
+  the true executed count alongside the timing data and give the floor
+  a tight bound; that is the right home for it and it is not done
+  here.
 
 ### Bugs fixed during this work
 

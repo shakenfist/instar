@@ -19,11 +19,27 @@
 #   MATRIX_CONCURRENCY   stestr workers inside the container (default 4)
 #   MATRIX_LOG           where to write the captured log
 #                        (default ./matrix-<kind>.log)
+#   MATRIX_SET           which half of the matrix split to run:
+#                        "queue" (default, what gates a merge) or
+#                        "nightly" (the six heavy VHD conversion tests
+#                        that do not). Both selections are read out of
+#                        the Makefile; see below.
 #   MATRIX_SELECT        stestr selection regex; runs only matching
 #                        tests. For reproducing one CI entry locally
 #                        without paying for the whole suite. CI never
 #                        sets it -- a partial run must not be able to
-#                        report as a green matrix entry.
+#                        report as a green matrix entry. It is reserved
+#                        for that: it overrides MATRIX_SET's selection
+#                        rather than narrowing it, so it is not the way
+#                        to express the queue/nightly split.
+#
+# The queue and nightly selections are defined once, in the Makefile's
+# test-container-matrix-queue and test-container-matrix-nightly targets,
+# because tools/ci/check-test-partition.py reads them from there to
+# prove the two are exact complements of what a matrix entry used to
+# run. This script lifts the selector out of the named target rather
+# than carrying a copy, so there is nothing here that can drift from
+# what the guard checks.
 #
 # Exits with the functional runner's exit code, so the matrix entry
 # fails exactly when the suite does.
@@ -51,6 +67,49 @@ if [ -z "${TESTDATA_PATH:-}" ]; then
     exit 2
 fi
 
+# Read the positional stestr selector out of a Makefile
+# test-container-* target: skip to the target, then to its `stestr run`
+# invocation, then take the first argument that is a bare quoted string
+# (an --exclude-regex argument has its flag on the same line, so it is
+# not one).
+makefile_selector() {
+    local target="$1"
+    local selector
+    selector=$(awk -v tgt="${target}:" '
+        index($0, tgt) == 1 { found = 1; next }
+        found && /^[A-Za-z0-9_.-]+:/ { exit }
+        found && /stestr[ \t]+run/ { in_run = 1; next }
+        found && in_run && /^[ \t]+"/ {
+            line = $0
+            sub(/^[ \t]+"/, "", line)
+            sub(/"[ \t]*\\?[ \t]*$/, "", line)
+            print line
+            exit
+        }
+    ' "${REPO_ROOT}/Makefile")
+    # A recipe writes a literal dollar as "$$" so make passes it
+    # through; the selectors anchor each test id with "$", so undo the
+    # doubling to get the regex stestr must actually see.
+    selector="${selector//\$\$/\$}"
+    if [ -z "$selector" ]; then
+        echo "Error: no stestr selector found in Makefile target ${target}." >&2
+        echo "The queue and nightly selections are defined there and read" >&2
+        echo "from there; a parse failure must fail the entry rather than" >&2
+        echo "quietly running a different set of tests." >&2
+        return 1
+    fi
+    printf '%s\n' "$selector"
+}
+
+case "${MATRIX_SET:-queue}" in
+    queue) SELECT_TARGET=test-container-matrix-queue ;;
+    nightly) SELECT_TARGET=test-container-matrix-nightly ;;
+    *)
+        echo "Error: MATRIX_SET must be 'queue' or 'nightly', not '${MATRIX_SET}'." >&2
+        exit 2
+        ;;
+esac
+
 PACKAGE=$("${REPO_ROOT}/tools/ci/resolve-package.sh" "$PKG_KIND" "$PACKAGE_DIR")
 
 echo "=== ${NAME} (${IMAGE}) ==="
@@ -66,6 +125,10 @@ if [ -n "${MATRIX_SELECT:-}" ]; then
     echo "matrix result. Never set it in CI." >&2
     echo "" >&2
     RUNNER_ARGS+=(--select "$MATRIX_SELECT")
+else
+    SELECTOR=$(makefile_selector "$SELECT_TARGET") || exit 2
+    echo "selection: ${MATRIX_SET:-queue} (Makefile ${SELECT_TARGET})"
+    RUNNER_ARGS+=(--select "$SELECTOR")
 fi
 
 set +e

@@ -282,6 +282,52 @@ echo "--- Seeding stestr timing data ---"
 /workspace/tools/ci/seed-stestr-timing.sh /tmp/test-venv/bin/stestr stestr-timing.txt
 
 echo ""
+echo "--- Counting the selection ---"
+# A lower bound on how many tests this run must execute, discovered
+# rather than written down, for the length floor further down.
+#
+# It is a lower bound and not the real total, which matters if you are
+# tempted to tighten the comparison. "stestr list" enumerates only
+# statically discoverable ids; tests that build their cases at load time
+# appear as one id here and as many at run time. Measured on this tree:
+# listing the suite minus test_info_malicious gives 2378 ids, and running
+# that same selection reports 3675, with no parenthesised scenario id in
+# the listing at all. So "ran fewer than listed" always means something
+# went wrong, while "ran at least as many as listed" does not prove the
+# run was complete. Deriving even that bound beats the figure this
+# replaced, which was a hand-written ~3250 that drifts every time a test
+# is added.
+LIST_ARGS=(list)
+if [ -n "$EXCLUDE_RE" ]; then
+    LIST_ARGS+=(--exclude-regex "$EXCLUDE_RE")
+fi
+if [ -n "$SELECT_RE" ]; then
+    LIST_ARGS+=("$SELECT_RE")
+fi
+set +e
+/tmp/test-venv/bin/stestr "${LIST_ARGS[@]}" > /tmp/stestr-list.txt 2>/tmp/stestr-list-err.txt
+LIST_RC=$?
+set -e
+if [ "$LIST_RC" -ne 0 ]; then
+    echo "" >&2
+    echo "Error: could not list the tests for this selection; stestr list" >&2
+    echo "exited $LIST_RC. Without a count there is nothing to check the" >&2
+    echo "run length against, so this is a failure rather than a run with" >&2
+    echo "one guard switched off." >&2
+    sed -n "1,20p" /tmp/stestr-list-err.txt >&2
+    exit 1
+fi
+EXPECTED=$(grep -c . /tmp/stestr-list.txt)
+if [ "$EXPECTED" -eq 0 ]; then
+    echo "" >&2
+    echo "Error: the selection matched no tests at all. A selector that" >&2
+    echo "matches nothing exits zero with everything passing, which is" >&2
+    echo "indistinguishable from a green run." >&2
+    exit 1
+fi
+echo "selection contains $EXPECTED tests"
+
+echo ""
 echo "--- Running suite ---"
 STESTR_ARGS=(run --concurrency "$CONCURRENCY")
 if [ -n "$EXCLUDE_RE" ]; then
@@ -315,16 +361,26 @@ if grep -qE "^ - Worker [0-9]+ \([0-9]+ tests\) => N/A" /tmp/stestr-output.txt; 
     echo "is PARTIAL and its result is not trustworthy." >&2
     exit 1
 fi
-if [ -z "$SELECT_RE" ]; then
-    # Full-suite floor. The suite is ~3250 tests; anything dramatically
-    # short means the run was cut off before stestr noticed.
-    RAN=$(sed -n "s/^Ran: \([0-9]*\) tests.*/\1/p" /tmp/stestr-output.txt | tail -n1)
-    if [ -n "$RAN" ] && [ "$RAN" -lt 2500 ]; then
-        echo "" >&2
-        echo "Error: full run executed only $RAN tests (expected ~3250)." >&2
-        echo "The run was truncated; treat it as a failure, not a pass." >&2
-        exit 1
-    fi
+# Length floor, against the count discovered above rather than a
+# constant, so it covers every selection instead of only an unselected
+# full run. The previous form was keyed on SELECT_RE being empty, which
+# meant any selected run -- including the merge-queue gate once that
+# started passing a selector -- skipped this check entirely, and a
+# truncated gate run reads as green.
+RAN=$(sed -n "s/^Ran: \([0-9]*\) tests.*/\1/p" /tmp/stestr-output.txt | tail -n1)
+if [ -z "$RAN" ]; then
+    echo "" >&2
+    echo "Error: stestr printed no \"Ran: N tests\" total, so the run" >&2
+    echo "length cannot be checked. Treat it as a failure." >&2
+    exit 1
+fi
+if [ "$RAN" -lt "$EXPECTED" ]; then
+    echo "" >&2
+    echo "Error: run executed $RAN tests, fewer than the $EXPECTED ids" >&2
+    echo "discovery found for this selection. Since load-time cases make" >&2
+    echo "a real run longer than the listing, not shorter, the run was" >&2
+    echo "truncated; treat it as a failure, not a pass." >&2
+    exit 1
 fi
 exit "$STESTR_RC"
 '
