@@ -567,15 +567,34 @@ copy lives in shakenfist/development at
 - `docs/commentary/` has been reviewed against the
   change. If architectural decisions or data flow have
   changed, update the relevant commentary document.
-- Plan files in `docs/plans/` are up to date — completed
-  phases are marked complete in the master plan's
-  Execution table, deferred items are listed in the
-  Future work section, and `docs/plans/index.md` reflects
-  the current status.
-- Deferred work from phase plans is also reflected in
-  the master plan's Future work section. We won't refer
-  to phase plans again, so deferred work needs to be
-  centrally tracked on the master.
+- Plan files in `docs/plans/` are up to date. Check the
+  four things below one at a time and report each
+  separately. This item has been signed off as a single
+  impression while individual parts of it were false,
+  which is how a plan retires with its deferred work
+  recorded nowhere that will be read again.
+  - Every completed phase reads `Complete` in the master
+    plan's Execution table and has a `Merged` cell. The
+    push-audit phase itself is the one row that
+    legitimately has none, because it closes out in its
+    own pull request.
+  - The master plan's own `## Status:` line reads
+    `Complete` once its last phase has landed. This is
+    the part that gets missed: the Execution table is
+    what the eye checks, and a table of eighteen
+    `Complete` rows above a header still reading
+    `In progress` does not look wrong.
+  - `docs/plans/index.md` agrees with both.
+  - Every issue any phase of this plan filed and left
+    open appears in the master plan's Future work
+    section. We won't refer to phase plans again, so an
+    issue recorded only in a phase plan is a deferral
+    that has lost its owner. Enumerate the plan's issues
+    and grep the master plan for each number; do not
+    reason about whether they are already covered, and
+    do not treat a mention in Execution-table prose as
+    Future work — that prose is a phase's narrative, not
+    a handover.
 
 <!-- shared-block: plan-phase-references v1 -->
 Plan phase references (shared block; do not edit -- the canonical
