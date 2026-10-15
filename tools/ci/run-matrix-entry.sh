@@ -23,7 +23,14 @@
 #                        "queue" (default, what gates a merge) or
 #                        "nightly" (the six heavy VHD conversion tests
 #                        that do not). Both selections are read out of
-#                        the Makefile; see below.
+#                        the Makefile; see below. "all" passes no
+#                        selector at all, which is the whole suite as a
+#                        matrix entry ran it before the split -- the
+#                        union of the two halves, and the only mode that
+#                        measures a duration for every test. The nightly
+#                        measurement leg uses it; nothing that gates a
+#                        merge does, because the point of the split is
+#                        that the gate runs less.
 #   MATRIX_SELECT        stestr selection regex; runs only matching
 #                        tests. For reproducing one CI entry locally
 #                        without paying for the whole suite. CI never
@@ -104,8 +111,11 @@ makefile_selector() {
 case "${MATRIX_SET:-queue}" in
     queue) SELECT_TARGET=test-container-matrix-queue ;;
     nightly) SELECT_TARGET=test-container-matrix-nightly ;;
+    # No target, and so no selector: the runner's own default is the
+    # whole suite, which is what a matrix entry ran before it was split.
+    all) SELECT_TARGET='' ;;
     *)
-        echo "Error: MATRIX_SET must be 'queue' or 'nightly', not '${MATRIX_SET}'." >&2
+        echo "Error: MATRIX_SET must be 'queue', 'nightly' or 'all', not '${MATRIX_SET}'." >&2
         exit 2
         ;;
 esac
@@ -125,6 +135,8 @@ if [ -n "${MATRIX_SELECT:-}" ]; then
     echo "matrix result. Never set it in CI." >&2
     echo "" >&2
     RUNNER_ARGS+=(--select "$MATRIX_SELECT")
+elif [ -z "$SELECT_TARGET" ]; then
+    echo "selection: all (no selector -- the whole suite, both halves of the split)"
 else
     SELECTOR=$(makefile_selector "$SELECT_TARGET") || exit 2
     echo "selection: ${MATRIX_SET:-queue} (Makefile ${SELECT_TARGET})"

@@ -306,6 +306,47 @@ tracked in private-ci's plan, not here.
    safety net, so the issue-filing step is part of the job and not a
    follow-up.
 
+   Settled while building it, and recorded here because the back brief
+   asks for the workflow-file question in writing:
+
+   - **Its own file**, `.github/workflows/nightly-matrix.yml`.
+     `needs:` cannot cross workflow files, and `package-build` is
+     gated to `merge_group || workflow_dispatch`, so a scheduled job
+     could not consume its artifact from either side of that boundary.
+     The nightly builds its own packages, as `differential-fuzz.yml`
+     builds its own binaries. Adding `schedule:` to
+     `functional-tests.yml` would also fire every job there whose
+     condition begins `always()`, starting with `can_enqueue`.
+   - **Two shapes of leg, because D1 and D3 pull against each other.**
+     D1 assumes the nightly runs the whole suite and can therefore
+     publish the timings it measured; D3 makes it run six tests. Both
+     hold: seven distro legs run the six moved tests, which is the
+     coverage, and one more leg runs the whole suite on Debian 13,
+     which is the measurement. That leg is redundant as coverage and
+     is not there for coverage -- it is the only job left in CI that
+     executes the whole suite in a single stestr repository, so it is
+     the only place the timing file can be derived from. The workflow
+     says so, because a reader will otherwise delete it.
+   - **The measurement leg does not seed the timings it measures.**
+     stestr keeps one duration per test id and only the tests that
+     execute update theirs, so a seeded repository hands back the
+     seeded figure for everything that did not run: a deleted test's
+     duration would live on forever, and a test that silently stopped
+     running would never lose its old one. Setting `STESTR_TIMING_OUT`
+     therefore turns seeding off for that run, which costs it an
+     unbalanced partition and nothing else.
+   - **The refresh is a pull request, never a push to `develop`,** and
+     only when the measurement moved materially. "Materially" is
+     defined on each test's share of the suite's weight rather than on
+     seconds, because stestr's bin packing is scale-free: a uniformly
+     slower runner changes every number in the file and not one
+     scheduling decision. One test moving two points of the suite's
+     weight (about 100 seconds, against a worker's quarter share of 25
+     points), or a tenth of the weight relocating between tests, is
+     material. Everything else is noise, and the file is only a
+     scheduling hint -- a stale one degrades packing gradually and can
+     never make a run wrong -- so the default is silence.
+
 3. **The six heavy VHD conversion tests move off the merge gate** and
    run nightly on all seven distros. They are the Hyper-V and
    VirtualPC roundtrip, to-raw and compare cases.

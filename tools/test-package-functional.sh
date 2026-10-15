@@ -29,6 +29,20 @@
 #       src/target/debian/instar_*.deb debian:13
 #
 # Environment:
+#   STESTR_TIMING_OUT
+#                   when set, a host path to write this run's derived
+#                   per-test durations to, in the format
+#                   tools/ci/generate-stestr-timing.py produces. Setting
+#                   it declares the run a MEASUREMENT: the committed
+#                   timing file is not seeded into the repository first,
+#                   so the durations come only from this run. Seeding and
+#                   measuring at once would be self-referential -- every
+#                   test that did not execute would keep the duration it
+#                   was seeded with, so a deleted test's figure would
+#                   live on forever and a test that silently stopped
+#                   running would never lose its old one. The cost is a
+#                   worse-packed run, which is why only the nightly
+#                   measurement leg sets this and never a gating one.
 #   TESTDATA_PATH   instar-testdata working tree to mount read-only at
 #                   /testdata (default: <repo>/../instar-testdata). It
 #                   MUST already be git-LFS materialised -- in CI run
@@ -272,14 +286,25 @@ cd /tmp/instar-tests
 /tmp/test-venv/bin/pip install -q -r requirements.txt
 
 echo ""
-echo "--- Seeding stestr timing data ---"
-# See tools/ci/seed-stestr-timing.sh for why: a repository created fresh
-# in every container has no durations to bin-pack from, which is what
-# puts several minutes of VHD conversion tests on one worker while the
-# others idle. The timing file travels with the tests/ tree (copied
-# above), and a missing one is not an error -- the scheduler just
-# partitions blind, as it always has.
-/workspace/tools/ci/seed-stestr-timing.sh /tmp/test-venv/bin/stestr stestr-timing.txt
+if [ -n "${TIMING_OUT:-}" ]; then
+    echo "--- NOT seeding stestr timing data: this run measures it ---"
+    # A measurement must not inherit the numbers it is measuring. stestr
+    # keeps one duration per test id in its repository and only the tests
+    # that execute update theirs, so a seeded repository hands back the
+    # seeded figure for every test that did not run -- including tests
+    # that no longer exist. Starting empty costs this run a worse
+    # partition and gives the derived file only what was measured here.
+    echo "(the partition will be blind, which is the price of measuring)"
+else
+    echo "--- Seeding stestr timing data ---"
+    # See tools/ci/seed-stestr-timing.sh for why: a repository created
+    # fresh in every container has no durations to bin-pack from, which
+    # is what puts several minutes of VHD conversion tests on one worker
+    # while the others idle. The timing file travels with the tests/ tree
+    # (copied above), and a missing one is not an error -- the scheduler
+    # just partitions blind, as it always has.
+    /workspace/tools/ci/seed-stestr-timing.sh /tmp/test-venv/bin/stestr stestr-timing.txt
+fi
 
 echo ""
 echo "--- Counting the selection ---"
@@ -382,8 +407,49 @@ if [ "$RAN" -lt "$EXPECTED" ]; then
     echo "truncated; treat it as a failure, not a pass." >&2
     exit 1
 fi
+
+# Derive the timing data, if this run was asked to measure. Deliberately
+# after the truncation guards and before the verdict: a truncated run
+# holds durations for only the tests its surviving workers reached, and
+# publishing those would quietly teach the scheduler that half the suite
+# takes no time at all. A run that completed and merely FAILED tests is
+# still a valid measurement, so this does not depend on STESTR_RC.
+if [ -n "${TIMING_OUT:-}" ]; then
+    echo ""
+    echo "--- Deriving stestr timing data ---"
+    if "$PYBIN" /workspace/tools/ci/generate-stestr-timing.py .stestr "$TIMING_OUT"; then
+        # The container runs as root; hand the file back to the user who
+        # invoked docker so the job can diff and commit it.
+        chown "$TIMING_UID:$TIMING_GID" "$TIMING_OUT" || true
+    else
+        # A measurement that cannot be derived must not change the
+        # verdict of the suite: the leg still tested this distro.
+        echo "warning: could not derive timing data from this run" >&2
+    fi
+fi
 exit "$STESTR_RC"
 '
+
+# Measurement mode. The repository is mounted read-only on purpose -- so
+# a container running as root cannot leave root-owned stestr artefacts in
+# the host worktree -- which means a run asked to publish its measured
+# durations needs a second, writable mount for that one file. Only the
+# derived text crosses the boundary, not stestr's repository directory:
+# the derivation runs in the container, where the repository and the
+# interpreter that reads it already are.
+TIMING_ARGS=()
+if [ -n "${STESTR_TIMING_OUT:-}" ]; then
+    TIMING_DIR=$(dirname "$STESTR_TIMING_OUT")
+    mkdir -p "$TIMING_DIR"
+    TIMING_DIR=$(realpath "$TIMING_DIR")
+    TIMING_ARGS=(
+        -v "$TIMING_DIR:/timing-out"
+        -e TIMING_OUT="/timing-out/$(basename "$STESTR_TIMING_OUT")"
+        -e TIMING_UID="$(id -u)"
+        -e TIMING_GID="$(id -g)"
+    )
+    echo "    measuring: per-test durations will be written to $STESTR_TIMING_OUT"
+fi
 
 set +e
 docker run --rm \
@@ -398,6 +464,7 @@ docker run --rm \
     -e EXCLUDE_RE="$EXCLUDE_RE" \
     -e SELECT_RE="$SELECT_RE" \
     -e CONCURRENCY="$CONCURRENCY" \
+    "${TIMING_ARGS[@]+"${TIMING_ARGS[@]}"}" \
     "$DISTRO_IMAGE" \
     bash -c "$INNER"
 RC=$?

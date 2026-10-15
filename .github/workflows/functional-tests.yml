@@ -199,6 +199,24 @@ jobs:
       - name: Test the stestr timing generator
         run: tools/ci/test-generate-stestr-timing.sh
 
+      # The nightly matrix refreshes that same timing file and decides
+      # on its own whether the refresh is worth a pull request. Both ways
+      # that decision can be wrong are silent -- a pull request every
+      # morning for measurement noise, or none ever while the committed
+      # hint rots -- so the publisher is exercised here over synthetic
+      # measurements, all of them through its --dry-run so no branch is
+      # pushed and no API is called.
+      - name: Test the stestr timing publisher
+        run: tools/ci/test-publish-stestr-timing.sh
+
+      # The nightly matrix's issue reporter only runs when a leg fails,
+      # so nothing else here executes it -- which is exactly how the
+      # fuzz crash reporter broke every nightly fuzz run for a month
+      # without anyone being told. The test stubs `gh` and drives both
+      # the filing and the comment-instead-of-duplicate paths.
+      - name: Test the nightly matrix failure reporter
+        run: tools/ci/test-report-nightly-matrix-failure.sh
+
       # A new fuzz target has to be added to fuzz_targets/, Cargo.toml's
       # [[bin]] list and coverage-fuzz.yml's TARGETS array by hand, and a
       # target missing from that last one is never fuzzed in CI at all
@@ -221,10 +239,13 @@ jobs:
       - name: Test the mangled plan-filename phrase guard
         run: tools/ci/test-check-doc-phrases.sh
 
-      # The corpus seed builders run unattended in the nightly fuzz job,
-      # over adversarial fixtures chosen to be hostile. One that makes a
-      # builder raise seeds nothing for any target, not just its own.
-      - name: Test the fuzz corpus seed builders
+      # Every test_*.py in tools/ci, which is two unattended things: the
+      # fuzz corpus seed builders, which run over adversarial fixtures
+      # chosen to be hostile (one that makes a builder raise seeds
+      # nothing for any target, not just its own), and the stestr timing
+      # comparison, which decides whether the nightly opens a pull
+      # request.
+      - name: Test the tools/ci Python helpers
         run: python3 -m unittest discover -s tools/ci -t tools/ci -v
 
       - name: Test the inline-script audit check

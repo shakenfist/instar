@@ -1,0 +1,413 @@
+name: Nightly distro matrix
+
+# The six heavy VHD conversion tests -- the Hyper-V and VirtualPC
+# roundtrip, to-raw and compare cases -- do not gate a merge. They were
+# 2945 of the suite's 5967 seconds of execute time, on every leg of a
+# seven-distro matrix, and what they measure is a distro's qemu-img
+# rather than the change under test. They run here instead, once a night,
+# on all seven distros.
+#
+# That trade is only honest if a red nightly reaches a person, so filing
+# an issue is part of the job (see tools/ci/report-nightly-matrix-
+# failure.sh) rather than something to add later. A nightly whose failure
+# is visible only as a red square in the Actions tab is not a safety net.
+#
+# WHY THIS IS ITS OWN WORKFLOW FILE, and not more jobs in
+# functional-tests.yml. Both reasons are structural:
+#
+#   - `needs:` cannot cross workflow files, and the package artifact a
+#     matrix leg installs is built by `package-build` over there, which
+#     is gated to `merge_group || workflow_dispatch`. A scheduled job
+#     could not `needs:` it even in the same file, so this builds its own
+#     packages -- the same choice differential-fuzz.yml makes when it
+#     builds its own binaries rather than consuming someone else's.
+#   - A `schedule:` trigger added to functional-tests.yml would fire
+#     every job there whose condition starts with `always()`. `can_enqueue`
+#     is exactly that, and it would publish a nightly enqueue verdict for
+#     a default branch with nothing to enqueue.
+#
+# WHY THERE ARE TWO SHAPES OF LEG HERE. The distinction is worth reading
+# before deleting one of them as redundant:
+#
+#   - `nightly-legs` runs the six moved tests on all seven distros. This is the
+#     coverage the nightly exists to keep. Those conversions are where a
+#     distro's qemu-img is most likely to disagree with instar, and the
+#     distro axis moves when a distro ships a new qemu rather than when
+#     instar changes, so once a day is still far finer than the signal.
+#   - `measure` runs the WHOLE suite, on Debian 13 only. Its purpose is
+#     not coverage: every test in it either still gates a merge or runs
+#     on the seven legs above, so as coverage it is redundant and that is
+#     fine. It exists because it is the only job left in CI that executes
+#     the whole suite in a single stestr repository, which makes it the
+#     only place tests/stestr-timing.txt can be *derived* from. That file
+#     is what lets stestr bin-pack its workers instead of splitting the
+#     suite round-robin, it must not be hand-maintained, and if this leg
+#     were removed it would simply stop being refreshed with nothing
+#     going red to say so.
+
+on:
+  # 22:00 UTC: the daily schedules cluster between 00:30 and 04:00
+  # (export-repo-config, differential-fuzz, coverage-fuzz), and seven
+  # `xl` legs plus a full-suite leg is the largest nightly this
+  # repository runs. Starting four hours ahead of that cluster gives it
+  # the shared on-demand pool to itself -- which matters, because the
+  # pool has a measured ceiling of about three concurrent legs, so these
+  # eight jobs stagger rather than run at once.
+  schedule:
+    - cron: '0 22 * * *'
+
+  workflow_dispatch:
+    inputs:
+      force_timing_pr:
+        description: >-
+          Open the timing-refresh pull request even if the measurement
+          did not move materially
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+# `contents: write` and `pull-requests: write` are for the timing
+# refresh, which pushes a bot branch and opens a pull request -- the same
+# thing rust-nightly-bump.yml does with the same two permissions. Nothing
+# here writes to the default branch: `develop` is merge-queue protected,
+# nothing in this repository pushes to it from CI, and a file that only
+# hints at scheduling is nowhere near a good enough reason to be the
+# first thing that does.
+
+concurrency:
+  # Never cancel in progress: a nightly that is half way through seven
+  # distros has already spent most of its cost, and a manual dispatch
+  # while it runs should queue rather than discard it.
+  group: nightly-matrix
+  cancel-in-progress: false
+
+jobs:
+  # One build for every leg, exactly as the merge queue does it: the
+  # legs must all install the same artifact, or a divergence between two
+  # distros could be a divergence between two builds.
+  package-build:
+    name: "Build packages"
+    runs-on: [self-hosted, debian-13, s]
+    timeout-minutes: 60
+
+    env:
+      DOCKER_BUILDKIT: 1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Docker
+        run: tools/ci/install-docker.sh
+
+      - name: Remove previous devcontainers, if any
+        run: |
+          docker image rm -f instar-build instar-release 2>/dev/null || true
+
+      - name: Build instar and both packages
+        run: |
+          make instar
+          make package
+
+      # Flatten both packages into one directory so the legs can glob
+      # with a fixed depth. resolve-package.sh also asserts exactly one
+      # of each kind exists, which fails here rather than eight times
+      # over.
+      - name: Stage packages
+        run: |
+          mkdir -p dist
+          cp "$(tools/ci/resolve-package.sh deb)" dist/
+          cp "$(tools/ci/resolve-package.sh rpm)" dist/
+          ls -la dist/
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: instar-packages
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  # The distro coverage: the six moved tests, on every distro the
+  # published support matrix promises.
+  nightly-legs:
+    needs: package-build
+    name: "Nightly: ${{ matrix.distro.name }}"
+    runs-on: [self-hosted, debian-13, xl]
+    # The six tests are about 2945 seconds of execute time between them,
+    # so at concurrency 4 a leg is bounded below by its heaviest pair of
+    # workers -- roughly 20 minutes, plus the package install and the
+    # testdata preparation. Generous rather than tight: a timeout firing
+    # mid-suite is indistinguishable from a distro divergence in the
+    # issue this files.
+    timeout-minutes: 60
+    # Same quarantine hatch as the merge-queue matrix, and the flag means
+    # less here: a nightly gates nothing, so this only changes the
+    # colour of the run. The issue is still filed either way, by the
+    # failure step below.
+    continue-on-error: ${{ matrix.distro.allow_failure }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # The seven distros of the merge-queue matrix, copied rather than
+        # shared. The entries in functional-tests.yml carry load-bearing
+        # comments and audit markers that a shared JSON file could not
+        # hold, so the two lists are kept in step by
+        # tools/ci/check-test-partition.py, which fails if they disagree
+        # -- a distro quietly dropped from one side is a loss of coverage
+        # with no symptom at all.
+        distro:
+          # Debian 12 is a SUPPORTED TARGET here, not a build platform;
+          # bookworm is end of life, but the published support matrix
+          # promises Debian 11 and newer. See the longer note on the
+          # same entry in functional-tests.yml before removing it.
+          - name: 'Debian 12'
+            # audit-ok: eol-distro -- supported target, see the note above
+            image: 'debian:12'
+            pkg_kind: 'deb'
+            allow_failure: false
+          - name: 'Debian 13'
+            image: 'debian:13'
+            pkg_kind: 'deb'
+            allow_failure: false
+          - name: 'Ubuntu 22.04'
+            image: 'ubuntu:22.04'
+            pkg_kind: 'deb'
+            allow_failure: false
+          - name: 'Ubuntu 24.04'
+            image: 'ubuntu:24.04'
+            pkg_kind: 'deb'
+            allow_failure: false
+          - name: 'Fedora latest'
+            image: 'fedora:latest'
+            pkg_kind: 'rpm'
+            allow_failure: false
+          - name: 'Rocky 9'
+            image: 'rockylinux:9'
+            pkg_kind: 'rpm'
+            allow_failure: false
+          # Rocky 10 is not in the Docker Official `rockylinux` library,
+          # which stops at 9; it lives under the vendor namespace.
+          - name: 'Rocky 10'
+            image: 'rockylinux/rockylinux:10'
+            pkg_kind: 'rpm'
+            allow_failure: false
+
+    env:
+      DOCKER_BUILDKIT: 1
+
+    steps:
+      - name: Checkout instar
+        uses: actions/checkout@v7
+        with:
+          path: instar
+          fetch-depth: 0
+
+      - name: Prepare instar-testdata
+        env:
+          TESTDATA_TOKEN: ${{ secrets.GITLAB_TESTDATA_TOKEN }}
+        run: ${GITHUB_WORKSPACE}/instar/tools/ci/prepare-testdata.sh
+
+      # git-lfs writes every image fully allocated, and the tree is
+      # 7.46 GiB of mostly zeros. The same step runs ahead of every other
+      # testdata consumer; a shared tools/ci/ script is replacing all of
+      # those copies, and this one goes with them.
+      - name: Resparsify test images
+        run: |
+          cd ${TESTDATA_PATH}
+          find downloaded/ -type f \( -name '*.qcow2' -o -name '*.vmdk' \
+            -o -name '*.vhd' -o -name '*.vhdx' -o -name '*.img' \) \
+            -exec sh -c 'cp --sparse=always "$1" "$1.s" && mv "$1.s" "$1"' _ {} \;
+
+      # jq is for the issue reporter's deduplication, which runs only on
+      # the failure path -- but installing it there would be one more
+      # thing to go wrong on the night something is already wrong.
+      - name: Install Docker
+        run: ${GITHUB_WORKSPACE}/instar/tools/ci/install-docker.sh jq
+
+      - name: Download packages
+        uses: actions/download-artifact@v8
+        with:
+          name: instar-packages
+          path: ${{ github.workspace }}/packages
+
+      - name: Run the nightly selection on ${{ matrix.distro.image }}
+        env:
+          PACKAGE_DIR: ${{ github.workspace }}/packages
+          MATRIX_LOG: ${{ github.workspace }}/matrix.log
+          # The six tests, read out of the Makefile target that defines
+          # them rather than restated here.
+          MATRIX_SET: nightly
+        run: |
+          cd ${GITHUB_WORKSPACE}/instar
+          tools/ci/run-matrix-entry.sh \
+            "${{ matrix.distro.name }}" \
+            "${{ matrix.distro.image }}" \
+            "${{ matrix.distro.pkg_kind }}"
+
+      - name: Install GitHub CLI on host
+        if: failure()
+        run: ${GITHUB_WORKSPACE}/instar/tools/ci/install-gh-cli.sh
+
+      # The point of the whole job. The issue names the distro and the
+      # failing tests, because that pair is the signal: one distro red
+      # and six green is a qemu-img divergence at that distro's version,
+      # while all seven red is an instar regression the pull-request jobs
+      # missed.
+      - name: File or update an issue for this distro
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          cd ${GITHUB_WORKSPACE}/instar
+          tools/ci/report-nightly-matrix-failure.sh \
+            "${{ matrix.distro.name }}" \
+            "${{ matrix.distro.image }}" \
+            "${{ github.workspace }}/matrix.log"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nightly-${{ matrix.distro.pkg_kind }}-${{ strategy.job-index }}-logs
+          path: ${{ github.workspace }}/matrix.log
+          retention-days: 7
+          if-no-files-found: warn
+
+  # The measurement leg. Read the note at the top of this file before
+  # deciding it duplicates the merge queue: as coverage it does, and that
+  # is not why it is here.
+  measure:
+    needs: package-build
+    name: "Measure: full suite on Debian 13"
+    runs-on: [self-hosted, debian-13, xl]
+    # A full suite, and deliberately an unseeded one -- the measurement
+    # cannot inherit the numbers it is measuring, so this leg pays the
+    # unbalanced partition the rest of CI no longer does. The merge-queue
+    # matrix allowed 120 minutes for the same work when it was seeded;
+    # keep that here, where nothing waits on the answer.
+    timeout-minutes: 120
+
+    env:
+      DOCKER_BUILDKIT: 1
+
+    steps:
+      - name: Checkout instar
+        uses: actions/checkout@v7
+        with:
+          path: instar
+          # Full history: the timing refresh commits and pushes a branch,
+          # and a shallow clone cannot be pushed.
+          fetch-depth: 0
+
+      - name: Prepare instar-testdata
+        env:
+          TESTDATA_TOKEN: ${{ secrets.GITLAB_TESTDATA_TOKEN }}
+        run: ${GITHUB_WORKSPACE}/instar/tools/ci/prepare-testdata.sh
+
+      # See the matching step on the legs above.
+      - name: Resparsify test images
+        run: |
+          cd ${TESTDATA_PATH}
+          find downloaded/ -type f \( -name '*.qcow2' -o -name '*.vmdk' \
+            -o -name '*.vhd' -o -name '*.vhdx' -o -name '*.img' \) \
+            -exec sh -c 'cp --sparse=always "$1" "$1.s" && mv "$1.s" "$1"' _ {} \;
+
+      # python3 compares the measurement against the committed file, jq
+      # is for the issue reporter's deduplication.
+      - name: Install Docker
+        run: ${GITHUB_WORKSPACE}/instar/tools/ci/install-docker.sh jq python3
+
+      - name: Download packages
+        uses: actions/download-artifact@v8
+        with:
+          name: instar-packages
+          path: ${{ github.workspace }}/packages
+
+      - name: Run the whole suite and measure it
+        id: suite
+        env:
+          PACKAGE_DIR: ${{ github.workspace }}/packages
+          MATRIX_LOG: ${{ github.workspace }}/matrix.log
+          # No selector: the union of the queue and nightly halves, which
+          # is the only run that measures a duration for every test.
+          MATRIX_SET: all
+          # Setting this declares the run a measurement, which also stops
+          # the committed timings being seeded into it. See
+          # tools/test-package-functional.sh for why that matters.
+          #
+          # Its own directory, not the workspace root: the runner mounts
+          # that directory into the container writable, and the
+          # workspace root holds the instar checkout, which is mounted
+          # read-only on purpose so a container running as root cannot
+          # leave root-owned files in it.
+          STESTR_TIMING_OUT: ${{ github.workspace }}/timing/stestr-timing.txt
+        run: |
+          cd ${GITHUB_WORKSPACE}/instar
+          tools/ci/run-matrix-entry.sh \
+            "Debian 13 (full suite)" \
+            "debian:13" \
+            "deb"
+
+      # Kept whatever the verdict and whatever the comparison decides, so
+      # a night that publishes nothing still leaves the numbers for
+      # anyone wondering where the suite's time goes.
+      - name: Upload the measured timings
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: stestr-timing
+          path: ${{ github.workspace }}/timing/stestr-timing.txt
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Install GitHub CLI on host
+        if: always()
+        run: ${GITHUB_WORKSPACE}/instar/tools/ci/install-gh-cli.sh
+
+      # Only on a successful suite: a failed leg's durations are still
+      # real, but a morning with both a failure issue and a timing pull
+      # request is a morning where the pull request is noise.
+      - name: Publish refreshed timings if they moved materially
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          FORCE: ${{ inputs.force_timing_pr }}
+        run: |
+          cd ${GITHUB_WORKSPACE}/instar
+          ARGS=("${{ github.workspace }}/timing/stestr-timing.txt")
+          if [ "${FORCE}" = "true" ]; then ARGS+=(--force); fi
+          tools/ci/publish-stestr-timing.sh "${ARGS[@]}"
+
+      # Keyed on the suite step rather than on the job, and on "did not
+      # succeed" rather than "failed": a suite that failed and a leg that
+      # died before reaching it both need reporting, while a failure in
+      # the publishing step above is a bug in the publisher and must not
+      # be filed as a distro failure against a suite that passed.
+      - name: File or update an issue for the measurement leg
+        if: failure() && steps.suite.outcome != 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          cd ${GITHUB_WORKSPACE}/instar
+          tools/ci/report-nightly-matrix-failure.sh \
+            "Debian 13 (full suite)" \
+            "debian:13" \
+            "${{ github.workspace }}/matrix.log"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nightly-measure-logs
+          path: ${{ github.workspace }}/matrix.log
+          retention-days: 7
+          if-no-files-found: warn
