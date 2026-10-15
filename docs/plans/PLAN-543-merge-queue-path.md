@@ -679,7 +679,19 @@ Commits: the plan; then one per step. Every commit passes
 
 ### Bugs fixed during this work
 
-* None directly. #543 is not closed by this change.
+* **A failed resparsify replaced a good image with a truncated one,
+  and exited zero.** Found by comparing the eight inline copies of the
+  step before replacing them with a shared script. Six of the eight ran
+  `cp --sparse=always` and `mv` as two unconditional statements, so a
+  copy that failed part way -- ENOSPC being the realistic case on a
+  7.5 GiB tree -- was followed by an `mv` that moved the partial file
+  over the original. The step then exited zero, because `mv` succeeded.
+  The two newest copies had `cp && mv` and were correct. No copy
+  propagated failure at all: `find -exec` does not fail on a non-zero
+  child, and a `while` loop reports only its last command. The shared
+  script takes the `&&`, adds the failure propagation neither form had,
+  and its self-test asserts that an image survives a failed copy.
+* Otherwise none directly. #543 is not closed by this change.
 
 ### Back brief
 

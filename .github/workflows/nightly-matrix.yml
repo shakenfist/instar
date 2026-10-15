@@ -215,15 +215,11 @@ jobs:
         run: ${GITHUB_WORKSPACE}/instar/tools/ci/prepare-testdata.sh
 
       # git-lfs writes every image fully allocated, and the tree is
-      # 7.46 GiB of mostly zeros. The same step runs ahead of every other
-      # testdata consumer; a shared tools/ci/ script is replacing all of
-      # those copies, and this one goes with them.
+      # 7.46 GiB of mostly zeros. Every testdata consumer runs this ahead
+      # of the suite, through one shared script so that the extension
+      # list and the directory scope cannot drift between them.
       - name: Resparsify test images
-        run: |
-          cd ${TESTDATA_PATH}
-          find downloaded/ -type f \( -name '*.qcow2' -o -name '*.vmdk' \
-            -o -name '*.vhd' -o -name '*.vhdx' -o -name '*.img' \) \
-            -exec sh -c 'cp --sparse=always "$1" "$1.s" && mv "$1.s" "$1"' _ {} \;
+        run: ${GITHUB_WORKSPACE}/instar/tools/ci/resparsify-testdata.sh "${TESTDATA_PATH}"
 
       # jq is for the issue reporter's deduplication, which runs only on
       # the failure path -- but installing it there would be one more
@@ -314,11 +310,7 @@ jobs:
 
       # See the matching step on the legs above.
       - name: Resparsify test images
-        run: |
-          cd ${TESTDATA_PATH}
-          find downloaded/ -type f \( -name '*.qcow2' -o -name '*.vmdk' \
-            -o -name '*.vhd' -o -name '*.vhdx' -o -name '*.img' \) \
-            -exec sh -c 'cp --sparse=always "$1" "$1.s" && mv "$1.s" "$1"' _ {} \;
+        run: ${GITHUB_WORKSPACE}/instar/tools/ci/resparsify-testdata.sh "${TESTDATA_PATH}"
 
       # python3 compares the measurement against the committed file, jq
       # is for the issue reporter's deduplication.

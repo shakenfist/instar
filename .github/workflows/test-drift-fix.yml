@@ -124,23 +124,11 @@ jobs:
           TESTDATA_TOKEN: ${{ secrets.GITLAB_TESTDATA_TOKEN }}
         run: ${GITHUB_WORKSPACE}/instar/tools/ci/prepare-testdata.sh
 
+      # Git operations fill the images' sparse holes with real zeros,
+      # which changes the allocated size qemu-img reports and so the
+      # disk_size the comparison tests check.
       - name: Resparsify test images
-        run: |
-          # Git operations (clone or pull) fill sparse holes with zeros,
-          # affecting qemu-img disk_size output. Restore sparseness with
-          # cp --sparse=always. This is fast and idempotent on already-sparse
-          # files from the cache.
-          cd ${TESTDATA_PATH}
-          find downloaded/ -type f \( \
-            -name "*.qcow2" -o \
-            -name "*.vmdk" -o \
-            -name "*.vhd" -o \
-            -name "*.vhdx" -o \
-            -name "*.img" \
-          \) -print0 | while IFS= read -r -d '' file; do
-            cp --sparse=always "$file" "$file.sparse"
-            mv "$file.sparse" "$file"
-          done
+        run: ${GITHUB_WORKSPACE}/instar/tools/ci/resparsify-testdata.sh "${TESTDATA_PATH}"
 
       - name: Fetch prior CI failure logs from PR
         id: prior_failures

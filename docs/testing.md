@@ -743,6 +743,29 @@ an explicit "infrastructure problem, not a test regression" message if any is
 still a pointer, so a git-LFS outage can never be silently misattributed to
 instar (see GitHub issue #451 for the incident this guards against).
 
+Every job that prepares testdata then runs
+**`tools/ci/resparsify-testdata.sh <tree>`**. git and git-lfs write each file
+out fully allocated, so a clone or an `lfs pull` fills the images' sparse
+holes with real zeros: the tree becomes about 7.5 GiB of mostly zeros, and
+`qemu-img info` reports an allocated size that belongs to git rather than to
+the fixture, which the disk_size comparisons check. The script restores the
+holes with `cp --sparse=always`, over `downloaded/` only and over the five
+whole-disk image extensions only — `custom/` fixtures keep the allocation
+their tests expect. It is a shared script rather than a step repeated in each
+workflow because a mirrored copy's only symptom when it drifts is a slower
+job.
+
+That script is also a **cross-repository interface**: private-ci's
+instar-testdata dependencies-disk image build fetches it from instar's default
+branch over HTTPS and runs it against its own clone, outside GitHub Actions.
+So its one-argument call means "the whole tree" permanently, it reads no
+`GITHUB_*` variable, and it exits non-zero on failure so that a broken fetch
+fails their build rather than quietly shipping an unsparsified image. Anything
+narrower — resparsifying only the files a fetch changed, say — has to arrive as
+further optional arguments. `tools/ci/test-resparsify-testdata.sh` exercises
+exactly that calling convention, and measures allocated blocks before and
+after rather than trusting the exit status.
+
 ## Expected Output Overrides
 
 For malicious images where running `qemu-img` would be dangerous, store the

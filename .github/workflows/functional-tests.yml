@@ -175,6 +175,16 @@ jobs:
       - name: Test the apt lock wrapper
         run: tools/ci/test-apt-get.sh
 
+      # The resparsify script runs ahead of every testdata job here, and
+      # is also fetched over HTTPS and run against its own clone by
+      # private-ci's testdata image build -- with one positional argument
+      # and no Actions environment. Nothing else exercises that calling
+      # convention, and the symptom of this script silently doing nothing
+      # is only a slower job, so the test measures allocated blocks
+      # before and after rather than trusting the exit status.
+      - name: Test the testdata resparsifier
+        run: tools/ci/test-resparsify-testdata.sh
+
       # tools/test-package-functional.sh seeds stestr's per-run
       # repository with a committed timing file before "stestr run", so
       # the scheduler can bin-pack workers by measured duration instead
@@ -773,18 +783,7 @@ jobs:
         run: ${GITHUB_WORKSPACE}/instar/tools/ci/prepare-testdata.sh
 
       - name: Resparsify test images
-        run: |
-          cd ${TESTDATA_PATH}
-          find downloaded/ -type f \( \
-            -name "*.qcow2" -o \
-            -name "*.vmdk" -o \
-            -name "*.vhd" -o \
-            -name "*.vhdx" -o \
-            -name "*.img" \
-          \) -print0 | while IFS= read -r -d '' file; do
-            cp --sparse=always "$file" "$file.sparse"
-            mv "$file.sparse" "$file"
-          done
+        run: ${GITHUB_WORKSPACE}/instar/tools/ci/resparsify-testdata.sh "${TESTDATA_PATH}"
 
       - name: Install Docker
         run: ${GITHUB_WORKSPACE}/instar/tools/ci/install-docker.sh
@@ -841,18 +840,7 @@ jobs:
         run: ${GITHUB_WORKSPACE}/instar/tools/ci/prepare-testdata.sh
 
       - name: Resparsify test images
-        run: |
-          cd ${TESTDATA_PATH}
-          find downloaded/ -type f \( \
-            -name "*.qcow2" -o \
-            -name "*.vmdk" -o \
-            -name "*.vhd" -o \
-            -name "*.vhdx" -o \
-            -name "*.img" \
-          \) -print0 | while IFS= read -r -d '' file; do
-            cp --sparse=always "$file" "$file.sparse"
-            mv "$file.sparse" "$file"
-          done
+        run: ${GITHUB_WORKSPACE}/instar/tools/ci/resparsify-testdata.sh "${TESTDATA_PATH}"
 
       - name: Install Docker
         run: ${GITHUB_WORKSPACE}/instar/tools/ci/install-docker.sh
@@ -1042,18 +1030,7 @@ jobs:
         run: ${GITHUB_WORKSPACE}/instar/tools/ci/prepare-testdata.sh
 
       - name: Resparsify test images
-        run: |
-          cd ${TESTDATA_PATH}
-          find downloaded/ -type f \( \
-            -name "*.qcow2" -o \
-            -name "*.vmdk" -o \
-            -name "*.vhd" -o \
-            -name "*.vhdx" -o \
-            -name "*.img" \
-          \) -print0 | while IFS= read -r -d '' file; do
-            cp --sparse=always "$file" "$file.sparse"
-            mv "$file.sparse" "$file"
-          done
+        run: ${GITHUB_WORKSPACE}/instar/tools/ci/resparsify-testdata.sh "${TESTDATA_PATH}"
 
       - name: Install Docker
         run: ${GITHUB_WORKSPACE}/instar/tools/ci/install-docker.sh
@@ -1121,18 +1098,7 @@ jobs:
         run: ${GITHUB_WORKSPACE}/instar/tools/ci/prepare-testdata.sh
 
       - name: Resparsify test images
-        run: |
-          cd ${TESTDATA_PATH}
-          find downloaded/ -type f \( \
-            -name "*.qcow2" -o \
-            -name "*.vmdk" -o \
-            -name "*.vhd" -o \
-            -name "*.vhdx" -o \
-            -name "*.img" \
-          \) -print0 | while IFS= read -r -d '' file; do
-            cp --sparse=always "$file" "$file.sparse"
-            mv "$file.sparse" "$file"
-          done
+        run: ${GITHUB_WORKSPACE}/instar/tools/ci/resparsify-testdata.sh "${TESTDATA_PATH}"
 
       - name: Install Docker
         run: ${GITHUB_WORKSPACE}/instar/tools/ci/install-docker.sh
@@ -1254,23 +1220,11 @@ jobs:
           TESTDATA_TOKEN: ${{ secrets.GITLAB_TESTDATA_TOKEN }}
         run: ${GITHUB_WORKSPACE}/instar/tools/ci/prepare-testdata.sh
 
+      # Git operations fill the images' sparse holes with real zeros,
+      # which changes the allocated size qemu-img reports and so the
+      # disk_size the comparison tests check.
       - name: Resparsify test images
-        run: |
-          # Git operations (clone or pull) fill sparse holes with zeros,
-          # affecting qemu-img disk_size output. Restore sparseness with
-          # cp --sparse=always. This is fast and idempotent on already-sparse
-          # files from the cache.
-          cd ${TESTDATA_PATH}
-          find downloaded/ -type f \( \
-            -name "*.qcow2" -o \
-            -name "*.vmdk" -o \
-            -name "*.vhd" -o \
-            -name "*.vhdx" -o \
-            -name "*.img" \
-          \) -print0 | while IFS= read -r -d '' file; do
-            cp --sparse=always "$file" "$file.sparse"
-            mv "$file.sparse" "$file"
-          done
+        run: ${GITHUB_WORKSPACE}/instar/tools/ci/resparsify-testdata.sh "${TESTDATA_PATH}"
 
       - name: Install Docker
         run: ${GITHUB_WORKSPACE}/instar/tools/ci/install-docker.sh
