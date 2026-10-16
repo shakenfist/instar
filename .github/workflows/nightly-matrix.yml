@@ -66,7 +66,10 @@ on:
       force_timing_pr:
         description: >-
           Open the timing-refresh pull request even if the measurement
-          did not move materially
+          did not move materially. A measurement that FAILED still
+          publishes nothing: the publishing job needs a successful
+          measuring job, because timings from a run that fell over are
+          not worth committing.
         required: false
         default: false
         type: boolean
@@ -175,7 +178,12 @@ jobs:
     # workers -- roughly 20 minutes, plus the package install and the
     # testdata preparation. Generous rather than tight: a timeout firing
     # mid-suite is indistinguishable from a distro divergence in the
-    # issue this files.
+    # issue this files. It also has to cover an unseeded run: the
+    # committed timings are a hint, a corrupt file is deliberately a
+    # warning rather than a failure, and without them these six land
+    # wherever the blind partition puts them -- worst case the three
+    # heaviest on one worker, which is about 24 minutes of execution
+    # before anything else.
     timeout-minutes: 60
     # Same quarantine hatch as the merge-queue matrix, and the flag means
     # less here: a nightly gates nothing, so this only changes the
@@ -463,6 +471,17 @@ jobs:
   # against the committed file and, if the numbers moved, push the
   # refresh branch and open the pull request.
   #
+  # What crosses the boundary is data, and that is the point of the
+  # split rather than an oversight in it. The measuring job runs the
+  # suite over hostile images and cannot push; this job can push and
+  # runs no tests, no containers and no testdata. The timing file it
+  # receives is parsed, not executed, every line is validated and
+  # anything unparseable is dropped, and the result is never committed
+  # directly -- it becomes a pull request that a person reads and
+  # merges. A measurement that lied about a duration would at worst
+  # make the scheduler pack a little worse, and would have to get past
+  # that review to do even that.
+  #
   # WHY THIS IS A JOB OF ITS OWN. It is the only job in the workflow
   # that holds write scopes, and the rule it exists to keep is that no
   # job both runs the suite and holds one. The suite executes instar,
@@ -557,8 +576,20 @@ jobs:
           cd ${GITHUB_WORKSPACE}/instar
           ARGS=("${{ github.workspace }}/timing/stestr-timing.txt")
           if [ "${FORCE}" = "true" ]; then ARGS+=(--force); fi
+          # PIPESTATUS, not a bare pipeline: a run step's default shell
+          # is "bash -e" without pipefail, so piping into tee reports
+          # tee's status and a failed publish would read as a green step
+          # -- which would also stop the failure issue below ever being
+          # filed. Same idiom as the build and suite steps elsewhere.
+          set +e
           tools/ci/publish-stestr-timing.sh "${ARGS[@]}" \
             2>&1 | tee "${{ github.workspace }}/timing-publish.log"
+          publish_exit_code=${PIPESTATUS[0]}
+          set -e
+          if [ ${publish_exit_code} -ne 0 ]; then
+            echo "Timing refresh failed with exit code ${publish_exit_code}"
+            exit ${publish_exit_code}
+          fi
 
       # Without this a publisher bug is a red run and nothing else, and
       # this workflow's own argument is that a nightly whose red is
