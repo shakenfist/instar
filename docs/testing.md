@@ -1029,12 +1029,56 @@ instead of quietly following a defaulted path. What it detects is a **path
 mismatch** — the disk mounted somewhere else, or a runner advertising the
 disk's label without the disk. It cannot be a failed mount: that stops the
 fleet's userdata before the runner registers, so such a job stays queued and
-never runs this script at all. **No workflow sets the flag today.**
+never runs this script at all.
+
+### The `instar` runner label
+
+Eight of the nine jobs that prepare testdata ask the fleet for that disk with
+an extra `runs-on` label:
+
+```yaml
+runs-on: [self-hosted, debian-13, xl, instar]
+```
+
+`instar` means "a runner carrying the pre-seeded instar-testdata dependencies
+disk". The conductor matches labels as a set, so the order does not matter,
+and it works with any size the conductor knows — but the arrangement is
+verified for `debian-13` only, because the disk is owned by the uid `debian`
+has on that image and a runner whose user has another uid fails at boot
+rather than running the job. The label must also be listed under
+`self-hosted-runner.labels` in `.github/actionlint.yaml`, or actionlint (which
+runs in pre-commit) rejects the `runs-on` before it can be committed.
+
+Those same eight jobs set `TESTDATA_REQUIRE_CACHE: '1'` on their prepare step.
+A job that asked for the disk and did not get it must say so, rather than
+quietly falling back to the clone the label exists to avoid. They are
+`package-matrix`, `integration-core`, `integration-convert-qcow2`,
+`integration-convert-vhd` and `oslo-crossval-master` in
+`functional-tests.yml`; `nightly-legs` and `measure` in `nightly-matrix.yml`;
+and `coverage-fuzz` in `coverage-fuzz.yml`.
+
+The ninth testdata consumer, `test-and-fix` in `test-drift-fix.yml`, carries
+neither, deliberately and permanently. It runs on `[self-hosted, claude-code]`
+— the *static* runner fleet, which the conductor only watches and never
+attaches a disk to, so no runner there will ever advertise `instar` and a
+labelled job would queue until GitHub cancelled it 24 hours later. It keeps
+cloning fresh. The reason is recorded next to that job as well as here,
+because a reader about to tidy the inconsistency away is looking at the
+workflow.
+
+### Resparsifying
 
 Eight of the nine jobs that prepare testdata then run
-**`tools/ci/resparsify-testdata.sh <tree>`** — every one that runs the Python
-integration suite over the tree (five in `functional-tests.yml`, two in
-`nightly-matrix.yml`, one in `test-drift-fix.yml`). The exception is
+**`tools/ci/resparsify-prepared-testdata.sh`** — every one that runs the
+Python integration suite over the tree (five in `functional-tests.yml`, two in
+`nightly-matrix.yml`, one in `test-drift-fix.yml`). That step takes no
+arguments: it reads the `TESTDATA_SOURCE` and `TESTDATA_CHANGED_FILES` above
+and calls `tools/ci/resparsify-testdata.sh` in whichever of its two forms the
+tree needs — the whole tree for a fresh clone, and only the paths the update
+changed for a tree that was updated in place. An unset or unrecognised
+`TESTDATA_SOURCE` is an error there rather than a fall back to the whole tree,
+because the fallback is the expensive branch and taking it silently would cost
+the most on exactly the runner that was supposed to save. The exception is
 `coverage-fuzz.yml`, which prepares the tree only to seed fuzz corpora and
 never asks `qemu-img info` for an allocated size, so the fully allocated
 tree costs it disk and nothing else. git and git-lfs write each file

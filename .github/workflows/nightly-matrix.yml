@@ -172,7 +172,12 @@ jobs:
   nightly-legs:
     needs: package-build
     name: "Nightly: ${{ matrix.distro.name }}"
-    runs-on: [self-hosted, debian-13, xl]
+    # `instar` asks the fleet for a runner carrying the pre-seeded
+    # instar-testdata dependencies disk, which is what lets the step below
+    # require the cache instead of cloning 7.46 GiB. The label is verified
+    # alongside `debian-13` only -- see "Test Data Location" in
+    # docs/testing.md.
+    runs-on: [self-hosted, debian-13, xl, instar]
     # The six tests are about 2945 seconds of execute time between them,
     # so at concurrency 4 a leg is bounded below by its heaviest pair of
     # workers -- roughly 20 minutes, plus the package install and the
@@ -266,6 +271,9 @@ jobs:
       - name: Prepare instar-testdata
         env:
           TESTDATA_TOKEN: ${{ secrets.GITLAB_TESTDATA_TOKEN }}
+          # The job asked for the testdata disk above, so a cache that is not
+          # there is an infrastructure fault and not a cue to clone.
+          TESTDATA_REQUIRE_CACHE: '1'
         run: ${GITHUB_WORKSPACE}/instar/tools/ci/prepare-testdata.sh
 
       # git-lfs writes every image fully allocated, and the tree is
@@ -274,9 +282,12 @@ jobs:
       # one testdata consumer that does not, because it seeds fuzz
       # corpora and compares no allocated sizes -- through one shared
       # script so that the extension list and the directory scope cannot
-      # drift between them.
+      # drift between them. Which part of the tree it rewrites depends on
+      # where the tree came from: all of a fresh clone, and only what the
+      # update changed on a runner whose tree is the testdata disk's
+      # copy-on-write overlay.
       - name: Resparsify test images
-        run: ${GITHUB_WORKSPACE}/instar/tools/ci/resparsify-testdata.sh "${TESTDATA_PATH}"
+        run: ${GITHUB_WORKSPACE}/instar/tools/ci/resparsify-prepared-testdata.sh
 
       # jq is for the issue reporter's deduplication, which runs only on
       # the failure path -- but installing it there would be one more
@@ -349,7 +360,12 @@ jobs:
   measure:
     needs: package-build
     name: "Measure: full suite on Debian 13"
-    runs-on: [self-hosted, debian-13, xl]
+    # `instar` asks the fleet for a runner carrying the pre-seeded
+    # instar-testdata dependencies disk, which is what lets the step below
+    # require the cache instead of cloning 7.46 GiB. The label is verified
+    # alongside `debian-13` only -- see "Test Data Location" in
+    # docs/testing.md.
+    runs-on: [self-hosted, debian-13, xl, instar]
     # A full suite, and deliberately an unseeded one -- the measurement
     # cannot inherit the numbers it is measuring, so this leg pays the
     # unbalanced partition the rest of CI no longer does. The merge-queue
@@ -384,11 +400,14 @@ jobs:
       - name: Prepare instar-testdata
         env:
           TESTDATA_TOKEN: ${{ secrets.GITLAB_TESTDATA_TOKEN }}
+          # The job asked for the testdata disk above, so a cache that is not
+          # there is an infrastructure fault and not a cue to clone.
+          TESTDATA_REQUIRE_CACHE: '1'
         run: ${GITHUB_WORKSPACE}/instar/tools/ci/prepare-testdata.sh
 
       # See the matching step on the legs above.
       - name: Resparsify test images
-        run: ${GITHUB_WORKSPACE}/instar/tools/ci/resparsify-testdata.sh "${TESTDATA_PATH}"
+        run: ${GITHUB_WORKSPACE}/instar/tools/ci/resparsify-prepared-testdata.sh
 
       # jq is for the issue reporter's deduplication, which runs only on
       # the failure path -- but installing it there would be one more

@@ -139,7 +139,7 @@ jobs:
       # which changes the allocated size qemu-img reports and so the
       # disk_size the comparison tests check.
       - name: Resparsify test images
-        run: ${GITHUB_WORKSPACE}/instar/tools/ci/resparsify-testdata.sh "${TESTDATA_PATH}"
+        run: ${GITHUB_WORKSPACE}/instar/tools/ci/resparsify-prepared-testdata.sh
 
       - name: Fetch prior CI failure logs from PR
         id: prior_failures

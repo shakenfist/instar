@@ -50,7 +50,12 @@ permissions:
 
 jobs:
   coverage-fuzz:
-    runs-on: [self-hosted, debian-13, xl]
+    # `instar` asks the fleet for a runner carrying the pre-seeded
+    # instar-testdata dependencies disk, which is what lets the step below
+    # require the cache instead of cloning 7.46 GiB. The label is verified
+    # alongside `debian-13` only -- see "Test Data Location" in
+    # docs/testing.md.
+    runs-on: [self-hosted, debian-13, xl, instar]
     timeout-minutes: 480
 
     env:
@@ -63,6 +68,9 @@ jobs:
       - name: Prepare instar-testdata
         env:
           TESTDATA_TOKEN: ${{ secrets.GITLAB_TESTDATA_TOKEN }}
+          # The job asked for the testdata disk above, so a cache that is not
+          # there is an infrastructure fault and not a cue to clone.
+          TESTDATA_REQUIRE_CACHE: '1'
         run: ${GITHUB_WORKSPACE}/tools/ci/prepare-testdata.sh
 
       - name: Verify corpus push token

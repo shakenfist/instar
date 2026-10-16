@@ -225,6 +225,16 @@ jobs:
       - name: Test the testdata preparation
         run: tools/ci/test-prepare-testdata.sh
 
+      # The step between those two: which of resparsify-testdata.sh's two
+      # calling forms a prepared tree needs. Both of its mistakes are
+      # invisible in a passing job -- narrowing a fresh clone leaves most
+      # of the tree allocated, and widening a cached one writes gigabytes
+      # into a copy-on-write overlay and still leaves a correct tree -- so
+      # the test measures allocated blocks on the files a run was not
+      # supposed to touch as well as the ones it was.
+      - name: Test the prepared-testdata resparsify step
+        run: tools/ci/test-resparsify-prepared-testdata.sh
+
       # tools/test-package-functional.sh seeds stestr's per-run
       # repository with a committed timing file before "stestr run", so
       # the scheduler can bin-pack workers by measured duration instead
@@ -747,7 +757,12 @@ jobs:
       github.event_name == 'merge_group' ||
       github.event_name == 'workflow_dispatch'
     name: "Matrix: ${{ matrix.distro.name }}"
-    runs-on: [self-hosted, debian-13, xl]
+    # `instar` asks the fleet for a runner carrying the pre-seeded
+    # instar-testdata dependencies disk, which is what lets the step below
+    # require the cache instead of cloning 7.46 GiB. The label is verified
+    # alongside `debian-13` only -- see "Test Data Location" in
+    # docs/testing.md.
+    runs-on: [self-hosted, debian-13, xl, instar]
     # Generous on purpose: the suite is ~3250 tests at concurrency 4 in
     # a container, and a timeout firing mid-suite is indistinguishable
     # from a flaky distro in the summary. Tighten once the first runs
@@ -828,10 +843,13 @@ jobs:
       - name: Prepare instar-testdata
         env:
           TESTDATA_TOKEN: ${{ secrets.GITLAB_TESTDATA_TOKEN }}
+          # The job asked for the testdata disk above, so a cache that is not
+          # there is an infrastructure fault and not a cue to clone.
+          TESTDATA_REQUIRE_CACHE: '1'
         run: ${GITHUB_WORKSPACE}/instar/tools/ci/prepare-testdata.sh
 
       - name: Resparsify test images
-        run: ${GITHUB_WORKSPACE}/instar/tools/ci/resparsify-testdata.sh "${TESTDATA_PATH}"
+        run: ${GITHUB_WORKSPACE}/instar/tools/ci/resparsify-prepared-testdata.sh
 
       - name: Install Docker
         run: ${GITHUB_WORKSPACE}/instar/tools/ci/install-docker.sh
@@ -869,7 +887,12 @@ jobs:
     if: >-
       github.event_name != 'merge_group'
       && needs.check_paths.outputs.code_changed != 'false'
-    runs-on: [self-hosted, debian-13, xl]
+    # `instar` asks the fleet for a runner carrying the pre-seeded
+    # instar-testdata dependencies disk, which is what lets the step below
+    # require the cache instead of cloning 7.46 GiB. The label is verified
+    # alongside `debian-13` only -- see "Test Data Location" in
+    # docs/testing.md.
+    runs-on: [self-hosted, debian-13, xl, instar]
     timeout-minutes: 45
 
     env:
@@ -885,10 +908,13 @@ jobs:
       - name: Prepare instar-testdata
         env:
           TESTDATA_TOKEN: ${{ secrets.GITLAB_TESTDATA_TOKEN }}
+          # The job asked for the testdata disk above, so a cache that is not
+          # there is an infrastructure fault and not a cue to clone.
+          TESTDATA_REQUIRE_CACHE: '1'
         run: ${GITHUB_WORKSPACE}/instar/tools/ci/prepare-testdata.sh
 
       - name: Resparsify test images
-        run: ${GITHUB_WORKSPACE}/instar/tools/ci/resparsify-testdata.sh "${TESTDATA_PATH}"
+        run: ${GITHUB_WORKSPACE}/instar/tools/ci/resparsify-prepared-testdata.sh
 
       - name: Install Docker
         run: ${GITHUB_WORKSPACE}/instar/tools/ci/install-docker.sh
@@ -1059,7 +1085,12 @@ jobs:
     if: >-
       github.event_name != 'merge_group'
       && needs.check_paths.outputs.code_changed != 'false'
-    runs-on: [self-hosted, debian-13, xl]
+    # `instar` asks the fleet for a runner carrying the pre-seeded
+    # instar-testdata dependencies disk, which is what lets the step below
+    # require the cache instead of cloning 7.46 GiB. The label is verified
+    # alongside `debian-13` only -- see "Test Data Location" in
+    # docs/testing.md.
+    runs-on: [self-hosted, debian-13, xl, instar]
     timeout-minutes: 60
 
     env:
@@ -1075,10 +1106,13 @@ jobs:
       - name: Prepare instar-testdata
         env:
           TESTDATA_TOKEN: ${{ secrets.GITLAB_TESTDATA_TOKEN }}
+          # The job asked for the testdata disk above, so a cache that is not
+          # there is an infrastructure fault and not a cue to clone.
+          TESTDATA_REQUIRE_CACHE: '1'
         run: ${GITHUB_WORKSPACE}/instar/tools/ci/prepare-testdata.sh
 
       - name: Resparsify test images
-        run: ${GITHUB_WORKSPACE}/instar/tools/ci/resparsify-testdata.sh "${TESTDATA_PATH}"
+        run: ${GITHUB_WORKSPACE}/instar/tools/ci/resparsify-prepared-testdata.sh
 
       - name: Install Docker
         run: ${GITHUB_WORKSPACE}/instar/tools/ci/install-docker.sh
@@ -1127,7 +1161,12 @@ jobs:
     if: >-
       github.event_name != 'merge_group'
       && needs.check_paths.outputs.code_changed != 'false'
-    runs-on: [self-hosted, debian-13, xl]
+    # `instar` asks the fleet for a runner carrying the pre-seeded
+    # instar-testdata dependencies disk, which is what lets the step below
+    # require the cache instead of cloning 7.46 GiB. The label is verified
+    # alongside `debian-13` only -- see "Test Data Location" in
+    # docs/testing.md.
+    runs-on: [self-hosted, debian-13, xl, instar]
     timeout-minutes: 90
 
     env:
@@ -1143,10 +1182,13 @@ jobs:
       - name: Prepare instar-testdata
         env:
           TESTDATA_TOKEN: ${{ secrets.GITLAB_TESTDATA_TOKEN }}
+          # The job asked for the testdata disk above, so a cache that is not
+          # there is an infrastructure fault and not a cue to clone.
+          TESTDATA_REQUIRE_CACHE: '1'
         run: ${GITHUB_WORKSPACE}/instar/tools/ci/prepare-testdata.sh
 
       - name: Resparsify test images
-        run: ${GITHUB_WORKSPACE}/instar/tools/ci/resparsify-testdata.sh "${TESTDATA_PATH}"
+        run: ${GITHUB_WORKSPACE}/instar/tools/ci/resparsify-prepared-testdata.sh
 
       - name: Install Docker
         run: ${GITHUB_WORKSPACE}/instar/tools/ci/install-docker.sh
@@ -1249,7 +1291,12 @@ jobs:
     if: >-
       github.event_name != 'merge_group'
       && needs.check_paths.outputs.code_changed != 'false'
-    runs-on: [self-hosted, debian-13, xl]
+    # `instar` asks the fleet for a runner carrying the pre-seeded
+    # instar-testdata dependencies disk, which is what lets the step below
+    # require the cache instead of cloning 7.46 GiB. The label is verified
+    # alongside `debian-13` only -- see "Test Data Location" in
+    # docs/testing.md.
+    runs-on: [self-hosted, debian-13, xl, instar]
     timeout-minutes: 30
     continue-on-error: true
 
@@ -1266,13 +1313,16 @@ jobs:
       - name: Prepare instar-testdata
         env:
           TESTDATA_TOKEN: ${{ secrets.GITLAB_TESTDATA_TOKEN }}
+          # The job asked for the testdata disk above, so a cache that is not
+          # there is an infrastructure fault and not a cue to clone.
+          TESTDATA_REQUIRE_CACHE: '1'
         run: ${GITHUB_WORKSPACE}/instar/tools/ci/prepare-testdata.sh
 
       # Git operations fill the images' sparse holes with real zeros,
       # which changes the allocated size qemu-img reports and so the
       # disk_size the comparison tests check.
       - name: Resparsify test images
-        run: ${GITHUB_WORKSPACE}/instar/tools/ci/resparsify-testdata.sh "${TESTDATA_PATH}"
+        run: ${GITHUB_WORKSPACE}/instar/tools/ci/resparsify-prepared-testdata.sh
 
       - name: Install Docker
         run: ${GITHUB_WORKSPACE}/instar/tools/ci/install-docker.sh
