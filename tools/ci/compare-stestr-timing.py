@@ -50,7 +50,10 @@ usage: compare-stestr-timing.py OLD_FILE NEW_FILE
 
 Writes a Markdown report to stdout -- the verdict, the totals and the
 largest movers -- which tools/ci/publish-stestr-timing.sh uses as the
-body of the pull request it opens.
+body of the pull request it opens. Because that report names test ids
+read out of a file another job produced, the ids are checked against
+TEST_ID_RE here and anything else stops the refresh; see the note on
+that constant.
 
 Exit codes, so the caller branches on a status rather than parsing prose:
 
@@ -67,6 +70,7 @@ reason this script is not a diff.
 """
 
 import os
+import re
 import sys
 
 # Both thresholds are in percentage points of the suite's total measured
@@ -80,6 +84,34 @@ TOTAL_VARIATION_PP = 10.0
 # pasting a 3,675-line file into a pull request body.
 REPORT_MOVERS = 15
 
+# What a test id is allowed to look like on this path: a dotted
+# module.Class.method, optionally carrying a testscenarios suffix in
+# parentheses. Every one of the 3,675 ids in the committed file matches
+# it, and the characters it admits -- letters, digits, underscore, dot,
+# hyphen, plus -- are the ones those ids actually use.
+#
+# This is a security boundary rather than a tidiness check, and it is
+# here because this is the publication path. The ids arrive in a file
+# derived by the one job that runs the whole suite over 7.5 GiB of
+# deliberately malformed images, and from here they travel into a
+# Markdown report, into the body of a pull request opened unattended,
+# and into the committed scheduling hint. An id carrying a backtick, a
+# pipe, a fenced block, an `@name` or an HTML comment would be rendering
+# as Markdown in a pull request nobody wrote. Constraining the id is
+# what makes every code span and table cell below safe, so nothing
+# downstream has to escape them one at a time.
+#
+# It fails closed: an id outside this shape raises, the publisher exits
+# non-zero and the nightly files an issue about the refresh. That is the
+# right direction for the path that WRITES the committed file --
+# tools/ci/seed-stestr-timing.sh, which only reads it before a run,
+# deliberately fails open instead, because one bad line there would take
+# out every testdata job. The cost here is that a test id in some new
+# shape -- a scenario name with a space or a comma in it -- stops the
+# refresh until someone widens this. That is a visible issue rather than
+# a silent publish, which is the trade this whole script is built on.
+TEST_ID_RE = re.compile(r'^[A-Za-z0-9_.+-]+(\([A-Za-z0-9_.+-]+\))?$')
+
 
 class TimingError(Exception):
     """A timing file could not be read or parsed."""
@@ -91,11 +123,11 @@ def read_timings(path):
     :param str path: path to the file, in the format
         tools/ci/generate-stestr-timing.py writes.
     :return: a dict mapping test id (str) to duration (float seconds).
-    :raises TimingError: if the file cannot be read or holds a line that
-        is not an id and a duration. A malformed file is an error rather
-        than something to work around: this decides whether to open a
-        pull request, and guessing at a half-written measurement is how
-        a wrong hint gets committed.
+    :raises TimingError: if the file cannot be read, holds a line that is
+        not an id and a duration, or holds an id outside TEST_ID_RE. A
+        malformed file is an error rather than something to work around:
+        this decides whether to open a pull request, and guessing at a
+        half-written measurement is how a wrong hint gets committed.
     """
     durations = {}
     try:
@@ -107,6 +139,10 @@ def read_timings(path):
                 parts = line.split('\t')
                 if len(parts) != 2:
                     raise TimingError(f'{path}:{number}: expected "<test id><TAB><duration>", got {line!r}')
+                if not TEST_ID_RE.match(parts[0]):
+                    # Quoted with !r so the rejected bytes cannot break
+                    # the line they are reported on either.
+                    raise TimingError(f'{path}:{number}: {parts[0]!r} is not a test id')
                 try:
                     durations[parts[0]] = float(parts[1])
                 except ValueError:

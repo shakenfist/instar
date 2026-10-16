@@ -2,6 +2,10 @@
 
 ## Status: In progress
 
+Steps 1 to 6 and 8 are done, and step 5's measurement is recorded under
+Execution ("The step-5 measurement"). Step 7 is the only outstanding
+step, and it is blocked on private-ci rather than on anything here.
+
 ## Prompt
 
 Before responding to questions or discussion points in this
@@ -486,13 +490,45 @@ tracked in private-ci's plan, not here.
 | 2 | medium | opus | none | The selectors (D3, D4). Add two Makefile targets beside the existing `test-container-core`, `test-container-convert-qcow2` and `test-container-convert-vhd` at `Makefile:681-775`: one for what the merge queue runs and one for what the nightly runs. The nightly's selection is exactly the six tests of `TestConvertVhdToQcow2Roundtrip`, `TestConvertVhdToRaw` and `TestConvertVhdCompare` whose fixtures are the Hyper-V and VirtualPC images -- name them by test id, not by class, because each of those classes also holds sub-second cases that should stay on the gate. The queue's selection is the complement. Thread the queue selector into `tools/ci/run-matrix-entry.sh`; note that `MATRIX_SELECT` is explicitly reserved for local partial runs and must not be reused for this, so add a separate variable and keep `MATRIX_SELECT`'s warning intact. |
 | 3 | medium | opus | none | The nightly job (D2). A scheduled cross-distro job over the same seven-distro list, reusing `package-build`'s artifact or rebuilding, running the step-2 nightly selector. Copy the structure of `differential-fuzz.yml` for `schedule:`, `workflow_dispatch:`, `issues: write` and the failure reporting: a red nightly must file or update an issue naming the distro and the test. Publish the timing data step 1 consumes (D1) as part of this job. Decide and record whether it lives in `functional-tests.yml` or its own workflow file -- `needs:` cannot cross workflow files, which is the constraint that matters. |
 | 4 | medium | opus | none | The guard (D5). Extend `tools/ci/check-test-partition.py` so its discovered job set includes the merge-queue matrix and the nightly, and so it asserts their selectors together cover everything the matrix covers today. Keep its stated principle intact: the job set is discovered from the workflow and the selectors read from the Makefile, never a second copy. Extend `tools/ci/test_check_test_partition.py` with a case per new failure mode: a test claimed by no queue job and no nightly job; a nightly selector that silently overlaps the queue's; a matrix selector that drops a whole module. Add the guard's invocation to the `ci-tooling` job if the existing invocation does not already cover the new assertions. |
-| 5 | medium | opus | none | Measure (the point of the plan). Dispatch the workflow and record, by the same method as Situation: per-leg step times, the suite's wall time, stestr's Worker Balance block, the matrix stage span and the total. Compare against this run's 42-minute leg, 39:09 suite, 2197/1490/1367/913 worker split, 235-minute matrix stage and 420-minute total. Post the comparison to #543. If the leg does not reach roughly 18 minutes, say so plainly and do not tune the selector to make the number look better -- the selector is a coverage decision, not a dial. |
+| 5 | medium | opus | none | **Done: dispatched as workflow run 38818648724; median clean leg 16m31s against the 42-minute baseline, and the comparison is posted on #543. See "The step-5 measurement" below for the legs and the two caveats.** Measure (the point of the plan). Dispatch the workflow and record, by the same method as Situation: per-leg step times, the suite's wall time, stestr's Worker Balance block, the matrix stage span and the total. Compare against this run's 42-minute leg, 39:09 suite, 2197/1490/1367/913 worker split, 235-minute matrix stage and 420-minute total. Post the comparison to #543. If the leg does not reach roughly 18 minutes, say so plainly and do not tune the selector to make the number look better -- the selector is a coverage decision, not a dial. |
 | 6 | low | sonnet | none | Documentation. Amend the superset argument at `functional-tests.yml:26-53` per D6 -- state the second exception, where the six tests run instead, and at what cadence. Update `docs/testing.md:418-457`, which describes the distro matrix and how to reproduce a CI entry: the entry-level command is unchanged but what the queue selects is not, and the nightly is a new thing to document. Record the measured per-distro suite medians (30 to 38 min, every distro's max above the slowest median) so a later reader can check whether the spread is still narrow. ~~No `CHANGELOG.md` entry: nothing user-visible changes.~~ **Reversed during step 8, on audit advice: there is an entry, under Changed.** The original call read "user-visible" as "visible in the binary", and nothing in the binary changes. But the person this is visible to is a contributor, and what they need is discoverable only from the changelog: a VHD change that passes the merge queue and then turns the nightly red has found a per-distro qemu divergence rather than a flake, and the six tests moving off the gate is why the two can now disagree. Finding that out from a GitHub issue filed overnight, with no record of the change in behaviour, is the failure the entry prevents. |
 | 7 | medium | opus | none | The testdata dependencies disk (D8, D9). **Half of this step has already landed, in the branch that did steps 1 to 6 and 8: the resparsify step is out of YAML and into `tools/ci/resparsify-testdata.sh`, with the comment naming private-ci's image build as a cross-repository consumer (D8) and a `tools/ci/test-resparsify-testdata.sh` that exercises their calling convention. What is still outstanding is the `instar` runner label, `TESTDATA_REQUIRE_CACHE=1`, and making the resparsify conditional on which branch `prepare-testdata.sh` took -- do not redo the lift.** **Do not merge this step before the `ci-instar-testdata` session confirms private-ci's conductor phase is deployed and soaked (D9); an early merge queues every labelled job for 24 hours and then cancels it.** Add `instar` to `runs-on` for all seven testdata consumers -- `package-matrix`, `integration-core`, `integration-convert-qcow2`, `integration-convert-vhd` and `oslo-crossval-master` in `functional-tests.yml`, the nightly from step 3, and `coverage-fuzz.yml`; leave `test-drift-fix.yml` unlabelled and add a comment there saying why -- `claude-code` is the static fleet, no static runner advertises `instar`, and a labelled job would queue for 24 hours and then be cancelled, so the inconsistency with every other testdata consumer is deliberate and must survive a future tidy-up. Set `TESTDATA_REQUIRE_CACHE=1` on each, and teach `prepare-testdata.sh` to treat a missing cache under that flag as an infra error in the same idiom as its existing LFS-pointer guard. Then make resparsify conditional: have `prepare-testdata.sh` export which branch it took to `$GITHUB_ENV` beside `TESTDATA_PATH`, and on the cache path resparsify **only the files the fetch and `lfs pull` changed**, not the whole tree. Skipping it outright would be wrong in the other direction: the image is resparsified at build time, but objects `lfs pull` fetches on the runner are not, so a day of testdata drift would accumulate unsparsified files. Resparsifying everything is equally wrong -- `cp --sparse=always` over a copy-on-write overlay writes the 7.5 GiB the disk exists to avoid. The changed set is derivable from the reset (`git diff --name-only` across it) intersected with the extension list. The shared script that step is narrowing already exists, so this is an extra optional argument to `tools/ci/resparsify-testdata.sh` and a matching case in its self-test, not a new script: its one-argument call means "the whole tree" permanently, because private-ci's image build fetches it over HTTPS and relies on that (D8). Message that session when it merges. Extend the prepare-testdata self-test for the require-cache failure path and prove it with the cache absent, not by reading it. Measure one leg before and after and record it on #543. |
 | 8 | high | opus | none | Push audit: run `PUSH-AUDIT.md` over `git diff origin/develop...HEAD`. Findings are fixed in this branch before the PR, or declined in writing here. |
 
 Commits: the plan; then one per step. Every commit passes
 `pre-commit run --all-files`.
+
+### The step-5 measurement
+
+Dispatched as workflow run 38818648724. The comparison is posted on
+#543; this is the record of it.
+
+| Leg | Wall |
+|-----|------|
+| fastest | 14m07s |
+| | 15m03s |
+| **median** | **16m31s** |
+| | 18m55s |
+| slowest | 21m38s |
+
+Five legs ran clean, median 16m31s against the 42-minute baseline in
+Situation. That meets the success criterion of "about 18 minutes,
+measured", and it is the number the plan was written to produce.
+
+Two things about the run are not the change's doing, and both have to
+be said rather than averaged away.
+
+* **Two legs failed, on the load-flakiness this repository has already
+  documented**, in `test_convert` re-encode cases. Attributed by
+  measurement, not by assumption: the same tests passed in 84 to 138
+  seconds on a green leg of the same run and took 484 to 610 seconds on
+  the red ones, which is the signature of host contention rather than a
+  behavioural difference.
+* **The stage span and the total are not comparable to the 235 and 420
+  minute baselines.** The first leg waited 1h52m for a runner, so what
+  the run measures end to end is the fleet's queueing, not the suite.
+  The per-leg wall times above are the figures this step set out to
+  move, and they are measured on the legs themselves.
 
 ### Review checklist additions
 
@@ -685,6 +721,26 @@ already larger than the change it hardens. The two stestr self-tests
 duplicate a venv build and a duration helper verbatim; the duplication
 is in test scaffolding, costs a reader nothing and risks no behaviour.
 Both are better done by whoever next needs to touch those files.
+
+**Declined from the automated review rounds, in writing.** Two further
+findings were real and not taken.
+
+* **The publishing job runs on a self-hosted runner with persisted
+  credentials.** Accepted rather than fixed. It is the only checkout in
+  the workflow that keeps its job token, and that is the point of
+  splitting it off the measuring leg: the job runs no tests, no
+  containers and no testdata, it downloads one derived text file and
+  pushes a branch, and these runners are provisioned per job. The
+  exposure the split was built to remove -- a write token sitting in a
+  tree while instar and `qemu-img` chew through 7.5 GiB of malicious
+  images for two hours -- is gone either way.
+* **The partition guard's YAML parsing is a hand-rolled text scan.**
+  True, and it has already bitten once: it discovered a prose comment
+  as a CI job, recorded under "Bugs fixed during this work" above.
+  Replacing the scan with a real parser is the right follow-up, and it
+  is not a late change to a branch whose hardening already exceeds the
+  change it hardens -- the same call as the refactor declined above,
+  and for the same reason.
 
 ### Bugs fixed during this work
 

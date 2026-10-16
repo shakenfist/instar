@@ -23,6 +23,15 @@
 # Nothing in it touches this repository or the GitHub API, and the last
 # section asserts that.
 #
+# One case drives it with a hostile measurement rather than a merely
+# malformed one. The ids in that file come from the job that ran the
+# whole suite over 7.5 GiB of deliberately malformed images, and from
+# here they travel into a Markdown report, into the body of a pull
+# request opened unattended, and into the committed file -- so an id
+# carrying a backtick, a code fence, an `@name` or a forged table row is
+# a real input shape, and it must stop the refresh rather than be
+# escaped downstream.
+#
 # Needs bash, coreutils, git and python3. No docker, no venv, no
 # testdata.
 
@@ -184,6 +193,52 @@ if [ "${STATUS}" -eq 0 ]; then
     fail "a malformed measurement reported success"
 else
     ok "exited ${STATUS}"
+fi
+
+# The measured ids come from the job that ran the suite over 7.5 GiB of
+# deliberately malformed images, and they end up in a Markdown report, in
+# the body of a pull request opened unattended, and in the committed
+# file. So a hostile id must stop the refresh here, at the one place that
+# writes it -- not be escaped further down, and not be dropped the way
+# the seeding path drops a bad line before a run.
+start "a hostile test id stops the refresh and reaches neither the body nor the file"
+# The backticks and the $( ) below are the hostile payload, so the single
+# quotes keeping them literal are the whole point.
+# shellcheck disable=SC2016
+{
+    cat "${COMMITTED}"
+    printf 'test_convert.TestEvil.test_a`whoami`\t900.00\n'
+    printf 'test_convert.TestEvil.test_fence```\t500.00\n'
+    printf 'test_convert.TestEvil.test_mention @shakenfist please merge\t400.00\n'
+    printf 'test_convert.TestEvil.test_row | 0.00s | 0.00s | +99.00 pp |\t300.00\n'
+} > "${WORK}/hostile.txt"
+OUT="${WORK}/hostile.log"
+STATUS=0
+run_publisher "${OUT}" "${WORK}/hostile.txt" --dry-run || STATUS=$?
+if [ "${STATUS}" -eq 0 ]; then
+    fail "a hostile test id reported success"
+else
+    ok "exited ${STATUS}"
+fi
+if grep -q 'is not a test id' "${OUT}"; then
+    ok "said which line it refused"
+else
+    fail "did not say why it refused the measurement"
+fi
+if grep -q 'would publish' "${OUT}"; then
+    fail "offered to publish a measurement carrying a hostile id"
+else
+    ok "offered to publish nothing"
+fi
+# Refused at the read, so the report that becomes the pull request body
+# is never built at all -- neither its movers table nor the body the dry
+# run would print. The one place the rejected bytes appear is the
+# diagnostic naming the line, which goes to the job log and is quoted
+# with repr.
+if grep -q -- '--- body ---' "${OUT}" || grep -q '| Test | Committed |' "${OUT}"; then
+    fail "a pull request body was built from a measurement carrying a hostile id"
+else
+    ok "no body and no movers table were built"
 fi
 
 start "an empty measurement is an error"

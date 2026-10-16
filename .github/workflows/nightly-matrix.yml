@@ -475,12 +475,22 @@ jobs:
   # split rather than an oversight in it. The measuring job runs the
   # suite over hostile images and cannot push; this job can push and
   # runs no tests, no containers and no testdata. The timing file it
-  # receives is parsed, not executed, every line is validated and
-  # anything unparseable is dropped, and the result is never committed
+  # receives is parsed, not executed, and the result is never committed
   # directly -- it becomes a pull request that a person reads and
   # merges. A measurement that lied about a duration would at worst
   # make the scheduler pack a little worse, and would have to get past
   # that review to do even that.
+  #
+  # The two paths that read that file validate it differently, and
+  # deliberately so. Here, on the publishing path,
+  # tools/ci/compare-stestr-timing.py requires every line to be a test
+  # id matching a conservative charset and a number, and ANYTHING ELSE
+  # STOPS THE REFRESH -- nothing is dropped and nothing is published,
+  # because the ids travel from here into a Markdown report, into the
+  # body of a pull request opened unattended, and into the committed
+  # file. Dropping lines is what tools/ci/seed-stestr-timing.sh does on
+  # the reading path before a run, where one bad line must not take out
+  # every testdata job.
   #
   # WHY THIS IS A JOB OF ITS OWN. It is the only job in the workflow
   # that holds write scopes, and the rule it exists to keep is that no
@@ -493,12 +503,27 @@ jobs:
   # testdata: it downloads one derived text file, runs two scripts from
   # the checkout, and pushes.
   #
-  # `needs: measure` is also what replaces the old "only on a successful
-  # suite" condition -- a failed measurement never reaches this job, so
-  # a morning with a failure issue does not also get a timing pull
-  # request nobody should read.
+  # A failed measurement still publishes nothing: the steps below check
+  # that one arrived and skip the publisher if it did not, so a morning
+  # with a failure issue does not also get a timing pull request nobody
+  # should read.
+  #
+  # The job runs anyway, which is the fix for a defect in the earlier
+  # shape of this. With `needs: measure` alone a failed measuring job
+  # skipped this one entirely -- and the refresh's own failure issue is
+  # filed from here, so a leg that failed night after night left the
+  # committed timings ageing with nothing saying so. The leg does file an
+  # issue about itself, but that issue is about the leg; it says nothing
+  # about the scheduling hint going stale behind it. The quieter case
+  # filed nothing at all: the derivation inside the leg is deliberately a
+  # warning rather than an error, so the leg could go green, upload no
+  # timing artifact, and leave this job red at its download step. So the
+  # gate moved from the job to the steps below: not publishing from a
+  # failed night is kept, and the silence around it is not.
   publish-timing:
     needs: measure
+    # Not `always()`: a cancelled run has nothing to report.
+    if: ${{ !cancelled() }}
     name: "Publish refreshed stestr timings"
     runs-on: [self-hosted, debian-13, s]
     # A download, a comparison and a push. Generous for all three.
@@ -544,7 +569,16 @@ jobs:
           # the measurement leg, because nothing in this job executes
           # anything from outside the repository.
 
+      # Conditional, because this job now also runs when the measuring
+      # job did not succeed, and non-fatal, because a measuring leg that
+      # went green without deriving a timing file uploads no artifact --
+      # in which case this step's own failure would be the whole story,
+      # and a red download step is exactly the silence the step after it
+      # exists to break.
       - name: Download the measured timings
+        id: download
+        if: needs.measure.result == 'success'
+        continue-on-error: true
         uses: actions/download-artifact@v8
         with:
           name: stestr-timing
@@ -562,7 +596,46 @@ jobs:
       - name: Install GitHub CLI on host
         run: ${GITHUB_WORKSPACE}/instar/tools/ci/install-gh-cli.sh
 
+      # The two ways a refresh can fail to happen rather than fail: the
+      # measuring job did not succeed, or it succeeded without writing
+      # the derived file -- which it treats as a warning and not an error
+      # on purpose, so that a measurement it could not derive does not
+      # change the suite's verdict. Either way there is nothing this job
+      # will publish and nothing is published, which is right; the issue
+      # filed below is what stops that being silent.
+      - name: Check that a measurement arrived
+        id: measurement
+        env:
+          MEASURE_RESULT: ${{ needs.measure.result }}
+          DOWNLOAD_OUTCOME: ${{ steps.download.outcome }}
+          TIMING_FILE: ${{ github.workspace }}/timing/stestr-timing.txt
+          NOTE_FILE: ${{ github.workspace }}/timing-unmeasured.log
+        run: |
+          if [ "${MEASURE_RESULT}" != "success" ]; then
+            REASON="the measurement job did not succeed (result: ${MEASURE_RESULT})"
+          elif [ ! -s "${TIMING_FILE}" ]; then
+            REASON="the measurement job succeeded but delivered no timing file"
+            REASON="${REASON} (artifact download: ${DOWNLOAD_OUTCOME})"
+          else
+            echo "publishable=true" >> "${GITHUB_OUTPUT}"
+            echo "A measurement arrived: $(wc -l < "${TIMING_FILE}") test durations."
+            exit 0
+          fi
+          echo "publishable=false" >> "${GITHUB_OUTPUT}"
+          printf 'No stestr timing measurement to publish: %s.\n' "${REASON}" \
+            > "${NOTE_FILE}"
+          echo "${REASON}; tests/stestr-timing.txt was not refreshed."
+          # Red only when this pipeline is what broke. A measuring job
+          # that failed has already made the run red and filed its own
+          # issue, and a second red here would say nothing new; a
+          # measuring job that went green and delivered nothing is a
+          # defect in this mechanism with nothing else to show it.
+          if [ "${MEASURE_RESULT}" = "success" ]; then
+            exit 1
+          fi
+
       - name: Publish refreshed timings if they moved materially
+        if: steps.measurement.outputs.publishable == 'true'
         id: publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -570,8 +643,7 @@ jobs:
           FORCE: ${{ inputs.force_timing_pr }}
         # Captured as well as printed, so that if this step is what
         # failed, the issue filed below can quote the publisher's own
-        # output. The default shell runs with pipefail, so the tee does
-        # not mask the exit code.
+        # output.
         run: |
           cd ${GITHUB_WORKSPACE}/instar
           ARGS=("${{ github.workspace }}/timing/stestr-timing.txt")
@@ -615,6 +687,27 @@ jobs:
             "Debian 13 (full suite)" \
             "debian:13" \
             "${{ github.workspace }}/timing-publish.log"
+
+      # The other half of the same argument, for the case where the
+      # publisher never ran. A measuring leg that fails night after
+      # night, or one that goes green while its derivation quietly
+      # warns, leaves the committed timings ageing with nothing anywhere
+      # naming that -- so this says it, under a dedup key of its own so
+      # it neither collapses into the publisher's issue nor into the
+      # measuring leg's distro issue. Those are three different things to
+      # go and look at.
+      - name: File or update an issue for timings that are not being refreshed
+        if: always() && steps.measurement.outputs.publishable == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          cd ${GITHUB_WORKSPACE}/instar
+          tools/ci/report-nightly-matrix-failure.sh \
+            --kind timing-unmeasured \
+            "Debian 13 (full suite)" \
+            "debian:13" \
+            "${{ github.workspace }}/timing-unmeasured.log"
 
       - name: Upload the publisher log
         if: always()

@@ -20,7 +20,8 @@
 #
 # Usage:
 #   tools/ci/report-nightly-matrix-failure.sh DISTRO IMAGE LOG_FILE \
-#       [--dry-run] [--no-dedup] [--kind distro|timing-refresh]
+#       [--dry-run] [--no-dedup] \
+#       [--kind distro|timing-refresh|timing-unmeasured]
 #
 #   DISTRO     the matrix entry's name, e.g. "Rocky 9".
 #   IMAGE      the container image it ran on, e.g. "rockylinux:9".
@@ -37,6 +38,17 @@
 # `timing-refresh` therefore says so in the title, the body and the dedup
 # key, and skips the per-test and cross-distro reasoning that does not
 # apply. `distro` is the default and is the failing-leg report.
+#
+# `timing-unmeasured` is the third way the refresh can fail to happen,
+# and the quietest. The publishing job will not commit timings derived
+# from a run that fell over, so when the measurement leg does not
+# succeed -- or succeeds without writing the derived file, which it
+# treats as a warning rather than an error on purpose -- there is nothing
+# it will publish. That skipping is right; the silence around it was not,
+# the committed hint then ages a night at a time with nothing anywhere
+# saying so. This kind is that signal, and it keys separately from both
+# of the others: a publisher bug and an absent measurement need different
+# people to look at different jobs.
 #
 # --dry-run builds the report and prints it instead of touching the
 # GitHub API, for local testing against a downloaded matrix log. It
@@ -83,7 +95,7 @@ set -euo pipefail
 
 usage() {
     echo "usage: $0 DISTRO IMAGE LOG_FILE [--dry-run] [--no-dedup]" \
-        "[--kind distro|timing-refresh]" >&2
+        "[--kind distro|timing-refresh|timing-unmeasured]" >&2
     exit 2
 }
 
@@ -99,9 +111,10 @@ while [ $# -gt 0 ]; do
             shift
             KIND="${1:-}"
             case "${KIND}" in
-                distro|timing-refresh) ;;
+                distro|timing-refresh|timing-unmeasured) ;;
                 *)
-                    echo "unknown --kind: '${KIND}' (expected distro or timing-refresh)" >&2
+                    echo "unknown --kind: '${KIND}' (expected distro, timing-refresh" \
+                        "or timing-unmeasured)" >&2
                     usage
                     ;;
             esac
@@ -233,19 +246,48 @@ cp "${SANITISED_FILE}" "${EXCERPT_FILE}"
 # leg's distro, so a publisher bug cannot be collapsed into an open
 # distro-divergence issue (or collapse one into itself); it is one leg,
 # so there is no distro to key on.
-if [ "${KIND}" = "timing-refresh" ]; then
-    TITLE="Nightly timing refresh failure"
-    DEDUP_KEY="nightly-timing-refresh"
-else
-    TITLE="Nightly matrix failure: ${DISTRO}"
-    DEDUP_KEY="nightly-matrix:${DISTRO}"
-fi
+case "${KIND}" in
+    timing-refresh)
+        TITLE="Nightly timing refresh failure"
+        DEDUP_KEY="nightly-timing-refresh"
+        ;;
+    timing-unmeasured)
+        TITLE="Nightly stestr timings are not being refreshed"
+        DEDUP_KEY="nightly-timing-unmeasured"
+        ;;
+    *)
+        TITLE="Nightly matrix failure: ${DISTRO}"
+        DEDUP_KEY="nightly-matrix:${DISTRO}"
+        ;;
+esac
 
 # Backticks throughout the body below are Markdown code spans, not
 # command substitution, so the single quotes are deliberate.
 # shellcheck disable=SC2016
 {
-    if [ "${KIND}" = "timing-refresh" ]; then
+    if [ "${KIND}" = "timing-unmeasured" ]; then
+        printf 'The nightly measurement leg produced no timing measurement that could be\n'
+        printf 'published, so `tests/stestr-timing.txt` was not refreshed. **This is not a\n'
+        printf 'failing test, and it names no test.**\n\n'
+        printf 'That file is the per-test duration list stestr bin-packs its workers from,\n'
+        printf 'and the measurement leg on **%s** (`%s`) is the only job that\n' \
+            "${DISTRO}" "${IMAGE}"
+        printf 'can re-derive it, because it is the only one that still runs the whole\n'
+        printf 'Python suite in a single stestr repository. The job that publishes the\n'
+        printf 'refresh runs no tests and will not commit timings derived from a run that\n'
+        printf 'fell over, so either the leg did not succeed or it succeeded without\n'
+        printf 'writing the derived file. The excerpt below says which.\n\n'
+        printf 'That skipping is deliberate. The silence was the defect: the committed file\n'
+        printf 'keeps working and simply ages, packing the workers a little worse every\n'
+        printf 'night, and nothing else anywhere says so. This issue is that signal, and it\n'
+        printf 'collects a comment each night until a refresh lands again.\n\n'
+        printf 'Where to look. If the leg failed there is a separate "Nightly matrix\n'
+        printf 'failure" issue for it, and fixing that fixes this. If the leg went green,\n'
+        printf 'the derivation is what broke: it is a warning rather than an error on\n'
+        printf "purpose -- a measurement that cannot be derived must not change the suite's\n"
+        printf "verdict -- so look for that warning in the leg's \"Run the whole suite and\n"
+        printf 'measure it" step.\n\n'
+    elif [ "${KIND}" = "timing-refresh" ]; then
         printf 'The nightly timing refresh failed on **%s** (`%s`). **No test failed.**\n\n' \
             "${DISTRO}" "${IMAGE}"
         printf 'The measurement leg ran the whole suite and the suite passed. What broke is\n'
@@ -338,7 +380,14 @@ if [ "${DEDUP}" -eq 1 ]; then
             "${SANITISED_FILE}" "${COMMENT_FILE}"' EXIT
         # shellcheck disable=SC2016
         {
-            if [ "${KIND}" = "timing-refresh" ]; then
+            if [ "${KIND}" = "timing-unmeasured" ]; then
+                printf 'Still unrefreshed, as of %s.\n\n' \
+                    "${WORKFLOW_URL:-an unrecorded run}"
+                printf 'Another night without a refresh of `tests/stestr-timing.txt`, so\n'
+                printf 'the committed hint is a night staler again. Still not a failing\n'
+                printf 'test; the excerpt below says which half of the mechanism was\n'
+                printf 'missing this time.\n'
+            elif [ "${KIND}" = "timing-refresh" ]; then
                 printf 'The timing refresh failed again in %s.\n\n' \
                     "${WORKFLOW_URL:-an unrecorded run}"
                 printf 'Still the publisher and still not a test: the suite passed, and\n'

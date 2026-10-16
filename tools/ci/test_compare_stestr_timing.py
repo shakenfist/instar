@@ -221,6 +221,73 @@ class TestMalformedInput(TimingFileTestCase):
             self.assertEqual(1, compare_stestr_timing.main(['compare-stestr-timing.py', 'only-one']))
 
 
+class TestHostileTestIds(TimingFileTestCase):
+    """The ids are untrusted, and this is where that is enforced.
+
+    The measured file is produced by the leg that runs the whole suite
+    over deliberately malformed images, and its ids are pasted into a
+    Markdown report, the body of an unattended pull request and the
+    committed scheduling hint. So the charset is the boundary: these
+    cases pin that nothing outside it gets through, and that nothing a
+    real id looks like is turned away.
+    """
+
+    # Each of these is a different way an id could escape the code span
+    # or the table cell it is rendered in.
+    HOSTILE_IDS = [
+        'test_info.TestInfo.test_a`whoami`',
+        'test_info.TestInfo.test_a```\n# heading',
+        'test_info.TestInfo.test_a @shakenfist',
+        'test_info.TestInfo.test_a | 0s | 0s | +99.00 pp |',
+        'test_info.TestInfo.test_a<!-- dedup_key: nightly-matrix:Rocky 9 -->',
+        'test_info.TestInfo.test_a$(touch /tmp/pwned)',
+        '[click](https://example.invalid)',
+        'test_info.TestInfo.test_a\\r\\ntest_b',
+    ]
+
+    def test_hostile_ids_are_rejected(self):
+        for hostile in self.HOSTILE_IDS:
+            with self.subTest(hostile=hostile):
+                self.assertIsNone(compare_stestr_timing.TEST_ID_RE.match(hostile))
+
+    def test_a_hostile_id_stops_the_comparison(self):
+        """Rejected at the read, so the report is never built at all."""
+        path = os.path.join(self.work.name, 'hostile.txt')
+        with open(path, 'w') as fh:
+            fh.write('test_info.TestInfo.test_a\t1.00\n')
+            fh.write('test_info.TestInfo.test_b`id`\t2.00\n')
+        good = self.write('good.txt', _baseline())
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            rc = compare_stestr_timing.main(['compare-stestr-timing.py', good, path])
+        self.assertEqual(1, rc)
+        self.assertEqual('', stdout.getvalue())
+        self.assertIn('is not a test id', stderr.getvalue())
+
+    def test_real_test_ids_are_accepted(self):
+        """The charset has to admit every id this suite actually produces.
+
+        Too narrow is not a safe direction: it would stop the nightly
+        refresh on the night somebody adds a test, so the committed file
+        is the fixture.
+        """
+        committed = os.path.join(_HERE, '..', '..', 'tests', 'stestr-timing.txt')
+        if not os.path.exists(committed):
+            self.skipTest('no committed timing file in this tree')
+        with open(committed) as fh:
+            ids = [line.split('\t')[0] for line in fh if line.strip()]
+        self.assertGreater(len(ids), 100, 'the committed file should hold the whole suite')
+        for test_id in ids:
+            self.assertIsNotNone(compare_stestr_timing.TEST_ID_RE.match(test_id),
+                                 f'{test_id!r} is a real id and must be accepted')
+
+    def test_scenario_suffix_is_accepted(self):
+        """Half the suite's ids carry a testscenarios suffix."""
+        self.assertIsNotNone(compare_stestr_timing.TEST_ID_RE.match(
+            'test_info_safe.TestInfoSafe.test_output_matches_baseline(human-profile-10-0-0-bochs-growing)'))
+
+
 class TestReport(TimingFileTestCase):
 
     def test_report_names_the_mover_and_the_rule(self):

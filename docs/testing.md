@@ -668,7 +668,7 @@ the repository runs — and holds two shapes of job:
 |-----|------|----------|
 | `nightly-legs` (seven, one per distro) | the six moved VHD conversion tests (`MATRIX_SET=nightly`) | a GitHub issue per failing distro, and the leg's log as an artifact |
 | `measure` (one, Debian 13) | the **whole** suite (`MATRIX_SET=all`), deliberately unseeded | the measured timings as a 30-day artifact, and an issue if the suite fails |
-| `publish-timing` (one, no tests) | nothing — it downloads that artifact and compares it | a pull request refreshing `tests/stestr-timing.txt`, and an issue if the refresh itself fails |
+| `publish-timing` (one, no tests) | nothing — it downloads that artifact and compares it | a pull request refreshing `tests/stestr-timing.txt`, an issue if the refresh itself fails, and an issue if there was no measurement to refresh from |
 
 `measure` is redundant as coverage — every test in it either still gates
 a merge or runs on the seven legs above — and that is not why it is
@@ -688,10 +688,21 @@ no testdata — it downloads one derived text file and pushes. The
 invariant to preserve when editing this workflow: **no job both runs the
 suite and holds a write scope.** `issues: write` is the one exception,
 on every leg, because a leg files its own failure issue and that scope
-cannot push code or touch a pull request. `needs: measure` is also what
-keeps the refresh off a failed night: a failed measurement never reaches
-the publisher, so a morning with a failure issue does not also get a
-timing pull request nobody should read.
+cannot push code or touch a pull request.
+
+**A failed night publishes nothing, and says so.** `publish-timing`
+checks that a measurement actually arrived and skips the publisher when
+one did not, so a morning with a failure issue does not also get a
+timing pull request nobody should read. It no longer skips the whole
+job, though, and that distinction matters: the refresh's own failure
+issue is filed from this job, so while a failed measurement skipped it
+entirely, a measuring leg that failed night after night left the
+committed timings quietly ageing with nothing naming that. The same hole
+swallowed the quieter case — the derivation inside the measuring leg is
+a warning rather than an error on purpose, so a leg could go green,
+upload no timing artifact, and leave the publisher red at its download
+step with no issue. Both now file one, under a key of their own (see
+"Failure reporting" below).
 
 **The timing-refresh pull request arrives with its checks not running.**
 It is opened with the job's own `GITHUB_TOKEN`, so its author is
@@ -748,7 +759,18 @@ actually moved.
   changing a single scheduling decision, and that is by far the commonest
   night-to-night difference. It publishes when one test's share moves by
   at least 2 percentage points, or when at least 10 points of the suite's
-  weight relocate between tests.
+  weight relocate between tests. It is also where the measured test ids
+  are validated, because this is the path that publishes them: an id
+  must be a dotted `module.Class.method` with an optional parenthesised
+  scenario suffix, drawn from a conservative charset, and anything else
+  stops the refresh rather than being dropped. The ids come from the job
+  that ran the suite over the malicious images, and they travel from
+  here into a Markdown report, into the body of a pull request opened
+  unattended, and into the committed file — so a backtick, a pipe, a
+  code fence or an `@name` in one would be rendering as Markdown in a
+  pull request nobody wrote. Failing closed is the opposite of the
+  seeding path's behaviour above, and deliberately: this one writes the
+  file, that one only reads it.
 - **`tools/ci/publish-stestr-timing.sh MEASURED [--dry-run] [--force]`**
   acts on that verdict. On a material change it copies the measurement
   over the committed file, force-pushes the single long-lived
@@ -781,12 +803,18 @@ about why it failed.
 Deduplication is **per distro**, keyed on a hidden `<!-- dedup_key: ...
 -->` marker in the body rather than on the title alone, so a divergence
 that takes a week to work through arrives as one issue with a comment
-per night instead of seven issues. `--kind timing-refresh` switches to a
-second, separate key: a bug in the publisher is not a distro divergence,
-and filing it as one would send a reader looking for a `qemu-img`
-difference that is not there, while filing nothing would leave a red run
-visible only in the Actions tab. That report opens by saying no test
-failed.
+per night instead of seven issues. `--kind` switches to one of two
+separate keys, because these are three different things with three
+different places to look, and collapsing any of them into the others
+sends a reader looking for a `qemu-img` difference that is not there:
+
+- `--kind timing-refresh` is a bug in the publisher. The suite passed
+  and the refresh broke, and the report opens by saying no test failed.
+- `--kind timing-unmeasured` is no measurement to publish — the
+  measuring leg did not succeed, or succeeded without deriving the file.
+  Nothing is published from a run that fell over, which is right; this
+  is the issue that stops the resulting staleness being invisible, and
+  it collects a comment each night until a refresh lands again.
 
 **Driving all of it by hand.** None of this needs CI:
 

@@ -437,6 +437,57 @@ else
     fail "the default kind's dedup key changed"
 fi
 
+# --- No measurement at all is a third kind -----------------------------
+# The quietest of the three. The publisher never runs, so there is no
+# publisher bug to report and nothing is published -- correctly -- but the
+# committed hint then ages with nothing anywhere saying so. The report
+# must say that, must not read as a test failure, and must key separately
+# from both the publisher's issue and the leg's distro issue.
+start "a timing-unmeasured report says the timings are going stale, not that a test failed"
+printf 'No stestr timing measurement to publish: the measurement job did not succeed (result: failure).\n' \
+    > "${WORK}/unmeasured.log"
+OUT="${WORK}/unmeasured-report.log"
+STATUS=0
+"${REPORTER}" --kind timing-unmeasured "Debian 13 (full suite)" "debian:13" \
+    "${WORK}/unmeasured.log" --dry-run > "${OUT}" 2>&1 || STATUS=$?
+if [ "${STATUS}" -ne 0 ]; then
+    fail "the timing-unmeasured dry run exited ${STATUS}"
+    cat "${OUT}" >&2
+else
+    ok "exited zero"
+fi
+if grep -q "would file an issue titled 'Nightly stestr timings are not being refreshed'" "${OUT}"; then
+    ok "the title names the staleness"
+else
+    fail "the title does not name the staleness"
+fi
+if grep -q 'it names no test' "${OUT}"; then
+    ok "the body says no test failed"
+else
+    fail "the body does not make clear that no test failed"
+fi
+if grep -q 'dedup_key: nightly-timing-unmeasured' "${OUT}"; then
+    ok "it dedups on its own key"
+else
+    fail "the dedup key is not the timing-unmeasured one"
+fi
+if grep -q 'dedup_key: nightly-timing-refresh' "${OUT}" ||
+        grep -q 'dedup_key: nightly-matrix' "${OUT}"; then
+    fail "it can collapse into the publisher's or the leg's issue"
+else
+    ok "it cannot collapse into either of the other two"
+fi
+if grep -q 'qemu-img divergence at this' "${OUT}"; then
+    fail "the body carries the cross-distro reasoning, which does not apply"
+else
+    ok "the cross-distro reasoning is left out"
+fi
+if grep -q 'did not succeed (result: failure)' "${OUT}"; then
+    ok "the excerpt quotes why there was no measurement"
+else
+    fail "the excerpt does not say why there was no measurement"
+fi
+
 # --- A hostile log excerpt ---------------------------------------------
 # The excerpt is captured test output, and this suite's test output
 # carries the bytes of deliberately malformed images. So the fixture here
