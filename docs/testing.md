@@ -478,8 +478,9 @@ MATRIX_SET=nightly \
 The nightly itself runs in its own workflow,
 `.github/workflows/nightly-matrix.yml`, once a night across all seven
 distros, plus one further Debian-13-only leg that runs the whole suite
-(`MATRIX_SET=all`) to refresh `tests/stestr-timing.txt`, since no other
-job executes the whole suite in one stestr repository any more. See
+(`MATRIX_SET=all`) to measure `tests/stestr-timing.txt`, since no other
+job executes the whole suite in one stestr repository any more; a second
+job with no tests in it publishes the refresh. See
 "CI job layout and the partition guard" below for the two Makefile
 targets that define the split and the guard that keeps the queue and
 nightly selections exact complements of what a matrix entry used to
@@ -666,16 +667,53 @@ the repository runs — and holds two shapes of job:
 | Job | Runs | Produces |
 |-----|------|----------|
 | `nightly-legs` (seven, one per distro) | the six moved VHD conversion tests (`MATRIX_SET=nightly`) | a GitHub issue per failing distro, and the leg's log as an artifact |
-| `measure` (one, Debian 13) | the **whole** suite (`MATRIX_SET=all`), deliberately unseeded | a pull request refreshing `tests/stestr-timing.txt`, the measurement itself as a 30-day artifact, and an issue if either the suite or the refresh fails |
+| `measure` (one, Debian 13) | the **whole** suite (`MATRIX_SET=all`), deliberately unseeded | the measured timings as a 30-day artifact, and an issue if the suite fails |
+| `publish-timing` (one, no tests) | nothing — it downloads that artifact and compares it | a pull request refreshing `tests/stestr-timing.txt`, and an issue if the refresh itself fails |
 
 `measure` is redundant as coverage — every test in it either still gates
 a merge or runs on the seven legs above — and that is not why it is
 there. It is the only job left in CI that executes the whole suite in a
 single stestr repository, which makes it the only place the timing data
-can be measured rather than guessed. It is also the only job in the
-workflow with write permissions; the workflow level is `contents: read`,
-because the seven legs run instar and `qemu-img` over deliberately
-malicious images outside the KVM sandbox.
+can be measured rather than guessed.
+
+**Measuring and publishing are two jobs because of the token.** The
+workflow level is `contents: read`, because every leg that runs the
+suite runs instar and `qemu-img` over deliberately malicious images
+outside the KVM sandbox, over a working tree the container can read.
+`publish-timing` is the only job that holds a write scope
+(`contents: write` for the branch it pushes, `pull-requests: write` for
+the pull request it opens), it is the only checkout in the workflow that
+keeps its job token, and it runs no test, installs no package and reads
+no testdata — it downloads one derived text file and pushes. The
+invariant to preserve when editing this workflow: **no job both runs the
+suite and holds a write scope.** `issues: write` is the one exception,
+on every leg, because a leg files its own failure issue and that scope
+cannot push code or touch a pull request. `needs: measure` is also what
+keeps the refresh off a failed night: a failed measurement never reaches
+the publisher, so a morning with a failure issue does not also get a
+timing pull request nobody should read.
+
+**The timing-refresh pull request arrives with its checks not running.**
+It is opened with the job's own `GITHUB_TOKEN`, so its author is
+`github-actions[bot]`, and this repository sets the Actions
+contributor-approval policy to `all_external_contributors`, which a bot
+counts as. Measured on the `rust-nightly-bump` pull requests #584, #604,
+#627 and #656, which are opened the same way: every `pull_request`
+workflow run *is* created within seconds, and attempt 1 of each ends
+`action_required`, waiting for an approval that never arrives on its
+own — on all four a maintainer approved them hours later, attempt 2 ran
+green, and the pull request merged through the queue normally. So the
+commonly repeated version of this, that a `GITHUB_TOKEN`-created pull
+request triggers no workflow runs at all, is not what happens here; the
+runs exist and wait. The effect is the same either way, since `develop`
+requires those checks. **To unblock it, use "Approve and run workflows"
+on the pull request's checks tab.** Closing and reopening is the usual
+advice for a pull request whose checks never fired and is probably not
+the fix here, because the gate is keyed on who authored the pull
+request; a PAT for an account with write access would avoid the gate
+altogether, at the cost of a secret to rotate and to leave in reach of a
+nightly job. The pull request body says all of this too, so whoever
+finds it does not have to come here.
 
 **The timing data and the four scripts that maintain it.**
 `tests/stestr-timing.txt` is a committed list of `<test id><TAB><duration
@@ -720,7 +758,11 @@ actually moved.
   scheduling hint is nowhere near a good enough reason to be the first
   thing in this repository that writes to a merge-queue-protected
   branch. On an immaterial change it prints the comparison and exits 0
-  having done nothing, which is the normal case.
+  having done nothing, which is the normal case. It assigns the pull
+  request to nobody unless `TIMING_PR_ASSIGNEE` names a login, and a
+  failed assignment is a warning rather than a failed nightly: a
+  hardcoded account that is renamed or loses access would turn a
+  scheduling hint into a failure issue.
 
 **Failure reporting.**
 `tools/ci/report-nightly-matrix-failure.sh DISTRO IMAGE LOG_FILE` files
@@ -767,7 +809,12 @@ tools/ci/report-nightly-matrix-failure.sh "Rocky 9" rockylinux:9 \
 A manual `workflow_dispatch` of `nightly-matrix.yml` takes a
 `force_timing_pr` input, which opens the refresh pull request even when
 the comparison called the change immaterial; the scheduled run never
-sets it. The self-tests —
+sets it. A dispatch runs in a concurrency group of its own, keyed on its
+run id, so it cannot be the pending run that GitHub discards when the
+22:00 schedule arrives — which also means a dispatch can run alongside
+the schedule, and the two will share the `xl` pool rather than fit in
+it. `publish-timing` carries its own group, so the branch push stays
+serialised whatever the rest of the workflow does. The self-tests —
 `tools/ci/test-seed-stestr-timing.sh`,
 `test-generate-stestr-timing.sh`, `test-publish-stestr-timing.sh`,
 `test-report-nightly-matrix-failure.sh` and
@@ -1177,6 +1224,23 @@ written-down total, so it covers the merge queue's half of the suite and
 the nightly's six tests as well as an unselected full run; a constant
 could only ever check the last of those, and drifted every time a test
 was added.
+
+**Nor must a run where everything skipped.** A skip reports a result, so
+it counts towards stestr's `Ran:` total, which means the floor above is
+satisfied by a selection in which every test skipped exactly as by one
+in which every test executed. That is reachable: every test in the
+nightly's six calls `skipTest` when its VHD fixture is missing, so one
+absent file would give a green leg that tested nothing. So
+`tools/test-package-functional.sh` also fails when `Ran:` minus
+`Skipped:` is zero, and prints the executed count on every run. The rule
+is "nothing executed at all" rather than a minimum fraction executed,
+deliberately: skips are a property of the distro rather than of the
+change — the EL streams with no `qemu-storage-daemon` skip the whole
+bitmap oracle set, and the full suite legitimately skips hundreds — so
+any fraction tight enough to catch a real loss on Debian would fail
+Rocky on a good night. One consequence worth knowing before it surprises
+you: a hand-run `--select` whose every case skips on this distro now
+fails rather than passing.
 
 ## Environment Variables
 

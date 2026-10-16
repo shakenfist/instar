@@ -252,6 +252,10 @@ cat > "${STUB_BIN}/gh" <<'STUB'
 # can be driven both ways without an API. Everything else succeeds
 # silently, which is what `gh pr create` looks like from the publisher.
 printf '%s\n' "$*" >> "${GH_STUB_LOG}"
+if [ -n "${GH_STUB_FAIL_EDIT:-}" ] && [ "${1:-}" = "pr" ] && [ "${2:-}" = "edit" ]; then
+    echo "stub: pr edit refused" >&2
+    exit 1
+fi
 if [ "${1:-}" = "pr" ] && [ "${2:-}" = "list" ]; then
     cat "${GH_STUB_OPEN_PR}"
 fi
@@ -293,6 +297,8 @@ run_scratch_publisher() {
         GH_TOKEN="stub-token" \
         GH_STUB_LOG="${GH_LOG}" \
         GH_STUB_OPEN_PR="${GH_OPEN_PR}" \
+        GH_STUB_FAIL_EDIT="${GH_STUB_FAIL_EDIT:-}" \
+        TIMING_PR_ASSIGNEE="${TIMING_PR_ASSIGNEE:-}" \
         BASE_BRANCH="develop" \
         WORKFLOW_URL="https://example.invalid/runs/1" \
         "${SCRATCH}/tools/ci/publish-stestr-timing.sh" "$@" > "${out}" 2>&1 || status=$?
@@ -329,6 +335,11 @@ if grep -q "pr create" "${GH_LOG}"; then
     ok "a pull request was opened"
 else
     fail "no pull request was opened"
+fi
+if grep -q "assignee" "${GH_LOG}"; then
+    fail "assigned the pull request with no assignee asked for"
+else
+    ok "assigned nobody: no login is written into the publisher"
 fi
 if git --git-dir="${REMOTE}" rev-parse --verify --quiet develop > /dev/null &&
     [ "$(git --git-dir="${REMOTE}" rev-parse develop)" != \
@@ -414,6 +425,62 @@ if [ -s "${GH_LOG}" ]; then
     fail "called gh for a refresh it had nothing to publish"
 else
     ok "called no GitHub API at all"
+fi
+
+start "an assignee asked for in the environment is set after the event"
+# Asked for separately from opening the pull request, and asserted
+# separately, because the two must not share a fate: an assignment that
+# cannot be made is a warning and an opened pull request, never a failed
+# nightly that filed an issue about a scheduling hint.
+: > "${GH_OPEN_PR}"
+: > "${GH_LOG}"
+OUT="${WORK}/write-assignee.log"
+STATUS=0
+TIMING_PR_ASSIGNEE="someone" run_scratch_publisher "${OUT}" "${WORK}/halved.txt" || STATUS=$?
+if [ "${STATUS}" -ne 0 ]; then
+    fail "publishing with an assignee exited ${STATUS}"
+    sed 's/^/      /' "${OUT}" >&2
+else
+    ok "exited zero"
+fi
+if grep -q "pr create" "${GH_LOG}"; then
+    ok "opened the pull request"
+else
+    fail "opened no pull request"
+fi
+if grep -q "pr edit stestr-timing/refresh --add-assignee someone" "${GH_LOG}"; then
+    ok "assigned the login the environment named"
+else
+    fail "did not assign the login the environment named"
+fi
+
+start "an assignment that fails leaves the pull request standing"
+HEAVIEST3="$(awk -F '\t' '$2 > max { max = $2; id = $1 } END { print id }' \
+    "${SCRATCH}/tests/stestr-timing.txt")"
+awk -F '\t' -v id="${HEAVIEST3}" 'BEGIN { OFS = "\t" }
+    $1 == id { $2 = sprintf("%.2f", $2 * 7); print; next }
+    { print }' "${SCRATCH}/tests/stestr-timing.txt" > "${WORK}/sevenfold.txt"
+: > "${GH_LOG}"
+OUT="${WORK}/write-assignee-fails.log"
+STATUS=0
+GH_STUB_FAIL_EDIT=1 TIMING_PR_ASSIGNEE="departed" \
+    run_scratch_publisher "${OUT}" "${WORK}/sevenfold.txt" || STATUS=$?
+if [ "${STATUS}" -ne 0 ]; then
+    fail "a refused assignment failed the publisher (exit ${STATUS})"
+    sed 's/^/      /' "${OUT}" >&2
+else
+    ok "exited zero despite the refused assignment"
+fi
+if grep -q "could not assign departed" "${OUT}"; then
+    ok "warned that the assignment did not happen"
+else
+    fail "said nothing about the failed assignment"
+fi
+if git --git-dir="${REMOTE}" show "stestr-timing/refresh:tests/stestr-timing.txt" 2> /dev/null \
+    | cmp -s - "${WORK}/sevenfold.txt"; then
+    ok "the refresh itself still reached the remote"
+else
+    fail "the refresh did not reach the remote"
 fi
 
 # --- Nothing was written -----------------------------------------------

@@ -1016,7 +1016,7 @@ Each review item has an `action` field:
 - `.github/workflows/test-drift-fix.yml` - Scheduled/on-demand test maintenance
 - `.github/workflows/differential-fuzz.yml` - On-demand differential fuzzing (instar vs qemu-img + libyal)
 - `.github/workflows/coverage-fuzz.yml` - Coverage-guided fuzzing of parser crates (nightly + PR)
-- `.github/workflows/nightly-matrix.yml` - The nightly half of the distro matrix: the six heavy VHD conversion tests on all seven distros, plus a full-suite measurement leg that refreshes `tests/stestr-timing.txt`. Files an issue when a leg or the refresh fails (see "The nightly matrix's timing refresh and failure reporting" in `docs/testing.md`)
+- `.github/workflows/nightly-matrix.yml` - The nightly half of the distro matrix: the six heavy VHD conversion tests on all seven distros, plus a full-suite leg that measures `tests/stestr-timing.txt` and a separate job, holding the only write scopes in the workflow and running no tests, that publishes the refresh. Files an issue when a leg or the refresh fails (see "The nightly matrix's timing refresh and failure reporting" in `docs/testing.md`)
 - `.github/workflows/rust-nightly-bump.yml` - Weekly devcontainer Rust nightly pin bump (see "Toolchain pinning" above)
 - `.github/workflows/codeql-analysis.yml` - CodeQL static analysis (push/PR to develop, plus weekly cron)
 - `.github/workflows/supply-chain.yml` - gitleaks secret scanning on debian-13 (PR/push, plus weekly cron)
@@ -1063,7 +1063,7 @@ step -- see "Self-hosted runners and the GitHub CLI" in
 - `tools/ci/seed-stestr-timing.sh` - Loads the committed `tests/stestr-timing.txt` into a fresh stestr repository before `stestr run`, so the scheduler bin-packs its workers by measured duration instead of splitting the suite round-robin. A missing or unusable file is not an error (see "The nightly matrix's timing refresh and failure reporting" in `docs/testing.md`)
 - `tools/ci/generate-stestr-timing.py` - Derives that file from a stestr repository's recorded durations; it must never be hand-maintained
 - `tools/ci/compare-stestr-timing.py` - Decides whether a fresh measurement moved materially, in shares of the suite's weight because bin packing is scale-free; exits 0 material, 10 immaterial, 1 error
-- `tools/ci/publish-stestr-timing.sh` - Opens or updates the one long-lived timing-refresh pull request when it did. Never pushes to `develop`
+- `tools/ci/publish-stestr-timing.sh` - Opens or updates the one long-lived timing-refresh pull request when it did. Never pushes to `develop`, assigns nobody unless `TIMING_PR_ASSIGNEE` says so, and its header records why the pull request it opens needs a maintainer to approve its checks
 - `tools/ci/report-nightly-matrix-failure.sh` - Files or updates the `test-failure` issue for a failed nightly leg, naming the distro and the failing tests, with a separate deduplication key for a failed timing refresh
 - `tools/ci/test-seed-stestr-timing.sh`, `tools/ci/test-generate-stestr-timing.sh`, `tools/ci/test_compare_stestr_timing.py`, `tools/ci/test-publish-stestr-timing.sh`, `tools/ci/test-report-nightly-matrix-failure.sh` - Tests for those five; the `ci-tooling` CI job runs them all
 - `tools/mermaid-lint.sh` - Renders every tracked markdown file that contains a mermaid fence, in the upstream mermaid-cli container (see "Diagrams" above); `mermaid-lint.yml` and the push audit's wave 1 both run it

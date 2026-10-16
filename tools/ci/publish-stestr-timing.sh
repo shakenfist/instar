@@ -27,6 +27,43 @@
 # never make a run wrong, so silence on a night when nothing moved is
 # worth far more than a pull request every morning that nobody reads.
 #
+# THE PULL REQUEST THIS OPENS ARRIVES WITH ITS CHECKS NOT RUNNING, and
+# that is not a defect in this script. It is created by `gh pr create`
+# with the job's own GITHUB_TOKEN, so its author is
+# `github-actions[bot]`, and this repository sets the Actions
+# contributor-approval policy to `all_external_contributors`, which a
+# bot counts as.
+#
+# Measured, rather than taken from the lore, on the `rust-nightly-bump`
+# pull requests #584, #604, #627 and #656, which are opened in exactly
+# this way: every `pull_request` workflow run -- Lint, CodeQL, Supply
+# chain, Functional Tests -- IS created, within seconds of the pull
+# request, and attempt 1 of each ends `action_required`, queued behind
+# an approval that never arrives by itself. On all four a maintainer
+# approved them hours later, attempt 2 ran green, and the pull request
+# merged through the queue normally.
+#
+# So the widely-repeated version of this -- that a GITHUB_TOKEN-created
+# pull request triggers no workflow runs at all -- is not what this
+# repository does; the runs exist and wait. The effect is the same
+# either way: `develop` requires those checks, so the refresh cannot
+# merge until somebody acts.
+#
+# What to do about it:
+#   - Approve the runs: "Approve and run workflows" on the pull
+#     request's checks tab. That is what unblocked all four bump pull
+#     requests, and it is the normal path.
+#   - Closing and reopening is the usual advice for a pull request whose
+#     checks never fired, and is probably not the fix here: the gate is
+#     keyed on who authored the pull request, which reopening does not
+#     change. It was not what unblocked any of the four.
+#   - Open it as a person instead. A PAT for an account with write
+#     access is not an external contributor, so it skips the gate (and
+#     in repositories that suppress the runs outright rather than
+#     queueing them, it is the documented way round that too). It costs
+#     a secret to rotate and to leave in reach of this job, which is why
+#     this uses the job token and accepts the approval click.
+#
 # Usage:
 #   tools/ci/publish-stestr-timing.sh MEASURED_FILE [--dry-run] [--force]
 #
@@ -46,6 +83,13 @@
 #   GH_TOKEN       (required unless --dry-run) for `gh pr create`.
 #   WORKFLOW_URL   (optional) run URL recorded in the pull request body.
 #   BASE_BRANCH    (default develop) base for the pull request.
+#   TIMING_PR_ASSIGNEE
+#                  (optional) a login to assign the pull request to,
+#                  best-effort. Unset everywhere in CI on purpose: an
+#                  unattended nightly must not fail because a login
+#                  changed or lost access, and the pull request is the
+#                  deliverable -- an assignee is a convenience on top of
+#                  it. A failure to assign is a warning, not an error.
 #
 # Exits non-zero only on a real failure -- bad arguments, an unreadable
 # or malformed measurement, a git or gh error. An immaterial measurement
@@ -139,6 +183,15 @@ trap 'rm -f "${BODY_FILE}"' EXIT
     printf ' it is equally safe to close, which only leaves the packing as good as it'
     printf ' is today.\n\n'
     printf '%s\n\n' "${REPORT}"
+    printf '**Its checks are awaiting approval rather than running, and that is'
+    printf ' expected.** This pull request is opened by the nightly job with the'
+    printf ' workflow GITHUB_TOKEN, so its author is `github-actions[bot]`, and'
+    printf ' this repository requires approval for workflow runs on pull requests'
+    printf ' from external contributors. The runs are created and then sit at'
+    printf ' `action_required` until a maintainer uses "Approve and run workflows"'
+    printf ' on the checks tab; `develop` requires those checks, so nothing merges'
+    printf ' until that happens. Every `rust-nightly-bump` pull request behaves the'
+    printf ' same way, so it says nothing about this one.\n\n'
     if [ "${MATERIAL}" -eq 0 ]; then
         printf 'Opened with `--force` from a manual dispatch: the comparison above'
         printf ' did not consider the change material.\n\n'
@@ -200,6 +253,17 @@ fi
 
 gh pr create \
     --base "${BASE_BRANCH}" \
-    --assignee mikalstill \
     --title "${TITLE}" \
     --body-file "${BODY_FILE}"
+
+# Assignment is optional, best-effort, and names nobody here. A
+# hardcoded login ties an unattended nightly to one account: if it is
+# renamed or loses access, `gh pr create` fails, the pull request is
+# never opened and the run files a failure issue -- for a scheduling
+# hint, and over something that is not even part of the refresh. So the
+# login comes from the environment if anyone wants one, and failing to
+# set it leaves the pull request alone rather than failing the job.
+if [ -n "${TIMING_PR_ASSIGNEE:-}" ]; then
+    gh pr edit "${BRANCH}" --add-assignee "${TIMING_PR_ASSIGNEE}" ||
+        echo "warning: could not assign ${TIMING_PR_ASSIGNEE}; the pull request stands." >&2
+fi

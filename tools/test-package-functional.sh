@@ -408,6 +408,44 @@ if [ "$RAN" -lt "$EXPECTED" ]; then
     exit 1
 fi
 
+# Skip floor, the complement of the length floor above. A skipped test
+# reports a result, so it counts towards "Ran", which means a selection
+# in which every test skipped satisfies the floor exactly as a
+# selection in which every test executed. That is not hypothetical
+# here: every test in the nightly selection calls skipTest when its VHD
+# fixture is missing, so one absent file would give a green leg that
+# tested nothing. The length floor cannot see it, because the count is
+# right.
+#
+# The rule is "nothing executed at all" and not "fewer than some
+# fraction executed", and the reason is that there is no legitimate
+# skip rate to compare against. Skips are a property of the distro, not
+# of the change: the EL streams that cannot install qemu-storage-daemon
+# skip the whole bitmap oracle set, every distro skips whichever
+# fixtures its qemu cannot produce, and the full suite legitimately
+# skips hundreds. Any fraction tight enough to catch a real loss on
+# Debian would fail Rocky on a good night. Zero executed tests needs no
+# tuning, is never legitimate, and is the shape every realistic cause
+# of a silently-empty run takes.
+#
+# One deliberate consequence: a hand-run --select whose every case
+# skips on this distro now fails rather than passing. That run did not
+# test anything either, and saying so is the point.
+SKIPPED=$(sed -n "s/^ *- Skipped: \([0-9]*\).*/\1/p" /tmp/stestr-output.txt | tail -n1)
+SKIPPED=${SKIPPED:-0}
+EXECUTED=$((RAN - SKIPPED))
+if [ "$EXECUTED" -le 0 ]; then
+    echo "" >&2
+    echo "Error: all $RAN tests in this selection skipped; nothing was" >&2
+    echo "actually executed. A skip counts towards the \"Ran\" total" >&2
+    echo "that stestr prints, so this run passes the length floor above" >&2
+    echo "while testing nothing at all. The usual cause is missing test" >&2
+    echo "fixtures, so check the testdata preparation rather than the" >&2
+    echo "tests." >&2
+    exit 1
+fi
+echo "$EXECUTED of $RAN tests executed, $SKIPPED skipped"
+
 # Derive the timing data, if this run was asked to measure. Deliberately
 # after the truncation guards and before the verdict: a truncated run
 # holds durations for only the tests its surviving workers reached, and
