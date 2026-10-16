@@ -20,12 +20,23 @@
 #
 # Usage:
 #   tools/ci/report-nightly-matrix-failure.sh DISTRO IMAGE LOG_FILE \
-#       [--dry-run] [--no-dedup]
+#       [--dry-run] [--no-dedup] [--kind distro|timing-refresh]
 #
 #   DISTRO     the matrix entry's name, e.g. "Rocky 9".
 #   IMAGE      the container image it ran on, e.g. "rockylinux:9".
 #   LOG_FILE   the leg's captured log (MATRIX_LOG from
 #              tools/ci/run-matrix-entry.sh).
+#
+# --kind says what failed, because the nightly has one job that can go
+# red without a test having failed. The measurement leg runs the whole
+# suite and then publishes the refreshed timings, and a failure in that
+# publishing step is a bug in the publisher: filing it as a distro
+# failure would send a reader looking for a qemu-img divergence that is
+# not there, while filing nothing at all leaves a red run visible only in
+# the Actions tab, which is precisely what this script exists to prevent.
+# `timing-refresh` therefore says so in the title, the body and the dedup
+# key, and skips the per-test and cross-distro reasoning that does not
+# apply. `distro` is the default and is the failing-leg report.
 #
 # --dry-run builds the report and prints it instead of touching the
 # GitHub API, for local testing against a downloaded matrix log. It
@@ -65,17 +76,30 @@
 set -euo pipefail
 
 usage() {
-    echo "usage: $0 DISTRO IMAGE LOG_FILE [--dry-run] [--no-dedup]" >&2
+    echo "usage: $0 DISTRO IMAGE LOG_FILE [--dry-run] [--no-dedup]" \
+        "[--kind distro|timing-refresh]" >&2
     exit 2
 }
 
 DRY_RUN=0
 DEDUP=1
+KIND=distro
 POSITIONAL=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --dry-run) DRY_RUN=1; DEDUP=0 ;;
         --no-dedup) DEDUP=0 ;;
+        --kind)
+            shift
+            KIND="${1:-}"
+            case "${KIND}" in
+                distro|timing-refresh) ;;
+                *)
+                    echo "unknown --kind: '${KIND}' (expected distro or timing-refresh)" >&2
+                    usage
+                    ;;
+            esac
+            ;;
         -*) usage ;;
         *) POSITIONAL+=("$1") ;;
     esac
@@ -162,42 +186,67 @@ else
         | "${SCRUB[@]}" 2> /dev/null > "${EXCERPT_FILE}" || true
 fi
 
-TITLE="Nightly matrix failure: ${DISTRO}"
-
 # A machine-readable marker in an otherwise human-readable body. The
 # fuzz reporter makes its whole body JSON, which suits a crash record
 # nobody reads without the reproducer, but a distro divergence is read by
 # a person first -- so the body is Markdown and only the dedup key is
 # hidden in a comment.
-DEDUP_KEY="nightly-matrix:${DISTRO}"
+#
+# The timing refresh gets a key of its own rather than the measurement
+# leg's distro, so a publisher bug cannot be collapsed into an open
+# distro-divergence issue (or collapse one into itself); it is one leg,
+# so there is no distro to key on.
+if [ "${KIND}" = "timing-refresh" ]; then
+    TITLE="Nightly timing refresh failure"
+    DEDUP_KEY="nightly-timing-refresh"
+else
+    TITLE="Nightly matrix failure: ${DISTRO}"
+    DEDUP_KEY="nightly-matrix:${DISTRO}"
+fi
 
 # Backticks throughout the body below are Markdown code spans, not
 # command substitution, so the single quotes are deliberate.
 # shellcheck disable=SC2016
 {
-    printf 'The nightly distro matrix failed on **%s** (`%s`), running qemu-img %s.\n\n' \
-        "${DISTRO}" "${IMAGE}" "${QEMU}"
-    if [ "${TEST_COUNT}" -gt 0 ]; then
-        printf 'Failing tests (%s):\n\n' "${TEST_COUNT}"
-        awk -v limit="${MAX_TESTS_LISTED}" 'NR <= limit { printf "- `%s`\n", $0 }' "${TESTS_FILE}"
-        if [ "${TEST_COUNT}" -gt "${MAX_TESTS_LISTED}" ]; then
-            printf -- '- ... and %s more; the full list is in the job log.\n' \
-                "$((TEST_COUNT - MAX_TESTS_LISTED))"
-        fi
-        printf '\n'
+    if [ "${KIND}" = "timing-refresh" ]; then
+        printf 'The nightly timing refresh failed on **%s** (`%s`). **No test failed.**\n\n' \
+            "${DISTRO}" "${IMAGE}"
+        printf 'The measurement leg ran the whole suite and the suite passed. What broke is\n'
+        printf 'the step after it, `tools/ci/publish-stestr-timing.sh`, which compares the\n'
+        printf 'measured durations against the committed `tests/stestr-timing.txt` and opens\n'
+        printf 'a pull request when they moved materially. So this is a bug in the publisher\n'
+        printf 'or in its access to the repository -- not a qemu-img divergence, and not an\n'
+        printf 'instar regression. Nothing in the suite is implicated by this issue.\n\n'
+        printf 'What it costs: `tests/stestr-timing.txt` was not refreshed tonight. The\n'
+        printf 'committed file still works, it is simply one night staler, and stestr\n'
+        printf "bin-packs its workers less well as it ages. It will not fix itself, which\n"
+        printf 'is why this is an issue rather than a red square in the Actions tab.\n\n'
     else
-        printf 'No failing test was identified in the log, so this leg failed before or\n'
-        printf 'outside the tests themselves -- a package that would not install, testdata\n'
-        printf 'that was not materialised, one of the truncated-run guards, or a timeout.\n'
-        printf 'The excerpt below is the end of the log rather than a failure block.\n\n'
+        printf 'The nightly distro matrix failed on **%s** (`%s`), running qemu-img %s.\n\n' \
+            "${DISTRO}" "${IMAGE}" "${QEMU}"
+        if [ "${TEST_COUNT}" -gt 0 ]; then
+            printf 'Failing tests (%s):\n\n' "${TEST_COUNT}"
+            awk -v limit="${MAX_TESTS_LISTED}" 'NR <= limit { printf "- `%s`\n", $0 }' \
+                "${TESTS_FILE}"
+            if [ "${TEST_COUNT}" -gt "${MAX_TESTS_LISTED}" ]; then
+                printf -- '- ... and %s more; the full list is in the job log.\n' \
+                    "$((TEST_COUNT - MAX_TESTS_LISTED))"
+            fi
+            printf '\n'
+        else
+            printf 'No failing test was identified in the log, so this leg failed before or\n'
+            printf 'outside the tests themselves -- a package that would not install, testdata\n'
+            printf 'that was not materialised, one of the truncated-run guards, or a timeout.\n'
+            printf 'The excerpt below is the end of the log rather than a failure block.\n\n'
+        fi
+        if [ -n "${TOTALS}" ]; then
+            printf 'Totals: %s\n\n' "${TOTALS}"
+        fi
+        printf 'What this means depends on the other six legs of the same run. The same\n'
+        printf 'test failing here and passing elsewhere is a qemu-img divergence at this\n'
+        printf "distro's version; the same test failing on every distro is an instar\n"
+        printf 'regression, and one the pull-request jobs did not catch.\n\n'
     fi
-    if [ -n "${TOTALS}" ]; then
-        printf 'Totals: %s\n\n' "${TOTALS}"
-    fi
-    printf 'What this means depends on the other six legs of the same run. The same\n'
-    printf 'test failing here and passing elsewhere is a qemu-img divergence at this\n'
-    printf "distro's version; the same test failing on every distro is an instar\n"
-    printf 'regression, and one the pull-request jobs did not catch.\n\n'
     printf 'Log excerpt:\n\n'
     printf '```\n'
     cat "${EXCERPT_FILE}"
@@ -245,25 +294,36 @@ if [ "${DEDUP}" -eq 1 ]; then
         2> /dev/null || true)"
 
     if [ -n "${EXISTING}" ]; then
-        echo "${DISTRO} already has open issue #${EXISTING}; commenting instead of filing a duplicate"
+        echo "'${TITLE}' already has open issue #${EXISTING};" \
+            "commenting instead of filing a duplicate"
         COMMENT_FILE="$(mktemp)"
         trap 'rm -f "${TESTS_FILE}" "${BODY_FILE}" "${EXCERPT_FILE}" "${COMMENT_FILE}"' EXIT
+        # shellcheck disable=SC2016
         {
-            printf 'Failed again on %s in %s.\n\n' "${DISTRO}" "${WORKFLOW_URL:-an unrecorded run}"
-            if [ "${TEST_COUNT}" -gt 0 ]; then
-                printf 'Failing tests this run (%s):\n\n' "${TEST_COUNT}"
-                awk -v limit="${MAX_TESTS_LISTED}" 'NR <= limit { printf "- `%s`\n", $0 }' "${TESTS_FILE}"
-                if [ "${TEST_COUNT}" -gt "${MAX_TESTS_LISTED}" ]; then
-                    printf -- '- ... and %s more.\n' "$((TEST_COUNT - MAX_TESTS_LISTED))"
-                fi
+            if [ "${KIND}" = "timing-refresh" ]; then
+                printf 'The timing refresh failed again in %s.\n\n' \
+                    "${WORKFLOW_URL:-an unrecorded run}"
+                printf 'Still the publisher and still not a test: the suite passed, and\n'
+                printf '`tests/stestr-timing.txt` went another night without being refreshed.\n'
             else
-                printf 'No failing test was identified in the log this time either.\n'
+                printf 'Failed again on %s in %s.\n\n' \
+                    "${DISTRO}" "${WORKFLOW_URL:-an unrecorded run}"
+                if [ "${TEST_COUNT}" -gt 0 ]; then
+                    printf 'Failing tests this run (%s):\n\n' "${TEST_COUNT}"
+                    awk -v limit="${MAX_TESTS_LISTED}" 'NR <= limit { printf "- `%s`\n", $0 }' \
+                        "${TESTS_FILE}"
+                    if [ "${TEST_COUNT}" -gt "${MAX_TESTS_LISTED}" ]; then
+                        printf -- '- ... and %s more.\n' "$((TEST_COUNT - MAX_TESTS_LISTED))"
+                    fi
+                else
+                    printf 'No failing test was identified in the log this time either.\n'
+                fi
+                printf '\nqemu-img %s' "${QEMU}"
+                if [ -n "${TOTALS}" ]; then
+                    printf ' -- %s' "${TOTALS}"
+                fi
+                printf '\n'
             fi
-            printf '\nqemu-img %s' "${QEMU}"
-            if [ -n "${TOTALS}" ]; then
-                printf ' -- %s' "${TOTALS}"
-            fi
-            printf '\n'
         } > "${COMMENT_FILE}"
         gh issue comment "${EXISTING}" --body-file "${COMMENT_FILE}"
         exit 0

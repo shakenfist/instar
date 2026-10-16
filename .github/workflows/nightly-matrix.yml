@@ -66,18 +66,15 @@ on:
         default: false
         type: boolean
 
+# Read-only at the workflow level, because a workflow-level grant is a
+# grant to all nine jobs. Seven of them install a package and run instar
+# and qemu-img over instar-testdata's deliberately malicious images,
+# outside the KVM sandbox; the write scopes the timing refresh needs have
+# no business being reachable from there. Each job that needs more says
+# so itself, and the merge-queue matrix runs the same code path under
+# `contents: read` already.
 permissions:
-  contents: write
-  issues: write
-  pull-requests: write
-
-# `contents: write` and `pull-requests: write` are for the timing
-# refresh, which pushes a bot branch and opens a pull request -- the same
-# thing rust-nightly-bump.yml does with the same two permissions. Nothing
-# here writes to the default branch: `develop` is merge-queue protected,
-# nothing in this repository pushes to it from CI, and a file that only
-# hints at scheduling is nowhere near a good enough reason to be the
-# first thing that does.
+  contents: read
 
 concurrency:
   # Never cancel in progress: a nightly that is half way through seven
@@ -101,6 +98,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          # Nothing here pushes, and the build runs in a container over
+          # this working tree, so the default of writing the job token
+          # into .git/config would only widen what a build step can
+          # reach.
+          persist-credentials: false
 
       - name: Install Docker
         run: tools/ci/install-docker.sh
@@ -151,6 +154,13 @@ jobs:
     # colour of the run. The issue is still filed either way, by the
     # failure step below.
     continue-on-error: ${{ matrix.distro.allow_failure }}
+
+    # Only what the failure reporter below needs. These legs run instar
+    # and qemu-img over the malicious testdata images, so they get no
+    # write access to the repository's contents or its pull requests.
+    permissions:
+      contents: read
+      issues: write
 
     strategy:
       fail-fast: false
@@ -208,6 +218,14 @@ jobs:
         with:
           path: instar
           fetch-depth: 0
+          # This working tree is mounted into a container that runs
+          # instar and qemu-img over instar-testdata's deliberately
+          # malicious images, outside the KVM sandbox. The default would
+          # write the job token into its .git/config, where that code
+          # path can read it; nothing on this leg pushes, so the
+          # credential is pure exposure. pr-re-review.yml refuses it for
+          # the same reason.
+          persist-credentials: false
 
       - name: Prepare instar-testdata
         env:
@@ -291,6 +309,20 @@ jobs:
     # keep that here, where nothing waits on the answer.
     timeout-minutes: 120
 
+    # The only job that needs write access, and the reason the workflow
+    # level is read-only: `contents: write` and `pull-requests: write`
+    # are for the timing refresh, which pushes a bot branch and opens a
+    # pull request -- the same thing rust-nightly-bump.yml does with the
+    # same two permissions -- and `issues: write` is for the failure
+    # reporter. Nothing here writes to the default branch: `develop` is
+    # merge-queue protected, nothing in this repository pushes to it from
+    # CI, and a file that only hints at scheduling is nowhere near a good
+    # enough reason to be the first thing that does.
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+
     env:
       DOCKER_BUILDKIT: 1
 
@@ -302,6 +334,12 @@ jobs:
           # Full history: the timing refresh commits and pushes a branch,
           # and a shallow clone cannot be pushed.
           fetch-depth: 0
+          # This is the one leg that keeps its credentials, because
+          # tools/ci/publish-stestr-timing.sh pushes through this
+          # checkout's remote. It runs the suite too, so the exposure the
+          # other legs avoid is real here; it is accepted rather than
+          # ignored, and is the reason this job's write scopes are
+          # declared on the job instead of the workflow.
 
       - name: Prepare instar-testdata
         env:
@@ -368,21 +406,28 @@ jobs:
       # real, but a morning with both a failure issue and a timing pull
       # request is a morning where the pull request is noise.
       - name: Publish refreshed timings if they moved materially
+        id: publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           FORCE: ${{ inputs.force_timing_pr }}
+        # Captured as well as printed, so that if this step is what
+        # failed, the issue filed below can quote the publisher's own
+        # output rather than the tail of a suite log that passed. The
+        # default shell runs with pipefail, so the tee does not mask the
+        # exit code.
         run: |
           cd ${GITHUB_WORKSPACE}/instar
           ARGS=("${{ github.workspace }}/timing/stestr-timing.txt")
           if [ "${FORCE}" = "true" ]; then ARGS+=(--force); fi
-          tools/ci/publish-stestr-timing.sh "${ARGS[@]}"
+          tools/ci/publish-stestr-timing.sh "${ARGS[@]}" \
+            2>&1 | tee "${{ github.workspace }}/timing-publish.log"
 
       # Keyed on the suite step rather than on the job, and on "did not
       # succeed" rather than "failed": a suite that failed and a leg that
-      # died before reaching it both need reporting, while a failure in
-      # the publishing step above is a bug in the publisher and must not
-      # be filed as a distro failure against a suite that passed.
+      # died before reaching it both need reporting, and a failure in the
+      # publishing step above must not be filed as a distro failure
+      # against a suite that passed -- it gets its own report below.
       - name: File or update an issue for the measurement leg
         if: failure() && steps.suite.outcome != 'success'
         env:
@@ -394,6 +439,26 @@ jobs:
             "Debian 13 (full suite)" \
             "debian:13" \
             "${{ github.workspace }}/matrix.log"
+
+      # The other half of that split. Without this a publisher bug is a
+      # red run and nothing else: the step above declines to file,
+      # correctly, because no test failed -- and this workflow's own
+      # argument is that a nightly whose red is visible only in the
+      # Actions tab is not a safety net. --kind timing-refresh makes the
+      # issue say it is the refresh that broke, so nobody goes looking
+      # for a qemu-img divergence that is not there.
+      - name: File or update an issue for a failed timing refresh
+        if: failure() && steps.suite.outcome == 'success' && steps.publish.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          cd ${GITHUB_WORKSPACE}/instar
+          tools/ci/report-nightly-matrix-failure.sh \
+            --kind timing-refresh \
+            "Debian 13 (full suite)" \
+            "debian:13" \
+            "${{ github.workspace }}/timing-publish.log"
 
       - name: Upload logs
         if: always()

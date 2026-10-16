@@ -35,7 +35,11 @@
 #     variable at all.
 #   - A non-zero exit on any failure, so a caller that cannot fetch or
 #     cannot run this fails loudly instead of quietly degrading to
-#     unsparsified images and slower jobs.
+#     unsparsified images and slower jobs. Matching no images at all
+#     counts as a failure for that reason: the work not happening is the
+#     thing being guarded against, and it cannot be seen from the
+#     outside. A caller that wants to pass a tree with no images has to
+#     stop calling this for such a tree.
 #
 # A caller that wants less than the whole tree -- resparsifying only the
 # files a fetch changed, say -- must ask for that with further optional
@@ -106,8 +110,23 @@ if [ "${FAILED}" -ne 0 ]; then
     exit 1
 fi
 
+# Zero matches inside an existing downloaded/ is a failure, not an empty
+# tree. The directory is there, so the path is right; what is wrong is
+# either the extension list below having been edited into something that
+# matches nothing, or instar-testdata having moved its images. Both leave
+# every consumer running against fully allocated images, which looks
+# exactly like success and shows up much later as a slow job and as
+# disk_size comparisons that measure git's allocation rather than the
+# fixture's. The one-argument interface is unchanged -- only the exit
+# code for a tree this script can do nothing with.
 if [ "${RESPARSIFIED}" -eq 0 ]; then
-    echo "resparsify-testdata: warning: no images matched under ${SCOPE}" >&2
+    echo "resparsify-testdata: no images matched under ${SCOPE}" >&2
+    echo "Expected at least one *.qcow2, *.vmdk, *.vhd, *.vhdx or *.img file somewhere" >&2
+    echo "beneath it, because that is what an instar-testdata tree holds. Either the" >&2
+    echo "extension list in this script no longer matches the images, or the tree's" >&2
+    echo "layout changed; resparsifying nothing is indistinguishable from success and" >&2
+    echo "must not be reported as it." >&2
+    exit 1
 fi
 
 echo "resparsify-testdata: resparsified ${RESPARSIFIED} image(s) under ${SCOPE}"

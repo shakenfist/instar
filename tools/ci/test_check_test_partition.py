@@ -22,6 +22,9 @@ itself part of the partition it checks.
 
 import io
 import os
+import re
+import shutil
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -29,6 +32,7 @@ from contextlib import redirect_stdout
 import importlib.util
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
 _spec = importlib.util.spec_from_file_location(
     'check_test_partition', os.path.join(_HERE, 'check-test-partition.py'))
 guard = importlib.util.module_from_spec(_spec)
@@ -112,6 +116,96 @@ DISTROS = '''\
             image: 'rockylinux/rockylinux:10'
             pkg_kind: 'rpm'
             allow_failure: false
+'''
+
+# What every variant of the list below must parse to. Written once so a
+# reformat that loses an entry cannot be made to agree with a reformatted
+# expectation.
+DISTROS_PARSED = [
+    ('Debian 12', 'debian:12', 'deb'),
+    ('Ubuntu 22.04', 'ubuntu:22.04', 'deb'),
+    ('Rocky 10', 'rockylinux/rockylinux:10', 'rpm'),
+]
+
+# The same three distros with one entry's keys in a different order.
+# YAML-equivalent, and the shape a reformat most plausibly takes: the
+# audit marker still sits between two keys of that entry, so this is
+# both halves of the brittleness at once.
+DISTROS_ONE_REORDERED = '''\
+    strategy:
+      matrix:
+        distro:
+          # Debian 12 is a supported target, not a build platform.
+          - image: 'debian:12'
+            # audit-ok: eol-distro -- supported target, see the note above
+            pkg_kind: 'deb'
+            name: 'Debian 12'
+            allow_failure: false
+          - name: 'Ubuntu 22.04'
+            image: 'ubuntu:22.04'
+            pkg_kind: 'deb'
+            allow_failure: false
+          - name: 'Rocky 10'
+            image: 'rockylinux/rockylinux:10'
+            pkg_kind: 'rpm'
+            allow_failure: false
+'''
+
+# Every entry reordered, each differently, with `name:` last in one of
+# them and a comment between two keys of another.
+DISTROS_ALL_REORDERED = '''\
+    strategy:
+      matrix:
+        distro:
+          # Debian 12 is a supported target, not a build platform.
+          - allow_failure: false
+            image: 'debian:12'
+            # audit-ok: eol-distro -- supported target, see the note above
+            pkg_kind: 'deb'
+            name: 'Debian 12'
+          - pkg_kind: 'deb'
+            name: 'Ubuntu 22.04'
+            allow_failure: false
+            image: 'ubuntu:22.04'
+          - image: 'rockylinux/rockylinux:10'
+            allow_failure: false
+            name: 'Rocky 10'
+            pkg_kind: 'rpm'
+'''
+
+# A comment between two keys of a normally-ordered entry, which the
+# parser has always handled. Kept as its own case so the key-order work
+# cannot quietly break it.
+DISTROS_COMMENTED_BETWEEN_KEYS = '''\
+    strategy:
+      matrix:
+        distro:
+          - name: 'Debian 12'
+            # audit-ok: eol-distro -- supported target, see the note above
+            image: 'debian:12'
+            pkg_kind: 'deb'
+            allow_failure: false
+          - name: 'Ubuntu 22.04'
+            # A comment here too, because one entry carrying one is how
+            # the brittle version of this parser passed by luck.
+            image: 'ubuntu:22.04'
+            pkg_kind: 'deb'
+            allow_failure: false
+          - name: 'Rocky 10'
+            image: 'rockylinux/rockylinux:10'
+            # Trailing comment inside the last entry.
+            pkg_kind: 'rpm'
+            allow_failure: false
+'''
+
+# The axis key with nothing readable under it. An emptied list and a list
+# this parser cannot read are the same thing from here, which is why
+# either is a failure rather than a leg left out of the comparison.
+DISTROS_EMPTY_AXIS = '''\
+    strategy:
+      matrix:
+        distro:
+          # The entries used to be here.
 '''
 
 WORKFLOW = '''\
@@ -521,6 +615,171 @@ class TestMatrixPartition(unittest.TestCase):
         self.assertEqual(rc, 1, out)
         self.assertIn('are run by NO pull-request job', out)
         self.assertIn('claimed by NO half of it', out)
+
+
+class TestDistroAxisParsing(unittest.TestCase):
+    '''The distro lists are compared with each other, so anything that
+    makes one of them parse short makes that comparison smaller without
+    making it fail. parse_distro_matrix is a text scan over indentation
+    rather than a YAML parse, so the reformats a YAML author is free to
+    make are exactly the drift it has to survive.'''
+
+    def test_the_plain_list_parses(self):
+        self.assertEqual(guard.parse_distro_matrix(DISTROS), DISTROS_PARSED)
+
+    def test_one_entry_with_reordered_keys_parses(self):
+        self.assertEqual(guard.parse_distro_matrix(DISTROS_ONE_REORDERED), DISTROS_PARSED)
+
+    def test_every_entry_reordered_parses(self):
+        self.assertEqual(guard.parse_distro_matrix(DISTROS_ALL_REORDERED), DISTROS_PARSED)
+
+    def test_comments_between_keys_parse(self):
+        self.assertEqual(guard.parse_distro_matrix(DISTROS_COMMENTED_BETWEEN_KEYS),
+                         DISTROS_PARSED)
+
+    def test_an_axis_with_no_readable_entries_is_empty_not_absent(self):
+        # Empty and absent must not be the same value: the measurement
+        # leg has no axis at all and is fine, while an axis that reads as
+        # nothing is a failure.
+        self.assertEqual(guard.parse_distro_matrix(DISTROS_EMPTY_AXIS), [])
+        self.assertIsNone(guard.parse_distro_matrix('  measure:\n    steps:\n'))
+
+    def test_reordered_keys_are_still_compared_end_to_end(self):
+        # The whole point: a reformatted nightly list must still be
+        # compared against the queue's, not dropped from the comparison.
+        broken = NIGHTLY_WORKFLOW.replace(DISTROS, DISTROS_ALL_REORDERED)
+        self.assertNotEqual(broken, NIGHTLY_WORKFLOW)
+        rc, out = run_guard(MATRIX_IDS, nightly=broken)
+        self.assertEqual(rc, 0, out)
+        self.assertIn('agree on 3 distros', out)
+
+    def test_a_distro_dropped_from_a_reordered_list_is_still_reported(self):
+        # Both failure modes at once: the list is reformatted and a
+        # distro is gone from it. The reformat must not be what hides the
+        # missing distro.
+        broken = NIGHTLY_WORKFLOW.replace(DISTROS, DISTROS_ALL_REORDERED).replace('''\
+          - image: 'rockylinux/rockylinux:10'
+            allow_failure: false
+            name: 'Rocky 10'
+            pkg_kind: 'rpm'
+''', '', 1)
+        self.assertNotIn('Rocky 10', broken)
+        rc, out = run_guard(MATRIX_IDS, nightly=broken)
+        self.assertEqual(rc, 1, out)
+        self.assertIn('only in functional-tests.yml:package-matrix: Rocky 10', out)
+
+
+class TestDistroComparisonCannotGoQuiet(unittest.TestCase):
+    '''A distro dropped during a change is the failure mode with no
+    symptom, so the comparison that exists to catch it must not be able
+    to compare nothing and still pass.'''
+
+    def test_axis_that_reads_as_no_distros_fails(self):
+        broken = NIGHTLY_WORKFLOW.replace(DISTROS, DISTROS_EMPTY_AXIS)
+        self.assertNotEqual(broken, NIGHTLY_WORKFLOW)
+        rc, out = run_guard(MATRIX_IDS, nightly=broken)
+        self.assertEqual(rc, 1, out)
+        self.assertIn('distro axis that reads as no distros', out)
+        self.assertIn('nightly-matrix.yml:nightly-legs', out)
+
+    def test_selecting_leg_with_no_distro_list_fails(self):
+        # The axis removed outright rather than emptied: one list is left
+        # and two legs select tests, so nothing would be compared.
+        broken = NIGHTLY_WORKFLOW.replace(DISTROS, '')
+        self.assertNotEqual(broken, NIGHTLY_WORKFLOW)
+        rc, out = run_guard(MATRIX_IDS, nightly=broken)
+        self.assertEqual(rc, 1, out)
+        self.assertIn('only 1 distro list could be read', out)
+        self.assertIn('nightly-matrix.yml:nightly-legs', out)
+
+    def test_measurement_leg_removed_fails(self):
+        # Deleting the measurement job costs no coverage, so every other
+        # assertion here stays green while tests/stestr-timing.txt stops
+        # being refreshed.
+        broken = NIGHTLY_WORKFLOW[:NIGHTLY_WORKFLOW.index('  measure:')]
+        self.assertNotIn('MATRIX_SET: all', broken)
+        rc, out = run_guard(MATRIX_IDS, nightly=broken)
+        self.assertEqual(rc, 1, out)
+        self.assertIn('no workflow job runs the matrix with MATRIX_SET=all', out)
+        self.assertIn('stestr-timing.txt', out)
+
+
+def _shell_makefile_selector(target, repo_root):
+    '''Run run-matrix-entry.sh's own makefile_selector against a tree.
+
+    The function is lifted out of the real script and evaluated, so this
+    exercises the awk CI actually runs rather than a copy of it. Returns
+    (returncode, stdout).'''
+    runner = os.path.join(_REPO_ROOT, 'tools', 'ci', 'run-matrix-entry.sh')
+    with open(runner, encoding='utf-8') as f:
+        text = f.read()
+    m = re.search(r'^makefile_selector\(\)\s*\{\n.*?^\}$', text, re.DOTALL | re.MULTILINE)
+    if not m:
+        raise AssertionError('makefile_selector() not found in %s -- if it was renamed or '
+                             'reshaped, this test has to follow it' % runner)
+    script = 'set -uo pipefail\nREPO_ROOT=%s\n%s\nmakefile_selector %s\n' % (
+        repo_root, m.group(0), target)
+    proc = subprocess.run([shutil.which('bash') or '/bin/bash', '-c', script],
+                          capture_output=True, text=True)
+    return proc.returncode, proc.stdout.strip()
+
+
+class TestSelectorExtractorsAgree(unittest.TestCase):
+    '''Two independent parsers read the same Makefile recipe.
+
+    tools/ci/run-matrix-entry.sh lifts the selector with awk, taking the
+    first recipe line that begins with a double quote. This guard lifts
+    it with _quoted_tokens, taking the first quoted token not preceded by
+    --exclude-regex. They agree on today's recipes by construction, not
+    by rule, so the agreement is asserted: if they ever diverged, the
+    entry runner would select one regex while the guard proved another
+    one correct, and both would look fine.'''
+
+    def _targets(self, makefile_text):
+        targets = re.findall(r'^(test-container-[a-z0-9-]+):', makefile_text, re.MULTILINE)
+        self.assertTrue(targets, 'no test-container-* targets found')
+        return targets
+
+    def _assert_agree(self, target, makefile_text, repo_root):
+        includes, _excludes = guard.parse_makefile_target(makefile_text, target)
+        rc, shell_selector = _shell_makefile_selector(target, repo_root)
+        if not includes:
+            # No positional selector (the exclude-only catch-all). The
+            # shell must refuse rather than lift something else.
+            self.assertNotEqual(rc, 0,
+                                '%s has no positional selector for the guard but the shell '
+                                'found %r' % (target, shell_selector))
+            return
+        self.assertEqual(len(includes), 1,
+                         '%s has %d positional selectors; the shell can only lift one'
+                         % (target, len(includes)))
+        self.assertEqual(rc, 0, '%s: the shell refused a target the guard read as %r'
+                         % (target, includes[0]))
+        self.assertEqual(shell_selector, includes[0],
+                         '%s: the entry runner would select %r while the guard validated %r'
+                         % (target, shell_selector, includes[0]))
+
+    def test_every_real_target_agrees(self):
+        with open(os.path.join(_REPO_ROOT, 'Makefile'), encoding='utf-8') as f:
+            makefile_text = f.read()
+        for target in self._targets(makefile_text):
+            with self.subTest(target=target):
+                self._assert_agree(target, makefile_text, _REPO_ROOT)
+
+    def test_the_comparison_is_not_vacuous(self):
+        # The drift this guards against, made real: --exclude-regex moved
+        # onto its own line. The shell's rule then lifts the exclusion as
+        # the selection while the guard still reads the right one, so the
+        # check above must fail on such a recipe or it proves nothing.
+        reformatted = MAKEFILE.replace(
+            '\t\t\t--exclude-regex "(test_info_malicious|test_bench)" \\\n',
+            '\t\t\t--exclude-regex \\\n\t\t\t"(test_info_malicious|test_bench)" \\\n')
+        self.assertNotEqual(reformatted, MAKEFILE)
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, 'Makefile'), 'w') as f:
+                f.write(reformatted)
+            with self.assertRaises(AssertionError):
+                self._assert_agree('test-container-matrix-queue', reformatted, d)
 
 
 if __name__ == '__main__':

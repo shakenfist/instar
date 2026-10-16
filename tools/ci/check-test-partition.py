@@ -62,7 +62,15 @@ How it stays honest (no duplicated source of truth):
     their entries carry a Debian 12 end-of-life rationale and an audit
     marker that JSON cannot hold, so this is the thing that keeps them
     in step. A distro present in one list and not the other is reported
-    by name.
+    by name. Reading those lists is a text scan, so a list that reads as
+    no distros at all, or a run with fewer than two readable lists while
+    more than one leg selects tests, is a failure in its own right --
+    otherwise a reformatted list would leave the comparison with nothing
+    to compare and the run would still be green.
+  - A leg running the selector-free set must exist too. It contributes no
+    coverage, so no other assertion here needs it, but it is the only run
+    that measures a duration for every test and so the only thing
+    tests/stestr-timing.txt can be derived from.
   - The full test-ID universe comes from `stestr list` (fed on stdin),
     i.e. stestr's own discovery -- not a reimplementation.
 
@@ -356,7 +364,17 @@ def parse_distro_matrix(job_text):
     The entries are read rather than named, so the comments and audit
     markers that live between them -- which is why the two lists are
     copies rather than a shared file -- do not have to be understood
-    here.'''
+    here.
+
+    An entry begins at its `-` and its keys are read in whatever order
+    they appear, with comment lines between two keys of one entry
+    tolerated (the Debian 12 end-of-life marker is exactly that). The
+    key order matters because this is a text scan over indentation
+    rather than a YAML parse: an earlier version keyed each entry on
+    `- name:` being its first line, so a YAML-equivalent reformat
+    putting `image:` first would have returned a shorter list -- and a
+    shorter list is how the comparison in check_matrix_partition goes
+    quiet rather than loud.'''
     lines = job_text.splitlines()
     start = None
     indent = 0
@@ -376,13 +394,17 @@ def parse_distro_matrix(job_text):
             continue
         if len(line) - len(line.lstrip()) <= indent:
             break
-        m = re.match(r'^\s*-\s*name:\s*\'?([^\'\n]*?)\'?\s*$', line)
+        m = re.match(r'^\s*-\s*(.*)$', line)
         if m:
-            current = {'name': m.group(1)}
+            current = {}
             entries.append(current)
-            continue
-        m = re.match(r'^\s*([a-z_]+):\s*\'?([^\'\n]*?)\'?\s*$', line)
-        if m and current is not None:
+            rest = m.group(1)
+        else:
+            if current is None:
+                continue
+            rest = line.strip()
+        m = re.match(r'^([a-z_]+):\s*\'?([^\'\n]*?)\'?\s*$', rest)
+        if m:
             current[m.group(1)] = m.group(2)
     return [(e.get('name', ''), e.get('image', ''), e.get('pkg_kind', '')) for e in entries]
 
@@ -531,6 +553,26 @@ def check_matrix_partition(makefile_text, workflows, entry_runner_text,
                        % (name, set_targets[name]))
         rc = 1
 
+    # The set that passes no selector is checked separately, because the
+    # assertion above deliberately skips it: it contributes no coverage,
+    # so every arithmetic check here would still pass with no leg running
+    # it. It is nonetheless the only run that measures a duration for
+    # every test, and so the only place tests/stestr-timing.txt can be
+    # derived from. Losing the leg would stop that refresh with nothing
+    # going red, which is the same shape of silent loss as a dropped
+    # test.
+    measuring = sorted(name for name, target in set_targets.items() if not target)
+    if measuring and not any(job.matrix_set in measuring for job in jobs):
+        out.append('')
+        out.append('FAIL: no workflow job runs the matrix with MATRIX_SET=%s, the '
+                   'selector-free set that measures every test:' % ', '.join(measuring))
+        out.append('  tests/stestr-timing.txt can only be derived from a run that '
+                   'executes the whole suite in one stestr repository, so without such '
+                   'a leg the committed timings stop being refreshed and nothing says so.')
+        out.append('  Restore the measurement job, or delete the set from '
+                   'tools/ci/run-matrix-entry.sh if the refresh is genuinely gone.')
+        rc = 1
+
     selecting = [job for job in jobs if job.selector]
     if selecting:
         claims = {tid: [job.matrix_set for job in selecting if job.selector.selects(tid)]
@@ -579,8 +621,50 @@ def check_matrix_partition(makefile_text, workflows, entry_runner_text,
     # so comparing them here is what keeps them in step. A distro present
     # in one and not the other loses a whole distro's coverage with no
     # symptom.
+    #
+    # A leg whose axis is present but reads as no distros at all is a
+    # failure rather than a leg to leave out of the comparison.
+    # parse_distro_matrix is a text scan, so an unreadable list and a
+    # deliberately emptied one look identical to it -- and dropping such
+    # a leg would leave one list with nothing to compare against, which
+    # is this check going quiet while still reporting PASS.
+    empty_axis = [job for job in jobs if job.distros is not None and not job.distros]
+    if empty_axis:
+        out.append('')
+        out.append('FAIL: %d matrix leg(s) have a distro axis that reads as no distros:'
+                   % len(empty_axis))
+        for job in empty_axis:
+            out.append('  %s (set=%s)' % (job.label, job.matrix_set))
+        out.append('')
+        out.append('Either the axis really is empty -- in which case that leg runs nothing '
+                   '-- or its entries no longer parse, and the two cannot be told apart '
+                   'from here. If the entries were reformatted, teach parse_distro_matrix '
+                   'in tools/ci/check-test-partition.py the new shape; an unparsed list '
+                   'silently removes the leg from the comparison below.')
+        rc = 1
+
     with_distros = [job for job in jobs if job.distros]
-    if len(with_distros) > 1:
+    if len(with_distros) < 2 and len(selecting) > 1:
+        # More than one leg selects tests, so there is more than one list
+        # that has to stay in step, and fewer than two of them could be
+        # read. Nothing below would compare anything, and the run would
+        # still be green.
+        out.append('')
+        out.append('FAIL: %d matrix legs select tests but only %d distro list could be '
+                   'read, so nothing checked the lists against each other:'
+                   % (len(selecting), len(with_distros)))
+        for job in jobs:
+            out.append('  %-34s set=%-8s %s'
+                       % (job.label, job.matrix_set,
+                          'no distro axis' if job.distros is None
+                          else '%d distros' % len(job.distros)))
+        out.append('')
+        out.append('The lists are deliberately copies of each other, so this comparison is '
+                   'the only thing that keeps them in step. With one list there is nothing '
+                   'to compare, and a distro dropped from the other side would not be '
+                   'reported by anything.')
+        rc = 1
+    elif len(with_distros) > 1:
         reference = with_distros[0]
         ref_set = set(reference.distros)
         for job in with_distros[1:]:
@@ -609,11 +693,13 @@ def check_matrix_partition(makefile_text, workflows, entry_runner_text,
             out.append('      %d distro lists agree on %d distros.'
                        % (len(with_distros), len(with_distros[0].distros)))
         else:
-            # Not a failure on its own -- a single list has nothing to
-            # disagree with -- but it must not read as a comparison that
-            # happened, or the check could go quiet without saying so.
-            out.append('      only %d distro list found; nothing to compare it with.'
-                       % len(with_distros))
+            # Reachable only when at most one leg selects tests, because
+            # more than one selecting leg with fewer than two readable
+            # lists is a failure above. It still says so rather than
+            # staying silent, so a run can never look like a comparison
+            # that happened.
+            out.append('      only %d distro list found; nothing to compare it with '
+                       '(at most one matrix leg selects tests).' % len(with_distros))
     return rc, out
 
 

@@ -47,8 +47,18 @@
 # because tools/ci/check-test-partition.py reads them from there to
 # prove the two are exact complements of what a matrix entry used to
 # run. This script lifts the selector out of the named target rather
-# than carrying a copy, so there is nothing here that can drift from
-# what the guard checks.
+# than carrying a copy, so no regex is restated here.
+#
+# What can still drift is how it is lifted: the awk below and the guard's
+# own extractor read the same recipe by different rules -- awk takes the
+# first recipe line beginning with a double quote, the guard takes the
+# first quoted token not preceded by --exclude-regex. They agree on
+# today's recipes, and a recipe reformat (--exclude-regex on a line of
+# its own, say) could make this script select the exclusion while the
+# guard went on validating the selection. That agreement is therefore
+# asserted rather than assumed, by
+# tools/ci/test_check_test_partition.py, over every test-container-*
+# target in the Makefile.
 #
 # Exits with the functional runner's exit code, so the matrix entry
 # fails exactly when the suite does.

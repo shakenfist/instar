@@ -211,6 +211,29 @@ expect_status "a missing tree path fails" 1 "${WORK}/no-such-tree"
 expect_status "a file given as the tree path fails" 1 "${TREE}/downloaded/in-scope.vhd"
 expect_status "a tree with no downloaded/ fails" 1 "${WORK}"
 
+start "a downloaded/ with no images fails rather than succeeding quietly"
+# The directory exists, so the path is right and the caller gets no hint
+# that nothing happened: an extension-list typo or a layout change in
+# instar-testdata lands here, and a warning plus exit 0 would surface
+# only as a slow job and as disk_size comparisons measuring git's
+# allocation. The message has to say what was expected, because the
+# caller that sees it may well be private-ci's image build rather than
+# anyone in this repository.
+EMPTY_TREE="$(make_tree no-images)"
+allocated "${EMPTY_TREE}/downloaded/notes.txt"
+allocated "${EMPTY_TREE}/downloaded/backing.raw"
+STATUS=0
+OUTPUT="$("${BASH_BIN}" "${SCRIPT}" "${EMPTY_TREE}" 2>&1)" || STATUS=$?
+if [ "${STATUS}" -ne 0 ]; then
+    ok "exits non-zero when nothing matched"
+else
+    fail "expected a non-zero exit, got 0: ${OUTPUT}"
+fi
+case "${OUTPUT}" in
+    *"no images matched"*"*.qcow2"*) ok "says what it expected to find" ;;
+    *) fail "expected the extension list in '${OUTPUT}'" ;;
+esac
+
 start "a failing copy is a failing run"
 # The loud-failure half of the contract. An unwritable directory is the
 # cheapest way to make cp fail; root ignores the mode bits, so there is

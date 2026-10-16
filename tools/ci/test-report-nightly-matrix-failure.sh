@@ -371,6 +371,66 @@ else
     fail "miscounted the failing tests"
 fi
 
+# --- The timing refresh is a different kind of failure -----------------
+# The measurement leg can go red without a test failing: it publishes the
+# refreshed timings after the suite, and a bug there used to produce a red
+# run and no issue at all. The report for it must not read as a distro
+# divergence, or a reader spends the morning looking for one.
+start "a timing-refresh report says it is the publisher, not a test"
+{
+    echo "Comparing the measurement against tests/stestr-timing.txt"
+    echo "### Verdict: material"
+    echo "remote: Permission to shakenfist/instar.git denied to github-actions[bot]."
+    echo "fatal: unable to access 'https://github.com/shakenfist/instar/': error 403"
+} > "${WORK}/publish.log"
+OUT="${WORK}/timing-report.log"
+STATUS=0
+"${REPORTER}" --kind timing-refresh "Debian 13 (full suite)" "debian:13" \
+    "${WORK}/publish.log" --dry-run > "${OUT}" 2>&1 || STATUS=$?
+if [ "${STATUS}" -ne 0 ]; then
+    fail "the timing-refresh dry run exited ${STATUS}"
+    cat "${OUT}" >&2
+else
+    ok "exited zero"
+fi
+if grep -q "would file an issue titled 'Nightly timing refresh failure'" "${OUT}"; then
+    ok "the title names the timing refresh"
+else
+    fail "the title does not name the timing refresh"
+fi
+if grep -q 'No test failed' "${OUT}" && grep -q 'publish-stestr-timing.sh' "${OUT}"; then
+    ok "the body says no test failed and names the publisher"
+else
+    fail "the body does not make clear that the refresh broke rather than a test"
+fi
+if grep -q 'qemu-img divergence at this' "${OUT}"; then
+    fail "the body still carries the cross-distro reasoning, which does not apply"
+else
+    ok "the cross-distro reasoning is left out"
+fi
+if grep -q 'dedup_key: nightly-timing-refresh' "${OUT}"; then
+    ok "it dedups on its own key rather than the measurement leg's distro"
+else
+    fail "the dedup key is not the timing-refresh one"
+fi
+if grep -q 'error 403' "${OUT}"; then
+    ok "the excerpt is the publisher's own output"
+else
+    fail "the excerpt does not quote the publisher's output"
+fi
+
+start "a timing-refresh failure does not collide with the distro report"
+# Same leg, same log, default kind: the title and key must be the distro
+# ones, so one cannot dedup into the other.
+OUT="${WORK}/timing-as-distro.log"
+"${REPORTER}" "Debian 13 (full suite)" "debian:13" "${WORK}/publish.log" --dry-run \
+    > "${OUT}" 2>&1
+if grep -q 'dedup_key: nightly-matrix:Debian 13 (full suite)' "${OUT}"; then
+    ok "the default kind still keys on the distro"
+else
+    fail "the default kind's dedup key changed"
+fi
+
 # --- Argument handling -------------------------------------------------
 start "bad arguments are rejected"
 if "${REPORTER}" "Rocky 9" --dry-run > /dev/null 2>&1; then
@@ -382,6 +442,11 @@ if "${REPORTER}" a b c --nonsense > /dev/null 2>&1; then
     fail "an unknown flag was accepted"
 else
     ok "unknown flag rejected"
+fi
+if "${REPORTER}" a b c --kind publisher > /dev/null 2>&1; then
+    fail "an unknown --kind was accepted"
+else
+    ok "unknown --kind rejected"
 fi
 
 echo ""

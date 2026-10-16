@@ -164,16 +164,52 @@ start "the derived durations match what stestr itself recorded"
 recorded_matches_derived "test_toy.TestToy.test_long" "${LONG_RECORDED}"
 recorded_matches_derived "test_toy.TestToy.test_short" "${SHORT_RECORDED}"
 
-start "a repository with no recorded run is refused, not silently empty"
+start "a repository directory with no times store is refused"
+NODBM="${WORK}/nodbm"
+mkdir -p "${NODBM}/.stestr"
+if "${VENV}/bin/python3" "${GENERATE}" "${NODBM}/.stestr" "${WORK}/should-not-exist.txt" \
+    >"${WORK}/nodbm.out" 2>"${WORK}/nodbm.err"; then
+    fail "generator exited 0 against a repository with no times store"
+elif [ -e "${WORK}/should-not-exist.txt" ]; then
+    fail "generator wrote an output file despite refusing"
+elif ! grep -q 'could not open stestr repository' "${WORK}/nodbm.err"; then
+    fail "a missing times store was refused by the wrong branch:"
+    sed 's/^/      /' "${WORK}/nodbm.err" >&2
+else
+    ok "a repository with no times store is refused and writes nothing"
+fi
+
+start "a repository whose times store exists but is empty is refused"
+# A REAL but empty dbm, deliberately. An absent times.dbm raises OSError
+# and is caught by the branch above, so building this case as a bare
+# `mkdir .stestr` left the generator's "no recorded durations" guard
+# unexercised: the whole guard could be deleted with every test here
+# still green, and a repository that had been initialised but never run
+# would then have written an empty timing file over the committed one.
+# The assertion on the message is what pins which of the two branches
+# refused it.
 EMPTYREPO="${WORK}/emptyrepo"
 mkdir -p "${EMPTYREPO}/.stestr"
-if "${VENV}/bin/python3" "${GENERATE}" "${EMPTYREPO}/.stestr" "${WORK}/should-not-exist.txt" \
+"${VENV}/bin/python3" - "${EMPTYREPO}/.stestr/times.dbm" <<'PY'
+import dbm.dumb as dumbdbm
+import sys
+
+# Mode 'c' creates the store and leaves it empty, which is the state
+# stestr's own repository is in before any test has been run.
+dumbdbm.open(sys.argv[1], 'c').close()
+PY
+if [ ! -e "${EMPTYREPO}/.stestr/times.dbm.dir" ]; then
+    fail "could not create an empty times.dbm to test against"
+elif "${VENV}/bin/python3" "${GENERATE}" "${EMPTYREPO}/.stestr" "${WORK}/should-not-exist.txt" \
     >"${WORK}/empty.out" 2>"${WORK}/empty.err"; then
     fail "generator exited 0 against a repository with no recorded durations"
 elif [ -e "${WORK}/should-not-exist.txt" ]; then
     fail "generator wrote an output file despite refusing"
+elif ! grep -q 'no recorded test durations' "${WORK}/empty.err"; then
+    fail "an empty times store was refused by the wrong branch:"
+    sed 's/^/      /' "${WORK}/empty.err" >&2
 else
-    ok "an empty repository is refused and writes nothing"
+    ok "an empty times store is refused and writes nothing"
 fi
 
 start "a nonexistent repository path is refused"
