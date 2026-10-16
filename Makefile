@@ -818,20 +818,25 @@ test-container-convert-vhd: instar-devcontainer instar
 # still caught at pull-request time; what this gives up is only the
 # distro axis, and that axis moves when a distro ships a new qemu, not
 # when instar changes, so a nightly run across all seven distros is
-# still a finer cadence than the signal. The six:
+# still a finer cadence than the signal.
 #
-#   test_convert.TestConvertVhdToQcow2Roundtrip.test_hyperv_vhd_qcow2_roundtrip
-#   test_convert.TestConvertVhdToQcow2Roundtrip.test_virtualpc_vhd_qcow2_roundtrip
-#   test_convert.TestConvertVhdToRaw.test_convert_hyperv_dynamic_vhd
-#   test_convert.TestConvertVhdToRaw.test_convert_virtualpc_vhd
-#   test_convert.TestConvertVhdCompare.test_compare_hyperv_vhd_vs_raw
-#   test_convert.TestConvertVhdCompare.test_compare_virtualpc_vhd_vs_raw
+# Which six is not restated in prose here. They are the alternation in
+# test-container-matrix-nightly's regex below, and the negated copy of
+# it in this target's; tools/ci/check-test-partition.py reads both
+# recipes and fails if the two stop being exact complements or if a test
+# is claimed by both. A prose list would be a third copy that nothing
+# checks, and it is the only one of the three that can drift silently.
 #
-# They are named by test id rather than by class deliberately. All
-# three of those classes also hold sub-second fixed and zero-filled
-# cases -- test_convert_vhd_fixed, test_convert_vhd_d2v_zerofilled and
+# They are named by test id rather than by class deliberately.
+# TestConvertVhdToRaw and TestConvertVhdCompare also hold sub-second
+# fixed and zero-filled cases -- test_convert_vhd_fixed,
+# test_convert_vhd_d2v_zerofilled and
 # test_compare_vhd_d2v_zerofilled_vs_raw -- which stay on the gate and
 # which a class-level selector would move off it for no gain.
+# TestConvertVhdToQcow2Roundtrip is the one class that holds only moved
+# tests, so it alone could be selected whole; naming all six by id keeps
+# one rule instead of two, and stops a sub-second case added to that
+# class later from falling off the gate silently.
 #
 # A literal "$" in a recipe is written "$$" so make passes it through;
 # both regexes anchor the test id with "$" to keep a future test whose
@@ -882,6 +887,16 @@ test-container-matrix-queue: instar-devcontainer instar
 # tests, named by test id, run across all seven distros once a day
 # instead of on every merge. See test-container-matrix-queue for the
 # argument and for why the regexes are literal here.
+#
+# Three things the queue target carries are deliberately absent. Its
+# --exclude-regex has nothing to match: this selection is six named ids
+# in test_convert, none of them a malicious-image or benchmark test.
+# INSTAR_REQUIRE_LIBVHDI and --system-site-packages are for the
+# differencing tests, whose oracle is libvhdi -- those live in
+# test_differencing and are the only callers of the pyvhdi helpers in
+# tests/base.py, so nothing in this selection can reach that oracle and
+# an isolated venv costs it nothing. All three go back in if this
+# selection ever grows past the six.
 test-container-matrix-nightly: instar-devcontainer instar
 	@echo "Running the nightly matrix selection inside container..."
 	@if [ ! -d "$(TESTDATA_PATH)" ]; then \

@@ -10,6 +10,13 @@
 # data yet, must still run the suite). Both are asserted against the
 # real script and a real stestr repository -- not by reading the shell.
 #
+# A third case matters for the same reason the second does: this script
+# runs at the head of every testdata job, so a malformed committed file
+# must be a warning and a blind partition rather than a hard failure
+# across all of them at once. Both halves of that are asserted -- a file
+# with some bad lines still seeds the good ones, and a file with no
+# usable line at all exits zero.
+#
 # stestr and its subunit/testtools dependencies are not assumed to be on
 # the host (PEP 668), so this creates its own throwaway venv from the
 # same tests/requirements.txt the suite itself uses, keeping the
@@ -155,6 +162,85 @@ else
     fail "scheduler did not isolate the long test onto its own worker:"
     printf '%s\n' "${PART_OUT}" >"${WORK}/partition.out"
     sed 's/^/      /' "${WORK}/partition.out" >&2
+fi
+
+# --- A corrupt timing file must not take CI down -----------------------
+# This script runs at the head of every testdata job, so a malformed
+# committed file -- one bad line from an unattended nightly refresh --
+# would otherwise hard-fail all of them at once, under `set -e`, for a
+# file that changes which worker a test runs on and nothing about what is
+# tested. The absence of the file is explicitly not an error, so its
+# corruption must not be either.
+start "a malformed line is skipped and the rest of the file still loads"
+MIXED="${WORK}/timing-mixed.txt"
+{
+    printf 'demo.TestMixed.test_good_long\t11.75\n'
+    printf 'demo.TestMixed.test_no_tab 4.00\n'
+    printf 'demo.TestMixed.test_not_a_number\tbanana\n'
+    printf 'demo.TestMixed.test_negative\t-3.00\n'
+    printf 'demo.TestMixed.test_good_short\t0.20\n'
+} >"${MIXED}"
+RUNDIR="${WORK}/run-mixed"
+mkdir -p "${RUNDIR}"
+(
+    cd "${RUNDIR}" &&
+        "${SEED}" "${STESTR}" "${MIXED}" \
+            >"${WORK}/mixed.out" 2>"${WORK}/mixed.err"
+)
+RC=$?
+if [ "${RC}" -ne 0 ]; then
+    fail "a file with three bad lines exited ${RC}; it must fail open"
+    sed 's/^/      /' "${WORK}/mixed.err" >&2
+elif [ ! -d "${RUNDIR}/.stestr" ]; then
+    fail "the usable lines were not loaded into a repository"
+else
+    ok "exits 0 and still seeds the repository"
+fi
+if grep -q "skipping" "${WORK}/mixed.err"; then
+    ok "said which lines it skipped"
+else
+    fail "skipped lines silently"
+fi
+if [ -d "${RUNDIR}/.stestr" ]; then
+    GOOD_LONG="$(query_duration "${RUNDIR}" "demo.TestMixed.test_good_long")"
+    GOOD_SHORT="$(query_duration "${RUNDIR}" "demo.TestMixed.test_good_short")"
+    if [ "${GOOD_LONG}" = "MISSING" ] || [ "${GOOD_SHORT}" = "MISSING" ]; then
+        fail "a bad line cost the good lines their durations (${GOOD_LONG}, ${GOOD_SHORT})"
+    elif ! awk -v d="${GOOD_LONG}" 'BEGIN { exit !(d > 11.0 && d < 12.5) }'; then
+        fail "demo.TestMixed.test_good_long duration is ${GOOD_LONG}, expected ~11.75"
+    else
+        ok "both good lines kept their durations (${GOOD_LONG}s, ${GOOD_SHORT}s)"
+    fi
+    for BAD in test_no_tab test_not_a_number test_negative; do
+        if [ "$(query_duration "${RUNDIR}" "demo.TestMixed.${BAD}")" = "MISSING" ]; then
+            ok "demo.TestMixed.${BAD} was not invented a duration"
+        else
+            fail "demo.TestMixed.${BAD} got a duration from an unusable line"
+        fi
+    done
+fi
+
+start "a wholly unusable timing file warns and partitions blind"
+GARBAGE="${WORK}/timing-garbage.txt"
+printf 'this is not a timing file at all\nnor is this\n' >"${GARBAGE}"
+RUNDIR="${WORK}/run-garbage"
+mkdir -p "${RUNDIR}"
+(
+    cd "${RUNDIR}" &&
+        "${SEED}" "${STESTR}" "${GARBAGE}" \
+            >"${WORK}/garbage.out" 2>"${WORK}/garbage.err"
+)
+RC=$?
+if [ "${RC}" -ne 0 ]; then
+    fail "an unusable timing file exited ${RC}; every testdata job would have failed"
+    sed 's/^/      /' "${WORK}/garbage.err" >&2
+else
+    ok "exits 0"
+fi
+if grep -q "partition this run blind" "${WORK}/garbage.err"; then
+    ok "warned that the run will be partitioned blind"
+else
+    fail "did not say what it was going to do instead"
 fi
 
 start "wrong argument count is refused with a usage message"

@@ -230,14 +230,17 @@ jobs:
       - name: Test the stestr timing seed
         run: tools/ci/test-seed-stestr-timing.sh
 
-      # tests/stestr-timing.subunit (the file the step above seeds
-      # from) is derived, not hand-maintained: this generator reads
-      # the per-test durations a real "stestr run" already recorded in
-      # its own repository and re-emits them as a fresh subunit v2
-      # stream. The test runs a real (tiny, toy) suite to produce a
-      # real repository to derive from, so it is checking the
-      # generator against stestr's own recorded numbers, not a value
-      # this test invents.
+      # tests/stestr-timing.txt (the file the step above seeds from)
+      # is derived, not hand-maintained: this generator reads the
+      # per-test durations a real "stestr run" already recorded in its
+      # own repository and re-emits them as sorted
+      # "<test id><TAB><duration>" text, rounded to 0.01s. Text rather
+      # than a subunit stream, and rounded, so a nightly refresh of the
+      # file stays a small diff instead of a new binary blob every
+      # night. The test runs a real (tiny, toy) suite to produce a real
+      # repository to derive from, so it is checking the generator
+      # against stestr's own recorded numbers, not a value this test
+      # invents.
       - name: Test the stestr timing generator
         run: tools/ci/test-generate-stestr-timing.sh
 
@@ -246,8 +249,11 @@ jobs:
       # that decision can be wrong are silent -- a pull request every
       # morning for measurement noise, or none ever while the committed
       # hint rots -- so the publisher is exercised here over synthetic
-      # measurements, all of them through its --dry-run so no branch is
-      # pushed and no API is called.
+      # measurements. The verdict cases run through --dry-run; the write
+      # path runs for real against a throwaway repository with a file://
+      # remote and a stubbed gh, because --dry-run returns before
+      # reaching it. Nothing is pushed anywhere outside the test's own
+      # temp directory and no API is called.
       - name: Test the stestr timing publisher
         run: tools/ci/test-publish-stestr-timing.sh
 
@@ -765,10 +771,10 @@ jobs:
           # bookworm reached end of life on 2026-06-10, but
           # docs/installation.md and README.md promise Debian 11 and
           # newer, and this entry is how that promise is kept honest:
-          # it installs the shipped .deb on bookworm and runs the full
-          # suite against bookworm's own qemu-img. Remove it only
-          # together with the published support matrix, not to settle
-          # an audit finding.
+          # it installs the shipped .deb on bookworm and runs the
+          # merge-queue half of the suite against bookworm's own
+          # qemu-img. Remove it only together with the published
+          # support matrix, not to settle an audit finding.
           - name: 'Debian 12'
             # audit-ok: eol-distro -- supported target, see the note above
             image: 'debian:12'

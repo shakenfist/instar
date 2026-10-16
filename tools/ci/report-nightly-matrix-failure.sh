@@ -69,9 +69,15 @@
 # a leg that cannot file its issue has already failed, and masking its
 # verdict with the reporter's would lose the distro's result.
 #
+# The log excerpt is untrusted: it is captured test output, and this
+# suite's test output carries the bytes of deliberately malformed
+# images. It is sanitised before it reaches the issue body -- see the
+# note above the sanitising step below.
+#
 # tools/ci/test-report-nightly-matrix-failure.sh exercises this against
 # synthetic logs, including a leg that died before running any test at
-# all.
+# all and one whose bytes try to escape the Markdown code fence and
+# forge another distro's deduplication key.
 
 set -euo pipefail
 
@@ -148,7 +154,8 @@ fi
 TESTS_FILE="$(mktemp)"
 BODY_FILE="$(mktemp)"
 EXCERPT_FILE="$(mktemp)"
-trap 'rm -f "${TESTS_FILE}" "${BODY_FILE}" "${EXCERPT_FILE}"' EXIT
+SANITISED_FILE="$(mktemp)"
+trap 'rm -f "${TESTS_FILE}" "${BODY_FILE}" "${EXCERPT_FILE}" "${SANITISED_FILE}"' EXIT
 
 sed -n 's/^{[0-9][0-9]*} \([^ ][^ ]*\) \[[^]]*\] \.\.\. FAILED$/\1/p' \
     "${LOG_FILE}" 2> /dev/null | sort -u > "${TESTS_FILE}" || true
@@ -185,6 +192,36 @@ else
         | tr -d '\000' \
         | "${SCRUB[@]}" 2> /dev/null > "${EXCERPT_FILE}" || true
 fi
+
+# The excerpt is untrusted input. It is captured test output, and this
+# suite's test output carries the bytes of deliberately malformed
+# images, so take away the two things it could otherwise do to the issue
+# body it is about to be pasted into.
+#
+# Close the fence. A line of three or more backticks ends the Markdown
+# code block, and everything after it renders as Markdown instead of as
+# log text -- which is also the only way an `@name` or a `#543` in
+# fixture bytes becomes a real mention or a cross-reference on somebody
+# else's issue, since GitHub linkifies neither inside an intact fence.
+# Holding the fence is therefore the fix for all three. A would-be
+# closing line has its backticks turned into apostrophes; no other byte
+# of the excerpt is touched.
+#
+# Inject a dedup marker. The deduplication below matches the hidden
+# "<!-- dedup_key: ... -->" comment with a plain substring test over the
+# whole body, which knows nothing about Markdown structure -- so an
+# excerpt carrying that text could collapse this report into another
+# distro's issue, or make a new report look like an existing one. No
+# HTML comment can be opened from inside the excerpt.
+FENCE_LINE_RE='^\( \{0,3\}\)```*[[:space:]]*$'
+if ! sed -e "s|${FENCE_LINE_RE}|\\1'''|" -e 's|<!--|<! --|g' \
+        "${EXCERPT_FILE}" > "${SANITISED_FILE}" 2> /dev/null; then
+    # Dropping the excerpt loses diagnostic detail the job log still
+    # has; pasting an unsanitised one in cannot be the fallback.
+    printf '(the log excerpt could not be sanitised, and was dropped)\n' \
+        > "${SANITISED_FILE}"
+fi
+cp "${SANITISED_FILE}" "${EXCERPT_FILE}"
 
 # A machine-readable marker in an otherwise human-readable body. The
 # fuzz reporter makes its whole body JSON, which suits a crash record
@@ -297,7 +334,8 @@ if [ "${DEDUP}" -eq 1 ]; then
         echo "'${TITLE}' already has open issue #${EXISTING};" \
             "commenting instead of filing a duplicate"
         COMMENT_FILE="$(mktemp)"
-        trap 'rm -f "${TESTS_FILE}" "${BODY_FILE}" "${EXCERPT_FILE}" "${COMMENT_FILE}"' EXIT
+        trap 'rm -f "${TESTS_FILE}" "${BODY_FILE}" "${EXCERPT_FILE}" \
+            "${SANITISED_FILE}" "${COMMENT_FILE}"' EXIT
         # shellcheck disable=SC2016
         {
             if [ "${KIND}" = "timing-refresh" ]; then

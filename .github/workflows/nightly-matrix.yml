@@ -233,9 +233,12 @@ jobs:
         run: ${GITHUB_WORKSPACE}/instar/tools/ci/prepare-testdata.sh
 
       # git-lfs writes every image fully allocated, and the tree is
-      # 7.46 GiB of mostly zeros. Every testdata consumer runs this ahead
-      # of the suite, through one shared script so that the extension
-      # list and the directory scope cannot drift between them.
+      # 7.46 GiB of mostly zeros. Every job that runs the Python suite
+      # over this tree runs this ahead of it -- coverage-fuzz.yml is the
+      # one testdata consumer that does not, because it seeds fuzz
+      # corpora and compares no allocated sizes -- through one shared
+      # script so that the extension list and the directory scope cannot
+      # drift between them.
       - name: Resparsify test images
         run: ${GITHUB_WORKSPACE}/instar/tools/ci/resparsify-testdata.sh "${TESTDATA_PATH}"
 

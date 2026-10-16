@@ -654,6 +654,127 @@ for what the unfixed version cost across repositories, and the fleet
 audit
 [merge-group-cancellation](https://github.com/shakenfist/development/blob/main/audits/merge-group-cancellation.md).
 
+### The nightly matrix's timing refresh and failure reporting
+
+`nightly-matrix.yml` runs unattended, so everything it produces is
+produced by a script: nobody opens the Actions tab on a morning when
+nothing seems wrong. It fires at **22:00 UTC** — four hours ahead of the
+other daily schedules, because the shared `xl` pool has a measured
+ceiling of about three concurrent legs and this is the largest nightly
+the repository runs — and holds two shapes of job:
+
+| Job | Runs | Produces |
+|-----|------|----------|
+| `nightly-legs` (seven, one per distro) | the six moved VHD conversion tests (`MATRIX_SET=nightly`) | a GitHub issue per failing distro, and the leg's log as an artifact |
+| `measure` (one, Debian 13) | the **whole** suite (`MATRIX_SET=all`), deliberately unseeded | a pull request refreshing `tests/stestr-timing.txt`, the measurement itself as a 30-day artifact, and an issue if either the suite or the refresh fails |
+
+`measure` is redundant as coverage — every test in it either still gates
+a merge or runs on the seven legs above — and that is not why it is
+there. It is the only job left in CI that executes the whole suite in a
+single stestr repository, which makes it the only place the timing data
+can be measured rather than guessed. It is also the only job in the
+workflow with write permissions; the workflow level is `contents: read`,
+because the seven legs run instar and `qemu-img` over deliberately
+malicious images outside the KVM sandbox.
+
+**The timing data and the four scripts that maintain it.**
+`tests/stestr-timing.txt` is a committed list of `<test id><TAB><duration
+seconds>` lines, sorted by id and rounded to 0.01s. It is a *scheduling
+hint*: stestr partitions a run across workers from durations held in its
+own repository, and a repository created fresh in every CI container
+starts with none, so without it a test that takes minutes lands wherever
+round-robin puts it and that worker becomes the run's wall time. A stale
+hint degrades packing gradually and can never make a run wrong, which
+sets the bias for the whole mechanism — stay quiet unless the numbers
+actually moved.
+
+- **`tools/ci/seed-stestr-timing.sh STESTR_BIN TIMING_FILE`** is the
+  consumer. `tools/test-package-functional.sh` calls it from the
+  directory `stestr run` is about to run in; it converts the committed
+  text into a synthetic subunit v2 stream and `stestr load
+  --force-init`s it, which is the only mechanism stestr offers for this
+  short of a hand-written worker-assignment file. A missing or unusable
+  timing file is **not** an error: the run proceeds with the scheduler
+  partitioning blind, exactly as it did before the file existed.
+- **`tools/ci/generate-stestr-timing.py REPO_DIR OUTPUT_FILE`** is the
+  derivation, reading the durations out of a stestr repository's on-disk
+  `times.dbm`. Text rather than a subunit stream, sorted and rounded, so
+  a nightly refresh is a small diff instead of a fresh ~700 KB binary
+  blob every night. Generating twice from the same repository must give
+  byte-identical output.
+- **`tools/ci/compare-stestr-timing.py OLD NEW`** decides whether a
+  measurement is worth a human's attention, and exits 0 for material, 10
+  for immaterial, 1 for an error. Both of its rules are expressed in each
+  test's *share of the suite's weight*, because bin packing is scale-free
+  — a contended or slower runner changes every number in the file without
+  changing a single scheduling decision, and that is by far the commonest
+  night-to-night difference. It publishes when one test's share moves by
+  at least 2 percentage points, or when at least 10 points of the suite's
+  weight relocate between tests.
+- **`tools/ci/publish-stestr-timing.sh MEASURED [--dry-run] [--force]`**
+  acts on that verdict. On a material change it copies the measurement
+  over the committed file, force-pushes the single long-lived
+  `stestr-timing/refresh` branch, and opens a pull request — or, if one
+  is already open for that branch, says so and leaves it to be updated
+  in place rather than opening a second. It never pushes to `develop`: a
+  scheduling hint is nowhere near a good enough reason to be the first
+  thing in this repository that writes to a merge-queue-protected
+  branch. On an immaterial change it prints the comparison and exits 0
+  having done nothing, which is the normal case.
+
+**Failure reporting.**
+`tools/ci/report-nightly-matrix-failure.sh DISTRO IMAGE LOG_FILE` files
+the issue, under the existing `test-failure` and `needs-attention`
+labels so there is one queue of "CI found something and nobody has
+looked" rather than two. The body names both the distro and the failing
+tests, because that pair is the whole signal: one distro red and six
+green is a `qemu-img` divergence at that distro's version, while all
+seven red is an instar regression the pull-request jobs missed. It also
+records the leg's live `qemu-img` version and the `Ran: N tests` totals,
+and quotes a bounded excerpt anchored on stestr's failure block rather
+than the end of the log — a matrix log ends with the totals and the
+worker balance, so a plain tail says how long the run took and nothing
+about why it failed.
+
+Deduplication is **per distro**, keyed on a hidden `<!-- dedup_key: ...
+-->` marker in the body rather than on the title alone, so a divergence
+that takes a week to work through arrives as one issue with a comment
+per night instead of seven issues. `--kind timing-refresh` switches to a
+second, separate key: a bug in the publisher is not a distro divergence,
+and filing it as one would send a reader looking for a `qemu-img`
+difference that is not there, while filing nothing would leave a red run
+visible only in the Actions tab. That report opens by saying no test
+failed.
+
+**Driving all of it by hand.** None of this needs CI:
+
+```bash
+# Re-derive the committed timing file from a local full run.
+cd tests && ../tests/.venv/bin/stestr run --exclude-regex test_info_malicious
+cd ..
+tests/.venv/bin/python3 tools/ci/generate-stestr-timing.py \
+    tests/.stestr tests/stestr-timing.txt
+
+# Ask what the nightly would do with a measurement, touching neither
+# git nor the GitHub API.
+tools/ci/publish-stestr-timing.sh /path/to/measured-timing.txt --dry-run
+
+# Ask what the reporter would file for a downloaded leg log.
+tools/ci/report-nightly-matrix-failure.sh "Rocky 9" rockylinux:9 \
+    matrix.log --dry-run
+```
+
+A manual `workflow_dispatch` of `nightly-matrix.yml` takes a
+`force_timing_pr` input, which opens the refresh pull request even when
+the comparison called the change immaterial; the scheduled run never
+sets it. The self-tests —
+`tools/ci/test-seed-stestr-timing.sh`,
+`test-generate-stestr-timing.sh`, `test-publish-stestr-timing.sh`,
+`test-report-nightly-matrix-failure.sh` and
+`tools/ci/test_compare_stestr_timing.py` — all run in the `ci-tooling`
+job, and none of them needs docker, a venv or testdata beyond what they
+build themselves.
+
 ### CI job layout and the partition guard
 
 On a pull request the integration suite is split across several jobs
@@ -811,8 +932,13 @@ an explicit "infrastructure problem, not a test regression" message if any is
 still a pointer, so a git-LFS outage can never be silently misattributed to
 instar (see GitHub issue #451 for the incident this guards against).
 
-Every job that prepares testdata then runs
-**`tools/ci/resparsify-testdata.sh <tree>`**. git and git-lfs write each file
+Eight of the nine jobs that prepare testdata then run
+**`tools/ci/resparsify-testdata.sh <tree>`** — every one that runs the Python
+integration suite over the tree (five in `functional-tests.yml`, two in
+`nightly-matrix.yml`, one in `test-drift-fix.yml`). The exception is
+`coverage-fuzz.yml`, which prepares the tree only to seed fuzz corpora and
+never asks `qemu-img info` for an allocated size, so the fully allocated
+tree costs it disk and nothing else. git and git-lfs write each file
 out fully allocated, so a clone or an `lfs pull` fills the images' sparse
 holes with real zeros: the tree becomes about 7.5 GiB of mostly zeros, and
 `qemu-img info` reports an allocated size that belongs to git rather than to
@@ -1044,8 +1170,13 @@ that reports as a pass (one Rocky run "passed" having executed 454 of
 `assert_bytes_identical` (`tests/base.py`), which reports sizes and the
 first differing offset rather than the buffers, and
 `tools/test-package-functional.sh`, which fails the run outright on the
-crash marker, on any worker reporting `N/A` elapsed time, or on a
-full-suite test count far below the expected ~3250.
+crash marker, on any worker reporting `N/A` elapsed time, or on a run
+that executed fewer tests than `stestr list` found for the same
+selection. That floor is derived per selection rather than being a
+written-down total, so it covers the merge queue's half of the suite and
+the nightly's six tests as well as an unselected full run; a constant
+could only ever check the last of those, and drifted every time a test
+was added.
 
 ## Environment Variables
 

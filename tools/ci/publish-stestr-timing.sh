@@ -34,8 +34,10 @@
 #                  tools/ci/generate-stestr-timing.py writes.
 #   --dry-run      print the verdict, the title and the body, and touch
 #                  neither git nor the GitHub API. How
-#                  tools/ci/test-publish-stestr-timing.sh exercises
-#                  every path.
+#                  tools/ci/test-publish-stestr-timing.sh exercises the
+#                  verdict for each class of measurement; it exercises
+#                  the write path below for real, against a throwaway
+#                  repository with a file:// remote and a stubbed gh.
 #   --force        publish even when the comparison says the change is
 #                  immaterial. For a manual dispatch that wants the
 #                  refresh anyway; the scheduled run never sets it.

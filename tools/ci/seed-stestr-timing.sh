@@ -41,7 +41,11 @@
 #                 file is NOT an error -- a developer checkout, or a
 #                 tree where this data has not yet been generated, must
 #                 still be able to run the suite; the scheduler simply
-#                 partitions blind, as it always has.
+#                 partitions blind, as it always has. Nor is a corrupt
+#                 one: unparseable lines are skipped, and a file that
+#                 yields nothing usable at all is reported and then
+#                 ignored, for the same reason. This script FAILS OPEN
+#                 by design -- see the note above the conversion below.
 #
 # Must be run from the directory that will hold .stestr/ -- i.e. the
 # same cwd "stestr run" is about to be invoked from -- since stestr
@@ -84,31 +88,77 @@ trap 'rm -f "${SUBUNIT_FILE}"' EXIT
 # for scheduling (stestr.scheduler.partition_tests via
 # repository.get_test_times()), so neither the timeline nor the status
 # is meaningful beyond that.
-"${PYTHON_BIN}" - "${TIMING_FILE}" "${SUBUNIT_FILE}" <<'PY'
+#
+# EVERYTHING BELOW FAILS OPEN, and that is the point. This script runs
+# at the head of every testdata job, under `set -e`, over a file a
+# nightly job rewrites unattended. The file is a scheduling hint whose
+# absence is explicitly not an error, so a corrupt one must not be
+# either: one malformed line hard-failing the conversion would take out
+# every testdata job at once, for a file that changes which worker a
+# test runs on and nothing about what is tested. The converter therefore
+# skips lines it cannot parse and fails only when nothing at all was
+# usable, and a failure of either the conversion or the load is a
+# warning followed by a blind partition. Failing closed is still right
+# in tools/ci/publish-stestr-timing.sh, which WRITES this file -- that
+# is where a malformed measurement must stop.
+if ! "${PYTHON_BIN}" - "${TIMING_FILE}" "${SUBUNIT_FILE}" <<'PY'
 import datetime
+import math
 import sys
 
 import subunit.v2
 
 in_path, out_path = sys.argv[1], sys.argv[2]
 epoch = datetime.datetime.fromtimestamp(0, tz=datetime.timezone.utc)
+loaded = 0
+skipped = 0
 with open(in_path) as in_fh, open(out_path, 'wb') as out_fh:
     stream = subunit.v2.StreamResultToBytes(out_fh)
     stream.startTestRun()
     offset = 0.0
-    for line in in_fh:
+    for lineno, line in enumerate(in_fh, start=1):
         line = line.rstrip('\n')
         if not line:
             continue
-        test_id, duration_text = line.split('\t')
-        duration = float(duration_text)
+        try:
+            test_id, duration_text = line.split('\t')
+            duration = float(duration_text)
+        except ValueError:
+            duration = None
+        # A negative, infinite or NaN duration is as unusable as an
+        # unparseable one: it would put the synthetic stop timestamp
+        # before its start, or fail to build a timedelta at all.
+        if duration is None or not math.isfinite(duration) or duration < 0:
+            skipped += 1
+            if skipped <= 5:
+                print(f'warning: {in_path}:{lineno}: not a '
+                      f'"<test id><TAB><duration>" line; skipping', file=sys.stderr)
+            continue
         start = epoch + datetime.timedelta(seconds=offset)
         stop = epoch + datetime.timedelta(seconds=offset + duration)
         stream.status(test_id=test_id, test_status='inprogress', timestamp=start)
         stream.status(test_id=test_id, test_status='success', timestamp=stop)
         offset += duration
+        loaded += 1
     stream.stopTestRun()
+
+if skipped:
+    print(f'warning: skipped {skipped} unusable line(s) in {in_path}', file=sys.stderr)
+if not loaded:
+    print(f'error: {in_path} held no usable "<test id><TAB><duration>" lines',
+          file=sys.stderr)
+    sys.exit(1)
+print(f'converted {loaded} test duration(s) from {in_path}')
 PY
+then
+    echo "warning: ${TIMING_FILE} yielded no usable timing data;" \
+        "the scheduler will partition this run blind" >&2
+    exit 0
+fi
 
 echo "seeding stestr repository timing data from ${TIMING_FILE}"
-"${STESTR_BIN}" load --force-init "${SUBUNIT_FILE}"
+if ! "${STESTR_BIN}" load --force-init "${SUBUNIT_FILE}"; then
+    echo "warning: stestr could not load the timing data derived from" \
+        "${TIMING_FILE}; the scheduler will partition this run blind" >&2
+    exit 0
+fi

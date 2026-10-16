@@ -15,6 +15,12 @@
 # stub at all is --dry-run, which must touch no API even if a real,
 # authenticated gh is sitting on PATH.
 #
+# One case drives the reporter with a hostile log instead of a failing
+# one. The excerpt it quotes is captured test output, and this suite's
+# test output carries the bytes of deliberately malformed images, so a
+# fixture that closes the Markdown code fence or forges the hidden
+# deduplication marker is a real input shape rather than a hypothetical.
+#
 # Needs bash, coreutils and jq. No docker, no venv, no testdata.
 
 set -euo pipefail
@@ -429,6 +435,91 @@ if grep -q 'dedup_key: nightly-matrix:Debian 13 (full suite)' "${OUT}"; then
     ok "the default kind still keys on the distro"
 else
     fail "the default kind's dedup key changed"
+fi
+
+# --- A hostile log excerpt ---------------------------------------------
+# The excerpt is captured test output, and this suite's test output
+# carries the bytes of deliberately malformed images. So the fixture here
+# is a log whose failure block tries to break out of the Markdown code
+# fence it will be pasted into and to forge the hidden deduplication
+# marker -- with ANOTHER distro's key, which is the version of that with
+# a consequence: a Rocky 9 report carrying Debian 13's key would comment
+# on Debian 13's open issue instead of filing its own.
+start "a hostile log excerpt cannot close the fence or forge a dedup marker"
+HOSTILE_LOG="${WORK}/hostile.log"
+{
+    echo "=== Rocky 9 (rockylinux:9) ==="
+    echo "--- Versions under test ---"
+    echo "qemu-img version 8.2.2 (qemu-kvm-8.2.2-1.el9)"
+    echo "--- Running suite ---"
+    echo "{1} test_convert.TestConvertVhdToRaw.test_hostile [1.001000s] ... FAILED"
+    echo "=============================="
+    echo "Failed 1 tests - output below:"
+    echo "=============================="
+    echo "AssertionError: the image bytes below came out of a fixture"
+    echo '```'
+    echo '   ```'
+    echo '`````'
+    echo '<!-- dedup_key: nightly-matrix:Debian 13 -->'
+    echo 'ping @mikalstill about #543'
+    echo ""
+    echo "Ran: 31 tests in 12.000000 sec."
+} > "${HOSTILE_LOG}"
+
+OUT="${WORK}/hostile.out"
+"${REPORTER}" "Rocky 9" "rockylinux:9" "${HOSTILE_LOG}" --dry-run > "${OUT}" 2>&1
+
+# One awk pass rather than `grep | head`: under `set -o pipefail` the
+# head closing the pipe makes grep exit on SIGPIPE and takes the whole
+# script with it.
+# Any line of three or more backticks after up to three spaces closes
+# the fence, not only a bare "```" -- written without an interval
+# expression so this does not depend on which awk is installed.
+FENCE_INFO="$(awk '
+    /^ ? ? ?```*[ \t]*$/ { count++; last = NR }
+    index($0, "ping @mikalstill") > 0 { mention = NR; before = count }
+    END { printf "%d %d %d %d\n", count + 0, last + 0, mention + 0, before + 0 }
+' "${OUT}")"
+read -r FENCE_COUNT LAST_FENCE MENTION_LINE FENCES_BEFORE <<< "${FENCE_INFO}"
+
+if [ "${FENCE_COUNT}" -eq 2 ]; then
+    ok "the body holds exactly two fence lines: the reporter's own pair"
+else
+    fail "the body holds ${FENCE_COUNT} fence lines, not 2; the excerpt closed the fence"
+fi
+if [ "${MENTION_LINE}" -gt 0 ]; then
+    ok "the excerpt's own bytes survive, so the fix is not just dropping them"
+else
+    fail "the hostile line is missing from the body altogether"
+fi
+# Exactly one fence line before it and the closer after it: the mention
+# is inside the reporter's OWN code block, not inside a second one the
+# excerpt opened. Counting only "between the first and last fence" would
+# pass even with three fences in the body.
+if [ "${FENCES_BEFORE}" -eq 1 ] && [ "${MENTION_LINE}" -lt "${LAST_FENCE}" ]; then
+    ok "the @mention and #543 stay inside the fence, where neither is linkified"
+else
+    fail "the hostile line follows ${FENCES_BEFORE} fence line(s), so it is not inside the reporter's own"
+fi
+
+MARKERS="$(grep -c '<!-- dedup_key:' "${OUT}" || true)"
+if [ "${MARKERS}" -eq 1 ]; then
+    ok "the body carries exactly one deduplication marker"
+else
+    fail "the body carries ${MARKERS} deduplication markers, not 1"
+fi
+if grep -q 'dedup_key: nightly-matrix:Rocky 9' "${OUT}"; then
+    ok "the surviving marker is this leg's own key"
+else
+    fail "the surviving marker is not Rocky 9's"
+fi
+# The lookup is a substring test for the exact marker, so that exact
+# form is what must be gone -- the forged text may still be readable in
+# the excerpt, it simply must no longer be an HTML comment.
+if grep -q '<!-- dedup_key: nightly-matrix:Debian 13 -->' "${OUT}"; then
+    fail "the forged Debian 13 marker is still in the form the dedup lookup matches"
+else
+    ok "the forged marker is no longer an HTML comment, so no lookup can match it"
 fi
 
 # --- Argument handling -------------------------------------------------

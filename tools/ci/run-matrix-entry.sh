@@ -33,6 +33,15 @@
 #                        measurement leg uses it; nothing that gates a
 #                        merge does, because the point of the split is
 #                        that the gate runs less.
+#   STESTR_TIMING_OUT    where tools/test-package-functional.sh writes
+#                        the per-test durations this run measured. Not
+#                        read here; passed straight through the
+#                        environment to the runner, which treats being
+#                        asked to measure as also meaning "do not seed
+#                        the committed timings into this run". The
+#                        nightly's measurement leg sets it on the step
+#                        that calls this script; nothing that gates a
+#                        merge does.
 #   MATRIX_SELECT        stestr selection regex; runs only matching
 #                        tests. For reproducing one CI entry locally
 #                        without paying for the whole suite. CI never
