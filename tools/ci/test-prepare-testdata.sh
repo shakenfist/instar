@@ -4,7 +4,7 @@
 #
 # Every job that touches testdata runs that script first, and two of the
 # things it now decides cannot be seen from its output in a passing job:
-# which of its two branches ran, and whether it is allowed to fall back
+# which branch ran, and whether it is allowed to fall back
 # to a fresh clone at all. Both only show up when they are wrong, and
 # both show up as a job that merely looks slow -- the failure mode the
 # whole testdata-disk arrangement exists to remove. So they are measured
@@ -31,6 +31,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPT="${REPO_ROOT}/tools/ci/prepare-testdata.sh"
+WRAPPER="${REPO_ROOT}/tools/ci/resparsify-prepared-testdata.sh"
 RESPARSIFY="${REPO_ROOT}/tools/ci/resparsify-testdata.sh"
 FIXTURE_CHECK="${REPO_ROOT}/tools/ci/check-testdata-fixtures.sh"
 
@@ -102,6 +103,15 @@ case "$1" in
         # show the union happening.
         if [ -n "${GIT_STUB_STAT_DIRTY:-}" ]; then
             tr '\n' '\0' < "${GIT_STUB_STAT_DIRTY}"
+        fi
+        ;;
+    lfs)
+        # `git lfs ls-files`, replayed verbatim from a file holding
+        # lines in the shape git-lfs 3.6.1 was measured to print:
+        # "<short oid> - <path>" for a working-tree pointer and
+        # "<short oid> * <path>" for a materialised file.
+        if [ "$2" = 'ls-files' ] && [ -n "${GIT_STUB_LFS_LS_FILES:-}" ]; then
+            cat "${GIT_STUB_LFS_LS_FILES}"
         fi
         ;;
 esac
@@ -176,10 +186,13 @@ make_cache() {
 }
 
 start "the branch taken is reported"
+# The cache cases from here to the narrow-resparsify check all vouch
+# for the cache, because the narrow treatment they exercise is only
+# ever given to a cache the job asserted is the fleet's disk.
 CACHE="$(make_cache cache-tree)"
 printf '%s\n' 'downloaded/qemu-iotests/updated.qcow2' 'README.md' > "${WORK}/changed.txt"
 run_prepare cache \
-    TESTDATA_CACHE="${CACHE}" \
+    TESTDATA_REQUIRE_CACHE=1 TESTDATA_CONTRACT_CACHE="${CACHE}" TESTDATA_CACHE="${CACHE}" \
     GIT_STUB_PREVIOUS_REV='1111111111111111111111111111111111111111' \
     GIT_STUB_CHANGED="${WORK}/changed.txt"
 if [ "$(cat "${WORK}/cache/status")" -eq 0 ]; then
@@ -220,6 +233,31 @@ else
     fail "no clone in: $(cat "${WORK}/clone/log")"
 fi
 
+# A tree at the cache path on a job that did not require it -- a
+# long-lived cache on a static runner, say -- is not known to be
+# sparse, so it must not be handed to the narrow resparsify.
+CACHE_UV="$(make_cache unverified-cache)"
+run_prepare unverified \
+    TESTDATA_CACHE="${CACHE_UV}" \
+    GIT_STUB_PREVIOUS_REV='6666666666666666666666666666666666666666' \
+    GIT_STUB_CHANGED="${WORK}/changed.txt"
+if [ "$(cat "${WORK}/unverified/status")" -eq 0 ] \
+    && [ "$(env_value unverified TESTDATA_SOURCE)" = 'unverified-cache' ]; then
+    ok "a cache the job did not require exports TESTDATA_SOURCE=unverified-cache"
+else
+    fail "exit $(cat "${WORK}/unverified/status"), source '$(env_value unverified TESTDATA_SOURCE)'"
+fi
+if grep -q 'reset --hard' "${WORK}/unverified/log" && ! grep -q '^clone' "${WORK}/unverified/log"; then
+    ok "and still updates it in place rather than cloning"
+else
+    fail "unexpected git calls: $(cat "${WORK}/unverified/log")"
+fi
+if [ -z "$(env_value unverified TESTDATA_CHANGED_FILES)" ]; then
+    ok "and exports no changed-file list, because the whole tree is resparsified"
+else
+    fail "exported '$(env_value unverified TESTDATA_CHANGED_FILES)'"
+fi
+
 start "the changed-file list, and that the resparsifier accepts it"
 # The two halves have to fit: this list is produced for one consumer,
 # which refuses paths it will not act on. A list it cannot take is as
@@ -246,7 +284,7 @@ printf '%s\n' 'downloaded/qemu-iotests/updated.qcow2' \
     'downloaded/qemu-iotests/stale-stat.qcow2' > "${WORK}/stat-dirty.txt"
 CACHE_SD="$(make_cache stat-dirty-cache)"
 run_prepare statdirty \
-    TESTDATA_CACHE="${CACHE_SD}" \
+    TESTDATA_REQUIRE_CACHE=1 TESTDATA_CONTRACT_CACHE="${CACHE_SD}" TESTDATA_CACHE="${CACHE_SD}" \
     GIT_STUB_PREVIOUS_REV='5555555555555555555555555555555555555555' \
     GIT_STUB_CHANGED="${WORK}/changed.txt" \
     GIT_STUB_STAT_DIRTY="${WORK}/stat-dirty.txt"
@@ -284,7 +322,7 @@ fi
 CACHE_RT="$(make_cache runnertemp-cache)"
 mkdir -p "${WORK}/runnertemp-dir"
 run_prepare runnertemp \
-    TESTDATA_CACHE="${CACHE_RT}" \
+    TESTDATA_REQUIRE_CACHE=1 TESTDATA_CONTRACT_CACHE="${CACHE_RT}" TESTDATA_CACHE="${CACHE_RT}" \
     RUNNER_TEMP="${WORK}/runnertemp-dir" \
     GIT_STUB_PREVIOUS_REV='3333333333333333333333333333333333333333' \
     GIT_STUB_CHANGED="${WORK}/changed.txt"
@@ -292,6 +330,47 @@ case "$(env_value runnertemp TESTDATA_CHANGED_FILES)" in
     "${WORK}/runnertemp-dir"/*) ok "the list is written under \$RUNNER_TEMP when set" ;;
     *) fail "list went to '$(env_value runnertemp TESTDATA_CHANGED_FILES)'" ;;
 esac
+
+# The third source: files still LFS pointers before the pull, which the
+# pull writes out fully allocated and leaves no trace of -- it refreshes
+# the index as it goes, so no diff-files afterwards names them. One
+# pointer overlaps the tree diff, one is new to the list, and one line
+# is a materialised file, which must not be listed.
+printf '%s\n' \
+    '495f0e0c5c - downloaded/qemu-iotests/updated.qcow2' \
+    '480099afeb - downloaded/qemu-iotests/still-a-pointer.qcow2' \
+    '7c1a2b3d4e * downloaded/qemu-iotests/materialised.qcow2' \
+    > "${WORK}/lfs-ls-files.txt"
+CACHE_PTR="$(make_cache pointer-cache)"
+run_prepare pointers \
+    TESTDATA_REQUIRE_CACHE=1 TESTDATA_CONTRACT_CACHE="${CACHE_PTR}" TESTDATA_CACHE="${CACHE_PTR}" \
+    GIT_STUB_PREVIOUS_REV='7777777777777777777777777777777777777777' \
+    GIT_STUB_CHANGED="${WORK}/changed.txt" \
+    GIT_STUB_LFS_LS_FILES="${WORK}/lfs-ls-files.txt"
+PTR_LIST="$(env_value pointers TESTDATA_CHANGED_FILES)"
+EXPECTED_PTR="$(printf '%s\n' 'downloaded/qemu-iotests/still-a-pointer.qcow2' \
+    | cat - "${WORK}/changed.txt" | sort -u)"
+if [ "$(sort -u "${PTR_LIST}")" = "${EXPECTED_PTR}" ]; then
+    ok "a pointer the update did not touch is in the list, a materialised file is not"
+else
+    fail "list was '$(cat "${PTR_LIST}")', wanted '${EXPECTED_PTR}'"
+fi
+if [ "$(grep -n 'lfs ls-files' "${WORK}/pointers/log" | cut -d: -f1)" \
+    -lt "$(grep -n 'lfs pull' "${WORK}/pointers/log" | cut -d: -f1)" ]; then
+    ok "the pointers are listed before the pull, not after it"
+else
+    fail "wrong order: $(cat "${WORK}/pointers/log")"
+fi
+case "$(cat "${WORK}/pointers/out")" in
+    *"::warning::"*"were still LFS pointers"*)
+        ok "and warns, because the cache's builder should have pulled them" ;;
+    *) fail "expected a pointer warning: $(cat "${WORK}/pointers/out")" ;;
+esac
+if ! grep -q 'lfs ls-files' "${WORK}/unverified/log" "${WORK}/clone/log"; then
+    ok "the whole-tree branches do not pay for the listing"
+else
+    fail "lfs ls-files ran on a branch that resparsifies the whole tree"
+fi
 
 blocks() { stat -c %b "$1"; }
 NARROW_TREE="${CACHE}"
@@ -336,7 +415,7 @@ else
     fail "expected exit 0, got ${STATUS}: ${OUTPUT}"
 fi
 case "${OUTPUT}" in
-    *"testdata source: cache"*) ok "still says which branch it took" ;;
+    *"testdata source: unverified-cache"*) ok "still says which branch it took" ;;
     *) fail "expected the branch in '${OUTPUT}'" ;;
 esac
 
@@ -506,6 +585,32 @@ for bad in true yes TRUE 2 ' 1'; do
         esac
     else
         fail "'${bad}' gave exit $(cat "${WORK}/require-bad/status"), git: $(cat "${WORK}/require-bad/log")"
+    fi
+done
+
+start "what each branch exports is what the resparsify step reads"
+# The two scripts are joined by three variable names and three source
+# values, and the workflow steps between them pass no arguments, so a
+# rename on either side just means a branch is never taken -- or, for a
+# new source value, that every job fails at the resparsify step. Fed
+# straight from the $GITHUB_ENV each branch above wrote, rather than by
+# matching either script's text, so that any spelling of the export
+# that works passes and any that does not fails.
+for case_name in clone:'resparsifying the whole tree' \
+    unverified:'did not vouch for' \
+    cache:'resparsifying only the'; do
+    name="${case_name%%:*}"
+    want="${case_name#*:}"
+    mapfile -t EXPORTED < "${WORK}/${name}/env"
+    STATUS=0
+    OUTPUT="$(env -i PATH="/usr/bin:/bin" "${EXPORTED[@]}" bash "${WRAPPER}" 2>&1)" || STATUS=$?
+    if [ "${STATUS}" -eq 0 ]; then
+        case "${OUTPUT}" in
+            *"${want}"*) ok "the ${name} branch's exports take the resparsify step's ${name} path" ;;
+            *) fail "the ${name} branch's exports took the wrong path: ${OUTPUT}" ;;
+        esac
+    else
+        fail "the resparsify step rejected the ${name} branch's exports (${STATUS}): ${OUTPUT}"
     fi
 done
 

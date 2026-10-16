@@ -1013,12 +1013,13 @@ looking. Beside `TESTDATA_PATH` it exports:
 
 | Variable | Meaning |
 |---|---|
-| `TESTDATA_SOURCE` | `cache` (updated in place) or `clone` (fresh). A fresh clone writes every image out fully allocated, so the whole tree needs resparsifying; a cache needs only what the update changed. That narrower treatment assumes the cache was built from an already-sparse tree, which the fleet's pre-built disk is and which the script cannot itself check — a cache seeded any other way would need a third `TESTDATA_SOURCE` value rather than this one. |
-| `TESTDATA_CHANGED_FILES` | On the cache branch only: a file listing the paths the update changed, one per line, for the narrow resparsify above. Derived here because the reset that changed them happens here — by the time a later step runs there is nothing left to diff. |
+| `TESTDATA_SOURCE` | `clone` (fresh), `cache` (the fleet's testdata disk, updated in place) or `unverified-cache` (some other tree already at the cache path, updated in place). A fresh clone writes every image out fully allocated, so the whole tree needs resparsifying; the disk needs only what the update changed. That narrower treatment assumes the tree was already sparse, which the script cannot check, so it is given only when `TESTDATA_REQUIRE_CACHE=1` has asserted the tree is the fleet's pre-built disk. Any other cache — a long-lived one on a static runner, say — is `unverified-cache` and resparsified whole. |
+| `TESTDATA_CHANGED_FILES` | For `cache` only: a file listing the paths the update changed, one per line, for the narrow resparsify above. Derived here because the reset that changed them happens here — by the time a later step runs there is nothing left to diff. |
 
-The list has two sources, and the second one is not obvious. Besides the diff
-between the two trees it carries every path whose index stat data was stale
-before the update. Resparsifying is a `cp` and a `mv`, so the disk build's own
+The list has three sources, and the last two are not obvious. Besides the
+diff between the two trees it carries every path whose index stat data was
+stale before the update, and every file that was still an LFS pointer before
+`git lfs pull`. Resparsifying is a `cp` and a `mv`, so the disk build's own
 resparsify leaves the index disagreeing with the files it rewrote, and
 `git reset --hard` then rewrites those entries even though their content is
 identical — measured, with the clean-stat control alongside it, in
@@ -1029,7 +1030,18 @@ re-expanded. Including them costs nothing extra: the reset already wrote them
 into the overlay. The script emits a `::warning::` naming the count when it
 finds any, because the real fix belongs to whatever built the cache — a
 `git update-index --refresh` after its resparsify — and this is the only place
-the cost is visible.
+the cost is visible. A count close to the number of images in the tree means
+something else: the index stat data did not survive the trip from the disk
+build to the runner at all (a different uid, or inode numbers that changed on
+the way), so the narrow resparsify has quietly become a whole-tree one and the
+disk is saving nothing. That needs fixing in how the disk is built or mounted;
+a refresh at build time will not help.
+
+The pointers are the same kind of gap. `git lfs pull` writes each pointer out
+fully allocated and then refreshes the index for it, so nothing afterwards —
+not the tree diff, not a second `git diff-files` — names it; the script lists
+them with `git lfs ls-files` beforehand instead, and warns, because a disk that
+ships pointers was built without pulling them.
 
 Both are printed as well as written to `$GITHUB_ENV`, and running the script
 by hand with `$GITHUB_ENV` unset is fine.
@@ -1110,8 +1122,8 @@ the Python integration suite over the tree (five in `functional-tests.yml`,
 two in `nightly-matrix.yml`, one in `test-drift-fix.yml`). That step takes no
 arguments: it reads the `TESTDATA_SOURCE` and `TESTDATA_CHANGED_FILES` above
 and calls `tools/ci/resparsify-testdata.sh` in whichever of its two forms the
-tree needs — the whole tree for a fresh clone, and only the paths the update
-changed for a tree that was updated in place. An unset or unrecognised
+tree needs — the whole tree for a fresh clone or an `unverified-cache`, and
+only the paths the update changed for the fleet's disk updated in place. An unset or unrecognised
 `TESTDATA_SOURCE` is an error there rather than a fall back to the whole tree,
 because the fallback is the expensive branch and taking it silently would cost
 the most on exactly the runner that was supposed to save. The exception is

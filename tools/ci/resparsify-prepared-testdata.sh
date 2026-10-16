@@ -4,12 +4,13 @@
 # prepared, in whichever of the two ways that tree actually needs.
 #
 # A fresh clone is written out fully allocated, every image of it, so it
-# gets resparsify-testdata.sh's whole-tree call. A tree that was updated
-# in place gets the narrow one: where that cache is the runner fleet's
-# testdata dependencies disk, the tree is a copy-on-write overlay of an
-# image that was resparsified when it was built, so the only images in
-# it that are not already sparse are the ones this job's own fetch and
-# `git lfs pull` brought in -- which is exactly the changed-file list.
+# gets resparsify-testdata.sh's whole-tree call, as does a cache nobody
+# vouched for. A tree updated in place on the runner fleet's testdata
+# dependencies disk gets the narrow one: it is a copy-on-write overlay
+# of an image that was resparsified when it was built, so the only
+# images in it that are not already sparse are the ones this job's own
+# fetch and `git lfs pull` brought in -- which is exactly the
+# changed-file list.
 # Sweeping the whole tree there would write back into the overlay the
 # gigabytes the disk exists to avoid, and skipping it altogether would
 # leave the day's drift fully allocated.
@@ -38,7 +39,8 @@
 # Inputs (environment), all of them exported by prepare-testdata.sh:
 #
 #   TESTDATA_PATH          (required) the prepared tree.
-#   TESTDATA_SOURCE        (required) "clone" or "cache".
+#   TESTDATA_SOURCE        (required) "clone", "unverified-cache" or
+#                          "cache".
 #   TESTDATA_CHANGED_FILES (required when the source is "cache") a file
 #                          listing the paths that update changed.
 #
@@ -63,19 +65,24 @@ case "${TESTDATA_SOURCE:-}" in
         echo "testdata source is a fresh clone: resparsifying the whole tree"
         exec "${RESPARSIFY}" "${TESTDATA_PATH}"
         ;;
+    unverified-cache)
+        # A tree that was already there, on a job that did not assert
+        # it is the fleet's disk. Nothing says what it arrived with was
+        # sparse, and narrowing would leave anything that was not fully
+        # allocated with no symptom but drifting disk_size results. No
+        # overlay is being protected here either, so the whole tree.
+        echo "testdata source is a cache this job did not vouch for: resparsifying the whole tree"
+        exec "${RESPARSIFY}" "${TESTDATA_PATH}"
+        ;;
     cache)
         # The assumption this branch rests on, stated where it is
-        # relied upon: "cache" is only evidence that a tree was already
-        # there, and narrowing to the changed files is correct only if
-        # everything that was already there was already sparse. Nothing
-        # observes that. It holds today because the only cache any job
-        # meets is the fleet's pre-built testdata disk, whose image is
-        # resparsified when it is built, and the labelled jobs refuse to
-        # run without exactly that disk. A cache seeded some other way
-        # would leave its untouched images fully allocated here, costing
-        # disk and skewing the disk_size comparisons -- so give such a
-        # cache its own TESTDATA_SOURCE value rather than widening what
-        # this one means.
+        # relied upon: narrowing to the changed files is correct only
+        # if everything that was already there was already sparse.
+        # Nothing observes that directly. prepare-testdata.sh reports
+        # "cache" only when TESTDATA_REQUIRE_CACHE=1 has asserted the
+        # tree is the fleet's pre-built testdata disk, whose image is
+        # resparsified when it is built; any other cache arrives as
+        # "unverified-cache" above.
         if [ -z "${TESTDATA_CHANGED_FILES:-}" ]; then
             echo "::error::TESTDATA_SOURCE=cache but TESTDATA_CHANGED_FILES is not set." \
                  "prepare-testdata.sh exports both together on that branch, so one without" \
@@ -103,9 +110,9 @@ case "${TESTDATA_SOURCE:-}" in
         exit 1
         ;;
     *)
-        echo "::error::TESTDATA_SOURCE is '${TESTDATA_SOURCE}', which is neither 'clone' nor" \
-             "'cache'. Those are the only two values prepare-testdata.sh exports, so either it" \
-             "has gained a third branch without teaching this script what the tree looks like," \
+        echo "::error::TESTDATA_SOURCE is '${TESTDATA_SOURCE}', which is not 'clone'," \
+             "'unverified-cache' or 'cache'. Those are the only values prepare-testdata.sh exports," \
+             "so either it has gained a branch without teaching this script what the tree looks like," \
              "or something else in the job overwrote the variable." >&2
         exit 1
         ;;

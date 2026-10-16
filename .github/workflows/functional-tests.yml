@@ -218,7 +218,7 @@ jobs:
         run: tools/ci/test-resparsify-testdata.sh
 
       # prepare-testdata.sh decides two things a passing job cannot
-      # show: which of its two branches ran, and whether it may fall
+      # show: which branch ran, and whether it may fall
       # back to a fresh clone at all. Both surface only as a job that
       # merely looks slow, which is invisible for weeks. git is stubbed
       # in the test, so it needs no token, no network and no testdata.
@@ -237,8 +237,8 @@ jobs:
       - name: Test the testdata changed-file list against real git
         run: tools/ci/test-testdata-changed-files.sh
 
-      # The step between those two: which of resparsify-testdata.sh's two
-      # calling forms a prepared tree needs. Both of its mistakes are
+      # The step between prepare-testdata.sh and resparsify-testdata.sh:
+      # which of the latter's two calling forms a prepared tree needs. Both of its mistakes are
       # invisible in a passing job -- narrowing a fresh clone leaves most
       # of the tree allocated, and widening a cached one writes gigabytes
       # into a copy-on-write overlay and still leaves a correct tree -- so

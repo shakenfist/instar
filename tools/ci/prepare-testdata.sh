@@ -37,13 +37,14 @@
 # Output: prints, and when GITHUB_ENV is set writes to it,
 #
 #   TESTDATA_PATH          the resolved tree.
-#   TESTDATA_SOURCE        "cache" or "clone" -- which of the two
-#                          branches below ran. A later step has to know:
-#                          the two leave the tree in materially
-#                          different states, and nothing else can tell
-#                          them apart by looking.
-#   TESTDATA_CHANGED_FILES on the cache branch only, a file listing the
-#                          paths the update changed, one per line.
+#   TESTDATA_SOURCE        "cache", "unverified-cache" or "clone" --
+#                          which branch below ran, and for a cache
+#                          whether the job vouched for it. A later step
+#                          has to know: they leave the tree in
+#                          materially different states, and nothing
+#                          else can tell them apart by looking.
+#   TESTDATA_CHANGED_FILES for "cache" only, a file listing the paths
+#                          the update changed, one per line.
 #
 # WHY THE BRANCH TAKEN IS PART OF THE OUTPUT. A fresh clone writes every
 # image out fully allocated, so the whole tree needs resparsifying
@@ -65,7 +66,9 @@
 # is invisible for weeks. The assertion names the contractual path
 # literally rather than taking it from TESTDATA_CACHE, so that a change
 # to either side of that contract fails here instead of quietly
-# following a defaulted path somewhere else.
+# following a defaulted path somewhere else. The same flag is what
+# makes a cache "cache" rather than "unverified-cache": having asserted
+# the tree is the fleet's disk, the job can vouch that it was sparse.
 
 set -euo pipefail
 
@@ -184,6 +187,7 @@ fi
 # list is built. Declared here so that neither reference depends on
 # which branch ran.
 STAT_DIRTY=''
+LFS_POINTERS=''
 
 if [ -d "${TESTDATA_CACHE}/.git" ]; then
     echo "Using cached testdata at ${TESTDATA_CACHE}, updating in place..."
@@ -213,18 +217,22 @@ if [ -d "${TESTDATA_CACHE}/.git" ]; then
     git fetch --depth 1 origin main
     git reset --hard origin/main
     TESTDATA_PATH="${TESTDATA_CACHE}"
-    # "cache" is only ever observed as "a tree was already here", which
-    # is strictly weaker than what the narrow resparsify downstream
-    # relies on -- that the tree it was built from was already sparse.
-    # Nothing here can check the stronger thing, and today the two
-    # coincide because the only cache any job meets is the fleet's
-    # pre-built disk, whose image is resparsified when it is built. A
-    # second kind of cache, seeded any other way, would make this value
-    # a lie in the expensive direction: the images it arrived with would
-    # stay fully allocated because no update touched them. Such a cache
-    # needs a third TESTDATA_SOURCE value, not a looser reading of this
-    # one.
-    TESTDATA_SOURCE='cache'
+    # A tree being here is strictly weaker evidence than what the narrow
+    # resparsify downstream relies on -- that every image it arrived
+    # with was already sparse. Nothing here can observe that. What can
+    # be said is whether the job vouched for it: TESTDATA_REQUIRE_CACHE=1
+    # has just asserted this is the contractual mount of the fleet's
+    # pre-built disk, whose image is resparsified when it is built, and
+    # only that earns "cache" and the narrow treatment. Any other tree
+    # at this path -- a long-lived cache on a static runner, seeded who
+    # knows how -- is reported as "unverified-cache" and resparsified
+    # whole, because narrowing it would leave whatever it arrived with
+    # fully allocated with no symptom but drifting disk_size results.
+    if [ "${REQUIRE_CACHE}" = '1' ]; then
+        TESTDATA_SOURCE='cache'
+    else
+        TESTDATA_SOURCE='unverified-cache'
+    fi
 else
     echo "No cache at ${TESTDATA_CACHE}, cloning fresh..."
     TESTDATA_PATH="${GITHUB_WORKSPACE}/instar-testdata"
@@ -238,6 +246,18 @@ fi
 # clone; pull fetches and checks out the actual objects. Both are
 # idempotent and cheap when the objects are already present.
 git lfs install --local
+if [ "${TESTDATA_SOURCE}" = 'cache' ]; then
+    # The working-tree files that are still LFS pointers, which are
+    # exactly the ones the pull below is about to write out fully
+    # allocated. Neither list above names a pointer whose path the
+    # update did not touch, and the pull leaves no trace afterwards:
+    # it refreshes the index for every file it writes, so a second
+    # diff-files after it comes back empty (measured with git-lfs
+    # 3.6.1). ls-files marks a pointer in the working tree with "-",
+    # whether or not the object is already in the local store, and a
+    # materialised file with "*".
+    LFS_POINTERS="$(git lfs ls-files | sed -n 's/^[0-9a-f]* - //p')"
+fi
 git lfs pull
 
 # The paths this update brought in, for a later step that needs to treat
@@ -267,20 +287,27 @@ if [ "${TESTDATA_SOURCE}" = 'cache' ]; then
         # algorithm.
         PREVIOUS_REV="$(git hash-object -t tree /dev/null)"
     fi
-    # Two sources, unioned: what the two trees disagree about, and what
-    # was stat-dirty going in. Both are paths the reset rewrote, and
-    # the second is invisible to any diff of the trees -- see the
-    # capture above. Adding them costs nothing that has not already
+    # Three sources, unioned: what the two trees disagree about, what
+    # was stat-dirty going in, and what was still a pointer before the
+    # pull. All of them are paths this update rewrote, and the last two
+    # are invisible to any diff of the trees -- see the captures above. Adding them costs nothing that has not already
     # been spent: the reset expanded those files into the
     # copy-on-write overlay whether or not this list names them, so
     # resparsifying them afterwards shrinks a copy-up that has already
     # happened rather than causing one. tools/ci/test-testdata-changed-files.sh
     # proves the union against a real git, including that the tree diff
     # alone would miss them.
+    #
+    # Rename detection is left on: a renamed image is listed under its
+    # new path only, which is all the resparsify needs. Anything that
+    # wants deletions out of this list should pass --no-renames.
     {
         git diff --name-only -z "${PREVIOUS_REV}" HEAD | tr '\0' '\n'
         if [ -n "${STAT_DIRTY}" ]; then
             printf '%s\n' "${STAT_DIRTY}"
+        fi
+        if [ -n "${LFS_POINTERS}" ]; then
+            printf '%s\n' "${LFS_POINTERS}"
         fi
     } | sort -u > "${TESTDATA_CHANGED_FILES}"
     if [ -n "${STAT_DIRTY}" ]; then
@@ -295,6 +322,15 @@ if [ "${TESTDATA_SOURCE}" = 'cache' ]; then
              "the reset rewrote them and they are resparsified again here." \
              "Whatever built this cache should run 'git update-index --refresh'" \
              "after resparsifying it."
+    fi
+    if [ -n "${LFS_POINTERS}" ]; then
+        # Same reasoning: a cache that arrives with pointers was built
+        # without materialising them, and every job pays for the pull.
+        echo "::warning::$(printf '%s\n' "${LFS_POINTERS}" | wc -l) path(s) in" \
+             "${TESTDATA_CACHE} were still LFS pointers before 'git lfs pull'," \
+             "so the pull wrote them out and they are resparsified here." \
+             "Whatever built this cache should run 'git lfs pull' before" \
+             "resparsifying it."
     fi
     echo "the update changed $(wc -l < "${TESTDATA_CHANGED_FILES}") path(s)," \
          "listed in ${TESTDATA_CHANGED_FILES}"

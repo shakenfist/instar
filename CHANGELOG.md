@@ -394,9 +394,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   taking no arguments, in place of `tools/ci/resparsify-testdata.sh
   "${TESTDATA_PATH}"`: it reads the `TESTDATA_SOURCE` and
   `TESTDATA_CHANGED_FILES` that `prepare-testdata.sh` now exports and
-  rewrites the whole tree only for a fresh clone, because sweeping a
-  cached tree writes into the overlay the gigabytes the disk exists to
-  avoid. `tools/ci/resparsify-testdata.sh` itself is unchanged in how
+  rewrites only what the update changed on the fleet's disk, because
+  sweeping it writes into the overlay the gigabytes the disk exists to
+  avoid. A fresh clone, and any cache a job did not require with
+  `TESTDATA_REQUIRE_CACHE=1`, are still resparsified whole. `tools/ci/resparsify-testdata.sh` itself is unchanged in how
   it is called with one argument, which is a cross-repository contract
   with private-ci's image build.
 

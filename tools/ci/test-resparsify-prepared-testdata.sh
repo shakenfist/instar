@@ -21,7 +21,6 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPT="${REPO_ROOT}/tools/ci/resparsify-prepared-testdata.sh"
-PREPARE="${REPO_ROOT}/tools/ci/prepare-testdata.sh"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK}"' EXIT
@@ -217,26 +216,34 @@ else
     fail "expected a non-zero exit and an untouched tree: $(output_of cache-stale-list)"
 fi
 
-start "the variable names still match what prepare-testdata.sh exports"
-# This script and prepare-testdata.sh are joined by three variable names
-# and two source values, and nothing else in the repository would notice
-# a rename on one side of that: the workflow steps pass no arguments, so
-# a renamed variable just means the branch is never taken, and the
-# expensive branch is the one that still works.
-for name in TESTDATA_PATH TESTDATA_SOURCE TESTDATA_CHANGED_FILES; do
-    if grep -q "echo \"${name}=" "${PREPARE}"; then
-        ok "${name} is still exported by prepare-testdata.sh"
-    else
-        fail "${name} is read here but prepare-testdata.sh no longer exports it"
-    fi
-done
-for value in clone cache; do
-    if grep -q "TESTDATA_SOURCE='${value}'" "${PREPARE}"; then
-        ok "prepare-testdata.sh still reports the '${value}' source"
-    else
-        fail "this script branches on TESTDATA_SOURCE=${value}, which prepare-testdata.sh no longer sets"
-    fi
-done
+start "a cache nobody vouched for gets the whole tree"
+# A tree that was already there on a job without TESTDATA_REQUIRE_CACHE
+# -- a long-lived cache on a static runner, say. Nothing says it was
+# sparse, so narrowing it to the changed files would leave whatever it
+# arrived with fully allocated. No changed-file list is passed, because
+# prepare-testdata.sh exports none for this source.
+TREE="$(make_tree unverified-tree)"
+CHANGED_BEFORE="$(blocks "${TREE}/downloaded/changed.qcow2")"
+UNTOUCHED_BEFORE="$(blocks "${TREE}/downloaded/untouched.qcow2")"
+run_step unverified TESTDATA_PATH="${TREE}" TESTDATA_SOURCE=unverified-cache
+if [ "$(status_of unverified)" -eq 0 ]; then
+    ok "exits 0 with no changed-file list"
+else
+    fail "expected exit 0, got $(status_of unverified): $(output_of unverified)"
+fi
+if [ "$(blocks "${TREE}/downloaded/changed.qcow2")" -lt "${CHANGED_BEFORE}" ] \
+    && [ "$(blocks "${TREE}/downloaded/untouched.qcow2")" -lt "${UNTOUCHED_BEFORE}" ]; then
+    ok "every image in the tree shrank"
+else
+    fail "expected both images to shrink: $(output_of unverified)"
+fi
+
+# The names this script reads and the source values it branches on are
+# a contract with prepare-testdata.sh, and nothing else would notice a
+# rename on one side: the workflow steps pass no arguments. That
+# contract is tested end to end in tools/ci/test-prepare-testdata.sh,
+# which feeds the $GITHUB_ENV each of its branches writes straight into
+# this script, rather than here by matching source text.
 
 echo
 if [ "${FAILURES}" -ne 0 ]; then
