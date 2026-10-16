@@ -281,7 +281,8 @@ fi
 # them deliberately -- one path in both lists, one in each -- because
 # the union is a union and not a concatenation.
 printf '%s\n' 'downloaded/qemu-iotests/updated.qcow2' \
-    'downloaded/qemu-iotests/stale-stat.qcow2' > "${WORK}/stat-dirty.txt"
+    'downloaded/qemu-iotests/stale-stat.qcow2' \
+    'downloaded/qemu-iotests/stale-stat.txt' > "${WORK}/stat-dirty.txt"
 CACHE_SD="$(make_cache stat-dirty-cache)"
 run_prepare statdirty \
     TESTDATA_REQUIRE_CACHE=1 TESTDATA_CONTRACT_CACHE="${CACHE_SD}" TESTDATA_CACHE="${CACHE_SD}" \
@@ -304,6 +305,22 @@ case "$(cat "${WORK}/statdirty/out")" in
     *"::warning::"*"update-index --refresh"*)
         ok "and says so, because the cache's builder is what should fix it" ;;
     *) fail "expected a warning naming the fix: $(cat "${WORK}/statdirty/out")" ;;
+esac
+# Two counts, because the total answers "which failure is this" and
+# only the second answers "what does it cost". git reports every
+# tracked path whose stat data differs, images or not, so a reader
+# given one number would compare it against the wrong denominator --
+# the fixture here is deliberately two images and one file that is
+# neither an image nor under downloaded/'s image extensions.
+case "$(cat "${WORK}/statdirty/out")" in
+    *"3 tracked path(s)"*"2 of them in-scope images"*)
+        ok "and separates the tracked-path count from the image count" ;;
+    *) fail "expected both counts: $(cat "${WORK}/statdirty/out")" ;;
+esac
+case "$(cat "${WORK}/statdirty/out")" in
+    *"number of tracked files in the tree"*)
+        ok "and says what a large total means, against the right denominator" ;;
+    *) fail "expected the tracked-files reading: $(cat "${WORK}/statdirty/out")" ;;
 esac
 if ! grep -q '::warning::' "${WORK}/cache/out"; then
     ok "no warning when nothing was stat-dirty"

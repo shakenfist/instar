@@ -20,13 +20,16 @@ What is left is not code and cannot be done before this merges:
   rewrite and resparsify those images again (see Bugs fixed below);
   and private-ci's own Execution table still shows phase 3 as `In
   progress` although it is deployed.
-* Reading the measurement leg's `prepare-testdata.sh` warnings. A
-  stat-dirty count close to the number of images means the index stat
-  data did not survive the handoff from the disk build to the runner
-  (uid or inode differences), so the narrow resparsify became
-  whole-tree and the disk saved nothing -- not merely a missing
-  `update-index --refresh`. A pointer count means the disk build did
-  not pull every LFS object.
+* Reading the measurement leg's `prepare-testdata.sh` warnings. The
+  stat-dirty warning gives a tracked-path total and an in-scope image
+  count; the total is the diagnostic one, because git reports every
+  tracked path whose stat data differs and the tree holds around
+  770,000 of them against a few thousand images. A total near the
+  number of tracked files means the index stat data did not survive
+  the handoff from the disk build to the runner (uid or inode
+  differences), so the narrow resparsify became whole-tree and the
+  disk saved nothing -- not merely a missing `update-index --refresh`.
+  A pointer count means the disk build did not pull every LFS object.
 * Re-running step 8's push audit over the commits added after it ran.
 
 #543 itself is not closed by this plan either way: the capacity

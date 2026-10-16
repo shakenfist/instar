@@ -490,6 +490,93 @@ case "${OUTPUT}" in
     *) fail "exit ${STATUS}, expected one image in '${OUTPUT}'" ;;
 esac
 
+start "a large list is filtered without a process per entry"
+# The changed-file list this mode reads is not bounded by the number of
+# images. Its stat-dirty half covers every tracked path, so a cache
+# whose index did not survive the trip from the disk build names all
+# ~770,000 files in instar-testdata. A classifier that resolved each one
+# would spend a process per entry and the step would hit the job
+# timeout -- which would hide the ::warning:: that diagnoses exactly
+# that situation behind a failure that explains nothing.
+#
+# Counted rather than timed: a wall-clock bound would be a flake on a
+# loaded runner, and the property is not "fast" but "one resolution per
+# candidate worth resolving". The stub counts and then execs the real
+# thing, so the script under test still gets real answers.
+TREE="$(narrow_tree narrow-bulk)"
+COUNT_BIN="${WORK}/count-bin"
+mkdir -p "${COUNT_BIN}"
+REAL_REALPATH="$(command -v realpath)"
+cat > "${COUNT_BIN}/realpath" <<STUB
+#!/usr/bin/env bash
+echo x >> "${WORK}/realpath-calls"
+exec "${REAL_REALPATH}" "\$@"
+STUB
+chmod +x "${COUNT_BIN}/realpath"
+BULK_LIST="${WORK}/bulk-list.txt"
+: > "${BULK_LIST}"
+for i in $(seq 1 2000); do
+    printf 'docs/page-%s.md\ncustom/fixture-%s.qcow2\ndownloaded/notes-%s.txt\n' \
+        "${i}" "${i}" "${i}" >> "${BULK_LIST}"
+done
+printf 'downloaded/named.qcow2\n' >> "${BULK_LIST}"
+: > "${WORK}/realpath-calls"
+NAMED_BEFORE="$(blocks "${TREE}/downloaded/named.qcow2")"
+STATUS=0
+OUTPUT="$(PATH="${COUNT_BIN}:${PATH}" "${BASH_BIN}" "${SCRIPT}" "${TREE}" \
+    --files-from "${BULK_LIST}" 2>&1)" || STATUS=$?
+CALLS="$(wc -l < "${WORK}/realpath-calls")"
+if [ "${STATUS}" -eq 0 ] \
+    && [ "$(blocks "${TREE}/downloaded/named.qcow2")" -lt "${NAMED_BEFORE}" ]; then
+    ok "6001 entries, and the one in-scope image still shrank"
+else
+    fail "exit ${STATUS}: ${OUTPUT}"
+fi
+# One for the tree itself, one for the single in-scope candidate. The
+# bound is deliberately loose -- what must not happen is a count that
+# grows with the list.
+if [ "${CALLS}" -le 10 ]; then
+    ok "resolved ${CALLS} path(s), not one per entry"
+else
+    fail "resolved ${CALLS} path(s) for a 6001-entry list"
+fi
+
+start "the narrow argument forms the parser accepts are all exercised"
+# Each of these is a branch of the argument parser with no other
+# coverage: the attached spelling, a second list, the end-of-options
+# separator, and a list whose last line has no newline -- which is what
+# a generator that forgot the final write produces, and which the read
+# loop handles on purpose.
+TREE="$(narrow_tree narrow-forms)"
+printf 'downloaded/unnamed.qcow2\n' > "${WORK}/forms-a.txt"
+printf 'downloaded/nested/also-unnamed.vhd' > "${WORK}/forms-b.txt"
+NAMED_BEFORE="$(blocks "${TREE}/downloaded/named.qcow2")"
+UNNAMED_BEFORE="$(blocks "${TREE}/downloaded/unnamed.qcow2")"
+NESTED_BEFORE="$(blocks "${TREE}/downloaded/nested/also-unnamed.vhd")"
+CUSTOM_BEFORE="$(blocks "${TREE}/custom/fixture.qcow2")"
+STATUS=0
+OUTPUT="$("${BASH_BIN}" "${SCRIPT}" "${TREE}" \
+    --files-from="${WORK}/forms-a.txt" \
+    --files-from "${WORK}/forms-b.txt" \
+    -- downloaded/named.qcow2 2>&1)" || STATUS=$?
+if [ "${STATUS}" -eq 0 ]; then
+    ok "exits 0"
+else
+    fail "exit ${STATUS}: ${OUTPUT}"
+fi
+if [ "$(blocks "${TREE}/downloaded/named.qcow2")" -lt "${NAMED_BEFORE}" ] \
+    && [ "$(blocks "${TREE}/downloaded/unnamed.qcow2")" -lt "${UNNAMED_BEFORE}" ] \
+    && [ "$(blocks "${TREE}/downloaded/nested/also-unnamed.vhd")" -lt "${NESTED_BEFORE}" ]; then
+    ok "all three forms contributed: attached list, separate list, path after --"
+else
+    fail "not every form was acted on: ${OUTPUT}"
+fi
+if [ "$(blocks "${TREE}/custom/fixture.qcow2")" = "${CUSTOM_BEFORE}" ]; then
+    ok "and nothing outside the three was touched"
+else
+    fail "custom/fixture.qcow2 was rewritten: ${OUTPUT}"
+fi
+
 start "the extension list is published rather than copied"
 # tools/ci/prepare-testdata.sh builds the changed-file list this mode
 # consumes, and nothing else in the repository may hold a second copy of

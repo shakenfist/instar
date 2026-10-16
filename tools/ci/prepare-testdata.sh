@@ -299,8 +299,11 @@ if [ "${TESTDATA_SOURCE}" = 'cache' ]; then
     # alone would miss them.
     #
     # Rename detection is left on: a renamed image is listed under its
-    # new path only, which is all the resparsify needs. Anything that
-    # wants deletions out of this list should pass --no-renames.
+    # new path only, which is all the resparsify needs, since the old
+    # path no longer exists and the consumer drops it anyway. Passing
+    # --no-renames would *add* the old path, reported as a deletion --
+    # it does not take deletions out. Pure deletions are listed either
+    # way.
     {
         git diff --name-only -z "${PREVIOUS_REV}" HEAD | tr '\0' '\n'
         if [ -n "${STAT_DIRTY}" ]; then
@@ -317,9 +320,25 @@ if [ "${TESTDATA_SOURCE}" = 'cache' ]; then
         # files. The fix is on the other side -- the build runs
         # `git update-index --refresh` after resparsifying -- and this
         # is the only place the cost is visible.
-        echo "::warning::$(printf '%s\n' "${STAT_DIRTY}" | wc -l) path(s) in" \
-             "${TESTDATA_CACHE} had stale index stat data before the update, so" \
-             "the reset rewrote them and they are resparsified again here." \
+        #
+        # Two counts, because one of them answers the wrong question.
+        # git reports every tracked path whose stat data differs, and
+        # instar-testdata tracks around 770,000 of them against a few
+        # thousand images, so the total says which failure this is --
+        # a handful of images the build rewrote, or an index that did
+        # not survive the trip at all -- while the second says what it
+        # costs. The extension list comes from the resparsifier rather
+        # than a second copy here.
+        STAT_DIRTY_TOTAL="$(printf '%s\n' "${STAT_DIRTY}" | wc -l)"
+        STAT_DIRTY_IMAGES="$(printf '%s\n' "${STAT_DIRTY}" \
+            | grep -c -E "^downloaded/.*\.($("${SCRIPT_DIR}/resparsify-testdata.sh" \
+                --list-extensions | paste -sd '|'))\$" || true)"
+        echo "::warning::${STAT_DIRTY_TOTAL} tracked path(s) in ${TESTDATA_CACHE}," \
+             "${STAT_DIRTY_IMAGES} of them in-scope images, had stale index stat" \
+             "data before the update, so the reset rewrote them and they are" \
+             "resparsified again here. A total near the number of tracked files" \
+             "in the tree means the index did not survive the handoff from the" \
+             "disk build and the narrow resparsify has become a whole-tree one." \
              "Whatever built this cache should run 'git update-index --refresh'" \
              "after resparsifying it."
     fi

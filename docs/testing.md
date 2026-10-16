@@ -1030,12 +1030,17 @@ re-expanded. Including them costs nothing extra: the reset already wrote them
 into the overlay. The script emits a `::warning::` naming the count when it
 finds any, because the real fix belongs to whatever built the cache — a
 `git update-index --refresh` after its resparsify — and this is the only place
-the cost is visible. A count close to the number of images in the tree means
-something else: the index stat data did not survive the trip from the disk
-build to the runner at all (a different uid, or inode numbers that changed on
-the way), so the narrow resparsify has quietly become a whole-tree one and the
-disk is saving nothing. That needs fixing in how the disk is built or mounted;
-a refresh at build time will not help.
+the cost is visible. The warning carries two counts, and the first is the one
+to read: `git diff-files` reports every *tracked* path whose stat data
+differs, images or not, and instar-testdata tracks around 770,000 of them
+against a few thousand images. A total near the number of tracked files in the
+tree means something other than a missed refresh — the index stat data did not
+survive the trip from the disk build to the runner at all (a different uid, or
+inode numbers that changed on the way), so the narrow resparsify has quietly
+become a whole-tree one and the disk is saving nothing. That needs fixing in
+how the disk is built or mounted; a refresh at build time will not help. The
+second count, the in-scope images among them, is what the resparsify actually
+pays for.
 
 The pointers are the same kind of gap. `git lfs pull` writes each pointer out
 fully allocated and then refreshes the index for it, so nothing afterwards —
@@ -1178,6 +1183,28 @@ A path that resolves outside the tree is refused in both forms, and a refusal
 resparsifies nothing at all. An empty narrow set is success, unlike the
 whole-tree form: a cached tree whose update changed no image is the normal
 case, not a misconfiguration.
+
+That refusal is deliberate and its blast radius is worth knowing before you
+meet it. The `--files-from` list on the cache path comes from git, not from an
+operator, so a single instar-testdata commit adding a symlink under
+`downloaded/` with an image extension and a target outside the checkout would
+fail the resparsify step on **all eight labelled jobs at once**, and keep
+failing until that commit is fixed. Fleet-wide CI failure with
+`resparsify-testdata: refusing …: resolves outside …` in it is a testdata
+commit to look at, not an instar regression; the refusal message names the
+list file the entry came from for that reason. Refusing is still the right
+behaviour — the alternative is writing outside the tree — but it is the one
+failure here that is nobody's pull request.
+
+Everything else in a list is filtered rather than refused, and the filtering
+is done without resolving each entry: a candidate that is relative, free of
+`..`, and either outside `downloaded/` or not an image extension is dropped on
+the string alone. That matters because the list is not bounded by the number
+of images — its stat-dirty component names every tracked path, so a cache
+whose index did not survive the handoff names all ~770,000 — and a process per
+entry would turn the step into a job timeout, hiding the warning that
+diagnoses it. `tools/ci/test-resparsify-testdata.sh` counts the resolutions
+rather than timing the run.
 
 ## Expected Output Overrides
 

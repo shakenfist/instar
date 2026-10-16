@@ -104,6 +104,14 @@ STALE="${CACHE}/downloaded/qemu-iotests/stale-stat.qcow2"
 CONTROL="${CACHE}/downloaded/qemu-iotests/control.qcow2"
 while IFS= read -r image; do inflate "${image}"; done \
     < <(find "${CACHE}/downloaded" -type f -name '*.qcow2')
+# Backdated before the refresh, and not for tidiness. Git calls an
+# entry whose mtime is not older than the index file "racily clean"
+# and may re-examine or re-record it, so a control refreshed in the
+# same second it was written could read as stat-dirty on one
+# filesystem's timestamp resolution and clean on another -- an
+# intermittent failure of the one assertion here that is supposed to
+# be the quiet half of the comparison.
+find "${CACHE}/downloaded" -type f -exec touch -d '-1 minute' {} +
 git -C "${CACHE}" update-index --refresh > /dev/null
 INFLATED_BLOCKS="$(blocks "${STALE}")"
 bash "${RESPARSIFY}" "${CACHE}" downloaded/qemu-iotests/stale-stat.qcow2 > /dev/null

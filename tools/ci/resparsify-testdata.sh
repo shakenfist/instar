@@ -228,9 +228,21 @@ else
     # from either form), 2 for inside the tree but not something this
     # script acts on (droppable from a changed-file list, refused when
     # named).
+    # in_scope_extension PATH -- true when the path ends in one of the
+    # whole-disk image extensions. Pure string work, no subprocess.
+    in_scope_extension() {
+        local ext
+        for ext in "${EXTENSIONS[@]}"; do
+            case "$1" in
+                *".${ext}") return 0 ;;
+            esac
+        done
+        return 1
+    }
+
     classify() {
         local candidate="$1"
-        local absolute resolved relative ext matched
+        local absolute resolved relative
 
         CLASSIFIED=''
         REASON=''
@@ -239,6 +251,42 @@ else
             REASON='empty path'
             return 1
         fi
+
+        # Decide what can be decided from the string before resolving,
+        # because resolving costs a process and the list can be very
+        # large. The stat-dirty half of a changed-file list covers
+        # every tracked path, not only the images, so a cache whose
+        # index did not survive the trip from the disk build names all
+        # of them -- around 770,000 for instar-testdata. One realpath
+        # per entry turns this step into a job timeout, and a timeout
+        # would bury the ::warning:: that diagnoses that exact
+        # situation under a failure that explains nothing.
+        #
+        # Only *rejections* are taken on the string. Nothing is
+        # accepted without being resolved, so the escape-the-tree check
+        # below still sees every path this script might write to, and
+        # anything that could climb or be redirected -- an absolute
+        # path, or any path containing ".." -- skips the shortcut
+        # entirely and is resolved as it always was.
+        #
+        # One deliberate narrowing: a relative candidate reaching an
+        # in-scope image *through* a symlinked directory is now dropped
+        # rather than followed. Whole-tree mode never reached those
+        # either, because find does not descend a symlink, so the two
+        # forms agree where before only one of them acted.
+        case "${candidate}" in
+            /*|*..*) ;;
+            "${SCOPE_REL}"/*)
+                if ! in_scope_extension "${candidate}"; then
+                    REASON="not one of $(extension_phrase)"
+                    return 2
+                fi
+                ;;
+            *)
+                REASON="not under ${SCOPE_REL}/"
+                return 2
+                ;;
+        esac
 
         case "${candidate}" in
             /*) absolute="${candidate}" ;;
@@ -266,13 +314,7 @@ else
                 ;;
         esac
 
-        matched=0
-        for ext in "${EXTENSIONS[@]}"; do
-            case "${relative}" in
-                *".${ext}") matched=1; break ;;
-            esac
-        done
-        if [ "${matched}" -eq 0 ]; then
+        if ! in_scope_extension "${relative}"; then
             REASON="not one of $(extension_phrase)"
             return 2
         fi
