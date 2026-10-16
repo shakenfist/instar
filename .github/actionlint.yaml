@@ -10,9 +10,9 @@ self-hosted-runner:
     # it runs in a container, and static runners have no docker daemon.
     - debian-13-docker
     # A runner carrying the pre-seeded instar-testdata dependencies
-    # disk. Permitted here ahead of its first use on purpose: actionlint
-    # rejects an unknown self-hosted runner label, so a `runs-on` naming
-    # it cannot even be committed until this entry exists.
+    # disk. This entry has to come before any `runs-on` that names it:
+    # actionlint rejects an unknown self-hosted runner label, so such a
+    # workflow cannot even be committed until the label is listed here.
     - instar
     - static
     - vm

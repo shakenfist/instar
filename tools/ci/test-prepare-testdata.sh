@@ -16,6 +16,16 @@
 # just enough of a checkout to satisfy the fixture guard. That makes the
 # interesting assertion possible: not only that the script failed, but
 # that it failed *without* having started a clone.
+#
+# Every case here runs everywhere, deliberately: there is no skip and
+# nothing conditional on what this machine happens to have mounted.
+# The require-cache cases used to stand down when the contractual path
+# existed -- which is the runner they exist for -- and a stood-down
+# case printed "ok", so "we tested the refusal" and "we could not test
+# it" read identically. They now relocate the contract through
+# TESTDATA_CONTRACT_CACHE instead; if a case ever has to become
+# conditional again, make it say so loudly rather than reporting a
+# pass.
 
 set -euo pipefail
 
@@ -271,55 +281,117 @@ case "${OUTPUT}" in
     *) fail "expected the branch in '${OUTPUT}'" ;;
 esac
 
+start "the contractual path is a constant, relocatable only by the test seam"
+# Everything below moves the contract to a temporary directory, because
+# the real one is a disk this machine does not have. Two things make
+# that honest rather than a way of testing something else.
+#
+# The default is still the literal path: asserted here by running with
+# the seam unset, which is also the one case in this file that pins the
+# constant the fleet agreed to.
+run_prepare default-contract TESTDATA_REQUIRE_CACHE=1 TESTDATA_CACHE="${WORK}/somewhere-else"
+DEFAULT_OUT="$(cat "${WORK}/default-contract/out")"
+case "${DEFAULT_OUT}" in
+    *"not the agreed ${CONTRACT_CACHE}"*) ok "unset, the contract is ${CONTRACT_CACHE}" ;;
+    *) fail "expected ${CONTRACT_CACHE} in '${DEFAULT_OUT}'" ;;
+esac
+# And the seam is a different variable from TESTDATA_CACHE, so a job
+# cannot satisfy the guard by pointing both halves of it at the same
+# wrong place. That only holds while nothing in CI sets it.
+if ! grep -rq 'TESTDATA_CONTRACT_CACHE' "${REPO_ROOT}/.github"; then
+    ok "nothing under .github/ sets the seam"
+else
+    fail "a workflow sets it: $(grep -rn 'TESTDATA_CONTRACT_CACHE' "${REPO_ROOT}/.github")"
+fi
+run_prepare seam-alone TESTDATA_REQUIRE_CACHE=1 \
+    TESTDATA_CONTRACT_CACHE="${WORK}/relocated-contract"
+case "$(cat "${WORK}/seam-alone/out")" in
+    *"not the agreed ${WORK}/relocated-contract"*)
+        ok "relocating the contract alone still refuses a TESTDATA_CACHE that does not match" ;;
+    *) fail "expected a mismatch against the relocated path: $(cat "${WORK}/seam-alone/out")" ;;
+esac
+
 start "TESTDATA_REQUIRE_CACHE refuses the fallback with the cache absent"
 # Proved with the cache absent rather than by reading the branch: this
 # is the assertion that stops a mounted-nowhere disk from degrading into
-# a 7.46 GiB clone that merely looks slow.
-if [ -d "${CONTRACT_CACHE}/.git" ]; then
-    # On a runner that really has the disk the default path exists, and
-    # the case below would be measuring the wrong thing.
-    ok "skipped: ${CONTRACT_CACHE} exists here, so this case cannot be set up"
+# a 7.46 GiB clone that merely looks slow. Hermetic through the seam
+# above: the previous shape of this case stood down whenever the real
+# path happened to exist, which is precisely the runner the guard is
+# for, and a stood-down case printed "ok".
+ABSENT_CONTRACT="${WORK}/absent-contract"
+run_prepare require TESTDATA_REQUIRE_CACHE=1 \
+    TESTDATA_CONTRACT_CACHE="${ABSENT_CONTRACT}" TESTDATA_CACHE="${ABSENT_CONTRACT}"
+REQUIRE_STATUS="$(cat "${WORK}/require/status")"
+REQUIRE_OUT="$(cat "${WORK}/require/out")"
+if [ "${REQUIRE_STATUS}" -ne 0 ]; then
+    ok "exits non-zero (${REQUIRE_STATUS}) instead of cloning"
 else
-    run_prepare require TESTDATA_REQUIRE_CACHE=1
-    REQUIRE_STATUS="$(cat "${WORK}/require/status")"
-    REQUIRE_OUT="$(cat "${WORK}/require/out")"
-    if [ "${REQUIRE_STATUS}" -ne 0 ]; then
-        ok "exits non-zero (${REQUIRE_STATUS}) instead of cloning"
-    else
-        fail "expected a non-zero exit: ${REQUIRE_OUT}"
-    fi
-    if [ ! -s "${WORK}/require/log" ]; then
-        ok "ran no git at all, so nothing was cloned"
-    else
-        fail "git was called: $(cat "${WORK}/require/log")"
-    fi
-    if [ -z "$(ls -A "${WORK}/require/workspace")" ]; then
-        ok "left no checkout in the workspace"
-    else
-        fail "workspace holds $(ls -A "${WORK}/require/workspace")"
-    fi
-    case "${REQUIRE_OUT}" in
-        *"::error::"*) ok "reports it as an infra error, in the annotated idiom" ;;
-        *) fail "expected an ::error:: annotation in '${REQUIRE_OUT}'" ;;
-    esac
-    case "${REQUIRE_OUT}" in
-        *"${CONTRACT_CACHE}"*) ok "names the contractual path" ;;
-        *) fail "expected ${CONTRACT_CACHE} in '${REQUIRE_OUT}'" ;;
-    esac
-    # The diagnosis is load bearing and easy to get wrong in the
-    # reassuring direction: a mount that failed cannot produce this
-    # message, because it stops the runner before it registers, so the
-    # job never starts. Blaming one would send the reader to userdata
-    # logs for an event that cannot have happened.
-    case "${REQUIRE_OUT}" in
-        *"path mismatch, not a failed mount"*) ok "diagnoses a path mismatch, not a mount failure" ;;
-        *) fail "expected the path-mismatch diagnosis in '${REQUIRE_OUT}'" ;;
-    esac
-    if ! grep -q 'TESTDATA_REQUIRE_CACHE' "${WORK}/require/env"; then
-        ok "exported nothing to \$GITHUB_ENV"
-    else
-        fail "wrote to GITHUB_ENV: $(cat "${WORK}/require/env")"
-    fi
+    fail "expected a non-zero exit: ${REQUIRE_OUT}"
+fi
+if [ ! -s "${WORK}/require/log" ]; then
+    ok "ran no git at all, so nothing was cloned"
+else
+    fail "git was called: $(cat "${WORK}/require/log")"
+fi
+if [ -z "$(ls -A "${WORK}/require/workspace")" ]; then
+    ok "left no checkout in the workspace"
+else
+    fail "workspace holds $(ls -A "${WORK}/require/workspace")"
+fi
+case "${REQUIRE_OUT}" in
+    *"::error::"*) ok "reports it as an infra error, in the annotated idiom" ;;
+    *) fail "expected an ::error:: annotation in '${REQUIRE_OUT}'" ;;
+esac
+case "${REQUIRE_OUT}" in
+    *"${ABSENT_CONTRACT}"*) ok "names the contractual path" ;;
+    *) fail "expected ${ABSENT_CONTRACT} in '${REQUIRE_OUT}'" ;;
+esac
+# The diagnosis is load bearing and easy to get wrong in the
+# reassuring direction: a mount that failed cannot produce this
+# message, because it stops the runner before it registers, so the
+# job never starts. Blaming one would send the reader to userdata
+# logs for an event that cannot have happened.
+case "${REQUIRE_OUT}" in
+    *"path mismatch, not a failed mount"*) ok "diagnoses a path mismatch, not a mount failure" ;;
+    *) fail "expected the path-mismatch diagnosis in '${REQUIRE_OUT}'" ;;
+esac
+if ! grep -q 'TESTDATA_REQUIRE_CACHE' "${WORK}/require/env"; then
+    ok "exported nothing to \$GITHUB_ENV"
+else
+    fail "wrote to GITHUB_ENV: $(cat "${WORK}/require/env")"
+fi
+
+start "TESTDATA_REQUIRE_CACHE is satisfied by a cache at the contractual path"
+# The load-bearing half, and until the seam above it was covered by
+# nothing: every other case here proves the guard refuses, none proved
+# it lets the ordinary job through. A guard that refused everything
+# would pass all of them and fail every labelled job in CI.
+PRESENT_CONTRACT="$(make_cache present-contract)"
+run_prepare satisfied TESTDATA_REQUIRE_CACHE=1 \
+    TESTDATA_CONTRACT_CACHE="${PRESENT_CONTRACT}" TESTDATA_CACHE="${PRESENT_CONTRACT}" \
+    GIT_STUB_PREVIOUS_REV='4444444444444444444444444444444444444444' \
+    GIT_STUB_CHANGED="${WORK}/changed.txt"
+SATISFIED_OUT="$(cat "${WORK}/satisfied/out")"
+if [ "$(cat "${WORK}/satisfied/status")" -eq 0 ]; then
+    ok "exits 0"
+else
+    fail "expected exit 0, got $(cat "${WORK}/satisfied/status"): ${SATISFIED_OUT}"
+fi
+if [ "$(env_value satisfied TESTDATA_SOURCE)" = 'cache' ] \
+    && [ "$(env_value satisfied TESTDATA_PATH)" = "${PRESENT_CONTRACT}" ]; then
+    ok "takes the cache branch and exports the contractual path"
+else
+    fail "source '$(env_value satisfied TESTDATA_SOURCE)', path '$(env_value satisfied TESTDATA_PATH)'"
+fi
+if grep -q 'reset --hard' "${WORK}/satisfied/log" && ! grep -q '^clone' "${WORK}/satisfied/log"; then
+    ok "updated in place without cloning"
+else
+    fail "unexpected git calls: $(cat "${WORK}/satisfied/log")"
+fi
+if [ -n "$(env_value satisfied TESTDATA_CHANGED_FILES)" ]; then
+    ok "still produces the changed-file list the narrow resparsify needs"
+else
+    fail "no TESTDATA_CHANGED_FILES: $(cat "${WORK}/satisfied/env")"
 fi
 
 start "TESTDATA_REQUIRE_CACHE also refuses a cache somewhere else"
@@ -341,8 +413,10 @@ case "${ELSEWHERE_OUT}" in
 esac
 
 start "TESTDATA_REQUIRE_CACHE unset keeps the fallback"
-# The flag is implemented but switched on nowhere, so the default has to
-# stay exactly what it was.
+# The flag is on in CI, but only on the jobs that ask the fleet for the
+# disk. Everything else -- the static-fleet drift fixer, a developer
+# running this by hand, a future job that has no reason to want the
+# disk -- still has to get the clone it always got.
 if [ "$(cat "${WORK}/clone/status")" -eq 0 ] && grep -q '^clone' "${WORK}/clone/log"; then
     ok "a missing cache still clones when the flag is not set"
 else

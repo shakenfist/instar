@@ -22,6 +22,10 @@
 #   TESTDATA_REQUIRE_CACHE
 #                    (optional) Set to 1 to refuse the fresh-clone
 #                    fallback; see "REQUIRING THE CACHE" below.
+#   TESTDATA_CONTRACT_CACHE
+#                    (test seam) Relocates the contractual path that
+#                    flag is checked against. See CONTRACT_CACHE below
+#                    for why this does not weaken the check.
 #   GITHUB_WORKSPACE (required in Actions) Fresh-clone parent dir.
 #   RUNNER_TEMP      (optional) Where the changed-file list below is
 #                    written; the workspace when unset.
@@ -42,9 +46,11 @@
 #
 # WHY THE BRANCH TAKEN IS PART OF THE OUTPUT. A fresh clone writes every
 # image out fully allocated, so the whole tree needs resparsifying
-# afterwards (tools/ci/resparsify-testdata.sh). A cache does not: where
-# that cache is a pre-built testdata dependencies disk, the tree is a
-# copy-on-write overlay of an image that was resparsified when it was
+# afterwards. The consumer is tools/ci/resparsify-prepared-testdata.sh,
+# which reads these variables and picks one of the two calling forms of
+# tools/ci/resparsify-testdata.sh. A cache does not need all of it:
+# where that cache is a pre-built testdata dependencies disk, the tree
+# is a copy-on-write overlay of an image that was resparsified when it was
 # built, and rewriting all of it would write the gigabytes into the
 # overlay that the disk exists to avoid. Only the paths this update
 # brought in need it, which is why the changed-file list is produced
@@ -77,7 +83,24 @@ REPO_PATH='private/instar-testdata.git'
 # Written out literally, and deliberately not derived from
 # TESTDATA_CACHE above, because this is the half of the contract this
 # repository is responsible for asserting.
-CONTRACT_CACHE='/srv/ci/cached/instar-testdata'
+#
+# TESTDATA_CONTRACT_CACHE relocates it, and exists for exactly one
+# caller: tools/ci/test-prepare-testdata.sh, which otherwise cannot
+# exercise either side of the guard below without the real disk being
+# mounted on the machine running the tests. A case that can only be
+# skipped is a case that proves nothing, and the half of the contract
+# that matters most -- a required cache that is present -- is the half
+# a developer machine can never reach.
+#
+# It is a seam, not a loophole, and the distinction is that it is a
+# *different variable* from TESTDATA_CACHE. The guard asks whether the
+# operational override agrees with the agreed path; letting the same
+# variable supply both sides would make it tautological, which is the
+# thing the literal was written out to prevent. Supplying only this one
+# does not help a misconfigured job either: TESTDATA_CACHE still has to
+# match it. Nothing under .github/ sets it, and
+# tools/ci/test-prepare-testdata.sh asserts that nothing does.
+CONTRACT_CACHE="${TESTDATA_CONTRACT_CACHE:-/srv/ci/cached/instar-testdata}"
 
 if ! command -v git-lfs >/dev/null 2>&1; then
     echo "::error::git-lfs is not installed on this runner; instar-testdata" \
@@ -145,6 +168,17 @@ if [ -d "${TESTDATA_CACHE}/.git" ]; then
     git fetch --depth 1 origin main
     git reset --hard origin/main
     TESTDATA_PATH="${TESTDATA_CACHE}"
+    # "cache" is only ever observed as "a tree was already here", which
+    # is strictly weaker than what the narrow resparsify downstream
+    # relies on -- that the tree it was built from was already sparse.
+    # Nothing here can check the stronger thing, and today the two
+    # coincide because the only cache any job meets is the fleet's
+    # pre-built disk, whose image is resparsified when it is built. A
+    # second kind of cache, seeded any other way, would make this value
+    # a lie in the expensive direction: the images it arrived with would
+    # stay fully allocated because no update touched them. Such a cache
+    # needs a third TESTDATA_SOURCE value, not a looser reading of this
+    # one.
     TESTDATA_SOURCE='cache'
 else
     echo "No cache at ${TESTDATA_CACHE}, cloning fresh..."

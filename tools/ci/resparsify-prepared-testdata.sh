@@ -64,6 +64,18 @@ case "${TESTDATA_SOURCE:-}" in
         exec "${RESPARSIFY}" "${TESTDATA_PATH}"
         ;;
     cache)
+        # The assumption this branch rests on, stated where it is
+        # relied upon: "cache" is only evidence that a tree was already
+        # there, and narrowing to the changed files is correct only if
+        # everything that was already there was already sparse. Nothing
+        # observes that. It holds today because the only cache any job
+        # meets is the fleet's pre-built testdata disk, whose image is
+        # resparsified when it is built, and the labelled jobs refuse to
+        # run without exactly that disk. A cache seeded some other way
+        # would leave its untouched images fully allocated here, costing
+        # disk and skewing the disk_size comparisons -- so give such a
+        # cache its own TESTDATA_SOURCE value rather than widening what
+        # this one means.
         if [ -z "${TESTDATA_CHANGED_FILES:-}" ]; then
             echo "::error::TESTDATA_SOURCE=cache but TESTDATA_CHANGED_FILES is not set." \
                  "prepare-testdata.sh exports both together on that branch, so one without" \

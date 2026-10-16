@@ -69,8 +69,8 @@ permissions:
 jobs:
   test-and-fix:
     # No testdata-disk label here, deliberately, and it stays that way
-    # even once the jobs in the other workflows that prepare testdata
-    # ask for one. `claude-code` is the *static* runner fleet: the
+    # even though every other job that prepares testdata now asks for
+    # one. `claude-code` is the *static* runner fleet: the
     # conductor only watches those VMs and never attaches a cache disk
     # to them, so no static runner will ever advertise the `instar`
     # label. A job here requesting it would never be assigned and would

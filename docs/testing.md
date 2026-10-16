@@ -1013,7 +1013,7 @@ looking. Beside `TESTDATA_PATH` it exports:
 
 | Variable | Meaning |
 |---|---|
-| `TESTDATA_SOURCE` | `cache` (updated in place) or `clone` (fresh). A fresh clone writes every image out fully allocated, so the whole tree needs resparsifying; a cache usually does not. |
+| `TESTDATA_SOURCE` | `cache` (updated in place) or `clone` (fresh). A fresh clone writes every image out fully allocated, so the whole tree needs resparsifying; a cache needs only what the update changed. That narrower treatment assumes the cache was built from an already-sparse tree, which the fleet's pre-built disk is and which the script cannot itself check — a cache seeded any other way would need a third `TESTDATA_SOURCE` value rather than this one. |
 | `TESTDATA_CHANGED_FILES` | On the cache branch only: a file listing the paths the update changed, one per line, for the narrow resparsify above. Derived here because the reset that changed them happens here — by the time a later step runs there is nothing left to diff. |
 
 Both are printed as well as written to `$GITHUB_ENV`, and running the script
@@ -1025,16 +1025,27 @@ that silently did the slow thing merely looks slow, which is the failure mode
 that goes unnoticed for weeks. The assertion names the contractual mount path
 (`/srv/ci/cached/instar-testdata`) literally rather than taking it from
 `TESTDATA_CACHE`, so a change to either side of that contract fails there
-instead of quietly following a defaulted path. What it detects is a **path
-mismatch** — the disk mounted somewhere else, or a runner advertising the
+instead of quietly following a defaulted path. `TESTDATA_CONTRACT_CACHE`
+relocates it, and exists only so `tools/ci/test-prepare-testdata.sh` can
+exercise both sides of the guard on a machine with no such disk; it is a
+different variable from `TESTDATA_CACHE` on purpose, so the two cannot be
+pointed at the same wrong place, and nothing under `.github/` sets it. What
+it detects is a **path mismatch** — the disk mounted somewhere else, or a runner advertising the
 disk's label without the disk. It cannot be a failed mount: that stops the
 fleet's userdata before the runner registers, so such a job stays queued and
 never runs this script at all.
 
 ### The `instar` runner label
 
-Eight of the nine jobs that prepare testdata ask the fleet for that disk with
-an extra `runs-on` label:
+Nine jobs prepare testdata. Two different eights are drawn from them below,
+and they are not the same eight: the set that asks for the disk here, and the
+set that resparsifies afterwards in the next section. Each lists its members,
+and `coverage-fuzz` and `test-and-fix` are what separate them —
+`coverage-fuzz` asks for the disk but does not resparsify, and `test-and-fix`
+resparsifies but cannot ask for the disk.
+
+All of them except `test-and-fix` ask the fleet for that disk with an extra
+`runs-on` label:
 
 ```yaml
 runs-on: [self-hosted, debian-13, xl, instar]
@@ -1049,13 +1060,14 @@ rather than running the job. The label must also be listed under
 `self-hosted-runner.labels` in `.github/actionlint.yaml`, or actionlint (which
 runs in pre-commit) rejects the `runs-on` before it can be committed.
 
-Those same eight jobs set `TESTDATA_REQUIRE_CACHE: '1'` on their prepare step.
-A job that asked for the disk and did not get it must say so, rather than
-quietly falling back to the clone the label exists to avoid. They are
-`package-matrix`, `integration-core`, `integration-convert-qcow2`,
-`integration-convert-vhd` and `oslo-crossval-master` in
-`functional-tests.yml`; `nightly-legs` and `measure` in `nightly-matrix.yml`;
-and `coverage-fuzz` in `coverage-fuzz.yml`.
+Those same eight jobs — call them the **label set** — also set
+`TESTDATA_REQUIRE_CACHE: '1'` on their prepare step. A job that asked for the
+disk and did not get it must say so, rather than quietly falling back to the
+clone the label exists to avoid. They are `package-matrix`,
+`integration-core`, `integration-convert-qcow2`, `integration-convert-vhd`
+and `oslo-crossval-master` in `functional-tests.yml`; `nightly-legs` and
+`measure` in `nightly-matrix.yml`; and `coverage-fuzz` in
+`coverage-fuzz.yml`.
 
 The ninth testdata consumer, `test-and-fix` in `test-drift-fix.yml`, carries
 neither, deliberately and permanently. It runs on `[self-hosted, claude-code]`
@@ -1068,10 +1080,11 @@ workflow.
 
 ### Resparsifying
 
-Eight of the nine jobs that prepare testdata then run
-**`tools/ci/resparsify-prepared-testdata.sh`** — every one that runs the
-Python integration suite over the tree (five in `functional-tests.yml`, two in
-`nightly-matrix.yml`, one in `test-drift-fix.yml`). That step takes no
+A different eight of those nine jobs — the **resparsify set**, which is the
+label set with `coverage-fuzz` taken out and `test-and-fix` put in — then run
+**`tools/ci/resparsify-prepared-testdata.sh`**. They are every job that runs
+the Python integration suite over the tree (five in `functional-tests.yml`,
+two in `nightly-matrix.yml`, one in `test-drift-fix.yml`). That step takes no
 arguments: it reads the `TESTDATA_SOURCE` and `TESTDATA_CHANGED_FILES` above
 and calls `tools/ci/resparsify-testdata.sh` in whichever of its two forms the
 tree needs — the whole tree for a fresh clone, and only the paths the update

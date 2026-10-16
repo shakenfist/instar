@@ -10,9 +10,15 @@
 # compare instar's disk_size against qemu-img's see an allocation that
 # belongs to git rather than to the fixture.
 #
-# `cp --sparse=always` rewrites the holes. It is cheap and idempotent, so
-# running it over a tree that is already sparse costs little and is the
-# normal case on a cached tree.
+# `cp --sparse=always` rewrites the holes. It is idempotent -- a second
+# run over an already-sparse image produces the same image -- but it is
+# not free: it copies and renames every file it is given, sparse or not.
+# On an ordinary filesystem that costs time. On a copy-on-write overlay,
+# which is what a runner's testdata dependencies disk gives it, it also
+# writes every one of those files into the overlay, which is the cost
+# the disk exists to avoid. Hence the narrow mode below, and hence the
+# whole-tree form being reserved for trees that genuinely need all of
+# it.
 #
 # Scope is deliberately narrow, and widening it is a behaviour change
 # rather than a tidy-up: only `downloaded/`, and only the five image
@@ -82,7 +88,9 @@
 #
 # Either way a path that resolves outside the tree is refused outright,
 # in both forms, and nothing is resparsified when any entry is refused.
-# Paths may be tree-relative or absolute inside the tree.
+# Paths may be tree-relative or absolute inside the tree, and a symlink
+# is judged by what it points at: every rule above is applied to the
+# resolved target, which is also the file that gets rewritten.
 #
 # An empty narrow set is success, unlike the whole-tree form: "nothing
 # changed in this update" is the normal case on a cached tree, and the
@@ -269,11 +277,19 @@ else
             return 2
         fi
 
-        if [ -L "${resolved}" ]; then
-            REASON='is a symlink, not a regular file'
-            return 2
-        fi
-
+        # No symlink check, on purpose, and please do not add one back:
+        # realpath above has already resolved every component including
+        # the last, so a test on ${resolved} can never see a symlink and
+        # would be dead code. What matters is the target, and the target
+        # is what the three checks around this one judge -- inside the
+        # tree, under ${SCOPE_REL}/, an in-scope extension -- so a
+        # symlink pointing anywhere this script would not write directly
+        # is refused by the same rules as a plain path. One pointing at
+        # an in-scope image is followed, which is harmless: the copy
+        # below writes ${resolved}, the real file, leaving the symlink
+        # itself alone, and whole-tree mode reaches the same file through
+        # find. Resolving first also means naming both a link and its
+        # target resparsifies the target once rather than twice.
         if [ ! -f "${resolved}" ]; then
             REASON='does not exist'
             return 2

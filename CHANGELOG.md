@@ -365,6 +365,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **CI jobs that need instar-testdata now ask the runner fleet for a
+  machine that already has it.** Eight of the nine jobs that prepare
+  testdata carry an extra `instar` label in their `runs-on` and set
+  `TESTDATA_REQUIRE_CACHE: '1'` on their prepare step. Each of them was
+  cloning 7.46 GiB of git-LFS content and checking out 769,672 files
+  before it could start, a median of 82 seconds and roughly 52 GiB per
+  merge group; the label gets them a pre-seeded copy of the tree
+  instead, as a per-runner copy-on-write overlay that is discarded with
+  the runner
+  ([#543](https://github.com/shakenfist/instar/issues/543)).
+
+  Three things change for a contributor adding or editing a CI job that
+  prepares testdata. The job needs `instar` in its `runs-on`, and the
+  label has to be listed under `self-hosted-runner.labels` in
+  `.github/actionlint.yaml` first — actionlint runs in pre-commit and
+  rejects an unknown label, so the `runs-on` cannot be committed before
+  the entry exists. A job carrying the label should also set
+  `TESTDATA_REQUIRE_CACHE: '1'`, which is a new hard-failure mode:
+  `tools/ci/prepare-testdata.sh` refuses the fresh-clone fallback and
+  fails the job naming `/srv/ci/cached/instar-testdata`, rather than
+  quietly doing the 7.46 GiB thing the label exists to avoid, because a
+  job that merely looks slow goes unnoticed for weeks. And the
+  resparsify step is now `tools/ci/resparsify-prepared-testdata.sh`
+  taking no arguments, in place of `tools/ci/resparsify-testdata.sh
+  "${TESTDATA_PATH}"`: it reads the `TESTDATA_SOURCE` and
+  `TESTDATA_CHANGED_FILES` that `prepare-testdata.sh` now exports and
+  rewrites the whole tree only for a fresh clone, because sweeping a
+  cached tree writes into the overlay the gigabytes the disk exists to
+  avoid. `tools/ci/resparsify-testdata.sh` itself is unchanged in how
+  it is called with one argument, which is a cross-repository contract
+  with private-ci's image build.
+
+  `test-and-fix` in `test-drift-fix.yml` is the deliberate exception
+  and keeps cloning fresh. It runs on the static `claude-code` fleet,
+  which is only watched and never has a disk attached, so no runner
+  there will ever advertise `instar` and a labelled job would sit in
+  the queue until GitHub cancelled it 24 hours later — worse than the
+  clone it was trying to avoid.
+
 - **Six heavy VHD conversion tests no longer gate a merge; a nightly job
   runs them across all seven distros instead.** The Hyper-V and
   VirtualPC cases of `TestConvertVhdToQcow2Roundtrip`,

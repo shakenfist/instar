@@ -35,10 +35,23 @@ WORK="$(mktemp -d)"
 trap 'chmod -R u+w "${WORK}" 2>/dev/null; rm -rf "${WORK}"' EXIT
 
 FAILURES=0
+SKIPS=0
+SKIPPED_CASES=''
 
 start() { echo "--- $1"; }
 ok() { echo "    ok: $1"; }
 fail() { echo "    FAIL: $1" >&2; FAILURES=$((FAILURES + 1)); }
+
+# A case this environment cannot set up. Counted and named in the
+# summary rather than reported as an ok, because "we checked it" and
+# "we could not check it" reading identically is how a guard loses its
+# only coverage without anybody noticing.
+skip() {
+    echo "    SKIP: $1"
+    SKIPS=$((SKIPS + 1))
+    SKIPPED_CASES="${SKIPPED_CASES}
+  - $1"
+}
 
 BASH_BIN="$(command -v bash)"
 
@@ -368,7 +381,13 @@ fi
 
 start "a named path this script will not act on is refused"
 TREE="$(narrow_tree narrow-refusals)"
-ln -s /etc/hostname "${TREE}/downloaded/link.qcow2"
+# Three symlinks, all with an in-scope extension, differing only in what
+# they point at -- which is the only thing the script judges them by. A
+# fourth, pointing at an in-scope image, is the case that is *not* a
+# refusal and has a section of its own below.
+ln -s /etc/hostname "${TREE}/downloaded/out-of-tree-link.qcow2"
+ln -s ../custom/fixture.qcow2 "${TREE}/downloaded/out-of-scope-link.qcow2"
+ln -s no-such-image.qcow2 "${TREE}/downloaded/dangling-link.qcow2"
 refuses() {
     # refuses DESCRIPTION [ARG...] -- non-zero exit, and the refused
     # path named in the message
@@ -393,7 +412,9 @@ refuses "a path outside the tree reached through downloaded/" "downloaded/../../
 refuses "a non-image inside downloaded/" downloaded/notes.txt
 refuses "an image outside downloaded/" custom/fixture.qcow2
 refuses "an image that does not exist" downloaded/no-such-image.qcow2
-refuses "a symlink with an image extension" downloaded/link.qcow2
+refuses "a symlink whose target is outside the tree" downloaded/out-of-tree-link.qcow2
+refuses "a symlink whose target is outside downloaded/" downloaded/out-of-scope-link.qcow2
+refuses "a symlink whose target does not exist" downloaded/dangling-link.qcow2
 
 start "a refused entry resparsifies nothing at all"
 # The refusal has to be a precondition, not a partial run: a job that
@@ -423,6 +444,52 @@ else
     fail "exit ${STATUS}, ${BEFORE} -> $(blocks "${TREE}/downloaded/named.qcow2") blocks: ${OUTPUT}"
 fi
 
+start "a symlink to an in-scope image inside the tree is followed"
+# The counterpart to the three refusals above, and the reason there is
+# no symlink check in the script: every rule is applied to the resolved
+# target, so a link to an image this script would have rewritten anyway
+# is simply a second name for it. Fixtures with an out-of-tree target
+# cannot assert this -- they are refused for being out of the tree and
+# would pass whatever the script did about symlinks.
+TREE="$(narrow_tree narrow-symlink)"
+ln -s named.qcow2 "${TREE}/downloaded/link.qcow2"
+NAMED_BEFORE="$(blocks "${TREE}/downloaded/named.qcow2")"
+UNNAMED_BEFORE="$(blocks "${TREE}/downloaded/unnamed.qcow2")"
+STATUS=0
+OUTPUT="$("${BASH_BIN}" "${SCRIPT}" "${TREE}" downloaded/link.qcow2 2>&1)" || STATUS=$?
+if [ "${STATUS}" -eq 0 ]; then
+    ok "exits 0"
+else
+    fail "exit ${STATUS}: ${OUTPUT}"
+fi
+if [ "$(blocks "${TREE}/downloaded/named.qcow2")" -lt "${NAMED_BEFORE}" ]; then
+    ok "the target shrank: ${NAMED_BEFORE} -> $(blocks "${TREE}/downloaded/named.qcow2")"
+else
+    fail "the target did not shrink from ${NAMED_BEFORE}: ${OUTPUT}"
+fi
+if [ -L "${TREE}/downloaded/link.qcow2" ]; then
+    ok "the link itself is still a link, not replaced by a copy"
+else
+    fail "the link was replaced: $(ls -l "${TREE}/downloaded/link.qcow2")"
+fi
+if [ "$(blocks "${TREE}/downloaded/unnamed.qcow2")" = "${UNNAMED_BEFORE}" ]; then
+    ok "nothing else in the tree was rewritten"
+else
+    fail "an unnamed image was rewritten: ${OUTPUT}"
+fi
+# Naming both names one file: the resolution that makes the link
+# followable is also what collapses the pair, so a caller whose
+# changed-file list holds both does not pay for the copy twice.
+TREE="$(narrow_tree narrow-symlink-dedup)"
+ln -s named.qcow2 "${TREE}/downloaded/link.qcow2"
+STATUS=0
+OUTPUT="$("${BASH_BIN}" "${SCRIPT}" "${TREE}" downloaded/link.qcow2 downloaded/named.qcow2 2>&1)" \
+    || STATUS=$?
+case "${OUTPUT}" in
+    *"resparsified 1 named image(s)"*) ok "a link and its target count as one image" ;;
+    *) fail "exit ${STATUS}, expected one image in '${OUTPUT}'" ;;
+esac
+
 start "the extension list is published rather than copied"
 # tools/ci/prepare-testdata.sh builds the changed-file list this mode
 # consumes, and nothing else in the repository may hold a second copy of
@@ -445,7 +512,7 @@ start "a failing copy is a failing run"
 # cheapest way to make cp fail; root ignores the mode bits, so there is
 # nothing to test as root.
 if [ "$(id -u)" -eq 0 ]; then
-    ok "skipped: running as root, which is not refused write access"
+    skip "a failing copy is a failing run: running as root, which is not refused write access"
 else
     TREE="$(make_tree unwritable)"
     allocated "${TREE}/downloaded/disk.qcow2" 4
@@ -471,8 +538,15 @@ else
 fi
 
 echo
+if [ "${SKIPS}" -ne 0 ]; then
+    echo "${SKIPS} check(s) skipped:${SKIPPED_CASES}"
+fi
 if [ "${FAILURES}" -ne 0 ]; then
     echo "${FAILURES} check(s) failed"
     exit 1
+fi
+if [ "${SKIPS}" -ne 0 ]; then
+    echo "All checks passed, but ${SKIPS} were skipped and proved nothing"
+    exit 0
 fi
 echo "All checks passed"
