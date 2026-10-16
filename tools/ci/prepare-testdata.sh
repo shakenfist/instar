@@ -20,8 +20,9 @@
 #   TESTDATA_CACHE   (optional) On-runner cache dir, default
 #                    /srv/ci/cached/instar-testdata.
 #   TESTDATA_REQUIRE_CACHE
-#                    (optional) Set to 1 to refuse the fresh-clone
-#                    fallback; see "REQUIRING THE CACHE" below.
+#                    (optional) 1 refuses the fresh-clone fallback; 0
+#                    or unset allows it. Any other value is an error,
+#                    not an "off" -- see "REQUIRING THE CACHE" below.
 #   TESTDATA_CONTRACT_CACHE
 #                    (test seam) Relocates the contractual path that
 #                    flag is checked against. See CONTRACT_CACHE below
@@ -123,9 +124,31 @@ fi
 # traced or echoed line, so keep shell tracing off.
 AUTHED_URL="https://oauth2:${TESTDATA_TOKEN}@${REPO_HOST}/${REPO_PATH}"
 
+# Read as a tri-state rather than compared against '1', because the
+# two ways of getting this wrong are not symmetric. An unrecognised
+# value read as "off" gives back the 7.46 GiB fallback clone this flag
+# exists to refuse, on a job whose author believed they had turned the
+# refusal on -- and the symptom is a job that merely looks slow, which
+# is the failure mode the whole arrangement is built to remove. So
+# "off" is spelled out exhaustively and everything else is an error
+# rather than a default.
+case "${TESTDATA_REQUIRE_CACHE:-}" in
+    ''|'0') REQUIRE_CACHE=0 ;;
+    '1') REQUIRE_CACHE=1 ;;
+    *)
+        echo "::error::TESTDATA_REQUIRE_CACHE is" \
+             "'${TESTDATA_REQUIRE_CACHE}'; it takes 1 to require the" \
+             "prepared cache and 0 or unset to allow the fresh-clone" \
+             "fallback. Refusing to guess: reading an unrecognised value" \
+             "as off would hand back the fallback clone the flag was set" \
+             "to prevent, and that is invisible in a passing job." >&2
+        exit 1
+        ;;
+esac
+
 # Asserted before either branch, so that a cache at some other path
 # cannot satisfy a job that asked for the contractual one.
-if [ "${TESTDATA_REQUIRE_CACHE:-}" = '1' ]; then
+if [ "${REQUIRE_CACHE}" = '1' ]; then
     if [ "${TESTDATA_CACHE}" != "${CONTRACT_CACHE}" ]; then
         echo "::error::TESTDATA_REQUIRE_CACHE=1 but TESTDATA_CACHE is" \
              "${TESTDATA_CACHE}, not the agreed ${CONTRACT_CACHE}. The path is" \
@@ -157,6 +180,11 @@ if [ "${TESTDATA_REQUIRE_CACHE:-}" = '1' ]; then
     fi
 fi
 
+# Set on the cache branch only, and read again where the changed-file
+# list is built. Declared here so that neither reference depends on
+# which branch ran.
+STAT_DIRTY=''
+
 if [ -d "${TESTDATA_CACHE}/.git" ]; then
     echo "Using cached testdata at ${TESTDATA_CACHE}, updating in place..."
     cd "${TESTDATA_CACHE}"
@@ -164,6 +192,23 @@ if [ -d "${TESTDATA_CACHE}/.git" ]; then
     # across the reset, and this is the only moment the pre-update
     # revision is still reachable by name.
     PREVIOUS_REV="$(git rev-parse --verify --quiet HEAD || true)"
+    # Captured before the fetch as well, and for a reason the tree diff
+    # below cannot cover. The disk build resparsifies after its own
+    # checkout; resparsifying is a cp + mv, so the index's stored stat
+    # data for every image it touched no longer matches the file. The
+    # reset then rewrites those entries -- measured, not assumed: an
+    # unchanged file whose index entry is stat-dirty gets a new mtime
+    # across the reset, while an unchanged file with clean stat data
+    # does not. Under LFS that rewrite comes back through the smudge
+    # filter fully allocated, and no diff between the two trees names
+    # it, so the narrow resparsify below would skip exactly the files
+    # the reset had just re-expanded.
+    #
+    # Plumbing on purpose: `git diff` and `git status` are porcelain
+    # and silently run update-index --refresh, which would clear the
+    # evidence before it could be read. Nothing may run them here
+    # first.
+    STAT_DIRTY="$(git diff-files --name-only -z | tr '\0' '\n')"
     git remote set-url origin "${AUTHED_URL}"
     git fetch --depth 1 origin main
     git reset --hard origin/main
@@ -222,8 +267,35 @@ if [ "${TESTDATA_SOURCE}" = 'cache' ]; then
         # algorithm.
         PREVIOUS_REV="$(git hash-object -t tree /dev/null)"
     fi
-    git diff --name-only -z "${PREVIOUS_REV}" HEAD | tr '\0' '\n' \
-        > "${TESTDATA_CHANGED_FILES}"
+    # Two sources, unioned: what the two trees disagree about, and what
+    # was stat-dirty going in. Both are paths the reset rewrote, and
+    # the second is invisible to any diff of the trees -- see the
+    # capture above. Adding them costs nothing that has not already
+    # been spent: the reset expanded those files into the
+    # copy-on-write overlay whether or not this list names them, so
+    # resparsifying them afterwards shrinks a copy-up that has already
+    # happened rather than causing one. tools/ci/test-testdata-changed-files.sh
+    # proves the union against a real git, including that the tree diff
+    # alone would miss them.
+    {
+        git diff --name-only -z "${PREVIOUS_REV}" HEAD | tr '\0' '\n'
+        if [ -n "${STAT_DIRTY}" ]; then
+            printf '%s\n' "${STAT_DIRTY}"
+        fi
+    } | sort -u > "${TESTDATA_CHANGED_FILES}"
+    if [ -n "${STAT_DIRTY}" ]; then
+        # Worth an annotation rather than a log line: a non-zero count
+        # means whatever built this cache left the index stat-dirty,
+        # and every job on it then pays to rewrite and resparsify those
+        # files. The fix is on the other side -- the build runs
+        # `git update-index --refresh` after resparsifying -- and this
+        # is the only place the cost is visible.
+        echo "::warning::$(printf '%s\n' "${STAT_DIRTY}" | wc -l) path(s) in" \
+             "${TESTDATA_CACHE} had stale index stat data before the update, so" \
+             "the reset rewrote them and they are resparsified again here." \
+             "Whatever built this cache should run 'git update-index --refresh'" \
+             "after resparsifying it."
+    fi
     echo "the update changed $(wc -l < "${TESTDATA_CHANGED_FILES}") path(s)," \
          "listed in ${TESTDATA_CHANGED_FILES}"
 fi

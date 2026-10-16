@@ -1,6 +1,6 @@
 # PLAN-543: Cut the merge queue's critical path
 
-## Status: In progress
+## Status: Code complete; post-merge measurement and handoff outstanding
 
 Every step in the Execution table is done. Steps 1 to 6 and 8 landed
 first, with step 5's measurement recorded under Execution ("The step-5
@@ -14,7 +14,12 @@ What is left is not code and cannot be done before this merges:
   alongside the step-5 comparison. It needs one matrix leg that
   actually ran on a disk-bearing runner.
 * Messaging the `ci-instar-testdata` session that the labelled half
-  has merged, which is what their plan is waiting on.
+  has merged, which is what their plan is waiting on. Two things to
+  pass on with it: the disk build should run `git update-index
+  --refresh` after it resparsifies, or every job on the disk pays to
+  rewrite and resparsify those images again (see Bugs fixed below);
+  and private-ci's own Execution table still shows phase 3 as `In
+  progress` although it is deployed.
 * Re-running step 8's push audit over the commits added after it ran.
 
 #543 itself is not closed by this plan either way: the capacity
@@ -623,14 +628,23 @@ be said rather than averaged away.
 - [ ] The six moved tests are named by test id. A class-level selector
       would also move that class's sub-second cases off the gate for
       no gain.
-- [ ] The set of jobs carrying the `instar` label is exactly the set
+- [x] The set of jobs carrying the `instar` label is exactly the set
       of jobs that run `prepare-testdata.sh`, minus the static-fleet
       one that can never be assigned such a runner. Checked in both
       directions by parsing the finished YAML, not by reading the
       diff: a consumer without the label pays for a clone it did not
       need, and a labelled non-consumer holds a scarce disk-bearing
       runner for nothing. `ci-tooling` is the trap -- it greps like a
-      consumer and is not one.
+      consumer and is not one. **Done**, by loading every workflow
+      with a YAML parser and comparing the two sets: eight labelled
+      jobs, all nine consumers accounted for, both exceptions
+      (`ci-tooling`, which tests the script, and `test-and-fix`, which
+      cannot be given the disk) matching their documented reason, and
+      every labelled job also carrying `debian-13` and
+      `TESTDATA_REQUIRE_CACHE: '1'`. This is a one-off check and not a
+      standing guard, which review was right to press on; #674 tracks
+      making it one, and `docs/testing.md` now says plainly that
+      nothing enforces it.
 
 ## Risks and mitigations
 
@@ -686,6 +700,16 @@ be said rather than averaged away.
   group runner, because a job-level flag would disable a whole
   group's gate -- which is the sharp edge the comment at
   `functional-tests.yml:632-641` already warns about.
+* **A standing guard on the `instar` label set** (#674). The
+  correspondence between labelled jobs and testdata consumers is
+  checked by hand; both directions of drift are silent, and the worst
+  case -- the label on the static-fleet job -- queues for 24 hours
+  before GitHub cancels it. Deferred rather than written here because
+  the right shape is one PyYAML reader serving this and
+  `check-test-partition.py`'s existing hand-rolled scan, which means
+  adding PyYAML to that script's venv; a third hand-rolled scan would
+  be the wrong direction. The checks themselves are written out in the
+  issue.
 * **Raise `--concurrency` above 4.** Untested and plausibly the
   cheapest remaining win once the six tests are gone, but the suite
   boots a KVM guest per test and `docs/testing.md:434,459` warns that
@@ -853,6 +877,25 @@ findings were real and not taken.
   the same shape of prose. Worth recording for how it was found: not by
   reading the guard, but by extending it and watching what it claimed
   to see.
+* **The narrow resparsify skipped images the update's reset had just
+  re-expanded.** Found by review of the pull request, and nearly
+  dismissed: the first measurement said `git reset --hard` leaves a
+  stat-dirty entry alone, and it was wrong because it used the inode
+  as the signal. Git overwrites an existing path in place, so the
+  inode survives a rewrite and reports every file as untouched. With
+  mtime as the signal and an unchanged, clean-stat control beside it,
+  the opposite shows: the reset *does* rewrite an entry whose content
+  is identical but whose index stat data is stale, and the disk build
+  leaves exactly that state behind because resparsifying is a `cp` and
+  a `mv`. Under LFS those files return fully allocated, and no diff of
+  the two trees names them, so the narrow list missed them and the
+  disk quietly gave back part of its saving. `prepare-testdata.sh` now
+  unions the stat-dirty set into the list -- which costs nothing, the
+  reset having already written them into the overlay -- and warns,
+  because the real fix is a `git update-index --refresh` on the side
+  that builds the disk. `tools/ci/test-testdata-changed-files.sh`
+  pins all of it against a real git, including that the tree diff
+  alone would have missed it.
 * Otherwise none directly. #543 is not closed by this change.
 
 ### Back brief

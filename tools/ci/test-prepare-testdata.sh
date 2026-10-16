@@ -94,6 +94,16 @@ case "$1" in
             tr '\n' '\0' < "${GIT_STUB_CHANGED}"
         fi
         ;;
+    diff-files)
+        # The paths whose index stat data was stale before the update.
+        # A separate subcommand from "diff" above and a separate stub
+        # input, because the script unions two lists that come from
+        # different places and a stub that conflated them could not
+        # show the union happening.
+        if [ -n "${GIT_STUB_STAT_DIRTY:-}" ]; then
+            tr '\n' '\0' < "${GIT_STUB_STAT_DIRTY}"
+        fi
+        ;;
 esac
 exit 0
 STUB
@@ -142,6 +152,19 @@ run_prepare() {
 # env_value CASE VAR -- what the script exported to $GITHUB_ENV
 env_value() {
     sed -n "s/^$2=//p" "${WORK}/$1/env" | tail -1
+}
+
+# env_is_empty CASE -- the script exported nothing at all.
+#
+# Emptiness rather than the absence of a particular name: the first
+# version of this grepped for TESTDATA_REQUIRE_CACHE, which the script
+# never writes to $GITHUB_ENV on any path, so it passed whatever the
+# script did. What a refusal must not do is export TESTDATA_PATH or
+# TESTDATA_SOURCE -- a later step reading either of those would act on
+# a tree the script just refused to prepare -- and only an empty file
+# says that.
+env_is_empty() {
+    [ ! -s "${WORK}/$1/env" ]
 }
 
 # a cache the script will take the update-in-place branch on
@@ -208,10 +231,46 @@ if [ -n "${CHANGED}" ] && [ -f "${CHANGED}" ]; then
 else
     fail "TESTDATA_CHANGED_FILES was '${CHANGED}'"
 fi
-if [ "$(cat "${CHANGED}")" = "$(cat "${WORK}/changed.txt")" ]; then
+if [ "$(sort -u "${CHANGED}")" = "$(sort -u "${WORK}/changed.txt")" ]; then
     ok "it holds every changed path, images and otherwise"
 else
     fail "list was '$(cat "${CHANGED}")'"
+fi
+
+# The other half of the list, which no diff of the two trees produces:
+# paths whose index stat data was stale before the update, which the
+# reset rewrites and the tree diff does not name. The case overlaps
+# them deliberately -- one path in both lists, one in each -- because
+# the union is a union and not a concatenation.
+printf '%s\n' 'downloaded/qemu-iotests/updated.qcow2' \
+    'downloaded/qemu-iotests/stale-stat.qcow2' > "${WORK}/stat-dirty.txt"
+CACHE_SD="$(make_cache stat-dirty-cache)"
+run_prepare statdirty \
+    TESTDATA_CACHE="${CACHE_SD}" \
+    GIT_STUB_PREVIOUS_REV='5555555555555555555555555555555555555555' \
+    GIT_STUB_CHANGED="${WORK}/changed.txt" \
+    GIT_STUB_STAT_DIRTY="${WORK}/stat-dirty.txt"
+SD_LIST="$(env_value statdirty TESTDATA_CHANGED_FILES)"
+EXPECTED_UNION="$(cat "${WORK}/changed.txt" "${WORK}/stat-dirty.txt" | sort -u)"
+if [ "$(sort -u "${SD_LIST}")" = "${EXPECTED_UNION}" ]; then
+    ok "a stat-dirty path the tree diff does not name is in the list"
+else
+    fail "union was '$(cat "${SD_LIST}")', wanted '${EXPECTED_UNION}'"
+fi
+if [ "$(wc -l < "${SD_LIST}")" -eq "$(printf '%s\n' "${EXPECTED_UNION}" | wc -l)" ]; then
+    ok "and a path in both lists appears once"
+else
+    fail "list has $(wc -l < "${SD_LIST}") entries: $(cat "${SD_LIST}")"
+fi
+case "$(cat "${WORK}/statdirty/out")" in
+    *"::warning::"*"update-index --refresh"*)
+        ok "and says so, because the cache's builder is what should fix it" ;;
+    *) fail "expected a warning naming the fix: $(cat "${WORK}/statdirty/out")" ;;
+esac
+if ! grep -q '::warning::' "${WORK}/cache/out"; then
+    ok "no warning when nothing was stat-dirty"
+else
+    fail "warned with a clean index: $(cat "${WORK}/cache/out")"
 fi
 if [ -z "$(env_value clone TESTDATA_CHANGED_FILES)" ]; then
     ok "the fresh-clone branch exports no list, because the whole tree is new"
@@ -295,6 +354,11 @@ case "${DEFAULT_OUT}" in
     *"not the agreed ${CONTRACT_CACHE}"*) ok "unset, the contract is ${CONTRACT_CACHE}" ;;
     *) fail "expected ${CONTRACT_CACHE} in '${DEFAULT_OUT}'" ;;
 esac
+if env_is_empty default-contract; then
+    ok "and exported nothing"
+else
+    fail "wrote to GITHUB_ENV: $(cat "${WORK}/default-contract/env")"
+fi
 # And the seam is a different variable from TESTDATA_CACHE, so a job
 # cannot satisfy the guard by pointing both halves of it at the same
 # wrong place. That only holds while nothing in CI sets it.
@@ -355,7 +419,7 @@ case "${REQUIRE_OUT}" in
     *"path mismatch, not a failed mount"*) ok "diagnoses a path mismatch, not a mount failure" ;;
     *) fail "expected the path-mismatch diagnosis in '${REQUIRE_OUT}'" ;;
 esac
-if ! grep -q 'TESTDATA_REQUIRE_CACHE' "${WORK}/require/env"; then
+if env_is_empty require; then
     ok "exported nothing to \$GITHUB_ENV"
 else
     fail "wrote to GITHUB_ENV: $(cat "${WORK}/require/env")"
@@ -411,6 +475,39 @@ case "${ELSEWHERE_OUT}" in
     *"not the agreed ${CONTRACT_CACHE}"*) ok "names both paths" ;;
     *) fail "expected both paths in '${ELSEWHERE_OUT}'" ;;
 esac
+if env_is_empty elsewhere; then
+    ok "and exported nothing, so no later step can act on that tree"
+else
+    fail "wrote to GITHUB_ENV: $(cat "${WORK}/elsewhere/env")"
+fi
+
+start "TESTDATA_REQUIRE_CACHE takes 1, 0 or unset and nothing else"
+# The asymmetry worth testing: an unrecognised value read as "off"
+# hands back the 7.46 GiB fallback on a job whose author believed the
+# refusal was on, and the only symptom is a slow job. '0' is the one
+# value that may legitimately mean off, so it has to keep working.
+run_prepare require-zero TESTDATA_REQUIRE_CACHE=0 TESTDATA_CACHE="${WORK}/no-such-cache-0"
+if [ "$(cat "${WORK}/require-zero/status")" -eq 0 ] \
+    && [ "$(env_value require-zero TESTDATA_SOURCE)" = 'clone' ]; then
+    ok "0 allows the fallback, like unset"
+else
+    fail "exit $(cat "${WORK}/require-zero/status")': $(cat "${WORK}/require-zero/out")"
+fi
+for bad in true yes TRUE 2 ' 1'; do
+    run_prepare require-bad TESTDATA_REQUIRE_CACHE="${bad}" \
+        TESTDATA_CACHE="${WORK}/no-such-cache-bad"
+    BAD_OUT="$(cat "${WORK}/require-bad/out")"
+    if [ "$(cat "${WORK}/require-bad/status")" -ne 0 ] \
+        && [ ! -s "${WORK}/require-bad/log" ] \
+        && env_is_empty require-bad; then
+        case "${BAD_OUT}" in
+            *"::error::"*) ok "'${bad}' is an error, and nothing was cloned" ;;
+            *) fail "'${bad}' failed without an annotation: ${BAD_OUT}" ;;
+        esac
+    else
+        fail "'${bad}' gave exit $(cat "${WORK}/require-bad/status"), git: $(cat "${WORK}/require-bad/log")"
+    fi
+done
 
 start "TESTDATA_REQUIRE_CACHE unset keeps the fallback"
 # The flag is on in CI, but only on the jobs that ask the fleet for the

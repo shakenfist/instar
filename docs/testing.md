@@ -1016,6 +1016,21 @@ looking. Beside `TESTDATA_PATH` it exports:
 | `TESTDATA_SOURCE` | `cache` (updated in place) or `clone` (fresh). A fresh clone writes every image out fully allocated, so the whole tree needs resparsifying; a cache needs only what the update changed. That narrower treatment assumes the cache was built from an already-sparse tree, which the fleet's pre-built disk is and which the script cannot itself check — a cache seeded any other way would need a third `TESTDATA_SOURCE` value rather than this one. |
 | `TESTDATA_CHANGED_FILES` | On the cache branch only: a file listing the paths the update changed, one per line, for the narrow resparsify above. Derived here because the reset that changed them happens here — by the time a later step runs there is nothing left to diff. |
 
+The list has two sources, and the second one is not obvious. Besides the diff
+between the two trees it carries every path whose index stat data was stale
+before the update. Resparsifying is a `cp` and a `mv`, so the disk build's own
+resparsify leaves the index disagreeing with the files it rewrote, and
+`git reset --hard` then rewrites those entries even though their content is
+identical — measured, with the clean-stat control alongside it, in
+`tools/ci/test-testdata-changed-files.sh`. Under LFS they come back from the
+smudge filter fully allocated, and no diff of the two trees names them, so a
+list built from the diff alone would skip exactly the files the reset had just
+re-expanded. Including them costs nothing extra: the reset already wrote them
+into the overlay. The script emits a `::warning::` naming the count when it
+finds any, because the real fix belongs to whatever built the cache — a
+`git update-index --refresh` after its resparsify — and this is the only place
+the cost is visible.
+
 Both are printed as well as written to `$GITHUB_ENV`, and running the script
 by hand with `$GITHUB_ENV` unset is fine.
 
@@ -1068,6 +1083,14 @@ clone the label exists to avoid. They are `package-matrix`,
 and `oslo-crossval-master` in `functional-tests.yml`; `nightly-legs` and
 `measure` in `nightly-matrix.yml`; and `coverage-fuzz` in
 `coverage-fuzz.yml`.
+
+Nothing enforces that correspondence automatically. It was checked in both
+directions when the label was introduced, by parsing the finished YAML rather
+than reading the diff, and it is re-checked by hand when a job is added — but
+a new consumer that forgets the label pays for a 7.46 GiB clone it did not
+need, and a labelled non-consumer holds a scarce disk-bearing runner, and
+neither shows up as anything but a slow job. Issue #674 tracks turning it into
+a guard in `ci-tooling`.
 
 The ninth testdata consumer, `test-and-fix` in `test-drift-fix.yml`, carries
 neither, deliberately and permanently. It runs on `[self-hosted, claude-code]`

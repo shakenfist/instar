@@ -225,6 +225,18 @@ jobs:
       - name: Test the testdata preparation
         run: tools/ci/test-prepare-testdata.sh
 
+      # The premise under the step above, against a real git rather
+      # than the stub: that the list it builds names every path the
+      # update's reset rewrote. One of those sources is invisible to a
+      # diff of the two trees -- an entry whose index stat data went
+      # stale when the disk build resparsified it, which the reset
+      # rewrites anyway -- and a list that missed it would leave those
+      # images fully allocated in the overlay while the job still
+      # passed. Local bare repositories only: no network, no token, no
+      # testdata.
+      - name: Test the testdata changed-file list against real git
+        run: tools/ci/test-testdata-changed-files.sh
+
       # The step between those two: which of resparsify-testdata.sh's two
       # calling forms a prepared tree needs. Both of its mistakes are
       # invisible in a passing job -- narrowing a fresh clone leaves most

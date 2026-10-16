@@ -301,10 +301,17 @@ else
 
     declare -A SEEN=()
 
-    # add_candidate CANDIDATE STRICT -- STRICT=1 for a path the caller
-    # named, where anything this script will not act on is an error.
+    # add_candidate CANDIDATE STRICT ORIGIN -- STRICT=1 for a path the
+    # caller named, where anything this script will not act on is an
+    # error. ORIGIN says where the path came from, and is carried into
+    # every refusal: the two sources fail for different reasons and send
+    # the reader to different repositories. A path on the command line
+    # is this caller's mistake; a path in a list file came from whatever
+    # produced that list -- for the cache path, the testdata update's own
+    # diff -- and someone triaging a run that refused one needs to look
+    # at that commit, not at this script.
     add_candidate() {
-        local candidate="$1" strict="$2" status=0
+        local candidate="$1" strict="$2" origin="$3" status=0
 
         classify "${candidate}" || status=$?
         case "${status}" in
@@ -315,12 +322,14 @@ else
                 fi
                 ;;
             1)
-                echo "resparsify-testdata: refusing ${candidate}: ${REASON}" >&2
+                echo "resparsify-testdata: refusing ${candidate}" \
+                     "(${origin}): ${REASON}" >&2
                 exit 1
                 ;;
             *)
                 if [ "${strict}" -eq 1 ]; then
-                    echo "resparsify-testdata: refusing ${candidate}: ${REASON}" >&2
+                    echo "resparsify-testdata: refusing ${candidate}" \
+                         "(${origin}): ${REASON}" >&2
                     exit 1
                 fi
                 SKIPPED=$((SKIPPED + 1))
@@ -339,12 +348,12 @@ else
             if [ -z "${line}" ]; then
                 continue
             fi
-            add_candidate "${line}" 0
+            add_candidate "${line}" 0 "listed in ${list_file}"
         done < "${list_file}"
     done
 
     for named in ${NAMED[@]+"${NAMED[@]}"}; do
-        add_candidate "${named}" 1
+        add_candidate "${named}" 1 'named on the command line'
     done
 fi
 

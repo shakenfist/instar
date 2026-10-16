@@ -386,8 +386,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `tools/ci/prepare-testdata.sh` refuses the fresh-clone fallback and
   fails the job naming `/srv/ci/cached/instar-testdata`, rather than
   quietly doing the 7.46 GiB thing the label exists to avoid, because a
-  job that merely looks slow goes unnoticed for weeks. And the
-  resparsify step is now `tools/ci/resparsify-prepared-testdata.sh`
+  job that merely looks slow goes unnoticed for weeks. That flag takes
+  `1`, `0` or nothing at all; any other value is an error rather than
+  an "off", because a `true` or a `yes` read as off would hand back the
+  fallback clone on a job whose author believed the refusal was on. And
+  the resparsify step is now `tools/ci/resparsify-prepared-testdata.sh`
   taking no arguments, in place of `tools/ci/resparsify-testdata.sh
   "${TESTDATA_PATH}"`: it reads the `TESTDATA_SOURCE` and
   `TESTDATA_CHANGED_FILES` that `prepare-testdata.sh` now exports and
