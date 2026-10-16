@@ -19,12 +19,46 @@
 #                    private/instar-testdata repository.
 #   TESTDATA_CACHE   (optional) On-runner cache dir, default
 #                    /srv/ci/cached/instar-testdata.
+#   TESTDATA_REQUIRE_CACHE
+#                    (optional) Set to 1 to refuse the fresh-clone
+#                    fallback; see "REQUIRING THE CACHE" below.
 #   GITHUB_WORKSPACE (required in Actions) Fresh-clone parent dir.
-#   GITHUB_ENV       (optional) When set, the resolved TESTDATA_PATH is
-#                    exported to it for later steps.
+#   RUNNER_TEMP      (optional) Where the changed-file list below is
+#                    written; the workspace when unset.
+#   GITHUB_ENV       (optional) When set, the resolved TESTDATA_PATH and
+#                    the two variables below are exported to it for
+#                    later steps.
 #
-# Output: prints the resolved TESTDATA_PATH and, when GITHUB_ENV is set,
-# writes "TESTDATA_PATH=<path>" to it.
+# Output: prints, and when GITHUB_ENV is set writes to it,
+#
+#   TESTDATA_PATH          the resolved tree.
+#   TESTDATA_SOURCE        "cache" or "clone" -- which of the two
+#                          branches below ran. A later step has to know:
+#                          the two leave the tree in materially
+#                          different states, and nothing else can tell
+#                          them apart by looking.
+#   TESTDATA_CHANGED_FILES on the cache branch only, a file listing the
+#                          paths the update changed, one per line.
+#
+# WHY THE BRANCH TAKEN IS PART OF THE OUTPUT. A fresh clone writes every
+# image out fully allocated, so the whole tree needs resparsifying
+# afterwards (tools/ci/resparsify-testdata.sh). A cache does not: where
+# that cache is a pre-built testdata dependencies disk, the tree is a
+# copy-on-write overlay of an image that was resparsified when it was
+# built, and rewriting all of it would write the gigabytes into the
+# overlay that the disk exists to avoid. Only the paths this update
+# brought in need it, which is why the changed-file list is produced
+# here: the reset that changed them has already happened by the time any
+# later step runs, so this is the only place that set can be derived.
+#
+# REQUIRING THE CACHE. With TESTDATA_REQUIRE_CACHE=1 a missing cache is
+# an infra error rather than a 7.46 GiB fallback clone, in the same
+# idiom as the LFS guard above: a job that silently did the slow thing
+# merely looks slow, and looking slow is exactly the failure mode that
+# is invisible for weeks. The assertion names the contractual path
+# literally rather than taking it from TESTDATA_CACHE, so that a change
+# to either side of that contract fails here instead of quietly
+# following a defaulted path somewhere else.
 
 set -euo pipefail
 
@@ -36,6 +70,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TESTDATA_CACHE="${TESTDATA_CACHE:-/srv/ci/cached/instar-testdata}"
 REPO_HOST='gitlab.home.stillhq.com'
 REPO_PATH='private/instar-testdata.git'
+
+# Where the runner fleet's testdata dependencies disk is mounted, by
+# agreement with the fleet: userdata mounts it there by filesystem label
+# before the runner registers, and the conductor carries the same path.
+# Written out literally, and deliberately not derived from
+# TESTDATA_CACHE above, because this is the half of the contract this
+# repository is responsible for asserting.
+CONTRACT_CACHE='/srv/ci/cached/instar-testdata'
 
 if ! command -v git-lfs >/dev/null 2>&1; then
     echo "::error::git-lfs is not installed on this runner; instar-testdata" \
@@ -58,16 +100,56 @@ fi
 # traced or echoed line, so keep shell tracing off.
 AUTHED_URL="https://oauth2:${TESTDATA_TOKEN}@${REPO_HOST}/${REPO_PATH}"
 
+# Asserted before either branch, so that a cache at some other path
+# cannot satisfy a job that asked for the contractual one.
+if [ "${TESTDATA_REQUIRE_CACHE:-}" = '1' ]; then
+    if [ "${TESTDATA_CACHE}" != "${CONTRACT_CACHE}" ]; then
+        echo "::error::TESTDATA_REQUIRE_CACHE=1 but TESTDATA_CACHE is" \
+             "${TESTDATA_CACHE}, not the agreed ${CONTRACT_CACHE}. The path is" \
+             "half of the contract with the runner fleet's testdata dependencies" \
+             "disk; a job that requires the disk must look where the fleet" \
+             "mounts it, so fix the override or the agreement rather than this" \
+             "check." >&2
+        exit 1
+    fi
+    if [ ! -d "${CONTRACT_CACHE}/.git" ]; then
+        # Deliberately not blamed on a failed mount, which cannot be the
+        # cause: a mount that fails stops the fleet's userdata before the
+        # runner registers, so the job stays queued and never reaches
+        # this script at all. What is left is a mismatch -- we are
+        # looking somewhere the disk is not, or this runner advertised
+        # the label without carrying the disk.
+        echo "::error::TESTDATA_REQUIRE_CACHE=1 but there is no prepared" \
+             "instar-testdata tree at ${CONTRACT_CACHE}. This is a path" \
+             "mismatch, not a failed mount: a mount failure stops the runner" \
+             "before it registers, so such a job never starts and never gets" \
+             "here. Either the mount path changed on one side of the contract," \
+             "or this job was assigned a runner advertising the testdata disk's" \
+             "label without the disk. Do not read userdata logs for a mount" \
+             "failure; compare the paths. This is an infrastructure problem, NOT" \
+             "a test or instar regression, and the fresh-clone fallback is" \
+             "refused on purpose: 7.46 GiB of clone would turn it into a job" \
+             "that merely looks slow." >&2
+        exit 1
+    fi
+fi
+
 if [ -d "${TESTDATA_CACHE}/.git" ]; then
     echo "Using cached testdata at ${TESTDATA_CACHE}, updating in place..."
     cd "${TESTDATA_CACHE}"
+    # Captured before the fetch: the changed-file list below is the diff
+    # across the reset, and this is the only moment the pre-update
+    # revision is still reachable by name.
+    PREVIOUS_REV="$(git rev-parse --verify --quiet HEAD || true)"
     git remote set-url origin "${AUTHED_URL}"
     git fetch --depth 1 origin main
     git reset --hard origin/main
     TESTDATA_PATH="${TESTDATA_CACHE}"
+    TESTDATA_SOURCE='cache'
 else
     echo "No cache at ${TESTDATA_CACHE}, cloning fresh..."
     TESTDATA_PATH="${GITHUB_WORKSPACE}/instar-testdata"
+    TESTDATA_SOURCE='clone'
     git clone --depth 1 "${AUTHED_URL}" "${TESTDATA_PATH}"
     cd "${TESTDATA_PATH}"
 fi
@@ -78,6 +160,39 @@ fi
 # idempotent and cheap when the objects are already present.
 git lfs install --local
 git lfs pull
+
+# The paths this update brought in, for a later step that needs to treat
+# them differently from the rest of the tree -- resparsifying only them,
+# today. Derived here because the reset that changed them is here: by
+# the time a later step runs there is nothing left to diff.
+#
+# The list is every changed path, not only the images: the consumer
+# filters it against its own idea of what it acts on, so that this
+# script does not carry a second copy of that extension list to drift
+# from. Paths arrive NUL-separated from git and are rewritten one per
+# line, which keeps them raw rather than quoted; a path containing a
+# literal newline would split into two entries that the consumer then
+# discards, and instar-testdata has none.
+TESTDATA_CHANGED_FILES=''
+if [ "${TESTDATA_SOURCE}" = 'cache' ]; then
+    # RUNNER_TEMP rather than the workspace: it survives to the next
+    # step, is cleaned between jobs, and is not inside anybody's
+    # checkout -- one of the workflows checks instar out at the
+    # workspace root, where this would land as an untracked file in the
+    # repository. Falls back to the workspace when run outside Actions.
+    TESTDATA_CHANGED_FILES="${RUNNER_TEMP:-${GITHUB_WORKSPACE}}/testdata-changed-files.txt"
+    if [ -z "${PREVIOUS_REV}" ]; then
+        # No HEAD before the update, so everything in the tree is new;
+        # git's empty tree is the honest left-hand side for that, and
+        # asking git for it keeps this correct under either hash
+        # algorithm.
+        PREVIOUS_REV="$(git hash-object -t tree /dev/null)"
+    fi
+    git diff --name-only -z "${PREVIOUS_REV}" HEAD | tr '\0' '\n' \
+        > "${TESTDATA_CHANGED_FILES}"
+    echo "the update changed $(wc -l < "${TESTDATA_CHANGED_FILES}") path(s)," \
+         "listed in ${TESTDATA_CHANGED_FILES}"
+fi
 
 # Guard: prove the fixtures the suite cannot do without are present and
 # materialised. The check is a separate script because
@@ -90,6 +205,13 @@ git lfs pull
 "${SCRIPT_DIR}/check-testdata-fixtures.sh" "${TESTDATA_PATH}" --annotate
 
 echo "testdata ready at ${TESTDATA_PATH} (LFS materialised, required fixtures verified)"
+echo "testdata source: ${TESTDATA_SOURCE}"
 if [ -n "${GITHUB_ENV:-}" ]; then
-    echo "TESTDATA_PATH=${TESTDATA_PATH}" >> "${GITHUB_ENV}"
+    {
+        echo "TESTDATA_PATH=${TESTDATA_PATH}"
+        echo "TESTDATA_SOURCE=${TESTDATA_SOURCE}"
+        if [ -n "${TESTDATA_CHANGED_FILES}" ]; then
+            echo "TESTDATA_CHANGED_FILES=${TESTDATA_CHANGED_FILES}"
+        fi
+    } >> "${GITHUB_ENV}"
 fi

@@ -2,7 +2,7 @@
 #
 # Tests for tools/ci/resparsify-testdata.sh.
 #
-# Two reasons this one is worth a test rather than a read-through.
+# Three reasons this one is worth a test rather than a read-through.
 #
 # It is a cross-repository interface: private-ci's testdata image build
 # fetches it over HTTPS and runs it as a plain user against a clone, with
@@ -17,6 +17,14 @@
 # sparseness is measured here in allocated blocks before and after, not
 # asserted by reading the script: a change that stopped shrinking files
 # would still exit 0 and still print its summary.
+#
+# The narrow mode inverts that last point and needs both halves measured.
+# It exists to not write bytes -- the tree it runs against on a runner
+# with a testdata dependencies disk is a copy-on-write overlay, so every
+# image it rewrites unnecessarily lands in the overlay. A narrow run that
+# had quietly widened to the whole tree would exit 0, print a count, and
+# leave a perfectly correct tree behind, so the cases below measure the
+# files that were *not* named as well as the ones that were.
 
 set -euo pipefail
 
@@ -202,14 +210,12 @@ expect_status() {
 }
 
 expect_status "no arguments fails" 1
-# Rejected rather than ignored: the changed-files-only mode this script
-# is expected to grow takes further arguments, and a caller asking for
-# it against a version that does not have it must not quietly get a
-# whole-tree run instead.
-expect_status "two arguments fails" 1 "${TREE}" "${TREE}/downloaded/in-scope.vhd"
 expect_status "a missing tree path fails" 1 "${WORK}/no-such-tree"
 expect_status "a file given as the tree path fails" 1 "${TREE}/downloaded/in-scope.vhd"
 expect_status "a tree with no downloaded/ fails" 1 "${WORK}"
+expect_status "an unknown option fails" 1 "${TREE}" --narrow
+expect_status "--files-from with no file fails" 1 "${TREE}" --files-from
+expect_status "--files-from naming a missing list fails" 1 "${TREE}" --files-from "${WORK}/no-such-list"
 
 start "a downloaded/ with no images fails rather than succeeding quietly"
 # The directory exists, so the path is right and the caller gets no hint
@@ -232,6 +238,206 @@ fi
 case "${OUTPUT}" in
     *"no images matched"*"*.qcow2"*) ok "says what it expected to find" ;;
     *) fail "expected the extension list in '${OUTPUT}'" ;;
+esac
+
+# ---------------------------------------------------------------------
+# The narrow mode. Its whole reason for existing is to not write bytes,
+# so every case here measures allocated blocks on the files it did not
+# name as well as on the ones it did: a narrow run that quietly fell
+# back to the whole tree would still exit 0, still print a count, and
+# still leave a correct-looking tree -- while writing the gigabytes into
+# a copy-on-write overlay that the narrowing exists to avoid.
+
+narrow_tree() {
+    # narrow_tree NAME -> a tree with one in-scope image per interesting
+    # category, all fully allocated
+    local tree
+    tree="$(make_tree "$1")"
+    allocated "${tree}/downloaded/named.qcow2"
+    allocated "${tree}/downloaded/unnamed.qcow2"
+    allocated "${tree}/downloaded/nested/also-unnamed.vhd"
+    allocated "${tree}/downloaded/notes.txt"
+    allocated "${tree}/custom/fixture.qcow2"
+    echo "${tree}"
+}
+
+start "naming one file resparsifies only that file"
+TREE="$(narrow_tree narrow-named)"
+NAMED_BEFORE="$(blocks "${TREE}/downloaded/named.qcow2")"
+UNNAMED_BEFORE="$(blocks "${TREE}/downloaded/unnamed.qcow2")"
+NESTED_BEFORE="$(blocks "${TREE}/downloaded/nested/also-unnamed.vhd")"
+SUM_BEFORE="$(md5sum < "${TREE}/downloaded/named.qcow2")"
+STATUS=0
+OUTPUT="$("${BASH_BIN}" "${SCRIPT}" "${TREE}" downloaded/named.qcow2 2>&1)" || STATUS=$?
+if [ "${STATUS}" -eq 0 ]; then
+    ok "exits 0"
+else
+    fail "expected exit 0, got ${STATUS}: ${OUTPUT}"
+fi
+if [ "$(blocks "${TREE}/downloaded/named.qcow2")" -lt "${NAMED_BEFORE}" ]; then
+    ok "the named image shrank: ${NAMED_BEFORE} -> $(blocks "${TREE}/downloaded/named.qcow2")"
+else
+    fail "the named image did not shrink from ${NAMED_BEFORE}"
+fi
+if [ "$(blocks "${TREE}/downloaded/unnamed.qcow2")" = "${UNNAMED_BEFORE}" ] \
+    && [ "$(blocks "${TREE}/downloaded/nested/also-unnamed.vhd")" = "${NESTED_BEFORE}" ]; then
+    ok "the images it was not given are left fully allocated"
+else
+    UNNAMED_NOW="$(blocks "${TREE}/downloaded/unnamed.qcow2")"
+    NESTED_NOW="$(blocks "${TREE}/downloaded/nested/also-unnamed.vhd")"
+    fail "an unnamed image was resparsified: ${UNNAMED_NOW} and ${NESTED_NOW} blocks"
+fi
+if [ "$(md5sum < "${TREE}/downloaded/named.qcow2")" = "${SUM_BEFORE}" ]; then
+    ok "the named image's contents are unchanged"
+else
+    fail "resparsifying altered the named image's contents"
+fi
+
+start "an absolute path inside the tree is accepted"
+TREE="$(narrow_tree narrow-absolute)"
+BEFORE="$(blocks "${TREE}/downloaded/named.qcow2")"
+STATUS=0
+OUTPUT="$("${BASH_BIN}" "${SCRIPT}" "${TREE}" "${TREE}/downloaded/named.qcow2" 2>&1)" || STATUS=$?
+if [ "${STATUS}" -eq 0 ] && [ "$(blocks "${TREE}/downloaded/named.qcow2")" -lt "${BEFORE}" ]; then
+    ok "exit 0 and the image shrank: ${BEFORE} -> $(blocks "${TREE}/downloaded/named.qcow2")"
+else
+    fail "exit ${STATUS}, ${BEFORE} -> $(blocks "${TREE}/downloaded/named.qcow2") blocks: ${OUTPUT}"
+fi
+
+start "a changed-file list is filtered rather than refused"
+# What the caller actually has is a reset's "git diff --name-only":
+# in-scope images mixed with text files, custom/ fixtures and paths the
+# update deleted. Filtering those here is deliberate, so that the caller
+# does not need its own copy of the extension list to drift from.
+TREE="$(narrow_tree narrow-list)"
+LIST_FILE="${WORK}/changed.txt"
+cat > "${LIST_FILE}" <<EOF
+downloaded/named.qcow2
+downloaded/notes.txt
+custom/fixture.qcow2
+downloaded/deleted-by-the-update.qcow2
+EOF
+NAMED_BEFORE="$(blocks "${TREE}/downloaded/named.qcow2")"
+UNNAMED_BEFORE="$(blocks "${TREE}/downloaded/unnamed.qcow2")"
+TEXT_BEFORE="$(blocks "${TREE}/downloaded/notes.txt")"
+CUSTOM_BEFORE="$(blocks "${TREE}/custom/fixture.qcow2")"
+STATUS=0
+OUTPUT="$("${BASH_BIN}" "${SCRIPT}" "${TREE}" --files-from "${LIST_FILE}" 2>&1)" || STATUS=$?
+if [ "${STATUS}" -eq 0 ]; then
+    ok "exits 0 with a list holding non-images, custom/ files and a deleted path"
+else
+    fail "expected exit 0, got ${STATUS}: ${OUTPUT}"
+fi
+if [ "$(blocks "${TREE}/downloaded/named.qcow2")" -lt "${NAMED_BEFORE}" ]; then
+    ok "the in-scope image from the list shrank: ${NAMED_BEFORE} -> $(blocks "${TREE}/downloaded/named.qcow2")"
+else
+    fail "the listed image did not shrink from ${NAMED_BEFORE}"
+fi
+if [ "$(blocks "${TREE}/downloaded/notes.txt")" = "${TEXT_BEFORE}" ] \
+    && [ "$(blocks "${TREE}/custom/fixture.qcow2")" = "${CUSTOM_BEFORE}" ] \
+    && [ "$(blocks "${TREE}/downloaded/unnamed.qcow2")" = "${UNNAMED_BEFORE}" ]; then
+    ok "the out-of-scope entries and the rest of the tree are untouched"
+else
+    fail "something out of scope was rewritten"
+fi
+case "${OUTPUT}" in
+    *"3 candidate(s) not in scope"*) ok "counts what it dropped" ;;
+    *) fail "expected a dropped-candidate count in '${OUTPUT}'" ;;
+esac
+if [ -z "$(find "${TREE}" -name '*.resparsify' -print -quit)" ]; then
+    ok "leaves no .resparsify temporary files behind"
+else
+    fail "left a .resparsify temporary file behind"
+fi
+
+start "an empty narrow set is success, unlike an empty whole tree"
+# The normal case on a cached tree: the update changed no image. The
+# whole-tree form treats zero matches as a misconfiguration, and this
+# must not inherit that -- a nightly-fresh dependencies disk would fail
+# every job on the day nothing changed.
+TREE="$(narrow_tree narrow-empty)"
+: > "${WORK}/empty.txt"
+BEFORE="$(blocks "${TREE}/downloaded/named.qcow2")"
+STATUS=0
+OUTPUT="$("${BASH_BIN}" "${SCRIPT}" "${TREE}" --files-from "${WORK}/empty.txt" 2>&1)" || STATUS=$?
+if [ "${STATUS}" -eq 0 ] && [ "$(blocks "${TREE}/downloaded/named.qcow2")" = "${BEFORE}" ]; then
+    ok "exit 0 and nothing was rewritten"
+else
+    fail "exit ${STATUS}, ${BEFORE} -> $(blocks "${TREE}/downloaded/named.qcow2") blocks: ${OUTPUT}"
+fi
+
+start "a named path this script will not act on is refused"
+TREE="$(narrow_tree narrow-refusals)"
+ln -s /etc/hostname "${TREE}/downloaded/link.qcow2"
+refuses() {
+    # refuses DESCRIPTION [ARG...] -- non-zero exit, and the refused
+    # path named in the message
+    local description="$1"
+    shift
+    local status=0 output
+    output="$("${BASH_BIN}" "${SCRIPT}" "${TREE}" "$@" 2>&1)" || status=$?
+    if [ "${status}" -ne 0 ]; then
+        ok "${description}"
+    else
+        fail "${description}: expected a non-zero exit, got 0: ${output}"
+    fi
+    case "${output}" in
+        *refusing*) ;;
+        *) fail "${description}: expected a refusal message in '${output}'" ;;
+    esac
+}
+
+refuses "an absolute path outside the tree" /etc/hostname
+refuses "a relative path climbing out of the tree" ../../etc/hostname
+refuses "a path outside the tree reached through downloaded/" "downloaded/../../etc/hostname"
+refuses "a non-image inside downloaded/" downloaded/notes.txt
+refuses "an image outside downloaded/" custom/fixture.qcow2
+refuses "an image that does not exist" downloaded/no-such-image.qcow2
+refuses "a symlink with an image extension" downloaded/link.qcow2
+
+start "a refused entry resparsifies nothing at all"
+# The refusal has to be a precondition, not a partial run: a job that
+# fails after rewriting half the tree has still written the bytes into
+# the overlay, and the next job inherits whatever state it left.
+BEFORE="$(blocks "${TREE}/downloaded/named.qcow2")"
+STATUS=0
+OUTPUT="$("${BASH_BIN}" "${SCRIPT}" "${TREE}" downloaded/named.qcow2 /etc/hostname 2>&1)" || STATUS=$?
+if [ "${STATUS}" -ne 0 ] && [ "$(blocks "${TREE}/downloaded/named.qcow2")" = "${BEFORE}" ]; then
+    ok "exit ${STATUS} and the valid image alongside it is still at ${BEFORE} blocks"
+else
+    fail "exit ${STATUS}, ${BEFORE} -> $(blocks "${TREE}/downloaded/named.qcow2") blocks: ${OUTPUT}"
+fi
+
+start "a list naming a path outside the tree is refused, not filtered"
+# The filtering above is a convenience for the caller's own tree; it is
+# not permission to follow a path somewhere else. Only entries that
+# resolve inside the tree are candidates at all.
+LIST_FILE="${WORK}/escaping.txt"
+printf '%s\n' downloaded/named.qcow2 /etc/hostname > "${LIST_FILE}"
+BEFORE="$(blocks "${TREE}/downloaded/named.qcow2")"
+STATUS=0
+OUTPUT="$("${BASH_BIN}" "${SCRIPT}" "${TREE}" --files-from "${LIST_FILE}" 2>&1)" || STATUS=$?
+if [ "${STATUS}" -ne 0 ] && [ "$(blocks "${TREE}/downloaded/named.qcow2")" = "${BEFORE}" ]; then
+    ok "exit ${STATUS}, nothing rewritten"
+else
+    fail "exit ${STATUS}, ${BEFORE} -> $(blocks "${TREE}/downloaded/named.qcow2") blocks: ${OUTPUT}"
+fi
+
+start "the extension list is published rather than copied"
+# tools/ci/prepare-testdata.sh builds the changed-file list this mode
+# consumes, and nothing else in the repository may hold a second copy of
+# the extensions: a mirrored copy's only symptom when it drifts is a
+# slower job.
+STATUS=0
+OUTPUT="$("${BASH_BIN}" "${SCRIPT}" --list-extensions 2>&1)" || STATUS=$?
+if [ "${STATUS}" -eq 0 ] && [ "$(echo "${OUTPUT}" | wc -l)" -ge 5 ]; then
+    ok "--list-extensions prints $(echo "${OUTPUT}" | wc -l) extensions"
+else
+    fail "exit ${STATUS}: ${OUTPUT}"
+fi
+case "${OUTPUT}" in
+    *qcow2*vmdk*vhd*vhdx*img*) ok "lists the five whole-disk image extensions" ;;
+    *) fail "expected the five extensions in '${OUTPUT}'" ;;
 esac
 
 start "a failing copy is a failing run"

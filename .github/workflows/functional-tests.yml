@@ -217,6 +217,14 @@ jobs:
       - name: Test the testdata resparsifier
         run: tools/ci/test-resparsify-testdata.sh
 
+      # prepare-testdata.sh decides two things a passing job cannot
+      # show: which of its two branches ran, and whether it may fall
+      # back to a fresh clone at all. Both surface only as a job that
+      # merely looks slow, which is invisible for weeks. git is stubbed
+      # in the test, so it needs no token, no network and no testdata.
+      - name: Test the testdata preparation
+        run: tools/ci/test-prepare-testdata.sh
+
       # tools/test-package-functional.sh seeds stestr's per-run
       # repository with a committed timing file before "stestr run", so
       # the scheduler can bin-pack workers by measured duration instead

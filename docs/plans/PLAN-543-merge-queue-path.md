@@ -3,8 +3,10 @@
 ## Status: In progress
 
 Steps 1 to 6 and 8 are done, and step 5's measurement is recorded under
-Execution ("The step-5 measurement"). Step 7 is the only outstanding
-step, and it is blocked on private-ci rather than on anything here.
+Execution ("The step-5 measurement"). Step 7 is split: everything that
+does not request the runner label has landed, and the label itself (and
+the flag that depends on it) is held on private-ci's conductor deploy.
+The step 7 row says which is which.
 
 ## Prompt
 
@@ -457,20 +459,38 @@ tracked in private-ci's plan, not here.
    Two things instar owes in return, and both are the interesting part
    of step 7 rather than the label:
 
-   - **`TESTDATA_REQUIRE_CACHE=1`.** Their request, and the right one:
-     without it a mount failure degrades to a silent 7.46 GiB clone
-     that merely looks slow -- the same shape as the bug this whole
-     plan is about. With it, a missing cache is an infra error in the
-     idiom `prepare-testdata.sh` already uses for a non-materialised
-     LFS tree.
-   - **Do not resparsify over the overlay.** Their catch, and it would
-     have silently eaten most of the saving: the "Resparsify test
-     images" step does `cp --sparse=always` then `mv` over every image
-     under `downloaded/`, which on a copy-on-write overlay writes
-     those bytes into the overlay. The image is already resparsified
-     at build time, so this must run only on the fresh-clone path.
-     That means `prepare-testdata.sh` has to report which branch it
-     took, which it does not do today.
+   - **`TESTDATA_REQUIRE_CACHE=1`.** Their request, and the right one.
+     What it catches is a **path mismatch**: the disk mounted somewhere
+     other than where we look, or a runner that advertised the label
+     without the disk. Without the flag either of those degrades to a
+     silent 7.46 GiB clone that merely looks slow -- the same shape as
+     the bug this whole plan is about. With it, that is an infra error
+     in the idiom `prepare-testdata.sh` already uses for a
+     non-materialised LFS tree.
+
+     It does **not** catch a failed mount, and the message must not
+     say it does. That session confirmed the sequencing: a mount
+     failure makes their userdata print
+     `CONDUCTOR-CACHE-DISK-FAILED` and stop *before the runner
+     registers*, so the job stays queued and never reaches our script
+     at all. A message blaming a mount would send the next person to
+     read userdata logs for an event that cannot have happened. The
+     assertion therefore names `/srv/ci/cached/instar-testdata`
+     literally rather than inheriting the default from
+     `TESTDATA_CACHE`, so that a change on either side of the contract
+     fails the assertion first.
+   - **Do not resparsify the whole tree over the overlay.** Their
+     catch, and it would have silently eaten most of the saving: the
+     "Resparsify test images" step does `cp --sparse=always` then `mv`
+     over every image under `downloaded/`, which on a copy-on-write
+     overlay writes those bytes into the overlay. Skipping it on the
+     cache path outright is wrong in the other direction, though --
+     the image is resparsified at build time, but the objects the
+     job's own `lfs pull` fetches are not, so a day of drift would
+     accumulate fully allocated. What the cache path needs is the
+     changed files and nothing else, which means
+     `prepare-testdata.sh` has to report both which branch it took and
+     what the update changed. Neither of which it did.
 
 9. **Step 7 must not merge before private-ci's conductor phase is
    deployed.** This is a hard sequencing constraint, not a
@@ -482,6 +502,26 @@ tracked in private-ci's plan, not here.
    merging and soaking for 12 hours, and the `ci-instar-testdata`
    session will say when it has.
 
+   Because it is a sequencing constraint and not a property of the
+   code, it gates only the part of step 7 that requests the label.
+   Everything else in that step is independent of whether the disk
+   exists, so it lands first; the step 7 row carries the split.
+
+   Two amendments that session supplied to the contract in Decision 8,
+   recorded here because they change what the held half has to do:
+
+   - **Contract item 1 ("add `instar` to `runs-on`") is verified for
+     `debian-13` only.** Any job requesting the label must request
+     `debian-13` alongside it. Every testdata consumer here already
+     does, so this costs nothing today -- but it means the label is
+     not a free addition to a leg on some other image.
+   - **`instar` has to be in `.github/actionlint.yaml` before any
+     `runs-on` names it.** actionlint rejects an unknown self-hosted
+     runner label, and it runs in pre-commit, so without the entry the
+     labelled change cannot be committed locally at all. The entry is
+     therefore in the landed half: permitting a label changes no job's
+     behaviour.
+
 ## Execution
 
 | Step | Effort | Model | Isolation | Brief for sub-agent |
@@ -492,7 +532,7 @@ tracked in private-ci's plan, not here.
 | 4 | medium | opus | none | The guard (D5). Extend `tools/ci/check-test-partition.py` so its discovered job set includes the merge-queue matrix and the nightly, and so it asserts their selectors together cover everything the matrix covers today. Keep its stated principle intact: the job set is discovered from the workflow and the selectors read from the Makefile, never a second copy. Extend `tools/ci/test_check_test_partition.py` with a case per new failure mode: a test claimed by no queue job and no nightly job; a nightly selector that silently overlaps the queue's; a matrix selector that drops a whole module. Add the guard's invocation to the `ci-tooling` job if the existing invocation does not already cover the new assertions. |
 | 5 | medium | opus | none | **Done: dispatched as workflow run 38818648724; median clean leg 16m31s against the 42-minute baseline, and the comparison is posted on #543. See "The step-5 measurement" below for the legs and the two caveats.** Measure (the point of the plan). Dispatch the workflow and record, by the same method as Situation: per-leg step times, the suite's wall time, stestr's Worker Balance block, the matrix stage span and the total. Compare against this run's 42-minute leg, 39:09 suite, 2197/1490/1367/913 worker split, 235-minute matrix stage and 420-minute total. Post the comparison to #543. If the leg does not reach roughly 18 minutes, say so plainly and do not tune the selector to make the number look better -- the selector is a coverage decision, not a dial. |
 | 6 | low | sonnet | none | Documentation. Amend the superset argument at `functional-tests.yml:26-53` per D6 -- state the second exception, where the six tests run instead, and at what cadence. Update `docs/testing.md:418-457`, which describes the distro matrix and how to reproduce a CI entry: the entry-level command is unchanged but what the queue selects is not, and the nightly is a new thing to document. Record the measured per-distro suite medians (30 to 38 min, every distro's max above the slowest median) so a later reader can check whether the spread is still narrow. ~~No `CHANGELOG.md` entry: nothing user-visible changes.~~ **Reversed during step 8, on audit advice: there is an entry, under Changed.** The original call read "user-visible" as "visible in the binary", and nothing in the binary changes. But the person this is visible to is a contributor, and what they need is discoverable only from the changelog: a VHD change that passes the merge queue and then turns the nightly red has found a per-distro qemu divergence rather than a flake, and the six tests moving off the gate is why the two can now disagree. Finding that out from a GitHub issue filed overnight, with no record of the change in behaviour, is the failure the entry prevents. |
-| 7 | medium | opus | none | The testdata dependencies disk (D8, D9). **Half of this step has already landed, in the branch that did steps 1 to 6 and 8: the resparsify step is out of YAML and into `tools/ci/resparsify-testdata.sh`, with the comment naming private-ci's image build as a cross-repository consumer (D8) and a `tools/ci/test-resparsify-testdata.sh` that exercises their calling convention. What is still outstanding is the `instar` runner label, `TESTDATA_REQUIRE_CACHE=1`, and making the resparsify conditional on which branch `prepare-testdata.sh` took -- do not redo the lift.** **Do not merge this step before the `ci-instar-testdata` session confirms private-ci's conductor phase is deployed and soaked (D9); an early merge queues every labelled job for 24 hours and then cancels it.** Add `instar` to `runs-on` for all seven testdata consumers -- `package-matrix`, `integration-core`, `integration-convert-qcow2`, `integration-convert-vhd` and `oslo-crossval-master` in `functional-tests.yml`, the nightly from step 3, and `coverage-fuzz.yml`; leave `test-drift-fix.yml` unlabelled and add a comment there saying why -- `claude-code` is the static fleet, no static runner advertises `instar`, and a labelled job would queue for 24 hours and then be cancelled, so the inconsistency with every other testdata consumer is deliberate and must survive a future tidy-up. Set `TESTDATA_REQUIRE_CACHE=1` on each, and teach `prepare-testdata.sh` to treat a missing cache under that flag as an infra error in the same idiom as its existing LFS-pointer guard. Then make resparsify conditional: have `prepare-testdata.sh` export which branch it took to `$GITHUB_ENV` beside `TESTDATA_PATH`, and on the cache path resparsify **only the files the fetch and `lfs pull` changed**, not the whole tree. Skipping it outright would be wrong in the other direction: the image is resparsified at build time, but objects `lfs pull` fetches on the runner are not, so a day of testdata drift would accumulate unsparsified files. Resparsifying everything is equally wrong -- `cp --sparse=always` over a copy-on-write overlay writes the 7.5 GiB the disk exists to avoid. The changed set is derivable from the reset (`git diff --name-only` across it) intersected with the extension list. The shared script that step is narrowing already exists, so this is an extra optional argument to `tools/ci/resparsify-testdata.sh` and a matching case in its self-test, not a new script: its one-argument call means "the whole tree" permanently, because private-ci's image build fetches it over HTTPS and relies on that (D8). Message that session when it merges. Extend the prepare-testdata self-test for the require-cache failure path and prove it with the cache absent, not by reading it. Measure one leg before and after and record it on #543. |
+| 7 | medium | opus | none | The testdata dependencies disk (D8, D9). **Split, because only the half that requests the runner label is gated.** *Landed:* the resparsify step out of YAML and into `tools/ci/resparsify-testdata.sh`, with the comment naming private-ci's image build as a cross-repository consumer (D8) and a `tools/ci/test-resparsify-testdata.sh` exercising their calling convention (done in the branch that did steps 1 to 6 and 8 -- do not redo the lift); `prepare-testdata.sh` reporting which branch it took as `TESTDATA_SOURCE`, and on the cache branch the paths the update changed as `TESTDATA_CHANGED_FILES`, because the reset that changed them is the only moment that set can be derived; the narrowing itself as *further optional* arguments to `resparsify-testdata.sh` (`--files-from <list>`, trailing named paths, `--list-extensions`), leaving the one-argument whole-tree call byte-identical for private-ci (D8); `TESTDATA_REQUIRE_CACHE` implemented -- asserting `/srv/ci/cached/instar-testdata` literally, and diagnosing a path mismatch rather than a failed mount, which cannot reach it -- and **set in no workflow**; `tools/ci/test-prepare-testdata.sh`, which stubs git and proves the require-cache refusal with the cache absent, wired into `ci-tooling`; `instar` in `.github/actionlint.yaml`, which has to precede any `runs-on` that names it (D9) and changes no job's behaviour; and the reason `test-drift-fix.yml` stays unlabelled, recorded in that workflow rather than only here, because the reader about to tidy the inconsistency away is looking at the workflow. *Held:* adding `instar` to the `runs-on` of the seven testdata consumers -- `package-matrix`, `integration-core`, `integration-convert-qcow2`, `integration-convert-vhd` and `oslo-crossval-master` in `functional-tests.yml`, the nightly from step 3, and `coverage-fuzz.yml`; setting `TESTDATA_REQUIRE_CACHE=1` on each; making those workflows' resparsify steps conditional on `TESTDATA_SOURCE` (which has nothing to act on until a cache exists); and measuring one leg before and after, recorded on #543. *Why held:* the conductor does not yet know the label, so a labelled job is bucketed as plain `debian-13`/`xl`, never assigned, and cancelled 24 hours later -- strictly worse than the problem this plan fixes (D9). *The go is all three of:* an explicit message from the `ci-instar-testdata` session that private-ci's conductor phase is deployed; a live probe job on `[self-hosted, debian-13, s, instar]` that is actually assigned and runs; and 12 hours of soak after that. Message that session when the held half merges. |
 | 8 | high | opus | none | Push audit: run `PUSH-AUDIT.md` over `git diff origin/develop...HEAD`. Findings are fixed in this branch before the PR, or declined in writing here. |
 
 Commits: the plan; then one per step. Every commit passes
@@ -557,7 +597,7 @@ be said rather than averaged away.
 | Step 1 picks a timing mechanism stestr does not really support, and the balance silently does not change | Step 1 proves the effect from stestr's own Worker Balance block on this host, before and after, where the whole suite is six minutes. No CI round trip needed. Owner: step 1. |
 | The leg does not reach 18 minutes and the queue is still near the limit | Step 5 reports it either way, and packing is held in Deferred work for exactly this case rather than being spent in advance. |
 | Step 7 merges before private-ci's conductor knows the `instar` label, and every labelled job queues 24 hours then cancels | D9 makes this a release gate, not a judgement call: the `ci-instar-testdata` session confirms deployment first. The step is last in the table and the back brief says to land steps 1 to 6 without it rather than hold the pull request. Owner: step 7. |
-| The resparsify step copies 7.5 GiB into the copy-on-write overlay and gives back most of the disk's saving | D8: resparsify only on the fresh-clone path, which requires `prepare-testdata.sh` to report which branch it took. Found by the `ci-instar-testdata` session, not by this plan -- worth noting as evidence that the disk's value is easy to lose silently. Owner: step 7. |
+| The resparsify step copies 7.5 GiB into the copy-on-write overlay and gives back most of the disk's saving | D8: on the cache path resparsify only the files the update changed -- not the whole tree, and not nothing either, since the objects the job's own `lfs pull` fetches land fully allocated. That requires `prepare-testdata.sh` to report both which branch it took and what changed, and `resparsify-testdata.sh` to take a narrower request without disturbing its one-argument form. Found by the `ci-instar-testdata` session, not by this plan -- worth noting as evidence that the disk's value is easy to lose silently. Owner: step 7, landed half. |
 | `tools/ci/resparsify-testdata.sh`'s interface changes and breaks private-ci's nightly image build | D8 makes it a named interface with a self-test in their calling convention, and the script says who consumes it. Their side fails loudly rather than degrading, by design. Owner: step 7. |
 | Someone later gives `test-drift-fix.yml` the `instar` label for consistency, and it queues 24 hours then cancels | The reason goes in that workflow next to the job, not only in this plan: a reader about to make the change is looking at the workflow. Owner: step 7. |
 | Someone later "fixes" the gating by putting the six tests back | D6 records the reason in the workflow comment that already warns readers off re-running everything everywhere, which is where someone about to do this will be looking. |

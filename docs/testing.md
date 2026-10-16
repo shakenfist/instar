@@ -1007,6 +1007,30 @@ an explicit "infrastructure problem, not a test regression" message if any is
 still a pointer, so a git-LFS outage can never be silently misattributed to
 instar (see GitHub issue #451 for the incident this guards against).
 
+Which of its two branches ran is part of its output, because the two leave the
+tree in materially different states and nothing else can tell them apart by
+looking. Beside `TESTDATA_PATH` it exports:
+
+| Variable | Meaning |
+|---|---|
+| `TESTDATA_SOURCE` | `cache` (updated in place) or `clone` (fresh). A fresh clone writes every image out fully allocated, so the whole tree needs resparsifying; a cache usually does not. |
+| `TESTDATA_CHANGED_FILES` | On the cache branch only: a file listing the paths the update changed, one per line, for the narrow resparsify above. Derived here because the reset that changed them happens here — by the time a later step runs there is nothing left to diff. |
+
+Both are printed as well as written to `$GITHUB_ENV`, and running the script
+by hand with `$GITHUB_ENV` unset is fine.
+
+`TESTDATA_REQUIRE_CACHE=1` turns a missing cache into an infra error instead
+of a 7.46 GiB fallback clone, in the same idiom as the pointer guard: a job
+that silently did the slow thing merely looks slow, which is the failure mode
+that goes unnoticed for weeks. The assertion names the contractual mount path
+(`/srv/ci/cached/instar-testdata`) literally rather than taking it from
+`TESTDATA_CACHE`, so a change to either side of that contract fails there
+instead of quietly following a defaulted path. What it detects is a **path
+mismatch** — the disk mounted somewhere else, or a runner advertising the
+disk's label without the disk. It cannot be a failed mount: that stops the
+fleet's userdata before the runner registers, so such a job stays queued and
+never runs this script at all. **No workflow sets the flag today.**
+
 Eight of the nine jobs that prepare testdata then run
 **`tools/ci/resparsify-testdata.sh <tree>`** — every one that runs the Python
 integration suite over the tree (five in `functional-tests.yml`, two in
@@ -1029,11 +1053,39 @@ instar-testdata dependencies-disk image build fetches it from instar's default
 branch over HTTPS and runs it against its own clone, outside GitHub Actions.
 So its one-argument call means "the whole tree" permanently, it reads no
 `GITHUB_*` variable, and it exits non-zero on failure so that a broken fetch
-fails their build rather than quietly shipping an unsparsified image. Anything
-narrower — resparsifying only the files a fetch changed, say — has to arrive as
-further optional arguments. `tools/ci/test-resparsify-testdata.sh` exercises
-exactly that calling convention, and measures allocated blocks before and
-after rather than trusting the exit status.
+fails their build rather than quietly shipping an unsparsified image.
+`tools/ci/test-resparsify-testdata.sh` exercises exactly that calling
+convention, and measures allocated blocks before and after rather than
+trusting the exit status.
+
+Anything narrower therefore arrives as **further optional arguments** after
+the tree path:
+
+```
+resparsify-testdata.sh <tree> [--files-from <list>]... [--] [<file>...]
+```
+
+The caller that needs this is a job whose tree came off a pre-built testdata
+dependencies disk: that tree is a copy-on-write overlay of an image which was
+resparsified when it was built, so rewriting all of it would write gigabytes
+into the overlay the disk exists to avoid — while skipping it altogether would
+leave the day's drift, which the job's own fetch and `lfs pull` land fully
+allocated. Only what the update changed needs it. Paths may be tree-relative
+or absolute inside the tree, and the two ways in differ on purpose:
+
+- `--files-from <list>` takes a newline-separated **candidate** list — a
+  changed-file list, which legitimately holds non-images, `custom/` fixtures
+  and paths the update deleted. Entries that are not in-scope images that
+  exist are dropped and counted, so the caller does not need a second copy of
+  the extension list to drift from. (`--list-extensions` publishes that list
+  for a caller that does want to filter.)
+- Trailing positional paths are **named deliberately**, so anything the script
+  will not act on is refused instead.
+
+A path that resolves outside the tree is refused in both forms, and a refusal
+resparsifies nothing at all. An empty narrow set is success, unlike the
+whole-tree form: a cached tree whose update changed no image is the normal
+case, not a misconfiguration.
 
 ## Expected Output Overrides
 

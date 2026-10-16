@@ -9,6 +9,11 @@ self-hosted-runner:
     # Needed by mermaid-lint.yml: mmdc renders through a browser, so
     # it runs in a container, and static runners have no docker daemon.
     - debian-13-docker
+    # A runner carrying the pre-seeded instar-testdata dependencies
+    # disk. Permitted here ahead of its first use on purpose: actionlint
+    # rejects an unknown self-hosted runner label, so a `runs-on` naming
+    # it cannot even be committed until this entry exists.
+    - instar
     - static
     - vm
     - xs
