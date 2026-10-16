@@ -1,0 +1,719 @@
+name: Nightly distro matrix
+
+# The six heavy VHD conversion tests -- the Hyper-V and VirtualPC
+# roundtrip, to-raw and compare cases -- do not gate a merge. They were
+# 2945 of the suite's 5967 seconds of execute time, on every leg of a
+# seven-distro matrix, and what they measure is a distro's qemu-img
+# rather than the change under test. They run here instead, once a night,
+# on all seven distros.
+#
+# That trade is only honest if a red nightly reaches a person, so filing
+# an issue is part of the job (see tools/ci/report-nightly-matrix-
+# failure.sh) rather than something to add later. A nightly whose failure
+# is visible only as a red square in the Actions tab is not a safety net.
+#
+# WHY THIS IS ITS OWN WORKFLOW FILE, and not more jobs in
+# functional-tests.yml. Both reasons are structural:
+#
+#   - `needs:` cannot cross workflow files, and the package artifact a
+#     matrix leg installs is built by `package-build` over there, which
+#     is gated to `merge_group || workflow_dispatch`. A scheduled job
+#     could not `needs:` it even in the same file, so this builds its own
+#     packages -- the same choice differential-fuzz.yml makes when it
+#     builds its own binaries rather than consuming someone else's.
+#   - A `schedule:` trigger added to functional-tests.yml would fire
+#     every job there whose condition starts with `always()`. `can_enqueue`
+#     is exactly that, and it would publish a nightly enqueue verdict for
+#     a default branch with nothing to enqueue.
+#
+# WHY THERE ARE TWO SHAPES OF LEG HERE. The distinction is worth reading
+# before deleting one of them as redundant:
+#
+#   - `nightly-legs` runs the six moved tests on all seven distros. This is the
+#     coverage the nightly exists to keep. Those conversions are where a
+#     distro's qemu-img is most likely to disagree with instar, and the
+#     distro axis moves when a distro ships a new qemu rather than when
+#     instar changes, so once a day is still far finer than the signal.
+#   - `measure` runs the WHOLE suite, on Debian 13 only. Its purpose is
+#     not coverage: every test in it either still gates a merge or runs
+#     on the seven legs above, so as coverage it is redundant and that is
+#     fine. It exists because it is the only job left in CI that executes
+#     the whole suite in a single stestr repository, which makes it the
+#     only place tests/stestr-timing.txt can be *derived* from. That file
+#     is what lets stestr bin-pack its workers instead of splitting the
+#     suite round-robin, it must not be hand-maintained, and if this leg
+#     were removed it would simply stop being refreshed with nothing
+#     going red to say so.
+#
+# `publish-timing` is the third job shape and is not a leg at all: it
+# runs no test, and exists so that the job holding the write scopes the
+# refresh needs is not the job running the suite over malicious images.
+# See the comment on it.
+
+on:
+  # 22:00 UTC: the daily schedules cluster between 00:30 and 04:00
+  # (export-repo-config, differential-fuzz, coverage-fuzz), and seven
+  # `xl` legs plus a full-suite leg is the largest nightly this
+  # repository runs. Starting four hours ahead of that cluster gives it
+  # the shared on-demand pool to itself -- which matters, because the
+  # pool has a measured ceiling of about three concurrent legs, so these
+  # eight `xl` jobs stagger rather than run at once.
+  schedule:
+    - cron: '0 22 * * *'
+
+  workflow_dispatch:
+    inputs:
+      force_timing_pr:
+        description: >-
+          Open the timing-refresh pull request even if the measurement
+          did not move materially. A measurement that FAILED still
+          publishes nothing: the publishing job needs a successful
+          measuring job, because timings from a run that fell over are
+          not worth committing.
+        required: false
+        default: false
+        type: boolean
+
+# Read-only at the workflow level, because a workflow-level grant is a
+# grant to all ten jobs. Eight of them install a package and run instar
+# and qemu-img over instar-testdata's deliberately malicious images,
+# outside the KVM sandbox; the write scopes the timing refresh needs have
+# no business being reachable from there. Each job that needs more says
+# so itself, and the merge-queue matrix runs the same code path under
+# `contents: read` already. Exactly one job holds a write scope, it runs
+# no tests, and keeping those two facts in one job is the point of the
+# `measure` / `publish-timing` split below.
+permissions:
+  contents: read
+
+concurrency:
+  # Never cancel in progress: a nightly that is half way through seven
+  # distros has already spent most of its cost, and a manual dispatch
+  # while it runs should queue rather than discard it.
+  #
+  # A manual dispatch gets a group of its own, keyed on its run id, and
+  # that is the whole reason this expression is not the constant it
+  # looks like it should be. GitHub keeps exactly one *pending* run per
+  # group: queue a dispatch behind a running nightly under one shared
+  # key and it waits, but a second dispatch -- or the 22:00 schedule
+  # arriving while a dispatch waits -- silently cancels the one already
+  # queued. A dispatch is somebody asking for a measurement now, so
+  # losing it without a word is the wrong failure. Scheduled runs keep
+  # sharing `nightly-matrix-schedule`, where collapsing is right: two
+  # nightlies of the same thing are redundant, and the next one is a
+  # day away.
+  #
+  # The cost is that a dispatch can now run alongside the schedule, and
+  # these are the heaviest jobs the repository has. That is a slower
+  # run, not a wrong one -- the shared pool serialises what it cannot
+  # fit -- and the one job where overlap would be unsafe, the timing
+  # publisher, carries its own concurrency group so its pushes stay
+  # serialised whatever the workflow does.
+  group: >-
+    nightly-matrix-${{ github.event_name == 'workflow_dispatch'
+    && github.run_id || 'schedule' }}
+  cancel-in-progress: false
+
+jobs:
+  # One build for every leg, exactly as the merge queue does it: the
+  # legs must all install the same artifact, or a divergence between two
+  # distros could be a divergence between two builds.
+  package-build:
+    name: "Build packages"
+    runs-on: [self-hosted, debian-13, s]
+    timeout-minutes: 60
+
+    env:
+      DOCKER_BUILDKIT: 1
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          # Nothing here pushes, and the build runs in a container over
+          # this working tree, so the default of writing the job token
+          # into .git/config would only widen what a build step can
+          # reach.
+          persist-credentials: false
+
+      - name: Install Docker
+        run: tools/ci/install-docker.sh
+
+      - name: Remove previous devcontainers, if any
+        run: |
+          docker image rm -f instar-build instar-release 2>/dev/null || true
+
+      - name: Build instar and both packages
+        run: |
+          make instar
+          make package
+
+      # Flatten both packages into one directory so the legs can glob
+      # with a fixed depth. resolve-package.sh also asserts exactly one
+      # of each kind exists, which fails here rather than eight times
+      # over.
+      - name: Stage packages
+        run: |
+          mkdir -p dist
+          cp "$(tools/ci/resolve-package.sh deb)" dist/
+          cp "$(tools/ci/resolve-package.sh rpm)" dist/
+          ls -la dist/
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: instar-packages
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  # The distro coverage: the six moved tests, on every distro the
+  # published support matrix promises.
+  nightly-legs:
+    needs: package-build
+    name: "Nightly: ${{ matrix.distro.name }}"
+    runs-on: [self-hosted, debian-13, xl]
+    # The six tests are about 2945 seconds of execute time between them,
+    # so at concurrency 4 a leg is bounded below by its heaviest pair of
+    # workers -- roughly 20 minutes, plus the package install and the
+    # testdata preparation. Generous rather than tight: a timeout firing
+    # mid-suite is indistinguishable from a distro divergence in the
+    # issue this files. It also has to cover an unseeded run: the
+    # committed timings are a hint, a corrupt file is deliberately a
+    # warning rather than a failure, and without them these six land
+    # wherever the blind partition puts them -- worst case the three
+    # heaviest on one worker, which is about 24 minutes of execution
+    # before anything else.
+    timeout-minutes: 60
+    # Same quarantine hatch as the merge-queue matrix, and the flag means
+    # less here: a nightly gates nothing, so this only changes the
+    # colour of the run. The issue is still filed either way, by the
+    # failure step below.
+    continue-on-error: ${{ matrix.distro.allow_failure }}
+
+    # Only what the failure reporter below needs. These legs run instar
+    # and qemu-img over the malicious testdata images, so they get no
+    # write access to the repository's contents or its pull requests.
+    permissions:
+      contents: read
+      issues: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # The seven distros of the merge-queue matrix, copied rather than
+        # shared. The entries in functional-tests.yml carry load-bearing
+        # comments and audit markers that a shared JSON file could not
+        # hold, so the two lists are kept in step by
+        # tools/ci/check-test-partition.py, which fails if they disagree
+        # -- a distro quietly dropped from one side is a loss of coverage
+        # with no symptom at all.
+        distro:
+          # Debian 12 is a SUPPORTED TARGET here, not a build platform;
+          # bookworm is end of life, but the published support matrix
+          # promises Debian 11 and newer. See the longer note on the
+          # same entry in functional-tests.yml before removing it.
+          - name: 'Debian 12'
+            # audit-ok: eol-distro -- supported target, see the note above
+            image: 'debian:12'
+            pkg_kind: 'deb'
+            allow_failure: false
+          - name: 'Debian 13'
+            image: 'debian:13'
+            pkg_kind: 'deb'
+            allow_failure: false
+          - name: 'Ubuntu 22.04'
+            image: 'ubuntu:22.04'
+            pkg_kind: 'deb'
+            allow_failure: false
+          - name: 'Ubuntu 24.04'
+            image: 'ubuntu:24.04'
+            pkg_kind: 'deb'
+            allow_failure: false
+          - name: 'Fedora latest'
+            image: 'fedora:latest'
+            pkg_kind: 'rpm'
+            allow_failure: false
+          - name: 'Rocky 9'
+            image: 'rockylinux:9'
+            pkg_kind: 'rpm'
+            allow_failure: false
+          # Rocky 10 is not in the Docker Official `rockylinux` library,
+          # which stops at 9; it lives under the vendor namespace.
+          - name: 'Rocky 10'
+            image: 'rockylinux/rockylinux:10'
+            pkg_kind: 'rpm'
+            allow_failure: false
+
+    env:
+      DOCKER_BUILDKIT: 1
+
+    steps:
+      - name: Checkout instar
+        uses: actions/checkout@v7
+        with:
+          path: instar
+          fetch-depth: 0
+          # This working tree is mounted into a container that runs
+          # instar and qemu-img over instar-testdata's deliberately
+          # malicious images, outside the KVM sandbox. The default would
+          # write the job token into its .git/config, where that code
+          # path can read it; nothing on this leg pushes, so the
+          # credential is pure exposure. pr-re-review.yml refuses it for
+          # the same reason.
+          persist-credentials: false
+
+      - name: Prepare instar-testdata
+        env:
+          TESTDATA_TOKEN: ${{ secrets.GITLAB_TESTDATA_TOKEN }}
+        run: ${GITHUB_WORKSPACE}/instar/tools/ci/prepare-testdata.sh
+
+      # git-lfs writes every image fully allocated, and the tree is
+      # 7.46 GiB of mostly zeros. Every job that runs the Python suite
+      # over this tree runs this ahead of it -- coverage-fuzz.yml is the
+      # one testdata consumer that does not, because it seeds fuzz
+      # corpora and compares no allocated sizes -- through one shared
+      # script so that the extension list and the directory scope cannot
+      # drift between them.
+      - name: Resparsify test images
+        run: ${GITHUB_WORKSPACE}/instar/tools/ci/resparsify-testdata.sh "${TESTDATA_PATH}"
+
+      # jq is for the issue reporter's deduplication, which runs only on
+      # the failure path -- but installing it there would be one more
+      # thing to go wrong on the night something is already wrong.
+      - name: Install Docker
+        run: ${GITHUB_WORKSPACE}/instar/tools/ci/install-docker.sh jq
+
+      - name: Download packages
+        uses: actions/download-artifact@v8
+        with:
+          name: instar-packages
+          path: ${{ github.workspace }}/packages
+
+      - name: Run the nightly selection on ${{ matrix.distro.image }}
+        env:
+          PACKAGE_DIR: ${{ github.workspace }}/packages
+          MATRIX_LOG: ${{ github.workspace }}/matrix.log
+          # The six tests, read out of the Makefile target that defines
+          # them rather than restated here.
+          MATRIX_SET: nightly
+        run: |
+          cd ${GITHUB_WORKSPACE}/instar
+          tools/ci/run-matrix-entry.sh \
+            "${{ matrix.distro.name }}" \
+            "${{ matrix.distro.image }}" \
+            "${{ matrix.distro.pkg_kind }}"
+
+      - name: Install GitHub CLI on host
+        if: failure()
+        run: ${GITHUB_WORKSPACE}/instar/tools/ci/install-gh-cli.sh
+
+      # The point of the whole job. The issue names the distro and the
+      # failing tests, because that pair is the signal: one distro red
+      # and six green is a qemu-img divergence at that distro's version,
+      # while all seven red is an instar regression the pull-request jobs
+      # missed.
+      - name: File or update an issue for this distro
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          cd ${GITHUB_WORKSPACE}/instar
+          tools/ci/report-nightly-matrix-failure.sh \
+            "${{ matrix.distro.name }}" \
+            "${{ matrix.distro.image }}" \
+            "${{ github.workspace }}/matrix.log"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nightly-${{ matrix.distro.pkg_kind }}-${{ strategy.job-index }}-logs
+          path: ${{ github.workspace }}/matrix.log
+          retention-days: 7
+          if-no-files-found: warn
+
+  # The measurement leg. Read the note at the top of this file before
+  # deciding it duplicates the merge queue: as coverage it does, and that
+  # is not why it is here.
+  #
+  # It measures and publishes nothing. The refresh it feeds is the
+  # separate `publish-timing` job below, and the split is a security
+  # boundary rather than tidiness: this leg mounts the working tree into
+  # a container that runs instar and qemu-img over instar-testdata's
+  # deliberately malicious images, outside the KVM sandbox, so it must
+  # not be holding a token that can write to the repository while it
+  # does so. The two halves hand over through an artifact, exactly as
+  # `package-build` hands the legs their packages.
+  measure:
+    needs: package-build
+    name: "Measure: full suite on Debian 13"
+    runs-on: [self-hosted, debian-13, xl]
+    # A full suite, and deliberately an unseeded one -- the measurement
+    # cannot inherit the numbers it is measuring, so this leg pays the
+    # unbalanced partition the rest of CI no longer does. The merge-queue
+    # matrix allowed 120 minutes for the same work when it was seeded;
+    # keep that here, where nothing waits on the answer.
+    timeout-minutes: 120
+
+    # The same scopes as the seven distro legs, for the same reason:
+    # this job runs the suite, so it gets no write access to the
+    # repository's contents or its pull requests. `issues: write` is the
+    # failure reporter below. The write scopes the timing refresh needs
+    # live on `publish-timing`, which runs no tests.
+    permissions:
+      contents: read
+      issues: write
+
+    env:
+      DOCKER_BUILDKIT: 1
+
+    steps:
+      - name: Checkout instar
+        uses: actions/checkout@v7
+        with:
+          path: instar
+          # This working tree is mounted into the container that runs
+          # the suite over the malicious testdata images. Nothing here
+          # pushes -- `publish-timing` does the pushing, from its own
+          # checkout -- so the default of writing the job token into
+          # .git/config would be exposure and nothing else.
+          persist-credentials: false
+
+      - name: Prepare instar-testdata
+        env:
+          TESTDATA_TOKEN: ${{ secrets.GITLAB_TESTDATA_TOKEN }}
+        run: ${GITHUB_WORKSPACE}/instar/tools/ci/prepare-testdata.sh
+
+      # See the matching step on the legs above.
+      - name: Resparsify test images
+        run: ${GITHUB_WORKSPACE}/instar/tools/ci/resparsify-testdata.sh "${TESTDATA_PATH}"
+
+      # jq is for the issue reporter's deduplication, which runs only on
+      # the failure path -- but installing it there would be one more
+      # thing to go wrong on the night something is already wrong.
+      - name: Install Docker
+        run: ${GITHUB_WORKSPACE}/instar/tools/ci/install-docker.sh jq
+
+      - name: Download packages
+        uses: actions/download-artifact@v8
+        with:
+          name: instar-packages
+          path: ${{ github.workspace }}/packages
+
+      - name: Run the whole suite and measure it
+        id: suite
+        env:
+          PACKAGE_DIR: ${{ github.workspace }}/packages
+          MATRIX_LOG: ${{ github.workspace }}/matrix.log
+          # No selector: the union of the queue and nightly halves, which
+          # is the only run that measures a duration for every test.
+          MATRIX_SET: all
+          # Setting this declares the run a measurement, which also stops
+          # the committed timings being seeded into it. See
+          # tools/test-package-functional.sh for why that matters.
+          #
+          # Its own directory, not the workspace root: the runner mounts
+          # that directory into the container writable, and the
+          # workspace root holds the instar checkout, which is mounted
+          # read-only on purpose so a container running as root cannot
+          # leave root-owned files in it.
+          STESTR_TIMING_OUT: ${{ github.workspace }}/timing/stestr-timing.txt
+        run: |
+          cd ${GITHUB_WORKSPACE}/instar
+          tools/ci/run-matrix-entry.sh \
+            "Debian 13 (full suite)" \
+            "debian:13" \
+            "deb"
+
+      # The handover to `publish-timing`, and kept whatever the verdict,
+      # so a night that publishes nothing still leaves the numbers for
+      # anyone wondering where the suite's time goes.
+      - name: Upload the measured timings
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: stestr-timing
+          path: ${{ github.workspace }}/timing/stestr-timing.txt
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Install GitHub CLI on host
+        if: failure()
+        run: ${GITHUB_WORKSPACE}/instar/tools/ci/install-gh-cli.sh
+
+      # Keyed on the suite step rather than on the job, and on "did not
+      # succeed" rather than "failed": a suite that failed and a leg that
+      # died before reaching it both need reporting.
+      - name: File or update an issue for the measurement leg
+        if: failure() && steps.suite.outcome != 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          cd ${GITHUB_WORKSPACE}/instar
+          tools/ci/report-nightly-matrix-failure.sh \
+            "Debian 13 (full suite)" \
+            "debian:13" \
+            "${{ github.workspace }}/matrix.log"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nightly-measure-logs
+          path: ${{ github.workspace }}/matrix.log
+          retention-days: 7
+          if-no-files-found: warn
+
+  # The other half of the measurement: compare what the leg measured
+  # against the committed file and, if the numbers moved, push the
+  # refresh branch and open the pull request.
+  #
+  # What crosses the boundary is data, and that is the point of the
+  # split rather than an oversight in it. The measuring job runs the
+  # suite over hostile images and cannot push; this job can push and
+  # runs no tests, no containers and no testdata. The timing file it
+  # receives is parsed, not executed, and the result is never committed
+  # directly -- it becomes a pull request that a person reads and
+  # merges. A measurement that lied about a duration would at worst
+  # make the scheduler pack a little worse, and would have to get past
+  # that review to do even that.
+  #
+  # The two paths that read that file validate it differently, and
+  # deliberately so. Here, on the publishing path,
+  # tools/ci/compare-stestr-timing.py requires every line to be a test
+  # id matching a conservative charset and a number, and ANYTHING ELSE
+  # STOPS THE REFRESH -- nothing is dropped and nothing is published,
+  # because the ids travel from here into a Markdown report, into the
+  # body of a pull request opened unattended, and into the committed
+  # file. Dropping lines is what tools/ci/seed-stestr-timing.sh does on
+  # the reading path before a run, where one bad line must not take out
+  # every testdata job.
+  #
+  # WHY THIS IS A JOB OF ITS OWN. It is the only job in the workflow
+  # that holds write scopes, and the rule it exists to keep is that no
+  # job both runs the suite and holds one. The suite executes instar,
+  # qemu-img and 7.5 GiB of deliberately malicious images outside the
+  # KVM sandbox, over a working tree the container can read; a job token
+  # with `contents: write` sitting in that tree's .git/config for the
+  # two hours that takes is the largest piece of exposure this workflow
+  # had. Nothing here runs a test, installs a package, or reads
+  # testdata: it downloads one derived text file, runs two scripts from
+  # the checkout, and pushes.
+  #
+  # A failed measurement still publishes nothing: the steps below check
+  # that one arrived and skip the publisher if it did not, so a morning
+  # with a failure issue does not also get a timing pull request nobody
+  # should read.
+  #
+  # The job runs anyway, which is the fix for a defect in the earlier
+  # shape of this. With `needs: measure` alone a failed measuring job
+  # skipped this one entirely -- and the refresh's own failure issue is
+  # filed from here, so a leg that failed night after night left the
+  # committed timings ageing with nothing saying so. The leg does file an
+  # issue about itself, but that issue is about the leg; it says nothing
+  # about the scheduling hint going stale behind it. The quieter case
+  # filed nothing at all: the derivation inside the leg is deliberately a
+  # warning rather than an error, so the leg could go green, upload no
+  # timing artifact, and leave this job red at its download step. So the
+  # gate moved from the job to the steps below: not publishing from a
+  # failed night is kept, and the silence around it is not.
+  publish-timing:
+    needs: measure
+    # Not `always()`: a cancelled run has nothing to report.
+    if: ${{ !cancelled() }}
+    name: "Publish refreshed stestr timings"
+    runs-on: [self-hosted, debian-13, s]
+    # A download, a comparison and a push. Generous for all three.
+    timeout-minutes: 20
+
+    # The write scopes, and the reason the workflow level is read-only:
+    # `contents: write` and `pull-requests: write` are for the timing
+    # refresh, which pushes a bot branch and opens a pull request -- the
+    # same thing rust-nightly-bump.yml does with the same two
+    # permissions -- and `issues: write` is for the failure reporter.
+    # Nothing here writes to the default branch: `develop` is
+    # merge-queue protected, nothing in this repository pushes to it
+    # from CI, and a file that only hints at scheduling is nowhere near
+    # a good enough reason to be the first thing that does.
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+
+    # The push path, serialised on a key of its own. The workflow-level
+    # group now lets a manual dispatch run beside the schedule, which is
+    # safe for everything above and not for this: two runs force-pushing
+    # `stestr-timing/refresh` and racing to open a pull request for it
+    # is the one overlap worth preventing. Losing a queued publish to
+    # the pending-run collapse is the benign direction -- the loser's
+    # measurement is still an artifact, and a stale scheduling hint
+    # degrades packing gradually and can never make a run wrong.
+    concurrency:
+      group: nightly-matrix-timing-publish
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout instar
+        uses: actions/checkout@v7
+        with:
+          path: instar
+          # Full history: the timing refresh commits and pushes a
+          # branch, and a shallow clone cannot be pushed.
+          fetch-depth: 0
+          # Credentials kept, deliberately and uniquely in this
+          # workflow: tools/ci/publish-stestr-timing.sh pushes through
+          # this checkout's remote. It is safe here and was not safe on
+          # the measurement leg, because nothing in this job executes
+          # anything from outside the repository.
+
+      # Conditional, because this job now also runs when the measuring
+      # job did not succeed, and non-fatal, because a measuring leg that
+      # went green without deriving a timing file uploads no artifact --
+      # in which case this step's own failure would be the whole story,
+      # and a red download step is exactly the silence the step after it
+      # exists to break.
+      - name: Download the measured timings
+        id: download
+        if: needs.measure.result == 'success'
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: stestr-timing
+          path: ${{ github.workspace }}/timing
+
+      # python3 compares the measurement against the committed file, jq
+      # is for the issue reporter's deduplication. No Docker: this job
+      # runs no container.
+      - name: Install python3 and jq on host
+        run: |
+          cd ${GITHUB_WORKSPACE}/instar
+          tools/ci/apt-get.sh update
+          tools/ci/apt-get.sh install -y python3 jq
+
+      - name: Install GitHub CLI on host
+        run: ${GITHUB_WORKSPACE}/instar/tools/ci/install-gh-cli.sh
+
+      # The two ways a refresh can fail to happen rather than fail: the
+      # measuring job did not succeed, or it succeeded without writing
+      # the derived file -- which it treats as a warning and not an error
+      # on purpose, so that a measurement it could not derive does not
+      # change the suite's verdict. Either way there is nothing this job
+      # will publish and nothing is published, which is right; the issue
+      # filed below is what stops that being silent.
+      - name: Check that a measurement arrived
+        id: measurement
+        env:
+          MEASURE_RESULT: ${{ needs.measure.result }}
+          DOWNLOAD_OUTCOME: ${{ steps.download.outcome }}
+          TIMING_FILE: ${{ github.workspace }}/timing/stestr-timing.txt
+          NOTE_FILE: ${{ github.workspace }}/timing-unmeasured.log
+        run: |
+          if [ "${MEASURE_RESULT}" != "success" ]; then
+            REASON="the measurement job did not succeed (result: ${MEASURE_RESULT})"
+          elif [ ! -s "${TIMING_FILE}" ]; then
+            REASON="the measurement job succeeded but delivered no timing file"
+            REASON="${REASON} (artifact download: ${DOWNLOAD_OUTCOME})"
+          else
+            echo "publishable=true" >> "${GITHUB_OUTPUT}"
+            echo "A measurement arrived: $(wc -l < "${TIMING_FILE}") test durations."
+            exit 0
+          fi
+          echo "publishable=false" >> "${GITHUB_OUTPUT}"
+          printf 'No stestr timing measurement to publish: %s.\n' "${REASON}" \
+            > "${NOTE_FILE}"
+          echo "${REASON}; tests/stestr-timing.txt was not refreshed."
+          # Red only when this pipeline is what broke. A measuring job
+          # that failed has already made the run red and filed its own
+          # issue, and a second red here would say nothing new; a
+          # measuring job that went green and delivered nothing is a
+          # defect in this mechanism with nothing else to show it.
+          if [ "${MEASURE_RESULT}" = "success" ]; then
+            exit 1
+          fi
+
+      - name: Publish refreshed timings if they moved materially
+        if: steps.measurement.outputs.publishable == 'true'
+        id: publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          FORCE: ${{ inputs.force_timing_pr }}
+        # Captured as well as printed, so that if this step is what
+        # failed, the issue filed below can quote the publisher's own
+        # output.
+        run: |
+          cd ${GITHUB_WORKSPACE}/instar
+          ARGS=("${{ github.workspace }}/timing/stestr-timing.txt")
+          if [ "${FORCE}" = "true" ]; then ARGS+=(--force); fi
+          # PIPESTATUS, not a bare pipeline: a run step's default shell
+          # is "bash -e" without pipefail, so piping into tee reports
+          # tee's status and a failed publish would read as a green step
+          # -- which would also stop the failure issue below ever being
+          # filed. Same idiom as the build and suite steps elsewhere.
+          set +e
+          tools/ci/publish-stestr-timing.sh "${ARGS[@]}" \
+            2>&1 | tee "${{ github.workspace }}/timing-publish.log"
+          publish_exit_code=${PIPESTATUS[0]}
+          set -e
+          if [ ${publish_exit_code} -ne 0 ]; then
+            echo "Timing refresh failed with exit code ${publish_exit_code}"
+            exit ${publish_exit_code}
+          fi
+
+      # Without this a publisher bug is a red run and nothing else, and
+      # this workflow's own argument is that a nightly whose red is
+      # visible only in the Actions tab is not a safety net. --kind
+      # timing-refresh makes the issue say it is the refresh that broke,
+      # so nobody goes looking for a qemu-img divergence that is not
+      # there.
+      # Keyed on the publisher step rather than on the job: an infra
+      # failure before the publisher ran -- a checkout, the artifact
+      # download, apt -- has no publisher output to quote and is not a
+      # broken refresh, so it stays a red run rather than an issue
+      # saying the refresh is broken. Same split the measurement leg
+      # makes with its own suite step.
+      - name: File or update an issue for a failed timing refresh
+        if: failure() && steps.publish.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          cd ${GITHUB_WORKSPACE}/instar
+          tools/ci/report-nightly-matrix-failure.sh \
+            --kind timing-refresh \
+            "Debian 13 (full suite)" \
+            "debian:13" \
+            "${{ github.workspace }}/timing-publish.log"
+
+      # The other half of the same argument, for the case where the
+      # publisher never ran. A measuring leg that fails night after
+      # night, or one that goes green while its derivation quietly
+      # warns, leaves the committed timings ageing with nothing anywhere
+      # naming that -- so this says it, under a dedup key of its own so
+      # it neither collapses into the publisher's issue nor into the
+      # measuring leg's distro issue. Those are three different things to
+      # go and look at.
+      - name: File or update an issue for timings that are not being refreshed
+        if: always() && steps.measurement.outputs.publishable == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          cd ${GITHUB_WORKSPACE}/instar
+          tools/ci/report-nightly-matrix-failure.sh \
+            --kind timing-unmeasured \
+            "Debian 13 (full suite)" \
+            "debian:13" \
+            "${{ github.workspace }}/timing-unmeasured.log"
+
+      - name: Upload the publisher log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: nightly-timing-publish-log
+          path: ${{ github.workspace }}/timing-publish.log
+          retention-days: 7
+          if-no-files-found: warn

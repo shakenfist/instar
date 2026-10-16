@@ -95,7 +95,7 @@ expect() {
 # would shrink the check and the generated cases together, and nothing
 # would notice. This is the one assertion that must be updated by hand
 # when a fixture is deliberately added or removed.
-EXPECTED_REQUIRED=3
+EXPECTED_REQUIRED=5
 
 count="$(required | grep -c .)"
 start "the required-fixture list is non-empty and parseable"

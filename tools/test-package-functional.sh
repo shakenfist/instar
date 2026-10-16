@@ -29,6 +29,20 @@
 #       src/target/debian/instar_*.deb debian:13
 #
 # Environment:
+#   STESTR_TIMING_OUT
+#                   when set, a host path to write this run's derived
+#                   per-test durations to, in the format
+#                   tools/ci/generate-stestr-timing.py produces. Setting
+#                   it declares the run a MEASUREMENT: the committed
+#                   timing file is not seeded into the repository first,
+#                   so the durations come only from this run. Seeding and
+#                   measuring at once would be self-referential -- every
+#                   test that did not execute would keep the duration it
+#                   was seeded with, so a deleted test's figure would
+#                   live on forever and a test that silently stopped
+#                   running would never lose its old one. The cost is a
+#                   worse-packed run, which is why only the nightly
+#                   measurement leg sets this and never a gating one.
 #   TESTDATA_PATH   instar-testdata working tree to mount read-only at
 #                   /testdata (default: <repo>/../instar-testdata). It
 #                   MUST already be git-LFS materialised -- in CI run
@@ -52,6 +66,15 @@
 #   (package + prerequisite install need it) and the repo is mounted
 #   read-only, so no root-owned .stestr/ artefacts leak into the host
 #   worktree.
+#
+#   Before "stestr run", tools/ci/seed-stestr-timing.sh loads
+#   tests/stestr-timing.txt (a committed, machine-derived list of
+#   per-test durations) into the fresh .stestr repository, so
+#   the scheduler bin-packs workers by measured duration instead of
+#   distributing every test round-robin. Without it, one matrix leg put
+#   1424s of VirtualPC conversion tests on a single worker out of 5967s
+#   total execute time, so that worker ran 2197s wall while the
+#   lightest ran 913s. See tools/ci/seed-stestr-timing.sh for why.
 #
 # This is the per-matrix-entry functional runner. It is separate from
 # tools/test-package-install.sh, which stays the fast packaging smoke
@@ -263,6 +286,73 @@ cd /tmp/instar-tests
 /tmp/test-venv/bin/pip install -q -r requirements.txt
 
 echo ""
+if [ -n "${TIMING_OUT:-}" ]; then
+    echo "--- NOT seeding stestr timing data: this run measures it ---"
+    # A measurement must not inherit the numbers it is measuring. stestr
+    # keeps one duration per test id in its repository and only the tests
+    # that execute update theirs, so a seeded repository hands back the
+    # seeded figure for every test that did not run -- including tests
+    # that no longer exist. Starting empty costs this run a worse
+    # partition and gives the derived file only what was measured here.
+    echo "(the partition will be blind, which is the price of measuring)"
+else
+    echo "--- Seeding stestr timing data ---"
+    # See tools/ci/seed-stestr-timing.sh for why: a repository created
+    # fresh in every container has no durations to bin-pack from, which
+    # is what puts several minutes of VHD conversion tests on one worker
+    # while the others idle. The timing file travels with the tests/ tree
+    # (copied above), and a missing one is not an error -- the scheduler
+    # just partitions blind, as it always has.
+    /workspace/tools/ci/seed-stestr-timing.sh /tmp/test-venv/bin/stestr stestr-timing.txt
+fi
+
+echo ""
+echo "--- Counting the selection ---"
+# A lower bound on how many tests this run must execute, discovered
+# rather than written down, for the length floor further down.
+#
+# It is a lower bound and not the real total, which matters if you are
+# tempted to tighten the comparison. "stestr list" enumerates only
+# statically discoverable ids; tests that build their cases at load time
+# appear as one id here and as many at run time. Measured on this tree:
+# listing the suite minus test_info_malicious gives 2378 ids, and running
+# that same selection reports 3675, with no parenthesised scenario id in
+# the listing at all. So "ran fewer than listed" always means something
+# went wrong, while "ran at least as many as listed" does not prove the
+# run was complete. Deriving even that bound beats the figure this
+# replaced, which was a hand-written ~3250 that drifts every time a test
+# is added.
+LIST_ARGS=(list)
+if [ -n "$EXCLUDE_RE" ]; then
+    LIST_ARGS+=(--exclude-regex "$EXCLUDE_RE")
+fi
+if [ -n "$SELECT_RE" ]; then
+    LIST_ARGS+=("$SELECT_RE")
+fi
+set +e
+/tmp/test-venv/bin/stestr "${LIST_ARGS[@]}" > /tmp/stestr-list.txt 2>/tmp/stestr-list-err.txt
+LIST_RC=$?
+set -e
+if [ "$LIST_RC" -ne 0 ]; then
+    echo "" >&2
+    echo "Error: could not list the tests for this selection; stestr list" >&2
+    echo "exited $LIST_RC. Without a count there is nothing to check the" >&2
+    echo "run length against, so this is a failure rather than a run with" >&2
+    echo "one guard switched off." >&2
+    sed -n "1,20p" /tmp/stestr-list-err.txt >&2
+    exit 1
+fi
+EXPECTED=$(grep -c . /tmp/stestr-list.txt)
+if [ "$EXPECTED" -eq 0 ]; then
+    echo "" >&2
+    echo "Error: the selection matched no tests at all. A selector that" >&2
+    echo "matches nothing exits zero with everything passing, which is" >&2
+    echo "indistinguishable from a green run." >&2
+    exit 1
+fi
+echo "selection contains $EXPECTED tests"
+
+echo ""
 echo "--- Running suite ---"
 STESTR_ARGS=(run --concurrency "$CONCURRENCY")
 if [ -n "$EXCLUDE_RE" ]; then
@@ -296,19 +386,108 @@ if grep -qE "^ - Worker [0-9]+ \([0-9]+ tests\) => N/A" /tmp/stestr-output.txt; 
     echo "is PARTIAL and its result is not trustworthy." >&2
     exit 1
 fi
-if [ -z "$SELECT_RE" ]; then
-    # Full-suite floor. The suite is ~3250 tests; anything dramatically
-    # short means the run was cut off before stestr noticed.
-    RAN=$(sed -n "s/^Ran: \([0-9]*\) tests.*/\1/p" /tmp/stestr-output.txt | tail -n1)
-    if [ -n "$RAN" ] && [ "$RAN" -lt 2500 ]; then
-        echo "" >&2
-        echo "Error: full run executed only $RAN tests (expected ~3250)." >&2
-        echo "The run was truncated; treat it as a failure, not a pass." >&2
-        exit 1
+# Length floor, against the count discovered above rather than a
+# constant, so it covers every selection instead of only an unselected
+# full run. The previous form was keyed on SELECT_RE being empty, which
+# meant any selected run -- including the merge-queue gate once that
+# started passing a selector -- skipped this check entirely, and a
+# truncated gate run reads as green.
+RAN=$(sed -n "s/^Ran: \([0-9]*\) tests.*/\1/p" /tmp/stestr-output.txt | tail -n1)
+if [ -z "$RAN" ]; then
+    echo "" >&2
+    echo "Error: stestr printed no \"Ran: N tests\" total, so the run" >&2
+    echo "length cannot be checked. Treat it as a failure." >&2
+    exit 1
+fi
+if [ "$RAN" -lt "$EXPECTED" ]; then
+    echo "" >&2
+    echo "Error: run executed $RAN tests, fewer than the $EXPECTED ids" >&2
+    echo "discovery found for this selection. Since load-time cases make" >&2
+    echo "a real run longer than the listing, not shorter, the run was" >&2
+    echo "truncated; treat it as a failure, not a pass." >&2
+    exit 1
+fi
+
+# Skip floor, the complement of the length floor above. A skipped test
+# reports a result, so it counts towards "Ran", which means a selection
+# in which every test skipped satisfies the floor exactly as a
+# selection in which every test executed. That is not hypothetical
+# here: every test in the nightly selection calls skipTest when its VHD
+# fixture is missing, so one absent file would give a green leg that
+# tested nothing. The length floor cannot see it, because the count is
+# right.
+#
+# The rule is "nothing executed at all" and not "fewer than some
+# fraction executed", and the reason is that there is no legitimate
+# skip rate to compare against. Skips are a property of the distro, not
+# of the change: the EL streams that cannot install qemu-storage-daemon
+# skip the whole bitmap oracle set, every distro skips whichever
+# fixtures its qemu cannot produce, and the full suite legitimately
+# skips hundreds. Any fraction tight enough to catch a real loss on
+# Debian would fail Rocky on a good night. Zero executed tests needs no
+# tuning, is never legitimate, and is the shape every realistic cause
+# of a silently-empty run takes.
+#
+# One deliberate consequence: a hand-run --select whose every case
+# skips on this distro now fails rather than passing. That run did not
+# test anything either, and saying so is the point.
+SKIPPED=$(sed -n "s/^ *- Skipped: \([0-9]*\).*/\1/p" /tmp/stestr-output.txt | tail -n1)
+SKIPPED=${SKIPPED:-0}
+EXECUTED=$((RAN - SKIPPED))
+if [ "$EXECUTED" -le 0 ]; then
+    echo "" >&2
+    echo "Error: all $RAN tests in this selection skipped; nothing was" >&2
+    echo "actually executed. A skip counts towards the \"Ran\" total" >&2
+    echo "that stestr prints, so this run passes the length floor above" >&2
+    echo "while testing nothing at all. The usual cause is missing test" >&2
+    echo "fixtures, so check the testdata preparation rather than the" >&2
+    echo "tests." >&2
+    exit 1
+fi
+echo "$EXECUTED of $RAN tests executed, $SKIPPED skipped"
+
+# Derive the timing data, if this run was asked to measure. Deliberately
+# after the truncation guards and before the verdict: a truncated run
+# holds durations for only the tests its surviving workers reached, and
+# publishing those would quietly teach the scheduler that half the suite
+# takes no time at all. A run that completed and merely FAILED tests is
+# still a valid measurement, so this does not depend on STESTR_RC.
+if [ -n "${TIMING_OUT:-}" ]; then
+    echo ""
+    echo "--- Deriving stestr timing data ---"
+    if "$PYBIN" /workspace/tools/ci/generate-stestr-timing.py .stestr "$TIMING_OUT"; then
+        # The container runs as root; hand the file back to the user who
+        # invoked docker so the job can diff and commit it.
+        chown "$TIMING_UID:$TIMING_GID" "$TIMING_OUT" || true
+    else
+        # A measurement that cannot be derived must not change the
+        # verdict of the suite: the leg still tested this distro.
+        echo "warning: could not derive timing data from this run" >&2
     fi
 fi
 exit "$STESTR_RC"
 '
+
+# Measurement mode. The repository is mounted read-only on purpose -- so
+# a container running as root cannot leave root-owned stestr artefacts in
+# the host worktree -- which means a run asked to publish its measured
+# durations needs a second, writable mount for that one file. Only the
+# derived text crosses the boundary, not stestr's repository directory:
+# the derivation runs in the container, where the repository and the
+# interpreter that reads it already are.
+TIMING_ARGS=()
+if [ -n "${STESTR_TIMING_OUT:-}" ]; then
+    TIMING_DIR=$(dirname "$STESTR_TIMING_OUT")
+    mkdir -p "$TIMING_DIR"
+    TIMING_DIR=$(realpath "$TIMING_DIR")
+    TIMING_ARGS=(
+        -v "$TIMING_DIR:/timing-out"
+        -e TIMING_OUT="/timing-out/$(basename "$STESTR_TIMING_OUT")"
+        -e TIMING_UID="$(id -u)"
+        -e TIMING_GID="$(id -g)"
+    )
+    echo "    measuring: per-test durations will be written to $STESTR_TIMING_OUT"
+fi
 
 set +e
 docker run --rm \
@@ -323,6 +502,7 @@ docker run --rm \
     -e EXCLUDE_RE="$EXCLUDE_RE" \
     -e SELECT_RE="$SELECT_RE" \
     -e CONCURRENCY="$CONCURRENCY" \
+    "${TIMING_ARGS[@]+"${TIMING_ARGS[@]}"}" \
     "$DISTRO_IMAGE" \
     bash -c "$INNER"
 RC=$?

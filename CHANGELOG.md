@@ -365,6 +365,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Six heavy VHD conversion tests no longer gate a merge; a nightly job
+  runs them across all seven distros instead.** The Hyper-V and
+  VirtualPC cases of `TestConvertVhdToQcow2Roundtrip`,
+  `TestConvertVhdToRaw` and `TestConvertVhdCompare` were half the distro
+  matrix suite's execute time and all of its stestr worker imbalance:
+  round-robin scheduling put the three VirtualPC cases on one worker,
+  which ran 2197 seconds while the lightest finished in 913, and a
+  matrix leg's wall time is its slowest worker's. That put the merge
+  queue over the `develop` ruleset's 360-minute
+  `check_response_timeout_minutes`, which ejects a pull request even
+  though nothing failed
+  ([#543](https://github.com/shakenfist/instar/issues/543)). The six now
+  run once a day in `nightly-matrix.yml` across all seven distros, and a
+  red nightly files or updates a GitHub issue naming the distro, its
+  `qemu-img` version and the failing tests, rather than leaving a red
+  square in the Actions tab nobody opens.
+
+  What changes for a contributor: a VHD change is still gated on every
+  pull request by `integration-convert-vhd`, which runs all nine of
+  those classes' tests on Debian 13. What it is no longer gated on is
+  the other six distros' `qemu-img` versions. So a VHD change that
+  passes the queue and turns the nightly red has almost certainly found
+  a per-distro qemu divergence rather than a flake — the issue says
+  which distro and which qemu version, and that pair is the whole
+  signal. The split itself is held by
+  `tools/ci/check-test-partition.py`, which reads both halves out of the
+  Makefile and fails if a test is claimed by both or by neither, so
+  nothing can fall off the gate unnoticed. stestr now also bin-packs its
+  workers from a committed `tests/stestr-timing.txt` that the same
+  nightly re-measures, so a future heavy test cannot silently recreate
+  the imbalance.
+
 - **Every VHDX read through the chain walker refuses a payload block
   that overlaps a region the image declares.** A VHDX region table names
   where the BAT, the metadata region and any other region the writer

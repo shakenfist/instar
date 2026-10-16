@@ -102,7 +102,10 @@ Per-format feature detail is in
   `tools/ci/check-test-partition.sh` fails if any `test_*.py` test is run
   by no pull-request job. An orphan is a hard CI failure; deliberate
   exclusions live in an allowlist in
-  `tools/ci/check-test-partition.py`.
+  `tools/ci/check-test-partition.py`. The same guard holds the
+  merge-queue and nightly halves of the distro matrix to being exact
+  complements: a distro added to one must be added to the other, while a
+  test belongs to exactly one -- claiming it in both fails the guard too.
 
 - **`automated_reviewer`'s `needs` list must name every job that can
   fail a PR**, including `ci-tooling`. Three jobs are deliberately
