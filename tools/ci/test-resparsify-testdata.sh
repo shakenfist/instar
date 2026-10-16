@@ -515,9 +515,15 @@ STUB
 chmod +x "${COUNT_BIN}/realpath"
 BULK_LIST="${WORK}/bulk-list.txt"
 : > "${BULK_LIST}"
-for i in $(seq 1 2000); do
-    printf 'docs/page-%s.md\ncustom/fixture-%s.qcow2\ndownloaded/notes-%s.txt\n' \
-        "${i}" "${i}" "${i}" >> "${BULK_LIST}"
+# Weighted towards the shape that is both the most common in a real
+# list and the most expensive to get wrong: a path under downloaded/
+# that is not an image, which is the one the extension rejection
+# builds a message for.
+for i in $(seq 1 4000); do
+    printf 'downloaded/notes-%s.txt\n' "${i}" >> "${BULK_LIST}"
+done
+for i in $(seq 1 1000); do
+    printf 'docs/page-%s.md\ncustom/fixture-%s.qcow2\n' "${i}" "${i}" >> "${BULK_LIST}"
 done
 printf 'downloaded/named.qcow2\n' >> "${BULK_LIST}"
 : > "${WORK}/realpath-calls"
@@ -539,6 +545,34 @@ if [ "${CALLS}" -le 10 ]; then
     ok "resolved ${CALLS} path(s), not one per entry"
 else
     fail "resolved ${CALLS} path(s) for a 6001-entry list"
+fi
+
+# Counting realpath alone is not enough, and the gap was not
+# hypothetical: the first version of this check passed while the
+# classifier still forked a subshell per rejected candidate, to build
+# the phrase for a rejection message that is only ever printed for a
+# path the caller named. A counter that names one kind of process
+# reports on less than it examined.
+#
+# CPU time rather than wall time, and rather than a count: a command
+# substitution is a fork of the shell itself, so there is no binary to
+# wrap, and CPU barely moves when the runner is loaded while wall
+# clock does. The separation is wide enough that the bound does not
+# have to be tight -- measured here, 2000 rejected entries under
+# downloaded/ cost 0.17s of CPU filtered on the string and 3.06s with
+# a subshell each, and the real list is 770,000 entries rather than
+# 6001.
+: > "${WORK}/realpath-calls"
+dd if=/dev/zero of="${TREE}/downloaded/named.qcow2" bs=1M count=4 status=none
+TIMEFORMAT='%3U %3S'
+CPU_LINE="$( { time PATH="${COUNT_BIN}:${PATH}" "${BASH_BIN}" "${SCRIPT}" "${TREE}" \
+    --files-from "${BULK_LIST}" > /dev/null 2>&1; } 2>&1 )"
+unset TIMEFORMAT
+CPU_HUNDREDTHS="$(echo "${CPU_LINE}" | awk '{printf "%d", ($1 + $2) * 100}')"
+if [ "${CPU_HUNDREDTHS}" -lt 150 ]; then
+    ok "and spent ${CPU_HUNDREDTHS} hundredths of a second of CPU on it, not a fork per entry"
+else
+    fail "6001 entries cost ${CPU_HUNDREDTHS} hundredths of a second of CPU (${CPU_LINE})"
 fi
 
 start "the narrow argument forms the parser accepts are all exercised"

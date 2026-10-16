@@ -138,8 +138,25 @@ jobs:
       # Git operations fill the images' sparse holes with real zeros,
       # which changes the allocated size qemu-img reports and so the
       # disk_size the comparison tests check.
+      #
+      # The one call site that stays on resparsify-testdata.sh's
+      # one-argument form rather than the resparsify-prepared-testdata.sh
+      # wrapper the other eight use, and it must stay. This workflow
+      # file comes from the default branch while the scripts it runs
+      # come from the pull request's own checkout, so the two can be of
+      # different ages: a branch cut before the wrapper existed would
+      # fail here on a missing file, and one cut before
+      # prepare-testdata.sh exported TESTDATA_SOURCE would have the
+      # wrapper refuse for want of it. Every branch has the
+      # one-argument form, which is a cross-repository contract and so
+      # does not move. Nothing is lost by it either: this job runs on
+      # the static claude-code fleet, never gets the testdata disk, and
+      # so always takes a branch that wants the whole tree resparsified
+      # anyway.
       - name: Resparsify test images
-        run: ${GITHUB_WORKSPACE}/instar/tools/ci/resparsify-prepared-testdata.sh
+        run: >-
+          ${GITHUB_WORKSPACE}/instar/tools/ci/resparsify-testdata.sh
+          "${TESTDATA_PATH}"
 
       - name: Fetch prior CI failure logs from PR
         id: prior_failures

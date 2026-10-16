@@ -127,6 +127,16 @@ extension_phrase() {
     echo "${phrase}"
 }
 
+# Evaluated once. A command substitution forks a subshell even for a
+# shell function, and this phrase is built for every candidate the
+# classifier rejects on its extension -- which, for a changed-file
+# list whose stat-dirty half names every tracked path, is most of
+# ~770,000 entries. That is the per-entry process cost the string
+# shortcut in classify() exists to remove, reintroduced inside the
+# message it builds for a rejection almost nothing reads: REASON is
+# only printed for a path the caller named.
+EXTENSION_PHRASE="$(extension_phrase)"
+
 if [ "$#" -eq 1 ] && [ "$1" = '--list-extensions' ]; then
     printf '%s\n' "${EXTENSIONS[@]}"
     exit 0
@@ -278,7 +288,7 @@ else
             /*|*..*) ;;
             "${SCOPE_REL}"/*)
                 if ! in_scope_extension "${candidate}"; then
-                    REASON="not one of $(extension_phrase)"
+                    REASON="not one of ${EXTENSION_PHRASE}"
                     return 2
                 fi
                 ;;
@@ -315,7 +325,7 @@ else
         esac
 
         if ! in_scope_extension "${relative}"; then
-            REASON="not one of $(extension_phrase)"
+            REASON="not one of ${EXTENSION_PHRASE}"
             return 2
         fi
 
@@ -441,7 +451,7 @@ fi
 # code for a tree this script can do nothing with.
 if [ "${RESPARSIFIED}" -eq 0 ]; then
     echo "resparsify-testdata: no images matched under ${SCOPE}" >&2
-    echo "Expected at least one $(extension_phrase) file somewhere" >&2
+    echo "Expected at least one ${EXTENSION_PHRASE} file somewhere" >&2
     echo "beneath it, because that is what an instar-testdata tree holds. Either the" >&2
     echo "extension list in this script no longer matches the images, or the tree's" >&2
     echo "layout changed; resparsifying nothing is indistinguishable from success and" >&2

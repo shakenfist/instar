@@ -720,6 +720,17 @@ be said rather than averaged away.
   adding PyYAML to that script's venv; a third hand-rolled scan would
   be the wrong direction. The checks themselves are written out in the
   issue.
+* **Refresh the index on the runner rather than rewriting** (#675).
+  `prepare-testdata.sh` unions the stat-dirty set into the
+  changed-file list so the narrow resparsify shrinks what the reset
+  re-expanded, which is correct but pays twice: the reset writes each
+  file into the overlay and the resparsify writes it again. A
+  `git update-index -q --refresh` before the fetch would re-hash those
+  entries instead, so the reset leaves them alone. Deferred because
+  the trade is unmeasured -- re-hashing goes through the LFS clean
+  filter, so the worst case is hashing 7.46 GiB rather than writing
+  it, and which is cheaper depends on the runner. The union stays
+  either way as the backstop.
 * **Raise `--concurrency` above 4.** Untested and plausibly the
   cheapest remaining win once the six tests are gone, but the suite
   boots a KVM guest per test and `docs/testing.md:434,459` warns that
@@ -906,6 +917,25 @@ findings were real and not taken.
   that builds the disk. `tools/ci/test-testdata-changed-files.sh`
   pins all of it against a real git, including that the tree diff
   alone would have missed it.
+* **A new test passed on this machine and had never once passed in
+  CI.** `tools/ci/test-testdata-changed-files.sh` builds local
+  repositories with `git init`, and this developer has
+  `init.defaultBranch=main` set where the runners leave it unset. On a
+  runner the bare repository's HEAD therefore pointed at an unborn
+  `master` while the push created `main`, and `git clone` reports that
+  as "you appear to have cloned an empty repository" -- a warning, not
+  an error -- so the script carried on and failed three assertions
+  later with a confusing `find: no such directory`. Three rounds of
+  review were reported with "gates green" on the strength of a local
+  run; `ci-tooling` had been red since the commit that added the file,
+  and the steps after it never ran at all. The test now neutralises
+  `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM`, pins every branch name
+  explicitly, and checks the clone produced a tree at the point it
+  clones rather than letting the failure surface downstream. The
+  general lesson is narrower than "run CI": a test whose subject is a
+  tool's behaviour must not inherit that tool's ambient
+  configuration, because the developer's configuration is part of
+  what it is measuring.
 * Otherwise none directly. #543 is not closed by this change.
 
 ### Back brief

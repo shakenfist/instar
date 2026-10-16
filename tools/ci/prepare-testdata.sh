@@ -290,13 +290,14 @@ if [ "${TESTDATA_SOURCE}" = 'cache' ]; then
     # Three sources, unioned: what the two trees disagree about, what
     # was stat-dirty going in, and what was still a pointer before the
     # pull. All of them are paths this update rewrote, and the last two
-    # are invisible to any diff of the trees -- see the captures above. Adding them costs nothing that has not already
-    # been spent: the reset expanded those files into the
-    # copy-on-write overlay whether or not this list names them, so
-    # resparsifying them afterwards shrinks a copy-up that has already
-    # happened rather than causing one. tools/ci/test-testdata-changed-files.sh
-    # proves the union against a real git, including that the tree diff
-    # alone would miss them.
+    # are invisible to any diff of the trees -- see the captures above.
+    # Adding them costs nothing that has not already been spent: the
+    # reset expanded those files into the copy-on-write overlay whether
+    # or not this list names them, so resparsifying them afterwards
+    # shrinks a copy-up that has already happened rather than causing
+    # one. tools/ci/test-testdata-changed-files.sh proves the union
+    # against a real git, including that the tree diff alone would miss
+    # them.
     #
     # Rename detection is left on: a renamed image is listed under its
     # new path only, which is all the resparsify needs, since the old

@@ -43,6 +43,19 @@
 
 set -euo pipefail
 
+# Hermetic against whoever is running it. This file asserts what git
+# does, so anything git reads from the environment is part of the
+# measurement: the first version of it passed here and failed on every
+# CI runner because this developer has init.defaultBranch=main set and
+# the runners do not, which left the bare repository's HEAD pointing
+# at an unborn master while the push created main -- and `git clone`
+# reports that as "you appear to have cloned an empty repository"
+# rather than as an error. Every repository below is created by this
+# script in its own temporary directory, so there is no user or system
+# configuration it needs.
+export GIT_CONFIG_GLOBAL=/dev/null
+export GIT_CONFIG_SYSTEM=/dev/null
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK}"' EXIT
 
@@ -81,10 +94,10 @@ git_q() { git -C "$1" -c user.email=ci@example.invalid -c user.name=ci "${@:2}";
 start "what a shallow fetch and reset rewrites, with real git"
 
 REMOTE="${WORK}/remote.git"
-git init -q --bare "${REMOTE}"
+git init -q -b main --bare "${REMOTE}"
 
 SEED="${WORK}/seed"
-git init -q "${SEED}"
+git init -q -b main "${SEED}"
 mkdir -p "${SEED}/downloaded/qemu-iotests"
 for name in stale-stat control modified renamed-from deleted; do
     make_image "${SEED}/downloaded/qemu-iotests/${name}.qcow2"
@@ -99,7 +112,14 @@ git_q "${SEED}" push -q "file://${REMOTE}" HEAD:main
 # resparsified the way the disk build resparsifies -- but only one file
 # of it, so that the file next to it is a control with clean stat data.
 CACHE="${WORK}/cache"
-git clone -q --depth 1 "file://${REMOTE}" "${CACHE}"
+git clone -q --branch main --depth 1 "file://${REMOTE}" "${CACHE}"
+if [ -d "${CACHE}/downloaded" ]; then
+    ok "the seeded remote clones out to a populated tree"
+else
+    fail "the clone produced no tree; the remote may have no main branch"
+    echo "${FAILURES} check(s) failed -- nothing below can run" >&2
+    exit 1
+fi
 STALE="${CACHE}/downloaded/qemu-iotests/stale-stat.qcow2"
 CONTROL="${CACHE}/downloaded/qemu-iotests/control.qcow2"
 while IFS= read -r image; do inflate "${image}"; done \
@@ -130,7 +150,7 @@ fi
 # non-image changed, and two images left alone -- the stat-dirty one
 # and its clean control.
 PUSHER="${WORK}/pusher"
-git clone -q "file://${REMOTE}" "${PUSHER}"
+git clone -q --branch main "file://${REMOTE}" "${PUSHER}"
 make_image "${PUSHER}/downloaded/qemu-iotests/modified.qcow2"
 git_q "${PUSHER}" mv downloaded/qemu-iotests/renamed-from.qcow2 \
     downloaded/qemu-iotests/renamed-to.qcow2

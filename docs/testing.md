@@ -1062,10 +1062,10 @@ relocates it, and exists only so `tools/ci/test-prepare-testdata.sh` can
 exercise both sides of the guard on a machine with no such disk; it is a
 different variable from `TESTDATA_CACHE` on purpose, so the two cannot be
 pointed at the same wrong place, and nothing under `.github/` sets it. What
-it detects is a **path mismatch** — the disk mounted somewhere else, or a runner advertising the
-disk's label without the disk. It cannot be a failed mount: that stops the
-fleet's userdata before the runner registers, so such a job stays queued and
-never runs this script at all.
+it detects is a **path mismatch** — the disk mounted somewhere else, or a
+runner advertising the disk's label without the disk. It cannot be a failed
+mount: that stops the fleet's userdata before the runner registers, so such a
+job stays queued and never runs this script at all.
 
 ### The `instar` runner label
 
@@ -1121,17 +1121,32 @@ workflow.
 ### Resparsifying
 
 A different eight of those nine jobs — the **resparsify set**, which is the
-label set with `coverage-fuzz` taken out and `test-and-fix` put in — then run
-**`tools/ci/resparsify-prepared-testdata.sh`**. They are every job that runs
-the Python integration suite over the tree (five in `functional-tests.yml`,
-two in `nightly-matrix.yml`, one in `test-drift-fix.yml`). That step takes no
-arguments: it reads the `TESTDATA_SOURCE` and `TESTDATA_CHANGED_FILES` above
-and calls `tools/ci/resparsify-testdata.sh` in whichever of its two forms the
-tree needs — the whole tree for a fresh clone or an `unverified-cache`, and
-only the paths the update changed for the fleet's disk updated in place. An unset or unrecognised
-`TESTDATA_SOURCE` is an error there rather than a fall back to the whole tree,
-because the fallback is the expensive branch and taking it silently would cost
-the most on exactly the runner that was supposed to save. The exception is
+label set with `coverage-fuzz` taken out and `test-and-fix` put in — then
+resparsify the tree. They are every job that runs the Python integration
+suite over it: five in `functional-tests.yml`, two in `nightly-matrix.yml`,
+and `test-and-fix` in `test-drift-fix.yml`.
+
+Seven of them call **`tools/ci/resparsify-prepared-testdata.sh`**, which
+takes no arguments: it reads the `TESTDATA_SOURCE` and
+`TESTDATA_CHANGED_FILES` above and calls `tools/ci/resparsify-testdata.sh` in
+whichever of its two forms the tree needs — the whole tree for a fresh clone
+or an `unverified-cache`, and only the paths the update changed for the
+fleet's disk updated in place. An unset or unrecognised `TESTDATA_SOURCE` is
+an error there rather than a fall back to the whole tree, because the
+fallback is the expensive branch and taking it silently would cost the most
+on exactly the runner that was supposed to save.
+
+`test-and-fix` is the eighth and calls `resparsify-testdata.sh` with its one
+positional argument instead, deliberately. That workflow runs from the
+default branch while the scripts it invokes come from the pull request's own
+checkout, so the two can be of different ages: a branch cut before the
+wrapper existed would fail on a missing file, and one cut before
+`prepare-testdata.sh` exported `TESTDATA_SOURCE` would have the wrapper
+refuse for want of it — breaking other people's pull requests, not this
+repository's own gates. The one-argument form is a cross-repository contract
+and exists on every branch. The job also loses nothing by it: on the static
+`claude-code` fleet it never meets the disk, so it always wants the whole
+tree resparsified anyway. The exception is
 `coverage-fuzz.yml`, which prepares the tree only to seed fuzz corpora and
 never asks `qemu-img info` for an allocated size, so the fully allocated
 tree costs it disk and nothing else. git and git-lfs write each file

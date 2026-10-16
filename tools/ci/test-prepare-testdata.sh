@@ -636,10 +636,55 @@ start "TESTDATA_REQUIRE_CACHE unset keeps the fallback"
 # disk. Everything else -- the static-fleet drift fixer, a developer
 # running this by hand, a future job that has no reason to want the
 # disk -- still has to get the clone it always got.
-if [ "$(cat "${WORK}/clone/status")" -eq 0 ] && grep -q '^clone' "${WORK}/clone/log"; then
-    ok "a missing cache still clones when the flag is not set"
+#
+# The exact complement of the refusal case above, and not the earlier
+# clone case re-read: this one looks for the cache at the *contractual*
+# path and finds it missing, which is the configuration the guard
+# refuses, with only the flag changed. Re-asserting the earlier run
+# would have proved that a missing cache somewhere else still clones,
+# which nothing threatened.
+ABSENT_CONTRACT_UNSET="${WORK}/absent-contract-unset"
+run_prepare fallback \
+    TESTDATA_CONTRACT_CACHE="${ABSENT_CONTRACT_UNSET}" \
+    TESTDATA_CACHE="${ABSENT_CONTRACT_UNSET}"
+if [ "$(cat "${WORK}/fallback/status")" -eq 0 ] \
+    && grep -q '^clone' "${WORK}/fallback/log"; then
+    ok "the contractual path missing still clones when the flag is not set"
 else
-    fail "exit $(cat "${WORK}/clone/status"): $(cat "${WORK}/clone/out")"
+    fail "exit $(cat "${WORK}/fallback/status"): $(cat "${WORK}/fallback/out")"
+fi
+if [ "$(env_value fallback TESTDATA_SOURCE)" = 'clone' ]; then
+    ok "and calls it a clone, so the whole tree is resparsified"
+else
+    fail "source was '$(env_value fallback TESTDATA_SOURCE)'"
+fi
+
+start "the workspace is required up front, not discovered halfway"
+# A developer debugging a runner runs this by hand. $GITHUB_ENV being
+# unset is fine and is asserted above; $GITHUB_WORKSPACE is not
+# optional, because the fresh clone has nowhere to go without it, and
+# the point of checking it at the top is that the refusal arrives
+# before the update rather than as a bare "unbound variable" after it.
+mkdir -p "${WORK}/no-workspace"
+NOWS_STATUS=0
+NOWS_OUT="$(env -i \
+    PATH="${STUB_BIN}:/usr/bin:/bin" \
+    HOME="${WORK}/no-workspace" \
+    GIT_STUB_LOG="${WORK}/no-workspace/log" \
+    GIT_STUB_FIXTURES="${WORK}/make-fixtures" \
+    TESTDATA_TOKEN='not-a-real-token' \
+    TESTDATA_REQUIRE_CACHE=1 \
+    TESTDATA_CACHE="${WORK}/no-workspace/cache" \
+    bash "${SCRIPT}" 2>&1)" || NOWS_STATUS=$?
+case "${NOWS_OUT}" in
+    *"::error::GITHUB_WORKSPACE is not set"*)
+        ok "names GITHUB_WORKSPACE rather than dying on an expansion" ;;
+    *) fail "expected the up-front refusal, got (${NOWS_STATUS}): ${NOWS_OUT}" ;;
+esac
+if [ "${NOWS_STATUS}" -ne 0 ] && [ ! -s "${WORK}/no-workspace/log" ]; then
+    ok "and refuses before running any git at all"
+else
+    fail "exit ${NOWS_STATUS}, git log: $(cat "${WORK}/no-workspace/log" 2>/dev/null)"
 fi
 
 echo
