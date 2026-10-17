@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
-# Phase 9c CLI parity harness for `instar snapshot`.
-# Codifies D1/D2/D3 divergences (per PLAN-snapshot-phase-09) and
-# confirmed parities as assertions against both tools where
-# applicable. Exits non-zero on any failure.
+# CLI parity harness for `instar snapshot`.
+# Codifies three divergences from qemu-img and the confirmed parities
+# as assertions against both tools where applicable. The group
+# headers below label the divergences D1-D3:
+#   D1: -U (--force-share) with -c/-d/-a. qemu refuses because
+#       force-share needs a read-only image; instar now refuses too.
+#   D2: bare `snapshot FILE`. qemu defaults to list; instar now does.
+#   D3: mixed mode flags (-c x -d y). Both refuse without touching
+#       the image, but instar exits 2 with a clap usage error where
+#       qemu exits 1; kept, and documented.
+# Exits non-zero on any failure.
 #
 # Assertion groups:
 #   1. -U with -c/-d/-a refused (exit non-zero), image bit-identical.

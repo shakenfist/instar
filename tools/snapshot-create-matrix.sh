@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Phase 6f verification matrix for `instar snapshot -c` against
+# Verification matrix for `instar snapshot -c` against
 # qemu-img 10.0.8. For each fixture, run instar -c on copy A and
 # qemu-img -c on copy B, then assert qemu-img check is clean on A
 # and the snapshot listings / info match modulo the date columns.
 #
-# Not a committed test (phase 11 owns that) — this is the phase 6
-# validation harness. Exits non-zero on any failure.
+# Not a committed test (the committed coverage is tests/test_snapshot.py)
+# — this is the manual validation harness written when create was built.
+# Exits non-zero on any failure.
 set -uo pipefail
 
 INSTAR="${INSTAR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/src/target/release/instar}"

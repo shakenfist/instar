@@ -176,7 +176,7 @@ class TestVersionDetection(InstarTestBase):
 
 
 # The exact `qemu-img --version` strings the CI matrix distros ship,
-# captured empirically by tools/probe-qemu-versions.sh (phase-2 step 2a).
+# captured empirically by tools/probe-qemu-versions.sh.
 # These pin the parser against the real distro suffix and Debian epoch
 # forms so a regression that fell back to the newest profile (silently
 # wrong output on an older-qemu distro) fails here.

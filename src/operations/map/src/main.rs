@@ -21,7 +21,7 @@
 //!
 //! If the source format is unrecognised or has a backing reference
 //! the result reports the matching `ERROR_*` code; the host
-//! renderer in phase 4 will translate to a clear user-facing
+//! (`map_error_message`) translates it to a clear user-facing
 //! message.
 
 #![no_std]
@@ -148,8 +148,8 @@ unsafe fn finish(
 ///   through the call table.
 ///
 /// These invariants hold by construction of the host-side VMM
-/// (`src/vmm/src/main.rs::run_map` in phase 3); no other caller
-/// is architecturally possible.
+/// (`src/vmm/src/main.rs::run_map`); no other caller is
+/// architecturally possible.
 #[no_mangle]
 pub unsafe extern "C" fn _start() -> u64 {
     let call_table = get_call_table();

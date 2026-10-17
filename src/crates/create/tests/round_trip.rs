@@ -366,7 +366,7 @@ fn sweep_vhdx_dynamic() {
 }
 
 // ---------------------------------------------------------------------------
-// vhd differencing child (phase 5)
+// vhd differencing child
 // ---------------------------------------------------------------------------
 //
 // Everything below covers `plan_vhd` with a backing reference — the
@@ -447,9 +447,9 @@ fn materialise_differencing(path: &str) -> Vec<u8> {
     materialise(&plan)
 }
 
-/// The load-bearing test of phase 5: lay a differencing plan's writes into
-/// a buffer and read every parent-bearing structure back with the phase 3
-/// parser.
+/// The load-bearing test of the differencing VHD emitter: lay a
+/// differencing plan's writes into a buffer and read every parent-bearing
+/// structure back with `crates/vhd`'s parser.
 ///
 /// It is *necessary and not sufficient* — emitter and parser share their
 /// offset constants, so this alone could pass with both halves wrong in
@@ -464,11 +464,15 @@ fn materialise_differencing(path: &str) -> Vec<u8> {
 fn vhd_differencing_round_trips_through_the_parser() {
     let bytes = materialise_differencing(DIFF_PARENT_PATH);
 
-    // --- layout (decision 1) -------------------------------------------
+    // --- layout ---------------------------------------------------------
     //
-    // Asserted through the plan rather than only through the parser,
-    // because the locator data region is new file real estate and its
-    // offset is what the four placement rules are about.
+    // The locator data goes in its own sector between the dynamic header
+    // and the BAT, the one placement `locator_defect`'s four rules (no
+    // overlap with the head footer or the dynamic header, inside the
+    // image, length within the declared space) all accept. Asserted
+    // through the plan rather than only through the parser, because the
+    // locator data region is new file real estate and its offset is what
+    // those rules are about.
     let opts = diff_opts(DIFF_PARENT_PATH);
     let mut scratch = vec![0u8; VHD_MAX_METADATA_SCRATCH];
     let plan = plan_vhd(&opts, &mut scratch).expect("differencing plan");
@@ -543,7 +547,9 @@ fn vhd_differencing_round_trips_through_the_parser() {
     // lies inside the image, and is no longer than its declared space.
     assert_eq!(entry.defect, None);
     assert_eq!(entry.platform(), vhd::VhdPlatform::W2ru);
-    // Decision 4: a byte count, not the sector count SPEC(VHD) implies.
+    // A byte count, not the sector count SPEC(VHD) implies: the sector
+    // reading is arithmetically impossible on both measured Hyper-V
+    // images, and nothing downstream would catch a wrong `1` here.
     assert_eq!(entry.platform_data_space, 512);
     assert_eq!(
         entry.platform_data_length,
@@ -614,8 +620,8 @@ fn vhd_differencing_round_trips_through_the_parser() {
 /// would pass just as happily if `locator_defect` never returned a defect
 /// at all. This takes the same emitted bytes, moves only the locator's
 /// `platform_data_offset` from 1536 to 512 — inside the dynamic header,
-/// which is the placement decision 1 rejected — and asserts the parser
-/// notices.
+/// which is a placement the emitter must never use — and asserts the
+/// parser notices.
 #[test]
 fn vhd_differencing_locator_misplacement_is_detected() {
     let mut bytes = materialise_differencing(DIFF_PARENT_PATH);
@@ -704,9 +710,9 @@ fn parent_unicode_name(bytes: &[u8]) -> Vec<u8> {
 /// relative input — and the `W2ku` one, which is not normalised.
 ///
 /// `W2ru` is a Windows-defined platform code, so a relative path goes
-/// out in the Windows convention the phase 3 Hyper-V fixtures use: `/`
-/// becomes `\` and the result is prefixed `.\`, with a leading `./`
-/// replaced by that prefix rather than doubled. A POSIX-absolute path
+/// out in the Windows convention the Hyper-V-made differencing fixtures
+/// use: `/` becomes `\` and the result is prefixed `.\`, with a leading
+/// `./` replaced by that prefix rather than doubled. A POSIX-absolute path
 /// has no honest `W2ku` rendering, so it keeps its bytes — see
 /// [PLAN-differencing.md](docs/plans/PLAN-differencing.md).
 ///
@@ -895,7 +901,7 @@ fn vhd_differencing_parent_name_field_always_ends_in_a_nul() {
     }
 }
 
-/// Decision 5: a differencing VHD is Dynamic-only. `disk_type = 4` means
+/// A differencing VHD is Dynamic-only. `disk_type = 4` means
 /// "the BAT says which blocks are mine", and a fixed VHD has neither a BAT
 /// nor a dynamic header to hold the parent locators.
 #[test]
@@ -1285,12 +1291,13 @@ const VHDX_PARENT_PATH: &str = "parent.vhdx";
 const VHDX_PARENT_PATH_EMITTED: &str = r".\parent.vhdx";
 
 /// The item's exact length for [`VHDX_PARENT_PATH`] under
-/// `relative_path`, written out as the sum decision 5 of the phase plan
-/// gives: 148 fixed bytes (20 header, two 12-byte entries, a 28-byte
-/// `parent_linkage` key and a 76-byte linkage value) plus the key and
-/// the *emitted* value, which is two code units longer than the typed
-/// one. Spelled as arithmetic rather than as `200` so that a changed
-/// layout has to be argued with rather than re-measured.
+/// `relative_path`, written out as the sum of the item layout (one item,
+/// two entries, keys before values, no padding): 148 fixed bytes (20
+/// header, two 12-byte entries, a 28-byte `parent_linkage` key and a
+/// 76-byte linkage value) plus the key and the *emitted* value, which is
+/// two code units longer than the typed one. Spelled as arithmetic rather
+/// than as `200` so that a changed layout has to be argued with rather
+/// than re-measured.
 const VHDX_LOCATOR_ITEM_LEN: u32 = 148 + 2 * 13 + 2 * 13;
 
 fn vhdx_diff_opts(path: &str) -> VhdxCreateOpts<'_> {
@@ -1591,7 +1598,7 @@ fn vhdx_differencing_locator_misplacement_is_detected() {
 ///
 /// A relative path goes out in the Windows convention `relative_path` is
 /// defined in — `/` to `\`, leading `.\`, a leading `./` replaced rather
-/// than doubled — matching the phase 3 Hyper-V fixtures. A
+/// than doubled — matching the Hyper-V-made differencing fixtures. A
 /// POSIX-absolute path has no honest `absolute_win32_path` rendering and
 /// keeps its bytes; see
 /// [PLAN-differencing.md](docs/plans/PLAN-differencing.md).

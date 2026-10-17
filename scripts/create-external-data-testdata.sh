@@ -5,7 +5,7 @@
 #
 # These images have a separate metadata file (QCOW2 headers, L1/L2
 # tables, refcounts) and a raw data file (cluster data). Used for
-# testing Phase 13 external data file support.
+# testing qcow2 external data file support.
 #
 # Usage: ./create-external-data-testdata.sh <output_dir>
 

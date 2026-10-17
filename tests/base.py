@@ -56,9 +56,9 @@ COMMAND_OUTPUT_DIRS = {
     'compare': 'compare',          # compare-human, compare-json
     'measure': 'measure',          # measure-human, measure-json
     'create': 'create-info',       # create-info-json (json-only, no human variant)
-    'map': 'map',                  # map-human, map-json (PLAN-map phase 6)
-    'snapshot-list': 'snapshot-list',  # snapshot-list-human (PLAN-snapshot phase 11)
-    'dd': 'dd-info',               # dd-info-json (PLAN-dd phase 7)
+    'map': 'map',                  # map-human, map-json
+    'snapshot-list': 'snapshot-list',  # snapshot-list-human
+    'dd': 'dd-info',               # dd-info-json (qemu-img info of the dd output)
 }
 
 
@@ -309,11 +309,11 @@ class InstarTestBase(testtools.TestCase):
         """
         Resolve the profile name matching the host's qemu-img version.
 
-        Phase 5's map-json baselines produced 3 profiles (with two
-        format transitions across the 6.0-10.2 range), so the
-        existing `next(iter(profiles['profiles']))` pattern is no
-        longer safe for any command that has multiple profiles for
-        a given output_type. This looks up the host's qemu-img version
+        Some commands have several profiles for one output_type (the
+        map-json baselines, for example, change format more than once
+        across the supported qemu range), so taking
+        `next(iter(profiles['profiles']))` is not safe for them. This
+        looks up the host's qemu-img version
         in `version_to_profile` by full major.minor.patch match
         (_select_version_match), so a 7.2.22 host correctly selects
         profile-7-2-19 rather than the profile-6-1-0 that a
@@ -709,7 +709,7 @@ class InstarTestBase(testtools.TestCase):
         worker then silently never runs, and stestr exits 0 if nothing
         else failed, so a truncated run looks like a pass. That is how a
         Rocky run reported "0 failures" having executed 454 of 3253 tests
-        (matrix-CI phase 2c).
+        in the distro matrix CI.
 
         Report sizes, the first differing offset and a short hex window
         instead -- which is more useful for diagnosis than a megabyte of

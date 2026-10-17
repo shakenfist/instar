@@ -1,6 +1,6 @@
 //! Coverage-guided fuzzing for the per-parser `map_extents` entry
-//! points added in phase 1 of PLAN-map.md. First byte selects the
-//! format (qcow2/vmdk/vhd/vhdx); remaining bytes feed through the
+//! points. First byte selects the format (qcow2/vmdk/vhd/vhdx);
+//! remaining bytes feed through the
 //! existing instar_fuzz::build_call_table() mock to drive the
 //! cached sector reader and into the per-cluster extent emission
 //! path.

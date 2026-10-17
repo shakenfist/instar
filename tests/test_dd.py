@@ -1,8 +1,8 @@
 """Tests for the dd subcommand.
 
-Phase 2 (TestDdWholeImage) covers whole-image copies only.
+TestDdWholeImage covers whole-image copies.
 
-Phase 3 (TestDdRawWindow) adds an output-window matrix: each case
+TestDdRawWindow is an output-window matrix: each case
 runs `instar dd` and `qemu-img dd` with the same bs/count/skip
 operands and asserts byte-identical output.  Both a raw and a qcow2
 input are exercised for every windowed case.  Direct Python byte
@@ -10,7 +10,7 @@ comparison is used (read both output files and assertEqual on the
 bytes) because dd parity is about exact file bytes including any
 zero-padding from a short final block.
 
-Phase 4b (TestDdStructuredWindow) adds the structured-output window
+TestDdStructuredWindow is the structured-output window
 matrix for qcow2, vmdk, vpc, and vhdx.  Structured files are NOT
 byte-comparable to qemu's file (cluster/grain/block allocation
 differs), so parity is validated by:
@@ -19,6 +19,12 @@ differs), so parity is validated by:
 Empty-window (count=0) cases use format-specific assertions because
 some formats produce unreadable output from qemu-img dd itself
 (vmdk) or from instar (vhdx).
+
+The remaining classes cover unaligned windows crossing cluster
+boundaries (TestDdUnalignedClusterCrossing), CLI rejection parity
+(TestDdErrors), the raw output default (TestDdOutputDefault), the
+input formats dd reads (TestDdInputFormats, TestDdDmg), and refusal
+of detect-only input formats (TestDdDetectOnlyRefusal).
 """
 
 import json
@@ -254,7 +260,7 @@ def _assert_dd_parity(
 
 
 class TestDdRawWindow(InstarTestBase):
-    """Phase-3 output-window matrix for ``instar dd -O raw``.
+    """Output-window matrix for ``instar dd -O raw``.
 
     Each test method exercises one window scenario on BOTH a raw and a
     qcow2 input image.  The images are 1 MiB and carry two distinct
@@ -477,7 +483,7 @@ def _assert_structured_dd_parity(
 
 
 class TestDdStructuredWindow(InstarTestBase):
-    """Phase-4b: structured-output window matrix for instar dd -O <fmt>.
+    """Structured-output window matrix for instar dd -O <fmt>.
 
     Each test method exercises one window scenario on BOTH a raw and a
     qcow2 input image, for each of the four structured output formats:
@@ -490,8 +496,8 @@ class TestDdStructuredWindow(InstarTestBase):
     Empty-window (count=0) cases use format-specific assertions because:
       - vmdk: qemu-img dd itself produces an unreadable file; assert exit 0 only.
       - vhdx: instar's empty vhdx is rejected by qemu-img info; assert exit 0 only.
-        (This is a known phase-4 limitation -- vhdx empty-window is tracked as
-        a future enhancement.)
+        (This is a known limitation -- vhdx empty-window output is tracked
+        as a future enhancement.)
       - qcow2 / vpc: both tools produce readable 0-virtual-size images; assert
         full parity (vsize == 0).
     """
@@ -556,7 +562,7 @@ class TestDdStructuredWindow(InstarTestBase):
                  Assert virtual-size parity (both 0).
           vhdx:  qemu-img dd exits 0 and produces a readable vsize=0 image.
                  instar exits 0 but produces a file rejected by qemu-img info
-                 (known phase-4 limitation -- instar empty-vhdx is not yet
+                 (known limitation -- instar empty-vhdx is not yet
                  readable).  Assert instar exit 0 only.
         """
         for src_fmt, src_path in (
@@ -595,7 +601,7 @@ class TestDdStructuredWindow(InstarTestBase):
 
             # ------------------------------------------------------------------
             # vhdx empty: qemu exits 0 and image is readable; instar exits 0
-            # but its output is rejected by qemu-img info (known phase-4
+            # but its output is rejected by qemu-img info (known
             # limitation -- instar empty-vhdx is not yet readable).
             # Assert instar exits 0 only; do not attempt qemu-img info or
             # round-trip on the instar output.
@@ -603,7 +609,7 @@ class TestDdStructuredWindow(InstarTestBase):
             full_label = f'{label} fmt=vhdx src={src_fmt}'
             self._assert_empty_instar_exit0_only(
                 src_path, window_ops, 'vhdx', '.vhdx', full_label,
-                note='Known phase-4 limitation: instar empty vhdx (count=0) is '
+                note='Known limitation: instar empty vhdx (count=0) is '
                      'rejected by qemu-img info. Exit-0 only is asserted.',
             )
 
@@ -667,7 +673,7 @@ class TestDdStructuredWindow(InstarTestBase):
         """Assert instar exits 0; do not attempt qemu-img info on its output.
 
         Used when instar's empty-window output is unreadable by qemu-img info
-        (e.g. vhdx count=0 -- known phase-4 limitation).  Instar must exit 0;
+        (e.g. vhdx count=0 -- a known limitation).  Instar must exit 0;
         qemu-img dd is not run (it would succeed, but comparing the output
         would fail and obscure the known limitation).
         """
@@ -734,7 +740,7 @@ class TestDdStructuredWindow(InstarTestBase):
                    0-capacity); assert instar exit 0 only.
           vpc    -- both tools produce a readable 0-vsize image; assert parity.
           vhdx   -- qemu succeeds and image is readable (vsize=0); instar exits
-                   0 but its output is rejected by qemu-img info (known phase-4
+                   0 but its output is rejected by qemu-img info (known
                    limitation); assert instar exit 0 only.
         """
         self._run_empty_window(
@@ -861,7 +867,7 @@ class TestDdUnalignedClusterCrossing(InstarTestBase):
 # ---------------------------------------------------------------------------
 
 class TestDdErrors(InstarTestBase):
-    """Phase-6a: CLI rejection parity matrix for ``instar dd``.
+    """CLI rejection parity matrix for ``instar dd``.
 
     Each test case verifies that ``instar dd`` exits non-zero for an
     invalid invocation.  For cases where ``qemu-img dd`` is given the
@@ -1033,7 +1039,7 @@ class TestDdErrors(InstarTestBase):
 # ---------------------------------------------------------------------------
 
 class TestDdOutputDefault(InstarTestBase):
-    """Phase-6b: omitting -O produces raw output even from a qcow2 input.
+    """Omitting -O produces raw output even from a qcow2 input.
 
     qemu-img dd (and instar dd, by parity) always defaults the output
     format to raw regardless of the input format.  This test makes that
@@ -1115,7 +1121,7 @@ def _make_patterned_raw(path: str) -> None:
 
 
 class TestDdInputFormats(InstarTestBase):
-    """Phase-6b: input-format coverage for ``instar dd``.
+    """Input-format coverage for ``instar dd``.
 
     dd inherits convert's input read path (auto-detection + backing-chain
     composition).  Every existing dd test feeds a raw or qcow2 input.
@@ -1237,10 +1243,10 @@ class TestDdInputFormats(InstarTestBase):
     def test_input_vdi(self):
         """dd reads a vdi input full-copy and matches qemu-img dd byte-for-byte.
 
-        Format-coverage phase 2 graduates VDI to a real read format.  This
-        smoke test uses the aligned vdi-simple fixture and does a full-image
-        copy (no skip/count window) so the whole read path is exercised;
-        windowed and data-bearing VDI coverage is added in step 2e.
+        VDI is a real read format for dd.  This smoke test uses the aligned
+        vdi-simple fixture and does a full-image copy (no skip/count window)
+        so the whole read path is exercised; windowed and data-bearing VDI
+        coverage is in test_input_vdi_windowed.
         """
         image = self.get_image('vdi-simple')
         if not image.path.exists():
@@ -1283,12 +1289,12 @@ class TestDdInputFormats(InstarTestBase):
     def test_input_parallels(self):
         """dd reads a parallels input full-copy and matches qemu-img dd.
 
-        Format-coverage phase 3 graduates Parallels to a real read format;
-        phase 1 gated dd for parallels but never added a refusal test (a
-        documented gap this phase closes with positive coverage).  This
-        smoke uses parallels-v2 ('WithouFreSpacExt') and does a full-image
-        copy (no skip/count window) so the whole read path is exercised;
-        windowed and both-magic coverage is added in step 3e.
+        Parallels is a real read format for dd.  While dd still refused
+        parallels input that refusal was never pinned by a test; this
+        positive coverage closes that gap.  This smoke uses parallels-v2
+        ('WithouFreSpacExt') and does a full-image copy (no skip/count
+        window) so the whole read path is exercised; windowed coverage is
+        in test_input_parallels_windowed.
         """
         # qemu-img is the oracle here and the RHEL-family builds have no
         # driver for this format.
@@ -1727,7 +1733,7 @@ class TestDdInputFormats(InstarTestBase):
 
 
 class TestDdDmg(InstarTestBase):
-    """Windowed dd on DMG input (format-coverage phase 5).
+    """Windowed dd on DMG input.
 
     Pins the graduation of DMG to a real read format.  dmg-simple is a
     4 MiB UDIF image with two zlib-wrapped UDZO chunks: chunk 0 covers
@@ -1871,10 +1877,10 @@ class TestDdDmg(InstarTestBase):
 
         The koly SectorCount exceeds the mish coverage, so the tail is an
         uncovered gap.  DMG reads ERROR on a gap rather than zero-filling
-        (the phase-5 EIO-parity semantic), so dd fails on both sides -- the
-        messages differ (qemu ``Input/output error`` vs instar's generic
-        operation failure).  Only the non-zero exit and clean termination
-        are pinned, not the message.
+        (matching qemu, which returns EIO there), so dd fails on both
+        sides -- the messages differ (qemu ``Input/output error`` vs
+        instar's generic operation failure).  Only the non-zero exit and
+        clean termination are pinned, not the message.
         """
         image = self.get_image('dmg-gap')
         if not image.path.exists():
@@ -1955,9 +1961,9 @@ class TestDdDetectOnlyRefusal(InstarTestBase):
         """dd refuses a cloop-simple input with the typed message."""
         self._assert_refused('cloop-simple', 'cloop')
 
-    # NOTE: dmg is no longer refused here.  Format-coverage phase 5
-    # graduates DMG to a real read format; dd now reads it.  The windowed
-    # dd byte-parity smoke lives in TestDdDmg below.
+    # NOTE: dmg is no longer refused here.  DMG is a real read format and
+    # dd reads it.  The windowed dd byte-parity smoke lives in TestDdDmg
+    # below.
 
     def test_dd_iso_passthrough(self):
         """dd keeps reading iso as raw (deliberate qemu parity).

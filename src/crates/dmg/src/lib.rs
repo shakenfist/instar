@@ -37,8 +37,9 @@
 //! trailer probe share one source of truth for the trailer geometry.
 //!
 //! Chunk *decompression* (zlib inflate) and the actual byte copies live in
-//! the reader arm (guest op, step 5b); this crate only parses metadata and
-//! answers span-typed lookups. Codec decode support beyond zlib
+//! the chain reader's DMG arm (`read_chain_virtual_cluster` in the
+//! `qcow2` crate); this crate only parses metadata and answers span-typed
+//! lookups. Codec decode support beyond zlib
 //! (bzip2 / lzfse / ADC) is out of scope — the typed refusals above stand
 //! in.
 

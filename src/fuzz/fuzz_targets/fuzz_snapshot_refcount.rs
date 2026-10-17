@@ -38,18 +38,18 @@
 //! slot length), id bytes, name bytes, and a 1 KiB old-table
 //! window — each cyclically from the pool.
 //!
-//! ## The invariant set (phase 12 plan), re-derived
+//! ## The invariant set, re-derived
 //!
 //! 1. **Precheck never mutates.** `precheck_snapshot_refcount`
-//!    takes `refblocks: &[u8]` ("the borrow makes the
-//!    no-mutation guarantee structural", phase 7b); the
+//!    takes `refblocks: &[u8]` (the borrow makes the
+//!    no-mutation guarantee structural); the
 //!    byte-identity assert guards interior-mutability
 //!    regressions and documents the contract.
 //! 2. **Precheck-Ok implies apply-Ok** — *conditioned on the
 //!    visited refcount-entry multiset being duplicate-free per
 //!    walk side*. Derivation: the precheck is exactly
-//!    `update_snapshot_refcount`'s pass 1 (phase 7b: it
-//!    delegates to the same `dry_run_refcount_pass` dispatch),
+//!    `update_snapshot_refcount`'s pass 1 (it delegates to
+//!    the same `dry_run_refcount_pass` dispatch),
 //!    so precheck-Ok always implies the apply's own pass 1
 //!    passes. Pass 2's only divergent error channel is
 //!    value-dependent: every structural failure (staging gap,
@@ -86,8 +86,8 @@
 //!    exactly, and `set_refcount_in_block` masks sub-byte
 //!    widths so co-resident bits are untouched — refblocks are
 //!    byte-identical to the start state.
-//! 4. **Flag-walker idempotence and containment** (phase 8b
-//!    contract): on a successful `update_copied_flags_for_l1`,
+//! 4. **Flag-walker idempotence and containment**: on a
+//!    successful `update_copied_flags_for_l1`,
 //!    only bit 63 of each L1/L2 type-and-offset word may have
 //!    changed (the dispatched helpers preserve every other bit)
 //!    and extended-L2 bitmap halves are untouched; afterwards
@@ -133,9 +133,9 @@
 //!    bounds extraction) and whose byte_len re-parses at one
 //!    fewer entry.
 //!
-//! (A phase 12 invariant 8 covered `SnapshotPlan::push`'s bound;
-//! the never-adopted `SnapshotPlan` API and its op 7 were removed
-//! in PLAN-snapshot phase 14.)
+//! (An eighth invariant once covered `SnapshotPlan::push`'s
+//! bound; the `SnapshotPlan` API was never adopted, and it was
+//! removed along with that invariant and its fuzz op 7.)
 
 #![no_main]
 use libfuzzer_sys::fuzz_target;

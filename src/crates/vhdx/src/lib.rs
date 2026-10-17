@@ -14,9 +14,9 @@
 //! arrays, so [`VhdxMetadata`] is several kilobytes when an image
 //! carries a parent locator. The sibling VHD crate made the opposite
 //! choice: `VhdParentInfo` borrows the undecoded parent name and
-//! decodes into a buffer the caller supplies. One phase, two answers,
-//! so the reason is worth stating rather than leaving a later reader
-//! to decide the pair is simply inconsistent.
+//! decodes into a buffer the caller supplies. Two sibling parsers, two
+//! answers, so the reason is worth stating rather than leaving a later
+//! reader to decide the pair is simply inconsistent.
 //!
 //! The difference is where the bytes come from. A VHD's locator fields
 //! live in a header the caller has already read, so a borrow is free
@@ -31,8 +31,9 @@
 //! The cost is bounded and paid on the stack: `MAX_PARENT_LOCATOR_*`
 //! cap the item at eight entries with a 96-byte key and a 780-byte
 //! value each, roughly 7.3 KB inside a 4 MiB guest stack
-//! (`STACK_SIZE`, `src/vmm/src/main.rs`). See decision 7 of
-//! `docs/plans/PLAN-differencing-phase-03-parse.md`.
+//! (`STACK_SIZE`, `src/vmm/src/main.rs`). In exchange the parser itself
+//! takes a byte slice and does no I/O, so a fuzz target can drive it
+//! directly; the staging reads live in `parse_metadata`.
 
 #![no_std]
 #![allow(clippy::too_many_arguments)]
@@ -609,10 +610,12 @@ pub enum VhdxParentLocatorNotStaged {
     ///
     /// Not `Absent`: the metadata table really does list a parent
     /// locator item, and an image carrying one while denying it has a
-    /// parent is anomalous in a way a later phase may want to report.
-    /// Recording it here rather than collapsing it keeps decision 4's
-    /// distinction intact while costing the sector reads only to
-    /// images that will actually use them.
+    /// parent is anomalous in a way a consumer may want to report.
+    /// Recording it here rather than collapsing it keeps the distinction
+    /// between a missing item and one that was not read intact, so the
+    /// anomaly can be reported rather than mistaken for absence, while
+    /// costing the sector reads only to images that will actually use
+    /// them.
     ImageClaimsNoParent,
 }
 
@@ -620,13 +623,13 @@ pub enum VhdxParentLocatorNotStaged {
 ///
 /// Three states rather than an `Option`, because "the metadata table
 /// lists no parent locator item" and "it lists one that we declined to
-/// stage" mean different things to a later phase: the first says the
+/// stage" mean different things to a consumer: the first says the
 /// image is structurally broken if it also claims a parent, the second
 /// says instar hit its own limit and should say so differently. The
 /// declined case keeps the item's declared offset and length, which are
-/// the facts that explain the decision (decision 4 of
-/// `docs/plans/PLAN-differencing-phase-03-parse.md`, applied at the
-/// item level).
+/// the facts that explain the decision: as with a malformed entry, the
+/// item is reported rather than dropped, because a dropped item is
+/// indistinguishable from an absent one.
 //
 // The parsed variant is several KB and the others are a handful of
 // bytes, which is what `large_enum_variant` objects to. Its remedy —
@@ -673,10 +676,9 @@ impl VhdxParentLocatorState {
 /// The first structural problem found in a parent locator item or one
 /// of its entries.
 ///
-/// A defect marks the offending entry; it never removes it. Phase 4
-/// has to be able to say *why* it is refusing an image, and a dropped
-/// entry is indistinguishable from an absent one (decision 4 of
-/// `docs/plans/PLAN-differencing-phase-03-parse.md`).
+/// A defect marks the offending entry; it never removes it. The read
+/// policy has to be able to say *why* it is refusing an image, and a
+/// dropped entry is indistinguishable from an absent one.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum VhdxParentLocatorDefect {
     /// `key_value_count` claims more entries than the item's bytes can
@@ -1026,12 +1028,11 @@ pub fn posix_relative_path<'a>(value: &[u8], out: &'a mut [u8]) -> Option<&'a [u
 /// because every offset inside the item is relative to that point.
 ///
 /// Takes a byte slice and performs no I/O, so a fuzz target can be
-/// pointed straight at it (decision 7 of
-/// `docs/plans/PLAN-differencing-phase-03-parse.md`). This is a
-/// deliberate departure from the local precedent —
-/// `qcow2::read_backing_file` (`src/crates/qcow2/src/lib.rs:683`) does
-/// its own call-table I/O — and not a claim that qcow2 agrees; the
-/// staging read lives in `parse_metadata` instead.
+/// pointed straight at it. This is a deliberate departure from the local
+/// precedent — `qcow2::read_backing_file`
+/// (`src/crates/qcow2/src/lib.rs:683`) does its own call-table I/O — and
+/// not a claim that qcow2 agrees; the staging read lives in
+/// `parse_metadata` instead.
 ///
 /// Returns `None` only when `item` is too short to hold the parent
 /// locator header, in which case there is nothing to preserve.
@@ -1131,10 +1132,11 @@ pub struct VhdxMetadata {
     /// problem with its *contents* is marked inside the locator rather
     /// than reported here.
     ///
-    /// Nothing consumes this yet: phase 3 of the differencing plan
-    /// parses, and phase 4 decides what to do about what it finds.
-    /// `has_parent` above still comes from the file parameters flags
-    /// and is unaffected by anything here.
+    /// This reports what the item holds and decides nothing; `info`
+    /// reads the preferred path from it to report the backing file, and
+    /// what to do about a defect is the consumer's call. `has_parent`
+    /// above still comes from the file parameters flags and is
+    /// unaffected by anything here.
     pub parent_locator: VhdxParentLocatorState,
 }
 
@@ -1403,17 +1405,17 @@ pub unsafe fn parse_metadata(
     // every other item above and then handed to `parse_parent_locator`
     // as a plain byte slice, so that the parser itself does no I/O. An
     // item the parser declines to stage comes back as `NotStaged`,
-    // never as `Absent`, so that a later phase can tell a resource
+    // never as `Absent`, so that a consumer can tell a resource
     // refusal from a missing item; a locator that is present but
     // malformed comes back marked, not dropped.
     //
     // The `has_parent` gate matters twice. It keeps the extra sector
     // reads — and so `bytes_read` — off every image that will never
-    // use them, which is all of them until phase 4. And it means an
-    // image that lists a locator item while denying it has a parent is
-    // reported as `ImageClaimsNoParent` rather than read: that
+    // use them, which is every image that is not differencing. And it
+    // means an image that lists a locator item while denying it has a
+    // parent is reported as `ImageClaimsNoParent` rather than read: that
     // combination is anomalous, and the anomaly is worth more to a
-    // later phase than the item's contents would be.
+    // consumer than the item's contents would be.
     //
     // `buffer` is reused as the sector staging buffer here, which is
     // safe because every other item has already been read out of it.
@@ -2108,11 +2110,11 @@ pub struct VhdxState {
     ///
     /// `init` deliberately does **not** refuse such an image. Read
     /// entry points test this flag and refuse with a diagnosis of
-    /// their own (see `PLAN-differencing-phase-04-read-policy.md`,
-    /// decision 3), which keeps VHDX symmetric with VHD -- whose
+    /// their own, which keeps VHDX symmetric with VHD -- whose
     /// `VhdState::init` likewise accepts `DISK_TYPE_DIFFERENCING` and
     /// exposes `disk_type` -- and leaves both formats initialising
-    /// successfully for the composition work in phases 11-16.
+    /// successfully, which the operations that compose a child over its
+    /// parent chain depend on.
     ///
     /// **A consumer that composes sector data must test this.** An
     /// image with it set reads as zeros wherever the parent holds the
@@ -2993,8 +2995,8 @@ impl VhdxState {
         // overshoot. AllocationSummary::clamp enforces the invariant
         // allocated_bytes <= virtual_size at construction;
         // `measure_<fmt>` would otherwise reject the summary as
-        // InvalidSize. Mirrors the qcow2 out-of-bounds skip
-        // established in PLAN-fuzzing-bugs phase 2.
+        // InvalidSize. Mirrors the qcow2 allocation scan, which parses
+        // but does not count clusters mapped past virtual_size.
         let allocated_bytes = allocated_blocks.saturating_mul(self.block_size as u64);
 
         Some(AllocationSummary::clamp(
@@ -4802,7 +4804,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // preferred_path() -- differencing phase 4, step 4c
+    // preferred_path()
     // ------------------------------------------------------------------
 
     #[test]
@@ -5570,8 +5572,7 @@ mod tests {
 
     /// Build a whole metadata region: the five items `build_metadata`
     /// writes, plus optionally a sixth table entry and item for a
-    /// parent locator, laid out the way the phase 1 pin's generator
-    /// lays out Hyper-V's.
+    /// parent locator, laid out the way Hyper-V lays out its own.
     fn metadata_region(has_parent: bool, with_locator: bool) -> std::vec::Vec<u8> {
         let mut region = std::vec![0u8; STAGE_REGION_LEN];
         build_metadata(

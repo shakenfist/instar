@@ -173,9 +173,9 @@ class TestSecurityFeatureDetection(InstarTestBase):
         Verify instar rejects VMDK descriptors with non-FLAT extents.
 
         VMDK descriptor files can reference arbitrary files as extents
-        (e.g. /etc/passwd). Phase 22 added host-side descriptor
-        recognition: instar now detects the ``# Disk DescriptorFile``
-        prefix and validates the descriptor before launching the guest.
+        (e.g. /etc/passwd). instar's host side recognises the
+        ``# Disk DescriptorFile`` prefix and validates the descriptor
+        before launching the guest.
         A descriptor with a SPARSE extent (instead of FLAT) is rejected
         outright — extent paths are never followed.
         """
@@ -774,7 +774,7 @@ class TestRawFormatValidation(InstarTestBase):
 
 
 class TestCVEReproduction(InstarTestBase):
-    """CVE reproduction tests (Phase 4 of security audit).
+    """CVE reproduction tests.
 
     Each test uses a purpose-built reproducer image that mimics the attack
     vector from a known qemu-img CVE. Tests verify that instar's mitigations

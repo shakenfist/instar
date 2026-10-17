@@ -79,10 +79,11 @@ pub fn build_v3(
 
 /// Hand-craft a minimal valid v2 qcow2 header cluster.
 ///
-/// Mirrors phase 2's `make_header` (qcow2.rs) field layout but sizes
-/// the buffer to a full `cluster_size` and computes `cluster_bits`
-/// from `cluster_size`. Sets: magic, version=2, cluster_bits,
-/// virtual_size, l1_size=1, l1_table_offset=2*cluster_size,
+/// Mirrors the planner unit tests' `make_header` (src/qcow2.rs)
+/// field layout but sizes the buffer to a full `cluster_size` and
+/// computes `cluster_bits` from `cluster_size`. Sets: magic,
+/// version=2, cluster_bits, virtual_size, l1_size=1,
+/// l1_table_offset=2*cluster_size,
 /// refcount_table_offset=cluster_size, refcount_table_clusters=1 —
 /// all big-endian. No header extensions or backing reference.
 pub fn make_v2_header(cluster_size: usize, virtual_size: u64) -> Vec<u8> {
@@ -106,8 +107,9 @@ pub fn make_v2_header(cluster_size: usize, virtual_size: u64) -> Vec<u8> {
 /// followed by the `backing_name` string; update the header's
 /// `backing_file_offset`/`backing_file_size` to point at that string.
 ///
-/// Layout written from `at` (mirrors phase 2's `put_backing_format_ext`
-/// plus the explicit backing string the qemu fixture carries):
+/// Layout written from `at` (mirrors the planner unit tests'
+/// `put_backing_format_ext` in src/qcow2.rs, plus the explicit
+/// backing string the qemu fixture carries):
 ///   at      : EXT_BACKING_FORMAT type (u32 BE)
 ///   at + 4  : ext len = 5 (u32 BE)
 ///   at + 8  : "qcow2" (5 bytes; body padded to 8 -> at+8..at+16)

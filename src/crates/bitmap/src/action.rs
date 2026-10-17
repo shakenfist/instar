@@ -1,14 +1,14 @@
 //! Per-action logic for the bitmap subcommand.
 //!
-//! Each action (`add`, `remove`, `clear`, `enable`, `disable`, and —
-//! in 3d — same-image `merge`) is a pure validate-then-mutate function
+//! Each action (`add`, `remove`, `clear`, `enable`, `disable`, and
+//! same-image `merge`) is a pure validate-then-mutate function
 //! over caller-staged slices (directory bytes, refcount-block bytes)
 //! plus scalar geometry, reusing `snapshot::qcow2` for allocation and
 //! refcount arithmetic. They are `no_std` and perform no I/O.
 //!
-//! # Double-buffered directory (Open question 2)
+//! # Double-buffered directory
 //!
-//! The Phase-4 guest stages the existing directory bytes and the
+//! The guest op stages the existing directory bytes and the
 //! refcount blocks once, then applies the ordered action list one
 //! action at a time, **double-buffering** the directory: each action
 //! reads `old_dir` and writes a fresh `out_dir`, and the guest swaps
@@ -37,11 +37,9 @@
 //! **table clusters** (whose host offset and length are recorded in
 //! the entry) — and reports the table's location
 //! ([`ActionOutcome::freed_table_offset`] /
-//! [`ActionOutcome::freed_table_size`]) so the Phase-4 guest can walk
-//! the on-disk table itself and free the data clusters (and, for
-//! `clear`, zero the table clusters back to an all-zero empty table).
-//! See the "3c design decisions" note in
-//! `docs/plans/PLAN-bitmap-phase-03-planner.md`.
+//! [`ActionOutcome::freed_table_size`]) so the guest op can walk the
+//! on-disk table itself and free the data clusters (and, for `clear`,
+//! zero the table clusters back to an all-zero empty table).
 
 use crate::directory::{
     build_directory_replacing, build_directory_with_added, build_directory_without,
@@ -90,7 +88,7 @@ pub struct BitmapGeometry {
     pub host_refblocks_start: u64,
 }
 
-/// What an action changed, so the Phase-4 guest knows what to write /
+/// What an action changed, so the guest op knows what to write /
 /// zero on disk and how the bitmaps extension must change.
 ///
 /// Small and `Copy`; carries no heap. The `table_clusters_to_zero`
@@ -241,9 +239,9 @@ fn set_cluster_refcount(
 ///
 /// The read companion to [`set_cluster_refcount`]; the actions
 /// themselves only need the write path (freeing table clusters), so
-/// this is currently exercised only by the crate's tests. Gated
-/// `#[cfg(test)]` so it does not read as dead code until the Phase-4
-/// guest (which will want to inspect refcounts) links against it.
+/// this is exercised only by the crate's tests. The guest op does not
+/// call it, so it is gated `#[cfg(test)]` rather than shipped as dead
+/// code.
 #[cfg(test)]
 fn read_cluster_refcount(
     refblocks: &[u8],

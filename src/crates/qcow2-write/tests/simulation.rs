@@ -11,7 +11,7 @@
 //! For a grid of {cluster size 512 / 4096 / 65536 / 2 MiB ×
 //! image size × write pattern (sequential, sparse, straddling,
 //! sub-cluster, repeated overwrite)} each scenario runs the
-//! decision-1 loop (plan a window, execute it, resume) to
+//! windowed loop (plan a window, execute it, resume) to
 //! completion plus `plan_flush`, then asserts three families:
 //!
 //! 1. `assert_virtual_content_matches_model` — the re-parsed
@@ -30,20 +30,21 @@
 //!    virtual content is byte-wise old-or-new relative to the
 //!    barrier's flush epoch.
 //!
-//! The staged refblocks are mutated by the PLANNER at plan time
-//! (decision 6); the disk sees refcount changes only via
+//! The staged refblocks are a single copy mutated by the PLANNER
+//! at plan time; the disk sees refcount changes only via
 //! `plan_flush`'s write-back steps, so the crash checks replay
 //! refblock bytes from the journal (the bytes captured when the
 //! write-back executed), never from planner state.
 //!
 //! Deviations the harness cannot express (reported, not
 //! weakened): at intermediate truncation points the FULL
-//! refcount walk cannot hold by design — decision 7(c) orders
-//! refcount write-backs last, so a truncation after the L1/L2
-//! write-backs but before the refblock write-backs legitimately
-//! shows reachable clusters with on-disk refcount 0. The full
-//! walk therefore runs on completed epochs; truncation points
-//! get the structural + content checks above.
+//! refcount walk cannot hold by design — the crash-ordering
+//! contract emits refcount write-backs last, so a truncation
+//! after the L1/L2 write-backs but before the refblock
+//! write-backs legitimately shows reachable clusters with
+//! on-disk refcount 0. The full walk therefore runs on
+//! completed epochs; truncation points get the structural +
+//! content checks above.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -56,8 +57,8 @@ use qcow2_write::{
 use shared::ImageFormat;
 
 /// Deliberately small step window so every scenario exercises
-/// multi-window resume (window-invariance itself is step 3c's
-/// property; here windows just have to compose correctly).
+/// multi-window resume (window-invariance itself is pinned by
+/// tests/ordering.rs; here windows just have to compose correctly).
 const STEP_CAP: usize = 12;
 
 /// L2 window slots: small enough that multi-L2 scenarios evict.
@@ -395,7 +396,7 @@ fn staging_config() -> StagingConfig {
     }
 }
 
-/// The decision-1 executor loop for one write request: plan a
+/// The windowed executor loop for one write request: plan a
 /// window, execute it, reset, resume until `Ok` or a real error.
 /// Returns the concatenated executed program.
 fn run_write(
@@ -691,8 +692,9 @@ fn full_consistency_walk(disk: &[u8], initial_len: usize) -> BTreeMap<u64, u64> 
 /// Structural walk of a truncated image: every on-disk L1/L2
 /// pointer must reference a cluster whose bytes were fully
 /// present — either part of the initial image or covered by
-/// replayed writes. This is decision 7's payoff: a pointer never
-/// becomes durable before the data/init writes it references.
+/// replayed writes. This is what the crash-ordering contract buys:
+/// a pointer never becomes durable before the data/init writes it
+/// references.
 fn crash_structural_walk(disk: &[u8], covered: &[bool], ctx: &str) {
     let hdr = parse_disk_header(disk);
     let cs = hdr.cluster_size as usize;
@@ -1268,15 +1270,14 @@ fn sim_multi_epoch_mixed_c4k() {
     );
 }
 
-/// Unaligned virtual size (the phase-4 plan's amended decision
-/// 7 / D9), backing-less: the EOV-tail write — from the tail
-/// cluster's base up to exactly `virtual_size` — allocates the
-/// full cluster with a beyond-EOV zero-fill. The reference model
-/// treats beyond-EOV bytes as outside virtual content (all
-/// content comparisons run over `virtual_size` bytes), the
-/// consistency walk still sees the full allocated tail cluster,
-/// and the per-barrier crash pass runs unchanged over the new
-/// shape.
+/// Unaligned virtual size, backing-less: the EOV-tail write —
+/// from the tail cluster's base up to exactly `virtual_size` —
+/// allocates the full cluster with a beyond-EOV zero-fill. The
+/// reference model treats beyond-EOV bytes as outside virtual
+/// content (all content comparisons run over `virtual_size`
+/// bytes), the consistency walk still sees the full allocated
+/// tail cluster, and the per-barrier crash pass runs unchanged
+/// over the new shape.
 #[test]
 fn sim_unaligned_virtual_size_eov_tail() {
     for (cluster_bits, base) in [(9u32, 32u64 << 10), (12, 1u64 << 20)] {
@@ -1313,11 +1314,11 @@ fn sim_unaligned_virtual_size_eov_tail() {
 }
 
 /// Unaligned virtual size on a BACKED image: the EOV-tail write
-/// is full coverage (amended decision 7 — bytes beyond EOV are
-/// not virtual content, so the zero-fill is the correct
-/// pre-image), while every genuinely partial write below EOV
-/// keeps the NeedsBackingFill refusal; the mutated image stays
-/// consistent through flush and the crash pass.
+/// is full coverage (bytes beyond EOV are not virtual content,
+/// so the zero-fill is the correct pre-image), while every
+/// genuinely partial write below EOV keeps the NeedsBackingFill
+/// refusal; the mutated image stays consistent through flush
+/// and the crash pass.
 #[test]
 fn sim_backed_unaligned_eov_tail() {
     let cs = 1u64 << 12;

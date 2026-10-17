@@ -1,11 +1,11 @@
 //! Guest-side literal executor for `qcow2-write` step programs.
 //!
 //! The production counterpart of the pure planner in
-//! `crates/qcow2-write`, built to the settled decisions 1-2 of
-//! `docs/plans/PLAN-qcow2-write-infrastructure-phase-04-commit.md`
-//! (shared by the phase 4-6 op migrations). Where the planner is
-//! I/O-free and address-free (qcow2-write decision 3), this crate
-//! owns the other half of the split:
+//! `crates/qcow2-write`, shared by every op that writes qcow2
+//! through the planner (commit, rebase and bench) so none of them
+//! interprets step programs with its own code. The planner never
+//! performs I/O and never sees a memory address, so this crate owns
+//! the other half of the split:
 //!
 //! - **(a) the `RegionId` → slice mapping** — [`Regions`] wraps
 //!   the caller-carved staging slices (scratch-address carved by
@@ -40,10 +40,11 @@
 //!   [`BarrierClass::Ordering`] is a no-op and
 //!   [`BarrierClass::Durability`] maps to `fsync_input(0)` on an
 //!   fsync-capable `Input0` and degrades to `Ordering` where no
-//!   fsync primitive exists (qcow2-write decision 4; phase-4
-//!   divergence D8 accepts the degradation on `Output`). A
-//!   degraded barrier succeeds; an fsync that runs and reports
-//!   failure is an [`ExecError`].
+//!   fsync primitive exists. The degradation is accepted on
+//!   `Output` because the call table has no output fsync and
+//!   commit/rebase issued zero fsyncs before the planner existed,
+//!   so it changes nothing. A degraded barrier succeeds; an fsync
+//!   that runs and reports failure is an [`ExecError`].
 //!
 //! [`execute`] is a LITERAL interpreter of the [`StepKind`] doc
 //! contracts: zero planning logic, zero classification, zero
@@ -141,7 +142,7 @@ pub struct ExecStats {
 }
 
 // ---------------------------------------------------------------------------
-// Device access (decision 2(b))
+// Device access (policy (b))
 // ---------------------------------------------------------------------------
 
 /// Per-[`TargetDevice`] sector-addressed I/O.
@@ -170,7 +171,7 @@ pub trait DeviceIo {
 
     /// Make `device` durable, if it has an fsync primitive:
     /// `None` means no capability (a Durability barrier degrades
-    /// to Ordering — decision 2(e)); `Some(ok)` reports the
+    /// to Ordering — policy (e)); `Some(ok)` reports the
     /// fsync's outcome.
     fn fsync(&mut self, device: TargetDevice) -> Option<bool>;
 }
@@ -181,9 +182,10 @@ pub trait DeviceIo {
 /// Maps `Input0` to `read_input_sector(0, ..)` /
 /// `write_input_sector(0, ..)` / `fsync_input(0)` and `Output`
 /// to `read_output_sector` / `write_output_sector` with no fsync
-/// primitive (the call table exposes only `fsync_input`;
-/// `fsync_output` is recorded future work the phase 4-5
-/// migrations must not take implicitly).
+/// primitive (the call table exposes only `fsync_input`). An
+/// `fsync_output` would be a new call-table slot and a deliberate
+/// change to commit/rebase durability, not something this mapping
+/// adds implicitly.
 pub struct CallTableIo<'a> {
     call_table: &'a CallTable,
     input_sector_size: usize,
@@ -274,23 +276,24 @@ impl DeviceIo for CallTableIo<'_> {
 }
 
 // ---------------------------------------------------------------------------
-// Region mapping (decision 2(a))
+// Region mapping (policy (a))
 // ---------------------------------------------------------------------------
 
 /// The executor's `RegionId` → slice mapping plus its service
 /// buffers, all carved by the op from scratch addresses and lent
-/// per window (decision 2(a): never `static`).
+/// per window (never `static`: a `.bss` buffer in a guest op can
+/// overflow into the op's code — the HEADER_MISMATCH hazard class).
 ///
 /// The six region slices are the exact buffers the planner's
-/// [`qcow2_write::StagedRegions`] views alias (same carve, other
-/// half of the decision-1 loop); everything is `&mut` — the
-/// union of the [`StepKind`] contracts writes into every region
-/// kind (`PatchEntryU64` into L1/L2 slots, `LoadCluster` /
-/// `ReadCluster` into their targets, and read-only uses don't
-/// need the distinction).
+/// [`qcow2_write::StagedRegions`] views alias (same carve, the
+/// execute half of the plan-a-window / execute-it / resume loop);
+/// everything is `&mut` — the union of the [`StepKind`] contracts
+/// writes into every region kind (`PatchEntryU64` into L1/L2 slots,
+/// `LoadCluster` / `ReadCluster` into their targets, and read-only
+/// uses don't need the distinction).
 ///
-/// The two service buffers are the executor's own (decision
-/// 2(c)-(d)): `rmw_sector` is the sub-sector RMW bounce and
+/// The two service buffers are the executor's own (policies
+/// (c)-(d)): `rmw_sector` is the sub-sector RMW bounce and
 /// `fill_sector` synthesises `ZeroRange` / `FillRange` bytes.
 /// Each must be at least the sector size of every device the
 /// window touches (byte-range calls refuse shorter ones as
@@ -306,9 +309,8 @@ pub struct Regions<'a> {
     pub l2_window: &'a mut [u8],
     /// [`RegionId::RefcountTable`]: the staged refcount table.
     pub refcount_table: &'a mut [u8],
-    /// [`RegionId::Refblocks`]: the staged refblocks (single
-    /// copy, mutated in place by the planner — qcow2-write
-    /// decision 6).
+    /// [`RegionId::Refblocks`]: the staged refblocks (a single
+    /// copy, which the planner mutates in place as it allocates).
     pub refblocks: &'a mut [u8],
     /// [`RegionId::Bounce`]: the cluster-sized planner bounce
     /// region (filler in v1 programs; addressable regardless).
@@ -331,7 +333,7 @@ pub struct Regions<'a> {
 
 impl Regions<'_> {
     /// Resolve `region[region_offset .. region_offset + len]` to
-    /// a mutable byte window, bounds-checked per the decision-3
+    /// a mutable byte window, bounds-checked per the region
     /// contract ([`RegionId::L2Slot`] resolves against the slot's
     /// cluster-sized window, never the whole `l2_window`).
     /// Returns the window plus a reborrow of `rmw_sector`, so a
@@ -387,7 +389,7 @@ impl Regions<'_> {
 }
 
 // ---------------------------------------------------------------------------
-// Byte-range layer (decision 2(c))
+// Byte-range layer (policy (c))
 // ---------------------------------------------------------------------------
 
 /// Read `dst.len()` bytes from `device` at byte offset
@@ -399,9 +401,9 @@ impl Regions<'_> {
 /// byte-exact to their semantics: whole aligned sectors transfer
 /// directly into `dst`; a sub-sector head/tail reads the
 /// covering sector into `rmw_sector` and copies the wanted
-/// bytes out. Exposed for the op migrations' plain byte reads
-/// (e.g. commit's overlay metadata staging in step 4b), not just
-/// for [`execute`].
+/// bytes out. Exposed for the ops' plain byte reads (e.g.
+/// bench staging the refcount table and L1, rebase reading an
+/// original L2 table), not just for [`execute`].
 ///
 /// `rmw_sector` must be at least the device's sector size
 /// ([`ExecCause::Geometry`] otherwise, checked even for fully
@@ -495,7 +497,7 @@ pub fn write_bytes(
 
 /// Write `len` bytes of `byte` to `device` at `disk_offset`
 /// (the [`StepKind::ZeroRange`] / [`StepKind::FillRange`]
-/// lowering, decision 2(d)).
+/// lowering, policy (d)).
 ///
 /// Fills `fill_sector` with the byte once, then loops
 /// `min(sector_size, remaining)` chunks through [`write_bytes`]
@@ -576,9 +578,9 @@ fn exec_step(
             // "Store `value` as a big-endian u64 at
             // `region_offset` within `region`" — a pure memory
             // op; it must NOT touch disk (the patch reaches disk
-            // via a later WriteRange / WritebackCluster, decision
-            // 7 ordering). `step.len` is an unused filler field
-            // for this kind.
+            // via a later WriteRange / WritebackCluster, per the
+            // crash-ordering contract). `step.len` is an unused
+            // filler field for this kind.
             let (dst, _) = regions.resolve(step.region, step.region_offset, 8)?;
             dst.copy_from_slice(&step.value.to_be_bytes());
             Ok(())
@@ -617,11 +619,11 @@ fn exec_step(
         StepKind::Barrier { class } => match class {
             // All call-table I/O is synchronous, so issue order
             // is completion order and an Ordering barrier is a
-            // no-op (decision 2(e)).
+            // no-op (policy (e)).
             BarrierClass::Ordering => Ok(()),
             BarrierClass::Durability => match devices.fsync(step.device) {
                 // No fsync primitive: degrade to Ordering
-                // (divergence D8, accepted).
+                // (accepted; see policy (e)).
                 None => Ok(()),
                 Some(true) => {
                     stats.fsyncs += 1;
@@ -635,7 +637,7 @@ fn exec_step(
 
 /// Execute one planned window in emission order.
 ///
-/// The production form of the decision-1 loop body: the op plans
+/// The production form of the windowed loop body: the op plans
 /// into its step buffer until `Ok` or `BufFull`, calls `execute`
 /// on the emitted window, resets the buffer and resumes. Each
 /// step is applied literally per its [`StepKind`] doc contract;
@@ -1269,7 +1271,7 @@ mod tests {
         assert_eq!(&bufs.l1[16..24], &0xdeadbeefcafef00du64.to_be_bytes());
     }
 
-    // ---------------- barrier policy (decision 2(e)) ----------------
+    // ---------------- barrier policy (policy (e)) ----------------
 
     fn barrier(device: TargetDevice, class: BarrierClass) -> Step {
         mkstep(
@@ -1299,8 +1301,8 @@ mod tests {
 
     #[test]
     fn durability_on_output_degrades_to_ordering() {
-        // The output device has no fsync primitive (divergence
-        // D8): the barrier degrades and succeeds silently.
+        // The output device has no fsync primitive (policy
+        // (e)): the barrier degrades and succeeds silently.
         let mut bufs = Bufs::new(4096, 2, 512);
         let mut mock = MockIo::new(512, 8 * 512);
         let steps = [barrier(TargetDevice::Output, BarrierClass::Durability)];
@@ -1588,7 +1590,7 @@ mod tests {
 
     // =====================================================================
     // End-to-end: qcow2-write planner programs executed by this
-    // executor over a mock disk (the production decision-1 loop).
+    // executor over a mock disk (the production windowed loop).
     // =====================================================================
 
     /// Parameterised v3 header (the qcow2-write test pattern).
@@ -1620,7 +1622,7 @@ mod tests {
 
     /// The image under test: a mock Input0 disk holding a
     /// minimal valid qcow2, plus the staged buffers and planner
-    /// state the decision-1 loop threads.
+    /// state the windowed loop threads.
     struct Harness {
         mock: MockIo,
         bufs: Bufs,
@@ -1686,7 +1688,7 @@ mod tests {
         }
     }
 
-    /// The decision-1 loop for one request: plan a window,
+    /// The windowed loop for one request: plan a window,
     /// execute it with the production executor, reset, resume.
     fn run_write(h: &mut Harness, voff: u64, len: u64, data: DataSource) {
         let filler = mkstep(
@@ -1876,7 +1878,7 @@ mod tests {
         }
 
         // 3. The flush's Durability barriers really fsynced the
-        // RW input device (decision 2(e)).
+        // RW input device (policy (e)).
         assert!(h.mock.fsyncs > 0, "flush must fsync Input0");
         // 4. The output device was never touched.
         assert!(h

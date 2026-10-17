@@ -13,11 +13,11 @@
 //!
 //! For qcow2, the backing-side write composition (cluster
 //! allocation, refblock staging and dirty tracking, the L2/L1
-//! /refcount flush) moved to `crates/qcow2-write` +
-//! `crates/qcow2-write-exec` in phase 4 of
-//! `PLAN-qcow2-write-infrastructure`; [`plan_commit_qcow2`]
-//! keeps the overlay-side and cross-image validation plus the
-//! overlay geometry the clear pass needs. The vmdk path
+//! /refcount flush) lives in the shared `crates/qcow2-write` +
+//! `crates/qcow2-write-exec` engine, which commit, rebase and
+//! bench all use; [`plan_commit_qcow2`] keeps the overlay-side
+//! and cross-image validation plus the overlay geometry the
+//! clear pass needs. The vmdk path
 //! ([`plan_commit_vmdk`], [`allocate_backing_grain_vmdk`])
 //! still owns its backing-side allocator and scratch staging.
 //!
@@ -35,11 +35,11 @@ mod vmdk;
 ///
 /// Each variant maps to a distinct
 /// [`shared::CommitResult::ERROR_*`] wire code via the
-/// `map_commit_error` helper in `src/operations/commit/src/main.rs`
-/// (phase 7 step 7c). Wire codes 0..=13 are append-only and
-/// stable; phase 7 step 7a appended codes 8..=13 to cover the
-/// planner-internal variants below that didn't have a phase-1
-/// wire equivalent.
+/// `map_commit_error` helper in `src/operations/commit/src/main.rs`.
+/// Wire codes are append-only and stable; codes 8..=13 were
+/// appended to give the planner-internal variants below, which
+/// had no equivalent in the original wire ABI, codes of their
+/// own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitError {
     /// The overlay or backing is not a format this crate

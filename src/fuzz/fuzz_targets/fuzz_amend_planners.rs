@@ -24,8 +24,8 @@
 //! oracle is panic.
 //!
 //! No re-parse round-trip: applying the patches and re-parsing the
-//! resulting cluster is a stronger property covered by the phase-5
-//! unit tests (`crates/amend/src/qcow2.rs`). This target's contract
+//! resulting cluster is a stronger property covered by the unit
+//! tests in `crates/amend/src/qcow2.rs`. This target's contract
 //! is narrower: no panics, no integer overflows, no overlapping
 //! writes, no out-of-cluster writes, no patch counts above the
 //! bound.

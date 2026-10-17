@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Migration-proof harness: instar-before vs instar-after byte identity.
 
-The phase-1 Q3 oracle for the qcow2-write migrations (phases 4-6 of
-PLAN-qcow2-write-infrastructure.md). For a deterministic fixture matrix
-built fresh each run with a pinned qemu-img, the harness:
+The oracle for moving the commit, rebase and bench operations onto the
+shared qcow2-write crate: a migration that is meant to be invisible must
+leave every image byte-identical to what the pre-migration binary produces.
+For a deterministic fixture matrix built fresh each run with a pinned
+qemu-img, the harness:
 
   1. builds THREE identical fixture sets per combo (twin equality is
      verified by sha256 before anything runs);
@@ -23,20 +25,26 @@ built fresh each run with a pinned qemu-img, the harness:
 
 Every combo appears in the per-combo TSV with its bucket and verdict;
 nothing is skipped and there are no tolerance windows. The only sanctioned
-fallback is the D9 unaligned-virtual-size combo (decision 7 of the phase-4
-plan): if raw sha256 differs there, virtual-content equality (qemu-img
-convert to raw) is checked and the divergence reported loudly and
-separately — it is expected to be unnecessary after step 4q.
+fallback is the unaligned-virtual-size combo (marked `d9` in the matrix):
+the migrated commit clamps its tail-cluster write to virtual_size, so bytes
+past the end of the virtual disk may legitimately differ while virtual
+content does not. If raw sha256 differs there, virtual-content equality
+(qemu-img convert to raw) is checked and the divergence reported loudly and
+separately — it is expected to be unnecessary, because qcow2-write treats a
+write that reaches virtual_size as covering the whole tail cluster and
+zero-fills the remainder.
 
 For --op commit the matrix is: cluster_size {512, 4096, 65536} x
 size {1M, 64M} x seed {empty, 64k-at-0, multi-extent} x lazy_refcounts
 {off, on} x {implicit, explicit -b} = 72 combos, plus one unaligned-size
 combo (1M+512, 64K clusters, seeded, implicit). The expected-refusal
 inventory (exactly the eight cs=512 multi-extent combos, wire-11 refcount
-exhaustion) carries over from the 4p D6 probe, so the seed recipes must
-not drift from d6-matrix.py's offsets and patterns.
+exhaustion) was measured by probing the pre-migration binary over this
+matrix, so the seed recipes must not drift from that probe's
+(d6-matrix.py's) offsets and patterns.
 
-Commit additionally runs the D6 capacity-widening exemplar outside the
+The migration deliberately widened commit's backing-side capacity caps, so
+commit additionally runs a capacity-widening exemplar outside the
 matrix (cs=512 16M backing with 8M seeded -> 66 populated refcount-table
 entries): before must refuse wire-10 pre-mutation, after must succeed
 deterministically, `qemu-img check` must be clean on the result, and the
@@ -58,7 +66,7 @@ Exit status is non-zero on any failure. Combo directories are deleted on
 PASS to bound disk use (keep with --keep-all); failing directories are
 always kept for post-mortem.
 
-Reusable for phases 5-6: add an entry to OPS wiring up the op's fixture
+To cover another op, add an entry to OPS wiring up the op's fixture
 builder, invocation, mutated-file list and expected-refusal inventory.
 """
 
@@ -147,9 +155,10 @@ def diff_invocations(label_a, a, label_b, b):
 # ---------------------------------------------------------------------------
 
 def commit_matrix():
-    """The phase-1 Q3 matrix plus the decision-7 unaligned-size combo.
+    """The commit proof matrix plus the unaligned-size combo.
 
-    Expected buckets are the 4p D6 inventory (d6-results.tsv): every
+    Expected buckets are the refusal inventory measured on the pre-migration
+    binary (d6-results.tsv): every
     refusal on this matrix is wire-11 refcount exhaustion on the eight
     cs=512 multi-extent combos; refuse-before/succeed-after is empty ON
     the matrix (the widening exemplar lives outside it).
@@ -277,9 +286,11 @@ def prove_combo(combo, workdir, args):
         row['verdict'] = 'PASS'
         return row
 
-    # The single sanctioned fallback: D9 unaligned-size combo, virtual-content
-    # equality when raw sha256 differs (decision 7; expected unnecessary
-    # after 4q — flag loudly if it triggers).
+    # The single sanctioned fallback: the unaligned-size (d9) combo, where the
+    # tail-cluster clamp may leave bytes past virtual_size different, gets
+    # virtual-content equality when raw sha256 differs (expected unnecessary
+    # now that qcow2-write zero-fills the EOV tail cluster — flag loudly if it
+    # triggers).
     only_sha_diffs = all(d.startswith('sha256(') for d in diffs)
     if combo['d9'] and bucket == 'both-succeed' and only_sha_diffs:
         virt_equal = all(
@@ -414,10 +425,10 @@ def prove_widening_exemplar(workdir, args):
 
 
 # ---------------------------------------------------------------------------
-# rebase fixtures (phase 5)
+# rebase fixtures
 # ---------------------------------------------------------------------------
 #
-# The 5b matrix per the phase-5 plan and its 5p outcome notes:
+# The rebase matrix, shaped by probes of the pre-migration binary:
 #
 #   cluster_size {512, 4096, 65536} x overlay size {1M, 64M}
 #     x chain {2-chain rebase-to-base, 3-chain CHAIN-SHORTENING, safe detach}
@@ -425,20 +436,21 @@ def prove_widening_exemplar(workdir, args):
 #
 # Pruning (documented, honest — every surviving combo is in the TSV):
 #   * detach x identical is incoherent (no new backing to be identical to);
-#     5p pruned it. Dropped.
+#     the probes pruned it too. Dropped.
 #   * -u ignores the seed entirely (metadata-only header/path patch), so it
 #     is run ONCE per (cs, size, chain), not once per seed. The -u fixture is
 #     built with the 'divergent' seed as a representative (its content is
 #     ignored by -u).
 #   * 3-chain uses the SHORTENING form (overlay->mid0->base, new backing =
 #     base): the plain rebase-to-mid keeps old and new chains identical and
-#     copies nothing (5p warning). mid0.qcow2 (10 chars) >= base.qcow2 so the
-#     new-backing path fits the overlay's existing backing-path slot (5p
-#     wire-8 warning).
-#   * NO `write -z` zero-flag seeds anywhere (the P7 chain-reader defect would
+#     copies nothing. mid0.qcow2 (10 chars) >= base.qcow2 so the new-backing
+#     path fits the overlay's existing backing-path slot (a longer path
+#     refuses with wire 8).
+#   * NO `write -z` zero-flag seeds anywhere (the chain reader mis-reads
+#     zero-flag clusters in a chain member, a pre-existing defect that would
 #     contaminate the comparison).
 #
-# Seed offsets/patterns are frozen to 5p's run_matrix.py so the expected
+# Seed offsets/patterns are frozen to the probe's run_matrix.py so the expected
 # both-refuse inventory does not drift: every cs=512 x divergent x safe combo
 # refuses wire 10 (v1 never appends refblocks — orphan-append scaffolding
 # identity is the both-refuse bar). That is exactly 3 chains x 2 sizes = 6
@@ -833,15 +845,16 @@ def _rebase_holed_rt(workdir, args):
 
 
 # ---------------------------------------------------------------------------
-# bench fixtures + proof (phase 6, decision 7)
+# bench fixtures + proof
 # ---------------------------------------------------------------------------
 #
 # Bench is NOT a byte-identity migration for allocating schedules: the crate
 # allocates L2-first while pre-migration bench allocated data-first, so with a
 # shared linear cursor the two host offsets swap for every fresh-L2 write and
-# the final images differ (divergence B-D1). The proof therefore pre-declares
-# a bucket per combo (a/b/c/d, seeded from the 6p refusal inventory) and runs
-# the right assertion for each bucket rather than a blanket byte compare:
+# the final images differ (labelled B-D1 in verdict details). The proof
+# therefore pre-declares a bucket per combo (a/b/c/d, seeded from a refusal
+# inventory probed on the pre-migration binary) and runs the right assertion
+# for each bucket rather than a blanket byte compare:
 #
 #   (a) controls  — raw `-w`, read runs (paths untouched by the migration):
 #       full identity (normalised stdout + stderr + per-file sha256).
@@ -858,9 +871,11 @@ def _rebase_holed_rt(workdir, args):
 #   (d) refusals: identical rc/stderr; sha-unchanged WHERE today's refusal is
 #       pre-mutation (holed-RT wire-3; compressed with NO growth, gate-2). The
 #       compressed-AFTER-growth shape is pre-declared recorded-NOT-sha-stable
-#       (verdict = rc/stderr identical + check-clean, per 6p probe 7).
+#       (verdict = rc/stderr identical + check-clean): the growth is written
+#       before the compressed cluster is reached, so even on the pre-migration
+#       binary this refusal mutates the image.
 #
-# Bench stdout/JSON normalisation (decision 7): the proof runs `bench
+# Bench stdout/JSON normalisation: the proof runs `bench
 # --output json`, which emits ONLY the structured object (no human header /
 # flush / completion lines). The three wall-clock fields
 # (elapsed-seconds / requests-per-second / bytes-per-second) are stripped; the
@@ -878,7 +893,7 @@ BENCH_WALLCLOCK_KEYS = {'elapsed-seconds', 'requests-per-second', 'bytes-per-sec
 
 
 def normalise_bench_stdout(stdout):
-    """Strip the three wall-clock JSON fields (decision 7).
+    """Strip the three wall-clock JSON fields, which vary run to run.
 
     On a refusal bench emits no stdout (the error goes to stderr), so an empty
     string round-trips unchanged. On success the structured object is returned
@@ -1265,7 +1280,7 @@ def prove_bench_combo(combo, workdir, args):
 
 
 # ---------------------------------------------------------------------------
-# op registry (phases 5-6 add entries here)
+# op registry (one entry per migrated op)
 # ---------------------------------------------------------------------------
 
 OPS = {

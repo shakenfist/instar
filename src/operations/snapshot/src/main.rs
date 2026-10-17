@@ -1,10 +1,11 @@
 //! Snapshot operation: list / apply / create / delete qcow2 internal snapshots.
 //!
-//! Phase 8 of `PLAN-snapshot.md` lands `MODE_APPLY`, the last
-//! mutating mode; `MODE_LIST` (phase 3), `MODE_CREATE` (phase 6)
-//! and `MODE_DELETE` (phase 7) are unchanged in behaviour
-//! (delete's find now goes through the shared raw-table finder
-//! in name-only mode).
+//! One guest binary serves all four modes: `MODE_LIST` and the
+//! three mutating modes `MODE_CREATE`, `MODE_DELETE` and
+//! `MODE_APPLY`. Delete and apply both resolve their snapshot
+//! argument through the shared raw-table finder
+//! (`snapshot::table::find_snapshot_in_table`), delete in
+//! name-only mode and apply in ID-then-name mode.
 //!
 //! Flow:
 //! 1. Read [`SnapshotConfig`] at [`OPERATION_CONFIG_ADDR`] and
@@ -119,19 +120,18 @@ use snapshot::SnapshotError;
 // Scratch layout
 // ---------------------------------------------------------------------------
 //
-// List mode (phase 3) only needs HEADER_BUF + CACHE_BUF_A. Create
-// mode (phase 6) adds the commit-style staging regions: the raw old
-// snapshot table, the active L1, the L1 copy, the L2 staging arena,
-// the refcount table, the refblock host-offset array, the refblocks
-// arena, the new-table build buffer, and a sector-sized RMW bounce
-// buffer. Delete mode (phase 7) appends a second L1 + L2 staging
-// set for the deleted snapshot's chain (regions whose lifetimes
-// don't overlap — L1_COPY_BUF — are create-only and left unused by
-// delete). Apply mode (phase 8) stages both chains exactly like
-// delete (the target snapshot's chain in the SNAP_* regions, the
-// old active chain in the create-mode regions) and repurposes
-// NEW_TABLE_BUF — apply allocates no snapshot table — for the
-// zero-padded new-L1 working copy.
+// List mode only needs HEADER_BUF + CACHE_BUF_A. Create mode adds the
+// commit-style staging regions: the raw old snapshot table, the
+// active L1, the L1 copy, the L2 staging arena, the refcount table,
+// the refblock host-offset array, the refblocks arena, the new-table
+// build buffer, and a sector-sized RMW bounce buffer. Delete mode
+// appends a second L1 + L2 staging set for the deleted snapshot's
+// chain (regions whose lifetimes don't overlap — L1_COPY_BUF — are
+// create-only and left unused by delete). Apply mode stages both
+// chains exactly like delete (the target snapshot's chain in the
+// SNAP_* regions, the old active chain in the create-mode regions)
+// and repurposes NEW_TABLE_BUF — apply allocates no snapshot table —
+// for the zero-padded new-L1 working copy.
 
 const HEADER_BUF: usize = SCRATCH_MEM_BASE;
 const CACHE_BUF_A: usize = HEADER_BUF + MAX_SECTOR_SIZE;
@@ -164,10 +164,13 @@ const NEW_TABLE_LIMIT: usize = 66 * 1024;
 const RMW_BOUNCE: usize = NEW_TABLE_BUF + NEW_TABLE_LIMIT;
 const RMW_BOUNCE_LIMIT: usize = MAX_SECTOR_SIZE;
 
-// Delete-mode staging (phase 7): the deleted snapshot's L1 and its
-// L2 set form a SECOND staged chain (delete needs both chains: the
-// snapshot's for the decrement walk, the active's for the COPIED
-// refresh — no dedup between them, see phase plan open question 6).
+// Delete-mode staging: the deleted snapshot's L1 and its L2 set form
+// a SECOND staged chain (delete needs both chains: the snapshot's for
+// the decrement walk, the active's for the COPIED refresh). L2
+// clusters shared by both chains are deliberately staged twice: the
+// budget fits, the two walks want different mutability (read-only
+// decrement vs flag rewrite), and dedup bookkeeping would invite
+// aliasing bugs.
 const SNAP_L1_BUF: usize = RMW_BOUNCE + RMW_BOUNCE_LIMIT;
 const SNAP_L1_LIMIT: usize = 64 * 1024;
 
@@ -406,16 +409,15 @@ fn map_snapshot_error(e: SnapshotError) -> u32 {
 }
 
 // ---------------------------------------------------------------------------
-// Shared staging helpers (create + delete)
+// Shared staging helpers (create, delete and apply)
 // ---------------------------------------------------------------------------
 //
-// Factored out of phase 6's run_create so MODE_DELETE composes the
-// same stages instead of copy-pasting them. Behaviourally identical
-// to the phase 6 inline code (same gate order, same messages, same
-// error codes) — re-verified by re-running the phase 6 harnesses.
+// The three mutating modes compose these same stages rather than
+// carrying their own copies, so every mode applies the same gates in
+// the same order with the same messages and error codes.
 
-/// The mutating-mode feature gates (phase 6 step 1, shared by
-/// delete): encryption, external data file, compression,
+/// The mutating-mode feature gates, run first by every mutating mode:
+/// encryption, external data file, compression,
 /// dirty / corrupt, the bitmaps autoclear bit, and the
 /// `refcount_bits == 16` allocator restriction. Returns the
 /// `SnapshotResult::ERROR_*` code on refusal.
@@ -466,8 +468,8 @@ unsafe fn mutating_feature_gates(
 }
 
 /// Stage the raw on-disk snapshot table into `OLD_TABLE_BUF` and
-/// return its exact byte length (phase 6's two-phase read: stage
-/// up to the bound, then measure with `snapshot_table_byte_len`).
+/// return its exact byte length (a two-step read: stage up to the
+/// bound, then measure with `snapshot_table_byte_len`).
 /// The caller must only invoke this when `nb_snapshots > 0`.
 ///
 /// # Safety
@@ -511,8 +513,8 @@ unsafe fn stage_old_table(
 
 /// Stage every L2 table referenced by the L1 at `l1_ptr` into the
 /// staging arena at `staging_base`, applying the compressed-cluster
-/// gate to each staged table (phase 6's inline walk). Returns the
-/// populated [`StagedL2Set`].
+/// gate to each staged table. Returns the populated
+/// [`StagedL2Set`].
 ///
 /// # Safety
 ///
@@ -1178,10 +1180,10 @@ unsafe fn run_create(
     // ----- Step 12: writeback group D (free old table) ------------------
     // Decrement the old table's clusters in the staged refblocks and
     // write those refblocks back. Skipped when there was no old
-    // table. Phase 7 (open question 3) aligned this free to a
-    // decrement, qemu's semantics: identical bytes on well-formed
-    // images (the old table's refcount is 1) but an underflow now
-    // surfaces a double-free bookkeeping bug instead of masking it.
+    // table. The free is a decrement, as qemu does it, rather than a
+    // set-to-zero: the bytes are identical on well-formed images (the
+    // old table's refcount is 1), but an underflow surfaces a
+    // double-free bookkeeping bug instead of masking it.
     if hdr.nb_snapshots > 0 && old_table_len > 0 {
         let old_table_clusters = (old_table_len as u64).div_ceil(cluster_size).max(1);
         let first_cluster = hdr.snapshots_offset / cluster_size;
@@ -1233,7 +1235,7 @@ unsafe fn run_create(
     )
 }
 
-/// MODE_DELETE: the qemu-faithful delete (phase 7).
+/// MODE_DELETE: the qemu-faithful delete.
 ///
 /// Mirrors `qcow2_snapshot_delete` from qemu 10.0.x, adapted to
 /// the staged model (see the module docs for the write-group
@@ -1306,9 +1308,8 @@ unsafe fn run_delete(
     // arg_len beyond the wire buffer cannot be compared and so
     // matches nothing (parity: qemu-img-created names are at most
     // 255 bytes, and qemu's own matcher would find nothing either).
-    // The find walks the RAW staged table via the shared finder
-    // (phase 8a refactor) in NameOnly mode — behaviourally
-    // identical to phase 7's inline walk.
+    // The find walks the RAW staged table via the shared finder in
+    // NameOnly mode, comparing the full on-disk name bytes.
     let arg_len = config.arg_len as usize;
     let mut found = None;
     if arg_len <= config.arg.len() {
@@ -1614,9 +1615,12 @@ unsafe fn run_delete(
     // writeback ("Update L1 only if addend >= 0"); it is also
     // being freed. Refresh the staged deleted chain here; group C
     // writes back the surviving (refcount > 0) snap-set L2s. The
-    // snap L1 buffer is mutated in place but never written. Found
-    // by the phase 13 differential fuzzer (soak2 iteration 209);
-    // same mechanism as MODE_APPLY's step 10b.
+    // snap L1 buffer is mutated in place but never written. Without
+    // this refresh a surviving snapshot's shared L2 keeps stale
+    // COPIED-clear entries: safe (a spurious COW, never corruption)
+    // but not byte-identical to qemu, as differential fuzzing found
+    // (create a, create b, COW writes, delete a). It is the same
+    // mechanism as MODE_APPLY's step 11.
     {
         let snap_l1_mut = core::slice::from_raw_parts_mut(snap_l1_ptr, snap_l1_bytes);
         if let Err(e) = update_copied_flags_for_l1(
@@ -1706,14 +1710,14 @@ fn count_allocated_l1_entries(l1_bytes: &[u8]) -> usize {
     n
 }
 
-/// MODE_APPLY: the qemu-faithful apply / "goto" (phase 8).
+/// MODE_APPLY: the qemu-faithful apply / "goto".
 ///
 /// Mirrors `qcow2_snapshot_goto` from qemu 10.0.x, adapted to the
 /// staged model. Matching is **ID first, then name** — two FULL
 /// passes over the raw table (`find_snapshot_by_id_or_name`: a
 /// later entry matching by ID beats an earlier entry matching by
-/// name; phase plan fact 2 — the opposite asymmetry from
-/// delete's name-only matcher). Apply rewrites the **active L1
+/// name — the opposite asymmetry from delete's name-only
+/// matcher). Apply rewrites the **active L1
 /// in place**; it never touches the snapshot table or the
 /// header. Write-group ordering (phase plan, Situation):
 ///
@@ -1956,8 +1960,8 @@ unsafe fn run_apply(
     // overflow against the staged refblocks. The dry-run walks
     // from_l1 fully, then to_l1; one closure serves both staged
     // sets by counting calls against the from-chain's allocated
-    // L1 entry count (the same pattern the phase 5 SwapForApply
-    // unit test models).
+    // L1 entry count (the same pattern the snapshot crate's
+    // SwapForApply unit test models).
     {
         let active_l1 = core::slice::from_raw_parts(active_l1_ptr as *const u8, active_l1_bytes);
         let snap_l1 = core::slice::from_raw_parts(snap_l1_ptr as *const u8, snap_l1_bytes);
@@ -2090,7 +2094,7 @@ unsafe fn run_apply(
         }
     }
 
-    // ----- Step 10b: COPIED refresh over the SURVIVING old chain ----------
+    // ----- Step 11: COPIED refresh over the SURVIVING old chain -----------
     // qemu's -1 walk also recomputes COPIED on the OLD active
     // chain's L2 entries (post-decrement == final refcounts) and
     // flushes the dirty L2s whose clusters were NOT freed —
@@ -2115,11 +2119,11 @@ unsafe fn run_apply(
         }
     }
 
-    // ----- Step 11: write group C ------------------------------------------
+    // ----- Step 12: write group C ------------------------------------------
     // All staged refblocks (now carrying the decrements), the
     // refreshed L1 to BOTH locations at their two lengths, the
     // dirty snapshot-set L2s, and the surviving old-active L2s
-    // (refreshed in step 10b; a physical L2 shared by both sets
+    // (refreshed in step 11; a physical L2 shared by both sets
     // is written twice with identical bytes). The freed
     // old-active-only L2s are never written (qemu's
     // cache_discards drops them).
@@ -2165,7 +2169,7 @@ unsafe fn run_apply(
             fail!(SnapshotResult::ERROR_IO);
         }
     }
-    // Surviving old-active L2s (step 10b): write back the staged
+    // Surviving old-active L2s (step 11): write back the staged
     // active-set L2s whose own cluster's final refcount is still
     // non-zero. Freed L2s (refcount 0) are skipped — never
     // written, matching qemu's cache discard.

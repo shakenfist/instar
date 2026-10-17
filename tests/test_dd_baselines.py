@@ -1,4 +1,4 @@
-"""Phase-7c: cross-version baseline tests for ``instar dd``.
+"""Cross-version baseline tests for ``instar dd``.
 
 For each ``DD_CASES`` entry the test:
   1. Creates a fresh fixture with ``qemu-img create -f <input_format>
@@ -21,9 +21,11 @@ Format naming:
   ``_INSTAR_DD_OUTPUT_FORMAT`` at call time. The info_json normaliser
   also uses 'vpc'.
 
-Special case ``1M-raw-count0-vhdx``: instar's empty vhdx is rejected
-by ``qemu-img info`` (known phase-4 limitation). For that case only
-``instar dd`` exit 0 is asserted; the info comparison is skipped.
+Special case ``1M-raw-count0-vhdx``: instar's empty (0-virtual-size)
+vhdx is rejected by ``qemu-img info``, while qemu's own empty vhdx is
+readable. This is a known, still-open limitation (see Future work in
+PLAN-dd.md). For that case only ``instar dd`` exit 0 is asserted; the
+info comparison is skipped.
 
 Known writer divergences (``KNOWN_DD_DIVERGENCES``):
   vhdx whole/windowed cases: instar uses a default block-size of 32 MiB
@@ -36,8 +38,8 @@ Known writer divergences (``KNOWN_DD_DIVERGENCES``):
   documented instar/qemu design differences.
 
 The whole class skips cleanly if the ``dd-info-json`` directory or
-``version-map.json`` is absent (e.g. before the testdata commit from
-step 7b lands).
+``version-map.json`` is absent (e.g. an instar-testdata checkout that
+predates the dd baselines).
 
 ``DD_CASES`` is an exact mirror of the same constant in
 ``instar-testdata/scripts/generate-baselines.py`` — the two must
@@ -161,8 +163,9 @@ KNOWN_DD_DIVERGENCES = {
 # ---------------------------------------------------------------------------
 
 # count=0 -O vhdx: instar's empty vhdx is rejected by qemu-img info
-# (known phase-4 / phase-7 limitation). Assert instar exit 0 only; do
-# not run qemu-img info or compare against the baseline.
+# (known open limitation; qemu's empty vhdx is readable, so the baseline
+# would never match). Assert instar exit 0 only; do not run qemu-img
+# info or compare against the baseline.
 _SKIP_INFO_COMPARE = {'1M-raw-count0-vhdx'}
 
 
@@ -189,11 +192,11 @@ def _qemu_img_info_json(path: str, timeout: int = 30) -> tuple:
 # ---------------------------------------------------------------------------
 
 class TestDdBaselines(InstarTestBase):
-    """Phase-7c: assert instar dd info JSON matches the qemu-img dd baselines.
+    """Assert instar dd info JSON matches the qemu-img dd baselines.
 
     The whole class skips cleanly when the ``dd-info-json`` directory or
-    ``version-map.json`` is absent so the test suite can run before the
-    testdata commit from step 7b lands.
+    ``version-map.json`` is absent, so the test suite can still run
+    against an instar-testdata checkout that predates the dd baselines.
     """
 
     # ----------------------------------------------------------------
@@ -220,7 +223,7 @@ class TestDdBaselines(InstarTestBase):
             self.skipTest(
                 'dd-info-json baselines not present in testdata repo; '
                 'run `make baselines-dd && make profiles` in instar-testdata '
-                'to generate them (PLAN-dd step 7b).'
+                'to generate them.'
             )
 
     # ----------------------------------------------------------------
@@ -354,7 +357,7 @@ def _make_dd_baseline_test(case):
             )
 
         # Special case: count=0 vhdx — instar's empty vhdx is rejected
-        # by qemu-img info (known phase-4 limitation). Assert exit 0 only.
+        # by qemu-img info (known open limitation). Assert exit 0 only.
         if skip_info:
             with (
                 tempfile.NamedTemporaryFile(suffix=in_suffix) as tmp_in,
@@ -450,7 +453,7 @@ def _make_dd_baseline_test(case):
     test.__doc__ = (
         f'instar dd {" ".join(window_operands)} -O {output_format} '
         f'on a {input_size} {input_format} fixture matches the '
-        f'phase-7 baseline.'
+        f'qemu-img dd baseline.'
     )
     return test
 

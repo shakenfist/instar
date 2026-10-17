@@ -1,15 +1,21 @@
 """Integration tests for `instar resize`.
 
-Phase 11 of PLAN-resize.md. Structurally a sibling of
-`test_create.py`'s phase-8 matrix: a top-level `RESIZE_CASES`
-mirror, factory-generated per-(target, case) tests, plus a
-small fixed set of error-path tests pinning the host CLI
-rejection contracts established in phases 8 and 9.
+Structurally a sibling of `test_create.py`'s baseline matrix: a
+top-level `RESIZE_CASES` mirror, factory-generated per-(target,
+case) tests, plus a small fixed set of error-path tests pinning
+the host CLI rejection contracts (argument parsing, shrink and
+preallocation rules, format refusals).
 
-Step 11a (this file's initial commit) ships the parent class,
-the schema-drift tripwire, and the targeted error-path tests.
-The baseline matrix factory + cross-validation + round-trip +
-consistency surfaces land in 11b / 11c.
+The surfaces are a schema-drift tripwire and the cross-version
+baseline matrix (``TestResizeBaselineMatrix``), live
+cross-validation against the system qemu-img
+(``TestResizeCrossValidation``), a create -> resize -> check
+round-trip (``TestResizeRoundTripCheck``), an internal-consistency
+suite for the formats qemu-img cannot resize
+(``TestResizeConsistency``), and the error paths
+(``TestResizeErrorPaths``). ``TestResizeLargeImages`` and
+``TestResizeQemuCreatedImages`` cover large qcow2 images and
+qcow2 images created by qemu-img.
 
 Tests require `/dev/kvm` access for the non-raw paths.
 """
@@ -349,7 +355,7 @@ class TestResizeBaselineMatrix(TestResizeSmoke):
     `qemu-img info --output=json` on the post-resize file, and
     asserts byte-equivalence against the version-matched baseline
     (modulo the divergence whitelist already established by
-    phase 8's create matrix and reused here via
+    the create baseline matrix and reused here via
     `KNOWN_WRITER_DIVERGENCES`).
 
     Bypasses get_output_profiles() and reads the per-target
@@ -515,7 +521,7 @@ def _make_resize_baseline_test(target, case):
     test.__doc__ = (
         f'instar create -f {target} {" ".join(create_opts)} {start_size} '
         f'-> resize {end_spec} (prealloc={prealloc}) matches '
-        f'phase-10 baseline.'
+        f'the qemu-img baseline.'
     )
     return test
 
@@ -535,15 +541,15 @@ for _target, _cases in RESIZE_CASES.items():
 # Surface 6: targeted error-path tests.
 # ----------------------------------------------------------------------
 #
-# Each pins a host CLI rejection contract established in phase 8 or 9.
-# The baseline matrix in 11b skips the shrink-without-flag cases (a
+# Each pins a host CLI rejection contract.
+# The baseline matrix skips the shrink-without-flag cases (a
 # baseline-diff on an error message is too brittle); these tests pin
 # the user-facing stderr substring instead.
 
 class TestResizeErrorPaths(TestResizeSmoke):
-    """Host CLI rejection contracts (phases 8 and 9)."""
+    """Host CLI rejection contracts."""
 
-    # ----------- Shrink-without-flag rejections (phase 8 contract) -----------
+    # ----------- Shrink-without-flag rejections -----------
 
     def test_shrink_without_flag_rejected_raw(self):
         """`instar resize -f raw foo.raw 1M` on a 64M file requires --shrink."""
@@ -580,7 +586,7 @@ class TestResizeErrorPaths(TestResizeSmoke):
             self.assertNotEqual(rc, 0)
             self.assertIn('shrink', stderr.lower())
 
-    # ----------- Invalid size strings (phase 8 parser) -----------
+    # ----------- Invalid size strings -----------
 
     def test_invalid_size_string_empty_rejected(self):
         """Empty size is a CLI parse error (clap rejects)."""
@@ -603,7 +609,7 @@ class TestResizeErrorPaths(TestResizeSmoke):
             self.assertNotEqual(rc, 0,
                                 f'expected nonsense SIZE to fail; stderr={stderr}')
 
-    # ----------- Preallocation rejections (phase 9 contract) -----------
+    # ----------- Preallocation rejections -----------
 
     def test_metadata_on_raw_rejected(self):
         """`-f raw --preallocation metadata` rejected (no metadata to populate)."""
@@ -710,7 +716,7 @@ class TestResizeErrorPaths(TestResizeSmoke):
                 f'qemu-img check failed after refused resize: '
                 f'{r.stdout}{r.stderr}')
 
-    # ----------- --object / --image-opts deferral (phase 8) -----------
+    # ----------- --object / --image-opts deferral -----------
 
     def test_object_flag_rejected(self):
         """`--object` is rejected with the documented deferral message."""
@@ -808,7 +814,7 @@ class TestResizeErrorPaths(TestResizeSmoke):
             _, stderr, rc = self.run_instar_resize(str(parent), '100M')
             self.assertEqual(rc, 0, f'stderr: {stderr!r}')
 
-    # ----------- Phase-1 format-coverage: new-format refusals -----------
+    # ----------- Refusals of bochs, cloop, parallels, QED; DMG as raw -----------
     #
     # `probe_resize_target` (main.rs) header-probes the target with
     # `detect_format_from_header`, so bochs, cloop, and parallels land
@@ -817,8 +823,8 @@ class TestResizeErrorPaths(TestResizeSmoke):
     # koly trailer, and resize's tail probe is hand-rolled for VHD
     # footers only -- there is no DMG-trailer probe wired into resize,
     # so a DMG source is indistinguishable from raw here and resize
-    # succeeds, rewriting it as if it were a raw device. Documents the
-    # phase-1 gap rather than asserting a refusal that does not exist
+    # succeeds, rewriting it as if it were a raw device. Documents that
+    # gap rather than asserting a refusal that does not exist
     # (mirrors the iso quirk pinned for convert/compare/dd).
 
     def _copy_fixture(self, image_id, td, suffix):
@@ -881,15 +887,15 @@ class TestResizeErrorPaths(TestResizeSmoke):
     def test_qed_refused(self):
         """resize refuses a qed-simple target and leaves it byte-unchanged.
 
-        Format-coverage phase 6 keeps QED read-refused as policy (see
-        docs/plans/PLAN-format-coverage-phase-06-qed.md).  QED's
+        instar keeps QED read-refused as deliberate policy (see
+        docs/quirks.md "QED read-refusal as policy").  QED's
         offset-0 header magic is recognised by `probe_resize_target`, so
         it lands in the default arm and is refused before any write.
 
         COSMETIC PIN (as-is, do not normalise): the message renders the
         Rust Debug spelling of the format variant -- capital-Q "Qed" --
         where the chain-gate ops say lowercase "qed".  A wording quirk,
-        not a safety issue; phase 6 pins it rather than touching other
+        not a safety issue; it is pinned rather than touching other
         formats' messages for zero user value.
         """
         with tempfile.TemporaryDirectory() as td:
@@ -939,7 +945,7 @@ class TestResizeCrossValidation(TestResizeSmoke):
     via qemu-img), then `instar info` on both outputs and
     asserts byte-equivalence of the normalised JSONs. Catches
     writer divergences that surface against the *currently
-    installed* qemu-img version rather than the frozen phase-10
+    installed* qemu-img version rather than the frozen baseline
     matrix.
     """
 

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Phase 7e refusal-path checks for `instar snapshot -d`, a sibling
-# of tools/snapshot-create-refusals.sh. Each case must fail
-# (non-zero exit) with a sensible message and leave the image
-# bit-for-bit untouched. Not a committed test — phase 7 validation
-# only.
+# Refusal-path checks for `instar snapshot -d`, a sibling of
+# tools/snapshot-create-refusals.sh. Each case must fail (non-zero
+# exit) with a sensible message and leave the image bit-for-bit
+# untouched. Not a committed test — a manual validation harness
+# written when delete was built.
 set -uo pipefail
 
 INSTAR="${INSTAR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/src/target/release/instar}"

@@ -24,10 +24,9 @@
 //!   header rewrite or the vmdk descriptor rewrite).
 //!
 //! For qcow2 safe mode the write composition (cluster
-//! allocation, refcount staging, L2/L1 patching) lives in
-//! `crates/qcow2-write` + `crates/qcow2-write-exec` since
-//! phase 5 of `PLAN-qcow2-write-infrastructure`; the qcow2
-//! safe context is plain overlay geometry. The vmdk safe
+//! allocation, refcount staging, L2/L1 patching) lives in the
+//! shared `crates/qcow2-write` + `crates/qcow2-write-exec`
+//! engine; the qcow2 safe context is plain overlay geometry. The vmdk safe
 //! context still carries the in-crate grain allocator's staged
 //! state.
 //!
@@ -44,8 +43,8 @@ mod vmdk;
 /// Errors returned by the `plan_rebase_*` family of functions.
 ///
 /// Mirrors the [`shared::RebaseResult::ERROR_*`] numeric codes
-/// where applicable; phase 3 (the rebase guest binary) maps
-/// variants to those codes when reporting back to the host.
+/// where applicable; the rebase guest binary maps variants to
+/// those codes when reporting back to the host.
 /// Additional variants describe planner-internal conditions
 /// that don't have a corresponding wire-level error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1,10 +1,13 @@
 """Normalisation + comparison helpers for `qemu-img info`-shape JSON.
 
-Phase 8 of PLAN-create.md compares JSON produced by two writers
+The create integration tests compare JSON produced by two writers
 (instar create, qemu-img create) read by either parser (instar
-info, qemu-img info). Some fields legitimately diverge between
-runs — random per-invocation IDs, filesystem-dependent block
-counts, absolute paths — and must be excluded before comparison.
+info, qemu-img info); the tests for the other image-writing
+commands (dd, resize, amend, commit, rebase, bitmap) compare
+`qemu-img info` JSON of instar's output the same way. Some fields
+legitimately diverge between runs — random per-invocation IDs,
+filesystem-dependent block counts, absolute paths — and must be
+excluded before comparison.
 
 `normalise_info_json()` is the canonical pre-comparison filter.
 `assert_info_equivalent()` wraps `assertEqual` on the normalised
@@ -79,7 +82,8 @@ def _substitute_path(obj, tmp_path):
     """Recursively replace `filename` fields equalling `tmp_path` with
     the FILENAME_PLACEHOLDER sentinel.
 
-    Matches the baseline-recording convention from phase 7's generator.
+    Matches the convention instar-testdata's baseline generator uses
+    when it records info JSON baselines.
     """
     if isinstance(obj, dict):
         for k, v in obj.items():

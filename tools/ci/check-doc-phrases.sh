@@ -7,15 +7,15 @@
 # PLAN-map into one naming PLAN-m and workap either side of the space.
 # The result reads like a minor typo, not a clear breakage -- a reader
 # skimming the page does not stumble, they just come away slightly
-# confused, so nothing forces a human to notice and report it. Phase 9
-# of PLAN-differencing.md found and fixed seven instances of this in
-# docs/testing.md alone; a further 17 had already spread across five
-# other pages by the time phase 10 went looking, and would have kept
-# spreading silently without something that greps for the pattern on
-# every change. This is that something. (Concrete before/after examples
-# are not reproduced here: doing so would itself match the pattern this
-# script exists to catch. See docs/plans/PLAN-differencing-phase-10-
-# docs.md's decision 4 for real ones.)
+# confused, so nothing forces a human to notice and report it. Seven
+# instances were found and fixed in docs/testing.md alone; a further
+# 17 had already spread across five other pages by the time anyone
+# went looking again, and would have kept spreading silently without
+# something that greps for the pattern on every change. This is that
+# something. (Concrete before/after examples are not reproduced here:
+# doing so would itself match the pattern this script exists to
+# catch. The survey in docs/plans/PLAN-differencing-phase-10-docs.md
+# lists real ones.)
 #
 # Scope is every tracked file except two directories, because the
 # corruption lands in any prose that names a plan file -- CHANGELOG.md

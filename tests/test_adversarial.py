@@ -812,7 +812,7 @@ class TestAdversarialVmdkDescriptor(InstarTestBase):
 
 
 class TestAdversarialDmgManifest(InstarTestBase):
-    """Verify malformed DMG fixtures are handled safely (format-coverage 5).
+    """Verify malformed DMG fixtures are handled safely.
 
     Four fixtures probe the koly-trailer / chunk-table parsing at its
     edges: a trailer cut short (no valid 512-byte block at any candidate
@@ -821,13 +821,12 @@ class TestAdversarialDmgManifest(InstarTestBase):
     source is absent (empty rsrc+XML lengths).  A fifth, dmg-empty-table,
     is the qemu zero-chunk segfault reproducer (valid koly + well-formed
     plist whose single ``<data>`` block decodes with a corrupted mish
-    magic → zero parsed chunks); it is NOT yet registered in the instar
-    manifest (that lands with the 5d testdata commit), so it is exercised
-    by a direct path into the testdata tree.
+    magic → zero parsed chunks); this class reaches it by a direct path
+    into the testdata tree rather than through the manifest.
 
-    Phase 5 graduates DMG to a real read format, so the pre-graduation
-    issue-#444 detect-only gate no longer fires.  The empirical
-    post-graduation convert behaviour, pinned below per fixture, is:
+    DMG is a real read format, so the detect-only refusal gate that
+    issue #444 introduced for unread formats no longer fires for it.  The
+    empirical convert behaviour, pinned below per fixture, is:
 
       dmg-truncated-koly     info reports vsize 0; convert refuses
                              host-side ("input image has zero virtual
@@ -988,7 +987,7 @@ class TestAdversarialDmgManifest(InstarTestBase):
 
 
 class TestAdversarialDmgReaderRefusals(InstarTestBase):
-    """The phase-5 refused DMG fixtures: reader-init refusals (fmt-cov 5e).
+    """DMG fixtures the reader must refuse at init.
 
     Seven fixtures reach the DMG reader (valid koly, non-empty chunk
     source) but must be refused at init for a reason instar names but qemu
@@ -1272,7 +1271,7 @@ class TestAdversarialVdiManifest(InstarTestBase):
 
 
 class TestAdversarialParallelsManifest(InstarTestBase):
-    """Verify malformed Parallels fixtures are refused cleanly (fmt-cov 3).
+    """Verify malformed Parallels fixtures are refused cleanly.
 
     Four fixtures each violate one of qemu's Parallels open-time
     validation rules that the new ``parallels`` crate enforces:
@@ -1396,7 +1395,7 @@ class TestAdversarialParallelsManifest(InstarTestBase):
 
 
 class TestAdversarialQcow1Manifest(InstarTestBase):
-    """Verify malformed QCOW1 fixtures are refused cleanly (fmt-cov 4).
+    """Verify malformed QCOW1 fixtures are refused cleanly.
 
     Five fixtures each violate one of qemu's qcow1 open-time validation
     rules that the new ``qcow1`` crate's ``Qcow1Header::parse`` enforces:
@@ -1418,9 +1417,7 @@ class TestAdversarialQcow1Manifest(InstarTestBase):
     and the info arm falls back to the default/empty result -- detection
     still routes the image to ``qcow`` (magic + version 1 are intact), so
     info prints ``file format: qcow`` with ``virtual size: 0 (0 bytes)``
-    and exits 0 (empirically pinned 2026-07-18; see
-    PLAN-format-coverage-phase-04-qcow1-read.md step 4e, "the info arm
-    parses MORE than magic+version").  This zero virtual size is exactly
+    and exits 0 (empirically pinned 2026-07-18).  This zero virtual size is exactly
     why convert and dd refuse: they surface "input image has zero virtual
     size" rather than a format-detection failure.
 

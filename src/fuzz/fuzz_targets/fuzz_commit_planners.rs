@@ -6,9 +6,8 @@
 //! (`plan_commit_qcow2`, `plan_commit_vmdk`). On every successful
 //! return, asserts context invariants:
 //!
-//! For [`Qcow2CommitContext`] (slimmed to overlay geometry by
-//! phase 4 of `PLAN-qcow2-write-infrastructure` — the backing
-//! refblock staging moved to `crates/qcow2-write`, whose planner
+//! For [`Qcow2CommitContext`] (overlay geometry only — the backing
+//! refblock staging lives in `crates/qcow2-write`, whose planner
 //! has its own fuzz/simulation surface):
 //!
 //!   1. `overlay_entries_per_refblock ==
@@ -43,9 +42,8 @@ use commit::{
 const HEADER_BYTES: usize = 32;
 
 /// Scratch buffer size for the vmdk planner (backing GD + GT
-/// copies plus dirty maps; the qcow2 planner has been pure
-/// geometry since phase 4 and takes no scratch). 8 MiB is well
-/// over the v1 ceiling.
+/// copies plus dirty maps; the qcow2 planner is pure geometry
+/// and takes no scratch). 8 MiB is well over the v1 ceiling.
 const SCRATCH_BYTES: usize = 8 * 1024 * 1024;
 
 thread_local! {

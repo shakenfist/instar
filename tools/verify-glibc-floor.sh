@@ -2,8 +2,8 @@
 # Verify the glibc floor of a built instar release empirically: install
 # the .deb / .rpm on every distribution in the matrix CI and exercise
 # the binary against /dev/kvm. This is the real acceptance gate for the
-# build base (docs/plans/PLAN-distro-matrix-ci-phase-01-glibc-build.md
-# step 1d) -- a nominal "build glibc <= target glibc" is necessary but
+# build base (docs/plans/PLAN-distro-matrix-ci-phase-01-glibc-build.md)
+# -- a nominal "build glibc <= target glibc" is necessary but
 # not sufficient, so we prove the binary actually runs on each distro
 # rather than trusting the version arithmetic.
 #

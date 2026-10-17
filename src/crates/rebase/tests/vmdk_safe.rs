@@ -1,5 +1,5 @@
 //! End-to-end integration tests for the vmdk monolithicSparse
-//! safe-mode rebase planner (step 2e).
+//! safe-mode rebase planner.
 //!
 //! Safe-mode vmdk rebase requires the host to stage the existing
 //! grain directory and any already-allocated grain tables. A

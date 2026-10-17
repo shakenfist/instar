@@ -1,10 +1,10 @@
 //! qcow2 repair planners.
 //!
-//! The leak-reclamation planner (phase 2,
-//! [`reclaim_leaks_in_refblock`]) lives here, alongside the
-//! `use` surface the phase 3 refcount-rebuild + COPIED-reconciliation
-//! planner will draw on. The imports are declared once, up front, so
-//! they are reviewed before the planners that consume them land.
+//! The safe-tier leak-reclamation planner
+//! ([`reclaim_leaks_in_refblock`]) and the lossy-tier refcount
+//! counting/correction and COPIED-reconciliation planners
+//! ([`account_reference_in_map`], [`correct_refcounts_in_refblock`],
+//! [`reconcile_copied_flags_for_l1`]) live here.
 //!
 //! The reused building blocks:
 //! - From `snapshot::qcow2`: the refcount accessors and the
@@ -15,10 +15,10 @@
 //!   `?`-propagation and [`RepairCounters`](crate::RepairCounters)
 //!   for the return tally.
 
-// The refcount accessors and arithmetic are used by the phase-2
-// leak planner and the phase-3 counting/correction primitives
-// below. `update_copied_flags_for_l1` is the snapshot COPIED
-// reconciler that `reconcile_copied_flags_for_l1` wraps. The
+// The refcount accessors and arithmetic are used by the leak
+// planner and the counting/correction primitives below.
+// `update_copied_flags_for_l1` is the snapshot COPIED reconciler
+// that `reconcile_copied_flags_for_l1` wraps. The
 // explicit `SnapshotError` match in `account_reference_in_map`
 // translates the overflow variant itself rather than via the
 // generic `From`.
@@ -28,12 +28,12 @@ use snapshot::qcow2::{
 };
 use snapshot::SnapshotError;
 
-// Phase-4 imports: the metadata-walk orchestration will consume the
-// L1/L2 cluster visitor and decode L1/L2 entries with the on-disk
-// flag/mask constants. The phase-3 planners reuse the snapshot
-// COPIED reconciler, which already decodes those flags internally,
-// so these stay unused for now. Gated to keep the module
-// warning-clean; phase 4 drops the gate as it wires up the walk.
+// The L1/L2 cluster visitor and the on-disk flag/mask constants are
+// not used by the planners: the metadata walk lives in the `check`
+// guest op, and the COPIED reconciler decodes those flags internally.
+// Only `L1_OFFSET_MASK` and `OFLAG_COPIED` are used, by the unit tests
+// (through `use super::*`) to build L1 fixtures; the rest are unused.
+// The `allow` keeps the module warning-clean.
 #[allow(unused_imports)]
 use qcow2::{L1_OFFSET_MASK, L2_OFFSET_MASK, OFLAG_COMPRESSED, OFLAG_COPIED};
 #[allow(unused_imports)]
@@ -56,10 +56,11 @@ use crate::RepairError;
 /// reports *referenced* is never modified, regardless of its stored
 /// refcount — the safe tier never lowers a live cluster's refcount,
 /// even when it is over-counted; correcting an over-count needs a
-/// per-cluster recount and is phase 3's lossy concern.
+/// per-cluster recount, which is the lossy `all` tier's job
+/// ([`correct_refcounts_in_refblock`]).
 ///
 /// `is_referenced` takes the **local** entry index within this
-/// block; the guest (phase 4) maps it to a global cluster index and
+/// block; the guest maps it to a global cluster index and
 /// tests its reference bitmap, keeping this planner ignorant of
 /// global cluster-index math.
 ///
@@ -90,13 +91,20 @@ pub fn reclaim_leaks_in_refblock(
 /// `map` is the caller-staged computed-refcount structure — a second
 /// refcount array held in guest memory, interpreted at the image's
 /// `refcount_bits` width, mirroring qemu's in-memory `refcount_table`
-/// during `qcow2_check_refcounts`. The guest (phase 4) zeroes it,
-/// then calls this once per discovered reference to every cluster
-/// (active L1 -> L2s, each snapshot L1 -> L2s, the refcount table +
-/// blocks, the snapshot table, and the header/L1/refcount clusters
+/// during `qcow2_check_refcounts`. A counting walk zeroes it, then
+/// calls this once per discovered reference to every cluster (active
+/// L1 -> L2s, each snapshot L1 -> L2s, the refcount table + blocks,
+/// the snapshot table, and the header/L1/refcount clusters
 /// themselves). The accumulated map is the *computed* refcount that
 /// [`correct_refcounts_in_refblock`] then reconciles the on-disk
 /// refblocks against.
+///
+/// The `check` guest op does not call this yet. Its `all` tier refuses
+/// images with snapshots or compressed clusters, and within that scope
+/// every valid refcount is 0 or 1, so it derives the computed value
+/// from the detection walk's boolean reference bitmap instead of
+/// staging a count map. This primitive is for a snapshot- and
+/// compression-aware counting walk that would lift that refusal.
 ///
 /// Reads the current computed count, adds 1 via the overflow-checked
 /// [`check_refcount_after_addend`], and writes it back.
@@ -166,13 +174,13 @@ pub enum RefcountFix {
 
 /// Per-refblock tally of refcount corrections, by direction.
 ///
-/// The guest (phase 4) folds these into
+/// The guest folds these into
 /// [`RepairCounters`](crate::RepairCounters): `freed` maps to
 /// `leaks`, and `raised + lowered` to `refcounts`. `freed` is
 /// counted separately from `lowered` because a lowering-to-zero is a
 /// leak discovered by the recount (the cluster is referenced zero
-/// times) rather than by phase 2's boolean predicate, and the guest
-/// reports it under the leak counter.
+/// times) rather than by the safe tier's boolean predicate, and the
+/// guest reports it under the leak counter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RefcountFixTally {
     /// Entries raised toward a higher computed reference count
@@ -206,7 +214,7 @@ pub struct RefcountFixTally {
 /// covered range; it is skipped and left byte-identical (no read, no
 /// write), so a partial map never zeroes uncovered entries.
 ///
-/// This **generalises** phase 2's [`reclaim_leaks_in_refblock`]: a
+/// This **generalises** [`reclaim_leaks_in_refblock`]: a
 /// leak is simply `computed == 0`. Both coexist — the safe (`leaks`)
 /// tier uses the cheap boolean predicate with no count-map memory,
 /// the lossy (`all`) tier uses this count-driven correction, exactly
@@ -250,14 +258,14 @@ pub fn correct_refcounts_in_refblock(
 /// `l2_for_index` / `refcount_for_cluster` closures, and the
 /// `extended_l2` flag unchanged, and maps the returned
 /// `SnapshotError` to [`RepairError`] via the crate's `From` bridge,
-/// keeping the `check` crate the single home for repair entry points
-/// with one error type for phase 4.
+/// keeping the `check` crate the single home for repair entry points,
+/// so the guest handles one error type.
 ///
 /// The COPIED rule — set iff the referenced cluster's refcount == 1,
 /// for both the L1 entry (keyed on the L2-table cluster's refcount)
 /// and each L2 entry (keyed on the data cluster's refcount) — lives
 /// in the already-tested snapshot reconciler and is **not**
-/// reimplemented here. The guest (phase 4) backs `refcount_for_cluster`
+/// reimplemented here. The guest backs `refcount_for_cluster`
 /// with the **corrected** on-disk refcounts, so reconciliation runs
 /// after [`correct_refcounts_in_refblock`].
 ///
@@ -512,7 +520,7 @@ mod tests {
     }
 
     // ============================================================
-    // Phase 3a: account_reference_in_map + correct_refcounts_in_refblock
+    // account_reference_in_map + correct_refcounts_in_refblock
     // ============================================================
 
     /// (3a-1) Repeated accounting accumulates: three references to
@@ -944,7 +952,7 @@ mod tests {
     }
 
     // ============================================================
-    // Phase 3b: reconcile_copied_flags_for_l1
+    // reconcile_copied_flags_for_l1
     // ============================================================
     //
     // Mirrors the snapshot crate's own update_copied_flags_for_l1
@@ -953,7 +961,7 @@ mod tests {
     // (standard) or 16 bytes (extended L2, the second 8 bytes being
     // the subcluster bitmap). Real mutable L2 buffers are threaded
     // through the 'l2 lifetime with a raw-pointer reborrow, the same
-    // pattern the snapshot tests and the phase-4 guest use.
+    // pattern the snapshot tests and the guest op use.
 
     /// (3b-1) COPIED is SET on an L1 entry whose L2-table cluster has
     /// refcount == 1. The L2 closure returns None, so the walk errors

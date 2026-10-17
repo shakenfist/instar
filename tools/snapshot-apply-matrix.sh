@@ -20,8 +20,9 @@
 # `qemu-img compare` against a reference copy taken at snapshot
 # time must report "Images are identical" after a diverged apply.
 #
-# Not a committed test (phase 11 owns that) — this is the phase 8
-# validation harness. Exits non-zero on any failure.
+# Not a committed test (the committed coverage is tests/test_snapshot.py)
+# — this is the manual validation harness written when apply was built.
+# Exits non-zero on any failure.
 set -uo pipefail
 
 INSTAR="${INSTAR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/src/target/release/instar}"
@@ -185,8 +186,8 @@ run_fixture "zero-byte-disk" mk_zero
 # Snapshots: id=1 name="2", id=2 name="x". `-a 2` must apply the
 # snapshot with ID 2 (named "x") under BOTH tools — a later entry
 # matching by ID beats an earlier entry matching by name. The same
-# fixture contrasts `-d 2` (phase 7: name-only) deleting the one
-# NAMED "2".
+# fixture contrasts `-d 2` (delete matches by name only) deleting the
+# one NAMED "2".
 printf '\n=== Precedence: -a 2 applies ID 2; -d 2 deletes the name "2" ===\n'
 rm -f "$WORK"/base.qcow2
 qemu-img create -f qcow2 "$WORK/base.qcow2" 64M >/dev/null 2>&1
@@ -206,7 +207,7 @@ else
 fi
 assert_content_identical "precedence/-a 2" "$WORK/A.qcow2" "$WORK/refx.qcow2"
 # Contrast: -d 2 on the same fixture targets the snapshot NAMED
-# "2" (id 1), the phase 7 name-only behaviour.
+# "2" (id 1), because delete matches by name only.
 cp "$WORK/base.qcow2" "$WORK/D.qcow2"
 "$INSTAR" snapshot -d 2 "$WORK/D.qcow2" >/dev/null 2>&1
 survivors=$(qemu-img snapshot -l "$WORK/D.qcow2" 2>&1 | awk 'NR>2 {print $1":"$2}')

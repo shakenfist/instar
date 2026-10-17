@@ -182,8 +182,7 @@ pub fn write_le_u64(buf: &mut [u8], off: usize, val: u64) {
 /// boundary: it is resolved against an allowlist and opened by the
 /// host. A lossy decoder would manufacture a path that was not in the
 /// image and hand the allowlist something to match on that the image
-/// never contained. See decision 2 of
-/// `docs/plans/PLAN-differencing-phase-03-parse.md`.
+/// never contained.
 pub fn utf16_to_utf8(src: &[u8], big_endian: bool, dst: &mut [u8]) -> Option<usize> {
     if !src.len().is_multiple_of(2) {
         return None;
@@ -721,7 +720,7 @@ pub const ARGON2_MEM_BASE: usize = 0x02000000; // 32 MiB
 /// Maximum sector size supported
 pub const MAX_SECTOR_SIZE: usize = 65536;
 
-/// Guest-side scratch limit for the create operation (phase 2).
+/// Guest-side scratch limit for the create operation.
 ///
 /// The create guest binary statically reserves this many bytes inside
 /// the guest scratch region for the [`MetadataPlan`] returned by
@@ -751,7 +750,7 @@ pub const COMPRESSED_BUF_SIZE: usize = MAX_CLUSTER_SIZE + MAX_SECTOR_SIZE;
 
 /// Summary of source-side allocation as seen by a parser.
 ///
-/// Phase 2 of `PLAN-measure.md` produces this from a parsed source
+/// Each parser's `scan_allocation` produces this from a parsed source
 /// image; the `measure` crate consumes it as input to the per-format
 /// size calculators.
 ///
@@ -761,8 +760,10 @@ pub const COMPRESSED_BUF_SIZE: usize = MAX_CLUSTER_SIZE + MAX_SECTOR_SIZE;
 ///   `allocated_bytes` as `count * block_size` (or similar) must
 ///   cap the product — otherwise the per-format calculators
 ///   surface `MeasureError::InvalidSize` and the user sees
-///   "measure: source image is unsupported format". See
-///   `PLAN-fuzzing-bugs.md` phases 2 and 4.
+///   "measure: source image is unsupported format". Fuzzing found
+///   exactly this overshoot in the qcow2, vhd, vhdx and vmdk scanners
+///   (malformed metadata whose cluster or block counts run past the
+///   virtual size).
 /// * `target_units_with_data <=
 ///   virtual_size.div_ceil(target_unit_size)` when
 ///   `target_unit_size != 0`. The scanner is responsible for
@@ -1294,8 +1295,9 @@ pub struct CallTable {
     /// elapsed is measured from here to receipt of the terminal
     /// [`send_bench_result`](Self::send_bench_result). The trailing
     /// flush (when `flush_interval` divides such that the final
-    /// completion flushes) is **inside** the bracket, per phase 1's
-    /// verified cadence.
+    /// completion flushes) is **inside** the bracket, as it is in
+    /// `qemu-img bench`, whose flush cadence the bench crate
+    /// reproduces exactly.
     ///
     /// [`BenchResult`] **may arrive without a preceding
     /// `BenchStart`**: a validation/probe/parse failure before the
@@ -1636,16 +1638,14 @@ impl CallTable {
     /// Magic value indicating a valid call table
     pub const MAGIC: u32 = 0x494D4147; // "IMAG"
 
-    /// Current ABI version (bumped: PLAN-map phase 2 appended
-    /// `send_map_extent` and `send_map_result` to support the
-    /// streaming-emit shape map needs; PLAN-snapshot phase 1
-    /// appended `send_snapshot_entry`, `send_snapshot_result`,
-    /// and `fsync_input` for the snapshot subcommand and its
-    /// durability checkpoints; PLAN-amend phase 1 appended
-    /// `send_amend_result` for the amend subcommand;
-    /// PLAN-bitmap phase 2 appended `send_bitmap_result` for the
-    /// bitmap subcommand; PLAN-bench phase 2 appended
-    /// `send_bench_start` and `send_bench_result` for the bench
+    /// Current ABI version. Bumped whenever entries are appended;
+    /// the most recent appends, oldest first, were
+    /// `send_map_extent` and `send_map_result` (the streaming-emit
+    /// shape map needs); `send_snapshot_entry`,
+    /// `send_snapshot_result`, and `fsync_input` (the snapshot
+    /// subcommand and its durability checkpoints);
+    /// `send_amend_result` (amend); `send_bitmap_result` (bitmap);
+    /// and `send_bench_start` and `send_bench_result` (the bench
     /// subcommand's timing bracket).
     pub const VERSION: u32 = 20;
 }
@@ -1792,7 +1792,7 @@ pub enum ImageFormat {
     Vdi = 8,
     /// QED format (magic: 0x00444551 "QED\0"). Read-refused by
     /// policy — qemu does not deprecate QED, see docs/quirks.md
-    /// format-coverage phase 6.
+    /// ("QED Read-Refusal Is Policy").
     Qed = 9,
     /// ISO 9660 format (CD/DVD image, magic: "CD001" at offset 0x8001)
     Iso = 10,
@@ -1805,8 +1805,7 @@ pub enum ImageFormat {
     VmdkDescriptor = 12,
     /// Parallels disk image (magic: "WithoutFreeSpace" or
     /// "WithouFreSpacExt" at offset 0, version 2 at offset 16).
-    /// Full read support (convert/compare/dd/bench) since
-    /// PLAN-format-coverage phase 3.
+    /// Full read support (convert/compare/dd/bench).
     Parallels = 13,
     /// Bochs growing disk image (magic: "Bochs Virtual HD Image" /
     /// "Redolog" / "Growing" NUL-terminated fields, version at
@@ -1817,7 +1816,7 @@ pub enum ImageFormat {
     Cloop = 15,
     /// Apple disk image (UDIF), identified by a "koly" trailer near
     /// the end of the file. Full read support (convert/compare/dd/
-    /// bench) since PLAN-format-coverage phase 5.
+    /// bench).
     Dmg = 16,
 }
 
@@ -2956,8 +2955,8 @@ pub struct MapConfig {
     /// Sector size for input I/O (typically 65536).
     pub sector_size: u32,
     /// Number of input devices in the backing chain. Reserved
-    /// for the chain follow-up; phase 2 enforces
-    /// `input_device_count == 1`.
+    /// for chain mode, which is not implemented yet; the map
+    /// guest refuses any `input_device_count` other than 1.
     pub input_device_count: u32,
     /// Start the emission window at this virtual byte offset.
     /// Zero means "start at the beginning of the image".
@@ -3359,13 +3358,14 @@ impl SnapshotResult {
     /// table.
     pub const ERROR_DUPLICATE_NAME: u32 = 4;
     /// A cluster's refcount would exceed `1 << refcount_bits`.
-    /// Caught by the phase 5 dry-run pass.
+    /// Caught by the refcount update's dry-run pass, before any
+    /// refblock is mutated.
     pub const ERROR_REFCOUNT_OVERFLOW: u32 = 5;
     /// Refcount table is full and cannot grow within v1's
     /// bounds.
     pub const ERROR_ALLOCATION_FAILED: u32 = 6;
-    /// Would exceed the in-memory snapshot-table cap (phase 2
-    /// picks the value; qcow2 spec allows up to 65536).
+    /// Would exceed the in-memory snapshot-table cap (16
+    /// snapshots in v1; the qcow2 spec allows up to 65536).
     pub const ERROR_SNAPSHOT_TABLE_FULL: u32 = 7;
     /// Sector read or write failed at the call-table boundary.
     pub const ERROR_IO: u32 = 8;
@@ -3459,10 +3459,10 @@ impl CreateConfig {
     /// Clear this bit explicitly to request qcow2 v2 (compat 0.10).
     pub const FLAG_COMPAT_V3: u32 = 1 << 2;
     /// Flag: backing-file existence/format check should be skipped
-    /// (qemu-img's `-u` / `--backing-unsafe`). Phase 5 wires this up.
+    /// (qemu-img's `-u` / `--backing-unsafe`).
     pub const FLAG_BACKING_UNSAFE: u32 = 1 << 3;
 
-    /// Preallocation mode encoded in flags bits 4-5 (phase 6).
+    /// Preallocation mode encoded in flags bits 4-5.
     /// Mirrors `MeasureConfig::PREALLOC_*`'s layout exactly.
     pub const PREALLOC_MASK: u32 = 0b11 << 4;
     pub const PREALLOC_OFF: u32 = 0 << 4;
@@ -3509,8 +3509,8 @@ pub struct CreateResult {
     /// lengths in the plan).
     pub metadata_bytes_written: u64,
     /// File size after the guest finishes (max byte_offset + len across
-    /// the plan; the host may grow the file beyond this for
-    /// preallocation in phase 6).
+    /// the plan; the host may grow the file beyond this when it
+    /// applies `falloc` / `full` preallocation afterwards).
     pub file_size_after: u64,
     /// Resolved cluster/grain/block size. 0 for raw output.
     pub resolved_unit_size: u32,
@@ -3714,8 +3714,7 @@ impl ResizeConfig {
 
 /// Result structure for the resize operation.
 ///
-/// Passed by the guest into `call_table.send_resize_result` (the
-/// call-table field is added in phase 7).
+/// Passed by the guest into `call_table.send_resize_result`.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ResizeResult {
@@ -3880,8 +3879,7 @@ impl RebaseConfig {
 
 /// Result structure for the rebase operation.
 ///
-/// Passed by the guest into `call_table.send_rebase_result`
-/// (added in phase 1 of `PLAN-rebase-commit`).
+/// Passed by the guest into `call_table.send_rebase_result`.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct RebaseResult {
@@ -3966,24 +3964,27 @@ impl RebaseResult {
     pub const ERROR_INTERNAL_OVERFLOW: u32 = 13;
     /// The overlay has internal snapshots (`nb_snapshots > 0`)
     /// and the rebase is safe-mode (no `-u`), including safe
-    /// detach. Safe mode mutates snapshot-shared L2 tables in
-    /// place and sets refcount=1 on clusters two L1 trees
-    /// reference, so a later `qemu-img snapshot -d` frees live
-    /// active-view data (GitHub issue #421). Refused as an
-    /// interim phase-2 gate; the real fix (snapshot-aware COW)
-    /// lands in phase 7 of `PLAN-qcow2-write-infrastructure`.
-    /// `-u` metadata-only rebase never touches snapshot-shared
-    /// clusters and stays allowed.
+    /// detach. A safe-mode rebase that mutated snapshot-shared
+    /// L2 tables in place and set refcount=1 on clusters two L1
+    /// trees reference would let a later `qemu-img snapshot -d`
+    /// free live active-view data (GitHub issue #421), so this
+    /// was once refused. The rebase op now copies-on-write every
+    /// snapshot-shared cluster it touches, so this code no
+    /// longer fires; it remains only as the defensive mapping for
+    /// `qcow2_write::Gate::HasSnapshots` (codes are append-only,
+    /// never reused). `-u`
+    /// metadata-only rebase never touches snapshot-shared
+    /// clusters.
     pub const ERROR_OVERLAY_HAS_SNAPSHOTS: u32 = 14;
     /// The overlay uses qcow2 features the safe-mode rebase
     /// write envelope does not support: the extended-L2
     /// incompatible bit (16-byte L2 entries the walk would
     /// misread as 8-byte — previously silent corruption), the
     /// zstd compression-type bit, or any unknown incompatible
-    /// bit (the spec requires refusal). Added by phase 5 of
-    /// `PLAN-qcow2-write-infrastructure`
-    /// (`qcow2_write::check_envelope` on the overlay header,
-    /// pre-mutation). `-u` metadata-only rebase only rewrites
+    /// bit (the spec requires refusal). Raised by the
+    /// qcow2-write envelope check on the overlay header
+    /// (`qcow2_write::check_envelope_with`, pre-mutation). `-u`
+    /// metadata-only rebase only rewrites
     /// header/path bytes and stays allowed.
     pub const ERROR_OVERLAY_UNSUPPORTED: u32 = 15;
     /// The overlay's metadata is inconsistent in a way the
@@ -3994,8 +3995,7 @@ impl RebaseResult {
     /// refusal (unknown L1/L2 entry bits, refcount
     /// inconsistencies, snapshot-shared clusters on an image
     /// claiming none). Refused before any image mutation where
-    /// staging detects it. Added by phase 5 of
-    /// `PLAN-qcow2-write-infrastructure`.
+    /// staging detects it.
     pub const ERROR_OVERLAY_INCONSISTENT: u32 = 16;
 
     /// True if magic matches.
@@ -4080,11 +4080,11 @@ impl AmendConfig {
 
 /// Result structure for the amend operation.
 ///
-/// Passed by the guest into `call_table.send_amend_result`
-/// (added in phase 1 of `PLAN-amend`). Carries the action taken,
-/// the resulting version / lazy-refcounts state (so the host can
-/// render the success line and phase-7 baselines can assert the
-/// post-amend state without a second probe), and the error code.
+/// Passed by the guest into `call_table.send_amend_result`.
+/// Carries the action taken, the resulting version /
+/// lazy-refcounts state (so the host can render the success line
+/// and the integration baselines can assert the post-amend state
+/// without a second probe), and the error code.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct AmendResult {
@@ -4122,7 +4122,8 @@ impl AmendResult {
     /// Input is not qcow2 (v1 is qcow2-only).
     pub const ERROR_UNSUPPORTED_FORMAT: u32 = 1;
     /// An unrecognised / unsupported `-o` key reached the guest
-    /// (defence in depth; mostly rejected host-side in phase 4).
+    /// (defence in depth; the host CLI rejects most of these
+    /// before launching the guest).
     pub const ERROR_INVALID_OPTION: u32 = 2;
     /// `compat=0.10` refused because a v3 incompatible feature is
     /// set (`DIRTY`, `CORRUPT`, `EXTERNAL_DATA`, `COMPRESSION`,
@@ -4144,9 +4145,11 @@ impl AmendResult {
     /// `INCOMPAT_DIRTY` is set; refuse to amend an image another
     /// writer may hold open.
     pub const ERROR_DIRTY: u32 = 8;
-    /// The image carries header extension(s) that a v2⇔v3
-    /// transition would have to relocate, and v1 punts. Reserved
-    /// in case phase 2 decides not to implement relocation.
+    /// A v2⇔v3 transition would have to relocate the header
+    /// extensions / backing string past the end of the header
+    /// cluster (or the extension chain is malformed, so the
+    /// relocation cannot be bounded). Relocation within the
+    /// header cluster is supported; v1 refuses anything beyond.
     pub const ERROR_EXTENSION_RELOCATION_UNSUPPORTED: u32 = 9;
     /// A device write back to the header cluster failed.
     pub const ERROR_WRITE_FAILED: u32 = 10;
@@ -4395,16 +4398,16 @@ impl BitmapResult {
 /// Configuration structure for the bench operation.
 ///
 /// Passed by the host into the guest's operation-config region and
-/// cast by the bench guest op (phase 3). Unlike [`BitmapConfig`],
+/// cast by the bench guest op. Unlike [`BitmapConfig`],
 /// bench carries **pure CLI parameters — deliberately no host-probed
 /// image cross-checks**: bench runs on all five input formats and the
 /// guest derives `image_size` from its own format parse, so there is
 /// nothing the host can probe without host-side parsing that the
 /// security model exists to avoid.
 ///
-/// Field additions discovered in later phases must go into
-/// `_reserved`, never reorder existing fields (the host writes the
-/// struct field-by-field at explicit byte offsets in phase 4).
+/// Field additions must go into `_reserved`, never reorder
+/// existing fields (the host writes the struct field-by-field at
+/// explicit byte offsets).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct BenchConfig {
@@ -4518,8 +4521,8 @@ impl BenchResult {
     /// identifying which envelope check refused the image. The host
     /// (`map_bench_error`) renders each id as a short reason:
     ///
-    /// - `0` — the format itself has no write support yet (phase 5a:
-    ///   a non-{raw,qcow2} family reaching the guest under `-w`).
+    /// - `0` — the format itself has no write support (a
+    ///   non-{raw,qcow2} family reaching the guest under `-w`).
     /// - `1` — qcow2 `refcount_bits != 16` (only 16-bit is supported).
     /// - `2` — qcow2 compression feature set, or an unknown
     ///   incompatible-features bit beyond the ones bench recognises
@@ -4536,20 +4539,20 @@ impl BenchResult {
     /// The bench guest op mirrors these ids in its `wgate` const block;
     /// the two lists must stay in sync.
     pub const ERROR_WRITE_UNSUPPORTED: u32 = 7;
-    /// A qcow2 allocating write could not obtain a free cluster because
-    /// the refcount table is full and v1 never grows it (the host
-    /// renders "image too large for in-place bench write"). Unused until
-    /// the 5b allocating-write path exists.
+    /// A qcow2 allocating write could not obtain a free cluster: the
+    /// refcount table is full even after preemptive refcount growth,
+    /// or the growth envelope itself overflowed (the host renders
+    /// "image too large for in-place bench write").
     pub const ERROR_ALLOC_EXHAUSTED: u32 = 8;
     /// The qcow2 write planner (`crates/qcow2-write`) refused a cluster
     /// as internally inconsistent: an unknown L1/L2 entry bit pattern
     /// (including the v3 all-zeroes flag — issue #432 territory), a
     /// staged-refcount inconsistency, missing refcount coverage, a
     /// staging mismatch, or a defensive backing-fill refusal after the
-    /// op's copy-on-write resubmit. Appended by phase 6 step 6b
-    /// (`PLAN-qcow2-write-infrastructure-phase-06-bench.md`, decision 6)
-    /// for the crate classification refusals bench had no prior
-    /// rendering for. The host renders "image metadata is inconsistent".
+    /// op's copy-on-write resubmit. Appended when bench moved onto
+    /// the qcow2-write crate, for the crate classification refusals
+    /// bench had no prior rendering for. The host renders "image
+    /// metadata is inconsistent".
     pub const ERROR_IMAGE_INCONSISTENT: u32 = 9;
 
     /// True if magic matches.
@@ -4626,8 +4629,7 @@ impl CommitConfig {
 
 /// Result structure for the commit operation.
 ///
-/// Passed by the guest into `call_table.send_commit_result`
-/// (added in phase 1 of `PLAN-rebase-commit`).
+/// Passed by the guest into `call_table.send_commit_result`.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct CommitResult {
@@ -4709,43 +4711,45 @@ impl CommitResult {
     /// host or guest bug, not a malformed image.
     pub const ERROR_INTERNAL_OVERFLOW: u32 = 13;
     /// The backing file has internal snapshots
-    /// (`nb_snapshots > 0`). v1 commit writes into the backing
-    /// without COWing snapshot-shared clusters or L2 tables, so
-    /// proceeding would silently corrupt the snapshots (GitHub
-    /// issue #420). Refused as an interim phase-2 gate; the
-    /// real fix (COW into the backing) lands in phase 7 of
-    /// `PLAN-qcow2-write-infrastructure`.
+    /// (`nb_snapshots > 0`). A commit that wrote into the
+    /// backing without COWing snapshot-shared clusters or L2
+    /// tables would silently corrupt the snapshots (GitHub
+    /// issue #420), so this was once refused. The commit op now
+    /// copies-on-write into the backing, so this code no longer
+    /// fires; it remains only as the defensive mapping for
+    /// `qcow2_write::Gate::HasSnapshots` (codes are append-only,
+    /// never reused).
     pub const ERROR_BACKING_HAS_SNAPSHOTS: u32 = 14;
     /// The overlay has internal snapshots (`nb_snapshots > 0`).
     /// The post-commit overlay-clear pass zeroes active L2
     /// entries and decrements the data clusters they reference
     /// without accounting for the snapshot's reference, leaving
     /// snapshot-shared clusters at `refcount=0 reference=1`
-    /// (proven by the phase-2 step-2a parity test; qemu-img
-    /// stays check-clean on the same shape). This is the
-    /// overlay-side sibling of issue #420 (issue #423).
-    /// Refused as an interim phase-2 gate; the real fix
-    /// (snapshot-aware refcounting) lands in phase 7 of
-    /// `PLAN-qcow2-write-infrastructure`.
+    /// (proven by a parity test against qemu-img, which stays
+    /// check-clean on the same shape). This is the overlay-side
+    /// sibling of issue #420 (issue #423), and was once refused.
+    /// The commit op now skips the clear pass when the overlay
+    /// carries snapshots, preserving them as qemu-img does, and
+    /// no longer emits this code; it is kept because codes are
+    /// append-only, never reused.
     pub const ERROR_OVERLAY_HAS_SNAPSHOTS: u32 = 15;
     /// The backing file's header carries feature bits the
     /// commit write envelope does not support: the zstd
     /// compression-type bit or any unknown incompatible bit
     /// (`qcow2_write::Gate::UnknownIncompatible`). The qcow2
     /// spec requires refusing unknown incompatible bits; commit
-    /// previously proceeded in violation of the spec (phase-4
-    /// divergence D1 of
-    /// `PLAN-qcow2-write-infrastructure-phase-04-commit`).
-    /// Refused before any staging or mutation.
+    /// previously proceeded in violation of the spec. Refused
+    /// before any staging or mutation.
     pub const ERROR_BACKING_UNSUPPORTED: u32 = 16;
     /// The backing file's metadata is inconsistent as a write
     /// substrate: a sparse (non-contiguous) refcount table,
     /// reserved bits in refcount-table/L1/L2 entries,
     /// snapshot-shared or refcount-zero clusters on an image
     /// whose header says `nb_snapshots == 0`, or refcounts
-    /// outside the staged refblock set (phase-4 divergences
-    /// D3/D4). Staging-time refusals (the sparse-RT gate — a
-    /// live corruption before phase 4) leave the backing
+    /// outside the staged refblock set. Staging-time refusals
+    /// (the sparse-RT gate — a sparse refcount table was a live
+    /// corruption before commit moved onto qcow2-write, GitHub
+    /// issue #428) leave the backing
     /// byte-untouched; mid-loop classification refusals leave
     /// previously committed cluster data in place, the same
     /// posture as [`Self::ERROR_REFCOUNT_EXHAUSTED`].
@@ -5539,12 +5543,11 @@ mod tests {
 
     #[test]
     fn rebase_result_error_codes_distinct() {
-        // Phase 3 added codes 7..=13; the phase-2 snapshot gate
-        // (issue #421) added 14; phase 5 of
-        // PLAN-qcow2-write-infrastructure added the overlay
-        // classification codes 15 and 16. Confirm every code is
-        // distinct so the host's match arms don't accidentally
-        // alias.
+        // Codes 0..=13 are the planner and guest refusals, 14 the
+        // snapshot gate (issue #421), and 15 and 16 the
+        // qcow2-write overlay classification codes. Confirm every
+        // code is distinct so the host's match arms don't
+        // accidentally alias.
         let codes = [
             RebaseResult::ERROR_OK,
             RebaseResult::ERROR_UNSUPPORTED_FORMAT,
@@ -5615,13 +5618,11 @@ mod tests {
 
     #[test]
     fn commit_result_error_codes_distinct() {
-        // Phase 7 step 7a added codes 8..=13; the phase-2
-        // snapshot gates added 14 (backing, issue #420) and 15
-        // (overlay, issue #423); phase 4 of
-        // PLAN-qcow2-write-infrastructure added the backing
-        // classification codes 16 and 17. Confirm every code is
-        // distinct so the host's match arms don't accidentally
-        // alias.
+        // Codes 0..=13 are the planner and guest refusals, 14 and
+        // 15 the snapshot gates (backing, issue #420; overlay,
+        // issue #423), and 16 and 17 the qcow2-write backing
+        // classification codes. Confirm every code is distinct so
+        // the host's match arms don't accidentally alias.
         let codes = [
             CommitResult::ERROR_OK,
             CommitResult::ERROR_UNSUPPORTED_FORMAT,
@@ -5746,8 +5747,8 @@ mod tests {
 
     #[test]
     fn amend_result_error_codes_distinct() {
-        // Phase 1 defines codes 0..=12. Confirm every code is
-        // distinct and contiguously numbered.
+        // Codes 0..=12. Confirm every code is distinct and
+        // contiguously numbered.
         let codes = [
             AmendResult::ERROR_OK,
             AmendResult::ERROR_UNSUPPORTED_FORMAT,
@@ -5876,8 +5877,9 @@ mod tests {
 
     #[test]
     fn bench_result_error_codes_distinct() {
-        // Phase 2 defines codes 0..=6; phase 5 appends 7..=8; phase 6
-        // step 6b appends 9. Confirm every code is distinct and
+        // Codes 0..=6 are the config, parse and I/O refusals, 7..=8
+        // the write-test refusals, and 9 the qcow2-write
+        // classification refusal. Confirm every code is distinct and
         // contiguously numbered.
         let codes = [
             BenchResult::ERROR_OK,
@@ -5998,9 +6000,8 @@ mod tests {
 
     #[test]
     fn bitmap_result_error_codes_distinct() {
-        // Phase 2 defines codes 0..=17; phase 3 appends 18 and 19.
-        // Confirm every code is distinct and contiguously numbered
-        // (append-only).
+        // Codes 0..=19. Confirm every code is distinct and
+        // contiguously numbered (append-only).
         let codes = [
             BitmapResult::ERROR_OK,
             BitmapResult::ERROR_UNSUPPORTED_FORMAT,
@@ -6656,15 +6657,10 @@ mod tests {
 
     #[test]
     fn call_table_version_is_twenty() {
-        // PLAN-snapshot phase 1 bumped the call-table ABI from
-        // 16 to 17 by appending `send_snapshot_entry`,
-        // `send_snapshot_result`, and `fsync_input`.
-        // PLAN-amend phase 1 bumps 17 to 18 by appending
-        // `send_amend_result`.
-        // PLAN-bitmap phase 2 bumps 18 to 19 by appending
-        // `send_bitmap_result`.
-        // PLAN-bench phase 2 bumps 19 to 20 by appending
-        // `send_bench_start` and `send_bench_result`.
+        // Version 17 appended `send_snapshot_entry`,
+        // `send_snapshot_result`, and `fsync_input`; 18 appended
+        // `send_amend_result`; 19 appended `send_bitmap_result`;
+        // 20 appended `send_bench_start` and `send_bench_result`.
         assert_eq!(CallTable::VERSION, 20);
     }
 
@@ -6955,9 +6951,8 @@ mod tests {
 
     // ------------------------------------------------------------------
     // decode_utf16_field_nul_terminated / write_nul_terminated
-    // (differencing phase 4, step 4c: moved out of `operations/info`
-    // so they run as part of this crate's suite -- see
-    // docs/plans/PLAN-differencing-phase-04-read-policy.md)
+    // (these live here rather than in `operations/info` so they run
+    // as part of this crate's host-side test suite)
     // ------------------------------------------------------------------
 
     #[test]
@@ -7115,7 +7110,7 @@ mod tests {
 
     #[test]
     fn utf16_to_utf8_refuses_conflicting_fixture_mac_blob() {
-        // The 25-byte `Mac ` platform locator blob from the phase 2
+        // The 25-byte `Mac ` platform locator blob from the test
         // fixture vhd-diff-locator-conflicting.vhd. It exists to be
         // undecodable: a lossy decoder would turn that fixture into a
         // silent pass, so this test is what proves the decoder honours

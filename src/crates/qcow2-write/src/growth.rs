@@ -1,23 +1,23 @@
 //! Preemptive refcount-growth planning (pure arithmetic).
 //!
-//! Moved verbatim from `crates/bench` by phase 6 step 6a of
-//! `docs/plans/PLAN-qcow2-write-infrastructure-phase-06-bench.md`
-//! (settled decision 1), generalizing bench's growth planner
-//! into this shared crate — the master plan's mission item 3
-//! (`docs/plans/PLAN-qcow2-write-infrastructure.md`). The
-//! algorithm, growth layout, and refusal envelope are specified
-//! by `docs/plans/PLAN-bench-refcount-growth.md`.
+//! This planner began in `crates/bench` and was moved here
+//! verbatim, so that every qcow2 writer (bench, commit, rebase)
+//! sizes refcount growth with the same arithmetic instead of
+//! each op carrying its own. The algorithm, growth layout, and
+//! refusal envelope are described in
+//! `docs/qcow2/qcow2-write-planner.md` ("Refcount growth").
 //!
 //! Like the rest of this crate the module is pure and I/O-free:
 //! [`plan_refcount_growth`] is saturating `u64` arithmetic over
 //! caller-supplied geometry and staging caps — no call-table
 //! types and no guest addresses. The imperative growth
 //! *execution* (write order, the data-first/fsync/header-flip
-//! dance, freeing the old refcount table) stays with the
-//! consumer (`src/operations/bench`), as does the schedule-
-//! coupled worst-case bound: callers pass the computed
-//! `worst_case_new_clusters` number across this boundary
-//! (bench derives it via its `worst_case_touched`).
+//! dance, freeing the old refcount table) lives in
+//! `qcow2_write_exec::growth`, and the worst-case bound stays
+//! with each consumer because it depends on that op's write
+//! pattern: callers pass the computed `worst_case_new_clusters`
+//! number across this boundary (bench derives it via its
+//! schedule-coupled `worst_case_touched`).
 
 /// A refcount growth request that exceeds the guest's staging budget (or
 /// carries degenerate geometry — `entries_per_refblock == 0` or
@@ -91,8 +91,9 @@ pub struct RefcountGrowthPlan {
 /// terminate with [`GrowthOverflow`] instead of looping.
 const GROWTH_FIXED_POINT_ROUNDS: u32 = 8;
 
-/// Plan the preemptive refcount growth for a bench write run (phase 01
-/// of `docs/plans/PLAN-bench-refcount-growth.md`). Pure saturating u64
+/// Plan the preemptive refcount growth for a write run (bench, or
+/// commit/rebase copy-on-write), sized before the first write so the run
+/// can never exhaust refcount coverage part-way. Pure saturating u64
 /// arithmetic; no I/O and no panics on any input.
 ///
 /// Inputs:
@@ -238,7 +239,7 @@ pub fn plan_refcount_growth(
 #[cfg(test)]
 mod tests {
     //! Unit tests for [`plan_refcount_growth`], relocated verbatim from
-    //! `crates/bench` (phase 6 step 6a — see the module docs). Pure
+    //! `crates/bench` with the planner (see the module docs). Pure
     //! arithmetic — host-only, no KVM or testdata required.
     use super::*;
 
@@ -377,7 +378,7 @@ mod tests {
         // — which stays in `crates/bench`, where
         // touched_wrap_whole_image_matrix pins exactly these data/L2
         // caps for these image/cs combos (the cross-check that lived in
-        // this test before the phase-6 step-6a move). file_end=5
+        // this test while the planner was in `crates/bench`). file_end=5
         // clusters, populated=1, rt_capacity = cs/8 (a one-cluster RT).
         //
         // Hand computations (epb = cs/2; base_end = 5 + worst_new):
@@ -523,9 +524,9 @@ mod tests {
 
     #[test]
     fn growth_invariants_over_grid() {
-        // The four phase-01 invariants, property-style over a seedless
-        // parameter grid (worst_case_new_clusters iterated ascending so
-        // monotonicity is checked pairwise):
+        // The planner's four correctness invariants, property-style
+        // over a seedless parameter grid (worst_case_new_clusters
+        // iterated ascending so monotonicity is checked pairwise):
         //   1. self-coverage: every new-structure cluster index is below
         //      needed_slots * epb;
         //   2. worst_end_clusters >= file_end + worst_new;

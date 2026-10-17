@@ -2,10 +2,10 @@
 //!
 //! `merge` OR-s a source bitmap's set bits into a destination bitmap.
 //! The *data-cluster orchestration* (reading/OR-ing/allocating data
-//! clusters) is Phase-4 guest code that performs I/O and is untestable
-//! here (Open question 4) — the bits-set round-trip is a Phase-7
-//! integration test. This file therefore covers only the crate's pure,
-//! public functions:
+//! clusters) is guest-op code that performs I/O and is untestable here
+//! — the bits-set round-trip is covered by the Python integration
+//! suite (`tests/test_bitmap.py`). This file therefore covers only the
+//! crate's pure, public functions:
 //!
 //! - [`merge_validate`](bitmap::merge::merge_validate) — the six
 //!   validation outcomes, driven off a real staged directory built with

@@ -317,9 +317,9 @@ jobs:
 
       # A bad automated replace once spliced the word "work" into plan
       # filenames named in doc prose, and the result reads like a typo
-      # rather than a break -- phase 9 fixed seven instances, and 17
-      # more had already spread before anything looked. Pure text
-      # parsing: no docker, no cargo, no testdata.
+      # rather than a break -- one sweep fixed seven instances in
+      # docs/testing.md, and 17 more had already spread before anything
+      # looked. Pure text parsing: no docker, no cargo, no testdata.
       - name: Check for mangled plan-filename phrases
         run: tools/ci/check-doc-phrases.sh
 
@@ -687,8 +687,7 @@ jobs:
   # Deliberately NOT on `xl`. This job runs `make instar && make package`
   # -- a docker build and two packaging steps, with no VM, no KVM and no
   # test suite -- which is the same class of work `build-and-test` does
-  # on `s`. It sat on `xl` only because step 4b of
-  # PLAN-distro-matrix-ci-phase-04-workflow.md told it to copy
+  # on `s`. It sat on `xl` only because it was written by copying
   # `package-smoke`'s preamble, and the runner label came along with the
   # paste.
   #

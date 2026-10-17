@@ -7,19 +7,24 @@
 //! `MetadataPlan`, then writes every plan entry to the output device.
 //! Emits a `CreateResult` at completion describing what was written.
 //!
+//! Preallocation is split with the host: for qcow2 with a non-off
+//! mode the guest also emits the L2 tables and extends the file to
+//! its post-preallocation size, but leaves the data region sparse;
+//! the host's `apply_preallocation` pass materialises it for falloc
+//! and full modes.
+//!
 //! Out of scope:
-//!  - Preallocation modes (phase 6 handles host-side).
 //!  - Backing-chain composition beyond a single immediate backing
 //!    (matches qemu-img — only the immediate parent reference is
 //!    recorded; the runtime opener resolves the chain).
 //!  - LUKS / encryption.
 //!
-//! Phase 5 added VHDX-as-backing virtual_size extraction via
+//! A VHDX backing file's virtual_size is extracted via
 //! `vhdx::VhdxState::init`.
 //!
 //! Raw output short-circuits: the guest emits no writes (the host
-//! ftruncates in phase 3); a defensive invocation returns a success
-//! `CreateResult` with metadata_bytes_written = 0.
+//! creates raw output itself with ftruncate); a defensive invocation
+//! returns a success `CreateResult` with metadata_bytes_written = 0.
 
 #![no_std]
 #![no_main]
@@ -676,8 +681,9 @@ fn target_can_address(target: ImageFormat, virtual_size: u64, config: &CreateCon
 /// a time. Returns the total bytes written or `None` on I/O failure.
 ///
 /// Every `byte_offset` in the plan is sector-aligned and every
-/// `bytes.len()` is a multiple of 512 by construction (see phase 1's
-/// per-format layouts); a debug_assert guards each call.
+/// `bytes.len()` is a multiple of 512 by construction (the
+/// `crates/create` planners lay every structure out on 512-byte
+/// boundaries); a debug_assert guards each call.
 ///
 /// # Safety
 ///
@@ -724,7 +730,7 @@ unsafe fn write_plan(call_table: &CallTable, plan: &MetadataPlan<'_>) -> Option<
 ///   the virtual size was resolved.)
 ///
 /// These invariants hold by construction of the host-side VMM
-/// (phase 3 wires `run_create`); no other caller is architecturally
+/// (`run_create` sets them up); no other caller is architecturally
 /// possible.
 #[no_mangle]
 pub unsafe extern "C" fn _start() -> u64 {
@@ -1176,8 +1182,9 @@ unsafe fn emit_qcow2_l2_and_extend(
 
     // Extend the file: write a zero sector at file_size_after -
     // sector_size so the file reaches the post-preallocation size.
-    // The data region itself is sparse here; the host fill_zeros
-    // pass in step 6c materialises it for falloc / full modes.
+    // The data region itself is sparse here; the host's
+    // apply_preallocation pass materialises it for falloc / full
+    // modes.
     if file_size_after > 0 {
         let zero_sector =
             core::slice::from_raw_parts_mut(CREATE_SCRATCH as *mut u8, output_sector_size);

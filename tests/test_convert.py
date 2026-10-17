@@ -3610,14 +3610,15 @@ class TestConvertVhdToRaw(InstarTestBase):
 
 
 class TestConvertParallelsToRaw(InstarTestBase):
-    """Smoke test for Parallels to raw conversion (format-coverage phase 3).
+    """Parallels to raw conversion parity.
 
-    Pins the graduation of Parallels from a detect-only refusal to a real
-    read format: converting the parallels-v1 ('WithoutFreeSpace') and
+    Pins Parallels as a real read format rather than a detect-only
+    refusal: converting the parallels-v1 ('WithoutFreeSpace') and
     parallels-v2 ('WithouFreSpacExt') fixtures to raw with instar must be
     byte-identical to qemu-img convert.  Both magics are covered so the
-    per-magic off_multiplier path is exercised; the full safe-fixture
-    matrix (data-v1/v2, cluster-4k, inuse, past-eof) lands in step 3e.
+    per-magic off_multiplier path is exercised; the rest of the class is
+    the full safe-fixture matrix (data-v1/v2, cluster-4k, inuse,
+    past-eof) plus parity through non-raw output formats.
     """
 
     def setUp(self):
@@ -3672,8 +3673,8 @@ class TestConvertParallelsToRaw(InstarTestBase):
         self._assert_convert_parity('parallels-v2')
 
     # ------------------------------------------------------------------
-    # Step 3e: full safe-fixture convert matrix (five new ids; v1/v2 are
-    # pinned by the 3c smokes above).  Each fixture pins a verified
+    # Full safe-fixture convert matrix (five more ids; v1/v2 are pinned
+    # by the smoke tests above).  Each fixture pins a verified
     # Parallels read semantic and must be byte-identical to qemu-img
     # convert (using the suite's own qemu-img, so the qemu 8.1.x
     # past-EOF-open regression window is not in play):
@@ -3734,7 +3735,7 @@ class TestConvertParallelsToRaw(InstarTestBase):
         self._assert_convert_parity('parallels-cluster-4k')
 
     # ------------------------------------------------------------------
-    # Step 3e: Parallels read validated through non-raw output formats.
+    # Parallels read validated through non-raw output formats.
     #
     # Convert parallels-data-v2 with instar to qcow2 / vpc, flatten the
     # instar output back to raw with qemu-img, and compare against the
@@ -3891,7 +3892,7 @@ class TestConvertParallelsToRaw(InstarTestBase):
 
 
 class TestConvertQcow1ToRaw(InstarTestBase):
-    """Full QCOW1 ('qcow' v1) convert matrix (format-coverage phase 4).
+    """Full QCOW1 ('qcow' v1) convert matrix.
 
     Pins the graduation of qcow1 from a misdetect-as-qcow2 refusal to a
     real read format: every safe fixture must convert byte-identically to
@@ -4258,12 +4259,13 @@ class TestConvertQcow1ToRaw(InstarTestBase):
 
 
 class TestConvertVdiToRaw(InstarTestBase):
-    """Smoke test for VDI to raw conversion (format-coverage phase 2).
+    """VDI to raw conversion parity.
 
-    Pins the graduation of VDI from a detect-only refusal to a real read
-    format: converting the aligned vdi-simple fixture to raw with instar
-    must be byte-identical to qemu-img convert.  The full safe-fixture
-    matrix (data/static/odd-size/past-eof) is covered in step 2e.
+    Pins VDI as a real read format rather than a detect-only refusal:
+    converting the aligned vdi-simple fixture to raw with instar must be
+    byte-identical to qemu-img convert.  The rest of the class is the
+    full safe-fixture matrix (data/static/odd-size/past-eof) plus parity
+    through non-raw output formats.
     """
 
     def test_convert_vdi_simple(self):
@@ -4305,7 +4307,7 @@ class TestConvertVdiToRaw(InstarTestBase):
             )
 
     # ------------------------------------------------------------------
-    # Step 2e: full safe-fixture convert matrix.
+    # Full safe-fixture convert matrix.
     #
     # vdi-data-dynamic pins the non-identity block map plus a
     # discarded-block zero-fill; vdi-static-data pins the static
@@ -4383,7 +4385,7 @@ class TestConvertVdiToRaw(InstarTestBase):
         self._test_vdi_convert('vdi-bmap-past-eof')
 
     # ------------------------------------------------------------------
-    # Step 2e: VDI read validated through non-raw output formats.
+    # VDI read validated through non-raw output formats.
     #
     # Convert vdi-data-dynamic with instar to qcow2 / vpc, flatten the
     # instar output back to raw with qemu-img, and compare against the
@@ -5060,8 +5062,8 @@ class TestConvertSnapshot(InstarTestBase):
         (content 0xAA) and id=2 name="x" (content 0xBB);
         extracting snapshot "2" must yield ID 2's 0xBB content,
         matching ``qemu-img convert -l 2``. Regression test for
-        the PLAN-snapshot phase 14 two-pass ``find_snapshot``
-        fix (probe 1).
+        a single-pass ``find_snapshot`` that returned the first
+        ID-or-name match and so picked ID 1 here.
         """
         if shutil.which('qemu-io') is None:
             self.skipTest('qemu-io not available')
@@ -6439,15 +6441,15 @@ class TestConvertVhdxBlockSize(InstarTestBase):
 
 
 class TestConvertDmgToRaw(InstarTestBase):
-    """DMG (Apple UDIF) convert-to-raw byte parity (format-coverage phase 5).
+    """DMG (Apple UDIF) convert-to-raw byte parity.
 
-    Pins the graduation of dmg from the issue-#444 detect-only gate to a
-    real read format.  dmg-simple is a 4 MiB UDIF image with two
+    Pins dmg as a real read format rather than an issue-#444 detect-only
+    refusal.  dmg-simple is a 4 MiB UDIF image with two
     zlib-wrapped UDZO chunks (chunk 0 covers [0, 2 MiB), chunk 1 covers
     [2 MiB, 4 MiB)); instar convert-to-raw must reproduce qemu-img
     convert byte-for-byte.  The fixture carries a ``.dmg`` extension so
-    unforced qemu-img probes it as dmg (qemu's dmg probe is filename-only,
-    per the phase-5 plan).  Modelled on TestConvertQcow1ToRaw's parity
+    unforced qemu-img probes it as dmg (qemu's dmg probe is filename-only).
+    Modelled on TestConvertQcow1ToRaw's parity
     smoke, but reads the manifest fixture directly since DMGs cannot be
     created locally (only the testdata generator builds them).
     """
@@ -6647,8 +6649,8 @@ class TestConvertDmgToRaw(InstarTestBase):
 
         The koly SectorCount (16) exceeds the mish coverage (8 sectors), so
         the tail is an uncovered gap.  DMG reads ERROR on a gap rather than
-        zero-filling (the phase-5 EIO-parity semantic), so convert fails on
-        both sides -- but the messages differ: qemu emits ``error while
+        zero-filling (instar deliberately matches qemu's EIO there), so
+        convert fails on both sides -- but the messages differ: qemu emits ``error while
         reading ... Input/output error`` while instar surfaces the generic
         ``convert operation failed``.  This is an error-parity fixture, not
         a byte-parity one; only the non-zero exit and clean termination are
@@ -6679,8 +6681,8 @@ class TestConvertDmgToRaw(InstarTestBase):
     def test_convert_dmg_extensionless_divergence(self):
         """Extensionless DMG: qemu probes raw, instar detects via trailer.
 
-        qemu's dmg probe is purely the ``.dmg`` filename extension (phase-5
-        plan, "Probe"): an extensionless copy of dmg-simple is probed as
+        qemu's dmg probe is purely the ``.dmg`` filename extension: an
+        extensionless copy of dmg-simple is probed as
         RAW by an unforced ``qemu-img convert`` -- its output is the whole
         container copied verbatim (11747 bytes, sector-rounded up to 11776),
         NOT the 4 MiB decoded disk.  instar's detection is trailer-based and
@@ -6869,9 +6871,8 @@ class TestConvertDetectOnlyRefusal(InstarTestBase):
         """convert refuses a cloop-simple input with the typed message."""
         self._assert_refused('cloop-simple', 'cloop')
 
-    # NOTE: dmg is no longer refused here.  Format-coverage phase 5
-    # graduates DMG (Apple UDIF) to a real read format: the chain
-    # discovery variant now maps "dmg" to a reader arm, so convert reads
+    # NOTE: dmg is not refused here.  DMG (Apple UDIF) is a real read
+    # format: the chain discovery variant maps "dmg" to a reader arm, so convert reads
     # it byte-for-byte instead of gating it.  The convert byte-parity
     # smoke lives in TestConvertDmgToRaw below.
 

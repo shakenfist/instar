@@ -1,10 +1,9 @@
 //! Directory-level byte helpers for the qcow2 bitmaps directory.
 //!
-//! Templated on `snapshot::table`, these functions locate, build,
-//! and rewrite bitmap directory entries and serialize the bitmaps
-//! extension body, reusing the Phase 1 entry codec in
-//! [`qcow2::bitmap`]. They are `no_std`, panic-free, and
-//! bounds-checked.
+//! Templated on `snapshot::table`, these functions locate, build, and
+//! rewrite bitmap directory entries and serialize the bitmaps
+//! extension body, reusing the entry codec in [`qcow2::bitmap`]. They
+//! are `no_std`, panic-free, and bounds-checked.
 //!
 //! The bitmap directory is a sequence of variable-length entries
 //! packed back-to-back. Each entry occupies

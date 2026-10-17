@@ -1,8 +1,8 @@
 //! qcow2 snapshot mutator primitives.
 //!
-//! Pure functions over caller-staged byte slices. No I/O. The
-//! phase 5 mission is to land the eight building blocks the
-//! phase 6-8 per-mode planners will compose:
+//! Pure functions over caller-staged byte slices. No I/O. These
+//! are the building blocks the snapshot guest op's create, delete
+//! and apply modes compose:
 //!
 //! 1. [`read_refcount_in_block`] — scalar refcount read.
 //! 2. [`set_refcount_in_block`] — scalar refcount write (lifted
@@ -886,7 +886,7 @@ where
 /// op's addend(s). `refblocks` is immutable — the borrow makes the
 /// no-mutation guarantee structural.
 ///
-/// MODE_DELETE (phase 7) calls this *before any disk write* so a
+/// MODE_DELETE calls this *before any disk write* so a
 /// corrupt image (a chain cluster whose decrement would
 /// underflow) fails with the file untouched; the later full
 /// [`update_snapshot_refcount`] call's internal dry-run is then a
@@ -2496,11 +2496,12 @@ mod tests {
         assert_eq!(refblocks, snapshot);
     }
 
-    // ---- L2-table refcount coverage (phase 6b, open question 2) ----
+    // ---- L2-table refcount coverage ----
     //
-    // These tests pin the phase-6 extension: update_snapshot_refcount
-    // must adjust each L2 table cluster's refcount once per non-zero
-    // L1 entry, mirroring qemu's qcow2_update_snapshot_refcount.
+    // These tests pin that update_snapshot_refcount adjusts each L2
+    // table cluster's refcount once per non-zero L1 entry, not only
+    // the data clusters, mirroring qemu's
+    // qcow2_update_snapshot_refcount.
 
     /// An L2 table with a single allocated data cluster at
     /// host 0x10_0000 (entry idx 0x100 under refblock_lookup).

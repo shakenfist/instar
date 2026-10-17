@@ -15,8 +15,9 @@
 # then exact: cmp over the common prefix, with any instar tail
 # beyond qemu's length all zeroes (the sector-granular tail quirk).
 #
-# Not a committed test (phase 11 owns that) — this is the phase 7
-# validation harness. Exits non-zero on any failure.
+# Not a committed test (the committed coverage is tests/test_snapshot.py)
+# — this is the manual validation harness written when delete was built.
+# Exits non-zero on any failure.
 set -uo pipefail
 
 INSTAR="${INSTAR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/src/target/release/instar}"
@@ -363,8 +364,8 @@ PY
 fi
 
 # --- Shared-L2 surviving-snapshot COPIED refresh ---------------------------
-# Regression for the phase 13 differential-fuzzer finding (soak2
-# iteration 209). Two snapshots share an L2; guest writes then COW
+# Regression for a differential-fuzzer finding (soak2 iteration
+# 209). Two snapshots share an L2; guest writes then COW
 # the ACTIVE chain onto fresh L2s, so the shared L2 belongs only to
 # the two snapshots. Deleting one drops the shared data clusters
 # 2 -> 1, and qemu's -1 walk writes the SURVIVING snapshot's L2

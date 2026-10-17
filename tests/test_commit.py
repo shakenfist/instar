@@ -1,23 +1,31 @@
 """Integration tests for `instar commit`.
 
-Phase 8 of PLAN-rebase-commit.md. Structurally a sibling of
-`test_rebase.py`:
+Structurally a sibling of `test_rebase.py`:
 
 - ``TestCommitSmoke`` parents the helpers.
 - ``TestCommitErrorPaths`` pins the host CLI rejection
-  contracts established in phase 8 step 8c (pre-checks +
-  chain discovery on the backing).
+  contracts (pre-checks + chain discovery on the backing).
+- ``TestCommitBackingAllowlist`` pins that the overlay's recorded
+  backing is resolved through the backing-path allowlist before
+  commit writes to it.
 - ``TestCommitSuccessPaths`` enumerates the end-to-end success
   contracts. qcow2 fixtures are built with ``instar create``;
   the vmdk case uses ``qemu-img create`` because instar's
   vmdk-with-backing create doesn't yet emit matching CIDs
   (same gap as the rebase tests).
+- ``TestCommitRoundTrip`` commits byte-identical fixture pairs
+  with instar and qemu-img and compares the resulting info JSON.
+- ``TestCommitBaselineMatrix`` compares instar's results against
+  the cross-version qemu-img baselines in instar-testdata.
+- ``TestCommitSnapshotCow`` pins copy-on-write parity with qemu
+  when the backing or the overlay carries internal snapshots.
+- ``TestCommitBackingClassification`` pins the typed refusals
+  for backing shapes commit cannot safely write into, and the
+  widened refcount-block capacity.
 
 Tests run on the host's installed `instar` binary. The
 success-path tests require ``/dev/kvm`` access; the error
 paths don't.
-
-Cross-version round-trip baselines belong to phase 9.
 """
 
 import hashlib
@@ -53,13 +61,14 @@ class TestCommitSmoke(InstarTestBase):
 
 
 # ----------------------------------------------------------------------
-# Error-path tests — pin the host CLI rejection contracts
-# established in phase 8 step 8c.
+# Error-path tests — pin the host CLI rejection contracts: the
+# pre-checks and chain discovery on the backing, all of which
+# run before any guest boots.
 # ----------------------------------------------------------------------
 
 
 class TestCommitErrorPaths(TestCommitSmoke):
-    """Host CLI rejection contracts (phase 8 step 8c)."""
+    """Host CLI rejection contracts (pre-checks and chain discovery)."""
 
     def test_overlay_missing_rejected(self):
         """`instar commit` against a non-existent overlay is rejected."""
@@ -154,8 +163,8 @@ class TestCommitErrorPaths(TestCommitSmoke):
     def test_qed_overlay_refused(self):
         """A qed overlay is refused by the format probe, byte-unchanged.
 
-        Format-coverage phase 6 keeps QED read-refused as policy (see
-        docs/plans/PLAN-format-coverage-phase-06-qed.md).  QED's
+        instar keeps QED read-refused as deliberate policy (see
+        docs/quirks.md "QED read-refusal as policy").  QED's
         offset-0 header magic is recognised by the overlay format probe,
         which has no QED arm (commit is qcow2/vmdk only), so the commit
         is refused before any backing byte changes.  Unlike
@@ -450,8 +459,8 @@ class TestCommitBackingAllowlist(TestCommitSmoke):
 
 
 # ----------------------------------------------------------------------
-# Success-path tests — end-to-end with the commit guest
-# lifecycle from phase 8 step 8d.
+# Success-path tests — end-to-end through the host CLI and the
+# commit guest lifecycle.
 # ----------------------------------------------------------------------
 
 
@@ -461,13 +470,12 @@ class TestCommitSuccessPaths(TestCommitSmoke):
     def _build_qcow2_overlay_pair(self, td):
         """Create a qcow2 backing + overlay pair.
 
-        v1 commit's success path is end-to-end exercised even for
-        an empty overlay (open question 8 in the phase 8 plan):
-        the guest walks the L1, finds every entry zero, and
-        reports ``clusters_committed: 0``. That's enough for a
-        smoke test of the host CLI + guest plumbing; round-trip
-        tests that verify backing-side data parity belong to
-        phase 9.
+        commit's success path is end-to-end exercised even for
+        an empty overlay: the guest walks the L1, finds every
+        entry zero, and reports ``clusters_committed: 0``. That's
+        enough for a smoke test of the host CLI + guest plumbing;
+        backing-side data parity is verified by
+        ``TestCommitRoundTrip`` and ``TestCommitBaselineMatrix``.
 
         Returns ``(overlay, backing)`` paths.
         """
@@ -498,9 +506,8 @@ class TestCommitSuccessPaths(TestCommitSmoke):
             # Overlay's L2 entries should be cleared — qemu-img
             # info should report actual-size much smaller than the
             # overlay's virtual size (the overlay-clear pass
-            # zeroes the L2 entries it committed). Confirming the
-            # backing's data via a separate check belongs to a
-            # round-trip test in phase 9.
+            # zeroes the L2 entries it committed). The backing's
+            # data is confirmed by TestCommitRoundTrip.
             stdout, stderr, rc = self.run_instar_info(
                 overlay, output_format='json')
             self.assertEqual(rc, 0, f'info failed: stderr={stderr!r}')
@@ -589,14 +596,14 @@ class TestCommitSuccessPaths(TestCommitSmoke):
                 overlay, '-b', str(backing))
             if rc != 0:
                 self.skipTest(
-                    f'vmdk commit smoke: known phase 7 follow-up '
+                    f'vmdk commit smoke: known info vmdk backing_file gap '
                     f'(stderr={stderr!r})')
             self.assertIn('Image committed.', stdout,
                           f'unexpected stdout: {stdout!r}')
 
 
 # ----------------------------------------------------------------------
-# Round-trip tests — phase 9 step 9c. For every supported
+# Round-trip tests. For every supported
 # (format, case) pair, build two byte-identical overlay+backing
 # pairs, commit one with `instar commit` and the other with
 # `qemu-img commit`, then assert the resulting info JSONs (both
@@ -679,7 +686,7 @@ class TestCommitRoundTrip(TestCommitSmoke):
             if rc != 0:
                 if target == 'vmdk':
                     self.skipTest(
-                        f'vmdk round-trip: known phase 7 follow-up '
+                        f'vmdk round-trip: known info vmdk backing_file gap '
                         f'(stderr={stderr!r})')
                 self.fail(f'instar commit failed: stderr={stderr!r}')
 
@@ -762,7 +769,7 @@ class TestCommitRoundTrip(TestCommitSmoke):
             explicit_base='base.qcow2', seed_spec='seed-64k')
 
     def test_vmdk_explicit_round_trip_skips_known_gap(self):
-        """vmdk round-trip is gated on the phase 7 follow-up.
+        """vmdk round-trip is gated on the info vmdk backing_file gap.
 
         Instar's explicit-`-b` path for vmdk currently refuses
         because the host info operation doesn't expose vmdk
@@ -778,7 +785,7 @@ class TestCommitRoundTrip(TestCommitSmoke):
 
 
 # ----------------------------------------------------------------------
-# Cross-version baseline matrix — phase 9 step 9b. For every
+# Cross-version baseline matrix. For every
 # entry in COMMIT_CASES the test builds the same fixtures the
 # generator built, runs ``instar commit``, then asserts both the
 # resulting overlay info JSON and the resulting backing info JSON
@@ -1008,7 +1015,7 @@ def _make_commit_baseline_test(target, case):
             if rc != 0:
                 if target == 'vmdk':
                     self.skipTest(
-                        f'vmdk matrix: known phase 7 follow-up '
+                        f'vmdk matrix: known info vmdk backing_file gap '
                         f'(stderr={stderr!r})')
                 self.fail(
                     f'instar commit failed for {target}/{case_name}: '
@@ -1065,7 +1072,7 @@ def _make_commit_baseline_test(target, case):
         f'test_baseline_{target}_{case_name.replace("-", "_")}'
     )
     test.__doc__ = (
-        f'instar commit {target} {case_name} matches phase-9 baseline.'
+        f'instar commit {target} {case_name} matches the qemu-img baseline.'
     )
     return test
 
@@ -1082,17 +1089,17 @@ for _target, _cases in COMMIT_CASES.items():
 
 
 # ----------------------------------------------------------------------
-# Internal-snapshot COW — phase 7 of PLAN-qcow2-write-infrastructure
-# (step 7b). The interim phase-2 refusal gates are lifted: commit
-# now merges into a snapshot-bearing backing by copy-on-write
-# (GitHub #420) and preserves an overlay's internal snapshots by
-# leaving the overlay untouched (#423). Both are the FIRST
-# end-to-end COW proven against qemu, so the proof is qemu-parity,
-# NOT before/after byte identity (C11): the committed backing is
-# `qemu-img compare`-identical to a `qemu-img commit` twin and
-# `qemu-img check`-clean (C5), and every pre-existing snapshot's
-# virtual view (via the snapshot read-back oracle) equals the qemu
-# twin's read-back for that op (C6). A backing snapshot fully
+# Internal-snapshot COW. Commit merges into a snapshot-bearing
+# backing by copy-on-write (GitHub #420) and preserves an
+# overlay's internal snapshots by leaving the overlay untouched
+# (#423); earlier builds refused both shapes. The proof is
+# qemu-parity, NOT before/after byte identity: the placement of
+# COW output is unconstrained because qemu's own placement is
+# nondeterministic run-to-run at 512-byte clusters. The committed
+# backing must be `qemu-img compare`-identical to a `qemu-img
+# commit` twin and `qemu-img check`-clean, and every pre-existing
+# snapshot's virtual view (via the snapshot read-back oracle) must
+# equal the qemu twin's read-back for that op. A backing snapshot fully
 # covers the committed extent, so its read-back is additionally
 # PRESERVED (== pre-commit); an overlay snapshot may read through
 # the freshly-committed backing where it has no allocation, so its
@@ -1108,27 +1115,30 @@ class TestCommitSnapshotCow(TestCommitSmoke):
                        base_post_snapshot_write=False,
                        overlay_snapshot=False,
                        overlay_post_snapshot_write=True):
-        """Build the phase-1 Q1 fixture shape in `fixture_dir`.
+        """Build the commit-into-snapshot-bearing-backing fixture in `fixture_dir`.
 
         base.qcow2 (64M, pattern 0xaa at [1M,3M)) at
         `cluster_size`, optional `snapshot -c snap1` on the base,
         overlay.qcow2 backed by it (relative name) with pattern
-        0xcc at [1536k,2560k) — the snapshot-shared extent that
-        triggers Q1 mode A. `cluster_size=512` drives COW across a
-        refcount-refblock boundary (the growth path, C9).
+        0xcc at [1536k,2560k) — the snapshot-shared extent where a
+        blind data-cluster overwrite would bleed the committed
+        pattern into snap1. `cluster_size=512` drives COW across a
+        refcount-refblock boundary, exercising refcount growth
+        during COW.
 
         With `base_post_snapshot_write`, a 0xbb write into the
         base's active layer at [512k,1536k) after snap1 COWs the
         base's active L2 (owned, OFLAG_COPIED set) while the 0xaa
-        data clusters stay snapshot-shared — the mixed C1/C2 shape.
+        data clusters stay snapshot-shared — the mixed shape that
+        needs data-cluster COW but not L2-table COW.
 
         With `overlay_snapshot`, the base is left snapshot-free
         and the overlay instead gets `snapshot -c osnap` after
         the 0xcc write, then (unless
         `overlay_post_snapshot_write` is False) a post-snapshot
         0xdd write at [2M,3M). `overlay_post_snapshot_write=False`
-        reproduces phase 1's second-order shape: the snapshot
-        taken after all overlay writes.
+        gives the second-order shape: the snapshot taken after
+        all overlay writes.
         """
         fixture_dir = Path(fixture_dir)
         fixture_dir.mkdir(parents=True, exist_ok=True)
@@ -1207,20 +1217,20 @@ class TestCommitSnapshotCow(TestCommitSmoke):
     def test_backing_internal_snapshots_cow(self):
         """Commit into a snapshot-bearing backing COWs and preserves it (#420).
 
-        Phase-1 Q1 showed this shape silently corrupted snap1 in
-        v1 (mode A: the blind data-cluster overwrite bled the
-        committed pattern into the snapshot's virtual view while
-        `qemu-img check` stayed clean). Phase 7's COW copies the
-        snapshot-shared data clusters (C1) and L2 tables (C2)
-        instead. Over the Q1 matrix (cluster sizes {65536, 512},
-        the cs=512 leg crossing a refblock boundary to exercise
-        the growth path C9; and with/without a post-snapshot write
-        into the base's active layer), assert:
+        Before copy-on-write, this shape silently corrupted snap1:
+        the blind data-cluster overwrite bled the committed
+        pattern into the snapshot's virtual view while `qemu-img
+        check` stayed clean. Commit now copies the
+        snapshot-shared data clusters and L2 tables instead. Over
+        cluster sizes {65536, 512} (the cs=512 leg crossing a
+        refblock boundary to exercise refcount growth during
+        COW) and with/without a post-snapshot write into the
+        base's active layer, assert:
 
         - the commit succeeds (rc 0);
-        - C5: instar's committed backing is `qemu-img compare`-
+        - instar's committed backing is `qemu-img compare`-
           identical to a `qemu-img commit` twin and check-clean;
-        - C6: snap1's read-back is PRESERVED (== pre-commit) and
+        - snap1's read-back is PRESERVED (== pre-commit) and
           equals the qemu twin's snap1 read-back.
         """
         self._require_qemu_tools()
@@ -1242,37 +1252,38 @@ class TestCommitSnapshotCow(TestCommitSmoke):
                         f'stderr={stderr!r}')
 
                     twin_overlay, twin_base = self._qemu_commit_twin(overlay)
-                    # C5: active-view parity + check clean.
+                    # Active-view parity + check clean.
                     self._assert_compare_identical(base, twin_base)
                     self._assert_check_clean(base)
-                    # C6: snap1 preserved and == qemu twin.
+                    # snap1 preserved and == qemu twin.
                     snap1_post = snapshot_readback('qemu-img', base, 'snap1')
                     snap1_twin = snapshot_readback(
                         'qemu-img', twin_base, 'snap1')
                     self.assertEqual(
                         snap1_post, snap1_pre,
-                        'C6: commit must preserve the backing snapshot')
+                        'commit must preserve the backing snapshot')
                     self.assertEqual(
                         snap1_post, snap1_twin,
-                        'C6: snap1 read-back must equal the qemu twin')
+                        'snap1 read-back must equal the qemu twin')
 
     def test_overlay_internal_snapshots_cow(self):
         """Commit from a snapshot-bearing overlay preserves it (#423).
 
-        v1's post-commit overlay-clear pass zeroed the active L2
-        entries and dropped snapshot-shared clusters' refcounts to
-        0 without accounting for osnap's reference (check-dirty
+        The post-commit overlay-clear pass zeroes the active L2
+        entries; run on a snapshot-bearing overlay it once dropped
+        snapshot-shared clusters' refcounts to 0 without
+        accounting for osnap's reference (check-dirty
         `refcount=0 reference=1`). qemu preserves overlay
-        snapshots on commit; phase 7 skips the clear pass when the
+        snapshots on commit; instar skips the clear pass when the
         overlay carries snapshots, leaving it byte-unchanged. Over
-        the Q1 matrix (cluster sizes {65536, 512} × the two 7p
-        shapes — second-order and post-snapshot-write), assert:
+        cluster sizes {65536, 512} × the two overlay-snapshot
+        shapes (second-order and post-snapshot-write), assert:
 
         - the commit succeeds (rc 0);
-        - C5: the committed backing and the overlay's active view
+        - the committed backing and the overlay's active view
           are both `qemu-img compare`-identical to a `qemu-img
           commit` twin, and both images are check-clean;
-        - C6: osnap's read-back equals the qemu twin's osnap
+        - osnap's read-back equals the qemu twin's osnap
           read-back. (Unlike a backing snapshot, an overlay
           snapshot reads through the freshly-committed backing
           where it has no allocation, so its read-back may differ
@@ -1298,34 +1309,35 @@ class TestCommitSnapshotCow(TestCommitSmoke):
                         f'failed; stderr={stderr!r}')
 
                     twin_overlay, twin_base = self._qemu_commit_twin(overlay)
-                    # C5: backing + overlay active views parity, check clean.
+                    # Backing + overlay active views parity, check clean.
                     self._assert_compare_identical(base, twin_base)
                     self._assert_compare_identical(overlay, twin_overlay)
                     self._assert_check_clean(base)
                     self._assert_check_clean(overlay)
-                    # C6: osnap read-back == qemu twin (read-through-aware).
+                    # osnap read-back == qemu twin (read-through-aware).
                     osnap_post = snapshot_readback(
                         'qemu-img', overlay, 'osnap')
                     osnap_twin = snapshot_readback(
                         'qemu-img', twin_overlay, 'osnap')
                     self.assertEqual(
                         osnap_post, osnap_twin,
-                        'C6: osnap read-back must equal the qemu twin')
+                        'osnap read-back must equal the qemu twin')
 
 
 # ----------------------------------------------------------------------
-# Backing classification tests — phase 4 of
-# PLAN-qcow2-write-infrastructure (step 4b). The commit guest's
-# backing-side write composition moved onto crates/qcow2-write +
-# crates/qcow2-write-exec; these tests pin the divergence budget:
-# the new typed refusals (D1 unknown/compression feature bits,
-# D2 compressed backing clusters, D4 sparse refcount tables) and
-# the deliberate capacity widening (D6).
+# Backing classification tests. The commit guest composes its
+# backing-side writes with crates/qcow2-write +
+# crates/qcow2-write-exec, which changed behaviour on four backing
+# shapes relative to the earlier hand-written writer. These tests
+# pin each change: typed refusals for unknown/compression
+# incompatible feature bits, compressed backing clusters and
+# sparse refcount tables, and the deliberate widening of the
+# refcount-block staging capacity.
 # ----------------------------------------------------------------------
 
 
 class TestCommitBackingClassification(TestCommitSmoke):
-    """Backing-side refusals and capacity widening (phase 4)."""
+    """Backing-side refusals and refcount-block capacity widening."""
 
     @staticmethod
     def _refcount_table_entries(path):
@@ -1346,9 +1358,8 @@ class TestCommitBackingClassification(TestCommitSmoke):
     def test_refuse_compressed_backing(self):
         """Commit into a compressed-cluster backing refuses pre-mutation.
 
-        Divergence D2 (scratchpad issue draft
-        ``issue-draft-commit-compressed-backing.md``): before
-        phase 4, this shape was LIVE CORRUPTION — the per-cluster
+        Before commit's backing writes moved onto the qcow2-write
+        crate, this shape was LIVE CORRUPTION — the per-cluster
         loop masked the compressed backing L2 entry with
         `L2_OFFSET_MASK` and wrote raw overlay data over the
         shared host cluster, silently destroying the deflate
@@ -1407,7 +1418,7 @@ class TestCommitBackingClassification(TestCommitSmoke):
             self.assertEqual(
                 self.sha256(backing), backing_before,
                 'a refused commit must not touch the backing '
-                '(pre-phase-4 this shape was silently corrupted)')
+                '(the pre-qcow2-write commit silently corrupted this shape)')
             self.assertEqual(
                 self.sha256(overlay), overlay_before,
                 'a refused commit must not touch the overlay')
@@ -1415,7 +1426,7 @@ class TestCommitBackingClassification(TestCommitSmoke):
     def test_refuse_backing_unknown_incompatible(self):
         """A backing with the zstd/unknown incompatible bit refuses.
 
-        Divergence D1: the qcow2 spec requires refusing unknown
+        The qcow2 spec requires refusing unknown
         incompatible feature bits, but commit previously
         proceeded. The qcow2-write envelope now gates the backing
         header before any staging (new wire code 16,
@@ -1482,15 +1493,14 @@ class TestCommitBackingClassification(TestCommitSmoke):
     def test_refuse_sparse_refcount_table_backing(self):
         """Commit into a holed-refcount-table backing refuses pre-mutation.
 
-        Divergence D4 (scratchpad issue draft
-        ``issue-draft-commit-sparse-refcount-table.md``): a holed
-        refcount table is stock-producible (discards free no
-        refblocks, but ``qemu-img resize --shrink`` frees
+        A holed refcount table is stock-producible (discards free
+        no refblocks, but ``qemu-img resize --shrink`` frees
         all-zero refblocks anywhere in the table) and passes
-        ``qemu-img check`` clean. Before phase 4, commit
-        compacted the nonzero RT entries and indexed them as if
-        dense — silent refcount corruption (2654 check errors in
-        the 4p probe). The dense-prefix contiguity gate now
+        ``qemu-img check`` clean. Before commit's backing writes
+        moved onto the qcow2-write crate, commit compacted the
+        nonzero RT entries and indexed them as if dense — silent
+        refcount corruption (2654 check errors on a probe image).
+        The dense-prefix contiguity gate now
         refuses at staging time (wire code 17,
         ERROR_BACKING_INCONSISTENT), before any backing byte
         changes.
@@ -1534,7 +1544,7 @@ class TestCommitBackingClassification(TestCommitSmoke):
                     'fixture did not produce a holed refcount table '
                     f'with this qemu-img (populated indices {populated})')
             # The holed backing passes qemu-img check clean — the
-            # whole point of the D4 gate.
+            # whole point of the dense-prefix contiguity gate.
             self._run_tool(['qemu-img', 'check', 'backing.qcow2'], td)
 
             self._run_tool(
@@ -1566,18 +1576,18 @@ class TestCommitBackingClassification(TestCommitSmoke):
             self.assertEqual(
                 self.sha256(backing), backing_before,
                 'a refused commit must not touch the backing '
-                '(pre-phase-4 this shape was silently corrupted)')
+                '(the pre-qcow2-write commit silently corrupted this shape)')
             self.assertEqual(
                 self.sha256(overlay), overlay_before,
                 'a refused commit must not touch the overlay')
 
     def test_widened_backing_refblock_capacity_commits(self):
-        """A >32-refblock backing now commits (capacity widening D6).
+        """A >32-refblock backing now commits (refcount capacity widening).
 
-        The 4p probe's off-matrix exemplar: a 16M cluster_size=512
+        A 16M cluster_size=512
         backing with 8M seeded has 66 populated refcount-table
         entries — over the old 32-refblock staging cap, so the
-        pre-phase-4 binary refused with wire code 10
+        pre-qcow2-write commit binary refused with wire code 10
         (scratch-too-small). The qcow2-write staging is bounded by
         staged bytes and MAX_REFBLOCKS=2048 instead, so this shape
         must now succeed, check-clean, and match a qemu-img commit
@@ -1617,7 +1627,7 @@ class TestCommitBackingClassification(TestCommitSmoke):
                 overlay_a, timeout=120)
             self.assertEqual(
                 rc, 0,
-                f'widened-capacity commit failed (the pre-phase-4 cap '
+                f'widened-capacity commit failed (the old 32-refblock cap '
                 f'refused this shape): stderr={stderr!r}')
             self.assertIn('Image committed.', stdout,
                           f'unexpected stdout: {stdout!r}')

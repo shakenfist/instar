@@ -1,7 +1,7 @@
 """Integration tests for ``instar check --repair`` (qcow2 repair).
 
-Codifies the behaviour verified by hand during phase 7 of
-PLAN-check-repair: the leaks/all tiers repair the check-validation
+Codifies the repair behaviour, as first verified by hand against
+``qemu-img check``: the leaks/all tiers repair the check-validation
 fixtures to ``qemu-img check``-clean with guest data preserved; the
 refuse paths (corrupt-bit / snapshot / compression) leave the image
 byte-identical; and the overlapping case is a safe *partial* repair
@@ -17,11 +17,11 @@ corrupt for repeatable runs. The oracles are the post-repair image
 * known data-pattern reads via ``qemu-io read -P`` (data survived),
 * sha256 byte-identity (for the refuse paths).
 
-They deliberately do **not** assert on instar's own repaired-counter
-output: those per-counter fields are not yet on the guest->host wire
-(PLAN-check-repair phase 6), and instar's own exit code still reflects
-the *detected* corruption even after a successful repair (e.g.
-refcount-zero exits 2 but is qemu-clean afterward).
+The per-tier tests deliberately judge a repair by that external state
+rather than by instar's own report of it. The per-class repaired-*
+counters instar now sends from guest to host are pinned separately
+(``TestRepairCounters``), and instar's exit code is asserted only in
+the tests that are about it (partial repair, clean image, refusals).
 
 The base fixtures carry four known data patterns written by
 ``create-corrupt-images.py``: 0xAA at 0, 0xBB at 64k, 0xCC at 128k,

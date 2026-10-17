@@ -1,10 +1,10 @@
-//! Coverage-guided fuzzing for the Phase-1 qcow2 persistent-dirty-
-//! bitmap parsers (`src/crates/qcow2/src/bitmap.rs`).
+//! Coverage-guided fuzzing for the qcow2 persistent-dirty-bitmap
+//! parsers (`src/crates/qcow2/src/bitmap.rs`).
 //!
 //! The bitmap directory / table / extension bytes are the highest
 //! attacker-controlled surface in the whole `bitmap` feature: they are
-//! parsed verbatim from a hostile image. Phase 1 wrote every parser
-//! panic-free by construction (length-guarded reads,
+//! parsed verbatim from a hostile image. Every parser is written to
+//! be panic-free by construction (length-guarded reads,
 //! `checked_*`/saturating arithmetic). This target is the adversarial
 //! validation that the discipline held — the **only** oracle is
 //! panic-freedom (plus a handful of trivially-safe round-trip /

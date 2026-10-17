@@ -1,7 +1,7 @@
 """Integration tests for the `instar map` subcommand.
 
-Phase 6 of PLAN-map. Exercises the streaming map renderer
-end-to-end against the phase 5 baseline matrix in
+Exercises the streaming map renderer end-to-end against the
+cross-version qemu-img map baseline matrix in
 `instar-testdata/expected-outputs/map-{human,json}/`.
 
 The test suite is split into five classes, all inheriting
@@ -14,7 +14,8 @@ from `TestMapSmoke`:
   the version-keyed profile.
 * `TestMapWindowFilter` — in-test fixtures exercising
   `--start-offset` / `--max-length`.
-* `TestMapErrorPaths` — host-side guards from phase 3b.
+* `TestMapErrorPaths` — host-side guards (--image-opts, missing
+  source, sector size, chain images).
 * `TestMapDivergenceRegression` — for each
   `KNOWN_MAP_DIVERGENCES` entry, asserts the divergence
   still happens so accidental fixes surface loudly.
@@ -72,7 +73,7 @@ class TestMapSmoke(InstarTestBase):
             )
 
     def test_baselines_present_human(self):
-        """The phase 5 baselines must be reachable via base.py helpers."""
+        """The map-human baselines must be reachable via base.py helpers."""
         profiles = self.get_output_profiles(
             output_type='human', command='map'
         )
@@ -88,12 +89,12 @@ class TestMapSmoke(InstarTestBase):
         )
 
     def test_baselines_present_json(self):
-        """The phase 5 baselines must be reachable for JSON too."""
+        """The map-json baselines must be reachable too."""
         profiles = self.get_output_profiles(
             output_type='json', command='map'
         )
         self.assertIn('profiles', profiles)
-        # Phase 5 produced 3 map-json profiles; assert at least 1
+        # The map-json matrix has several profiles; assert at least 1
         # so the test doesn't break when the matrix evolves.
         self.assertGreater(len(profiles['profiles']), 0)
 
@@ -276,7 +277,7 @@ class TestMapBaselineSource(TestMapSmoke):
 
     Skip categories:
       1. The image file is missing on disk (sparse checkouts).
-      2. The phase 5 baseline meta.json reports a non-zero exit
+      2. The baseline meta.json reports a non-zero exit
          (qemu-img couldn't produce a clean baseline — chain
          image without -F hint, compressed-cluster source, etc.).
       3. The image is listed in KNOWN_MAP_DIVERGENCES (deliberate
@@ -380,7 +381,7 @@ def _make_map_source_test(image_dict, output_type):
     )
     test.__doc__ = (
         f'instar map {image_dict["id"]} --output={output_type} matches '
-        f'the phase-6 baseline.'
+        f'the qemu-img map baseline.'
     )
     return test
 
@@ -577,8 +578,8 @@ class TestMapWindowFilter(TestMapSmoke):
 
 
 class TestMapErrorPaths(TestMapSmoke):
-    """Host-side guards from phase 3b: --image-opts refusal,
-    missing source, invalid sector size, chain image refusal.
+    """Host-side guards: --image-opts refusal, missing source,
+    invalid sector size, chain image refusal.
     """
 
     def test_image_opts_rejected(self):
@@ -635,7 +636,7 @@ class TestMapErrorPaths(TestMapSmoke):
             f'stderr: {stderr!r}'
         )
 
-    # ----------- Phase-1 format-coverage: new-format refusals -----------
+    # ----------- Formats map does not read: refusals -----------
     #
     # map does not use the host chain-discovery gate (issue #444); it
     # calls the guest's `detect_format_from_header` directly and any
@@ -680,8 +681,8 @@ class TestMapErrorPaths(TestMapSmoke):
     def test_qed_refused(self):
         """map refuses a qed-simple source (header-detected).
 
-        Format-coverage phase 6 keeps QED read-refused as policy (see
-        docs/plans/PLAN-format-coverage-phase-06-qed.md).  QED's
+        QED is read-refused by policy (see "QED read-refusal as policy"
+        in docs/quirks.md).  QED's
         offset-0 header magic is recognised by the guest probe but has
         no reader arm, so it lands in the same default arm as
         bochs/cloop/parallels and is refused with "source format
@@ -701,7 +702,7 @@ class TestMapErrorPaths(TestMapSmoke):
         DMG detection is trailer-only and not wired into map's guest
         format probe (`detect_format_from_header`), so a DMG source is
         indistinguishable from raw here and map succeeds, mapping the
-        whole file as one allocated raw extent. Documents the phase-1
+        whole file as one allocated raw extent. Documents that detection
         gap rather than asserting a refusal that does not exist.
         """
         image = self.get_image('dmg-simple')

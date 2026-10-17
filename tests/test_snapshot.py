@@ -1,11 +1,11 @@
 """Integration tests for the `instar snapshot` subcommand.
 
-Phase 11 of PLAN-snapshot. Five test families:
+Five test families:
 
   (a) List matrix (human) — factory-generated per baselined image:
       ``TZ=UTC instar snapshot -l`` byte-equals the host-resolved
       profile-10-0-0 baseline; plus the bare-filename-equals-``-l``
-      test (phase 9 D2 behaviour).
+      test (a bare ``snapshot FILE`` defaults to list, as in qemu-img).
 
   (b) List goldens (JSON) — per baselined image: ``instar snapshot
       -l --output=json`` byte-equals ``tests/golden/snapshot-list/
@@ -36,8 +36,8 @@ Relationship to the shell harnesses under ``tools/``:
   post-op invariants. They overlap by design.
 
 TZ note: every ``instar snapshot -l`` invocation pins ``TZ=UTC``
-via ``env_overrides`` — the phase 10 baselines were generated under
-UTC and the DATE column is local-time-rendered.
+via ``env_overrides`` — the snapshot-list-human baselines were generated
+under UTC and the DATE column is local-time-rendered.
 
 Skip taxonomy (mirrors test_map.py):
   1. Image file missing on disk (sparse checkouts).
@@ -124,7 +124,7 @@ class TestSnapshotSmoke(InstarTestBase):
             )
 
     def test_baselines_present_human(self):
-        """The phase 10 snapshot-list-human baselines are reachable."""
+        """The snapshot-list-human baselines are reachable."""
         profiles = self.get_output_profiles(
             output_type='human', command='snapshot-list',
         )
@@ -147,7 +147,7 @@ class TestSnapshotSmoke(InstarTestBase):
 
 
 class TestSnapshotListHuman(TestSnapshotSmoke):
-    """Byte-compare ``instar snapshot -l`` against the phase 10 profile.
+    """Byte-compare ``instar snapshot -l`` against the baseline profile.
 
     Runs against whichever profile the host qemu-img resolves to; both
     the pre-9.0 and 9.0+ layouts are compared byte-for-byte.
@@ -215,7 +215,7 @@ def _make_list_human_test(image_id):
 
     test.__name__ = f'test_list_human_{image_id.replace("-", "_")}'
     test.__doc__ = (
-        f'instar snapshot -l {image_id} matches the phase-10 baseline.'
+        f'instar snapshot -l {image_id} matches the qemu-img baseline.'
     )
     return test
 
@@ -237,7 +237,8 @@ for _iid in _snapshot_image_ids():
 
 
 # Bare-filename equals -l: `instar snapshot FILE` must produce the
-# same output as `instar snapshot -l FILE` (phase 9 D2 behaviour).
+# same output as `instar snapshot -l FILE`, because qemu-img snapshot
+# defaults to list when no mode flag is given.
 
 class TestSnapshotBareFilename(TestSnapshotSmoke):
     """``instar snapshot FILE`` and ``instar snapshot -l FILE`` agree."""
@@ -318,7 +319,7 @@ def _make_json_golden_test(image_id):
     test.__name__ = f'test_json_golden_{image_id.replace("-", "_")}'
     test.__doc__ = (
         f'instar snapshot -l --output=json {image_id} matches the '
-        f'phase-11 JSON golden.'
+        f'JSON golden.'
     )
     return test
 
@@ -665,7 +666,7 @@ class TestSnapshotDelete(TestSnapshotSmoke):
 
             # Struct-decode header at offset 60: nb_snapshots (u32BE) and
             # snapshots_offset (u64BE). After deleting the sole snapshot both
-            # must be 0 (qemu's behaviour, verified in phase 7).
+            # must be 0 (qemu's behaviour, verified against qemu-img).
             with open(path, 'rb') as f:
                 f.seek(60)
                 data = f.read(12)
@@ -677,9 +678,9 @@ class TestSnapshotDelete(TestSnapshotSmoke):
         """``-d 2`` matches the snapshot *named* "2" (not snapshot with ID 2).
 
         snap-qcow2-namecollision has: ID=1 name="2", ID=2 name="x".
-        ``instar snapshot -d 2`` (delete uses name-only matching, fact from
-        phase 7) deletes the entry named "2", i.e. ID 1. Afterwards only
-        the entry with name "x" remains.
+        ``instar snapshot -d 2`` (delete uses name-only matching, as
+        qemu-img 10's ``bdrv_snapshot_find`` does) deletes the entry named
+        "2", i.e. ID 1. Afterwards only the entry with name "x" remains.
         """
         src = self._testdata_root / _image_path_for_id('snap-qcow2-namecollision')
         if not src.exists():
@@ -984,9 +985,9 @@ class TestSnapshotErrorPaths(TestSnapshotSmoke):
     def test_qed_list_refused(self):
         """``-l`` on a qed image: non-zero exit.
 
-        Format-coverage phase 6 keeps QED read-refused as policy (see
-        docs/plans/PLAN-format-coverage-phase-06-qed.md).  snapshot is
-        qcow2-only; a QED source (recognised by its offset-0 header
+        QED is read-refused as deliberate policy (see the "QED
+        Read-Refusal Is Deliberate Policy" section of docs/quirks.md).
+        snapshot is qcow2-only; a QED source (recognised by its offset-0 header
         magic) is refused just like raw/vmdk/vhdx above.
         """
         img = self.get_image('qed-simple')

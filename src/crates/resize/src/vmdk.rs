@@ -1,10 +1,10 @@
 //! VMDK-specific resize planning.
 //!
-//! Phase 6 of `PLAN-resize.md`. The public entry point
+//! The public entry point
 //! [`plan_resize_vmdk`](super::plan_resize_vmdk) in the crate
 //! root dispatches into [`plan_grow`] here, which classifies the
-//! request and emits the patch list. Phase 6 supports
-//! `MonolithicSparse` only; other subformats are rejected with
+//! request and emits the patch list. Only `MonolithicSparse` is
+//! supported; other subformats are rejected with
 //! [`ResizeError::UnsupportedSubformat`].
 
 use core::fmt::Write;

@@ -13,13 +13,13 @@
 //!   plus a deferred-apply [`RebasePlan`] of metadata patches
 //!   the guest applies after the comparison loop completes.
 //!
-//! Phase 5 of `PLAN-qcow2-write-infrastructure` moved the
-//! safe-mode write composition (cluster allocation, refblock
-//! staging, dirty tracking) into `crates/qcow2-write` +
-//! `crates/qcow2-write-exec`; the old
+//! The safe-mode write composition (cluster allocation,
+//! refblock staging, dirty tracking) lives in the shared
+//! `crates/qcow2-write` + `crates/qcow2-write-exec` engine,
+//! which replaced this crate's old
 //! `allocate_overlay_cluster_qcow2` helper, its
 //! `AllocationState`, and the context's staged refblock copy
-//! and dirty bitmap are gone. What remains here is the shared
+//! and dirty bitmap. What remains here is the shared
 //! validation, the deferred header/backing-path metadata plan,
 //! and the overlay geometry.
 //!
@@ -73,22 +73,20 @@ pub struct Qcow2RebaseOpts<'a> {
     pub overlay_file_size: u64,
     /// Raw refcount-table bytes (an array of u64 BE entries
     /// pointing at refcount blocks). Retained for API
-    /// stability; unconsumed since phase 5 of
-    /// `PLAN-qcow2-write-infrastructure` moved safe-mode
-    /// allocation into `crates/qcow2-write`. Pass an empty
-    /// slice.
+    /// stability; unconsumed since safe-mode allocation moved
+    /// into `crates/qcow2-write`. Pass an empty slice.
     pub refcount_table: &'a [u8],
     /// Host byte offsets of each refcount block. Retained for
-    /// API stability; unconsumed since phase 5. Pass an empty
-    /// slice.
+    /// API stability; unconsumed (see `refcount_table`). Pass
+    /// an empty slice.
     pub refblock_host_offsets: &'a [u64],
     /// Concatenated refcount-block bytes. Retained for API
-    /// stability; unconsumed since phase 5. Pass an empty
-    /// slice.
+    /// stability; unconsumed (see `refcount_table`). Pass an
+    /// empty slice.
     pub refcount_blocks: &'a [u8],
     /// Number of refcount blocks present in
     /// `refcount_blocks`. Retained for API stability;
-    /// unconsumed since phase 5. Pass zero.
+    /// unconsumed (see `refcount_table`). Pass zero.
     pub refblock_count: u32,
     /// New backing file's virtual size in bytes. Used for
     /// compatibility checking.
@@ -126,9 +124,8 @@ pub enum Qcow2RebaseOutput<'a> {
 /// Overlay geometry carried by the guest across safe-mode
 /// rebase's per-cluster comparison loop.
 ///
-/// Phase 5 of `PLAN-qcow2-write-infrastructure` reduced this
-/// to plain geometry: the staged refcount-block copy and the
-/// dirty bitmap the old in-crate allocator mutated moved into
+/// This is plain geometry: the staged refcount-block copy and
+/// the dirty bitmap the old in-crate allocator mutated live in
 /// `qcow2_write::WriteState` and the guest's own staging
 /// carve.
 #[derive(Debug, Clone, Copy)]
@@ -219,7 +216,7 @@ impl Qcow2RebaseOpts<'_> {
 }
 
 // ---------------------------------------------------------------------------
-// Safe mode (step 2c)
+// Safe mode
 // ---------------------------------------------------------------------------
 
 fn plan_qcow2_safe<'a>(
@@ -240,8 +237,8 @@ fn plan_qcow2_safe<'a>(
 
     // Lay out scratch: header rewrite buffer, path buffer.
     // (The staged refcount-block copy and dirty bitmap the
-    // old in-crate allocator carved here moved into the
-    // guest's qcow2-write staging in phase 5.)
+    // old in-crate allocator carved here now live in the
+    // guest's qcow2-write staging.)
     let header_rewrite_len = HEADER_REWRITE_SPAN;
     let path_buf_len = MAX_BACKING_PATH_LEN;
     let need = header_rewrite_len

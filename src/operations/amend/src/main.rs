@@ -1,7 +1,7 @@
 //! Amend operation: change an existing qcow2 image's compat
 //! version (`compat=0.10`/`1.1`) and/or lazy-refcounts state.
 //!
-//! Phase 3 of `PLAN-amend`. The guest:
+//! The guest:
 //!  1. Reads the [`AmendConfig`] the host wrote at
 //!     [`OPERATION_CONFIG_ADDR`].
 //!  2. Reads the first header cluster of the output device (the

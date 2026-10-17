@@ -1,4 +1,4 @@
-//! Coverage-guided fuzzing for the Phase-3 bitmap planner crate
+//! Coverage-guided fuzzing for the bitmap planner crate
 //! (`src/crates/bitmap/`): the per-action validate-then-mutate
 //! functions, the directory builders they call, and the pure `merge`
 //! helpers.

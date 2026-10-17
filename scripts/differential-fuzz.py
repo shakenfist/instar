@@ -65,7 +65,7 @@ SNAP_CLUSTER_SIZES = [512, 4096, 65536]
 # Probability that a commit/rebase/bench iteration builds a
 # SNAPSHOT-BEARING fixture (and gains the read-back oracle) instead of the
 # plain snapshot-free fixture. Drawn from iter_rng so a fixed top --seed
-# stays deterministic (decision 6).
+# stays deterministic.
 SNAPSHOT_FIXTURE_PROB = 0.40
 DATA_PATTERNS = ['zeros', 'random', 'sparse', 'mbr']
 
@@ -129,12 +129,13 @@ def write_mbr_header(path):
 # SectorCount always equals the exact mish coverage): a gap image fails
 # convert on BOTH sides (EIO parity, per the dmg-gap fixture) and would
 # only pollute the differential content-comparison signal, not exercise
-# it. Only zero / raw / zlib chunks are used (the phase-5 read scope; no
-# ADC/bzip2/lzfse/zstd codecs), and every chunk stays within instar's own
+# it. Only zero / raw / zlib chunks are used (the chunk types instar's dmg
+# reader decodes; ADC/bzip2/lzfse/zstd are typed refusals), and every chunk
+# stays within instar's own
 # bounded-memory staging cap (DMG_MAX_STAGED_SECTOR_COUNT = 4096 sectors,
 # comp_len well under COMPRESSED_BUF_SIZE) so the fuzzer explores real
 # convertible images -- the capacity-divergence corner is already pinned
-# by the dmg-overcap-chunk fixture in the integration matrix (5e), not
+# by the dmg-overcap-chunk fixture in the integration matrix, not
 # fuzzed here.
 # ---------------------------------------------------------------------------
 
@@ -366,9 +367,8 @@ def generate_image(rng, workdir, iteration):
 
     if fmt == 'vdi':
         # VDI supports dynamic (default) and static (pre-allocated,
-        # identity block map) images; instar's reader must handle both
-        # (PLAN-format-coverage-phase-02-vdi-read.md step 2f), so pick
-        # static some of the time.
+        # identity block map) images; instar's reader must handle both,
+        # so pick static some of the time.
         static = rng.random() < 0.3
         attrs['static'] = static
         if static:
@@ -379,19 +379,17 @@ def generate_image(rng, workdir, iteration):
         # -o cluster_size (qemu-img default is 1 MiB, tracks=2048);
         # instar's reader derives cluster boundaries from it, so pick
         # a non-default value -- including small ones that exercise
-        # chunk-boundary handling -- some of the time
-        # (PLAN-format-coverage-phase-03-parallels-read.md step 3f),
-        # mirroring the vdi static=on branch above.
+        # chunk-boundary handling -- some of the time, mirroring the
+        # vdi static=on branch above.
         if rng.random() < 0.3:
             cluster_size = rng.choice([4096, 65536, 1048576])
             attrs['cluster_size'] = cluster_size
             cmd.extend(['-o', f'cluster_size={cluster_size}'])
 
     # qcow (v1, qemu's create name for the format instar's qcow1 crate
-    # reads) supports no -o options this fuzzer needs to vary
-    # (PLAN-format-coverage-phase-04-qcow1-read.md step 4f) — cluster_bits
-    # and l2_bits default to 12/9 and there is no supported way to set
-    # them via qemu-img create. No branch needed here; the compressed
+    # reads) supports no -o options this fuzzer needs to vary —
+    # cluster_bits and l2_bits default to 12/9 and there is no supported
+    # way to set them via qemu-img create. No branch needed here; the compressed
     # variant is applied as a post-processing step below, after the data
     # pattern is written, since it needs a fully-populated source image.
 
@@ -1102,10 +1100,10 @@ def op_convert(instar_bin, instar_copy, qemu_copy, fmt,
 # ---------------------------------------------------------------------------
 #
 # This is the broadest parity guard for `dd`: it explores the operand
-# space the fixed integration matrix (phases 3/4/6) cannot, especially
+# space the fixed integration matrix (tests/test_dd.py) cannot, especially
 # non-512 `bs`, unaligned windows, and skip/count interactions. instar
-# matches qemu for all of these (verified phases 3/4); the fuzzer's job
-# is to keep that true. Any REAL divergence is a bug to fix, NOT to
+# matches qemu for all of these (verified against qemu-img dd when dd was
+# built); the fuzzer's job is to keep that true. Any REAL divergence is a bug to fix, NOT to
 # whitelist.
 
 # bs values: a deliberate mix of 512-multiples (exercise the fast
@@ -1227,7 +1225,8 @@ def op_dd(instar_bin, instar_copy, qemu_copy, fmt, timeout, rng):
     #     represent a 0-capacity disk) while instar exits 0 with an
     #     empty vmdk — an exit-code divergence on a degenerate input.
     #   * -O vhdx: instar's 0-virtual-size vhdx is rejected by
-    #     qemu-img info/convert (the documented phase-4 limitation), so
+    #     qemu-img info/convert (a vhdx writer limitation at zero
+    #     virtual size, documented in docs/dd.md), so
     #     flattening instar's output to raw fails while qemu's empty
     #     vhdx is readable.
     # Skip these (return None) — do NOT whitelist anything else; every
@@ -1781,15 +1780,14 @@ def _resize_option_picker(rng):
     tests/test_resize.py and the resize planner's documented gaps:
       * qcow2 + raw only — qemu-img can't resize vmdk/vhd/vhdx on
         any shipped version; the differential surface has nothing
-        to compare against for those targets (see PLAN-resize
-        phase 10 and 11 for the asymmetry).
+        to compare against for those targets.
       * qcow2 refcount_bits is now exercised across all widths —
         build_header derives refcount_order from refcount_bits and
         sub-byte widths are packed LSB-first (instar #365), so the
         widths qemu accepts are differential-comparable.
       * No qcow2 compat=0.10 (instar hardcodes compat=1.1).
-      * No qcow2 + preallocation=metadata (planner gap deferred
-        from phase 2c; master-plan Future work).
+      * No qcow2 + preallocation=metadata (a planner gap; not yet
+        implemented, see future work in PLAN-resize.md).
       * No qcow2 cluster_size=2097152 — the qcow2 resize planner's
         worst-case scratch buffer (QCOW2_MAX_RESIZE_SCRATCH = 32M)
         is sized for default-cluster-size images; 2 MiB cluster
@@ -1918,8 +1916,8 @@ def op_resize(instar_bin, instar_copy, qemu_copy, fmt, timeout, rng):
         create_args_base + [str(qemu_path), start_size],
         timeout=timeout)
     if ic_rc != 0 or qc_rc != 0:
-        # Divergent rejections at the create step show up as
-        # phase 8's create matrix issues, not resize issues.
+        # Divergent rejections at the create step are create
+        # issues (op_create's territory), not resize issues.
         if ic_rc != 0 and qc_rc != 0:
             return None  # both rejected; not a resize-side divergence
         return {
@@ -2032,12 +2030,12 @@ def _amend_option_picker(rng):
       * noop      — create compat=1.1, amend compat=1.1.
 
     Divergence avoidance (a mis-steered picker floods false
-    divergences — see PLAN-amend phase 8b Situation):
+    divergences):
       * Never emits `compression_type=zstd` (or any
         `compression_type`): instar refuses a compat=0.10 downgrade
         of a zstd-compression image while qemu-img accepts it
-        (rewriting compression_type) — the one documented phase-6
-        divergence.
+        (rewriting compression_type) — the one documented amend
+        divergence (docs/amend.md).
       * Keeps `refcount_bits=16` (the qcow2 default) on every
         downgrade case: instar refuses a compat=0.10 downgrade of an
         image whose refcount width is not 16. refcount_bits is only
@@ -2218,7 +2216,7 @@ def op_amend(instar_bin, instar_copy, qemu_copy, fmt, timeout, rng):
 
 
 # ---------------------------------------------------------------------------
-# Differential bitmap op (phase-9 step 9b)
+# Differential bitmap op
 # ---------------------------------------------------------------------------
 
 # KNOWN_BITMAP_DIFFERENTIAL_DIVERGENCES -- intentional instar-vs-qemu
@@ -2247,7 +2245,8 @@ def op_amend(instar_bin, instar_copy, qemu_copy, fmt, timeout, rng):
 #                           granularity for merge", crates/bitmap
 #                           merge.rs -- equal granularity_bits required,
 #                           a documented v1 limitation exercised as a
-#                           refusal by Phase 6). The picker only merges a
+#                           refusal by the crate's unit tests). The
+#                           picker only merges a
 #                           source into a destination of EQUAL effective
 #                           granularity (tracking each bitmap's resolved
 #                           granularity, including the cluster-size-
@@ -2256,8 +2255,8 @@ def op_amend(instar_bin, instar_copy, qemu_copy, fmt, timeout, rng):
 # The generated operation space (add [+granularity], add+disable,
 # remove, clear, enable, disable, single-source same-file equal-
 # granularity merge with an existing enabled destination) is exactly the
-# space Phase 7's fixed BITMAP_CASES matrix proved parity-equivalent
-# against qemu-img 10.0.8, so any divergence op_bitmap surfaces is a real
+# space the fixed BITMAP_CASES matrix in tests/test_bitmap.py proved
+# parity-equivalent against qemu-img 10.0.8, so any divergence op_bitmap surfaces is a real
 # bug, not a steer-around.
 KNOWN_BITMAP_DIFFERENTIAL_DIVERGENCES = {
     'cross_file_merge', 'merge_mixed', 'refcount_bits', 'compat_v2',
@@ -2305,8 +2304,9 @@ def _bitmap_option_picker(rng):
         ceilings).
       * Sequence length is 2..6 invocations.
 
-    This is exactly the operation space Phase 7's BITMAP_CASES matrix
-    proved parity-equivalent, so any op_bitmap divergence is a real bug.
+    This is exactly the operation space tests/test_bitmap.py's
+    BITMAP_CASES matrix proved parity-equivalent, so any op_bitmap
+    divergence is a real bug.
     """
     cluster_size = rng.choice(QCOW2_CLUSTER_SIZES)
     create_opts = [
@@ -2437,8 +2437,8 @@ def op_bitmap(instar_bin, instar_copy, qemu_copy, fmt, timeout, rng):
     Per invocation the oracle is: (1) exit-code agreement, (2) the
     ``qemu-img info`` bitmaps array (name/granularity/flags), (3) a
     structural ``qemu-img check`` on the instar image. The bit-content
-    merge oracle lives in Phase 7 (too heavy per iteration -- Open
-    question 4). Returns a typed divergence dict or None.
+    merge oracle lives in tests/test_bitmap.py's TestBitmapMergeBits (too
+    heavy to run per iteration). Returns a typed divergence dict or None.
     """
     plan = _bitmap_option_picker(rng)
     create_opts = plan['create_opts']
@@ -2551,11 +2551,11 @@ def op_bitmap(instar_bin, instar_copy, qemu_copy, fmt, timeout, rng):
 
 
 # ---------------------------------------------------------------------------
-# bench (differential over the deterministic CLI surface — PLAN-bench phase 7)
+# bench (differential over the deterministic CLI surface)
 # ---------------------------------------------------------------------------
 
 # Small image sizes (bytes) — bench launches a guest VMM per invocation, so
-# keep the schedules cheap. All <= 64 MiB per the phase-4 validated envelope.
+# keep the schedules cheap: all <= 64 MiB.
 _BENCH_IMAGE_SIZES = [1 << 20, 4 << 20, 16 << 20, 64 << 20]
 
 # BENCH_MAX_BUFSIZE is 2 MiB; exactly 2 MiB is still accepted (the cap is
@@ -2627,10 +2627,11 @@ def _bench_invocation_args(fmt, count, depth, bufsize, step, pattern,
 
 
 # ---------------------------------------------------------------------------
-# Snapshot-bearing COW fixtures (phase 8 thread 2)
+# Snapshot-bearing COW fixtures
 #
 # The commit/rebase/bench ops build SNAPSHOT-FREE fixtures by construction;
-# these helpers add the snapshot-bearing branch that phase 7 opened. The
+# these helpers add a snapshot-bearing branch so the copy-on-write paths those
+# ops take on snapshot-bearing images are differentially compared too. The
 # recipes are lifted from the retired scripts/cow-soak.py generators
 # (gen_commit / gen_rebase / gen_bench); the oracle reuses the shared
 # snapshot_readback helper. A snapshot-bearing fixture is byte-identical on
@@ -2976,7 +2977,7 @@ def _op_bench_snapshot(instar_bin, iter_dir, rng, timeout):
 
 def _bench_option_picker(rng):
     """Pick a parity-respecting bench plan: an image recipe plus one or more
-    bench invocations, all inside the phase-4 validated envelope and steered
+    bench invocations, all inside the argument envelope bench validates and steered
     clear of every KNOWN_BENCH_DIVERGENCES trigger so any surfaced
     divergence is real.
 
@@ -3318,7 +3319,7 @@ def op_rebase(instar_bin, instar_copy, qemu_copy, fmt, timeout, rng):
     via the picker.
     """
     # ~40% of rebase ops build a snapshot-bearing overlay (#421) and gain
-    # the read-back oracle; deterministic under a fixed --seed (decision 6).
+    # the read-back oracle; deterministic under a fixed --seed.
     snap = rng.random() < SNAPSHOT_FIXTURE_PROB
     if snap and shutil.which('qemu-io') is not None:
         return _op_rebase_snapshot(
@@ -3575,7 +3576,7 @@ def op_commit(instar_bin, instar_copy, qemu_copy, fmt, timeout, rng):
     """
     # ~40% of commit ops build a snapshot-bearing fixture (backing- or
     # overlay-snapshot; #420/#423) and gain the read-back oracle;
-    # deterministic under a fixed --seed (decision 6).
+    # deterministic under a fixed --seed.
     snap = rng.random() < SNAPSHOT_FIXTURE_PROB
     if snap and shutil.which('qemu-io') is not None:
         return _op_commit_snapshot(
@@ -3760,24 +3761,23 @@ def op_commit(instar_bin, instar_copy, qemu_copy, fmt, timeout, rng):
 
 
 # ---------------------------------------------------------------------------
-# op_map: instar map vs qemu-img map (PLAN-map phase 8)
+# op_map: instar map vs qemu-img map
 # ---------------------------------------------------------------------------
 
 # Per-extent fields compared between instar and qemu-img. The skipped
-# fields are documented in docs/plans/PLAN-map-phase-08-fuzz-
-# differential.md (depth: always 0 in v1; compressed: instar emits
-# false always; offset: compressed-cluster reporting drift across
-# binaries; filename: paths differ between the two copies).
+# fields, and why: depth (always 0 in v1); compressed (instar emits
+# false always); offset (compressed-cluster reporting drifts across
+# binaries); filename (paths differ between the two copies).
 MAP_COMPARE_FIELDS = ('start', 'length', 'present', 'zero', 'data')
 
 # Per-format field skips for documented divergences that would
-# otherwise flood the differential signal. The phase 8 smoke
-# discovered each entry empirically.
+# otherwise flood the differential signal. Each entry was found
+# empirically by smoke runs of op_map.
 MAP_FIELD_SKIPS = {
     # VHD unallocated blocks: instar reports present=false (true
     # to the on-disk BAT 0xFFFFFFFF marker); qemu-img reports
     # present=true with zero=true (the "ZeroAllocated"
-    # convention, same as it uses for raw sparse runs). Phase 6's
+    # convention, same as it uses for raw sparse runs).
     # KNOWN_MAP_DIVERGENCES in tests/test_map.py marks
     # hyperv-dynamic-vhd and virtualpc-vhd with the same rationale.
     # Keeping {start, length, zero, data} comparison active for
@@ -3965,12 +3965,11 @@ def _run_qemu_io(args, timeout=30, cwd=None):
 
 # ---------------------------------------------------------------------------
 # op_snapshot: instar snapshot -c/-d/-a chains vs qemu-img
-# (PLAN-snapshot phase 13)
 # ---------------------------------------------------------------------------
 
 # Fixed NONZERO date written into every live snapshot-table entry's
-# date_sec / date_nsec after each successful create, on BOTH sides
-# (phase 13 probe 3). Nonzero matters: with date_sec == 0,
+# date_sec / date_nsec after each successful create, on BOTH sides,
+# because the two tools stamp different creation times. Nonzero matters: with date_sec == 0,
 # `instar snapshot -l` prints a blank DATE column while
 # `qemu-img snapshot -l` renders the epoch in local time (degenerate
 # input; see docs/quirks.md). With 0x60000000 both tools print
@@ -3994,7 +3993,7 @@ SNAPSHOT_NAME_POOL = [
 # Module-level qemu-img version cache (startup probe, not a
 # build-time constant — contributors may run older distros than the
 # CI container, whose Debian-stable qemu-utils tracks the 10.0.x
-# series the phase 6-8 harnesses pinned).
+# series the tools/snapshot-*-matrix.sh harnesses were validated against).
 _QEMU_IMG_VERSION = None
 
 # Keys for one-shot log messages (version-gate skips), so they print
@@ -4084,17 +4083,16 @@ def _snapshot_pick_arg(rng, live):
 # |   or grows the refcount table (qemu grows both and succeeds)
 # |   | "snapshot -c quirks" — create may exhaust the image's
 # |   existing refblocks. 512-byte clusters pair only with 4M
-# |   images, the phase 6-8 matrix pairing. |
+# |   images, the tools/snapshot-*-matrix.sh pairing. |
 #
 # Divergences HANDLED by the comparator (not avoided): freed-cluster
 # discard (qemu side runs file.discard=ignore), date stamps
-# (per-step normalization, probes 2/3), the sector-granular file
-# tail (zero-tail tolerance), stderr wording (exit codes only,
-# probe 4).
+# (per-step normalization), the sector-granular file tail (zero-tail
+# tolerance), stderr wording (exit codes only).
 def _snapshot_chain_picker(rng):
     """Pick (base_opts, chain) for one snapshot-chain iteration.
 
-    base_opts mirrors the phase 6-8 matrix dimensions
+    base_opts mirrors the snapshot matrix harnesses' dimensions
     (tools/snapshot-*-matrix.sh): cluster_size in {512, 4096, 65536};
     compat in {1.1, 0.10}; extended_l2 only with 64k clusters and
     compat 1.1; size in {4M, 16M, 64M} (4M only for 512-byte
@@ -4114,7 +4112,7 @@ def _snapshot_chain_picker(rng):
     extended_l2 = (cluster_size == 65536 and compat == '1.1'
                    and rng.random() < 0.3)
     # Avoidance row 7: 512-byte clusters only pair with 4M images
-    # (exactly the phase 6-8 matrix pairing). instar v1 never
+    # (exactly the tools/snapshot-*-matrix.sh pairing). instar v1 never
     # allocates new refblocks or grows the refcount table
     # (docs/quirks.md, "Create may exhaust the image's existing
     # refblocks"), so at 512-byte clusters a larger image's
@@ -4183,7 +4181,7 @@ def _snapshot_normalize_table(path):
     `qcow2_write_snapshots` writes each entry field-by-field and
     never touches the pad bytes, so a table reallocated into a
     reused (freed, dirty) cluster keeps stale bytes there under
-    qemu. Found by the first phase 13 soak: a create-after-apply
+    qemu. Found by the first soak of this op: a create-after-apply
     chain reallocated the table into a freed data cluster and
     diverged by exactly the 2 pad bytes after a 70-byte entry.
     Both images are valid — the padding is dead bytes — so this is
@@ -4314,7 +4312,7 @@ def _snapshot_dead_clusters(inst_path, qemu_path):
 
 
 def _snapshot_compare_bytes(inst_path, qemu_path):
-    """Byte-identity check ported from the phase 6-8 harnesses'
+    """Byte-identity check ported from the snapshot matrix harnesses'
     assert_byte_identical (tools/snapshot-*-matrix.sh): the files
     must agree over their common prefix, and the longer file's tail
     must be all zero (the sector-granular file-tail quirk —
@@ -4391,8 +4389,8 @@ def _snapshot_qemu_image_opts(path):
     qemu leaves stale bytes in freed clusters exactly like instar
     does (docs/quirks.md, "Freed-cluster bytes may differ from
     qemu-img's", under both -d and -a). With discard suppressed the
-    post-op images are bit-for-bit identical (phase 6-8 harnesses;
-    probes 1-2).
+    post-op images are bit-for-bit identical (as the
+    tools/snapshot-*-matrix.sh harnesses demonstrate).
     """
     return f'driver=qcow2,file.filename={path},file.discard=ignore'
 
@@ -4401,8 +4399,8 @@ def op_snapshot(instar_bin, instar_copy, qemu_copy, fmt, timeout,
                 rng):
     """Apply a random create/delete/apply/write chain to identical
     qcow2 images via instar and qemu-img; demand byte-identical
-    results after every element (the phase 6-8 matrix methodology
-    ported from tools/snapshot-*-matrix.sh).
+    results after every element (the matrix methodology ported from
+    tools/snapshot-*-matrix.sh).
 
     instar_copy / qemu_copy / fmt are part of the standard op_*
     signature but unused — snapshot builds its own image pair via

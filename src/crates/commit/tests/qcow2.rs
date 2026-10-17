@@ -5,8 +5,8 @@
 //! asserts the returned context's geometry matches the parsed
 //! headers. The per-cluster commit loop and the backing-side
 //! write composition are exercised by `crates/qcow2-write` /
-//! `crates/qcow2-write-exec` and the phase 7 guest binary's
-//! integration tests.
+//! `crates/qcow2-write-exec` and the commit guest binary's
+//! integration tests (`tests/test_commit.py`).
 
 mod common;
 

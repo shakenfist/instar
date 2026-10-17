@@ -107,8 +107,9 @@ pub const DYN_PARENT_NAME_OFFSET: usize = 64;
 ///
 /// This is the bound for *parsing*: a name filling all 512 bytes with no
 /// terminator is valid and complete, and a reader must never scan past the
-/// field looking for one (decision 3; over-reading here is libvhdi defect
-/// C). instar's own *emitter* refuses at 256 code units and accepts at
+/// field looking for one (libvhdi does exactly that, over-reading two bytes
+/// into the locator table and reporting a 257th character). instar's own
+/// *emitter* refuses at 256 code units and accepts at
 /// most 255, so that everything instar writes keeps a terminating NUL
 /// inside the field and reads back correctly through libvhdi
 /// (PLAN-differencing-phase-01-pin.md:716). The two numbers are opposite
@@ -433,8 +434,8 @@ impl<'a> VhdImageWindow<'a> {
 /// the only source for the BAT's extent is `table_offset` and
 /// `max_table_entries` in the very header whose locators are being
 /// validated — using an untrusted header to validate its own contents
-/// proves nothing. Phase 11 (host-side chain walking) must not assume this
-/// parser has already refused such an image.
+/// proves nothing. Host-side chain walking must not assume this parser has
+/// already refused such an image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VhdImageBounds {
     /// Total image length in bytes.
@@ -484,8 +485,9 @@ impl VhdPlatform {
 
     /// Selection rank for [`VhdParentLocatorTable::preferred_locator`]:
     /// `W2ru` (0) before `W2ku` (1) before `Wi2r` (2) before `Wi2k` (3).
-    /// `None` for every non-Windows code, which is never selected
-    /// (decision 5 of PLAN-differencing-phase-03-parse.md).
+    /// `None` for every non-Windows code, which is never selected: which
+    /// entry names the parent is settled by the platform code, so that the
+    /// host and the guest cannot disagree about what a chain is.
     pub fn preference(self) -> Option<u8> {
         match self {
             VhdPlatform::W2ru => Some(0),
@@ -509,10 +511,11 @@ impl VhdPlatform {
 /// Why a parent locator entry, or an attempt to decode its platform data,
 /// was refused.
 ///
-/// Decision 4: a malformed entry is *marked*, not dropped, and its raw
-/// fields are preserved, so phase 4 can say why it is refusing. The first
-/// six variants are set at parse time and are purely structural; the last
-/// three arise only when a caller asks for the string.
+/// A malformed entry is *marked*, not dropped, and its raw fields are
+/// preserved, so the read policy can say why it is refusing — a dropped
+/// entry is indistinguishable from an absent one. The first six variants
+/// are set at parse time and are purely structural; the last three arise
+/// only when a caller asks for the string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VhdLocatorDefect {
     /// The platform code is populated but `platform_data_length` is zero:
@@ -583,7 +586,8 @@ impl VhdParentLocator {
     /// Parse one 24-byte entry and validate its offsets against `bounds`.
     ///
     /// Never returns `None` for a malformed entry: the entry comes back
-    /// with `defect` set, raw fields intact (decision 4). `None` means
+    /// with `defect` set, raw fields intact, so a caller can say why it
+    /// refuses. `None` means
     /// only that `entry` is shorter than [`PARENT_LOCATOR_ENTRY_SIZE`].
     pub fn parse(entry: &[u8], bounds: &VhdImageBounds) -> Option<Self> {
         if entry.len() < PARENT_LOCATOR_ENTRY_SIZE {
@@ -780,7 +784,8 @@ pub enum AmbiguityReason {
     ContentsUnknown,
 }
 
-/// The outcome of selecting the entry that names the parent (decision 5).
+/// The outcome of selecting the entry that names the parent, by platform
+/// code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreferredLocator {
     /// Exactly one entry wins. `slot` indexes
@@ -796,7 +801,7 @@ pub enum PreferredLocator {
     /// absolute `W2ku` path, which is a different file. Without this,
     /// a caller cannot tell that from an image that simply never had a
     /// relative locator, and would have to re-walk `entries` to find
-    /// out. Phase 4 decides whether to refuse, warn or proceed;
+    /// out. Whether to refuse, warn or proceed is the caller's policy;
     /// this only makes sure the fact reaches it.
     Found {
         slot: usize,
@@ -804,8 +809,8 @@ pub enum PreferredLocator {
     },
     /// No entry carries a Windows platform code, or every entry that does
     /// is unused or malformed. The caller reads `entries` to say why —
-    /// decision 4 keeps the reason on the entries rather than duplicating
-    /// it here.
+    /// malformed entries are marked rather than dropped, so the reason
+    /// lives on the entries rather than being duplicated here.
     NotFound,
     /// Two entries share the winning platform code and do not agree.
     /// `first` is the lowest-slot winner; `second` is the lowest slot
@@ -858,7 +863,7 @@ impl VhdParentLocatorTable {
     ///
     /// **This decides which entry names the parent, and nothing else.**
     /// Whether an ambiguous table is refused, warned about, or resolved to
-    /// the relative entry is phase 4's policy.
+    /// the relative entry is the caller's policy.
     ///
     /// Two consequences worth stating, because they surprise people:
     ///
@@ -1005,7 +1010,7 @@ impl<'a> VhdParentInfo<'a> {
     ///
     /// Returns `None` only for a short or non-`cxsparse` buffer. A hostile
     /// locator table does not fail the parse; its entries come back with
-    /// `defect` set (decision 4).
+    /// `defect` set rather than being dropped.
     ///
     /// **This cannot check that the image is differencing.** `disk_type`
     /// lives in the footer, not the header, so the caller gates on
@@ -1056,8 +1061,9 @@ impl<'a> VhdParentInfo<'a> {
     /// The 512-byte field is the bound: the decode stops at the first
     /// `0x0000` code unit if there is one, and otherwise consumes all 256
     /// code units. It never looks past the field for a terminator
-    /// (decision 3 — over-reading here is libvhdi defect C, and
-    /// `vhd-diff-locator-overlong.vhd` exists to catch it).
+    /// (libvhdi does, over-reading two bytes into the locator table and
+    /// reporting a 257th character; `vhd-diff-locator-overlong.vhd`
+    /// exists to catch it).
     ///
     /// A `dst` of [`MAX_PARENT_NAME_UTF8`] bytes can never be too small.
     pub fn decode_name(&self, dst: &mut [u8]) -> Option<usize> {
@@ -2007,7 +2013,8 @@ impl VhdState {
         // virtual_size at construction; `measure_<fmt>` rejects
         // summaries that violate it, which would surface to the user
         // as "source image is unsupported format". Mirrors the qcow2
-        // out-of-bounds skip established in PLAN-fuzzing-bugs phase 2.
+        // allocation scan, which parses but does not count clusters
+        // mapped past virtual_size.
         let allocated_bytes = allocated_blocks.saturating_mul(self.block_size as u64);
 
         Some(AllocationSummary::clamp(
@@ -2270,7 +2277,7 @@ pub fn build_dynamic_header(
 // ============================================================================
 //
 // Offset authority: every field written below is cited to the parsing
-// constants at the top of this module, which phase 3 derived from an xxd
+// constants at the top of this module, which were derived from an xxd
 // of a Hyper-V-produced differencing image
 // (docs/plans/PLAN-differencing-phase-01-pin.md). Nothing outside instar
 // reads most of what these functions write: libvhdi never parses the VHD
@@ -2453,10 +2460,10 @@ pub fn build_dynamic_header_parent(
 ///   bytes in that same order.
 /// * `platform_data_space`: `u32` at [`LOC_DATA_SPACE_OFFSET`] (`+4`).
 ///   **A byte count.** SPEC(VHD)'s wording implies a count of 512-byte
-///   sectors; it is wrong, and phase 1 pinned it by showing the sector
-///   reading is arithmetically impossible on both measured Hyper-V
-///   images — see [`VhdParentLocator::platform_data_space`]. A one-sector
-///   region is `512`, never `1`.
+///   sectors; it is wrong, because the sector reading is arithmetically
+///   impossible on both measured Hyper-V images — see
+///   [`VhdParentLocator::platform_data_space`]. A one-sector region is
+///   `512`, never `1`.
 /// * `platform_data_length`: `u32` at [`LOC_DATA_LENGTH_OFFSET`] (`+8`),
 ///   the encoded byte count with no terminator, as returned by
 ///   [`build_parent_locator_data`].
@@ -2966,9 +2973,9 @@ mod tests {
     // Parent locator tests (differencing VHDs)
     //
     // In-memory only: the crate is no_std and must test without the
-    // instar-testdata repository present. The phase 2 fixtures are
-    // consumed for real by phase 8's integration tests; the adversarial
-    // shapes below reconstruct them as byte buffers.
+    // instar-testdata repository present. The real differencing fixtures
+    // in instar-testdata are consumed by the Python integration tests;
+    // the adversarial shapes below reconstruct them as byte buffers.
     // ====================================================================
 
     use shared::write_le_u16;
@@ -3132,8 +3139,8 @@ mod tests {
         let mut out = [0u8; MAX_PARENT_NAME_UTF8];
         let n = info.decode_name(&mut out).unwrap();
         // The parser reports the string faithfully and does nothing with
-        // it. Refusing a traversal is phase 4's job, resolving it is
-        // phase 11's, and neither belongs here.
+        // it. Refusing a traversal is the read policy's job, resolving it
+        // is the host chain walk's, and neither belongs here.
         assert_eq!(&out[..n], b"../../../etc/passwd");
     }
 
@@ -3359,7 +3366,7 @@ mod tests {
 
     #[test]
     fn locator_malformed_entry_preserves_raw_fields() {
-        // Decision 4: marked, not dropped, and phase 4 can say why.
+        // Marked, not dropped, so the read policy can say why it refuses.
         let mut buf = make_diff_header("p.vhd");
         put_locator(&mut buf, 0, b"W2ru", 0x1234, 0x5678, 0xdead_beef);
         let info = VhdParentInfo::parse(&buf, &TEST_BOUNDS).unwrap();
@@ -3603,7 +3610,7 @@ mod tests {
         // looking like an image that never carried a relative locator.
         // Corrupting slot 0 is how an attacker steers a reader from the
         // relative path to the absolute one, so the demotion is
-        // reported and phase 4 gets to have a policy about it.
+        // reported and the caller gets to have a policy about it.
         assert_eq!(
             info.locators.preferred_locator(Some(&window(&win))),
             PreferredLocator::Found {
@@ -4564,10 +4571,11 @@ mod tests {
 
     #[test]
     fn emit_name_and_locator_data_use_opposite_endiannesses() {
-        // Decision 3 of PLAN-differencing-phase-05-vhd-emitter.md: the
-        // same path encodes to two different byte strings, one for the
-        // header name field and one for the locator platform data. If a
-        // later refactor unifies the two encoders, this fails.
+        // The same path encodes to two different byte strings: UTF-16
+        // big endian for the header name field and little endian for the
+        // locator platform data. If a later refactor unifies the two
+        // encoders, this fails rather than silently writing a name no
+        // Windows reader can resolve.
         let mut buf = emit_base_header();
         let name_len =
             build_dynamic_header_parent(&mut buf, &EMIT_PARENT_ID, 0, EMIT_PATH).unwrap();
@@ -4711,11 +4719,11 @@ mod tests {
 
     #[test]
     fn emit_locator_data_space_is_bytes_not_sectors() {
-        // Decision 4: SPEC(VHD)'s wording implies a count of 512-byte
-        // sectors and is wrong; phase 1 pinned the field as a byte count
-        // against two measured Hyper-V images. A one-sector region is
-        // 512 here, and writing 1 is the single most plausible wrong
-        // value in this phase.
+        // SPEC(VHD)'s wording implies a count of 512-byte sectors and is
+        // wrong; two measured Hyper-V images show the field is a byte
+        // count. A one-sector region is 512 here, and writing 1 is the
+        // single most plausible wrong value in the emitter -- it
+        // round-trips through nothing else that would catch it.
         let mut buf = emit_base_header();
         build_parent_locator_entry(&mut buf, 0, b"W2ru", 512, 24, 2048).unwrap();
 
@@ -4871,7 +4879,7 @@ mod tests {
         );
     }
 
-    // -------- complement: what the phase 3 parser makes of it ------------
+    // -------- complement: what the parser makes of it --------------------
 
     #[test]
     fn emit_parent_header_reads_back_through_the_parser() {

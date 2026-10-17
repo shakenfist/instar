@@ -316,7 +316,7 @@ mod tests {
     #[test]
     fn test_parse_qemu_version_output_real_distro_strings() {
         // The exact `qemu-img --version` banners the CI matrix distros
-        // ship (tools/probe-qemu-versions.sh, phase-2 step 2a). A parse
+        // ship (as recorded by tools/probe-qemu-versions.sh). A parse
         // failure here would silently fall back to newest() (10.0) and
         // emit wrong output on an older-qemu distro.
         let cases = [

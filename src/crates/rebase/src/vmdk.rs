@@ -1,9 +1,9 @@
 //! vmdk monolithicSparse rebase planner.
 //!
-//! - **Unsafe mode** (step 2d) emits a descriptor rewrite that
+//! - **Unsafe mode** emits a descriptor rewrite that
 //!   substitutes `parentCID=` and `parentFileNameHint=` while
 //!   preserving every other descriptor line.
-//! - **Safe mode** (step 2e) emits a [`RebaseVmdkSafeContext`]
+//! - **Safe mode** emits a [`RebaseVmdkSafeContext`]
 //!   that carries the staged grain-directory and grain-table
 //!   bytes (mutated by the allocator as the guest decides to
 //!   copy a grain), plus the same descriptor rewrite as a
@@ -359,9 +359,9 @@ fn plan_vmdk_unsafe<'a>(
     // unsafe planner (line 411) which initialises
     // `RebasePlan::new(opts.overlay_file_size)`. Earlier this
     // function used `RebasePlan::new(0)`, which left callers
-    // (and the phase-10 fuzz harness) with no way to bound
-    // the patch's range — the bug surfaced on the very first
-    // fuzz run.
+    // (and the `fuzz_rebase_planners` fuzz target) with no way
+    // to bound the patch's range — the bug surfaced on the very
+    // first fuzz run.
     let patch_bytes: &'a [u8] = &scratch[..slot_size];
     let mut plan = RebasePlan::new(opts.overlay_file_size);
     plan.push(RebasePatch::Write {
@@ -769,7 +769,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Safe-mode planner + allocator tests (step 2e).
+    // Safe-mode planner + allocator tests.
     // -----------------------------------------------------------------------
 
     /// Build a safe-mode opts value with a single allocated GT

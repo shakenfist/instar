@@ -1,4 +1,4 @@
-"""Cross-version COW parity (phase 7 step 7e).
+"""Cross-version COW parity for qcow2 writes into snapshot-shared clusters.
 
 The per-op COW tests (``TestCommitSnapshotCow`` / ``TestRebaseSnapshotCow`` /
 ``TestBenchSnapshotCow``) prove qemu-parity against the *system* qemu-img
@@ -13,19 +13,21 @@ a snapshot-bearing image), at cluster sizes {512, 65536}, we run instar's
 COW **once**, then for EACH pinned version V:
 
 * ``qemu-img check`` (V) on instar's result is clean — no
-  ``refcount=1 reference=2``, no leaks (C5);
+  ``refcount=1 reference=2``, no leaks;
 * ``qemu-img compare`` (V) of instar's active view against V's own COW
-  twin is identical (C5);
+  twin is identical;
 * the snapshot read-back oracle (with V's qemu-img) of every pre-existing
-  snapshot equals V's own twin's read-back (C6/C7/C8).
+  snapshot equals V's own twin's read-back: commit and bench preserve
+  each snapshot's pre-op content, and safe rebase reads the snapshot
+  through the NEW backing, as qemu does.
 
 The twin for version V is built by copying the identical seed fixture and
 running V's qemu-img for the same op, so the comparison is
 version-consistent (instar-under-V vs qemu-V, never cross-wired). Content
 seeding uses the system qemu-io (write patterns are version-agnostic
-bytes); every version claim is made with the pinned qemu-img. This pins
-the 7p finding that qemu's COW semantics are version-invariant
-(6.2.0 .. 10.2.0), now against instar's own COW output.
+bytes); every version claim is made with the pinned qemu-img. Probes of
+qemu alone found its COW semantics version-invariant (6.2.0 .. 10.2.0);
+this module pins that against instar's own COW output.
 
 Gated on the pinned binaries being present (skips if absent), like the
 other version-matrix tests. Bounded to a small version subset spanning the
@@ -101,7 +103,7 @@ class TestCowCrossVersion(InstarTestBase):
     # -- parity assertions ----------------------------------------------
 
     def _assert_check_clean(self, qbin, ver, image, ctx):
-        """Assert `qbin check image` is clean (C5)."""
+        """Assert `qbin check image` is clean."""
         r = subprocess.run(
             [qbin, 'check', str(image)],
             capture_output=True, text=True, timeout=120)
@@ -115,7 +117,7 @@ class TestCowCrossVersion(InstarTestBase):
             f'[{ver} {ctx}] refcount=1 reference=2 in instar COW output')
 
     def _assert_compare_identical(self, qbin, ver, a, b, ctx):
-        """Assert `qbin compare a b` reports the active views equal (C5)."""
+        """Assert `qbin compare a b` reports the active views equal."""
         r = subprocess.run(
             [qbin, 'compare', str(a), str(b)],
             capture_output=True, text=True, timeout=120)
@@ -141,7 +143,7 @@ class TestCowCrossVersion(InstarTestBase):
         """Q1 commit fixture: snapshot-bearing backing + overlay.
 
         base.qcow2 (64M, 0xaa at [1M,3M)) with snap1, overlay on it
-        (0xcc at [1536k,2560k)). Commit preserves snap1 (C6).
+        (0xcc at [1536k,2560k)). Commit preserves snap1.
         """
         seed.mkdir(parents=True, exist_ok=True)
         opt = f'cluster_size={cs}'
@@ -163,7 +165,7 @@ class TestCowCrossVersion(InstarTestBase):
 
         base_old (6M, 0x11 [0,4M)), base_new (6M, 0x22 [2M,6M)), overlay
         on base_old (0x33 [1M,2M)) with snap1. Safe rebase reads snap1
-        through base_new afterward (C7).
+        through base_new afterward.
         """
         seed.mkdir(parents=True, exist_ok=True)
         opt = f'cluster_size={cs}'
@@ -186,7 +188,7 @@ class TestCowCrossVersion(InstarTestBase):
         """bench fixture: a single image whose active clusters are shared.
 
         64M image, 0xaa across [0,1M), then snap1 -> every allocated
-        cluster is snapshot-shared, so `bench -w` must COW (C8).
+        cluster is snapshot-shared, so `bench -w` must COW.
         """
         seed.mkdir(parents=True, exist_ok=True)
         self._run(['qemu-img', 'create', '-f', 'qcow2', '-o',
@@ -201,7 +203,7 @@ class TestCowCrossVersion(InstarTestBase):
 
     def test_commit_backing_snapshot_cross_version(self):
         """Commit COW output is check-clean + read-back-parity under all
-        pinned qemu versions (C5/C6)."""
+        pinned qemu versions."""
         versions = self._present_versions()
         for cs in self.CLUSTER_SIZES:
             with self.subTest(cluster_size=cs), \
@@ -232,7 +234,7 @@ class TestCowCrossVersion(InstarTestBase):
 
     def test_safe_rebase_overlay_snapshot_cross_version(self):
         """Safe-rebase COW output is check-clean + read-through-new-backing
-        read-back-parity under all pinned qemu versions (C5/C7)."""
+        read-back-parity under all pinned qemu versions."""
         versions = self._present_versions()
         for cs in self.CLUSTER_SIZES:
             with self.subTest(cluster_size=cs), \
@@ -267,7 +269,7 @@ class TestCowCrossVersion(InstarTestBase):
 
     def test_bench_write_snapshot_cross_version(self):
         """`bench -w` COW output is check-clean + read-back-parity (snapshot
-        preserved) under all pinned qemu versions (C5/C8)."""
+        preserved) under all pinned qemu versions."""
         if not os.access('/dev/kvm', os.R_OK | os.W_OK):
             self.skipTest('/dev/kvm not readable+writable')
         versions = self._present_versions()

@@ -464,7 +464,8 @@ run --trailer "${STRWINDOW}"
 check "the model still lands, without a window" "$(trailer_line)" \
     "Co-Authored-By: Claude claude-opus-5 <noreply@anthropic.com>"
 
-# Decision 2: no prettifying, no lookup table. The id goes out verbatim.
+# No prettifying, no lookup table: a table of display names would go
+# stale the same way the hardcoded trailer did. The id goes out verbatim.
 start "the model id is emitted verbatim, not prettified"
 run --trailer "${SUCCESS}"
 lacks "no display name" "${OUT}" "Opus"

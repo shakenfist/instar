@@ -1,18 +1,20 @@
 //! Resize operation: in-place mutation of an existing disk image.
 //!
-//! Phase 7 of `PLAN-resize.md`.  Reads a `ResizeConfig` from
-//! `OPERATION_CONFIG_ADDR`, reads sector 0 of the output device,
-//! detects the format, runs the format-specific pre-pass that
-//! stages every byte range the planner's opts struct needs,
-//! calls the matching `crates/resize::plan_resize_*`, and
-//! applies the resulting patches via `write_output_sector` (with
-//! read-modify-write through the new `read_output_sector` call-
-//! table primitive for partial-sector patches).
+//! Reads a `ResizeConfig` from `OPERATION_CONFIG_ADDR`, reads
+//! sector 0 of the output device, detects the format, runs the
+//! format-specific pre-pass that stages every byte range the
+//! planner's opts struct needs, calls the matching
+//! `crates/resize::plan_resize_*`, and applies the resulting
+//! patches via `write_output_sector` (with read-modify-write
+//! through the `read_output_sector` call-table primitive for
+//! partial-sector patches).
 //!
 //! Out of scope:
-//!  - Preallocation modes (phase 9 handles host-side).
-//!  - QCOW2 `Preallocation::Metadata` (deferred to phase 9 — the
-//!    planner already rejects it with `PreallocationUnsupported`).
+//!  - Data-region preallocation (`falloc` / `full`): the host
+//!    applies it after the guest returns (`apply_preallocation`).
+//!  - `Preallocation::Metadata`: not yet implemented; the planner
+//!    rejects it with `PreallocationUnsupported` (see
+//!    PLAN-resize-phase-09-preallocation.md).
 //!  - Backing-chain composition (resize doesn't touch backing
 //!    references; matches qemu).
 
@@ -926,9 +928,9 @@ unsafe fn run_vmdk(
         current_virtual_size: config.current_virtual_size,
         new_virtual_size: config.new_virtual_size,
         grain_size: (grain_size_sectors * 512) as u32,
-        // For phase 7 we only handle MonolithicSparse — every
-        // other subformat is rejected up-front by detect_format
-        // or by the planner.
+        // Only MonolithicSparse is handled — every other
+        // subformat is rejected up-front by detect_format or by
+        // the planner.
         subformat: VmdkSubformat::MonolithicSparse,
         allow_shrink: config.allow_shrink(),
         preallocation: map_prealloc(config.flags),

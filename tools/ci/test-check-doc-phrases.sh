@@ -141,7 +141,7 @@ start 'docs/plans/ is exempt because it quotes the corruption as an example'
 TREE="${WORK}/plans-exempt"
 build_tree "${TREE}"
 cat > "${TREE}/docs/plans/PLAN-example.md" <<'EOF'  # audit-ok: plan-reference
-Phase 9 found phrases such as "the PLAN-s worknapshot" and repaired them.
+A survey found phrases such as "the PLAN-s worknapshot" and repaired them.
 EOF
 commit_tree "${TREE}"
 expect_pass 'a quoted example inside docs/plans/ does not trip the guard' "${TREE}"

@@ -1,8 +1,8 @@
 //! Snapshot-table serialisation helpers for MODE_CREATE.
 //!
 //! Pure functions over caller-staged byte slices — no I/O. These
-//! compose the on-disk snapshot table that the phase 6 create
-//! guest binary writes to a freshly allocated region:
+//! compose the on-disk snapshot table that the guest op's create
+//! mode writes to a freshly allocated region:
 //!
 //! - [`NewSnapshotEntry`] + [`serialize_snapshot_entry`] emit one
 //!   new entry (40-byte header + 24-byte extra data + id + name),
@@ -12,17 +12,17 @@
 //!   its exact byte length so the guest can stage / copy / free it.
 //! - [`snapshot_table_entry_bounds`] returns one raw entry's
 //!   (start offset, unpadded length) for MODE_DELETE's
-//!   find-by-name walk and compaction maths (phase 7).
+//!   find-by-name walk and compaction maths.
 //! - [`find_snapshot_in_table`] resolves a snapshot argument
 //!   against the raw table with per-mode matching semantics
 //!   ([`MatchMode`]): `-d` is name-only, `-a` is ID-then-name
 //!   (two full passes, qemu's `find_snapshot_by_id_or_name`
-//!   shape) — phase 8.
+//!   shape).
 //! - [`build_snapshot_table`] copies the old entries verbatim and
 //!   8-aligns the new entry after them.
 //! - [`build_snapshot_table_without`] copies every entry except
 //!   one verbatim, re-aligning survivors — MODE_DELETE's table
-//!   compaction (phase 7), matching `qcow2_write_snapshots`'
+//!   compaction, matching `qcow2_write_snapshots`'
 //!   full-table rewrite after the in-memory `memmove`.
 //! - [`parse_decimal_id`] / [`format_decimal_u64`] implement
 //!   qemu's `find_new_snapshot_id` ID arithmetic (strtoul-style
@@ -215,10 +215,10 @@ pub fn snapshot_table_byte_len(table: &[u8], nb_snapshots: u32) -> Result<usize,
 /// `index` within `table`, walking entries exactly like
 /// [`snapshot_table_byte_len`].
 ///
-/// MODE_DELETE (phase 7) uses this to find the matched entry's raw
-/// bytes (the find-by-name walk compares the full on-disk name,
-/// independent of the bounded parser's 63-char truncation) and to
-/// compute the compaction copy ranges.
+/// MODE_DELETE uses this to find the matched entry's raw bytes (the
+/// find-by-name walk compares the full on-disk name, independent of
+/// the bounded parser's name-length cap) and to compute the
+/// compaction copy ranges.
 ///
 /// Returns [`SnapshotError::InvalidConfig`] if
 /// `index >= nb_snapshots`, or [`SnapshotError::ParseFailed`] if
@@ -289,13 +289,14 @@ pub fn build_snapshot_table(
 /// with the alignment gaps zeroed. Returns the total byte length
 /// (unpadded after the last surviving entry, matching qemu).
 ///
-/// This is MODE_DELETE's table compaction (phase 7, open
-/// question 5): a verbatim per-entry copy preserves unknown
-/// trailing extra data byte-for-byte, exactly what the
-/// byte-identity matrix against `qemu-img snapshot -d` requires.
-/// Removing the sole remaining entry yields length 0 (the caller
-/// then writes header `nb_snapshots = 0, snapshots_offset = 0`
-/// and allocates no table — phase plan fact 3).
+/// This is MODE_DELETE's table compaction. qemu re-serialises every
+/// entry from parsed state; a verbatim per-entry copy instead
+/// preserves unknown trailing extra data byte-for-byte, which is
+/// what byte-identity against `qemu-img snapshot -d` output
+/// requires for qemu-written images. Removing the sole remaining
+/// entry yields length 0 (the caller then writes header
+/// `nb_snapshots = 0, snapshots_offset = 0` and allocates no
+/// table, as qemu does when the last snapshot is deleted).
 ///
 /// `old_len` is the exact byte length of the old table (from
 /// [`snapshot_table_byte_len`]); only `old_table[..old_len]` is
@@ -345,7 +346,7 @@ pub fn build_snapshot_table_without(
 /// Matching semantics for [`find_snapshot_in_table`].
 ///
 /// qemu's mutating modes resolve their snapshot argument with
-/// *different* matchers (phase 8 fact 2):
+/// *different* matchers:
 ///
 /// - `qemu-img snapshot -a` goes through
 ///   `qcow2_snapshot_goto` -> `find_snapshot_by_id_or_name`:
@@ -1108,7 +1109,7 @@ mod tests {
 
     #[test]
     fn find_id_pass_beats_earlier_name_match() {
-        // The phase 8 precedence fixture: id=1 name="2", id=2
+        // The ID-versus-name precedence fixture: id=1 name="2", id=2
         // name="x". Needle "2" must resolve to the SECOND entry
         // (ID match) under IdThenName even though the first
         // entry's NAME matches — a later ID match beats an

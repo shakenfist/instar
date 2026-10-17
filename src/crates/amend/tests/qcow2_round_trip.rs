@@ -5,8 +5,8 @@
 //! hand-crafted), calls `plan_amend_qcow2`, applies the emitted
 //! patches with `apply_amend`, re-parses with `QcowHeader::parse`
 //! (and `parse_header_extensions` where extensions are involved),
-//! and asserts the resulting header invariants. Where phase 2's
-//! inline unit tests assert "the planner emits these bytes", this
+//! and asserts the resulting header invariants. Where the
+//! planner's inline unit tests (src/qcow2.rs) assert "the planner emits these bytes", this
 //! suite asserts "after applying those bytes and re-parsing, the
 //! header is correct and self-consistent" across every transition,
 //! including compound (down-then-up, lazy on-then-off) sequences.

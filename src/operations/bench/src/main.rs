@@ -1,17 +1,19 @@
 //! Bench operation: measure guest-side image read throughput
 //! (`qemu-img bench` parity, read path).
 //!
-//! # Flow (Mission §1 of `PLAN-bench-phase-03-guest-read.md`)
+//! # Flow (read path)
 //!
 //! 1. Validate the call table and cast the [`shared::BenchConfig`] the
-//!    host wrote at [`OPERATION_CONFIG_ADDR`]. Reject an invalid magic,
-//!    a bad `bufsize`, or (until phase 5) a write request with
-//!    `ERROR_BAD_CONFIG`.
+//!    host wrote at [`OPERATION_CONFIG_ADDR`]. Reject an invalid magic
+//!    or a bad `bufsize` with `ERROR_BAD_CONFIG`. A write request
+//!    (`FLAG_WRITE`) forks to the write path after the format probe;
+//!    formats other than raw and qcow2 are refused there with
+//!    `ERROR_WRITE_UNSUPPORTED`.
 //! 2. Cast the [`shared::ChainConfig`] at [`CHAIN_CONFIG_ADDR`], verify
 //!    the input sector sizes agree, probe sector 0 of device 0 and
 //!    cross-check the guest's own header parse against the host's
-//!    format claims. Any format bench cannot read (LUKS, qcow1, vdi,
-//!    qed, iso, the legacy vmdk3, unknown) is refused with
+//!    format claims. Any format bench cannot read (LUKS, qed, iso, the
+//!    legacy vmdk3, unknown) is refused with
 //!    `ERROR_UNSUPPORTED_FORMAT`.
 //! 3. Build [`bench::BenchParams`] from the config and initialise the
 //!    op-lifetime cached chain state ([`qcow2::ChainStates`] +
@@ -51,11 +53,11 @@ use shared::{
     MAX_SECTOR_SIZE, OPERATION_CONFIG_ADDR, SCRATCH_MEM_BASE,
 };
 
-// Phase-6 step 6b: the qcow2 `-w` path is driven by the shared windowed
-// planner (`qcow2-write`) and its literal guest executor
-// (`qcow2-write-exec`). The moved refcount-growth planner lives in
-// `qcow2_write::growth` (step 6a); `worst_case_touched` stays in
-// `crates/bench` (BenchParams/schedule-coupled).
+// The qcow2 `-w` path is driven by the shared windowed planner
+// (`qcow2-write`) and its literal guest executor (`qcow2-write-exec`).
+// The refcount-growth planner lives in `qcow2_write::growth`, shared
+// with commit/rebase; `worst_case_touched` stays in `crates/bench`
+// because it is computed from BenchParams and the request schedule.
 use qcow2_write::growth::{plan_refcount_growth, GrowthCaps, GrowthOverflow};
 use qcow2_write::{
     check_envelope_with, new_state_cow, plan_flush, plan_write, DataSource, Gate, RegionId,
@@ -67,7 +69,7 @@ use qcow2_write_exec::{
 };
 
 // ================================================================
-// Scratch memory layout (Mission §4)
+// Scratch memory layout
 // ================================================================
 // Buffers grow up from SCRATCH_MEM_BASE and must stay below
 // ALLOC_HEAP_BASE (the top-of-scratch 512 KiB bump heap):
@@ -100,15 +102,15 @@ const _: () = assert!(DYNAMIC_START + 2 * MAX_SECTOR_SIZE * MAX_CHAIN_DEVICES <=
 const _: () = assert!(bench::BENCH_MAX_BUFSIZE == MAX_CLUSTER_SIZE as u64);
 
 // ================================================================
-// qcow2 write-mode scratch (phase 6 step 6b, Mission §1-§2)
+// qcow2 write-mode scratch
 // ================================================================
 // Only the qcow2 `-w` path touches these regions; the read path and the
 // raw `-w` path never reference them. They sit ABOVE the per-device
 // L1/L2 caches `init_chain_states` consumes (2 × MAX_SECTOR_SIZE per
 // chain device, growing up from DYNAMIC_START).
 //
-// The migration onto `qcow2-write` / `qcow2-write-exec` re-carves this
-// region to hold the planner/executor staging (settled decision 5):
+// This region holds the `qcow2-write` / `qcow2-write-exec` planner and
+// executor staging, carved tight and verified by const asserts below:
 // the step program, the staged active L1, the fixed-slot L2 window, the
 // staged refcount table (also the plan_flush writeback-offset source —
 // so the old `WRITE_RB_OFFSETS` side table is RECLAIMED), the staged
@@ -116,13 +118,12 @@ const _: () = assert!(bench::BENCH_MAX_BUFSIZE == MAX_CLUSTER_SIZE as u64);
 // (v1-filler) planner bounce region. The executor's `CallerData` region
 // aliases BUF_DEST (the COW-fill cluster buffer, free on the write
 // path); `read_chain_virtual_cluster` keeps using BUF_COMPRESSED /
-// BUF_STAGING for backing-chain decompression during the decision-3
-// try/refuse/fill/resubmit protocol.
+// BUF_STAGING for backing-chain decompression during the backed-fill
+// try/refuse/fill/resubmit protocol (see `run_qcow2_write`).
 //
-// Preemptive setup-time refcount growth (PLAN-bench-refcount-growth,
-// moved to `qcow2_write::growth` in step 6a) may extend the staged set
-// before the timing bracket opens; the caps below ARE its refusal
-// envelope.
+// Preemptive setup-time refcount growth (planned by
+// `qcow2_write::growth`) may extend the staged set before the timing
+// bracket opens; the caps below ARE its refusal envelope.
 
 /// First free byte above the dynamic per-device caches.
 const WRITE_SCRATCH_BASE: usize = DYNAMIC_START + 2 * MAX_SECTOR_SIZE * MAX_CHAIN_DEVICES;
@@ -153,7 +154,7 @@ const WRITE_MAX_REFBLOCKS: usize = 2048;
 
 /// The windowed step program (`[Step; WRITE_STEP_CAPACITY]`). 64 KiB
 /// holds well over 1000 steps (~100 worst-case allocating clusters per
-/// refill); the decision-1 loop windows anything larger.
+/// refill); the windowed loop plans anything larger across refills.
 const WRITE_STEP_BUF: usize = WRITE_SCRATCH_BASE;
 const WRITE_STEP_BUF_LIMIT: usize = 64 * 1024;
 const WRITE_STEP_CAPACITY: usize = WRITE_STEP_BUF_LIMIT / core::mem::size_of::<Step>();
@@ -164,8 +165,9 @@ const WRITE_L1_BUF: usize = WRITE_STEP_BUF + WRITE_STEP_BUF_LIMIT;
 const WRITE_L1_LIMIT: usize = 64 * 1024;
 
 /// The fixed-slot staged-L2 window (`RegionId::L2Slot`). Sized to hold
-/// exactly one slot at the maximum cluster size (decision 5's ≥1-slot
-/// requirement at cs=2 MiB); more slots at smaller cluster sizes.
+/// exactly one slot at the maximum cluster size (the planner needs at
+/// least one slot, and bench accepts cs=2 MiB); more slots at smaller
+/// cluster sizes.
 const WRITE_L2_WINDOW: usize = WRITE_L1_BUF + WRITE_L1_LIMIT;
 const WRITE_L2_WINDOW_LIMIT: usize = MAX_CLUSTER_SIZE;
 
@@ -175,8 +177,8 @@ const WRITE_L2_WINDOW_LIMIT: usize = MAX_CLUSTER_SIZE;
 const WRITE_RT_BUF: usize = WRITE_L2_WINDOW + WRITE_L2_WINDOW_LIMIT;
 const WRITE_RT_LIMIT: usize = 64 * 1024;
 
-/// The staged refcount blocks (`RegionId::Refblocks`; dense prefix,
-/// mutated in place by the planner's allocator — decision 6).
+/// The staged refcount blocks (`RegionId::Refblocks`; dense prefix, a
+/// single copy mutated in place by the planner's allocator).
 const WRITE_REFBLOCKS_BUF: usize = WRITE_RT_BUF + WRITE_RT_LIMIT;
 const WRITE_REFBLOCKS_LIMIT: usize = 2 * 1024 * 1024;
 
@@ -223,10 +225,11 @@ const _: () = assert!(WRITE_MAX_REFBLOCKS <= qcow2_write::MAX_REFBLOCKS);
 /// support") is emitted by the pre-bracket format fork in `_start`.
 ///
 /// The ids 1-7 equal `qcow2_write::Gate::code()` for the corresponding
-/// gates one-to-one (a phase-3 design), pinned by the const-asserts
-/// below so a divergence is a build error — this is how the migration
-/// keeps bench's `ERROR_WRITE_UNSUPPORTED` rendering while sourcing the
-/// gate decisions from the shared `check_envelope`.
+/// gates one-to-one (the crate numbered its gates to match these
+/// existing wire ids), pinned by the const-asserts below so a divergence
+/// is a build error — this is how bench keeps its
+/// `ERROR_WRITE_UNSUPPORTED` rendering while sourcing the gate
+/// decisions from the shared `check_envelope`.
 mod wgate {
     pub const REFCOUNT_BITS: u64 = 1;
     pub const COMPRESSION: u64 = 2;
@@ -237,8 +240,8 @@ mod wgate {
     pub const SNAPSHOTS: u64 = 7;
 }
 
-// The wgate ids equal the crate's Gate codes one-to-one (decision 6's
-// gate-code-equality pin — a build error if the crate ever renumbers).
+// The wgate ids equal the crate's Gate codes one-to-one (a build error
+// if the crate ever renumbers, since these ids are on the wire).
 const _: () = assert!(Gate::RefcountWidth.code() as u64 == wgate::REFCOUNT_BITS);
 const _: () = assert!(Gate::UnknownIncompatible.code() as u64 == wgate::COMPRESSION);
 const _: () = assert!(Gate::ExtendedL2.code() as u64 == wgate::EXTENDED_L2);
@@ -269,10 +272,9 @@ fn panic(_info: &PanicInfo) -> ! {
 /// vdi is served by the qcow2 crate's `vdi-input` arm, parallels by its
 /// `parallels-input` arm, qcow1 by its `qcow1-input` arm, and dmg by
 /// its `dmg-input` arm, which bench enables in its Cargo.toml (alongside
-/// `vhd-input`/`vhdx-input`); format-coverage phases 2, 3, 4 and 5
-/// graduate them here in lock-step with the host `chain::ImageFormat`
-/// graduation so bench reads VDI, Parallels, QCOW1 and DMG rather than
-/// refusing them.
+/// `vhd-input`/`vhdx-input`). Each is accepted here in lock-step with
+/// the host `chain::ImageFormat` support for it, so bench reads VDI,
+/// Parallels, QCOW1 and DMG rather than refusing them.
 ///
 /// Returns a family tag: distinct formats compare unequal, but `Vmdk4`
 /// and `VmdkDescriptor` share a family so a descriptor whose flat
@@ -381,20 +383,20 @@ unsafe fn write_input_byte_range(
 }
 
 // ================================================================
-// qcow2 allocating-write path (phase 6 step 6b: migrated onto
-// crates/qcow2-write + crates/qcow2-write-exec)
+// qcow2 allocating-write path (crates/qcow2-write +
+// crates/qcow2-write-exec)
 // ================================================================
 //
-// The per-cluster write path is now driven by the shared windowed
-// planner (`plan_write` / `plan_flush`) and its literal guest executor
-// (`execute`), replacing bench's hand-inlined disk walk + write-through
-// metadata (settled decisions 2-6 of
-// PLAN-qcow2-write-infrastructure-phase-06-bench.md). Setup (gates,
-// refblock staging, preemptive refcount growth) stays op-side, but its
-// gate checks come from the shared `check_envelope` and its growth
-// planner from `qcow2_write::growth`; growth EXECUTION is re-pointed at
-// the executor's byte-range layer. The `write_input_byte_range` helper
-// above is retained solely for the untouched raw `-w` path.
+// The per-cluster write path is driven by the shared windowed planner
+// (`plan_write` / `plan_flush`) and its literal guest executor
+// (`execute`). The planner's staged L1/L2 window is authoritative and
+// on-disk metadata is stale between flushes, so bench never walks the
+// on-disk L1/L2 itself. Setup (gates, refblock staging, preemptive
+// refcount growth) stays op-side, but its gate checks come from the
+// shared `check_envelope`, its growth planner from
+// `qcow2_write::growth`, and its growth execution from
+// `qcow2_write_exec::growth`. The `write_input_byte_range` helper above
+// is used only by the raw `-w` path.
 
 /// Read a big-endian u64 from `buf` at `off`. Callers guarantee
 /// `off + 8 <= buf.len()`.
@@ -423,7 +425,7 @@ fn invalidate_dev0_caches(chain_states: &mut qcow2::ChainStates) {
 /// Byte geometry of the qcow2-write scratch carve for one run, threaded
 /// to the [`StagedRegions`] / [`Regions`] view builders so the planner
 /// and executor alias the exact same buffers (the two halves of the
-/// qcow2-write decision-1 loop).
+/// qcow2-write windowed loop).
 #[derive(Clone, Copy)]
 struct WriteCarve {
     cluster_size: usize,
@@ -470,7 +472,7 @@ unsafe fn init_step_storage() -> &'static mut [Step] {
 ///
 /// The returned slices alias the fixed scratch regions; the caller must
 /// not hold a [`Regions`] view (or any other aliasing borrow) at the
-/// same time. The decision-1 loop guarantees this: plan with the staged
+/// same time. The windowed loop guarantees this: plan with the staged
 /// view, drop it, execute with the regions view.
 unsafe fn staged_view<'a>(carve: &WriteCarve) -> StagedRegions<'a> {
     StagedRegions {
@@ -544,15 +546,16 @@ fn map_gate(g: Gate) -> (u32, u64) {
     }
 }
 
-/// Render a [`plan_write`] / [`plan_flush`] refusal to bench's wire code
-/// (settled decision 6). `RefcountExhausted` keeps `ERROR_ALLOC_EXHAUSTED`;
+/// Render a [`plan_write`] / [`plan_flush`] refusal to bench's wire code.
+/// Codes are append-only, so existing renderings never change:
+/// `RefcountExhausted` keeps `ERROR_ALLOC_EXHAUSTED`;
 /// `CompressedCluster` keeps bench's mid-run gate-2
 /// `ERROR_WRITE_UNSUPPORTED` rendering; the crate classification refusals
 /// bench had no prior rendering for map to the appended
 /// `ERROR_IMAGE_INCONSISTENT` (code 9); planner-protocol errors are
 /// internal bugs (`ERROR_PARSE_FAILED`). Exhaustive.
 ///
-/// Phase 7 (7d) COW adoption: with `new_state_cow`, the crate classifies
+/// Copy-on-write: with `new_state_cow`, the crate classifies
 /// snapshot-shared data clusters (`SnapshotShared`) and L2 tables
 /// (`SnapshotSharedL2Table`) into COW emission instead of returning them
 /// as errors, so those arms no longer fire on the `-w` path. They are
@@ -655,7 +658,7 @@ fn map_growth_error(e: growth::GrowthExecError) -> (u32, u64) {
 }
 
 /// Parse the top image's header, apply the shared write envelope
-/// ([`check_envelope_with`], decision 6), stage the refcount table +
+/// ([`check_envelope_with`]), stage the refcount table +
 /// refblocks + active L1 into scratch, and preemptively grow the
 /// refcount structures to the schedule's worst-case coverage. All checks
 /// are pre-bracket: a refusal returns before any BenchStart and leaves
@@ -689,25 +692,23 @@ unsafe fn qcow2_write_setup(
         }
     };
 
-    // ---- Write-envelope gates (decision 6: the shared check_envelope,
-    // rendered onto bench's ERROR_WRITE_UNSUPPORTED + gate-id wire). ----
+    // ---- Write-envelope gates (the shared check_envelope, rendered
+    // onto bench's ERROR_WRITE_UNSUPPORTED + gate-id wire). ----
     //
-    // Phase 7 COW adoption (7d, decision 4a/4b, lifting the last of the
-    // three interim snapshot-refusal gates): `allow_snapshots = true`
-    // relaxes the `Gate::HasSnapshots` refusal so a snapshot-bearing image
-    // reaches the COW planner instead of being refused with
-    // `ERROR_WRITE_UNSUPPORTED` + gate id 7. Every other gate is
-    // unconditional. Paired with `new_state_cow` below, the qcow2-write
-    // classifier then emits COW steps for snapshot-shared data clusters
-    // (C1) and L2 tables (C2) — bench writes into its own image's active
-    // view, so every pre-existing snapshot is preserved (C8), matching a
-    // qemu twin. bench already provisions the refcount growth the COW
-    // allocations need (the preemptive growth pass below, sized from
-    // `worst_case_touched`, which upper-bounds the fresh D'/T' clusters COW
-    // allocates exactly as it bounds fresh allocations for unallocated
-    // writes), so C9 is inherited unchanged. The `Gate::HasSnapshots`
-    // rendering (`wgate::SNAPSHOTS`) is kept for defensive/non-COW callers
-    // but no longer fires here.
+    // Copy-on-write: `allow_snapshots = true` relaxes the
+    // `Gate::HasSnapshots` refusal so a snapshot-bearing image reaches the
+    // COW planner instead of being refused with `ERROR_WRITE_UNSUPPORTED` +
+    // gate id 7. Every other gate is unconditional. Paired with
+    // `new_state_cow` below, the qcow2-write classifier then emits COW
+    // steps for snapshot-shared data clusters and L2 tables — bench writes
+    // into its own image's active view, so every pre-existing snapshot is
+    // preserved, matching a qemu twin. bench already provisions the
+    // refcount growth the COW allocations need (the preemptive growth pass
+    // below, sized from `worst_case_touched`, which upper-bounds the fresh
+    // copy clusters and L2 tables COW allocates exactly as it bounds fresh
+    // allocations for unallocated writes), so COW needs no extra growth
+    // logic. The `Gate::HasSnapshots` rendering (`wgate::SNAPSHOTS`) is
+    // kept for defensive/non-COW callers but no longer fires here.
     if let Err(gate) = check_envelope_with(&hdr, true) {
         return Err(map_gate(gate));
     }
@@ -797,7 +798,7 @@ unsafe fn qcow2_write_setup(
         *bytes_read += cluster_usize as u64;
     }
 
-    // ---- Preemptive refcount growth (decision 1 + growth module) ----
+    // ---- Preemptive refcount growth (qcow2_write{,_exec}::growth) ----
     let mut exec = growth::GrowthExec::new(cluster_size, entries_per_refblock, refblock_count);
     let file_end_clusters = {
         let refblocks = core::slice::from_raw_parts(
@@ -834,8 +835,9 @@ unsafe fn qcow2_write_setup(
         Err(GrowthOverflow) => return Err((BenchResult::ERROR_ALLOC_EXHAUSTED, 0)),
     };
     if plan.new_refblocks > 0 {
-        // Growth's durability fsyncs must be REAL (the phase-6 census: 1
-        // in-place / 2 relocation). The run's `io` is fsync-DISABLED (so
+        // Growth's durability fsyncs must be REAL (1 for in-place growth, 2
+        // for relocation, so a crash cannot leave the header pointing at an
+        // unwritten refcount table). The run's `io` is fsync-DISABLED (so
         // `plan_flush` emits zero fsyncs and bench owns the cadence); the
         // growth helper fsyncs through its `DeviceIo`, so it gets a
         // fsync-ENABLED `CallTableIo` on the same call table. Its writes
@@ -903,7 +905,7 @@ enum WriteOutcome {
 
 /// Drive one `plan_write` request to completion: plan into the step
 /// window, execute each window on `BufFull` (resuming with identical
-/// args, the decision-1 contract), and surface the outcome. On a
+/// args, the resume contract), and surface the outcome. On a
 /// `NeedsBackingFill` refusal the benign decision-9 scaffolding (a fresh
 /// L2 staged into the window) is executed first so the caller's resubmit
 /// classifies against a consistent staged window.
@@ -951,8 +953,9 @@ unsafe fn drive_plan_write(
                 return WriteOutcome::NeedsFill;
             }
             Err(e) => {
-                // Execute the already-emitted window first (preserve the
-                // pre-refusal bytes, phases 4-5 posture), then surface the
+                // Execute the already-emitted window first (the steps
+                // before the refusal are valid and complete, so the image
+                // keeps them, as commit and rebase do), then surface the
                 // planner refusal — it dominates any exec failure.
                 let _ = exec_window(io, steps, carve);
                 let (c, d) = map_write_error(e);
@@ -962,10 +965,10 @@ unsafe fn drive_plan_write(
     }
 }
 
-/// Drive one full `plan_flush` epoch to completion (decision 4). All
-/// Durability barriers degrade to Ordering on the fsync-disabled
-/// executor, so the caller issues its own single op-side fsync afterward
-/// (or none, at end of bracket).
+/// Drive one full `plan_flush` epoch to completion. All Durability
+/// barriers degrade to Ordering on the fsync-disabled executor, so the
+/// caller issues its own single op-side fsync afterward (or none, at end
+/// of bracket).
 ///
 /// # Safety
 ///
@@ -1007,8 +1010,9 @@ unsafe fn drive_plan_flush(
 /// allocate-on-write, flush ordering) and `crates/qcow2-write-exec`
 /// (the literal executor). The executor is fsync-DISABLED so the crate's
 /// flush-epoch Durability barriers degrade to Ordering; bench issues its
-/// own single op-side `fsync_input(0)` per count-based cadence point,
-/// preserving today's fsync census exactly (decision 4).
+/// own single op-side `fsync_input(0)` per count-based cadence point, so
+/// the fsync count is exactly one per scheduled flush (matching
+/// `bench::total_flushes`), however many barriers the planner emits.
 ///
 /// # Safety
 ///
@@ -1026,9 +1030,9 @@ unsafe fn run_qcow2_write(
     chain_states: &mut qcow2::ChainStates,
     mut bytes_read: u64,
 ) -> u64 {
-    // fsync-DISABLED executor I/O (decision 4): every plan_flush
-    // Durability barrier on Input0 degrades to Ordering, so the executor
-    // emits ZERO fsyncs and bench owns the cadence fsyncs itself.
+    // fsync-DISABLED executor I/O: every plan_flush Durability barrier on
+    // Input0 degrades to Ordering, so the executor emits ZERO fsyncs and
+    // bench owns the cadence fsyncs itself.
     let mut io = CallTableIo::new(call_table, false);
 
     // ---- Pre-bracket setup + envelope gates + preemptive growth ----
@@ -1053,10 +1057,10 @@ unsafe fn run_qcow2_write(
         max_refblocks: refblock_count,
         device: TargetDevice::Input0,
     };
-    // COW-enabled (phase 7, 7d, decision 4b): snapshot-shared data
-    // clusters (C1) and L2 tables (C2) classify into COW emission instead
-    // of refusing, so `bench -w` into a snapshot-bearing image copies the
-    // shared clusters and preserves every pre-existing snapshot (C8).
+    // COW-enabled: snapshot-shared data clusters and L2 tables classify
+    // into COW emission instead of refusing, so `bench -w` into a
+    // snapshot-bearing image copies the shared clusters and preserves
+    // every pre-existing snapshot.
     let mut wstate = match new_state_cow(&hdr, &staging_config) {
         Ok(s) => s,
         Err(gate) => {
@@ -1117,7 +1121,9 @@ unsafe fn run_qcow2_write(
             let in_off = (voff - cluster_start) as usize;
             let win_len = win_end - voff;
 
-            // Decision 3: submit the pattern window as-is.
+            // Try first: submit the pattern window as-is. Only a partial
+            // allocating write on a backed image refuses (NeedsFill), and
+            // is then filled from the chain and resubmitted below.
             match drive_plan_write(
                 &mut wstate,
                 &mut io,
@@ -1176,8 +1182,9 @@ unsafe fn run_qcow2_write(
                     ) {
                         WriteOutcome::Done => {}
                         WriteOutcome::NeedsFill => {
-                            // Defensive: a full-cluster resubmit must not
-                            // re-refuse (decision 6).
+                            // Defensive: a full-cluster resubmit cannot
+                            // need a fill, so a re-refusal means the image
+                            // or planner state is inconsistent.
                             return fail(
                                 call_table,
                                 BenchResult::ERROR_IMAGE_INCONSISTENT,
@@ -1203,10 +1210,10 @@ unsafe fn run_qcow2_write(
         completed += 1;
         bytes_read += bufsize;
 
-        // Flush cadence (decision 4): drive ONE full plan_flush epoch
-        // (staged dirty L2s + L1 + dirty refblocks reach disk — no
-        // executor fsync) then issue exactly ONE op-side fsync.
-        // `flushes_issued` counts cadence points only.
+        // Flush cadence: drive ONE full plan_flush epoch (staged dirty L2s
+        // + L1 + dirty refblocks reach disk — no executor fsync) then issue
+        // exactly ONE op-side fsync. `flushes_issued` counts cadence points
+        // only.
         if bench::flush_after_completion(params.count, completed as u32, params.flush_interval) {
             if let Err((error, detail)) =
                 drive_plan_flush(&mut wstate, &mut io, &mut step_buf, &carve)
@@ -1258,8 +1265,8 @@ unsafe fn run_qcow2_write(
 /// - Initialised the chain's input devices and routed virtio-block I/O
 ///   through the call table.
 ///
-/// These invariants hold by construction of the host-side VMM (phase
-/// 4's `run_bench`); no other caller is architecturally possible.
+/// These invariants hold by construction of the host-side VMM
+/// (`run_bench`); no other caller is architecturally possible.
 #[no_mangle]
 pub unsafe extern "C" fn _start() -> u64 {
     let call_table = get_call_table();
@@ -1274,13 +1281,13 @@ pub unsafe extern "C" fn _start() -> u64 {
     if !config.is_valid() {
         return fail(call_table, BenchResult::ERROR_BAD_CONFIG, 0, 0, bytes_read);
     }
-    // Write vs read mode (phase 5). FLAG_WRITE selects the write-mode
-    // fork below; the raw-only gate (phase 5a) is applied after the
-    // format probe, pre-bracket. FLAG_NO_DRAIN is read (and documented)
-    // but is a no-op under serial execution.
+    // Write vs read mode. FLAG_WRITE selects the write-mode fork
+    // below; the raw/qcow2-only write gate is applied after the format
+    // probe, pre-bracket. FLAG_NO_DRAIN is read (and documented) but is
+    // a no-op under serial execution.
     let is_write = config.flags & BenchConfig::FLAG_WRITE != 0;
     // Guard only what would break the guest: the qemu numeric bounds
-    // (count/depth/step ranges) are the host's job in phase 4. A zero
+    // (count/depth/step ranges) are validated by the host CLI. A zero
     // or over-cap bufsize would overrun BUF_DEST.
     let bufsize = config.bufsize;
     if bufsize == 0 || bufsize > bench::BENCH_MAX_BUFSIZE {

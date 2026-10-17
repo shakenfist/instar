@@ -1,15 +1,23 @@
 #!/usr/bin/env bash
 # Prove that a change under review does not alter `instar info` output.
 #
-# Written for differencing phase 3 (docs/plans/PLAN-differencing-phase-03-parse.md),
-# whose whole premise is that teaching crates/vhd and crates/vhdx to parse a
-# differencing image's parent locators changes nothing about what any
-# operation *does* with what it now knows (see survey finding 4 and decision
-# 6 in that plan: populating info's backing_file field for a VHD/VHDX would
-# silently turn on host-side chain walking in discover_backing_chain, which
-# is phase 11's job, not this one's). Later phases that touch the same two
-# crates without meaning to change info output can reuse this script as a
-# gate; that is why it lives in tools/ rather than being run by hand once.
+# Written for the change that taught crates/vhd and crates/vhdx to parse a
+# differencing image's parent locators
+# (docs/plans/PLAN-differencing-phase-03-parse.md). That change's whole
+# premise was that parsing changes nothing about what any operation *does*
+# with what it now knows: populating info's backing_file field for a
+# VHD/VHDX would silently turn on host-side chain walking in
+# discover_backing_chain, which was deliberately left to a separate change.
+# Later changes that touch the same two crates without meaning to change
+# info output can reuse this script as a gate; that is why it lives in
+# tools/ rather than being run by hand once.
+#
+# Caveat: host-side chain discovery has since landed, and `instar info` now
+# reports a backing file for a VHD/VHDX differencing child (see
+# tests/test_differencing.py). Check 4 below still asserts the parse-only
+# invariant that no vpc/vhdx image carries a backing-file line, so on the
+# current tree it flags the diff-child fixtures; byte-identity against the
+# base (check 3) is the part of this script that still applies as-is.
 #
 # Base commit selection: this script never hardcodes a base SHA. It computes
 # `git merge-base origin/develop HEAD` in the current worktree, i.e. the
@@ -37,8 +45,9 @@
 #   4. Additionally greps every vpc/vhdx image's CURRENT-binary output for a
 #      "backing file" / "backing-filename" line. Byte-identity with the base
 #      binary already forbids a *new* one appearing, but this is the
-#      falsifiable form of decision 6 stated directly: no VHD or VHDX image
-#      may carry that line at all, regardless of what the base binary did.
+#      falsifiable form of the parse-only invariant stated directly: no VHD
+#      or VHDX image may carry that line at all, regardless of what the base
+#      binary did.
 #      Both stdout and stderr are compared, along with the exit status.
 #   5. Images absent from the local testdata checkout are skipped and
 #      counted, never treated as failures -- except for the handful in
@@ -103,7 +112,7 @@ CURRENT_BINARY="$REPO_ROOT/src/target/release/instar"
 # to an existence check that a leftover artifact from an earlier run
 # satisfies -- and the script would compare two stale binaries and print
 # PASS. A false PASS is the worst thing this script can do, since its
-# whole job is to be the falsifiable form of decision 6.
+# whole job is to prove that info output did not change.
 rm -f "$CURRENT_BINARY"
 if ! make -C "$REPO_ROOT" instar; then
     echo "error: building the current tree's instar failed" >&2
@@ -154,10 +163,10 @@ FAILED=0
 FAILED_IDS=()
 
 # Images that must be present, not merely skipped. These are the
-# differencing fixtures phase 2 added: the parsers this script guards
-# read a parent locator, and these are the only images in the manifest
-# that have one. A run that skipped them compared nothing that could
-# have changed.
+# differencing fixtures that existed when the parsers this script guards
+# were written: those parsers read a parent locator, and these were then
+# the only images in the manifest that had one. A run that skipped them
+# compared nothing that could have changed.
 REQUIRED_IDS=(
     vhd-differencing
     vhd-diff-child-aligned
@@ -225,9 +234,10 @@ while IFS=$'\t' read -r img_id img_path img_format; do
             entry_failed=1
         fi
 
-        # Decision 6 / survey finding 4: no vpc (VHD) or vhdx image may
-        # carry a backing-file line, independent of what the base binary
-        # did.
+        # Parsing a parent locator must not populate backing_file: no vpc
+        # (VHD) or vhdx image may carry a backing-file line, independent of
+        # what the base binary did. (See the caveat in the header: chain
+        # discovery now reports one for differencing children.)
         case "$img_format" in
             vpc|vhdx)
                 if grep -qi 'backing file\|backing-filename' "$cur_out"; then

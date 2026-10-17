@@ -1,7 +1,7 @@
 //! Coverage-guided fuzzing for the qcow2 repair planners in
-//! `crates/check/` — the "no corruption regardless of input"
-//! surface the check-repair master plan (phase 9) flags for
-//! fuzzing.
+//! `crates/check/` — a repair planner rewrites metadata in the
+//! user's image, so it must not corrupt it regardless of input,
+//! which makes it a surface worth fuzzing.
 //!
 //! Structured-header planner archetype (like
 //! `fuzz_snapshot_refcount`): decode a 32-byte header, synthesize

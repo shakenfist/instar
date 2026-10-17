@@ -19,8 +19,8 @@
 //!
 //! No re-parse round-trip: resize mutates an existing image, so a
 //! faithful reparse would require reconstructing a complete input
-//! image from fuzzer-synthetic existing-state bytes. Phase 11's
-//! consistency suite (`TestResizeConsistency` +
+//! image from fuzzer-synthetic existing-state bytes. The
+//! integration consistency suite (`TestResizeConsistency` +
 //! `TestResizeBaselineMatrix`) cross-checks the planner+guest pair
 //! against real images. This target's contract is narrower:
 //! no panics, no integer overflows, no overlapping writes, no
@@ -100,16 +100,16 @@ fuzz_target!(|data: &[u8]| {
     // Per-format clamp because the planners have different
     // robustness profiles:
     //
-    // * **qcow2** is robust against large sizes after followup-01
-    //   (the targeted refcount-block pre-pass bounded the staging
-    //   regardless of image size).  Use 48 bits = 256 TiB to
-    //   exercise the new code path at cloud-disk scale.
-    // * **vmdk / vhd / vhdx** still have the phase-12 planner-
-    //   input-validation gap (returning Ok with corrupt
-    //   total_file_size when the host passes mutually
+    // * **qcow2** is robust against large sizes: its targeted
+    //   refcount-block pre-pass bounds the staging regardless of
+    //   image size.  Use 48 bits = 256 TiB to exercise that code
+    //   path at cloud-disk scale.
+    // * **vmdk / vhd / vhdx** still have a planner input-
+    //   validation gap this fuzzer found (returning Ok with
+    //   corrupt total_file_size when the host passes mutually
     //   inconsistent values).  Keep the 40-bit / 1 TiB clamp
-    //   until those planners are hardened (master-plan Future
-    //   work).
+    //   until those planners are hardened (future work in
+    //   PLAN-resize.md).
     //
     // The qcow2 branch is selected by `format_sel == 1`.
     const SIZE_MASK_TIGHT: u64 = (1 << 40) - 1;

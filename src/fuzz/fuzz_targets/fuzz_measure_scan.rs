@@ -1,6 +1,6 @@
 //! Coverage-guided fuzzing for the per-parser `scan_allocation` entry
-//! points added in phase 2 of PLAN-measure.md. First byte selects the
-//! format (qcow2/vmdk/vhd/vhdx); remaining bytes feed through the
+//! points. First byte selects the format (qcow2/vmdk/vhd/vhdx);
+//! remaining bytes feed through the
 //! existing instar_fuzz::build_call_table() mock to drive the cached
 //! sector reader and into the metadata-walking scan path.
 //!

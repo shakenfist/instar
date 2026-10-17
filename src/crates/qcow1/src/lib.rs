@@ -102,7 +102,8 @@ pub const QCOW1_OFLAG_COMPRESSED: u64 = 1u64 << 63;
 /// v7.0.0:247): `l1_size > INT_MAX / sizeof(uint64_t)` is refused. With
 /// `INT_MAX == 2_147_483_647` and `sizeof(uint64_t) == 8` this is
 /// `268_435_455` (`0x0fff_ffff`). See [`compute_l1_size`] for the full
-/// arithmetic; step 4d pins the empirical boundary against real qemu.
+/// arithmetic; the `qcow1-huge-size` integration fixture pins the
+/// empirical boundary against real qemu.
 pub const QCOW1_L1_SIZE_MAX: u64 = (i32::MAX as u64) / 8;
 
 // ============================================================================

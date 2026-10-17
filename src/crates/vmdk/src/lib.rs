@@ -957,8 +957,10 @@ impl VmdkState {
 
         // AllocationSummary::clamp keeps `allocated_bytes <=
         // virtual_size` even when the last allocated grain extends
-        // past the declared virtual size. Mirrors the qcow2
-        // out-of-bounds skip established in PLAN-fuzzing-bugs phase 2.
+        // past the declared virtual size. Mirrors the qcow2 allocation
+        // scan's out-of-bounds skip: the measure path and
+        // `fuzz_measure_scan` depend on `allocated_bytes <=
+        // virtual_size`.
         let allocated_bytes = allocated_grains.saturating_mul(self.grain_size_bytes);
         Some(AllocationSummary::clamp(
             virtual_size,
@@ -976,9 +978,9 @@ impl VmdkState {
     /// Single-extent monolithicSparse / monolithicFlat /
     /// streamOptimized only — multi-extent descriptor-driven layouts
     /// are not propagated here (the parser returns the top extent
-    /// only, matching `scan_allocation`'s posture). The map host CLI
-    /// in phase 3 will refuse multi-extent sources with a clear
-    /// error.
+    /// only, matching `scan_allocation`'s posture). Multi-extent
+    /// sources never reach this walker in the map op: `VmdkState::init`
+    /// handles only single-extent binary headers, so they fail init.
     ///
     /// The walker mirrors `scan_allocation` for sector reading and
     /// GD/GT traversal but classifies each GT entry via

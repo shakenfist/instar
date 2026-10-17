@@ -1,22 +1,20 @@
 //! Bitmap operation: mutate a qcow2 image's persistent dirty
 //! bitmaps (`qemu-img bitmap` parity).
 //!
-//! Phase 4 of `PLAN-bitmap`. The guest is the `no_std` / `no_main`
-//! KVM-guest binary `bitmap.bin`: it reads the [`BitmapConfig`] the
-//! host wrote at [`OPERATION_CONFIG_ADDR`], validates the call table
-//! and config, dispatches on the target format, drives the Phase-3
-//! planner crate over the ordered action list, performs the on-disk
-//! data-cluster work the crate cannot, writes everything back under
-//! a crash-safe autoclear dance, and returns a [`BitmapResult`].
+//! The guest is the `no_std` / `no_main` KVM-guest binary
+//! `bitmap.bin`: it reads the [`BitmapConfig`] the host wrote at
+//! [`OPERATION_CONFIG_ADDR`], validates the call table and config,
+//! dispatches on the target format, drives the `bitmap` planner crate
+//! over the ordered action list, performs the on-disk data-cluster
+//! work the crate cannot, writes everything back under a crash-safe
+//! autoclear dance, and returns a [`BitmapResult`].
 //!
-//! **This is step 4d: merge on-disk orchestration, on top of 4c's
-//! metadata-action loop + write-back + autoclear dance** for the five
-//! metadata actions (add / remove / clear / enable / disable). On top
-//! of 4b's header read + gates + host cross-check + staging,
-//! `run_qcow2` applies the ordered action list in memory
+//! **Metadata actions** (add / remove / clear / enable / disable):
+//! after the header read, feature gates, host cross-check and
+//! staging, `run_qcow2` applies the ordered action list in memory
 //! (double-buffering the directory, threading one [`AllocCursor`] and
 //! the staged refblocks), performs the on-disk data-cluster work the
-//! Phase-3 crate cannot (walking a freed/cleared bitmap's on-disk
+//! I/O-free crate cannot (walking a freed/cleared bitmap's on-disk
 //! table to free its data clusters), and writes everything back under
 //! the crash-safe autoclear dance (clear autoclear → write
 //! clusters/directory/refblocks → rewrite the bitmaps extension → set
@@ -25,16 +23,15 @@
 //! **Merge (`ACTION_MERGE`)** is handled by a dedicated flow
 //! ([`run_merge`]) since it mutates only the destination bitmap's
 //! *table entries* and *data clusters* (never the directory), so it
-//! does not fit 4c's directory-centric write-back. An invocation is
-//! **either** all-metadata-actions (the 4c path) **or** a single
-//! merge action (the 4d path); an invocation that mixes merge with
-//! other actions is refused with `ERROR_UNSUPPORTED_ACTION` (v1
-//! restriction — the host/tests drive them separately). v1 merge
-//! supports a **single** `--merge` source (the first entry of the
-//! merge-source pool); a multi-source request is applied as N
-//! sequential single-source merges into the destination. Non-qcow2
-//! targets are refused with `ERROR_UNSUPPORTED_FORMAT` (v1 is
-//! qcow2-only).
+//! does not fit the directory-centric metadata write-back. An
+//! invocation is **either** all-metadata-actions **or** a single
+//! merge action; an invocation that mixes merge with other actions is
+//! refused with `ERROR_UNSUPPORTED_ACTION` (v1 restriction — the
+//! host/tests drive them separately). The host collapses every
+//! `--merge` into that one action and passes the source names in the
+//! merge-source pool; the guest merges each source into the
+//! destination in turn. Non-qcow2 targets are refused with
+//! `ERROR_UNSUPPORTED_FORMAT` (v1 is qcow2-only).
 //!
 //! **First-add / no-extension case:** when the image has no bitmaps
 //! extension yet, the first `--add` creates a new `EXT_BITMAPS`
@@ -43,7 +40,7 @@
 //! room check; if there is no room it returns
 //! `ERROR_SCRATCH_TOO_SMALL`.
 //!
-//! Device idiom (Phase 5 host, mirrored here): the image is attached
+//! Device idiom (set by the host, mirrored here): the image is attached
 //! **input read-write** at slot 0, so the runner reads/writes via
 //! `read_input_sector(0, ..)` / `write_input_sector(0, ..)` /
 //! `fsync_input(0)`.
@@ -101,10 +98,9 @@ fn panic(_info: &PanicInfo) -> ! {
 // `BITMAP_DIR_LIMIT` (64 KiB, like snapshot's `OLD_TABLE_LIMIT`); a
 // larger directory is refused with `ERROR_SCRATCH_TOO_SMALL`.
 //
-// TABLE_BUF / DATA_A / DATA_B / ZERO_BUF are unused in 4b (they are
-// carved now so the layout is stable): 4c walks a bitmap's on-disk
-// table in TABLE_BUF and zero-fills with ZERO_BUF; 4d reads/OR's
-// bitmap data clusters through DATA_A / DATA_B.
+// The metadata actions walk a bitmap's on-disk table in TABLE_BUF
+// and zero-fill with ZERO_BUF; merge reads and ORs bitmap data
+// clusters through DATA_A / DATA_B.
 
 /// The bitmaps directory staging bound. A directory larger than this
 /// is refused with `ERROR_SCRATCH_TOO_SMALL` (matches snapshot's
@@ -290,7 +286,7 @@ fn read_u64_be(buf: &[u8], off: usize) -> u64 {
 /// contiguous from refcount-table index 0 (the v1 gate below), so
 /// index 0 always covers cluster 0 ⇒ `host_refblocks_start == 0`.
 /// Carried explicitly to mirror snapshot's model and to feed
-/// `refblock_byte_offset_for_cluster` in 4c/4d.
+/// `refblock_byte_offset_for_cluster` in the refcount walks.
 #[derive(Clone, Copy)]
 struct StagedRefblocks {
     refblock_count: usize,
@@ -399,7 +395,7 @@ unsafe fn stage_refblocks(
 }
 
 /// The cluster-host-offset -> (staged refblock byte offset, entry
-/// index) mapping closure the 4c/4d refcount walks will use.
+/// index) mapping closure the metadata and merge refcount walks use.
 /// Refblocks are contiguous from RT index 0, so refblock slot ==
 /// cluster_index / entries_per_refblock. Copied from snapshot's
 /// `rb_lookup`.
@@ -432,8 +428,9 @@ fn rb_lookup(
 /// cross-checks the host-probed [`BitmapConfig`] fields against the
 /// guest's own re-parse, stages the bitmaps directory + refcount
 /// table + refblocks into scratch, then hands off to [`run_actions`]
-/// which applies the ordered action list (4c) and writes back under
-/// the autoclear dance. `ACTION_MERGE` is deferred to 4d.
+/// which applies the ordered action list and writes back under the
+/// autoclear dance. A sole `ACTION_MERGE` is routed to [`run_merge`]
+/// instead.
 ///
 /// `#[inline(never)]` is load-bearing. Built for `x86_64-unknown-none`
 /// with `opt-level = "z"` + `lto = true`, inlining a large runner body
@@ -508,7 +505,7 @@ unsafe fn run_qcow2(call_table: &CallTable, config: &BitmapConfig) -> BitmapResu
     // DIRTY / CORRUPT: refuse to touch an image another writer may
     // hold open, or a known-corrupt image. There is no dedicated
     // ERROR_DIRTY in BitmapResult, so map to ERROR_PARSE_FAILED with
-    // an explanatory verbose_print (documented in the phase notes).
+    // an explanatory verbose_print.
     if (hdr.incompatible_features & (INCOMPAT_DIRTY | INCOMPAT_CORRUPT)) != 0
         || hdr.dirty
         || hdr.corrupt
@@ -617,7 +614,7 @@ unsafe fn run_qcow2(call_table: &CallTable, config: &BitmapConfig) -> BitmapResu
         }
     }
     // `dir_len` (possibly 0) + DIR_A now hold the staged directory for
-    // 4c to double-buffer into DIR_B.
+    // `run_actions` to double-buffer into DIR_B.
 
     // --- Stage the refcount table + refblocks ----------------------------
     let staged = match stage_refblocks(call_table, &hdr, sector_size) {
@@ -639,11 +636,11 @@ unsafe fn run_qcow2(call_table: &CallTable, config: &BitmapConfig) -> BitmapResu
     //
     // Merge mutates only the destination bitmap's *table entries* and
     // *data clusters* (not the directory), so it uses a dedicated flow
-    // rather than 4c's directory-centric write-back. v1 restricts an
-    // invocation to EITHER all-metadata-actions OR a single merge
-    // action: a mix is refused with ERROR_UNSUPPORTED_ACTION (the
-    // host/tests drive them separately; documented in the module doc
-    // and the phase-4 plan).
+    // rather than the directory-centric metadata write-back. v1
+    // restricts an invocation to EITHER all-metadata-actions OR a
+    // single merge action: a mix is refused with
+    // ERROR_UNSUPPORTED_ACTION (the host/tests drive them separately;
+    // documented in the module doc).
     let actions = &config.actions[..num_actions];
     let any_merge = actions.iter().any(|&a| a == BitmapConfig::ACTION_MERGE);
     if any_merge {
@@ -736,7 +733,7 @@ fn read_u32_be(buf: &[u8], off: usize) -> u32 {
 }
 
 // ---------------------------------------------------------------------------
-// Action loop + write-back + autoclear dance (step 4c)
+// Action loop + write-back + autoclear dance
 // ---------------------------------------------------------------------------
 
 /// Maximum number of table clusters the guest may accumulate to
@@ -792,11 +789,11 @@ fn entries_per_refblock(cluster_size: u64) -> u64 {
 /// `TABLE_BUF` and setting each `Allocated` cluster's refcount to 0 in
 /// the staged `REFBLOCKS_BUF`.
 ///
-/// The Phase-3 crate already freed the *table* clusters (for `remove`)
+/// The `bitmap` crate already freed the *table* clusters (for `remove`)
 /// or left them allocated (for `clear`); this frees only the data
-/// clusters the crate could not see, exactly as the 3c design split
-/// prescribes. Read-only device I/O (staging the table); the frees are
-/// in-memory refblock mutations.
+/// clusters the I/O-free crate cannot see, because it never reads the
+/// on-disk bitmap table. Read-only device I/O (staging the table); the
+/// frees are in-memory refblock mutations.
 ///
 /// # Safety
 ///
@@ -1091,8 +1088,9 @@ unsafe fn run_actions(
                 }
             }
             BitmapConfig::ACTION_MERGE => {
-                // Merge is 4d; refuse for now (image untouched — the
-                // loop has only mutated scratch up to this point).
+                // Unreachable: a merge is routed to `run_merge` before
+                // this loop runs. Refuse defensively (image untouched —
+                // the loop has only mutated scratch up to this point).
                 return make_result(config, last_action, BitmapResult::ERROR_UNSUPPORTED_ACTION);
             }
             _ => return make_result(config, last_action, BitmapResult::ERROR_UNSUPPORTED_ACTION),
@@ -1515,7 +1513,7 @@ unsafe fn write_bitmaps_extension(
 }
 
 // ---------------------------------------------------------------------------
-// Merge on-disk orchestration (step 4d)
+// Merge on-disk orchestration
 // ---------------------------------------------------------------------------
 
 /// Resolve merge source `k`'s name slice within `config.merge_source_pool`,
@@ -1552,7 +1550,8 @@ fn alloc_err_to_code(e: SnapshotError) -> u32 {
 /// offset/size — is unchanged); it mutates only the destination's
 /// bitmap **table entries** and its **data clusters**, plus the
 /// refcounts of freshly-allocated / freed data clusters. It therefore
-/// runs its own write-back rather than 4c's directory-centric one.
+/// runs its own write-back rather than `run_actions`' directory-centric
+/// one.
 ///
 /// The full pre-flight (`merge_validate` for every source) runs
 /// *before* any write, so a validation refusal leaves the image
