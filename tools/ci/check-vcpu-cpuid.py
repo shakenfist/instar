@@ -23,6 +23,11 @@ Two properties are checked:
   2. `setup_cpuid` itself still calls `set_cpuid2`, so the helper cannot
      be hollowed out into something that satisfies property 1 while
      setting nothing.
+
+Both properties are read from code rather than from text: a commented-out
+call does not count towards property 1, and property 2 looks only inside
+the helper's own braces, so a mention of set_cpuid2 in a neighbouring
+function cannot vouch for a helper that no longer makes the call.
 """
 
 import argparse
@@ -32,18 +37,50 @@ import sys
 CREATE = re.compile(r'\bcreate_vcpu\s*\(')
 SET_SREGS = re.compile(r'\bset_sregs\s*\(')
 SETUP_CPUID = re.compile(r'\bsetup_cpuid\s*\(')
-HELPER_DEF = re.compile(r'^fn setup_cpuid\b')
+SET_CPUID2 = re.compile(r'\.set_cpuid2\s*\(')
+HELPER_DEF = re.compile(r'^\s*(?:pub(?:\([^)]*\))?\s+)?fn setup_cpuid\b')
+LINE_COMMENT = re.compile(r'//.*$')
+
+
+def code(line):
+    """Return the line with any trailing line comment removed.
+
+    This is deliberately naive: it would also truncate a string literal
+    containing '//', which none of the lines these patterns match
+    contain. The point is that commenting a call out -- the most likely
+    way the call gets lost while someone is debugging -- stops counting
+    as a call.
+    """
+    return LINE_COMMENT.sub('', line)
+
+
+def helper_body(lines, index):
+    """Return the helper's own lines, from its `fn` line to its closing brace.
+
+    rustfmt closes a function with a `}` at the same indentation as the
+    `fn` that opened it, so that brace is where the body ends. Returns
+    None if there is no such brace, which means the source is not shaped
+    the way this guard can read.
+    """
+    opener = lines[index]
+    indent = opener[:len(opener) - len(opener.lstrip())]
+    body = [opener]
+    for line in lines[index + 1:]:
+        body.append(line)
+        if line == f'{indent}}}':
+            return body
+    return None
 
 
 def check_call_sites(lines):
     """Return a list of complaints about vCPUs that reach SREGS unprepared."""
     problems = []
     for index, line in enumerate(lines):
-        if not CREATE.search(line):
+        if not CREATE.search(code(line)):
             continue
         prepared = False
         for offset in range(index + 1, len(lines)):
-            follower = lines[offset]
+            follower = code(lines[offset])
             if SETUP_CPUID.search(follower):
                 prepared = True
                 break
@@ -63,8 +100,14 @@ def check_helper(lines):
     for index, line in enumerate(lines):
         if not HELPER_DEF.match(line):
             continue
-        body = '\n'.join(lines[index:index + 20])
-        if 'set_cpuid2' in body:
+        body = helper_body(lines, index)
+        if body is None:
+            return [
+                f'line {index + 1}: setup_cpuid has no closing brace at its '
+                f'own indentation, so this guard cannot tell what its body '
+                f'does'
+            ]
+        if SET_CPUID2.search('\n'.join(code(part) for part in body)):
             return []
         return [
             f'line {index + 1}: setup_cpuid no longer calls set_cpuid2, so '
@@ -84,7 +127,7 @@ def main():
         lines = source.read().splitlines()
 
     problems = check_helper(lines) + check_call_sites(lines)
-    vcpus = sum(1 for line in lines if CREATE.search(line))
+    vcpus = sum(1 for line in lines if CREATE.search(code(line)))
 
     if problems:
         print(f'{args.source}: guest CPUID setup is missing or incomplete:',
