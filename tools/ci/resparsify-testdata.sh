@@ -88,9 +88,14 @@
 #
 # Either way a path that resolves outside the tree is refused outright,
 # in both forms, and nothing is resparsified when any entry is refused.
-# Paths may be tree-relative or absolute inside the tree, and a symlink
-# is judged by what it points at: every rule above is applied to the
-# resolved target, which is also the file that gets rewritten.
+# Paths may be tree-relative or absolute inside the tree. A symlink is
+# judged by what it points at -- every rule above is applied to the
+# resolved target, which is also the file that gets rewritten -- but a
+# relative path free of ".." must first pass the same rules on its own
+# name, before anything is resolved. So downloaded/a.raw pointing at
+# a.qcow2, or custom/x.qcow2 pointing at ../downloaded/a.qcow2, is
+# dropped from a --files-from list and refused when named, even though
+# its target is in scope.
 #
 # An empty narrow set is success, unlike the whole-tree form: "nothing
 # changed in this update" is the normal case on a cached tree, and the
@@ -232,12 +237,6 @@ else
     TREE_REAL="$(realpath -- "${TREE}")"
     SKIPPED=0
 
-    # classify CANDIDATE -> sets CLASSIFIED to the absolute path when it
-    # is an in-scope image that exists, and REASON when it is not.
-    # Returns 0 for accepted, 1 for outside the tree (never acceptable
-    # from either form), 2 for inside the tree but not something this
-    # script acts on (droppable from a changed-file list, refused when
-    # named).
     # in_scope_extension PATH -- true when the path ends in one of the
     # whole-disk image extensions. Pure string work, no subprocess.
     in_scope_extension() {
@@ -250,6 +249,12 @@ else
         return 1
     }
 
+    # classify CANDIDATE -> sets CLASSIFIED to the absolute path when it
+    # is an in-scope image that exists, and REASON when it is not.
+    # Returns 0 for accepted, 1 for outside the tree (never acceptable
+    # from either form), 2 for inside the tree but not something this
+    # script acts on (droppable from a changed-file list, refused when
+    # named).
     classify() {
         local candidate="$1"
         local absolute resolved relative
@@ -279,10 +284,14 @@ else
         # path, or any path containing ".." -- skips the shortcut
         # entirely and is resolved as it always was.
         #
-        # One deliberate narrowing: a relative candidate reaching an
-        # in-scope image *through* a symlinked directory is now dropped
-        # rather than followed. Whole-tree mode never reached those
-        # either, because find does not descend a symlink, so the two
+        # One deliberate narrowing: a relative candidate whose own name
+        # fails these rules is rejected even when it resolves to an
+        # in-scope image -- a link named outside downloaded/ or without
+        # an image extension, or a path that reaches an image *through*
+        # a symlinked directory. Such a candidate is dropped from a list
+        # and refused when named. Whole-tree mode never reached those
+        # either, because find neither descends a symlinked directory
+        # nor matches a name without an image extension, so the two
         # forms agree where before only one of them acted.
         case "${candidate}" in
             /*|*..*) ;;
@@ -337,7 +346,8 @@ else
         # tree, under ${SCOPE_REL}/, an in-scope extension -- so a
         # symlink pointing anywhere this script would not write directly
         # is refused by the same rules as a plain path. One pointing at
-        # an in-scope image is followed, which is harmless: the copy
+        # an in-scope image is followed -- provided its own name already
+        # passed the string rules above -- which is harmless: the copy
         # below writes ${resolved}, the real file, leaving the symlink
         # itself alone, and whole-tree mode reaches the same file through
         # find. Resolving first also means naming both a link and its

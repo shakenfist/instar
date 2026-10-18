@@ -4,11 +4,14 @@
 # list rests on, against a real git.
 #
 # On the cache path that script derives the narrow resparsify's work
-# list from two things: `git diff --name-only -z PREVIOUS_REV HEAD`
-# across the update, and the paths whose index stat data was stale
-# before it. The whole saving of the testdata dependencies disk
-# depends on one property of that union: **every path the reset
-# rewrote is in it**. A path the reset rewrote and the list missed
+# list from three things: `git diff --name-only -z PREVIOUS_REV HEAD`
+# across the update, the paths whose index stat data was stale before
+# it, and the working-tree files that were still LFS pointers before
+# `git lfs pull`. This file covers the first two against a real git;
+# the third is covered only by the stubbed git in
+# tools/ci/test-prepare-testdata.sh. The whole saving of the testdata
+# dependencies disk depends on one property of that union: **every
+# path the reset rewrote is in it**. A path the reset rewrote and the list missed
 # comes back through the LFS smudge filter fully allocated, is never
 # resparsified, and sits in the copy-on-write overlay at full size --
 # which costs the disk its reason to exist and shows up as nothing

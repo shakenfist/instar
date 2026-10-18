@@ -1203,8 +1203,8 @@ That refusal is deliberate and its blast radius is worth knowing before you
 meet it. The `--files-from` list on the cache path comes from git, not from an
 operator, so a single instar-testdata commit adding a symlink under
 `downloaded/` with an image extension and a target outside the checkout would
-fail the resparsify step on **all eight labelled jobs at once**, and keep
-failing until that commit is fixed. Fleet-wide CI failure with
+fail the resparsify step on **all seven jobs that call the wrapper at once**,
+and keep failing until that commit is fixed. Fleet-wide CI failure with
 `resparsify-testdata: refusing …: resolves outside …` in it is a testdata
 commit to look at, not an instar regression; the refusal message names the
 list file the entry came from for that reason. Refusing is still the right
@@ -1214,7 +1214,9 @@ failure here that is nobody's pull request.
 Everything else in a list is filtered rather than refused, and the filtering
 is done without resolving each entry: a candidate that is relative, free of
 `..`, and either outside `downloaded/` or not an image extension is dropped on
-the string alone. That matters because the list is not bounded by the number
+the string alone, and refused if it was named as an argument rather than read
+from a list. That applies to a symlink too, whatever it points at: the link's
+own name has to pass before its target is looked at. That matters because the list is not bounded by the number
 of images — its stat-dirty component names every tracked path, so a cache
 whose index did not survive the handoff names all ~770,000 — and a process per
 entry would turn the step into a job timeout, hiding the warning that
