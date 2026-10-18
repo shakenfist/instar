@@ -776,13 +776,19 @@ errors, all fixed in the close-out commit:
   measurement found that on a disk a day behind testdata `main`,
   `git reset --hard` takes 2 to 4 minutes for 643 changed paths, and
   the prepare step 3m07s against a clone's 1m30s. Testdata `main`
-  moves daily at about 08:30 to 09:10 UTC (the "Coverage fuzz run
-  started" commit from `coverage-fuzz.yml`, scheduled at 04:00 UTC),
-  and the disk is rebuilt last in private-ci's nightly image cycle,
-  which starts at 13:11 UTC and reaches the testdata disk at about
-  15:05 UTC (per the `ci-instar-testdata` session, from
-  `conductor/imagebuilder.py`). So a job sees a stale disk for about
-  six hours a day. The hypothesis, not
+  moves twice a day, both times from `coverage-fuzz.yml`: a one-file
+  "Coverage fuzz run started" commit at the start of the run, which
+  is its write check, and the corpus push at the end, which is the
+  change that costs. The run's 04:00 UTC cron fires late (created at
+  08:11 to 11:35 UTC over 11 to 18 Oct) and runs about eight hours,
+  so the corpus push lands at about 16:25 to 17:10 UTC. The disk is
+  rebuilt last in private-ci's nightly image cycle, which starts at
+  13:11 UTC and reaches it at about 15:05 UTC (per the
+  `ci-instar-testdata` session, from `conductor/imagebuilder.py`), so
+  every corpus push misses it: a day's corpus is missing from the disk
+  for about 22 hours. The 643 paths of 17 Oct were most likely the
+  previous day's 16:25 UTC push of 583 corpus entries plus the OVA
+  corpus. The hypothesis, not
   measured: the reset smudges each new LFS object individually where
   `git lfs pull` fetches a batch, so `GIT_LFS_SKIP_SMUDGE=1` on the
   reset and the existing pull after it would remove most of the cost.
@@ -795,7 +801,13 @@ errors, all fixed in the close-out commit:
   gains a commit, rather than only nightly. Moving coverage-fuzz's
   schedule is not a fix and is not to be done: the disk is behind
   from whenever the commit lands until the next build, so an earlier
-  commit only moves the window. The skip-smudge reset is still worth
+  commit only moves the window. Rebuilding on change also removes
+  the dependence on the fuzz timing above. One cheap help on this
+  side, asked for by that session and not done here: make the
+  start-of-run write check a non-committing one (a `git push
+  --dry-run`, or a push to a scratch ref), so testdata `main` changes
+  once a day rather than twice and private-ci is not rebuilding the
+  disk for one timestamp file. The skip-smudge reset is still worth
   having on this side, because the reset is what makes a stale disk
   slower than a clone at all, and a disk can still be briefly behind
   between a commit and its rebuild.
