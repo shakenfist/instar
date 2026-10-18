@@ -789,13 +789,16 @@ errors, all fixed in the close-out commit:
   The pointer capture before the pull already lists what that would
   leave as pointers, so the narrow resparsify would still cover them;
   `tools/ci/test-testdata-changed-files.sh` is where to prove it.
-  The other levers are timing. On this side, schedule coverage-fuzz so
-  its commit lands before about 13:00 UTC, which makes the stale
-  window disappear without any private-ci change, at the cost of
-  moving when the fuzz runs. On private-ci's side, give the testdata
-  disk its own build time; putting it first in the cycle would save
-  only about 1.5 hours. The `ci-instar-testdata` session is putting
-  its options to Michael as inputs to its phase 5.
+  The stale window itself is closed on private-ci's side, which is
+  the lever chosen (relayed by the `ci-instar-testdata` session):
+  its phase 5 rebuilds the testdata disk soon after testdata `main`
+  gains a commit, rather than only nightly. Moving coverage-fuzz's
+  schedule is not a fix and is not to be done: the disk is behind
+  from whenever the commit lands until the next build, so an earlier
+  commit only moves the window. The skip-smudge reset is still worth
+  having on this side, because the reset is what makes a stale disk
+  slower than a clone at all, and a disk can still be briefly behind
+  between a commit and its rebuild.
 * **Raise `--concurrency` above 4.** Untested and plausibly the
   cheapest remaining win once the six tests are gone, but the suite
   boots a KVM guest per test and `docs/testing.md:434,459` warns that
