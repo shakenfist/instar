@@ -7,10 +7,12 @@
 # required to notice. Reading the guard cannot distinguish "this holds"
 # from "this cannot fail": only mutation can.
 #
-# Four cases: the tree as it stands must pass, and the three ways the
-# property can be lost -- one call site forgetting the helper, the helper
-# keeping its name while setting nothing, and the helper disappearing
-# altogether -- must each be caught.
+# Six cases: the tree as it stands must pass, and the five ways the
+# property can be lost -- one call site forgetting the helper, a call site
+# commenting it out, the helper keeping its name while setting nothing, a
+# hollowed-out helper vouched for by a later function that mentions
+# set_cpuid2, and the helper disappearing altogether -- must each be
+# caught.
 
 set -euo pipefail
 
@@ -77,6 +79,52 @@ if python3 "${CHECK}" --source "${WORK}/helper-absent.rs" >/dev/null 2>&1; then
     fail 'guard passed a source with no setup_cpuid at all'
 else
     ok 'guard caught the missing helper'
+fi
+
+# A call site comments the helper out rather than deleting it. Commenting
+# a line out while debugging is the likeliest way the call is lost, and a
+# guard that matches text rather than code would not notice.
+start 'a commented-out setup_cpuid call is caught'
+python3 - "${SOURCE}" "${WORK}/one-site-commented.rs" <<'PYEOF'
+import sys
+src = open(sys.argv[1], encoding='utf-8').read()
+needle = '    setup_cpuid(&kvm, &vcpu)?;\n'
+assert needle in src, 'the fix no longer spells the call this way'
+commented = '    // setup_cpuid(&kvm, &vcpu)?;\n'
+open(sys.argv[2], 'w', encoding='utf-8').write(src.replace(needle, commented, 1))
+PYEOF
+if python3 "${CHECK}" --source "${WORK}/one-site-commented.rs" >/dev/null 2>&1; then
+    fail 'guard counted a commented-out call as a call'
+else
+    ok 'guard caught the commented-out call'
+fi
+
+# A hollowed-out helper, with a later function that mentions set_cpuid2.
+# A body scan reading a fixed window past the helper would find that
+# mention and vouch for a helper that makes no call at all.
+start 'a hollowed-out helper is not vouched for by a later function'
+python3 - "${SOURCE}" "${WORK}/helper-hollow-decoy.rs" <<'PYEOF'
+import re
+import sys
+src = open(sys.argv[1], encoding='utf-8').read()
+body = re.search(r'fn setup_cpuid\b.*?\n}\n', src, re.S)
+assert body, 'setup_cpuid is not defined as expected'
+hollow = (
+    'fn setup_cpuid(kvm: &Kvm, vcpu: &VcpuFd) -> Result<(), kvm_ioctls::Error> {\n'
+    '    Ok(())\n'
+    '}\n'
+    '\n'
+    'fn decoy(kvm: &Kvm, vcpu: &VcpuFd) -> Result<(), kvm_ioctls::Error> {\n'
+    '    let cpuid = kvm.get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)?;\n'
+    '    vcpu.set_cpuid2(&cpuid)\n'
+    '}\n'
+)
+open(sys.argv[2], 'w', encoding='utf-8').write(src.replace(body.group(0), hollow))
+PYEOF
+if python3 "${CHECK}" --source "${WORK}/helper-hollow-decoy.rs" >/dev/null 2>&1; then
+    fail 'guard accepted a hollow helper on a neighbouring set_cpuid2'
+else
+    ok 'guard read only the helper body'
 fi
 
 echo

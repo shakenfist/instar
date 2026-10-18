@@ -107,6 +107,14 @@ Per-format feature detail is in
   complements: a distro added to one must be added to the other, while a
   test belongs to exactly one -- claiming it in both fails the guard too.
 
+- **A new vCPU must be given a guest CPUID.** A fresh KVM vCPU
+  advertises no long mode, so since Linux 6.12.112 `KVM_SET_SREGS`
+  refuses the long-mode EFER `setup_sregs` writes, and every operation
+  fails with `Error: Error(22)`. Call `setup_cpuid` straight after
+  `create_vcpu`; `tools/ci/check-vcpu-cpuid.py` fails the build
+  otherwise, because no pull-request job starts a guest. See
+  [docs/guest-architecture.md](docs/guest-architecture.md).
+
 - **`automated_reviewer`'s `needs` list must name every job that can
   fail a PR**, including `ci-tooling`. Three jobs are deliberately
   outside it, each for a stated reason in the comment above the list:
