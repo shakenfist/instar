@@ -776,17 +776,26 @@ errors, all fixed in the close-out commit:
   measurement found that on a disk a day behind testdata `main`,
   `git reset --hard` takes 2 to 4 minutes for 643 changed paths, and
   the prepare step 3m07s against a clone's 1m30s. Testdata `main`
-  moves daily at about 08:30 to 09:10 UTC (the coverage-fuzz commit),
-  so a job is in that case from then until the next nightly disk
-  build; when that build runs was not checked. The hypothesis, not
+  moves daily at about 08:30 to 09:10 UTC (the "Coverage fuzz run
+  started" commit from `coverage-fuzz.yml`, scheduled at 04:00 UTC),
+  and the disk is rebuilt last in private-ci's nightly image cycle,
+  which starts at 13:11 UTC and reaches the testdata disk at about
+  15:05 UTC (per the `ci-instar-testdata` session, from
+  `conductor/imagebuilder.py`). So a job sees a stale disk for about
+  six hours a day. The hypothesis, not
   measured: the reset smudges each new LFS object individually where
   `git lfs pull` fetches a batch, so `GIT_LFS_SKIP_SMUDGE=1` on the
   reset and the existing pull after it would remove most of the cost.
   The pointer capture before the pull already lists what that would
   leave as pointers, so the narrow resparsify would still cover them;
   `tools/ci/test-testdata-changed-files.sh` is where to prove it.
-  Moving the disk build to just after the fuzz commit is the other
-  lever, and it is private-ci's.
+  The other levers are timing. On this side, schedule coverage-fuzz so
+  its commit lands before about 13:00 UTC, which makes the stale
+  window disappear without any private-ci change, at the cost of
+  moving when the fuzz runs. On private-ci's side, give the testdata
+  disk its own build time; putting it first in the cycle would save
+  only about 1.5 hours. The `ci-instar-testdata` session is putting
+  its options to Michael as inputs to its phase 5.
 * **Raise `--concurrency` above 4.** Untested and plausibly the
   cheapest remaining win once the six tests are gone, but the suite
   boots a KVM guest per test and `docs/testing.md:434,459` warns that
