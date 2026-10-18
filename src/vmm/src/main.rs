@@ -43,8 +43,10 @@ use guest_protocol::{
     decode_framed, encode_vmm_config_framed, guest_, vmm_config, vmm_config_chain,
     vmm_config_chain_with_output, vmm_config_input_only, FRAME_HEADER_SIZE,
 };
-use kvm_bindings::{kvm_regs, kvm_segment, kvm_sregs, kvm_userspace_memory_region};
-use kvm_ioctls::{Kvm, VcpuExit};
+use kvm_bindings::{
+    kvm_regs, kvm_segment, kvm_sregs, kvm_userspace_memory_region, KVM_MAX_CPUID_ENTRIES,
+};
+use kvm_ioctls::{Kvm, VcpuExit, VcpuFd};
 use log::{debug, info, warn};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryMmap};
 
@@ -2761,6 +2763,7 @@ fn execute_info_operation(
 
     // Create vCPU
     let mut vcpu = vm.create_vcpu(0)?;
+    setup_cpuid(&kvm, &vcpu)?;
 
     // Set up registers
     let mut sregs = vcpu.get_sregs()?;
@@ -5733,6 +5736,7 @@ fn run_bench_guest(
 
     // --- vCPU setup ------------------------------------------------------
     let mut vcpu = vm.create_vcpu(0)?;
+    setup_cpuid(&kvm, &vcpu)?;
     let mut sregs = vcpu.get_sregs()?;
     setup_sregs(&mut sregs);
     vcpu.set_sregs(&sregs)?;
@@ -8739,6 +8743,7 @@ fn run_resize_guest(
 
     // --- vCPU setup ------------------------------------------------------
     let mut vcpu = vm.create_vcpu(0)?;
+    setup_cpuid(&kvm, &vcpu)?;
     let mut sregs = vcpu.get_sregs()?;
     setup_sregs(&mut sregs);
     vcpu.set_sregs(&sregs)?;
@@ -9721,6 +9726,7 @@ fn run_amend_guest(
 
     // --- vCPU setup ------------------------------------------------------
     let mut vcpu = vm.create_vcpu(0)?;
+    setup_cpuid(&kvm, &vcpu)?;
     let mut sregs = vcpu.get_sregs()?;
     setup_sregs(&mut sregs);
     vcpu.set_sregs(&sregs)?;
@@ -10132,6 +10138,7 @@ fn run_bitmap_guest(
 
     // --- vCPU setup ------------------------------------------------------
     let mut vcpu = vm.create_vcpu(0)?;
+    setup_cpuid(&kvm, &vcpu)?;
     let mut sregs = vcpu.get_sregs()?;
     setup_sregs(&mut sregs);
     vcpu.set_sregs(&sregs)?;
@@ -10564,6 +10571,7 @@ fn run_rebase_guest(
 
     // --- vCPU setup ------------------------------------------------------
     let mut vcpu = vm.create_vcpu(0)?;
+    setup_cpuid(&kvm, &vcpu)?;
     let mut sregs = vcpu.get_sregs()?;
     setup_sregs(&mut sregs);
     vcpu.set_sregs(&sregs)?;
@@ -10965,6 +10973,7 @@ fn run_commit_guest(
 
     // --- vCPU setup ------------------------------------------------------
     let mut vcpu = vm.create_vcpu(0)?;
+    setup_cpuid(&kvm, &vcpu)?;
     let mut sregs = vcpu.get_sregs()?;
     setup_sregs(&mut sregs);
     vcpu.set_sregs(&sregs)?;
@@ -11478,6 +11487,7 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
 
     // Create vCPU
     let mut vcpu = vm.create_vcpu(0)?;
+    setup_cpuid(&kvm, &vcpu)?;
     debug!("Created vCPU");
 
     // Set up registers
@@ -11871,6 +11881,7 @@ fn run_copy(args: CopyArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     }
 
     let mut vcpu = vm.create_vcpu(0)?;
+    setup_cpuid(&kvm, &vcpu)?;
     debug!("Created vCPU");
 
     let mut sregs = vcpu.get_sregs()?;
@@ -12401,6 +12412,7 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
 
     // Create vCPU
     let mut vcpu = vm.create_vcpu(0)?;
+    setup_cpuid(&kvm, &vcpu)?;
     debug!("Created vCPU");
 
     // Set up registers
@@ -13217,6 +13229,7 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
 
     // Create vCPU
     let mut vcpu = vm.create_vcpu(0)?;
+    setup_cpuid(&kvm, &vcpu)?;
     debug!("Created vCPU");
 
     // Set up registers
@@ -14285,6 +14298,7 @@ fn execute_convert(
 
     // Create vCPU
     let mut vcpu = vm.create_vcpu(0)?;
+    setup_cpuid(&kvm, &vcpu)?;
     debug!("Created vCPU");
 
     let mut sregs = vcpu.get_sregs()?;
@@ -15689,6 +15703,7 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
 
     // --- vCPU setup ------------------------------------------------------
     let mut vcpu = vm.create_vcpu(0)?;
+    setup_cpuid(&kvm, &vcpu)?;
     debug!("Created vCPU");
 
     let mut sregs = vcpu.get_sregs()?;
@@ -16100,6 +16115,7 @@ fn run_map(args: MapArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error
 
     // --- vCPU setup ------------------------------------------------------
     let mut vcpu = vm.create_vcpu(0)?;
+    setup_cpuid(&kvm, &vcpu)?;
     let mut sregs = vcpu.get_sregs()?;
     setup_sregs(&mut sregs);
     vcpu.set_sregs(&sregs)?;
@@ -16779,6 +16795,7 @@ fn run_snapshot_list(
 
     // --- vCPU setup ------------------------------------------------------
     let mut vcpu = vm.create_vcpu(0)?;
+    setup_cpuid(&kvm, &vcpu)?;
     let mut sregs = vcpu.get_sregs()?;
     setup_sregs(&mut sregs);
     vcpu.set_sregs(&sregs)?;
@@ -17249,6 +17266,7 @@ fn run_snapshot_mutating_guest(
 
     // --- vCPU setup ------------------------------------------------------
     let mut vcpu = vm.create_vcpu(0)?;
+    setup_cpuid(&kvm, &vcpu)?;
     let mut sregs = vcpu.get_sregs()?;
     setup_sregs(&mut sregs);
     vcpu.set_sregs(&sregs)?;
@@ -18425,6 +18443,7 @@ fn run_create_guest(
 
     // --- vCPU setup ------------------------------------------------------
     let mut vcpu = vm.create_vcpu(0)?;
+    setup_cpuid(&kvm, &vcpu)?;
     let mut sregs = vcpu.get_sregs()?;
     setup_sregs(&mut sregs);
     vcpu.set_sregs(&sregs)?;
@@ -19251,6 +19270,24 @@ fn setup_page_tables(
     }
 
     Ok(())
+}
+
+/// Give the vCPU the guest CPUID KVM wants to see before it will accept
+/// long-mode control registers.
+///
+/// A freshly created vCPU has an empty guest CPUID, which advertises no
+/// long mode. Linux 6.12.112 started validating EFER against the guest's
+/// capabilities in `KVM_SET_SREGS`, so the `EFER.LME | EFER.LMA` that
+/// `setup_sregs` writes is refused with EINVAL unless the CPUID is set
+/// first. Older kernels asked no such question, which is why every vCPU
+/// here ran without a CPUID for as long as it did.
+///
+/// The supported CPUID is what KVM itself reports, so the guest sees the
+/// host's features rather than a hand-built subset; the operations run in
+/// here read it only for long mode.
+fn setup_cpuid(kvm: &Kvm, vcpu: &VcpuFd) -> Result<(), kvm_ioctls::Error> {
+    let cpuid = kvm.get_supported_cpuid(KVM_MAX_CPUID_ENTRIES)?;
+    vcpu.set_cpuid2(&cpuid)
 }
 
 fn setup_sregs(sregs: &mut kvm_sregs) {

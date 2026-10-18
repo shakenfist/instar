@@ -160,6 +160,15 @@ jobs:
       - name: Check CI test partition
         run: tools/ci/check-test-partition.sh
 
+      # A guard rather than a test: nothing in the pull-request gate runs
+      # a guest, so a vCPU created without a guest CPUID would reach the
+      # merge queue before anything noticed.
+      - name: Check every vCPU is given a guest CPUID
+        run: python3 tools/ci/check-vcpu-cpuid.py
+
+      - name: Test the vCPU CPUID guard
+        run: tools/ci/test-check-vcpu-cpuid.sh
+
       # Steps of this job rather than a job of their own: together they
       # take under two seconds, and a separate job would claim a second
       # runner slot and repeat the checkout and the apt refresh to run

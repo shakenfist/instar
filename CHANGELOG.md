@@ -603,6 +603,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Every operation now gives its vCPU a guest CPUID, so instar works
+  on Linux 6.12.112 and newer** (#778). A freshly created KVM vCPU has
+  an empty guest CPUID, which advertises no long mode, and the VMM
+  never called `KVM_SET_CPUID2`. That was harmless until the kernel
+  began validating EFER against the guest's capabilities in
+  `KVM_SET_SREGS` (upstream `184bd464bdb6`, backported to 6.12.112),
+  at which point the `EFER.LME | EFER.LMA` every operation's setup path
+  writes was refused with EINVAL. The symptom was total and
+  uninformative: every subcommand, `instar info` on a 1 MiB fixture
+  included, exited 1 with `Error: Error(22)` on a host that had taken
+  the update. The CPUID KVM reports as supported is now set on each of
+  the seventeen vCPUs the VMM creates, at the point of creation, and a
+  CI guard fails the build if an eighteenth is ever added without it --
+  nothing in the pull-request gate runs a guest, so the merge queue
+  would otherwise be the first to know.
+
 - **A composed read of a malformed qcow2 subcluster no longer reports
   success without writing the bytes** (#650). Where a subcluster's
   allocation bit was set while its L2 entry named host offset zero,
