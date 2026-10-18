@@ -772,45 +772,49 @@ errors, all fixed in the close-out commit:
   build now refreshes its own index, and every leg on a disk built
   that way reported no stat-dirty paths. The trade only comes back if
   that build step regresses.
-* **Make a stale disk no slower than a clone.** The step-7
-  measurement found that on a disk a day behind testdata `main`,
-  `git reset --hard` takes 2 to 4 minutes for 643 changed paths, and
-  the prepare step 3m07s against a clone's 1m30s. Testdata `main`
-  moves twice a day, both times from `coverage-fuzz.yml`: a one-file
-  "Coverage fuzz run started" commit at the start of the run, which
-  is its write check, and the corpus push at the end, which is the
-  change that costs. The run's 04:00 UTC cron fires late (created at
-  08:11 to 11:35 UTC over 11 to 18 Oct) and runs about eight hours,
-  so the corpus push lands at about 16:25 to 17:10 UTC. The disk is
-  rebuilt last in private-ci's nightly image cycle, which starts at
-  13:11 UTC and reaches it at about 15:05 UTC (per the
-  `ci-instar-testdata` session, from `conductor/imagebuilder.py`), so
-  every corpus push misses it: a day's corpus is missing from the disk
-  for about 22 hours. The 643 paths of 17 Oct were most likely the
-  previous day's 16:25 UTC push of 583 corpus entries plus the OVA
-  corpus. The hypothesis, not
-  measured: the reset smudges each new LFS object individually where
-  `git lfs pull` fetches a batch, so `GIT_LFS_SKIP_SMUDGE=1` on the
-  reset and the existing pull after it would remove most of the cost.
-  The pointer capture before the pull already lists what that would
-  leave as pointers, so the narrow resparsify would still cover them;
-  `tools/ci/test-testdata-changed-files.sh` is where to prove it.
-  The stale window itself is closed on private-ci's side, which is
-  the lever chosen (relayed by the `ci-instar-testdata` session):
-  its phase 5 rebuilds the testdata disk soon after testdata `main`
-  gains a commit, rather than only nightly. Moving coverage-fuzz's
-  schedule is not a fix and is not to be done: the disk is behind
-  from whenever the commit lands until the next build, so an earlier
-  commit only moves the window. Rebuilding on change also removes
-  the dependence on the fuzz timing above. One cheap help on this
-  side, asked for by that session and not done here: make the
-  start-of-run write check a non-committing one (a `git push
-  --dry-run`, or a push to a scratch ref), so testdata `main` changes
-  once a day rather than twice and private-ci is not rebuilding the
-  disk for one timestamp file. The skip-smudge reset is still worth
-  having on this side, because the reset is what makes a stale disk
-  slower than a clone at all, and a disk can still be briefly behind
-  between a commit and its rebuild.
+* **Make a stale disk no slower than a clone** (#790).
+  * *What was measured.* On a disk a day behind testdata `main`,
+    `git reset --hard` takes 2 to 4 minutes for 643 changed paths,
+    and the prepare step 3m07s against a clone's 1m30s.
+  * *Why the disk is stale.* Testdata `main` moves twice a day, both
+    times from `coverage-fuzz.yml`: a one-file "Coverage fuzz run
+    started" commit at the start of the run, which is its write
+    check, and the corpus push at the end, which is the change that
+    costs. The run's 04:00 UTC cron fires late (created at 08:11 to
+    11:35 UTC over 11 to 18 Oct) and runs about eight hours, so the
+    corpus push lands at about 16:25 to 17:10 UTC. The disk is
+    rebuilt last in private-ci's nightly image cycle, which starts at
+    13:11 UTC and reaches it at about 15:05 UTC (per the
+    `ci-instar-testdata` session, from `conductor/imagebuilder.py`),
+    so every corpus push misses it: a day's corpus is missing from
+    the disk for about 22 hours. The 643 paths of 17 Oct were most
+    likely the previous day's 16:25 UTC push of 583 corpus entries
+    plus the OVA corpus.
+  * *The window: private-ci's to close, agreed and not yet built.*
+    As of 19 Oct the chosen lever, relayed by the `ci-instar-testdata`
+    session, is private-ci's `PLAN-instar-testdata-disk.md` phase 5,
+    which is to rebuild the testdata disk soon after testdata `main`
+    gains a commit rather than only nightly. That phase was not
+    started then, so until its Execution row reads Complete, expect
+    the window above. Moving coverage-fuzz's schedule is not a fix
+    and is not to be done: the disk is behind from whenever the
+    commit lands until the next build, so an earlier commit only
+    moves the window.
+  * *On this side, tracked in #790.* First, the skip-smudge reset.
+    The hypothesis, not measured: the reset smudges each new LFS
+    object individually where `git lfs pull` fetches a batch, so
+    `GIT_LFS_SKIP_SMUDGE=1` on the reset and the existing pull after
+    it would remove most of the cost. The pointer capture before the
+    pull already lists what that would leave as pointers, so the
+    narrow resparsify would still cover them;
+    `tools/ci/test-testdata-changed-files.sh` is where to prove it.
+    It is still worth having once private-ci rebuilds on change,
+    because a disk is still briefly behind between a commit and its
+    rebuild. Second, asked for by that session: make the start-of-run
+    write check a non-committing one (a `git push --dry-run`, or a
+    push to a scratch ref), so testdata `main` changes once a day
+    rather than twice and private-ci is not rebuilding the disk for
+    one timestamp file.
 * **Raise `--concurrency` above 4.** Untested and plausibly the
   cheapest remaining win once the six tests are gone, but the suite
   boots a KVM guest per test and `docs/testing.md:434,459` warns that
