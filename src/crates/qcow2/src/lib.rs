@@ -1403,9 +1403,13 @@ pub enum ClusterLookup {
     /// into that file (`block/qcow2.h:724-733` at qemu v10.0.0).
     Standard(u64),
     /// Extended-L2 entry whose subclusters are of more than one type.
-    /// (host_offset, subcluster_bitmap)
-    /// Bitmap bits 0-31 = allocation, bits 32-63 = zero. Classify each
-    /// subcluster with [`subcluster_type`] or [`subcluster_range`].
+    /// (raw L2 word, subcluster bitmap)
+    /// Bitmap bits 0-31 = allocation, bits 32-63 = zero. The L2 word
+    /// is carried whole rather than as a host offset because the
+    /// classifier needs its flags too: at host offset 0, `COPIED`
+    /// decides between a data-file cluster and an unallocated one.
+    /// Classify each subcluster with [`subcluster_range`], passing
+    /// [`Qcow2State::has_data_file`].
     StandardSubclusters(u64, u64),
     /// Compressed cluster: raw L2 entry for offset/size parsing
     Compressed(u64),
@@ -2544,14 +2548,13 @@ impl Qcow2State {
     fn classify_l2_entry(&self, l2_entry: u64, bitmap: u64) -> ClusterLookup {
         let extended_l2 = self.extended_l2;
         let (ty, run) = subcluster_range(l2_entry, bitmap, 0, extended_l2, self.has_data_file());
-        let host_offset = l2_entry & L2_OFFSET_MASK;
         match ty {
             SubclusterType::Invalid => ClusterLookup::Invalid,
             SubclusterType::Compressed => ClusterLookup::Compressed(l2_entry),
             _ if run < subclusters_per_cluster(extended_l2) => {
-                ClusterLookup::StandardSubclusters(host_offset, bitmap)
+                ClusterLookup::StandardSubclusters(l2_entry, bitmap)
             }
-            SubclusterType::Normal => ClusterLookup::Standard(host_offset),
+            SubclusterType::Normal => ClusterLookup::Standard(l2_entry & L2_OFFSET_MASK),
             SubclusterType::ZeroPlain | SubclusterType::ZeroAlloc => ClusterLookup::Zero,
             SubclusterType::UnallocatedPlain | SubclusterType::UnallocatedAlloc => {
                 ClusterLookup::Unallocated
@@ -4053,7 +4056,7 @@ mod tests {
         let (entry, bitmap) = (OFLAG_COPIED, 0x3);
         let want = std::vec![(St::Normal, 2), (St::UnallocatedAlloc, 30)];
         assert_eq!(sc_runs(entry, bitmap, true, true), want);
-        let mixed = ClusterLookup::StandardSubclusters(0, 0x3);
+        let mixed = ClusterLookup::StandardSubclusters(entry, 0x3);
         assert_eq!(sc_verdict(entry, bitmap, true, true), mixed);
         // The same words without a data file are invalid.
         assert_eq!(
@@ -4092,21 +4095,28 @@ mod tests {
             // unallocated, not a zero-filled StandardSubclusters(0, 0).
             (OFLAG_COPIED, 0, true, false, L::Unallocated),
             (SC_COMP, SC_ALL_ALLOC, true, false, L::Compressed(SC_COMP)),
-            // Extended, mixed.
+            // Extended, mixed: the verdict carries the L2 word whole.
             (0, 1 << 32, true, false, L::StandardSubclusters(0, 1 << 32)),
             (
                 SC_HOST,
                 0x3,
                 true,
                 false,
-                L::StandardSubclusters(0x50000, 0x3),
+                L::StandardSubclusters(SC_HOST, 0x3),
             ),
             (
                 SC_HOST,
                 0x1_FFFF_FFFE,
                 true,
                 false,
-                L::StandardSubclusters(0x50000, 0x1_FFFF_FFFE),
+                L::StandardSubclusters(SC_HOST, 0x1_FFFF_FFFE),
+            ),
+            (
+                OFLAG_COPIED,
+                0x3,
+                true,
+                true,
+                L::StandardSubclusters(OFLAG_COPIED, 0x3),
             ),
             // Invalid.
             (0, 1 << 3, true, false, L::Invalid),
@@ -6095,108 +6105,273 @@ mod tests {
     }
 
     // ====================================================================
-    // Extended-L2 wide I/O path: alloc bit set at host offset zero (#650)
+    // Chain reader: where every byte of a subcluster comes from
+    // (#650, #653, #654)
     // ====================================================================
     //
-    // An extended-L2 entry can name host offset 0 while the subcluster
-    // allocation bitmap claims a subcluster is allocated. There is no
-    // host cluster to read. #650 was the wide path leaving the caller's
-    // buffer untouched under a `true` return; its fix zero-filled the
-    // subcluster. qemu instead calls the entry INVALID and fails the
-    // read with EIO (#653), and so does instar now: these two tests pin
-    // the lookup verdict and the refused read.
+    // An in-memory chain whose devices each serve bytes that say which
+    // device, and which offset, they came from. The child's bytes depend
+    // on the host offset, the data file's on its offset, the backing
+    // file's on the virtual offset, and all three are non-zero and
+    // distinct, so a subcluster read from the wrong layer, at the wrong
+    // offset, or zero-filled instead of descended, shows in the output.
+    // Each entry below is read through `read_chain_virtual_cluster` with
+    // a sector no larger than a subcluster (the narrow I/O path) and with
+    // one larger (the wide path), and the expected provenance is stated
+    // per run of subclusters, in qemu's types.
+    //
+    // The data device is addressed by `data_device_idx`, not by its
+    // place in the chain, so the harness keeps it out of the chain: an
+    // unallocated subcluster then descends to the backing device or
+    // reads zeros, which is qemu's answer (#792 is the host putting the
+    // data device in the chain, which this harness does not reproduce).
 
-    // Byte size of the in-memory qcow2 image the #650 mock serves.
-    const W650_IMG_LEN: usize = 8192;
+    const SC_MAX_DEVS: usize = 3;
+    /// 16 KiB clusters: 512-byte subclusters, so a 512-byte sector takes
+    /// the narrow path and a 4096-byte sector the wide path.
+    const SC_CLUSTER: u64 = 16384;
+    const SC_CLUSTER_BITS: u32 = 14;
+    const SC_SC_SIZE: u64 = SC_CLUSTER / QCOW_EXTL2_SUBCLUSTERS_PER_CLUSTER as u64;
+    const SC_NARROW_SSZ: usize = 512;
+    const SC_WIDE_SSZ: usize = 4096;
+    /// Image layout: cluster 0 header area, 1 the L1 table, 2 the L2
+    /// table, 3 and 4 host data clusters. Eight virtual clusters.
+    const SC_L1_OFF: u64 = SC_CLUSTER;
+    const SC_L2_OFF: u64 = 2 * SC_CLUSTER;
+    const SC_HOST_A: u64 = 3 * SC_CLUSTER;
+    const SC_HOST_B: u64 = 4 * SC_CLUSTER;
+    const SC_IMG_LEN: usize = 5 * SC_CLUSTER as usize;
+    const SC_VDISK_LEN: usize = 8 * SC_CLUSTER as usize;
+    /// A host offset past the end of the image: a read of it fails, so
+    /// a test that passes with it proves the host cluster was not read.
+    const SC_HOST_PAST_EOF: u64 = 64 * SC_CLUSTER;
 
-    // Serialize tests touching the W650 globals (extern "C" callbacks
-    // can only close over 'static state; mirrors Z432_LOCK above).
-    static W650_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    static mut W650_IMG: [u8; W650_IMG_LEN] = [0u8; W650_IMG_LEN];
-    static mut W650_CAP_SECTORS: u64 = 0;
+    // Serialize tests touching the SC globals (extern "C" callbacks can
+    // only close over 'static state; mirrors Z432_LOCK above).
+    static SC_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static mut SC_IMAGES: [*const u8; SC_MAX_DEVS] = [core::ptr::null(); SC_MAX_DEVS];
+    static mut SC_LENS: [usize; SC_MAX_DEVS] = [0; SC_MAX_DEVS];
+    static mut SC_SSZ: usize = SC_NARROW_SSZ;
+    static mut SC_ERR_CALLS: u32 = 0;
+    static mut SC_ERR_OP: [u8; 32] = [0; 32];
+    static mut SC_ERR_SECTOR: u64 = 0;
+    static mut SC_ERR_STATUS: u32 = 0;
 
-    // 512-byte sectors over 8192-byte clusters put the subcluster at
-    // 8192 / 32 = 256 bytes, so `sector_size > sc_size` and the
-    // StandardSubclusters arm takes the WIDE path. That relationship is
-    // the whole point of the fixture: at the default 64 KiB cluster the
-    // subcluster would be 2048 bytes and the narrow path -- which has
-    // defended this case since I2 -- would run instead.
-    const W650_SSZ: usize = 512;
-    const W650_CLUSTER: u64 = 8192;
-    const W650_SC_SIZE: u64 = W650_CLUSTER / 32;
+    fn sc_child_byte(host_off: u64) -> u8 {
+        0x40 + ((host_off / 64) % 0x40) as u8
+    }
+    fn sc_backing_byte(virt_off: u64) -> u8 {
+        0x80 + ((virt_off / 64) % 0x40) as u8
+    }
+    fn sc_data_byte(host_off: u64) -> u8 {
+        0xC0 + ((host_off / 64) % 0x3f) as u8
+    }
 
-    // Subcluster 3 is marked allocated with no host cluster behind it:
-    // the malformed subcluster. Subcluster 0 carries a zero bit, so the
-    // bitmap mixes zero and alloc bits as the #650 fuzz case did; the
-    // alloc bit alone is what makes the entry invalid.
-    const W650_BAD_SC: u32 = 3;
-    const W650_ZERO_SC: u32 = 0;
-    const W650_BITMAP: u64 = (1u64 << (32 + W650_ZERO_SC)) | (1u64 << W650_BAD_SC);
-
-    unsafe extern "C" fn w650_read_sector(
-        _device_idx: u32,
+    unsafe extern "C" fn sc_read_sector(
+        device_idx: u32,
         sector: u64,
         out_buf: *mut u8,
         sector_size: usize,
     ) -> bool {
-        let start = (sector as usize).saturating_mul(sector_size);
-        if start + sector_size > W650_IMG_LEN {
+        let dev = device_idx as usize;
+        if dev >= SC_MAX_DEVS {
             return false;
         }
-        let base = core::ptr::addr_of!(W650_IMG) as *const u8;
-        core::ptr::copy_nonoverlapping(base.add(start), out_buf, sector_size);
+        let img = *(core::ptr::addr_of!(SC_IMAGES) as *const *const u8).add(dev);
+        let len = *(core::ptr::addr_of!(SC_LENS) as *const usize).add(dev);
+        if img.is_null() {
+            return false;
+        }
+        let start = (sector as usize).saturating_mul(sector_size);
+        if start + sector_size > len {
+            return false;
+        }
+        core::ptr::copy_nonoverlapping(img.add(start), out_buf, sector_size);
         true
     }
 
-    unsafe extern "C" fn w650_capacity(_device_idx: u32) -> u64 {
-        W650_CAP_SECTORS
+    unsafe extern "C" fn sc_capacity(device_idx: u32) -> u64 {
+        let dev = device_idx as usize;
+        if dev >= SC_MAX_DEVS {
+            return 0;
+        }
+        let len = *(core::ptr::addr_of!(SC_LENS) as *const usize).add(dev);
+        (len / SC_SSZ) as u64
     }
 
-    fn w650_call_table() -> shared::CallTable {
+    unsafe extern "C" fn sc_ssz(_device_idx: u32) -> usize {
+        SC_SSZ
+    }
+
+    /// Record what `send_error` was called with: the reader returns a
+    /// bare bool, so this is the only evidence of *why* a read failed.
+    unsafe extern "C" fn sc_send_err(op: *const u8, _dev: *const u8, sector: u64, status: u32) {
+        SC_ERR_CALLS += 1;
+        SC_ERR_SECTOR = sector;
+        SC_ERR_STATUS = status;
+        let dst = core::ptr::addr_of_mut!(SC_ERR_OP) as *mut u8;
+        core::ptr::write_bytes(dst, 0, 32);
+        for i in 0..31 {
+            let b = *op.add(i);
+            *dst.add(i) = b;
+            if b == 0 {
+                break;
+            }
+        }
+    }
+
+    fn sc_call_table() -> shared::CallTable {
         shared::CallTable {
-            read_input_sector: w650_read_sector,
-            get_input_capacity: w650_capacity,
+            read_input_sector: sc_read_sector,
+            get_input_capacity: sc_capacity,
+            get_input_sector_size: sc_ssz,
+            send_error: sc_send_err,
             ..stub_call_table()
         }
     }
 
-    /// Build the in-memory extended-L2 fixture into `W650_IMG` and set
-    /// the served capacity. Layout (cluster_size = 8192, 16-byte L2
-    /// entries):
-    ///   - L1 table at 512: L1[0] -> L2 table at 1024.
-    ///   - L2 table at 1024: entry[0] host offset field = 0 (@1024),
-    ///     subcluster bitmap = W650_BITMAP (@1032).
-    ///
-    /// Everything outside the two tables is 0xDD, so a read of the
-    /// chunk from file offset zero returns recognisable bytes.
-    unsafe fn w650_build_image() {
-        let mut img = [0xDDu8; W650_IMG_LEN];
-        let mut put = |off: usize, v: u64| {
-            img[off..off + 8].copy_from_slice(&v.to_be_bytes());
-        };
-        put(512, 1024 | OFLAG_COPIED);
-        put(1024, 0);
-        put(1032, W650_BITMAP);
-        let dst = core::ptr::addr_of_mut!(W650_IMG) as *mut u8;
-        core::ptr::copy_nonoverlapping(img.as_ptr(), dst, W650_IMG_LEN);
-        W650_CAP_SECTORS = (W650_IMG_LEN / W650_SSZ) as u64;
+    /// What `send_error` captured during one read: how many calls, the
+    /// operation marker of the last, its `sector` and its `status`.
+    #[derive(Debug)]
+    struct ScErr {
+        calls: u32,
+        op: std::string::String,
+        sector: u64,
+        status: u32,
     }
 
-    /// Construct a `Qcow2State` matching the #650 fixture geometry. The
-    /// caller owns the two cache buffers (each >= MAX_SECTOR_SIZE).
-    fn w650_state(l1_cache: &mut [u8], l2_cache: &mut [u8]) -> Qcow2State {
+    fn sc_take_err() -> ScErr {
+        unsafe {
+            let src = core::ptr::addr_of!(SC_ERR_OP) as *const u8;
+            let mut n = 0usize;
+            while n < 32 && *src.add(n) != 0 {
+                n += 1;
+            }
+            let op = core::str::from_utf8(core::slice::from_raw_parts(src, n)).unwrap_or("?");
+            ScErr {
+                calls: SC_ERR_CALLS,
+                op: std::string::String::from(op),
+                sector: SC_ERR_SECTOR,
+                status: SC_ERR_STATUS,
+            }
+        }
+    }
+
+    /// Where a byte of a subcluster must come from.
+    #[derive(Clone, Copy, Debug)]
+    enum ScOwner {
+        /// The image itself, at this host cluster plus the intra-cluster
+        /// offset.
+        Child(u64),
+        /// The external data file, likewise.
+        Data(u64),
+        /// The backing device, at the virtual offset.
+        Backing,
+        Zero,
+    }
+
+    /// The L2 entries every test image carries, as (virtual cluster,
+    /// L2 word, bitmap). The data-file flag changes what clusters 2 and
+    /// 3 mean; nothing else depends on it.
+    const SC_ENTRIES: &[(u64, u64, u64)] = &[
+        // 0: a host cluster with Normal x8, ZeroAlloc x8, UnallocatedAlloc x16.
+        (0, OFLAG_COPIED | SC_HOST_A, (0xFF00 << 32) | 0xFF),
+        // 1: #654's entry: only subcluster 0's zero bit, no host cluster.
+        (1, 0, 1 << 32),
+        // 2: #653's entry: COPIED | 0 with every alloc bit.
+        (2, OFLAG_COPIED, 0x0000_0000_FFFF_FFFF),
+        // 3: qemu's `write -P 0xab 0 1k` on a data-file image: COPIED | 0,
+        //    the first two alloc bits.
+        (3, OFLAG_COPIED, 0x3),
+        // 4: a host cluster whose subcluster 3 is both allocated and zero.
+        (
+            4,
+            OFLAG_COPIED | SC_HOST_B,
+            (1 << 35) | 0x0000_0000_FFFF_FFFF,
+        ),
+        // 5: a host cluster past the end of the image that no subcluster
+        //    uses: ZeroAlloc x16, UnallocatedAlloc x16.
+        (5, OFLAG_COPIED | SC_HOST_PAST_EOF, 0xFFFF << 32),
+        // 6: #650's entry: subcluster 0 zero, subcluster 3 allocated, no
+        //    host cluster.
+        (6, 0, (1 << 32) | (1 << 3)),
+        // 7: a host cluster whose Normal run is at the end: ZeroAlloc x8,
+        //    UnallocatedAlloc x8, Normal x16.
+        (7, OFLAG_COPIED | SC_HOST_B, (0xFF << 32) | 0xFFFF_0000),
+    ];
+
+    /// Classic (8-byte entry) images for the Standard arm, as (virtual
+    /// cluster, L2 word).
+    const SC_CLASSIC_ENTRIES: &[(u64, u64)] = &[
+        // 0: COPIED | 0: a data-file image's virtual cluster 0.
+        (0, OFLAG_COPIED),
+        // 1: an ordinary host cluster.
+        (1, OFLAG_COPIED | SC_HOST_A),
+        // 2: unallocated.
+        (2, 0),
+    ];
+
+    /// The chain under test: device 0 is the qcow2 built from the entries
+    /// above, device 1 the backing device when `backing`, device 2 the
+    /// data device (always served; a test that names it sets
+    /// `data_device_idx` to 2).
+    struct ScChain {
+        qcow2: std::vec::Vec<u8>,
+        backing: Option<std::vec::Vec<u8>>,
+        data: std::vec::Vec<u8>,
+        extended_l2: bool,
+        has_data_file: bool,
+    }
+
+    fn sc_chain(extended_l2: bool, has_data_file: bool, backing: bool) -> ScChain {
+        let mut img: std::vec::Vec<u8> = (0..SC_IMG_LEN as u64).map(sc_child_byte).collect();
+        let l1 = SC_L1_OFF as usize;
+        let l2 = SC_L2_OFF as usize;
+        img[l1..l1 + SC_CLUSTER as usize].fill(0);
+        img[l2..l2 + SC_CLUSTER as usize].fill(0);
+        let put = |img: &mut std::vec::Vec<u8>, off: usize, v: u64| {
+            img[off..off + 8].copy_from_slice(&v.to_be_bytes());
+        };
+        put(&mut img, l1, SC_L2_OFF | OFLAG_COPIED);
+        if extended_l2 {
+            for &(ci, entry, bitmap) in SC_ENTRIES {
+                put(&mut img, l2 + ci as usize * 16, entry);
+                put(&mut img, l2 + ci as usize * 16 + 8, bitmap);
+            }
+        } else {
+            for &(ci, entry) in SC_CLASSIC_ENTRIES {
+                put(&mut img, l2 + ci as usize * 8, entry);
+            }
+        }
+        ScChain {
+            qcow2: img,
+            backing: backing.then(|| (0..SC_VDISK_LEN as u64).map(sc_backing_byte).collect()),
+            data: (0..SC_VDISK_LEN as u64).map(sc_data_byte).collect(),
+            extended_l2,
+            has_data_file,
+        }
+    }
+
+    fn sc_state(chain: &ScChain, l1_cache: &mut [u8], l2_cache: &mut [u8]) -> Qcow2State {
+        let mut features = 0;
+        if chain.extended_l2 {
+            features |= INCOMPAT_EXTENDED_L2;
+        }
+        if chain.has_data_file {
+            features |= INCOMPAT_EXTERNAL_DATA;
+        }
         Qcow2State {
             device_idx: 0,
-            cluster_size: W650_CLUSTER,
-            cluster_bits: 13,
+            cluster_size: SC_CLUSTER,
+            cluster_bits: SC_CLUSTER_BITS,
             l1_size: 1,
-            l1_table_offset: 512,
-            incompatible_features: INCOMPAT_EXTENDED_L2,
+            l1_table_offset: SC_L1_OFF,
+            incompatible_features: features,
             compression_type: 0,
             crypt_method: 0,
             luks_ext_offset: 0,
             luks_ext_len: 0,
-            extended_l2: true,
+            extended_l2: chain.extended_l2,
             l1_cached_sector: u64::MAX,
             l1_cache_buf: l1_cache.as_mut_ptr(),
             l2_cached_sector: u64::MAX,
@@ -6204,72 +6379,82 @@ mod tests {
         }
     }
 
-    #[test]
-    fn extended_l2_alloc_bit_at_host_zero_is_invalid() {
-        // qemu classifies an unallocated entry with any alloc bit as
-        // QCOW2_SUBCLUSTER_INVALID (block/qcow2.h:771-772 at v10.0.0),
-        // so the lookup must say Invalid rather than hand the reader a
-        // StandardSubclusters bitmap to zero-fill.
-        let _guard = W650_LOCK.lock().unwrap();
-        unsafe {
-            w650_build_image();
+    /// Point the mock devices at the chain's buffers. The caller holds
+    /// `SC_LOCK` and clears them again with `sc_detach`.
+    unsafe fn sc_attach(chain: &ScChain, sector_size: usize) {
+        let imgs = core::ptr::addr_of_mut!(SC_IMAGES) as *mut *const u8;
+        let lens = core::ptr::addr_of_mut!(SC_LENS) as *mut usize;
+        *imgs = chain.qcow2.as_ptr();
+        *lens = chain.qcow2.len();
+        match &chain.backing {
+            Some(b) => {
+                *imgs.add(1) = b.as_ptr();
+                *lens.add(1) = b.len();
+            }
+            None => {
+                *imgs.add(1) = core::ptr::null();
+                *lens.add(1) = 0;
+            }
         }
-        let call_table = w650_call_table();
-        let mut l1_cache = std::vec![0u8; MAX_SECTOR_SIZE];
-        let mut l2_cache = std::vec![0u8; MAX_SECTOR_SIZE];
-        let mut state = w650_state(&mut l1_cache, &mut l2_cache);
-        let cap = (W650_IMG_LEN / W650_SSZ) as u64;
-        let mut bytes_read = 0u64;
-
-        let v = unsafe { state.cluster_lookup(&call_table, 0, W650_SSZ, cap, &mut bytes_read) };
-        assert!(
-            matches!(v, Some(ClusterLookup::Invalid)),
-            "an all-zero extended-L2 entry with an alloc bit set and no data file \
-             must resolve to Invalid"
-        );
-
-        // And the geometry really does select the wide path, so that a
-        // reader which stopped refusing would reach it.
-        assert!(
-            W650_SSZ as u64 > W650_SC_SIZE,
-            "fixture must have sector_size > subcluster size to take the wide I/O path"
-        );
+        *imgs.add(2) = chain.data.as_ptr();
+        *lens.add(2) = chain.data.len();
+        SC_SSZ = sector_size;
+        SC_ERR_CALLS = 0;
+        SC_ERR_SECTOR = 0;
+        SC_ERR_STATUS = 0;
+        core::ptr::write_bytes(core::ptr::addr_of_mut!(SC_ERR_OP) as *mut u8, 0, 32);
     }
 
-    #[test]
-    fn extended_l2_wide_path_refuses_an_alloc_bit_at_host_zero() {
-        let _guard = W650_LOCK.lock().unwrap();
-        unsafe {
-            w650_build_image();
+    unsafe fn sc_detach() {
+        let imgs = core::ptr::addr_of_mut!(SC_IMAGES) as *mut *const u8;
+        for i in 0..SC_MAX_DEVS {
+            *imgs.add(i) = core::ptr::null();
         }
-        let call_table = w650_call_table();
+    }
+
+    /// Read `[virt_off, virt_off + len)` through the chain with the given
+    /// sector size. The buffer starts as 0x33, a byte no device serves,
+    /// so a byte the reader never wrote is visible.
+    fn sc_read(
+        chain: &ScChain,
+        data_device_idx: u32,
+        sector_size: usize,
+        virt_off: u64,
+        len: u64,
+    ) -> (bool, std::vec::Vec<u8>, ScErr) {
+        let _guard = SC_LOCK.lock().unwrap();
+        unsafe { sc_attach(chain, sector_size) };
+        let call_table = sc_call_table();
         let mut l1_cache = std::vec![0u8; MAX_SECTOR_SIZE];
         let mut l2_cache = std::vec![0u8; MAX_SECTOR_SIZE];
-        let state = w650_state(&mut l1_cache, &mut l2_cache);
-
         let mut chain_states = ChainStates::default();
-        chain_states.qcow2_states[0] = Some(state);
+        chain_states.qcow2_states[0] = Some(sc_state(chain, &mut l1_cache, &mut l2_cache));
 
-        let mut chain_config = ChainConfig::single_chain(1);
+        let chain_len = 1 + chain.backing.is_some() as usize;
+        let mut chain_config = ChainConfig::single_chain(chain_len as u32);
         chain_config.devices[0].format = ImageFormat::Qcow2 as u32;
-        chain_config.devices[0].cluster_size = W650_CLUSTER as u32;
-        chain_config.devices[0].data_device_idx = 0;
+        chain_config.devices[0].cluster_size = SC_CLUSTER as u32;
+        chain_config.devices[0].data_device_idx = data_device_idx;
+        if chain.backing.is_some() {
+            chain_config.devices[1].format = ImageFormat::Raw as u32;
+            chain_config.devices[1].cluster_size = 0;
+            chain_config.devices[1].data_device_idx = 0;
+        }
 
         let mut compressed_buf = std::vec![0u8; MAX_SECTOR_SIZE];
         let mut staging_buf = std::vec![0u8; MAX_SECTOR_SIZE];
         let mut staging_cluster_offset = u64::MAX;
-
-        let mut buf = std::vec![0xAAu8; W650_CLUSTER as usize];
+        let mut buf = std::vec![0x33u8; len as usize];
         let mut bytes_read = 0u64;
         let ok = unsafe {
             read_chain_virtual_cluster(
                 &call_table,
                 0,
-                1,
-                0,
+                chain_len,
+                virt_off,
                 buf.as_mut_ptr(),
-                W650_CLUSTER,
-                W650_SSZ,
+                len,
+                sector_size,
                 &chain_config,
                 &mut chain_states,
                 compressed_buf.as_mut_ptr(),
@@ -6281,13 +6466,473 @@ mod tests {
                 &mut bytes_read,
             )
         };
+        let err = sc_take_err();
+        unsafe { sc_detach() };
+        (ok, buf, err)
+    }
+
+    /// The whole-cluster verdict `cluster_lookup` gives virtual cluster
+    /// `ci` of the chain.
+    fn sc_lookup(chain: &ScChain, sector_size: usize, ci: u64) -> Option<ClusterLookup> {
+        let _guard = SC_LOCK.lock().unwrap();
+        unsafe { sc_attach(chain, sector_size) };
+        let call_table = sc_call_table();
+        let mut l1_cache = std::vec![0u8; MAX_SECTOR_SIZE];
+        let mut l2_cache = std::vec![0u8; MAX_SECTOR_SIZE];
+        let mut state = sc_state(chain, &mut l1_cache, &mut l2_cache);
+        let cap = (SC_IMG_LEN / sector_size) as u64;
+        let mut bytes_read = 0u64;
+        let v = unsafe {
+            state.cluster_lookup(
+                &call_table,
+                ci * SC_CLUSTER,
+                sector_size,
+                cap,
+                &mut bytes_read,
+            )
+        };
+        unsafe { sc_detach() };
+        v
+    }
+
+    /// The bytes `[virt_off, virt_off + len)` must hold, given the owner
+    /// of each run of subclusters of the cluster the range lies in.
+    fn sc_expected(runs: &[(ScOwner, u32)], virt_off: u64, len: u64) -> std::vec::Vec<u8> {
+        let mut owners = std::vec::Vec::new();
+        for &(owner, n) in runs {
+            for _ in 0..n {
+                owners.push(owner);
+            }
+        }
+        assert_eq!(owners.len(), 32, "runs must cover the cluster");
+        let cluster_base = virt_off - virt_off % SC_CLUSTER;
         assert!(
-            !ok,
-            "subcluster {W650_BAD_SC} is marked allocated at host offset 0 with no data \
-             file: qemu fails this read with EIO, so the reader must too"
+            virt_off + len <= cluster_base + SC_CLUSTER,
+            "range within one cluster"
+        );
+        (virt_off..virt_off + len)
+            .map(|v| {
+                let intra = v - cluster_base;
+                match owners[(intra / SC_SC_SIZE) as usize] {
+                    ScOwner::Child(host) => sc_child_byte(host + intra),
+                    ScOwner::Data(host) => sc_data_byte(host + intra),
+                    ScOwner::Backing => sc_backing_byte(v),
+                    ScOwner::Zero => 0,
+                }
+            })
+            .collect()
+    }
+
+    /// Both I/O paths, named for the assertion messages.
+    const SC_ARMS: [(&str, usize); 2] = [("narrow", SC_NARROW_SSZ), ("wide", SC_WIDE_SSZ)];
+
+    /// Read the range through both arms and check every byte's owner.
+    fn sc_assert_provenance(
+        chain: &ScChain,
+        data_device_idx: u32,
+        virt_off: u64,
+        len: u64,
+        runs: &[(ScOwner, u32)],
+        label: &str,
+    ) {
+        let want = sc_expected(runs, virt_off, len);
+        for (arm, ssz) in SC_ARMS {
+            let (ok, got, err) = sc_read(chain, data_device_idx, ssz, virt_off, len);
+            assert!(
+                ok,
+                "{label} ({arm} arm): read of {len} at {virt_off} failed: {err:?}"
+            );
+            assert_eq!(err.calls, 0, "{label} ({arm} arm): no error may be raised");
+            if let Some(i) = (0..want.len()).find(|&i| got[i] != want[i]) {
+                panic!(
+                    "{label} ({arm} arm): byte {} (virtual offset {}, subcluster {}) is {:#04x}, \
+                     expected {:#04x}; runs {runs:?}",
+                    i,
+                    virt_off + i as u64,
+                    (virt_off + i as u64) % SC_CLUSTER / SC_SC_SIZE,
+                    got[i],
+                    want[i]
+                );
+            }
+        }
+    }
+
+    /// Read the range through both arms and check the read is refused
+    /// by name: once, with the invalid-L2-entry marker, the virtual
+    /// offset and the device index.
+    fn sc_assert_refused(chain: &ScChain, data_device_idx: u32, virt_off: u64, label: &str) {
+        for (arm, ssz) in SC_ARMS {
+            let (ok, _, err) = sc_read(chain, data_device_idx, ssz, virt_off, SC_CLUSTER);
+            assert!(
+                !ok,
+                "{label} ({arm} arm): qemu fails this read with EIO, so must instar"
+            );
+            assert_eq!(
+                err.calls, 1,
+                "{label} ({arm} arm): the refusal must be raised on send_error exactly once"
+            );
+            assert_eq!(
+                err.op,
+                shared::InvalidL2EntryRefusal::OPERATION,
+                "{label} ({arm} arm): the read must fail by raising the invalid-entry refusal"
+            );
+            assert_eq!(
+                err.sector, virt_off,
+                "{label} ({arm} arm): the refusal names the virtual byte offset"
+            );
+            assert_eq!(
+                err.status, 0,
+                "{label} ({arm} arm): the refusal names chain device 0"
+            );
+        }
+    }
+
+    use ScOwner::{Backing, Child, Data, Zero};
+
+    #[test]
+    fn sc_harness_geometry_selects_both_arms() {
+        // Vacuity guard: the sector sizes must straddle the subcluster
+        // size, or both reads below take the same path.
+        assert!(SC_NARROW_SSZ as u64 <= SC_SC_SIZE);
+        assert!(SC_WIDE_SSZ as u64 > SC_SC_SIZE);
+        // And the three patterns never collide with each other or zero.
+        for off in (0..SC_VDISK_LEN as u64).step_by(64) {
+            let (c, b, d) = (sc_child_byte(off), sc_backing_byte(off), sc_data_byte(off));
+            assert!(c != 0 && b != 0 && d != 0 && c != b && b != d && c != d);
+            assert!(c != 0x33 && b != 0x33 && d != 0x33);
+        }
+    }
+
+    #[test]
+    fn sc_mixed_cluster_bytes_come_from_the_right_layer() {
+        let normal_zero_unalloc = |unalloc| [(Child(SC_HOST_A), 8), (Zero, 8), (unalloc, 16)];
+        let chain = sc_chain(true, false, true);
+        sc_assert_provenance(
+            &chain,
+            0,
+            0,
+            SC_CLUSTER,
+            &normal_zero_unalloc(Backing),
+            "N Za Ua, backing",
+        );
+        // Without a backing device the unallocated run is zeros.
+        let chain = sc_chain(true, false, false);
+        sc_assert_provenance(
+            &chain,
+            0,
+            0,
+            SC_CLUSTER,
+            &normal_zero_unalloc(Zero),
+            "N Za Ua, no backing",
+        );
+        // A Normal run that is not at the start of the cluster.
+        let chain = sc_chain(true, false, true);
+        let runs = [(Zero, 8), (Backing, 8), (Child(SC_HOST_B), 16)];
+        sc_assert_provenance(
+            &chain,
+            0,
+            7 * SC_CLUSTER,
+            SC_CLUSTER,
+            &runs,
+            "Za Ua N, backing",
         );
     }
 
+    #[test]
+    fn sc_partial_and_unaligned_reads_fill_exactly_the_bytes_asked() {
+        let chain = sc_chain(true, false, true);
+        let runs = [(Child(SC_HOST_A), 8), (Zero, 8), (Backing, 16)];
+        // One wide sector; one narrow sector inside the zero run; windows
+        // that start and end inside subclusters and cross a run boundary
+        // (Normal to ZeroAlloc at 4096, ZeroAlloc to UnallocatedAlloc at
+        // 8192); and the last bytes of the cluster.
+        for (off, len) in [
+            (4096, 4096),
+            (4608, 512),
+            (4000, 200),
+            (8100, 300),
+            (16284, 100),
+        ] {
+            let label = std::format!("window {len}@{off}");
+            sc_assert_provenance(&chain, 0, off, len, &runs, &label);
+        }
+        // The same windows in a cluster whose Normal run is last.
+        let runs = [(Zero, 8), (Backing, 8), (Child(SC_HOST_B), 16)];
+        for (off, len) in [(0, 4096), (3900, 400), (8000, 300), (12345, 678)] {
+            let label = std::format!("window {len}@{off} of cluster 7");
+            sc_assert_provenance(&chain, 0, 7 * SC_CLUSTER + off, len, &runs, &label);
+        }
+    }
+
+    #[test]
+    fn sc_issue_654_unallocated_subclusters_read_the_backing_file() {
+        // #654: subcluster 0 has its zero bit, the other 31 have neither
+        // bit. qemu reads them from the backing file; instar zero-filled
+        // them, because the host offset was 0.
+        let chain = sc_chain(true, false, true);
+        let runs = [(Zero, 1), (Backing, 31)];
+        sc_assert_provenance(&chain, 0, SC_CLUSTER, SC_CLUSTER, &runs, "#654");
+        assert!(matches!(
+            sc_lookup(&chain, SC_NARROW_SSZ, 1),
+            Some(ClusterLookup::StandardSubclusters(0, b)) if b == 1 << 32
+        ));
+        // And at the bottom of the chain they are zeros.
+        let chain = sc_chain(true, false, false);
+        sc_assert_provenance(
+            &chain,
+            0,
+            SC_CLUSTER,
+            SC_CLUSTER,
+            &[(Zero, 32)],
+            "#654, no backing",
+        );
+    }
+
+    #[test]
+    fn sc_issue_653_entry_is_refused_by_name_without_a_data_file() {
+        // #653: COPIED | 0 with every alloc bit. Without a data file there
+        // is no host cluster, and before the classifier instar served the
+        // image's header and tables (host offset 0) as guest data.
+        for backing in [false, true] {
+            let chain = sc_chain(true, false, backing);
+            assert!(matches!(
+                sc_lookup(&chain, SC_NARROW_SSZ, 2),
+                Some(ClusterLookup::Invalid)
+            ));
+            sc_assert_refused(&chain, 0, 2 * SC_CLUSTER, "#653");
+        }
+    }
+
+    #[test]
+    fn sc_issue_653_entry_reads_the_data_file_with_one() {
+        // With a data file the same entry is virtual cluster 0's normal
+        // shape: a whole cluster at data-file offset 0 (qcow2.h:729-730).
+        let chain = sc_chain(true, true, true);
+        assert!(matches!(
+            sc_lookup(&chain, SC_NARROW_SSZ, 2),
+            Some(ClusterLookup::Standard(0))
+        ));
+        sc_assert_provenance(
+            &chain,
+            2,
+            2 * SC_CLUSTER,
+            SC_CLUSTER,
+            &[(Data(0), 32)],
+            "#653 + data file",
+        );
+    }
+
+    #[test]
+    fn sc_partial_data_file_cluster_reads_the_data_file_then_descends() {
+        // What qemu writes for a 1 KiB write at offset 0 of a data-file
+        // image with 16 KiB clusters: COPIED | 0, bitmap 0x3. The first
+        // two subclusters are in the data file at offset 0; the rest are
+        // UnallocatedAlloc and read the backing file, or zeros without
+        // one. instar's convert wrote zeros for the whole cluster.
+        let chain = sc_chain(true, true, true);
+        let runs = [(Data(0), 2), (Backing, 30)];
+        sc_assert_provenance(
+            &chain,
+            2,
+            3 * SC_CLUSTER,
+            SC_CLUSTER,
+            &runs,
+            "data-file partial, backing",
+        );
+        assert!(matches!(
+            sc_lookup(&chain, SC_NARROW_SSZ, 3),
+            Some(ClusterLookup::StandardSubclusters(e, 0x3)) if e == OFLAG_COPIED
+        ));
+        let chain = sc_chain(true, true, false);
+        let runs = [(Data(0), 2), (Zero, 30)];
+        sc_assert_provenance(
+            &chain,
+            2,
+            3 * SC_CLUSTER,
+            SC_CLUSTER,
+            &runs,
+            "data-file partial, no backing",
+        );
+        // Without the data file the same words are invalid.
+        let chain = sc_chain(true, false, true);
+        sc_assert_refused(
+            &chain,
+            0,
+            3 * SC_CLUSTER,
+            "data-file partial entry, no data file",
+        );
+    }
+
+    #[test]
+    fn sc_data_file_host_clusters_are_read_from_the_data_device() {
+        // A data-file image's non-zero host offsets are data-file offsets
+        // too: cluster 0's Normal run is at SC_HOST_A in the data device,
+        // not in the image.
+        let chain = sc_chain(true, true, true);
+        let runs = [(Data(SC_HOST_A), 8), (Zero, 8), (Backing, 16)];
+        sc_assert_provenance(&chain, 2, 0, SC_CLUSTER, &runs, "N Za Ua, data file");
+    }
+
+    #[test]
+    fn sc_alloc_and_zero_overlap_is_refused_by_name() {
+        // A subcluster both allocated and zero makes the whole entry
+        // invalid (qcow2.h:761-762), with or without a data file.
+        for has_data_file in [false, true] {
+            let chain = sc_chain(true, has_data_file, true);
+            let data_dev = if has_data_file { 2 } else { 0 };
+            assert!(matches!(
+                sc_lookup(&chain, SC_NARROW_SSZ, 4),
+                Some(ClusterLookup::Invalid)
+            ));
+            sc_assert_refused(&chain, data_dev, 4 * SC_CLUSTER, "alloc-zero overlap");
+        }
+    }
+
+    #[test]
+    fn sc_host_cluster_is_not_read_when_no_run_is_normal() {
+        // Cluster 5's host offset is past the end of the image, so a read
+        // of it fails. Its subclusters are all ZeroAlloc or
+        // UnallocatedAlloc, so neither arm has any reason to read it: the
+        // wide arm's single chunk read is for Normal runs only.
+        let chain = sc_chain(true, false, true);
+        let runs = [(Zero, 16), (Backing, 16)];
+        sc_assert_provenance(
+            &chain,
+            0,
+            5 * SC_CLUSTER,
+            SC_CLUSTER,
+            &runs,
+            "Za Ua past EOF",
+        );
+        // Including a window that lies wholly in the unallocated run.
+        sc_assert_provenance(
+            &chain,
+            0,
+            5 * SC_CLUSTER + 8192,
+            4096,
+            &runs,
+            "Ua window past EOF",
+        );
+    }
+
+    #[test]
+    fn sc_missing_data_device_fails_closed() {
+        // The header declares a data file but no data device is attached
+        // (data_device_idx 0). Host offset 0 would then be the image's
+        // own header, so every read that takes bytes from a Normal
+        // subcluster fails, without claiming the entry is invalid.
+        let chain = sc_chain(true, true, true);
+        for (ci, label) in [
+            (2, "Standard(0)"),
+            (3, "mixed at host 0"),
+            (0, "mixed at a host cluster"),
+        ] {
+            for (arm, ssz) in SC_ARMS {
+                let (ok, _, err) = sc_read(&chain, 0, ssz, ci * SC_CLUSTER, SC_CLUSTER);
+                assert!(!ok, "{label} ({arm} arm): must fail without a data device");
+                assert_eq!(
+                    err.calls, 0,
+                    "{label} ({arm} arm): this is not an invalid entry"
+                );
+            }
+        }
+        // Reads that touch no Normal subcluster still succeed.
+        sc_assert_provenance(
+            &chain,
+            0,
+            SC_CLUSTER,
+            SC_CLUSTER,
+            &[(Zero, 1), (Backing, 31)],
+            "#654, data file declared",
+        );
+    }
+
+    #[test]
+    fn sc_classic_data_file_cluster_zero_reads_the_data_file() {
+        // Classic L2, data file: COPIED | 0 is virtual cluster 0 at
+        // data-file offset 0, and a non-zero host offset is a data-file
+        // offset. Before the classifier the first read the data device
+        // only because the host had put it next in the chain.
+        let chain = sc_chain(false, true, true);
+        assert!(matches!(
+            sc_lookup(&chain, SC_NARROW_SSZ, 0),
+            Some(ClusterLookup::Standard(0))
+        ));
+        sc_assert_provenance(
+            &chain,
+            2,
+            0,
+            SC_CLUSTER,
+            &[(Data(0), 32)],
+            "classic COPIED|0, data file",
+        );
+        sc_assert_provenance(
+            &chain,
+            2,
+            SC_CLUSTER,
+            SC_CLUSTER,
+            &[(Data(SC_HOST_A), 32)],
+            "classic host A, data file",
+        );
+        sc_assert_provenance(
+            &chain,
+            2,
+            2 * SC_CLUSTER,
+            SC_CLUSTER,
+            &[(Backing, 32)],
+            "classic unallocated, data file",
+        );
+        // Without a data file COPIED | 0 is unallocated and reads the
+        // backing file; the host cluster is in the image.
+        let chain = sc_chain(false, false, true);
+        assert!(matches!(
+            sc_lookup(&chain, SC_NARROW_SSZ, 0),
+            Some(ClusterLookup::Unallocated)
+        ));
+        sc_assert_provenance(
+            &chain,
+            0,
+            0,
+            SC_CLUSTER,
+            &[(Backing, 32)],
+            "classic COPIED|0, no data file",
+        );
+        sc_assert_provenance(
+            &chain,
+            0,
+            SC_CLUSTER,
+            SC_CLUSTER,
+            &[(Child(SC_HOST_A), 32)],
+            "classic host A, no data file",
+        );
+    }
+
+    #[test]
+    fn extended_l2_alloc_bit_at_host_zero_is_invalid() {
+        // #650's entry: qemu classifies an unallocated entry with any
+        // alloc bit as QCOW2_SUBCLUSTER_INVALID (block/qcow2.h:771-772 at
+        // v10.0.0), so the lookup must say Invalid rather than hand the
+        // reader a StandardSubclusters bitmap to zero-fill.
+        let chain = sc_chain(true, false, false);
+        assert!(
+            matches!(
+                sc_lookup(&chain, SC_WIDE_SSZ, 6),
+                Some(ClusterLookup::Invalid)
+            ),
+            "an all-zero extended-L2 entry with an alloc bit set and no data file \
+             must resolve to Invalid"
+        );
+    }
+
+    #[test]
+    fn extended_l2_wide_path_refuses_an_alloc_bit_at_host_zero() {
+        // #650 was the wide path leaving the caller's buffer untouched
+        // under a `true` return for this entry; its fix zero-filled the
+        // subcluster; qemu fails the read with EIO (#653), and so does
+        // instar, by name. Both arms are exercised by sc_assert_refused.
+        let chain = sc_chain(true, false, false);
+        sc_assert_refused(&chain, 0, 6 * SC_CLUSTER, "#650");
+    }
     // ====================================================================
     // VDI chain-reader arm (read_chain_virtual_cluster ImageFormat::Vdi)
     // ====================================================================
@@ -13780,6 +14425,60 @@ fn devices_behind(chain_len: usize, dev_offset: usize) -> Option<usize> {
     chain_len.checked_sub(dev_offset)?.checked_sub(1)
 }
 
+/// The device a qcow2 cluster's host offset is read from: the external
+/// data file when the header declares one (`has_data_file`), else the
+/// image itself. The header decides, as it does in qemu, which refuses
+/// to open an image whose data-file extension and feature bit disagree.
+/// Compressed clusters are not read through this; they are in the image
+/// whatever the header says.
+///
+/// `None` when the header declares a data file but no data device is
+/// attached (`data_device_idx == 0`, never a data device because device
+/// 0 is the top of the chain). The caller fails any read that needs it:
+/// a host offset in a data-file image addresses the data file, and
+/// reading it from the image instead would serve the image's own header
+/// and tables as guest data, since qemu puts virtual cluster 0 at
+/// data-file offset 0. The host opens the data file before the guest
+/// starts, so this is reached only by a host-side defect.
+#[inline]
+fn data_read_device(
+    chain_config: &ChainConfig,
+    dev_idx: usize,
+    has_data_file: bool,
+) -> Option<u32> {
+    if !has_data_file {
+        return Some(dev_idx as u32);
+    }
+    match chain_config.devices[dev_idx].data_device_idx {
+        0 => None,
+        data_dev => Some(data_dev),
+    }
+}
+
+/// Whether any subcluster in `[sc_from, sc_to)` of an extended-L2 entry
+/// is `Normal`: whether a read of that range has bytes to take from the
+/// host cluster at all.
+fn subclusters_include_normal(
+    l2_entry: u64,
+    bitmap: u64,
+    sc_from: u32,
+    sc_to: u32,
+    has_data_file: bool,
+) -> bool {
+    let mut sc = sc_from;
+    while sc < sc_to {
+        let (ty, run) = subcluster_range(l2_entry, bitmap, sc, true, has_data_file);
+        if run == 0 {
+            return false;
+        }
+        if ty == SubclusterType::Normal {
+            return true;
+        }
+        sc += run;
+    }
+    false
+}
+
 /// Whether the device at `dev_idx` has at least one device behind it
 /// *in its own chain*, according to the config's declared
 /// segmentation.
@@ -13802,7 +14501,13 @@ fn parent_in_chain(chain_config: &ChainConfig, dev_idx: usize) -> bool {
 /// Read one cluster's worth of virtual data by walking a backing chain.
 ///
 /// For each device in the chain (starting from the top):
-/// - QCOW2: perform L1/L2 lookup. If unallocated, try next device.
+/// - QCOW2: perform L1/L2 lookup. If unallocated, try next device. An
+///   extended-L2 entry whose subclusters differ in type is read one run
+///   of equal type at a time, as [`subcluster_range`] classifies them:
+///   `Normal` from the host cluster (in the external data file, if the
+///   header declares one), zero types as zeros, unallocated types from
+///   the next device. An entry qemu calls invalid fails the read and
+///   raises [`shared::InvalidL2EntryRefusal`] on `send_error`.
 /// - VMDK (with `vmdk-input` feature): perform GD/GT grain lookup.
 ///   If unallocated, try next device.
 /// - VHD (with `vhd-input` feature): perform BAT block lookup. If
@@ -13873,6 +14578,7 @@ pub unsafe fn read_chain_virtual_cluster(
                 let compression_type = state.compression_type;
                 let cluster_bits = state.cluster_bits;
                 let crypt_method = state.crypt_method;
+                let has_data_file = state.has_data_file();
 
                 match state.cluster_lookup(call_table, virtual_offset, sector_size, cap, bytes_read)
                 {
@@ -13887,92 +14593,119 @@ pub unsafe fn read_chain_virtual_cluster(
                         core::ptr::write_bytes(buf, 0, chunk_size as usize);
                         return true;
                     }
-                    Some(ClusterLookup::StandardSubclusters(host_offset, bitmap)) => {
-                        let alloc_bits = bitmap as u32;
-                        let zero_bits = (bitmap >> 32) as u32;
-
+                    Some(ClusterLookup::StandardSubclusters(l2_entry, bitmap)) => {
+                        // An extended-L2 entry whose subclusters differ in
+                        // type. Each run of one type is decided once, by
+                        // subcluster_range (qemu's
+                        // qcow2_get_subcluster_range_type), and the two I/O
+                        // paths below differ only in how a Normal run's
+                        // bytes reach the buffer. The host offset is read
+                        // for Normal runs alone, and whether it is zero
+                        // means nothing here: with an external data file it
+                        // is a real offset into that file, and without one
+                        // the classifier never calls such a run Normal.
+                        let host_offset = l2_entry & L2_OFFSET_MASK;
                         let intra_offset = virtual_offset % qcow2_cluster_size;
                         let read_size = if chunk_size < qcow2_cluster_size {
                             chunk_size
                         } else {
                             qcow2_cluster_size
                         };
+                        let chunk_end = intra_offset + read_size;
+                        let sc_size =
+                            qcow2_cluster_size / QCOW_EXTL2_SUBCLUSTERS_PER_CLUSTER as u64;
+                        // Resolved only when a Normal run is read, so a
+                        // data-file image whose data device is missing
+                        // fails exactly the reads that need it.
+                        let read_dev = data_read_device(chain_config, dev_idx, has_data_file);
 
-                        // Per-subcluster handling for mixed allocation
-                        let sc_size = qcow2_cluster_size / 32;
-                        let sc_start = intra_offset / sc_size;
-                        let sc_count = read_size / sc_size;
-                        let read_dev = chain_config.devices[dev_idx].data_device_idx;
-                        let read_dev = if read_dev != 0 {
-                            read_dev
-                        } else {
-                            dev_idx as u32
-                        };
-
-                        // When sector_size <= subcluster_size, we can
-                        // read only the allocated subcluster runs and
-                        // skip I/O for zero/unallocated ranges. When
-                        // sector_size > subcluster_size, we must read
-                        // the full chunk first (a per-subcluster read
-                        // would read an entire sector for each 2 KB
-                        // subcluster, wasting I/O or overrunning the
-                        // buffer).
-                        if sector_size as u64 <= sc_size {
-                            // ---- NARROW I/O PATH ----
-                            // Read only allocated runs; zero-fill and
-                            // backing-chain-recurse the rest.
-                            let mut i = 0u64;
-                            while i < sc_count {
-                                let sc_idx = (sc_start + i) as u32;
-                                let is_zero = (zero_bits >> sc_idx) & 1 != 0;
-                                let is_alloc = (alloc_bits >> sc_idx) & 1 != 0;
-
-                                if is_zero || (!is_alloc && host_offset == 0) {
-                                    // ZERO RUN: coalesce contiguous zero subclusters
-                                    let run_start = i;
-                                    let mut run_len = 1u64;
-                                    while i + run_len < sc_count {
-                                        let next = (sc_start + i + run_len) as u32;
-                                        let nz = (zero_bits >> next) & 1 != 0;
-                                        let na = (alloc_bits >> next) & 1 != 0;
-                                        if nz || (!na && host_offset == 0) {
-                                            run_len += 1;
-                                        } else {
-                                            break;
-                                        }
-                                    }
-                                    core::ptr::write_bytes(
-                                        buf.add((run_start * sc_size) as usize),
-                                        0,
-                                        (run_len * sc_size) as usize,
+                        // A sector larger than a subcluster cannot be read
+                        // one run at a time without reading a whole sector
+                        // for each sub-sector run, so the wide path reads
+                        // the chunk from the host cluster once, decrypts
+                        // it, and then overwrites every run that is not
+                        // Normal. A sector no larger than a subcluster
+                        // reads only the Normal runs. The chunk read is
+                        // skipped when no run in the chunk is Normal: the
+                        // host cluster then holds nothing this read needs.
+                        let wide = sector_size as u64 > sc_size;
+                        if wide
+                            && subclusters_include_normal(
+                                l2_entry,
+                                bitmap,
+                                (intra_offset / sc_size) as u32,
+                                chunk_end.div_ceil(sc_size) as u32,
+                                has_data_file,
+                            )
+                        {
+                            let Some(read_dev) = read_dev else {
+                                return false;
+                            };
+                            let read_offset = host_offset + intra_offset;
+                            if !read_cluster_sectors(
+                                call_table,
+                                read_dev,
+                                read_offset,
+                                buf,
+                                read_size,
+                                sector_size,
+                                bytes_read,
+                            ) {
+                                return false;
+                            }
+                            #[cfg(feature = "aes-decrypt")]
+                            if crypt_method == 1 {
+                                if let Some(key) = aes_key {
+                                    decrypt_cluster_aes_cbc(buf, read_size, virtual_offset, key);
+                                }
+                            }
+                            #[cfg(feature = "luks-decrypt")]
+                            if crypt_method == 2 {
+                                if let Some(key) = luks_key {
+                                    decrypt_cluster_aes_xts(
+                                        buf,
+                                        read_size,
+                                        read_offset,
+                                        key,
+                                        luks_sector_size,
                                     );
-                                    i += run_len;
-                                } else if is_alloc {
-                                    // ALLOC RUN: coalesce contiguous allocated subclusters
-                                    let run_start = i;
-                                    let mut run_len = 1u64;
-                                    while i + run_len < sc_count {
-                                        let next = (sc_start + i + run_len) as u32;
-                                        let nz = (zero_bits >> next) & 1 != 0;
-                                        let na = (alloc_bits >> next) & 1 != 0;
-                                        if na && !nz {
-                                            run_len += 1;
-                                        } else {
-                                            break;
-                                        }
-                                    }
+                                }
+                            }
+                        }
 
-                                    let run_buf_off = (run_start * sc_size) as usize;
-                                    let run_host = host_offset + (sc_start + run_start) * sc_size;
-                                    let run_bytes = run_len * sc_size;
-
-                                    if host_offset != 0 {
+                        let mut pos = intra_offset;
+                        while pos < chunk_end {
+                            let sc = (pos / sc_size) as u32;
+                            let (ty, run) =
+                                subcluster_range(l2_entry, bitmap, sc, true, has_data_file);
+                            // The run is clipped to the chunk, so a read
+                            // that starts or ends inside a subcluster (a
+                            // dd window) fills exactly the bytes asked for.
+                            let run_end = ((sc + run) as u64 * sc_size).min(chunk_end);
+                            if run_end <= pos {
+                                // Only an Invalid entry has no run, and
+                                // cluster_lookup refused that before this
+                                // arm. Fail closed rather than loop.
+                                return false;
+                            }
+                            let len = run_end - pos;
+                            let buf_off = (pos - intra_offset) as usize;
+                            let dst = buf.add(buf_off);
+                            match ty {
+                                SubclusterType::Normal => {
+                                    // The wide path's chunk read above
+                                    // already holds these bytes.
+                                    if !wide {
+                                        let Some(read_dev) = read_dev else {
+                                            return false;
+                                        };
+                                        let run_host = host_offset + pos;
                                         if !read_cluster_sectors(
                                             call_table,
                                             read_dev,
                                             run_host,
-                                            buf.add(run_buf_off),
-                                            run_bytes,
+                                            dst,
+                                            len,
                                             sector_size,
                                             bytes_read,
                                         ) {
@@ -13981,11 +14714,10 @@ pub unsafe fn read_chain_virtual_cluster(
                                         #[cfg(feature = "aes-decrypt")]
                                         if crypt_method == 1 {
                                             if let Some(key) = aes_key {
-                                                let virt = virtual_offset + run_start * sc_size;
                                                 decrypt_cluster_aes_cbc(
-                                                    buf.add(run_buf_off),
-                                                    run_bytes,
-                                                    virt,
+                                                    dst,
+                                                    len,
+                                                    virtual_offset + buf_off as u64,
                                                     key,
                                                 );
                                             }
@@ -13994,27 +14726,23 @@ pub unsafe fn read_chain_virtual_cluster(
                                         if crypt_method == 2 {
                                             if let Some(key) = luks_key {
                                                 decrypt_cluster_aes_xts(
-                                                    buf.add(run_buf_off),
-                                                    run_bytes,
+                                                    dst,
+                                                    len,
                                                     run_host,
                                                     key,
                                                     luks_sector_size,
                                                 );
                                             }
                                         }
-                                    } else {
-                                        // host_offset == 0 but alloc set:
-                                        // malformed (I2), zero-fill defensively
-                                        core::ptr::write_bytes(
-                                            buf.add(run_buf_off),
-                                            0,
-                                            run_bytes as usize,
-                                        );
                                     }
-                                    i += run_len;
-                                } else {
-                                    // UNALLOC: recurse into backing chain
-                                    let buf_off = (i * sc_size) as usize;
+                                }
+                                SubclusterType::ZeroAlloc | SubclusterType::ZeroPlain => {
+                                    core::ptr::write_bytes(dst, 0, len as usize);
+                                }
+                                SubclusterType::UnallocatedAlloc
+                                | SubclusterType::UnallocatedPlain => {
+                                    // The backing chain's bytes, or zeros at
+                                    // the bottom of the chain.
                                     let remaining = match devices_behind(chain_len, dev_offset) {
                                         Some(r) => r,
                                         None => return false,
@@ -14024,9 +14752,9 @@ pub unsafe fn read_chain_virtual_cluster(
                                             call_table,
                                             chain_start + dev_offset + 1,
                                             remaining,
-                                            virtual_offset + i * sc_size,
-                                            buf.add(buf_off),
-                                            sc_size,
+                                            virtual_offset + buf_off as u64,
+                                            dst,
+                                            len,
                                             sector_size,
                                             chain_config,
                                             chain_states,
@@ -14041,116 +14769,17 @@ pub unsafe fn read_chain_virtual_cluster(
                                             return false;
                                         }
                                     } else {
-                                        // Bottom of chain: zero
-                                        core::ptr::write_bytes(
-                                            buf.add(buf_off),
-                                            0,
-                                            sc_size as usize,
-                                        );
+                                        core::ptr::write_bytes(dst, 0, len as usize);
                                     }
-                                    i += 1;
                                 }
-                            }
-                        } else {
-                            // ---- WIDE I/O PATH ----
-                            // Sector is larger than a subcluster; read the
-                            // full chunk, decrypt, then selectively overwrite.
-                            if host_offset != 0 {
-                                let read_offset = host_offset + intra_offset;
-                                if !read_cluster_sectors(
-                                    call_table,
-                                    read_dev,
-                                    read_offset,
-                                    buf,
-                                    read_size,
-                                    sector_size,
-                                    bytes_read,
-                                ) {
+                                // cluster_lookup routes compressed and
+                                // invalid entries to their own arms, so
+                                // neither type reaches a mixed cluster.
+                                SubclusterType::Compressed | SubclusterType::Invalid => {
                                     return false;
                                 }
-                                #[cfg(feature = "aes-decrypt")]
-                                if crypt_method == 1 {
-                                    if let Some(key) = aes_key {
-                                        decrypt_cluster_aes_cbc(
-                                            buf,
-                                            read_size,
-                                            virtual_offset,
-                                            key,
-                                        );
-                                    }
-                                }
-                                #[cfg(feature = "luks-decrypt")]
-                                if crypt_method == 2 {
-                                    if let Some(key) = luks_key {
-                                        decrypt_cluster_aes_xts(
-                                            buf,
-                                            read_size,
-                                            host_offset + intra_offset,
-                                            key,
-                                            luks_sector_size,
-                                        );
-                                    }
-                                }
                             }
-
-                            // Selectively fill non-allocated subclusters:
-                            // zero subclusters get zeroed, unallocated
-                            // subclusters come from backing chain or zero
-                            // at bottom of chain.
-                            for i in 0..sc_count {
-                                let sc_idx = (sc_start + i) as u32;
-                                let is_zero = (zero_bits >> sc_idx) & 1 != 0;
-                                let is_alloc = (alloc_bits >> sc_idx) & 1 != 0;
-                                let buf_off = (i * sc_size) as usize;
-
-                                if is_zero || (!is_alloc && host_offset == 0) {
-                                    core::ptr::write_bytes(buf.add(buf_off), 0, sc_size as usize);
-                                } else if !is_alloc {
-                                    let remaining = match devices_behind(chain_len, dev_offset) {
-                                        Some(r) => r,
-                                        None => return false,
-                                    };
-                                    if remaining > 0 {
-                                        if !read_chain_virtual_cluster(
-                                            call_table,
-                                            chain_start + dev_offset + 1,
-                                            remaining,
-                                            virtual_offset + i * sc_size,
-                                            buf.add(buf_off),
-                                            sc_size,
-                                            sector_size,
-                                            chain_config,
-                                            chain_states,
-                                            compressed_buf,
-                                            staging_buf,
-                                            staging_cluster_offset,
-                                            aes_key,
-                                            luks_key,
-                                            luks_sector_size,
-                                            bytes_read,
-                                        ) {
-                                            return false;
-                                        }
-                                    } else {
-                                        core::ptr::write_bytes(
-                                            buf.add(buf_off),
-                                            0,
-                                            sc_size as usize,
-                                        );
-                                    }
-                                } else if host_offset == 0 {
-                                    // Alloc set while the L2 entry names
-                                    // offset zero: malformed, and the chunk
-                                    // read above was skipped for exactly
-                                    // that reason, so nothing has written
-                                    // this subcluster.  Zero-fill rather
-                                    // than report success over whatever the
-                                    // caller's buffer already held.  The
-                                    // narrow path defends the same case.
-                                    core::ptr::write_bytes(buf.add(buf_off), 0, sc_size as usize);
-                                }
-                                // Allocated subclusters: already read above
-                            }
+                            pos = run_end;
                         }
                         return true;
                     }
@@ -14165,14 +14794,14 @@ pub unsafe fn read_chain_virtual_cluster(
                         } else {
                             qcow2_cluster_size
                         };
-                        // If this device has an external data file, read
-                        // standard clusters from the data device instead.
-                        // Compressed clusters stay on the metadata device.
-                        let read_dev = chain_config.devices[dev_idx].data_device_idx;
-                        let read_dev = if read_dev != 0 {
-                            read_dev
-                        } else {
-                            dev_idx as u32
+                        // With an external data file the host offset is an
+                        // offset into that file, including offset 0, which
+                        // is where qemu puts virtual cluster 0. Compressed
+                        // clusters stay on the metadata device.
+                        let read_dev = match data_read_device(chain_config, dev_idx, has_data_file)
+                        {
+                            Some(d) => d,
+                            None => return false,
                         };
                         if !read_cluster_sectors(
                             call_table,
@@ -14311,10 +14940,16 @@ pub unsafe fn read_chain_virtual_cluster(
                     Some(ClusterLookup::Compressed(_)) => {
                         return false;
                     }
-                    // qemu fails the read of an invalid entry with EIO
-                    // (#653); this fails it as a generic read error until
-                    // the refusal is reported by name.
-                    Some(ClusterLookup::Invalid) => return false,
+                    Some(ClusterLookup::Invalid) => {
+                        // qemu fails the read with EIO and "Invalid cluster
+                        // entry found" (block/qcow2-cluster.c:712-718 at
+                        // v10.0.0). Before #653 this entry's host offset 0
+                        // was read, serving the image's own header as
+                        // guest data. The refusal is raised by name because
+                        // this function's bool cannot carry the reason.
+                        send_invalid_l2_entry_refusal(call_table, dev_idx as u32, virtual_offset);
+                        return false;
+                    }
                     None => return false,
                 }
             }
@@ -15778,6 +16413,32 @@ unsafe fn send_differencing_refusal(call_table: &CallTable, status: u32) {
         b"input\0".as_ptr(),
         0,
         status,
+    );
+}
+
+/// Raise the invalid-L2-entry read refusal on the call table's
+/// `send_error` channel.
+///
+/// `read_chain_virtual_cluster` returns a bare `bool` to convert, dd,
+/// compare, bench and rebase, none of which has a result code for "the
+/// image is corrupt", so the reason is raised from inside the reader on
+/// the channel the host already watches, as `send_differencing_refusal`
+/// does. `virtual_offset` travels in the `sector` argument as a byte
+/// offset and `dev_idx` in `status`; see
+/// [`shared::InvalidL2EntryRefusal`].
+///
+/// # Safety
+///
+/// `call_table` must be a valid initialised [`CallTable`].
+// Same reason as `send_differencing_refusal` above: the call table's
+// string arguments are `*const u8`.
+#[allow(clippy::manual_c_str_literals)]
+unsafe fn send_invalid_l2_entry_refusal(call_table: &CallTable, dev_idx: u32, virtual_offset: u64) {
+    (call_table.send_error)(
+        shared::InvalidL2EntryRefusal::OPERATION_C.as_ptr(),
+        b"input\0".as_ptr(),
+        virtual_offset,
+        dev_idx,
     );
 }
 

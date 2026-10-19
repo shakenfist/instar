@@ -251,6 +251,33 @@ phase 1 or are filed as separate issues. No existing issue covers
 either (searched 2026-10-19). Both were filed and kept out of this
 phase: see Execution notes.
 
+## Step 1c measurements
+
+The master plan's rows A to D, re-run on 2026-10-20 against the binary
+built from the step 1c tree, for the read path (`convert -O raw`,
+`compare`, `dd` and `bench`). map, measure and check are step 1d's and
+are not measured here.
+
+| # | Fixture | Before (develop `da9f043f`) | After step 1c | qemu 10.0.13 |
+|---|---|---|---|---|
+| A (#654) | `issue_654` | subclusters 1-31 of cluster 0 read zeros | read the backing file; `convert`, `compare`, `dd` and `bench` agree with qemu byte for byte | the same |
+| B (#653) | `issue_653` | served file offset 0 (header, L1) as guest data, exit 0 | refused, exit 1: `convert: Invalid cluster entry found at virtual offset 0 (0x0): the qcow2 L2 entry marks a subcluster allocated with no host cluster behind it, or both allocated and zero, so the image is corrupt and the read failed as it does in qemu`; `compare`, `dd` and `bench` refuse with the same sentence under their own name, and `compare` no longer prints `Content mismatch at offset 0!` first | `EIO`, "Invalid cluster entry found" |
+| C | `data_file_partial` | `convert` wrote zeros for the 4 KiB of data | data read from the data file, the rest zeros; `compare`, `dd`, `bench` agree with qemu | the same |
+| D | `data_file_classic` | right by accident (the data device was next in the chain) | right through `Standard(0)` and `data_device_idx`; the chain's order no longer matters for this cluster | the same |
+
+All 34 of step 1a's fixtures (`build_all(include_host_offset_refusals=True)`)
+through `convert -O raw`, compared with `expected_raw`:
+
+| Result | Count | Fixtures |
+|---|---|---|
+| bytes match `expected_raw` | 18 | every valid fixture without a data file, `mixed_classic_nobacking_datafile`, `mixed_ext_nobacking_datafile`, `data_file_partial`, `data_file_classic`, `data_file_full_cluster` |
+| refused by name, exit 1 | 8 | `issue_653`, `issue_653_backing`, `issue_653_32k`, `issue_650`, `issue_650_backing`, `data_file_ext_no_copied`, `alloc_zero_overlap`, `alloc_zero_overlap_data_file` |
+| wrong, #792 (unallocated clusters fall into the data device) | 6 | `mixed_classic_backing_datafile`, `mixed_ext_backing_datafile`, `data_file_partial_backing`, `data_file_partial_32k`, `data_file_classic_no_copied_backing`, and `data_file_classic_no_copied`, which has no backing file: its classic host-0 entry without `COPIED` is unallocated, `continue`s into the next device, and that device is the data file |
+| not refused: qemu's host-offset rules, not classification | 2 | `data_file_compressed` (exit 1 with the generic text: the compressed cluster is read from the metadata device and does not inflate) and `data_file_offset_mismatch` (exit 0; the master plan's Future work item) |
+
+The `dd` window check (`bs=4096 skip=1 count=3`) is byte-identical to
+`qemu-img dd`'s 8192-byte output on `issue_654` and `data_file_partial`.
+
 ## Execution notes
 
 * 2026-10-20 (AEDT). Back brief answered: the steps run sequentially as

@@ -3147,6 +3147,47 @@ impl DifferencingRefusal {
 }
 
 // ============================================================================
+// Invalid qcow2 L2 entry read refusal signal
+// ============================================================================
+
+/// The `send_error` channel used to report that the qcow2 chain reader
+/// refused an L2 entry qemu classifies as `QCOW2_SUBCLUSTER_INVALID`:
+/// an extended-L2 entry with an allocation bit set and no host cluster
+/// behind it, or with a subcluster marked both allocated and zero
+/// (`block/qcow2.h:739-796` at qemu v10.0.0). qemu fails such a read
+/// with `EIO` and "Invalid cluster entry found"
+/// (`block/qcow2-cluster.c:712-718`); so does instar, since #653 showed
+/// the alternative was serving the image's own header as guest data.
+///
+/// The reader returns a bare `bool` to convert, dd, compare, bench and
+/// rebase, none of which has a result code that can say *why* a read
+/// failed, so the reason travels the way [`DifferencingRefusal`] does:
+/// the guest calls `send_error(operation, device, sector, status)` with
+/// [`InvalidL2EntryRefusal::OPERATION`] as the operation string, the
+/// host's `SerialDecoder` captures it, and a formatter renders it in
+/// place of the generic failure text.
+///
+/// The `sector` argument carries the **virtual byte offset** of the
+/// refused read, not a sector number, so the host can name where in
+/// the guest-visible disk the corrupt entry lies without knowing the
+/// sector size the guest read with. `status` carries the index of the
+/// chain device whose L2 table holds the entry.
+pub struct InvalidL2EntryRefusal;
+
+impl InvalidL2EntryRefusal {
+    /// Reserved `send_error` operation marker for this signal.
+    /// Distinct from every real operation name, from `"cpu-exception"`
+    /// and from [`DifferencingRefusal::OPERATION`], so the host's
+    /// decoder can tell the `send_error` uses apart.
+    pub const OPERATION: &'static str = "qcow2-invalid-l2-entry";
+
+    /// The same marker as [`Self::OPERATION`], NUL-terminated, for the
+    /// call table's `send_error`. `invalid_l2_entry_marker_c_string_matches_operation`
+    /// asserts the two spellings agree.
+    pub const OPERATION_C: &'static [u8] = b"qcow2-invalid-l2-entry\0";
+}
+
+// ============================================================================
 // Snapshot configuration and result structures
 // ============================================================================
 
@@ -6415,6 +6456,41 @@ mod tests {
         assert_ne!(
             DifferencingRefusal::STATUS_VHD,
             DifferencingRefusal::STATUS_VHDX
+        );
+    }
+
+    #[test]
+    fn invalid_l2_entry_operation_marker_is_distinct_from_the_other_senders() {
+        // The host tells the `send_error` uses apart by comparing
+        // `err.operation` against each marker string.
+        assert_eq!(InvalidL2EntryRefusal::OPERATION, "qcow2-invalid-l2-entry");
+        assert_ne!(InvalidL2EntryRefusal::OPERATION, "cpu-exception");
+        assert_ne!(
+            InvalidL2EntryRefusal::OPERATION,
+            DifferencingRefusal::OPERATION
+        );
+    }
+
+    #[test]
+    fn invalid_l2_entry_marker_c_string_matches_operation() {
+        // Same hazard as the differencing marker: a drift between the C
+        // string the guest raises and the &str the host compares means
+        // the refusal is raised but never captured, and the failure
+        // silently reverts to the generic text.
+        let c = InvalidL2EntryRefusal::OPERATION_C;
+        assert_eq!(
+            c.last().copied(),
+            Some(0),
+            "the C marker must be NUL-terminated"
+        );
+        assert_eq!(
+            &c[..c.len() - 1],
+            InvalidL2EntryRefusal::OPERATION.as_bytes(),
+            "the C marker must spell the same operation as OPERATION"
+        );
+        assert!(
+            !InvalidL2EntryRefusal::OPERATION.as_bytes().contains(&0),
+            "OPERATION must not embed a NUL, or the C marker truncates it"
         );
     }
 
