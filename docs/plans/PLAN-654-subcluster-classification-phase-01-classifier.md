@@ -46,7 +46,232 @@ its diff against the brief before merging it back.
 
 ## Step 1a measurements
 
-To be filled in by step 1a.
+All against qemu-img and qemu-io 10.0.13 (Debian `1:10.0.13+ds-0+deb13u1`)
+on 2026-10-19. qemu source citations are v10.0.0: `block/qcow2.h`,
+`block/qcow2-cluster.c`, `block/qcow2.c` and `block/qcow2-refcount.c`.
+Nothing here was checked on another qemu version; read every claim as
+"qemu 10.0.13 does this", not "qemu does this".
+
+### The fixture helper
+
+`tests/helpers/qcow2_subclusters.py`. `BUILDERS` maps a fixture name to
+a function that takes a target directory and returns a
+`SubclusterFixture`: the image path, backing and data-file paths, the
+L2 slots, and per subcluster of the whole virtual disk (eight clusters)
+the qemu type and the owner (`child`, `data-file`, `backing`, `zero`,
+`refuse`), plus `expected_raw` (the virtual disk as qemu reads it, or
+`None` if anything refuses). `build_all()` builds them all, 32 images
+in about two seconds.
+
+The types are derived, not hand-written: the helper reads the L2
+entries back out of the built image and classifies them with a Python
+transcription of `qcow2_get_cluster_type`/`qcow2_get_subcluster_type`
+(`qcow2.h:713-796`). Ownership follows qemu's read path:
+zero types, and unallocated types without a backing file, read zeros
+(`qcow2.c:2414-2420`); `INVALID` is `EIO` (`qcow2-cluster.c:705-713`).
+The child's bytes are taken from the file at the host offset, the data
+file's at the host offset, the backing file's at the virtual offset,
+and a compressed cluster's from the model of what was written. Each
+builder also names the types it exists to exhibit and raises if qemu
+does not produce them, so a qemu allocation change cannot silently
+turn one fixture into another. The backing file's byte at offset `o`
+is `(o // 512) % 255 + 1`: never zero, and different per 512-byte
+sector, so a read from the wrong place or of the wrong layer shows.
+Data and backing files are named by absolute path in the header,
+because qemu resolves a relative `data_file` name against its working
+directory, not the image's (measured: `qemu-io` from `/` fails with
+"Could not open 'r.data'").
+
+`HOST_OFFSET_REFUSAL_BUILDERS` holds two more shapes that classify as
+valid but that qemu's `qcow2_get_host_offset` still refuses: a
+compressed entry in a data-file image (`qcow2-cluster.c:664-672`) and a
+data-file host offset that differs from the guest offset (`:693-704`,
+the master plan's Future work item). They are kept out of `BUILDERS`
+because phase 1 does not decide them.
+
+### Results
+
+The mixed fixtures put one qemu-written shape in each cluster (with S
+the subcluster size and C the cluster size): 0, the first 2S written;
+1, 4S written then its second 2S zeroed; 2, its second subcluster
+zeroed only; 3, untouched; 4, written whole then zeroed whole; 5,
+written whole; 6, written compressed (not possible with a data file,
+so untouched there); 7, zeroed whole. Patched fixtures write cluster 1
+first so that the L2 table exists, then patch cluster 0.
+
+The master plan's measured rows are these fixtures: A is `issue_654`, B is
+`issue_653`, C is `data_file_partial` and D is `data_file_classic`.
+
+Legend. Types: `N` normal, `Za` zero-alloc, `Zp` zero-plain, `Ua`
+unallocated-alloc, `Up` unallocated-plain, `C` compressed, `I`
+invalid. Owners after the slash: `c` child, `d` data file, `b`
+backing, `0` zero, `R` refuse; `x30` is a run of 30 subclusters.
+Convert: exit code / converted bytes equal `expected_raw`. Map: qemu's
+entries as `start+length:` then `D` data or `H` hole, `z` zero, `@1`
+depth 1 (the backing file), `[offset]`. Check: exit code and the class
+of qemu's `ERROR` lines. Measure: `qemu-img measure -O qcow2`
+required bytes. `EIO` means the command failed with "Input/output
+error".
+
+| Fixture | Types/owners per cluster | Convert | Map | Check | Measure |
+|---|---|---|---|---|---|
+| `mixed_classic_nobacking_nodatafile` | 0:N/c 1:N/c 2:Zp/0 3:Up/0 4:Za/0 5:N/c 6:C/c 7:Zp/0 | 0 / y | 0k+128k:D[0x50000] 128k+64k:Hz 192k+64k:Hz 256k+64k:Hz[0x70000] 320k+64k:D[0x80000] 384k+64k:D 448k+64k:Hz | 0 clean | 589824 |
+| `mixed_classic_nobacking_datafile` | 0:N/d 1:N/d 2:Zp/0 3:Up/0 4:Za/0 5:N/d 6:Up/0 7:Zp/0 | 0 / y | 0k+128k:D[0x0] 128k+64k:Hz 192k+64k:Hz 256k+64k:Hz[0x40000] 320k+64k:D[0x50000] 384k+64k:Hz 448k+64k:Hz | 0 clean | 524288 |
+| `mixed_classic_backing_nodatafile` | 0:N/c 1:N/c 2:N/c 3:Up/b 4:Za/0 5:N/c 6:C/c 7:Zp/0 | 0 / y | 0k+192k:D[0x50000] 192k+64k:D@1[0x30000] 256k+64k:Hz[0x80000] 320k+64k:D[0x90000] 384k+64k:D 448k+64k:Hz | 0 clean | 720896 |
+| `mixed_classic_backing_datafile` | 0:N/d 1:N/d 2:N/d 3:Up/b 4:Za/0 5:N/d 6:Up/b 7:Zp/0 | 0 / y | 0k+192k:D[0x0] 192k+64k:D@1[0x30000] 256k+64k:Hz[0x40000] 320k+64k:D[0x50000] 384k+64k:D@1[0x60000] 448k+64k:Hz | 0 clean | 720896 |
+| `mixed_ext_nobacking_nodatafile` | 0:Nx2 Uax30/cx2 0x30 1:Nx2 Zax2 Uax28/cx2 0x30 2:Up Zp Upx30/0x32 3:Upx32/0x32 4:Zax32/0x32 5:Nx32/cx32 6:Cx32/cx32 7:Zpx32/0x32 | 0 / y | 0k+4k:D[0x50000] 4k+60k:Hz[0x51000] 64k+4k:D[0x60000] 68k+4k:Hz[0x61000] 72k+56k:Hz[0x62000] 128k+2k:Hz 130k+2k:Hz 132k+124k:Hz 256k+64k:Hz[0x70000] 320k+64k:D[0x80000] 384k+64k:D 448k+64k:Hz | 0 clean | 589824 |
+| `mixed_ext_nobacking_datafile` | 0:Nx2 Uax30/dx2 0x30 1:Nx2 Zax2 Uax28/dx2 0x30 2:Up Zp Upx30/0x32 3:Upx32/0x32 4:Zax32/0x32 5:Nx32/dx32 6:Upx32/0x32 7:Zpx32/0x32 | 0 / y | 0k+4k:D[0x0] 4k+60k:Hz[0x1000] 64k+4k:D[0x10000] 68k+4k:Hz[0x11000] 72k+56k:Hz[0x12000] 128k+2k:Hz 130k+2k:Hz 132k+124k:Hz 256k+64k:Hz[0x40000] 320k+64k:D[0x50000] 384k+64k:Hz 448k+64k:Hz | 0 clean | 524288 |
+| `mixed_ext_backing_nodatafile` | 0:Nx2 Uax30/cx2 bx30 1:Nx2 Zax2 Uax28/cx2 0x2 bx28 2:Up Zp Upx30/b 0 bx30 3:Upx32/bx32 4:Zax32/0x32 5:Nx32/cx32 6:Cx32/cx32 7:Zpx32/0x32 | 0 / y | 0k+4k:D[0x50000] 4k+60k:D@1[0x1000] 64k+4k:D[0x60000] 68k+4k:Hz[0x61000] 72k+58k:D@1[0x12000] 130k+2k:Hz 132k+124k:D@1[0x21000] 256k+64k:Hz[0x70000] 320k+64k:D[0x80000] 384k+64k:D 448k+64k:Hz | 0 clean | 720896 |
+| `mixed_ext_backing_datafile` | 0:Nx2 Uax30/dx2 bx30 1:Nx2 Zax2 Uax28/dx2 0x2 bx28 2:Up Zp Upx30/b 0 bx30 3:Upx32/bx32 4:Zax32/0x32 5:Nx32/dx32 6:Upx32/bx32 7:Zpx32/0x32 | 0 / y | 0k+4k:D[0x0] 4k+60k:D@1[0x1000] 64k+4k:D[0x10000] 68k+4k:Hz[0x11000] 72k+58k:D@1[0x12000] 130k+2k:Hz 132k+124k:D@1[0x21000] 256k+64k:Hz[0x40000] 320k+64k:D[0x50000] 384k+64k:D@1[0x60000] 448k+64k:Hz | 0 clean | 720896 |
+| `mixed_ext_backing_nodatafile_16k` | 0:Nx2 Uax30/cx2 bx30 1:Nx2 Zax2 Uax28/cx2 0x2 bx28 2:Up Zp Upx30/b 0 bx30 3:Upx32/bx32 4:Zax32/0x32 5:Nx32/cx32 6:Cx32/cx32 7:Zpx32/0x32 | 0 / y | 0k+1k:D[0x14000] 1k+15k:D@1[0x400] 16k+1k:D[0x18000] 17k+1k:Hz[0x18400] 18k+14k:D@1[0x4800] 32k+0k:Hz 33k+31k:D@1[0x8400] 64k+16k:Hz[0x1c000] 80k+16k:D[0x20000] 96k+16k:D 112k+16k:Hz | 0 clean | 458752 |
+| `mixed_ext_backing_nodatafile_32k` | 0:Nx2 Uax30/cx2 bx30 1:Nx2 Zax2 Uax28/cx2 0x2 bx28 2:Up Zp Upx30/b 0 bx30 3:Upx32/bx32 4:Zax32/0x32 5:Nx32/cx32 6:Cx32/cx32 7:Zpx32/0x32 | 0 / y | 0k+2k:D[0x28000] 2k+30k:D@1[0x800] 32k+2k:D[0x30000] 34k+2k:Hz[0x30800] 36k+29k:D@1[0x9000] 65k+1k:Hz 66k+62k:D@1[0x10800] 128k+32k:Hz[0x38000] 160k+32k:D[0x40000] 192k+32k:D 224k+32k:Hz | 0 clean | 589824 |
+| `mixed_ext_backing_nodatafile_128k` | 0:Nx2 Uax30/cx2 bx30 1:Nx2 Zax2 Uax28/cx2 0x2 bx28 2:Up Zp Upx30/b 0 bx30 3:Upx32/bx32 4:Zax32/0x32 5:Nx32/cx32 6:Cx32/cx32 7:Zpx32/0x32 | 0 / y | 0k+8k:D[0xa0000] 8k+120k:D@1[0x2000] 128k+8k:D[0xc0000] 136k+8k:Hz[0xc2000] 144k+116k:D@1[0x24000] 260k+4k:Hz 264k+248k:D@1[0x42000] 512k+128k:Hz[0xe0000] 640k+128k:D[0x100000] 768k+128k:D 896k+128k:Hz | 0 clean | 1114112 |
+| `issue_654` | 0:Zp Upx31/0 bx31 1:Upx32/bx32 2:Upx32/bx32 3:Upx32/bx32 4:Upx32/bx32 5:Upx32/bx32 6:Upx32/bx32 7:Upx32/bx32 | 0 / y | 0k+2k:Hz 2k+510k:D@1[0x800] | 0 clean | 851968 |
+| `issue_653` | 0:Ix32/Rx32 1:Nx32/cx32 2:Upx32/0x32 3:Upx32/0x32 4:Upx32/0x32 5:Upx32/0x32 6:Upx32/0x32 7:Upx32/0x32 | 1 / n/a | EIO | 2 unalloc-with-alloc-bits | EIO |
+| `issue_653_backing` | 0:Ix32/Rx32 1:Nx32/cx32 2:Upx32/bx32 3:Upx32/bx32 4:Upx32/bx32 5:Upx32/bx32 6:Upx32/bx32 7:Upx32/bx32 | 1 / n/a | EIO | 2 unalloc-with-alloc-bits | EIO |
+| `data_file_partial` | 0:Nx2 Uax30/dx2 0x30 1:Upx32/0x32 2:Upx32/0x32 3:Upx32/0x32 4:Upx32/0x32 5:Upx32/0x32 6:Upx32/0x32 7:Upx32/0x32 | 0 / y | 0k+4k:D[0x0] 4k+60k:Hz[0x1000] 64k+448k:Hz | 0 clean | 393216 |
+| `data_file_partial_backing` | 0:Nx2 Uax30/dx2 bx30 1:Upx32/bx32 2:Upx32/bx32 3:Upx32/bx32 4:Upx32/bx32 5:Upx32/bx32 6:Upx32/bx32 7:Upx32/bx32 | 0 / y | 0k+4k:D[0x0] 4k+508k:D@1[0x1000] | 0 clean | 851968 |
+| `data_file_classic` | 0:N/d 1:Up/0 2:Up/0 3:Up/0 4:Up/0 5:Up/0 6:Up/0 7:Up/0 | 0 / y | 0k+64k:D[0x0] 64k+448k:Hz | 0 clean | 393216 |
+| `data_file_full_cluster` | 0:Nx32/dx32 1:Upx32/0x32 2:Upx32/0x32 3:Upx32/0x32 4:Upx32/0x32 5:Upx32/0x32 6:Upx32/0x32 7:Upx32/0x32 | 0 / y | 0k+64k:D[0x0] 64k+448k:Hz | 0 clean | 393216 |
+| `data_file_ext_no_copied` | 0:Ix32/Rx32 1:Upx32/0x32 2:Upx32/0x32 3:Upx32/0x32 4:Upx32/0x32 5:Upx32/0x32 6:Upx32/0x32 7:Upx32/0x32 | 1 / n/a | EIO | 2 unalloc-with-alloc-bits | EIO |
+| `data_file_classic_no_copied` | 0:Up/0 1:Up/0 2:Up/0 3:Up/0 4:Up/0 5:Up/0 6:Up/0 7:Up/0 | 0 / y | 0k+512k:Hz | 0 clean | 327680 |
+| `data_file_classic_no_copied_backing` | 0:Up/b 1:Up/b 2:Up/b 3:Up/b 4:Up/b 5:Up/b 6:Up/b 7:Up/b | 0 / y | 0k+512k:D@1[0x0] | 0 clean | 851968 |
+| `issue_650` | 0:Ix32/Rx32 1:Nx32/cx32 2:Upx32/0x32 3:Upx32/0x32 4:Upx32/0x32 5:Upx32/0x32 6:Upx32/0x32 7:Upx32/0x32 | 1 / n/a | EIO | 2 unalloc-with-alloc-bits | EIO |
+| `issue_650_backing` | 0:Ix32/Rx32 1:Nx32/cx32 2:Upx32/bx32 3:Upx32/bx32 4:Upx32/bx32 5:Upx32/bx32 6:Upx32/bx32 7:Upx32/bx32 | 1 / n/a | EIO | 2 unalloc-with-alloc-bits | EIO |
+| `alloc_zero_overlap` | 0:Ix32/Rx32 1:Upx32/0x32 2:Upx32/0x32 3:Upx32/0x32 4:Upx32/0x32 5:Upx32/0x32 6:Upx32/0x32 7:Upx32/0x32 | 1 / n/a | EIO | 2 alloc-zero-overlap | EIO |
+| `alloc_zero_overlap_data_file` | 0:Ix32/Rx32 1:Upx32/0x32 2:Upx32/0x32 3:Upx32/0x32 4:Upx32/0x32 5:Upx32/0x32 6:Upx32/0x32 7:Upx32/0x32 | 1 / n/a | EIO | 2 alloc-zero-overlap | EIO |
+| `host_without_ref` | 0:Uax32/0x32 1:Upx32/0x32 2:Upx32/0x32 3:Upx32/0x32 4:Upx32/0x32 5:Upx32/0x32 6:Upx32/0x32 7:Upx32/0x32 | 0 / y | 0k+64k:Hz[0x50000] 64k+448k:Hz | 0 clean | 327680 |
+| `host_without_ref_backing` | 0:Uax32/bx32 1:Upx32/bx32 2:Upx32/bx32 3:Upx32/bx32 4:Upx32/bx32 5:Upx32/bx32 6:Upx32/bx32 7:Upx32/bx32 | 0 / y | 0k+512k:D@1[0x0] | 0 clean | 851968 |
+| `compressed_bitmap_all_alloc` | 0:Cx32/cx32 1:Upx32/0x32 2:Upx32/0x32 3:Upx32/0x32 4:Upx32/0x32 5:Upx32/0x32 6:Upx32/0x32 7:Upx32/0x32 | 0 / y | 0k+64k:D 64k+448k:Hz | 2 compressed-bitmap+leak | 393216 |
+| `compressed_bitmap_arbitrary` | 0:Cx32/cx32 1:Upx32/0x32 2:Upx32/0x32 3:Upx32/0x32 4:Upx32/0x32 5:Upx32/0x32 6:Upx32/0x32 7:Upx32/0x32 | 0 / y | 0k+64k:D 64k+448k:Hz | 2 compressed-bitmap+leak | 393216 |
+| `issue_654_32k` | 0:Zp Upx31/0 bx31 1:Upx32/bx32 2:Upx32/bx32 3:Upx32/bx32 4:Upx32/bx32 5:Upx32/bx32 6:Upx32/bx32 7:Upx32/bx32 | 0 / y | 0k+1k:Hz 1k+255k:D@1[0x400] | 0 clean | 589824 |
+| `data_file_partial_32k` | 0:N Uax31/d bx31 1:Upx32/bx32 2:Upx32/bx32 3:Upx32/bx32 4:Upx32/bx32 5:Upx32/bx32 6:Upx32/bx32 7:Upx32/bx32 | 0 / y | 0k+1k:D[0x0] 1k+255k:D@1[0x400] | 0 clean | 589824 |
+| `issue_653_32k` | 0:Ix32/Rx32 1:Nx32/cx32 2:Upx32/bx32 3:Upx32/bx32 4:Upx32/bx32 5:Upx32/bx32 6:Upx32/bx32 7:Upx32/bx32 | 1 / n/a | EIO | 2 unalloc-with-alloc-bits | EIO |
+| `data_file_compressed` | 0:Cx32/Rx32 1:Upx32/0x32 2:Upx32/0x32 3:Upx32/0x32 4:Upx32/0x32 5:Upx32/0x32 6:Upx32/0x32 7:Upx32/0x32 | 1 / n/a | EIO | 2 compressed-with-data-file | EIO |
+| `data_file_offset_mismatch` | 0:Upx32/0x32 1:Nx32/Rx32 2:Upx32/0x32 3:Upx32/0x32 4:Upx32/0x32 5:Upx32/0x32 6:Upx32/0x32 7:Upx32/0x32 | 1 / n/a | EIO | 0 clean | EIO |
+
+Every well-formed and every patched-but-valid fixture converts to
+exactly `expected_raw`, and every `INVALID` fixture fails. So the
+helper's derivation agrees with qemu on all 34 fixtures. qemu's
+refusal reads, on stderr, `qcow2: Image is corrupt: Invalid cluster
+entry found  (L2 offset: 0x40000, L2 index: 0); further non-fatal
+corruption events will be suppressed`, then `qemu-img: error while
+reading block status at offset 0: Input/output error`. Opened
+read-only, qemu does not set the corrupt bit (the header's incompatible
+features were unchanged after every command).
+
+Points the later steps need:
+
+* **Row C's measure.** At this fixture size qemu measures 393216 for
+  `data_file_partial`. The master plan's 458752/524288 pair came from a larger
+  image; step 1e should compare against qemu, not against those
+  numbers.
+* **Map of an `UNALLOCATED_ALLOC` run without a backing file** is
+  `"data": false, "zero": true` *with* an `offset` (`host_without_ref`:
+  `0k+64k:Hz[0x50000]`; the `Ua` runs of the mixed fixtures likewise).
+  With a backing file the same run is reported as the backing file's
+  data at depth 1.
+* **Classic L2 with a backing file and a partial `write -z`** is not a
+  zero cluster: qemu writes zeros into a newly allocated cluster
+  (`mixed_classic_backing_*` cluster 2 is `N`). The builders take
+  types from the image, so this needs no special case.
+* **Host 0 without `COPIED` in a data-file image is unallocated.** With
+  classic L2 (`data_file_classic_no_copied*`) the cluster reads zeros or
+  the backing file, not the data file, which is the case #792's
+  fall-through gets wrong. With extended L2 and alloc bits it is
+  `INVALID` (`data_file_ext_no_copied`).
+
+### The three `qemu-img check` questions
+
+Read from `check_refcounts_l2` (`qcow2-refcount.c:1662-1849`) and then
+measured:
+
+1. **An entry with a non-zero host offset and a zero bitmap
+   (instar's `HostWithoutRef`) is not reported.** `host_without_ref`
+   and `host_without_ref_backing` check clean, exit 0. qemu has no such
+   rule: a `NORMAL` cluster's bitmap is tested only for alloc/zero
+   overlap (`:1756-1761`). Per D5, instar's check should stop reporting
+   it.
+2. **Alloc-and-zero overlap is reported**, exit 2. On an allocated
+   cluster (including a data-file `COPIED|0` entry) the message is
+   `ERROR offset=<host>: Allocated cluster has corrupted subcluster
+   allocation bitmap` (`:1756-1761`). Where the host offset is 0 and
+   there is no data file, the cluster is unallocated, and the same
+   bitmap is reported instead as `ERROR: Unallocated cluster has
+   non-zero subcluster allocation map` (`:1838-1843`), which is also
+   the message for #650, #653 (row B) and `data_file_ext_no_copied`.
+3. **A compressed entry with a non-zero bitmap is reported**, exit 2:
+   `ERROR compressed cluster 0 with non-zero subcluster allocation
+   bitmap, entry=0x4000000000050000` (`:1717-1722`). The rule is "any
+   non-zero bitmap", so **qemu 10.0.13 also reports
+   `0x00000000ffffffff`**, the pattern `validate_subcluster_bitmap`
+   (`src/crates/qcow2/src/lib.rs:1452-1461`) exempts as legacy qemu
+   output. Because qemu's check `break`s before counting the compressed
+   cluster's refcount, it also reports the cluster as leaked (`Leaked
+   cluster 5 refcount=1 reference=0`); that leak is an artefact of the
+   error path, not a second defect. Reading still works: qemu returns
+   `COMPRESSED` without looking at the bitmap, and both fixtures
+   convert correctly, as D2 assumes.
+
+### Write paths (master plan open question 2)
+
+| Path | Extended L2 | External data file | Interprets host offset 0 itself |
+|---|---|---|---|
+| `qcow2-write` (`check_envelope_with`) | refused, `src/crates/qcow2-write/src/lib.rs:674-676` | refused, `:677-679` | Validates it: `classify_l2_entry` (`:1636-1700`) takes entry 0 as unallocated, host 0 with the zero flag as unallocated, and refuses any other host-0 entry as `UnknownL2Entry` (`:1685-1687`). Correct for images without a data file. |
+| bench `-w` | refused via `check_envelope_with`, `src/operations/bench/src/main.rs:713` | refused, same call | No decoding of its own; writes go through `qcow2-write`, reads through `read_chain_virtual_cluster` (`:1150`), which phase 1 fixes. |
+| rebase | safe mode refused via `check_envelope_with`, `src/operations/rebase/src/main.rs:1070` | refused, `src/crates/rebase/src/qcow2.rs:159-160` (both modes) | No decoding of its own: overlay entries through `qcow2-write`, chain data through `read_chain_virtual_cluster` (`main.rs:1927`), which phase 1 fixes. |
+| commit | refused, `src/operations/commit/src/main.rs:925-929` | refused, `main.rs:903-908` and `src/crates/commit/src/qcow2.rs:66-67,81-82` | **Yes, wrongly, on classic L2.** It decodes overlay entries itself and ignores `QCOW_OFLAG_ZERO`: `main.rs:1227-1235` skips any entry with host offset 0 and otherwise copies the host cluster's bytes; the clear pass (`:1384-1390`) and the allocation count (`:1114-1119`) do the same. Measured below. |
+| resize | accepted | refused, `src/crates/resize/src/qcow2.rs:1740-1742` | **Yes, wrongly, on shrink.** Any non-zero L2 word above the new size is treated as a host cluster and its refcount set to 0 (`qcow2.rs:1516-1545` for the straddling L2, `:1675-1690` for wholly discarded ones), with no test of the host offset. A word that is non-zero with host offset 0 zeroes the refcount of cluster 0, the header. Measured below. |
+| snapshot | accepted | refused by the op, `src/operations/snapshot/src/main.rs:438-441` (the crate itself has no gate) | Yes, and consistently with qemu: the L2 walks treat host 0 as "no host cluster" for refcounting (`src/crates/snapshot/src/qcow2.rs:650-668`, `:1026-1037`) and scrub a stale `COPIED` from host-0 entries (`:1306-1323`). That is what qemu's `qcow2_update_snapshot_refcount` does (`qcow2-refcount.c:1318-1376`, which also ignores the bitmap), and with data files refused, host 0 has no other meaning. Out of scope. |
+
+Measured against the instar binary built from develop `da9f043f`
+(`src/target/release/instar` in the primary clone):
+
+* **commit, classic L2.** Base qcow2 filled with `0x42`; overlay with
+  `write -z 0 64k` (entry `0x1`, `ZERO_PLAIN`), `write -P 0x55 64k 64k`
+  then `write -z 64k 64k` (entry `0x8000000000050001`, `ZERO_ALLOC`),
+  and `write -P 0x66 128k 4k`. After `qemu-img commit` the base reads
+  `00 00 66` at offsets 0, 64k, 128k; after `instar commit` it reads
+  `42 55 66`. Both exit 0; `qemu-img compare` reports "Content mismatch
+  at offset 0!". The zero-plain cluster was skipped and the zero-alloc
+  cluster's stale bytes were committed.
+* **resize `--shrink`, classic L2.** 1M image, cluster 0 written, then
+  `write -z 960k 64k` (entry `0x1`), shrunk to 512K. `qemu-img resize`
+  leaves a clean image; `instar resize` exits 0 and `qemu-img check`
+  then exits 2 with `ERROR cluster 0 refcount=0 reference=1`. The same
+  test with a qemu-written extended-L2 zero-plain entry (word 0, so
+  skipped) and with compressed entries was clean.
+
+Both shapes are qemu-written, not crafted, and both runs exit 0. Neither
+is an extended-L2 entry, so neither is something the classifier
+changes, but both are write paths interpreting host offset 0 on entries
+they did not validate. The phase's scope admits write paths only in
+that case, so it is the management session's call whether they join
+phase 1 or are filed as separate issues. No existing issue covers
+either (searched 2026-10-19). Both were filed and kept out of this
+phase: see Execution notes.
+
+## Execution notes
+
+* 2026-10-20 (AEDT). Back brief answered: the steps run sequentially as
+  planned, with fable for 1c, and this session may push and open the
+  pull request once the success criteria pass.
+* Step 1a found two write paths that interpret host offset 0 wrongly on
+  classic L2, both reproduced by the management session on qemu-written
+  images. The operator chose to file them rather than widen the phase:
+  #794 (`resize --shrink` sets the header cluster's refcount to 0) and
+  #795 (`commit` ignores `QCOW_OFLAG_ZERO`). They are not phase 1 work.
+* Step 1a's `qemu-img check` measurements settle D5 for step 1d. `check`
+  stops reporting `HostWithoutRef`, which qemu does not report. It
+  keeps reporting alloc-and-zero overlap. It reports a compressed entry
+  with a non-zero bitmap **including** `alloc_bits == 0xFFFF_FFFF`,
+  because qemu 10.0.13 flags that pattern too. The legacy exemption in
+  `validate_subcluster_bitmap` goes.
+* The fixtures are named for their issue or behaviour rather than for
+  the master plan's rows, to keep plan references out of code. The
+  mapping is in "Step 1a measurements". The management session
+  re-checked all 34 against `qemu-img convert`: 24 valid fixtures match
+  `expected_raw` byte for byte, and all 10 refusal fixtures fail.
 
 ## Success criteria for the phase
 
