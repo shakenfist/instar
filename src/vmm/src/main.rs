@@ -15905,7 +15905,11 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
                                 // "source image is unsupported format" --
                                 // true but not the reason. The tail prints
                                 // the captured reason instead.
-                                if serial_decoder.last_differencing_refusal.is_none() {
+                                // Likewise a corrupt qcow2 L2 entry refused
+                                // by the allocation scan.
+                                if serial_decoder.last_differencing_refusal.is_none()
+                                    && serial_decoder.last_invalid_l2_entry.is_none()
+                                {
                                     print_measure_result(
                                         &msg,
                                         &args.output,
@@ -16004,6 +16008,13 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         return Err(serial_decoder
             .differencing_refusal_error("measure", DifferencingComposition::Unsupported)
             .into());
+    }
+
+    // A corrupt qcow2 L2 entry is refused inside the allocation scan,
+    // which then reports the generic "unsupported format". Prefer the
+    // captured reason, which is qemu's.
+    if serial_decoder.last_invalid_l2_entry.is_some() {
+        return Err(serial_decoder.invalid_l2_entry_error("measure").into());
     }
 
     if !measure_result_seen {
@@ -16411,6 +16422,14 @@ fn run_map(args: MapArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error
         return Ok(());
     }
 
+    // A corrupt qcow2 L2 entry is refused inside the map walk, which
+    // then reports the generic I/O failure. Prefer the captured reason,
+    // which is qemu's; as on any other failure, the extents before it
+    // stay on stdout.
+    if serial_decoder.last_invalid_l2_entry.is_some() {
+        return Err(serial_decoder.invalid_l2_entry_error("map").into());
+    }
+
     let result = map_result.ok_or_else(|| "map: guest returned no MapResult".to_string())?;
 
     // Render: success path closes the streaming output via
@@ -16435,11 +16454,17 @@ fn run_map(args: MapArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error
 /// "hole" → unallocated, reads as zero, no backing data.
 /// "zero" → explicit zero record in metadata, no backing data.
 /// "data" → present, contains data, emit `offset` in JSON.
+/// "zero-at" / "hole-at" → as "zero" / "hole", but the metadata names
+/// a host cluster, so emit `offset` as qemu-img does for qcow2
+/// ZERO_ALLOC and UNALLOCATED_ALLOC (`block/qcow2.c:2171-2177` at
+/// qemu v10.0.0).
 fn map_state_triple(state: &str) -> (bool, bool, bool, bool) {
     match state {
         "hole" => (false, true, false, false),
         "zero" => (true, true, false, false),
         "data" => (true, false, true, true),
+        "zero-at" => (true, true, false, true),
+        "hole-at" => (false, true, false, true),
         // Defensive fallback for an unknown state code (the guest
         // emits only the three above). Treat as data so the offset
         // is preserved for debugging.
@@ -20201,6 +20226,33 @@ mod map_renderer_tests {
     #[test]
     fn state_triple_data() {
         assert_eq!(map_state_triple("data"), (true, false, true, true));
+    }
+
+    #[test]
+    fn state_triple_offset_bearing_zero_and_hole() {
+        // qcow2 ZERO_ALLOC and UNALLOCATED_ALLOC: qemu-img map prints
+        // an offset for both, which the offset-less states do not.
+        assert_eq!(map_state_triple("zero-at"), (true, true, false, true));
+        assert_eq!(map_state_triple("hole-at"), (false, true, false, true));
+    }
+
+    #[test]
+    fn json_offset_bearing_zero_and_hole_byte_exact() {
+        // qemu-img 10.0.13 map --output=json of a data-file image whose
+        // cluster 0 holds 4 KiB of data in two 2 KiB subclusters, the
+        // rest of that cluster unallocated-alloc, and one zero-alloc
+        // cluster after it.
+        let out = render_json(&[
+            ext(0, 4096, "data", 0),
+            ext(4096, 61440, "hole-at", 4096),
+            ext(65536, 65536, "zero-at", 65536),
+        ]);
+        let expected = "\
+[{ \"start\": 0, \"length\": 4096, \"depth\": 0, \"present\": true, \"zero\": false, \"data\": true, \"compressed\": false, \"offset\": 0},
+{ \"start\": 4096, \"length\": 61440, \"depth\": 0, \"present\": false, \"zero\": true, \"data\": false, \"compressed\": false, \"offset\": 4096},
+{ \"start\": 65536, \"length\": 65536, \"depth\": 0, \"present\": true, \"zero\": true, \"data\": false, \"compressed\": false, \"offset\": 65536}]
+";
+        assert_eq!(String::from_utf8(out).unwrap(), expected);
     }
 
     #[test]

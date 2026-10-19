@@ -62,13 +62,17 @@ fn panic(_info: &PanicInfo) -> ! {
 /// Encode a parser-facing `MapExtent` into the FFI
 /// `MapExtentRecord` form sent across the call-table boundary.
 ///
-/// `STATE_DATA` records carry a `file_offset` from the enum
-/// payload; the other states leave `file_offset` zero.
+/// The states that carry a `file_offset` in the enum payload pass it
+/// through; the other states leave `file_offset` zero.
 fn encode_extent(e: MapExtent) -> MapExtentRecord {
     let (state, file_offset) = match e.state {
         MapExtentState::Hole => (MapExtentRecord::STATE_HOLE, 0),
         MapExtentState::ZeroAllocated => (MapExtentRecord::STATE_ZERO_ALLOCATED, 0),
         MapExtentState::Data { file_offset } => (MapExtentRecord::STATE_DATA, file_offset),
+        MapExtentState::ZeroAllocatedAt { file_offset } => {
+            (MapExtentRecord::STATE_ZERO_ALLOCATED_AT, file_offset)
+        }
+        MapExtentState::HoleAt { file_offset } => (MapExtentRecord::STATE_HOLE_AT, file_offset),
     };
     MapExtentRecord {
         magic: MapExtentRecord::MAGIC,
@@ -83,8 +87,8 @@ fn encode_extent(e: MapExtent) -> MapExtentRecord {
 /// Clip an extent against the half-open window
 /// `[window_start, window_end)`. Returns `Some(clipped)` if the
 /// extent overlaps the window; `None` if it lies entirely
-/// outside. The clipped extent's `file_offset` (when `Data`) is
-/// adjusted forward by the amount trimmed off the front.
+/// outside. The clipped extent's `file_offset` (for the states that
+/// carry one) is adjusted forward by the amount trimmed off the front.
 fn clip_to_window(e: MapExtent, window_start: u64, window_end: u64) -> Option<MapExtent> {
     let e_end = e.start.saturating_add(e.length);
     if e_end <= window_start || e.start >= window_end {
@@ -96,6 +100,12 @@ fn clip_to_window(e: MapExtent, window_start: u64, window_end: u64) -> Option<Ma
     let new_length = new_end - new_start;
     let new_state = match e.state {
         MapExtentState::Data { file_offset } => MapExtentState::Data {
+            file_offset: file_offset.saturating_add(front_trim),
+        },
+        MapExtentState::ZeroAllocatedAt { file_offset } => MapExtentState::ZeroAllocatedAt {
+            file_offset: file_offset.saturating_add(front_trim),
+        },
+        MapExtentState::HoleAt { file_offset } => MapExtentState::HoleAt {
             file_offset: file_offset.saturating_add(front_trim),
         },
         other => other,

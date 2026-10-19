@@ -1087,9 +1087,13 @@ class TestExtendedL2BitmapValidation(InstarTestBase):
                 f'should report subcluster-errors: {stdout}'
             )
 
-    def test_check_flags_host_without_ref(self):
-        """I3: host_offset != 0 but alloc_bits == 0 and
-        zero_bits == 0 is corruption."""
+    def test_check_accepts_host_without_ref(self):
+        """A host offset with both bitmap halves 0 is not corruption.
+
+        qemu reads such an entry as 32 UNALLOCATED_ALLOC subclusters,
+        and qemu-img check 10.0.13 reports no error for it, so neither
+        does instar.
+        """
         with self._make_allocated_ext_l2() as img:
             # Keep the L2 entry (host offset present) but clear
             # both bitmap halves
@@ -1099,14 +1103,15 @@ class TestExtendedL2BitmapValidation(InstarTestBase):
                 Path(img.name), output_format='json'
             )
             result = json.loads(stdout)
-            self.assertGreater(
-                result.get('corruptions', 0), 0,
-                f'host without ref should be corruption: '
-                f'{stdout}'
-            )
-            self.assertGreater(
+            self.assertEqual(
                 result.get('subcluster-errors', 0), 0,
-                f'should report subcluster-errors: {stdout}'
+                f'host without ref should not be a subcluster '
+                f'error: {stdout}'
+            )
+            self.assertEqual(
+                result.get('corruptions', 0), 0,
+                f'host without ref should not be corruption: '
+                f'{stdout}'
             )
 
     def test_check_flags_compressed_nonzero_bitmap(self):
@@ -1163,10 +1168,13 @@ class TestExtendedL2BitmapValidation(InstarTestBase):
                 f'error: {stdout}'
             )
 
-    def test_check_accepts_compressed_legacy_qemu(self):
-        """Ok: compressed entry with alloc_bits=0xFFFF_FFFF and
-        zero_bits=0 (legacy QEMU pattern) should NOT be
-        corruption."""
+    def test_check_flags_compressed_all_alloc_bitmap(self):
+        """A compressed entry with alloc_bits=0xFFFF_FFFF and
+        zero_bits=0 is corruption.
+
+        qemu-img check 10.0.13 reports any non-zero bitmap on a
+        compressed entry, this pattern included, so instar does too.
+        """
         with self._make_allocated_ext_l2() as img:
             img2 = tempfile.NamedTemporaryFile(suffix='.qcow2')
             subprocess.run(
@@ -1177,7 +1185,6 @@ class TestExtendedL2BitmapValidation(InstarTestBase):
                 capture_output=True, check=True
             )
 
-            # Patch bitmap to the legacy QEMU pattern
             bitmap = 0x00000000_FFFFFFFF
             self._patch_l2_bitmap(img2.name, bitmap)
 
@@ -1185,10 +1192,10 @@ class TestExtendedL2BitmapValidation(InstarTestBase):
                 Path(img2.name), output_format='json'
             )
             result = json.loads(stdout)
-            self.assertEqual(
+            self.assertGreater(
                 result.get('subcluster-errors', 0), 0,
-                f'compressed legacy QEMU bitmap should not be '
-                f'a subcluster error: {stdout}'
+                f'compressed all-alloc bitmap should be a '
+                f'subcluster error: {stdout}'
             )
             img2.close()
 

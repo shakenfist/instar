@@ -840,12 +840,34 @@ pub enum MapExtentState {
     /// on-disk bytes.
     Data { file_offset: u64 },
     /// Region reads as zero and is explicitly recorded as zero
-    /// in the metadata (qcow2 ZERO_PLAIN / ZERO_ALLOC, vmdk
-    /// grain marker `0xFFFFFFFE`, vhdx PAYLOAD_BLOCK_ZERO).
+    /// in the metadata (qcow2 ZERO_PLAIN, vmdk grain marker
+    /// `0xFFFFFFFE`, vhdx PAYLOAD_BLOCK_ZERO).
     ZeroAllocated,
     /// Region is unallocated — reads as zero but is not present
     /// in the source file (the qemu-img `present=false` case).
     Hole,
+    /// As `ZeroAllocated`, but the metadata also names a host
+    /// cluster at `file_offset`, which qemu-img map reports as the
+    /// extent's `offset` (qcow2 ZERO_ALLOC).
+    ZeroAllocatedAt { file_offset: u64 },
+    /// As `Hole`, but the metadata names a host cluster at
+    /// `file_offset` that this region does not use, which qemu-img
+    /// map still reports as the extent's `offset` (qcow2
+    /// UNALLOCATED_ALLOC: a subcluster with neither bitmap bit set
+    /// in a cluster that has a host offset).
+    HoleAt { file_offset: u64 },
+}
+
+impl MapExtentState {
+    /// The host file offset this state reports, if it has one.
+    pub fn file_offset(&self) -> Option<u64> {
+        match *self {
+            MapExtentState::Data { file_offset }
+            | MapExtentState::ZeroAllocatedAt { file_offset }
+            | MapExtentState::HoleAt { file_offset } => Some(file_offset),
+            MapExtentState::ZeroAllocated | MapExtentState::Hole => None,
+        }
+    }
 }
 
 /// One contiguous extent of the source's virtual address space
@@ -879,7 +901,8 @@ pub struct MapExtent {
 /// Two adjacent extents merge when:
 /// - Their virtual ranges are contiguous (`a.start + a.length
 ///   == b.start`).
-/// - Their states match. For `Data` that requires the file
+/// - Their states match. For the states that carry a file offset
+///   (`Data`, `ZeroAllocatedAt`, `HoleAt`) that requires the file
 ///   offsets to be contiguous too:
 ///   `a.state.file_offset + a.length == b.state.file_offset`.
 ///   For `ZeroAllocated` and `Hole`, state equality is enough.
@@ -970,6 +993,14 @@ fn extents_mergeable(a: &MapExtent, b: &MapExtent) -> bool {
         (
             MapExtentState::Data { file_offset: a_off },
             MapExtentState::Data { file_offset: b_off },
+        )
+        | (
+            MapExtentState::ZeroAllocatedAt { file_offset: a_off },
+            MapExtentState::ZeroAllocatedAt { file_offset: b_off },
+        )
+        | (
+            MapExtentState::HoleAt { file_offset: a_off },
+            MapExtentState::HoleAt { file_offset: b_off },
         ) => a_off.checked_add(a.length) == Some(b_off),
         _ => false,
     }
@@ -3002,9 +3033,9 @@ pub struct MapExtentRecord {
     pub start: u64,
     /// Extent length in bytes. Never zero.
     pub length: u64,
-    /// Source file offset for `state == STATE_DATA`; zero
-    /// otherwise. (Host renderer omits the JSON field when
-    /// `state != STATE_DATA`.)
+    /// Source file offset for `STATE_DATA`, `STATE_ZERO_ALLOCATED_AT`
+    /// and `STATE_HOLE_AT`; zero otherwise. (Host renderer omits the
+    /// JSON field for the other states.)
     pub file_offset: u64,
     /// Reserved padding for forward compat (compressed length,
     /// subcluster flags, chain depth).
@@ -3019,12 +3050,18 @@ impl MapExtentRecord {
     /// the source file.
     pub const STATE_HOLE: u32 = 0;
     /// Extent state: explicitly recorded as zero in the metadata
-    /// (qcow2 ZERO_PLAIN / ZERO_ALLOC, vmdk grain marker, vhdx
+    /// (qcow2 ZERO_PLAIN, vmdk grain marker, vhdx
     /// PAYLOAD_BLOCK_ZERO).
     pub const STATE_ZERO_ALLOCATED: u32 = 1;
     /// Extent state: contains data backed by the source file at
     /// `file_offset`.
     pub const STATE_DATA: u32 = 2;
+    /// Extent state: recorded as zero, with a host cluster at
+    /// `file_offset` (qcow2 ZERO_ALLOC).
+    pub const STATE_ZERO_ALLOCATED_AT: u32 = 3;
+    /// Extent state: unallocated, but inside a host cluster at
+    /// `file_offset` (qcow2 UNALLOCATED_ALLOC).
+    pub const STATE_HOLE_AT: u32 = 4;
 
     /// True if magic matches.
     pub fn is_valid(&self) -> bool {
@@ -6218,6 +6255,33 @@ mod tests {
     }
 
     #[test]
+    fn coalescer_offset_bearing_zero_and_hole_merge_only_when_contiguous() {
+        // qcow2 ZERO_ALLOC and UNALLOCATED_ALLOC runs carry a host
+        // offset, so like Data they merge only when it is contiguous,
+        // and never with the offset-less state of the same kind.
+        let za = |start, length, file_offset| MapExtent {
+            start,
+            length,
+            state: MapExtentState::ZeroAllocatedAt { file_offset },
+        };
+        let ua = |start, length, file_offset| MapExtent {
+            start,
+            length,
+            state: MapExtentState::HoleAt { file_offset },
+        };
+        let r = collect(&[za(0, 4096, 0x1000), za(4096, 4096, 0x2000)]);
+        assert_eq!(r.slice(), &[za(0, 8192, 0x1000)]);
+        let r = collect(&[ua(0, 4096, 0x1000), ua(4096, 4096, 0x9000)]);
+        assert_eq!(r.slice(), &[ua(0, 4096, 0x1000), ua(4096, 4096, 0x9000)]);
+        let r = collect(&[ua(0, 4096, 0x1000), hole(4096, 4096)]);
+        assert_eq!(r.slice(), &[ua(0, 4096, 0x1000), hole(4096, 4096)]);
+        let r = collect(&[zero_alloc(0, 4096), za(4096, 4096, 0x1000)]);
+        assert_eq!(r.slice(), &[zero_alloc(0, 4096), za(4096, 4096, 0x1000)]);
+        assert_eq!(za(0, 1, 7).state.file_offset(), Some(7));
+        assert_eq!(hole(0, 1).state.file_offset(), None);
+    }
+
+    #[test]
     fn coalescer_virtual_gap_splits() {
         // No virtual gap allowed even for matching state.
         let r = collect(&[data(0, 4096, 0), data(8192, 4096, 8192)]);
@@ -6387,6 +6451,8 @@ mod tests {
         assert_eq!(MapExtentRecord::STATE_HOLE, 0);
         assert_eq!(MapExtentRecord::STATE_ZERO_ALLOCATED, 1);
         assert_eq!(MapExtentRecord::STATE_DATA, 2);
+        assert_eq!(MapExtentRecord::STATE_ZERO_ALLOCATED_AT, 3);
+        assert_eq!(MapExtentRecord::STATE_HOLE_AT, 4);
     }
 
     #[test]
