@@ -128,10 +128,10 @@ const _: () = assert!(
 // needs the active L1 table and its referenced L2 tables resident at
 // once so reconcile_copied_flags_for_l1 can rewrite COPIED across the
 // whole active mapping. These two regions extend the top-anchored
-// phase-4 layout DOWNWARD (toward SCRATCH_MEM_BASE), staying clear of
-// the forward-growing reference bitmap, exactly like the refblock
+// leaks-tier layout DOWNWARD (toward SCRATCH_MEM_BASE), staying clear
+// of the forward-growing reference bitmap, exactly like the refblock
 // staging above; the refcount-correction pass (step 2) reuses the
-// phase-4 REPAIR_REFBLOCK_BUF refblock staging, so no new buffer is
+// leaks-tier REPAIR_REFBLOCK_BUF refblock staging, so no new buffer is
 // needed for it.
 //
 // The L2 staging region mirrors snapshot's L2_STAGING / MAX_STAGED_L2:
@@ -156,7 +156,7 @@ const REPAIR_ALL_MAX_STAGED_L2: usize = 256;
 /// L2_STAGING_LIMIT.
 const REPAIR_ALL_L2_STAGING_LIMIT: usize = 2 * 1024 * 1024;
 
-/// Active-L1 staging buffer base — sits just below the phase-4
+/// Active-L1 staging buffer base — sits just below the leaks-tier
 /// refblock staging buffer.
 const REPAIR_ALL_L1_BUF: usize = REPAIR_REFBLOCK_BUF - REPAIR_ALL_L1_LIMIT;
 
@@ -165,9 +165,9 @@ const REPAIR_ALL_L1_BUF: usize = REPAIR_REFBLOCK_BUF - REPAIR_ALL_L1_LIMIT;
 /// bmp-extent guard checks the bitmap does not grow up into it.
 const REPAIR_ALL_L2_STAGING: usize = REPAIR_ALL_L1_BUF - REPAIR_ALL_L2_STAGING_LIMIT;
 
-// Compile-time guards: the all-tier staging extends the phase-4
+// Compile-time guards: the all-tier staging extends the leaks-tier
 // layout downward and must stay above SCRATCH_MEM_BASE and below the
-// phase-4 refblock buffer (no overlap with the refblock staging, the
+// leaks-tier refblock buffer (no overlap with the refblock staging, the
 // RMW bounce, or the allocator heap). The bitmap's dynamic extent is
 // checked at runtime in repair_all_qcow2.
 const _: () = assert!(
@@ -176,7 +176,7 @@ const _: () = assert!(
 );
 const _: () = assert!(
     REPAIR_ALL_L1_BUF + REPAIR_ALL_L1_LIMIT <= REPAIR_REFBLOCK_BUF,
-    "all-tier L1 buffer overlaps the phase-4 refblock staging"
+    "all-tier L1 buffer overlaps the leaks-tier refblock staging"
 );
 const _: () = assert!(
     REPAIR_ALL_L2_STAGING + REPAIR_ALL_L2_STAGING_LIMIT <= REPAIR_ALL_L1_BUF,
@@ -3266,8 +3266,9 @@ unsafe fn check_qcow2(
                 // active image has since diverged from via copy-on-write).
                 // Such a cluster has refcount > 0 but tests `!bmp`, so leak
                 // reclamation would free it and corrupt the snapshot. Refuse
-                // repair on snapshotted images and report it incomplete; the
-                // snapshot-aware recount is future work (see phase 5 scope).
+                // repair on snapshotted images and report it incomplete; a
+                // snapshot-aware recount is not yet implemented (see
+                // PLAN-check-repair.md).
                 // This guard takes precedence over the all tier (the all
                 // tier requires nb_snapshots == 0).
                 (call_table.debug_print)(
@@ -3661,7 +3662,7 @@ unsafe fn write_input_byte_range(
 /// Iterates the refcount table exactly as the detector's leak sweep
 /// does (reading each refblock offset from the table), stages each
 /// non-zero refblock cluster into the scratch buffer, and drives the
-/// pure phase-2 planner `check::qcow2::reclaim_leaks_in_refblock`, which
+/// pure planner `check::qcow2::reclaim_leaks_in_refblock`, which
 /// zeroes every entry with `rc > 0` that the `is_referenced` predicate
 /// reports unreferenced. If any entry in a refblock was reclaimed, the
 /// staged cluster is written back at `refblock_off` (length
@@ -3896,10 +3897,11 @@ struct AllTierStagedL2 {
 /// `bmp.test(cidx) ? 1 : 0`. No separate counting walk, no
 /// `account_reference_in_map`.
 ///
-/// Ordering (master-plan safety point 4):
+/// Ordering (crash-safe: the `corrupt` bit brackets every lossy write,
+/// so a run interrupted before step 4 completes leaves it set):
 ///   1. Set `INCOMPAT_CORRUPT` (header offset 72); fsync.
-///   2. Refcount correction per refblock (reusing the phase-4 refblock
-///      staging) via `correct_refcounts_in_refblock`; fsync.
+///   2. Refcount correction per refblock (reusing the leaks-tier
+///      refblock staging) via `correct_refcounts_in_refblock`; fsync.
 ///   3. COPIED reconciliation over the active L1 + its staged L2s via
 ///      `reconcile_copied_flags_for_l1`; fsync.
 ///   4. Clear `INCOMPAT_CORRUPT`; fsync.
@@ -3913,7 +3915,7 @@ struct AllTierStagedL2 {
 /// image refusing read-write open until re-repaired.
 ///
 /// The two `bmp`-backed closures use the SAME cluster-index math as
-/// the read-only detector and the phase-4 leaks pass:
+/// the read-only detector and the leaks-tier pass:
 ///   - refcount correction: `computed_for(local_idx)` -> `cidx =
 ///     rt_idx * entries_per_block + local_idx` (the detector's
 ///     `global_entry == local_idx` when a whole refblock is iterated
@@ -3926,7 +3928,7 @@ struct AllTierStagedL2 {
 ///
 /// `call_table` must be the validated CallTable; the input device must
 /// be open read-write; `bmp` must be the live, completed reference
-/// bitmap from the detection walk; the repair scratch region (phase-4
+/// bitmap from the detection walk; the repair scratch region (leaks-tier
 /// refblock staging + the all-tier L1/L2 staging) must be free.
 #[allow(clippy::too_many_arguments)]
 unsafe fn repair_all_qcow2(
@@ -4097,7 +4099,7 @@ unsafe fn repair_all_qcow2(
 
         // Correct against the bmp-derived ground truth: every correct
         // refcount is 0 or 1 in the supported scope. Same cidx math as
-        // the detector / phase-4 leaks pass.
+        // the detector / leaks-tier pass.
         let fix = match check::qcow2::correct_refcounts_in_refblock(
             refblock,
             entries_per_block,

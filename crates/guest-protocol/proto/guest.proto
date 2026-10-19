@@ -226,8 +226,8 @@ message CreateResultMessage {
   // MetadataWrite lengths in the plan).
   uint64 metadata_bytes_written = 3;
   // File size after the guest finishes (max byte_offset + len across
-  // the plan). The host may grow the file beyond this for
-  // preallocation in phase 6.
+  // the plan). The host may grow the file beyond this when a
+  // preallocation mode (falloc / full) is requested.
   uint64 file_size_after = 4;
   // Cluster / grain / block size actually used. 0 for raw output.
   uint32 resolved_unit_size = 5;
@@ -352,8 +352,8 @@ message BenchResultMessage {
 
 // Single coalesced map extent (from map operation). Sent once
 // per emitted extent; followed by a MapResultMessage terminator
-// after the last extent. The host accumulates these into the
-// rendered human / JSON output in phase 4.
+// after the last extent. The host accumulates these and renders
+// them as the human or JSON output.
 message MapExtentMessage {
   // Virtual offset of the extent's first byte.
   uint64 start = 1;
@@ -387,7 +387,7 @@ message MapResultMessage {
 // once per snapshot, followed by a SnapshotResultMessage
 // terminator after the last entry. The host renders these into
 // the qemu-img-compatible column-aligned table or the
-// instar-extension JSON array in PLAN-snapshot phase 4.
+// instar-extension JSON array.
 message SnapshotEntryMessage {
   // Snapshot ID (qemu's decimal string: "0", "1", ...).
   string id = 1;

@@ -12,9 +12,9 @@
 //! This crate is `no_std` and performs no I/O. The scratch buffer
 //! is caller-supplied; returned patches borrow from it. The
 //! planner is the correctness core of amend: it owns every
-//! refusal decision and the byte-exact header rewrite. Phase 3
-//! (the guest op) reads the cluster, calls this planner, applies
-//! the patches, and reports the result.
+//! refusal decision and the byte-exact header rewrite. The amend
+//! guest op (`src/operations/amend`) reads the cluster, calls this
+//! planner, applies the patches, and reports the result.
 //!
 //! Unlike [`qcow2::create::build_header`] — which always emits a
 //! fresh v3 header and cannot preserve arbitrary existing
@@ -30,13 +30,13 @@ mod qcow2;
 /// Errors returned by [`plan_amend_qcow2`].
 ///
 /// Each variant maps 1:1 to a [`shared::AmendResult::ERROR_*`]
-/// wire code via [`AmendError::error_code`]. Phase 3 (the amend
-/// guest binary) reports that code back to the host.
+/// wire code via [`AmendError::error_code`]. The amend guest
+/// binary reports that code back to the host.
 ///
 /// Note: `ERROR_HEADER_MISMATCH (6)` and `ERROR_WRITE_FAILED
 /// (10)` have no variant here — they are guest-side concerns (the
-/// host/guest cross-check and the device write), surfaced in
-/// phase 3, not by the pure planner.
+/// host/guest cross-check and the device write), surfaced by the
+/// guest binary, not by the pure planner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AmendError {
     /// Input is not qcow2 / nonsensical. Maps to
@@ -213,7 +213,7 @@ impl<'a> AmendPlan<'a> {
 ///
 /// The planner derives the current version / lazy / features
 /// entirely from `header_cluster`; host-probed cross-check fields
-/// are validated by the guest (phase 3), keeping the planner pure
+/// are validated by the guest op, keeping the planner pure
 /// and unit-testable.
 pub struct Qcow2AmendOpts<'a> {
     /// The whole first cluster of the image.

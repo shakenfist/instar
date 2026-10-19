@@ -1,10 +1,10 @@
 //! qcow2 commit planner: overlay-side and cross-image
 //! validation plus the geometry the guest's commit loop needs.
 //!
-//! Phase 4 of `PLAN-qcow2-write-infrastructure` moved the
-//! backing-side write composition (allocation, refblock
-//! staging, dirty tracking) into `crates/qcow2-write` +
-//! `crates/qcow2-write-exec`; what remains here is the
+//! The backing-side write composition (allocation, refblock
+//! staging, dirty tracking) lives in the shared
+//! `crates/qcow2-write` + `crates/qcow2-write-exec` engine;
+//! what remains here is the
 //! cross-image validation gate and the overlay geometry the
 //! guest threads through the per-cluster loop and the
 //! overlay-clear pass.
@@ -35,7 +35,7 @@ pub struct Qcow2CommitOpts<'a> {
 
 /// Geometry the guest threads through a qcow2 commit loop and
 /// the overlay-clear pass. Backing-side write state lives in
-/// `qcow2_write::WriteState` since phase 4.
+/// `qcow2_write::WriteState`, not here.
 #[derive(Debug, Clone, Copy)]
 pub struct Qcow2CommitContext {
     pub overlay_cluster_size: u32,

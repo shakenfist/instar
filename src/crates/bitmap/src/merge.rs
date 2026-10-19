@@ -13,22 +13,22 @@
 //!   bitmap-table entry given the matching destination entry
 //!   ([`merge_cluster_action`]), and OR-ing one data cluster into
 //!   another ([`or_bitmap_data`]).
-//! - **The Phase-4 guest** owns the orchestration: walking the two
+//! - **The guest op** owns the orchestration: walking the two
 //!   on-disk bitmap tables, reading/writing the data clusters,
 //!   allocating destination data clusters, rewriting the destination
 //!   bitmap table + refcounts, and re-serializing the directory. None
 //!   of that lives here.
 //!
-//! See the "3d design decisions" note in
-//! `docs/plans/PLAN-bitmap-phase-03-planner.md` for the crate/guest
-//! contract and the [`MergeClusterAction`] truth table.
+//! The [`MergeClusterAction`] truth table is the crate/guest contract
+//! for each table entry.
 //!
-//! # Same-image only (Open question 5)
+//! # Same-image only
 //!
 //! v1 merges a source and destination that live in the **same** qcow2
 //! image (they therefore share `virtual_size` and cluster geometry).
-//! Cross-file `-b` merge is deferred (the ABI has no source-file
-//! field; Phase 5 rejects `-b` with `ERROR_UNSUPPORTED_ACTION`).
+//! Cross-file `-b` merge is not yet supported: the ABI has no
+//! source-file field, so the host CLI refuses `-b`/`-F` before it
+//! launches the guest.
 
 use crate::directory::{find_bitmap, FoundBitmap};
 use crate::BitmapError;
@@ -157,7 +157,7 @@ pub fn or_bitmap_data(dst: &mut [u8], src: &[u8]) -> Result<(), BitmapError> {
 /// entry pair during a merge.
 ///
 /// The bitmap table maps each data cluster of the bitmap to one of
-/// three states (Phase 1 [`BitmapTableEntry`]): `AllZeroes` (implicit
+/// three states ([`BitmapTableEntry`]): `AllZeroes` (implicit
 /// zero bits, unallocated), `AllOnes` (implicit one bits,
 /// unallocated), or `Allocated(offset)` (a real data cluster). A merge
 /// OR-s the source's bits into the destination's, per table index.
@@ -223,7 +223,7 @@ pub enum MergeClusterAction {
 /// bitmap-table entry pair.
 ///
 /// `source_entry` and `dest_entry` are the raw big-endian table words
-/// (as read from the on-disk bitmap tables), decoded via Phase 1's
+/// (as read from the on-disk bitmap tables), decoded via
 /// [`decode_bitmap_table_entry`]. A raw word that fails validation
 /// (reserved bits set, or offset + all-ones flag both present) yields
 /// [`BitmapError::ParseFailed`] — the guest must not act on a

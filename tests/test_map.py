@@ -1,7 +1,7 @@
 """Integration tests for the `instar map` subcommand.
 
-Phase 6 of PLAN-map. Exercises the streaming map renderer
-end-to-end against the phase 5 baseline matrix in
+Exercises the streaming map renderer end-to-end against the
+cross-version qemu-img map baseline matrix in
 `instar-testdata/expected-outputs/map-{human,json}/`.
 
 The test suite is split into five classes, all inheriting
@@ -14,7 +14,8 @@ from `TestMapSmoke`:
   the version-keyed profile.
 * `TestMapWindowFilter` — in-test fixtures exercising
   `--start-offset` / `--max-length`.
-* `TestMapErrorPaths` — host-side guards from phase 3b.
+* `TestMapErrorPaths` — host-side guards (--image-opts, missing
+  source, sector size, chain images).
 * `TestMapDivergenceRegression` — for each
   `KNOWN_MAP_DIVERGENCES` entry, asserts the divergence
   still happens so accidental fixes surface loudly.
@@ -72,7 +73,7 @@ class TestMapSmoke(InstarTestBase):
             )
 
     def test_baselines_present_human(self):
-        """The phase 5 baselines must be reachable via base.py helpers."""
+        """The map-human baselines must be reachable via base.py helpers."""
         profiles = self.get_output_profiles(
             output_type='human', command='map'
         )
@@ -88,12 +89,12 @@ class TestMapSmoke(InstarTestBase):
         )
 
     def test_baselines_present_json(self):
-        """The phase 5 baselines must be reachable for JSON too."""
+        """The map-json baselines must be reachable too."""
         profiles = self.get_output_profiles(
             output_type='json', command='map'
         )
         self.assertIn('profiles', profiles)
-        # Phase 5 produced 3 map-json profiles; assert at least 1
+        # The map-json matrix has several profiles; assert at least 1
         # so the test doesn't break when the matrix evolves.
         self.assertGreater(len(profiles['profiles']), 0)
 
@@ -159,12 +160,12 @@ def _safe_tier_images():
 #     candidate divergence (compressed-cluster reporting) but the
 #     fixture happens not to exercise compressed clusters in
 #     practice — TestMapDivergenceRegression's assertNotEqual
-#     surfaced this during 6d and the entry was removed (see the
-#     comment on the removed entry below).
+#     surfaced this and the entry was removed (see the comment on
+#     the removed entry below).
 #   * Raw sparseness: instar emits one fully-allocated Data extent;
 #     qemu-img walks SEEK_HOLE.
 #   * Image-specific divergences surfaced empirically: this list
-#     grows during 6b development as the per-image factory runs and
+#     grows as the per-image factory runs against new fixtures and
 #     reveals additional skip candidates.
 KNOWN_MAP_DIVERGENCES = {
     # ---------- Chain sources ----------
@@ -200,7 +201,7 @@ KNOWN_MAP_DIVERGENCES = {
     # cluster reporting deferred), but the actual fixture happens
     # to be 1 MiB of zeros with no compressed clusters actually
     # exercised — instar matches qemu-img byte-for-byte. Removed
-    # by the TestMapDivergenceRegression assertion during 6d.
+    # when the TestMapDivergenceRegression assertion flagged it.
     'cirros-qcow2':
         ('json', 'compressed-cluster reporting deferred; '
                  'cirros-0.6.3 uses compressed-cluster L2 entries'),
@@ -251,16 +252,16 @@ KNOWN_MAP_DIVERGENCES = {
                  'qemu-img emits one whole-image extent'),
     # Note: vhd-d2v-zerofilled was a candidate divergence (VHD
     # present:false vs true) but the actual fixture has allocated
-    # data and instar matches byte-for-byte. Removed by the
-    # TestMapDivergenceRegression assertion during 6d.
+    # data and instar matches byte-for-byte. Removed when the
+    # TestMapDivergenceRegression assertion flagged it.
 
     # ---------- VHDX divergences ----------
     # instar's vhdx walker exposes the BAT entries individually
     # (per-block data vs zero); qemu-img reports the file as one
-    # data extent. This is the inverse of what the phase 4c
-    # quirks doc anticipated (which talked about
-    # PAYLOAD_BLOCK_PARTIALLY_PRESENT) — turns out for these
-    # fixtures qemu-img doesn't drill into the BAT at all.
+    # data extent. This is the inverse of the
+    # PAYLOAD_BLOCK_PARTIALLY_PRESENT divergence docs/quirks.md
+    # describes — for these fixtures qemu-img doesn't drill into
+    # the BAT at all.
     'qemu-vhdx':
         ('json', 'instar vhdx walker exposes BAT-level detail; '
                  'qemu-img emits one whole-image extent'),
@@ -276,7 +277,7 @@ class TestMapBaselineSource(TestMapSmoke):
 
     Skip categories:
       1. The image file is missing on disk (sparse checkouts).
-      2. The phase 5 baseline meta.json reports a non-zero exit
+      2. The baseline meta.json reports a non-zero exit
          (qemu-img couldn't produce a clean baseline — chain
          image without -F hint, compressed-cluster source, etc.).
       3. The image is listed in KNOWN_MAP_DIVERGENCES (deliberate
@@ -380,7 +381,7 @@ def _make_map_source_test(image_dict, output_type):
     )
     test.__doc__ = (
         f'instar map {image_dict["id"]} --output={output_type} matches '
-        f'the phase-6 baseline.'
+        f'the qemu-img map baseline.'
     )
     return test
 
@@ -400,17 +401,18 @@ class TestMapWindowFilter(TestMapSmoke):
 
     These tests construct a small fragmented qcow2 fixture in a
     `tempfile.mkdtemp()` directory (cleaned up in `setUp`/
-    `addCleanup`) via the recipe from phase 4a: `truncate` a
-    1 MiB raw image, write 64 KiB of data at offset 0 and at
-    offset 0x80000, then `qemu-img convert -f raw -O qcow2` to
+    `addCleanup`) by this recipe: `truncate` a 1 MiB raw
+    image, write 64 KiB of data at offset 0 and at offset
+    0x80000, then `qemu-img convert -f raw -O qcow2` to
     produce a qcow2 with two allocated extents separated by a
     hole.
 
     Tests assert *structural* properties (extent count, byte
     ranges, presence/absence of specific offsets) rather than
-    byte-equality against qemu-img — the phase 4a `MapRenderer`
-    unit tests already pin the byte-level shape, and adding
-    qemu-img comparison here would duplicate that coverage.
+    byte-equality against qemu-img — the `MapRenderer` unit
+    tests in `src/vmm` already pin the byte-level shape, and
+    adding qemu-img comparison here would duplicate that
+    coverage.
     """
 
     @classmethod
@@ -577,8 +579,8 @@ class TestMapWindowFilter(TestMapSmoke):
 
 
 class TestMapErrorPaths(TestMapSmoke):
-    """Host-side guards from phase 3b: --image-opts refusal,
-    missing source, invalid sector size, chain image refusal.
+    """Host-side guards: --image-opts refusal, missing source,
+    invalid sector size, chain image refusal.
     """
 
     def test_image_opts_rejected(self):
@@ -635,7 +637,7 @@ class TestMapErrorPaths(TestMapSmoke):
             f'stderr: {stderr!r}'
         )
 
-    # ----------- Phase-1 format-coverage: new-format refusals -----------
+    # ----------- Formats map does not read: refusals -----------
     #
     # map does not use the host chain-discovery gate (issue #444); it
     # calls the guest's `detect_format_from_header` directly and any
@@ -680,8 +682,8 @@ class TestMapErrorPaths(TestMapSmoke):
     def test_qed_refused(self):
         """map refuses a qed-simple source (header-detected).
 
-        Format-coverage phase 6 keeps QED read-refused as policy (see
-        docs/plans/PLAN-format-coverage-phase-06-qed.md).  QED's
+        QED is read-refused by policy (see "QED read-refusal as policy"
+        in docs/quirks.md).  QED's
         offset-0 header magic is recognised by the guest probe but has
         no reader arm, so it lands in the same default arm as
         bochs/cloop/parallels and is refused with "source format
@@ -701,7 +703,7 @@ class TestMapErrorPaths(TestMapSmoke):
         DMG detection is trailer-only and not wired into map's guest
         format probe (`detect_format_from_header`), so a DMG source is
         indistinguishable from raw here and map succeeds, mapping the
-        whole file as one allocated raw extent. Documents the phase-1
+        whole file as one allocated raw extent. Documents that detection
         gap rather than asserting a refusal that does not exist.
         """
         image = self.get_image('dmg-simple')

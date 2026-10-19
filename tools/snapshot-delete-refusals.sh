@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Phase 7e refusal-path checks for `instar snapshot -d`, a sibling
-# of tools/snapshot-create-refusals.sh. Each case must fail
-# (non-zero exit) with a sensible message and leave the image
-# bit-for-bit untouched. Not a committed test — phase 7 validation
-# only.
+# Refusal-path checks for `instar snapshot -d`, a sibling of
+# tools/snapshot-create-refusals.sh. Each case must fail (non-zero
+# exit) with a sensible message and leave the image bit-for-bit
+# untouched. Not a committed test — a manual validation harness
+# written when delete was built.
 set -uo pipefail
 
 INSTAR="${INSTAR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/src/target/release/instar}"
@@ -40,7 +40,8 @@ qemu-io -c "write 0 64k" "$WORK/nf.qcow2" >/dev/null 2>&1
 qemu-img snapshot -c alpha "$WORK/nf.qcow2" >/dev/null 2>&1
 refuse "not-found-by-name" "$WORK/nf.qcow2" "nosuch"
 
-# Not-found by pure ID (fact 2: -d has no ID matching path).
+# Not-found by pure ID: qemu-img's -d matches by name only and has no
+# ID matching path, so "1" is not found here.
 refuse "not-found-by-id" "$WORK/nf.qcow2" "1"
 
 # Delete on a 0-snapshot image.

@@ -43,7 +43,7 @@ pub struct BenchParams {
     pub count: u32,
     /// Queue depth (`-d`) — accepted, validated, and echoed in the
     /// header for output parity; it is not consumed by any function in
-    /// this crate (v1 executes serially, see the master plan's OQ1).
+    /// this crate (bench executes requests serially, one in flight).
     pub depth: u32,
     /// Bytes per request (`-s`).
     pub bufsize: u64,
@@ -131,7 +131,7 @@ impl BenchParams {
     /// - No pattern-without-write error: qemu silently ignores
     ///   `--pattern` on read tests.
     /// - No offset/image-size bounds check: qemu submits the request
-    ///   and lets it fail at request time; that is a phase-3 (guest op)
+    ///   and lets it fail at request time; that is the guest op's
     ///   concern, not this crate's.
     /// - `no_drain` without `flush_interval` is valid and irrelevant —
     ///   there is nothing to drain around if no flush is ever scheduled.
@@ -168,10 +168,11 @@ impl BenchParams {
     }
 }
 
-/// A `BenchParams` validation failure. The host (phase 4) maps each
-/// variant to the captured qemu message text (step 1e); the
-/// instar-only [`BenchParamError::BufsizeAboveInstarCap`] gets an
-/// instar-worded "not yet supported above 2 MiB" message instead.
+/// A `BenchParams` validation failure. The host CLI maps each
+/// variant to the message text qemu-img bench prints for the same
+/// failure, byte for byte; the instar-only
+/// [`BenchParamError::BufsizeAboveInstarCap`] gets an instar-worded
+/// "not yet supported above 2 MiB" message instead.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum BenchParamError {
     /// `count < 1` (the `u32` representation already caps the top).
@@ -222,8 +223,9 @@ pub enum BenchParamError {
 /// }
 /// ```
 ///
-/// instar adopts the **master rule** (master-plan OQ7); the 10.0.8
-/// `% image_size` behaviour is recorded in phase 6's divergence registry.
+/// instar adopts the **master rule**, because the 10.0.8 rule is the bug
+/// qemu fixed; the 10.0.8 `% image_size` behaviour is recorded as a known
+/// divergence in `KNOWN_BENCH_DIVERGENCES` (tests/test_bench.py).
 /// The `image_size <= bufsize ⇒ 0` guard also subsumes qemu's separate
 /// `image_size == 0` zero-guard: when `image_size == 0` it is `<= bufsize`
 /// for any `bufsize >= 1`, so this single branch covers both. Wrapped
@@ -258,8 +260,8 @@ pub fn next_offset(cur: u64, step: u64, image_size: u64, bufsize: u64) -> u64 {
 ///
 /// A first request that overruns EOF is submitted anyway and fails at
 /// request time (qemu's `Failed request: Input/output error`); catching
-/// that is phase 3's concern, not this schedule's. Every subsequent offset
-/// is [`next_offset`] applied to its predecessor with
+/// that is the guest op's concern, not this schedule's. Every subsequent
+/// offset is [`next_offset`] applied to its predecessor with
 /// [`BenchParams::effective_step`], so it lands in
 /// `[0, image_size - bufsize)` (possibly unaligned — correct, not rounded).
 pub struct OffsetSchedule {
@@ -316,9 +318,9 @@ impl Iterator for OffsetSchedule {
 /// Yields `(chunk_offset, chunk_len)` pairs (`Iterator<Item = (u64, u64)>`)
 /// in ascending offset order covering the whole range. Every chunk but the
 /// last is exactly `max_transfer` bytes; the last carries the remainder.
-/// This is how phase 3's guest loop turns a bench buffer larger than one
-/// virtio transfer (the guest passes `shared::MAX_SECTOR_SIZE`, 64 KiB)
-/// into a series of in-range transfers.
+/// This is how the guest op's request loop turns a bench buffer larger
+/// than one virtio transfer (the guest passes `shared::MAX_SECTOR_SIZE`,
+/// 64 KiB) into a series of in-range transfers.
 ///
 /// Edge cases: `len == 0` yields nothing (there is nothing to transfer);
 /// `max_transfer == 0` yields nothing too — that is a defensive guard so a
@@ -460,8 +462,8 @@ fn units_spanned(start: u64, end: u64, granule: u64) -> u64 {
 }
 
 /// Upper-bound the distinct data clusters and L2 tables a whole bench
-/// write schedule can touch (phase 01 of
-/// `docs/plans/PLAN-bench-refcount-growth.md`).
+/// write schedule can touch, so the refcount-growth planner can size the
+/// refcount structures before the first write.
 ///
 /// Three bounds are combined with `min`, each independently sound:
 ///

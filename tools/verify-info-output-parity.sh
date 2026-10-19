@@ -1,23 +1,25 @@
 #!/usr/bin/env bash
 # Prove that a change under review does not alter `instar info` output.
 #
-# Written for differencing phase 3 (docs/plans/PLAN-differencing-phase-03-parse.md),
-# whose whole premise is that teaching crates/vhd and crates/vhdx to parse a
-# differencing image's parent locators changes nothing about what any
-# operation *does* with what it now knows (see survey finding 4 and decision
-# 6 in that plan: populating info's backing_file field for a VHD/VHDX would
-# silently turn on host-side chain walking in discover_backing_chain, which
-# is phase 11's job, not this one's). Later phases that touch the same two
-# crates without meaning to change info output can reuse this script as a
-# gate; that is why it lives in tools/ rather than being run by hand once.
+# Written for the change that taught crates/vhd and crates/vhdx to parse a
+# differencing image's parent locators (docs/plans/PLAN-differencing.md).
+# That change's premise was that parsing alone changes nothing about what
+# any operation *does* with what it now knows. Any later change that
+# touches those two crates without meaning to change info output can use
+# this script as a gate; that is why it lives in tools/ rather than being
+# run by hand once.
+#
+# Host-side chain discovery has since landed, so `instar info` now reports
+# a backing file for a VHD/VHDX differencing child (see
+# tests/test_differencing.py). The comparison against the base binary
+# still holds as-is: it is relative, so a change that alters which images
+# report a backing file shows up as a stdout difference.
 #
 # Base commit selection: this script never hardcodes a base SHA. It computes
 # `git merge-base origin/develop HEAD` in the current worktree, i.e. the
 # commit where the current branch diverged from develop. develop moves out
-# from under long-lived phase branches (it did during this phase: the
-# branch was cut at b0c8d32, origin/develop had moved to e7af6a1a+ by the
-# time this script was written), so the merge-base is the only stable
-# definition of "before this phase's changes". Run `git fetch origin` before
+# from under long-lived branches, so the merge-base is the only stable
+# definition of "before this branch's changes". Run `git fetch origin` before
 # this script if origin/develop might be stale locally — the script does
 # not fetch on your behalf, so a stale remote-tracking ref silently picks
 # the wrong base.
@@ -34,22 +36,16 @@
 #      verbose formatter but never the info text or JSON, so a verbose
 #      comparison would show a spurious difference that is not a behaviour
 #      change — under both binaries and requires byte-identical stdout.
-#   4. Additionally greps every vpc/vhdx image's CURRENT-binary output for a
-#      "backing file" / "backing-filename" line. Byte-identity with the base
-#      binary already forbids a *new* one appearing, but this is the
-#      falsifiable form of decision 6 stated directly: no VHD or VHDX image
-#      may carry that line at all, regardless of what the base binary did.
 #      Both stdout and stderr are compared, along with the exit status.
-#   5. Images absent from the local testdata checkout are skipped and
+#   4. Images absent from the local testdata checkout are skipped and
 #      counted, never treated as failures -- except for the handful in
-#      REQUIRED_IDS, which are the only images in the manifest carrying a
-#      parent locator. Skipping those, or comparing nothing at all, is
+#      REQUIRED_IDS, the differencing fixtures (images with a parent
+#      locator) that existed when the parsers were written. Skipping those, or comparing nothing at all, is
 #      reported as an error rather than a pass: a gate that compared no
 #      image that could have changed proves nothing.
 #
-# Exit status: 0 if every compared image matched (and no vpc/vhdx image
-# gained a backing-file line); non-zero otherwise, so this can be used as a
-# CI/review gate. A build failure in either tree, and a run that compared
+# Exit status: 0 if every compared image matched; non-zero otherwise, so
+# this can be used as a CI/review gate. A build failure in either tree, and a run that compared
 # nothing, both exit 2 rather than falling through to a pass.
 #
 # Requires: docker (for `make instar`), git, jq, diff. Does not require
@@ -103,7 +99,7 @@ CURRENT_BINARY="$REPO_ROOT/src/target/release/instar"
 # to an existence check that a leftover artifact from an earlier run
 # satisfies -- and the script would compare two stale binaries and print
 # PASS. A false PASS is the worst thing this script can do, since its
-# whole job is to be the falsifiable form of decision 6.
+# whole job is to prove that info output did not change.
 rm -f "$CURRENT_BINARY"
 if ! make -C "$REPO_ROOT" instar; then
     echo "error: building the current tree's instar failed" >&2
@@ -154,10 +150,10 @@ FAILED=0
 FAILED_IDS=()
 
 # Images that must be present, not merely skipped. These are the
-# differencing fixtures phase 2 added: the parsers this script guards
-# read a parent locator, and these are the only images in the manifest
-# that have one. A run that skipped them compared nothing that could
-# have changed.
+# differencing fixtures that existed when the parsers this script guards
+# were written: those parsers read a parent locator, and these were then
+# the only images in the manifest that had one. A run that skipped them
+# compared nothing that could have changed.
 REQUIRED_IDS=(
     vhd-differencing
     vhd-diff-child-aligned
@@ -168,8 +164,8 @@ REQUIRED_IDS=(
 # loop over a possibly-empty array.
 FOUND_REQUIRED=" "
 
-# id, path, format as tab-separated records.
-while IFS=$'\t' read -r img_id img_path img_format; do
+# id, path as tab-separated records.
+while IFS=$'\t' read -r img_id img_path; do
     full_path="$TESTDATA_ROOT/$img_path"
 
     if [ ! -f "$full_path" ]; then
@@ -214,9 +210,9 @@ while IFS=$'\t' read -r img_id img_path img_format; do
             entry_failed=1
         fi
 
-        # stderr as well as stdout. Nothing in the phase this script was
+        # stderr as well as stdout. Nothing in the change this script was
         # written for can plausibly write to stderr, but the script is
-        # meant to be reused by later phases that can, and a new
+        # meant to be reused by later changes that can, and a new
         # diagnostic line is exactly the kind of change that would
         # otherwise slip through a stdout-only gate.
         if ! cmp -s "$cur_out.stderr" "$base_out.stderr"; then
@@ -225,24 +221,13 @@ while IFS=$'\t' read -r img_id img_path img_format; do
             entry_failed=1
         fi
 
-        # Decision 6 / survey finding 4: no vpc (VHD) or vhdx image may
-        # carry a backing-file line, independent of what the base binary
-        # did.
-        case "$img_format" in
-            vpc|vhdx)
-                if grep -qi 'backing file\|backing-filename' "$cur_out"; then
-                    echo "FAIL: $img_id ($mode): current binary emitted a backing-file line for a $img_format image"
-                    entry_failed=1
-                fi
-                ;;
-        esac
     done
 
     if [ "$entry_failed" -ne 0 ]; then
         FAILED=$((FAILED + 1))
         FAILED_IDS+=("$img_id")
     fi
-done < <(jq -r '.images[] | [.id, .path, .format] | @tsv' "$MANIFEST")
+done < <(jq -r '.images[] | [.id, .path] | @tsv' "$MANIFEST")
 
 echo ""
 echo "=== Summary ==="

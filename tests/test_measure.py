@@ -1,9 +1,12 @@
 """Smoke tests for the measure operation (CLI wiring + qemu-img parity).
 
-Phase 4 of PLAN-measure.md ships the host CLI; these tests confirm
-end-to-end invocation works and that output matches qemu-img
-byte-for-byte for the cases qemu-img supports. The comprehensive
-cross-version test matrix lives in phase 7.
+These tests confirm end-to-end invocation works and that output
+matches qemu-img byte-for-byte for the cases qemu-img supports:
+pinned smoke values for `--size` mode, `-o` option passing, the
+cross-version baseline matrix (``TestMeasureBaselineSize`` and
+``TestMeasureBaselineSource``), registered divergences, a
+convert round-trip against measure's prediction, and the
+source-image formats measure refuses.
 """
 
 import json
@@ -73,7 +76,7 @@ class TestMeasureSmoke(InstarTestBase):
             return '', f'Timeout after {timeout}s', -1
 
     def test_measure_baselines_present(self):
-        """Phase 6's baselines must be reachable via get_output_profiles."""
+        """The measure baselines must be reachable via get_output_profiles."""
         profiles = self.get_output_profiles(output_type='json', command='measure')
         self.assertIn('profiles', profiles)
         self.assertGreater(len(profiles['profiles']), 0,
@@ -109,10 +112,11 @@ class TestMeasureSmoke(InstarTestBase):
             '}\n',
         )
 
-    # --- --size mode, qcow2 target (pinned to phase 1 fixture values) ---
+    # --- --size mode, qcow2 target (pinned to the qemu-img sourced values
+    # in the measure crate's QCOW2_CASES unit-test table) ---
 
     def test_size_qcow2_default(self):
-        """--size 1M -O qcow2 matches the phase 1 fixture row 'qcow2 cluster=64K'.
+        """--size 1M -O qcow2 matches the QCOW2_CASES row 'qcow2 cluster=64K'.
 
         Pinned values: required=327680, fully-allocated=1376256. If this
         breaks, the qcow2 size math has drifted from qemu-img.
@@ -125,12 +129,12 @@ class TestMeasureSmoke(InstarTestBase):
         )
 
     def test_size_qcow2_cluster_512(self):
-        """--size 1M -O qcow2 --cluster-size 512: pinned phase 1 fixture values."""
+        """--size 1M -O qcow2 --cluster-size 512: pinned qemu-img sourced values."""
         stdout, stderr, rc = self.run_instar_measure(
             '--size', '1M', '-O', 'qcow2', '--cluster-size', '512'
         )
         self.assertEqual(rc, 0, f'stderr: {stderr}')
-        # From phase 1 QCOW2_CASES "1M empty cs=512" row.
+        # From the measure crate's QCOW2_CASES "1M empty cs=512" row.
         self.assertEqual(
             stdout,
             'required size: 22528\nfully allocated size: 1071104\n',
@@ -151,7 +155,7 @@ class TestMeasureSmoke(InstarTestBase):
     def test_source_image_runs(self):
         """Source-image mode runs end-to-end against a real safe-tier qcow2.
 
-        Doesn't pin exact bytes (those live in phase 7's cross-version matrix);
+        Doesn't pin exact bytes (those live in TestMeasureBaselineSource);
         just confirms exit 0 and required <= fully-allocated.
         """
         image = self.get_image('cirros-qcow2')
@@ -170,12 +174,12 @@ class TestMeasureSmoke(InstarTestBase):
     def _assert_measure_clamp_matches_qemu(
         self, fmt, ext, size, create_opts=None,
     ):
-        """Helper for phase-4 B1 regression tests.
+        """Helper for the small-image allocation clamp regression tests.
 
         Creates a small image of `fmt`, forces a block / grain
         allocation via qemu-io, and asserts `instar measure -O qcow2`
         matches `qemu-img measure -O qcow2` byte-for-byte. Before the
-        phase-4 clamp the dynamic-block scanners reported
+        scanners clamped allocation to the virtual size they reported
         `allocated_bytes > virtual_size` for any format whose
         block / grain size exceeds the virtual size, surfaced to the
         user as 'measure: source image is unsupported format'.
@@ -221,7 +225,7 @@ class TestMeasureSmoke(InstarTestBase):
                 )
 
     def test_measure_small_vpc_with_allocated_block(self):
-        """Regression for B1 (PLAN-fuzzing-bugs phase 4) — VPC.
+        """Regression for the allocation-overshoot clamp — VPC.
 
         1 MiB dynamic VPC with default 2 MiB block_size: a single
         allocated block makes `allocated_blocks * block_size` overshoot
@@ -235,11 +239,11 @@ class TestMeasureSmoke(InstarTestBase):
         )
 
     def test_measure_small_vhdx_with_allocated_block(self):
-        """Regression for B1 (PLAN-fuzzing-bugs phase 4) — VHDX.
+        """Regression for the allocation-overshoot clamp — VHDX.
 
         1 MiB dynamic VHDX with the qemu-default 32 MiB block_size: a
         single allocated block would overshoot virtual_size by 32x
-        without the phase-4 clamp. Tests the vhdx::scan_allocation
+        without the clamp. Tests the vhdx::scan_allocation
         clamp on the same shape as the VPC case.
         """
         self._assert_measure_clamp_matches_qemu(
@@ -247,7 +251,7 @@ class TestMeasureSmoke(InstarTestBase):
         )
 
     def test_measure_small_vmdk_with_allocated_grain(self):
-        """Regression for B1 (PLAN-fuzzing-bugs phase 4) — VMDK.
+        """Regression for the allocation-overshoot clamp — VMDK.
 
         Small monolithicSparse VMDK with a grain-sized write that lands
         on the boundary of virtual_size. Tests the vmdk::scan_allocation
@@ -286,7 +290,7 @@ class TestMeasureOptions(TestMeasureSmoke):
     # --- cluster_size ---
 
     def test_o_cluster_size_numeric(self):
-        """``-o cluster_size=512`` produces the phase-1 fixture values.
+        """``-o cluster_size=512`` produces the pinned qemu-img values.
 
         qemu-img: measure --size 1M -O qcow2 -o cluster_size=512 --output=json
         => required=22528, fully-allocated=1071104
@@ -617,7 +621,7 @@ def _make_size_test(case, output_type):
     test.__name__ = f'test_size_{case[0].replace("-", "_")}_{output_type}'
     test.__doc__ = (
         f'--size {case[1]} -O {case[2]} --output={output_type} '
-        f'matches the phase-6 baseline.'
+        f'matches the qemu-img baseline.'
     )
     return test
 
@@ -655,8 +659,8 @@ class TestMeasureBaselineSource(TestMeasureSmoke):
 # Known divergences from qemu-img's source-scanning behaviour. Each entry
 # is `image_id -> (target_pattern, reason)`. The test factory skips matching
 # (image, target) pairs with the documented reason rather than failing.
-# These are real gaps in instar's parser scanners — see the master plan's
-# Future Work section for follow-up.
+# These are real gaps in instar's parser scanners — see the Future work
+# section of PLAN-measure.md for follow-up.
 KNOWN_SOURCE_SCANNER_DIVERGENCES = {
     # raw scanner does not call SEEK_HOLE/SEEK_DATA on the underlying file,
     # so genuinely-sparse raw images (with on-disk fallocate holes) count
@@ -670,10 +674,10 @@ KNOWN_SOURCE_SCANNER_DIVERGENCES = {
     # for some real-world images — likely a compressed-cluster or
     # extended-L2 subcluster edge case worth its own investigation.
     #
-    # `debian-12-sfagent` and `sf-vda-backing` were here too until
-    # PLAN-fuzzing-bugs phase 2 (qcow2::scan_allocation OOB L2 skip) fixed
-    # them as an incidental consequence; the byte-equality test now passes
-    # for both. `sf-vda` still diverges and remains entered.
+    # `debian-12-sfagent` and `sf-vda-backing` were here too until the
+    # fix making qcow2::scan_allocation skip out-of-bounds L2 tables
+    # corrected them as an incidental consequence; the byte-equality test
+    # now passes for both. `sf-vda` still diverges and remains entered.
     'sf-vda':            ('qcow2', 'instar qcow2 scanner counts allocated bytes differently'),
 
     # VHDX scanner treats every block as fully allocated; qemu-img returns
@@ -769,7 +773,7 @@ def _make_source_test(image_dict, target, output_type):
     )
     test.__doc__ = (
         f'instar measure {image_dict["id"]} -O {target} --output={output_type} '
-        f'matches the phase-6 baseline.'
+        f'matches the qemu-img baseline.'
     )
     return test
 
@@ -915,7 +919,8 @@ class TestMeasureRoundTrip(TestMeasureSmoke):
       measure + convert, same bound assertion.
 
     Cushion: one output sector (65536 bytes) to absorb writer-side alignment
-    artefacts (e.g. VHD's leading-footer sector-alignment gap from phase 1e).
+    artefacts (e.g. VHD's leading footer, which the writer pads to a whole
+    output sector while measure counts it as 512 bytes).
     For vhdx the cushion is widened to 1 MiB (vhdx::MB_ALIGN) because the
     VHDX writer aligns metadata to 1 MiB boundaries.
     """
@@ -1092,7 +1097,7 @@ class TestMeasureRoundTrip(TestMeasureSmoke):
 
 
 class TestMeasureNewFormatRefusal(TestMeasureSmoke):
-    """Phase-1 format-coverage: new-format source-image refusals.
+    """Source-image handling of bochs, cloop, parallels, QED and DMG.
 
     measure's source-image mode calls the guest's
     `detect_format_from_header` directly (measure/src/main.rs:337);
@@ -1102,7 +1107,7 @@ class TestMeasureNewFormatRefusal(TestMeasureSmoke):
     detected only by its koly trailer -- a probe that is wired into
     `instar info` only, not into `detect_format_from_header` -- so
     measure never distinguishes a DMG source from raw and instead
-    sizes it as a raw device. Documents the phase-1 gap rather than
+    sizes it as a raw device. Documents that gap rather than
     asserting a refusal that does not exist (mirrors the iso quirk
     pinned for convert/compare/dd).
     """
@@ -1140,8 +1145,8 @@ class TestMeasureNewFormatRefusal(TestMeasureSmoke):
     def test_qed_refused(self):
         """measure refuses a qed-simple source (header-detected).
 
-        Format-coverage phase 6 keeps QED read-refused as policy (see
-        docs/plans/PLAN-format-coverage-phase-06-qed.md).  QED's
+        instar keeps QED read-refused as deliberate policy (see
+        docs/quirks.md "QED read-refusal as policy").  QED's
         offset-0 header magic is recognised by the guest probe but has
         no reader arm, so it lands in the same default arm as
         bochs/cloop/parallels and is reported as "source image is

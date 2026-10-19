@@ -3089,9 +3089,9 @@ mod tests {
     // Format-wide invariants
     // ====================================================================
     //
-    // Per the phase plan: every measure function, for a small set of
-    // (virtual_size, allocated_bytes) combos with default options, must
-    // return Ok and satisfy the cross-format invariants
+    // Every measure function, for a small set of (virtual_size,
+    // allocated_bytes) combos with default options, must return Ok and
+    // satisfy the cross-format invariants
     //
     //   required <= fully_allocated
     //   fully_allocated >= virtual_size  (raw + qcow2; the sparse formats'

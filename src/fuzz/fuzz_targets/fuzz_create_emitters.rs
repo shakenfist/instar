@@ -17,7 +17,7 @@
 //! `ScratchTooSmall`, `PreallocationUnsupported`) are silently
 //! ignored; libFuzzer's only oracle is panic.
 //!
-//! Phase 9b layers a header re-parse round-trip on top: when the
+//! A header re-parse round-trip is layered on top: when the
 //! plan's `minimum_file_size` fits within `REPARSE_BUFFER_CAP`
 //! (16 MiB), the harness assembles the emitted writes into a
 //! contiguous buffer and re-parses the relevant header slice with

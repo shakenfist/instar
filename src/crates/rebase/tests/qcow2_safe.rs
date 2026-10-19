@@ -4,9 +4,8 @@
 //! Safe mode's contract is split across the planner (which
 //! validates the overlay and builds the deferred metadata
 //! plan) and the guest-side comparison loop (not exercised in
-//! unit tests; its write composition lives in
-//! `crates/qcow2-write` since phase 5 of
-//! `PLAN-qcow2-write-infrastructure`). These integration tests
+//! unit tests; its write composition lives in the shared
+//! `crates/qcow2-write` engine). These integration tests
 //! cover what the planner can deliver end-to-end:
 //!
 //! - Smoke: build an overlay via `create`, plan a rebase,

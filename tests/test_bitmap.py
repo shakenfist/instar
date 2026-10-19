@@ -1,18 +1,18 @@
 """Integration tests for `instar bitmap`.
 
-Phase 7 of PLAN-bitmap.md. The live differential suite: for each
-case in `BITMAP_CASES`, create a qcow2 image with `qemu-img`, copy
-it to A (instar) and B (qemu), apply the same sequence of bitmap
-actions to each -- `instar bitmap ...` on A and `qemu-img bitmap
-...` on B -- then assert `qemu-img check` passes on the instar
-output and the two images carry an equivalent `bitmaps` array (read
-via `qemu-img info --output=json` on *both* copies).
+The live differential suite: for each case in `BITMAP_CASES`, create a
+qcow2 image with `qemu-img`, copy it to A (instar) and B (qemu), apply
+the same sequence of bitmap actions to each -- `instar bitmap ...` on
+A and `qemu-img bitmap ...` on B -- then assert `qemu-img check`
+passes on the instar output and the two images carry an equivalent
+`bitmaps` array (read via `qemu-img info --output=json` on *both*
+copies).
 
-CRITICAL: instar's `info` emits no bitmaps (Phase-1 step 1e was
-deferred), so the info cross-check is **qemu-vs-qemu**: both A and B
-are read with `qemu-img info` and their `format-specific.data.bitmaps`
-arrays compared, sorted by name (the on-disk directory order may
-differ between the two independently-produced images).
+CRITICAL: instar's `info` does not yet list bitmaps, so the info
+cross-check is **qemu-vs-qemu**: both A and B are read with `qemu-img
+info` and their `format-specific.data.bitmaps` arrays compared, sorted
+by name (the on-disk directory order may differ between the two
+independently-produced images).
 
 This is the *live* differential against the locally-installed
 `qemu-img` (10.0.8). `bitmap` launches a guest VM, so the test
@@ -20,9 +20,10 @@ classes guard on `/dev/kvm` (mirroring amend's guest-needs-kvm
 skip). Fixtures are built with `qemu-img create` at compat=1.1
 (bitmaps require qcow2 v3).
 
-Step 7a covers the metadata-action + ordered-sequence + empty-merge
-matrix across a cluster-size spread. The bits-set merge oracle
-(7b) and the refusal suite (7c) are added in later steps.
+The suite covers the metadata-action + ordered-sequence + empty-merge
+matrix across a cluster-size spread, a bits-set merge validated through
+a read-back oracle, the refusal contracts, and a cross-version baseline
+matrix.
 """
 
 import json  # noqa: F401  (used by helpers/future steps)
@@ -223,7 +224,7 @@ class TestBitmapSmoke(InstarTestBase):
             f'{json.dumps(bb, indent=2, sort_keys=True)}')
 
     # ------------------------------------------------------------------
-    # Bits-set seeding + read-back oracle (step 7b, Open question 2).
+    # Bits-set seeding + read-back oracle.
     #
     # `_seed_bitmap` uses qemu-img/qemu-io to write KNOWN dirty extents
     # into a bitmap (never instar), and `_bitmap_dirty_extents` reads
@@ -304,7 +305,7 @@ class TestBitmapSmoke(InstarTestBase):
 
         The `x-dirty-bitmap` convention inverts `data`: a DIRTY cluster
         reports `"data": false` and a clean cluster `"data": true`. This
-        polarity is centralised HERE (Open question 2).
+        polarity is centralised HERE so no caller can get it backwards.
 
         Returns a SORTED, COALESCED list of `(offset, length)` dirty
         ranges. The bitmap MUST be disabled (see `_seed_bitmap`) for the
@@ -562,7 +563,7 @@ _install_bitmap_diff_tests()
 
 
 # ----------------------------------------------------------------------
-# MERGE_BITS_VARIANTS -- the bits-set same-file merge matrix (step 7b).
+# MERGE_BITS_VARIANTS -- the bits-set same-file merge matrix.
 #
 # Each variant seeds a SOURCE bitmap 'src' with known dirty writes and a
 # DEST bitmap 'dst' (possibly pre-seeded with its own writes), then merges
@@ -603,7 +604,7 @@ MERGE_BITS_VARIANTS = {
 class TestBitmapMergeBits(TestBitmapSmoke):
     """Bits-set same-file `--merge`, cross-validated against qemu.
 
-    The first real exercise of the Phase-4 guest merge orchestration:
+    The end-to-end exercise of the guest op's merge orchestration:
     seed known dirty bits into 'src' (and optionally 'dst'), copy the
     image to A (instar) and B (qemu), run `bitmap --merge src <img> dst`
     on each, then assert (a) `qemu-img check(A)` clean, (b) the bitmaps
@@ -1016,10 +1017,10 @@ class TestBitmapSameInvocationAddThenFree(TestBitmapSmoke):
 
 
 # ----------------------------------------------------------------------
-# TestBitmapRefusals -- the error-path contracts (step 7c, Mission §4).
+# TestBitmapRefusals -- the error-path contracts.
 #
 # Every case asserts `rc != 0` and `assertIn(substr, stderr)` against the
-# EXACT Phase-5 host messages (`src/vmm/src/main.rs` `run_bitmap` +
+# EXACT host messages (`src/vmm/src/main.rs` `run_bitmap` +
 # `map_bitmap_error`). Cases split into two kinds:
 #
 #   * HOST-SIDE (argument validation + the non-qcow2 probe): these fail
@@ -1035,8 +1036,8 @@ class TestBitmapSameInvocationAddThenFree(TestBitmapSmoke):
 # than failing -- exactly `test_amend.py`'s divergence-record pattern.
 # ----------------------------------------------------------------------
 class TestBitmapRefusals(TestBitmapSmoke):
-    """Refusal contracts for `instar bitmap`, matched to the Phase-5
-    host messages, plus the intentional instar-over-refuses divergences.
+    """Refusal contracts for `instar bitmap`, matched to the host
+    messages, plus the intentional instar-over-refuses divergences.
     """
 
     # ---- Host-side argument-validation refusals (no guest, no kvm) ----
@@ -1227,13 +1228,14 @@ class TestBitmapRefusals(TestBitmapSmoke):
     def test_qed_refused(self):
         """A qed image is refused host-side, byte-unchanged.
 
-        Format-coverage phase 6 keeps QED read-refused as policy (see
-        docs/plans/PLAN-format-coverage-phase-06-qed.md).  QED's
-        offset-0 header magic is recognised by `probe_bitmap_target`,
-        which runs before any guest launch (no kvm) and refuses every
-        non-qcow2 format -- so a QED image is refused with "not a qcow2
-        image" and left untouched.  qemu-img has no QED bitmap driver
-        either, so this is a refusal pin, not a divergence.
+        QED is read-refused as deliberate policy (see the "QED
+        Read-Refusal Is Deliberate Policy" section of docs/quirks.md).
+        QED's offset-0 header magic is recognised by
+        `probe_bitmap_target`, which runs before any guest launch (no
+        kvm) and refuses every non-qcow2 format -- so a QED image is
+        refused with "not a qcow2 image" and left untouched.  qemu-img
+        has no QED bitmap driver either, so this is a refusal pin, not a
+        divergence.
         """
         image = self.get_image('qed-simple')
         if not image.path.exists():
@@ -1337,7 +1339,7 @@ class TestBitmapRefusals(TestBitmapSmoke):
 
 
 # ----------------------------------------------------------------------
-# Cross-version baseline comparison matrix (Phase 8).
+# Cross-version baseline comparison matrix.
 #
 # BITMAP_BASELINE_CASES is the instar-side replica of the generator's
 # BITMAP_CASES (../instar-testdata/scripts/generate-baselines.py). Each

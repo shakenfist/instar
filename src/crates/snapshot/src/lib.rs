@@ -1,8 +1,8 @@
 //! Pure planner crate for qcow2 snapshot mutator primitives.
 //!
 //! This crate is the per-operation home for the byte-level
-//! mutators that the snapshot create / delete / apply guest
-//! binaries (phases 6-8) compose into per-mode patch lists.
+//! mutators that the snapshot guest op's create / delete / apply
+//! modes compose into ordered groups of in-place disk writes.
 //! It is parallel to `commit` and `rebase`: pure functions over
 //! caller-staged slices, no I/O, no allocator.
 //!
@@ -24,15 +24,14 @@
 //!   mutator (dry-run reads only, apply pass mutates).
 //! - [`qcow2::precheck_snapshot_refcount`] — the dry-run pass
 //!   alone, read-only, for callers that must validate before any
-//!   disk write but apply after a commit point (delete, phase 7).
+//!   disk write but apply after a commit point (`MODE_DELETE`).
 //! - [`qcow2::update_copied_flags_for_l1`] — rewrites COPIED
 //!   flags on L1 and L2 entries based on current refcount.
 //!
 //! The crate is `no_std` and performs no I/O. Mutators operate
-//! on slices in place. (A speculative `SnapshotPatch` /
-//! `SnapshotPlan` patch-list API existed through phase 13 but
-//! was never adopted — the guest binaries went with direct
-//! write-groups in phase 6 — and was removed in phase 14.)
+//! on slices in place, and the guest op writes the mutated
+//! buffers back directly as ordered write groups; there is no
+//! intermediate patch-list representation.
 
 #![no_std]
 #![allow(clippy::too_many_arguments)]
@@ -45,10 +44,10 @@ use shared::SnapshotResult;
 /// Errors returned by the snapshot mutator primitives.
 ///
 /// The first 13 variants map 1:1 to the [`SnapshotResult::ERROR_*`]
-/// wire codes from phase 1; the trailing two variants
+/// wire codes; the trailing two variants
 /// ([`Self::MisalignedAccess`] and [`Self::Unsupported`]) are
-/// planner-internal misuse codes that the phase 6-8 guest
-/// binaries translate to the closest matching wire code via
+/// planner-internal misuse codes that the guest op's mutating
+/// modes translate to the closest matching wire code via
 /// the [`From<SnapshotError> for u32`] impl below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapshotError {

@@ -1,11 +1,13 @@
-"""Smoke tests for `instar create`.
+"""Integration tests for `instar create`.
 
-Phase 3 of PLAN-create.md ships the host CLI subcommand; these
-tests confirm end-to-end invocation works for each target format
-plus a couple of error and option-flag paths. The comprehensive
-matrix (every cluster_size, every refcount_bits, every backing /
-preallocation combination, qemu-img info equivalence across the
-~80 qemu-img versions) lives in phase 8.
+The smoke tests confirm end-to-end invocation works for each target
+format plus a couple of error and option-flag paths. Later classes
+cover -o target options, backing files, preallocation, and the
+comprehensive matrix: every CREATE_CASES entry (cluster_size,
+refcount_bits, subformat, preallocation, ...) compared against
+qemu-img info baselines recorded across the ~80 pinned qemu-img
+versions, cross-validated against the live system qemu-img, and
+round-tripped through `instar check`.
 
 These tests require /dev/kvm access for the non-raw paths.
 """
@@ -209,11 +211,11 @@ class TestCreateSmoke(InstarTestBase):
             return '', f'Timeout after {timeout}s', -1
 
     # ------------------------------------------------------------------
-    # Baseline reachability (phase 8a)
+    # Baseline reachability
     # ------------------------------------------------------------------
 
     def test_create_baselines_present(self):
-        """Phase 7's baselines must be reachable via get_output_profiles."""
+        """The create-info-json baselines must be reachable via get_output_profiles."""
         profiles = self.get_output_profiles(output_type='json', command='create')
         self.assertIn('profiles', profiles)
         self.assertGreater(len(profiles['profiles']), 0,
@@ -1323,12 +1325,11 @@ class TestCreateOOptions(InstarTestBase):
 
 
 class TestCreateBackingChain(InstarTestBase):
-    """Phase-5 backing-file polish tests.
+    """Backing-file tests.
 
-    Covers cases the master plan explicitly called out: vhdx-as-
-    backing (phase 5a), vmdk-from-vmdk CID round-trip (phase 5b),
+    Covers vhdx-as-backing, the vmdk-from-vmdk CID round-trip,
     non-recursion through grandparent chains, format-mismatch
-    auto-detect, and the new BACKING_SIZE_TOO_LARGE error.
+    auto-detect, and the BACKING_SIZE_TOO_LARGE error.
     """
 
     def run_instar_create(self, *args, timeout=60):
@@ -1355,7 +1356,7 @@ class TestCreateBackingChain(InstarTestBase):
         return json.loads(stdout)
 
     def test_vhdx_as_backing(self):
-        """Phase 5a: create a vhdx parent, use it as backing for a qcow2 child.
+        """Create a vhdx parent, use it as backing for a qcow2 child.
 
         The child's virtual_size should be inferred from the parent
         via VhdxState::init's metadata-region walk.
@@ -1378,7 +1379,7 @@ class TestCreateBackingChain(InstarTestBase):
             self.assertEqual(info.get('backing-filename-format'), 'vhdx')
 
     def test_vmdk_from_vmdk_parentcid(self):
-        """Phase 5b: vmdk-from-vmdk reads the parent's CID into parentCID."""
+        """vmdk-from-vmdk reads the parent's CID into parentCID."""
         with tempfile.TemporaryDirectory() as td:
             parent = Path(td) / 'parent.vmdk'
             child = Path(td) / 'child.vmdk'
@@ -1466,7 +1467,7 @@ class TestCreateBackingChain(InstarTestBase):
     def test_backing_too_large_for_target(self):
         """A 4 TiB raw backing exceeds qcow2 cluster_size=512 addressable range.
 
-        Phase 5c's ceiling check should fire, returning
+        The backing-size ceiling check should fire, returning
         ERROR_BACKING_SIZE_TOO_LARGE with the actionable hint in
         stderr.
         """
@@ -1485,9 +1486,9 @@ class TestCreateBackingChain(InstarTestBase):
 
 
 class TestCreatePreallocation(InstarTestBase):
-    """Phase-6 preallocation tests.
+    """Preallocation tests.
 
-    Covers the new accept set: raw + falloc/full, qcow2 +
+    Covers the accept set: raw + falloc/full, qcow2 +
     metadata/falloc/full, plus rejections for raw+metadata and
     vmdk/vpc/vhdx + non-`off`.
     """
@@ -1606,7 +1607,7 @@ class TestCreatePreallocation(InstarTestBase):
 
 
 # ----------------------------------------------------------------------
-# Phase 8b: cross-version baseline matrix
+# Cross-version baseline matrix
 # ----------------------------------------------------------------------
 #
 # Mirror of instar-testdata/scripts/generate-baselines.py:CREATE_CASES.
@@ -1670,8 +1671,8 @@ def _instar_target_name(target):
     The case-dict key follows the on-disk baseline directory name
     (which mirrors instar's user-facing format vocabulary). instar
     itself accepts 'vpc' for the VHD format, matching qemu-img's
-    canonical name; the dict uses 'vhd' for symmetry with
-    PLAN-create-phase-07-baselines.md.
+    canonical name; the dict uses 'vhd' so its keys match the baseline
+    directory names in instar-testdata.
     """
     return 'vpc' if target == 'vhd' else target
 
@@ -1775,7 +1776,7 @@ class TestCreateBaselineMatrix(TestCreateSmoke):
     @staticmethod
     def _run_qemu_img_info(path, timeout=30):
         """Run system qemu-img info --output=json. No -f flag so the
-        auto-detect path matches what phase 7's generator recorded.
+        auto-detect path matches what the baseline generator recorded.
         Returns (stdout, stderr, rc).
         """
         try:
@@ -1886,7 +1887,7 @@ def _make_baseline_test(target, case):
     )
     test.__doc__ = (
         f'instar create -f {target} {" ".join(case[2])} {case[1]} '
-        f'matches phase-7 baseline.'
+        f'matches the qemu-img baseline.'
     )
     return test
 
@@ -1903,7 +1904,7 @@ for _target, _cases in CREATE_CASES.items():
 
 
 # ----------------------------------------------------------------------
-# Phase 8c: instar-vs-qemu-img cross-validation via instar info
+# instar-vs-qemu-img cross-validation via instar info
 # ----------------------------------------------------------------------
 #
 # Curated subset of CREATE_CASES chosen to avoid the known writer
@@ -1936,7 +1937,7 @@ class TestCreateCrossValidation(TestCreateSmoke):
     Compares `instar create | instar info` to `qemu-img create | instar
     info` on the live system qemu-img — no baseline lookup. Catches
     writer divergences that surface against the *currently installed*
-    qemu-img version rather than the frozen phase-7 matrix. Independent
+    qemu-img version rather than the frozen baseline matrix. Independent
     of the testdata repo.
 
     The same KNOWN_WRITER_DIVERGENCES set applies: if instar's writer
@@ -2045,7 +2046,7 @@ for _target, _case in CROSS_VALIDATION_CASES:
 
 
 # ----------------------------------------------------------------------
-# Phase 8d: instar check round-trip across the full matrix
+# instar check round-trip across the full matrix
 # ----------------------------------------------------------------------
 #
 # Light-weight write-then-read sanity check: for each (target, case),

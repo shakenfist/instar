@@ -1,68 +1,72 @@
 //! Pure windowed step-program planner for writes into existing
 //! qcow2 images.
 //!
-//! This crate is the centrepiece of
-//! `docs/plans/PLAN-qcow2-write-infrastructure.md`: a `no_std`,
-//! I/O-free planner that turns "write N bytes at virtual offset
-//! X into an existing qcow2" into a typed step program the guest
-//! ops (commit, rebase, bench — phases 4-6) execute. Every shape
-//! here implements a numbered settled decision from
-//! `docs/plans/PLAN-qcow2-write-infrastructure-phase-03-crate.md`
-//! ("Settled design decisions", pinned empirically by the master
-//! plan's "Findings: phase 1 semantics pin" Q4 subsection):
+//! A `no_std`, I/O-free planner that turns "write N bytes at
+//! virtual offset X into an existing qcow2" into a typed step
+//! program the guest ops (commit, rebase safe mode and bench `-w`)
+//! execute. The design rests on these properties:
 //!
-//! - Decision 1 — *windowed step-program*: [`plan_write`] /
-//!   [`plan_flush`] emit into a caller-provided [`StepBuf`]; a
-//!   full-image program is never materialised (commit's envelope
-//!   reaches ~2M clusters). [`WriteError::BufFull`] is the
-//!   resume signal, not a failure.
-//! - Decision 2 — *steps are plain Rust data*: [`Step`] is a
-//!   `#[repr(C)]` struct with a [`StepKind`] tag, const-asserted
-//!   at ≤ 48 bytes so a 64 KiB buffer holds 1300+ steps.
-//! - Decision 3 — *address-free planner*: steps name staged
-//!   buffers by [`RegionId`] + offset and devices by
-//!   [`TargetDevice`]; the executor owns the region-id → slice
-//!   mapping. No guest address ever enters this crate.
-//! - Decision 4 — *barrier semantics*: [`BarrierClass`] encodes
-//!   the fsync asymmetry (the call table exposes only
-//!   `fsync_input`, `src/shared/src/lib.rs`; executors degrade
-//!   Durability to Ordering where no fsync primitive exists).
-//! - Decision 5 — *fixed-slot L2 window* with planner-emitted
-//!   load/writeback and deterministic LRU (access counter in
-//!   [`WriteState`], no clocks).
-//! - Decision 6 — *single staged refblock copy, mutated in
-//!   place* (bench's model), dirty bitset in [`WriteState`].
-//! - Decision 7 — *crash-ordering contract in emission order*
-//!   (pinned mechanically by the step-3c suite).
-//! - Decision 8 — *unified envelope gates* in
-//!   [`check_envelope`], run by [`new_state`] before any step
-//!   can exist.
-//! - Decision 9 — capacity refusals are clean but not
-//!   byte-idempotent in v1 (see [`WriteError`]).
-//! - Decision 10 — dependencies are `shared`, `qcow2` (parsing,
-//!   geometry) and `snapshot` (allocator + refcount RMW
-//!   primitives, e.g. [`snapshot::qcow2::AllocCursor`]).
+//! - *Windowed step-program*: [`plan_write`] / [`plan_flush`] emit
+//!   into a caller-provided [`StepBuf`]; a full-image program is
+//!   never materialised (commit's envelope reaches ~2M clusters).
+//!   [`WriteError::BufFull`] is the resume signal, not a failure.
+//! - *Steps are plain Rust data*: [`Step`] is a `#[repr(C)]`
+//!   struct with a [`StepKind`] tag, const-asserted at ≤ 48 bytes
+//!   so a 64 KiB buffer holds 1300+ steps. Planner and executor
+//!   share a binary, so there is no serialization boundary to
+//!   design for.
+//! - *Address-free planner*: steps name staged buffers by
+//!   [`RegionId`] + offset and devices by [`TargetDevice`]; the
+//!   executor owns the region-id → slice mapping. No guest address
+//!   ever enters this crate, which keeps it host-unit-testable.
+//! - *Barrier semantics*: [`BarrierClass`] encodes the fsync
+//!   asymmetry (the call table exposes only `fsync_input`,
+//!   `src/shared/src/lib.rs`; executors degrade Durability to
+//!   Ordering where no fsync primitive exists).
+//! - *Fixed-slot L2 window* with planner-emitted load/writeback and
+//!   deterministic LRU (access counter in [`WriteState`], no
+//!   clocks).
+//! - *Single staged refblock copy, mutated in place* (bench's
+//!   model; the duplicate planner-scratch copies commit and rebase
+//!   used to keep cost 3-4 MiB of scratch), dirty bitset in
+//!   [`WriteState`].
+//! - *Crash-ordering contract in emission order*: (a) a data
+//!   cluster's writes precede the L2 patch that makes it reachable;
+//!   (b) a fresh L2 table's zero/init write precedes the L1 patch
+//!   that references it; (c) refcount write-backs are emitted only
+//!   by [`plan_flush`], after every pointer patch of the epoch;
+//!   (d) Durability barriers separate those groups. The ordering
+//!   property suite (`tests/ordering.rs`) asserts these over whole
+//!   emitted programs.
+//! - *Unified envelope gates* in [`check_envelope`], run by
+//!   [`new_state`] before any step can exist, so a refused image is
+//!   never mutated.
+//! - Capacity refusals are clean but not byte-idempotent (see
+//!   [`WriteError`]).
+//! - Dependencies are `shared`, `qcow2` (parsing, geometry) and
+//!   `snapshot` (allocator + refcount RMW primitives, e.g.
+//!   [`snapshot::qcow2::AllocCursor`]).
 //!
-//! Phase 3a shipped the type vocabulary, the envelope gates and
-//! a gated [`WriteState`] constructor. Phase 3b fills in
-//! [`plan_write`] and [`plan_flush`], with three documented
-//! refinements the phase plan anticipated:
+//! Three API details refine that shape:
 //!
 //! - [`StagedRegions`]: the planning calls take a view of the
-//!   executor-staged buffers (the API sketch anticipated a
-//!   `staged` parameter). Classification reads L2 entries and
+//!   executor-staged buffers. Classification reads L2 entries and
 //!   refcounts through it; the allocator mutates the staged
-//!   refblocks through it in place (decision 6).
-//! - [`StepKind::FillRange`] and [`StepKind::ZeroRegion`] join
-//!   the step vocabulary (the sketch's trailing `...`): the
-//!   former lowers [`DataSource::Fill`], the latter initialises
-//!   a fresh L2 window slot to zeros.
-//! - The decision-5 window protocol: when the planner emits a
-//!   [`StepKind::LoadCluster`] it returns
-//!   [`WriteError::BufFull`] immediately, because the slot's
-//!   bytes exist only after the executor runs the load. BufFull
-//!   is therefore a *window boundary* signal, not strictly a
-//!   capacity signal; the caller's loop is identical either way.
+//!   refblocks through it in place.
+//! - [`StepKind::FillRange`] and [`StepKind::ZeroRegion`] complete
+//!   the step vocabulary: the former lowers [`DataSource::Fill`],
+//!   the latter initialises a fresh L2 window slot to zeros.
+//! - The L2 window protocol: when the planner emits a
+//!   [`StepKind::LoadCluster`] it returns [`WriteError::BufFull`]
+//!   immediately, because the slot's bytes exist only after the
+//!   executor runs the load. BufFull is therefore a *window
+//!   boundary* signal, not strictly a capacity signal; the caller's
+//!   loop is identical either way.
+//!
+//! Copy-on-write is opt-in ([`new_state_cow`]): with it, a
+//! snapshot-shared data cluster is copied to a fresh cluster
+//! (*data-cluster COW*) and a snapshot-shared L2 table is copied to
+//! a fresh table (*L2-table COW*) instead of being refused.
 
 #![no_std]
 
@@ -73,9 +77,9 @@
 pub mod growth;
 
 /// Vec-backed simulation harness (executor stand-in + COW fixtures +
-/// assertion helpers) for driving [`plan_write`]/[`plan_flush`]. Lifted
-/// out of `#[cfg(test)] mod tests` in phase 8a so the crate's unit
-/// tests AND the `fuzz_qcow2_write` cargo-fuzz target share one harness.
+/// assertion helpers) for driving [`plan_write`]/[`plan_flush`]. Kept
+/// outside `#[cfg(test)] mod tests` so the crate's unit tests AND the
+/// `fuzz_qcow2_write` cargo-fuzz target share one harness.
 /// Gated behind `sim` (or `test`) — OFF in the production guest ops.
 #[cfg(any(test, feature = "sim"))]
 pub mod sim;
@@ -87,11 +91,12 @@ use snapshot::qcow2::{
 use snapshot::SnapshotError;
 
 // Re-exports for the execution crate (`qcow2-write-exec`): its
-// region-agnostic refcount-growth executor reaches the refcount codec
-// and the host-offset mask through its existing `qcow2-write`
-// dependency, so `qcow2-write-exec` needs no direct `snapshot`/`qcow2`
-// dependency (phase 7 decision 5). `L1_OFFSET_MASK` also stays in scope
-// for this crate's own use via this re-export.
+// region-agnostic refcount-growth executor reaches the refcount codec and
+// the host-offset mask through its existing `qcow2-write` dependency, so
+// `qcow2-write-exec` needs no direct `snapshot`/`qcow2` dependency. That
+// executor is shared by commit, rebase and bench rather than
+// re-implemented per op. `L1_OFFSET_MASK` also stays in scope for this
+// crate's own use via this re-export.
 pub use qcow2::L1_OFFSET_MASK;
 pub use snapshot::qcow2::set_refcount_in_block;
 
@@ -104,31 +109,32 @@ pub use snapshot::qcow2::set_refcount_in_block;
 /// Matches the stage-everything caps of the ops this crate
 /// absorbs (`MAX_STAGED_L2 == 256` in both
 /// `src/operations/commit/src/main.rs` and
-/// `src/operations/rebase/src/main.rs`), so decision 5's
-/// degenerate large-window case covers commit's current
+/// `src/operations/rebase/src/main.rs`), so the L2 window's
+/// degenerate large-window case covers commit's stage-everything
 /// behaviour without growing [`WriteState`].
 pub const MAX_L2_SLOTS: usize = 256;
 
 /// Upper bound on [`StagingConfig::max_refblocks`].
 ///
-/// The master plan's Q4 findings call out the cap asymmetry to
-/// unify: commit caps at 32 staged refblocks while rebase and
-/// bench cap at 2048 (`WRITE_MAX_REFBLOCKS`,
+/// The ops this crate absorbed had asymmetric caps: commit
+/// capped at 32 staged refblocks while rebase and bench cap at
+/// 2048 (`WRITE_MAX_REFBLOCKS`,
 /// `src/operations/bench/src/main.rs`). The unified crate takes
 /// the larger figure; the dirty bitset this sizes costs
 /// `2048 / 8 == 256` bytes of state.
 pub const MAX_REFBLOCKS: usize = 2048;
 
-/// Decision 2's size budget for [`Step`], asserted below.
+/// Size budget for [`Step`], asserted below: at 48 bytes a
+/// 64 KiB step buffer holds 1300+ steps.
 pub const STEP_SIZE_LIMIT: usize = 48;
 
 // ---------------------------------------------------------------------------
 // Geometry
 // ---------------------------------------------------------------------------
 
-/// Image geometry derived from a parsed [`QcowHeader`]
-/// (decision 10: `qcow2` owns parsing; this crate derives what
-/// planning needs and nothing else).
+/// Image geometry derived from a parsed [`QcowHeader`] (the
+/// `qcow2` crate owns parsing; this crate derives what planning
+/// needs and nothing else).
 ///
 /// All derived quantities assume the envelope gates have passed:
 /// `entries_per_l2` assumes standard 8-byte L2 entries
@@ -199,15 +205,17 @@ impl Geometry {
 // Staging configuration
 // ---------------------------------------------------------------------------
 
-/// Caller-chosen staging shape (decisions 5 and 6).
+/// Caller-chosen staging shape (the L2 window and the staged
+/// refblock set).
 ///
 /// The caller (executor) carves the actual staging buffers out
-/// of its scratch region — the master plan's Q4 findings pin
-/// staging to scratch-address-carved slices, never `static`
-/// (the `.bss`/HEADER_MISMATCH hazard class). The planner only
-/// needs the *shape*: how many L2 window slots exist (decision
-/// 5) and how many staged refblocks the dirty bitset must cover
-/// (decision 6).
+/// of its scratch region — staging must be scratch-address-carved
+/// slices, never `static`, because static buffers land in `.bss`
+/// and can overflow into neighbouring memory (the
+/// `.bss`/HEADER_MISMATCH hazard class). The
+/// planner only needs the *shape*: how many L2 window slots
+/// exist and how many staged refblocks the dirty bitset must
+/// cover.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StagingConfig {
     /// Number of L2 window slots the executor stages
@@ -218,21 +226,19 @@ pub struct StagingConfig {
     /// Number of staged refblocks the dirty bitset covers
     /// (`1..=MAX_REFBLOCKS`).
     pub max_refblocks: usize,
-    /// The device the written image lives on (decision 3 — the
-    /// dimension exists because commit writes the *backing* via
-    /// the output device while bench writes its image via input
-    /// slot 0). Every step [`plan_write`] / [`plan_flush`] emit
-    /// targets this device; a 3b field the phase plan's
-    /// `StagingConfig` sketch anticipated with its trailing
-    /// `...`.
+    /// The device the written image lives on (the dimension
+    /// exists because commit writes the *backing* via the output
+    /// device while bench writes its image via input slot 0).
+    /// Every step [`plan_write`] / [`plan_flush`] emit targets
+    /// this device.
     pub device: TargetDevice,
 }
 
 // ---------------------------------------------------------------------------
-// Step vocabulary (decisions 2, 3, 4)
+// Step vocabulary
 // ---------------------------------------------------------------------------
 
-/// Staged-buffer regions a [`Step`] may reference (decision 3).
+/// Staged-buffer regions a [`Step`] may reference.
 ///
 /// The planner is address-free: it names buffers symbolically
 /// and the executor owns the region-id → slice mapping. This is
@@ -242,13 +248,13 @@ pub struct StagingConfig {
 pub enum RegionId {
     /// The staged copy of the active L1 table.
     L1,
-    /// One slot of the fixed-slot staged-L2 window (decision
-    /// 5); the index is `< StagingConfig::l2_slots`.
+    /// One slot of the fixed-slot staged-L2 window; the index is
+    /// `< StagingConfig::l2_slots`.
     L2Slot(u16),
     /// The staged copy of the refcount table.
     RefcountTable,
     /// The staged refblock array (single copy, mutated in
-    /// place — decision 6, bench's model).
+    /// place — bench's model).
     Refblocks,
     /// The cluster-sized bounce buffer for sub-cluster RMW.
     Bounce,
@@ -256,7 +262,7 @@ pub enum RegionId {
     CallerData,
 }
 
-/// Devices a [`Step`] may target (decision 3).
+/// Devices a [`Step`] may target.
 ///
 /// The device dimension exists from day one because commit is
 /// two-device: it writes the backing via the output device and
@@ -271,7 +277,8 @@ pub enum TargetDevice {
     Output,
 }
 
-/// Barrier strength (decision 4 — the fsync asymmetry, decided).
+/// Barrier strength (how the fsync asymmetry between the input
+/// and output devices is handled).
 ///
 /// The contract: no step after a barrier may be issued before
 /// every step preceding it has been issued (`Ordering`) / made
@@ -281,8 +288,9 @@ pub enum TargetDevice {
 /// the call table exposes only `fsync_input`
 /// (`src/shared/src/lib.rs`), and commit/rebase write via the
 /// output device with zero fsyncs today. Adding `fsync_output`
-/// is recorded future work that phases 4-5 must NOT take
-/// implicitly.
+/// would be a call-table ABI change and a deliberate durability
+/// upgrade; it is not implemented, and no executor may assume
+/// it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum BarrierClass {
@@ -293,18 +301,17 @@ pub enum BarrierClass {
     Durability,
 }
 
-/// Discriminant of a [`Step`] (decision 2).
+/// Discriminant of a [`Step`].
 ///
 /// Which `Step` fields each kind consumes is documented per
 /// variant; unused numeric fields are zero, an unused `region`
 /// is [`RegionId::Bounce`] and an unused `device` carries the
 /// configured [`StagingConfig::device`] — fixed fillers so
-/// emitted programs are bit-deterministic (the step-3c
+/// emitted programs are bit-deterministic (the ordering suite's
 /// window-invariance property compares whole `Step` values).
 /// Executors stay dumb: even the refblock flush is a planner
 /// emission pattern (per-dirty-refblock [`StepKind::WriteRange`]
-/// steps from [`plan_flush`]), not a magic composite step
-/// (decision 6).
+/// steps from [`plan_flush`]), not a magic composite step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum StepKind {
@@ -322,56 +329,64 @@ pub enum StepKind {
     /// Write `len` bytes of the fill byte (the low 8 bits of
     /// `value`) to `device` at `disk_offset` (no region). Lowers
     /// [`DataSource::Fill`] so bench-style patterned writes
-    /// never bounce through a staged buffer; a 3b extension of
-    /// the decision-2 vocabulary (the phase plan's `StepKind`
-    /// sketch ends in `...`).
+    /// never bounce through a staged buffer.
     FillRange,
     /// Store `value` as a big-endian u64 at `region_offset`
     /// within `region` (L1/L2 pointer patches; reaches disk via
     /// a later [`Self::WriteRange`] / [`Self::WritebackCluster`]
-    /// per decision 7's ordering).
+    /// in crash-contract order).
     PatchEntryU64,
     /// Load one cluster (`len == cluster_size`) from `device`
     /// at `disk_offset` into the L2 window slot `region`
-    /// (decision 5, emitted on window miss).
+    /// (emitted on window miss).
     LoadCluster,
     /// Write one cluster (`len == cluster_size`) from the L2
     /// window slot `region` back to `device` at `disk_offset`
-    /// (decision 5, emitted before eviction or at flush).
+    /// (emitted before eviction or at flush).
     WritebackCluster,
     /// Zero `len` bytes within `region` at `region_offset` (no
     /// device I/O). Initialises a freshly allocated L2 table's
     /// window slot to all-zero before entries are patched into
     /// it; the slot reaches disk via a later
-    /// [`Self::WritebackCluster`], which decision 7(b) orders
-    /// before the L1 patch's disk write. A 3b extension of the
-    /// decision-2 vocabulary.
+    /// [`Self::WritebackCluster`], which the crash-ordering
+    /// contract places before the L1 patch's disk write (a fresh
+    /// L2 is initialised before anything references it).
     ZeroRegion,
-    /// Barrier of the given class separating emission groups
-    /// (decision 4); consumes no other fields.
+    /// Barrier of the given class separating emission groups;
+    /// consumes no other fields.
     Barrier {
         /// Barrier strength.
         class: BarrierClass,
     },
 }
 
-/// One planned step (decision 2: plain Rust data, not a packed
-/// byte encoding — planner and executor share a binary, so no
+/// One planned step (plain Rust data, not a packed byte
+/// encoding — planner and executor share a binary, so no
 /// serialization boundary exists).
 ///
 /// Fixed-size `#[repr(C)]` struct, const-asserted at ≤
 /// [`STEP_SIZE_LIMIT`] bytes so a 64 KiB buffer holds 1300+
 /// steps (≈ 100+ worst-case allocating clusters per refill at
-/// ~11 steps each — master plan Q4). Field applicability per
-/// kind is documented on [`StepKind`].
+/// a budget of ~11 steps per cluster). The budget has headroom:
+/// [`plan_write`] emits at most seven steps for one cluster — a
+/// dirty victim slot's [`StepKind::WritebackCluster`]; a fresh
+/// L2's [`StepKind::ZeroRegion`] or a shared L2's
+/// [`StepKind::LoadCluster`], then its L1
+/// [`StepKind::PatchEntryU64`]; three data steps (head fill,
+/// body, tail fill, or a COW's pre-image read, copy and body);
+/// and the L2 [`StepKind::PatchEntryU64`]. Refcount changes are
+/// staged mutations of the refblocks rather than steps, and
+/// barriers and refblock write-backs come only from
+/// [`plan_flush`]. Field applicability per kind is documented
+/// on [`StepKind`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct Step {
     /// What the executor must do; selects which fields apply.
     pub kind: StepKind,
-    /// Device side of the transfer (decision 3).
+    /// Device side of the transfer.
     pub device: TargetDevice,
-    /// Staged-buffer side of the transfer (decision 3).
+    /// Staged-buffer side of the transfer.
     pub region: RegionId,
     /// Byte offset within `region`.
     pub region_offset: u64,
@@ -392,12 +407,11 @@ const _: () = assert!(core::mem::size_of::<Step>() <= STEP_SIZE_LIMIT);
 /// Signal that a [`StepBuf`] has no room for another step.
 ///
 /// Converted to [`WriteError::BufFull`] at the planner boundary;
-/// per decision 1 this is the normal windowing resume signal,
-/// not a failure.
+/// this is the normal windowing resume signal, not a failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BufFull;
 
-/// Caller-provided step window (decision 1).
+/// Caller-provided step window.
 ///
 /// Wraps a caller-owned `&mut [Step]` — the buffer length (and
 /// therefore the window size) is caller-chosen — with an
@@ -457,17 +471,15 @@ impl<'a> StepBuf<'a> {
 }
 
 // ---------------------------------------------------------------------------
-// Staged-region view (decisions 3, 5, 6 — 3b refinement)
+// Staged-region view
 // ---------------------------------------------------------------------------
 
 /// The planner's view of the executor-staged buffers, passed to
 /// every planning call.
 ///
-/// A 3b refinement the phase plan anticipated (its API sketch
-/// carried a `staged: ...` parameter): the planner is pure — no
-/// I/O, no guest addresses — but classification must read L2
-/// entries and refcounts *somewhere*, and the settled model is
-/// that the caller lends the planner a view of the same staged
+/// The planner is pure — no I/O, no guest addresses — but
+/// classification must read L2 entries and refcounts *somewhere*,
+/// so the caller lends the planner a view of the same staged
 /// buffers its executor maps the [`RegionId`]s onto. The view is
 /// passed per call rather than stored in [`WriteState`] so the
 /// state type stays lifetime-free for the ops' scratch-carved
@@ -479,28 +491,28 @@ impl<'a> StepBuf<'a> {
 /// - `l1` ([`RegionId::L1`]): the staged active L1, at least
 ///   `l1_size * 8` bytes. Read-only to the planner — L1
 ///   mutations are emitted as [`StepKind::PatchEntryU64`] steps
-///   so the crash-ordering suite can check them as data
-///   (decision 7).
+///   so the crash-ordering suite can check them as data.
 /// - `l2_window` ([`RegionId::L2Slot`]): the staged-L2 window,
 ///   [`StagingConfig::l2_slots`] contiguous cluster-sized slots.
 ///   Read-only to the planner (same reason).
 /// - `refcount_table` ([`RegionId::RefcountTable`]): the staged
 ///   refcount table; maps staged refblock index to host offset
 ///   for [`plan_flush`]'s refcounts-last write-backs. At least
-///   8 bytes per staged refblock. Read-only (v1 never grows the
-///   refcount table — decision 9).
+///   8 bytes per staged refblock. Read-only (the planner never
+///   grows the refcount table; consumers that grow it do so
+///   op-side, before planning, sized by the [`growth`] module).
 /// - `refblocks` ([`RegionId::Refblocks`]): the staged refblocks
 ///   as a dense prefix — staged refblock `j` occupies bytes
 ///   `[j * cluster_size, (j + 1) * cluster_size)` and covers
 ///   host cluster indices `[j * entries_per_refblock, ...)` from
 ///   host offset zero (bench's contiguous-from-index-0 staging
-///   model). **Mutable**: decision 6 pins bench's single staged
+///   model). **Mutable**: the crate uses bench's single staged
 ///   copy mutated in place, so the `snapshot` crate's allocator
 ///   updates refcounts here directly at plan time and
 ///   [`plan_flush`] emits only the write-backs.
 ///
 /// The planner assumes the staged regions reflect every step
-/// emitted by *previous* planning calls: the decision-1 executor
+/// emitted by *previous* planning calls: the windowed executor
 /// loop (plan a window, execute it, reset the buffer, plan on)
 /// is a hard contract, because classification reads through this
 /// view would otherwise see stale bytes.
@@ -514,39 +526,40 @@ pub struct StagedRegions<'a> {
     pub refcount_table: &'a [u8],
     /// Staged refblock bytes, a dense prefix covering host
     /// clusters from zero ([`RegionId::Refblocks`]); mutated in
-    /// place by the planner's allocator (decision 6).
+    /// place by the planner's allocator.
     pub refblocks: &'a mut [u8],
 }
 
 // ---------------------------------------------------------------------------
-// Envelope gates (decision 8)
+// Envelope gates
 // ---------------------------------------------------------------------------
 
-/// A typed envelope refusal (decision 8: gates are unified and
-/// checked before any write step exists — [`new_state`] runs
-/// them, so a gated image can never produce a [`WriteState`],
-/// honouring the phase-2 "no mutation before envelope checks"
-/// deferral by construction).
+/// A typed envelope refusal (gates are unified and checked
+/// before any write step exists — [`new_state`] runs them, so a
+/// gated image can never produce a [`WriteState`] and is never
+/// mutated before its refusal; the hand-written ops this crate
+/// replaced could write scaffolding clusters before refusing).
 ///
 /// Every variant is a pure header check — the gates take a
-/// parsed [`QcowHeader`] and perform no I/O. One condition from
-/// decision 8 is deliberately NOT here: *compressed clusters*
+/// parsed [`QcowHeader`] and perform no I/O. One envelope
+/// condition is deliberately NOT here: *compressed clusters*
 /// cannot be gated from the header alone (zlib images carry
 /// compressed L2 entries without any header bit), so the write
 /// path's classification refuses them on encounter at plan time
-/// (step 3b). What CAN be seen in the header — the
-/// `INCOMPAT_COMPRESSION` (zstd) bit, or any unknown
-/// incompatible bit — refuses as [`Self::UnknownIncompatible`],
-/// matching bench's proven gate
+/// ([`WriteError::CompressedCluster`]). What CAN be seen in the
+/// header — the `INCOMPAT_COMPRESSION` (zstd) bit, or any
+/// unknown incompatible bit — refuses as
+/// [`Self::UnknownIncompatible`], matching bench's proven gate
 /// (`src/operations/bench/src/main.rs`).
 ///
 /// The `u32` codes ([`Self::code`]) are stable for host
 /// rendering. Codes 1-7 deliberately equal bench's `wgate`
-/// constants so the phase-6 migration maps them one-to-one;
-/// codes 8+ are new to this crate.
+/// constants so bench maps them one-to-one (const-asserted in
+/// `src/operations/bench/src/main.rs`); codes 8+ are new to
+/// this crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Gate {
-    /// `refcount_bits != 16`. The v1 write envelope, like the
+    /// `refcount_bits != 16`. The write envelope, like the
     /// `snapshot` crate's allocator, supports 16-bit refcounts
     /// only. Code 1.
     RefcountWidth,
@@ -568,10 +581,13 @@ pub enum Gate {
     /// The dirty or corrupt incompatible bit is set; metadata
     /// cannot be trusted as a planning substrate. Code 6.
     DirtyCorrupt,
-    /// `nb_snapshots != 0`. v1 refuses snapshot-bearing images
-    /// outright: in-place writes corrupt snapshot-shared
-    /// clusters (GitHub issues #420/#423, found by phases 1-2).
-    /// Phase 7's COW support lifts this gate. Code 7.
+    /// `nb_snapshots != 0`, on a state built without
+    /// copy-on-write. In-place writes corrupt snapshot-shared
+    /// clusters (GitHub issues #420/#423), so the non-COW
+    /// envelope refuses snapshot-bearing images outright; a
+    /// COW-enabled caller ([`check_envelope_with`] with
+    /// `allow_snapshots`, [`new_state_cow`]) skips this gate.
+    /// Code 7.
     HasSnapshots,
     /// `version` is not 2 or 3. [`QcowHeader::parse`] cannot
     /// produce such a header; this defends direct struct
@@ -609,8 +625,8 @@ impl From<Gate> for u32 {
     }
 }
 
-/// Check the decision-8 write envelope against a parsed header,
-/// refusing snapshot-bearing images (the safe-by-default policy).
+/// Check the write envelope against a parsed header, refusing
+/// snapshot-bearing images (the safe-by-default policy).
 ///
 /// Pure header predicate, no I/O. Returns the first tripped
 /// [`Gate`] in a fixed check order (version, refcount width,
@@ -622,15 +638,15 @@ impl From<Gate> for u32 {
 ///
 /// This is the `allow_snapshots == false` specialisation of
 /// [`check_envelope_with`]; a caller that has copy-on-write
-/// support (phase 7) passes `true` there to relax
-/// [`Gate::HasSnapshots`] (decision 4b — the gate becomes a
-/// capability policy, not a hard refusal).
+/// support passes `true` there to relax [`Gate::HasSnapshots`]
+/// (the gate is a capability policy, not a hard refusal, so the
+/// crate stays safe by default for any non-COW caller).
 pub fn check_envelope(hdr: &QcowHeader) -> Result<(), Gate> {
     check_envelope_with(hdr, false)
 }
 
-/// [`check_envelope`] with the decision-4b copy-on-write
-/// capability made explicit.
+/// [`check_envelope`] with the copy-on-write capability made
+/// explicit.
 ///
 /// When `allow_snapshots` is `true` the [`Gate::HasSnapshots`]
 /// refusal is skipped: the caller undertakes to COW every
@@ -679,17 +695,17 @@ pub fn check_envelope_with(hdr: &QcowHeader, allow_snapshots: bool) -> Result<()
 
 /// Errors from the planning functions.
 ///
-/// Decision 9 (capacity semantics): capacity and classification
-/// refusals are clean but not byte-idempotent in v1.
-/// [`Self::RefcountExhausted`] — and any classification refusal
-/// below — can surface mid-plan after earlier windows executed;
-/// the image is left with the same semantics as today's ops:
-/// unreferenced scaffolding clusters may exist (their staged
-/// refcounts claimed but never flushed), no metadata was
-/// flushed, and the image is check-clean. Full byte-idempotence
-/// needs a worst-case pre-pass whose bound machinery arrives
-/// with phase 6's refcount-growth planner, so it is deferred
-/// there. After a refusal the in-flight request is abandoned
+/// Capacity semantics: capacity and classification refusals are
+/// clean but not byte-idempotent. [`Self::RefcountExhausted`] —
+/// and any classification refusal below — can surface mid-plan
+/// after earlier windows executed; the image is left with the
+/// same semantics as the hand-written ops had: unreferenced
+/// scaffolding clusters may exist (their staged refcounts
+/// claimed but never flushed), no metadata was flushed, and the
+/// image is check-clean. Full byte-idempotence would need a
+/// worst-case pre-pass over the whole request schedule before
+/// the first window executes; it is not implemented. After a
+/// refusal the in-flight request is abandoned
 /// ([`WriteState`] returns to idle); the steps already emitted
 /// into the window are safe to execute or to discard.
 ///
@@ -698,21 +714,24 @@ pub fn check_envelope_with(hdr: &QcowHeader, allow_snapshots: bool) -> Result<()
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteError {
     /// The current window is complete — either the step buffer
-    /// filled, or the planner emitted a
-    /// [`StepKind::LoadCluster`] whose bytes it needs (the
-    /// decision-5 protocol). NOT a failure: per decision 1 this
-    /// is the windowing resume signal — execute the emitted
-    /// steps, [`StepBuf::reset`], and call the planner again
-    /// with the same arguments; [`WriteState`] holds the resume
-    /// point, and the concatenated windows are identical to what
-    /// one unbounded buffer would have produced. Code 1.
+    /// filled, or the planner emitted a [`StepKind::LoadCluster`]
+    /// whose bytes it needs (the L2 window protocol). NOT a
+    /// failure: this is the windowing resume signal — execute the
+    /// emitted steps, [`StepBuf::reset`], and call the planner
+    /// again with the same arguments; [`WriteState`] holds the
+    /// resume point, and the concatenated windows are identical
+    /// to what one unbounded buffer would have produced. Code 1.
     BufFull,
-    /// Every staged refblock is full; v1 does not grow the
-    /// refcount table (decision 9 above; phase 6 moves bench's
-    /// growth planner in). Code 2.
+    /// Every staged refblock is full. The planner never grows
+    /// the refcount table itself: consumers grow it op-side
+    /// before planning (sized by the [`growth`] module), and
+    /// this refusal is the ceiling once that is exhausted (see
+    /// the capacity semantics above). Code 2.
     RefcountExhausted,
-    /// Retained from the phase-3a stubs for API stability; no
-    /// planning function returns it since 3b. Code 3.
+    /// Retained for API and wire-code stability (the planning
+    /// functions were stubs returning it before they were
+    /// implemented); no planning function returns it now.
+    /// Code 3.
     NotImplemented,
     /// The request runs past the virtual disk size (or past the
     /// active L1's coverage on a header whose L1 is too small
@@ -720,13 +739,13 @@ pub enum WriteError {
     /// overflowed. Refused before any step or state change.
     /// Code 4.
     OutOfBounds,
-    /// Planner-protocol misuse: a resumed call's arguments do
-    /// not match the in-flight request recorded in
-    /// [`WriteState`] (decision 1 requires resuming with the
-    /// SAME arguments), or [`plan_write`] / [`plan_flush`] was
-    /// called while the *other* planner holds the resume point.
-    /// The in-flight request is preserved so a correct resume
-    /// still succeeds. Code 5.
+    /// Planner-protocol misuse: a resumed call's arguments do not
+    /// match the in-flight request recorded in [`WriteState`]
+    /// (the windowing protocol requires resuming with the SAME
+    /// arguments), or [`plan_write`] / [`plan_flush`] was called
+    /// while the *other* planner holds the resume point. The
+    /// in-flight request is preserved so a correct resume still
+    /// succeeds. Code 5.
     ResumeMismatch,
     /// The [`StagedRegions`] slices do not match the geometry
     /// and [`StagingConfig`] (too short, refblocks not a whole
@@ -737,23 +756,24 @@ pub enum WriteError {
     /// Caller/staging bug, not an image classification. Code 6.
     StagedRegionsMismatch,
     /// Classification refusal: the write touches a compressed
-    /// cluster (decision 8 — per-cluster zlib compression
-    /// carries no header bit, so this is detected at plan time,
-    /// on encounter). Code 7.
+    /// cluster (compressed writes are outside the envelope, and
+    /// per-cluster zlib compression carries no header bit, so
+    /// this is detected at plan time, on encounter). Code 7.
     CompressedCluster,
     /// Classification refusal: the target data cluster is
     /// snapshot-shared — `OFLAG_COPIED` clear on an allocated L2
     /// entry, or a staged refcount above 1. Overwriting it in
-    /// place is the #420 corruption; phase 7's copy-on-write
-    /// lifts this. Unreachable through [`new_state`]'s
+    /// place is the #420 corruption. A COW-enabled state
+    /// ([`new_state_cow`]) copies the cluster instead; without
+    /// COW this is unreachable through [`new_state`]'s
     /// `nb_snapshots == 0` gate on consistent images, kept as
     /// defence in depth (bench's posture). Code 8.
     SnapshotShared,
     /// Classification refusal: the L2 *table* itself is
     /// snapshot-shared (`OFLAG_COPIED` clear on the allocated L1
     /// entry, or the L2 cluster's staged refcount above 1).
-    /// Patching it in place is the #421 corruption; phase 7
-    /// lifts this. Code 9.
+    /// Patching it in place is the #421 corruption; a
+    /// COW-enabled state copies the table instead. Code 9.
     SnapshotSharedL2Table,
     /// Classification refusal: an L1 entry carries bits outside
     /// `OFLAG_COPIED` and the L2-offset mask, or a misaligned or
@@ -763,28 +783,30 @@ pub enum WriteError {
     /// Classification refusal: an L2 entry carries an unknown
     /// bit pattern — a reserved bit, a flags-only entry with no
     /// offset, or a misaligned offset. (The v3 all-zeroes flag,
-    /// bit 0, is no longer refused here: decision 6 classifies a
-    /// zero-flag target by its host offset and refcount.) Code
-    /// 11.
+    /// bit 0, is not refused here: a zero-flag target is
+    /// classified by its host offset and refcount, as qemu
+    /// does.) Code 11.
     UnknownL2Entry,
     /// Classification refusal: an allocated entry whose target
     /// cluster has staged refcount zero — the image's refcounts
     /// are inconsistent and cannot anchor a safe write. Code 12.
     RefcountInconsistent,
     /// Classification refusal: the cluster's refcount lives
-    /// outside the staged refblock set, so the decision-6 owned
-    /// check cannot run. The executor stages every populated
-    /// refblock (bench's model); hitting this means the staging
-    /// was partial. Code 13.
+    /// outside the staged refblock set, so the owned check
+    /// (COPIED *and* staged refcount 1) cannot run. The executor
+    /// stages every populated refblock (bench's model); hitting
+    /// this means the staging was partial. Code 13.
     RefcountCoverage,
-    /// Classification refusal: a sub-cluster write would
-    /// allocate a fresh cluster in an image with a backing file,
-    /// where the uncovered remainder's virtual content comes
-    /// from the backing chain — a chain read the pure planner
-    /// cannot perform. v1 fills uncovered remainders with zeros,
-    /// which is only correct without a backing file; callers
-    /// with backing chains pass full clusters (phase 6) until
-    /// phase 7's COW machinery absorbs the fill.
+    /// Classification refusal: a sub-cluster write would allocate
+    /// a fresh cluster in an image with a backing file, where the
+    /// uncovered remainder's virtual content comes from the
+    /// backing chain — a chain read the pure planner cannot
+    /// perform. The planner fills uncovered remainders with
+    /// zeros, which is only correct without a backing file;
+    /// callers with backing chains perform the chain read
+    /// themselves and pass full clusters (bench resubmits a
+    /// chain-filled full cluster on this refusal; commit and
+    /// rebase always pass full clusters).
     ///
     /// Coverage is judged against the EFFECTIVE cluster end,
     /// `min(cluster_size, virtual_size - cluster_virtual_base)`:
@@ -792,9 +814,10 @@ pub enum WriteError {
     /// a write starting at the cluster base whose coverage
     /// reaches `virtual_size` is full coverage — bytes beyond
     /// EOV are not virtual content, so the crate's beyond-EOV
-    /// zero-fill is the correct pre-image regardless of backing
-    /// (`PLAN-qcow2-write-infrastructure-phase-04-commit.md`,
-    /// amended decision 7 / divergence D9). Every genuinely
+    /// zero-fill is the correct pre-image regardless of backing.
+    /// Without this, commit's clamped tail write on a
+    /// chained-backing image would refuse where qemu and the
+    /// pre-crate commit both succeed. Every genuinely
     /// partial write below EOV — including a head gap below EOV
     /// on the tail cluster — keeps this refusal. Code 14.
     NeedsBackingFill,
@@ -828,14 +851,13 @@ impl From<BufFull> for WriteError {
     }
 }
 
-/// Result of a completed planning call (decision 1).
+/// Result of a completed planning call.
 ///
 /// Returned when the *request* completed within the current
 /// window; a window that fills mid-request ends with
 /// [`WriteError::BufFull`] instead, with the resume point held
 /// in [`WriteState`] and the partial emission readable via
-/// [`StepBuf::emitted`]. Step 3b may extend this with resume
-/// diagnostics; 3a keeps the settled minimum.
+/// [`StepBuf::emitted`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Window {
     /// Steps emitted into the [`StepBuf`] by this call.
@@ -845,8 +867,8 @@ pub struct Window {
 /// Where the bytes of a [`plan_write`] come from.
 ///
 /// Abstracts "caller data region at offset" vs "fill pattern"
-/// (bench's patterned writes) so the phase 4-6 migrations don't
-/// bounce data twice (phase-3 plan, API sketch).
+/// (bench's patterned writes) so consumers never bounce data
+/// twice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataSource {
     /// Bytes live in [`RegionId::CallerData`] starting at this
@@ -863,11 +885,10 @@ pub enum DataSource {
 }
 
 // ---------------------------------------------------------------------------
-// Write state (decisions 5, 6)
+// Write state
 // ---------------------------------------------------------------------------
 
-/// Bookkeeping for one slot of the staged-L2 window
-/// (decision 5).
+/// Bookkeeping for one slot of the staged-L2 window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct L2Slot {
     /// Whether the slot holds a staged L2 table.
@@ -881,8 +902,7 @@ pub struct L2Slot {
     /// freshly allocated, not-yet-written L2).
     pub host_offset: u64,
     /// Value of the state's access counter at last touch;
-    /// eviction is deterministic LRU over this (decision 5 —
-    /// no clocks).
+    /// eviction is deterministic LRU over this (no clocks).
     pub last_access: u64,
 }
 
@@ -897,15 +917,14 @@ impl L2Slot {
 }
 
 /// Planner state threaded through [`plan_write`] /
-/// [`plan_flush`] calls (decision 1's resume point lives here).
+/// [`plan_flush`] calls (the windowing resume point lives here).
 ///
-/// Constructed only by [`new_state`], which runs the decision-8
-/// gates first — holding a `WriteState` is proof the image
-/// passed the envelope. Holds the derived [`Geometry`], the
-/// caller's [`StagingConfig`], the L2 window map (decision 5),
-/// the refblock dirty bitset (decision 6), the deterministic
-/// LRU access counter and the `snapshot` crate's allocator
-/// cursor (decision 10).
+/// Constructed only by [`new_state`] / [`new_state_cow`], which
+/// run the envelope gates first — holding a `WriteState` is
+/// proof the image passed the envelope. Holds the derived
+/// [`Geometry`], the caller's [`StagingConfig`], the L2 window
+/// map, the refblock dirty bitset, the deterministic LRU access
+/// counter and the `snapshot` crate's allocator cursor.
 pub struct WriteState {
     geometry: Geometry,
     config: StagingConfig,
@@ -916,10 +935,11 @@ pub struct WriteState {
     /// Whether the gated header carries a backing file
     /// reference (drives [`WriteError::NeedsBackingFill`]).
     has_backing: bool,
-    /// Whether copy-on-write is enabled (decision 4b): built by
+    /// Whether copy-on-write is enabled: built by
     /// [`new_state_cow`]. When `true`, a snapshot-shared data
-    /// cluster or L2 table classifies into COW emission (C1/C2)
-    /// instead of the [`WriteError::SnapshotShared`] /
+    /// cluster or L2 table classifies into data-cluster /
+    /// L2-table COW emission instead of the
+    /// [`WriteError::SnapshotShared`] /
     /// [`WriteError::SnapshotSharedL2Table`] refusal, which is
     /// kept as the safe-by-default (`false`) behaviour and as
     /// defence in depth.
@@ -928,21 +948,22 @@ pub struct WriteState {
     /// emitted); cleared by [`plan_flush`]'s L1 write-back.
     l1_dirty: bool,
     /// Non-barrier steps emitted since the last barrier, across
-    /// windows. [`plan_flush`] emits a barrier at a decision-7
-    /// contract point only when this is non-zero, so adjacent
-    /// barriers collapse deterministically (a stream-position
-    /// property, independent of the step-buffer size — the
-    /// window-invariance requirement).
+    /// windows. [`plan_flush`] emits a barrier at a
+    /// crash-ordering contract point only when this is non-zero,
+    /// so adjacent barriers collapse deterministically (a
+    /// stream-position property, independent of the step-buffer
+    /// size — the window-invariance requirement).
     steps_since_barrier: u64,
     /// Per-slot "a ZeroRegion for this slot was emitted in the
     /// CURRENT window and is not yet executed" bits: the slot's
     /// staged bytes are garbage until the executor runs the
     /// step, but their logical content is known-zero, so
     /// classification substitutes 0 instead of reading them.
-    /// Cleared at every planner-call entry (the decision-1 loop
-    /// guarantees the previous window was executed by then).
+    /// Cleared at every planner-call entry (the windowed
+    /// executor loop guarantees the previous window was executed
+    /// by then).
     slot_pending_zero: [u64; MAX_L2_SLOTS / 64],
-    /// Decision-1 resume point.
+    /// Windowing resume point.
     pending: Pending,
 }
 
@@ -968,7 +989,7 @@ impl WriteState {
     }
 
     /// Whether staged refblock `idx` diverges from disk
-    /// (decision 6; flushed by [`plan_flush`]). `false` above
+    /// (flushed by [`plan_flush`]). `false` above
     /// [`StagingConfig::max_refblocks`].
     pub fn refblock_dirty(&self, idx: usize) -> bool {
         if idx >= self.config.max_refblocks {
@@ -978,18 +999,18 @@ impl WriteState {
     }
 
     /// Monotonic access counter driving deterministic LRU
-    /// eviction (decision 5).
+    /// eviction.
     pub fn access_counter(&self) -> u64 {
         self.access_counter
     }
 
-    /// The `snapshot` crate's allocator cursor (decision 10).
+    /// The `snapshot` crate's allocator cursor.
     pub fn alloc_cursor(&self) -> &AllocCursor {
         &self.alloc_cursor
     }
 
     /// Whether copy-on-write is enabled for this state (built by
-    /// [`new_state_cow`]; decision 4b).
+    /// [`new_state_cow`]).
     pub fn cow_enabled(&self) -> bool {
         self.cow_enabled
     }
@@ -1000,7 +1021,7 @@ impl WriteState {
         self.l1_dirty
     }
 
-    // ----- internal window bookkeeping (decision 5) -----
+    // ----- internal L2 window bookkeeping -----
 
     /// Window slot currently staging the L2 table for `l1_idx`.
     fn find_slot(&self, l1_idx: u32) -> Option<usize> {
@@ -1008,7 +1029,7 @@ impl WriteState {
             .find(|&i| self.l2_slots[i].valid && self.l2_slots[i].l1_idx == l1_idx)
     }
 
-    /// Deterministic eviction choice (decision 5): the first
+    /// Deterministic eviction choice: the first
     /// invalid slot, else the least-recently-used valid slot
     /// (ties broken toward the lowest index). Pure over state,
     /// so a resumed call recomputes the same victim.
@@ -1027,8 +1048,8 @@ impl WriteState {
         best
     }
 
-    /// Bump the deterministic LRU clock for `idx` (decision 5 —
-    /// an access counter, no wall clocks). Called exactly once
+    /// Bump the deterministic LRU clock for `idx` (an access
+    /// counter, no wall clocks). Called exactly once
     /// per cluster group, when the group's slot becomes ready.
     fn touch(&mut self, idx: usize) {
         self.access_counter += 1;
@@ -1067,12 +1088,12 @@ impl WriteState {
     }
 }
 
-/// Build a [`WriteState`] for an image, running the decision-8
-/// envelope gates first.
+/// Build a [`WriteState`] for an image, running the envelope
+/// gates first.
 ///
 /// A gated image yields a typed refusal before any step can be
-/// emitted ("no mutation before envelope checks" — the phase-2
-/// deferral, honoured by construction). An out-of-range
+/// emitted, so a refused image is never mutated (by
+/// construction, not by caller discipline). An out-of-range
 /// [`StagingConfig`] refuses as [`Gate::InvalidStagingConfig`].
 /// On success all bookkeeping is zeroed: every L2 slot invalid,
 /// no refblock dirty, access counter zero and a default
@@ -1080,16 +1101,16 @@ impl WriteState {
 ///
 /// Snapshot-bearing images refuse here as [`Gate::HasSnapshots`];
 /// a caller with copy-on-write support uses [`new_state_cow`]
-/// instead (decision 4b).
+/// instead.
 pub fn new_state(hdr: &QcowHeader, cfg: &StagingConfig) -> Result<WriteState, Gate> {
     new_state_impl(hdr, cfg, false)
 }
 
-/// Build a copy-on-write [`WriteState`] (decision 4b): the
-/// envelope permits snapshot-bearing images
-/// ([`check_envelope_with`] with `allow_snapshots == true`), and
-/// snapshot-shared clusters classify into COW emission (C1/C2)
-/// rather than refusing. Every other envelope gate still applies.
+/// Build a copy-on-write [`WriteState`]: the envelope permits
+/// snapshot-bearing images ([`check_envelope_with`] with
+/// `allow_snapshots == true`), and snapshot-shared clusters
+/// classify into data-cluster / L2-table COW emission rather
+/// than refusing. Every other envelope gate still applies.
 pub fn new_state_cow(hdr: &QcowHeader, cfg: &StagingConfig) -> Result<WriteState, Gate> {
     new_state_impl(hdr, cfg, true)
 }
@@ -1124,12 +1145,13 @@ fn new_state_impl(
 }
 
 // ---------------------------------------------------------------------------
-// Planner internals (decision 1 resume machinery)
+// Planner internals (windowing resume machinery)
 // ---------------------------------------------------------------------------
 
 /// Micro-stage within the current cluster's emission group.
 ///
-/// Decision 1's window-invariance rests on this: every state
+/// Window-invariance (the emitted program is independent of the
+/// step-buffer size) rests on this: every state
 /// mutation (allocator claim, slot assignment, LRU touch, dirty
 /// bit) is tied to exactly one stage transition, and a stage
 /// advances only after its step (if any) was pushed. A
@@ -1149,7 +1171,7 @@ enum ClusterStage {
     /// ZeroRegion init is next.
     FreshAlloc,
     /// The fresh slot's ZeroRegion was emitted; the L1 patch is
-    /// next (decision 7(b): init before the referencing patch).
+    /// next (crash ordering: init before the referencing patch).
     FreshZeroed,
     /// The slot stages the right L2 table; classification runs.
     SlotReady,
@@ -1162,10 +1184,10 @@ enum ClusterStage {
     /// Body write emitted; the tail zero-fill is next.
     BodyDone,
     /// Tail zero-fill emitted (or not needed); the L2 patch that
-    /// makes the cluster reachable is next (decision 7(a): data
+    /// makes the cluster reachable is next (crash ordering: data
     /// before the patch).
     TailDone,
-    // ----- L2-table copy-on-write (C2, 7p-corrected) -----
+    // ----- L2-table copy-on-write -----
     /// The shared L2 table's replacement `T'` was allocated
     /// (`l2_host`, `cow_src` holds old `T`); the LoadCluster that
     /// copies old `T` into the window slot is next.
@@ -1178,7 +1200,7 @@ enum ClusterStage {
     /// window boundary so the load executes before the child is
     /// classified.
     CowL2Decrement,
-    // ----- data-cluster copy-on-write (C1) -----
+    // ----- data-cluster copy-on-write -----
     /// A fresh data cluster `D'` was allocated (`data_host`) to
     /// COW the shared `D` (`cow_src`); the pre-image
     /// establishment is next (zeros for a zero-flag source, a
@@ -1193,7 +1215,7 @@ enum ClusterStage {
     /// bytes is next.
     CowDataBody,
     /// The body write was emitted; the L2 patch to `D' | COPIED`
-    /// is next (decision 7(a): data before the patch).
+    /// is next (crash ordering: data before the patch).
     CowDataPatch,
     /// The L2 patch was emitted; the `rc(D)` decrement (a staged
     /// mutation, refcounts-last) closes the cluster.
@@ -1219,17 +1241,19 @@ struct WriteProgress {
     /// [`ClusterStage::DataAlloc`]).
     data_host: u64,
     /// The old (shared) cluster being copied-on-write — the data
-    /// cluster `D` for C1 or the L2 table `T` for C2 — whose
+    /// cluster `D` for data-cluster COW or the L2 table `T` for
+    /// L2-table COW — whose
     /// staged refcount is decremented at the end of the COW
     /// group. Valid from the COW stages.
     cow_src: u64,
     /// Whether the COWed data cluster's pre-image is all-zero (a
-    /// zero-flag source, decision 6) rather than the old
-    /// cluster's bytes. Valid in the data-COW stages.
+    /// zero-flag source) rather than the old cluster's bytes.
+    /// Valid in the data-COW stages.
     cow_zero_preimage: bool,
 }
 
-/// Flush emission stage (decision 7(c)-(d) skeleton).
+/// Flush emission stage (the refcounts-last, barrier-separated
+/// skeleton of the crash-ordering contract).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FlushStage {
     /// Barrier pinning the epoch's data writes (if any steps are
@@ -1237,12 +1261,13 @@ enum FlushStage {
     PreBarrier,
     /// Dirty L2 slot write-backs, ascending slot order.
     L2Writebacks,
-    /// Barrier before the L1 write (7(b) at flush granularity).
+    /// Barrier before the L1 write (a fresh L2's init precedes
+    /// the L1 entry that references it, at flush granularity).
     L1Barrier,
     /// Staged-L1 write-back.
     L1Write,
-    /// Barrier before the refcount write-backs (7(c):
-    /// refcounts last).
+    /// Barrier before the refcount write-backs (refcounts last,
+    /// after every pointer patch of the epoch).
     RbBarrier,
     /// Dirty refblock write-backs, ascending refblock order.
     RbWritebacks,
@@ -1258,7 +1283,8 @@ struct FlushProgress {
     next_idx: u32,
 }
 
-/// Which planner (if any) holds the decision-1 resume point.
+/// Which planner (if any) holds the resume point of the
+/// plan-a-window, execute, resume loop.
 #[derive(Debug, Clone, Copy)]
 enum Pending {
     Idle,
@@ -1296,7 +1322,7 @@ fn push_step(
     Ok(())
 }
 
-/// Emit a Durability barrier at a decision-7 contract point,
+/// Emit a Durability barrier at a crash-ordering contract point,
 /// unless no step was emitted since the last barrier (adjacent
 /// barriers collapse; empty groups emit nothing).
 fn barrier_if_needed(state: &mut WriteState, steps: &mut StepBuf<'_>) -> Result<(), WriteError> {
@@ -1383,7 +1409,7 @@ fn zero_range_step(disk_offset: u64, len: u64, dev: TargetDevice) -> Step {
 
 /// Read one cluster from `disk_offset` on `device` into
 /// [`RegionId::Bounce`] — the COW pre-image read of the old
-/// shared data cluster (C1).
+/// shared data cluster (data-cluster COW).
 fn read_cluster_to_bounce_step(disk_offset: u64, cs: u64, dev: TargetDevice) -> Step {
     Step {
         kind: StepKind::ReadCluster,
@@ -1397,7 +1423,8 @@ fn read_cluster_to_bounce_step(disk_offset: u64, cs: u64, dev: TargetDevice) -> 
 }
 
 /// Write the full [`RegionId::Bounce`] cluster back out to
-/// `disk_offset` — the COW pre-image copy `Bounce -> D'` (C1).
+/// `disk_offset` — the data-cluster COW pre-image copy
+/// `Bounce -> D'`.
 fn write_bounce_cluster_step(disk_offset: u64, cs: u64, dev: TargetDevice) -> Step {
     Step {
         kind: StepKind::WriteRange,
@@ -1476,8 +1503,8 @@ fn validate_staged(
 }
 
 /// Read the refcount of the cluster at host offset `host` from
-/// the staged refblocks (decision 6; `host` must be
-/// cluster-aligned — callers validate).
+/// the staged refblocks (`host` must be cluster-aligned —
+/// callers validate).
 fn read_staged_refcount(
     state: &WriteState,
     staged: &StagedRegions<'_>,
@@ -1501,9 +1528,10 @@ fn read_staged_refcount(
 }
 
 /// Allocate one fresh cluster from the staged refblocks via the
-/// `snapshot` crate's allocator (decision 10), which sets the
-/// claimed refcount to 1 in place (decision 6), and mark the
-/// covering refblock dirty for the refcounts-last flush.
+/// `snapshot` crate's allocator, which sets the claimed
+/// refcount to 1 in place in the single staged refblock copy,
+/// and mark the covering refblock dirty for the refcounts-last
+/// flush.
 fn alloc_cluster(
     state: &mut WriteState,
     staged: &mut StagedRegions<'_>,
@@ -1530,13 +1558,15 @@ fn alloc_cluster(
 
 /// Decrement the staged refcount of the cluster at host offset
 /// `host` by one — the copy-on-write bookkeeping the allocator
-/// does not expose (the allocator only ever increments; C1/C2).
+/// does not expose (the allocator only ever increments; both
+/// data-cluster and L2-table COW decrement the old cluster).
 ///
-/// Mirrors [`alloc_cluster`]'s single-staged-copy mutation
-/// (decision 6): the covering staged refblock is read, decremented
-/// through the `snapshot` scalar accessors, written back in place,
-/// and marked dirty so [`plan_flush`] writes it back last
-/// (decision 7(c), refcounts last). A decrement that would take
+/// Mirrors [`alloc_cluster`]'s single-staged-copy mutation: the
+/// covering staged refblock is read, decremented through the
+/// `snapshot` scalar accessors, written back in place, and
+/// marked dirty so [`plan_flush`] writes it back last (the
+/// crash-ordering contract's refcounts-last rule). A decrement
+/// that would take
 /// the refcount below zero is an image inconsistency
 /// ([`WriteError::RefcountInconsistent`], the same family as a
 /// staged-refcount-zero allocated entry) — never a silent wrap,
@@ -1581,15 +1611,15 @@ enum Classified {
     /// offset: overwrite in place, no metadata change.
     Owned(u64),
     /// A zero-flag entry with an allocated host offset and staged
-    /// refcount 1 (decision 6, 7p-corrected): reuse the host
-    /// cluster in place, but the eventual L2 patch clears the
-    /// zero flag (`host | COPIED`), and uncovered bytes are
-    /// zero-filled (the pre-image is logically zero). qemu does
-    /// NOT free the old offset, so neither do we.
+    /// refcount 1: reuse the host cluster in place, but the
+    /// eventual L2 patch clears the zero flag (`host | COPIED`),
+    /// and uncovered bytes are zero-filled (the pre-image is
+    /// logically zero). qemu does NOT free the old offset, so
+    /// neither do we.
     OwnedZero(u64),
-    /// A snapshot-shared cluster to copy-on-write (C1): the old
-    /// host `D`, and whether its pre-image is all-zero (a
-    /// zero-flag shared source, decision 6) rather than the old
+    /// A snapshot-shared cluster to copy-on-write (data-cluster
+    /// COW): the old host `D`, and whether its pre-image is
+    /// all-zero (a zero-flag shared source) rather than the old
     /// cluster's bytes. Only produced when [`WriteState`] is
     /// COW-enabled; otherwise the classifier refuses with
     /// [`WriteError::SnapshotShared`].
@@ -1601,9 +1631,8 @@ enum Classified {
     },
 }
 
-/// Classify one L2 entry (decision 8's plan-time refusals plus
-/// the owned check from the phase-3b brief: COPIED *and* staged
-/// refcount 1).
+/// Classify one L2 entry (the envelope's plan-time refusals plus
+/// the owned check: COPIED *and* staged refcount 1).
 fn classify_l2_entry(
     state: &WriteState,
     staged: &StagedRegions<'_>,
@@ -1617,15 +1646,18 @@ fn classify_l2_entry(
     }
     // Bits outside {COPIED, offset, the v3 zero flag} are
     // reserved and unknown; refuse them (the zero flag is now
-    // handled per decision 6 rather than refused wholesale).
+    // classified by host offset and refcount rather than refused
+    // wholesale).
     if entry & !(OFLAG_COPIED | L2_OFFSET_MASK | QCOW_OFLAG_ZERO) != 0 {
         return Err(WriteError::UnknownL2Entry);
     }
     let host = entry & L2_OFFSET_MASK;
     let cs = state.geometry.cluster_size;
     if entry & QCOW_OFLAG_ZERO != 0 {
-        // Zero-flag WRITE target (decision 6, 7p-corrected). qemu
-        // does NOT free the old offset.
+        // Zero-flag WRITE target. qemu does NOT free the old
+        // offset: it reuses an owned one and COWs a shared one, so
+        // allocating fresh here would leak the old cluster (rc 1,
+        // unreferenced: check-dirty) or skip a required COW.
         if host == 0 {
             // No allocation behind the flag: allocate fresh /
             // zero-fill, exactly like an unmapped entry.
@@ -1686,9 +1718,9 @@ enum L1Verdict {
     /// Owned, exclusively referenced L2 table at this host
     /// offset: patch and write it in place.
     Owned(u64),
-    /// A snapshot-shared L2 table to copy-on-write (C2): the old
-    /// host `T`. Only produced when [`WriteState`] is COW-enabled;
-    /// otherwise the classifier refuses with
+    /// A snapshot-shared L2 table to copy-on-write (L2-table
+    /// COW): the old host `T`. Only produced when [`WriteState`]
+    /// is COW-enabled; otherwise the classifier refuses with
     /// [`WriteError::SnapshotSharedL2Table`].
     CowL2(u64),
 }
@@ -1696,8 +1728,8 @@ enum L1Verdict {
 /// Validate an allocated L1 entry and classify the L2 table (the
 /// L2-table analogue of [`classify_l2_entry`]; the COPIED +
 /// refcount check here is what routed the #421-style shared-L2
-/// in-place patch to a refusal, and now routes it to C2 COW when
-/// COW is enabled).
+/// in-place patch to a refusal, and routes it to L2-table COW
+/// when COW is enabled).
 fn validate_l1_entry(
     state: &WriteState,
     staged: &StagedRegions<'_>,
@@ -1792,7 +1824,7 @@ fn drive_write(
                     let raw = read_u64_be(staged.l1, l1_idx as usize * 8);
                     if raw == 0 {
                         // Empty L1 slot: allocate a fresh L2
-                        // table (phase-3b brief).
+                        // table.
                         prog.l2_host = alloc_cluster(state, staged)?;
                         prog.stage = ClusterStage::FreshAlloc;
                     } else {
@@ -1809,27 +1841,28 @@ fn drive_write(
                                     last_access: last,
                                 };
                                 prog.stage = ClusterStage::Enter;
-                                // Decision-5 window protocol: the
-                                // slot's bytes exist only after
-                                // the executor runs the
-                                // LoadCluster, so close the window
-                                // here; the resumed call re-enters
-                                // via the window-hit path and
-                                // classifies real bytes.
+                                // L2 window protocol: the slot's
+                                // bytes exist only after the
+                                // executor runs the LoadCluster, so
+                                // close the window here; the
+                                // resumed call re-enters via the
+                                // window-hit path and classifies
+                                // real bytes.
                                 return Err(WriteError::BufFull);
                             }
                             L1Verdict::CowL2(old_l2_host) => {
-                                // L2-table COW (C2, 7p-corrected):
-                                // allocate T', copy old T into the
-                                // slot, re-point the slot and the
-                                // L1 at T', decrement rc(T), and
-                                // touch NO child refcount (the
-                                // children are already rc>=2 from
-                                // snapshot creation; a child bump
-                                // would corrupt to rc3). The
-                                // children keep COPIED clear, so a
-                                // write through T' into one fires
-                                // per-child data COW (C1/C3).
+                                // L2-table COW: allocate T', copy
+                                // old T into the slot, re-point the
+                                // slot and the L1 at T', decrement
+                                // rc(T), and touch NO child
+                                // refcount (the children are
+                                // already rc>=2 from snapshot
+                                // creation; a child bump would
+                                // corrupt to rc3). The children
+                                // keep COPIED clear, so a write
+                                // through T' into one fires
+                                // per-child data-cluster COW
+                                // (nested COW).
                                 prog.l2_host = alloc_cluster(state, staged)?;
                                 prog.cow_src = old_l2_host;
                                 prog.stage = ClusterStage::CowL2Load;
@@ -1852,10 +1885,10 @@ fn drive_write(
                     prog.stage = ClusterStage::FreshZeroed;
                 }
                 ClusterStage::FreshZeroed => {
-                    // Decision 7(b): the ZeroRegion init precedes
-                    // this L1 patch in the stream; on disk the
-                    // ordering holds because plan_flush writes
-                    // the L2 slots back before the L1.
+                    // Crash ordering: the ZeroRegion init
+                    // precedes this L1 patch in the stream; on
+                    // disk the ordering holds because plan_flush
+                    // writes the L2 slots back before the L1.
                     push_step(
                         state,
                         steps,
@@ -1887,23 +1920,22 @@ fn drive_write(
                             break 'cluster;
                         }
                         Classified::OwnedZero(host) => {
-                            // Zero-flag target, rc 1 (decision 6):
-                            // reuse the existing host cluster, but
-                            // treat it like a fresh allocation so
-                            // the uncovered head/tail are
-                            // zero-filled (the pre-image is
-                            // logically zero) and the L2 patch
-                            // clears the zero flag (host |
-                            // COPIED). No allocation, no refcount
-                            // change, and — unlike Unallocated —
-                            // no NeedsBackingFill refusal, because
-                            // the pre-image is zero regardless of
-                            // any backing chain.
+                            // Zero-flag target, rc 1: reuse the
+                            // existing host cluster, but treat it
+                            // like a fresh allocation so the
+                            // uncovered head/tail are zero-filled
+                            // (the pre-image is logically zero) and
+                            // the L2 patch clears the zero flag
+                            // (host | COPIED). No allocation, no
+                            // refcount change, and — unlike
+                            // Unallocated — no NeedsBackingFill
+                            // refusal, because the pre-image is
+                            // zero regardless of any backing chain.
                             prog.data_host = host;
                             prog.stage = ClusterStage::DataAlloc;
                         }
                         Classified::CowData { old, zero_preimage } => {
-                            // Data-cluster COW (C1): allocate D',
+                            // Data-cluster COW: allocate D',
                             // establish the pre-image, write the
                             // body, patch the L2 entry to D' |
                             // COPIED, then decrement rc(D). The
@@ -1917,25 +1949,25 @@ fn drive_write(
                         Classified::Unallocated => {
                             // Effective cluster end for coverage
                             // classification: the physical cluster
-                            // end, clamped to `virtual_size` on
-                            // the final (tail) cluster of an
-                            // unaligned image. A write from
-                            // in_off == 0 whose coverage reaches
-                            // it is FULL coverage — bytes beyond
-                            // EOV are not virtual content, so the
-                            // beyond-EOV zero-fill is the correct
-                            // pre-image regardless of backing
-                            // (phase-4 plan, amended decision 7 /
-                            // divergence D9). A head gap below
-                            // EOV on a backed image still
-                            // refuses: its pre-image is backing
-                            // content.
+                            // end, clamped to `virtual_size` on the
+                            // final (tail) cluster of an unaligned
+                            // image. A write from in_off == 0 whose
+                            // coverage reaches it is FULL coverage
+                            // — bytes beyond EOV are not virtual
+                            // content, so the beyond-EOV zero-fill
+                            // is the correct pre-image regardless
+                            // of backing (and commit's clamped tail
+                            // write on a chained-backing image
+                            // succeeds, as it does under qemu). A
+                            // head gap below EOV on a backed image
+                            // still refuses: its pre-image is
+                            // backing content.
                             let eff_end = cs.min(geo.virtual_size - (cur - in_off));
                             if state.has_backing && (in_off != 0 || in_off + win_len < eff_end) {
-                                // v1 fills uncovered below-EOV
-                                // remainders with zeros — only
-                                // correct without a backing chain
-                                // (see
+                                // The planner fills uncovered
+                                // below-EOV remainders with zeros —
+                                // only correct without a backing
+                                // chain (see
                                 // WriteError::NeedsBackingFill).
                                 return Err(WriteError::NeedsBackingFill);
                             }
@@ -1976,9 +2008,9 @@ fn drive_write(
                     prog.stage = ClusterStage::TailDone;
                 }
                 ClusterStage::TailDone => {
-                    // Decision 7(a): every write covering the
+                    // Crash ordering: every write covering the
                     // fresh cluster precedes this patch in the
-                    // stream.
+                    // stream (data before the pointer).
                     push_step(
                         state,
                         steps,
@@ -1994,12 +2026,12 @@ fn drive_write(
                     prog.stage = ClusterStage::Enter;
                     break 'cluster;
                 }
-                // ----- L2-table COW (C2) -----
+                // ----- L2-table COW -----
                 ClusterStage::CowL2Load => {
                     // Read old T into the window slot; the slot is
-                    // then aliased to the fresh T' so its
-                    // writeback (and the child's C1 patch) lands
-                    // in T', leaving old T intact for the snapshot.
+                    // then aliased to the fresh T' so its writeback
+                    // (and the child's data-COW patch) lands in T',
+                    // leaving old T intact for the snapshot.
                     push_step(state, steps, load_step(prog.slot, prog.cow_src, cs, dev))?;
                     let v = prog.slot as usize;
                     let last = state.l2_slots[v].last_access;
@@ -2027,18 +2059,22 @@ fn drive_write(
                     prog.stage = ClusterStage::CowL2Decrement;
                 }
                 ClusterStage::CowL2Decrement => {
-                    // rc(T) -= 1, NO child-refcount change (7p).
+                    // rc(T) -= 1, NO child-refcount change: qemu
+                    // already raised every child to rc>=2 at
+                    // snapshot creation, and copying T to T' only
+                    // redistributes the reference (net child delta
+                    // 0); a child bump would corrupt to rc3.
                     dec_refcount(state, staged, prog.cow_src)?;
                     prog.stage = ClusterStage::Enter;
-                    // Decision-5 window protocol: the slot's bytes
-                    // exist only after the executor runs the
-                    // LoadCluster above, so close the window; the
-                    // resumed call re-enters via the window-hit
-                    // path and classifies the (still
-                    // snapshot-shared) child, triggering C1.
+                    // L2 window protocol: the slot's bytes exist
+                    // only after the executor runs the LoadCluster
+                    // above, so close the window; the resumed call
+                    // re-enters via the window-hit path and
+                    // classifies the (still snapshot-shared) child,
+                    // triggering data-cluster COW.
                     return Err(WriteError::BufFull);
                 }
-                // ----- data-cluster COW (C1) -----
+                // ----- data-cluster COW -----
                 ClusterStage::CowDataEnter => {
                     let full = in_off == 0 && win_len == cs;
                     if full {
@@ -2046,9 +2082,9 @@ fn drive_write(
                         // needed (every byte is replaced).
                         prog.stage = ClusterStage::CowDataBody;
                     } else if prog.cow_zero_preimage {
-                        // Zero-flag source (decision 6): the
-                        // pre-image is all zero, so zero the fresh
-                        // D' and overlay the body.
+                        // Zero-flag source: the pre-image is all
+                        // zero, so zero the fresh D' and overlay
+                        // the body.
                         push_step(state, steps, zero_range_step(prog.data_host, cs, dev))?;
                         prog.stage = ClusterStage::CowDataBody;
                     } else {
@@ -2088,7 +2124,7 @@ fn drive_write(
                     prog.stage = ClusterStage::CowDataPatch;
                 }
                 ClusterStage::CowDataPatch => {
-                    // Decision 7(a): every write covering D'
+                    // Crash ordering: every write covering D'
                     // precedes this patch in the stream.
                     push_step(
                         state,
@@ -2104,7 +2140,7 @@ fn drive_write(
                     prog.stage = ClusterStage::CowDataDecrement;
                 }
                 ClusterStage::CowDataDecrement => {
-                    // rc(D) -= 1 (refcounts-last, decision 7(c)):
+                    // rc(D) -= 1 (crash ordering: refcounts last):
                     // the old D keeps the snapshot's reference.
                     dec_refcount(state, staged, prog.cow_src)?;
                     prog.consumed += win_len;
@@ -2219,11 +2255,11 @@ fn drive_flush(
 }
 
 // ---------------------------------------------------------------------------
-// Planners (decisions 1-7)
+// Planners
 // ---------------------------------------------------------------------------
 
 /// Plan "write `len` bytes of `data` at virtual offset `voff`"
-/// into the caller's step window (decisions 1-3, 5-7).
+/// into the caller's step window.
 ///
 /// Per-cluster classification (input L2 entry state → action):
 ///
@@ -2234,15 +2270,15 @@ fn drive_flush(
 /// | `OFLAG_COMPRESSED` set | [`WriteError::CompressedCluster`] |
 /// | reserved bits / flags-only / misaligned | [`WriteError::UnknownL2Entry`] |
 /// | zero flag, host == 0 | treated as `zero` above (allocate fresh) |
-/// | zero flag, host != 0, staged refcount 1 | owned-zero: reuse the host, zero-fill the uncovered head/tail, patch `host \| COPIED` (clears the zero flag; decision 6, no free of the old offset) |
-/// | zero flag, host != 0, staged refcount > 1 | COW-enabled: C1 with an all-zero pre-image; else [`WriteError::SnapshotShared`] |
-/// | allocated, `OFLAG_COPIED` clear | COW-enabled: C1 data-cluster COW; else [`WriteError::SnapshotShared`] |
+/// | zero flag, host != 0, staged refcount 1 | owned-zero: reuse the host, zero-fill the uncovered head/tail, patch `host \| COPIED` (clears the zero flag; no free of the old offset, matching qemu) |
+/// | zero flag, host != 0, staged refcount > 1 | COW-enabled: data-cluster COW with an all-zero pre-image; else [`WriteError::SnapshotShared`] |
+/// | allocated, `OFLAG_COPIED` clear | COW-enabled: data-cluster COW; else [`WriteError::SnapshotShared`] |
 /// | allocated, staged refcount 0 | [`WriteError::RefcountInconsistent`] |
-/// | allocated, staged refcount > 1 | COW-enabled: C1 data-cluster COW; else [`WriteError::SnapshotShared`] |
+/// | allocated, staged refcount > 1 | COW-enabled: data-cluster COW; else [`WriteError::SnapshotShared`] |
 /// | allocated, refcount not staged | [`WriteError::RefcountCoverage`] |
 /// | allocated, COPIED, refcount 1 | owned: overwrite in place, no metadata change |
 ///
-/// C1 data-cluster COW (COW-enabled state, [`new_state_cow`])
+/// Data-cluster COW (COW-enabled state, [`new_state_cow`])
 /// allocates a fresh `D'`, establishes the pre-image (a full copy
 /// of the old `D`, or zeros for a zero-flag source), writes the
 /// body, patches the L2 entry to `D' \| COPIED`, and decrements
@@ -2250,19 +2286,22 @@ fn drive_flush(
 ///
 /// The allocated L1 entry feeding the lookup passes the analogous
 /// checks first: an owned L2 table is loaded in place, a shared
-/// one triggers C2 L2-table COW when COW is enabled (copy `T` to a
+/// one triggers L2-table COW when COW is enabled (copy `T` to a
 /// fresh `T'`, re-point the L1 to `T' \| COPIED`, decrement
-/// `rc(T)`, leave child refcounts UNTOUCHED — 7p) or refuses with
+/// `rc(T)`, leave child refcounts UNTOUCHED — snapshot creation
+/// already raised every child to rc >= 2, so a child increment
+/// would corrupt them to rc 3) or refuses with
 /// [`WriteError::SnapshotSharedL2Table`] otherwise
 /// ([`WriteError::UnknownL1Entry`] for a malformed entry).
 ///
-/// Emission per allocating cluster follows decision 7: uncovered
-/// head zero-fill, body, uncovered tail zero-fill — all covering
-/// the fresh cluster — then the L2 patch (7(a)); a fresh L2's
-/// [`StepKind::ZeroRegion`] init precedes the L1 patch (7(b));
-/// no refcount write-back is emitted here (7(c) — the staged
-/// refblocks are mutated in place per decision 6 and flushed by
-/// [`plan_flush`]). The v1 fill for uncovered ranges is zeros,
+/// Emission per allocating cluster follows the crash-ordering
+/// contract: uncovered head zero-fill, body, uncovered tail
+/// zero-fill — all covering the fresh cluster — then the L2 patch
+/// (data before the pointer); a fresh L2's
+/// [`StepKind::ZeroRegion`] init precedes the L1 patch; no
+/// refcount write-back is emitted here (refcounts last — the
+/// staged refblocks are mutated in place and flushed by
+/// [`plan_flush`]). The fill for uncovered ranges is zeros,
 /// the virtual pre-image of an unallocated cluster in a
 /// backing-less image; images WITH a backing file refuse partial
 /// allocating writes as [`WriteError::NeedsBackingFill`] rather
@@ -2276,17 +2315,17 @@ fn drive_flush(
 /// up to `virtual_size` classifies as full coverage too — bytes
 /// beyond EOV are not virtual content, so the emitted beyond-EOV
 /// [`StepKind::ZeroRange`] is the correct pre-image regardless of
-/// backing (`PLAN-qcow2-write-infrastructure-phase-04-commit.md`,
-/// amended decision 7 / divergence D9).
+/// backing (this is what lets commit's clamped tail write succeed
+/// on a chained-backing image, as it does under qemu).
 ///
-/// Windowing (decision 1): on [`WriteError::BufFull`] — which
-/// also signals the decision-5 load boundary, see
-/// [`StagedRegions`] — the caller executes the emitted window,
-/// resets the buffer, and calls again with the SAME arguments;
-/// `state` holds the resume point and the concatenation across
-/// windows is invariant over the buffer size. The caller MUST
-/// execute each emitted window before the next planner call (the
-/// classification reads assume it).
+/// Windowing: on [`WriteError::BufFull`] — which also signals the
+/// L2 window's load boundary, see [`StagedRegions`] — the caller
+/// executes the emitted window, resets the buffer, and calls
+/// again with the SAME arguments; `state` holds the resume point
+/// and the concatenation across windows is invariant over the
+/// buffer size. The caller MUST execute each emitted window
+/// before the next planner call (the classification reads assume
+/// it).
 pub fn plan_write(
     state: &mut WriteState,
     staged: &mut StagedRegions<'_>,
@@ -2312,8 +2351,9 @@ pub fn plan_write(
         Pending::Write(p) => p,
         _ => {
             // Request admission: bounds-check before any step or
-            // state change (the phase-2 "no mutation before the
-            // checks" posture, applied to the request).
+            // state change (no mutation before the checks, the
+            // same posture as the envelope gates, applied to the
+            // request).
             let end = voff.checked_add(len).ok_or(WriteError::OutOfBounds)?;
             if end > state.geometry.virtual_size {
                 return Err(WriteError::OutOfBounds);
@@ -2342,7 +2382,7 @@ pub fn plan_write(
         }
     };
     // A planner call means the previous window was executed
-    // (decision-1 contract): pending slot inits are now real.
+    // (windowing contract): pending slot inits are now real.
     state.pending = Pending::Idle;
     state.pending_zero_clear_all();
     match drive_write(state, staged, &mut prog, steps) {
@@ -2359,9 +2399,8 @@ pub fn plan_write(
 
 /// Plan the end-of-epoch flush: write-backs for dirty L2 window
 /// slots (ascending slot order), the staged L1 if dirty, then
-/// the dirty refblocks (ascending, refcounts last — decision
-/// 7(c)), with Durability barriers at the decision-4/7(d)
-/// contract points.
+/// the dirty refblocks (ascending, refcounts last), with
+/// Durability barriers at the crash-ordering contract points.
 ///
 /// Emission skeleton (empty groups vanish, adjacent barriers
 /// collapse — both deterministic over the dirty state, never
@@ -2369,14 +2408,14 @@ pub fn plan_write(
 ///
 /// ```text
 /// [Barrier] WritebackCluster*  — pin data writes; dirty L2s
-/// [Barrier] WriteRange(L1)     — 7(b): L2 init durable first
-/// [Barrier] WriteRange(Refblocks)*  — 7(c): refcounts last
+/// [Barrier] WriteRange(L1)     — L2 init durable first
+/// [Barrier] WriteRange(Refblocks)*  — refcounts last
 /// [Barrier]                    — close the epoch
 /// ```
 ///
 /// All barriers are [`BarrierClass::Durability`]; executors on
 /// devices without an fsync primitive degrade them to Ordering
-/// (decision 4), which matches commit/rebase's current
+/// (see [`BarrierClass`]), which matches commit/rebase's current
 /// no-fsync reality. [`WriteError::BufFull`] resumes exactly
 /// like [`plan_write`].
 pub fn plan_flush(
@@ -2459,8 +2498,9 @@ mod tests {
 
     #[test]
     fn step_size_within_48_byte_budget() {
-        // Decision 2: fixed size, ≤ 48 bytes (also enforced at
-        // compile time by the `const` assertion above).
+        // Fixed size, ≤ 48 bytes so a 64 KiB buffer holds 1300+
+        // steps (also enforced at compile time by the `const`
+        // assertion above).
         assert!(core::mem::size_of::<Step>() <= STEP_SIZE_LIMIT);
     }
 
@@ -2487,7 +2527,7 @@ mod tests {
         assert_eq!(buf.remaining(), 0);
 
         // Full: push refuses and leaves the emitted prefix
-        // intact (decision 1's resume protocol).
+        // intact (the windowing resume protocol relies on it).
         assert_eq!(buf.push(step(StepKind::ReadCluster)), Err(BufFull));
         assert_eq!(buf.emitted(), 3);
         assert_eq!(
@@ -2592,7 +2632,8 @@ mod tests {
         assert_eq!(check_envelope(&clean_header()), Ok(()));
         // Refuse: the zstd compression-type bit and an unknown
         // future bit (per-cluster zlib compression carries no
-        // header bit — that refusal is classification-time, 3b).
+        // header bit — that refusal is classification-time, in
+        // plan_write).
         for bits in [qcow2::INCOMPAT_COMPRESSION, 1u64 << 60] {
             let mut h = header_bytes(3);
             h[72..80].copy_from_slice(&bits.to_be_bytes());
@@ -2653,8 +2694,9 @@ mod tests {
     fn envelope_snapshots_gate() {
         // Accept: nb_snapshots == 0 via the clean header.
         assert_eq!(check_envelope(&clean_header()), Ok(()));
-        // Refuse: v1 has no COW; phase 7 lifts this (issues
-        // #420/#423 are what the gate prevents).
+        // Refuse: the non-COW envelope rejects snapshot-bearing
+        // images (issues #420/#423 are what the gate prevents);
+        // check_envelope_with(.., true) lifts it for COW callers.
         let mut h = header_bytes(3);
         h[60..64].copy_from_slice(&1u32.to_be_bytes());
         assert_eq!(check_envelope(&parse(&h)), Err(Gate::HasSnapshots));
@@ -2712,9 +2754,8 @@ mod tests {
 
     #[test]
     fn new_state_refuses_gated_image() {
-        // Gates run before any state exists (decision 8; the
-        // phase-2 "no mutation before envelope checks" deferral
-        // honoured by construction).
+        // Gates run before any state exists, so a refused image
+        // is never mutated (honoured by construction).
         let mut h = header_bytes(3);
         h[60..64].copy_from_slice(&1u32.to_be_bytes()); // nb_snapshots = 1
         assert_eq!(
@@ -2780,8 +2821,9 @@ mod tests {
     #[test]
     fn alloc_write_full_cluster_emission_shape() {
         // Empty image, one full-cluster write: fresh L2 (cluster
-        // 4) + fresh data cluster (5), emission order per
-        // decision 7 (a)-(b).
+        // 4) + fresh data cluster (5), emission order per the
+        // crash-ordering contract (data before the L2 patch, L2
+        // init before the L1 patch).
         let (mut img, mut st) = mk(12, 2, false);
         let cs = img.cs as u64;
         let steps = run_write_ok(&mut img, &mut st, 0, cs, caller_data(), 64);
@@ -2797,11 +2839,13 @@ mod tests {
         // Fresh L2 slot init.
         assert_eq!(steps[0].region, RegionId::L2Slot(0));
         assert_eq!(steps[0].len, cs);
-        // 7(b): L2 init precedes the L1 patch referencing it.
+        // Crash ordering: L2 init precedes the L1 patch
+        // referencing it.
         assert_eq!(steps[1].region, RegionId::L1);
         assert_eq!(steps[1].region_offset, 0);
         assert_eq!(steps[1].value, 4 * cs | OFLAG_COPIED);
-        // Data write, then 7(a): the L2 patch last.
+        // Data write, then the L2 patch last (data before the
+        // pointer).
         assert_eq!(steps[2].region, RegionId::CallerData);
         assert_eq!(steps[2].region_offset, 0);
         assert_eq!(steps[2].disk_offset, 5 * cs);
@@ -2809,7 +2853,7 @@ mod tests {
         assert_eq!(steps[3].region, RegionId::L2Slot(0));
         assert_eq!(steps[3].region_offset, 0);
         assert_eq!(steps[3].value, 5 * cs | OFLAG_COPIED);
-        // Refcounts mutated in place (decision 6), dirty bits set.
+        // Refcounts mutated in place, dirty bits set.
         assert_eq!(rc_of(&img, 4), 1);
         assert_eq!(rc_of(&img, 5), 1);
         assert_eq!(rc_of(&img, 6), 0);
@@ -2829,7 +2873,7 @@ mod tests {
 
     #[test]
     fn owned_overwrite_load_boundary_then_in_place_write() {
-        // Allocated + owned (COPIED, refcount 1): the decision-5
+        // Allocated + owned (COPIED, refcount 1): the L2 window
         // protocol loads the L2 through a forced window
         // boundary, then overwrites in place with no metadata
         // change.
@@ -2868,9 +2912,9 @@ mod tests {
         // expected refusal).
         let cs = 1u64 << 12;
         // A non-COW state: snapshot-shared clusters still refuse.
-        // (The v3 zero flag, entry bit 0, is no longer refused —
-        // decision 6 classifies it by host+refcount; covered in
-        // the zero-flag-target tests below.)
+        // (The v3 zero flag, entry bit 0, is not refused — a
+        // zero-flag target is classified by host+refcount; covered
+        // in the zero-flag-target tests below.)
         let rows: [(u64, u64, WriteError); 7] = [
             (5 * cs | OFLAG_COMPRESSED, 1, WriteError::CompressedCluster),
             (5 * cs, 1, WriteError::SnapshotShared), // COPIED clear
@@ -2963,17 +3007,19 @@ mod tests {
         assert_eq!(kinds(&steps), vec![StepKind::WriteRange]);
     }
 
-    // ---------------- EOV tail cluster (amended decision 7 / D9) ----------------
+    // ---------------- EOV tail cluster ----------------
 
     #[test]
     fn eov_tail_write_classifies_full_coverage() {
-        // Phase-4 plan, amended decision 7: on the final (tail)
-        // cluster of an unaligned virtual size, a partial
-        // allocating write from the cluster base whose coverage
-        // reaches virtual_size classifies as FULL coverage on
-        // backed and backing-less images alike, and the crate
-        // zero-fills the beyond-EOV remainder to the physical
-        // cluster end.
+        // On the final (tail) cluster of an unaligned virtual
+        // size, a partial allocating write from the cluster base
+        // whose coverage reaches virtual_size classifies as FULL
+        // coverage on backed and backing-less images alike, and
+        // the crate zero-fills the beyond-EOV remainder to the
+        // physical cluster end. Bytes beyond EOV are not virtual
+        // content, so this is correct regardless of backing, and
+        // it is what lets commit's clamped tail write succeed on
+        // a chained-backing image.
         for backed in [false, true] {
             for cluster_bits in [9u32, 16] {
                 let cs = 1u64 << cluster_bits;
@@ -3014,9 +3060,10 @@ mod tests {
 
     #[test]
     fn eov_tail_refusal_boundaries_on_backed_image() {
-        // The amended-decision-7 rule only exempts the beyond-EOV
-        // remainder: every genuinely partial write below EOV on a
-        // backed image keeps the NeedsBackingFill refusal.
+        // Only the remainder beyond EOV is exempt from backing
+        // fill (the backing has nothing to contribute there):
+        // every genuinely partial write below EOV on a backed
+        // image keeps the NeedsBackingFill refusal.
         for cluster_bits in [9u32, 16] {
             let cs = 1u64 << cluster_bits;
             let tail_len = cs / 2 + 24;
@@ -3199,8 +3246,8 @@ mod tests {
                 StepKind::PatchEntryU64,
             ]
         );
-        // Caller-data continuity across the split (decision 1's
-        // consumed-offset bookkeeping).
+        // Caller-data continuity across the split (the resume
+        // machinery's consumed-offset bookkeeping).
         assert_eq!(steps[3].region_offset, 0);
         assert_eq!(steps[3].disk_offset, 5 * cs + (cs - 100));
         assert_eq!(steps[3].len, 100);
@@ -3380,11 +3427,12 @@ mod tests {
 
     #[test]
     fn window_invariance_across_buffer_sizes() {
-        // Decision 1: the concatenated emission is identical for
-        // every step-buffer size, including a pathological
-        // 1-step buffer that splits every cluster group at every
-        // possible point (step 3c pins this property over a much
-        // larger grid; this is the 3b anchor).
+        // Window-invariance: the concatenated emission is
+        // identical for every step-buffer size, including a
+        // pathological 1-step buffer that splits every cluster
+        // group at every possible point (tests/ordering.rs pins
+        // this property over a much larger grid; this is the
+        // in-crate anchor).
         let reference = invariance_scenario(128);
         for cap in [1usize, 2, 3, 5, 7] {
             let got = invariance_scenario(cap);
@@ -3533,11 +3581,12 @@ mod tests {
 
     #[test]
     fn refcount_arithmetic_hand_computed_across_cluster_sizes() {
-        // The phase-3b brief's matrix: 512 B, 4 KiB, 64 KiB and
-        // 2 MiB clusters. A 3-cluster write on an empty image
-        // claims cluster 4 (fresh L2) and clusters 5-7 (data);
-        // every refcount expectation below is hand-computed
-        // against the 16-bit big-endian refblock layout.
+        // Cluster sizes from the 512 B minimum to the 2 MiB
+        // maximum: 512 B, 4 KiB, 64 KiB and 2 MiB. A 3-cluster
+        // write on an empty image claims cluster 4 (fresh L2) and
+        // clusters 5-7 (data); every refcount expectation below
+        // is hand-computed against the 16-bit big-endian refblock
+        // layout.
         for cluster_bits in [9u32, 12, 16, 21] {
             let (mut img, mut st) = mk(cluster_bits, 1, false);
             let cs = img.cs as u64;
@@ -3599,9 +3648,10 @@ mod tests {
             .expect_err("full refblocks must refuse");
         assert_eq!(err, WriteError::RefcountExhausted);
         assert!(steps.is_empty(), "no allocation possible, nothing emitted");
-        // Decision-9 shape: with exactly ONE free entry the
-        // fresh L2 claims it and the data allocation fails,
-        // leaving claimed-but-unflushed scaffolding.
+        // Capacity refusals are clean but not byte-idempotent:
+        // with exactly ONE free entry the fresh L2 claims it and
+        // the data allocation fails, leaving claimed-but-unflushed
+        // scaffolding.
         let (mut img, mut st) = mk(12, 1, false);
         for c in 0..(img.cs as u64 * 8 / 16) {
             set_rc(&mut img, c, 1);
@@ -3617,7 +3667,7 @@ mod tests {
         assert_eq!(
             rc_of(&img, 4),
             1,
-            "scaffolding L2 stays claimed (decision 9)"
+            "scaffolding L2 stays claimed (capacity refusals are not byte-idempotent)"
         );
     }
 
@@ -3643,7 +3693,7 @@ mod tests {
                 durability,
                 StepKind::WriteRange, // L1
                 durability,
-                StepKind::WriteRange, // refblock 0 (refcounts last, 7(c))
+                StepKind::WriteRange, // refblock 0 (refcounts last)
                 durability,
             ]
         );
@@ -3963,15 +4013,16 @@ mod tests {
     }
 
     // =====================================================================
-    // Phase 7 copy-on-write (C1-C4), the decision-6 zero-flag WRITE
-    // target, and the refcount-decrement guard. The `mk`/`exec`/
+    // Copy-on-write (data-cluster, L2-table, nested, and its crash
+    // ordering), the zero-flag WRITE target, and the
+    // refcount-decrement guard. The `mk`/`exec`/
     // `run_write`/`run_flush` harness above is the simulation: it applies
     // every emitted step to the Vec-backed image, so each test's post-state
     // assertions (refcounts, COPIED flags, snapshot clusters intact,
     // structural validity) verify the schedule end to end.
     // =====================================================================
 
-    // ---------------- capability (decision 4b) ----------------
+    // ---------------- COW envelope capability ----------------
 
     #[test]
     fn cow_envelope_capability_relaxes_only_snapshots() {
@@ -4025,7 +4076,7 @@ mod tests {
         let _ = run_write_ok(&mut img, &mut st, 0, cs, caller_data(), 64);
     }
 
-    // ---------------- C1: data-cluster COW ----------------
+    // ---------------- data-cluster COW ----------------
 
     #[test]
     fn cow_data_full_cluster_c1() {
@@ -4092,7 +4143,7 @@ mod tests {
         assert_eq!(rc_of(&img, 6), 1);
     }
 
-    // ---------------- C2: L2-table COW, NO child increment ----------------
+    // ---------------- L2-table COW, NO child increment ----------------
 
     #[test]
     fn cow_l2_table_no_child_increment_c2() {
@@ -4108,7 +4159,7 @@ mod tests {
         // rc 2 — the L2-COW did NOT increment it.
         assert_eq!(rc_of(&img, 6), 2);
         // Child 0 (cluster 5), the write target, drops 2->1 (its own
-        // C1 data COW; active no longer shares it).
+        // data-cluster COW; active no longer shares it).
         assert_eq!(rc_of(&img, 5), 1);
         // Old T (cluster 4) decremented 2->1 (the snapshot keeps it).
         assert_eq!(rc_of(&img, 4), 1);
@@ -4125,7 +4176,7 @@ mod tests {
         assert_eq!(disk_u64(&img, 7 * img.cs + 8), 6 * cs);
     }
 
-    // ---------------- C3: nested COW in one write ----------------
+    // ---------------- nested COW in one write ----------------
 
     #[test]
     fn cow_nested_l2_then_data_c3() {
@@ -4160,7 +4211,7 @@ mod tests {
         assert!(img.disk[5 * cs..6 * cs].iter().all(|&b| b == 0xCD));
     }
 
-    // ---------------- C4: crash ordering ----------------
+    // ---------------- crash ordering ----------------
 
     #[test]
     fn cow_crash_ordering_c4() {
@@ -4172,11 +4223,11 @@ mod tests {
         let cs = img.cs as u64;
         add_shared_l2_two_children(&mut img);
         let write = run_write_ok(&mut img, &mut st, 0, cs, caller_data(), 128);
-        // plan_write emits NO refcount write-backs (decision 6: the
-        // staged refblocks are mutated in place, flushed last).
+        // plan_write emits NO refcount write-backs (the staged
+        // refblocks are mutated in place, flushed last).
         assert!(write.iter().all(|s| s.region != RegionId::Refblocks));
         // Within the write, every data write to D0' precedes the L2
-        // patch that publishes it (decision 7(a)).
+        // patch that publishes it (data before the pointer).
         let last_data = write
             .iter()
             .rposition(|s| s.kind == StepKind::WriteRange && s.region != RegionId::L1)
@@ -4217,12 +4268,12 @@ mod tests {
         assert_eq!(flush[last_nonbarrier].region, RegionId::Refblocks);
     }
 
-    // ---------------- decision 6: zero-flag WRITE target ----------------
+    // ---------------- zero-flag WRITE target ----------------
 
     #[test]
     fn zero_flag_target_host_zero_allocates() {
         // host == 0 zero-flag entry: classify Unallocated, allocate
-        // a fresh cluster (decision 6). Non-COW state suffices.
+        // a fresh cluster. Non-COW state suffices.
         let (mut img, mut st) = mk(12, 2, false);
         let cs = img.cs as u64;
         let c4 = 4 * img.cs;
@@ -4357,7 +4408,7 @@ mod tests {
     #[test]
     fn cow_decrement_underflow_is_inconsistent() {
         // A COPIED-clear entry pointing at a cluster with staged
-        // refcount 0 is an inconsistent image: the C1 decrement
+        // refcount 0 is an inconsistent image: the data-COW decrement
         // would underflow. The guard surfaces RefcountInconsistent
         // rather than wrapping. The shared cluster (7) sits above
         // the free clusters (5, 6) so the allocator does not reuse

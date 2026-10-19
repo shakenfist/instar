@@ -1,10 +1,11 @@
-//! Simulation harness for the write planner (phase 8a lift).
+//! Simulation harness for the write planner.
 //!
 //! A minimal executor over Vec-backed staging + disk, mirroring what
-//! the phase 4-6 guest ops do with the emitted programs. This module
-//! was lifted **verbatim** out of the crate's `#[cfg(test)] mod tests`
-//! so both the in-crate unit tests and the `fuzz_qcow2_write`
-//! cargo-fuzz target can drive [`plan_write`]/[`plan_flush`] through
+//! the commit, rebase and bench guest ops do with the emitted
+//! programs (via `qcow2-write-exec`). This module was lifted
+//! **verbatim** out of the crate's `#[cfg(test)] mod tests` so both
+//! the in-crate unit tests and the `fuzz_qcow2_write` cargo-fuzz
+//! target can drive [`plan_write`]/[`plan_flush`] through
 //! the same `BufFull`-resume loop and assert the same invariants
 //! (refcounts, COPIED flags, snapshot-cluster preservation). It is a
 //! pure move: the unit tests import it via `use super::sim::*` and
@@ -93,8 +94,11 @@ pub fn mk(cluster_bits: u32, l2_slots: usize, backing: bool) -> (TestImg, WriteS
 }
 
 /// [`mk`] with an explicit `virtual_size` (still `l1_size` =
-/// 4): the EOV-tail tests need unaligned sizes (the phase-4
-/// plan's amended decision 7).
+/// 4): the EOV-tail tests need unaligned sizes, because a
+/// partial allocating write that reaches an unaligned
+/// `virtual_size` classifies as full coverage (bytes past EOV
+/// are not virtual content, so zero-fill is the correct
+/// pre-image).
 pub fn mk_vs(
     cluster_bits: u32,
     l2_slots: usize,
@@ -239,7 +243,7 @@ pub fn exec(img: &mut TestImg, steps: &[Step]) {
     }
 }
 
-/// The decision-1 executor loop for one write request:
+/// The windowed executor loop for one write request:
 /// plan / execute / reset until `Ok` or a real error.
 /// Returns the concatenated program (all windows in order).
 pub fn run_write(
@@ -342,7 +346,8 @@ pub fn caller_data() -> DataSource {
 }
 
 // =====================================================================
-// Phase 7 copy-on-write (C1-C4) fixtures + assertion helpers. The
+// Copy-on-write fixtures + assertion helpers (data-cluster COW,
+// L2-table COW, nested COW, and their write ordering). The
 // `mk`/`exec`/`run_write`/`run_flush` harness above is the simulation:
 // it applies every emitted step to the Vec-backed image, so each
 // test's/target's post-state assertions (refcounts, COPIED flags,

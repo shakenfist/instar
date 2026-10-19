@@ -1,18 +1,12 @@
 //! QCOW2-specific resize planning.
 //!
-//! Phase 2 of `PLAN-resize.md`. The public entry point
+//! The public entry point
 //! [`plan_resize_qcow2`](super::plan_resize_qcow2) in the crate
-//! root dispatches into [`plan_grow`] here, which decides on a
+//! root dispatches into [`plan_grow`] here, which hands shrink
+//! requests to the shrink planner and otherwise decides on a
 //! [`Qcow2GrowAction`] and emits a [`ResizePlan`] of patches in
 //! the documented crash-safety order (prepare → header → cleanup).
 
-// Step 2c wires the L1AndRefcountGrow path and Preallocation::Metadata
-// support; until then the helpers that only those paths need are
-// dead-code-flagged below at their definitions.
-
-// build_l1_table / build_refcount_block / build_refcount_table
-// land as imports in step 2c when the L1AndRefcountGrow path
-// needs them.
 use qcow2::create::{
     build_header, compute_layout, BuildHeaderOptions, Preallocation as Qcow2CreatePreallocation,
     Qcow2CreateError, Qcow2Layout,
@@ -399,9 +393,11 @@ fn add_l1_and_refcount_growth_blocks(
 
 /// Plan a qcow2 resize.
 ///
-/// Phase 2b implements the HeaderOnly and L1Grow flavours;
-/// L1AndRefcountGrow returns [`ResizeError::ScratchTooSmall`]
-/// until step 2c lands the full algorithm.
+/// Shrink requests (with `allow_shrink`) go to the shrink
+/// planner; grow requests are classified into HeaderOnly, L1Grow
+/// or L1AndRefcountGrow and planned accordingly.
+/// `Preallocation::Metadata` is not yet supported and is rejected
+/// with [`ResizeError::PreallocationUnsupported`].
 pub(crate) fn plan_grow<'a>(
     opts: &Qcow2ResizeOpts<'_>,
     scratch: &'a mut [u8],
@@ -421,7 +417,8 @@ pub(crate) fn plan_grow<'a>(
         return Ok(ResizePlan::new(ResizeAction::NoOp, opts.current_file_size));
     }
     if opts.preallocation == Preallocation::Metadata {
-        // 2c lifts this gate after the metadata layer lands.
+        // Metadata preallocation on grow is not yet implemented
+        // (see PLAN-resize.md's future-work list).
         return Err(ResizeError::PreallocationUnsupported);
     }
     if opts.extended_l2 && opts.preallocation != Preallocation::Off {
@@ -563,10 +560,10 @@ fn plan_header_only<'a>(
 /// For the rare edge case where an existing refcount block holds
 /// both increment (new-L1) and decrement (old-L1) entries (small
 /// images where new and old L1 share a block), the planner emits
-/// TWO patches for that block: one in phase 2 with only the
-/// increment applied, one in phase 4 with both applied. This keeps
-/// the crash-safety invariant intact at the cost of one extra
-/// write per overlapping block.
+/// TWO patches for that block: one at patch step 2 with only the
+/// increment applied, one at patch step 4 with both applied. This
+/// keeps the crash-safety invariant intact at the cost of one
+/// extra write per overlapping block.
 fn plan_l1_grow<'a>(
     opts: &Qcow2ResizeOpts<'_>,
     target_layout: &Qcow2Layout,
@@ -1363,8 +1360,12 @@ fn plan_shrink<'a>(
     let cluster_size_us = opts.cluster_size as usize;
     let cluster_bits = cluster_bits_from(opts.cluster_size)?;
 
-    // Round down to cluster boundary per the phase plan's
-    // open question 1.
+    // Round down to a cluster boundary so the walk below only ever
+    // discards whole clusters. The rounded size is what lands in the
+    // header (pinned by `shrink_rounds_down_to_cluster_boundary`).
+    // This was meant to match qemu, but qemu-img 10.0.13 keeps the
+    // exact requested size instead (10M shrunk to 5M + 4096 reports
+    // 5246976, not a 64 KiB multiple); see #791.
     let new_virtual_size = (opts.new_virtual_size / cluster_size) * cluster_size;
     if new_virtual_size < cluster_size {
         // Minimum one cluster of virtual size; smaller asks
@@ -1924,9 +1925,10 @@ fn block_offset_in_file(refcount_table_bytes: &[u8], idx: u64) -> Result<u64, Re
 /// to `value` (currently only 0 or 1 are used). Handles every
 /// permitted refcount width.
 ///
-/// **Phase 5 of PLAN-snapshot lifted the bit-level body** into
-/// the new `snapshot` crate as `set_refcount_in_block`. This
-/// thin wrapper keeps the resize-side signature
+/// **The bit-level body lives in the `snapshot` crate** as
+/// `set_refcount_in_block`, shared with the snapshot planners
+/// so both edit refcount blocks identically. This thin wrapper
+/// keeps the resize-side signature
 /// (`refcount_bits: u8`, [`ResizeError`] return type) so the
 /// 14 existing call sites compile unchanged. The new home is
 /// authoritative; do not edit the bit-level logic here.

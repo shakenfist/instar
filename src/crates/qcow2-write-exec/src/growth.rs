@@ -8,20 +8,21 @@
 //! materializing every provisioned refblock (#433), and running the
 //! data-first / fsync / header-flip / old-RT-free dance in write order.
 //!
-//! Moved verbatim (behaviour byte-identical) out of
-//! `src/operations/bench` by phase 7 (settled decision 5, mechanism A)
-//! of `docs/plans/PLAN-qcow2-write-infrastructure-phase-07-cow.md`,
-//! generalized so `commit`/`rebase` can reuse it. Two mechanical
-//! generalizations make it region-agnostic:
+//! This code began as bench's private growth routine and was moved
+//! here verbatim (behaviour byte-identical, as a guest-op module rather
+//! than a change to the pure planner crate) so that `commit` and
+//! `rebase` can grow refcounts during copy-on-write without a second
+//! implementation. Two mechanical generalizations make it
+//! region-agnostic:
 //!
 //! - **the target device is a parameter** ([`TargetDevice`]) — bench
-//!   passes `Input0`, commit/rebase will pass `Output`. All writes go
+//!   passes `Input0`, commit/rebase pass `Output`. All writes go
 //!   through [`crate::write_bytes`] and all durability fsyncs through
 //!   [`crate::DeviceIo::fsync`], so the census follows the device's
 //!   fsync capability exactly (a fsync-capable `Input0` performs REAL
-//!   fsyncs; an `Output` with no primitive degrades to ordering — the
-//!   phase-4 divergence D8 policy, identical to the executor's
-//!   `BarrierClass::Durability`).
+//!   fsyncs; an `Output` with no fsync primitive degrades to ordering,
+//!   which keeps commit/rebase at the zero fsyncs they always issued —
+//!   the same policy as the executor's `BarrierClass::Durability`).
 //! - **the scratch buffers are borrowed slices** ([`GrowthBuffers`]) —
 //!   the staged refcount table, the staged refblocks, and one RMW
 //!   sector. The op carves them from its own scratch (bench's
@@ -198,11 +199,12 @@ fn flush_dirty_refblocks(
 /// Mirrors the executor's `BarrierClass::Durability` policy (crate
 /// docs, policy (e)) so the census is region-agnostic: a fsync-capable
 /// device performs a REAL fsync (`Some(true)`); a device with no fsync
-/// primitive degrades to ordering (`None`) and succeeds silently
-/// (divergence D8); a fsync that runs and reports failure
-/// (`Some(false)`) is a hard error. bench passes a fsync-ENABLED
-/// `Input0`, so every growth fsync here is REAL — the phase-6 census (1
-/// in-place / 2 relocation) is preserved exactly.
+/// primitive degrades to ordering (`None`) and succeeds silently, as
+/// commit/rebase on `Output` always have; a fsync that runs and reports
+/// failure (`Some(false)`) is a hard error. bench passes a
+/// fsync-ENABLED `Input0`, so every growth fsync here is REAL — bench's
+/// growth census (1 fsync for in-place growth, 2 for relocation) is
+/// unchanged from before the move.
 fn durability(devices: &mut impl DeviceIo, device: TargetDevice) -> Result<(), GrowthExecError> {
     match devices.fsync(device) {
         Some(false) => Err(GrowthExecError::FsyncFailed),

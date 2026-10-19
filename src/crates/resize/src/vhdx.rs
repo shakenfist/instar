@@ -1,6 +1,6 @@
 //! VHDX-specific resize planning.
 //!
-//! Phase 5 of `PLAN-resize.md`. The public entry point
+//! The public entry point
 //! [`plan_resize_vhdx`](super::plan_resize_vhdx) in the crate
 //! root dispatches into [`plan_grow`] here, which classifies the
 //! request and emits the patch list in the documented

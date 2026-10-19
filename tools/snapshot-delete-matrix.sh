@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Phase 7e verification matrix for `instar snapshot -d` against
-# qemu-img 10.0.8. The centrepiece is the byte-identity scheme that
-# delete makes possible because it writes no timestamps (phase plan
-# fact 5): prepare each fixture ONCE with qemu, `cp` to A and B,
-# delete with instar on A and qemu-img on B, then compare bytes.
+# Verification matrix for `instar snapshot -d` against qemu-img
+# 10.0.8. The centrepiece is the byte-identity scheme that delete
+# makes possible because it writes no timestamps (unlike create):
+# prepare each fixture ONCE with qemu, `cp` to A and B, delete with
+# instar on A and qemu-img on B, then compare bytes.
 #
 # The qemu side runs with `file.discard=ignore`: by default qemu-img
 # punches holes (discard) over the clusters a delete frees
@@ -15,8 +15,9 @@
 # then exact: cmp over the common prefix, with any instar tail
 # beyond qemu's length all zeroes (the sector-granular tail quirk).
 #
-# Not a committed test (phase 11 owns that) — this is the phase 7
-# validation harness. Exits non-zero on any failure.
+# Not a committed test (the committed coverage is tests/test_snapshot.py)
+# — this is the manual validation harness written when delete was built.
+# Exits non-zero on any failure.
 set -uo pipefail
 
 INSTAR="${INSTAR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/src/target/release/instar}"
@@ -160,7 +161,7 @@ run_fixture "backing-file"   mk_backing
 run_fixture "extended-l2"    mk_ext_l2
 run_fixture "zero-byte-disk" mk_zero
 
-# --- Sole-snapshot delete: header must become (0, 0), fact 3 -------------
+# --- Sole-snapshot delete: header must become (0, 0), like qemu -----------
 printf '\n=== Sole-snapshot delete: header (nb=0, offset=0) ===\n'
 mk_v3_64k
 qemu-img snapshot -c only "$WORK/base.qcow2" >/dev/null 2>&1
@@ -191,7 +192,7 @@ else
     bad "dup-name: survivor wrong: id=$remaining_id tag=$remaining_tag (want id=2 tag=dup)"
 fi
 
-# --- Name-vs-ID precedence: -d matches by NAME only (fact 2) -------------
+# --- Name-vs-ID precedence: -d matches by NAME only, like qemu ------------
 # Snapshots: id=1 name="2", id=2 name="x". `-d 2` must delete the
 # one NAMED "2" (id 1), never the one with ID 2.
 printf '\n=== Name-vs-ID precedence: -d 2 removes the snapshot NAMED "2" ===\n'
@@ -206,7 +207,7 @@ else
     bad "precedence: survivors wrong: $survivors (want 2:x)"
 fi
 
-# --- Pure-ID not-found parity (fact 2: no ID matching path) --------------
+# --- Pure-ID not-found parity (qemu's -d has no ID matching path) ---------
 # Image with snapshots alpha(id 1) and gamma(id 3): `-d 3` must fail
 # with exit 1 and leave the image byte-identical, matching qemu.
 printf '\n=== Pure-ID arg: -d 3 fails not-found, image untouched ===\n'
@@ -363,8 +364,8 @@ PY
 fi
 
 # --- Shared-L2 surviving-snapshot COPIED refresh ---------------------------
-# Regression for the phase 13 differential-fuzzer finding (soak2
-# iteration 209). Two snapshots share an L2; guest writes then COW
+# Regression for a differential-fuzzer finding (soak2 iteration
+# 209). Two snapshots share an L2; guest writes then COW
 # the ACTIVE chain onto fresh L2s, so the shared L2 belongs only to
 # the two snapshots. Deleting one drops the shared data clusters
 # 2 -> 1, and qemu's -1 walk writes the SURVIVING snapshot's L2

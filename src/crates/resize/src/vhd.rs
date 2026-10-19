@@ -1,6 +1,6 @@
 //! VHD-specific resize planning.
 //!
-//! Phase 4 of `PLAN-resize.md`. The public entry point
+//! The public entry point
 //! [`plan_resize_vhd`](super::plan_resize_vhd) in the crate root
 //! dispatches into [`plan_grow`] here, which classifies the
 //! request into a [`VhdGrowAction`] and emits the patch list in
@@ -50,7 +50,8 @@ pub(crate) fn plan_grow<'a>(
         if !opts.allow_shrink {
             return Err(ResizeError::ShrinkWithoutFlag);
         }
-        // Phase 4 ships grow only; shrink is deferred.
+        // Only grow is implemented; VHD shrink is not yet
+        // supported.
         return Err(ResizeError::UnsupportedShrink);
     }
     if opts.new_virtual_size == opts.current_virtual_size {
@@ -173,10 +174,10 @@ fn plan_fixed_grow<'a>(
     let mut plan = ResizePlan::new(ResizeAction::Grow, total_file_size);
 
     // Phase A (prepare): write the new footer at new EOF. This
-    // is intentionally before the old-footer zero patch — see
-    // the phase plan's rationale: a crash after this patch but
-    // before the next leaves the file with two valid footers,
-    // the last of which (at new EOF) is the one parsers use.
+    // is intentionally before the old-footer zero patch: a crash
+    // after this patch but before the next leaves the file with
+    // two valid footers, the last of which (at new EOF) is the one
+    // parsers use.
     plan.push(ResizePatch::Write {
         byte_offset: opts.new_virtual_size,
         bytes: footer_buf,

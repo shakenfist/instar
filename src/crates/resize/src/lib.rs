@@ -11,10 +11,10 @@
 //! are caller-supplied; the returned [`ResizePlan`] borrows from
 //! the scratch buffer.
 //!
-//! This phase ships scaffolding only: the type surface and
-//! stubbed planners that return [`ResizeError::UnsupportedFormat`].
-//! Later phases (2 = qcow2 grow, 3 = qcow2 shrink, 4 = vhd, 5 =
-//! vhdx, 6 = vmdk) fill in the per-format implementations.
+//! Planners exist for raw (grow and shrink), qcow2 (grow and
+//! shrink), vhd fixed and dynamic (grow), vhdx dynamic (grow) and
+//! vmdk monolithicSparse (grow). Unsupported combinations are
+//! refused with a specific [`ResizeError`] rather than planned.
 
 #![no_std]
 
@@ -154,9 +154,10 @@ pub enum ResizePatch<'a> {
 /// QCOW2 grow at small cluster sizes with a refcount-table
 /// extension is the dominant case: a header rewrite plus an L1
 /// append plus ~32 refcount-block appends plus old-L1 refcount
-/// decrements plus new L1-table refcount increments. 128 is
-/// conservative; phase 2 either confirms this is sufficient or
-/// raises the bound.
+/// decrements plus new L1-table refcount increments. 128 is a
+/// conservative bound with headroom over that worst case; a
+/// planner that would exceed it fails rather than truncating the
+/// plan.
 pub const MAX_RESIZE_PATCHES: usize = 128;
 
 /// A complete in-place mutation plan.
@@ -252,8 +253,8 @@ impl<'a> ResizePatch<'a> {
 ///
 /// Layout numerically matches `shared::ResizeConfig::PREALLOC_*`
 /// (and, for consistency, `shared::CreateConfig::PREALLOC_*`).
-/// Forward-compat tripwire: phase 1d asserts the variant count
-/// is exactly four.
+/// Forward-compat tripwire: a test in `tests/round_trip.rs`
+/// asserts the variant count is exactly four.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum Preallocation {
@@ -304,8 +305,9 @@ pub struct RawResizeOpts {
     /// Requested new virtual size in bytes.
     pub new_virtual_size: u64,
     /// Preallocation for the newly-added region (`Grow` only).
-    /// Phase 1's planner does not consume this; phase 9's host-
-    /// side preallocation pass reads it from the config.
+    /// The raw planner does not consume this; the host-side
+    /// preallocation pass reads it from the config after the
+    /// file has been extended.
     pub preallocation: Preallocation,
 }
 
@@ -571,33 +573,31 @@ pub struct VhdxResizeOpts<'a> {
 //
 // Each per-format planner takes a caller-supplied scratch buffer
 // large enough to stage its append/write payloads. These
-// constants give the guest binary (phase 7) a static upper bound
-// per format. They are conservative for phase 1 and will be
-// tightened as each format's planner lands.
+// constants are generous per-format upper bounds for callers
+// that allocate on the host (tests, fuzzers). They were sized
+// before the planners were written and have not been tightened
+// to each planner's measured worst case. The guest binary does
+// not use them: it hands every planner a fixed 8 MiB scratch
+// region and maps an overflow to `ScratchTooSmall`.
 
 /// Worst-case scratch buffer size for [`plan_resize_qcow2`].
-// TODO(phase-2): tighten once the qcow2 grow planner lands.
 pub const QCOW2_MAX_RESIZE_SCRATCH: usize = 32 * 1024 * 1024;
 
 /// Worst-case scratch buffer size for [`plan_resize_vmdk`].
-// TODO(phase-6): tighten once the vmdk planner lands.
 pub const VMDK_MAX_RESIZE_SCRATCH: usize = 4 * 1024 * 1024;
 
 /// Worst-case scratch buffer size for [`plan_resize_vhd`].
-// TODO(phase-4): tighten once the vhd planner lands.
 pub const VHD_MAX_RESIZE_SCRATCH: usize = 4 * 1024 * 1024;
 
 /// Worst-case scratch buffer size for [`plan_resize_vhdx`].
-// TODO(phase-5): tighten once the vhdx planner lands.
 pub const VHDX_MAX_RESIZE_SCRATCH: usize = 8 * 1024 * 1024;
 
 // ============================================================================
 // Planner functions
 // ============================================================================
 //
-// Phase 1 stubs every planner to `UnsupportedFormat`. Phase 1c
-// upgrades `plan_resize_raw` to a real implementation. Phases
-// 2–6 fill in the per-format planners.
+// One planner per format. Each dispatches into its format module
+// and returns a patch list for the host to apply in order.
 
 /// Plan a resize of a raw image.
 ///
@@ -628,10 +628,10 @@ pub fn plan_resize_raw(opts: &RawResizeOpts) -> Result<ResizePlan<'static>, Resi
 
 /// Plan a resize of a qcow2 image.
 ///
-/// Phase 2 implements the grow planner (HeaderOnly and L1Grow
-/// flavours; L1AndRefcountGrow lands in step 2c and
-/// `Preallocation::Metadata` likewise). Phase 3 will land the
-/// shrink planner.
+/// Grow covers all three flavours (HeaderOnly, L1Grow and
+/// L1AndRefcountGrow); shrink is planned when the caller passes
+/// `allow_shrink`. `Preallocation::Metadata` is not yet
+/// supported and is rejected with `PreallocationUnsupported`.
 pub fn plan_resize_qcow2<'a>(
     opts: &Qcow2ResizeOpts<'_>,
     scratch: &'a mut [u8],
@@ -641,8 +641,9 @@ pub fn plan_resize_qcow2<'a>(
 
 /// Plan a resize of a vmdk image.
 ///
-/// Phase 6 lands monolithicSparse grow; other subformats
-/// remain unsupported.
+/// Supports monolithicSparse grow only; other subformats are
+/// rejected with `UnsupportedSubformat` and shrink with
+/// `UnsupportedShrink`.
 pub fn plan_resize_vmdk<'a>(
     opts: &VmdkResizeOpts<'_>,
     scratch: &'a mut [u8],
@@ -652,7 +653,8 @@ pub fn plan_resize_vmdk<'a>(
 
 /// Plan a resize of a vhd image.
 ///
-/// Phase 4 lands fixed and dynamic grow; shrink is deferred.
+/// Supports fixed and dynamic grow; shrink is not yet
+/// implemented and is rejected with `UnsupportedShrink`.
 pub fn plan_resize_vhd<'a>(
     opts: &VhdResizeOpts<'_>,
     scratch: &'a mut [u8],
@@ -662,8 +664,8 @@ pub fn plan_resize_vhd<'a>(
 
 /// Plan a resize of a vhdx image.
 ///
-/// Phase 5 lands the dynamic grow planner; shrink is not
-/// supported by qemu upstream and the planner rejects it.
+/// Supports dynamic grow; shrink is not supported by qemu
+/// upstream and the planner rejects it.
 pub fn plan_resize_vhdx<'a>(
     opts: &VhdxResizeOpts<'_>,
     scratch: &'a mut [u8],
@@ -885,9 +887,8 @@ mod tests {
         .is_empty());
     }
 
-    // Note: every non-raw planner has shipped as of phases 2-6;
-    // their dedicated integration suites
-    // (tests/qcow2_grow.rs, tests/qcow2_shrink.rs,
-    // tests/vhd_grow.rs, tests/vhdx_grow.rs, tests/vmdk_grow.rs)
-    // own that coverage now.
+    // Note: the non-raw planners are covered by their dedicated
+    // integration suites (tests/qcow2_grow.rs,
+    // tests/qcow2_shrink.rs, tests/vhd_grow.rs, tests/vhdx_grow.rs,
+    // tests/vmdk_grow.rs), not here.
 }

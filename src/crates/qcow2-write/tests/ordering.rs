@@ -1,11 +1,12 @@
-//! Step 3c: the decision-7 crash-ordering contract as tests.
+//! The planner's crash-ordering contract as tests.
 //!
 //! A property-style integration suite (public API only) that runs
 //! deterministic pseudo-random write sets through `plan_write` /
 //! `plan_flush`, collects the FULL emitted program across every
-//! window, and asserts the settled ordering invariants of
-//! `docs/plans/PLAN-qcow2-write-infrastructure-phase-03-crate.md`
-//! decision 7 mechanically:
+//! window, and asserts mechanically the ordering invariants that
+//! keep a crash at any point from leaving a pointer to unwritten
+//! data or a refcount ahead of its references. This file labels
+//! them 7(a)-7(d) throughout (helper docs and failure messages):
 //!
 //! - 7(a) [`assert_write_covers_cluster_before_l2_patch`]: for
 //!   every `PatchEntryU64` making a data cluster reachable, data
@@ -40,8 +41,9 @@
 //! identical.
 //!
 //! The assertion helpers are deliberately reusable (they consume
-//! only the tagged step program plus a small context struct);
-//! phase 7 extends them for COW.
+//! only the tagged step program plus a small context struct).
+//! Copy-on-write schedules are not driven here; their ordering is
+//! pinned by the crate's unit tests over the `sim` harness.
 
 use qcow2::{
     QcowHeader, L1_OFFSET_MASK, L2_OFFSET_MASK, OFLAG_COMPRESSED, OFLAG_COPIED, QCOW2_MAGIC,
@@ -166,8 +168,10 @@ fn mk_image(
 }
 
 /// [`mk_image`] with an explicit `virtual_size` (still
-/// `L1_TABLES` L1 entries): the EOV-tail scenarios need unaligned
-/// sizes (the phase-4 plan's amended decision 7).
+/// `L1_TABLES` L1 entries): the EOV-tail scenarios need
+/// unaligned sizes, because a partial allocating write that
+/// reaches an unaligned `virtual_size` classifies as full
+/// coverage.
 fn mk_image_vs(
     cluster_bits: u32,
     l2_slots: usize,
@@ -278,8 +282,8 @@ fn region_bytes(img: &mut SimImage, region: RegionId, off: usize, len: usize) ->
 }
 
 /// Apply one emitted window literally (the executor role of the
-/// decision-1 loop). Semantics mirror what the phase 4-6 guest
-/// ops will do with the program.
+/// plan/execute/reset loop). Semantics mirror what the guest ops
+/// do with the program through `qcow2-write-exec`.
 fn exec_steps(img: &mut SimImage, steps: &[Step]) {
     let cs = img.cs;
     for s in steps {
@@ -330,7 +334,7 @@ fn exec_steps(img: &mut SimImage, steps: &[Step]) {
 }
 
 // ---------------------------------------------------------------------------
-// Harness: the decision-1 plan/execute/reset loop with program
+// Harness: the windowed plan/execute/reset loop with program
 // collection and provenance tags
 // ---------------------------------------------------------------------------
 
@@ -467,7 +471,7 @@ fn final_content(img: &SimImage) -> FinalContent {
 }
 
 // ---------------------------------------------------------------------------
-// Invariant assertion helpers (reusable; phase 7 extends for COW)
+// Invariant assertion helpers (reusable over any step program)
 // ---------------------------------------------------------------------------
 
 /// Everything the mechanical checks need to know about the run:
@@ -990,7 +994,7 @@ fn assert_no_barriers_in_write_phase(prog: &[Tagged]) {
     }
 }
 
-/// The full decision-7 ordering contract plus bounds, over the
+/// The full crash-ordering contract plus bounds, over the
 /// complete concatenated program of a harness run.
 fn assert_ordering_contract(h: &Harness) {
     let ctx = ctx_of(h);
@@ -1303,9 +1307,10 @@ fn flush_skeleton_exact_shapes() {
 
 #[test]
 fn gated_images_never_yield_a_write_state() {
-    // Decision 8 as the 3c "no write step exists for a gated
-    // image" property: `plan_write` needs a `WriteState`, and a
-    // gated header cannot produce one, so no program can exist.
+    // Envelope gates run before any write step can exist, checked
+    // as the "no write step exists for a gated image" property:
+    // `plan_write` needs a `WriteState`, and a gated header
+    // cannot produce one, so no program can exist.
     let cs = 4096u64;
     let virtual_size = L1_TABLES as u64 * (cs / 8) * cs;
     let cfg = StagingConfig {
@@ -1393,7 +1398,7 @@ fn gated_images_never_yield_a_write_state() {
 
 /// Negative controls: each mechanical checker must actually
 /// reject a program violating its invariant (guards against the
-/// helpers passing vacuously, now and when phase 7 extends them).
+/// helpers passing vacuously, now and as they are extended).
 #[test]
 fn invariant_helpers_reject_violations() {
     fn panics(f: impl FnOnce()) -> bool {
@@ -1527,8 +1532,9 @@ fn invariant_helpers_reject_violations() {
     assert!(panics(|| assert_flush_barrier_skeleton(&prog, &[(0, 1)])));
 }
 
-/// The amended-decision-7 EOV-tail shape (phase-4 plan / D9): on
-/// an unaligned virtual size, a tail write covering
+/// The EOV-tail shape (bytes past `virtual_size` are not virtual
+/// content, so they zero-fill regardless of backing): on an
+/// unaligned virtual size, a tail write covering
 /// [cluster base, virtual_size) is a full-coverage allocating
 /// write on backed and backing-less images alike. The invariant
 /// helpers must hold over programs containing the shape — 7(a)'s

@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
-# Phase 8e verification matrix for `instar snapshot -a` against
-# qemu-img 10.0.8. Apply writes no timestamps, no snapshot-table
-# bytes, and no header bytes (phase plan fact 7), so FULL
-# byte-identity against qemu holds for every scenario — including
-# diverged applies — which is this harness's bar: prepare each
-# fixture ONCE with qemu, `cp` to A and B, apply with instar on A
-# and qemu-img on B, then compare bytes.
+# Verification matrix for `instar snapshot -a` against qemu-img
+# 10.0.8. Apply writes no timestamps, no snapshot-table bytes, and
+# no header bytes (only qemu's truncate and L1-grow paths touch the
+# header, and instar refuses both), so FULL byte-identity against
+# qemu holds for every scenario — including diverged applies —
+# which is this harness's bar: prepare each fixture ONCE with qemu,
+# `cp` to A and B, apply with instar on A and qemu-img on B, then
+# compare bytes.
 #
 # The qemu side runs with `file.discard=ignore`: apply frees the
 # old active chain's clusters and qemu would punch holes over them
 # by default (QCOW2_DISCARD_SNAPSHOT), while instar deliberately
-# never writes to freed clusters (stale bytes remain — fact 6's
-# cache-discard behaviour). Disabling the protocol-level discard on
+# never writes to freed clusters (stale bytes remain — qemu's walk
+# likewise discards, rather than flushes, cached metadata for
+# clusters it frees). Disabling the protocol-level discard on
 # the qemu side removes that documented divergence (docs/quirks.md)
 # and the comparison is then exact: cmp over the common prefix,
 # with any instar tail beyond qemu's length all zeroes.
@@ -20,8 +22,9 @@
 # `qemu-img compare` against a reference copy taken at snapshot
 # time must report "Images are identical" after a diverged apply.
 #
-# Not a committed test (phase 11 owns that) — this is the phase 8
-# validation harness. Exits non-zero on any failure.
+# Not a committed test (the committed coverage is tests/test_snapshot.py)
+# — this is the manual validation harness written when apply was built.
+# Exits non-zero on any failure.
 set -uo pipefail
 
 INSTAR="${INSTAR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/src/target/release/instar}"
@@ -162,8 +165,9 @@ run_fixture() {
     qemu-img snapshot -c snap1 "$WORK/base.qcow2" >/dev/null 2>&1
     # Reference copy at snapshot time (content oracle).
     cp "$WORK/base.qcow2" "$WORK/ref.qcow2"
-    # Fresh apply: immediately after create. Per fact 6 the only
-    # delta vs the pre-apply image is the snapshot-L1 flag scrub,
+    # Fresh apply: immediately after create. The only delta vs the
+    # pre-apply image is the snapshot-L1 flag scrub (qemu's +1 walk
+    # writes the snapshot's stored L1 back with refreshed flags),
     # and instar must match qemu exactly.
     apply_and_compare "$name" "fresh" snap1 || return
     # Diverged apply (zero-byte disks cannot diverge).
@@ -181,12 +185,12 @@ run_fixture "backing-file"   mk_backing
 run_fixture "extended-l2"    mk_ext_l2
 run_fixture "zero-byte-disk" mk_zero
 
-# --- Precedence fixture: -a matches ID first, then name (fact 2) ----------
+# --- Precedence fixture: -a matches ID first, then name, like qemu ---------
 # Snapshots: id=1 name="2", id=2 name="x". `-a 2` must apply the
 # snapshot with ID 2 (named "x") under BOTH tools — a later entry
 # matching by ID beats an earlier entry matching by name. The same
-# fixture contrasts `-d 2` (phase 7: name-only) deleting the one
-# NAMED "2".
+# fixture contrasts `-d 2` (delete matches by name only) deleting the
+# one NAMED "2".
 printf '\n=== Precedence: -a 2 applies ID 2; -d 2 deletes the name "2" ===\n'
 rm -f "$WORK"/base.qcow2
 qemu-img create -f qcow2 "$WORK/base.qcow2" 64M >/dev/null 2>&1
@@ -206,7 +210,7 @@ else
 fi
 assert_content_identical "precedence/-a 2" "$WORK/A.qcow2" "$WORK/refx.qcow2"
 # Contrast: -d 2 on the same fixture targets the snapshot NAMED
-# "2" (id 1), the phase 7 name-only behaviour.
+# "2" (id 1), because delete matches by name only.
 cp "$WORK/base.qcow2" "$WORK/D.qcow2"
 "$INSTAR" snapshot -d 2 "$WORK/D.qcow2" >/dev/null 2>&1
 survivors=$(qemu-img snapshot -l "$WORK/D.qcow2" 2>&1 | awk 'NR>2 {print $1":"$2}')
@@ -272,12 +276,14 @@ if [ -f "$WORK/A.qcow2" ]; then
 fi
 
 # --- Apply middle of three snapshots, delete one, apply again --------------
-# Cross-mode interaction (master plan open question 9). The
-# snapshots are taken at DIFFERENT divergence points, so the apply
-# exercises the surviving-old-active-L2 path: the old active chain
-# shares L2s with s3 (not with the applied s2) — qemu's -1 walk
-# refreshes those L2s' COPIED flags and flushes them because the
-# clusters are not freed.
+# Cross-mode interaction: refcounts are per-cluster, so applying
+# after a chain of creates that referenced different cluster sets
+# needs no special handling. The snapshots are taken at DIFFERENT
+# divergence points, so the apply exercises the
+# surviving-old-active-L2 path: the old active chain shares L2s
+# with s3 (not with the applied s2) — qemu's -1 walk refreshes
+# those L2s' COPIED flags and flushes them because the clusters
+# are not freed.
 printf '\n=== Cross-mode: apply middle of three, delete one, apply again ===\n'
 rm -f "$WORK"/base.qcow2
 qemu-img create -f qcow2 "$WORK/base.qcow2" 64M >/dev/null 2>&1

@@ -11,7 +11,7 @@
 //! then returns `required + fully_allocated` bytes for the target
 //! format. The result is sent via `send_measure_result`.
 //!
-//! Out of scope for phase 3:
+//! Out of scope:
 //! - Backing-chain composition (single-device source only).
 //! - LUKS source decryption.
 //! - Snapshot extraction.
@@ -336,8 +336,12 @@ fn target_unit_size_for(c: &MeasureConfig) -> u64 {
 /// into `MeasureResult::ERROR_INVALID_SIZE` ("source image is
 /// unsupported format") -- true but useless. Raising the refusal first
 /// lets the host render the specific reason instead. The channel is
-/// the one described in decision 2 of
-/// `docs/plans/PLAN-differencing-phase-04-read-policy.md`.
+/// the one every op shares for this refusal: `send_error` with the
+/// reserved [`DifferencingRefusal`] operation marker and a status
+/// naming the format, which the host captures once and renders in
+/// place of its generic failure text. A per-op result code would not
+/// do, because several ops have no result struct or error constants
+/// to carry one.
 ///
 /// # Safety
 ///

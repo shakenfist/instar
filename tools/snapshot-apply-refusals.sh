@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Phase 8e refusal-path checks for `instar snapshot -a`, a sibling
-# of tools/snapshot-{create,delete}-refusals.sh. Each case must
-# fail (non-zero exit) with a sensible message and leave the image
-# bit-for-bit untouched. Not a committed test — phase 8 validation
-# only.
+# Refusal-path checks for `instar snapshot -a`, a sibling of
+# tools/snapshot-{create,delete}-refusals.sh. Each case must fail
+# (non-zero exit) with a sensible message and leave the image
+# bit-for-bit untouched. Not a committed test — a manual validation
+# harness written when apply was built.
 set -uo pipefail
 
 INSTAR="${INSTAR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/src/target/release/instar}"
@@ -35,7 +35,7 @@ refuse() {
 }
 
 # Not-found: the argument matches neither any ID nor any name
-# (apply is ID-then-name, fact 2 — so a *pure ID* arg like "1"
+# (apply matches ID first, then name — so a *pure ID* arg like "1"
 # WOULD match; "nosuch" matches nothing on either pass).
 qemu-img create -f qcow2 "$WORK/nf.qcow2" 64M >/dev/null 2>&1
 qemu-io -c "write 0 64k" "$WORK/nf.qcow2" >/dev/null 2>&1
@@ -48,12 +48,14 @@ qemu-io -c "write 0 64k" "$WORK/none.qcow2" >/dev/null 2>&1
 refuse "zero-snapshot-image" "$WORK/none.qcow2" "alpha"
 
 # disk_size mismatch: qemu-img happily resizes a snapshot-bearing
-# image (verified during phase 8 planning), and a later
+# image (verified against qemu-img), and a later
 # `qemu-img snapshot -a` TRUNCATES the image back to the
 # snapshot's disk_size (blk_truncate inside qcow2_snapshot_goto).
-# instar REFUSES instead (ERROR_L1_SIZE_MISMATCH, open question
-# 1) and leaves the image untouched; the workaround is
-# `qemu-img resize` back to the snapshot's size.
+# instar REFUSES instead (ERROR_L1_SIZE_MISMATCH) and leaves the
+# image untouched, because truncating would mean reimplementing
+# resize inside apply for a case only a qemu-resized image can
+# reach; the workaround is `qemu-img resize` back to the
+# snapshot's size.
 qemu-img create -f qcow2 "$WORK/rs.qcow2" 64M >/dev/null 2>&1
 qemu-io -c "write 0 64k" "$WORK/rs.qcow2" >/dev/null 2>&1
 qemu-img snapshot -c s1 "$WORK/rs.qcow2" >/dev/null 2>&1

@@ -1,19 +1,21 @@
-"""Phase 4c smoke pins for QCOW1 ("qcow" v1) read support.
+"""Smoke pins for QCOW1 ("qcow" v1) read support.
 
-These tests create their qcow images LOCALLY with the host `qemu-img`
-(the 4d instar-side manifest entries do not exist yet), so they do not
-depend on the instar-testdata fixture set.  They pin the behaviours the
-detection graduation unlocks:
+These tests create their qcow images LOCALLY with the host `qemu-img`,
+so they do not depend on the instar-testdata fixture set (the manifest's
+qcow1-* fixtures are exercised by the per-command suites).  They pin the
+behaviours that detecting QCOW1 as its own format, rather than as qcow2,
+makes possible:
 
 * convert / compare / dd read-path byte-parity vs qemu-img on a plain
   qcow image, including a compressed twin and a backing chain;
 * the subcommand policy divergences that are deliberately NOT lifted for
   qcow (check rc-63; map/measure refusals — qemu supports both on qcow1,
-  instar refuses by scope, see PLAN-format-coverage-phase-04);
+  instar refuses by scope, see the "`check`, `map`, and `measure`" QCOW1
+  entry in docs/quirks.md);
 * the encrypted (AES, crypt_method=1) posture: info succeeds and prints
   the encrypted line, data ops refuse cleanly;
 * the misdetection-regression guard: a fresh qcow image now reports
-  "file format: qcow" with its real virtual size (before phase 4c it was
+  "file format: qcow" with its real virtual size (it used to be
   misdetected as qcow2 with virtual size 0).
 """
 
@@ -252,9 +254,10 @@ class TestQcow1SubcommandPolicy(Qcow1SmokeBase):
     def test_map_refused(self):
         """map refuses a qcow source (recorded divergence: qemu supports it).
 
-        See PLAN-format-coverage-phase-04 "map and measure stay
-        refusals". Detection routes the image to Qcow1, which map's guest
-        has no arm for, so it refuses with "source format unrecognised".
+        map support for QCOW1 is deliberately out of scope (see the QCOW1
+        "`check`, `map`, and `measure`" entry in docs/quirks.md). Detection
+        routes the image to Qcow1, which map's guest has no arm for, so it
+        refuses with "source format unrecognised".
         """
         with tempfile.TemporaryDirectory() as tmp:
             src = self._make_plain_qcow(tmp)
@@ -336,7 +339,7 @@ class TestQcow1MisdetectionGuard(Qcow1SmokeBase):
     def test_info_reports_qcow_with_real_size(self):
         """info on a fresh qcow reports "file format: qcow" and the real size.
 
-        Before phase 4c, version-blind detection matched the shared
+        Detection used to be version-blind: it matched the shared
         qcow2 magic and reported "file format: qcow2" with "virtual size:
         0" (and a garbage qcow2 format-specific block). This guards
         against a regression back to that behaviour.

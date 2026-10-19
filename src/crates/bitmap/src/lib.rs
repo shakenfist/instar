@@ -1,18 +1,17 @@
 //! Pure planner crate for qcow2 persistent dirty bitmap mutators.
 //!
-//! This crate is the correctness core of the `bitmap` subcommand
-//! (master plan phase 3). It computes qcow2 persistent dirty bitmap
-//! mutations as pure functions over caller-staged big-endian byte
-//! slices (directory bytes, refcount-block bytes) plus scalar
-//! geometry, mirroring the in-place slice-mutator convention of
-//! `snapshot` and `check`. It performs no I/O and owns no
-//! allocator: the Phase 4 guest op stages on-disk structures into
-//! scratch, calls these functions to mutate the buffers, and writes
-//! them back.
+//! This crate is the correctness core of the `bitmap` subcommand. It
+//! computes qcow2 persistent dirty bitmap mutations as pure functions
+//! over caller-staged big-endian byte slices (directory bytes,
+//! refcount-block bytes) plus scalar geometry, mirroring the in-place
+//! slice-mutator convention of `snapshot` and `check`. It performs no
+//! I/O and owns no allocator: the guest op stages on-disk structures
+//! into scratch, calls these functions to mutate the buffers, and
+//! writes them back.
 //!
 //! The crate reuses `snapshot::qcow2` for cluster allocation and
 //! refcount arithmetic (16-bit refcount width only, no refcount-
-//! table growth), and the Phase 1 `qcow2::bitmap` primitives for
+//! table growth), and the `qcow2::bitmap` primitives for
 //! directory-entry and bitmap-table codecs.
 //!
 //! - [`directory`] — directory-level byte helpers (find, build,
@@ -20,7 +19,7 @@
 //! - [`action`] — per-action validate-then-mutate functions.
 //! - [`merge`] — the pure crate-side pieces of same-image `merge`
 //!   (validation, per-cluster OR, per-table-entry disposition); the
-//!   Phase-4 guest owns the table walk and cluster I/O.
+//!   guest op owns the table walk and cluster I/O.
 //!
 //! The crate is `no_std` and panic-free.
 
@@ -39,10 +38,10 @@ use shared::BitmapResult;
 ///
 /// Each variant maps to a [`BitmapResult::ERROR_*`] wire code via
 /// the [`From<BitmapError> for u32`] impl below, mirroring
-/// `snapshot::SnapshotError`. The phase 2 ABI froze codes 0..=17;
-/// phase 3 appended [`BitmapResult::ERROR_UNSUPPORTED_REFCOUNT_WIDTH`]
-/// (18) for the 16-bit-only allocator constraint inherited from
-/// `snapshot::qcow2`.
+/// `snapshot::SnapshotError`. The wire codes are append-only ABI:
+/// [`BitmapResult::ERROR_UNSUPPORTED_REFCOUNT_WIDTH`] (18) follows the
+/// original codes 0..=17 and reports the 16-bit-only allocator
+/// constraint inherited from `snapshot::qcow2`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BitmapError {
     /// Input is not qcow2 (v1 is qcow2-only). Maps to

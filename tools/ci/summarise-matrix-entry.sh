@@ -3,9 +3,11 @@
 #
 # A red matrix must name the distro AND the qemu-img version it ran
 # against, because that is what separates "instar broke" from "instar
-# diverges at this qemu version boundary" -- the distinction phases 2,
-# 2b and 3 spent their whole budget establishing. Without the version in
-# the summary, every red row needs a log dive to attribute.
+# diverges at this qemu version boundary" -- and instar's output really
+# does differ by qemu version (the qcow2 map and snapshot layouts, the
+# VHD creator app), so a failure is not attributable without it.
+# Without the version in the summary, every red row needs a log dive to
+# attribute.
 #
 # Usage:
 #   tools/ci/summarise-matrix-entry.sh <name> <image> <exit-code> <log>

@@ -1,18 +1,17 @@
 //! Pure planner crate for `qcow2 check --repair`.
 //!
 //! This crate is the per-operation home for the byte-level repair
-//! planners that the `check` guest binary (phase 4) will compose
-//! into in-place patch sequences. It is parallel to `snapshot` /
-//! `commit` / `rebase`: pure functions over caller-staged slices,
-//! no I/O, no allocator. It reuses `snapshot`'s hardened
-//! refcount/L1/L2 primitives (`set_refcount_in_block`,
-//! `for_each_cluster_in_l1`, `update_copied_flags_for_l1`, ...)
-//! rather than re-deriving refcount-width arithmetic.
+//! planners that the `check` guest binary drives to repair a qcow2
+//! image in place. It is parallel to `snapshot` / `commit` /
+//! `rebase`: pure functions over caller-staged slices, no I/O, no
+//! allocator. It reuses `snapshot`'s hardened refcount/L1/L2
+//! primitives (`set_refcount_in_block`, `for_each_cluster_in_l1`,
+//! `update_copied_flags_for_l1`, ...) rather than re-deriving
+//! refcount-width arithmetic.
 //!
-//! Phase 1 ships only the stable public type surface that phases
-//! 2-3 consume; the planners themselves live in [`qcow2`] and are
-//! added later. The types are fixed now to avoid churning the
-//! planner signatures across phases.
+//! The crate root holds the public types every planner shares
+//! ([`RepairTier`], [`RepairError`], [`RepairCounters`]); the
+//! planners themselves live in [`qcow2`].
 
 #![no_std]
 
@@ -21,7 +20,7 @@ pub mod qcow2;
 /// Which repair tier a planner is operating in.
 ///
 /// Mirrors `qemu-img check -r leaks|all`. Decoded by the guest
-/// (phase 4) from [`shared::CheckConfig`]'s
+/// from [`shared::CheckConfig`]'s
 /// [`FLAG_REPAIR`](shared::CheckConfig::FLAG_REPAIR) /
 /// [`FLAG_REPAIR_ALL`](shared::CheckConfig::FLAG_REPAIR_ALL) bits
 /// and threaded into the planner entry points so each planner
@@ -29,19 +28,20 @@ pub mod qcow2;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepairTier {
     /// The safe, lossless tier: reclaim allocated-but-unreferenced
-    /// clusters only (phase 2).
+    /// clusters only (see
+    /// [`crate::qcow2::reclaim_leaks_in_refblock`]).
     Leaks,
     /// The lossy tier: the leaks tier plus refcount-structure
     /// rebuild, COPIED reconciliation, and `corrupt`-bit clearing
-    /// (phase 3).
+    /// (see [`crate::qcow2::correct_refcounts_in_refblock`] and
+    /// [`crate::qcow2::reconcile_copied_flags_for_l1`]).
     All,
 }
 
 /// Errors returned by the repair planners.
 ///
-/// An internal planner type, not a wire type: the guest (phase 4)
-/// translates a hard failure into a `send_error` call and a
-/// partial repair into
+/// An internal planner type, not a wire type: the guest translates
+/// a hard failure into a `send_error` call and a partial repair into
 /// [`CheckResult::FLAG_REPAIR_INCOMPLETE`](shared::CheckResult::FLAG_REPAIR_INCOMPLETE),
 /// rather than mapping these 1:1 to wire codes. The
 /// [`From<snapshot::SnapshotError>`] impl lets the planners
@@ -110,7 +110,7 @@ impl From<snapshot::SnapshotError> for RepairError {
 
 /// The repair-outcome tally a planner returns.
 ///
-/// The guest (phase 4) folds these into the
+/// The guest folds these into the
 /// [`CheckResult`](shared::CheckResult) wire struct's
 /// `repaired_leaks` / `repaired_refcounts` / `repaired_corruptions`
 /// counters and sets

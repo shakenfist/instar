@@ -2090,10 +2090,10 @@ class TestCheckQcow2Snapshots(InstarTestBase):
 class TestCheckVdiRefusal(InstarTestBase):
     """check has no VDI support and must refuse it cleanly.
 
-    Format-coverage phase 2 graduates VDI to a real *read* format for
-    convert/compare/dd/bench, which lifts the phase-1 host gate for
-    every op that discovers a backing chain -- including check.  But
-    check does not link the chain reader; its own format dispatch has
+    VDI is a real *read* format for convert/compare/dd/bench, so the
+    host-side detect-only gate (issue #444) no longer refuses it for any
+    op that discovers a backing chain -- including check.  But check
+    does not link the chain reader; its own format dispatch has
     no VDI arm.  This pins that check fails cleanly (non-zero exit,
     "does not support checks" message) rather than silently reading the
     VDI container as raw or hanging.  Real qemu-img-style VDI check
@@ -2155,10 +2155,10 @@ class TestCheckVdiRefusal(InstarTestBase):
 class TestCheckParallelsRefusal(InstarTestBase):
     """check has no Parallels support and must refuse it cleanly.
 
-    Format-coverage phase 3 graduates Parallels to a real *read* format
-    for convert/compare/dd/bench, which lifts the phase-1 host gate for
-    every op that discovers a backing chain -- including check.  But
-    check does not link the chain reader; its own format dispatch has no
+    Parallels is a real *read* format for convert/compare/dd/bench, so
+    the host-side detect-only gate (issue #444) no longer refuses it for
+    any op that discovers a backing chain -- including check.  But check
+    does not link the chain reader; its own format dispatch has no
     Parallels arm.  This pins that check fails cleanly (exit 63, "does
     not support checks" message) rather than silently reading the
     Parallels container as raw or hanging.  qemu-img's own parallels
@@ -2220,10 +2220,10 @@ class TestCheckParallelsRefusal(InstarTestBase):
 
 
 class TestCheckDmgRefusal(InstarTestBase):
-    """check has no DMG support and must refuse it cleanly (fmt-cov 5).
+    """check has no DMG support and must refuse it cleanly.
 
-    Format-coverage phase 5 graduates DMG to a real *read* format for
-    convert/compare/dd/bench, which lifts the phase-1 host gate for every
+    DMG is a real *read* format for convert/compare/dd/bench, so the
+    host-side detect-only gate (issue #444) no longer refuses it for any
     op that discovers a backing chain.  check is deliberately NOT one of
     those consumers: it does not link the chain reader, and its own
     format dispatch has no DMG arm.  Unlike VDI/Parallels -- whose header
@@ -2292,11 +2292,12 @@ class TestCheckDmgRefusal(InstarTestBase):
 
 
 class TestCheckQedRefusal(InstarTestBase):
-    """check has no QED support and must refuse it cleanly (fmt-cov 6).
+    """check has no QED support and must refuse it cleanly.
 
-    Format-coverage phase 6 records QED as read-refused by deliberate
-    policy (see docs/plans/PLAN-format-coverage-phase-06-qed.md): QED
-    keeps its info/detection path but gains no reader.  check does not
+    QED is read-refused by deliberate policy -- there is no demand for
+    it and oslo.utils bans it outright (see "QED read-refusal as policy"
+    in docs/quirks.md): QED keeps its info/detection path but has no
+    reader.  check does not
     link the chain reader and its own format dispatch has no QED arm.
     Unlike DMG (a koly-trailer probe that check never sees, so check
     names the container "raw"), QED carries an offset-0 header magic

@@ -100,8 +100,8 @@ pub enum Qcow2CreateError {
     BackingMetadataTooLarge,
     /// Preallocation is requested but the option combination is
     /// not supported (e.g. metadata-mode + extended_l2 — the
-    /// subcluster bitmap layout adds complexity phase 6 doesn't
-    /// implement).
+    /// subcluster bitmap layout adds complexity the preallocating
+    /// emitter doesn't implement).
     PreallocationUnsupported,
 }
 
@@ -310,10 +310,10 @@ pub struct BuildHeaderOptions<'a> {
     /// Set the COMPAT_LAZY_REFCOUNTS bit (`compatible_features`).
     pub lazy_refcounts: bool,
     /// Optional LUKS header pointer extension data: `(offset, length)`
-    /// describing where the LUKS blob lives in the file. Phase 1's
-    /// `crates/create` orchestrator always passes `None`; the parameter
-    /// exists so a future encrypted-create phase can wire LUKS support
-    /// without redesigning the API.
+    /// describing where the LUKS blob lives in the file. Every caller,
+    /// including the `crates/create` orchestrator, passes `None`
+    /// today; the parameter exists so encrypted create can be wired
+    /// up later without redesigning the API.
     pub luks_header: Option<(u64, u64)>,
 }
 
@@ -461,9 +461,8 @@ pub fn build_l1_table<'a>(
 /// cluster offset with `OFLAG_COPIED` set. Entries past the virtual
 /// range (the last L2 table may have unused tail entries) stay zero.
 ///
-/// Phase 6 rejects `extended_l2 + preallocation != Off` in
-/// `compute_layout` so this function only needs to handle the
-/// 8-byte L2 entry layout.
+/// `compute_layout` rejects `extended_l2 + preallocation != Off`, so
+/// this function only needs to handle the 8-byte L2 entry layout.
 pub fn build_l2_table<'a>(
     buf: &'a mut [u8],
     layout: &Qcow2Layout,
@@ -1038,8 +1037,8 @@ mod tests {
 
     #[test]
     fn metadata_mode_off_keeps_existing_layout() {
-        // Sanity: existing Off-mode layouts are unaffected by the
-        // phase-6 extension.
+        // Sanity: Off-mode layouts are unaffected by the
+        // preallocation support.
         let off = compute_layout(1 << 30, 16, 16, false, Preallocation::Off).unwrap();
         assert_eq!(off.l2_clusters, 0);
         assert_eq!(off.data_clusters, 0);

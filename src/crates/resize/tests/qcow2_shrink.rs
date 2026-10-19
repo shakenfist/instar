@@ -2,9 +2,9 @@
 //!
 //! Each test builds a starting qcow2 image via crates/create,
 //! optionally writes a known cluster (by directly manipulating
-//! L2 / refcount bytes — phase 3 ships before the write
-//! operation, so we forge allocations by hand for the tests
-//! that need them), calls `plan_resize_qcow2` with
+//! L2 / refcount bytes — these crate tests run on the host
+//! without the guest write operation, so we forge allocations by
+//! hand for the tests that need them), calls `plan_resize_qcow2` with
 //! `allow_shrink: true`, applies the patch list against the
 //! starting bytes, then re-parses with `qcow2::QcowHeader::parse`
 //! and asserts the expected post-resize geometry.
@@ -86,10 +86,10 @@ fn build_starting_image(virtual_size: u64, cluster_size: u32) -> (Vec<u8>, QcowH
 /// newly-allocated clusters. Returns the host offset of the
 /// allocated data cluster.
 ///
-/// This is a deliberately ugly test-only forging helper — phase 3
-/// ships before the write operation, so we build "allocated"
-/// images by hand to exercise the shrink planner's discard
-/// path.
+/// This is a deliberately ugly test-only forging helper — the
+/// crate tests have no write operation to allocate clusters
+/// with, so we build "allocated" images by hand to exercise the
+/// shrink planner's discard path.
 fn forge_allocated_cluster(
     bytes: &mut Vec<u8>,
     header: &QcowHeader,

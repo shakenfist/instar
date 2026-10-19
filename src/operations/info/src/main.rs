@@ -430,9 +430,10 @@ pub unsafe extern "C" fn _start() -> u64 {
             // Differencing (parent-referencing) VHD reports its parent's
             // unicode name as `backing_file`, following how qcow2's
             // backing file already flows through `send_info_result`.
-            // `info` composes nothing, so it reports a parent rather than
-            // refusing one (decision 4 of
-            // docs/plans/PLAN-differencing-phase-04-read-policy.md).
+            // `info` composes nothing, so it has no wrong answer to give;
+            // it reports a parent rather than refusing one, because
+            // refusing would remove the only way to inspect an image the
+            // data ops decline to read.
             let mut backing_file_buf = [0u8; MAX_BACKING_FILE_LEN + 1];
 
             if detailed {
@@ -484,8 +485,8 @@ pub unsafe extern "C" fn _start() -> u64 {
         ImageFormat::Vhdx => {
             // Differencing (HasParent) VHDX reports the parent locator's
             // path as `backing_file`, mirroring the VHD arm above and how
-            // qcow2's backing file is reported. See decision 4 of
-            // docs/plans/PLAN-differencing-phase-04-read-policy.md.
+            // qcow2's backing file is reported: `info` reports a parent
+            // rather than refusing one.
             let mut backing_file_buf = [0u8; MAX_BACKING_FILE_LEN + 1];
 
             if detailed {
@@ -725,13 +726,11 @@ fn format_to_str(format: ImageFormat) -> *const u8 {
         ImageFormat::Iso => b"iso\0".as_ptr(),
         ImageFormat::Luks => b"luks\0".as_ptr(),
         // VMDK monolithicFlat descriptor — reported as "vmdk" to
-        // match qemu-img info output. Full descriptor-specific
-        // info reporting (createType, extent filename) is handled
-        // in Phase 22c.
+        // match qemu-img info output. The descriptor-specific
+        // fields (CID, createType, summed extent size) are filled
+        // in by the `VmdkDescriptor` arm of `_start`'s dispatch.
         ImageFormat::VmdkDescriptor => b"vmdk\0".as_ptr(),
-        // Detection and info-name only (format-coverage phase 1,
-        // step 2a); dispatch/size parsing for these formats lands
-        // in step 3a. Names match qemu-img's format_name strings.
+        // Names match qemu-img's format_name strings.
         ImageFormat::Parallels => b"parallels\0".as_ptr(),
         ImageFormat::Bochs => b"bochs\0".as_ptr(),
         ImageFormat::Cloop => b"cloop\0".as_ptr(),
@@ -829,7 +828,8 @@ fn parse_vhd_footer(buffer: &[u8], result: &mut InfoResult) {
 /// Returns true and NUL-terminates `backing_file_buf` when a non-empty
 /// name decodes; false (leaving the buffer untouched) on any read or
 /// decode failure, so a malformed differencing image is reported without
-/// a parent line rather than refused -- `info` never refuses (decision 4).
+/// a parent line rather than refused -- `info` never refuses, since it is
+/// the only way to inspect an image the data ops decline to read.
 unsafe fn parse_vhd_parent_name(
     call_table: &CallTable,
     footer_bytes: &[u8],
@@ -905,9 +905,9 @@ unsafe fn parse_vhd_parent_name(
     }
 
     // Decode + NUL-terminate is `shared::decode_utf16_field_nul_terminated`
-    // (differencing phase 4, step 4c review: moved out of `info` into
-    // `shared` so it runs under that crate's test suite -- `info` is a
-    // `no_main` guest binary and cannot run `cargo test` at all).
+    // (it lives in `shared` rather than here so it runs under that crate's
+    // test suite -- `info` is a `no_main` guest binary and cannot run
+    // `cargo test` at all).
     let name_bytes =
         &dyn_header_bytes[DYN_PARENT_NAME_OFFSET..DYN_PARENT_NAME_OFFSET + DYN_PARENT_NAME_SIZE];
     shared::decode_utf16_field_nul_terminated(name_bytes, true, backing_file_buf)
@@ -1073,12 +1073,12 @@ unsafe fn parse_vhdx_metadata(
         None => return false,
     };
 
-    // Which key to report is `VhdxParentLocator::preferred_path` (moved
-    // there in differencing phase 4 step 4c review, so the preference
-    // order is tested under crates/vhdx's own suite rather than as a
-    // free function here that could never run); copying it into a
-    // NUL-terminated buffer is `shared::write_nul_terminated`, likewise
-    // moved so it runs under `shared`'s suite.
+    // Which key to report is `VhdxParentLocator::preferred_path` (it
+    // lives there so the preference order is tested under crates/vhdx's
+    // own suite rather than as a free function here that could never
+    // run); copying it into a NUL-terminated buffer is
+    // `shared::write_nul_terminated`, likewise kept in `shared` so it
+    // runs under that crate's suite.
     //
     // The `relative_path` key holds a *Windows* relative path, so its
     // bytes are rendered back into POSIX convention before they are
@@ -1207,9 +1207,8 @@ unsafe fn parse_qcow2_header(
 /// * **Virtual size is truncated DOWN to a 512-byte multiple.** qemu's
 ///   qcow driver sets `bs->total_sectors = header.size / 512` and info
 ///   reports `total_sectors * 512` — unlike VDI, which rounds up. The
-///   phase-4 plan's 4d pin verifies this: fixture `qcow1-odd-size`
-///   stores 1048577 in the header yet every qemu baseline reports
-///   1048576.
+///   fixture `qcow1-odd-size` pins this: it stores 1048577 in the
+///   header yet every qemu baseline reports 1048576.
 /// * `cluster_size = 1 << cluster_bits` is emitted normally (qemu
 ///   prints a cluster_size for qcow; no suppression as for parallels).
 /// * `crypt_method != 0` (AES) sets `FLAG_ENCRYPTED`: `info` works on an
@@ -2326,10 +2325,10 @@ fn panic(_info: &PanicInfo) -> ! {
     }
 }
 
-// Unit tests for the detect-only format size parsers (format-coverage
-// phase 1, step 3a). Byte-array fixtures mirror the VDI/QED style used
-// elsewhere and the real instar-testdata images (parallels-v{1,2},
-// empty.bochs, simple-pattern.cloop, dmg-simple).
+// Unit tests for the parallels, bochs, cloop and dmg size parsers.
+// Byte-array fixtures mirror the VDI/QED style used elsewhere and the
+// real instar-testdata images (parallels-v{1,2}, empty.bochs,
+// simple-pattern.cloop, dmg-simple).
 //
 // NOTE ON EXECUTION: the info operation is a `#![no_std] #![no_main]`
 // guest binary, so `cargo test -p info` cannot build the standard test

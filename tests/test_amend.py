@@ -1,18 +1,18 @@
 """Integration tests for `instar amend`.
 
-Phase 6 of PLAN-amend.md. The live differential suite: for each
-case in `AMEND_CASES`, create a qcow2 image with `qemu-img`, copy
-it, amend copy A with `instar amend` and copy B with `qemu-img
-amend`, then assert the two are equivalent via `qemu-img info
---output=json` (normalised), that `qemu-img check` passes on the
-instar output, and that `qemu-img compare` shows the guest data is
-unchanged (amend touches only header metadata). Plus refusal tests
-(instar refuses the same structurally-impossible amends qemu does)
-and a `KNOWN_AMEND_DIVERGENCES` registry for any accepted
-difference.
+The live differential suite: for each case in `AMEND_CASES`,
+create a qcow2 image with `qemu-img`, copy it, amend copy A with
+`instar amend` and copy B with `qemu-img amend`, then assert the
+two are equivalent via `qemu-img info --output=json` (normalised),
+that `qemu-img check` passes on the instar output, and that
+`qemu-img compare` shows the guest data is unchanged (amend touches
+only header metadata). Plus refusal tests (instar refuses the same
+structurally-impossible amends qemu does) and a
+`KNOWN_AMEND_DIVERGENCES` registry for any accepted difference.
 
 This is the *live* differential against the locally-installed
-`qemu-img`. The cross-version baselines are phase 7.
+`qemu-img`. The cross-version comparison against recorded per-version
+baselines is `TestAmendBaselineMatrix`, below.
 
 `amend` launches a guest VM, so the test classes guard on
 `/dev/kvm` (mirroring resize's guest-needs-kvm skip). Fixtures are
@@ -57,12 +57,13 @@ AMEND_CASES = {
 
 # Cases where the post-amend info JSON diverges from qemu's, for a
 # documented reason. Keyed by (format, case_name) -> reason string,
-# consulted in `_make_amend_diff_test`. Phase 4 found instar's
-# amended images `qemu-img info`-identical to qemu's, so this is
-# expected to be empty. A case NOT in this dict that fails the diff
-# is a real regression and must be investigated, not silenced. If
-# `qemu-img compare` ever shows a DATA difference, that's a real bug
-# to fix in phases 2-3, not a divergence to register here.
+# consulted in `_make_amend_diff_test`. Every case was verified
+# `qemu-img info`-identical to qemu's when the host CLI landed, so
+# this is expected to be empty. A case NOT in this dict that fails
+# the diff is a real regression and must be investigated, not
+# silenced. If `qemu-img compare` ever shows a DATA difference, that's
+# a real bug to fix in the amend planner or guest op, not a divergence
+# to register here.
 KNOWN_AMEND_DIVERGENCES = {}
 
 
@@ -565,8 +566,8 @@ class TestAmendRefusals(TestAmendSmoke):
     def test_qed_refused(self):
         """amend refuses a qed image, leaving it byte-unchanged.
 
-        Format-coverage phase 6 keeps QED read-refused as policy (see
-        docs/plans/PLAN-format-coverage-phase-06-qed.md).  amend is
+        instar keeps QED read-refused as policy (see "QED read-refusal
+        as policy" in docs/quirks.md).  amend is
         qcow2-only; a QED image (recognised by its offset-0 header
         magic) is refused with "only qcow2 images can be amended"
         before any header byte changes.  qemu-img has no QED amend
@@ -851,9 +852,10 @@ class TestAmendClusterSizes(TestAmendSmoke):
     The core `.bss` overflow (fixed by raising `OPERATION_LOAD_ADDR`
     0x20000 -> 0x22000) corrupted the loaded op's code at 0x20380 and
     surfaced only for certain qcow2 cluster sizes (512, 2048, 16384,
-    ...). It slipped through phases 5-7 because every by-example fixture
-    used the default 64 KiB cluster; only the phase-8 differential
-    fuzzer exercised non-default sizes. These cases amend images across
+    ...). It slipped through the Rust unit tests, the live differential
+    suite and the cross-version baselines because every by-example fixture
+    used the default 64 KiB cluster; only the differential fuzzer
+    exercised non-default sizes. These cases amend images across
     a spread of cluster sizes -- including ones that previously failed
     -- so a regression of that class is caught by the routine
     integration suite, not only by opportunistic fuzzing.

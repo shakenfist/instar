@@ -1234,9 +1234,8 @@ class TestCompareDetectOnlyRefusal(InstarTestBase):
         """compare refuses a cloop-simple input with the typed message."""
         self._assert_refused('cloop-simple', 'cloop')
 
-    # NOTE: dmg is no longer refused here.  Format-coverage phase 5
-    # graduates DMG to a real read format; compare now reads it.  The
-    # dmg-simple-vs-raw identical smoke lives in TestCompareDmg below.
+    # NOTE: dmg is not refused here.  DMG is a real read format and
+    # compare reads it; its coverage lives in TestCompareDmg below.
 
     def test_compare_iso_passthrough(self):
         """compare keeps reading iso as raw (deliberate qemu parity)."""
@@ -1250,13 +1249,14 @@ class TestCompareDetectOnlyRefusal(InstarTestBase):
 
 
 class TestCompareDmg(InstarTestBase):
-    """Smoke test for comparing DMG input (format-coverage phase 5).
+    """compare read-path tests for DMG input.
 
-    Pins the graduation of DMG from the issue-#444 detect-only refusal to
-    a real read format: comparing the dmg-simple fixture against its own
-    qemu-img raw conversion must report identical content and exit 0,
-    which proves compare reads the UDIF chunks rather than the container
-    bytes.  The full DMG compare matrix is covered in step 5e.
+    Pins DMG as a real read format rather than an issue-#444 detect-only
+    refusal: comparing the dmg-simple fixture against its own qemu-img
+    raw conversion must report identical content and exit 0, which
+    proves compare reads the UDIF chunks rather than the container
+    bytes.  The rest of the class covers the multipart and resource-fork
+    chunk-table paths and a differing pair.
     """
 
     def setUp(self):
@@ -1361,12 +1361,12 @@ class TestCompareDmg(InstarTestBase):
 
 
 class TestCompareVdi(InstarTestBase):
-    """Smoke test for comparing VDI input (format-coverage phase 2).
+    """compare read-path tests for VDI input.
 
-    Pins the graduation of VDI from a detect-only refusal to a real read
-    format: comparing the aligned vdi-simple fixture against its own
-    qemu-img raw conversion must report identical content and exit 0.
-    The full VDI compare matrix is covered in step 2e.
+    Pins VDI as a real read format rather than a detect-only refusal:
+    comparing the aligned vdi-simple fixture against its own qemu-img
+    raw conversion must report identical content and exit 0.  The rest
+    of the class covers a VDI-vs-VDI identical pair and a differing pair.
     """
 
     def test_compare_vdi_simple_vs_raw(self):
@@ -1455,14 +1455,14 @@ class TestCompareVdi(InstarTestBase):
 
 
 class TestCompareParallels(InstarTestBase):
-    """Smoke test for comparing Parallels input (format-coverage phase 3).
+    """compare read-path tests for Parallels input.
 
-    Phase 1 gated Parallels for compare but never added a refusal test
-    (a documented gap this phase closes with positive coverage).  Pins
-    the graduation to a real read format: comparing the parallels-v2
+    Parallels was never covered by a compare refusal test while it was
+    detect-only, so this class is its only compare coverage.  It pins
+    Parallels as a real read format: comparing the parallels-v2
     ('WithouFreSpacExt') fixture against its own qemu-img raw conversion
-    must report identical content and exit 0.  The full compare matrix
-    (both magics, differing pairs) lands in step 3e.
+    must report identical content and exit 0.  The rest of the class
+    covers both magics (a v1 vs v2 identical pair) and a differing pair.
     """
 
     def setUp(self):
@@ -1550,7 +1550,7 @@ class TestCompareParallels(InstarTestBase):
 
 
 class TestCompareQcow1(InstarTestBase):
-    """compare read-path pins for QCOW1 ('qcow' v1) (format-coverage phase 4)."""
+    """compare read-path pins for QCOW1 ('qcow' v1)."""
 
     def setUp(self):
         super().setUp()

@@ -6,9 +6,10 @@
 //! writes that constitute a valid empty image in the requested
 //! format.
 //!
-//! This phase ships scaffolding only: the type surface and stubbed
-//! planners that return [`CreateError::ScratchTooSmall`]. Later
-//! phase-1 steps fill in the per-format implementations.
+//! There is a planner for qcow2 ([`plan_qcow2`]), VMDK
+//! monolithicSparse and streamOptimized ([`plan_vmdk`]), VHD fixed and
+//! dynamic, including differencing children ([`plan_vhd`]), and VHDX
+//! ([`plan_vhdx`]). Raw output has no metadata, so it has no planner.
 //!
 //! This crate is `no_std` and performs no I/O. Scratch buffers are
 //! caller-supplied; the returned [`MetadataPlan`] borrows from the
@@ -23,9 +24,12 @@ use shared::ImageFormat;
 /// `backing_file` field size so the host CLI and guest planner agree.
 pub const MAX_BACKING_FILE_LEN: usize = 1024;
 
-// Worst-case scratch sizes for each format. These are conservative
-// placeholders for the phase-1a scaffold; phase-1c..1f tighten them
-// once the planners' real memory requirements are known.
+// Worst-case scratch sizes for each format: the library's upper
+// bounds, which host-side callers (tests, fuzzers) use to size their
+// buffers. The guest enforces the smaller
+// `shared::GUEST_CREATE_SCRATCH_LIMIT` instead. The VMDK, VHD and VHDX
+// bounds were set generously before their planners were written and
+// have not yet been tightened to the planners' real requirements.
 
 /// Worst-case scratch buffer size required by [`plan_qcow2`].
 ///
@@ -33,20 +37,22 @@ pub const MAX_BACKING_FILE_LEN: usize = 1024;
 /// `cluster_size=512` with `extended_l2=true` (16-byte L2 entries),
 /// L2 coverage drops to 16 KiB and L1 grows toward 16 MiB long
 /// before hitting the `QCOW2_MAX_L1_SIZE` cap. 32 MiB covers every
-/// option combination within the supported virtual-size range; the
-/// guest binary (phase 2) only needs to allocate this once.
+/// option combination within the supported virtual-size range. The
+/// guest cannot afford that inside its scratch budget, so it plans
+/// within `shared::GUEST_CREATE_SCRATCH_LIMIT` and rejects the
+/// combinations that need more.
 pub const QCOW2_MAX_METADATA_SCRATCH: usize = 32 * 1024 * 1024;
 
 /// Worst-case scratch buffer size required by [`plan_vmdk`].
-// TODO(phase-1d): tighten
+// TODO: tighten to the planner's real requirement.
 pub const VMDK_MAX_METADATA_SCRATCH: usize = 4 * 1024 * 1024;
 
 /// Worst-case scratch buffer size required by [`plan_vhd`].
-// TODO(phase-1e): tighten
+// TODO: tighten to the planner's real requirement.
 pub const VHD_MAX_METADATA_SCRATCH: usize = 4 * 1024 * 1024;
 
 /// Worst-case scratch buffer size required by [`plan_vhdx`].
-// TODO(phase-1f): tighten
+// TODO: tighten to the planner's real requirement.
 pub const VHDX_MAX_METADATA_SCRATCH: usize = 4 * 1024 * 1024;
 
 /// Errors returned by the `plan_*` family of functions.
@@ -93,8 +99,8 @@ pub enum CreateError {
     /// The requested preallocation mode isn't supported for this
     /// option combination (e.g. metadata-mode + extended_l2; or
     /// any preallocation other than `Off` for a target format
-    /// whose phase-6 emitter doesn't yet populate metadata for
-    /// the data region).
+    /// whose emitter doesn't yet populate metadata for the data
+    /// region).
     PreallocationUnsupported,
 }
 
@@ -148,8 +154,8 @@ pub const MAX_METADATA_WRITES: usize = 96;
 /// `total_metadata_bytes` is the sum of `writes()[*].bytes.len()`.
 /// `minimum_file_size` is the smallest file size that contains every
 /// write's byte range (the maximum of `byte_offset + bytes.len()`
-/// across all writes); the caller may need to extend the file past
-/// this for preallocation in later phases.
+/// across all writes); the host extends the file past this when
+/// `falloc` or `full` preallocation is requested.
 #[derive(Debug, Clone, Copy)]
 pub struct MetadataPlan<'a> {
     /// Sum of all `writes()[*].bytes.len()`.
@@ -231,7 +237,7 @@ pub struct Qcow2CreateOpts<'a> {
     pub compat_v3: bool,
     /// Optional backing image to chain to.
     pub backing: Option<BackingRef<'a>>,
-    /// Preallocation mode (phase 6). `Off` (default) emits header +
+    /// Preallocation mode. `Off` (default) emits header +
     /// L1 (empty) + refcount only. `Metadata` / `Falloc` / `Full`
     /// populate L1 + L2 + refcount for the full virtual range; the
     /// host applies the matching post-pass (truncate / fallocate /
@@ -242,11 +248,12 @@ pub struct Qcow2CreateOpts<'a> {
 
 /// VMDK subformat selector.
 ///
-/// Phase 1 ships [`MonolithicSparse`](VmdkSubformat::MonolithicSparse)
-/// and [`StreamOptimized`](VmdkSubformat::StreamOptimized). The
-/// remaining variants are listed so phase-4's `-o subformat=...`
-/// option parser can return a clear "not yet supported" error
-/// instead of an "unknown subformat" one.
+/// Only [`MonolithicSparse`](VmdkSubformat::MonolithicSparse) and
+/// [`StreamOptimized`](VmdkSubformat::StreamOptimized) are supported:
+/// the other subformats span several files, which needs multi-output
+/// device support in the call table. They are listed so the
+/// `-o subformat=...` option parser can return a clear "not yet
+/// supported" error instead of an "unknown subformat" one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VmdkSubformat {
     /// Single sparse extent (supported).
@@ -276,9 +283,9 @@ pub struct VmdkCreateOpts<'a> {
     /// into the new descriptor's `parentCID=` line. `None` falls back
     /// to a fixed sentinel (`0xdeadbeef`) — used when the backing
     /// isn't a VMDK or the caller couldn't extract the CID (e.g.
-    /// parent descriptor unreadable). Phase 5b wires this through
-    /// from the create guest's
-    /// [`vmdk::read_and_parse_descriptor`] call.
+    /// parent descriptor unreadable). The create guest fills it from
+    /// its `read_vmdk_parent_cid` helper, which calls
+    /// [`vmdk::read_and_parse_descriptor`] on the parent.
     pub parent_cid: Option<u32>,
 }
 
@@ -740,10 +747,10 @@ fn image_format_name_bytes(fmt: ImageFormat) -> &'static [u8] {
         ImageFormat::Qed => b"qed",
         ImageFormat::Iso => b"iso",
         ImageFormat::Luks => b"luks",
-        // Detection/info-name only (format-coverage phase 1); create
-        // has no read or write path for these, so this arm only
-        // affects the informational backing-format-hint string, never
-        // whether a backing file is actually opened.
+        // Detection/info-name only; create has no read or write path
+        // for these, so this arm only affects the informational
+        // backing-format-hint string, never whether a backing file is
+        // actually opened.
         ImageFormat::Parallels => b"parallels",
         ImageFormat::Bochs => b"bochs",
         ImageFormat::Cloop => b"cloop",
@@ -925,7 +932,7 @@ pub fn plan_vmdk<'a>(
 /// hook for the parent filename.
 ///
 /// `parent_cid` carries the parent's `CID` value when the caller
-/// could extract it (vmdk-from-vmdk path; phase 5b wires this via
+/// could extract it (vmdk-from-vmdk path, via
 /// `vmdk::read_and_parse_descriptor`). `None` falls back to the
 /// fixed sentinel `0xdeadbeef` — used when the backing is non-vmdk
 /// (no CID concept) or descriptor extraction fails.
@@ -1038,9 +1045,10 @@ fn format_u64_decimal(mut val: u64, buf: &mut [u8; 20]) -> &[u8] {
 /// instar wrote before differencing support existed; moving it
 /// unconditionally would change the bytes of every `create -f vpc`.
 ///
-/// Fixed layout: phase 1 emits only the footer at byte
-/// `virtual_size`. The data region is left as a sparse hole; phase 6
-/// handles `preallocation=full` by writing zeros. A `Fixed` subformat
+/// Fixed layout: only the footer is emitted, at byte `virtual_size`.
+/// The data region is left as a sparse hole. Preallocation for vpc is
+/// not yet implemented; the host refuses any mode but `off` before
+/// planning. A `Fixed` subformat
 /// with a backing reference is refused with
 /// [`CreateError::BackingFileUnsupported`].
 pub fn plan_vhd<'a>(
@@ -2425,8 +2433,8 @@ mod vhd_plan_tests {
 
     /// A `Fixed` VHD still refuses a backing reference: `disk_type = 4`
     /// needs the BAT and dynamic header a fixed image does not have.
-    /// The `Dynamic` arm now emits a differencing child instead; step
-    /// 5e covers it.
+    /// The `Dynamic` arm emits a differencing child instead;
+    /// `plan_vhd_dynamic_accepts_backing` below covers it.
     #[test]
     fn plan_vhd_fixed_rejects_backing() {
         let mut opts = default_fixed(1 << 20);

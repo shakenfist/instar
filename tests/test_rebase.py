@@ -1,30 +1,36 @@
 """Integration tests for `instar rebase`.
 
-Phase 5 of PLAN-rebase-commit.md. Structurally a sibling of
-`test_resize.py`'s phase-11 layout:
+Structurally a sibling of `test_resize.py`'s layout:
 
 - ``TestRebaseSmoke`` parents the helpers and is the place to
   hang the runner overrides (timeouts, default flags) for
   child classes.
 - ``TestRebaseErrorPaths`` pins the host CLI rejection
-  contracts established in phase 4 step 4c (pre-checks +
-  chain discovery).
+  contracts (pre-checks + chain discovery).
 - ``TestRebaseSuccessPaths`` enumerates the success-path
   contracts. The qcow2 in-place rewrite paths use ``instar
   create`` to build the fixtures; the vmdk path uses
   ``qemu-img create`` because instar's vmdk-with-backing
   create doesn't yet emit matching CIDs (out-of-scope for the
   rebase plan; tracked under PLAN-create's vmdk follow-ups).
-- ``TestRebaseRoundTrip`` (step 5f) runs ``instar rebase``
+- ``TestRebaseRoundTrip`` runs ``instar rebase``
   and ``qemu-img rebase`` against identically-seeded
   fixtures and asserts the resulting ``qemu-img info
   --output=json`` outputs are byte-equivalent after
   whitelist normalisation.
-- ``TestRebaseBaselineMatrix`` (step 5e) consumes the
-  cross-version baselines step 5d generates in
+- ``TestRebaseBaselineMatrix`` consumes the cross-version
+  baselines that ``generate-baselines.py`` records in
   ``instar-testdata`` and asserts ``instar rebase``'s output
   matches the version-pinned ``qemu-img rebase`` baseline
   for every ``(target, case)`` pair.
+- ``TestRebaseSnapshotCow`` pins copy-on-write parity with
+  qemu for a safe-mode rebase of a snapshot-bearing overlay,
+  and ``-u`` parity on the same shape.
+- ``TestRebaseStagedL2Growth`` pins the fixes for the
+  staged-L2 arena growth hang and corruption (#422).
+- ``TestRebaseOverlayClassification`` pins the typed refusals
+  for overlay shapes safe mode cannot write into, and the
+  capacity changes of the qcow2-write based runner.
 
 Tests run on the host's installed `instar` binary. The
 success-path tests require ``/dev/kvm`` access; the error
@@ -50,7 +56,7 @@ from helpers.snapshot_readback import snapshot_readback
 class TestRebaseSmoke(InstarTestBase):
     """Parent class for the rebase test families.
 
-    The runner helpers live on `InstarTestBase` (step 5a);
+    The runner helpers live on `InstarTestBase`;
     this class is a stable parent that the child classes
     inherit from in case any test-family-specific defaults
     are needed later.
@@ -69,13 +75,14 @@ class TestRebaseSmoke(InstarTestBase):
 
 
 # ----------------------------------------------------------------------
-# Error-path tests — pin the host CLI rejection contracts
-# established in phase 4 step 4c.
+# Error-path tests — pin the host CLI rejection contracts: the
+# pre-checks and chain discovery, all of which run before any
+# guest boots.
 # ----------------------------------------------------------------------
 
 
 class TestRebaseErrorPaths(TestRebaseSmoke):
-    """Host CLI rejection contracts (phase 4 step 4c)."""
+    """Host CLI rejection contracts (pre-checks and chain discovery)."""
 
     def test_overlay_missing_rejected(self):
         """`instar rebase` against a non-existent overlay is rejected."""
@@ -169,8 +176,8 @@ class TestRebaseErrorPaths(TestRebaseSmoke):
     def test_qed_overlay_refused(self):
         """A qed overlay is refused by the probe, byte-unchanged.
 
-        Format-coverage phase 6 keeps QED read-refused as policy (see
-        docs/plans/PLAN-format-coverage-phase-06-qed.md).  QED's
+        instar keeps QED read-refused as deliberate policy (see
+        docs/quirks.md "QED read-refusal as policy").  QED's
         offset-0 header magic is recognised by the overlay probe, which
         has no QED arm, so the rebase is refused before any write (even
         with `-u`, whose unsafe path is reached only after the format
@@ -202,10 +209,9 @@ class TestRebaseErrorPaths(TestRebaseSmoke):
 
 
 # ----------------------------------------------------------------------
-# Success-path tests — end-to-end with the rebase guest
-# lifecycle from phase 4 step 4d. The qcow2 in-place cases
-# run today; vmdk and qemu-img round-trip are still skipped
-# pending the test scaffolding in phase 5 step 5f.
+# Success-path tests — end-to-end through the host CLI and the
+# rebase guest lifecycle, for the qcow2 in-place cases and vmdk.
+# Comparison against qemu-img rebase lives in TestRebaseRoundTrip.
 # ----------------------------------------------------------------------
 
 
@@ -494,7 +500,7 @@ class TestRebaseRoundTrip(TestRebaseSmoke):
 
 
 # ----------------------------------------------------------------------
-# Baseline matrix (step 5e) — instar rebase output matches the
+# Baseline matrix — instar rebase output matches the
 # version-pinned qemu-img rebase baseline for every (target, case)
 # pair. Factory-generated, mirroring TestCreateBaselineMatrix.
 # ----------------------------------------------------------------------
@@ -531,7 +537,7 @@ class TestRebaseBaselineMatrix(TestRebaseSmoke):
 
     Bypasses ``get_expected_output()`` and reads
     ``expected-outputs/rebase-info-json/<target>/<version>/<case>.stdout.txt``
-    directly — phase 7's ``detect-profiles.py`` flat-copies into
+    directly — ``detect-profiles.py`` flat-copies into
     ``profiles/profile-NN/`` keyed by case-name only, so collisions
     between targets silently overwrite. Reading the raw per-target
     bucket sidesteps the bug (same approach as
@@ -711,7 +717,7 @@ def _make_rebase_baseline_test(target, case):
         f'test_baseline_{target}_{case_name.replace("-", "_")}'
     )
     test.__doc__ = (
-        f'instar rebase {target} {case_name} matches phase-5 baseline.'
+        f'instar rebase {target} {case_name} matches the qemu-img baseline.'
     )
     return test
 
@@ -728,37 +734,37 @@ for _target, _cases in REBASE_CASES.items():
 
 
 # ----------------------------------------------------------------------
-# Internal-snapshot gate — phase 2 of
-# PLAN-qcow2-write-infrastructure (GitHub issue #421). Safe-mode
-# `instar rebase` (any mode without -u, including safe detach)
-# refuses, byte-idempotently, when the overlay carries internal
-# snapshots: safe mode mutates snapshot-shared L2 tables in place
-# and sets refcount=1 on clusters two L1 trees reference, so a
-# routine `qemu-img snapshot -d` afterwards frees live
-# active-view data. `-u` metadata-only rebase never touches
-# snapshot-shared clusters and stays allowed (parity-tested
-# below). Phase 7's snapshot-aware COW is the real fix.
+# Internal-snapshot COW (GitHub issue #421). Safe-mode `instar
+# rebase` (any mode without -u, including safe detach) of an
+# overlay carrying internal snapshots once mutated
+# snapshot-shared L2 tables in place and set refcount=1 on
+# clusters two L1 trees reference, so a routine `qemu-img
+# snapshot -d` afterwards freed live active-view data; it was
+# then refused outright. It now copies snapshot-shared
+# structures before writing through them. `-u` metadata-only
+# rebase never touches snapshot-shared clusters and has always
+# been allowed (parity-tested below).
 # ----------------------------------------------------------------------
 
 
 class TestRebaseSnapshotCow(TestRebaseSmoke):
     """Safe-mode overlay-snapshot COW parity vs qemu + `-u` parity (#421).
 
-    Phase 7 step 7c lifts the interim phase-2 refusal gate: a
-    safe-mode rebase of a snapshot-bearing overlay now succeeds by
-    copy-on-write instead of refusing. The proof is qemu-parity,
-    NOT before/after byte identity (C11): the rebased overlay's
-    active view is `qemu-img compare`-identical to a `qemu-img
-    rebase` (safe) twin and `qemu-img check`-clean — no
-    `refcount=1 reference=2` (the #421 signature) and no leaks
-    (C5) — and every pre-existing snapshot's virtual view (via the
-    snapshot read-back oracle) equals the qemu twin's read-back
-    (C7). rebase's snapshot semantic is the OPPOSITE of commit's:
-    qemu's safe-rebase contract covers the active view only, so a
-    snapshot's unallocated ranges silently read through the NEW
-    backing afterwards — the read-back expected value is the
-    snapshot read THROUGH base_new, matching qemu, never the
-    snapshot's pre-rebase content.
+    A safe-mode rebase of a snapshot-bearing overlay succeeds by
+    copy-on-write. The proof is qemu-parity, NOT before/after byte
+    identity: COW output placement is unconstrained because qemu's
+    own placement is nondeterministic run-to-run at 512-byte
+    clusters. The rebased overlay's active view must be `qemu-img
+    compare`-identical to a `qemu-img rebase` (safe) twin and
+    `qemu-img check`-clean — no `refcount=1 reference=2` (the #421
+    signature) and no leaks — and every pre-existing snapshot's
+    virtual view (via the snapshot read-back oracle) must equal the
+    qemu twin's read-back. rebase's snapshot semantic is the
+    OPPOSITE of commit's: qemu's safe-rebase contract covers the
+    active view only, so a snapshot's unallocated ranges silently
+    read through the NEW backing afterwards — the read-back
+    expected value is the snapshot read THROUGH base_new, matching
+    qemu, never the snapshot's pre-rebase content.
     """
 
     def setUp(self):
@@ -766,16 +772,16 @@ class TestRebaseSnapshotCow(TestRebaseSmoke):
         self._require_qemu_tools()
 
     def _build_bases(self, fixture_dir, cluster_size=65536):
-        """Create the phase-1 Q2 backing pair in `fixture_dir`.
+        """Create the old/new backing pair in `fixture_dir`.
 
         base_old.qcow2 (6M, 0x11 at [0,4M)) and base_new.qcow2
         (6M, 0x22 at [2M,6M)), both at `cluster_size`. Idempotent
         so twin overlays can share one pair (identical
         `full-backing-filename` keeps the info JSONs
         comparable). `cluster_size=512` drives the COW schedule
-        across a refcount-refblock boundary (the growth/relocation
-        path, C9) and exercises the cs=512 walk that had the #422
-        livelock (fixed in phase 2 — must not regress/hang).
+        across a refcount-refblock boundary (refcount growth and
+        relocation during COW) and exercises the cs=512 walk that
+        had the #422 livelock (fixed — must not regress/hang).
         """
         fixture_dir = Path(fixture_dir)
         fixture_dir.mkdir(parents=True, exist_ok=True)
@@ -796,7 +802,7 @@ class TestRebaseSnapshotCow(TestRebaseSmoke):
 
     def _build_overlay(self, fixture_dir, name, post_snapshot_write,
                        cluster_size=65536):
-        """Create a snapshot-bearing Q2 overlay on base_old.qcow2.
+        """Create a snapshot-bearing overlay on base_old.qcow2.
 
         6M overlay at `cluster_size` backed by base_old.qcow2
         (relative name), 0x33 at [1M,2M), then `snapshot -c
@@ -863,7 +869,7 @@ class TestRebaseSnapshotCow(TestRebaseSmoke):
     def _assert_check_clean(self, image):
         """Assert `qemu-img check` is clean — the #421 signature
         (`refcount=1 reference=2`) and leaks are exactly what COW
-        must eliminate (C5)."""
+        must eliminate."""
         r = subprocess.run(
             ['qemu-img', 'check', str(image)],
             capture_output=True, text=True, timeout=120)
@@ -878,27 +884,27 @@ class TestRebaseSnapshotCow(TestRebaseSmoke):
     def test_safe_rebase_overlay_internal_snapshots_cow(self):
         """Safe-mode rebase of a snapshot-bearing overlay COWs (#421).
 
-        Phase-1 Q2 showed this shape silently corrupted the
-        overlay's refcounts in v1 (safe mode wrote new mappings
-        into the snapshot-shared active L2 in place, leaving
-        `refcount=1 reference=2` on clusters two L1 trees
-        reference — a `qemu-img snapshot -d` later frees live
-        active-view data). Phase 7's COW copies the shared active
-        L2 (C2) instead, so that failure mode is structurally
-        unreachable. Over the Q2 matrix (cluster sizes {65536,
-        512}, the cs=512 leg crossing a refblock boundary to
-        exercise the growth/relocation path C9 and the walk that
-        had the #422 livelock; and with/without a post-snapshot
+        Before copy-on-write, this shape silently corrupted the
+        overlay's refcounts (safe mode wrote new mappings into the
+        snapshot-shared active L2 in place, leaving `refcount=1
+        reference=2` on clusters two L1 trees reference — a
+        `qemu-img snapshot -d` later frees live active-view data).
+        Rebase now copies the shared active L2 instead, so that
+        failure mode is structurally unreachable. Over cluster
+        sizes {65536, 512} (the cs=512 leg crossing a refblock
+        boundary to exercise refcount growth and relocation
+        during COW, and the walk that had the #422 livelock) and
+        with/without a post-snapshot
         write that COWs the active L2 away from snap1's), an
         instar-rebased overlay is compared against a `qemu-img
         rebase` (safe) twin built from the identical seed:
 
         - the rebase succeeds (rc 0, no hang — a #422 regression
           would time out and return rc -1);
-        - C5: instar's rebased active view is `qemu-img compare`-
+        - instar's rebased active view is `qemu-img compare`-
           identical to the qemu twin and both are check-clean
           (zero `refcount=1 reference=2`);
-        - C7: snap1's read-back equals the qemu twin's — the
+        - snap1's read-back equals the qemu twin's — the
           snapshot reads THROUGH the NEW backing (base_new), the
           opposite of commit's preserved semantic.
         """
@@ -931,12 +937,12 @@ class TestRebaseSnapshotCow(TestRebaseSmoke):
                          '-F', 'qcow2', overlay_q.name],
                         fixture, timeout=180)
 
-                    # C5: active-view parity + check clean.
+                    # Active-view parity + check clean.
                     self._assert_compare_identical(overlay_i, overlay_q)
                     self._assert_check_clean(overlay_i)
                     self._assert_check_clean(overlay_q)
 
-                    # C7: snap1 reads through the NEW backing, equal
+                    # snap1 reads through the NEW backing, equal
                     # to the qemu twin's read-back.
                     snap_i = snapshot_readback(
                         'qemu-img', overlay_i, 'snap1')
@@ -944,7 +950,7 @@ class TestRebaseSnapshotCow(TestRebaseSmoke):
                         'qemu-img', overlay_q, 'snap1')
                     self.assertEqual(
                         snap_i, snap_q,
-                        'C7: snap1 read-through-new-backing read-back must '
+                        'snap1 read-through-new-backing read-back must '
                         'equal the qemu twin')
 
     def test_unsafe_rebase_overlay_internal_snapshots_matches_qemu(self):
@@ -1006,8 +1012,7 @@ class TestRebaseSnapshotCow(TestRebaseSmoke):
 
 
 # ----------------------------------------------------------------------
-# Staged-L2 arena growth (issue #422) — phase 2 step 2d of
-# PLAN-qcow2-write-infrastructure.
+# Staged-L2 arena growth (issue #422).
 # ----------------------------------------------------------------------
 
 
@@ -1093,8 +1098,9 @@ class TestRebaseStagedL2Growth(TestRebaseSmoke):
         overlay must still be check-clean and both backings
         byte-unchanged. The overlay FILE may legitimately change:
         the pre-refusal data-cluster writes land in unreferenced
-        clusters (byte-idempotence of this path is deferred to
-        phase 3's ordering contract).
+        clusters. Capacity refusals are clean but not
+        byte-idempotent: guaranteeing that would need a worst-case
+        capacity pre-pass before the first write.
         """
         with tempfile.TemporaryDirectory() as td:
             fixture = Path(td) / 'fixture'
@@ -1182,16 +1188,17 @@ class TestRebaseStagedL2Growth(TestRebaseSmoke):
 
 
 # ----------------------------------------------------------------------
-# Overlay classification and capacity tests — phase 5 of
-# PLAN-qcow2-write-infrastructure (the safe-mode migration onto
-# crates/qcow2-write). New typed refusals (wire codes 15/16),
-# the stage-everything capacity widening, and the L2-window
-# eviction path.
+# Overlay classification and capacity tests. Safe-mode rebase
+# composes its overlay writes with crates/qcow2-write, which
+# changed behaviour relative to the earlier hand-written writer:
+# new typed refusals (wire codes 15/16), the widening from
+# staging every L2 table up front, and the L2-window eviction
+# path.
 # ----------------------------------------------------------------------
 
 
 class TestRebaseOverlayClassification(TestRebaseSmoke):
-    """Overlay-side refusals and capacity changes (phase 5)."""
+    """Overlay-side refusals and capacity changes (qcow2-write runner)."""
 
     def setUp(self):
         super().setUp()
@@ -1215,8 +1222,8 @@ class TestRebaseOverlayClassification(TestRebaseSmoke):
     def test_holed_refcount_table_overlay_refused(self):
         """A holed-refcount-table overlay refuses pre-mutation.
 
-        Replaces a live corruption (divergence R-D4, the rebase
-        sibling of GitHub issue #428): the old staging compacted
+        Replaces a live corruption (the rebase sibling of GitHub
+        issue #428): the old staging compacted
         non-zero refcount-table entries into a dense array and
         indexed them as dense, so a safe rebase of an overlay
         whose RT had a zero entry below populated ones wrote
@@ -1229,7 +1236,8 @@ class TestRebaseOverlayClassification(TestRebaseSmoke):
         refblocks dense-prefix and gates on RT contiguity: wire
         16, before any image mutation.
 
-        Recipe adapted from the phase-5 probes: qemu >= 10 turns
+        Recipe adapted from the probes that found the corruption:
+        qemu >= 10 turns
         discards into zero-plain clusters (which would mask the
         backing), so the divergent region (50M+) stays untouched
         by the discard/shrink history and the backing is attached
@@ -1314,8 +1322,7 @@ class TestRebaseOverlayClassification(TestRebaseSmoke):
     def test_extended_l2_overlay_refused(self):
         """An extended-L2 overlay refuses pre-mutation (wire 15).
 
-        Replaces a live silent corruption (divergence R-D1): the
-        old safe-mode walk hard-coded 8-byte L2 entries, so on an
+        Replaces a live silent corruption: the old safe-mode walk hard-coded 8-byte L2 entries, so on an
         extended_l2=on overlay every second "entry" it read was a
         subcluster bitmap — the rebase exited 0 having garbled the
         mapping (old-backing bytes readable at virtual offsets
@@ -1375,9 +1382,10 @@ class TestRebaseOverlayClassification(TestRebaseSmoke):
     def test_zstd_overlay_refused(self):
         """A zstd-compression-type overlay refuses (wire 15).
 
-        Deliberate narrowing (spec-mandated, like commit's D1):
-        an overlay with the zstd incompatible bit but no actual
-        compressed clusters rebased CORRECTLY before this phase —
+        Deliberate narrowing (spec-mandated, like commit's refusal
+        of unknown backing feature bits): an overlay with the zstd
+        incompatible bit but no actual compressed clusters rebased
+        CORRECTLY before rebase moved onto qcow2-write —
         the bit is inert without compressed data — but the qcow2
         spec requires refusing writes under unknown/compression
         incompatible bits, and a zstd-compressed cluster would
@@ -1421,7 +1429,7 @@ class TestRebaseOverlayClassification(TestRebaseSmoke):
     def test_many_l2_overlay_capacity_widened(self):
         """A 512-populated-L2 overlay now rebases (was wire 9).
 
-        The R-D6 capacity widening: the old runner staged EVERY
+        The capacity widening: the old runner staged EVERY
         pre-existing L2 table up front and refused past
         MAX_STAGED_L2 == 256 even when nothing needed copying.
         The migrated runner probes original L2 tables one at a
@@ -1456,7 +1464,7 @@ class TestRebaseOverlayClassification(TestRebaseSmoke):
                 timeout=300)
             self.assertEqual(
                 rc, 0,
-                f'many-L2 overlay must now rebase (the R-D6 '
+                f'many-L2 overlay must now rebase (the capacity '
                 f'widening): stderr={stderr!r}')
             self._run_tool(
                 ['qemu-img', 'rebase', '-b', 'base_new.qcow2',
@@ -1489,7 +1497,7 @@ class TestRebaseOverlayClassification(TestRebaseSmoke):
         space, so a sparse 17408M overlay with a divergent
         cluster in each of its 34 coverage spans forces at least
         two window evictions mid-loop. The structural safety
-        argument (R-D5): the walk never revisits a table, so an
+        argument: the walk never revisits a table, so an
         evicted table is written exactly once and never reloaded
         — content parity with a qemu-img rebase twin proves the
         final bytes.

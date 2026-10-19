@@ -8,7 +8,7 @@
 //! append-only, so commit gets new grains by extending the
 //! backing past its existing data.
 //!
-//! v1 only allocates grains in GTs the backing already has.
+//! Commit only allocates grains in GTs the backing already has.
 //! Allocating a fresh GT (and bumping the backing's GD entry)
 //! when the covering GDE is zero on the backing is a follow-up
 //! tracked under "Future work" in
@@ -91,9 +91,9 @@ pub struct VmdkCommitContext<'a> {
     pub backing_num_gd_entries: u32,
     pub backing_gd_offset_sectors: u64,
     pub backing_allocated_gt_count: u32,
-    /// Staged backing GD bytes; the GD-extension follow-up
-    /// flagged in the phase plan would let the allocator
-    /// flip a GDE here.
+    /// Staged backing GD bytes. Nothing writes a GDE here yet:
+    /// allocating a fresh GT and flipping its GDE is unbuilt
+    /// ("Future work" in `PLAN-rebase-commit.md`).
     pub backing_grain_directory: &'a mut [u8],
     /// Concatenated backing GT bytes; the guest updates the
     /// matching entry after [`allocate_backing_grain_vmdk`]
@@ -105,7 +105,7 @@ pub struct VmdkCommitContext<'a> {
     /// mutated and the guest must flush it.
     pub backing_gt_dirty: &'a mut [u8],
     /// Single-byte GD dirty flag (non-zero = guest must
-    /// flush the GD). v1 of the allocator never sets this;
+    /// flush the GD). The allocator never sets this yet;
     /// reserved for the GT-extension follow-up.
     pub backing_gd_dirty: &'a mut [u8],
     /// Backing's current file size — start point for the EOF
@@ -297,11 +297,11 @@ pub fn plan_commit_vmdk<'a>(
 ///
 /// Pure: this function only inspects
 /// `context.backing_grain_size_sectors` and advances the
-/// allocator cursor. v1 does not extend the backing's GD or
+/// allocator cursor. It does not extend the backing's GD or
 /// allocate new GTs — if the caller encounters a backing GDE
 /// of zero it must skip the grain rather than calling this
 /// allocator. The GD-extension follow-up is tracked under
-/// "Future work" in the phase plan.
+/// "Future work" in `PLAN-rebase-commit.md`.
 pub fn allocate_backing_grain_vmdk(
     context: &mut VmdkCommitContext<'_>,
     state: &mut BackingGrainAllocationState,

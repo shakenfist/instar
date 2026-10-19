@@ -1,10 +1,10 @@
 #!/bin/bash
 # Capture the exact `qemu-img --version` string every matrix-CI distro
-# ships in its stock package. This is the empirical input to
-# docs/plans/PLAN-distro-matrix-ci-phase-02-qemu-profiles.md step 2a:
-# instar's output profile is chosen from the detected qemu-img
-# major.minor.patch, so we must know each distro's real version string
-# (including distro suffixes and the epoch form) rather than assume it.
+# ships in its stock package. This is the empirical input to qemu
+# output-profile selection (docs/output-formats.md): instar's output
+# profile is chosen from the detected qemu-img major.minor.patch, so we
+# must know each distro's real version string (including distro
+# suffixes and the epoch form) rather than assume it.
 #
 # Usage: tools/probe-qemu-versions.sh
 #
@@ -14,7 +14,8 @@
 # For each distro it installs the qemu-img-providing package with the
 # native package manager and prints one line:
 #   <distro-image><TAB><raw qemu-img --version first line>
-# so the output is a paste-ready table for the phase-2 bucketing.
+# so the output is a paste-ready table for bucketing distros by the
+# qemu version profile they select.
 #
 # The distro lists mirror tools/verify-glibc-floor.sh and can be
 # overridden for a narrower run, e.g.:

@@ -20,8 +20,7 @@
 //!   5. No two `Write` patches overlap.
 //!
 //! For safe-mode `RebaseQcow2SafeContext` (plain overlay
-//! geometry since phase 5 of PLAN-qcow2-write-infrastructure
-//! moved the staged refblock copy and dirty bitmap into
+//! geometry; the staged refblock copy and dirty bitmap live in
 //! `crates/qcow2-write`):
 //!
 //!   6. `overlay_cluster_size` is a parse-legal power of two
@@ -321,8 +320,7 @@ fn assert_plan_invariants(plan: &RebasePlan<'_>, label: &str) {
     }
 }
 
-/// Safe-mode qcow2 context invariants (overlay geometry only
-/// since phase 5).
+/// Safe-mode qcow2 context invariants (overlay geometry only).
 fn assert_qcow2_safe_context(ctx: &RebaseQcow2SafeContext) {
     assert!(
         ctx.overlay_cluster_size.is_power_of_two()

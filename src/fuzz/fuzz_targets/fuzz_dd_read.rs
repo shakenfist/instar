@@ -3,8 +3,9 @@
 //!
 //! Both walk a (possibly sub-sector / past-capacity) byte window over
 //! a device, reading whole sectors through a `CallTable` and copying
-//! only the requested bytes. The phase-3 bugs were partial-tail drops
-//! and multi-sector mis-offsets, and the risk surface is OOB writes
+//! only the requested bytes. The bugs these primitives have had were
+//! dropped sub-sector tails and multi-sector mis-offsets (a window's
+//! start floored to a sector), and the risk surface is OOB writes
 //! past the requested range. This target drives both primitives with
 //! a fuzzer-chosen `(virtual_offset, length, sector_size, capacity)`
 //! against a deterministic position-dependent device and checks every
@@ -15,8 +16,8 @@
 //! size — a misaligned copy cannot accidentally match). The mock
 //! `read_input_sector` is an `extern "C" fn` and can only close over
 //! `'static` state, so the per-iteration capacity lives in a global
-//! guarded by a mutex (mirrors the phase-5 `READ_TEST_*` fixture and
-//! the qcow2 streaming fixture).
+//! guarded by a mutex (mirrors the `READ_TEST_*` fixture in the qcow2
+//! crate's unit tests and the qcow2 streaming fixture).
 //!
 //! Invariants asserted (libFuzzer's oracle is panic):
 //!
@@ -52,7 +53,8 @@ const MAX_LEN: u64 = 1 << 20; // 1 MiB
 const SENTINEL: u8 = 0xAA;
 
 /// Deterministic position-dependent device byte. Must match
-/// `pattern_sector` below and the phase-5 `read_test_pattern_byte`.
+/// `pattern_sector` below and the qcow2 crate's unit-test
+/// `read_test_pattern_byte`.
 fn pattern_byte(o: u64) -> u8 {
     (o % 251) as u8
 }

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Migration-proof harness: instar-before vs instar-after byte identity.
 
-The phase-1 Q3 oracle for the qcow2-write migrations (phases 4-6 of
-PLAN-qcow2-write-infrastructure.md). For a deterministic fixture matrix
-built fresh each run with a pinned qemu-img, the harness:
+The oracle for moving the commit, rebase and bench operations onto the
+shared qcow2-write crate: a migration that is meant to be invisible must
+leave every image byte-identical to what the pre-migration binary produces.
+For a deterministic fixture matrix built fresh each run with a pinned
+qemu-img, the harness:
 
   1. builds THREE identical fixture sets per combo (twin equality is
      verified by sha256 before anything runs);
@@ -23,20 +25,26 @@ built fresh each run with a pinned qemu-img, the harness:
 
 Every combo appears in the per-combo TSV with its bucket and verdict;
 nothing is skipped and there are no tolerance windows. The only sanctioned
-fallback is the D9 unaligned-virtual-size combo (decision 7 of the phase-4
-plan): if raw sha256 differs there, virtual-content equality (qemu-img
-convert to raw) is checked and the divergence reported loudly and
-separately — it is expected to be unnecessary after step 4q.
+fallback is the unaligned-virtual-size combo (marked `d9` in the matrix):
+the migrated commit clamps its tail-cluster write to virtual_size, so bytes
+past the end of the virtual disk may legitimately differ while virtual
+content does not. If raw sha256 differs there, virtual-content equality
+(qemu-img convert to raw) is checked and the divergence reported loudly and
+separately — it is expected to be unnecessary, because qcow2-write treats a
+write that reaches virtual_size as covering the whole tail cluster and
+zero-fills the remainder.
 
 For --op commit the matrix is: cluster_size {512, 4096, 65536} x
 size {1M, 64M} x seed {empty, 64k-at-0, multi-extent} x lazy_refcounts
 {off, on} x {implicit, explicit -b} = 72 combos, plus one unaligned-size
 combo (1M+512, 64K clusters, seeded, implicit). The expected-refusal
 inventory (exactly the eight cs=512 multi-extent combos, wire-11 refcount
-exhaustion) carries over from the 4p D6 probe, so the seed recipes must
-not drift from d6-matrix.py's offsets and patterns.
+exhaustion) was measured by probing the pre-migration binary over this
+matrix, so the seed recipes must not drift from that probe's offsets and
+patterns.
 
-Commit additionally runs the D6 capacity-widening exemplar outside the
+The migration deliberately widened commit's backing-side capacity caps, so
+commit additionally runs a capacity-widening exemplar outside the
 matrix (cs=512 16M backing with 8M seeded -> 66 populated refcount-table
 entries): before must refuse wire-10 pre-mutation, after must succeed
 deterministically, `qemu-img check` must be clean on the result, and the
@@ -58,7 +66,7 @@ Exit status is non-zero on any failure. Combo directories are deleted on
 PASS to bound disk use (keep with --keep-all); failing directories are
 always kept for post-mortem.
 
-Reusable for phases 5-6: add an entry to OPS wiring up the op's fixture
+To cover another op, add an entry to OPS wiring up the op's fixture
 builder, invocation, mutated-file list and expected-refusal inventory.
 """
 
@@ -147,12 +155,12 @@ def diff_invocations(label_a, a, label_b, b):
 # ---------------------------------------------------------------------------
 
 def commit_matrix():
-    """The phase-1 Q3 matrix plus the decision-7 unaligned-size combo.
+    """The commit proof matrix plus the unaligned-size combo.
 
-    Expected buckets are the 4p D6 inventory (d6-results.tsv): every
-    refusal on this matrix is wire-11 refcount exhaustion on the eight
-    cs=512 multi-extent combos; refuse-before/succeed-after is empty ON
-    the matrix (the widening exemplar lives outside it).
+    Expected buckets are the refusal inventory measured on the pre-migration
+    binary: every refusal on this matrix is wire-11 refcount exhaustion on
+    the eight cs=512 multi-extent combos; refuse-before/succeed-after is
+    empty ON the matrix (the widening exemplar lives outside it).
     """
     combos = []
     for cs, size, seed, lazy, bm in itertools.product(CLUSTER_SIZES, SIZES, SEEDS, LAZY, BASE_MODES):
@@ -169,7 +177,8 @@ def commit_matrix():
 def build_commit_fixture(combo, setdir, qemu_img, qemu_io):
     """One backing + seeded overlay pair; relative paths only, so twin
     sets built in different directories are byte-identical. Seed offsets
-    and patterns must match 4p's d6-matrix.py exactly."""
+    and patterns must match the probe that measured the expected-refusal
+    inventory exactly, or the inventory no longer applies."""
     os.makedirs(setdir)
     opts = f'cluster_size={combo["cs"]},lazy_refcounts={combo["lazy"]}'
     size = str(combo['size'])
@@ -277,9 +286,11 @@ def prove_combo(combo, workdir, args):
         row['verdict'] = 'PASS'
         return row
 
-    # The single sanctioned fallback: D9 unaligned-size combo, virtual-content
-    # equality when raw sha256 differs (decision 7; expected unnecessary
-    # after 4q — flag loudly if it triggers).
+    # The single sanctioned fallback: a combo marked `d9` (the unaligned-size
+    # shape), where the tail-cluster clamp may leave bytes past virtual_size
+    # different, gets virtual-content equality when raw sha256 differs
+    # (expected unnecessary for commit now that qcow2-write zero-fills the EOV
+    # tail cluster — flag loudly if it triggers).
     only_sha_diffs = all(d.startswith('sha256(') for d in diffs)
     if combo['d9'] and bucket == 'both-succeed' and only_sha_diffs:
         virt_equal = all(
@@ -302,12 +313,12 @@ def prove_combo(combo, workdir, args):
 
 
 # ---------------------------------------------------------------------------
-# commit extra checks: the D6 capacity-widening exemplar (off-matrix)
+# commit extra checks: the capacity-widening exemplar (off-matrix)
 # ---------------------------------------------------------------------------
 
 def build_widening_fixture(setdir, qemu_img, qemu_io):
-    """4p's off-matrix exemplar: cs=512 16M backing with 8M seeded (66
-    populated refcount-table entries > the old 32-refblock cap), small
+    """The off-matrix widening exemplar: cs=512 16M backing with 8M seeded
+    (66 populated refcount-table entries > the old 32-refblock cap), small
     seeded overlay."""
     os.makedirs(setdir)
     check_run([qemu_img, 'create', '-f', 'qcow2', '-o', 'cluster_size=512', 'base.qcow2', '16M'], setdir)
@@ -414,10 +425,10 @@ def prove_widening_exemplar(workdir, args):
 
 
 # ---------------------------------------------------------------------------
-# rebase fixtures (phase 5)
+# rebase fixtures
 # ---------------------------------------------------------------------------
 #
-# The 5b matrix per the phase-5 plan and its 5p outcome notes:
+# The rebase matrix, shaped by probes of the pre-migration binary:
 #
 #   cluster_size {512, 4096, 65536} x overlay size {1M, 64M}
 #     x chain {2-chain rebase-to-base, 3-chain CHAIN-SHORTENING, safe detach}
@@ -425,20 +436,21 @@ def prove_widening_exemplar(workdir, args):
 #
 # Pruning (documented, honest — every surviving combo is in the TSV):
 #   * detach x identical is incoherent (no new backing to be identical to);
-#     5p pruned it. Dropped.
+#     the probes pruned it too. Dropped.
 #   * -u ignores the seed entirely (metadata-only header/path patch), so it
 #     is run ONCE per (cs, size, chain), not once per seed. The -u fixture is
 #     built with the 'divergent' seed as a representative (its content is
 #     ignored by -u).
 #   * 3-chain uses the SHORTENING form (overlay->mid0->base, new backing =
 #     base): the plain rebase-to-mid keeps old and new chains identical and
-#     copies nothing (5p warning). mid0.qcow2 (10 chars) >= base.qcow2 so the
-#     new-backing path fits the overlay's existing backing-path slot (5p
-#     wire-8 warning).
-#   * NO `write -z` zero-flag seeds anywhere (the P7 chain-reader defect would
+#     copies nothing. mid0.qcow2 (10 chars) >= base.qcow2 so the new-backing
+#     path fits the overlay's existing backing-path slot (a longer path
+#     refuses with wire 8).
+#   * NO `write -z` zero-flag seeds anywhere (the chain reader mis-reads
+#     zero-flag clusters in a chain member, a pre-existing defect that would
 #     contaminate the comparison).
 #
-# Seed offsets/patterns are frozen to 5p's run_matrix.py so the expected
+# Seed offsets/patterns are frozen to the probe's run_matrix.py so the expected
 # both-refuse inventory does not drift: every cs=512 x divergent x safe combo
 # refuses wire 10 (v1 never appends refblocks — orphan-append scaffolding
 # identity is the both-refuse bar). That is exactly 3 chains x 2 sizes = 6
@@ -448,10 +460,11 @@ def prove_widening_exemplar(workdir, args):
 #   * UNALIGNED (1M+512, cs=65536): backings sized to the overlay, divergence
 #     placed in the EOV-tail cluster so the crate's zero-fill of beyond-EOV
 #     bytes is compared against a source that is itself zero there -> fully
-#     byte-identical (no D9).
-#   * OVERSIZED (P6's shape): old backing 2M carrying 0x55 past the overlay's
-#     1M+512 EOV, divergent -> the pre-declared D9 fallback (raw sha diverges
-#     beyond EOV, virtual content identical).
+#     byte-identical (no `d9` fallback).
+#   * OVERSIZED: old backing 2M carrying 0x55 past the overlay's 1M+512 EOV,
+#     divergent -> the pre-declared `d9` virtual-content fallback (raw sha
+#     diverges beyond EOV, because the pre-migration binary copies old-chain
+#     bytes there while the crate zero-fills; virtual content identical).
 #   * JSON-COUNTER: a cs=65536/64M/2chain/divergent/safe combo run with
 #     --output json so before-vs-after stdout identity pins clusters_copied /
 #     bytes_copied (they print in --output json only).
@@ -495,7 +508,8 @@ def _q_write(qemu_io, setdir, name, *cmds):
 def build_rebase_fixture(combo, setdir, qemu_img, qemu_io):
     """Relative paths only, so twin sets in different dirs are byte-identical.
 
-    Frozen to 5p's run_matrix.py / run_matrix_3chainb.py seed offsets."""
+    Seed offsets are frozen to the probe that measured the expected-refusal
+    inventory (see the section header)."""
     os.makedirs(setdir)
     cs = combo['cs']
     special = combo.get('special')
@@ -511,8 +525,8 @@ def build_rebase_fixture(combo, setdir, qemu_img, qemu_io):
         _q_write(qemu_io, setdir, 'overlay.qcow2', ovl_w)
         return
     if special == 'oversized':
-        # P6's D9 shape: old backing 2M carrying 0x55 over [1M, 2M) (non-zero
-        # past the overlay's 1M+512 EOV); new backing 2M empty.
+        # The `d9` fallback shape: old backing 2M carrying 0x55 over [1M, 2M)
+        # (non-zero past the overlay's 1M+512 EOV); new backing 2M empty.
         for name in ('base_old.qcow2', 'base_new.qcow2'):
             _q_create(qemu_img, setdir, name, OVERSIZED_BACKING, cs)
         _q_write(qemu_io, setdir, 'base_old.qcow2', 'write -P 0x55 1M 1M')
@@ -585,8 +599,9 @@ def run_rebase(binary, setdir, combo):
 
 
 def rebase_matrix():
-    """The deterministic 5b matrix (see the section header for the pruning
-    rationale). Expected buckets follow 5p's refusal inventory exactly."""
+    """The deterministic rebase matrix (see the section header for the
+    pruning rationale). Expected buckets follow the refusal inventory probed
+    on the pre-migration binary exactly."""
     combos = []
     for cs in CLUSTER_SIZES:
         for size in SIZES:
@@ -617,7 +632,7 @@ def rebase_matrix():
 
 
 # ---------------------------------------------------------------------------
-# rebase extra checks (off-matrix): P8 widening, eviction, holed-RT refusal
+# rebase extra checks (off-matrix): widening, eviction, holed-RT refusal
 # ---------------------------------------------------------------------------
 
 def prove_rebase_extras(workdir, args):
@@ -630,8 +645,8 @@ def prove_rebase_extras(workdir, args):
 
 
 def _rebase_widening_exemplar(workdir, args):
-    """P8: cs=512 / 64M / 512 populated L2 tables / IDENTICAL chains. Before
-    refuses wire 9 pre-mutation (sha unchanged); after succeeds
+    """Widening: cs=512 / 64M / 512 populated L2 tables / IDENTICAL chains.
+    Before refuses wire 9 pre-mutation (sha unchanged); after succeeds
     deterministically, check-clean, info-equivalent to a qemu-img rebase
     twin."""
     failures = []
@@ -707,8 +722,8 @@ def _rebase_eviction(workdir, args):
     """The eviction shape (cs=64K, 34 divergent L2-coverage spans, sparse
     17408M): after touches more tables than window slots. Before stages
     everything and also succeeds -> a genuine byte-identity row (raw sha of
-    the mutated overlay identical before-vs-after; R-D5 says final bytes match
-    despite the mid-loop eviction I/O order). Plus virtual-content parity vs a
+    the mutated overlay identical before-vs-after; final bytes match despite
+    the mid-loop eviction I/O order). Plus virtual-content parity vs a
     qemu-img rebase twin (via streaming qemu-img compare, no 17 GB raw
     materialisation)."""
     failures = []
@@ -788,10 +803,10 @@ def _rebase_eviction(workdir, args):
 
 
 def _rebase_holed_rt(workdir, args):
-    """Holed-refcount-table overlay (R-D4 recipe, adapted from 5p): the after
-    binary refuses wire 16 pre-mutation. The before binary mis-allocates
-    (live defect) — not run here; this is an after-only spot check that the
-    contiguity gate fires before any mutation."""
+    """Holed-refcount-table overlay (the recipe probed on the pre-migration
+    binary): the after binary refuses wire 16 pre-mutation. The before binary
+    mis-allocates (live defect) — not run here; this is an after-only spot
+    check that the contiguity gate fires before any mutation."""
     failures = []
     hr_dir = os.path.join(workdir, 'rebase-holed-rt')
     if os.path.exists(hr_dir):
@@ -833,15 +848,16 @@ def _rebase_holed_rt(workdir, args):
 
 
 # ---------------------------------------------------------------------------
-# bench fixtures + proof (phase 6, decision 7)
+# bench fixtures + proof
 # ---------------------------------------------------------------------------
 #
 # Bench is NOT a byte-identity migration for allocating schedules: the crate
 # allocates L2-first while pre-migration bench allocated data-first, so with a
 # shared linear cursor the two host offsets swap for every fresh-L2 write and
-# the final images differ (divergence B-D1). The proof therefore pre-declares
-# a bucket per combo (a/b/c/d, seeded from the 6p refusal inventory) and runs
-# the right assertion for each bucket rather than a blanket byte compare:
+# the final images differ (verdict details tag this `B-D1`). The proof
+# therefore pre-declares a bucket per combo (a/b/c/d, seeded from a refusal
+# inventory probed on the pre-migration binary) and runs the right assertion
+# for each bucket rather than a blanket byte compare:
 #
 #   (a) controls  — raw `-w`, read runs (paths untouched by the migration):
 #       full identity (normalised stdout + stderr + per-file sha256).
@@ -849,18 +865,20 @@ def _rebase_holed_rt(workdir, args):
 #       overwrite-only INTERSECT growth corner: full byte identity
 #       (sha-equal before-vs-after) + `qemu-img check` clean.
 #   (c) allocating (fresh, growth-triggering, backed-overlay COW): NOT
-#       sha-equal (B-D1). Instead: determinism (after x2 sha-equal within a
-#       side), `qemu-img compare` content-equal (before-image vs after-image),
-#       `qemu-img check` clean on both, normalised `info` equivalence,
-#       `flushes-issued` identity (carried by the normalised JSON), and — for
-#       growth shapes — identical RT-geometry deltas (rt offset/clusters +
-#       populated-refblock count before->after).
+#       sha-equal (the allocation-order swap above). Instead: determinism
+#       (after x2 sha-equal within a side), `qemu-img compare` content-equal
+#       (before-image vs after-image), `qemu-img check` clean on both,
+#       normalised `info` equivalence, `flushes-issued` identity (carried by
+#       the normalised JSON), and — for growth shapes — identical RT-geometry
+#       deltas (rt offset/clusters + populated-refblock count before->after).
 #   (d) refusals: identical rc/stderr; sha-unchanged WHERE today's refusal is
 #       pre-mutation (holed-RT wire-3; compressed with NO growth, gate-2). The
 #       compressed-AFTER-growth shape is pre-declared recorded-NOT-sha-stable
-#       (verdict = rc/stderr identical + check-clean, per 6p probe 7).
+#       (verdict = rc/stderr identical + check-clean): the growth is written
+#       before the compressed cluster is reached, so even on the pre-migration
+#       binary this refusal mutates the image.
 #
-# Bench stdout/JSON normalisation (decision 7): the proof runs `bench
+# Bench stdout/JSON normalisation: the proof runs `bench
 # --output json`, which emits ONLY the structured object (no human header /
 # flush / completion lines). The three wall-clock fields
 # (elapsed-seconds / requests-per-second / bytes-per-second) are stripped; the
@@ -878,7 +896,7 @@ BENCH_WALLCLOCK_KEYS = {'elapsed-seconds', 'requests-per-second', 'bytes-per-sec
 
 
 def normalise_bench_stdout(stdout):
-    """Strip the three wall-clock JSON fields (decision 7).
+    """Strip the three wall-clock JSON fields, which vary run to run.
 
     On a refusal bench emits no stdout (the error goes to stderr), so an empty
     string round-trips unchanged. On success the structured object is returned
@@ -902,7 +920,8 @@ def bench_rt_geometry(path):
     populated_refblocks counts non-zero refcount-table entries (each points at
     a materialised refcount block). This is the bucket-(c) RT-geometry probe;
     growth shapes must show the SAME (offset, clusters, populated) transition
-    before-vs-after (the growth planner is a pure relocation, B-D8)."""
+    before-vs-after (the growth planner moved crates unchanged, so growth
+    behaviour must be identical)."""
     with open(path, 'rb') as f:
         header = f.read(72)
         if header[:4] != b'QFI\xfb':
@@ -931,8 +950,8 @@ def bench_files(combo):
 def build_bench_fixture(combo, setdir, qemu_img, qemu_io):
     """Build one bench fixture. Relative paths only, so twin sets built in
     different directories are byte-identical (the backing filename embedded in
-    an overlay header is the relative 'backing.qcow2' in every set — the 6p
-    twin-fixture gotcha)."""
+    an overlay header is the relative 'backing.qcow2' in every set; an absolute
+    path there would make otherwise-identical twin sets differ)."""
     os.makedirs(setdir)
     fixture = combo['fixture']
     cs = combo.get('cs')
@@ -964,7 +983,7 @@ def build_bench_fixture(combo, setdir, qemu_img, qemu_io):
         os.unlink(os.path.join(setdir, 'src.qcow2'))
         return
     if fixture == 'holed':
-        # Genuine holed refcount table (probe 5 recipe, adapted from #428/#430):
+        # Genuine holed refcount table (recipe adapted from #428/#430):
         # scatter touches, fill, discard a middle band, shrink -> the RT points
         # past a hole. Check-clean on qemu >= 10; bench's contiguity gate
         # refuses it wire-3, pre-mutation.
@@ -1000,18 +1019,19 @@ def run_bench(binary, setdir, combo):
 
 
 def bench_matrix():
-    """The decision-7 bench matrix, pruned to coherent combos, with every combo
-    pre-assigned its proof bucket (a/b/c/d) IN CODE (seeded from the 6p refusal
-    inventory). Cluster sizes {512, 4096, 65536, 2097152} x sizes {16M, 64M} x
-    schedule classes {fresh-allocating, overwrite-only, growth-triggering,
-    backed-overlay COW} x flush-interval {none, 0, k} x {pattern, straddling},
-    plus raw/read controls and the pre-declared refusal shapes."""
+    """The bench proof matrix, pruned to coherent combos, with every combo
+    pre-assigned its proof bucket (a/b/c/d) IN CODE (seeded from the refusal
+    inventory probed on the pre-migration binary). Cluster sizes {512, 4096,
+    65536, 2097152} x sizes {16M, 64M} x schedule classes {fresh-allocating,
+    overwrite-only, growth-triggering, backed-overlay COW} x flush-interval
+    {none, 0, k} x {pattern, straddling}, plus raw/read controls and the
+    pre-declared refusal shapes."""
     combos = []
 
     def flush_args(kind, count):
         # A cadence flush-interval must be >= the queue depth (qemu/instar both
         # reject 'flush interval smaller than depth'); the default depth is 64,
-        # so a small cadence needs -d 1 (as 6p's cadence probes used).
+        # so a small cadence needs -d 1.
         if kind == 'none':
             return [], 'none'
         if kind == '0':
@@ -1046,7 +1066,8 @@ def bench_matrix():
 
             # (c) growth-triggering: fresh image, allocating schedule that
             # crosses the refcount-block threshold (unreachable at cs >= 64K
-            # in-envelope -- one refblock covers >= 2 TiB; 6p probe 6).
+            # in-envelope -- one refblock covers >= 2 TiB, so there is no
+            # growth path to exercise).
             if cs in (512, 4096):
                 gcount = '255' if cs == 512 else '200'
                 combos.append({
@@ -1056,7 +1077,9 @@ def bench_matrix():
                     'growth': True})
 
             # (c) backed-overlay COW: sub-cluster partial writes over a backed
-            # image drive the decision-3 try/refuse/fill/resubmit path.
+            # image drive the try/refuse/fill/resubmit path (the planner
+            # refuses NeedsBackingFill, the op chain-fills the cluster and
+            # resubmits it whole).
             if size == BENCH_SIZES[0]:
                 ovl_buf = min(cs // 2, 4096)
                 combos.append({
@@ -1069,7 +1092,7 @@ def bench_matrix():
     # (b) the post-#433 overwrite-only INTERSECT growth corner: overwrite the
     # prefilled band with a schedule whose worst-case touch estimate crosses
     # the preemptive-growth threshold. Post-fix the pre-grown refblocks are
-    # materialised, so this is byte-identical AND check-clean (NEWDEF089).
+    # materialised, so this is byte-identical AND check-clean.
     combos.append({
         'tag': 'bench-cs512-sz16M-overwrite-growth-corner', 'bucket': 'b', 'expected': 'success',
         'fmt': 'qcow2', 'cs': 512, 'size': 16 * 1024 * 1024, 'image': 'img.qcow2', 'fixture': 'overwrite',
@@ -1099,9 +1122,10 @@ def bench_matrix():
         'bench_args': ['-c', '8', '-s', '65536', '-S', '65536', '--pattern', '90'],
         'growth': False})
 
-    # (d) refusals (6p refusal inventory). holed-RT + compressed-no-growth are
-    # pre-mutation (sha-stable); compressed-after-growth is recorded NOT
-    # sha-stable (growth mutates before the per-cluster gate fires).
+    # (d) refusals (the probed refusal inventory). holed-RT and
+    # compressed-no-growth are pre-mutation (sha-stable);
+    # compressed-after-growth is recorded NOT sha-stable (growth mutates
+    # before the per-cluster gate fires).
     combos.append({
         'tag': 'bench-cs4096-holed-rt-refusal', 'bucket': 'd', 'expected': 'refuse',
         'fmt': 'qcow2', 'cs': 4096, 'size': 96 * 1024 * 1024, 'image': 'img.qcow2', 'fixture': 'holed',
@@ -1220,7 +1244,7 @@ def prove_bench_combo(combo, workdir, args):
 
     # bucket (c): stdout/stderr/rc identity (flushes-issued lives in the
     # normalised JSON), then compare + check + info + RT-geometry. sha WILL
-    # differ (B-D1) -- that is expected, not asserted.
+    # differ (the allocation-order swap) -- that is expected, not asserted.
     non_sha = [d for d in diffs if not d.startswith('sha256(')]
     if non_sha:
         row.update(verdict='BUCKET-C-STDOUT-MISMATCH', fail=True,
@@ -1265,7 +1289,7 @@ def prove_bench_combo(combo, workdir, args):
 
 
 # ---------------------------------------------------------------------------
-# op registry (phases 5-6 add entries here)
+# op registry (one entry per migrated op)
 # ---------------------------------------------------------------------------
 
 OPS = {

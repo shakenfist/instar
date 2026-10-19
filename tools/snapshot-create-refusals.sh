@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Phase 6f refusal-path checks for `instar snapshot -c`. Each case
-# must fail (non-zero exit) with a sensible message; the image must
-# not be mutated. Not a committed test — phase 6 validation only.
+# Refusal-path checks for `instar snapshot -c`. Each case must fail
+# (non-zero exit) with a sensible message; the image must not be
+# mutated. Not a committed test — a manual validation harness written
+# when create was built.
 set -uo pipefail
 
 INSTAR="${INSTAR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/src/target/release/instar}"

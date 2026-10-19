@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Phase 6f verification matrix for `instar snapshot -c` against
+# Verification matrix for `instar snapshot -c` against
 # qemu-img 10.0.8. For each fixture, run instar -c on copy A and
 # qemu-img -c on copy B, then assert qemu-img check is clean on A
 # and the snapshot listings / info match modulo the date columns.
 #
-# Not a committed test (phase 11 owns that) — this is the phase 6
-# validation harness. Exits non-zero on any failure.
+# Not a committed test (the committed coverage is tests/test_snapshot.py)
+# — this is the manual validation harness written when create was built.
+# Exits non-zero on any failure.
 set -uo pipefail
 
 INSTAR="${INSTAR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/src/target/release/instar}"
@@ -136,12 +137,13 @@ run_fixture() {
 }
 
 # --- (6) Post-snapshot-write corruption probe ----------------------------
-# THE test that catches the L2-table refcount gap (open question 2):
-# create a snapshot with instar, then have qemu write new data
-# through the active L1. Without the L2-table refcount bump, qemu's
-# post-snapshot write would skip the L2 COW and corrupt the
-# snapshot. We assert check stays clean and the snapshot's data is
-# still the pre-write content.
+# THE test that catches a missing L2-table refcount bump (after a
+# create the active L1 and the snapshot's L1 copy share the same
+# physical L2 tables): create a snapshot with instar, then have qemu
+# write new data through the active L1. Without the L2-table
+# refcount bump, qemu's post-snapshot write would skip the L2 COW
+# and corrupt the snapshot. We assert check stays clean and the
+# snapshot's data is still the pre-write content.
 post_write_probe() {
     printf '\n=== Probe (6): post-snapshot-write does not corrupt the snapshot ===\n'
     rm -f "$WORK"/p.qcow2

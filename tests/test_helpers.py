@@ -2,7 +2,7 @@
 
 These tests don't touch the binary or testdata — they exercise
 helper functions in isolation, mainly the info_json
-normalisation that phase 8 relies on.
+normalisation that the info JSON comparisons rely on.
 """
 
 import json

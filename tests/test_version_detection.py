@@ -176,7 +176,7 @@ class TestVersionDetection(InstarTestBase):
 
 
 # The exact `qemu-img --version` strings the CI matrix distros ship,
-# captured empirically by tools/probe-qemu-versions.sh (phase-2 step 2a).
+# captured empirically by tools/probe-qemu-versions.sh.
 # These pin the parser against the real distro suffix and Debian epoch
 # forms so a regression that fell back to the newest profile (silently
 # wrong output on an older-qemu distro) fails here.
@@ -263,7 +263,7 @@ class TestVersionMatchSelection(testtools.TestCase):
 class TestProfileSelectionMatrix(InstarTestBase):
     """Guard get_profile_for_installed_qemu against the real testdata
     version map for every distro qemu version in the CI matrix
-    (docs/plans/PLAN-distro-matrix-ci-phase-02-qemu-profiles.md 2a)."""
+    (docs/plans/PLAN-distro-matrix-ci-phase-02-qemu-profiles.md)."""
 
     # (version string, expected info profile) per matrix distro.
     MATRIX = [

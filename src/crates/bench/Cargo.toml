@@ -9,9 +9,9 @@ publish = false
 # This crate is dependency-free: it computes the bench request
 # schedule, transfer split, flush cadence and worst-case allocation
 # bound (`worst_case_touched`) as pure arithmetic. The refcount-growth
-# planner moved to `qcow2_write::growth` in phase-6 step 6a; step 6b
-# removed the temporary re-export, so src/operations/bench now imports
-# those types from the crate directly.
+# planner lives in `qcow2_write::growth`, shared with commit and rebase,
+# and src/operations/bench imports those types from that crate directly;
+# this crate does not re-export them.
 [dependencies]
 
 [lints]

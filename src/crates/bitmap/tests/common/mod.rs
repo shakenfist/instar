@@ -8,12 +8,12 @@
 //! scalar geometry. So the fixtures here are exactly those buffers —
 //! a [`Fixture`] carries them together with a [`BitmapGeometry`], and
 //! the `apply_*` helpers drive the crate's public `action_*` functions
-//! the way the Phase-4 guest does (double-buffering the directory).
+//! the way the guest op does (double-buffering the directory).
 //!
 //! Everything here goes through the crate's **public API**; the point
 //! of the `tests/` crate is that it sees only `pub` items.
 //!
-//! # Toy refcount layout (Open question 2)
+//! # Toy refcount layout
 //!
 //! The refcount fixtures use a single, self-consistent toy layout so
 //! that [`refcount_at`] assertions are meaningful and the first-fit
@@ -81,7 +81,7 @@ pub fn geometry() -> BitmapGeometry {
     }
 }
 
-/// The caller-staged state the Phase-4 guest hands to the actions: the
+/// The caller-staged state the guest op hands to the actions: the
 /// bitmap directory bytes (exactly `nb_bitmaps` packed entries), the
 /// refcount-block bytes, and the geometry.
 pub struct Fixture {

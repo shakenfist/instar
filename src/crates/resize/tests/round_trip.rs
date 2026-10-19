@@ -41,8 +41,8 @@ fn plan_carries_patches_in_push_order() {
 
     // Patches range over disjoint byte regions in this test,
     // which the planner-invariant for a real-world resize will
-    // also satisfy. Overlap-checking is deferred to phase 12's
-    // fuzz harness per the phase plan's open question 5.
+    // also satisfy. Overlap-checking across real planner output
+    // lives in the fuzz_resize_planners fuzz target, not here.
     let total: u64 = patches.iter().map(ResizePatch::len).sum();
     assert_eq!(total, 8 + 16 + (1 << 20));
 }
@@ -70,10 +70,10 @@ fn plan_capacity_is_max_resize_patches() {
 
 #[test]
 fn preallocation_variant_count_is_four() {
-    // Forward-compat tripwire: phase 9 will key off all four
-    // variants. Adding a fifth would need new translation logic
-    // host-side; deliberately fail this test so the change is
-    // reviewed.
+    // Forward-compat tripwire: the host-side preallocation pass
+    // keys off all four variants. Adding a fifth would need new
+    // translation logic host-side; deliberately fail this test so
+    // the change is reviewed.
     let variants = [
         Preallocation::Off,
         Preallocation::Metadata,
@@ -114,7 +114,7 @@ fn plan_resize_raw_classifies_action_for_three_size_pairs() {
     assert_eq!(noop.patches().len(), 0);
 }
 
-// Every non-raw planner has shipped as of phases 2-6; their
-// dedicated integration suites
-// (tests/qcow2_grow.rs, tests/qcow2_shrink.rs, tests/vhd_grow.rs,
-// tests/vhdx_grow.rs, tests/vmdk_grow.rs) own that coverage now.
+// The non-raw planners are covered by their dedicated
+// integration suites (tests/qcow2_grow.rs, tests/qcow2_shrink.rs,
+// tests/vhd_grow.rs, tests/vhdx_grow.rs, tests/vmdk_grow.rs),
+// not here.

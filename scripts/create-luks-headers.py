@@ -2,9 +2,9 @@
 """Generate synthetic LUKS v1 and v2 header test images.
 
 These headers have realistic field values for testing header
-parsing (Phase 12b). They are NOT valid encrypted containers
-(no actual key material or encrypted payload), so they cannot
-be used for decryption testing (Phase 12c).
+parsing. They are NOT valid encrypted containers (no actual
+key material or encrypted payload), so they cannot be used
+for decryption testing.
 
 For full LUKS containers with inner formats, use
 create-luks-testdata.sh instead (requires cryptsetup).

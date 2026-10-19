@@ -1,22 +1,21 @@
 """Integration tests for `instar bench`.
 
-Phase 6 of PLAN-bench.md. Converts the 4c/5c smoke matrices (captured
-in PLAN-bench-phase-01-crate.md's "Captured qemu-img 10.0.8 message
-contract" + "Supplement 2", PLAN-bench-phase-04-host-cli.md's
-"Captured smoke results (step 4c)", and PLAN-bench-phase-05-write.md's
-"Captured write verification (step 5c)") into a live differential
-suite against the locally-installed `qemu-img` (10.0.8), and
+A live differential suite against the locally-installed `qemu-img`
+(10.0.8). The expectations are qemu-img 10.0.8's message contract for
+argument validation (including the unparseable-value forms), its
+header and completion-line output across formats and options, and its
+write behaviour, all run live rather than recorded. The suite
 formalises `KNOWN_BENCH_DIVERGENCES` so the contract survives future
 changes.
 
-Scope contract (the OQ13 decisions, recorded):
+Scope contract:
 
 * Timing values are NEVER asserted. The completion line is checked
   against the shape `^Run completed in \\d+\\.\\d{3} seconds\\.$`
   (`COMPLETION_RE`) only; `--output json`'s `elapsed-seconds` is
   checked for presence/type/positivity only, never for a specific
   value.
-* **No cross-version baselines** (OQ13 resolved): the deterministic
+* **No cross-version baselines**: the deterministic
   header depends only on arguments, so a baseline matrix would record
   only the uncomparable timing line. There is deliberately no
   `test_bench_baselines.py` and no `expected-outputs/bench-*` tree;
@@ -28,21 +27,24 @@ Scope contract (the OQ13 decisions, recorded):
   divergence that stops diverging fails `TestBenchDivergenceRegression`
   loudly, forcing a registry update rather than a silent pass.
 
-Nine test classes, all inheriting from `BenchTestBase`:
+Test classes, all inheriting from `BenchTestBase`:
 
-* `TestBenchHeaderParity` — the 4c header-byte-parity rows.
-* `TestBenchValidation` — the corrected §2 message-contract table
-  (phase-04 Mission section 2), host-side, no guest launch.
+* `TestBenchHeaderParity` — header-byte parity with qemu-img across
+  formats and options.
+* `TestBenchValidation` — the host-side argument-validation message
+  contract, no guest launch.
 * `TestBenchReadBehaviour` — EOF/wrap/chain read-path behaviour.
-* `TestBenchWrite` — the 5c write-verification matrix, thinned.
+* `TestBenchWrite` — the write-verification matrix, thinned.
 * `TestBenchWriteRefusals` — the write-path gate contracts.
 * `TestBenchSnapshotCow` — copy-on-write into a snapshot-bearing
-  image (phase-7 step 7d, contract C8).
-* `TestBenchRefcountGrowth` — the qcow2 `-w` refcount-growth matrix
-  (PLAN-bench-refcount-growth phase 03).
+  image, preserving every internal snapshot bit-identically.
+* `TestBenchRefcountGrowth` — the qcow2 `-w` refcount-growth matrix.
 * `TestBenchJson` — the `--output json` schema.
 * `TestBenchDivergenceRegression` — re-verifies every testable
   `KNOWN_BENCH_DIVERGENCES` entry still diverges.
+* `TestBenchVdi`, `TestBenchParallels`, `TestBenchQcow1`,
+  `TestBenchDmg` — read smoke tests for the additional formats bench
+  reads; `TestBenchQed` pins bench's refusal of QED input.
 """
 
 import json
@@ -58,7 +60,7 @@ from helpers.snapshot_readback import snapshot_readback
 
 
 # Shape-only match for the completion line -- the timing value itself
-# is never asserted anywhere in this file (OQ13, module docstring).
+# is never asserted anywhere in this file (see the module docstring).
 COMPLETION_RE = re.compile(r'^Run completed in \d+\.\d{3} seconds\.$')
 
 
@@ -78,7 +80,7 @@ KNOWN_BENCH_DIVERGENCES = {
     'depth-serialized': (
         'json',
         "-d is echoed in the header for parity but bench executes "
-        'serially in v1 (master plan OQ1); --output json always '
+        'serially (one request at a time); --output json always '
         'reports "effective-depth": 1 regardless of the requested '
         'depth. No live regression test -- this is a semantic '
         'property verified directly by TestBenchJson.'
@@ -89,9 +91,9 @@ KNOWN_BENCH_DIVERGENCES = {
         '(offset %= image_size - bufsize) so a wrapped request never '
         'overruns EOF; qemu-img 10.0.8 still ships the buggy '
         '`% image_size` rule and can EIO near EOF on a request that '
-        'wraps past the last full buffer. Captured live in phase 1 '
-        '(read, the 10240-byte vector) and phase 5\'s 5c raw x (d) '
-        'row (write).'
+        'wraps past the last full buffer. Observed live against '
+        'qemu-img 10.0.8 on a read of a 10240-byte image and on a '
+        'cluster-straddling raw write run.'
     ),
     'cache-modes-refused': (
         'validation',
@@ -166,10 +168,10 @@ class BenchTestBase(InstarTestBase):
     """Shared helpers for the `instar bench` test families.
 
     Owns the `instar bench` / `qemu-img bench` runners, the
-    `/dev/kvm` skip guard, and the fixture builders (Mission
-    section 3): `make_raw_mbr`, `make_qcow2`, `make_populated_qcow2`,
-    `make_overlay`, `make_compressed_qcow2`, `make_vmdk`, `make_vhd`,
-    `make_vhdx`, plus `sha256` and `header_line`.
+    `/dev/kvm` skip guard, and the fixture builders: `make_raw_mbr`,
+    `make_qcow2`, `make_populated_qcow2`, `make_overlay`,
+    `make_compressed_qcow2`, `make_vmdk`, `make_vhd`, `make_vhdx`,
+    plus `sha256` and `header_line`.
     """
 
     def run_instar_bench(self, *args, timeout=120):
@@ -225,7 +227,7 @@ class BenchTestBase(InstarTestBase):
         return r
 
     # ------------------------------------------------------------------
-    # Fixture builders (Mission section 3).
+    # Fixture builders.
     # ------------------------------------------------------------------
 
     def make_raw_mbr(self, path, size='10M'):
@@ -268,9 +270,8 @@ class BenchTestBase(InstarTestBase):
     def make_populated_qcow2(self, path, size='16M', fill_size='8M'):
         """A qcow2 fixture with `[0, fill_size)` pre-filled with 0xbb.
 
-        Mirrors the 5c capture's "populated qcow2" base image: writes
-        land on already-allocated clusters, exercising the write
-        path's fast overwrite-in-place branch.
+        Writes land on already-allocated clusters, exercising the
+        write path's fast overwrite-in-place branch.
         """
         self.make_qcow2(path, size=size)
         self._qemu_io(path, f'write -P 0xbb 0 {fill_size}')
@@ -283,9 +284,9 @@ class BenchTestBase(InstarTestBase):
         `td` is the directory both files are created in -- instar's
         default `SecurityConfig` restricts backing references to the
         top image's own directory, so the backing file MUST live
-        alongside the overlay (5c capture note). Returns
-        `(backing_path, overlay_path)`. The backing reference is
-        written as the bare relative filename so a copy of the
+        alongside the overlay (instar refuses the chain otherwise).
+        Returns `(backing_path, overlay_path)`. The backing reference
+        is written as the bare relative filename so a copy of the
         overlay into any other directory containing a same-named
         backing file still resolves.
         """
@@ -337,7 +338,7 @@ class BenchTestBase(InstarTestBase):
 
     def make_vmdk(self, path, size='10M'):
         """A monolithicSparse vmdk fixture (single-file, embedded
-        descriptor -- mirrors the 4c/5c capture's `test.vmdk`)."""
+        descriptor)."""
         r = subprocess.run(
             ['qemu-img', 'create', '-f', 'vmdk',
              '-o', 'subformat=monolithicSparse', str(path), size],
@@ -369,7 +370,7 @@ class BenchTestBase(InstarTestBase):
 
 
 class TestBenchHeaderParity(BenchTestBase):
-    """The 4c header-byte-parity rows.
+    """Header-byte parity between instar and qemu-img.
 
     Identical args on identical fixtures, instar vs qemu-img: the
     first stdout line (the header) must be byte-EQUAL between tools,
@@ -506,13 +507,13 @@ class TestBenchHeaderParity(BenchTestBase):
 
 
 class TestBenchValidation(BenchTestBase):
-    """The corrected §2 message-contract table (phase-04 Mission §2).
+    """The host-side argument-validation message contract.
 
     Host-side validation failures only -- these fail inside
     `validate_bench_args`, BEFORE any guest launches, so (with one
     documented exception) they need no `/dev/kvm` guard. Every
-    numeric option has two failure forms (Supplement 2 of the phase-1
-    1e capture): an unparseable value gets the value-echoing
+    numeric option has two failure forms (both captured from
+    qemu-img 10.0.8): an unparseable value gets the value-echoing
     `Invalid <name> specified: '<v>'.` text, an out-of-range *number*
     gets the `Must be between` text. Where instar and qemu-img share
     the exact same message (a parity row), both sides are run and
@@ -595,9 +596,9 @@ class TestBenchValidation(BenchTestBase):
             '2147483647.')
 
     def test_range_bufsize(self):
-        """Includes the suffix-multiply overflow route (Supplement 2):
-        a suffix multiply that overflows u64 takes the range form, not
-        the echo form."""
+        """Includes the suffix-multiply overflow route: a suffix
+        multiply that overflows u64 takes the range form, not the echo
+        form (qemu's cvtnum returns ERANGE for it)."""
         core = ('Invalid buffer size specified. Must be between 1 and '
                 '2147483647.')
         self._assert_failure_and_parity('-s', '3G', core)
@@ -759,7 +760,7 @@ class TestBenchReadBehaviour(BenchTestBase):
             self.assertEqual(self.header_line(i_out), self.header_line(q_out))
 
     def test_wrap_window_master_rule_succeeds(self):
-        """The phase-1 10240-byte wrap vector: instar's master wrap
+        """The 10240-byte wrap vector: instar's master wrap
         rule keeps every wrapped request in-bounds, so the run
         succeeds. Paired with
         `TestBenchDivergenceRegression.test_wrap_rule_10_0_8_still_diverges`,
@@ -797,14 +798,14 @@ class TestBenchReadBehaviour(BenchTestBase):
 
 
 class TestBenchWrite(BenchTestBase):
-    """The 5c write-verification matrix, thinned (KVM).
+    """The write-verification matrix, thinned (KVM).
 
     Every scenario uses a fresh pristine copy per tool
     (`shutil.copy2`) so instar's and qemu-img's runs never share a
     mutated file. Virtual-content parity is asserted via
     `qemu-img compare` (allocator placement may legitimately differ
-    between the two implementations; see PLAN-bench-phase-05-write.md
-    step 5b) plus `qemu-img check` clean; raw is additionally
+    between the two implementations, since each picks its own free
+    clusters) plus `qemu-img check` clean; raw is additionally
     byte-comparable (sha256) since there is no allocator involved.
     """
 
@@ -951,16 +952,16 @@ class TestBenchWrite(BenchTestBase):
 
     def test_qcow2_2mib_cluster_allocating_write(self):
         """cs = 2 MiB allocating `-w`: compare identical + check clean
-        vs a qemu-img twin (phase-6 step-6b requirement; the first live
-        exercise of the qcow2-write crate at 2 MiB clusters guest-side).
+        vs a qemu-img twin (the only live exercise of the qcow2-write
+        crate at 2 MiB clusters guest-side).
 
         `-c 20 -s 2097152` steps by one 2 MiB cluster per request, so
         each of the 20 writes allocates a fresh 2 MiB data cluster (and
         a fresh L2 on first touch). Non-wrapping: 19*2097152 + 4096 =
         39,849,984 < 64 MiB. cs=2 MiB has no in-envelope growth path
         (one refblock covers 2 TiB), so this is pure allocation. The
-        oracle is virtual content (allocator placement legitimately
-        differs, B-D1), not byte identity.
+        oracle is virtual content (instar's allocator legitimately
+        places clusters differently from qemu's), not byte identity.
         """
         self._require_kvm()
         with tempfile.TemporaryDirectory() as td:
@@ -1014,7 +1015,8 @@ class TestBenchWrite(BenchTestBase):
             os.unlink(trace_path)
 
     def test_flush_census_fsync_count(self):
-        """Decision 4 fsync census: on an overwrite-only (no-growth,
+        """fsync census, preserved exactly across bench's move onto the
+        qcow2-write executor: on an overwrite-only (no-growth,
         no-alloc) run the executor issues ZERO fsyncs and bench owns
         exactly one op-side fsync per count-based cadence point, so the
         cadence run's fsync count exceeds an interval-0 run's by exactly
@@ -1118,10 +1120,10 @@ class TestBenchWrite(BenchTestBase):
 
 
 class TestBenchWriteRefusals(BenchTestBase):
-    """Write-path gate contracts (Mission §3; ~10 tests).
+    """Write-path gate contracts.
 
-    vmdk/vhd/vhdx are refused HOST-SIDE (Mission §3's "-w host-side
-    format gate", `run_bench`, before the header prints or the guest
+    vmdk/vhd/vhdx are refused HOST-SIDE (the `-w` host-side format
+    gate in `run_bench`, before the header prints or the guest
     launches) so those three need no `/dev/kvm` guard; refcount_bits=1,
     compression, LUKS encryption, extended L2, an external data file,
     and the dirty bit are all refused GUEST-SIDE (the qcow2 write
@@ -1130,9 +1132,8 @@ class TestBenchWriteRefusals(BenchTestBase):
     image's sha256 is unchanged -- a refused write must not touch the
     file.
 
-    Internal snapshots are NO LONGER refused: phase-7 step 7d lifted
-    the last snapshot gate and `bench -w` now copies snapshot-shared
-    clusters (see `TestBenchSnapshotCow`).
+    Internal snapshots are NOT refused: `bench -w` copies
+    snapshot-shared clusters (see `TestBenchSnapshotCow`).
     """
 
     def _assert_write_refused(self, path, fmt_hint, expected_substr):
@@ -1259,10 +1260,10 @@ class TestBenchWriteRefusals(BenchTestBase):
 
         `qemu-io write -z 0 65536` sets QCOW_OFLAG_ZERO (bit 0) on
         cluster 0's L2 entry without allocating a host cluster
-        (host_offset == 0). Phase 6 (decision 8) refused such a target
-        as `UnknownL2Entry` -> bench wire code 9 -- a conservative
-        interim while the crate had no zero-flag handling. Phase 7
-        (step 7a, decision 6, alongside the #432 read-path fix)
+        (host_offset == 0). bench once refused such a target as
+        `UnknownL2Entry` -> bench wire code 9 -- a conservative
+        interim while the qcow2-write crate had no zero-flag
+        handling. The crate (alongside the #432 read-path fix) now
         classifies a host==0 zero-flag target as `Unallocated` and
         allocates a fresh cluster, exactly as qemu does when writing
         into a zero cluster. A `-w` schedule that covers cluster 0
@@ -1323,22 +1324,22 @@ class TestBenchWriteRefusals(BenchTestBase):
 
 
 class TestBenchSnapshotCow(BenchTestBase):
-    """`bench -w` copy-on-write into a snapshot-bearing image (C8).
+    """`bench -w` copy-on-write into a snapshot-bearing image.
 
-    Phase-7 step 7d lifts the last of the three interim
-    snapshot-refusal gates (commit 7b and rebase 7c lifted the other
-    two). bench writes into its OWN image's active view, so a write
-    that lands on a snapshot-shared cluster now copies it (C1) and
-    COWs the snapshot-shared L2 table above it (C2) instead of being
-    refused with `ERROR_WRITE_UNSUPPORTED` (gate 7). Every pre-existing
-    internal snapshot is preserved bit-identically (C8, like commit's
-    C6), and the active view stays `qemu-img compare`-identical to a
-    `qemu-img bench -w` twin and `qemu-img check`-clean.
+    bench, like commit and rebase, once refused writes into a
+    snapshot-bearing image (`ERROR_WRITE_UNSUPPORTED`). bench writes
+    into its OWN image's active view, so a write that lands on a
+    snapshot-shared cluster now copies it and COWs the
+    snapshot-shared L2 table above it instead. Every pre-existing
+    internal snapshot is preserved bit-identically (as commit
+    preserves a backing's snapshots), and the active view stays
+    `qemu-img compare`-identical to a `qemu-img bench -w` twin and
+    `qemu-img check`-clean.
 
     The matrix is cluster size {65536, 512}; the cs=512 leg COWs
     hundreds of 512-byte clusters at the file end, crossing refblock
     boundaries and exercising the preemptive refcount growth bench
-    already shares (C9 — inherited unchanged, since
+    already shares (inherited unchanged, since
     `worst_case_touched` upper-bounds the fresh COW clusters exactly
     as it bounds fresh allocations for unallocated writes).
     """
@@ -1361,16 +1362,16 @@ class TestBenchSnapshotCow(BenchTestBase):
         self.assertEqual(r.returncode, 0, f'snapshot -c failed: {r.stderr}')
 
     def test_snapshot_shared_cow_compare_check_preserve(self):
-        """`bench -w` into a snapshot-bearing image: C5 + C8 parity.
+        """`bench -w` into a snapshot-bearing image: qemu parity + preservation.
 
         Over cluster sizes {65536, 512} (the cs=512 leg crossing a
-        refblock boundary, C9):
+        refblock boundary to exercise refcount growth during COW):
 
         - instar `bench -w` succeeds (rc 0);
-        - C5: the result is `qemu-img compare`-identical to a
+        - the result is `qemu-img compare`-identical to a
           `qemu-img bench -w` twin and `qemu-img check`-clean with
           zero `refcount=1 reference=2`;
-        - C8: snap1's read-back is PRESERVED (== pre-write) and
+        - snap1's read-back is PRESERVED (== pre-write) and
           equals the qemu twin's snap1 read-back.
         """
         self._require_kvm()
@@ -1397,7 +1398,7 @@ class TestBenchSnapshotCow(BenchTestBase):
                 q_out, q_err, q_rc = self.run_qemu_bench(*args, str(b))
                 self.assertEqual(q_rc, 0, f'qemu: {q_err}')
 
-                # C5: active-view parity + check clean, no doubly-referenced
+                # Active-view parity + check clean, no doubly-referenced
                 # clusters.
                 cmp_out, cmp_err, cmp_rc = self.run_qemu_img_compare(a, b)
                 self.assertEqual(
@@ -1409,25 +1410,25 @@ class TestBenchSnapshotCow(BenchTestBase):
                     'refcount=1 reference=2', chk_out + chk_err,
                     'COW must leave no doubly-referenced clusters')
 
-                # C8: snap1 preserved and == qemu twin.
+                # snap1 preserved and == qemu twin.
                 snap1_post = snapshot_readback('qemu-img', a, 'snap1')
                 snap1_twin = snapshot_readback('qemu-img', b, 'snap1')
                 self.assertEqual(
                     snap1_post, snap1_pre,
-                    'C8: bench -w must preserve the internal snapshot')
+                    'bench -w must preserve the internal snapshot')
                 self.assertEqual(
                     snap1_post, snap1_twin,
-                    'C8: snap1 read-back must equal the qemu twin')
+                    'snap1 read-back must equal the qemu twin')
 
 
 class TestBenchRefcountGrowth(BenchTestBase):
     """The qcow2 `-w` refcount-growth matrix (KVM).
 
-    PLAN-bench-refcount-growth phase 03: since phase 02, bench's
-    qcow2 write setup preemptively grows the refcount structures
-    (new refblocks at the file end; the refcount table relocated and
-    enlarged when out of slots) instead of refusing schedules whose
-    allocations outrun the populated refblock coverage. The
+    bench's qcow2 write setup preemptively grows the refcount
+    structures (new refblocks at the file end; the refcount table
+    relocated and enlarged when out of slots) instead of refusing
+    schedules whose allocations outrun the populated refblock
+    coverage. The
     refblock-coverage divergence registered during the interim
     mitigation (differential-fuzz issues #397-#401) is retired; its
     regression test is replaced by the parity tests here.
@@ -1934,9 +1935,9 @@ class TestBenchDivergenceRegression(BenchTestBase):
                 i_err)
 
             # -c 3 (not 100) keeps every request in-bounds on the 10 MiB
-            # fixture, per the 4c capture's note on this exact row: with
-            # more requests qemu's OWN `% image_size` wrap bug would EIO
-            # first, masking the divergence this test targets.
+            # fixture: with more requests qemu's OWN `% image_size` wrap
+            # bug would EIO first (observed live with -c 100 -s 3M),
+            # masking the divergence this test targets.
             q_out, q_err, q_rc = self.run_qemu_bench(
                 '-c', '3', '-s', '3M', '-f', 'raw', str(img))
             self.assertEqual(
@@ -2023,7 +2024,7 @@ class TestBenchDivergenceRegression(BenchTestBase):
 
 
 class TestBenchVdi(BenchTestBase):
-    """Smoke test for benchmarking VDI input (format-coverage phase 2).
+    """Smoke test for benchmarking VDI input.
 
     VDI graduates to a real read format for the reader-linking ops,
     including bench (bench's Cargo.toml enables the qcow2 `vdi-input`
@@ -2062,7 +2063,7 @@ class TestBenchVdi(BenchTestBase):
 
 
 class TestBenchParallels(BenchTestBase):
-    """Smoke test for benchmarking Parallels input (format-coverage phase 3).
+    """Smoke test for benchmarking Parallels input.
 
     Parallels graduates to a real read format for the reader-linking ops,
     including bench (bench's Cargo.toml enables the qcow2 `parallels-input`
@@ -2101,7 +2102,7 @@ class TestBenchParallels(BenchTestBase):
 
 
 class TestBenchQcow1(BenchTestBase):
-    """Smoke test for benchmarking QCOW1 input (format-coverage phase 4).
+    """Smoke test for benchmarking QCOW1 input.
 
     qcow1 graduates to a real read format for the reader-linking ops,
     including bench (bench's Cargo.toml enables the qcow2 ``qcow1-input``
@@ -2141,7 +2142,7 @@ class TestBenchQcow1(BenchTestBase):
 
 
 class TestBenchDmg(BenchTestBase):
-    """Smoke test for benchmarking DMG input (format-coverage phase 5).
+    """Smoke test for benchmarking DMG input.
 
     DMG graduates to a real read format for the reader-linking ops,
     including bench (bench's Cargo.toml enables the qcow2 ``dmg-input``
@@ -2181,11 +2182,11 @@ class TestBenchDmg(BenchTestBase):
 
 
 class TestBenchQed(BenchTestBase):
-    """bench refuses QED input (format-coverage phase 6).
+    """bench refuses QED input.
 
     Unlike VDI/Parallels/QCOW1/DMG -- which graduated to real read
     formats -- QED stays read-refused by deliberate policy (see
-    docs/plans/PLAN-format-coverage-phase-06-qed.md).  bench routes
+    docs/quirks.md "QED read-refusal as policy").  bench routes
     every source through the issue-#444 host chain-discovery gate, so a
     QED input is refused there ("input format 'qed' is detected but not
     supported for reading (detection and info only)") before any guest

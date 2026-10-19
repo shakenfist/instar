@@ -1275,8 +1275,7 @@ pub unsafe fn parse_snapshot_table(
 /// `id=2 name="x"`, the needle `2` resolves to ID 2, not to the
 /// snapshot named "2". (The earlier per-entry id-or-name walk
 /// returned the first hit of either kind, which diverged from
-/// qemu on exactly such collision tables; fixed in PLAN-snapshot
-/// phase 14, probe 1.)
+/// qemu on exactly such collision tables.)
 ///
 /// Returns the index into `SnapshotTable::entries` if found.
 pub fn find_snapshot(table: &SnapshotTable, needle: &[u8]) -> Option<usize> {
@@ -2329,7 +2328,8 @@ impl Qcow2State {
     ///
     /// Reports allocations in the top layer only; backing-chain
     /// composition (shadowing across layers) is the caller's
-    /// responsibility (see phase 3 host code in `PLAN-measure.md`).
+    /// responsibility. The measure host does not do it yet, so
+    /// `instar measure` reports top-layer allocations only (#642).
     ///
     /// `virtual_size` must be supplied by the caller because
     /// `Qcow2State` does not store it.
@@ -4297,8 +4297,8 @@ mod tests {
     // ====================================================================
     // Smoke-test that the new helpers are wired correctly via the
     // module's public API. Full Qcow2State::map_extents end-to-end
-    // coverage lives in the phase 6 integration tests against real
-    // testdata.
+    // coverage lives in the map integration tests (tests/test_map.py)
+    // against real testdata.
     // ====================================================================
 
     #[test]
@@ -4311,7 +4311,7 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Snapshot table parser tests (PLAN-snapshot phase 2)
+    // Snapshot table parser tests
     // ----------------------------------------------------------------
 
     /// Build a 40-byte snapshot header with the given fields.
@@ -5001,13 +5001,14 @@ mod tests {
     // ---- Byte-accurate read primitives (read_raw_sectors /
     //      read_cluster_sectors) -------------------------------------
     //
-    // Phase 3 rewrote these two shared read primitives to serve
-    // arbitrary sub-sector byte ranges, keeping a sector-aligned fast
-    // path byte-identical and adding a byte-accurate scratch-and-copy
-    // path for unaligned / partial windows. These tests pin both paths
-    // to a deterministic, position-dependent device pattern so any
-    // regression (e.g. dropping a partial tail, or mis-offsetting into
-    // a multi-sector cluster) fails fast without KVM or testdata.
+    // These two shared read primitives serve arbitrary sub-sector byte
+    // ranges (`instar dd` needs byte-accurate reads to match qemu-img
+    // dd): a sector-aligned fast path, and a byte-accurate
+    // scratch-and-copy path for unaligned / partial windows. These tests
+    // pin both paths to a deterministic, position-dependent device
+    // pattern so any regression (e.g. dropping a partial tail, or
+    // mis-offsetting into a multi-sector cluster) fails fast without KVM
+    // or testdata.
 
     /// Sector size used by the read-primitive tests. Small so cases are
     /// easy to reason about by hand.
@@ -5189,9 +5190,9 @@ mod tests {
 
     #[test]
     fn read_raw_sub_sector_length_tail() {
-        // Sector-aligned start, length not a sector multiple. Dropping
-        // the partial tail was the phase-3 bug; len=300 and len=1000
-        // both leave a non-zero tail that must be copied.
+        // Sector-aligned start, length not a sector multiple. The
+        // sector-only primitive dropped the partial tail; len=300 and
+        // len=1000 both leave a non-zero tail that must be copied.
         check_read_raw(0, 300, 32);
         check_read_raw(512, 1000, 32);
     }
@@ -5243,7 +5244,8 @@ mod tests {
     #[test]
     fn read_cluster_unaligned_host_offset_multi_sector() {
         // Non-sector-aligned host_offset into a multi-sector cluster —
-        // the latent bug phase 3 fixed. host_offset 600 (sector 1 + 88)
+        // a latent bug in the sector-only primitive, which mis-offset
+        // into such clusters. host_offset 600 (sector 1 + 88)
         // with a 1536-byte (3-sector) cluster spans a partial head, a
         // full interior sector, and a partial tail. Assert exact bytes.
         check_read_cluster(600, 1536, 32);
@@ -14698,18 +14700,19 @@ pub unsafe fn read_chain_virtual_cluster(
             #[cfg(feature = "dmg-input")]
             ImageFormat::Dmg => {
                 // ================= EIO PARITY (READ THIS) =================
-                // This arm INVERTS the phase 2-4 zero-fill posture. Unlike
-                // the VDI / Parallels / VHD / qcow1 arms, DMG reads ERROR
-                // where those formats zero-fill. qemu's block/dmg.c short-
-                // preads a truncated data fork and treats a gap (a sector
-                // covered by no chunk: a hole between chunks, a dropped
-                // unsupported-codec chunk, or the koly-SectorCount tail
-                // beyond mish coverage) as a hard I/O error — convert exits
-                // non-zero. We mirror that exactly: any span whose bytes
-                // the device cannot supply, and any Gap, returns `false`
-                // here — NEVER a zero-fill. Only genuine zero/ignore chunks
-                // write zeros. DMG has no backing file, so there is no
-                // chain descent from this arm.
+                // This arm INVERTS the other read-only arms' zero-fill
+                // posture. Unlike the VDI / Parallels / VHD / qcow1 arms,
+                // DMG reads ERROR where those formats zero-fill. qemu's
+                // block/dmg.c short-preads a truncated data fork and
+                // treats a gap (a sector covered by no chunk: a hole
+                // between chunks, a dropped unsupported-codec chunk, or
+                // the koly-SectorCount tail beyond mish coverage) as a
+                // hard I/O error — convert exits non-zero. We mirror that
+                // exactly: any span whose bytes the device cannot supply,
+                // and any Gap, returns `false` here — NEVER a zero-fill.
+                // Only genuine zero/ignore chunks write zeros. DMG has no
+                // backing file, so there is no chain descent from this
+                // arm.
                 let state = match &chain_states.dmg_states[dev_idx] {
                     Some(s) => s,
                     None => return false,
@@ -15140,8 +15143,7 @@ pub struct ChainStates {
 /// the channel the host already watches: the host's `SerialDecoder`
 /// captures an `error` message whose operation is
 /// `DifferencingRefusal::OPERATION` and renders it in place of the
-/// operation's generic failure text. See decision 2 of
-/// `docs/plans/PLAN-differencing-phase-04-read-policy.md`.
+/// operation's generic failure text.
 ///
 /// `status` is one of `DifferencingRefusal::STATUS_VHD` /
 /// `STATUS_VHDX`.

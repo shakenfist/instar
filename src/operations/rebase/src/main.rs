@@ -1,24 +1,24 @@
 //! Rebase operation: change an overlay's backing-file reference.
 //!
-//! Phase 3 of `PLAN-rebase-commit.md`. Reads a `RebaseConfig`
-//! from `OPERATION_CONFIG_ADDR`, reads sector 0 of the output
+//! Reads a `RebaseConfig` from `OPERATION_CONFIG_ADDR`, reads
+//! sector 0 of the output
 //! device (the overlay being rebased), detects the format,
 //! dispatches to the matching per-format runner, and reports
 //! the outcome via `send_rebase_result` + `send_complete`.
 //!
-//! The qcow2 safe-mode runner (re-composed by phase 5 of
-//! `PLAN-qcow2-write-infrastructure`) walks every guest
-//! cluster, probes the overlay's ORIGINAL pre-run mapping to
-//! decide whether the cluster needs comparing at all, reads
-//! the old and new chains through the untouched chain reader,
-//! and for divergent clusters plans the overlay write via
+//! The qcow2 safe-mode runner walks every guest cluster,
+//! probes the overlay's ORIGINAL pre-run mapping to decide
+//! whether the cluster needs comparing at all, reads the old
+//! and new chains through the chain reader, and for divergent
+//! clusters plans the overlay write via the shared
 //! `qcow2_write::plan_write` (allocation, classification
-//! refusals, L2 window management) executed literally by
-//! `qcow2_write_exec::execute`. One `plan_flush` epoch replaces
-//! the inline L2 → L1 → refblock flush; the deferred
-//! header/backing-path patch group (`apply_rebase_plan`) still
-//! lands last. The `-u` metadata-only path, unsafe detach and
-//! the whole vmdk runner are untouched.
+//! refusals, copy-on-write, L2 window management) executed
+//! literally by `qcow2_write_exec::execute`. One `plan_flush`
+//! epoch writes the L2 → L1 → refblock metadata at the end;
+//! the deferred header/backing-path patch group
+//! (`apply_rebase_plan`) lands after it. The `-u`
+//! metadata-only path, unsafe detach and the vmdk runner use
+//! their own in-crate planners instead.
 
 #![no_std]
 #![no_main]
@@ -53,8 +53,8 @@ use shared::{
 // because exactly one per-format runner executes per
 // invocation:
 //
-// 1. The qcow2 SAFE-MODE ladder (phase 5 of
-//    PLAN-qcow2-write-infrastructure): fixed regions only,
+// 1. The qcow2 SAFE-MODE ladder (the qcow2-write carve
+//    shared with commit and bench): fixed regions only,
 //    each derived from the previous one's end (the c84743e
 //    ordering discipline), const-asserted below the allocator
 //    heap. This replaced the old EXISTING_STATE growable
@@ -86,8 +86,10 @@ const STABLE_HEADER_BUF: usize = HEADER_BUF + MAX_SECTOR_SIZE;
 const OVERLAY_L1_BUF: usize = STABLE_HEADER_BUF + MAX_SECTOR_SIZE;
 const OVERLAY_L1_LIMIT: usize = MAX_SECTOR_SIZE;
 /// Read-only copy of the ORIGINAL pre-run L1 table for the
-/// skip probe (decision 1): the probe must consult the
-/// overlay's pre-run mapping, never the planner's patched L1.
+/// skip probe: the probe must consult the overlay's pre-run
+/// mapping, never the planner's patched L1 (calling plan_write
+/// on an already-mapped cluster would classify it Owned and
+/// overwrite it with old-chain content).
 const ORIG_L1_BUF: usize = OVERLAY_L1_BUF + OVERLAY_L1_LIMIT;
 const ORIG_L1_LIMIT: usize = MAX_SECTOR_SIZE;
 /// Staged overlay refcount table (`RegionId::RefcountTable`).
@@ -95,13 +97,15 @@ const ORIG_L1_LIMIT: usize = MAX_SECTOR_SIZE;
 /// model): the planner only reads the entries covering the
 /// staged refblocks (`refblock_count * 8` bytes, <= 16 KiB at
 /// the 2048-refblock cap), so a 1 MiB-cluster refcount table
-/// larger than this buffer must not refuse (the old staging
-/// budget allowed it; see the phase-5 envelope computation).
+/// larger than this buffer must not refuse (the old shared
+/// staging arena allowed it, and this fixed-region carve must
+/// not narrow what that arena accepted).
 const OVERLAY_RT_BUF: usize = ORIG_L1_BUF + ORIG_L1_LIMIT;
 const OVERLAY_RT_LIMIT: usize = MAX_SECTOR_SIZE;
 /// Staged overlay refblocks (`RegionId::Refblocks`), a dense
 /// prefix covering host clusters from zero, contiguity-gated
-/// at staging (divergence R-D4's fix). Capacity:
+/// at staging (a holed refcount table refuses pre-mutation
+/// instead of being silently misallocated). Capacity:
 /// byte-capacity-driven with the `qcow2_write::MAX_REFBLOCKS`
 /// (2048) count cap on top.
 const OVERLAY_REFBLOCKS_BUF: usize = OVERLAY_RT_BUF + OVERLAY_RT_LIMIT;
@@ -109,13 +113,14 @@ const OVERLAY_REFBLOCKS_LIMIT: usize = 3 * 1024 * 1024;
 /// Overlay L2 window (`RegionId::L2Slot`):
 /// `min(MAX_L2_SLOTS, OVERLAY_L2_LIMIT / cluster_size)` slots
 /// (>= 2 at the 1 MiB cluster envelope). Unlike the retired
-/// stage-everything arena, eviction is reachable and accepted
-/// (R-D5): the walk never revisits a table, so an evicted
-/// table is written exactly once and never reloaded.
+/// stage-everything arena, eviction is reachable and accepted:
+/// the walk never revisits a table, so an evicted table is
+/// written exactly once and never reloaded (final bytes are
+/// unchanged; only intermediate I/O order differs).
 const OVERLAY_L2_STAGING: usize = OVERLAY_REFBLOCKS_BUF + OVERLAY_REFBLOCKS_LIMIT;
 const OVERLAY_L2_LIMIT: usize = 2 * 1024 * 1024;
-/// Probe L2 buffer (decision 1): one cluster-sized slot holding
-/// the ORIGINAL on-disk L2 table for the walk's current
+/// Probe L2 buffer for the skip probe: one cluster-sized slot
+/// holding the ORIGINAL on-disk L2 table for the walk's current
 /// `l1_idx`, reloaded on `l1_idx` change (the walk is
 /// monotonic, so exactly one read per populated table).
 const PROBE_L2_BUF: usize = OVERLAY_L2_STAGING + OVERLAY_L2_LIMIT;
@@ -236,7 +241,7 @@ const _: () = assert!(
 );
 const _: () = assert!(
     STEP_CAPACITY >= 512,
-    "step window unexpectedly small; the decision-1 loop assumes 1300+ steps"
+    "step window unexpectedly small; the plan-execute-resume loop assumes 1300+ steps"
 );
 // At the largest cluster rebase accepts (COMPARE_BUF_SIZE), the
 // planner bounce and the probe buffer still cover a whole
@@ -294,8 +299,9 @@ fn err_result(overlay_format: u32, mode: u32, error: u32) -> RebaseResult {
 
 /// Map a `RebaseError` from the planner crate to the matching
 /// `RebaseResult::ERROR_*` wire code. Every variant has a
-/// distinct destination after phase 3 step 3a appended codes
-/// 7..=13.
+/// distinct destination; codes 7..=13 were appended (wire codes
+/// are append-only) to give the planner-internal variants their
+/// own codes.
 fn map_rebase_error(e: RebaseError) -> u32 {
     match e {
         RebaseError::UnsupportedFormat | RebaseError::UnsupportedSubformat => {
@@ -317,8 +323,8 @@ fn map_rebase_error(e: RebaseError) -> u32 {
 }
 
 /// Map a `qcow2_write::Gate` envelope refusal on the OVERLAY
-/// header to a `RebaseResult::ERROR_*` wire code (phase-5
-/// decision 6). Every gate that duplicates an existing op or
+/// header to a `RebaseResult::ERROR_*` wire code. Codes are
+/// append-only: every gate that duplicates an existing op or
 /// planner gate keeps that gate's code — and is unreachable in
 /// practice because those run first, in their existing order.
 /// The genuinely new refusal family is
@@ -326,7 +332,7 @@ fn map_rebase_error(e: RebaseError) -> u32 {
 /// bits — rebase previously proceeded in violation of the
 /// spec) plus [`Gate::ExtendedL2`] (safe mode previously
 /// misread 16-byte L2 entries as 8-byte and silently corrupted
-/// the overlay — divergence R-D1).
+/// the overlay).
 fn map_overlay_gate(gate: Gate) -> u32 {
     match gate {
         Gate::UnknownIncompatible | Gate::ExtendedL2 => RebaseResult::ERROR_OVERLAY_UNSUPPORTED,
@@ -345,26 +351,31 @@ fn map_overlay_gate(gate: Gate) -> u32 {
 }
 
 /// Map a `qcow2_write::WriteError` from `plan_write` /
-/// `plan_flush` to a `RebaseResult::ERROR_*` wire code (phase-5
-/// decision 6). `BufFull` is the windowing resume signal, never
+/// `plan_flush` to a `RebaseResult::ERROR_*` wire code (codes
+/// are append-only, as for [`map_overlay_gate`]). `BufFull` is
+/// the windowing resume signal, never
 /// surfaced as an error — the driving loop consumes it; it only
 /// lands here if the loop is broken (an op bug).
 fn map_write_error(e: WriteError) -> u32 {
     match e {
-        // The allocator ran out of staged refblocks; phase 6's
-        // refcount-growth planner lifts this. Keeps wire 10 and
-        // its message (pinned by TestRebaseStagedL2Growth).
+        // The allocator ran out of staged refblocks even after
+        // the runner's preemptive refcount growth — the ceiling
+        // once growth's own envelope is exhausted. Keeps wire 10
+        // and its message (pinned by TestRebaseStagedL2Growth).
         WriteError::RefcountExhausted => RebaseResult::ERROR_REFCOUNT_EXHAUSTED,
-        // Unreachable behind the decision-1 skip probe (any
+        // Unreachable behind the skip probe (any
         // non-zero original L2 entry — compressed included —
         // skips the cluster before the planner sees it); mapped
         // defensively to the existing unsupported-format code.
         WriteError::CompressedCluster => RebaseResult::ERROR_UNSUPPORTED_FORMAT,
         // Classification refusals on inconsistent-but-gate-
-        // passing overlays (divergence R-D3/R-D4).
-        // NeedsBackingFill is unreachable for rebase's
-        // full-cluster (EOV-tail-clamped) requests after the 4q
-        // amendment; mapped here defensively.
+        // passing overlays (bad COPIED / refcount / reserved
+        // bits, or a holed refcount table the old code silently
+        // misallocated). NeedsBackingFill is unreachable for
+        // rebase's full-cluster (EOV-tail-clamped) requests,
+        // because qcow2-write treats a partial write that reaches
+        // `virtual_size` as full coverage; mapped here
+        // defensively.
         WriteError::SnapshotShared
         | WriteError::SnapshotSharedL2Table
         | WriteError::RefcountInconsistent
@@ -384,9 +395,11 @@ fn map_write_error(e: WriteError) -> u32 {
 }
 
 /// Map a shared [`growth::grow_refcounts`] failure to a
-/// `RebaseResult::ERROR_*` wire code (phase 7, decision 5).
+/// `RebaseResult::ERROR_*` wire code. Growth execution is the
+/// helper shared with commit and bench, not per-op code.
 /// `StageOutOfCoverage` is the planner's self-coverage-invariant
-/// internal-bug path (the `*_INCONSISTENT` family, decision 7); a
+/// internal-bug path, mapped to the existing `*_INCONSISTENT`
+/// family rather than a new code; a
 /// device write failure keeps the code the executor's own window
 /// writes use (`ERROR_HEADER_MISMATCH`, the code `exec_window`
 /// failures map to). `FsyncFailed` cannot arise on the fsync-less
@@ -512,15 +525,13 @@ unsafe fn apply_rebase_plan(call_table: &CallTable, plan: &RebasePlan<'_>) -> bo
 }
 
 // ---------------------------------------------------------------------------
-// Per-format runners (stubs in step 3b)
+// Per-format runners
 // ---------------------------------------------------------------------------
 
 /// qcow2 rebase runner.
 ///
 /// Dispatches on the `FLAG_UNSAFE` bit of [`RebaseConfig`] and
 /// delegates to [`run_qcow2_unsafe`] or [`run_qcow2_safe`].
-/// Safe mode is a stub in step 3c that returns
-/// `ERROR_UNSUPPORTED_FORMAT`; step 3e fills it in.
 unsafe fn run_qcow2(call_table: &CallTable, config: &RebaseConfig) -> RebaseResult {
     if config.is_unsafe() {
         run_qcow2_unsafe(call_table, config)
@@ -620,13 +631,14 @@ unsafe fn run_qcow2_unsafe(call_table: &CallTable, config: &RebaseConfig) -> Reb
 }
 
 // ---------------------------------------------------------------------------
-// qcow2 safe-mode staging + step-window plumbing (phase 5)
+// qcow2 safe-mode staging + step-window plumbing
 // ---------------------------------------------------------------------------
 
 /// Geometry of the safe-mode scratch carve for one run,
 /// threaded to the [`StagedRegions`] / [`Regions`] view
 /// builders so the planner and executor alias the exact same
-/// buffers (the two halves of the qcow2-write decision-1 loop).
+/// buffers (the two halves of the qcow2-write plan/execute
+/// window loop).
 #[derive(Clone, Copy)]
 struct OverlayCarve {
     cluster_size: usize,
@@ -649,9 +661,9 @@ struct OverlayCarve {
 ///
 /// The returned slices alias the fixed scratch regions; the
 /// caller must not hold a [`Regions`] view (or any other
-/// aliasing borrow) at the same time. The decision-1 loop
-/// guarantees this: plan with the staged view, drop it, execute
-/// with the regions view.
+/// aliasing borrow) at the same time. The plan/execute window
+/// loop guarantees this: plan with the staged view, drop it,
+/// execute with the regions view.
 unsafe fn staged_view<'a>(carve: &OverlayCarve) -> StagedRegions<'a> {
     StagedRegions {
         l1: core::slice::from_raw_parts(OVERLAY_L1_BUF as *const u8, carve.l1_bytes),
@@ -733,7 +745,9 @@ unsafe fn init_step_storage() -> &'static mut [Step] {
 /// Cluster-aligned current file end of the overlay, derived from
 /// its staged refcount structures — the rebase-side analogue of
 /// commit's `backing_file_end_clusters`, the base the
-/// refcount-growth planner grows from (C9). Considers (a) the
+/// refcount-growth planner grows from (so a COW schedule that
+/// crosses a refblock boundary grows rather than refusing).
+/// Considers (a) the
 /// highest staged refblock entry with a nonzero refcount, (b) the
 /// refcount table's extent, (c) the L1 table's extent, (d) each
 /// populated refblock cluster's own offset, and (e) the header
@@ -783,8 +797,8 @@ unsafe fn overlay_file_end_clusters(carve: &OverlayCarve, overlay: &QcowHeader) 
 /// index 0 (bench's contiguity gate). A sparse (holed) refcount
 /// table refuses as `ERROR_OVERLAY_INCONSISTENT` BEFORE any
 /// mutation — under the old dense-compaction staging this shape
-/// was silently misallocated (divergence R-D4, a live defect:
-/// holed RTs are stock-producible via discard + `qemu-img
+/// was silently misallocated (a live defect, not a theoretical
+/// one: holed RTs are stock-producible via discard + `qemu-img
 /// resize --shrink` and pass `qemu-img check`; the rebase
 /// sibling of GitHub issue #428). Entries with reserved low
 /// bits or a missing/misaligned masked offset refuse the same
@@ -907,8 +921,9 @@ unsafe fn stage_overlay_qcow2(
 /// `x86_64-unknown-none` with `opt-level = "z"` + `lto = true`,
 /// inlining a large runner into the `extern "C"` `_start` can
 /// miscompile it (see the note on `run_qcow2` in
-/// `src/operations/amend/src/main.rs`). The phase-5 rework made
-/// this function strictly larger, so keep it out of line.
+/// `src/operations/amend/src/main.rs`). Moving safe mode onto
+/// qcow2-write made this function strictly larger, so keep it
+/// out of line.
 #[inline(never)]
 unsafe fn run_qcow2_safe(call_table: &CallTable, config: &RebaseConfig) -> RebaseResult {
     let sector_size = (call_table.get_output_sector_size)();
@@ -934,7 +949,8 @@ unsafe fn run_qcow2_safe(call_table: &CallTable, config: &RebaseConfig) -> Rebas
     };
 
     // v1 covers refcount_bits == 16 only; this matches the
-    // planner's safe-mode coverage (see qcow2.rs step 2c).
+    // planner's safe-mode coverage (see `plan_qcow2_safe` in
+    // crates/rebase/src/qcow2.rs).
     if parsed.refcount_bits != 16 {
         return err_result(
             config.overlay_format,
@@ -943,27 +959,28 @@ unsafe fn run_qcow2_safe(call_table: &CallTable, config: &RebaseConfig) -> Rebas
         );
     }
 
-    // Phase 7 COW adoption (decision 4a, GitHub #421): the
-    // interim phase-2 nb_snapshots gate that refused any
-    // snapshot-bearing overlay is lifted here. Safe-mode rebase
-    // of a snapshot-bearing overlay is now handled by
+    // Snapshot-bearing overlays are accepted (GitHub #421);
+    // there is deliberately no nb_snapshots gate here. Safe-mode
+    // rebase of a snapshot-bearing overlay is handled by
     // copy-on-write: `new_state_cow` + `check_envelope_with(..,
     // allow_snapshots = true)` below let the qcow2-write
     // classifier emit COW steps for snapshot-shared active L2
-    // tables (C2) instead of writing new mappings into them in
-    // place, and the shared refcount-growth planner provisions
-    // the extra refblocks the COW allocations need (C9). The old
-    // failure mode (writing into a shared L2 in place, leaving
-    // `refcount=1 reference=2` on clusters two L1 trees
-    // reference, so a later `qemu-img snapshot -d` frees live
-    // active-view data — #421) is thereby structurally
+    // tables instead of writing new mappings into them in place,
+    // and the shared refcount-growth planner provisions the
+    // extra refblocks the COW allocations need (so a COW
+    // schedule that crosses a refblock boundary grows rather
+    // than refusing). The old failure mode (writing into a shared
+    // L2 in place, leaving `refcount=1 reference=2` on clusters
+    // two L1 trees reference, so a later `qemu-img snapshot -d`
+    // frees live active-view data — #421) is thereby structurally
     // unreachable: COW never mutates a snapshot's own L1/L2, so
     // every pre-existing snapshot is preserved and reads through
     // whatever backing the overlay now points at (the NEW one),
-    // matching `qemu-img rebase`'s active-view-only contract
-    // (C7). This runner is only entered without FLAG_UNSAFE (see
+    // matching `qemu-img rebase`'s active-view-only contract.
+    // This runner is only entered without FLAG_UNSAFE (see
     // `run_qcow2`), so it also covers safe detach; the `-u`
-    // metadata-only path is untouched. The `*_HAS_SNAPSHOTS`
+    // metadata-only path rewrites only the header, so it has no
+    // snapshot gate and needs no COW. The `*_HAS_SNAPSHOTS`
     // wire code + host message are retained for
     // defensive/non-COW callers but no longer fire here.
     let cluster_size = parsed.cluster_size;
@@ -1038,17 +1055,18 @@ unsafe fn run_qcow2_safe(call_table: &CallTable, config: &RebaseConfig) -> Rebas
         }
     };
 
-    // ----- qcow2-write envelope on the overlay (decision 6;
-    // phase-7 decision 4b) -- `allow_snapshots = true` relaxes
-    // the `Gate::HasSnapshots` refusal so a snapshot-bearing
-    // overlay reaches the COW planner. Runs after the op gates
+    // ----- qcow2-write envelope on the overlay ---------------
+    // `allow_snapshots = true` relaxes the crate's
+    // safe-by-default `Gate::HasSnapshots` refusal so a
+    // snapshot-bearing overlay reaches the COW planner. Runs
+    // after the op gates
     // and the planner's legacy validation, which together cover
     // every other Gate except UnknownIncompatible and ExtendedL2
     // with their existing codes — so the only refusals this adds
     // are the spec-mandated zstd/unknown-incompatible-bit gate
     // and the extended-L2 gate (ERROR_OVERLAY_UNSUPPORTED;
-    // divergence R-D1 — extended-L2 safe rebase was live silent
-    // corruption). Before any staging or mutation.
+    // extended-L2 safe rebase was live silent corruption before
+    // this gate existed). Before any staging or mutation.
     if let Err(gate) = check_envelope_with(&parsed, true) {
         return err_result(
             config.overlay_format,
@@ -1060,13 +1078,14 @@ unsafe fn run_qcow2_safe(call_table: &CallTable, config: &RebaseConfig) -> Rebas
     // ----- Stage overlay metadata (qcow2-write carve) --------
     // L1 (twice: planner + probe copies), refcount-table
     // prefix, and refblocks as a dense prefix, contiguity-gated
-    // (divergence R-D4's fix — pre-mutation refusal of the
-    // holed-RT shape the old dense compaction misallocated).
+    // (pre-mutation refusal of the holed-RT shape the old dense
+    // compaction silently misallocated).
     // Pre-existing L2 tables are no longer staged eagerly: the
     // qcow2-write planner loads them into the fixed-slot window
     // on demand, and the skip probe reads the ORIGINAL tables
-    // through its own buffer (this lifts the old MAX_STAGED_L2
-    // staging refusal — the R-D6 widening).
+    // through its own buffer (this deliberately lifts the old
+    // MAX_STAGED_L2 staging refusal, which refused many-L2
+    // overlays even when nothing needed copying).
     let mut carve = match stage_overlay_qcow2(call_table, sector_size, &parsed) {
         Ok(c) => c,
         Err(code) => {
@@ -1080,9 +1099,9 @@ unsafe fn run_qcow2_safe(call_table: &CallTable, config: &RebaseConfig) -> Rebas
         max_refblocks: qcow2_write::MAX_REFBLOCKS.min(OVERLAY_REFBLOCKS_LIMIT / cluster_size_usize),
         device: TargetDevice::Output,
     };
-    // COW-enabled (decision 4b): snapshot-shared active L2
-    // tables (C2) and any snapshot-shared data cluster (C1)
-    // classify into COW emission instead of refusing
+    // COW-enabled: snapshot-shared active L2 tables and any
+    // snapshot-shared data cluster classify into COW emission
+    // instead of refusing
     // ERROR_OVERLAY_INCONSISTENT.
     let mut wstate: WriteState = match new_state_cow(&parsed, &staging_config) {
         Ok(s) => s,
@@ -1099,11 +1118,12 @@ unsafe fn run_qcow2_safe(call_table: &CallTable, config: &RebaseConfig) -> Rebas
     // The rebase guest's input slots are read-only chain
     // members and every emitted step targets the fsync-less
     // Output device (the overlay), so Durability barriers
-    // degrade to Ordering — zero fsyncs, exactly as before
-    // (divergence R-D8).
+    // degrade to Ordering — zero fsyncs, preserving rebase's
+    // historical behaviour (it has never offered a
+    // crash-consistency contract).
     let mut io = CallTableIo::new(call_table, false);
 
-    // ----- Preemptive refcount growth (C9, decisions 3 & 5) --
+    // ----- Preemptive refcount growth -----------------------
     // COW allocates at most one new data cluster plus one new L2
     // table per touched snapshot-shared cluster; rebase writes
     // only into clusters the ACTIVE overlay does not already own
@@ -1112,21 +1132,23 @@ unsafe fn run_qcow2_safe(call_table: &CallTable, config: &RebaseConfig) -> Rebas
     // data + at most one COWed L2 table per touched cluster).
     // Provision the refblock coverage that worst case needs
     // BEFORE the write loop so a COW schedule crossing a refblock
-    // boundary grows instead of RefcountExhausting (the 7p
-    // refinement — count refblock growth even when the refcount
-    // table itself does not grow — is inherent to
-    // `plan_refcount_growth`; the cs=512 legs relocate the RT,
-    // exercising that path).
+    // boundary grows instead of RefcountExhausting, as qemu
+    // does. `plan_refcount_growth` sizes on new refblocks
+    // needed, not on refcount-table growth (probing showed qemu
+    // adding a refblock with `refcount_table_clusters`
+    // unchanged); the cs=512 legs relocate the RT, exercising
+    // that path.
     //
     // Gated on `nb_snapshots > 0`: without internal snapshots no
     // overlay cluster is shared, so no COW and no COW-induced
     // allocation occurs, and rebase's fresh-cluster allocation is
-    // provisioned exactly as before (C12 — the non-snapshot and
-    // `-u` outputs stay byte-for-byte unchanged). A snapshot-
-    // bearing overlay is a COW image whose byte placement is not
-    // part of the proof (C11), so the worst-case coverage is
-    // check-clean and compare-neutral even where it over-
-    // provisions.
+    // provisioned exactly as before COW existed (the
+    // non-snapshot and `-u` outputs stay byte-for-byte
+    // unchanged). A snapshot-bearing overlay is a COW image whose
+    // byte placement need not match qemu's — only `qemu-img
+    // check` and `compare` constrain it — so the worst-case
+    // coverage is check-clean and compare-neutral even where it
+    // over-provisions.
     if parsed.nb_snapshots > 0 {
         let worst_case_new = context.overlay_cluster_count.saturating_mul(2);
 
@@ -1305,12 +1327,14 @@ unsafe fn run_qcow2_safe(call_table: &CallTable, config: &RebaseConfig) -> Rebas
         }
         let l1_idx_usize = l1_idx as usize;
 
-        // Skip probe (phase-5 decision 1): consult the
-        // ORIGINAL pre-run overlay mapping only. A cluster the
-        // overlay already mapped before this run is skipped —
-        // any non-zero L2 entry (compressed, zero-flag and
-        // garbage entries included), byte-for-byte today's
-        // predicate. The probe NEVER consults the planner's
+        // Skip probe: consult the ORIGINAL pre-run overlay
+        // mapping only. A cluster the overlay already mapped
+        // before this run is skipped — any non-zero L2 entry
+        // (compressed, zero-flag and garbage entries included),
+        // byte-for-byte the predicate rebase has always used;
+        // calling plan_write on a mapped cluster would classify
+        // it Owned and overwrite it with old-chain content. The
+        // probe NEVER consults the planner's
         // staged L1 or window: patches only ever cover
         // already-visited clusters, and fresh tables were
         // L1-empty originally (unmapped by definition — never
@@ -1388,11 +1412,14 @@ unsafe fn run_qcow2_safe(call_table: &CallTable, config: &RebaseConfig) -> Rebas
         // classification, L2 window management) and execute
         // each emitted window via the step executor. The
         // request is the full cluster, clamped to the virtual
-        // size on the tail cluster of an unaligned image (the
-        // 4q EOV-tail rule / divergence R-D9 — bytes beyond
-        // EOV are not virtual content; the planner zero-fills
-        // the beyond-EOV remainder). `old_buf` doubles as
-        // `RegionId::CallerData`.
+        // size on the tail cluster of an unaligned image (bytes
+        // beyond EOV are not virtual content, so the planner
+        // treats a write reaching EOV as full coverage and
+        // zero-fills the beyond-EOV remainder, where the old
+        // runner copied old-chain bytes; virtual content is
+        // identical either way, and the full-cluster compare
+        // above keeps copy decisions identical). `old_buf`
+        // doubles as `RegionId::CallerData`.
         let win_len = cluster_size.min(parsed.virtual_size - guest_offset);
         loop {
             let planned = {
@@ -1435,9 +1462,9 @@ unsafe fn run_qcow2_safe(call_table: &CallTable, config: &RebaseConfig) -> Rebas
                     // this reproduces the pre-migration
                     // bytes-written-up-to-the-refusal behaviour,
                     // keeping refusal paths byte-identical to
-                    // the old composition (divergence R-D10 /
-                    // commit 4b's rule). The planner error
-                    // dominates any exec failure.
+                    // the composition qcow2-write replaced (the
+                    // same rule the commit runner follows). The
+                    // planner error dominates any exec failure.
                     let _ = exec_window(&mut io, &mut step_buf, &carve);
                     return err_result(
                         config.overlay_format,
@@ -1456,7 +1483,7 @@ unsafe fn run_qcow2_safe(call_table: &CallTable, config: &RebaseConfig) -> Rebas
     // One plan_flush epoch: dirty L2 window slots → staged L1
     // (if dirty) → dirty refblocks (refcounts last), the same
     // final bytes as the old inline flush. Barriers degrade to
-    // Ordering on the fsync-less output device (R-D8). The
+    // Ordering on the fsync-less output device. The
     // deferred header/backing-path patch group lands AFTER
     // this — preserving the "header lands after refcounts"
     // order.
@@ -1544,9 +1571,11 @@ unsafe fn buffers_eq(a: *const u8, b: *const u8, len: usize) -> bool {
 
 /// vmdk rebase runner.
 ///
-/// v1 only supports unsafe mode. Safe mode is blocked on
-/// phase 2 step 2e (the grain allocator) and returns
-/// `ERROR_UNSUPPORTED_FORMAT` for now.
+/// v1 only supports unsafe mode. `crates/rebase` has a vmdk
+/// safe-mode planner and grain allocator, but this guest has no
+/// vmdk safe-mode comparison loop yet, so safe mode returns
+/// `ERROR_UNSUPPORTED_FORMAT` (not yet implemented; see Future
+/// work in PLAN-rebase-commit.md).
 unsafe fn run_vmdk(call_table: &CallTable, config: &RebaseConfig) -> RebaseResult {
     if config.is_unsafe() {
         run_vmdk_unsafe(call_table, config)
@@ -1802,7 +1831,7 @@ unsafe fn read_input_byte_range(
 }
 
 // ---------------------------------------------------------------------------
-// Chain reader (step 3f)
+// Chain reader
 // ---------------------------------------------------------------------------
 
 /// Read whatever data the backing chain at

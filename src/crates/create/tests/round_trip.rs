@@ -366,7 +366,7 @@ fn sweep_vhdx_dynamic() {
 }
 
 // ---------------------------------------------------------------------------
-// vhd differencing child (phase 5)
+// vhd differencing child
 // ---------------------------------------------------------------------------
 //
 // Everything below covers `plan_vhd` with a backing reference — the
@@ -402,9 +402,12 @@ const DIFF_PARENT_PATH: &str = "parent.vhd";
 /// deliberately disagree now.
 const DIFF_PARENT_PATH_EMITTED: &str = r".\parent.vhd";
 
-/// Absolute file offsets of a differencing child's metadata, per decision
-/// 1 of the phase plan. Written as literals rather than derived from the
-/// planner, so a layout change has to edit them.
+/// Absolute file offsets of a differencing child's metadata. The locator
+/// data takes the one sector between the dynamic header and the BAT —
+/// where both measured Hyper-V images put it, and where `locator_defect`
+/// accepts it — so the BAT moves from 1536 to 2048 for a child only.
+/// Written as literals rather than derived from the planner, so a layout
+/// change has to edit them.
 const DIFF_HEAD_FOOTER_OFF: usize = 0;
 const DIFF_DYN_HEADER_OFF: usize = 512;
 const DIFF_LOCATOR_DATA_OFF: usize = 1536;
@@ -447,9 +450,9 @@ fn materialise_differencing(path: &str) -> Vec<u8> {
     materialise(&plan)
 }
 
-/// The load-bearing test of phase 5: lay a differencing plan's writes into
-/// a buffer and read every parent-bearing structure back with the phase 3
-/// parser.
+/// The load-bearing test of the differencing VHD emitter: lay a
+/// differencing plan's writes into a buffer and read every parent-bearing
+/// structure back with `crates/vhd`'s parser.
 ///
 /// It is *necessary and not sufficient* — emitter and parser share their
 /// offset constants, so this alone could pass with both halves wrong in
@@ -464,11 +467,15 @@ fn materialise_differencing(path: &str) -> Vec<u8> {
 fn vhd_differencing_round_trips_through_the_parser() {
     let bytes = materialise_differencing(DIFF_PARENT_PATH);
 
-    // --- layout (decision 1) -------------------------------------------
+    // --- layout ---------------------------------------------------------
     //
-    // Asserted through the plan rather than only through the parser,
-    // because the locator data region is new file real estate and its
-    // offset is what the four placement rules are about.
+    // The locator data goes in its own sector between the dynamic header
+    // and the BAT, the one placement `locator_defect`'s four rules (no
+    // overlap with the head footer or the dynamic header, inside the
+    // image, length within the declared space) all accept. Asserted
+    // through the plan rather than only through the parser, because the
+    // locator data region is new file real estate and its offset is what
+    // those rules are about.
     let opts = diff_opts(DIFF_PARENT_PATH);
     let mut scratch = vec![0u8; VHD_MAX_METADATA_SCRATCH];
     let plan = plan_vhd(&opts, &mut scratch).expect("differencing plan");
@@ -543,7 +550,9 @@ fn vhd_differencing_round_trips_through_the_parser() {
     // lies inside the image, and is no longer than its declared space.
     assert_eq!(entry.defect, None);
     assert_eq!(entry.platform(), vhd::VhdPlatform::W2ru);
-    // Decision 4: a byte count, not the sector count SPEC(VHD) implies.
+    // A byte count, not the sector count SPEC(VHD) implies: the sector
+    // reading is arithmetically impossible on both measured Hyper-V
+    // images, and nothing downstream would catch a wrong `1` here.
     assert_eq!(entry.platform_data_space, 512);
     assert_eq!(
         entry.platform_data_length,
@@ -614,8 +623,8 @@ fn vhd_differencing_round_trips_through_the_parser() {
 /// would pass just as happily if `locator_defect` never returned a defect
 /// at all. This takes the same emitted bytes, moves only the locator's
 /// `platform_data_offset` from 1536 to 512 — inside the dynamic header,
-/// which is the placement decision 1 rejected — and asserts the parser
-/// notices.
+/// which is a placement the emitter must never use — and asserts the
+/// parser notices.
 #[test]
 fn vhd_differencing_locator_misplacement_is_detected() {
     let mut bytes = materialise_differencing(DIFF_PARENT_PATH);
@@ -704,9 +713,9 @@ fn parent_unicode_name(bytes: &[u8]) -> Vec<u8> {
 /// relative input — and the `W2ku` one, which is not normalised.
 ///
 /// `W2ru` is a Windows-defined platform code, so a relative path goes
-/// out in the Windows convention the phase 3 Hyper-V fixtures use: `/`
-/// becomes `\` and the result is prefixed `.\`, with a leading `./`
-/// replaced by that prefix rather than doubled. A POSIX-absolute path
+/// out in the Windows convention the Hyper-V-made differencing fixtures
+/// use: `/` becomes `\` and the result is prefixed `.\`, with a leading
+/// `./` replaced by that prefix rather than doubled. A POSIX-absolute path
 /// has no honest `W2ku` rendering, so it keeps its bytes — see
 /// [PLAN-differencing.md](docs/plans/PLAN-differencing.md).
 ///
@@ -895,7 +904,7 @@ fn vhd_differencing_parent_name_field_always_ends_in_a_nul() {
     }
 }
 
-/// Decision 5: a differencing VHD is Dynamic-only. `disk_type = 4` means
+/// A differencing VHD is Dynamic-only. `disk_type = 4` means
 /// "the BAT says which blocks are mine", and a fixed VHD has neither a BAT
 /// nor a dynamic header to hold the parent locators.
 #[test]
@@ -959,8 +968,8 @@ fn summarise_plan(label: &str, plan: &MetadataPlan<'_>, out: &mut String) {
 }
 
 /// Every byte `plan_vhd` emits for a non-differencing VHD, as it was on
-/// `develop` at `f981374` — the commit this phase branched from, before
-/// the differencing emitter existed.
+/// `develop` at `f981374` — the last commit before the differencing
+/// emitter existed.
 ///
 /// **How these constants were obtained, and why they mean what they say.**
 /// They are not a transcription of the current tree's behaviour. A
@@ -971,14 +980,14 @@ fn summarise_plan(label: &str, plan: &MetadataPlan<'_>, out: &mut String) {
 /// `develop`'s output by construction, and the assertion below is a real
 /// comparison between two revisions rather than a restatement of one.
 ///
-/// What it protects is the risk named in the phase plan: the locator data
-/// region sits between the dynamic header and the BAT, so moving the BAT
-/// unconditionally instead of only for a differencing child is a
-/// one-character mistake that silently changes the bytes of every
-/// `create -f vpc` invocation — including the ones `tests/test_create.py`
-/// compares against qemu-img, where the failure would look like a qemu
-/// disagreement rather than like this. The `off=` columns for `w2` and
-/// `w3` are where that shows up: the BAT stays at 1536.
+/// What it protects against: the locator data region sits between the
+/// dynamic header and the BAT, so moving the BAT unconditionally instead
+/// of only for a differencing child is a one-character mistake that
+/// silently changes the bytes of every `create -f vpc` invocation —
+/// including the ones `tests/test_create.py` compares against qemu-img,
+/// where the failure would look like a qemu disagreement rather than like
+/// this. The `off=` columns for `w2` and `w3` are where that shows up: the
+/// BAT stays at 1536.
 ///
 /// If a deliberate change to the non-differencing layout is ever made,
 /// regenerate this the same way — from the revision being compared
@@ -1285,12 +1294,13 @@ const VHDX_PARENT_PATH: &str = "parent.vhdx";
 const VHDX_PARENT_PATH_EMITTED: &str = r".\parent.vhdx";
 
 /// The item's exact length for [`VHDX_PARENT_PATH`] under
-/// `relative_path`, written out as the sum decision 5 of the phase plan
-/// gives: 148 fixed bytes (20 header, two 12-byte entries, a 28-byte
-/// `parent_linkage` key and a 76-byte linkage value) plus the key and
-/// the *emitted* value, which is two code units longer than the typed
-/// one. Spelled as arithmetic rather than as `200` so that a changed
-/// layout has to be argued with rather than re-measured.
+/// `relative_path`, written out as the sum of the item layout (one item,
+/// two entries, keys before values, no padding): 148 fixed bytes (20
+/// header, two 12-byte entries, a 28-byte `parent_linkage` key and a
+/// 76-byte linkage value) plus the key and the *emitted* value, which is
+/// two code units longer than the typed one. Spelled as arithmetic rather
+/// than as `200` so that a changed layout has to be argued with rather
+/// than re-measured.
 const VHDX_LOCATOR_ITEM_LEN: u32 = 148 + 2 * 13 + 2 * 13;
 
 fn vhdx_diff_opts(path: &str) -> VhdxCreateOpts<'_> {
@@ -1539,8 +1549,8 @@ fn vhdx_differencing_round_trips_through_the_parser() {
 /// check for overlap either. That is a real gap in this tree's reader
 /// rather than something this test papers over: an image whose items
 /// overlap is read back as sound, and the item that wins is whichever
-/// one was written last. It is recorded here so that a later phase
-/// adding an overlap check knows the check was missing, not forgotten.
+/// one was written last. It is recorded here so that whoever adds an
+/// overlap check later knows the check was missing, not forgotten.
 #[test]
 fn vhdx_differencing_locator_misplacement_is_detected() {
     let laid = lay_out_vhdx(&vhdx_diff_opts(VHDX_PARENT_PATH));
@@ -1591,7 +1601,7 @@ fn vhdx_differencing_locator_misplacement_is_detected() {
 ///
 /// A relative path goes out in the Windows convention `relative_path` is
 /// defined in — `/` to `\`, leading `.\`, a leading `./` replaced rather
-/// than doubled — matching the phase 3 Hyper-V fixtures. A
+/// than doubled — matching the Hyper-V-made differencing fixtures. A
 /// POSIX-absolute path has no honest `absolute_win32_path` rendering and
 /// keeps its bytes; see
 /// [PLAN-differencing.md](docs/plans/PLAN-differencing.md).
@@ -1961,8 +1971,8 @@ fn vhdx_non_differencing_metadata_is_unchanged() {
 }
 
 /// Every byte `plan_vhdx` emits for a non-differencing VHDX, as it was
-/// on `develop` at `9a80776` — the commit this phase branched from,
-/// before the differencing emitter existed.
+/// on `develop` at `9a80776` — the last commit before the
+/// differencing emitter existed.
 ///
 /// **How these constants were obtained, and why they mean what they
 /// say.** They are not a transcription of the current tree's behaviour.

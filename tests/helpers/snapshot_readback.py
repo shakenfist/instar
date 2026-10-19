@@ -1,19 +1,23 @@
-"""Snapshot read-back oracle (COW parity contract C6/C7/C8).
+"""Snapshot read-back oracle for copy-on-write parity tests.
 
 Extract a named internal snapshot's *virtual view* as a raw sha256,
 WITHOUT ever mutating the original image: copy the image, apply the
-snapshot on the copy, convert the copy to raw, sha256 the raw. This is
-the Python port of ``scratchpad/7p/oracle/readback.sh`` (phase 7 probe
-7p), landed here by step 7b as the reusable oracle the later COW parity
-steps (7c/7e) extend.
+snapshot on the copy, convert the copy to raw, sha256 the raw. It is the
+shared oracle for the commit, rebase and bench tests that write into
+snapshot-bearing images, which must leave every pre-existing snapshot's
+virtual view correct.
 
-The oracle constrains snapshot *content*, never image bytes: qemu's COW
-placement is nondeterministic (Q3), so the phase-7 proof is qemu-parity
-(``qemu-img compare`` + ``qemu-img check`` + this read-back), not
-before/after byte identity (C11). Compare a post-op image's snapshot
-read-back against the SAME snapshot read-back of a ``qemu-img``-committed
-twin computed with the identical pinned ``qemu-img`` binary; the expected
-value is per-op (commit preserves; rebase reads through the new backing).
+The oracle constrains snapshot *content*, never image bytes: qemu's own
+COW placement is not even deterministic run-to-run (at 512-byte clusters,
+one binary gave a different physical layout on every run), so byte parity
+with qemu is unachievable as well as unnecessary. COW correctness is
+therefore proved by qemu-parity (``qemu-img compare`` + ``qemu-img check``
++ this read-back), not before/after byte identity.
+Compare a post-op image's snapshot read-back against the SAME snapshot
+read-back of a ``qemu-img``-committed twin computed with the identical
+pinned ``qemu-img`` binary; the expected value is per-op (commit and bench
+preserve the snapshot's pre-op content; rebase reads through the new
+backing).
 
 Usage::
 

@@ -2,23 +2,24 @@
 //!
 //! Where [`round_trip`](../round_trip.rs) pins single actions, this
 //! suite drives the guest's *ordered action list* through the public
-//! `apply_*` helpers (the double-buffered directory the Phase-4 guest
+//! `apply_*` helpers (the double-buffered directory the guest op
 //! stages), asserting the running directory state **and** a
-//! refcount-conservation check after every step (Open question 3).
+//! refcount-conservation check after every step.
 //!
 //! # Refcount-conservation approach
 //!
 //! The crate cannot observe the whole qcow2 structure (that is
-//! `qemu-img check`, Phase 7), but it *can* observe the staged refcount
-//! blocks. So after each step we snapshot the refblocks, apply one
-//! action, and assert — via [`assert_refblocks_delta`] — that **only**
-//! the clusters we expect changed refcount (to the expected values) and
-//! **every other cluster is byte-for-byte unchanged**. Steps that must
-//! not touch refcounts at all (`enable`/`disable`, `clear` of an empty
-//! bitmap) assert the before/after refblock buffers are byte-identical.
-//! A whole sequence's net delta is the sum of its per-step deltas: the
-//! empty→empty round-trip (add then remove) additionally asserts the
-//! final refblocks equal the very-first snapshot.
+//! `qemu-img check`, run by `tests/test_bitmap.py`), but it *can*
+//! observe the staged refcount blocks. So after each step we snapshot
+//! the refblocks, apply one action, and assert — via
+//! [`assert_refblocks_delta`] — that **only** the clusters we expect
+//! changed refcount (to the expected values) and **every other cluster
+//! is byte-for-byte unchanged**. Steps that must not touch refcounts at
+//! all (`enable`/`disable`, `clear` of an empty bitmap) assert the
+//! before/after refblock buffers are byte-identical. A whole sequence's
+//! net delta is the sum of its per-step deltas: the empty→empty
+//! round-trip (add then remove) additionally asserts the final
+//! refblocks equal the very-first snapshot.
 
 mod common;
 

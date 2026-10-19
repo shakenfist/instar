@@ -480,8 +480,8 @@ pub unsafe extern "C" fn _start() -> u64 {
 
     // The input window to copy. For a `dd` windowed copy this is
     // [window_start, window_end); for normal whole-image convert it is
-    // [0, virtual_size). Phase 3 made convert_to_raw honour this window;
-    // phase 4 extends it to the structured writers (qcow2/vmdk/vhd/vhdx).
+    // [0, virtual_size). Every writer (raw, qcow2, vmdk, vhd, vhdx) honours
+    // this window.
     let (read_start, read_end) = if config.has_dd_window() {
         (config.window_start, config.window_end)
     } else {
@@ -1584,7 +1584,7 @@ unsafe fn derive_luks_v2_master_key(
 }
 
 // ================================================================
-// Raw output path (existing Phase 3 logic)
+// Raw output path
 // ================================================================
 
 unsafe fn convert_to_raw(
@@ -2278,7 +2278,7 @@ unsafe fn write_qcow2_metadata(
 }
 
 // ================================================================
-// Uncompressed QCOW2 output (Phase 4)
+// Uncompressed QCOW2 output
 // ================================================================
 
 #[allow(clippy::too_many_arguments)]
@@ -2741,7 +2741,7 @@ unsafe fn write_refcount_table(
 }
 
 // ================================================================
-// Compressed QCOW2 output (Phase 5)
+// Compressed QCOW2 output
 // ================================================================
 
 /// Increment the refcount for a host cluster in the tracking
@@ -3128,7 +3128,7 @@ unsafe fn convert_to_qcow2_compressed(
 }
 
 // ================================================================
-// VMDK monolithicSparse output (Phase 8d)
+// VMDK monolithicSparse output
 // ================================================================
 
 /// Computed layout for VMDK output.
@@ -3510,7 +3510,7 @@ unsafe fn convert_to_vmdk(
 }
 
 // ================================================================
-// streamOptimized VMDK output (Phase 8e)
+// streamOptimized VMDK output
 // ================================================================
 
 /// Convert input to streamOptimized VMDK format with DEFLATE
