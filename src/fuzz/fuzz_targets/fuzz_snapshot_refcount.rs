@@ -1,6 +1,7 @@
 //! Coverage-guided fuzzing for the snapshot crate's mutator
-//! primitives — the "no corruption regardless of input" surface
-//! the master plan flags as the part needing care.
+//! primitives — the "no corruption regardless of input" surface,
+//! where a wrong refcount or COPIED bit silently corrupts an
+//! image.
 //!
 //! Structured-header planner archetype (like
 //! `fuzz_resize_planners`): decode a 32-byte header, synthesize
@@ -555,7 +556,8 @@ fn run_flag_walker(cfg: &Cfg, s: &mut Scratch, rb_len: usize, l1_len: usize, l2_
 
     // Post-state: COPIED equals (refcount == 1) for every
     // allocated entry; offset-zero entries are scrubbed clear
-    // (the phase 8b contract).
+    // (qemu's walk assigns them refcount 0, so a stale COPIED bit
+    // is cleared).
     for (i, chunk) in l1.chunks_exact(8).enumerate() {
         let raw = u64::from_be_bytes(chunk.try_into().unwrap());
         let l2_off = raw & qcow2::L1_OFFSET_MASK;

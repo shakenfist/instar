@@ -190,7 +190,8 @@ class TestInfoChainJsonOutput(InstarTestBase):
 
         Covers a differencing VHD child, a differencing VHDX child and
         a qcow2 chain: every format `discover_backing_chain` walks, not
-        only the two formats this phase newly resolves a parent for.
+        only the two differencing formats whose parent comes from a
+        parent locator.
         """
         # The qcow2 case needs both members present. A qcow2 chain is
         # not fail-soft, so a tree holding only the top image gives a

@@ -501,7 +501,9 @@ fn parse_memory_size(s: &str) -> Result<u64, Box<dyn std::error::Error>> {
 /// while a multiply-overflow (`Overflow`) is a *number* out of
 /// range and gets the `Must be between` form — matching qemu's
 /// cvtnum, whose EINVAL and ERANGE outcomes produce those two
-/// different messages (1e capture Supplement 2).
+/// different messages (verified live against qemu-img 10.0.8:
+/// `-s abc` echoes the value, `-s 200000000000000G` gets the range
+/// form).
 enum QemuImgSizeError {
     /// The value is not a number (empty, non-numeric, bad suffix).
     Invalid,
@@ -569,7 +571,7 @@ fn parse_resize_size(s: &str) -> Result<ParsedResizeSize, Box<dyn std::error::Er
 }
 
 // ============================================================================
-// Multi-device management (Phase 0c)
+// Multi-device management
 //
 // All operations use DeviceSet for device management. This provides:
 // - Unified MMIO dispatch to correct device based on address
@@ -3179,8 +3181,7 @@ fn discover_backing_chain(
         // routinely — refusing them would be a parity regression, not a
         // safety fix. `raw`/`unknown` stay pass-through so genuinely
         // unidentifiable input keeps its secure-mode partition-gate
-        // behaviour. This mirrors the post-1a management decision recorded
-        // in docs/plans/PLAN-format-coverage-phase-01-detection.md.
+        // behaviour.
         if matches!(
             ImageFormat::from_str(&info_result.format),
             ImageFormat::Unknown
@@ -4072,9 +4073,10 @@ struct AmendArgs {
 ///
 /// The action flags use `ArgAction::Count` (bare toggles) and
 /// `ArgAction::Append` (`--merge`) so that `ArgMatches::indices_of`
-/// can reconstruct the exact command-line order (Open question 1);
-/// the typed fields here exist only so clap validates the surface
-/// and `--help` reads correctly.
+/// can reconstruct the exact command-line order (qemu applies the
+/// actions in CLI order, and per-flag fields alone lose the order
+/// across flags); the typed fields here exist only so clap validates
+/// the surface and `--help` reads correctly.
 #[derive(Args, Debug)]
 struct BitmapArgs {
     /// Image file.
@@ -4729,7 +4731,7 @@ struct BenchArgs {
     /// Image file to benchmark. Exactly one is required; zero or
     /// more than one is a validation error handled by
     /// `validate_bench_args`, not clap's own arity check (qemu
-    /// parity — 1e capture invocations 15, 16).
+    /// parity — qemu-img prints one message for both cases).
     #[arg(num_args = 0.., value_name = "FILENAME")]
     filename: Vec<String>,
 
@@ -4811,8 +4813,8 @@ struct BenchArgs {
 
     /// Indicates FILENAME is a complete image specification.
     /// Refused at runtime: qemu's own mutual-exclusion message when
-    /// combined with `-f`/`--format` (1e capture invocation 14), or
-    /// `bench: --image-opts is not yet supported` alone.
+    /// combined with `-f`/`--format`, or `bench: --image-opts is not
+    /// yet supported` alone.
     #[arg(long = "image-opts")]
     image_opts: bool,
 
@@ -4824,14 +4826,13 @@ struct BenchArgs {
     /// Cache mode selector. `writeback` (qemu's default) is
     /// accepted silently; other valid qemu cache modes are refused
     /// with an instar "not yet supported" message; anything else
-    /// gets qemu's own terse `Invalid cache mode` text (1e capture
-    /// invocation 11).
+    /// gets qemu's own terse `Invalid cache mode` text.
     #[arg(short = 't', value_name = "CACHE")]
     cache: Option<String>,
 
-    /// Force the image format detection. Accepted as a hint for the
-    /// (4b) discovery step; dd's warn-then-ignore posture applies
-    /// when it disagrees with the auto-detected format.
+    /// Force the image format detection. Accepted as a hint only:
+    /// the input format is always auto-detected, and dd's
+    /// warn-then-ignore posture applies when the hint disagrees.
     #[arg(short = 'f', long)]
     format: Option<String>,
 
@@ -4841,12 +4842,12 @@ struct BenchArgs {
 }
 
 /// The validated result of parsing `BenchArgs`, ready for
-/// `run_bench` (wired in 4b) to open the image and launch the
-/// guest. Bundles the bench crate's pure, qemu-parity
-/// `bench::BenchParams` with the host-only pieces that crate has no
-/// business knowing about: the filename, the `-f` format hint
-/// (validated against the auto-detected format only once discovery
-/// exists, in 4b), and the `--output` selector.
+/// `run_bench` to open the image and launch the guest. Bundles the
+/// bench crate's pure, qemu-parity `bench::BenchParams` with the
+/// host-only pieces that crate has no business knowing about: the
+/// filename, the `-f` format hint (compared against the
+/// auto-detected format by `run_bench`, after chain discovery), and
+/// the `--output` selector.
 #[derive(Debug, Clone, PartialEq)]
 struct BenchInvocation {
     /// The validated, qemu-parity request parameters.
@@ -4854,7 +4855,7 @@ struct BenchInvocation {
     /// The single positional filename (count already checked == 1).
     filename: String,
     /// `-f`/`--format`'s value, if given. Not validated here --
-    /// `run_bench` (4b) compares it against the auto-detected
+    /// `run_bench` compares it against the auto-detected
     /// format and applies dd's warn-then-ignore posture when they
     /// disagree.
     format_hint: Option<String>,
@@ -4871,8 +4872,9 @@ struct BenchInvocation {
 /// The three-way outcome of parsing one bench numeric option.
 /// qemu distinguishes an unparseable value (echoed back:
 /// `Invalid <name> specified: '<v>'.`) from an out-of-range
-/// *number* (`Invalid <name> specified. Must be between ...`) --
-/// Supplement 2 of the 1e capture (PLAN-bench-phase-01-crate.md).
+/// *number* (`Invalid <name> specified. Must be between ...`)
+/// (verified live against qemu-img 10.0.8 for all seven numeric
+/// options: `-c abc` gets `Invalid request count specified: 'abc'.`).
 enum BenchNumParse {
     /// A parseable number; the caller applies the option's own
     /// range check.
@@ -4887,9 +4889,10 @@ enum BenchNumParse {
 
 /// Classify a plain (non-suffixed) integer option value
 /// (`-c`/`-d`/`--pattern`/`--flush-interval`). A leading `-` is a
-/// number (qemu range-rejects negatives, it does not echo them --
-/// 1e capture invocations 2, 7); an optionally-signed all-digit
-/// string that overflows `i64` is likewise a number out of range.
+/// number (qemu range-rejects negatives, it does not echo them:
+/// `-c -1` and `--pattern -1` get the range form); an
+/// optionally-signed all-digit string that overflows `i64` is
+/// likewise a number out of range.
 fn parse_bench_plain_int(s: &str) -> BenchNumParse {
     let t = s.trim();
     if let Ok(v) = t.parse::<i64>() {
@@ -4920,11 +4923,11 @@ enum BenchSizeParse {
 /// accepts (including suffixed forms like `1k`) is a number; a
 /// suffix multiply that overflows `u64` (e.g. `200000000000000G`)
 /// is a *number* out of range (qemu's cvtnum returns ERANGE and
-/// prints the range form -- verified live, Supplement 2); a plain
-/// optionally-negative integer (e.g. `-1`) is likewise a number
-/// out of range (`-S -1` gets the range form -- 1e capture
-/// invocation 22); everything else (e.g. `abc`, `-1k`) is
-/// unparseable and gets the value-echoing form.
+/// prints the range form -- verified live against qemu-img 10.0.8);
+/// a plain optionally-negative integer (e.g. `-1`) is likewise a
+/// number out of range (qemu-img prints the range form for
+/// `-S -1`); everything else (e.g. `abc`, `-1k`) is unparseable and
+/// gets the value-echoing form.
 fn parse_bench_size(s: &str) -> BenchSizeParse {
     match parse_qemu_img_size_classified(s) {
         Ok(v) => BenchSizeParse::Value(v),
@@ -4936,10 +4939,11 @@ fn parse_bench_size(s: &str) -> BenchSizeParse {
     }
 }
 
-/// Validate `BenchArgs` against the qemu-img 10.0.8 message
-/// contract (the captured transcripts, numbered by invocation, are
-/// in PLAN-bench-phase-01-crate.md). Pure and unit-tested: every
-/// message string below is pinned byte-for-byte in the
+/// Validate `BenchArgs` against qemu-img bench's message contract.
+/// Every qemu-worded string below was captured verbatim from
+/// qemu-img 10.0.8 (Debian 1:10.0.8+ds-0+deb13u1+b2) by running the
+/// failing invocation against a scratch raw image. Pure and
+/// unit-tested: every message string is pinned byte-for-byte in the
 /// `bench_validate_tests` module below.
 ///
 /// Check order: the seven numeric options (`-c`, `-d`, `-s`
@@ -4952,11 +4956,10 @@ fn parse_bench_size(s: &str) -> BenchSizeParse {
 /// gets the value-echoing `Invalid <name> specified: '<v>'.`, an
 /// out-of-range *number* gets the `Must be between` form. The order
 /// is deliberate: a nonzero `--flush-interval` without `-w` must
-/// surface the qemu cross-option text (invocation 8), and `-w
-/// --flush-interval 32 -d 64` must surface `Flush interval can't be
-/// smaller than depth` (invocation 9), ahead of any of instar's own
-/// refusals. Both are exercised directly by
-/// `invocation_8_*`/`invocation_9_*` below.
+/// surface the qemu cross-option text, and `-w --flush-interval 32
+/// -d 64` must surface `Flush interval can't be smaller than depth`,
+/// ahead of any of instar's own refusals. Both are exercised
+/// directly by `invocation_8_*`/`invocation_9_*` below.
 fn validate_bench_args(args: &BenchArgs) -> Result<BenchInvocation, String> {
     // -c: request count.
     let count: u32 = match &args.count {
@@ -4996,10 +4999,9 @@ fn validate_bench_args(args: &BenchArgs) -> Result<BenchInvocation, String> {
     };
 
     // -s: buffer size. qemu's [1, 2147483647] bound is checked
-    // FIRST, then the instar-only 2 MiB cap -- precedence pinned by
-    // the 1e capture's invocation 5 (`-s 3G` gets qemu's text,
-    // never instar's cap text, because 3 GiB is already outside
-    // qemu's own bound).
+    // FIRST, then the instar-only 2 MiB cap, so `-s 3G` gets qemu's
+    // range text (as qemu-img itself prints), never instar's cap
+    // text, because 3 GiB is already outside qemu's own bound.
     let bufsize: u64 = match &args.buffer_size {
         None => bench::DEFAULT_BUFSIZE,
         Some(s) => match parse_bench_size(s) {
@@ -5038,8 +5040,8 @@ fn validate_bench_args(args: &BenchArgs) -> Result<BenchInvocation, String> {
     };
 
     // -o: the first request's byte offset. Wider bound than the
-    // other four options -- i64::MAX, not QEMU_BENCH_ARG_MAX (1e
-    // capture invocation 17).
+    // other four options -- i64::MAX, not QEMU_BENCH_ARG_MAX (qemu-img
+    // prints `Must be between 0 and 9223372036854775807` for `-o -1`).
     let offset: u64 = match &args.offset {
         None => 0,
         Some(s) => match parse_bench_size(s) {
@@ -5074,11 +5076,12 @@ fn validate_bench_args(args: &BenchArgs) -> Result<BenchInvocation, String> {
     };
 
     // --flush-interval: has its own [0, 2147483647] range check
-    // (Supplement 2 of the 1e capture), fired here in table order,
-    // BEFORE the two cross-option rules below. 0 is valid ("never
-    // flush") and -- verified live -- `--flush-interval 0` without
-    // `-w` is silently accepted: the cross-option check gates on
-    // the value, not on flag presence.
+    // (verified live against qemu-img 10.0.8, which fires it before
+    // the cross-option rules), so it runs here BEFORE the two
+    // cross-option rules below. 0 is valid ("never flush") and --
+    // also verified live -- `--flush-interval 0` without `-w` is
+    // silently accepted: the cross-option check gates on the value,
+    // not on flag presence.
     let flush_interval: u32 = match &args.flush_interval {
         None => 0,
         Some(s) => match parse_bench_plain_int(s) {
@@ -5099,8 +5102,9 @@ fn validate_bench_args(args: &BenchArgs) -> Result<BenchInvocation, String> {
 
     // Cross-option rules owned by the bench crate: flush-requires-
     // write and flush-smaller-than-depth. Built with the REAL `-w`/
-    // `--no-drain` values so invocations 8 and 9 route through these
-    // qemu-worded messages before any of instar's own refusals below.
+    // `--no-drain` values so a flush interval without `-w`, or one
+    // smaller than the depth, routes through these qemu-worded
+    // messages before any of instar's own refusals below.
     let candidate = BenchParams {
         count,
         depth,
@@ -5133,7 +5137,8 @@ fn validate_bench_args(args: &BenchArgs) -> Result<BenchInvocation, String> {
             BenchParamError::BufsizeAboveInstarCap => {
                 "bench: buffer sizes above 2 MiB are not yet supported".to_string()
             }
-            // Reachable: 1e capture invocations 8 and 9.
+            // Reachable: `--flush-interval 50` without `-w`, and
+            // `-w -d 64 --flush-interval 32`.
             BenchParamError::FlushRequiresWrite => {
                 "--flush-interval is only available in write tests".to_string()
             }
@@ -5153,7 +5158,7 @@ fn validate_bench_args(args: &BenchArgs) -> Result<BenchInvocation, String> {
     // -t: cache mode. qemu's own default (writeback) is silently
     // accepted; other valid-but-unsupported qemu modes get an
     // instar-worded refusal; anything else gets qemu's own terse
-    // "Invalid cache mode" text (1e capture invocation 11).
+    // "Invalid cache mode" text (qemu-img lists no valid modes).
     if let Some(cache) = &args.cache {
         match cache.as_str() {
             "writeback" => {}
@@ -5179,8 +5184,7 @@ fn validate_bench_args(args: &BenchArgs) -> Result<BenchInvocation, String> {
     }
 
     // --image-opts: qemu-parity mutual exclusion with -f/--format
-    // first (1e capture invocation 14), then the house "not yet
-    // supported" refusal.
+    // first, then the house "not yet supported" refusal.
     if args.image_opts && args.format.is_some() {
         return Err("--image-opts and --format are mutually exclusive".to_string());
     }
@@ -5191,7 +5195,7 @@ fn validate_bench_args(args: &BenchArgs) -> Result<BenchInvocation, String> {
     // -q / -U (--force-share): accepted no-ops; nothing to check.
 
     // Filename count: qemu collapses "zero" and "too many" into the
-    // identical two-line message (1e capture invocations 15, 16).
+    // identical two-line message.
     if args.filename.len() != 1 {
         return Err(
             "Expecting one image file name\nTry 'instar bench --help' for more info".to_string(),
@@ -5209,11 +5213,11 @@ fn validate_bench_args(args: &BenchArgs) -> Result<BenchInvocation, String> {
 }
 
 /// Render the qemu-parity header line, printed once discovery and
-/// validation succeed and before the guest launches (Mission
-/// section 3). Byte-identical to qemu-img for equal arguments:
-/// offset is the parsed decimal byte value, step is the
-/// *effective* step (`-S 0` renders as `bufsize`, 1e capture
-/// invocation 24), and the read/write word comes from `is_write`.
+/// validation succeed and before the guest launches. Byte-identical
+/// to qemu-img for equal arguments: offset is the parsed decimal
+/// byte value, step is the *effective* step (`-S 0` renders as
+/// `bufsize`, exactly as qemu-img prints it), and the read/write
+/// word comes from `is_write`.
 fn render_bench_header(params: &BenchParams) -> String {
     format!(
         "Sending {} {} requests, {} bytes each, {} in parallel (starting at offset {}, step size {})",
@@ -5233,20 +5237,23 @@ fn render_bench_flush_line(interval: u32) -> String {
 }
 
 /// Render the completion line. qemu's timing precision is exactly 3
-/// decimal digits (`%0.3f`-shaped; 1e capture invocations 20/21).
+/// decimal digits (`%0.3f`-shaped, in every qemu-img 10.0.8 run
+/// observed, read and write).
 fn render_bench_completion(secs: f64) -> String {
     format!("Run completed in {:.3} seconds.", secs)
 }
 
-/// Render the `--output json` object for a completed bench run, per
-/// Mission section 3's schema (hyphenated keys, hand-built JSON --
-/// no serde, matching the house idiom in `print_measure_result_json`).
-/// `effective-depth` is a fixed `1`: v1 executes serially regardless
-/// of `-d` (master plan OQ1). Rates divide by `elapsed_seconds`; a
-/// `0.0` elapsed value (an extremely fast, tiny run) produces a
-/// non-finite rate exactly like a bare floating point division
-/// would -- no special-casing, since the captured contract has no
-/// zero-elapsed json example to pin.
+/// Render the `--output json` object for a completed bench run
+/// (hyphenated keys, hand-built JSON -- no serde, matching the house
+/// idiom in `print_measure_result_json`). `effective-depth` is a
+/// fixed `1`: requests execute serially regardless of `-d`, because
+/// the guest's virtio driver submits one request and spins until it
+/// completes, and the host services descriptors serially anyway
+/// (true queue depth is Future work in docs/plans/PLAN-bench.md).
+/// Rates divide by `elapsed_seconds`; a `0.0` elapsed value (an
+/// extremely fast, tiny run) produces a non-finite rate exactly like
+/// a bare floating point division would -- no special-casing, since
+/// qemu-img has no json output to match.
 fn render_bench_json(
     params: &BenchParams,
     filename: &str,
@@ -5303,12 +5310,15 @@ struct BenchRunResult {
 /// Map a `BenchResult::ERROR_*` code to a user-facing message.
 ///
 /// `ERROR_IO_READ` renders as the **bare** qemu text `Failed request:
-/// Input/output error` (1e capture invocation 19): by the time it
-/// fires the header has already printed on stdout, so this reproduces
-/// qemu's exact zero-byte-image transcript. Every other code carries
-/// instar's `bench:` prefix. `ERROR_IO_WRITE` / `ERROR_IO_FLUSH` /
-/// `ERROR_WRITE_UNSUPPORTED` / `ERROR_ALLOC_EXHAUSTED` are reachable
-/// from the `-w` write path.
+/// Input/output error`, which is what qemu-img 10.0.8 prints when a
+/// request fails at I/O time: by the time it fires the header has
+/// already printed on stdout, reproducing qemu's header-then-failure
+/// transcript shape. (A zero-byte image, qemu's example of this path,
+/// never gets here: instar's chain discovery refuses it before the
+/// header prints, a registered divergence in tests/test_bench.py.)
+/// Every other code carries instar's `bench:` prefix.
+/// `ERROR_IO_WRITE` / `ERROR_IO_FLUSH` / `ERROR_WRITE_UNSUPPORTED` /
+/// `ERROR_ALLOC_EXHAUSTED` are reachable from the `-w` write path.
 /// Render a short reason for the qcow2 write envelope gate id carried
 /// in `BenchResult::error_detail` alongside `ERROR_WRITE_UNSUPPORTED`.
 /// The ids are documented on `shared::BenchResult::ERROR_WRITE_UNSUPPORTED`
@@ -5368,17 +5378,19 @@ fn map_bench_error(code: u32, error_detail: u64) -> String {
 
 /// Run `instar bench`: validate the qemu-parity argument surface,
 /// discover the input's backing chain, print the header, launch the
-/// read-only bench guest, and render the completion line (or the
-/// `--output json` object). See PLAN-bench-phase-04-host-cli.md §4.
+/// bench guest (read-only, or with the top image writable for `-w`),
+/// and render the completion line (or the `--output json` object).
 fn run_bench(args: &BenchArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
-    // Validate the CLI surface (qemu-parity messages, §2). Err strings
+    // Validate the CLI surface (qemu-parity messages). Err strings
     // propagate as-is; `main` renders them as `Error: <msg>` and exits 1.
     let invocation = validate_bench_args(args)?;
 
     // Bench uses convert's input-path sector size (the ConvertArgs
     // `--sector-size` default): the virtio-block transport I/O
     // granularity, not a format-level property. Recorded here because it
-    // is part of the measurement's definition (see the 4c measurements).
+    // is part of the measurement's definition: bench deliberately does not
+    // invent a bench-specific value, so its numbers compare with convert's
+    // read path.
     let sector_size = MAX_SECTOR_SIZE; // 65536
 
     // Discover the input backing chain (convert's idiom, incl. the
@@ -5420,7 +5432,8 @@ fn run_bench(args: &BenchArgs, verbose: bool) -> Result<(), Box<dyn std::error::
         .into());
     }
 
-    // The discovered top-of-chain format is authoritative (§2).
+    // The discovered top-of-chain format is authoritative; `-f` is only
+    // a hint.
     let top_format = chain.images()[0].format;
     let top_format_name = top_format.to_string();
 
@@ -5439,10 +5452,13 @@ fn run_bench(args: &BenchArgs, verbose: bool) -> Result<(), Box<dyn std::error::
 
     // -w host-side format gate: write tests are supported only for raw
     // and qcow2. Every other discovered top format is refused here,
-    // before the header prints or the guest launches (Mission §3
-    // divergence registry). raw and qcow2 both pass; qcow2 then reaches
-    // the guest, which refuses it with ERROR_WRITE_UNSUPPORTED until 5b
-    // lands the allocating write path.
+    // before the header prints or the guest launches (a registered
+    // divergence: qemu-img bench writes vmdk/vhd/vhdx too). raw and
+    // qcow2 both pass; qcow2 then reaches the guest's allocating write
+    // path, which applies its own write-envelope gates (refcount width,
+    // compression, extended L2, ...) and refuses with
+    // ERROR_WRITE_UNSUPPORTED plus a gate id when the image falls
+    // outside them.
     if invocation.params.is_write && !matches!(top_format, ImageFormat::Raw | ImageFormat::Qcow2) {
         return Err(format!(
             "bench: write tests are not yet supported for {}",
@@ -5667,7 +5683,7 @@ fn run_bench_guest(
         // (2× the larger of the file/virtual size, floored at 1 GiB);
         // the refcount-table-growth gate bounds real growth well below
         // it, and the file still grows sparsely on demand. raw writes
-        // stay in place, so raw gets no hint (identical to phase 5a).
+        // stay in place and never grow the file, so raw gets no hint.
         let top = &chain.images()[0];
         let rw_capacity_hint = if matches!(top.format, ImageFormat::Qcow2) {
             let on_disk = std::fs::metadata(&top.path).map(|m| m.len()).unwrap_or(0);
@@ -5894,13 +5910,14 @@ fn run_bench_guest(
 #[cfg(test)]
 mod bench_validate_tests {
     //! Byte-for-byte pins of `validate_bench_args`'s message table
-    //! (Mission section 2 of PLAN-bench-phase-04-host-cli.md)
-    //! against the 1e capture and its Supplement 2
-    //! (PLAN-bench-phase-01-crate.md). Every message string here is
-    //! copied verbatim from one of those two documents: each
-    //! numeric option pins BOTH failure forms -- the value-echoing
-    //! `Invalid <name> specified: '<v>'.` for unparseable input and
-    //! the `Must be between` form for out-of-range numbers.
+    //! against qemu-img 10.0.8's own output. Every qemu-worded
+    //! message string here was copied verbatim from a live
+    //! qemu-img 10.0.8 run of the same invocation; the
+    //! `invocation_N_*` test names keep the numbering of that set
+    //! of captured transcripts. Each numeric option pins BOTH
+    //! failure forms -- the value-echoing `Invalid <name>
+    //! specified: '<v>'.` for unparseable input and the `Must be
+    //! between` form for out-of-range numbers.
     use super::*;
 
     /// A `BenchArgs` with every field at its clap default plus a
@@ -5983,8 +6000,9 @@ mod bench_validate_tests {
 
     #[test]
     fn count_unparseable_gets_value_echoing_message() {
-        // Supplement 2: unparseable input takes the value-echoing
-        // form, with the exact `: 'abc'.` punctuation.
+        // Verified live against qemu-img 10.0.8: unparseable input
+        // takes the value-echoing form, with the exact `: 'abc'.`
+        // punctuation.
         let args = BenchArgs {
             count: Some("abc".to_string()),
             ..default_bench_args()
@@ -6127,8 +6145,8 @@ mod bench_validate_tests {
 
     #[test]
     fn bufsize_suffix_overflow_gets_range_form() {
-        // Verified live (Supplement 2): a suffix multiply that
-        // overflows u64 is a NUMBER out of range (qemu's cvtnum
+        // Verified live against qemu-img 10.0.8: a suffix multiply
+        // that overflows u64 is a NUMBER out of range (qemu's cvtnum
         // ERANGE), not an unparseable value -- range form, no echo.
         let args = BenchArgs {
             buffer_size: Some("200000000000000G".to_string()),
@@ -6180,8 +6198,8 @@ mod bench_validate_tests {
 
     #[test]
     fn step_suffix_overflow_gets_range_form() {
-        // Verified live (Supplement 2): suffix-multiply overflow is
-        // a number out of range, not an unparseable value.
+        // Verified live against qemu-img 10.0.8: suffix-multiply
+        // overflow is a number out of range, not an unparseable value.
         let args = BenchArgs {
             step_size: Some("200000000000000G".to_string()),
             ..default_bench_args()
@@ -6243,7 +6261,7 @@ mod bench_validate_tests {
 
     #[test]
     fn offset_suffix_overflow_gets_range_form() {
-        // Verified live (Supplement 2): `-o 200000000000000G`
+        // Verified live against qemu-img 10.0.8: `-o 200000000000000G`
         // (2e14 * 2^30, overflows u64) gets the range form.
         let args = BenchArgs {
             offset: Some("200000000000000G".to_string()),
@@ -6324,7 +6342,7 @@ mod bench_validate_tests {
         );
     }
 
-    // --- --flush-interval range check (Supplement 2) -------------------
+    // --- --flush-interval range check --------------------------------
 
     #[test]
     fn flush_interval_unparseable_gets_value_echoing_message() {
@@ -6376,7 +6394,7 @@ mod bench_validate_tests {
         // An out-of-range interval WITHOUT -w must produce the
         // range message, not "--flush-interval is only available in
         // write tests" -- the range check runs first (verified
-        // live; Supplement 2).
+        // live against qemu-img 10.0.8).
         let args = BenchArgs {
             flush_interval: Some("-1".to_string()),
             count: Some("10".to_string()),
@@ -6479,9 +6497,9 @@ mod bench_validate_tests {
 
     #[test]
     fn invocation_13_cache_none_is_refused_diverging_from_qemu() {
-        // Divergence-registry material: real qemu-img 10.0.8 accepts
-        // `-t none` and runs the benchmark (1e capture invocation
-        // 13); instar v1 refuses it outright.
+        // A registered divergence: real qemu-img 10.0.8 accepts
+        // `-t none` and runs the benchmark; instar v1 refuses it
+        // outright.
         let args = BenchArgs {
             cache: Some("none".to_string()),
             ..default_bench_args()
@@ -6494,9 +6512,11 @@ mod bench_validate_tests {
 
     #[test]
     fn invocation_12_aio_bogus_gets_instar_worded_refusal() {
-        // Diverges from qemu's own "Invalid aio option: bogus" (1e
-        // capture invocation 12) by design (OQ6): every -i value is
-        // refused since no aio backend selection exists yet.
+        // Diverges from qemu's own "Invalid aio option: bogus" by
+        // design: instar has no aio backend to select (its backing
+        // store is a plain file), so every -i value is refused as
+        // not yet supported rather than accepted with a different
+        // meaning.
         let args = BenchArgs {
             aio: Some("bogus".to_string()),
             ..default_bench_args()
@@ -6625,14 +6645,14 @@ mod bench_clap_hyphen_tests {
     //! Clap-LEVEL pins for negative numeric values. The
     //! `bench_validate_tests` module constructs `BenchArgs` directly
     //! and never exercises clap's own tokenizer -- which is exactly
-    //! the gap that let the 4c smoke run find `-c -1` dying inside
-    //! clap ("unexpected argument '-1' found", exit 2) instead of
-    //! reaching `validate_bench_args` and producing qemu's range
-    //! message (exit 1). These tests parse full argv vectors through
+    //! the gap that once let `-c -1` die inside clap ("unexpected
+    //! argument '-1' found", exit 2) instead of reaching
+    //! `validate_bench_args` and producing qemu's range message
+    //! (exit 1). These tests parse full argv vectors through
     //! `Cli::try_parse_from` (the resize idiom) and assert both
     //! halves of the contract: clap ACCEPTS the hyphen value thanks
     //! to `allow_hyphen_values = true`, and `validate_bench_args`
-    //! then produces the exact 1e-capture message.
+    //! then produces qemu-img 10.0.8's exact range message.
     use super::*;
     use clap::Parser;
 
@@ -6701,10 +6721,10 @@ mod bench_clap_hyphen_tests {
     #[test]
     fn flush_interval_negative_reaches_validation() {
         // -w -d 1 so the flush-interval RANGE check is what fires
-        // (matching the qemu transcript in Supplement 2), not the
-        // "-flush-interval is only available in write tests" rule;
-        // the range check precedes the -w refusal (verified live
-        // in the 4c smoke run).
+        // (matching qemu-img 10.0.8's transcript for the same argv),
+        // not the "-flush-interval is only available in write tests"
+        // rule; the range check precedes the -w refusal (verified
+        // live against qemu-img 10.0.8).
         assert_eq!(
             clap_then_validate_err(&[
                 "instar",
@@ -9069,8 +9089,9 @@ fn run_bitmap(
 
     // g. Probe the qcow2 header + bitmaps extension for the guest's
     // cross-check, then launch the bitmap guest over an input-RW
-    // attach. bitmap uses a 512-byte sector size (open question 5:
-    // metadata writes are sub-cluster; there is no --sector-size flag).
+    // attach. bitmap uses a 512-byte sector size: its metadata writes
+    // are sub-cluster, and qemu-img bitmap has no --sector-size flag
+    // for instar to mirror.
     let probed = probe_bitmap_target(&args.filename)?;
     let sector_size: u32 = 512;
     let result = run_bitmap_guest(
@@ -11232,13 +11253,12 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
 
     // VMDK monolithicFlat descriptor pre-flight validation.
     //
-    // The guest info operation parses descriptor text directly
-    // (Phase 22c), but it can't run the security-sensitive
-    // rejections — backing allowlist, multi-extent, parent-hint,
-    // non-zero offset — because those all touch the host
-    // filesystem. Do that here so an unsupported descriptor
-    // fails cleanly before we launch the guest instead of
-    // silently producing misleading output.
+    // The guest info operation parses descriptor text directly,
+    // but it can't run the security-sensitive rejections — backing
+    // allowlist, multi-extent, parent-hint, non-zero offset —
+    // because those all touch the host filesystem. Do that here so
+    // an unsupported descriptor fails cleanly before we launch the
+    // guest instead of silently producing misleading output.
     //
     // The resolved descriptor (when present) is also threaded into
     // JSON info output so each flat extent appears as a separate
@@ -16959,11 +16979,11 @@ fn run_snapshot_create(
     name: &str,
     verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // --- Validate the snapshot name (open question 9) -------------------
+    // --- Validate the snapshot name -------------------------------------
     // qemu-img silently truncates names to 255 bytes; instar refuses
     // loudly instead (divergence noted in docs/quirks.md). An empty
-    // name is also refused (the plan requires a non-empty name even
-    // though qemu-img accepts it — documented divergence).
+    // name is also refused, even though qemu-img accepts one (also a
+    // documented divergence).
     let name_bytes = name.as_bytes();
     if name_bytes.is_empty() {
         return Err("snapshot: -c requires a non-empty snapshot name".into());
@@ -17856,9 +17876,12 @@ fn create_backing_format_code(s: &str) -> Result<u32, Box<dyn std::error::Error>
 /// device, populate `CreateConfig`, launch the create guest binary,
 /// and wait for the result.
 ///
-/// Phase 3c ships the no-backing path. Phase 3d adds the backing
-/// attach; phase 3e replaces the minimal error reporting here with
-/// the full human / json / quiet renderer.
+/// With `-b`, the backing image is attached read-only as input
+/// device 0 (the guest reads it to recover the virtual size when
+/// `--size` is omitted); without it, a 1-sector tempfile stub fills
+/// that slot. Guest errors map through `create_error_detail` (and
+/// remove the partial output); success renders through
+/// `render_create_success` (human / json / quiet).
 fn run_create_nonraw(args: &CreateArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
     // --- Resolve fields from args ---------------------------------------
     let target_format = create_target_format(&args.target_format)?;
@@ -17933,8 +17956,8 @@ fn run_create_nonraw(args: &CreateArgs, verbose: bool) -> Result<(), Box<dyn std
     // footprint (kilobytes typically), but virtio needs a capacity to
     // expose. Pass a generous upper bound (virtual_size + 64 MiB)
     // and let the file stay sparse. For the inferred-from-backing
-    // path (virtual_size == 0; phase 3d) we fall back to 64 MiB —
-    // the BAT/L1/refcount metadata is far smaller than that.
+    // path (virtual_size == 0, size taken from `-b`) we fall back to
+    // 64 MiB — the BAT/L1/refcount metadata is far smaller than that.
     let output_capacity_hint = virtual_size
         .saturating_add(64 * 1024 * 1024)
         .max(64 * 1024 * 1024);
@@ -18321,7 +18344,7 @@ fn run_create_guest(
     guest_mem.write_obj(grain_size, GuestAddress(OPERATION_CONFIG_ADDR + 32))?;
     guest_mem.write_obj(block_size, GuestAddress(OPERATION_CONFIG_ADDR + 36))?;
     // Backing-file fields. backing_file_bytes is empty when no -b
-    // was given (phase 3c's stub-input path); otherwise it holds the
+    // was given (the stub-input path); otherwise it holds the
     // user-typed path bytes and the guest reads input device 0 to
     // recover the backing's virtual size when CreateConfig.virtual_size
     // is zero.
@@ -18354,9 +18377,9 @@ fn run_create_guest(
 
     // --- Set up devices --------------------------------------------------
     // core unconditionally initialises input device 0 (see core/src/
-    // main.rs::_start), so even though phase 3c has no real backing we
-    // attach a tiny stub at device index 0 and place the output at
-    // index 1. The guest never reads from the stub.
+    // main.rs::_start), so input device 0 is always attached — the
+    // real backing image when -b is given, otherwise a tiny stub the
+    // guest never reads — and the output sits at index 1.
     let mut device_set = DeviceSet::new();
     let mut io_events: Vec<IoEvent> = Vec::new();
 
@@ -18442,9 +18465,9 @@ fn run_create_guest(
     let mut serial_transmitter = SerialTransmitter::new();
     let mut debug_buffer = DebugBuffer::new();
 
-    // 1 stub input + 1 output, no progress events (the metadata write
-    // is tiny and instant). Phase 3d replaces the stub with the real
-    // backing image when -b is given.
+    // 1 input (the backing image, or the stub when no -b was given)
+    // + 1 output, no progress events (the metadata write is tiny and
+    // instant).
     let config = vmm_config(args.sector_size, args.sector_size, 100);
     serial_transmitter.queue_config(&config);
     debug!(
@@ -21104,11 +21127,14 @@ Offset          Length          Mapped to       File
         assert_ne!(apply, delete);
     }
 
-    // --- D1: force-share refusal for mutating modes ---------------
+    // --- force-share refusal for mutating modes -------------------
+    // qemu-img refuses `-U` with -c/-d/-a ("force-share=on can only be
+    // used with read-only images", exit 1, image untouched); instar
+    // matches by refusing host-side before any file access.
 
     /// Helper: build a minimal SnapshotArgs for refusal tests.
-    /// The filename is intentionally bogus — the D1 check must fire
-    /// before any file access.
+    /// The filename is intentionally bogus — the force-share check
+    /// must fire before any file access.
     fn snapshot_args_for_d1(
         force_share: bool,
         create: Option<&str>,
@@ -21134,7 +21160,7 @@ Offset          Length          Mapped to       File
 
     #[test]
     fn snapshot_force_share_with_create_is_refused_before_file() {
-        // D1: -U -c must be rejected before any file access.
+        // -U -c must be rejected before any file access.
         let args = snapshot_args_for_d1(true, Some("snap1"), None, None, false);
         let err = run_snapshot(args, false).unwrap_err();
         let msg = err.to_string();
@@ -21147,7 +21173,7 @@ Offset          Length          Mapped to       File
 
     #[test]
     fn snapshot_force_share_with_delete_is_refused_before_file() {
-        // D1: -U -d must be rejected before any file access.
+        // -U -d must be rejected before any file access.
         let args = snapshot_args_for_d1(true, None, Some("snap1"), None, false);
         let err = run_snapshot(args, false).unwrap_err();
         let msg = err.to_string();
@@ -21160,7 +21186,7 @@ Offset          Length          Mapped to       File
 
     #[test]
     fn snapshot_force_share_with_apply_is_refused_before_file() {
-        // D1: -U -a must be rejected before any file access.
+        // -U -a must be rejected before any file access.
         let args = snapshot_args_for_d1(true, None, None, Some("snap1"), false);
         let err = run_snapshot(args, false).unwrap_err();
         let msg = err.to_string();
@@ -21224,7 +21250,7 @@ Offset          Length          Mapped to       File
 
     #[test]
     fn snapshot_force_share_with_list_proceeds_past_d1_check() {
-        // D1: -U -l must NOT be refused at the force-share gate;
+        // -U -l must NOT be refused at the force-share gate;
         // the error that follows is file-not-found (or similar),
         // NOT a force-share message.
         let args = snapshot_args_for_d1(true, None, None, None, true);
@@ -21237,11 +21263,11 @@ Offset          Length          Mapped to       File
         );
     }
 
-    // --- D2: bare filename (no mode flag) defaults to list --------
+    // --- bare filename (no mode flag) defaults to list, like qemu ---
 
     #[test]
     fn snapshot_bare_filename_dispatches_to_list() {
-        // D2: no mode flag → list path. The list path fails because
+        // No mode flag → list path. The list path fails because
         // the file doesn't exist, but the error must not be a
         // force-share or "required mode" clap error.
         let args = snapshot_args_for_d1(false, None, None, None, false);

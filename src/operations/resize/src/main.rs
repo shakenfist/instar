@@ -14,7 +14,7 @@
 //!    applies it after the guest returns (`apply_preallocation`).
 //!  - `Preallocation::Metadata`: not yet implemented; the planner
 //!    rejects it with `PreallocationUnsupported` (see
-//!    PLAN-resize-phase-09-preallocation.md).
+//!    docs/plans/PLAN-resize.md).
 //!  - Backing-chain composition (resize doesn't touch backing
 //!    references; matches qemu).
 

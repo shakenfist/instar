@@ -40,7 +40,8 @@ qemu-io -c "write 0 64k" "$WORK/nf.qcow2" >/dev/null 2>&1
 qemu-img snapshot -c alpha "$WORK/nf.qcow2" >/dev/null 2>&1
 refuse "not-found-by-name" "$WORK/nf.qcow2" "nosuch"
 
-# Not-found by pure ID (fact 2: -d has no ID matching path).
+# Not-found by pure ID: qemu-img's -d matches by name only and has no
+# ID matching path, so "1" is not found here.
 refuse "not-found-by-id" "$WORK/nf.qcow2" "1"
 
 # Delete on a 0-snapshot image.

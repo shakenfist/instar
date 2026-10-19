@@ -82,7 +82,7 @@ fn panic(_info: &PanicInfo) -> ! {
 }
 
 // ---------------------------------------------------------------------------
-// Scratch layout (Open question 4)
+// Scratch layout
 // ---------------------------------------------------------------------------
 //
 // Named regions carved forward from `SCRATCH_MEM_BASE`, mirroring
@@ -423,7 +423,8 @@ fn rb_lookup(
 /// Drive the bitmap mutation over a qcow2 image.
 ///
 /// Reads the full header cluster, parses the header and bitmaps
-/// extension, runs the gate battery (Mission §2) — refusing *before
+/// extension, runs the gate battery (qcow2 v3, not dirty/corrupt,
+/// 16-bit refcounts, autoclear-consistent bitmaps) — refusing *before
 /// any write* so a refusal leaves the image byte-identical —
 /// cross-checks the host-probed [`BitmapConfig`] fields against the
 /// guest's own re-parse, stages the bitmaps directory + refcount
@@ -878,8 +879,10 @@ unsafe fn free_bitmap_data_clusters(
 }
 
 /// The ordered action loop, the write-back, and the crash-safe
-/// autoclear dance (Open question 1). Only reached after every gate
-/// passed and staging succeeded.
+/// autoclear dance (a crash at any point leaves either the pre-op
+/// image or one with the autoclear bit clear, so qemu ignores the
+/// bitmaps). Only reached after every gate passed and staging
+/// succeeded.
 ///
 /// The loop mutates only scratch (the DIR_A/DIR_B double-buffer and
 /// REFBLOCKS_BUF in memory) plus read-only table-walk reads, so any

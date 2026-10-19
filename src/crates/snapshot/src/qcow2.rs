@@ -58,11 +58,11 @@ pub fn read_refcount_in_block(
         // occupies the LOWEST bits of byte 0, matching qemu's
         // get_refcount_ro0/ro1/ro2 in block/qcow2-refcount.c
         // (`>> (index % 8)`, `>> (2 * (index % 4))`,
-        // `>> (4 * (index % 2))`). These paths were MSB-first
-        // until the PLAN-snapshot pre-push audit caught the
-        // divergence from qemu and from qcow2::lookup_refcount;
-        // the MSB-first order corrupted refcount_bits 1/2/4
-        // images in `resize --shrink`, which delegates here.
+        // `>> (4 * (index % 2))`). These paths were once
+        // MSB-first, diverging from qemu and from
+        // qcow2::lookup_refcount; the MSB-first order corrupted
+        // refcount_bits 1/2/4 images in `resize --shrink`, which
+        // delegates here.
         1 => {
             let byte = (local_idx / 8) as usize;
             if byte >= block.len() {
@@ -138,10 +138,9 @@ pub fn read_refcount_in_block(
 /// now delegates here via a thin wrapper). The byte-and-wider
 /// widths are preserved byte-for-byte from the original; the
 /// sub-byte widths (1/2/4) were corrected to qemu's LSB-first
-/// packing during the PLAN-snapshot pre-push audit — the
-/// original MSB-first order corrupted sub-byte-width images in
-/// `resize --shrink` (see the ordering note on
-/// [`read_refcount_in_block`]). The signature widens
+/// packing — the original MSB-first order corrupted
+/// sub-byte-width images in `resize --shrink` (see the ordering
+/// note on [`read_refcount_in_block`]). The signature widens
 /// `refcount_bits` from `u8` to `u32` to match the rest of the
 /// snapshot crate's API; resize bridges the type difference via
 /// a thin wrapper.
@@ -339,8 +338,10 @@ pub fn alloc_cluster_in_refblocks(
 /// [`SnapshotError::Unsupported`].
 ///
 /// Returns [`SnapshotError::RefcountExhausted`] if no run of
-/// `count` consecutive free clusters exists. Refcount-table growth
-/// is a separate concern (see open question 7 in the phase plan).
+/// `count` consecutive free clusters exists in the staged
+/// refblocks. This allocator never adds a refblock or grows the
+/// refcount table, where qemu-img grows the refcount structures
+/// and succeeds; the divergence is documented in docs/quirks.md.
 pub fn alloc_contiguous_clusters_in_refblocks(
     blocks: &mut [u8],
     cluster_size: u64,
@@ -578,7 +579,8 @@ pub enum L2Classification {
 /// each L2 entry, classifies it; allocated entries (Standard
 /// or Compressed) build a [`L1ClusterRef`] and invoke `visit`.
 /// Unallocated L1 entries (entry value zero after masking) and
-/// unallocated L2 entries are skipped (open question 8).
+/// unallocated L2 entries are skipped: they have no host cluster
+/// whose refcount could be adjusted.
 ///
 /// Returning `false` from the visitor stops the walk; the
 /// function returns `Ok(())` either way.
@@ -1216,7 +1218,7 @@ where
 /// COPIED flag rewritten similarly.
 ///
 /// Entries that reference no cluster are **scrubbed**, not
-/// skipped (phase 8b): qemu's `qcow2_update_snapshot_refcount`
+/// skipped: qemu's `qcow2_update_snapshot_refcount`
 /// strips `QCOW_OFLAG_COPIED` before classifying and assigns
 /// `refcount = 0` to `QCOW2_CLUSTER_ZERO_PLAIN` (standard L2
 /// only: zero bit set, offset 0 — with subclusters the zero
@@ -1311,7 +1313,7 @@ where
                     // UNALLOCATED or ZERO_PLAIN: qemu treats the
                     // refcount as 0, so COPIED can never be
                     // legitimately set — scrub a stale bit
-                    // (phase 8b; see the doc comment).
+                    // (see the doc comment).
                     if (l2_entry & OFLAG_COPIED) != 0 {
                         rewrite_l2_entry_copied_flag(l2_bytes, l2_idx as u32, false, extended_l2)?;
                         rewrites = rewrites.saturating_add(1);
@@ -1483,9 +1485,8 @@ mod tests {
     fn sub_byte_widths_are_lsb_first_like_qemu() {
         // Round-trip tests pass under EITHER bit order (set and
         // read mirror each other), which is how an MSB-first bug
-        // survived until the PLAN-snapshot pre-push audit. This
-        // test pins the on-disk layout byte-exactly against
-        // qemu's get/set_refcount_ro0/ro1/ro2
+        // went unnoticed. This test pins the on-disk layout
+        // byte-exactly against qemu's get/set_refcount_ro0/ro1/ro2
         // (block/qcow2-refcount.c): entry 0 occupies the LOWEST
         // bits of byte 0.
         //
@@ -3092,7 +3093,7 @@ mod tests {
         assert_eq!(r, Err(SnapshotError::InvalidConfig));
     }
 
-    // ---------------- phase 8b: stale-COPIED scrub ----------------
+    // ---------------- stale-COPIED scrub ----------------
     //
     // qemu's qcow2_update_snapshot_refcount strips COPIED before
     // classifying; ZERO_PLAIN / UNALLOCATED entries get

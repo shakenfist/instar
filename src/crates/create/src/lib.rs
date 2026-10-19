@@ -154,8 +154,8 @@ pub const MAX_METADATA_WRITES: usize = 96;
 /// `total_metadata_bytes` is the sum of `writes()[*].bytes.len()`.
 /// `minimum_file_size` is the smallest file size that contains every
 /// write's byte range (the maximum of `byte_offset + bytes.len()`
-/// across all writes); the caller may need to extend the file past
-/// this for preallocation in later phases.
+/// across all writes); the host extends the file past this when
+/// `falloc` or `full` preallocation is requested.
 #[derive(Debug, Clone, Copy)]
 pub struct MetadataPlan<'a> {
     /// Sum of all `writes()[*].bytes.len()`.
@@ -283,9 +283,9 @@ pub struct VmdkCreateOpts<'a> {
     /// into the new descriptor's `parentCID=` line. `None` falls back
     /// to a fixed sentinel (`0xdeadbeef`) — used when the backing
     /// isn't a VMDK or the caller couldn't extract the CID (e.g.
-    /// parent descriptor unreadable). Phase 5b wires this through
-    /// from the create guest's
-    /// [`vmdk::read_and_parse_descriptor`] call.
+    /// parent descriptor unreadable). The create guest fills it from
+    /// its `read_vmdk_parent_cid` helper, which calls
+    /// [`vmdk::read_and_parse_descriptor`] on the parent.
     pub parent_cid: Option<u32>,
 }
 
@@ -932,7 +932,7 @@ pub fn plan_vmdk<'a>(
 /// hook for the parent filename.
 ///
 /// `parent_cid` carries the parent's `CID` value when the caller
-/// could extract it (vmdk-from-vmdk path; phase 5b wires this via
+/// could extract it (vmdk-from-vmdk path, via
 /// `vmdk::read_and_parse_descriptor`). `None` falls back to the
 /// fixed sentinel `0xdeadbeef` — used when the backing is non-vmdk
 /// (no CID concept) or descriptor extraction fails.
@@ -2433,8 +2433,8 @@ mod vhd_plan_tests {
 
     /// A `Fixed` VHD still refuses a backing reference: `disk_type = 4`
     /// needs the BAT and dynamic header a fixed image does not have.
-    /// The `Dynamic` arm now emits a differencing child instead; step
-    /// 5e covers it.
+    /// The `Dynamic` arm emits a differencing child instead;
+    /// `plan_vhd_dynamic_accepts_backing` below covers it.
     #[test]
     fn plan_vhd_fixed_rejects_backing() {
         let mut opts = default_fixed(1 << 20);

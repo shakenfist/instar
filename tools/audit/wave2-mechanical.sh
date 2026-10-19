@@ -53,13 +53,12 @@ diff_added_lines() {
 # whole purpose is telling "nothing found" apart from "nothing
 # examined", every section has to state its result.
 #
-# This fixes a sibling of a defect the push-audit runbook already hit
-# at a smaller scale, where `head -20` cut 32 hits and hid six of
-# them (PLAN-fuzz-autofix-phase-02-push-audit.md): a bare `head -N`
-# silently hides everything past the cap, which at this audit's
-# 55,000-line union is far more likely to bite than it did there. It
-# does not change which lines are shown or the cap, only whether a
-# reader can tell the list was cut.
+# This fixes a sibling of a defect the push-audit runbook already hit at
+# a smaller scale, where `head -20` cut 32 hits and hid six of them: a
+# bare `head -N` silently hides everything past the cap, which at this
+# audit's 55,000-line union is far more likely to bite than it did
+# there. It does not change which lines are shown or the cap, only
+# whether a reader can tell the list was cut.
 show_capped() {
     local cap="$1" content="$2" total
     total="$(printf '%s\n' "$content" | grep -c .)"

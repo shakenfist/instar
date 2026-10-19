@@ -3128,7 +3128,7 @@ unsafe fn convert_to_qcow2_compressed(
 }
 
 // ================================================================
-// VMDK monolithicSparse output (Phase 8d)
+// VMDK monolithicSparse output
 // ================================================================
 
 /// Computed layout for VMDK output.
@@ -3510,7 +3510,7 @@ unsafe fn convert_to_vmdk(
 }
 
 // ================================================================
-// streamOptimized VMDK output (Phase 8e)
+// streamOptimized VMDK output
 // ================================================================
 
 /// Convert input to streamOptimized VMDK format with DEFLATE

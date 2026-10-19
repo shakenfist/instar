@@ -158,7 +158,7 @@ const _: () = assert!(
 );
 const _: () = assert!(
     STEP_CAPACITY >= 512,
-    "step window unexpectedly small; the decision-1 loop assumes 1300+ steps"
+    "step window unexpectedly small; the plan-execute-resume loop assumes 1300+ steps"
 );
 // At the largest cluster commit accepts (DATA_BUF_LIMIT), the
 // planner bounce still covers a whole cluster and the L2 window

@@ -241,7 +241,7 @@ const _: () = assert!(
 );
 const _: () = assert!(
     STEP_CAPACITY >= 512,
-    "step window unexpectedly small; the decision-1 loop assumes 1300+ steps"
+    "step window unexpectedly small; the plan-execute-resume loop assumes 1300+ steps"
 );
 // At the largest cluster rebase accepts (COMPARE_BUF_SIZE), the
 // planner bounce and the probe buffer still cover a whole
@@ -969,10 +969,10 @@ unsafe fn run_qcow2_safe(call_table: &CallTable, config: &RebaseConfig) -> Rebas
     // and the shared refcount-growth planner provisions the
     // extra refblocks the COW allocations need (so a COW
     // schedule that crosses a refblock boundary grows rather
-    // than refusing). The old failure mode (writing into a shared L2 in place, leaving
-    // `refcount=1 reference=2` on clusters two L1 trees
-    // reference, so a later `qemu-img snapshot -d` frees live
-    // active-view data — #421) is thereby structurally
+    // than refusing). The old failure mode (writing into a shared
+    // L2 in place, leaving `refcount=1 reference=2` on clusters
+    // two L1 trees reference, so a later `qemu-img snapshot -d`
+    // frees live active-view data — #421) is thereby structurally
     // unreachable: COW never mutates a snapshot's own L1/L2, so
     // every pre-existing snapshot is preserved and reads through
     // whatever backing the overlay now points at (the NEW one),

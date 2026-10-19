@@ -280,10 +280,10 @@ fn table_cluster_count(table_size: u32, cluster_size: u64) -> Result<u64, Bitmap
 ///
 /// Then allocates `ceil(table_bytes / cluster_size)` **table
 /// clusters** for the new bitmap's all-zero table (an empty bitmap has
-/// no data clusters — see master OQ8), records their host offsets in
-/// [`ActionOutcome::table_clusters_to_zero`] (the guest zero-fills
-/// them), builds the enabled directory entry, and appends it to
-/// `out_dir` via
+/// no data clusters, matching qemu's lazy `store_bitmap_data`), records
+/// their host offsets in [`ActionOutcome::table_clusters_to_zero`] (the
+/// guest zero-fills them), builds the enabled directory entry, and
+/// appends it to `out_dir` via
 /// [`build_directory_with_added`](crate::directory::build_directory_with_added).
 ///
 /// Validation runs entirely before the allocation, so a refused `add`

@@ -382,7 +382,7 @@ class TestDdRawWindow(InstarTestBase):
 
 
 # ---------------------------------------------------------------------------
-# Phase-4b: structured-output window matrix
+# Structured-output window matrix
 # ---------------------------------------------------------------------------
 
 def _qemu_img_info_vsize(path: str) -> int:
@@ -863,7 +863,7 @@ class TestDdUnalignedClusterCrossing(InstarTestBase):
 
 
 # ---------------------------------------------------------------------------
-# Phase-6a: CLI rejection matrix
+# CLI rejection matrix
 # ---------------------------------------------------------------------------
 
 class TestDdErrors(InstarTestBase):
@@ -1035,7 +1035,7 @@ class TestDdErrors(InstarTestBase):
 
 
 # ---------------------------------------------------------------------------
-# Phase-6b: -O default is raw (not the input format)
+# -O default is raw (not the input format)
 # ---------------------------------------------------------------------------
 
 class TestDdOutputDefault(InstarTestBase):
@@ -1108,7 +1108,7 @@ class TestDdOutputDefault(InstarTestBase):
 
 
 # ---------------------------------------------------------------------------
-# Phase-6b: input-format coverage
+# Input-format coverage
 # ---------------------------------------------------------------------------
 
 def _make_patterned_raw(path: str) -> None:
@@ -1919,8 +1919,9 @@ class TestDdDetectOnlyRefusal(InstarTestBase):
 
     qed is detected/sized by info but has no read path; dd must
     refuse it rather than emitting the container bytes plus zero padding
-    (issue #444).  iso keeps its raw pass-through per the post-1a
-    management decision (exact-length output, no sector padding).
+    (issue #444).  iso keeps its raw pass-through (exact-length output,
+    no sector padding): an ISO's container bytes are its disk content, and
+    qemu-img, which has no iso driver, reads ISOs as raw too.
     """
 
     def _refusal_image(self, image_id):
@@ -1968,7 +1969,7 @@ class TestDdDetectOnlyRefusal(InstarTestBase):
     def test_dd_iso_passthrough(self):
         """dd keeps reading iso as raw (deliberate qemu parity).
 
-        Pins the step-1a behaviour: rc 0, output is the exact 376832-byte
+        Pins the raw pass-through: rc 0, output is the exact 376832-byte
         container length (dd sizes to the file, not the padded vsize).
         """
         image = self._refusal_image('iso-simple')

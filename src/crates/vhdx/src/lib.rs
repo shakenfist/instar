@@ -457,7 +457,7 @@ pub const PARENT_LOCATOR_ENTRY_SIZE: usize = 12;
 /// `parent_linkage2`) and instar writes two, so this clears real images
 /// with room to spare. An item claiming more is parsed up to the limit
 /// and the locator is marked `EntryCountExceedsCapacity` rather than
-/// dropped, so a later phase knows entries went unread and can say so.
+/// dropped, so a caller knows entries went unread and can say so.
 pub const MAX_PARENT_LOCATOR_ENTRIES: usize = 8;
 
 /// Longest key that is decoded, **in UTF-16 source bytes**: 64 bytes,
@@ -483,10 +483,10 @@ pub const MAX_PARENT_LOCATOR_KEY_UTF16_BYTES: usize = 64;
 /// stores `ValueLength` as a u16 and fixes no path length, and a
 /// Windows extended-length path — one prefixed `\\?\` — may legitimately
 /// run to tens of thousands of characters. Such a value is marked
-/// `ValueTooLong` here, so a phase reading that defect must treat it as
+/// `ValueTooLong` here, so a caller reading that defect must treat it as
 /// possibly *our* bound rather than evidence of a hostile image. The
 /// entry keeps its raw `value_offset` and `value_length`, which is
-/// what a later phase would need to re-read it into a bigger buffer.
+/// what a caller would need to re-read it into a bigger buffer.
 /// The longest measured Hyper-V value is an 88-character `volume_path`.
 pub const MAX_PARENT_LOCATOR_VALUE_UTF16_BYTES: usize = 520;
 
@@ -714,7 +714,7 @@ pub enum VhdxParentLocatorDefect {
 ///
 /// The four raw fields are preserved exactly as they were read, for
 /// every entry, whether or not the entry is well formed — that is what
-/// lets a later phase report the entry it refused. `defect` records the
+/// lets a caller report the entry it refused. `defect` records the
 /// first structural problem found, in this order: key bounds, key
 /// length, key decoding, value bounds, value length, value decoding,
 /// duplicate key. The key is resolved before the value is looked at, so
@@ -4104,7 +4104,7 @@ mod tests {
     }
 
     // ====================================================================
-    // count_allocated_in_bat tests (phase 2d)
+    // count_allocated_in_bat tests
     // ====================================================================
 
     /// Build an 8-byte LE BAT entry with the given state and a deterministic
@@ -4569,7 +4569,7 @@ mod tests {
         assert_eq!(entry.defect, Some(VhdxParentLocatorDefect::KeyOutOfBounds));
         // The key is resolved first, so a key this broken leaves the
         // value undecoded too — but both raw descriptors survive, which
-        // is what lets a later phase say which entry it refused.
+        // is what lets a caller say which entry it refused.
         assert_eq!(entry.key(), b"");
         assert_eq!(entry.value(), b"");
         assert_eq!(entry.key_offset as usize, len);
@@ -4722,7 +4722,7 @@ mod tests {
             locator.entries()[1].defect,
             Some(VhdxParentLocatorDefect::DuplicateKey)
         );
-        // The duplicate keeps its decoded value, so a later phase can
+        // The duplicate keeps its decoded value, so a caller can
         // report what the two entries disagreed about.
         assert_eq!(locator.entries()[1].value(), r".\second.vhdx".as_bytes());
         // find() and value_of() resolve to the first entry.
@@ -4999,8 +4999,8 @@ mod tests {
         assert!(!declined.is_absent());
         assert!(declined.parsed().is_none());
 
-        // And the refusal keeps the facts that explain it, so a later
-        // phase can report the length it declined and, if it wants,
+        // And the refusal keeps the facts that explain it, so a
+        // caller can report the length it declined and, if it wants,
         // re-read the item with a bigger buffer.
         match declined {
             VhdxParentLocatorState::NotStaged {
@@ -5735,9 +5735,9 @@ mod tests {
 
         // The five reads this function always did — table, file
         // parameters, virtual size, logical and physical sector size —
-        // and not one more. This is the unit-level form of the phase's
-        // no-behaviour-change claim: an image without a parent costs
-        // exactly what it cost before.
+        // and not one more. Parsing the parent locator must not change
+        // what an image without a parent costs: it costs exactly what
+        // it cost before parent locators were read.
         assert_eq!(bytes_read, 5 * 512);
     }
 

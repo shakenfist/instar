@@ -5,8 +5,9 @@
 #           (or a user in the disk group with loop device access).
 #
 # These containers have real encrypted payloads and can be used
-# for decryption testing (Phase 12c/12e). For header-only
-# parsing tests, use create-luks-headers.py instead.
+# for decryption testing, including the inner format behind the
+# LUKS layer. For header-only parsing tests, use
+# create-luks-headers.py instead.
 #
 # Usage: sudo ./create-luks-testdata.sh <output_dir>
 

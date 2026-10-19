@@ -402,9 +402,12 @@ const DIFF_PARENT_PATH: &str = "parent.vhd";
 /// deliberately disagree now.
 const DIFF_PARENT_PATH_EMITTED: &str = r".\parent.vhd";
 
-/// Absolute file offsets of a differencing child's metadata, per decision
-/// 1 of the phase plan. Written as literals rather than derived from the
-/// planner, so a layout change has to edit them.
+/// Absolute file offsets of a differencing child's metadata. The locator
+/// data takes the one sector between the dynamic header and the BAT —
+/// where both measured Hyper-V images put it, and where `locator_defect`
+/// accepts it — so the BAT moves from 1536 to 2048 for a child only.
+/// Written as literals rather than derived from the planner, so a layout
+/// change has to edit them.
 const DIFF_HEAD_FOOTER_OFF: usize = 0;
 const DIFF_DYN_HEADER_OFF: usize = 512;
 const DIFF_LOCATOR_DATA_OFF: usize = 1536;
@@ -965,8 +968,8 @@ fn summarise_plan(label: &str, plan: &MetadataPlan<'_>, out: &mut String) {
 }
 
 /// Every byte `plan_vhd` emits for a non-differencing VHD, as it was on
-/// `develop` at `f981374` — the commit this phase branched from, before
-/// the differencing emitter existed.
+/// `develop` at `f981374` — the last commit before the differencing
+/// emitter existed.
 ///
 /// **How these constants were obtained, and why they mean what they say.**
 /// They are not a transcription of the current tree's behaviour. A
@@ -977,14 +980,14 @@ fn summarise_plan(label: &str, plan: &MetadataPlan<'_>, out: &mut String) {
 /// `develop`'s output by construction, and the assertion below is a real
 /// comparison between two revisions rather than a restatement of one.
 ///
-/// What it protects is the risk named in the phase plan: the locator data
-/// region sits between the dynamic header and the BAT, so moving the BAT
-/// unconditionally instead of only for a differencing child is a
-/// one-character mistake that silently changes the bytes of every
-/// `create -f vpc` invocation — including the ones `tests/test_create.py`
-/// compares against qemu-img, where the failure would look like a qemu
-/// disagreement rather than like this. The `off=` columns for `w2` and
-/// `w3` are where that shows up: the BAT stays at 1536.
+/// What it protects against: the locator data region sits between the
+/// dynamic header and the BAT, so moving the BAT unconditionally instead
+/// of only for a differencing child is a one-character mistake that
+/// silently changes the bytes of every `create -f vpc` invocation —
+/// including the ones `tests/test_create.py` compares against qemu-img,
+/// where the failure would look like a qemu disagreement rather than like
+/// this. The `off=` columns for `w2` and `w3` are where that shows up: the
+/// BAT stays at 1536.
 ///
 /// If a deliberate change to the non-differencing layout is ever made,
 /// regenerate this the same way — from the revision being compared
@@ -1546,8 +1549,8 @@ fn vhdx_differencing_round_trips_through_the_parser() {
 /// check for overlap either. That is a real gap in this tree's reader
 /// rather than something this test papers over: an image whose items
 /// overlap is read back as sound, and the item that wins is whichever
-/// one was written last. It is recorded here so that a later phase
-/// adding an overlap check knows the check was missing, not forgotten.
+/// one was written last. It is recorded here so that whoever adds an
+/// overlap check later knows the check was missing, not forgotten.
 #[test]
 fn vhdx_differencing_locator_misplacement_is_detected() {
     let laid = lay_out_vhdx(&vhdx_diff_opts(VHDX_PARENT_PATH));
@@ -1968,8 +1971,8 @@ fn vhdx_non_differencing_metadata_is_unchanged() {
 }
 
 /// Every byte `plan_vhdx` emits for a non-differencing VHDX, as it was
-/// on `develop` at `9a80776` — the commit this phase branched from,
-/// before the differencing emitter existed.
+/// on `develop` at `9a80776` — the last commit before the
+/// differencing emitter existed.
 ///
 /// **How these constants were obtained, and why they mean what they
 /// say.** They are not a transcription of the current tree's behaviour.

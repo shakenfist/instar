@@ -963,8 +963,13 @@ unsafe fn run_create(
 
     let entries_per_refblock = (cluster_size * 8) / 16;
 
-    // ----- Step 5 (open question 6): copy active L1 verbatim BEFORE -----
-    // any flag rewrite, exactly like qemu.
+    // ----- Step 5: copy active L1 verbatim BEFORE any flag rewrite -----
+    // qemu writes the snapshot's L1 copy before its refcount / flag
+    // pass and never revisits it, so the stored copy keeps COPIED set
+    // even though the refcounts are now 2; copying the pre-rewrite
+    // bytes reproduces that. It is harmless: `qemu-img check`
+    // validates only the active chain's flags, and apply scrubs the
+    // stored copy when the snapshot is gone back to.
     if l1_size_bytes > 0 {
         core::ptr::copy_nonoverlapping(active_l1_ptr, L1_COPY_BUF as *mut u8, l1_size_bytes);
     }
@@ -1242,8 +1247,10 @@ unsafe fn run_create(
 /// ordering). Matching is by NAME ONLY, first match in table
 /// order — `bdrv_snapshot_find` does a plain `strcmp(sn->name,
 /// name)` scan and **ID matching does not exist** on the qemu 10
-/// delete path (phase plan fact 2; `qcow2::find_snapshot`'s
-/// id-or-name semantics are deliberately not used). The find
+/// delete path (with `id=1,name="2"` and `id=2,name="x"`,
+/// `qemu-img snapshot -d 2` deletes the one *named* "2"), so
+/// `qcow2::find_snapshot`'s id-or-name semantics are deliberately
+/// not used. The find
 /// walks the RAW staged table so the comparison covers the full
 /// on-disk name, independent of the bounded parser's 63-byte
 /// id/name truncation; an empty argument is allowed and matches
@@ -1340,7 +1347,8 @@ unsafe fn run_delete(
     // The snapshot's L1 + L2 set feed the decrement walk (read-only
     // staging); the active L1 + L2 set feed the COPIED refresh
     // (mutated in place). Shared L2 clusters appear in both staged
-    // sets — deliberately no dedup (phase plan open question 6).
+    // sets — deliberately no dedup (see the rationale above
+    // `SNAP_L1_BUF`).
     let snap_l1_bytes = (snap_l1_size as usize).saturating_mul(8);
     if snap_l1_bytes > SNAP_L1_LIMIT {
         fail!(SnapshotResult::ERROR_UNSUPPORTED_FEATURE);
@@ -1464,9 +1472,9 @@ unsafe fn run_delete(
     }
 
     // ----- Steps 4 + 6: compacted table build + allocation ---------------
-    // Skipped entirely when the remaining count is 0 (fact 3: qemu
-    // writes header nb_snapshots = 0 / snapshots_offset = 0 and
-    // allocates no new table).
+    // Skipped entirely when the remaining count is 0 (qemu-img
+    // likewise writes header nb_snapshots = 0 / snapshots_offset = 0
+    // and allocates no new table).
     let remaining = hdr.nb_snapshots - 1;
     let mut alloc_cursor = AllocCursor::default();
     let mut new_table_len: usize = 0;
@@ -1719,7 +1727,7 @@ fn count_allocated_l1_entries(l1_bytes: &[u8]) -> usize {
 /// name — the opposite asymmetry from delete's name-only
 /// matcher). Apply rewrites the **active L1
 /// in place**; it never touches the snapshot table or the
-/// header. Write-group ordering (phase plan, Situation):
+/// header. Write-group ordering:
 ///
 ///   precheck: SwapForApply, read-only, both directions, before
 ///     ANY write
@@ -1739,7 +1747,8 @@ fn count_allocated_l1_entries(l1_bytes: &[u8]) -> usize {
 ///      refreshed L1 to BOTH locations — hdr.l1_table_offset at
 ///      the padded length and sn.l1_table_offset at
 ///      sn.l1_size * 8 (replicating the snapshot-stored-L1 flag
-///      write qemu's +1 walk performs, fact 6) — + the dirty
+///      write qemu's +1 walk performs: qemu writes a walked L1
+///      back whenever the addend is >= 0) — + the dirty
 ///      snapshot-set L2s + the SURVIVING old-active L2s (final
 ///      refcount > 0; e.g. shared with another snapshot). Freed
 ///      old-active L2s are NEVER written.
@@ -1749,17 +1758,20 @@ fn count_allocated_l1_entries(l1_bytes: &[u8]) -> usize {
 /// every cluster reachable from the new active chain has
 /// refcount >= 2 (the snapshot still references everything the
 /// new active L1 does), so every COPIED flag ends clear in both
-/// qemu's mid-state write and the final state — identical bytes
-/// (phase plan, "The key flag invariant").
+/// qemu's mid-state write and the final state — identical bytes.
 ///
 /// Geometry refusals (`ERROR_L1_SIZE_MISMATCH`): a stored
 /// `disk_size` differing from the current virtual size (qemu
-/// TRUNCATES the image here — fact 3; instar refuses, open
-/// question 1; an absent disk_size — the finder's 0 sentinel —
-/// matches, mirroring `qcow2_read_snapshots`' default of the
-/// current virtual size), and `sn.l1_size > hdr.l1_size` (qemu
-/// grows the active L1; instar refuses, fact 4). A smaller
-/// snapshot L1 takes the zero-pad path, like qemu.
+/// TRUNCATES the image to the snapshot's disk_size here; instar
+/// refuses, because truncating would mean reimplementing resize
+/// inside apply for a case only a qemu-resized image can reach —
+/// the workaround is `qemu-img resize` back to the snapshot's
+/// size; an absent disk_size — the finder's 0 sentinel — matches,
+/// mirroring `qcow2_read_snapshots`' default of the current
+/// virtual size), and `sn.l1_size > hdr.l1_size` (qemu grows the
+/// active L1; instar refuses, and given the disk_size refusal
+/// only a hand-crafted image can reach it). A smaller snapshot
+/// L1 takes the zero-pad path, like qemu.
 ///
 /// # Safety
 ///
@@ -1843,8 +1855,8 @@ unsafe fn run_apply(
     // ----- Step 3: geometry checks ----------------------------------------
     // disk_size: 0 is the finder's "absent extra data" sentinel —
     // qemu's reader defaults an absent disk_size to the CURRENT
-    // virtual size, so the check passes (open question 5); a
-    // genuinely-zero disk_size on a 0-byte image also matches.
+    // virtual size, so the check passes; a genuinely-zero disk_size
+    // on a 0-byte image also matches.
     if found.disk_size_or_zero != 0 && found.disk_size_or_zero != hdr.virtual_size {
         (call_table.verbose_print)(b"snapshot: disk_size mismatch refused\n\0".as_ptr());
         fail!(SnapshotResult::ERROR_L1_SIZE_MISMATCH);
@@ -1996,7 +2008,10 @@ unsafe fn run_apply(
 
     // ----- Step 6: in-memory +1 walk over the snapshot's chain ------------
     // (IncrementForCreate is the inc walk; the create-flavoured
-    // name is cosmetic — open question 3.)
+    // name is cosmetic. The inc and dec walks run separately
+    // rather than as one SwapForApply pass because group A must
+    // carry only the increments and the decrements must follow
+    // the group B commit point; SwapForApply serves the precheck.)
     {
         let snap_l1 = core::slice::from_raw_parts(snap_l1_ptr as *const u8, snap_l1_bytes);
         match update_snapshot_refcount(
@@ -2141,7 +2156,8 @@ unsafe fn run_apply(
         }
         // The snapshot's stored L1: its own sn.l1_size * 8 length
         // (the write that replicates qemu's +1-walk flag scrub of
-        // the stored L1 — fact 6).
+        // the stored L1: qemu writes a walked L1 back whenever the
+        // addend is >= 0).
         if snap_l1_bytes > 0
             && !write_input_byte_range(
                 call_table,

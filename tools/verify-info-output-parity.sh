@@ -2,30 +2,24 @@
 # Prove that a change under review does not alter `instar info` output.
 #
 # Written for the change that taught crates/vhd and crates/vhdx to parse a
-# differencing image's parent locators
-# (docs/plans/PLAN-differencing-phase-03-parse.md). That change's whole
-# premise was that parsing changes nothing about what any operation *does*
-# with what it now knows: populating info's backing_file field for a
-# VHD/VHDX would silently turn on host-side chain walking in
-# discover_backing_chain, which was deliberately left to a separate change.
-# Later changes that touch the same two crates without meaning to change
-# info output can reuse this script as a gate; that is why it lives in
-# tools/ rather than being run by hand once.
+# differencing image's parent locators (docs/plans/PLAN-differencing.md).
+# That change's premise was that parsing alone changes nothing about what
+# any operation *does* with what it now knows. Any later change that
+# touches those two crates without meaning to change info output can use
+# this script as a gate; that is why it lives in tools/ rather than being
+# run by hand once.
 #
-# Caveat: host-side chain discovery has since landed, and `instar info` now
-# reports a backing file for a VHD/VHDX differencing child (see
-# tests/test_differencing.py). Check 4 below still asserts the parse-only
-# invariant that no vpc/vhdx image carries a backing-file line, so on the
-# current tree it flags the diff-child fixtures; byte-identity against the
-# base (check 3) is the part of this script that still applies as-is.
+# Host-side chain discovery has since landed, so `instar info` now reports
+# a backing file for a VHD/VHDX differencing child (see
+# tests/test_differencing.py). The comparison against the base binary
+# still holds as-is: it is relative, so a change that alters which images
+# report a backing file shows up as a stdout difference.
 #
 # Base commit selection: this script never hardcodes a base SHA. It computes
 # `git merge-base origin/develop HEAD` in the current worktree, i.e. the
 # commit where the current branch diverged from develop. develop moves out
-# from under long-lived phase branches (it did during this phase: the
-# branch was cut at b0c8d32, origin/develop had moved to e7af6a1a+ by the
-# time this script was written), so the merge-base is the only stable
-# definition of "before this phase's changes". Run `git fetch origin` before
+# from under long-lived branches, so the merge-base is the only stable
+# definition of "before this branch's changes". Run `git fetch origin` before
 # this script if origin/develop might be stale locally — the script does
 # not fetch on your behalf, so a stale remote-tracking ref silently picks
 # the wrong base.
@@ -42,23 +36,16 @@
 #      verbose formatter but never the info text or JSON, so a verbose
 #      comparison would show a spurious difference that is not a behaviour
 #      change — under both binaries and requires byte-identical stdout.
-#   4. Additionally greps every vpc/vhdx image's CURRENT-binary output for a
-#      "backing file" / "backing-filename" line. Byte-identity with the base
-#      binary already forbids a *new* one appearing, but this is the
-#      falsifiable form of the parse-only invariant stated directly: no VHD
-#      or VHDX image may carry that line at all, regardless of what the base
-#      binary did.
 #      Both stdout and stderr are compared, along with the exit status.
-#   5. Images absent from the local testdata checkout are skipped and
+#   4. Images absent from the local testdata checkout are skipped and
 #      counted, never treated as failures -- except for the handful in
-#      REQUIRED_IDS, which are the only images in the manifest carrying a
-#      parent locator. Skipping those, or comparing nothing at all, is
+#      REQUIRED_IDS, the differencing fixtures (images with a parent
+#      locator) that existed when the parsers were written. Skipping those, or comparing nothing at all, is
 #      reported as an error rather than a pass: a gate that compared no
 #      image that could have changed proves nothing.
 #
-# Exit status: 0 if every compared image matched (and no vpc/vhdx image
-# gained a backing-file line); non-zero otherwise, so this can be used as a
-# CI/review gate. A build failure in either tree, and a run that compared
+# Exit status: 0 if every compared image matched; non-zero otherwise, so
+# this can be used as a CI/review gate. A build failure in either tree, and a run that compared
 # nothing, both exit 2 rather than falling through to a pass.
 #
 # Requires: docker (for `make instar`), git, jq, diff. Does not require
@@ -177,8 +164,8 @@ REQUIRED_IDS=(
 # loop over a possibly-empty array.
 FOUND_REQUIRED=" "
 
-# id, path, format as tab-separated records.
-while IFS=$'\t' read -r img_id img_path img_format; do
+# id, path as tab-separated records.
+while IFS=$'\t' read -r img_id img_path; do
     full_path="$TESTDATA_ROOT/$img_path"
 
     if [ ! -f "$full_path" ]; then
@@ -223,9 +210,9 @@ while IFS=$'\t' read -r img_id img_path img_format; do
             entry_failed=1
         fi
 
-        # stderr as well as stdout. Nothing in the phase this script was
+        # stderr as well as stdout. Nothing in the change this script was
         # written for can plausibly write to stderr, but the script is
-        # meant to be reused by later phases that can, and a new
+        # meant to be reused by later changes that can, and a new
         # diagnostic line is exactly the kind of change that would
         # otherwise slip through a stdout-only gate.
         if ! cmp -s "$cur_out.stderr" "$base_out.stderr"; then
@@ -234,25 +221,13 @@ while IFS=$'\t' read -r img_id img_path img_format; do
             entry_failed=1
         fi
 
-        # Parsing a parent locator must not populate backing_file: no vpc
-        # (VHD) or vhdx image may carry a backing-file line, independent of
-        # what the base binary did. (See the caveat in the header: chain
-        # discovery now reports one for differencing children.)
-        case "$img_format" in
-            vpc|vhdx)
-                if grep -qi 'backing file\|backing-filename' "$cur_out"; then
-                    echo "FAIL: $img_id ($mode): current binary emitted a backing-file line for a $img_format image"
-                    entry_failed=1
-                fi
-                ;;
-        esac
     done
 
     if [ "$entry_failed" -ne 0 ]; then
         FAILED=$((FAILED + 1))
         FAILED_IDS+=("$img_id")
     fi
-done < <(jq -r '.images[] | [.id, .path, .format] | @tsv' "$MANIFEST")
+done < <(jq -r '.images[] | [.id, .path] | @tsv' "$MANIFEST")
 
 echo ""
 echo "=== Summary ==="

@@ -4,7 +4,7 @@
 #
 # Every input here is a shape the `claude` CLI was measured producing
 # at 2.1.238, not one that seemed plausible. The two that matter most
-# are the ones the phase plan was originally written without: turn
+# are the ones the helper was originally written without: turn
 # exhaustion, which is the dominant outcome for a run with
 # `--max-turns 30` and which carries no `.result` key at all, and a
 # stream truncated mid-line by a killed process. Both used to produce
@@ -158,7 +158,7 @@ check "both blocks are there" \
     "$(printf '%s\n' "${OUT}" | grep -c COMMIT_SUMMARY_START)" "2"
 contains "and the failure is still diagnosed" "${OUT}" "terminal_reason: max_turns"
 
-# The case the plan got wrong. .result is ABSENT, not empty, so a
+# The case that is easy to get wrong. .result is ABSENT, not empty, so a
 # helper that read .result would report nothing at all here -- and this
 # is what an automation with --max-turns 30 hits most often.
 start "a turn-exhausted stream keeps the text AND names max_turns"

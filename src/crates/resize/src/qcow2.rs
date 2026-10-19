@@ -1360,8 +1360,12 @@ fn plan_shrink<'a>(
     let cluster_size_us = opts.cluster_size as usize;
     let cluster_bits = cluster_bits_from(opts.cluster_size)?;
 
-    // Round down to cluster boundary per the phase plan's
-    // open question 1.
+    // Round down to a cluster boundary so the walk below only ever
+    // discards whole clusters. The rounded size is what lands in the
+    // header (pinned by `shrink_rounds_down_to_cluster_boundary`).
+    // This was meant to match qemu, but qemu-img 10.0.13 keeps the
+    // exact requested size instead (10M shrunk to 5M + 4096 reports
+    // 5246976, not a 64 KiB multiple); see #791.
     let new_virtual_size = (opts.new_virtual_size / cluster_size) * cluster_size;
     if new_virtual_size < cluster_size {
         // Minimum one cluster of virtual size; smaller asks

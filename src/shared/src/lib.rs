@@ -4418,8 +4418,9 @@ pub struct BenchConfig {
     /// Number of requests (1..=0x7fffffff, validated host-side).
     pub count: u32,
     /// Requested queue depth. Echoed in the header line and JSON
-    /// only; the guest ignores it — v1 execution is serial
-    /// (master plan Open question 1).
+    /// only; the guest ignores it — execution is serial, because
+    /// the guest virtio driver has one request slot and the host
+    /// services descriptors in order (see `docs/bench.md`).
     pub depth: u32,
 
     /// Bytes per request (1..=BENCH_MAX_BUFSIZE).
@@ -5319,13 +5320,13 @@ mod tests {
 
     #[test]
     fn call_table_carries_resize_function_pointers() {
-        // Forward-compat tripwire: phase 7a appended
+        // Forward-compat tripwire: the resize op appended
         // `read_output_sector` and `send_resize_result` at the
         // end of CallTable. The size budget asserts no field
         // sneaks in past them. Update the budget deliberately
         // when adding new fields and document the change.
         let expected_fn_ptr = core::mem::size_of::<usize>();
-        let min_fn_ptrs_in_table = 25; // grew from 23 in phase 7a
+        let min_fn_ptrs_in_table = 25; // grew from 23 for resize
         let min_size = core::mem::size_of::<u32>() * 2 // magic + version
             + expected_fn_ptr * min_fn_ptrs_in_table;
         assert!(
@@ -5356,7 +5357,7 @@ mod tests {
 
     #[test]
     fn resize_config_size_budget() {
-        // Forward-compat tripwire: if a future phase grows this
+        // Forward-compat tripwire: if a future change grows this
         // past 256 bytes that's a deliberate ABI change and the
         // assertion should fail on purpose so it's reviewed.
         assert!(
@@ -5459,7 +5460,7 @@ mod tests {
     fn rebase_config_size_budget() {
         // RebaseConfig embeds a 1024-byte backing path; the rest
         // of the struct should stay under ~150 bytes so the total
-        // fits comfortably below 1.2 KiB. If a future phase grows
+        // fits comfortably below 1.2 KiB. If a future change grows
         // it past 1200, that's a deliberate ABI change and the
         // assertion should fail on purpose so it's reviewed.
         assert!(
@@ -6492,11 +6493,10 @@ mod tests {
         // The host writes this struct field-by-field at fixed
         // offsets in the VMM (`run_snapshot_create` /
         // `run_snapshot_list`), so every offset and the total size
-        // is load-bearing. PLAN-snapshot phase 6a carved
-        // `date_sec` / `date_nsec` from the front of the old
-        // `_reserved: [u8; 32]` without moving any pre-existing
-        // field: total size, `arg` offset, and all earlier offsets
-        // are unchanged.
+        // is load-bearing. `date_sec` / `date_nsec` were carved
+        // from the front of the old `_reserved: [u8; 32]` without
+        // moving any pre-existing field: total size, `arg` offset,
+        // and all earlier offsets are unchanged.
         use core::mem::offset_of;
         assert_eq!(core::mem::size_of::<SnapshotConfig>(), 312);
         assert_eq!(offset_of!(SnapshotConfig, magic), 0);

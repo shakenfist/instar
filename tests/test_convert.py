@@ -2327,7 +2327,7 @@ class TestConvertVmdkFlatRejection(InstarTestBase):
 
 
 class TestConvertVmdkFlatChain(InstarTestBase):
-    """Phase 23b: monolithicFlat in backing chains.
+    """monolithicFlat in backing chains.
 
     The child descriptor has parentFileNameHint pointing at a
     parent monolithicFlat. Chain discovery follows the hint,
@@ -2389,7 +2389,7 @@ class TestConvertVmdkFlatChain(InstarTestBase):
 
 
 class TestConvertVmdkMultiExtent(InstarTestBase):
-    """Phase 23a: twoGbMaxExtentFlat multi-extent input."""
+    """twoGbMaxExtentFlat multi-extent input."""
 
     def test_convert_multi_extent_flat_to_raw(self):
         """Convert 3-extent flat VMDK to raw and verify content."""
@@ -2455,7 +2455,7 @@ class TestConvertVmdkMultiExtent(InstarTestBase):
 
 
 class TestConvertVmdkFlatOutput(InstarTestBase):
-    """Phase 23c: monolithicFlat VMDK output."""
+    """monolithicFlat VMDK output."""
 
     def test_convert_raw_to_vmdk_flat(self):
         """Convert raw input to monolithicFlat VMDK output."""
@@ -5883,11 +5883,11 @@ class TestConvertExtendedL2Output(InstarTestBase):
 class TestExtendedL2SparseOutput(InstarTestBase):
     """Test instar's sparse subcluster bitmap output.
 
-    Phase 24b: when instar writes extended-L2 QCOW2, the
-    subcluster bitmap should mark zero 2 KiB ranges as zero
-    (not all-allocated). These tests convert with instar,
-    then validate that qemu-img accepts the bitmap encoding
-    and the logical content round-trips correctly.
+    When instar writes extended-L2 QCOW2, the subcluster
+    bitmap should mark zero 2 KiB ranges as zero (not
+    all-allocated). These tests convert with instar, then
+    validate that qemu-img accepts the bitmap encoding and
+    the logical content round-trips correctly.
     """
 
     def test_sparse_bitmap_roundtrip(self):
@@ -6022,8 +6022,8 @@ class TestExtendedL2SparseOutput(InstarTestBase):
 class TestExtendedL2NarrowIO(InstarTestBase):
     """Test the narrow I/O read path for extended-L2 subclusters.
 
-    Phase 24c: when sector_size <= subcluster_size, the read
-    path issues per-run reads instead of reading the full
+    When sector_size <= subcluster_size, the read path
+    issues per-run reads instead of reading the full
     cluster. The default sector size is 64KB which is larger
     than the 2KB subcluster size for 64KB clusters, so the
     narrow path is only exercised with an explicit small
@@ -6490,7 +6490,7 @@ class TestConvertDmgToRaw(InstarTestBase):
             )
 
     # ------------------------------------------------------------------
-    # Phase-5e fixture matrix: byte parity for the three safe read-path
+    # Fixture matrix: byte parity for the three safe read-path
     # fixtures beyond dmg-simple (mixed chunk types, multipart mish
     # composition, the old resource-fork table path).
     # ------------------------------------------------------------------
@@ -6758,15 +6758,15 @@ class TestConvertDmgToRaw(InstarTestBase):
     def test_convert_qcow2_over_dmg_backing_chain(self):
         """Convert a qcow2 overlay backed by a DMG image; match qemu-img.
 
-        Empirically verified (phase-5e) that qemu accepts ``qemu-img create
+        Empirically verified that qemu accepts ``qemu-img create
         -b <dmg> -F dmg`` for a qcow2 overlay and reads the composed chain.
         Builds ``overlay.qcow2`` over a copied dmg-simple in the test
         tmpdir (instar only reads backing files inside the overlay's
         directory), writes a 64 KiB overlay pattern over part of the
         backing, then asserts instar and qemu-img produce identical raw
-        output.  This exercises the mid-chain DMG position the 5b reader arm
-        was designed for.  Skipped only if the tested qemu refuses -F dmg
-        (it does not on this host).
+        output.  This exercises the DMG reader arm in a mid-chain (backing)
+        position rather than as the head.  Skipped only if the tested qemu
+        refuses -F dmg (it does not on this host).
         """
         image = self.get_image('dmg-simple')
         if not image.path.exists():
@@ -6872,9 +6872,9 @@ class TestConvertDetectOnlyRefusal(InstarTestBase):
         self._assert_refused('cloop-simple', 'cloop')
 
     # NOTE: dmg is not refused here.  DMG (Apple UDIF) is a real read
-    # format: the chain discovery variant maps "dmg" to a reader arm, so convert reads
-    # it byte-for-byte instead of gating it.  The convert byte-parity
-    # smoke lives in TestConvertDmgToRaw below.
+    # format: the chain discovery variant maps "dmg" to a reader arm, so
+    # convert reads it byte-for-byte instead of gating it.  The convert
+    # byte-parity smoke lives in TestConvertDmgToRaw below.
 
     def test_convert_refuses_midchain_qed(self):
         """convert refuses when a qcow2 overlay's backing file is qed.
@@ -6914,7 +6914,7 @@ class TestConvertDetectOnlyRefusal(InstarTestBase):
     def test_convert_iso_passthrough(self):
         """convert keeps reading iso as raw (deliberate qemu parity).
 
-        Pins the step-1a behaviour: rc 0, output sector-padded to the
+        Pins the raw pass-through: rc 0, output sector-padded to the
         393216-byte virtual size.
         """
         image = self._refusal_image('iso-simple')

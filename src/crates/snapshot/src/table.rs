@@ -92,9 +92,9 @@ pub struct NewSnapshotEntry<'a> {
     /// the image's virtual size.
     pub disk_size: u64,
     /// qemu record/replay icount (extra-data offset 16). `0` for
-    /// `qemu-img` (it memsets the whole `QEMUSnapshotInfo`, so
-    /// icount is 0, not the `u64::MAX` "absent" sentinel — see
-    /// phase plan fact 4).
+    /// `qemu-img` (`img_snapshot` memsets the whole
+    /// `QEMUSnapshotInfo`, so icount is 0, not the `u64::MAX`
+    /// "absent" sentinel).
     pub icount: u64,
 }
 
@@ -196,8 +196,8 @@ fn entry_bounds_at(table: &[u8], offset: usize) -> Result<(usize, usize), Snapsh
 /// `40 + extra_data_size + id_str_size + name_size`, and the
 /// *next* entry's start is rounded up to the next 8-byte boundary.
 /// The returned length is the end of the last entry **without** a
-/// trailing pad, matching what `qemu-img` writes (phase plan
-/// fact 4).
+/// trailing pad, matching what `qemu-img` writes (it ends the table
+/// immediately after the last entry's name, not rounded to 8).
 ///
 /// Walks raw headers directly so it is independent of the bounded
 /// parser's 63-char id/name truncation. Returns
@@ -663,8 +663,9 @@ mod tests {
 
     #[test]
     fn serialize_icount_is_zero_not_absent_sentinel() {
-        // Phase plan fact 4: qemu-img writes icount = 0, not the
-        // u64::MAX "absent" sentinel the read side uses.
+        // qemu-img writes icount = 0 (it memsets the whole
+        // QEMUSnapshotInfo), not the u64::MAX "absent" sentinel the
+        // read side uses.
         let e = sample_entry(b"1", b"x");
         let mut out = [0u8; 128];
         let n = serialize_snapshot_entry(&e, &mut out).unwrap();
@@ -1229,9 +1230,9 @@ mod tests {
     #[test]
     fn find_absent_extra_data_reports_zero_disk_size() {
         // extra_data_size = 8 (< 16): disk_size is absent; the
-        // finder reports the 0 sentinel (open question 5 — the
-        // caller treats it as matching, mirroring
-        // qcow2_read_snapshots' current-virtual-size default).
+        // finder reports the 0 sentinel (the apply caller treats
+        // it as matching, mirroring qcow2_read_snapshots'
+        // current-virtual-size default).
         let mut raw = [0u8; 512];
         let total = build_find_table(&mut raw, &[(b"1", b"a", 8)]);
         let f = find_snapshot_in_table(&raw, total, 1, b"a", MatchMode::NameOnly)

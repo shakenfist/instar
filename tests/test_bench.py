@@ -80,7 +80,7 @@ KNOWN_BENCH_DIVERGENCES = {
     'depth-serialized': (
         'json',
         "-d is echoed in the header for parity but bench executes "
-        'serially in v1 (master plan OQ1); --output json always '
+        'serially (one request at a time); --output json always '
         'reports "effective-depth": 1 regardless of the requested '
         'depth. No live regression test -- this is a semantic '
         'property verified directly by TestBenchJson.'
@@ -168,10 +168,10 @@ class BenchTestBase(InstarTestBase):
     """Shared helpers for the `instar bench` test families.
 
     Owns the `instar bench` / `qemu-img bench` runners, the
-    `/dev/kvm` skip guard, and the fixture builders (Mission
-    section 3): `make_raw_mbr`, `make_qcow2`, `make_populated_qcow2`,
-    `make_overlay`, `make_compressed_qcow2`, `make_vmdk`, `make_vhd`,
-    `make_vhdx`, plus `sha256` and `header_line`.
+    `/dev/kvm` skip guard, and the fixture builders: `make_raw_mbr`,
+    `make_qcow2`, `make_populated_qcow2`, `make_overlay`,
+    `make_compressed_qcow2`, `make_vmdk`, `make_vhd`, `make_vhdx`,
+    plus `sha256` and `header_line`.
     """
 
     def run_instar_bench(self, *args, timeout=120):
@@ -227,7 +227,7 @@ class BenchTestBase(InstarTestBase):
         return r
 
     # ------------------------------------------------------------------
-    # Fixture builders (Mission section 3).
+    # Fixture builders.
     # ------------------------------------------------------------------
 
     def make_raw_mbr(self, path, size='10M'):
@@ -270,9 +270,8 @@ class BenchTestBase(InstarTestBase):
     def make_populated_qcow2(self, path, size='16M', fill_size='8M'):
         """A qcow2 fixture with `[0, fill_size)` pre-filled with 0xbb.
 
-        Mirrors the 5c capture's "populated qcow2" base image: writes
-        land on already-allocated clusters, exercising the write
-        path's fast overwrite-in-place branch.
+        Writes land on already-allocated clusters, exercising the
+        write path's fast overwrite-in-place branch.
         """
         self.make_qcow2(path, size=size)
         self._qemu_io(path, f'write -P 0xbb 0 {fill_size}')
@@ -285,9 +284,9 @@ class BenchTestBase(InstarTestBase):
         `td` is the directory both files are created in -- instar's
         default `SecurityConfig` restricts backing references to the
         top image's own directory, so the backing file MUST live
-        alongside the overlay (5c capture note). Returns
-        `(backing_path, overlay_path)`. The backing reference is
-        written as the bare relative filename so a copy of the
+        alongside the overlay (instar refuses the chain otherwise).
+        Returns `(backing_path, overlay_path)`. The backing reference
+        is written as the bare relative filename so a copy of the
         overlay into any other directory containing a same-named
         backing file still resolves.
         """
@@ -339,7 +338,7 @@ class BenchTestBase(InstarTestBase):
 
     def make_vmdk(self, path, size='10M'):
         """A monolithicSparse vmdk fixture (single-file, embedded
-        descriptor -- mirrors the 4c/5c capture's `test.vmdk`)."""
+        descriptor)."""
         r = subprocess.run(
             ['qemu-img', 'create', '-f', 'vmdk',
              '-o', 'subformat=monolithicSparse', str(path), size],
@@ -371,7 +370,7 @@ class BenchTestBase(InstarTestBase):
 
 
 class TestBenchHeaderParity(BenchTestBase):
-    """The 4c header-byte-parity rows.
+    """Header-byte parity between instar and qemu-img.
 
     Identical args on identical fixtures, instar vs qemu-img: the
     first stdout line (the header) must be byte-EQUAL between tools,
@@ -597,9 +596,9 @@ class TestBenchValidation(BenchTestBase):
             '2147483647.')
 
     def test_range_bufsize(self):
-        """Includes the suffix-multiply overflow route (Supplement 2):
-        a suffix multiply that overflows u64 takes the range form, not
-        the echo form."""
+        """Includes the suffix-multiply overflow route: a suffix
+        multiply that overflows u64 takes the range form, not the echo
+        form (qemu's cvtnum returns ERANGE for it)."""
         core = ('Invalid buffer size specified. Must be between 1 and '
                 '2147483647.')
         self._assert_failure_and_parity('-s', '3G', core)
@@ -961,8 +960,8 @@ class TestBenchWrite(BenchTestBase):
         a fresh L2 on first touch). Non-wrapping: 19*2097152 + 4096 =
         39,849,984 < 64 MiB. cs=2 MiB has no in-envelope growth path
         (one refblock covers 2 TiB), so this is pure allocation. The
-        oracle is virtual content (allocator placement legitimately
-        differs, B-D1), not byte identity.
+        oracle is virtual content (instar's allocator legitimately
+        places clusters differently from qemu's), not byte identity.
         """
         self._require_kvm()
         with tempfile.TemporaryDirectory() as td:
@@ -1121,10 +1120,10 @@ class TestBenchWrite(BenchTestBase):
 
 
 class TestBenchWriteRefusals(BenchTestBase):
-    """Write-path gate contracts (Mission §3; ~10 tests).
+    """Write-path gate contracts.
 
-    vmdk/vhd/vhdx are refused HOST-SIDE (Mission §3's "-w host-side
-    format gate", `run_bench`, before the header prints or the guest
+    vmdk/vhd/vhdx are refused HOST-SIDE (the `-w` host-side format
+    gate in `run_bench`, before the header prints or the guest
     launches) so those three need no `/dev/kvm` guard; refcount_bits=1,
     compression, LUKS encryption, extended L2, an external data file,
     and the dirty bit are all refused GUEST-SIDE (the qcow2 write
@@ -1936,9 +1935,9 @@ class TestBenchDivergenceRegression(BenchTestBase):
                 i_err)
 
             # -c 3 (not 100) keeps every request in-bounds on the 10 MiB
-            # fixture, per the 4c capture's note on this exact row: with
-            # more requests qemu's OWN `% image_size` wrap bug would EIO
-            # first, masking the divergence this test targets.
+            # fixture: with more requests qemu's OWN `% image_size` wrap
+            # bug would EIO first (observed live with -c 100 -s 3M),
+            # masking the divergence this test targets.
             q_out, q_err, q_rc = self.run_qemu_bench(
                 '-c', '3', '-s', '3M', '-f', 'raw', str(img))
             self.assertEqual(

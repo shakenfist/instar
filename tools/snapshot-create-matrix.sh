@@ -137,12 +137,13 @@ run_fixture() {
 }
 
 # --- (6) Post-snapshot-write corruption probe ----------------------------
-# THE test that catches the L2-table refcount gap (open question 2):
-# create a snapshot with instar, then have qemu write new data
-# through the active L1. Without the L2-table refcount bump, qemu's
-# post-snapshot write would skip the L2 COW and corrupt the
-# snapshot. We assert check stays clean and the snapshot's data is
-# still the pre-write content.
+# THE test that catches a missing L2-table refcount bump (after a
+# create the active L1 and the snapshot's L1 copy share the same
+# physical L2 tables): create a snapshot with instar, then have qemu
+# write new data through the active L1. Without the L2-table
+# refcount bump, qemu's post-snapshot write would skip the L2 COW
+# and corrupt the snapshot. We assert check stays clean and the
+# snapshot's data is still the pre-write content.
 post_write_probe() {
     printf '\n=== Probe (6): post-snapshot-write does not corrupt the snapshot ===\n'
     rm -f "$WORK"/p.qcow2

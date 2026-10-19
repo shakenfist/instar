@@ -109,10 +109,9 @@ pub const DYN_PARENT_NAME_OFFSET: usize = 64;
 /// terminator is valid and complete, and a reader must never scan past the
 /// field looking for one (libvhdi does exactly that, over-reading two bytes
 /// into the locator table and reporting a 257th character). instar's own
-/// *emitter* refuses at 256 code units and accepts at
-/// most 255, so that everything instar writes keeps a terminating NUL
-/// inside the field and reads back correctly through libvhdi
-/// (PLAN-differencing-phase-01-pin.md:716). The two numbers are opposite
+/// *emitter* refuses at 256 code units and accepts at most 255, so that
+/// everything instar writes keeps a terminating NUL inside the field and
+/// reads back correctly through libvhdi. The two numbers are opposite
 /// directions of the same field, not a typo in either.
 pub const DYN_PARENT_NAME_SIZE: usize = 512;
 /// Parent locator table offset: 8 entries of 24 bytes.

@@ -149,13 +149,14 @@ OSLO_SKIP_IMAGES = {
     'qcow1-crypt-invalid',
     'qcow1-backing-name-too-long',
     # Malformed/refused DMG fixtures that reach the DMG reader. safety:
-    # "malformed", run_in_ci: true, so they need an explicit skip. oslo has no DMG inspector
-    # and falls back to RawFileInspector ('raw'), blindly accepting every one;
-    # qemu refuses the two cap fixtures at open, decodes/refuses the codec
-    # fixtures build-dependently, converts the overcap fixture (which instar
-    # refuses on its staging cap), and segfaults on read for dmg-empty-table
-    # (rc 139) even though its info succeeds. Cross-validating oslo's blind raw
-    # acceptance against instar's typed refusals is not meaningful.
+    # "malformed", run_in_ci: true, so they need an explicit skip. oslo has no
+    # DMG inspector and falls back to RawFileInspector ('raw'), blindly
+    # accepting every one; qemu refuses the two cap fixtures at open,
+    # decodes/refuses the codec fixtures build-dependently, converts the
+    # overcap fixture (which instar refuses on its staging cap), and segfaults
+    # on read for dmg-empty-table (rc 139) even though its info succeeds.
+    # Cross-validating oslo's blind raw acceptance against instar's typed
+    # refusals is not meaningful.
     'dmg-chunk-len-over',
     'dmg-sc-over',
     'dmg-codec-bzip2',
@@ -269,12 +270,12 @@ KNOWN_VSIZE_DIVERGENCES = {
     'vmdk-flat-10m': (0, 10 * 1024 * 1024),
     'vmdk-flat-with-parent': (0, 1 * 1024 * 1024),
     # Paired with the KNOWN_FORMAT_DIVERGENCES entries above for formats
-    # oslo has no inspector for. RawFileInspector.virtual_size returns however many
-    # bytes oslo's detection loop consumed before it settled on 'raw',
-    # not necessarily the full file length: for bochs-growing (2560 B),
-    # cloop-simple (1690 B), and dmg-simple (11747 B) that happens to
-    # equal the exact file size (the whole file fits in oslo's first
-    # read chunk); for parallels-v1/v2 (327680 B on disk) oslo stops
+    # oslo has no inspector for. RawFileInspector.virtual_size returns
+    # however many bytes oslo's detection loop consumed before it settled
+    # on 'raw', not necessarily the full file length: for bochs-growing
+    # (2560 B), cloop-simple (1690 B), and dmg-simple (11747 B) that
+    # happens to equal the exact file size (the whole file fits in oslo's
+    # first read chunk); for parallels-v1/v2 (327680 B on disk) oslo stops
     # after consuming only 262144 B. instar reports the real virtual
     # disk size parsed from each format's own header/trailer. Values
     # below were captured from a live run against oslo.utils 10.1.2.dev8
@@ -314,13 +315,14 @@ KNOWN_VSIZE_DIVERGENCES = {
     'bochs-growing': (2560, 1032192),
     'cloop-simple': (1690, 1024 * 1024),
     'dmg-simple': (11747, 4 * 1024 * 1024),
-    # The four further safe DMG fixtures follow the same oslo rule as dmg-simple --
-    # RawFileInspector.virtual_size is min(file_size, 262144); all four fit
-    # entirely in oslo's first read chunk, so oslo returns each whole file
-    # length, while instar reports the koly SectorCount * 512 virtual size.
-    # Because these are also KNOWN_FORMAT_DIVERGENCES entries, TestOsloVirtualSize
-    # skips them before reaching this dict; the pairs are a documented, verified
-    # reference (captured live against oslo.utils 10.1.2.dev8, git master).
+    # The four further safe DMG fixtures follow the same oslo rule as
+    # dmg-simple -- RawFileInspector.virtual_size is min(file_size, 262144);
+    # all four fit entirely in oslo's first read chunk, so oslo returns each
+    # whole file length, while instar reports the koly SectorCount * 512
+    # virtual size. Because these are also KNOWN_FORMAT_DIVERGENCES entries,
+    # TestOsloVirtualSize skips them before reaching this dict; the pairs are a
+    # documented, verified reference (captured live against oslo.utils
+    # 10.1.2.dev8, git master).
     'dmg-mixed': (37029, 2162688),
     'dmg-multipart': (4719, 1048576),
     'dmg-rsrc-fork': (2218, 524288),

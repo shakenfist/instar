@@ -1,7 +1,7 @@
 //! Coverage-guided fuzzing for the `crates/qcow2-write` planner
 //! (`plan_write` / `plan_flush`) driven through the crate's own
 //! Vec-backed simulation harness (`qcow2_write::sim`, lifted out of the
-//! unit tests in phase 8a).
+//! crate's unit tests so this target and they share one executor).
 //!
 //! The input bytes are hand-decoded into:
 //!

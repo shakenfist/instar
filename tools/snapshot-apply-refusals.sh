@@ -35,7 +35,7 @@ refuse() {
 }
 
 # Not-found: the argument matches neither any ID nor any name
-# (apply is ID-then-name, fact 2 — so a *pure ID* arg like "1"
+# (apply matches ID first, then name — so a *pure ID* arg like "1"
 # WOULD match; "nosuch" matches nothing on either pass).
 qemu-img create -f qcow2 "$WORK/nf.qcow2" 64M >/dev/null 2>&1
 qemu-io -c "write 0 64k" "$WORK/nf.qcow2" >/dev/null 2>&1

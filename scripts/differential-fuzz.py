@@ -127,16 +127,15 @@ def write_mbr_header(path):
 #
 # Unlike the fixture generator, every image built here is GAP-FREE (koly
 # SectorCount always equals the exact mish coverage): a gap image fails
-# convert on BOTH sides (EIO parity, per the dmg-gap fixture) and would
-# only pollute the differential content-comparison signal, not exercise
-# it. Only zero / raw / zlib chunks are used (the chunk types instar's dmg
-# reader decodes; ADC/bzip2/lzfse/zstd are typed refusals), and every chunk
-# stays within instar's own
-# bounded-memory staging cap (DMG_MAX_STAGED_SECTOR_COUNT = 4096 sectors,
-# comp_len well under COMPRESSED_BUF_SIZE) so the fuzzer explores real
-# convertible images -- the capacity-divergence corner is already pinned
-# by the dmg-overcap-chunk fixture in the integration matrix, not
-# fuzzed here.
+# convert on BOTH sides (EIO parity, per the dmg-gap fixture) and would only
+# pollute the differential content-comparison signal, not exercise it. Only
+# zero / raw / zlib chunks are used (the chunk types instar's dmg reader
+# decodes; ADC/bzip2/lzfse/zstd are typed refusals), and every chunk stays
+# within instar's own bounded-memory staging cap
+# (DMG_MAX_STAGED_SECTOR_COUNT = 4096 sectors, comp_len well under
+# COMPRESSED_BUF_SIZE) so the fuzzer explores real convertible images -- the
+# capacity-divergence corner is already pinned by the dmg-overcap-chunk
+# fixture in the integration matrix, not fuzzed here.
 # ---------------------------------------------------------------------------
 
 DMG_SECTOR_SIZE = 512
@@ -1099,12 +1098,12 @@ def op_convert(instar_bin, instar_copy, qemu_copy, fmt,
 # dd: random bs/count/skip/-O parity vs qemu-img dd
 # ---------------------------------------------------------------------------
 #
-# This is the broadest parity guard for `dd`: it explores the operand
-# space the fixed integration matrix (tests/test_dd.py) cannot, especially
-# non-512 `bs`, unaligned windows, and skip/count interactions. instar
-# matches qemu for all of these (verified against qemu-img dd when dd was
-# built); the fuzzer's job is to keep that true. Any REAL divergence is a bug to fix, NOT to
-# whitelist.
+# This is the broadest parity guard for `dd`: it explores the operand space
+# the fixed integration matrix (tests/test_dd.py) cannot, especially non-512
+# `bs`, unaligned windows, and skip/count interactions. instar matches qemu
+# for all of these (verified against qemu-img dd when dd was built); the
+# fuzzer's job is to keep that true. Any REAL divergence is a bug to fix,
+# NOT to whitelist.
 
 # bs values: a deliberate mix of 512-multiples (exercise the fast
 # sector-aligned path), non-512 values (exercise 512-rounding + CHS +
@@ -1390,7 +1389,7 @@ def op_measure(instar_bin, instar_copy, qemu_copy, fmt,
 
         # `bitmaps` field comparison: both sides should agree on
         # presence (instar emits "bitmaps": 0 only for qcow2 v3
-        # sources targeting qcow2; phase 7c verified parity).
+        # sources targeting qcow2, matching qemu-img measure).
         # required / fully-allocated must match exactly.
         for key in ('required', 'fully-allocated'):
             if i_json.get(key) != q_json.get(key):
@@ -1480,7 +1479,7 @@ def op_measure(instar_bin, instar_copy, qemu_copy, fmt,
     # `required` is an *upper bound* on what convert produces for an
     # image with the given source-side AllocationSummary — not a
     # lower bound. instar's parser scanners can over-report
-    # allocated_bytes (known phase 7c scanner divergences: raw lacks
+    # allocated_bytes (known scanner divergences: raw lacks
     # SEEK_HOLE detection, vhdx scanner treats every block as fully
     # allocated, etc.), which inflates `required`. convert's
     # zero-skipping then produces a smaller-than-`required` output
@@ -1574,7 +1573,7 @@ def _normalise_create_info(obj, target, tmp_path):
 
 def _create_option_picker(rng):
     """Pick a (target, size_str, options_list) triple biased to avoid
-    instar/qemu writer divergences documented in phase 8b's
+    instar/qemu writer divergences documented in
     KNOWN_WRITER_DIVERGENCES.
 
     All qcow2 refcount_bits widths are now exercised — build_header
@@ -2252,11 +2251,11 @@ def op_amend(instar_bin, instar_copy, qemu_copy, fmt, timeout, rng):
 #                           granularity, including the cluster-size-
 #                           derived default).
 #
-# The generated operation space (add [+granularity], add+disable,
-# remove, clear, enable, disable, single-source same-file equal-
-# granularity merge with an existing enabled destination) is exactly the
-# space the fixed BITMAP_CASES matrix in tests/test_bitmap.py proved
-# parity-equivalent against qemu-img 10.0.8, so any divergence op_bitmap surfaces is a real
+# The generated operation space (add [+granularity], add+disable, remove,
+# clear, enable, disable, single-source same-file equal-granularity merge
+# with an existing enabled destination) is exactly the space the fixed
+# BITMAP_CASES matrix in tests/test_bitmap.py proved parity-equivalent
+# against qemu-img 10.0.8, so any divergence op_bitmap surfaces is a real
 # bug, not a steer-around.
 KNOWN_BITMAP_DIFFERENTIAL_DIVERGENCES = {
     'cross_file_merge', 'merge_mixed', 'refcount_bits', 'compat_v2',
@@ -2286,7 +2285,8 @@ def _bitmap_option_picker(rng):
         name (op_bitmap splits the trailing token off as the name). Each
         invocation carries exactly ONE logical action.
 
-    Parity constraints (so instar and qemu AGREE -- Open question 3):
+    Parity constraints (so instar and qemu AGREE, and any divergence
+    is a real bug):
       * Never emits ``-b``/``-F`` (instar is same-file merge only).
       * Never mixes ``--merge`` with another action in one invocation
         (instar requires merge to be the sole action).
@@ -3138,7 +3138,7 @@ def _build_bench_image(path, recipe, timeout):
 
 def op_bench(instar_bin, instar_copy, qemu_copy, fmt, timeout, rng):
     """Differential ``bench`` over the deterministic CLI surface (never
-    durations — PLAN-bench OQ13).
+    durations, which differ run to run and so are never compared).
 
     Self-built images like op_bitmap: instar_copy / qemu_copy / fmt are part
     of the standard op_* signature but unused. bench launches a guest VMM
@@ -3967,13 +3967,13 @@ def _run_qemu_io(args, timeout=30, cwd=None):
 # op_snapshot: instar snapshot -c/-d/-a chains vs qemu-img
 # ---------------------------------------------------------------------------
 
-# Fixed NONZERO date written into every live snapshot-table entry's
-# date_sec / date_nsec after each successful create, on BOTH sides,
-# because the two tools stamp different creation times. Nonzero matters: with date_sec == 0,
-# `instar snapshot -l` prints a blank DATE column while
-# `qemu-img snapshot -l` renders the epoch in local time (degenerate
-# input; see docs/quirks.md). With 0x60000000 both tools print
-# '2021-01-14 19:25:36' (host-local) and -l output is byte-identical.
+# Fixed NONZERO date written into every live snapshot-table entry's date_sec
+# / date_nsec after each successful create, on BOTH sides, because the two
+# tools stamp different creation times. Nonzero matters: with date_sec == 0,
+# `instar snapshot -l` prints a blank DATE column while `qemu-img snapshot
+# -l` renders the epoch in local time (degenerate input; see
+# docs/quirks.md). With 0x60000000 both tools print '2021-01-14 19:25:36'
+# (host-local) and -l output is byte-identical.
 SNAPSHOT_NORM_DATE_SEC = 0x60000000
 SNAPSHOT_NORM_DATE_NSEC = 0
 

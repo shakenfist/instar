@@ -1,11 +1,10 @@
 #!/bin/bash
 # Capture the exact `qemu-img --version` string every matrix-CI distro
 # ships in its stock package. This is the empirical input to qemu
-# output-profile selection
-# (docs/plans/PLAN-distro-matrix-ci-phase-02-qemu-profiles.md):
-# instar's output profile is chosen from the detected qemu-img
-# major.minor.patch, so we must know each distro's real version string
-# (including distro suffixes and the epoch form) rather than assume it.
+# output-profile selection (docs/output-formats.md): instar's output
+# profile is chosen from the detected qemu-img major.minor.patch, so we
+# must know each distro's real version string (including distro
+# suffixes and the epoch form) rather than assume it.
 #
 # Usage: tools/probe-qemu-versions.sh
 #

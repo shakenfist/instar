@@ -160,12 +160,12 @@ def _safe_tier_images():
 #     candidate divergence (compressed-cluster reporting) but the
 #     fixture happens not to exercise compressed clusters in
 #     practice — TestMapDivergenceRegression's assertNotEqual
-#     surfaced this during 6d and the entry was removed (see the
-#     comment on the removed entry below).
+#     surfaced this and the entry was removed (see the comment on
+#     the removed entry below).
 #   * Raw sparseness: instar emits one fully-allocated Data extent;
 #     qemu-img walks SEEK_HOLE.
 #   * Image-specific divergences surfaced empirically: this list
-#     grows during 6b development as the per-image factory runs and
+#     grows as the per-image factory runs against new fixtures and
 #     reveals additional skip candidates.
 KNOWN_MAP_DIVERGENCES = {
     # ---------- Chain sources ----------
@@ -201,7 +201,7 @@ KNOWN_MAP_DIVERGENCES = {
     # cluster reporting deferred), but the actual fixture happens
     # to be 1 MiB of zeros with no compressed clusters actually
     # exercised — instar matches qemu-img byte-for-byte. Removed
-    # by the TestMapDivergenceRegression assertion during 6d.
+    # when the TestMapDivergenceRegression assertion flagged it.
     'cirros-qcow2':
         ('json', 'compressed-cluster reporting deferred; '
                  'cirros-0.6.3 uses compressed-cluster L2 entries'),
@@ -252,16 +252,16 @@ KNOWN_MAP_DIVERGENCES = {
                  'qemu-img emits one whole-image extent'),
     # Note: vhd-d2v-zerofilled was a candidate divergence (VHD
     # present:false vs true) but the actual fixture has allocated
-    # data and instar matches byte-for-byte. Removed by the
-    # TestMapDivergenceRegression assertion during 6d.
+    # data and instar matches byte-for-byte. Removed when the
+    # TestMapDivergenceRegression assertion flagged it.
 
     # ---------- VHDX divergences ----------
     # instar's vhdx walker exposes the BAT entries individually
     # (per-block data vs zero); qemu-img reports the file as one
-    # data extent. This is the inverse of what the phase 4c
-    # quirks doc anticipated (which talked about
-    # PAYLOAD_BLOCK_PARTIALLY_PRESENT) — turns out for these
-    # fixtures qemu-img doesn't drill into the BAT at all.
+    # data extent. This is the inverse of the
+    # PAYLOAD_BLOCK_PARTIALLY_PRESENT divergence docs/quirks.md
+    # describes — for these fixtures qemu-img doesn't drill into
+    # the BAT at all.
     'qemu-vhdx':
         ('json', 'instar vhdx walker exposes BAT-level detail; '
                  'qemu-img emits one whole-image extent'),
@@ -401,17 +401,18 @@ class TestMapWindowFilter(TestMapSmoke):
 
     These tests construct a small fragmented qcow2 fixture in a
     `tempfile.mkdtemp()` directory (cleaned up in `setUp`/
-    `addCleanup`) via the recipe from phase 4a: `truncate` a
-    1 MiB raw image, write 64 KiB of data at offset 0 and at
-    offset 0x80000, then `qemu-img convert -f raw -O qcow2` to
+    `addCleanup`) by this recipe: `truncate` a 1 MiB raw
+    image, write 64 KiB of data at offset 0 and at offset
+    0x80000, then `qemu-img convert -f raw -O qcow2` to
     produce a qcow2 with two allocated extents separated by a
     hole.
 
     Tests assert *structural* properties (extent count, byte
     ranges, presence/absence of specific offsets) rather than
-    byte-equality against qemu-img — the phase 4a `MapRenderer`
-    unit tests already pin the byte-level shape, and adding
-    qemu-img comparison here would duplicate that coverage.
+    byte-equality against qemu-img — the `MapRenderer` unit
+    tests in `src/vmm` already pin the byte-level shape, and
+    adding qemu-img comparison here would duplicate that
+    coverage.
     """
 
     @classmethod

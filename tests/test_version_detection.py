@@ -263,7 +263,7 @@ class TestVersionMatchSelection(testtools.TestCase):
 class TestProfileSelectionMatrix(InstarTestBase):
     """Guard get_profile_for_installed_qemu against the real testdata
     version map for every distro qemu version in the CI matrix
-    (docs/plans/PLAN-distro-matrix-ci-phase-02-qemu-profiles.md 2a)."""
+    (docs/plans/PLAN-distro-matrix-ci-phase-02-qemu-profiles.md)."""
 
     # (version string, expected info profile) per matrix distro.
     MATRIX = [

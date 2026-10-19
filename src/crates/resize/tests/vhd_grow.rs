@@ -215,8 +215,9 @@ fn dynamic_grow_with_no_blocks_allocated() {
     // Relocate path even with zero allocated blocks. The
     // resulting image is still parseable and reports the new
     // geometry. (In-place coverage requires forging an image
-    // with explicit BAT padding — see open question 4 in the
-    // phase plan.)
+    // with explicit BAT padding: `decide_dynamic_action` goes
+    // in-place only when the new BAT ends at or before the first
+    // allocated block, or the tail footer if there is none.)
     let bytes = build_starting_vhd(1u64 << 30, create::VhdSubformat::Dynamic, 2 * 1024 * 1024);
     let opts = opts_from_image(&bytes, VhdSubformat::Dynamic, 2u64 << 30, false);
     let mut scratch = vec![0u8; VHD_SCRATCH];

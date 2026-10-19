@@ -51,7 +51,7 @@
 //!   parser contract: id is copied to at most 63 bytes and the
 //!   remainder of the 64-byte buffer is zero (null-terminated);
 //!   name is copied to at most 255 bytes with the same rule for
-//!   its 256-byte buffer. NOTE: the phase plan's literal
+//!   its 256-byte buffer. NOTE: the tempting assertion
 //!   `id_len as usize <= entry.id.len()` does NOT hold —
 //!   `SnapshotEntry::id_len` stores the raw on-disk u16
 //!   (`raw.id_str_size`, up to 65535) while only
@@ -84,7 +84,8 @@ const CTRL: usize = 512;
 const MIN_LEN: usize = CTRL + 32;
 
 /// Clamp for both `for_each_snapshot_entry` iteration counts and
-/// the pure-reader nb (open question 4 in the phase plan).
+/// the pure-reader nb, bounding the per-exec cost so the target
+/// keeps a useful exec rate.
 const MAX_NB: u32 = 4096;
 
 /// Per-entry semantic checks for the streaming parser's output.

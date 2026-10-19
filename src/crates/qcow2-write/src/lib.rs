@@ -366,12 +366,19 @@ pub enum StepKind {
 ///
 /// Fixed-size `#[repr(C)]` struct, const-asserted at ≤
 /// [`STEP_SIZE_LIMIT`] bytes so a 64 KiB buffer holds 1300+
-/// steps (≈ 100+ worst-case allocating clusters per refill: an
-/// allocating cluster write costs up to ~11 steps — COW read,
-/// fill, data write, fresh-L2 write, L1 patch, L2 patch, two
-/// refcount updates, refblock write-back and up to two
-/// barriers). Field applicability per kind is documented on
-/// [`StepKind`].
+/// steps (≈ 100+ worst-case allocating clusters per refill at
+/// a budget of ~11 steps per cluster). The budget has headroom:
+/// [`plan_write`] emits at most seven steps for one cluster — a
+/// dirty victim slot's [`StepKind::WritebackCluster`]; a fresh
+/// L2's [`StepKind::ZeroRegion`] or a shared L2's
+/// [`StepKind::LoadCluster`], then its L1
+/// [`StepKind::PatchEntryU64`]; three data steps (head fill,
+/// body, tail fill, or a COW's pre-image read, copy and body);
+/// and the L2 [`StepKind::PatchEntryU64`]. Refcount changes are
+/// staged mutations of the refblocks rather than steps, and
+/// barriers and refblock write-backs come only from
+/// [`plan_flush`]. Field applicability per kind is documented
+/// on [`StepKind`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
 pub struct Step {
@@ -1254,12 +1261,13 @@ enum FlushStage {
     PreBarrier,
     /// Dirty L2 slot write-backs, ascending slot order.
     L2Writebacks,
-    /// Barrier before the L1 write (7(b) at flush granularity).
+    /// Barrier before the L1 write (a fresh L2's init precedes
+    /// the L1 entry that references it, at flush granularity).
     L1Barrier,
     /// Staged-L1 write-back.
     L1Write,
-    /// Barrier before the refcount write-backs (7(c):
-    /// refcounts last).
+    /// Barrier before the refcount write-backs (refcounts last,
+    /// after every pointer patch of the epoch).
     RbBarrier,
     /// Dirty refblock write-backs, ascending refblock order.
     RbWritebacks,
@@ -1275,7 +1283,8 @@ struct FlushProgress {
     next_idx: u32,
 }
 
-/// Which planner (if any) holds the decision-1 resume point.
+/// Which planner (if any) holds the resume point of the
+/// plan-a-window, execute, resume loop.
 #[derive(Debug, Clone, Copy)]
 enum Pending {
     Idle,
@@ -1313,7 +1322,7 @@ fn push_step(
     Ok(())
 }
 
-/// Emit a Durability barrier at a decision-7 contract point,
+/// Emit a Durability barrier at a crash-ordering contract point,
 /// unless no step was emitted since the last barrier (adjacent
 /// barriers collapse; empty groups emit nothing).
 fn barrier_if_needed(state: &mut WriteState, steps: &mut StepBuf<'_>) -> Result<(), WriteError> {
@@ -1400,7 +1409,7 @@ fn zero_range_step(disk_offset: u64, len: u64, dev: TargetDevice) -> Step {
 
 /// Read one cluster from `disk_offset` on `device` into
 /// [`RegionId::Bounce`] — the COW pre-image read of the old
-/// shared data cluster (C1).
+/// shared data cluster (data-cluster COW).
 fn read_cluster_to_bounce_step(disk_offset: u64, cs: u64, dev: TargetDevice) -> Step {
     Step {
         kind: StepKind::ReadCluster,
@@ -1414,7 +1423,8 @@ fn read_cluster_to_bounce_step(disk_offset: u64, cs: u64, dev: TargetDevice) -> 
 }
 
 /// Write the full [`RegionId::Bounce`] cluster back out to
-/// `disk_offset` — the COW pre-image copy `Bounce -> D'` (C1).
+/// `disk_offset` — the data-cluster COW pre-image copy
+/// `Bounce -> D'`.
 fn write_bounce_cluster_step(disk_offset: u64, cs: u64, dev: TargetDevice) -> Step {
     Step {
         kind: StepKind::WriteRange,
@@ -2829,7 +2839,8 @@ mod tests {
         // Fresh L2 slot init.
         assert_eq!(steps[0].region, RegionId::L2Slot(0));
         assert_eq!(steps[0].len, cs);
-        // 7(b): L2 init precedes the L1 patch referencing it.
+        // Crash ordering: L2 init precedes the L1 patch
+        // referencing it.
         assert_eq!(steps[1].region, RegionId::L1);
         assert_eq!(steps[1].region_offset, 0);
         assert_eq!(steps[1].value, 4 * cs | OFLAG_COPIED);
@@ -2862,7 +2873,7 @@ mod tests {
 
     #[test]
     fn owned_overwrite_load_boundary_then_in_place_write() {
-        // Allocated + owned (COPIED, refcount 1): the decision-5
+        // Allocated + owned (COPIED, refcount 1): the L2 window
         // protocol loads the L2 through a forced window
         // boundary, then overwrites in place with no metadata
         // change.
@@ -3049,9 +3060,10 @@ mod tests {
 
     #[test]
     fn eov_tail_refusal_boundaries_on_backed_image() {
-        // The amended-decision-7 rule only exempts the beyond-EOV
-        // remainder: every genuinely partial write below EOV on a
-        // backed image keeps the NeedsBackingFill refusal.
+        // Only the remainder beyond EOV is exempt from backing
+        // fill (the backing has nothing to contribute there):
+        // every genuinely partial write below EOV on a backed
+        // image keeps the NeedsBackingFill refusal.
         for cluster_bits in [9u32, 16] {
             let cs = 1u64 << cluster_bits;
             let tail_len = cs / 2 + 24;
@@ -3636,9 +3648,10 @@ mod tests {
             .expect_err("full refblocks must refuse");
         assert_eq!(err, WriteError::RefcountExhausted);
         assert!(steps.is_empty(), "no allocation possible, nothing emitted");
-        // Decision-9 shape: with exactly ONE free entry the
-        // fresh L2 claims it and the data allocation fails,
-        // leaving claimed-but-unflushed scaffolding.
+        // Capacity refusals are clean but not byte-idempotent:
+        // with exactly ONE free entry the fresh L2 claims it and
+        // the data allocation fails, leaving claimed-but-unflushed
+        // scaffolding.
         let (mut img, mut st) = mk(12, 1, false);
         for c in 0..(img.cs as u64 * 8 / 16) {
             set_rc(&mut img, c, 1);
@@ -3680,7 +3693,7 @@ mod tests {
                 durability,
                 StepKind::WriteRange, // L1
                 durability,
-                StepKind::WriteRange, // refblock 0 (refcounts last, 7(c))
+                StepKind::WriteRange, // refblock 0 (refcounts last)
                 durability,
             ]
         );
@@ -4009,7 +4022,7 @@ mod tests {
     // structural validity) verify the schedule end to end.
     // =====================================================================
 
-    // ---------------- capability (decision 4b) ----------------
+    // ---------------- COW envelope capability ----------------
 
     #[test]
     fn cow_envelope_capability_relaxes_only_snapshots() {
@@ -4063,7 +4076,7 @@ mod tests {
         let _ = run_write_ok(&mut img, &mut st, 0, cs, caller_data(), 64);
     }
 
-    // ---------------- C1: data-cluster COW ----------------
+    // ---------------- data-cluster COW ----------------
 
     #[test]
     fn cow_data_full_cluster_c1() {
@@ -4130,7 +4143,7 @@ mod tests {
         assert_eq!(rc_of(&img, 6), 1);
     }
 
-    // ---------------- C2: L2-table COW, NO child increment ----------------
+    // ---------------- L2-table COW, NO child increment ----------------
 
     #[test]
     fn cow_l2_table_no_child_increment_c2() {
@@ -4146,7 +4159,7 @@ mod tests {
         // rc 2 — the L2-COW did NOT increment it.
         assert_eq!(rc_of(&img, 6), 2);
         // Child 0 (cluster 5), the write target, drops 2->1 (its own
-        // C1 data COW; active no longer shares it).
+        // data-cluster COW; active no longer shares it).
         assert_eq!(rc_of(&img, 5), 1);
         // Old T (cluster 4) decremented 2->1 (the snapshot keeps it).
         assert_eq!(rc_of(&img, 4), 1);
@@ -4163,7 +4176,7 @@ mod tests {
         assert_eq!(disk_u64(&img, 7 * img.cs + 8), 6 * cs);
     }
 
-    // ---------------- C3: nested COW in one write ----------------
+    // ---------------- nested COW in one write ----------------
 
     #[test]
     fn cow_nested_l2_then_data_c3() {
@@ -4198,7 +4211,7 @@ mod tests {
         assert!(img.disk[5 * cs..6 * cs].iter().all(|&b| b == 0xCD));
     }
 
-    // ---------------- C4: crash ordering ----------------
+    // ---------------- crash ordering ----------------
 
     #[test]
     fn cow_crash_ordering_c4() {
@@ -4395,7 +4408,7 @@ mod tests {
     #[test]
     fn cow_decrement_underflow_is_inconsistent() {
         // A COPIED-clear entry pointing at a cluster with staged
-        // refcount 0 is an inconsistent image: the C1 decrement
+        // refcount 0 is an inconsistent image: the data-COW decrement
         // would underflow. The guard surfaces RefcountInconsistent
         // rather than wrapping. The shared cluster (7) sits above
         // the free clusters (5, 6) so the allocator does not reuse

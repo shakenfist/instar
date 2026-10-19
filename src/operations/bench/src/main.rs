@@ -492,7 +492,8 @@ unsafe fn staged_view<'a>(carve: &WriteCarve) -> StagedRegions<'a> {
 /// no [`StagedRegions`] view may be live across this call. `CallerData`
 /// aliases BUF_DEST (the COW-fill cluster buffer), so the caller must
 /// have finished any COW fill into BUF_DEST before the emitted window
-/// reads it (the decision-3 protocol does: fill, patch, THEN resubmit).
+/// reads it (the backed-fill protocol does: chain-read the pre-image
+/// into BUF_DEST, patch the pattern in, THEN resubmit).
 #[inline(never)]
 unsafe fn exec_window(
     io: &mut CallTableIo<'_>,
@@ -530,7 +531,7 @@ unsafe fn exec_window(
 /// above); the parse-defended `UnsupportedVersion` and the op-controlled
 /// `InvalidStagingConfig` are would-be internal bugs (`ERROR_PARSE_FAILED`,
 /// bench's internal-bug convention). Exhaustive — a new `Gate` variant is
-/// a build error (decision-6 completeness).
+/// a build error, so every refusal the crate can return has a wire code.
 fn map_gate(g: Gate) -> (u32, u64) {
     match g {
         Gate::RefcountWidth => (BenchResult::ERROR_WRITE_UNSUPPORTED, wgate::REFCOUNT_BITS),
@@ -896,8 +897,9 @@ enum WriteOutcome {
     /// The request classified and its window(s) executed.
     Done,
     /// The planner refused `NeedsBackingFill`: a backed partial
-    /// allocating write. The caller performs the decision-3 COW fill +
-    /// full-cluster resubmit.
+    /// allocating write. The caller chain-reads the pre-image cluster,
+    /// patches the pattern window in, and resubmits it as a full-cluster
+    /// write.
     NeedsFill,
     /// A refusal or I/O failure, rendered to (code, detail).
     Fail(u32, u64),
@@ -906,9 +908,11 @@ enum WriteOutcome {
 /// Drive one `plan_write` request to completion: plan into the step
 /// window, execute each window on `BufFull` (resuming with identical
 /// args, the resume contract), and surface the outcome. On a
-/// `NeedsBackingFill` refusal the benign decision-9 scaffolding (a fresh
-/// L2 staged into the window) is executed first so the caller's resubmit
-/// classifies against a consistent staged window.
+/// `NeedsBackingFill` refusal the scaffolding the refused attempt already
+/// emitted (a fresh L2 staged into the window) is executed first: it is
+/// benign (the image stays consistent, though not byte-idempotent
+/// mid-run), and the caller's resubmit then classifies against a
+/// consistent staged window.
 ///
 /// # Safety
 ///
@@ -1352,16 +1356,16 @@ pub unsafe extern "C" fn _start() -> u64 {
     }
 
     // ---- Write-mode format gate (pre-bracket) ----
-    // Write mode supports RAW (phase 5a, in place) and QCOW2 (phase 5b,
-    // allocating). Any other family-checked format reaching here under
-    // FLAG_WRITE is refused with ERROR_WRITE_UNSUPPORTED and gate id 0
-    // ("format has no write support yet"); the host already refuses
-    // non-{raw,qcow2} before launching, so this is defence in depth.
-    // The qcow2 envelope checks (refcount_bits, compression, extended-L2,
-    // external data, LUKS, dirty/corrupt, snapshots) run inside
-    // `run_qcow2_write` before its own BenchStart. `cfg` is the host's
-    // format claim, already cross-checked against dev0 and the guest's
-    // own sector-0 probe at the gate above.
+    // Write mode supports RAW (in place) and QCOW2 (allocating writes).
+    // Any other family-checked format reaching here under FLAG_WRITE is
+    // refused with ERROR_WRITE_UNSUPPORTED and gate id 0 ("format has no
+    // write support yet"); the host already refuses non-{raw,qcow2}
+    // before launching, so this is defence in depth. The qcow2 envelope
+    // checks (refcount_bits, compression, extended-L2, external data,
+    // LUKS, dirty/corrupt; snapshot-bearing images are COWed rather than
+    // refused) run inside `run_qcow2_write` before its own BenchStart.
+    // `cfg` is the host's format claim, already cross-checked against
+    // dev0 and the guest's own sector-0 probe at the gate above.
     if is_write {
         match cfg {
             ImageFormat::Raw | ImageFormat::Qcow2 => {}
@@ -1425,7 +1429,7 @@ pub unsafe extern "C" fn _start() -> u64 {
         );
     }
 
-    // ---- Write path fork: qcow2 allocating writes (phase 5b) ----
+    // ---- Write path fork: qcow2 allocating writes ----
     // qcow2 `-w` runs a self-contained driver: it parses the header,
     // applies the write-envelope gates (pre-bracket), stages the refcount
     // table + refblocks, then opens its OWN timing bracket around the
@@ -1455,7 +1459,7 @@ pub unsafe extern "C" fn _start() -> u64 {
     // doc contract in `shared`).
     (call_table.send_bench_start)();
 
-    // ---- Write path (phase 5a: raw, in place) ----
+    // ---- Write path (raw, in place) ----
     // The raw-only gate above guarantees a write run reaching here is a
     // flat raw file; each request patches `[offset, offset + bufsize)`
     // with the pattern byte through RW input slot 0.
@@ -1549,7 +1553,10 @@ pub unsafe extern "C" fn _start() -> u64 {
     }
 
     // ---- Read path: one read_chain_virtual_range per offset ----
-    // No progress messages inside the timed window (Mission §3).
+    // No progress messages inside the timed window: qemu-img bench
+    // prints nothing between its header and completion lines, and each
+    // progress message is a serial-port vmexit that would land inside the
+    // measured bracket, adding instar-only cost proportional to count.
     let dest = BUF_DEST as *mut u8;
     let mut staging_cluster_offset: u64 = u64::MAX;
     let mut completed: u64 = 0;

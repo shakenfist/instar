@@ -51,7 +51,7 @@ KNOWN_CREATE_CHECK_FAILURES = {
 #    rather than what the -o flag requested. The resize case names
 #    differ from the create case names, so we re-list them here.
 # 2. **Resize-time planner gaps.** Documented Future-work items
-#    from the master plan; the resize op rejects rather than
+#    in PLAN-resize.md; the resize op rejects rather than
 #    silently producing the wrong layout.
 #
 # A case NOT in this dict that fails the diff is a real
@@ -67,11 +67,11 @@ KNOWN_RESIZE_DIVERGENCES = {
     # -o compat=0.10 flag is silently ignored.
     ('qcow2', '1M-to-64M-compat-v2'): 'instar hardcodes compat=1.1',
 
-    # Resize-time planner gap (master-plan Future work)
+    # Resize-time planner gap (Future work in PLAN-resize.md)
     # ----------------------------------------
     # qcow2 + preallocation=metadata on resize is rejected by
-    # the planner (PreallocationUnsupported, deferred from
-    # phase 2c). qemu accepts it.
+    # the planner (PreallocationUnsupported: the metadata-mode
+    # L2 population path is not built). qemu accepts it.
     ('qcow2', '1M-to-4M-prealloc-metadata'):
         'qcow2 metadata preallocation deferred (master-plan Future work)',
 }

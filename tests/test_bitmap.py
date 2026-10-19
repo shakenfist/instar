@@ -305,7 +305,7 @@ class TestBitmapSmoke(InstarTestBase):
 
         The `x-dirty-bitmap` convention inverts `data`: a DIRTY cluster
         reports `"data": false` and a clean cluster `"data": true`. This
-        polarity is centralised HERE (Open question 2).
+        polarity is centralised HERE so no caller can get it backwards.
 
         Returns a SORTED, COALESCED list of `(offset, length)` dirty
         ranges. The bitmap MUST be disabled (see `_seed_bitmap`) for the

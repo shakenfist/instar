@@ -1,5 +1,6 @@
 //! Coverage-guided fuzzing for `dd::compute_dd_window` (the dd
-//! planner-equivalent extracted in phase 8a of PLAN-dd).
+//! planner-equivalent, kept in its own `no_std` crate rather than in
+//! the vmm binary so it can be fuzzed independently).
 //!
 //! Decodes the fuzzer bytes into the four window operands the host
 //! derives from a `dd` invocation — `(virtual_size, bs, count_opt,

@@ -659,8 +659,8 @@ class TestMeasureBaselineSource(TestMeasureSmoke):
 # Known divergences from qemu-img's source-scanning behaviour. Each entry
 # is `image_id -> (target_pattern, reason)`. The test factory skips matching
 # (image, target) pairs with the documented reason rather than failing.
-# These are real gaps in instar's parser scanners — see the master plan's
-# Future Work section for follow-up.
+# These are real gaps in instar's parser scanners — see the Future work
+# section of PLAN-measure.md for follow-up.
 KNOWN_SOURCE_SCANNER_DIVERGENCES = {
     # raw scanner does not call SEEK_HOLE/SEEK_DATA on the underlying file,
     # so genuinely-sparse raw images (with on-disk fallocate holes) count
@@ -919,7 +919,8 @@ class TestMeasureRoundTrip(TestMeasureSmoke):
       measure + convert, same bound assertion.
 
     Cushion: one output sector (65536 bytes) to absorb writer-side alignment
-    artefacts (e.g. VHD's leading-footer sector-alignment gap from phase 1e).
+    artefacts (e.g. VHD's leading footer, which the writer pads to a whole
+    output sector while measure counts it as 512 bytes).
     For vhdx the cushion is widened to 1 MiB (vhdx::MB_ALIGN) because the
     VHDX writer aligns metadata to 1 MiB boundaries.
     """

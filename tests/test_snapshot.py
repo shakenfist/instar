@@ -46,9 +46,9 @@ Skip taxonomy (mirrors test_map.py):
      regression; add to KNOWN_SNAPSHOT_DIVERGENCES if deliberate).
   4. No baseline file for the resolved profile.
 
-There is deliberately no "old qemu-img" skip: since phase 2b instar
-emits whichever column layout the detected version uses, so every
-profile is byte-comparable on every host.
+There is deliberately no "old qemu-img" skip: instar emits whichever
+column layout the detected qemu-img version uses (the columns changed
+at 9.0.0), so every profile is byte-comparable on every host.
 """
 
 import json
@@ -168,7 +168,7 @@ def _make_list_human_test(image_id):
         # columns changed at 9.0.0), so every profile is comparable.
         # This used to skip on any pre-9.0 host because instar only
         # ever emitted the modern form -- which meant Debian 12 and
-        # Ubuntu 22.04 silently tested nothing here. See phase 2b.
+        # Ubuntu 22.04 silently tested nothing here.
         profile_name = self.get_profile_for_installed_qemu(
             output_type='human', command='snapshot-list',
         )
@@ -428,7 +428,7 @@ class TestSnapshotVmstateStructural(TestSnapshotSmoke):
 
 
 class TestSnapshotJsonSchema(TestSnapshotSmoke):
-    """Pin the QMP-shaped JSON key names from the master plan fact 4."""
+    """Pin the JSON key names, which mirror qemu's QMP SnapshotInfo struct."""
 
     def test_qmp_key_names(self):
         """JSON output uses the documented QMP-compatible key names."""
