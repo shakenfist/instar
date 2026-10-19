@@ -1,6 +1,19 @@
 # PLAN-543: Cut the merge queue's critical path
 
-## Status: Complete
+## Status: In progress
+
+**Not complete: the testdata disk broke the nightly.** Since #673 the
+six VHD tests this plan moved off the merge queue fail on all seven
+distros every night (#780 to #786), and the merge queue cannot see it
+because it no longer runs them. Nightly run 38985117481 on
+`eea59b99`, before #673, cloned testdata and passed on every leg;
+run 39080337878 on `81423f22`, which adds only #673 and a Renovate
+bump, read the disk (`testdata source: cache`) and failed on every
+leg. All six fail in 0.34 s in total with `instar info` returning
+`Info operation failed: Invalid argument (os error 22)` on
+`downloaded/qemu-iotests/hyperv2012r2-dynamic.vhd` and
+`virtualpc-dynamic.vhd`. The cause is not yet found. The plan stays
+open until it is fixed and a nightly on the disk is green.
 
 Every step in the Execution table is done. Steps 1 to 6 and 8 landed
 in #671 (merged as `eea59b99`), with step 5's measurement recorded
@@ -661,20 +674,30 @@ errors, all fixed in the close-out commit:
 
 ### Review checklist additions
 
-- [ ] Every test that runs in the merge-queue matrix today runs
+- [x] Every test that runs in the merge-queue matrix today runs
       either in the queue or in the nightly after this change, and the
       guard fails if that stops being true. Proved by the step-4
-      self-test, not by reading the selectors.
-- [ ] All seven distros still run in both the queue and the nightly.
+      self-test, not by reading the selectors. **Checked at close-out:**
+      `tools/ci/test_check_test_partition.py` passes its 40 cases, and
+      deleting one of the six ids from `test-container-matrix-nightly`'s
+      regex makes `tools/ci/check-test-partition.sh` exit 1 naming
+      exactly that test; restored, it passes.
+- [x] All seven distros still run in both the queue and the nightly.
       A distro dropped during the change is the failure mode with no
-      symptom.
-- [ ] A red nightly produces an issue. Proved by running the failure
-      path, not by reading the step.
-- [ ] `MATRIX_SELECT` is still reserved for local partial runs, still
-      warns, and is set nowhere in CI.
-- [ ] The six moved tests are named by test id. A class-level selector
+      symptom. **Checked:** the guard reports both distro lists agree
+      on seven, and nightly run 39080337878 ran a leg for each.
+- [x] A red nightly produces an issue. Proved by running the failure
+      path, not by reading the step. **Proved, unhappily, by the real
+      thing:** the regression in Status above filed #780 to #786, one
+      per distro, each naming the distro and its six failing tests.
+- [x] `MATRIX_SELECT` is still reserved for local partial runs, still
+      warns, and is set nowhere in CI. **Checked:** no occurrence under
+      `.github/`, and `tools/ci/run-matrix-entry.sh` still prints its
+      partial-run note when it is set.
+- [x] The six moved tests are named by test id. A class-level selector
       would also move that class's sub-second cases off the gate for
-      no gain.
+      no gain. **Checked:** `test-container-matrix-nightly`'s regex is
+      six literal `test_convert.<Class>.<test>` ids.
 - [x] The set of jobs carrying the `instar` label is exactly the set
       of jobs that run `prepare-testdata.sh`, minus the static-fleet
       one that can never be assigned such a runner. Checked in both
@@ -791,7 +814,7 @@ errors, all fixed in the close-out commit:
     likely the previous day's 16:25 UTC push of 583 corpus entries
     plus the OVA corpus.
   * *The window: private-ci's to close, agreed and not yet built.*
-    As of 19 Oct the chosen lever, relayed by the `ci-instar-testdata`
+    As of 18 Oct (UTC) the chosen lever, relayed by the `ci-instar-testdata`
     session, is private-ci's `PLAN-instar-testdata-disk.md` phase 5,
     which is to rebuild the testdata disk soon after testdata `main`
     gains a commit rather than only nightly. That phase was not
