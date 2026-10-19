@@ -99,8 +99,10 @@ pub const COMPAT_LAZY_REFCOUNTS: u64 = 1 << 0;
 ///   ChainDeviceInfo.data_device_idx; VMM validates and opens the
 ///   data file as a separate virtio-block device)
 /// - Bit 3 (compression): conditionally supported (see below)
-/// - Bit 4 (extended_l2): supported (16-byte L2 entries; subcluster
-///   bitmap is ignored, treating the cluster as fully allocated)
+/// - Bit 4 (extended_l2): supported (16-byte L2 entries; each
+///   subcluster is decided by `subcluster_type()` and
+///   `subcluster_range()`, which follow qemu's classification, and an
+///   entry qemu calls invalid is refused)
 ///
 /// When the `decompress-zstd` feature is enabled, bit 3 is included
 /// because ZSTD decompression is available. Otherwise only zlib

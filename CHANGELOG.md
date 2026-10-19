@@ -365,6 +365,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **Invalid extended-L2 qcow2 entries are refused instead of
+  zero-filled.** `convert`, `dd`, `compare`, `bench`, `rebase`, `map`
+  and `measure` now fail with "Invalid cluster entry found at virtual
+  offset N", as qemu-img does, and `compare` no longer prints a
+  spurious "Content mismatch at offset 0!" first. See `docs/quirks.md`.
+- **`map` carries `"offset"` on zero-allocated and unallocated-allocated
+  runs**, as `qemu-img map` does, including on classic-L2 images.
+- **`measure` no longer counts zero-flag clusters as allocated**,
+  matching `qemu-img measure` (589824 reported against qemu's 458752 on
+  a 1M image with zeroed clusters).
+- **`check` follows qemu-img 10.0.13 on subcluster bitmaps.** A host
+  cluster with an empty bitmap is no longer reported, and a compressed
+  entry with any non-zero bitmap is, including the all-allocated
+  pattern previously exempted as legacy.
+
 - **CI jobs that need instar-testdata now ask the runner fleet for a
   machine that already has it.** Eight of the nine jobs that prepare
   testdata carry an extra `instar` label in their `runs-on` and set
@@ -602,6 +617,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   fixed by hand.
 
 ### Fixed
+
+- **Extended-L2 qcow2 reads ignored the backing file for subclusters
+  with neither the allocation nor the zero bit set**, reading zeros
+  instead ([#654](https://github.com/shakenfist/instar/issues/654)).
+- **A crafted extended-L2 entry served the image's own header as guest
+  data** ([#653](https://github.com/shakenfist/instar/issues/653)).
+- **Data-file qcow2 images whose cluster 0 is `COPIED` with host offset
+  0** read as zeros, mapped as a hole, measured short, or failed
+  `check` as corrupt; all four now treat it as data at offset 0.
 
 - **Every operation now gives its vCPU a guest CPUID, so instar works
   on Linux 6.12.112 and newer** (#778). A freshly created KVM vCPU has
