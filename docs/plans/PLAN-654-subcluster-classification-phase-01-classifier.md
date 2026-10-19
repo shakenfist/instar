@@ -299,6 +299,24 @@ The `dd` window check (`bs=4096 skip=1 count=3`) is byte-identical to
   mapping is in "Step 1a measurements". The management session
   re-checked all 34 against `qemu-img convert`: 24 valid fixtures match
   `expected_raw` byte for byte, and all 10 refusal fixtures fail.
+* Step 1e found that `compare` reads chunks of the larger cluster size
+  through a reader that fills one input cluster per call. With clusters
+  under 64K it compares stale buffer bytes. That predates this work; the
+  management session reproduced it on develop and filed it as #800. The
+  affected compare cases are expected failures citing it.
+* Step 1d went beyond its row in two places, and both were kept. map
+  gained offset-bearing zero and hole states (record codes 3 and 4) so
+  that it reports qemu's `"offset"`. measure stopped counting zero-flag
+  clusters. On a plain classic image the management session confirmed
+  that both changes fix a divergence from qemu-img that develop already
+  had.
+* 2026-10-20 (AEDT), on HEAD `8eb7a246`, before the push: `make lint`,
+  `make test-rust` (2617 passed, 0 failed), `make instar` and
+  `make check-binary-sizes` (convert is the largest at 365KB of 768KB)
+  all pass. The new module plus test_map, test_measure,
+  test_check_formats, test_check_chain and test_check_repair ran 1230
+  tests: 0 failed and 19 expected failures. The `host_offset == 0` grep
+  finds only the classifier's doc comment and tests.
 
 ## Success criteria for the phase
 
