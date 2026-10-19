@@ -4,22 +4,25 @@
 # list rests on, against a real git.
 #
 # On the cache path that script derives the narrow resparsify's work
-# list from two things: `git diff --name-only -z PREVIOUS_REV HEAD`
-# across the update, and the paths whose index stat data was stale
-# before it. The whole saving of the testdata dependencies disk
-# depends on one property of that union: **every path the reset
-# rewrote is in it**. A path the reset rewrote and the list missed
-# comes back through the LFS smudge filter fully allocated, is never
-# resparsified, and sits in the copy-on-write overlay at full size --
-# which costs the disk its reason to exist and shows up as nothing
-# worse than a job that looks slightly slow.
+# list from three things: `git diff --name-only -z PREVIOUS_REV HEAD`
+# across the update, the paths whose index stat data was stale before
+# it, and the working-tree files that were still LFS pointers before
+# `git lfs pull`. This file covers the first two against a real git;
+# the third is covered only by the stubbed git in
+# tools/ci/test-prepare-testdata.sh. The whole saving of the testdata
+# dependencies disk depends on one property of that union: **every
+# path the reset rewrote is in it**. A path the reset rewrote and the
+# list missed comes back through the LFS smudge filter fully
+# allocated, is never resparsified, and sits in the copy-on-write
+# overlay at full size -- which costs the disk its reason to exist and
+# shows up as nothing worse than a job that looks slightly slow.
 #
 # tools/ci/test-prepare-testdata.sh stubs git, so it can prove what the
-# script does with the two lists and not what git puts in them. This
-# file is the other half, and it is deliberately not a test of the
-# script: it runs the same sequence of git commands against a local
-# bare repository and asserts what git does, so the premise is pinned
-# by something that fails if a future git changes it.
+# script does with all three lists and not what git puts in them. This
+# file is the other half for the first two, and it is deliberately not a
+# test of the script: it runs the same sequence of git commands against
+# a local bare repository and asserts what git does, so the premise is
+# pinned by something that fails if a future git changes it.
 #
 # The second source exists because of what is measured below. The disk
 # build resparsifies after its own checkout, and resparsifying is a cp

@@ -15,7 +15,7 @@
 # gigabytes the disk exists to avoid, and skipping it altogether would
 # leave the day's drift fully allocated.
 #
-# WHY THIS IS A SCRIPT RATHER THAN A CONDITIONAL IN EIGHT WORKFLOW
+# WHY THIS IS A SCRIPT RATHER THAN A CONDITIONAL IN SEVEN WORKFLOW
 # STEPS. Three reasons, in increasing order of what they cost.
 #
 # resparsify-testdata.sh cannot make this decision itself. It is a
@@ -26,7 +26,7 @@
 # two calling forms therefore belongs to its caller, and in CI the
 # caller is a workflow step.
 #
-# Eight copies of that choice in YAML would be eight places for it to
+# Seven copies of that choice in YAML would be seven places for it to
 # drift, and the drift has no symptom: a step that quietly widened back
 # to the whole tree still leaves a perfectly correct tree behind, and
 # the cost lands as gigabytes written into somebody's overlay. That is

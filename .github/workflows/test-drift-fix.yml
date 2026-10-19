@@ -141,7 +141,7 @@ jobs:
       #
       # The one call site that stays on resparsify-testdata.sh's
       # one-argument form rather than the resparsify-prepared-testdata.sh
-      # wrapper the other eight use, and it must stay. This workflow
+      # wrapper the other seven use, and it must stay. This workflow
       # file comes from the default branch while the scripts it runs
       # come from the pull request's own checkout, so the two can be of
       # different ages: a branch cut before the wrapper existed would
