@@ -18,7 +18,7 @@
         fuzz-build fuzz-run fuzz-coverage snapshot-harnesses \
         test-container test-container-core test-container-convert-qcow2 test-container-convert-vhd \
         test-container-matrix-queue test-container-matrix-nightly \
-        clean-cargo-cache release check-version
+        clean-cargo-cache set-version propose-release tag-release check-version
 
 # Default target
 help:
@@ -66,8 +66,10 @@ help:
 	@echo "  install-hooks        Install pre-commit hooks"
 	@echo ""
 	@echo "Release:"
-	@echo "  release VERSION=x.y.z  Bump versions, commit, and tag a release"
-	@echo "  check-version          Verify Cargo.toml versions match a git tag"
+	@echo "  propose-release VERSION=x.y.z  Bump versions and open the release pull request"
+	@echo "  tag-release VERSION=x.y.z      Tag the merged release commit, starting the release"
+	@echo "  set-version VERSION=x.y.z      Set every crate's version (propose-release runs this)"
+	@echo "  check-version TAG=vx.y.z       Verify the Cargo.toml version matches a release tag"
 	@echo ""
 	@echo "Testing:"
 	@echo "  test-venv            Create Python venv for tests"
@@ -985,16 +987,17 @@ CARGO_TOML_FILES := \
 	src/operations/snapshot/Cargo.toml \
 	crates/guest-protocol/Cargo.toml
 
-# Bump all Cargo.toml versions, commit, and create a signed tag.
+# Set every Cargo.toml in CARGO_TOML_FILES to VERSION, and fail if any of
+# them did not take. tools/propose-release.sh runs this to bump the
+# version on its release branch; it changes files only, and commits
+# nothing.
 #
-# Usage: make release VERSION=0.2.0
-#
-# This does NOT push -- review the commit and tag before pushing.
-release:
+# Usage: make set-version VERSION=0.2.0
+set-version:
 ifndef VERSION
-	$(error VERSION is not set. Usage: make release VERSION=0.2.0)
+	$(error VERSION is not set. Usage: make set-version VERSION=0.2.0)
 endif
-	@echo "Bumping version to $(VERSION) in all Cargo.toml files..."
+	@echo "Setting version to $(VERSION) in all Cargo.toml files..."
 	@for f in $(CARGO_TOML_FILES); do \
 		if [ ! -f "$$f" ]; then \
 			echo "Error: $$f not found"; \
@@ -1019,30 +1022,33 @@ endif
 		exit 1; \
 	fi
 	@echo "All versions set to $(VERSION)."
-	@echo ""
-	@echo "Creating release commit and tag..."
-	git add $(CARGO_TOML_FILES)
-	git commit -m "Release v$(VERSION)."
-	git tag "v$(VERSION)" -m "Release v$(VERSION)"
-	@echo ""
-	@echo "Done. Review the commit and tag, then push with:"
-	@echo "  git push origin HEAD"
-	@echo "  git push origin v$(VERSION)"
 
-# Verify that the version in src/vmm/Cargo.toml matches a tag.
-# Used by the release workflow as a safety check.
+# A release is two steps, so that the version bump goes through the merge
+# queue and the tagged commit has the CI run the release workflow requires:
+# propose-release opens a pull request with the bump, and, once that has
+# merged through the queue, tag-release tags the merged commit and pushes
+# the tag. See "Releases" in docs/development.md.
+#
+# Usage: make propose-release VERSION=0.2.0
+#        make tag-release VERSION=0.2.0 [COMMIT=<sha>]
+propose-release:
+ifndef VERSION
+	$(error VERSION is not set. Usage: make propose-release VERSION=0.2.0)
+endif
+	tools/propose-release.sh $(VERSION)
+
+tag-release:
+ifndef VERSION
+	$(error VERSION is not set. Usage: make tag-release VERSION=0.2.0 [COMMIT=<sha>])
+endif
+	tools/tag-release.sh $(VERSION) $(COMMIT)
+
+# Check that the version in src/vmm/Cargo.toml matches a release tag,
+# the same check the release workflow's check-version job runs.
 #
 # Usage: make check-version TAG=v0.2.0
 check-version:
 ifndef TAG
 	$(error TAG is not set. Usage: make check-version TAG=v0.2.0)
 endif
-	@EXPECTED=$$(echo "$(TAG)" | sed 's/^v//'); \
-	ACTUAL=$$(grep '^version = ' src/vmm/Cargo.toml | head -1 | \
-		sed 's/version = "//;s/"//'); \
-	if [ "$$ACTUAL" != "$$EXPECTED" ]; then \
-		echo "ERROR: Tag $(TAG) expects version $$EXPECTED"; \
-		echo "       but src/vmm/Cargo.toml has $$ACTUAL"; \
-		exit 1; \
-	fi; \
-	echo "Version check passed: $$ACTUAL matches $(TAG)"
+	tools/release-version.sh check refs/tags/$(TAG)

@@ -469,16 +469,76 @@ instar/
 See [CHANGELOG.md](https://github.com/shakenfist/instar/blob/develop/CHANGELOG.md)
 for release notes.
 
-Release artifacts (pre-compiled Linux binaries) are published to
+Release artifacts (pre-compiled Linux binaries, plus `.deb` and `.rpm`
+packages) are published to
 [GitHub Releases](https://github.com/shakenfist/instar/releases)
 via the release workflow (`.github/workflows/release.yml`). Tags
-are signed with Sigstore. To cut a release:
+are signed with Sigstore.
+
+A release is two steps, because the commit that is tagged must have
+been through the merge queue: the release workflow refuses to build a
+commit whose `functional-tests.yml` merge queue run did not succeed,
+and a version bump pushed straight to `develop` has no such run.
+
+1. **Propose.** From a clean `develop` that is in step with `origin`,
+   run `make propose-release VERSION=0.2.0` (or
+   `tools/propose-release.sh 0.2.0`). It creates a `release-0.2.0`
+   branch, sets every crate's version with `make set-version`, runs
+   pre-commit, the release workflow's own version check and
+   `make test-rust`, and then asks before it commits `Release 0.2.0.`,
+   pushes the branch and opens a pull request. On `N`, or on any
+   failure before the push, it deletes the branch and leaves the
+   checkout as it was.
+2. **Merge.** Get the pull request reviewed and land it through the
+   merge queue like any other change, then wait for the queue's
+   `functional-tests.yml` run on the merged commit to finish.
+3. **Tag.** Run `make tag-release VERSION=0.2.0` (or
+   `tools/tag-release.sh 0.2.0`). It finds the commit that merged
+   `Release 0.2.0.`, which is the queue's merge commit rather than
+   `develop`'s tip, checks that it carries the version, lists anything
+   that merged after it and so is not in the release, and asks before
+   it pushes the annotated tag `v0.2.0`. It then watches the workflow
+   run.
+4. **Approve.** The workflow runs `ci-gate`, `check-version` and
+   `build`, then waits at `sign-tag` for a reviewer to approve the
+   `release` environment. After approval it re-signs the tag with
+   gitsign and creates the GitHub release.
+
+`ci-gate` checks that `functional-tests.yml` succeeded on the tagged
+commit, in its merge queue run. A run started by hand, as
+`pr-retest.yml` does with `workflow_dispatch`, does not count, so to
+recover from a flaky queue run use "Re-run jobs" on that merge queue
+run itself, then re-run the `ci-gate` job. How the gate decides is
+documented with the action, as
+[`require-ci-success`](https://github.com/shakenfist/actions/blob/main/docs/actions.md#require-ci-success).
+It has no override. A commit merged around the queue, by an
+administrator bypassing it, cannot be released: tag a later commit
+that went through the queue instead.
+
+A gate or version-check failure means nothing was signed or published,
+so every such failure is recoverable. The release template's
+[recovery table](https://github.com/shakenfist/development/blob/main/templates/release-automation/README.md#recovering-from-a-gate-failure)
+says what to do for each cause. Where it says to move the tag:
 
 ```bash
-make release VERSION=0.2.0
-git push origin HEAD
-git push origin v0.2.0
+git push origin :refs/tags/v0.2.0   # needs the tag ruleset's bypass
+git tag -d v0.2.0
+tools/tag-release.sh 0.2.0 <commit that went through the queue>
 ```
+
+Running `release.yml` by hand with `workflow_dispatch` is a dry run:
+it runs `check-version` and `build`, and skips `ci-gate`, `sign-tag`
+and `github-release`.
+
+The release scripts come from shakenfist/development's
+[Rust release template](https://github.com/shakenfist/development/tree/main/templates/release-automation-rust).
+`tools/tag-release.sh` and `tools/sign-release-tag.sh` are copied from
+it unchanged, and `tools/propose-release.sh` and
+`tools/release-version.sh` differ only between their
+`--- per-repository settings ---` markers, so make changes upstream
+first. The version the tag must name is `src/vmm/Cargo.toml`'s;
+`make set-version` keeps the other crates in `CARGO_TOML_FILES` at
+the same version.
 
 ## GitHub automation
 
@@ -645,9 +705,9 @@ full runtime, succeeds at the real work, and then dies on
 `gh: command not found`. That is exactly what happened to
 `rust-nightly-bump` on 2026-08-24: it validated `nightly-2026-08-24`,
 committed it and pushed the branch, then failed the run without opening
-the PR. Worse, in `release.yml` the `gh` call sits on a `if: failure()`
-error-reporting path, where a missing `gh` would have silently swallowed
-the report of the original failure.
+the PR. Worse, an `if: failure()` error-reporting step that calls `gh`
+silently swallows the report of the original failure when `gh` is
+missing.
 
 ### Merge queue and the `develop` ruleset
 
@@ -1009,7 +1069,7 @@ Each review item has an `action` field:
 - `.github/workflows/functional-tests.yml` - Main CI, and the caller for the
   shared automated review workflow
   (`shakenfist/actions/.github/workflows/pr-auto-review.yml`)
-- `.github/workflows/release.yml` - Release workflow (Sigstore-signed tags, GitHub Releases with pre-compiled binaries)
+- `.github/workflows/release.yml` - Release workflow, on a `v*` tag: the CI gate, the version check, the build, then Sigstore-signed tags and GitHub Releases with pre-compiled binaries (see "Releases" above)
 - `.github/workflows/pr-re-review.yml` - Manual re-review trigger
 - `.github/workflows/pr-retest.yml` - Manual retest trigger via bot command
 - `.github/workflows/pr-fix-tests.yml` - Test failure fixing
@@ -1043,6 +1103,9 @@ step -- see "Self-hosted runners and the GitHub CLI" in
 - `tools/ci/test-apt-get.sh` - Tests for that wrapper against a fake `apt-get`; the `ci-tooling` CI job runs it
 - `tools/ci/install-docker.sh` - Installs the Docker client and daemon on a self-hosted runner, plus any extra packages passed as arguments (see "Self-hosted runners and Docker" above)
 - `tools/ci/install-gh-cli.sh` - Installs the GitHub CLI on a self-hosted runner if absent (see "Self-hosted runners and the GitHub CLI" above)
+- `tools/propose-release.sh`, `tools/tag-release.sh` - The two release steps: open the version-bump pull request, then tag the commit that merged it (see "Releases" above)
+- `tools/release-version.sh` - Reads and checks the release version in `src/vmm/Cargo.toml`; `check-version` in `release.yml` and `make check-version` run it
+- `tools/sign-release-tag.sh` - Re-signs the release tag with gitsign and force-pushes it; `sign-tag` in `release.yml` runs it on a throwaway runner
 - `tools/ci/fuzz-tier.sh` - Computes tiered nightly per-target fuzz durations
 - `tools/ci/report-fuzz-crash.sh` - Files the `security-audit` issue for a coverage-fuzz crash (bounds the log excerpt, dedups against open issues; see "Crash reporting" in `docs/testing.md`)
 - `tools/ci/pick-fuzz-artifact.sh` - Chooses which libFuzzer artifact to report as the reproducer
