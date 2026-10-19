@@ -1,19 +1,6 @@
 # PLAN-543: Cut the merge queue's critical path
 
-## Status: In progress
-
-**Not complete: the testdata disk broke the nightly.** Since #673 the
-six VHD tests this plan moved off the merge queue fail on all seven
-distros every night (#780 to #786), and the merge queue cannot see it
-because it no longer runs them. Nightly run 38985117481 on
-`eea59b99`, before #673, cloned testdata and passed on every leg;
-run 39080337878 on `81423f22`, which adds only #673 and a Renovate
-bump, read the disk (`testdata source: cache`) and failed on every
-leg. All six fail in 0.34 s in total with `instar info` returning
-`Info operation failed: Invalid argument (os error 22)` on
-`downloaded/qemu-iotests/hyperv2012r2-dynamic.vhd` and
-`virtualpc-dynamic.vhd`. The cause is not yet found. The plan stays
-open until it is fixed and a nightly on the disk is green.
+## Status: Complete
 
 Every step in the Execution table is done. Steps 1 to 6 and 8 landed
 in #671 (merged as `eea59b99`), with step 5's measurement recorded
@@ -22,6 +9,22 @@ landed in #673 (merged as `673233f3`), the second once the conductor
 gate cleared; the step 7 row records both and the evidence for the
 gate. The post-merge work is recorded under Execution ("The step-7
 measurement" and "The second push audit").
+
+**A red nightly that was not the disk.** On 18 Oct the six VHD tests
+this plan moved off the merge queue failed on all seven distros
+(#780 to #786), each in a fraction of a second with `instar info`
+returning `Invalid argument (os error 22)`. That was the first
+nightly to read the testdata disk, and the merge queue cannot see
+those six tests, so the disk was the obvious suspect -- and wrong.
+The cause was #778: Debian's 6.12.113 kernel, which reached the CI
+runner images in the same window, rejects `KVM_SET_SREGS` when the
+VMM sets no guest CPUID. The evidence is a pair of nightlies that
+both read the disk: run 39080337878 on `81423f22` failed every leg,
+and run 39178562519 on `b0e1f249` passed every leg (six tests in
+662 s on Debian 13), with only #779 and #788 -- the #778 fix --
+between them. It is recorded here because the coincidence will
+recur: a nightly-only test set means a regression that lands
+alongside an infrastructure change is first seen together with it.
 
 #543 itself is not closed by this plan: the capacity direction is its
 other half.
@@ -687,9 +690,10 @@ errors, all fixed in the close-out commit:
       symptom. **Checked:** the guard reports both distro lists agree
       on seven, and nightly run 39080337878 ran a leg for each.
 - [x] A red nightly produces an issue. Proved by running the failure
-      path, not by reading the step. **Proved, unhappily, by the real
-      thing:** the regression in Status above filed #780 to #786, one
-      per distro, each naming the distro and its six failing tests.
+      path, not by reading the step. **Proved by the real thing:**
+      the #778 kernel regression described in Status above filed #780
+      to #786, one per distro, each naming the distro and its six
+      failing tests.
 - [x] `MATRIX_SELECT` is still reserved for local partial runs, still
       warns, and is set nowhere in CI. **Checked:** no occurrence under
       `.github/`, and `tools/ci/run-matrix-entry.sh` still prints its
