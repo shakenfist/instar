@@ -365,6 +365,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **The chain config is version 4.** An external data file device now
+  carries `FLAG_DATA_DEVICE` (bit 31), set only by the host, and is
+  never treated as a layer.
+
 - **Invalid extended-L2 qcow2 entries are refused instead of
   zero-filled.** `convert`, `dd`, `compare`, `bench`, `rebase`, `map`
   and `measure` now fail with "Invalid cluster entry found at virtual
@@ -618,6 +622,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Unallocated clusters in data-file qcow2 images read the data file**
+  instead of the backing file or zeros
+  ([#792](https://github.com/shakenfist/instar/issues/792)).
+- **Data-file entries qemu refuses are now refused by name**: a
+  compressed entry, and a host offset that differs from the guest
+  offset ([#803](https://github.com/shakenfist/instar/issues/803)).
+- **A VMDK flat descriptor's extent walk ran past its own extents** into
+  whatever device followed, so `compare` of a qcow2 overlay larger than
+  its flat VMDK backing depended on argument order, and a flat
+  descriptor with a parent served the parent's raw bytes.
+- **`check --chain` validated an external data file as a backing
+  image**, reporting a chain error when the guest's data began with
+  another format's magic or the data file was empty.
 - **Extended-L2 qcow2 reads ignored the backing file for subclusters
   with neither the allocation nor the zero bit set**, reading zeros
   instead ([#654](https://github.com/shakenfist/instar/issues/654)).
