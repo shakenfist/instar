@@ -332,7 +332,10 @@ The `dd` window check (`bs=4096 skip=1 count=3`) is byte-identical to
   35 fixtures and 175 tests, and the three #800 compare entries left
   `EXPECTED_FAILURES`. The `check` change to count a data-file
   image's cluster 0 exposed #804: L2 tables are counted too. #803
-  tracks qemu's data-file host-offset checks.
+  tracks qemu's data-file host-offset checks. The refusal message was
+  shortened in this round to `<op>: Invalid cluster entry found at
+  virtual offset N (0x…): corrupt qcow2 L2 entry`; row B of the step
+  1c measurements quotes the longer sentence that was measured then.
 
 ## Success criteria for the phase
 

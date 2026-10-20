@@ -14984,6 +14984,11 @@ fn chunk_crosses_granule(virtual_offset: u64, chunk_size: u64, granule: u64) -> 
 /// sizes. Splitting here, rather than in each caller, keeps the
 /// function's contract -- every byte of `chunk_size` is filled -- true
 /// at every depth.
+///
+/// Each piece re-enters the reader at the same device but cannot split
+/// there again, so a split adds at most one reader frame per device.
+/// The frame is about 10.7KB in the convert build, so a chain of
+/// `MAX_CHAIN_DEVICES` stays under 350KB of the guest's 4MB stack.
 #[allow(clippy::too_many_arguments)]
 unsafe fn read_chain_split_at_granule(
     granule: u64,
@@ -15328,7 +15333,16 @@ pub unsafe fn read_chain_virtual_cluster(
                             match ty {
                                 SubclusterType::Normal => {
                                     // The wide path's chunk read above
-                                    // already holds these bytes.
+                                    // already holds these bytes. The
+                                    // decryptors need a run that starts on
+                                    // a 512-byte boundary. Only convert and
+                                    // compare take a key, and their chunks
+                                    // are cluster-aligned; dd, the one
+                                    // caller with byte windows, cannot open
+                                    // encrypted images. That leaves the
+                                    // subcluster size, which qemu refuses
+                                    // below 512 bytes and instar does not
+                                    // yet (#805).
                                     if !wide {
                                         let Some(read_dev) = read_dev else {
                                             return false;

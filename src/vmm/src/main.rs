@@ -16464,7 +16464,7 @@ fn map_state_triple(state: &str) -> (bool, bool, bool, bool) {
         "zero-at" => (true, true, false, true),
         "hole-at" => (false, true, false, true),
         // Defensive fallback for an unknown state code (the guest
-        // emits only the three above). Treat as data so the offset
+        // emits only the five above). Treat as data so the offset
         // is preserved for debugging.
         _ => (true, false, true, true),
     }
