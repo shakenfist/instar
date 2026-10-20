@@ -102,10 +102,10 @@ Parameters item and BAT:
 
 Both are sparse (1265664 bytes allocated): qemu `ftruncate`s the file
 out to `data_start + virtual_size` and writes only the structure. The
-mechanism is `vhdx_create_bat` (`block/vhdx.c:1690-1765`): the data
-region starts at `bat_offset + bat_region_length + 5 MiB` (`:1712`),
+mechanism is `vhdx_create_bat` (`block/vhdx.c:1690-1768`): the data
+region starts at `bat_offset + bat_region_length + 5 MiB` (`:1708`),
 a fixed image is truncated to `data_start + image_size` with
-`PREALLOC_MODE_OFF` (`:1722-1728`), and the BAT is filled by
+`PREALLOC_MODE_OFF` (`:1719-1725`), and the BAT is filled by
 emulating one write per block with the state
 `FULLY_PRESENT`, overridden to `ZERO` when `use_zero_blocks` is set
 (`:1731-1758`). `use_zero_blocks` defaults to **true**
