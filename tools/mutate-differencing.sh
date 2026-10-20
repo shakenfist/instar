@@ -682,7 +682,7 @@ self_test() {
 # phase's definition of done asks the two to stay in step, which until
 # now was a promise kept by hand. Asserting it makes the drift a
 # failure instead of a documentation bug nobody reads.
-EXPECTED_CASES=118
+EXPECTED_CASES=126
 
 check_case_count() {
     # Only meaningful for a whole run; a selection is expected to be short.
@@ -1833,6 +1833,78 @@ rust_case 'vmm-image-flags-keep-the-data-device-mark' "${VMM_MAIN_LIB}" \
     '            image.flags & !shared::ChainDeviceInfo::FLAG_DATA_DEVICE,' \
     '            image.flags, // MUTATED' \
     instar 'write_chain_device_entries_marks_every_data_device_and_nothing_else'
+
+# --- qcow2 data-file entries qemu refuses (#803) ----------------------
+#
+# qemu's read path applies two rules to an image with an external data
+# file, after the entry has classified as valid: a compressed entry is
+# refused, and so is a host cluster offset that is not the guest
+# cluster offset (block/qcow2-cluster.c:668-675 and :696-704 at
+# v10.0.0). Before instar applied them, the second shape read the data
+# file at the entry's offset and returned the wrong bytes under success.
+#
+# The first two cases remove one rule each, caught through the chain
+# reader by a test that reads every entry shape the rule covers through
+# both arms. The third removes the rules' deference to the invalid-entry
+# refusal, which qemu reaches first. The fourth removes the reader's
+# refusal arm, so a refused entry reads as success over a buffer nothing
+# wrote. The fifth and sixth remove the rule from the classic measure
+# walk and the extended map walk, which qemu-img map and measure fail on
+# too. The last two are the host's half: the decoder no longer captures
+# the refusal, or the run loops no longer see it, and either way the
+# reason falls back to the generic failure text.
+rust_case 'qcow2-data-file-compressed-entry-read' "${QCOW2_LIB}" \
+    '        SubclusterType::Compressed => Some(DataFileEntryViolation::Compressed),' \
+    '        SubclusterType::Compressed => None, // MUTATED' \
+    qcow2 'sc_data_file_compressed_entry_is_refused_by_name' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'qcow2-data-file-host-offset-not-checked' "${QCOW2_LIB}" \
+    '            && l2_entry & L2_OFFSET_MASK != guest_cluster_offset =>' \
+    '            && false => // MUTATED' \
+    qcow2 'sc_data_file_host_offset_that_is_not_the_guest_offset_is_refused' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'qcow2-data-file-rules-before-invalid' "${QCOW2_LIB}" \
+    '        SubclusterType::Invalid => None,
+        SubclusterType::Compressed => Some(DataFileEntryViolation::Compressed),' \
+    '        SubclusterType::Compressed => Some(DataFileEntryViolation::Compressed), // MUTATED' \
+    qcow2 'sc_data_file_invalid_entry_is_refused_as_invalid_first' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'qcow2-data-file-entry-not-refused' "${QCOW2_LIB}" \
+    '                        send_data_file_entry_refusal(
+                            call_table,
+                            virtual_offset - virtual_offset % qcow2_cluster_size,
+                            violation,
+                        );
+                        return false;' \
+    '                        let _ = violation;
+                        return true; // MUTATED: the refusal removed' \
+    qcow2 'sc_data_file_host_offset_that_is_not_the_guest_offset_is_refused' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'qcow2-data-file-measure-walk-unchecked' "${QCOW2_LIB}" \
+    '        RefusedL2Entry::check_data_file(entry, 0, false, has_data_file, v)?;' \
+    '        // MUTATED: the data-file rules removed' \
+    qcow2 'metadata_walks_refuse_data_file_entries_as_qemu_does' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'qcow2-data-file-map-walk-unchecked' "${QCOW2_LIB}" \
+    '    RefusedL2Entry::check_data_file(l2_entry, sc_bitmap, true, has_data_file, virtual_offset)?;' \
+    '    // MUTATED: the data-file rules removed' \
+    qcow2 'metadata_walks_refuse_data_file_entries_as_qemu_does' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'vmm-data-file-refusal-not-captured' "${VMM_MAIN_LIB}" \
+    '                    self.last_data_file_entry = Some((err.sector, err.status));' \
+    '                    // MUTATED: the refusal not captured' \
+    instar 'add_byte_captures_the_data_file_entry_refusal'
+
+rust_case 'vmm-data-file-refusal-not-rendered' "${VMM_MAIN_LIB}" \
+    '        self.last_invalid_l2_entry.is_some() || self.last_data_file_entry.is_some()' \
+    '        self.last_invalid_l2_entry.is_some() // MUTATED' \
+    instar 'data_file_entry_error_names_qemu_wording_for_each_rule'
 
 # ---------------------------------------------------------------------
 # Two chains in one device array, which is `compare` alone.

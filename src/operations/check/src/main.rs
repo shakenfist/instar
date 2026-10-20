@@ -2859,6 +2859,28 @@ unsafe fn check_qcow2(
 
                     result.clusters_checked += 1;
 
+                    let compressed = (l2e & qcow2::OFLAG_COMPRESSED) != 0;
+
+                    // A data-file image has no compressed clusters.
+                    // qemu-img check reports "ERROR compressed cluster N
+                    // with data file" as a corruption and goes no further
+                    // with the entry: no bitmap check, no refcount, not
+                    // counted as allocated (block/qcow2-refcount.c:1714-1718
+                    // at qemu v10.0.0). Its read path refuses the entry
+                    // too, and so does instar's (#803). qemu's check does
+                    // not apply the read path's other data-file rule, a
+                    // host offset that differs from the guest offset, and
+                    // nor does this.
+                    if compressed && has_external_data {
+                        uses_compression = true;
+                        result.corruptions += 1;
+                        result.total_errors += 1;
+                        (call_table.debug_print)(
+                            b"check: compressed cluster with data file\n\0".as_ptr(),
+                        );
+                        continue;
+                    }
+
                     // Validate the extended-L2 subcluster bitmap,
                     // including an entry of 0, whose bitmap can still
                     // hold zero bits (zero-plain) or, corruptly, alloc
@@ -2893,7 +2915,6 @@ unsafe fn check_qcow2(
                         continue;
                     }
 
-                    let compressed = (l2e & qcow2::OFLAG_COMPRESSED) != 0;
                     if compressed {
                         // Signal the all-tier gate to refuse this image
                         // (the bmp-as-count identity and the COPIED rule

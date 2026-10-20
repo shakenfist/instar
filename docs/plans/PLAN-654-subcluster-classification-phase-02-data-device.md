@@ -432,3 +432,25 @@ rule), and convert for both.
   all match qemu, and `data_file_mid_chain` fails closed as #806
   predicts. The definition-of-done grep now excludes `docs/plans`,
   because this plan quotes the phrase it greps for.
+* Step 2b's fix turned the twelve #792 entries in
+  `EXPECTED_FAILURES` into unexpected successes, which fail the run, so
+  the step 2b commit as first made did not pass its own integration
+  module. The management session folded the removal of `_ISSUE_792`
+  into that commit before anything was pushed. Step 2d's first item is
+  therefore already done.
+* Step 2c widened the host-offset rule to match qemu. `qcow2_get_host_offset`
+  (`block/qcow2-cluster.c:682-705` at v10.0.0) applies it to `ZERO_ALLOC`
+  and `UNALLOCATED_ALLOC` entries too, not only `NORMAL`, so instar now
+  refuses those as well. The crate harness's data-file host clusters
+  had moved off their guest offsets, a shape qemu refuses, so they now
+  sit at the guest offsets, and nine expectations moved with them.
+  instar's message leaves out the host offset, which qemu prints,
+  because the refusal carries only the virtual offset. qemu's separate
+  unaligned-offset rule (`:687-695`) applies to every image, not only
+  data-file ones. instar has no named refusal for it, but the
+  management session measured that it fails closed: a 512-byte
+  misaligned entry makes `convert` exit 1 with the generic message, as
+  qemu fails with `EIO`. check's compressed-with-data-file rule has no
+  mutation case, because it lives in a guest operation; the integration
+  module's check test covers it.
+

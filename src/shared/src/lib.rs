@@ -3225,6 +3225,58 @@ impl InvalidL2EntryRefusal {
 }
 
 // ============================================================================
+// qcow2 data-file L2 entry refusal signal
+// ============================================================================
+
+/// The `send_error` channel used to report that a qcow2 read or metadata
+/// walk refused an L2 entry of an image with an external data file
+/// because it breaks one of the two rules qemu's read path applies to
+/// such images (#803). Both are in `qcow2_get_host_offset`
+/// (`block/qcow2-cluster.c:666-705` at qemu v10.0.0), after the entry
+/// has classified as valid:
+///
+/// * a compressed entry: a data-file image has no compressed clusters,
+///   and qemu fails with "Compressed cluster entry found in image with
+///   external data file" (`:668-675`);
+/// * a host cluster offset that differs from the guest cluster offset:
+///   qemu maps a data file one to one, and fails with "External data
+///   file host cluster offset ... does not match guest cluster offset"
+///   (`:696-704`). Without the rule, instar read the data file at the
+///   entry's offset and returned the wrong bytes under success.
+///
+/// It travels as [`InvalidL2EntryRefusal`] does: the guest calls
+/// `send_error(operation, device, sector, status)` with
+/// [`DataFileEntryRefusal::OPERATION`] as the operation string, and the
+/// host's `SerialDecoder` captures it and renders it in place of the
+/// generic failure text.
+///
+/// The `sector` argument carries the **virtual byte offset of the
+/// cluster** whose entry was refused (qemu's "guest cluster offset"),
+/// not a sector number. `status` carries which rule the entry breaks,
+/// one of the `STATUS_*` constants.
+pub struct DataFileEntryRefusal;
+
+impl DataFileEntryRefusal {
+    /// Reserved `send_error` operation marker for this signal. Distinct
+    /// from every real operation name, from `"cpu-exception"`, from
+    /// [`DifferencingRefusal::OPERATION`] and from
+    /// [`InvalidL2EntryRefusal::OPERATION`], so the host's decoder can
+    /// tell the `send_error` uses apart.
+    pub const OPERATION: &'static str = "qcow2-data-file-entry";
+
+    /// The same marker as [`Self::OPERATION`], NUL-terminated, for the
+    /// call table's `send_error`. `data_file_entry_marker_c_string_matches_operation`
+    /// asserts the two spellings agree.
+    pub const OPERATION_C: &'static [u8] = b"qcow2-data-file-entry\0";
+
+    // Status codes are stable: only appended, never reordered.
+    /// A compressed entry in an image with an external data file.
+    pub const STATUS_COMPRESSED: u32 = 1;
+    /// A host cluster offset that is not the guest cluster offset.
+    pub const STATUS_HOST_OFFSET_MISMATCH: u32 = 2;
+}
+
+// ============================================================================
 // Snapshot configuration and result structures
 // ============================================================================
 
@@ -6686,6 +6738,46 @@ mod tests {
             !InvalidL2EntryRefusal::OPERATION.as_bytes().contains(&0),
             "OPERATION must not embed a NUL, or the C marker truncates it"
         );
+    }
+
+    #[test]
+    fn data_file_entry_operation_marker_is_distinct_from_the_other_senders() {
+        assert_eq!(DataFileEntryRefusal::OPERATION, "qcow2-data-file-entry");
+        for other in [
+            "cpu-exception",
+            DifferencingRefusal::OPERATION,
+            InvalidL2EntryRefusal::OPERATION,
+        ] {
+            assert_ne!(DataFileEntryRefusal::OPERATION, other);
+        }
+    }
+
+    #[test]
+    fn data_file_entry_marker_c_string_matches_operation() {
+        // As for the invalid-entry marker: a drift between the two
+        // spellings raises a refusal the host never captures.
+        let c = DataFileEntryRefusal::OPERATION_C;
+        assert_eq!(
+            c.last().copied(),
+            Some(0),
+            "the C marker must be NUL-terminated"
+        );
+        assert_eq!(
+            &c[..c.len() - 1],
+            DataFileEntryRefusal::OPERATION.as_bytes(),
+            "the C marker must spell the same operation as OPERATION"
+        );
+        assert!(
+            !DataFileEntryRefusal::OPERATION.as_bytes().contains(&0),
+            "OPERATION must not embed a NUL, or the C marker truncates it"
+        );
+    }
+
+    #[test]
+    fn data_file_entry_status_codes_are_stable_and_distinct() {
+        // Pinned: appended only, never reordered.
+        assert_eq!(DataFileEntryRefusal::STATUS_COMPRESSED, 1);
+        assert_eq!(DataFileEntryRefusal::STATUS_HOST_OFFSET_MISMATCH, 2);
     }
 
     #[test]

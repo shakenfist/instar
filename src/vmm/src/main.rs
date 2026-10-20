@@ -810,6 +810,13 @@ struct SerialDecoder {
     /// travels on `send_error` and the tail of the run loop renders it
     /// instead of the generic failure text.
     last_invalid_l2_entry: Option<u64>,
+    /// The last qcow2 L2 entry the guest refused because the image has an
+    /// external data file and the entry breaks one of qemu's rules for
+    /// one (#803), as `(guest cluster offset, status)`: the `sector` and
+    /// `status` fields of an `error` message whose `operation` is
+    /// `shared::DataFileEntryRefusal::OPERATION`. Same pattern as
+    /// `last_invalid_l2_entry`, and rendered wherever that is.
+    last_data_file_entry: Option<(u64, u32)>,
 }
 
 /// Maximum serial decoder buffer size: frame header + max protobuf message
@@ -823,6 +830,58 @@ impl SerialDecoder {
             last_cpu_exception: None,
             last_differencing_refusal: None,
             last_invalid_l2_entry: None,
+            last_data_file_entry: None,
+        }
+    }
+
+    /// Whether the guest refused a qcow2 L2 entry by name, either as an
+    /// invalid entry or under a data-file rule. A run loop that saw one
+    /// renders [`Self::l2_entry_refusal_error`] instead of its own
+    /// result or failure text.
+    fn l2_entry_refused(&self) -> bool {
+        self.last_invalid_l2_entry.is_some() || self.last_data_file_entry.is_some()
+    }
+
+    /// The terminal error for a read or metadata walk the guest ended by
+    /// refusing a qcow2 L2 entry: [`Self::data_file_entry_error`] or
+    /// [`Self::invalid_l2_entry_error`], whichever the decoder captured.
+    /// The two are kept behind one entry point so that an operation that
+    /// renders one cannot forget the other (#665 was a refusal raised
+    /// with no renderer).
+    fn l2_entry_refusal_error(&self, op: &str) -> String {
+        if self.last_data_file_entry.is_some() {
+            self.data_file_entry_error(op)
+        } else {
+            self.invalid_l2_entry_error(op)
+        }
+    }
+
+    /// Format the terminal error for a read the guest refused because a
+    /// data-file image's L2 entry breaks one of qemu's rules for such
+    /// images (#803). Sibling to [`Self::invalid_l2_entry_error`].
+    ///
+    /// The wording is qemu's (`block/qcow2-cluster.c:670-673` and
+    /// `:698-702` at v10.0.0), so a user who has seen `qemu-img` refuse
+    /// the image can recognise the same refusal here. qemu's offset
+    /// message also prints the entry's host offset, which the refusal
+    /// does not carry; the guest cluster offset it names is the virtual
+    /// offset given here.
+    fn data_file_entry_error(&self, op: &str) -> String {
+        match self.last_data_file_entry {
+            Some((offset, status)) => {
+                let what = match status {
+                    shared::DataFileEntryRefusal::STATUS_COMPRESSED => {
+                        "Compressed cluster entry found in image with external data file"
+                    }
+                    shared::DataFileEntryRefusal::STATUS_HOST_OFFSET_MISMATCH => {
+                        "External data file host cluster offset does not match guest cluster \
+                         offset"
+                    }
+                    _ => "corrupt qcow2 L2 entry in image with external data file",
+                };
+                format!("{op}: {what} at virtual offset {offset} ({offset:#x})")
+            }
+            None => format!("{op}: guest did not return a result"),
         }
     }
 
@@ -961,6 +1020,10 @@ impl SerialDecoder {
                 } else if err.operation == shared::InvalidL2EntryRefusal::OPERATION {
                     // `sector` is the virtual byte offset of the refused read.
                     self.last_invalid_l2_entry = Some(err.sector);
+                } else if err.operation == shared::DataFileEntryRefusal::OPERATION {
+                    // `sector` is the refused cluster's virtual byte offset,
+                    // `status` the rule its entry breaks.
+                    self.last_data_file_entry = Some((err.sector, err.status));
                 }
             }
             return Some(msg);
@@ -1132,6 +1195,83 @@ mod guest_exception_tests {
         }
         assert_eq!(decoded, 1);
         assert_eq!(decoder.last_invalid_l2_entry, Some(196608));
+        assert_eq!(decoder.last_differencing_refusal, None);
+        assert_eq!(decoder.last_cpu_exception, None);
+    }
+
+    #[test]
+    fn data_file_entry_error_names_qemu_wording_for_each_rule() {
+        // qemu's wording, block/qcow2-cluster.c:670-673 and :698-702 at
+        // v10.0.0, for each status the guest raises (#803).
+        for (status, words) in [
+            (
+                shared::DataFileEntryRefusal::STATUS_COMPRESSED,
+                "Compressed cluster entry found in image with external data file",
+            ),
+            (
+                shared::DataFileEntryRefusal::STATUS_HOST_OFFSET_MISMATCH,
+                "External data file host cluster offset does not match guest cluster offset",
+            ),
+        ] {
+            let mut decoder = super::SerialDecoder::new();
+            decoder.last_data_file_entry = Some((65536, status));
+            assert!(decoder.l2_entry_refused());
+            for op in [
+                "convert", "dd", "compare", "bench", "rebase", "map", "measure",
+            ] {
+                let msg = decoder.l2_entry_refusal_error(op);
+                assert_eq!(
+                    msg,
+                    format!("{op}: {words} at virtual offset 65536 (0x10000)")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn l2_entry_refusal_error_renders_whichever_refusal_was_captured() {
+        let mut decoder = super::SerialDecoder::new();
+        assert!(!decoder.l2_entry_refused());
+        assert_eq!(
+            decoder.l2_entry_refusal_error("map"),
+            "map: guest did not return a result"
+        );
+        decoder.last_invalid_l2_entry = Some(0);
+        assert!(decoder.l2_entry_refused());
+        assert!(decoder
+            .l2_entry_refusal_error("map")
+            .contains("Invalid cluster entry found"));
+    }
+
+    #[test]
+    fn add_byte_captures_the_data_file_entry_refusal() {
+        // The guest raises the refusal with the marker as the operation,
+        // the cluster's virtual offset as the sector and the rule as the
+        // status; the decoder must capture exactly that and nothing else.
+        let msg = guest_protocol::error_message(
+            shared::DataFileEntryRefusal::OPERATION,
+            "input",
+            131072,
+            shared::DataFileEntryRefusal::STATUS_HOST_OFFSET_MISMATCH,
+        );
+        let mut framed = [0u8; 256];
+        let n = guest_protocol::encode_framed(&msg, &mut framed).expect("encode");
+        let mut decoder = super::SerialDecoder::new();
+        let mut decoded = 0;
+        for &b in &framed[..n] {
+            if decoder.add_byte(b).is_some() {
+                decoded += 1;
+            }
+        }
+        assert_eq!(decoded, 1);
+        assert_eq!(
+            decoder.last_data_file_entry,
+            Some((
+                131072,
+                shared::DataFileEntryRefusal::STATUS_HOST_OFFSET_MISMATCH
+            ))
+        );
+        assert_eq!(decoder.last_invalid_l2_entry, None);
         assert_eq!(decoder.last_differencing_refusal, None);
         assert_eq!(decoder.last_cpu_exception, None);
     }
@@ -1553,6 +1693,14 @@ fn format_message(msg: &guest_::GuestMessage) -> String {
                 // device whose L2 table holds the entry.
                 format!(
                     "error op={} device={} virtual_offset={} chain_device={}",
+                    err.operation, err.device, err.sector, err.status
+                )
+            } else if err.operation == shared::DataFileEntryRefusal::OPERATION {
+                // A data-file image's L2 entry broke one of qemu's rules
+                // for such images: sector is the cluster's virtual byte
+                // offset, status the rule.
+                format!(
+                    "error op={} device={} virtual_offset={} rule={}",
                     err.operation, err.device, err.sector, err.status
                 )
             } else {
@@ -6117,8 +6265,8 @@ fn run_bench_guest(
     }
     // A corrupt qcow2 L2 entry is refused inside the chain reader, which
     // bench then reports as a failed request. Prefer the captured reason.
-    if serial_decoder.last_invalid_l2_entry.is_some() {
-        return Err(serial_decoder.invalid_l2_entry_error("bench").into());
+    if serial_decoder.l2_entry_refused() {
+        return Err(serial_decoder.l2_entry_refusal_error("bench").into());
     }
     if !result_seen {
         return Err(serial_decoder.no_result_error("bench").into());
@@ -10953,8 +11101,8 @@ fn run_rebase_guest(
     // A corrupt qcow2 L2 entry in the old chain is refused inside the
     // chain reader. Prefer the captured reason, matching convert, dd,
     // compare and bench.
-    if serial_decoder.last_invalid_l2_entry.is_some() {
-        return Err(serial_decoder.invalid_l2_entry_error("rebase").into());
+    if serial_decoder.l2_entry_refused() {
+        return Err(serial_decoder.l2_entry_refusal_error("rebase").into());
     }
     if !result_seen {
         return Err(serial_decoder.no_result_error("rebase").into());
@@ -13538,7 +13686,7 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
                                 // does the same. The tail renders the
                                 // captured reason instead.
                                 if serial_decoder.last_differencing_refusal.is_none()
-                                    && serial_decoder.last_invalid_l2_entry.is_none()
+                                    && !serial_decoder.l2_entry_refused()
                                 {
                                     print_compare_result(&msg, &args.output, args.strict);
                                 }
@@ -13639,8 +13787,8 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     }
     // Likewise for a corrupt qcow2 L2 entry refused inside the chain
     // reader: the guest's result for a failed read is not a comparison.
-    if serial_decoder.last_invalid_l2_entry.is_some() {
-        return Err(serial_decoder.invalid_l2_entry_error("compare").into());
+    if serial_decoder.l2_entry_refused() {
+        return Err(serial_decoder.l2_entry_refusal_error("compare").into());
     }
 
     // Return error if no result was received
@@ -14720,13 +14868,13 @@ fn execute_convert(
         // part-way through the output. The output is left as it stands,
         // as qemu-img convert leaves its own after "Invalid cluster
         // entry found"; only the reason is rendered by name.
-        if serial_decoder.last_invalid_l2_entry.is_some() {
+        if serial_decoder.l2_entry_refused() {
             let op = if exec.window.is_some() {
                 "dd"
             } else {
                 "convert"
             };
-            return Err(serial_decoder.invalid_l2_entry_error(op).into());
+            return Err(serial_decoder.l2_entry_refusal_error(op).into());
         }
         return Err("convert operation failed".into());
     }
@@ -16027,7 +16175,7 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
                                 // Likewise a corrupt qcow2 L2 entry refused
                                 // by the allocation scan.
                                 if serial_decoder.last_differencing_refusal.is_none()
-                                    && serial_decoder.last_invalid_l2_entry.is_none()
+                                    && !serial_decoder.l2_entry_refused()
                                 {
                                     print_measure_result(
                                         &msg,
@@ -16132,8 +16280,8 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     // A corrupt qcow2 L2 entry is refused inside the allocation scan,
     // which then reports the generic "unsupported format". Prefer the
     // captured reason, which is qemu's.
-    if serial_decoder.last_invalid_l2_entry.is_some() {
-        return Err(serial_decoder.invalid_l2_entry_error("measure").into());
+    if serial_decoder.l2_entry_refused() {
+        return Err(serial_decoder.l2_entry_refusal_error("measure").into());
     }
 
     if !measure_result_seen {
@@ -16545,8 +16693,8 @@ fn run_map(args: MapArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error
     // then reports the generic I/O failure. Prefer the captured reason,
     // which is qemu's; as on any other failure, the extents before it
     // stay on stdout.
-    if serial_decoder.last_invalid_l2_entry.is_some() {
-        return Err(serial_decoder.invalid_l2_entry_error("map").into());
+    if serial_decoder.l2_entry_refused() {
+        return Err(serial_decoder.l2_entry_refusal_error("map").into());
     }
 
     let result = map_result.ok_or_else(|| "map: guest returned no MapResult".to_string())?;

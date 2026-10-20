@@ -660,18 +660,9 @@ _BUILDER_LIST = [
            ops=[('write', 0xab, 0, 1024)]),
     _shape('issue_653_32k', 'As issue_653_backing at 32K clusters.', [INVALID], cluster_size=32768, backing=True,
            ops=[('write', 0x77, 32768, 32768)], patches=[(0, QCOW_OFLAG_COPIED, L2_BITMAP_ALL_ALLOC)]),
-]
 
-#: Every fixture whose ownership follows from qemu's subcluster
-#: classification, keyed by name. Each value takes a target directory and
-#: returns a SubclusterFixture.
-BUILDERS: Dict[str, Callable[[Path], SubclusterFixture]] = dict(_BUILDER_LIST)
-
-#: Shapes that classify as valid but that qemu's read path still refuses
-#: (block/qcow2-cluster.c:668-705). They are kept apart from BUILDERS because
-#: the refusal comes from qemu's host-offset checks, not from its
-#: classification.
-HOST_OFFSET_REFUSAL_BUILDERS: Dict[str, Callable[[Path], SubclusterFixture]] = dict([
+    # Shapes that classify as valid but that qemu's read path still refuses
+    # through its data-file rules (block/qcow2-cluster.c:668-705, #803).
     _shape('data_file_compressed', 'Extended L2 with a data file; cluster 0 written, then its entry patched to '
            'a compressed descriptor: qemu refuses compressed clusters with a data file.',
            [COMPRESSED], data_file=True, ops=[('write', 0xab, 0, _K64)],
@@ -679,7 +670,12 @@ HOST_OFFSET_REFUSAL_BUILDERS: Dict[str, Callable[[Path], SubclusterFixture]] = d
     _shape('data_file_offset_mismatch', 'Extended L2 with a data file; cluster 1 written, then its host offset '
            'moved one cluster on: qemu refuses a data-file host offset that differs from the guest offset.',
            [NORMAL], data_file=True, ops=[('write', 0xab, _K64, _K64)], patch_fn=_move_host_offset(1, _K64)),
-])
+]
+
+#: Every fixture whose ownership follows from qemu's subcluster
+#: classification and read path, keyed by name. Each value takes a target
+#: directory and returns a SubclusterFixture.
+BUILDERS: Dict[str, Callable[[Path], SubclusterFixture]] = dict(_BUILDER_LIST)
 
 
 def _data_file_mid_chain(target_dir: Path) -> SubclusterFixture:
@@ -795,12 +791,9 @@ DATA_DEVICE_COMPARE_PAIRS: Dict[str, Callable[[Path], ComparePairFixture]] = {
 }
 
 
-def build_all(target_dir: Path, include_host_offset_refusals: bool = False,
-              include_data_device: bool = False) -> Dict[str, SubclusterFixture]:
+def build_all(target_dir: Path, include_data_device: bool = False) -> Dict[str, SubclusterFixture]:
     """Build every fixture into `target_dir` and return them keyed by name."""
     builders = dict(BUILDERS)
-    if include_host_offset_refusals:
-        builders.update(HOST_OFFSET_REFUSAL_BUILDERS)
     if include_data_device:
         builders.update(DATA_DEVICE_BUILDERS)
     return {name: build(Path(target_dir)) for name, build in builders.items()}

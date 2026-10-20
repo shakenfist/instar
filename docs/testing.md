@@ -2179,7 +2179,7 @@ guards. See the VHD and VHDX notes in
 [chain-config.md](chain-config.md#format-specific-notes) for the
 composing path being guarded.
 
-There are **118 cases**, in nine groups.
+There are **126 cases**, in ten groups.
 
 Twenty-seven cover the writer. Fifteen mutate a library crate
 (`create`, `vhd`, `vhdx`) and are caught by a Rust unit or round-trip
@@ -2378,7 +2378,7 @@ the buffer unwritten. Its test reads over backing files whose clusters
 are stored in reverse order on the host, so a read that runs on into
 the next host cluster cannot land on the right bytes by accident.
 
-The last group is **12 data-device cases**, guarding the fix for issue
+Then **12 data-device cases**, guarding the fix for issue
 #792. The host puts a qcow2's external data file, and a VMDK flat
 descriptor's extents, in the device slots immediately after the image
 that owns them, inside its chain segment. Before the chain config
@@ -2406,6 +2406,24 @@ writing a data device unmarked, and passing an info operation's flags
 through with the mark intact. Both are caught by a `vmm` unit test that
 reads the host's config back as the guest's own type and checks it
 against the same rule.
+
+The last group is **8 data-file entry cases**, guarding the fix for
+issue #803. qemu applies two rules to the L2 entries of an image with
+an external data file, after an entry has classified as valid: a
+compressed entry is refused, and so is a host cluster offset that is
+not the guest cluster offset, because qemu maps a data file one to one.
+Without the second rule instar read the data file at the entry's offset
+and returned the wrong bytes under success. Two cases remove one rule
+each, and each is caught through the chain reader by a test that reads
+every entry shape the rule covers through both the narrow and the wide
+arm. One removes the rules' deference to the invalid-entry refusal,
+which qemu reaches first, caught by an entry that is both invalid and
+moved. One removes the reader's refusal arm, so a refused entry reads
+as success over a buffer nothing wrote. Two remove the rule from the
+classic `measure` walk and the extended `map` walk, caught by a unit
+test of the metadata walkers. The last two are the host's half: the
+`vmm` decoder no longer captures the refusal, or the run loops no longer
+see it, and the reason falls back to the generic failure text.
 
 Most of the reader cases name a test in the `qcow2` crate and run it
 with the full input-format feature list, because the

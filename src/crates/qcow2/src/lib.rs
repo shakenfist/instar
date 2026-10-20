@@ -1422,6 +1422,14 @@ pub enum ClusterLookup {
     /// `block/qcow2-cluster.c:712-718` at v10.0.0); callers must refuse
     /// it too, not zero-fill it or read the host offset.
     Invalid,
+    /// The entry classifies as valid, but the image has an external
+    /// data file and the entry breaks one of qemu's rules for those: it
+    /// is compressed, or its host cluster offset is not the guest
+    /// cluster offset (#803). qemu fails the read with `EIO`
+    /// (`block/qcow2-cluster.c:668-675` and `:696-704` at v10.0.0);
+    /// callers must refuse it too, not inflate it from the image or read
+    /// the data file at the entry's offset.
+    DataFileRefused(DataFileEntryViolation),
 }
 
 // ============================================================================
@@ -1867,6 +1875,10 @@ impl TargetUnitTracker {
 /// counted. Last-cluster contributions are capped at
 /// `virtual_size - cluster_start` so a cluster that straddles
 /// `virtual_size` still contributes its in-bounds portion.
+///
+/// An entry inside `virtual_size` that breaks a data-file rule
+/// ([`data_file_entry_violation`]) fails the count with its virtual
+/// offset, since qemu's measure fails there too (#803).
 pub fn walk_l2_standard(
     l2_bytes: &[u8],
     cluster_size: u64,
@@ -1874,15 +1886,22 @@ pub fn walk_l2_standard(
     virtual_size: u64,
     has_data_file: bool,
     tracker: &mut TargetUnitTracker,
-) -> u64 {
+) -> Result<u64, RefusedL2Entry> {
     if cluster_size == 0 {
-        return 0;
+        return Ok(0);
     }
     let mut allocated_bytes: u64 = 0;
     for (i, chunk) in l2_bytes.chunks_exact(8).enumerate() {
         let entry = u64::from_be_bytes([
             chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
         ]);
+        let v = base_virtual_offset.saturating_add((i as u64).saturating_mul(cluster_size));
+        if v >= virtual_size {
+            // OOB: cluster starts at or past virtual_size; no
+            // guest-visible bytes here. See doc comment.
+            continue;
+        }
+        RefusedL2Entry::check_data_file(entry, 0, false, has_data_file, v)?;
         // A classic entry is never `Invalid` (block/qcow2.h:781-796).
         if !matches!(
             subcluster_type(entry, 0, 0, false, has_data_file),
@@ -1890,28 +1909,136 @@ pub fn walk_l2_standard(
         ) {
             continue;
         }
-        let v = base_virtual_offset.saturating_add((i as u64).saturating_mul(cluster_size));
-        if v >= virtual_size {
-            // OOB: cluster starts at or past virtual_size; no
-            // guest-visible bytes here. See doc comment.
-            continue;
-        }
         let cluster_contrib = cluster_size.min(virtual_size - v);
         allocated_bytes = allocated_bytes.saturating_add(cluster_contrib);
         tracker.observe_allocated(v, cluster_contrib);
     }
-    allocated_bytes
+    Ok(allocated_bytes)
 }
 
-/// An L2 entry that [`subcluster_type`] classifies as `Invalid`, found
-/// by a metadata walk (measure, map) at this virtual offset. qemu fails
-/// the same walk with `EIO` ("Invalid cluster entry found"), so the
-/// walkers stop and the caller refuses the image rather than measuring
-/// or mapping it.
+/// Which of qemu's two rules for the L2 entries of an image with an
+/// external data file an entry breaks (#803). Both are in
+/// `qcow2_get_host_offset` (`block/qcow2-cluster.c:666-705` at qemu
+/// v10.0.0), which applies them to an entry that has already classified
+/// as valid; see [`data_file_entry_violation`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InvalidL2Entry {
-    /// Virtual byte offset of the cluster the entry describes.
-    pub virtual_offset: u64,
+pub enum DataFileEntryViolation {
+    /// A compressed entry: "Compressed cluster entry found in image with
+    /// external data file" (`:668-675`).
+    Compressed,
+    /// A host cluster offset that is not the guest cluster offset:
+    /// "External data file host cluster offset ... does not match guest
+    /// cluster offset" (`:696-704`).
+    HostOffsetMismatch,
+}
+
+impl DataFileEntryViolation {
+    /// The [`shared::DataFileEntryRefusal`] status code that names this
+    /// rule to the host.
+    pub fn status(self) -> u32 {
+        match self {
+            Self::Compressed => shared::DataFileEntryRefusal::STATUS_COMPRESSED,
+            Self::HostOffsetMismatch => shared::DataFileEntryRefusal::STATUS_HOST_OFFSET_MISMATCH,
+        }
+    }
+}
+
+/// Whether the L2 entry of the cluster at `guest_cluster_offset` breaks
+/// one of qemu's data-file rules, and which.
+///
+/// Transcribes the checks in `qcow2_get_host_offset`
+/// (`block/qcow2-cluster.c:665-705` at qemu v10.0.0). Without
+/// `has_data_file` nothing is a violation. With it:
+///
+/// * a `Compressed` entry is refused (`:668-675`): a data-file image has
+///   no compressed clusters, and its compressed bytes would have to come
+///   from the metadata file;
+/// * an entry that names a host cluster, which is every `Normal`,
+///   `ZeroAlloc` or `UnallocatedAlloc` subcluster type (`:682-705`), is
+///   refused when its host cluster offset is not `guest_cluster_offset`:
+///   qemu maps a data file one to one. This includes `QCOW_OFLAG_COPIED`
+///   at host offset 0, which is valid only for the cluster at guest
+///   offset 0. The rule covers the zero and unallocated types too,
+///   because qemu applies it before it decides whether to read.
+///
+/// An `Invalid` entry is not a violation here: qemu reaches its own
+/// refusal for that first (`:666-667`, then `:712-718`), and so does
+/// instar, through [`subcluster_type`]. The plain types carry no host
+/// cluster and break neither rule.
+///
+/// qemu refuses an unaligned host cluster offset before it compares
+/// offsets (`:687-695`). instar has no separate unaligned rule, so in a
+/// data-file image such an offset is refused as a mismatch, since it
+/// cannot equal a cluster-aligned guest offset.
+pub fn data_file_entry_violation(
+    l2_entry: u64,
+    bitmap: u64,
+    extended_l2: bool,
+    has_data_file: bool,
+    guest_cluster_offset: u64,
+) -> Option<DataFileEntryViolation> {
+    if !has_data_file {
+        return None;
+    }
+    match subcluster_type(l2_entry, bitmap, 0, extended_l2, true) {
+        SubclusterType::Invalid => None,
+        SubclusterType::Compressed => Some(DataFileEntryViolation::Compressed),
+        _ if l2_entry_names_host_cluster(l2_entry, extended_l2, true)
+            && l2_entry & L2_OFFSET_MASK != guest_cluster_offset =>
+        {
+            Some(DataFileEntryViolation::HostOffsetMismatch)
+        }
+        _ => None,
+    }
+}
+
+/// An L2 entry a metadata walk (measure, map) refuses, and the virtual
+/// offset of the cluster it describes. qemu fails the same walk with
+/// `EIO`, so the walkers stop and the caller refuses the image rather
+/// than measuring or mapping it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefusedL2Entry {
+    /// [`subcluster_type`] classifies the entry `Invalid`: qemu's
+    /// "Invalid cluster entry found". Raised as
+    /// [`shared::InvalidL2EntryRefusal`].
+    Invalid {
+        /// Virtual byte offset of the cluster the entry describes.
+        virtual_offset: u64,
+    },
+    /// The entry breaks a data-file rule (#803); see
+    /// [`data_file_entry_violation`]. Raised as
+    /// [`shared::DataFileEntryRefusal`].
+    DataFile {
+        /// Virtual byte offset of the cluster the entry describes.
+        virtual_offset: u64,
+        violation: DataFileEntryViolation,
+    },
+}
+
+impl RefusedL2Entry {
+    /// `Err` with the data-file refusal of the cluster at
+    /// `guest_cluster_offset` if its entry breaks a data-file rule.
+    fn check_data_file(
+        l2_entry: u64,
+        bitmap: u64,
+        extended_l2: bool,
+        has_data_file: bool,
+        guest_cluster_offset: u64,
+    ) -> Result<(), RefusedL2Entry> {
+        match data_file_entry_violation(
+            l2_entry,
+            bitmap,
+            extended_l2,
+            has_data_file,
+            guest_cluster_offset,
+        ) {
+            Some(violation) => Err(RefusedL2Entry::DataFile {
+                virtual_offset: guest_cluster_offset,
+                violation,
+            }),
+            None => Ok(()),
+        }
+    }
 }
 
 /// Count the source bytes `qemu-img measure` counts in an extended-L2
@@ -1929,8 +2056,9 @@ pub struct InvalidL2Entry {
 /// [`walk_l2_standard`] does, so measure counts the target clusters
 /// that qemu's measure rounds every data run up to (`:5197-5201`).
 ///
-/// An `Invalid` entry inside `virtual_size` fails the count with its
-/// virtual offset, since qemu's measure fails there too.
+/// An `Invalid` entry inside `virtual_size`, or one that breaks a
+/// data-file rule ([`data_file_entry_violation`], #803), fails the count
+/// with its virtual offset, since qemu's measure fails there too.
 ///
 /// `l2_bytes` may have a trailing partial entry; incomplete 16-byte
 /// pairs at the tail are ignored. `cluster_size == 0` defensively
@@ -1947,7 +2075,7 @@ pub fn count_allocated_in_l2_extended(
     virtual_size: u64,
     has_data_file: bool,
     tracker: &mut TargetUnitTracker,
-) -> Result<u64, InvalidL2Entry> {
+) -> Result<u64, RefusedL2Entry> {
     if cluster_size == 0 {
         return Ok(0);
     }
@@ -1969,13 +2097,14 @@ pub fn count_allocated_in_l2_extended(
             continue;
         }
         let cluster_cap = cluster_size.min(virtual_size - cluster_start);
+        RefusedL2Entry::check_data_file(l2_entry, sc_bitmap, true, has_data_file, cluster_start)?;
 
         let mut sc: u32 = 0;
         while sc < QCOW_EXTL2_SUBCLUSTERS_PER_CLUSTER {
             let (ty, run) = subcluster_range(l2_entry, sc_bitmap, sc, true, has_data_file);
             let counted_run = match ty {
                 SubclusterType::Invalid => {
-                    return Err(InvalidL2Entry {
+                    return Err(RefusedL2Entry::Invalid {
                         virtual_offset: cluster_start,
                     });
                 }
@@ -2049,19 +2178,24 @@ fn map_state_for(ty: SubclusterType, host_offset: u64) -> Option<MapExtentState>
 /// virtual address of the cluster's first byte; the caller is
 /// responsible for clamping `length` against virtual_size if the
 /// cluster straddles end-of-image.
+///
+/// `Err` if the entry breaks a data-file rule
+/// ([`data_file_entry_violation`]), which `qemu-img map` fails on with
+/// `EIO` (#803).
 pub fn classify_qcow2_l2_standard(
     entry: u64,
     virtual_offset: u64,
     cluster_size: u64,
     has_data_file: bool,
-) -> MapExtent {
+) -> Result<MapExtent, RefusedL2Entry> {
+    RefusedL2Entry::check_data_file(entry, 0, false, has_data_file, virtual_offset)?;
     let ty = subcluster_type(entry, 0, 0, false, has_data_file);
-    MapExtent {
+    Ok(MapExtent {
         start: virtual_offset,
         length: cluster_size,
         // A classic entry is never `Invalid` (block/qcow2.h:781-796).
         state: map_state_for(ty, entry & L2_OFFSET_MASK).unwrap_or(MapExtentState::Hole),
-    }
+    })
 }
 
 /// Classify one extended-L2 entry by pushing one `MapExtent` per run of
@@ -2079,8 +2213,9 @@ pub fn classify_qcow2_l2_standard(
 /// The caller is responsible for clamping `cluster_length` to
 /// virtual_size if the cluster straddles end-of-image. Returns
 /// `Ok(false)` if the coalescer signalled abort, and `Err` if the entry
-/// is `Invalid`, which `qemu-img map` fails on with `EIO`; nothing is
-/// pushed for an invalid entry.
+/// is `Invalid` or breaks a data-file rule ([`data_file_entry_violation`],
+/// #803), both of which `qemu-img map` fails on with `EIO`; nothing is
+/// pushed for a refused entry.
 pub fn classify_qcow2_l2_extended<F: FnMut(MapExtent) -> bool>(
     l2_entry: u64,
     sc_bitmap: u64,
@@ -2089,7 +2224,7 @@ pub fn classify_qcow2_l2_extended<F: FnMut(MapExtent) -> bool>(
     cluster_length: u64,
     has_data_file: bool,
     sink: &mut MapExtentCoalescer<'_, F>,
-) -> Result<bool, InvalidL2Entry> {
+) -> Result<bool, RefusedL2Entry> {
     if cluster_size == 0 || cluster_length == 0 {
         return Ok(true);
     }
@@ -2097,6 +2232,7 @@ pub fn classify_qcow2_l2_extended<F: FnMut(MapExtent) -> bool>(
     if subcluster_size == 0 {
         return Ok(true);
     }
+    RefusedL2Entry::check_data_file(l2_entry, sc_bitmap, true, has_data_file, virtual_offset)?;
     let host_offset = l2_entry & L2_OFFSET_MASK;
 
     let mut sc: u32 = 0;
@@ -2104,7 +2240,7 @@ pub fn classify_qcow2_l2_extended<F: FnMut(MapExtent) -> bool>(
         let (ty, run) = subcluster_range(l2_entry, sc_bitmap, sc, true, has_data_file);
         let run_start = (sc as u64).saturating_mul(subcluster_size);
         let Some(state) = map_state_for(ty, host_offset.saturating_add(run_start)) else {
-            return Err(InvalidL2Entry { virtual_offset });
+            return Err(RefusedL2Entry::Invalid { virtual_offset });
         };
         // Clamp the run against the cluster's remaining length so it
         // never exceeds the cluster's effective span (caller-supplied
@@ -2422,8 +2558,9 @@ impl Qcow2State {
     /// Look up the host cluster for a given virtual offset.
     ///
     /// Returns the cluster's [`ClusterLookup`] verdict, classified by
-    /// [`subcluster_type`] with the image's external-data-file flag, or
-    /// `None` on I/O error (including a failed subcluster bitmap read).
+    /// [`subcluster_type`] with the image's external-data-file flag and
+    /// checked against the data-file rules ([`data_file_entry_violation`]),
+    /// or `None` on I/O error (including a failed subcluster bitmap read).
     ///
     /// # Safety
     ///
@@ -2507,7 +2644,11 @@ impl Qcow2State {
             0
         };
 
-        Some(self.classify_l2_entry(l2_entry, bitmap))
+        Some(self.classify_l2_entry(
+            l2_entry,
+            bitmap,
+            virtual_offset - virtual_offset % cluster_size,
+        ))
     }
 
     /// Whether the header sets `INCOMPAT_EXTERNAL_DATA`, which makes
@@ -2521,9 +2662,29 @@ impl Qcow2State {
     /// [`subcluster_range`]. The cluster has one type when the run that
     /// starts at subcluster 0 covers it; otherwise it is mixed and the
     /// caller classifies each subcluster itself.
-    fn classify_l2_entry(&self, l2_entry: u64, bitmap: u64) -> ClusterLookup {
+    ///
+    /// `guest_cluster_offset` is the virtual offset of the cluster the
+    /// entry describes. A valid entry that breaks a data-file rule is
+    /// `DataFileRefused` whatever its subcluster types, because qemu
+    /// checks the rules before it decides how to read any of them.
+    fn classify_l2_entry(
+        &self,
+        l2_entry: u64,
+        bitmap: u64,
+        guest_cluster_offset: u64,
+    ) -> ClusterLookup {
         let extended_l2 = self.extended_l2;
-        let (ty, run) = subcluster_range(l2_entry, bitmap, 0, extended_l2, self.has_data_file());
+        let has_data_file = self.has_data_file();
+        let (ty, run) = subcluster_range(l2_entry, bitmap, 0, extended_l2, has_data_file);
+        if let Some(violation) = data_file_entry_violation(
+            l2_entry,
+            bitmap,
+            extended_l2,
+            has_data_file,
+            guest_cluster_offset,
+        ) {
+            return ClusterLookup::DataFileRefused(violation);
+        }
         match ty {
             SubclusterType::Invalid => ClusterLookup::Invalid,
             SubclusterType::Compressed => ClusterLookup::Compressed(l2_entry),
@@ -2558,8 +2719,9 @@ impl Qcow2State {
     /// pure helpers always see whole entries.
     ///
     /// Returns `None` on an I/O failure or adversarial L2 offset, and on
-    /// an L2 entry the classifier calls `Invalid`, after raising
-    /// [`shared::InvalidL2EntryRefusal`] for it (qemu-img measure fails
+    /// an L2 entry the classifier calls `Invalid` or that breaks a
+    /// data-file rule, after raising [`shared::InvalidL2EntryRefusal`] or
+    /// [`shared::DataFileEntryRefusal`] for it (qemu-img measure fails
     /// there with `EIO`).
     ///
     /// # Safety
@@ -2692,24 +2854,14 @@ impl Qcow2State {
                 );
 
                 let counted = if extended_l2 {
-                    match count_allocated_in_l2_extended(
+                    count_allocated_in_l2_extended(
                         meaningful,
                         cluster_size,
                         base_virtual_offset,
                         virtual_size,
                         has_data_file,
                         &mut tracker,
-                    ) {
-                        Ok(n) => n,
-                        Err(invalid) => {
-                            send_invalid_l2_entry_refusal(
-                                call_table,
-                                self.device_idx,
-                                invalid.virtual_offset,
-                            );
-                            return None;
-                        }
-                    }
+                    )
                 } else {
                     walk_l2_standard(
                         meaningful,
@@ -2719,6 +2871,13 @@ impl Qcow2State {
                         has_data_file,
                         &mut tracker,
                     )
+                };
+                let counted = match counted {
+                    Ok(n) => n,
+                    Err(refused) => {
+                        send_refused_l2_entry(call_table, self.device_idx, refused);
+                        return None;
+                    }
                 };
                 allocated_bytes = allocated_bytes.saturating_add(counted);
 
@@ -2764,9 +2923,10 @@ impl Qcow2State {
     /// termination via `emit` returning `false`). Returns `None` on
     /// an I/O failure or adversarial L2 offset, matching
     /// `scan_allocation`'s convention, and on an L2 entry the
-    /// classifier calls `Invalid`, after raising
-    /// [`shared::InvalidL2EntryRefusal`] for it (qemu-img map fails
-    /// there with `EIO`).
+    /// classifier calls `Invalid` or that breaks a data-file rule, after
+    /// raising [`shared::InvalidL2EntryRefusal`] or
+    /// [`shared::DataFileEntryRefusal`] for it (qemu-img map fails there
+    /// with `EIO`).
     ///
     /// # Safety
     ///
@@ -2935,7 +3095,7 @@ impl Qcow2State {
                             meaningful[entry_byte_offset + 14],
                             meaningful[entry_byte_offset + 15],
                         ]);
-                        match classify_qcow2_l2_extended(
+                        classify_qcow2_l2_extended(
                             l2_entry,
                             sc_bitmap,
                             cluster_virt,
@@ -2943,30 +3103,29 @@ impl Qcow2State {
                             cluster_visible,
                             has_data_file,
                             &mut coalescer,
-                        ) {
-                            Ok(cont) => cont,
-                            Err(invalid) => {
-                                send_invalid_l2_entry_refusal(
-                                    call_table,
-                                    self.device_idx,
-                                    invalid.virtual_offset,
-                                );
-                                return None;
-                            }
-                        }
+                        )
                     } else {
-                        let mut ext = classify_qcow2_l2_standard(
+                        classify_qcow2_l2_standard(
                             l2_entry,
                             cluster_virt,
                             cluster_size,
                             has_data_file,
-                        );
-                        // Clamp to virtual_size for end-of-image
-                        // clusters.
-                        if ext.length > cluster_visible {
-                            ext.length = cluster_visible;
+                        )
+                        .map(|mut ext| {
+                            // Clamp to virtual_size for end-of-image
+                            // clusters.
+                            if ext.length > cluster_visible {
+                                ext.length = cluster_visible;
+                            }
+                            coalescer.push(ext)
+                        })
+                    };
+                    let cont = match cont {
+                        Ok(cont) => cont,
+                        Err(refused) => {
+                            send_refused_l2_entry(call_table, self.device_idx, refused);
+                            return None;
                         }
-                        coalescer.push(ext)
                     };
 
                     next_unwalked = cluster_virt.saturating_add(cluster_visible);
@@ -3870,7 +4029,7 @@ mod tests {
             l2_cached_sector: u64::MAX,
             l2_cache_buf: core::ptr::null_mut(),
         };
-        state.classify_l2_entry(entry, bitmap)
+        state.classify_l2_entry(entry, bitmap, 0)
     }
 
     #[test]
@@ -4036,6 +4195,208 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn data_file_entry_violation_follows_qcow2_get_host_offset() {
+        // qemu's two data-file rules, block/qcow2-cluster.c:668-675 and
+        // :696-704 at v10.0.0 (#803), for the cluster at guest offset G.
+        use DataFileEntryViolation::{Compressed as C, HostOffsetMismatch as M};
+        const G: u64 = 0x50000;
+        const MOVED: u64 = OFLAG_COPIED | 0x60000;
+        // (entry, bitmap, extended_l2, has_data_file, verdict, what)
+        let cases: &[(u64, u64, bool, bool, Option<DataFileEntryViolation>, &str)] = &[
+            // Without a data file neither rule applies.
+            (SC_COMP, 0, false, false, None, "compressed, no data file"),
+            (MOVED, 0, false, false, None, "moved host, no data file"),
+            (
+                MOVED,
+                SC_ALL_ALLOC,
+                true,
+                false,
+                None,
+                "moved host, extended, no data file",
+            ),
+            // A compressed entry, whatever its bitmap.
+            (SC_COMP, 0, false, true, Some(C), "classic compressed"),
+            (
+                SC_COMP,
+                SC_ALL_ALLOC,
+                true,
+                true,
+                Some(C),
+                "extended compressed",
+            ),
+            // A host cluster at the guest offset is the one-to-one map.
+            (SC_HOST, 0, false, true, None, "classic normal in place"),
+            (
+                SC_HOST | QCOW_OFLAG_ZERO,
+                0,
+                false,
+                true,
+                None,
+                "classic zero-alloc in place",
+            ),
+            (
+                SC_HOST,
+                SC_ALL_ALLOC,
+                true,
+                true,
+                None,
+                "extended normal in place",
+            ),
+            (SC_HOST, 0x3, true, true, None, "extended mixed in place"),
+            // Moved: every type that names a host cluster (:682-684).
+            (MOVED, 0, false, true, Some(M), "classic normal moved"),
+            (
+                MOVED | QCOW_OFLAG_ZERO,
+                0,
+                false,
+                true,
+                Some(M),
+                "classic zero-alloc moved",
+            ),
+            (
+                MOVED,
+                SC_ALL_ALLOC,
+                true,
+                true,
+                Some(M),
+                "extended normal moved",
+            ),
+            (MOVED, 0x3, true, true, Some(M), "extended mixed moved"),
+            (
+                MOVED,
+                SC_ALL_ZERO,
+                true,
+                true,
+                Some(M),
+                "extended zero-alloc moved",
+            ),
+            (
+                MOVED,
+                0,
+                true,
+                true,
+                Some(M),
+                "extended unallocated-alloc moved",
+            ),
+            // A non-zero host offset names a host cluster with or
+            // without COPIED.
+            (
+                0x60000,
+                0,
+                false,
+                true,
+                Some(M),
+                "classic moved without COPIED",
+            ),
+            // COPIED | 0 is host offset 0, which is in place only at
+            // guest offset 0 (checked below).
+            (
+                OFLAG_COPIED,
+                0,
+                false,
+                true,
+                Some(M),
+                "classic COPIED|0 off cluster 0",
+            ),
+            (
+                OFLAG_COPIED,
+                0x3,
+                true,
+                true,
+                Some(M),
+                "extended COPIED|0 off cluster 0",
+            ),
+            // No host cluster: the plain types break neither rule.
+            (0, 0, false, true, None, "classic unallocated"),
+            (QCOW_OFLAG_ZERO, 0, false, true, None, "classic zero-plain"),
+            (0, SC_ALL_ZERO, true, true, None, "extended zero-plain"),
+            // Invalid entries are the classifier's refusal, which qemu
+            // reaches first (:666-667).
+            (
+                MOVED,
+                (1 << 35) | SC_ALL_ALLOC,
+                true,
+                true,
+                None,
+                "moved alloc-zero overlap",
+            ),
+            (0, 0x1, true, true, None, "alloc bit without a host cluster"),
+        ];
+        for &(entry, bitmap, ext, df, want, what) in cases {
+            assert_eq!(
+                data_file_entry_violation(entry, bitmap, ext, df, G),
+                want,
+                "{what}: entry {entry:#x} bitmap {bitmap:#x}"
+            );
+        }
+        for ext in [false, true] {
+            assert_eq!(
+                data_file_entry_violation(OFLAG_COPIED, SC_ALL_ALLOC, ext, true, 0),
+                None,
+                "COPIED|0 is virtual cluster 0's own offset (extended {ext})"
+            );
+        }
+        assert_eq!(C.status(), shared::DataFileEntryRefusal::STATUS_COMPRESSED);
+        assert_eq!(
+            M.status(),
+            shared::DataFileEntryRefusal::STATUS_HOST_OFFSET_MISMATCH
+        );
+    }
+
+    #[test]
+    fn sc_verdict_refuses_data_file_entries_after_invalid_ones() {
+        // `sc_verdict` looks up virtual cluster 0, so SC_HOST is moved.
+        use DataFileEntryViolation::{Compressed as C, HostOffsetMismatch as M};
+        let cases: &[(u64, u64, bool, ClusterLookup)] = &[
+            (SC_COMP, 0, false, ClusterLookup::DataFileRefused(C)),
+            (
+                SC_COMP,
+                SC_ALL_ALLOC,
+                true,
+                ClusterLookup::DataFileRefused(C),
+            ),
+            (SC_HOST, 0, false, ClusterLookup::DataFileRefused(M)),
+            (
+                SC_HOST,
+                SC_ALL_ALLOC,
+                true,
+                ClusterLookup::DataFileRefused(M),
+            ),
+            // Not Zero or Unallocated: qemu applies the rule first.
+            (
+                SC_HOST | QCOW_OFLAG_ZERO,
+                0,
+                false,
+                ClusterLookup::DataFileRefused(M),
+            ),
+            (SC_HOST, 0, true, ClusterLookup::DataFileRefused(M)),
+            (
+                SC_HOST,
+                (1 << 35) | SC_ALL_ALLOC,
+                true,
+                ClusterLookup::Invalid,
+            ),
+            (OFLAG_COPIED, SC_ALL_ALLOC, true, ClusterLookup::Standard(0)),
+        ];
+        for &(entry, bitmap, ext, want) in cases {
+            assert_eq!(
+                sc_verdict(entry, bitmap, ext, true),
+                want,
+                "entry {entry:#x} bitmap {bitmap:#x} extended {ext}"
+            );
+        }
+        // Without a data file the same entries are read as before.
+        assert_eq!(
+            sc_verdict(SC_COMP, 0, false, false),
+            ClusterLookup::Compressed(SC_COMP)
+        );
+        assert_eq!(
+            sc_verdict(SC_HOST, 0, false, false),
+            ClusterLookup::Standard(0x50000)
+        );
     }
 
     #[test]
@@ -4713,10 +5074,11 @@ mod tests {
     fn count_l2_extended_data_file_copied_at_offset_zero_counts() {
         // A data-file image's cluster 0 with 4 KiB written (COPIED|0,
         // bitmap 0x3) is two NORMAL subclusters; without the data file
-        // the same entry is INVALID and the count fails there.
+        // the same entry is INVALID and the count fails there. Cluster
+        // 1's host cluster is at its guest offset, as a data file needs.
         let mut buf = [0u8; 32];
         put_ext_entry(&mut buf, 0, OFLAG_COPIED, 0x3);
-        put_ext_entry(&mut buf, 1, 0x50000, 0xFFFF_FFFF);
+        put_ext_entry(&mut buf, 1, 0x10000, 0xFFFF_FFFF);
         assert_eq!(
             count_allocated_in_l2_extended(
                 &buf,
@@ -4737,7 +5099,7 @@ mod tests {
                 false,
                 &mut TargetUnitTracker::new(0)
             ),
-            Err(InvalidL2Entry {
+            Err(RefusedL2Entry::Invalid {
                 virtual_offset: 0x10_0000
             })
         );
@@ -4759,7 +5121,7 @@ mod tests {
                 false,
                 &mut TargetUnitTracker::new(0)
             ),
-            Err(InvalidL2Entry {
+            Err(RefusedL2Entry::Invalid {
                 virtual_offset: 65536
             })
         );
@@ -4817,7 +5179,6 @@ mod tests {
     fn walk_l2_standard_counts_what_qemu_measure_counts() {
         // NORMAL and COMPRESSED count; ZERO_PLAIN, ZERO_ALLOC and an
         // unallocated entry with flag bits do not (block/qcow2.c:5193-5202).
-        // With a data file, COPIED at host offset 0 is NORMAL.
         let mut buf = [0u8; 6 * 8];
         put_std_entry(&mut buf, 0, OFLAG_COPIED);
         put_std_entry(&mut buf, 1, OFLAG_COPIED | 0x10000);
@@ -4826,14 +5187,110 @@ mod tests {
         put_std_entry(&mut buf, 4, OFLAG_COMPRESSED | 0x30000);
         let mut t = TargetUnitTracker::new(0);
         assert_eq!(
-            walk_l2_standard(&buf, 4096, 0, u64::MAX, false, &mut t),
+            walk_l2_standard(&buf, 4096, 0, u64::MAX, false, &mut t).unwrap(),
             2 * 4096
         );
+        // With a data file, COPIED at host offset 0 is NORMAL. A data
+        // file has no compressed clusters and maps every host cluster at
+        // its guest offset (#803), so its table is laid out that way.
+        let mut buf = [0u8; 6 * 8];
+        put_std_entry(&mut buf, 0, OFLAG_COPIED);
+        put_std_entry(&mut buf, 1, OFLAG_COPIED | 0x1000);
+        put_std_entry(&mut buf, 2, QCOW_OFLAG_ZERO);
+        put_std_entry(&mut buf, 3, OFLAG_COPIED | 0x3000 | QCOW_OFLAG_ZERO);
+        let mut t = TargetUnitTracker::new(0);
+        assert_eq!(
+            walk_l2_standard(&buf, 4096, 0, u64::MAX, true, &mut t).unwrap(),
+            2 * 4096
+        );
+    }
+
+    #[test]
+    fn metadata_walks_refuse_data_file_entries_as_qemu_does() {
+        // qemu-img map and measure fail with EIO on a data-file entry
+        // that is compressed or not at its guest offset (#803); the
+        // walkers stop with the cluster's virtual offset and rule.
+        use DataFileEntryViolation::{Compressed as C, HostOffsetMismatch as M};
+        let refused = |virtual_offset, violation| RefusedL2Entry::DataFile {
+            virtual_offset,
+            violation,
+        };
+        // Classic, 4 KiB clusters: cluster 0 in place, cluster 1 moved.
+        let mut buf = [0u8; 2 * 8];
+        put_std_entry(&mut buf, 0, OFLAG_COPIED);
+        put_std_entry(&mut buf, 1, OFLAG_COPIED | 0x2000);
         let mut t = TargetUnitTracker::new(0);
         assert_eq!(
             walk_l2_standard(&buf, 4096, 0, u64::MAX, true, &mut t),
-            3 * 4096
+            Err(refused(0x1000, M))
         );
+        // Past virtual_size the entry has no guest-visible meaning.
+        let mut t = TargetUnitTracker::new(0);
+        assert_eq!(
+            walk_l2_standard(&buf, 4096, 0, 4096, true, &mut t),
+            Ok(4096)
+        );
+        // Without a data file both rules are off.
+        let mut t = TargetUnitTracker::new(0);
+        assert_eq!(
+            walk_l2_standard(&buf, 4096, 0, u64::MAX, false, &mut t),
+            Ok(4096)
+        );
+        assert_eq!(
+            classify_qcow2_l2_standard(OFLAG_COPIED | 0x2000, 0x1000, 4096, true),
+            Err(refused(0x1000, M))
+        );
+        put_std_entry(&mut buf, 1, OFLAG_COMPRESSED | 0x30000);
+        let mut t = TargetUnitTracker::new(0);
+        assert_eq!(
+            walk_l2_standard(&buf, 4096, 0, u64::MAX, true, &mut t),
+            Err(refused(0x1000, C))
+        );
+        assert_eq!(
+            classify_qcow2_l2_standard(OFLAG_COMPRESSED | 0x30000, 0x1000, 4096, true),
+            Err(refused(0x1000, C))
+        );
+
+        // Extended, 64 KiB clusters, a table based at 1 MiB.
+        for (entry, bitmap, violation) in [
+            (OFLAG_COPIED | 0x60000, SC_ALL_ALLOC, M),
+            // A host cluster no subcluster reads is still checked.
+            (OFLAG_COPIED | 0x60000, 0, M),
+            (OFLAG_COMPRESSED | 0x30000, 0, C),
+        ] {
+            let mut buf = [0u8; 2 * 16];
+            put_ext_entry(&mut buf, 0, OFLAG_COPIED | 0x10_0000, SC_ALL_ALLOC);
+            put_ext_entry(&mut buf, 1, entry, bitmap);
+            assert_eq!(
+                count_allocated_in_l2_extended(
+                    &buf,
+                    65536,
+                    0x10_0000,
+                    u64::MAX,
+                    true,
+                    &mut TargetUnitTracker::new(0)
+                ),
+                Err(refused(0x11_0000, violation)),
+                "entry {entry:#x} bitmap {bitmap:#x}"
+            );
+            let mut pushed = 0usize;
+            let mut emit = |_: MapExtent| -> bool {
+                pushed += 1;
+                true
+            };
+            {
+                let mut sink = MapExtentCoalescer::new(&mut emit);
+                assert_eq!(
+                    classify_qcow2_l2_extended(
+                        entry, bitmap, 0x11_0000, 65536, 65536, true, &mut sink
+                    ),
+                    Err(refused(0x11_0000, violation)),
+                    "entry {entry:#x} bitmap {bitmap:#x}"
+                );
+                assert!(sink.finish());
+            }
+            assert_eq!(pushed, 0, "nothing is pushed for a refused entry");
+        }
     }
 
     // ---- TargetUnitTracker / walk_l2_standard (bug #286) ----
@@ -4894,7 +5351,7 @@ mod tests {
         put_std_entry(&mut buf, 16, 0x20000);
         put_std_entry(&mut buf, 17, 0x30000);
         let mut t = TargetUnitTracker::new(65536);
-        let allocated = walk_l2_standard(&buf, 4096, 0, u64::MAX, false, &mut t);
+        let allocated = walk_l2_standard(&buf, 4096, 0, u64::MAX, false, &mut t).unwrap();
         assert_eq!(allocated, 3 * 4096);
         // Entry 0 covers virtual [0, 4096) → unit 0.
         // Entry 16 covers virtual [65536, 69632) → unit 1.
@@ -4909,7 +5366,7 @@ mod tests {
         let mut buf = [0u8; 8 * 8];
         put_std_entry(&mut buf, 0, 0x10000);
         let mut t = TargetUnitTracker::new(65536);
-        let _ = walk_l2_standard(&buf, 4096, 1 << 30, u64::MAX, false, &mut t);
+        let _ = walk_l2_standard(&buf, 4096, 1 << 30, u64::MAX, false, &mut t).unwrap();
         // After the call, last_unit_idx should reflect the high offset.
         assert_eq!(t.last_unit_idx, (1u64 << 30) / 65536);
     }
@@ -4933,7 +5390,7 @@ mod tests {
         put_std_entry(&mut buf, 2, 0x30000);
         put_std_entry(&mut buf, 3, 0x40000);
         let mut t = TargetUnitTracker::new(0);
-        let allocated = walk_l2_standard(&buf, 4096, 0, 8192, false, &mut t);
+        let allocated = walk_l2_standard(&buf, 4096, 0, 8192, false, &mut t).unwrap();
         assert_eq!(allocated, 2 * 4096);
     }
 
@@ -4945,7 +5402,7 @@ mod tests {
         put_std_entry(&mut buf, 0, 0x10000);
         put_std_entry(&mut buf, 1, 0x20000);
         let mut t = TargetUnitTracker::new(0);
-        let allocated = walk_l2_standard(&buf, 4096, 0, 6000, false, &mut t);
+        let allocated = walk_l2_standard(&buf, 4096, 0, 6000, false, &mut t).unwrap();
         assert_eq!(allocated, 4096 + 1904);
     }
 
@@ -4961,7 +5418,7 @@ mod tests {
         let virtual_size: u64 = 8192;
         let target_unit: u64 = 4096;
         let mut t = TargetUnitTracker::new(target_unit);
-        let _ = walk_l2_standard(&buf, 4096, 0, virtual_size, false, &mut t);
+        let _ = walk_l2_standard(&buf, 4096, 0, virtual_size, false, &mut t).unwrap();
         let cap = virtual_size.div_ceil(target_unit);
         assert!(
             t.target_units_with_data <= cap,
@@ -5020,7 +5477,7 @@ mod tests {
 
     #[test]
     fn classify_standard_zero_is_hole() {
-        let e = classify_qcow2_l2_standard(0, 0, 65536, false);
+        let e = classify_qcow2_l2_standard(0, 0, 65536, false).unwrap();
         assert_eq!(e.start, 0);
         assert_eq!(e.length, 65536);
         assert_eq!(e.state, MapExtentState::Hole);
@@ -5029,7 +5486,7 @@ mod tests {
     #[test]
     fn classify_standard_normal_is_data() {
         // host_offset = 0x50000, no flag bits.
-        let e = classify_qcow2_l2_standard(0x0005_0000, 0, 65536, false);
+        let e = classify_qcow2_l2_standard(0x0005_0000, 0, 65536, false).unwrap();
         assert_eq!(
             e.state,
             MapExtentState::Data {
@@ -5042,7 +5499,7 @@ mod tests {
     fn classify_standard_compressed_is_data() {
         // OFLAG_COMPRESSED set; offset bits in L2_OFFSET_MASK range.
         let entry = OFLAG_COMPRESSED | 0x0001_2000;
-        let e = classify_qcow2_l2_standard(entry, 65536, 65536, false);
+        let e = classify_qcow2_l2_standard(entry, 65536, 65536, false).unwrap();
         assert_eq!(e.start, 65536);
         assert_eq!(e.length, 65536);
         // file_offset masked with L2_OFFSET_MASK.
@@ -5059,7 +5516,7 @@ mod tests {
     fn classify_standard_oflag_copied_only_is_hole() {
         // OFLAG_COPIED is bit 63; on its own with no offset and no
         // external data file the entry is UNALLOCATED_PLAIN.
-        let e = classify_qcow2_l2_standard(OFLAG_COPIED, 0, 65536, false);
+        let e = classify_qcow2_l2_standard(OFLAG_COPIED, 0, 65536, false).unwrap();
         assert_eq!(e.state, MapExtentState::Hole);
     }
 
@@ -5069,17 +5526,17 @@ mod tests {
         // NORMAL cluster at data-file offset 0 (block/qcow2.h:724-733):
         // qemu-img map reports a data-file image's cluster 0 as data at
         // offset 0.
-        let e = classify_qcow2_l2_standard(OFLAG_COPIED, 0, 65536, true);
+        let e = classify_qcow2_l2_standard(OFLAG_COPIED, 0, 65536, true).unwrap();
         assert_eq!(e.state, MapExtentState::Data { file_offset: 0 });
         // Without COPIED it is still unallocated.
-        let e = classify_qcow2_l2_standard(0, 0, 65536, true);
+        let e = classify_qcow2_l2_standard(0, 0, 65536, true).unwrap();
         assert_eq!(e.state, MapExtentState::Hole);
     }
 
     #[test]
     fn classify_standard_oflag_copied_with_offset_is_data() {
         let entry = OFLAG_COPIED | 0x0001_0000;
-        let e = classify_qcow2_l2_standard(entry, 0, 65536, false);
+        let e = classify_qcow2_l2_standard(entry, 0, 65536, false).unwrap();
         assert_eq!(
             e.state,
             MapExtentState::Data {
@@ -5285,7 +5742,7 @@ mod tests {
                         has_data_file,
                         &mut sink
                     ),
-                    Err(InvalidL2Entry {
+                    Err(RefusedL2Entry::Invalid {
                         virtual_offset: 0x20_0000
                     }),
                     "entry {entry:#x} bitmap {bitmap:#x} data file {has_data_file}"
@@ -5378,7 +5835,7 @@ mod tests {
     fn classify_standard_compressed_offset_masked() {
         // Make sure high garbage bits don't leak into file_offset.
         let entry = OFLAG_COMPRESSED | OFLAG_COPIED | 0x0007_0000;
-        let e = classify_qcow2_l2_standard(entry, 0, 65536, false);
+        let e = classify_qcow2_l2_standard(entry, 0, 65536, false).unwrap();
         let want = entry & L2_OFFSET_MASK;
         assert_eq!(e.state, MapExtentState::Data { file_offset: want });
     }
@@ -6518,7 +6975,7 @@ mod tests {
     #[test]
     fn classify_standard_zero_flag_host_zero_is_zeroallocated() {
         // QCOW_OFLAG_ZERO with host_offset == 0 (ZERO_PLAIN).
-        let e = classify_qcow2_l2_standard(QCOW_OFLAG_ZERO, 0, 65536, false);
+        let e = classify_qcow2_l2_standard(QCOW_OFLAG_ZERO, 0, 65536, false).unwrap();
         assert_eq!(e.state, MapExtentState::ZeroAllocated);
     }
 
@@ -6530,7 +6987,7 @@ mod tests {
         // (block/qcow2.c:2171-2177; measured on qemu-img 10.0.13 as
         // `"present": true, "zero": true, "data": false, "offset": ...`).
         let entry = 0x0005_0000 | OFLAG_COPIED | QCOW_OFLAG_ZERO;
-        let e = classify_qcow2_l2_standard(entry, 0, 65536, false);
+        let e = classify_qcow2_l2_standard(entry, 0, 65536, false).unwrap();
         assert_eq!(
             e.state,
             MapExtentState::ZeroAllocatedAt {
@@ -6713,7 +7170,8 @@ mod tests {
 
     /// The L2 entries every test image carries, as (virtual cluster,
     /// L2 word, bitmap). The data-file flag changes what clusters 2 and
-    /// 3 mean; nothing else depends on it.
+    /// 3 mean, and `sc_chain` then puts every host cluster at its guest
+    /// offset; nothing else depends on it.
     const SC_ENTRIES: &[(u64, u64, u64)] = &[
         // 0: a host cluster with Normal x8, ZeroAlloc x8, UnallocatedAlloc x16.
         (0, OFLAG_COPIED | SC_HOST_A, (0xFF00 << 32) | 0xFF),
@@ -6775,14 +7233,26 @@ mod tests {
             img[off..off + 8].copy_from_slice(&v.to_be_bytes());
         };
         put(&mut img, l1, SC_L2_OFF | OFLAG_COPIED);
+        // qemu maps a data file one to one and refuses an entry whose
+        // host cluster is anywhere else (#803), so in a data-file image
+        // every entry that names a host cluster names its own guest
+        // offset, as qemu writes it. Tests of that refusal move an
+        // offset with `sc_set_entry`.
+        let placed = |ci: u64, entry: u64| {
+            if has_data_file && l2_entry_names_host_cluster(entry, extended_l2, true) {
+                (entry & !L2_OFFSET_MASK) | ci * SC_CLUSTER
+            } else {
+                entry
+            }
+        };
         if extended_l2 {
             for &(ci, entry, bitmap) in SC_ENTRIES {
-                put(&mut img, l2 + ci as usize * 16, entry);
+                put(&mut img, l2 + ci as usize * 16, placed(ci, entry));
                 put(&mut img, l2 + ci as usize * 16 + 8, bitmap);
             }
         } else {
             for &(ci, entry) in SC_CLASSIC_ENTRIES {
-                put(&mut img, l2 + ci as usize * 8, entry);
+                put(&mut img, l2 + ci as usize * 8, placed(ci, entry));
             }
         }
         ScChain {
@@ -7284,15 +7754,16 @@ mod tests {
     fn sc_issue_653_entry_reads_the_data_file_with_one() {
         // With a data file the same entry is virtual cluster 0's normal
         // shape: a whole cluster at data-file offset 0 (qcow2.h:729-730).
-        let chain = sc_chain(true, true, true);
+        let mut chain = sc_chain(true, true, true);
+        sc_set_entry(&mut chain, 0, OFLAG_COPIED, 0x0000_0000_FFFF_FFFF);
         assert!(matches!(
-            sc_lookup(&chain, SC_NARROW_SSZ, 2),
+            sc_lookup(&chain, SC_NARROW_SSZ, 0),
             Some(ClusterLookup::Standard(0))
         ));
         sc_assert_provenance(
             &chain,
             SC_DATA_DEV,
-            2 * SC_CLUSTER,
+            0,
             SC_CLUSTER,
             &[(Data(0), 32)],
             "#653 + data file",
@@ -7306,54 +7777,54 @@ mod tests {
         // two subclusters are in the data file at offset 0; the rest are
         // UnallocatedAlloc and read the backing file, or zeros without
         // one. instar's convert wrote zeros for the whole cluster.
-        let chain = sc_chain(true, true, true);
+        let partial = |has_data_file, backing| {
+            let mut chain = sc_chain(true, has_data_file, backing);
+            sc_set_entry(&mut chain, 0, OFLAG_COPIED, 0x3);
+            chain
+        };
+        let chain = partial(true, true);
         let runs = [(Data(0), 2), (Backing, 30)];
         sc_assert_provenance(
             &chain,
             SC_DATA_DEV,
-            3 * SC_CLUSTER,
+            0,
             SC_CLUSTER,
             &runs,
             "data-file partial, backing",
         );
         assert!(matches!(
-            sc_lookup(&chain, SC_NARROW_SSZ, 3),
+            sc_lookup(&chain, SC_NARROW_SSZ, 0),
             Some(ClusterLookup::StandardSubclusters(e, 0x3)) if e == OFLAG_COPIED
         ));
-        let chain = sc_chain(true, true, false);
+        let chain = partial(true, false);
         let runs = [(Data(0), 2), (Zero, 30)];
         sc_assert_provenance(
             &chain,
             SC_DATA_DEV,
-            3 * SC_CLUSTER,
+            0,
             SC_CLUSTER,
             &runs,
             "data-file partial, no backing",
         );
         // Without the data file the same words are invalid.
-        let chain = sc_chain(true, false, true);
-        sc_assert_refused(
-            &chain,
-            0,
-            3 * SC_CLUSTER,
-            "data-file partial entry, no data file",
-        );
+        let chain = partial(false, true);
+        sc_assert_refused(&chain, 0, 0, "data-file partial entry, no data file");
     }
 
     #[test]
     fn sc_data_file_host_clusters_are_read_from_the_data_device() {
         // A data-file image's non-zero host offsets are data-file offsets
-        // too: cluster 0's Normal run is at SC_HOST_A in the data device,
-        // not in the image.
+        // too: cluster 7's Normal run is at its guest offset in the data
+        // device, not in the image.
         let chain = sc_chain(true, true, true);
-        let runs = [(Data(SC_HOST_A), 8), (Zero, 8), (Backing, 16)];
+        let runs = [(Zero, 8), (Backing, 8), (Data(7 * SC_CLUSTER), 16)];
         sc_assert_provenance(
             &chain,
             SC_DATA_DEV,
-            0,
+            7 * SC_CLUSTER,
             SC_CLUSTER,
             &runs,
-            "N Za Ua, data file",
+            "Za Ua N, data file",
         );
     }
 
@@ -7406,11 +7877,7 @@ mod tests {
         // own header, so every read that takes bytes from a Normal
         // subcluster fails, without claiming the entry is invalid.
         let chain = sc_chain(true, true, true);
-        for (ci, label) in [
-            (2, "Standard(0)"),
-            (3, "mixed at host 0"),
-            (0, "mixed at a host cluster"),
-        ] {
+        for (ci, label) in [(2, "Standard"), (3, "mixed"), (0, "mixed at host 0")] {
             for (arm, ssz) in SC_ARMS {
                 let (ok, _, err) = sc_read(&chain, 0, ssz, ci * SC_CLUSTER, SC_CLUSTER);
                 assert!(!ok, "{label} ({arm} arm): must fail without a data device");
@@ -7435,8 +7902,9 @@ mod tests {
     fn sc_classic_data_file_cluster_zero_reads_the_data_file() {
         // Classic L2, data file: COPIED | 0 is virtual cluster 0 at
         // data-file offset 0, and a non-zero host offset is a data-file
-        // offset. Before the classifier the first read the data device
-        // only because the host had put it next in the chain.
+        // offset, which is cluster 1's own. Before the classifier the
+        // first read the data device only because the host had put it
+        // next in the chain.
         let chain = sc_chain(false, true, true);
         assert!(matches!(
             sc_lookup(&chain, SC_NARROW_SSZ, 0),
@@ -7455,8 +7923,8 @@ mod tests {
             SC_DATA_DEV,
             SC_CLUSTER,
             SC_CLUSTER,
-            &[(Data(SC_HOST_A), 32)],
-            "classic host A, data file",
+            &[(Data(SC_CLUSTER), 32)],
+            "classic non-zero host offset, data file",
         );
         sc_assert_provenance(
             &chain,
@@ -7491,15 +7959,130 @@ mod tests {
         );
     }
 
-    /// Overwrite virtual cluster `ci`'s extended L2 entry.
+    /// Overwrite virtual cluster `ci`'s L2 entry. A classic image has
+    /// no bitmap, so `bitmap` must then be 0.
     fn sc_set_entry(chain: &mut ScChain, ci: u64, entry: u64, bitmap: u64) {
-        assert!(
-            chain.extended_l2,
-            "an extended L2 entry needs an extended image"
-        );
+        if !chain.extended_l2 {
+            assert_eq!(bitmap, 0, "a classic L2 entry has no bitmap");
+            let at = SC_L2_OFF as usize + ci as usize * 8;
+            chain.qcow2[at..at + 8].copy_from_slice(&entry.to_be_bytes());
+            return;
+        }
         let at = SC_L2_OFF as usize + ci as usize * 16;
         chain.qcow2[at..at + 8].copy_from_slice(&entry.to_be_bytes());
         chain.qcow2[at + 8..at + 16].copy_from_slice(&bitmap.to_be_bytes());
+    }
+
+    /// Read virtual cluster `ci` of a data-file chain through both arms,
+    /// whole and as a window inside it, and check every read is refused
+    /// by name: once, with the data-file marker, the cluster's guest
+    /// offset and the rule's status (#803).
+    fn sc_assert_data_file_refused(chain: &ScChain, ci: u64, status: u32, label: &str) {
+        for (arm, ssz) in SC_ARMS {
+            for (off, len) in [(0, SC_CLUSTER), (SC_CLUSTER / 2 + 512, 1024)] {
+                let virt_off = ci * SC_CLUSTER + off;
+                let (ok, _, err) = sc_read(chain, SC_DATA_DEV, ssz, virt_off, len);
+                let what = std::format!("{label} ({arm} arm, {len} at {virt_off})");
+                assert!(!ok, "{what}: qemu fails this read with EIO, so must instar");
+                assert_eq!(err.calls, 1, "{what}: the refusal is raised exactly once");
+                assert_eq!(
+                    err.op,
+                    shared::DataFileEntryRefusal::OPERATION,
+                    "{what}: the read must fail by raising the data-file refusal"
+                );
+                assert_eq!(
+                    err.sector,
+                    ci * SC_CLUSTER,
+                    "{what}: the refusal names the cluster's guest offset"
+                );
+                assert_eq!(err.status, status, "{what}: the refusal names the rule");
+            }
+        }
+    }
+
+    #[test]
+    fn sc_data_file_compressed_entry_is_refused_by_name() {
+        // A data-file image has no compressed clusters. qemu fails the
+        // read (block/qcow2-cluster.c:668-675 at v10.0.0); instar used to
+        // inflate it from the image, and failed only because the bytes
+        // there were not a deflate stream (#803).
+        for extended_l2 in [false, true] {
+            for backing in [false, true] {
+                let mut chain = sc_chain(extended_l2, true, backing);
+                sc_set_entry(&mut chain, 1, OFLAG_COMPRESSED | SC_HOST_A, 0);
+                sc_assert_data_file_refused(
+                    &chain,
+                    1,
+                    shared::DataFileEntryRefusal::STATUS_COMPRESSED,
+                    &std::format!("compressed, extended {extended_l2}, backing {backing}"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sc_data_file_host_offset_that_is_not_the_guest_offset_is_refused() {
+        // qemu maps a data file one to one and fails a read whose entry
+        // names any other host cluster (block/qcow2-cluster.c:696-704 at
+        // v10.0.0). instar used to read the data file at the entry's
+        // offset and return those bytes under success (#803). Every type
+        // that names a host cluster is refused, through the Standard arm,
+        // the mixed arm's narrow and wide paths, and the zero and
+        // unallocated verdicts, which qemu checks before reading nothing.
+        let moved = OFLAG_COPIED | SC_HOST_A;
+        let classic: &[(u64, &str)] = &[
+            (moved, "classic normal"),
+            (moved | QCOW_OFLAG_ZERO, "classic zero-alloc"),
+            (OFLAG_COPIED, "classic COPIED|0 at cluster 1"),
+        ];
+        let extended: &[(u64, u64, &str)] = &[
+            (moved, 0x0000_0000_FFFF_FFFF, "extended normal"),
+            (moved, (0xFF00 << 32) | 0xFF, "extended mixed"),
+            (moved, 0xFFFF_FFFF << 32, "extended zero-alloc"),
+            (moved, 0, "extended unallocated-alloc"),
+            (OFLAG_COPIED, 0x3, "extended COPIED|0 at cluster 1"),
+        ];
+        let status = shared::DataFileEntryRefusal::STATUS_HOST_OFFSET_MISMATCH;
+        for backing in [false, true] {
+            for &(entry, label) in classic {
+                let mut chain = sc_chain(false, true, backing);
+                sc_set_entry(&mut chain, 1, entry, 0);
+                sc_assert_data_file_refused(&chain, 1, status, label);
+            }
+            for &(entry, bitmap, label) in extended {
+                let mut chain = sc_chain(true, true, backing);
+                sc_set_entry(&mut chain, 1, entry, bitmap);
+                sc_assert_data_file_refused(&chain, 1, status, label);
+            }
+        }
+        // The same entries are not refused without a data file: the
+        // host offset is then into the image, wherever it is.
+        let mut chain = sc_chain(true, false, true);
+        sc_set_entry(&mut chain, 1, moved, 0x0000_0000_FFFF_FFFF);
+        sc_assert_provenance(
+            &chain,
+            0,
+            SC_CLUSTER,
+            SC_CLUSTER,
+            &[(Child(SC_HOST_A), 32)],
+            "moved host, no data file",
+        );
+    }
+
+    #[test]
+    fn sc_data_file_invalid_entry_is_refused_as_invalid_first() {
+        // An entry that is both invalid and not at its guest offset gets
+        // qemu's invalid-entry refusal: get_host_offset breaks out for
+        // QCOW2_SUBCLUSTER_INVALID before the offset rule
+        // (block/qcow2-cluster.c:666-667).
+        let mut chain = sc_chain(true, true, true);
+        sc_set_entry(
+            &mut chain,
+            1,
+            OFLAG_COPIED | SC_HOST_A,
+            (1 << 35) | 0x0000_0000_FFFF_FFFF,
+        );
+        sc_assert_refused(&chain, SC_DATA_DEV, SC_CLUSTER, "moved alloc-zero overlap");
     }
 
     #[test]
@@ -7528,7 +8111,7 @@ mod tests {
         // same `continue` to the next device.
         for (entry, label) in [
             (0, "#792, extended, no host cluster"),
-            (OFLAG_COPIED | SC_HOST_A, "#792, extended, host cluster"),
+            (OFLAG_COPIED | SC_CLUSTER, "#792, extended, host cluster"),
         ] {
             let mut chain = sc_chain(true, true, true);
             sc_set_entry(&mut chain, 1, entry, 0);
@@ -7568,7 +8151,7 @@ mod tests {
         for (entry, label) in [
             (0, "#792, extended, no host cluster, no backing"),
             (
-                OFLAG_COPIED | SC_HOST_A,
+                OFLAG_COPIED | SC_CLUSTER,
                 "#792, extended, host cluster, no backing",
             ),
         ] {
@@ -7604,7 +8187,7 @@ mod tests {
             );
             // A Normal run read from the data file, a zero run, and an
             // unallocated run, whole and as a window inside the last.
-            let runs = [(Data(SC_HOST_A), 8), (Zero, 8), (unalloc, 16)];
+            let runs = [(Data(0), 8), (Zero, 8), (unalloc, 16)];
             sc_assert_provenance(
                 &chain,
                 SC_DATA_DEV,
@@ -15642,8 +16225,6 @@ unsafe fn read_chain_split_at_granule(
 /// data file when the header declares one (`has_data_file`), else the
 /// image itself. The header decides, as it does in qemu, which refuses
 /// to open an image whose data-file extension and feature bit disagree.
-/// Compressed clusters are not read through this; they are in the image
-/// whatever the header says.
 ///
 /// `None` when the header declares a data file but no data device is
 /// attached (`data_device_idx == 0`, never a data device because device
@@ -15653,6 +16234,10 @@ unsafe fn read_chain_split_at_granule(
 /// and tables as guest data, since qemu puts virtual cluster 0 at
 /// data-file offset 0. The host opens the data file before the guest
 /// starts, so this is reached only by a host-side defect.
+///
+/// Compressed clusters are not read through this: they are in the
+/// image, and a data-file image has none, so `cluster_lookup` refuses a
+/// compressed entry in one (#803).
 #[inline]
 fn data_read_device(
     chain_config: &ChainConfig,
@@ -15720,7 +16305,10 @@ fn parent_in_chain(chain_config: &ChainConfig, dev_idx: usize) -> bool {
 ///   `Normal` from the host cluster (in the external data file, if the
 ///   header declares one), zero types as zeros, unallocated types from
 ///   the next device. An entry qemu calls invalid fails the read and
-///   raises [`shared::InvalidL2EntryRefusal`] on `send_error`.
+///   raises [`shared::InvalidL2EntryRefusal`] on `send_error`, and an
+///   entry of a data-file image that is compressed, or whose host
+///   cluster offset is not its guest cluster offset, fails it and raises
+///   [`shared::DataFileEntryRefusal`] (#803).
 /// - VMDK (with `vmdk-input` feature): perform GD/GT grain lookup.
 ///   If unallocated, try next device.
 /// - VHD (with `vhd-input` feature): perform BAT block lookup. If
@@ -16069,8 +16657,9 @@ pub unsafe fn read_chain_virtual_cluster(
                         };
                         // With an external data file the host offset is an
                         // offset into that file, including offset 0, which
-                        // is where qemu puts virtual cluster 0. Compressed
-                        // clusters stay on the metadata device.
+                        // is where qemu puts virtual cluster 0, and
+                        // cluster_lookup has checked that it is the guest
+                        // offset (#803).
                         let read_dev = match data_read_device(chain_config, dev_idx, has_data_file)
                         {
                             Some(d) => d,
@@ -16221,6 +16810,22 @@ pub unsafe fn read_chain_virtual_cluster(
                         // guest data. The refusal is raised by name because
                         // this function's bool cannot carry the reason.
                         send_invalid_l2_entry_refusal(call_table, dev_idx as u32, virtual_offset);
+                        return false;
+                    }
+                    Some(ClusterLookup::DataFileRefused(violation)) => {
+                        // qemu fails the read with EIO before it reads
+                        // anything (block/qcow2-cluster.c:668-675 and
+                        // :696-704 at v10.0.0). Without this a compressed
+                        // entry was inflated from the image, and a moved
+                        // host offset read the data file at the wrong
+                        // place under success (#803). The refusal names
+                        // the cluster's guest offset, as qemu's message
+                        // does.
+                        send_data_file_entry_refusal(
+                            call_table,
+                            virtual_offset - virtual_offset % qcow2_cluster_size,
+                            violation,
+                        );
                         return false;
                     }
                     None => return false,
@@ -17745,6 +18350,47 @@ unsafe fn send_invalid_l2_entry_refusal(call_table: &CallTable, dev_idx: u32, vi
         virtual_offset,
         dev_idx,
     );
+}
+
+/// Report that a read or metadata walk refused a data-file image's L2
+/// entry under one of qemu's data-file rules (#803), on the
+/// `send_error` channel, as [`send_invalid_l2_entry_refusal`] does for an
+/// invalid entry. `guest_cluster_offset` travels in the `sector`
+/// argument as a byte offset and the rule's status code in `status`;
+/// see [`shared::DataFileEntryRefusal`].
+///
+/// # Safety
+///
+/// `call_table` must be a valid initialised [`CallTable`].
+#[allow(clippy::manual_c_str_literals)]
+unsafe fn send_data_file_entry_refusal(
+    call_table: &CallTable,
+    guest_cluster_offset: u64,
+    violation: DataFileEntryViolation,
+) {
+    (call_table.send_error)(
+        shared::DataFileEntryRefusal::OPERATION_C.as_ptr(),
+        b"input\0".as_ptr(),
+        guest_cluster_offset,
+        violation.status(),
+    );
+}
+
+/// Raise the named refusal a metadata walk found.
+///
+/// # Safety
+///
+/// `call_table` must be a valid initialised [`CallTable`].
+unsafe fn send_refused_l2_entry(call_table: &CallTable, dev_idx: u32, refused: RefusedL2Entry) {
+    match refused {
+        RefusedL2Entry::Invalid { virtual_offset } => {
+            send_invalid_l2_entry_refusal(call_table, dev_idx, virtual_offset)
+        }
+        RefusedL2Entry::DataFile {
+            virtual_offset,
+            violation,
+        } => send_data_file_entry_refusal(call_table, virtual_offset, violation),
+    }
 }
 
 /// Initialize format-specific state for all devices in a chain.
