@@ -506,19 +506,35 @@ and a version bump pushed straight to `develop` has no such run.
 
 `ci-gate` checks that `functional-tests.yml` succeeded on the tagged
 commit, in its merge queue run. A run started by hand, as
-`pr-retest.yml` does with `workflow_dispatch`, does not count, so to
-recover from a flaky queue run use "Re-run jobs" on that merge queue
-run itself, then re-run the `ci-gate` job. How the gate decides is
-documented with the action, as
+`pr-retest.yml` does with `workflow_dispatch`, does not count. How the
+gate decides is documented with the action, as
 [`require-ci-success`](https://github.com/shakenfist/actions/blob/main/docs/actions.md#require-ci-success).
 It has no override. A commit merged around the queue, by an
 administrator bypassing it, cannot be released: tag a later commit
 that went through the queue instead.
 
+The queue merges an entry only once `Can merge` passes, so a commit
+that merged through the queue already has a successful run. A queue
+run that fails, flaky or not, gets its entry ejected, and the commit
+it built never reaches `develop`: re-running that run cannot make any
+tag pass. Re-queue the pull request instead, and tag the commit that
+merges. Re-running a queue run matters only when the tagged commit's
+own run was re-run after it merged and that later attempt failed,
+because the gate judges each run at its latest attempt. Then use
+"Re-run jobs" on that merge queue run until it succeeds, and re-run
+the release's `ci-gate` job.
+
 A gate or version-check failure means nothing was signed or published,
-so every such failure is recoverable. The release template's
+so every such failure is recoverable. It shows only as the failed
+workflow run, which `tools/tag-release.sh` is watching. The workflow
+files no issue for it: `propose-release.sh` and `tag-release.sh` both
+check the version before the tag is pushed. The
 [recovery table](https://github.com/shakenfist/development/blob/main/templates/release-automation/README.md#recovering-from-a-gate-failure)
-says what to do for each cause. Where it says to move the tag:
+in the shared release template's README says what to do for each
+cause; it is the canonical one, and the
+[Rust template's README](https://github.com/shakenfist/development/blob/main/templates/release-automation-rust/README.md#the-ci-gate)
+points to it rather than keeping its own. Where it says to move the
+tag:
 
 ```bash
 git push origin :refs/tags/v0.2.0   # needs the tag ruleset's bypass
@@ -538,7 +554,9 @@ it unchanged, and `tools/propose-release.sh` and
 `--- per-repository settings ---` markers, so make changes upstream
 first. The version the tag must name is `src/vmm/Cargo.toml`'s;
 `make set-version` keeps the other crates in `CARGO_TOML_FILES` at
-the same version.
+the same version. Bump with it, never with `tools/release-version.sh
+set`, which changes only `src/vmm/Cargo.toml` and would leave the
+other crates behind.
 
 ## GitHub automation
 

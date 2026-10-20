@@ -1044,11 +1044,14 @@ endif
 	tools/tag-release.sh $(VERSION) $(COMMIT)
 
 # Check that the version in src/vmm/Cargo.toml matches a release tag,
-# the same check the release workflow's check-version job runs.
+# the same check the release workflow's check-version job runs. TAG may
+# omit the leading v: release-version.sh passes any ref that is not
+# refs/tags/v* without comparing, so the v is added here rather than
+# letting TAG=0.2.0 report success unchecked.
 #
 # Usage: make check-version TAG=v0.2.0
 check-version:
 ifndef TAG
 	$(error TAG is not set. Usage: make check-version TAG=v0.2.0)
 endif
-	tools/release-version.sh check refs/tags/$(TAG)
+	tools/release-version.sh check refs/tags/v$(patsubst v%,%,$(TAG))

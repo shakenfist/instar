@@ -99,14 +99,23 @@ jobs:
   #
   # instar has one build job and no publishing job of its own: its
   # release is the GitHub release, which github-release below creates.
-  # Any job added here must need check-version, be listed in sign-tag's
-  # needs, and, if it publishes, need sign-tag and carry the push and
-  # tag guard.
+  # Any job added here must need check-version, directly or through
+  # another build job; carry if: !cancelled() && every need's result ==
+  # 'success', so a dry run reaches it and a failed or skipped
+  # dependency still stops it; be listed in sign-tag's needs; and, if it
+  # publishes, need sign-tag and carry the push and tag guard.
   # ---------------------------------------------------------------------
 
+  # The if: is needed for the workflow_dispatch dry run. A job with no
+  # if: of its own runs only if every job upstream of it succeeded, not
+  # just the ones it names in needs, so the skipped ci-gate would skip
+  # this job even though check-version ran. Testing check-version's
+  # result alone lets it run then, and on a tag push check-version
+  # succeeds only after the gate did.
   build:
     name: Build Linux binaries
     needs: check-version
+    if: ${{ !cancelled() && needs.check-version.result == 'success' }}
     runs-on: [self-hosted, debian-13, s]
     timeout-minutes: 30
 

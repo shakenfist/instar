@@ -155,9 +155,10 @@ git push origin "refs/tags/${TAG}" || {
 #
 # The run for this tag is the one whose head is the tag and whose event
 # is the push, on the tagged commit and created after this push: during
-# a recovery, an earlier run for the same tag name may still be listed. GitHub can take a few seconds to create it. Failing to
-# find or watch it is not a failure of the release, which is already
-# under way, so it only says where to look.
+# a recovery, an earlier run for the same tag name may still be listed.
+# GitHub can take a few seconds to create it. Failing to find or watch
+# it is not a failure of the release, which is already under way, so it
+# only says where to look.
 
 info "Waiting for the release workflow to start"
 RUN_ID=''
