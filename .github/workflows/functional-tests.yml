@@ -383,15 +383,20 @@ jobs:
     # audits/merge-group-cancellation.md.
     #
     # Cancelling is safe because this queue is serial
-    # (max_entries_to_build: 1), so any other in-flight merge_group run
-    # is by definition superseded and its queue branch already
-    # abandoned. The merge_group- prefix keeps a queue run from sharing
-    # a group with a workflow_dispatch run on develop, whose github.ref
-    # is the same string.
+    # (max_entries_to_build: 1), so any other first attempt of a
+    # merge_group run is by definition superseded and its queue branch
+    # already abandoned. A re-run is not a queue build, though. It keeps
+    # its original event, so with the base-branch key a "Re-run jobs" on
+    # an old queue run, the release recovery in docs/development.md,
+    # would cancel the live queue entry or be cancelled by it. Re-runs
+    # therefore keep their own queue branch's group. The merge_group-
+    # prefix keeps a queue run from sharing a group with a
+    # workflow_dispatch run on develop, whose github.ref is the same
+    # string.
     concurrency:
       group: >-
         ${{ github.workflow }}-build-and-test-${{
-        github.event_name == 'merge_group'
+        github.event_name == 'merge_group' && github.run_attempt == '1'
         && format('merge_group-{0}', github.event.merge_group.base_ref)
         || github.ref }}
       cancel-in-progress: true
@@ -710,10 +715,11 @@ jobs:
     # plus the whole Rust suite on `s` inside 30, and this is that build
     # plus `make deb rpm`.
     timeout-minutes: 60
+    # Keyed as build-and-test's is, for the reasons given there.
     concurrency:
       group: >-
         ${{ github.workflow }}-package-build-${{
-        github.event_name == 'merge_group'
+        github.event_name == 'merge_group' && github.run_attempt == '1'
         && format('merge_group-{0}', github.event.merge_group.base_ref)
         || github.ref }}
       cancel-in-progress: true
@@ -788,10 +794,11 @@ jobs:
     # from a flaky distro in the summary. Tighten once the first runs
     # give real numbers.
     timeout-minutes: 120
+    # Keyed as build-and-test's is, for the reasons given there.
     concurrency:
       group: >-
         ${{ github.workflow }}-package-matrix-${{ matrix.distro.name }}-${{
-        github.event_name == 'merge_group'
+        github.event_name == 'merge_group' && github.run_attempt == '1'
         && format('merge_group-{0}', github.event.merge_group.base_ref)
         || github.ref }}
       cancel-in-progress: true

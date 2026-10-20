@@ -1,11 +1,17 @@
 # Release workflow for Instar
 #
-# Triggers on version tags (v*). Requires approval from the 'release'
-# environment before publishing. Uses Sigstore for tag signing and
-# GitHub Releases for binary distribution.
+# Triggers on version tags (v*), which tools/tag-release.sh pushes once
+# the version bump from tools/propose-release.sh has merged through the
+# merge queue. Nothing is signed or published unless CI passed on the
+# tagged commit and a reviewer approves the 'release' environment.
+# Releases go to GitHub Releases only, as pre-compiled binaries and
+# packages; there is no registry to publish to.
 #
-# Adapted from shakenfist/development/templates/release-automation/
-# for Rust binary releases (no PyPI, pre-compiled binaries instead).
+# Every job outside the marked build section is the same in every Rust
+# repository. The build section holds this repository's own build job.
+# See the template's README for the invariants the fixed jobs keep.
+#
+# Template source: shakenfist/development/templates/release-automation-rust/
 
 name: Release
 
@@ -16,74 +22,100 @@ on:
     tags:
       - 'v*'
 
-  # Allow manual trigger for testing (won't publish without a tag)
+  # A dry run of the build, on any ref: it runs check-version and the
+  # build jobs, and every job with an effect outside the run is skipped.
   workflow_dispatch:
 
+# One run per ref at a time, never cancelled part way: a release that has
+# signed its tag or begun publishing must finish.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  # Fails the release unless the named CI workflows succeeded on the
+  # tagged commit, so that nothing is signed or published from code CI
+  # did not pass. It carries the same push and tag guard as the
+  # publishing jobs, so a workflow_dispatch dry run skips it and still
+  # exercises the build. See "Releases" in docs/development.md for what
+  # counts as CI, and
+  # https://github.com/shakenfist/actions/blob/main/docs/actions.md
+  # (the require-ci-success section) for how the gate works.
+  ci-gate:
+    name: Require CI success on the tagged commit
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: [self-hosted, static]
+
+    permissions:
+      actions: read
+      contents: read
+
+    steps:
+      - name: Require CI success
+        uses: shakenfist/actions/require-ci-success@main
+        # A few API calls per commit, at most 21 commits, and up to
+        # five pages of the default branch's history.
+        timeout-minutes: 5
+        with:
+          workflows: |
+            functional-tests.yml
+
+  # The root of the build graph: every other job needs this one, directly
+  # or through a job that does, so the gate sits upstream of all of them.
+  # A skipped ci-gate would otherwise skip this job too, so the guard lets
+  # a skipped gate through, but only on a run that publishes nothing. A
+  # tag push always runs the gate, and this job then needs its success. A
+  # workflow_dispatch skips the gate by design, and never reaches a
+  # publishing job. The ${{ }} wrapper is required: YAML reads a bare
+  # value starting with "!" as a tag.
+  #
+  # The tag must name the version the tree carries. instar commits no
+  # Cargo.lock, so there is no lockfile to compare. On a dry run with no
+  # tag there is nothing to compare with, and the script only reads the
+  # version.
   check-version:
-    name: Verify Cargo.toml version matches tag
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: [self-hosted, debian-13, s]
+    name: Check the version matches the tag
+    needs: ci-gate
+    if: >-
+      ${{ !cancelled() && (needs.ci-gate.result == 'success' ||
+      (github.event_name != 'push' && needs.ci-gate.result == 'skipped')) }}
+    runs-on: [self-hosted, static]
+    timeout-minutes: 10
 
     permissions:
       contents: read
-      issues: write
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
-      - name: Check version consistency
-        id: check
-        run: |
-          TAG_NAME="${GITHUB_REF#refs/tags/}"
-          EXPECTED="${TAG_NAME#v}"
-          ACTUAL=$(grep '^version = ' src/vmm/Cargo.toml \
-            | head -1 | sed 's/version = "//;s/"//')
-          echo "Tag: ${TAG_NAME}"
-          echo "Expected version: ${EXPECTED}"
-          echo "Cargo.toml version: ${ACTUAL}"
+      - name: Check the version
+        run: tools/release-version.sh check "${GITHUB_REF}"
 
-          if [ "${ACTUAL}" != "${EXPECTED}" ]; then
-            echo "mismatch=true" >> "$GITHUB_OUTPUT"
-            echo "tag=${TAG_NAME}" >> "$GITHUB_OUTPUT"
-            echo "expected=${EXPECTED}" >> "$GITHUB_OUTPUT"
-            echo "actual=${ACTUAL}" >> "$GITHUB_OUTPUT"
-            echo "::error::Version mismatch: tag ${TAG_NAME} expects ${EXPECTED} but Cargo.toml has ${ACTUAL}"
-            exit 1
-          fi
+  # ---------------------------------------------------------------------
+  # BEGIN repository build and publish jobs.
+  #
+  # instar has one build job and no publishing job of its own: its
+  # release is the GitHub release, which github-release below creates.
+  # Any job added here must need check-version, directly or through
+  # another build job; carry if: !cancelled() && every need's result ==
+  # 'success', so a dry run reaches it and a failed or skipped
+  # dependency still stops it; be listed in sign-tag's needs; and, if it
+  # publishes, need sign-tag and carry the push and tag guard.
+  # ---------------------------------------------------------------------
 
-      - name: File issue on version mismatch
-        if: failure() && steps.check.outputs.mismatch == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          tools/ci/install-gh-cli.sh
-          gh issue create \
-            --title "Release ${{ steps.check.outputs.tag }}: Cargo.toml version mismatch" \
-            --label "bug" \
-            --body "$(cat <<'ISSUE_EOF'
-          The release workflow for tag \`${{ steps.check.outputs.tag }}\` failed
-          because the Cargo.toml version does not match the tag.
-
-          - **Tag expects:** ${{ steps.check.outputs.expected }}
-          - **Cargo.toml has:** ${{ steps.check.outputs.actual }}
-
-          To fix this, bump the version and re-tag:
-          \`\`\`bash
-          make release VERSION=${{ steps.check.outputs.expected }}
-          git push origin HEAD
-          git push origin ${{ steps.check.outputs.tag }}
-          \`\`\`
-
-          See the [failed workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.
-          ISSUE_EOF
-          )"
-
+  # The if: is needed for the workflow_dispatch dry run. A job with no
+  # if: of its own runs only if every job upstream of it succeeded, not
+  # just the ones it names in needs, so the skipped ci-gate would skip
+  # this job even though check-version ran. Testing check-version's
+  # result alone lets it run then, and on a tag push check-version
+  # succeeds only after the gate did.
   build:
     name: Build Linux binaries
     needs: check-version
-    if: always() && (needs.check-version.result == 'success' || needs.check-version.result == 'skipped')
+    if: ${{ !cancelled() && needs.check-version.result == 'success' }}
     runs-on: [self-hosted, debian-13, s]
     timeout-minutes: 30
 
@@ -107,6 +139,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Install Docker
         run: tools/ci/install-docker.sh
@@ -161,21 +194,45 @@ jobs:
       # entries therefore upload just the tarball; the deb/rpm
       # globs match nothing and that's fine. Filename-prefixed
       # globs avoid pulling in unrelated artifacts that may exist
-      # in the working directory.
+      # in the working directory. The release- prefix is what
+      # github-release attaches to the GitHub release.
       - name: Upload distribution artifact
         uses: actions/upload-artifact@v7
         with:
-          name: binary-${{ matrix.target }}
+          name: release-${{ matrix.target }}
           path: |
             ${{ env.ARCHIVE }}
             instar_*.deb
             instar-*.rpm
           if-no-files-found: error
 
+  # ---------------------------------------------------------------------
+  # END repository build and publish jobs.
+  # ---------------------------------------------------------------------
+
+  # Keyless Sigstore signing of the tag, gated on approval of the release
+  # environment. Every publishing job needs this one, so nothing is
+  # published until a reviewer approves, and it needs every build job, so
+  # the tag is never re-pushed while a build is running or after one has
+  # failed.
+  #
+  # The event is tested as well as the ref because a dispatch can be
+  # aimed at a tag: the ref test alone passes there, and the run re-signs
+  # and force-pushes a tag that already exists, rewriting a signed object
+  # someone may already have verified. Nothing is lost by requiring push:
+  # re-running a failed release goes through "Re-run jobs", which keeps
+  # the original push event.
   sign-tag:
     name: Sign release tag with Sigstore
-    needs: build
-    runs-on: [self-hosted, debian-13, s]
+    needs: [build]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    # The script installs gitsign with sudo and writes global git config,
+    # so this job needs a throwaway runner rather than the shared static
+    # pool, which grants no passwordless sudo and would carry the global
+    # git config into whatever lands on it next. vm is what insists on a
+    # throwaway runner; s because the job is small.
+    runs-on: [self-hosted, vm, debian-13, s]
+    timeout-minutes: 15
     environment: release
 
     permissions:
@@ -188,55 +245,40 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install gitsign
-        run: |
-          GITSIGN_VERSION="0.14.0"
-          curl -sLO "https://github.com/sigstore/gitsign/releases/download/v${GITSIGN_VERSION}/gitsign_${GITSIGN_VERSION}_linux_amd64"
-          curl -sLO "https://github.com/sigstore/gitsign/releases/download/v${GITSIGN_VERSION}/checksums.txt"
-          sha256sum --ignore-missing -c checksums.txt
-          chmod +x "gitsign_${GITSIGN_VERSION}_linux_amd64"
-          sudo mv "gitsign_${GITSIGN_VERSION}_linux_amd64" /usr/local/bin/gitsign
+      - name: Sign and push the release tag
+        run: tools/sign-release-tag.sh "${GITHUB_REF_NAME}" "${GITHUB_SHA}"
 
-      - name: Configure git for Sigstore signing
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git config --global tag.gpgsign true
-          git config --global gpg.format x509
-          git config --global gpg.x509.program gitsign
-
-      - name: Create signed tag
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TAG_NAME="${GITHUB_REF#refs/tags/}"
-          echo "Signing tag: ${TAG_NAME}"
-          git tag -d "${TAG_NAME}" || true
-          git tag -s "${TAG_NAME}" -m "Release ${TAG_NAME}" "${GITHUB_SHA}"
-          git push origin "${TAG_NAME}" --force
-
+  # This job does not check out, and does not need to:
+  # action-gh-release is a JavaScript action running on the host, so it
+  # reads an absolute path happily. The static pool persists between jobs
+  # and download-artifact extracts into its target rather than replacing
+  # it, so the artefacts go to the per-job runner.temp, where nothing an
+  # earlier job left can join the release.
+  #
+  # fail_on_unmatched_files is the other half: action-gh-release treats a
+  # glob that matches nothing as a warning, so without it a release that
+  # attached no files at all still reported success.
   github-release:
     name: Create GitHub Release
     needs: [build, sign-tag]
-    runs-on: [self-hosted, debian-13, s]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: [self-hosted, static]
+    timeout-minutes: 15
 
     permissions:
       contents: write
 
     steps:
-      - name: Download artifacts
+      - name: Download release artefacts
         uses: actions/download-artifact@v8
         with:
-          pattern: binary-*
+          pattern: release-*
+          path: ${{ runner.temp }}/dist/
           merge-multiple: true
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
-          files: |
-            instar-*.tar.gz
-            instar_*.deb
-            instar-*.rpm
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          files: ${{ runner.temp }}/dist/*
+          fail_on_unmatched_files: true
