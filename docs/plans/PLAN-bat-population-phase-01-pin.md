@@ -368,6 +368,35 @@ after `git add`. Steps 1b and 1c are separate commits because the
 comparator is useful, and reviewable, without the sweep. Step 1d's
 commit carries data and the plan section that explains it.
 
+## Sweep results
+
+Run on 2026-10-21 against instar-testdata `cf67642b`
+(`cf67642bbb93fdce0cd5adbae032951f74838563`), all 80 static builds
+from 6.0.0 to 10.2.0, the host `qemu-img` excluded:
+
+    python3 tools/sweep-qemu-create.py \
+        --write tests/golden/qemu-create-pins.json \
+        --scratch <scratchpad>/sweep --jobs 2
+
+Wall time 377 s (load average falling from about 14 to 7 during the
+run). The pin lists exactly the 80 versions in
+`qemu-img-binaries/x86_64`, and is 71622 bytes.
+
+The result is the expected one: every case is a single group except
+the monolithicFlat descriptor, which splits exactly at the
+`ddb.toolsVersion` boundary.
+
+| Case | Groups | Boundary |
+|------|--------|----------|
+| `vmdk-flat-64M` | 2 | 6.1.1 / 6.2.0: `descriptor` gains `ddb.toolsVersion = "2147483647"`; `rc`, `stderr` and `extent_length` unchanged |
+| the other 30 cases (23 VHDX, 6 preallocation, `vmdk-flat-backing`) | 1 | none, 6.0.0 to 10.2.0 |
+
+The first group is 6.0.0, 6.0.1, 6.1.0 and 6.1.1. The boundary was
+replayed on its own with `--check --cases vmdk-flat-64M --versions
+6.1.0,6.1.1,6.2.0` and matched the pin. Every pinned value that the
+spot sample above also measured agrees with it, so the master plan's
+Situation stands.
+
 ## Risks and mitigations
 
 * **Correlated error between the comparator and a future emitter.** If
