@@ -58,12 +58,13 @@ also feeds the later VMDK `twoGbMaxExtent*` multi-extent output leaf.
 This plan takes the prerequisite and the two leaves; the multi-extent
 leaf stays out (see the Mission).
 
-It is sequenced after `PLAN-654-subcluster-classification`, which is
-planned on the `fix-654-subcluster-classification` branch (commits
-`9bac3c45` and `97dadb66`) and is not yet on `develop`. That plan
-rebuilds the qcow2 read path and touches none of the VHD, VHDX or VMDK
-writers, so this plan does not depend on it and can be planned against
-`develop` as it stands at `da9f043f`.
+It runs alongside `PLAN-654-subcluster-classification`, whose first
+phase merged as `d08841e3` (#801). That plan rebuilds the qcow2 read
+path and touches none of the VHD, VHDX or VMDK writers, so this plan
+does not depend on it. The one file both edit is the check op
+(`src/operations/check/src/main.rs`), whose qcow2 arms #801 rewrote;
+the VHDX line numbers this plan cites there were taken at `da9f043f`
+and each phase's survey re-reads them.
 
 Everything below was surveyed or measured on 2026-10-20. "Measured"
 means one of: the host's qemu-img 10.0.13 (Debian
