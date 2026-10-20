@@ -488,7 +488,12 @@ and a version bump pushed straight to `develop` has no such run.
    `make test-rust`, and then asks before it commits `Release 0.2.0.`,
    pushes the branch and opens a pull request. On `N`, or on any
    failure before the push, it deletes the branch and leaves the
-   checkout as it was.
+   checkout as it was. It does not touch `CHANGELOG.md`: date the
+   release there with a second commit on `release-0.2.0`, moving the
+   `## [Unreleased]` entries under `## [0.2.0] - YYYY-MM-DD`, and push
+   it before the pull request queues. `tag-release.sh` finds the merge
+   that contains `Release 0.2.0.`, so the extra commit does not change
+   which commit is tagged.
 2. **Merge.** Get the pull request reviewed and land it through the
    merge queue like any other change, then wait for the queue's
    `functional-tests.yml` run on the merged commit to finish.
