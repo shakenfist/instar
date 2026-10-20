@@ -347,8 +347,9 @@ def _write_qcow2_backing(path: Path, content: bytes, cluster_size: int, parts_di
 
 def build_fixture(target_dir: Path, name: str, description: str, *, cluster_size: int = 65536,
                   extended_l2: bool = True, backing: bool = False, backing_cluster_size: int = 0,
-                  data_file: bool = False,
-                  ops: Sequence[Op] = (), patches: Sequence[Patch] = (),
+                  backing_fixture: Optional['SubclusterFixture'] = None,
+                  data_file: bool = False, data_file_raw: Optional[bool] = None,
+                  ops: Sequence[Op] = (), data_file_ops: Sequence[Op] = (), patches: Sequence[Patch] = (),
                   patch_fn: Optional[Callable[[Qcow2Layout], Sequence[Patch]]] = None,
                   expect_types: FrozenSet[str] = frozenset()) -> SubclusterFixture:
     """Build one fixture, derive its expectations, and check it has `expect_types`.
@@ -359,26 +360,52 @@ def build_fixture(target_dir: Path, name: str, description: str, *, cluster_size
     chose. Data and backing files are named by absolute path, because qemu
     resolves a relative data-file name against its working directory. The
     backing file is raw unless `backing_cluster_size` is set, when it is a
-    qcow2 with clusters of that size holding the same bytes.
+    qcow2 with clusters of that size holding the same bytes, or
+    `backing_fixture` is given, when that already-built fixture is the backing
+    file and its `expected_raw` is what the backing chain reads.
+
+    `data_file_raw` sets the qcow2 option of that name when it is not None.
+    `data_file_ops` are written into the data file itself, as a raw image,
+    after the qcow2 writes: bytes the qcow2 does not map, which a correct
+    reader never returns.
     """
     target_dir = Path(target_dir).resolve()
     target_dir.mkdir(parents=True, exist_ok=True)
     virtual_size = cluster_size * CLUSTERS_PER_FIXTURE
+    if backing_fixture is not None:
+        backing = True
+        if backing_fixture.expected_raw is None or backing_fixture.virtual_size != virtual_size:
+            raise ValueError(f'{name}: backing fixture {backing_fixture.name} must read cleanly at '
+                             f'{virtual_size} bytes')
+    if data_file_ops and not data_file:
+        raise ValueError(f'{name}: data_file_ops needs a data file')
     path = target_dir / f'{name}.qcow2'
     backing_suffix = 'qcow2' if backing_cluster_size else 'raw'
-    backing_path = target_dir / f'{name}.backing.{backing_suffix}' if backing else None
+    if backing_fixture is not None:
+        backing_path = backing_fixture.path
+    else:
+        backing_path = target_dir / f'{name}.backing.{backing_suffix}' if backing else None
     data_path = target_dir / f'{name}.data' if data_file else None
-    for stale in (path, backing_path, data_path):
+    for stale in (path, None if backing_fixture is not None else backing_path, data_path):
         if stale is not None and stale.exists():
             stale.unlink()
 
     options = [f'cluster_size={cluster_size}', 'extended_l2=' + ('on' if extended_l2 else 'off')]
     if data_path is not None:
         options.append(f'data_file={data_path}')
+        if data_file_raw is not None:
+            options.append('data_file_raw=' + ('on' if data_file_raw else 'off'))
     argv = ['qemu-img', 'create', '-q', '-f', 'qcow2', '-o', ','.join(options)]
-    backing_bytes = backing_content(virtual_size) if backing_path is not None else bytes(virtual_size)
+    if backing_fixture is not None:
+        backing_bytes = backing_fixture.expected_raw
+    elif backing_path is not None:
+        backing_bytes = backing_content(virtual_size)
+    else:
+        backing_bytes = bytes(virtual_size)
     model = bytearray(backing_bytes)
-    if backing_path is not None and backing_cluster_size:
+    if backing_fixture is not None:
+        argv += ['-b', str(backing_path), '-F', 'qcow2']
+    elif backing_path is not None and backing_cluster_size:
         _write_qcow2_backing(backing_path, backing_bytes, backing_cluster_size, target_dir / f'{name}.parts')
         argv += ['-b', str(backing_path), '-F', 'qcow2']
     elif backing_path is not None:
@@ -392,6 +419,12 @@ def build_fixture(target_dir: Path, name: str, description: str, *, cluster_size
             io_argv += ['-c', _qemu_io_command(op)]
             _apply_to_model(model, op)
         _run(io_argv + [str(path)])
+
+    if data_file_ops:
+        io_argv = ['qemu-io', '-f', 'raw']
+        for op in data_file_ops:
+            io_argv += ['-c', _qemu_io_command(op)]
+        _run(io_argv + [str(data_path)])
 
     all_patches = list(patches)
     if patch_fn is not None:
@@ -649,9 +682,125 @@ HOST_OFFSET_REFUSAL_BUILDERS: Dict[str, Callable[[Path], SubclusterFixture]] = d
 ])
 
 
-def build_all(target_dir: Path, include_host_offset_refusals: bool = False) -> Dict[str, SubclusterFixture]:
+def _data_file_mid_chain(target_dir: Path) -> SubclusterFixture:
+    """A classic qcow2 over a data-file qcow2 over a raw file: a data device sits between two layers.
+
+    The middle layer has extended L2, its own data file and the raw base as
+    its backing file. Its cluster 0 has subclusters 0-1 written (the rest
+    read the base), cluster 2 is written whole, and the rest are unallocated
+    and read the base. Its data file also holds bytes at cluster 3 that the
+    middle layer does not map. The top layer, with no data file, writes
+    cluster 4 and zeroes cluster 6; everything else reads the middle layer.
+    """
+    middle = build_fixture(
+        target_dir, 'data_file_mid_chain_middle',
+        'The middle layer of data_file_mid_chain: extended L2, a data file, and a raw backing file.',
+        data_file=True, backing=True,
+        ops=[('write', 0xab, 0, 4096), ('write', 0xcd, 2 * _K64, _K64)],
+        data_file_ops=[('write', 0x77, 3 * _K64, _K64)],
+        expect_types=frozenset({NORMAL, UNALLOCATED_ALLOC, UNALLOCATED_PLAIN}))
+    return build_fixture(
+        target_dir, 'data_file_mid_chain',
+        'Classic L2, no data file, over data_file_mid_chain_middle (a data-file qcow2 over a raw file): '
+        'unallocated clusters of either qcow2 layer read the next layer, never the middle layer\'s data file.',
+        extended_l2=False, backing_fixture=middle,
+        ops=[('write', 0x5a, 4 * _K64, _K64), ('zero', 6 * _K64, _K64)],
+        expect_types=frozenset({NORMAL, ZERO_PLAIN, UNALLOCATED_PLAIN}))
+
+
+#: Data-file shapes whose unallocated clusters must read the backing chain
+#: or zeros, never the data file (#792), keyed by name. They are kept apart
+#: from BUILDERS until instar stops reading a data file as a backing layer;
+#: each value takes a target directory and returns a SubclusterFixture.
+DATA_DEVICE_BUILDERS: Dict[str, Callable[[Path], SubclusterFixture]] = dict([
+    # The issue's first reproduction: data file plus raw backing file.
+    _shape('issue_792_backing_classic', 'Classic L2 with a data file over a raw backing file; cluster 0 written '
+           'whole and 4K written at cluster 2. Unallocated clusters read the backing file, not the data file '
+           '(#792).',
+           [NORMAL, UNALLOCATED_PLAIN], extended_l2=False, data_file=True, backing=True,
+           ops=[('write', 0xab, 0, _K64), ('write', 0xcd, 2 * _K64, 4096)]),
+    _shape('issue_792_backing_ext', 'As issue_792_backing_classic with extended L2: cluster 2\'s unwritten '
+           'subclusters also read the backing file (#792).',
+           [NORMAL, UNALLOCATED_ALLOC, UNALLOCATED_PLAIN], data_file=True, backing=True,
+           ops=[('write', 0xab, 0, _K64), ('write', 0xcd, 2 * _K64, 4096)]),
+    # The issue's second reproduction: data_file_raw=off, no backing file,
+    # and bytes written straight into the data file where the qcow2 maps
+    # nothing. They must read as zeros.
+    _shape('issue_792_stale_data_file_classic', 'Classic L2 with a data file, data_file_raw=off, no backing file; '
+           '4K written at cluster 0, then 0x77 written into the data file at cluster 5, which the qcow2 does '
+           'not map: cluster 5 reads zeros (#792).',
+           [NORMAL, UNALLOCATED_PLAIN], extended_l2=False, data_file=True, data_file_raw=False,
+           ops=[('write', 0xab, 0, 4096)], data_file_ops=[('write', 0x77, 5 * _K64, _K64)]),
+    _shape('issue_792_stale_data_file_ext', 'As issue_792_stale_data_file_classic with extended L2, and 0x77 also '
+           'written into the data file under cluster 0\'s unallocated subclusters 4-31: those read zeros too '
+           '(#792).',
+           [NORMAL, UNALLOCATED_ALLOC, UNALLOCATED_PLAIN], data_file=True, data_file_raw=False,
+           ops=[('write', 0xab, 0, 4096)],
+           data_file_ops=[('write', 0x77, 4 * _S64, _K64 - 4 * _S64), ('write', 0x77, 5 * _K64, _K64)]),
+    ('data_file_mid_chain', _data_file_mid_chain),
+])
+
+
+@dataclasses.dataclass(frozen=True)
+class ComparePairFixture:
+    """Two fixtures that `compare` reads as one chain each.
+
+    `identical` is whether qemu reads the same virtual disk from both, which
+    is what `compare` must report.
+    """
+    name: str
+    description: str
+    left: SubclusterFixture
+    right: SubclusterFixture
+
+    @property
+    def identical(self) -> bool:
+        """Return True when both sides read the same bytes."""
+        return self.left.expected_raw == self.right.expected_raw
+
+
+def _data_file_pair(target_dir: Path) -> ComparePairFixture:
+    """Two data-file images over raw backing files whose virtual disks are identical.
+
+    Left has extended L2, right classic L2, and both write 4K at cluster 0, so
+    the rest of every cluster reads the backing file (classic L2 copies it into
+    the data file on that write). Right's data file also holds bytes at cluster
+    5 that its qcow2 does not map. Each side's data device sits inside its own
+    chain, so a reader that takes either data file for a backing layer reports
+    a difference that is not there.
+    """
+    left = build_fixture(
+        target_dir, 'data_file_pair_left', 'The left input of data_file_pair: extended L2, a data file and a raw '
+        'backing file, 4K written at cluster 0.',
+        data_file=True, backing=True, ops=[('write', 0xab, 0, 4096)],
+        expect_types=frozenset({NORMAL, UNALLOCATED_ALLOC, UNALLOCATED_PLAIN}))
+    right = build_fixture(
+        target_dir, 'data_file_pair_right', 'The right input of data_file_pair: classic L2, a data file and a raw '
+        'backing file, 4K written at cluster 0, and bytes the qcow2 does not map in the data file at cluster 5.',
+        extended_l2=False, data_file=True, backing=True, ops=[('write', 0xab, 0, 4096)],
+        data_file_ops=[('write', 0x77, 5 * _K64, _K64)],
+        expect_types=frozenset({NORMAL, UNALLOCATED_PLAIN}))
+    pair = ComparePairFixture(
+        'data_file_pair', 'compare of two data-file images over backing files, each data device in its own '
+        'chain: identical (#792).', left, right)
+    if not pair.identical:
+        raise RuntimeError('data_file_pair: qemu does not read the same disk from both sides')
+    return pair
+
+
+#: compare cases whose two inputs are both data-file images, keyed by name.
+#: Each value takes a target directory and returns a ComparePairFixture.
+DATA_DEVICE_COMPARE_PAIRS: Dict[str, Callable[[Path], ComparePairFixture]] = {
+    'data_file_pair': _data_file_pair,
+}
+
+
+def build_all(target_dir: Path, include_host_offset_refusals: bool = False,
+              include_data_device: bool = False) -> Dict[str, SubclusterFixture]:
     """Build every fixture into `target_dir` and return them keyed by name."""
     builders = dict(BUILDERS)
     if include_host_offset_refusals:
         builders.update(HOST_OFFSET_REFUSAL_BUILDERS)
+    if include_data_device:
+        builders.update(DATA_DEVICE_BUILDERS)
     return {name: build(Path(target_dir)) for name, build in builders.items()}
