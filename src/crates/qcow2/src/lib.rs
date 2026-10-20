@@ -99,8 +99,10 @@ pub const COMPAT_LAZY_REFCOUNTS: u64 = 1 << 0;
 ///   ChainDeviceInfo.data_device_idx; VMM validates and opens the
 ///   data file as a separate virtio-block device)
 /// - Bit 3 (compression): conditionally supported (see below)
-/// - Bit 4 (extended_l2): supported (16-byte L2 entries; subcluster
-///   bitmap is ignored, treating the cluster as fully allocated)
+/// - Bit 4 (extended_l2): supported (16-byte L2 entries; each
+///   subcluster is decided by `subcluster_type()` and
+///   `subcluster_range()`, which follow qemu's classification, and an
+///   entry qemu calls invalid is refused)
 ///
 /// When the `decompress-zstd` feature is enabled, bit 3 is included
 /// because ZSTD decompression is available. Otherwise only zlib
@@ -1376,103 +1378,348 @@ shared::cached_read!(read_u8_cached, u8, be, 1);
 // ============================================================================
 
 /// Result of looking up a virtual offset in QCOW2 L1/L2 tables.
+///
+/// The verdict is derived from [`subcluster_type`], so a variant that
+/// names the whole cluster (`Unallocated`, `Zero`, `Standard`) means
+/// every subcluster of an extended-L2 entry has that type, and only a
+/// genuinely mixed entry is `StandardSubclusters`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClusterLookup {
-    /// Cluster is unallocated (reads as zeros, or from backing)
+    /// Every subcluster is `UnallocatedPlain` or `UnallocatedAlloc`:
+    /// the cluster reads from the backing layer, or as zeros at the
+    /// bottom of the chain. Any host offset the entry carries is not
+    /// read.
     Unallocated,
-    /// Classic (non-extended) L2 entry with the qcow2 v3 all-zeroes
-    /// flag (`QCOW_OFLAG_ZERO`, bit 0) set. The cluster reads as all
-    /// zeros regardless of the host-offset field; the chain reader
-    /// must zero-fill it and must NOT fall through to a backing layer
+    /// Every subcluster is `ZeroPlain` or `ZeroAlloc`: the cluster
+    /// reads as all zeros regardless of the host-offset field. For a
+    /// classic entry this is the qcow2 v3 all-zeroes flag
+    /// (`QCOW_OFLAG_ZERO`, bit 0); for an extended entry it is a zero
+    /// bitmap covering all 32 subclusters. The chain reader must
+    /// zero-fill it and must NOT fall through to a backing layer
     /// (unlike `Unallocated`) nor read the host offset (unlike
-    /// `Standard`). The extended-L2 equivalent is expressed through
-    /// `StandardSubclusters`' zero bitmap.
+    /// `Standard`).
     Zero,
-    /// Standard cluster at given host byte offset
+    /// Every subcluster is `Normal`: the whole cluster is at the given
+    /// host byte offset. A host offset of 0 is possible only in an
+    /// image with an external data file, where it is a real offset
+    /// into that file (`block/qcow2.h:724-733` at qemu v10.0.0).
     Standard(u64),
-    /// Standard cluster with extended L2 subcluster bitmap.
-    /// (host_offset, subcluster_bitmap)
-    /// Bitmap bits 0-31 = allocation, bits 32-63 = zero.
+    /// Extended-L2 entry whose subclusters are of more than one type.
+    /// (raw L2 word, subcluster bitmap)
+    /// Bitmap bits 0-31 = allocation, bits 32-63 = zero. The L2 word
+    /// is carried whole rather than as a host offset because the
+    /// classifier needs its flags too: at host offset 0, `COPIED`
+    /// decides between a data-file cluster and an unallocated one.
+    /// Classify each subcluster with [`subcluster_range`], passing
+    /// [`Qcow2State::has_data_file`].
     StandardSubclusters(u64, u64),
     /// Compressed cluster: raw L2 entry for offset/size parsing
     Compressed(u64),
+    /// The entry is what qemu calls `QCOW2_SUBCLUSTER_INVALID`: alloc
+    /// bits with no host cluster behind them (#650, #653), or a
+    /// subcluster marked both allocated and zero. qemu fails the read
+    /// with `EIO` ("Invalid cluster entry found",
+    /// `block/qcow2-cluster.c:712-718` at v10.0.0); callers must refuse
+    /// it too, not zero-fill it or read the host offset.
+    Invalid,
 }
 
 // ============================================================================
-// Extended L2 subcluster bitmap validation
+// Subcluster classification (qemu's qcow2_get_subcluster_type)
 // ============================================================================
 
-/// Verdict for an extended-L2 entry's subcluster bitmap.
-/// `Ok` means the bitmap is self-consistent per the QCOW2 spec.
-/// Other variants identify which invariant failed so callers
-/// can log specifically.
+/// Subclusters per cluster in an extended-L2 image
+/// (`QCOW_EXTL2_SUBCLUSTERS_PER_CLUSTER`, `block/qcow2.h:81` at qemu
+/// v10.0.0). A classic image has one subcluster per cluster.
+pub const QCOW_EXTL2_SUBCLUSTERS_PER_CLUSTER: u32 = 32;
+
+/// The type of one subcluster of a qcow2 L2 entry, as qemu's
+/// `QCow2SubclusterType` (`block/qcow2.h:540-548` at v10.0.0) defines
+/// it. This is the one place instar decides what an L2 entry means;
+/// see [`subcluster_type`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubclusterType {
+    /// Data is at the entry's host offset (in the external data file,
+    /// if the image has one).
+    Normal,
+    /// Reads as zeros; the entry also names a host cluster.
+    ZeroAlloc,
+    /// Reads as zeros; no host cluster.
+    ZeroPlain,
+    /// Reads from the backing layer (zeros without one); the entry
+    /// names a host cluster that this subcluster does not use.
+    UnallocatedAlloc,
+    /// Reads from the backing layer (zeros without one); no host
+    /// cluster.
+    UnallocatedPlain,
+    /// The whole cluster is compressed; the bitmap is not consulted.
+    Compressed,
+    /// The entry is corrupt and the read must fail. This is a property
+    /// of the whole entry and bitmap, not of one subcluster's bits.
+    Invalid,
+}
+
+/// qemu's `QCow2ClusterType` (`block/qcow2.h:532-538` at v10.0.0),
+/// the whole-entry classification the subcluster type is built on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClusterType {
+    Unallocated,
+    ZeroPlain,
+    ZeroAlloc,
+    Normal,
+    Compressed,
+}
+
+/// Transcription of `qcow2_get_cluster_type` (`block/qcow2.h:713-737`
+/// at qemu v10.0.0).
+///
+/// The zero flag (bit 0) only means "reads as zeros" without extended
+/// L2; with extended L2 that is the bitmap's job. A host offset of 0
+/// generally means unallocated, but with an external data file 0 is a
+/// valid offset: every data-file cluster has refcount 1, so
+/// `QCOW_OFLAG_COPIED` disambiguates (`:724-733`).
+fn cluster_type(l2_entry: u64, extended_l2: bool, has_data_file: bool) -> ClusterType {
+    if l2_entry & OFLAG_COMPRESSED != 0 {
+        ClusterType::Compressed
+    } else if l2_entry & QCOW_OFLAG_ZERO != 0 && !extended_l2 {
+        if l2_entry & L2_OFFSET_MASK != 0 {
+            ClusterType::ZeroAlloc
+        } else {
+            ClusterType::ZeroPlain
+        }
+    } else if l2_entry & L2_OFFSET_MASK == 0 {
+        if has_data_file && l2_entry & OFLAG_COPIED != 0 {
+            ClusterType::Normal
+        } else {
+            ClusterType::Unallocated
+        }
+    } else {
+        ClusterType::Normal
+    }
+}
+
+/// Whether an uncompressed L2 entry names a host cluster, as qemu's
+/// cluster type decides it: true for `Normal` and `ZeroAlloc`, which
+/// with an external data file includes `QCOW_OFLAG_COPIED` at host
+/// offset 0, where qemu puts virtual cluster 0. A compressed entry is
+/// false; its offset is a byte address with a sector count, not a
+/// cluster.
+pub fn l2_entry_names_host_cluster(l2_entry: u64, extended_l2: bool, has_data_file: bool) -> bool {
+    matches!(
+        cluster_type(l2_entry, extended_l2, has_data_file),
+        ClusterType::Normal | ClusterType::ZeroAlloc
+    )
+}
+
+/// Subclusters in one cluster: 32 with extended L2, else 1.
+fn subclusters_per_cluster(extended_l2: bool) -> u32 {
+    if extended_l2 {
+        QCOW_EXTL2_SUBCLUSTERS_PER_CLUSTER
+    } else {
+        1
+    }
+}
+
+/// Bitmap alloc bits for subclusters `[from, to)`
+/// (`QCOW_OFLAG_SUB_ALLOC_RANGE`, `block/qcow2.h:88-89`). `to <= 32`.
+fn sub_alloc_range(from: u32, to: u32) -> u32 {
+    ((1u64 << to) - (1u64 << from)) as u32
+}
+
+/// Classify subcluster `sc_index` of an L2 entry.
+///
+/// Transcribes `qcow2_get_subcluster_type` (`block/qcow2.h:747-796` at
+/// qemu v10.0.0) on top of `qcow2_get_cluster_type` (`:713-737`):
+///
+/// * `l2_entry` is the 64-bit L2 word and `bitmap` the extended-L2
+///   subcluster bitmap (bits 0-31 allocated, bits 32-63 reads-as-zero),
+///   ignored without extended L2.
+/// * `has_data_file` is the header's `INCOMPAT_EXTERNAL_DATA` bit. With
+///   it, `QCOW_OFLAG_COPIED` at host offset 0 is `Normal`.
+/// * `Invalid` checks the *whole* entry and bitmap, not only the bits
+///   for `sc_index` (`:739-745`): an alloc bit on an unallocated entry
+///   (`:771-772`), or any subcluster both allocated and zero on a
+///   normal entry (`:761-762`), makes every subcluster `Invalid`.
+/// * A compressed entry is `Compressed` whatever its bitmap holds
+///   (`:758-759`); `check` is where a non-zero bitmap there is flagged.
+///
+/// `sc_index` must be below 32 with extended L2 and 0 without it, as
+/// qemu asserts (`:754`). An index outside the cluster is a caller bug;
+/// it classifies as `Invalid` so the read fails closed rather than
+/// consulting the wrong bits.
+pub fn subcluster_type(
+    l2_entry: u64,
+    bitmap: u64,
+    sc_index: u32,
+    extended_l2: bool,
+    has_data_file: bool,
+) -> SubclusterType {
+    if sc_index >= subclusters_per_cluster(extended_l2) {
+        return SubclusterType::Invalid;
+    }
+    let ctype = cluster_type(l2_entry, extended_l2, has_data_file);
+    if !extended_l2 {
+        // block/qcow2.h:781-796.
+        return match ctype {
+            ClusterType::Compressed => SubclusterType::Compressed,
+            ClusterType::ZeroPlain => SubclusterType::ZeroPlain,
+            ClusterType::ZeroAlloc => SubclusterType::ZeroAlloc,
+            ClusterType::Normal => SubclusterType::Normal,
+            ClusterType::Unallocated => SubclusterType::UnallocatedPlain,
+        };
+    }
+
+    let alloc_bits = bitmap as u32;
+    let zero_bits = (bitmap >> 32) as u32;
+    let sc_bit = 1u32 << sc_index;
+    match ctype {
+        ClusterType::Compressed => SubclusterType::Compressed,
+        ClusterType::Normal => {
+            if zero_bits & alloc_bits != 0 {
+                SubclusterType::Invalid
+            } else if zero_bits & sc_bit != 0 {
+                SubclusterType::ZeroAlloc
+            } else if alloc_bits & sc_bit != 0 {
+                SubclusterType::Normal
+            } else {
+                SubclusterType::UnallocatedAlloc
+            }
+        }
+        ClusterType::Unallocated => {
+            if alloc_bits != 0 {
+                SubclusterType::Invalid
+            } else if zero_bits & sc_bit != 0 {
+                SubclusterType::ZeroPlain
+            } else {
+                SubclusterType::UnallocatedPlain
+            }
+        }
+        // cluster_type() yields ZeroPlain/ZeroAlloc only without
+        // extended L2, which returned above (qemu: g_assert_not_reached,
+        // :778-779). Fail closed rather than panic in the guest.
+        ClusterType::ZeroPlain | ClusterType::ZeroAlloc => SubclusterType::Invalid,
+    }
+}
+
+/// Classify subcluster `sc_from` and count how many contiguous
+/// subclusters from it share its type.
+///
+/// Transcribes `qcow2_get_subcluster_range_type`
+/// (`block/qcow2-cluster.c:395-429` at qemu v10.0.0). Returns the type
+/// and the run length in subclusters, which is at least 1 and runs to
+/// the end of the cluster at most. A compressed entry, and every entry
+/// without extended L2, is one run to the end of the cluster (`:406-407`).
+/// For `Invalid` the run length is 0, as qemu returns `-EINVAL`
+/// (`:404-405`): there is nothing to read.
+///
+/// Like qemu's, a run of `UnallocatedAlloc` or `UnallocatedPlain` ends
+/// at the next subcluster with either bitmap bit set (`:420-424`), and
+/// a run of a zero type at the next subcluster without its zero bit
+/// (`:415-418`).
+pub fn subcluster_range(
+    l2_entry: u64,
+    bitmap: u64,
+    sc_from: u32,
+    extended_l2: bool,
+    has_data_file: bool,
+) -> (SubclusterType, u32) {
+    let ty = subcluster_type(l2_entry, bitmap, sc_from, extended_l2, has_data_file);
+    let per_cluster = subclusters_per_cluster(extended_l2);
+    if ty == SubclusterType::Invalid {
+        return (ty, 0);
+    }
+    if !extended_l2 || ty == SubclusterType::Compressed {
+        return (ty, per_cluster - sc_from);
+    }
+
+    // sc_from < 32 here: subcluster_type() returned Invalid otherwise.
+    let alloc_bits = bitmap as u32;
+    let zero_bits = (bitmap >> 32) as u32;
+    let below = sub_alloc_range(0, sc_from);
+    let run = match ty {
+        SubclusterType::Normal => (alloc_bits | below).trailing_ones() - sc_from,
+        SubclusterType::ZeroPlain | SubclusterType::ZeroAlloc => {
+            (zero_bits | below).trailing_ones() - sc_from
+        }
+        SubclusterType::UnallocatedPlain | SubclusterType::UnallocatedAlloc => {
+            ((zero_bits | alloc_bits) & !below).trailing_zeros() - sc_from
+        }
+        // Handled above.
+        SubclusterType::Compressed | SubclusterType::Invalid => 0,
+    };
+    (ty, run)
+}
+
+// ============================================================================
+// Extended L2 subcluster bitmap validation (check)
+// ============================================================================
+
+/// What `qemu-img check` would say about an extended-L2 entry's
+/// subcluster bitmap. `Ok` means it says nothing; each other variant is
+/// one of its `ERROR` lines in `check_refcounts_l2`
+/// (`block/qcow2-refcount.c` at qemu v10.0.0).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubclusterBitmapStatus {
-    /// Bitmap is consistent.
+    /// Nothing to report.
     Ok,
-    /// Compressed entry but bitmap is non-zero (spec reserves 0).
-    /// We also accept the legacy QEMU pattern alloc_bits=0xFFFF_FFFF
-    /// with zero_bits=0; anything else is flagged.
+    /// A compressed entry with a non-zero bitmap: "compressed cluster
+    /// with non-zero subcluster allocation bitmap" (`:1717-1722`). See
+    /// [`compressed_entry_has_bitmap`].
     CompressedNonZero,
-    /// `alloc_bits & zero_bits != 0` — subcluster simultaneously
-    /// allocated and all-zero without a host cluster.
+    /// An allocated cluster (a host offset, or `QCOW_OFLAG_COPIED` at
+    /// offset 0 with an external data file) with a subcluster both
+    /// allocated and zero: "Allocated cluster has corrupted subcluster
+    /// allocation bitmap" (`:1756-1761`).
     AllocAndZeroOverlap,
-    /// `host_offset == 0 && alloc_bits != 0` — bitmap claims
-    /// subclusters are allocated but no host cluster to hold them.
-    AllocWithoutHost,
-    /// `host_offset != 0 && alloc_bits == 0 && zero_bits == 0` —
-    /// host cluster allocated but no subcluster references it.
-    HostWithoutRef,
+    /// An unallocated cluster with an allocation bit set: "Unallocated
+    /// cluster has non-zero subcluster allocation map" (`:1838-1843`).
+    /// This is #650's and #653's shape.
+    UnallocatedWithAllocBits,
 }
 
-/// Validate an extended-L2 entry's subcluster bitmap against the
-/// QCOW2 spec's invalid-combination rules.
+/// Whether a compressed extended-L2 entry carries a non-zero subcluster
+/// bitmap, which `qemu-img check` reports (`block/qcow2-refcount.c:1717-1722`
+/// at qemu v10.0.0) for any non-zero value, including
+/// `0x0000_0000_ffff_ffff` (measured on qemu-img 10.0.13).
 ///
-/// `compressed` must be the result of `(l2e & OFLAG_COMPRESSED) != 0`.
-/// `host_offset` is `l2e & L2_OFFSET_MASK` for standard entries
-/// (ignored for compressed).
-///
-/// For compressed entries the spec requires `sc_bitmap == 0`; we
-/// also accept `alloc_bits == 0xFFFF_FFFF && zero_bits == 0` for
-/// compatibility with images produced by older QEMU versions.
-///
-/// For standard (non-compressed) entries the following are invalid:
-/// - I1: `alloc_bits & zero_bits != 0`
-/// - I2: `host_offset == 0 && alloc_bits != 0`
-/// - I3: `host_offset != 0 && alloc_bits == 0 && zero_bits == 0`
-pub fn validate_subcluster_bitmap(
-    compressed: bool,
-    host_offset: u64,
-    sc_bitmap: u64,
-) -> SubclusterBitmapStatus {
-    let alloc_bits = sc_bitmap as u32;
-    let zero_bits = (sc_bitmap >> 32) as u32;
+/// This is a check-only rule and deliberately not part of
+/// [`subcluster_type`]: qemu's read path returns `COMPRESSED` without
+/// looking at the bitmap (`block/qcow2.h:758-759`) and reads such an
+/// entry, and so does instar, so a classifier that refused it would
+/// diverge from qemu on read.
+pub fn compressed_entry_has_bitmap(l2_entry: u64, sc_bitmap: u64) -> bool {
+    l2_entry & OFLAG_COMPRESSED != 0 && sc_bitmap != 0
+}
 
-    if compressed {
-        // Spec says bitmap must be 0 for compressed entries.
-        // Accept alloc_bits == 0xFFFF_FFFF with zero_bits == 0
-        // for compatibility with older QEMU versions.
-        if sc_bitmap == 0 || (alloc_bits == 0xFFFF_FFFF && zero_bits == 0) {
-            return SubclusterBitmapStatus::Ok;
-        }
+/// Classify an extended-L2 entry's bitmap the way `qemu-img check`
+/// reports it.
+///
+/// Validity is [`subcluster_type`]'s: an entry is reported if and only
+/// if the classifier calls it `Invalid`, or it is a compressed entry
+/// with a bitmap ([`compressed_entry_has_bitmap`]). Which message an
+/// invalid entry gets follows qemu's check, which tests the bitmap after
+/// deciding whether the cluster is allocated: the classifier decides
+/// that too, since with an empty bitmap a host cluster classifies as
+/// `UnallocatedAlloc` and no host cluster as `UnallocatedPlain`.
+///
+/// A host cluster whose bitmap is empty is not reported: qemu reads it
+/// as 32 `UnallocatedAlloc` subclusters and `qemu-img check` 10.0.13
+/// accepts it.
+pub fn validate_subcluster_bitmap(
+    l2_entry: u64,
+    sc_bitmap: u64,
+    has_data_file: bool,
+) -> SubclusterBitmapStatus {
+    if compressed_entry_has_bitmap(l2_entry, sc_bitmap) {
         return SubclusterBitmapStatus::CompressedNonZero;
     }
-
-    // I1: subcluster simultaneously allocated and all-zero
-    if alloc_bits & zero_bits != 0 {
-        return SubclusterBitmapStatus::AllocAndZeroOverlap;
+    if subcluster_type(l2_entry, sc_bitmap, 0, true, has_data_file) != SubclusterType::Invalid {
+        return SubclusterBitmapStatus::Ok;
     }
-
-    // I2: bitmap claims allocated subclusters but no host cluster
-    if host_offset == 0 && alloc_bits != 0 {
-        return SubclusterBitmapStatus::AllocWithoutHost;
+    match subcluster_type(l2_entry, 0, 0, true, has_data_file) {
+        SubclusterType::UnallocatedAlloc => SubclusterBitmapStatus::AllocAndZeroOverlap,
+        _ => SubclusterBitmapStatus::UnallocatedWithAllocBits,
     }
-
-    // I3: host cluster allocated but no subcluster references it
-    if host_offset != 0 && alloc_bits == 0 && zero_bits == 0 {
-        return SubclusterBitmapStatus::HostWithoutRef;
-    }
-
-    SubclusterBitmapStatus::Ok
 }
 
 /// State for reading QCOW2 virtual content from a device.
@@ -1584,9 +1831,18 @@ impl TargetUnitTracker {
     }
 }
 
-/// Like [`count_allocated_in_l2_standard`] but also feeds each
-/// allocated entry's virtual range into `tracker`, so the scan can
-/// count target units touched without a second pass.
+/// Count the source bytes `qemu-img measure` counts in a standard
+/// (non-extended-L2) L2 table byte slice, feeding each counted entry's
+/// virtual range into `tracker` so the scan can count target units
+/// touched without a second pass.
+///
+/// An entry counts when [`subcluster_type`] makes it `Normal` or
+/// `Compressed`: qemu's measure counts block-status `DATA` and skips
+/// `ZERO` (`block/qcow2.c:5193-5202` at qemu v10.0.0), and
+/// `qcow2_co_block_status` sets `DATA` for exactly those two types
+/// (`:2178-2184`). So a zero-flagged entry does not count, and with
+/// `has_data_file` an entry of `QCOW_OFLAG_COPIED` at host offset 0 (a
+/// data-file image's virtual cluster 0) does.
 ///
 /// `base_virtual_offset` is the virtual address covered by the first
 /// entry in `l2_bytes`. `virtual_size` is the image's declared
@@ -1616,6 +1872,7 @@ pub fn walk_l2_standard(
     cluster_size: u64,
     base_virtual_offset: u64,
     virtual_size: u64,
+    has_data_file: bool,
     tracker: &mut TargetUnitTracker,
 ) -> u64 {
     if cluster_size == 0 {
@@ -1626,7 +1883,11 @@ pub fn walk_l2_standard(
         let entry = u64::from_be_bytes([
             chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
         ]);
-        if entry == 0 {
+        // A classic entry is never `Invalid` (block/qcow2.h:781-796).
+        if !matches!(
+            subcluster_type(entry, 0, 0, false, has_data_file),
+            SubclusterType::Normal | SubclusterType::Compressed
+        ) {
             continue;
         }
         let v = base_virtual_offset.saturating_add((i as u64).saturating_mul(cluster_size));
@@ -1642,27 +1903,34 @@ pub fn walk_l2_standard(
     allocated_bytes
 }
 
-/// Count allocated source bytes in an extended-L2 (16-byte entry) L2
-/// table byte slice. Each entry is two big-endian u64s: `l2_entry`
-/// followed by `sc_bitmap`.
+/// An L2 entry that [`subcluster_type`] classifies as `Invalid`, found
+/// by a metadata walk (measure, map) at this virtual offset. qemu fails
+/// the same walk with `EIO` ("Invalid cluster entry found"), so the
+/// walkers stop and the caller refuses the image rather than measuring
+/// or mapping it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InvalidL2Entry {
+    /// Virtual byte offset of the cluster the entry describes.
+    pub virtual_offset: u64,
+}
+
+/// Count the source bytes `qemu-img measure` counts in an extended-L2
+/// (16-byte entry) L2 table byte slice. Each entry is two big-endian
+/// u64s: `l2_entry` followed by `sc_bitmap`.
 ///
-/// Subcluster bitmap layout (32 subclusters per cluster):
-/// - `alloc_bits = sc_bitmap as u32`
-/// - `zero_bits  = (sc_bitmap >> 32) as u32`
+/// Every subcluster is classified by [`subcluster_range`]. As in
+/// [`walk_l2_standard`], `Normal` subclusters count (`cluster_size / 32`
+/// each) and a `Compressed` entry counts as one whole cluster; zero and
+/// unallocated subclusters do not. With `has_data_file`, an entry of
+/// `QCOW_OFLAG_COPIED` at host offset 0 is a data-file cluster and its
+/// allocated subclusters count.
 ///
-/// Counting rules (mirroring `Qcow2State::cluster_lookup` for the
-/// extended-L2 case):
-/// - `l2_entry == 0` and `(sc_bitmap >> 32) == 0` → unallocated (0).
-/// - `l2_entry == 0` with any `zero_bits` set → logically zero (0).
-/// - `l2_entry & OFLAG_COMPRESSED != 0` → allocated, counts as
-///   `cluster_size` (compressed clusters carry one full cluster's
-///   worth of decompressed data; see PLAN open-question 1).
-/// - `l2_entry != 0` (standard, non-compressed):
-///     - `alloc_bits == 0xFFFF_FFFF && zero_bits == 0` → counts as
-///       `cluster_size` (whole cluster allocated, matches
-///       `ClusterLookup::Standard`).
-///     - otherwise → counts as
-///       `popcount(alloc_bits) * (cluster_size / 32)`.
+/// Each counted run's virtual range is fed into `tracker`, as
+/// [`walk_l2_standard`] does, so measure counts the target clusters
+/// that qemu's measure rounds every data run up to (`:5197-5201`).
+///
+/// An `Invalid` entry inside `virtual_size` fails the count with its
+/// virtual offset, since qemu's measure fails there too.
 ///
 /// `l2_bytes` may have a trailing partial entry; incomplete 16-byte
 /// pairs at the tail are ignored. `cluster_size == 0` defensively
@@ -1677,11 +1945,13 @@ pub fn count_allocated_in_l2_extended(
     cluster_size: u64,
     base_virtual_offset: u64,
     virtual_size: u64,
-) -> u64 {
+    has_data_file: bool,
+    tracker: &mut TargetUnitTracker,
+) -> Result<u64, InvalidL2Entry> {
     if cluster_size == 0 {
-        return 0;
+        return Ok(0);
     }
-    let subcluster_size = cluster_size / 32;
+    let subcluster_size = cluster_size / QCOW_EXTL2_SUBCLUSTERS_PER_CLUSTER as u64;
     let mut total: u64 = 0;
     for (i, chunk) in l2_bytes.chunks_exact(16).enumerate() {
         let l2_entry = u64::from_be_bytes([
@@ -1690,12 +1960,6 @@ pub fn count_allocated_in_l2_extended(
         let sc_bitmap = u64::from_be_bytes([
             chunk[8], chunk[9], chunk[10], chunk[11], chunk[12], chunk[13], chunk[14], chunk[15],
         ]);
-
-        if l2_entry == 0 {
-            // l2_entry==0 is unallocated regardless of zero_bits — zero
-            // subclusters consume no source bytes (logically zero).
-            continue;
-        }
 
         let cluster_start =
             base_virtual_offset.saturating_add((i as u64).saturating_mul(cluster_size));
@@ -1706,203 +1970,162 @@ pub fn count_allocated_in_l2_extended(
         }
         let cluster_cap = cluster_size.min(virtual_size - cluster_start);
 
-        if (l2_entry & OFLAG_COMPRESSED) != 0 {
-            // Compressed cluster counts as one full cluster's worth.
-            total = total.saturating_add(cluster_cap);
-            continue;
+        let mut sc: u32 = 0;
+        while sc < QCOW_EXTL2_SUBCLUSTERS_PER_CLUSTER {
+            let (ty, run) = subcluster_range(l2_entry, sc_bitmap, sc, true, has_data_file);
+            let counted_run = match ty {
+                SubclusterType::Invalid => {
+                    return Err(InvalidL2Entry {
+                        virtual_offset: cluster_start,
+                    });
+                }
+                SubclusterType::Normal | SubclusterType::Compressed => {
+                    // A compressed run is the whole cluster: one full
+                    // cluster's worth of decompressed data.
+                    let run_start = (sc as u64).saturating_mul(subcluster_size);
+                    let run_len = (run as u64)
+                        .saturating_mul(subcluster_size)
+                        .min(cluster_cap.saturating_sub(run_start));
+                    if run_len > 0 {
+                        tracker.observe_allocated(cluster_start + run_start, run_len);
+                    }
+                    run_len
+                }
+                _ => 0,
+            };
+            total = total.saturating_add(counted_run);
+            sc += run;
         }
-
-        let alloc_bits = sc_bitmap as u32;
-        let zero_bits = (sc_bitmap >> 32) as u32;
-        let raw_contrib = if alloc_bits == 0xFFFF_FFFF && zero_bits == 0 {
-            cluster_size
-        } else {
-            let popcount = alloc_bits.count_ones() as u64;
-            popcount.saturating_mul(subcluster_size)
-        };
-        total = total.saturating_add(raw_contrib.min(cluster_cap));
     }
-    total
+    Ok(total)
+}
+
+/// The map state of a run of subclusters of type `ty` whose first byte
+/// is at `host_offset` (the entry's host offset plus the run's offset
+/// into the cluster), or `None` for `Invalid`.
+///
+/// This is `qcow2_co_block_status` (`block/qcow2.c:2171-2192` at qemu
+/// v10.0.0): `NORMAL`, `ZERO_ALLOC` and `UNALLOCATED_ALLOC` report the
+/// host offset, so `qemu-img map` prints an `offset` for all three;
+/// the zero types are `zero` and present, and the unallocated types are
+/// neither present nor data. With an external data file the offset is
+/// into the data file, as qemu's is. A compressed cluster stays `Data`
+/// at its masked L2 offset, which is instar's existing (divergent)
+/// report for it (see `docs/quirks.md`).
+fn map_state_for(ty: SubclusterType, host_offset: u64) -> Option<MapExtentState> {
+    Some(match ty {
+        SubclusterType::Normal | SubclusterType::Compressed => MapExtentState::Data {
+            file_offset: host_offset,
+        },
+        SubclusterType::ZeroAlloc => MapExtentState::ZeroAllocatedAt {
+            file_offset: host_offset,
+        },
+        SubclusterType::ZeroPlain => MapExtentState::ZeroAllocated,
+        SubclusterType::UnallocatedAlloc => MapExtentState::HoleAt {
+            file_offset: host_offset,
+        },
+        SubclusterType::UnallocatedPlain => MapExtentState::Hole,
+        SubclusterType::Invalid => return None,
+    })
 }
 
 /// Classify one standard-L2 entry into a single `MapExtent`.
 ///
-/// The classification mirrors `Qcow2State::cluster_lookup`'s
-/// standard-L2 decision tree exactly:
+/// The entry's type comes from [`subcluster_type`], and its state from
+/// what `qemu-img map` reports for that type (see `map_state_for`):
 ///
-/// - `entry == 0` → `Hole`.
-/// - `entry & OFLAG_COMPRESSED != 0` → `Data { file_offset:
-///   entry & L2_OFFSET_MASK }`. For map's purposes the compressed
-///   cluster occupies one cluster's worth of virtual space at the
-///   masked file offset; the embedded length-in-sectors field is
-///   not extracted (map only reports file_offset, not file_length).
-/// - `entry & QCOW_OFLAG_ZERO != 0` (bit 0) → `ZeroAllocated`. The
-///   qcow2 v3 all-zeroes flag on a standard L2 entry reads as zeros
-///   regardless of the host-offset field (`host_offset == 0` is
-///   `ZERO_PLAIN`, `host_offset != 0` is `ZERO_ALLOC`); qemu-img map
-///   reports both as `present: true, zero: true, data: false`. This
-///   mirrors `cluster_lookup`'s `ClusterLookup::Zero` verdict.
-/// - Otherwise, `host_offset = entry & L2_OFFSET_MASK`:
-///   - `host_offset == 0` → `Hole` (matches cluster_lookup's
-///     "host_offset == 0 && !extended_l2 → Unallocated" path).
-///   - `host_offset != 0` → `Data { file_offset: host_offset }`.
+/// - `Normal` → `Data` at the host offset. With `has_data_file`, an
+///   entry of `QCOW_OFLAG_COPIED` at host offset 0 is `Normal`: a
+///   data-file image's virtual cluster 0 is data at offset 0.
+/// - `Compressed` → `Data` at `entry & L2_OFFSET_MASK`. For map's
+///   purposes the compressed cluster occupies one cluster's worth of
+///   virtual space at the masked file offset; the embedded
+///   length-in-sectors field is not extracted.
+/// - `ZeroAlloc` (the zero flag with a host offset) →
+///   `ZeroAllocatedAt` the host offset; `ZeroPlain` → `ZeroAllocated`.
+/// - `UnallocatedPlain` (host offset 0 otherwise) → `Hole`.
 ///
 /// `cluster_size` is the extent's length. `virtual_offset` is the
 /// virtual address of the cluster's first byte; the caller is
 /// responsible for clamping `length` against virtual_size if the
 /// cluster straddles end-of-image.
-pub fn classify_qcow2_l2_standard(entry: u64, virtual_offset: u64, cluster_size: u64) -> MapExtent {
-    if entry == 0 {
-        return MapExtent {
-            start: virtual_offset,
-            length: cluster_size,
-            state: MapExtentState::Hole,
-        };
-    }
-    if (entry & OFLAG_COMPRESSED) != 0 {
-        let file_offset = entry & L2_OFFSET_MASK;
-        return MapExtent {
-            start: virtual_offset,
-            length: cluster_size,
-            state: MapExtentState::Data { file_offset },
-        };
-    }
-    if (entry & QCOW_OFLAG_ZERO) != 0 {
-        // qcow2 v3 all-zeroes flag (bit 0): reads as zeros regardless
-        // of the host-offset field (ZERO_PLAIN / ZERO_ALLOC).
-        return MapExtent {
-            start: virtual_offset,
-            length: cluster_size,
-            state: MapExtentState::ZeroAllocated,
-        };
-    }
-    let host_offset = entry & L2_OFFSET_MASK;
-    if host_offset == 0 {
-        return MapExtent {
-            start: virtual_offset,
-            length: cluster_size,
-            state: MapExtentState::Hole,
-        };
-    }
+pub fn classify_qcow2_l2_standard(
+    entry: u64,
+    virtual_offset: u64,
+    cluster_size: u64,
+    has_data_file: bool,
+) -> MapExtent {
+    let ty = subcluster_type(entry, 0, 0, false, has_data_file);
     MapExtent {
         start: virtual_offset,
         length: cluster_size,
-        state: MapExtentState::Data {
-            file_offset: host_offset,
-        },
+        // A classic entry is never `Invalid` (block/qcow2.h:781-796).
+        state: map_state_for(ty, entry & L2_OFFSET_MASK).unwrap_or(MapExtentState::Hole),
     }
 }
 
-/// Classify one extended-L2 entry by pushing 1-32 subcluster
-/// `MapExtent`s through the supplied coalescer.
+/// Classify one extended-L2 entry by pushing one `MapExtent` per run of
+/// same-typed subclusters through the supplied coalescer.
 ///
-/// Each cluster has 32 subclusters of size `cluster_size / 32`.
-/// The 64-bit `sc_bitmap` packs the per-subcluster state as two
-/// 32-bit words: `alloc_bits = sc_bitmap as u32` and
-/// `zero_bits = (sc_bitmap >> 32) as u32`. Per cluster_lookup
-/// extended-L2 decision tree:
-///
-/// - `l2_entry == 0`, `zero_bits == 0`: 32× `Hole`. Coalesces to
-///   one extent.
-/// - `l2_entry == 0`, `zero_bits != 0`: per-subcluster: if
-///   `zero_bits[i]` set → `ZeroAllocated`, else → `Hole`.
-/// - `l2_entry & OFLAG_COMPRESSED != 0`: 32× `Data { file_offset
-///   = (l2_entry & L2_OFFSET_MASK) + i * subcluster_size }`.
-///   (Compressed clusters do not technically have one host offset
-///   per subcluster, but emitting them as a Data sequence that
-///   coalesces into one cluster-wide extent matches the qemu-img
-///   map output.)
-/// - `l2_entry != 0`, `alloc_bits == 0xFFFF_FFFF`, `zero_bits ==
-///   0`: 32× `Data` with contiguous file offsets (collapses).
-/// - Otherwise: per-subcluster (alloc[i], zero[i]) →
-///   (0,0)=`Hole`, (0,1)=`ZeroAllocated`, (1,0)=`Data { offset
-///   = host_offset + i * subcluster_size }`, (1,1)=`ZeroAllocated`
-///   (zero wins; sc_bitmap_invalid rejects this combo, but treat
-///   defensively as zero for forward compatibility).
+/// Each cluster has 32 subclusters of size `cluster_size / 32`, and the
+/// runs come from [`subcluster_range`], so the types are qemu's (see
+/// [`classify_qcow2_l2_standard`] for how a type becomes a state). A
+/// `Normal`, `ZeroAlloc` or `UnallocatedAlloc` run reports
+/// `host_offset + first_subcluster * subcluster_size`; with
+/// `has_data_file` that is an offset into the data file, and host
+/// offset 0 is a real one. A compressed entry is one `Data` run at its
+/// masked L2 offset (qemu does not consult its bitmap).
 ///
 /// The caller is responsible for clamping `cluster_length` to
 /// virtual_size if the cluster straddles end-of-image. Returns
-/// `false` if the coalescer signalled abort.
+/// `Ok(false)` if the coalescer signalled abort, and `Err` if the entry
+/// is `Invalid`, which `qemu-img map` fails on with `EIO`; nothing is
+/// pushed for an invalid entry.
 pub fn classify_qcow2_l2_extended<F: FnMut(MapExtent) -> bool>(
     l2_entry: u64,
     sc_bitmap: u64,
     virtual_offset: u64,
     cluster_size: u64,
     cluster_length: u64,
+    has_data_file: bool,
     sink: &mut MapExtentCoalescer<'_, F>,
-) -> bool {
+) -> Result<bool, InvalidL2Entry> {
     if cluster_size == 0 || cluster_length == 0 {
-        return true;
+        return Ok(true);
     }
-    let subcluster_size = cluster_size / 32;
+    let subcluster_size = cluster_size / QCOW_EXTL2_SUBCLUSTERS_PER_CLUSTER as u64;
     if subcluster_size == 0 {
-        return true;
+        return Ok(true);
     }
-    let alloc_bits = sc_bitmap as u32;
-    let zero_bits = (sc_bitmap >> 32) as u32;
     let host_offset = l2_entry & L2_OFFSET_MASK;
-    let is_compressed = (l2_entry & OFLAG_COMPRESSED) != 0;
 
-    // Per-subcluster emission. The coalescer merges
-    // adjacent same-state subclusters back into one extent.
-    let mut sub_virt = virtual_offset;
-    let mut consumed: u64 = 0;
-    for i in 0..32u32 {
-        // Clamp the final subcluster against the cluster's
-        // remaining length so the emitted run never exceeds the
-        // cluster's effective span (caller-supplied
+    let mut sc: u32 = 0;
+    while sc < QCOW_EXTL2_SUBCLUSTERS_PER_CLUSTER {
+        let (ty, run) = subcluster_range(l2_entry, sc_bitmap, sc, true, has_data_file);
+        let run_start = (sc as u64).saturating_mul(subcluster_size);
+        let Some(state) = map_state_for(ty, host_offset.saturating_add(run_start)) else {
+            return Err(InvalidL2Entry { virtual_offset });
+        };
+        // Clamp the run against the cluster's remaining length so it
+        // never exceeds the cluster's effective span (caller-supplied
         // `cluster_length` accounts for end-of-image clamping).
-        let remaining = cluster_length.saturating_sub(consumed);
-        if remaining == 0 {
+        if run_start >= cluster_length {
             break;
         }
-        let sub_len = subcluster_size.min(remaining);
-
-        let state = if is_compressed {
-            // All 32 subclusters point into the same compressed
-            // payload; emit each at host_offset + i * subcluster_size
-            // so the coalescer collapses them into one cluster-wide
-            // Data extent.
-            MapExtentState::Data {
-                file_offset: host_offset.saturating_add((i as u64).saturating_mul(subcluster_size)),
-            }
-        } else if l2_entry == 0 {
-            if (zero_bits >> i) & 1 != 0 {
-                MapExtentState::ZeroAllocated
-            } else {
-                MapExtentState::Hole
-            }
-        } else {
-            let a = (alloc_bits >> i) & 1 != 0;
-            let z = (zero_bits >> i) & 1 != 0;
-            match (a, z) {
-                (false, false) => MapExtentState::Hole,
-                (_, true) => MapExtentState::ZeroAllocated,
-                (true, false) => {
-                    if host_offset == 0 {
-                        MapExtentState::Hole
-                    } else {
-                        MapExtentState::Data {
-                            file_offset: host_offset
-                                .saturating_add((i as u64).saturating_mul(subcluster_size)),
-                        }
-                    }
-                }
-            }
-        };
-
+        let run_len = (run as u64)
+            .saturating_mul(subcluster_size)
+            .min(cluster_length - run_start);
         let cont = sink.push(MapExtent {
-            start: sub_virt,
-            length: sub_len,
+            start: virtual_offset.saturating_add(run_start),
+            length: run_len,
             state,
         });
         if !cont {
-            return false;
+            return Ok(false);
         }
-        sub_virt = sub_virt.saturating_add(sub_len);
-        consumed = consumed.saturating_add(sub_len);
+        sc += run;
     }
-    true
+    Ok(true)
 }
 
 impl Qcow2State {
@@ -2198,8 +2421,9 @@ impl Qcow2State {
 
     /// Look up the host cluster for a given virtual offset.
     ///
-    /// Returns the cluster type (unallocated, standard, or compressed)
-    /// or `None` on I/O error.
+    /// Returns the cluster's [`ClusterLookup`] verdict, classified by
+    /// [`subcluster_type`] with the image's external-data-file flag, or
+    /// `None` on I/O error (including a failed subcluster bitmap read).
     ///
     /// # Safety
     ///
@@ -2264,7 +2488,10 @@ impl Qcow2State {
             bytes_read,
         )?;
 
-        // For extended L2, read the subcluster bitmap (second 8 bytes)
+        // For extended L2, read the subcluster bitmap (second 8 bytes).
+        // A failed read fails the lookup: treating it as an empty bitmap
+        // would turn an I/O error into "nothing allocated" and read the
+        // backing file or zeros in place of the data.
         let bitmap = if self.extended_l2 {
             read_u64_be_cached(
                 call_table,
@@ -2275,50 +2502,38 @@ impl Qcow2State {
                 &mut self.l2_cached_sector,
                 self.l2_cache_buf,
                 bytes_read,
-            )
-            .unwrap_or(0)
+            )?
         } else {
             0
         };
 
-        // Decode L2 entry
-        if l2_entry == 0 {
-            if self.extended_l2 && (bitmap >> 32) != 0 {
-                // l2_entry is 0 but bitmap has zero bits set (zero-plain subclusters)
-                Some(ClusterLookup::StandardSubclusters(0, bitmap))
-            } else {
-                Some(ClusterLookup::Unallocated)
+        Some(self.classify_l2_entry(l2_entry, bitmap))
+    }
+
+    /// Whether the header sets `INCOMPAT_EXTERNAL_DATA`, which makes
+    /// host offset 0 a real data-file offset (`block/qcow2.h:724-733`
+    /// at qemu v10.0.0).
+    pub fn has_data_file(&self) -> bool {
+        self.incompatible_features & INCOMPAT_EXTERNAL_DATA != 0
+    }
+
+    /// Reduce an L2 entry to a whole-cluster verdict through
+    /// [`subcluster_range`]. The cluster has one type when the run that
+    /// starts at subcluster 0 covers it; otherwise it is mixed and the
+    /// caller classifies each subcluster itself.
+    fn classify_l2_entry(&self, l2_entry: u64, bitmap: u64) -> ClusterLookup {
+        let extended_l2 = self.extended_l2;
+        let (ty, run) = subcluster_range(l2_entry, bitmap, 0, extended_l2, self.has_data_file());
+        match ty {
+            SubclusterType::Invalid => ClusterLookup::Invalid,
+            SubclusterType::Compressed => ClusterLookup::Compressed(l2_entry),
+            _ if run < subclusters_per_cluster(extended_l2) => {
+                ClusterLookup::StandardSubclusters(l2_entry, bitmap)
             }
-        } else if (l2_entry & OFLAG_COMPRESSED) != 0 {
-            Some(ClusterLookup::Compressed(l2_entry))
-        } else if !self.extended_l2 {
-            // Classic (non-extended) L2 entry. Bit 0 (QCOW_OFLAG_ZERO)
-            // wins over the host-offset field: a set zero flag means the
-            // cluster reads as all zeros whether host_offset is 0
-            // (ZERO_PLAIN) or not (ZERO_ALLOC). Test it before the
-            // host_offset==0 → Unallocated fallback so a zero-flag entry
-            // is never mis-routed to Unallocated or Standard.
-            if (l2_entry & QCOW_OFLAG_ZERO) != 0 {
-                Some(ClusterLookup::Zero)
-            } else {
-                let host_offset = l2_entry & L2_OFFSET_MASK;
-                if host_offset == 0 {
-                    Some(ClusterLookup::Unallocated)
-                } else {
-                    Some(ClusterLookup::Standard(host_offset))
-                }
-            }
-        } else {
-            // Extended L2: zero status is carried by the subcluster
-            // zero bitmap, not bit 0 of the entry.
-            let host_offset = l2_entry & L2_OFFSET_MASK;
-            let alloc_bits = bitmap as u32;
-            let zero_bits = (bitmap >> 32) as u32;
-            if alloc_bits == 0xFFFF_FFFF && zero_bits == 0 {
-                // All subclusters allocated, none zeroed — same as Standard
-                Some(ClusterLookup::Standard(host_offset))
-            } else {
-                Some(ClusterLookup::StandardSubclusters(host_offset, bitmap))
+            SubclusterType::Normal => ClusterLookup::Standard(l2_entry & L2_OFFSET_MASK),
+            SubclusterType::ZeroPlain | SubclusterType::ZeroAlloc => ClusterLookup::Zero,
+            SubclusterType::UnallocatedPlain | SubclusterType::UnallocatedAlloc => {
+                ClusterLookup::Unallocated
             }
         }
     }
@@ -2336,12 +2551,16 @@ impl Qcow2State {
     ///
     /// For each non-zero L1 entry, the L2 table at the masked host
     /// offset is read in `MAX_SECTOR_SIZE`-aligned chunks and counted
-    /// via `count_allocated_in_l2_standard` or
-    /// `count_allocated_in_l2_extended` depending on
-    /// `self.extended_l2`. The per-chunk byte slice is always an
-    /// entry-aligned multiple (8 divides every sector size we
+    /// via [`walk_l2_standard`] or [`count_allocated_in_l2_extended`]
+    /// depending on `self.extended_l2`. The per-chunk byte slice is
+    /// always an entry-aligned multiple (8 divides every sector size we
     /// support, and 16 divides `MAX_SECTOR_SIZE = 65536`), so the
     /// pure helpers always see whole entries.
+    ///
+    /// Returns `None` on an I/O failure or adversarial L2 offset, and on
+    /// an L2 entry the classifier calls `Invalid`, after raising
+    /// [`shared::InvalidL2EntryRefusal`] for it (qemu-img measure fails
+    /// there with `EIO`).
     ///
     /// # Safety
     ///
@@ -2359,17 +2578,16 @@ impl Qcow2State {
     ) -> Option<AllocationSummary> {
         let cluster_size = self.cluster_size;
         let extended_l2 = self.extended_l2;
+        let has_data_file = self.has_data_file();
         let l1_size = self.l1_size as u64;
         let l1_table_offset = self.l1_table_offset;
 
         let mut allocated_bytes: u64 = 0;
-        // Target-unit tracker. Only meaningful for the standard-L2
-        // walk path; extended L2 leaves the tracker untouched and
-        // `target_units_with_data` ends up at 0, which makes
-        // `measure_*` fall back to the legacy approximation. See
-        // bug #286 for the standard-L2 fix; extended-L2 target-aware
-        // accounting is tracked as follow-up.
-        let mut tracker = TargetUnitTracker::new(if extended_l2 { 0 } else { target_unit_size });
+        // Target-unit tracker: counts the target clusters that hold
+        // source data, which qemu's measure rounds each data run up
+        // to. See bug #286. A scan with no data leaves it at 0, which
+        // makes `measure_*` fall back to the legacy approximation.
+        let mut tracker = TargetUnitTracker::new(target_unit_size);
         // Virtual address covered by one L2 table (entries_per_l2 *
         // cluster_size). Bytes 0..l2_coverage of the source virtual
         // address space map to L1 entry 0, l2_coverage..2*l2_coverage
@@ -2473,22 +2691,36 @@ impl Qcow2State {
                     (l2_bytes_consumed / entry_size_bytes).saturating_mul(cluster_size),
                 );
 
-                allocated_bytes = allocated_bytes.saturating_add(if extended_l2 {
-                    count_allocated_in_l2_extended(
+                let counted = if extended_l2 {
+                    match count_allocated_in_l2_extended(
                         meaningful,
                         cluster_size,
                         base_virtual_offset,
                         virtual_size,
-                    )
+                        has_data_file,
+                        &mut tracker,
+                    ) {
+                        Ok(n) => n,
+                        Err(invalid) => {
+                            send_invalid_l2_entry_refusal(
+                                call_table,
+                                self.device_idx,
+                                invalid.virtual_offset,
+                            );
+                            return None;
+                        }
+                    }
                 } else {
                     walk_l2_standard(
                         meaningful,
                         cluster_size,
                         base_virtual_offset,
                         virtual_size,
+                        has_data_file,
                         &mut tracker,
                     )
-                });
+                };
+                allocated_bytes = allocated_bytes.saturating_add(counted);
 
                 l2_bytes_consumed += meaningful_len as u64;
                 sector += 1;
@@ -2531,7 +2763,10 @@ impl Qcow2State {
     /// Returns `Some(())` on a successful walk (including early
     /// termination via `emit` returning `false`). Returns `None` on
     /// an I/O failure or adversarial L2 offset, matching
-    /// `scan_allocation`'s convention.
+    /// `scan_allocation`'s convention, and on an L2 entry the
+    /// classifier calls `Invalid`, after raising
+    /// [`shared::InvalidL2EntryRefusal`] for it (qemu-img map fails
+    /// there with `EIO`).
     ///
     /// # Safety
     ///
@@ -2552,6 +2787,7 @@ impl Qcow2State {
 
         let cluster_size = self.cluster_size;
         let extended_l2 = self.extended_l2;
+        let has_data_file = self.has_data_file();
         let l1_size = self.l1_size as u64;
         let l1_table_offset = self.l1_table_offset;
 
@@ -2699,17 +2935,32 @@ impl Qcow2State {
                             meaningful[entry_byte_offset + 14],
                             meaningful[entry_byte_offset + 15],
                         ]);
-                        classify_qcow2_l2_extended(
+                        match classify_qcow2_l2_extended(
                             l2_entry,
                             sc_bitmap,
                             cluster_virt,
                             cluster_size,
                             cluster_visible,
+                            has_data_file,
                             &mut coalescer,
-                        )
+                        ) {
+                            Ok(cont) => cont,
+                            Err(invalid) => {
+                                send_invalid_l2_entry_refusal(
+                                    call_table,
+                                    self.device_idx,
+                                    invalid.virtual_offset,
+                                );
+                                return None;
+                            }
+                        }
                     } else {
-                        let mut ext =
-                            classify_qcow2_l2_standard(l2_entry, cluster_virt, cluster_size);
+                        let mut ext = classify_qcow2_l2_standard(
+                            l2_entry,
+                            cluster_virt,
+                            cluster_size,
+                            has_data_file,
+                        );
                         // Clamp to virtual_size for end-of-image
                         // clusters.
                         if ext.length > cluster_visible {
@@ -3556,15 +3807,430 @@ mod tests {
         assert_eq!(result.bitmap_directory_offset, 0);
     }
 
+    // ---- subcluster_type / subcluster_range ----
+    //
+    // The expectations are qemu's: each case cites the line of
+    // qcow2_get_cluster_type / qcow2_get_subcluster_type
+    // (block/qcow2.h:713-796 at v10.0.0) or
+    // qcow2_get_subcluster_range_type (block/qcow2-cluster.c:395-429)
+    // that decides it.
+
+    type St = SubclusterType;
+
+    // A host cluster, and the same cluster compressed.
+    const SC_HOST: u64 = OFLAG_COPIED | 0x50000;
+    const SC_COMP: u64 = OFLAG_COMPRESSED | 0x50000;
+    const SC_ALL_ALLOC: u64 = 0x0000_0000_FFFF_FFFF;
+    const SC_ALL_ZERO: u64 = 0xFFFF_FFFF_0000_0000;
+
+    /// Every subcluster's type, in order.
+    fn sc_types(entry: u64, bitmap: u64, ext: bool, df: bool) -> std::vec::Vec<St> {
+        (0..subclusters_per_cluster(ext))
+            .map(|i| subcluster_type(entry, bitmap, i, ext, df))
+            .collect()
+    }
+
+    /// The runs `subcluster_range` yields walking the cluster from
+    /// subcluster 0. An invalid entry is the single run `(Invalid, 0)`.
+    fn sc_runs(entry: u64, bitmap: u64, ext: bool, df: bool) -> std::vec::Vec<(St, u32)> {
+        let mut out = std::vec::Vec::new();
+        let mut sc = 0;
+        while sc < subclusters_per_cluster(ext) {
+            let (ty, run) = subcluster_range(entry, bitmap, sc, ext, df);
+            out.push((ty, run));
+            if run == 0 {
+                break;
+            }
+            sc += run;
+        }
+        out
+    }
+
+    /// The whole-cluster verdict `cluster_lookup` gives an entry, without
+    /// the table walk. The cache pointers are never dereferenced.
+    fn sc_verdict(entry: u64, bitmap: u64, ext: bool, df: bool) -> ClusterLookup {
+        let mut features = if ext { INCOMPAT_EXTENDED_L2 } else { 0 };
+        if df {
+            features |= INCOMPAT_EXTERNAL_DATA;
+        }
+        let state = Qcow2State {
+            device_idx: 0,
+            cluster_size: 65536,
+            cluster_bits: 16,
+            l1_size: 1,
+            l1_table_offset: 0,
+            incompatible_features: features,
+            compression_type: 0,
+            crypt_method: 0,
+            luks_ext_offset: 0,
+            luks_ext_len: 0,
+            extended_l2: ext,
+            l1_cached_sector: u64::MAX,
+            l1_cache_buf: core::ptr::null_mut(),
+            l2_cached_sector: u64::MAX,
+            l2_cache_buf: core::ptr::null_mut(),
+        };
+        state.classify_l2_entry(entry, bitmap)
+    }
+
+    #[test]
+    fn sc_type_classic_table() {
+        // (entry, has_data_file, expected, qemu line)
+        let cases: &[(u64, bool, St, &str)] = &[
+            // Compressed wins over the zero flag.
+            (SC_COMP, false, St::Compressed, ":717-718"),
+            (SC_COMP | QCOW_OFLAG_ZERO, false, St::Compressed, ":717-718"),
+            (QCOW_OFLAG_ZERO, false, St::ZeroPlain, ":723"),
+            (QCOW_OFLAG_ZERO, true, St::ZeroPlain, ":723"),
+            (SC_HOST | QCOW_OFLAG_ZERO, false, St::ZeroAlloc, ":720-721"),
+            // Host 0 is unallocated without a data file, COPIED or not.
+            (0, false, St::UnallocatedPlain, ":731-732"),
+            (OFLAG_COPIED, false, St::UnallocatedPlain, ":731-732"),
+            // With a data file, COPIED | 0 is a real cluster, and host 0
+            // without COPIED is still unallocated.
+            (OFLAG_COPIED, true, St::Normal, ":729-730"),
+            (0, true, St::UnallocatedPlain, ":731-732"),
+            (SC_HOST, false, St::Normal, ":734-735"),
+            (0x50000, true, St::Normal, ":734-735"),
+        ];
+        for &(entry, df, want, line) in cases {
+            let msg = std::format!("classic entry {entry:#x} df={df} (qcow2.h{line}, :781-796)");
+            assert_eq!(subcluster_type(entry, 0, 0, false, df), want, "{msg}");
+            // Without extended L2 the bitmap is ignored (:740-741), and
+            // one subcluster is the whole cluster.
+            assert_eq!(
+                subcluster_type(entry, u64::MAX, 0, false, df),
+                want,
+                "{msg}"
+            );
+            assert_eq!(
+                subcluster_range(entry, u64::MAX, 0, false, df),
+                (want, 1),
+                "{msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn sc_type_extended_table() {
+        let ext = |entry, bitmap, sc, df| subcluster_type(entry, bitmap, sc, true, df);
+        let overlap = (1 << 35) | SC_ALL_ALLOC;
+
+        // :758-759: compressed regardless of the bitmap.
+        assert_eq!(ext(SC_COMP, 0, 0, false), St::Compressed);
+        assert_eq!(ext(SC_COMP, SC_ALL_ALLOC, 7, false), St::Compressed);
+        assert_eq!(ext(SC_COMP, 0x3_0000_0005, 0, false), St::Compressed);
+
+        // :761-762: alloc and zero both set for any subcluster makes
+        // every subcluster invalid, including ones with neither bit.
+        assert_eq!(ext(SC_HOST, overlap, 3, false), St::Invalid);
+        assert_eq!(ext(SC_HOST, (1 << 32) | 1, 31, false), St::Invalid);
+        assert_eq!(ext(OFLAG_COPIED, overlap, 0, true), St::Invalid);
+
+        // :763-768.
+        assert_eq!(ext(SC_HOST, 1 << 36, 4, false), St::ZeroAlloc);
+        assert_eq!(ext(SC_HOST, 1 << 4, 4, false), St::Normal);
+        assert_eq!(ext(SC_HOST, 1 << 4, 5, false), St::UnallocatedAlloc);
+        assert_eq!(ext(SC_HOST, 0, 0, false), St::UnallocatedAlloc);
+
+        // :771-772: any alloc bit on an unallocated entry is invalid,
+        // whichever subcluster is asked about.
+        assert_eq!(ext(0, 1 << 3, 0, false), St::Invalid);
+        assert_eq!(ext(OFLAG_COPIED, SC_ALL_ALLOC, 0, false), St::Invalid);
+        assert_eq!(ext(0, 0x3, 0, true), St::Invalid);
+
+        // :773-776.
+        assert_eq!(ext(0, 1 << 32, 0, false), St::ZeroPlain);
+        assert_eq!(ext(0, 1 << 32, 1, false), St::UnallocatedPlain);
+        assert_eq!(ext(0, 0, 31, false), St::UnallocatedPlain);
+
+        // :719: bit 0 is not the zero flag with extended L2, so it
+        // neither zeroes the cluster nor makes host 0 allocated.
+        assert_eq!(ext(QCOW_OFLAG_ZERO, 0, 0, false), St::UnallocatedPlain);
+        assert_eq!(ext(SC_HOST | QCOW_OFLAG_ZERO, 1, 0, false), St::Normal);
+
+        // :729-730: COPIED | 0 is normal only with a data file.
+        assert_eq!(ext(OFLAG_COPIED, 1, 0, true), St::Normal);
+        assert_eq!(ext(OFLAG_COPIED, 0, 0, true), St::UnallocatedAlloc);
+        assert_eq!(ext(OFLAG_COPIED, 0, 0, false), St::UnallocatedPlain);
+    }
+
+    #[test]
+    fn sc_type_index_outside_the_cluster_fails_closed() {
+        // qemu asserts sc_index < subclusters_per_cluster (qcow2.h:754).
+        assert_eq!(subcluster_type(SC_HOST, 0, 1, false, false), St::Invalid);
+        assert_eq!(
+            subcluster_type(SC_HOST, SC_ALL_ALLOC, 32, true, false),
+            St::Invalid
+        );
+        assert_eq!(
+            subcluster_range(SC_HOST, SC_ALL_ALLOC, 32, true, false),
+            (St::Invalid, 0)
+        );
+    }
+
+    #[test]
+    fn sc_range_shapes() {
+        let range = |entry, bitmap, sc| subcluster_range(entry, bitmap, sc, true, false);
+        // qcow2-cluster.c:404-405: invalid has no run.
+        assert_eq!(range(0, 1 << 3, 0), (St::Invalid, 0));
+        // :406-407: compressed runs to the end of the cluster.
+        assert_eq!(range(SC_COMP, 0x5, 5), (St::Compressed, 27));
+        // :411-413: a Normal run counts alloc bits from sc_from.
+        assert_eq!(range(SC_HOST, 0b0111_0110, 1), (St::Normal, 2));
+        assert_eq!(range(SC_HOST, 0b0111_0110, 4), (St::Normal, 3));
+        assert_eq!(range(SC_HOST, SC_ALL_ALLOC, 0), (St::Normal, 32));
+        // :415-418: a zero run counts zero bits from sc_from.
+        assert_eq!(range(SC_HOST, SC_ALL_ZERO, 0), (St::ZeroAlloc, 32));
+        assert_eq!(range(0, 0x6 << 32, 1), (St::ZeroPlain, 2));
+        // :420-424: an unallocated run ends at the next subcluster with
+        // either bit set, and runs to the end when there is none.
+        assert_eq!(range(SC_HOST, 0x3, 2), (St::UnallocatedAlloc, 30));
+        assert_eq!(range(0, 1 << 40, 0), (St::UnallocatedPlain, 8));
+        assert_eq!(range(0, 0, 0), (St::UnallocatedPlain, 32));
+    }
+
+    #[test]
+    fn sc_range_agrees_with_per_subcluster_types() {
+        // For any entry, the runs subcluster_range reports must be the
+        // maximal runs of equal subcluster_type values. Deterministic
+        // LCG so a failure replays.
+        let mut seed: u64 = 0x654_653_650;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            seed
+        };
+        let entries = [0, OFLAG_COPIED, SC_HOST, 0x50000, SC_COMP];
+        for _ in 0..4000 {
+            let r = next();
+            let entry = entries[(r % entries.len() as u64) as usize];
+            let df = (r >> 8) & 1 == 1;
+            let alloc = next() as u32 & next() as u32;
+            let mut zero = next() as u32 & next() as u32;
+            // Mostly valid bitmaps, so the runs are exercised.
+            if (r >> 9) % 8 != 0 {
+                zero &= !alloc;
+            }
+            let bitmap = ((zero as u64) << 32) | alloc as u64;
+            let types = sc_types(entry, bitmap, true, df);
+            for sc in 0..32u32 {
+                let (ty, run) = subcluster_range(entry, bitmap, sc, true, df);
+                assert_eq!(ty, types[sc as usize]);
+                if ty == St::Invalid {
+                    assert_eq!(run, 0);
+                    assert!(
+                        types.iter().all(|&t| t == St::Invalid),
+                        "invalid is whole-entry"
+                    );
+                    continue;
+                }
+                let want = types[sc as usize..]
+                    .iter()
+                    .take_while(|&&t| t == ty)
+                    .count();
+                assert_eq!(
+                    run as usize, want,
+                    "entry {entry:#x} bitmap {bitmap:#x} df={df} sc {sc}: types {types:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sc_issue_653_entry() {
+        // COPIED | 0 with every alloc bit set. Without a data file qemu
+        // calls it invalid (qcow2.h:771-772) and fails the read; before
+        // the classifier instar returned Standard(0) and served the
+        // image header as guest data.
+        let entry = OFLAG_COPIED;
+        let types = sc_types(entry, SC_ALL_ALLOC, true, false);
+        assert!(types.iter().all(|&t| t == St::Invalid));
+        assert_eq!(
+            sc_verdict(entry, SC_ALL_ALLOC, true, false),
+            ClusterLookup::Invalid
+        );
+        // With a data file the same entry is a whole normal cluster at
+        // data-file offset 0 (qcow2.h:729-730).
+        let types = sc_types(entry, SC_ALL_ALLOC, true, true);
+        assert!(types.iter().all(|&t| t == St::Normal));
+        assert_eq!(
+            sc_verdict(entry, SC_ALL_ALLOC, true, true),
+            ClusterLookup::Standard(0)
+        );
+    }
+
+    #[test]
+    fn sc_data_file_partial_write_entry() {
+        // What qemu writes for `write -P 0xab 0 4k` on a 64K-cluster
+        // extended-L2 data-file image: entry COPIED | 0, bitmap 0x3.
+        let (entry, bitmap) = (OFLAG_COPIED, 0x3);
+        let want = std::vec![(St::Normal, 2), (St::UnallocatedAlloc, 30)];
+        assert_eq!(sc_runs(entry, bitmap, true, true), want);
+        let mixed = ClusterLookup::StandardSubclusters(entry, 0x3);
+        assert_eq!(sc_verdict(entry, bitmap, true, true), mixed);
+        // The same words without a data file are invalid.
+        assert_eq!(
+            sc_runs(entry, bitmap, true, false),
+            std::vec![(St::Invalid, 0)]
+        );
+        assert_eq!(
+            sc_verdict(entry, bitmap, true, false),
+            ClusterLookup::Invalid
+        );
+    }
+
+    #[test]
+    fn sc_verdicts_name_the_whole_cluster_only_when_uniform() {
+        use ClusterLookup as L;
+        // (entry, bitmap, extended_l2, has_data_file, verdict)
+        let cases: &[(u64, u64, bool, bool, ClusterLookup)] = &[
+            // Classic.
+            (0, 0, false, false, L::Unallocated),
+            (OFLAG_COPIED, 0, false, false, L::Unallocated),
+            (OFLAG_COPIED, 0, false, true, L::Standard(0)),
+            (0, 0, false, true, L::Unallocated),
+            (QCOW_OFLAG_ZERO, 0, false, false, L::Zero),
+            (SC_HOST | QCOW_OFLAG_ZERO, 0, false, false, L::Zero),
+            (SC_HOST, 0, false, false, L::Standard(0x50000)),
+            (SC_COMP, 0, false, false, L::Compressed(SC_COMP)),
+            // Extended, uniform.
+            (SC_HOST, SC_ALL_ALLOC, true, false, L::Standard(0x50000)),
+            (0, SC_ALL_ZERO, true, false, L::Zero),
+            (SC_HOST, SC_ALL_ZERO, true, false, L::Zero),
+            (0, 0, true, false, L::Unallocated),
+            // A host cluster no subcluster uses is 32 x UnallocatedAlloc,
+            // which reads the backing file, as qemu does.
+            (SC_HOST, 0, true, false, L::Unallocated),
+            // COPIED | 0 with an empty bitmap and no data file is
+            // unallocated, not a zero-filled StandardSubclusters(0, 0).
+            (OFLAG_COPIED, 0, true, false, L::Unallocated),
+            (SC_COMP, SC_ALL_ALLOC, true, false, L::Compressed(SC_COMP)),
+            // Extended, mixed: the verdict carries the L2 word whole.
+            (0, 1 << 32, true, false, L::StandardSubclusters(0, 1 << 32)),
+            (
+                SC_HOST,
+                0x3,
+                true,
+                false,
+                L::StandardSubclusters(SC_HOST, 0x3),
+            ),
+            (
+                SC_HOST,
+                0x1_FFFF_FFFE,
+                true,
+                false,
+                L::StandardSubclusters(SC_HOST, 0x1_FFFF_FFFE),
+            ),
+            (
+                OFLAG_COPIED,
+                0x3,
+                true,
+                true,
+                L::StandardSubclusters(OFLAG_COPIED, 0x3),
+            ),
+            // Invalid.
+            (0, 1 << 3, true, false, L::Invalid),
+            (SC_HOST, (1 << 35) | SC_ALL_ALLOC, true, true, L::Invalid),
+        ];
+        for &(entry, bitmap, ext, df, want) in cases {
+            assert_eq!(
+                sc_verdict(entry, bitmap, ext, df),
+                want,
+                "entry {entry:#x} bitmap {bitmap:#x} ext={ext} df={df}"
+            );
+        }
+    }
+
+    /// L2 words and bitmaps read back out of the images that
+    /// tests/helpers/qcow2_subclusters.py builds with qemu-img and
+    /// qemu-io 10.0.13 (or patches, for the invalid shapes), with the
+    /// types qemu-img convert's results confirm for them, in the
+    /// notation of that helper's measurement table: `N` normal, `Za`
+    /// zero-alloc, `Zp` zero-plain, `Ua` unallocated-alloc, `Up`
+    /// unallocated-plain, `C` compressed, `I` invalid, `xN` a run of N.
+    /// Columns: fixture and cluster, shape (`ext`/`classic`, `+df` for
+    /// a data file), L2 word, bitmap, runs.
+    const SC_QEMU_FIXTURES: &str = "
+  mixed_ext_nobacking_nodatafile/c0     ext        8000000000050000 0000000000000003 Nx2 Uax30
+  mixed_ext_nobacking_nodatafile/c1     ext        8000000000060000 0000000c00000003 Nx2 Zax2 Uax28
+  mixed_ext_nobacking_nodatafile/c2     ext        0000000000000000 0000000200000000 Up Zp Upx30
+  mixed_ext_nobacking_nodatafile/c3     ext        0000000000000000 0000000000000000 Upx32
+  mixed_ext_nobacking_nodatafile/c4     ext        8000000000070000 ffffffff00000000 Zax32
+  mixed_ext_nobacking_nodatafile/c5     ext        8000000000080000 00000000ffffffff Nx32
+  mixed_ext_nobacking_nodatafile/c6     ext        4000000000090000 0000000000000000 Cx32
+  mixed_ext_nobacking_nodatafile/c7     ext        0000000000000000 ffffffff00000000 Zpx32
+  mixed_ext_nobacking_datafile/c4       ext+df     8000000000040000 ffffffff00000000 Zax32
+  mixed_classic_nobacking_nodatafile/c4 classic    8000000000070001 0000000000000000 Za
+  mixed_classic_nobacking_nodatafile/c7 classic    0000000000000001 0000000000000000 Zp
+  mixed_classic_nobacking_datafile/c4   classic+df 8000000000040001 0000000000000000 Za
+  issue_654/c0                          ext        0000000000000000 0000000100000000 Zp Upx31
+  issue_653/c0                          ext        8000000000000000 00000000ffffffff I
+  issue_650/c0                          ext        0000000000000000 0000000100000002 I
+  data_file_partial/c0                  ext+df     8000000000000000 0000000000000003 Nx2 Uax30
+  data_file_partial_32k/c0              ext+df     8000000000000000 0000000000000001 N Uax31
+  data_file_classic/c0                  classic+df 8000000000000000 0000000000000000 N
+  data_file_full_cluster/c0             ext+df     8000000000000000 00000000ffffffff Nx32
+  data_file_ext_no_copied/c0            ext+df     0000000000000000 0000000000000003 I
+  data_file_classic_no_copied/c0        classic+df 0000000000000000 0000000000000000 Up
+  alloc_zero_overlap/c0                 ext        8000000000050000 00000008ffffffff I
+  alloc_zero_overlap_data_file/c0       ext+df     8000000000000000 00000008ffffffff I
+  host_without_ref/c0                   ext        8000000000050000 0000000000000000 Uax32
+  compressed_bitmap_all_alloc/c0        ext        4000000000050000 00000000ffffffff Cx32
+  compressed_bitmap_arbitrary/c0        ext        4000000000050000 0000000300000005 Cx32
+    ";
+
+    #[test]
+    fn sc_types_of_qemu_written_fixtures() {
+        let mut rows = 0;
+        for line in SC_QEMU_FIXTURES.lines().filter(|l| !l.trim().is_empty()) {
+            let cols: std::vec::Vec<&str> = line.split_whitespace().collect();
+            let (name, shape) = (cols[0], cols[1]);
+            let ext = shape.starts_with("ext");
+            let df = shape.ends_with("+df");
+            let entry = u64::from_str_radix(cols[2], 16).unwrap();
+            let bitmap = u64::from_str_radix(cols[3], 16).unwrap();
+            let want: std::vec::Vec<(St, u32)> = cols[4..]
+                .iter()
+                .map(|tok| {
+                    let (ty, n) = tok.split_once('x').unwrap_or((tok, "1"));
+                    let ty = match ty {
+                        "N" => St::Normal,
+                        "Za" => St::ZeroAlloc,
+                        "Zp" => St::ZeroPlain,
+                        "Ua" => St::UnallocatedAlloc,
+                        "Up" => St::UnallocatedPlain,
+                        "C" => St::Compressed,
+                        "I" => return (St::Invalid, 0),
+                        other => panic!("{name}: unknown type {other}"),
+                    };
+                    (ty, n.parse().unwrap())
+                })
+                .collect();
+            assert_eq!(sc_runs(entry, bitmap, ext, df), want, "{name}");
+            rows += 1;
+        }
+        assert_eq!(rows, 26, "every fixture row was parsed and checked");
+    }
+
     // ---- validate_subcluster_bitmap ----
+    //
+    // Expected statuses are what qemu-img check 10.0.13 reports for the
+    // same entry (block/qcow2-refcount.c:1662-1849 at v10.0.0).
+
+    /// A standard entry with a host cluster.
+    const VSB_HOST: u64 = OFLAG_COPIED | 0x10000;
+    /// A compressed entry.
+    const VSB_COMPRESSED: u64 = OFLAG_COMPRESSED | 0x50000;
 
     #[test]
     fn sc_bitmap_ok_all_allocated() {
         // All 32 subclusters allocated, none zeroed, host != 0
         let bitmap: u64 = 0x00000000_FFFFFFFF;
         assert_eq!(
-            validate_subcluster_bitmap(false, 0x10000, bitmap),
-            SubclusterBitmapStatus::Ok,
+            validate_subcluster_bitmap(VSB_HOST, bitmap, false),
+            SubclusterBitmapStatus::Ok
         );
     }
 
@@ -3573,8 +4239,8 @@ mod tests {
         // All 32 subclusters zero-plain (l2e == 0, host == 0)
         let bitmap: u64 = 0xFFFFFFFF_00000000;
         assert_eq!(
-            validate_subcluster_bitmap(false, 0, bitmap),
-            SubclusterBitmapStatus::Ok,
+            validate_subcluster_bitmap(0, bitmap, false),
+            SubclusterBitmapStatus::Ok
         );
     }
 
@@ -3586,29 +4252,54 @@ mod tests {
         let zero_bits: u64 = 0x00FF0000;
         let bitmap = (zero_bits << 32) | alloc_bits;
         assert_eq!(
-            validate_subcluster_bitmap(false, 0x10000, bitmap),
-            SubclusterBitmapStatus::Ok,
+            validate_subcluster_bitmap(VSB_HOST, bitmap, false),
+            SubclusterBitmapStatus::Ok
         );
     }
 
     #[test]
     fn sc_bitmap_ok_all_unallocated() {
-        // l2e == 0, bitmap == 0 → unallocated (not reached via validator
-        // in practice, but should be Ok)
         assert_eq!(
-            validate_subcluster_bitmap(false, 0, 0),
-            SubclusterBitmapStatus::Ok,
+            validate_subcluster_bitmap(0, 0, false),
+            SubclusterBitmapStatus::Ok
         );
     }
 
     #[test]
     fn sc_bitmap_ok_host_with_zero_only() {
-        // Host cluster present, all subclusters are zero-plain
+        // Host cluster present, all subclusters are zero-alloc
         // (data was written then zeroed; host not yet freed)
         let bitmap: u64 = 0xFFFFFFFF_00000000;
         assert_eq!(
-            validate_subcluster_bitmap(false, 0x10000, bitmap),
-            SubclusterBitmapStatus::Ok,
+            validate_subcluster_bitmap(VSB_HOST, bitmap, false),
+            SubclusterBitmapStatus::Ok
+        );
+    }
+
+    #[test]
+    fn sc_bitmap_ok_host_with_empty_bitmap() {
+        // A host cluster with an empty bitmap is 32 UNALLOCATED_ALLOC
+        // subclusters, which qemu-img check accepts (measured on
+        // 10.0.13: exit 0, no errors).
+        assert_eq!(
+            validate_subcluster_bitmap(VSB_HOST, 0, false),
+            SubclusterBitmapStatus::Ok
+        );
+    }
+
+    #[test]
+    fn sc_bitmap_ok_data_file_copied_at_offset_zero() {
+        // A data-file image's virtual cluster 0 with two subclusters
+        // written: COPIED at host offset 0 is NORMAL (block/qcow2.h:724-733)
+        // and qemu-img check is clean.
+        assert_eq!(
+            validate_subcluster_bitmap(OFLAG_COPIED, 0x3, true),
+            SubclusterBitmapStatus::Ok
+        );
+        // Without a data file the same entry is unallocated with alloc bits.
+        assert_eq!(
+            validate_subcluster_bitmap(OFLAG_COPIED, 0x3, false),
+            SubclusterBitmapStatus::UnallocatedWithAllocBits,
         );
     }
 
@@ -3616,90 +4307,92 @@ mod tests {
     fn sc_bitmap_ok_compressed_zero() {
         // Compressed entry with bitmap == 0 (spec-compliant)
         assert_eq!(
-            validate_subcluster_bitmap(true, 0, 0),
-            SubclusterBitmapStatus::Ok,
+            validate_subcluster_bitmap(VSB_COMPRESSED, 0, false),
+            SubclusterBitmapStatus::Ok
         );
     }
 
     #[test]
-    fn sc_bitmap_ok_compressed_legacy_qemu() {
-        // Compressed entry with alloc_bits == 0xFFFF_FFFF, zero_bits == 0
-        // (legacy QEMU pattern, accepted for compatibility)
+    fn sc_bitmap_err_compressed_all_alloc() {
+        // qemu-img check 10.0.13 reports any non-zero bitmap on a
+        // compressed entry, including alloc_bits == 0xFFFF_FFFF.
         let bitmap: u64 = 0x00000000_FFFFFFFF;
         assert_eq!(
-            validate_subcluster_bitmap(true, 0, bitmap),
-            SubclusterBitmapStatus::Ok,
+            validate_subcluster_bitmap(VSB_COMPRESSED, bitmap, false),
+            SubclusterBitmapStatus::CompressedNonZero,
+        );
+        // Reading it is still allowed: the classifier ignores the bitmap.
+        assert_eq!(
+            subcluster_type(VSB_COMPRESSED, bitmap, 0, true, false),
+            SubclusterType::Compressed
         );
     }
 
     #[test]
     fn sc_bitmap_err_alloc_and_zero_overlap() {
-        // I1: subcluster 0 is both allocated and zero
-        let bitmap: u64 = (1u64 << 32) | 1; // zero_bits bit 0 + alloc_bits bit 0
+        // Subcluster 0 is both allocated and zero on a host cluster
+        let bitmap: u64 = (1u64 << 32) | 1;
         assert_eq!(
-            validate_subcluster_bitmap(false, 0x10000, bitmap),
+            validate_subcluster_bitmap(VSB_HOST, bitmap, false),
+            SubclusterBitmapStatus::AllocAndZeroOverlap,
+        );
+        // With a data file, COPIED at offset 0 is an allocated cluster too.
+        assert_eq!(
+            validate_subcluster_bitmap(OFLAG_COPIED, bitmap, true),
             SubclusterBitmapStatus::AllocAndZeroOverlap,
         );
     }
 
     #[test]
     fn sc_bitmap_err_alloc_and_zero_overlap_no_host() {
-        // I5/I1: l2e == 0, subcluster simultaneously alloc+zero
+        // Without a host cluster qemu tests the alloc bits first, so the
+        // overlap is reported as an unallocated cluster with alloc bits.
         let bitmap: u64 = (1u64 << 32) | 1;
         assert_eq!(
-            validate_subcluster_bitmap(false, 0, bitmap),
-            SubclusterBitmapStatus::AllocAndZeroOverlap,
+            validate_subcluster_bitmap(0, bitmap, false),
+            SubclusterBitmapStatus::UnallocatedWithAllocBits,
         );
     }
 
     #[test]
     fn sc_bitmap_err_alloc_without_host() {
-        // I2: alloc bits set but host_offset == 0
+        // Alloc bits set but host_offset == 0 (#650, #653)
         let bitmap: u64 = 0x0000FFFF;
         assert_eq!(
-            validate_subcluster_bitmap(false, 0, bitmap),
-            SubclusterBitmapStatus::AllocWithoutHost,
+            validate_subcluster_bitmap(0, bitmap, false),
+            SubclusterBitmapStatus::UnallocatedWithAllocBits,
         );
-    }
-
-    #[test]
-    fn sc_bitmap_err_host_without_ref() {
-        // I3: host cluster present but both bitmap halves are 0
         assert_eq!(
-            validate_subcluster_bitmap(false, 0x10000, 0),
-            SubclusterBitmapStatus::HostWithoutRef,
+            validate_subcluster_bitmap(OFLAG_COPIED, 0xFFFF_FFFF, false),
+            SubclusterBitmapStatus::UnallocatedWithAllocBits,
+        );
+        // A data-file entry without COPIED is unallocated as well.
+        assert_eq!(
+            validate_subcluster_bitmap(0, bitmap, true),
+            SubclusterBitmapStatus::UnallocatedWithAllocBits,
         );
     }
 
     #[test]
     fn sc_bitmap_err_compressed_nonzero() {
-        // C1: compressed entry with a partial alloc bitmap
+        // Compressed entry with a partial alloc bitmap
         let bitmap: u64 = 0x0000000F;
         assert_eq!(
-            validate_subcluster_bitmap(true, 0, bitmap),
+            validate_subcluster_bitmap(VSB_COMPRESSED, bitmap, false),
             SubclusterBitmapStatus::CompressedNonZero,
         );
     }
 
     #[test]
     fn sc_bitmap_err_compressed_zero_bits_set() {
-        // C1: compressed entry with zero_bits set (even though alloc_bits == 0)
+        // Compressed entry with zero_bits set (even though alloc_bits == 0)
         let bitmap: u64 = 0x00010000_00000000;
         assert_eq!(
-            validate_subcluster_bitmap(true, 0, bitmap),
+            validate_subcluster_bitmap(VSB_COMPRESSED, bitmap, false),
             SubclusterBitmapStatus::CompressedNonZero,
         );
-    }
-
-    #[test]
-    fn sc_bitmap_err_compressed_legacy_plus_zero_bits() {
-        // C1: compressed entry with legacy alloc pattern BUT
-        // also has zero_bits set — should be flagged
-        let bitmap: u64 = 0x00010000_FFFFFFFF;
-        assert_eq!(
-            validate_subcluster_bitmap(true, 0, bitmap),
-            SubclusterBitmapStatus::CompressedNonZero,
-        );
+        assert!(compressed_entry_has_bitmap(VSB_COMPRESSED, bitmap));
+        assert!(!compressed_entry_has_bitmap(VSB_HOST, bitmap));
     }
 
     // ---- count_allocated_in_l2_standard ----
@@ -3789,14 +4482,36 @@ mod tests {
 
     #[test]
     fn count_l2_extended_empty_slice() {
-        assert_eq!(count_allocated_in_l2_extended(&[], 65536, 0, u64::MAX), 0);
+        assert_eq!(
+            count_allocated_in_l2_extended(
+                &[],
+                65536,
+                0,
+                u64::MAX,
+                false,
+                &mut TargetUnitTracker::new(0)
+            )
+            .unwrap(),
+            0
+        );
     }
 
     #[test]
     fn count_l2_extended_all_zero_entries() {
         // 3 pairs, all l2_entry=0, sc_bitmap=0 → unallocated.
         let buf = [0u8; 48];
-        assert_eq!(count_allocated_in_l2_extended(&buf, 65536, 0, u64::MAX), 0);
+        assert_eq!(
+            count_allocated_in_l2_extended(
+                &buf,
+                65536,
+                0,
+                u64::MAX,
+                false,
+                &mut TargetUnitTracker::new(0)
+            )
+            .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -3807,7 +4522,18 @@ mod tests {
         let bitmap: u64 = (0xFFFF_FFFFu64) << 32;
         let mut buf = [0u8; 16];
         put_ext_entry(&mut buf, 0, 0, bitmap);
-        assert_eq!(count_allocated_in_l2_extended(&buf, 65536, 0, u64::MAX), 0);
+        assert_eq!(
+            count_allocated_in_l2_extended(
+                &buf,
+                65536,
+                0,
+                u64::MAX,
+                false,
+                &mut TargetUnitTracker::new(0)
+            )
+            .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -3817,7 +4543,15 @@ mod tests {
         let mut buf = [0u8; 16];
         put_ext_entry(&mut buf, 0, 0x50000, bitmap);
         assert_eq!(
-            count_allocated_in_l2_extended(&buf, 65536, 0, u64::MAX),
+            count_allocated_in_l2_extended(
+                &buf,
+                65536,
+                0,
+                u64::MAX,
+                false,
+                &mut TargetUnitTracker::new(0)
+            )
+            .unwrap(),
             65536
         );
     }
@@ -3831,7 +4565,15 @@ mod tests {
         let mut buf = [0u8; 16];
         put_ext_entry(&mut buf, 0, 0x50000, bitmap);
         assert_eq!(
-            count_allocated_in_l2_extended(&buf, 65536, 0, u64::MAX),
+            count_allocated_in_l2_extended(
+                &buf,
+                65536,
+                0,
+                u64::MAX,
+                false,
+                &mut TargetUnitTracker::new(0)
+            )
+            .unwrap(),
             8 * 2048
         );
     }
@@ -3843,7 +4585,15 @@ mod tests {
         let mut buf = [0u8; 16];
         put_ext_entry(&mut buf, 0, OFLAG_COMPRESSED | 0xDEAD, 0);
         assert_eq!(
-            count_allocated_in_l2_extended(&buf, 65536, 0, u64::MAX),
+            count_allocated_in_l2_extended(
+                &buf,
+                65536,
+                0,
+                u64::MAX,
+                false,
+                &mut TargetUnitTracker::new(0)
+            )
+            .unwrap(),
             65536
         );
     }
@@ -3861,7 +4611,15 @@ mod tests {
         put_ext_entry(&mut buf, 3, OFLAG_COMPRESSED | 0xCAFE, 0);
         // 0 + 65536 + (4 * 2048) + 65536 = 139264.
         assert_eq!(
-            count_allocated_in_l2_extended(&buf, 65536, 0, u64::MAX),
+            count_allocated_in_l2_extended(
+                &buf,
+                65536,
+                0,
+                u64::MAX,
+                false,
+                &mut TargetUnitTracker::new(0)
+            )
+            .unwrap(),
             65536 + 4 * 2048 + 65536,
         );
     }
@@ -3874,7 +4632,15 @@ mod tests {
         let mut buf = [0u8; 16];
         put_ext_entry(&mut buf, 0, 0x100000, bitmap);
         assert_eq!(
-            count_allocated_in_l2_extended(&buf, 2 * 1024 * 1024, 0, u64::MAX),
+            count_allocated_in_l2_extended(
+                &buf,
+                2 * 1024 * 1024,
+                0,
+                u64::MAX,
+                false,
+                &mut TargetUnitTracker::new(0)
+            )
+            .unwrap(),
             16 * 65536,
         );
     }
@@ -3889,7 +4655,15 @@ mod tests {
         buf[16] = 0xAB; // partial tail
         buf[17] = 0xCD;
         assert_eq!(
-            count_allocated_in_l2_extended(&buf, 65536, 0, u64::MAX),
+            count_allocated_in_l2_extended(
+                &buf,
+                65536,
+                0,
+                u64::MAX,
+                false,
+                &mut TargetUnitTracker::new(0)
+            )
+            .unwrap(),
             65536
         );
     }
@@ -3899,7 +4673,18 @@ mod tests {
         let full: u64 = 0x0000_0000_FFFF_FFFF;
         let mut buf = [0u8; 16];
         put_ext_entry(&mut buf, 0, 0x50000, full);
-        assert_eq!(count_allocated_in_l2_extended(&buf, 0, 0, u64::MAX), 0);
+        assert_eq!(
+            count_allocated_in_l2_extended(
+                &buf,
+                0,
+                0,
+                u64::MAX,
+                false,
+                &mut TargetUnitTracker::new(0)
+            )
+            .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -3910,7 +4695,145 @@ mod tests {
         let bitmap: u64 = 0x0000_FFFF_0000_0000; // 16 zero subclusters
         let mut buf = [0u8; 16];
         put_ext_entry(&mut buf, 0, 0, bitmap);
-        assert_eq!(count_allocated_in_l2_extended(&buf, 65536, 0, u64::MAX), 0);
+        assert_eq!(
+            count_allocated_in_l2_extended(
+                &buf,
+                65536,
+                0,
+                u64::MAX,
+                false,
+                &mut TargetUnitTracker::new(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn count_l2_extended_data_file_copied_at_offset_zero_counts() {
+        // A data-file image's cluster 0 with 4 KiB written (COPIED|0,
+        // bitmap 0x3) is two NORMAL subclusters; without the data file
+        // the same entry is INVALID and the count fails there.
+        let mut buf = [0u8; 32];
+        put_ext_entry(&mut buf, 0, OFLAG_COPIED, 0x3);
+        put_ext_entry(&mut buf, 1, 0x50000, 0xFFFF_FFFF);
+        assert_eq!(
+            count_allocated_in_l2_extended(
+                &buf,
+                65536,
+                0,
+                u64::MAX,
+                true,
+                &mut TargetUnitTracker::new(0)
+            ),
+            Ok(2 * 2048 + 65536)
+        );
+        assert_eq!(
+            count_allocated_in_l2_extended(
+                &buf,
+                65536,
+                0x10_0000,
+                u64::MAX,
+                false,
+                &mut TargetUnitTracker::new(0)
+            ),
+            Err(InvalidL2Entry {
+                virtual_offset: 0x10_0000
+            })
+        );
+    }
+
+    #[test]
+    fn count_l2_extended_invalid_entry_fails_but_not_past_virtual_size() {
+        // An alloc-and-zero overlap inside the image fails the count; the
+        // same entry past virtual_size has no guest-visible meaning and
+        // is skipped, as every out-of-bounds entry is.
+        let mut buf = [0u8; 32];
+        put_ext_entry(&mut buf, 1, 0x50000, (1u64 << 32) | 1);
+        assert_eq!(
+            count_allocated_in_l2_extended(
+                &buf,
+                65536,
+                0,
+                2 * 65536,
+                false,
+                &mut TargetUnitTracker::new(0)
+            ),
+            Err(InvalidL2Entry {
+                virtual_offset: 65536
+            })
+        );
+        assert_eq!(
+            count_allocated_in_l2_extended(
+                &buf,
+                65536,
+                0,
+                65536,
+                false,
+                &mut TargetUnitTracker::new(0)
+            ),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn count_l2_extended_records_target_units() {
+        // Two 2 KiB subclusters in each of clusters 0 and 1, and a
+        // compressed cluster 3: qemu's measure rounds each data run up
+        // to a 64 KiB target cluster, so three target units hold data.
+        let mut buf = [0u8; 64];
+        put_ext_entry(&mut buf, 0, 0x50000, 0x3);
+        put_ext_entry(&mut buf, 1, 0x60000, 0x3);
+        put_ext_entry(&mut buf, 3, OFLAG_COMPRESSED | 0x70000, 0);
+        let mut t = TargetUnitTracker::new(65536);
+        assert_eq!(
+            count_allocated_in_l2_extended(&buf, 65536, 0, u64::MAX, false, &mut t),
+            Ok(2 * 4096 + 65536)
+        );
+        assert_eq!(t.target_units_with_data, 3);
+    }
+
+    #[test]
+    fn count_l2_extended_unallocated_alloc_and_zero_alloc_do_not_count() {
+        // A host cluster whose bitmap is empty (UNALLOCATED_ALLOC) or all
+        // zero (ZERO_ALLOC) has no data for qemu-img measure to count.
+        let mut buf = [0u8; 32];
+        put_ext_entry(&mut buf, 0, 0x50000, 0);
+        put_ext_entry(&mut buf, 1, 0x60000, 0xFFFF_FFFFu64 << 32);
+        assert_eq!(
+            count_allocated_in_l2_extended(
+                &buf,
+                65536,
+                0,
+                u64::MAX,
+                false,
+                &mut TargetUnitTracker::new(0)
+            ),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn walk_l2_standard_counts_what_qemu_measure_counts() {
+        // NORMAL and COMPRESSED count; ZERO_PLAIN, ZERO_ALLOC and an
+        // unallocated entry with flag bits do not (block/qcow2.c:5193-5202).
+        // With a data file, COPIED at host offset 0 is NORMAL.
+        let mut buf = [0u8; 6 * 8];
+        put_std_entry(&mut buf, 0, OFLAG_COPIED);
+        put_std_entry(&mut buf, 1, OFLAG_COPIED | 0x10000);
+        put_std_entry(&mut buf, 2, QCOW_OFLAG_ZERO);
+        put_std_entry(&mut buf, 3, OFLAG_COPIED | 0x20000 | QCOW_OFLAG_ZERO);
+        put_std_entry(&mut buf, 4, OFLAG_COMPRESSED | 0x30000);
+        let mut t = TargetUnitTracker::new(0);
+        assert_eq!(
+            walk_l2_standard(&buf, 4096, 0, u64::MAX, false, &mut t),
+            2 * 4096
+        );
+        let mut t = TargetUnitTracker::new(0);
+        assert_eq!(
+            walk_l2_standard(&buf, 4096, 0, u64::MAX, true, &mut t),
+            3 * 4096
+        );
     }
 
     // ---- TargetUnitTracker / walk_l2_standard (bug #286) ----
@@ -3967,11 +4890,11 @@ mod tests {
         // L2 with 3 non-zero entries at index 0, 16, 17 (cluster_size 4K,
         // target unit 64K → entry 0 → unit 0; entries 16,17 → unit 1).
         let mut buf = [0u8; 64 * 8];
-        put_std_entry(&mut buf, 0, 0x1);
-        put_std_entry(&mut buf, 16, 0x2);
-        put_std_entry(&mut buf, 17, 0x3);
+        put_std_entry(&mut buf, 0, 0x10000);
+        put_std_entry(&mut buf, 16, 0x20000);
+        put_std_entry(&mut buf, 17, 0x30000);
         let mut t = TargetUnitTracker::new(65536);
-        let allocated = walk_l2_standard(&buf, 4096, 0, u64::MAX, &mut t);
+        let allocated = walk_l2_standard(&buf, 4096, 0, u64::MAX, false, &mut t);
         assert_eq!(allocated, 3 * 4096);
         // Entry 0 covers virtual [0, 4096) → unit 0.
         // Entry 16 covers virtual [65536, 69632) → unit 1.
@@ -3984,9 +4907,9 @@ mod tests {
         // Same buffer but starting at an L1-offset of 1 GiB. The base
         // offset must shift the per-entry virtual ranges.
         let mut buf = [0u8; 8 * 8];
-        put_std_entry(&mut buf, 0, 0x1);
+        put_std_entry(&mut buf, 0, 0x10000);
         let mut t = TargetUnitTracker::new(65536);
-        let _ = walk_l2_standard(&buf, 4096, 1 << 30, u64::MAX, &mut t);
+        let _ = walk_l2_standard(&buf, 4096, 1 << 30, u64::MAX, false, &mut t);
         // After the call, last_unit_idx should reflect the high offset.
         assert_eq!(t.last_unit_idx, (1u64 << 30) / 65536);
     }
@@ -4005,12 +4928,12 @@ mod tests {
         // 4 non-zero entries, cluster 4K. virtual_size = 8K → only the
         // first two entries are in-bounds.
         let mut buf = [0u8; 4 * 8];
-        put_std_entry(&mut buf, 0, 0x1);
-        put_std_entry(&mut buf, 1, 0x2);
-        put_std_entry(&mut buf, 2, 0x3);
-        put_std_entry(&mut buf, 3, 0x4);
+        put_std_entry(&mut buf, 0, 0x10000);
+        put_std_entry(&mut buf, 1, 0x20000);
+        put_std_entry(&mut buf, 2, 0x30000);
+        put_std_entry(&mut buf, 3, 0x40000);
         let mut t = TargetUnitTracker::new(0);
-        let allocated = walk_l2_standard(&buf, 4096, 0, 8192, &mut t);
+        let allocated = walk_l2_standard(&buf, 4096, 0, 8192, false, &mut t);
         assert_eq!(allocated, 2 * 4096);
     }
 
@@ -4019,10 +4942,10 @@ mod tests {
         // virtual_size = 6000; the second 4K cluster (at offset 4096)
         // straddles virtual_size. In-bounds portion = 6000 - 4096 = 1904.
         let mut buf = [0u8; 4 * 8];
-        put_std_entry(&mut buf, 0, 0x1);
-        put_std_entry(&mut buf, 1, 0x2);
+        put_std_entry(&mut buf, 0, 0x10000);
+        put_std_entry(&mut buf, 1, 0x20000);
         let mut t = TargetUnitTracker::new(0);
-        let allocated = walk_l2_standard(&buf, 4096, 0, 6000, &mut t);
+        let allocated = walk_l2_standard(&buf, 4096, 0, 6000, false, &mut t);
         assert_eq!(allocated, 4096 + 1904);
     }
 
@@ -4033,12 +4956,12 @@ mod tests {
         // pre-fix code would inflate this; the fix keeps it bounded.
         let mut buf = [0u8; 4 * 8];
         for i in 0..4 {
-            put_std_entry(&mut buf, i, 0x1);
+            put_std_entry(&mut buf, i, 0x10000 * (i as u64 + 1));
         }
         let virtual_size: u64 = 8192;
         let target_unit: u64 = 4096;
         let mut t = TargetUnitTracker::new(target_unit);
-        let _ = walk_l2_standard(&buf, 4096, 0, virtual_size, &mut t);
+        let _ = walk_l2_standard(&buf, 4096, 0, virtual_size, false, &mut t);
         let cap = virtual_size.div_ceil(target_unit);
         assert!(
             t.target_units_with_data <= cap,
@@ -4056,7 +4979,18 @@ mod tests {
         let mut buf = [0u8; 32];
         put_ext_entry(&mut buf, 0, 0x10000, full);
         put_ext_entry(&mut buf, 1, 0x20000, full);
-        assert_eq!(count_allocated_in_l2_extended(&buf, 65536, 0, 65536), 65536,);
+        assert_eq!(
+            count_allocated_in_l2_extended(
+                &buf,
+                65536,
+                0,
+                65536,
+                false,
+                &mut TargetUnitTracker::new(0)
+            )
+            .unwrap(),
+            65536,
+        );
     }
 
     #[test]
@@ -4066,7 +5000,18 @@ mod tests {
         let full: u64 = 0x0000_0000_FFFF_FFFF;
         let mut buf = [0u8; 16];
         put_ext_entry(&mut buf, 0, 0x10000, full);
-        assert_eq!(count_allocated_in_l2_extended(&buf, 65536, 0, 30000), 30000,);
+        assert_eq!(
+            count_allocated_in_l2_extended(
+                &buf,
+                65536,
+                0,
+                30000,
+                false,
+                &mut TargetUnitTracker::new(0)
+            )
+            .unwrap(),
+            30000,
+        );
     }
 
     // ====================================================================
@@ -4075,7 +5020,7 @@ mod tests {
 
     #[test]
     fn classify_standard_zero_is_hole() {
-        let e = classify_qcow2_l2_standard(0, 0, 65536);
+        let e = classify_qcow2_l2_standard(0, 0, 65536, false);
         assert_eq!(e.start, 0);
         assert_eq!(e.length, 65536);
         assert_eq!(e.state, MapExtentState::Hole);
@@ -4084,7 +5029,7 @@ mod tests {
     #[test]
     fn classify_standard_normal_is_data() {
         // host_offset = 0x50000, no flag bits.
-        let e = classify_qcow2_l2_standard(0x0005_0000, 0, 65536);
+        let e = classify_qcow2_l2_standard(0x0005_0000, 0, 65536, false);
         assert_eq!(
             e.state,
             MapExtentState::Data {
@@ -4097,7 +5042,7 @@ mod tests {
     fn classify_standard_compressed_is_data() {
         // OFLAG_COMPRESSED set; offset bits in L2_OFFSET_MASK range.
         let entry = OFLAG_COMPRESSED | 0x0001_2000;
-        let e = classify_qcow2_l2_standard(entry, 65536, 65536);
+        let e = classify_qcow2_l2_standard(entry, 65536, 65536, false);
         assert_eq!(e.start, 65536);
         assert_eq!(e.length, 65536);
         // file_offset masked with L2_OFFSET_MASK.
@@ -4112,18 +5057,29 @@ mod tests {
 
     #[test]
     fn classify_standard_oflag_copied_only_is_hole() {
-        // OFLAG_COPIED is bit 63; on its own with no offset the
-        // entry is non-zero but host_offset is 0 — treat as Hole
-        // to match cluster_lookup's "host_offset == 0 →
-        // Unallocated" path.
-        let e = classify_qcow2_l2_standard(OFLAG_COPIED, 0, 65536);
+        // OFLAG_COPIED is bit 63; on its own with no offset and no
+        // external data file the entry is UNALLOCATED_PLAIN.
+        let e = classify_qcow2_l2_standard(OFLAG_COPIED, 0, 65536, false);
+        assert_eq!(e.state, MapExtentState::Hole);
+    }
+
+    #[test]
+    fn classify_standard_data_file_copied_at_offset_zero_is_data() {
+        // With an external data file, COPIED at host offset 0 is a
+        // NORMAL cluster at data-file offset 0 (block/qcow2.h:724-733):
+        // qemu-img map reports a data-file image's cluster 0 as data at
+        // offset 0.
+        let e = classify_qcow2_l2_standard(OFLAG_COPIED, 0, 65536, true);
+        assert_eq!(e.state, MapExtentState::Data { file_offset: 0 });
+        // Without COPIED it is still unallocated.
+        let e = classify_qcow2_l2_standard(0, 0, 65536, true);
         assert_eq!(e.state, MapExtentState::Hole);
     }
 
     #[test]
     fn classify_standard_oflag_copied_with_offset_is_data() {
         let entry = OFLAG_COPIED | 0x0001_0000;
-        let e = classify_qcow2_l2_standard(entry, 0, 65536);
+        let e = classify_qcow2_l2_standard(entry, 0, 65536, false);
         assert_eq!(
             e.state,
             MapExtentState::Data {
@@ -4143,6 +5099,24 @@ mod tests {
         cluster_size: u64,
         cluster_visible: u64,
     ) -> ([MapExtent; 40], usize) {
+        extract_extents_with(
+            l2_entry,
+            sc_bitmap,
+            virtual_offset,
+            cluster_size,
+            cluster_visible,
+            false,
+        )
+    }
+
+    fn extract_extents_with(
+        l2_entry: u64,
+        sc_bitmap: u64,
+        virtual_offset: u64,
+        cluster_size: u64,
+        cluster_visible: u64,
+        has_data_file: bool,
+    ) -> ([MapExtent; 40], usize) {
         let mut buf = [MapExtent {
             start: 0,
             length: 0,
@@ -4157,14 +5131,18 @@ mod tests {
         };
         {
             let mut sink = MapExtentCoalescer::new(&mut emit);
-            assert!(classify_qcow2_l2_extended(
-                l2_entry,
-                sc_bitmap,
-                virtual_offset,
-                cluster_size,
-                cluster_visible,
-                &mut sink,
-            ));
+            assert_eq!(
+                classify_qcow2_l2_extended(
+                    l2_entry,
+                    sc_bitmap,
+                    virtual_offset,
+                    cluster_size,
+                    cluster_visible,
+                    has_data_file,
+                    &mut sink,
+                ),
+                Ok(true)
+            );
             assert!(sink.finish());
         }
         (buf, count)
@@ -4231,14 +5209,20 @@ mod tests {
     fn classify_extended_checkerboard_alloc_keeps_split() {
         // alloc_bits = 0xAAAAAAAA (every other subcluster
         // allocated), zero_bits = 0. Result: 32 separate extents
-        // alternating Hole / Data. The coalescer cannot merge them
+        // alternating HoleAt / Data. The coalescer cannot merge them
         // because the states differ.
         let alloc: u64 = 0xAAAA_AAAA;
         let host_offset: u64 = 0x1_0000_0000;
         let (buf, count) = extract_extents(host_offset, alloc, 0, 65536, 65536);
         assert_eq!(count, 32);
-        // Even-index subclusters are Hole (low bits = 0).
-        assert_eq!(buf[0].state, MapExtentState::Hole);
+        // Even-index subclusters are UNALLOCATED_ALLOC (low bits = 0),
+        // which qemu-img map reports with the host offset.
+        assert_eq!(
+            buf[0].state,
+            MapExtentState::HoleAt {
+                file_offset: host_offset
+            }
+        );
         // Odd-index are Data.
         match buf[1].state {
             MapExtentState::Data { file_offset } => {
@@ -4251,8 +5235,8 @@ mod tests {
     #[test]
     fn classify_extended_one_alloc_amid_holes() {
         // alloc_bits = 1 (subcluster 0 only), zero_bits = 0.
-        // 1 Data extent then 1 Hole extent (31 subclusters worth
-        // of Hole, coalesced).
+        // 1 Data extent then 1 HoleAt extent (31 UNALLOCATED_ALLOC
+        // subclusters, coalesced, at the host offset that follows).
         let alloc: u64 = 1;
         let host_offset: u64 = 0x8000;
         let (buf, count) = extract_extents(host_offset, alloc, 0, 65536, 65536);
@@ -4264,22 +5248,111 @@ mod tests {
             }
         );
         assert_eq!(buf[0].length, 2048);
-        assert_eq!(buf[1].state, MapExtentState::Hole);
+        assert_eq!(
+            buf[1].state,
+            MapExtentState::HoleAt {
+                file_offset: host_offset + 2048
+            }
+        );
         assert_eq!(buf[1].length, 2048 * 31);
     }
 
     #[test]
-    fn classify_extended_alloc_plus_zero_subcluster_is_zero_alloc() {
-        // Subcluster 0 has both alloc and zero set: zero wins
-        // (defensive against sc_bitmap validator I1).
-        let bitmap: u64 = (1u64 << 32) | 1;
-        let (buf, count) = extract_extents(0x1_0000, bitmap, 0, 65536, 65536);
-        // Subcluster 0: ZeroAllocated. Subclusters 1..32: Hole
-        // (l2_entry != 0 path: alloc=0, zero=0 → Hole).
+    fn classify_extended_invalid_entry_is_refused() {
+        // A subcluster both allocated and zero, and alloc bits with no
+        // host cluster, are INVALID; qemu-img map fails with EIO there.
+        // Nothing is pushed for the entry.
+        for (entry, bitmap, has_data_file) in [
+            (0x1_0000u64, (1u64 << 32) | 1, false),
+            (0, 0x3, false),
+            (OFLAG_COPIED, 0x3, false),
+            (0, 0x3, true),
+        ] {
+            let mut pushed = 0usize;
+            let mut emit = |_: MapExtent| -> bool {
+                pushed += 1;
+                true
+            };
+            {
+                let mut sink = MapExtentCoalescer::new(&mut emit);
+                assert_eq!(
+                    classify_qcow2_l2_extended(
+                        entry,
+                        bitmap,
+                        0x20_0000,
+                        65536,
+                        65536,
+                        has_data_file,
+                        &mut sink
+                    ),
+                    Err(InvalidL2Entry {
+                        virtual_offset: 0x20_0000
+                    }),
+                    "entry {entry:#x} bitmap {bitmap:#x} data file {has_data_file}"
+                );
+                assert!(sink.finish());
+            }
+            assert_eq!(pushed, 0);
+        }
+    }
+
+    #[test]
+    fn classify_extended_data_file_partial_cluster_zero() {
+        // qemu-io `write -P 0xab 0 4k` on an extended-L2 data-file image
+        // writes entry COPIED|0 with bitmap 0x3. qemu-img 10.0.13 map:
+        // data at offset 0 for 4 KiB, then an unallocated run that still
+        // reports offset 4096 (block/qcow2.c:2171-2177).
+        let (buf, count) = extract_extents_with(OFLAG_COPIED, 0x3, 0, 65536, 65536, true);
         assert_eq!(count, 2);
-        assert_eq!(buf[0].state, MapExtentState::ZeroAllocated);
-        assert_eq!(buf[0].length, 2048);
-        assert_eq!(buf[1].state, MapExtentState::Hole);
+        assert_eq!(
+            buf[0],
+            MapExtent {
+                start: 0,
+                length: 4096,
+                state: MapExtentState::Data { file_offset: 0 }
+            }
+        );
+        assert_eq!(
+            buf[1],
+            MapExtent {
+                start: 4096,
+                length: 61440,
+                state: MapExtentState::HoleAt { file_offset: 4096 }
+            }
+        );
+    }
+
+    #[test]
+    fn classify_extended_mixed_types_match_qemu_map() {
+        // Cluster 1 of the mixed fixtures: subclusters 0-1 written,
+        // 2-3 zeroed after being written (ZERO_ALLOC), the rest
+        // UNALLOCATED_ALLOC; and cluster 2: subcluster 1 zeroed only
+        // (ZERO_PLAIN amid UNALLOCATED_PLAIN). The states are what
+        // qemu-img 10.0.13 map reports for them.
+        let host = 0x6_0000u64;
+        let bitmap = (0b1100u64 << 32) | 0b0011;
+        let (buf, count) = extract_extents(host, bitmap, 0x1_0000, 65536, 65536);
+        assert_eq!(count, 3);
+        assert_eq!(buf[0].state, MapExtentState::Data { file_offset: host });
+        assert_eq!(
+            buf[1].state,
+            MapExtentState::ZeroAllocatedAt {
+                file_offset: host + 4096
+            }
+        );
+        assert_eq!(buf[1].length, 4096);
+        assert_eq!(
+            buf[2].state,
+            MapExtentState::HoleAt {
+                file_offset: host + 8192
+            }
+        );
+        let (buf, count) = extract_extents(0, 0b10u64 << 32, 0x2_0000, 65536, 65536);
+        assert_eq!(count, 3);
+        assert_eq!(buf[0].state, MapExtentState::Hole);
+        assert_eq!(buf[1].state, MapExtentState::ZeroAllocated);
+        assert_eq!(buf[2].state, MapExtentState::Hole);
+        assert_eq!(buf[2].length, 30 * 2048);
     }
 
     #[test]
@@ -4305,7 +5378,7 @@ mod tests {
     fn classify_standard_compressed_offset_masked() {
         // Make sure high garbage bits don't leak into file_offset.
         let entry = OFLAG_COMPRESSED | OFLAG_COPIED | 0x0007_0000;
-        let e = classify_qcow2_l2_standard(entry, 0, 65536);
+        let e = classify_qcow2_l2_standard(entry, 0, 65536, false);
         let want = entry & L2_OFFSET_MASK;
         assert_eq!(e.state, MapExtentState::Data { file_offset: want });
     }
@@ -5445,127 +6518,324 @@ mod tests {
     #[test]
     fn classify_standard_zero_flag_host_zero_is_zeroallocated() {
         // QCOW_OFLAG_ZERO with host_offset == 0 (ZERO_PLAIN).
-        let e = classify_qcow2_l2_standard(QCOW_OFLAG_ZERO, 0, 65536);
+        let e = classify_qcow2_l2_standard(QCOW_OFLAG_ZERO, 0, 65536, false);
         assert_eq!(e.state, MapExtentState::ZeroAllocated);
     }
 
     #[test]
-    fn classify_standard_zero_flag_host_nonzero_is_zeroallocated() {
+    fn classify_standard_zero_flag_host_nonzero_is_zeroallocated_at_host() {
         // QCOW_OFLAG_ZERO with a host offset set (ZERO_ALLOC); the zero
-        // flag wins over the Data classification the offset would imply.
+        // flag wins over the Data classification the offset would imply,
+        // and qemu-img map still reports the host offset
+        // (block/qcow2.c:2171-2177; measured on qemu-img 10.0.13 as
+        // `"present": true, "zero": true, "data": false, "offset": ...`).
         let entry = 0x0005_0000 | OFLAG_COPIED | QCOW_OFLAG_ZERO;
-        let e = classify_qcow2_l2_standard(entry, 0, 65536);
-        assert_eq!(e.state, MapExtentState::ZeroAllocated);
+        let e = classify_qcow2_l2_standard(entry, 0, 65536, false);
+        assert_eq!(
+            e.state,
+            MapExtentState::ZeroAllocatedAt {
+                file_offset: 0x0005_0000
+            }
+        );
     }
 
     // ====================================================================
-    // Extended-L2 wide I/O path: alloc bit set at host offset zero (#650)
+    // Chain reader: where every byte of a subcluster comes from
+    // (#650, #653, #654)
     // ====================================================================
     //
-    // An extended-L2 entry can name host offset 0 while the subcluster
-    // allocation bitmap claims a subcluster is allocated. There is no
-    // host cluster to read, so the chunk read is skipped -- and before
-    // the fix the wide path matched no fill arm for such a subcluster
-    // and left the caller's buffer untouched under a `true` return,
-    // handing back whatever the caller had there. The narrow path
-    // already zero-filled it. `fuzz_chain_compose` found this with a
-    // dual-sentinel fill check, which is not a committed regression
-    // test; these two are.
+    // An in-memory chain whose devices each serve bytes that say which
+    // device, and which offset, they came from. The child's bytes depend
+    // on the host offset, the data file's on its offset, the backing
+    // file's on the virtual offset, and all three are non-zero and
+    // distinct, so a subcluster read from the wrong layer, at the wrong
+    // offset, or zero-filled instead of descended, shows in the output.
+    // Each entry below is read through `read_chain_virtual_cluster` with
+    // a sector no larger than a subcluster (the narrow I/O path) and with
+    // one larger (the wide path), and the expected provenance is stated
+    // per run of subclusters, in qemu's types.
+    //
+    // The data device is addressed by `data_device_idx`, not by its
+    // place in the chain, so the harness keeps it out of the chain: an
+    // unallocated subcluster then descends to the backing device or
+    // reads zeros, which is qemu's answer (#792 is the host putting the
+    // data device in the chain, which this harness does not reproduce).
 
-    // Byte size of the in-memory qcow2 image the #650 mock serves.
-    const W650_IMG_LEN: usize = 8192;
+    const SC_MAX_DEVS: usize = 3;
+    /// 16 KiB clusters: 512-byte subclusters, so a 512-byte sector takes
+    /// the narrow path and a 4096-byte sector the wide path.
+    const SC_CLUSTER: u64 = 16384;
+    const SC_CLUSTER_BITS: u32 = 14;
+    const SC_SC_SIZE: u64 = SC_CLUSTER / QCOW_EXTL2_SUBCLUSTERS_PER_CLUSTER as u64;
+    const SC_NARROW_SSZ: usize = 512;
+    const SC_WIDE_SSZ: usize = 4096;
+    /// Image layout: cluster 0 header area, 1 the L1 table, 2 the L2
+    /// table, 3 and 4 host data clusters. Eight virtual clusters.
+    const SC_L1_OFF: u64 = SC_CLUSTER;
+    const SC_L2_OFF: u64 = 2 * SC_CLUSTER;
+    const SC_HOST_A: u64 = 3 * SC_CLUSTER;
+    const SC_HOST_B: u64 = 4 * SC_CLUSTER;
+    const SC_IMG_LEN: usize = 5 * SC_CLUSTER as usize;
+    const SC_VDISK_LEN: usize = 8 * SC_CLUSTER as usize;
+    /// A host offset past the end of the image: a read of it fails, so
+    /// a test that passes with it proves the host cluster was not read.
+    const SC_HOST_PAST_EOF: u64 = 64 * SC_CLUSTER;
 
-    // Serialize tests touching the W650 globals (extern "C" callbacks
-    // can only close over 'static state; mirrors Z432_LOCK above).
-    static W650_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    static mut W650_IMG: [u8; W650_IMG_LEN] = [0u8; W650_IMG_LEN];
-    static mut W650_CAP_SECTORS: u64 = 0;
+    // Serialize tests touching the SC globals (extern "C" callbacks can
+    // only close over 'static state; mirrors Z432_LOCK above).
+    static SC_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static mut SC_IMAGES: [*const u8; SC_MAX_DEVS] = [core::ptr::null(); SC_MAX_DEVS];
+    static mut SC_LENS: [usize; SC_MAX_DEVS] = [0; SC_MAX_DEVS];
+    static mut SC_SSZ: usize = SC_NARROW_SSZ;
+    static mut SC_ERR_CALLS: u32 = 0;
+    static mut SC_ERR_OP: [u8; 32] = [0; 32];
+    static mut SC_ERR_SECTOR: u64 = 0;
+    static mut SC_ERR_STATUS: u32 = 0;
 
-    // 512-byte sectors over 8192-byte clusters put the subcluster at
-    // 8192 / 32 = 256 bytes, so `sector_size > sc_size` and the
-    // StandardSubclusters arm takes the WIDE path. That relationship is
-    // the whole point of the fixture: at the default 64 KiB cluster the
-    // subcluster would be 2048 bytes and the narrow path -- which has
-    // defended this case since I2 -- would run instead.
-    const W650_SSZ: usize = 512;
-    const W650_CLUSTER: u64 = 8192;
-    const W650_SC_SIZE: u64 = W650_CLUSTER / 32;
+    fn sc_child_byte(host_off: u64) -> u8 {
+        0x40 + ((host_off / 64) % 0x40) as u8
+    }
+    fn sc_backing_byte(virt_off: u64) -> u8 {
+        0x80 + ((virt_off / 64) % 0x40) as u8
+    }
+    fn sc_data_byte(host_off: u64) -> u8 {
+        0xC0 + ((host_off / 64) % 0x3f) as u8
+    }
 
-    // Subcluster 3 is marked allocated with no host cluster behind it:
-    // the malformed subcluster. Subcluster 0 carries a zero bit, which
-    // is what makes `cluster_lookup` resolve an all-zero L2 entry to
-    // StandardSubclusters at all rather than to Unallocated, and so is
-    // load-bearing rather than decoration.
-    const W650_BAD_SC: u32 = 3;
-    const W650_ZERO_SC: u32 = 0;
-    const W650_BITMAP: u64 = (1u64 << (32 + W650_ZERO_SC)) | (1u64 << W650_BAD_SC);
-
-    unsafe extern "C" fn w650_read_sector(
-        _device_idx: u32,
+    unsafe extern "C" fn sc_read_sector(
+        device_idx: u32,
         sector: u64,
         out_buf: *mut u8,
         sector_size: usize,
     ) -> bool {
-        let start = (sector as usize).saturating_mul(sector_size);
-        if start + sector_size > W650_IMG_LEN {
+        let dev = device_idx as usize;
+        if dev >= SC_MAX_DEVS {
             return false;
         }
-        let base = core::ptr::addr_of!(W650_IMG) as *const u8;
-        core::ptr::copy_nonoverlapping(base.add(start), out_buf, sector_size);
+        let img = *(core::ptr::addr_of!(SC_IMAGES) as *const *const u8).add(dev);
+        let len = *(core::ptr::addr_of!(SC_LENS) as *const usize).add(dev);
+        if img.is_null() {
+            return false;
+        }
+        let start = (sector as usize).saturating_mul(sector_size);
+        if start + sector_size > len {
+            return false;
+        }
+        core::ptr::copy_nonoverlapping(img.add(start), out_buf, sector_size);
         true
     }
 
-    unsafe extern "C" fn w650_capacity(_device_idx: u32) -> u64 {
-        W650_CAP_SECTORS
+    unsafe extern "C" fn sc_capacity(device_idx: u32) -> u64 {
+        let dev = device_idx as usize;
+        if dev >= SC_MAX_DEVS {
+            return 0;
+        }
+        let len = *(core::ptr::addr_of!(SC_LENS) as *const usize).add(dev);
+        (len / SC_SSZ) as u64
     }
 
-    fn w650_call_table() -> shared::CallTable {
+    unsafe extern "C" fn sc_ssz(_device_idx: u32) -> usize {
+        SC_SSZ
+    }
+
+    /// Record what `send_error` was called with: the reader returns a
+    /// bare bool, so this is the only evidence of *why* a read failed.
+    unsafe extern "C" fn sc_send_err(op: *const u8, _dev: *const u8, sector: u64, status: u32) {
+        SC_ERR_CALLS += 1;
+        SC_ERR_SECTOR = sector;
+        SC_ERR_STATUS = status;
+        let dst = core::ptr::addr_of_mut!(SC_ERR_OP) as *mut u8;
+        core::ptr::write_bytes(dst, 0, 32);
+        for i in 0..31 {
+            let b = *op.add(i);
+            *dst.add(i) = b;
+            if b == 0 {
+                break;
+            }
+        }
+    }
+
+    fn sc_call_table() -> shared::CallTable {
         shared::CallTable {
-            read_input_sector: w650_read_sector,
-            get_input_capacity: w650_capacity,
+            read_input_sector: sc_read_sector,
+            get_input_capacity: sc_capacity,
+            get_input_sector_size: sc_ssz,
+            send_error: sc_send_err,
             ..stub_call_table()
         }
     }
 
-    /// Build the in-memory extended-L2 fixture into `W650_IMG` and set
-    /// the served capacity. Layout (cluster_size = 8192, 16-byte L2
-    /// entries):
-    ///   - L1 table at 512: L1[0] -> L2 table at 1024.
-    ///   - L2 table at 1024: entry[0] host offset field = 0 (@1024),
-    ///     subcluster bitmap = W650_BITMAP (@1032).
-    ///
-    /// Everything outside the two tables is 0xDD, so a mutation that
-    /// dropped the `host_offset != 0` guard and read the chunk from
-    /// file offset zero returns recognisable bytes rather than the
-    /// zeros the fixture asserts.
-    unsafe fn w650_build_image() {
-        let mut img = [0xDDu8; W650_IMG_LEN];
-        let mut put = |off: usize, v: u64| {
-            img[off..off + 8].copy_from_slice(&v.to_be_bytes());
-        };
-        put(512, 1024 | OFLAG_COPIED);
-        put(1024, 0);
-        put(1032, W650_BITMAP);
-        let dst = core::ptr::addr_of_mut!(W650_IMG) as *mut u8;
-        core::ptr::copy_nonoverlapping(img.as_ptr(), dst, W650_IMG_LEN);
-        W650_CAP_SECTORS = (W650_IMG_LEN / W650_SSZ) as u64;
+    /// What `send_error` captured during one read: how many calls, the
+    /// operation marker of the last, its `sector` and its `status`.
+    #[derive(Debug)]
+    struct ScErr {
+        calls: u32,
+        op: std::string::String,
+        sector: u64,
+        status: u32,
     }
 
-    /// Construct a `Qcow2State` matching the #650 fixture geometry. The
-    /// caller owns the two cache buffers (each >= MAX_SECTOR_SIZE).
-    fn w650_state(l1_cache: &mut [u8], l2_cache: &mut [u8]) -> Qcow2State {
+    fn sc_take_err() -> ScErr {
+        unsafe {
+            let src = core::ptr::addr_of!(SC_ERR_OP) as *const u8;
+            let mut n = 0usize;
+            while n < 32 && *src.add(n) != 0 {
+                n += 1;
+            }
+            let op = core::str::from_utf8(core::slice::from_raw_parts(src, n)).unwrap_or("?");
+            ScErr {
+                calls: SC_ERR_CALLS,
+                op: std::string::String::from(op),
+                sector: SC_ERR_SECTOR,
+                status: SC_ERR_STATUS,
+            }
+        }
+    }
+
+    /// Where a byte of a subcluster must come from.
+    #[derive(Clone, Copy, Debug)]
+    enum ScOwner {
+        /// The image itself, at this host cluster plus the intra-cluster
+        /// offset.
+        Child(u64),
+        /// The external data file, likewise.
+        Data(u64),
+        /// The backing device, at the virtual offset.
+        Backing,
+        Zero,
+    }
+
+    /// The L2 entries every test image carries, as (virtual cluster,
+    /// L2 word, bitmap). The data-file flag changes what clusters 2 and
+    /// 3 mean; nothing else depends on it.
+    const SC_ENTRIES: &[(u64, u64, u64)] = &[
+        // 0: a host cluster with Normal x8, ZeroAlloc x8, UnallocatedAlloc x16.
+        (0, OFLAG_COPIED | SC_HOST_A, (0xFF00 << 32) | 0xFF),
+        // 1: #654's entry: only subcluster 0's zero bit, no host cluster.
+        (1, 0, 1 << 32),
+        // 2: #653's entry: COPIED | 0 with every alloc bit.
+        (2, OFLAG_COPIED, 0x0000_0000_FFFF_FFFF),
+        // 3: qemu's `write -P 0xab 0 1k` on a data-file image: COPIED | 0,
+        //    the first two alloc bits.
+        (3, OFLAG_COPIED, 0x3),
+        // 4: a host cluster whose subcluster 3 is both allocated and zero.
+        (
+            4,
+            OFLAG_COPIED | SC_HOST_B,
+            (1 << 35) | 0x0000_0000_FFFF_FFFF,
+        ),
+        // 5: a host cluster past the end of the image that no subcluster
+        //    uses: ZeroAlloc x16, UnallocatedAlloc x16.
+        (5, OFLAG_COPIED | SC_HOST_PAST_EOF, 0xFFFF << 32),
+        // 6: #650's entry: subcluster 0 zero, subcluster 3 allocated, no
+        //    host cluster.
+        (6, 0, (1 << 32) | (1 << 3)),
+        // 7: a host cluster whose Normal run is at the end: ZeroAlloc x8,
+        //    UnallocatedAlloc x8, Normal x16.
+        (7, OFLAG_COPIED | SC_HOST_B, (0xFF << 32) | 0xFFFF_0000),
+    ];
+
+    /// Classic (8-byte entry) images for the Standard arm, as (virtual
+    /// cluster, L2 word).
+    const SC_CLASSIC_ENTRIES: &[(u64, u64)] = &[
+        // 0: COPIED | 0: a data-file image's virtual cluster 0.
+        (0, OFLAG_COPIED),
+        // 1: an ordinary host cluster.
+        (1, OFLAG_COPIED | SC_HOST_A),
+        // 2: unallocated.
+        (2, 0),
+    ];
+
+    /// The chain under test: device 0 is the qcow2 built from the entries
+    /// above, device 1 the backing device when `backing`, device 2 the
+    /// data device (always served; a test that names it sets
+    /// `data_device_idx` to 2).
+    struct ScChain {
+        qcow2: std::vec::Vec<u8>,
+        backing: Option<std::vec::Vec<u8>>,
+        /// The backing device's qcow2 cluster size, or 0 when it is raw.
+        backing_cluster: u64,
+        data: std::vec::Vec<u8>,
+        extended_l2: bool,
+        has_data_file: bool,
+    }
+
+    fn sc_chain(extended_l2: bool, has_data_file: bool, backing: bool) -> ScChain {
+        let mut img: std::vec::Vec<u8> = (0..SC_IMG_LEN as u64).map(sc_child_byte).collect();
+        let l1 = SC_L1_OFF as usize;
+        let l2 = SC_L2_OFF as usize;
+        img[l1..l1 + SC_CLUSTER as usize].fill(0);
+        img[l2..l2 + SC_CLUSTER as usize].fill(0);
+        let put = |img: &mut std::vec::Vec<u8>, off: usize, v: u64| {
+            img[off..off + 8].copy_from_slice(&v.to_be_bytes());
+        };
+        put(&mut img, l1, SC_L2_OFF | OFLAG_COPIED);
+        if extended_l2 {
+            for &(ci, entry, bitmap) in SC_ENTRIES {
+                put(&mut img, l2 + ci as usize * 16, entry);
+                put(&mut img, l2 + ci as usize * 16 + 8, bitmap);
+            }
+        } else {
+            for &(ci, entry) in SC_CLASSIC_ENTRIES {
+                put(&mut img, l2 + ci as usize * 8, entry);
+            }
+        }
+        ScChain {
+            qcow2: img,
+            backing: backing.then(|| (0..SC_VDISK_LEN as u64).map(sc_backing_byte).collect()),
+            backing_cluster: 0,
+            data: (0..SC_VDISK_LEN as u64).map(sc_data_byte).collect(),
+            extended_l2,
+            has_data_file,
+        }
+    }
+
+    /// The same chain over a classic qcow2 backing file with
+    /// `backing_cluster`-byte clusters, which serves the same bytes as
+    /// the raw backing device. Its clusters are stored in reverse order
+    /// on the host, so a read that runs past the end of one backing
+    /// cluster into the next host cluster gets the wrong virtual
+    /// cluster's bytes instead of the right ones by coincidence.
+    fn sc_chain_over_qcow2(extended_l2: bool, backing_cluster: u64) -> ScChain {
+        let mut chain = sc_chain(extended_l2, false, true);
+        let n = SC_VDISK_LEN as u64 / backing_cluster;
+        let (l1, l2, data0) = (backing_cluster, 2 * backing_cluster, 3 * backing_cluster);
+        assert!(n * 8 <= backing_cluster, "one L2 table maps the disk");
+        let mut img = std::vec![0u8; (data0 + n * backing_cluster) as usize];
+        img[l1 as usize..l1 as usize + 8].copy_from_slice(&(l2 | OFLAG_COPIED).to_be_bytes());
+        for k in 0..n {
+            let host = data0 + (n - 1 - k) * backing_cluster;
+            let at = (l2 + k * 8) as usize;
+            img[at..at + 8].copy_from_slice(&(host | OFLAG_COPIED).to_be_bytes());
+            for i in 0..backing_cluster {
+                img[(host + i) as usize] = sc_backing_byte(k * backing_cluster + i);
+            }
+        }
+        chain.backing = Some(img);
+        chain.backing_cluster = backing_cluster;
+        chain
+    }
+
+    fn sc_state(chain: &ScChain, l1_cache: &mut [u8], l2_cache: &mut [u8]) -> Qcow2State {
+        let mut features = 0;
+        if chain.extended_l2 {
+            features |= INCOMPAT_EXTENDED_L2;
+        }
+        if chain.has_data_file {
+            features |= INCOMPAT_EXTERNAL_DATA;
+        }
         Qcow2State {
             device_idx: 0,
-            cluster_size: W650_CLUSTER,
-            cluster_bits: 13,
+            cluster_size: SC_CLUSTER,
+            cluster_bits: SC_CLUSTER_BITS,
             l1_size: 1,
-            l1_table_offset: 512,
-            incompatible_features: INCOMPAT_EXTENDED_L2,
+            l1_table_offset: SC_L1_OFF,
+            incompatible_features: features,
             compression_type: 0,
             crypt_method: 0,
             luks_ext_offset: 0,
             luks_ext_len: 0,
-            extended_l2: true,
+            extended_l2: chain.extended_l2,
             l1_cached_sector: u64::MAX,
             l1_cache_buf: l1_cache.as_mut_ptr(),
             l2_cached_sector: u64::MAX,
@@ -5573,76 +6843,109 @@ mod tests {
         }
     }
 
-    #[test]
-    fn extended_l2_alloc_bit_at_host_zero_is_standard_subclusters() {
-        // Vacuity guard for the chain-read test below: if the lookup
-        // stops resolving this entry to StandardSubclusters(0, bitmap)
-        // then the read never reaches the subcluster fill loop, and a
-        // green chain-read test would prove nothing about either path.
-        let _guard = W650_LOCK.lock().unwrap();
-        unsafe {
-            w650_build_image();
+    /// Point the mock devices at the chain's buffers. The caller holds
+    /// `SC_LOCK` and clears them again with `sc_detach`.
+    unsafe fn sc_attach(chain: &ScChain, sector_size: usize) {
+        let imgs = core::ptr::addr_of_mut!(SC_IMAGES) as *mut *const u8;
+        let lens = core::ptr::addr_of_mut!(SC_LENS) as *mut usize;
+        *imgs = chain.qcow2.as_ptr();
+        *lens = chain.qcow2.len();
+        match &chain.backing {
+            Some(b) => {
+                *imgs.add(1) = b.as_ptr();
+                *lens.add(1) = b.len();
+            }
+            None => {
+                *imgs.add(1) = core::ptr::null();
+                *lens.add(1) = 0;
+            }
         }
-        let call_table = w650_call_table();
-        let mut l1_cache = std::vec![0u8; MAX_SECTOR_SIZE];
-        let mut l2_cache = std::vec![0u8; MAX_SECTOR_SIZE];
-        let mut state = w650_state(&mut l1_cache, &mut l2_cache);
-        let cap = (W650_IMG_LEN / W650_SSZ) as u64;
-        let mut bytes_read = 0u64;
-
-        let v = unsafe { state.cluster_lookup(&call_table, 0, W650_SSZ, cap, &mut bytes_read) };
-        assert!(
-            matches!(v, Some(ClusterLookup::StandardSubclusters(0, b)) if b == W650_BITMAP),
-            "an all-zero extended-L2 entry with a zero bit set must resolve to \
-             StandardSubclusters(0, W650_BITMAP); it did not, so the chain-read test \
-             below no longer reaches the subcluster fill loop"
-        );
-
-        // And the geometry really does select the wide path.
-        assert!(
-            W650_SSZ as u64 > W650_SC_SIZE,
-            "fixture must have sector_size > subcluster size to take the wide I/O path"
-        );
+        *imgs.add(2) = chain.data.as_ptr();
+        *lens.add(2) = chain.data.len();
+        SC_SSZ = sector_size;
+        SC_ERR_CALLS = 0;
+        SC_ERR_SECTOR = 0;
+        SC_ERR_STATUS = 0;
+        core::ptr::write_bytes(core::ptr::addr_of_mut!(SC_ERR_OP) as *mut u8, 0, 32);
     }
 
-    #[test]
-    fn extended_l2_wide_path_zeroes_an_alloc_bit_at_host_zero() {
-        let _guard = W650_LOCK.lock().unwrap();
-        unsafe {
-            w650_build_image();
+    unsafe fn sc_detach() {
+        let imgs = core::ptr::addr_of_mut!(SC_IMAGES) as *mut *const u8;
+        for i in 0..SC_MAX_DEVS {
+            *imgs.add(i) = core::ptr::null();
         }
-        let call_table = w650_call_table();
+    }
+
+    /// Read `[virt_off, virt_off + len)` through the chain with the given
+    /// sector size. The buffer starts as 0x33, a byte no device serves,
+    /// so a byte the reader never wrote is visible.
+    fn sc_read(
+        chain: &ScChain,
+        data_device_idx: u32,
+        sector_size: usize,
+        virt_off: u64,
+        len: u64,
+    ) -> (bool, std::vec::Vec<u8>, ScErr) {
+        let _guard = SC_LOCK.lock().unwrap();
+        unsafe { sc_attach(chain, sector_size) };
+        let call_table = sc_call_table();
         let mut l1_cache = std::vec![0u8; MAX_SECTOR_SIZE];
         let mut l2_cache = std::vec![0u8; MAX_SECTOR_SIZE];
-        let state = w650_state(&mut l1_cache, &mut l2_cache);
-
         let mut chain_states = ChainStates::default();
-        chain_states.qcow2_states[0] = Some(state);
+        chain_states.qcow2_states[0] = Some(sc_state(chain, &mut l1_cache, &mut l2_cache));
+        let mut backing_l1_cache = std::vec![0u8; MAX_SECTOR_SIZE];
+        let mut backing_l2_cache = std::vec![0u8; MAX_SECTOR_SIZE];
+        let bc = chain.backing_cluster;
+        if bc != 0 {
+            chain_states.qcow2_states[1] = Some(Qcow2State {
+                device_idx: 1,
+                cluster_size: bc,
+                cluster_bits: bc.trailing_zeros(),
+                l1_size: 1,
+                l1_table_offset: bc,
+                incompatible_features: 0,
+                compression_type: 0,
+                crypt_method: 0,
+                luks_ext_offset: 0,
+                luks_ext_len: 0,
+                extended_l2: false,
+                l1_cached_sector: u64::MAX,
+                l1_cache_buf: backing_l1_cache.as_mut_ptr(),
+                l2_cached_sector: u64::MAX,
+                l2_cache_buf: backing_l2_cache.as_mut_ptr(),
+            });
+        }
 
-        let mut chain_config = ChainConfig::single_chain(1);
+        let chain_len = 1 + chain.backing.is_some() as usize;
+        let mut chain_config = ChainConfig::single_chain(chain_len as u32);
         chain_config.devices[0].format = ImageFormat::Qcow2 as u32;
-        chain_config.devices[0].cluster_size = W650_CLUSTER as u32;
-        chain_config.devices[0].data_device_idx = 0;
+        chain_config.devices[0].cluster_size = SC_CLUSTER as u32;
+        chain_config.devices[0].data_device_idx = data_device_idx;
+        if chain.backing.is_some() {
+            let format = if bc != 0 {
+                ImageFormat::Qcow2
+            } else {
+                ImageFormat::Raw
+            };
+            chain_config.devices[1].format = format as u32;
+            chain_config.devices[1].cluster_size = bc as u32;
+            chain_config.devices[1].data_device_idx = 0;
+        }
 
         let mut compressed_buf = std::vec![0u8; MAX_SECTOR_SIZE];
         let mut staging_buf = std::vec![0u8; MAX_SECTOR_SIZE];
         let mut staging_cluster_offset = u64::MAX;
-
-        // Prefill with a sentinel the image cannot produce, so a
-        // subcluster the reader never wrote is distinguishable from one
-        // it deliberately zeroed. This is the dual-sentinel idea from
-        // `fuzz_chain_compose` reduced to a single known fixture.
-        let mut buf = std::vec![0xAAu8; W650_CLUSTER as usize];
+        let mut buf = std::vec![0x33u8; len as usize];
         let mut bytes_read = 0u64;
         let ok = unsafe {
             read_chain_virtual_cluster(
                 &call_table,
                 0,
-                1,
-                0,
+                chain_len,
+                virt_off,
                 buf.as_mut_ptr(),
-                W650_CLUSTER,
-                W650_SSZ,
+                len,
+                sector_size,
                 &chain_config,
                 &mut chain_states,
                 compressed_buf.as_mut_ptr(),
@@ -5654,29 +6957,521 @@ mod tests {
                 &mut bytes_read,
             )
         };
-        assert!(ok, "read_chain_virtual_cluster returned false");
+        let err = sc_take_err();
+        unsafe { sc_detach() };
+        (ok, buf, err)
+    }
 
-        // The malformed subcluster first and by name, because it is the
-        // one the fix is about and a whole-buffer assertion alone would
-        // not say which subcluster failed.
-        let bad = (W650_BAD_SC as u64 * W650_SC_SIZE) as usize;
-        let bad_end = bad + W650_SC_SIZE as usize;
+    /// The whole-cluster verdict `cluster_lookup` gives virtual cluster
+    /// `ci` of the chain.
+    fn sc_lookup(chain: &ScChain, sector_size: usize, ci: u64) -> Option<ClusterLookup> {
+        let _guard = SC_LOCK.lock().unwrap();
+        unsafe { sc_attach(chain, sector_size) };
+        let call_table = sc_call_table();
+        let mut l1_cache = std::vec![0u8; MAX_SECTOR_SIZE];
+        let mut l2_cache = std::vec![0u8; MAX_SECTOR_SIZE];
+        let mut state = sc_state(chain, &mut l1_cache, &mut l2_cache);
+        let cap = (SC_IMG_LEN / sector_size) as u64;
+        let mut bytes_read = 0u64;
+        let v = unsafe {
+            state.cluster_lookup(
+                &call_table,
+                ci * SC_CLUSTER,
+                sector_size,
+                cap,
+                &mut bytes_read,
+            )
+        };
+        unsafe { sc_detach() };
+        v
+    }
+
+    /// The bytes `[virt_off, virt_off + len)` must hold, given the owner
+    /// of each run of subclusters of the cluster the range lies in.
+    fn sc_expected(runs: &[(ScOwner, u32)], virt_off: u64, len: u64) -> std::vec::Vec<u8> {
+        let mut owners = std::vec::Vec::new();
+        for &(owner, n) in runs {
+            for _ in 0..n {
+                owners.push(owner);
+            }
+        }
+        assert_eq!(owners.len(), 32, "runs must cover the cluster");
+        let cluster_base = virt_off - virt_off % SC_CLUSTER;
         assert!(
-            buf[bad..bad_end].iter().all(|&b| b == 0),
-            "subcluster {W650_BAD_SC} is marked allocated at host offset 0: it must be \
-             zero-filled, not left as the caller's buffer contents, got {:02x?}",
-            &buf[bad..bad + 16]
+            virt_off + len <= cluster_base + SC_CLUSTER,
+            "range within one cluster"
         );
+        (virt_off..virt_off + len)
+            .map(|v| {
+                let intra = v - cluster_base;
+                match owners[(intra / SC_SC_SIZE) as usize] {
+                    ScOwner::Child(host) => sc_child_byte(host + intra),
+                    ScOwner::Data(host) => sc_data_byte(host + intra),
+                    ScOwner::Backing => sc_backing_byte(v),
+                    ScOwner::Zero => 0,
+                }
+            })
+            .collect()
+    }
 
-        // Every other subcluster is a zero bit or unallocated at the
-        // bottom of the chain, so the whole cluster reads as zeros.
-        assert!(
-            buf.iter().all(|&b| b == 0),
-            "the whole cluster must read as zeros; first non-zero byte at {}",
-            buf.iter().position(|&b| b != 0).unwrap_or(0)
+    /// Both I/O paths, named for the assertion messages.
+    const SC_ARMS: [(&str, usize); 2] = [("narrow", SC_NARROW_SSZ), ("wide", SC_WIDE_SSZ)];
+
+    /// Read the range through both arms and check every byte's owner.
+    fn sc_assert_provenance(
+        chain: &ScChain,
+        data_device_idx: u32,
+        virt_off: u64,
+        len: u64,
+        runs: &[(ScOwner, u32)],
+        label: &str,
+    ) {
+        let want = sc_expected(runs, virt_off, len);
+        for (arm, ssz) in SC_ARMS {
+            let (ok, got, err) = sc_read(chain, data_device_idx, ssz, virt_off, len);
+            assert!(
+                ok,
+                "{label} ({arm} arm): read of {len} at {virt_off} failed: {err:?}"
+            );
+            assert_eq!(err.calls, 0, "{label} ({arm} arm): no error may be raised");
+            if let Some(i) = (0..want.len()).find(|&i| got[i] != want[i]) {
+                panic!(
+                    "{label} ({arm} arm): byte {} (virtual offset {}, subcluster {}) is {:#04x}, \
+                     expected {:#04x}; runs {runs:?}",
+                    i,
+                    virt_off + i as u64,
+                    (virt_off + i as u64) % SC_CLUSTER / SC_SC_SIZE,
+                    got[i],
+                    want[i]
+                );
+            }
+        }
+    }
+
+    /// Read the range through both arms and check the read is refused
+    /// by name: once, with the invalid-L2-entry marker, the virtual
+    /// offset and the device index.
+    fn sc_assert_refused(chain: &ScChain, data_device_idx: u32, virt_off: u64, label: &str) {
+        for (arm, ssz) in SC_ARMS {
+            let (ok, _, err) = sc_read(chain, data_device_idx, ssz, virt_off, SC_CLUSTER);
+            assert!(
+                !ok,
+                "{label} ({arm} arm): qemu fails this read with EIO, so must instar"
+            );
+            assert_eq!(
+                err.calls, 1,
+                "{label} ({arm} arm): the refusal must be raised on send_error exactly once"
+            );
+            assert_eq!(
+                err.op,
+                shared::InvalidL2EntryRefusal::OPERATION,
+                "{label} ({arm} arm): the read must fail by raising the invalid-entry refusal"
+            );
+            assert_eq!(
+                err.sector, virt_off,
+                "{label} ({arm} arm): the refusal names the virtual byte offset"
+            );
+            assert_eq!(
+                err.status, 0,
+                "{label} ({arm} arm): the refusal names chain device 0"
+            );
+        }
+    }
+
+    use ScOwner::{Backing, Child, Data, Zero};
+
+    #[test]
+    fn sc_harness_geometry_selects_both_arms() {
+        // Vacuity guard: the sector sizes must straddle the subcluster
+        // size, or both reads below take the same path.
+        assert!(SC_NARROW_SSZ as u64 <= SC_SC_SIZE);
+        assert!(SC_WIDE_SSZ as u64 > SC_SC_SIZE);
+        // And the three patterns never collide with each other or zero.
+        for off in (0..SC_VDISK_LEN as u64).step_by(64) {
+            let (c, b, d) = (sc_child_byte(off), sc_backing_byte(off), sc_data_byte(off));
+            assert!(c != 0 && b != 0 && d != 0 && c != b && b != d && c != d);
+            assert!(c != 0x33 && b != 0x33 && d != 0x33);
+        }
+    }
+
+    #[test]
+    fn sc_mixed_cluster_bytes_come_from_the_right_layer() {
+        let normal_zero_unalloc = |unalloc| [(Child(SC_HOST_A), 8), (Zero, 8), (unalloc, 16)];
+        let chain = sc_chain(true, false, true);
+        sc_assert_provenance(
+            &chain,
+            0,
+            0,
+            SC_CLUSTER,
+            &normal_zero_unalloc(Backing),
+            "N Za Ua, backing",
+        );
+        // Without a backing device the unallocated run is zeros.
+        let chain = sc_chain(true, false, false);
+        sc_assert_provenance(
+            &chain,
+            0,
+            0,
+            SC_CLUSTER,
+            &normal_zero_unalloc(Zero),
+            "N Za Ua, no backing",
+        );
+        // A Normal run that is not at the start of the cluster.
+        let chain = sc_chain(true, false, true);
+        let runs = [(Zero, 8), (Backing, 8), (Child(SC_HOST_B), 16)];
+        sc_assert_provenance(
+            &chain,
+            0,
+            7 * SC_CLUSTER,
+            SC_CLUSTER,
+            &runs,
+            "Za Ua N, backing",
         );
     }
 
+    #[test]
+    fn sc_partial_and_unaligned_reads_fill_exactly_the_bytes_asked() {
+        let chain = sc_chain(true, false, true);
+        let runs = [(Child(SC_HOST_A), 8), (Zero, 8), (Backing, 16)];
+        // One wide sector; one narrow sector inside the zero run; windows
+        // that start and end inside subclusters and cross a run boundary
+        // (Normal to ZeroAlloc at 4096, ZeroAlloc to UnallocatedAlloc at
+        // 8192); and the last bytes of the cluster.
+        for (off, len) in [
+            (4096, 4096),
+            (4608, 512),
+            (4000, 200),
+            (8100, 300),
+            (16284, 100),
+        ] {
+            let label = std::format!("window {len}@{off}");
+            sc_assert_provenance(&chain, 0, off, len, &runs, &label);
+        }
+        // The same windows in a cluster whose Normal run is last.
+        let runs = [(Zero, 8), (Backing, 8), (Child(SC_HOST_B), 16)];
+        for (off, len) in [(0, 4096), (3900, 400), (8000, 300), (12345, 678)] {
+            let label = std::format!("window {len}@{off} of cluster 7");
+            sc_assert_provenance(&chain, 0, 7 * SC_CLUSTER + off, len, &runs, &label);
+        }
+    }
+
+    #[test]
+    fn sc_unallocated_runs_split_at_smaller_backing_clusters() {
+        // A run of unallocated subclusters is handed to the backing
+        // device in one read. When the backing file is a qcow2 whose
+        // clusters are smaller than the run, that read crosses its
+        // cluster boundaries, and each backing cluster is somewhere else
+        // on the host. 1024 is a cluster smaller than the wide arm's
+        // sector, and 16384 the child's own cluster size, as a control.
+        for bc in [1024u64, 2048, 4096, 8192, SC_CLUSTER] {
+            let chain = sc_chain_over_qcow2(true, bc);
+            sc_assert_provenance(
+                &chain,
+                0,
+                0,
+                SC_CLUSTER,
+                &[(Child(SC_HOST_A), 8), (Zero, 8), (Backing, 16)],
+                &std::format!("N Za Ua over {bc}-byte backing clusters"),
+            );
+            sc_assert_provenance(
+                &chain,
+                0,
+                SC_CLUSTER,
+                SC_CLUSTER,
+                &[(Zero, 1), (Backing, 31)],
+                &std::format!("#654 over {bc}-byte backing clusters"),
+            );
+            sc_assert_provenance(
+                &chain,
+                0,
+                7 * SC_CLUSTER + 3900,
+                5000,
+                &[(Zero, 8), (Backing, 8), (Child(SC_HOST_B), 16)],
+                &std::format!("window over {bc}-byte backing clusters"),
+            );
+            // A classic child's wholly unallocated cluster goes to the
+            // backing device as one chunk too.
+            let chain = sc_chain_over_qcow2(false, bc);
+            sc_assert_provenance(
+                &chain,
+                0,
+                2 * SC_CLUSTER,
+                SC_CLUSTER,
+                &[(Backing, 32)],
+                &std::format!("classic unallocated over {bc}-byte backing clusters"),
+            );
+        }
+    }
+
+    #[test]
+    fn sc_issue_654_unallocated_subclusters_read_the_backing_file() {
+        // #654: subcluster 0 has its zero bit, the other 31 have neither
+        // bit. qemu reads them from the backing file; instar zero-filled
+        // them, because the host offset was 0.
+        let chain = sc_chain(true, false, true);
+        let runs = [(Zero, 1), (Backing, 31)];
+        sc_assert_provenance(&chain, 0, SC_CLUSTER, SC_CLUSTER, &runs, "#654");
+        assert!(matches!(
+            sc_lookup(&chain, SC_NARROW_SSZ, 1),
+            Some(ClusterLookup::StandardSubclusters(0, b)) if b == 1 << 32
+        ));
+        // And at the bottom of the chain they are zeros.
+        let chain = sc_chain(true, false, false);
+        sc_assert_provenance(
+            &chain,
+            0,
+            SC_CLUSTER,
+            SC_CLUSTER,
+            &[(Zero, 32)],
+            "#654, no backing",
+        );
+    }
+
+    #[test]
+    fn sc_issue_653_entry_is_refused_by_name_without_a_data_file() {
+        // #653: COPIED | 0 with every alloc bit. Without a data file there
+        // is no host cluster, and before the classifier instar served the
+        // image's header and tables (host offset 0) as guest data.
+        for backing in [false, true] {
+            let chain = sc_chain(true, false, backing);
+            assert!(matches!(
+                sc_lookup(&chain, SC_NARROW_SSZ, 2),
+                Some(ClusterLookup::Invalid)
+            ));
+            sc_assert_refused(&chain, 0, 2 * SC_CLUSTER, "#653");
+        }
+    }
+
+    #[test]
+    fn sc_issue_653_entry_reads_the_data_file_with_one() {
+        // With a data file the same entry is virtual cluster 0's normal
+        // shape: a whole cluster at data-file offset 0 (qcow2.h:729-730).
+        let chain = sc_chain(true, true, true);
+        assert!(matches!(
+            sc_lookup(&chain, SC_NARROW_SSZ, 2),
+            Some(ClusterLookup::Standard(0))
+        ));
+        sc_assert_provenance(
+            &chain,
+            2,
+            2 * SC_CLUSTER,
+            SC_CLUSTER,
+            &[(Data(0), 32)],
+            "#653 + data file",
+        );
+    }
+
+    #[test]
+    fn sc_partial_data_file_cluster_reads_the_data_file_then_descends() {
+        // What qemu writes for a 1 KiB write at offset 0 of a data-file
+        // image with 16 KiB clusters: COPIED | 0, bitmap 0x3. The first
+        // two subclusters are in the data file at offset 0; the rest are
+        // UnallocatedAlloc and read the backing file, or zeros without
+        // one. instar's convert wrote zeros for the whole cluster.
+        let chain = sc_chain(true, true, true);
+        let runs = [(Data(0), 2), (Backing, 30)];
+        sc_assert_provenance(
+            &chain,
+            2,
+            3 * SC_CLUSTER,
+            SC_CLUSTER,
+            &runs,
+            "data-file partial, backing",
+        );
+        assert!(matches!(
+            sc_lookup(&chain, SC_NARROW_SSZ, 3),
+            Some(ClusterLookup::StandardSubclusters(e, 0x3)) if e == OFLAG_COPIED
+        ));
+        let chain = sc_chain(true, true, false);
+        let runs = [(Data(0), 2), (Zero, 30)];
+        sc_assert_provenance(
+            &chain,
+            2,
+            3 * SC_CLUSTER,
+            SC_CLUSTER,
+            &runs,
+            "data-file partial, no backing",
+        );
+        // Without the data file the same words are invalid.
+        let chain = sc_chain(true, false, true);
+        sc_assert_refused(
+            &chain,
+            0,
+            3 * SC_CLUSTER,
+            "data-file partial entry, no data file",
+        );
+    }
+
+    #[test]
+    fn sc_data_file_host_clusters_are_read_from_the_data_device() {
+        // A data-file image's non-zero host offsets are data-file offsets
+        // too: cluster 0's Normal run is at SC_HOST_A in the data device,
+        // not in the image.
+        let chain = sc_chain(true, true, true);
+        let runs = [(Data(SC_HOST_A), 8), (Zero, 8), (Backing, 16)];
+        sc_assert_provenance(&chain, 2, 0, SC_CLUSTER, &runs, "N Za Ua, data file");
+    }
+
+    #[test]
+    fn sc_alloc_and_zero_overlap_is_refused_by_name() {
+        // A subcluster both allocated and zero makes the whole entry
+        // invalid (qcow2.h:761-762), with or without a data file.
+        for has_data_file in [false, true] {
+            let chain = sc_chain(true, has_data_file, true);
+            let data_dev = if has_data_file { 2 } else { 0 };
+            assert!(matches!(
+                sc_lookup(&chain, SC_NARROW_SSZ, 4),
+                Some(ClusterLookup::Invalid)
+            ));
+            sc_assert_refused(&chain, data_dev, 4 * SC_CLUSTER, "alloc-zero overlap");
+        }
+    }
+
+    #[test]
+    fn sc_host_cluster_is_not_read_when_no_run_is_normal() {
+        // Cluster 5's host offset is past the end of the image, so a read
+        // of it fails. Its subclusters are all ZeroAlloc or
+        // UnallocatedAlloc, so neither arm has any reason to read it: the
+        // wide arm's single chunk read is for Normal runs only.
+        let chain = sc_chain(true, false, true);
+        let runs = [(Zero, 16), (Backing, 16)];
+        sc_assert_provenance(
+            &chain,
+            0,
+            5 * SC_CLUSTER,
+            SC_CLUSTER,
+            &runs,
+            "Za Ua past EOF",
+        );
+        // Including a window that lies wholly in the unallocated run.
+        sc_assert_provenance(
+            &chain,
+            0,
+            5 * SC_CLUSTER + 8192,
+            4096,
+            &runs,
+            "Ua window past EOF",
+        );
+    }
+
+    #[test]
+    fn sc_missing_data_device_fails_closed() {
+        // The header declares a data file but no data device is attached
+        // (data_device_idx 0). Host offset 0 would then be the image's
+        // own header, so every read that takes bytes from a Normal
+        // subcluster fails, without claiming the entry is invalid.
+        let chain = sc_chain(true, true, true);
+        for (ci, label) in [
+            (2, "Standard(0)"),
+            (3, "mixed at host 0"),
+            (0, "mixed at a host cluster"),
+        ] {
+            for (arm, ssz) in SC_ARMS {
+                let (ok, _, err) = sc_read(&chain, 0, ssz, ci * SC_CLUSTER, SC_CLUSTER);
+                assert!(!ok, "{label} ({arm} arm): must fail without a data device");
+                assert_eq!(
+                    err.calls, 0,
+                    "{label} ({arm} arm): this is not an invalid entry"
+                );
+            }
+        }
+        // Reads that touch no Normal subcluster still succeed.
+        sc_assert_provenance(
+            &chain,
+            0,
+            SC_CLUSTER,
+            SC_CLUSTER,
+            &[(Zero, 1), (Backing, 31)],
+            "#654, data file declared",
+        );
+    }
+
+    #[test]
+    fn sc_classic_data_file_cluster_zero_reads_the_data_file() {
+        // Classic L2, data file: COPIED | 0 is virtual cluster 0 at
+        // data-file offset 0, and a non-zero host offset is a data-file
+        // offset. Before the classifier the first read the data device
+        // only because the host had put it next in the chain.
+        let chain = sc_chain(false, true, true);
+        assert!(matches!(
+            sc_lookup(&chain, SC_NARROW_SSZ, 0),
+            Some(ClusterLookup::Standard(0))
+        ));
+        sc_assert_provenance(
+            &chain,
+            2,
+            0,
+            SC_CLUSTER,
+            &[(Data(0), 32)],
+            "classic COPIED|0, data file",
+        );
+        sc_assert_provenance(
+            &chain,
+            2,
+            SC_CLUSTER,
+            SC_CLUSTER,
+            &[(Data(SC_HOST_A), 32)],
+            "classic host A, data file",
+        );
+        sc_assert_provenance(
+            &chain,
+            2,
+            2 * SC_CLUSTER,
+            SC_CLUSTER,
+            &[(Backing, 32)],
+            "classic unallocated, data file",
+        );
+        // Without a data file COPIED | 0 is unallocated and reads the
+        // backing file; the host cluster is in the image.
+        let chain = sc_chain(false, false, true);
+        assert!(matches!(
+            sc_lookup(&chain, SC_NARROW_SSZ, 0),
+            Some(ClusterLookup::Unallocated)
+        ));
+        sc_assert_provenance(
+            &chain,
+            0,
+            0,
+            SC_CLUSTER,
+            &[(Backing, 32)],
+            "classic COPIED|0, no data file",
+        );
+        sc_assert_provenance(
+            &chain,
+            0,
+            SC_CLUSTER,
+            SC_CLUSTER,
+            &[(Child(SC_HOST_A), 32)],
+            "classic host A, no data file",
+        );
+    }
+
+    #[test]
+    fn extended_l2_alloc_bit_at_host_zero_is_invalid() {
+        // #650's entry: qemu classifies an unallocated entry with any
+        // alloc bit as QCOW2_SUBCLUSTER_INVALID (block/qcow2.h:771-772 at
+        // v10.0.0), so the lookup must say Invalid rather than hand the
+        // reader a StandardSubclusters bitmap to zero-fill.
+        let chain = sc_chain(true, false, false);
+        assert!(
+            matches!(
+                sc_lookup(&chain, SC_WIDE_SSZ, 6),
+                Some(ClusterLookup::Invalid)
+            ),
+            "an all-zero extended-L2 entry with an alloc bit set and no data file \
+             must resolve to Invalid"
+        );
+    }
+
+    #[test]
+    fn extended_l2_wide_path_refuses_an_alloc_bit_at_host_zero() {
+        // #650 was the wide path leaving the caller's buffer untouched
+        // under a `true` return for this entry; its fix zero-filled the
+        // subcluster; qemu fails the read with EIO (#653), and so does
+        // instar, by name. Both arms are exercised by sc_assert_refused.
+        let chain = sc_chain(true, false, false);
+        sc_assert_refused(&chain, 0, 6 * SC_CLUSTER, "#650");
+    }
     // ====================================================================
     // VDI chain-reader arm (read_chain_virtual_cluster ImageFormat::Vdi)
     // ====================================================================
@@ -13169,6 +14964,134 @@ fn devices_behind(chain_len: usize, dev_offset: usize) -> Option<usize> {
     chain_len.checked_sub(dev_offset)?.checked_sub(1)
 }
 
+/// Whether a chunk at `virtual_offset` runs past the end of the
+/// `granule`-sized unit (a qcow2 cluster, a VMDK grain) it starts in.
+#[inline]
+fn chunk_crosses_granule(virtual_offset: u64, chunk_size: u64, granule: u64) -> bool {
+    granule != 0 && virtual_offset % granule + chunk_size > granule
+}
+
+/// Read a chunk that crosses a device's cluster or grain boundaries as
+/// one read per unit, each starting again at that device.
+///
+/// A device's arm maps one unit through one table entry, and adjacent
+/// units are not adjacent on the host, so a chunk that spans several of
+/// them has to be resolved one at a time. The top device's caller sizes
+/// chunks to the top device's own clusters, but a lower device in the
+/// chain can have smaller ones (a 64K child over a 16K backing file),
+/// a descent for an unallocated run hands down whatever span the run
+/// covers, and `compare` reads in the larger of its two inputs' cluster
+/// sizes. Splitting here, rather than in each caller, keeps the
+/// function's contract -- every byte of `chunk_size` is filled -- true
+/// at every depth.
+///
+/// Each piece re-enters the reader at the same device but cannot split
+/// there again, so a split adds at most one reader frame per device.
+/// The frame is about 10.7KB in the convert build, so a chain of
+/// `MAX_CHAIN_DEVICES` stays under 350KB of the guest's 4MB stack.
+#[allow(clippy::too_many_arguments)]
+unsafe fn read_chain_split_at_granule(
+    granule: u64,
+    call_table: &CallTable,
+    chain_start: usize,
+    chain_len: usize,
+    virtual_offset: u64,
+    buf: *mut u8,
+    chunk_size: u64,
+    sector_size: usize,
+    chain_config: &ChainConfig,
+    chain_states: &mut ChainStates,
+    compressed_buf: *mut u8,
+    staging_buf: *mut u8,
+    staging_cluster_offset: &mut u64,
+    aes_key: Option<&[u8; 16]>,
+    luks_key: Option<&[u8]>,
+    luks_sector_size: u64,
+    bytes_read: &mut u64,
+) -> bool {
+    let mut done = 0u64;
+    while done < chunk_size {
+        let cur = virtual_offset + done;
+        let span = (chunk_size - done).min(granule - cur % granule);
+        if !read_chain_virtual_cluster(
+            call_table,
+            chain_start,
+            chain_len,
+            cur,
+            buf.add(done as usize),
+            span,
+            sector_size,
+            chain_config,
+            chain_states,
+            compressed_buf,
+            staging_buf,
+            staging_cluster_offset,
+            aes_key,
+            luks_key,
+            luks_sector_size,
+            bytes_read,
+        ) {
+            return false;
+        }
+        done += span;
+    }
+    true
+}
+
+/// The device a qcow2 cluster's host offset is read from: the external
+/// data file when the header declares one (`has_data_file`), else the
+/// image itself. The header decides, as it does in qemu, which refuses
+/// to open an image whose data-file extension and feature bit disagree.
+/// Compressed clusters are not read through this; they are in the image
+/// whatever the header says.
+///
+/// `None` when the header declares a data file but no data device is
+/// attached (`data_device_idx == 0`, never a data device because device
+/// 0 is the top of the chain). The caller fails any read that needs it:
+/// a host offset in a data-file image addresses the data file, and
+/// reading it from the image instead would serve the image's own header
+/// and tables as guest data, since qemu puts virtual cluster 0 at
+/// data-file offset 0. The host opens the data file before the guest
+/// starts, so this is reached only by a host-side defect.
+#[inline]
+fn data_read_device(
+    chain_config: &ChainConfig,
+    dev_idx: usize,
+    has_data_file: bool,
+) -> Option<u32> {
+    if !has_data_file {
+        return Some(dev_idx as u32);
+    }
+    match chain_config.devices[dev_idx].data_device_idx {
+        0 => None,
+        data_dev => Some(data_dev),
+    }
+}
+
+/// Whether any subcluster in `[sc_from, sc_to)` of an extended-L2 entry
+/// is `Normal`: whether a read of that range has bytes to take from the
+/// host cluster at all.
+fn subclusters_include_normal(
+    l2_entry: u64,
+    bitmap: u64,
+    sc_from: u32,
+    sc_to: u32,
+    has_data_file: bool,
+) -> bool {
+    let mut sc = sc_from;
+    while sc < sc_to {
+        let (ty, run) = subcluster_range(l2_entry, bitmap, sc, true, has_data_file);
+        if run == 0 {
+            return false;
+        }
+        if ty == SubclusterType::Normal {
+            return true;
+        }
+        sc += run;
+    }
+    false
+}
+
 /// Whether the device at `dev_idx` has at least one device behind it
 /// *in its own chain*, according to the config's declared
 /// segmentation.
@@ -13191,7 +15114,13 @@ fn parent_in_chain(chain_config: &ChainConfig, dev_idx: usize) -> bool {
 /// Read one cluster's worth of virtual data by walking a backing chain.
 ///
 /// For each device in the chain (starting from the top):
-/// - QCOW2: perform L1/L2 lookup. If unallocated, try next device.
+/// - QCOW2: perform L1/L2 lookup. If unallocated, try next device. An
+///   extended-L2 entry whose subclusters differ in type is read one run
+///   of equal type at a time, as [`subcluster_range`] classifies them:
+///   `Normal` from the host cluster (in the external data file, if the
+///   header declares one), zero types as zeros, unallocated types from
+///   the next device. An entry qemu calls invalid fails the read and
+///   raises [`shared::InvalidL2EntryRefusal`] on `send_error`.
 /// - VMDK (with `vmdk-input` feature): perform GD/GT grain lookup.
 ///   If unallocated, try next device.
 /// - VHD (with `vhd-input` feature): perform BAT block lookup. If
@@ -13207,6 +15136,10 @@ fn parent_in_chain(chain_config: &ChainConfig, dev_idx: usize) -> bool {
 /// - Raw/other: read sectors directly (base of chain).
 ///
 /// If all devices have the cluster unallocated, fills with zeros.
+///
+/// A chunk that crosses a qcow2 cluster or VMDK grain boundary of the
+/// device being read is split there, so every byte of `chunk_size` is
+/// filled whatever the cluster sizes further down the chain.
 ///
 /// # Safety
 ///
@@ -13262,6 +15195,29 @@ pub unsafe fn read_chain_virtual_cluster(
                 let compression_type = state.compression_type;
                 let cluster_bits = state.cluster_bits;
                 let crypt_method = state.crypt_method;
+                let has_data_file = state.has_data_file();
+
+                if chunk_crosses_granule(virtual_offset, chunk_size, qcow2_cluster_size) {
+                    return read_chain_split_at_granule(
+                        qcow2_cluster_size,
+                        call_table,
+                        dev_idx,
+                        chain_len - dev_offset,
+                        virtual_offset,
+                        buf,
+                        chunk_size,
+                        sector_size,
+                        chain_config,
+                        chain_states,
+                        compressed_buf,
+                        staging_buf,
+                        staging_cluster_offset,
+                        aes_key,
+                        luks_key,
+                        luks_sector_size,
+                        bytes_read,
+                    );
+                }
 
                 match state.cluster_lookup(call_table, virtual_offset, sector_size, cap, bytes_read)
                 {
@@ -13276,92 +15232,128 @@ pub unsafe fn read_chain_virtual_cluster(
                         core::ptr::write_bytes(buf, 0, chunk_size as usize);
                         return true;
                     }
-                    Some(ClusterLookup::StandardSubclusters(host_offset, bitmap)) => {
-                        let alloc_bits = bitmap as u32;
-                        let zero_bits = (bitmap >> 32) as u32;
-
+                    Some(ClusterLookup::StandardSubclusters(l2_entry, bitmap)) => {
+                        // An extended-L2 entry whose subclusters differ in
+                        // type. Each run of one type is decided once, by
+                        // subcluster_range (qemu's
+                        // qcow2_get_subcluster_range_type), and the two I/O
+                        // paths below differ only in how a Normal run's
+                        // bytes reach the buffer. The host offset is read
+                        // for Normal runs alone, and whether it is zero
+                        // means nothing here: with an external data file it
+                        // is a real offset into that file, and without one
+                        // the classifier never calls such a run Normal.
+                        let host_offset = l2_entry & L2_OFFSET_MASK;
                         let intra_offset = virtual_offset % qcow2_cluster_size;
                         let read_size = if chunk_size < qcow2_cluster_size {
                             chunk_size
                         } else {
                             qcow2_cluster_size
                         };
+                        let chunk_end = intra_offset + read_size;
+                        let sc_size =
+                            qcow2_cluster_size / QCOW_EXTL2_SUBCLUSTERS_PER_CLUSTER as u64;
+                        // Resolved only when a Normal run is read, so a
+                        // data-file image whose data device is missing
+                        // fails exactly the reads that need it.
+                        let read_dev = data_read_device(chain_config, dev_idx, has_data_file);
 
-                        // Per-subcluster handling for mixed allocation
-                        let sc_size = qcow2_cluster_size / 32;
-                        let sc_start = intra_offset / sc_size;
-                        let sc_count = read_size / sc_size;
-                        let read_dev = chain_config.devices[dev_idx].data_device_idx;
-                        let read_dev = if read_dev != 0 {
-                            read_dev
-                        } else {
-                            dev_idx as u32
-                        };
-
-                        // When sector_size <= subcluster_size, we can
-                        // read only the allocated subcluster runs and
-                        // skip I/O for zero/unallocated ranges. When
-                        // sector_size > subcluster_size, we must read
-                        // the full chunk first (a per-subcluster read
-                        // would read an entire sector for each 2 KB
-                        // subcluster, wasting I/O or overrunning the
-                        // buffer).
-                        if sector_size as u64 <= sc_size {
-                            // ---- NARROW I/O PATH ----
-                            // Read only allocated runs; zero-fill and
-                            // backing-chain-recurse the rest.
-                            let mut i = 0u64;
-                            while i < sc_count {
-                                let sc_idx = (sc_start + i) as u32;
-                                let is_zero = (zero_bits >> sc_idx) & 1 != 0;
-                                let is_alloc = (alloc_bits >> sc_idx) & 1 != 0;
-
-                                if is_zero || (!is_alloc && host_offset == 0) {
-                                    // ZERO RUN: coalesce contiguous zero subclusters
-                                    let run_start = i;
-                                    let mut run_len = 1u64;
-                                    while i + run_len < sc_count {
-                                        let next = (sc_start + i + run_len) as u32;
-                                        let nz = (zero_bits >> next) & 1 != 0;
-                                        let na = (alloc_bits >> next) & 1 != 0;
-                                        if nz || (!na && host_offset == 0) {
-                                            run_len += 1;
-                                        } else {
-                                            break;
-                                        }
-                                    }
-                                    core::ptr::write_bytes(
-                                        buf.add((run_start * sc_size) as usize),
-                                        0,
-                                        (run_len * sc_size) as usize,
+                        // A sector larger than a subcluster cannot be read
+                        // one run at a time without reading a whole sector
+                        // for each sub-sector run, so the wide path reads
+                        // the chunk from the host cluster once, decrypts
+                        // it, and then overwrites every run that is not
+                        // Normal. A sector no larger than a subcluster
+                        // reads only the Normal runs. The chunk read is
+                        // skipped when no run in the chunk is Normal: the
+                        // host cluster then holds nothing this read needs.
+                        let wide = sector_size as u64 > sc_size;
+                        if wide
+                            && subclusters_include_normal(
+                                l2_entry,
+                                bitmap,
+                                (intra_offset / sc_size) as u32,
+                                chunk_end.div_ceil(sc_size) as u32,
+                                has_data_file,
+                            )
+                        {
+                            let Some(read_dev) = read_dev else {
+                                return false;
+                            };
+                            let read_offset = host_offset + intra_offset;
+                            if !read_cluster_sectors(
+                                call_table,
+                                read_dev,
+                                read_offset,
+                                buf,
+                                read_size,
+                                sector_size,
+                                bytes_read,
+                            ) {
+                                return false;
+                            }
+                            #[cfg(feature = "aes-decrypt")]
+                            if crypt_method == 1 {
+                                if let Some(key) = aes_key {
+                                    decrypt_cluster_aes_cbc(buf, read_size, virtual_offset, key);
+                                }
+                            }
+                            #[cfg(feature = "luks-decrypt")]
+                            if crypt_method == 2 {
+                                if let Some(key) = luks_key {
+                                    decrypt_cluster_aes_xts(
+                                        buf,
+                                        read_size,
+                                        read_offset,
+                                        key,
+                                        luks_sector_size,
                                     );
-                                    i += run_len;
-                                } else if is_alloc {
-                                    // ALLOC RUN: coalesce contiguous allocated subclusters
-                                    let run_start = i;
-                                    let mut run_len = 1u64;
-                                    while i + run_len < sc_count {
-                                        let next = (sc_start + i + run_len) as u32;
-                                        let nz = (zero_bits >> next) & 1 != 0;
-                                        let na = (alloc_bits >> next) & 1 != 0;
-                                        if na && !nz {
-                                            run_len += 1;
-                                        } else {
-                                            break;
-                                        }
-                                    }
+                                }
+                            }
+                        }
 
-                                    let run_buf_off = (run_start * sc_size) as usize;
-                                    let run_host = host_offset + (sc_start + run_start) * sc_size;
-                                    let run_bytes = run_len * sc_size;
-
-                                    if host_offset != 0 {
+                        let mut pos = intra_offset;
+                        while pos < chunk_end {
+                            let sc = (pos / sc_size) as u32;
+                            let (ty, run) =
+                                subcluster_range(l2_entry, bitmap, sc, true, has_data_file);
+                            // The run is clipped to the chunk, so a read
+                            // that starts or ends inside a subcluster (a
+                            // dd window) fills exactly the bytes asked for.
+                            let run_end = ((sc + run) as u64 * sc_size).min(chunk_end);
+                            if run_end <= pos {
+                                // Only an Invalid entry has no run, and
+                                // cluster_lookup refused that before this
+                                // arm. Fail closed rather than loop.
+                                return false;
+                            }
+                            let len = run_end - pos;
+                            let buf_off = (pos - intra_offset) as usize;
+                            let dst = buf.add(buf_off);
+                            match ty {
+                                SubclusterType::Normal => {
+                                    // The wide path's chunk read above
+                                    // already holds these bytes. The
+                                    // decryptors need a run that starts on
+                                    // a 512-byte boundary. Only convert and
+                                    // compare take a key, and their chunks
+                                    // are cluster-aligned; dd, the one
+                                    // caller with byte windows, cannot open
+                                    // encrypted images. That leaves the
+                                    // subcluster size, which qemu refuses
+                                    // below 512 bytes and instar does not
+                                    // yet (#805).
+                                    if !wide {
+                                        let Some(read_dev) = read_dev else {
+                                            return false;
+                                        };
+                                        let run_host = host_offset + pos;
                                         if !read_cluster_sectors(
                                             call_table,
                                             read_dev,
                                             run_host,
-                                            buf.add(run_buf_off),
-                                            run_bytes,
+                                            dst,
+                                            len,
                                             sector_size,
                                             bytes_read,
                                         ) {
@@ -13370,11 +15362,10 @@ pub unsafe fn read_chain_virtual_cluster(
                                         #[cfg(feature = "aes-decrypt")]
                                         if crypt_method == 1 {
                                             if let Some(key) = aes_key {
-                                                let virt = virtual_offset + run_start * sc_size;
                                                 decrypt_cluster_aes_cbc(
-                                                    buf.add(run_buf_off),
-                                                    run_bytes,
-                                                    virt,
+                                                    dst,
+                                                    len,
+                                                    virtual_offset + buf_off as u64,
                                                     key,
                                                 );
                                             }
@@ -13383,27 +15374,23 @@ pub unsafe fn read_chain_virtual_cluster(
                                         if crypt_method == 2 {
                                             if let Some(key) = luks_key {
                                                 decrypt_cluster_aes_xts(
-                                                    buf.add(run_buf_off),
-                                                    run_bytes,
+                                                    dst,
+                                                    len,
                                                     run_host,
                                                     key,
                                                     luks_sector_size,
                                                 );
                                             }
                                         }
-                                    } else {
-                                        // host_offset == 0 but alloc set:
-                                        // malformed (I2), zero-fill defensively
-                                        core::ptr::write_bytes(
-                                            buf.add(run_buf_off),
-                                            0,
-                                            run_bytes as usize,
-                                        );
                                     }
-                                    i += run_len;
-                                } else {
-                                    // UNALLOC: recurse into backing chain
-                                    let buf_off = (i * sc_size) as usize;
+                                }
+                                SubclusterType::ZeroAlloc | SubclusterType::ZeroPlain => {
+                                    core::ptr::write_bytes(dst, 0, len as usize);
+                                }
+                                SubclusterType::UnallocatedAlloc
+                                | SubclusterType::UnallocatedPlain => {
+                                    // The backing chain's bytes, or zeros at
+                                    // the bottom of the chain.
                                     let remaining = match devices_behind(chain_len, dev_offset) {
                                         Some(r) => r,
                                         None => return false,
@@ -13413,9 +15400,9 @@ pub unsafe fn read_chain_virtual_cluster(
                                             call_table,
                                             chain_start + dev_offset + 1,
                                             remaining,
-                                            virtual_offset + i * sc_size,
-                                            buf.add(buf_off),
-                                            sc_size,
+                                            virtual_offset + buf_off as u64,
+                                            dst,
+                                            len,
                                             sector_size,
                                             chain_config,
                                             chain_states,
@@ -13430,116 +15417,17 @@ pub unsafe fn read_chain_virtual_cluster(
                                             return false;
                                         }
                                     } else {
-                                        // Bottom of chain: zero
-                                        core::ptr::write_bytes(
-                                            buf.add(buf_off),
-                                            0,
-                                            sc_size as usize,
-                                        );
+                                        core::ptr::write_bytes(dst, 0, len as usize);
                                     }
-                                    i += 1;
                                 }
-                            }
-                        } else {
-                            // ---- WIDE I/O PATH ----
-                            // Sector is larger than a subcluster; read the
-                            // full chunk, decrypt, then selectively overwrite.
-                            if host_offset != 0 {
-                                let read_offset = host_offset + intra_offset;
-                                if !read_cluster_sectors(
-                                    call_table,
-                                    read_dev,
-                                    read_offset,
-                                    buf,
-                                    read_size,
-                                    sector_size,
-                                    bytes_read,
-                                ) {
+                                // cluster_lookup routes compressed and
+                                // invalid entries to their own arms, so
+                                // neither type reaches a mixed cluster.
+                                SubclusterType::Compressed | SubclusterType::Invalid => {
                                     return false;
                                 }
-                                #[cfg(feature = "aes-decrypt")]
-                                if crypt_method == 1 {
-                                    if let Some(key) = aes_key {
-                                        decrypt_cluster_aes_cbc(
-                                            buf,
-                                            read_size,
-                                            virtual_offset,
-                                            key,
-                                        );
-                                    }
-                                }
-                                #[cfg(feature = "luks-decrypt")]
-                                if crypt_method == 2 {
-                                    if let Some(key) = luks_key {
-                                        decrypt_cluster_aes_xts(
-                                            buf,
-                                            read_size,
-                                            host_offset + intra_offset,
-                                            key,
-                                            luks_sector_size,
-                                        );
-                                    }
-                                }
                             }
-
-                            // Selectively fill non-allocated subclusters:
-                            // zero subclusters get zeroed, unallocated
-                            // subclusters come from backing chain or zero
-                            // at bottom of chain.
-                            for i in 0..sc_count {
-                                let sc_idx = (sc_start + i) as u32;
-                                let is_zero = (zero_bits >> sc_idx) & 1 != 0;
-                                let is_alloc = (alloc_bits >> sc_idx) & 1 != 0;
-                                let buf_off = (i * sc_size) as usize;
-
-                                if is_zero || (!is_alloc && host_offset == 0) {
-                                    core::ptr::write_bytes(buf.add(buf_off), 0, sc_size as usize);
-                                } else if !is_alloc {
-                                    let remaining = match devices_behind(chain_len, dev_offset) {
-                                        Some(r) => r,
-                                        None => return false,
-                                    };
-                                    if remaining > 0 {
-                                        if !read_chain_virtual_cluster(
-                                            call_table,
-                                            chain_start + dev_offset + 1,
-                                            remaining,
-                                            virtual_offset + i * sc_size,
-                                            buf.add(buf_off),
-                                            sc_size,
-                                            sector_size,
-                                            chain_config,
-                                            chain_states,
-                                            compressed_buf,
-                                            staging_buf,
-                                            staging_cluster_offset,
-                                            aes_key,
-                                            luks_key,
-                                            luks_sector_size,
-                                            bytes_read,
-                                        ) {
-                                            return false;
-                                        }
-                                    } else {
-                                        core::ptr::write_bytes(
-                                            buf.add(buf_off),
-                                            0,
-                                            sc_size as usize,
-                                        );
-                                    }
-                                } else if host_offset == 0 {
-                                    // Alloc set while the L2 entry names
-                                    // offset zero: malformed, and the chunk
-                                    // read above was skipped for exactly
-                                    // that reason, so nothing has written
-                                    // this subcluster.  Zero-fill rather
-                                    // than report success over whatever the
-                                    // caller's buffer already held.  The
-                                    // narrow path defends the same case.
-                                    core::ptr::write_bytes(buf.add(buf_off), 0, sc_size as usize);
-                                }
-                                // Allocated subclusters: already read above
-                            }
+                            pos = run_end;
                         }
                         return true;
                     }
@@ -13554,14 +15442,14 @@ pub unsafe fn read_chain_virtual_cluster(
                         } else {
                             qcow2_cluster_size
                         };
-                        // If this device has an external data file, read
-                        // standard clusters from the data device instead.
-                        // Compressed clusters stay on the metadata device.
-                        let read_dev = chain_config.devices[dev_idx].data_device_idx;
-                        let read_dev = if read_dev != 0 {
-                            read_dev
-                        } else {
-                            dev_idx as u32
+                        // With an external data file the host offset is an
+                        // offset into that file, including offset 0, which
+                        // is where qemu puts virtual cluster 0. Compressed
+                        // clusters stay on the metadata device.
+                        let read_dev = match data_read_device(chain_config, dev_idx, has_data_file)
+                        {
+                            Some(d) => d,
+                            None => return false,
                         };
                         if !read_cluster_sectors(
                             call_table,
@@ -13700,6 +15588,16 @@ pub unsafe fn read_chain_virtual_cluster(
                     Some(ClusterLookup::Compressed(_)) => {
                         return false;
                     }
+                    Some(ClusterLookup::Invalid) => {
+                        // qemu fails the read with EIO and "Invalid cluster
+                        // entry found" (block/qcow2-cluster.c:712-718 at
+                        // v10.0.0). Before #653 this entry's host offset 0
+                        // was read, serving the image's own header as
+                        // guest data. The refusal is raised by name because
+                        // this function's bool cannot carry the reason.
+                        send_invalid_l2_entry_refusal(call_table, dev_idx as u32, virtual_offset);
+                        return false;
+                    }
                     None => return false,
                 }
             }
@@ -13711,6 +15609,28 @@ pub unsafe fn read_chain_virtual_cluster(
                 };
 
                 let grain_size_bytes = state.grain_size_bytes;
+
+                if chunk_crosses_granule(virtual_offset, chunk_size, grain_size_bytes) {
+                    return read_chain_split_at_granule(
+                        grain_size_bytes,
+                        call_table,
+                        dev_idx,
+                        chain_len - dev_offset,
+                        virtual_offset,
+                        buf,
+                        chunk_size,
+                        sector_size,
+                        chain_config,
+                        chain_states,
+                        compressed_buf,
+                        staging_buf,
+                        staging_cluster_offset,
+                        aes_key,
+                        luks_key,
+                        luks_sector_size,
+                        bytes_read,
+                    );
+                }
 
                 match state.grain_lookup(call_table, virtual_offset, sector_size, cap, bytes_read) {
                     Some(GrainLookup::Unallocated) => {
@@ -14979,15 +16899,12 @@ pub unsafe fn read_chain_virtual_cluster(
 
 /// Read an arbitrary virtual byte range, filling the FULL `len` bytes.
 ///
-/// [`read_chain_virtual_cluster`] only fills up to one input cluster per
-/// call (its `chunk_size` is clamped to the qcow2 cluster size for qcow2
-/// inputs), so a caller that hands it a span larger than the input
-/// cluster — e.g. a VMDK 64 KiB grain or a VHD/VHDX block read from a
-/// qcow2 with 512-byte clusters — would otherwise get only the first
-/// cluster filled and stale/zero bytes after it. The qcow2 output path
-/// loops in `min(input_cluster, output_cluster)` steps to avoid this;
-/// this wrapper centralises that loop so the VMDK/VHD/VHDX writers can
-/// request a whole grain/block and get every byte.
+/// [`read_chain_virtual_cluster`] splits a chunk that crosses a qcow2
+/// cluster or VMDK grain boundary itself, at every depth of the chain.
+/// This wrapper predates that and still bounds each call to one top
+/// device cluster, which keeps each call's span within the sizes the
+/// reader's scratch buffers were chosen for, so the VMDK/VHD/VHDX
+/// writers can request a whole grain or block and get every byte.
 ///
 /// # Safety
 ///
@@ -15163,6 +17080,32 @@ unsafe fn send_differencing_refusal(call_table: &CallTable, status: u32) {
         b"input\0".as_ptr(),
         0,
         status,
+    );
+}
+
+/// Raise the invalid-L2-entry read refusal on the call table's
+/// `send_error` channel.
+///
+/// `read_chain_virtual_cluster` returns a bare `bool` to convert, dd,
+/// compare, bench and rebase, none of which has a result code for "the
+/// image is corrupt", so the reason is raised from inside the reader on
+/// the channel the host already watches, as `send_differencing_refusal`
+/// does. `virtual_offset` travels in the `sector` argument as a byte
+/// offset and `dev_idx` in `status`; see
+/// [`shared::InvalidL2EntryRefusal`].
+///
+/// # Safety
+///
+/// `call_table` must be a valid initialised [`CallTable`].
+// Same reason as `send_differencing_refusal` above: the call table's
+// string arguments are `*const u8`.
+#[allow(clippy::manual_c_str_literals)]
+unsafe fn send_invalid_l2_entry_refusal(call_table: &CallTable, dev_idx: u32, virtual_offset: u64) {
+    (call_table.send_error)(
+        shared::InvalidL2EntryRefusal::OPERATION_C.as_ptr(),
+        b"input\0".as_ptr(),
+        virtual_offset,
+        dev_idx,
     );
 }
 

@@ -840,12 +840,34 @@ pub enum MapExtentState {
     /// on-disk bytes.
     Data { file_offset: u64 },
     /// Region reads as zero and is explicitly recorded as zero
-    /// in the metadata (qcow2 ZERO_PLAIN / ZERO_ALLOC, vmdk
-    /// grain marker `0xFFFFFFFE`, vhdx PAYLOAD_BLOCK_ZERO).
+    /// in the metadata (qcow2 ZERO_PLAIN, vmdk grain marker
+    /// `0xFFFFFFFE`, vhdx PAYLOAD_BLOCK_ZERO).
     ZeroAllocated,
     /// Region is unallocated — reads as zero but is not present
     /// in the source file (the qemu-img `present=false` case).
     Hole,
+    /// As `ZeroAllocated`, but the metadata also names a host
+    /// cluster at `file_offset`, which qemu-img map reports as the
+    /// extent's `offset` (qcow2 ZERO_ALLOC).
+    ZeroAllocatedAt { file_offset: u64 },
+    /// As `Hole`, but the metadata names a host cluster at
+    /// `file_offset` that this region does not use, which qemu-img
+    /// map still reports as the extent's `offset` (qcow2
+    /// UNALLOCATED_ALLOC: a subcluster with neither bitmap bit set
+    /// in a cluster that has a host offset).
+    HoleAt { file_offset: u64 },
+}
+
+impl MapExtentState {
+    /// The host file offset this state reports, if it has one.
+    pub fn file_offset(&self) -> Option<u64> {
+        match *self {
+            MapExtentState::Data { file_offset }
+            | MapExtentState::ZeroAllocatedAt { file_offset }
+            | MapExtentState::HoleAt { file_offset } => Some(file_offset),
+            MapExtentState::ZeroAllocated | MapExtentState::Hole => None,
+        }
+    }
 }
 
 /// One contiguous extent of the source's virtual address space
@@ -879,7 +901,8 @@ pub struct MapExtent {
 /// Two adjacent extents merge when:
 /// - Their virtual ranges are contiguous (`a.start + a.length
 ///   == b.start`).
-/// - Their states match. For `Data` that requires the file
+/// - Their states match. For the states that carry a file offset
+///   (`Data`, `ZeroAllocatedAt`, `HoleAt`) that requires the file
 ///   offsets to be contiguous too:
 ///   `a.state.file_offset + a.length == b.state.file_offset`.
 ///   For `ZeroAllocated` and `Hole`, state equality is enough.
@@ -970,6 +993,14 @@ fn extents_mergeable(a: &MapExtent, b: &MapExtent) -> bool {
         (
             MapExtentState::Data { file_offset: a_off },
             MapExtentState::Data { file_offset: b_off },
+        )
+        | (
+            MapExtentState::ZeroAllocatedAt { file_offset: a_off },
+            MapExtentState::ZeroAllocatedAt { file_offset: b_off },
+        )
+        | (
+            MapExtentState::HoleAt { file_offset: a_off },
+            MapExtentState::HoleAt { file_offset: b_off },
         ) => a_off.checked_add(a.length) == Some(b_off),
         _ => false,
     }
@@ -3002,9 +3033,9 @@ pub struct MapExtentRecord {
     pub start: u64,
     /// Extent length in bytes. Never zero.
     pub length: u64,
-    /// Source file offset for `state == STATE_DATA`; zero
-    /// otherwise. (Host renderer omits the JSON field when
-    /// `state != STATE_DATA`.)
+    /// Source file offset for `STATE_DATA`, `STATE_ZERO_ALLOCATED_AT`
+    /// and `STATE_HOLE_AT`; zero otherwise. (Host renderer omits the
+    /// JSON field for the other states.)
     pub file_offset: u64,
     /// Reserved padding for forward compat (compressed length,
     /// subcluster flags, chain depth).
@@ -3019,12 +3050,18 @@ impl MapExtentRecord {
     /// the source file.
     pub const STATE_HOLE: u32 = 0;
     /// Extent state: explicitly recorded as zero in the metadata
-    /// (qcow2 ZERO_PLAIN / ZERO_ALLOC, vmdk grain marker, vhdx
+    /// (qcow2 ZERO_PLAIN, vmdk grain marker, vhdx
     /// PAYLOAD_BLOCK_ZERO).
     pub const STATE_ZERO_ALLOCATED: u32 = 1;
     /// Extent state: contains data backed by the source file at
     /// `file_offset`.
     pub const STATE_DATA: u32 = 2;
+    /// Extent state: recorded as zero, with a host cluster at
+    /// `file_offset` (qcow2 ZERO_ALLOC).
+    pub const STATE_ZERO_ALLOCATED_AT: u32 = 3;
+    /// Extent state: unallocated, but inside a host cluster at
+    /// `file_offset` (qcow2 UNALLOCATED_ALLOC).
+    pub const STATE_HOLE_AT: u32 = 4;
 
     /// True if magic matches.
     pub fn is_valid(&self) -> bool {
@@ -3144,6 +3181,47 @@ impl DifferencingRefusal {
     /// The source is a differencing VHDX (`HasParent` set on the
     /// metadata region).
     pub const STATUS_VHDX: u32 = 2;
+}
+
+// ============================================================================
+// Invalid qcow2 L2 entry read refusal signal
+// ============================================================================
+
+/// The `send_error` channel used to report that the qcow2 chain reader
+/// refused an L2 entry qemu classifies as `QCOW2_SUBCLUSTER_INVALID`:
+/// an extended-L2 entry with an allocation bit set and no host cluster
+/// behind it, or with a subcluster marked both allocated and zero
+/// (`block/qcow2.h:739-796` at qemu v10.0.0). qemu fails such a read
+/// with `EIO` and "Invalid cluster entry found"
+/// (`block/qcow2-cluster.c:712-718`); so does instar, since #653 showed
+/// the alternative was serving the image's own header as guest data.
+///
+/// The reader returns a bare `bool` to convert, dd, compare, bench and
+/// rebase, none of which has a result code that can say *why* a read
+/// failed, so the reason travels the way [`DifferencingRefusal`] does:
+/// the guest calls `send_error(operation, device, sector, status)` with
+/// [`InvalidL2EntryRefusal::OPERATION`] as the operation string, the
+/// host's `SerialDecoder` captures it, and a formatter renders it in
+/// place of the generic failure text.
+///
+/// The `sector` argument carries the **virtual byte offset** of the
+/// refused read, not a sector number, so the host can name where in
+/// the guest-visible disk the corrupt entry lies without knowing the
+/// sector size the guest read with. `status` carries the index of the
+/// chain device whose L2 table holds the entry.
+pub struct InvalidL2EntryRefusal;
+
+impl InvalidL2EntryRefusal {
+    /// Reserved `send_error` operation marker for this signal.
+    /// Distinct from every real operation name, from `"cpu-exception"`
+    /// and from [`DifferencingRefusal::OPERATION`], so the host's
+    /// decoder can tell the `send_error` uses apart.
+    pub const OPERATION: &'static str = "qcow2-invalid-l2-entry";
+
+    /// The same marker as [`Self::OPERATION`], NUL-terminated, for the
+    /// call table's `send_error`. `invalid_l2_entry_marker_c_string_matches_operation`
+    /// asserts the two spellings agree.
+    pub const OPERATION_C: &'static [u8] = b"qcow2-invalid-l2-entry\0";
 }
 
 // ============================================================================
@@ -6177,6 +6255,33 @@ mod tests {
     }
 
     #[test]
+    fn coalescer_offset_bearing_zero_and_hole_merge_only_when_contiguous() {
+        // qcow2 ZERO_ALLOC and UNALLOCATED_ALLOC runs carry a host
+        // offset, so like Data they merge only when it is contiguous,
+        // and never with the offset-less state of the same kind.
+        let za = |start, length, file_offset| MapExtent {
+            start,
+            length,
+            state: MapExtentState::ZeroAllocatedAt { file_offset },
+        };
+        let ua = |start, length, file_offset| MapExtent {
+            start,
+            length,
+            state: MapExtentState::HoleAt { file_offset },
+        };
+        let r = collect(&[za(0, 4096, 0x1000), za(4096, 4096, 0x2000)]);
+        assert_eq!(r.slice(), &[za(0, 8192, 0x1000)]);
+        let r = collect(&[ua(0, 4096, 0x1000), ua(4096, 4096, 0x9000)]);
+        assert_eq!(r.slice(), &[ua(0, 4096, 0x1000), ua(4096, 4096, 0x9000)]);
+        let r = collect(&[ua(0, 4096, 0x1000), hole(4096, 4096)]);
+        assert_eq!(r.slice(), &[ua(0, 4096, 0x1000), hole(4096, 4096)]);
+        let r = collect(&[zero_alloc(0, 4096), za(4096, 4096, 0x1000)]);
+        assert_eq!(r.slice(), &[zero_alloc(0, 4096), za(4096, 4096, 0x1000)]);
+        assert_eq!(za(0, 1, 7).state.file_offset(), Some(7));
+        assert_eq!(hole(0, 1).state.file_offset(), None);
+    }
+
+    #[test]
     fn coalescer_virtual_gap_splits() {
         // No virtual gap allowed even for matching state.
         let r = collect(&[data(0, 4096, 0), data(8192, 4096, 8192)]);
@@ -6346,6 +6451,8 @@ mod tests {
         assert_eq!(MapExtentRecord::STATE_HOLE, 0);
         assert_eq!(MapExtentRecord::STATE_ZERO_ALLOCATED, 1);
         assert_eq!(MapExtentRecord::STATE_DATA, 2);
+        assert_eq!(MapExtentRecord::STATE_ZERO_ALLOCATED_AT, 3);
+        assert_eq!(MapExtentRecord::STATE_HOLE_AT, 4);
     }
 
     #[test]
@@ -6415,6 +6522,41 @@ mod tests {
         assert_ne!(
             DifferencingRefusal::STATUS_VHD,
             DifferencingRefusal::STATUS_VHDX
+        );
+    }
+
+    #[test]
+    fn invalid_l2_entry_operation_marker_is_distinct_from_the_other_senders() {
+        // The host tells the `send_error` uses apart by comparing
+        // `err.operation` against each marker string.
+        assert_eq!(InvalidL2EntryRefusal::OPERATION, "qcow2-invalid-l2-entry");
+        assert_ne!(InvalidL2EntryRefusal::OPERATION, "cpu-exception");
+        assert_ne!(
+            InvalidL2EntryRefusal::OPERATION,
+            DifferencingRefusal::OPERATION
+        );
+    }
+
+    #[test]
+    fn invalid_l2_entry_marker_c_string_matches_operation() {
+        // Same hazard as the differencing marker: a drift between the C
+        // string the guest raises and the &str the host compares means
+        // the refusal is raised but never captured, and the failure
+        // silently reverts to the generic text.
+        let c = InvalidL2EntryRefusal::OPERATION_C;
+        assert_eq!(
+            c.last().copied(),
+            Some(0),
+            "the C marker must be NUL-terminated"
+        );
+        assert_eq!(
+            &c[..c.len() - 1],
+            InvalidL2EntryRefusal::OPERATION.as_bytes(),
+            "the C marker must spell the same operation as OPERATION"
+        );
+        assert!(
+            !InvalidL2EntryRefusal::OPERATION.as_bytes().contains(&0),
+            "OPERATION must not embed a NUL, or the C marker truncates it"
         );
     }
 

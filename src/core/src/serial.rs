@@ -675,6 +675,8 @@ pub fn send_map_extent(record: &shared::MapExtentRecord) {
         shared::MapExtentRecord::STATE_HOLE => "hole",
         shared::MapExtentRecord::STATE_ZERO_ALLOCATED => "zero",
         shared::MapExtentRecord::STATE_DATA => "data",
+        shared::MapExtentRecord::STATE_ZERO_ALLOCATED_AT => "zero-at",
+        shared::MapExtentRecord::STATE_HOLE_AT => "hole-at",
         _ => "unknown",
     };
     let msg =

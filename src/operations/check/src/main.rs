@@ -2653,7 +2653,7 @@ unsafe fn check_qcow2(
     let mut table_buffer = [0u8; MAX_SECTOR_SIZE];
 
     // Track fragmentation
-    let mut last_data_offset: u64 = 0;
+    let mut last_data_offset: Option<u64> = None;
     let mut fragmented_entries: u64 = 0;
     let mut total_data_entries: u64 = 0;
 
@@ -2859,33 +2859,37 @@ unsafe fn check_qcow2(
 
                     result.clusters_checked += 1;
 
-                    if l2e == 0 {
-                        // For extended L2, l2e==0 can still have a meaningful
-                        // bitmap (e.g. zero-plain subclusters with zero_bits
-                        // set). Validate the bitmap before skipping.
-                        if hdr.extended_l2 && sc_bitmap != 0 {
-                            let status = qcow2::validate_subcluster_bitmap(
-                                false, // not compressed (l2e == 0)
-                                0,     // host_offset == 0
-                                sc_bitmap,
-                            );
-                            if status != qcow2::SubclusterBitmapStatus::Ok {
-                                result.corruptions += 1;
-                                result.total_errors += 1;
-                                result.subcluster_errors += 1;
-                                (call_table.debug_print)(match status {
-                                    qcow2::SubclusterBitmapStatus::AllocAndZeroOverlap => {
-                                        b"check: ext-L2 bitmap alloc+zero overlap (l2e=0)\n\0"
-                                            .as_ptr()
-                                    }
-                                    qcow2::SubclusterBitmapStatus::AllocWithoutHost => {
-                                        b"check: ext-L2 bitmap alloc without host (l2e=0)\n\0"
-                                            .as_ptr()
-                                    }
-                                    _ => b"check: ext-L2 bitmap invalid (l2e=0)\n\0".as_ptr(),
-                                });
-                            }
+                    // Validate the extended-L2 subcluster bitmap,
+                    // including an entry of 0, whose bitmap can still
+                    // hold zero bits (zero-plain) or, corruptly, alloc
+                    // bits. The rules are the classifier's and the
+                    // messages qemu-img check's.
+                    if hdr.extended_l2 {
+                        let status =
+                            qcow2::validate_subcluster_bitmap(l2e, sc_bitmap, has_external_data);
+                        if status != qcow2::SubclusterBitmapStatus::Ok {
+                            result.corruptions += 1;
+                            result.total_errors += 1;
+                            result.subcluster_errors += 1;
+                            (call_table.debug_print)(match status {
+                                qcow2::SubclusterBitmapStatus::CompressedNonZero => {
+                                    b"check: compressed cluster with non-zero subcluster \
+                                      allocation bitmap\n\0"
+                                        .as_ptr()
+                                }
+                                qcow2::SubclusterBitmapStatus::AllocAndZeroOverlap => {
+                                    b"check: Allocated cluster has corrupted subcluster \
+                                      allocation bitmap\n\0"
+                                        .as_ptr()
+                                }
+                                _ => b"check: Unallocated cluster has non-zero subcluster \
+                                       allocation map\n\0"
+                                    .as_ptr(),
+                            });
                         }
+                    }
+
+                    if l2e == 0 {
                         continue;
                     }
 
@@ -2897,45 +2901,19 @@ unsafe fn check_qcow2(
                         uses_compression = true;
                     }
 
-                    // Validate extended-L2 subcluster bitmap
-                    if hdr.extended_l2 {
-                        let host_offset_for_check = if compressed {
-                            0 // Not meaningful for compressed; validator ignores it.
-                        } else {
-                            l2e & qcow2::L2_OFFSET_MASK
-                        };
-                        let status = qcow2::validate_subcluster_bitmap(
-                            compressed,
-                            host_offset_for_check,
-                            sc_bitmap,
-                        );
-                        if status != qcow2::SubclusterBitmapStatus::Ok {
-                            result.corruptions += 1;
-                            result.total_errors += 1;
-                            result.subcluster_errors += 1;
-                            (call_table.debug_print)(match status {
-                                qcow2::SubclusterBitmapStatus::CompressedNonZero => {
-                                    b"check: ext-L2 compressed non-zero bitmap\n\0".as_ptr()
-                                }
-                                qcow2::SubclusterBitmapStatus::AllocAndZeroOverlap => {
-                                    b"check: ext-L2 bitmap alloc+zero overlap\n\0".as_ptr()
-                                }
-                                qcow2::SubclusterBitmapStatus::AllocWithoutHost => {
-                                    b"check: ext-L2 bitmap alloc without host\n\0".as_ptr()
-                                }
-                                qcow2::SubclusterBitmapStatus::HostWithoutRef => {
-                                    b"check: ext-L2 bitmap host without ref\n\0".as_ptr()
-                                }
-                                _ => b"check: ext-L2 bitmap invalid\n\0".as_ptr(),
-                            });
-                        }
-                    }
-
                     if !compressed {
-                        let data_off = l2e & qcow2::L2_OFFSET_MASK;
-                        if data_off == 0 {
+                        // With an external data file, host offset 0 is
+                        // a real cluster (qemu puts virtual cluster 0
+                        // there), so the classifier decides, not the
+                        // offset.
+                        if !qcow2::l2_entry_names_host_cluster(
+                            l2e,
+                            hdr.extended_l2,
+                            has_external_data,
+                        ) {
                             continue;
                         }
+                        let data_off = l2e & qcow2::L2_OFFSET_MASK;
 
                         if data_off % cluster_size != 0 {
                             result.corruptions += 1;
@@ -3001,8 +2979,8 @@ unsafe fn check_qcow2(
 
                         // Fragmentation tracking
                         total_data_entries += 1;
-                        if last_data_offset != 0 {
-                            if let Some(exp) = last_data_offset.checked_add(cluster_size) {
+                        if let Some(last) = last_data_offset {
+                            if let Some(exp) = last.checked_add(cluster_size) {
                                 if data_off != exp {
                                     fragmented_entries += 1;
                                 }
@@ -3010,7 +2988,7 @@ unsafe fn check_qcow2(
                                 fragmented_entries += 1;
                             }
                         }
-                        last_data_offset = data_off;
+                        last_data_offset = Some(data_off);
 
                         // Update max offset (only for metadata file)
                         if !has_external_data {
