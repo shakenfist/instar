@@ -323,8 +323,31 @@ def _read_at(path: Path, offset: int, length: int) -> bytes:
     return data + bytes(length - len(data))
 
 
+def _write_qcow2_backing(path: Path, content: bytes, cluster_size: int, parts_dir: Path) -> None:
+    """Write `content` as a classic qcow2 with `cluster_size` clusters, stored in reverse order on the host.
+
+    Each cluster is written by its own qemu-io command, last cluster first, so
+    qemu allocates the host clusters backwards. A reader that runs past the
+    end of one backing cluster into the next host cluster then reads another
+    virtual cluster's bytes rather than, by coincidence, the right ones.
+    """
+    _run(['qemu-img', 'create', '-q', '-f', 'qcow2', '-o', f'cluster_size={cluster_size},extended_l2=off',
+          str(path), str(len(content))])
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    io_argv = ['qemu-io', '-f', 'qcow2']
+    for offset in reversed(range(0, len(content), cluster_size)):
+        part = parts_dir / f'{offset}.bin'
+        part.write_bytes(content[offset:offset + cluster_size])
+        io_argv += ['-c', f'write -s {part} {offset} {cluster_size}']
+    _run(io_argv + [str(path)])
+    for part in parts_dir.iterdir():
+        part.unlink()
+    parts_dir.rmdir()
+
+
 def build_fixture(target_dir: Path, name: str, description: str, *, cluster_size: int = 65536,
-                  extended_l2: bool = True, backing: bool = False, data_file: bool = False,
+                  extended_l2: bool = True, backing: bool = False, backing_cluster_size: int = 0,
+                  data_file: bool = False,
                   ops: Sequence[Op] = (), patches: Sequence[Patch] = (),
                   patch_fn: Optional[Callable[[Qcow2Layout], Sequence[Patch]]] = None,
                   expect_types: FrozenSet[str] = frozenset()) -> SubclusterFixture:
@@ -334,13 +357,16 @@ def build_fixture(target_dir: Path, name: str, description: str, *, cluster_size
     `patch_l2` after qemu has written the image; `patch_fn` computes more of
     them from the qemu-built layout, for patches that depend on an offset qemu
     chose. Data and backing files are named by absolute path, because qemu
-    resolves a relative data-file name against its working directory.
+    resolves a relative data-file name against its working directory. The
+    backing file is raw unless `backing_cluster_size` is set, when it is a
+    qcow2 with clusters of that size holding the same bytes.
     """
     target_dir = Path(target_dir).resolve()
     target_dir.mkdir(parents=True, exist_ok=True)
     virtual_size = cluster_size * CLUSTERS_PER_FIXTURE
     path = target_dir / f'{name}.qcow2'
-    backing_path = target_dir / f'{name}.backing.raw' if backing else None
+    backing_suffix = 'qcow2' if backing_cluster_size else 'raw'
+    backing_path = target_dir / f'{name}.backing.{backing_suffix}' if backing else None
     data_path = target_dir / f'{name}.data' if data_file else None
     for stale in (path, backing_path, data_path):
         if stale is not None and stale.exists():
@@ -352,7 +378,10 @@ def build_fixture(target_dir: Path, name: str, description: str, *, cluster_size
     argv = ['qemu-img', 'create', '-q', '-f', 'qcow2', '-o', ','.join(options)]
     backing_bytes = backing_content(virtual_size) if backing_path is not None else bytes(virtual_size)
     model = bytearray(backing_bytes)
-    if backing_path is not None:
+    if backing_path is not None and backing_cluster_size:
+        _write_qcow2_backing(backing_path, backing_bytes, backing_cluster_size, target_dir / f'{name}.parts')
+        argv += ['-b', str(backing_path), '-F', 'qcow2']
+    elif backing_path is not None:
         backing_path.write_bytes(backing_bytes)
         argv += ['-b', str(backing_path), '-F', 'raw']
     _run(argv + [str(path), str(virtual_size)])
@@ -436,10 +465,17 @@ def mixed_ops(cluster_size: int, compressed: bool) -> Tuple[Op, ...]:
     return tuple(ops)
 
 
-def _mixed(extended_l2: bool, backing: bool, data_file: bool, cluster_size: int = 65536):
-    name = 'mixed_{}_{}_{}{}'.format(
+def _mixed(extended_l2: bool, backing: bool, data_file: bool, cluster_size: int = 65536,
+           backing_cluster_size: int = 0):
+    name = 'mixed_{}_{}_{}{}{}'.format(
         'ext' if extended_l2 else 'classic', 'backing' if backing else 'nobacking',
-        'datafile' if data_file else 'nodatafile', '' if cluster_size == 65536 else f'_{cluster_size // 1024}k')
+        'datafile' if data_file else 'nodatafile', '' if cluster_size == 65536 else f'_{cluster_size // 1024}k',
+        f'_over_{backing_cluster_size // 1024}k_qcow2' if backing_cluster_size else '')
+    if backing_cluster_size:
+        backing_label = f'qcow2 backing with {backing_cluster_size // 1024}K clusters'
+    else:
+        backing_label = 'raw backing' if backing else 'no backing'
+
     if extended_l2:
         expect = {NORMAL, ZERO_ALLOC, ZERO_PLAIN, UNALLOCATED_ALLOC, UNALLOCATED_PLAIN}
     else:
@@ -451,9 +487,10 @@ def _mixed(extended_l2: bool, backing: bool, data_file: bool, cluster_size: int 
         return build_fixture(
             target_dir, name,
             'One cluster of each qemu-written shape (see mixed_ops), {} L2, {}, {}, {}K clusters.'.format(
-                'extended' if extended_l2 else 'classic', 'raw backing' if backing else 'no backing',
+                'extended' if extended_l2 else 'classic', backing_label,
                 'external data file' if data_file else 'no data file', cluster_size // 1024),
-            cluster_size=cluster_size, extended_l2=extended_l2, backing=backing, data_file=data_file,
+            cluster_size=cluster_size, extended_l2=extended_l2, backing=backing,
+            backing_cluster_size=backing_cluster_size, data_file=data_file,
             ops=mixed_ops(cluster_size, compressed=not data_file), expect_types=frozenset(expect))
     return name, build
 
@@ -506,6 +543,13 @@ _BUILDER_LIST = [
     _mixed(True, True, False, cluster_size=16384),
     _mixed(True, True, False, cluster_size=32768),
     _mixed(True, True, False, cluster_size=131072),
+    # Over a qcow2 backing file whose clusters are smaller than the child's:
+    # a run of unallocated subclusters, or a wholly unallocated classic
+    # cluster, reaches the backing file as one read that spans several of
+    # its clusters. 1K is also smaller than a 64K child's 2K subclusters.
+    _mixed(True, True, False, backing_cluster_size=16384),
+    _mixed(True, True, False, backing_cluster_size=1024),
+    _mixed(False, True, False, backing_cluster_size=16384),
 
     # The shapes of issues #653 and #654, and the data-file shapes that read wrongly beside them.
     _shape('issue_654', 'Extended L2 with backing; only subcluster 0 of cluster 0 zeroed (host 0, zero bit 0 set, '

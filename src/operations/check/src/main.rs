@@ -2653,7 +2653,7 @@ unsafe fn check_qcow2(
     let mut table_buffer = [0u8; MAX_SECTOR_SIZE];
 
     // Track fragmentation
-    let mut last_data_offset: u64 = 0;
+    let mut last_data_offset: Option<u64> = None;
     let mut fragmented_entries: u64 = 0;
     let mut total_data_entries: u64 = 0;
 
@@ -2902,10 +2902,18 @@ unsafe fn check_qcow2(
                     }
 
                     if !compressed {
-                        let data_off = l2e & qcow2::L2_OFFSET_MASK;
-                        if data_off == 0 {
+                        // With an external data file, host offset 0 is
+                        // a real cluster (qemu puts virtual cluster 0
+                        // there), so the classifier decides, not the
+                        // offset.
+                        if !qcow2::l2_entry_names_host_cluster(
+                            l2e,
+                            hdr.extended_l2,
+                            has_external_data,
+                        ) {
                             continue;
                         }
+                        let data_off = l2e & qcow2::L2_OFFSET_MASK;
 
                         if data_off % cluster_size != 0 {
                             result.corruptions += 1;
@@ -2971,8 +2979,8 @@ unsafe fn check_qcow2(
 
                         // Fragmentation tracking
                         total_data_entries += 1;
-                        if last_data_offset != 0 {
-                            if let Some(exp) = last_data_offset.checked_add(cluster_size) {
+                        if let Some(last) = last_data_offset {
+                            if let Some(exp) = last.checked_add(cluster_size) {
                                 if data_off != exp {
                                     fragmented_entries += 1;
                                 }
@@ -2980,7 +2988,7 @@ unsafe fn check_qcow2(
                                 fragmented_entries += 1;
                             }
                         }
-                        last_data_offset = data_off;
+                        last_data_offset = Some(data_off);
 
                         // Update max offset (only for metadata file)
                         if !has_external_data {

@@ -4855,9 +4855,10 @@ rather than fixed, because none of them was that change's job to close:
 
 ## Invalid qcow2 subcluster entries are refused, as in qemu-img
 
-**Classification: no divergence from qemu-img. Recorded because instar
-used to zero-fill these entries, and the reason it stopped is worth
-keeping.**
+**Classification: no divergence from qemu-img for the entries qemu
+classifies as invalid; two related data-file shapes still diverge (see
+the end of this entry). Recorded because instar used to zero-fill these
+entries, and the reason it stopped is worth keeping.**
 
 ### Observed Behavior
 
@@ -4873,7 +4874,7 @@ instar refuses the same entries. `convert`, `dd`, `compare`, `bench`
 and `rebase` fail with a message in the same class as qemu's:
 
 ```
-convert: Invalid cluster entry found at virtual offset 65536 (0x10000): the qcow2 L2 entry marks a subcluster allocated with no host cluster behind it, or both allocated and zero, so the image is corrupt and the read failed as it does in qemu
+convert: Invalid cluster entry found at virtual offset 65536 (0x10000): corrupt qcow2 L2 entry
 ```
 
 (the operation name and offset vary; the message is one line). `map`
@@ -4899,6 +4900,15 @@ well-formed and reads from the backing file, read zeros instead
 `check` follows what qemu-img 10.0.13 was measured to report: a host
 cluster with an empty subcluster bitmap is not reported, and a
 compressed entry with any non-zero bitmap is reported.
+
+Two shapes in a data-file image are refused by qemu's read path after
+classification, and instar does not yet refuse them by name
+([issue #803](https://github.com/shakenfist/instar/issues/803)). A
+compressed entry fails with instar's generic read-failure text, where
+qemu says that compressed clusters are not allowed with a data file. A
+host offset that differs from the guest offset is read from the data
+file at that offset and the operation succeeds, where qemu fails the
+read with `EIO`, because qemu maps data-file clusters one to one.
 
 ## Future Additions
 

@@ -626,6 +626,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **Data-file qcow2 images whose cluster 0 is `COPIED` with host offset
   0** read as zeros, mapped as a hole, measured short, or failed
   `check` as corrupt; all four now treat it as data at offset 0.
+- **Reads through a qcow2 backing file with smaller clusters than the
+  image above it left part of the buffer unwritten and reported
+  success.** A 64K image over a 16K backing file converted with wrong
+  bytes and exit 0. The chain reader now splits a read at each qcow2
+  cluster and VMDK grain boundary of the device it reads, at every
+  depth of the chain. The same fix stops `compare` from comparing
+  stale bytes for images with clusters under 64K
+  ([#800](https://github.com/shakenfist/instar/issues/800)).
 
 - **Every operation now gives its vCPU a guest CPUID, so instar works
   on Linux 6.12.112 and newer** (#778). A freshly created KVM vCPU has

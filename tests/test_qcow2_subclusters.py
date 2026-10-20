@@ -28,8 +28,8 @@ it has to remove the entry.
 The fixtures in `HOST_OFFSET_REFUSAL_BUILDERS` are deliberately not run here.
 They classify as valid, and qemu refuses them through its host-offset rules
 (a compressed entry with a data file, a data-file host offset different from
-the guest offset), which instar does not implement yet; they are future work,
-not classification.
+the guest offset), which instar does not implement yet (#803); that is not
+classification.
 """
 
 import json
@@ -53,10 +53,6 @@ _ISSUE_792 = ('#792: an unallocated cluster in a data-file image falls through t
 _COMPRESSED_MAP = ('instar map reports compressed clusters with compressed: false and a host offset; see '
                    'docs/quirks.md "qcow2 compressed clusters report compressed: false" and the compressed '
                    'entries of KNOWN_MAP_DIVERGENCES in tests/test_map.py')
-_COMPARE_SMALL_CLUSTER = ('#800: instar compare reads chunks of the larger cluster size of the two images through a '
-                          'reader that fills one input cluster per call, so a qcow2 with clusters smaller than 64K is '
-                          'compared against stale buffer bytes after its first cluster; convert and dd read the same '
-                          'images correctly')
 
 # (operation, fixture) -> why instar does not yet agree with qemu-img.
 EXPECTED_FAILURES = {}
@@ -67,9 +63,6 @@ for _fixture in ('mixed_classic_backing_datafile', 'mixed_ext_backing_datafile',
 for _fixture in ('mixed_classic_nobacking_nodatafile', 'mixed_ext_nobacking_nodatafile',
                  'compressed_bitmap_all_alloc', 'compressed_bitmap_arbitrary'):
     EXPECTED_FAILURES[('map', _fixture)] = _COMPRESSED_MAP
-for _fixture in ('issue_654_32k', 'mixed_ext_backing_nodatafile_16k', 'mixed_ext_backing_nodatafile_32k'):
-    EXPECTED_FAILURES[('compare', _fixture)] = _COMPARE_SMALL_CLUSTER
-EXPECTED_FAILURES[('compare', 'data_file_partial_32k')] = _ISSUE_792 + '; and then: ' + _COMPARE_SMALL_CLUSTER
 
 
 def _run(argv, timeout=120):

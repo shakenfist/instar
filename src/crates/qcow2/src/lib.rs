@@ -1498,6 +1498,19 @@ fn cluster_type(l2_entry: u64, extended_l2: bool, has_data_file: bool) -> Cluste
     }
 }
 
+/// Whether an uncompressed L2 entry names a host cluster, as qemu's
+/// cluster type decides it: true for `Normal` and `ZeroAlloc`, which
+/// with an external data file includes `QCOW_OFLAG_COPIED` at host
+/// offset 0, where qemu puts virtual cluster 0. A compressed entry is
+/// false; its offset is a byte address with a sector count, not a
+/// cluster.
+pub fn l2_entry_names_host_cluster(l2_entry: u64, extended_l2: bool, has_data_file: bool) -> bool {
+    matches!(
+        cluster_type(l2_entry, extended_l2, has_data_file),
+        ClusterType::Normal | ClusterType::ZeroAlloc
+    )
+}
+
 /// Subclusters in one cluster: 32 with extended L2, else 1.
 fn subclusters_per_cluster(extended_l2: bool) -> u32 {
     if extended_l2 {
@@ -6740,6 +6753,8 @@ mod tests {
     struct ScChain {
         qcow2: std::vec::Vec<u8>,
         backing: Option<std::vec::Vec<u8>>,
+        /// The backing device's qcow2 cluster size, or 0 when it is raw.
+        backing_cluster: u64,
         data: std::vec::Vec<u8>,
         extended_l2: bool,
         has_data_file: bool,
@@ -6768,10 +6783,37 @@ mod tests {
         ScChain {
             qcow2: img,
             backing: backing.then(|| (0..SC_VDISK_LEN as u64).map(sc_backing_byte).collect()),
+            backing_cluster: 0,
             data: (0..SC_VDISK_LEN as u64).map(sc_data_byte).collect(),
             extended_l2,
             has_data_file,
         }
+    }
+
+    /// The same chain over a classic qcow2 backing file with
+    /// `backing_cluster`-byte clusters, which serves the same bytes as
+    /// the raw backing device. Its clusters are stored in reverse order
+    /// on the host, so a read that runs past the end of one backing
+    /// cluster into the next host cluster gets the wrong virtual
+    /// cluster's bytes instead of the right ones by coincidence.
+    fn sc_chain_over_qcow2(extended_l2: bool, backing_cluster: u64) -> ScChain {
+        let mut chain = sc_chain(extended_l2, false, true);
+        let n = SC_VDISK_LEN as u64 / backing_cluster;
+        let (l1, l2, data0) = (backing_cluster, 2 * backing_cluster, 3 * backing_cluster);
+        assert!(n * 8 <= backing_cluster, "one L2 table maps the disk");
+        let mut img = std::vec![0u8; (data0 + n * backing_cluster) as usize];
+        img[l1 as usize..l1 as usize + 8].copy_from_slice(&(l2 | OFLAG_COPIED).to_be_bytes());
+        for k in 0..n {
+            let host = data0 + (n - 1 - k) * backing_cluster;
+            let at = (l2 + k * 8) as usize;
+            img[at..at + 8].copy_from_slice(&(host | OFLAG_COPIED).to_be_bytes());
+            for i in 0..backing_cluster {
+                img[(host + i) as usize] = sc_backing_byte(k * backing_cluster + i);
+            }
+        }
+        chain.backing = Some(img);
+        chain.backing_cluster = backing_cluster;
+        chain
     }
 
     fn sc_state(chain: &ScChain, l1_cache: &mut [u8], l2_cache: &mut [u8]) -> Qcow2State {
@@ -6851,6 +6893,28 @@ mod tests {
         let mut l2_cache = std::vec![0u8; MAX_SECTOR_SIZE];
         let mut chain_states = ChainStates::default();
         chain_states.qcow2_states[0] = Some(sc_state(chain, &mut l1_cache, &mut l2_cache));
+        let mut backing_l1_cache = std::vec![0u8; MAX_SECTOR_SIZE];
+        let mut backing_l2_cache = std::vec![0u8; MAX_SECTOR_SIZE];
+        let bc = chain.backing_cluster;
+        if bc != 0 {
+            chain_states.qcow2_states[1] = Some(Qcow2State {
+                device_idx: 1,
+                cluster_size: bc,
+                cluster_bits: bc.trailing_zeros(),
+                l1_size: 1,
+                l1_table_offset: bc,
+                incompatible_features: 0,
+                compression_type: 0,
+                crypt_method: 0,
+                luks_ext_offset: 0,
+                luks_ext_len: 0,
+                extended_l2: false,
+                l1_cached_sector: u64::MAX,
+                l1_cache_buf: backing_l1_cache.as_mut_ptr(),
+                l2_cached_sector: u64::MAX,
+                l2_cache_buf: backing_l2_cache.as_mut_ptr(),
+            });
+        }
 
         let chain_len = 1 + chain.backing.is_some() as usize;
         let mut chain_config = ChainConfig::single_chain(chain_len as u32);
@@ -6858,8 +6922,13 @@ mod tests {
         chain_config.devices[0].cluster_size = SC_CLUSTER as u32;
         chain_config.devices[0].data_device_idx = data_device_idx;
         if chain.backing.is_some() {
-            chain_config.devices[1].format = ImageFormat::Raw as u32;
-            chain_config.devices[1].cluster_size = 0;
+            let format = if bc != 0 {
+                ImageFormat::Qcow2
+            } else {
+                ImageFormat::Raw
+            };
+            chain_config.devices[1].format = format as u32;
+            chain_config.devices[1].cluster_size = bc as u32;
             chain_config.devices[1].data_device_idx = 0;
         }
 
@@ -7083,6 +7152,54 @@ mod tests {
         for (off, len) in [(0, 4096), (3900, 400), (8000, 300), (12345, 678)] {
             let label = std::format!("window {len}@{off} of cluster 7");
             sc_assert_provenance(&chain, 0, 7 * SC_CLUSTER + off, len, &runs, &label);
+        }
+    }
+
+    #[test]
+    fn sc_unallocated_runs_split_at_smaller_backing_clusters() {
+        // A run of unallocated subclusters is handed to the backing
+        // device in one read. When the backing file is a qcow2 whose
+        // clusters are smaller than the run, that read crosses its
+        // cluster boundaries, and each backing cluster is somewhere else
+        // on the host. 1024 is a cluster smaller than the wide arm's
+        // sector, and 16384 the child's own cluster size, as a control.
+        for bc in [1024u64, 2048, 4096, 8192, SC_CLUSTER] {
+            let chain = sc_chain_over_qcow2(true, bc);
+            sc_assert_provenance(
+                &chain,
+                0,
+                0,
+                SC_CLUSTER,
+                &[(Child(SC_HOST_A), 8), (Zero, 8), (Backing, 16)],
+                &std::format!("N Za Ua over {bc}-byte backing clusters"),
+            );
+            sc_assert_provenance(
+                &chain,
+                0,
+                SC_CLUSTER,
+                SC_CLUSTER,
+                &[(Zero, 1), (Backing, 31)],
+                &std::format!("#654 over {bc}-byte backing clusters"),
+            );
+            sc_assert_provenance(
+                &chain,
+                0,
+                7 * SC_CLUSTER + 3900,
+                5000,
+                &[(Zero, 8), (Backing, 8), (Child(SC_HOST_B), 16)],
+                &std::format!("window over {bc}-byte backing clusters"),
+            );
+            // A classic child's wholly unallocated cluster goes to the
+            // backing device as one chunk too.
+            let chain = sc_chain_over_qcow2(false, bc);
+            sc_assert_provenance(
+                &chain,
+                0,
+                2 * SC_CLUSTER,
+                SC_CLUSTER,
+                &[(Backing, 32)],
+                &std::format!("classic unallocated over {bc}-byte backing clusters"),
+            );
         }
     }
 
@@ -14847,6 +14964,75 @@ fn devices_behind(chain_len: usize, dev_offset: usize) -> Option<usize> {
     chain_len.checked_sub(dev_offset)?.checked_sub(1)
 }
 
+/// Whether a chunk at `virtual_offset` runs past the end of the
+/// `granule`-sized unit (a qcow2 cluster, a VMDK grain) it starts in.
+#[inline]
+fn chunk_crosses_granule(virtual_offset: u64, chunk_size: u64, granule: u64) -> bool {
+    granule != 0 && virtual_offset % granule + chunk_size > granule
+}
+
+/// Read a chunk that crosses a device's cluster or grain boundaries as
+/// one read per unit, each starting again at that device.
+///
+/// A device's arm maps one unit through one table entry, and adjacent
+/// units are not adjacent on the host, so a chunk that spans several of
+/// them has to be resolved one at a time. The top device's caller sizes
+/// chunks to the top device's own clusters, but a lower device in the
+/// chain can have smaller ones (a 64K child over a 16K backing file),
+/// a descent for an unallocated run hands down whatever span the run
+/// covers, and `compare` reads in the larger of its two inputs' cluster
+/// sizes. Splitting here, rather than in each caller, keeps the
+/// function's contract -- every byte of `chunk_size` is filled -- true
+/// at every depth.
+#[allow(clippy::too_many_arguments)]
+unsafe fn read_chain_split_at_granule(
+    granule: u64,
+    call_table: &CallTable,
+    chain_start: usize,
+    chain_len: usize,
+    virtual_offset: u64,
+    buf: *mut u8,
+    chunk_size: u64,
+    sector_size: usize,
+    chain_config: &ChainConfig,
+    chain_states: &mut ChainStates,
+    compressed_buf: *mut u8,
+    staging_buf: *mut u8,
+    staging_cluster_offset: &mut u64,
+    aes_key: Option<&[u8; 16]>,
+    luks_key: Option<&[u8]>,
+    luks_sector_size: u64,
+    bytes_read: &mut u64,
+) -> bool {
+    let mut done = 0u64;
+    while done < chunk_size {
+        let cur = virtual_offset + done;
+        let span = (chunk_size - done).min(granule - cur % granule);
+        if !read_chain_virtual_cluster(
+            call_table,
+            chain_start,
+            chain_len,
+            cur,
+            buf.add(done as usize),
+            span,
+            sector_size,
+            chain_config,
+            chain_states,
+            compressed_buf,
+            staging_buf,
+            staging_cluster_offset,
+            aes_key,
+            luks_key,
+            luks_sector_size,
+            bytes_read,
+        ) {
+            return false;
+        }
+        done += span;
+    }
+    true
+}
+
 /// The device a qcow2 cluster's host offset is read from: the external
 /// data file when the header declares one (`has_data_file`), else the
 /// image itself. The header decides, as it does in qemu, which refuses
@@ -14946,6 +15132,10 @@ fn parent_in_chain(chain_config: &ChainConfig, dev_idx: usize) -> bool {
 ///
 /// If all devices have the cluster unallocated, fills with zeros.
 ///
+/// A chunk that crosses a qcow2 cluster or VMDK grain boundary of the
+/// device being read is split there, so every byte of `chunk_size` is
+/// filled whatever the cluster sizes further down the chain.
+///
 /// # Safety
 ///
 /// `buf` must point to at least `chunk_size` writable bytes.
@@ -15001,6 +15191,28 @@ pub unsafe fn read_chain_virtual_cluster(
                 let cluster_bits = state.cluster_bits;
                 let crypt_method = state.crypt_method;
                 let has_data_file = state.has_data_file();
+
+                if chunk_crosses_granule(virtual_offset, chunk_size, qcow2_cluster_size) {
+                    return read_chain_split_at_granule(
+                        qcow2_cluster_size,
+                        call_table,
+                        dev_idx,
+                        chain_len - dev_offset,
+                        virtual_offset,
+                        buf,
+                        chunk_size,
+                        sector_size,
+                        chain_config,
+                        chain_states,
+                        compressed_buf,
+                        staging_buf,
+                        staging_cluster_offset,
+                        aes_key,
+                        luks_key,
+                        luks_sector_size,
+                        bytes_read,
+                    );
+                }
 
                 match state.cluster_lookup(call_table, virtual_offset, sector_size, cap, bytes_read)
                 {
@@ -15383,6 +15595,28 @@ pub unsafe fn read_chain_virtual_cluster(
                 };
 
                 let grain_size_bytes = state.grain_size_bytes;
+
+                if chunk_crosses_granule(virtual_offset, chunk_size, grain_size_bytes) {
+                    return read_chain_split_at_granule(
+                        grain_size_bytes,
+                        call_table,
+                        dev_idx,
+                        chain_len - dev_offset,
+                        virtual_offset,
+                        buf,
+                        chunk_size,
+                        sector_size,
+                        chain_config,
+                        chain_states,
+                        compressed_buf,
+                        staging_buf,
+                        staging_cluster_offset,
+                        aes_key,
+                        luks_key,
+                        luks_sector_size,
+                        bytes_read,
+                    );
+                }
 
                 match state.grain_lookup(call_table, virtual_offset, sector_size, cap, bytes_read) {
                     Some(GrainLookup::Unallocated) => {
@@ -16651,15 +16885,12 @@ pub unsafe fn read_chain_virtual_cluster(
 
 /// Read an arbitrary virtual byte range, filling the FULL `len` bytes.
 ///
-/// [`read_chain_virtual_cluster`] only fills up to one input cluster per
-/// call (its `chunk_size` is clamped to the qcow2 cluster size for qcow2
-/// inputs), so a caller that hands it a span larger than the input
-/// cluster — e.g. a VMDK 64 KiB grain or a VHD/VHDX block read from a
-/// qcow2 with 512-byte clusters — would otherwise get only the first
-/// cluster filled and stale/zero bytes after it. The qcow2 output path
-/// loops in `min(input_cluster, output_cluster)` steps to avoid this;
-/// this wrapper centralises that loop so the VMDK/VHD/VHDX writers can
-/// request a whole grain/block and get every byte.
+/// [`read_chain_virtual_cluster`] splits a chunk that crosses a qcow2
+/// cluster or VMDK grain boundary itself, at every depth of the chain.
+/// This wrapper predates that and still bounds each call to one top
+/// device cluster, which keeps each call's span within the sizes the
+/// reader's scratch buffers were chosen for, so the VMDK/VHD/VHDX
+/// writers can request a whole grain or block and get every byte.
 ///
 /// # Safety
 ///

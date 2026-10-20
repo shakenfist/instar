@@ -317,6 +317,22 @@ The `dd` window check (`bs=4096 skip=1 count=3`) is byte-identical to
   test_check_formats, test_check_chain and test_check_repair ran 1230
   tests: 0 failed and 19 expected failures. The `host_offset == 0` grep
   finds only the classifier's doc comment and tests.
+* 2026-10-20 (AEDT), CI on `b18590b0`: the mutation-pattern guard
+  failed, because two cases targeted the #650 zero-fill this phase
+  removed. They were retargeted at the refusal and the classifier
+  (`1fd5cedd`).
+* 2026-10-20 (AEDT), review round 1 on `1fd5cedd` (2 fix, 1 document,
+  6 consider). The first fix item was real and older than this phase:
+  the chain reader assumed every chunk fits in one cluster of each
+  device, so a 64K image over a 16K qcow2 backing file converted wrong
+  with exit 0 on develop too. A split at qcow2 cluster and VMDK grain
+  boundaries, inside the reader, fixed it and #800 with it. The
+  crate harness and the fixture builder gained qcow2 backing files
+  whose clusters sit in reverse order on the host; the module now has
+  35 fixtures and 175 tests, and the three #800 compare entries left
+  `EXPECTED_FAILURES`. The `check` change to count a data-file
+  image's cluster 0 exposed #804: L2 tables are counted too. #803
+  tracks qemu's data-file host-offset checks.
 
 ## Success criteria for the phase
 

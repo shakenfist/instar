@@ -845,9 +845,7 @@ impl SerialDecoder {
         match self.last_invalid_l2_entry {
             Some(offset) => format!(
                 "{op}: Invalid cluster entry found at virtual offset {offset} ({offset:#x}): \
-                 the qcow2 L2 entry marks a subcluster allocated with no host cluster behind \
-                 it, or both allocated and zero, so the image is corrupt and the read failed \
-                 as it does in qemu"
+                 corrupt qcow2 L2 entry"
             ),
             None => format!("{op}: guest did not return a result"),
         }

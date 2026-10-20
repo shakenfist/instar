@@ -2179,7 +2179,7 @@ guards. See the VHD and VHDX notes in
 [chain-config.md](chain-config.md#format-specific-notes) for the
 composing path being guarded.
 
-There are **105 cases**, in eight groups.
+There are **106 cases**, in eight groups.
 
 Twenty-seven cover the writer. Fifteen mutate a library crate
 (`create`, `vhd`, `vhdx`) and are caught by a Rust unit or round-trip
@@ -2353,7 +2353,7 @@ binary, by `TestAdversarialChainDeviceCount` in `tests/test_adversarial.py`
 -- the same test module that builds the fixture, since no static
 `instar-testdata` image has this shape.
 
-The last group is **2 subcluster cases**, and is the only group not
+The last group is **3 subcluster cases**, and is the only group not
 about a differencing format at all. It is here because the defect it
 guards is the same class as the rest -- a span the reader never wrote,
 returned to the caller under a successful read -- and because the
@@ -2370,7 +2370,13 @@ which is the vacuity guard -- without it a green test would prove only
 that the read never reached the refusal. Both are `rust_case` against
 the crate's in-memory subcluster fixture, whose test reads through
 both the narrow and the wide arm. `docs/quirks.md` records the
-refusal.
+refusal. The third removes the split that cuts a chunk at a qcow2
+device's own cluster boundaries: without it, a run of unallocated
+subclusters handed to a qcow2 backing file with smaller clusters reads
+one backing cluster's worth from the wrong place and leaves the rest of
+the buffer unwritten. Its test reads over backing files whose clusters
+are stored in reverse order on the host, so a read that runs on into
+the next host cluster cannot land on the right bytes by accident.
 
 Most of the reader cases name a test in the `qcow2` crate and run it
 with the full input-format feature list, because the

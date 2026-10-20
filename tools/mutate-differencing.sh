@@ -682,7 +682,7 @@ self_test() {
 # phase's definition of done asks the two to stay in step, which until
 # now was a promise kept by hand. Asserting it makes the drift a
 # failure instead of a documentation bug nobody reads.
-EXPECTED_CASES=105
+EXPECTED_CASES=106
 
 check_case_count() {
     # Only meaningful for a whole run; a selection is expected to be short.
@@ -1705,6 +1705,17 @@ rust_case 'qcow2-subcluster-alloc-at-host-zero-not-invalid' "${QCOW2_LIB}" \
             if false { // MUTATED
                 SubclusterType::Invalid' \
     qcow2 'extended_l2_alloc_bit_at_host_zero_is_invalid' \
+    --features "${QCOW2_FEATURES}"
+
+# A chunk handed to a qcow2 device with smaller clusters than the
+# chunk spans several of its clusters, which are not adjacent on the
+# host. Removing the split makes the backing device read one cluster's
+# worth from the first host cluster and leave the rest of the buffer
+# as it was, under success.
+rust_case 'qcow2-chunk-not-split-at-backing-clusters' "${QCOW2_LIB}" \
+    '                if chunk_crosses_granule(virtual_offset, chunk_size, qcow2_cluster_size) {' \
+    '                if false { // MUTATED' \
+    qcow2 'sc_unallocated_runs_split_at_smaller_backing_clusters' \
     --features "${QCOW2_FEATURES}"
 
 # ---------------------------------------------------------------------
