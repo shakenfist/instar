@@ -231,7 +231,7 @@ the failure #654 measured.
 
 | Phase | Plan | Status | Merged |
 |-------|------|--------|--------|
-| 1. One subcluster classifier (#653, #654, rows C and D) | [PLAN-654-subcluster-classification-phase-01-classifier.md](PLAN-654-subcluster-classification-phase-01-classifier.md) | In progress | |
+| 1. One subcluster classifier (#653, #654, rows C and D) | [PLAN-654-subcluster-classification-phase-01-classifier.md](PLAN-654-subcluster-classification-phase-01-classifier.md) | Complete | `d08841e` (#801) |
 | 2. The data device is not a chain layer (#792) | PLAN-654-subcluster-classification-phase-02-data-device.md | Not started | |
 | 3. Push audit | - | Not started | |
 
