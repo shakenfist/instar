@@ -2360,17 +2360,17 @@ returned to the caller under a successful read -- and because the
 differencing work's own fuzz target is what found it. An extended-L2
 qcow2 entry can mark a subcluster allocated while naming host offset
 zero, which is a contradiction: there is no host cluster to read it
-from. The narrow arm of the fill loop has always zero-filled such a
-subcluster; the wide arm, taken when the device's sector size exceeds
-`cluster / 32`, matched no arm at all and left the caller's buffer
-untouched (issue #650). One case removes the arm that now handles it;
-the other reverts the lookup that classifies the entry, which is the
-vacuity guard -- without it a green test would prove only that the
-read never reached the fill loop. Both are `rust_case` against a
-static in-memory fixture at 8192-byte clusters and 512-byte sectors,
-the geometry that selects the wide arm; the default 64 KiB cluster
-takes the narrow one. `docs/quirks.md` records why instar zero-fills
-here where qemu fails the read.
+from. The wide arm of the fill loop, taken when the device's sector
+size exceeds `cluster / 32`, once matched no arm for it and left the
+caller's buffer untouched (issue #650). qemu calls the entry INVALID
+and fails the read, and instar now does the same, by name. One case
+removes that refusal, so the read reports success over a buffer
+nothing wrote; the other removes the classifier's alloc-bit check,
+which is the vacuity guard -- without it a green test would prove only
+that the read never reached the refusal. Both are `rust_case` against
+the crate's in-memory subcluster fixture, whose test reads through
+both the narrow and the wide arm. `docs/quirks.md` records the
+refusal.
 
 Most of the reader cases name a test in the `qcow2` crate and run it
 with the full input-format feature list, because the
