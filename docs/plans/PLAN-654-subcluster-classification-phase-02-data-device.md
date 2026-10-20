@@ -140,8 +140,8 @@ the master plan criticises.
 
 **D3. `init_chain_states` validates the marking before any read.** A
 segment's first device is never a data device. Every non-zero
-`data_device_idx` names a marked device in the owner's segment, after
-the owner. Every marked device has exactly one owner: a qcow2 owns one,
+`data_device_idx` names the marked device in the slot immediately after
+its owner, which is where the VMM always puts it. Every marked device has exactly one owner: a qcow2 owns one,
 and a `VmdkDescriptor` owns the contiguous run of marked devices that
 starts at its `data_device_idx`, which is also how its extent walk now
 ends (survey item 6). A config that breaks these rules is refused with
@@ -230,7 +230,7 @@ merging it back.
   fails closed.
 * `compare` of a qcow2 overlay over a smaller monolithicFlat VMDK
   against qemu's raw output says identical in both argument orders.
-* `grep -rn "counts as a device behind\|covered by that chain's segment" src/shared docs`
+* `grep -rn "counts as a device behind\|covered by that chain's segment" src/shared docs --exclude-dir=plans`
   returns nothing.
 * `grep -n "CHAIN_CONFIG_VERSION" src/vmm/src/main.rs` returns nothing.
 * Each mutation case added in steps 2b and 2c is caught by a named
@@ -417,3 +417,18 @@ rule), and convert for both.
 
   None of the three changes D1-D3 or D5, so the phase continued
   without stopping.
+* Step 2b, run in a separate worktree as planned, made D3 stricter than
+  written: a `data_device_idx` must name the slot immediately after its
+  owner, not just any later slot in the segment. The VMM only ever writes
+  it that way, and the stricter rule keeps the VHD, VHDX and qcow1
+  bottom-of-chain arithmetic exact. D3 above is corrected to match. The
+  rule lives in `ChainConfig::data_devices_are_owned`, beside
+  `segmentation_covers`. Two extras were kept: the VMM masks the
+  data-device bit out of the flags an info operation reports, so an
+  image cannot mark itself, and a VMM unit test with two mutation
+  cases checks the host's output against the guest's rule. The
+  management session re-ran two of the 12 new mutation cases (both
+  caught), and converted all ten #792 fixtures with the step's binary:
+  all match qemu, and `data_file_mid_chain` fails closed as #806
+  predicts. The definition-of-done grep now excludes `docs/plans`,
+  because this plan quotes the phrase it greps for.

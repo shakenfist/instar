@@ -48,18 +48,12 @@ INVALID_ENTRY_MESSAGE = 'Invalid cluster entry found'
 
 OPERATIONS = ('convert', 'compare', 'map', 'check', 'measure')
 
-_ISSUE_792 = ('#792: an unallocated cluster in a data-file image falls through to the next device in the chain, '
-              'which is the data file, instead of reading zeros or the backing file')
 _COMPRESSED_MAP = ('instar map reports compressed clusters with compressed: false and a host offset; see '
                    'docs/quirks.md "qcow2 compressed clusters report compressed: false" and the compressed '
                    'entries of KNOWN_MAP_DIVERGENCES in tests/test_map.py')
 
 # (operation, fixture) -> why instar does not yet agree with qemu-img.
 EXPECTED_FAILURES = {}
-for _fixture in ('mixed_classic_backing_datafile', 'mixed_ext_backing_datafile', 'data_file_partial_backing',
-                 'data_file_partial_32k', 'data_file_classic_no_copied_backing', 'data_file_classic_no_copied'):
-    for _operation in ('convert', 'compare'):
-        EXPECTED_FAILURES[(_operation, _fixture)] = _ISSUE_792
 for _fixture in ('mixed_classic_nobacking_nodatafile', 'mixed_ext_nobacking_nodatafile',
                  'compressed_bitmap_all_alloc', 'compressed_bitmap_arbitrary'):
     EXPECTED_FAILURES[('map', _fixture)] = _COMPRESSED_MAP

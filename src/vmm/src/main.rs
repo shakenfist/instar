@@ -333,8 +333,6 @@ const CHECK_RESULT_FLAG_REPAIR_INCOMPLETE: u32 = 1 << 8;
 #[allow(dead_code)]
 const CHAIN_CONFIG_MAGIC: u32 = 0x4348414E; // "CHAN"
 #[allow(dead_code)]
-const CHAIN_CONFIG_VERSION: u32 = 3;
-#[allow(dead_code)]
 const MAX_CHAIN_DEVICES: usize = 16;
 
 // InfoResult constants (must match shared crate)
@@ -3580,6 +3578,13 @@ fn print_backing_chain_json(chain: &BackingChain) {
 /// If the chain has an external data file, it is inserted as device `start_idx + 1`
 /// (between the top image and the rest of the backing chain).
 ///
+/// Every data device written -- a qcow2's data file, a VMDK flat
+/// descriptor's extents -- carries `ChainDeviceInfo::FLAG_DATA_DEVICE`,
+/// and nothing else does. The slot after an owner is otherwise
+/// indistinguishable from a raw backing file, and the guest's chain
+/// reader read it as one (issue #792). The guest checks the marks
+/// against `ChainConfig::data_devices_are_owned` before it reads.
+///
 /// Returns the number of device entries written.
 fn write_chain_device_entries(
     guest_mem: &GuestMemoryMmap,
@@ -3600,7 +3605,14 @@ fn write_chain_device_entries(
             image.format.to_shared_format_u32(),
             GuestAddress(dev_offset),
         )?;
-        guest_mem.write_obj(image.flags, GuestAddress(dev_offset + 4))?;
+        // The flags are the info operation's, which runs on the image's
+        // own bytes. The data device mark is the host's statement about
+        // a slot's role, so it is cleared here rather than trusted: an
+        // image must not be able to make the guest step over itself.
+        guest_mem.write_obj(
+            image.flags & !shared::ChainDeviceInfo::FLAG_DATA_DEVICE,
+            GuestAddress(dev_offset + 4),
+        )?;
         guest_mem.write_obj(image.virtual_size, GuestAddress(dev_offset + 8))?;
         guest_mem.write_obj(image.actual_size, GuestAddress(dev_offset + 16))?;
         guest_mem.write_obj(image.cluster_size, GuestAddress(dev_offset + 24))?;
@@ -3627,7 +3639,10 @@ fn write_chain_device_entries(
                 ImageFormat::Raw.to_shared_format_u32(),
                 GuestAddress(dev_offset),
             )?;
-            guest_mem.write_obj(0u32, GuestAddress(dev_offset + 4))?;
+            guest_mem.write_obj(
+                shared::ChainDeviceInfo::FLAG_DATA_DEVICE,
+                GuestAddress(dev_offset + 4),
+            )?;
             guest_mem.write_obj(data_file.extent_size, GuestAddress(dev_offset + 8))?;
             guest_mem.write_obj(data_size, GuestAddress(dev_offset + 16))?;
             guest_mem.write_obj(0u32, GuestAddress(dev_offset + 24))?;
@@ -3878,7 +3893,14 @@ fn write_chain_config_header(
 
     guest_mem.write_obj(CHAIN_CONFIG_MAGIC, GuestAddress(CHAIN_CONFIG_ADDR))?;
     guest_mem.write_obj(device_count as u32, GuestAddress(CHAIN_CONFIG_ADDR + 4))?;
-    guest_mem.write_obj(CHAIN_CONFIG_VERSION, GuestAddress(CHAIN_CONFIG_ADDR + 8))?;
+    // The version comes from the shared crate the guest is built
+    // against, not from a copy kept here: two definitions let a bump
+    // reach one side only, which is the skew the version exists to
+    // refuse.
+    guest_mem.write_obj(
+        shared::ChainConfig::VERSION,
+        GuestAddress(CHAIN_CONFIG_ADDR + 8),
+    )?;
     guest_mem.write_obj(segments.len() as u32, GuestAddress(CHAIN_CONFIG_ADDR + 12))?;
 
     let segments_base = CHAIN_CONFIG_ADDR + 528;
@@ -3946,6 +3968,105 @@ fn write_chain_config(
     debug!("Wrote chain config at 0x{CHAIN_CONFIG_ADDR:x} ({device_count} devices, 1 chain)");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod chain_config_writer_tests {
+    //! The chain config the host writes, read back as the guest's own
+    //! type and checked against the rule the guest checks it with.
+    use super::*;
+    use std::path::PathBuf;
+
+    fn image(format: ImageFormat, flags: u32, extents: &[u64]) -> ChainImage {
+        ChainImage {
+            path: PathBuf::from("/nonexistent/image"),
+            format,
+            virtual_size: 1 << 20,
+            actual_size: 1 << 20,
+            cluster_size: 0,
+            backing_file_raw: None,
+            flags,
+            external_data_files: extents
+                .iter()
+                .map(|&extent_size| ExternalDataFile {
+                    path: PathBuf::from("/nonexistent/data"),
+                    extent_size,
+                })
+                .collect(),
+        }
+    }
+
+    fn chain(images: Vec<ChainImage>) -> BackingChain {
+        let mut chain = BackingChain::new();
+        for image in images {
+            chain.push(image);
+        }
+        chain
+    }
+
+    #[test]
+    fn write_chain_device_entries_marks_every_data_device_and_nothing_else() {
+        let guest_mem =
+            GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(CHAIN_CONFIG_ADDR), 0x1000)])
+                .expect("guest memory");
+        // `compare`'s packing of two chains: a data-file qcow2 over a raw
+        // backing file, whose info flags claim the data device mark for
+        // the image itself, and a flat descriptor with two extents over
+        // a parent.
+        let chain1 = chain(vec![
+            image(
+                ImageFormat::Qcow2,
+                shared::ChainDeviceInfo::FLAG_DATA_DEVICE
+                    | shared::InfoResult::FLAG_HAS_EXTERNAL_DATA,
+                &[1 << 20],
+            ),
+            image(ImageFormat::Raw, 0, &[]),
+        ]);
+        let chain2 = chain(vec![
+            image(ImageFormat::VmdkDescriptor, 0, &[1 << 19, 1 << 19]),
+            image(ImageFormat::Raw, 0, &[]),
+        ]);
+        let devices_base = CHAIN_CONFIG_ADDR + 16;
+        let n1 = write_chain_device_entries(&guest_mem, &chain1, devices_base, 0).expect("chain 1");
+        let n2 =
+            write_chain_device_entries(&guest_mem, &chain2, devices_base, n1).expect("chain 2");
+        assert_eq!((n1, n2), (3, 4));
+        let segments = [
+            shared::ChainSegment { first: 0, count: 3 },
+            shared::ChainSegment { first: 3, count: 4 },
+        ];
+        write_chain_config_header(&guest_mem, n1 + n2, &segments).expect("header");
+
+        let mut bytes = [0u8; core::mem::size_of::<shared::ChainConfig>()];
+        guest_mem
+            .read_slice(&mut bytes, GuestAddress(CHAIN_CONFIG_ADDR))
+            .expect("read back");
+        // SAFETY: ChainConfig is repr(C) and made of integers only, so
+        // every bit pattern is a valid value; read_unaligned copies it
+        // out of a byte buffer with no alignment of its own.
+        let config: shared::ChainConfig =
+            unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const shared::ChainConfig) };
+
+        assert!(config.is_valid());
+        let marked: Vec<bool> = config.devices[..7]
+            .iter()
+            .map(|d| d.is_data_device())
+            .collect();
+        assert_eq!(marked, [false, true, false, false, true, true, false]);
+        assert_eq!(config.devices[0].data_device_idx, 1);
+        assert_eq!(config.devices[3].data_device_idx, 4);
+        // The info flags survive; only the mark an image cannot give
+        // itself is cleared.
+        assert_eq!(
+            config.devices[0].flags,
+            shared::InfoResult::FLAG_HAS_EXTERNAL_DATA
+        );
+        assert!(config.segmentation_covers(7));
+        assert!(
+            config.data_devices_are_owned(7),
+            "the guest must accept the layout the host writes"
+        );
+    }
 }
 
 /// Create a single-device BackingChain from image info for simple operations.

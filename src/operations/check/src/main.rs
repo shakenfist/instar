@@ -3380,7 +3380,8 @@ unsafe fn check_qcow2(
 
 /// Validate backing chain consistency.
 ///
-/// For each backing device (1..device_count):
+/// For each backing device (1..device_count, skipping the external data
+/// devices the host marks with `ChainDeviceInfo::FLAG_DATA_DEVICE`):
 /// 1. Read first sector and detect format
 /// 2. Cross-check format matches chain metadata from host
 /// 3. Cross-check virtual size consistency (overlay virtual size
@@ -3402,6 +3403,18 @@ unsafe fn validate_chain(
             Some(d) => d,
             None => break,
         };
+
+        // An external data device (a qcow2's data file, a VMDK flat
+        // descriptor's extent) shares the chain's device array but is
+        // not a backing image: it has no header of its own to
+        // cross-check, its bytes are guest data, and it is behind
+        // nothing. Validating it as a backing image reported a chain
+        // error whenever the guest's data happened to start with
+        // another format's magic, or the data file was empty, where
+        // qemu-img check reports none (#792).
+        if chain_dev.is_data_device() {
+            continue;
+        }
 
         // Get device capacity from call table
         let capacity = (call_table.get_input_capacity)(dev_idx as u32);

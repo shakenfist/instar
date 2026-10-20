@@ -6555,13 +6555,19 @@ mod tests {
     // one larger (the wide path), and the expected provenance is stated
     // per run of subclusters, in qemu's types.
     //
-    // The data device is addressed by `data_device_idx`, not by its
-    // place in the chain, so the harness keeps it out of the chain: an
-    // unallocated subcluster then descends to the backing device or
-    // reads zeros, which is qemu's answer (#792 is the host putting the
-    // data device in the chain, which this harness does not reproduce).
+    // The devices are laid out as the host lays them out: the qcow2 at
+    // 0, its data device (when the host attached one) at 1, marked with
+    // `FLAG_DATA_DEVICE` and inside the chain's segment, and the backing
+    // device after it. An earlier version of this harness kept the data
+    // device outside the chain, at an index the host never uses, and so
+    // could not see the reader read it as the backing file (#792): every
+    // test passed against a layout no real read ever had.
 
     const SC_MAX_DEVS: usize = 3;
+    /// Where the host puts a data-file image's data device: the slot
+    /// after the image. A test passes it as `data_device_idx`, and 0 for
+    /// a chain whose host attached none.
+    const SC_DATA_DEV: u32 = 1;
     /// 16 KiB clusters: 512-byte subclusters, so a 512-byte sector takes
     /// the narrow path and a 4096-byte sector the wide path.
     const SC_CLUSTER: u64 = 16384;
@@ -6747,9 +6753,8 @@ mod tests {
     ];
 
     /// The chain under test: device 0 is the qcow2 built from the entries
-    /// above, device 1 the backing device when `backing`, device 2 the
-    /// data device (always served; a test that names it sets
-    /// `data_device_idx` to 2).
+    /// above, then the data device when a test attaches it (see
+    /// `sc_read`), then the backing device when `backing`.
     struct ScChain {
         qcow2: std::vec::Vec<u8>,
         backing: Option<std::vec::Vec<u8>>,
@@ -6843,25 +6848,33 @@ mod tests {
         }
     }
 
-    /// Point the mock devices at the chain's buffers. The caller holds
-    /// `SC_LOCK` and clears them again with `sc_detach`.
-    unsafe fn sc_attach(chain: &ScChain, sector_size: usize) {
+    /// The device index of the chain's backing device, given whether the
+    /// host attached a data device in front of it.
+    fn sc_backing_idx(data_device: bool) -> usize {
+        1 + data_device as usize
+    }
+
+    /// Point the mock devices at the chain's buffers, with the data
+    /// device in the slot after the qcow2 when `data_device`. The caller
+    /// holds `SC_LOCK` and clears them again with `sc_detach`.
+    unsafe fn sc_attach(chain: &ScChain, sector_size: usize, data_device: bool) {
         let imgs = core::ptr::addr_of_mut!(SC_IMAGES) as *mut *const u8;
         let lens = core::ptr::addr_of_mut!(SC_LENS) as *mut usize;
+        for i in 0..SC_MAX_DEVS {
+            *imgs.add(i) = core::ptr::null();
+            *lens.add(i) = 0;
+        }
         *imgs = chain.qcow2.as_ptr();
         *lens = chain.qcow2.len();
-        match &chain.backing {
-            Some(b) => {
-                *imgs.add(1) = b.as_ptr();
-                *lens.add(1) = b.len();
-            }
-            None => {
-                *imgs.add(1) = core::ptr::null();
-                *lens.add(1) = 0;
-            }
+        if data_device {
+            *imgs.add(SC_DATA_DEV as usize) = chain.data.as_ptr();
+            *lens.add(SC_DATA_DEV as usize) = chain.data.len();
         }
-        *imgs.add(2) = chain.data.as_ptr();
-        *lens.add(2) = chain.data.len();
+        if let Some(b) = &chain.backing {
+            let at = sc_backing_idx(data_device);
+            *imgs.add(at) = b.as_ptr();
+            *lens.add(at) = b.len();
+        }
         SC_SSZ = sector_size;
         SC_ERR_CALLS = 0;
         SC_ERR_SECTOR = 0;
@@ -6879,6 +6892,12 @@ mod tests {
     /// Read `[virt_off, virt_off + len)` through the chain with the given
     /// sector size. The buffer starts as 0x33, a byte no device serves,
     /// so a byte the reader never wrote is visible.
+    ///
+    /// `data_device_idx` is what the host writes for the qcow2:
+    /// `SC_DATA_DEV` when it attached the data device, which then sits at
+    /// that index, marked, between the qcow2 and the backing device, in
+    /// one segment covering all three; 0 when it attached none, and the
+    /// backing device follows the qcow2 directly.
     fn sc_read(
         chain: &ScChain,
         data_device_idx: u32,
@@ -6886,8 +6905,14 @@ mod tests {
         virt_off: u64,
         len: u64,
     ) -> (bool, std::vec::Vec<u8>, ScErr) {
+        assert!(
+            data_device_idx == 0 || data_device_idx == SC_DATA_DEV,
+            "the host puts a data device in the slot after its owner"
+        );
+        let data_device = data_device_idx == SC_DATA_DEV;
+        let backing_idx = sc_backing_idx(data_device);
         let _guard = SC_LOCK.lock().unwrap();
-        unsafe { sc_attach(chain, sector_size) };
+        unsafe { sc_attach(chain, sector_size, data_device) };
         let call_table = sc_call_table();
         let mut l1_cache = std::vec![0u8; MAX_SECTOR_SIZE];
         let mut l2_cache = std::vec![0u8; MAX_SECTOR_SIZE];
@@ -6897,8 +6922,8 @@ mod tests {
         let mut backing_l2_cache = std::vec![0u8; MAX_SECTOR_SIZE];
         let bc = chain.backing_cluster;
         if bc != 0 {
-            chain_states.qcow2_states[1] = Some(Qcow2State {
-                device_idx: 1,
+            chain_states.qcow2_states[backing_idx] = Some(Qcow2State {
+                device_idx: backing_idx as u32,
                 cluster_size: bc,
                 cluster_bits: bc.trailing_zeros(),
                 l1_size: 1,
@@ -6916,21 +6941,34 @@ mod tests {
             });
         }
 
-        let chain_len = 1 + chain.backing.is_some() as usize;
+        let chain_len = 1 + data_device as usize + chain.backing.is_some() as usize;
         let mut chain_config = ChainConfig::single_chain(chain_len as u32);
         chain_config.devices[0].format = ImageFormat::Qcow2 as u32;
         chain_config.devices[0].cluster_size = SC_CLUSTER as u32;
         chain_config.devices[0].data_device_idx = data_device_idx;
+        if data_device {
+            // What the host writes for a data file: raw, marked, sized
+            // as the file.
+            let data = &mut chain_config.devices[SC_DATA_DEV as usize];
+            data.format = ImageFormat::Raw as u32;
+            data.flags = shared::ChainDeviceInfo::FLAG_DATA_DEVICE;
+            data.virtual_size = chain.data.len() as u64;
+        }
         if chain.backing.is_some() {
             let format = if bc != 0 {
                 ImageFormat::Qcow2
             } else {
                 ImageFormat::Raw
             };
-            chain_config.devices[1].format = format as u32;
-            chain_config.devices[1].cluster_size = bc as u32;
-            chain_config.devices[1].data_device_idx = 0;
+            chain_config.devices[backing_idx].format = format as u32;
+            chain_config.devices[backing_idx].cluster_size = bc as u32;
+            chain_config.devices[backing_idx].data_device_idx = 0;
         }
+        assert!(
+            chain_config.segmentation_covers(chain_len)
+                && chain_config.data_devices_are_owned(chain_len),
+            "the harness must build a config chain init accepts"
+        );
 
         let mut compressed_buf = std::vec![0u8; MAX_SECTOR_SIZE];
         let mut staging_buf = std::vec![0u8; MAX_SECTOR_SIZE];
@@ -6966,7 +7004,7 @@ mod tests {
     /// `ci` of the chain.
     fn sc_lookup(chain: &ScChain, sector_size: usize, ci: u64) -> Option<ClusterLookup> {
         let _guard = SC_LOCK.lock().unwrap();
-        unsafe { sc_attach(chain, sector_size) };
+        unsafe { sc_attach(chain, sector_size, false) };
         let call_table = sc_call_table();
         let mut l1_cache = std::vec![0u8; MAX_SECTOR_SIZE];
         let mut l2_cache = std::vec![0u8; MAX_SECTOR_SIZE];
@@ -7253,7 +7291,7 @@ mod tests {
         ));
         sc_assert_provenance(
             &chain,
-            2,
+            SC_DATA_DEV,
             2 * SC_CLUSTER,
             SC_CLUSTER,
             &[(Data(0), 32)],
@@ -7272,7 +7310,7 @@ mod tests {
         let runs = [(Data(0), 2), (Backing, 30)];
         sc_assert_provenance(
             &chain,
-            2,
+            SC_DATA_DEV,
             3 * SC_CLUSTER,
             SC_CLUSTER,
             &runs,
@@ -7286,7 +7324,7 @@ mod tests {
         let runs = [(Data(0), 2), (Zero, 30)];
         sc_assert_provenance(
             &chain,
-            2,
+            SC_DATA_DEV,
             3 * SC_CLUSTER,
             SC_CLUSTER,
             &runs,
@@ -7309,7 +7347,14 @@ mod tests {
         // not in the image.
         let chain = sc_chain(true, true, true);
         let runs = [(Data(SC_HOST_A), 8), (Zero, 8), (Backing, 16)];
-        sc_assert_provenance(&chain, 2, 0, SC_CLUSTER, &runs, "N Za Ua, data file");
+        sc_assert_provenance(
+            &chain,
+            SC_DATA_DEV,
+            0,
+            SC_CLUSTER,
+            &runs,
+            "N Za Ua, data file",
+        );
     }
 
     #[test]
@@ -7318,7 +7363,7 @@ mod tests {
         // invalid (qcow2.h:761-762), with or without a data file.
         for has_data_file in [false, true] {
             let chain = sc_chain(true, has_data_file, true);
-            let data_dev = if has_data_file { 2 } else { 0 };
+            let data_dev = if has_data_file { SC_DATA_DEV } else { 0 };
             assert!(matches!(
                 sc_lookup(&chain, SC_NARROW_SSZ, 4),
                 Some(ClusterLookup::Invalid)
@@ -7399,7 +7444,7 @@ mod tests {
         ));
         sc_assert_provenance(
             &chain,
-            2,
+            SC_DATA_DEV,
             0,
             SC_CLUSTER,
             &[(Data(0), 32)],
@@ -7407,7 +7452,7 @@ mod tests {
         );
         sc_assert_provenance(
             &chain,
-            2,
+            SC_DATA_DEV,
             SC_CLUSTER,
             SC_CLUSTER,
             &[(Data(SC_HOST_A), 32)],
@@ -7415,7 +7460,7 @@ mod tests {
         );
         sc_assert_provenance(
             &chain,
-            2,
+            SC_DATA_DEV,
             2 * SC_CLUSTER,
             SC_CLUSTER,
             &[(Backing, 32)],
@@ -7444,6 +7489,139 @@ mod tests {
             &[(Child(SC_HOST_A), 32)],
             "classic host A, no data file",
         );
+    }
+
+    /// Overwrite virtual cluster `ci`'s extended L2 entry.
+    fn sc_set_entry(chain: &mut ScChain, ci: u64, entry: u64, bitmap: u64) {
+        assert!(
+            chain.extended_l2,
+            "an extended L2 entry needs an extended image"
+        );
+        let at = SC_L2_OFF as usize + ci as usize * 16;
+        chain.qcow2[at..at + 8].copy_from_slice(&entry.to_be_bytes());
+        chain.qcow2[at + 8..at + 16].copy_from_slice(&bitmap.to_be_bytes());
+    }
+
+    #[test]
+    fn sc_issue_792_unallocated_cluster_in_a_data_file_image_reads_the_backing_file() {
+        // #792: the host puts a data-file image's data device in the
+        // slot after the image, so the next device the reader tried for
+        // a cluster the image leaves unallocated was the data file, read
+        // at the virtual offset as though it were a raw backing file.
+        // qemu reads the backing file. Classic L2: cluster 2 has no
+        // entry.
+        let chain = sc_chain(false, true, true);
+        assert!(matches!(
+            sc_lookup(&chain, SC_NARROW_SSZ, 2),
+            Some(ClusterLookup::Unallocated)
+        ));
+        sc_assert_provenance(
+            &chain,
+            SC_DATA_DEV,
+            2 * SC_CLUSTER,
+            SC_CLUSTER,
+            &[(Backing, 32)],
+            "#792, classic",
+        );
+        // Extended L2: every subcluster unallocated, with and without a
+        // host cluster, is a whole-cluster Unallocated verdict, and the
+        // same `continue` to the next device.
+        for (entry, label) in [
+            (0, "#792, extended, no host cluster"),
+            (OFLAG_COPIED | SC_HOST_A, "#792, extended, host cluster"),
+        ] {
+            let mut chain = sc_chain(true, true, true);
+            sc_set_entry(&mut chain, 1, entry, 0);
+            assert!(
+                matches!(
+                    sc_lookup(&chain, SC_NARROW_SSZ, 1),
+                    Some(ClusterLookup::Unallocated)
+                ),
+                "{label}"
+            );
+            sc_assert_provenance(
+                &chain,
+                SC_DATA_DEV,
+                SC_CLUSTER,
+                SC_CLUSTER,
+                &[(Backing, 32)],
+                label,
+            );
+        }
+    }
+
+    #[test]
+    fn sc_issue_792_unallocated_cluster_without_a_backing_file_reads_zeros() {
+        // #792's second case: with no backing file the data device was
+        // the last device in the chain, so a cluster qemu reads as zeros
+        // came back as whatever the data file held at that offset, which
+        // `data_file_raw=off` leaves unrelated to the guest's disk.
+        let chain = sc_chain(false, true, false);
+        sc_assert_provenance(
+            &chain,
+            SC_DATA_DEV,
+            2 * SC_CLUSTER,
+            SC_CLUSTER,
+            &[(Zero, 32)],
+            "#792, classic, no backing",
+        );
+        for (entry, label) in [
+            (0, "#792, extended, no host cluster, no backing"),
+            (
+                OFLAG_COPIED | SC_HOST_A,
+                "#792, extended, host cluster, no backing",
+            ),
+        ] {
+            let mut chain = sc_chain(true, true, false);
+            sc_set_entry(&mut chain, 1, entry, 0);
+            sc_assert_provenance(
+                &chain,
+                SC_DATA_DEV,
+                SC_CLUSTER,
+                SC_CLUSTER,
+                &[(Zero, 32)],
+                label,
+            );
+        }
+    }
+
+    #[test]
+    fn sc_issue_792_unallocated_subcluster_runs_descend_past_the_data_device() {
+        // The reader's other way down the chain: a run of unallocated
+        // subclusters in a mixed cluster re-enters the reader at the next
+        // device, which is the data device too. With a backing file the
+        // run must read it, and without one, zeros.
+        for (backing, unalloc, label) in [(true, Backing, "backing"), (false, Zero, "no backing")] {
+            let chain = sc_chain(true, true, backing);
+            // #654's entry: subcluster 0 zero, the rest unallocated.
+            sc_assert_provenance(
+                &chain,
+                SC_DATA_DEV,
+                SC_CLUSTER,
+                SC_CLUSTER,
+                &[(Zero, 1), (unalloc, 31)],
+                &std::format!("#654's entry in a data-file image, {label}"),
+            );
+            // A Normal run read from the data file, a zero run, and an
+            // unallocated run, whole and as a window inside the last.
+            let runs = [(Data(SC_HOST_A), 8), (Zero, 8), (unalloc, 16)];
+            sc_assert_provenance(
+                &chain,
+                SC_DATA_DEV,
+                0,
+                SC_CLUSTER,
+                &runs,
+                &std::format!("N Za Ua in a data-file image, {label}"),
+            );
+            sc_assert_provenance(
+                &chain,
+                SC_DATA_DEV,
+                8192 + 100,
+                3000,
+                &runs,
+                &std::format!("a window in the unallocated run, {label}"),
+            );
+        }
     }
 
     #[test]
@@ -13925,6 +14103,54 @@ mod tests {
         SEG_ERR_CALLS += 1;
     }
 
+    /// Every device serves a valid qcow2 header in sector 0 and zeros
+    /// after it, over a capacity that covers the header's L1 table, so
+    /// a qcow2 device initialises and a refusal can only come from the
+    /// config.
+    unsafe extern "C" fn seg_read_sector(
+        _device_idx: u32,
+        sector: u64,
+        out_buf: *mut u8,
+        sector_size: usize,
+    ) -> bool {
+        if sector >= SEG_CAPACITY {
+            return false;
+        }
+        core::ptr::write_bytes(out_buf, 0, sector_size);
+        if sector == 0 {
+            let header = make_qcow2_header();
+            core::ptr::copy_nonoverlapping(header.as_ptr(), out_buf, header.len().min(sector_size));
+        }
+        true
+    }
+
+    /// 512 KiB of 512-byte sectors: past make_qcow2_header's L1 table.
+    const SEG_CAPACITY: u64 = 1024;
+
+    unsafe extern "C" fn seg_capacity(_device_idx: u32) -> u64 {
+        SEG_CAPACITY
+    }
+
+    /// One device as the host describes it to chain init: its format,
+    /// whether it carries `FLAG_DATA_DEVICE`, and its `data_device_idx`.
+    #[derive(Clone, Copy)]
+    struct InitDev(ImageFormat, bool, u32);
+
+    /// A layer: an image with no data device of its own.
+    fn layer(format: ImageFormat) -> InitDev {
+        InitDev(format, false, 0)
+    }
+
+    /// An image whose data device, or first extent, is `data_device_idx`.
+    fn owner(format: ImageFormat, data_device_idx: u32) -> InitDev {
+        InitDev(format, false, data_device_idx)
+    }
+
+    /// A data device, written as the host writes one: raw and marked.
+    fn data_dev() -> InitDev {
+        InitDev(ImageFormat::Raw, true, 0)
+    }
+
     /// Run chain init over `device_count` raw devices with the given
     /// segmentation, and report whether it succeeded, how many typed
     /// errors it raised, and what it said.
@@ -13933,12 +14159,26 @@ mod tests {
         segment_count: u32,
         segments: &[(u32, u32)],
     ) -> (bool, u32, std::string::String) {
+        let devices = std::vec![layer(ImageFormat::Raw); device_count as usize];
+        run_chain_init(&devices, segment_count, segments)
+    }
+
+    /// Run chain init over `devices` with the given segmentation, and
+    /// report as `run_seg_init` does.
+    fn run_chain_init(
+        devices: &[InitDev],
+        segment_count: u32,
+        segments: &[(u32, u32)],
+    ) -> (bool, u32, std::string::String) {
         let _guard = SEG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let call_table = shared::CallTable {
             send_error: seg_send_err,
             debug_print: seg_dbg,
+            read_input_sector: seg_read_sector,
+            get_input_capacity: seg_capacity,
             ..stub_call_table()
         };
+        let device_count = devices.len() as u32;
 
         let mut chain_config = ChainConfig::new();
         chain_config.device_count = device_count;
@@ -13949,8 +14189,13 @@ mod tests {
                 count: *count,
             };
         }
-        for dev_idx in 0..device_count as usize {
-            chain_config.devices[dev_idx].format = ImageFormat::Raw as u32;
+        for (dev_idx, &InitDev(format, marked, data_device_idx)) in devices.iter().enumerate() {
+            let info = &mut chain_config.devices[dev_idx];
+            info.format = format as u32;
+            if marked {
+                info.flags = shared::ChainDeviceInfo::FLAG_DATA_DEVICE;
+            }
+            info.data_device_idx = data_device_idx;
         }
 
         let mut chain_states = ChainStates::default();
@@ -14043,6 +14288,361 @@ mod tests {
             );
             assert_eq!(calls, 0, "{label} must not raise the differencing refusal");
         }
+    }
+
+    // ========================================================================
+    // Where external data devices may sit (#792)
+    //
+    // The host marks each data device and puts it in the slots after its
+    // owner. The chain reader steps over marked devices and reaches them
+    // only through `data_device_idx`, so chain init checks the layout
+    // with `ChainConfig::data_devices_are_owned` before any read. Each
+    // refusal test holds at least one config that breaks exactly one of
+    // that rule's clauses and keeps the others, so dropping any clause
+    // lets a config through and fails the test that names it.
+    // ========================================================================
+
+    /// Assert chain init refuses `devices` over `segments`, says the
+    /// data device layout is why, and raises no typed refusal.
+    fn assert_data_device_layout_refused(
+        devices: &[InitDev],
+        segments: &[(u32, u32)],
+        label: &str,
+    ) {
+        let (ok, calls, msg) = run_chain_init(devices, segments.len() as u32, segments);
+        assert!(!ok, "{label} must not initialise");
+        assert!(
+            msg.contains("data devices are not where the host puts them"),
+            "{label} must say why, said {msg:?}"
+        );
+        // Not a typed refusal: those describe the user's image, and this
+        // is instar disagreeing with itself about the config.
+        assert_eq!(calls, 0, "{label} must not raise a typed refusal");
+    }
+
+    #[test]
+    fn init_chain_states_accepts_every_data_device_layout_the_host_writes() {
+        use ImageFormat::{Qcow2, Raw, VmdkDescriptor};
+        for (devices, segments, label) in [
+            (
+                &[owner(Qcow2, 1), data_dev()][..],
+                &[(0u32, 2u32)][..],
+                "a data-file image",
+            ),
+            (
+                &[owner(Qcow2, 1), data_dev(), layer(Raw)][..],
+                &[(0, 3)][..],
+                "a data-file image over a raw backing file",
+            ),
+            (
+                &[owner(Qcow2, 1), data_dev(), layer(Qcow2)][..],
+                &[(0, 3)][..],
+                "a data-file image over a qcow2 backing file",
+            ),
+            (
+                &[owner(VmdkDescriptor, 1), data_dev(), data_dev()][..],
+                &[(0, 3)][..],
+                "a flat descriptor with two extents",
+            ),
+            (
+                &[
+                    owner(Qcow2, 1),
+                    data_dev(),
+                    owner(VmdkDescriptor, 3),
+                    data_dev(),
+                ][..],
+                &[(0, 4)][..],
+                "a data-file image over a flat descriptor",
+            ),
+            (
+                &[
+                    owner(Qcow2, 1),
+                    data_dev(),
+                    layer(Raw),
+                    owner(Qcow2, 4),
+                    data_dev(),
+                ][..],
+                &[(0, 3), (3, 2)][..],
+                "compare of two data-file images",
+            ),
+            (
+                &[
+                    owner(VmdkDescriptor, 1),
+                    data_dev(),
+                    owner(Qcow2, 3),
+                    data_dev(),
+                ][..],
+                &[(0, 2), (2, 2)][..],
+                "compare of a flat descriptor and a data-file image",
+            ),
+        ] {
+            let (ok, calls, msg) = run_chain_init(devices, segments.len() as u32, segments);
+            assert!(ok, "{label} must initialise, said {msg:?}");
+            assert_eq!(calls, 0, "{label} must raise nothing");
+        }
+    }
+
+    #[test]
+    fn init_chain_states_refuses_a_data_device_at_the_top_of_a_chain() {
+        use ImageFormat::{Qcow2, Raw, VmdkDescriptor};
+        // compare's layout with the second chain's top image marked and
+        // named by the last device of the first chain, so it is claimed
+        // and only the clause about a chain's top device refuses it. Read
+        // with the mark, the second chain would have no layer at all.
+        assert_data_device_layout_refused(
+            &[owner(Qcow2, 1), data_dev(), layer(Raw)],
+            &[(0, 1), (1, 2)],
+            "a qcow2's data device at the top of the next chain",
+        );
+        // The same through a descriptor's run of extents, which would
+        // otherwise run on into the next chain.
+        assert_data_device_layout_refused(
+            &[owner(VmdkDescriptor, 1), data_dev(), data_dev(), layer(Raw)],
+            &[(0, 2), (2, 2)],
+            "a descriptor's extent run reaching the top of the next chain",
+        );
+        assert_data_device_layout_refused(&[data_dev()], &[(0, 1)], "a marked device 0");
+    }
+
+    #[test]
+    fn init_chain_states_refuses_a_data_device_index_on_a_device_that_cannot_own_one() {
+        use ImageFormat::{Qcow2, Raw};
+        // Only a qcow2's header names a data file, and only a VMDK
+        // descriptor names extents.
+        assert_data_device_layout_refused(
+            &[owner(Raw, 1), data_dev()],
+            &[(0, 2)],
+            "a raw image naming a data device",
+        );
+        // A data device has no metadata, so it names nothing, even when
+        // the host has written it with a qcow2's format.
+        assert_data_device_layout_refused(
+            &[owner(Qcow2, 1), InitDev(Qcow2, true, 2), data_dev()],
+            &[(0, 3)],
+            "a data device naming another",
+        );
+    }
+
+    #[test]
+    fn init_chain_states_refuses_a_data_device_index_that_misses_the_next_slot() {
+        use ImageFormat::{Qcow2, Raw};
+        // The slot named is a layer: the reader would serve a backing
+        // file's bytes as the image's data file.
+        assert_data_device_layout_refused(
+            &[owner(Qcow2, 1), layer(Raw)],
+            &[(0, 2)],
+            "a data device index naming an unmarked device",
+        );
+        // A marked device, but not in the slot after its owner, which is
+        // the only place the host puts one. The device in between is a
+        // layer the walk would reach before the data file, behind an
+        // image that has a data file of its own.
+        assert_data_device_layout_refused(
+            &[owner(Qcow2, 2), layer(Raw), data_dev()],
+            &[(0, 3)],
+            "a data device two slots after its owner",
+        );
+        // A slot outside the devices being walked.
+        assert_data_device_layout_refused(
+            &[layer(Raw), owner(Qcow2, 2)],
+            &[(0, 2)],
+            "a data device index past the last device",
+        );
+        // A slot before the owner.
+        assert_data_device_layout_refused(
+            &[owner(Qcow2, 1), data_dev(), owner(Qcow2, 1)],
+            &[(0, 3)],
+            "a data device index naming an earlier slot",
+        );
+    }
+
+    #[test]
+    fn init_chain_states_refuses_a_data_device_no_image_claims() {
+        use ImageFormat::{Qcow2, Raw};
+        // A marked backing slot that nothing names: the reader would
+        // step over the base of the chain and read zeros in its place.
+        assert_data_device_layout_refused(
+            &[layer(Qcow2), layer(Raw), data_dev()],
+            &[(0, 3)],
+            "an unclaimed marked device",
+        );
+    }
+
+    #[test]
+    fn init_chain_states_refuses_a_second_data_device_after_a_qcow2() {
+        use ImageFormat::{Qcow2, Raw};
+        // A qcow2 has one data file. A marked device after it is claimed
+        // by nobody, unlike a descriptor's second extent.
+        assert_data_device_layout_refused(
+            &[owner(Qcow2, 1), data_dev(), data_dev()],
+            &[(0, 3)],
+            "two marked devices after a qcow2",
+        );
+        assert_data_device_layout_refused(
+            &[owner(Qcow2, 1), data_dev(), data_dev(), layer(Raw)],
+            &[(0, 4)],
+            "two marked devices after a qcow2, over a backing file",
+        );
+    }
+
+    // ========================================================================
+    // The VMDK flat descriptor's extent walk
+    //
+    // A descriptor's content is its extents, on the data devices the host
+    // attaches after it. A read past the last extent must stop there and
+    // read zeros, as qemu does, rather than take the next device -- the
+    // descriptor's parent, or under `compare` the other input's top
+    // image -- as one more extent.
+    // ========================================================================
+
+    /// Bytes for a test extent or image: `tag` in the high nibble, the
+    /// 512-byte sector number in the low one, so a read at the wrong
+    /// device or the wrong offset shows.
+    fn desc_bytes(tag: u8, len: usize) -> std::vec::Vec<u8> {
+        (0..len).map(|i| tag | ((i / 512) % 16) as u8).collect()
+    }
+
+    /// Read `len` bytes at `virt_off` through a VMDK flat descriptor at
+    /// device 0, whose extents start at device 1. `devices` are devices
+    /// 1 and 2: whether the host marked each as a data device, and its
+    /// bytes. The descriptor's chain is `segments[0]`.
+    fn desc_read(
+        devices: &[(bool, &[u8])],
+        segments: &[(u32, u32)],
+        virt_off: u64,
+        len: u64,
+    ) -> (bool, std::vec::Vec<u8>) {
+        assert!(devices.len() < SC_MAX_DEVS);
+        let device_count = 1 + devices.len();
+        // The descriptor's own bytes are text the reader never reads.
+        let descriptor = std::vec![b'#'; 512];
+
+        let mut chain_config = ChainConfig::new();
+        chain_config.device_count = device_count as u32;
+        chain_config.segment_count = segments.len() as u32;
+        for (i, &(first, count)) in segments.iter().enumerate() {
+            chain_config.segments[i] = shared::ChainSegment { first, count };
+        }
+        chain_config.devices[0].format = ImageFormat::VmdkDescriptor as u32;
+        chain_config.devices[0].data_device_idx = 1;
+        let mut extents = 0u64;
+        for (i, &(marked, bytes)) in devices.iter().enumerate() {
+            let info = &mut chain_config.devices[1 + i];
+            info.format = ImageFormat::Raw as u32;
+            info.virtual_size = bytes.len() as u64;
+            if marked {
+                info.flags = shared::ChainDeviceInfo::FLAG_DATA_DEVICE;
+                extents += bytes.len() as u64;
+            }
+        }
+        chain_config.devices[0].virtual_size = extents;
+        assert!(
+            chain_config.segmentation_covers(device_count)
+                && chain_config.data_devices_are_owned(device_count),
+            "the harness must build a config chain init accepts"
+        );
+
+        let _guard = SC_LOCK.lock().unwrap();
+        unsafe {
+            let imgs = core::ptr::addr_of_mut!(SC_IMAGES) as *mut *const u8;
+            let lens = core::ptr::addr_of_mut!(SC_LENS) as *mut usize;
+            *imgs = descriptor.as_ptr();
+            *lens = descriptor.len();
+            for (i, &(_, bytes)) in devices.iter().enumerate() {
+                *imgs.add(1 + i) = bytes.as_ptr();
+                *lens.add(1 + i) = bytes.len();
+            }
+            SC_SSZ = 512;
+        }
+        let call_table = sc_call_table();
+        let mut chain_states = ChainStates::default();
+        let mut compressed_buf = std::vec![0u8; MAX_SECTOR_SIZE];
+        let mut staging_buf = std::vec![0u8; MAX_SECTOR_SIZE];
+        let mut staging_cluster_offset = u64::MAX;
+        let mut buf = std::vec![0x33u8; len as usize];
+        let mut bytes_read = 0u64;
+        let ok = unsafe {
+            read_chain_virtual_cluster(
+                &call_table,
+                0,
+                segments[0].1 as usize,
+                virt_off,
+                buf.as_mut_ptr(),
+                len,
+                512,
+                &chain_config,
+                &mut chain_states,
+                compressed_buf.as_mut_ptr(),
+                staging_buf.as_mut_ptr(),
+                &mut staging_cluster_offset,
+                None,
+                None,
+                0,
+                &mut bytes_read,
+            )
+        };
+        unsafe { sc_detach() };
+        (ok, buf)
+    }
+
+    #[test]
+    fn vmdk_descriptor_extent_walk_stops_at_its_last_extent() {
+        let extent = desc_bytes(0xA0, 65536);
+        let next = desc_bytes(0x50, 131072);
+        for (segments, label) in [
+            // compare's layout: the descriptor and its extent are one
+            // input's chain and the next device is the other input's top
+            // image. A qcow2 overlay larger than the descriptor it sits
+            // on reads here, so `compare` said the two inputs differed in
+            // one argument order and were identical in the other.
+            (
+                &[(0u32, 2u32), (2, 1)][..],
+                "the next device in another chain",
+            ),
+            // The descriptor's parent, which the host follows a parent
+            // hint to.
+            (&[(0, 3)][..], "the descriptor's parent"),
+        ] {
+            let (ok, got) = desc_read(
+                &[(true, &extent[..]), (false, &next[..])],
+                segments,
+                0,
+                4096,
+            );
+            assert!(ok, "{label}: a read inside the extent must succeed");
+            assert_eq!(got, extent[..4096], "{label}: inside the extent");
+
+            let (ok, got) = desc_read(
+                &[(true, &extent[..]), (false, &next[..])],
+                segments,
+                65536,
+                4096,
+            );
+            assert!(ok, "{label}: a read past the last extent must succeed");
+            assert!(
+                got.iter().all(|&b| b == 0),
+                "{label}: past the last extent is zeros, not the next device's bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn vmdk_descriptor_reads_each_of_its_extents() {
+        // Two extents: the walk crosses the first into the second, at the
+        // second's own offset, and stops after it.
+        let first = desc_bytes(0xA0, 16384);
+        let second = desc_bytes(0xB0, 16384);
+        let devices = [(true, &first[..]), (true, &second[..])];
+        let segments = [(0u32, 3u32)];
+        let (ok, got) = desc_read(&devices, &segments, 4096, 4096);
+        assert!(ok);
+        assert_eq!(got, first[4096..8192], "inside the first extent");
+        let (ok, got) = desc_read(&devices, &segments, 16384 + 1024, 2048);
+        assert!(ok);
+        assert_eq!(got, second[1024..3072], "inside the second extent");
+        let (ok, got) = desc_read(&devices, &segments, 32768, 4096);
+        assert!(ok);
+        assert!(got.iter().all(|&b| b == 0), "past both extents");
     }
 }
 
@@ -15134,6 +15734,8 @@ fn parent_in_chain(chain_config: &ChainConfig, dev_idx: usize) -> bool {
 ///   present block, and descends for the runs of logical sectors the
 ///   bitmap leaves to the parent image.
 /// - Raw/other: read sectors directly (base of chain).
+/// - A device marked [`shared::ChainDeviceInfo::FLAG_DATA_DEVICE`] is
+///   skipped: it is an owner's data file or extent, not a layer (#792).
 ///
 /// If all devices have the cluster unallocated, fills with zeros.
 ///
@@ -15179,6 +15781,29 @@ pub unsafe fn read_chain_virtual_cluster(
 ) -> bool {
     for dev_offset in 0..chain_len {
         let dev_idx = chain_start + dev_offset;
+        // An external data device sits in its owner's segment, in the
+        // slot after the owner, but it is not a layer: its bytes are the
+        // owner's clusters at the owner's host offsets, reached through
+        // the owner's `data_device_idx`, never a lower image at the
+        // virtual offset. It falls to the raw arm below, so without this
+        // a cluster the owner leaves unallocated read the data file
+        // instead of the backing file or zeros, under success (#792).
+        //
+        // Every layer advance in this function passes through this loop
+        // head: a `continue` reaches the next iteration, and a descent
+        // re-enters the function at the next device. So one check here
+        // covers every format arm, and nothing below needs to know that
+        // data devices exist. A descent into a run of nothing but data
+        // devices skips them all and reaches the zero fill at the
+        // bottom, which is the right answer at the bottom of a qcow2
+        // chain. The arms whose bottom-of-chain answer is a refusal
+        // instead (a differencing VHD or VHDX) never have a data device
+        // behind them: `init_chain_states` refuses a config in which a
+        // data device follows anything but its owner or the owner's
+        // other data devices (`ChainConfig::data_devices_are_owned`).
+        if chain_config.devices[dev_idx].is_data_device() {
+            continue;
+        }
         let format = chain_config.devices[dev_idx].detected_format();
         let cap = (call_table.get_input_capacity)(dev_idx as u32);
 
@@ -16851,9 +17476,22 @@ pub unsafe fn read_chain_virtual_cluster(
 
                 // Walk data devices to find which extent holds
                 // the requested virtual offset.
+                //
+                // The extents are the run of marked data devices that
+                // starts at data_device_idx, and the walk stops at the
+                // first device that is not one. Before the mark it ran
+                // on until a zero virtual_size or the end of the array,
+                // so a read past the last extent took whatever device
+                // came next -- the descriptor's parent, or under
+                // `compare` the other input's top image -- as one more
+                // extent and served its raw bytes, under success.
+                // qemu reads zeros there. `init_chain_states` checks
+                // that the run is where the host put it.
                 let mut remaining = virtual_offset;
                 let mut d = first_data_dev;
-                while (d as usize) < chain_config.device_count as usize {
+                while (d as usize) < chain_config.device_count as usize
+                    && chain_config.devices[d as usize].is_data_device()
+                {
                     let ext_size = chain_config.devices[d as usize].virtual_size;
                     if ext_size == 0 {
                         break; // End of data devices
@@ -17172,6 +17810,25 @@ pub unsafe fn init_chain_states(
     if !chain_config.segmentation_covers(device_count) {
         (call_table.debug_print)(
             b"init_chain_states: chain config segments do not cover the devices\n\0".as_ptr(),
+        );
+        return false;
+    }
+    // The chain reader steps over every device marked as an external
+    // data device, and reaches one only through its owner's
+    // `data_device_idx`. Both only work if the marks are where the host
+    // puts data devices: a mark anywhere else drops a layer from the
+    // walk, and a `data_device_idx` naming an unmarked device reads a
+    // layer as an owner's data file or extent. Check the layout here,
+    // once, so the reader can trust it (#792).
+    //
+    // A plain failure, for the same reason as the segmentation check
+    // above: the host writes both fields, so a config that breaks the
+    // rule is instar disagreeing with itself, not a property of the
+    // user's image.
+    if !chain_config.data_devices_are_owned(device_count) {
+        (call_table.debug_print)(
+            b"init_chain_states: chain config data devices are not where the host puts them\n\0"
+                .as_ptr(),
         );
         return false;
     }
