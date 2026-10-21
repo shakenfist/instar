@@ -502,6 +502,9 @@ class TestVhdxStructureMalformed(_VhdxTestCase):
                         f.seek(at)
                         f.write(value)
                         f.flush()
+                        # Either outcome is fine: some fields tolerate any
+                        # value, others make the image unreadable. What
+                        # must never happen is any other exception.
                         try:
                             parse_vhdx(path)
                         except VhdxParseError:

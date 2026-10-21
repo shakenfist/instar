@@ -62,6 +62,9 @@ def measure_version(qemu_img: str, version: str, case_names: list, scratch: str)
     results = {}
     for name in case_names:
         results[name] = qemu_pins.run_case(qemu_img, name, workdir)
+    # run_case removes each case's own directory, so the version directory
+    # is normally empty by now. Removing it is tidying, not correctness:
+    # if anything else is in it, leave it for the operator to look at.
     try:
         workdir.rmdir()
     except OSError:

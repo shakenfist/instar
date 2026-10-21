@@ -27,6 +27,7 @@ Stdlib only, and nothing from `tests/base.py`, so that
 `tests/` on `sys.path`.
 """
 
+import contextlib
 import copy
 import difflib
 import json
@@ -327,8 +328,8 @@ def volatile_mask(paths: List[Path]) -> set:
     file are not in the mask; a length difference is reported separately.
     """
     mask = set()
-    handles = [open(path, 'rb') for path in paths]
-    try:
+    with contextlib.ExitStack() as stack:
+        handles = [stack.enter_context(open(path, 'rb')) for path in paths]
         offset = 0
         while True:
             chunks = [handle.read(COMPARE_CHUNK) for handle in handles]
@@ -339,9 +340,6 @@ def volatile_mask(paths: List[Path]) -> set:
             if min(len(chunk) for chunk in chunks) < COMPARE_CHUNK:
                 return mask
             offset += COMPARE_CHUNK
-    finally:
-        for handle in handles:
-            handle.close()
 
 
 def text_regions(path: Path) -> List[Tuple[int, int]]:
