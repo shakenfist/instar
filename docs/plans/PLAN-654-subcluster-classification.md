@@ -719,10 +719,12 @@ chosen to defer to here, so that we do not forget them.
   reachability probe so it cannot pass vacuously, is the follow-up
   #654's comment argues for. It also touches the three fuzz-target
   lists that #651 says nothing cross-checks.
-* **check's allocation count on data-file images.** On row C's image
+* **check's total cluster count** (#814). On row C's image
   `instar check` reports `3/4097` clusters allocated where
-  `qemu-img check` reports `3/16`. That is unrelated to classification,
-  so it is not fixed here.
+  `qemu-img check` reports `3/16`. The push audit found the denominator
+  is one higher than qemu's on every qcow2 image, not only data-file
+  ones (`2/8193` against `1/8192` on a plain image). That is unrelated
+  to classification, so it is not fixed here.
 * **Write paths that misread host offset 0 on classic L2.** Phase 1's
   step 1a measured two, both on qemu-written images and both exiting
   0: `resize --shrink` zeroes the header cluster's refcount when a
@@ -752,11 +754,19 @@ chosen to defer to here, so that we do not forget them.
   backing file of a larger qcow2, serving the parent's raw bytes. The
   extent-walk bound that fixes it has a crate test and a mutation case,
   but no fixture drives it end to end (#810's review, item 6).
-* **qemu's data-file offset check.** qemu refuses a data-file entry
-  whose host offset differs from its guest offset
-  (`block/qcow2-cluster.c:696-704`), and a compressed entry in a
-  data-file image. Phase 1 filed both as #803, and phase 2 takes it
-  (that phase's D5).
+* **qemu's other host-offset checks** (#812). qemu refuses an
+  unaligned host cluster offset in any image
+  (`block/qcow2-cluster.c:686-694`) and a zero flag in a pre-v3 image
+  (`:657-664`). Both checks sit in `qcow2_get_host_offset()`, not in the
+  classifier this plan transcribed. instar reads both: `map` reports
+  the unaligned cluster as data, and `convert` serves zeros for the v2
+  one. Found by the push audit.
+* **The ZSTD backing-chain tests never run** (#813). Their capability
+  probe writes to `/dev/null`, which fails whatever qemu supports.
+* **commit's data-file refusal blames the overlay** (#815) when it is
+  the backing file that owns the data file.
+* **map renders an unknown extent state from the guest as data**
+  (#816), the guest's own `"unknown"` fallback included.
 
 ### Bugs fixed during this work
 

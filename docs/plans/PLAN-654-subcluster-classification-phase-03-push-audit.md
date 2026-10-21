@@ -316,6 +316,170 @@ Four high-effort agents are the expensive part of this phase, and if
 step 2 shows a mutation case surviving or a fixture skipping, the
 briefs should change before they run.
 
+## Audit findings
+
+All four judgment reports came back with no critical or high finding,
+and the code reviewers raised no blocking finding. The documentation
+review raised four blocking findings, all pages this plan made false.
+So the audit has findings: the plan stays `In progress` and the fixes
+land as one follow-up pull request after this one merges (Decision 6).
+
+Each finding below says what was re-measured, and by whom. The reports'
+full text is not kept here; their scratch artefacts were on Kasm and
+are not part of the record.
+
+### For the follow-up pull request
+
+Defects this plan introduced, or made true by changing the code under
+them. Labels: **D** documentation, **C** code, **T** tests.
+
+| # | Finding | Source | Verified |
+|---|---|---|---|
+| D1 | `docs/chain-config.md:322` gives `ChainConfig::VERSION = 3`; the code says 4 (`src/shared/src/lib.rs:5139`). Blocking. | 3c | management session, read |
+| D2 | `docs/quirks.md:4859` heads the entry "two related data-file shapes still diverge", but its body (`:4904-4915`) says both are now refused by name. Blocking. | 3c | management session, read |
+| D3 | `docs/check.md:31` lists "host-without-ref" as a validated bitmap shape. Phase 1 deliberately stopped reporting it, since qemu accepts it (`src/crates/qcow2/src/lib.rs:1713-1715`). Blocking. | 3c | management session, read |
+| D4 | `docs/map.md` predates phase 1's map changes, and the page is outside the audit scope because neither pull request touched it. It says `offset` is omitted when `present` is false, but `hole-at` carries one (`:81`). It documents three states, but the parser emits five (`:100-107`). It never says map refuses invalid and data-file entries. It says standard-L2 `QCOW_OFLAG_ZERO` is not honoured, but `map_state_for` (`src/crates/qcow2/src/lib.rs:2144`) honours it (`:120-127,228-234,277`). Blocking. | 3c | management session, read |
+| D5 | `docs/format-coverage.md:872-873` says compressed clusters "remain in the metadata device", but in a data-file image they are refused. | 3c | — |
+| D6 | `docs/testing.md:2356` calls the subcluster group "the first of the two groups not about a differencing format", but two more follow. Fix with it the pre-existing "26 writer cases" at `:2475` against twenty-seven at `:2184`. | 3c | — |
+| D7 | `docs/qcow2/qcow2-l1l2-tables.md:125-137`: the `get_cluster_type` pseudocode omits the extended-L2 zero-bit rule and the data-file `COPIED` rule that this plan's classifier transcribes, so it contradicts the new text from `:238` onwards. | 3c | — |
+| D8 | `docs/vmdk/vmdk-extents.md:258` says a monolithicFlat descriptor with `parentFileNameHint` is rejected. `docs/format-coverage.md:343` says it is followed, and step 2a of phase 2 measured it being followed. Pre-existing text, but this plan's measurement is what proves it wrong. | 3c | management session, read |
+| C1 | The two refusals carry different offsets for the same entry. The reader's invalid-entry refusal sends the chunk's virtual offset (`src/crates/qcow2/src/lib.rs:16812`). The data-file refusal, and both walkers, send the cluster's (`:16825-16827`). So `dd` with a mid-cluster window names a different offset from `map`. The reader should build a `RefusedL2Entry` and call `send_refused_l2_entry` (`:18384`): one dispatch point instead of two hand-written calls. | 3a | — |
+| C2 | `count_allocated_in_l2_extended` ends with `_ => 0` over `SubclusterType` (`:2132`). The arms should be named, as `map_state_for` does, so a new variant is a compile error and not a silent "not counted". | 3a | — |
+| C3 | `read_chain_split_at_granule` (`:16176`) is an `unsafe fn` with no `# Safety` section; its siblings have one. | 3a | — |
+| C4 | The VmdkDescriptor extent-walk comment (`:18082-18092`) narrates history ("Before the mark it ran on until..."). Keep the reason, drop the past. | 3a | — |
+| C5 | `clip_to_window` (`src/operations/map/src/main.rs:105-110`) repeats the "which states carry an offset" match that `MapExtentState::file_offset()` (`src/shared/src/lib.rs:861`) owns. This plan added `zero-at` and `hole-at` to both, which is the drift risk. | 3a | — |
+| C6 | An unrecognised refusal status renders as a sentence about the image: "corrupt qcow2 L2 entry in image with external data file" (`src/vmm/src/main.rs:884`). It should say the status was not recognised. 3d's crafted-frame unit test produced statuses 0 and 22 from truncated frames. That is informational, since only the guest writes the port. | 3d | — |
+| C7 | `pub unsafe fn init_chain_qcow2_states` (`src/crates/qcow2/src/lib.rs:18238`) has no callers, and it skips both `segmentation_covers` and `data_devices_are_owned`. Since phase 2 the reader trusts the device marks, so a future caller would bypass the check that makes that safe. Delete it. | 3a | management session: no caller in `src/` |
+| C8 | `CHAIN_CONFIG_MAGIC` (`src/vmm/src/main.rs:334`) duplicates `shared::ChainConfig::MAGIC`. Phase 2's D7 removed the version's duplicate for the same skew reason. | 3a | — |
+| T1 | `data_file_mid_chain`'s convert and compare entries are `expectedFailure`s, which absorb any failure. The #806 reason says the read fails closed, but `check_convert` asserts `rc == 0` and then the bytes, so a regression to wrong bytes under rc 0 would still count as an expected failure. Pin the current behaviour (rc != 0, no output claimed correct) instead. | 3b | — |
+| T2 | The VMM renders both refusals for `dd`, `bench` and `rebase` (`src/vmm/src/main.rs:14871`, `:6268`, `:11104`), but no integration test drives a refused entry through any of the three. | 3b | — |
+
+### Filed as issues
+
+Problems that predate this plan, or lie outside what it changed.
+
+| Issue | Finding | Source | Verified |
+|---|---|---|---|
+| [#812](https://github.com/shakenfist/instar/issues/812) | qemu refuses an unaligned host cluster offset (`block/qcow2-cluster.c:686-694`) and a zero flag in a pre-v3 image (`:657-664`); instar reads both. `instar map` reports the unaligned cluster as data at offset 328192, exit 0. `instar measure` exits 0. `instar convert` of the v2 image exits 0 and serves zeros for a cluster holding `0x55`. | 3a (unaligned measured; v2 not measured) | management session re-measured both |
+| [#813](https://github.com/shakenfist/instar/issues/813) | `TestZstdBackingChain` has never run. Its probe creates a qcow2 on `/dev/null`, which fails with "Image is not in qcow2 format" whatever qemu supports. The two "capability" skips step 2 recorded are this. | 3b | management session re-measured |
+| [#814](https://github.com/shakenfist/instar/issues/814) | `check`'s total cluster count is one higher than qemu's on every qcow2 image: `2/8193` against `1/8192` on a plain image. The numerator gap is #804. This is the Future work entry that named no issue, and it is not specific to data files. | step 4, from 3d's note | management session measured |
+| [#815](https://github.com/shakenfist/instar/issues/815) | `commit` into a backing file that owns a data file refuses correctly, but blames the overlay. | 3d | — |
+| [#816](https://github.com/shakenfist/instar/issues/816) | `map_state_triple` renders an unknown extent state, including the guest's own `"unknown"`, as data. | 3d | — |
+
+New evidence went to two existing issues as comments:
+* **#806:** every reading operation fails closed but gives no reason (rebase reports "the overlay's header could not be parsed"). The comment suggests an interim refusal by name at discovery.
+* **#807:** `instar compare` reports the mid-chain image as differing from itself. Re-measured by the management session.
+
+### Declined
+
+* **Splitting `src/crates/qcow2/src/lib.rs`** (3a, `source-file-size`).
+  This plan grew it by about 1,230 production and 2,836 test lines, and
+  3a named two seams that already exist: the I/O-free classifier block
+  and the 11,650-line test module. The block makes this a judgment, not
+  a gate. A split is its own change and its own review, and it would
+  churn every line both phases touched in the same release.
+* **The 19-line comment at the head of the device loop** (3a). 3a
+  judged it justified as the layer-advance invariant. Its overlap with
+  `data_devices_are_owned`'s doc is a sentence.
+* **Pinning the four `_COMPRESSED_MAP` expected failures more tightly**
+  (3b). `tests/test_map.py`'s `TestMapDivergenceRegression` already
+  pins that divergence exactly. No open issue tracks it;
+  `docs/quirks.md:1027-1038` records it as future work for `map`.
+* **Two `check_data_file` call sites with no mutation case** (3b).
+  `metadata_walks_refuse_data_file_entries_as_qemu_does` asserts both,
+  so the gap is in demonstration, not coverage.
+* **`data_device_idx = 1` in `docs/vmdk/vmdk-extents.md:253` and
+  `docs/commentary/architectural-decisions.md:171`** (3c). Both
+  describe device 0, a top-level descriptor, for which `idx + 1` is 1.
+* **`docs/measure.md:138,189`, "under investigation"** (3c). The
+  report did not measure it, it predates this plan, and it is not about
+  anything this plan changed.
+* **`docs/guest-architecture.md:100`, "phase-7 step-7z"** (3c). It
+  predates this plan, so it is #592's backlog.
+
+### Negative results worth keeping
+
+* **Cross-phase fit** (3a): every `match` on `ClusterLookup`,
+  `SubclusterType` and `RefusedL2Entry` names every variant, except C2's
+  wildcard, which is correct today. All eight VMM render sites go
+  through `l2_entry_refused()` and `l2_entry_refusal_error(op)`, and
+  every caller of the reader and of the walkers is covered. `check`
+  counts these entries as corruptions, as `qemu-img check` does.
+* **Mutation cases** (3b): all 23 fail for the behaviour they mutate.
+  A build error scores BROKEN rather than PASS, and the baseline
+  requires exactly one matching test to pass unmutated. Two cases were
+  re-run by hand to read the failure. Phase 1's tests still build the
+  shapes they describe under phase 2's harness, because `sc_read`
+  asserts its own config passes `segmentation_covers` and
+  `data_devices_are_owned`.
+* **CI parity** (3b): #810's `integration-core` job ran the same 314
+  tests with the same two skips (#813) and the same six expected
+  failures as step 2's local run.
+* **Hostile guest input** (3d): seven adversarial VMM unit tests, run
+  in a scratch copy, all passed (`make test-rust` 2687, 0 failed). They
+  covered unknown statuses, `u64::MAX` offsets, crossed markers, near-miss
+  marker spellings, 4 MiB of random bytes and a 4,000-byte map state.
+  No input panics the VMM, and no guest string reaches rendered output.
+* **The data-device flag** (3d): all three chain-config writers go
+  through `write_chain_device_entries`, which sets bit 31 only on the
+  data files it opened. An image's own flags cannot mark a device.
+* **Paths** (3d): the top image's data file and VMDK extents pass the
+  same `validate_backing_path` as backing files. A backing image's data
+  file is never opened (#806), so no path escapes the allowlist that
+  way.
+* **The extent walk** (3d): the single VMDK extent walk stops at
+  `device_count` and at the first unmarked device. map, measure and
+  check do not walk extents, and rebase's reader refuses descriptors.
+* **#806 across operations** (3d): every operation that reads the
+  mid-chain image fails closed or refuses by name. None serves wrong
+  data, except the two already filed: #807 (compare) and #642
+  (measure, which reports the top layer whether or not a data file is
+  involved).
+
+### Mutation cases on the merged tree
+
+Step 2 ran each case by name on HEAD `29bd35e2`. Each was killed, meaning its named test failed under the mutation, and 3b judged every kill causal. A test that kills two cases appears twice.
+
+| Case | Killed by |
+|---|---|
+| `qcow2-subcluster-alloc-at-host-zero-not-refused` | `extended_l2_wide_path_refuses_an_alloc_bit_at_host_zero` |
+| `qcow2-subcluster-alloc-at-host-zero-not-invalid` | `extended_l2_alloc_bit_at_host_zero_is_invalid` |
+| `qcow2-chunk-not-split-at-backing-clusters` | `sc_unallocated_runs_split_at_smaller_backing_clusters` |
+| `qcow2-data-device-read-as-the-next-layer` | `sc_issue_792_unallocated_cluster_in_a_data_file_image_reads_the_backing_file` |
+| `qcow2-data-device-read-at-the-bottom-of-the-chain` | `sc_issue_792_unallocated_cluster_without_a_backing_file_reads_zeros` |
+| `qcow2-data-device-read-by-a-subcluster-descent` | `sc_issue_792_unallocated_subcluster_runs_descend_past_the_data_device` |
+| `vmdk-descriptor-extent-walk-unbounded` | `vmdk_descriptor_extent_walk_stops_at_its_last_extent` |
+| `chain-config-data-device-at-a-chain-top-accepted` | `init_chain_states_refuses_a_data_device_at_the_top_of_a_chain` |
+| `chain-config-data-device-index-on-any-device-accepted` | `init_chain_states_refuses_a_data_device_index_on_a_device_that_cannot_own_one` |
+| `chain-config-data-device-index-not-checked` | `init_chain_states_refuses_a_data_device_index_that_misses_the_next_slot` |
+| `chain-config-data-device-index-any-later-slot` | `init_chain_states_refuses_a_data_device_index_that_misses_the_next_slot` |
+| `chain-config-unclaimed-data-device-accepted` | `init_chain_states_refuses_a_data_device_no_image_claims` |
+| `chain-config-qcow2-claims-a-run` | `init_chain_states_refuses_a_second_data_device_after_a_qcow2` |
+| `vmm-data-device-written-unmarked` | `write_chain_device_entries_marks_every_data_device_and_nothing_else` |
+| `vmm-image-flags-keep-the-data-device-mark` | `write_chain_device_entries_marks_every_data_device_and_nothing_else` |
+| `qcow2-data-file-compressed-entry-read` | `sc_data_file_compressed_entry_is_refused_by_name` |
+| `qcow2-data-file-host-offset-not-checked` | `sc_data_file_host_offset_that_is_not_the_guest_offset_is_refused` |
+| `qcow2-data-file-rules-before-invalid` | `sc_data_file_invalid_entry_is_refused_as_invalid_first` |
+| `qcow2-data-file-entry-not-refused` | `sc_data_file_host_offset_that_is_not_the_guest_offset_is_refused` |
+| `qcow2-data-file-measure-walk-unchecked` | `metadata_walks_refuse_data_file_entries_as_qemu_does` |
+| `qcow2-data-file-map-walk-unchecked` | `metadata_walks_refuse_data_file_entries_as_qemu_does` |
+| `vmm-data-file-refusal-not-captured` | `add_byte_captures_the_data_file_entry_refusal` |
+| `vmm-data-file-refusal-not-rendered` | `data_file_entry_error_names_qemu_wording_for_each_rule` |
+
+### Fixed in this record
+
+* The master plan's Future work still carried "qemu's data-file offset check", which is #803. Phase 2 closed it, so the entry now records the two host-offset checks qemu applies that #803 did not cover (#812). The entry that named no issue now names #814. #812, #813, #815 and #816 have entries of their own (3c).
+* 3c read step 4's "this phase's `Status`" as a line in this file. No phase plan has one; it means this phase's `Status` cell in the master plan's Execution table, which stays `In progress`.
+
+### What this audit did not cover
+
+* The `create`-feature tests in the qcow2 crate, and the `no_main`
+  guest binaries, which `make test-rust` excludes.
+* The libvhdi oracle cases of the mutation harness. None of the 23 is
+  one, and `vhdiinfo` is not installed on Kasm.
+* The integration modules outside this plan's two. Phase 2's definition
+  of done ran nine.
+
 ## Execution notes
 
 * 2026-10-22 (AEDT), back brief. Michael confirmed the step table's
@@ -350,3 +514,24 @@ briefs should change before they run.
     counted the file as host-side code, but `src/core` is the guest's
     runtime. Decision 5 and 3d's brief now point at the marker in
     `src/shared` and the VMM's capture and parse sites.
+* 3a, 3b, 3c and 3d ran in parallel on HEAD `3ae3c117`.
+  * The mutation harness edits source in place and rebuilds `instar`.
+    Once 3b was running, it was told to re-run cases only in its own
+    detached worktree, so it could not change the tree 3a and 3d were
+    reading, or the binary 3d was running. 3b confirmed it never ran
+    the harness in the shared worktree.
+  * 3d's scratch worktree could not be removed completely, because
+    Docker left a root-owned `.cargo-cache` in it. It is deregistered
+    and lives in the session scratchpad.
+* 2026-10-22 (AEDT), step 4. The triage is under *Audit findings*.
+  * The management session re-measured each issue it filed except
+    #815 and #816, and read each blocking documentation finding against
+    the code.
+  * 3a's unmeasured v2 zero-flag claim turned out worse than reported:
+    `convert` serves zeros, exit 0.
+  * The survey's "Future work entry with no issue" is #814, and it is
+    not specific to data files.
+  * Outcome: findings remain, so per Decision 6 the plan stays
+    `In progress`, and the follow-up pull request carries D1 to D8, C1
+    to C8, T1 and T2. That pull request records this phase's merge
+    commit and sets `Complete`.
