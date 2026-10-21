@@ -216,12 +216,16 @@ def qemu_img_builds(root: Path) -> dict:
     `root` is instar-testdata's `qemu-img-binaries/x86_64`. A version
     directory whose `qemu-img` is missing or not executable (an LFS
     checkout can drop the bit) is not a build, for the sweep and the CI
-    check alike.
+    check alike. A build in a directory not named for a release, such as
+    `latest` or `10.2.0-rc1`, raises PinError: the pin is keyed by
+    release, so it has nowhere to put one.
     """
     builds = {}
     for entry in root.iterdir():
         binary = entry / 'qemu-img'
         if binary.is_file() and os.access(binary, os.X_OK):
+            if not re.fullmatch(r'\d+\.\d+\.\d+', entry.name):
+                raise PinError(f'qemu-img build directory {entry} is not named for a qemu release (such as 10.2.0)')
             builds[entry.name] = binary
     return dict(sorted(builds.items(), key=lambda item: version_key(item[0])))
 

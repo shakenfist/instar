@@ -16,8 +16,10 @@ from helpers import qemu_pins
 
 REPIN_HINT = 're-run tools/sweep-qemu-create.py --write tests/golden/qemu-create-pins.json'
 
-# VHDX create cases that are allowed to differ between versions or are
-# refusals whose text is not a structure.
+# VHDX create cases that qemu refuses. Their result is an error message,
+# whose wording a qemu release may change without it mattering to instar,
+# so they are left to the pinned-version tests rather than required to
+# have one answer across every version.
 VHDX_SINGLE_ANSWER_EXCLUDED = {'vhdx-dynamic-65T', 'vhdx-fixed-backing', 'vhdx-fixed-prealloc-metadata'}
 
 
@@ -37,14 +39,16 @@ class TestQemuCreatePins(InstarTestBase):
             self.skipTest(f'no executable pinned qemu-img binaries under {root}')
         return found
 
-    def _compare(self, qemu_img, case_name, version, workdir):
+    def _compare(self, qemu_img, case_name, version, workdir, what=None, remedy=None):
         """Fail unless `qemu_img` still produces what `version`'s group pins for the case."""
         want = qemu_pins.expected(case_name, version)
         got = qemu_pins.run_case(qemu_img, case_name, workdir)
         differences = qemu_pins.result_diff(want, got)
+        what = what or f'qemu-img {version}'
+        remedy = remedy or f'if qemu is right, {REPIN_HINT}'
         self.assertEqual([], differences,
-                         f'{case_name} under qemu-img {version} differs from the pin '
-                         f'(pinned != measured); if qemu is right, {REPIN_HINT}:\n' + '\n'.join(differences))
+                         f'{case_name} under {what} differs from the pin (pinned != measured); {remedy}:\n'
+                         + '\n'.join(differences))
 
     def test_every_present_build_is_pinned(self):
         present = self._present_versions()
@@ -86,10 +90,21 @@ class TestQemuCreatePins(InstarTestBase):
         pinned = qemu_pins.newest_pinned_at_or_below(host_version)
         if pinned is None:
             self.skipTest(f'host qemu-img {host_version} is older than every pinned version')
+        # The sweep measures only the static builds, so re-pinning cannot
+        # clear a host difference: it is either a qemu change the static
+        # builds do not cover yet, or a distribution patch.
+        newest = max(qemu_pins.load_pin()['versions'], key=qemu_pins.version_key)
+        newer = (f'; the host is newer than every pinned build ({newest})'
+                 if qemu_pins.version_key(host_version) > qemu_pins.version_key(newest) else '')
+        remedy = ('re-pinning will not help, since the sweep does not measure the host. Either a qemu release '
+                  f'after {pinned} changed it, so add its build to instar-testdata and re-pin, or '
+                  f'the distribution patched qemu{newer}')
         with tempfile.TemporaryDirectory() as workdir:
             for case in qemu_pins.CASES:
                 with self.subTest(host=host_version, pinned=pinned, case=case['name']):
-                    self._compare('qemu-img', case['name'], pinned, Path(workdir))
+                    self._compare('qemu-img', case['name'], pinned, Path(workdir),
+                                  what=f'the host qemu-img {host_version} (compared with the {pinned} pin)',
+                                  remedy=remedy)
 
     def test_vhdx_create_cases_have_one_answer(self):
         names = [case['name'] for case in qemu_pins.CASES

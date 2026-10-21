@@ -2764,6 +2764,14 @@ preallocation changes for vpc, vmdk and vhdx, and the vmdk
 monolithicFlat descriptor. Results are grouped by outcome, so a
 version boundary shows up as a case with more than one group.
 
+Each preallocation mode records whether its image has the same bytes
+(`same_bytes_as_off`) and the same allocation
+(`same_allocation_as_off`) as a `preallocation=off` image. The `off`
+entry compares two `off` images, and the bytes that differ between
+those images are masked out, so its `same_bytes_as_off` is true by
+construction. Only its allocation comparison is measured. The `falloc`
+and `full` entries are the ones that carry evidence.
+
 `tests/test_qemu_create_pins.py` keeps it honest. It fails when a
 build is present that the pin does not list, when 6.0.0, 6.2.0,
 8.2.0, 10.2.0 or the host `qemu-img` no longer produce what the pin
@@ -2773,7 +2781,7 @@ When instar-testdata gains a qemu build, re-pin every version and
 case (about six minutes at `--jobs 2`):
 
 ```bash
-tools/sweep-qemu-create.py --write tests/golden/qemu-create-pins.json --jobs 4
+tools/sweep-qemu-create.py --write tests/golden/qemu-create-pins.json --jobs 2
 ```
 
 To replay a suspected boundary on its own, check a few versions and
