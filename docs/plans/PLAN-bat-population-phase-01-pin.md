@@ -397,6 +397,32 @@ replayed on its own with `--check --cases vmdk-flat-64M --versions
 spot sample above also measured agrees with it, so the master plan's
 Situation stands.
 
+## Execution notes
+
+Departures from the plan as written, recorded 2026-10-21
+(Australia/Sydney).
+
+* Step 1b found three qemu 7.0.0 `block/vhdx.c` citations in the
+  plans off by a few lines: data start is `:1708` not `:1712`, the
+  fixed truncate is `:1719-1725` not `:1722-1728`, and
+  `vhdx_create_bat` ends at `:1768` not `:1765`. Corrected at source
+  in both plans in commit `7a796640`.
+* Step 1b could not measure libvhdi's reading of a fixed VHDX,
+  because `docker run` was denied on the host. It is still
+  unmeasured; it is not a gate.
+* Step 1c added, beyond its brief and kept: BAT run lists folded in
+  the pin file (`compact_bat`/`expand_bat`), per-directory
+  preallocation images with the sparse VMDK's embedded descriptor
+  compared as normalised text (its CID is unpadded hex), a `--cases`
+  filter for `--check` replays, and a `parse_error` result instead of
+  an aborted sweep.
+* Step 1e: the single planned 58 s `test_pinned_versions_reproduce`
+  was split, by the management session, into one test per version
+  (`test_pinned_6_0_0_reproduces` and so on, about 20 s each) so
+  stestr can spread them across workers. Ran: 7.
+* Step 1d: the management session independently re-measured 6.0.1
+  and 7.2.17 with `--check`; both matched on all 31 cases.
+
 ## Risks and mitigations
 
 * **Correlated error between the comparator and a future emitter.** If

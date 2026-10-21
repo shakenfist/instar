@@ -151,7 +151,9 @@ block size, File Parameters bits, BAT state histogram, first and last
 BAT entries, apparent and allocated size), on 6.0.0, 6.2.0, 7.0.0,
 7.2.0, 8.0.0, 8.2.0, 9.0.0, 9.2.0, 10.0.0, 10.1.0, 10.2.0 and 10.0.13,
 with `qemu-img check` clean on every one. No version boundary was
-found in the sample; phase 1 sweeps all 80 builds.
+found in the sample, and phase 1's sweep of all 80 static builds
+confirmed it, pinning the result in
+`tests/golden/qemu-create-pins.json`.
 
 **Preallocation of vmdk, vpc and vhdx is a no-op in qemu, and
 `metadata` is refused.** `qemu-img create -f {vpc,vmdk,vhdx} -o
