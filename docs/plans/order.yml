@@ -31,3 +31,4 @@
 - PLAN-qcow2-write-infrastructure.md: qcow2 write infrastructure
 - PLAN-format-coverage.md: Format coverage expansion
 - PLAN-differencing.md: VHD and VHDX differencing output
+- PLAN-bat-population.md: Populated BAT output
