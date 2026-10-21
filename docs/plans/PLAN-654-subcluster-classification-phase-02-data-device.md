@@ -230,7 +230,7 @@ merging it back.
   fails closed.
 * `compare` of a qcow2 overlay over a smaller monolithicFlat VMDK
   against qemu's raw output says identical in both argument orders.
-* `grep -rn "counts as a device behind\|covered by that chain's segment" src/shared docs --exclude-dir=plans`
+* `grep -rn "counts as a device behind" src/shared docs --exclude-dir=plans`
   returns nothing.
 * `grep -n "CHAIN_CONFIG_VERSION" src/vmm/src/main.rs` returns nothing.
 * Each mutation case added in steps 2b and 2c is caught by a named
@@ -453,4 +453,22 @@ rule), and convert for both.
   qemu fails with `EIO`. check's compressed-with-data-file rule has no
   mutation case, because it lives in a guest operation; the integration
   module's check test covers it.
+* The definition-of-done grep for the stale ABI claim also matched
+  "covered by that chain's segment", which stays true under D1, because
+  a data device does stay inside its owner's segment. The item now
+  greps only for the false half, "counts as a device behind".
+* 2026-10-21 (AEDT), definition of done on HEAD `9a9ae6b6`, before the
+  push. The three greps are empty, `EXPECTED_CASES` and
+  `docs/testing.md` both say 126, and `--check-patterns` reports 126
+  land and 0 drifted. `make lint`, `make test-rust` (2680 passed, 0
+  failed), `make instar` and `make check-binary-sizes` (convert 366KB
+  of 768KB) pass. The subcluster module plus test_convert,
+  test_compare, test_check_chain, test_check_formats, test_map,
+  test_measure, test_bench and test_dd ran 1805 tests: 1243 passed,
+  549 skipped, 6 expected failures, 0 unexpected successes and 7
+  failures. All seven were heavy test_convert cases (four VHD, one
+  streamOptimized VMDK, two manifest images) with no qcow2 data file
+  in them, and all seven passed on a `--serial` replay. The step 2a
+  fixtures agree with qemu-img except `data_file_mid_chain` (#806), as
+  the definition of done allows.
 
