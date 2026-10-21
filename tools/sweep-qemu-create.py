@@ -50,8 +50,7 @@ def available_versions(testdata: Path) -> list:
     root = binaries_root(testdata)
     if not root.is_dir():
         raise SystemExit(f'no qemu-img builds at {root}')
-    return sorted((entry.name for entry in root.iterdir() if (entry / 'qemu-img').is_file()),
-                  key=qemu_pins.version_key)
+    return list(qemu_pins.qemu_img_builds(root))
 
 
 def measure_version(qemu_img: str, version: str, case_names: list, scratch: str) -> tuple:

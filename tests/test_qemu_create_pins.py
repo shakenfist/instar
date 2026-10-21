@@ -8,7 +8,6 @@ says, and every VHDX create case must have one answer across versions
 unless a test says otherwise.
 """
 
-import os
 import tempfile
 from pathlib import Path
 
@@ -33,11 +32,7 @@ class TestQemuCreatePins(InstarTestBase):
         root = self._binaries_root()
         if not root.is_dir():
             self.skipTest(f'no pinned qemu-img binaries under {root}')
-        found = {}
-        for entry in sorted(root.iterdir()):
-            binary = entry / 'qemu-img'
-            if binary.exists() and os.access(binary, os.X_OK):
-                found[entry.name] = binary
+        found = qemu_pins.qemu_img_builds(root)
         if not found:
             self.skipTest(f'no executable pinned qemu-img binaries under {root}')
         return found
@@ -70,7 +65,8 @@ class TestQemuCreatePins(InstarTestBase):
     # first with ddb.toolsVersion in a monolithicFlat descriptor, the newest
     # and one between, so a writer change anywhere in the range shows up.
     # One test per version rather than one loop, so stestr can spread them
-    # across workers; each takes about 15 seconds.
+    # across workers; each takes over 20 seconds (tests/stestr-timing.txt
+    # has the measured times).
     def test_pinned_6_0_0_reproduces(self):
         self._check_version('6.0.0')
 

@@ -349,7 +349,7 @@ all succeed and agree with qemu. Three things do not:
   of every boundary: 1024 MiB gives 8 MiB, 1025 MiB gives 16 MiB,
   102400 MiB gives 16 MiB, 102401 MiB gives 32 MiB, 33554432 MiB
   (32 TiB) gives 32 MiB and one MiB more gives 64 MiB. The source is
-  `block/vhdx.c:1960-1971`. The quirk text, `docs/create.md`'s
+  `block/vhdx.c:1962-1974`. The quirk text, `docs/create.md`'s
   divergence bullet and future-work bullet, the comment on
   `KNOWN_WRITER_DIVERGENCES` in `tests/test_create.py:1698-1703` and
   the differential fuzzer's picker docstring

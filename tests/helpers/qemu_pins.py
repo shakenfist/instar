@@ -67,7 +67,7 @@ SOURCE_NAME = 'source.raw'
 
 # The convert source: 64 MiB of raw, zero except for three whole 8 MiB
 # blocks of a non-zero byte. 8 MiB is qemu's default VHDX block size below
-# 1 GiB (qemu 7.0.0 block/vhdx.c:1965-1973), so each data block lands in
+# 1 GiB (qemu 7.0.0 block/vhdx.c:1962-1974), so each data block lands in
 # exactly one BAT entry, and the zero blocks between them show whether the
 # writer allocates what it was never given.
 CONVERT_SOURCE_SIZE = 64 * 1024 * 1024
@@ -158,7 +158,7 @@ CASES = [
     # blocks and 1016 sector bitmap slots are also exactly 131072 entries.
     _dynamic([], '4161792M'),
     # Each side of every default block size threshold (qemu 7.0.0
-    # block/vhdx.c:1965-1973: above 1 GiB, 100 GiB and 32 TiB).
+    # block/vhdx.c:1962-1974: above 1 GiB, 100 GiB and 32 TiB).
     _dynamic([], '1024M'),
     _dynamic([], '1025M'),
     _dynamic([], '102400M'),
@@ -208,6 +208,22 @@ if len(CASES_BY_NAME) != len(CASES):
 def version_key(version: str) -> tuple:
     """Sort key for a dotted qemu version such as `8.2.10`."""
     return tuple(int(part) for part in version.split('.'))
+
+
+def qemu_img_builds(root: Path) -> dict:
+    """Return {version: qemu-img path} for every executable build under `root`, oldest first.
+
+    `root` is instar-testdata's `qemu-img-binaries/x86_64`. A version
+    directory whose `qemu-img` is missing or not executable (an LFS
+    checkout can drop the bit) is not a build, for the sweep and the CI
+    check alike.
+    """
+    builds = {}
+    for entry in root.iterdir():
+        binary = entry / 'qemu-img'
+        if binary.is_file() and os.access(binary, os.X_OK):
+            builds[entry.name] = binary
+    return dict(sorted(builds.items(), key=lambda item: version_key(item[0])))
 
 
 def qemu_img_version(qemu_img) -> str:
