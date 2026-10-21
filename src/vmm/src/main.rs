@@ -333,8 +333,6 @@ const CHECK_RESULT_FLAG_REPAIR_INCOMPLETE: u32 = 1 << 8;
 #[allow(dead_code)]
 const CHAIN_CONFIG_MAGIC: u32 = 0x4348414E; // "CHAN"
 #[allow(dead_code)]
-const CHAIN_CONFIG_VERSION: u32 = 3;
-#[allow(dead_code)]
 const MAX_CHAIN_DEVICES: usize = 16;
 
 // InfoResult constants (must match shared crate)
@@ -812,6 +810,13 @@ struct SerialDecoder {
     /// travels on `send_error` and the tail of the run loop renders it
     /// instead of the generic failure text.
     last_invalid_l2_entry: Option<u64>,
+    /// The last qcow2 L2 entry the guest refused because the image has an
+    /// external data file and the entry breaks one of qemu's rules for
+    /// one (#803), as `(guest cluster offset, status)`: the `sector` and
+    /// `status` fields of an `error` message whose `operation` is
+    /// `shared::DataFileEntryRefusal::OPERATION`. Same pattern as
+    /// `last_invalid_l2_entry`, and rendered wherever that is.
+    last_data_file_entry: Option<(u64, u32)>,
 }
 
 /// Maximum serial decoder buffer size: frame header + max protobuf message
@@ -825,6 +830,58 @@ impl SerialDecoder {
             last_cpu_exception: None,
             last_differencing_refusal: None,
             last_invalid_l2_entry: None,
+            last_data_file_entry: None,
+        }
+    }
+
+    /// Whether the guest refused a qcow2 L2 entry by name, either as an
+    /// invalid entry or under a data-file rule. A run loop that saw one
+    /// renders [`Self::l2_entry_refusal_error`] instead of its own
+    /// result or failure text.
+    fn l2_entry_refused(&self) -> bool {
+        self.last_invalid_l2_entry.is_some() || self.last_data_file_entry.is_some()
+    }
+
+    /// The terminal error for a read or metadata walk the guest ended by
+    /// refusing a qcow2 L2 entry: [`Self::data_file_entry_error`] or
+    /// [`Self::invalid_l2_entry_error`], whichever the decoder captured.
+    /// The two are kept behind one entry point so that an operation that
+    /// renders one cannot forget the other (#665 was a refusal raised
+    /// with no renderer).
+    fn l2_entry_refusal_error(&self, op: &str) -> String {
+        if self.last_data_file_entry.is_some() {
+            self.data_file_entry_error(op)
+        } else {
+            self.invalid_l2_entry_error(op)
+        }
+    }
+
+    /// Format the terminal error for a read the guest refused because a
+    /// data-file image's L2 entry breaks one of qemu's rules for such
+    /// images (#803). Sibling to [`Self::invalid_l2_entry_error`].
+    ///
+    /// The wording is qemu's (`block/qcow2-cluster.c:670-673` and
+    /// `:698-702` at v10.0.0), so a user who has seen `qemu-img` refuse
+    /// the image can recognise the same refusal here. qemu's offset
+    /// message also prints the entry's host offset, which the refusal
+    /// does not carry; the guest cluster offset it names is the virtual
+    /// offset given here.
+    fn data_file_entry_error(&self, op: &str) -> String {
+        match self.last_data_file_entry {
+            Some((offset, status)) => {
+                let what = match status {
+                    shared::DataFileEntryRefusal::STATUS_COMPRESSED => {
+                        "Compressed cluster entry found in image with external data file"
+                    }
+                    shared::DataFileEntryRefusal::STATUS_HOST_OFFSET_MISMATCH => {
+                        "External data file host cluster offset does not match guest cluster \
+                         offset"
+                    }
+                    _ => "corrupt qcow2 L2 entry in image with external data file",
+                };
+                format!("{op}: {what} at virtual offset {offset} ({offset:#x})")
+            }
+            None => format!("{op}: guest did not return a result"),
         }
     }
 
@@ -963,6 +1020,10 @@ impl SerialDecoder {
                 } else if err.operation == shared::InvalidL2EntryRefusal::OPERATION {
                     // `sector` is the virtual byte offset of the refused read.
                     self.last_invalid_l2_entry = Some(err.sector);
+                } else if err.operation == shared::DataFileEntryRefusal::OPERATION {
+                    // `sector` is the refused cluster's virtual byte offset,
+                    // `status` the rule its entry breaks.
+                    self.last_data_file_entry = Some((err.sector, err.status));
                 }
             }
             return Some(msg);
@@ -1134,6 +1195,83 @@ mod guest_exception_tests {
         }
         assert_eq!(decoded, 1);
         assert_eq!(decoder.last_invalid_l2_entry, Some(196608));
+        assert_eq!(decoder.last_differencing_refusal, None);
+        assert_eq!(decoder.last_cpu_exception, None);
+    }
+
+    #[test]
+    fn data_file_entry_error_names_qemu_wording_for_each_rule() {
+        // qemu's wording, block/qcow2-cluster.c:670-673 and :698-702 at
+        // v10.0.0, for each status the guest raises (#803).
+        for (status, words) in [
+            (
+                shared::DataFileEntryRefusal::STATUS_COMPRESSED,
+                "Compressed cluster entry found in image with external data file",
+            ),
+            (
+                shared::DataFileEntryRefusal::STATUS_HOST_OFFSET_MISMATCH,
+                "External data file host cluster offset does not match guest cluster offset",
+            ),
+        ] {
+            let mut decoder = super::SerialDecoder::new();
+            decoder.last_data_file_entry = Some((65536, status));
+            assert!(decoder.l2_entry_refused());
+            for op in [
+                "convert", "dd", "compare", "bench", "rebase", "map", "measure",
+            ] {
+                let msg = decoder.l2_entry_refusal_error(op);
+                assert_eq!(
+                    msg,
+                    format!("{op}: {words} at virtual offset 65536 (0x10000)")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn l2_entry_refusal_error_renders_whichever_refusal_was_captured() {
+        let mut decoder = super::SerialDecoder::new();
+        assert!(!decoder.l2_entry_refused());
+        assert_eq!(
+            decoder.l2_entry_refusal_error("map"),
+            "map: guest did not return a result"
+        );
+        decoder.last_invalid_l2_entry = Some(0);
+        assert!(decoder.l2_entry_refused());
+        assert!(decoder
+            .l2_entry_refusal_error("map")
+            .contains("Invalid cluster entry found"));
+    }
+
+    #[test]
+    fn add_byte_captures_the_data_file_entry_refusal() {
+        // The guest raises the refusal with the marker as the operation,
+        // the cluster's virtual offset as the sector and the rule as the
+        // status; the decoder must capture exactly that and nothing else.
+        let msg = guest_protocol::error_message(
+            shared::DataFileEntryRefusal::OPERATION,
+            "input",
+            131072,
+            shared::DataFileEntryRefusal::STATUS_HOST_OFFSET_MISMATCH,
+        );
+        let mut framed = [0u8; 256];
+        let n = guest_protocol::encode_framed(&msg, &mut framed).expect("encode");
+        let mut decoder = super::SerialDecoder::new();
+        let mut decoded = 0;
+        for &b in &framed[..n] {
+            if decoder.add_byte(b).is_some() {
+                decoded += 1;
+            }
+        }
+        assert_eq!(decoded, 1);
+        assert_eq!(
+            decoder.last_data_file_entry,
+            Some((
+                131072,
+                shared::DataFileEntryRefusal::STATUS_HOST_OFFSET_MISMATCH
+            ))
+        );
+        assert_eq!(decoder.last_invalid_l2_entry, None);
         assert_eq!(decoder.last_differencing_refusal, None);
         assert_eq!(decoder.last_cpu_exception, None);
     }
@@ -1555,6 +1693,14 @@ fn format_message(msg: &guest_::GuestMessage) -> String {
                 // device whose L2 table holds the entry.
                 format!(
                     "error op={} device={} virtual_offset={} chain_device={}",
+                    err.operation, err.device, err.sector, err.status
+                )
+            } else if err.operation == shared::DataFileEntryRefusal::OPERATION {
+                // A data-file image's L2 entry broke one of qemu's rules
+                // for such images: sector is the cluster's virtual byte
+                // offset, status the rule.
+                format!(
+                    "error op={} device={} virtual_offset={} rule={}",
                     err.operation, err.device, err.sector, err.status
                 )
             } else {
@@ -3580,6 +3726,13 @@ fn print_backing_chain_json(chain: &BackingChain) {
 /// If the chain has an external data file, it is inserted as device `start_idx + 1`
 /// (between the top image and the rest of the backing chain).
 ///
+/// Every data device written -- a qcow2's data file, a VMDK flat
+/// descriptor's extents -- carries `ChainDeviceInfo::FLAG_DATA_DEVICE`,
+/// and nothing else does. The slot after an owner is otherwise
+/// indistinguishable from a raw backing file, and the guest's chain
+/// reader read it as one (issue #792). The guest checks the marks
+/// against `ChainConfig::data_devices_are_owned` before it reads.
+///
 /// Returns the number of device entries written.
 fn write_chain_device_entries(
     guest_mem: &GuestMemoryMmap,
@@ -3600,7 +3753,14 @@ fn write_chain_device_entries(
             image.format.to_shared_format_u32(),
             GuestAddress(dev_offset),
         )?;
-        guest_mem.write_obj(image.flags, GuestAddress(dev_offset + 4))?;
+        // The flags are the info operation's, which runs on the image's
+        // own bytes. The data device mark is the host's statement about
+        // a slot's role, so it is cleared here rather than trusted: an
+        // image must not be able to make the guest step over itself.
+        guest_mem.write_obj(
+            image.flags & !shared::ChainDeviceInfo::FLAG_DATA_DEVICE,
+            GuestAddress(dev_offset + 4),
+        )?;
         guest_mem.write_obj(image.virtual_size, GuestAddress(dev_offset + 8))?;
         guest_mem.write_obj(image.actual_size, GuestAddress(dev_offset + 16))?;
         guest_mem.write_obj(image.cluster_size, GuestAddress(dev_offset + 24))?;
@@ -3627,7 +3787,10 @@ fn write_chain_device_entries(
                 ImageFormat::Raw.to_shared_format_u32(),
                 GuestAddress(dev_offset),
             )?;
-            guest_mem.write_obj(0u32, GuestAddress(dev_offset + 4))?;
+            guest_mem.write_obj(
+                shared::ChainDeviceInfo::FLAG_DATA_DEVICE,
+                GuestAddress(dev_offset + 4),
+            )?;
             guest_mem.write_obj(data_file.extent_size, GuestAddress(dev_offset + 8))?;
             guest_mem.write_obj(data_size, GuestAddress(dev_offset + 16))?;
             guest_mem.write_obj(0u32, GuestAddress(dev_offset + 24))?;
@@ -3878,7 +4041,14 @@ fn write_chain_config_header(
 
     guest_mem.write_obj(CHAIN_CONFIG_MAGIC, GuestAddress(CHAIN_CONFIG_ADDR))?;
     guest_mem.write_obj(device_count as u32, GuestAddress(CHAIN_CONFIG_ADDR + 4))?;
-    guest_mem.write_obj(CHAIN_CONFIG_VERSION, GuestAddress(CHAIN_CONFIG_ADDR + 8))?;
+    // The version comes from the shared crate the guest is built
+    // against, not from a copy kept here: two definitions let a bump
+    // reach one side only, which is the skew the version exists to
+    // refuse.
+    guest_mem.write_obj(
+        shared::ChainConfig::VERSION,
+        GuestAddress(CHAIN_CONFIG_ADDR + 8),
+    )?;
     guest_mem.write_obj(segments.len() as u32, GuestAddress(CHAIN_CONFIG_ADDR + 12))?;
 
     let segments_base = CHAIN_CONFIG_ADDR + 528;
@@ -3946,6 +4116,105 @@ fn write_chain_config(
     debug!("Wrote chain config at 0x{CHAIN_CONFIG_ADDR:x} ({device_count} devices, 1 chain)");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod chain_config_writer_tests {
+    //! The chain config the host writes, read back as the guest's own
+    //! type and checked against the rule the guest checks it with.
+    use super::*;
+    use std::path::PathBuf;
+
+    fn image(format: ImageFormat, flags: u32, extents: &[u64]) -> ChainImage {
+        ChainImage {
+            path: PathBuf::from("/nonexistent/image"),
+            format,
+            virtual_size: 1 << 20,
+            actual_size: 1 << 20,
+            cluster_size: 0,
+            backing_file_raw: None,
+            flags,
+            external_data_files: extents
+                .iter()
+                .map(|&extent_size| ExternalDataFile {
+                    path: PathBuf::from("/nonexistent/data"),
+                    extent_size,
+                })
+                .collect(),
+        }
+    }
+
+    fn chain(images: Vec<ChainImage>) -> BackingChain {
+        let mut chain = BackingChain::new();
+        for image in images {
+            chain.push(image);
+        }
+        chain
+    }
+
+    #[test]
+    fn write_chain_device_entries_marks_every_data_device_and_nothing_else() {
+        let guest_mem =
+            GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(CHAIN_CONFIG_ADDR), 0x1000)])
+                .expect("guest memory");
+        // `compare`'s packing of two chains: a data-file qcow2 over a raw
+        // backing file, whose info flags claim the data device mark for
+        // the image itself, and a flat descriptor with two extents over
+        // a parent.
+        let chain1 = chain(vec![
+            image(
+                ImageFormat::Qcow2,
+                shared::ChainDeviceInfo::FLAG_DATA_DEVICE
+                    | shared::InfoResult::FLAG_HAS_EXTERNAL_DATA,
+                &[1 << 20],
+            ),
+            image(ImageFormat::Raw, 0, &[]),
+        ]);
+        let chain2 = chain(vec![
+            image(ImageFormat::VmdkDescriptor, 0, &[1 << 19, 1 << 19]),
+            image(ImageFormat::Raw, 0, &[]),
+        ]);
+        let devices_base = CHAIN_CONFIG_ADDR + 16;
+        let n1 = write_chain_device_entries(&guest_mem, &chain1, devices_base, 0).expect("chain 1");
+        let n2 =
+            write_chain_device_entries(&guest_mem, &chain2, devices_base, n1).expect("chain 2");
+        assert_eq!((n1, n2), (3, 4));
+        let segments = [
+            shared::ChainSegment { first: 0, count: 3 },
+            shared::ChainSegment { first: 3, count: 4 },
+        ];
+        write_chain_config_header(&guest_mem, n1 + n2, &segments).expect("header");
+
+        let mut bytes = [0u8; core::mem::size_of::<shared::ChainConfig>()];
+        guest_mem
+            .read_slice(&mut bytes, GuestAddress(CHAIN_CONFIG_ADDR))
+            .expect("read back");
+        // SAFETY: ChainConfig is repr(C) and made of integers only, so
+        // every bit pattern is a valid value; read_unaligned copies it
+        // out of a byte buffer with no alignment of its own.
+        let config: shared::ChainConfig =
+            unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const shared::ChainConfig) };
+
+        assert!(config.is_valid());
+        let marked: Vec<bool> = config.devices[..7]
+            .iter()
+            .map(|d| d.is_data_device())
+            .collect();
+        assert_eq!(marked, [false, true, false, false, true, true, false]);
+        assert_eq!(config.devices[0].data_device_idx, 1);
+        assert_eq!(config.devices[3].data_device_idx, 4);
+        // The info flags survive; only the mark an image cannot give
+        // itself is cleared.
+        assert_eq!(
+            config.devices[0].flags,
+            shared::InfoResult::FLAG_HAS_EXTERNAL_DATA
+        );
+        assert!(config.segmentation_covers(7));
+        assert!(
+            config.data_devices_are_owned(7),
+            "the guest must accept the layout the host writes"
+        );
+    }
 }
 
 /// Create a single-device BackingChain from image info for simple operations.
@@ -5996,8 +6265,8 @@ fn run_bench_guest(
     }
     // A corrupt qcow2 L2 entry is refused inside the chain reader, which
     // bench then reports as a failed request. Prefer the captured reason.
-    if serial_decoder.last_invalid_l2_entry.is_some() {
-        return Err(serial_decoder.invalid_l2_entry_error("bench").into());
+    if serial_decoder.l2_entry_refused() {
+        return Err(serial_decoder.l2_entry_refusal_error("bench").into());
     }
     if !result_seen {
         return Err(serial_decoder.no_result_error("bench").into());
@@ -10832,8 +11101,8 @@ fn run_rebase_guest(
     // A corrupt qcow2 L2 entry in the old chain is refused inside the
     // chain reader. Prefer the captured reason, matching convert, dd,
     // compare and bench.
-    if serial_decoder.last_invalid_l2_entry.is_some() {
-        return Err(serial_decoder.invalid_l2_entry_error("rebase").into());
+    if serial_decoder.l2_entry_refused() {
+        return Err(serial_decoder.l2_entry_refusal_error("rebase").into());
     }
     if !result_seen {
         return Err(serial_decoder.no_result_error("rebase").into());
@@ -13417,7 +13686,7 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
                                 // does the same. The tail renders the
                                 // captured reason instead.
                                 if serial_decoder.last_differencing_refusal.is_none()
-                                    && serial_decoder.last_invalid_l2_entry.is_none()
+                                    && !serial_decoder.l2_entry_refused()
                                 {
                                     print_compare_result(&msg, &args.output, args.strict);
                                 }
@@ -13518,8 +13787,8 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     }
     // Likewise for a corrupt qcow2 L2 entry refused inside the chain
     // reader: the guest's result for a failed read is not a comparison.
-    if serial_decoder.last_invalid_l2_entry.is_some() {
-        return Err(serial_decoder.invalid_l2_entry_error("compare").into());
+    if serial_decoder.l2_entry_refused() {
+        return Err(serial_decoder.l2_entry_refusal_error("compare").into());
     }
 
     // Return error if no result was received
@@ -14599,13 +14868,13 @@ fn execute_convert(
         // part-way through the output. The output is left as it stands,
         // as qemu-img convert leaves its own after "Invalid cluster
         // entry found"; only the reason is rendered by name.
-        if serial_decoder.last_invalid_l2_entry.is_some() {
+        if serial_decoder.l2_entry_refused() {
             let op = if exec.window.is_some() {
                 "dd"
             } else {
                 "convert"
             };
-            return Err(serial_decoder.invalid_l2_entry_error(op).into());
+            return Err(serial_decoder.l2_entry_refusal_error(op).into());
         }
         return Err("convert operation failed".into());
     }
@@ -15906,7 +16175,7 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
                                 // Likewise a corrupt qcow2 L2 entry refused
                                 // by the allocation scan.
                                 if serial_decoder.last_differencing_refusal.is_none()
-                                    && serial_decoder.last_invalid_l2_entry.is_none()
+                                    && !serial_decoder.l2_entry_refused()
                                 {
                                     print_measure_result(
                                         &msg,
@@ -16011,8 +16280,8 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     // A corrupt qcow2 L2 entry is refused inside the allocation scan,
     // which then reports the generic "unsupported format". Prefer the
     // captured reason, which is qemu's.
-    if serial_decoder.last_invalid_l2_entry.is_some() {
-        return Err(serial_decoder.invalid_l2_entry_error("measure").into());
+    if serial_decoder.l2_entry_refused() {
+        return Err(serial_decoder.l2_entry_refusal_error("measure").into());
     }
 
     if !measure_result_seen {
@@ -16424,8 +16693,8 @@ fn run_map(args: MapArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error
     // then reports the generic I/O failure. Prefer the captured reason,
     // which is qemu's; as on any other failure, the extents before it
     // stay on stdout.
-    if serial_decoder.last_invalid_l2_entry.is_some() {
-        return Err(serial_decoder.invalid_l2_entry_error("map").into());
+    if serial_decoder.l2_entry_refused() {
+        return Err(serial_decoder.l2_entry_refusal_error("map").into());
     }
 
     let result = map_result.ok_or_else(|| "map: guest returned no MapResult".to_string())?;

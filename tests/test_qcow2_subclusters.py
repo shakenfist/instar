@@ -7,9 +7,11 @@ subcluster's bytes must come from, so convert is checked against that
 expectation as well as against qemu-img:
 
 * convert -O raw: byte-equal to the fixture's `expected_raw` and to
-  `qemu-img convert`; an invalid entry is refused by name, as qemu refuses it.
+  `qemu-img convert`; an entry qemu refuses is refused by name, as qemu
+  refuses it: an invalid entry, or a data-file entry that is compressed or
+  not at its guest offset (#803).
 * compare: instar compare of the fixture against qemu-img's raw output says
-  identical; an invalid entry is refused by name.
+  identical; an entry qemu refuses is refused by name.
 * map --output json: equal to `qemu-img map`. instar map reads one image on
   its own, so a fixture with a backing file is checked for that refusal.
 * check: exit code and corruption count agree with `qemu-img check`. The
@@ -20,16 +22,22 @@ expectation as well as against qemu-img:
   layer only (#642), so a fixture with a backing file is compared against
   qemu measuring the image opened with its backing link cut.
 
+Three narrower sets of tests sit beside those:
+
+* every pair in `helpers.qcow2_subclusters.COMPARE_PAIRS` is compared in
+  both argument orders, and instar must agree with `qemu-img compare`;
+* the data-file images in `CHECK_CHAIN_FIXTURES`, all over qcow2 backing
+  files, pass `check --chain` with no chain error, as `qemu-img check` does:
+  a data file is not a chain layer (a raw backing file always reports a
+  chain error, #808);
+* the fixtures in `REVERSED_COMPARE_FIXTURES` are also compared with
+  qemu-img's raw output as the first input, so the fixture's devices follow
+  the other input's.
+
 Known divergences are listed in `EXPECTED_FAILURES` and marked with
 `unittest.expectedFailure`, which testtools honours: when one starts passing
 it is reported as an unexpected success, which fails the run, so whoever fixes
 it has to remove the entry.
-
-The fixtures in `HOST_OFFSET_REFUSAL_BUILDERS` are deliberately not run here.
-They classify as valid, and qemu refuses them through its host-offset rules
-(a compressed entry with a data file, a data-file host offset different from
-the guest offset), which instar does not implement yet (#803); that is not
-classification.
 """
 
 import json
@@ -46,23 +54,41 @@ from helpers import qcow2_subclusters
 # words, whichever operation reaches it.
 INVALID_ENTRY_MESSAGE = 'Invalid cluster entry found'
 
+# The fixtures qemu refuses through a data-file rule rather than as an invalid
+# entry, and the phrase instar's refusal carries for each, in qemu's words
+# (block/qcow2-cluster.c:670-673 and :698-702 at v10.0.0, #803).
+DATA_FILE_REFUSAL_MESSAGES = {
+    'data_file_compressed': 'Compressed cluster entry found in image with external data file',
+    'data_file_offset_mismatch': 'External data file host cluster offset does not match guest cluster offset',
+}
+
+QCOW2_MAGIC = b'QFI\xfb'
+
 OPERATIONS = ('convert', 'compare', 'map', 'check', 'measure')
 
-_ISSUE_792 = ('#792: an unallocated cluster in a data-file image falls through to the next device in the chain, '
-              'which is the data file, instead of reading zeros or the backing file')
 _COMPRESSED_MAP = ('instar map reports compressed clusters with compressed: false and a host offset; see '
                    'docs/quirks.md "qcow2 compressed clusters report compressed: false" and the compressed '
                    'entries of KNOWN_MAP_DIVERGENCES in tests/test_map.py')
 
 # (operation, fixture) -> why instar does not yet agree with qemu-img.
 EXPECTED_FAILURES = {}
-for _fixture in ('mixed_classic_backing_datafile', 'mixed_ext_backing_datafile', 'data_file_partial_backing',
-                 'data_file_partial_32k', 'data_file_classic_no_copied_backing', 'data_file_classic_no_copied'):
-    for _operation in ('convert', 'compare'):
-        EXPECTED_FAILURES[(_operation, _fixture)] = _ISSUE_792
+_MID_CHAIN = 'the VMM discovers no external data file below the top image, so the read fails closed (#806)'
+for _operation in ('convert', 'compare'):
+    EXPECTED_FAILURES[(_operation, 'data_file_mid_chain')] = _MID_CHAIN
 for _fixture in ('mixed_classic_nobacking_nodatafile', 'mixed_ext_nobacking_nodatafile',
                  'compressed_bitmap_all_alloc', 'compressed_bitmap_arbitrary'):
     EXPECTED_FAILURES[('map', _fixture)] = _COMPRESSED_MAP
+
+# Data-file images over qcow2 backing files that check --chain must pass
+# without a chain error.
+CHECK_CHAIN_FIXTURES = ('mixed_ext_backing_datafile_over_64k_qcow2', 'data_file_holds_qcow2_header',
+                        'data_file_empty')
+
+# Fixtures that are also compared with qemu-img's raw output given first. A
+# monolithicFlat VMDK smaller than its overlay is followed in the device array
+# by the other input when it is given second, and a read past its extent must
+# not reach that input.
+REVERSED_COMPARE_FIXTURES = ('qcow2_over_smaller_flat_vmdk',)
 
 
 def _run(argv, timeout=120):
@@ -80,6 +106,7 @@ class TestQcow2Subclusters(InstarTestBase):
     _tmpdir = None
     _fixtures = None
     _qemu_raw = None
+    _pairs = None
 
     @classmethod
     def setUpClass(cls):
@@ -95,6 +122,7 @@ class TestQcow2Subclusters(InstarTestBase):
             out = cls._tmpdir / f'{name}.qemu.raw'
             stdout, stderr, rc = _run(['qemu-img', 'convert', '-O', 'raw', fixture.path, out])
             cls._qemu_raw[name] = (out if rc == 0 else None, rc, stderr)
+        cls._pairs = qcow2_subclusters.build_compare_pairs(cls._tmpdir / 'pairs')
 
     @classmethod
     def tearDownClass(cls):
@@ -112,9 +140,10 @@ class TestQcow2Subclusters(InstarTestBase):
     def _instar(self, *args):
         return _run([self.instar, *args])
 
-    def _assert_refused(self, stdout, stderr, rc, what):
-        self.assertNotEqual(rc, 0, f'{what}: instar did not refuse an invalid entry; stdout={stdout[:500]!r}')
-        self.assertIn(INVALID_ENTRY_MESSAGE, stderr, f'{what}: refusal does not name the invalid entry')
+    def _assert_refused(self, name, stdout, stderr, rc, what):
+        message = DATA_FILE_REFUSAL_MESSAGES.get(name, INVALID_ENTRY_MESSAGE)
+        self.assertNotEqual(rc, 0, f'{what}: instar did not refuse the entry; stdout={stdout[:500]!r}')
+        self.assertIn(message, stderr, f'{what}: refusal does not name the entry qemu refuses; stderr={stderr!r}')
 
     def _assert_backing_refused(self, stdout, stderr, rc, what):
         self.assertNotEqual(rc, 0, f'{what}: instar map did not refuse a backing chain; stdout={stdout[:500]!r}')
@@ -130,8 +159,8 @@ class TestQcow2Subclusters(InstarTestBase):
         out = self._tmpdir / f'{name}.convert.instar.raw'
         stdout, stderr, rc = self._instar('convert', '-O', 'raw', fixture.path, out)
         if fixture.refuses:
-            self.assertNotEqual(qemu_rc, 0, f'{name}: qemu-img convert unexpectedly read an invalid entry')
-            self._assert_refused(stdout, stderr, rc, f'{name} convert')
+            self.assertNotEqual(qemu_rc, 0, f'{name}: qemu-img convert unexpectedly read a refused entry')
+            self._assert_refused(name, stdout, stderr, rc, f'{name} convert')
             return
         self.assertEqual(qemu_rc, 0, f'{name}: qemu-img convert failed: {qemu_stderr}')
         self.assertEqual(rc, 0, f'{name}: instar convert failed: {stderr}')
@@ -151,11 +180,38 @@ class TestQcow2Subclusters(InstarTestBase):
             with open(qemu_out, 'wb') as f:
                 f.truncate(fixture.virtual_size)
             stdout, stderr, rc = self.run_instar_compare(fixture.path, qemu_out)
-            self._assert_refused(stdout, stderr, rc, f'{name} compare')
+            self._assert_refused(name, stdout, stderr, rc, f'{name} compare')
             return
+        if fixture.expected_raw[:4] == QCOW2_MAGIC:
+            # A raw file whose guest bytes start with a qcow2 header is probed
+            # as qcow2, by qemu-img compare without -F raw as much as by instar
+            # compare, which has no format option. Compare against qemu's
+            # qcow2 conversion instead, which nothing can mistake.
+            qemu_out = self._tmpdir / f'{name}.qemu.qcow2'
+            q_stdout, q_stderr, q_rc = _run(['qemu-img', 'convert', '-O', 'qcow2', fixture.path, qemu_out])
+            self.assertEqual(q_rc, 0, f'{name}: qemu-img convert -O qcow2 failed: {q_stderr}')
         stdout, stderr, rc = self.run_instar_compare(fixture.path, qemu_out)
         self.assertEqual(rc, 0, f'{name}: instar compare says the fixture differs from qemu-img convert: '
                                 f'stdout={stdout!r} stderr={stderr!r}')
+
+    def check_compare_reversed(self, name):
+        qemu_out, qemu_rc, qemu_stderr = self._qemu_raw[name]
+        self.assertEqual(qemu_rc, 0, f'{name}: qemu-img convert failed: {qemu_stderr}')
+        stdout, stderr, rc = self.run_instar_compare(qemu_out, self._fixtures[name].path)
+        self.assertEqual(rc, 0, f'{name}: instar compare of qemu-img convert against the fixture says they differ: '
+                                f'stdout={stdout!r} stderr={stderr!r}')
+
+    def check_compare_pair(self, name):
+        pair = self._pairs[name]
+        expected_rc = 0 if pair.identical else 1
+        for first, second in ((pair.left, pair.right), (pair.right, pair.left)):
+            what = f'{name}: compare {first.name} {second.name}'
+            q_stdout, q_stderr, q_rc = _run(['qemu-img', 'compare', first.path, second.path])
+            self.assertEqual(q_rc, expected_rc, f'{what}: qemu-img exit code {q_rc}; stdout={q_stdout!r} '
+                                                f'stderr={q_stderr!r}')
+            stdout, stderr, rc = self.run_instar_compare(first.path, second.path)
+            self.assertEqual(rc, q_rc, f'{what}: instar exit code {rc}, qemu-img {q_rc}; stdout={stdout!r} '
+                                       f'stderr={stderr!r}')
 
     # -------------------------------------------------------------------- map
 
@@ -167,8 +223,8 @@ class TestQcow2Subclusters(InstarTestBase):
             return
         q_stdout, q_stderr, q_rc = _run(['qemu-img', 'map', '--output=json', fixture.path])
         if fixture.refuses:
-            self.assertNotEqual(q_rc, 0, f'{name}: qemu-img map unexpectedly read an invalid entry')
-            self._assert_refused(stdout, stderr, rc, f'{name} map')
+            self.assertNotEqual(q_rc, 0, f'{name}: qemu-img map unexpectedly read a refused entry')
+            self._assert_refused(name, stdout, stderr, rc, f'{name} map')
             return
         self.assertEqual(q_rc, 0, f'{name}: qemu-img map failed: {q_stderr}')
         self.assertEqual(rc, 0, f'{name}: instar map failed: {stderr}')
@@ -189,6 +245,18 @@ class TestQcow2Subclusters(InstarTestBase):
                          f'{name}: check corruption count: instar={instar_json} qemu-img={qemu_json}; '
                          f'qemu-img stderr={q_stderr!r}')
 
+    def check_check_chain(self, name):
+        fixture = self._fixtures[name]
+        stdout, stderr, rc = self.run_instar_check(fixture.path, output_format='json', chain=True)
+        q_stdout, q_stderr, q_rc = self.run_qemu_img_check(fixture.path, output_format='json')
+        self.assertEqual(rc, q_rc, f'{name}: check --chain exit code: instar={rc} qemu-img={q_rc}; '
+                                   f'instar stdout={stdout!r} stderr={stderr!r}')
+        instar_json = json.loads(stdout)
+        self.assertEqual(instar_json.get('chain-errors'), 0,
+                         f'{name}: check --chain reports a chain error: {instar_json}; stderr={stderr!r}')
+        self.assertEqual(instar_json.get('corruptions', 0), json.loads(q_stdout).get('corruptions', 0),
+                         f'{name}: check --chain corruption count: instar={instar_json} qemu-img={q_stdout}')
+
     # ---------------------------------------------------------------- measure
 
     def check_measure(self, name):
@@ -202,8 +270,8 @@ class TestQcow2Subclusters(InstarTestBase):
                                            'file': {'driver': 'file', 'filename': source}})
         q_stdout, q_stderr, q_rc = _run(['qemu-img', 'measure', '-O', 'qcow2', '--output=json', source])
         if fixture.refuses:
-            self.assertNotEqual(q_rc, 0, f'{name}: qemu-img measure unexpectedly read an invalid entry')
-            self._assert_refused(stdout, stderr, rc, f'{name} measure')
+            self.assertNotEqual(q_rc, 0, f'{name}: qemu-img measure unexpectedly read a refused entry')
+            self._assert_refused(name, stdout, stderr, rc, f'{name} measure')
             return
         self.assertEqual(q_rc, 0, f'{name}: qemu-img measure failed: {q_stderr}')
         self.assertEqual(rc, 0, f'{name}: instar measure failed: {stderr}')
@@ -214,10 +282,18 @@ class TestQcow2Subclusters(InstarTestBase):
                              f'{name}: measure {key}: instar={instar_json} qemu-img={qemu_json}')
 
 
+_OPERATION_LABELS = {
+    'compare_reversed': 'compare with qemu-img\'s raw output first',
+    'compare_pair': 'compare in both argument orders',
+    'check_chain': 'check --chain',
+}
+
+
 def _make_test(operation, name):
     def test(self):
         getattr(self, f'check_{operation}')(name)
-    fixture_doc = f'{operation}: instar agrees with qemu-img on the {name} fixture.'
+    label = _OPERATION_LABELS.get(operation, operation)
+    fixture_doc = f'{label}: instar agrees with qemu-img on the {name} fixture.'
     reason = EXPECTED_FAILURES.get((operation, name))
     if reason is not None:
         test.__doc__ = f'{fixture_doc} Expected to fail: {reason}.'
@@ -229,7 +305,17 @@ def _make_test(operation, name):
 for _name in qcow2_subclusters.BUILDERS:
     for _operation in OPERATIONS:
         setattr(TestQcow2Subclusters, f'test_{_operation}_{_name}', _make_test(_operation, _name))
+for _operation, _names in (('compare_reversed', REVERSED_COMPARE_FIXTURES), ('check_chain', CHECK_CHAIN_FIXTURES),
+                           ('compare_pair', qcow2_subclusters.COMPARE_PAIRS)):
+    for _name in _names:
+        setattr(TestQcow2Subclusters, f'test_{_operation}_{_name}', _make_test(_operation, _name))
 
 _unknown = {key for key in EXPECTED_FAILURES if key[1] not in qcow2_subclusters.BUILDERS}
 if _unknown:
     raise RuntimeError(f'EXPECTED_FAILURES names fixtures that do not exist: {sorted(_unknown)}')
+for _label, _names in (('DATA_FILE_REFUSAL_MESSAGES', DATA_FILE_REFUSAL_MESSAGES),
+                       ('REVERSED_COMPARE_FIXTURES', REVERSED_COMPARE_FIXTURES),
+                       ('CHECK_CHAIN_FIXTURES', CHECK_CHAIN_FIXTURES)):
+    _unknown = set(_names) - set(qcow2_subclusters.BUILDERS)
+    if _unknown:
+        raise RuntimeError(f'{_label} names fixtures that do not exist: {sorted(_unknown)}')

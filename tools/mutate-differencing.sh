@@ -682,7 +682,7 @@ self_test() {
 # phase's definition of done asks the two to stay in step, which until
 # now was a promise kept by hand. Asserting it makes the drift a
 # failure instead of a documentation bug nobody reads.
-EXPECTED_CASES=106
+EXPECTED_CASES=126
 
 check_case_count() {
     # Only meaningful for a whole run; a selection is expected to be short.
@@ -1717,6 +1717,194 @@ rust_case 'qcow2-chunk-not-split-at-backing-clusters' "${QCOW2_LIB}" \
     '                if false { // MUTATED' \
     qcow2 'sc_unallocated_runs_split_at_smaller_backing_clusters' \
     --features "${QCOW2_FEATURES}"
+
+# --- External data devices: in the chain's segment, not a layer -------
+#
+# The host puts a data-file image's data device, and a VMDK flat
+# descriptor's extents, in the slots after the image, inside its
+# segment, and marks each with FLAG_DATA_DEVICE (#792). The reader steps
+# over a marked device at the top of its device loop, chain init checks
+# that the marks are where the host puts them, and the descriptor's
+# extent walk stops at the end of its run of marked devices.
+#
+# The first three cases remove the reader's skip, each caught by a
+# different test, because the reader reaches the next device in two
+# different ways -- a `continue` for a wholly unallocated cluster, and a
+# descent for a run of unallocated subclusters -- and the data device
+# can be the last device in the chain or sit in front of a backing
+# file. One check covers all of them, so one test catching it would not
+# show the others are guarded.
+DATA_DEVICE_SKIP='        if chain_config.devices[dev_idx].is_data_device() {
+            continue;
+        }'
+DATA_DEVICE_SKIP_REMOVED='        if false { // MUTATED: a data device read as a layer
+            continue;
+        }'
+
+rust_case 'qcow2-data-device-read-as-the-next-layer' "${QCOW2_LIB}" \
+    "${DATA_DEVICE_SKIP}" "${DATA_DEVICE_SKIP_REMOVED}" \
+    qcow2 'sc_issue_792_unallocated_cluster_in_a_data_file_image_reads_the_backing_file' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'qcow2-data-device-read-at-the-bottom-of-the-chain' "${QCOW2_LIB}" \
+    "${DATA_DEVICE_SKIP}" "${DATA_DEVICE_SKIP_REMOVED}" \
+    qcow2 'sc_issue_792_unallocated_cluster_without_a_backing_file_reads_zeros' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'qcow2-data-device-read-by-a-subcluster-descent' "${QCOW2_LIB}" \
+    "${DATA_DEVICE_SKIP}" "${DATA_DEVICE_SKIP_REMOVED}" \
+    qcow2 'sc_issue_792_unallocated_subcluster_runs_descend_past_the_data_device' \
+    --features "${QCOW2_FEATURES}"
+
+# The extent walk back to its old bound, the end of the device array:
+# a read past a descriptor's last extent takes the next device -- under
+# `compare`, the other input's top image -- as one more extent.
+rust_case 'vmdk-descriptor-extent-walk-unbounded' "${QCOW2_LIB}" \
+    '                while (d as usize) < chain_config.device_count as usize
+                    && chain_config.devices[d as usize].is_data_device()
+                {' \
+    '                while (d as usize) < chain_config.device_count as usize // MUTATED
+                {' \
+    qcow2 'vmdk_descriptor_extent_walk_stops_at_its_last_extent' \
+    --features "${QCOW2_FEATURES}"
+
+# One case per clause of ChainConfig::data_devices_are_owned, which
+# lives in the shared crate and is caught through chain init in the
+# qcow2 crate. Each named test holds a config that breaks only the
+# clause its case removes, so no clause can be deleted behind another.
+# The fourth narrows "the slot after the owner" to "any slot after the
+# owner", which is the looser reading of where a data device may sit.
+SHARED_LIB='src/shared/src/lib.rs'
+
+rust_case 'chain-config-data-device-at-a-chain-top-accepted' "${SHARED_LIB}" \
+    '                .is_some_and(|top| top.is_data_device())' \
+    '                .is_some_and(|_| false) // MUTATED' \
+    qcow2 'init_chain_states_refuses_a_data_device_at_the_top_of_a_chain' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'chain-config-data-device-index-on-any-device-accepted' "${SHARED_LIB}" \
+    '                (false, ImageFormat::VmdkDescriptor) => true,
+                _ => return false,' \
+    '                (false, ImageFormat::VmdkDescriptor) => true,
+                _ => false, // MUTATED' \
+    qcow2 'init_chain_states_refuses_a_data_device_index_on_a_device_that_cannot_own_one' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'chain-config-data-device-index-not-checked' "${SHARED_LIB}" \
+    '            if first != owner + 1 || first >= device_count || !devices[first].is_data_device() {' \
+    '            if false { // MUTATED' \
+    qcow2 'init_chain_states_refuses_a_data_device_index_that_misses_the_next_slot' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'chain-config-data-device-index-any-later-slot' "${SHARED_LIB}" \
+    '            if first != owner + 1 || first >= device_count || !devices[first].is_data_device() {' \
+    '            if first <= owner || first >= device_count || !devices[first].is_data_device() { // MUTATED' \
+    qcow2 'init_chain_states_refuses_a_data_device_index_that_misses_the_next_slot' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'chain-config-unclaimed-data-device-accepted' "${SHARED_LIB}" \
+    '            .all(|(info, &claimed)| claimed || !info.is_data_device())' \
+    '            .all(|(_, &claimed)| claimed || true) // MUTATED' \
+    qcow2 'init_chain_states_refuses_a_data_device_no_image_claims' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'chain-config-qcow2-claims-a-run' "${SHARED_LIB}" \
+    '                (false, ImageFormat::Qcow2) => false,' \
+    '                (false, ImageFormat::Qcow2) => true, // MUTATED' \
+    qcow2 'init_chain_states_refuses_a_second_data_device_after_a_qcow2' \
+    --features "${QCOW2_FEATURES}"
+
+# The host half. The first writes data devices unmarked, which the
+# guest reads as #792 did; the second passes an info operation's flags
+# through with the mark intact, so an image could make the guest step
+# over it. Both are caught by reading the host's config back as the
+# guest's own type. The vmm crate's package is `instar`.
+VMM_MAIN_LIB='src/vmm/src/main.rs'
+
+rust_case 'vmm-data-device-written-unmarked' "${VMM_MAIN_LIB}" \
+    '            guest_mem.write_obj(
+                shared::ChainDeviceInfo::FLAG_DATA_DEVICE,
+                GuestAddress(dev_offset + 4),
+            )?;' \
+    '            guest_mem.write_obj(0u32, GuestAddress(dev_offset + 4))?; // MUTATED' \
+    instar 'write_chain_device_entries_marks_every_data_device_and_nothing_else'
+
+rust_case 'vmm-image-flags-keep-the-data-device-mark' "${VMM_MAIN_LIB}" \
+    '            image.flags & !shared::ChainDeviceInfo::FLAG_DATA_DEVICE,' \
+    '            image.flags, // MUTATED' \
+    instar 'write_chain_device_entries_marks_every_data_device_and_nothing_else'
+
+# --- qcow2 data-file entries qemu refuses (#803) ----------------------
+#
+# qemu's read path applies two rules to an image with an external data
+# file, after the entry has classified as valid: a compressed entry is
+# refused, and so is a host cluster offset that is not the guest
+# cluster offset (block/qcow2-cluster.c:668-675 and :696-704 at
+# v10.0.0). Before instar applied them, the second shape read the data
+# file at the entry's offset and returned the wrong bytes under success.
+#
+# The first two cases remove one rule each, caught through the chain
+# reader by a test that reads every entry shape the rule covers through
+# both arms. The third removes the rules' deference to the invalid-entry
+# refusal, which qemu reaches first. The fourth removes the reader's
+# refusal arm, so a refused entry reads as success over a buffer nothing
+# wrote. The fifth and sixth remove the rule from the classic measure
+# walk and the extended map walk, which qemu-img map and measure fail on
+# too. The last two are the host's half: the decoder no longer captures
+# the refusal, or the run loops no longer see it, and either way the
+# reason falls back to the generic failure text.
+rust_case 'qcow2-data-file-compressed-entry-read' "${QCOW2_LIB}" \
+    '        SubclusterType::Compressed => Some(DataFileEntryViolation::Compressed),' \
+    '        SubclusterType::Compressed => None, // MUTATED' \
+    qcow2 'sc_data_file_compressed_entry_is_refused_by_name' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'qcow2-data-file-host-offset-not-checked' "${QCOW2_LIB}" \
+    '            && l2_entry & L2_OFFSET_MASK != guest_cluster_offset =>' \
+    '            && false => // MUTATED' \
+    qcow2 'sc_data_file_host_offset_that_is_not_the_guest_offset_is_refused' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'qcow2-data-file-rules-before-invalid' "${QCOW2_LIB}" \
+    '        SubclusterType::Invalid => None,
+        SubclusterType::Compressed => Some(DataFileEntryViolation::Compressed),' \
+    '        SubclusterType::Compressed => Some(DataFileEntryViolation::Compressed), // MUTATED' \
+    qcow2 'sc_data_file_invalid_entry_is_refused_as_invalid_first' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'qcow2-data-file-entry-not-refused' "${QCOW2_LIB}" \
+    '                        send_data_file_entry_refusal(
+                            call_table,
+                            virtual_offset - virtual_offset % qcow2_cluster_size,
+                            violation,
+                        );
+                        return false;' \
+    '                        let _ = violation;
+                        return true; // MUTATED: the refusal removed' \
+    qcow2 'sc_data_file_host_offset_that_is_not_the_guest_offset_is_refused' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'qcow2-data-file-measure-walk-unchecked' "${QCOW2_LIB}" \
+    '        RefusedL2Entry::check_data_file(entry, 0, false, has_data_file, v)?;' \
+    '        // MUTATED: the data-file rules removed' \
+    qcow2 'metadata_walks_refuse_data_file_entries_as_qemu_does' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'qcow2-data-file-map-walk-unchecked' "${QCOW2_LIB}" \
+    '    RefusedL2Entry::check_data_file(l2_entry, sc_bitmap, true, has_data_file, virtual_offset)?;' \
+    '    // MUTATED: the data-file rules removed' \
+    qcow2 'metadata_walks_refuse_data_file_entries_as_qemu_does' \
+    --features "${QCOW2_FEATURES}"
+
+rust_case 'vmm-data-file-refusal-not-captured' "${VMM_MAIN_LIB}" \
+    '                    self.last_data_file_entry = Some((err.sector, err.status));' \
+    '                    // MUTATED: the refusal not captured' \
+    instar 'add_byte_captures_the_data_file_entry_refusal'
+
+rust_case 'vmm-data-file-refusal-not-rendered' "${VMM_MAIN_LIB}" \
+    '        self.last_invalid_l2_entry.is_some() || self.last_data_file_entry.is_some()' \
+    '        self.last_invalid_l2_entry.is_some() // MUTATED' \
+    instar 'data_file_entry_error_names_qemu_wording_for_each_rule'
 
 # ---------------------------------------------------------------------
 # Two chains in one device array, which is `compare` alone.

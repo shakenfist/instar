@@ -3225,6 +3225,58 @@ impl InvalidL2EntryRefusal {
 }
 
 // ============================================================================
+// qcow2 data-file L2 entry refusal signal
+// ============================================================================
+
+/// The `send_error` channel used to report that a qcow2 read or metadata
+/// walk refused an L2 entry of an image with an external data file
+/// because it breaks one of the two rules qemu's read path applies to
+/// such images (#803). Both are in `qcow2_get_host_offset`
+/// (`block/qcow2-cluster.c:666-705` at qemu v10.0.0), after the entry
+/// has classified as valid:
+///
+/// * a compressed entry: a data-file image has no compressed clusters,
+///   and qemu fails with "Compressed cluster entry found in image with
+///   external data file" (`:668-675`);
+/// * a host cluster offset that differs from the guest cluster offset:
+///   qemu maps a data file one to one, and fails with "External data
+///   file host cluster offset ... does not match guest cluster offset"
+///   (`:696-704`). Without the rule, instar read the data file at the
+///   entry's offset and returned the wrong bytes under success.
+///
+/// It travels as [`InvalidL2EntryRefusal`] does: the guest calls
+/// `send_error(operation, device, sector, status)` with
+/// [`DataFileEntryRefusal::OPERATION`] as the operation string, and the
+/// host's `SerialDecoder` captures it and renders it in place of the
+/// generic failure text.
+///
+/// The `sector` argument carries the **virtual byte offset of the
+/// cluster** whose entry was refused (qemu's "guest cluster offset"),
+/// not a sector number. `status` carries which rule the entry breaks,
+/// one of the `STATUS_*` constants.
+pub struct DataFileEntryRefusal;
+
+impl DataFileEntryRefusal {
+    /// Reserved `send_error` operation marker for this signal. Distinct
+    /// from every real operation name, from `"cpu-exception"`, from
+    /// [`DifferencingRefusal::OPERATION`] and from
+    /// [`InvalidL2EntryRefusal::OPERATION`], so the host's decoder can
+    /// tell the `send_error` uses apart.
+    pub const OPERATION: &'static str = "qcow2-data-file-entry";
+
+    /// The same marker as [`Self::OPERATION`], NUL-terminated, for the
+    /// call table's `send_error`. `data_file_entry_marker_c_string_matches_operation`
+    /// asserts the two spellings agree.
+    pub const OPERATION_C: &'static [u8] = b"qcow2-data-file-entry\0";
+
+    // Status codes are stable: only appended, never reordered.
+    /// A compressed entry in an image with an external data file.
+    pub const STATUS_COMPRESSED: u32 = 1;
+    /// A host cluster offset that is not the guest cluster offset.
+    pub const STATUS_HOST_OFFSET_MISMATCH: u32 = 2;
+}
+
+// ============================================================================
 // Snapshot configuration and result structures
 // ============================================================================
 
@@ -4859,11 +4911,19 @@ pub const MAX_CHAIN_SEGMENTS: usize = MAX_CHAIN_DEVICES;
 /// guest hands its chain reader for the slots in this range: the
 /// devices at `first .. first + count` are one chain, `first` is its
 /// top image, and no device outside the range is behind any device
-/// inside it. An external data file inserted into the middle of a
-/// chain's device run belongs to the chain it was inserted into, so
-/// it is covered by that chain's segment and counts as a device
-/// behind the image above it, which is what the reader's own
-/// arithmetic already assumes.
+/// inside it.
+///
+/// An external data device -- a qcow2's data file, or a VMDK flat
+/// descriptor's extents -- stays inside its owner's segment, in the
+/// slots immediately after the owner, but it is not a layer of the
+/// chain. It carries [`ChainDeviceInfo::FLAG_DATA_DEVICE`], the reader
+/// reaches it only through its owner's
+/// [`data_device_idx`](ChainDeviceInfo::data_device_idx), and a walk
+/// down the chain steps over it: nothing is behind a data device, and
+/// it is behind nothing. Reading it as the layer under its owner served
+/// the data file's bytes for every cluster the owner leaves unallocated
+/// (issue #792). [`ChainConfig::data_devices_are_owned`] is the rule
+/// for where marked devices may sit.
 ///
 /// `device_count` alone cannot carry this: it bounds a flat array,
 /// and an operation reading two images at once packs both chains
@@ -4929,7 +4989,8 @@ pub struct ChainDeviceInfo {
     /// Detected format (ImageFormat as u32)
     pub format: u32,
 
-    /// Feature flags from the info operation
+    /// Feature flags from the info operation (the `InfoResult::FLAG_*`
+    /// bits), plus [`Self::FLAG_DATA_DEVICE`], which only the host sets.
     pub flags: u32,
 
     /// Virtual size in bytes
@@ -4945,11 +5006,32 @@ pub struct ChainDeviceInfo {
     /// 0 = data is in this device itself (normal case).
     /// Non-zero = device index of the external data file.
     /// Used for QCOW2 images with external data files where
-    /// metadata (L1/L2/refcounts) and cluster data are separate.
+    /// metadata (L1/L2/refcounts) and cluster data are separate,
+    /// and for a VMDK flat descriptor, whose extents start here.
+    /// The device it names carries [`Self::FLAG_DATA_DEVICE`].
     pub data_device_idx: u32,
 }
 
 impl ChainDeviceInfo {
+    /// The device is an external data device -- a qcow2's data file or
+    /// one of a VMDK flat descriptor's extents -- and not a layer of
+    /// the chain.
+    ///
+    /// The host sets this on every data device it attaches, and the
+    /// info operation never sets it: it describes the device's role in
+    /// this chain, which only the host knows, not anything the device's
+    /// own bytes say. The bit sits at the top of `flags`, well clear of
+    /// the `InfoResult::FLAG_*` bits that share the field, and the host
+    /// clears it from the flags an info operation reports, so an image
+    /// cannot mark itself.
+    ///
+    /// Without the mark a data device is indistinguishable from a raw
+    /// backing file in the slot after its owner, and the chain reader
+    /// read it as one (issue #792). See [`ChainSegment`] for the layout
+    /// and [`ChainConfig::data_devices_are_owned`] for the rule the guest
+    /// checks it against.
+    pub const FLAG_DATA_DEVICE: u32 = 1 << 31;
+
     /// Create a new empty device info
     pub const fn new() -> Self {
         Self {
@@ -4988,6 +5070,12 @@ impl ChainDeviceInfo {
     pub fn has_external_data_device(&self) -> bool {
         self.data_device_idx != 0
     }
+
+    /// Whether this device is an external data device rather than a
+    /// layer of the chain; see [`Self::FLAG_DATA_DEVICE`].
+    pub fn is_data_device(&self) -> bool {
+        (self.flags & Self::FLAG_DATA_DEVICE) != 0
+    }
 }
 
 /// Configuration for backing chain operations.
@@ -5021,7 +5109,7 @@ pub struct ChainConfig {
     /// Number of devices in the chain (1 = no backing files)
     pub device_count: u32,
 
-    /// Structure version for future extensibility (currently 3)
+    /// Structure version for future extensibility (currently 4)
     pub version: u32,
 
     /// Number of valid entries in `segments`. Never zero in a config
@@ -5045,8 +5133,16 @@ impl ChainConfig {
     /// Magic value for chain config
     pub const MAGIC: u32 = 0x4348414E; // "CHAN"
 
-    /// Current structure version (3 = segment_count / segments fields)
-    pub const VERSION: u32 = 3;
+    /// Current structure version (3 = segment_count / segments fields,
+    /// 4 = data devices carry [`ChainDeviceInfo::FLAG_DATA_DEVICE`]).
+    ///
+    /// Version 4 changes no field offset. It is a new version anyway
+    /// because the two sides would otherwise disagree about the same
+    /// bytes without either noticing: a version 3 guest handed a
+    /// version 4 config ignores the mark and reads the data file as the
+    /// layer under its owner (issue #792), and a version 3 host writes
+    /// data devices unmarked. The bump turns that skew into a refusal.
+    pub const VERSION: u32 = 4;
 
     /// Create a new empty chain config
     pub const fn new() -> Self {
@@ -5123,6 +5219,90 @@ impl ChainConfig {
             return false;
         }
         ChainSegment::covers(&self.segments[..declared], device_count)
+    }
+
+    /// True if every device marked [`ChainDeviceInfo::FLAG_DATA_DEVICE`]
+    /// in the first `device_count` slots sits where the host puts a data
+    /// device, and every `data_device_idx` names one.
+    ///
+    /// The host inserts an image's data devices in the slots immediately
+    /// after it, inside its segment, and points the image's
+    /// `data_device_idx` at the first of them. The chain reader steps
+    /// over every marked device, so a mark in the wrong place is a layer
+    /// the walk silently drops, and a `data_device_idx` naming an
+    /// unmarked device is a layer read as raw extent or data-file bytes.
+    /// Neither is something an image can cause -- the host writes both
+    /// fields -- so a config that breaks the rule means the host and the
+    /// guest disagree about the layout, and is refused rather than read.
+    ///
+    /// The rule, all of which the host's own layout satisfies:
+    ///
+    /// * no segment's first device is marked, because the top of a chain
+    ///   is never a data device;
+    /// * only a qcow2 (its external data file) or a VMDK flat descriptor
+    ///   (its extents) has a non-zero `data_device_idx`, and never one
+    ///   that is itself marked, because a data device has no metadata
+    ///   that could point anywhere;
+    /// * a non-zero `data_device_idx` names the slot immediately after
+    ///   its owner, inside `device_count`, and that slot is marked;
+    /// * every marked device is claimed by an owner: a qcow2 claims the
+    ///   one device its `data_device_idx` names, and a VMDK descriptor
+    ///   claims the run of marked devices that starts there, which is
+    ///   also where the reader's extent walk stops.
+    ///
+    /// No device can be claimed twice under these rules. A second owner
+    /// would have to sit inside the first owner's run to name a device
+    /// in it, and everything in a run is marked, which an owner may not
+    /// be. Nor can a run leave its segment: it is contiguous from the
+    /// slot after its owner, and the next segment's first device is
+    /// unmarked.
+    ///
+    /// Callers pass the device count they are about to walk, as for
+    /// [`Self::segmentation_covers`].
+    pub fn data_devices_are_owned(&self, device_count: usize) -> bool {
+        if device_count > MAX_CHAIN_DEVICES {
+            return false;
+        }
+        let devices = &self.devices[..device_count];
+
+        let declared = (self.segment_count as usize).min(MAX_CHAIN_SEGMENTS);
+        for seg in &self.segments[..declared] {
+            if devices
+                .get(seg.first as usize)
+                .is_some_and(|top| top.is_data_device())
+            {
+                return false;
+            }
+        }
+
+        let mut claimed = [false; MAX_CHAIN_DEVICES];
+        for (owner, info) in devices.iter().enumerate() {
+            let first = info.data_device_idx as usize;
+            if first == 0 {
+                continue;
+            }
+            let claims_a_run = match (info.is_data_device(), info.detected_format()) {
+                (false, ImageFormat::Qcow2) => false,
+                (false, ImageFormat::VmdkDescriptor) => true,
+                _ => return false,
+            };
+            if first != owner + 1 || first >= device_count || !devices[first].is_data_device() {
+                return false;
+            }
+            let mut d = first;
+            while d < device_count && devices[d].is_data_device() {
+                claimed[d] = true;
+                d += 1;
+                if !claims_a_run {
+                    break;
+                }
+            }
+        }
+
+        devices
+            .iter()
+            .zip(claimed.iter())
+            .all(|(info, &claimed)| claimed || !info.is_data_device())
     }
 
     /// Get the number of devices in the chain
@@ -6561,6 +6741,46 @@ mod tests {
     }
 
     #[test]
+    fn data_file_entry_operation_marker_is_distinct_from_the_other_senders() {
+        assert_eq!(DataFileEntryRefusal::OPERATION, "qcow2-data-file-entry");
+        for other in [
+            "cpu-exception",
+            DifferencingRefusal::OPERATION,
+            InvalidL2EntryRefusal::OPERATION,
+        ] {
+            assert_ne!(DataFileEntryRefusal::OPERATION, other);
+        }
+    }
+
+    #[test]
+    fn data_file_entry_marker_c_string_matches_operation() {
+        // As for the invalid-entry marker: a drift between the two
+        // spellings raises a refusal the host never captures.
+        let c = DataFileEntryRefusal::OPERATION_C;
+        assert_eq!(
+            c.last().copied(),
+            Some(0),
+            "the C marker must be NUL-terminated"
+        );
+        assert_eq!(
+            &c[..c.len() - 1],
+            DataFileEntryRefusal::OPERATION.as_bytes(),
+            "the C marker must spell the same operation as OPERATION"
+        );
+        assert!(
+            !DataFileEntryRefusal::OPERATION.as_bytes().contains(&0),
+            "OPERATION must not embed a NUL, or the C marker truncates it"
+        );
+    }
+
+    #[test]
+    fn data_file_entry_status_codes_are_stable_and_distinct() {
+        // Pinned: appended only, never reordered.
+        assert_eq!(DataFileEntryRefusal::STATUS_COMPRESSED, 1);
+        assert_eq!(DataFileEntryRefusal::STATUS_HOST_OFFSET_MISMATCH, 2);
+    }
+
+    #[test]
     fn map_config_flag_verbose_is_top_bit() {
         // The convention in this crate (cross-checked against
         // ConvertConfig::FLAG_VERBOSE) is that bit 31 carries
@@ -7327,6 +7547,43 @@ mod tests {
         config.version = ChainConfig::VERSION;
         config.magic = 0;
         assert!(!config.is_valid());
+    }
+
+    #[test]
+    fn chain_config_version_4_is_the_one_that_marks_data_devices() {
+        // Version 3 has the same field offsets as version 4. Its hosts
+        // write data devices unmarked and its guests ignore the mark, so
+        // either half of a 3/4 pair reads a data file as the layer under
+        // its owner (issue #792). Only the version tells them apart.
+        assert_eq!(ChainConfig::VERSION, 4);
+        let mut config = ChainConfig::single_chain(1);
+        config.version = 3;
+        assert!(
+            !config.is_valid(),
+            "a version 3 config predates the data device mark and must not validate"
+        );
+    }
+
+    #[test]
+    fn data_device_flag_is_clear_of_every_info_flag() {
+        // The info operation's flags travel in the same field. A shared
+        // bit would let an image's own header mark it as a data device.
+        let info_flags = InfoResult::FLAG_HAS_BACKING_FILE
+            | InfoResult::FLAG_HAS_EXTERNAL_DATA
+            | InfoResult::FLAG_ENCRYPTED
+            | InfoResult::FLAG_COMPRESSED
+            | InfoResult::FLAG_HAS_SNAPSHOTS
+            | InfoResult::FLAG_DIRTY
+            | InfoResult::FLAG_CORRUPT
+            | InfoResult::FLAG_HAS_MBR
+            | InfoResult::FLAG_HAS_GPT;
+        assert_eq!(info_flags & ChainDeviceInfo::FLAG_DATA_DEVICE, 0);
+
+        let mut dev = ChainDeviceInfo::new();
+        dev.flags = info_flags;
+        assert!(!dev.is_data_device());
+        dev.flags |= ChainDeviceInfo::FLAG_DATA_DEVICE;
+        assert!(dev.is_data_device());
     }
 
     #[test]
