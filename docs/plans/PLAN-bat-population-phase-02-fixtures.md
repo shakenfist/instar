@@ -262,7 +262,10 @@ do not need to redo them.
    that do not read the data region: `info`, `check` and `map`. A
    convert or compare of 128 GiB would be the first test in the suite
    to read that much, and the BAT walk that #626 breaks is already
-   exercised by `check` and `map`.
+   exercised by `check` and `map`. The same holds for the committed
+   dynamic 131041M fixture, which is 128 GiB virtual too, so it also
+   gets only `info`, `check` and `map` (corrected during step 2c; see
+   the execution notes).
 
 3. **The generator goes in `scripts/create-vhd-testdata.sh`**, as a
    new section behind the existing `REGEN_VHDX=1` switch, writing to
@@ -341,7 +344,26 @@ notes before the instar push.
 
 ## Execution notes
 
-None yet.
+- 2026-10-22 (AEDT). Back brief answers: run 2a→2d sequentially via
+  sub-agents; commit the five fixtures directly to instar-testdata
+  `main` (rebased on origin/main) once every instar step has passed
+  review and before the instar push; after the definition of done
+  passes and the testdata push has landed, push the branch and open
+  the pull request.
+- Step 2b generated the fixtures into a scratch directory with
+  `REGEN_VHDX=1` and copied only the five new files into
+  instar-testdata, because a `REGEN_VHDX=1` run against the real
+  checkout also regenerates the four existing non-reproducible VHDX
+  files. Review corrected the pinned range the draft claimed (6.0.0
+  to 10.2.0, not 5.2) and the script header's file counts.
+- Step 2c found that the step brief put the dynamic 131041M fixture
+  through the full read matrix, where convert and compare also fail
+  on #626 (compare reporting it as a content mismatch, #807). Rather
+  than tabling two more known failures, the fixture now gets only the
+  metadata operations, as decision 2 already did for the fixed
+  131041M images and for the same reason; decision 2 is corrected to
+  say so. The known-failure table holds the seven entries decision 4
+  lists, and the module runs 46 tests.
 
 ## Risks and mitigations
 
