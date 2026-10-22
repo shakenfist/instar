@@ -868,6 +868,29 @@ impl MapExtentState {
             MapExtentState::ZeroAllocated | MapExtentState::Hole => None,
         }
     }
+
+    /// This state with its host file offset, if it has one (see
+    /// [`Self::file_offset`]), moved on by `delta` bytes, as when the
+    /// front of an extent is trimmed off. The states without one are
+    /// returned unchanged.
+    ///
+    /// Kept beside `file_offset` and naming every state, so that a new
+    /// offset-bearing state is a compile error here rather than an
+    /// extent whose offset a caller forgets to move.
+    pub fn advanced_by(self, delta: u64) -> Self {
+        match self {
+            MapExtentState::Data { file_offset } => MapExtentState::Data {
+                file_offset: file_offset.saturating_add(delta),
+            },
+            MapExtentState::ZeroAllocatedAt { file_offset } => MapExtentState::ZeroAllocatedAt {
+                file_offset: file_offset.saturating_add(delta),
+            },
+            MapExtentState::HoleAt { file_offset } => MapExtentState::HoleAt {
+                file_offset: file_offset.saturating_add(delta),
+            },
+            MapExtentState::ZeroAllocated | MapExtentState::Hole => self,
+        }
+    }
 }
 
 /// One contiguous extent of the source's virtual address space
@@ -3204,11 +3227,14 @@ impl DifferencingRefusal {
 /// host's `SerialDecoder` captures it, and a formatter renders it in
 /// place of the generic failure text.
 ///
-/// The `sector` argument carries the **virtual byte offset** of the
-/// refused read, not a sector number, so the host can name where in
-/// the guest-visible disk the corrupt entry lies without knowing the
-/// sector size the guest read with. `status` carries the index of the
-/// chain device whose L2 table holds the entry.
+/// The `sector` argument carries the **virtual byte offset of the
+/// cluster** whose entry was refused, not a sector number, so the host
+/// can name where in the guest-visible disk the corrupt entry lies
+/// without knowing the sector size the guest read with. It is the
+/// cluster's offset rather than the read's, so a read that starts
+/// mid-cluster names the same offset as `map` and `measure` do for the
+/// same entry. `status` carries the index of the chain device whose L2
+/// table holds the entry.
 pub struct InvalidL2EntryRefusal;
 
 impl InvalidL2EntryRefusal {
@@ -6459,6 +6485,48 @@ mod tests {
         assert_eq!(r.slice(), &[zero_alloc(0, 4096), za(4096, 4096, 0x1000)]);
         assert_eq!(za(0, 1, 7).state.file_offset(), Some(7));
         assert_eq!(hole(0, 1).state.file_offset(), None);
+    }
+
+    #[test]
+    fn advanced_by_moves_exactly_the_offsets_file_offset_reports() {
+        // Every state whose file_offset() is Some must have it moved by
+        // the trim, and every other state must come back unchanged.
+        let states = [
+            MapExtentState::Data {
+                file_offset: 0x1000,
+            },
+            MapExtentState::ZeroAllocatedAt {
+                file_offset: 0x1000,
+            },
+            MapExtentState::HoleAt {
+                file_offset: 0x1000,
+            },
+            MapExtentState::ZeroAllocated,
+            MapExtentState::Hole,
+        ];
+        for state in states {
+            let moved = state.advanced_by(0x200);
+            assert_eq!(
+                moved.file_offset(),
+                state.file_offset().map(|off| off + 0x200),
+                "{state:?}"
+            );
+            assert_eq!(
+                core::mem::discriminant(&moved),
+                core::mem::discriminant(&state),
+                "{state:?}: the state's kind must not change"
+            );
+        }
+        assert_eq!(
+            MapExtentState::Data {
+                file_offset: u64::MAX - 1
+            }
+            .advanced_by(4),
+            MapExtentState::Data {
+                file_offset: u64::MAX
+            },
+            "the offset saturates rather than wrapping"
+        );
     }
 
     #[test]

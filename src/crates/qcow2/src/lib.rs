@@ -1992,10 +1992,13 @@ pub fn data_file_entry_violation(
     }
 }
 
-/// An L2 entry a metadata walk (measure, map) refuses, and the virtual
-/// offset of the cluster it describes. qemu fails the same walk with
-/// `EIO`, so the walkers stop and the caller refuses the image rather
-/// than measuring or mapping it.
+/// An L2 entry a metadata walk (measure, map) or the chain reader
+/// refuses, and the virtual offset of the cluster it describes. qemu
+/// fails the same walk or read with `EIO`, so the walkers stop and the
+/// caller refuses the image rather than measuring or mapping it, and
+/// the reader fails the read. Every refusal is raised through
+/// `send_refused_l2_entry`, so all of them name the same offset for the
+/// same entry, wherever in the cluster the read began.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefusedL2Entry {
     /// [`subcluster_type`] classifies the entry `Invalid`: qemu's
@@ -2120,7 +2123,12 @@ pub fn count_allocated_in_l2_extended(
                     }
                     run_len
                 }
-                _ => 0,
+                // Every arm is named, so that a new subcluster type is a
+                // compile error here rather than silently not counted.
+                SubclusterType::ZeroPlain
+                | SubclusterType::ZeroAlloc
+                | SubclusterType::UnallocatedPlain
+                | SubclusterType::UnallocatedAlloc => 0,
             };
             total = total.saturating_add(counted_run);
             sc += run;
@@ -7556,33 +7564,39 @@ mod tests {
         }
     }
 
-    /// Read the range through both arms and check the read is refused
-    /// by name: once, with the invalid-L2-entry marker, the virtual
-    /// offset and the device index.
-    fn sc_assert_refused(chain: &ScChain, data_device_idx: u32, virt_off: u64, label: &str) {
+    /// Read the cluster at `cluster_off` through both arms, whole and as
+    /// a window inside it, and check every read is refused by name:
+    /// once, with the invalid-L2-entry marker, the cluster's virtual
+    /// offset and the device index. The window's refusal names the
+    /// cluster, not where the read began, as the map and measure walkers
+    /// name it and as the data-file refusal does.
+    fn sc_assert_refused(chain: &ScChain, data_device_idx: u32, cluster_off: u64, label: &str) {
+        assert_eq!(
+            cluster_off % SC_CLUSTER,
+            0,
+            "{label}: name a cluster's first byte"
+        );
         for (arm, ssz) in SC_ARMS {
-            let (ok, _, err) = sc_read(chain, data_device_idx, ssz, virt_off, SC_CLUSTER);
-            assert!(
-                !ok,
-                "{label} ({arm} arm): qemu fails this read with EIO, so must instar"
-            );
-            assert_eq!(
-                err.calls, 1,
-                "{label} ({arm} arm): the refusal must be raised on send_error exactly once"
-            );
-            assert_eq!(
-                err.op,
-                shared::InvalidL2EntryRefusal::OPERATION,
-                "{label} ({arm} arm): the read must fail by raising the invalid-entry refusal"
-            );
-            assert_eq!(
-                err.sector, virt_off,
-                "{label} ({arm} arm): the refusal names the virtual byte offset"
-            );
-            assert_eq!(
-                err.status, 0,
-                "{label} ({arm} arm): the refusal names chain device 0"
-            );
+            for (off, len) in [(0, SC_CLUSTER), (SC_CLUSTER / 2 + 512, 1024)] {
+                let virt_off = cluster_off + off;
+                let (ok, _, err) = sc_read(chain, data_device_idx, ssz, virt_off, len);
+                let what = std::format!("{label} ({arm} arm, {len} at {virt_off})");
+                assert!(!ok, "{what}: qemu fails this read with EIO, so must instar");
+                assert_eq!(
+                    err.calls, 1,
+                    "{what}: the refusal must be raised on send_error exactly once"
+                );
+                assert_eq!(
+                    err.op,
+                    shared::InvalidL2EntryRefusal::OPERATION,
+                    "{what}: the read must fail by raising the invalid-entry refusal"
+                );
+                assert_eq!(
+                    err.sector, cluster_off,
+                    "{what}: the refusal names the cluster's virtual byte offset"
+                );
+                assert_eq!(err.status, 0, "{what}: the refusal names chain device 0");
+            }
         }
     }
 
@@ -16172,6 +16186,16 @@ fn chunk_crosses_granule(virtual_offset: u64, chunk_size: u64, granule: u64) -> 
 /// there again, so a split adds at most one reader frame per device.
 /// The frame is about 10.7KB in the convert build, so a chain of
 /// `MAX_CHAIN_DEVICES` stays under 350KB of the guest's 4MB stack.
+///
+/// # Safety
+///
+/// The same requirements as [`read_chain_virtual_cluster`], which every
+/// piece is passed to with these arguments: `buf` must point to at least
+/// `chunk_size` writable bytes, since each piece is written at its offset
+/// into it; `compressed_buf`, `staging_buf` and `staging_cluster_offset`
+/// must be as that function describes; and `call_table` must be valid.
+/// `granule` must be non-zero, which [`chunk_crosses_granule`] returning
+/// true guarantees, so only call this when it does.
 #[allow(clippy::too_many_arguments)]
 unsafe fn read_chain_split_at_granule(
     granule: u64,
@@ -16802,29 +16826,41 @@ pub unsafe fn read_chain_virtual_cluster(
                     Some(ClusterLookup::Compressed(_)) => {
                         return false;
                     }
+                    // Both refusals name the virtual offset of the
+                    // cluster whose entry is refused, not of this chunk,
+                    // so a read that starts mid-cluster names the same
+                    // offset as map's and measure's walkers do for the
+                    // same entry. The refusal is raised by name because
+                    // this function's bool cannot carry the reason.
                     Some(ClusterLookup::Invalid) => {
                         // qemu fails the read with EIO and "Invalid cluster
                         // entry found" (block/qcow2-cluster.c:712-718 at
-                        // v10.0.0). Before #653 this entry's host offset 0
-                        // was read, serving the image's own header as
-                        // guest data. The refusal is raised by name because
-                        // this function's bool cannot carry the reason.
-                        send_invalid_l2_entry_refusal(call_table, dev_idx as u32, virtual_offset);
+                        // v10.0.0). Reading this entry's host offset 0
+                        // would serve the image's own header as guest
+                        // data (#653).
+                        let virtual_offset = virtual_offset - virtual_offset % qcow2_cluster_size;
+                        send_refused_l2_entry(
+                            call_table,
+                            dev_idx as u32,
+                            RefusedL2Entry::Invalid { virtual_offset },
+                        );
                         return false;
                     }
                     Some(ClusterLookup::DataFileRefused(violation)) => {
                         // qemu fails the read with EIO before it reads
                         // anything (block/qcow2-cluster.c:668-675 and
-                        // :696-704 at v10.0.0). Without this a compressed
-                        // entry was inflated from the image, and a moved
-                        // host offset read the data file at the wrong
-                        // place under success (#803). The refusal names
-                        // the cluster's guest offset, as qemu's message
-                        // does.
-                        send_data_file_entry_refusal(
+                        // :696-704 at v10.0.0). Reading on would inflate a
+                        // compressed entry from the image, or read the
+                        // data file at a moved host offset, and return the
+                        // wrong bytes under success (#803).
+                        let virtual_offset = virtual_offset - virtual_offset % qcow2_cluster_size;
+                        send_refused_l2_entry(
                             call_table,
-                            virtual_offset - virtual_offset % qcow2_cluster_size,
-                            violation,
+                            dev_idx as u32,
+                            RefusedL2Entry::DataFile {
+                                virtual_offset,
+                                violation,
+                            },
                         );
                         return false;
                     }
@@ -18084,14 +18120,12 @@ pub unsafe fn read_chain_virtual_cluster(
                 //
                 // The extents are the run of marked data devices that
                 // starts at data_device_idx, and the walk stops at the
-                // first device that is not one. Before the mark it ran
-                // on until a zero virtual_size or the end of the array,
-                // so a read past the last extent took whatever device
-                // came next -- the descriptor's parent, or under
-                // `compare` the other input's top image -- as one more
-                // extent and served its raw bytes, under success.
-                // qemu reads zeros there. `init_chain_states` checks
-                // that the run is where the host put it.
+                // first device that is not one. The device after the
+                // last extent is the descriptor's parent, or under
+                // `compare` the other input's top image; taking it as
+                // one more extent would serve its raw bytes under
+                // success where qemu reads zeros. `init_chain_states`
+                // checks that the run is where the host put it.
                 let mut remaining = virtual_offset;
                 let mut d = first_data_dev;
                 while (d as usize) < chain_config.device_count as usize
@@ -18223,48 +18257,6 @@ pub unsafe fn read_chain_virtual_range(
     true
 }
 
-/// Initialize QCOW2 state for each QCOW2 device in a chain.
-///
-/// Iterates over `device_count` devices, initializing a `Qcow2State` for
-/// each one whose format is QCOW2. Returns `true` on success, or `false`
-/// if any QCOW2 device fails to initialize.
-///
-/// # Safety
-///
-/// Caller must ensure `call_table` is a valid initialized `CallTable`,
-/// `chain_config` describes the attached devices, `device_count` does not
-/// exceed `MAX_CHAIN_DEVICES`, and the memory regions at
-/// `dynamic_bufs_start` are large enough for L1/L2 caches.
-pub unsafe fn init_chain_qcow2_states(
-    call_table: &CallTable,
-    chain_config: &ChainConfig,
-    qcow2_states: &mut [Option<Qcow2State>; MAX_CHAIN_DEVICES],
-    device_count: usize,
-    sector_size: usize,
-    dynamic_bufs_start: usize,
-    bytes_read: &mut u64,
-) -> bool {
-    for (dev_idx, state) in qcow2_states.iter_mut().enumerate().take(device_count) {
-        let dev_info = &chain_config.devices[dev_idx];
-        if matches!(dev_info.detected_format(), ImageFormat::Qcow2) {
-            let cap = (call_table.get_input_capacity)(dev_idx as u32);
-            *state = Qcow2State::init(
-                call_table,
-                dev_idx as u32,
-                sector_size,
-                cap,
-                l1_cache_addr(dynamic_bufs_start, dev_idx),
-                l2_cache_addr(dynamic_bufs_start, dev_idx),
-                bytes_read,
-            );
-            if state.is_none() {
-                return false;
-            }
-        }
-    }
-    true
-}
-
 // ============================================================================
 // ChainStates: unified state container for multi-format chain reading
 // ============================================================================
@@ -18333,9 +18325,9 @@ unsafe fn send_differencing_refusal(call_table: &CallTable, status: u32) {
 /// compare, bench and rebase, none of which has a result code for "the
 /// image is corrupt", so the reason is raised from inside the reader on
 /// the channel the host already watches, as `send_differencing_refusal`
-/// does. `virtual_offset` travels in the `sector` argument as a byte
-/// offset and `dev_idx` in `status`; see
-/// [`shared::InvalidL2EntryRefusal`].
+/// does. `virtual_offset`, the virtual offset of the cluster whose entry
+/// is refused, travels in the `sector` argument as a byte offset and
+/// `dev_idx` in `status`; see [`shared::InvalidL2EntryRefusal`].
 ///
 /// # Safety
 ///
@@ -18376,7 +18368,7 @@ unsafe fn send_data_file_entry_refusal(
     );
 }
 
-/// Raise the named refusal a metadata walk found.
+/// Raise the named refusal a metadata walk or the chain reader found.
 ///
 /// # Safety
 ///
@@ -18406,9 +18398,10 @@ unsafe fn send_refused_l2_entry(call_table: &CallTable, dev_idx: u32, refused: R
 ///
 /// # Safety
 ///
-/// Same requirements as `init_chain_qcow2_states`: valid `call_table`,
-/// valid `chain_config`, `device_count <= MAX_CHAIN_DEVICES`, and
-/// sufficient memory at `dynamic_bufs_start`.
+/// Caller must ensure `call_table` is a valid initialized `CallTable`,
+/// `chain_config` describes the attached devices, `device_count` does not
+/// exceed `MAX_CHAIN_DEVICES`, and the memory regions at
+/// `dynamic_bufs_start` are large enough for every device's caches.
 // Same reason as `send_differencing_refusal` above: `debug_print` takes a
 // `*const u8`.
 #[allow(clippy::manual_c_str_literals)]

@@ -331,8 +331,6 @@ const CHECK_RESULT_FLAG_REPAIR_INCOMPLETE: u32 = 1 << 8;
 // ChainConfig constants (must match shared crate)
 // These are used by write_chain_config(), which every chain-reading op calls.
 #[allow(dead_code)]
-const CHAIN_CONFIG_MAGIC: u32 = 0x4348414E; // "CHAN"
-#[allow(dead_code)]
 const MAX_CHAIN_DEVICES: usize = 16;
 
 // InfoResult constants (must match shared crate)
@@ -802,8 +800,8 @@ struct SerialDecoder {
     /// no result struct to carry this fact, so it travels on `send_error`
     /// instead and is captured here for a resultless run loop to explain.
     last_differencing_refusal: Option<u32>,
-    /// The virtual byte offset of the last qcow2 read the guest refused
-    /// because its L2 entry is what qemu calls an invalid cluster entry:
+    /// The virtual byte offset of the cluster whose L2 entry the guest
+    /// last refused as what qemu calls an invalid cluster entry:
     /// the `sector` field of an `error` message whose `operation` is
     /// `shared::InvalidL2EntryRefusal::OPERATION`. Same pattern as the
     /// two above: the chain reader returns a bare bool, so the reason
@@ -877,7 +875,15 @@ impl SerialDecoder {
                         "External data file host cluster offset does not match guest cluster \
                          offset"
                     }
-                    _ => "corrupt qcow2 L2 entry in image with external data file",
+                    // Only the guest writes the port, so this is a guest
+                    // that knows a rule this host does not, or a garbled
+                    // frame: say so, rather than describe the image.
+                    _ => {
+                        return format!(
+                            "{op}: guest refused a qcow2 L2 entry with an unrecognised data-file \
+                             refusal status {status} at virtual offset {offset} ({offset:#x})"
+                        );
+                    }
                 };
                 format!("{op}: {what} at virtual offset {offset} ({offset:#x})")
             }
@@ -895,9 +901,10 @@ impl SerialDecoder {
     ///
     /// The wording keeps qemu's "Invalid cluster entry found", which is
     /// what `qemu-img` prints for the same image, so a user who has seen
-    /// one can recognise the other; the virtual offset is where in the
-    /// guest-visible disk the entry lies, as qemu's "error while reading
-    /// at byte N" gives it.
+    /// one can recognise the other. The virtual offset is that of the
+    /// cluster the entry describes, wherever in it the refused read
+    /// began, so `dd`, `convert`, `map` and `measure` all name the same
+    /// offset for the same entry.
     fn invalid_l2_entry_error(&self, op: &str) -> String {
         match self.last_invalid_l2_entry {
             Some(offset) => format!(
@@ -1225,6 +1232,27 @@ mod guest_exception_tests {
                     format!("{op}: {words} at virtual offset 65536 (0x10000)")
                 );
             }
+        }
+    }
+
+    #[test]
+    fn data_file_entry_error_names_an_unrecognised_status_as_such() {
+        // A status this host does not know is a fact about the guest, not
+        // about the image: the message must say the status was not
+        // recognised and give its value, not describe a corrupt entry.
+        // Truncated frames have decoded as 0 and 22, so both are pinned.
+        for status in [0, 22, u32::MAX] {
+            let mut decoder = super::SerialDecoder::new();
+            decoder.last_data_file_entry = Some((65536, status));
+            let msg = decoder.l2_entry_refusal_error("dd");
+            assert_eq!(
+                msg,
+                format!(
+                    "dd: guest refused a qcow2 L2 entry with an unrecognised data-file \
+                     refusal status {status} at virtual offset 65536 (0x10000)"
+                )
+            );
+            assert!(!msg.contains("corrupt"), "{msg}");
         }
     }
 
@@ -4039,12 +4067,12 @@ fn write_chain_config_header(
         .into());
     }
 
-    guest_mem.write_obj(CHAIN_CONFIG_MAGIC, GuestAddress(CHAIN_CONFIG_ADDR))?;
-    guest_mem.write_obj(device_count as u32, GuestAddress(CHAIN_CONFIG_ADDR + 4))?;
-    // The version comes from the shared crate the guest is built
-    // against, not from a copy kept here: two definitions let a bump
-    // reach one side only, which is the skew the version exists to
+    // The magic and the version come from the shared crate the guest
+    // is built against, not from copies kept here: two definitions let
+    // a change reach one side only, which is the skew both exist to
     // refuse.
+    guest_mem.write_obj(shared::ChainConfig::MAGIC, GuestAddress(CHAIN_CONFIG_ADDR))?;
+    guest_mem.write_obj(device_count as u32, GuestAddress(CHAIN_CONFIG_ADDR + 4))?;
     guest_mem.write_obj(
         shared::ChainConfig::VERSION,
         GuestAddress(CHAIN_CONFIG_ADDR + 8),

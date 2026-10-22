@@ -1691,9 +1691,14 @@ rust_case 'vhdx-read-zero-sector-group-allowed' "${VHDX_READ_LIB}" \
 # stops calling the entry Invalid, the refusal arm is never reached
 # and the first case would be testing dead code.
 rust_case 'qcow2-subcluster-alloc-at-host-zero-not-refused' "${QCOW2_LIB}" \
-    '                        send_invalid_l2_entry_refusal(call_table, dev_idx as u32, virtual_offset);
+    '                        send_refused_l2_entry(
+                            call_table,
+                            dev_idx as u32,
+                            RefusedL2Entry::Invalid { virtual_offset },
+                        );
                         return false;' \
-    '                        return true; // MUTATED: the refusal removed' \
+    '                        let _ = virtual_offset;
+                        return true; // MUTATED: the refusal removed' \
     qcow2 'extended_l2_wide_path_refuses_an_alloc_bit_at_host_zero' \
     --features "${QCOW2_FEATURES}"
 
@@ -1873,13 +1878,16 @@ rust_case 'qcow2-data-file-rules-before-invalid' "${QCOW2_LIB}" \
     --features "${QCOW2_FEATURES}"
 
 rust_case 'qcow2-data-file-entry-not-refused' "${QCOW2_LIB}" \
-    '                        send_data_file_entry_refusal(
+    '                        send_refused_l2_entry(
                             call_table,
-                            virtual_offset - virtual_offset % qcow2_cluster_size,
-                            violation,
+                            dev_idx as u32,
+                            RefusedL2Entry::DataFile {
+                                virtual_offset,
+                                violation,
+                            },
                         );
                         return false;' \
-    '                        let _ = violation;
+    '                        let _ = (virtual_offset, violation);
                         return true; // MUTATED: the refusal removed' \
     qcow2 'sc_data_file_host_offset_that_is_not_the_guest_offset_is_refused' \
     --features "${QCOW2_FEATURES}"

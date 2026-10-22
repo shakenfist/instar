@@ -2353,8 +2353,8 @@ binary, by `TestAdversarialChainDeviceCount` in `tests/test_adversarial.py`
 -- the same test module that builds the fixture, since no static
 `instar-testdata` image has this shape.
 
-Then **3 subcluster cases**, the first of the two groups not about a
-differencing format at all. It is here because the defect it
+Then **3 subcluster cases**, the first of the three groups not about
+a differencing format at all. It is here because the defect it
 guards is the same class as the rest -- a span the reader never wrote,
 returned to the caller under a successful read -- and because the
 differencing work's own fuzz target is what found it. An extended-L2
@@ -2472,7 +2472,7 @@ report a clean run; it warns once up front when it is missing.
 A full run took **4m59s** on a warm tree with `vhdiinfo` present and
 everything passing, and 4m43s when it held 57 cases; an earlier run
 of the same tree took 9m38s because it also had to build a docker
-image. Before the reader cases existed the 26 writer cases alone took
+image. Before the reader cases existed the writer cases alone took
 2m32s, 2m44s and 3m35s on three measured runs. Those are observations rather than estimates:
 an earlier "about two minutes" here was a guess, and an understated
 figure invites the reader to assume a run has hung. Expect a spread,

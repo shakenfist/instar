@@ -88,7 +88,8 @@ fn encode_extent(e: MapExtent) -> MapExtentRecord {
 /// `[window_start, window_end)`. Returns `Some(clipped)` if the
 /// extent overlaps the window; `None` if it lies entirely
 /// outside. The clipped extent's `file_offset` (for the states that
-/// carry one) is adjusted forward by the amount trimmed off the front.
+/// carry one, which `MapExtentState` decides) is adjusted forward by the
+/// amount trimmed off the front.
 fn clip_to_window(e: MapExtent, window_start: u64, window_end: u64) -> Option<MapExtent> {
     let e_end = e.start.saturating_add(e.length);
     if e_end <= window_start || e.start >= window_end {
@@ -98,22 +99,10 @@ fn clip_to_window(e: MapExtent, window_start: u64, window_end: u64) -> Option<Ma
     let new_end = e_end.min(window_end);
     let front_trim = new_start - e.start;
     let new_length = new_end - new_start;
-    let new_state = match e.state {
-        MapExtentState::Data { file_offset } => MapExtentState::Data {
-            file_offset: file_offset.saturating_add(front_trim),
-        },
-        MapExtentState::ZeroAllocatedAt { file_offset } => MapExtentState::ZeroAllocatedAt {
-            file_offset: file_offset.saturating_add(front_trim),
-        },
-        MapExtentState::HoleAt { file_offset } => MapExtentState::HoleAt {
-            file_offset: file_offset.saturating_add(front_trim),
-        },
-        other => other,
-    };
     Some(MapExtent {
         start: new_start,
         length: new_length,
-        state: new_state,
+        state: e.state.advanced_by(front_trim),
     })
 }
 

@@ -2551,8 +2551,9 @@ unsafe fn check_qcow2(
     // When true, standard (uncompressed) L2 cluster offsets point into
     // the external data file, not this metadata file. We must skip
     // bounds/overlap/refcount checks for those clusters against the
-    // metadata file size. Compressed clusters and L2 tables remain in
-    // the metadata file and are validated normally.
+    // metadata file size. L2 tables remain in the metadata file and
+    // are validated normally; a data-file image has no compressed
+    // clusters, so a compressed entry is reported as a corruption.
     let has_external_data = hdr.has_external_data;
 
     if has_external_data {
