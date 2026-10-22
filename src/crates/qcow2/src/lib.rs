@@ -2123,7 +2123,12 @@ pub fn count_allocated_in_l2_extended(
                     }
                     run_len
                 }
-                _ => 0,
+                // Every arm is named, so that a new subcluster type is a
+                // compile error here rather than silently not counted.
+                SubclusterType::ZeroPlain
+                | SubclusterType::ZeroAlloc
+                | SubclusterType::UnallocatedPlain
+                | SubclusterType::UnallocatedAlloc => 0,
             };
             total = total.saturating_add(counted_run);
             sc += run;
