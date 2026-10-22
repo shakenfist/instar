@@ -55,6 +55,14 @@
 #                                          vhdx-diff-child.vhdx
 #   vhdx-diff-grandchild-composed.raw    - the composition of all three
 #
+# and five qemu-written VHDX images, four fixed and one dynamic, whose
+# structure matches cases pinned in tests/helpers/qemu_pins.py (see the
+# section at the end of this script):
+#
+#   vhdx-fixed-16M.vhdx, vhdx-fixed-16M-bsz-off-data.vhdx,
+#   vhdx-fixed-17M.vhdx, vhdx-fixed-17M-bsz-off-data.vhdx,
+#   vhdx-dynamic-131041M-block-1M.vhdx
+#
 # The VHD grandchild sits on the ALIGNED child rather than the mixed one:
 # the mixed child shares a sector bitmap byte between owners on purpose, and
 # a third level over it would make every divergence a question about
@@ -81,21 +89,21 @@
 # sibling because there is no correct composition for a hostile parent
 # reference.
 #
-# Reproducibility: every file here is byte-reproducible except four VHDX
+# Reproducibility: every file here is byte-reproducible except nine VHDX
 # files, where qemu-img generates fresh header, log and virtual-disk-id GUIDs
-# that this script does not rewrite. Two of them, the real parent/child pair,
-# must therefore be regenerated and shipped together: the child
-# parent_linkage value binds to the parent DataWriteGuid, so a child paired
-# with a differently generated parent will not resolve. The third,
-# vhdx-diff-grandchild.vhdx, binds the same way to the child's
+# that this script does not rewrite. Five are the qemu-written images at the
+# end of this script, each independent of the others. Of the remaining four,
+# two, the real parent/child pair, must therefore be regenerated and shipped
+# together: the child parent_linkage value binds to the parent DataWriteGuid,
+# so a child paired with a differently generated parent will not resolve. The
+# third, vhdx-diff-grandchild.vhdx, binds the same way to the child's
 # DataWriteGuid and so must be shipped with the pair as well -- but it gets
-# its own guard rather than riding along with the pair's, because it binds
-# to the child as that file sits on disk and so can be built correctly
-# against a pair that is already committed. The fourth,
-# vhdx-differencing.vhdx, is not paired with anything -- it carries no
-# parent_linkage at all -- but it is still a fresh qemu-img product each run,
-# so it gets its own independent skip-if-exists guard below rather than
-# riding along with the pair's.
+# its own guard rather than riding along with the pair's, because it binds to
+# the child as that file sits on disk and so can be built correctly against a
+# pair that is already committed. The fourth, vhdx-differencing.vhdx, is not
+# paired with anything -- it carries no parent_linkage at all -- but it is
+# still a fresh qemu-img product each run, so it gets its own independent
+# skip-if-exists guard below rather than riding along with the pair's.
 #
 # That includes vhd-differencing.vhd, the one VHD here qemu-img creates, and
 # it holds across qemu versions rather than only within one. A VHD footer does
@@ -140,7 +148,7 @@ set -euo pipefail
 
 # The audit directory defaults WITH the output directory, not independently
 # of it.  A one-argument run is the scratch dry-run the reproducibility check
-# prescribes, and it must not send the sixteen format-coverage files to the
+# prescribes, and it must not send the twenty format-coverage files to the
 # scratch tree while still writing the six adversarial ones into the real
 # testdata checkout: the moment a constant in VHD_ADVERSARIAL_FIXTURES
 # changes, that would rewrite six committed LFS objects from a run nobody
@@ -1931,5 +1939,62 @@ def write_vhdx_pair(p, written):
 if __name__ == "__main__":
     sys.exit(main())
 PYTHON_DIFF
+
+# --- qemu-written fixed VHDX, and a dynamic VHDX at the 131041M geometry ---
+#
+# Five small images written by the host qemu-img, shaped to match the cases
+# in tests/helpers/qemu_pins.py so that each one's structural summary can be
+# compared with what every pinned qemu build, 6.0.0 to 10.2.0, writes:
+#
+#   vhdx-fixed-16M.vhdx                  - fixed, 16 MiB: two whole 8 MiB
+#                                          blocks, ZERO block states
+#   vhdx-fixed-16M-bsz-off-data.vhdx     - fixed with block_state_zero=off,
+#                                          16 MiB, FULLY_PRESENT blocks, with
+#                                          0x11 at 0 and 0x22 at 12 MiB
+#   vhdx-fixed-17M.vhdx                  - fixed, 17 MiB: a partial final
+#                                          block, ZERO block states
+#   vhdx-fixed-17M-bsz-off-data.vhdx     - fixed with block_state_zero=off,
+#                                          17 MiB, with 0x33 at 0 and 0x44 in
+#                                          the last 64 KiB
+#   vhdx-dynamic-131041M-block-1M.vhdx   - dynamic, 1 MiB blocks, 131041 MiB
+#                                          virtual size, 8 MiB on disk
+#
+# Like the VHDX files above these are not byte-reproducible (qemu-img stamps
+# fresh GUIDs), so each is opt in and independently guarded: it is skipped
+# when it already exists unless REGEN_VHDX=1 is passed.  They are not paired
+# with anything, so regenerating one never touches another.
+
+echo "  Creating qemu-written VHDX images..."
+
+# make_qemu_vhdx NAME SIZE OPTIONS [QEMU-IO-ARGS...]
+make_qemu_vhdx() {
+    local name="$1" size="$2" opts="$3"
+    shift 3
+    local path="$OUTDIR/$name"
+    case "${REGEN_VHDX:-0}" in
+        ""|0|[Ff][Aa][Ll][Ss][Ee]|[Nn][Oo]|[Oo][Ff][Ff]) ;;
+        *) rm -f "$path" ;;
+    esac
+    if [ -e "$path" ]; then
+        echo "  Skipping $name: it exists and is not byte-reproducible." \
+             "Pass REGEN_VHDX=1 to rebuild it."
+        return 0
+    fi
+    qemu-img create -q -f vhdx -o "$opts" "$path" "$size"
+    if [ "$#" -gt 0 ]; then
+        qemu-io -f vhdx "$@" "$path" > /dev/null
+    fi
+    echo "  Created $path ($(stat -c %s "$path") bytes)"
+}
+
+make_qemu_vhdx vhdx-fixed-16M.vhdx 16M subformat=fixed
+make_qemu_vhdx vhdx-fixed-16M-bsz-off-data.vhdx 16M \
+    subformat=fixed,block_state_zero=off \
+    -c 'write -P 0x11 0 64k' -c 'write -P 0x22 12M 64k'
+make_qemu_vhdx vhdx-fixed-17M.vhdx 17M subformat=fixed
+make_qemu_vhdx vhdx-fixed-17M-bsz-off-data.vhdx 17M \
+    subformat=fixed,block_state_zero=off \
+    -c 'write -P 0x33 0 64k' -c 'write -P 0x44 17344k 64k'
+make_qemu_vhdx vhdx-dynamic-131041M-block-1M.vhdx 131041M block_size=1M
 
 echo "Done. Verify with: qemu-img info $OUTDIR/vhd-fixed.vhd"
