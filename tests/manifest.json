@@ -361,6 +361,61 @@
             "generated_by": "scripts/create-vhd-testdata.sh"
         },
         {
+            "id": "vhdx-fixed-16M",
+            "path": "custom/format-coverage/vhdx-fixed-16M.vhdx",
+            "format": "vhdx",
+            "safety": "safe",
+            "run_in_ci": true,
+            "sha256": "f1abdb07673edc61389455e11b653453406ad7157fd9cd152673b0206d327c2c",
+            "description": "Fixed VHDX (16 MiB, two whole 8 MiB blocks) written by qemu-img create -f vhdx -o subformat=fixed. The BAT holds ZERO block states. Its structural summary equals the vhdx-fixed-16M case in tests/helpers/qemu_pins.py, which every pinned qemu build from 6.0.0 to 10.2.0 writes identically",
+            "tags": ["vhdx", "fixed", "format-coverage"],
+            "generated_by": "scripts/create-vhd-testdata.sh"
+        },
+        {
+            "id": "vhdx-fixed-16M-bsz-off-data",
+            "path": "custom/format-coverage/vhdx-fixed-16M-bsz-off-data.vhdx",
+            "format": "vhdx",
+            "safety": "safe",
+            "run_in_ci": true,
+            "sha256": "31be0d4f70a80bbd975367569ca772ba5f019f54a033609e58536e75b482c0f2",
+            "description": "Fixed VHDX (16 MiB) written by qemu-img create -f vhdx -o subformat=fixed,block_state_zero=off, then qemu-io writes 0x11 at offset 0 and 0x22 at 12M, 64 KiB each. The BAT holds FULLY_PRESENT block states at sequential offsets. Its structural summary equals the vhdx-fixed-16M-bsz-off case in tests/helpers/qemu_pins.py",
+            "tags": ["vhdx", "fixed", "format-coverage"],
+            "generated_by": "scripts/create-vhd-testdata.sh"
+        },
+        {
+            "id": "vhdx-fixed-17M",
+            "path": "custom/format-coverage/vhdx-fixed-17M.vhdx",
+            "format": "vhdx",
+            "safety": "safe",
+            "run_in_ci": true,
+            "sha256": "00e962bcbacac4dd05d7545ced92088df88484b62a0ef8aea72277b615cb28f4",
+            "description": "Fixed VHDX (17 MiB, three 8 MiB blocks, the last holding 1 MiB) written by qemu-img create -f vhdx -o subformat=fixed. The BAT holds ZERO block states. Its structural summary equals the vhdx-fixed-17M case in tests/helpers/qemu_pins.py",
+            "tags": ["vhdx", "fixed", "format-coverage"],
+            "generated_by": "scripts/create-vhd-testdata.sh"
+        },
+        {
+            "id": "vhdx-fixed-17M-bsz-off-data",
+            "path": "custom/format-coverage/vhdx-fixed-17M-bsz-off-data.vhdx",
+            "format": "vhdx",
+            "safety": "safe",
+            "run_in_ci": true,
+            "sha256": "4e49c621caada9259079b06f66c920627bb5213a1799350e50d7c6a835bdf93a",
+            "description": "Fixed VHDX (17 MiB, partial final block) written by qemu-img create -f vhdx -o subformat=fixed,block_state_zero=off, then qemu-io writes 0x33 at offset 0 and 0x44 at 17344k (the last 64 KiB), 64 KiB each. Its structural summary equals the vhdx-fixed-17M-bsz-off case in tests/helpers/qemu_pins.py",
+            "tags": ["vhdx", "fixed", "format-coverage"],
+            "generated_by": "scripts/create-vhd-testdata.sh"
+        },
+        {
+            "id": "vhdx-dynamic-131041M-block-1M",
+            "path": "custom/format-coverage/vhdx-dynamic-131041M-block-1M.vhdx",
+            "format": "vhdx",
+            "safety": "safe",
+            "run_in_ci": true,
+            "sha256": "82b073bcd69bdde0c244955ba905be943ced908f276b7942fa5d31ec9cf0ac51",
+            "description": "Dynamic VHDX with 1 MiB blocks and a 131041 MiB virtual size, written by qemu-img create -f vhdx -o block_size=1M. It stores 8 MiB and has the BAT geometry of a very large disk. Its structural summary equals the vhdx-dynamic-131041M-block-1M case in tests/helpers/qemu_pins.py",
+            "tags": ["vhdx", "dynamic", "format-coverage"],
+            "generated_by": "scripts/create-vhd-testdata.sh"
+        },
+        {
             "id": "vmdk-multi-extent",
             "path": "custom/format-coverage/vmdk-multi-extent.vmdk",
             "format": "vmdk",
