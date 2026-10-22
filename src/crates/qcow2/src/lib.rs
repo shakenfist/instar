@@ -18257,48 +18257,6 @@ pub unsafe fn read_chain_virtual_range(
     true
 }
 
-/// Initialize QCOW2 state for each QCOW2 device in a chain.
-///
-/// Iterates over `device_count` devices, initializing a `Qcow2State` for
-/// each one whose format is QCOW2. Returns `true` on success, or `false`
-/// if any QCOW2 device fails to initialize.
-///
-/// # Safety
-///
-/// Caller must ensure `call_table` is a valid initialized `CallTable`,
-/// `chain_config` describes the attached devices, `device_count` does not
-/// exceed `MAX_CHAIN_DEVICES`, and the memory regions at
-/// `dynamic_bufs_start` are large enough for L1/L2 caches.
-pub unsafe fn init_chain_qcow2_states(
-    call_table: &CallTable,
-    chain_config: &ChainConfig,
-    qcow2_states: &mut [Option<Qcow2State>; MAX_CHAIN_DEVICES],
-    device_count: usize,
-    sector_size: usize,
-    dynamic_bufs_start: usize,
-    bytes_read: &mut u64,
-) -> bool {
-    for (dev_idx, state) in qcow2_states.iter_mut().enumerate().take(device_count) {
-        let dev_info = &chain_config.devices[dev_idx];
-        if matches!(dev_info.detected_format(), ImageFormat::Qcow2) {
-            let cap = (call_table.get_input_capacity)(dev_idx as u32);
-            *state = Qcow2State::init(
-                call_table,
-                dev_idx as u32,
-                sector_size,
-                cap,
-                l1_cache_addr(dynamic_bufs_start, dev_idx),
-                l2_cache_addr(dynamic_bufs_start, dev_idx),
-                bytes_read,
-            );
-            if state.is_none() {
-                return false;
-            }
-        }
-    }
-    true
-}
-
 // ============================================================================
 // ChainStates: unified state container for multi-format chain reading
 // ============================================================================
@@ -18440,9 +18398,10 @@ unsafe fn send_refused_l2_entry(call_table: &CallTable, dev_idx: u32, refused: R
 ///
 /// # Safety
 ///
-/// Same requirements as `init_chain_qcow2_states`: valid `call_table`,
-/// valid `chain_config`, `device_count <= MAX_CHAIN_DEVICES`, and
-/// sufficient memory at `dynamic_bufs_start`.
+/// Caller must ensure `call_table` is a valid initialized `CallTable`,
+/// `chain_config` describes the attached devices, `device_count` does not
+/// exceed `MAX_CHAIN_DEVICES`, and the memory regions at
+/// `dynamic_bufs_start` are large enough for every device's caches.
 // Same reason as `send_differencing_refusal` above: `debug_print` takes a
 // `*const u8`.
 #[allow(clippy::manual_c_str_literals)]
