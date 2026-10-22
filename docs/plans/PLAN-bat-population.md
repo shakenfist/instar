@@ -709,7 +709,7 @@ rather than merge requests.
 
 | Phase | Plan | Status | Merged |
 |-------|------|--------|--------|
-| 1. Pin qemu's behaviour across the 80 static builds, build the structural VHDX comparator, correct `docs/create.md` | [PLAN-bat-population-phase-01-pin.md](PLAN-bat-population-phase-01-pin.md) | In progress | |
+| 1. Pin qemu's behaviour across the 80 static builds, build the structural VHDX comparator, correct `docs/create.md` | [PLAN-bat-population-phase-01-pin.md](PLAN-bat-population-phase-01-pin.md) | Complete | `fef62417` (#809) |
 | 2. Fixed VHDX fixtures and baselines (instar-testdata + instar) | PLAN-bat-population-phase-02-fixtures.md | Not started | |
 | 3. Host-only create: non-qcow2 preallocation parity and monolithicFlat | PLAN-bat-population-phase-03-host-create.md | Not started | |
 | 4. Read side: BAT entry count (#626), partial last block, `LeaveBlocksAllocated` and `resize` | PLAN-bat-population-phase-04-read-side.md | Not started | |
