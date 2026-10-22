@@ -9,7 +9,10 @@ reproduces #626 in 8 MiB. `scripts/create-vhd-testdata.sh` writes them.
 `TestVhdxFixedFixturePins` checks that each committed file has the
 structure every pinned `qemu-img` build writes for its command
 (`helpers.qemu_pins`), so the fixture stands for all of them rather than
-for the one build that generated it. That needs no qemu.
+for the one build that generated it, and that each fixed fixture holds
+exactly the data the generator wrote, read through its BAT. That needs no
+qemu, so it also catches a fixture whose data never landed, which the
+reads below would not: instar and qemu-img agree on an all-zero image.
 
 `TestVhdxFixedReads` runs instar's read operations on those fixtures and
 on four images built here with the host `qemu-img`: the two convert-to-fixed
@@ -33,7 +36,10 @@ from pathlib import Path
 
 from base import QEMU_TOOL_TIMEOUT, InstarTestBase
 from helpers import qemu_pins
-from helpers.vhdx_structure import parse_vhdx, structural_diff, summarise
+from helpers.vhdx_structure import KIND_PAYLOAD, parse_vhdx, structural_diff, summarise
+
+KiB = 1024
+MiB = 1024 * KiB
 
 # Each committed fixture's manifest id, and the pin case for the
 # `qemu-img create` that wrote it. The data written into the `off` images
@@ -46,6 +52,22 @@ FIXTURE_PIN_CASES = {
     'vhdx-fixed-17M-bsz-off-data': 'vhdx-fixed-17M-bsz-off',
     'vhdx-dynamic-131041M-block-1M': 'vhdx-dynamic-131041M-block-1M',
 }
+
+# What `scripts/create-vhd-testdata.sh` writes into each fixed fixture with
+# qemu-io, as (offset, length, byte); every other byte of the virtual disk
+# is zero. The last write in the 17M image lands in its partial final
+# block, the block #797 is about.
+FIXTURE_DATA = {
+    'vhdx-fixed-16M': (),
+    'vhdx-fixed-16M-bsz-off-data': ((0, 64 * KiB, 0x11), (12 * MiB, 64 * KiB, 0x22)),
+    'vhdx-fixed-17M': (),
+    'vhdx-fixed-17M-bsz-off-data': ((0, 64 * KiB, 0x33), (17344 * KiB, 64 * KiB, 0x44)),
+}
+
+# BAT payload states (SPEC(VHDX) 2.5.1): those that read as zeros, and the
+# one whose block is read from the file.
+ZERO_STATES = (0, 1, 2, 3)
+FULLY_PRESENT = 6
 
 # Images built at test time by `qemu-img convert -f raw -O vhdx` of
 # `qemu_pins.write_convert_source`, named for the pin case whose `-o`
@@ -80,6 +102,11 @@ READ_MATRIX.update({name: METADATA_OPS for name in ['vhdx-dynamic-131041M-block-
 # message. `check` reports why only on its verbose output, so it is run
 # with `-v` here; `map` refuses a VHDX whose BAT it cannot lay out as an
 # unrecognised format.
+#
+# The map entries match loosely: the map guest reports no reason, even
+# with -v, so any failure to lay out the BAT reads as an unrecognised
+# format. The check entries carry the precise #626 message for the same
+# images.
 #
 # #626: instar counts one sector bitmap slot more than the BAT holds, a
 # trailing one after the last payload entry. That only matters when the
@@ -145,6 +172,28 @@ def _first_difference(a: Path, b: Path):
             offset += len(chunk_a)
 
 
+def _virtual_disk(path: Path) -> bytes:
+    """The virtual disk of a VHDX with no parent, read through its BAT without qemu or instar."""
+    structure = parse_vhdx(path)
+    size = structure.virtual_disk_size
+    disk = bytearray(size)
+    payload_blocks = (entry for entry in structure.bat_entries() if entry[1] == KIND_PAYLOAD)
+    with open(path, 'rb') as handle:
+        for block, (index, _kind, state, offset) in enumerate(payload_blocks):
+            if state in ZERO_STATES:
+                continue
+            if state != FULLY_PRESENT:
+                raise ValueError(f'BAT entry {index} has state {state}, which this reader does not handle')
+            start = block * structure.block_size
+            length = min(structure.block_size, size - start)
+            handle.seek(offset)
+            chunk = handle.read(length)
+            if len(chunk) != length:
+                raise ValueError(f'BAT entry {index} at file offset {offset} runs past the end of the file')
+            disk[start:start + length] = chunk
+    return bytes(disk)
+
+
 def _map_coverage_problems(extents, virtual_size):
     """Why `extents` do not tile `[0, virtual_size)` exactly, or nothing if they do."""
     position = 0
@@ -159,7 +208,7 @@ def _map_coverage_problems(extents, virtual_size):
 
 
 class TestVhdxFixedFixturePins(InstarTestBase):
-    """Each committed fixture has the structure every pinned qemu-img build writes."""
+    """Each committed fixture has the structure every pinned qemu-img build writes, and its data."""
 
 
 def _make_pin_test(image_id, case_name):
@@ -177,8 +226,28 @@ def _make_pin_test(image_id, case_name):
     return test
 
 
+def _make_data_test(image_id, writes):
+    def test(self):
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(f'fixture not available: {image.path}')
+        got = _virtual_disk(image.path)
+        want = bytearray(len(got))
+        for offset, length, byte in writes:
+            want[offset:offset + length] = bytes([byte]) * length
+        if got != want:
+            first = next(i for i in range(len(got)) if got[i] != want[i])
+            self.fail(f'{image_id} holds 0x{got[first]:02x} at virtual offset {first} where the generator wrote '
+                      f'0x{want[first]:02x}; regenerate it with scripts/create-vhd-testdata.sh')
+
+    test.__doc__ = f'{image_id} holds exactly the data the generator wrote.'
+    return test
+
+
 for _image_id, _case_name in FIXTURE_PIN_CASES.items():
     setattr(TestVhdxFixedFixturePins, _test_name(_image_id), _make_pin_test(_image_id, _case_name))
+for _image_id, _writes in FIXTURE_DATA.items():
+    setattr(TestVhdxFixedFixturePins, _test_name(_image_id, 'data'), _make_data_test(_image_id, _writes))
 
 
 class TestVhdxFixedReads(InstarTestBase):

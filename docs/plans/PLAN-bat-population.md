@@ -1468,6 +1468,10 @@ chosen to defer to here, so that we do not forget them.
   BAT, and so its data region, by the log's size.
 * `convert -O vpc` fixed output. instar converts to dynamic VHD only;
   qemu converts to either.
+* A failed `instar convert` leaves a zero-byte output file (seen on the
+  #626 geometry). Measure what qemu-img leaves behind on the same
+  failure before calling it a defect; if qemu removes or never creates
+  the file, instar should match.
 * `block_state_zero` on `convert`, if a user needs qemu's default
   (appended-data) convert-to-fixed layout rather than the in-place one
   (open question 3).

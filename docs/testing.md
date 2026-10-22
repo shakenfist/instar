@@ -2712,7 +2712,10 @@ structure or contents the tests need to be exactly known:
 - `create-check-testdata.sh` — QCOW2 images with specific corruptions
 
 `tests/test_vhdx_fixed_fixtures.py` checks each of the five
-qemu-written fixtures against the structure pin, then runs instar's
+qemu-written fixtures against the structure pin, reads the four fixed
+ones through their BAT to check they hold exactly the data the
+generator wrote (needing neither qemu nor instar, since both would
+agree on an image whose writes never landed), then runs instar's
 read operations on them (and on some fixed and convert-built images
 made at test time) against `qemu-img`'s answers. Images at the 131041M
 geometry get only `info`, `check` and `map`, since a convert or compare

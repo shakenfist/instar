@@ -183,15 +183,17 @@ Also measured, and what each means for this phase:
   128M leaves `LeaveBlocksAllocated` set with the eight new BAT
   entries `NOT_PRESENT`, which qemu-img check accepts; `instar create
   -f vhdx` at 65T exits 0 where qemu-img refuses.
-* Not filed, recorded for the phases that own them:
+* Two smaller defects, recorded where the phases that own them will
+  find them:
   * `instar convert` leaves a zero-byte output file when it fails (seen
     on the #626 geometry). Whether qemu-img does the same was not
-    measured; phase 8's survey should measure it before calling it a
-    defect.
+    measured; it is in the master plan's Future work, which asks for
+    that measurement before calling it a defect.
   * `instar check` reports an image end offset of 75,497,472 on the
     65M `off` image, whose file is 76,546,048 bytes; on block-multiple
     images the two agree. It is the partial final block again, so it
-    belongs with #797 in phase 4.
+    is recorded on #797 (issuecomment-6334705401), which phase 4
+    fixes. qemu-img reports no end offset for VHDX at all.
 
 ### Manifest and the tests that read it
 

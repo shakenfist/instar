@@ -1980,10 +1980,16 @@ make_qemu_vhdx() {
              "Pass REGEN_VHDX=1 to rebuild it."
         return 0
     fi
-    qemu-img create -q -f vhdx -o "$opts" "$path" "$size"
+    # Build under a temporary name and move it into place last, so that a
+    # failed qemu-io cannot leave a data-less image the guard above would
+    # then keep.
+    local tmp="$path.tmp"
+    rm -f "$tmp"
+    qemu-img create -q -f vhdx -o "$opts" "$tmp" "$size"
     if [ "$#" -gt 0 ]; then
-        qemu-io -f vhdx "$@" "$path" > /dev/null
+        qemu-io -f vhdx "$@" "$tmp" > /dev/null
     fi
+    mv "$tmp" "$path"
     echo "  Created $path ($(stat -c %s "$path") bytes)"
 }
 
