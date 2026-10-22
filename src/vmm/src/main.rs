@@ -331,8 +331,6 @@ const CHECK_RESULT_FLAG_REPAIR_INCOMPLETE: u32 = 1 << 8;
 // ChainConfig constants (must match shared crate)
 // These are used by write_chain_config(), which every chain-reading op calls.
 #[allow(dead_code)]
-const CHAIN_CONFIG_MAGIC: u32 = 0x4348414E; // "CHAN"
-#[allow(dead_code)]
 const MAX_CHAIN_DEVICES: usize = 16;
 
 // InfoResult constants (must match shared crate)
@@ -4069,12 +4067,12 @@ fn write_chain_config_header(
         .into());
     }
 
-    guest_mem.write_obj(CHAIN_CONFIG_MAGIC, GuestAddress(CHAIN_CONFIG_ADDR))?;
-    guest_mem.write_obj(device_count as u32, GuestAddress(CHAIN_CONFIG_ADDR + 4))?;
-    // The version comes from the shared crate the guest is built
-    // against, not from a copy kept here: two definitions let a bump
-    // reach one side only, which is the skew the version exists to
+    // The magic and the version come from the shared crate the guest
+    // is built against, not from copies kept here: two definitions let
+    // a change reach one side only, which is the skew both exist to
     // refuse.
+    guest_mem.write_obj(shared::ChainConfig::MAGIC, GuestAddress(CHAIN_CONFIG_ADDR))?;
+    guest_mem.write_obj(device_count as u32, GuestAddress(CHAIN_CONFIG_ADDR + 4))?;
     guest_mem.write_obj(
         shared::ChainConfig::VERSION,
         GuestAddress(CHAIN_CONFIG_ADDR + 8),
