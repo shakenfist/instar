@@ -18120,14 +18120,12 @@ pub unsafe fn read_chain_virtual_cluster(
                 //
                 // The extents are the run of marked data devices that
                 // starts at data_device_idx, and the walk stops at the
-                // first device that is not one. Before the mark it ran
-                // on until a zero virtual_size or the end of the array,
-                // so a read past the last extent took whatever device
-                // came next -- the descriptor's parent, or under
-                // `compare` the other input's top image -- as one more
-                // extent and served its raw bytes, under success.
-                // qemu reads zeros there. `init_chain_states` checks
-                // that the run is where the host put it.
+                // first device that is not one. The device after the
+                // last extent is the descriptor's parent, or under
+                // `compare` the other input's top image; taking it as
+                // one more extent would serve its raw bytes under
+                // success where qemu reads zeros. `init_chain_states`
+                // checks that the run is where the host put it.
                 let mut remaining = virtual_offset;
                 let mut d = first_data_dev;
                 while (d as usize) < chain_config.device_count as usize
