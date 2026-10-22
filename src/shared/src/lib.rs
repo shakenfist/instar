@@ -3204,11 +3204,14 @@ impl DifferencingRefusal {
 /// host's `SerialDecoder` captures it, and a formatter renders it in
 /// place of the generic failure text.
 ///
-/// The `sector` argument carries the **virtual byte offset** of the
-/// refused read, not a sector number, so the host can name where in
-/// the guest-visible disk the corrupt entry lies without knowing the
-/// sector size the guest read with. `status` carries the index of the
-/// chain device whose L2 table holds the entry.
+/// The `sector` argument carries the **virtual byte offset of the
+/// cluster** whose entry was refused, not a sector number, so the host
+/// can name where in the guest-visible disk the corrupt entry lies
+/// without knowing the sector size the guest read with. It is the
+/// cluster's offset rather than the read's, so a read that starts
+/// mid-cluster names the same offset as `map` and `measure` do for the
+/// same entry. `status` carries the index of the chain device whose L2
+/// table holds the entry.
 pub struct InvalidL2EntryRefusal;
 
 impl InvalidL2EntryRefusal {

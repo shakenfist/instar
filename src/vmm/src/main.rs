@@ -802,8 +802,8 @@ struct SerialDecoder {
     /// no result struct to carry this fact, so it travels on `send_error`
     /// instead and is captured here for a resultless run loop to explain.
     last_differencing_refusal: Option<u32>,
-    /// The virtual byte offset of the last qcow2 read the guest refused
-    /// because its L2 entry is what qemu calls an invalid cluster entry:
+    /// The virtual byte offset of the cluster whose L2 entry the guest
+    /// last refused as what qemu calls an invalid cluster entry:
     /// the `sector` field of an `error` message whose `operation` is
     /// `shared::InvalidL2EntryRefusal::OPERATION`. Same pattern as the
     /// two above: the chain reader returns a bare bool, so the reason
@@ -895,9 +895,10 @@ impl SerialDecoder {
     ///
     /// The wording keeps qemu's "Invalid cluster entry found", which is
     /// what `qemu-img` prints for the same image, so a user who has seen
-    /// one can recognise the other; the virtual offset is where in the
-    /// guest-visible disk the entry lies, as qemu's "error while reading
-    /// at byte N" gives it.
+    /// one can recognise the other. The virtual offset is that of the
+    /// cluster the entry describes, wherever in it the refused read
+    /// began, so `dd`, `convert`, `map` and `measure` all name the same
+    /// offset for the same entry.
     fn invalid_l2_entry_error(&self, op: &str) -> String {
         match self.last_invalid_l2_entry {
             Some(offset) => format!(

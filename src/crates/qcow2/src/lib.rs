@@ -1992,10 +1992,13 @@ pub fn data_file_entry_violation(
     }
 }
 
-/// An L2 entry a metadata walk (measure, map) refuses, and the virtual
-/// offset of the cluster it describes. qemu fails the same walk with
-/// `EIO`, so the walkers stop and the caller refuses the image rather
-/// than measuring or mapping it.
+/// An L2 entry a metadata walk (measure, map) or the chain reader
+/// refuses, and the virtual offset of the cluster it describes. qemu
+/// fails the same walk or read with `EIO`, so the walkers stop and the
+/// caller refuses the image rather than measuring or mapping it, and
+/// the reader fails the read. Every refusal is raised through
+/// `send_refused_l2_entry`, so all of them name the same offset for the
+/// same entry, wherever in the cluster the read began.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefusedL2Entry {
     /// [`subcluster_type`] classifies the entry `Invalid`: qemu's
@@ -7556,33 +7559,39 @@ mod tests {
         }
     }
 
-    /// Read the range through both arms and check the read is refused
-    /// by name: once, with the invalid-L2-entry marker, the virtual
-    /// offset and the device index.
-    fn sc_assert_refused(chain: &ScChain, data_device_idx: u32, virt_off: u64, label: &str) {
+    /// Read the cluster at `cluster_off` through both arms, whole and as
+    /// a window inside it, and check every read is refused by name:
+    /// once, with the invalid-L2-entry marker, the cluster's virtual
+    /// offset and the device index. The window's refusal names the
+    /// cluster, not where the read began, as the map and measure walkers
+    /// name it and as the data-file refusal does.
+    fn sc_assert_refused(chain: &ScChain, data_device_idx: u32, cluster_off: u64, label: &str) {
+        assert_eq!(
+            cluster_off % SC_CLUSTER,
+            0,
+            "{label}: name a cluster's first byte"
+        );
         for (arm, ssz) in SC_ARMS {
-            let (ok, _, err) = sc_read(chain, data_device_idx, ssz, virt_off, SC_CLUSTER);
-            assert!(
-                !ok,
-                "{label} ({arm} arm): qemu fails this read with EIO, so must instar"
-            );
-            assert_eq!(
-                err.calls, 1,
-                "{label} ({arm} arm): the refusal must be raised on send_error exactly once"
-            );
-            assert_eq!(
-                err.op,
-                shared::InvalidL2EntryRefusal::OPERATION,
-                "{label} ({arm} arm): the read must fail by raising the invalid-entry refusal"
-            );
-            assert_eq!(
-                err.sector, virt_off,
-                "{label} ({arm} arm): the refusal names the virtual byte offset"
-            );
-            assert_eq!(
-                err.status, 0,
-                "{label} ({arm} arm): the refusal names chain device 0"
-            );
+            for (off, len) in [(0, SC_CLUSTER), (SC_CLUSTER / 2 + 512, 1024)] {
+                let virt_off = cluster_off + off;
+                let (ok, _, err) = sc_read(chain, data_device_idx, ssz, virt_off, len);
+                let what = std::format!("{label} ({arm} arm, {len} at {virt_off})");
+                assert!(!ok, "{what}: qemu fails this read with EIO, so must instar");
+                assert_eq!(
+                    err.calls, 1,
+                    "{what}: the refusal must be raised on send_error exactly once"
+                );
+                assert_eq!(
+                    err.op,
+                    shared::InvalidL2EntryRefusal::OPERATION,
+                    "{what}: the read must fail by raising the invalid-entry refusal"
+                );
+                assert_eq!(
+                    err.sector, cluster_off,
+                    "{what}: the refusal names the cluster's virtual byte offset"
+                );
+                assert_eq!(err.status, 0, "{what}: the refusal names chain device 0");
+            }
         }
     }
 
@@ -16802,29 +16811,41 @@ pub unsafe fn read_chain_virtual_cluster(
                     Some(ClusterLookup::Compressed(_)) => {
                         return false;
                     }
+                    // Both refusals name the virtual offset of the
+                    // cluster whose entry is refused, not of this chunk,
+                    // so a read that starts mid-cluster names the same
+                    // offset as map's and measure's walkers do for the
+                    // same entry. The refusal is raised by name because
+                    // this function's bool cannot carry the reason.
                     Some(ClusterLookup::Invalid) => {
                         // qemu fails the read with EIO and "Invalid cluster
                         // entry found" (block/qcow2-cluster.c:712-718 at
-                        // v10.0.0). Before #653 this entry's host offset 0
-                        // was read, serving the image's own header as
-                        // guest data. The refusal is raised by name because
-                        // this function's bool cannot carry the reason.
-                        send_invalid_l2_entry_refusal(call_table, dev_idx as u32, virtual_offset);
+                        // v10.0.0). Reading this entry's host offset 0
+                        // would serve the image's own header as guest
+                        // data (#653).
+                        let virtual_offset = virtual_offset - virtual_offset % qcow2_cluster_size;
+                        send_refused_l2_entry(
+                            call_table,
+                            dev_idx as u32,
+                            RefusedL2Entry::Invalid { virtual_offset },
+                        );
                         return false;
                     }
                     Some(ClusterLookup::DataFileRefused(violation)) => {
                         // qemu fails the read with EIO before it reads
                         // anything (block/qcow2-cluster.c:668-675 and
-                        // :696-704 at v10.0.0). Without this a compressed
-                        // entry was inflated from the image, and a moved
-                        // host offset read the data file at the wrong
-                        // place under success (#803). The refusal names
-                        // the cluster's guest offset, as qemu's message
-                        // does.
-                        send_data_file_entry_refusal(
+                        // :696-704 at v10.0.0). Reading on would inflate a
+                        // compressed entry from the image, or read the
+                        // data file at a moved host offset, and return the
+                        // wrong bytes under success (#803).
+                        let virtual_offset = virtual_offset - virtual_offset % qcow2_cluster_size;
+                        send_refused_l2_entry(
                             call_table,
-                            virtual_offset - virtual_offset % qcow2_cluster_size,
-                            violation,
+                            dev_idx as u32,
+                            RefusedL2Entry::DataFile {
+                                virtual_offset,
+                                violation,
+                            },
                         );
                         return false;
                     }
@@ -18333,9 +18354,9 @@ unsafe fn send_differencing_refusal(call_table: &CallTable, status: u32) {
 /// compare, bench and rebase, none of which has a result code for "the
 /// image is corrupt", so the reason is raised from inside the reader on
 /// the channel the host already watches, as `send_differencing_refusal`
-/// does. `virtual_offset` travels in the `sector` argument as a byte
-/// offset and `dev_idx` in `status`; see
-/// [`shared::InvalidL2EntryRefusal`].
+/// does. `virtual_offset`, the virtual offset of the cluster whose entry
+/// is refused, travels in the `sector` argument as a byte offset and
+/// `dev_idx` in `status`; see [`shared::InvalidL2EntryRefusal`].
 ///
 /// # Safety
 ///
@@ -18376,7 +18397,7 @@ unsafe fn send_data_file_entry_refusal(
     );
 }
 
-/// Raise the named refusal a metadata walk found.
+/// Raise the named refusal a metadata walk or the chain reader found.
 ///
 /// # Safety
 ///
