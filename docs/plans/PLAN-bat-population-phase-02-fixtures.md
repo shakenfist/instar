@@ -364,6 +364,9 @@ notes before the instar push.
   131041M images and for the same reason; decision 2 is corrected to
   say so. The known-failure table holds the seven entries decision 4
   lists, and the module runs 46 tests.
+- The five fixtures landed in instar-testdata as `d2f9467719`, directly
+  on `main` after rebasing onto origin/main (`278b015a30`), before the
+  instar branch was pushed.
 
 ## Risks and mitigations
 
