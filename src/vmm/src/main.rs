@@ -877,7 +877,15 @@ impl SerialDecoder {
                         "External data file host cluster offset does not match guest cluster \
                          offset"
                     }
-                    _ => "corrupt qcow2 L2 entry in image with external data file",
+                    // Only the guest writes the port, so this is a guest
+                    // that knows a rule this host does not, or a garbled
+                    // frame: say so, rather than describe the image.
+                    _ => {
+                        return format!(
+                            "{op}: guest refused a qcow2 L2 entry with an unrecognised data-file \
+                             refusal status {status} at virtual offset {offset} ({offset:#x})"
+                        );
+                    }
                 };
                 format!("{op}: {what} at virtual offset {offset} ({offset:#x})")
             }
@@ -1226,6 +1234,27 @@ mod guest_exception_tests {
                     format!("{op}: {words} at virtual offset 65536 (0x10000)")
                 );
             }
+        }
+    }
+
+    #[test]
+    fn data_file_entry_error_names_an_unrecognised_status_as_such() {
+        // A status this host does not know is a fact about the guest, not
+        // about the image: the message must say the status was not
+        // recognised and give its value, not describe a corrupt entry.
+        // Truncated frames have decoded as 0 and 22, so both are pinned.
+        for status in [0, 22, u32::MAX] {
+            let mut decoder = super::SerialDecoder::new();
+            decoder.last_data_file_entry = Some((65536, status));
+            let msg = decoder.l2_entry_refusal_error("dd");
+            assert_eq!(
+                msg,
+                format!(
+                    "dd: guest refused a qcow2 L2 entry with an unrecognised data-file \
+                     refusal status {status} at virtual offset 65536 (0x10000)"
+                )
+            );
+            assert!(!msg.contains("corrupt"), "{msg}");
         }
     }
 
