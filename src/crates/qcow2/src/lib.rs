@@ -16186,6 +16186,16 @@ fn chunk_crosses_granule(virtual_offset: u64, chunk_size: u64, granule: u64) -> 
 /// there again, so a split adds at most one reader frame per device.
 /// The frame is about 10.7KB in the convert build, so a chain of
 /// `MAX_CHAIN_DEVICES` stays under 350KB of the guest's 4MB stack.
+///
+/// # Safety
+///
+/// The same requirements as [`read_chain_virtual_cluster`], which every
+/// piece is passed to with these arguments: `buf` must point to at least
+/// `chunk_size` writable bytes, since each piece is written at its offset
+/// into it; `compressed_buf`, `staging_buf` and `staging_cluster_offset`
+/// must be as that function describes; and `call_table` must be valid.
+/// `granule` must be non-zero, which [`chunk_crosses_granule`] returning
+/// true guarantees, so only call this when it does.
 #[allow(clippy::too_many_arguments)]
 unsafe fn read_chain_split_at_granule(
     granule: u64,
