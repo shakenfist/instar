@@ -336,7 +336,25 @@ session's standing rules:
 
 ## Execution notes
 
-None yet.
+* **Back brief, 2026-10-23 (AEDT).** The operator chose to land the
+  convert rename (#820) in this phase, and allowed the management
+  session to push the branch and open the pull request once the
+  definition of done passes.
+* **3a.** Two corrections in review. Decision 1 now covers measure as
+  well as create: the host tells the measure guest "off" for vmdk, vpc
+  and vhdx too. A stale comment in `validate_create_args` was also
+  fixed. The agent added an `fsync` to
+  `qemu_pins._prealloc_create`. Without it, `st_blocks` was read
+  before delayed allocation settled, and the vhdx case failed about
+  one run in three, even comparing `off` with `off`. It was kept,
+  because the pin sweep benefits from it too.
+* **3b.** The agent found that `convert` rounds a raw source's virtual
+  size up to the next 64 KiB for every output format; qemu-img keeps
+  it exactly. The management session reproduced it on `da9f043f` and
+  on this branch and filed it as #821. It is unrelated to extent
+  naming and out of scope here. 3b's tests use a 1 MiB source so that
+  they do not depend on it, and 3c's create path does not go through
+  convert.
 
 ## Risks and mitigations
 

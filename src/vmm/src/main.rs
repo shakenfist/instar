@@ -14182,6 +14182,44 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     execute_convert(exec, verbose)
 }
 
+/// Name the extent file of a monolithicFlat VMDK the way qemu does.
+///
+/// Returns the extent's path and the name the descriptor records for it.
+/// qemu (`filename_decompose`, `block/vmdk.c:2279-2316`, and the `"%s-flat%s"`
+/// format in `vmdk_co_do_create`, `:2599`, qemu 7.0.0) takes the basename
+/// after the last `/`, splits it at its last `.`, and writes
+/// `<prefix>-flat<postfix>` in the output's directory. The output's own
+/// extension is kept, a name with no dot gets a bare `-flat` suffix, and a
+/// leading dot is the split point (`.hid` gives `-flat.hid`). qemu also
+/// looks for `\` and then `:` when there is no `/`; neither is a path
+/// separator on the hosts instar runs on, so they are not split on.
+///
+/// The name is handled as bytes, so a non-UTF-8 basename does not panic:
+/// the extent path keeps the exact bytes, and the recorded descriptor name
+/// has any invalid sequences replaced with U+FFFD (which a descriptor
+/// cannot carry verbatim, as it is text).
+fn vmdk_flat_extent_path(output: &Path) -> (std::path::PathBuf, String) {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    let bytes = output.as_os_str().as_bytes();
+    let base_start = bytes.iter().rposition(|&b| b == b'/').map_or(0, |i| i + 1);
+    let (dir, base) = bytes.split_at(base_start);
+    let (prefix, postfix) = match base.iter().rposition(|&b| b == b'.') {
+        Some(i) => base.split_at(i),
+        None => (base, &base[base.len()..]),
+    };
+    let mut name = Vec::with_capacity(base.len() + 5);
+    name.extend_from_slice(prefix);
+    name.extend_from_slice(b"-flat");
+    name.extend_from_slice(postfix);
+    let mut path = dir.to_vec();
+    path.extend_from_slice(&name);
+    (
+        std::path::PathBuf::from(std::ffi::OsString::from_vec(path)),
+        String::from_utf8_lossy(&name).into_owned(),
+    )
+}
+
 /// Launch the convert guest, run the vCPU loop, and finalise the output.
 /// Shared by `run_convert` (window `None`) and `run_dd` (window `Some`).
 /// Behaviour for convert is identical to the previous inline body.
@@ -14296,14 +14334,7 @@ fn execute_convert(
     // the host writes the descriptor afterwards. Override target
     // format to Raw and derive the flat extent filename.
     let (effective_target_format, flat_extent_path) = if is_vmdk_flat_output {
-        // Derive flat extent filename: "foo.vmdk" -> "foo-flat.vmdk"
-        let out_path = Path::new(&exec.output);
-        let stem = out_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("output");
-        let flat_name = format!("{stem}-flat.vmdk");
-        let flat_path = out_path.with_file_name(&flat_name);
+        let (flat_path, flat_name) = vmdk_flat_extent_path(Path::new(&exec.output));
         (1u32, Some((flat_path, flat_name))) // ImageFormat::Raw
     } else {
         (target_format, None)
@@ -22205,5 +22236,78 @@ mod clap_count_indices_tests {
             m.indices_of("clear").is_some(),
             "absent Count flag still yields a phantom index; gate on get_count() > 0"
         );
+    }
+}
+
+#[cfg(test)]
+mod vmdk_flat_extent_path_tests {
+    //! Unit tests for `vmdk_flat_extent_path`. Integration coverage against
+    //! the host qemu-img lives in `tests/test_convert.py`.
+    use super::*;
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::PathBuf;
+
+    /// Assert `output` gives the extent path `extent`, and that the descriptor
+    /// records the final component of `extent`.
+    fn check(output: &str, extent: &str) {
+        let (path, name) = vmdk_flat_extent_path(Path::new(output));
+        assert_eq!(path, PathBuf::from(extent));
+        assert_eq!(name, extent.rsplit('/').next().unwrap());
+    }
+
+    #[test]
+    fn vmdk_extension_is_kept() {
+        check("out.vmdk", "out-flat.vmdk");
+    }
+
+    #[test]
+    fn other_extension_is_kept() {
+        check("out.img", "out-flat.img");
+    }
+
+    #[test]
+    fn no_extension_gets_a_bare_suffix() {
+        check("out", "out-flat");
+    }
+
+    #[test]
+    fn leading_dot_is_the_split_point() {
+        check(".hid", "-flat.hid");
+    }
+
+    #[test]
+    fn split_is_at_the_last_dot() {
+        check("a.b.c", "a.b-flat.c");
+    }
+
+    #[test]
+    fn trailing_dot_is_kept() {
+        check("x.", "x-flat.");
+    }
+
+    #[test]
+    fn extent_stays_in_the_outputs_directory() {
+        check("dir/sub/x.y", "dir/sub/x-flat.y");
+        check("/abs/noext", "/abs/noext-flat");
+    }
+
+    #[test]
+    fn dots_in_directories_are_ignored() {
+        check("d.ir/out", "d.ir/out-flat");
+    }
+
+    #[test]
+    fn backslash_and_colon_are_not_separators() {
+        check("a\\b.vmdk", "a\\b-flat.vmdk");
+        check("a:b.vmdk", "a:b-flat.vmdk");
+    }
+
+    #[test]
+    fn non_utf8_basename_does_not_panic() {
+        let out = Path::new(OsStr::from_bytes(b"d/\xff\xfe.img"));
+        let (path, name) = vmdk_flat_extent_path(out);
+        assert_eq!(path.as_os_str().as_bytes(), b"d/\xff\xfe-flat.img");
+        assert_eq!(name, "\u{fffd}\u{fffd}-flat.img");
     }
 }
