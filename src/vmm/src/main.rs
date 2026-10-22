@@ -7479,9 +7479,14 @@ struct CreateArgs {
     subformat: String,
 
     /// vmdk grain size in bytes. Power of two in [4 KiB, 64 KiB].
-    /// Default (when -f vmdk): 65536.
+    /// Default (when -f vmdk): 65536. Not valid for monolithicFlat.
     #[arg(long, default_value = "0")]
     grain_size: u32,
+
+    /// vmdk `-o zeroed_grain`, which has no flag of its own. Sparse
+    /// vmdk accepts and ignores it; monolithicFlat refuses `on`.
+    #[arg(skip)]
+    zeroed_grain: bool,
 
     /// vhd / vhdx block size in bytes. Power of two.
     /// vhd default: 2 MiB; vhdx default: 32 MiB.
@@ -7489,8 +7494,8 @@ struct CreateArgs {
     block_size: u32,
 
     /// Preallocation mode: "off" (default), "metadata" (qcow2
-    /// only), "falloc" or "full" (raw or qcow2). vmdk, vpc and
-    /// vhdx accept only "off".
+    /// only), "falloc" or "full". For vmdk, vpc and vhdx, "falloc"
+    /// and "full" write the image "off" writes, as qemu-img does.
     #[arg(long, default_value = "off",
           value_parser = ["off", "metadata", "falloc", "full"])]
     preallocation: String,
@@ -15261,6 +15266,7 @@ struct CreateOptionOverrides {
     compat_v3: Option<bool>,
     vmdk_subformat: Option<u8>,
     grain_size: Option<u32>,
+    zeroed_grain: Option<bool>,
     vhd_subformat: Option<u8>,
     block_size: Option<u32>,
     preallocation: Option<&'static str>,
@@ -15497,10 +15503,12 @@ fn parse_create_o_options(
                 ("vmdk", "grain_size") => {
                     out.grain_size = Some(parse_create_o_size_u32(key, value)?);
                 }
-                ("vmdk", "adapter_type")
-                | ("vmdk", "hwversion")
-                | ("vmdk", "toolsversion")
-                | ("vmdk", "zeroed_grain") => {
+                ("vmdk", "zeroed_grain") => {
+                    // Stored so that monolithicFlat can refuse `on`, as
+                    // qemu does; sparse vmdk ignores it.
+                    out.zeroed_grain = Some(parse_create_o_bool(key, value)?);
+                }
+                ("vmdk", "adapter_type") | ("vmdk", "hwversion") | ("vmdk", "toolsversion") => {
                     // accept-ignore — no effect on the empty-image bytes
                     // we emit
                 }
@@ -18292,13 +18300,11 @@ fn format_qemu_snapshot_date_local(date_sec: u64) -> String {
 /// `-o KEY=VAL,...` parsing sits on top of the individual
 /// flags: parse `-o` first, then apply the overrides
 /// to a mutable copy of the args (last-wins, matches qemu-img
-/// and measure), then run the full validator. Raw output bypasses
-/// the guest entirely; everything else dispatches into
-/// `run_create_nonraw`.
-fn run_create(mut args: CreateArgs, _verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let overrides = parse_create_o_options(&args.target_format, &args.option)?;
-    apply_create_overrides(&mut args, overrides);
-    validate_create_args(&args)?;
+/// and measure), then run the full validator. Raw and monolithicFlat
+/// VMDK output bypass the guest entirely; everything else dispatches
+/// into `run_create_nonraw`.
+fn run_create(args: CreateArgs, _verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let args = resolve_create_args(args)?;
 
     // Raw output bypasses the guest entirely — there is no metadata
     // to emit. Open + ftruncate (+ optional posix_fallocate for the
@@ -18307,7 +18313,27 @@ fn run_create(mut args: CreateArgs, _verbose: bool) -> Result<(), Box<dyn std::e
         return run_create_raw(&args);
     }
 
+    // A monolithicFlat VMDK is a sparse raw extent plus a text
+    // descriptor, both written here.
+    if is_vmdk_flat_create(&args) {
+        return run_create_vmdk_flat(&args);
+    }
+
     run_create_nonraw(&args, _verbose)
+}
+
+/// Apply `-o` on top of the individual flags and validate the result:
+/// the arguments every create path then works from.
+fn resolve_create_args(mut args: CreateArgs) -> Result<CreateArgs, Box<dyn std::error::Error>> {
+    let overrides = parse_create_o_options(&args.target_format, &args.option)?;
+    apply_create_overrides(&mut args, overrides);
+    validate_create_args(&args)?;
+    Ok(args)
+}
+
+/// Whether `args` (with `-o` applied) asks for a monolithicFlat VMDK.
+fn is_vmdk_flat_create(args: &CreateArgs) -> bool {
+    args.target_format == "vmdk" && args.subformat == "monolithicFlat"
 }
 
 /// Apply parsed `-o` overrides on top of the individual `--flag`
@@ -18342,6 +18368,9 @@ fn apply_create_overrides(args: &mut CreateArgs, overrides: CreateOptionOverride
     }
     if let Some(v) = overrides.grain_size {
         args.grain_size = v;
+    }
+    if let Some(v) = overrides.zeroed_grain {
+        args.zeroed_grain = v;
     }
     if let Some(v) = overrides.vhd_subformat {
         args.subformat = match v {
@@ -19234,6 +19263,120 @@ fn run_create_raw(args: &CreateArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Host-side monolithicFlat VMDK creation: a sparse raw extent and the
+/// text descriptor that names it.
+///
+/// The extent is the requested size rounded up to a whole sector, as qemu
+/// writes it (a 1000-byte request gives a 1024-byte extent and `RW 2
+/// FLAT`). qemu only truncates the extent, under every preallocation mode,
+/// so `falloc` and `full` allocate nothing here either; that is why
+/// `create_raw_finalize` is not used. The extent is named by
+/// `vmdk_flat_extent_path`, as convert names it, and the descriptor is the
+/// one convert writes.
+///
+/// The arguments were validated before this runs, so nothing is opened
+/// for a refused command. Once a file has been opened (and so truncated),
+/// any failure removes every file this call opened.
+fn run_create_vmdk_flat(args: &CreateArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let size_str = args
+        .size
+        .as_ref()
+        .ok_or("create: vmdk monolithicFlat requires SIZE")?;
+    let virtual_size = parse_memory_size(size_str)?
+        .checked_next_multiple_of(512)
+        .ok_or("create: SIZE is too large")?;
+
+    let descriptor_path = Path::new(&args.filename);
+    let (extent_path, extent_name) = vmdk_flat_extent_path(descriptor_path);
+    let mut opened = Vec::new();
+    let result = write_vmdk_flat(
+        descriptor_path,
+        &extent_path,
+        &extent_name,
+        virtual_size,
+        &mut opened,
+    );
+    let descriptor_len = match result {
+        Ok(n) => n,
+        Err(e) => {
+            for path in &opened {
+                let _ = std::fs::remove_file(path);
+            }
+            return Err(e);
+        }
+    };
+
+    render_create_success(args, virtual_size, descriptor_len, descriptor_len, 0);
+    Ok(())
+}
+
+/// Write a monolithicFlat VMDK for `run_create_vmdk_flat`, returning the
+/// descriptor's length. Each file is pushed onto `opened` as soon as it
+/// has been opened, so the caller can remove exactly those on failure.
+fn write_vmdk_flat(
+    descriptor_path: &Path,
+    extent_path: &Path,
+    extent_name: &str,
+    virtual_size: u64,
+    opened: &mut Vec<std::path::PathBuf>,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let open = |path: &Path| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o644)
+            .open(path)
+            .map_err(|e| format!("create: open '{}' failed: {}", path.display(), e))
+    };
+
+    let mut descriptor = open(descriptor_path)?;
+    opened.push(descriptor_path.to_path_buf());
+    let extent = open(extent_path)?;
+    opened.push(extent_path.to_path_buf());
+
+    extent.set_len(virtual_size).map_err(|e| {
+        format!(
+            "create: ftruncate '{}' failed: {}",
+            extent_path.display(),
+            e
+        )
+    })?;
+
+    // The first call measures the descriptor; the second fills a buffer of
+    // exactly that length.
+    let capacity_sectors = virtual_size / 512;
+    let needed = vmdk::build_flat_descriptor(&mut [], 0, capacity_sectors, extent_name.as_bytes());
+    let mut text = vec![0u8; needed];
+    let written =
+        vmdk::build_flat_descriptor(&mut text, 0, capacity_sectors, extent_name.as_bytes());
+    if written != needed {
+        return Err(format!(
+            "create: descriptor is {} bytes, not the {} measured",
+            written, needed
+        )
+        .into());
+    }
+    descriptor.write_all(&text).map_err(|e| {
+        format!(
+            "create: write '{}' failed: {}",
+            descriptor_path.display(),
+            e
+        )
+    })?;
+
+    extent
+        .sync_all()
+        .map_err(|e| format!("create: sync '{}' failed: {}", extent_path.display(), e))?;
+    descriptor
+        .sync_all()
+        .map_err(|e| format!("create: sync '{}' failed: {}", descriptor_path.display(), e))?;
+    Ok(needed as u64)
+}
+
 /// Apply ftruncate + optional preallocation pass + fsync. Split out
 /// so `run_create_raw` can handle cleanup uniformly on any failure.
 ///
@@ -19499,6 +19642,34 @@ fn render_create_success_json(
     println!("}}");
 }
 
+/// The options a monolithicFlat VMDK cannot take.
+///
+/// qemu refuses a backing file ("Flat image can't have backing file") and
+/// `zeroed_grain=on` ("Flat image can't enable zeroed grain"), at
+/// `block/vmdk.c:2428-2437` in qemu 7.0.0. A grain size means nothing for
+/// a flat extent, so it is refused rather than ignored. Without a backing
+/// file the size must be given. `preallocation=metadata` is refused by the
+/// common preallocation check.
+fn validate_vmdk_flat_create_args(args: &CreateArgs) -> Result<(), Box<dyn std::error::Error>> {
+    if args.backing.is_some() {
+        return Err("create: vmdk monolithicFlat cannot have a backing file".into());
+    }
+    if args.size.is_none() {
+        return Err("create: vmdk monolithicFlat requires SIZE".into());
+    }
+    if args.zeroed_grain {
+        return Err("create: vmdk monolithicFlat cannot enable zeroed_grain".into());
+    }
+    if args.grain_size != 0 {
+        return Err(format!(
+            "create: vmdk monolithicFlat has no grains, so it takes no grain size (got {})",
+            args.grain_size
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// Host-side defensive validation of `CreateArgs`. The guest
 /// re-checks every critical field, but failing early at the host
 /// gives a clearer user-facing error before any I/O or KVM setup.
@@ -19506,6 +19677,11 @@ fn validate_create_args(args: &CreateArgs) -> Result<(), Box<dyn std::error::Err
     // Filename + (size or backing).
     if args.filename.is_empty() {
         return Err("create: FILENAME is required".into());
+    }
+    // Before the size check, because a flat image cannot take its size
+    // from a backing file.
+    if is_vmdk_flat_create(args) {
+        validate_vmdk_flat_create_args(args)?;
     }
     if args.size.is_none() && args.backing.is_none() {
         return Err("create: either SIZE or -b BACKING must be provided".into());
@@ -19577,12 +19753,6 @@ fn validate_create_args(args: &CreateArgs) -> Result<(), Box<dyn std::error::Err
                     args.subformat
                 )
                 .into());
-            }
-            if args.subformat == "monolithicFlat" {
-                return Err("create: vmdk monolithicFlat is not yet supported \
-                            (multi-file subformats are not implemented; \
-                            use instar convert -O vmdk for now)"
-                    .into());
             }
         }
         "vpc" => {
@@ -19964,12 +20134,21 @@ mod create_option_tests {
     }
 
     #[test]
-    fn vmdk_monolithic_flat_parses_but_host_will_reject() {
-        // The create library and the host validator reject
-        // monolithicFlat; the parser is permissive so the user gets
-        // the more specific "deferred" error from the host pass.
+    fn vmdk_monolithic_flat_parses() {
         let o = parse_create_o_options("vmdk", &s("subformat=monolithicFlat")).unwrap();
         assert_eq!(o.vmdk_subformat, Some(2));
+    }
+
+    #[test]
+    fn vmdk_zeroed_grain_is_stored() {
+        let o = parse_create_o_options("vmdk", &s("zeroed_grain=on")).unwrap();
+        assert_eq!(o.zeroed_grain, Some(true));
+        let o = parse_create_o_options("vmdk", &s("zeroed_grain=off")).unwrap();
+        assert_eq!(o.zeroed_grain, Some(false));
+        let err = parse_create_o_options("vmdk", &s("zeroed_grain=maybe"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("zeroed_grain"), "{}", err);
     }
 
     #[test]
@@ -20134,22 +20313,242 @@ mod create_option_tests {
     }
 
     fn create_args(fmt: &str, mode: &str) -> CreateArgs {
+        parse_create_cli(&["-f", fmt, "--preallocation", mode, "image.img", "1M"])
+    }
+
+    /// `instar create ARGV...` as clap parses it, before `-o` is applied.
+    fn parse_create_cli(argv: &[&str]) -> CreateArgs {
         use clap::Parser;
-        let cli = Cli::try_parse_from([
-            "instar",
-            "create",
-            "-f",
-            fmt,
-            "--preallocation",
-            mode,
-            "image.img",
-            "1M",
-        ])
-        .expect("clap parse");
+        let full = ["instar", "create"].iter().chain(argv.iter());
+        let cli = Cli::try_parse_from(full).expect("clap parse");
         match cli.command {
             Commands::Create(args) => args,
             other => panic!("expected Create, got {other:?}"),
         }
+    }
+
+    /// The error `instar create ARGV...` stops with before any file is
+    /// opened, or the resolved arguments.
+    fn resolve(argv: &[&str]) -> Result<CreateArgs, String> {
+        resolve_create_args(parse_create_cli(argv)).map_err(|e| e.to_string())
+    }
+
+    const FLAT_O: &str = "subformat=monolithicFlat";
+
+    #[test]
+    fn flat_subformat_spellings_resolve_alike() {
+        for argv in [
+            &["-f", "vmdk", "-o", FLAT_O, "f.vmdk", "1M"][..],
+            &[
+                "-f",
+                "vmdk",
+                "--subformat",
+                "monolithicFlat",
+                "f.vmdk",
+                "1M",
+            ][..],
+        ] {
+            let args = resolve(argv).unwrap();
+            assert!(is_vmdk_flat_create(&args), "{:?}", argv);
+        }
+        let sparse = resolve(&["-f", "vmdk", "f.vmdk", "1M"]).unwrap();
+        assert!(!is_vmdk_flat_create(&sparse));
+    }
+
+    #[test]
+    fn flat_refuses_a_backing_file() {
+        let want = "create: vmdk monolithicFlat cannot have a backing file";
+        for argv in [
+            &[
+                "-f", "vmdk", "-o", FLAT_O, "-b", "b.vmdk", "-F", "vmdk", "f.vmdk", "1M",
+            ][..],
+            &[
+                "-f",
+                "vmdk",
+                "--subformat",
+                "monolithicFlat",
+                "-b",
+                "b.vmdk",
+                "-u",
+                "f.vmdk",
+            ][..],
+            &[
+                "-f",
+                "vmdk",
+                "-o",
+                "subformat=monolithicFlat,backing_file=b.vmdk",
+                "f.vmdk",
+                "1M",
+            ][..],
+        ] {
+            assert_eq!(resolve(argv).unwrap_err(), want, "{:?}", argv);
+        }
+    }
+
+    #[test]
+    fn flat_requires_a_size() {
+        let err = resolve(&["-f", "vmdk", "-o", FLAT_O, "f.vmdk"]).unwrap_err();
+        assert_eq!(err, "create: vmdk monolithicFlat requires SIZE");
+        resolve(&[
+            "-f",
+            "vmdk",
+            "-o",
+            "subformat=monolithicFlat,size=1M",
+            "f.vmdk",
+        ])
+        .unwrap();
+    }
+
+    #[test]
+    fn flat_refuses_zeroed_grain_on() {
+        let err = resolve(&[
+            "-f",
+            "vmdk",
+            "-o",
+            "subformat=monolithicFlat,zeroed_grain=on",
+            "f.vmdk",
+            "1M",
+        ])
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "create: vmdk monolithicFlat cannot enable zeroed_grain"
+        );
+        resolve(&[
+            "-f",
+            "vmdk",
+            "-o",
+            "subformat=monolithicFlat,zeroed_grain=off",
+            "f.vmdk",
+            "1M",
+        ])
+        .unwrap();
+        // Sparse vmdk still accepts and ignores it.
+        resolve(&["-f", "vmdk", "-o", "zeroed_grain=on", "f.vmdk", "1M"]).unwrap();
+    }
+
+    #[test]
+    fn flat_refuses_a_grain_size() {
+        let want =
+            "create: vmdk monolithicFlat has no grains, so it takes no grain size (got 4096)";
+        for argv in [
+            &[
+                "-f",
+                "vmdk",
+                "-o",
+                "subformat=monolithicFlat,grain_size=4k",
+                "f.vmdk",
+                "1M",
+            ][..],
+            &[
+                "-f",
+                "vmdk",
+                "-o",
+                FLAT_O,
+                "--grain-size",
+                "4096",
+                "f.vmdk",
+                "1M",
+            ][..],
+        ] {
+            assert_eq!(resolve(argv).unwrap_err(), want, "{:?}", argv);
+        }
+    }
+
+    #[test]
+    fn flat_preallocation_modes() {
+        for mode in ["off", "falloc", "full"] {
+            let o = format!("subformat=monolithicFlat,preallocation={}", mode);
+            resolve(&["-f", "vmdk", "-o", &o, "f.vmdk", "1M"]).unwrap();
+        }
+        let err = resolve(&[
+            "-f",
+            "vmdk",
+            "-o",
+            FLAT_O,
+            "--preallocation",
+            "metadata",
+            "f.vmdk",
+            "1M",
+        ])
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "create: preallocation=metadata is not supported for vmdk"
+        );
+    }
+
+    /// Run the flat writer for `name` in `dir` with SIZE `size`.
+    fn create_flat(dir: &Path, name: &str, size: &str, extra: &[&str]) -> Result<(), String> {
+        let out = dir.join(name);
+        let mut argv = vec!["-q", "-f", "vmdk", "-o", FLAT_O];
+        argv.extend_from_slice(extra);
+        argv.push(out.to_str().unwrap());
+        argv.push(size);
+        let args = resolve(&argv)?;
+        run_create_vmdk_flat(&args).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn flat_extent_is_rounded_up_to_a_sector_and_sparse() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        for mode in ["off", "full"] {
+            let sub = dir.path().join(mode);
+            std::fs::create_dir(&sub).unwrap();
+            let pre = format!("preallocation={}", mode);
+            create_flat(&sub, "out", "1000", &["-o", &pre]).unwrap();
+            let extent = std::fs::metadata(sub.join("out-flat")).unwrap();
+            assert_eq!(extent.len(), 1024, "{}", mode);
+            assert_eq!(
+                extent.blocks(),
+                0,
+                "{}: the extent should stay sparse",
+                mode
+            );
+            let text = std::fs::read_to_string(sub.join("out")).unwrap();
+            assert!(text.contains("RW 2 FLAT \"out-flat\" 0\n"), "{}", text);
+            assert!(text.contains("createType=\"monolithicFlat\""), "{}", text);
+        }
+    }
+
+    #[test]
+    fn flat_truncates_existing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("c.vmdk"), vec![0xAAu8; 8192]).unwrap();
+        std::fs::write(dir.path().join("c-flat.vmdk"), vec![0xAAu8; 8192]).unwrap();
+        create_flat(dir.path(), "c.vmdk", "4096", &[]).unwrap();
+        let extent = std::fs::read(dir.path().join("c-flat.vmdk")).unwrap();
+        assert_eq!(extent, vec![0u8; 4096]);
+        let text = std::fs::read(dir.path().join("c.vmdk")).unwrap();
+        assert!(text.starts_with(b"# Disk DescriptorFile\n"));
+        assert!(!text.contains(&0xAA));
+    }
+
+    #[test]
+    fn flat_failure_after_opening_removes_the_descriptor() {
+        // The extent's name is taken by a directory, so opening it fails
+        // after the descriptor has been opened (and truncated).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("c.vmdk"), b"old").unwrap();
+        std::fs::create_dir(dir.path().join("c-flat.vmdk")).unwrap();
+        let err = create_flat(dir.path(), "c.vmdk", "1M", &[]).unwrap_err();
+        assert!(err.contains("c-flat.vmdk"), "{}", err);
+        assert!(!dir.path().join("c.vmdk").exists());
+        assert!(dir.path().join("c-flat.vmdk").is_dir());
+    }
+
+    #[test]
+    fn flat_refusal_opens_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("c.vmdk"), b"old").unwrap();
+        std::fs::write(dir.path().join("c-flat.vmdk"), b"old").unwrap();
+        create_flat(dir.path(), "c.vmdk", "1M", &["-o", "zeroed_grain=on"]).unwrap_err();
+        assert_eq!(std::fs::read(dir.path().join("c.vmdk")).unwrap(), b"old");
+        assert_eq!(
+            std::fs::read(dir.path().join("c-flat.vmdk")).unwrap(),
+            b"old"
+        );
     }
 
     #[test]

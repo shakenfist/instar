@@ -1129,6 +1129,23 @@ create only: `instar resize --preallocation falloc|full` on these
 formats does allocate the appended region (see
 [format-coverage.md](format-coverage.md)).
 
+### VMDK descriptors omit qemu's DDB lines
+
+A VMDK descriptor written by `qemu-img create` ends with a Disk Data
+Base: `ddb.virtualHWVersion`, `ddb.geometry.cylinders`, `.heads` and
+`.sectors`, `ddb.adapterType`, and from qemu 6.2.0 `ddb.toolsVersion`
+(`tests/golden/qemu-create-pins.json` has the two groups either side of
+that boundary). instar's descriptors stop at the `#DDB` comment, for
+monolithicFlat (from `create` and `convert`) and for the sparse
+subformats alike. So `-o adapter_type`, `hwversion` and `toolsversion`
+are accepted and change nothing. `qemu-img info` reports the same image
+either way: the tests compare its JSON for instar's and qemu's
+monolithicFlat images, ignoring only the CID and allocation.
+
+Every instar VMDK also carries the constant `CID=fffffffe` where qemu
+writes a random one. That is the same missing identity source as the
+all-zero VHD unique id (#566).
+
 ### VHD `virtual_size` diverges from qemu-img by CHS rounding
 
 `qemu-img create -f vpc` rounds the requested `virtual_size` up

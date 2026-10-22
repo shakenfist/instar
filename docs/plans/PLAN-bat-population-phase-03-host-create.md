@@ -355,6 +355,18 @@ session's standing rules:
   naming and out of scope here. 3b's tests use a 1 MiB source so that
   they do not depend on it, and 3c's create path does not go through
   convert.
+* **3c.** The agent turned up two defects outside this phase's scope.
+  The management session reproduced both and filed them:
+  * #822: `instar check` exits 63 on any monolithicFlat VMDK,
+    including one qemu-img made, although `docs/check.md` says it
+    validates them. 3c's test therefore only requires that check
+    treats a created image the way it treats a converted one.
+  * #823: instar's sparse VMDK descriptors name their extent
+    `"output.vmdk"`, whatever the file is called.
+
+  The descriptor comparison with the pin removes the `ddb.` lines and
+  collapses trailing newlines to one, because qemu's blank line after
+  `#DDB` is left at the end once those lines go.
 
 ## Risks and mitigations
 
