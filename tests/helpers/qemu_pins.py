@@ -145,6 +145,12 @@ CASES = [
     _fixed(['block_state_zero=off'], '64M'),
     _fixed([], '65M'),
     _fixed(['block_state_zero=off'], '65M'),
+    # The small sizes the committed fixed fixtures use: two whole blocks and
+    # two whole blocks plus a 1 MiB partial one, in both BAT modes.
+    _fixed([], '16M'),
+    _fixed(['block_state_zero=off'], '16M'),
+    _fixed([], '17M'),
+    _fixed(['block_state_zero=off'], '17M'),
     _fixed(['block_size=1M'], '64M'),
     _fixed(['block_size=1M', 'block_state_zero=off'], '64M'),
     # 131041 one-MiB payload blocks plus their 31 sector bitmap slots fill

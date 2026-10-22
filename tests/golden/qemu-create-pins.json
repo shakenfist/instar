@@ -217,6 +217,214 @@
         }
       }
     ],
+    "vhdx-fixed-16M": [
+      {
+        "versions": [
+          "6.0.0", "6.0.1", "6.1.0", "6.1.1", "6.2.0", "7.0.0", "7.1.0", "7.2.0", "7.2.1", "7.2.2", "7.2.3", "7.2.4",
+          "7.2.5", "7.2.6", "7.2.7", "7.2.8", "7.2.9", "7.2.10", "7.2.11", "7.2.12", "7.2.13", "7.2.14", "7.2.15",
+          "7.2.16", "7.2.17", "7.2.18", "7.2.19", "7.2.20", "7.2.21", "7.2.22", "8.0.0", "8.0.1", "8.0.2", "8.0.3",
+          "8.0.4", "8.0.5", "8.1.0", "8.1.1", "8.1.2", "8.1.3", "8.1.4", "8.1.5", "8.2.0", "8.2.1", "8.2.2", "8.2.3",
+          "8.2.4", "8.2.5", "8.2.6", "8.2.7", "8.2.8", "8.2.9", "8.2.10", "9.0.0", "9.0.1", "9.0.2", "9.0.3", "9.0.4",
+          "9.1.0", "9.1.1", "9.1.2", "9.1.3", "9.2.0", "9.2.1", "9.2.2", "9.2.3", "9.2.4", "10.0.0", "10.0.1", "10.0.2",
+          "10.0.3", "10.0.4", "10.0.5", "10.0.6", "10.0.7", "10.1.0", "10.1.1", "10.1.2", "10.1.3", "10.2.0"
+        ],
+        "result": {
+          "rc": 0,
+          "stderr": "",
+          "summary": {
+            "file_length": 25165824,
+            "region_table_1": [
+              {"region": "bat", "offset": 2097152, "length": 1048576, "required": 0},
+              {"region": "metadata", "offset": 3145728, "length": 1048576, "required": 0}
+            ],
+            "region_table_2": [
+              {"region": "bat", "offset": 2097152, "length": 1048576, "required": 0},
+              {"region": "metadata", "offset": 3145728, "length": 1048576, "required": 0}
+            ],
+            "region_tables_agree": true,
+            "log_offset": 1048576,
+            "log_length": 1048576,
+            "metadata_items": {
+              "file_parameters": {"offset": 65536, "length": 8, "flags": 4},
+              "virtual_disk_size": {"offset": 65544, "length": 8, "flags": 6},
+              "page83": {"offset": 65552, "length": 16, "flags": 6},
+              "logical_sector_size": {"offset": 65568, "length": 4, "flags": 6},
+              "physical_sector_size": {"offset": 65572, "length": 4, "flags": 6}
+            },
+            "block_size": 8388608,
+            "logical_sector_size": 512,
+            "physical_sector_size": 512,
+            "virtual_disk_size": 16777216,
+            "leave_blocks_allocated": true,
+            "has_parent": false,
+            "chunk_ratio": 512,
+            "bat_capacity": 131072,
+            "bat_entry_count": 2,
+            "bat": [
+              [0, 2, "payload", 2, 0, 0],
+              [2, 131070, "padding", 0, 0, 0]
+            ]
+          },
+          "check_rc": 0
+        }
+      }
+    ],
+    "vhdx-fixed-16M-bsz-off": [
+      {
+        "versions": [
+          "6.0.0", "6.0.1", "6.1.0", "6.1.1", "6.2.0", "7.0.0", "7.1.0", "7.2.0", "7.2.1", "7.2.2", "7.2.3", "7.2.4",
+          "7.2.5", "7.2.6", "7.2.7", "7.2.8", "7.2.9", "7.2.10", "7.2.11", "7.2.12", "7.2.13", "7.2.14", "7.2.15",
+          "7.2.16", "7.2.17", "7.2.18", "7.2.19", "7.2.20", "7.2.21", "7.2.22", "8.0.0", "8.0.1", "8.0.2", "8.0.3",
+          "8.0.4", "8.0.5", "8.1.0", "8.1.1", "8.1.2", "8.1.3", "8.1.4", "8.1.5", "8.2.0", "8.2.1", "8.2.2", "8.2.3",
+          "8.2.4", "8.2.5", "8.2.6", "8.2.7", "8.2.8", "8.2.9", "8.2.10", "9.0.0", "9.0.1", "9.0.2", "9.0.3", "9.0.4",
+          "9.1.0", "9.1.1", "9.1.2", "9.1.3", "9.2.0", "9.2.1", "9.2.2", "9.2.3", "9.2.4", "10.0.0", "10.0.1", "10.0.2",
+          "10.0.3", "10.0.4", "10.0.5", "10.0.6", "10.0.7", "10.1.0", "10.1.1", "10.1.2", "10.1.3", "10.2.0"
+        ],
+        "result": {
+          "rc": 0,
+          "stderr": "",
+          "summary": {
+            "file_length": 25165824,
+            "region_table_1": [
+              {"region": "bat", "offset": 2097152, "length": 1048576, "required": 0},
+              {"region": "metadata", "offset": 3145728, "length": 1048576, "required": 0}
+            ],
+            "region_table_2": [
+              {"region": "bat", "offset": 2097152, "length": 1048576, "required": 0},
+              {"region": "metadata", "offset": 3145728, "length": 1048576, "required": 0}
+            ],
+            "region_tables_agree": true,
+            "log_offset": 1048576,
+            "log_length": 1048576,
+            "metadata_items": {
+              "file_parameters": {"offset": 65536, "length": 8, "flags": 4},
+              "virtual_disk_size": {"offset": 65544, "length": 8, "flags": 6},
+              "page83": {"offset": 65552, "length": 16, "flags": 6},
+              "logical_sector_size": {"offset": 65568, "length": 4, "flags": 6},
+              "physical_sector_size": {"offset": 65572, "length": 4, "flags": 6}
+            },
+            "block_size": 8388608,
+            "logical_sector_size": 512,
+            "physical_sector_size": 512,
+            "virtual_disk_size": 16777216,
+            "leave_blocks_allocated": true,
+            "has_parent": false,
+            "chunk_ratio": 512,
+            "bat_capacity": 131072,
+            "bat_entry_count": 2,
+            "bat": [
+              [0, 2, "payload", 6, 8388608, 8388608],
+              [2, 131070, "padding", 0, 0, 0]
+            ]
+          },
+          "check_rc": 0
+        }
+      }
+    ],
+    "vhdx-fixed-17M": [
+      {
+        "versions": [
+          "6.0.0", "6.0.1", "6.1.0", "6.1.1", "6.2.0", "7.0.0", "7.1.0", "7.2.0", "7.2.1", "7.2.2", "7.2.3", "7.2.4",
+          "7.2.5", "7.2.6", "7.2.7", "7.2.8", "7.2.9", "7.2.10", "7.2.11", "7.2.12", "7.2.13", "7.2.14", "7.2.15",
+          "7.2.16", "7.2.17", "7.2.18", "7.2.19", "7.2.20", "7.2.21", "7.2.22", "8.0.0", "8.0.1", "8.0.2", "8.0.3",
+          "8.0.4", "8.0.5", "8.1.0", "8.1.1", "8.1.2", "8.1.3", "8.1.4", "8.1.5", "8.2.0", "8.2.1", "8.2.2", "8.2.3",
+          "8.2.4", "8.2.5", "8.2.6", "8.2.7", "8.2.8", "8.2.9", "8.2.10", "9.0.0", "9.0.1", "9.0.2", "9.0.3", "9.0.4",
+          "9.1.0", "9.1.1", "9.1.2", "9.1.3", "9.2.0", "9.2.1", "9.2.2", "9.2.3", "9.2.4", "10.0.0", "10.0.1", "10.0.2",
+          "10.0.3", "10.0.4", "10.0.5", "10.0.6", "10.0.7", "10.1.0", "10.1.1", "10.1.2", "10.1.3", "10.2.0"
+        ],
+        "result": {
+          "rc": 0,
+          "stderr": "",
+          "summary": {
+            "file_length": 26214400,
+            "region_table_1": [
+              {"region": "bat", "offset": 2097152, "length": 1048576, "required": 0},
+              {"region": "metadata", "offset": 3145728, "length": 1048576, "required": 0}
+            ],
+            "region_table_2": [
+              {"region": "bat", "offset": 2097152, "length": 1048576, "required": 0},
+              {"region": "metadata", "offset": 3145728, "length": 1048576, "required": 0}
+            ],
+            "region_tables_agree": true,
+            "log_offset": 1048576,
+            "log_length": 1048576,
+            "metadata_items": {
+              "file_parameters": {"offset": 65536, "length": 8, "flags": 4},
+              "virtual_disk_size": {"offset": 65544, "length": 8, "flags": 6},
+              "page83": {"offset": 65552, "length": 16, "flags": 6},
+              "logical_sector_size": {"offset": 65568, "length": 4, "flags": 6},
+              "physical_sector_size": {"offset": 65572, "length": 4, "flags": 6}
+            },
+            "block_size": 8388608,
+            "logical_sector_size": 512,
+            "physical_sector_size": 512,
+            "virtual_disk_size": 17825792,
+            "leave_blocks_allocated": true,
+            "has_parent": false,
+            "chunk_ratio": 512,
+            "bat_capacity": 131072,
+            "bat_entry_count": 3,
+            "bat": [
+              [0, 3, "payload", 2, 0, 0],
+              [3, 131069, "padding", 0, 0, 0]
+            ]
+          },
+          "check_rc": 0
+        }
+      }
+    ],
+    "vhdx-fixed-17M-bsz-off": [
+      {
+        "versions": [
+          "6.0.0", "6.0.1", "6.1.0", "6.1.1", "6.2.0", "7.0.0", "7.1.0", "7.2.0", "7.2.1", "7.2.2", "7.2.3", "7.2.4",
+          "7.2.5", "7.2.6", "7.2.7", "7.2.8", "7.2.9", "7.2.10", "7.2.11", "7.2.12", "7.2.13", "7.2.14", "7.2.15",
+          "7.2.16", "7.2.17", "7.2.18", "7.2.19", "7.2.20", "7.2.21", "7.2.22", "8.0.0", "8.0.1", "8.0.2", "8.0.3",
+          "8.0.4", "8.0.5", "8.1.0", "8.1.1", "8.1.2", "8.1.3", "8.1.4", "8.1.5", "8.2.0", "8.2.1", "8.2.2", "8.2.3",
+          "8.2.4", "8.2.5", "8.2.6", "8.2.7", "8.2.8", "8.2.9", "8.2.10", "9.0.0", "9.0.1", "9.0.2", "9.0.3", "9.0.4",
+          "9.1.0", "9.1.1", "9.1.2", "9.1.3", "9.2.0", "9.2.1", "9.2.2", "9.2.3", "9.2.4", "10.0.0", "10.0.1", "10.0.2",
+          "10.0.3", "10.0.4", "10.0.5", "10.0.6", "10.0.7", "10.1.0", "10.1.1", "10.1.2", "10.1.3", "10.2.0"
+        ],
+        "result": {
+          "rc": 0,
+          "stderr": "",
+          "summary": {
+            "file_length": 26214400,
+            "region_table_1": [
+              {"region": "bat", "offset": 2097152, "length": 1048576, "required": 0},
+              {"region": "metadata", "offset": 3145728, "length": 1048576, "required": 0}
+            ],
+            "region_table_2": [
+              {"region": "bat", "offset": 2097152, "length": 1048576, "required": 0},
+              {"region": "metadata", "offset": 3145728, "length": 1048576, "required": 0}
+            ],
+            "region_tables_agree": true,
+            "log_offset": 1048576,
+            "log_length": 1048576,
+            "metadata_items": {
+              "file_parameters": {"offset": 65536, "length": 8, "flags": 4},
+              "virtual_disk_size": {"offset": 65544, "length": 8, "flags": 6},
+              "page83": {"offset": 65552, "length": 16, "flags": 6},
+              "logical_sector_size": {"offset": 65568, "length": 4, "flags": 6},
+              "physical_sector_size": {"offset": 65572, "length": 4, "flags": 6}
+            },
+            "block_size": 8388608,
+            "logical_sector_size": 512,
+            "physical_sector_size": 512,
+            "virtual_disk_size": 17825792,
+            "leave_blocks_allocated": true,
+            "has_parent": false,
+            "chunk_ratio": 512,
+            "bat_capacity": 131072,
+            "bat_entry_count": 3,
+            "bat": [
+              [0, 3, "payload", 6, 8388608, 8388608],
+              [3, 131069, "padding", 0, 0, 0]
+            ]
+          },
+          "check_rc": 0
+        }
+      }
+    ],
     "vhdx-fixed-64M-block-1M": [
       {
         "versions": [
