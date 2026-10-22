@@ -21,6 +21,7 @@ import tempfile
 from pathlib import Path
 
 from base import InstarTestBase
+from helpers import qemu_pins
 from helpers.info_json import assert_info_equivalent
 
 # ----------------------------------------------------------------------
@@ -1485,12 +1486,43 @@ class TestCreateBackingChain(InstarTestBase):
             self.assertIn('cluster size', stderr.lower())
 
 
+# Preallocation pin cases instar cannot create yet, each with the reason and
+# the message it fails with. A case that starts to work fails its test, which
+# says to remove the entry; a case that fails differently fails it too.
+KNOWN_PREALLOCATION_REFUSALS = {
+    'prealloc-vhdx-fixed': ('fixed VHDX is not written yet', 'subformat=fixed is not yet supported'),
+    'prealloc-vmdk-monolithicFlat': ('monolithicFlat create is not written on the host yet',
+                                     'vmdk monolithicFlat is not yet supported'),
+}
+
+
+def known_refusal_problem(case_name, reason, message, run):
+    """Why the KNOWN_PREALLOCATION_REFUSALS entry for `case_name` is stale, or None while it still holds.
+
+    `run` runs the pin case. A case that gets through has been fixed, and a
+    case that fails with some other message has changed; either way the
+    entry no longer describes instar.
+    """
+    try:
+        run()
+    except RuntimeError as e:
+        failure = str(e)
+    else:
+        return (f'instar now creates {case_name} ({reason}): remove this entry, {case_name!r}, '
+                f'from KNOWN_PREALLOCATION_REFUSALS')
+    if message not in failure:
+        return (f'instar refuses {case_name}, but not with the message KNOWN_PREALLOCATION_REFUSALS records '
+                f'({message!r}) for it ({reason}): {failure}')
+    return None
+
+
 class TestCreatePreallocation(InstarTestBase):
     """Preallocation tests.
 
     Covers the accept set: raw + falloc/full, qcow2 +
-    metadata/falloc/full, plus rejections for raw+metadata and
-    vmdk/vpc/vhdx + non-`off`.
+    metadata/falloc/full, vmdk/vpc/vhdx + falloc/full (which write what
+    `off` writes, as qemu does), plus rejections for raw+metadata and
+    vmdk/vpc/vhdx + metadata.
     """
 
     def run_instar_create(self, *args, timeout=120):
@@ -1596,14 +1628,100 @@ class TestCreatePreallocation(InstarTestBase):
             self.assertNotEqual(rc, 0)
             self.assertIn('raw has no metadata', stderr)
 
-    def test_vmdk_metadata_deferred(self):
-        """`-f vmdk -o preallocation=metadata` returns the future-work error."""
+    def _instar_pin_results(self, case_name):
+        """Run pin case `case_name` with instar in place of qemu-img, and return (pinned, measured)."""
         with tempfile.TemporaryDirectory() as td:
-            path = Path(td) / 'v.vmdk'
-            _, stderr, rc = self.run_instar_create(
-                '-f', 'vmdk', '-o', 'preallocation=metadata', str(path), '4M')
-            self.assertNotEqual(rc, 0)
-            self.assertIn('preallocation is implemented for raw and qcow2 only', stderr)
+            measured = qemu_pins.run_case(self.get_instar_binary(), case_name, Path(td))
+        return qemu_pins.expected(case_name), measured
+
+    def _assert_noop_preallocation(self, case_name):
+        """Every mode behaves as the qemu pin says: falloc and full are `off`, metadata is refused."""
+        pinned, measured = self._instar_pin_results(case_name)
+        off_length = measured['modes']['off']['file_length']
+        for mode in qemu_pins.PREALLOC_MODES:
+            want = pinned['modes'][mode]
+            got = measured['modes'][mode]
+            for field in ('rc', 'same_bytes_as_off', 'same_allocation_as_off'):
+                self.assertEqual(want[field], got[field], f'{case_name} preallocation={mode}: {field}')
+            if mode == 'metadata':
+                self.assertIsNone(got['file_length'], f'{case_name}: metadata left a file behind')
+                self.assertIn('preallocation=metadata is not supported for', got['stderr'])
+            else:
+                # qemu's absolute lengths are not instar's (the pin notes why), so compare with instar's own off.
+                self.assertEqual(off_length, got['file_length'], f'{case_name} preallocation={mode}: file_length')
+
+    def test_vpc_noop_preallocation(self):
+        """`-f vpc` accepts falloc and full and writes what `off` writes, as qemu does."""
+        self._assert_noop_preallocation('prealloc-vpc')
+
+    def test_vpc_fixed_noop_preallocation(self):
+        """`-f vpc -o subformat=fixed` accepts falloc and full and writes what `off` writes."""
+        self._assert_noop_preallocation('prealloc-vpc-fixed')
+
+    def test_vmdk_noop_preallocation(self):
+        """`-f vmdk` accepts falloc and full and writes what `off` writes, as qemu does."""
+        self._assert_noop_preallocation('prealloc-vmdk')
+
+    def test_vhdx_noop_preallocation(self):
+        """`-f vhdx` accepts falloc and full and writes what `off` writes, as qemu does."""
+        self._assert_noop_preallocation('prealloc-vhdx')
+
+    def test_metadata_refusal_text(self):
+        """metadata is refused for vmdk, vpc and vhdx, through -o and through --preallocation."""
+        for fmt in ('vmdk', 'vpc', 'vhdx'):
+            for spelling in (['-o', 'preallocation=metadata'], ['--preallocation', 'metadata']):
+                with tempfile.TemporaryDirectory() as td:
+                    path = Path(td) / f'image.{fmt}'
+                    _, stderr, rc = self.run_instar_create('-f', fmt, *spelling, str(path), '4M')
+                    self.assertEqual(rc, 1, f'{fmt} {spelling}: {stderr}')
+                    self.assertIn(f'create: preallocation=metadata is not supported for {fmt}', stderr)
+                    self.assertNotIn('not yet', stderr)
+                    self.assertFalse(path.exists(), f'{fmt} {spelling} left an image behind')
+
+    def test_noop_preallocation_through_flag(self):
+        """`--preallocation falloc|full` is accepted for vmdk, vpc and vhdx as `-o preallocation=` is."""
+        for fmt in ('vmdk', 'vpc', 'vhdx'):
+            for mode in ('falloc', 'full'):
+                with tempfile.TemporaryDirectory() as td:
+                    path = Path(td) / f'image.{fmt}'
+                    _, stderr, rc = self.run_instar_create('-f', fmt, '--preallocation', mode, str(path), '4M')
+                    self.assertEqual(rc, 0, f'{fmt} {mode}: {stderr}')
+                    self.assertTrue(path.exists())
+
+    def test_known_refusals_still_refuse(self):
+        """Each KNOWN_PREALLOCATION_REFUSALS case fails with its recorded message, until its entry is removed."""
+        binary = self.get_instar_binary()
+        for case_name, (reason, message) in KNOWN_PREALLOCATION_REFUSALS.items():
+            with self.subTest(case=case_name):
+                with tempfile.TemporaryDirectory() as td:
+                    problem = known_refusal_problem(
+                        case_name, reason, message, lambda: qemu_pins.run_case(binary, case_name, Path(td)))
+                if problem:
+                    self.fail(problem)
+
+    def test_known_refusal_check_rejects_a_passing_entry(self):
+        """An entry whose case now succeeds is reported, with the instruction to remove it."""
+        problem = known_refusal_problem('prealloc-x', 'a reason', 'some message', lambda: {'modes': {}})
+        self.assertIsNotNone(problem)
+        self.assertIn('remove this entry', problem)
+        self.assertIn("'prealloc-x'", problem)
+
+    def test_known_refusal_check_rejects_a_different_failure(self):
+        """An entry whose case fails with some other message is reported."""
+        def fails():
+            raise RuntimeError('preallocation=off failed: something else entirely')
+
+        problem = known_refusal_problem('prealloc-x', 'a reason', 'some message', fails)
+        self.assertIsNotNone(problem)
+        self.assertIn("'some message'", problem)
+        self.assertIn('something else entirely', problem)
+
+    def test_known_refusal_check_accepts_the_recorded_failure(self):
+        """An entry whose case fails with its recorded message is not a problem."""
+        def fails():
+            raise RuntimeError('preallocation=off failed: Error: some message here')
+
+        self.assertIsNone(known_refusal_problem('prealloc-x', 'a reason', 'some message', fails))
 
 
 # ----------------------------------------------------------------------

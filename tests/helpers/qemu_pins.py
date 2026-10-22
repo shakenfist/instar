@@ -441,7 +441,14 @@ def _prealloc_create(qemu_img, case: dict, mode: str, label: str, workdir: Path)
     image = imagedir / f'{IMAGE_STEM}.{case["suffix"]}'
     options = ','.join(case['options'] + [f'preallocation={mode}'])
     proc = _run([qemu_img, 'create', '-f', case['format'], '-o', options, image, case['size']], imagedir)
-    return proc, normalise_stderr(proc.stderr, imagedir), _prealloc_measured_file(case, image)
+    measured = _prealloc_measured_file(case, image)
+    if proc.returncode == 0:
+        # `st_blocks` of a file with delayed allocation still pending counts
+        # reservations that differ between two runs of one command. Allocation
+        # is compared, so let the filesystem settle first.
+        with open(measured, 'rb') as f:
+            os.fsync(f.fileno())
+    return proc, normalise_stderr(proc.stderr, imagedir), measured
 
 
 def _prealloc_measure(qemu_img, case: dict, workdir: Path) -> dict:

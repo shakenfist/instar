@@ -1106,15 +1106,28 @@ recurse, matching qemu-img.
 | Mode | raw | qcow2 | vmdk / vpc / vhdx |
 |------|-----|-------|-------------------|
 | `off` | yes | yes | yes |
-| `metadata` | rejected | yes | rejected (future work) |
-| `falloc` | yes | yes | rejected (future work) |
-| `full` | yes | yes | rejected (future work) |
+| `metadata` | rejected | yes | rejected |
+| `falloc` | yes | yes | accepted, same as `off` |
+| `full` | yes | yes | accepted, same as `off` |
 
 `raw + metadata` is rejected because raw has no metadata to
-preallocate. Non-qcow2 sparse formats reject non-`off`
-preallocation with a "future work" pointer — each format needs
-its own BAT-population pattern plus the same host
-`apply_preallocation` post-pass qcow2 already uses.
+preallocate.
+
+For vmdk, vpc and vhdx, `falloc` and `full` are accepted and write
+exactly the image `off` writes, because qemu-img does: none of those
+drivers has a `preallocation` create option (`block/vpc.c:1194`, qemu
+7.0.0), and the file protocol that consumes the key preallocates the
+file while it is still empty. `tests/golden/qemu-create-pins.json`
+records that content and allocation match `off` on all 80 pinned
+builds. `metadata` is refused, as qemu refuses it ("Unsupported
+preallocation mode: metadata", `block/file-posix.c:2024-2026`), with
+`create: preallocation=metadata is not supported for FORMAT`. The host
+always tells the guest `off` for these formats, so the result does not
+depend on the guest ignoring the preallocation bits. `instar measure`
+takes the same modes and refuses `metadata` the same way. This is
+create only: `instar resize --preallocation falloc|full` on these
+formats does allocate the appended region (see
+[format-coverage.md](format-coverage.md)).
 
 ### VHD `virtual_size` diverges from qemu-img by CHS rounding
 

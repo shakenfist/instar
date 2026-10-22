@@ -127,6 +127,7 @@ Rejected (future work):
 Honoured:
 - `size`, `subformat` (monolithicSparse|streamOptimized)
 - `backing_file`, `backing_fmt`
+- `preallocation` (off|falloc|full; `falloc` and `full` are no-ops, `metadata` is refused)
 
 Rejected (instar doesn't emit these subformats):
 - `subformat=monolithicFlat`, `subformat=twoGbMaxExtent*`
@@ -155,6 +156,8 @@ Honoured:
   See [Backing-file semantics](#backing-file-semantics) below and the
   "VHD/VHDX differencing" section of [quirks.md](quirks.md).
 
+- `preallocation` (off|falloc|full; `falloc` and `full` are no-ops, `metadata` is refused)
+
 Accepted but no size effect:
 - `force_size`
 
@@ -162,6 +165,7 @@ Accepted but no size effect:
 
 Honoured:
 - `size`, `block_size` (1 MiB..256 MiB power of two)
+- `preallocation` (off|falloc|full; `falloc` and `full` are no-ops, `metadata` is refused)
 - `backing_file`, `backing_fmt` — a VHDX child with a parent sets the
   `HasParent` file-parameter bit and writes a populated parent
   locator metadata item carrying the parent's active-header
@@ -331,15 +335,29 @@ of [quirks.md](quirks.md).
 | Mode      | raw                   | qcow2                                                | vmdk / vpc / vhdx |
 |-----------|-----------------------|------------------------------------------------------|-------------------|
 | `off`     | `ftruncate` only      | header + L1 + refcount only                          | header + BAT only |
-| `metadata`| rejected              | L1 + L2 + refcount populated; data region as a hole  | rejected (future work) |
-| `falloc`  | `posix_fallocate`     | metadata mode + `posix_fallocate` on data region     | rejected (future work) |
-| `full`    | `fallocate(ZERO_RANGE)` with `pwrite` fallback | metadata mode + zero-fill data region   | rejected (future work) |
+| `metadata`| rejected              | L1 + L2 + refcount populated; data region as a hole  | rejected |
+| `falloc`  | `posix_fallocate`     | metadata mode + `posix_fallocate` on data region     | accepted, same as `off` |
+| `full`    | `fallocate(ZERO_RANGE)` with `pwrite` fallback | metadata mode + zero-fill data region   | accepted, same as `off` |
 
 For qcow2 metadata mode the L2 tables can total well over the guest's
 8 MiB scratch limit at large virtual sizes, so the guest streams them
 through a reusable single-cluster slot rather than packaging them into
 the `MetadataPlan`. The host's `apply_preallocation` helper handles
 `falloc` and `full` post-emission.
+
+`falloc` and `full` on vmdk, vpc and vhdx are accepted and change nothing: the
+image is the one `off` writes. That is qemu-img's behaviour, not a shortcut.
+None of the three drivers lists a `preallocation` create option
+(`block/vpc.c:1194`, qemu 7.0.0); the key is consumed by the file protocol
+that creates the image file (`block/file-posix.c:2614`), which preallocates
+the empty file before the driver writes anything. The committed
+`tests/golden/qemu-create-pins.json` records, for all 80 qemu-img builds from
+6.0.0, that `falloc` and `full` images equal the `off` image in content and
+in allocated blocks. `metadata` is refused ("Unsupported preallocation mode:
+metadata", `block/file-posix.c:2024-2026`), and instar refuses it too, with
+`create: preallocation=metadata is not supported for FORMAT`. By contrast,
+`instar resize --preallocation falloc|full` on these formats does allocate
+the newly appended region (see [format-coverage.md](format-coverage.md)).
 
 ## Known divergences from `qemu-img create`
 
@@ -386,9 +404,6 @@ through `instar check` and match `qemu-img` (instar #365).
   header bit).
 - vhdx default `block_size` matching qemu's 32 MiB at all virtual
   sizes.
-- Preallocation for vmdk / vpc / vhdx (each format needs its own
-  BAT-population pattern plus the same host `apply_preallocation`
-  post-pass that qcow2 already uses).
 - Multi-file VMDK subformats (`monolithicFlat`, `twoGbMaxExtentSparse`,
   `twoGbMaxExtentFlat`) — needs multi-output-device support in the
   call table.

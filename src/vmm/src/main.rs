@@ -15132,6 +15132,21 @@ fn parse_o_options(
                 ("vmdk", "grain_size") => {
                     out.grain_size = Some(parse_o_size_u32(key, value)?);
                 }
+                ("vmdk" | "vpc" | "vhdx", "preallocation") => match value {
+                    "off" => out.preallocation = Some("off"),
+                    "falloc" => out.preallocation = Some("falloc"),
+                    "full" => out.preallocation = Some("full"),
+                    // Refused in run_measure, once -o and --preallocation
+                    // have been merged, so both spellings get one answer.
+                    "metadata" => out.preallocation = Some("metadata"),
+                    _ => {
+                        return Err(format!(
+                            "measure: bad value '{}' for -o key 'preallocation'",
+                            value
+                        )
+                        .into())
+                    }
+                },
                 ("vmdk", "adapter_type")
                 | ("vmdk", "hwversion")
                 | ("vmdk", "toolsversion")
@@ -15264,6 +15279,26 @@ fn parse_create_o_u8(key: &str, value: &str) -> Result<u8, Box<dyn std::error::E
         .map_err(|_| -> Box<dyn std::error::Error> {
             format!("create: bad number '{}' for -o key '{}'", value, key).into()
         })
+}
+
+/// The refusal for `preallocation=metadata` on vmdk, vpc and vhdx.
+///
+/// qemu-img refuses metadata preallocation for these formats at every
+/// version ("Unsupported preallocation mode: metadata"), and instar does
+/// not plan to add it, so the text does not promise future support.
+/// Create and measure both use it, whichever spelling (`-o` or
+/// `--preallocation`) asked for the mode.
+fn preallocation_metadata_refusal(op: &str, format: &str) -> String {
+    format!(
+        "{}: preallocation=metadata is not supported for {}",
+        op, format
+    )
+}
+
+/// Whether `format` takes preallocation only as a no-op: off, falloc and
+/// full all write the image off does, as in qemu-img.
+fn preallocation_is_noop_format(format: &str) -> bool {
+    matches!(format, "vmdk" | "vpc" | "vhdx")
 }
 
 /// Parse one or more qemu-img-style `-o KEY=VAL,KEY=VAL,...`
@@ -15483,16 +15518,15 @@ fn parse_create_o_options(
                     // accept-ignore
                 }
 
-                // -------- non-qcow2 preallocation: deferred --------
+                // -------- vmdk, vpc and vhdx preallocation --------
+                // qemu accepts off, falloc and full and writes the same
+                // image for all three; only metadata is refused.
                 ("vmdk" | "vpc" | "vhdx", "preallocation") => match value {
                     "off" => out.preallocation = Some("off"),
-                    "metadata" | "falloc" | "full" => {
-                        return Err(format!(
-                            "create: -o preallocation={} is not yet supported for {} \
-                             (preallocation is implemented for raw and qcow2 only)",
-                            value, target
-                        )
-                        .into())
+                    "falloc" => out.preallocation = Some("falloc"),
+                    "full" => out.preallocation = Some("full"),
+                    "metadata" => {
+                        return Err(preallocation_metadata_refusal("create", target).into())
                     }
                     _ => {
                         return Err(format!(
@@ -15835,6 +15869,12 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
         block_size = v;
     }
 
+    // qemu-img refuses metadata preallocation for these formats. Checked
+    // here, after -o is applied, so --preallocation and -o agree.
+    if preallocation_is_noop_format(&args.target_format) && preallocation_str == "metadata" {
+        return Err(preallocation_metadata_refusal("measure", &args.target_format).into());
+    }
+
     // Resolve flags + per-format byte fields from local (possibly overridden) values.
     let mut measure_flags: u32 = 0;
     if extended_l2 {
@@ -15859,7 +15899,11 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
             return Err(format!("measure: unsupported preallocation mode '{}'", other).into());
         }
     };
-    measure_flags |= prealloc_bits;
+    // vmdk, vpc and vhdx measure the same under every accepted mode, as
+    // create writes the same image, so the guest is always told "off".
+    if !preallocation_is_noop_format(&args.target_format) {
+        measure_flags |= prealloc_bits;
+    }
 
     let mut vmdk_subformat: u8 = match args.subformat.as_str() {
         "" | "monolithicSparse" => 0,
@@ -18351,7 +18395,15 @@ fn run_create_nonraw(args: &CreateArgs, verbose: bool) -> Result<(), Box<dyn std
     if args.backing_unsafe {
         flags |= CREATE_CONFIG_FLAG_BACKING_UNSAFE;
     }
-    flags |= match args.preallocation.as_str() {
+    // vmdk, vpc and vhdx write the same image under every accepted mode, so
+    // the guest is always told "off". The guest ignores the bits for these
+    // formats today; sending off keeps the parity from depending on that.
+    let prealloc_mode = if preallocation_is_noop_format(&args.target_format) {
+        "off"
+    } else {
+        args.preallocation.as_str()
+    };
+    flags |= match prealloc_mode {
         "metadata" => CREATE_CONFIG_PREALLOC_METADATA,
         "falloc" => CREATE_CONFIG_PREALLOC_FALLOC,
         "full" => CREATE_CONFIG_PREALLOC_FULL,
@@ -19524,12 +19576,11 @@ fn validate_create_args(args: &CreateArgs) -> Result<(), Box<dyn std::error::Err
 
     // Preallocation accept set:
     //   off       — any format (default)
-    //   metadata  — qcow2 only (raw has no metadata to preallocate;
-    //               vmdk/vpc/vhdx deferred)
-    //   falloc    — raw or qcow2
-    //   full      — raw or qcow2
-    // Non-qcow2 sparse formats (vmdk/vpc/vhdx) reject all non-`off`
-    // modes with a clear "future work" pointer.
+    //   metadata  — qcow2 only (raw has no metadata to preallocate, and
+    //               qemu refuses it for vmdk, vpc and vhdx)
+    //   falloc    — raw, qcow2, and vmdk/vpc/vhdx as a no-op
+    //   full      — raw, qcow2, and vmdk/vpc/vhdx as a no-op
+    // The no-op formats write the image off would, as qemu does.
     match (args.target_format.as_str(), args.preallocation.as_str()) {
         (_, "off") => {}
         ("raw", "metadata") => {
@@ -19538,13 +19589,9 @@ fn validate_create_args(args: &CreateArgs) -> Result<(), Box<dyn std::error::Err
                 .into());
         }
         ("qcow2", "metadata") | ("raw" | "qcow2", "falloc") | ("raw" | "qcow2", "full") => {}
-        ("vmdk" | "vpc" | "vhdx", mode @ ("metadata" | "falloc" | "full")) => {
-            return Err(format!(
-                "create: --preallocation={} is not yet supported for {} \
-                 (preallocation is implemented for raw and qcow2 only)",
-                mode, args.target_format
-            )
-            .into());
+        ("vmdk" | "vpc" | "vhdx", "falloc" | "full") => {}
+        ("vmdk" | "vpc" | "vhdx", "metadata") => {
+            return Err(preallocation_metadata_refusal("create", &args.target_format).into());
         }
         (_, other) => {
             return Err(format!("create: unknown --preallocation '{}'", other).into());
@@ -20005,11 +20052,104 @@ mod create_option_tests {
     }
 
     #[test]
-    fn vmdk_preallocation_metadata_deferred() {
-        let err = parse_create_o_options("vmdk", &s("preallocation=metadata"))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("preallocation is implemented for raw and qcow2 only"));
+    fn noop_preallocation_formats_accept_off_falloc_and_full() {
+        for fmt in ["vmdk", "vpc", "vhdx"] {
+            for mode in ["off", "falloc", "full"] {
+                let o =
+                    parse_create_o_options(fmt, &s(&format!("preallocation={}", mode))).unwrap();
+                assert_eq!(o.preallocation, Some(mode), "{} {}", fmt, mode);
+            }
+        }
+    }
+
+    #[test]
+    fn noop_preallocation_formats_refuse_metadata() {
+        for fmt in ["vmdk", "vpc", "vhdx"] {
+            let err = parse_create_o_options(fmt, &s("preallocation=metadata"))
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                err,
+                format!(
+                    "create: preallocation=metadata is not supported for {}",
+                    fmt
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn noop_preallocation_formats_refuse_unknown_mode() {
+        for fmt in ["vmdk", "vpc", "vhdx"] {
+            let err = parse_create_o_options(fmt, &s("preallocation=bogus"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("bad value 'bogus'"), "{}: {}", fmt, err);
+        }
+    }
+
+    #[test]
+    fn measure_o_preallocation_noop_formats() {
+        for fmt in ["vmdk", "vpc", "vhdx"] {
+            for mode in ["off", "falloc", "full", "metadata"] {
+                let o = parse_o_options(fmt, &s(&format!("preallocation={}", mode))).unwrap();
+                assert_eq!(o.preallocation, Some(mode), "{} {}", fmt, mode);
+            }
+            let err = parse_o_options(fmt, &s("preallocation=bogus"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("bad value 'bogus'"), "{}: {}", fmt, err);
+        }
+    }
+
+    fn create_args(fmt: &str, mode: &str) -> CreateArgs {
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "instar",
+            "create",
+            "-f",
+            fmt,
+            "--preallocation",
+            mode,
+            "image.img",
+            "1M",
+        ])
+        .expect("clap parse");
+        match cli.command {
+            Commands::Create(args) => args,
+            other => panic!("expected Create, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_noop_preallocation_formats() {
+        for fmt in ["vmdk", "vpc", "vhdx"] {
+            for mode in ["off", "falloc", "full"] {
+                validate_create_args(&create_args(fmt, mode))
+                    .unwrap_or_else(|e| panic!("{} {} refused: {}", fmt, mode, e));
+            }
+            let err = validate_create_args(&create_args(fmt, "metadata"))
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                err,
+                format!(
+                    "create: preallocation=metadata is not supported for {}",
+                    fmt
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_refusal_names_the_operation_and_format() {
+        assert_eq!(
+            preallocation_metadata_refusal("measure", "vpc"),
+            "measure: preallocation=metadata is not supported for vpc"
+        );
+        assert!(preallocation_is_noop_format("vhdx"));
+        assert!(!preallocation_is_noop_format("qcow2"));
+        assert!(!preallocation_is_noop_format("raw"));
     }
 
     #[test]
