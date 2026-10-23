@@ -14238,6 +14238,18 @@ fn vmdk_flat_extent_path(output: &Path, op: &str) -> Result<(std::path::PathBuf,
     ))
 }
 
+/// The monolithicFlat descriptor naming `extent_name`, for create and
+/// convert. The builder reports the length it needs whatever the buffer, so
+/// it is measured first and the buffer sized to fit.
+fn vmdk_flat_descriptor(capacity_sectors: u64, extent_name: &str) -> Vec<u8> {
+    let needed = vmdk::build_flat_descriptor(&mut [], 0, capacity_sectors, extent_name.as_bytes());
+    let mut text = vec![0u8; needed];
+    let written =
+        vmdk::build_flat_descriptor(&mut text, 0, capacity_sectors, extent_name.as_bytes());
+    debug_assert_eq!(written, needed);
+    text
+}
+
 /// Launch the convert guest, run the vCPU loop, and finalise the output.
 /// Shared by `run_convert` (window `None`) and `run_dd` (window `Some`).
 /// Behaviour for convert is identical to the previous inline body.
@@ -14962,14 +14974,12 @@ fn execute_convert(
     // the flat file.
     if let Some((ref _flat_path, ref flat_name)) = flat_extent_path {
         // convert writes no backing file for flat output, so out_vsize == virtual_size.
-        let capacity_sectors = out_vsize / 512;
-        let mut desc_buf = [0u8; 1024];
-        let n =
-            vmdk::build_flat_descriptor(&mut desc_buf, 0, capacity_sectors, flat_name.as_bytes());
-        std::fs::write(&exec.output, &desc_buf[..n])?;
+        let text = vmdk_flat_descriptor(out_vsize / 512, flat_name);
+        std::fs::write(&exec.output, &text)?;
         debug!(
             "Wrote monolithicFlat descriptor: {} ({} bytes)",
-            exec.output, n
+            exec.output,
+            text.len()
         );
     }
 
@@ -19361,20 +19371,7 @@ fn write_vmdk_flat(
         )
     })?;
 
-    // The first call measures the descriptor; the second fills a buffer of
-    // exactly that length.
-    let capacity_sectors = virtual_size / 512;
-    let needed = vmdk::build_flat_descriptor(&mut [], 0, capacity_sectors, extent_name.as_bytes());
-    let mut text = vec![0u8; needed];
-    let written =
-        vmdk::build_flat_descriptor(&mut text, 0, capacity_sectors, extent_name.as_bytes());
-    if written != needed {
-        return Err(format!(
-            "create: descriptor is {} bytes, not the {} measured",
-            written, needed
-        )
-        .into());
-    }
+    let text = vmdk_flat_descriptor(virtual_size / 512, extent_name);
     descriptor.write_all(&text).map_err(|e| {
         format!(
             "create: write '{}' failed: {}",
@@ -19389,7 +19386,7 @@ fn write_vmdk_flat(
     descriptor
         .sync_all()
         .map_err(|e| format!("create: sync '{}' failed: {}", descriptor_path.display(), e))?;
-    Ok(needed as u64)
+    Ok(text.len() as u64)
 }
 
 /// Apply ftruncate + optional preallocation pass + fsync. Split out
@@ -20505,9 +20502,10 @@ mod create_option_tests {
     }
 
     #[test]
-    fn flat_extent_is_rounded_up_to_a_sector_and_sparse() {
+    fn flat_extent_is_rounded_up_and_full_allocates_what_off_does() {
         use std::os::unix::fs::MetadataExt;
         let dir = tempfile::tempdir().unwrap();
+        let mut blocks = Vec::new();
         for mode in ["off", "full"] {
             let sub = dir.path().join(mode);
             std::fs::create_dir(&sub).unwrap();
@@ -20515,16 +20513,14 @@ mod create_option_tests {
             create_flat(&sub, "out", "1000", &["-o", &pre]).unwrap();
             let extent = std::fs::metadata(sub.join("out-flat")).unwrap();
             assert_eq!(extent.len(), 1024, "{}", mode);
-            assert_eq!(
-                extent.blocks(),
-                0,
-                "{}: the extent should stay sparse",
-                mode
-            );
+            blocks.push(extent.blocks());
             let text = std::fs::read_to_string(sub.join("out")).unwrap();
             assert!(text.contains("RW 2 FLAT \"out-flat\" 0\n"), "{}", text);
             assert!(text.contains("createType=\"monolithicFlat\""), "{}", text);
         }
+        // Compared with off rather than zero, as a filesystem may count
+        // metadata blocks against an empty sparse file.
+        assert_eq!(blocks[0], blocks[1], "full should allocate what off does");
     }
 
     #[test]

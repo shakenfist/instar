@@ -1933,6 +1933,7 @@ class TestCreateVmdkFlat(InstarTestBase):
                                        capture_output=True, text=True)
                     self.assertEqual(r.returncode, 0, r.stderr)
                     self.assertEqual(self.files_in(qemu_dir), self.files_in(instar_dir))
+                    self.assertIn(f'FLAT "{extent_name}"', (qemu_dir / name).read_text())
 
     def test_refusals_write_nothing(self):
         """Each refused option fails with its message before either file is opened."""
