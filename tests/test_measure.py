@@ -1174,3 +1174,51 @@ class TestMeasureNewFormatRefusal(TestMeasureSmoke):
         data = json.loads(stdout)
         self.assertGreater(data['required'], 0)
         self.assertGreater(data['fully-allocated'], 0)
+
+
+class TestMeasureNoopPreallocation(TestMeasureSmoke):
+    """vmdk, vpc and vhdx accept falloc and full as qemu does, where they change nothing.
+
+    qemu-img cannot measure these formats, so the reference is instar's own
+    answer for `off`. metadata is refused by qemu when it creates them, and
+    so by measure, through `-o` and `--preallocation` alike.
+    """
+
+    FORMATS = ('vmdk', 'vpc', 'vhdx')
+
+    def test_o_preallocation_does_not_change_the_answer(self):
+        """`-o preallocation=falloc|full` prints what `off` prints."""
+        for fmt in self.FORMATS:
+            off, stderr, rc = self.run_instar_measure('--size', '64M', '-O', fmt)
+            self.assertEqual(rc, 0, f'{fmt}: {stderr}')
+            for mode in ('off', 'falloc', 'full'):
+                stdout, stderr, rc = self.run_instar_measure(
+                    '--size', '64M', '-O', fmt, '-o', f'preallocation={mode}')
+                self.assertEqual(rc, 0, f'{fmt} -o preallocation={mode}: {stderr}')
+                self.assertEqual(off, stdout, f'{fmt} -o preallocation={mode}')
+
+    def test_flag_preallocation_does_not_change_the_answer(self):
+        """`--preallocation falloc|full` prints what `off` prints."""
+        for fmt in self.FORMATS:
+            off, stderr, rc = self.run_instar_measure('--size', '64M', '-O', fmt)
+            self.assertEqual(rc, 0, f'{fmt}: {stderr}')
+            for mode in ('falloc', 'full'):
+                stdout, stderr, rc = self.run_instar_measure(
+                    '--size', '64M', '-O', fmt, '--preallocation', mode)
+                self.assertEqual(rc, 0, f'{fmt} --preallocation {mode}: {stderr}')
+                self.assertEqual(off, stdout, f'{fmt} --preallocation {mode}')
+
+    def test_metadata_refused_by_both_spellings(self):
+        """metadata is refused with one message whichever way it is asked for."""
+        for fmt in self.FORMATS:
+            for spelling in (['-o', 'preallocation=metadata'], ['--preallocation', 'metadata']):
+                stdout, stderr, rc = self.run_instar_measure('--size', '64M', '-O', fmt, *spelling)
+                self.assertEqual(rc, 1, f'{fmt} {spelling}: stdout {stdout!r}')
+                self.assertIn(f'measure: preallocation=metadata is not supported for {fmt}', stderr)
+                self.assertEqual('', stdout)
+
+    def test_o_preallocation_bad_value_refused(self):
+        """An unknown mode is a bad value, not an unrecognised key."""
+        _, stderr, rc = self.run_instar_measure('--size', '64M', '-O', 'vpc', '-o', 'preallocation=bogus')
+        self.assertEqual(rc, 1)
+        self.assertIn("bad value 'bogus'", stderr)

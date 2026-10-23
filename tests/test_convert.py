@@ -2596,6 +2596,117 @@ class TestConvertVmdkFlatOutput(InstarTestBase):
             )
 
 
+# Output name -> extent name, as qemu-img writes them (block/vmdk.c
+# filename_decompose and the "%s-flat%s" format): split the basename at
+# its last dot and keep the postfix. See #820.
+FLAT_EXTENT_NAMES = (
+    ('out.vmdk', 'out-flat.vmdk'),
+    ('out.img', 'out-flat.img'),
+    ('out', 'out-flat'),
+    ('.hid', '-flat.hid'),
+    ('a.b.c', 'a.b-flat.c'),
+    ('sub.d/x.y', 'sub.d/x-flat.y'),
+    ('sub.d/noext', 'sub.d/noext-flat'),
+)
+
+
+class TestConvertVmdkFlatExtentName(InstarTestBase):
+    """The monolithicFlat extent is named the way qemu-img names it."""
+
+    def _source(self, tmpdir):
+        src = Path(tmpdir) / 'src.raw'
+        src.write_bytes(((b'instar flat naming ' * 64 + bytes(range(256))) * 1024)[:1048576])
+        return src
+
+    def _written(self, root):
+        return sorted(
+            str(p.relative_to(root)) for p in Path(root).rglob('*')
+            if p.is_file() and p.name != 'src.raw')
+
+    def _instar_convert_flat(self, root, name):
+        src = self._source(root)
+        out = Path(root) / name
+        out.parent.mkdir(parents=True, exist_ok=True)
+        stdout, stderr, rc = self.run_instar_convert(
+            src, out, output_format='vmdk', subformat='monolithicFlat',
+            timeout=60)
+        self.assertEqual(rc, 0, f'convert to {name} failed: {stderr}')
+        return src, out
+
+    def test_extent_name_follows_the_output_extension(self):
+        """The extent keeps the output's extension and the descriptor names it."""
+        for name, extent_name in FLAT_EXTENT_NAMES:
+            with self.subTest(output=name), tempfile.TemporaryDirectory() as tmpdir:
+                src, out = self._instar_convert_flat(tmpdir, name)
+                extent = Path(tmpdir) / extent_name
+
+                self.assertEqual(
+                    self._written(tmpdir), sorted([name, extent_name]),
+                    'unexpected files written')
+                self.assertIn(
+                    f'FLAT "{Path(extent_name).name}"', out.read_text(),
+                    'descriptor should name the extent that was written')
+                self.assertEqual(extent.read_bytes(), src.read_bytes())
+
+                # The image reads back through its descriptor.
+                back = Path(tmpdir) / 'back.raw'
+                stdout, stderr, rc = self.run_instar_convert(
+                    out, back, timeout=60)
+                self.assertEqual(rc, 0, f'read back failed: {stderr}')
+                self.assertEqual(back.read_bytes(), src.read_bytes())
+
+    def test_extent_name_matches_qemu_img(self):
+        """instar and qemu-img write the same files and FLAT line."""
+        if shutil.which('qemu-img') is None:
+            self.skipTest('qemu-img not available')
+
+        for name, _ in FLAT_EXTENT_NAMES:
+            with self.subTest(output=name), \
+                    tempfile.TemporaryDirectory() as itmp, \
+                    tempfile.TemporaryDirectory() as qtmp:
+                src, out = self._instar_convert_flat(itmp, name)
+
+                qsrc = self._source(qtmp)
+                qout = Path(qtmp) / name
+                qout.parent.mkdir(parents=True, exist_ok=True)
+                proc = subprocess.run(
+                    ['qemu-img', 'convert', '-O', 'vmdk', '-o',
+                     'subformat=monolithicFlat', str(qsrc), str(qout)],
+                    capture_output=True, text=True, timeout=60)
+                self.assertEqual(
+                    proc.returncode, 0, f'qemu-img failed: {proc.stderr}')
+
+                self.assertEqual(
+                    self._written(itmp), self._written(qtmp),
+                    'instar and qemu-img disagree on the files written')
+
+                def flat_line(path):
+                    return [line.split(None, 2)[2:]
+                            for line in path.read_text().splitlines()
+                            if ' FLAT ' in line]
+
+                self.assertEqual(flat_line(out), flat_line(qout))
+
+    def test_unrecordable_extent_names_write_nothing(self):
+        """An extent name the descriptor cannot record is refused before any output is written."""
+        # Argument parsing already refuses a non-UTF-8 name.
+        cases = (
+            ('a"b.vmdk', 'convert: vmdk monolithicFlat cannot record the extent name'),
+            ('a\nb.vmdk', 'convert: vmdk monolithicFlat cannot record the extent name'),
+            ('a\rb.vmdk', 'convert: vmdk monolithicFlat cannot record the extent name'),
+            (os.fsdecode(b'\xff.vmdk'), 'invalid UTF-8 was detected in one or more arguments'),
+        )
+        for name, message in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmpdir:
+                src = self._source(tmpdir)
+                stdout, stderr, rc = self.run_instar_convert(
+                    src, Path(tmpdir) / name, output_format='vmdk',
+                    subformat='monolithicFlat', timeout=60)
+                self.assertNotEqual(rc, 0, stdout)
+                self.assertIn(message, stderr)
+                self.assertEqual(self._written(tmpdir), [])
+
+
 class TestConvertVmdkCompare(InstarTestBase):
     """Test comparing VMDK images against raw equivalents.
 

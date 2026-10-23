@@ -14,13 +14,16 @@ These tests require /dev/kvm access for the non-raw paths.
 
 import json
 import os
+import resource
 import shutil
+import signal
 import struct
 import subprocess
 import tempfile
 from pathlib import Path
 
 from base import InstarTestBase
+from helpers import qemu_pins
 from helpers.info_json import assert_info_equivalent
 
 # ----------------------------------------------------------------------
@@ -1485,12 +1488,41 @@ class TestCreateBackingChain(InstarTestBase):
             self.assertIn('cluster size', stderr.lower())
 
 
+# Preallocation pin cases instar cannot create yet, each with the reason and
+# the message it fails with. A case that starts to work fails its test, which
+# says to remove the entry; a case that fails differently fails it too.
+KNOWN_PREALLOCATION_REFUSALS = {
+    'prealloc-vhdx-fixed': ('fixed VHDX is not written yet', 'subformat=fixed is not yet supported'),
+}
+
+
+def known_refusal_problem(case_name, reason, message, run):
+    """Why the KNOWN_PREALLOCATION_REFUSALS entry for `case_name` is stale, or None while it still holds.
+
+    `run` runs the pin case. A case that gets through has been fixed, and a
+    case that fails with some other message has changed; either way the
+    entry no longer describes instar.
+    """
+    try:
+        run()
+    except RuntimeError as e:
+        failure = str(e)
+    else:
+        return (f'instar now creates {case_name} ({reason}): remove this entry, {case_name!r}, '
+                f'from KNOWN_PREALLOCATION_REFUSALS')
+    if message not in failure:
+        return (f'instar refuses {case_name}, but not with the message KNOWN_PREALLOCATION_REFUSALS records '
+                f'({message!r}) for it ({reason}): {failure}')
+    return None
+
+
 class TestCreatePreallocation(InstarTestBase):
     """Preallocation tests.
 
     Covers the accept set: raw + falloc/full, qcow2 +
-    metadata/falloc/full, plus rejections for raw+metadata and
-    vmdk/vpc/vhdx + non-`off`.
+    metadata/falloc/full, vmdk/vpc/vhdx + falloc/full (which write what
+    `off` writes, as qemu does), plus rejections for raw+metadata and
+    vmdk/vpc/vhdx + metadata.
     """
 
     def run_instar_create(self, *args, timeout=120):
@@ -1596,14 +1628,395 @@ class TestCreatePreallocation(InstarTestBase):
             self.assertNotEqual(rc, 0)
             self.assertIn('raw has no metadata', stderr)
 
-    def test_vmdk_metadata_deferred(self):
-        """`-f vmdk -o preallocation=metadata` returns the future-work error."""
+    def _instar_pin_results(self, case_name):
+        """Run pin case `case_name` with instar in place of qemu-img, and return (pinned, measured)."""
         with tempfile.TemporaryDirectory() as td:
-            path = Path(td) / 'v.vmdk'
-            _, stderr, rc = self.run_instar_create(
-                '-f', 'vmdk', '-o', 'preallocation=metadata', str(path), '4M')
-            self.assertNotEqual(rc, 0)
-            self.assertIn('preallocation is implemented for raw and qcow2 only', stderr)
+            measured = qemu_pins.run_case(self.get_instar_binary(), case_name, Path(td))
+        return qemu_pins.expected(case_name), measured
+
+    def _assert_noop_preallocation(self, case_name):
+        """Every mode behaves as the qemu pin says: falloc and full are `off`, metadata is refused."""
+        pinned, measured = self._instar_pin_results(case_name)
+        off_length = measured['modes']['off']['file_length']
+        for mode in qemu_pins.PREALLOC_MODES:
+            want = pinned['modes'][mode]
+            got = measured['modes'][mode]
+            for field in ('rc', 'same_bytes_as_off', 'same_allocation_as_off'):
+                self.assertEqual(want[field], got[field], f'{case_name} preallocation={mode}: {field}')
+            if mode == 'metadata':
+                self.assertIsNone(got['file_length'], f'{case_name}: metadata left a file behind')
+                self.assertIn('preallocation=metadata is not supported for', got['stderr'])
+            else:
+                # qemu's absolute lengths are not instar's (the pin notes why), so compare with instar's own off.
+                self.assertEqual(off_length, got['file_length'], f'{case_name} preallocation={mode}: file_length')
+
+    def test_vpc_noop_preallocation(self):
+        """`-f vpc` accepts falloc and full and writes what `off` writes, as qemu does."""
+        self._assert_noop_preallocation('prealloc-vpc')
+
+    def test_vpc_fixed_noop_preallocation(self):
+        """`-f vpc -o subformat=fixed` accepts falloc and full and writes what `off` writes."""
+        self._assert_noop_preallocation('prealloc-vpc-fixed')
+
+    def test_vmdk_noop_preallocation(self):
+        """`-f vmdk` accepts falloc and full and writes what `off` writes, as qemu does."""
+        self._assert_noop_preallocation('prealloc-vmdk')
+
+    def test_vhdx_noop_preallocation(self):
+        """`-f vhdx` accepts falloc and full and writes what `off` writes, as qemu does."""
+        self._assert_noop_preallocation('prealloc-vhdx')
+
+    def test_vmdk_monolithic_flat_noop_preallocation(self):
+        """A monolithicFlat extent is the same sparse file under off, falloc and full, as qemu writes it."""
+        self._assert_noop_preallocation('prealloc-vmdk-monolithicFlat')
+
+    def test_metadata_refusal_text(self):
+        """metadata is refused for vmdk, vpc and vhdx, through -o and through --preallocation."""
+        for fmt in ('vmdk', 'vpc', 'vhdx'):
+            for spelling in (['-o', 'preallocation=metadata'], ['--preallocation', 'metadata']):
+                with tempfile.TemporaryDirectory() as td:
+                    path = Path(td) / f'image.{fmt}'
+                    _, stderr, rc = self.run_instar_create('-f', fmt, *spelling, str(path), '4M')
+                    self.assertEqual(rc, 1, f'{fmt} {spelling}: {stderr}')
+                    self.assertIn(f'create: preallocation=metadata is not supported for {fmt}', stderr)
+                    self.assertNotIn('not yet', stderr)
+                    self.assertFalse(path.exists(), f'{fmt} {spelling} left an image behind')
+
+    def test_noop_preallocation_through_flag(self):
+        """`--preallocation falloc|full` is accepted for vmdk, vpc and vhdx as `-o preallocation=` is."""
+        for fmt in ('vmdk', 'vpc', 'vhdx'):
+            for mode in ('falloc', 'full'):
+                with tempfile.TemporaryDirectory() as td:
+                    path = Path(td) / f'image.{fmt}'
+                    _, stderr, rc = self.run_instar_create('-f', fmt, '--preallocation', mode, str(path), '4M')
+                    self.assertEqual(rc, 0, f'{fmt} {mode}: {stderr}')
+                    self.assertTrue(path.exists())
+
+    def test_known_refusals_still_refuse(self):
+        """Each KNOWN_PREALLOCATION_REFUSALS case fails with its recorded message, until its entry is removed."""
+        binary = self.get_instar_binary()
+        for case_name, (reason, message) in KNOWN_PREALLOCATION_REFUSALS.items():
+            with self.subTest(case=case_name):
+                with tempfile.TemporaryDirectory() as td:
+                    problem = known_refusal_problem(
+                        case_name, reason, message, lambda: qemu_pins.run_case(binary, case_name, Path(td)))
+                if problem:
+                    self.fail(problem)
+
+    def test_known_refusal_check_rejects_a_passing_entry(self):
+        """An entry whose case now succeeds is reported, with the instruction to remove it."""
+        problem = known_refusal_problem('prealloc-x', 'a reason', 'some message', lambda: {'modes': {}})
+        self.assertIsNotNone(problem)
+        self.assertIn('remove this entry', problem)
+        self.assertIn("'prealloc-x'", problem)
+
+    def test_known_refusal_check_rejects_a_different_failure(self):
+        """An entry whose case fails with some other message is reported."""
+        def fails():
+            raise RuntimeError('preallocation=off failed: something else entirely')
+
+        problem = known_refusal_problem('prealloc-x', 'a reason', 'some message', fails)
+        self.assertIsNotNone(problem)
+        self.assertIn("'some message'", problem)
+        self.assertIn('something else entirely', problem)
+
+    def test_known_refusal_check_accepts_the_recorded_failure(self):
+        """An entry whose case fails with its recorded message is not a problem."""
+        def fails():
+            raise RuntimeError('preallocation=off failed: Error: some message here')
+
+        self.assertIsNone(known_refusal_problem('prealloc-x', 'a reason', 'some message', fails))
+
+
+# ----------------------------------------------------------------------
+# monolithicFlat VMDK
+# ----------------------------------------------------------------------
+
+def descriptor_without_ddb(descriptor):
+    """A VMDK descriptor with qemu's DDB entries removed, for comparing with instar's.
+
+    instar writes no `ddb.` lines (docs/quirks.md says why). Dropping them
+    leaves qemu's blank separator line after `#DDB` at the end of the text,
+    so trailing blank lines are reduced to a single final newline on both
+    sides.
+    """
+    lines = [line for line in descriptor.split('\n') if not line.startswith('ddb.')]
+    return '\n'.join(lines).rstrip('\n') + '\n'
+
+
+def drop_keys(value, keys):
+    """`value` (parsed JSON) with every dict entry named in `keys` removed, at any depth."""
+    if isinstance(value, dict):
+        return {k: drop_keys(v, keys) for k, v in value.items() if k not in keys}
+    if isinstance(value, list):
+        return [drop_keys(v, keys) for v in value]
+    return value
+
+
+# Output name -> the extent qemu-img writes beside it (block/vmdk.c
+# filename_decompose and the "%s-flat%s" format).
+FLAT_CREATE_EXTENT_NAMES = (
+    ('out.vmdk', 'out-flat.vmdk'),
+    ('out.img', 'out-flat.img'),
+    ('out', 'out-flat'),
+    ('.hid', '-flat.hid'),
+)
+
+FLAT = ('-f', 'vmdk', '-o', 'subformat=monolithicFlat')
+
+# Output names whose extent name a monolithicFlat descriptor cannot record, as (name, exit code, message): a quote or
+# line break would end the quoted name or the line, and the descriptor is UTF-8 text, so argument parsing already
+# refuses a non-UTF-8 name.
+UNRECORDABLE_FLAT_NAMES = (
+    ('a"b.vmdk', 1, 'vmdk monolithicFlat cannot record the extent name'),
+    ('a\nb.vmdk', 1, 'vmdk monolithicFlat cannot record the extent name'),
+    ('a\rb.vmdk', 1, 'vmdk monolithicFlat cannot record the extent name'),
+    (os.fsdecode(b'\xff.vmdk'), 2, 'invalid UTF-8 was detected in one or more arguments'),
+)
+
+
+class TestCreateVmdkFlat(InstarTestBase):
+    """`create -f vmdk -o subformat=monolithicFlat`, written on the host."""
+
+    def run_instar_create(self, *args, cwd=None, preexec_fn=None, timeout=120):
+        cmd = [str(self.get_instar_binary()), 'create', *[str(a) for a in args]]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd, preexec_fn=preexec_fn)
+        return r.stdout, r.stderr, r.returncode
+
+    def create_flat(self, path, size, *extra, **kwargs):
+        stdout, stderr, rc = self.run_instar_create(*FLAT, *extra, path, size, **kwargs)
+        self.assertEqual(rc, 0, f'create {path} failed: {stderr}')
+        return stdout
+
+    def files_in(self, directory):
+        return sorted(p.name for p in Path(directory).iterdir())
+
+    def test_pin_64m_descriptor_and_extent(self):
+        """The 64M case matches the newest qemu's descriptor (without DDB lines) and extent length."""
+        pin = qemu_pins.load_pin()
+        newest = max(pin['versions'], key=qemu_pins.version_key)
+        want = qemu_pins.expected('vmdk-flat-64M', version=newest)
+        with tempfile.TemporaryDirectory() as td:
+            got = qemu_pins.run_case(self.get_instar_binary(), 'vmdk-flat-64M', Path(td))
+        self.assertEqual(want['rc'], got['rc'], got['stderr'])
+        self.assertEqual(want['stderr'], got['stderr'])
+        self.assertEqual(want['extent_length'], got['extent_length'])
+        self.assertIsNotNone(got['descriptor'])
+        self.assertEqual(descriptor_without_ddb(want['descriptor']), descriptor_without_ddb(got['descriptor']))
+
+    def test_pin_backing_is_refused(self):
+        """A backing file is refused, as by every pinned qemu, and nothing is written."""
+        want = qemu_pins.expected('vmdk-flat-backing')
+        with tempfile.TemporaryDirectory() as td:
+            got = qemu_pins.run_case(self.get_instar_binary(), 'vmdk-flat-backing', Path(td))
+        self.assertEqual(want['rc'], got['rc'])
+        self.assertIsNone(got['descriptor'])
+        self.assertIsNone(got['extent_length'])
+        self.assertIn('create: vmdk monolithicFlat cannot have a backing file', got['stderr'])
+
+    def test_size_is_rounded_up_to_a_sector(self):
+        """A 1000-byte request gives a 1024-byte extent and `RW 2 FLAT`, as qemu writes it."""
+        with tempfile.TemporaryDirectory() as td:
+            stdout = self.create_flat(Path(td) / 'out.img', '1000')
+            self.assertEqual(self.files_in(td), ['out-flat.img', 'out.img'])
+            self.assertEqual((Path(td) / 'out-flat.img').stat().st_size, 1024)
+            self.assertIn('RW 2 FLAT "out-flat.img" 0\n', (Path(td) / 'out.img').read_text())
+            self.assertIn('virtual_size=1024', stdout)
+
+    def test_full_allocates_what_off_allocates(self):
+        """The extent stays sparse under falloc and full: its blocks equal those under off."""
+        blocks = {}
+        with tempfile.TemporaryDirectory() as td:
+            for mode in ('off', 'falloc', 'full'):
+                directory = Path(td) / mode
+                directory.mkdir()
+                self.create_flat(directory / 'c.vmdk', '64M', '-o', f'preallocation={mode}')
+                extent = directory / 'c-flat.vmdk'
+                with open(extent, 'rb') as f:
+                    os.fsync(f.fileno())
+                self.assertEqual(extent.stat().st_size, 64 * 1024 * 1024)
+                blocks[mode] = extent.stat().st_blocks
+        self.assertEqual(blocks['off'], blocks['full'], blocks)
+        self.assertEqual(blocks['off'], blocks['falloc'], blocks)
+
+    def test_subformat_spellings_are_identical(self):
+        """`-o subformat=monolithicFlat` and `--subformat monolithicFlat` write the same files."""
+        with tempfile.TemporaryDirectory() as td:
+            outputs = {}
+            for label, args in (('o', FLAT), ('flag', ('-f', 'vmdk', '--subformat', 'monolithicFlat'))):
+                directory = Path(td) / label
+                directory.mkdir()
+                stdout, stderr, rc = self.run_instar_create(*args, '--output', 'json', 'c.vmdk', '3M',
+                                                            cwd=directory)
+                self.assertEqual(rc, 0, stderr)
+                outputs[label] = (stdout, (directory / 'c.vmdk').read_bytes(),
+                                  (directory / 'c-flat.vmdk').stat().st_size, self.files_in(directory))
+            self.assertEqual(outputs['o'], outputs['flag'])
+
+    def test_json_and_quiet_output(self):
+        """JSON reports the descriptor, and -q prints nothing."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'c.vmdk'
+            stdout = self.create_flat(path, '64M', '--output', 'json')
+            report = json.loads(stdout)
+            length = path.stat().st_size
+            self.assertEqual(report, {
+                'filename': str(path), 'format': 'vmdk', 'virtual_size': 64 * 1024 * 1024,
+                'metadata_bytes_written': length, 'file_size_after': length, 'resolved_unit_size': 0,
+            })
+            self.assertEqual(self.create_flat(path, '64M', '-q'), '')
+            human = self.create_flat(path, '64M')
+            self.assertEqual(human.strip(), f'Created: {path} (format=vmdk, virtual_size=67108864)')
+
+    def test_instar_info_and_check_read_it(self):
+        """instar info reads the image, and check treats it as it treats a flat image convert wrote."""
+        with tempfile.TemporaryDirectory() as td:
+            created = Path(td) / 'created' / 'c.vmdk'
+            created.parent.mkdir()
+            self.create_flat(created, '1M')
+            stdout, stderr, rc = self.run_instar_info(created, output_format='json')
+            self.assertEqual(rc, 0, stderr)
+            info = json.loads(stdout)
+            self.assertEqual(info['format'], 'vmdk')
+            self.assertEqual(info['virtual-size'], 1024 * 1024)
+            self.assertEqual(info['format-specific']['data']['create-type'], 'monolithicFlat')
+            self.assertEqual([Path(e['filename']).name for e in info['format-specific']['data']['extents']],
+                             ['c-flat.vmdk'])
+
+            source = Path(td) / 'src.raw'
+            source.write_bytes(bytes(1024 * 1024))
+            converted = Path(td) / 'converted' / 'c.vmdk'
+            converted.parent.mkdir()
+            _, stderr, rc = self.run_instar_convert(source, converted, output_format='vmdk',
+                                                    subformat='monolithicFlat', timeout=60)
+            self.assertEqual(rc, 0, stderr)
+            want = self.run_instar_check(converted)
+            got = self.run_instar_check(created)
+            self.assertEqual(want[2], got[2], got)
+            # check refuses monolithicFlat images (exit 63) until #822 is fixed; tighten this to 0 then.
+            self.assertIn(got[2], (0, 63), got)
+
+    def test_qemu_img_info_matches_qemu_created_image(self):
+        """qemu-img info of instar's flat image matches qemu's own, apart from the CID and allocation."""
+        self._require_qemu_img()
+        with tempfile.TemporaryDirectory() as td:
+            infos = {}
+            for label in ('instar', 'qemu'):
+                directory = Path(td) / label
+                directory.mkdir()
+                if label == 'instar':
+                    self.create_flat('c.vmdk', '64M', cwd=directory)
+                else:
+                    r = subprocess.run(['qemu-img', 'create', '-q', *FLAT, 'c.vmdk', '64M'], cwd=directory,
+                                       capture_output=True, text=True)
+                    self.assertEqual(r.returncode, 0, r.stderr)
+                r = subprocess.run(['qemu-img', 'info', '--output=json', 'c.vmdk'], cwd=directory,
+                                   capture_output=True, text=True)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                infos[label] = drop_keys(json.loads(r.stdout), {'cid', 'actual-size'})
+            self.assertEqual(infos['qemu'], infos['instar'])
+
+    def test_extent_names_match_qemu(self):
+        """The extent is named as qemu-img names it, whatever the output is called."""
+        have_qemu = shutil.which('qemu-img') is not None
+        for name, extent_name in FLAT_CREATE_EXTENT_NAMES:
+            with self.subTest(output=name), tempfile.TemporaryDirectory() as td:
+                instar_dir = Path(td) / 'instar'
+                instar_dir.mkdir()
+                self.create_flat(name, '1M', cwd=instar_dir)
+                self.assertEqual(self.files_in(instar_dir), sorted([name, extent_name]))
+                self.assertIn(f'FLAT "{extent_name}"', (instar_dir / name).read_text())
+                if have_qemu:
+                    qemu_dir = Path(td) / 'qemu'
+                    qemu_dir.mkdir()
+                    r = subprocess.run(['qemu-img', 'create', '-q', *FLAT, name, '1M'], cwd=qemu_dir,
+                                       capture_output=True, text=True)
+                    self.assertEqual(r.returncode, 0, r.stderr)
+                    self.assertEqual(self.files_in(qemu_dir), self.files_in(instar_dir))
+                    self.assertIn(f'FLAT "{extent_name}"', (qemu_dir / name).read_text())
+
+    def test_refusals_write_nothing(self):
+        """Each refused option fails with its message before either file is opened."""
+        cases = [
+            (('-b', 'base.vmdk', '-F', 'vmdk', 'c.vmdk', '64M'),
+             'create: vmdk monolithicFlat cannot have a backing file'),
+            (('-o', 'zeroed_grain=on', 'c.vmdk', '64M'), 'create: vmdk monolithicFlat cannot enable zeroed_grain'),
+            (('-o', 'grain_size=4096', 'c.vmdk', '64M'),
+             'create: vmdk monolithicFlat has no grains, so it takes no grain size (got 4096)'),
+            (('--grain-size', '65536', 'c.vmdk', '64M'),
+             'create: vmdk monolithicFlat has no grains, so it takes no grain size (got 65536)'),
+            (('-o', 'preallocation=metadata', 'c.vmdk', '64M'),
+             'create: preallocation=metadata is not supported for vmdk'),
+            (('c.vmdk',), 'create: vmdk monolithicFlat requires SIZE'),
+        ]
+        for args, message in cases:
+            with self.subTest(args=args), tempfile.TemporaryDirectory() as td:
+                (Path(td) / 'base.vmdk').write_bytes(b'')
+                _, stderr, rc = self.run_instar_create(*FLAT, *args, cwd=td)
+                self.assertEqual(rc, 1, stderr)
+                self.assertIn(message, stderr)
+                self.assertEqual(self.files_in(td), ['base.vmdk'])
+
+    def test_unrecordable_extent_names_write_nothing(self):
+        """An extent name the descriptor cannot record is refused before either file is opened."""
+        for name, want_rc, message in UNRECORDABLE_FLAT_NAMES:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as td:
+                _, stderr, rc = self.run_instar_create(*FLAT, name, '1M', cwd=td)
+                self.assertEqual(rc, want_rc, stderr)
+                self.assertIn(message, stderr)
+                self.assertEqual(self.files_in(td), [])
+
+    def test_existing_files_are_truncated(self):
+        """An existing descriptor and extent are replaced, as qemu replaces them."""
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / 'c.vmdk').write_bytes(b'\xaa' * 8192)
+            (Path(td) / 'c-flat.vmdk').write_bytes(b'\xaa' * 200000)
+            self.create_flat(Path(td) / 'c.vmdk', '4096')
+            self.assertEqual((Path(td) / 'c-flat.vmdk').read_bytes(), bytes(4096))
+            descriptor = (Path(td) / 'c.vmdk').read_bytes()
+            self.assertTrue(descriptor.startswith(b'# Disk DescriptorFile\n'))
+            self.assertNotIn(b'\xaa', descriptor)
+
+    def test_failure_opening_the_extent_removes_the_descriptor(self):
+        """When the extent cannot be opened, the descriptor already opened is removed."""
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / 'c.vmdk').write_bytes(b'old')
+            (Path(td) / 'c-flat.vmdk').mkdir()
+            _, stderr, rc = self.run_instar_create(*FLAT, 'c.vmdk', '1M', cwd=td)
+            self.assertEqual(rc, 1)
+            self.assertIn("open 'c-flat.vmdk' failed", stderr)
+            self.assertEqual(self.files_in(td), ['c-flat.vmdk'])
+            self.assertTrue((Path(td) / 'c-flat.vmdk').is_dir())
+
+    def test_failure_sizing_the_extent_removes_both_files(self):
+        """When the extent cannot be sized, neither file is left behind."""
+        def limit_file_size():
+            # A file-size limit makes ftruncate past it fail with EFBIG; the
+            # signal that also comes with it is ignored so the error is seen.
+            signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+            resource.setrlimit(resource.RLIMIT_FSIZE, (1024 * 1024, 1024 * 1024))
+
+        with tempfile.TemporaryDirectory() as td:
+            _, stderr, rc = self.run_instar_create(*FLAT, 'c.vmdk', '64M', cwd=td, preexec_fn=limit_file_size)
+            self.assertEqual(rc, 1, stderr)
+            self.assertIn("ftruncate 'c-flat.vmdk' failed", stderr)
+            self.assertEqual(self.files_in(td), [])
+
+    def test_unwritable_directory_leaves_nothing(self):
+        """In a directory that cannot be written, create fails and writes nothing."""
+        if os.geteuid() == 0:
+            self.skipTest('root can write a read-only directory')
+        with tempfile.TemporaryDirectory() as td:
+            directory = Path(td) / 'ro'
+            directory.mkdir()
+            directory.chmod(0o555)
+            try:
+                _, stderr, rc = self.run_instar_create(*FLAT, directory / 'c.vmdk', '1M')
+                self.assertEqual(rc, 1)
+                self.assertIn('Permission denied', stderr)
+                self.assertEqual(self.files_in(directory), [])
+            finally:
+                directory.chmod(0o755)
 
 
 # ----------------------------------------------------------------------
