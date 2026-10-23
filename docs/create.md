@@ -173,10 +173,13 @@ Refused, before either file is opened:
 | `-o zeroed_grain=on` | `create: vmdk monolithicFlat cannot enable zeroed_grain` |
 | `--grain-size` or `-o grain_size` | `create: vmdk monolithicFlat has no grains, so it takes no grain size (got N)` |
 | `preallocation=metadata` | `create: preallocation=metadata is not supported for vmdk` |
+| an extent name holding `"`, CR or LF | `create: vmdk monolithicFlat cannot record the extent name "..." in its descriptor (it must be UTF-8 without '"', CR or LF)` |
 
 qemu-img refuses the first, third and last too ("Flat image can't have
 backing file", "Flat image can't enable zeroed grain", "Unsupported
-preallocation mode: metadata"); it has no grain size option at all. On
+preallocation mode: metadata"); it has no grain size option at all. It
+writes any extent name verbatim (see
+[quirks.md](quirks.md#vmdk-flat-extent-names-must-fit-the-descriptor)). On
 the metadata refusal qemu-img leaves a zero-byte descriptor behind;
 instar leaves nothing. If a failure happens after a file has been opened
 (the extent's name is taken by a directory, or the extent cannot be

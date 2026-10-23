@@ -14199,11 +14199,12 @@ fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::erro
 /// looks for `\` and then `:` when there is no `/`; neither is a path
 /// separator on the hosts instar runs on, so they are not split on.
 ///
-/// The name is handled as bytes, so a non-UTF-8 basename does not panic:
-/// the extent path keeps the exact bytes, and the recorded descriptor name
-/// has any invalid sequences replaced with U+FFFD (which a descriptor
-/// cannot carry verbatim, as it is text).
-fn vmdk_flat_extent_path(output: &Path) -> (std::path::PathBuf, String) {
+/// The descriptor records the name as a quoted string on a line of UTF-8
+/// text, so a name that is not UTF-8, or that holds a `"`, CR or LF, is
+/// refused rather than written: it would name a file other than the
+/// extent, or end the quoted string and add descriptor lines of its own.
+/// qemu writes such names verbatim. `op` prefixes the refusal.
+fn vmdk_flat_extent_path(output: &Path, op: &str) -> Result<(std::path::PathBuf, String), String> {
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
     let bytes = output.as_os_str().as_bytes();
@@ -14217,12 +14218,24 @@ fn vmdk_flat_extent_path(output: &Path) -> (std::path::PathBuf, String) {
     name.extend_from_slice(prefix);
     name.extend_from_slice(b"-flat");
     name.extend_from_slice(postfix);
+    let recordable = std::str::from_utf8(&name)
+        .ok()
+        .filter(|n| !n.contains(['"', '\r', '\n']));
+    let Some(recorded) = recordable else {
+        return Err(format!(
+            "{}: vmdk monolithicFlat cannot record the extent name {:?} in its descriptor \
+             (it must be UTF-8 without '\"', CR or LF)",
+            op,
+            String::from_utf8_lossy(&name)
+        ));
+    };
+    let recorded = recorded.to_string();
     let mut path = dir.to_vec();
     path.extend_from_slice(&name);
-    (
+    Ok((
         std::path::PathBuf::from(std::ffi::OsString::from_vec(path)),
-        String::from_utf8_lossy(&name).into_owned(),
-    )
+        recorded,
+    ))
 }
 
 /// Launch the convert guest, run the vCPU loop, and finalise the output.
@@ -14339,7 +14352,7 @@ fn execute_convert(
     // the host writes the descriptor afterwards. Override target
     // format to Raw and derive the flat extent filename.
     let (effective_target_format, flat_extent_path) = if is_vmdk_flat_output {
-        let (flat_path, flat_name) = vmdk_flat_extent_path(Path::new(&exec.output));
+        let (flat_path, flat_name) = vmdk_flat_extent_path(Path::new(&exec.output), "convert")?;
         (1u32, Some((flat_path, flat_name))) // ImageFormat::Raw
     } else {
         (target_format, None)
@@ -14948,7 +14961,7 @@ fn execute_convert(
     // file; now we create the small text descriptor that points at
     // the flat file.
     if let Some((ref _flat_path, ref flat_name)) = flat_extent_path {
-        // monolithicFlat is convert-only, so out_vsize == virtual_size.
+        // convert writes no backing file for flat output, so out_vsize == virtual_size.
         let capacity_sectors = out_vsize / 512;
         let mut desc_buf = [0u8; 1024];
         let n =
@@ -19276,7 +19289,9 @@ fn run_create_raw(args: &CreateArgs) -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// The arguments were validated before this runs, so nothing is opened
 /// for a refused command. Once a file has been opened (and so truncated),
-/// any failure removes every file this call opened.
+/// any failure removes every file this call opened. A symlink is followed
+/// when opened and only the link is removed, so the file it points at is
+/// left truncated, as `run_create_raw` leaves it.
 fn run_create_vmdk_flat(args: &CreateArgs) -> Result<(), Box<dyn std::error::Error>> {
     let size_str = args
         .size
@@ -19287,7 +19302,7 @@ fn run_create_vmdk_flat(args: &CreateArgs) -> Result<(), Box<dyn std::error::Err
         .ok_or("create: SIZE is too large")?;
 
     let descriptor_path = Path::new(&args.filename);
-    let (extent_path, extent_name) = vmdk_flat_extent_path(descriptor_path);
+    let (extent_path, extent_name) = vmdk_flat_extent_path(descriptor_path, "create")?;
     let mut opened = Vec::new();
     let result = write_vmdk_flat(
         descriptor_path,
@@ -22650,7 +22665,7 @@ mod vmdk_flat_extent_path_tests {
     /// Assert `output` gives the extent path `extent`, and that the descriptor
     /// records the final component of `extent`.
     fn check(output: &str, extent: &str) {
-        let (path, name) = vmdk_flat_extent_path(Path::new(output));
+        let (path, name) = vmdk_flat_extent_path(Path::new(output), "test").unwrap();
         assert_eq!(path, PathBuf::from(extent));
         assert_eq!(name, extent.rsplit('/').next().unwrap());
     }
@@ -22702,11 +22717,32 @@ mod vmdk_flat_extent_path_tests {
         check("a:b.vmdk", "a:b-flat.vmdk");
     }
 
+    /// Assert `output` is refused, naming `op` and the offending name.
+    fn refused(output: &[u8], shown: &str) {
+        let err = vmdk_flat_extent_path(Path::new(OsStr::from_bytes(output)), "op").unwrap_err();
+        assert!(err.starts_with("op: "), "{err}");
+        assert!(err.contains(shown), "{err} should show {shown}");
+    }
+
     #[test]
-    fn non_utf8_basename_does_not_panic() {
-        let out = Path::new(OsStr::from_bytes(b"d/\xff\xfe.img"));
-        let (path, name) = vmdk_flat_extent_path(out);
-        assert_eq!(path.as_os_str().as_bytes(), b"d/\xff\xfe-flat.img");
-        assert_eq!(name, "\u{fffd}\u{fffd}-flat.img");
+    fn non_utf8_basename_is_refused() {
+        refused(b"d/\xff\xfe.img", "\"\u{fffd}\u{fffd}-flat.img\"");
+    }
+
+    #[test]
+    fn descriptor_breaking_characters_are_refused() {
+        refused(b"a\"b.vmdk", r#""a\"b-flat.vmdk""#);
+        refused(b"a\nb.vmdk", r#""a\nb-flat.vmdk""#);
+        refused(b"a\rb.vmdk", r#""a\rb-flat.vmdk""#);
+    }
+
+    #[test]
+    fn non_utf8_and_quotes_in_directories_are_allowed() {
+        // Only the basename is recorded; the directory never reaches the
+        // descriptor.
+        let out = Path::new(OsStr::from_bytes(b"\xff\"/out.vmdk"));
+        let (path, name) = vmdk_flat_extent_path(out, "op").unwrap();
+        assert_eq!(path.as_os_str().as_bytes(), b"\xff\"/out-flat.vmdk");
+        assert_eq!(name, "out-flat.vmdk");
     }
 }

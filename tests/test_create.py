@@ -1764,6 +1764,16 @@ FLAT_CREATE_EXTENT_NAMES = (
 
 FLAT = ('-f', 'vmdk', '-o', 'subformat=monolithicFlat')
 
+# Output names whose extent name a monolithicFlat descriptor cannot record, as (name, exit code, message): a quote or
+# line break would end the quoted name or the line, and the descriptor is UTF-8 text, so argument parsing already
+# refuses a non-UTF-8 name.
+UNRECORDABLE_FLAT_NAMES = (
+    ('a"b.vmdk', 1, 'vmdk monolithicFlat cannot record the extent name'),
+    ('a\nb.vmdk', 1, 'vmdk monolithicFlat cannot record the extent name'),
+    ('a\rb.vmdk', 1, 'vmdk monolithicFlat cannot record the extent name'),
+    (os.fsdecode(b'\xff.vmdk'), 2, 'invalid UTF-8 was detected in one or more arguments'),
+)
+
 
 class TestCreateVmdkFlat(InstarTestBase):
     """`create -f vmdk -o subformat=monolithicFlat`, written on the host."""
@@ -1883,6 +1893,7 @@ class TestCreateVmdkFlat(InstarTestBase):
             want = self.run_instar_check(converted)
             got = self.run_instar_check(created)
             self.assertEqual(want[2], got[2], got)
+            # check refuses monolithicFlat images (exit 63) until #822 is fixed; tighten this to 0 then.
             self.assertIn(got[2], (0, 63), got)
 
     def test_qemu_img_info_matches_qemu_created_image(self):
@@ -1944,6 +1955,15 @@ class TestCreateVmdkFlat(InstarTestBase):
                 self.assertEqual(rc, 1, stderr)
                 self.assertIn(message, stderr)
                 self.assertEqual(self.files_in(td), ['base.vmdk'])
+
+    def test_unrecordable_extent_names_write_nothing(self):
+        """An extent name the descriptor cannot record is refused before either file is opened."""
+        for name, want_rc, message in UNRECORDABLE_FLAT_NAMES:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as td:
+                _, stderr, rc = self.run_instar_create(*FLAT, name, '1M', cwd=td)
+                self.assertEqual(rc, want_rc, stderr)
+                self.assertIn(message, stderr)
+                self.assertEqual(self.files_in(td), [])
 
     def test_existing_files_are_truncated(self):
         """An existing descriptor and extent are replaced, as qemu replaces them."""

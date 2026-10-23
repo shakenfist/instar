@@ -1146,6 +1146,21 @@ Every instar VMDK also carries the constant `CID=fffffffe` where qemu
 writes a random one. That is the same missing identity source as the
 all-zero VHD unique id (#566).
 
+### VMDK flat extent names must fit the descriptor
+
+A monolithicFlat descriptor names its extent on a line of text, as
+`RW <sectors> FLAT "<name>" 0`. qemu-img writes the name verbatim
+(measured with qemu-img 10.0.13): a `"`, CR or LF in the output's
+basename ends the quoted string or the line, so the descriptor names a
+different file or gains lines of its own, and a non-UTF-8 name is
+written as raw bytes. instar refuses the quote, CR and LF in `create`
+and `convert`, before any file is opened, with `<op>: vmdk monolithicFlat
+cannot record the extent name "..." in its descriptor`. It never sees a
+non-UTF-8 name: its command line takes only UTF-8 arguments, and exits 2
+with `invalid UTF-8 was detected in one or more arguments`. Its
+descriptor reader requires UTF-8 too, so such an image could not be read
+back.
+
 ### VHD `virtual_size` diverges from qemu-img by CHS rounding
 
 `qemu-img create -f vpc` rounds the requested `virtual_size` up

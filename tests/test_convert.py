@@ -2687,6 +2687,25 @@ class TestConvertVmdkFlatExtentName(InstarTestBase):
 
                 self.assertEqual(flat_line(out), flat_line(qout))
 
+    def test_unrecordable_extent_names_write_nothing(self):
+        """An extent name the descriptor cannot record is refused before any output is written."""
+        # Argument parsing already refuses a non-UTF-8 name.
+        cases = (
+            ('a"b.vmdk', 'convert: vmdk monolithicFlat cannot record the extent name'),
+            ('a\nb.vmdk', 'convert: vmdk monolithicFlat cannot record the extent name'),
+            ('a\rb.vmdk', 'convert: vmdk monolithicFlat cannot record the extent name'),
+            (os.fsdecode(b'\xff.vmdk'), 'invalid UTF-8 was detected in one or more arguments'),
+        )
+        for name, message in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmpdir:
+                src = self._source(tmpdir)
+                stdout, stderr, rc = self.run_instar_convert(
+                    src, Path(tmpdir) / name, output_format='vmdk',
+                    subformat='monolithicFlat', timeout=60)
+                self.assertNotEqual(rc, 0, stdout)
+                self.assertIn(message, stderr)
+                self.assertEqual(self._written(tmpdir), [])
+
 
 class TestConvertVmdkCompare(InstarTestBase):
     """Test comparing VMDK images against raw equivalents.
