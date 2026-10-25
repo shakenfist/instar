@@ -556,7 +556,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   shapes beyond the limit are logged and counted in the run's summary,
   and a pull request's divergences stay on the pull request as its red
   check and uploaded logs. The summary counts a filing that failed
-  apart from one that succeeded.
+  apart from one that succeeded. A shape includes the fields that say
+  what diverged, such as the target format, so a qcow2 and a vmdk
+  convert mismatch are still filed separately.
 
 - **A docs-only merge group no longer runs the distro matrix.** The
   `check_paths` filter that already let a docs-only pull request skip
@@ -583,9 +585,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   remains of the 480-minute timeout after the build, less 30 minutes for
   the push and what follows it, so slow setup costs fuzzing time rather
   than the night's corpus. The job summary records the budget each run
-  got. Crash minimisation is bounded too, at two minutes a crash and
-  never into the push's time, and `check-fuzz-targets.sh` fails if the
-  deadline and the job's timeout disagree.
+  got. Each target is clamped to the deadline as it starts, so time
+  spent on an earlier crash comes out of the targets after it; crash
+  minimisation is bounded at two minutes a crash and never into the
+  push's time; and `check-fuzz-targets.sh` fails if the deadline and
+  the job's timeout disagree.
 
 - **The merge queue's `package-build` job no longer competes for an `xl`
   runner.** It builds a `.deb` and an `.rpm` -- a docker build and two

@@ -5099,6 +5099,49 @@ def write_divergence_report(log_dir, seed, iteration, attrs, divergence):
     return report_path
 
 
+# The fields a divergence carries that say *what* diverged rather than by
+# how much: the format converted to, the libyal tool, the measure or map
+# field, the convert or resize option in play, whether a rebase detaches,
+# the snapshot scenario, the repair corruption class and tier, and the
+# fixed wording some checks give their finding. Everything else a divergence carries is in
+# PER_ITERATION_FIELDS: values that change every iteration (sizes,
+# hashes, option strings, outputs), which would stop any two matching.
+# test_differential_fuzz_issues.py fails on a divergence field that is in
+# neither, so a new one gets decided rather than silently left out.
+SHAPE_FIELDS = (
+    'target_format', 'format', 'tool', 'field', 'compress',
+    'preallocation', 'apply_shrink', 'note', 'reason',
+    'shape', 'corruption', 'tier', 'is_detach',
+)
+PER_ITERATION_FIELDS = frozenset({
+    # Handled by divergence_key itself.
+    'operation', 'operation_in_chain', 'instar_stderr', 'context', 'recipe', 'field_divergences',
+    # Outputs, exit codes and the values compared.
+    'instar_stdout', 'qemu_stdout', 'qemu_stderr', 'libyal_stderr', 'instar_path_stderr',
+    'qemu_path_stderr', 'compare_stderr', 'instar_rc', 'qemu_rc', 'libyal_rc', 'instar_path_rc',
+    'qemu_path_rc', 'compare_rc', 'instar_ok', 'libyal_ok', 'instar_sha256', 'qemu_sha256',
+    'instar_normalised', 'qemu_normalised', 'instar_normalized', 'qemu_normalized', 'instar_value',
+    'qemu_value', 'instar_count', 'qemu_count', 'instar_has_bitmaps', 'qemu_has_bitmaps',
+    'instar_bitmaps', 'qemu_bitmaps', 'instar_header', 'qemu_header', 'instar_message',
+    'qemu_message', 'instar_extent', 'qemu_extent', 'instar_metrics', 'instar', 'qemu', 'orig',
+    # The iteration's randomly chosen inputs.
+    'create_opts', 'create_options', 'amend_opts', 'options', 'base_options', 'argv', 'invocation',
+    'window_args', 'extent_index', 'start_size', 'end_spec', 'size', 'vsize', 'out_vsize',
+    'overlay_size', 'new_backing_name', 'new_backing_size', 'rebase_flags', 'bs',
+    'count', 'skip', 'cluster_size', 'snaps', 'chain', 'element_index', 'element', 'iteration',
+})
+
+
+def _normalise_message(text):
+    """The first line of a message, without its per-iteration noise."""
+    first = next((line.strip() for line in str(text).splitlines() if line.strip()), '')
+    # A path starts a token: not the slash in read/write or 1/2.
+    first = re.sub(r'(?<![\w/])/\S*', '<path>', first)
+    first = re.sub(r'0x[0-9a-fA-F]+', 'N', first)
+    first = re.sub(r'\d{3,}', 'N', first)
+    return first
+
+
 def divergence_key(divergence):
     """The shape of a divergence: what makes two of them the same finding.
 
@@ -5108,19 +5151,29 @@ def divergence_key(divergence):
     one 100-iteration run, each titled with an operation and a format the
     fault had nothing to do with.
 
-    The shape is the divergence type, the operation, and the first line of
-    instar's stderr with the per-iteration noise taken out: paths (every
-    iteration works in its own files) and numbers of three or more digits
-    (offsets and sizes). Short numbers stay, because an errno or exit code
-    is part of what distinguishes one fault from another.
+    The shape is the divergence type, the operation, the SHAPE_FIELDS the
+    divergence carries, the names of the fields a libyal comparison found
+    different, and the first line of instar's stderr with the
+    per-iteration noise taken out: paths (every iteration works in its own
+    files), hex values and numbers of three or more digits (offsets and
+    sizes). Short numbers stay, because an errno or exit code is part of
+    what distinguishes one fault from another. Most divergence types carry
+    no stderr at all, which is why the fields matter: without them a qcow2
+    and a vmdk convert mismatch would be one issue.
     """
     context = divergence.get('context') or {}
     stderr = divergence.get('instar_stderr') or context.get('instar_stderr') or ''
-    first = next((line.strip() for line in str(stderr).splitlines() if line.strip()), '')
-    first = re.sub(r'/\S*', '<path>', first)
-    first = re.sub(r'\d{3,}', 'N', first)
     operation = divergence.get('operation') or divergence.get('operation_in_chain') or ''
-    return (str(divergence.get('type', 'unknown')), str(operation), first)
+    fields = tuple(
+        (name, str(divergence[name])) for name in SHAPE_FIELDS if divergence.get(name) is not None
+    )
+    recipe = divergence.get('recipe')
+    if isinstance(recipe, dict) and recipe.get('fmt'):
+        fields += (('recipe.fmt', str(recipe['fmt'])),)
+    differing = divergence.get('field_divergences')
+    if isinstance(differing, dict):
+        fields += (('field_divergences', ','.join(sorted(differing))),)
+    return (str(divergence.get('type', 'unknown')), str(operation), fields, _normalise_message(stderr))
 
 
 class IssueFiler:

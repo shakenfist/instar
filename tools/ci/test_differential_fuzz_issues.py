@@ -12,6 +12,7 @@ than its limit. `gh` is never run; the filer's issue and comment
 callables are replaced with recorders.
 """
 
+import ast
 import os
 import types
 import unittest
@@ -99,8 +100,109 @@ class DivergenceKeyTestCase(unittest.TestCase):
         self.assertEqual(df.divergence_key(a), df.divergence_key(b))
 
     def test_a_divergence_with_no_stderr_still_has_a_key(self):
-        self.assertEqual(('snapshot_byte_divergence', '', ''),
+        self.assertEqual(('snapshot_byte_divergence', '', (), ''),
                          df.divergence_key({'type': 'snapshot_byte_divergence'}))
+
+    def test_a_hex_offset_does_not_distinguish(self):
+        a = exit_code('map', 'Error: bad L2 entry at 0xab12cd\n')
+        b = exit_code('map', 'Error: bad L2 entry at 0x3f00\n')
+        self.assertEqual(df.divergence_key(a), df.divergence_key(b))
+
+    def test_a_slash_inside_a_word_is_not_a_path(self):
+        a = exit_code('info', 'Error: read/write not permitted\n')
+        b = exit_code('info', 'Error: read/only not permitted\n')
+        self.assertNotEqual(df.divergence_key(a), df.divergence_key(b))
+
+    def test_a_quoted_path_is_still_a_path(self):
+        a = exit_code('info', 'Error: cannot open "/tmp/instar-fuzz-ab12/img0.qcow2"\n')
+        b = exit_code('info', 'Error: cannot open "/tmp/instar-fuzz-cd34/img9.qcow2"\n')
+        self.assertEqual(df.divergence_key(a), df.divergence_key(b))
+
+
+class ContentDivergenceKeyTestCase(unittest.TestCase):
+    """Most divergence types carry no stderr, so their fields are the shape."""
+
+    def convert(self, target_format, sha, compress=False):
+        return {'type': 'convert_content_divergence', 'target_format': target_format,
+                'compress': compress, 'instar_sha256': sha, 'qemu_sha256': 'f' * 64}
+
+    def test_the_target_format_distinguishes(self):
+        self.assertNotEqual(df.divergence_key(self.convert('qcow2', 'a' * 64)),
+                            df.divergence_key(self.convert('vmdk', 'a' * 64)))
+
+    def test_compression_distinguishes(self):
+        self.assertNotEqual(df.divergence_key(self.convert('qcow2', 'a' * 64)),
+                            df.divergence_key(self.convert('qcow2', 'a' * 64, compress=True)))
+
+    def test_a_hash_does_not_distinguish(self):
+        self.assertEqual(df.divergence_key(self.convert('qcow2', 'a' * 64)),
+                         df.divergence_key(self.convert('qcow2', 'b' * 64)))
+
+    def test_the_measure_field_distinguishes_and_its_values_do_not(self):
+        def measure(field, value):
+            return {'type': 'measure_numeric_divergence', 'target_format': 'qcow2', 'field': field,
+                    'instar_value': value, 'qemu_value': 0, 'instar_stdout': str(value)}
+        self.assertEqual(df.divergence_key(measure('required', 1)), df.divergence_key(measure('required', 2)))
+        self.assertNotEqual(df.divergence_key(measure('required', 1)),
+                            df.divergence_key(measure('fully-allocated', 1)))
+
+    def test_the_libyal_fields_that_differ_distinguish(self):
+        def libyal(fields):
+            return {'type': 'libyal_info_divergence', 'tool': 'vhdiinfo', 'format': 'vhd',
+                    'field_divergences': {f: {'instar': 1, 'libyal': 2} for f in fields}}
+        self.assertNotEqual(df.divergence_key(libyal(['virtual_size'])),
+                            df.divergence_key(libyal(['identifier'])))
+        self.assertEqual(df.divergence_key(libyal(['identifier', 'virtual_size'])),
+                         df.divergence_key(libyal(['virtual_size', 'identifier'])))
+
+    def test_a_bench_recipe_format_distinguishes(self):
+        def bench(fmt):
+            return {'type': 'bench_write_divergence', 'operation': 'bench',
+                    'recipe': {'fmt': fmt, 'size': 123}, 'argv': ['x'], 'reason': 'differ'}
+        self.assertNotEqual(df.divergence_key(bench('raw')), df.divergence_key(bench('qcow2')))
+
+
+class ShapeFieldsTestCase(unittest.TestCase):
+    def divergence_fields(self):
+        """Every field named in a divergence the fuzzer builds.
+
+        Reads the source rather than running it: a divergence is a dict
+        literal with a 'type' ending in _divergence, plus the context
+        dicts some of them spread in with **ctx, which are found by name.
+        """
+        with open(_DF_PATH, encoding='utf-8') as f:
+            tree = ast.parse(f.read())
+        spread = set()
+        fields = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Dict):
+                continue
+            keys = [k.value if isinstance(k, ast.Constant) else None for k in node.keys]
+            types_ = [v.value for k, v in zip(keys, node.values)
+                      if k == 'type' and isinstance(v, ast.Constant)]
+            if types_ and str(types_[0]).endswith('_divergence'):
+                fields.update(k for k in keys if k and k != 'type')
+                spread.update(v.id for k, v in zip(keys, node.values) if k is None and isinstance(v, ast.Name))
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Assign) and isinstance(node.value, ast.Dict)
+                    and any(isinstance(t, ast.Name) and t.id in spread for t in node.targets)):
+                fields.update(k.value for k in node.value.keys if isinstance(k, ast.Constant))
+        return fields
+
+    def test_the_scan_finds_the_divergences(self):
+        # A scan that matched nothing would pass the test below vacuously.
+        fields = self.divergence_fields()
+        for expected in ('target_format', 'field_divergences', 'corruption', 'shape'):
+            self.assertIn(expected, fields)
+
+    def test_every_divergence_field_is_classified(self):
+        unclassified = self.divergence_fields() - set(df.SHAPE_FIELDS) - df.PER_ITERATION_FIELDS
+        self.assertEqual(set(), unclassified,
+                         'add each to SHAPE_FIELDS if it says what diverged, or to '
+                         'PER_ITERATION_FIELDS if it changes every iteration')
+
+    def test_no_field_is_both(self):
+        self.assertEqual(set(), set(df.SHAPE_FIELDS) & df.PER_ITERATION_FIELDS)
 
 
 class IssueFilerTestCase(unittest.TestCase):

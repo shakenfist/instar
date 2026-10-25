@@ -54,6 +54,18 @@ start "budget: never negative"
 check "a deadline already inside the reserve" \
     "$(FUZZ_TIER_NOW=1000 "${TIER}" budget 1200 600 27000)" "0"
 
+# coverage-fuzz.yml calls budget once per target, with that target's
+# planned duration as the cap, so time an earlier crash spent minimising
+# comes out of the later targets. Zero is its signal to skip the target:
+# libFuzzer reads -max_total_time=0 as no limit at all.
+start "budget: a target clamped to what is left of the deadline"
+check "a target planned for longer than is left gets what is left" \
+    "$(FUZZ_TIER_NOW=1000 "${TIER}" budget 2200 600 900)" "600"
+check "a target planned for less than is left keeps its plan" \
+    "$(FUZZ_TIER_NOW=1000 "${TIER}" budget 4600 600 900)" "900"
+check "a target starting exactly at the reserve gets zero" \
+    "$(FUZZ_TIER_NOW=1000 "${TIER}" budget 1600 600 900)" "0"
+
 start "plan: a roomy budget favours the deep targets"
 PLAN="$("${TIER}" plan 2000 300 "${TARGETS[@]}")"
 check "fast targets get the fast slice" \
