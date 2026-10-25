@@ -548,6 +548,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   a future regression fails loudly instead of quietly discarding a
   night's work.
 
+- **The differential fuzzer files one issue per divergence shape, at
+  most five a run, and never from a pull request**
+  ([#787](https://github.com/shakenfist/instar/issues/787)). One
+  100-iteration pull-request run filed 98 issues for a single kernel
+  fault. Repeats of a shape are now noted as a comment on its issue,
+  shapes beyond the limit are logged and counted in the run's summary,
+  and a pull request's divergences stay on the pull request as its red
+  check and uploaded logs. The summary counts a filing that failed
+  apart from one that succeeded. A shape includes the fields that say
+  what diverged, such as the target format, so a qcow2 and a vmdk
+  convert mismatch are still filed separately.
+
+- **A docs-only merge group no longer runs the distro matrix.** The
+  `check_paths` filter that already let a docs-only pull request skip
+  the expensive jobs now runs in the merge queue as well, diffing the
+  group against its `base_sha`, so a change to documentation alone no
+  longer spends seven `xl` legs and part of the queue's 360-minute
+  deadline. `can_merge` now also depends on `check_paths`, so a failed
+  filter cannot pass as a group with nothing to test.
+
+- **The fuzzers no longer run after every merge.** Both
+  `coverage-fuzz.yml` and `differential-fuzz.yml` ran a smoke test on
+  every push to `develop` touching `src/` -- about 75 and 20 minutes of
+  an `xl` runner per merge, from the pool the merge queue waits on, for
+  a weaker copy of what each runs nightly. The pull-request and nightly
+  runs are unchanged, so a merged change that crashes a fuzz target is
+  now found by the next nightly rather than within the hour.
+
+- **The nightly coverage fuzz sizes its fuzzing from the job's
+  deadline** ([#519](https://github.com/shakenfist/instar/issues/519)).
+  The fixed 450-minute budget left 30 minutes for setup and the corpus
+  push, and once seeding the corpus slowed from two minutes to
+  twenty-five on the testdata disk the job was killed mid-fuzz on seven
+  nights out of nine, before the push ran. The budget is now whatever
+  remains of the 480-minute timeout after the build, less 30 minutes for
+  the push and what follows it, so slow setup costs fuzzing time rather
+  than the night's corpus. The job summary records the budget each run
+  got. Each target is clamped to the deadline as it starts, so time
+  spent on an earlier crash comes out of the targets after it; crash
+  minimisation is bounded at two minutes a crash and never into the
+  push's time; and `check-fuzz-targets.sh` fails if the deadline and
+  the job's timeout disagree.
+
 - **The merge queue's `package-build` job no longer competes for an `xl`
   runner.** It builds a `.deb` and an `.rpm` -- a docker build and two
   packaging steps, with no VM and no test suite -- but ran on the

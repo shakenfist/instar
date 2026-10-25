@@ -59,7 +59,12 @@ build_tree() {
     {
         echo 'jobs:'
         echo '  fuzz:'
+        echo '    timeout-minutes: 480'
         echo '    steps:'
+        # shellcheck disable=SC2016  # the workflow's own shell text, written literally
+        echo '      - run: echo "FUZZ_DEADLINE=$(( $(date +%s) + 480 * 60 ))" >> "$GITHUB_ENV"'
+        echo '      - timeout-minutes: 20'
+        echo '        run: tools/ci/push-fuzz-corpus.sh'
         echo '      - run: |'
         echo '          TARGETS=('
         for t in "${targets[@]}"; do
@@ -196,6 +201,26 @@ sed -i 's/    fuzz_alpha/    fuzz_alpha\n    fuzz_nonexistent/' \
     "${TREE}/tools/ci/fuzz-tier.sh"
 expect_fail 'a FAST_TIER name that is not a target fails' "${TREE}" \
     'fuzz_nonexistent'
+
+start 'FUZZ_DEADLINE must use the job timeout, not a step timeout'
+TREE="${WORK}/deadline-short"
+build_tree "${TREE}" "${FOUR[@]}"
+sed -i 's/^    timeout-minutes: 480$/    timeout-minutes: 420/' \
+    "${TREE}/.github/workflows/coverage-fuzz.yml"
+expect_fail 'a lowered job timeout with the deadline left alone fails' "${TREE}" \
+    'FUZZ_DEADLINE 480 minutes' 'timeout-minutes is 420'
+
+TREE="${WORK}/deadline-moved"
+build_tree "${TREE}" "${FOUR[@]}"
+sed -i 's/+ 480 \* 60/+ 500 * 60/' "${TREE}/.github/workflows/coverage-fuzz.yml"
+expect_fail 'a deadline past the job timeout fails' "${TREE}" \
+    'FUZZ_DEADLINE 500 minutes'
+
+TREE="${WORK}/deadline-gone"
+build_tree "${TREE}" "${FOUR[@]}"
+sed -i 's/FUZZ_DEADLINE=/DEADLINE=/' "${TREE}/.github/workflows/coverage-fuzz.yml"
+expect_fail 'a deadline the parser cannot find fails rather than passing' "${TREE}" \
+    'expected one job timeout-minutes and one FUZZ_DEADLINE'
 
 if [ "${FAILURES}" -ne 0 ]; then
     echo "test-check-fuzz-targets: ${FAILURES} test(s) failed" >&2

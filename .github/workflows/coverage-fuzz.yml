@@ -19,16 +19,15 @@ on:
       - 'tools/ci/report-fuzz-crash.sh'
       - 'tools/ci/pick-fuzz-artifact.sh'
 
-  # Post-merge smoke test: 15s per target
-  push:
-    branches: [develop]
-    paths:
-      - 'src/**'
-      - 'scripts/extract-fuzz-corpus.py'
-      - '.github/workflows/coverage-fuzz.yml'
-      - 'tools/ci/fuzz-tier.sh'
-      - 'tools/ci/report-fuzz-crash.sh'
-      - 'tools/ci/pick-fuzz-artifact.sh'
+  # No push trigger, deliberately. There was a post-merge smoke run of
+  # every target for 15s on each push to develop touching src/. It cost
+  # about 75 minutes of an `xl` runner per merge -- the seeding and the
+  # build, not the fuzzing -- taken from the pool the merge queue waits
+  # on, and it was a strictly weaker copy of the nightly, which runs
+  # the same targets for minutes each within a day. It last found
+  # anything in August. A merged change that crashes a target is found
+  # by the next nightly; one that breaks the fuzz build is found by the
+  # pull_request run above when it touches fuzz or crate code.
 
   # Manual: configurable duration and target selection
   workflow_dispatch:
@@ -62,6 +61,19 @@ jobs:
       DOCKER_BUILDKIT: 1
 
     steps:
+      # First, so the deadline is measured from as near the job's own
+      # start as a step can get. The fuzzing below is sized from it rather
+      # than from a fixed budget: a fixed 450 minutes left 30 for
+      # everything else in the job, and when seeding the corpus went from
+      # two minutes to twenty-five on the testdata disk (cold reads of the
+      # whole accumulated corpus, where a fresh clone had left it in the
+      # page cache) the nightly was killed mid-fuzz on seven nights out of
+      # nine, losing the corpus push after it (#519). 480 is the
+      # timeout-minutes above; GitHub offers no way to read it back, so
+      # change the two together.
+      - name: Record the job's deadline
+        run: echo "FUZZ_DEADLINE=$(( $(date +%s) + 480 * 60 ))" >> "$GITHUB_ENV"
+
       - name: Checkout
         uses: actions/checkout@v7
 
@@ -129,30 +141,14 @@ jobs:
             DURATION=${INPUT_DURATION}
             TARGETS=${INPUT_TARGETS}
 
-            # Count targets (default: every target in src/fuzz/Cargo.toml)
-            if [ -n "$TARGETS" ]; then
-              N_TARGETS=$(echo "$TARGETS" | tr ',' '\n' | wc -l)
-            else
-              N_TARGETS=$(tools/ci/count-fuzz-targets.sh)
-            fi
-
-            # Cap duration so total fits in 450 min (30 min headroom)
-            MAX_DURATION=$(( 450 * 60 / N_TARGETS ))
-            if [ "$DURATION" -gt "$MAX_DURATION" ]; then
-              echo "::warning::Capping duration from ${DURATION}s to ${MAX_DURATION}s to fit timeout"
-              DURATION=$MAX_DURATION
-            fi
-
+            # Capped to what fits before the job's deadline in the run
+            # step, once the build has taken what it takes.
             echo "duration=${DURATION}" >> $GITHUB_OUTPUT
             echo "targets=${TARGETS}" >> $GITHUB_OUTPUT
           elif [ "$EVENT_NAME" = "pull_request" ]; then
             # Build + single target smoke test
             echo "duration=10" >> $GITHUB_OUTPUT
             echo "targets=fuzz_format_detect" >> $GITHUB_OUTPUT
-          elif [ "$EVENT_NAME" = "push" ]; then
-            # Post-merge: 15s per target, all targets
-            echo "duration=15" >> $GITHUB_OUTPUT
-            echo "targets=" >> $GITHUB_OUTPUT
           else
             # schedule (nightly) — per-target durations are tiered in the
             # run step via tools/ci/fuzz-tier.sh against NIGHTLY_BUDGET_SECONDS
@@ -175,11 +171,19 @@ jobs:
           FUZZ_TARGETS: ${{ steps.params.outputs.targets }}
           EVENT_NAME: ${{ github.event_name }}
           # Nightly per-target durations are tiered (see tools/ci/fuzz-tier.sh):
-          # the deep parser targets split this wall-clock budget while the
-          # fast-saturating targets take a short fixed slice. 27000s = 450 min
-          # leaves ~30 min of the 480 min job timeout for build/seed/push.
+          # the deep parser targets split the wall-clock budget while the
+          # fast-saturating targets take a short fixed slice. The budget is
+          # whatever is left before FUZZ_DEADLINE once the targets are
+          # built, less FUZZ_RESERVE_SECONDS, and never more than
+          # NIGHTLY_BUDGET_SECONDS (450 min, which a quick setup reaches).
           NIGHTLY_BUDGET_SECONDS: '27000'
           FAST_TIER_SECONDS: '300'
+          # What the steps after this one need: the corpus push's own
+          # 20-minute timeout, plus ten minutes for crash reporting, a
+          # container start per target, libFuzzer finishing its last
+          # input, and the log upload. Crash minimisation is bounded on
+          # its own, against FUZZ_DEADLINE, below.
+          FUZZ_RESERVE_SECONDS: '1800'
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
@@ -251,14 +255,29 @@ jobs:
             )
           fi
 
+          # What fits before the deadline, measured now that the build
+          # is done rather than guessed at the top of the job.
+          BUDGET=$(tools/ci/fuzz-tier.sh budget \
+            "$FUZZ_DEADLINE" "$FUZZ_RESERVE_SECONDS" "$NIGHTLY_BUDGET_SECONDS")
+          echo "Fuzzing budget: ${BUDGET}s of ${NIGHTLY_BUDGET_SECONDS}s"
+
           # Build the per-target run plan as "<target> <duration>" lines.
           # The nightly schedule tiers durations via tools/ci/fuzz-tier.sh
           # so the deep parser targets get most of the budget; every other
-          # event type runs each target for the uniform params duration.
+          # event type runs each target for the uniform params duration,
+          # which a manual run may not stretch past the budget either.
           if [ "$EVENT_NAME" = "schedule" ]; then
             PLAN=$(tools/ci/fuzz-tier.sh plan \
-              "$NIGHTLY_BUDGET_SECONDS" "$FAST_TIER_SECONDS" "${TARGETS[@]}")
+              "$BUDGET" "$FAST_TIER_SECONDS" "${TARGETS[@]}")
           else
+            if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+              MAX_DURATION=$(( BUDGET / ${#TARGETS[@]} ))
+              [ "$MAX_DURATION" -lt 1 ] && MAX_DURATION=1
+              if [ "$FUZZ_DURATION" -gt "$MAX_DURATION" ]; then
+                echo "::warning::Capping duration from ${FUZZ_DURATION}s to ${MAX_DURATION}s to fit timeout"
+                FUZZ_DURATION=$MAX_DURATION
+              fi
+            fi
             PLAN=$(for T in "${TARGETS[@]}"; do echo "$T $FUZZ_DURATION"; done)
           fi
           echo "Run plan (target duration):"
@@ -267,9 +286,30 @@ jobs:
           CRASHES_FOUND=0
           REPORT_FAILURES=0
           NO_ARTIFACT=0
+          SKIPPED=0
+          SHORTENED=0
 
           while read -r TARGET DURATION; do
             [ -z "$TARGET" ] && continue
+
+            # The plan was sized before anything ran, so time spent
+            # minimising and reporting an earlier crash comes out of it
+            # here: each target gets no more than is left before the
+            # reserve. Without this, early crashes push every later
+            # target into the corpus push's time, which is #519. Zero
+            # means skip, not -max_total_time=0, which is no limit.
+            LEFT=$(tools/ci/fuzz-tier.sh budget \
+              "$FUZZ_DEADLINE" "$FUZZ_RESERVE_SECONDS" "$DURATION")
+            if [ "$LEFT" -eq 0 ]; then
+              echo "::warning::Skipping $TARGET: no fuzzing time left before the reserve"
+              SKIPPED=$((SKIPPED + 1))
+              continue
+            fi
+            if [ "$LEFT" -lt "$DURATION" ]; then
+              echo "::notice::Shortening $TARGET from ${DURATION}s to ${LEFT}s to keep the reserve"
+              SHORTENED=$((SHORTENED + 1))
+              DURATION=$LEFT
+            fi
             echo "=== Fuzzing $TARGET for ${DURATION}s ==="
 
             # Run fuzzer inside container
@@ -307,11 +347,27 @@ jobs:
               CRASH_FILE=$(tools/ci/pick-fuzz-artifact.sh crash \
                 "src/fuzz/artifacts/$TARGET/")
               if [ -n "$CRASH_FILE" ]; then
-                echo "Minimizing crash: $CRASH_FILE"
+                # Minimisation is the one thing after the fuzzing whose
+                # length is set by the input rather than by us, once per
+                # crashing target. Each gets at most two minutes, and no
+                # more than leaves the corpus push its 20 (plus five for
+                # the rest) before FUZZ_DEADLINE, so a night with several
+                # crashes reports some unminimised rather than losing the
+                # push. The timeout is on the docker client, with --init
+                # so the signal it forwards ends the whole container; one
+                # inside would kill cargo and leave libFuzzer holding the
+                # tee open. The container is named so that it can still be
+                # killed if the client had to be. A partly minimised input
+                # is still used below.
+                TMIN_SECONDS=$(tools/ci/fuzz-tier.sh budget "$FUZZ_DEADLINE" 1500 120)
+              fi
+              if [ -n "$CRASH_FILE" ] && [ "$TMIN_SECONDS" -gt 0 ]; then
+                echo "Minimizing crash: $CRASH_FILE (at most ${TMIN_SECONDS}s)"
                 # No -max_len here: cargo fuzz tmin passes its own, and
                 # a second one trips libFuzzer's
                 # `assert(MaxInputLen == 0)` so minimization always fails.
-                docker run --rm \
+                TMIN_NAME="coverage-fuzz-tmin-${TARGET}-$$"
+                timeout -k 30 "$TMIN_SECONDS" docker run --rm --init --name "$TMIN_NAME" \
                   -u "$(id -u):$(id -g)" \
                   -e HOME=/build \
                   -e CARGO_HOME=/build/.cargo \
@@ -325,6 +381,7 @@ jobs:
                     cargo fuzz tmin $TARGET /workspace/$CRASH_FILE \
                       2>&1 | tee /workspace/coverage-fuzz-logs/${TARGET}-tmin.log
                   " || true
+                docker kill "$TMIN_NAME" >/dev/null 2>&1 || true
 
                 # Report the minimized input when tmin produced one:
                 # otherwise the issue quotes the size of, and the
@@ -336,7 +393,11 @@ jobs:
                   echo "Minimized to: $MIN_FILE"
                   CRASH_FILE=$MIN_FILE
                 fi
+              elif [ -n "$CRASH_FILE" ]; then
+                echo "::notice::Not minimising $CRASH_FILE: no time left before the corpus push"
+              fi
 
+              if [ -n "$CRASH_FILE" ]; then
                 # Reporting must never end the run: the remaining targets
                 # still have to be fuzzed. Failures are counted and turned
                 # into a failure in the final step, so a fuzz run that
@@ -372,7 +433,10 @@ jobs:
           {
             echo "### Coverage fuzz"
             echo ""
-            echo "- targets fuzzed: $(echo "$PLAN" | grep -c .)"
+            echo "- targets planned: $(echo "$PLAN" | grep -c .)"
+            echo "- shortened to keep the reserve: $SHORTENED"
+            echo "- skipped for lack of time: $SKIPPED"
+            echo "- fuzzing budget: ${BUDGET}s of ${NIGHTLY_BUDGET_SECONDS}s"
             echo "- non-zero exits: $CRASHES_FOUND"
             echo "- could not be reported: $REPORT_FAILURES"
             echo "- exited without an artifact: $NO_ARTIFACT"
@@ -393,7 +457,10 @@ jobs:
       # `timeout-minutes: 480` here, after the fuzzing had finished
       # (#519). The budget could not have worked: NIGHTLY_BUDGET_SECONDS
       # is 450 minutes, leaving 30 for setup and this push, and this
-      # push alone measured 22.
+      # push alone measured 22. In October setup grew instead and the
+      # job died in the fuzzing step before reaching this one, which is
+      # why the fuzzing is now sized from the job's deadline with this
+      # step's 20 minutes held back (FUZZ_RESERVE_SECONDS above).
       #
       # The timeout below is what keeps that honest. The script now does
       # a trees-only clone and touches only genuinely new entries, so 20

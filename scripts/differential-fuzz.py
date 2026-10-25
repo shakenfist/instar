@@ -5099,11 +5099,179 @@ def write_divergence_report(log_dir, seed, iteration, attrs, divergence):
     return report_path
 
 
+# The fields a divergence carries that say *what* diverged rather than by
+# how much: the format converted to, the libyal tool, the measure or map
+# field, the convert or resize option in play, whether a rebase detaches,
+# the snapshot scenario, the repair corruption class and tier, and the
+# fixed wording some checks give their finding. Everything else a divergence carries is in
+# PER_ITERATION_FIELDS: values that change every iteration (sizes,
+# hashes, option strings, outputs), which would stop any two matching.
+# test_differential_fuzz_issues.py fails on a divergence field that is in
+# neither, so a new one gets decided rather than silently left out.
+SHAPE_FIELDS = (
+    'target_format', 'format', 'tool', 'field', 'compress',
+    'preallocation', 'apply_shrink', 'note', 'reason',
+    'shape', 'corruption', 'tier', 'is_detach',
+)
+PER_ITERATION_FIELDS = frozenset({
+    # Handled by divergence_key itself.
+    'operation', 'operation_in_chain', 'instar_stderr', 'context', 'recipe', 'field_divergences',
+    # Outputs, exit codes and the values compared.
+    'instar_stdout', 'qemu_stdout', 'qemu_stderr', 'libyal_stderr', 'instar_path_stderr',
+    'qemu_path_stderr', 'compare_stderr', 'instar_rc', 'qemu_rc', 'libyal_rc', 'instar_path_rc',
+    'qemu_path_rc', 'compare_rc', 'instar_ok', 'libyal_ok', 'instar_sha256', 'qemu_sha256',
+    'instar_normalised', 'qemu_normalised', 'instar_normalized', 'qemu_normalized', 'instar_value',
+    'qemu_value', 'instar_count', 'qemu_count', 'instar_has_bitmaps', 'qemu_has_bitmaps',
+    'instar_bitmaps', 'qemu_bitmaps', 'instar_header', 'qemu_header', 'instar_message',
+    'qemu_message', 'instar_extent', 'qemu_extent', 'instar_metrics', 'instar', 'qemu', 'orig',
+    # The iteration's randomly chosen inputs.
+    'create_opts', 'create_options', 'amend_opts', 'options', 'base_options', 'argv', 'invocation',
+    'window_args', 'extent_index', 'start_size', 'end_spec', 'size', 'vsize', 'out_vsize',
+    'overlay_size', 'new_backing_name', 'new_backing_size', 'rebase_flags', 'bs',
+    'count', 'skip', 'cluster_size', 'snaps', 'chain', 'element_index', 'element', 'iteration',
+})
+
+
+def _normalise_message(text):
+    """The first line of a message, without its per-iteration noise."""
+    first = next((line.strip() for line in str(text).splitlines() if line.strip()), '')
+    # A path starts a token: not the slash in read/write or 1/2.
+    first = re.sub(r'(?<![\w/])/\S*', '<path>', first)
+    first = re.sub(r'0x[0-9a-fA-F]+', 'N', first)
+    first = re.sub(r'\d{3,}', 'N', first)
+    return first
+
+
+def divergence_key(divergence):
+    """The shape of a divergence: what makes two of them the same finding.
+
+    A run files one issue per shape rather than one per iteration. Without
+    this, a fault that makes every iteration diverge -- a kernel that
+    refused every guest, in #787 -- filed an issue per iteration: 98 from
+    one 100-iteration run, each titled with an operation and a format the
+    fault had nothing to do with.
+
+    The shape is the divergence type, the operation, the SHAPE_FIELDS the
+    divergence carries, the names of the fields a libyal comparison found
+    different, and the first line of instar's stderr with the
+    per-iteration noise taken out: paths (every iteration works in its own
+    files), hex values and numbers of three or more digits (offsets and
+    sizes). Short numbers stay, because an errno or exit code is part of
+    what distinguishes one fault from another. Most divergence types carry
+    no stderr at all, which is why the fields matter: without them a qcow2
+    and a vmdk convert mismatch would be one issue.
+    """
+    context = divergence.get('context') or {}
+    stderr = divergence.get('instar_stderr') or context.get('instar_stderr') or ''
+    operation = divergence.get('operation') or divergence.get('operation_in_chain') or ''
+    fields = tuple(
+        (name, str(divergence[name])) for name in SHAPE_FIELDS if divergence.get(name) is not None
+    )
+    recipe = divergence.get('recipe')
+    if isinstance(recipe, dict) and recipe.get('fmt'):
+        fields += (('recipe.fmt', str(recipe['fmt'])),)
+    differing = divergence.get('field_divergences')
+    if isinstance(differing, dict):
+        fields += (('field_divergences', ','.join(sorted(differing))),)
+    return (str(divergence.get('type', 'unknown')), str(operation), fields, _normalise_message(stderr))
+
+
+class IssueFiler:
+    """Files a run's divergences as GitHub issues, one per shape, capped.
+
+    The first divergence of each shape is filed when it is found, as
+    before, so a run killed part way still leaves its findings filed.
+    Repeats of a shape are counted and noted on that issue at the end of
+    the run. Once max_issues have been attempted, new shapes are counted
+    and reported in the run's log and summary instead: a run that reaches
+    the cap is itself the finding, and its JSON reports are in the
+    uploaded logs either way.
+
+    The cap is on attempts, not successes. A filing that fails is nearly
+    always gh failing (a missing token, rate limiting), so trying every
+    further shape against it would only add a 30-second timeout each.
+    The summary counts the two apart, so a run whose filings failed does
+    not report them as filed.
+    """
+
+    def __init__(self, seed, workflow_url, max_issues, file_issue=None, comment=None):
+        self.seed = seed
+        self.workflow_url = workflow_url
+        self.max_issues = max_issues
+        self.file_issue = file_issue or file_github_issue
+        self.comment = comment or comment_github_issue
+        self.shapes = {}
+        self.filed = 0
+        self.failed = 0
+        self.suppressed = 0
+
+    def divergence(self, iteration, attrs, div):
+        key = divergence_key(div)
+        shape = self.shapes.get(key)
+        if shape is not None:
+            shape['iterations'].append(iteration)
+            return
+        shape = {'iterations': [iteration], 'url': None}
+        self.shapes[key] = shape
+        if self.filed + self.failed >= self.max_issues:
+            self.suppressed += 1
+            logger.warning(
+                'Not filing an issue for iteration %d: this run has tried '
+                'its limit of %d', iteration, self.max_issues,
+            )
+            return
+        shape['url'] = self.file_issue(self.seed, iteration, attrs, div, self.workflow_url)
+        if shape['url']:
+            self.filed += 1
+        else:
+            self.failed += 1
+
+    def finish(self):
+        """Note repeats on the issues filed, and log what was held back."""
+        for shape in self.shapes.values():
+            repeats = shape['iterations'][1:]
+            if shape['url'] and repeats:
+                shown = ', '.join(str(i) for i in repeats[:20])
+                more = ', ...' if len(repeats) > 20 else ''
+                self.comment(shape['url'], (
+                    f'{len(repeats)} more iteration(s) of this run diverged '
+                    f'the same way and were not filed separately: '
+                    f'{shown}{more}.'
+                ))
+        if self.suppressed:
+            logger.warning(
+                'Issue filing stopped at %d: %d further divergence shape(s) '
+                'were not filed. A run that reaches the limit usually has '
+                'one cause behind everything it found; see the reports in '
+                'the log directory.', self.max_issues, self.suppressed,
+            )
+        return {
+            'issues_filed': self.filed,
+            'issues_failed': self.failed,
+            'issue_shapes_suppressed': self.suppressed,
+            'divergence_shapes': len(self.shapes),
+        }
+
+
+def comment_github_issue(url, body):
+    """Add a comment to an issue this run filed. Never raises."""
+    try:
+        result = subprocess.run(
+            ['gh', 'issue', 'comment', url, '--body', body],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            logger.warning('Failed to comment on %s: %s', url, result.stderr.strip())
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        logger.warning('Could not comment on %s: %s', url, exc)
+
+
 def file_github_issue(seed, iteration, attrs, divergence, workflow_url):
     """File a GitHub issue for a divergence immediately.
 
     Requires the `gh` CLI to be installed and GH_TOKEN to be set.
-    Logs a warning and continues if issue creation fails.
+    Logs a warning and continues if issue creation fails. Returns the
+    issue's URL, or None if none was filed.
     """
     div_type = divergence.get('type', 'unknown')
     attrs_json = json.dumps(attrs, indent=2)
@@ -5155,16 +5323,17 @@ def file_github_issue(seed, iteration, attrs, divergence, workflow_url):
                 'Filed issue for iteration %d: %s',
                 iteration, issue_url,
             )
-        else:
-            logger.warning(
-                'Failed to file issue for iteration %d: %s',
-                iteration, result.stderr.strip(),
-            )
+            return issue_url or None
+        logger.warning(
+            'Failed to file issue for iteration %d: %s',
+            iteration, result.stderr.strip(),
+        )
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
         logger.warning(
             'Could not file issue for iteration %d: %s',
             iteration, exc,
         )
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -5212,6 +5381,11 @@ def main():
         '--create-issues', action='store_true',
         help='File GitHub issues immediately as divergences are found '
              '(requires gh CLI and GH_TOKEN)',
+    )
+    parser.add_argument(
+        '--max-issues', type=int, default=5,
+        help='With --create-issues, the most issues one run files; one per '
+             'divergence shape, repeats noted on it (default: 5)',
     )
     parser.add_argument(
         '--workflow-url', type=str, default=None,
@@ -5277,6 +5451,7 @@ def main():
     logger.info('  workdir:    %s', workdir)
 
     rng = random.Random(seed)
+    issues = IssueFiler(seed, args.workflow_url, args.max_issues) if args.create_issues else None
     divergences = []
     inconclusive = []
     start_time = time.time()
@@ -5335,11 +5510,8 @@ def main():
                     i, div.get('type', 'unknown'), report_path,
                 )
 
-                if args.create_issues:
-                    file_github_issue(
-                        seed, i, attrs, div,
-                        args.workflow_url,
-                    )
+                if issues is not None:
+                    issues.divergence(i, attrs, div)
 
                 if args.fail_fast:
                     logger.error(
@@ -5373,6 +5545,8 @@ def main():
             'inconclusive_count': len(inconclusive),
             'inconclusive_iterations': [d[0] for d in inconclusive],
         }
+        if issues is not None:
+            summary.update(issues.finish())
         summary_path = log_dir / f'summary-{seed}.json'
         with open(summary_path, 'w') as f:
             json.dump(summary, f, indent=2)
