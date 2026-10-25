@@ -34,6 +34,21 @@ repos:
         pass_filenames: false
         files: ^(src/\.devcontainer/.*Dockerfile|renovate\.json|tools/ci/check-(devcontainer-pins\.sh|renovate-manager\.py))$
 
+      # A line number in documentation goes stale on the next edit to the
+      # code it points into, in a change that never touches the document;
+      # name the function or class instead. The files are the ones the
+      # consistency audit's docs-line-references criterion covers. Unlike
+      # the audit, this hook cannot see fenced blocks, so quoted tool
+      # output in a fence can trip it; the audit remains the backstop.
+      - id: docs-line-references
+        name: No source line-number references in documentation
+        language: pygrep
+        entry: >-
+          \b[\w./-]+\.(py|pyi|rs|go|sh|proto|js|ts|c|h|cc|cpp|toml|ya?ml|j2|html):\d+(?:[-,]\d+)*(?![\d:])|/blob/(?![0-9a-f]{40}/)[^\s)#]+#L\d+
+        types: [markdown]
+        files: ^(docs/|README\.md$|AGENTS\.md$|ARCHITECTURE\.md$)
+        exclude: (^|/)plans/
+
   # Lints the agent context (AGENTS.md, CLAUDE.md, .claude/ and
   # anything else an agent is handed) for malformed structure,
   # smuggled instructions and the like. Renovate's pre-commit manager
