@@ -1798,17 +1798,78 @@ unsafe fn check_vhdx(
                 // longest-standing arm about what "allocated" means.
                 allocated_blocks += 1;
 
-                // Validate offset is within file bounds
-                let block_end = file_offset + block_size as u64;
-                if block_end > actual_size {
-                    result.corruptions += 1;
-                    result.total_errors += 1;
-                    (call_table.debug_print)(
-                        b"check: VHDX block offset out of bounds\n\0".as_ptr(),
-                    );
-                    payload_block_idx += 1;
-                    continue;
-                }
+                // How much of the file this block occupies: a whole
+                // block, except that the last payload block ends with
+                // the virtual disk, so when the virtual size is not a
+                // multiple of the block size it holds only the
+                // remainder. qemu allocates a fixed image's partial
+                // last block only that far, so requiring the whole
+                // block would call qemu's own fixed images truncated
+                // (#797).
+                //
+                // The length is taken from the payload index, which
+                // counts virtual-disk blocks. qemu's
+                // vhdx_check_bat_entries (block/vhdx.c:884-960 in
+                // qemu 7.0.0) means to allow the same thing ("Allow
+                // that the last block exists only partially"), but
+                // computes the length from the BAT index, which also
+                // counts the interleaved sector bitmap slots. The two
+                // agree only inside the first chunk; past it the BAT
+                // index times the block size exceeds the virtual size,
+                // the unsigned subtraction wraps, and qemu requires the
+                // whole block. It runs that check on every open, so
+                // qemu refuses a fixed `block_state_zero=off` image it
+                // has just written whenever the partial block lies past
+                // the first chunk (measured on every qemu-img build
+                // from 6.0.0 to 10.2.0 at 4608.5M with 1 MiB blocks).
+                // Every byte the virtual disk needs is in such a file,
+                // so it is not corrupt, and this check accepts it.
+                //
+                // The loop visits payload indices below
+                // ceil(virtual_disk_size / block_size) only, so the
+                // block always starts inside the virtual disk and the
+                // subtraction cannot underflow. That is a property of
+                // the loop bound rather than of the image, so an
+                // underflow is still counted as a corruption rather
+                // than assumed away.
+                let block_len = match payload_block_idx
+                    .checked_mul(block_size as u64)
+                    .and_then(|start| virtual_disk_size.checked_sub(start))
+                {
+                    Some(remaining) => remaining.min(block_size as u64),
+                    None => {
+                        result.corruptions += 1;
+                        result.total_errors += 1;
+                        (call_table.debug_print)(
+                            b"check: VHDX block past the end of the virtual disk\n\0".as_ptr(),
+                        );
+                        payload_block_idx += 1;
+                        continue;
+                    }
+                };
+
+                // Validate the block is within file bounds. It must
+                // start inside the file, and the file must hold all of
+                // its length; only the last block can be short, and
+                // only by the virtual disk's own arithmetic, so a file
+                // cut anywhere inside or before a block still fails
+                // here. The start test is implied by the end test
+                // while every length is at least one byte, which the
+                // loop bound gives, and is stated anyway so that a
+                // block at end of file is refused without relying on
+                // that.
+                let block_end = match file_offset.checked_add(block_len) {
+                    Some(end) if file_offset < actual_size && end <= actual_size => end,
+                    _ => {
+                        result.corruptions += 1;
+                        result.total_errors += 1;
+                        (call_table.debug_print)(
+                            b"check: VHDX block offset out of bounds\n\0".as_ptr(),
+                        );
+                        payload_block_idx += 1;
+                        continue;
+                    }
+                };
 
                 // A block's own bytes must not be the image's own
                 // structure. Two separate statements rather than one,
@@ -1862,12 +1923,7 @@ unsafe fn check_vhdx(
                 }
                 if declared_regions[..declared_region_count].iter().any(
                     |&(region_offset, region_length)| {
-                        vhdx::ranges_overlap(
-                            file_offset,
-                            block_size as u64,
-                            region_offset,
-                            region_length,
-                        )
+                        vhdx::ranges_overlap(file_offset, block_len, region_offset, region_length)
                     },
                 ) {
                     result.corruptions += 1;

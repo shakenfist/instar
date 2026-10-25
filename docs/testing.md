@@ -2810,9 +2810,19 @@ convert or compare would read 128 GiB; `measure` is compared on
 `fully-allocated` only, because instar and `qemu-img` count a VHDX
 source's allocation differently. The committed dynamic image at that
 geometry is also converted to qcow2, which walks its all-`ZERO` BAT
-without reading 128 GiB. Its `KNOWN_READ_FAILURES` table lists known
-failures by issue (#797); a listed entry must still fail with its
-recorded message, and one that starts passing fails the test, asking
+without reading 128 GiB. A fixed `block_state_zero=off` image of
+4608.5M with 1 MiB blocks, whose partial last block lies past the first
+chunk, gets the same four operations; `qemu-img` cannot open it (see
+"VHDX partial last block past the first chunk" in
+[quirks.md](quirks.md)), so its oracle is the size it was created with,
+and a separate test requires the host `qemu-img check` to keep exiting
+2 on it. The 17M fixture's partial last block is also checked cut short
+in the file and cut off at its start, both of which `check` must report
+as corrupt, and whole, where `check` must report the image as ending at
+the end of the file. Its `KNOWN_READ_FAILURES` table is empty, because
+instar reads every image there as `qemu-img` does; it is kept for the
+next regression, whose entry must still fail with its recorded message
+until the fix lands, and one that starts passing fails the test, asking
 for the entry to be removed.
 
 Most adversarial and CVE-reproducer image generation scripts live in

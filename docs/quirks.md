@@ -841,6 +841,62 @@ Users comparing instar output against `qemu-img check` may notice these
 discrepancies, particularly for images with refcount issues or extensive
 L2 table corruption beyond the first sector.
 
+## VHDX partial last block past the first chunk
+
+**Classification: qemu defect, not mimicked.** It changes which images
+`check` reports as corrupt, not how output is formatted, so no flag
+restores qemu's behaviour.
+
+### Observed Behavior
+
+When a VHDX's virtual size is not a whole number of blocks, its last
+payload block is partial, and `qemu-img` allocates a present one only as
+far as the end of the virtual disk. qemu's `vhdx_check_bat_entries()` in
+`block/vhdx.c` (qemu 7.0.0), which runs on every open, means to allow
+that ("Allow that the last block exists only partially"), but
+computes the block's length as `MIN(block_size, virtual_size - i *
+block_size)` where `i` is the **BAT** index. The BAT interleaves one
+sector bitmap entry after every chunk of payload entries, so past the
+first chunk `i` is larger than the payload index, `i * block_size`
+exceeds the virtual size, the unsigned subtraction wraps, and qemu
+demands the whole block.
+
+The result is that `qemu-img` writes fixed images it then refuses to
+open. Measured on all 80 static `qemu-img` builds from 6.0.0 to 10.2.0:
+
+```bash
+$ qemu-img create -f vhdx \
+    -o subformat=fixed,block_size=1M,block_state_zero=off f.vhdx 4608.5M
+$ qemu-img info f.vhdx      # exits 1
+$ qemu-img check f.vhdx     # exits 2
+VHDX BAT entry 4609 end offset 4841275391 points after end of file (4840751104)
+```
+
+Payload block 4608 is BAT entry 4609 because one sector bitmap entry
+follows the first 4096 payload entries (a chunk, at 1 MiB blocks and
+512-byte sectors). At 2048.5M the partial block is inside the first
+chunk and both commands are clean; at 4097M and 4609M there is no
+partial block and both are clean. With `block_state_zero` on (the
+default) every entry is `ZERO`, the test never applies, and qemu opens
+the image.
+
+### instar Behavior
+
+`instar check` measures the partial block from its payload index, which
+is what qemu's comment describes, and passes these images: every byte
+the virtual disk needs is in the file. A present block must still start
+inside the file, and the file must still hold all of the block the
+virtual disk uses, so a truncated image is still reported as corrupt.
+instar's other readers already read these images. A `qemu-img check`
+failure of the form above, on a fixed VHDX whose virtual size is not a
+whole number of blocks and that is larger than one chunk, is this
+defect rather than damage to the image.
+
+`tests/test_vhdx_fixed_fixtures.py` builds the 4608.5M image with the
+host `qemu-img`, requires `instar info`, `check`, `map` and `measure` to
+pass on it, and requires the host `qemu-img check` to exit 2 on it, so
+a qemu that fixes the defect shows up there.
+
 ## measure subcommand quirks
 
 ### `--image-opts` is rejected
