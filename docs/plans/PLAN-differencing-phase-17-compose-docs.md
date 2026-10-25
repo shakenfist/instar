@@ -108,7 +108,7 @@ So, checked against the tree today:
 > from `create -b`, but refuses to compose one on read rather than
 > merging the parent's sectors into the result, a composition
 > deferred and tracked in
-> [docs/plans/PLAN-differencing.md](docs/plans/PLAN-differencing.md).
+> [docs/plans/PLAN-differencing.md](PLAN-differencing.md).
 
 Both halves are wrong. Five operations compose, and the composition is
 not deferred -- it is built, tested and fuzzed. It is also a landed
@@ -193,7 +193,7 @@ confirms it is the only part of that file still owed.
 recorded in Windows convention is reported with an "actual path" that
 cannot exist, affecting both formats -- and then says fixing it
 "belongs with the composition work in
-[PLAN-differencing.md](plans/PLAN-differencing.md)". The composition
+[PLAN-differencing.md](PLAN-differencing.md)". The composition
 work is finished and this was not fixed, so the deferral now points at
 nothing. No open issue tracks it: `gh issue list --search 'info actual
 path parent locator'` returns none.
