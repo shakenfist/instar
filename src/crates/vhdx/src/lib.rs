@@ -1895,18 +1895,73 @@ pub fn sb_bat_index(block_index: u64, chunk_ratio: u32) -> Option<u64> {
         .checked_add(chunk_ratio)
 }
 
+/// Number of BAT entries a VHDX with `total_payload_blocks` payload
+/// blocks has, for either kind of image.
+///
+/// This is the one place the count is written down. Every reader that
+/// bounds a BAT walk and every writer that sizes a BAT region calls
+/// it, so the two cannot disagree about where the table ends.
+///
+/// With `has_parent` set this is [`differencing_bat_entry_count`],
+/// which pads to whole chunk groups. With no parent it is the count
+/// SPEC(VHDX) 2.5 gives:
+///
+/// > Total BAT Entries = Payload Blocks Count +
+/// > Fl((Payload Blocks Count - 1) / Chunk Ratio)
+///
+/// which is also what qemu computes in `vhdx_calc_bat_entries`
+/// (`block/vhdx.c:868-882`, qemu 7.0.0): `data_blocks_cnt +
+/// ((data_blocks_cnt - 1) >> chunk_ratio_bits)`. Each whole group of
+/// `chunk_ratio` payload blocks that has another payload block after
+/// it contributes the sector bitmap entry between them; the group the
+/// last payload block falls in contributes none, because nothing
+/// follows its bitmap entry and an image with no parent never reads it.
+///
+/// The rule this replaced was `n + ceil(n / chunk_ratio)`. Since
+/// `ceil(n / c) == floor((n - 1) / c) + 1` for every `n >= 1`, that
+/// rule was one entry over at **every** geometry, not only at some.
+/// The excess only showed when it pushed the BAT across a 1 MiB region
+/// boundary, as 131041 payload blocks at a chunk ratio of 4096 do:
+/// 131072 entries fill exactly 1 MiB, and the 131073rd needed a second
+/// MiB that qemu's images do not have (issue #626).
+///
+/// Zero payload blocks have zero entries. A zero `chunk_ratio` with no
+/// parent counts the payload blocks alone: every reader refuses that
+/// geometry before it counts, so the arm only keeps the function
+/// total. A zero `chunk_ratio` with a parent is `None`, as
+/// [`differencing_bat_entry_count`] says. Returns `None` on overflow.
+pub fn bat_entry_count(
+    total_payload_blocks: u64,
+    chunk_ratio: u32,
+    has_parent: bool,
+) -> Option<u64> {
+    if has_parent {
+        return differencing_bat_entry_count(total_payload_blocks, chunk_ratio);
+    }
+    if total_payload_blocks == 0 {
+        return Some(0);
+    }
+    if chunk_ratio == 0 {
+        return Some(total_payload_blocks);
+    }
+    let sb_entries = total_payload_blocks
+        .checked_sub(1)?
+        .checked_div(u64::from(chunk_ratio))?;
+    total_payload_blocks.checked_add(sb_entries)
+}
+
 /// BAT entry count a differencing VHDX's BAT is padded out to.
 ///
 /// A differencing image reserves whole groups of `chunk_ratio + 1`
 /// entries, because a group's sector bitmap entry sits at the end of
 /// the group whether or not every payload entry ahead of it is backed
 /// by virtual disk. An image with no parent stops at the last entry it
-/// actually needs, which is the shorter count
-/// `calculate_bat_layout(.., false)` returns.
+/// actually needs, which is the shorter count [`bat_entry_count`]
+/// returns with `has_parent` clear.
 ///
-/// This is the rule `calculate_bat_layout` applies when its
-/// `has_parent` argument is set, and the only place it is written
-/// down; a reader resolving a sector bitmap bounds itself by it.
+/// This is the rule [`bat_entry_count`] applies when its `has_parent`
+/// argument is set, and the only place it is written down; a reader
+/// resolving a sector bitmap bounds itself by it.
 ///
 /// Returns `None` for a degenerate chunk ratio and on overflow.
 pub fn differencing_bat_entry_count(total_payload_blocks: u64, chunk_ratio: u32) -> Option<u64> {
@@ -2066,11 +2121,12 @@ pub struct VhdxState {
     /// A differencing VHDX pads its BAT out to whole groups of
     /// `chunk_ratio + 1` entries, so the bitmap entry of a group that
     /// the virtual disk only partly fills still sits at the end of
-    /// that group. `total_bat_entries` counts one entry per payload
-    /// block plus one per group, which is how an image with no parent
-    /// is sized and is shorter: bounding the lookup by it puts the
-    /// last group's bitmap entry out of reach, and puts every bitmap
-    /// entry out of reach in a disk smaller than one group.
+    /// that group. `total_bat_entries` is [`bat_entry_count`]'s
+    /// no-parent count, one entry per payload block plus the bitmap
+    /// entry of every group but the last, which is how an image with no
+    /// parent is sized and is shorter: bounding the lookup by it puts
+    /// the last group's bitmap entry out of reach, and puts every
+    /// bitmap entry out of reach in a disk of one group or less.
     ///
     /// Capped by what the declared BAT region can hold, so a lookup
     /// still cannot read past the region. `total_bat_entries` keeps
@@ -2322,26 +2378,23 @@ impl VhdxState {
             return None;
         }
 
-        // Calculate total BAT entries (payload blocks + SB blocks)
+        // Total BAT entries: payload blocks plus the sector bitmap
+        // entries interleaved between them. This is the no-parent count
+        // even for a differencing image; see `sb_bat_entry_bound` below
+        // for why the padded count is only a bound.
         let total_blocks = metadata
             .virtual_disk_size
             .div_ceil(metadata.block_size as u64);
-        // SB entries: one per chunk_ratio payload blocks
-        let sb_entries = if chunk_ratio > 0 {
-            total_blocks.div_ceil(chunk_ratio)
-        } else {
-            0
-        };
-        let total_bat_entries = total_blocks + sb_entries;
+        let chunk_ratio_u32 = u32::try_from(chunk_ratio).ok()?;
+        let total_bat_entries = bat_entry_count(total_blocks, chunk_ratio_u32, false)?;
 
         // Validate BAT counts fit in u32 (a malicious image
         // could claim extreme virtual_disk_size that would
         // overflow u32 on truncation).
         let total_bat_entries_u32 = u32::try_from(total_bat_entries).ok()?;
-        let chunk_ratio_u32 = u32::try_from(chunk_ratio).ok()?;
 
         // Validate BAT region can hold all entries
-        let needed_bat_bytes = total_bat_entries * 8;
+        let needed_bat_bytes = total_bat_entries.checked_mul(8)?;
         if needed_bat_bytes > bat_length as u64 {
             return None;
         }
@@ -3738,17 +3791,21 @@ pub fn build_bat_entry(state: u64, file_offset: u64) -> u64 {
 ///
 /// `has_parent` selects between the format's two BAT sizing rules, and
 /// is required rather than defaulted because the two differ by up to
-/// `chunk_ratio - 1` entries and a caller that guessed would emit a
+/// `chunk_ratio` entries and a caller that guessed would emit a
 /// region a conforming reader refuses:
 ///
-/// * An image with no parent stops at the last entry it needs, which
-///   is one entry per payload block plus the sector bitmap entry that
-///   ends each group those blocks reach into.
+/// * An image with no parent stops at the last entry it needs: one
+///   entry per payload block, plus the sector bitmap entry between
+///   each whole group of `chunk_ratio` payload blocks and the next
+///   payload block. The group the last payload block is in has no
+///   bitmap entry in the count, because no payload entry follows it.
 /// * A differencing image reserves whole groups of `chunk_ratio + 1`
 ///   entries, because a group's bitmap entry sits at the end of the
 ///   group whether or not every payload entry ahead of it is backed by
-///   virtual disk. [`differencing_bat_entry_count`] is that rule, and
-///   the one place it is written down.
+///   virtual disk.
+///
+/// [`bat_entry_count`] is both rules, and the one place they are
+/// written down.
 ///
 /// A degenerate `chunk_ratio` of zero yields `None` for a differencing
 /// image: with no group size there is no group to pad out to, and
@@ -3765,17 +3822,8 @@ pub fn calculate_bat_layout(
     let chunk_ratio_u64 = (1u64 << 23) * logical_sector_size as u64 / block_size as u64;
     let total_blocks = u32::try_from(total_blocks_u64).ok()?;
     let chunk_ratio = u32::try_from(chunk_ratio_u64).ok()?;
-    let total_bat_entries = if has_parent {
-        let padded = differencing_bat_entry_count(total_blocks_u64, chunk_ratio)?;
-        u32::try_from(padded).ok()?
-    } else {
-        let sb_entries = if chunk_ratio > 0 {
-            total_blocks.div_ceil(chunk_ratio)
-        } else {
-            0
-        };
-        total_blocks.checked_add(sb_entries)?
-    };
+    let total_bat_entries =
+        u32::try_from(bat_entry_count(total_blocks_u64, chunk_ratio, has_parent)?).ok()?;
     Some((total_bat_entries, chunk_ratio, total_blocks))
 }
 
@@ -3931,8 +3979,10 @@ mod tests {
             calculate_bat_layout(1024 * 1024 * 1024, DEFAULT_BLOCK_SIZE, 512, false).unwrap();
         assert_eq!(payload_blocks, 32); // 1GB / 32MB
         assert_eq!(chunk_ratio, 128); // (2^23 * 512) / 32MB
-                                      // SB entries = ceil(32/128) = 1
-        assert_eq!(total, 33);
+                                      // 32 + (32 - 1) / 128 = 32 + 0: the
+                                      // one group has no payload block
+                                      // after it, so no bitmap entry.
+        assert_eq!(total, 32);
 
         // The same disk as a differencing child: one whole group of
         // 128 payload entries plus its bitmap entry, 96 of whose
@@ -3951,14 +4001,16 @@ mod tests {
                 .unwrap();
         assert_eq!(payload_blocks, 128);
         assert_eq!(chunk_ratio, 128);
-        // 128 payload + ceil(128/128)=1 SB
-        assert_eq!(total, 129);
+        // 128 + (128 - 1) / 128 = 128 + 0. The virtual disk is exactly
+        // one chunk group, and still the group's bitmap entry is not
+        // counted, because no payload entry follows it.
+        assert_eq!(total, 128);
 
-        // The one geometry where the two rules agree: the virtual disk
-        // is an exact whole number of chunk groups, so the no-parent
-        // count has nothing left to pad. A test that only used a
-        // geometry like this could not tell the rules apart, which is
-        // why the cases above and below do not.
+        // The geometry where the two rules come closest: the virtual
+        // disk is an exact whole number of chunk groups, so the padded
+        // count adds only the last group's bitmap entry. They still
+        // differ by that one entry, which the old no-parent rule of
+        // `n + ceil(n / c)` used to count as well.
         let (total, _chunk_ratio, _payload_blocks) =
             calculate_bat_layout(4u64 * 1024 * 1024 * 1024, DEFAULT_BLOCK_SIZE, 512, true).unwrap();
         assert_eq!(total, 129);
@@ -3970,13 +4022,13 @@ mod tests {
             calculate_bat_layout(256 * 1024 * 1024, 1024 * 1024, 512, false).unwrap();
         assert_eq!(payload_blocks, 256);
         assert_eq!(chunk_ratio, 4096); // (2^23 * 512) / 1MB
-                                       // SB entries = ceil(256/4096) = 1
-        assert_eq!(total, 257);
+                                       // 256 + (256 - 1) / 4096 = 256 + 0
+        assert_eq!(total, 256);
 
         // A disk smaller than one group still reserves the whole
         // group: 4096 payload entries and the bitmap entry at their
         // end, which is BAT index 4096 and so out of reach of the
-        // 257-entry no-parent count.
+        // 256-entry no-parent count.
         let (total, _chunk_ratio, _payload_blocks) =
             calculate_bat_layout(256 * 1024 * 1024, 1024 * 1024, 512, true).unwrap();
         assert_eq!(total, 4097);
@@ -3988,7 +4040,7 @@ mod tests {
     ///
     /// Swept across both logical sector sizes and the whole block-size
     /// range, because `chunk_ratio` is a function of both and the two
-    /// rules diverge by up to `chunk_ratio - 1` entries.
+    /// rules diverge by up to `chunk_ratio` entries.
     #[test]
     fn bat_layout_differencing_count_matches_the_padded_rule() {
         // Not a whole number of chunk groups at every block size, which
@@ -4036,13 +4088,123 @@ mod tests {
         // 1 PiB (1 << 50) with 1MB blocks = 1 << 30 blocks,
         // fits in u32 — should succeed
         assert!(calculate_bat_layout(1u64 << 50, 1024 * 1024, 512, false).is_some());
-        // And so does the padded count at that size: 1 << 18 groups of
-        // 4097 entries is 1_074_003_968, the same number the no-parent
-        // rule reaches because 1 << 30 blocks is a whole number of
-        // groups.
+        // 1 << 30 blocks at a chunk ratio of 4096 is exactly 1 << 18
+        // groups: (1 << 30) + ((1 << 30) - 1) / 4096 = 1_073_741_824 +
+        // 262_143 = 1_074_003_967 entries with no parent.
+        let (total, _chunk_ratio, _payload_blocks) =
+            calculate_bat_layout(1u64 << 50, 1024 * 1024, 512, false).unwrap();
+        assert_eq!(total, 1_074_003_967);
+        // The padded count fits at that size too: 1 << 18 groups of
+        // 4097 entries is 1_074_003_968, one more than the no-parent
+        // count because the last group's bitmap entry is reserved.
         let (total, _chunk_ratio, _payload_blocks) =
             calculate_bat_layout(1u64 << 50, 1024 * 1024, 512, true).unwrap();
         assert_eq!(total, 1_074_003_968);
+    }
+
+    /// The boundary geometry of issue #626: 131041 MiB at 1 MiB blocks.
+    ///
+    /// 131041 payload blocks at a chunk ratio of 4096 need 131041 +
+    /// (131041 - 1) / 4096 = 131041 + 31 = 131072 entries, which is
+    /// 1048576 bytes: exactly one 1 MiB region, as qemu lays it out.
+    /// The old rule's 131041 + ceil(131041 / 4096) = 131073 entries
+    /// needed a second MiB, so instar's writers put the metadata region
+    /// 1 MiB later than qemu's and its readers refused qemu's image.
+    #[test]
+    fn bat_layout_131041_mib_fits_one_mib_region() {
+        let (total, chunk_ratio, payload_blocks) =
+            calculate_bat_layout(131_041 * 1024 * 1024, 1024 * 1024, 512, false).unwrap();
+        assert_eq!(payload_blocks, 131_041);
+        assert_eq!(chunk_ratio, 4096);
+        assert_eq!(total, 131_072);
+        assert_eq!(u64::from(total) * 8, 1024 * 1024);
+    }
+
+    /// `bat_entry_count` at the edges of a chunk group, with and
+    /// without a parent.
+    ///
+    /// For each payload count the three columns are the no-parent
+    /// count `n + (n - 1) / c`, the padded count `ceil(n / c) * (c +
+    /// 1)`, and, for the record, what the old no-parent rule `n +
+    /// ceil(n / c)` gave: one more than the first column at every
+    /// non-zero `n`.
+    #[test]
+    fn bat_entry_count_at_group_edges() {
+        const C: u32 = 4096;
+        const C64: u64 = C as u64;
+        let cases: [(u64, u64, u64, u64); 7] = [
+            // (n, no parent, with parent, old no-parent rule)
+            (0, 0, 0, 0),
+            // 1 + 0 / 4096; one group of 4097.
+            (1, 1, 4097, 2),
+            // 4096 + 4095 / 4096 = 4096 + 0; one group.
+            (C64, C64, C64 + 1, C64 + 1),
+            // 4097 + 4096 / 4096 = 4097 + 1; two groups.
+            (C64 + 1, C64 + 2, 2 * (C64 + 1), C64 + 3),
+            // 8192 + 8191 / 4096 = 8192 + 1; two groups.
+            (2 * C64, 2 * C64 + 1, 2 * (C64 + 1), 2 * C64 + 2),
+            // 8193 + 8192 / 4096 = 8193 + 2; three groups.
+            (2 * C64 + 1, 2 * C64 + 3, 3 * (C64 + 1), 2 * C64 + 4),
+            // 131041 + 131040 / 4096 = 131041 + 31; 32 groups.
+            (131_041, 131_072, 32 * (C64 + 1), 131_073),
+        ];
+        for (n, no_parent, with_parent, old_rule) in cases {
+            assert_eq!(
+                bat_entry_count(n, C, false),
+                Some(no_parent),
+                "n={n} no parent"
+            );
+            assert_eq!(
+                bat_entry_count(n, C, true),
+                Some(with_parent),
+                "n={n} with parent"
+            );
+            assert_eq!(
+                bat_entry_count(n, C, true),
+                differencing_bat_entry_count(n, C),
+                "n={n}: the parent arm is the padded rule"
+            );
+            assert_eq!(n + n.div_ceil(C64), old_rule, "n={n}: old rule column");
+            if n > 0 {
+                assert_eq!(old_rule, no_parent + 1, "n={n}: the old rule was one over");
+            }
+        }
+    }
+
+    /// With no parent the count ends exactly at the last payload
+    /// entry: the entry after the last payload block's BAT index is
+    /// the end of the table, whatever the geometry.
+    #[test]
+    fn bat_entry_count_ends_at_the_last_payload_entry() {
+        for &c in &[1u32, 2, 16, 128, 4096, 32_768] {
+            let c64 = u64::from(c);
+            for n in 1..=(3 * c64 + 2).min(20_000) {
+                let last = n - 1;
+                let last_bat_index = last + last / c64;
+                assert_eq!(
+                    bat_entry_count(n, c, false),
+                    Some(last_bat_index + 1),
+                    "n={n} c={c}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bat_entry_count_degenerate_and_overflow() {
+        // A zero chunk ratio with no parent counts payload blocks
+        // alone; with a parent there is no group to pad to.
+        assert_eq!(bat_entry_count(17, 0, false), Some(17));
+        assert_eq!(bat_entry_count(0, 0, false), Some(0));
+        assert_eq!(bat_entry_count(17, 0, true), None);
+        // n + (n - 1) / 1 overflows for n = u64::MAX.
+        assert_eq!(bat_entry_count(u64::MAX, 1, false), None);
+        // And does not for a chunk ratio that keeps it in range.
+        assert_eq!(
+            bat_entry_count(u64::MAX / 2, 1, false),
+            Some(u64::MAX / 2 + (u64::MAX / 2 - 1))
+        );
+        assert_eq!(bat_entry_count(u64::MAX, 4096, true), None);
     }
 
     // ====================================================================
@@ -6766,19 +6928,21 @@ mod tests {
         // At the common geometry -- 1 MiB blocks and 512-byte logical
         // sectors -- a chunk group is 4096 payload blocks, so 4 GiB of
         // virtual disk. `dynamic` is the entry count an image with no
-        // parent needs: one per payload block plus one per group. A
+        // parent needs: one per payload block plus the bitmap entry
+        // between each whole group and the payload block after it. A
         // differencing image pads to whole groups instead, because the
         // group's bitmap entry sits at the end of the group however
         // little of the group the disk fills.
         for (blocks, dynamic, last_sb) in [
             // A 16 MiB disk: a fraction of one group, and the shape of
             // the project's own differencing fixture.
-            (16u64, 17u64, 4096u64),
+            (16u64, 16u64, 4096u64),
             // 4 GiB: exactly one group.
-            (4096, 4097, 4096),
+            (4096, 4096, 4096),
             // 8 GiB: exactly two.
-            (8192, 8194, 8193),
+            (8192, 8193, 8193),
         ] {
+            assert_eq!(bat_entry_count(blocks, 4096, false), Some(dynamic));
             let padded = differencing_bat_entry_count(blocks, 4096).unwrap();
             let sb = sb_bat_index(blocks - 1, 4096).unwrap();
             assert_eq!(sb, last_sb, "last bitmap entry of a {blocks}-block disk");
@@ -6787,14 +6951,14 @@ mod tests {
                 "a {blocks}-block differencing BAT of {padded} entries must \
                  reach its last bitmap entry at {sb}"
             );
-            // And the point of the padding: under the shorter rule the
-            // entry is only reachable when the disk happens to end on a
-            // group boundary.
-            assert_eq!(
-                sb < dynamic,
-                blocks % 4096 == 0,
-                "the dynamic count of {dynamic} entries reaches entry {sb} \
-                 only for a whole number of groups"
+            // And the point of the padding: the shorter rule never
+            // reaches the last group's bitmap entry, not even when the
+            // disk ends on a group boundary, because nothing follows
+            // that entry in an image with no parent.
+            assert!(
+                sb >= dynamic,
+                "the dynamic count of {dynamic} entries must stop short \
+                 of the last bitmap entry at {sb}"
             );
         }
     }

@@ -1821,17 +1821,19 @@ fn chunk_ratio_of(block_size: u32, logical_sector_size: u32) -> u64 {
 /// the virtual disk defines whenever the disk stops part way through a
 /// group — which is every geometry whose block count is not an exact
 /// multiple of `chunk_ratio`. An emitter that sized the region by the
-/// no-parent rule (one entry per payload block, plus one per group)
-/// leaves those bitmap entries outside the region the region table
-/// declares, and a reader that honours the declaration cannot reach
-/// them: the child's own sectors become unresolvable.
+/// no-parent rule (one entry per payload block, plus the bitmap entry
+/// of every group but the last) leaves those bitmap entries outside
+/// the region the region table declares, and a reader that honours the
+/// declaration cannot reach them: the child's own sectors become
+/// unresolvable.
 ///
 /// Swept across both the block-size range and both logical sector
 /// sizes `init` accepts, because `chunk_ratio` is a function of both
 /// and it is `chunk_ratio` that decides how far the two rules diverge.
 /// The virtual sizes deliberately include ones that are *not* a whole
-/// number of groups: at an exact multiple the two rules agree and the
-/// test would pass either way.
+/// number of groups: at an exact multiple the two rules differ only by
+/// the last group's bitmap entry, which the 1 MiB region rounding
+/// usually absorbs.
 #[test]
 fn vhdx_differencing_bat_region_holds_every_padded_entry() {
     const LOGICAL_SECTOR_SIZE: u32 = 512;
@@ -1874,13 +1876,14 @@ fn vhdx_differencing_bat_region_holds_every_padded_entry() {
 /// The geometry at which the no-parent rule's shortfall is not absorbed
 /// by the 1 MiB region rounding, with the numbers written out.
 ///
-/// Everywhere else the shortfall — at most `chunk_ratio - 1` entries —
+/// Everywhere else the shortfall — at most `chunk_ratio` entries —
 /// disappears into the padding `round_up(entries * 8, 1 MiB)` adds, so a
 /// sweep of convenient sizes cannot tell a correctly sized region from a
-/// short one. Here it can: 126 977 blocks of 1 MiB need 127 009 entries
-/// by the no-parent rule, which is 1 016 072 bytes and rounds to exactly
-/// one 1 MiB region holding 131 072 entries, while the differencing rule
-/// needs 131 104 — 32 entries more than that region can hold. The last
+/// short one. Here it can: 126 977 blocks of 1 MiB need 127 008 entries
+/// by the no-parent rule (126 977 + 126 976 / 4096), which is 1 016 064
+/// bytes and rounds to exactly one 1 MiB region holding 131 072 entries,
+/// while the differencing rule needs 131 104 — 32 entries more than that
+/// region can hold. The last
 /// group's bitmap entry is at BAT index 131 103, inside the padded count
 /// and outside the rounded no-parent one.
 ///

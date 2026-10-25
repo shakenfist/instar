@@ -1002,10 +1002,12 @@ impl Default for VhdxOpts {
 /// `total_payload_blocks` and `total_bat_entries` come from
 /// `vhdx::calculate_bat_layout(virtual_size, block_size, 512, false)`.
 /// `total_bat_entries` already accounts for the chunk-ratio interleaving
-/// (one sector-bitmap BAT entry every `chunk_ratio` payload entries) so
-/// no manual interleaving is needed here. The `false` is "no parent":
-/// see the call site for why a differencing target is not a shape
-/// `measure` can be asked for.
+/// (a sector-bitmap BAT entry after each whole group of `chunk_ratio`
+/// payload entries that another payload entry follows, which is
+/// `n + (n - 1) / chunk_ratio` entries, as `vhdx::bat_entry_count`
+/// says) so no manual interleaving is needed here. The `false` is "no
+/// parent": see the call site for why a differencing target is not a
+/// shape `measure` can be asked for.
 pub fn measure_vhdx(s: &AllocationSummary, opts: &VhdxOpts) -> MeasureResult {
     // ---- Validate options. -------------------------------------------------
     // block_size: power of two in [1 MiB, 256 MiB].
@@ -2850,10 +2852,10 @@ mod tests {
         // total_blocks = ceil(1 GiB / 32 MiB) = 32
         // chunk_ratio  = (1<<23) * 512 / (32 MiB)
         //              = 4 294 967 296 / 33 554 432 = 128
-        // sb_entries   = ceil(32 / 128) = 1
-        // total_bat_entries = 32 + 1 = 33
-        // bat_size_bytes    = 33 * 8 = 264
-        // bat_region        = round_up(264, 1 MiB) = 1 MiB
+        // sb_entries   = (32 - 1) / 128 = 0
+        // total_bat_entries = 32 + 0 = 32
+        // bat_size_bytes    = 32 * 8 = 256
+        // bat_region        = round_up(256, 1 MiB) = 1 MiB
         // payload_start     = 2 MiB + 1 MiB + 1 MiB = 4 MiB
         // required          = 4 MiB + 0 = 4 194 304
         // fully_allocated   = 4 MiB + 32 * 32 MiB
@@ -2907,10 +2909,10 @@ mod tests {
         // total_blocks = ceil(1 GiB / 1 MiB) = 1024
         // chunk_ratio  = (1<<23) * 512 / (1 MiB) = 4 294 967 296 / 1 048 576
         //              = 4096
-        // sb_entries   = ceil(1024 / 4096) = 1
-        // total_bat_entries = 1024 + 1 = 1025
-        // bat_size_bytes    = 1025 * 8 = 8200
-        // bat_region        = round_up(8200, 1 MiB) = 1 MiB
+        // sb_entries   = (1024 - 1) / 4096 = 0
+        // total_bat_entries = 1024 + 0 = 1024
+        // bat_size_bytes    = 1024 * 8 = 8192
+        // bat_region        = round_up(8192, 1 MiB) = 1 MiB
         // payload_start     = 2 + 1 + 1 = 4 MiB
         // required          = 4 MiB
         // fully_allocated   = 4 MiB + 1024 * 1 MiB = 1028 MiB
@@ -2938,10 +2940,10 @@ mod tests {
         // total_blocks = ceil(64 GiB / 256 MiB) = 256
         // chunk_ratio  = (1<<23) * 512 / (256 MiB)
         //              = 4 294 967 296 / 268 435 456 = 16
-        // sb_entries   = ceil(256 / 16) = 16
-        // total_bat_entries = 256 + 16 = 272
-        // bat_size_bytes    = 272 * 8 = 2176
-        // bat_region        = round_up(2176, 1 MiB) = 1 MiB
+        // sb_entries   = (256 - 1) / 16 = 15
+        // total_bat_entries = 256 + 15 = 271
+        // bat_size_bytes    = 271 * 8 = 2168
+        // bat_region        = round_up(2168, 1 MiB) = 1 MiB
         // payload_start     = 4 MiB
         // required          = 4 MiB
         // fully_allocated   = 4 MiB + 256 * 256 MiB = 65540 MiB
@@ -2958,6 +2960,40 @@ mod tests {
             Ok(MeasureOutput {
                 required: 4 * MIB,
                 fully_allocated: 4 * MIB + 256 * 256 * MIB,
+            })
+        );
+    }
+
+    #[test]
+    fn vhdx_131041mib_1mib_block_bat_fills_one_mib() {
+        // virtual_size = 131041 MiB, block_size = 1 MiB, allocated = 0
+        //
+        // total_blocks = 131041
+        // chunk_ratio  = 4096
+        // sb_entries   = (131041 - 1) / 4096 = 31
+        // total_bat_entries = 131041 + 31 = 131072
+        // bat_size_bytes    = 131072 * 8 = 1 MiB exactly
+        // bat_region        = 1 MiB
+        // payload_start     = 2 + 1 + 1 = 4 MiB
+        // required          = 4 MiB
+        // fully_allocated   = 4 MiB + 131041 * 1 MiB
+        //
+        // This is the geometry issue #626 is about: counting a trailing
+        // bitmap entry as well gives 131073 entries, a 2 MiB BAT region
+        // and a prediction 1 MiB larger than the image qemu writes.
+        let s = AllocationSummary {
+            virtual_size: 131_041 * MIB,
+            allocated_bytes: 0,
+            target_units_with_data: 0,
+        };
+        let opts = VhdxOpts {
+            block_size: MIB as u32,
+        };
+        assert_eq!(
+            measure_vhdx(&s, &opts),
+            Ok(MeasureOutput {
+                required: 4 * MIB,
+                fully_allocated: 4 * MIB + 131_041 * MIB,
             })
         );
     }

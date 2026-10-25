@@ -1673,13 +1673,29 @@ unsafe fn check_vhdx(
         return bytes_read;
     }
 
-    // Calculate total BAT entries (payload + interleaved SB entries)
+    // Total BAT entries: the payload entries and the sector bitmap
+    // entries interleaved between them, counted by the one rule the
+    // readers and writers share. The image has no parent here: a
+    // differencing image was refused above.
     let total_payload_blocks = virtual_disk_size.div_ceil(block_size as u64);
-    let sb_entries = total_payload_blocks.div_ceil(chunk_ratio);
-    let total_bat_entries = total_payload_blocks + sb_entries;
+    let bat_entries_and_bytes = u32::try_from(chunk_ratio)
+        .ok()
+        .and_then(|cr| vhdx::bat_entry_count(total_payload_blocks, cr, false))
+        .and_then(|entries| entries.checked_mul(8).map(|bytes| (entries, bytes)));
+    let (total_bat_entries, needed_bat_bytes) = match bat_entries_and_bytes {
+        Some(v) => v,
+        None => {
+            // A geometry whose count does not fit the arithmetic
+            // cannot be backed by any BAT region.
+            result.corruptions += 1;
+            result.total_errors += 1;
+            result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
+            (call_table.debug_print)(b"check: VHDX BAT region too small\n\0".as_ptr());
+            return bytes_read;
+        }
+    };
 
     // Validate BAT region can hold all entries
-    let needed_bat_bytes = total_bat_entries * 8;
     if needed_bat_bytes > bat_length as u64 {
         result.corruptions += 1;
         result.total_errors += 1;

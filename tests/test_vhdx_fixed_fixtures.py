@@ -3,8 +3,9 @@
 instar-testdata holds four small fixed VHDX images written by `qemu-img`
 (two whole 8 MiB blocks, and two blocks plus a 1 MiB partial one, each in
 both `block_state_zero` modes, the `off` pair carrying data) and a dynamic
-image at the geometry where the BAT exactly fills its 1 MiB region, which
-reproduces #626 in 8 MiB. `scripts/create-vhd-testdata.sh` writes them.
+image at the geometry where the BAT exactly fills its 1 MiB region, the
+geometry #626 was about, in 8 MiB. `scripts/create-vhd-testdata.sh` writes
+them.
 
 `TestVhdxFixedFixturePins` checks that each committed file has the
 structure every pinned `qemu-img` build writes for its command
@@ -20,13 +21,16 @@ images, whose data blocks qemu appends past the preallocated area (a layout
 no committed fixture has), and fixed images at the #626 geometry, which as
 128 GiB files are too large to commit. Every image at the #626 geometry,
 committed or built here, gets only the operations that do not read the data
-region (`info`, `check`, `map`); the BAT walk #626 breaks is in those, and
-a convert or compare of a 128 GiB virtual disk would read all of it.
+region (`info`, `check`, `map`, `measure`); the BAT walk #626 broke is in
+those, and a convert or compare of a 128 GiB virtual disk would read all of
+it. The committed dynamic image is the exception: every one of its BAT
+entries is ZERO, so a convert of it to qcow2 walks the BAT without reading
+any data, and `TestVhdxFixedReads` runs one.
 
 What instar gets wrong today is listed in `KNOWN_READ_FAILURES`. A listed
 pair must still fail, with the message recorded there; once instar reads
 it correctly the test fails and asks for the entry to be removed, so a fix
-for #626 or #797 shows up here rather than going unnoticed.
+shows up here rather than going unnoticed.
 """
 
 import json
@@ -77,7 +81,7 @@ RUNTIME_CONVERT_IMAGES = ('vhdx-convert-fixed', 'vhdx-convert-fixed-bsz-off')
 # Images built at test time by `qemu-img create -f vhdx`: name to `-o`
 # options and size. 131041 one-MiB payload blocks and their 31 sector
 # bitmap slots fill a 1 MiB BAT region exactly (SPEC(VHDX) 2.5), the
-# geometry #626 miscounts. The files are sparse.
+# geometry #626 miscounted. The files are sparse.
 RUNTIME_CREATE_IMAGES = {
     'vhdx-fixed-131041M-block-1M': ('subformat=fixed,block_size=1M', '131041M'),
     'vhdx-fixed-131041M-block-1M-bsz-off': ('subformat=fixed,block_size=1M,block_state_zero=off', '131041M'),
@@ -86,16 +90,23 @@ RUNTIME_CREATE_IMAGES = {
 OP_INFO = 'info'
 OP_CHECK = 'check'
 OP_MAP = 'map'
+OP_MEASURE = 'measure'
 OP_CONVERT = 'convert'
 OP_COMPARE = 'compare'
-ALL_OPS = (OP_INFO, OP_CHECK, OP_MAP, OP_CONVERT, OP_COMPARE)
 # The operations that read only the headers, metadata and BAT.
-METADATA_OPS = (OP_INFO, OP_CHECK, OP_MAP)
+METADATA_OPS = (OP_INFO, OP_CHECK, OP_MAP, OP_MEASURE)
+ALL_OPS = METADATA_OPS + (OP_CONVERT, OP_COMPARE)
+
+# The committed image at the #626 geometry whose BAT is all ZERO entries,
+# so that converting it walks the whole BAT and reads no data.
+DYNAMIC_131041M = 'vhdx-dynamic-131041M-block-1M'
 
 # Which operations run on which image. The 131041 MiB images get only the
-# metadata operations, since a convert or compare would read 128 GiB.
+# metadata operations, since a convert or compare would read 128 GiB;
+# `test_dynamic_131041m_converts_to_qcow2` converts the one that holds no
+# data.
 READ_MATRIX = {name: ALL_OPS for name in list(FIXTURE_PIN_CASES) + list(RUNTIME_CONVERT_IMAGES)}
-READ_MATRIX.update({name: METADATA_OPS for name in ['vhdx-dynamic-131041M-block-1M', *RUNTIME_CREATE_IMAGES]})
+READ_MATRIX.update({name: METADATA_OPS for name in [DYNAMIC_131041M, *RUNTIME_CREATE_IMAGES]})
 
 # What instar cannot read today: (image, operation) to (issue, message).
 # Each listed pair must still fail, and its output must contain the
@@ -103,30 +114,16 @@ READ_MATRIX.update({name: METADATA_OPS for name in ['vhdx-dynamic-131041M-block-
 # with `-v` here; `map` refuses a VHDX whose BAT it cannot lay out as an
 # unrecognised format.
 #
-# The map entries match loosely: the map guest reports no reason, even
+# A map failure would match loosely: the map guest reports no reason, even
 # with -v, so any failure to lay out the BAT reads as an unrecognised
-# format. The check entries carry the precise #626 message for the same
-# images.
-#
-# #626: instar counts one sector bitmap slot more than the BAT holds, a
-# trailing one after the last payload entry. That only matters when the
-# BAT exactly fills its region, which is then judged too small for it.
-# `info` does not walk the BAT and passes.
+# format.
 #
 # #797: `check` requires the whole of every FULLY_PRESENT block to lie
 # inside the file, but qemu allocates the partial final block of a fixed
 # image only as far as the end of the virtual disk, so `check` fails on any
 # image whose last block is partial and present.
-BAT_REGION_TOO_SMALL = 'VHDX BAT region too small'
-MAP_UNRECOGNISED = 'source format unrecognised'
 KNOWN_READ_FAILURES = {
     ('vhdx-fixed-17M-bsz-off-data', OP_CHECK): (797, 'VHDX block offset out of bounds'),
-    ('vhdx-dynamic-131041M-block-1M', OP_CHECK): (626, BAT_REGION_TOO_SMALL),
-    ('vhdx-dynamic-131041M-block-1M', OP_MAP): (626, MAP_UNRECOGNISED),
-    ('vhdx-fixed-131041M-block-1M', OP_CHECK): (626, BAT_REGION_TOO_SMALL),
-    ('vhdx-fixed-131041M-block-1M', OP_MAP): (626, MAP_UNRECOGNISED),
-    ('vhdx-fixed-131041M-block-1M-bsz-off', OP_CHECK): (626, BAT_REGION_TOO_SMALL),
-    ('vhdx-fixed-131041M-block-1M-bsz-off', OP_MAP): (626, MAP_UNRECOGNISED),
 }
 
 COMPARE_CHUNK = 1024 * 1024
@@ -325,6 +322,31 @@ class TestVhdxFixedReads(InstarTestBase):
             return [f'instar map --output json is not JSON: {e}'], stdout + stderr
         return _map_coverage_problems(extents, parse_vhdx(image).virtual_disk_size), stdout + stderr
 
+    def _op_measure(self, image: Path, workdir: Path):
+        """instar measure -O qcow2 must succeed and agree with qemu-img on `fully-allocated`.
+
+        `required` is not compared. For a VHDX source the two tools count
+        allocation differently: qemu's vhdx driver reports no block status,
+        so `qemu-img measure` counts every block as data, while instar walks
+        the BAT and counts no ZERO block. On an all-ZERO fixed image qemu's
+        `required` is the whole disk and instar's is metadata only, and
+        neither is a misread of the image. `fully-allocated` depends only on
+        the virtual size, which both must read the same.
+        """
+        self._require_qemu_vhdx()
+        stdout, stderr, rc = self._instar('measure', '-O', 'qcow2', '--output', 'json', image)
+        if rc != 0:
+            return [f'instar measure exited {rc}: {_failure_line(OP_MEASURE, stdout, stderr)}'], stdout + stderr
+        qemu = self._run_tool(['qemu-img', 'measure', '-f', 'vhdx', '-O', 'qcow2', '--output=json', str(image)],
+                              workdir)
+        want = json.loads(qemu.stdout)['fully-allocated']
+        try:
+            got = json.loads(stdout)['fully-allocated']
+        except (json.JSONDecodeError, KeyError) as e:
+            return [f'instar measure --output json has no fully-allocated: {e!r}'], stdout + stderr
+        problems = [] if got == want else [f'instar measure fully-allocated {got} != qemu-img {want}']
+        return problems, stdout + stderr
+
     def _op_convert(self, image: Path, workdir: Path):
         self._require_qemu_vhdx()
         output = workdir / 'instar.raw'
@@ -378,6 +400,24 @@ class TestVhdxFixedReads(InstarTestBase):
         self.assertEqual(['map extents end at 8, not at the virtual size 10'],
                          _map_coverage_problems(extents((0, 4), (4, 4)), 10))
         self.assertEqual(['map extents end at 0, not at the virtual size 10'], _map_coverage_problems([], 10))
+
+    def test_dynamic_131041m_converts_to_qcow2(self):
+        """instar converts the dynamic image at the #626 geometry to qcow2, keeping its virtual size.
+
+        Every BAT entry of the fixture is ZERO, so the convert walks the
+        whole 131072-entry BAT, which #626 miscounted, and reads no data.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            image = self._image(DYNAMIC_131041M, workdir)
+            self._require_qemu_vhdx()
+            output = workdir / 'out.qcow2'
+            stdout, stderr, rc = self._instar('convert', '-O', 'qcow2', image, output)
+            self.assertEqual(0, rc, f'instar convert -O qcow2 exited {rc}: '
+                                    f'{_failure_line(OP_CONVERT, stdout, stderr)}')
+            converted = self._run_tool(['qemu-img', 'info', '-f', 'qcow2', '--output=json', str(output)], workdir)
+            source = self._run_tool(['qemu-img', 'info', '-f', 'vhdx', '--output=json', str(image)], workdir)
+            self.assertEqual(json.loads(source.stdout)['virtual-size'], json.loads(converted.stdout)['virtual-size'])
 
     def test_known_failures_are_in_the_matrix(self):
         """Every KNOWN_READ_FAILURES entry names a pair the matrix runs, so none is silently unchecked."""

@@ -175,6 +175,31 @@ fn metadata_only_grow_when_bat_fits() {
     assert_eq!(post.virtual_disk_size, 2u64 << 30);
 }
 
+/// 131040 MiB to 131041 MiB at 1 MiB blocks grows in place.
+///
+/// The starting image's BAT region is 1 MiB, 131072 entries, and the
+/// grown disk needs 131041 payload entries plus 31 sector bitmap
+/// entries: exactly 131072. Counting a trailing bitmap entry as well
+/// (issue #626) needed 131073 and appended a relocated 2 MiB BAT.
+#[test]
+fn grow_to_131041_mib_keeps_a_1_mib_bat_in_place() {
+    const MIB: u64 = 1 << 20;
+    let bytes = build_starting_vhdx(131_040 * MIB, MIB as u32);
+    let opts = opts_from_image(&bytes, 131_041 * MIB, false);
+    assert_eq!(opts.current_bat_length as u64, MIB);
+    let mut scratch = vec![0u8; VHDX_SCRATCH];
+    let plan = plan_resize_vhdx(&opts, &mut scratch).expect("plan");
+    assert_eq!(plan.action, ResizeAction::Grow);
+    // MetadataAndHeaders: VDS + inactive header + active header, and
+    // no appended BAT.
+    assert_eq!(plan.patches().len(), 3);
+    assert_eq!(plan.total_file_size, bytes.len() as u64);
+    assert!(plan
+        .patches()
+        .iter()
+        .all(|p| !matches!(p, ResizePatch::Append { .. })));
+}
+
 /// The metadata region of an image, as a mutable slice.
 fn metadata_region_mut(bytes: &mut [u8]) -> &mut [u8] {
     let (entries, _count) =

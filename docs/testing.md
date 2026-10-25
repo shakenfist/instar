@@ -2770,8 +2770,8 @@ structure or contents the tests need to be exactly known:
   `block_state_zero=off`, where the `off` ones carry known data
   written with `qemu-io` (0x11 at 0 and 0x22 at 12M; 0x33 at 0 and
   0x44 in the last 64 KiB), and a dynamic VHDX of 131041M with 1 MiB
-  blocks, whose BAT exactly fills its region and which reproduces #626
-  in 8 MiB on disk. Each of the five must keep the structure of its
+  blocks, whose BAT exactly fills its region, the geometry #626 was
+  about, in 8 MiB on disk. Each of the five must keep the structure of its
   case in `tests/helpers/qemu_pins.py`, which
   `tests/test_vhdx_fixed_fixtures.py` checks. It takes two output
   directories, `create-vhd-testdata.sh [output-dir] [audit-dir]`,
@@ -2805,9 +2805,13 @@ generator wrote (needing neither qemu nor instar, since both would
 agree on an image whose writes never landed), then runs instar's
 read operations on them (and on some fixed and convert-built images
 made at test time) against `qemu-img`'s answers. Images at the 131041M
-geometry get only `info`, `check` and `map`, since a convert or compare
-would read 128 GiB. Its `KNOWN_READ_FAILURES` table lists the known
-failures by issue (#626, #797); a listed entry must still fail with its
+geometry get only `info`, `check`, `map` and `measure`, since a full
+convert or compare would read 128 GiB; `measure` is compared on
+`fully-allocated` only, because instar and `qemu-img` count a VHDX
+source's allocation differently. The committed dynamic image at that
+geometry is also converted to qcow2, which walks its all-`ZERO` BAT
+without reading 128 GiB. Its `KNOWN_READ_FAILURES` table lists known
+failures by issue (#797); a listed entry must still fail with its
 recorded message, and one that starts passing fails the test, asking
 for the entry to be removed.
 

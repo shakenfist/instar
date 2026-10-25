@@ -380,6 +380,32 @@ mod tests {
         assert_eq!(decide_action(64, 128), VhdxGrowAction::BatGrowRelocate);
     }
 
+    /// 131040 MiB to 131041 MiB at 1 MiB blocks fits the existing 1 MiB
+    /// BAT region, which holds 131072 entries: the target is 131041
+    /// payload entries and (131041 - 1) / 4096 = 31 sector bitmap
+    /// entries, 131072 in all. Counting a trailing bitmap entry as well
+    /// (issue #626) made it 131073 and relocated the BAT for nothing.
+    #[test]
+    fn decide_action_131041_mib_fits_a_1_mib_bat() {
+        const MIB: u64 = 1 << 20;
+        let current_entries = (MIB / 8) as u32;
+        let (target, _chunk_ratio, _payload_blocks) =
+            calculate_bat_layout(131_041 * MIB, MIB as u32, 512, false).unwrap();
+        assert_eq!(target, 131_072);
+        assert_eq!(
+            decide_action(current_entries, target),
+            VhdxGrowAction::MetadataAndHeaders
+        );
+        // One block more needs one entry more, and that does relocate.
+        let (target, _chunk_ratio, _payload_blocks) =
+            calculate_bat_layout(131_042 * MIB, MIB as u32, 512, false).unwrap();
+        assert_eq!(target, 131_073);
+        assert_eq!(
+            decide_action(current_entries, target),
+            VhdxGrowAction::BatGrowRelocate
+        );
+    }
+
     #[test]
     fn is_clean_log_zero_guid_is_clean() {
         let mut hdr = [0u8; 64];
