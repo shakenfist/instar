@@ -256,6 +256,9 @@ surfaces totalling 114 tests:
   --shrink, invalid size strings, --preallocation=metadata on
   raw, --preallocation=falloc + --shrink, --object,
   --image-opts.
+- The differencing and fixed VHDX refusals, each on a scratch copy of
+  a qemu-written fixture that must come back byte-identical, and a
+  qemu-written dynamic VHDX that must still grow.
 
 Wall clock: ~32 s serial / ~10 s with `make test-container`'s
 `--concurrency 4`.

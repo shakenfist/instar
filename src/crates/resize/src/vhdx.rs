@@ -52,6 +52,15 @@ pub(crate) fn plan_grow<'a>(
     if opts.has_parent {
         return Err(ResizeError::UnsupportedSubformat);
     }
+    // A fixed image is refused before the size comparison, so a no-op
+    // and a shrink get this refusal too rather than a size-specific
+    // one. Growing it would append `PAYLOAD_BLOCK_NOT_PRESENT` entries
+    // to an image whose `LeaveBlocksAllocated` flag promises every
+    // block is allocated (SPEC(VHDX) 2.6.2.1), leaving a hybrid that
+    // claims to be fixed and is not.
+    if opts.leave_blocks_allocated {
+        return Err(ResizeError::FixedVhdx);
+    }
     if !is_clean_log(opts.existing_active_header) {
         return Err(ResizeError::RequiresCheckFirst);
     }

@@ -40,7 +40,7 @@ pub enum ResizeError {
     /// `instar resize` (QED, LUKS, encrypted qcow2, ...).
     UnsupportedFormat,
     /// The format is supported but the subformat isn't (multi-
-    /// file VMDK, fixed VHDX, ...).
+    /// file VMDK, differencing VHD / VHDX, ...).
     UnsupportedSubformat,
     /// The format is supported but shrinking it isn't (vmdk /
     /// vhd / vhdx in v1). qemu-img-compatible: the corresponding
@@ -89,6 +89,15 @@ pub enum ResizeError {
     /// on-disk bitmap clusters. Rather than silently destroy the
     /// bitmaps, resize refuses — matching `snapshot`'s posture.
     BitmapsPresent,
+    /// The image is a fixed VHDX: its File Parameters
+    /// `LeaveBlocksAllocated` flag is set. SPEC(VHDX) 2.6.2.1 says
+    /// a writer "SHOULD NOT change the state of any blocks to a
+    /// BLOCK_NOT_PRESENT state" on such an image, and the VHDX
+    /// planner's grow adds exactly such blocks: the image would
+    /// come out still flagged fixed but no longer fully allocated.
+    /// Refused for every request, grow, no-op and shrink alike, as
+    /// `qemu-img resize` refuses every VHDX.
+    FixedVhdx,
 }
 
 /// What the resize will do to the file. Carried in [`ResizePlan`]
@@ -562,6 +571,10 @@ pub struct VhdxResizeOpts<'a> {
     /// disk).  Resize rejects differencing with
     /// [`ResizeError::UnsupportedSubformat`].
     pub has_parent: bool,
+    /// The File Parameters `LeaveBlocksAllocated` flag, which
+    /// marks a fixed image.  Resize rejects a fixed image with
+    /// [`ResizeError::FixedVhdx`].
+    pub leave_blocks_allocated: bool,
     /// Current file size in bytes (pre-resize EOF).  The
     /// relocate path appends a new BAT region here.
     pub current_file_size: u64,
@@ -665,7 +678,9 @@ pub fn plan_resize_vhd<'a>(
 /// Plan a resize of a vhdx image.
 ///
 /// Supports dynamic grow; shrink is not supported by qemu
-/// upstream and the planner rejects it.
+/// upstream and the planner rejects it. A differencing image is
+/// rejected with `UnsupportedSubformat` and a fixed one with
+/// `FixedVhdx`.
 pub fn plan_resize_vhdx<'a>(
     opts: &VhdxResizeOpts<'_>,
     scratch: &'a mut [u8],

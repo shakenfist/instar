@@ -814,6 +814,53 @@ class TestResizeErrorPaths(TestResizeSmoke):
             _, stderr, rc = self.run_instar_resize(str(parent), '100M')
             self.assertEqual(rc, 0, f'stderr: {stderr!r}')
 
+    # ----------- Fixed VHDX refusal (issue #798) -----------
+    #
+    # qemu marks every fixed VHDX with the File Parameters
+    # LeaveBlocksAllocated flag. Growing one would add BAT entries that
+    # are not present, leaving an image flagged fixed that is not, so
+    # resize refuses by name. qemu-img refuses to resize any VHDX.
+
+    FIXED_VHDX_REFUSAL = 'refusing to resize a fixed VHDX'
+
+    def _assert_fixed_vhdx_refused(self, image_id, size, *flags):
+        """Resize a copy of `image_id` to `size` and assert the refusal left it untouched."""
+        with tempfile.TemporaryDirectory() as td:
+            path = self._copy_fixture(image_id, td, '.vhdx')
+            before = self.sha256(path)
+            _, stderr, rc = self.run_instar_resize(*flags, str(path), size)
+            self.assertNotEqual(rc, 0, f'stderr: {stderr!r}')
+            self.assertIn(self.FIXED_VHDX_REFUSAL, stderr)
+            self.assertIn('convert it to a dynamic VHDX', stderr)
+            self.assertEqual(
+                self.sha256(path), before,
+                'a refused resize must not touch the fixed VHDX',
+            )
+
+    def test_fixed_vhdx_grow_refused(self):
+        """resize refuses to grow a qemu-written fixed VHDX with ZERO blocks."""
+        self._assert_fixed_vhdx_refused('vhdx-fixed-16M', '80M')
+
+    def test_fixed_vhdx_with_data_grow_refused(self):
+        """resize refuses to grow a qemu-written fixed VHDX with FULLY_PRESENT blocks."""
+        self._assert_fixed_vhdx_refused('vhdx-fixed-16M-bsz-off-data', '80M')
+
+    def test_fixed_vhdx_shrink_refused(self):
+        """`--shrink` gets the fixed-image refusal, not a shrink-specific one."""
+        self._assert_fixed_vhdx_refused('vhdx-fixed-16M', '8M', '--shrink')
+
+    def test_fixed_vhdx_with_data_shrink_refused(self):
+        """`--shrink` on the FULLY_PRESENT fixture gets the same refusal."""
+        self._assert_fixed_vhdx_refused('vhdx-fixed-16M-bsz-off-data', '8M', '--shrink')
+
+    def test_qemu_dynamic_vhdx_still_grows(self):
+        """A qemu-written dynamic VHDX still grows, so the refusal is not over-broad."""
+        with tempfile.TemporaryDirectory() as td:
+            path = self._copy_fixture('qemu-vhdx', td, '.vhdx')
+            _, stderr, rc = self.run_instar_resize(str(path), '2G')
+            self.assertEqual(rc, 0, f'stderr: {stderr!r}')
+            self.assertNotIn(self.FIXED_VHDX_REFUSAL, stderr)
+
     # ----------- Refusals of bochs, cloop, parallels, QED; DMG as raw -----------
     #
     # `probe_resize_target` (main.rs) header-probes the target with

@@ -317,6 +317,11 @@ fuzz_target!(|data: &[u8]| {
                     logical_sector_size: 512,
                     physical_sector_size: 4096,
                     has_parent: flags & 0b1000_0000 != 0,
+                    // Bit 6 feeds `current_autoclear_features` in the
+                    // qcow2 arm and nothing else; here it drives the
+                    // fixed-image refusal so that it is fuzzed rather
+                    // than always off.
+                    leave_blocks_allocated: flags & 0b0100_0000 != 0,
                     current_file_size,
                 };
                 if let Ok(plan) = plan_resize_vhdx(&opts, &mut scratch) {

@@ -1284,7 +1284,8 @@ Same shortcut and rationale as `create`.
 `qemu-img resize -f vpc|vmdk|vhdx ...` rejects with
 `qemu-img: Image format driver does not support resize` on
 every qemu-img version from 6.0.0 through 10.2.0 (which the
-matrix exercises). instar resizes all three. The baselines record qemu's rejection verbatim, both as
+matrix exercises). instar resizes all three, except a fixed or a
+differencing VHDX, which it refuses too (see [resize.md](resize.md)). The baselines record qemu's rejection verbatim, both as
 documentation of the cross-tool gap and as a tripwire for the
 day qemu adds support. The `TestResizeConsistency`
 covers vmdk/vhd/vhdx via an `instar create → resize → info →

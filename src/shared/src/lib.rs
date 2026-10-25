@@ -3935,6 +3935,11 @@ impl ResizeResult {
     /// autoclear bit set). resize refuses rather than silently
     /// discarding them (build_header would drop the extension).
     pub const ERROR_BITMAPS_UNSUPPORTED: u32 = 14;
+    /// The image is a fixed VHDX (File Parameters
+    /// `LeaveBlocksAllocated` set). resize refuses rather than
+    /// grow it into an image that is flagged fixed but has
+    /// unallocated blocks.
+    pub const ERROR_FIXED_VHDX: u32 = 15;
 
     /// True if magic matches.
     pub fn is_valid(&self) -> bool {
@@ -5637,6 +5642,7 @@ mod tests {
         assert_eq!(ResizeResult::ERROR_PARSE_FAILED, 12);
         assert_eq!(ResizeResult::ERROR_HEADER_MISMATCH, 13);
         assert_eq!(ResizeResult::ERROR_BITMAPS_UNSUPPORTED, 14);
+        assert_eq!(ResizeResult::ERROR_FIXED_VHDX, 15);
     }
 
     #[test]

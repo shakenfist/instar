@@ -1122,6 +1122,11 @@ pub struct VhdxMetadata {
     pub logical_sector_size: u32,
     pub physical_sector_size: u32,
     pub has_parent: bool,
+    /// The File Parameters `LeaveBlocksAllocated` flag: set on a fixed
+    /// image, whose blocks a writer must not return to
+    /// `PAYLOAD_BLOCK_NOT_PRESENT`. See
+    /// [`FILE_PARAMETERS_LEAVE_BLOCKS_ALLOCATED`].
+    pub leave_blocks_allocated: bool,
     /// What was found where a parent locator item would be.
     ///
     /// `Absent` means the metadata table listed no parent locator item
@@ -1139,6 +1144,17 @@ pub struct VhdxMetadata {
     /// unaffected by anything here.
     pub parent_locator: VhdxParentLocatorState,
 }
+
+/// File Parameters flags bit 0, `LeaveBlocksAllocated` (SPEC(VHDX)
+/// 2.6.2.1; qemu's `VHDX_PARAMS_LEAVE_BLOCKS_ALLOCED`,
+/// `block/vhdx.h:275` in qemu 7.0.0).
+///
+/// It marks a fixed VHDX. The spec says that with it set "the
+/// implementation SHOULD NOT change the state of any blocks to a
+/// BLOCK_NOT_PRESENT state", so a writer that would add or free blocks
+/// must refuse the image rather than turn it into a part-fixed,
+/// part-dynamic hybrid. It does not change how an image is read.
+pub const FILE_PARAMETERS_LEAVE_BLOCKS_ALLOCATED: u32 = 1 << 0;
 
 /// File Parameters flags bit 1: the image is a differencing image
 /// (SPEC(VHDX) 2.6.2.1).
@@ -1228,6 +1244,9 @@ fn locate_metadata_items(table: &[u8]) -> Option<MetadataItemLocations> {
 pub struct VhdxMetadataItems {
     pub block_size: u32,
     pub has_parent: bool,
+    /// The File Parameters `LeaveBlocksAllocated` flag, as
+    /// [`VhdxMetadata::leave_blocks_allocated`] reports it.
+    pub leave_blocks_allocated: bool,
     pub virtual_disk_size: u64,
     pub virtual_disk_size_offset: u32,
     pub logical_sector_size: u32,
@@ -1261,7 +1280,9 @@ pub fn parse_metadata_region(region: &[u8]) -> Option<VhdxMetadataItems> {
 
     let fp = item(items.file_parameters, 8)?;
     let block_size = le_u32(region, fp);
-    let has_parent = le_u32(region, fp + 4) & FILE_PARAMETERS_HAS_PARENT != 0;
+    let fp_flags = le_u32(region, fp + 4);
+    let has_parent = fp_flags & FILE_PARAMETERS_HAS_PARENT != 0;
+    let leave_blocks_allocated = fp_flags & FILE_PARAMETERS_LEAVE_BLOCKS_ALLOCATED != 0;
     if !is_valid_metadata_block_size(block_size) {
         return None;
     }
@@ -1276,6 +1297,7 @@ pub fn parse_metadata_region(region: &[u8]) -> Option<VhdxMetadataItems> {
     Some(VhdxMetadataItems {
         block_size,
         has_parent,
+        leave_blocks_allocated,
         virtual_disk_size,
         virtual_disk_size_offset: items.virtual_disk_size,
         logical_sector_size,
@@ -1350,7 +1372,9 @@ pub unsafe fn parse_metadata(
     *bytes_read += sector_size as u64;
 
     let block_size = le_u32(&buffer, fp_off_in_sector);
-    let has_parent = le_u32(&buffer, fp_off_in_sector + 4) & FILE_PARAMETERS_HAS_PARENT != 0;
+    let fp_flags = le_u32(&buffer, fp_off_in_sector + 4);
+    let has_parent = fp_flags & FILE_PARAMETERS_HAS_PARENT != 0;
+    let leave_blocks_allocated = fp_flags & FILE_PARAMETERS_LEAVE_BLOCKS_ALLOCATED != 0;
     if !is_valid_metadata_block_size(block_size) {
         return None;
     }
@@ -1446,6 +1470,7 @@ pub unsafe fn parse_metadata(
         logical_sector_size,
         physical_sector_size,
         has_parent,
+        leave_blocks_allocated,
         parent_locator,
     })
 }
@@ -5808,6 +5833,68 @@ mod tests {
         assert!(items.has_parent);
     }
 
+    /// A fixture region with the File Parameters flags word replaced.
+    /// `build_metadata` puts File Parameters at 0x10000, its flags
+    /// after the block size.
+    fn metadata_region_with_flags(flags: u32) -> std::vec::Vec<u8> {
+        let mut region = metadata_region(false, false);
+        write_le_u32(&mut region, 0x10004, flags);
+        region
+    }
+
+    /// Both metadata parsers' reading of `LeaveBlocksAllocated` and
+    /// `HasParent` for one flags word, `parse_metadata_region`'s first.
+    fn parsed_flags(flags: u32) -> ((bool, bool), (bool, bool)) {
+        let region = metadata_region_with_flags(flags);
+        let items = parse_metadata_region(&region).unwrap();
+        let _guard = stage_lock();
+        let (metadata, _) = unsafe {
+            install_staged_region(&region);
+            parse_fixture_metadata()
+        };
+        let metadata = metadata.expect("metadata should parse");
+        (
+            (items.leave_blocks_allocated, items.has_parent),
+            (metadata.leave_blocks_allocated, metadata.has_parent),
+        )
+    }
+
+    #[test]
+    fn both_parsers_report_leave_blocks_allocated_set() {
+        // qemu writes exactly this flags word for every fixed image.
+        let (region, sectors) = parsed_flags(FILE_PARAMETERS_LEAVE_BLOCKS_ALLOCATED);
+        assert_eq!(region, (true, false));
+        assert_eq!(sectors, (true, false));
+    }
+
+    #[test]
+    fn both_parsers_report_leave_blocks_allocated_clear() {
+        let (region, sectors) = parsed_flags(0);
+        assert_eq!(region, (false, false));
+        assert_eq!(sectors, (false, false));
+    }
+
+    #[test]
+    fn both_parsers_read_the_two_flags_independently() {
+        // Each flag is its own bit: setting one reports nothing about
+        // the other, and the reserved bits above them are ignored.
+        for flags in [
+            0u32,
+            1,
+            2,
+            3,
+            0xffff_fffc,
+            0xffff_fffd,
+            0xffff_fffe,
+            u32::MAX,
+        ] {
+            let expected = (flags & 1 != 0, flags & 2 != 0);
+            let (region, sectors) = parsed_flags(flags);
+            assert_eq!(region, expected, "parse_metadata_region, flags {flags:#x}");
+            assert_eq!(sectors, expected, "parse_metadata, flags {flags:#x}");
+        }
+    }
+
     /// SPEC(VHDX) 2.6.1.2 fixes no order for items, so the parser must
     /// follow the table rather than assume `build_metadata`'s layout.
     #[test]
@@ -5890,6 +5977,7 @@ mod tests {
 
         let metadata = metadata.expect("ordinary metadata should parse");
         assert!(!metadata.has_parent);
+        assert!(!metadata.leave_blocks_allocated);
         // Absent, not a stale or garbage locator: the table listed no
         // item, which is the only thing `Absent` is allowed to mean.
         assert!(metadata.parent_locator.is_absent());
