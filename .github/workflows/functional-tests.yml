@@ -94,8 +94,10 @@ jobs:
   # docs-only group now skips them, and can_merge -- which lists this
   # job in its needs, so a failed filter cannot pass as "nothing to
   # test" -- reports success on the skips. Such a group's code is
-  # byte-identical to a develop commit that has already been through
-  # the full queue, which is also why the release gate may count it.
+  # byte-identical to the most recent develop commit that changed code,
+  # and that commit ran the full queue, which is also why the release
+  # gate may count it. That holds only while develop advances through
+  # the merge queue alone: a direct push to develop breaks it.
   check_paths:
     name: "Check paths"
     runs-on: [self-hosted, static]

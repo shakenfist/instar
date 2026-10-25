@@ -179,9 +179,10 @@ jobs:
           NIGHTLY_BUDGET_SECONDS: '27000'
           FAST_TIER_SECONDS: '300'
           # What the steps after this one need: the corpus push's own
-          # 20-minute timeout, plus ten minutes for crash minimisation and
-          # reporting, a container start per target, libFuzzer finishing
-          # its last input, and the log upload.
+          # 20-minute timeout, plus ten minutes for crash reporting, a
+          # container start per target, libFuzzer finishing its last
+          # input, and the log upload. Crash minimisation is bounded on
+          # its own, against FUZZ_DEADLINE, below.
           FUZZ_RESERVE_SECONDS: '1800'
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -325,11 +326,24 @@ jobs:
               CRASH_FILE=$(tools/ci/pick-fuzz-artifact.sh crash \
                 "src/fuzz/artifacts/$TARGET/")
               if [ -n "$CRASH_FILE" ]; then
-                echo "Minimizing crash: $CRASH_FILE"
+                # Minimisation is the one thing after the fuzzing whose
+                # length is set by the input rather than by us, once per
+                # crashing target. Each gets at most two minutes, and no
+                # more than leaves the corpus push its 20 (plus five for
+                # the rest) before FUZZ_DEADLINE, so a night with several
+                # crashes reports some unminimised rather than losing the
+                # push. The timeout is on the docker client, with --init
+                # so the signal it forwards ends the whole container; one
+                # inside would kill cargo and leave libFuzzer holding the
+                # tee open. A partly minimised input is still used below.
+                TMIN_SECONDS=$(tools/ci/fuzz-tier.sh budget "$FUZZ_DEADLINE" 1500 120)
+              fi
+              if [ -n "$CRASH_FILE" ] && [ "$TMIN_SECONDS" -gt 0 ]; then
+                echo "Minimizing crash: $CRASH_FILE (at most ${TMIN_SECONDS}s)"
                 # No -max_len here: cargo fuzz tmin passes its own, and
                 # a second one trips libFuzzer's
                 # `assert(MaxInputLen == 0)` so minimization always fails.
-                docker run --rm \
+                timeout -k 30 "$TMIN_SECONDS" docker run --rm --init \
                   -u "$(id -u):$(id -g)" \
                   -e HOME=/build \
                   -e CARGO_HOME=/build/.cargo \
@@ -354,7 +368,9 @@ jobs:
                   echo "Minimized to: $MIN_FILE"
                   CRASH_FILE=$MIN_FILE
                 fi
+              fi
 
+              if [ -n "$CRASH_FILE" ]; then
                 # Reporting must never end the run: the remaining targets
                 # still have to be fuzzed. Failures are counted and turned
                 # into a failure in the final step, so a fuzz run that

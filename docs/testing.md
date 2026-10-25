@@ -642,8 +642,10 @@ This used to run everything in the queue, so a docs-only pull request
 such as #659 spent seven `xl` legs and part of the 360-minute deadline
 on code it did not touch. The release gate (`require-ci-success`)
 counts the run, as it counts a docs-only pull request's: the code in
-such a commit is identical to a `develop` commit that went through the
-full queue.
+such a commit is identical to the most recent `develop` commit that
+changed code, and that commit ran the full queue. This relies on
+`develop` advancing only through the merge queue; a direct push to
+`develop` would break it.
 
 **Superseded merge groups are cancelled.** `build-and-test`,
 `package-build` and `package-matrix` each carry a `concurrency:` block,
@@ -1612,8 +1614,11 @@ one issue per divergence *shape* -- the divergence type, the operation,
 and the first line of instar's stderr with paths and numbers of three
 or more digits taken out -- when it first sees that shape, and at the
 end of the run comments on it with how many more iterations diverged
-the same way. Once a run has filed its limit, further shapes are only
-logged and counted in `summary-<seed>.json`. Both rules exist because
+the same way. Once a run has tried its limit, further shapes are only
+logged and counted in `summary-<seed>.json`. The limit counts attempts,
+since a failed filing is nearly always `gh` itself failing, but the
+summary reports `issues_filed` and `issues_failed` apart, so a run
+whose filings failed does not claim them. Both rules exist because
 one 100-iteration pull-request run on 2026-10-17 filed 98 issues for a
 single kernel fault (#787); under these rules it would have filed five,
 and its log would have said why it stopped.
@@ -1953,7 +1958,12 @@ it still fails when one list loses an entry.
 
 Crashes are minimized with `cargo fuzz tmin` and filed as GitHub
 Issues with the `security-audit` label immediately when found, by
-`tools/ci/report-fuzz-crash.sh`. New corpus entries are pushed to
+`tools/ci/report-fuzz-crash.sh`. Minimization gets at most two minutes
+a crash, and never time the corpus push needs before the job's
+deadline; the limit is a `timeout` on the `docker run` client, with
+`--init` so the signal it forwards ends the container, since a timeout
+inside it would kill `cargo` and leave libFuzzer holding the log pipe
+open. A crash out of time is reported as found. New corpus entries are pushed to
 `instar-testdata/custom/fuzz-corpus/` after nightly runs, and restored
 by target name on the next run so coverage compounds.
 

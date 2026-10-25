@@ -5129,10 +5129,16 @@ class IssueFiler:
     The first divergence of each shape is filed when it is found, as
     before, so a run killed part way still leaves its findings filed.
     Repeats of a shape are counted and noted on that issue at the end of
-    the run. Once max_issues have been filed, new shapes are counted and
-    reported in the run's log and summary instead: a run that reaches the
-    cap is itself the finding, and its JSON reports are in the uploaded
-    logs either way.
+    the run. Once max_issues have been attempted, new shapes are counted
+    and reported in the run's log and summary instead: a run that reaches
+    the cap is itself the finding, and its JSON reports are in the
+    uploaded logs either way.
+
+    The cap is on attempts, not successes. A filing that fails is nearly
+    always gh failing (a missing token, rate limiting), so trying every
+    further shape against it would only add a 30-second timeout each.
+    The summary counts the two apart, so a run whose filings failed does
+    not report them as filed.
     """
 
     def __init__(self, seed, workflow_url, max_issues, file_issue=None, comment=None):
@@ -5143,6 +5149,7 @@ class IssueFiler:
         self.comment = comment or comment_github_issue
         self.shapes = {}
         self.filed = 0
+        self.failed = 0
         self.suppressed = 0
 
     def divergence(self, iteration, attrs, div):
@@ -5153,15 +5160,18 @@ class IssueFiler:
             return
         shape = {'iterations': [iteration], 'url': None}
         self.shapes[key] = shape
-        if self.filed >= self.max_issues:
+        if self.filed + self.failed >= self.max_issues:
             self.suppressed += 1
             logger.warning(
-                'Not filing an issue for iteration %d: this run has filed '
+                'Not filing an issue for iteration %d: this run has tried '
                 'its limit of %d', iteration, self.max_issues,
             )
             return
-        self.filed += 1
         shape['url'] = self.file_issue(self.seed, iteration, attrs, div, self.workflow_url)
+        if shape['url']:
+            self.filed += 1
+        else:
+            self.failed += 1
 
     def finish(self):
         """Note repeats on the issues filed, and log what was held back."""
@@ -5184,6 +5194,7 @@ class IssueFiler:
             )
         return {
             'issues_filed': self.filed,
+            'issues_failed': self.failed,
             'issue_shapes_suppressed': self.suppressed,
             'divergence_shapes': len(self.shapes),
         }

@@ -119,7 +119,7 @@ class IssueFilerTestCase(unittest.TestCase):
         self.assertEqual(1, len(rec.comments))
         self.assertEqual('https://example.invalid/issues/1', rec.comments[0][0])
         self.assertIn('97 more iteration(s)', rec.comments[0][1])
-        self.assertEqual({'issues_filed': 1, 'issue_shapes_suppressed': 0,
+        self.assertEqual({'issues_filed': 1, 'issues_failed': 0, 'issue_shapes_suppressed': 0,
                           'divergence_shapes': 1}, summary)
 
     def test_filing_stops_at_the_limit(self):
@@ -161,6 +161,26 @@ class IssueFilerTestCase(unittest.TestCase):
         issues.finish()
 
         self.assertEqual([], rec.comments)
+
+    def test_a_filing_that_failed_is_not_reported_as_filed(self):
+        rec = Recorder(fail=True)
+        attempts = []
+        original = rec.file_issue
+
+        def counting(*args):
+            attempts.append(args[1])
+            return original(*args)
+
+        issues = df.IssueFiler(1234, None, 3, file_issue=counting, comment=rec.comment)
+        for i, op in enumerate(['info', 'map', 'measure', 'resize', 'commit']):
+            issues.divergence(i, {}, exit_code(op, 'Error: Error(22)\n'))
+        summary = issues.finish()
+
+        self.assertEqual(0, summary['issues_filed'])
+        self.assertEqual(3, summary['issues_failed'])
+        # A broken gh is tried no more often than a working one would be.
+        self.assertEqual([0, 1, 2], attempts)
+        self.assertEqual(2, summary['issue_shapes_suppressed'])
 
 
 if __name__ == '__main__':

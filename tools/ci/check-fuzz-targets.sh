@@ -23,6 +23,12 @@
 # the deep tier, so only a FAST_TIER entry naming a target that exists
 # nowhere above is an error.
 #
+# It also checks that the job's FUZZ_DEADLINE is computed from the same
+# number of minutes as its timeout-minutes. GitHub offers no way to read
+# the timeout back at runtime, so the workflow writes it twice, and a
+# deadline later than the real one sizes the fuzzing past the point the
+# job is killed, which is #519 again.
+#
 # Usage: tools/ci/check-fuzz-targets.sh
 # Exits 0 with a one-line summary when every list agrees, 1 otherwise --
 # every mismatch is reported before exiting, not just the first one
@@ -87,6 +93,16 @@ fast_tier_targets() {
     ' "${FUZZ_TIER}"
 }
 
+# The job-level timeout-minutes (four spaces in), not a step's.
+job_timeout_minutes() {
+    sed -n 's/^    timeout-minutes: *\([0-9][0-9]*\) *$/\1/p' "${WORKFLOW}"
+}
+
+deadline_minutes() {
+    # shellcheck disable=SC2016  # the $( is the workflow's text, matched literally
+    sed -n 's/.*FUZZ_DEADLINE=\$(( \$(date +%s) + \([0-9][0-9]*\) \* 60 )).*/\1/p' "${WORKFLOW}"
+}
+
 mapfile -t FS_LIST < <(fs_targets | sort -u)
 mapfile -t CARGO_LIST < <(cargo_bin_targets | sort -u)
 mapfile -t WORKFLOW_LIST < <(workflow_targets | sort -u)
@@ -142,6 +158,18 @@ for t in "${FAST_LIST[@]}"; do
     fi
 done
 
+mapfile -t TIMEOUT_LIST < <(job_timeout_minutes)
+mapfile -t DEADLINE_LIST < <(deadline_minutes)
+if [ "${#TIMEOUT_LIST[@]}" -ne 1 ] || [ "${#DEADLINE_LIST[@]}" -ne 1 ]; then
+    echo "ERROR: expected one job timeout-minutes and one FUZZ_DEADLINE" \
+        "in ${WORKFLOW}, found ${#TIMEOUT_LIST[@]} and ${#DEADLINE_LIST[@]}" >&2
+    FAILURES=$((FAILURES + 1))
+elif [ "${TIMEOUT_LIST[0]}" != "${DEADLINE_LIST[0]}" ]; then
+    echo "ERROR: ${WORKFLOW} sets FUZZ_DEADLINE ${DEADLINE_LIST[0]} minutes" \
+        "out, but the job's timeout-minutes is ${TIMEOUT_LIST[0]}" >&2
+    FAILURES=$((FAILURES + 1))
+fi
+
 if [ "${FAILURES}" -ne 0 ]; then
     echo "check-fuzz-targets: ${FAILURES} problem(s) found" >&2
     exit 1
@@ -149,5 +177,6 @@ fi
 
 summary="check-fuzz-targets: ${#FS_LIST[@]} fuzz targets agree across"
 summary="${summary} fuzz_targets/, Cargo.toml, and coverage-fuzz.yml;"
-summary="${summary} FAST_TIER (${#FAST_LIST[@]} targets) is a subset."
+summary="${summary} FAST_TIER (${#FAST_LIST[@]} targets) is a subset;"
+summary="${summary} FUZZ_DEADLINE matches the job's ${TIMEOUT_LIST[0]}-minute timeout."
 echo "${summary}"
