@@ -322,6 +322,14 @@ echo "--- Counting the selection ---"
 # run was complete. Deriving even that bound beats the figure this
 # replaced, which was a hand-written ~3250 that drifts every time a test
 # is added.
+#
+# "stestr list" refuses to run without a repository. Seeding creates one
+# with "stestr load --force-init", but a timing run skips seeding, and
+# the seed script returns early without one when the timing file is
+# missing or unusable, so create it here when nothing else has.
+if [ ! -d .stestr ]; then
+    /tmp/test-venv/bin/stestr init > /dev/null
+fi
 LIST_ARGS=(list)
 if [ -n "$EXCLUDE_RE" ]; then
     LIST_ARGS+=(--exclude-regex "$EXCLUDE_RE")
