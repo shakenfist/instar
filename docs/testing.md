@@ -1855,14 +1855,32 @@ The CI workflow (`.github/workflows/coverage-fuzz.yml`) runs:
 
 #### Tiered nightly durations
 
-The nightly run has a fixed wall-clock budget (450 min, inside the
-480 min job timeout). Rather than splitting it evenly, the run plan is
-computed by `tools/ci/fuzz-tier.sh`: the fast-saturating targets (pure
-window math, CHS rounding, and the planner/emitter crates) take a short
-fixed slice (300s — they reach steady coverage in well under a minute),
-and the deep parser/format targets split the remainder. With the
-current 43 targets (17 fast, 26 deep) that gives the 26 deep targets
-~14 min each versus ~10 min under an even split (27000 / 43).
+The nightly run's wall-clock budget is **what is left of the 480-minute
+job timeout** once the targets are built, less 30 minutes held back for
+the corpus push and everything after it, and never more than 450
+minutes. The job records its deadline in its first step, and
+`tools/ci/fuzz-tier.sh budget` turns that into seconds after the build.
+Rather than splitting the budget evenly, the run plan is computed by
+`tools/ci/fuzz-tier.sh plan`: the fast-saturating targets (pure window
+math, CHS rounding, and the planner/emitter crates) take a short fixed
+slice (300s — they reach steady coverage in well under a minute), and
+the deep parser/format targets split the remainder. With the current
+43 targets (17 fast, 26 deep) and the full 450 minutes, that gives the
+26 deep targets ~14 min each versus ~10 min under an even split
+(27000 / 43). A plan never sums to more than its budget: a budget too
+small for every target's fast slice is shared equally instead, with a
+warning. `tools/ci/test-fuzz-tier.sh` asserts both, in `ci-tooling`.
+
+The budget used to be a fixed 450 minutes, which left 30 for setup and
+the push, and that is #519 twice over. In August the push alone took
+22 minutes and the job died in it. In October setup grew instead:
+seeding the corpus went from two minutes to twenty-five once the job
+read testdata from the dependencies disk, because it reads every
+accumulated corpus entry and those reads are cold there, where a fresh
+clone had just left them in the page cache. The job then died in the
+fuzzing step on seven nights out of nine, before the push ran at all.
+Sizing from the deadline makes slow setup cost fuzzing time rather than
+the night's corpus; the job summary records the budget each night got.
 
 This is one of two levers for keeping per-target time useful as the
 target count grows; the other is corpus persistence (see *Corpus

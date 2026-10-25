@@ -1039,8 +1039,9 @@ pins in the same file managed.
 
 The `ci-tooling` CI job runs the cheap guards over CI's own tooling:
 the test-partition check below, plus
-`tools/ci/test-report-fuzz-crash.sh` and
-`tools/ci/test-pick-fuzz-artifact.sh` for the coverage-fuzz helpers
+`tools/ci/test-report-fuzz-crash.sh`,
+`tools/ci/test-pick-fuzz-artifact.sh` and `tools/ci/test-fuzz-tier.sh`
+for the coverage-fuzz helpers
 (see "Crash reporting" in [docs/testing.md](testing.md)) and
 `tools/ci/test-check-devcontainer-pins.sh` for the devcontainer pin
 guard (see "Cargo tool pinning" above). It is
@@ -1129,12 +1130,12 @@ step -- see "Self-hosted runners and the GitHub CLI" in
 - `tools/propose-release.sh`, `tools/tag-release.sh` - The two release steps: open the version-bump pull request, then tag the commit that merged it (see "Releases" above)
 - `tools/release-version.sh` - Reads and checks the release version in `src/vmm/Cargo.toml`; `check-version` in `release.yml` and `make check-version` run it
 - `tools/sign-release-tag.sh` - Re-signs the release tag with gitsign and force-pushes it; `sign-tag` in `release.yml` runs it on a throwaway runner
-- `tools/ci/fuzz-tier.sh` - Computes tiered nightly per-target fuzz durations
+- `tools/ci/fuzz-tier.sh` - Computes tiered nightly per-target fuzz durations, and the fuzzing budget left before the job's deadline
+- `tools/ci/test-fuzz-tier.sh` - Tests that a plan never sums to more than its budget and that the budget leaves its reserve; the `ci-tooling` CI job runs it
 - `tools/ci/report-fuzz-crash.sh` - Files the `security-audit` issue for a coverage-fuzz crash (bounds the log excerpt, dedups against open issues; see "Crash reporting" in `docs/testing.md`)
 - `tools/ci/pick-fuzz-artifact.sh` - Chooses which libFuzzer artifact to report as the reproducer
 - `tools/ci/test-report-fuzz-crash.sh`, `tools/ci/test-pick-fuzz-artifact.sh` - Tests for those two; run them after any change (the `ci-tooling` CI job does)
 - `tools/ci/check-fuzz-targets.sh` - Fails if the three places a fuzz target has to be registered by hand disagree: the `.rs` file under `src/fuzz/fuzz_targets/`, the `[[bin]]` stanza in `src/fuzz/Cargo.toml`, and the `TARGETS=(...)` array in `coverage-fuzz.yml`. A target absent from that array is never fuzzed in CI at all, silently, while its row in `docs/testing.md` keeps claiming it is. `FAST_TIER` in `fuzz-tier.sh` is checked as a subset, since an unlisted target legitimately defaults to the deep tier
-- `tools/ci/count-fuzz-targets.sh` - The number of `[[bin]]` targets in `src/fuzz/Cargo.toml`, so `coverage-fuzz.yml` derives the count instead of restating it
 - `tools/ci/test-check-fuzz-targets.sh` - Tests for the registration guard, against a synthetic four-target tree; the `ci-tooling` CI job runs it
 - `tools/ci/check-doc-phrases.sh` - Fails if any tracked file contains a plan filename mangled by a bad automated replace that spliced the word "work" into it; seven of these in `docs/testing.md` were repaired by hand, and a further 17 had spread to other pages before anything checked. It decides by rejoining the text either side of " work" and asking whether that names a file in `docs/plans/`, so it catches a splice at any offset and cannot false-positive on a real English continuation like "PLAN-differencing workflow", which rejoins to nothing. `docs/plans/` and `tools/ci/` are exempt: the plan pages quote corrupted phrases verbatim as examples when describing the bug, and this guard's own tests build fixtures carrying the pattern on purpose
 - `tools/ci/test-check-doc-phrases.sh` - Tests for that guard, including that it does not false-positive on legitimate strings like "the PLAN-map work" or "PLAN-differencing workflow"; the `ci-tooling` CI job runs it

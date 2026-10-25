@@ -548,6 +548,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   a future regression fails loudly instead of quietly discarding a
   night's work.
 
+- **The nightly coverage fuzz sizes its fuzzing from the job's
+  deadline** ([#519](https://github.com/shakenfist/instar/issues/519)).
+  The fixed 450-minute budget left 30 minutes for setup and the corpus
+  push, and once seeding the corpus slowed from two minutes to
+  twenty-five on the testdata disk the job was killed mid-fuzz on seven
+  nights out of nine, before the push ran. The budget is now whatever
+  remains of the 480-minute timeout after the build, less 30 minutes for
+  the push and what follows it, so slow setup costs fuzzing time rather
+  than the night's corpus. The job summary records the budget each run
+  got.
+
 - **The merge queue's `package-build` job no longer competes for an `xl`
   runner.** It builds a `.deb` and an `.rpm` -- a docker build and two
   packaging steps, with no VM and no test suite -- but ran on the

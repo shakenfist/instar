@@ -62,6 +62,19 @@ jobs:
       DOCKER_BUILDKIT: 1
 
     steps:
+      # First, so the deadline is measured from as near the job's own
+      # start as a step can get. The fuzzing below is sized from it rather
+      # than from a fixed budget: a fixed 450 minutes left 30 for
+      # everything else in the job, and when seeding the corpus went from
+      # two minutes to twenty-five on the testdata disk (cold reads of the
+      # whole accumulated corpus, where a fresh clone had left it in the
+      # page cache) the nightly was killed mid-fuzz on seven nights out of
+      # nine, losing the corpus push after it (#519). 480 is the
+      # timeout-minutes above; GitHub offers no way to read it back, so
+      # change the two together.
+      - name: Record the job's deadline
+        run: echo "FUZZ_DEADLINE=$(( $(date +%s) + 480 * 60 ))" >> "$GITHUB_ENV"
+
       - name: Checkout
         uses: actions/checkout@v7
 
@@ -129,20 +142,8 @@ jobs:
             DURATION=${INPUT_DURATION}
             TARGETS=${INPUT_TARGETS}
 
-            # Count targets (default: every target in src/fuzz/Cargo.toml)
-            if [ -n "$TARGETS" ]; then
-              N_TARGETS=$(echo "$TARGETS" | tr ',' '\n' | wc -l)
-            else
-              N_TARGETS=$(tools/ci/count-fuzz-targets.sh)
-            fi
-
-            # Cap duration so total fits in 450 min (30 min headroom)
-            MAX_DURATION=$(( 450 * 60 / N_TARGETS ))
-            if [ "$DURATION" -gt "$MAX_DURATION" ]; then
-              echo "::warning::Capping duration from ${DURATION}s to ${MAX_DURATION}s to fit timeout"
-              DURATION=$MAX_DURATION
-            fi
-
+            # Capped to what fits before the job's deadline in the run
+            # step, once the build has taken what it takes.
             echo "duration=${DURATION}" >> $GITHUB_OUTPUT
             echo "targets=${TARGETS}" >> $GITHUB_OUTPUT
           elif [ "$EVENT_NAME" = "pull_request" ]; then
@@ -175,11 +176,18 @@ jobs:
           FUZZ_TARGETS: ${{ steps.params.outputs.targets }}
           EVENT_NAME: ${{ github.event_name }}
           # Nightly per-target durations are tiered (see tools/ci/fuzz-tier.sh):
-          # the deep parser targets split this wall-clock budget while the
-          # fast-saturating targets take a short fixed slice. 27000s = 450 min
-          # leaves ~30 min of the 480 min job timeout for build/seed/push.
+          # the deep parser targets split the wall-clock budget while the
+          # fast-saturating targets take a short fixed slice. The budget is
+          # whatever is left before FUZZ_DEADLINE once the targets are
+          # built, less FUZZ_RESERVE_SECONDS, and never more than
+          # NIGHTLY_BUDGET_SECONDS (450 min, which a quick setup reaches).
           NIGHTLY_BUDGET_SECONDS: '27000'
           FAST_TIER_SECONDS: '300'
+          # What the steps after this one need: the corpus push's own
+          # 20-minute timeout, plus ten minutes for crash minimisation and
+          # reporting, a container start per target, libFuzzer finishing
+          # its last input, and the log upload.
+          FUZZ_RESERVE_SECONDS: '1800'
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
@@ -251,14 +259,29 @@ jobs:
             )
           fi
 
+          # What fits before the deadline, measured now that the build
+          # is done rather than guessed at the top of the job.
+          BUDGET=$(tools/ci/fuzz-tier.sh budget \
+            "$FUZZ_DEADLINE" "$FUZZ_RESERVE_SECONDS" "$NIGHTLY_BUDGET_SECONDS")
+          echo "Fuzzing budget: ${BUDGET}s of ${NIGHTLY_BUDGET_SECONDS}s"
+
           # Build the per-target run plan as "<target> <duration>" lines.
           # The nightly schedule tiers durations via tools/ci/fuzz-tier.sh
           # so the deep parser targets get most of the budget; every other
-          # event type runs each target for the uniform params duration.
+          # event type runs each target for the uniform params duration,
+          # which a manual run may not stretch past the budget either.
           if [ "$EVENT_NAME" = "schedule" ]; then
             PLAN=$(tools/ci/fuzz-tier.sh plan \
-              "$NIGHTLY_BUDGET_SECONDS" "$FAST_TIER_SECONDS" "${TARGETS[@]}")
+              "$BUDGET" "$FAST_TIER_SECONDS" "${TARGETS[@]}")
           else
+            if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+              MAX_DURATION=$(( BUDGET / ${#TARGETS[@]} ))
+              [ "$MAX_DURATION" -lt 1 ] && MAX_DURATION=1
+              if [ "$FUZZ_DURATION" -gt "$MAX_DURATION" ]; then
+                echo "::warning::Capping duration from ${FUZZ_DURATION}s to ${MAX_DURATION}s to fit timeout"
+                FUZZ_DURATION=$MAX_DURATION
+              fi
+            fi
             PLAN=$(for T in "${TARGETS[@]}"; do echo "$T $FUZZ_DURATION"; done)
           fi
           echo "Run plan (target duration):"
@@ -373,6 +396,7 @@ jobs:
             echo "### Coverage fuzz"
             echo ""
             echo "- targets fuzzed: $(echo "$PLAN" | grep -c .)"
+            echo "- fuzzing budget: ${BUDGET}s of ${NIGHTLY_BUDGET_SECONDS}s"
             echo "- non-zero exits: $CRASHES_FOUND"
             echo "- could not be reported: $REPORT_FAILURES"
             echo "- exited without an artifact: $NO_ARTIFACT"
@@ -393,7 +417,10 @@ jobs:
       # `timeout-minutes: 480` here, after the fuzzing had finished
       # (#519). The budget could not have worked: NIGHTLY_BUDGET_SECONDS
       # is 450 minutes, leaving 30 for setup and this push, and this
-      # push alone measured 22.
+      # push alone measured 22. In October setup grew instead and the
+      # job died in the fuzzing step before reaching this one, which is
+      # why the fuzzing is now sized from the job's deadline with this
+      # step's 20 minutes held back (FUZZ_RESERVE_SECONDS above).
       #
       # The timeout below is what keeps that honest. The script now does
       # a trees-only clone and touches only genuinely new entries, so 20
