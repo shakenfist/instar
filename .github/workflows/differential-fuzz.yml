@@ -11,13 +11,10 @@ on:
       - 'scripts/differential-fuzz.py'
       - '.github/workflows/differential-fuzz.yml'
 
-  # Post-merge smoke test: 200 iterations
-  push:
-    branches: [develop]
-    paths:
-      - 'src/**'
-      - 'crates/**'
-      - 'scripts/differential-fuzz.py'
+  # No push trigger, deliberately: a post-merge run of 200 iterations
+  # on each push to develop touching src/ cost about 20 minutes of an
+  # `xl` runner per merge, taken from the pool the merge queue waits
+  # on, to run a fifth of what the nightly runs within a day.
 
   # Manual: configurable
   workflow_dispatch:
@@ -98,9 +95,6 @@ jobs:
             echo "timeout=${INPUT_TIMEOUT}" >> $GITHUB_OUTPUT
           elif [ "$EVENT_NAME" = "pull_request" ]; then
             echo "iterations=100" >> $GITHUB_OUTPUT
-            echo "timeout=30" >> $GITHUB_OUTPUT
-          elif [ "$EVENT_NAME" = "push" ]; then
-            echo "iterations=200" >> $GITHUB_OUTPUT
             echo "timeout=30" >> $GITHUB_OUTPUT
           else
             # schedule (nightly)

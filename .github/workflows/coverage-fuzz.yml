@@ -19,16 +19,15 @@ on:
       - 'tools/ci/report-fuzz-crash.sh'
       - 'tools/ci/pick-fuzz-artifact.sh'
 
-  # Post-merge smoke test: 15s per target
-  push:
-    branches: [develop]
-    paths:
-      - 'src/**'
-      - 'scripts/extract-fuzz-corpus.py'
-      - '.github/workflows/coverage-fuzz.yml'
-      - 'tools/ci/fuzz-tier.sh'
-      - 'tools/ci/report-fuzz-crash.sh'
-      - 'tools/ci/pick-fuzz-artifact.sh'
+  # No push trigger, deliberately. There was a post-merge smoke run of
+  # every target for 15s on each push to develop touching src/. It cost
+  # about 75 minutes of an `xl` runner per merge -- the seeding and the
+  # build, not the fuzzing -- taken from the pool the merge queue waits
+  # on, and it was a strictly weaker copy of the nightly, which runs
+  # the same targets for minutes each within a day. It last found
+  # anything in August. A merged change that crashes a target is found
+  # by the next nightly; one that breaks the fuzz build is found by the
+  # pull_request run above when it touches fuzz or crate code.
 
   # Manual: configurable duration and target selection
   workflow_dispatch:
@@ -150,10 +149,6 @@ jobs:
             # Build + single target smoke test
             echo "duration=10" >> $GITHUB_OUTPUT
             echo "targets=fuzz_format_detect" >> $GITHUB_OUTPUT
-          elif [ "$EVENT_NAME" = "push" ]; then
-            # Post-merge: 15s per target, all targets
-            echo "duration=15" >> $GITHUB_OUTPUT
-            echo "targets=" >> $GITHUB_OUTPUT
           else
             # schedule (nightly) — per-target durations are tiered in the
             # run step via tools/ci/fuzz-tier.sh against NIGHTLY_BUDGET_SECONDS

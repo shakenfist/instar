@@ -548,6 +548,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   a future regression fails loudly instead of quietly discarding a
   night's work.
 
+- **The fuzzers no longer run after every merge.** Both
+  `coverage-fuzz.yml` and `differential-fuzz.yml` ran a smoke test on
+  every push to `develop` touching `src/` -- about 75 and 20 minutes of
+  an `xl` runner per merge, from the pool the merge queue waits on, for
+  a weaker copy of what each runs nightly. The pull-request and nightly
+  runs are unchanged, so a merged change that crashes a fuzz target is
+  now found by the next nightly rather than within the hour.
+
 - **The nightly coverage fuzz sizes its fuzzing from the job's
   deadline** ([#519](https://github.com/shakenfist/instar/issues/519)).
   The fixed 450-minute budget left 30 minutes for setup and the corpus

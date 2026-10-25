@@ -1571,14 +1571,20 @@ python3 scripts/differential-fuzz.py \
 ### CI integration
 
 The fuzzer runs automatically via `.github/workflows/differential-fuzz.yml`
-at three tiers:
+at two tiers, plus by hand:
 
 | Trigger | Iterations | When |
 |---------|-----------|------|
 | `pull_request` | 100 | PR changes fuzzer script or workflow |
-| `push` to develop | 200 | Post-merge smoke test |
 | `schedule` | 1000 | Nightly at 02:00 UTC |
 | `workflow_dispatch` | configurable | Manual trigger |
+
+There is no post-merge run. One of 200 iterations used to follow every
+push to `develop` that touched `src/`, and was dropped as a fifth of
+the nightly's work bought with about 20 minutes of an `xl` runner per
+merge, from the pool the merge queue waits on. The same reasoning
+removed coverage-guided fuzzing's post-merge run; see "CI integration"
+under Coverage-Guided Fuzzing.
 
 On failure, the workflow uploads logs as artifacts and auto-files GitHub
 Issues with the `security-audit` label, including the seed, iteration,
@@ -1850,8 +1856,16 @@ The CI workflow (`.github/workflows/coverage-fuzz.yml`) runs:
   durations** (see below).
 - **PR validation:** single-target smoke test when fuzz/parser code
   changes.
-- **Post-merge** (push to `develop`): 15s per target.
 - **Manual dispatch:** configurable duration and target selection.
+
+There is no post-merge run, on purpose. One used to fuzz every target
+for 15s after each push to `develop` that touched `src/`, and it cost
+about 75 minutes of an `xl` runner per merge -- corpus seeding and the
+build, not the fuzzing -- from the pool the merge queue waits on, for a
+strictly weaker copy of the nightly. It last found anything in August
+(#485 and #492, one `fuzz_rebase_planners` crash twice). A merged change
+that crashes a target is found by the next nightly instead, within a
+day.
 
 #### Tiered nightly durations
 
