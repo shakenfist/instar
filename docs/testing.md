@@ -1601,9 +1601,24 @@ merge, from the pool the merge queue waits on. The same reasoning
 removed coverage-guided fuzzing's post-merge run; see "CI integration"
 under Coverage-Guided Fuzzing.
 
-On failure, the workflow uploads logs as artifacts and auto-files GitHub
-Issues with the `security-audit` label, including the seed, iteration,
-image attributes, and a reproduction command.
+On failure, the workflow uploads logs as artifacts. The nightly and a
+manual run also file GitHub Issues with the `security-audit` label,
+including the seed, iteration, image attributes, and a reproduction
+command; a pull-request run does not, because its divergences belong
+on that pull request, as its red check and its uploaded logs.
+
+Filing is grouped and capped (`--max-issues`, default 5). A run files
+one issue per divergence *shape* -- the divergence type, the operation,
+and the first line of instar's stderr with paths and numbers of three
+or more digits taken out -- when it first sees that shape, and at the
+end of the run comments on it with how many more iterations diverged
+the same way. Once a run has filed its limit, further shapes are only
+logged and counted in `summary-<seed>.json`. Both rules exist because
+one 100-iteration pull-request run on 2026-10-17 filed 98 issues for a
+single kernel fault (#787); under these rules it would have filed five,
+and its log would have said why it stopped.
+`tools/ci/test_differential_fuzz_issues.py` holds both, in
+`ci-tooling`.
 
 ### Reproducing a divergence
 

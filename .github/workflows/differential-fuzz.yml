@@ -108,6 +108,7 @@ jobs:
           FUZZ_ITERATIONS: ${{ steps.params.outputs.iterations }}
           FUZZ_TIMEOUT: ${{ steps.params.outputs.timeout }}
           FUZZ_FAIL_FAST: ${{ inputs.fail_fast }}
+          EVENT_NAME: ${{ github.event_name }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
@@ -119,6 +120,17 @@ jobs:
           FAIL_FAST_ARG=""
           if [ "$FUZZ_FAIL_FAST" = "true" ]; then
             FAIL_FAST_ARG="--fail-fast"
+          fi
+
+          # A pull request's divergences belong on that pull request, as
+          # its red check and the uploaded logs, not in the issue tracker:
+          # the 100-iteration run on #679 filed 98 issues for one kernel
+          # fault in under four minutes (#787). Only the nightly and a
+          # manual run file issues, and those are capped and grouped by
+          # divergence shape inside the script (--max-issues).
+          ISSUES_ARG=""
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            ISSUES_ARG="--create-issues"
           fi
 
           # The instar binary is built inside the Docker container
@@ -144,7 +156,7 @@ jobs:
                 --iterations $FUZZ_ITERATIONS \
                 --timeout $FUZZ_TIMEOUT \
                 --log-dir /workspace/fuzz-logs \
-                --create-issues \
+                $ISSUES_ARG \
                 --workflow-url \"\$WORKFLOW_URL\" \
                 $SEED_ARG \
                 $FAIL_FAST_ARG

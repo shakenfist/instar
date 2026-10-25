@@ -548,6 +548,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   a future regression fails loudly instead of quietly discarding a
   night's work.
 
+- **The differential fuzzer files one issue per divergence shape, at
+  most five a run, and never from a pull request**
+  ([#787](https://github.com/shakenfist/instar/issues/787)). One
+  100-iteration pull-request run filed 98 issues for a single kernel
+  fault. Repeats of a shape are now noted as a comment on its issue,
+  shapes beyond the limit are logged and counted in the run's summary,
+  and a pull request's divergences stay on the pull request as its red
+  check and uploaded logs.
+
 - **A docs-only merge group no longer runs the distro matrix.** The
   `check_paths` filter that already let a docs-only pull request skip
   the expensive jobs now runs in the merge queue as well, diffing the
