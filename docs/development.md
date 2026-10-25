@@ -116,10 +116,12 @@ pointing back at `deb.debian.org`.
 snapshot removed the 404 failure mode and left the transport one, and
 if anything raised it: `snapshot.debian.org` is a single origin behind
 a CDN, not the `deb.debian.org` mirror network. A fetch failure here is
-not an ordinary build failure — the release image is only built in the
-merge queue for a docs-only change, so there is no pull-request run to
-catch it, and the failure ejects the pull request from the queue
-instead (#531). The occurrence on PR #560 was one object out of 150
+not an ordinary build failure — the release image is built in the
+merge queue, and when it fails there it ejects the pull request from
+the queue (#531). That pull request was docs-only, which had no
+pull-request run to catch the failure first; a docs-only merge group
+now skips the build altogether (see "Pull requests versus the merge
+queue" in [testing.md](testing.md)). The occurrence on PR #560 was one object out of 150
 dying with a TCP reset ten seconds in, after 125 MB had come down from
 the same host at 15.3 MB/s, with the next object succeeding. apt
 retries the failed object rather than the transaction, so a retry costs

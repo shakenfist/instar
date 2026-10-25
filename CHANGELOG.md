@@ -548,6 +548,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   a future regression fails loudly instead of quietly discarding a
   night's work.
 
+- **A docs-only merge group no longer runs the distro matrix.** The
+  `check_paths` filter that already let a docs-only pull request skip
+  the expensive jobs now runs in the merge queue as well, diffing the
+  group against its `base_sha`, so a change to documentation alone no
+  longer spends seven `xl` legs and part of the queue's 360-minute
+  deadline. `can_merge` now also depends on `check_paths`, so a failed
+  filter cannot pass as a group with nothing to test.
+
 - **The fuzzers no longer run after every merge.** Both
   `coverage-fuzz.yml` and `differential-fuzz.yml` ran a smoke test on
   every push to `develop` touching `src/` -- about 75 and 20 minutes of

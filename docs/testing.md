@@ -626,9 +626,24 @@ stops gating merges entirely rather than merely tolerating its own
 failure. Never leave a flag behind after its issue is fixed.
 
 Because `merge_group` does not inherit the `pull_request` trigger's
-`paths:` filter, this workflow always runs in the queue — including for
+`paths:` filter, this workflow always runs in the queue, including for
 docs-only changes. That is deliberate (a required check that never runs
-hangs the queue), at the cost of matrix latency on doc merges.
+hangs the queue). What it runs there is decided by the `check_paths`
+job, as on a pull request: a merge group that changes only
+documentation skips `build-and-test`, `package-build` and the matrix,
+and `can_merge` reports success on the skips. The filter diffs the
+group against `merge_group.base_sha` from the event payload, not
+against `develop`, so a re-run of the queue run after the group has
+merged sees the same diff rather than an empty one. `can_merge` lists
+`check_paths` among its needs, because if the filter itself failed,
+every job after it would skip and skips alone read as success.
+
+This used to run everything in the queue, so a docs-only pull request
+such as #659 spent seven `xl` legs and part of the 360-minute deadline
+on code it did not touch. The release gate (`require-ci-success`)
+counts the run, as it counts a docs-only pull request's: the code in
+such a commit is identical to a `develop` commit that went through the
+full queue.
 
 **Superseded merge groups are cancelled.** `build-and-test`,
 `package-build` and `package-matrix` each carry a `concurrency:` block,
