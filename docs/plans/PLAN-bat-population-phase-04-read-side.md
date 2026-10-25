@@ -392,6 +392,56 @@ work sits beside 4a's in `src/crates/vhdx/src/lib.rs`. Every brief also carries 
   `instar-testdata/qemu-sources/7.0.0/` or was measured. Say which.
 * Leave the work uncommitted.
 
+## Execution notes
+
+* **Back brief, 2026-10-25 (AEDT).** The operator kept decision 3
+  (payload index, not qemu's BAT index), and allowed the management
+  session to push the branch and open the pull request once the
+  definition of done passes. The steps ran in order, one opus agent
+  each at high effort.
+* **4a.** Converting the 131041M fixture to qcow2 takes about 61 s,
+  inside the 300 s tool timeout, and it was kept. 324 `test_measure`
+  skips are "no baseline meta": instar-testdata's 10.0.0 measure
+  profile is missing those files. The skip depends only on the file
+  existing, not on this change. The agent once ran its mutants at the
+  same time as `make test-rust`, which compiled a mutant into the test
+  build. It reran cleanly, and the later briefs forbade running the
+  two together.
+* **4b.** qemu cannot open the 4608.5M image, so the read matrix gained
+  a `QEMU_CANNOT_OPEN` table. For that image, the size it was created
+  with stands in for `qemu-img info`, and `qemu-img measure --size`
+  stands in for measuring the file. The `_op_*` helpers now take the
+  image name. `_test_name` also replaces `.`. Dropping only the
+  start-at-or-past-end-of-file test is an equivalent mutant, because
+  every block length is at least one byte, so the guard stays with a
+  comment saying it is implied. The management session confirmed the
+  quirk text's claim that instar's other readers handle such images:
+  `instar convert -O qcow2` of a 4608.5M image read back a marker
+  written into its partial last block.
+* **4c.** The fuzz target takes `leave_blocks_allocated` from flag bit
+  6, which only the qcow2 arm used. The agent also added one sentence
+  each to `docs/quirks.md`, `docs/format-coverage.md` and
+  `docs/testing.md`, which would otherwise have said instar resizes
+  every VHDX. They were kept. The management session confirmed the
+  documented workaround: convert a fixed image to dynamic VHDX,
+  resize it, and `compare` the result with the original.
+* **Definition of done, 2026-10-25 (AEDT).** After a fresh `make
+  instar` at the last step commit, `make test-rust` passed 2727 tests
+  with 3 ignored. The stestr run of the eight modules reported Ran:
+  1678, with 1252 passed, 414 skipped and 12 failed under 16 workers.
+  None of the 12 touch VHDX: they are qcow2 re-encodes, the
+  `vmdk-v3` convert, a VHD differencing compose and a create over a
+  flat VMDK, and each failed with "convert operation failed" or
+  "write to output device failed". Replayed alone (`--concurrency
+  1`), all 12 pass (Ran: 12, 0 failed), so they are host contention,
+  not this change. Of the 414 skips, 324 are the instar-testdata
+  measure-profile gap noted under 4a. Most of the other 90 are
+  existing, documented skips: known writer and scanner divergences,
+  "qemu-img cannot resize", raw has no check, and missing libvhdi
+  tools or ZSTD support. So the definition of done's "only
+  missing-binary and missing-driver skips" was too narrow as written,
+  and does not hold literally.
+
 ## Risks and mitigations
 
 * **The count change moves a pinned output.** It changes writer bytes
