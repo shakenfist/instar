@@ -711,7 +711,7 @@ rather than merge requests.
 |-------|------|--------|--------|
 | 1. Pin qemu's behaviour across the 80 static builds, build the structural VHDX comparator, correct `docs/create.md` | [PLAN-bat-population-phase-01-pin.md](PLAN-bat-population-phase-01-pin.md) | Complete | `fef62417` (#809) |
 | 2. Fixed VHDX fixtures (instar-testdata + instar) | [PLAN-bat-population-phase-02-fixtures.md](PLAN-bat-population-phase-02-fixtures.md) | Complete | instar-testdata `d2f9467719` (direct to `main`); instar `5c5bba75` (#819) |
-| 3. Host-only create: non-qcow2 preallocation parity and monolithicFlat | [PLAN-bat-population-phase-03-host-create.md](PLAN-bat-population-phase-03-host-create.md) | In progress | |
+| 3. Host-only create: non-qcow2 preallocation parity and monolithicFlat | [PLAN-bat-population-phase-03-host-create.md](PLAN-bat-population-phase-03-host-create.md) | Complete | `a8d2f4ca` (#824) |
 | 4. Read side: BAT entry count (#626), partial last block, `LeaveBlocksAllocated` and `resize` | PLAN-bat-population-phase-04-read-side.md | Not started | |
 | 5. VHDX geometry: default block size (#645), 64 TiB ceiling, one shared layout | PLAN-bat-population-phase-05-geometry.md | Not started | |
 | 6. Streaming BAT emitter and the fixed `plan_vhdx` | PLAN-bat-population-phase-06-emitter.md | Not started | |
