@@ -2622,6 +2622,45 @@ mod vhdx_plan_tests {
         assert!(have_meta, "no metadata region pointer");
     }
 
+    /// At 131041 MiB with 1 MiB blocks the BAT is 131041 payload entries
+    /// and 131040 / 4096 = 31 sector bitmap entries: 131072 entries,
+    /// exactly 1 MiB. qemu lays the image out with a 1 MiB BAT region
+    /// at 2 MiB and the metadata region at 3 MiB, and so must this
+    /// planner. Counting a trailing bitmap entry as well (issue #626)
+    /// needed 131073 entries, a 2 MiB region, and moved the metadata
+    /// region to 4 MiB.
+    #[test]
+    fn plan_vhdx_131041_mib_1_mib_blocks_has_a_1_mib_bat() {
+        const MIB: u64 = 1024 * 1024;
+        let opts = VhdxCreateOpts {
+            virtual_size: 131_041 * MIB,
+            block_size: MIB as u32,
+            backing: None,
+            parent_data_write_guid: [0u8; 16],
+        };
+        let mut scratch = vec![0u8; VHDX_MAX_METADATA_SCRATCH];
+        let plan = plan_vhdx(&opts, &mut scratch).expect("plan");
+        assert_eq!(plan.minimum_file_size, 4 * MIB);
+        let bytes = materialise(&plan);
+        for rt_off in [vhdx::REGION_TABLE1_OFFSET, vhdx::REGION_TABLE2_OFFSET] {
+            let rt = &bytes[rt_off as usize..rt_off as usize + 65536];
+            // `parse_region_table` returns the BAT entry, then the
+            // metadata entry, matched by GUID.
+            let ([bat, metadata], _count) =
+                vhdx::parse_region_table(rt).expect("parse region table");
+            assert_eq!(
+                (bat.file_offset, bat.length),
+                (2 * MIB, MIB as u32),
+                "BAT region in the region table at {rt_off}"
+            );
+            assert_eq!(
+                (metadata.file_offset, metadata.length),
+                (3 * MIB, MIB as u32),
+                "metadata region in the region table at {rt_off}"
+            );
+        }
+    }
+
     #[test]
     fn plan_vhdx_region_table_duplicated() {
         let opts = default_opts(1 << 20);

@@ -1031,13 +1031,13 @@ rust_case 'vhdx-relative-key-convention' "${VHDX_LIB}" \
 
 # How large a BAT the emitter declares for a differencing child. The
 # mutation sizes it by the no-parent rule, which is what instar did
-# before: one entry per payload block plus one per chunk group, rather
-# than whole groups of chunk_ratio + 1 entries. At most geometries the
-# shortfall vanishes into the 1 MiB region rounding, which is why the
-# named test is the one that picks a geometry where it does not.
+# before: the entries up to the last payload block, rather than whole
+# groups of chunk_ratio + 1 entries. At most geometries the shortfall
+# vanishes into the 1 MiB region rounding, which is why the named test
+# is the one that picks a geometry where it does not.
 rust_case 'vhdx-write-differencing-bat-sized-as-dynamic' "${VHDX_LIB}" \
-    '    let total_bat_entries = if has_parent {' \
-    '    let total_bat_entries = if false {  // MUTATED' \
+    '        u32::try_from(bat_entry_count(total_blocks_u64, chunk_ratio, has_parent)?).ok()?;' \
+    '        u32::try_from(bat_entry_count(total_blocks_u64, chunk_ratio, false)?).ok()?; // MUTATED' \
     create 'vhdx_differencing_bat_region_covers_the_last_group_bitmap'
 
 # ---------------------------------------------------------------------
@@ -2391,24 +2391,14 @@ integration_case 'check-vhdx-block-offset-zero-not-counted' "${CHECK_OP}" \
     "${CHECK_BLOCK_COUNTED}"
 
 integration_case 'check-vhdx-block-inside-a-region-not-counted' "${CHECK_OP}" \
-    '                        vhdx::ranges_overlap(
-                            file_offset,
-                            block_size as u64,
-                            region_offset,
-                            region_length,
-                        )' \
+    '                        vhdx::ranges_overlap(file_offset, block_len, region_offset, region_length)' \
     '                        // MUTATED: check no longer tests a block against the regions
-                        let _ = (file_offset, region_offset, region_length);
+                        let _ = (file_offset, block_len, region_offset, region_length);
                         false' \
     "${CHECK_BLOCK_COUNTED}"
 
 integration_case 'check-vhdx-region-test-replaced-by-a-high-water-mark' "${CHECK_OP}" \
-    '                        vhdx::ranges_overlap(
-                            file_offset,
-                            block_size as u64,
-                            region_offset,
-                            region_length,
-                        )' \
+    '                        vhdx::ranges_overlap(file_offset, block_len, region_offset, region_length)' \
     '                        // MUTATED: overlap test replaced by a high-water mark
                         file_offset < region_offset + u64::from(region_length)' \
     "${CHECK_BLOCK_TRAILING}"

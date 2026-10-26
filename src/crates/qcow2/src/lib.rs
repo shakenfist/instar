@@ -11366,13 +11366,16 @@ mod tests {
         let block_size = u64::from(VHDX_FIX_BLOCK_SIZE);
         let virtual_disk_size = payload_blocks * block_size;
         // A differencing BAT is whole groups of chunk_ratio + 1 entries;
-        // one with no parent stops at the last entry it needs. Spelled
-        // out here rather than taken from the crate under test.
-        let group_count = payload_blocks.div_ceil(chunk_ratio);
+        // one with no parent stops at the last payload entry, so it
+        // holds the bitmap entry of every group but the last, as
+        // SPEC(VHDX) 2.5 and qemu's `vhdx_calc_bat_entries` count it:
+        // n + (n - 1) / chunk_ratio. Spelled out here rather than taken
+        // from the crate under test, so the fixture stays an
+        // independent oracle for the count the crate computes.
         let total_bat_entries = if has_parent {
-            group_count * (chunk_ratio + 1)
+            payload_blocks.div_ceil(chunk_ratio) * (chunk_ratio + 1)
         } else {
-            payload_blocks + group_count
+            payload_blocks + payload_blocks.saturating_sub(1) / chunk_ratio
         };
         assert!(
             total_bat_entries * 8 <= u64::from(VHDX_FIX_BAT_LENGTH),
@@ -13551,7 +13554,7 @@ mod tests {
     // The differencing variant of the case above does not exist: read
     // against `VhdxState::init`, `total_bat_entries` -- the field
     // `scan_allocation` and `map_extents` size their walk bounds from
-    // -- is computed as `total_blocks + sb_entries` unconditionally,
+    // -- is the no-parent `vhdx::bat_entry_count` unconditionally,
     // with no `has_parent` branch at all. `has_parent` only changes
     // `sb_bat_entry_bound`, which only `sector_bitmap_lookup` reads --
     // exercised by the block_lookup/sector_bitmap_lookup cases above,

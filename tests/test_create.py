@@ -535,12 +535,13 @@ class TestCreateSmoke(InstarTestBase):
         region the child's own region table declared.
 
         The geometry is chosen so the shortfall is visible. The two
-        rules differ by at most `chunk_ratio - 1` entries and the BAT
+        rules differ by at most `chunk_ratio` entries and the BAT
         region is rounded up to a whole megabyte, so at most sizes the
         difference is absorbed by the rounding and a test would pass
         either way. At 126 977 blocks of 1 MiB the no-parent rule needs
-        127 009 entries, which is 1 016 072 bytes and rounds to exactly
-        one 1 MiB region of 131 072 entries, while the differencing rule
+        126 977 + 126 976 // 4096 = 127 008 entries, which is 1 016 064
+        bytes and rounds to exactly one 1 MiB region of 131 072 entries,
+        while the differencing rule
         needs 131 104 -- 32 more than that region holds. The final
         group's bitmap entry sits at BAT index 131 103.
 
@@ -1751,6 +1752,40 @@ def drop_keys(value, keys):
     if isinstance(value, list):
         return [drop_keys(v, keys) for v in value]
     return value
+
+
+def _region_layout(region_table):
+    """A `summarise()` region table as {region: (offset, length)}, without the Required bit."""
+    return {entry['region']: (entry['offset'], entry['length']) for entry in region_table}
+
+
+class TestCreateVhdxPinLayout(InstarTestBase):
+    """instar's dynamic VHDX lays its regions out where every pinned qemu-img does."""
+
+    def test_dynamic_131041m_block_1m_regions(self):
+        """`-o block_size=1M` at 131041M declares a 1 MiB BAT region at 2 MiB and metadata at 3 MiB.
+
+        131041 payload entries and 131040 // 4096 = 31 sector bitmap entries
+        make 131072 entries, exactly 1 MiB (SPEC(VHDX) 2.5). instar used to
+        count one bitmap entry more (#626), so it declared a 2 MiB BAT region
+        and put the metadata region 1 MiB later than qemu does. Only the
+        offsets and lengths are compared: instar writes the Required bit as 1
+        for both regions where qemu writes 0, which is a separate question.
+        """
+        case = 'vhdx-dynamic-131041M-block-1M'
+        with tempfile.TemporaryDirectory() as td:
+            got = qemu_pins.run_case(self.get_instar_binary(), case, Path(td))
+        self.assertEqual(0, got['rc'], got['stderr'])
+        self.assertNotIn('parse_error', got['summary'])
+        mib = 1024 * 1024
+        for table in ('region_table_1', 'region_table_2'):
+            self.assertEqual({'bat': (2 * mib, mib), 'metadata': (3 * mib, mib)},
+                             _region_layout(got['summary'][table]), f'instar {table}')
+        for group in qemu_pins.load_pin()['cases'][case]:
+            for table in ('region_table_1', 'region_table_2'):
+                self.assertEqual(_region_layout(group['result']['summary'][table]),
+                                 _region_layout(got['summary'][table]),
+                                 f'{table} differs from qemu-img {group["versions"][0]} to {group["versions"][-1]}')
 
 
 # Output name -> the extent qemu-img writes beside it (block/vmdk.c

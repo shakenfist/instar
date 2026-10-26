@@ -116,6 +116,7 @@ fn map_error(e: ResizeError) -> u32 {
         ResizeError::HeaderMismatch => ResizeResult::ERROR_HEADER_MISMATCH,
         ResizeError::ParseFailed => ResizeResult::ERROR_PARSE_FAILED,
         ResizeError::BitmapsPresent => ResizeResult::ERROR_BITMAPS_UNSUPPORTED,
+        ResizeError::FixedVhdx => ResizeResult::ERROR_FIXED_VHDX,
     }
 }
 
@@ -841,6 +842,7 @@ unsafe fn run_vhdx(
         logical_sector_size: metadata.logical_sector_size,
         physical_sector_size: metadata.physical_sector_size,
         has_parent: metadata.has_parent,
+        leave_blocks_allocated: metadata.leave_blocks_allocated,
         current_file_size: file_size_before,
     };
 

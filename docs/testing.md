@@ -256,6 +256,9 @@ surfaces totalling 114 tests:
   --shrink, invalid size strings, --preallocation=metadata on
   raw, --preallocation=falloc + --shrink, --object,
   --image-opts.
+- The differencing and fixed VHDX refusals, each on a scratch copy of
+  a qemu-written fixture that must come back byte-identical, and a
+  qemu-written dynamic VHDX that must still grow.
 
 Wall clock: ~32 s serial / ~10 s with `make test-container`'s
 `--concurrency 4`.
@@ -2770,8 +2773,8 @@ structure or contents the tests need to be exactly known:
   `block_state_zero=off`, where the `off` ones carry known data
   written with `qemu-io` (0x11 at 0 and 0x22 at 12M; 0x33 at 0 and
   0x44 in the last 64 KiB), and a dynamic VHDX of 131041M with 1 MiB
-  blocks, whose BAT exactly fills its region and which reproduces #626
-  in 8 MiB on disk. Each of the five must keep the structure of its
+  blocks, whose BAT exactly fills its region, the geometry #626 was
+  about, in 8 MiB on disk. Each of the five must keep the structure of its
   case in `tests/helpers/qemu_pins.py`, which
   `tests/test_vhdx_fixed_fixtures.py` checks. It takes two output
   directories, `create-vhd-testdata.sh [output-dir] [audit-dir]`,
@@ -2805,10 +2808,24 @@ generator wrote (needing neither qemu nor instar, since both would
 agree on an image whose writes never landed), then runs instar's
 read operations on them (and on some fixed and convert-built images
 made at test time) against `qemu-img`'s answers. Images at the 131041M
-geometry get only `info`, `check` and `map`, since a convert or compare
-would read 128 GiB. Its `KNOWN_READ_FAILURES` table lists the known
-failures by issue (#626, #797); a listed entry must still fail with its
-recorded message, and one that starts passing fails the test, asking
+geometry get only `info`, `check`, `map` and `measure`, since a full
+convert or compare would read 128 GiB; `measure` is compared on
+`fully-allocated` only, because instar and `qemu-img` count a VHDX
+source's allocation differently. The committed dynamic image at that
+geometry is also converted to qcow2, which walks its all-`ZERO` BAT
+without reading 128 GiB. A fixed `block_state_zero=off` image of
+4608.5M with 1 MiB blocks, whose partial last block lies past the first
+chunk, gets the same four operations; `qemu-img` cannot open it (see
+"VHDX partial last block past the first chunk" in
+[quirks.md](quirks.md)), so its oracle is the size it was created with,
+and a separate test requires the host `qemu-img check` to keep exiting
+2 on it. The 17M fixture's partial last block is also checked cut short
+in the file and cut off at its start, both of which `check` must report
+as corrupt, and whole, where `check` must report the image as ending at
+the end of the file. Its `KNOWN_READ_FAILURES` table is empty, because
+instar reads every image there as `qemu-img` does; it is kept for the
+next regression, whose entry must still fail with its recorded message
+until the fix lands, and one that starts passing fails the test, asking
 for the entry to be removed.
 
 Most adversarial and CVE-reproducer image generation scripts live in

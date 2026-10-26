@@ -13,8 +13,8 @@ use resize::{
 };
 use shared::{le_u32, le_u64, write_le_u32, write_le_u64};
 use vhdx::{
-    parse_metadata_region, parse_region_table, VhdxHeader, HEADER1_OFFSET, HEADER2_OFFSET,
-    REGION_TABLE1_OFFSET,
+    parse_metadata_region, parse_region_table, VhdxHeader, FILE_PARAMETERS_LEAVE_BLOCKS_ALLOCATED,
+    HEADER1_OFFSET, HEADER2_OFFSET, REGION_TABLE1_OFFSET,
 };
 
 const VHDX_SCRATCH: usize = QCOW2_MAX_RESIZE_SCRATCH;
@@ -133,6 +133,7 @@ fn opts_from_image<'a>(
         logical_sector_size: metadata.logical_sector_size,
         physical_sector_size: metadata.physical_sector_size,
         has_parent: metadata.has_parent,
+        leave_blocks_allocated: metadata.leave_blocks_allocated,
         current_file_size: bytes.len() as u64,
     }
 }
@@ -173,6 +174,31 @@ fn metadata_only_grow_when_bat_fits() {
         [metadata.file_offset as usize..metadata.file_offset as usize + metadata.length as usize];
     let post = parse_metadata_region(metadata_bytes).expect("metadata");
     assert_eq!(post.virtual_disk_size, 2u64 << 30);
+}
+
+/// 131040 MiB to 131041 MiB at 1 MiB blocks grows in place.
+///
+/// The starting image's BAT region is 1 MiB, 131072 entries, and the
+/// grown disk needs 131041 payload entries plus 31 sector bitmap
+/// entries: exactly 131072. Counting a trailing bitmap entry as well
+/// (issue #626) needed 131073 and appended a relocated 2 MiB BAT.
+#[test]
+fn grow_to_131041_mib_keeps_a_1_mib_bat_in_place() {
+    const MIB: u64 = 1 << 20;
+    let bytes = build_starting_vhdx(131_040 * MIB, MIB as u32);
+    let opts = opts_from_image(&bytes, 131_041 * MIB, false);
+    assert_eq!(opts.current_bat_length as u64, MIB);
+    let mut scratch = vec![0u8; VHDX_SCRATCH];
+    let plan = plan_resize_vhdx(&opts, &mut scratch).expect("plan");
+    assert_eq!(plan.action, ResizeAction::Grow);
+    // MetadataAndHeaders: VDS + inactive header + active header, and
+    // no appended BAT.
+    assert_eq!(plan.patches().len(), 3);
+    assert_eq!(plan.total_file_size, bytes.len() as u64);
+    assert!(plan
+        .patches()
+        .iter()
+        .all(|p| !matches!(p, ResizePatch::Append { .. })));
 }
 
 /// The metadata region of an image, as a mutable slice.
@@ -363,6 +389,85 @@ fn rejects_an_image_whose_metadata_says_it_has_a_parent() {
         plan_resize_vhdx(&opts, &mut scratch).unwrap_err(),
         ResizeError::UnsupportedSubformat
     );
+}
+
+/// A starting image with the File Parameters `LeaveBlocksAllocated`
+/// flag set, the way qemu marks every fixed VHDX it writes. Only the
+/// flag differs from a dynamic image, so a refusal can only come from
+/// the flag.
+fn build_fixed_flagged_vhdx(virtual_size: u64, block_size: u32) -> Vec<u8> {
+    let mut bytes = build_starting_vhdx(virtual_size, block_size);
+    let region = metadata_region_mut(&mut bytes);
+    // File Parameters is item 0 at 0x10000; flags follow block size.
+    let flags = le_u32(region, 0x10004);
+    write_le_u32(
+        region,
+        0x10004,
+        flags | FILE_PARAMETERS_LEAVE_BLOCKS_ALLOCATED,
+    );
+    bytes
+}
+
+#[test]
+fn rejects_growing_a_fixed_image() {
+    let bytes = build_fixed_flagged_vhdx(1u64 << 30, 32 * 1024 * 1024);
+    let opts = opts_from_image(&bytes, 2u64 << 30, false);
+    assert!(opts.leave_blocks_allocated);
+    let mut scratch = vec![0u8; VHDX_SCRATCH];
+    assert_eq!(
+        plan_resize_vhdx(&opts, &mut scratch).unwrap_err(),
+        ResizeError::FixedVhdx
+    );
+}
+
+#[test]
+fn rejects_a_no_op_resize_of_a_fixed_image() {
+    let bytes = build_fixed_flagged_vhdx(1u64 << 30, 32 * 1024 * 1024);
+    let opts = opts_from_image(&bytes, 1u64 << 30, false);
+    let mut scratch = vec![0u8; VHDX_SCRATCH];
+    assert_eq!(
+        plan_resize_vhdx(&opts, &mut scratch).unwrap_err(),
+        ResizeError::FixedVhdx
+    );
+}
+
+#[test]
+fn rejects_shrinking_a_fixed_image() {
+    // With and without the shrink flag: the fixed-image refusal comes
+    // before either shrink refusal.
+    let bytes = build_fixed_flagged_vhdx(2u64 << 30, 32 * 1024 * 1024);
+    for allow_shrink in [false, true] {
+        let opts = opts_from_image(&bytes, 1u64 << 30, allow_shrink);
+        let mut scratch = vec![0u8; VHDX_SCRATCH];
+        assert_eq!(
+            plan_resize_vhdx(&opts, &mut scratch).unwrap_err(),
+            ResizeError::FixedVhdx,
+            "allow_shrink {allow_shrink}",
+        );
+    }
+}
+
+#[test]
+fn rejects_growing_a_fixed_image_past_its_bat() {
+    // The grow that would relocate the BAT is refused too, not only
+    // the in-place one.
+    let bytes = build_fixed_flagged_vhdx(1u64 << 30, 1 << 20);
+    let opts = opts_from_image(&bytes, 1u64 << 40, false);
+    let mut scratch = vec![0u8; VHDX_SCRATCH];
+    assert_eq!(
+        plan_resize_vhdx(&opts, &mut scratch).unwrap_err(),
+        ResizeError::FixedVhdx
+    );
+}
+
+#[test]
+fn a_dynamic_image_still_grows() {
+    let bytes = build_starting_vhdx(1u64 << 30, 32 * 1024 * 1024);
+    let opts = opts_from_image(&bytes, 2u64 << 30, false);
+    assert!(!opts.leave_blocks_allocated);
+    let mut scratch = vec![0u8; VHDX_SCRATCH];
+    let plan = plan_resize_vhdx(&opts, &mut scratch).expect("plan");
+    assert_eq!(plan.action, ResizeAction::Grow);
 }
 
 #[test]
