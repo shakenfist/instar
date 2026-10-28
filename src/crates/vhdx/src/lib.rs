@@ -234,9 +234,6 @@ pub const BAT_ENTRY_OFFSET_MASK: u64 = 0xFFFF_FFFF_FFF0_0000;
 /// Mask for extracting the state from a BAT entry (bits 0-2).
 pub const BAT_ENTRY_STATE_MASK: u64 = 0x07;
 
-/// Default block size (32 MiB, same as QEMU default).
-pub const DEFAULT_BLOCK_SIZE: u32 = 32 * 1024 * 1024;
-
 /// VHDX version we support (1).
 pub const VHDX_VERSION: u16 = 1;
 
@@ -4273,10 +4270,13 @@ mod tests {
     // BAT layout calculation tests
     // ====================================================================
 
+    /// The 32 MiB block size the BAT layout tests below use.
+    const BLOCK_32_MIB: u32 = 32 * 1024 * 1024;
+
     #[test]
     fn bat_layout_1gb_32mb_blocks() {
         let (total, chunk_ratio, payload_blocks) =
-            calculate_bat_layout(1024 * 1024 * 1024, DEFAULT_BLOCK_SIZE, 512, false).unwrap();
+            calculate_bat_layout(1024 * 1024 * 1024, BLOCK_32_MIB, 512, false).unwrap();
         assert_eq!(payload_blocks, 32); // 1GB / 32MB
         assert_eq!(chunk_ratio, 128); // (2^23 * 512) / 32MB
                                       // 32 + (32 - 1) / 128 = 32 + 0: the
@@ -4288,7 +4288,7 @@ mod tests {
         // 128 payload entries plus its bitmap entry, 96 of whose
         // payload entries the 1 GiB virtual disk never reaches.
         let (total, chunk_ratio, payload_blocks) =
-            calculate_bat_layout(1024 * 1024 * 1024, DEFAULT_BLOCK_SIZE, 512, true).unwrap();
+            calculate_bat_layout(1024 * 1024 * 1024, BLOCK_32_MIB, 512, true).unwrap();
         assert_eq!(payload_blocks, 32);
         assert_eq!(chunk_ratio, 128);
         assert_eq!(total, 129);
@@ -4297,8 +4297,7 @@ mod tests {
     #[test]
     fn bat_layout_4gb_32mb_blocks() {
         let (total, chunk_ratio, payload_blocks) =
-            calculate_bat_layout(4u64 * 1024 * 1024 * 1024, DEFAULT_BLOCK_SIZE, 512, false)
-                .unwrap();
+            calculate_bat_layout(4u64 * 1024 * 1024 * 1024, BLOCK_32_MIB, 512, false).unwrap();
         assert_eq!(payload_blocks, 128);
         assert_eq!(chunk_ratio, 128);
         // 128 + (128 - 1) / 128 = 128 + 0. The virtual disk is exactly
@@ -4312,7 +4311,7 @@ mod tests {
         // differ by that one entry, which the old no-parent rule of
         // `n + ceil(n / c)` used to count as well.
         let (total, _chunk_ratio, _payload_blocks) =
-            calculate_bat_layout(4u64 * 1024 * 1024 * 1024, DEFAULT_BLOCK_SIZE, 512, true).unwrap();
+            calculate_bat_layout(4u64 * 1024 * 1024 * 1024, BLOCK_32_MIB, 512, true).unwrap();
         assert_eq!(total, 129);
     }
 
@@ -5147,14 +5146,7 @@ mod tests {
     #[test]
     fn metadata_builder() {
         let mut buf = [0u8; 0x10000 + 64];
-        let written = build_metadata(
-            &mut buf,
-            DEFAULT_BLOCK_SIZE,
-            1024 * 1024 * 1024,
-            512,
-            4096,
-            false,
-        );
+        let written = build_metadata(&mut buf, BLOCK_32_MIB, 1024 * 1024 * 1024, 512, 4096, false);
         assert!(written > 0);
 
         // Check signature
@@ -5167,7 +5159,7 @@ mod tests {
 
         // Check block size at items area
         let bs = le_u32(&buf, 0x10000);
-        assert_eq!(bs, DEFAULT_BLOCK_SIZE);
+        assert_eq!(bs, BLOCK_32_MIB);
 
         // Check virtual disk size
         let vs = le_u64(&buf, 0x10000 + 8);

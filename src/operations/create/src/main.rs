@@ -565,32 +565,15 @@ fn vhdx_opts_from<'a>(
     };
     Ok(VhdxCreateOpts {
         virtual_size,
-        block_size: vhdx_block_size_from(config),
+        // 0 when the user gave no block size, which asks the layout for
+        // qemu's default for the size (`vhdx::default_block_size`: 8, 16,
+        // 32 or 64 MiB). The pre-flight check in `target_can_address`
+        // passes the same value to the same layout, so the two cannot
+        // disagree about the geometry.
+        block_size: config.block_size,
         backing,
         parent_data_write_guid,
     })
-}
-
-/// The block size a VHDX is created with when the user gives none.
-///
-/// instar has always used 32 MiB here, where qemu scales its default
-/// with the virtual size (`vhdx::default_block_size`). It is passed to
-/// the layout explicitly, rather than as the 0 that asks the layout for
-/// qemu's default, so that sizing the writer from `vhdx::layout` does
-/// not also change the bytes of every VHDX created without
-/// `block_size`.
-const VHDX_BLOCK_SIZE_WHEN_UNSET: u32 = 32 * 1024 * 1024;
-
-/// The VHDX block size `config` asks for, with
-/// [`VHDX_BLOCK_SIZE_WHEN_UNSET`] in place of an unset one. The planner
-/// and the pre-flight ceiling check both size from this, so they cannot
-/// disagree about the geometry.
-fn vhdx_block_size_from(config: &CreateConfig) -> u32 {
-    if config.block_size == 0 {
-        VHDX_BLOCK_SIZE_WHEN_UNSET
-    } else {
-        config.block_size
-    }
 }
 
 /// Pre-flight check: can the target format address `virtual_size`
@@ -684,11 +667,7 @@ fn target_can_address(target: ImageFormat, virtual_size: u64, config: &CreateCon
         // invalid option it is, rather than this gate reporting it as a
         // backing file too large for the target.
         ImageFormat::Vhdx => !matches!(
-            vhdx::layout(
-                virtual_size,
-                vhdx_block_size_from(config),
-                config.has_backing()
-            ),
+            vhdx::layout(virtual_size, config.block_size, config.has_backing()),
             Err(vhdx::LayoutError::TooLarge | vhdx::LayoutError::Overflow)
         ),
         // Any other target was already rejected by validate_create_args
@@ -1077,16 +1056,20 @@ pub unsafe extern "C" fn _start() -> u64 {
                 Ok(o) => o,
                 Err(code) => return fail_with(call_table, config.target_format, code),
             };
-            let unit = opts.block_size;
             match plan_vhdx(&opts, scratch) {
                 Ok(p) => {
                     // plan_vhdx records the size rounded up to 512 bytes,
                     // as qemu-img does, because VirtualDiskSize must be a
-                    // multiple of the logical sector size. The layout it
-                    // took that from cannot refuse here, having just
-                    // succeeded for the planner.
+                    // multiple of the logical sector size, and the block
+                    // size the layout resolved, which is qemu's default
+                    // for the size when none was given. Report both as
+                    // recorded. The layout cannot refuse here, having just
+                    // succeeded for the planner; neither value depends on
+                    // whether the image has a parent.
+                    let mut unit = opts.block_size;
                     if let Ok(geometry) = vhdx::layout(virtual_size, opts.block_size, false) {
                         recorded_virtual_size = geometry.virtual_size;
+                        unit = geometry.block_size;
                     }
                     (p, unit)
                 }

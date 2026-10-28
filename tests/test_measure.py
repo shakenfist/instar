@@ -1066,9 +1066,10 @@ class TestMeasureRoundTrip(TestMeasureSmoke):
         """Empty raw 64 MiB -> vpc (vhd): convert output in measure's predicted range."""
         self._size_round_trip('vpc', '64M', 64 * 1024 * 1024)
 
-    # vhdx default block_size is 32 MiB, so the smallest meaningful sizes are
-    # multiples of 32 MiB. Use 64 MiB (1 block), 128 MiB (2 blocks), 256 MiB
-    # (4 blocks) to avoid triggering block-size-alignment edge cases.
+    # vhdx's default block_size scales with the size, as qemu-img's does, and
+    # is 8 MiB at every size here, so 64 MiB (8 blocks), 128 MiB (16 blocks)
+    # and 256 MiB (32 blocks) are whole numbers of blocks, which avoids
+    # triggering block-size-alignment edge cases.
     def test_size_round_trip_vhdx_64m(self):
         """Empty raw 64 MiB -> vhdx: convert output in measure's predicted range."""
         self._size_round_trip('vhdx', '64M', 64 * 1024 * 1024)
@@ -1175,6 +1176,142 @@ class TestMeasureNewFormatRefusal(TestMeasureSmoke):
         self.assertGreater(data['required'], 0)
         self.assertGreater(data['fully-allocated'], 0)
 
+
+
+MIB = 1024 * 1024
+
+
+class TestMeasureVhdxDefaultBlockSize(InstarTestBase):
+    """measure -O vhdx with no block_size sizes in qemu-img's default block size for the source's size.
+
+    qemu-img uses 8 MiB up to 1 GiB and 16 MiB above it (a strict `>`, vhdx_co_create, qemu 7.0.0 block/vhdx.c), and
+    convert writes the same. For a scanned source the block size can only be chosen once the source's size is read,
+    and the scan counts the target blocks holding data in it, so a block size chosen too early miscounts and missizes
+    alike. Every VHDX here has a 1 MiB BAT region, so its payload starts at 4 MiB.
+    """
+
+    # Borrowed rather than inherited, so the smoke tests do not run twice.
+    run_instar_measure = TestMeasureSmoke.run_instar_measure
+
+    PAYLOAD_START = 4 * MIB
+    ABOVE_1_GIB = (1 << 30) + 512
+
+    def _measure(self, *args):
+        stdout, stderr, rc = self.run_instar_measure(*args, '-O', 'vhdx', '--output', 'json')
+        self.assertEqual(rc, 0, stderr)
+        m = json.loads(stdout)
+        return m['required'], m['fully-allocated']
+
+    def test_size_default_block_size(self):
+        """--size: 128 blocks of 8 MiB at 1 GiB, 65 of 16 MiB one sector above it."""
+        self.assertEqual((self.PAYLOAD_START, self.PAYLOAD_START + 128 * 8 * MIB), self._measure('--size', 1 << 30))
+        self.assertEqual((self.PAYLOAD_START, self.PAYLOAD_START + 65 * 16 * MIB),
+                         self._measure('--size', self.ABOVE_1_GIB))
+
+    def test_raw_source_default_block_size(self):
+        """A raw source counts as fully allocated: 65 blocks of 16 MiB one sector above 1 GiB."""
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / 'src.raw'
+            with open(src, 'wb') as f:
+                f.truncate(self.ABOVE_1_GIB)
+            expected = self.PAYLOAD_START + 65 * 16 * MIB
+            self.assertEqual((expected, expected), self._measure(str(src)))
+
+    def test_qcow2_source_matches_the_convert_output(self):
+        """A sparse qcow2 one sector above 1 GiB with data in three 16 MiB blocks measures what convert writes.
+
+        The data sits at 0, 100 MiB and the last sector, in blocks 0, 6 and 64 at 16 MiB. convert writes those three
+        blocks after the metadata, so the file is 4 MiB + 3 * 16 MiB, which is measure's required size. Counted in
+        8 MiB blocks, the required size would be 4 MiB + 3 * 8 MiB.
+        """
+        self._require_qemu_img()
+        with tempfile.TemporaryDirectory() as td:
+            raw = Path(td) / 'src.raw'
+            with open(raw, 'wb') as f:
+                f.truncate(self.ABOVE_1_GIB)
+                for offset in (0, 100 * MIB, self.ABOVE_1_GIB - 512):
+                    f.seek(offset)
+                    f.write(b'\x5a' * 512)
+            src = Path(td) / 'src.qcow2'
+            r = subprocess.run(['qemu-img', 'convert', '-f', 'raw', '-O', 'qcow2', str(raw), str(src)],
+                               capture_output=True, text=True, timeout=300)
+            self.assertEqual(r.returncode, 0, r.stderr)
+
+            required, fully_allocated = self._measure(str(src))
+            self.assertEqual(self.PAYLOAD_START + 3 * 16 * MIB, required)
+            self.assertEqual(self.PAYLOAD_START + 65 * 16 * MIB, fully_allocated)
+
+            out = Path(td) / 'out.vhdx'
+            _, stderr, rc = self.run_instar_convert(src, out, output_format='vhdx', timeout=300)
+            self.assertEqual(rc, 0, stderr)
+            self.assertEqual(required, out.stat().st_size)
+            r = subprocess.run(['qemu-img', 'info', '--output=json', str(out)],
+                               capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(16 * MIB, json.loads(r.stdout)['cluster-size'])
+
+
+class TestMeasureOtherTargetsUnchanged(InstarTestBase):
+    """Choosing the VHDX block size from the source's size changes no other target's answer.
+
+    The block size is resolved inside each source format's scan, which every target goes through. These are the
+    answers for qcow2, vmdk and vpc targets recorded before that change, for a source of each format measure scans
+    and for two --size values either side of 100 GiB. The --size values are what instar has always answered; the
+    source values depend on the fixture, which a hash mismatch skips.
+    """
+
+    # Borrowed rather than inherited, so the smoke tests do not run twice.
+    run_instar_measure = TestMeasureSmoke.run_instar_measure
+
+    SOURCES = ('raw-mbr-partitioned', 'cirros-qcow2', 'plaso-vmdk', 'hyperv-dynamic-vhd', 'qemu-vhdx')
+    SIZES = (1073742336, 214748364800)
+
+    # (target, source image id or --size value) -> (required, fully-allocated)
+    EXPECTED = {
+        ('qcow2', 1073742336): (458752, 1074266112),
+        ('qcow2', 214748364800): (33030144, 214781394944),
+        ('qcow2', 'cirros-qcow2'): (23527424, 117768192),
+        ('qcow2', 'hyperv-dynamic-vhd'): (21037056, 136386248704),
+        ('qcow2', 'plaso-vmdk'): (393216, 458752),
+        ('qcow2', 'qemu-vhdx'): (101056512, 1074135040),
+        ('qcow2', 'raw-mbr-partitioned'): (10813440, 10813440),
+        ('vmdk', 1073742336): (78848, 1073886208),
+        ('vmdk', 214748364800): (13143552, 214761508352),
+        ('vmdk', 'cirros-qcow2'): (23219200, 117459968),
+        ('vmdk', 'hyperv-dynamic-vhd'): (8350208, 136373561856),
+        ('vmdk', 'plaso-vmdk'): (78848, 144384),
+        ('vmdk', 'qemu-vhdx'): (100740096, 1073818624),
+        ('vmdk', 'raw-mbr-partitioned'): (10499072, 10499072),
+        ('vpc', 1073742336): (4608, 1076106240),
+        ('vpc', 214748364800): (411648, 214801205248),
+        ('vpc', 'cirros-qcow2'): (48248832, 117471744),
+        ('vpc', 'hyperv-dynamic-vhd'): (262144, 136398766080),
+        ('vpc', 'plaso-vmdk'): (2100224, 2100224),
+        ('vpc', 'qemu-vhdx'): (100691968, 1074008064),
+        ('vpc', 'raw-mbr-partitioned'): (10490880, 10490880),
+    }
+
+    def _measure(self, target, *args):
+        stdout, stderr, rc = self.run_instar_measure(*args, '-O', target, '--output', 'json', timeout=120)
+        self.assertEqual(rc, 0, stderr)
+        m = json.loads(stdout)
+        return m['required'], m['fully-allocated']
+
+    def test_size(self):
+        for target in ('qcow2', 'vmdk', 'vpc'):
+            for size in self.SIZES:
+                with self.subTest(target=target, size=size):
+                    self.assertEqual(self.EXPECTED[(target, size)], self._measure(target, '--size', size))
+
+    def test_sources(self):
+        for image_id in self.SOURCES:
+            image = self.get_image(image_id)
+            if not image.path.exists():
+                self.skipTest(f'image not found: {image.path}')
+            self.skip_if_hash_mismatch(image)
+            for target in ('qcow2', 'vmdk', 'vpc'):
+                with self.subTest(target=target, source=image_id):
+                    self.assertEqual(self.EXPECTED[(target, image_id)], self._measure(target, str(image.path)))
 
 
 class TestMeasureVhdxSizeLimit(InstarTestBase):

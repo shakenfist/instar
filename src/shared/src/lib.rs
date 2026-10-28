@@ -2821,15 +2821,16 @@ impl ConvertConfig {
         }
     }
 
-    /// Output block size in bytes for VHDX output.
-    /// Returns 32MB if unset or out of range.
-    pub fn output_block_size_vhdx(&self) -> u64 {
-        let v = self.output_block_size;
-        if v != 0 && v.is_power_of_two() && (1024 * 1024..=256 * 1024 * 1024).contains(&v) {
-            v as u64
-        } else {
-            32 * 1024 * 1024
-        }
+    /// Output block size in bytes for VHDX output, as the host sent it.
+    ///
+    /// 0 when unset, which `vhdx::layout` resolves to qemu's default
+    /// for the output's virtual size (8, 16, 32 or 64 MiB). A value
+    /// out of range is passed through rather than replaced: the host
+    /// refuses one before the guest starts, and the layout refuses it
+    /// again, so the guest never silently writes a block size nobody
+    /// asked for.
+    pub fn output_block_size_vhdx(&self) -> u32 {
+        self.output_block_size
     }
 
     /// Check if a passphrase was provided for AES decryption.

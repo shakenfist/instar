@@ -5079,7 +5079,8 @@ struct ConvertArgs {
     grain_size: u32,
 
     /// Output block size for VHD/VHDX in bytes.
-    /// Defaults: 2097152 (2MB) for VHD, 33554432 (32MB) for VHDX.
+    /// Defaults: 2097152 (2MB) for VHD; for VHDX, qemu's size-scaled
+    /// default (8MB up to 1GB, 16MB up to 100GB, 32MB up to 32TB, then 64MB).
     /// Must be a power of 2. Only valid with -O vpc or -O vhdx.
     #[arg(long, default_value = "0")]
     block_size: u32,
@@ -7388,7 +7389,9 @@ struct MeasureArgs {
 
     // --- per-target vhd / vhdx options ---
     /// vhd / vhdx block size in bytes. Power of two; vhd: [512 KiB, 2 GiB],
-    /// vhdx: [1 MiB, 256 MiB]. Default (when -O vpc): 2 MiB; default (when -O vhdx): 32 MiB.
+    /// vhdx: [1 MiB, 256 MiB]. Default (when -O vpc): 2 MiB; default (when -O vhdx):
+    /// qemu's, scaled with the size (8 MiB up to 1 GiB, 16 MiB up to 100 GiB,
+    /// 32 MiB up to 32 TiB, then 64 MiB).
     #[arg(long, default_value = "0")]
     block_size: u32,
 
@@ -7488,7 +7491,9 @@ struct CreateArgs {
     zeroed_grain: bool,
 
     /// vhd / vhdx block size in bytes. Power of two.
-    /// vhd default: 2 MiB; vhdx default: 32 MiB.
+    /// vhd default: 2 MiB; vhdx default: qemu's, scaled with the size
+    /// (8 MiB up to 1 GiB, 16 MiB up to 100 GiB, 32 MiB up to 32 TiB,
+    /// then 64 MiB).
     #[arg(long, default_value = "0")]
     block_size: u32,
 
@@ -13928,21 +13933,13 @@ fn check_vhdx_virtual_size(op: &str, virtual_size: u64) -> Result<(), String> {
     Ok(())
 }
 
-/// The VHDX output block size convert and dd use when none is given.
-///
-/// The guest substitutes 32 MiB for an unset block size
-/// (`ConvertConfig::output_block_size_vhdx`), and the output capacity
-/// must be sized for the block size the guest will actually write, so
-/// the host resolves an unset one the same way. qemu instead scales its
-/// default with the virtual size, which `vhdx::layout` applies when it
-/// is passed 0; that is not what the guest writes today.
-const VHDX_OUTPUT_BLOCK_SIZE_WHEN_UNSET: u32 = 32 * 1024 * 1024;
-
 /// Compute the output file capacity (with format-specific metadata
 /// headroom) for a given target format and output virtual size.
 ///
 /// `block_size` is the requested output block size, 0 when none was
-/// given. Only VHDX output reads it.
+/// given. Only VHDX output reads it, and passes it to `vhdx::layout`
+/// as it is: the guest writer does the same, so an unset block size
+/// resolves to the same qemu default for the size on both sides.
 fn compute_output_capacity(target_format: u32, vsize: u64, block_size: u32) -> u64 {
     let is_qcow2_output = target_format == 2;
     let is_vmdk_output = target_format == 3;
@@ -13950,11 +13947,6 @@ fn compute_output_capacity(target_format: u32, vsize: u64, block_size: u32) -> u
     let is_vhdx_output = target_format == 6;
     let is_structured_output = is_qcow2_output || is_vmdk_output || is_vhd_output || is_vhdx_output;
     if is_vhdx_output {
-        let block_size = if block_size == 0 {
-            VHDX_OUTPUT_BLOCK_SIZE_WHEN_UNSET
-        } else {
-            block_size
-        };
         // The largest file convert's packed writer produces: everything
         // up to the end of the metadata region, then every payload block
         // allocated (dd never skips a zero block), each a whole block
@@ -13974,9 +13966,10 @@ fn compute_output_capacity(target_format: u32, vsize: u64, block_size: u32) -> u
             // so the capacity is never used to hold an image; it only
             // needs to be some value. Keep a block-rounded estimate with a
             // fixed allowance for the structures before the payload, as
-            // for an unchecked size.
+            // for an unchecked size, rounded to qemu's default block for
+            // the size, which is never 0.
             Err(_) => {
-                let vhdx_block = u64::from(VHDX_OUTPUT_BLOCK_SIZE_WHEN_UNSET);
+                let vhdx_block = u64::from(vhdx::default_block_size(vsize));
                 vsize
                     .div_ceil(vhdx_block)
                     .saturating_mul(vhdx_block)
@@ -14383,7 +14376,7 @@ fn execute_convert(
     // Large clusters are processed in MAX_SECTOR_SIZE-sized chunks by
     // the guest, but the QCOW2 header parser limits at MAX_CLUSTER_SIZE.
     // VHD and VHDX report their block_size in cluster_size which can
-    // be much larger (e.g. 32MB for VHDX) — these formats use their
+    // be much larger (up to 256MB for VHDX) — these formats use their
     // own block_lookup path that handles large blocks correctly.
     for image in chain.images() {
         if matches!(image.format, ImageFormat::Vhd | ImageFormat::Vhdx) {
@@ -22644,12 +22637,12 @@ mod dd_format_tests {
 
     #[test]
     fn capacity_vhdx_is_the_layout_plus_every_block() {
-        // VHDX (format 6) with no block size: the 32 MiB the guest
-        // writes. Up to 1 GiB the BAT fits one 1 MiB region, so the
-        // payload starts at 4 MiB (1 MiB of header structures, 1 MiB
-        // log, 1 MiB BAT, 1 MiB metadata) and every block is a whole
-        // 32 MiB.
-        let block: u64 = 32 * MIB;
+        // VHDX (format 6) with no block size: qemu's default for the
+        // size, which the guest writes too, 8 MiB up to 1 GiB. The BAT
+        // fits one 1 MiB region, so the payload starts at 4 MiB (1 MiB of
+        // header structures, 1 MiB log, 1 MiB BAT, 1 MiB metadata) and
+        // every block is a whole 8 MiB.
+        let block: u64 = 8 * MIB;
 
         // 1 MiB input → one block.
         assert_eq!(compute_output_capacity(6, MIB, 0), 4 * MIB + block);
@@ -22663,16 +22656,35 @@ mod dd_format_tests {
             4 * MIB + 2 * block
         );
 
-        // An explicit 32 MiB is the same as none.
+        // An explicit 8 MiB is the same as none at this size.
+        assert_eq!(
+            compute_output_capacity(6, block + 1, 8 * MIB as u32),
+            4 * MIB + 2 * block
+        );
+
+        // An explicit 32 MiB block size sizes in 32 MiB blocks.
         assert_eq!(
             compute_output_capacity(6, block + 1, 32 * MIB as u32),
-            4 * MIB + 2 * block
+            4 * MIB + 32 * MIB
         );
 
         // An explicit 1 MiB block size sizes in 1 MiB blocks.
         assert_eq!(
             compute_output_capacity(6, block + 1, MIB as u32),
-            4 * MIB + 33 * MIB
+            4 * MIB + 9 * MIB
+        );
+    }
+
+    #[test]
+    fn capacity_vhdx_default_block_scales_with_the_size() {
+        // Above 1 GiB qemu's default is 16 MiB (a strict `>`,
+        // `vhdx_co_create`, qemu 7.0.0), so 1 GiB + 512 bytes is 65
+        // blocks of 16 MiB, where 8 MiB blocks would need 129.
+        let gib: u64 = 1024 * MIB;
+        assert_eq!(compute_output_capacity(6, gib, 0), 4 * MIB + 128 * 8 * MIB);
+        assert_eq!(
+            compute_output_capacity(6, gib + 512, 0),
+            4 * MIB + 65 * 16 * MIB
         );
     }
 
@@ -22699,17 +22711,17 @@ mod dd_format_tests {
     #[test]
     fn capacity_vhdx_falls_back_where_the_layout_refuses() {
         // Above the 64 TiB ceiling, or with a block size the layout
-        // refuses, the guest refuses too; the estimate is the
-        // block-rounded size plus a fixed 10 MiB.
-        let block: u64 = 32 * MIB;
+        // refuses, the guest refuses too; the estimate is the size
+        // rounded to qemu's default block for it, plus a fixed 10 MiB.
         let vsize: u64 = 65 * 1024 * 1024 * 1024 * MIB;
+        let block: u64 = 64 * MIB;
         assert_eq!(
             compute_output_capacity(6, vsize, MIB as u32),
             vsize.div_ceil(block) * block + 10 * MIB
         );
         assert_eq!(
             compute_output_capacity(6, MIB, 3 * MIB as u32),
-            block + 10 * MIB
+            8 * MIB + 10 * MIB
         );
     }
 

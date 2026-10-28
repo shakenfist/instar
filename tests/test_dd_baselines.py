@@ -28,14 +28,12 @@ PLAN-dd.md). For that case only ``instar dd`` exit 0 is asserted; the
 info comparison is skipped.
 
 Known writer divergences (``KNOWN_DD_DIVERGENCES``):
-  vhdx whole/windowed cases: instar uses a default block-size of 32 MiB
-  for all virtual sizes; qemu-img uses 8 MiB for small images (≤ 1 GiB
-  in older versions). The ``cluster-size`` field in the info JSON
-  therefore differs. This matches the pattern documented for 'create'
-  in ``KNOWN_WRITER_DIVERGENCES`` in ``test_create.py``. Cases listed
-  here are skipped rather than compared. Do NOT add new entries to this
-  dict to silence genuine regressions; add them only for pre-existing,
-  documented instar/qemu design differences.
+  none at present. Cases listed there are skipped rather than compared.
+  Do NOT add new entries to this dict to silence genuine regressions;
+  add them only for pre-existing, documented instar/qemu design
+  differences. The vhdx cases are compared like every other: instar dd
+  chooses qemu-img's size-scaled default block size (8 MiB up to 1 GiB),
+  so the ``cluster-size`` field in the info JSON matches.
 
 The whole class skips cleanly if the ``dd-info-json`` directory or
 ``version-map.json`` is absent (e.g. an instar-testdata checkout that
@@ -138,24 +136,7 @@ _FMT_SUFFIX = {
 # writer in a documented way. Each entry maps case_name to a reason the
 # test skips. Do NOT add new entries here to silence genuine regressions;
 # these cover only pre-existing, documented design differences.
-#
-# vhdx default block-size: instar uses 32 MiB for all virtual sizes;
-# qemu-img uses 8 MiB for small images (< ~31 GiB threshold). This is
-# the same divergence documented in KNOWN_WRITER_DIVERGENCES in
-# test_create.py for ('vhdx', '1M-default') etc. The cluster-size field
-# in qemu-img info therefore differs, so the normalised comparison fails.
-KNOWN_DD_DIVERGENCES = {
-    '1M-raw-whole-vhdx': (
-        'instar default vhdx block-size (32 MiB) differs from '
-        'qemu-img (8 MiB for small images); same divergence as '
-        'KNOWN_WRITER_DIVERGENCES in test_create.py'
-    ),
-    '1M-raw-bs1000-count3-vhdx': (
-        'instar default vhdx block-size (32 MiB) differs from '
-        'qemu-img (8 MiB for small images); same divergence as '
-        'KNOWN_WRITER_DIVERGENCES in test_create.py'
-    ),
-}
+KNOWN_DD_DIVERGENCES = {}
 
 
 # ---------------------------------------------------------------------------

@@ -2742,6 +2742,32 @@ mod vhdx_plan_tests {
         assert_eq!(items.virtual_disk_size, 1_073_742_336);
     }
 
+    /// A block size of 0 is qemu's default for the size
+    /// (`vhdx_co_create`, qemu 7.0.0): 8 MiB up to 1 GiB, then 16 MiB,
+    /// each threshold a strict `>`. The planner writes the resolved
+    /// value into the Block Size metadata item.
+    #[test]
+    fn plan_vhdx_block_size_0_is_qemus_default_for_the_size() {
+        for (virtual_size, block_size) in [
+            (1u64 << 30, 8 * 1024 * 1024),
+            ((1u64 << 30) + 512, 16 * 1024 * 1024),
+        ] {
+            let opts = VhdxCreateOpts {
+                block_size: 0,
+                ..default_opts(virtual_size)
+            };
+            let bytes = run(&opts);
+            let rt = &bytes
+                [vhdx::REGION_TABLE1_OFFSET as usize..vhdx::REGION_TABLE1_OFFSET as usize + 65536];
+            let ([_bat, metadata], _count) =
+                vhdx::parse_region_table(rt).expect("parse region table");
+            let start = metadata.file_offset as usize;
+            let region = &bytes[start..start + metadata.length as usize];
+            let items = vhdx::parse_metadata_region(region).expect("parse metadata region");
+            assert_eq!(items.block_size, block_size, "virtual size {virtual_size}");
+        }
+    }
+
     /// 64 TiB is the largest image qemu creates (`vhdx_co_create`,
     /// qemu 7.0.0, a strict `>` on the rounded size), so one sector
     /// more is refused as a size the format cannot hold.

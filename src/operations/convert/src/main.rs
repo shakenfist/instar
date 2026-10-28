@@ -4396,7 +4396,8 @@ unsafe fn convert_to_vhdx(
     aes_key: Option<&[u8; 16]>,
     luks_key: Option<&[u8]>,
     luks_sector_size: u64,
-    block_size: u64,
+    // 0 asks the layout for qemu's default for `declared_size`.
+    block_size: u32,
     bytes_read: &mut u64,
     layout: &ScratchLayout,
 ) -> u64 {
@@ -4416,10 +4417,7 @@ unsafe fn convert_to_vhdx(
     // The layout never declares a BAT region shorter than 1 MiB, which
     // is what an empty window (declared_size == 0, so zero BAT entries)
     // needs: see `vhdx::layout` for why that is not qemu's own answer.
-    let geometry = match u32::try_from(block_size)
-        .map_err(|_| vhdx::LayoutError::InvalidBlockSize)
-        .and_then(|bs| vhdx::layout(declared_size, bs, false))
-    {
+    let geometry = match vhdx::layout(declared_size, block_size, false) {
         Ok(g) => g,
         Err(e) => {
             // The device field of an error message carries at most 32
@@ -4436,8 +4434,9 @@ unsafe fn convert_to_vhdx(
             return *bytes_read;
         }
     };
-    // From here on the block size is the one the layout resolved, which
-    // is the caller's whenever the caller passed one.
+    // From here on the block size is the one the layout resolved: the
+    // caller's whenever the caller passed one, and otherwise qemu's
+    // default for the declared size.
     let block_size = u64::from(geometry.block_size);
     let declared_size = geometry.virtual_size;
     let logical_sector_size = geometry.logical_sector_size;

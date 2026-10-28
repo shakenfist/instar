@@ -1245,15 +1245,27 @@ field. Future work: drop the accept-ignore and emit the zstd
 header bit so a subsequent convert / write into the image can
 emit zstd-compressed clusters.
 
-### vhdx default `block_size` differs from qemu-img
+### vhdx default `block_size` scales with the size, as qemu-img's does
 
-At virtual sizes ≤ 1 GiB, `instar create -f vhdx` defaults to
-an 8 MiB block size; `qemu-img create -f vhdx` always defaults
-to 32 MiB. Specifying `-o block_size=...` (or `--block-size`)
-explicitly avoids the divergence — the matrix
-demonstrates clean round-trip for explicit block-size cases
-(`1G-block-16M`, `1G-block-32M`). Future work is to match
-qemu's 32 MiB default at all virtual sizes.
+With no `-o block_size` (or `--block-size`), `instar create -f vhdx`,
+`convert -O vhdx`, `dd -O vhdx` and `measure -O vhdx` choose the block
+size qemu-img does, from the virtual size rounded up to 512 bytes, each
+threshold a strict `>` (`vhdx_co_create`, qemu 7.0.0 `block/vhdx.c`):
+
+| Virtual size | Block size |
+|--------------|------------|
+| up to 1 GiB | 8 MiB |
+| above 1 GiB, up to 100 GiB | 16 MiB |
+| above 100 GiB, up to 32 TiB | 32 MiB |
+| above 32 TiB, up to the 64 TiB limit | 64 MiB |
+
+`tests/golden/qemu-create-pins.json` records each side of every threshold
+on all 80 pinned qemu-img builds (6.0.0 to 10.2.0), and every build
+agrees. instar used 32 MiB at every size until #645, so a VHDX it wrote
+then has larger blocks than qemu-img would give it below 100 GiB, and
+smaller ones above 32 TiB. Both are valid; only `qemu-img info`'s
+`cluster-size` shows the difference. `measure -O vhdx` of a source image
+chooses from the source's virtual size, as `convert` does.
 
 ### A VHDX is at most 64 TiB, and its size is a multiple of 512
 
@@ -4495,7 +4507,8 @@ the host resolves when it walks the chain for them; see
 
 **A child's block size is independent of its parent's, deliberately.**
 instar gives a differencing child the same defaults as any other new
-image — 2 MiB blocks for VHD, 32 MiB for VHDX — rather than inheriting
+image — 2 MiB blocks for VHD, and for VHDX qemu-img's default for the
+virtual size (8 MiB up to 1 GiB) — rather than inheriting
 the parent's, and for VHDX the chunk ratio can differ too. This is
 legal and it is what Hyper-V tolerates: composition resolves a read by
 *virtual offset*, not by block index, so the two images need only agree

@@ -462,6 +462,21 @@ The management session runs the steps in order. Every step edits
   measure failure (checked against the `6bafd318` build). 4
   `test_convert` failures at load averages of 28 to 40 all passed when
   replayed alone.
+* **5d.** The management session confirmed `instar info` and the host
+  `qemu-img info` agree on `cluster-size` at all seven sizes of the
+  survey's table, for images instar created with no block size.
+  `measure` resolves its unit once: `detect_and_scan` returns it with
+  the summary, from each format arm's virtual size, or from the
+  override for `--size`. That one value feeds the calculator and the
+  report, and it is 0 for raw and a fixed VHD target exactly as before.
+  21 `measure` answers for the qcow2, vmdk and vpc targets, recorded
+  with a build of `b924aa34`, are unchanged and now pinned. The
+  convert test checks `cluster-size` only, not `virtual-size`, because
+  a raw source that is not a multiple of 64 KiB is rounded (#821). The
+  create test runs all nine dynamic pin cases. measure's guest binary
+  grew from 38048 to 39384 bytes. 8 `test_convert` failures (qcow2
+  re-encodes) passed when replayed alone. `test_differencing` ran with
+  libvhdi present and `INSTAR_REQUIRE_LIBVHDI=1`.
 
 ## Risks and mitigations
 
@@ -520,8 +535,9 @@ worktree's build, and its expected result.
   test_create as c, test_dd_baselines as d; print([k for k in
   c.KNOWN_WRITER_DIVERGENCES if k[0] == 'vhdx'], [k for k in
   d.KNOWN_DD_DIVERGENCES if k.endswith('-vhdx')])"` prints `[] []`.
-* `git grep -nE '8 MiB vs qemu 32|instar uses 32 MiB|emits 32 MiB data blocks|always defaults *to 32 MiB' -- docs tests scripts`
-  prints nothing.
+* `git grep -nE '8 MiB vs qemu 32|instar uses 32 MiB|emits 32 MiB data blocks|always defaults *to 32 MiB' -- docs tests scripts ':!docs/plans'`
+  prints nothing. (`docs/plans` is excluded because this plan quotes
+  the phrases; the first version of this item did not exclude it.)
 * `make test-rust` and `make check-binary-sizes` pass.
 * The stestr run of `test_create`, `test_convert`, `test_measure`,
   `test_dd_baselines`, `test_resize`, `test_vhdx_fixed_fixtures`,

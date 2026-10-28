@@ -942,20 +942,13 @@ fn measure_vhd_dynamic(s: &AllocationSummary, block_size: u64) -> MeasureResult 
 // ---------------------------------------------------------------------------
 
 /// Options for a VHDX output image.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct VhdxOpts {
     /// Block size in bytes: a power of two in `[1 MiB, 256 MiB]`, or 0 for
     /// qemu's default for the size (`vhdx::default_block_size`).
-    /// Default: 32 MiB.
+    /// Default: 0, because qemu's default depends on the virtual size,
+    /// which options alone do not know.
     pub block_size: u32,
-}
-
-impl Default for VhdxOpts {
-    fn default() -> Self {
-        Self {
-            block_size: 32 * 1024 * 1024,
-        }
-    }
 }
 
 /// Measure a VHDX output image.
@@ -2839,6 +2832,33 @@ mod tests {
     //   payload_start   = 2 MiB + bat_region + metadata_region
 
     #[test]
+    fn vhdx_block_size_0_is_qemus_default_for_the_size() {
+        // 1025 MiB is above qemu's 1 GiB threshold, so block size 0 is
+        // 16 MiB (`vhdx_co_create`, qemu 7.0.0): 65 payload blocks, where
+        // 8 MiB would need 129 and 32 MiB 33, one BAT region of 1 MiB,
+        // and a payload start of 4 MiB.
+        let s = AllocationSummary {
+            virtual_size: 1025 * MIB,
+            allocated_bytes: 1025 * MIB,
+            target_units_with_data: 0,
+        };
+        let expected = Ok(MeasureOutput {
+            required: 4 * MIB + 65 * 16 * MIB,
+            fully_allocated: 4 * MIB + 65 * 16 * MIB,
+        });
+        assert_eq!(measure_vhdx(&s, &VhdxOpts::default()), expected);
+        assert_eq!(
+            measure_vhdx(
+                &s,
+                &VhdxOpts {
+                    block_size: 16 * MIB as u32
+                }
+            ),
+            expected
+        );
+    }
+
+    #[test]
     fn vhdx_1gib_32mib_block_empty() {
         // virtual_size = 1 GiB, block_size = 32 MiB, allocated = 0
         //
@@ -3245,7 +3265,7 @@ mod tests {
                 "vhd R<=F vs={vs} alloc={alloc}"
             );
 
-            // vhdx (default opts: 32 MiB block)
+            // vhdx (default opts: qemu's default block size for vs)
             let m = measure_vhdx(&s, &VhdxOpts::default())
                 .unwrap_or_else(|e| panic!("vhdx vs={vs} alloc={alloc}: {e:?}"));
             assert!(

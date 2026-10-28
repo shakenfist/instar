@@ -365,6 +365,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **A VHDX written with no block size uses qemu-img's default for its
+  size**: 8 MiB up to 1 GiB, 16 MiB up to 100 GiB, 32 MiB up to 32 TiB,
+  then 64 MiB, each threshold a strict `>`
+  ([#645](https://github.com/shakenfist/instar/issues/645)). `create`,
+  `convert` and `dd` used 32 MiB at every size, so their output differed
+  from qemu-img's below 100 GiB and above 32 TiB, and `measure -O vhdx`
+  predicted 32 MiB blocks. A smaller image now has smaller blocks, and
+  `qemu-img info` reports the same `cluster-size` for instar's VHDX as
+  for qemu-img's. An explicit `-o block_size` or `--block-size` is
+  unchanged.
+
 - **The chain config is version 4.** An external data file device now
   carries `FLAG_DATA_DEVICE` (bit 31), set only by the host, and is
   never treated as a layer.

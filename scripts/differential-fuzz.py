@@ -1584,7 +1584,9 @@ def _create_option_picker(rng):
         vhd target entirely        (CHS-geometry rounding divergence)
         qcow2 compat=0.10          (instar hardcodes compat=1.1)
         compression_type=zstd      (instar accept-ignores; emits zlib)
-        vhdx default block_size    (instar 8 MiB vs qemu 32 MiB at <= 1 GiB)
+
+    The vhdx block size is drawn from no block_size (qemu's size-scaled
+    default, which instar matches) as well as explicit values.
     """
     target = rng.choice(['qcow2', 'vmdk', 'vhdx', 'raw'])
 
@@ -1637,11 +1639,11 @@ def _create_option_picker(rng):
         return target, size, [f'subformat={subformat}']
 
     if target == 'vhdx':
-        # block_size always explicit — instar's default diverges from
-        # qemu's at virtual sizes <= 1 GiB.
-        bs = rng.choice(['16M', '32M'])
+        # None leaves block_size unset, so both tools choose their default
+        # for the size.
+        bs = rng.choice([None, '16M', '32M'])
         size = rng.choice(['64M', '256M', '1G'])
-        return target, size, [f'block_size={bs}']
+        return target, size, [f'block_size={bs}'] if bs else []
 
     # raw
     size = rng.choice(['1M', '16M', '64M', '256M'])
