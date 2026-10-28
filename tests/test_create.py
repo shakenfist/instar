@@ -24,6 +24,7 @@ from pathlib import Path
 
 from base import InstarTestBase
 from helpers import qemu_pins
+from helpers import vhdx_structure
 from helpers.info_json import assert_info_equivalent
 
 # ----------------------------------------------------------------------
@@ -1788,6 +1789,176 @@ class TestCreateVhdxPinLayout(InstarTestBase):
                                  f'{table} differs from qemu-img {group["versions"][0]} to {group["versions"][-1]}')
 
 
+class TestCreateVhdxDefaultBlockSize(InstarTestBase):
+    """With no block_size, instar chooses the block size qemu-img does, and so lays its regions out the same way.
+
+    qemu's default scales with the virtual size: 8 MiB up to 1 GiB, 16 MiB up to 100 GiB, 32 MiB up to 32 TiB and
+    64 MiB up to the 64 TiB limit, each threshold a strict `>` (vhdx_co_create, qemu 7.0.0 block/vhdx.c). Each case is
+    compared with the pin, which every pinned qemu-img agrees on, not with the host qemu-img. Every image is sparse
+    and dynamic; the largest file is the 64 TiB image's 12 MiB of metadata. Only offsets, lengths and the block size
+    are compared: instar writes the Required bit and the physical sector size differently from qemu, which are
+    separate questions.
+    """
+
+    # Borrowed rather than inherited, so the smoke tests do not run twice.
+    run_instar_create = TestCreateSmoke.run_instar_create
+
+    # Each side of every threshold, the 64 TiB limit, and the two other dynamic pin cases with no block_size.
+    PIN_CASES = (
+        'vhdx-dynamic-64M',
+        'vhdx-dynamic-1024M',
+        'vhdx-dynamic-1025M',
+        'vhdx-dynamic-102400M',
+        'vhdx-dynamic-102401M',
+        'vhdx-dynamic-4161792M',
+        'vhdx-dynamic-33554432M',
+        'vhdx-dynamic-33554433M',
+        'vhdx-dynamic-64T',
+    )
+
+    # One sector above each threshold, which the pin does not hold, with the pin case one MiB above it. The block
+    # size is the same on both, and so is the payload block count, because 512 bytes and 1 MiB above a threshold
+    # both add one partial block at the new block size; so the BAT, and the metadata region after it, are too.
+    ONE_SECTOR_ABOVE = (
+        (1073742336, 'vhdx-dynamic-1025M', 16 * 1024 * 1024),
+        (107374182912, 'vhdx-dynamic-102401M', 32 * 1024 * 1024),
+        (35184372089344, 'vhdx-dynamic-33554433M', 64 * 1024 * 1024),
+    )
+
+    def _assert_matches_pin(self, summary, case):
+        want = qemu_pins.expected(case)['summary']
+        self.assertEqual(want['block_size'], summary['block_size'], f'block size against {case}')
+        for table in ('region_table_1', 'region_table_2'):
+            self.assertEqual(_region_layout(want[table]), _region_layout(summary[table]), f'{table} against {case}')
+
+    def test_pin_cases(self):
+        for case in self.PIN_CASES:
+            with self.subTest(case=case):
+                with tempfile.TemporaryDirectory() as td:
+                    got = qemu_pins.run_case(self.get_instar_binary(), case, Path(td))
+                self.assertEqual(0, got['rc'], got['stderr'])
+                self.assertNotIn('parse_error', got['summary'])
+                self._assert_matches_pin(got['summary'], case)
+
+    def test_one_sector_above_each_threshold(self):
+        for size, case, block_size in self.ONE_SECTOR_ABOVE:
+            with self.subTest(size=size):
+                with tempfile.TemporaryDirectory() as td:
+                    path = Path(td) / 't.vhdx'
+                    stdout, stderr, rc = self.run_instar_create('-f', 'vhdx', str(path), str(size))
+                    self.assertEqual(rc, 0, stderr)
+                    self.assertIn(f'unit_size={block_size})', stdout)
+                    summary = vhdx_structure.summarise(vhdx_structure.parse_vhdx(path))
+                self.assertEqual(size, summary['virtual_disk_size'])
+                self.assertEqual(block_size, summary['block_size'])
+                self._assert_matches_pin(summary, case)
+
+
+# The largest VHDX qemu-img creates (VHDX_MAX_IMAGE_SIZE, refused with a strict `>` in vhdx_co_create, qemu 7.0.0
+# block/vhdx.c), and the message instar refuses a larger one with.
+VHDX_MAX_VIRTUAL_SIZE = 64 << 40
+VHDX_CEILING_MESSAGE = f'exceeds the VHDX maximum of 64 TiB ({VHDX_MAX_VIRTUAL_SIZE} bytes)'
+
+
+class TestCreateVhdxSizeLimits(InstarTestBase):
+    """The 64 TiB VHDX ceiling and the 512-byte rounding of a VHDX's size.
+
+    qemu-img refuses to create a VHDX above 64 TiB but opens one, so
+    instar's readers have no ceiling and its writers do. Every size here
+    stays sparse: the largest file is the 64 TiB image's metadata.
+    """
+
+    # Borrowed rather than inherited, so the smoke tests do not run twice.
+    run_instar_create = TestCreateSmoke.run_instar_create
+    run_instar_info = TestCreateSmoke.run_instar_info
+
+    def _assert_refused_without_a_file(self, size):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 't.vhdx'
+            stdout, stderr, rc = self.run_instar_create('-f', 'vhdx', str(path), str(size))
+            self.assertNotEqual(rc, 0, f'stdout={stdout!r}')
+            self.assertIn(f'create: virtual size {size} {VHDX_CEILING_MESSAGE}', stderr)
+            # qemu-img leaves an empty file behind here; instar refuses
+            # before it opens the output.
+            self.assertFalse(path.exists(), 'a refused create left a file behind')
+
+    def test_64_tib_is_created(self):
+        """64 TiB is the largest size accepted, and the image stays sparse."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 't.vhdx'
+            _, stderr, rc = self.run_instar_create('-f', 'vhdx', str(path), str(VHDX_MAX_VIRTUAL_SIZE))
+            self.assertEqual(rc, 0, stderr)
+            self.assertLess(path.stat().st_size, 32 * 1024 * 1024)
+            stdout, stderr, rc = self.run_instar_info(path, output='json')
+            self.assertEqual(rc, 0, stderr)
+            self.assertEqual(json.loads(stdout)['virtual-size'], VHDX_MAX_VIRTUAL_SIZE)
+
+    def test_one_byte_above_64_tib_is_refused(self):
+        """64 TiB + 1 rounds up to 64 TiB + 512, above the ceiling."""
+        self._assert_refused_without_a_file(VHDX_MAX_VIRTUAL_SIZE + 1)
+
+    def test_one_sector_above_64_tib_is_refused(self):
+        self._assert_refused_without_a_file(VHDX_MAX_VIRTUAL_SIZE + 512)
+
+    def _patched_65_tib_parent(self, td):
+        """A dynamic 64 TiB VHDX whose VirtualDiskSize claims 65 TiB.
+
+        64 MiB blocks leave its BAT region room for 65 TiB of entries.
+        """
+        path = Path(td) / 'parent.vhdx'
+        _, stderr, rc = self.run_instar_create(
+            '-f', 'vhdx', '-o', 'block_size=64M', str(path), str(VHDX_MAX_VIRTUAL_SIZE))
+        self.assertEqual(rc, 0, stderr)
+        vhdx_structure.patch_virtual_disk_size(path, 65 << 40)
+        return path
+
+    def test_readers_open_a_vhdx_above_64_tib(self):
+        """info and check read a 65 TiB VHDX, as qemu-img opens one it would not create."""
+        with tempfile.TemporaryDirectory() as td:
+            path = self._patched_65_tib_parent(td)
+            stdout, stderr, rc = self.run_instar_info(path, output='json')
+            self.assertEqual(rc, 0, stderr)
+            self.assertEqual(json.loads(stdout)['virtual-size'], 65 << 40)
+            stdout, stderr, rc = self.run_instar_check(path)
+            self.assertEqual(rc, 0, f'stdout={stdout!r} stderr={stderr!r}')
+
+    def test_child_of_a_parent_above_64_tib_is_refused(self):
+        """A size taken from `-b` is refused in the guest, and names the ceiling."""
+        with tempfile.TemporaryDirectory() as td:
+            parent = self._patched_65_tib_parent(td)
+            child = Path(td) / 'child.vhdx'
+            _, stderr, rc = self.run_instar_create('-f', 'vhdx', '-b', str(parent), '-F', 'vhdx', str(child))
+            self.assertNotEqual(rc, 0)
+            self.assertIn(f"backing file's virtual size {VHDX_CEILING_MESSAGE}", stderr)
+            self.assertFalse(child.exists(), 'a refused create left a file behind')
+
+    ODD_SIZE = 1073741825
+    ROUNDED_SIZE = 1073742336
+
+    def test_odd_size_is_rounded_up_to_512(self):
+        """VirtualDiskSize must be a multiple of the logical sector size, so it is rounded up, as qemu-img does."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 't.vhdx'
+            stdout, stderr, rc = self.run_instar_create('-f', 'vhdx', str(path), str(self.ODD_SIZE))
+            self.assertEqual(rc, 0, stderr)
+            self.assertIn(f'virtual_size={self.ROUNDED_SIZE}', stdout)
+            self.assertEqual(vhdx_structure.parse_vhdx(path).virtual_disk_size, self.ROUNDED_SIZE)
+            stdout, stderr, rc = self.run_instar_info(path, output='json')
+            self.assertEqual(rc, 0, stderr)
+            self.assertEqual(json.loads(stdout)['virtual-size'], self.ROUNDED_SIZE)
+
+    def test_odd_size_rounding_matches_qemu_img_info(self):
+        self._require_qemu_img()
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 't.vhdx'
+            _, stderr, rc = self.run_instar_create('-f', 'vhdx', str(path), str(self.ODD_SIZE))
+            self.assertEqual(rc, 0, stderr)
+            r = subprocess.run(['qemu-img', 'info', '--output=json', str(path)],
+                               capture_output=True, text=True, timeout=30)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(json.loads(r.stdout)['virtual-size'], self.ROUNDED_SIZE)
+
+
 # Output name -> the extent qemu-img writes beside it (block/vmdk.c
 # filename_decompose and the "%s-flat%s" format).
 FLAT_CREATE_EXTENT_NAMES = (
@@ -2143,12 +2314,6 @@ KNOWN_WRITER_DIVERGENCES = {
     ('qcow2', '1G-compat-v2'): 'instar hardcodes compat=1.1',
     # qcow2: compression_type=zstd is accept-ignored, header records zlib.
     ('qcow2', '1G-zstd'): 'instar accept-ignores compression_type=zstd',
-    # vhdx: default block_size differs (instar 8 MiB vs qemu 32 MiB) for
-    # virtual sizes ≤ 1 GiB. Explicit block_size cases (1G-block-16M,
-    # 1G-block-32M) round-trip correctly.
-    ('vhdx', '1M-default'):  'instar default block_size differs from qemu',
-    ('vhdx', '64M-default'): 'instar default block_size differs from qemu',
-    ('vhdx', '1G-default'):  'instar default block_size differs from qemu',
     # vhd: qemu-img rounds virtual_size up to the next CHS-aligned
     # multiple (legacy geometry layout); instar uses the exact byte
     # count. Both files are valid VHDs but report different

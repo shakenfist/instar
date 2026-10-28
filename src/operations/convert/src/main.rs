@@ -4396,15 +4396,14 @@ unsafe fn convert_to_vhdx(
     aes_key: Option<&[u8; 16]>,
     luks_key: Option<&[u8]>,
     luks_sector_size: u64,
-    block_size: u64,
+    // 0 asks the layout for qemu's default for `declared_size`.
+    block_size: u32,
     bytes_read: &mut u64,
     layout: &ScratchLayout,
 ) -> u64 {
     let oss = (call_table.get_output_sector_size)();
     let oc = (call_table.get_output_capacity)();
     let progress_interval = (call_table.get_progress_interval)();
-    let logical_sector_size: u32 = 512;
-    let physical_sector_size: u32 = 4096;
 
     // has_parent = false: this writer flattens its input into a
     // self-contained dynamic VHDX. It emits no parent locator and
@@ -4412,42 +4411,49 @@ unsafe fn convert_to_vhdx(
     // the BAT it sizes must be the no-parent one -- a padded BAT here
     // would declare a region holding sector bitmap entries that
     // nothing ever writes or reads.
-    let (total_bat_entries, chunk_ratio, total_payload_blocks) = match vhdx::calculate_bat_layout(
-        declared_size,
-        block_size as u32,
-        logical_sector_size,
-        false,
-    ) {
-        Some(v) => v,
-        None => {
-            (call_table.send_error)(
-                b"convert\0".as_ptr(),
-                b"VHDX BAT layout overflow\0".as_ptr(),
-                0,
-                1,
-            );
-            return 1;
+    //
+    // Every offset, region length and sector size below comes from the
+    // one writer layout, which `create` and `measure` size from too.
+    // The layout never declares a BAT region shorter than 1 MiB, which
+    // is what an empty window (declared_size == 0, so zero BAT entries)
+    // needs: see `vhdx::layout` for why that is not qemu's own answer.
+    let geometry = match vhdx::layout(declared_size, block_size, false) {
+        Ok(g) => g,
+        Err(e) => {
+            // The device field of an error message carries at most 32
+            // characters, so each of these fits it.
+            let reason: &[u8] = match e {
+                vhdx::LayoutError::InvalidBlockSize => b"VHDX block size invalid\0",
+                vhdx::LayoutError::TooLarge => b"VHDX size above 64 TiB\0",
+                vhdx::LayoutError::Overflow => b"VHDX layout overflow\0",
+            };
+            (call_table.send_error)(b"convert\0".as_ptr(), reason.as_ptr(), 0, 1);
+            // Without a failed completion the host treats the run as a
+            // success and keeps an empty output file.
+            (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+            return *bytes_read;
         }
     };
+    // From here on the block size is the one the layout resolved: the
+    // caller's whenever the caller passed one, and otherwise qemu's
+    // default for the declared size.
+    let block_size = u64::from(geometry.block_size);
+    let declared_size = geometry.virtual_size;
+    let logical_sector_size = geometry.logical_sector_size;
+    let physical_sector_size = geometry.physical_sector_size;
+    let chunk_ratio = geometry.chunk_ratio;
+    let total_payload_blocks = geometry.payload_blocks;
 
-    // Layout offsets (all 1MB-aligned per VHDX spec)
-    let file_id_offset: u64 = 0; // 64KB
-    let _header1_offset: u64 = 0x10000; // 64KB
-    let _header2_offset: u64 = 0x20000; // 64KB
-    let _rt1_offset: u64 = 0x30000; // 64KB
-    let _rt2_offset: u64 = 0x40000; // 64KB
-    let log_offset: u64 = 0x10_0000; // 1MB
-    let bat_offset: u64 = 0x20_0000; // 2MB
-    let bat_size_bytes = total_bat_entries as u64 * 8;
-    // The BAT region must be a whole number of 1MB regions, and at least one
-    // (an empty window, declared_size == 0, yields zero BAT entries; a
-    // zero-length BAT region is invalid and makes qemu reject the file, so
-    // floor it to a single 1MB region — qemu's own count=0 VHDX is likewise a
-    // valid header-only image).
-    let bat_region_size = align_up(bat_size_bytes, vhdx::MB_ALIGN as usize).max(vhdx::MB_ALIGN);
-    let metadata_offset = bat_offset + bat_region_size;
-    let metadata_region_size = vhdx::MB_ALIGN; // 1MB
-    let payload_start = metadata_offset + metadata_region_size;
+    // Region offsets. The file identifier, headers and region tables
+    // before the log sit at the vhdx crate's fixed offsets.
+    let file_id_offset: u64 = 0;
+    let log_offset = geometry.log_offset;
+    let bat_offset = geometry.bat_offset;
+    let bat_size_bytes = u64::from(geometry.bat_entries) * 8;
+    let bat_region_size = u64::from(geometry.bat_region_len);
+    let metadata_offset = geometry.metadata_offset;
+    let metadata_region_size = u64::from(geometry.metadata_region_len);
+    let payload_start = geometry.data_start;
 
     // BAT buffer — allocate after dynamic input caches + staging buffer
     let bat_buf_addr = layout.staging_buf_addr(input_device_count) + MAX_CLUSTER_SIZE;

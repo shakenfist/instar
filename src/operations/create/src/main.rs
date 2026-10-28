@@ -552,10 +552,11 @@ fn vhdx_opts_from<'a>(
     identity: ParentIdentity,
 ) -> Result<VhdxCreateOpts<'a>, u32> {
     // A vhdx child records its parent's active-header `DataWriteGuid`
-    // as its own `parent_linkage`. With no backing file the planner
+    // as its own `parent_linkage`, because that GUID is what a reader
+    // checks to confirm the parent has not changed since the child was
+    // made (SPEC(VHDX) 2.6.2.6.3). With no backing file the planner
     // writes no parent metadata at all, so the zeroes below are never
-    // read. See docs/plans/PLAN-differencing.md.
-    // Matched on both dimensions, for the reason given in
+    // read. Matched on both dimensions, for the reason given in
     // `vhd_opts_from`.
     let parent_data_write_guid = match (identity, backing.is_some()) {
         (ParentIdentity::Vhdx { data_write_guid }, true) => data_write_guid,
@@ -564,11 +565,12 @@ fn vhdx_opts_from<'a>(
     };
     Ok(VhdxCreateOpts {
         virtual_size,
-        block_size: if config.block_size == 0 {
-            32 * 1024 * 1024
-        } else {
-            config.block_size
-        },
+        // 0 when the user gave no block size, which asks the layout for
+        // qemu's default for the size (`vhdx::default_block_size`: 8, 16,
+        // 32 or 64 MiB). The pre-flight check in `target_can_address`
+        // passes the same value to the same layout, so the two cannot
+        // disagree about the geometry.
+        block_size: config.block_size,
         backing,
         parent_data_write_guid,
     })
@@ -648,27 +650,26 @@ fn target_can_address(target: ImageFormat, virtual_size: u64, config: &CreateCon
                 None => true,
             }
         }
-        // VHDX: defer to the parser crate's authoritative computation.
-        // calculate_bat_layout returns None when either total_blocks or
-        // chunk_ratio overflows u32, which is precisely the ceiling we
-        // need to enforce. A differencing child's BAT is padded out to
+        // VHDX: ask the writer layout `plan_vhdx` sizes from, so this
+        // gate refuses exactly the sizes the planner would. It refuses
+        // a size above the 64 TiB ceiling and a BAT whose count does
+        // not fit its type. A differencing child's BAT is padded out to
         // whole chunk groups and so needs more entries than a plain
         // image of the same virtual size, which is why the backing
-        // file is part of the question rather than ignored here: the
-        // ceiling this gate enforces has to be the one `plan_vhdx`
-        // will size against. Today that is always the padded rule,
-        // because the only caller runs in the backing-derived path --
-        // but it is read off the config rather than hard-coded, so a
-        // second caller cannot be silently wrong.
-        ImageFormat::Vhdx => {
-            let block_size: u32 = if config.block_size == 0 {
-                32 * 1024 * 1024
-            } else {
-                config.block_size
-            };
-            vhdx::calculate_bat_layout(virtual_size, block_size, 512, config.has_backing())
-                .is_some()
-        }
+        // file is part of the question rather than ignored here. Today
+        // that is always the padded rule, because the only caller runs
+        // in the backing-derived path -- but it is read off the config
+        // rather than hard-coded, so a second caller cannot be silently
+        // wrong.
+        //
+        // An invalid block size is not a size the target cannot
+        // address, so it passes here and the planner refuses it as the
+        // invalid option it is, rather than this gate reporting it as a
+        // backing file too large for the target.
+        ImageFormat::Vhdx => !matches!(
+            vhdx::layout(virtual_size, config.block_size, config.has_backing()),
+            Err(vhdx::LayoutError::TooLarge | vhdx::LayoutError::Overflow)
+        ),
         // Any other target was already rejected by validate_create_args
         // / parse_create_o_options; treat as not addressable so we
         // surface a clear "unsupported format" error rather than
@@ -1003,6 +1004,9 @@ pub unsafe extern "C" fn _start() -> u64 {
     let scratch =
         core::slice::from_raw_parts_mut(CREATE_SCRATCH as *mut u8, GUEST_CREATE_SCRATCH_LIMIT);
 
+    // The size the image records, reported back to the host. Only VHDX
+    // records a different size from the one asked for.
+    let mut recorded_virtual_size = virtual_size;
     let (plan, resolved_unit_size) = match target {
         ImageFormat::Qcow2 => {
             let opts = qcow2_opts_from(config, virtual_size, backing_ref);
@@ -1052,9 +1056,23 @@ pub unsafe extern "C" fn _start() -> u64 {
                 Ok(o) => o,
                 Err(code) => return fail_with(call_table, config.target_format, code),
             };
-            let unit = opts.block_size;
             match plan_vhdx(&opts, scratch) {
-                Ok(p) => (p, unit),
+                Ok(p) => {
+                    // plan_vhdx records the size rounded up to 512 bytes,
+                    // as qemu-img does, because VirtualDiskSize must be a
+                    // multiple of the logical sector size, and the block
+                    // size the layout resolved, which is qemu's default
+                    // for the size when none was given. Report both as
+                    // recorded. The layout cannot refuse here, having just
+                    // succeeded for the planner; neither value depends on
+                    // whether the image has a parent.
+                    let mut unit = opts.block_size;
+                    if let Ok(geometry) = vhdx::layout(virtual_size, opts.block_size, false) {
+                        recorded_virtual_size = geometry.virtual_size;
+                        unit = geometry.block_size;
+                    }
+                    (p, unit)
+                }
                 Err(e) => return fail_with(call_table, config.target_format, map_create_error(e)),
             }
         }
@@ -1103,7 +1121,7 @@ pub unsafe extern "C" fn _start() -> u64 {
     send_result(
         call_table,
         config.target_format,
-        virtual_size,
+        recorded_virtual_size,
         bytes_written,
         file_size_after,
         resolved_unit_size,

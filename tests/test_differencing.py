@@ -4603,10 +4603,11 @@ class TestDifferencingCreatedChildComposes(DifferencingTestBase):
     longer than any third-party reader has been shown one. Measured
     rather than assumed, and it is read without complaint: libvhdi
     accepts the child, reports the parent's 16 MiB media size, and
-    returns every byte of it. The same holds at both of instar's
-    block sizes -- the 32 MiB default and `block_size=1M`, which puts
-    the padding in a different place -- and the two compositions come
-    back byte-identical.
+    returns every byte of it. The same holds at each block size it has
+    been measured at -- 32 MiB, instar's default for every size when
+    first measured, `block_size=1M`, which puts the padding in a
+    different place, and the 8 MiB qemu-img default instar now gives an
+    image this small -- and the compositions come back byte-identical.
 
     **Defect D: libvhdi ignores `SB_BLOCK_NOT_PRESENT`.** What it
     does not read correctly is the *absence* of a sector bitmap. A

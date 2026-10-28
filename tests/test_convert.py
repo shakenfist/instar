@@ -6532,7 +6532,7 @@ class TestConvertVhdxBlockSize(InstarTestBase):
         )
 
     def test_vhdx_block_default_explicit(self):
-        """VHDX with explicit default 32MB block size."""
+        """VHDX with an explicit 32MB block size, qemu-img's default from 100 GiB to 32 TiB."""
         self.assert_size_roundtrip(
             'raw-mbr-partitioned', 'vhdx', 'vhdx',
             '.vhdx', block_size=33554432
@@ -6549,6 +6549,67 @@ class TestConvertVhdxBlockSize(InstarTestBase):
         self.assert_convert_rejects(
             'vhdx', '.vhdx', block_size=536870912
         )
+
+    def test_vhdx_default_block_size_scales_with_the_size(self):
+        """With no --block-size, convert chooses qemu-img's default for the output's size.
+
+        qemu-img uses 8 MiB up to 1 GiB and 16 MiB above it (a strict `>`,
+        vhdx_co_create, qemu 7.0.0 block/vhdx.c), so one sector either side
+        of 1 GiB chooses differently. The sources are sparse raw files.
+        """
+        self._require_qemu_img()
+        for size, block_size in ((1 << 30, 8 * 1024 * 1024), ((1 << 30) + 512, 16 * 1024 * 1024)):
+            with self.subTest(size=size), tempfile.TemporaryDirectory() as td:
+                src = Path(td) / 'src.raw'
+                with open(src, 'wb') as f:
+                    f.truncate(size)
+                out = Path(td) / 'out.vhdx'
+                _, stderr, rc = self.run_instar_convert(src, out, output_format='vhdx', timeout=300)
+                self.assertEqual(rc, 0, stderr)
+                r = subprocess.run(['qemu-img', 'info', '--output=json', str(out)],
+                                   capture_output=True, text=True, timeout=60)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                # Only the block size: the virtual size of a raw source that is
+                # not a multiple of 64 KiB is rounded up to one (#821), which
+                # keeps 1 GiB + 512 above the threshold all the same.
+                self.assertEqual(json.loads(r.stdout)['cluster-size'], block_size)
+
+
+class TestConvertVhdxSizeLimit(InstarTestBase):
+    """convert and dd refuse a VHDX output above 64 TiB before opening it.
+
+    qemu-img refuses to create such a VHDX (vhdx_co_create, qemu 7.0.0
+    block/vhdx.c). The 65 TiB source is a sparse qcow2, so nothing here
+    allocates more than its metadata.
+    """
+
+    CEILING = f'exceeds the VHDX maximum of 64 TiB ({64 << 40} bytes)'
+    SIZE = 65 << 40
+
+    def _sparse_65_tib_qcow2(self, td):
+        path = Path(td) / 'src.qcow2'
+        r = subprocess.run([str(self.get_instar_binary()), 'create', '-f', 'qcow2', str(path), str(self.SIZE)],
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return path
+
+    def test_convert_refuses_without_creating_the_output(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = self._sparse_65_tib_qcow2(td)
+            out = Path(td) / 'out.vhdx'
+            _, stderr, rc = self.run_instar_convert(src, out, output_format='vhdx')
+            self.assertNotEqual(rc, 0)
+            self.assertIn(f'convert: virtual size {self.SIZE} {self.CEILING}', stderr)
+            self.assertFalse(out.exists(), 'a refused convert left an output file')
+
+    def test_dd_refuses_without_creating_the_output(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = self._sparse_65_tib_qcow2(td)
+            out = Path(td) / 'out.vhdx'
+            _, stderr, rc = self.run_instar_dd([f'if={src}', f'of={out}'], output_format='vhdx')
+            self.assertNotEqual(rc, 0)
+            self.assertIn(f'dd: virtual size {self.SIZE} {self.CEILING}', stderr)
+            self.assertFalse(out.exists(), 'a refused dd left an output file')
 
 
 class TestConvertDmgToRaw(InstarTestBase):

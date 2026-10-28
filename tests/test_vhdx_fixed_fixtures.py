@@ -30,7 +30,9 @@ entries is ZERO, so the convert walks the BAT without reading any data.
 
 `TestVhdxFixedReads` also pins how `check` treats a FULLY_PRESENT partial
 last block (#797): whole, it is clean and ends the image, and cut short in
-the file, or cut off at its start, it is a corruption.
+the file, or cut off at its start, it is a corruption. A region declared in
+the unused tail of its slot is a corruption too, because the slot is still a
+whole block.
 
 `KNOWN_READ_FAILURES` lists what instar would still get wrong. It is empty
 while instar reads every image here as qemu-img does; a listed pair must
@@ -42,13 +44,16 @@ shows up here rather than going unnoticed.
 import json
 import os
 import shutil
+import struct
 import subprocess
 import tempfile
 from pathlib import Path
 
 from base import QEMU_TOOL_TIMEOUT, InstarTestBase
 from helpers import qemu_pins
-from helpers.vhdx_structure import KIND_PAYLOAD, parse_vhdx, structural_diff, summarise
+from helpers.vhdx_structure import (KIND_PAYLOAD, REGION_TABLE_ENTRY_SIZE, REGION_TABLE_HEADER_SIZE,
+                                    REGION_TABLE_OFFSETS, REGION_TABLE_SIGNATURE, REGION_TABLE_SIZE, parse_vhdx,
+                                    structural_diff, summarise)
 
 KiB = 1024
 MiB = 1024 * KiB
@@ -150,8 +155,60 @@ KNOWN_READ_FAILURES = {}
 PARTIAL_LAST_BLOCK = 'vhdx-fixed-17M-bsz-off-data'
 PARTIAL_LAST_BLOCK_START = 24 * MiB
 PARTIAL_LAST_BLOCK_FILE_END = 25 * MiB
+# The fixture's block size, so the partial last block's slot runs on to
+# 32 MiB, past the end of the file.
+PARTIAL_LAST_BLOCK_SLOT_END = 32 * MiB
+
+# The region table fields a crafted extra region is written with: the
+# checksum and entry count in the table header, and an entry's GUID,
+# file offset, length and required flag (SPEC(VHDX) 2.3).
+REGION_TABLE_CHECKSUM_OFFSET = 4
+REGION_TABLE_ENTRY_COUNT_OFFSET = 8
+REGION_ENTRY_FORMAT = '<16sQII'
+# A GUID no VHDX region has, so the crafted region is an unrecognised
+# one, which a reader that does not require it skips (SPEC(VHDX) 2.3.1).
+UNRECOGNISED_REGION_GUID = bytes(range(1, 17))
 
 COMPARE_CHUNK = 1024 * 1024
+
+
+def _crc32c_table():
+    table = []
+    for n in range(256):
+        crc = n
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0x82f63b78 if crc & 1 else crc >> 1
+        table.append(crc)
+    return table
+
+
+_CRC32C_TABLE = _crc32c_table()
+
+
+def _crc32c(data: bytes) -> int:
+    """CRC-32C (Castagnoli), the checksum SPEC(VHDX) uses; the standard library has only CRC-32."""
+    crc = 0xffffffff
+    for byte in data:
+        crc = _CRC32C_TABLE[(crc ^ byte) & 0xff] ^ (crc >> 8)
+    return crc ^ 0xffffffff
+
+
+def _declare_region(path: Path, offset, length):
+    """Add an unrecognised, not required region at `offset` to both of `path`'s region tables."""
+    with open(path, 'r+b') as f:
+        for table_offset in REGION_TABLE_OFFSETS:
+            f.seek(table_offset)
+            table = bytearray(f.read(REGION_TABLE_SIZE))
+            if table[:4] != REGION_TABLE_SIGNATURE:
+                raise ValueError(f'no region table at {table_offset} in {path}')
+            count = struct.unpack_from('<I', table, REGION_TABLE_ENTRY_COUNT_OFFSET)[0]
+            struct.pack_into(REGION_ENTRY_FORMAT, table, REGION_TABLE_HEADER_SIZE + count * REGION_TABLE_ENTRY_SIZE,
+                             UNRECOGNISED_REGION_GUID, offset, length, 0)
+            struct.pack_into('<I', table, REGION_TABLE_ENTRY_COUNT_OFFSET, count + 1)
+            struct.pack_into('<I', table, REGION_TABLE_CHECKSUM_OFFSET, 0)
+            struct.pack_into('<I', table, REGION_TABLE_CHECKSUM_OFFSET, _crc32c(table))
+            f.seek(table_offset)
+            f.write(table)
 
 
 def _test_name(image_name, op=None):
@@ -460,14 +517,22 @@ class TestVhdxFixedReads(InstarTestBase):
         last block past the first chunk": qemu sizes a partial last block by
         its BAT index, so past the first chunk it requires a whole block.
         `test_vhdx_fixed_4608_5M_block_1M_bsz_off_check` requires instar to
-        pass the same image. If this test fails, the host qemu has fixed the
-        defect, and the quirk text needs revisiting.
+        pass the same image.
+
+        The host qemu-img is whichever one the runner's distribution ships,
+        so a qemu that has fixed the defect skips rather than fails, and
+        the skip says the quirk text needs revisiting. Any exit status
+        other than 0 or 2 still fails.
         """
         with tempfile.TemporaryDirectory() as tmp:
             workdir = Path(tmp)
             image = self._image(PARTIAL_PAST_FIRST_CHUNK, workdir)
             r = subprocess.run(['qemu-img', 'check', '-f', 'vhdx', str(image)], capture_output=True, text=True,
                                timeout=QEMU_TOOL_TIMEOUT)
+        if r.returncode == 0:
+            self.skipTest('the host qemu-img now opens its own fixed image with a partial last block past the '
+                          'first chunk, so the docs/quirks.md entry "VHDX partial last block past the first '
+                          'chunk" may be obsolete')
         self.assertEqual(2, r.returncode, f'qemu-img check exited {r.returncode}, not 2 (see docs/quirks.md, '
                                           f'"VHDX partial last block past the first chunk"): {r.stderr!r}')
 
@@ -500,6 +565,35 @@ class TestVhdxFixedReads(InstarTestBase):
     def test_partial_last_block_starting_at_end_of_file_is_a_corruption(self):
         """A partial last block whose start is the end of the file is out of bounds."""
         self._assert_check_finds_block_out_of_bounds(PARTIAL_LAST_BLOCK_START)
+
+    def _check_with_region_at(self, offset):
+        """instar check of a copy of the 17M fixture that also declares a 1 MiB region at `offset`."""
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            image = self._image(PARTIAL_LAST_BLOCK, workdir)
+            copy = workdir / 'region.vhdx'
+            shutil.copyfile(image, copy)
+            _declare_region(copy, offset, MiB)
+            declared = [region.offset for region in parse_vhdx(copy).region_table_1]
+            self.assertIn(offset, declared, 'the crafted region did not land in the region table')
+            return self._instar('check', '-v', copy)
+
+    def test_region_in_the_unused_tail_of_the_partial_last_block_is_a_corruption(self):
+        """A region declared in the partial last block's slot, past the data it holds, overlaps the block.
+
+        The block holds only the 1 MiB the virtual disk needs, so the region
+        at 25 MiB does not overlap the bytes a read uses. But the slot is a
+        whole 8 MiB block, and growing the image makes that block whole in
+        place, which would write virtual-disk data over the region.
+        """
+        stdout, stderr, rc = self._check_with_region_at(PARTIAL_LAST_BLOCK_FILE_END)
+        self.assertEqual(2, rc, f'instar check exited {rc}: {_failure_line(OP_CHECK, stdout, stderr)}')
+        self.assertIn('VHDX block inside a declared region', stdout + stderr)
+
+    def test_region_after_the_partial_last_block_slot_is_clean(self):
+        """A region declared where the partial last block's whole slot ends does not overlap it."""
+        stdout, stderr, rc = self._check_with_region_at(PARTIAL_LAST_BLOCK_SLOT_END)
+        self.assertEqual(0, rc, f'instar check exited {rc}: {_failure_line(OP_CHECK, stdout, stderr)}')
 
     def test_partial_last_block_ends_the_image(self):
         """instar check reports the image as ending where the partial last block, and the file, end.

@@ -25,3 +25,7 @@ fuzz-logs/
 # Pristine copies kept by tools/mutate-differencing.sh so that a killed
 # run leaves something to restore from.
 /.mutation-backups/
+
+# stestr runs from tests/ (tests/.gitignore covers its repository); one
+# started from the root by mistake leaves its repository here.
+/.stestr/

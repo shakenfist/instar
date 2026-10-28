@@ -234,9 +234,6 @@ pub const BAT_ENTRY_OFFSET_MASK: u64 = 0xFFFF_FFFF_FFF0_0000;
 /// Mask for extracting the state from a BAT entry (bits 0-2).
 pub const BAT_ENTRY_STATE_MASK: u64 = 0x07;
 
-/// Default block size (32 MiB, same as QEMU default).
-pub const DEFAULT_BLOCK_SIZE: u32 = 32 * 1024 * 1024;
-
 /// VHDX version we support (1).
 pub const VHDX_VERSION: u16 = 1;
 
@@ -3312,10 +3309,10 @@ pub fn build_header(buf: &mut [u8], sequence_number: u64) {
     // log_version: 0
     // version: 1
     write_le_u16(buf, HEADER_VERSION_OFFSET, VHDX_VERSION);
-    // log_length: 1MB (minimum, even if empty)
-    write_le_u32(buf, HEADER_LOG_LENGTH_OFFSET, MB_ALIGN as u32);
-    // log_offset: 0x100000 (1MB into file)
-    write_le_u64(buf, HEADER_LOG_OFFSET_OFFSET, 0x10_0000);
+    // The log is where `layout` places it, so the header and the
+    // region tables a writer emits cannot disagree about it.
+    write_le_u32(buf, HEADER_LOG_LENGTH_OFFSET, LOG_LENGTH);
+    write_le_u64(buf, HEADER_LOG_OFFSET_OFFSET, LOG_OFFSET);
 
     // Compute CRC-32C
     let checksum = compute_crc32c(&buf[..HEADER_SIZE], HEADER_CHECKSUM_OFFSET);
@@ -3853,6 +3850,281 @@ pub fn calculate_bat_layout(
 }
 
 // ============================================================================
+// Writer layout
+// ============================================================================
+//
+// Everything below is for writing a new image. Readers size a BAT walk
+// with `calculate_bat_layout` from the geometry the image declares and
+// never call `layout`: the ceiling and the 512-byte rounding are rules
+// for creating an image, and qemu opens images it would refuse to
+// create (its 64 TiB check sits in `vhdx_co_create`, and nothing on its
+// open path refers to `VHDX_MAX_IMAGE_SIZE`, qemu 7.0.0). A reader that
+// applied them would refuse well-formed images qemu and Hyper-V open.
+
+/// Largest virtual size a writer creates: 64 TiB.
+///
+/// qemu refuses a larger image in `vhdx_co_create` (`block/vhdx.c`,
+/// qemu 7.0.0, against `VHDX_MAX_IMAGE_SIZE` in `block/vhdx.h`) with
+/// "Image size too large; max of 64TB", and compares the size it has
+/// already rounded up to 512 bytes with a strict `>`, so exactly 64 TiB
+/// is accepted. [`layout`] applies the same rule.
+pub const MAX_VIRTUAL_SIZE: u64 = 64 << 40;
+
+/// File offset of the log a writer places: 1 MiB, the end of the
+/// header section.
+///
+/// qemu writes `VHDX_HEADER_SECTION_END` here (`vhdx_create_new_headers`,
+/// `block/vhdx.c`, qemu 7.0.0).
+pub const LOG_OFFSET: u64 = 1024 * 1024;
+
+/// Length of the log a writer places: 1 MiB, qemu's
+/// `DEFAULT_LOG_SIZE` (`block/vhdx.h`, qemu 7.0.0) and the smallest
+/// log `vhdx_co_create` accepts. A freshly written image has nothing
+/// to replay, so the log is empty whatever its length.
+pub const LOG_LENGTH: u32 = 1024 * 1024;
+
+/// File offset of the BAT region a writer places: 2 MiB, the first
+/// 1 MiB boundary after the log.
+///
+/// qemu places it at `ROUND_UP(VHDX_HEADER_SECTION_END + log_size, MiB)`
+/// (`vhdx_create_new_region_table`, `block/vhdx.c`, qemu 7.0.0). Both
+/// log constants are already whole MiB, so no rounding is needed here;
+/// writing the sum rather than a literal keeps the BAT from overlapping
+/// the log if either log constant ever changes.
+pub const BAT_OFFSET: u64 = LOG_OFFSET + LOG_LENGTH as u64;
+
+/// Length of the metadata region a writer places: 1 MiB.
+///
+/// qemu uses `1 * MiB` ("min size, and more than enough",
+/// `vhdx_create_new_region_table`, qemu 7.0.0). The metadata table
+/// and its items, a parent locator included, use well under that.
+pub const METADATA_REGION_LENGTH: u32 = 1024 * 1024;
+
+/// Logical sector size a writer declares: 512 bytes.
+pub const LOGICAL_SECTOR_SIZE: u32 = 512;
+
+/// Physical sector size a writer declares: 4096 bytes.
+///
+/// Every pinned qemu-img build (6.0.0 to 10.2.0, in
+/// `tests/golden/qemu-create-pins.json`) declares 512 here. instar has
+/// always written 4096, and changing it alters the bytes of every VHDX
+/// instar writes, so it is a decision for whoever next matches instar's
+/// output to qemu's field by field, not a side effect of moving the
+/// value here.
+pub const PHYSICAL_SECTOR_SIZE: u32 = 4096;
+
+/// The block size qemu chooses when it is not given one.
+///
+/// The thresholds are qemu's (`vhdx_co_create`, `block/vhdx.c`, qemu
+/// 7.0.0), each a strict `>`:
+///
+/// | Virtual size                   | Block size |
+/// |--------------------------------|------------|
+/// | above 32 TiB                   | 64 MiB     |
+/// | above 100 GiB, up to 32 TiB    | 32 MiB     |
+/// | above 1 GiB, up to 100 GiB     | 16 MiB     |
+/// | 1 GiB or less                  | 8 MiB      |
+///
+/// qemu compares the size after rounding it up to 512 bytes. Every
+/// threshold is a multiple of 512, so rounding first or not gives the
+/// same answer; [`layout`] passes the rounded size so that the size the
+/// block size is chosen from is the size the image records.
+///
+/// The answer above 64 TiB is still 64 MiB. This function chooses a
+/// block size and does not refuse anything: [`layout`] applies the
+/// ceiling.
+pub const fn default_block_size(virtual_size: u64) -> u32 {
+    const MIB: u32 = 1024 * 1024;
+    if virtual_size > 32 << 40 {
+        64 * MIB
+    } else if virtual_size > 100 << 30 {
+        32 * MIB
+    } else if virtual_size > 1 << 30 {
+        16 * MIB
+    } else {
+        8 * MIB
+    }
+}
+
+/// Why [`layout`] could not place an image.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum LayoutError {
+    /// The block size is not a power of two between 1 MiB and 256 MiB
+    /// inclusive (SPEC(VHDX) 2.6.2.1; qemu's `VHDX_BLOCK_SIZE_MIN` and
+    /// `VHDX_BLOCK_SIZE_MAX` in `block/vhdx.h` are the same bounds). A
+    /// block size of 0 is not this error: it asks for qemu's default.
+    InvalidBlockSize,
+    /// The virtual size, rounded up to 512 bytes, is above
+    /// [`MAX_VIRTUAL_SIZE`]. A size so close to `u64::MAX` that the
+    /// rounding itself overflows is above the ceiling too, and is this
+    /// error rather than [`LayoutError::Overflow`].
+    TooLarge,
+    /// A count or offset did not fit its type. Under the ceiling and
+    /// with a valid block size this cannot happen (64 TiB at 1 MiB
+    /// blocks is about 537 MB of BAT), so it is a backstop that keeps
+    /// the arithmetic checked rather than an answer any real input
+    /// gets.
+    Overflow,
+}
+
+/// Where everything in a newly written VHDX goes.
+///
+/// [`layout`] is the one place a writer's geometry is decided, so the
+/// region tables, the header, the metadata items and the BAT a writer
+/// emits cannot disagree with each other or with another writer.
+///
+/// Offsets are file offsets in bytes. Region lengths are `u32` because
+/// that is the width of the on-disk fields they are written to (the
+/// region table entry's Length and the header's LogLength), and
+/// [`layout`] has checked that they fit.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct VhdxLayout {
+    /// The virtual size the image records, rounded up to 512 bytes.
+    /// SPEC(VHDX) requires `VirtualDiskSize` to be a multiple of the
+    /// logical sector size, and qemu rounds silently
+    /// (`vhdx_co_create_opts`, `block/vhdx.c`, qemu 7.0.0: "The image
+    /// size is rounded to 512 bytes").
+    pub virtual_size: u64,
+    /// The block size, resolved: the caller's, or
+    /// [`default_block_size`] of `virtual_size` when the caller passed
+    /// 0.
+    pub block_size: u32,
+    /// Payload blocks per sector bitmap block.
+    pub chunk_ratio: u32,
+    /// Payload blocks needed to cover `virtual_size`.
+    pub payload_blocks: u32,
+    /// BAT entries, payload and sector bitmap together, by the rule for
+    /// an image with or without a parent ([`bat_entry_count`]).
+    pub bat_entries: u32,
+    /// [`LOG_OFFSET`].
+    pub log_offset: u64,
+    /// [`LOG_LENGTH`].
+    pub log_length: u32,
+    /// [`BAT_OFFSET`].
+    pub bat_offset: u64,
+    /// The BAT region's length: `bat_entries` entries of 8 bytes,
+    /// rounded up to 1 MiB, and never less than 1 MiB.
+    pub bat_region_len: u32,
+    /// The metadata region's offset, straight after the BAT region.
+    pub metadata_offset: u64,
+    /// [`METADATA_REGION_LENGTH`].
+    pub metadata_region_len: u32,
+    /// The end of the metadata region, where payload may start.
+    pub data_start: u64,
+    /// [`LOGICAL_SECTOR_SIZE`].
+    pub logical_sector_size: u32,
+    /// [`PHYSICAL_SECTOR_SIZE`].
+    pub physical_sector_size: u32,
+}
+
+/// Lay out a new VHDX of `virtual_size` bytes.
+///
+/// `block_size` of 0 asks for qemu's default for the size
+/// ([`default_block_size`]); anything else must be a power of two from
+/// 1 MiB to 256 MiB. `has_parent` selects the BAT count rule for a
+/// differencing image, as for [`calculate_bat_layout`].
+///
+/// In order:
+///
+/// 1. The size is rounded up to 512 bytes, as `vhdx_co_create_opts`
+///    does before anything else looks at it (qemu 7.0.0).
+/// 2. A rounded size above [`MAX_VIRTUAL_SIZE`] is
+///    [`LayoutError::TooLarge`], checked before the block size as
+///    `vhdx_co_create` does.
+/// 3. The block size is resolved and checked.
+/// 4. The regions are placed as `vhdx_create_new_region_table` places
+///    them (qemu 7.0.0): the log at 1 MiB, the BAT at the first MiB
+///    boundary after the log, the metadata region straight after the
+///    BAT, 1 MiB long.
+///
+/// One rule differs from qemu on purpose: the BAT region is never
+/// shorter than 1 MiB. It matters only at a virtual size of zero, where
+/// there are no payload blocks and so no entries, and sizing the region
+/// from the count alone would declare an empty BAT region. qemu refuses
+/// a file whose BAT region is empty (measured: `qemu-img info` from
+/// qemu 6.0.0, 10.0.13 and 10.2.0 fails with "Invalid argument" on an
+/// image patched to a zero-length BAT region, at virtual size 0 and at
+/// 64 MiB alike).
+///
+/// qemu does not take the floor itself. At zero blocks its
+/// `vhdx_calc_bat_entries` computes `data_blocks_cnt +
+/// ((data_blocks_cnt - 1) >> chunk_ratio_bits)` in `uint32_t`, so the
+/// subtraction wraps and the count is `0xFFFFFFFF >> chunk_ratio_bits`
+/// (8388607 at its 8 MiB default), and `qemu-img create -f vhdx z 0`
+/// writes a 64 MiB BAT region for an image with no blocks. Its open
+/// path then demands a region that large (`vhdx_open` refuses when
+/// `bat_entries > bat_rt.length / sizeof(VHDXBatEntry)`), which is why
+/// qemu also refuses a zero-size image with a 1 MiB BAT region
+/// (measured on the same three builds). Matching qemu there means
+/// copying an integer underflow into the geometry, so instar does not:
+/// a zero-size image gets the smallest BAT region that is not empty.
+///
+/// Every step is checked arithmetic, and nothing here panics on any
+/// input.
+pub fn layout(
+    virtual_size: u64,
+    block_size: u32,
+    has_parent: bool,
+) -> Result<VhdxLayout, LayoutError> {
+    // A size whose rounding overflows u64 is far above the ceiling, so
+    // it is refused as too large rather than as an arithmetic failure.
+    let virtual_size = virtual_size
+        .checked_next_multiple_of(u64::from(LOGICAL_SECTOR_SIZE))
+        .ok_or(LayoutError::TooLarge)?;
+    if virtual_size > MAX_VIRTUAL_SIZE {
+        return Err(LayoutError::TooLarge);
+    }
+
+    let block_size = if block_size == 0 {
+        default_block_size(virtual_size)
+    } else {
+        block_size
+    };
+    // The same rule the metadata parser applies to an image it reads,
+    // so a writer cannot emit a block size its own reader refuses.
+    if !is_valid_metadata_block_size(block_size) {
+        return Err(LayoutError::InvalidBlockSize);
+    }
+
+    let (bat_entries, chunk_ratio, payload_blocks) =
+        calculate_bat_layout(virtual_size, block_size, LOGICAL_SECTOR_SIZE, has_parent)
+            .ok_or(LayoutError::Overflow)?;
+
+    let bat_bytes = u64::from(bat_entries)
+        .checked_mul(8)
+        .ok_or(LayoutError::Overflow)?;
+    let bat_region_len = bat_bytes
+        .checked_next_multiple_of(MB_ALIGN)
+        .ok_or(LayoutError::Overflow)?
+        .max(MB_ALIGN);
+    let bat_region_len = u32::try_from(bat_region_len).map_err(|_| LayoutError::Overflow)?;
+
+    let metadata_offset = BAT_OFFSET
+        .checked_add(u64::from(bat_region_len))
+        .ok_or(LayoutError::Overflow)?;
+    let data_start = metadata_offset
+        .checked_add(u64::from(METADATA_REGION_LENGTH))
+        .ok_or(LayoutError::Overflow)?;
+
+    Ok(VhdxLayout {
+        virtual_size,
+        block_size,
+        chunk_ratio,
+        payload_blocks,
+        bat_entries,
+        log_offset: LOG_OFFSET,
+        log_length: LOG_LENGTH,
+        bat_offset: BAT_OFFSET,
+        bat_region_len,
+        metadata_offset,
+        metadata_region_len: METADATA_REGION_LENGTH,
+        data_start,
+        logical_sector_size: LOGICAL_SECTOR_SIZE,
+        physical_sector_size: PHYSICAL_SECTOR_SIZE,
+    })
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -3998,10 +4270,13 @@ mod tests {
     // BAT layout calculation tests
     // ====================================================================
 
+    /// The 32 MiB block size the BAT layout tests below use.
+    const BLOCK_32_MIB: u32 = 32 * 1024 * 1024;
+
     #[test]
     fn bat_layout_1gb_32mb_blocks() {
         let (total, chunk_ratio, payload_blocks) =
-            calculate_bat_layout(1024 * 1024 * 1024, DEFAULT_BLOCK_SIZE, 512, false).unwrap();
+            calculate_bat_layout(1024 * 1024 * 1024, BLOCK_32_MIB, 512, false).unwrap();
         assert_eq!(payload_blocks, 32); // 1GB / 32MB
         assert_eq!(chunk_ratio, 128); // (2^23 * 512) / 32MB
                                       // 32 + (32 - 1) / 128 = 32 + 0: the
@@ -4013,7 +4288,7 @@ mod tests {
         // 128 payload entries plus its bitmap entry, 96 of whose
         // payload entries the 1 GiB virtual disk never reaches.
         let (total, chunk_ratio, payload_blocks) =
-            calculate_bat_layout(1024 * 1024 * 1024, DEFAULT_BLOCK_SIZE, 512, true).unwrap();
+            calculate_bat_layout(1024 * 1024 * 1024, BLOCK_32_MIB, 512, true).unwrap();
         assert_eq!(payload_blocks, 32);
         assert_eq!(chunk_ratio, 128);
         assert_eq!(total, 129);
@@ -4022,8 +4297,7 @@ mod tests {
     #[test]
     fn bat_layout_4gb_32mb_blocks() {
         let (total, chunk_ratio, payload_blocks) =
-            calculate_bat_layout(4u64 * 1024 * 1024 * 1024, DEFAULT_BLOCK_SIZE, 512, false)
-                .unwrap();
+            calculate_bat_layout(4u64 * 1024 * 1024 * 1024, BLOCK_32_MIB, 512, false).unwrap();
         assert_eq!(payload_blocks, 128);
         assert_eq!(chunk_ratio, 128);
         // 128 + (128 - 1) / 128 = 128 + 0. The virtual disk is exactly
@@ -4037,7 +4311,7 @@ mod tests {
         // differ by that one entry, which the old no-parent rule of
         // `n + ceil(n / c)` used to count as well.
         let (total, _chunk_ratio, _payload_blocks) =
-            calculate_bat_layout(4u64 * 1024 * 1024 * 1024, DEFAULT_BLOCK_SIZE, 512, true).unwrap();
+            calculate_bat_layout(4u64 * 1024 * 1024 * 1024, BLOCK_32_MIB, 512, true).unwrap();
         assert_eq!(total, 129);
     }
 
@@ -4230,6 +4504,406 @@ mod tests {
             Some(u64::MAX / 2 + (u64::MAX / 2 - 1))
         );
         assert_eq!(bat_entry_count(u64::MAX, 4096, true), None);
+    }
+
+    // ====================================================================
+    // Writer layout tests
+    // ====================================================================
+
+    const MIB: u64 = 1024 * 1024;
+
+    // qemu's default block size on each side of each threshold. The
+    // thresholds and the strict `>` are `vhdx_co_create`'s (qemu 7.0.0);
+    // the boundary sizes and one sector above them were measured with
+    // qemu-img 6.0.0, 8.2.0 and 10.2.0. One sector below each threshold
+    // is included so that moving a threshold down is caught as well as
+    // turning `>` into `>=`.
+    #[test]
+    fn default_block_size_thresholds() {
+        let cases: &[(u64, u64)] = &[
+            (0, 8),
+            (512, 8),
+            (1073741824 - 512, 8),
+            (1073741824, 8),
+            (1073742336, 16),
+            (107374182400 - 512, 16),
+            (107374182400, 16),
+            (107374182912, 32),
+            (35184372088832 - 512, 32),
+            (35184372088832, 32),
+            (35184372089344, 64),
+            (70368744177664 - 512, 64),
+            (70368744177664, 64),
+            (70368744178176, 64),
+        ];
+        for &(size, mib) in cases {
+            assert_eq!(
+                u64::from(default_block_size(size)),
+                mib * MIB,
+                "default block size for {size}"
+            );
+        }
+    }
+
+    /// Expected placement of one qemu create pin case, copied from
+    /// `tests/golden/qemu-create-pins.json` (the crate tests cannot read
+    /// the JSON). Every value below is the same on all 80 pinned qemu
+    /// builds.
+    struct PinnedLayout {
+        case: &'static str,
+        virtual_size: u64,
+        block_size: u32,
+        chunk_ratio: u32,
+        bat_entries: u32,
+        bat_offset: u64,
+        bat_len: u32,
+        metadata_offset: u64,
+        metadata_len: u32,
+    }
+
+    // Every `vhdx-dynamic-*` pin case qemu created with no block size.
+    // `vhdx-dynamic-64M-bsz-off` differs from `vhdx-dynamic-64M` only in
+    // the BAT entry state qemu writes, not in where anything goes.
+    const PINNED_DEFAULT: &[PinnedLayout] = &[
+        PinnedLayout {
+            case: "vhdx-dynamic-64M",
+            virtual_size: 67108864,
+            block_size: 8388608,
+            chunk_ratio: 512,
+            bat_entries: 8,
+            bat_offset: 2097152,
+            bat_len: 1048576,
+            metadata_offset: 3145728,
+            metadata_len: 1048576,
+        },
+        PinnedLayout {
+            case: "vhdx-dynamic-64M-bsz-off",
+            virtual_size: 67108864,
+            block_size: 8388608,
+            chunk_ratio: 512,
+            bat_entries: 8,
+            bat_offset: 2097152,
+            bat_len: 1048576,
+            metadata_offset: 3145728,
+            metadata_len: 1048576,
+        },
+        PinnedLayout {
+            case: "vhdx-dynamic-1024M",
+            virtual_size: 1073741824,
+            block_size: 8388608,
+            chunk_ratio: 512,
+            bat_entries: 128,
+            bat_offset: 2097152,
+            bat_len: 1048576,
+            metadata_offset: 3145728,
+            metadata_len: 1048576,
+        },
+        PinnedLayout {
+            case: "vhdx-dynamic-1025M",
+            virtual_size: 1074790400,
+            block_size: 16777216,
+            chunk_ratio: 256,
+            bat_entries: 65,
+            bat_offset: 2097152,
+            bat_len: 1048576,
+            metadata_offset: 3145728,
+            metadata_len: 1048576,
+        },
+        PinnedLayout {
+            case: "vhdx-dynamic-102400M",
+            virtual_size: 107374182400,
+            block_size: 16777216,
+            chunk_ratio: 256,
+            bat_entries: 6424,
+            bat_offset: 2097152,
+            bat_len: 1048576,
+            metadata_offset: 3145728,
+            metadata_len: 1048576,
+        },
+        PinnedLayout {
+            case: "vhdx-dynamic-102401M",
+            virtual_size: 107375230976,
+            block_size: 33554432,
+            chunk_ratio: 128,
+            bat_entries: 3226,
+            bat_offset: 2097152,
+            bat_len: 1048576,
+            metadata_offset: 3145728,
+            metadata_len: 1048576,
+        },
+        PinnedLayout {
+            case: "vhdx-dynamic-4161792M",
+            virtual_size: 4363955208192,
+            block_size: 33554432,
+            chunk_ratio: 128,
+            bat_entries: 131072,
+            bat_offset: 2097152,
+            bat_len: 1048576,
+            metadata_offset: 3145728,
+            metadata_len: 1048576,
+        },
+        PinnedLayout {
+            case: "vhdx-dynamic-33554432M",
+            virtual_size: 35184372088832,
+            block_size: 33554432,
+            chunk_ratio: 128,
+            bat_entries: 1056767,
+            bat_offset: 2097152,
+            bat_len: 9437184,
+            metadata_offset: 11534336,
+            metadata_len: 1048576,
+        },
+        PinnedLayout {
+            case: "vhdx-dynamic-33554433M",
+            virtual_size: 35184373137408,
+            block_size: 67108864,
+            chunk_ratio: 64,
+            bat_entries: 532481,
+            bat_offset: 2097152,
+            bat_len: 5242880,
+            metadata_offset: 7340032,
+            metadata_len: 1048576,
+        },
+        PinnedLayout {
+            case: "vhdx-dynamic-64T",
+            virtual_size: 70368744177664,
+            block_size: 67108864,
+            chunk_ratio: 64,
+            bat_entries: 1064959,
+            bat_offset: 2097152,
+            bat_len: 9437184,
+            metadata_offset: 11534336,
+            metadata_len: 1048576,
+        },
+    ];
+
+    fn assert_matches_pin(l: &VhdxLayout, pin: &PinnedLayout) {
+        let case = pin.case;
+        assert_eq!(l.virtual_size, pin.virtual_size, "{case}: virtual size");
+        assert_eq!(l.block_size, pin.block_size, "{case}: block size");
+        assert_eq!(l.chunk_ratio, pin.chunk_ratio, "{case}: chunk ratio");
+        assert_eq!(l.bat_entries, pin.bat_entries, "{case}: BAT entry count");
+        assert_eq!(l.bat_offset, pin.bat_offset, "{case}: BAT offset");
+        assert_eq!(l.bat_region_len, pin.bat_len, "{case}: BAT region length");
+        assert_eq!(
+            l.metadata_offset, pin.metadata_offset,
+            "{case}: metadata offset"
+        );
+        assert_eq!(
+            l.metadata_region_len, pin.metadata_len,
+            "{case}: metadata length"
+        );
+        // Every pin case records the log at 1 MiB, 1 MiB long.
+        assert_eq!(l.log_offset, 1048576, "{case}: log offset");
+        assert_eq!(l.log_length, 1048576, "{case}: log length");
+    }
+
+    #[test]
+    fn layout_default_block_size_matches_qemu_pins() {
+        for pin in PINNED_DEFAULT {
+            let l = layout(pin.virtual_size, 0, false)
+                .unwrap_or_else(|e| panic!("{}: {e:?}", pin.case));
+            assert_matches_pin(&l, pin);
+        }
+    }
+
+    #[test]
+    fn layout_explicit_block_size_matches_qemu_pin() {
+        // vhdx-dynamic-131041M-block-1M: 131072 entries fill exactly
+        // 1 MiB, the geometry issue #626 was found at.
+        let pin = PinnedLayout {
+            case: "vhdx-dynamic-131041M-block-1M",
+            virtual_size: 137406447616,
+            block_size: 1048576,
+            chunk_ratio: 4096,
+            bat_entries: 131072,
+            bat_offset: 2097152,
+            bat_len: 1048576,
+            metadata_offset: 3145728,
+            metadata_len: 1048576,
+        };
+        let l = layout(pin.virtual_size, 1024 * 1024, false).unwrap();
+        assert_matches_pin(&l, &pin);
+    }
+
+    #[test]
+    fn layout_ceiling_is_64_tib() {
+        // vhdx-dynamic-64T is created; vhdx-dynamic-65T is refused by
+        // every pinned build ("Image size too large; max of 64TB").
+        let l = layout(MAX_VIRTUAL_SIZE, 0, false).unwrap();
+        assert_eq!(l.virtual_size, MAX_VIRTUAL_SIZE);
+        assert_eq!(
+            layout(MAX_VIRTUAL_SIZE, 1024 * 1024, false)
+                .unwrap()
+                .virtual_size,
+            MAX_VIRTUAL_SIZE
+        );
+        for size in [MAX_VIRTUAL_SIZE + 1, MAX_VIRTUAL_SIZE + 512, 65 << 40] {
+            assert_eq!(layout(size, 0, false), Err(LayoutError::TooLarge), "{size}");
+            assert_eq!(
+                layout(size, 1024 * 1024, true),
+                Err(LayoutError::TooLarge),
+                "{size}"
+            );
+        }
+    }
+
+    #[test]
+    fn layout_rounds_virtual_size_up_to_512() {
+        // qemu-img create -f vhdx t 1073741825 records 1073742336
+        // (measured on 6.0.0 and 10.2.0).
+        let l = layout(1073741825, 0, false).unwrap();
+        assert_eq!(l.virtual_size, 1073742336);
+        assert_eq!(l.block_size, 16 * 1024 * 1024);
+        assert_eq!(layout(1, 0, false).unwrap().virtual_size, 512);
+        assert_eq!(layout(512, 0, false).unwrap().virtual_size, 512);
+        assert_eq!(layout(513, 1024 * 1024, false).unwrap().virtual_size, 1024);
+    }
+
+    #[test]
+    fn layout_zero_size_has_a_1_mib_bat_region() {
+        for has_parent in [false, true] {
+            let l = layout(0, 0, has_parent).unwrap();
+            assert_eq!(l.virtual_size, 0);
+            assert_eq!(l.block_size, 8 * 1024 * 1024);
+            assert_eq!(l.payload_blocks, 0);
+            assert_eq!(l.bat_entries, 0);
+            assert_eq!(l.bat_offset, 2 * MIB);
+            assert_eq!(u64::from(l.bat_region_len), MIB, "has_parent {has_parent}");
+            assert_eq!(l.metadata_offset, 3 * MIB);
+            assert_eq!(l.data_start, 4 * MIB);
+        }
+    }
+
+    #[test]
+    fn layout_refuses_invalid_block_sizes() {
+        for bs in [0x8_0000, 3 * 1024 * 1024, 512 * 1024 * 1024, 1, u32::MAX] {
+            assert_eq!(
+                layout(64 * MIB, bs, false),
+                Err(LayoutError::InvalidBlockSize),
+                "{bs:#x}"
+            );
+            assert_eq!(
+                layout(64 * MIB, bs, true),
+                Err(LayoutError::InvalidBlockSize),
+                "{bs:#x}"
+            );
+        }
+        // Both ends of the valid range are accepted.
+        assert_eq!(
+            layout(64 * MIB, 1024 * 1024, false).unwrap().block_size,
+            1024 * 1024
+        );
+        assert_eq!(
+            layout(64 * MIB, 256 * 1024 * 1024, false)
+                .unwrap()
+                .block_size,
+            256 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn layout_extreme_sizes_do_not_panic() {
+        for size in [u64::MAX, u64::MAX - 511, 1u64 << 53, 1u64 << 63] {
+            for bs in [0, 1024 * 1024, 256 * 1024 * 1024, 0x8_0000, u32::MAX] {
+                for has_parent in [false, true] {
+                    assert_eq!(
+                        layout(size, bs, has_parent),
+                        Err(LayoutError::TooLarge),
+                        "{size} {bs}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn layout_with_parent_uses_the_differencing_count() {
+        let sizes = [
+            0,
+            512,
+            64 * MIB,
+            1073741824,
+            131_041 * MIB,
+            137406447616 + 512,
+            4363955208192,
+            MAX_VIRTUAL_SIZE,
+        ];
+        for size in sizes {
+            for bs in [
+                0u32,
+                1024 * 1024,
+                2 * 1024 * 1024,
+                32 * 1024 * 1024,
+                256 * 1024 * 1024,
+            ] {
+                let l = layout(size, bs, true).unwrap();
+                let (entries, chunk_ratio, blocks) =
+                    calculate_bat_layout(l.virtual_size, l.block_size, 512, true).unwrap();
+                assert_eq!(l.bat_entries, entries, "{size} {bs}");
+                assert_eq!(l.chunk_ratio, chunk_ratio, "{size} {bs}");
+                assert_eq!(l.payload_blocks, blocks, "{size} {bs}");
+                let expected_len = (u64::from(entries) * 8).div_ceil(MIB).max(1) * MIB;
+                assert_eq!(u64::from(l.bat_region_len), expected_len, "{size} {bs}");
+            }
+        }
+        // 131041 payload blocks at 1 MiB fill one MiB of BAT without a
+        // parent, but a differencing image pads to 32 whole groups of
+        // 4097 entries and needs a second MiB, which moves the metadata.
+        let child = layout(131_041 * MIB, 1024 * 1024, true).unwrap();
+        assert_eq!(child.bat_entries, 32 * 4097);
+        assert_eq!(u64::from(child.bat_region_len), 2 * MIB);
+        assert_eq!(child.metadata_offset, 4 * MIB);
+        let flat = layout(131_041 * MIB, 1024 * 1024, false).unwrap();
+        assert_eq!(u64::from(flat.bat_region_len), MIB);
+    }
+
+    #[test]
+    fn layout_regions_are_contiguous_and_fixed() {
+        let sizes = [
+            0,
+            512,
+            1073741825,
+            131_041 * MIB,
+            35184373137408,
+            MAX_VIRTUAL_SIZE,
+        ];
+        for size in sizes {
+            for has_parent in [false, true] {
+                let l = layout(size, 0, has_parent).unwrap();
+                assert_eq!(
+                    l.data_start,
+                    l.metadata_offset + u64::from(l.metadata_region_len),
+                    "{size}"
+                );
+                assert_eq!(
+                    l.metadata_offset,
+                    l.bat_offset + u64::from(l.bat_region_len)
+                );
+                assert_eq!(l.bat_offset, l.log_offset + u64::from(l.log_length));
+                assert_eq!(l.bat_region_len % (1024 * 1024), 0);
+                assert_eq!(l.logical_sector_size, 512);
+                assert_eq!(l.physical_sector_size, 4096);
+                // A chunk is 2^23 logical sectors whatever the block
+                // size, so the ratio and the block size trade off.
+                assert_eq!(
+                    u64::from(l.chunk_ratio) * u64::from(l.block_size),
+                    (1u64 << 23) * 512
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn header_builder_places_the_log_where_layout_does() {
+        let mut buf = [0u8; HEADER_SIZE];
+        build_header(&mut buf, 1);
+        let hdr = VhdxHeader::parse(&buf).unwrap();
+        let l = layout(64 * MIB, 0, false).unwrap();
+        assert_eq!(hdr.log_offset, l.log_offset);
+        assert_eq!(hdr.log_length, l.log_length);
+        assert_eq!(hdr.log_offset, 1048576);
+        assert_eq!(hdr.log_length, 1048576);
     }
 
     // ====================================================================
@@ -4472,14 +5146,7 @@ mod tests {
     #[test]
     fn metadata_builder() {
         let mut buf = [0u8; 0x10000 + 64];
-        let written = build_metadata(
-            &mut buf,
-            DEFAULT_BLOCK_SIZE,
-            1024 * 1024 * 1024,
-            512,
-            4096,
-            false,
-        );
+        let written = build_metadata(&mut buf, BLOCK_32_MIB, 1024 * 1024 * 1024, 512, 4096, false);
         assert!(written > 0);
 
         // Check signature
@@ -4492,7 +5159,7 @@ mod tests {
 
         // Check block size at items area
         let bs = le_u32(&buf, 0x10000);
-        assert_eq!(bs, DEFAULT_BLOCK_SIZE);
+        assert_eq!(bs, BLOCK_32_MIB);
 
         // Check virtual disk size
         let vs = le_u64(&buf, 0x10000 + 8);

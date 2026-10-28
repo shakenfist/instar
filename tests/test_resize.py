@@ -27,6 +27,7 @@ import tempfile
 from pathlib import Path
 
 from base import InstarTestBase
+from helpers import vhdx_structure
 from helpers.info_json import assert_info_equivalent
 
 
@@ -852,6 +853,50 @@ class TestResizeErrorPaths(TestResizeSmoke):
     def test_fixed_vhdx_with_data_shrink_refused(self):
         """`--shrink` on the FULLY_PRESENT fixture gets the same refusal."""
         self._assert_fixed_vhdx_refused('vhdx-fixed-16M-bsz-off-data', '8M', '--shrink')
+
+    # ----------- VHDX size ceiling (issue #799) -----------
+    #
+    # qemu-img creates no VHDX above 64 TiB (vhdx_co_create, qemu 7.0.0
+    # block/vhdx.c), so resize refuses to grow one past it, on the host,
+    # before the image is opened for writing.
+
+    def test_vhdx_grow_above_64_tib_refused(self):
+        """Growing a 64 TiB VHDX to 65 TiB is refused and leaves it byte-identical."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 't.vhdx'
+            _, stderr, rc = self.run_instar_create('-f', 'vhdx', str(path), str(64 << 40))
+            self.assertEqual(rc, 0, stderr)
+            before = self.sha256(path)
+            for size in (str(65 << 40), '+1T'):
+                _, stderr, rc = self.run_instar_resize(str(path), size)
+                self.assertNotEqual(rc, 0, f'resize to {size} succeeded')
+                self.assertIn(
+                    f'resize: virtual size {65 << 40} exceeds the VHDX maximum of 64 TiB ({64 << 40} bytes)',
+                    stderr)
+                self.assertEqual(self.sha256(path), before, 'a refused resize must not touch the VHDX')
+
+    def test_vhdx_above_64_tib_is_refused_in_every_direction(self):
+        """A VHDX already above 64 TiB is refused a no-op and a shrink too, and is left byte-identical.
+
+        It is still read, as qemu opens one, but the resize guest stages at
+        most a 2 MiB BAT region, and above 64 TiB even 256 MiB blocks need
+        3 MiB, so the host names the limit rather than letting the guest
+        report a scratch buffer it cannot fill. The image is a 64 TiB VHDX
+        whose VirtualDiskSize is patched to 65 TiB; 64 MiB blocks leave its
+        BAT region room for the larger size.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 't.vhdx'
+            _, stderr, rc = self.run_instar_create('-f', 'vhdx', '-o', 'block_size=64M', str(path), str(64 << 40))
+            self.assertEqual(rc, 0, stderr)
+            vhdx_structure.patch_virtual_disk_size(path, 65 << 40)
+            before = self.sha256(path)
+            for size, args in (((65 << 40), ()), (((64 << 40) + 512), ('--shrink',))):
+                _, stderr, rc = self.run_instar_resize(*args, str(path), str(size))
+                self.assertNotEqual(rc, 0, f'resize to {size} succeeded')
+                self.assertIn(
+                    f'resize: virtual size {size} exceeds the VHDX maximum of 64 TiB ({64 << 40} bytes)', stderr)
+                self.assertEqual(self.sha256(path), before, 'a refused resize must not touch the VHDX')
 
     def test_qemu_dynamic_vhdx_still_grows(self):
         """A qemu-written dynamic VHDX still grows, so the refusal is not over-broad."""

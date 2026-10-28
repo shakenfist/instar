@@ -108,33 +108,37 @@ pub unsafe extern "C" fn _start() -> u64 {
     // surfaced via send_complete (mirrors info/check semantics).
     let mut bytes_read: u64 = 0;
 
-    // 1. Build AllocationSummary.
+    // 1. Build AllocationSummary, and resolve the target unit size for it.
     // Target unit size is the cluster/block/grain size of the chosen
     // target format. The source scanner needs it to correctly count
     // *target* units that contain allocated source data — without it,
     // a fragmented source would be collapsed into one contiguous run
-    // and under-count required data clusters (bug #286).
-    let target_unit_size = target_unit_size_for(config);
+    // and under-count required data clusters (bug #286). A VHDX
+    // target's default block size depends on the virtual size, so the
+    // unit is resolved once that size is known: from the override
+    // here, or inside `detect_and_scan` once the source's format arm
+    // has read it, before the scan. Resolving it before the size is
+    // known would count, and size, a large source in the 8 MiB blocks
+    // of a small one.
+    //
     // Which failure `detect_and_scan` reports if it returns `None`.
     // Almost every way the scan can fail really is "this is not an
     // image measure can read", which is what `ERROR_INVALID_SIZE`
     // renders; the one that is not overwrites this.
     let mut scan_error = MeasureResult::ERROR_INVALID_SIZE;
-    let summary = if config.virtual_size_override != 0 {
-        AllocationSummary {
+    let (summary, unit) = if config.virtual_size_override != 0 {
+        let summary = AllocationSummary {
             virtual_size: config.virtual_size_override,
             allocated_bytes: 0,
             target_units_with_data: 0,
-        }
+        };
+        (
+            summary,
+            target_unit_size_for(config, config.virtual_size_override),
+        )
     } else {
-        match detect_and_scan(
-            call_table,
-            config,
-            target_unit_size,
-            &mut bytes_read,
-            &mut scan_error,
-        ) {
-            Some(s) => s,
+        match detect_and_scan(call_table, config, &mut bytes_read, &mut scan_error) {
+            Some(scanned) => scanned,
             None => {
                 send_error_result(call_table, config.target_format, scan_error);
                 (call_table.send_complete)(b"measure\0".as_ptr(), bytes_read, false);
@@ -143,32 +147,19 @@ pub unsafe extern "C" fn _start() -> u64 {
         }
     };
 
-    // 2. Compute output for target format + resolve unit size.
+    // 2. Compute output for the target format. `unit` is the one value
+    // resolved in step 1, so the unit the scan counted in, the unit the
+    // calculator sizes with and the unit the result reports are the
+    // same. Only a VHDX target's unit depends on the size; for the
+    // others `target_unit_size_for` returns what their options say.
     let target = ImageFormat::from_u32(config.target_format);
-    let (out, unit): (Result<MeasureOutput, MeasureError>, u32) = match target {
-        ImageFormat::Raw => (measure_raw(summary.virtual_size), 0u32),
-        ImageFormat::Qcow2 => {
-            let opts = qcow2_opts_from(config);
-            (measure_qcow2(&summary, &opts), opts.cluster_size)
-        }
-        ImageFormat::Vmdk4 => {
-            let opts = vmdk_opts_from(config);
-            (measure_vmdk(&summary, &opts), opts.grain_size)
-        }
-        ImageFormat::Vhd => {
-            let opts = vhd_opts_from(config);
-            // For Fixed VHDs there is no block; report 0 in that case.
-            let unit = match opts.subformat {
-                VhdSubformat::Fixed => 0,
-                VhdSubformat::Dynamic => opts.block_size,
-            };
-            (measure_vhd(&summary, &opts), unit)
-        }
-        ImageFormat::Vhdx => {
-            let opts = vhdx_opts_from(config);
-            (measure_vhdx(&summary, &opts), opts.block_size)
-        }
-        _ => (Err(MeasureError::InvalidOption), 0),
+    let out: Result<MeasureOutput, MeasureError> = match target {
+        ImageFormat::Raw => measure_raw(summary.virtual_size),
+        ImageFormat::Qcow2 => measure_qcow2(&summary, &qcow2_opts_from(config)),
+        ImageFormat::Vmdk4 => measure_vmdk(&summary, &vmdk_opts_from(config)),
+        ImageFormat::Vhd => measure_vhd(&summary, &vhd_opts_from(config)),
+        ImageFormat::Vhdx => measure_vhdx(&summary, &VhdxOpts { block_size: unit }),
+        _ => Err(MeasureError::InvalidOption),
     };
 
     // 3. Send result and signal completion.
@@ -183,6 +174,7 @@ fn map_error(e: MeasureError) -> u32 {
         MeasureError::Overflow => MeasureResult::ERROR_OVERFLOW,
         MeasureError::InvalidOption => MeasureResult::ERROR_INVALID_OPTION,
         MeasureError::InvalidSize => MeasureResult::ERROR_INVALID_SIZE,
+        MeasureError::TooLarge => MeasureResult::ERROR_TOO_LARGE,
     }
 }
 
@@ -304,28 +296,40 @@ fn vhd_opts_from(c: &MeasureConfig) -> VhdOpts {
     opts
 }
 
-fn vhdx_opts_from(c: &MeasureConfig) -> VhdxOpts {
-    let mut opts = VhdxOpts::default();
+/// The VHDX block size for a target of `virtual_size` bytes: the one
+/// the user asked for, or qemu's default for the size, which is what
+/// convert writes when it is given none (`vhdx::default_block_size`: 8,
+/// 16, 32 or 64 MiB). qemu chooses from the size rounded up to 512
+/// bytes, and every threshold is a multiple of 512, so the unrounded
+/// size chooses the same block size.
+fn vhdx_block_size_for(c: &MeasureConfig, virtual_size: u64) -> u32 {
     if c.block_size != 0 {
-        opts.block_size = c.block_size;
+        c.block_size
+    } else {
+        vhdx::default_block_size(virtual_size)
     }
-    opts
 }
 
 /// Resolve the target unit size (qcow2 cluster, vhd/vhdx block, vmdk
-/// grain) for the configured target format. Returned to the source
-/// scanner so it can populate `AllocationSummary::target_units_with_data`
-/// — see bug #286. Returns `0` when the target format has no
-/// per-cluster sizing (raw, or unknown / unsupported).
-fn target_unit_size_for(c: &MeasureConfig) -> u64 {
+/// grain) for the configured target format and a source of
+/// `virtual_size` bytes. Returned to the source scanner so it can
+/// populate `AllocationSummary::target_units_with_data` — see bug
+/// #286 — and then used by the calculator and reported in the result.
+/// Returns `0` when the target format has no per-cluster sizing (raw, a
+/// fixed VHD, or unknown / unsupported). Only the VHDX target reads
+/// `virtual_size`.
+fn target_unit_size_for(c: &MeasureConfig, virtual_size: u64) -> u32 {
     match ImageFormat::from_u32(c.target_format) {
-        ImageFormat::Qcow2 => qcow2_opts_from(c).cluster_size as u64,
-        ImageFormat::Vmdk4 => vmdk_opts_from(c).grain_size as u64,
-        ImageFormat::Vhd => match vhd_opts_from(c).subformat {
-            VhdSubformat::Fixed => 0,
-            VhdSubformat::Dynamic => vhd_opts_from(c).block_size as u64,
-        },
-        ImageFormat::Vhdx => vhdx_opts_from(c).block_size as u64,
+        ImageFormat::Qcow2 => qcow2_opts_from(c).cluster_size,
+        ImageFormat::Vmdk4 => vmdk_opts_from(c).grain_size,
+        ImageFormat::Vhd => {
+            let opts = vhd_opts_from(c);
+            match opts.subformat {
+                VhdSubformat::Fixed => 0,
+                VhdSubformat::Dynamic => opts.block_size,
+            }
+        }
+        ImageFormat::Vhdx => vhdx_block_size_for(c, virtual_size),
         _ => 0,
     }
 }
@@ -357,8 +361,12 @@ unsafe fn refuse_differencing(call_table: &CallTable, status: u32) {
 }
 
 /// Detect the source format on device 0 and run the matching parser's
-/// `scan_allocation` to produce an [`AllocationSummary`]. Returns `None`
-/// if the format is unrecognised or the parser rejects the image.
+/// `scan_allocation` to produce an [`AllocationSummary`], with the
+/// target unit size resolved for the source's virtual size
+/// ([`target_unit_size_for`]). Each format arm resolves the unit once
+/// it has read the virtual size and before it scans, because the scan
+/// counts target units in it. Returns `None` if the format is
+/// unrecognised or the parser rejects the image.
 ///
 /// On `None`, `scan_error` names the [`MeasureResult`] error code to
 /// report. The caller sets it to `ERROR_INVALID_SIZE` beforehand,
@@ -377,10 +385,9 @@ unsafe fn refuse_differencing(call_table: &CallTable, status: u32) {
 unsafe fn detect_and_scan(
     call_table: &CallTable,
     config: &MeasureConfig,
-    target_unit_size: u64,
     bytes_read: &mut u64,
     scan_error: &mut u32,
-) -> Option<AllocationSummary> {
+) -> Option<(AllocationSummary, u32)> {
     let sector_size = config.sector_size as usize;
     let input_capacity = (call_table.get_input_capacity)(0);
 
@@ -404,12 +411,14 @@ unsafe fn detect_and_scan(
             // Raw images carry no allocation metadata — treat every byte
             // as allocated. Virtual size is the device capacity.
             let virtual_size = input_capacity.checked_mul(sector_size as u64)?;
-            Some(raw::scan_allocation(virtual_size, target_unit_size))
+            let unit = target_unit_size_for(config, virtual_size);
+            Some((raw::scan_allocation(virtual_size, u64::from(unit)), unit))
         }
         ImageFormat::Qcow2 => {
             // Parse the header from the sector we already read to
             // recover the virtual size (Qcow2State does not store it).
             let parsed = qcow2::QcowHeader::parse(header)?;
+            let unit = target_unit_size_for(config, parsed.virtual_size);
             let mut state = qcow2::Qcow2State::init(
                 call_table,
                 0,
@@ -419,14 +428,15 @@ unsafe fn detect_and_scan(
                 cache_b,
                 bytes_read,
             )?;
-            state.scan_allocation(
+            let summary = state.scan_allocation(
                 call_table,
                 sector_size,
                 input_capacity,
                 parsed.virtual_size,
-                target_unit_size,
+                u64::from(unit),
                 bytes_read,
-            )
+            )?;
+            Some((summary, unit))
         }
         ImageFormat::Vmdk4 => {
             // VMDK init needs an approximation of the actual file size
@@ -442,7 +452,13 @@ unsafe fn detect_and_scan(
                 cache_b,
                 bytes_read,
             )?;
-            state.scan_allocation(call_table, sector_size, input_capacity, bytes_read)
+            // The same size the scan reports (`capacity_sectors` of 512
+            // bytes). This scanner does not count target units yet
+            // (#286), so only the calculator reads the unit.
+            let unit = target_unit_size_for(config, state.capacity_sectors.checked_mul(512)?);
+            let summary =
+                state.scan_allocation(call_table, sector_size, input_capacity, bytes_read)?;
+            Some((summary, unit))
         }
         ImageFormat::Vhd => {
             let mut state = vhd::VhdState::init(
@@ -462,7 +478,12 @@ unsafe fn detect_and_scan(
                 refuse_differencing(call_table, DifferencingRefusal::STATUS_VHD);
                 return None;
             }
-            state.scan_allocation(call_table, sector_size, input_capacity, bytes_read)
+            // As for VMDK: the size the scan reports, and a unit only the
+            // calculator reads.
+            let unit = target_unit_size_for(config, state.current_size);
+            let summary =
+                state.scan_allocation(call_table, sector_size, input_capacity, bytes_read)?;
+            Some((summary, unit))
         }
         ImageFormat::Vhdx => {
             let mut state = vhdx::VhdxState::init(
@@ -481,6 +502,9 @@ unsafe fn detect_and_scan(
                 refuse_differencing(call_table, DifferencingRefusal::STATUS_VHDX);
                 return None;
             }
+            // As for VMDK: the size the scan reports, and a unit only the
+            // calculator reads.
+            let unit = target_unit_size_for(config, state.virtual_disk_size);
             let summary =
                 state.scan_allocation(call_table, sector_size, input_capacity, bytes_read);
             // The BAT walk refuses an image whose present payload
@@ -495,7 +519,7 @@ unsafe fn detect_and_scan(
             if summary.is_none() && state.block_table_malformed {
                 *scan_error = MeasureResult::ERROR_MALFORMED_BLOCK_TABLE;
             }
-            summary
+            Some((summary?, unit))
         }
         _ => None,
     }

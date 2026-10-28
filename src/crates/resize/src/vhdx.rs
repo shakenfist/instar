@@ -8,7 +8,7 @@
 //! active-header-redundancy).
 
 use vhdx::{
-    build_header, build_metadata, build_region_table, calculate_bat_layout, HEADER1_OFFSET,
+    build_header, build_metadata, build_region_table, calculate_bat_layout, layout, HEADER1_OFFSET,
     HEADER2_OFFSET, HEADER_SIZE, REGION_TABLE1_OFFSET, REGION_TABLE2_OFFSET,
 };
 
@@ -31,10 +31,6 @@ const REGION_TABLE_REGION_SIZE: usize = 64 * 1024;
 /// 1-MiB alignment for the BAT region (matches `plan_vhdx`).
 const ONE_MIB: u64 = 1 << 20;
 
-/// Minimum / maximum allowed VHDX block sizes (power-of-two).
-const MIN_BLOCK_SIZE: u32 = 1 << 20; // 1 MiB
-const MAX_BLOCK_SIZE: u32 = 256 << 20; // 256 MiB
-
 /// Top-level entry point.
 pub(crate) fn plan_grow<'a>(
     opts: &VhdxResizeOpts<'_>,
@@ -43,7 +39,11 @@ pub(crate) fn plan_grow<'a>(
     if opts.new_virtual_size == 0 {
         return Err(ResizeError::InvalidNewVirtualSize);
     }
-    if !is_valid_block_size(opts.block_size) {
+    // The block size is the existing image's. `vhdx::layout` below
+    // checks its range, but reads 0 as "choose qemu's default", which
+    // would size the BAT for a block size the image does not have, so
+    // 0 is refused here.
+    if opts.block_size == 0 {
         return Err(ResizeError::InvalidNewVirtualSize);
     }
     if opts.preallocation == Preallocation::Metadata {
@@ -97,13 +97,30 @@ pub(crate) fn plan_grow<'a>(
     // no-parent rule, and the relocated BAT carries none of the sector
     // bitmap blocks a grown child needs -- so the refusal is the thing
     // to revisit first, not this argument.
-    let (target_total_bat_entries, _chunk_ratio, _payload_blocks) = calculate_bat_layout(
-        opts.new_virtual_size,
-        opts.block_size,
-        opts.logical_sector_size,
-        false,
-    )
-    .ok_or(ResizeError::InvalidNewVirtualSize)?;
+    //
+    // The grown image is held to the rules for writing a VHDX: a block
+    // size the format allows, and no more than 64 TiB, the largest image
+    // qemu creates. Growing past that writes an image qemu would never
+    // have made, so it is refused as a new size the format cannot hold.
+    let geometry = layout(opts.new_virtual_size, opts.block_size, false)
+        .map_err(|_| ResizeError::InvalidNewVirtualSize)?;
+    // The layout counts BAT entries for the 512-byte logical sectors
+    // instar writes. The chunk ratio, and so the number of sector bitmap
+    // entries, depends on the logical sector size, and an existing image
+    // may declare 4096, so an image that does not use 512 is counted by
+    // its own.
+    let target_total_bat_entries = if opts.logical_sector_size == geometry.logical_sector_size {
+        geometry.bat_entries
+    } else {
+        let (entries, _chunk_ratio, _payload_blocks) = calculate_bat_layout(
+            opts.new_virtual_size,
+            opts.block_size,
+            opts.logical_sector_size,
+            false,
+        )
+        .ok_or(ResizeError::InvalidNewVirtualSize)?;
+        entries
+    };
 
     let action = decide_action(opts.current_total_bat_entries, target_total_bat_entries);
     match action {
@@ -124,10 +141,6 @@ pub(crate) fn decide_action(
     } else {
         VhdxGrowAction::BatGrowRelocate
     }
-}
-
-fn is_valid_block_size(block_size: u32) -> bool {
-    (MIN_BLOCK_SIZE..=MAX_BLOCK_SIZE).contains(&block_size) && block_size.is_power_of_two()
 }
 
 fn is_valid_active_header_offset(offset: u64) -> bool {
@@ -358,17 +371,6 @@ fn plan_bat_grow_relocate<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn block_size_validation() {
-        assert!(is_valid_block_size(1 << 20)); // 1 MiB
-        assert!(is_valid_block_size(2 << 20)); // 2 MiB
-        assert!(is_valid_block_size(32 << 20)); // 32 MiB (default)
-        assert!(is_valid_block_size(256 << 20)); // 256 MiB max
-        assert!(!is_valid_block_size(0));
-        assert!(!is_valid_block_size(512 << 20)); // > max
-        assert!(!is_valid_block_size((1 << 20) + 1)); // not power of two
-    }
 
     #[test]
     fn inactive_header_picks_the_other_one() {

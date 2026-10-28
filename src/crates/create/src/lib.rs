@@ -336,10 +336,12 @@ pub struct VhdCreateOpts<'a> {
 /// Options for [`plan_vhdx`].
 #[derive(Debug, Clone, Copy)]
 pub struct VhdxCreateOpts<'a> {
-    /// Logical (virtual) size of the resulting image, in bytes.
+    /// Logical (virtual) size of the resulting image, in bytes. The
+    /// image records it rounded up to 512 bytes, and above
+    /// [`vhdx::MAX_VIRTUAL_SIZE`] (64 TiB) it is refused.
     pub virtual_size: u64,
-    /// Block size in bytes. Must be a power of two in
-    /// `1 MiB..=256 MiB`.
+    /// Block size in bytes: a power of two in `1 MiB..=256 MiB`, or 0
+    /// for qemu's default for the size ([`vhdx::default_block_size`]).
     pub block_size: u32,
     /// Optional backing image to chain to. A backing reference makes
     /// the image a differencing child: the File Parameters `HasParent`
@@ -571,12 +573,23 @@ fn map_vhdx_build_error(e: vhdx::VhdxBuildError) -> CreateError {
         vhdx::VhdxBuildError::PathEmpty | vhdx::VhdxBuildError::UnknownKey => {
             CreateError::BackingFileUnsupported
         }
-        // The metadata region is always METADATA_REGION_LEN (1 MiB)
-        // and the largest locator item is 706 bytes, so this is a
+        // The metadata region is always `vhdx::METADATA_REGION_LENGTH`
+        // (1 MiB) and the largest locator item is 706 bytes, so this is a
         // planner bug rather than a user input; report it as the
         // scratch problem it would be. Mapped rather than unwrapped
         // because `crates/create` is panic-free.
         vhdx::VhdxBuildError::BufferTooSmall => CreateError::ScratchTooSmall,
+    }
+}
+
+/// Map a `vhdx::layout` refusal onto this crate's error type.
+fn map_vhdx_layout_error(e: vhdx::LayoutError) -> CreateError {
+    match e {
+        vhdx::LayoutError::InvalidBlockSize => CreateError::InvalidBlockSize,
+        // Above the 64 TiB ceiling: a size the format cannot hold,
+        // which is what `InvalidVirtualSize` means.
+        vhdx::LayoutError::TooLarge => CreateError::InvalidVirtualSize,
+        vhdx::LayoutError::Overflow => CreateError::Overflow,
     }
 }
 
@@ -1372,13 +1385,6 @@ pub fn plan_vhdx<'a>(
     if opts.virtual_size == 0 {
         return Err(CreateError::InvalidVirtualSize);
     }
-    if opts.block_size == 0
-        || !opts.block_size.is_power_of_two()
-        || opts.block_size < 1024 * 1024
-        || opts.block_size > 256 * 1024 * 1024
-    {
-        return Err(CreateError::InvalidBlockSize);
-    }
     // The parent path, typed. Both the locator's path value and its
     // `parent_linkage` sibling are UTF-16 fields, so a path that is not
     // valid UTF-8 cannot be represented at all; refuse rather than
@@ -1402,41 +1408,37 @@ pub fn plan_vhdx<'a>(
         None => None,
     };
 
-    const LOGICAL_SECTOR_SIZE: u32 = 512;
-    const PHYSICAL_SECTOR_SIZE: u32 = 4096;
     const FILE_ID_LEN: usize = 4096;
     const REGION_TABLE_LEN: usize = 65536;
-    const METADATA_REGION_LEN: usize = 1024 * 1024;
 
+    // Every offset, length and sector size below comes from the one
+    // writer layout, so this planner places the regions where convert
+    // does and where `measure` predicts. `layout` also rounds the size
+    // up to 512 bytes, which SPEC(VHDX) requires of `VirtualDiskSize`,
+    // and refuses a block size outside 1 MiB to 256 MiB.
+    //
     // A child pads its BAT out to whole chunk groups; an image with no
     // parent stops at the last entry it needs. `parent_path` is the
     // typed form of `opts.backing` decided above, so the BAT is sized
     // by the same fact the File Parameters `HasParent` bit and the
     // parent locator are written from, and the three cannot disagree.
-    let (total_bat_entries, _chunk_ratio, _payload_blocks) = vhdx::calculate_bat_layout(
-        opts.virtual_size,
-        opts.block_size,
-        LOGICAL_SECTOR_SIZE,
-        parent_path.is_some(),
-    )
-    .ok_or(CreateError::Overflow)?;
-    let bat_size_bytes: u64 = total_bat_entries as u64 * 8;
-    let bat_region_size: u64 = bat_size_bytes.div_ceil(vhdx::MB_ALIGN) * vhdx::MB_ALIGN;
+    let geometry = vhdx::layout(opts.virtual_size, opts.block_size, parent_path.is_some())
+        .map_err(map_vhdx_layout_error)?;
+    let metadata_region_len = geometry.metadata_region_len as usize;
 
     let file_id_off: u64 = 0;
     let header1_off: u64 = vhdx::HEADER1_OFFSET;
     let header2_off: u64 = vhdx::HEADER2_OFFSET;
     let rt1_off: u64 = vhdx::REGION_TABLE1_OFFSET;
     let rt2_off: u64 = vhdx::REGION_TABLE2_OFFSET;
-    let bat_off: u64 = 0x20_0000;
-    let metadata_off: u64 = bat_off + bat_region_size;
-    let total_file_size: u64 = metadata_off + METADATA_REGION_LEN as u64;
+    let metadata_off: u64 = geometry.metadata_offset;
+    let total_file_size: u64 = geometry.data_start;
 
     let total_scratch_needed: usize = FILE_ID_LEN
         + vhdx::HEADER_SIZE
         + vhdx::HEADER_SIZE
         + REGION_TABLE_LEN
-        + METADATA_REGION_LEN;
+        + metadata_region_len;
     if scratch.len() < total_scratch_needed {
         return Err(CreateError::ScratchTooSmall);
     }
@@ -1445,7 +1447,7 @@ pub fn plan_vhdx<'a>(
     let (header1_region, rest) = rest.split_at_mut(vhdx::HEADER_SIZE);
     let (header2_region, rest) = rest.split_at_mut(vhdx::HEADER_SIZE);
     let (rt_region, rest) = rest.split_at_mut(REGION_TABLE_LEN);
-    let (metadata_region, _) = rest.split_at_mut(METADATA_REGION_LEN);
+    let (metadata_region, _) = rest.split_at_mut(metadata_region_len);
 
     file_id_region.fill(0);
     vhdx::build_file_identifier(file_id_region);
@@ -1458,19 +1460,19 @@ pub fn plan_vhdx<'a>(
     rt_region.fill(0);
     vhdx::build_region_table(
         rt_region,
-        bat_off,
-        bat_region_size as u32,
+        geometry.bat_offset,
+        geometry.bat_region_len,
         metadata_off,
-        METADATA_REGION_LEN as u32,
+        geometry.metadata_region_len,
     );
 
     metadata_region.fill(0);
     let metadata_items_end = vhdx::build_metadata(
         metadata_region,
-        opts.block_size,
-        opts.virtual_size,
-        LOGICAL_SECTOR_SIZE,
-        PHYSICAL_SECTOR_SIZE,
+        geometry.block_size,
+        geometry.virtual_size,
+        geometry.logical_sector_size,
+        geometry.physical_sector_size,
         // File Parameters `HasParent`. That single bit, plus the
         // locator item appended below, is the whole of what makes this
         // a differencing child on the metadata side.
@@ -2721,6 +2723,69 @@ mod vhdx_plan_tests {
             plan_vhdx(&opts, &mut scratch),
             Err(CreateError::InvalidBlockSize)
         ));
+    }
+
+    /// SPEC(VHDX) requires `VirtualDiskSize` to be a multiple of the
+    /// logical sector size, and qemu rounds an odd size up to 512
+    /// bytes (`vhdx_co_create_opts`, qemu 7.0.0). The planner writes
+    /// the rounded size into the metadata item.
+    #[test]
+    fn plan_vhdx_rounds_the_virtual_size_up_to_512() {
+        let opts = default_opts(1_073_741_825);
+        let bytes = run(&opts);
+        let rt = &bytes
+            [vhdx::REGION_TABLE1_OFFSET as usize..vhdx::REGION_TABLE1_OFFSET as usize + 65536];
+        let ([_bat, metadata], _count) = vhdx::parse_region_table(rt).expect("parse region table");
+        let start = metadata.file_offset as usize;
+        let region = &bytes[start..start + metadata.length as usize];
+        let items = vhdx::parse_metadata_region(region).expect("parse metadata region");
+        assert_eq!(items.virtual_disk_size, 1_073_742_336);
+    }
+
+    /// A block size of 0 is qemu's default for the size
+    /// (`vhdx_co_create`, qemu 7.0.0): 8 MiB up to 1 GiB, then 16 MiB,
+    /// each threshold a strict `>`. The planner writes the resolved
+    /// value into the Block Size metadata item.
+    #[test]
+    fn plan_vhdx_block_size_0_is_qemus_default_for_the_size() {
+        for (virtual_size, block_size) in [
+            (1u64 << 30, 8 * 1024 * 1024),
+            ((1u64 << 30) + 512, 16 * 1024 * 1024),
+        ] {
+            let opts = VhdxCreateOpts {
+                block_size: 0,
+                ..default_opts(virtual_size)
+            };
+            let bytes = run(&opts);
+            let rt = &bytes
+                [vhdx::REGION_TABLE1_OFFSET as usize..vhdx::REGION_TABLE1_OFFSET as usize + 65536];
+            let ([_bat, metadata], _count) =
+                vhdx::parse_region_table(rt).expect("parse region table");
+            let start = metadata.file_offset as usize;
+            let region = &bytes[start..start + metadata.length as usize];
+            let items = vhdx::parse_metadata_region(region).expect("parse metadata region");
+            assert_eq!(items.block_size, block_size, "virtual size {virtual_size}");
+        }
+    }
+
+    /// 64 TiB is the largest image qemu creates (`vhdx_co_create`,
+    /// qemu 7.0.0, a strict `>` on the rounded size), so one sector
+    /// more is refused as a size the format cannot hold.
+    #[test]
+    fn plan_vhdx_refuses_a_size_above_64_tib() {
+        let mut scratch = vec![0u8; VHDX_MAX_METADATA_SCRATCH];
+        let opts = default_opts(vhdx::MAX_VIRTUAL_SIZE);
+        assert!(plan_vhdx(&opts, &mut scratch).is_ok());
+        for size in [vhdx::MAX_VIRTUAL_SIZE + 1, vhdx::MAX_VIRTUAL_SIZE + 512] {
+            let opts = default_opts(size);
+            assert!(
+                matches!(
+                    plan_vhdx(&opts, &mut scratch),
+                    Err(CreateError::InvalidVirtualSize)
+                ),
+                "size {size}"
+            );
+        }
     }
 
     #[test]
