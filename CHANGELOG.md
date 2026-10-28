@@ -18,7 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `functional-tests.yml` run did not succeed, and the tag is re-signed
   with gitsign only after a reviewer approves the `release`
   environment. `make release`, which tagged whatever was checked out,
-  has been removed. See the Releases section of `docs/development.md`.
+  has been removed. Release tags can be checked with
+  `gitsign verify-tag`; the Releases section of `docs/development.md`
+  gives the command and the exact identity to check.
 
 - **A `pyvhdi` data oracle cross-validates every real differencing
   chain's composed bytes, not just its parent linkage.**
