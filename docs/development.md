@@ -544,9 +544,23 @@ points to it rather than keeping its own. Where it says to move the
 tag:
 
 ```bash
-git push origin :refs/tags/v0.2.0   # needs the tag ruleset's bypass
+git push origin :refs/tags/v0.2.0
 git tag -d v0.2.0
 tools/tag-release.sh 0.2.0 <commit that went through the queue>
+```
+
+Deleting a `v*` tag needs the tag ruleset's bypass in a repository
+that has a "Release tags" ruleset, as the release template's
+[RELEASE-SETUP.md](https://github.com/shakenfist/development/blob/main/templates/release-automation/RELEASE-SETUP.md)
+recommends.
+
+Once `sign-tag` has run, anyone can check a release tag's signature:
+
+```bash
+git fetch --tags --force origin
+gitsign verify-tag v0.2.0 \
+  --certificate-identity-regexp "^https://github.com/shakenfist/instar/" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
 Running `release.yml` by hand with `workflow_dispatch` is a dry run:

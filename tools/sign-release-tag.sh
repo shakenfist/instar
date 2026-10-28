@@ -12,8 +12,10 @@
 #
 # The signature can be checked afterwards with
 #   gitsign verify-tag TAG_NAME \
-#     --certificate-identity-regexp '^https://github.com/shakenfist/<repository>/' \
+#     --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/" \
 #     --certificate-oidc-issuer https://token.actions.githubusercontent.com
+# GitHub Actions sets GITHUB_REPOSITORY; when running it by hand, set it
+# to the repository's owner/name first, e.g. GITHUB_REPOSITORY=shakenfist/ryll.
 #
 # Template source: shakenfist/development/templates/release-automation-rust/
 
