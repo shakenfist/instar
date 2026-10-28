@@ -490,6 +490,33 @@ The management session runs the steps in order. Every step edits
   control test with the region at 32 MiB, where the slot ends, must
   pass, and it was kept. All six affected script cases (the four new
   ones and the two whose search string moved) are killed.
+* **Definition of done, 2026-10-28 (AEDT).** Checked by the management
+  session on a fresh `make instar` at `3d2d3f6c`. Every item passes:
+  * The `DEFAULT_BLOCK_SIZE`, layout-literal, stale-claim and
+    plan-reference greps print nothing. The `32 * 1024 * 1024` grep
+    prints only QCOW2 scratch constants and explicit block sizes inside
+    `#[cfg(test)]` modules and crate integration tests, none of them a
+    VHDX default.
+  * `cluster-size` at all seven threshold sizes is as the survey's
+    table says, and `qemu-img info` agrees.
+  * 64 TiB + 1 is refused with the 64 TiB message and leaves no file.
+    1073741825 records 1073742336.
+  * Both divergence tables are empty of VHDX entries.
+  * `make test-rust` passes 2757, with 3 ignored, and
+    `make check-binary-sizes` passes.
+  * The partition check passes. The four new mutation-script cases are
+    4 PASS, and all 130 patterns land.
+  * The stestr run of the nine modules at 12 workers ran 1599 of the
+    1599 listed: 1187 passed, 412 skipped and 0 failed. The skips:
+    * 324 are the measure baselines missing at every version (#845).
+    * About 20 are measure sources where instar succeeds but the qemu
+      baseline recorded a failure. Develop's build gives the same exit
+      status on the same fixtures.
+    * 7 are `test_differencing` cases that need libvhdi, absent on this
+      host. 5d ran that module with libvhdi present.
+    * The rest are documented writer, scanner and resize divergences,
+      qemu-img being unable to resize a format, raw having no check,
+      and missing ZSTD support.
 
 ## Risks and mitigations
 
