@@ -682,7 +682,7 @@ self_test() {
 # phase's definition of done asks the two to stay in step, which until
 # now was a promise kept by hand. Asserting it makes the drift a
 # failure instead of a documentation bug nobody reads.
-EXPECTED_CASES=126
+EXPECTED_CASES=130
 
 check_case_count() {
     # Only meaningful for a whole run; a selection is expected to be short.
@@ -2385,23 +2385,82 @@ CHECK_BLOCK_COUNTED="${CHECK_BLOCK_TESTS}.test_check_counts_a_block_naming_the_i
 CHECK_BLOCK_TRAILING="${CHECK_BLOCK_TESTS}"
 CHECK_BLOCK_TRAILING="${CHECK_BLOCK_TRAILING}.test_every_operation_accepts_a_region_declared_after_the_blocks"
 
+CHECK_OVERLAP_CALL=$'                        vhdx::ranges_overlap(\n'
+CHECK_OVERLAP_CALL+=$'                            file_offset,\n'
+CHECK_OVERLAP_CALL+=$'                            block_size as u64,\n'
+CHECK_OVERLAP_CALL+=$'                            region_offset,\n'
+CHECK_OVERLAP_CALL+=$'                            region_length,\n'
+CHECK_OVERLAP_CALL+=$'                        )'
+
 integration_case 'check-vhdx-block-offset-zero-not-counted' "${CHECK_OP}" \
     '                if file_offset == 0 {' \
     '                if file_offset == 0 && false { // MUTATED' \
     "${CHECK_BLOCK_COUNTED}"
 
 integration_case 'check-vhdx-block-inside-a-region-not-counted' "${CHECK_OP}" \
-    '                        vhdx::ranges_overlap(file_offset, block_len, region_offset, region_length)' \
+    "${CHECK_OVERLAP_CALL}" \
     '                        // MUTATED: check no longer tests a block against the regions
                         let _ = (file_offset, block_len, region_offset, region_length);
                         false' \
     "${CHECK_BLOCK_COUNTED}"
 
 integration_case 'check-vhdx-region-test-replaced-by-a-high-water-mark' "${CHECK_OP}" \
-    '                        vhdx::ranges_overlap(file_offset, block_len, region_offset, region_length)' \
+    "${CHECK_OVERLAP_CALL}" \
     '                        // MUTATED: overlap test replaced by a high-water mark
                         file_offset < region_offset + u64::from(region_length)' \
     "${CHECK_BLOCK_TRAILING}"
+
+# ---------------------------------------------------------------------
+# A VHDX's partial last block, and the BAT entry count. When the virtual
+# size is not a multiple of the block size, the last payload block
+# holds only the remainder, and qemu allocates a fixed image's partial
+# last block only that far (#797). `check` sizes that block from its
+# payload index for the end-of-file bound, and as a whole block for the
+# declared-region overlap test, because its slot is still a whole block
+# and a dynamic grow makes it whole in place. The BAT holds
+# n + (n - 1) / chunk_ratio entries for n payload blocks with no parent
+# (SPEC(VHDX) 2.5, qemu's vhdx_calc_bat_entries, #626); n + n / c has
+# one entry too many whenever the blocks exactly fill their last chunk.
+#
+# Three cases are `check`'s, through the real binary, for the reason
+# the region cases above give. Clamping the block to the whole block
+# size calls qemu's own fixed image truncated. Taking the length from
+# the BAT index rather than the payload index agrees with it only
+# inside the first chunk, so only the image whose partial block lies
+# past the first chunk notices; the host qemu-img writes it at test
+# time. Sizing the overlap test by the short length lets a region sit
+# in the unused tail of the slot, which only the crafted image with a
+# region declared there tells apart. The fourth counts n + n / c,
+# caught by the crate test at each group edge.
+# ---------------------------------------------------------------------
+
+PARTIAL_TESTS='test_vhdx_fixed_fixtures.TestVhdxFixedReads'
+
+integration_case 'check-vhdx-partial-last-block-clamped-to-the-block-size' "${CHECK_OP}" \
+    '                    Some(remaining) => remaining.min(block_size as u64),' \
+    '                    Some(_remaining) => block_size as u64, // MUTATED' \
+    "${PARTIAL_TESTS}.test_vhdx_fixed_17M_bsz_off_data_check"
+
+integration_case 'check-vhdx-partial-last-block-sized-by-the-bat-index' "${CHECK_OP}" \
+    $'                let block_len = match payload_block_idx\n                    .checked_mul(block_size as u64)' \
+    $'                let block_len = match bat_idx // MUTATED\n                    .checked_mul(block_size as u64)' \
+    "${PARTIAL_TESTS}.test_vhdx_fixed_4608_5M_block_1M_bsz_off_check"
+
+CHECK_OVERLAP_SHORT=$'                        vhdx::ranges_overlap(\n'
+CHECK_OVERLAP_SHORT+=$'                            file_offset,\n'
+CHECK_OVERLAP_SHORT+=$'                            block_len, // MUTATED\n'
+CHECK_OVERLAP_SHORT+=$'                            region_offset,\n'
+CHECK_OVERLAP_SHORT+=$'                            region_length,\n'
+CHECK_OVERLAP_SHORT+=$'                        )'
+
+integration_case 'check-vhdx-partial-last-block-overlap-by-its-short-length' "${CHECK_OP}" \
+    "${CHECK_OVERLAP_CALL}" "${CHECK_OVERLAP_SHORT}" \
+    "${PARTIAL_TESTS}.test_region_in_the_unused_tail_of_the_partial_last_block_is_a_corruption"
+
+rust_case 'vhdx-bat-entry-count-the-old-rule' "${VHDX_LIB}" \
+    $'    let sb_entries = total_payload_blocks\n        .checked_sub(1)?\n        .checked_div(u64::from(chunk_ratio))?;' \
+    $'    let sb_entries = total_payload_blocks.checked_div(u64::from(chunk_ratio))?; // MUTATED' \
+    vhdx 'bat_entry_count_at_group_edges'
 
 # ---------------------------------------------------------------------
 # bench and check attaching an over-deep chain. Issue #633: every other

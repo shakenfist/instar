@@ -477,6 +477,19 @@ The management session runs the steps in order. Every step edits
   grew from 38048 to 39384 bytes. 8 `test_convert` failures (qcow2
   re-encodes) passed when replayed alone. `test_differencing` ran with
   libvhdi present and `INSTAR_REQUIRE_LIBVHDI=1`.
+* **5e.** Three commits, not four. The new overlap mutant and the
+  three phase 4 mutants share `tools/mutate-differencing.sh`'s
+  enforced case count and `docs/testing.md`'s case list, so splitting
+  them would have meant a hand-edited count in a state no test ran.
+  The overlap fix and the script cases therefore land together. Item 5
+  of the review quoted `(n - 1) / c` as the mutant, but that is the
+  current, correct rule, so the mutant restores the old `n / c`. The
+  crafted image appends a 1 MiB unrecognised, not-required region at
+  25 MiB, inside the unused tail of `vhdx-fixed-17M-bsz-off-data`'s
+  last 8 MiB slot, with both region tables' CRC-32C recomputed. A
+  control test with the region at 32 MiB, where the slot ends, must
+  pass, and it was kept. All six affected script cases (the four new
+  ones and the two whose search string moved) are killed.
 
 ## Risks and mitigations
 

@@ -1686,11 +1686,13 @@ unsafe fn check_vhdx(
         Some(v) => v,
         None => {
             // A geometry whose count does not fit the arithmetic
-            // cannot be backed by any BAT region.
+            // cannot be backed by any BAT region. Its own message,
+            // so that it is not mistaken for a region that is merely
+            // shorter than the count it must hold.
             result.corruptions += 1;
             result.total_errors += 1;
             result.flags |= CheckResult::FLAG_HAS_CORRUPTIONS;
-            (call_table.debug_print)(b"check: VHDX BAT region too small\n\0".as_ptr());
+            (call_table.debug_print)(b"check: VHDX BAT entry count overflows\n\0".as_ptr());
             return bytes_read;
         }
     };
@@ -1921,9 +1923,21 @@ unsafe fn check_vhdx(
                     payload_block_idx += 1;
                     continue;
                 }
+                // The overlap test uses the whole block size, not the
+                // short length the end-of-file bound uses. A partial
+                // last block's data ends with the virtual disk, but
+                // its slot is still a whole block: a dynamic grow
+                // makes that block whole in place, so a region
+                // declared in the slot's unused tail would then have
+                // virtual-disk data written over it.
                 if declared_regions[..declared_region_count].iter().any(
                     |&(region_offset, region_length)| {
-                        vhdx::ranges_overlap(file_offset, block_len, region_offset, region_length)
+                        vhdx::ranges_overlap(
+                            file_offset,
+                            block_size as u64,
+                            region_offset,
+                            region_length,
+                        )
                     },
                 ) {
                     result.corruptions += 1;
