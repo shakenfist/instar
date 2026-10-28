@@ -210,8 +210,8 @@ twoGbMaxExtent subformats.
 8. **VMDK / VHD / VHDX `resize` and VMDK `rebase` — instar-only** — qemu-img
  refuses these on every shipped version ("Image format driver does not
  support resize / rebase"); instar performs them (monolithicSparse for
- vmdk, dynamic for vhdx). See the Resize and Rebase Format Support tables below. Measured
- 2026-07-20.
+ vmdk, dynamic for vhdx). See the Resize and Rebase Format Support tables
+ below. Measured 2026-07-20.
 9. **VHD `check` — instar-only** — instar runs full VHD footer/BAT validation
  (rc 0); qemu-img refuses `check` on vpc ("This image format does not
  support checks", exit 63). Measured 2026-07-20.
