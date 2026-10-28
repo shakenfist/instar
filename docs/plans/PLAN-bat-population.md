@@ -898,7 +898,11 @@ warning about qemu-unreadable partial-last-block sizes applies to
 phase 8 too. Phase 9 also corrects `docs/quirks.md`'s measure entry
 for VHDX sources, which says instar treats every BAT block as fully
 allocated. The reverse is true: qemu counts every block, and instar
-counts no `ZERO` block (measured in phase 4's survey).
+counts no `ZERO` block (measured in phase 4's survey). The same
+backwards claim sits in the comment on
+`KNOWN_SOURCE_SCANNER_DIVERGENCES['qemu-vhdx']` in
+`tests/test_measure.py` ("VHDX scanner treats every block as fully
+allocated"), reported by phase 4's implementing session.
 
 **Phase 10** is the cross-version matrix for everything above:
 create and convert fixed cases across every profile (including the
