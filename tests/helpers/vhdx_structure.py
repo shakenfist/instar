@@ -533,6 +533,28 @@ def parse_vhdx(path) -> VhdxStructure:
         )
 
 
+def patch_virtual_disk_size(path, virtual_disk_size):
+    """Overwrite the VirtualDiskSize metadata item of the VHDX at `path`.
+
+    Metadata items carry no checksum (SPEC(VHDX) 2.6.1), so the patched
+    image still opens. The BAT region must already be long enough for the
+    new size, which the caller arranges by choosing the block size.
+    """
+    structure = parse_vhdx(path)
+    region = next(r for r in structure.region_table_1 if r.guid == METADATA_REGION_GUID)
+    item = next(i for i in structure.metadata_items
+                if i.guid == VIRTUAL_DISK_SIZE_GUID and not i.is_user)
+    with open(path, 'r+b') as f:
+        f.seek(region.offset + item.offset)
+        f.write(struct.pack('<Q', virtual_disk_size))
+    patched = parse_vhdx(path)
+    if patched.virtual_disk_size != virtual_disk_size:
+        raise AssertionError(f'patched {path} reads back {patched.virtual_disk_size}')
+    bat = next(r for r in patched.region_table_1 if r.guid == BAT_REGION_GUID)
+    if patched.bat_entry_count * 8 > bat.length:
+        raise AssertionError(f'{patched.bat_entry_count} BAT entries do not fit the {bat.length}-byte BAT region')
+
+
 def _region_table_summary(table: Tuple[RegionEntry, ...]) -> list:
     return [{'region': entry.name, 'offset': entry.offset, 'length': entry.length, 'required': entry.required}
             for entry in table]

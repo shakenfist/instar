@@ -6575,7 +6575,6 @@ class TestConvertVhdxBlockSize(InstarTestBase):
                 self.assertEqual(json.loads(r.stdout)['cluster-size'], block_size)
 
 
-
 class TestConvertVhdxSizeLimit(InstarTestBase):
     """convert and dd refuse a VHDX output above 64 TiB before opening it.
 
@@ -6611,6 +6610,7 @@ class TestConvertVhdxSizeLimit(InstarTestBase):
             self.assertNotEqual(rc, 0)
             self.assertIn(f'dd: virtual size {self.SIZE} {self.CEILING}', stderr)
             self.assertFalse(out.exists(), 'a refused dd left an output file')
+
 
 class TestConvertDmgToRaw(InstarTestBase):
     """DMG (Apple UDIF) convert-to-raw byte parity.

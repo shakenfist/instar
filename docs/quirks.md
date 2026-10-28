@@ -1281,9 +1281,14 @@ its size from the parent, a source `measure` reads) is refused there,
 by the shared VHDX layout, before anything is written.
 
 The one difference is what a refusal leaves behind. qemu-img creates the
-output file before the VHDX driver checks the size, so a refused `create`
-leaves a zero-length file (measured with qemu-img 10.0.13, and with the
-6.0.0 and 10.2.0 static builds); instar leaves nothing.
+output file before the VHDX driver checks the size, so a refused
+`create` leaves a zero-length file (measured with qemu-img 10.0.13, and
+with the 6.0.0 and 10.2.0 static builds); instar leaves nothing, whether
+the host refuses or, for `create -b`, the guest does. `convert` and `dd`
+also check the size in the guest, after the host has created the output,
+but from a size no larger than the one the host has already accepted, so
+that check refuses nothing from the command line; were it to, it would
+leave the empty output, as any convert the guest fails does (#849).
 
 The limit is a rule for creating an image, not for opening one: qemu
 does not check it on open, and nor do instar's readers. `info`, `check`
@@ -1329,9 +1334,10 @@ Same shortcut and rationale as `create`.
 `qemu-img: Image format driver does not support resize` on
 every qemu-img version from 6.0.0 through 10.2.0 (which the
 matrix exercises). instar resizes all three, except a fixed or a
-differencing VHDX, which it refuses too (see [resize.md](resize.md)). The baselines record qemu's rejection verbatim, both as
-documentation of the cross-tool gap and as a tripwire for the
-day qemu adds support. The `TestResizeConsistency`
+differencing VHDX, which it refuses too (see
+[resize.md](resize.md)). The baselines record qemu's rejection
+verbatim, both as documentation of the cross-tool gap and as a
+tripwire for the day qemu adds support. The `TestResizeConsistency`
 covers vmdk/vhd/vhdx via an `instar create → resize → info →
 check` round-trip rather than a cross-tool diff. If
 `vmdkinfo` / `vhdiinfo` (libyal) ever gain resize support,

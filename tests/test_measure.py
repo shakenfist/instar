@@ -1177,7 +1177,6 @@ class TestMeasureNewFormatRefusal(TestMeasureSmoke):
         self.assertGreater(data['fully-allocated'], 0)
 
 
-
 MIB = 1024 * 1024
 
 
@@ -1351,6 +1350,7 @@ class TestMeasureVhdxSizeLimit(InstarTestBase):
             # The limit is the target's: the same source measures as qcow2.
             _, stderr, rc = self.run_instar_measure(str(src), '-O', 'qcow2')
             self.assertEqual(rc, 0, stderr)
+
 
 class TestMeasureNoopPreallocation(TestMeasureSmoke):
     """vmdk, vpc and vhdx accept falloc and full as qemu does, where they change nothing.

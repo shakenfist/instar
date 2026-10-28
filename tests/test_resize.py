@@ -27,6 +27,7 @@ import tempfile
 from pathlib import Path
 
 from base import InstarTestBase
+from helpers import vhdx_structure
 from helpers.info_json import assert_info_equivalent
 
 
@@ -872,6 +873,29 @@ class TestResizeErrorPaths(TestResizeSmoke):
                 self.assertIn(
                     f'resize: virtual size {65 << 40} exceeds the VHDX maximum of 64 TiB ({64 << 40} bytes)',
                     stderr)
+                self.assertEqual(self.sha256(path), before, 'a refused resize must not touch the VHDX')
+
+    def test_vhdx_above_64_tib_is_refused_in_every_direction(self):
+        """A VHDX already above 64 TiB is refused a no-op and a shrink too, and is left byte-identical.
+
+        It is still read, as qemu opens one, but the resize guest stages at
+        most a 2 MiB BAT region, and above 64 TiB even 256 MiB blocks need
+        3 MiB, so the host names the limit rather than letting the guest
+        report a scratch buffer it cannot fill. The image is a 64 TiB VHDX
+        whose VirtualDiskSize is patched to 65 TiB; 64 MiB blocks leave its
+        BAT region room for the larger size.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 't.vhdx'
+            _, stderr, rc = self.run_instar_create('-f', 'vhdx', '-o', 'block_size=64M', str(path), str(64 << 40))
+            self.assertEqual(rc, 0, stderr)
+            vhdx_structure.patch_virtual_disk_size(path, 65 << 40)
+            before = self.sha256(path)
+            for size, args in (((65 << 40), ()), (((64 << 40) + 512), ('--shrink',))):
+                _, stderr, rc = self.run_instar_resize(*args, str(path), str(size))
+                self.assertNotEqual(rc, 0, f'resize to {size} succeeded')
+                self.assertIn(
+                    f'resize: virtual size {size} exceeds the VHDX maximum of 64 TiB ({64 << 40} bytes)', stderr)
                 self.assertEqual(self.sha256(path), before, 'a refused resize must not touch the VHDX')
 
     def test_qemu_dynamic_vhdx_still_grows(self):

@@ -8240,8 +8240,11 @@ fn run_resize(args: ResizeArgs, verbose: bool) -> Result<(), Box<dyn std::error:
             .ok_or("resize: new virtual size underflows below zero")?,
     };
 
-    // Only the size the image would grow to is checked: a VHDX already
-    // above the limit is still read, as qemu opens one, but not written.
+    // Every target size above the limit is refused, a no-op or shrink of
+    // a VHDX already above it as well as a grow. Such an image is still
+    // read, as qemu opens one, but the guest could not resize it in any
+    // direction: it stages at most a 2 MiB BAT region, and above 64 TiB
+    // even 256 MiB blocks need 3 MiB. This names the reason it cannot.
     if probed.format == IMAGE_FORMAT_VHDX {
         check_vhdx_virtual_size("resize", new_virtual_size)?;
     }

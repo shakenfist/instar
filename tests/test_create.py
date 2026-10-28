@@ -1860,28 +1860,6 @@ VHDX_MAX_VIRTUAL_SIZE = 64 << 40
 VHDX_CEILING_MESSAGE = f'exceeds the VHDX maximum of 64 TiB ({VHDX_MAX_VIRTUAL_SIZE} bytes)'
 
 
-def patch_vhdx_virtual_disk_size(path, virtual_disk_size):
-    """Overwrite the VirtualDiskSize metadata item of the VHDX at `path`.
-
-    Metadata items carry no checksum (SPEC(VHDX) 2.6.1), so the patched
-    image still opens. The BAT region must already be long enough for the
-    new size, which the caller arranges by choosing the block size.
-    """
-    structure = vhdx_structure.parse_vhdx(path)
-    region = next(r for r in structure.region_table_1 if r.guid == vhdx_structure.METADATA_REGION_GUID)
-    item = next(i for i in structure.metadata_items
-                if i.guid == vhdx_structure.VIRTUAL_DISK_SIZE_GUID and not i.is_user)
-    with open(path, 'r+b') as f:
-        f.seek(region.offset + item.offset)
-        f.write(struct.pack('<Q', virtual_disk_size))
-    patched = vhdx_structure.parse_vhdx(path)
-    if patched.virtual_disk_size != virtual_disk_size:
-        raise AssertionError(f'patched {path} reads back {patched.virtual_disk_size}')
-    bat = next(r for r in patched.region_table_1 if r.guid == vhdx_structure.BAT_REGION_GUID)
-    if patched.bat_entry_count * 8 > bat.length:
-        raise AssertionError(f'{patched.bat_entry_count} BAT entries do not fit the {bat.length}-byte BAT region')
-
-
 class TestCreateVhdxSizeLimits(InstarTestBase):
     """The 64 TiB VHDX ceiling and the 512-byte rounding of a VHDX's size.
 
@@ -1931,7 +1909,7 @@ class TestCreateVhdxSizeLimits(InstarTestBase):
         _, stderr, rc = self.run_instar_create(
             '-f', 'vhdx', '-o', 'block_size=64M', str(path), str(VHDX_MAX_VIRTUAL_SIZE))
         self.assertEqual(rc, 0, stderr)
-        patch_vhdx_virtual_disk_size(path, 65 << 40)
+        vhdx_structure.patch_virtual_disk_size(path, 65 << 40)
         return path
 
     def test_readers_open_a_vhdx_above_64_tib(self):
