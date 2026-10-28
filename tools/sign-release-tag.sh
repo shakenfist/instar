@@ -10,10 +10,17 @@
 #
 # Usage: tools/sign-release-tag.sh TAG_NAME COMMIT_SHA
 #
-# The signature can be checked afterwards with
+# The signature can be checked afterwards with gitsign
+# (https://github.com/sigstore/gitsign). Outside GitHub Actions, first
+# set GITHUB_REPOSITORY to the repository's owner/name, for example
+# GITHUB_REPOSITORY=shakenfist/ryll:
 #   gitsign verify-tag TAG_NAME \
-#     --certificate-identity-regexp '^https://github.com/shakenfist/<repository>/' \
+#     --certificate-identity-regexp "^https://github\.com/${GITHUB_REPOSITORY}/\.github/workflows/release\.yml@refs/tags/v[0-9]" \
 #     --certificate-oidc-issuer https://token.actions.githubusercontent.com
+# The certificate's identity is the signing workflow and the ref it ran
+# on, so this accepts release.yml run for a version tag, the only kind
+# this script signs, and nothing else: a pattern ending at the
+# repository would accept any of its workflows.
 #
 # Template source: shakenfist/development/templates/release-automation-rust/
 

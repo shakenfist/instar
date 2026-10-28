@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Releases go through the merge queue and are gated on CI.** A
+  release is now two steps: `tools/propose-release.sh` (or
+  `make propose-release VERSION=x.y.z`) opens a release pull request
+  that lands through the merge queue, then `tools/tag-release.sh` (or
+  `make tag-release VERSION=x.y.z`) tags the merged commit. The release workflow's
+  `ci-gate` job refuses to build a commit whose merge queue
+  `functional-tests.yml` run did not succeed, and the tag is re-signed
+  with gitsign only after a reviewer approves the `release`
+  environment. `make release`, which tagged whatever was checked out,
+  has been removed. Release tags can be checked with
+  `gitsign verify-tag`; the Releases section of `docs/development.md`
+  gives the command and the exact identity to check.
+
 - **A `pyvhdi` data oracle cross-validates every real differencing
   chain's composed bytes, not just its parent linkage.**
   `TestDifferencingLibvhdiOracle` already checked that `vhdiinfo`
@@ -656,6 +669,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   build if the shipped binary ever requires a glibc above 2.31.
 
 ### Removed
+
+- **`make release` is gone.** Use `make propose-release VERSION=x.y.z`,
+  then `make tag-release VERSION=x.y.z` once the release pull request
+  has merged; the Releases section of `docs/development.md` has the
+  details.
 
 - **The `@shakenfist-bot please address comments` automation is
   retired**, along with `pr-address-comments.yml` and its helper
