@@ -853,6 +853,27 @@ class TestResizeErrorPaths(TestResizeSmoke):
         """`--shrink` on the FULLY_PRESENT fixture gets the same refusal."""
         self._assert_fixed_vhdx_refused('vhdx-fixed-16M-bsz-off-data', '8M', '--shrink')
 
+    # ----------- VHDX size ceiling (issue #799) -----------
+    #
+    # qemu-img creates no VHDX above 64 TiB (vhdx_co_create, qemu 7.0.0
+    # block/vhdx.c), so resize refuses to grow one past it, on the host,
+    # before the image is opened for writing.
+
+    def test_vhdx_grow_above_64_tib_refused(self):
+        """Growing a 64 TiB VHDX to 65 TiB is refused and leaves it byte-identical."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 't.vhdx'
+            _, stderr, rc = self.run_instar_create('-f', 'vhdx', str(path), str(64 << 40))
+            self.assertEqual(rc, 0, stderr)
+            before = self.sha256(path)
+            for size in (str(65 << 40), '+1T'):
+                _, stderr, rc = self.run_instar_resize(str(path), size)
+                self.assertNotEqual(rc, 0, f'resize to {size} succeeded')
+                self.assertIn(
+                    f'resize: virtual size {65 << 40} exceeds the VHDX maximum of 64 TiB ({64 << 40} bytes)',
+                    stderr)
+                self.assertEqual(self.sha256(path), before, 'a refused resize must not touch the VHDX')
+
     def test_qemu_dynamic_vhdx_still_grows(self):
         """A qemu-written dynamic VHDX still grows, so the refusal is not over-broad."""
         with tempfile.TemporaryDirectory() as td:

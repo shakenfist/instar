@@ -665,6 +665,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **A VHDX larger than 64 TiB is refused by name**, as qemu-img refuses
+  to create one, in `create`, `convert`, `dd`, `measure -O vhdx` and
+  `resize`, before any output is written
+  ([#799](https://github.com/shakenfist/instar/issues/799)). `measure`
+  of a source that large used to say the source was an unsupported
+  format. Readers still open such an image, as qemu does.
+- **`create -f vhdx` rounds the size up to a multiple of 512**, as
+  qemu-img does, instead of recording a `VirtualDiskSize` the format
+  forbids ([#843](https://github.com/shakenfist/instar/issues/843)).
 - **Unallocated clusters in data-file qcow2 images read the data file**
   instead of the backing file or zeros
   ([#792](https://github.com/shakenfist/instar/issues/792)).

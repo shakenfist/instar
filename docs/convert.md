@@ -94,7 +94,12 @@ The default can also be set via `convert.sparse` in the config file.
 - **vpc** - VHD dynamic output, configurable block size (512KB+,
   default 2MB via `--block-size`)
 - **vhdx** - VHDX dynamic output, configurable block size (1MB-256MB,
-  default 32MB via `--block-size`)
+  default 32MB via `--block-size`). The virtual size is at most 64 TiB
+  (70368744177664 bytes), the largest VHDX qemu-img creates: a larger
+  source is refused before the output file is opened, with `convert:
+  virtual size N exceeds the VHDX maximum of 64 TiB (70368744177664
+  bytes)`, and no output file is left behind. A size that is not a
+  multiple of 512 is recorded rounded up to one, as qemu-img does.
 
 ## Differencing images
 

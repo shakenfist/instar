@@ -1025,6 +1025,9 @@ pub unsafe extern "C" fn _start() -> u64 {
     let scratch =
         core::slice::from_raw_parts_mut(CREATE_SCRATCH as *mut u8, GUEST_CREATE_SCRATCH_LIMIT);
 
+    // The size the image records, reported back to the host. Only VHDX
+    // records a different size from the one asked for.
+    let mut recorded_virtual_size = virtual_size;
     let (plan, resolved_unit_size) = match target {
         ImageFormat::Qcow2 => {
             let opts = qcow2_opts_from(config, virtual_size, backing_ref);
@@ -1076,7 +1079,17 @@ pub unsafe extern "C" fn _start() -> u64 {
             };
             let unit = opts.block_size;
             match plan_vhdx(&opts, scratch) {
-                Ok(p) => (p, unit),
+                Ok(p) => {
+                    // plan_vhdx records the size rounded up to 512 bytes,
+                    // as qemu-img does, because VirtualDiskSize must be a
+                    // multiple of the logical sector size. The layout it
+                    // took that from cannot refuse here, having just
+                    // succeeded for the planner.
+                    if let Ok(geometry) = vhdx::layout(virtual_size, opts.block_size, false) {
+                        recorded_virtual_size = geometry.virtual_size;
+                    }
+                    (p, unit)
+                }
                 Err(e) => return fail_with(call_table, config.target_format, map_create_error(e)),
             }
         }
@@ -1125,7 +1138,7 @@ pub unsafe extern "C" fn _start() -> u64 {
     send_result(
         call_table,
         config.target_format,
-        virtual_size,
+        recorded_virtual_size,
         bytes_written,
         file_size_after,
         resolved_unit_size,

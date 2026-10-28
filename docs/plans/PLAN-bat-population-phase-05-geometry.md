@@ -443,6 +443,25 @@ The management session runs the steps in order. Every step edits
   The 16 `test_convert` failures under a load average of about 18 were
   qcow2, vmdk and vpc re-encodes and VHD compares. All 16 passed when
   replayed alone.
+* **5c.** Measure gained `MeasureResult::ERROR_TOO_LARGE = 5`, as
+  decision 5 allowed, because its existing code read as an unreadable
+  source. The agent's mutation run, with each host refusal removed,
+  found that the convert and dd guest backstop exited 0 and kept an
+  empty output file. Its layout refusal sent an error but no failed
+  completion, as the overflow path had before 5b. Fixed. Exit 1 still
+  leaves the empty file, because the host does not clean up after a
+  guest failure in general, which is out of scope. Two more fixes went
+  beyond the brief, kept because each makes a printed message true:
+  `create -b` of an over-limit VHDX parent now names the VHDX maximum
+  instead of advising a larger cluster size, and `create`'s `Created:`
+  line reports the rounded size. The management session reproduced
+  every host refusal's message, `create` at 64 TiB (a 20 MiB sparse
+  file), and resize leaving a 64 TiB image unchanged. A measure of a
+  scanned source prints its message twice, once from the guest and
+  once from the host, which is the existing pattern for every guest
+  measure failure (checked against the `6bafd318` build). 4
+  `test_convert` failures at load averages of 28 to 40 all passed when
+  replayed alone.
 
 ## Risks and mitigations
 

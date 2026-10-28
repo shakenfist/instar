@@ -218,7 +218,22 @@ Accepted but no size effect:
 ### vhdx
 
 Honoured:
-- `size`, `block_size` (1 MiB..256 MiB power of two)
+- `size`, at most 64 TiB (70368744177664 bytes), the largest VHDX
+  qemu-img creates. A larger size is refused before the output file is
+  opened, so nothing is left behind (qemu-img leaves an empty file):
+
+  ```
+  $ instar create -f vhdx big.vhdx 65T
+  Error: "create: virtual size 71468255805440 exceeds the VHDX maximum of 64 TiB (70368744177664 bytes)"
+  ```
+
+  A size taken from a backing file is checked in the guest and refused
+  with `backing file's virtual size exceeds the VHDX maximum of 64 TiB`.
+  A size that is not a multiple of 512 is rounded up to one, as qemu-img
+  does, because `VirtualDiskSize` must be a multiple of the logical
+  sector size: `1073741825` records `1073742336`, and the `Created:`
+  line reports the recorded size.
+- `block_size` (1 MiB..256 MiB power of two)
 - `preallocation` (off|falloc|full; `falloc` and `full` are no-ops, `metadata` is refused)
 - `backing_file`, `backing_fmt` — a VHDX child with a parent sets the
   `HasParent` file-parameter bit and writes a populated parent

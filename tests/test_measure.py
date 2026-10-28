@@ -1176,6 +1176,45 @@ class TestMeasureNewFormatRefusal(TestMeasureSmoke):
         self.assertGreater(data['fully-allocated'], 0)
 
 
+
+class TestMeasureVhdxSizeLimit(InstarTestBase):
+    """measure -O vhdx refuses a size above 64 TiB, the largest VHDX qemu-img creates.
+
+    An explicit --size is refused on the host. A source's size is learnt
+    only in the guest, which refuses it with its own result code rather
+    than the "unsupported format" one, because the source was read.
+    """
+
+    # Borrowed rather than inherited, so the smoke tests do not run twice.
+    run_instar_measure = TestMeasureSmoke.run_instar_measure
+
+    CEILING = f'exceeds the VHDX maximum of 64 TiB ({64 << 40} bytes)'
+    SIZE = 65 << 40
+
+    def test_size_at_64_tib_is_measured(self):
+        _, stderr, rc = self.run_instar_measure('--size', str(64 << 40), '-O', 'vhdx')
+        self.assertEqual(rc, 0, stderr)
+
+    def test_size_above_64_tib_is_refused(self):
+        for size in ((64 << 40) + 1, self.SIZE):
+            stdout, stderr, rc = self.run_instar_measure('--size', str(size), '-O', 'vhdx')
+            self.assertNotEqual(rc, 0, stdout)
+            self.assertIn(f'measure: virtual size {size} {self.CEILING}', stderr)
+
+    def test_source_above_64_tib_is_refused_by_name(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / 'src.qcow2'
+            r = subprocess.run([str(self.get_instar_binary()), 'create', '-f', 'qcow2', str(src), str(self.SIZE)],
+                               capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            stdout, stderr, rc = self.run_instar_measure(str(src), '-O', 'vhdx')
+            self.assertNotEqual(rc, 0, stdout)
+            self.assertIn(f'source virtual size {self.CEILING}', stderr)
+            self.assertNotIn('unsupported format', stderr)
+            # The limit is the target's: the same source measures as qcow2.
+            _, stderr, rc = self.run_instar_measure(str(src), '-O', 'qcow2')
+            self.assertEqual(rc, 0, stderr)
+
 class TestMeasureNoopPreallocation(TestMeasureSmoke):
     """vmdk, vpc and vhdx accept falloc and full as qemu does, where they change nothing.
 

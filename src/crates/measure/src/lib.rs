@@ -57,6 +57,10 @@ impl MeasureOutput {
 ///   range).
 /// - `InvalidSize`: `virtual_size` or `allocated_bytes` is outside the
 ///   range accepted by the target format (e.g. qcow2 caps at 2^63).
+/// - `TooLarge`: `virtual_size` is above the largest image the target
+///   format may be created at (VHDX: `vhdx::MAX_VIRTUAL_SIZE`, 64 TiB).
+///   Distinct from `InvalidSize`, which the host reports as a source it
+///   cannot read: here the source was read, and only the target refuses.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MeasureError {
     /// An arithmetic overflow occurred during size calculation.
@@ -65,6 +69,8 @@ pub enum MeasureError {
     InvalidOption,
     /// The virtual size or allocated bytes is out of range for the format.
     InvalidSize,
+    /// The virtual size is above the target format's creation limit.
+    TooLarge,
 }
 
 /// Convenience alias for the result type returned by all measure functions.
@@ -1008,7 +1014,7 @@ impl Default for VhdxOpts {
 ///
 /// A block size the layout refuses is [`MeasureError::InvalidOption`];
 /// a virtual size above `vhdx::MAX_VIRTUAL_SIZE` (64 TiB) is
-/// [`MeasureError::InvalidSize`].
+/// [`MeasureError::TooLarge`].
 pub fn measure_vhdx(s: &AllocationSummary, opts: &VhdxOpts) -> MeasureResult {
     // ---- Layout via the writer's helper. ----------------------------------
     // The layout also checks the block size (a power of two from 1 MiB to
@@ -1023,7 +1029,7 @@ pub fn measure_vhdx(s: &AllocationSummary, opts: &VhdxOpts) -> MeasureResult {
     // option is the thing to add first if that ever changes.
     let geometry = vhdx::layout(s.virtual_size, opts.block_size, false).map_err(|e| match e {
         vhdx::LayoutError::InvalidBlockSize => MeasureError::InvalidOption,
-        vhdx::LayoutError::TooLarge => MeasureError::InvalidSize,
+        vhdx::LayoutError::TooLarge => MeasureError::TooLarge,
         vhdx::LayoutError::Overflow => MeasureError::Overflow,
     })?;
 
@@ -3030,7 +3036,7 @@ mod tests {
             };
             assert_eq!(
                 measure_vhdx(&s, &opts),
-                Err(MeasureError::InvalidSize),
+                Err(MeasureError::TooLarge),
                 "virtual size {virtual_size}"
             );
         }
@@ -3159,7 +3165,7 @@ mod tests {
             target_units_with_data: 0,
         };
         let opts = VhdxOpts::default();
-        assert_eq!(measure_vhdx(&s, &opts), Err(MeasureError::InvalidSize));
+        assert_eq!(measure_vhdx(&s, &opts), Err(MeasureError::TooLarge));
     }
 
     // ====================================================================

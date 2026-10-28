@@ -4430,7 +4430,10 @@ unsafe fn convert_to_vhdx(
                 vhdx::LayoutError::Overflow => b"VHDX layout overflow\0",
             };
             (call_table.send_error)(b"convert\0".as_ptr(), reason.as_ptr(), 0, 1);
-            return 1;
+            // Without a failed completion the host treats the run as a
+            // success and keeps an empty output file.
+            (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+            return *bytes_read;
         }
     };
     // From here on the block size is the one the layout resolved, which

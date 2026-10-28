@@ -2981,6 +2981,12 @@ impl MeasureResult {
     /// the contradiction. Reusing that code would send the user
     /// looking for a format problem that does not exist.
     pub const ERROR_MALFORMED_BLOCK_TABLE: u32 = 4;
+    /// The source was read, and its virtual size is above the largest
+    /// image the target format may be created at (VHDX: 64 TiB). Distinct
+    /// from [`Self::ERROR_INVALID_SIZE`] for the same reason as
+    /// [`Self::ERROR_MALFORMED_BLOCK_TABLE`]: the source's format is not
+    /// the problem, the target's limit is.
+    pub const ERROR_TOO_LARGE: u32 = 5;
 
     /// True if magic matches.
     pub fn is_valid(&self) -> bool {
@@ -6732,6 +6738,7 @@ mod tests {
         assert_eq!(MeasureResult::ERROR_INVALID_OPTION, 2);
         assert_eq!(MeasureResult::ERROR_INVALID_SIZE, 3);
         assert_eq!(MeasureResult::ERROR_MALFORMED_BLOCK_TABLE, 4);
+        assert_eq!(MeasureResult::ERROR_TOO_LARGE, 5);
     }
 
     #[test]

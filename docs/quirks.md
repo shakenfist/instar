@@ -1255,6 +1255,38 @@ demonstrates clean round-trip for explicit block-size cases
 (`1G-block-16M`, `1G-block-32M`). Future work is to match
 qemu's 32 MiB default at all virtual sizes.
 
+### A VHDX is at most 64 TiB, and its size is a multiple of 512
+
+qemu-img creates no VHDX larger than 64 TiB (70368744177664 bytes):
+`vhdx_co_create` (qemu 7.0.0, `block/vhdx.c`) refuses a larger size with
+"Image size too large; max of 64TB", a strict `>`, so 64 TiB itself is
+accepted. instar applies the same limit to every VHDX it writes, in
+`create`, `convert`, `dd`, `measure -O vhdx` and `resize`. Where the
+host knows the size it refuses with `<op>: virtual size N exceeds the
+VHDX maximum of 64 TiB (70368744177664 bytes)` before it opens or creates
+the output; a size learnt only in the guest (a `create -b` that takes
+its size from the parent, a source `measure` reads) is refused there,
+by the shared VHDX layout, before anything is written.
+
+The one difference is what a refusal leaves behind. qemu-img creates the
+output file before the VHDX driver checks the size, so a refused `create`
+leaves a zero-length file (measured with qemu-img 10.0.13, and with the
+6.0.0 and 10.2.0 static builds); instar leaves nothing.
+
+The limit is a rule for creating an image, not for opening one: qemu
+does not check it on open, and nor do instar's readers. `info`, `check`
+and `measure -O qcow2` read a VHDX that claims more than 64 TiB, and
+`convert` to another format does not refuse one.
+
+qemu-img also rounds a requested size up to a multiple of 512
+(`vhdx_co_create_opts`, "Silently round up sizes"), because
+`VirtualDiskSize` must be a multiple of the logical sector size. instar
+does the same in `create` (`1073741825` records `1073742336`) and sizes
+`measure -O vhdx` from the rounded size, which is what `convert` and
+`dd` already declared. The thresholds of the limit and of qemu's
+default block size are all multiples of 512, so rounding never changes
+which side of one a size falls.
+
 ### VHD fixed subformat carries footer-only metadata
 
 `instar create -f vpc -o subformat=fixed FILENAME SIZE` produces

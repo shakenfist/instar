@@ -6551,6 +6551,43 @@ class TestConvertVhdxBlockSize(InstarTestBase):
         )
 
 
+
+class TestConvertVhdxSizeLimit(InstarTestBase):
+    """convert and dd refuse a VHDX output above 64 TiB before opening it.
+
+    qemu-img refuses to create such a VHDX (vhdx_co_create, qemu 7.0.0
+    block/vhdx.c). The 65 TiB source is a sparse qcow2, so nothing here
+    allocates more than its metadata.
+    """
+
+    CEILING = f'exceeds the VHDX maximum of 64 TiB ({64 << 40} bytes)'
+    SIZE = 65 << 40
+
+    def _sparse_65_tib_qcow2(self, td):
+        path = Path(td) / 'src.qcow2'
+        r = subprocess.run([str(self.get_instar_binary()), 'create', '-f', 'qcow2', str(path), str(self.SIZE)],
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return path
+
+    def test_convert_refuses_without_creating_the_output(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = self._sparse_65_tib_qcow2(td)
+            out = Path(td) / 'out.vhdx'
+            _, stderr, rc = self.run_instar_convert(src, out, output_format='vhdx')
+            self.assertNotEqual(rc, 0)
+            self.assertIn(f'convert: virtual size {self.SIZE} {self.CEILING}', stderr)
+            self.assertFalse(out.exists(), 'a refused convert left an output file')
+
+    def test_dd_refuses_without_creating_the_output(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = self._sparse_65_tib_qcow2(td)
+            out = Path(td) / 'out.vhdx'
+            _, stderr, rc = self.run_instar_dd([f'if={src}', f'of={out}'], output_format='vhdx')
+            self.assertNotEqual(rc, 0)
+            self.assertIn(f'dd: virtual size {self.SIZE} {self.CEILING}', stderr)
+            self.assertFalse(out.exists(), 'a refused dd left an output file')
+
 class TestConvertDmgToRaw(InstarTestBase):
     """DMG (Apple UDIF) convert-to-raw byte parity.
 

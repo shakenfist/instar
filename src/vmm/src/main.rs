@@ -151,13 +151,11 @@ const MEASURE_CONFIG_PREALLOC_FULL: u32 = 3 << 4;
 // MeasureResult constants (must match shared crate)
 const MEASURE_RESULT_MAGIC: u32 = 0x4D524553; // "MRES"
 const MEASURE_RESULT_ERROR_OK: u32 = 0;
-#[allow(dead_code)]
 const MEASURE_RESULT_ERROR_OVERFLOW: u32 = 1;
-#[allow(dead_code)]
 const MEASURE_RESULT_ERROR_INVALID_OPTION: u32 = 2;
-#[allow(dead_code)]
 const MEASURE_RESULT_ERROR_INVALID_SIZE: u32 = 3;
 const MEASURE_RESULT_ERROR_MALFORMED_BLOCK_TABLE: u32 = 4;
+const MEASURE_RESULT_ERROR_TOO_LARGE: u32 = shared::MeasureResult::ERROR_TOO_LARGE;
 
 // MapConfig constants (must match shared::MapConfig)
 const MAP_CONFIG_MAGIC: u32 = 0x4D41505F; // "MAP_"
@@ -8237,6 +8235,12 @@ fn run_resize(args: ResizeArgs, verbose: bool) -> Result<(), Box<dyn std::error:
             .ok_or("resize: new virtual size underflows below zero")?,
     };
 
+    // Only the size the image would grow to is checked: a VHDX already
+    // above the limit is still read, as qemu opens one, but not written.
+    if probed.format == IMAGE_FORMAT_VHDX {
+        check_vhdx_virtual_size("resize", new_virtual_size)?;
+    }
+
     if probed.format == IMAGE_FORMAT_RAW {
         run_resize_raw(&args, &probed, new_virtual_size)
     } else {
@@ -13247,27 +13251,12 @@ fn print_measure_result(
     if let Some(guest_::GuestMessage_::Payload::MeasureResult(result)) = &msg.payload {
         // Error path: emit a clear stderr message; print nothing on stdout.
         if result.error != MEASURE_RESULT_ERROR_OK {
-            let msg = match result.error {
-                MEASURE_RESULT_ERROR_OVERFLOW => "measure: overflow computing target size",
-                MEASURE_RESULT_ERROR_INVALID_OPTION => "measure: invalid option for target format",
-                MEASURE_RESULT_ERROR_INVALID_SIZE => "measure: source image is unsupported format",
-                // Not "unsupported format": the format was recognised
-                // and the allocation scan walked the block table far
-                // enough to find it naming a block the reader refuses
-                // to read. The image is malformed, not foreign. The
-                // same code is spelled out again in `run_measure`,
-                // which renders the failure the process exits on while
-                // this renders the one printed as the result arrives;
-                // both are reachable and both used to say "unknown
-                // error" for a code only one of them knew about.
-                MEASURE_RESULT_ERROR_MALFORMED_BLOCK_TABLE => {
-                    "measure: source block table names a block inside the image's own \
-                     structure (at file offset zero, or overlapping a region the image \
-                     declares); the format is recognised, the image is malformed"
-                }
-                _ => "measure: unknown error",
-            };
-            eprintln!("{}", msg);
+            // The same detail `run_measure` returns as the failure the
+            // process exits on; this is the line printed as the result
+            // arrives. Both are reachable, and both once said "unknown
+            // error" for a code only one of them knew about, so they
+            // share one table.
+            eprintln!("measure: {}", measure_error_detail(result.error));
             return;
         }
 
@@ -13916,6 +13905,29 @@ fn parse_output_format(s: &str) -> Result<u32, Box<dyn std::error::Error>> {
     }
 }
 
+/// Refuse a VHDX virtual size above `vhdx::MAX_VIRTUAL_SIZE` (64 TiB).
+///
+/// qemu-img refuses to create such an image ("Image size too large; max
+/// of 64TB", `vhdx_co_create` in qemu 7.0.0's `block/vhdx.c`), and
+/// `vhdx::layout` refuses it in the guest. Every host path that knows the
+/// size an output VHDX will declare calls this before it creates or opens
+/// the output, so the user gets a message naming the limit and nothing is
+/// left behind. `op` is the subcommand, which prefixes the message.
+///
+/// The writer rounds the size up to a multiple of 512 before it compares,
+/// as qemu does. The limit is itself a multiple of 512, so comparing the
+/// unrounded size gives the same answer and cannot overflow.
+fn check_vhdx_virtual_size(op: &str, virtual_size: u64) -> Result<(), String> {
+    if virtual_size > vhdx::MAX_VIRTUAL_SIZE {
+        return Err(format!(
+            "{op}: virtual size {virtual_size} exceeds the VHDX maximum of {} TiB ({} bytes)",
+            vhdx::MAX_VIRTUAL_SIZE >> 40,
+            vhdx::MAX_VIRTUAL_SIZE
+        ));
+    }
+    Ok(())
+}
+
 /// The VHDX output block size convert and dd use when none is given.
 ///
 /// The guest substitutes 32 MiB for an unset block size
@@ -13955,11 +13967,14 @@ fn compute_output_capacity(target_format: u32, vsize: u64, block_size: u32) -> u
             Ok(geometry) => u64::from(geometry.payload_blocks)
                 .saturating_mul(u64::from(geometry.block_size))
                 .saturating_add(geometry.data_start),
-            // A size or block size the layout refuses. The guest refuses
-            // it too, before it writes anything, so the capacity is never
-            // used to hold an image; it only needs to be some value. Keep
-            // a block-rounded estimate with a fixed allowance for the
-            // structures before the payload, as for an unchecked size.
+            // A size or block size the layout refuses. convert and dd
+            // refuse both on the host before they get here
+            // (`check_vhdx_virtual_size` and the block size validation),
+            // and the guest refuses them again before it writes anything,
+            // so the capacity is never used to hold an image; it only
+            // needs to be some value. Keep a block-rounded estimate with a
+            // fixed allowance for the structures before the payload, as
+            // for an unchecked size.
             Err(_) => {
                 let vhdx_block = u64::from(VHDX_OUTPUT_BLOCK_SIZE_WHEN_UNSET);
                 vsize
@@ -14395,6 +14410,17 @@ fn execute_convert(
     }
     // Output virtual size: input's for convert, dd's out_vsize otherwise.
     let out_vsize = exec.output_vsize_override.unwrap_or(virtual_size);
+    // Before the output is opened, so a refused VHDX leaves no file.
+    // `execute_convert` serves both subcommands, and only dd passes a
+    // window, so that names the one the user ran.
+    if is_vhdx_output {
+        let op = if exec.window.is_some() {
+            "dd"
+        } else {
+            "convert"
+        };
+        check_vhdx_virtual_size(op, out_vsize)?;
+    }
 
     // Open output file.
     // For QCOW2 output the file is always sparse (the guest
@@ -15868,6 +15894,38 @@ fn run_dd(args: DdArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>>
     execute_convert(exec, verbose)
 }
 
+/// User-facing message for each `MeasureResult::ERROR_*` code.
+fn measure_error_detail(code: u32) -> String {
+    match code {
+        MEASURE_RESULT_ERROR_OK => "ok".into(),
+        MEASURE_RESULT_ERROR_OVERFLOW => "overflow computing target size".into(),
+        MEASURE_RESULT_ERROR_INVALID_OPTION => "invalid option for target format".into(),
+        MEASURE_RESULT_ERROR_INVALID_SIZE => "source image is unsupported format".into(),
+        // Not "unsupported format": the format was recognised and the
+        // allocation scan walked the block table far enough to find it
+        // naming a block the reader refuses to read. The image is
+        // malformed, not foreign.
+        MEASURE_RESULT_ERROR_MALFORMED_BLOCK_TABLE => {
+            "source block table names a block inside the image's own \
+             structure (at file offset zero, or overlapping a region the \
+             image declares); the format is recognised, the image is \
+             malformed"
+                .into()
+        }
+        // Not "unsupported format" either: the source was read, and its
+        // size is more than the target format can be created at. The
+        // host refuses an explicit --size before the guest runs; this is
+        // the size of a measured source, which only the guest learns.
+        // VHDX is the only target with such a limit.
+        MEASURE_RESULT_ERROR_TOO_LARGE => format!(
+            "source virtual size exceeds the VHDX maximum of {} TiB ({} bytes)",
+            vhdx::MAX_VIRTUAL_SIZE >> 40,
+            vhdx::MAX_VIRTUAL_SIZE
+        ),
+        _ => "unknown error".into(),
+    }
+}
+
 /// Run the measure operation (predict output size for a target format).
 fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Touch the result magic constant so its presence is preserved for
@@ -16033,6 +16091,11 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     } else {
         0
     };
+    // A measured source's size is only known in the guest, which refuses
+    // it there with its own result code.
+    if target_format == IMAGE_FORMAT_VHDX {
+        check_vhdx_virtual_size("measure", virtual_size_override)?;
+    }
 
     // --- VMDK monolithicFlat source rejection (FILENAME mode only) -------
     if let Some(ref input_str) = args.input {
@@ -16467,23 +16530,7 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     }
 
     if measure_error != MEASURE_RESULT_ERROR_OK {
-        let detail = match measure_error {
-            MEASURE_RESULT_ERROR_OVERFLOW => "overflow computing target size",
-            MEASURE_RESULT_ERROR_INVALID_OPTION => "invalid option for target format",
-            MEASURE_RESULT_ERROR_INVALID_SIZE => "source image is unsupported format",
-            // Not "unsupported format": the format was recognised and
-            // the allocation scan walked the block table far enough to
-            // find it naming a block the reader refuses to read. The
-            // image is malformed, not foreign.
-            MEASURE_RESULT_ERROR_MALFORMED_BLOCK_TABLE => {
-                "source block table names a block inside the image's own \
-                 structure (at file offset zero, or overlapping a region the \
-                 image declares); the format is recognised, the image is \
-                 malformed"
-            }
-            _ => "unknown error",
-        };
-        return Err(format!("measure failed: {}", detail).into());
+        return Err(format!("measure failed: {}", measure_error_detail(measure_error)).into());
     }
 
     Ok(())
@@ -18720,7 +18767,7 @@ fn run_create_nonraw(args: &CreateArgs, verbose: bool) -> Result<(), Box<dyn std
                 let _ = std::fs::remove_file(output_path);
                 return Err(format!(
                     "create failed: {}",
-                    create_error_detail(create_result.error)
+                    create_error_message(create_result.error, target_format)
                 )
                 .into());
             }
@@ -19219,6 +19266,25 @@ fn run_create_guest(
     }
 
     Ok(harvested)
+}
+
+/// User-facing message for a `CreateResult::ERROR_*` code from a create
+/// of `target_format`.
+///
+/// For a VHDX target, a backing file too large means a size taken from
+/// the backing file is above the VHDX maximum: that is the only size the
+/// guest's check refuses for VHDX, and no option changes it, so the
+/// generic advice to try a larger cluster size would send the user the
+/// wrong way.
+fn create_error_message(code: u32, target_format: u32) -> String {
+    if code == CREATE_RESULT_ERROR_BACKING_SIZE_TOO_LARGE && target_format == IMAGE_FORMAT_VHDX {
+        return format!(
+            "backing file's virtual size exceeds the VHDX maximum of {} TiB ({} bytes)",
+            vhdx::MAX_VIRTUAL_SIZE >> 40,
+            vhdx::MAX_VIRTUAL_SIZE
+        );
+    }
+    create_error_detail(code).to_string()
 }
 
 /// User-facing message for each `CreateResult::ERROR_*` code.
@@ -19888,6 +19954,11 @@ fn validate_create_args(args: &CreateArgs) -> Result<(), Box<dyn std::error::Err
             )
             .into());
         }
+        // A size taken from `-b` instead is only known in the guest,
+        // whose layout refuses it there.
+        if args.target_format == "vhdx" {
+            check_vhdx_virtual_size("create", parsed)?;
+        }
     }
 
     Ok(())
@@ -20390,6 +20461,29 @@ mod create_option_tests {
     }
 
     const FLAT_O: &str = "subformat=monolithicFlat";
+
+    #[test]
+    fn vhdx_size_above_the_ceiling_is_refused_before_any_file_is_opened() {
+        let max = vhdx::MAX_VIRTUAL_SIZE.to_string();
+        assert!(resolve(&["-f", "vhdx", "t.vhdx", &max]).is_ok());
+        for size in [vhdx::MAX_VIRTUAL_SIZE + 1, vhdx::MAX_VIRTUAL_SIZE + 512] {
+            let size = size.to_string();
+            let err = resolve(&["-f", "vhdx", "t.vhdx", &size]).unwrap_err();
+            assert_eq!(
+                err,
+                format!(
+                    "create: virtual size {size} exceeds the VHDX maximum of 64 TiB \
+                     (70368744177664 bytes)"
+                )
+            );
+            // `-o size=` is applied before validation, so it is refused too.
+            let o = format!("size={size}");
+            assert!(resolve(&["-f", "vhdx", "-o", &o, "t.vhdx"]).is_err());
+        }
+        // The limit is VHDX's own.
+        let above = (vhdx::MAX_VIRTUAL_SIZE + 512).to_string();
+        assert!(resolve(&["-f", "qcow2", "t.qcow2", &above]).is_ok());
+    }
 
     #[test]
     fn flat_subformat_spellings_resolve_alike() {
@@ -21009,6 +21103,25 @@ mod create_error_detail_tests {
     }
 
     #[test]
+    fn a_vhdx_backing_file_too_large_names_the_ceiling() {
+        let vhdx = create_error_message(
+            CREATE_RESULT_ERROR_BACKING_SIZE_TOO_LARGE,
+            IMAGE_FORMAT_VHDX,
+        );
+        assert!(vhdx.contains("VHDX maximum of 64 TiB"), "{vhdx}");
+        assert!(!vhdx.contains("cluster size"), "{vhdx}");
+        // Every other target keeps the generic advice.
+        let qcow2 = create_error_message(
+            CREATE_RESULT_ERROR_BACKING_SIZE_TOO_LARGE,
+            IMAGE_FORMAT_QCOW2,
+        );
+        assert_eq!(
+            qcow2,
+            create_error_detail(CREATE_RESULT_ERROR_BACKING_SIZE_TOO_LARGE)
+        );
+    }
+
+    #[test]
     fn every_create_result_code_has_a_detail() {
         // A code added on one side and not the other would otherwise
         // surface as a generic fallback at runtime.
@@ -21022,6 +21135,44 @@ mod create_error_detail_tests {
             let detail = create_error_detail(code);
             assert!(!detail.is_empty(), "code {code} has an empty detail");
         }
+    }
+}
+
+#[cfg(test)]
+mod vhdx_virtual_size_limit_tests {
+    use super::*;
+
+    #[test]
+    fn the_ceiling_is_a_strict_greater_than() {
+        assert!(check_vhdx_virtual_size("convert", vhdx::MAX_VIRTUAL_SIZE).is_ok());
+        assert_eq!(
+            check_vhdx_virtual_size("convert", vhdx::MAX_VIRTUAL_SIZE + 1).unwrap_err(),
+            "convert: virtual size 70368744177665 exceeds the VHDX maximum of 64 TiB \
+             (70368744177664 bytes)"
+        );
+        // Rounding u64::MAX up to 512 would overflow; the check does not round.
+        assert!(check_vhdx_virtual_size("dd", u64::MAX)
+            .unwrap_err()
+            .starts_with("dd: "));
+    }
+
+    #[test]
+    fn every_measure_result_code_has_a_detail() {
+        for code in 0..=MEASURE_RESULT_ERROR_TOO_LARGE {
+            let detail = measure_error_detail(code);
+            assert!(!detail.is_empty(), "code {code} has an empty detail");
+            assert!(
+                !detail.starts_with("unknown"),
+                "code {code} hit the unknown fallback: {detail}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_too_large_detail_does_not_blame_the_source_format() {
+        let detail = measure_error_detail(MEASURE_RESULT_ERROR_TOO_LARGE);
+        assert!(!detail.contains("unsupported format"), "{detail}");
+        assert!(detail.contains("64 TiB"), "{detail}");
     }
 }
 

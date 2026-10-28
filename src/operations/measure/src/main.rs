@@ -183,6 +183,7 @@ fn map_error(e: MeasureError) -> u32 {
         MeasureError::Overflow => MeasureResult::ERROR_OVERFLOW,
         MeasureError::InvalidOption => MeasureResult::ERROR_INVALID_OPTION,
         MeasureError::InvalidSize => MeasureResult::ERROR_INVALID_SIZE,
+        MeasureError::TooLarge => MeasureResult::ERROR_TOO_LARGE,
     }
 }
 
