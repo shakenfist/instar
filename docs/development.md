@@ -558,9 +558,14 @@ Once `sign-tag` has run, anyone can check a release tag's signature:
 ```bash
 git fetch --tags --force origin
 gitsign verify-tag v0.2.0 \
-  --certificate-identity-regexp "^https://github.com/shakenfist/instar/" \
+  --certificate-identity-regexp '^https://github\.com/shakenfist/instar/\.github/workflows/release\.yml@refs/tags/v' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
+
+The pattern names `release.yml` running for a `v*` tag: a pattern that
+stops at the repository would accept a signature from any of its
+workflows. [gitsign](https://github.com/sigstore/gitsign) has
+install instructions.
 
 Running `release.yml` by hand with `workflow_dispatch` is a dry run:
 it runs `check-version` and `build`, and skips `ci-gate`, `sign-tag`
