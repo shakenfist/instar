@@ -544,15 +544,14 @@ points to it rather than keeping its own. Where it says to move the
 tag:
 
 ```bash
-git push origin :refs/tags/v0.2.0
+git push origin :refs/tags/v0.2.0   # needs the tag ruleset's bypass
 git tag -d v0.2.0
 tools/tag-release.sh 0.2.0 <commit that went through the queue>
 ```
 
-Deleting a `v*` tag needs the tag ruleset's bypass in a repository
-that has a "Release tags" ruleset, as the release template's
-[RELEASE-SETUP.md](https://github.com/shakenfist/development/blob/main/templates/release-automation/RELEASE-SETUP.md)
-recommends.
+The "Restrict releases" tag ruleset blocks creating, deleting and
+force-updating `v*` tags for everyone outside its bypass list, which
+holds the repository's admin role.
 
 Once `sign-tag` has run, anyone can check a release tag's signature:
 
