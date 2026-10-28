@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   release is now two steps: `tools/propose-release.sh` (or
   `make propose-release VERSION=x.y.z`) opens a release pull request
   that lands through the merge queue, then `tools/tag-release.sh` (or
-  `make tag-release`) tags the merged commit. The release workflow's
+  `make tag-release VERSION=x.y.z`) tags the merged commit. The release workflow's
   `ci-gate` job refuses to build a commit whose merge queue
   `functional-tests.yml` run did not succeed, and the tag is re-signed
   with gitsign only after a reviewer approves the `release`
@@ -658,6 +658,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   build if the shipped binary ever requires a glibc above 2.31.
 
 ### Removed
+
+- **`make release` is gone.** Use `make propose-release VERSION=x.y.z`,
+  then `make tag-release VERSION=x.y.z` once the release pull request
+  has merged; the Releases section of `docs/development.md` has the
+  details.
 
 - **The `@shakenfist-bot please address comments` automation is
   retired**, along with `pr-address-comments.yml` and its helper
