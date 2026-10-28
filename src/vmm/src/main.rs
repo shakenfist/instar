@@ -13916,23 +13916,58 @@ fn parse_output_format(s: &str) -> Result<u32, Box<dyn std::error::Error>> {
     }
 }
 
+/// The VHDX output block size convert and dd use when none is given.
+///
+/// The guest substitutes 32 MiB for an unset block size
+/// (`ConvertConfig::output_block_size_vhdx`), and the output capacity
+/// must be sized for the block size the guest will actually write, so
+/// the host resolves an unset one the same way. qemu instead scales its
+/// default with the virtual size, which `vhdx::layout` applies when it
+/// is passed 0; that is not what the guest writes today.
+const VHDX_OUTPUT_BLOCK_SIZE_WHEN_UNSET: u32 = 32 * 1024 * 1024;
+
 /// Compute the output file capacity (with format-specific metadata
 /// headroom) for a given target format and output virtual size.
-fn compute_output_capacity(target_format: u32, vsize: u64) -> u64 {
+///
+/// `block_size` is the requested output block size, 0 when none was
+/// given. Only VHDX output reads it.
+fn compute_output_capacity(target_format: u32, vsize: u64, block_size: u32) -> u64 {
     let is_qcow2_output = target_format == 2;
     let is_vmdk_output = target_format == 3;
     let is_vhd_output = target_format == 5;
     let is_vhdx_output = target_format == 6;
     let is_structured_output = is_qcow2_output || is_vmdk_output || is_vhd_output || is_vhdx_output;
     if is_vhdx_output {
-        // VHDX uses 32MB blocks — data is rounded up to block_size
-        // boundaries, plus ~4MB metadata overhead (file identifier,
-        // headers, region tables, log, BAT, metadata region).
-        let vhdx_block: u64 = 32 * 1024 * 1024;
-        vsize
-            .div_ceil(vhdx_block)
-            .saturating_mul(vhdx_block)
-            .saturating_add(10 * 1024 * 1024)
+        let block_size = if block_size == 0 {
+            VHDX_OUTPUT_BLOCK_SIZE_WHEN_UNSET
+        } else {
+            block_size
+        };
+        // The largest file convert's packed writer produces: everything
+        // up to the end of the metadata region, then every payload block
+        // allocated (dd never skips a zero block), each a whole block
+        // long. Sized from the same layout the guest places its regions
+        // with, so a large BAT at a small block size is counted: at
+        // 1 MiB blocks the BAT region alone passes 7 MiB from about
+        // 896 GiB of virtual size, which a fixed allowance would not
+        // cover.
+        match vhdx::layout(vsize, block_size, false) {
+            Ok(geometry) => u64::from(geometry.payload_blocks)
+                .saturating_mul(u64::from(geometry.block_size))
+                .saturating_add(geometry.data_start),
+            // A size or block size the layout refuses. The guest refuses
+            // it too, before it writes anything, so the capacity is never
+            // used to hold an image; it only needs to be some value. Keep
+            // a block-rounded estimate with a fixed allowance for the
+            // structures before the payload, as for an unchecked size.
+            Err(_) => {
+                let vhdx_block = u64::from(VHDX_OUTPUT_BLOCK_SIZE_WHEN_UNSET);
+                vsize
+                    .div_ceil(vhdx_block)
+                    .saturating_mul(vhdx_block)
+                    .saturating_add(10 * 1024 * 1024)
+            }
+        }
     } else if is_vhd_output {
         // Dynamic VHD writes a per-block sector bitmap immediately before
         // each block's payload, and the (bitmap + block) region is padded
@@ -14395,7 +14430,11 @@ fn execute_convert(
     };
     // Use the effective format so monolithicFlat (effective Raw) sizes
     // as a raw extent, matching the original inline capacity logic.
-    let output_capacity = compute_output_capacity(effective_target_format, capacity_vsize);
+    let output_capacity = compute_output_capacity(
+        effective_target_format,
+        capacity_vsize,
+        exec.output_block_size,
+    );
 
     // For monolithicFlat, the output device is the flat extent file.
     let output_file_path = if let Some((ref flat_path, _)) = flat_extent_path {
@@ -22395,9 +22434,9 @@ mod dd_format_tests {
     #[test]
     fn capacity_raw_is_vsize_unchanged() {
         // Raw format: no headroom, capacity == vsize.
-        assert_eq!(compute_output_capacity(1, 0), 0);
-        assert_eq!(compute_output_capacity(1, MIB), MIB);
-        assert_eq!(compute_output_capacity(1, u64::MAX), u64::MAX);
+        assert_eq!(compute_output_capacity(1, 0, 0), 0);
+        assert_eq!(compute_output_capacity(1, MIB, 0), MIB);
+        assert_eq!(compute_output_capacity(1, u64::MAX, 0), u64::MAX);
     }
 
     #[test]
@@ -22405,15 +22444,15 @@ mod dd_format_tests {
         // QCOW2 (format 2) adds vsize/100 + 10 MiB headroom.
         let vsize = MIB;
         let expected = vsize + vsize / 100 + 10 * MIB;
-        assert_eq!(compute_output_capacity(2, vsize), expected);
+        assert_eq!(compute_output_capacity(2, vsize, 0), expected);
         // Must be strictly greater than vsize for non-zero input.
-        assert!(compute_output_capacity(2, vsize) > vsize);
+        assert!(compute_output_capacity(2, vsize, 0) > vsize);
     }
 
     #[test]
     fn capacity_qcow2_zero_vsize() {
         // With vsize=0, headroom is still 10 MiB (only the +1% term is 0).
-        assert_eq!(compute_output_capacity(2, 0), 10 * MIB);
+        assert_eq!(compute_output_capacity(2, 0, 0), 10 * MIB);
     }
 
     #[test]
@@ -22421,8 +22460,8 @@ mod dd_format_tests {
         // VMDK (format 3) uses the same formula as QCOW2.
         let vsize = MIB;
         let expected = vsize + vsize / 100 + 10 * MIB;
-        assert_eq!(compute_output_capacity(3, vsize), expected);
-        assert!(compute_output_capacity(3, vsize) > vsize);
+        assert_eq!(compute_output_capacity(3, vsize, 0), expected);
+        assert!(compute_output_capacity(3, vsize, 0) > vsize);
     }
 
     #[test]
@@ -22437,47 +22476,97 @@ mod dd_format_tests {
         // 1 MiB input → 1 block of overhead.
         let vsize = MIB;
         let expected = vsize + oss + 10 * MIB;
-        assert_eq!(compute_output_capacity(5, vsize), expected);
-        assert!(compute_output_capacity(5, vsize) > vsize);
+        assert_eq!(compute_output_capacity(5, vsize, 0), expected);
+        assert!(compute_output_capacity(5, vsize, 0) > vsize);
 
         // 1 GiB input → 512 blocks of bitmap/alignment overhead.
         let vsize = 1024 * MIB;
         let n_blocks = vsize.div_ceil(vhd_block);
         let expected = vsize + n_blocks * oss + 10 * MIB;
-        assert_eq!(compute_output_capacity(5, vsize), expected);
+        assert_eq!(compute_output_capacity(5, vsize, 0), expected);
 
         // One byte over a block boundary still rounds the block count up.
         let vsize = vhd_block + 1;
         let expected = vsize + 2 * oss + 10 * MIB;
-        assert_eq!(compute_output_capacity(5, vsize), expected);
+        assert_eq!(compute_output_capacity(5, vsize, 0), expected);
     }
 
     #[test]
-    fn capacity_vhdx_rounds_to_32mib_blocks() {
-        // VHDX (format 6): round vsize up to 32 MiB boundary, add 10 MiB.
+    fn capacity_vhdx_is_the_layout_plus_every_block() {
+        // VHDX (format 6) with no block size: the 32 MiB the guest
+        // writes. Up to 1 GiB the BAT fits one 1 MiB region, so the
+        // payload starts at 4 MiB (1 MiB of header structures, 1 MiB
+        // log, 1 MiB BAT, 1 MiB metadata) and every block is a whole
+        // 32 MiB.
         let block: u64 = 32 * MIB;
 
-        // 1 MiB input → ceil to 1 block (32 MiB) + 10 MiB = 42 MiB.
-        assert_eq!(compute_output_capacity(6, MIB), block + 10 * MIB);
+        // 1 MiB input → one block.
+        assert_eq!(compute_output_capacity(6, MIB, 0), 4 * MIB + block);
 
         // Exactly one block stays at one block.
-        assert_eq!(compute_output_capacity(6, block), block + 10 * MIB);
+        assert_eq!(compute_output_capacity(6, block, 0), 4 * MIB + block);
 
-        // One byte over a block → two blocks + 10 MiB.
-        assert_eq!(compute_output_capacity(6, block + 1), 2 * block + 10 * MIB);
+        // One byte over a block → two blocks.
+        assert_eq!(
+            compute_output_capacity(6, block + 1, 0),
+            4 * MIB + 2 * block
+        );
+
+        // An explicit 32 MiB is the same as none.
+        assert_eq!(
+            compute_output_capacity(6, block + 1, 32 * MIB as u32),
+            4 * MIB + 2 * block
+        );
+
+        // An explicit 1 MiB block size sizes in 1 MiB blocks.
+        assert_eq!(
+            compute_output_capacity(6, block + 1, MIB as u32),
+            4 * MIB + 33 * MIB
+        );
+    }
+
+    #[test]
+    fn capacity_vhdx_counts_a_large_bat_at_small_blocks() {
+        // 2 TiB at 1 MiB blocks: 2097152 payload entries and
+        // 2097151 / 4096 = 511 sector bitmap entries, 2097663 entries of
+        // 8 bytes, so a 17 MiB BAT region and a payload start of
+        // 2 + 17 + 1 = 20 MiB. A fixed 10 MiB allowance is too small for
+        // a fully allocated source that large.
+        let vsize: u64 = 2 * 1024 * 1024 * MIB;
+        let cap = compute_output_capacity(6, vsize, MIB as u32);
+        assert_eq!(cap, vsize + 20 * MIB);
+        assert!(cap > vsize + 10 * MIB);
     }
 
     #[test]
     fn capacity_vhdx_zero_vsize() {
-        // vsize=0 → 0 blocks rounded up = 0, plus 10 MiB overhead.
-        assert_eq!(compute_output_capacity(6, 0), 10 * MIB);
+        // vsize=0 → no blocks, and the layout's 1 MiB BAT region floor:
+        // the file ends with the metadata region at 4 MiB.
+        assert_eq!(compute_output_capacity(6, 0, 0), 4 * MIB);
+    }
+
+    #[test]
+    fn capacity_vhdx_falls_back_where_the_layout_refuses() {
+        // Above the 64 TiB ceiling, or with a block size the layout
+        // refuses, the guest refuses too; the estimate is the
+        // block-rounded size plus a fixed 10 MiB.
+        let block: u64 = 32 * MIB;
+        let vsize: u64 = 65 * 1024 * 1024 * 1024 * MIB;
+        assert_eq!(
+            compute_output_capacity(6, vsize, MIB as u32),
+            vsize.div_ceil(block) * block + 10 * MIB
+        );
+        assert_eq!(
+            compute_output_capacity(6, MIB, 3 * MIB as u32),
+            block + 10 * MIB
+        );
     }
 
     #[test]
     fn capacity_structured_formats_all_exceed_vsize_for_nonzero_input() {
         // All structured formats must produce capacity > vsize when vsize > 0.
         for fmt in [2u32, 3, 5, 6] {
-            let cap = compute_output_capacity(fmt, MIB);
+            let cap = compute_output_capacity(fmt, MIB, 0);
             assert!(
                 cap > MIB,
                 "format {fmt}: capacity {cap} should exceed vsize {MIB}"

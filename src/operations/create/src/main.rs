@@ -552,10 +552,11 @@ fn vhdx_opts_from<'a>(
     identity: ParentIdentity,
 ) -> Result<VhdxCreateOpts<'a>, u32> {
     // A vhdx child records its parent's active-header `DataWriteGuid`
-    // as its own `parent_linkage`. With no backing file the planner
+    // as its own `parent_linkage`, because that GUID is what a reader
+    // checks to confirm the parent has not changed since the child was
+    // made (SPEC(VHDX) 2.6.2.6.3). With no backing file the planner
     // writes no parent metadata at all, so the zeroes below are never
-    // read. See docs/plans/PLAN-differencing.md.
-    // Matched on both dimensions, for the reason given in
+    // read. Matched on both dimensions, for the reason given in
     // `vhd_opts_from`.
     let parent_data_write_guid = match (identity, backing.is_some()) {
         (ParentIdentity::Vhdx { data_write_guid }, true) => data_write_guid,
@@ -564,14 +565,32 @@ fn vhdx_opts_from<'a>(
     };
     Ok(VhdxCreateOpts {
         virtual_size,
-        block_size: if config.block_size == 0 {
-            32 * 1024 * 1024
-        } else {
-            config.block_size
-        },
+        block_size: vhdx_block_size_from(config),
         backing,
         parent_data_write_guid,
     })
+}
+
+/// The block size a VHDX is created with when the user gives none.
+///
+/// instar has always used 32 MiB here, where qemu scales its default
+/// with the virtual size (`vhdx::default_block_size`). It is passed to
+/// the layout explicitly, rather than as the 0 that asks the layout for
+/// qemu's default, so that sizing the writer from `vhdx::layout` does
+/// not also change the bytes of every VHDX created without
+/// `block_size`.
+const VHDX_BLOCK_SIZE_WHEN_UNSET: u32 = 32 * 1024 * 1024;
+
+/// The VHDX block size `config` asks for, with
+/// [`VHDX_BLOCK_SIZE_WHEN_UNSET`] in place of an unset one. The planner
+/// and the pre-flight ceiling check both size from this, so they cannot
+/// disagree about the geometry.
+fn vhdx_block_size_from(config: &CreateConfig) -> u32 {
+    if config.block_size == 0 {
+        VHDX_BLOCK_SIZE_WHEN_UNSET
+    } else {
+        config.block_size
+    }
 }
 
 /// Pre-flight check: can the target format address `virtual_size`
@@ -648,27 +667,30 @@ fn target_can_address(target: ImageFormat, virtual_size: u64, config: &CreateCon
                 None => true,
             }
         }
-        // VHDX: defer to the parser crate's authoritative computation.
-        // calculate_bat_layout returns None when either total_blocks or
-        // chunk_ratio overflows u32, which is precisely the ceiling we
-        // need to enforce. A differencing child's BAT is padded out to
+        // VHDX: ask the writer layout `plan_vhdx` sizes from, so this
+        // gate refuses exactly the sizes the planner would. It refuses
+        // a size above the 64 TiB ceiling and a BAT whose count does
+        // not fit its type. A differencing child's BAT is padded out to
         // whole chunk groups and so needs more entries than a plain
         // image of the same virtual size, which is why the backing
-        // file is part of the question rather than ignored here: the
-        // ceiling this gate enforces has to be the one `plan_vhdx`
-        // will size against. Today that is always the padded rule,
-        // because the only caller runs in the backing-derived path --
-        // but it is read off the config rather than hard-coded, so a
-        // second caller cannot be silently wrong.
-        ImageFormat::Vhdx => {
-            let block_size: u32 = if config.block_size == 0 {
-                32 * 1024 * 1024
-            } else {
-                config.block_size
-            };
-            vhdx::calculate_bat_layout(virtual_size, block_size, 512, config.has_backing())
-                .is_some()
-        }
+        // file is part of the question rather than ignored here. Today
+        // that is always the padded rule, because the only caller runs
+        // in the backing-derived path -- but it is read off the config
+        // rather than hard-coded, so a second caller cannot be silently
+        // wrong.
+        //
+        // An invalid block size is not a size the target cannot
+        // address, so it passes here and the planner refuses it as the
+        // invalid option it is, rather than this gate reporting it as a
+        // backing file too large for the target.
+        ImageFormat::Vhdx => !matches!(
+            vhdx::layout(
+                virtual_size,
+                vhdx_block_size_from(config),
+                config.has_backing()
+            ),
+            Err(vhdx::LayoutError::TooLarge | vhdx::LayoutError::Overflow)
+        ),
         // Any other target was already rejected by validate_create_args
         // / parse_create_o_options; treat as not addressable so we
         // surface a clear "unsupported format" error rather than

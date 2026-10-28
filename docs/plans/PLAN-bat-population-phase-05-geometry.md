@@ -414,6 +414,35 @@ The management session runs the steps in order. Every step edits
   qcow2-target measure baselines (counted in instar-testdata). The real
   cause is fixtures with no measure baseline at any version, tracked
   as #845. The phase 4 plan now says so.
+* **5a.** The management session cross-checked the eleven pin
+  entries the agent copied into the crate tests against
+  `tests/golden/qemu-create-pins.json`, and all match. The agent also
+  measured the zero-size case: qemu refuses a zero-length BAT region
+  at any size, and also a zero-size image with a 1 MiB region, because
+  its count underflows to 8388607 entries. So convert's comment that
+  qemu's own `count=0` VHDX is a valid header-only image was wrong.
+  Decision 3 stands, and 5b deletes the comment.
+* **5b.** Behaviour-neutral against a build of `6bafd318`: `cmp`
+  finds `create` at 1G, `create` at 64M with 1 MiB blocks and a sparse
+  `convert` identical, and `create 1073741825` different in only 4
+  bytes. Those are `VirtualDiskSize` and the Virtual Disk ID, which
+  `build_metadata` derives from the size (and from the block size, so
+  5d moves it for every defaulted image too). The agent departed from
+  the brief in three places, all kept:
+  * `resize` checks the grown size with `layout`, but counts BAT entries
+    by the image's own logical sector size when that is not 512,
+    because `layout` counts for the 512 instar writes. It also refuses
+    block size 0, which `layout` would read as "the default".
+  * `target_can_address` refuses only `TooLarge` and `Overflow`, so an
+    invalid block size still reaches the planner's own error, not
+    "backing file too large".
+  * `measure` maps `TooLarge` to `InvalidSize`, which the host prints as
+    an unsupported source format. 5c must fix that message (decision 5
+    anticipated it).
+
+  The 16 `test_convert` failures under a load average of about 18 were
+  qcow2, vmdk and vpc re-encodes and VHD compares. All 16 passed when
+  replayed alone.
 
 ## Risks and mitigations
 

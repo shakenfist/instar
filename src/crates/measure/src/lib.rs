@@ -938,7 +938,8 @@ fn measure_vhd_dynamic(s: &AllocationSummary, block_size: u64) -> MeasureResult 
 /// Options for a VHDX output image.
 #[derive(Clone, Copy, Debug)]
 pub struct VhdxOpts {
-    /// Block size in bytes. Must be a power of two in `[1 MiB, 256 MiB]`.
+    /// Block size in bytes: a power of two in `[1 MiB, 256 MiB]`, or 0 for
+    /// qemu's default for the size (`vhdx::default_block_size`).
     /// Default: 32 MiB.
     pub block_size: u32,
 }
@@ -953,13 +954,11 @@ impl Default for VhdxOpts {
 
 /// Measure a VHDX output image.
 ///
-/// Uses `vhdx::calculate_bat_layout()` directly for the BAT entry count
-/// rather than re-deriving the chunk-ratio / interleaved-sector-bitmap
-/// formula. The crate's `vhdx::MB_ALIGN` (= 1 MiB) constant defines the
-/// 1 MiB alignment that the VHDX spec mandates for every region.
+/// Sizes the image from `vhdx::layout`, the same function the convert
+/// writer places its regions with, so the prediction cannot drift from
+/// the file convert writes.
 ///
-/// # Layout (verified against the writer in
-/// `src/operations/convert/src/main.rs:4140-4602`)
+/// # Layout
 ///
 /// ```text
 /// file_id      offset 0          (64 KiB region)
@@ -967,64 +966,54 @@ impl Default for VhdxOpts {
 /// header2      offset 0x20000    (64 KiB region)
 /// region_t1    offset 0x30000    (64 KiB region)
 /// region_t2    offset 0x40000    (64 KiB region)
-/// log          offset 0x10_0000  (1 MiB region)
-/// bat          offset 0x20_0000  (round_up(bat_bytes, 1 MiB))
+/// log          vhdx::LOG_OFFSET  (1 MiB region)
+/// bat          vhdx::BAT_OFFSET  (round_up(bat_bytes, 1 MiB), at least 1 MiB)
 /// metadata     follows BAT       (1 MiB region)
 /// payload      follows metadata  (each block round_up(block_size, 1 MiB))
 /// ```
 ///
-/// The fixed pre-BAT overhead is exactly 2 MiB. The file id, both headers,
-/// and both region tables share the `[0, 0x10_0000)` range, then the log
-/// region occupies `[0x10_0000, 0x20_0000)`. After that the writer places
-/// the BAT at `0x20_0000` and the metadata region immediately following.
 /// VHDX has no trailing footer: the file ends after the last allocated
-/// payload block. The writer at
-/// `src/operations/convert/src/main.rs:4567` does not append a footer; it
-/// only rewrites the BAT in place.
+/// payload block. The convert writer does not append a footer; it only
+/// rewrites the BAT in place.
 ///
 /// # Formula
 ///
 /// ```text
-/// fixed_pre_bat   = 2 * MB_ALIGN
-/// bat_region      = round_up(total_bat_entries * 8, MB_ALIGN)
-/// metadata_region = MB_ALIGN
-/// payload_start   = fixed_pre_bat + bat_region + metadata_region
+/// payload_start   = layout.data_start
 ///
 /// block_alloc     = round_up(block_size, MB_ALIGN)
 ///                   (== block_size when block_size is itself a power-of-two
-///                    >= 1 MiB, which is enforced by option validation)
+///                    >= 1 MiB, which `vhdx::layout` enforces)
 ///
 /// required        = payload_start + ceil_div(allocated_bytes, block_size)
 ///                                    * block_alloc
-/// fully_allocated = payload_start + total_payload_blocks * block_alloc
+/// fully_allocated = payload_start + layout.payload_blocks * block_alloc
 /// ```
 ///
-/// `total_payload_blocks` and `total_bat_entries` come from
-/// `vhdx::calculate_bat_layout(virtual_size, block_size, 512, false)`.
-/// `total_bat_entries` already accounts for the chunk-ratio interleaving
-/// (a sector-bitmap BAT entry after each whole group of `chunk_ratio`
+/// `layout.bat_entries`, which sizes the BAT region inside
+/// `data_start`, already accounts for the chunk-ratio interleaving (a
+/// sector-bitmap BAT entry after each whole group of `chunk_ratio`
 /// payload entries that another payload entry follows, which is
 /// `n + (n - 1) / chunk_ratio` entries, as `vhdx::bat_entry_count`
-/// says) so no manual interleaving is needed here. The `false` is "no
-/// parent": see the call site for why a differencing target is not a
-/// shape `measure` can be asked for.
+/// says) so no manual interleaving is needed here. The layout is asked
+/// for an image with no parent: see the call site for why a
+/// differencing target is not a shape `measure` can be asked for.
+///
+/// At a virtual size of zero there are no BAT entries, and the layout
+/// still declares a 1 MiB BAT region, as the convert writer does, so the
+/// prediction is 4 MiB rather than the 3 MiB a region sized from the
+/// count alone would give.
+///
+/// # Errors
+///
+/// A block size the layout refuses is [`MeasureError::InvalidOption`];
+/// a virtual size above `vhdx::MAX_VIRTUAL_SIZE` (64 TiB) is
+/// [`MeasureError::InvalidSize`].
 pub fn measure_vhdx(s: &AllocationSummary, opts: &VhdxOpts) -> MeasureResult {
-    // ---- Validate options. -------------------------------------------------
-    // block_size: power of two in [1 MiB, 256 MiB].
-    let bs = opts.block_size as u64;
-    let min_bs: u64 = 1024 * 1024; // 1 MiB
-    let max_bs: u64 = 256 * 1024 * 1024; // 256 MiB
-    if bs < min_bs || bs > max_bs || !opts.block_size.is_power_of_two() {
-        return Err(MeasureError::InvalidOption);
-    }
-
-    // ---- Validate sizes. ---------------------------------------------------
-    if s.allocated_bytes > s.virtual_size {
-        return Err(MeasureError::InvalidSize);
-    }
-
-    // ---- BAT layout via the writer's helper. ------------------------------
-    // logical_sector_size = 512 (instar's writer hard-codes 512 for VHDX).
+    // ---- Layout via the writer's helper. ----------------------------------
+    // The layout also checks the block size (a power of two from 1 MiB to
+    // 256 MiB), before the sizes below as this function always has.
+    //
     // has_parent = false: `measure` predicts the size of a self-contained
     // image. `VhdxOpts` carries no parent, nothing on the wire to the guest
     // offers one, and a differencing target is not a shape `measure` can be
@@ -1032,22 +1021,21 @@ pub fn measure_vhdx(s: &AllocationSummary, opts: &VhdxOpts) -> MeasureResult {
     // target would also need a parent locator in the metadata region and a
     // predicted size for it, neither of which this function computes, so the
     // option is the thing to add first if that ever changes.
-    let (total_bat_entries, _chunk_ratio, total_payload_blocks) =
-        vhdx::calculate_bat_layout(s.virtual_size, opts.block_size, 512, false)
-            .ok_or(MeasureError::Overflow)?;
+    let geometry = vhdx::layout(s.virtual_size, opts.block_size, false).map_err(|e| match e {
+        vhdx::LayoutError::InvalidBlockSize => MeasureError::InvalidOption,
+        vhdx::LayoutError::TooLarge => MeasureError::InvalidSize,
+        vhdx::LayoutError::Overflow => MeasureError::Overflow,
+    })?;
 
-    let total_bat_entries = total_bat_entries as u64;
-    let total_payload_blocks = total_payload_blocks as u64;
+    // ---- Validate sizes. ---------------------------------------------------
+    if s.allocated_bytes > s.virtual_size {
+        return Err(MeasureError::InvalidSize);
+    }
 
-    // ---- Pre-payload region sizes. ----------------------------------------
+    let bs = u64::from(geometry.block_size);
+    let total_payload_blocks = u64::from(geometry.payload_blocks);
     let mb_align = vhdx::MB_ALIGN; // 1 MiB
-    let fixed_pre_bat = mb_align.checked_mul(2).ok_or(MeasureError::Overflow)?;
-    let bat_size_bytes = total_bat_entries
-        .checked_mul(8)
-        .ok_or(MeasureError::Overflow)?;
-    let bat_region = round_up_u64(bat_size_bytes, mb_align)?;
-    let metadata_region = mb_align;
-    let payload_start = checked_sum(&[fixed_pre_bat, bat_region, metadata_region])?;
+    let payload_start = geometry.data_start;
 
     // ---- Per-block allocation cost. ---------------------------------------
     // VHDX spec requires each payload block to start on a 1 MiB boundary, so
@@ -2831,19 +2819,18 @@ mod tests {
     // VHDX
     // ====================================================================
     //
-    // Layout of every VHDX dynamic image (verified against
-    // `convert_to_vhdx` in `src/operations/convert/src/main.rs:4140-4602`):
+    // Layout of every VHDX dynamic image, as `vhdx::layout` places it for
+    // both `measure_vhdx` and `convert_to_vhdx`. The expected values below
+    // are worked by hand rather than taken from the layout, so that they
+    // check it:
     //
-    //   fixed_pre_bat   = 2 MiB        (file id + 2 headers + 2 region tables
+    //   before the BAT  = 2 MiB        (file id + 2 headers + 2 region tables
     //                                   share [0, 1 MiB); log region is
     //                                   [1 MiB, 2 MiB))
-    //   bat_region      = round_up(total_bat_entries * 8, 1 MiB)
+    //   bat_region      = round_up(total_bat_entries * 8, 1 MiB), at least
+    //                     1 MiB
     //   metadata_region = 1 MiB
-    //   payload_start   = fixed_pre_bat + bat_region + metadata_region
-    //
-    // total_bat_entries / total_payload_blocks come from
-    // `vhdx::calculate_bat_layout(virtual_size, block_size, 512, false)`,
-    // which is the same helper the writer uses, so the two cannot drift.
+    //   payload_start   = 2 MiB + bat_region + metadata_region
 
     #[test]
     fn vhdx_1gib_32mib_block_empty() {
@@ -2998,6 +2985,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn vhdx_zero_virtual_size_has_a_1_mib_bat_region() {
+        // virtual_size = 0: no payload blocks and no BAT entries. The
+        // convert writer still declares a 1 MiB BAT region, because an
+        // empty one makes qemu refuse the file, so the prediction is
+        // 2 MiB + 1 MiB BAT + 1 MiB metadata = 4 MiB, not the 3 MiB a
+        // region sized from the entry count alone would give.
+        let s = AllocationSummary {
+            virtual_size: 0,
+            allocated_bytes: 0,
+            target_units_with_data: 0,
+        };
+        let opts = VhdxOpts {
+            block_size: 32 * MIB as u32,
+        };
+        assert_eq!(
+            measure_vhdx(&s, &opts),
+            Ok(MeasureOutput {
+                required: 4 * MIB,
+                fully_allocated: 4 * MIB,
+            })
+        );
+    }
+
+    #[test]
+    fn vhdx_refuses_a_virtual_size_above_64_tib() {
+        // 64 TiB is the largest VHDX qemu creates, a strict `>` on the
+        // size rounded up to 512 bytes (`vhdx_co_create`, qemu 7.0.0).
+        let opts = VhdxOpts {
+            block_size: 32 * MIB as u32,
+        };
+        let at = AllocationSummary {
+            virtual_size: vhdx::MAX_VIRTUAL_SIZE,
+            allocated_bytes: 0,
+            target_units_with_data: 0,
+        };
+        assert!(measure_vhdx(&at, &opts).is_ok());
+        for virtual_size in [vhdx::MAX_VIRTUAL_SIZE + 1, vhdx::MAX_VIRTUAL_SIZE + 512] {
+            let s = AllocationSummary {
+                virtual_size,
+                allocated_bytes: 0,
+                target_units_with_data: 0,
+            };
+            assert_eq!(
+                measure_vhdx(&s, &opts),
+                Err(MeasureError::InvalidSize),
+                "virtual size {virtual_size}"
+            );
+        }
+    }
+
     // --- VHDX option validation tests ---
 
     #[test]
@@ -3110,15 +3148,18 @@ mod tests {
         assert_eq!(measure_vhd(&s, &opts), Err(MeasureError::Overflow));
     }
 
+    /// u64::MAX is far above the 64 TiB ceiling `vhdx::layout` applies,
+    /// so it is refused as a size the format cannot hold, before any
+    /// arithmetic could overflow.
     #[test]
-    fn vhdx_overflow_at_u64_max_virtual_size() {
+    fn vhdx_u64_max_virtual_size_is_too_large() {
         let s = AllocationSummary {
             virtual_size: u64::MAX,
             allocated_bytes: 0,
             target_units_with_data: 0,
         };
         let opts = VhdxOpts::default();
-        assert_eq!(measure_vhdx(&s, &opts), Err(MeasureError::Overflow));
+        assert_eq!(measure_vhdx(&s, &opts), Err(MeasureError::InvalidSize));
     }
 
     // ====================================================================

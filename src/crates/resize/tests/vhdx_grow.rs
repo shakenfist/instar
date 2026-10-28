@@ -201,6 +201,74 @@ fn grow_to_131041_mib_keeps_a_1_mib_bat_in_place() {
         .all(|p| !matches!(p, ResizePatch::Append { .. })));
 }
 
+/// One block past that, at 131042 MiB, needs 131073 entries with
+/// 512-byte logical sectors and so relocates the BAT. With 4096-byte
+/// logical sectors the chunk ratio is eight times larger, the same
+/// grow needs only 131042 + 3 = 131045 entries, and the BAT stays
+/// where it is. The planner counts by the image's own sector size,
+/// not the 512 bytes instar writes.
+#[test]
+fn grow_counts_the_bat_by_the_images_logical_sector_size() {
+    const MIB: u64 = 1 << 20;
+    let bytes = build_starting_vhdx(131_040 * MIB, MIB as u32);
+    let mut scratch = vec![0u8; VHDX_SCRATCH];
+
+    let opts = opts_from_image(&bytes, 131_042 * MIB, false);
+    assert_eq!(opts.logical_sector_size, 512);
+    let plan = plan_resize_vhdx(&opts, &mut scratch).expect("plan at 512");
+    assert!(
+        plan.patches()
+            .iter()
+            .any(|p| matches!(p, ResizePatch::Append { .. })),
+        "a 512-byte-sector grow to 131042 MiB relocates the BAT"
+    );
+
+    let mut opts = opts_from_image(&bytes, 131_042 * MIB, false);
+    opts.logical_sector_size = 4096;
+    let plan = plan_resize_vhdx(&opts, &mut scratch).expect("plan at 4096");
+    assert_eq!(plan.patches().len(), 3);
+    assert_eq!(plan.total_file_size, bytes.len() as u64);
+}
+
+/// A grown image is held to the 64 TiB ceiling qemu creates images
+/// under (`vhdx_co_create`, qemu 7.0.0, a strict `>` on the size
+/// rounded up to 512 bytes). Exactly 64 TiB passes the size rules
+/// (the plan may still need more scratch than this test gives it);
+/// anything above is refused as a new size the format cannot hold.
+#[test]
+fn rejects_growing_past_64_tib() {
+    let bytes = build_starting_vhdx(1u64 << 30, 256 * 1024 * 1024);
+    let mut scratch = vec![0u8; VHDX_SCRATCH];
+    let opts = opts_from_image(&bytes, vhdx::MAX_VIRTUAL_SIZE, false);
+    assert_ne!(
+        plan_resize_vhdx(&opts, &mut scratch).err(),
+        Some(ResizeError::InvalidNewVirtualSize)
+    );
+    for new_size in [vhdx::MAX_VIRTUAL_SIZE + 1, vhdx::MAX_VIRTUAL_SIZE + 512] {
+        let opts = opts_from_image(&bytes, new_size, false);
+        assert_eq!(
+            plan_resize_vhdx(&opts, &mut scratch).err(),
+            Some(ResizeError::InvalidNewVirtualSize),
+            "new size {new_size}"
+        );
+    }
+}
+
+#[test]
+fn rejects_a_zero_block_size() {
+    // 0 is not a block size an image can have. The writer layout reads
+    // it as "choose qemu's default", which would size the grown BAT for
+    // some other block size, so the planner refuses it.
+    let bytes = build_starting_vhdx(1u64 << 30, 32 * 1024 * 1024);
+    let mut opts = opts_from_image(&bytes, 2u64 << 30, false);
+    opts.block_size = 0;
+    let mut scratch = vec![0u8; VHDX_SCRATCH];
+    assert_eq!(
+        plan_resize_vhdx(&opts, &mut scratch).unwrap_err(),
+        ResizeError::InvalidNewVirtualSize
+    );
+}
+
 /// The metadata region of an image, as a mutable slice.
 fn metadata_region_mut(bytes: &mut [u8]) -> &mut [u8] {
     let (entries, _count) =
