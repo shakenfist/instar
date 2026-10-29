@@ -1,0 +1,28 @@
+{
+    "bypass_actors": [],
+    "conditions": {
+        "ref_name": {
+            "exclude": [],
+            "include": [
+                "refs/tags/v*"
+            ]
+        }
+    },
+    "enforcement": "active",
+    "name": "Restrict releases",
+    "rules": [
+        {
+            "parameters": null,
+            "type": "deletion"
+        },
+        {
+            "parameters": null,
+            "type": "non_fast_forward"
+        },
+        {
+            "parameters": null,
+            "type": "creation"
+        }
+    ],
+    "target": "tag"
+}
