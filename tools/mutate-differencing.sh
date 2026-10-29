@@ -682,7 +682,7 @@ self_test() {
 # phase's definition of done asks the two to stay in step, which until
 # now was a promise kept by hand. Asserting it makes the drift a
 # failure instead of a documentation bug nobody reads.
-EXPECTED_CASES=137
+EXPECTED_CASES=139
 
 check_case_count() {
     # Only meaningful for a whole run; a selection is expected to be short.
@@ -1095,6 +1095,25 @@ rust_case 'vhdx-write-fixed-padding-given-an-entry' "${VHDX_LIB}" \
     '        let entry = if index >= bat_entries {' \
     '        let entry = if index > bat_entries { // MUTATED' \
     vhdx 'fill_fixed_bat_partitions_every_index_like_qemus_forward_map'
+
+# The File Parameters LeaveBlocksAllocated bit plan_vhdx writes, which
+# qemu-img sets for a fixed image and only for one
+# (vhdx_create_new_metadata, qemu 7.0.0 block/vhdx.c). It changes how no
+# reader reads the image, and tells a writer not to free its blocks, so
+# setting it on a dynamic image or dropping it from a fixed one writes a
+# file every reader opens. The first mutation sets it for both
+# subformats, which leaves the two plans' metadata identical; the second
+# clears it for both, which a fixed image read back against its pin
+# shows.
+rust_case 'vhdx-write-leave-blocks-allocated-set-for-dynamic' "${CREATE_LIB}" \
+    '        fixed,' \
+    '        true, // MUTATED' \
+    create 'vhdx_fixed_metadata_differs_from_dynamic_only_in_leave_blocks_allocated'
+
+rust_case 'vhdx-write-leave-blocks-allocated-cleared-for-fixed' "${CREATE_LIB}" \
+    '        fixed,' \
+    '        false, // MUTATED' \
+    create 'vhdx_fixed_round_trips_match_qemu_pins'
 
 # ---------------------------------------------------------------------
 # The guest chain walker: composing a differencing VHD or VHDX against

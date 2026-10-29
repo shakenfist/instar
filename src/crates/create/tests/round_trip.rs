@@ -18,10 +18,10 @@
 //! regresses on its option surface this file catches it.
 
 use create::{
-    plan_qcow2, plan_vhd, plan_vhdx, plan_vmdk, BackingRef, CreateError, MetadataPlan,
-    MetadataWrite, Qcow2CreateOpts, VhdCreateOpts, VhdSubformat, VhdxCreateOpts, VmdkCreateOpts,
-    VmdkSubformat, MAX_BACKING_FILE_LEN, QCOW2_MAX_METADATA_SCRATCH, VHDX_MAX_METADATA_SCRATCH,
-    VHD_MAX_METADATA_SCRATCH, VMDK_MAX_METADATA_SCRATCH,
+    plan_qcow2, plan_vhd, plan_vhdx, plan_vmdk, BackingRef, CreateError, FixedVhdxPlan,
+    MetadataPlan, MetadataWrite, Qcow2CreateOpts, VhdCreateOpts, VhdSubformat, VhdxCreateOpts,
+    VhdxSubformat, VmdkCreateOpts, VmdkSubformat, MAX_BACKING_FILE_LEN, QCOW2_MAX_METADATA_SCRATCH,
+    VHDX_MAX_METADATA_SCRATCH, VHD_MAX_METADATA_SCRATCH, VMDK_MAX_METADATA_SCRATCH,
 };
 use shared::ImageFormat;
 
@@ -339,11 +339,13 @@ fn sweep_vhdx_dynamic() {
             let opts = VhdxCreateOpts {
                 virtual_size,
                 block_size,
+                subformat: VhdxSubformat::Dynamic,
+                block_state_zero: true,
                 backing: None,
                 parent_data_write_guid: [0u8; 16],
             };
             let mut scratch = vec![0u8; VHDX_MAX_METADATA_SCRATCH];
-            let plan = plan_vhdx(&opts, &mut scratch).expect("plan");
+            let plan = plan_vhdx(&opts, &mut scratch).expect("plan").metadata;
             assert_plan_invariants(&plan);
             let bytes = materialise(&plan);
 
@@ -1307,6 +1309,8 @@ fn vhdx_diff_opts(path: &str) -> VhdxCreateOpts<'_> {
     VhdxCreateOpts {
         virtual_size: 1 << 30,
         block_size: 32 * 1024 * 1024,
+        subformat: VhdxSubformat::Dynamic,
+        block_state_zero: true,
         backing: Some(BackingRef {
             path: path.as_bytes(),
             format: Some(ImageFormat::Vhdx),
@@ -1343,7 +1347,7 @@ impl LaidOutVhdx {
 /// 0x10028" is asserting it at the offset a reader would actually go to.
 fn lay_out_vhdx(opts: &VhdxCreateOpts<'_>) -> LaidOutVhdx {
     let mut scratch = vec![0u8; VHDX_MAX_METADATA_SCRATCH];
-    let plan = plan_vhdx(opts, &mut scratch).expect("vhdx plan");
+    let plan = plan_vhdx(opts, &mut scratch).expect("vhdx plan").metadata;
     assert_plan_invariants(&plan);
     let writes: Vec<(u64, u64)> = plan
         .writes()
@@ -1924,6 +1928,8 @@ fn vhdx_differencing_bat_region_covers_the_last_group_bitmap() {
     let plain = lay_out_vhdx(&VhdxCreateOpts {
         virtual_size,
         block_size: BLOCK_SIZE,
+        subformat: VhdxSubformat::Dynamic,
+        block_state_zero: true,
         backing: None,
         parent_data_write_guid: [0u8; 16],
     });
@@ -1948,6 +1954,8 @@ fn vhdx_non_differencing_metadata_is_unchanged() {
     let opts = VhdxCreateOpts {
         virtual_size: 1 << 30,
         block_size: 32 * 1024 * 1024,
+        subformat: VhdxSubformat::Dynamic,
+        block_state_zero: true,
         backing: None,
         // Read only when `backing` is `Some`. If it ever leaks into a
         // plain image, the golden test's w5 hashes move too.
@@ -2119,6 +2127,11 @@ fn vhdx_non_differencing_output_matches_develop() {
             let opts = VhdxCreateOpts {
                 virtual_size,
                 block_size,
+                subformat: VhdxSubformat::Dynamic,
+                // What the create op passes. Read only for a fixed
+                // image, so it must not reach this one; if it ever
+                // does, a hash moves.
+                block_state_zero: true,
                 backing: None,
                 // Read only when `backing` is `Some`, so this must not
                 // reach the image. If it ever does, the w5 hashes move.
@@ -2126,6 +2139,8 @@ fn vhdx_non_differencing_output_matches_develop() {
             };
             let mut scratch = vec![0u8; VHDX_MAX_METADATA_SCRATCH];
             let plan = plan_vhdx(&opts, &mut scratch).expect("plan");
+            assert!(plan.fixed.is_none(), "a dynamic image has no fixed plan");
+            let plan = plan.metadata;
             summarise_plan(
                 &format!("vhdx vsize={virtual_size} bsize={block_size}"),
                 &plan,
@@ -2146,4 +2161,1126 @@ fn vhdx_non_differencing_output_matches_develop() {
         "golden line count differs",
     );
     assert_eq!(out, GOLDEN_VHDX_NO_BACKING);
+}
+
+// ---------------------------------------------------------------------------
+// vhdx fixed
+// ---------------------------------------------------------------------------
+//
+// A fixed VHDX is the plan's metadata writes, a BAT the caller streams
+// through `vhdx::fill_fixed_bat`, and a file extended to the plan's
+// length. Everything below builds images that way, as a guest would, and
+// compares them field by field with what `qemu-img create -f vhdx -o
+// subformat=fixed` writes. The expected values are copied from
+// `tests/golden/qemu-create-pins.json`, whose every pinned qemu build
+// agrees on them, and each table row names the pin case it came from.
+// The crate tests cannot read that file (the container mounts only this
+// repository, and the workspace has no JSON parser), so a change to the
+// pins has to be copied here by hand.
+
+const MIB: u64 = 1024 * 1024;
+
+/// What a BAT index is, by the rule the comparator in
+/// `tests/helpers/vhdx_structure.py` applies: padding past the entry
+/// count, the last index of each group of `chunk_ratio + 1` a sector
+/// bitmap slot, and every other index a payload block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BatKind {
+    Payload,
+    SectorBitmap,
+    Padding,
+}
+use BatKind::{Padding, Payload, SectorBitmap};
+
+/// One BAT run as the pin file records it: `count` entries of one kind
+/// and state from index `start`, entry `start + k` at file offset
+/// `offset + k * stride`. A run of one entry has stride 0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PinRun {
+    start: u64,
+    count: u64,
+    kind: BatKind,
+    state: u64,
+    offset: u64,
+    stride: u64,
+}
+
+const fn run(
+    start: u64,
+    count: u64,
+    kind: BatKind,
+    state: u64,
+    offset: u64,
+    stride: u64,
+) -> PinRun {
+    PinRun {
+        start,
+        count,
+        kind,
+        state,
+        offset,
+        stride,
+    }
+}
+
+/// One `vhdx-fixed-*` pin case: the options it was created with and
+/// every per-case field the comparator compares. The fields every case
+/// shares are the `PIN_*` constants below.
+struct FixedPin {
+    case: &'static str,
+    virtual_size: u64,
+    /// The `block_size` option, 0 when the case gave none.
+    block_size: u32,
+    /// The `block_state_zero` option: off for a `-bsz-off` case.
+    block_state_zero: bool,
+    file_length: u64,
+    recorded_virtual_size: u64,
+    recorded_block_size: u32,
+    chunk_ratio: u64,
+    bat_entry_count: u64,
+    /// `repeated` occurs `repeat` times, each repeat `index_step`
+    /// entries and `offset_step` bytes after the last (the pin file's
+    /// `repeat`, `index_step` and first `offset_steps`), and `bat`
+    /// follows the repeats.
+    repeat: u64,
+    index_step: u64,
+    offset_step: u64,
+    repeated: &'static [PinRun],
+    bat: &'static [PinRun],
+}
+
+/// The ten small fixed pin cases, small enough to materialise whole:
+/// the largest file is 73 MiB.
+const FIXED_PINS: &[FixedPin] = &[
+    FixedPin {
+        case: "vhdx-fixed-16M",
+        virtual_size: 16 * MIB,
+        block_size: 0,
+        block_state_zero: true,
+        file_length: 25165824,
+        recorded_virtual_size: 16777216,
+        recorded_block_size: 8388608,
+        chunk_ratio: 512,
+        bat_entry_count: 2,
+        repeat: 0,
+        index_step: 0,
+        offset_step: 0,
+        repeated: &[],
+        bat: &[
+            run(0, 2, Payload, 2, 0, 0),
+            run(2, 131070, Padding, 0, 0, 0),
+        ],
+    },
+    FixedPin {
+        case: "vhdx-fixed-16M-bsz-off",
+        virtual_size: 16 * MIB,
+        block_size: 0,
+        block_state_zero: false,
+        file_length: 25165824,
+        recorded_virtual_size: 16777216,
+        recorded_block_size: 8388608,
+        chunk_ratio: 512,
+        bat_entry_count: 2,
+        repeat: 0,
+        index_step: 0,
+        offset_step: 0,
+        repeated: &[],
+        bat: &[
+            run(0, 2, Payload, 6, 8388608, 8388608),
+            run(2, 131070, Padding, 0, 0, 0),
+        ],
+    },
+    FixedPin {
+        // 17 MiB ends 1 MiB into its third 8 MiB block: the third entry
+        // still names a whole block, and the file ends inside it.
+        case: "vhdx-fixed-17M",
+        virtual_size: 17 * MIB,
+        block_size: 0,
+        block_state_zero: true,
+        file_length: 26214400,
+        recorded_virtual_size: 17825792,
+        recorded_block_size: 8388608,
+        chunk_ratio: 512,
+        bat_entry_count: 3,
+        repeat: 0,
+        index_step: 0,
+        offset_step: 0,
+        repeated: &[],
+        bat: &[
+            run(0, 3, Payload, 2, 0, 0),
+            run(3, 131069, Padding, 0, 0, 0),
+        ],
+    },
+    FixedPin {
+        case: "vhdx-fixed-17M-bsz-off",
+        virtual_size: 17 * MIB,
+        block_size: 0,
+        block_state_zero: false,
+        file_length: 26214400,
+        recorded_virtual_size: 17825792,
+        recorded_block_size: 8388608,
+        chunk_ratio: 512,
+        bat_entry_count: 3,
+        repeat: 0,
+        index_step: 0,
+        offset_step: 0,
+        repeated: &[],
+        bat: &[
+            run(0, 3, Payload, 6, 8388608, 8388608),
+            run(3, 131069, Padding, 0, 0, 0),
+        ],
+    },
+    FixedPin {
+        case: "vhdx-fixed-64M",
+        virtual_size: 64 * MIB,
+        block_size: 0,
+        block_state_zero: true,
+        file_length: 75497472,
+        recorded_virtual_size: 67108864,
+        recorded_block_size: 8388608,
+        chunk_ratio: 512,
+        bat_entry_count: 8,
+        repeat: 0,
+        index_step: 0,
+        offset_step: 0,
+        repeated: &[],
+        bat: &[
+            run(0, 8, Payload, 2, 0, 0),
+            run(8, 131064, Padding, 0, 0, 0),
+        ],
+    },
+    FixedPin {
+        case: "vhdx-fixed-64M-bsz-off",
+        virtual_size: 64 * MIB,
+        block_size: 0,
+        block_state_zero: false,
+        file_length: 75497472,
+        recorded_virtual_size: 67108864,
+        recorded_block_size: 8388608,
+        chunk_ratio: 512,
+        bat_entry_count: 8,
+        repeat: 0,
+        index_step: 0,
+        offset_step: 0,
+        repeated: &[],
+        bat: &[
+            run(0, 8, Payload, 6, 8388608, 8388608),
+            run(8, 131064, Padding, 0, 0, 0),
+        ],
+    },
+    FixedPin {
+        case: "vhdx-fixed-65M",
+        virtual_size: 65 * MIB,
+        block_size: 0,
+        block_state_zero: true,
+        file_length: 76546048,
+        recorded_virtual_size: 68157440,
+        recorded_block_size: 8388608,
+        chunk_ratio: 512,
+        bat_entry_count: 9,
+        repeat: 0,
+        index_step: 0,
+        offset_step: 0,
+        repeated: &[],
+        bat: &[
+            run(0, 9, Payload, 2, 0, 0),
+            run(9, 131063, Padding, 0, 0, 0),
+        ],
+    },
+    FixedPin {
+        case: "vhdx-fixed-65M-bsz-off",
+        virtual_size: 65 * MIB,
+        block_size: 0,
+        block_state_zero: false,
+        file_length: 76546048,
+        recorded_virtual_size: 68157440,
+        recorded_block_size: 8388608,
+        chunk_ratio: 512,
+        bat_entry_count: 9,
+        repeat: 0,
+        index_step: 0,
+        offset_step: 0,
+        repeated: &[],
+        bat: &[
+            run(0, 9, Payload, 6, 8388608, 8388608),
+            run(9, 131063, Padding, 0, 0, 0),
+        ],
+    },
+    FixedPin {
+        case: "vhdx-fixed-64M-block-1M",
+        virtual_size: 64 * MIB,
+        block_size: 1048576,
+        block_state_zero: true,
+        file_length: 75497472,
+        recorded_virtual_size: 67108864,
+        recorded_block_size: 1048576,
+        chunk_ratio: 4096,
+        bat_entry_count: 64,
+        repeat: 0,
+        index_step: 0,
+        offset_step: 0,
+        repeated: &[],
+        bat: &[
+            run(0, 64, Payload, 2, 0, 0),
+            run(64, 131008, Padding, 0, 0, 0),
+        ],
+    },
+    FixedPin {
+        case: "vhdx-fixed-64M-block-1M-bsz-off",
+        virtual_size: 64 * MIB,
+        block_size: 1048576,
+        block_state_zero: false,
+        file_length: 75497472,
+        recorded_virtual_size: 67108864,
+        recorded_block_size: 1048576,
+        chunk_ratio: 4096,
+        bat_entry_count: 64,
+        repeat: 0,
+        index_step: 0,
+        offset_step: 0,
+        repeated: &[],
+        bat: &[
+            run(0, 64, Payload, 6, 8388608, 1048576),
+            run(64, 131008, Padding, 0, 0, 0),
+        ],
+    },
+];
+
+/// `vhdx-fixed-131041M-block-1M-bsz-off`: a 128 GiB file, so it is
+/// checked with only its structure in memory and the data region left
+/// as the hole a sparse file would hold. 131041 blocks of 1 MiB are 31
+/// whole groups of 4096 payload entries, each followed by a sector
+/// bitmap slot, then 4065 entries that fill the region's last entry
+/// exactly, with no padding.
+const FIXED_PIN_131041M: FixedPin = FixedPin {
+    case: "vhdx-fixed-131041M-block-1M-bsz-off",
+    virtual_size: 131041 * MIB,
+    block_size: 1048576,
+    block_state_zero: false,
+    file_length: 137414836224,
+    recorded_virtual_size: 137406447616,
+    recorded_block_size: 1048576,
+    chunk_ratio: 4096,
+    bat_entry_count: 131072,
+    repeat: 31,
+    index_step: 4097,
+    offset_step: 4294967296,
+    repeated: &[
+        run(0, 4096, Payload, 6, 8388608, 1048576),
+        run(4096, 1, SectorBitmap, 0, 0, 0),
+    ],
+    bat: &[run(127007, 4065, Payload, 6, 133152374784, 1048576)],
+};
+
+/// Region table entries, identical in both tables of every fixed pin
+/// case: `(region GUID, offset, length, Required)`.
+const PIN_REGIONS: [(&str, u64, u32, u32); 2] = [
+    ("2DC27766-F623-4200-9D64-115E9BFD4A08", 2097152, 1048576, 0),
+    ("8B7CA206-4790-4B9A-B8FE-575F050F886E", 3145728, 1048576, 0),
+];
+
+/// The log region every fixed pin case declares: `(offset, length)`.
+const PIN_LOG: (u64, u32) = (1048576, 1048576);
+
+/// The metadata table of every fixed pin case, in table order:
+/// `(item GUID, offset in the region, length, flags)`. File Parameters
+/// is IsRequired (4), the other four IsRequired | IsVirtualDisk (6).
+const PIN_METADATA_ITEMS: [(&str, u32, u32, u32); 5] = [
+    ("CAA16737-FA36-4D43-B3B6-33F0AA44E76B", 65536, 8, 4), // file_parameters
+    ("2FA54224-CD1B-4876-B211-5DBED83BF4B8", 65544, 8, 6), // virtual_disk_size
+    ("BECA12AB-B2E6-4523-93EF-C309E000C746", 65552, 16, 6), // page83
+    ("8141BF1D-A96F-4709-BA47-F233A8FAAB5F", 65568, 4, 6), // logical_sector_size
+    ("CDA348C7-445D-4471-9CC9-E9885251C556", 65572, 4, 6), // physical_sector_size
+];
+
+/// Logical and physical sector size of every fixed pin case.
+const PIN_SECTOR_SIZES: (u32, u32) = (512, 512);
+
+/// `bat_capacity` of every fixed pin case: a 1 MiB BAT region.
+const PIN_BAT_CAPACITY: u64 = 131072;
+
+/// A GUID's text form as the bytes VHDX stores it: the first three
+/// groups little-endian, the last two in order. Written out here rather
+/// than taken from the `vhdx` crate, whose item GUIDs are what is under
+/// test.
+fn guid_bytes_le(text: &str) -> [u8; 16] {
+    let hex: String = text.chars().filter(|c| *c != '-').collect();
+    assert_eq!(hex.len(), 32, "{text}");
+    let mut raw = [0u8; 16];
+    for (i, byte) in raw.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap();
+    }
+    raw[0..4].reverse();
+    raw[4..6].reverse();
+    raw[6..8].reverse();
+    raw
+}
+
+/// A pin's BAT as one run per range, in index order: the repeats
+/// unrolled, then the rest.
+fn expand_pin_runs(pin: &FixedPin) -> Vec<PinRun> {
+    let mut runs = Vec::new();
+    for r in 0..pin.repeat {
+        for run in pin.repeated {
+            runs.push(PinRun {
+                start: run.start + r * pin.index_step,
+                offset: if run.state == 0 {
+                    run.offset
+                } else {
+                    run.offset + r * pin.offset_step
+                },
+                ..*run
+            });
+        }
+    }
+    runs.extend_from_slice(pin.bat);
+    runs
+}
+
+/// Run-length encode a BAT region the way the comparator does
+/// (`_parse_bat` in `tests/helpers/vhdx_structure.py`), so the result
+/// compares with a pin's runs directly. The state is bits 0-2 and the
+/// file offset bits 20-63, SPEC(VHDX) 2.5.1.
+fn bat_runs(bat: &[u8], entry_count: u64, chunk_ratio: u64) -> Vec<PinRun> {
+    let mut runs: Vec<PinRun> = Vec::new();
+    for (index, raw) in bat.chunks_exact(8).enumerate() {
+        let index = index as u64;
+        let value = u64::from_le_bytes(raw.try_into().unwrap());
+        let kind = if index >= entry_count {
+            Padding
+        } else if (index + 1) % (chunk_ratio + 1) == 0 {
+            SectorBitmap
+        } else {
+            Payload
+        };
+        let state = value & 0x7;
+        let offset = value & 0xFFFF_FFFF_FFF0_0000;
+        if let Some(current) = runs.last_mut() {
+            if current.kind == kind && current.state == state {
+                if current.count == 1 {
+                    current.stride = offset.wrapping_sub(current.offset);
+                    current.count = 2;
+                    continue;
+                }
+                if offset
+                    == current
+                        .offset
+                        .wrapping_add(current.count.wrapping_mul(current.stride))
+                {
+                    current.count += 1;
+                    continue;
+                }
+            }
+        }
+        runs.push(run(index, 1, kind, state, offset, 0));
+    }
+    runs
+}
+
+/// The first byte at which two images differ, for a failure message
+/// that does not print 73 MiB of bytes.
+fn first_difference(a: &[u8], b: &[u8]) -> Option<usize> {
+    a.iter()
+        .zip(b)
+        .position(|(x, y)| x != y)
+        .or_else(|| (a.len() != b.len()).then_some(a.len().min(b.len())))
+}
+
+/// Stream the first `upto` bytes of a fixed image's BAT into `image`
+/// through a buffer of `buf_len` bytes, as a guest with one reusable
+/// buffer would: fill it from the plan's layout, write it at the BAT
+/// offset plus its first entry's index times 8, and advance.
+fn stream_fixed_bat(image: &mut [u8], fixed: &FixedVhdxPlan, buf_len: usize, upto: u64) {
+    assert_eq!(buf_len % 8, 0);
+    let mut buf = vec![0xAAu8; buf_len];
+    let mut done = 0u64;
+    while done < upto {
+        let n = (upto - done).min(buf_len as u64) as usize;
+        vhdx::fill_fixed_bat(&fixed.layout, fixed.state, done / 8, &mut buf[..n])
+            .expect("fill a buffer of the BAT");
+        let at = (fixed.layout.bat_offset + done) as usize;
+        image[at..at + n].copy_from_slice(&buf[..n]);
+        done += n as u64;
+    }
+}
+
+// A device for `vhdx::VhdxState` to read, as the guest's readers do. The
+// image is held per test thread, and a sector past its end but inside
+// the declared capacity reads as zeros, which is what a sparse file's
+// hole reads as: that lets a 128 GiB fixed image be read back with only
+// its structure in memory.
+std::thread_local! {
+    static DEVICE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+unsafe extern "C" fn device_read_sector(
+    _device: u32,
+    sector: u64,
+    buf: *mut u8,
+    sector_size: usize,
+) -> bool {
+    DEVICE.with(|device| {
+        let device = device.borrow();
+        let start = sector as usize * sector_size;
+        // SAFETY: the reader passes a buffer of at least `sector_size`
+        // bytes, which is its contract with the call table.
+        let out = unsafe { std::slice::from_raw_parts_mut(buf, sector_size) };
+        out.fill(0);
+        if start < device.len() {
+            let end = (start + sector_size).min(device.len());
+            out[..end - start].copy_from_slice(&device[start..end]);
+        }
+        true
+    })
+}
+
+/// A `CallTable` whose only working entry reads [`DEVICE`]. Every other
+/// entry is a stub the VHDX reader never calls. A copy of the `vhdx`
+/// crate's test stub, because `shared` has no test-support surface to
+/// share one from.
+fn device_call_table() -> shared::CallTable {
+    unsafe extern "C" fn s_get_dev_count() -> u32 {
+        1
+    }
+    unsafe extern "C" fn s_in_cap(_: u32) -> u64 {
+        0
+    }
+    unsafe extern "C" fn s_in_secsz(_: u32) -> usize {
+        512
+    }
+    unsafe extern "C" fn s_write_out(_: u64, _: *const u8, _: usize) -> bool {
+        false
+    }
+    unsafe extern "C" fn s_out_cap() -> u64 {
+        0
+    }
+    unsafe extern "C" fn s_out_secsz() -> usize {
+        512
+    }
+    unsafe extern "C" fn s_prog_int() -> u32 {
+        100
+    }
+    unsafe extern "C" fn s_send_prog(_: *const u8, _: u64, _: u64, _: u32) {}
+    unsafe extern "C" fn s_send_err(_: *const u8, _: *const u8, _: u64, _: u32) {}
+    unsafe extern "C" fn s_send_complete(_: *const u8, _: u64, _: bool) {}
+    unsafe extern "C" fn s_dbg(_: *const u8) {}
+    unsafe extern "C" fn s_verb(_: *const u8) {}
+    unsafe extern "C" fn s_get_op_cfg() -> shared::ConfigResult {
+        shared::ConfigResult {
+            ptr: core::ptr::null(),
+            len: 0,
+        }
+    }
+    unsafe extern "C" fn s_get_chain_cfg() -> shared::ConfigResult {
+        shared::ConfigResult {
+            ptr: core::ptr::null(),
+            len: 0,
+        }
+    }
+    unsafe extern "C" fn s_send_info(
+        _: *const u8,
+        _: u32,
+        _: u64,
+        _: u64,
+        _: u32,
+        _: u32,
+        _: *const u8,
+        _: *const u8,
+    ) {
+    }
+    unsafe extern "C" fn s_send_info_q(
+        _: *const u8,
+        _: u32,
+        _: u64,
+        _: u64,
+        _: u32,
+        _: u32,
+        _: *const u8,
+        _: *const u8,
+        _: *const shared::Qcow2Info,
+    ) {
+    }
+    unsafe extern "C" fn s_send_info_v(
+        _: *const u8,
+        _: u32,
+        _: u64,
+        _: u64,
+        _: u32,
+        _: u32,
+        _: *const u8,
+        _: *const u8,
+        _: *const shared::VmdkInfo,
+    ) {
+    }
+    unsafe extern "C" fn s_send_info_vdi(
+        _: *const u8,
+        _: u32,
+        _: u64,
+        _: u64,
+        _: u32,
+        _: u32,
+        _: *const u8,
+        _: *const u8,
+        _: *const shared::VdiInfo,
+    ) {
+    }
+    unsafe extern "C" fn s_send_info_l(
+        _: *const u8,
+        _: u32,
+        _: u64,
+        _: u64,
+        _: u32,
+        _: u32,
+        _: *const u8,
+        _: *const u8,
+        _: *const shared::LuksInfo,
+    ) {
+    }
+    unsafe extern "C" fn s_send_check(_: *const shared::CheckResult) {}
+    unsafe extern "C" fn s_send_compare(_: *const shared::CompareResult) {}
+    unsafe extern "C" fn s_send_measure(_: *const shared::MeasureResult) {}
+    unsafe extern "C" fn s_send_create(_: *const shared::CreateResult) {}
+    unsafe extern "C" fn s_read_out(_: u64, _: *mut u8, _: usize) -> bool {
+        false
+    }
+    unsafe extern "C" fn s_send_resize(_: *const shared::ResizeResult) {}
+    unsafe extern "C" fn s_send_rebase(_: *const shared::RebaseResult) {}
+    unsafe extern "C" fn s_send_commit(_: *const shared::CommitResult) {}
+    unsafe extern "C" fn s_write_in(_: u32, _: u64, _: *const u8, _: usize) -> bool {
+        false
+    }
+    unsafe extern "C" fn s_send_map_ex(_: *const shared::MapExtentRecord) {}
+    unsafe extern "C" fn s_send_map_res(_: *const shared::MapResult) {}
+    unsafe extern "C" fn s_send_snap_ent(_: *const shared::SnapshotEntryRecord) {}
+    unsafe extern "C" fn s_send_snap_res(_: *const shared::SnapshotResult) {}
+    unsafe extern "C" fn s_fsync_in(_: u32) -> bool {
+        true
+    }
+    unsafe extern "C" fn s_send_amend(_: *const shared::AmendResult) {}
+    unsafe extern "C" fn s_send_bitmap(_: *const shared::BitmapResult) {}
+    unsafe extern "C" fn s_send_bench_start() {}
+    unsafe extern "C" fn s_send_bench_result(_: *const shared::BenchResult) {}
+    shared::CallTable {
+        magic: shared::CallTable::MAGIC,
+        version: shared::CallTable::VERSION,
+        get_input_device_count: s_get_dev_count,
+        read_input_sector: device_read_sector,
+        get_input_capacity: s_in_cap,
+        get_input_sector_size: s_in_secsz,
+        write_output_sector: s_write_out,
+        get_output_capacity: s_out_cap,
+        get_output_sector_size: s_out_secsz,
+        get_progress_interval: s_prog_int,
+        send_progress: s_send_prog,
+        send_error: s_send_err,
+        send_complete: s_send_complete,
+        debug_print: s_dbg,
+        verbose_print: s_verb,
+        get_operation_config: s_get_op_cfg,
+        get_chain_config: s_get_chain_cfg,
+        send_info_result: s_send_info,
+        send_info_result_qcow2: s_send_info_q,
+        send_info_result_vmdk: s_send_info_v,
+        send_info_result_vdi: s_send_info_vdi,
+        send_info_result_luks: s_send_info_l,
+        send_check_result: s_send_check,
+        send_compare_result: s_send_compare,
+        send_measure_result: s_send_measure,
+        send_create_result: s_send_create,
+        read_output_sector: s_read_out,
+        send_resize_result: s_send_resize,
+        send_rebase_result: s_send_rebase,
+        send_commit_result: s_send_commit,
+        write_input_sector: s_write_in,
+        send_map_extent: s_send_map_ex,
+        send_map_result: s_send_map_res,
+        send_snapshot_entry: s_send_snap_ent,
+        send_snapshot_result: s_send_snap_res,
+        fsync_input: s_fsync_in,
+        send_amend_result: s_send_amend,
+        send_bitmap_result: s_send_bitmap,
+        send_bench_start: s_send_bench_start,
+        send_bench_result: s_send_bench_result,
+    }
+}
+
+/// The bytes of the plan's write at `offset`, read from the write itself
+/// rather than from a materialised image: at 64 TiB the metadata region
+/// ends 516 MiB into the file.
+fn write_at<'a>(plan: &MetadataPlan<'a>, offset: u64) -> &'a [u8] {
+    plan.writes()
+        .iter()
+        .find(|w| w.byte_offset == offset)
+        .unwrap_or_else(|| panic!("no write at {offset}"))
+        .bytes
+}
+
+/// Plan a pin case's image.
+fn plan_fixed_pin<'a>(pin: &FixedPin, scratch: &'a mut [u8]) -> (MetadataPlan<'a>, FixedVhdxPlan) {
+    let opts = VhdxCreateOpts {
+        virtual_size: pin.virtual_size,
+        block_size: pin.block_size,
+        subformat: VhdxSubformat::Fixed,
+        block_state_zero: pin.block_state_zero,
+        backing: None,
+        parent_data_write_guid: [0u8; 16],
+    };
+    let plan = plan_vhdx(&opts, scratch).expect(pin.case);
+    let fixed = plan.fixed.expect("a fixed image has a fixed plan");
+    assert_plan_invariants(&plan.metadata);
+    (plan.metadata, fixed)
+}
+
+/// Check the plan's own numbers against the pin, before any image is
+/// built: the BAT bytes it asks the caller to stream, the length it asks
+/// the file to reach, and that its metadata writes end where the
+/// metadata region ends, as a dynamic plan's do.
+fn check_fixed_plan(pin: &FixedPin, metadata: &MetadataPlan<'_>, fixed: &FixedVhdxPlan) {
+    let case = pin.case;
+    assert_eq!(
+        fixed.layout.bat_entries as u64, pin.bat_entry_count,
+        "{case}"
+    );
+    assert_eq!(
+        fixed.bat_bytes,
+        fixed.layout.bat_entries as u64 * 8,
+        "{case}"
+    );
+    assert_eq!(fixed.bat_bytes, pin.bat_entry_count * 8, "{case}");
+    assert_eq!(fixed.file_length, pin.file_length, "{case}");
+    assert_eq!(fixed.file_length, fixed.layout.fixed_file_length, "{case}");
+    let (_, metadata_offset, metadata_len, _) = PIN_REGIONS[1];
+    assert_eq!(
+        metadata.minimum_file_size,
+        metadata_offset + u64::from(metadata_len),
+        "{case}: the metadata writes end at the end of the metadata region",
+    );
+    assert_eq!(
+        metadata.minimum_file_size, fixed.layout.data_start,
+        "{case}"
+    );
+}
+
+/// Read a fixed image back, structure by structure, and compare every
+/// field the comparator compares with the pin. `image` holds the file
+/// from offset 0, and `file_length` is the file's length, which may run
+/// past `image` into a hole.
+fn check_fixed_image(pin: &FixedPin, image: &[u8], file_length: u64) {
+    let case = pin.case;
+    assert_eq!(file_length, pin.file_length, "{case}: file length");
+
+    // File identifier, and both headers with the log they declare.
+    let sig = u64::from_le_bytes(image[..8].try_into().unwrap());
+    assert_eq!(sig, vhdx::FILE_IDENTIFIER_SIGNATURE, "{case}");
+    let header_at = |offset: u64| {
+        vhdx::VhdxHeader::parse(&image[offset as usize..offset as usize + vhdx::HEADER_SIZE])
+            .expect("parse header")
+    };
+    let (h1, h2) = (
+        header_at(vhdx::HEADER1_OFFSET),
+        header_at(vhdx::HEADER2_OFFSET),
+    );
+    let active = if h1.sequence_number >= h2.sequence_number {
+        h1
+    } else {
+        h2
+    };
+    assert_eq!(
+        (active.log_offset, active.log_length),
+        PIN_LOG,
+        "{case}: log"
+    );
+
+    // Both region tables, which must agree byte for byte.
+    let table_at = |offset: u64| &image[offset as usize..offset as usize + 65536];
+    let rt1 = table_at(vhdx::REGION_TABLE1_OFFSET);
+    assert!(
+        rt1 == table_at(vhdx::REGION_TABLE2_OFFSET),
+        "{case}: region tables disagree"
+    );
+    let (entries, count) = vhdx::parse_region_table(rt1).expect("parse region table");
+    assert_eq!(count, 2, "{case}: region table entry count");
+    for (entry, (guid, offset, length, required)) in entries.iter().zip(PIN_REGIONS) {
+        assert_eq!(entry.guid, guid_bytes_le(guid), "{case}");
+        assert_eq!(
+            (entry.file_offset, entry.length, entry.required),
+            (offset, length, required),
+            "{case}: region {guid}",
+        );
+    }
+    let [bat, metadata] = entries;
+
+    // The metadata table, entry by entry, and the values its items hold.
+    let region = &image[metadata.file_offset as usize..][..metadata.length as usize];
+    let table = walk_metadata_table(region);
+    assert_eq!(
+        table.len(),
+        PIN_METADATA_ITEMS.len(),
+        "{case}: metadata items"
+    );
+    for (entry, (guid, offset, length, flags)) in table.iter().zip(PIN_METADATA_ITEMS) {
+        assert_eq!(entry.item_id, guid_bytes_le(guid), "{case}: item order");
+        assert_eq!(
+            (entry.offset, entry.length, entry.flags),
+            (offset, length, flags),
+            "{case}: metadata item {guid}",
+        );
+    }
+    let items = vhdx::parse_metadata_region(region).expect("parse metadata region");
+    assert_eq!(items.block_size, pin.recorded_block_size, "{case}");
+    assert_eq!(items.virtual_disk_size, pin.recorded_virtual_size, "{case}");
+    assert_eq!(
+        (items.logical_sector_size, items.physical_sector_size),
+        PIN_SECTOR_SIZES,
+        "{case}: sector sizes",
+    );
+    assert!(
+        items.leave_blocks_allocated,
+        "{case}: LeaveBlocksAllocated must be set on a fixed image",
+    );
+    assert!(!items.has_parent, "{case}: HasParent");
+
+    // The BAT as runs, padding and sector bitmap slots included.
+    let bat_bytes = &image[bat.file_offset as usize..][..bat.length as usize];
+    assert_eq!(
+        bat_bytes.len() as u64 / 8,
+        PIN_BAT_CAPACITY,
+        "{case}: BAT capacity"
+    );
+    assert_eq!(
+        bat_runs(bat_bytes, pin.bat_entry_count, pin.chunk_ratio),
+        expand_pin_runs(pin),
+        "{case}: BAT runs",
+    );
+
+    // And through the reader the operations use: every payload block's
+    // lookup must land where the pin's run says it is.
+    let call_table = device_call_table();
+    let mut bat_cache = vec![0u8; shared::MAX_SECTOR_SIZE];
+    let mut data_cache = vec![0u8; shared::MAX_SECTOR_SIZE];
+    let mut bytes_read = 0u64;
+    let capacity = file_length / 512;
+    DEVICE.with(|device| device.replace(image.to_vec()));
+    // SAFETY: both cache buffers are MAX_SECTOR_SIZE bytes and outlive
+    // the state, and the call table's reader serves DEVICE.
+    let mut state = unsafe {
+        vhdx::VhdxState::init(
+            &call_table,
+            0,
+            512,
+            capacity,
+            bat_cache.as_mut_ptr(),
+            data_cache.as_mut_ptr(),
+            &mut bytes_read,
+        )
+    }
+    .expect("the reader opens the image");
+    assert_eq!(state.block_size, pin.recorded_block_size, "{case}");
+    assert_eq!(state.virtual_disk_size, pin.recorded_virtual_size, "{case}");
+    assert_eq!(state.logical_sector_size, PIN_SECTOR_SIZES.0, "{case}");
+    assert_eq!(u64::from(state.chunk_ratio), pin.chunk_ratio, "{case}");
+    assert_eq!(
+        u64::from(state.total_bat_entries),
+        pin.bat_entry_count,
+        "{case}"
+    );
+    assert_eq!(state.bat_offset, PIN_REGIONS[0].1, "{case}");
+    assert!(!state.has_parent, "{case}");
+
+    let block_size = u64::from(pin.recorded_block_size);
+    let mut lookup = |virtual_offset: u64| {
+        // SAFETY: as for `init` above.
+        unsafe { state.block_lookup(&call_table, virtual_offset, 512, capacity, &mut bytes_read) }
+    };
+    let mut block = 0u64;
+    for run in expand_pin_runs(pin).iter().filter(|r| r.kind == Payload) {
+        for k in 0..run.count {
+            let first = block * block_size;
+            let last = (first + block_size).min(pin.recorded_virtual_size) - 1;
+            for virtual_offset in [first, last] {
+                let got = lookup(virtual_offset);
+                match run.state {
+                    2 => assert!(
+                        matches!(got, Some(vhdx::VhdxBlockLookup::Zero)),
+                        "{case}: block {block} at {virtual_offset}: {got:?}",
+                    ),
+                    6 => {
+                        let want = run.offset + k * run.stride + (virtual_offset - first);
+                        assert!(
+                            matches!(
+                                got,
+                                Some(vhdx::VhdxBlockLookup::Present { host_byte_offset })
+                                    if host_byte_offset == want
+                            ),
+                            "{case}: block {block} at {virtual_offset}: {got:?}, want {want}",
+                        );
+                    }
+                    other => panic!("{case}: the pin has a payload run in state {other}"),
+                }
+            }
+            block += 1;
+        }
+    }
+    assert_eq!(
+        block,
+        pin.recorded_virtual_size.div_ceil(block_size),
+        "{case}: payload blocks the reader was asked about",
+    );
+    DEVICE.with(|device| device.take());
+}
+
+/// Every small fixed pin case, built as a guest would build it and read
+/// back field by field.
+///
+/// The BAT is streamed into an image already extended to the plan's
+/// file length three ways: the whole region through a 512-byte buffer,
+/// the whole region through a 64 KiB one, and only the entries'
+/// `bat_bytes` through 64 KiB, leaving the padding as the hole the plan
+/// says it may stay. All three files must be identical, which catches an
+/// entry lost or doubled at a buffer edge, where one whole-region fill
+/// could not. Each file is then compared with the pin.
+#[test]
+fn vhdx_fixed_round_trips_match_qemu_pins() {
+    for pin in FIXED_PINS {
+        let case = pin.case;
+        let mut scratch = vec![0u8; VHDX_MAX_METADATA_SCRATCH];
+        let (metadata, fixed) = plan_fixed_pin(pin, &mut scratch);
+        check_fixed_plan(pin, &metadata, &fixed);
+
+        let mut base = materialise(&metadata);
+        base.resize(fixed.file_length as usize, 0);
+        let region = u64::from(fixed.layout.bat_region_len);
+
+        let mut small = base.clone();
+        stream_fixed_bat(&mut small, &fixed, 512, region);
+        let mut large = base.clone();
+        stream_fixed_bat(&mut large, &fixed, 64 * 1024, region);
+        assert_eq!(
+            first_difference(&small, &large),
+            None,
+            "{case}: 512-byte and 64 KiB buffers wrote different files",
+        );
+        drop(large);
+        let mut entries_only = base;
+        stream_fixed_bat(&mut entries_only, &fixed, 64 * 1024, fixed.bat_bytes);
+        assert_eq!(
+            first_difference(&small, &entries_only),
+            None,
+            "{case}: leaving the padding as a hole wrote a different file",
+        );
+        drop(entries_only);
+
+        check_fixed_image(pin, &small, small.len() as u64);
+    }
+}
+
+/// `vhdx-fixed-131041M-block-1M-bsz-off`, whose BAT has a sector bitmap
+/// slot after every 4096 entries and ends exactly at the region's last
+/// entry. Only the structure is materialised: the data region of a
+/// 128 GiB file is a hole, and the reader is told the file's real
+/// length.
+#[test]
+fn vhdx_fixed_131041m_round_trip_matches_its_qemu_pin() {
+    let pin = &FIXED_PIN_131041M;
+    let mut scratch = vec![0u8; VHDX_MAX_METADATA_SCRATCH];
+    let (metadata, fixed) = plan_fixed_pin(pin, &mut scratch);
+    check_fixed_plan(pin, &metadata, &fixed);
+
+    let mut small = materialise(&metadata);
+    let region = u64::from(fixed.layout.bat_region_len);
+    stream_fixed_bat(&mut small, &fixed, 512, region);
+    let mut large = materialise(&metadata);
+    stream_fixed_bat(&mut large, &fixed, 64 * 1024, region);
+    assert_eq!(
+        first_difference(&small, &large),
+        None,
+        "buffer sizes disagree"
+    );
+
+    check_fixed_image(pin, &small, fixed.file_length);
+}
+
+/// The two geometries too large to pin: 2 TiB and 64 TiB at 1 MiB
+/// blocks, where the BAT region grows past 1 MiB and moves the metadata
+/// region and qemu's data start with it. The values are the ones the
+/// `vhdx` crate's filler tests carry: 2 TiB's 24 MiB data start was
+/// measured with qemu-img 10.0.13, and 64 TiB's 520 MiB is computed
+/// from qemu's rule. What this adds is that the plan hands the caller
+/// that same layout, and that its metadata writes end where the moved
+/// metadata region does. The entries are sampled at the edges of the
+/// first group and the last, not streamed.
+#[test]
+fn vhdx_fixed_plan_at_the_largest_geometries() {
+    // (virtual size, BAT entries, BAT region length, fixed data start,
+    // file length, index of the last group's first entry)
+    let cases: [(u64, u64, u32, u64, u64, u64); 2] = [
+        (
+            2 * 1024 * 1024 * MIB,
+            2097663,
+            17825792,
+            25165824,
+            2199048421376,
+            2093567,
+        ),
+        (
+            64 * 1024 * 1024 * MIB,
+            67125247,
+            537919488,
+            545259520,
+            70369289437184,
+            67121151,
+        ),
+    ];
+    for (virtual_size, entries, region_len, data_start, file_length, last_group) in cases {
+        let opts = VhdxCreateOpts {
+            virtual_size,
+            block_size: 1024 * 1024,
+            subformat: VhdxSubformat::Fixed,
+            block_state_zero: false,
+            backing: None,
+            parent_data_write_guid: [0u8; 16],
+        };
+        let mut scratch = vec![0u8; VHDX_MAX_METADATA_SCRATCH];
+        let plan = plan_vhdx(&opts, &mut scratch).expect("plan");
+        assert_plan_invariants(&plan.metadata);
+        let fixed = plan.fixed.expect("fixed plan");
+        let label = format!("vsize={virtual_size}");
+        assert_eq!(fixed.layout.bat_entries as u64, entries, "{label}");
+        assert_eq!(fixed.bat_bytes, entries * 8, "{label}");
+        assert_eq!(fixed.layout.bat_region_len, region_len, "{label}");
+        assert_eq!(fixed.layout.fixed_data_start, data_start, "{label}");
+        assert_eq!(fixed.file_length, file_length, "{label}");
+        let metadata_end = 2 * MIB + u64::from(region_len) + MIB;
+        assert_eq!(plan.metadata.minimum_file_size, metadata_end, "{label}");
+
+        // The emitted region table declares the BAT the filler sizes.
+        let rt = write_at(&plan.metadata, vhdx::REGION_TABLE1_OFFSET);
+        let ([bat, metadata], _) = vhdx::parse_region_table(rt).expect("parse region table");
+        assert_eq!(
+            (bat.file_offset, bat.length),
+            (2 * MIB, region_len),
+            "{label}"
+        );
+        assert_eq!(
+            metadata.file_offset,
+            2 * MIB + u64::from(region_len),
+            "{label}"
+        );
+
+        let entry_at = |index: u64| {
+            let mut out = [0u8; 8];
+            vhdx::fill_fixed_bat(&fixed.layout, fixed.state, index, &mut out).expect("fill");
+            u64::from_le_bytes(out)
+        };
+        let present = |block: u64| (data_start + block * MIB) | 6;
+        assert_eq!(entry_at(0), present(0), "{label}: first entry");
+        assert_eq!(
+            entry_at(4095),
+            present(4095),
+            "{label}: end of the first group"
+        );
+        assert_eq!(entry_at(4096), 0, "{label}: the first sector bitmap slot");
+        assert_eq!(
+            entry_at(4097),
+            present(4096),
+            "{label}: start of the second group"
+        );
+        let last_group_block = last_group - last_group / 4097;
+        assert_eq!(entry_at(last_group), present(last_group_block), "{label}");
+        assert_eq!(
+            entry_at(entries - 1),
+            present(virtual_size / MIB - 1),
+            "{label}: the last entry is the last block",
+        );
+        assert_eq!(entry_at(entries), 0, "{label}: the first padding entry");
+    }
+}
+
+/// A fixed plan's metadata writes are a dynamic plan's with one bit
+/// changed, File Parameters `LeaveBlocksAllocated`, and the dynamic
+/// plan's is clear. The writes are compared byte for byte, so the bit
+/// cannot be set on both, cleared on both, or joined by any other
+/// difference. `block_state_zero` reaches neither: it chooses the state
+/// of BAT entries the caller streams, not anything the writes hold.
+#[test]
+fn vhdx_fixed_metadata_differs_from_dynamic_only_in_leave_blocks_allocated() {
+    let mut geometries: Vec<(u64, u32)> = FIXED_PINS
+        .iter()
+        .chain([&FIXED_PIN_131041M])
+        .map(|pin| (pin.virtual_size, pin.block_size))
+        .collect();
+    geometries.extend([
+        (1 << 40, 32 * 1024 * 1024),
+        (vhdx::MAX_VIRTUAL_SIZE, 1024 * 1024),
+    ]);
+
+    for (virtual_size, block_size) in geometries {
+        let label = format!("vsize={virtual_size} bsize={block_size}");
+        let opts = |subformat, block_state_zero| VhdxCreateOpts {
+            virtual_size,
+            block_size,
+            subformat,
+            block_state_zero,
+            backing: None,
+            parent_data_write_guid: [0u8; 16],
+        };
+        let mut dynamic_scratch = vec![0u8; VHDX_MAX_METADATA_SCRATCH];
+        let dynamic = plan_vhdx(&opts(VhdxSubformat::Dynamic, true), &mut dynamic_scratch)
+            .expect("dynamic plan");
+        assert!(dynamic.fixed.is_none(), "{label}");
+        let dynamic = dynamic.metadata;
+
+        for (subformat, block_state_zero) in [
+            (VhdxSubformat::Dynamic, false),
+            (VhdxSubformat::Fixed, true),
+            (VhdxSubformat::Fixed, false),
+        ] {
+            let label = format!("{label} {subformat:?} block_state_zero={block_state_zero}");
+            let mut scratch = vec![0u8; VHDX_MAX_METADATA_SCRATCH];
+            let other = plan_vhdx(&opts(subformat, block_state_zero), &mut scratch)
+                .expect("plan")
+                .metadata;
+            assert_eq!(
+                other.minimum_file_size, dynamic.minimum_file_size,
+                "{label}"
+            );
+            assert_eq!(
+                other.total_metadata_bytes, dynamic.total_metadata_bytes,
+                "{label}"
+            );
+            assert_eq!(other.writes().len(), dynamic.writes().len(), "{label}");
+
+            let mut differences = Vec::new();
+            for (want, got) in dynamic.writes().iter().zip(other.writes()) {
+                assert_eq!(want.byte_offset, got.byte_offset, "{label}");
+                assert_eq!(want.bytes.len(), got.bytes.len(), "{label}");
+                for (i, (a, b)) in want.bytes.iter().zip(got.bytes).enumerate() {
+                    if a != b {
+                        differences.push((want.byte_offset + i as u64, *a, *b));
+                    }
+                }
+            }
+
+            if subformat == VhdxSubformat::Dynamic {
+                assert_eq!(differences, [], "{label}");
+                continue;
+            }
+            // The File Parameters item's flags word, found through the
+            // dynamic plan's own region table and metadata table.
+            let rt = write_at(&dynamic, vhdx::REGION_TABLE1_OFFSET);
+            let ([_, metadata], _) = vhdx::parse_region_table(rt).expect("parse region table");
+            let region = write_at(&dynamic, metadata.file_offset);
+            let file_parameters = walk_metadata_table(region)
+                .into_iter()
+                .find(|e| e.item_id == guid_bytes_le(PIN_METADATA_ITEMS[0].0))
+                .expect("a File Parameters item");
+            let flags_at = metadata.file_offset + u64::from(file_parameters.offset) + 4;
+            assert_eq!(
+                differences,
+                [(flags_at, 0x00, 0x01)],
+                "{label}: the only difference is LeaveBlocksAllocated, clear for \
+                 dynamic and set for fixed",
+            );
+        }
+    }
 }

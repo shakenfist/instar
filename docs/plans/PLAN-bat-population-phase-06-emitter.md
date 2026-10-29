@@ -533,6 +533,27 @@ Every brief also carries the session's standing rules:
   `vhdx-write-fixed-bat-interleaved-by-chunk-ratio` (PASS, source
   restored byte for byte) and `--check-patterns` (137 land).
   `make test-rust` passed 2769.
+* **6c.** Three departures, all kept:
+  * A fixed VHDX with any backing reference is refused before its path
+    is examined. A path the dynamic arm refuses for its own reason (too
+    long, not UTF-8) gets `BackingFileUnsupported` too, because qemu-img
+    refuses every VHDX backing file.
+  * `VhdxCreateOpts` has 15 literals, not the survey's 14.
+    `src/crates/resize/tests/vhdx_grow.rs` holds the fifteenth.
+  * `round_trip.rs` carries its own stub `CallTable` to read images
+    back through `VhdxState`, as the dmg, vdi, vhdx, parallels and
+    qcow1 crates' tests each do. `shared` has no shared one.
+
+  The replacement for `plan_vhdx`'s `PLAN-differencing.md` citation
+  states the reasoning that plan's phase 1 pin records: Hyper-V's
+  locator also carries `volume_path`, which needs a Windows volume
+  GUID, and `parent_linkage2`. The management session checked both
+  claims against that file. A dynamic `create` at 64M, 1G and 131041M
+  with 1 MiB blocks is byte-identical to the one built at `dab31e4d`
+  (`cmp`, agent). The baseline had to be rebuilt from `git archive`,
+  because the create op is `create.bin` beside the host binary, and
+  `make instar` overwrites it. `create.bin` grew from 58480 to 59024
+  bytes. `make test-rust` passed 2781, and `make fuzz-build` passes.
 
 ## Risks and mitigations
 

@@ -333,6 +333,20 @@ pub struct VhdCreateOpts<'a> {
     pub parent_timestamp: u32,
 }
 
+/// VHDX subformat selector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VhdxSubformat {
+    /// Dynamic (sparse) VHDX: every BAT entry is
+    /// `PAYLOAD_BLOCK_NOT_PRESENT`, and a block gets a place in the
+    /// file when it is first written.
+    Dynamic,
+    /// Fixed VHDX: every payload block has a BAT entry from the start,
+    /// placed where qemu-img places it, and the File Parameters
+    /// `LeaveBlocksAllocated` bit is set so that a writer keeps it that
+    /// way.
+    Fixed,
+}
+
 /// Options for [`plan_vhdx`].
 #[derive(Debug, Clone, Copy)]
 pub struct VhdxCreateOpts<'a> {
@@ -343,9 +357,26 @@ pub struct VhdxCreateOpts<'a> {
     /// Block size in bytes: a power of two in `1 MiB..=256 MiB`, or 0
     /// for qemu's default for the size ([`vhdx::default_block_size`]).
     pub block_size: u32,
+    /// Subformat to emit.
+    pub subformat: VhdxSubformat,
+    /// qemu-img's `block_state_zero` option: a fixed image's payload
+    /// entries are all `PAYLOAD_BLOCK_ZERO` when it is set and all
+    /// `PAYLOAD_BLOCK_FULLY_PRESENT` when it is not. qemu turns it on
+    /// when the option is not given (`vhdx_co_create`) and applies it
+    /// in `vhdx_create_bat` (`block/vhdx.c`, qemu 7.0.0).
+    ///
+    /// Read only for [`VhdxSubformat::Fixed`]. Dynamic output ignores
+    /// it and keeps its BAT `PAYLOAD_BLOCK_NOT_PRESENT` either way,
+    /// where qemu-img writes `PAYLOAD_BLOCK_ZERO` entries by default.
+    /// A reader treats the two alike for an image with no parent: both
+    /// read as zeros.
+    pub block_state_zero: bool,
     /// Optional backing image to chain to. A backing reference makes
     /// the image a differencing child: the File Parameters `HasParent`
-    /// bit is set and a parent locator metadata item is written.
+    /// bit is set and a parent locator metadata item is written. A
+    /// [`VhdxSubformat::Fixed`] image with one is refused with
+    /// [`CreateError::BackingFileUnsupported`], as qemu-img refuses
+    /// every VHDX backing file.
     pub backing: Option<BackingRef<'a>>,
     /// The parent's active-header `DataWriteGuid`, rendered into the
     /// child's `parent_linkage` locator entry. Only read when `backing`
@@ -359,6 +390,47 @@ pub struct VhdxCreateOpts<'a> {
     /// in the parent's header; see [`vhdx::render_guid_braced`]. An
     /// all-zero GUID is written as given and not second-guessed.
     pub parent_data_write_guid: [u8; 16],
+}
+
+/// What [`plan_vhdx`] returns: the structure writes every VHDX needs,
+/// and for a fixed image what the caller must add to them.
+#[derive(Debug, Clone, Copy)]
+pub struct VhdxPlan<'a> {
+    /// The file identifier, headers, region tables and metadata region.
+    /// The same writes for both subformats apart from the File
+    /// Parameters `LeaveBlocksAllocated` bit, so
+    /// `metadata.minimum_file_size` is the end of the metadata region
+    /// for both. A fixed image's file is longer than that; see
+    /// [`FixedVhdxPlan::file_length`].
+    pub metadata: MetadataPlan<'a>,
+    /// `Some` exactly when the subformat is [`VhdxSubformat::Fixed`].
+    pub fixed: Option<FixedVhdxPlan>,
+}
+
+/// The rest of a fixed VHDX: a BAT to stream and a length to reach.
+///
+/// The BAT is not among the metadata writes because it is not bounded
+/// by anything the planner can hold: at 64 TiB with 1 MiB blocks it is
+/// 513 MiB. The caller fills it a buffer at a time with
+/// [`vhdx::fill_fixed_bat`], passing [`FixedVhdxPlan::layout`] and
+/// [`FixedVhdxPlan::state`], and writes each buffer at
+/// `layout.bat_offset` plus the first entry's index times 8.
+#[derive(Debug, Clone, Copy)]
+pub struct FixedVhdxPlan {
+    /// The layout the metadata writes were built from. The BAT must be
+    /// filled from this one value, so that the BAT and the region table
+    /// that declares it cannot describe different geometries.
+    pub layout: vhdx::VhdxLayout,
+    /// The state every payload entry is written in, from
+    /// [`VhdxCreateOpts::block_state_zero`].
+    pub state: vhdx::FixedBlockState,
+    /// Bytes of BAT that hold entries: `layout.bat_entries * 8`. The
+    /// rest of the region is padding, zero, and may stay a hole.
+    pub bat_bytes: u64,
+    /// The length the file must reach: `layout.fixed_file_length`,
+    /// qemu-img's data start plus the virtual size. Not
+    /// `layout.data_start`, which is where the metadata region ends.
+    pub file_length: u64,
 }
 
 /// Build a metadata plan for a qcow2 image.
@@ -1354,7 +1426,7 @@ pub fn plan_vhd<'a>(
     }
 }
 
-/// Build a metadata plan for an empty Dynamic VHDX image.
+/// Build a plan for an empty VHDX image, dynamic or fixed.
 ///
 /// Layout (all offsets MB-aligned per the VHDX spec):
 ///
@@ -1378,12 +1450,37 @@ pub fn plan_vhd<'a>(
 /// sixth metadata item, the parent locator. Neither changes the file
 /// layout — the locator lives inside the metadata region that was
 /// already there — so `minimum_file_size` is the same either way.
+///
+/// A [`VhdxSubformat::Fixed`] image has the same writes with the File
+/// Parameters `LeaveBlocksAllocated` bit set, and the plan's
+/// [`VhdxPlan::fixed`] says what the caller adds: a BAT whose every
+/// payload entry names its block, streamed through
+/// [`vhdx::fill_fixed_bat`] into the region the writes leave as a hole,
+/// and a file extended to qemu-img's fixed length. A fixed image with a
+/// backing reference is [`CreateError::BackingFileUnsupported`].
 pub fn plan_vhdx<'a>(
     opts: &VhdxCreateOpts<'_>,
     scratch: &'a mut [u8],
-) -> Result<MetadataPlan<'a>, CreateError> {
+) -> Result<VhdxPlan<'a>, CreateError> {
     if opts.virtual_size == 0 {
         return Err(CreateError::InvalidVirtualSize);
+    }
+    let fixed = match opts.subformat {
+        VhdxSubformat::Dynamic => false,
+        VhdxSubformat::Fixed => true,
+    };
+    if fixed && opts.backing.is_some() {
+        // The same refusal, for the same reason, as a fixed VHD with a
+        // backing file in `plan_vhd`: a differencing child is defined by
+        // a BAT whose blocks are absent until the child writes them, and
+        // a fixed image has every block present from the start. Its BAT
+        // filler has no sector bitmaps to write, so it could not describe
+        // a child's blocks either. qemu-img refuses a backing file for
+        // any VHDX ("Backing file not supported for file format
+        // 'vhdx'", measured on every pinned build), so there is no
+        // qemu-written fixed child to match. Checked before the path is
+        // looked at, so the answer does not depend on which path it is.
+        return Err(CreateError::BackingFileUnsupported);
     }
     // The parent path, typed. Both the locator's path value and its
     // `parent_linkage` sibling are UTF-16 fields, so a path that is not
@@ -1474,8 +1571,10 @@ pub fn plan_vhdx<'a>(
         geometry.logical_sector_size,
         geometry.physical_sector_size,
         // File Parameters `LeaveBlocksAllocated`, which marks a fixed
-        // image. This planner writes a dynamic one.
-        false,
+        // image, as qemu-img sets it for one (`vhdx_create_new_metadata`,
+        // qemu 7.0.0). It tells a writer not to free a fixed image's
+        // blocks, so it must never be set on a dynamic one.
+        fixed,
         // File Parameters `HasParent`. That single bit, plus the
         // locator item appended below, is the whole of what makes this
         // a differencing child on the metadata side.
@@ -1506,9 +1605,14 @@ pub fn plan_vhdx<'a>(
         // 2.6.2.6.3 forbids), fabricating a drive letter, or refusing
         // absolute paths for vhdx alone. What a differencing chain
         // actually resolves through is `parent_linkage`, not either
-        // path key. See
-        // [PLAN-differencing.md](docs/plans/PLAN-differencing.md) and
-        // `docs/quirks.md`.
+        // path key. That is also why the locator carries
+        // `parent_linkage` and exactly this one path key, never
+        // `volume_path` (which needs a Windows volume GUID) or
+        // `parent_linkage2`. Hyper-V writes more entries than that, but
+        // a closer match to it is worth less than a guest that needs
+        // only the one path it is handed, and adding an entry later
+        // changes this emitter and nothing else. `docs/quirks.md`
+        // describes how `info` renders each key back.
         let mut locator_path_buf = [0u8; vhdx::MAX_PARENT_LOCATOR_VALUE_UTF8];
         let (path_key, path_value): (&[u8], &str) = if path.as_bytes().first() == Some(&b'/') {
             (vhdx::KEY_ABSOLUTE_WIN32_PATH, path)
@@ -1526,12 +1630,16 @@ pub fn plan_vhdx<'a>(
         .map_err(map_vhdx_build_error)?;
     }
 
-    // The BAT region is deliberately untouched, differencing or not.
-    // It is a sparse zero hole, which is every payload entry
+    // The BAT region is deliberately untouched by these writes,
+    // differencing, dynamic or fixed. For a dynamic image it stays a
+    // sparse zero hole, which is every payload entry
     // PAYLOAD_BLOCK_NOT_PRESENT and every sector-bitmap entry
     // SB_BLOCK_NOT_PRESENT — exactly what SPEC(VHDX) 2.5.1.1 says a
     // differencing child with no blocks of its own should say, so
-    // there is nothing to add here rather than something forgotten.
+    // there is nothing to add here rather than something forgotten. A
+    // fixed image's BAT is the caller's to stream from `fixed_plan`
+    // below, because it can be far larger than any buffer this planner
+    // is given.
 
     // Region table is identical at both offsets, so both writes
     // reference the same slice.
@@ -1563,7 +1671,31 @@ pub fn plan_vhdx<'a>(
         bytes: metadata_region,
     })?;
     debug_assert_eq!(plan.minimum_file_size, total_file_size);
-    Ok(plan)
+
+    // Built from `geometry`, the layout every write above came from, so
+    // the BAT a caller fills and the region table that declares it are
+    // the same geometry by construction.
+    let fixed_plan = if fixed {
+        Some(FixedVhdxPlan {
+            layout: geometry,
+            state: if opts.block_state_zero {
+                vhdx::FixedBlockState::Zero
+            } else {
+                vhdx::FixedBlockState::FullyPresent
+            },
+            bat_bytes: u64::from(geometry.bat_entries)
+                .checked_mul(8)
+                .ok_or(CreateError::Overflow)?,
+            file_length: geometry.fixed_file_length,
+        })
+    } else {
+        None
+    };
+
+    Ok(VhdxPlan {
+        metadata: plan,
+        fixed: fixed_plan,
+    })
 }
 
 /// Does a differencing child of `target` accept a parent the probe
@@ -2566,6 +2698,8 @@ mod vhdx_plan_tests {
         VhdxCreateOpts {
             virtual_size,
             block_size: 32 * 1024 * 1024,
+            subformat: VhdxSubformat::Dynamic,
+            block_state_zero: true,
             backing: None,
             parent_data_write_guid: [0u8; 16],
         }
@@ -2573,7 +2707,7 @@ mod vhdx_plan_tests {
 
     fn run(opts: &VhdxCreateOpts<'_>) -> std::vec::Vec<u8> {
         let mut scratch = vec![0u8; VHDX_MAX_METADATA_SCRATCH];
-        let plan = plan_vhdx(opts, &mut scratch).expect("plan");
+        let plan = plan_vhdx(opts, &mut scratch).expect("plan").metadata;
         let sum: u64 = plan.writes().iter().map(|w| w.bytes.len() as u64).sum();
         assert_eq!(plan.total_metadata_bytes, sum);
         let max_end: u64 = plan
@@ -2640,11 +2774,13 @@ mod vhdx_plan_tests {
         let opts = VhdxCreateOpts {
             virtual_size: 131_041 * MIB,
             block_size: MIB as u32,
+            subformat: VhdxSubformat::Dynamic,
+            block_state_zero: true,
             backing: None,
             parent_data_write_guid: [0u8; 16],
         };
         let mut scratch = vec![0u8; VHDX_MAX_METADATA_SCRATCH];
-        let plan = plan_vhdx(&opts, &mut scratch).expect("plan");
+        let plan = plan_vhdx(&opts, &mut scratch).expect("plan").metadata;
         assert_eq!(plan.minimum_file_size, 4 * MIB);
         let bytes = materialise(&plan);
         for rt_off in [vhdx::REGION_TABLE1_OFFSET, vhdx::REGION_TABLE2_OFFSET] {
@@ -2696,7 +2832,9 @@ mod vhdx_plan_tests {
         });
 
         let mut scratch = vec![0u8; VHDX_MAX_METADATA_SCRATCH];
-        let plan = plan_vhdx(&differencing, &mut scratch).expect("differencing plan");
+        let plan = plan_vhdx(&differencing, &mut scratch)
+            .expect("differencing plan")
+            .metadata;
         let (child_writes, child_min, child_meta) = (
             plan.writes().len(),
             plan.minimum_file_size,
@@ -2704,7 +2842,9 @@ mod vhdx_plan_tests {
         );
 
         let mut scratch = vec![0u8; VHDX_MAX_METADATA_SCRATCH];
-        let plan = plan_vhdx(&plain, &mut scratch).expect("plain plan");
+        let plan = plan_vhdx(&plain, &mut scratch)
+            .expect("plain plan")
+            .metadata;
 
         // The locator lives inside the metadata region that was already
         // there, so a differencing child is the same six writes, the
@@ -2715,6 +2855,67 @@ mod vhdx_plan_tests {
         assert_eq!(child_writes, plan.writes().len(), "write count");
         assert_eq!(child_min, plan.minimum_file_size, "minimum_file_size");
         assert_eq!(child_meta, plan.total_metadata_bytes, "metadata bytes");
+    }
+
+    /// A `Fixed` VHDX refuses a backing reference, as a fixed VHD does
+    /// and as qemu-img refuses any VHDX backing file. The refusal comes
+    /// before the path is examined, so a path the dynamic arm would
+    /// refuse for its own reason (too long, not UTF-8) gets the same
+    /// answer: a fixed VHDX takes no backing file at all.
+    #[test]
+    fn plan_vhdx_fixed_rejects_backing() {
+        let too_long = [b'a'; MAX_BACKING_FILE_LEN + 1];
+        for path in [&b"parent.vhdx"[..], &too_long[..], &[0xff, 0xfe][..]] {
+            let mut opts = default_opts(1 << 20);
+            opts.subformat = VhdxSubformat::Fixed;
+            opts.backing = Some(BackingRef {
+                path,
+                format: Some(ImageFormat::Vhdx),
+            });
+            for block_state_zero in [false, true] {
+                opts.block_state_zero = block_state_zero;
+                let mut scratch = vec![0u8; VHDX_MAX_METADATA_SCRATCH];
+                assert!(
+                    matches!(
+                        plan_vhdx(&opts, &mut scratch),
+                        Err(CreateError::BackingFileUnsupported)
+                    ),
+                    "path of {} bytes, block_state_zero={block_state_zero}",
+                    path.len()
+                );
+            }
+        }
+    }
+
+    /// Only a fixed image gets a fixed plan, and a dynamic one is
+    /// planned the same whatever `block_state_zero` says.
+    #[test]
+    fn plan_vhdx_fixed_plan_follows_the_subformat() {
+        let mut scratch = vec![0u8; VHDX_MAX_METADATA_SCRATCH];
+        let dynamic = default_opts(1 << 30);
+        assert!(plan_vhdx(&dynamic, &mut scratch)
+            .expect("dynamic plan")
+            .fixed
+            .is_none());
+
+        let fixed = VhdxCreateOpts {
+            subformat: VhdxSubformat::Fixed,
+            ..dynamic
+        };
+        for (block_state_zero, state) in [
+            (true, vhdx::FixedBlockState::Zero),
+            (false, vhdx::FixedBlockState::FullyPresent),
+        ] {
+            let opts = VhdxCreateOpts {
+                block_state_zero,
+                ..fixed
+            };
+            let plan = plan_vhdx(&opts, &mut scratch)
+                .expect("fixed plan")
+                .fixed
+                .expect("a fixed image has a fixed plan");
+            assert_eq!(plan.state, state, "block_state_zero={block_state_zero}");
+        }
     }
 
     #[test]
@@ -2795,7 +2996,7 @@ mod vhdx_plan_tests {
     fn plan_vhdx_writes_dont_overlap() {
         let opts = default_opts(1 << 30);
         let mut scratch = vec![0u8; VHDX_MAX_METADATA_SCRATCH];
-        let plan = plan_vhdx(&opts, &mut scratch).expect("plan");
+        let plan = plan_vhdx(&opts, &mut scratch).expect("plan").metadata;
         let mut sorted: std::vec::Vec<&MetadataWrite<'_>> = plan.writes().iter().collect();
         sorted.sort_by_key(|w| w.byte_offset);
         for pair in sorted.windows(2) {

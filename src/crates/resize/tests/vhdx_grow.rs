@@ -6,7 +6,7 @@
 //! patches, and re-parses the result to verify the post-resize
 //! state.
 
-use create::{plan_vhdx, MetadataPlan, VhdxCreateOpts};
+use create::{plan_vhdx, MetadataPlan, VhdxCreateOpts, VhdxSubformat};
 use resize::{
     plan_resize_vhdx, Preallocation, ResizeAction, ResizeError, ResizePatch, ResizePlan,
     VhdxResizeOpts, QCOW2_MAX_RESIZE_SCRATCH,
@@ -67,11 +67,15 @@ fn build_starting_vhdx(virtual_size: u64, block_size: u32) -> Vec<u8> {
     let opts = VhdxCreateOpts {
         virtual_size,
         block_size,
+        subformat: VhdxSubformat::Dynamic,
+        block_state_zero: true,
         backing: None,
         parent_data_write_guid: [0u8; 16],
     };
     let mut scratch = vec![0u8; create::VHDX_MAX_METADATA_SCRATCH];
-    let plan = plan_vhdx(&opts, &mut scratch).expect("create vhdx plan");
+    let plan = plan_vhdx(&opts, &mut scratch)
+        .expect("create vhdx plan")
+        .metadata;
     materialise_create(&plan)
 }
 

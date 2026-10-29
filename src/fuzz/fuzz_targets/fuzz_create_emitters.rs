@@ -35,7 +35,7 @@ use std::cell::RefCell;
 use create::{
     plan_qcow2, plan_vhd, plan_vhdx, plan_vmdk, BackingRef, CreateError,
     MetadataPlan, Qcow2CreateOpts, VhdCreateOpts, VhdSubformat, VhdxCreateOpts,
-    VmdkCreateOpts, VmdkSubformat, MAX_METADATA_WRITES, QCOW2_MAX_METADATA_SCRATCH,
+    VhdxSubformat, VmdkCreateOpts, VmdkSubformat, MAX_METADATA_WRITES, QCOW2_MAX_METADATA_SCRATCH,
 };
 use shared::ImageFormat;
 
@@ -194,6 +194,11 @@ fuzz_target!(|data: &[u8]| {
                 let opts = VhdxCreateOpts {
                     virtual_size,
                     block_size: unit_size,
+                    // The dynamic image the create op writes. Fixed
+                    // output reaches no caller yet, and its BAT filler
+                    // is not among the emitters this target checks.
+                    subformat: VhdxSubformat::Dynamic,
+                    block_state_zero: true,
                     backing,
                     // Parent identity for a differencing child. It does
                     // not affect the layout, but feeding structured
@@ -202,7 +207,7 @@ fuzz_target!(|data: &[u8]| {
                     // the VHD arm above feeds `vhd_parent_id`.
                     parent_data_write_guid: vhd_parent_id,
                 };
-                plan_vhdx(&opts, &mut scratch)
+                plan_vhdx(&opts, &mut scratch).map(|plan| plan.metadata)
             }
         };
 
