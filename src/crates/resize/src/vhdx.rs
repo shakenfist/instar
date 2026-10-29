@@ -301,6 +301,16 @@ fn plan_bat_grow_relocate<'a>(
         let new_bat_length: u32 = new_bat_size_bytes
             .try_into()
             .map_err(|_| ResizeError::Overflow)?;
+        // Both tables are rebuilt from scratch, so they carry what
+        // `build_region_table` writes rather than what the image had:
+        // Required clear on both entries, as qemu-img writes it. An
+        // image from a writer that sets Required (Disk2VHD does) comes
+        // out with it clear. That is harmless: Required tells a reader
+        // to refuse a region it does not recognise, and the BAT and
+        // metadata regions are the two every reader must recognise to
+        // read the image at all. qemu-img cannot resize a VHDX (the
+        // vhdx driver, `bdrv_vhdx` in qemu 7.0.0 `block/vhdx.c`, has no
+        // `bdrv_co_truncate`), so there is no qemu behaviour to match.
         build_region_table(
             rt1_buf,
             new_bat_offset,

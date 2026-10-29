@@ -40,7 +40,7 @@ use shared::{
 use create::{
     footer_fallback_applies, parent_format_matches, plan_qcow2, plan_vhd, plan_vhdx, plan_vmdk,
     BackingRef, CreateError, MetadataPlan, Qcow2CreateOpts, VhdCreateOpts, VhdSubformat,
-    VhdxCreateOpts, VmdkCreateOpts, VmdkSubformat,
+    VhdxCreateOpts, VhdxPlan, VhdxSubformat, VmdkCreateOpts, VmdkSubformat,
 };
 
 // ---------------------------------------------------------------------------
@@ -571,6 +571,11 @@ fn vhdx_opts_from<'a>(
         // passes the same value to the same layout, so the two cannot
         // disagree about the geometry.
         block_size: config.block_size,
+        // The host refuses `subformat=fixed` for vhdx, so this op only
+        // ever writes a dynamic image. `block_state_zero` is read only
+        // for a fixed one; true is qemu-img's default.
+        subformat: VhdxSubformat::Dynamic,
+        block_state_zero: true,
         backing,
         parent_data_write_guid,
     })
@@ -1057,7 +1062,9 @@ pub unsafe extern "C" fn _start() -> u64 {
                 Err(code) => return fail_with(call_table, config.target_format, code),
             };
             match plan_vhdx(&opts, scratch) {
-                Ok(p) => {
+                // A dynamic plan is its metadata writes alone; `fixed`
+                // is `None` for the subformat requested above.
+                Ok(VhdxPlan { metadata: p, .. }) => {
                     // plan_vhdx records the size rounded up to 512 bytes,
                     // as qemu-img does, because VirtualDiskSize must be a
                     // multiple of the logical sector size, and the block

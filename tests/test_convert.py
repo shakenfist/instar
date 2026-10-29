@@ -8,6 +8,8 @@ import tempfile
 from pathlib import Path
 
 from base import InstarTestBase
+from helpers import qemu_pins
+from helpers import vhdx_structure
 
 
 class TestConvertBasicQcow2ToRaw(InstarTestBase):
@@ -3587,6 +3589,45 @@ class TestConvertVhdxCheckOutput(InstarTestBase):
     def test_check_vhdx_to_vhdx_output(self):
         """Check instar VHDX output from VHDX input."""
         self._test_vhdx_output_check('qemu-vhdx')
+
+
+class TestConvertVhdxQemuStructure(InstarTestBase):
+    """convert writes the VHDX region tables and metadata qemu-img's create does.
+
+    convert builds its metadata table and its item data in two separate
+    buffers, so it is checked on its own rather than trusted to agree with
+    create. The comparison is with the pinned dynamic 64 MiB create
+    (`vhdx-dynamic-64M-bsz-off`): every field that does not depend on the
+    data written. The file length and the BAT follow the source's data, so
+    they are left out.
+    """
+
+    PIN_CASE = 'vhdx-dynamic-64M-bsz-off'
+    FIELDS = ('region_table_1', 'region_table_2', 'region_tables_agree', 'log_offset', 'log_length',
+              'metadata_items', 'block_size', 'logical_sector_size', 'physical_sector_size', 'virtual_disk_size',
+              'leave_blocks_allocated', 'has_parent', 'chunk_ratio', 'bat_capacity', 'bat_entry_count')
+
+    def test_raw_to_vhdx_region_and_metadata_structure(self):
+        want = qemu_pins.expected(self.PIN_CASE)['summary']
+        with tempfile.TemporaryDirectory() as td:
+            # 64 MiB of raw with three 8 MiB blocks of data, the source
+            # qemu-img's convert pins are taken from.
+            source = Path(td) / 'source.raw'
+            qemu_pins.write_convert_source(source)
+            out = Path(td) / 'out.vhdx'
+            _, stderr, rc = self.run_instar_convert(source, out, output_format='vhdx', timeout=120)
+            self.assertEqual(rc, 0, stderr)
+            summary = vhdx_structure.summarise(vhdx_structure.parse_vhdx(out))
+        self.assertEqual({field: want[field] for field in self.FIELDS},
+                         {field: summary[field] for field in self.FIELDS})
+        # Spelled out, since these are the fields most easily lost: qemu's
+        # Required bit, item flags and physical sector size.
+        for table in ('region_table_1', 'region_table_2'):
+            self.assertEqual([0, 0], [entry['required'] for entry in summary[table]], table)
+        self.assertEqual(4, summary['metadata_items']['file_parameters']['flags'])
+        for item in ('virtual_disk_size', 'page83', 'logical_sector_size', 'physical_sector_size'):
+            self.assertEqual(6, summary['metadata_items'][item]['flags'], item)
+        self.assertEqual(512, summary['physical_sector_size'])
 
 
 class TestConvertVhdToRaw(InstarTestBase):

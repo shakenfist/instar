@@ -4619,6 +4619,7 @@ unsafe fn convert_to_vhdx(
         declared_size,
         logical_sector_size,
         physical_sector_size,
+        false, // dynamic: LeaveBlocksAllocated clear
         false, // no parent
     );
     if !write_bytes_to_output(
@@ -4633,41 +4634,32 @@ unsafe fn convert_to_vhdx(
         return *bytes_read;
     }
 
-    // The metadata items are at metadata_offset + 0x10000. The
-    // build_metadata() wrote them into the buffer at offset 0x10000
-    // if the buffer was large enough. Since MAX_SECTOR_SIZE = 64KB
-    // = 0x10000, the items are at the very end of our 64KB buffer.
-    // We need to write them as a separate sector.
-    // Actually, build_metadata writes items at buf[0x10000..], but
-    // our buffer is exactly 0x10000 (64KB), so items_base is at
-    // the buffer boundary. Let's handle this by writing metadata
-    // items separately.
+    // The item data starts 64 KiB into the region, exactly where the
+    // buffer above ends, so `build_metadata` wrote the table alone and
+    // the items go through a sector of their own. Both calls place
+    // the items the same way, so the table and the data agree.
     let buf_data = layout.buf_data as *mut u8;
     core::ptr::write_bytes(buf_data, 0, oss);
     let item_slice = core::slice::from_raw_parts_mut(buf_data, oss);
-    // File Parameters: block_size (u32) + flags (u32)
-    shared::write_le_u32(item_slice, 0, block_size as u32);
-    shared::write_le_u32(item_slice, 4, 0); // flags: no parent
-                                            // Virtual Disk Size (u64) at offset 8
-    shared::write_le_u64(item_slice, 8, declared_size);
-    // Logical Sector Size (u32) at offset 16
-    shared::write_le_u32(item_slice, 16, logical_sector_size);
-    // Physical Sector Size (u32) at offset 20
-    shared::write_le_u32(item_slice, 20, physical_sector_size);
-    // Virtual Disk ID (16 bytes) at offset 24
-    let size_bytes = declared_size.to_le_bytes();
-    item_slice[24..32].copy_from_slice(&size_bytes);
-    let bs_bytes = (block_size as u32).to_le_bytes();
-    item_slice[32..36].copy_from_slice(&bs_bytes);
-    item_slice[36] = b'V';
-    item_slice[37] = b'H';
-    item_slice[38] = b'D';
-    item_slice[39] = b'X';
+    // A sector is at least 512 bytes, so it always holds the items.
+    let Some(items) = item_slice.first_chunk_mut::<{ vhdx::METADATA_ITEMS_LEN }>() else {
+        (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+        return *bytes_read;
+    };
+    vhdx::build_metadata_items(
+        items,
+        block_size as u32,
+        declared_size,
+        logical_sector_size,
+        physical_sector_size,
+        false, // dynamic: LeaveBlocksAllocated clear
+        false, // no parent
+    );
 
     if !write_bytes_to_output(
         call_table,
         buf_data,
-        metadata_offset + 0x10000,
+        metadata_offset + u64::from(vhdx::METADATA_ITEMS_MIN_OFFSET),
         oss as u64,
         oss,
         oc,
