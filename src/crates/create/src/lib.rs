@@ -1473,6 +1473,9 @@ pub fn plan_vhdx<'a>(
         geometry.virtual_size,
         geometry.logical_sector_size,
         geometry.physical_sector_size,
+        // File Parameters `LeaveBlocksAllocated`, which marks a fixed
+        // image. This planner writes a dynamic one.
+        false,
         // File Parameters `HasParent`. That single bit, plus the
         // locator item appended below, is the whole of what makes this
         // a differencing child on the metadata side.

@@ -2269,12 +2269,16 @@ guards. See the VHD and VHDX notes in
 [chain-config.md](chain-config.md#format-specific-notes) for the
 composing path being guarded.
 
-There are **130 cases**, in eleven groups.
+There are **132 cases**, in eleven groups.
 
-Twenty-seven cover the writer. Fifteen mutate a library crate
+Twenty-nine cover the writer. Seventeen mutate a library crate
 (`create`, `vhd`, `vhdx`) and are caught by a Rust unit or round-trip
-test; twelve are caught by a Python integration test through the real
-binary. Ten of those twelve mutate the `create` guest operation, which
+test. Two of those seventeen guard the region table and metadata table
+every VHDX writer shares: one sets Required on the region entries
+again, and one flags a virtual-disk metadata item IsRequired alone,
+both of which qemu-img writes differently and no reader notices. The
+remaining twelve writer cases are caught by a Python integration test
+through the real binary. Ten of those twelve mutate the `create` guest operation, which
 is excluded from `cargo test --workspace`, so a unit test written
 beside that code would never run; the other two mutate the `create`
 crate but break something only an external parser can see. Going

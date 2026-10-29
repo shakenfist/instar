@@ -180,6 +180,21 @@ const PHYSICAL_SECTOR_SIZE_GUID: [u8; 16] = [
     0xC7, 0x48, 0xA3, 0xCD, 0x5D, 0x44, 0x71, 0x44, 0x9C, 0xC9, 0xE9, 0x88, 0x52, 0x51, 0xC5, 0x56,
 ];
 
+// Page 83 Data GUID: BECA12AB-B2E6-4523-93EF-C309E000C746
+const PAGE_83_DATA_GUID: [u8; 16] = [
+    0xAB, 0x12, 0xCA, 0xBE, 0xE6, 0xB2, 0x23, 0x45, 0x93, 0xEF, 0xC3, 0x09, 0xE0, 0x00, 0xC7, 0x46,
+];
+
+/// Metadata table entry flags bit 1, `IsVirtualDisk` (SPEC(VHDX)
+/// 2.6.1.2; qemu's `VHDX_META_FLAGS_IS_VIRTUAL_DISK`): the item
+/// describes the virtual disk rather than the file.
+pub const METADATA_ENTRY_IS_VIRTUAL_DISK: u32 = 1 << 1;
+
+/// Metadata table entry flags bit 2, `IsRequired` (SPEC(VHDX) 2.6.1.2;
+/// qemu's `VHDX_META_FLAGS_IS_REQUIRED`): a reader that does not
+/// recognise the item must refuse the image.
+pub const METADATA_ENTRY_IS_REQUIRED: u32 = 1 << 2;
+
 /// Parent Locator metadata item GUID: A8D35F2D-B30B-454D-ABF7-D3D84834AB0C.
 ///
 /// This is the *metadata item* identifier, the `ItemID` of the table
@@ -546,7 +561,8 @@ pub const METADATA_ITEMS_MIN_OFFSET: u32 = 0x10000;
 /// Not a magic number copied from Hyper-V: it is where instar's own
 /// [`build_metadata`] leaves off. That function puts item data at
 /// [`METADATA_ITEMS_MIN_OFFSET`] and its five items consume
-/// 8 + 8 + 4 + 4 + 16 = 40 bytes, so the next free byte is `0x10028`.
+/// 8 + 8 + 16 + 4 + 4 = 40 bytes ([`METADATA_ITEMS_LEN`]), so the next
+/// free byte is `0x10028`.
 /// Hyper-V's measured `fat-differential.vhdx` puts its parent locator
 /// at the same offset for the same reason
 /// (`docs/plans/PLAN-differencing-phase-01-pin.md`, "VHDX -- the parent
@@ -3323,6 +3339,17 @@ pub fn build_header(buf: &mut [u8], sequence_number: u64) {
 ///
 /// `buf` must be at least 64KB and should be pre-zeroed.
 /// CRC-32C checksum is computed and written automatically.
+///
+/// Both entries are written with Required clear, as qemu-img writes
+/// them: `vhdx_create_new_region_table` (qemu 7.0.0, `block/vhdx.c`)
+/// never sets a region entry's flags. Other writers set it (Disk2VHD
+/// and the sample image in qemu's iotests both do), and nothing a
+/// reader does depends on it for these two regions. SPEC(VHDX) 2.3.2
+/// makes Required mean "refuse the image if you do not recognise this
+/// region", and the BAT and metadata regions are the two every reader
+/// must recognise to read the image at all. qemu's value is the one
+/// written because instar's output is compared field by field with
+/// qemu-img's.
 pub fn build_region_table(
     buf: &mut [u8],
     bat_offset: u64,
@@ -3330,6 +3357,9 @@ pub fn build_region_table(
     metadata_offset: u64,
     metadata_length: u32,
 ) {
+    // The Required flag of both entries: clear, as above.
+    let required: u32 = 0;
+
     // Signature
     write_le_u32(buf, 0, REGION_TABLE_SIGNATURE);
     // Entry count: 2 (BAT + Metadata)
@@ -3340,14 +3370,14 @@ pub fn build_region_table(
     buf[e0..e0 + 16].copy_from_slice(&BAT_REGION_GUID);
     write_le_u64(buf, e0 + 16, bat_offset);
     write_le_u32(buf, e0 + 24, bat_length);
-    write_le_u32(buf, e0 + 28, 1); // required
+    write_le_u32(buf, e0 + 28, required);
 
     // Entry 1: Metadata
     let e1 = e0 + REGION_TABLE_ENTRY_SIZE;
     buf[e1..e1 + 16].copy_from_slice(&METADATA_REGION_GUID);
     write_le_u64(buf, e1 + 16, metadata_offset);
     write_le_u32(buf, e1 + 24, metadata_length);
-    write_le_u32(buf, e1 + 28, 1); // required
+    write_le_u32(buf, e1 + 28, required);
 
     // CRC-32C over full 64KB
     let crc_len = if buf.len() >= 65536 { 65536 } else { buf.len() };
@@ -3355,119 +3385,176 @@ pub fn build_region_table(
     write_le_u32(buf, REGION_TABLE_CHECKSUM_OFFSET, checksum);
 }
 
+// Where `build_metadata` places each of its five items, relative to
+// the start of the item data at `METADATA_ITEMS_MIN_OFFSET`: qemu's
+// order, packed with no gaps, File Parameters, Virtual Disk Size,
+// Page 83 Data, Logical Sector Size and Physical Sector Size
+// (`vhdx_create_new_metadata`, qemu 7.0.0, `block/vhdx.c`).
+const ITEM_FILE_PARAMETERS: usize = 0;
+const ITEM_VIRTUAL_DISK_SIZE: usize = 8;
+const ITEM_PAGE_83_DATA: usize = 16;
+const ITEM_LOGICAL_SECTOR_SIZE: usize = 32;
+const ITEM_PHYSICAL_SECTOR_SIZE: usize = 36;
+
+/// The bytes of item data [`build_metadata`] writes: 8 + 8 + 16 + 4 + 4.
+pub const METADATA_ITEMS_LEN: usize = 40;
+
+/// The flags of every item but File Parameters, which qemu marks
+/// IsRequired alone.
+const VIRTUAL_DISK_ITEM: u32 = METADATA_ENTRY_IS_REQUIRED | METADATA_ENTRY_IS_VIRTUAL_DISK;
+
+/// The metadata table entries [`build_metadata`] writes, in table
+/// order: item GUID, offset relative to the item data, length and
+/// flags. The table lists the items in the order they sit in the
+/// region, as qemu's does.
+const BUILT_METADATA_ITEMS: [([u8; 16], usize, u32, u32); 5] = [
+    (
+        FILE_PARAMETERS_GUID,
+        ITEM_FILE_PARAMETERS,
+        8,
+        METADATA_ENTRY_IS_REQUIRED,
+    ),
+    (
+        VIRTUAL_DISK_SIZE_GUID,
+        ITEM_VIRTUAL_DISK_SIZE,
+        8,
+        VIRTUAL_DISK_ITEM,
+    ),
+    (PAGE_83_DATA_GUID, ITEM_PAGE_83_DATA, 16, VIRTUAL_DISK_ITEM),
+    (
+        LOGICAL_SECTOR_SIZE_GUID,
+        ITEM_LOGICAL_SECTOR_SIZE,
+        4,
+        VIRTUAL_DISK_ITEM,
+    ),
+    (
+        PHYSICAL_SECTOR_SIZE_GUID,
+        ITEM_PHYSICAL_SECTOR_SIZE,
+        4,
+        VIRTUAL_DISK_ITEM,
+    ),
+];
+
 /// Build VHDX metadata region content.
 ///
-/// Writes the metadata table header and all required metadata items
-/// into `buf`. `buf` should be pre-zeroed and at least 64KB.
+/// Writes the metadata table header, its five entries, and (when `buf`
+/// reaches far enough) the item data, into `buf`, which is the
+/// metadata region from its first byte and should be pre-zeroed. The
+/// table needs the first 192 bytes. The item data starts at
+/// [`METADATA_ITEMS_MIN_OFFSET`] and takes [`METADATA_ITEMS_LEN`]
+/// bytes; a `buf` shorter than that end gets the table alone, and the
+/// caller writes the items with [`build_metadata_items`] into a
+/// buffer of its own.
 ///
-/// Returns the number of bytes written (for the metadata table +
-/// items; the full region is 1MB on disk).
+/// The structure is qemu-img's (`vhdx_create_new_metadata`, qemu
+/// 7.0.0, `block/vhdx.c`): the five items in the order and at the
+/// offsets `BUILT_METADATA_ITEMS` lists, File Parameters flagged
+/// IsRequired and the other four IsRequired | IsVirtualDisk. The one
+/// field instar writes differently is the Page 83 Data, which qemu
+/// fills with a random GUID and instar derives from the image's size,
+/// so that two runs of the same command write the same bytes.
+///
+/// `leave_blocks_allocated` and `has_parent` are File Parameters bits
+/// 0 and 1, in that order; see [`build_metadata_items`].
+///
+/// Returns the offset, relative to the region start, at which the
+/// item data ends: where a further item such as a parent locator may
+/// go.
 pub fn build_metadata(
     buf: &mut [u8],
     block_size: u32,
     virtual_disk_size: u64,
     logical_sector_size: u32,
     physical_sector_size: u32,
+    leave_blocks_allocated: bool,
     has_parent: bool,
 ) -> usize {
-    // Metadata table header (32 bytes)
+    let items_base = METADATA_ITEMS_MIN_OFFSET as usize;
+
+    // Metadata table header (32 bytes): signature, a reserved u16, the
+    // entry count, and 20 reserved bytes.
     write_le_u64(buf, 0, METADATA_TABLE_SIGNATURE);
-    // Reserved u16 at offset 8
-    // Entry count at offset 10
-    let entry_count: u16 = 5; // FileParams, VirtualSize, LogicalSS, PhysicalSS, VirtualDiskID
-    write_le_u16(buf, 10, entry_count);
-    // Reserved 20 bytes at offset 12..32
+    write_le_u16(
+        buf,
+        METADATA_TABLE_ENTRY_COUNT_OFFSET,
+        BUILT_METADATA_ITEMS.len() as u16,
+    );
 
-    // Item data starts at offset 0x10000 (64KB into metadata region)
-    // This is the standard layout used by QEMU and Hyper-V.
-    let items_base: u32 = 0x10000;
-
-    // Entry 0: File Parameters at items_base+0 (8 bytes)
-    let e = 32;
-    buf[e..e + 16].copy_from_slice(&FILE_PARAMETERS_GUID);
-    write_le_u32(buf, e + 16, items_base); // offset
-    write_le_u32(buf, e + 20, 8); // length
-    write_le_u32(buf, e + 24, 0x04); // flags: IsRequired | IsVirtualDisk
-
-    // Entry 1: Virtual Disk Size at items_base+8 (8 bytes)
-    let e = 32 + METADATA_TABLE_ENTRY_SIZE;
-    buf[e..e + 16].copy_from_slice(&VIRTUAL_DISK_SIZE_GUID);
-    write_le_u32(buf, e + 16, items_base + 8);
-    write_le_u32(buf, e + 20, 8);
-    write_le_u32(buf, e + 24, 0x04);
-
-    // Entry 2: Logical Sector Size at items_base+16 (4 bytes)
-    let e = 32 + 2 * METADATA_TABLE_ENTRY_SIZE;
-    buf[e..e + 16].copy_from_slice(&LOGICAL_SECTOR_SIZE_GUID);
-    write_le_u32(buf, e + 16, items_base + 16);
-    write_le_u32(buf, e + 20, 4);
-    write_le_u32(buf, e + 24, 0x04);
-
-    // Entry 3: Physical Sector Size at items_base+20 (4 bytes)
-    let e = 32 + 3 * METADATA_TABLE_ENTRY_SIZE;
-    buf[e..e + 16].copy_from_slice(&PHYSICAL_SECTOR_SIZE_GUID);
-    write_le_u32(buf, e + 16, items_base + 20);
-    write_le_u32(buf, e + 20, 4);
-    write_le_u32(buf, e + 24, 0x04);
-
-    // Entry 4: Virtual Disk ID at items_base+24 (16 bytes)
-    let e = 32 + 4 * METADATA_TABLE_ENTRY_SIZE;
-    // Virtual Disk ID GUID: BECA12AB-B2E6-4523-93EF-C309E000C746
-    let vdisk_id_guid: [u8; 16] = [
-        0xAB, 0x12, 0xCA, 0xBE, 0xE6, 0xB2, 0x23, 0x45, 0x93, 0xEF, 0xC3, 0x09, 0xE0, 0x00, 0xC7,
-        0x46,
-    ];
-    buf[e..e + 16].copy_from_slice(&vdisk_id_guid);
-    write_le_u32(buf, e + 16, items_base + 24);
-    write_le_u32(buf, e + 20, 16);
-    write_le_u32(buf, e + 24, 0x04);
-
-    // Now write the actual item data at items_base within the buffer
-    // Note: items_base is relative to the metadata region start.
-    // We write items_base bytes into the buffer (which IS the
-    // metadata region). If buf is <64KB, we can't place items
-    // at offset 0x10000. Caller must provide a large enough buffer
-    // or handle this differently.
-    //
-    // For output, the caller writes the table portion and items
-    // portion separately. Return the table size here, and let
-    // the caller know the items offset.
-
-    // Actually, for simplicity we write everything into one buffer.
-    // The caller should provide a buffer >= items_base + 40.
-    if buf.len() >= items_base as usize + 40 {
-        let ib = items_base as usize;
-        // File Parameters: block_size (u32) + flags (u32)
-        write_le_u32(buf, ib, block_size);
-        let flags: u32 = if has_parent { 2 } else { 0 };
-        write_le_u32(buf, ib + 4, flags);
-
-        // Virtual Disk Size (u64)
-        write_le_u64(buf, ib + 8, virtual_disk_size);
-
-        // Logical Sector Size (u32)
-        write_le_u32(buf, ib + 16, logical_sector_size);
-
-        // Physical Sector Size (u32)
-        write_le_u32(buf, ib + 20, physical_sector_size);
-
-        // Virtual Disk ID (16 bytes) — deterministic from virtual_disk_size
-        let size_bytes = virtual_disk_size.to_le_bytes();
-        for i in 0..8 {
-            buf[ib + 24 + i] = size_bytes[i];
-        }
-        // Fill remaining 8 bytes with block_size-derived pattern
-        let bs_bytes = block_size.to_le_bytes();
-        for i in 0..4 {
-            buf[ib + 32 + i] = bs_bytes[i];
-        }
-        buf[ib + 36] = b'V';
-        buf[ib + 37] = b'H';
-        buf[ib + 38] = b'D';
-        buf[ib + 39] = b'X';
+    // The table entries: item GUID, offset from the region start,
+    // length, flags, and a reserved u32 left zero.
+    for (i, (guid, offset, length, flags)) in BUILT_METADATA_ITEMS.iter().enumerate() {
+        let e = METADATA_TABLE_HEADER_SIZE + i * METADATA_TABLE_ENTRY_SIZE;
+        buf[e..e + 16].copy_from_slice(guid);
+        write_le_u32(buf, e + 16, (items_base + offset) as u32);
+        write_le_u32(buf, e + 20, *length);
+        write_le_u32(buf, e + 24, *flags);
     }
 
-    items_base as usize + 40
+    if let Some(items) = buf.get_mut(items_base..items_base + METADATA_ITEMS_LEN) {
+        build_metadata_items(
+            items,
+            block_size,
+            virtual_disk_size,
+            logical_sector_size,
+            physical_sector_size,
+            leave_blocks_allocated,
+            has_parent,
+        );
+    }
+
+    items_base + METADATA_ITEMS_LEN
+}
+
+/// Write the item data of the five items [`build_metadata`] lists into
+/// `items`, whose first byte is [`METADATA_ITEMS_MIN_OFFSET`] in the
+/// metadata region.
+///
+/// For a writer that cannot hold the region's first 64 KiB and its
+/// items in one buffer: it builds the table with [`build_metadata`]
+/// over the first 64 KiB, and the items with this, from the same
+/// arguments. Both functions place the items by
+/// `BUILT_METADATA_ITEMS`, so the table and the data cannot
+/// disagree about where an item is. `items` must hold at least
+/// [`METADATA_ITEMS_LEN`] bytes, and nothing past that is touched.
+///
+/// The File Parameters flags are bit 0, `LeaveBlocksAllocated`
+/// ([`FILE_PARAMETERS_LEAVE_BLOCKS_ALLOCATED`]), which qemu sets for a
+/// fixed image only, and bit 1, `HasParent`. The physical sector size
+/// is written as given; [`PHYSICAL_SECTOR_SIZE`] says what instar's
+/// writers pass.
+pub fn build_metadata_items(
+    items: &mut [u8],
+    block_size: u32,
+    virtual_disk_size: u64,
+    logical_sector_size: u32,
+    physical_sector_size: u32,
+    leave_blocks_allocated: bool,
+    has_parent: bool,
+) {
+    let mut flags: u32 = 0;
+    if leave_blocks_allocated {
+        flags |= FILE_PARAMETERS_LEAVE_BLOCKS_ALLOCATED;
+    }
+    if has_parent {
+        flags |= FILE_PARAMETERS_HAS_PARENT;
+    }
+
+    // File Parameters: the block size, then the flags.
+    write_le_u32(items, ITEM_FILE_PARAMETERS, block_size);
+    write_le_u32(items, ITEM_FILE_PARAMETERS + 4, flags);
+
+    write_le_u64(items, ITEM_VIRTUAL_DISK_SIZE, virtual_disk_size);
+
+    // Page 83 Data: 16 bytes that identify the disk to a SCSI guest.
+    // Derived from the size and block size rather than random, so that
+    // the output of one command does not change from run to run.
+    let p83 = &mut items[ITEM_PAGE_83_DATA..ITEM_PAGE_83_DATA + 16];
+    p83[..8].copy_from_slice(&virtual_disk_size.to_le_bytes());
+    p83[8..12].copy_from_slice(&block_size.to_le_bytes());
+    p83[12..].copy_from_slice(b"VHDX");
+
+    write_le_u32(items, ITEM_LOGICAL_SECTOR_SIZE, logical_sector_size);
+    write_le_u32(items, ITEM_PHYSICAL_SECTOR_SIZE, physical_sector_size);
 }
 
 /// What an output builder in this crate refuses to write.
@@ -3903,15 +3990,19 @@ pub const METADATA_REGION_LENGTH: u32 = 1024 * 1024;
 /// Logical sector size a writer declares: 512 bytes.
 pub const LOGICAL_SECTOR_SIZE: u32 = 512;
 
-/// Physical sector size a writer declares: 4096 bytes.
+/// Physical sector size a writer declares: 512 bytes, the logical
+/// sector size.
 ///
-/// Every pinned qemu-img build (6.0.0 to 10.2.0, in
-/// `tests/golden/qemu-create-pins.json`) declares 512 here. instar has
-/// always written 4096, and changing it alters the bytes of every VHDX
-/// instar writes, so it is a decision for whoever next matches instar's
-/// output to qemu's field by field, not a side effect of moving the
-/// value here.
-pub const PHYSICAL_SECTOR_SIZE: u32 = 4096;
+/// qemu-img writes its logical sector size into both items
+/// (`vhdx_create_new_metadata`, qemu 7.0.0, `block/vhdx.c`), and every
+/// pinned qemu-img build (6.0.0 to 10.2.0, in
+/// `tests/golden/qemu-create-pins.json`) declares 512 here. Other
+/// writers do not agree with each other: Disk2VHD declares 512, and the
+/// sample image in qemu's iotests 4096. instar follows qemu-img, whose
+/// output its own is compared with field by field. A hypervisor that
+/// passes the value on to its guest reports 512-byte physical sectors
+/// for an instar VHDX, as it does for one qemu-img wrote.
+pub const PHYSICAL_SECTOR_SIZE: u32 = LOGICAL_SECTOR_SIZE;
 
 /// The block size qemu chooses when it is not given one.
 ///
@@ -4883,7 +4974,7 @@ mod tests {
                 assert_eq!(l.bat_offset, l.log_offset + u64::from(l.log_length));
                 assert_eq!(l.bat_region_len % (1024 * 1024), 0);
                 assert_eq!(l.logical_sector_size, 512);
-                assert_eq!(l.physical_sector_size, 4096);
+                assert_eq!(l.physical_sector_size, 512);
                 // A chunk is 2^23 logical sectors whatever the block
                 // size, so the ratio and the block size trade off.
                 assert_eq!(
@@ -4949,7 +5040,7 @@ mod tests {
     #[test]
     fn region_table_builder() {
         let mut buf = [0u8; 65536];
-        build_region_table(&mut buf, 0x200000, 0x10000, 0x300000, 0x100000);
+        build_region_table(&mut buf, 0x200000, 0x100000, 0x300000, 0x100000);
 
         // Should parse back
         let sig = le_u32(&buf, 0);
@@ -4962,6 +5053,47 @@ mod tests {
         let stored_crc = le_u32(&buf, REGION_TABLE_CHECKSUM_OFFSET);
         let computed_crc = compute_crc32c(&buf, REGION_TABLE_CHECKSUM_OFFSET);
         assert_eq!(stored_crc, computed_crc);
+
+        // Each entry as qemu-img writes it for `vhdx-dynamic-64M-bsz-off`
+        // in tests/golden/qemu-create-pins.json, Required clear on both:
+        // BAT at 2 MiB, metadata at 3 MiB, 1 MiB each, in that order.
+        let ([bat, metadata], _) = parse_region_table(&buf).expect("table should parse");
+        assert_eq!(
+            (bat.guid, bat.file_offset, bat.length, bat.required),
+            (BAT_REGION_GUID, 0x200000, 0x100000, 0)
+        );
+        assert_eq!(
+            (
+                metadata.guid,
+                metadata.file_offset,
+                metadata.length,
+                metadata.required
+            ),
+            (METADATA_REGION_GUID, 0x300000, 0x100000, 0)
+        );
+        let e = REGION_TABLE_HEADER_SIZE;
+        assert_eq!(&buf[e..e + 16], &BAT_REGION_GUID);
+        assert_eq!(le_u32(&buf, e + 28), 0, "BAT entry Required");
+        let e = REGION_TABLE_HEADER_SIZE + REGION_TABLE_ENTRY_SIZE;
+        assert_eq!(&buf[e..e + 16], &METADATA_REGION_GUID);
+        assert_eq!(le_u32(&buf, e + 28), 0, "metadata entry Required");
+    }
+
+    #[test]
+    fn required_is_written_clear_over_a_reused_buffer() {
+        // The doc asks for a pre-zeroed buffer, but the flag is written,
+        // not left to the zeroing: a caller reusing a buffer that held
+        // an older table gets qemu's value all the same.
+        let mut buf = [0xffu8; 65536];
+        build_region_table(&mut buf, 0x200000, 0x100000, 0x300000, 0x100000);
+        assert_eq!(le_u32(&buf, REGION_TABLE_HEADER_SIZE + 28), 0);
+        assert_eq!(
+            le_u32(
+                &buf,
+                REGION_TABLE_HEADER_SIZE + REGION_TABLE_ENTRY_SIZE + 28
+            ),
+            0
+        );
     }
 
     // ====================================================================
@@ -5146,8 +5278,17 @@ mod tests {
     #[test]
     fn metadata_builder() {
         let mut buf = [0u8; 0x10000 + 64];
-        let written = build_metadata(&mut buf, BLOCK_32_MIB, 1024 * 1024 * 1024, 512, 4096, false);
-        assert!(written > 0);
+        let written = build_metadata(
+            &mut buf,
+            BLOCK_32_MIB,
+            1024 * 1024 * 1024,
+            512,
+            4096,
+            false,
+            false,
+        );
+        assert_eq!(written, 0x10028);
+        assert_eq!(written, PARENT_LOCATOR_ITEM_OFFSET as usize);
 
         // Check signature
         let sig = le_u64(&buf, 0);
@@ -5164,6 +5305,120 @@ mod tests {
         // Check virtual disk size
         let vs = le_u64(&buf, 0x10000 + 8);
         assert_eq!(vs, 1024 * 1024 * 1024);
+
+        // The sector sizes sit after the 16-byte Page 83 Data.
+        assert_eq!(le_u32(&buf, 0x10020), 512);
+        assert_eq!(le_u32(&buf, 0x10024), 4096);
+    }
+
+    /// The metadata table qemu-img writes, entry by entry, as every
+    /// pinned build records it for `vhdx-dynamic-64M-bsz-off` (and every
+    /// other create case) in tests/golden/qemu-create-pins.json:
+    /// (item GUID, offset, length, flags), in table order.
+    const QEMU_METADATA_TABLE: [([u8; 16], u32, u32, u32); 5] = [
+        (FILE_PARAMETERS_GUID, 65536, 8, 4),
+        (VIRTUAL_DISK_SIZE_GUID, 65544, 8, 6),
+        (PAGE_83_DATA_GUID, 65552, 16, 6),
+        (LOGICAL_SECTOR_SIZE_GUID, 65568, 4, 6),
+        (PHYSICAL_SECTOR_SIZE_GUID, 65572, 4, 6),
+    ];
+
+    #[test]
+    fn metadata_builder_writes_qemus_table() {
+        let mut region = std::vec![0u8; 0x11000];
+        build_metadata(
+            &mut region,
+            8 * 1024 * 1024,
+            64 * 1024 * 1024,
+            LOGICAL_SECTOR_SIZE,
+            PHYSICAL_SECTOR_SIZE,
+            false,
+            false,
+        );
+        assert_eq!(
+            le_u16(&region, METADATA_TABLE_ENTRY_COUNT_OFFSET) as usize,
+            QEMU_METADATA_TABLE.len()
+        );
+        for (i, (guid, offset, length, flags)) in QEMU_METADATA_TABLE.iter().enumerate() {
+            let e = METADATA_TABLE_HEADER_SIZE + i * METADATA_TABLE_ENTRY_SIZE;
+            assert_eq!(&region[e..e + 16], guid, "entry {i} item");
+            assert_eq!(le_u32(&region, e + 16), *offset, "entry {i} offset");
+            assert_eq!(le_u32(&region, e + 20), *length, "entry {i} length");
+            assert_eq!(le_u32(&region, e + 24), *flags, "entry {i} flags");
+            assert_eq!(le_u32(&region, e + 28), 0, "entry {i} reserved");
+        }
+        // Nothing past the fifth entry.
+        let e = METADATA_TABLE_HEADER_SIZE + 5 * METADATA_TABLE_ENTRY_SIZE;
+        assert!(region[e..METADATA_ITEMS_MIN_OFFSET as usize]
+            .iter()
+            .all(|&b| b == 0));
+
+        // And the item data sits where the table says it does.
+        let items = parse_metadata_region(&region).expect("region should parse");
+        assert_eq!(items.block_size, 8 * 1024 * 1024);
+        assert_eq!(items.virtual_disk_size, 64 * 1024 * 1024);
+        assert_eq!(items.virtual_disk_size_offset, 65544);
+        assert_eq!(items.logical_sector_size, 512);
+        assert_eq!(items.physical_sector_size, 512);
+        assert!(!items.has_parent);
+        assert!(!items.leave_blocks_allocated);
+    }
+
+    #[test]
+    fn physical_sector_size_is_qemus() {
+        // qemu-img writes its logical sector size as the physical one,
+        // and every pinned build records 512.
+        assert_eq!(PHYSICAL_SECTOR_SIZE, 512);
+        assert_eq!(PHYSICAL_SECTOR_SIZE, LOGICAL_SECTOR_SIZE);
+    }
+
+    #[test]
+    fn metadata_builder_sets_each_file_parameters_bit_alone() {
+        // Bit 0 LeaveBlocksAllocated, bit 1 HasParent, each from its own
+        // argument, and nothing else in the word.
+        for (leave_blocks_allocated, has_parent, word) in [
+            (false, false, 0u32),
+            (true, false, 1),
+            (false, true, 2),
+            (true, true, 3),
+        ] {
+            let mut region = std::vec![0u8; 0x11000];
+            build_metadata(
+                &mut region,
+                8 * 1024 * 1024,
+                64 * 1024 * 1024,
+                512,
+                512,
+                leave_blocks_allocated,
+                has_parent,
+            );
+            assert_eq!(le_u32(&region, 0x10004), word);
+            let items = parse_metadata_region(&region).expect("region should parse");
+            assert_eq!(
+                (items.leave_blocks_allocated, items.has_parent),
+                (leave_blocks_allocated, has_parent)
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_items_written_apart_match_the_ones_written_in_place() {
+        // A writer that builds the table over the first 64 KiB and the
+        // items into a separate buffer must produce the same region as
+        // one that builds both in one buffer.
+        let mut whole = std::vec![0u8; 0x11000];
+        build_metadata(&mut whole, 2 * 1024 * 1024, 5 << 30, 512, 512, true, false);
+
+        let mut table = std::vec![0u8; 0x10000];
+        let end = build_metadata(&mut table, 2 * 1024 * 1024, 5 << 30, 512, 512, true, false);
+        let mut items = std::vec![0xa5u8; 512];
+        build_metadata_items(&mut items, 2 * 1024 * 1024, 5 << 30, 512, 512, true, false);
+
+        let base = METADATA_ITEMS_MIN_OFFSET as usize;
+        assert_eq!(&table[..], &whole[..base]);
+        assert_eq!(&items[..METADATA_ITEMS_LEN], &whole[base..end]);
+        // Nothing past the items is touched.
+        assert!(items[METADATA_ITEMS_LEN..].iter().all(|&b| b == 0xa5));
     }
 
     // ====================================================================
@@ -6435,6 +6690,7 @@ mod tests {
             64 * 1024 * 1024,
             512,
             512,
+            false,
             has_parent,
         );
 
@@ -6596,8 +6852,10 @@ mod tests {
     #[test]
     fn metadata_region_refuses_a_missing_required_item() {
         let mut region = metadata_region(false, false);
-        // Overwrite the Logical Sector Size entry's GUID.
-        let e = METADATA_TABLE_HEADER_SIZE + 2 * METADATA_TABLE_ENTRY_SIZE;
+        // Overwrite the Logical Sector Size entry's GUID: table entry 3,
+        // after the Page 83 Data.
+        let e = METADATA_TABLE_HEADER_SIZE + 3 * METADATA_TABLE_ENTRY_SIZE;
+        assert_eq!(&region[e..e + 16], &LOGICAL_SECTOR_SIZE_GUID);
         region[e..e + 16].fill(0);
         assert!(parse_metadata_region(&region).is_none());
     }
@@ -6606,11 +6864,27 @@ mod tests {
     fn metadata_region_refuses_an_out_of_spec_sector_size() {
         for bad in [0u32, 1024, 8192] {
             let mut region = std::vec![0u8; STAGE_REGION_LEN];
-            build_metadata(&mut region, 1024 * 1024, 64 * 1024 * 1024, bad, 512, false);
+            build_metadata(
+                &mut region,
+                1024 * 1024,
+                64 * 1024 * 1024,
+                bad,
+                512,
+                false,
+                false,
+            );
             assert!(parse_metadata_region(&region).is_none(), "logical {bad}");
 
             let mut region = std::vec![0u8; STAGE_REGION_LEN];
-            build_metadata(&mut region, 1024 * 1024, 64 * 1024 * 1024, 512, bad, false);
+            build_metadata(
+                &mut region,
+                1024 * 1024,
+                64 * 1024 * 1024,
+                512,
+                bad,
+                false,
+                false,
+            );
             assert!(parse_metadata_region(&region).is_none(), "physical {bad}");
         }
     }
@@ -6618,7 +6892,15 @@ mod tests {
     #[test]
     fn metadata_region_accepts_4k_sectors() {
         let mut region = std::vec![0u8; STAGE_REGION_LEN];
-        build_metadata(&mut region, 32 * 1024 * 1024, 1 << 30, 4096, 4096, false);
+        build_metadata(
+            &mut region,
+            32 * 1024 * 1024,
+            1 << 30,
+            4096,
+            4096,
+            false,
+            false,
+        );
         let items = parse_metadata_region(&region).unwrap();
         assert_eq!(items.logical_sector_size, 4096);
         assert_eq!(items.physical_sector_size, 4096);
@@ -6734,6 +7016,7 @@ mod tests {
             64 * 1024 * 1024,
             512,
             4096,
+            false,
             true,
         );
         region
@@ -6820,7 +7103,7 @@ mod tests {
         // Entry four is whatever `build_metadata` left there -- the
         // builder appended at the declared index and reached no
         // further. (It is not zero: `build_metadata` writes five
-        // entries, so index four is its Virtual Disk ID entry.)
+        // entries, so index four is its Physical Sector Size entry.)
         let pristine = built_metadata_region();
         let e4 = METADATA_TABLE_HEADER_SIZE + 4 * METADATA_TABLE_ENTRY_SIZE;
         assert_eq!(
@@ -7156,6 +7439,7 @@ mod tests {
             64 * 1024 * 1024,
             512,
             4096,
+            false,
             true,
         );
         let item_len = 148 + 26 + 22;
@@ -7183,6 +7467,7 @@ mod tests {
             64 * 1024 * 1024,
             512,
             4096,
+            false,
             true,
         );
         exact.truncate(PARENT_LOCATOR_ITEM_OFFSET as usize + item_len);

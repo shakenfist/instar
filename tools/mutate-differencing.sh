@@ -682,7 +682,7 @@ self_test() {
 # phase's definition of done asks the two to stay in step, which until
 # now was a promise kept by hand. Asserting it makes the drift a
 # failure instead of a documentation bug nobody reads.
-EXPECTED_CASES=130
+EXPECTED_CASES=132
 
 check_case_count() {
     # Only meaningful for a whole run; a selection is expected to be short.
@@ -1039,6 +1039,24 @@ rust_case 'vhdx-write-differencing-bat-sized-as-dynamic' "${VHDX_LIB}" \
     '        u32::try_from(bat_entry_count(total_blocks_u64, chunk_ratio, has_parent)?).ok()?;' \
     '        u32::try_from(bat_entry_count(total_blocks_u64, chunk_ratio, false)?).ok()?; // MUTATED' \
     create 'vhdx_differencing_bat_region_covers_the_last_group_bitmap'
+
+# The region table and metadata table every VHDX writer shares, written
+# the way qemu-img writes them (vhdx_create_new_region_table and
+# vhdx_create_new_metadata, qemu 7.0.0 block/vhdx.c). The first sets
+# Required on both region entries again, which Disk2VHD and the iotest
+# image do and qemu does not. The second flags one virtual-disk item
+# IsRequired alone, as instar used to flag all four. No reader instar or
+# qemu ships behaves differently on either, so only a test that compares
+# the bytes with qemu's sees them.
+rust_case 'vhdx-write-region-entries-required' "${VHDX_LIB}" \
+    '    let required: u32 = 0;' \
+    '    let required: u32 = 1; // MUTATED' \
+    vhdx 'region_table_builder'
+
+rust_case 'vhdx-write-virtual-disk-item-flagged-required-only' "${VHDX_LIB}" \
+    '    (PAGE_83_DATA_GUID, ITEM_PAGE_83_DATA, 16, VIRTUAL_DISK_ITEM),' \
+    '    (PAGE_83_DATA_GUID, ITEM_PAGE_83_DATA, 16, METADATA_ENTRY_IS_REQUIRED), // MUTATED' \
+    vhdx 'metadata_builder_writes_qemus_table'
 
 # ---------------------------------------------------------------------
 # The guest chain walker: composing a differencing VHD or VHDX against

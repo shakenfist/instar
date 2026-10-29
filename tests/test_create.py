@@ -12,6 +12,7 @@ round-tripped through `instar check`.
 These tests require /dev/kvm access for the non-raw paths.
 """
 
+import copy
 import json
 import os
 import resource
@@ -1755,13 +1756,64 @@ def drop_keys(value, keys):
     return value
 
 
-def _region_layout(region_table):
-    """A `summarise()` region table as {region: (offset, length)}, without the Required bit."""
-    return {entry['region']: (entry['offset'], entry['length']) for entry in region_table}
+# BAT entry states (SPEC(VHDX) 2.5.1.1).
+BAT_NOT_PRESENT = 0
+BAT_ZERO = 2
 
 
-class TestCreateVhdxPinLayout(InstarTestBase):
-    """instar's dynamic VHDX lays its regions out where every pinned qemu-img does."""
+def as_instar_writes_it(want, block_state_zero):
+    """qemu-img's pinned summary of a dynamic VHDX, with the two fields instar writes differently set to instar's.
+
+    instar's dynamic `create` writes qemu-img's structure field for field
+    except two. qemu extends the file to its data start, 4 MiB past the
+    end of the metadata region (vhdx_create_bat, qemu 7.0.0 block/vhdx.c);
+    instar's file ends with the metadata region. And with
+    block_state_zero on, which is qemu's default, qemu gives every payload
+    block a ZERO entry, where instar leaves the BAT NOT_PRESENT. Both read
+    back as the same disk. Returns the adjusted summary and the names of
+    the fields that needed adjusting, so a caller can insist that each
+    difference it allows is really there.
+    """
+    adjusted = copy.deepcopy(want)
+    changed = []
+    metadata = next(entry for entry in want['region_table_1'] if entry['region'] == 'metadata')
+    metadata_end = metadata['offset'] + metadata['length']
+    if adjusted['file_length'] != metadata_end:
+        adjusted['file_length'] = metadata_end
+        changed.append('file_length')
+    if block_state_zero:
+        for run in adjusted['bat']:
+            if run[2] == vhdx_structure.KIND_PAYLOAD and run[3] == BAT_ZERO:
+                run[3] = BAT_NOT_PRESENT
+                if 'bat state' not in changed:
+                    changed.append('bat state')
+    return adjusted, changed
+
+
+class _DynamicPinComparison:
+    """The comparison of instar's dynamic VHDX with a pinned qemu-img one, shared by the classes below."""
+
+    def assert_matches_qemu(self, summary, want, case, label):
+        """`summary` is qemu's `want` but for the file length and, at the default block_state_zero, the BAT state.
+
+        The allowed differences must be present as well as the only ones:
+        if instar ever writes qemu's file length or ZERO entries, this
+        fails, so the allowance is removed rather than left masking a
+        field that now agrees.
+        """
+        block_state_zero = '-bsz-off' not in case
+        adjusted, changed = as_instar_writes_it(want, block_state_zero)
+        self.assertEqual([], vhdx_structure.structural_diff(summary, adjusted), f'{label}: against {case}')
+        self.assertIn('file_length', changed, f'{label}: qemu\'s {case} no longer ends past its metadata region')
+        if block_state_zero:
+            self.assertIn('bat state', changed, f'{label}: qemu\'s {case} has no ZERO payload entries')
+        raw = vhdx_structure.structural_diff(summary, want)
+        self.assertTrue(any(d.startswith('file_length:') for d in raw), f'{label}: {raw}')
+        self.assertEqual(block_state_zero, any(d.startswith('bat') for d in raw), f'{label}: {raw}')
+
+
+class TestCreateVhdxPinLayout(_DynamicPinComparison, InstarTestBase):
+    """instar's dynamic VHDX has the structure every pinned qemu-img writes, but for two known fields."""
 
     def test_dynamic_131041m_block_1m_regions(self):
         """`-o block_size=1M` at 131041M declares a 1 MiB BAT region at 2 MiB and metadata at 3 MiB.
@@ -1769,9 +1821,8 @@ class TestCreateVhdxPinLayout(InstarTestBase):
         131041 payload entries and 131040 // 4096 = 31 sector bitmap entries
         make 131072 entries, exactly 1 MiB (SPEC(VHDX) 2.5). instar used to
         count one bitmap entry more (#626), so it declared a 2 MiB BAT region
-        and put the metadata region 1 MiB later than qemu does. Only the
-        offsets and lengths are compared: instar writes the Required bit as 1
-        for both regions where qemu writes 0, which is a separate question.
+        and put the metadata region 1 MiB later than qemu does. Every other
+        field is compared too, against every pinned qemu-img.
         """
         case = 'vhdx-dynamic-131041M-block-1M'
         with tempfile.TemporaryDirectory() as td:
@@ -1780,24 +1831,22 @@ class TestCreateVhdxPinLayout(InstarTestBase):
         self.assertNotIn('parse_error', got['summary'])
         mib = 1024 * 1024
         for table in ('region_table_1', 'region_table_2'):
-            self.assertEqual({'bat': (2 * mib, mib), 'metadata': (3 * mib, mib)},
-                             _region_layout(got['summary'][table]), f'instar {table}')
+            self.assertEqual([{'region': 'bat', 'offset': 2 * mib, 'length': mib, 'required': 0},
+                              {'region': 'metadata', 'offset': 3 * mib, 'length': mib, 'required': 0}],
+                             got['summary'][table], f'instar {table}')
         for group in qemu_pins.load_pin()['cases'][case]:
-            for table in ('region_table_1', 'region_table_2'):
-                self.assertEqual(_region_layout(group['result']['summary'][table]),
-                                 _region_layout(got['summary'][table]),
-                                 f'{table} differs from qemu-img {group["versions"][0]} to {group["versions"][-1]}')
+            self.assert_matches_qemu(got['summary'], group['result']['summary'], case,
+                                     f'qemu-img {group["versions"][0]} to {group["versions"][-1]}')
 
 
-class TestCreateVhdxDefaultBlockSize(InstarTestBase):
+class TestCreateVhdxDefaultBlockSize(_DynamicPinComparison, InstarTestBase):
     """With no block_size, instar chooses the block size qemu-img does, and so lays its regions out the same way.
 
     qemu's default scales with the virtual size: 8 MiB up to 1 GiB, 16 MiB up to 100 GiB, 32 MiB up to 32 TiB and
     64 MiB up to the 64 TiB limit, each threshold a strict `>` (vhdx_co_create, qemu 7.0.0 block/vhdx.c). Each case is
     compared with the pin, which every pinned qemu-img agrees on, not with the host qemu-img. Every image is sparse
-    and dynamic; the largest file is the 64 TiB image's 12 MiB of metadata. Only offsets, lengths and the block size
-    are compared: instar writes the Required bit and the physical sector size differently from qemu, which are
-    separate questions.
+    and dynamic; the largest file is the 64 TiB image's 12 MiB of metadata. The whole structure is compared, but for
+    the file length and the BAT state, which `as_instar_writes_it` describes.
     """
 
     # Borrowed rather than inherited, so the smoke tests do not run twice.
@@ -1825,12 +1874,6 @@ class TestCreateVhdxDefaultBlockSize(InstarTestBase):
         (35184372089344, 'vhdx-dynamic-33554433M', 64 * 1024 * 1024),
     )
 
-    def _assert_matches_pin(self, summary, case):
-        want = qemu_pins.expected(case)['summary']
-        self.assertEqual(want['block_size'], summary['block_size'], f'block size against {case}')
-        for table in ('region_table_1', 'region_table_2'):
-            self.assertEqual(_region_layout(want[table]), _region_layout(summary[table]), f'{table} against {case}')
-
     def test_pin_cases(self):
         for case in self.PIN_CASES:
             with self.subTest(case=case):
@@ -1838,7 +1881,7 @@ class TestCreateVhdxDefaultBlockSize(InstarTestBase):
                     got = qemu_pins.run_case(self.get_instar_binary(), case, Path(td))
                 self.assertEqual(0, got['rc'], got['stderr'])
                 self.assertNotIn('parse_error', got['summary'])
-                self._assert_matches_pin(got['summary'], case)
+                self.assert_matches_qemu(got['summary'], qemu_pins.expected(case)['summary'], case, 'instar')
 
     def test_one_sector_above_each_threshold(self):
         for size, case, block_size in self.ONE_SECTOR_ABOVE:
@@ -1851,7 +1894,11 @@ class TestCreateVhdxDefaultBlockSize(InstarTestBase):
                     summary = vhdx_structure.summarise(vhdx_structure.parse_vhdx(path))
                 self.assertEqual(size, summary['virtual_disk_size'])
                 self.assertEqual(block_size, summary['block_size'])
-                self._assert_matches_pin(summary, case)
+                # The pin case is the same image 1 MiB - 512 bytes larger, so only its size is put aside.
+                want = copy.deepcopy(qemu_pins.expected(case)['summary'])
+                self.assertNotEqual(size, want['virtual_disk_size'])
+                want['virtual_disk_size'] = size
+                self.assert_matches_qemu(summary, want, case, f'instar at {size}')
 
 
 # The largest VHDX qemu-img creates (VHDX_MAX_IMAGE_SIZE, refused with a strict `>` in vhdx_co_create, qemu 7.0.0

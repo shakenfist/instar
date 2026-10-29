@@ -480,7 +480,37 @@ Every brief also carries the session's standing rules:
 
 ## Execution notes
 
-None yet.
+* **Back brief, 2026-10-29 (AEDT).** The operator kept decision 1 as
+  recommended, qemu's values for both fields: Required 0 and 512-byte
+  physical sectors. They kept fable for 6b, and allowed the management
+  session to push the branch and open the pull request once the
+  definition of done passes. The steps run in order.
+* **6a.** Two changes beyond the brief, both kept:
+  * `convert_to_vhdx` wrote the metadata item data by hand, in the old
+    order, through a sector of its own (its buffer ends where the item
+    data starts). Changing only the table would have pointed its
+    entries at the wrong bytes, so the agent split the item writer out
+    as `vhdx::build_metadata_items`, which `build_metadata` and convert
+    now share. Both place items from one table, so the table and the
+    data cannot disagree.
+  * `round_trip.rs`'s `GOLDEN_VHDX_NO_BACKING` pins every byte
+    `plan_vhdx` writes, so the region-table and metadata hashes (`w3`
+    to `w5`) were regenerated. Every offset, length and count, and the
+    `w0` to `w2` hashes, are unchanged, and the comment says which
+    columns still compare with the old `develop`.
+
+  The management session reproduced the definition of done's diff
+  script (it prints nothing) and `qemu-img check` and `compare` on a
+  fresh dynamic create and a convert of a raw image with data in two
+  blocks (both clean, compare identical). It also confirmed that the
+  converted image carries Required 0, 512-byte physical sectors and
+  Page 83 at 65552, flagged 6. `instar resize` to 2T, which rebuilds
+  the region tables, passed `qemu-img check` (agent). The stestr run
+  of the eleven modules ran 2684: 2258 passed, 426 skipped, 0 failed.
+  The skips are the 324 measure baselines of #845, the known measure,
+  resize, create and info divergences, "qemu-img cannot resize", raw
+  having no check, ZSTD, and seven `test_differencing` cases that
+  need libvhdi, which this host lacks. `make test-rust` passed 2762.
 
 ## Risks and mitigations
 

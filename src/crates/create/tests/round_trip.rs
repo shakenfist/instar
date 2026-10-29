@@ -1973,9 +1973,11 @@ fn vhdx_non_differencing_metadata_is_unchanged() {
     );
 }
 
-/// Every byte `plan_vhdx` emits for a non-differencing VHDX, as it was
+/// Every byte `plan_vhdx` emits for a non-differencing VHDX: as it was
 /// on `develop` at `9a80776` — the last commit before the
-/// differencing emitter existed.
+/// differencing emitter existed — apart from the region tables and the
+/// metadata region, which have since been changed on purpose to
+/// qemu-img's structure.
 ///
 /// **How these constants were obtained, and why they mean what they
 /// say.** They are not a transcription of the current tree's behaviour.
@@ -1983,9 +1985,21 @@ fn vhdx_non_differencing_metadata_is_unchanged() {
 /// test was added there that built exactly the option matrix below and
 /// wrote this summary to a file, and `make test-rust` was run in that
 /// worktree. The text is that file's contents, pasted here unedited. So
-/// this constant is `develop`'s output by construction, and the
-/// assertion below is a real comparison between two revisions rather
-/// than a restatement of one.
+/// this constant was `develop`'s output by construction, and the
+/// assertion below a real comparison between two revisions rather than
+/// a restatement of one.
+///
+/// **The one deliberate change since.** The region tables (`w3`, `w4`)
+/// and the metadata region (`w5`) now carry qemu-img's structure:
+/// Required clear on both region entries, qemu's metadata item order
+/// and flags, and a 512-byte physical sector size. Their hashes were
+/// regenerated from the tree that made that change, the same throwaway
+/// way, and taken only after checking that nothing else moved: every
+/// offset, length, count and the `w0` to `w2` hashes of every line are
+/// still the `9a80776` values. So those columns remain a comparison
+/// with `develop`, and the three moved hashes are a pin on the new
+/// structure, whose fields the `vhdx` crate's builder tests compare
+/// with qemu-img's field by field.
 ///
 /// **What it covers, and what it does not.** Each line pins a write's
 /// offset, its length, and an FNV-1a-64 hash of every byte in it — so
@@ -2006,90 +2020,91 @@ vhdx vsize=1048576 bsize=1048576 min=4194304 meta=1191936 writes=6
   w0 off=0 len=4096 h=1537a6cf8f243b0a
   w1 off=65536 len=4096 h=615e69c3d445c125
   w2 off=131072 len=4096 h=db3b58eb855205b3
-  w3 off=196608 len=65536 h=25cd95f303fcd318
-  w4 off=262144 len=65536 h=25cd95f303fcd318
-  w5 off=3145728 len=1048576 h=f453e6adb1c76eb7
+  w3 off=196608 len=65536 h=df9c730238ed4888
+  w4 off=262144 len=65536 h=df9c730238ed4888
+  w5 off=3145728 len=1048576 h=8f92a034531d7359
 vhdx vsize=1048576 bsize=33554432 min=4194304 meta=1191936 writes=6
   w0 off=0 len=4096 h=1537a6cf8f243b0a
   w1 off=65536 len=4096 h=615e69c3d445c125
   w2 off=131072 len=4096 h=db3b58eb855205b3
-  w3 off=196608 len=65536 h=25cd95f303fcd318
-  w4 off=262144 len=65536 h=25cd95f303fcd318
-  w5 off=3145728 len=1048576 h=a45cd5f5e059c5b7
+  w3 off=196608 len=65536 h=df9c730238ed4888
+  w4 off=262144 len=65536 h=df9c730238ed4888
+  w5 off=3145728 len=1048576 h=e3552ce725e31499
 vhdx vsize=1048576 bsize=268435456 min=4194304 meta=1191936 writes=6
   w0 off=0 len=4096 h=1537a6cf8f243b0a
   w1 off=65536 len=4096 h=615e69c3d445c125
   w2 off=131072 len=4096 h=db3b58eb855205b3
-  w3 off=196608 len=65536 h=25cd95f303fcd318
-  w4 off=262144 len=65536 h=25cd95f303fcd318
-  w5 off=3145728 len=1048576 h=773dcb7b76224c97
+  w3 off=196608 len=65536 h=df9c730238ed4888
+  w4 off=262144 len=65536 h=df9c730238ed4888
+  w5 off=3145728 len=1048576 h=6451739a0a569b59
 vhdx vsize=1073741824 bsize=1048576 min=4194304 meta=1191936 writes=6
   w0 off=0 len=4096 h=1537a6cf8f243b0a
   w1 off=65536 len=4096 h=615e69c3d445c125
   w2 off=131072 len=4096 h=db3b58eb855205b3
-  w3 off=196608 len=65536 h=25cd95f303fcd318
-  w4 off=262144 len=65536 h=25cd95f303fcd318
-  w5 off=3145728 len=1048576 h=a7b7f7b24fef2bf7
+  w3 off=196608 len=65536 h=df9c730238ed4888
+  w4 off=262144 len=65536 h=df9c730238ed4888
+  w5 off=3145728 len=1048576 h=758dd78d44a0e7d9
 vhdx vsize=1073741824 bsize=33554432 min=4194304 meta=1191936 writes=6
   w0 off=0 len=4096 h=1537a6cf8f243b0a
   w1 off=65536 len=4096 h=615e69c3d445c125
   w2 off=131072 len=4096 h=db3b58eb855205b3
-  w3 off=196608 len=65536 h=25cd95f303fcd318
-  w4 off=262144 len=65536 h=25cd95f303fcd318
-  w5 off=3145728 len=1048576 h=2f3d8d61f724b177
+  w3 off=196608 len=65536 h=df9c730238ed4888
+  w4 off=262144 len=65536 h=df9c730238ed4888
+  w5 off=3145728 len=1048576 h=5d3d8d7490602a99
 vhdx vsize=1073741824 bsize=268435456 min=4194304 meta=1191936 writes=6
   w0 off=0 len=4096 h=1537a6cf8f243b0a
   w1 off=65536 len=4096 h=615e69c3d445c125
   w2 off=131072 len=4096 h=db3b58eb855205b3
-  w3 off=196608 len=65536 h=25cd95f303fcd318
-  w4 off=262144 len=65536 h=25cd95f303fcd318
-  w5 off=3145728 len=1048576 h=4ada37caddcbc7d7
+  w3 off=196608 len=65536 h=df9c730238ed4888
+  w4 off=262144 len=65536 h=df9c730238ed4888
+  w5 off=3145728 len=1048576 h=06bd2dbffc3082d9
 vhdx vsize=4294967296 bsize=1048576 min=4194304 meta=1191936 writes=6
   w0 off=0 len=4096 h=1537a6cf8f243b0a
   w1 off=65536 len=4096 h=615e69c3d445c125
   w2 off=131072 len=4096 h=db3b58eb855205b3
-  w3 off=196608 len=65536 h=25cd95f303fcd318
-  w4 off=262144 len=65536 h=25cd95f303fcd318
-  w5 off=3145728 len=1048576 h=da3222834184bf4b
+  w3 off=196608 len=65536 h=df9c730238ed4888
+  w4 off=262144 len=65536 h=df9c730238ed4888
+  w5 off=3145728 len=1048576 h=a38b5f2efdb2edb9
 vhdx vsize=4294967296 bsize=33554432 min=4194304 meta=1191936 writes=6
   w0 off=0 len=4096 h=1537a6cf8f243b0a
   w1 off=65536 len=4096 h=615e69c3d445c125
   w2 off=131072 len=4096 h=db3b58eb855205b3
-  w3 off=196608 len=65536 h=25cd95f303fcd318
-  w4 off=262144 len=65536 h=25cd95f303fcd318
-  w5 off=3145728 len=1048576 h=469ada16440e3f83
+  w3 off=196608 len=65536 h=df9c730238ed4888
+  w4 off=262144 len=65536 h=df9c730238ed4888
+  w5 off=3145728 len=1048576 h=8ce74db5139895f9
 vhdx vsize=4294967296 bsize=268435456 min=4194304 meta=1191936 writes=6
   w0 off=0 len=4096 h=1537a6cf8f243b0a
   w1 off=65536 len=4096 h=615e69c3d445c125
   w2 off=131072 len=4096 h=db3b58eb855205b3
-  w3 off=196608 len=65536 h=25cd95f303fcd318
-  w4 off=262144 len=65536 h=25cd95f303fcd318
-  w5 off=3145728 len=1048576 h=18c37434941d7f2b
+  w3 off=196608 len=65536 h=df9c730238ed4888
+  w4 off=262144 len=65536 h=df9c730238ed4888
+  w5 off=3145728 len=1048576 h=784a3294b4ec15b9
 vhdx vsize=1099511627776 bsize=1048576 min=12582912 meta=1191936 writes=6
   w0 off=0 len=4096 h=1537a6cf8f243b0a
   w1 off=65536 len=4096 h=615e69c3d445c125
   w2 off=131072 len=4096 h=db3b58eb855205b3
-  w3 off=196608 len=65536 h=42e5e0b0ed731f4c
-  w4 off=262144 len=65536 h=42e5e0b0ed731f4c
-  w5 off=11534336 len=1048576 h=50b5dbdb4cf425b7
+  w3 off=196608 len=65536 h=c39db0e458e61cb4
+  w4 off=262144 len=65536 h=c39db0e458e61cb4
+  w5 off=11534336 len=1048576 h=5010c8c652d96a79
 vhdx vsize=1099511627776 bsize=33554432 min=4194304 meta=1191936 writes=6
   w0 off=0 len=4096 h=1537a6cf8f243b0a
   w1 off=65536 len=4096 h=615e69c3d445c125
   w2 off=131072 len=4096 h=db3b58eb855205b3
-  w3 off=196608 len=65536 h=25cd95f303fcd318
-  w4 off=262144 len=65536 h=25cd95f303fcd318
-  w5 off=3145728 len=1048576 h=00becb237b867cb7
+  w3 off=196608 len=65536 h=df9c730238ed4888
+  w4 off=262144 len=65536 h=df9c730238ed4888
+  w5 off=3145728 len=1048576 h=53e1f058082afab9
 vhdx vsize=1099511627776 bsize=268435456 min=4194304 meta=1191936 writes=6
   w0 off=0 len=4096 h=1537a6cf8f243b0a
   w1 off=65536 len=4096 h=615e69c3d445c125
   w2 off=131072 len=4096 h=db3b58eb855205b3
-  w3 off=196608 len=65536 h=25cd95f303fcd318
-  w4 off=262144 len=65536 h=25cd95f303fcd318
-  w5 off=3145728 len=1048576 h=d39fc0a9114f0397
+  w3 off=196608 len=65536 h=df9c730238ed4888
+  w4 off=262144 len=65536 h=df9c730238ed4888
+  w5 off=3145728 len=1048576 h=24cf9c2c0a129279
 ";
 
 /// A non-differencing VHDX is byte-identical to what `develop` at
-/// `9a80776` produced for the same options.
+/// `9a80776` produced for the same options, apart from the region
+/// tables and metadata region that now follow qemu-img.
 ///
 /// See [`GOLDEN_VHDX_NO_BACKING`] for how the expected text was produced
 /// and for what the hashes do and do not cover.

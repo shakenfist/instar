@@ -11415,6 +11415,7 @@ mod tests {
             virtual_disk_size,
             logical_sector_size,
             logical_sector_size,
+            false,
             has_parent,
         );
 
