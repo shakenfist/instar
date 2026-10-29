@@ -389,6 +389,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   for qemu-img's. An explicit `-o block_size` or `--block-size` is
   unchanged.
 
+- **Every VHDX instar writes has qemu-img's region and metadata
+  structure.** `create`, `convert`, `dd` and `resize` now clear the
+  Required bit on the BAT and metadata region entries, flag the four
+  per-virtual-disk metadata items IsRequired and IsVirtualDisk (instar
+  flagged them IsRequired alone, which matched no writer), place the
+  Page 83 item third, and declare a 512-byte physical sector size where
+  they declared 4096. Each value is what every qemu-img from 6.0.0 to
+  10.2.0 writes. A hypervisor that passes the physical sector size to
+  its guest now reports 512 bytes for a newly written instar VHDX, as it
+  does for a qemu-img one. Readers are unaffected: instar and qemu-img
+  read images written either way. A resize that rebuilds the region
+  tables writes Required clear, even on an image that had it set.
+
 - **The chain config is version 4.** An external data file device now
   carries `FLAG_DATA_DEVICE` (bit 31), set only by the host, and is
   never treated as a layer.

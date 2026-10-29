@@ -3490,7 +3490,10 @@ pub fn build_metadata(
         write_le_u32(buf, e + 24, *flags);
     }
 
-    if let Some(items) = buf.get_mut(items_base..items_base + METADATA_ITEMS_LEN) {
+    if let Some(items) = buf
+        .get_mut(items_base..)
+        .and_then(|rest| rest.first_chunk_mut::<METADATA_ITEMS_LEN>())
+    {
         build_metadata_items(
             items,
             block_size,
@@ -3514,8 +3517,9 @@ pub fn build_metadata(
 /// over the first 64 KiB, and the items with this, from the same
 /// arguments. Both functions place the items by
 /// `BUILT_METADATA_ITEMS`, so the table and the data cannot
-/// disagree about where an item is. `items` must hold at least
-/// [`METADATA_ITEMS_LEN`] bytes, and nothing past that is touched.
+/// disagree about where an item is. `items` is exactly
+/// [`METADATA_ITEMS_LEN`] bytes, so the type rules out a short buffer
+/// and nothing outside it can be touched.
 ///
 /// The File Parameters flags are bit 0, `LeaveBlocksAllocated`
 /// ([`FILE_PARAMETERS_LEAVE_BLOCKS_ALLOCATED`]), which qemu sets for a
@@ -3523,7 +3527,7 @@ pub fn build_metadata(
 /// is written as given; [`PHYSICAL_SECTOR_SIZE`] says what instar's
 /// writers pass.
 pub fn build_metadata_items(
-    items: &mut [u8],
+    items: &mut [u8; METADATA_ITEMS_LEN],
     block_size: u32,
     virtual_disk_size: u64,
     logical_sector_size: u32,
@@ -3547,7 +3551,11 @@ pub fn build_metadata_items(
 
     // Page 83 Data: 16 bytes that identify the disk to a SCSI guest.
     // Derived from the size and block size rather than random, so that
-    // the output of one command does not change from run to run.
+    // the output of one command does not change from run to run. The
+    // cost is that two instar images of the same size and block size
+    // carry the same identifier, where qemu-img writes a random GUID;
+    // the header GUIDs are constant the same way, and #566 tracks
+    // giving created images a real identity.
     let p83 = &mut items[ITEM_PAGE_83_DATA..ITEM_PAGE_83_DATA + 16];
     p83[..8].copy_from_slice(&virtual_disk_size.to_le_bytes());
     p83[8..12].copy_from_slice(&block_size.to_le_bytes());
@@ -6302,7 +6310,15 @@ mod tests {
         let mut table = std::vec![0u8; 0x10000];
         let end = build_metadata(&mut table, 2 * 1024 * 1024, 5 << 30, 512, 512, true, false);
         let mut items = std::vec![0xa5u8; 512];
-        build_metadata_items(&mut items, 2 * 1024 * 1024, 5 << 30, 512, 512, true, false);
+        build_metadata_items(
+            items.first_chunk_mut().expect("512 bytes hold the items"),
+            2 * 1024 * 1024,
+            5 << 30,
+            512,
+            512,
+            true,
+            false,
+        );
 
         let base = METADATA_ITEMS_MIN_OFFSET as usize;
         assert_eq!(&table[..], &whole[..base]);

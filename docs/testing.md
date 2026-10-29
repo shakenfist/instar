@@ -2291,12 +2291,12 @@ dynamic image, caught because a fixed plan's metadata must then
 differ from a dynamic one's by that bit alone, and clearing it on a
 fixed one, caught by reading a fixed image back against its pin. The
 remaining twelve writer cases are caught by a Python integration test
-through the real binary. Ten of those twelve mutate the `create` guest operation, which
-is excluded from `cargo test --workspace`, so a unit test written
-beside that code would never run; the other two mutate the `create`
-crate but break something only an external parser can see. Going
-through the real binary means `make instar` before the test and again
-after the source is restored.
+through the real binary. Ten of those twelve mutate the `create` guest
+operation, which is excluded from `cargo test --workspace`, so a unit
+test written beside that code would never run; the other two mutate
+the `create` crate but break something only an external parser can
+see. Going through the real binary means `make instar` before the test
+and again after the source is restored.
 
 The other **47 reader cases** cover the reader — the VHD and VHDX arms of
 `read_chain_virtual_cluster`, the sector-bitmap helpers in the `vhd`

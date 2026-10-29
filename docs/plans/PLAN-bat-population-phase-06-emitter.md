@@ -66,7 +66,9 @@ Out:
 * **Documentation.** No user-facing page describes the fields this
   phase changes, and fixed output is not reachable from the CLI
   until phase 7 (survey). Phase 12 owns `docs/format-internals.md`'s
-  VHDX section and `CHANGELOG.md`.
+  VHDX section. The changed output itself gets a `CHANGELOG.md` entry
+  here, added at review (see Execution notes), because the change ships
+  with this pull request rather than with phase 12.
 * **Any call-table struct layout change.** Nothing here needs one.
 
 ## What the survey found
@@ -127,8 +129,9 @@ table builder never does). Parsed with the comparator:
 
 So instar's metadata flags are wrong against every writer. instar's
 Required bit matches both other writers and not qemu, and its physical
-sector size matches the iotest image and not qemu or Disk2VHD. Decision 1 chooses qemu's values, because qemu is this plan's
-oracle, and says why.
+sector size matches the iotest image and not qemu or Disk2VHD. Decision
+1 chooses qemu's values, because qemu is this plan's oracle, and says
+why.
 
 ### The builders have three callers, and resize is one
 
@@ -266,16 +269,15 @@ references in `src` that #592 tracks.
      4 matches no writer, and its comment says it writes 6.
    * **On Required and the physical sector size, qemu and the other
      writers disagree,** and this picks qemu. Both non-qemu fixtures
-     write Required 1, and the iotest image a 4096-byte physical
-     sector. This
-     plan's success criteria define "correct" as structurally
+     write Required 1, and the iotest image a 4096-byte physical sector.
+     This plan's success criteria define "correct" as structurally
      identical to `qemu-img create`, and instar's product is qemu-img
-     parity. Keeping the other writers' values would mean every fixed-output
-     test masks two fields for good, as `TestCreateVhdxPinLayout` does
-     today. The cost is that a hypervisor that reports the image's
-     physical sector size to its guest reports 512 bytes for an
-     instar VHDX, as it does for a qemu-written one. The back brief puts this choice to the
-     operator before 6a starts.
+     parity. Keeping the other writers' values would mean every
+     fixed-output test masks two fields for good, as
+     `TestCreateVhdxPinLayout` does today. The cost is that a hypervisor
+     that reports the image's physical sector size to its guest reports
+     512 bytes for an instar VHDX, as it does for a qemu-written one.
+     The back brief puts this choice to the operator before 6a starts.
 
 2. **Dynamic output keeps its file length and its `NOT_PRESENT` BAT.**
    After 6a, `structural_diff` between instar's dynamic `create` and
@@ -574,6 +576,24 @@ Every brief also carries the session's standing rules:
     passes.
   * `qemu-img check` is clean on `instar create -f vhdx t.vhdx 64M`
     and on a convert of a 64 MiB raw image with data in two blocks.
+* **Review round 1, #853.** 0 fix, 1 document, 5 consider, 2 none.
+  * **Taken:**
+    * The document item: a `CHANGELOG.md` entry for the changed output,
+      since it ships with this pull request. Phase 5 set the precedent
+      with its own entry for #645.
+    * `build_metadata_items` now takes `&mut [u8; METADATA_ITEMS_LEN]`,
+      so a short buffer cannot reach it. Convert takes the items from
+      its sector with `first_chunk_mut` and fails the conversion if the
+      sector were ever too short.
+    * The Page 83 comment now says that two images of the same size and
+      block size share the identifier, which #566 tracks.
+    * Three ragged paragraphs reflowed.
+  * **Declined:**
+    * The round-trip test's peak memory. About 300 MB is ordinary for
+      this suite's hosts, and the test is correct.
+    * The `fixed,` mutation anchor. The script already refuses a search
+      string that does not occur exactly once, so an ambiguous anchor
+      reports BROKEN rather than mutating the wrong line.
 
 ## Risks and mitigations
 

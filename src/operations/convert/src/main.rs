@@ -4641,8 +4641,13 @@ unsafe fn convert_to_vhdx(
     let buf_data = layout.buf_data as *mut u8;
     core::ptr::write_bytes(buf_data, 0, oss);
     let item_slice = core::slice::from_raw_parts_mut(buf_data, oss);
+    // A sector is at least 512 bytes, so it always holds the items.
+    let Some(items) = item_slice.first_chunk_mut::<{ vhdx::METADATA_ITEMS_LEN }>() else {
+        (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
+        return *bytes_read;
+    };
     vhdx::build_metadata_items(
-        item_slice,
+        items,
         block_size as u32,
         declared_size,
         logical_sector_size,
