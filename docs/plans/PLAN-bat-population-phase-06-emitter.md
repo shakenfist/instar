@@ -554,6 +554,26 @@ Every brief also carries the session's standing rules:
   because the create op is `create.bin` beside the host binary, and
   `make instar` overwrites it. `create.bin` grew from 58480 to 59024
   bytes. `make test-rust` passed 2781, and `make fuzz-build` passes.
+* **Definition of done, 2026-10-29 (AEDT).** Checked by the management
+  session on a fresh `make instar` at `e491c7b8`. Every item passes:
+  * The structural diff script prints nothing.
+  * The Required and 4096-byte grep checks print nothing, and the API
+    greps print three lines each.
+  * `make test-rust` passed 2781, with 3 ignored, and `make
+    check-binary-sizes` and `make fuzz-build` pass.
+  * The stestr run of the eleven modules at 8 workers ran 2684: 2251
+    passed, 426 skipped and 7 failed. The 7 were qcow2 compressed
+    re-encodes in `test_convert`, and one compressed raw case, none
+    touching VHDX, at a load average of about 9. All 7 passed when
+    replayed alone (`--concurrency 1`, Ran: 7, 0 failed), so they were
+    host contention. The skips are those 6a lists.
+  * All nine new mutation cases PASS, and `--check-patterns` reports
+    139 patterns land.
+  * `tools/ci/check-test-partition.sh` exits 0, the plan-reference
+    grep over the diff prints nothing, and `pre-commit run --all-files`
+    passes.
+  * `qemu-img check` is clean on `instar create -f vhdx t.vhdx 64M`
+    and on a convert of a 64 MiB raw image with data in two blocks.
 
 ## Risks and mitigations
 
