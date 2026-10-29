@@ -10,5 +10,11 @@
         "id": 20783686,
         "name": "Develop branch",
         "target": "branch"
+    },
+    {
+        "enforcement": "active",
+        "id": 26021750,
+        "name": "Restrict releases",
+        "target": "tag"
     }
 ]
