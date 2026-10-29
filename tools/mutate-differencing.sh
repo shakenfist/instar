@@ -682,7 +682,7 @@ self_test() {
 # phase's definition of done asks the two to stay in step, which until
 # now was a promise kept by hand. Asserting it makes the drift a
 # failure instead of a documentation bug nobody reads.
-EXPECTED_CASES=132
+EXPECTED_CASES=137
 
 check_case_count() {
     # Only meaningful for a whole run; a selection is expected to be short.
@@ -1057,6 +1057,44 @@ rust_case 'vhdx-write-virtual-disk-item-flagged-required-only' "${VHDX_LIB}" \
     '    (PAGE_83_DATA_GUID, ITEM_PAGE_83_DATA, 16, VIRTUAL_DISK_ITEM),' \
     '    (PAGE_83_DATA_GUID, ITEM_PAGE_83_DATA, 16, METADATA_ENTRY_IS_REQUIRED), // MUTATED' \
     vhdx 'metadata_builder_writes_qemus_table'
+
+# A fixed image's data start and the BAT filler that places every
+# payload block from it, both as qemu-img does (vhdx_create_bat,
+# vhdx_block_translate and vhdx_update_bat_table_entry, qemu 7.0.0
+# block/vhdx.c). Each of these writes a BAT that qemu-img info accepts
+# and that reads back wrong, or at a different offset from qemu's, so
+# only a comparison against the pinned structure sees it. The first
+# drops the 5 MiB qemu leaves after the BAT region, moving every
+# FULLY_PRESENT entry 5 MiB early. The second interleaves sector bitmap
+# slots every chunk_ratio entries instead of every chunk_ratio + 1,
+# which shifts every payload entry after the first group. The third
+# keeps the block offset on a ZERO entry, which Hyper-V refuses. The
+# fourth writes a payload entry into a sector bitmap slot, and the fifth
+# writes one into the padding past the last entry.
+rust_case 'vhdx-write-fixed-data-start-without-the-gap' "${VHDX_LIB}" \
+    '        .checked_add(FIXED_DATA_GAP)' \
+    '        .checked_add(0) // MUTATED' \
+    vhdx 'layout_fixed_data_start_is_4_mib_past_data_start_at_every_pin'
+
+rust_case 'vhdx-write-fixed-bat-interleaved-by-chunk-ratio' "${VHDX_LIB}" \
+    '    let group = chunk_ratio.checked_add(1).ok_or(BatFillError::Overflow)?;' \
+    '    let group = chunk_ratio.checked_add(0).ok_or(BatFillError::Overflow)?; // MUTATED' \
+    vhdx 'fill_fixed_bat_matches_qemu_pins'
+
+rust_case 'vhdx-write-fixed-zero-entry-keeps-the-offset' "${VHDX_LIB}" \
+    '                    FixedBlockState::Zero => PAYLOAD_BLOCK_ZERO,' \
+    '                    FixedBlockState::Zero => build_bat_entry(PAYLOAD_BLOCK_ZERO, offset), // MUTATED' \
+    vhdx 'fill_fixed_bat_matches_qemu_pins'
+
+rust_case 'vhdx-write-fixed-sector-bitmap-slot-given-a-payload-entry' "${VHDX_LIB}" \
+    '            let is_sector_bitmap = position_in_group == chunk_ratio;' \
+    '            let is_sector_bitmap = position_in_group > chunk_ratio; // MUTATED' \
+    vhdx 'fill_fixed_bat_partitions_every_index_like_qemus_forward_map'
+
+rust_case 'vhdx-write-fixed-padding-given-an-entry' "${VHDX_LIB}" \
+    '        let entry = if index >= bat_entries {' \
+    '        let entry = if index > bat_entries { // MUTATED' \
+    vhdx 'fill_fixed_bat_partitions_every_index_like_qemus_forward_map'
 
 # ---------------------------------------------------------------------
 # The guest chain walker: composing a differencing VHD or VHDX against

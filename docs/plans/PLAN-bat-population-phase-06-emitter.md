@@ -511,6 +511,28 @@ Every brief also carries the session's standing rules:
   resize, create and info divergences, "qemu-img cannot resize", raw
   having no check, ZSTD, and seven `test_differencing` cases that
   need libvhdi, which this host lacks. `make test-rust` passed 2762.
+* **6b**, on fable at high effort. Two changes to decision 4, both kept:
+  * `BatFillError` has a fourth variant, `DegenerateChunkRatio`, for a
+    hand-built layout with a chunk ratio of 0. `layout` never makes one,
+    and without the variant such a layout would get an all-zero BAT
+    with no error, or an `Overflow` that misnames the problem.
+  * Every error is decided before the first byte is written, not just
+    the two the decision names. An upfront bound, `bat_entries *
+    block_size + fixed_data_start`, covers every offset the loop can
+    compute.
+
+  The pin test covers seven geometries where the decision listed five.
+  It adds `vhdx-fixed-17M` and `vhdx-fixed-64M-block-1M-bsz-off`, so
+  ZERO is checked at a partial block and FULLY_PRESENT at an explicit
+  1 MiB block size. The management session diffed every copied
+  constant against `tests/golden/qemu-create-pins.json`: all five pin
+  cases match in every field and BAT run, including 131041M's 31
+  repeats. The two computed geometries agree with the plan: 2 TiB
+  gives a 17 MiB region with data at 24 MiB, and 64 TiB a 513 MiB
+  region with data at 520 MiB. The management session also reran
+  `vhdx-write-fixed-bat-interleaved-by-chunk-ratio` (PASS, source
+  restored byte for byte) and `--check-patterns` (137 land).
+  `make test-rust` passed 2769.
 
 ## Risks and mitigations
 

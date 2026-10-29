@@ -4100,13 +4100,51 @@ pub struct VhdxLayout {
     pub metadata_offset: u64,
     /// [`METADATA_REGION_LENGTH`].
     pub metadata_region_len: u32,
-    /// The end of the metadata region, where payload may start.
+    /// The end of the metadata region, where instar's dynamic writers
+    /// place payload (convert packs blocks from here, and measure
+    /// predicts that it does).
+    ///
+    /// This is not where qemu-img puts a fixed image's data, nor where
+    /// its dynamic file ends: both are [`VhdxLayout::fixed_data_start`],
+    /// [`FIXED_DATA_GAP`] later. A fixed writer that packed blocks from
+    /// here would write a well-formed image whose every BAT offset
+    /// differs from qemu's.
     pub data_start: u64,
+    /// Where qemu-img places the first payload block of a fixed image:
+    /// `bat_offset + bat_region_len + 5 MiB`, which is the end of the
+    /// metadata region plus [`FIXED_DATA_GAP`]. `vhdx_create_bat`
+    /// (`block/vhdx.c`, qemu 7.0.0) computes `data_file_offset` as the
+    /// BAT region's offset plus its length plus `5 * MiB`, where the
+    /// extra 4 MiB past the metadata region are "a 4 MB buffer for
+    /// future expansion". qemu also truncates a dynamic file to this
+    /// offset, so it is where a qemu-created dynamic image ends.
+    ///
+    /// Every `FULLY_PRESENT` entry a fixed BAT holds is this plus a
+    /// whole number of blocks ([`fill_fixed_bat`]). Not to be confused
+    /// with [`VhdxLayout::data_start`], 4 MiB earlier, which instar's
+    /// dynamic writers use.
+    pub fixed_data_start: u64,
+    /// The length qemu-img truncates a fixed image to:
+    /// [`VhdxLayout::fixed_data_start`] plus `virtual_size`, the size
+    /// already rounded to 512 bytes (`vhdx_create_bat`, qemu 7.0.0).
+    /// A last block the virtual size ends inside is not padded out, so
+    /// the file can end part way through the block its last BAT entry
+    /// points at.
+    pub fixed_file_length: u64,
     /// [`LOGICAL_SECTOR_SIZE`].
     pub logical_sector_size: u32,
     /// [`PHYSICAL_SECTOR_SIZE`].
     pub physical_sector_size: u32,
 }
+
+/// The gap qemu-img leaves between the end of the BAT region and the
+/// first payload block of a fixed image: 5 MiB, which is the 1 MiB
+/// metadata region plus a 4 MiB "buffer for future expansion"
+/// (`vhdx_create_bat`, `block/vhdx.c`, qemu 7.0.0). Measured against
+/// every fixed pin case in `tests/golden/qemu-create-pins.json`: with a
+/// 1 MiB BAT region at 2 MiB, the first `FULLY_PRESENT` entry is at
+/// 8 MiB.
+pub const FIXED_DATA_GAP: u64 = 5 * MB_ALIGN;
 
 /// Lay out a new VHDX of `virtual_size` bytes.
 ///
@@ -4197,6 +4235,17 @@ pub fn layout(
         .checked_add(u64::from(METADATA_REGION_LENGTH))
         .ok_or(LayoutError::Overflow)?;
 
+    // qemu's fixed data start is computed from the BAT region's end, as
+    // `vhdx_create_bat` does, and not from `data_start`, so that the two
+    // stay independent definitions: a reader of either doc comment can
+    // check it against the code without unwinding the other.
+    let fixed_data_start = metadata_offset
+        .checked_add(FIXED_DATA_GAP)
+        .ok_or(LayoutError::Overflow)?;
+    let fixed_file_length = fixed_data_start
+        .checked_add(virtual_size)
+        .ok_or(LayoutError::Overflow)?;
+
     Ok(VhdxLayout {
         virtual_size,
         block_size,
@@ -4210,9 +4259,175 @@ pub fn layout(
         metadata_offset,
         metadata_region_len: METADATA_REGION_LENGTH,
         data_start,
+        fixed_data_start,
+        fixed_file_length,
         logical_sector_size: LOGICAL_SECTOR_SIZE,
         physical_sector_size: PHYSICAL_SECTOR_SIZE,
     })
+}
+
+// ============================================================================
+// Fixed BAT filler
+// ============================================================================
+
+/// The state every payload entry of a fixed image's BAT is written in.
+///
+/// qemu-img writes `PAYLOAD_BLOCK_FULLY_PRESENT` for a fixed image and
+/// overrides it to `PAYLOAD_BLOCK_ZERO` when `block_state_zero` is on,
+/// which it is by default (`vhdx_create_bat`, `block/vhdx.c`, qemu
+/// 7.0.0). The whole BAT takes one state or the other; there is no
+/// per-block choice.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FixedBlockState {
+    /// `PAYLOAD_BLOCK_ZERO`, with FileOffsetMB 0. qemu forces the offset
+    /// to zero on a ZERO entry (`vhdx_update_bat_table_entry`) because
+    /// Hyper-V refuses a ZERO block that names a file offset.
+    Zero,
+    /// `PAYLOAD_BLOCK_FULLY_PRESENT`, with FileOffsetMB naming the
+    /// block's place in the data region.
+    FullyPresent,
+}
+
+/// Why [`fill_fixed_bat`] wrote nothing.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum BatFillError {
+    /// The output buffer's length is not a multiple of 8, so it cannot
+    /// hold a whole number of entries.
+    UnalignedBuffer,
+    /// The buffer would hold an entry at or past the BAT region's
+    /// capacity, `bat_region_len / 8`.
+    PastRegion,
+    /// The layout's chunk ratio is zero, so there is no group size to
+    /// interleave sector bitmap entries by. [`layout`] never produces
+    /// one, and every reader refuses an image that declares one.
+    DegenerateChunkRatio,
+    /// An entry's offset or index did not fit `u64`. With a layout from
+    /// [`layout`] this cannot happen, since the largest offset is the
+    /// 64 TiB ceiling plus a few hundred MiB, so it is a backstop that
+    /// keeps the arithmetic checked rather than an answer any real
+    /// layout gets.
+    Overflow,
+}
+
+/// Fill one buffer's worth of a fixed image's BAT.
+///
+/// `out` receives `out.len() / 8` little-endian entries, the ones at BAT
+/// indices `first_entry` onwards. Every entry is a pure function of its
+/// index and `layout`, so a caller streams a BAT of any size through
+/// one buffer by advancing `first_entry` by the buffer's entry count,
+/// and the function neither allocates nor keeps state between calls.
+/// The region tables the caller writes and the BAT it fills must come
+/// from the same `layout`, which is why this takes the layout rather
+/// than computing one: a BAT sized by one geometry and declared by
+/// another is an image a reader refuses.
+///
+/// Each index `j` is one of four things, decided in this order:
+///
+/// * `j >= layout.bat_entries` is padding, which is 0. qemu writes the
+///   whole region in one call, and everything past the last needed
+///   entry is zero (`vhdx_create_bat`, `block/vhdx.c`, qemu 7.0.0).
+/// * The last index of each group of `chunk_ratio + 1` is a sector
+///   bitmap slot, which is 0. qemu fills the BAT by emulating one write
+///   per payload block, and `vhdx_block_translate` places payload block
+///   `p` at BAT index `p + p / chunk_ratio`, so the slot after every
+///   `chunk_ratio` payload entries is never written. Which index is a
+///   slot is this function's one piece of arithmetic that is not a
+///   plain multiply: `(j + 1) % (chunk_ratio + 1) == 0`.
+/// * Otherwise `j` holds payload block `p = j - j / (chunk_ratio + 1)`,
+///   which is qemu's forward map inverted: the `j / (chunk_ratio + 1)`
+///   groups before `j` each gave up one index to a slot. For
+///   [`FixedBlockState::Zero`] the entry is `PAYLOAD_BLOCK_ZERO` with
+///   offset 0. For [`FixedBlockState::FullyPresent`] it is
+///   `PAYLOAD_BLOCK_FULLY_PRESENT` with the block's file offset,
+///   `fixed_data_start + p * block_size`. That offset is a whole number
+///   of MiB, so its low 20 bits are clear and the bytes above them are
+///   FileOffsetMB, the encoding `build_bat_entry` applies. qemu rounds
+///   the same sum up to a MiB (`vhdx_create_bat`), which changes
+///   nothing because both terms are already MiB multiples. A block the
+///   virtual size ends inside still gets a whole-block offset; the file
+///   simply ends before the block does.
+///
+/// The map is the one the crate's readers apply when they look a block
+/// up (`block_index + block_index / chunk_ratio`), so an image filled
+/// here is read back by the same rule that wrote it.
+///
+/// This is for an image with no parent, the only kind of fixed VHDX
+/// qemu-img can create: a differencing BAT has sector bitmap entries of
+/// its own to write, and its entries do not describe whole blocks. The
+/// planner that calls this refuses a fixed image with a backing file.
+///
+/// A buffer whose length is not a multiple of 8 is
+/// [`BatFillError::UnalignedBuffer`], and one that would reach an index
+/// at or past `bat_region_len / 8` is [`BatFillError::PastRegion`].
+/// Every error is decided before anything is written, so a caller never
+/// has a half-filled buffer to write out. Every count and offset is
+/// checked arithmetic, nothing indexes past the buffer, and nothing
+/// panics.
+pub fn fill_fixed_bat(
+    layout: &VhdxLayout,
+    state: FixedBlockState,
+    first_entry: u64,
+    out: &mut [u8],
+) -> Result<(), BatFillError> {
+    const ENTRY_LEN: usize = 8;
+    if !out.len().is_multiple_of(ENTRY_LEN) {
+        return Err(BatFillError::UnalignedBuffer);
+    }
+    let count = u64::try_from(out.len() / ENTRY_LEN).map_err(|_| BatFillError::Overflow)?;
+    let capacity = u64::from(layout.bat_region_len) / ENTRY_LEN as u64;
+    let end = first_entry
+        .checked_add(count)
+        .ok_or(BatFillError::Overflow)?;
+    if end > capacity {
+        return Err(BatFillError::PastRegion);
+    }
+    // Each group of `chunk_ratio` payload entries is followed by one
+    // sector bitmap slot, so the BAT repeats every `chunk_ratio + 1`
+    // entries. A zero ratio has no group to repeat.
+    let chunk_ratio = u64::from(layout.chunk_ratio);
+    if chunk_ratio == 0 {
+        return Err(BatFillError::DegenerateChunkRatio);
+    }
+    let group = chunk_ratio.checked_add(1).ok_or(BatFillError::Overflow)?;
+    let bat_entries = u64::from(layout.bat_entries);
+    let block_size = u64::from(layout.block_size);
+    // Every payload block number is below `bat_entries`, so if this
+    // bound fits, no entry's offset below can overflow, and the checks
+    // inside the loop cannot fail after a byte has been written.
+    bat_entries
+        .checked_mul(block_size)
+        .and_then(|bytes| bytes.checked_add(layout.fixed_data_start))
+        .ok_or(BatFillError::Overflow)?;
+
+    for (slot, index) in out.chunks_exact_mut(ENTRY_LEN).zip(first_entry..end) {
+        let entry = if index >= bat_entries {
+            // Padding: past the last entry the image needs.
+            0
+        } else {
+            let position_in_group = index.checked_rem(group).ok_or(BatFillError::Overflow)?;
+            let is_sector_bitmap = position_in_group == chunk_ratio;
+            if is_sector_bitmap {
+                0
+            } else {
+                let groups_before = index.checked_div(group).ok_or(BatFillError::Overflow)?;
+                let payload_block = index
+                    .checked_sub(groups_before)
+                    .ok_or(BatFillError::Overflow)?;
+                let offset = payload_block
+                    .checked_mul(block_size)
+                    .and_then(|bytes| bytes.checked_add(layout.fixed_data_start))
+                    .ok_or(BatFillError::Overflow)?;
+                match state {
+                    FixedBlockState::Zero => PAYLOAD_BLOCK_ZERO,
+                    FixedBlockState::FullyPresent => {
+                        build_bat_entry(PAYLOAD_BLOCK_FULLY_PRESENT, offset)
+                    }
+                }
+            }
+        };
+        slot.copy_from_slice(&entry.to_le_bytes());
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -4983,6 +5198,681 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ====================================================================
+    // qemu's fixed layout and the fixed BAT filler
+    // ====================================================================
+
+    /// One run of a fixed BAT as `tests/golden/qemu-create-pins.json`
+    /// records it: `count` entries from BAT index `start`, each in
+    /// `state` with a file offset of `offset` plus `stride` per entry.
+    /// A sector bitmap slot or padding is state 0, offset 0.
+    struct BatRun {
+        start: u64,
+        count: u64,
+        state: u64,
+        offset: u64,
+        stride: u64,
+    }
+
+    /// A fixed BAT as the pin file describes it, with the layout values
+    /// the comparator records beside it. `repeated` recurs `repeat`
+    /// times, each repeat `index_step` entries and `offset_step` bytes
+    /// after the last (the pin file's `repeat`, `index_step` and
+    /// `offset_steps[0]`), and `tail` follows the repeats.
+    struct PinnedFixedBat {
+        case: &'static str,
+        virtual_size: u64,
+        /// 0 asks for qemu's default, as the pin case did.
+        block_size: u32,
+        chunk_ratio: u32,
+        bat_entries: u32,
+        bat_region_len: u32,
+        fixed_data_start: u64,
+        file_length: u64,
+        state: FixedBlockState,
+        repeat: u64,
+        index_step: u64,
+        offset_step: u64,
+        repeated: &'static [BatRun],
+        tail: &'static [BatRun],
+    }
+
+    const PADDING: BatRun = BatRun {
+        start: 0,
+        count: 0,
+        state: 0,
+        offset: 0,
+        stride: 0,
+    };
+
+    /// Seven pin cases, every value the same on all 80 pinned qemu
+    /// builds, and two geometries too large to pin that check the
+    /// layout's arithmetic where the BAT region grows past 1 MiB.
+    const PINNED_FIXED: &[PinnedFixedBat] = &[
+        PinnedFixedBat {
+            // 17 MiB ends 1 MiB into its third 8 MiB block, and the
+            // third entry still names the whole block.
+            case: "vhdx-fixed-17M-bsz-off",
+            virtual_size: 17825792,
+            block_size: 0,
+            chunk_ratio: 512,
+            bat_entries: 3,
+            bat_region_len: 1048576,
+            fixed_data_start: 8388608,
+            file_length: 26214400,
+            state: FixedBlockState::FullyPresent,
+            repeat: 0,
+            index_step: 0,
+            offset_step: 0,
+            repeated: &[],
+            tail: &[
+                BatRun {
+                    start: 0,
+                    count: 3,
+                    state: 6,
+                    offset: 8388608,
+                    stride: 8388608,
+                },
+                BatRun {
+                    start: 3,
+                    count: 131069,
+                    ..PADDING
+                },
+            ],
+        },
+        PinnedFixedBat {
+            case: "vhdx-fixed-17M",
+            virtual_size: 17825792,
+            block_size: 0,
+            chunk_ratio: 512,
+            bat_entries: 3,
+            bat_region_len: 1048576,
+            fixed_data_start: 8388608,
+            file_length: 26214400,
+            state: FixedBlockState::Zero,
+            repeat: 0,
+            index_step: 0,
+            offset_step: 0,
+            repeated: &[],
+            tail: &[
+                BatRun {
+                    start: 0,
+                    count: 3,
+                    state: 2,
+                    offset: 0,
+                    stride: 0,
+                },
+                BatRun {
+                    start: 3,
+                    count: 131069,
+                    ..PADDING
+                },
+            ],
+        },
+        PinnedFixedBat {
+            case: "vhdx-fixed-64M",
+            virtual_size: 67108864,
+            block_size: 0,
+            chunk_ratio: 512,
+            bat_entries: 8,
+            bat_region_len: 1048576,
+            fixed_data_start: 8388608,
+            file_length: 75497472,
+            state: FixedBlockState::Zero,
+            repeat: 0,
+            index_step: 0,
+            offset_step: 0,
+            repeated: &[],
+            tail: &[
+                BatRun {
+                    start: 0,
+                    count: 8,
+                    state: 2,
+                    offset: 0,
+                    stride: 0,
+                },
+                BatRun {
+                    start: 8,
+                    count: 131064,
+                    ..PADDING
+                },
+            ],
+        },
+        PinnedFixedBat {
+            case: "vhdx-fixed-64M-block-1M-bsz-off",
+            virtual_size: 67108864,
+            block_size: 1048576,
+            chunk_ratio: 4096,
+            bat_entries: 64,
+            bat_region_len: 1048576,
+            fixed_data_start: 8388608,
+            file_length: 75497472,
+            state: FixedBlockState::FullyPresent,
+            repeat: 0,
+            index_step: 0,
+            offset_step: 0,
+            repeated: &[],
+            tail: &[
+                BatRun {
+                    start: 0,
+                    count: 64,
+                    state: 6,
+                    offset: 8388608,
+                    stride: 1048576,
+                },
+                BatRun {
+                    start: 64,
+                    count: 131008,
+                    ..PADDING
+                },
+            ],
+        },
+        PinnedFixedBat {
+            // 131041 blocks of 1 MiB: 31 full groups of 4096 payload
+            // entries, each followed by a sector bitmap slot, then the
+            // 4065 entries of the last group, which fill the region's
+            // last entry exactly. No padding.
+            case: "vhdx-fixed-131041M-block-1M-bsz-off",
+            virtual_size: 137406447616,
+            block_size: 1048576,
+            chunk_ratio: 4096,
+            bat_entries: 131072,
+            bat_region_len: 1048576,
+            fixed_data_start: 8388608,
+            file_length: 137414836224,
+            state: FixedBlockState::FullyPresent,
+            repeat: 31,
+            index_step: 4097,
+            offset_step: 4294967296,
+            repeated: &[
+                BatRun {
+                    start: 0,
+                    count: 4096,
+                    state: 6,
+                    offset: 8388608,
+                    stride: 1048576,
+                },
+                BatRun {
+                    start: 4096,
+                    count: 1,
+                    ..PADDING
+                },
+            ],
+            tail: &[BatRun {
+                start: 127007,
+                count: 4065,
+                state: 6,
+                offset: 133152374784,
+                stride: 1048576,
+            }],
+        },
+        PinnedFixedBat {
+            // Not a pin case: too large for the pin harness. 2 TiB at
+            // 1 MiB blocks is 2097152 payload blocks and 511 sector
+            // bitmap slots, 16781304 bytes of BAT in a 17 MiB region,
+            // so the data starts at 2 + 17 + 5 = 24 MiB (measured with
+            // qemu-img 10.0.13). The run structure is derived from
+            // those counts, not measured.
+            case: "2T at 1M blocks",
+            virtual_size: 2199023255552,
+            block_size: 1048576,
+            chunk_ratio: 4096,
+            bat_entries: 2097663,
+            bat_region_len: 17825792,
+            fixed_data_start: 25165824,
+            file_length: 2199048421376,
+            state: FixedBlockState::FullyPresent,
+            repeat: 511,
+            index_step: 4097,
+            offset_step: 4294967296,
+            repeated: &[
+                BatRun {
+                    start: 0,
+                    count: 4096,
+                    state: 6,
+                    offset: 25165824,
+                    stride: 1048576,
+                },
+                BatRun {
+                    start: 4096,
+                    count: 1,
+                    ..PADDING
+                },
+            ],
+            tail: &[
+                BatRun {
+                    start: 2093567,
+                    count: 4096,
+                    state: 6,
+                    offset: 2194753454080,
+                    stride: 1048576,
+                },
+                BatRun {
+                    start: 2097663,
+                    count: 130561,
+                    ..PADDING
+                },
+            ],
+        },
+        PinnedFixedBat {
+            // Not a pin case, and not measured: the ceiling, computed.
+            // 64 TiB at 1 MiB blocks is 67108864 payload blocks, 16384
+            // whole groups of 4096 with 16383 slots between them, so
+            // 67125247 entries, 537001976 bytes of BAT in a 513 MiB
+            // region, and the data starts at 2 + 513 + 5 = 520 MiB.
+            case: "64T at 1M blocks",
+            virtual_size: 70368744177664,
+            block_size: 1048576,
+            chunk_ratio: 4096,
+            bat_entries: 67125247,
+            bat_region_len: 537919488,
+            fixed_data_start: 545259520,
+            file_length: 70369289437184,
+            state: FixedBlockState::FullyPresent,
+            repeat: 16383,
+            index_step: 4097,
+            offset_step: 4294967296,
+            repeated: &[
+                BatRun {
+                    start: 0,
+                    count: 4096,
+                    state: 6,
+                    offset: 545259520,
+                    stride: 1048576,
+                },
+                BatRun {
+                    start: 4096,
+                    count: 1,
+                    ..PADDING
+                },
+            ],
+            tail: &[
+                BatRun {
+                    start: 67121151,
+                    count: 4096,
+                    state: 6,
+                    offset: 70364994469888,
+                    stride: 1048576,
+                },
+                BatRun {
+                    start: 67125247,
+                    count: 114689,
+                    ..PADDING
+                },
+            ],
+        },
+    ];
+
+    /// Expand a pin's run description into one run per entry range, in
+    /// index order, covering the whole region with no gap.
+    fn expand_runs(pin: &PinnedFixedBat) -> std::vec::Vec<BatRun> {
+        let mut runs = std::vec::Vec::new();
+        for r in 0..pin.repeat {
+            for run in pin.repeated {
+                runs.push(BatRun {
+                    start: run.start + r * pin.index_step,
+                    count: run.count,
+                    state: run.state,
+                    offset: if run.state == 0 {
+                        0
+                    } else {
+                        run.offset + r * pin.offset_step
+                    },
+                    stride: run.stride,
+                });
+            }
+        }
+        for run in pin.tail {
+            runs.push(BatRun {
+                start: run.start,
+                count: run.count,
+                state: run.state,
+                offset: run.offset,
+                stride: run.stride,
+            });
+        }
+        let mut next = 0;
+        for run in &runs {
+            assert_eq!(run.start, next, "{}: run gap at {next}", pin.case);
+            next += run.count;
+        }
+        assert_eq!(
+            next,
+            u64::from(pin.bat_region_len) / 8,
+            "{}: runs do not cover the region",
+            pin.case
+        );
+        runs
+    }
+
+    fn pinned_layout(pin: &PinnedFixedBat) -> VhdxLayout {
+        let l = layout(pin.virtual_size, pin.block_size, false)
+            .unwrap_or_else(|e| panic!("{}: {e:?}", pin.case));
+        let case = pin.case;
+        assert_eq!(l.virtual_size, pin.virtual_size, "{case}: virtual size");
+        assert_eq!(l.chunk_ratio, pin.chunk_ratio, "{case}: chunk ratio");
+        assert_eq!(l.bat_entries, pin.bat_entries, "{case}: BAT entries");
+        assert_eq!(l.bat_region_len, pin.bat_region_len, "{case}: BAT region");
+        assert_eq!(
+            l.fixed_data_start, pin.fixed_data_start,
+            "{case}: data start"
+        );
+        assert_eq!(l.fixed_file_length, pin.file_length, "{case}: file length");
+        l
+    }
+
+    /// Fill the whole BAT region through `buf_len`-byte buffers and
+    /// hand each entry to `check` with its index.
+    fn stream_bat(
+        l: &VhdxLayout,
+        state: FixedBlockState,
+        buf_len: usize,
+        mut check: impl FnMut(u64, u64),
+    ) {
+        let capacity = u64::from(l.bat_region_len) / 8;
+        let mut buf = std::vec![0u8; buf_len];
+        let per_buffer = buf_len as u64 / 8;
+        let mut first = 0;
+        while first < capacity {
+            let n = per_buffer.min(capacity - first);
+            let out = &mut buf[..n as usize * 8];
+            fill_fixed_bat(l, state, first, out).unwrap();
+            for (i, slot) in out.chunks_exact(8).enumerate() {
+                check(first + i as u64, le_u64(slot, 0));
+            }
+            first += n;
+        }
+    }
+
+    #[test]
+    fn fill_fixed_bat_matches_qemu_pins() {
+        for pin in PINNED_FIXED {
+            let case = pin.case;
+            let l = pinned_layout(pin);
+            let runs = expand_runs(pin);
+            let mut cursor = 0;
+            let mut last_offset = None;
+            stream_bat(&l, pin.state, 65536, |index, entry| {
+                while index >= runs[cursor].start + runs[cursor].count {
+                    cursor += 1;
+                }
+                let run = &runs[cursor];
+                let expected_offset = run.offset + (index - run.start) * run.stride;
+                let expected = build_bat_entry(run.state, expected_offset);
+                assert_eq!(entry, expected, "{case}: entry {index}");
+                if run.state == 6 {
+                    last_offset = Some(expected_offset);
+                }
+            });
+            assert_eq!(cursor, runs.len() - 1, "{case}: every run was visited");
+            // The file ends inside, or exactly at the end of, the last
+            // block a FULLY_PRESENT entry names.
+            if let Some(last) = last_offset {
+                assert!(l.fixed_file_length > last, "{case}");
+                assert!(
+                    l.fixed_file_length <= last + u64::from(l.block_size),
+                    "{case}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fill_fixed_bat_is_the_same_through_any_buffer_size() {
+        // The whole region in one call, through 512-byte buffers, and
+        // through 64 KiB buffers must agree byte for byte; an
+        // off-by-one at a buffer edge shows here and nowhere else.
+        for case in [
+            "vhdx-fixed-17M-bsz-off",
+            "vhdx-fixed-131041M-block-1M-bsz-off",
+        ] {
+            let pin = PINNED_FIXED.iter().find(|p| p.case == case).unwrap();
+            let l = pinned_layout(pin);
+            let capacity = (u64::from(l.bat_region_len) / 8) as usize;
+            let mut whole = std::vec![0u8; capacity * 8];
+            fill_fixed_bat(&l, pin.state, 0, &mut whole).unwrap();
+            for buf_len in [512, 65536] {
+                let mut streamed = std::vec![0u8; capacity * 8];
+                stream_bat(&l, pin.state, buf_len, |index, entry| {
+                    streamed[index as usize * 8..index as usize * 8 + 8]
+                        .copy_from_slice(&entry.to_le_bytes());
+                });
+                assert!(streamed == whole, "{case}: {buf_len}-byte buffers");
+            }
+        }
+    }
+
+    /// 40 blocks of 256 MiB: the smallest chunk ratio `layout` can
+    /// produce, 16, so a whole region holds every kind of index.
+    fn small_chunk_ratio_layout() -> VhdxLayout {
+        let l = layout(40 * 256 * MIB, 256 * 1024 * 1024, false).unwrap();
+        assert_eq!(l.chunk_ratio, 16);
+        assert_eq!(l.payload_blocks, 40);
+        // 40 payload entries and the two slots after blocks 15 and 31.
+        assert_eq!(l.bat_entries, 42);
+        l
+    }
+
+    #[test]
+    fn fill_fixed_bat_partitions_every_index_like_qemus_forward_map() {
+        let l = small_chunk_ratio_layout();
+        let capacity = (u64::from(l.bat_region_len) / 8) as usize;
+        for state in [FixedBlockState::FullyPresent, FixedBlockState::Zero] {
+            let mut region = std::vec![0u8; capacity * 8];
+            fill_fixed_bat(&l, state, 0, &mut region).unwrap();
+            let entry = |j: usize| le_u64(&region, j * 8);
+
+            // qemu's forward map: payload block p sits at p + p / 16
+            // (vhdx_block_translate). Every payload block has its own
+            // entry, with the offset qemu's fixed writer gives it.
+            let mut is_payload = std::vec![false; capacity];
+            for p in 0..40u64 {
+                let j = p + p / 16;
+                assert!(!is_payload[j as usize], "block {p} collides");
+                is_payload[j as usize] = true;
+                let expected = match state {
+                    // A ZERO entry names no offset, whatever block it is.
+                    FixedBlockState::Zero => build_bat_entry(PAYLOAD_BLOCK_ZERO, 0),
+                    FixedBlockState::FullyPresent => build_bat_entry(
+                        PAYLOAD_BLOCK_FULLY_PRESENT,
+                        l.fixed_data_start + p * 256 * MIB,
+                    ),
+                };
+                assert_eq!(entry(j as usize), expected, "{state:?}: block {p} at {j}");
+            }
+            // Everything else below the entry count is a sector bitmap
+            // slot, which is the last index of a group of 17, and is 0.
+            let mut slots = 0;
+            for j in 0..42 {
+                if !is_payload[j] {
+                    assert_eq!((j + 1) % 17, 0, "{j} is not a slot");
+                    assert_eq!(entry(j), 0, "slot {j}");
+                    slots += 1;
+                }
+            }
+            assert_eq!(slots, 2);
+            // Everything from the entry count to the region's capacity
+            // is padding, 0.
+            for j in 42..capacity {
+                assert_eq!(entry(j), 0, "padding {j}");
+            }
+            // And nothing at or past the capacity can be asked for.
+            let mut one = [0u8; 8];
+            assert_eq!(
+                fill_fixed_bat(&l, state, capacity as u64, &mut one),
+                Err(BatFillError::PastRegion)
+            );
+        }
+    }
+
+    #[test]
+    fn fill_fixed_bat_starting_mid_chunk_crosses_a_sector_bitmap_slot() {
+        let l = small_chunk_ratio_layout();
+        let capacity = (u64::from(l.bat_region_len) / 8) as usize;
+        let mut whole = std::vec![0u8; capacity * 8];
+        fill_fixed_bat(&l, FixedBlockState::FullyPresent, 0, &mut whole).unwrap();
+        // Windows that begin part way through a group and run over the
+        // slot at 16 or 33, over the entry count at 42, or up to the
+        // capacity, must equal the same slice of a whole-region fill.
+        let windows = [
+            (15u64, 4usize),
+            (16, 1),
+            (16, 2),
+            (17, 1),
+            (30, 9),
+            (33, 1),
+            (40, 5),
+            (41, 1),
+            (42, 3),
+            (capacity as u64 - 2, 2),
+        ];
+        for (first, count) in windows {
+            let mut part = std::vec![0xa5u8; count * 8];
+            fill_fixed_bat(&l, FixedBlockState::FullyPresent, first, &mut part).unwrap();
+            let lo = first as usize * 8;
+            assert!(part == whole[lo..lo + count * 8], "window {first}+{count}");
+        }
+        // The window over 15..19 holds block 15, the slot, then blocks
+        // 16 and 17, so the offsets step by one block across the slot.
+        let mut part = [0u8; 32];
+        fill_fixed_bat(&l, FixedBlockState::FullyPresent, 15, &mut part).unwrap();
+        let bs = 256 * MIB;
+        assert_eq!(le_u64(&part, 0), (l.fixed_data_start + 15 * bs) | 6);
+        assert_eq!(le_u64(&part, 8), 0);
+        assert_eq!(le_u64(&part, 16), (l.fixed_data_start + 16 * bs) | 6);
+        assert_eq!(le_u64(&part, 24), (l.fixed_data_start + 17 * bs) | 6);
+    }
+
+    #[test]
+    fn fill_fixed_bat_partial_last_block_entry_names_the_whole_block() {
+        // vhdx-fixed-17M-bsz-off: 17 MiB is two whole 8 MiB blocks and
+        // 1 MiB of a third. qemu's third entry is FULLY_PRESENT at
+        // 8388608 + 2 * 8388608, a whole block past the second, and the
+        // file is truncated to 26214400, 1 MiB into that block.
+        let l = layout(17825792, 0, false).unwrap();
+        assert_eq!(l.bat_entries, 3);
+        let mut bat = [0u8; 32];
+        fill_fixed_bat(&l, FixedBlockState::FullyPresent, 0, &mut bat).unwrap();
+        assert_eq!(le_u64(&bat, 0), 8388608 | 6);
+        assert_eq!(le_u64(&bat, 8), 16777216 | 6);
+        assert_eq!(le_u64(&bat, 16), 25165824 | 6);
+        assert_eq!(le_u64(&bat, 24), 0);
+        assert_eq!(l.fixed_file_length, 26214400);
+        assert_eq!(l.fixed_file_length - 25165824, MIB);
+        // vhdx-fixed-17M: the same geometry at the default
+        // block_state_zero, every entry ZERO with no offset, and the
+        // same file length.
+        let mut bat = [0u8; 32];
+        fill_fixed_bat(&l, FixedBlockState::Zero, 0, &mut bat).unwrap();
+        assert_eq!(le_u64(&bat, 0), 2);
+        assert_eq!(le_u64(&bat, 8), 2);
+        assert_eq!(le_u64(&bat, 16), 2);
+        assert_eq!(le_u64(&bat, 24), 0);
+    }
+
+    #[test]
+    fn fill_fixed_bat_errors_leave_the_buffer_untouched() {
+        let l = small_chunk_ratio_layout();
+        let capacity = u64::from(l.bat_region_len) / 8;
+        let state = FixedBlockState::FullyPresent;
+
+        let mut buf = [0xa5u8; 24];
+        assert_eq!(
+            fill_fixed_bat(&l, state, 0, &mut buf[..12]),
+            Err(BatFillError::UnalignedBuffer)
+        );
+        assert_eq!(
+            fill_fixed_bat(&l, state, 0, &mut buf[..1]),
+            Err(BatFillError::UnalignedBuffer)
+        );
+        assert_eq!(buf, [0xa5u8; 24]);
+
+        // The last entry fits; one more does not, from either end.
+        assert_eq!(fill_fixed_bat(&l, state, capacity - 3, &mut buf), Ok(()));
+        let mut buf = [0xa5u8; 24];
+        assert_eq!(
+            fill_fixed_bat(&l, state, capacity - 2, &mut buf),
+            Err(BatFillError::PastRegion)
+        );
+        assert_eq!(
+            fill_fixed_bat(&l, state, capacity, &mut buf[..8]),
+            Err(BatFillError::PastRegion)
+        );
+        assert_eq!(
+            fill_fixed_bat(&l, state, u64::MAX, &mut buf[..8]),
+            Err(BatFillError::Overflow)
+        );
+        assert_eq!(buf, [0xa5u8; 24]);
+
+        // An empty buffer asks for nothing and gets nothing, even at
+        // the capacity; past it there is no index to name.
+        assert_eq!(fill_fixed_bat(&l, state, capacity, &mut buf[..0]), Ok(()));
+        assert_eq!(
+            fill_fixed_bat(&l, state, capacity + 1, &mut buf[..0]),
+            Err(BatFillError::PastRegion)
+        );
+
+        // A layout that `layout` never produces: no group size.
+        let degenerate = VhdxLayout {
+            chunk_ratio: 0,
+            ..l
+        };
+        assert_eq!(
+            fill_fixed_bat(&degenerate, state, 0, &mut buf),
+            Err(BatFillError::DegenerateChunkRatio)
+        );
+        // Nor one whose offsets cannot be represented.
+        let huge = VhdxLayout {
+            fixed_data_start: u64::MAX - MIB,
+            ..l
+        };
+        assert_eq!(
+            fill_fixed_bat(&huge, state, 0, &mut buf),
+            Err(BatFillError::Overflow)
+        );
+        assert_eq!(buf, [0xa5u8; 24]);
+    }
+
+    #[test]
+    fn layout_fixed_data_start_is_4_mib_past_data_start_at_every_pin() {
+        // The two data starts are defined independently (one from the
+        // metadata region's end, one from the BAT region's end plus
+        // qemu's 5 MiB), and at every geometry they must differ by
+        // exactly the 4 MiB qemu leaves "for future expansion".
+        let mut geometries = std::vec::Vec::new();
+        for pin in PINNED_DEFAULT {
+            geometries.push((pin.case, pin.virtual_size, 0u32));
+        }
+        geometries.push(("vhdx-dynamic-131041M-block-1M", 137406447616, 1024 * 1024));
+        for pin in PINNED_FIXED {
+            geometries.push((pin.case, pin.virtual_size, pin.block_size));
+        }
+        geometries.push(("zero", 0, 0));
+        for (case, size, bs) in geometries {
+            for has_parent in [false, true] {
+                let l = layout(size, bs, has_parent).unwrap();
+                assert_eq!(l.fixed_data_start - l.data_start, 4 * MIB, "{case}");
+                assert_eq!(
+                    l.fixed_data_start,
+                    l.bat_offset + u64::from(l.bat_region_len) + 5 * MIB,
+                    "{case}"
+                );
+                assert_eq!(
+                    l.fixed_file_length,
+                    l.fixed_data_start + l.virtual_size,
+                    "{case}"
+                );
+                assert_eq!(l.fixed_data_start % MIB, 0, "{case}");
+            }
+        }
+        // And the one every small pin case shares: a 1 MiB BAT region at
+        // 2 MiB puts the first FULLY_PRESENT entry at 8 MiB.
+        assert_eq!(
+            layout(64 * MIB, 0, false).unwrap().fixed_data_start,
+            8388608
+        );
     }
 
     #[test]
