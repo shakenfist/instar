@@ -714,7 +714,7 @@ rather than merge requests.
 | 3. Host-only create: non-qcow2 preallocation parity and monolithicFlat | [PLAN-bat-population-phase-03-host-create.md](PLAN-bat-population-phase-03-host-create.md) | Complete | `a8d2f4ca` (#824) |
 | 4. Read side: BAT entry count (#626), partial last block, `LeaveBlocksAllocated` and `resize` | [PLAN-bat-population-phase-04-read-side.md](PLAN-bat-population-phase-04-read-side.md) | Complete | `d140aa04` (#835) |
 | 5. VHDX geometry: default block size (#645), 64 TiB ceiling, one shared layout | [PLAN-bat-population-phase-05-geometry.md](PLAN-bat-population-phase-05-geometry.md) | Complete | `52518787` (#848) |
-| 6. Streaming BAT emitter and the fixed `plan_vhdx` | [PLAN-bat-population-phase-06-emitter.md](PLAN-bat-population-phase-06-emitter.md) | In progress | |
+| 6. Streaming BAT emitter and the fixed `plan_vhdx` | [PLAN-bat-population-phase-06-emitter.md](PLAN-bat-population-phase-06-emitter.md) | Complete | `aef757d2` (#853) |
 | 7. `create -f vhdx -o subformat=fixed`: guest streaming and host CLI | PLAN-bat-population-phase-07-create.md | Not started | |
 | 8. `convert -O vhdx --subformat fixed` | PLAN-bat-population-phase-08-convert.md | Not started | |
 | 9. `measure -O vhdx -o subformat=fixed` | PLAN-bat-population-phase-09-measure.md | Not started | |
