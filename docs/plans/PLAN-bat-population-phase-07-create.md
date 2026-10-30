@@ -528,7 +528,48 @@ Every brief also carries the session's standing rules:
 
 ## Execution notes
 
-(Empty until the phase runs.)
+* **Back brief, 2026-10-30 (AEDT).** The operator kept decision 1 as
+  recommended: the host extends the file at open. They kept opus for 7a,
+  and allowed the management session to push the branch and open the
+  pull request once the definition of done passes. The steps run in
+  order.
+* **7a.** One departure, kept: `qemu_pins.run_case` checks an image with
+  `check -f vhdx`, and `instar check` has no `-f` option and exits 2 on
+  one. So decision 6's `check_rc == 0` could never hold for instar.
+  `tests/helpers/qemu_pins.py`'s `_check_rc` now leaves `-f` out when
+  the binary is named `instar`, which detects the format itself.
+  qemu-img is still told the format, so the pin sweep is unchanged. The
+  dynamic comparisons never asserted `check_rc`, which is why this had
+  not surfaced before.
+
+  The host's backing refusal is a `rust_case`, because a host unit test
+  drives `validate_create_args` through the CLI's own resolution. The
+  other four mutants are integration cases, all PASS, and the script
+  holds 144 cases. Decision 9's write-order item is recorded in the
+  script as reviewed, not mutated.
+
+  The management session reproduced the following:
+  * the definition of done's pin script, which prints nothing over all
+    11 fixed cases in 4.9 s;
+  * `instar check -f vhdx` exiting 2;
+  * dynamic `create` at 64M (default block size) and at 131041M with
+    1 MiB blocks, byte-identical (`cmp`) to the agent's `aef757d2`
+    baseline images;
+  * the 16 TiB refusal on this host's ext4, "create: a fixed VHDX of
+    17592186044416 bytes needs a 17592198627328-byte file, which the
+    filesystem holding 'big.vhdx' cannot store: File too large (os
+    error 27)", which leaves no file;
+  * a 2 TiB fixed create at 1 MiB blocks in 0.74 s.
+
+  From the agent's run:
+  * `make test-rust` passed 2790, and `make check-binary-sizes` and
+    `make fuzz-build` pass;
+  * `create.bin` grew from 59024 to 60224 bytes;
+  * the stestr run of the six modules ran 1521: 1496 passed, 25
+    skipped and 0 failed. The skips are osboxes multi-extent VMDK (14),
+    VHD CHS rounding (5), ZSTD (3, including the accepted-and-ignored
+    `compression_type`), raw having no check (2), and the hardcoded
+    `compat=1.1` (1).
 
 ## Risks and mitigations
 

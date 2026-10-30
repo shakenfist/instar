@@ -3588,7 +3588,7 @@ pub struct CreateConfig {
     pub qcow2_refcount_bits: u8,
     /// vmdk subformat: 0=MonolithicSparse, 1=StreamOptimized.
     pub vmdk_subformat: u8,
-    /// vhd subformat: 0=Dynamic, 1=Fixed.
+    /// vhd and vhdx subformat: 0=Dynamic, 1=Fixed.
     pub vhd_subformat: u8,
     /// Reserved padding.
     pub _pad: u8,
@@ -3632,6 +3632,16 @@ impl CreateConfig {
     pub const PREALLOC_METADATA: u32 = 1 << 4;
     pub const PREALLOC_FALLOC: u32 = 2 << 4;
     pub const PREALLOC_FULL: u32 = 3 << 4;
+
+    /// Flag: a fixed VHDX's payload BAT entries are written
+    /// `PAYLOAD_BLOCK_FULLY_PRESENT` rather than `PAYLOAD_BLOCK_ZERO`,
+    /// which is qemu-img's `-o block_state_zero=off`. Named for the
+    /// state it asks for rather than as a negative, so that a zeroed
+    /// `flags` word means qemu-img's default, `block_state_zero=on`
+    /// (`vhdx_co_create`, `block/vhdx.c`, qemu 7.0.0). Read only when
+    /// `vhd_subformat` asks for a fixed VHDX; a dynamic VHDX's BAT is
+    /// `PAYLOAD_BLOCK_NOT_PRESENT` whatever this says.
+    pub const FLAG_VHDX_FULLY_PRESENT: u32 = 1 << 6;
 
     /// True if magic matches.
     pub fn is_valid(&self) -> bool {

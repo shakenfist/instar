@@ -682,7 +682,7 @@ self_test() {
 # phase's definition of done asks the two to stay in step, which until
 # now was a promise kept by hand. Asserting it makes the drift a
 # failure instead of a documentation bug nobody reads.
-EXPECTED_CASES=139
+EXPECTED_CASES=144
 
 check_case_count() {
     # Only meaningful for a whole run; a selection is expected to be short.
@@ -2645,6 +2645,56 @@ integration_case 'create-op-footer-reads-the-last-sector' "${CREATE_OP}" \
     '        && (call_table.read_input_sector)(0, capacity - 1, header_ptr, sector_size)' \
     '        && (call_table.read_input_sector)(0, 0, header_ptr, sector_size)' \
     "${FIXED_PARENT}"
+
+# A fixed VHDX, from the host's CLI to the guest's BAT stream. Each
+# mutation below still writes a file every reader opens, so only the
+# comparison with the pinned qemu-img structure sees it. The first
+# writes a dynamic image when a fixed one was asked for, into a file
+# the host has already made the fixed length. The second ignores the
+# host's block_state_zero=off, so every payload entry is ZERO. The
+# third stops the BAT stream one 64 KiB slot early: the 128 GiB pin
+# case needs sixteen slots, so its last 8192 entries are left a hole
+# and read as NOT_PRESENT. The fourth has the host open a fixed output
+# as it opens a dynamic one, sparse and with the generous capacity
+# hint, which leaves the file ending with the metadata region instead
+# of at qemu-img's length.
+#
+# Not a case: streaming the BAT after the metadata instead of before
+# it. A finished file cannot show the order its sectors were written
+# in, and the guest op is out of `cargo test`'s reach, so the order is
+# a reviewed property of emit_vhdx_fixed_bat's call site rather than a
+# mutated one.
+FIXED_PIN='test_create.TestCreateVhdxFixedPinLayout.test_pin_cases'
+
+integration_case 'create-op-vhdx-subformat-ignored' "${CREATE_OP}" \
+    '        1 => VhdxSubformat::Fixed,' \
+    '        1 => VhdxSubformat::Dynamic, // MUTATED' \
+    "${FIXED_PIN}"
+
+integration_case 'create-op-vhdx-block-state-flag-ignored' "${CREATE_OP}" \
+    '        block_state_zero: config.flags & CreateConfig::FLAG_VHDX_FULLY_PRESENT == 0,' \
+    '        block_state_zero: true, // MUTATED' \
+    "${FIXED_PIN}"
+
+integration_case 'create-op-vhdx-fixed-bat-one-slot-short' "${CREATE_OP}" \
+    '    while written < total {' \
+    '    while written.saturating_add(MAX_SECTOR_SIZE as u64) < total { // MUTATED' \
+    "${FIXED_PIN}"
+
+integration_case 'create-host-vhdx-fixed-output-opened-sparse' "${VMM_MAIN}" \
+    '    let fixed_vhdx = fixed_vhdx_geometry(args, virtual_size, block_size);' \
+    '    let fixed_vhdx: Option<vhdx::VhdxLayout> = None; // MUTATED' \
+    "${FIXED_PIN}"
+
+# The host's own refusal of a backing file for a fixed VHDX. Without it
+# the guest's planner still refuses, but with "invalid option for target
+# format", which does not say what is wrong; and `-b` with no size is
+# told it needs a size. The host unit test drives validate_create_args
+# through the same resolution the CLI uses.
+rust_case 'create-host-vhdx-fixed-backing-refusal-removed' "${VMM_MAIN}" \
+    $'    if args.backing.is_some() {\n        return Err("create: vhdx subformat=fixed cannot have a backing file".into());' \
+    $'    if args.backing.is_some() && false { // MUTATED\n        return Err("create: vhdx subformat=fixed cannot have a backing file".into());' \
+    instar 'vhdx_fixed_refuses_a_backing_file'
 
 # ---------------------------------------------------------------------
 # The libvhdi oracle cross-check.

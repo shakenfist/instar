@@ -228,6 +228,9 @@ const CREATE_CONFIG_PREALLOC_METADATA: u32 = 1 << 4;
 const CREATE_CONFIG_PREALLOC_FALLOC: u32 = 2 << 4;
 #[allow(dead_code)]
 const CREATE_CONFIG_PREALLOC_FULL: u32 = 3 << 4;
+// A fixed VHDX with `-o block_state_zero=off`: every payload BAT entry is
+// FULLY_PRESENT rather than ZERO. Clear means qemu-img's default.
+const CREATE_CONFIG_FLAG_VHDX_FULLY_PRESENT: u32 = 1 << 6;
 const CREATE_CONFIG_MAX_BACKING_FILE: usize = 1024;
 
 #[allow(dead_code)]
@@ -7472,9 +7475,10 @@ struct CreateArgs {
     #[arg(long, default_value = "1.1", value_parser = ["0.10", "1.1"])]
     compat: String,
 
-    /// vmdk subformat (default: monolithicSparse). vhd subformat
-    /// (default: dynamic). Other subformats are accepted in this
-    /// argument name and validated against the chosen --format.
+    /// vmdk subformat (default: monolithicSparse). vhd and vhdx
+    /// subformat: dynamic (default) or fixed. Other subformats are
+    /// accepted in this argument name and validated against the chosen
+    /// --format.
     #[arg(long, default_value = "",
           value_parser = ["", "monolithicSparse", "streamOptimized",
                           "monolithicFlat", "dynamic", "fixed"])]
@@ -7489,6 +7493,13 @@ struct CreateArgs {
     /// vmdk accepts and ignores it; monolithicFlat refuses `on`.
     #[arg(skip)]
     zeroed_grain: bool,
+
+    /// vhdx `-o block_state_zero`, which has no flag of its own, as
+    /// qemu-img has none. `None` is qemu-img's default, on: a fixed
+    /// image's payload blocks are ZERO, and `Some(false)` makes them
+    /// FULLY_PRESENT. A dynamic image accepts and ignores it.
+    #[arg(skip)]
+    block_state_zero: Option<bool>,
 
     /// vhd / vhdx block size in bytes. Power of two.
     /// vhd default: 2 MiB; vhdx default: qemu's, scaled with the size
@@ -15358,6 +15369,7 @@ struct CreateOptionOverrides {
     zeroed_grain: Option<bool>,
     vhd_subformat: Option<u8>,
     block_size: Option<u32>,
+    block_state_zero: Option<bool>,
     preallocation: Option<&'static str>,
 
     // Create-specific keys with no individual-flag analogue.
@@ -15624,12 +15636,8 @@ fn parse_create_o_options(
 
                 // -------- vhdx --------
                 ("vhdx", "subformat") => match value {
-                    "dynamic" => { /* default */ }
-                    "fixed" => {
-                        return Err("create: -O vhdx -o subformat=fixed is not yet supported \
-                                    (only the dynamic vhdx subformat is implemented)"
-                            .into())
-                    }
+                    "dynamic" => out.vhd_subformat = Some(0),
+                    "fixed" => out.vhd_subformat = Some(1),
                     _ => {
                         return Err(format!(
                             "create: bad value '{}' for -o key 'subformat' \
@@ -15642,7 +15650,14 @@ fn parse_create_o_options(
                 ("vhdx", "block_size") => {
                     out.block_size = Some(parse_create_o_size_u32(key, value)?);
                 }
-                ("vhdx", "log_size") | ("vhdx", "block_state_zero") => {
+                ("vhdx", "block_state_zero") => {
+                    // Parsed for both subformats, because qemu-img refuses
+                    // a value that is not a boolean for both ("Parameter
+                    // 'block_state_zero' expects 'on' or 'off'", measured
+                    // with qemu-img 10.0.13). Only a fixed image reads it.
+                    out.block_state_zero = Some(parse_create_o_bool(key, value)?);
+                }
+                ("vhdx", "log_size") => {
                     // accept-ignore
                 }
 
@@ -18493,6 +18508,9 @@ fn apply_create_overrides(args: &mut CreateArgs, overrides: CreateOptionOverride
     if let Some(v) = overrides.block_size {
         args.block_size = v;
     }
+    if let Some(v) = overrides.block_state_zero {
+        args.block_state_zero = Some(v);
+    }
     if let Some(v) = overrides.preallocation {
         args.preallocation = v.to_string();
     }
@@ -18579,6 +18597,11 @@ fn run_create_nonraw(args: &CreateArgs, verbose: bool) -> Result<(), Box<dyn std
         "full" => CREATE_CONFIG_PREALLOC_FULL,
         _ => CREATE_CONFIG_PREALLOC_OFF,
     };
+    // Set only for the one case that reads it, so that every other image
+    // sends the flags word it always has.
+    if is_vhdx_fixed_create(args) && args.block_state_zero == Some(false) {
+        flags |= CREATE_CONFIG_FLAG_VHDX_FULLY_PRESENT;
+    }
 
     let vmdk_subformat: u8 = match args.subformat.as_str() {
         "streamOptimized" => 1,
@@ -18626,13 +18649,25 @@ fn run_create_nonraw(args: &CreateArgs, verbose: bool) -> Result<(), Box<dyn std
     // and let the file stay sparse. For the inferred-from-backing
     // path (virtual_size == 0, size taken from `-b`) we fall back to
     // 64 MiB — the BAT/L1/refcount metadata is far smaller than that.
-    let output_capacity_hint = virtual_size
-        .saturating_add(64 * 1024 * 1024)
-        .max(64 * 1024 * 1024);
-
-    let output_backing =
-        BackingStore::open(output_path, false, Some(output_capacity_hint), true)
-            .map_err(|e| format!("create: open '{}' for write failed: {}", args.filename, e))?;
+    //
+    // A fixed VHDX is the exception: its file is as long as qemu-img's
+    // from the start, so the device is exactly that long and the file is
+    // extended to it before the guest runs (see `fixed_vhdx_geometry`).
+    let fixed_vhdx = fixed_vhdx_geometry(args, virtual_size, block_size);
+    let (output_backing, output_capacity_hint) = match fixed_vhdx {
+        Some(geometry) => (
+            open_fixed_vhdx_output(output_path, &args.filename, &geometry)?,
+            geometry.fixed_file_length,
+        ),
+        None => {
+            let hint = virtual_size
+                .saturating_add(64 * 1024 * 1024)
+                .max(64 * 1024 * 1024);
+            let backing = BackingStore::open(output_path, false, Some(hint), true)
+                .map_err(|e| format!("create: open '{}' for write failed: {}", args.filename, e))?;
+            (backing, hint)
+        }
+    };
 
     // core unconditionally initialises input device 0 and places the
     // output device at MMIO index = active_input_count. The input
@@ -18889,6 +18924,77 @@ fn run_create_nonraw(args: &CreateArgs, verbose: bool) -> Result<(), Box<dyn std
             let _ = std::fs::remove_file(output_path);
             Err(e)
         }
+    }
+}
+
+/// The layout of the fixed VHDX `args` asks for, or `None` for any other
+/// image.
+///
+/// A fixed VHDX's file is `fixed_file_length` long, qemu-img's data start
+/// plus the virtual size, because qemu-img truncates it to that length
+/// before it writes the BAT (`vhdx_create_bat`, `block/vhdx.c`, qemu
+/// 7.0.0). The host extends the file rather than the guest, for three
+/// reasons. A filesystem that cannot hold a file that long (ext4 cannot
+/// hold one of 16 TiB or more) then fails here, before a guest boots, with
+/// an error the host can name; a guest writing a tail sector would fail
+/// after streaming the whole BAT, as an output write error the host cannot
+/// tell from a real I/O failure. The device is exactly that long, so the
+/// guest cannot leave the file the wrong length: a write past the end is
+/// refused, and nothing the guest writes can make the file shorter. And it
+/// is what qemu-img does, and what instar's raw create already does.
+///
+/// The guest plans the image from the same `vhdx::layout` call, with the
+/// same virtual size and the same block size, so the two cannot disagree
+/// about the length. A size or block size the layout refuses gives `None`:
+/// the output is then opened as for a dynamic image, and the guest refuses
+/// the layout with the message it gives for a dynamic one, so that refusal
+/// is worded in one place.
+fn fixed_vhdx_geometry(
+    args: &CreateArgs,
+    virtual_size: u64,
+    block_size: u32,
+) -> Option<vhdx::VhdxLayout> {
+    if !is_vhdx_fixed_create(args) {
+        return None;
+    }
+    vhdx::layout(virtual_size, block_size, false).ok()
+}
+
+/// Open a fixed VHDX's output, extended sparsely to its final length.
+///
+/// `BackingStore::open` creates (or truncates) the file and then sets its
+/// length. When the filesystem refuses the length with `EFBIG` the file is
+/// removed again, so a refused create leaves nothing behind, and the
+/// error says what was asked for and why it could not be stored.
+fn open_fixed_vhdx_output(
+    path: &Path,
+    filename: &str,
+    geometry: &vhdx::VhdxLayout,
+) -> Result<BackingStore, Box<dyn std::error::Error>> {
+    BackingStore::open(path, false, Some(geometry.fixed_file_length), false).map_err(|e| {
+        if e.raw_os_error() == Some(libc::EFBIG) {
+            let _ = std::fs::remove_file(path);
+        }
+        fixed_vhdx_open_error(&e, filename, geometry).into()
+    })
+}
+
+/// The message for a failure to open a fixed VHDX's output at its final
+/// length: a file too large for the filesystem is named as that, and
+/// anything else keeps the message every create output open gives.
+fn fixed_vhdx_open_error(
+    e: &std::io::Error,
+    filename: &str,
+    geometry: &vhdx::VhdxLayout,
+) -> String {
+    if e.raw_os_error() == Some(libc::EFBIG) {
+        format!(
+            "create: a fixed VHDX of {} bytes needs a {}-byte file, which the filesystem \
+             holding '{}' cannot store: {}",
+            geometry.virtual_size, geometry.fixed_file_length, filename, e
+        )
+    } else {
+        format!("create: open '{}' for write failed: {}", filename, e)
     }
 }
 
@@ -19788,6 +19894,30 @@ fn validate_vmdk_flat_create_args(args: &CreateArgs) -> Result<(), Box<dyn std::
     Ok(())
 }
 
+/// Whether `args` (with `-o` applied) asks for a fixed VHDX.
+fn is_vhdx_fixed_create(args: &CreateArgs) -> bool {
+    args.target_format == "vhdx" && args.subformat == "fixed"
+}
+
+/// The options a fixed VHDX cannot take.
+///
+/// qemu-img creates no differencing VHDX at all: the vhdx driver's create
+/// options have no `backing_file` (`vhdx_create_opts`, `block/vhdx.c`,
+/// qemu 7.0.0), so the generic create path refuses one with "Backing file
+/// not supported for file format 'vhdx'" (`bdrv_img_create`, `block.c`,
+/// qemu 7.0.0). instar does write a dynamic differencing VHDX, but a
+/// fixed image has every block present from the start, so a parent could
+/// never be read through it. The guest's planner refuses the combination
+/// too, with a message that does not say why; this names it before any
+/// file is opened. `preallocation=metadata` is refused by the common
+/// preallocation check.
+fn validate_vhdx_fixed_create_args(args: &CreateArgs) -> Result<(), Box<dyn std::error::Error>> {
+    if args.backing.is_some() {
+        return Err("create: vhdx subformat=fixed cannot have a backing file".into());
+    }
+    Ok(())
+}
+
 /// Host-side defensive validation of `CreateArgs`. The guest
 /// re-checks every critical field, but failing early at the host
 /// gives a clearer user-facing error before any I/O or KVM setup.
@@ -19800,6 +19930,11 @@ fn validate_create_args(args: &CreateArgs) -> Result<(), Box<dyn std::error::Err
     // from a backing file.
     if is_vmdk_flat_create(args) {
         validate_vmdk_flat_create_args(args)?;
+    }
+    // Before the size check too, so that `-b` without a size is told
+    // that a fixed VHDX takes no backing file, not that it needs a size.
+    if is_vhdx_fixed_create(args) {
+        validate_vhdx_fixed_create_args(args)?;
     }
     if args.size.is_none() && args.backing.is_none() {
         return Err("create: either SIZE or -b BACKING must be provided".into());
@@ -19882,10 +20017,19 @@ fn validate_create_args(args: &CreateArgs) -> Result<(), Box<dyn std::error::Err
                 .into());
             }
         }
+        "vhdx" => {
+            if !matches!(args.subformat.as_str(), "" | "dynamic" | "fixed") {
+                return Err(format!(
+                    "create: --subformat '{}' is not valid for vhdx (expected dynamic or fixed)",
+                    args.subformat
+                )
+                .into());
+            }
+        }
         _ => {
             if !args.subformat.is_empty() {
                 return Err(format!(
-                    "create: --subformat is only valid with -f vmdk or -f vpc (got -f {})",
+                    "create: --subformat is only valid with -f vmdk, -f vpc or -f vhdx (got -f {})",
                     args.target_format
                 )
                 .into());
@@ -20693,6 +20837,252 @@ mod create_option_tests {
         assert_eq!(
             std::fs::read(dir.path().join("c-flat.vmdk")).unwrap(),
             b"old"
+        );
+    }
+
+    const VHDX_FIXED_BACKING_REFUSAL: &str =
+        "create: vhdx subformat=fixed cannot have a backing file";
+
+    #[test]
+    fn vhdx_subformat_parses() {
+        let o = parse_create_o_options("vhdx", &s("subformat=fixed")).unwrap();
+        assert_eq!(o.vhd_subformat, Some(1));
+        let o = parse_create_o_options("vhdx", &s("subformat=dynamic")).unwrap();
+        assert_eq!(o.vhd_subformat, Some(0));
+        let err = parse_create_o_options("vhdx", &s("subformat=monolithicSparse"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expected dynamic or fixed"), "{}", err);
+    }
+
+    #[test]
+    fn vhdx_block_state_zero_is_parsed_not_ignored() {
+        let o = parse_create_o_options("vhdx", &s("block_state_zero=on")).unwrap();
+        assert_eq!(o.block_state_zero, Some(true));
+        let o = parse_create_o_options("vhdx", &s("block_state_zero=off")).unwrap();
+        assert_eq!(o.block_state_zero, Some(false));
+        assert_eq!(
+            parse_create_o_options("vhdx", &[])
+                .unwrap()
+                .block_state_zero,
+            None
+        );
+        // Refused for both subformats, as qemu-img refuses it.
+        for o in [
+            "block_state_zero=bogus",
+            "subformat=fixed,block_state_zero=bogus",
+        ] {
+            let err = parse_create_o_options("vhdx", &s(o))
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                err, "create: bad value 'bogus' for -o key 'block_state_zero' (expected on/off)",
+                "{}",
+                o
+            );
+        }
+        // log_size stays accept-ignored.
+        parse_create_o_options("vhdx", &s("log_size=1M")).unwrap();
+    }
+
+    #[test]
+    fn vhdx_fixed_spellings_resolve_alike() {
+        for argv in [
+            &["-f", "vhdx", "-o", "subformat=fixed", "f.vhdx", "64M"][..],
+            &["-f", "vhdx", "--subformat", "fixed", "f.vhdx", "64M"][..],
+        ] {
+            let args = resolve(argv).unwrap();
+            assert!(is_vhdx_fixed_create(&args), "{:?}", argv);
+            assert_eq!(args.block_state_zero, None, "{:?}", argv);
+        }
+        for argv in [
+            &["-f", "vhdx", "f.vhdx", "64M"][..],
+            &["-f", "vhdx", "--subformat", "dynamic", "f.vhdx", "64M"][..],
+            &["-f", "vhdx", "-o", "subformat=dynamic", "f.vhdx", "64M"][..],
+            // A fixed vpc is not a fixed vhdx.
+            &["-f", "vpc", "--subformat", "fixed", "f.vhd", "64M"][..],
+        ] {
+            let args = resolve(argv).unwrap();
+            assert!(!is_vhdx_fixed_create(&args), "{:?}", argv);
+        }
+        let args = resolve(&[
+            "-f",
+            "vhdx",
+            "-o",
+            "subformat=fixed,block_state_zero=off",
+            "f.vhdx",
+            "64M",
+        ])
+        .unwrap();
+        assert_eq!(args.block_state_zero, Some(false));
+    }
+
+    #[test]
+    fn vhdx_refuses_a_subformat_of_another_format() {
+        let err = resolve(&[
+            "-f",
+            "vhdx",
+            "--subformat",
+            "monolithicSparse",
+            "f.vhdx",
+            "64M",
+        ])
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "create: --subformat 'monolithicSparse' is not valid for vhdx (expected dynamic or fixed)"
+        );
+        let err = resolve(&["-f", "qcow2", "--subformat", "fixed", "f.qcow2", "64M"]).unwrap_err();
+        assert_eq!(
+            err,
+            "create: --subformat is only valid with -f vmdk, -f vpc or -f vhdx (got -f qcow2)"
+        );
+    }
+
+    #[test]
+    fn vhdx_fixed_refuses_a_backing_file() {
+        for argv in [
+            &[
+                "-f",
+                "vhdx",
+                "-o",
+                "subformat=fixed",
+                "-b",
+                "b.vhdx",
+                "-F",
+                "vhdx",
+                "f.vhdx",
+                "64M",
+            ][..],
+            // With no size, the backing refusal comes first.
+            &[
+                "-f",
+                "vhdx",
+                "--subformat",
+                "fixed",
+                "-b",
+                "b.vhdx",
+                "-u",
+                "f.vhdx",
+            ][..],
+            &[
+                "-f",
+                "vhdx",
+                "-o",
+                "subformat=fixed,backing_file=b.vhdx,backing_fmt=vhdx",
+                "f.vhdx",
+                "64M",
+            ][..],
+        ] {
+            assert_eq!(
+                resolve(argv).unwrap_err(),
+                VHDX_FIXED_BACKING_REFUSAL,
+                "{:?}",
+                argv
+            );
+        }
+        // A dynamic differencing VHDX is still accepted.
+        resolve(&["-f", "vhdx", "-b", "b.vhdx", "-F", "vhdx", "f.vhdx"]).unwrap();
+    }
+
+    #[test]
+    fn vhdx_fixed_metadata_preallocation_is_refused() {
+        for argv in [
+            &[
+                "-f",
+                "vhdx",
+                "-o",
+                "subformat=fixed,preallocation=metadata",
+                "f.vhdx",
+                "64M",
+            ][..],
+            &[
+                "-f",
+                "vhdx",
+                "--subformat",
+                "fixed",
+                "--preallocation",
+                "metadata",
+                "f.vhdx",
+                "64M",
+            ][..],
+        ] {
+            assert_eq!(
+                resolve(argv).unwrap_err(),
+                "create: preallocation=metadata is not supported for vhdx",
+                "{:?}",
+                argv
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_vhdx_geometry_is_the_layout_the_guest_plans_from() {
+        let fixed = resolve(&[
+            "-f",
+            "vhdx",
+            "-o",
+            "subformat=fixed,block_size=1M",
+            "f.vhdx",
+            "64M",
+        ])
+        .unwrap();
+        let mib = 1024 * 1024;
+        let geometry = fixed_vhdx_geometry(&fixed, 64 * mib, mib as u32).unwrap();
+        assert_eq!(geometry, vhdx::layout(64 * mib, mib as u32, false).unwrap());
+        // A 1 MiB BAT region at 2 MiB, metadata at 3 MiB, data at 8 MiB.
+        assert_eq!(geometry.fixed_file_length, 72 * mib);
+        // The size is rounded to 512 bytes, as the image records it.
+        let geometry = fixed_vhdx_geometry(&fixed, 64 * mib + 1, 0).unwrap();
+        assert_eq!(geometry.virtual_size, 64 * mib + 512);
+        assert_eq!(
+            geometry.fixed_file_length,
+            geometry.fixed_data_start + 64 * mib + 512
+        );
+        // A block size the layout refuses leaves the guest to refuse it.
+        assert!(fixed_vhdx_geometry(&fixed, 64 * mib, 512 * 1024).is_none());
+        let dynamic = resolve(&["-f", "vhdx", "f.vhdx", "64M"]).unwrap();
+        assert!(fixed_vhdx_geometry(&dynamic, 64 * mib, 0).is_none());
+    }
+
+    #[test]
+    fn fixed_vhdx_output_is_opened_at_its_full_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.vhdx");
+        std::fs::write(&path, b"old contents").unwrap();
+        let geometry = vhdx::layout(64 * 1024 * 1024, 0, false).unwrap();
+        let backing = open_fixed_vhdx_output(&path, "f.vhdx", &geometry).unwrap();
+        assert_eq!(backing.size(), geometry.fixed_file_length);
+        assert!(!backing.is_sparse());
+        drop(backing);
+        let metadata = std::fs::metadata(&path).unwrap();
+        assert_eq!(metadata.len(), geometry.fixed_file_length);
+        // Truncated and then extended: the old bytes are gone, and what
+        // is there reads as zeros.
+        let mut head = [0xffu8; 12];
+        std::io::Read::read_exact(&mut std::fs::File::open(&path).unwrap(), &mut head).unwrap();
+        assert_eq!(head, [0u8; 12]);
+    }
+
+    #[test]
+    fn fixed_vhdx_open_error_names_a_file_too_large_for_the_filesystem() {
+        let geometry = vhdx::layout(16 << 40, 0, false).unwrap();
+        let efbig = std::io::Error::from_raw_os_error(libc::EFBIG);
+        let message = fixed_vhdx_open_error(&efbig, "big.vhdx", &geometry);
+        assert_eq!(
+            message,
+            format!(
+                "create: a fixed VHDX of {} bytes needs a {}-byte file, which the filesystem \
+                 holding 'big.vhdx' cannot store: {}",
+                16u64 << 40,
+                geometry.fixed_file_length,
+                efbig
+            )
+        );
+        let eacces = std::io::Error::from_raw_os_error(libc::EACCES);
+        assert_eq!(
+            fixed_vhdx_open_error(&eacces, "big.vhdx", &geometry),
+            format!("create: open 'big.vhdx' for write failed: {}", eacces)
         );
     }
 
