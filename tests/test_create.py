@@ -13,6 +13,8 @@ These tests require /dev/kvm access for the non-raw paths.
 """
 
 import copy
+import decimal
+import errno
 import json
 import os
 import resource
@@ -23,10 +25,11 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from base import InstarTestBase
+from base import QEMU_TOOL_TIMEOUT, InstarTestBase
 from helpers import qemu_pins
 from helpers import vhdx_structure
 from helpers.info_json import assert_info_equivalent
+from test_vhdx_fixed_fixtures import PARTIAL_PAST_FIRST_CHUNK, RUNTIME_CREATE_IMAGES
 
 # ----------------------------------------------------------------------
 # Differencing identity readers
@@ -1493,10 +1496,9 @@ class TestCreateBackingChain(InstarTestBase):
 
 # Preallocation pin cases instar cannot create yet, each with the reason and
 # the message it fails with. A case that starts to work fails its test, which
-# says to remove the entry; a case that fails differently fails it too.
-KNOWN_PREALLOCATION_REFUSALS = {
-    'prealloc-vhdx-fixed': ('fixed VHDX is not written yet', 'subformat=fixed is not yet supported'),
-}
+# says to remove the entry; a case that fails differently fails it too. Empty
+# while instar creates every case, and kept so the next refusal has a place.
+KNOWN_PREALLOCATION_REFUSALS = {}
 
 
 def known_refusal_problem(case_name, reason, message, run):
@@ -1668,6 +1670,10 @@ class TestCreatePreallocation(InstarTestBase):
     def test_vhdx_noop_preallocation(self):
         """`-f vhdx` accepts falloc and full and writes what `off` writes, as qemu does."""
         self._assert_noop_preallocation('prealloc-vhdx')
+
+    def test_vhdx_fixed_noop_preallocation(self):
+        """`-f vhdx -o subformat=fixed` accepts falloc and full and writes what `off` writes."""
+        self._assert_noop_preallocation('prealloc-vhdx-fixed')
 
     def test_vmdk_monolithic_flat_noop_preallocation(self):
         """A monolithicFlat extent is the same sparse file under off, falloc and full, as qemu writes it."""
@@ -1899,6 +1905,288 @@ class TestCreateVhdxDefaultBlockSize(_DynamicPinComparison, InstarTestBase):
                 self.assertNotEqual(size, want['virtual_disk_size'])
                 want['virtual_disk_size'] = size
                 self.assert_matches_qemu(summary, want, case, f'instar at {size}')
+
+
+# The fixed VHDX refusal pin cases, and the message instar refuses each with. qemu-img refuses both too, in its own
+# words: it creates no VHDX with a backing file (bdrv_img_create, qemu 7.0.0 block.c), and metadata preallocation is
+# refused by the file protocol under the image (handle_aiocb_truncate, qemu 7.0.0 block/file-posix.c).
+VHDX_FIXED_PIN_REFUSALS = {
+    'vhdx-fixed-backing': 'create: vhdx subformat=fixed cannot have a backing file',
+    'vhdx-fixed-prealloc-metadata': 'create: preallocation=metadata is not supported for vhdx',
+}
+
+# Every fixed VHDX the pin holds an image of, in the pin's own order.
+VHDX_FIXED_PIN_CASES = tuple(
+    case['name'] for case in qemu_pins.CASES
+    if case['kind'] == qemu_pins.KIND_VHDX_CREATE and case['name'].startswith('vhdx-fixed-')
+    and case['name'] not in VHDX_FIXED_PIN_REFUSALS)
+
+# The one fixed pin case that is not small: a 128 GiB sparse file, which the qemu-img checks below would read whole.
+VHDX_FIXED_LARGE_PIN_CASE = 'vhdx-fixed-131041M-block-1M-bsz-off'
+
+
+class TestCreateVhdxFixedPinLayout(InstarTestBase):
+    """instar's fixed VHDX has the structure every pinned qemu-img writes, field for field.
+
+    Unlike the dynamic comparison, nothing is put aside: the file length, every BAT run, LeaveBlocksAllocated and both
+    region tables must equal qemu's at every pinned version. Every image is sparse; the largest is the 128 GiB pin
+    case, of which a few MiB is allocated.
+    """
+
+    run_instar_create = TestCreateSmoke.run_instar_create
+
+    def _create_case(self, case_name, workdir):
+        """Create pin case `case_name` with instar in `workdir`, and return the image's path."""
+        case = qemu_pins.CASES_BY_NAME[case_name]
+        path = Path(workdir) / 'image.vhdx'
+        _, stderr, rc = self.run_instar_create(*case['args'], str(path), case['size'])
+        self.assertEqual(0, rc, f'{case_name}: {stderr}')
+        return path
+
+    def test_pin_covers_every_fixed_case(self):
+        """The ten small fixed cases and the 128 GiB one, so a pin edit cannot quietly shrink what is compared."""
+        self.assertEqual(11, len(VHDX_FIXED_PIN_CASES), VHDX_FIXED_PIN_CASES)
+        self.assertIn(VHDX_FIXED_LARGE_PIN_CASE, VHDX_FIXED_PIN_CASES)
+
+    def test_pin_cases(self):
+        """Each fixed pin case, created by instar, equals qemu-img's structure at every pinned version."""
+        for case in VHDX_FIXED_PIN_CASES:
+            with self.subTest(case=case):
+                with tempfile.TemporaryDirectory() as td:
+                    got = qemu_pins.run_case(self.get_instar_binary(), case, Path(td))
+                self.assertEqual(0, got['rc'], got['stderr'])
+                self.assertNotIn('parse_error', got['summary'])
+                # run_case checks the image with the binary it created it with, here instar.
+                self.assertEqual(0, got['check_rc'], f'instar check of {case}')
+                self.assertTrue(got['summary']['leave_blocks_allocated'], case)
+                for group in qemu_pins.load_pin()['cases'][case]:
+                    label = f'qemu-img {group["versions"][0]} to {group["versions"][-1]}'
+                    self.assertEqual([], vhdx_structure.structural_diff(got['summary'], group['result']['summary']),
+                                     f'{case} against {label}')
+
+    def test_small_cases_check_clean_and_read_as_zeros_with_qemu_img(self):
+        """qemu-img checks each small fixed image clean, and reads it as identical to a raw image of zeros."""
+        self._require_qemu_img()
+        for case in VHDX_FIXED_PIN_CASES:
+            if case == VHDX_FIXED_LARGE_PIN_CASE:
+                continue
+            with self.subTest(case=case):
+                with tempfile.TemporaryDirectory() as td:
+                    path = self._create_case(case, td)
+                    r = subprocess.run(['qemu-img', 'check', '-f', 'vhdx', str(path)], capture_output=True,
+                                       text=True, timeout=60)
+                    self.assertEqual(0, r.returncode, r.stdout + r.stderr)
+                    zeros = Path(td) / 'zeros.raw'
+                    with open(zeros, 'wb') as f:
+                        f.truncate(vhdx_structure.parse_vhdx(path).virtual_disk_size)
+                    r = subprocess.run(['qemu-img', 'compare', '-f', 'vhdx', '-F', 'raw', str(path), str(zeros)],
+                                       capture_output=True, text=True, timeout=120)
+                    self.assertEqual(0, r.returncode, r.stdout + r.stderr)
+                    self.assertIn('Images are identical', r.stdout)
+
+    def test_refusals(self):
+        """A backing file and metadata preallocation are refused with instar's messages, and leave no file."""
+        for case_name, message in VHDX_FIXED_PIN_REFUSALS.items():
+            with self.subTest(case=case_name):
+                for group in qemu_pins.load_pin()['cases'][case_name]:
+                    self.assertNotEqual(0, group['result']['rc'], f'qemu-img {group["versions"]} accepts {case_name}')
+                case = qemu_pins.CASES_BY_NAME[case_name]
+                with tempfile.TemporaryDirectory() as td:
+                    base = Path(td) / 'base.vhdx'
+                    _, stderr, rc = self.run_instar_create('-f', 'vhdx', str(base), '64M')
+                    self.assertEqual(0, rc, stderr)
+                    args = [str(base) if arg == '{base}' else arg for arg in case['args']]
+                    path = Path(td) / 'image.vhdx'
+                    _, stderr, rc = self.run_instar_create(*args, str(path), case['size'])
+                    self.assertEqual(1, rc, stderr)
+                    self.assertIn(message, stderr)
+                    self.assertFalse(path.exists(), f'{case_name} left an image behind')
+
+    def test_spellings_write_identical_bytes(self):
+        """`--subformat fixed` is `-o subformat=fixed`, and an explicit qemu default is the default.
+
+        instar's VHDX GUIDs are constant (#566), so two images of the same request are byte for byte equal. On a
+        dynamic image `block_state_zero=off` is accepted and changes nothing, because a dynamic BAT is NOT_PRESENT
+        whatever it says; pinned here so that a change to that is deliberate.
+        """
+        pairs = (
+            ('vhdx-fixed-16M', ('-o', 'subformat=fixed'), ('--subformat', 'fixed')),
+            ('vhdx-fixed-16M', ('-o', 'subformat=fixed'), ('-o', 'subformat=fixed,block_state_zero=on')),
+            ('vhdx-fixed-16M-bsz-off', ('-o', 'subformat=fixed,block_state_zero=off'),
+             ('--subformat', 'fixed', '-o', 'block_state_zero=off')),
+            ('vhdx-dynamic-64M', (), ('-o', 'block_state_zero=off')),
+            ('vhdx-dynamic-64M', (), ('--subformat', 'dynamic', '-o', 'block_state_zero=on')),
+        )
+        for case_name, first, second in pairs:
+            with self.subTest(first=first, second=second):
+                size = qemu_pins.CASES_BY_NAME[case_name]['size']
+                images = []
+                with tempfile.TemporaryDirectory() as td:
+                    for index, spelling in enumerate((first, second)):
+                        path = Path(td) / f'{index}.vhdx'
+                        _, stderr, rc = self.run_instar_create('-f', 'vhdx', *spelling, str(path), size)
+                        self.assertEqual(0, rc, stderr)
+                        images.append(path.read_bytes())
+                self.assertEqual(images[0], images[1])
+
+    def test_block_state_zero_takes_only_a_boolean(self):
+        """`-o block_state_zero=bogus` is refused for both subformats, as qemu-img refuses it, and leaves no file."""
+        for options in ('block_state_zero=bogus', 'subformat=fixed,block_state_zero=bogus'):
+            with self.subTest(options=options):
+                with tempfile.TemporaryDirectory() as td:
+                    path = Path(td) / 'image.vhdx'
+                    _, stderr, rc = self.run_instar_create('-f', 'vhdx', '-o', options, str(path), '16M')
+                    self.assertEqual(1, rc, stderr)
+                    self.assertIn("bad value 'bogus' for -o key 'block_state_zero'", stderr)
+                    self.assertFalse(path.exists())
+
+
+TiB = 1 << 40
+
+# The fixed VHDX sizes compared with the host qemu-img rather than with the pin: 2 TiB at 1 MiB blocks, in both
+# block_state_zero modes. Each is a sparse file of a little over 2 TiB, of which some 17 MiB is allocated.
+VHDX_FIXED_2_TIB_OPTIONS = ('subformat=fixed,block_size=1M', 'subformat=fixed,block_size=1M,block_state_zero=off')
+
+# A fixed VHDX that ext4, whose largest file is 16 TiB less 4 KiB, cannot hold. At 16 TiB qemu's default block size is
+# 32 MiB (vhdx_co_create, qemu 7.0.0 block/vhdx.c), so the BAT holds 524288 payload and 4096 sector bitmap entries, a
+# 5 MiB region at 2 MiB. vhdx_create_bat puts the data start 5 MiB past the end of the BAT region, at 12 MiB, and
+# truncates a fixed image to the data start plus the virtual size. A dynamic 16 TiB image from the host qemu-img
+# 10.0.13, truncated to the data start alone, is 12582912 bytes long (measured).
+VHDX_FIXED_TOO_LARGE_FOR_EXT4 = 16 * TiB
+VHDX_FIXED_TOO_LARGE_FOR_EXT4_FILE_LENGTH = VHDX_FIXED_TOO_LARGE_FOR_EXT4 + 12 * 1024 * 1024
+
+# How instar refuses a fixed VHDX whose file the filesystem cannot store, up to the OS error that follows it.
+VHDX_FIXED_FILE_TOO_LARGE_MESSAGE = ("create: a fixed VHDX of {size} bytes needs a {length}-byte file, which the "
+                                     "filesystem holding '{path}' cannot store: ")
+
+# The suffixes a qemu-img size may carry, as powers of 1024.
+QEMU_SIZE_SUFFIXES = {'': 1, 'K': 1 << 10, 'M': 1 << 20, 'G': 1 << 30, 'T': 1 << 40}
+
+
+def qemu_size_in_bytes(size):
+    """A qemu-img size such as `4608.5M`, in bytes.
+
+    qemu-img takes a fraction before the suffix (do_strtosz, qemu 7.0.0 util/cutils.c), and instar's create does not,
+    so a size spelt for qemu-img is given to instar as a byte count.
+    """
+    suffix = size[-1].upper() if size[-1].isalpha() else ''
+    number = size[:-1] if suffix else size
+    return int(decimal.Decimal(number) * QEMU_SIZE_SUFFIXES[suffix])
+
+
+class TestCreateVhdxFixedLarge(InstarTestBase):
+    """Fixed VHDX at sizes the pin does not hold: compared with the host qemu-img, and against the filesystem.
+
+    The pin holds every pinned qemu-img's structure only up to 128 GiB. Above that, and at the size qemu-img creates
+    but cannot open again, instar's structure is compared with the host qemu-img's, whole and with nothing put aside.
+    One build is enough here, because for every fixed pin case all the pinned builds write the same structure. Every
+    image is sparse: no test allocates a data region.
+    """
+
+    def run_instar_create(self, *args, preexec_fn=None, timeout=QEMU_TOOL_TIMEOUT):
+        cmd = [str(self.get_instar_binary()), 'create', *[str(a) for a in args]]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, preexec_fn=preexec_fn)
+        return r.stdout, r.stderr, r.returncode
+
+    def _create_both(self, workdir, options, size):
+        """Create the same fixed VHDX with instar and with the host qemu-img; return their paths."""
+        ours = Path(workdir) / 'instar.vhdx'
+        _, stderr, rc = self.run_instar_create('-f', 'vhdx', '-o', options, ours, qemu_size_in_bytes(size))
+        self.assertEqual(0, rc, f'instar create -o {options} {size}: {stderr}')
+        theirs = Path(workdir) / 'qemu.vhdx'
+        self._run_tool(['qemu-img', 'create', '-q', '-f', 'vhdx', '-o', options, str(theirs), size], workdir)
+        return ours, theirs
+
+    def _assert_same_structure(self, ours, theirs, label):
+        differences = vhdx_structure.structural_diff(vhdx_structure.parse_vhdx(ours),
+                                                     vhdx_structure.parse_vhdx(theirs))
+        self.assertEqual([], differences, f'{label}: instar != qemu-img:\n' + '\n'.join(differences))
+
+    def _assert_instar_checks_clean(self, path, label):
+        stdout, stderr, rc = self.run_instar_check(path, timeout=QEMU_TOOL_TIMEOUT)
+        self.assertEqual(0, rc, f'instar check of {label}: {stdout}{stderr}')
+
+    def test_2_tib_matches_qemu_img(self):
+        """At 2 TiB with 1 MiB blocks, both modes have qemu-img's structure, and both tools check them clean."""
+        self._require_qemu_img()
+        self.skip_unless_qemu_supports('vhdx')
+        for options in VHDX_FIXED_2_TIB_OPTIONS:
+            with self.subTest(options=options):
+                with tempfile.TemporaryDirectory() as td:
+                    ours, theirs = self._create_both(td, options, '2T')
+                    self.assertEqual(2 * TiB, vhdx_structure.parse_vhdx(ours).virtual_disk_size)
+                    self._assert_same_structure(ours, theirs, f'-o {options} 2T')
+                    self._assert_instar_checks_clean(ours, f'-o {options} 2T')
+                    r = subprocess.run(['qemu-img', 'check', '-f', 'vhdx', str(ours)], capture_output=True,
+                                       text=True, timeout=QEMU_TOOL_TIMEOUT)
+                    self.assertEqual(0, r.returncode, f'qemu-img check of -o {options} 2T: {r.stdout}{r.stderr}')
+
+    def test_partial_last_block_past_the_first_chunk_matches_qemu_img(self):
+        """The size qemu-img creates but cannot open has qemu-img's structure, and instar checks it clean.
+
+        Its last payload block is partial, FULLY_PRESENT and past the first chunk, so qemu's open-time BAT check
+        demands a whole block the file does not hold ("VHDX partial last block past the first chunk" in
+        docs/quirks.md). instar writes the same file, so qemu-img cannot open instar's either, and neither
+        `qemu-img check` nor `info` can be an oracle for it; the structure is compared instead.
+        """
+        self._require_qemu_img()
+        self.skip_unless_qemu_supports('vhdx')
+        options, size = RUNTIME_CREATE_IMAGES[PARTIAL_PAST_FIRST_CHUNK]
+        with tempfile.TemporaryDirectory() as td:
+            ours, theirs = self._create_both(td, options, size)
+            self._assert_same_structure(ours, theirs, PARTIAL_PAST_FIRST_CHUNK)
+            self._assert_instar_checks_clean(ours, PARTIAL_PAST_FIRST_CHUNK)
+
+    def test_file_too_large_for_the_filesystem_is_refused(self):
+        """16 TiB is refused, naming the file length the filesystem cannot store, and leaves no file.
+
+        Only a filesystem with a file-size ceiling below the fixed file length can refuse it, ext4 among them. The
+        test first asks the directory's filesystem for a sparse file of that length, and skips if it is given one.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            probe = Path(td) / 'probe'
+            try:
+                with open(probe, 'wb') as f:
+                    f.truncate(VHDX_FIXED_TOO_LARGE_FOR_EXT4_FILE_LENGTH)
+            except OSError as e:
+                if e.errno != errno.EFBIG:
+                    raise
+            else:
+                self.skipTest(f'the filesystem holding {td} stores a sparse file of '
+                              f'{VHDX_FIXED_TOO_LARGE_FOR_EXT4_FILE_LENGTH} bytes, so it has no ceiling to refuse')
+            finally:
+                probe.unlink(missing_ok=True)
+
+            path = Path(td) / 'big.vhdx'
+            _, stderr, rc = self.run_instar_create('-f', 'vhdx', '-o', 'subformat=fixed', path,
+                                                   VHDX_FIXED_TOO_LARGE_FOR_EXT4)
+            self.assertEqual(1, rc, stderr)
+            self.assertIn(VHDX_FIXED_FILE_TOO_LARGE_MESSAGE.format(
+                size=VHDX_FIXED_TOO_LARGE_FOR_EXT4, length=VHDX_FIXED_TOO_LARGE_FOR_EXT4_FILE_LENGTH, path=path)
+                + os.strerror(errno.EFBIG), stderr)
+            self.assertEqual([], os.listdir(td), 'a refused create left a file behind')
+
+    def test_file_size_limit_is_refused_like_a_filesystem_ceiling(self):
+        """A process file-size limit fails the same way as a filesystem ceiling, so the refusal is seen everywhere.
+
+        Extending a file past RLIMIT_FSIZE fails with EFBIG, as extending it past ext4's ceiling does, on any
+        filesystem. The file length is the pin's, so it is qemu-img's length for the image that was refused.
+        """
+        def limit_file_size():
+            # The signal that comes with EFBIG is ignored, so the error is seen.
+            signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+            resource.setrlimit(resource.RLIMIT_FSIZE, (1024 * 1024, 1024 * 1024))
+
+        want = qemu_pins.expected('vhdx-fixed-16M')['summary']
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'limited.vhdx'
+            _, stderr, rc = self.run_instar_create('-f', 'vhdx', '-o', 'subformat=fixed', path, '16M',
+                                                   preexec_fn=limit_file_size)
+            self.assertEqual(1, rc, stderr)
+            self.assertIn(VHDX_FIXED_FILE_TOO_LARGE_MESSAGE.format(
+                size=want['virtual_disk_size'], length=want['file_length'], path=path) + os.strerror(errno.EFBIG),
+                stderr)
+            self.assertEqual([], os.listdir(td), 'a refused create left a file behind')
 
 
 # The largest VHDX qemu-img creates (VHDX_MAX_IMAGE_SIZE, refused with a strict `>` in vhdx_co_create, qemu 7.0.0

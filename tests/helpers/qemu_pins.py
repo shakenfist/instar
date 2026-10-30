@@ -283,6 +283,12 @@ def _create(qemu_img, case: dict, image: Path, workdir: Path) -> subprocess.Comp
 
 
 def _check_rc(qemu_img, fmt: str, image: Path, workdir: Path) -> int:
+    # A test can run a case with instar in place of qemu-img. instar's check
+    # detects the format itself and has no -f, which it refuses as an unknown
+    # argument (exit 2), so it is not given one; qemu-img is told the format
+    # so that it never probes.
+    if Path(qemu_img).name == 'instar':
+        return _run([qemu_img, 'check', image], workdir).returncode
     return _run([qemu_img, 'check', '-f', fmt, image], workdir).returncode
 
 

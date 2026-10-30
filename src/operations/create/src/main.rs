@@ -7,6 +7,11 @@
 //! `MetadataPlan`, then writes every plan entry to the output device.
 //! Emits a `CreateResult` at completion describing what was written.
 //!
+//! A fixed VHDX's BAT is not in the plan, because it can be far larger
+//! than the guest's scratch: the guest streams it one buffer at a time
+//! before the plan's writes, into a file the host has already extended
+//! to the image's full length.
+//!
 //! Preallocation is split with the host: for qcow2 with a non-off
 //! mode the guest also emits the L2 tables and extends the file to
 //! its post-preallocation size, but leaves the data region sparse;
@@ -39,15 +44,17 @@ use shared::{
 
 use create::{
     footer_fallback_applies, parent_format_matches, plan_qcow2, plan_vhd, plan_vhdx, plan_vmdk,
-    BackingRef, CreateError, MetadataPlan, Qcow2CreateOpts, VhdCreateOpts, VhdSubformat,
-    VhdxCreateOpts, VhdxPlan, VhdxSubformat, VmdkCreateOpts, VmdkSubformat,
+    BackingRef, CreateError, FixedVhdxPlan, MetadataPlan, Qcow2CreateOpts, VhdCreateOpts,
+    VhdSubformat, VhdxCreateOpts, VhdxPlan, VhdxSubformat, VmdkCreateOpts, VmdkSubformat,
 };
 
 // ---------------------------------------------------------------------------
 // Scratch layout
 // ---------------------------------------------------------------------------
 
-/// First MAX_SECTOR_SIZE bytes: backing-file header probe buffer.
+/// First MAX_SECTOR_SIZE bytes: backing-file header probe buffer, and
+/// the slot a fixed VHDX's BAT is streamed through. A fixed VHDX has no
+/// backing file, so the two uses never meet.
 const HEADER_BUF: usize = SCRATCH_MEM_BASE;
 /// Create planner scratch region (GUEST_CREATE_SCRATCH_LIMIT bytes,
 /// starting one sector after the header probe).
@@ -544,7 +551,8 @@ fn vhd_opts_from<'a>(
 ///
 /// As [`vhd_opts_from`]: a backing file whose identity is not a VHDX
 /// one is [`CreateResult::ERROR_PARENT_FORMAT_MISMATCH`] rather than a
-/// silent zero `parent_linkage`.
+/// silent zero `parent_linkage`. A `vhd_subformat` other than 0
+/// (dynamic) or 1 (fixed) is [`CreateResult::ERROR_INVALID_OPTION`].
 fn vhdx_opts_from<'a>(
     config: &CreateConfig,
     virtual_size: u64,
@@ -563,6 +571,15 @@ fn vhdx_opts_from<'a>(
         (_, false) => [0u8; 16],
         (_, true) => return Err(CreateResult::ERROR_PARENT_FORMAT_MISMATCH),
     };
+    // Refused rather than defaulted, unlike `vhd_opts_from`: the two
+    // subformats' files differ in length by the whole virtual size, and
+    // the host sized the output device for the one it asked for, so a
+    // value this op does not know is not one to guess at.
+    let subformat = match config.vhd_subformat {
+        0 => VhdxSubformat::Dynamic,
+        1 => VhdxSubformat::Fixed,
+        _ => return Err(CreateResult::ERROR_INVALID_OPTION),
+    };
     Ok(VhdxCreateOpts {
         virtual_size,
         // 0 when the user gave no block size, which asks the layout for
@@ -571,11 +588,10 @@ fn vhdx_opts_from<'a>(
         // passes the same value to the same layout, so the two cannot
         // disagree about the geometry.
         block_size: config.block_size,
-        // The host refuses `subformat=fixed` for vhdx, so this op only
-        // ever writes a dynamic image. `block_state_zero` is read only
-        // for a fixed one; true is qemu-img's default.
-        subformat: VhdxSubformat::Dynamic,
-        block_state_zero: true,
+        subformat,
+        // qemu-img's default is on, which the host asks for by leaving
+        // the flag clear. Only a fixed image reads it.
+        block_state_zero: config.flags & CreateConfig::FLAG_VHDX_FULLY_PRESENT == 0,
         backing,
         parent_data_write_guid,
     })
@@ -1012,6 +1028,8 @@ pub unsafe extern "C" fn _start() -> u64 {
     // The size the image records, reported back to the host. Only VHDX
     // records a different size from the one asked for.
     let mut recorded_virtual_size = virtual_size;
+    // A fixed VHDX's BAT and file length, which are not metadata writes.
+    let mut fixed_vhdx: Option<FixedVhdxPlan> = None;
     let (plan, resolved_unit_size) = match target {
         ImageFormat::Qcow2 => {
             let opts = qcow2_opts_from(config, virtual_size, backing_ref);
@@ -1062,9 +1080,10 @@ pub unsafe extern "C" fn _start() -> u64 {
                 Err(code) => return fail_with(call_table, config.target_format, code),
             };
             match plan_vhdx(&opts, scratch) {
-                // A dynamic plan is its metadata writes alone; `fixed`
-                // is `None` for the subformat requested above.
-                Ok(VhdxPlan { metadata: p, .. }) => {
+                // A dynamic plan is its metadata writes alone, and its
+                // `fixed` is `None`. A fixed one's BAT is streamed below.
+                Ok(VhdxPlan { metadata: p, fixed }) => {
+                    fixed_vhdx = fixed;
                     // plan_vhdx records the size rounded up to 512 bytes,
                     // as qemu-img does, because VirtualDiskSize must be a
                     // multiple of the logical sector size, and the block
@@ -1092,9 +1111,30 @@ pub unsafe extern "C" fn _start() -> u64 {
         }
     };
 
-    let file_size_after = plan.minimum_file_size;
-    let mut bytes_written = match write_plan(call_table, &plan) {
-        Some(n) => n,
+    let mut file_size_after = plan.minimum_file_size;
+    let mut bytes_written: u64 = 0;
+
+    // A fixed VHDX's BAT goes before the metadata writes, so that a
+    // create stopped part way (a host that is killed sees no failure to
+    // clean up after) never leaves headers and a region table describing
+    // a BAT that is only partly written. The file is already its full
+    // length: the host extended it before this op started.
+    if let Some(fixed) = fixed_vhdx.as_ref() {
+        match emit_vhdx_fixed_bat(call_table, fixed) {
+            Some(n) => bytes_written = n,
+            None => {
+                return fail_with(
+                    call_table,
+                    config.target_format,
+                    CreateResult::ERROR_WRITE_FAILED,
+                )
+            }
+        }
+        file_size_after = fixed.file_length;
+    }
+
+    match write_plan(call_table, &plan) {
+        Some(n) => bytes_written = bytes_written.saturating_add(n),
         None => {
             return fail_with(
                 call_table,
@@ -1102,7 +1142,7 @@ pub unsafe extern "C" fn _start() -> u64 {
                 CreateResult::ERROR_WRITE_FAILED,
             )
         }
-    };
+    }
 
     // qcow2 + non-Off preallocation: L2 tables are NOT in the
     // MetadataPlan because they can sum to more than the guest's
@@ -1228,6 +1268,69 @@ unsafe fn emit_qcow2_l2_and_extend(
     }
 
     Some(bytes_written)
+}
+
+/// Stream a fixed VHDX's BAT to the output device, one `HEADER_BUF` slot
+/// of entries at a time, and return the bytes written, or `None` if
+/// anything fails.
+///
+/// The BAT is not among the plan's metadata writes because nothing the
+/// guest holds can contain it: at 64 TiB with 1 MiB blocks it is 513 MiB.
+/// Each slot is filled by `vhdx::fill_fixed_bat` from the plan's own
+/// layout, the one the region table was built from, so the BAT written
+/// and the BAT declared cannot differ. `HEADER_BUF` is free for this
+/// because it only ever holds a backing image's header, and a fixed VHDX
+/// has no backing image (the planner refuses one).
+///
+/// Only the entries are written: `bat_bytes` rounded up to a whole
+/// sector. The filler writes the padding entries in that last sector as
+/// zero, and the rest of the BAT region stays a hole in the file. A hole
+/// reads as zero entries, which is what qemu-img writes there: it writes
+/// the whole region from a zeroed buffer (`vhdx_create_bat`,
+/// `block/vhdx.c`, qemu 7.0.0).
+///
+/// Before anything is written the device must be at least the plan's
+/// file length. The host sizes it from the same layout; a device shorter
+/// than that is a host that disagrees about the image, and writing to it
+/// would leave a file shorter than the BAT says it is.
+///
+/// `#[inline(never)]` for the reason `run_amend` gives: a large function
+/// inlined into `_start` has miscompiled before on `x86_64-unknown-none`.
+///
+/// # Safety
+///
+/// `call_table` must be valid and the output device attached. Nothing
+/// else may be using `HEADER_BUF`.
+#[inline(never)]
+unsafe fn emit_vhdx_fixed_bat(call_table: &CallTable, fixed: &FixedVhdxPlan) -> Option<u64> {
+    let sector_size = (call_table.get_output_sector_size)();
+    let output_capacity = (call_table.get_output_capacity)();
+    let sector = sector_size as u64;
+    if sector == 0 || MAX_SECTOR_SIZE % sector_size != 0 {
+        return None;
+    }
+    let device_bytes = output_capacity.checked_mul(sector)?;
+    if device_bytes < fixed.file_length {
+        return None;
+    }
+
+    // Whole sectors of entries: the slot is a whole number of sectors
+    // because the sector size divides MAX_SECTOR_SIZE (checked above).
+    let total = fixed.bat_bytes.checked_next_multiple_of(sector)?;
+    let slot = core::slice::from_raw_parts_mut(HEADER_BUF as *mut u8, MAX_SECTOR_SIZE);
+    let mut written: u64 = 0;
+    while written < total {
+        let len = (total - written).min(MAX_SECTOR_SIZE as u64) as usize;
+        let buf = &mut slot[..len];
+        let first_entry = written / 8;
+        vhdx::fill_fixed_bat(&fixed.layout, fixed.state, first_entry, buf).ok()?;
+        let byte_offset = fixed.layout.bat_offset.checked_add(written)?;
+        if !write_sector_aligned(call_table, byte_offset, buf, sector_size, output_capacity)? {
+            return None;
+        }
+        written = written.checked_add(len as u64)?;
+    }
+    Some(written)
 }
 
 /// Write `bytes` (a multiple of `sector_size` long, starting at a

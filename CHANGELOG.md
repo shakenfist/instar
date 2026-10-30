@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`instar create -f vhdx -o subformat=fixed` creates a fixed VHDX.**
+  The image has qemu-img's structure field for field: the
+  `LeaveBlocksAllocated` file parameter, a BAT entry for every payload
+  block (`PAYLOAD_BLOCK_ZERO`, or `PAYLOAD_BLOCK_FULLY_PRESENT` at
+  sequential offsets with `block_state_zero=off`), and a sparse file of
+  the data start plus the virtual size. A backing file is refused, as is
+  a size the filesystem cannot hold, with no file left behind.
+  `block_state_zero` is parsed for a dynamic image and changes nothing.
+  See the vhdx section of `docs/create.md`.
+
 - **Releases go through the merge queue and are gated on CI.** A
   release is now two steps: `tools/propose-release.sh` (or
   `make propose-release VERSION=x.y.z`) opens a release pull request
