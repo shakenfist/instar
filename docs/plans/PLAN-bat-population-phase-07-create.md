@@ -603,6 +603,30 @@ Every brief also carries the session's standing rules:
   is the guest's one-sector-per-request stream, as the survey predicted,
   and it scales with the BAT. The 15 TiB images were sparse (124 MiB
   allocated) and removed after each run.
+* **7c.** As decision 10 lists. The management session ran the two
+  documented refusal examples (backing file and `metadata`), which print
+  exactly what `docs/create.md` shows, and rewrapped one line of the
+  quirks paragraph.
+* **Definition of done, 2026-10-30 (AEDT).** Checked by the management
+  session on a fresh `make instar` at `f082d754`:
+  * The pin script prints nothing over all 11 fixed cases.
+  * The backed fixed create is refused with "cannot have a backing
+    file" and leaves no file.
+  * The "not yet supported" grep prints only measure's line, and
+    `FLAG_VHDX_FULLY_PRESENT` appears 4 times.
+  * `make check-binary-sizes` passes (`create.bin` is 60224 bytes).
+    `make test-rust` (2790) and `make fuzz-build` passed in 7a's run.
+    No Rust has changed since, so they were not rerun.
+  * The stestr run of the six modules at 8 workers ran 1602: 1577
+    passed, 25 skipped and 0 failed. The module names are substring
+    filters, so the run includes tests elsewhere whose names match. The
+    skips are those 7a lists. The 16 TiB test ran on ext4 and passed.
+  * The dynamic `cmp` against `aef757d2` and decision 8's timings are
+    above.
+  * The six new mutation cases PASSed in 7a's and 7b's runs.
+    `--check-patterns` reports 145 land.
+  * `tools/ci/check-test-partition.sh` exits 0, the plan-reference grep
+    prints nothing, and `pre-commit run --all-files` passes.
 
 ## Risks and mitigations
 
