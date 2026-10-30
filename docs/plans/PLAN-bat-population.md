@@ -1642,6 +1642,10 @@ Found while planning, and assigned to phases above:
   does not copy it. Reporting it upstream is the operator's call.
 * `docs/quirks.md`'s measure entry for VHDX sources states the
   divergence backwards. Phase 9.
+* Found by phase 7, outside this plan's scope and not yet filed:
+  instar's size arguments refuse a fractional size such as `1.5M`
+  ("invalid memory size"), which qemu-img accepts (`do_strtosz` in
+  `util/cutils.c`); `parse_memory_size` takes integers only.
 * Found by phase 3 and filed, outside this plan's scope: `convert`
   rounds a raw source's virtual size up to 64 KiB (#821); `check`
   refuses every monolithicFlat VMDK (#822); sparse VMDK descriptors

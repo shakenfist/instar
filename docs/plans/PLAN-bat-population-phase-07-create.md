@@ -570,6 +570,39 @@ Every brief also carries the session's standing rules:
     VHD CHS rounding (5), ZSTD (3, including the accepted-and-ignored
     `compression_type`), raw having no check (2), and the hardcoded
     `compat=1.1` (1).
+* **7b.** Decision 7's three tests, plus one more, all kept:
+  * `test_file_size_limit_is_refused_like_a_filesystem_ceiling` sets
+    `RLIMIT_FSIZE` in the child, as the monolithicFlat test does, so the
+    `EFBIG` path is exercised on any filesystem. The 16 TiB test can
+    only run where the filesystem refuses the length. The new mutant,
+    `create-host-vhdx-fixed-efbig-mapping-removed`, targets this test for
+    that reason. It PASSes, and the script holds 145 cases.
+  * The plan was wrong on one fact. instar's create refuses a
+    fractional size ("invalid memory size: '4608.5M'"), and qemu-img
+    accepts one (`do_strtosz`, `util/cutils.c`). So the
+    `RUNTIME_CREATE_IMAGES` size is converted to bytes before instar
+    sees it. The management session reproduced it with `1.5M`: instar
+    exits 1, and qemu-img writes 1572864 bytes. The finding is recorded
+    under the master plan's "Bugs fixed during this work" as outside
+    this plan. Filing an issue was refused by the session's permission
+    check and is left to the operator.
+
+  The stestr run of `test_create` ran 271: 262 passed, 9 skipped, 0
+  failed. The 16 TiB test ran on this host's ext4 and passed. Medians of
+  three, on `src/target/release/instar` at `72ed4946`, with the host
+  `qemu-img` 10.0.13:
+
+  | Size, 1 MiB blocks | `block_state_zero` | instar | qemu-img |
+  |---|---|---|---|
+  | 2 TiB | on | 0.769 s | 0.042 s |
+  | 2 TiB | off | 0.755 s | 0.042 s |
+  | 15 TiB | on | 4.454 s | 0.204 s |
+  | 15 TiB | off | 4.456 s | 0.192 s |
+
+  That is well under decision 8's 60 s, so nothing is batched. The cost
+  is the guest's one-sector-per-request stream, as the survey predicted,
+  and it scales with the BAT. The 15 TiB images were sparse (124 MiB
+  allocated) and removed after each run.
 
 ## Risks and mitigations
 

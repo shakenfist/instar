@@ -2269,9 +2269,9 @@ guards. See the VHD and VHDX notes in
 [chain-config.md](chain-config.md#format-specific-notes) for the
 composing path being guarded.
 
-There are **144 cases**, in eleven groups.
+There are **145 cases**, in eleven groups.
 
-Forty-one cover the writer. Twenty-four mutate a library crate
+Forty-two cover the writer. Twenty-four mutate a library crate
 (`create`, `vhd`, `vhdx`) and are caught by a Rust unit or round-trip
 test. Two of those twenty-four guard the region table and metadata table
 every VHDX writer shares: one sets Required on the region entries
@@ -2293,9 +2293,9 @@ fixed one, caught by reading a fixed image back against its pin. One
 more mutates the host: it removes the host's refusal of a backing file
 for a fixed VHDX, which a host unit test of the argument resolution
 catches, because the guest's own refusal of that combination does not
-say what is wrong. The remaining sixteen writer cases are caught by a
+say what is wrong. The remaining seventeen writer cases are caught by a
 Python integration test through the real binary. Thirteen of those
-sixteen mutate the `create` guest operation, which is excluded from
+seventeen mutate the `create` guest operation, which is excluded from
 `cargo test --workspace`, so a unit test written beside that code
 would never run. Three of the thirteen are a fixed VHDX's: the
 subformat read as dynamic whatever the host sent, the host's
@@ -2304,7 +2304,12 @@ slot early. One more mutates the host, opening a fixed output sparse
 at the dynamic capacity hint, so the file ends with the metadata
 region instead of at qemu-img's length. All four write a file every
 reader opens, and are caught only by comparing it with the pinned
-qemu-img structure. The other two mutate the `create` crate but break
+qemu-img structure. One more mutates the host too: it reports an
+`EFBIG` from extending a fixed output as an ordinary open failure,
+which does not say the file was too long and leaves the empty file
+behind. The test that catches it reaches `EFBIG` through a file-size
+limit, so it runs on every filesystem, not only where ext4 refuses a
+16 TiB image. The other two mutate the `create` crate but break
 something only an external parser can see. Going through the real
 binary means `make instar` before the test and again after the source
 is restored.

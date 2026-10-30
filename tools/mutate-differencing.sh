@@ -682,7 +682,7 @@ self_test() {
 # phase's definition of done asks the two to stay in step, which until
 # now was a promise kept by hand. Asserting it makes the drift a
 # failure instead of a documentation bug nobody reads.
-EXPECTED_CASES=144
+EXPECTED_CASES=145
 
 check_case_count() {
     # Only meaningful for a whole run; a selection is expected to be short.
@@ -2695,6 +2695,19 @@ rust_case 'create-host-vhdx-fixed-backing-refusal-removed' "${VMM_MAIN}" \
     $'    if args.backing.is_some() {\n        return Err("create: vhdx subformat=fixed cannot have a backing file".into());' \
     $'    if args.backing.is_some() && false { // MUTATED\n        return Err("create: vhdx subformat=fixed cannot have a backing file".into());' \
     instar 'vhdx_fixed_refuses_a_backing_file'
+
+# The host's handling of a fixed VHDX the filesystem cannot store. With
+# it gone, an EFBIG from extending the output is reported like any
+# other open failure, which does not say the file was too long, and the
+# empty file the open created is left behind. The host unit test of
+# fixed_vhdx_open_error cannot see this, because it never opens a file.
+# The test target hits EFBIG through a file-size limit, so it runs on
+# every filesystem; the 16 TiB test beside it fails the same way, but
+# only where ext4 or another ceiling makes it run.
+integration_case 'create-host-vhdx-fixed-efbig-mapping-removed' "${VMM_MAIN}" \
+    $'    BackingStore::open(path, false, Some(geometry.fixed_file_length), false).map_err(|e| {\n        if e.raw_os_error() == Some(libc::EFBIG) {\n            let _ = std::fs::remove_file(path);\n        }\n        fixed_vhdx_open_error(&e, filename, geometry).into()\n    })' \
+    $'    BackingStore::open(path, false, Some(geometry.fixed_file_length), false).map_err(|e| { // MUTATED\n        format!("create: open \'{}\' for write failed: {}", filename, e).into()\n    })' \
+    'test_create.TestCreateVhdxFixedLarge.test_file_size_limit_is_refused_like_a_filesystem_ceiling'
 
 # ---------------------------------------------------------------------
 # The libvhdi oracle cross-check.
