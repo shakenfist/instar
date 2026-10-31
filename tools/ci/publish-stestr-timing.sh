@@ -27,6 +27,33 @@
 # never make a run wrong, so silence on a night when nothing moved is
 # worth far more than a pull request every morning that nobody reads.
 #
+# AND A MATERIAL MOVE HAS TO PERSIST. Given the previous night's
+# measurement (--previous), a measurement that differs materially from
+# the committed file is published only if it does NOT differ materially
+# from that previous measurement: two consecutive measurements that
+# agree with each other and disagree with the committed file. One that
+# disagrees with both is a night nobody can tell apart from contention,
+# and it waits for the next.
+#
+# This exists because of what the first three refreshes showed. The
+# Hyper-V VHD roundtrip measured 647s, 357s and 600s on three
+# consecutive nights (#857 and #862), the six nightly-only VHD tests
+# swung from 44% of the suite's weight to 34% and back to 43%, and the
+# file two nights apart was immaterial against itself (7.8 points moved,
+# threshold 10) while each single night's step was material. That is a
+# threshold below the noise floor, and the noise was not the uniform
+# kind the scale-free comparison cancels: the measuring leg ran at the
+# same time as the seven distro legs on the same runner pool, and
+# contention hits a ten-minute conversion far harder than a sub-second
+# case. The measuring leg now runs after the legs for the same reason;
+# the persistence check is what stops one bad night publishing even so.
+#
+# Without a previous measurement -- the first night, or every earlier
+# artifact expired -- a material move publishes on one night's evidence,
+# as it did before. That is the visible failure direction (a pull request
+# that may be noise) rather than the silent one (a file ageing with
+# nothing to say why), and it is the one to prefer.
+#
 # THE PULL REQUEST THIS OPENS ARRIVES WITH ITS CHECKS NOT RUNNING, and
 # that is not a defect in this script. It is created by `gh pr create`
 # with the job's own GITHUB_TOKEN, so its author is
@@ -65,10 +92,22 @@
 #     this uses the job token and accepts the approval click.
 #
 # Usage:
-#   tools/ci/publish-stestr-timing.sh MEASURED_FILE [--dry-run] [--force]
+#   tools/ci/publish-stestr-timing.sh MEASURED_FILE [--previous FILE]
+#                                     [--dry-run] [--force]
 #
 #   MEASURED_FILE  the timing file this run derived, in the format
 #                  tools/ci/generate-stestr-timing.py writes.
+#   --previous FILE
+#                  the most recent earlier measurement, in the same
+#                  format, as tools/ci/fetch-previous-stestr-timing.sh
+#                  leaves it. A material move is published only if it
+#                  is immaterial against this file too. If FILE.source
+#                  exists its one line names where the measurement came
+#                  from and is quoted in the pull request body. Omit it
+#                  when there is no previous measurement; naming a file
+#                  that does not exist is an error, because a publisher
+#                  that quietly skipped the check would be back to
+#                  publishing noise with nothing in the log to say so.
 #   --dry-run      print the verdict, the title and the body, and touch
 #                  neither git nor the GitHub API. How
 #                  tools/ci/test-publish-stestr-timing.sh exercises the
@@ -76,8 +115,9 @@
 #                  the write path below for real, against a throwaway
 #                  repository with a file:// remote and a stubbed gh.
 #   --force        publish even when the comparison says the change is
-#                  immaterial. For a manual dispatch that wants the
-#                  refresh anyway; the scheduled run never sets it.
+#                  immaterial, or material but not yet persistent. For a
+#                  manual dispatch that wants the refresh anyway; the
+#                  scheduled run never sets it.
 #
 # Environment:
 #   GH_TOKEN       (required unless --dry-run) for `gh pr create`.
@@ -98,17 +138,23 @@
 set -euo pipefail
 
 usage() {
-    echo "usage: $0 MEASURED_FILE [--dry-run] [--force]" >&2
+    echo "usage: $0 MEASURED_FILE [--previous FILE] [--dry-run] [--force]" >&2
     exit 2
 }
 
 DRY_RUN=0
 FORCE=0
+PREVIOUS=""
 POSITIONAL=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --dry-run) DRY_RUN=1 ;;
         --force) FORCE=1 ;;
+        --previous)
+            [ $# -ge 2 ] || usage
+            PREVIOUS="$2"
+            shift
+            ;;
         -*) usage ;;
         *) POSITIONAL+=("$1") ;;
     esac
@@ -128,6 +174,10 @@ BRANCH="stestr-timing/refresh"
 
 if [ ! -f "${MEASURED}" ]; then
     echo "error: no measured timing file at ${MEASURED}" >&2
+    exit 1
+fi
+if [ -n "${PREVIOUS}" ] && [ ! -f "${PREVIOUS}" ]; then
+    echo "error: no previous timing file at ${PREVIOUS}" >&2
     exit 1
 fi
 
@@ -163,6 +213,57 @@ if [ "${MATERIAL}" -eq 0 ]; then
     echo "note: --force set, publishing an immaterial refresh anyway."
 fi
 
+# The persistence check. Only a material move reaches here, so the
+# question is whether the previous measurement already showed it: the
+# same comparison, with the previous measurement in the committed file's
+# place, must come back IMMATERIAL for the two nights to count as
+# agreeing. PERSISTENCE is what the pull request body says about it:
+#   agreed    two measurements agree against the committed file
+#   unchecked no previous measurement was available
+#   forced    the previous measurement disagrees and --force overrode it
+PERSISTENCE="unchecked"
+PREVIOUS_REPORT=""
+PREVIOUS_SOURCE=""
+if [ "${MATERIAL}" -eq 1 ] && [ -n "${PREVIOUS}" ]; then
+    if [ -s "${PREVIOUS}.source" ]; then
+        PREVIOUS_SOURCE="$(head -n 1 "${PREVIOUS}.source")"
+    else
+        PREVIOUS_SOURCE="${PREVIOUS}"
+    fi
+    set +e
+    PREVIOUS_REPORT=$(python3 "${REPO_ROOT}/tools/ci/compare-stestr-timing.py" "${PREVIOUS}" "${MEASURED}")
+    PREVIOUS_RC=$?
+    set -e
+    case "${PREVIOUS_RC}" in
+        10) PERSISTENCE="agreed" ;;
+        0)
+            echo "The previous measurement (${PREVIOUS_SOURCE}) disagrees with this one:"
+            echo ""
+            printf '%s\n' "${PREVIOUS_REPORT}"
+            echo ""
+            if [ "${FORCE}" -eq 0 ]; then
+                echo "Timings moved materially against ${COMMITTED_REL}, but the two most recent"
+                echo "measurements also differ materially from each other, so this cannot be told"
+                echo "apart from a contended night. Waiting for a measurement that agrees with"
+                echo "the one before it; leaving ${COMMITTED_REL} alone."
+                echo "Pass --force to publish anyway."
+                exit 0
+            fi
+            echo "note: --force set, publishing a refresh the previous measurement does not confirm."
+            PERSISTENCE="forced"
+            ;;
+        *)
+            echo "error: comparing ${MEASURED} against the previous measurement ${PREVIOUS} failed" >&2
+            printf '%s\n' "${PREVIOUS_REPORT}" >&2
+            exit 1
+            ;;
+    esac
+fi
+if [ "${MATERIAL}" -eq 1 ] && [ "${PERSISTENCE}" = "agreed" ]; then
+    echo "The previous measurement (${PREVIOUS_SOURCE}) agrees with this one; the move has persisted."
+    echo ""
+fi
+
 TITLE="Refresh the committed stestr test timings"
 
 BODY_FILE="$(mktemp)"
@@ -183,6 +284,31 @@ trap 'rm -f "${BODY_FILE}"' EXIT
     printf ' it is equally safe to close, which only leaves the packing as good as it'
     printf ' is today.\n\n'
     printf '%s\n\n' "${REPORT}"
+    case "${PERSISTENCE}" in
+        agreed)
+            printf '**The move has persisted.** The previous measurement, from %s,' \
+                "${PREVIOUS_SOURCE}"
+            printf ' agrees with this one -- compared against each other the two are'
+            printf ' immaterial -- while both differ materially from the committed file.'
+            printf ' Two consecutive measurements that agree is what rules out the'
+            printf ' one-night contention artefact that earlier refreshes turned out to'
+            printf ' be; the comparison between them is at the end of this body.\n\n'
+            ;;
+        unchecked)
+            printf '**No previous measurement was available to check this against**,'
+            printf ' so this refresh rests on one night'"'"'s evidence. A move that'
+            printf ' is contention rather than change will reverse on the next'
+            printf ' measurement, and that is a reason to leave this open a day'
+            printf ' rather than a reason to doubt the file.\n\n'
+            ;;
+        forced)
+            printf '**The previous measurement, from %s, does not confirm this one**' \
+                "${PREVIOUS_SOURCE}"
+            printf ' -- the two differ materially from each other -- and the refresh'
+            printf ' was opened anyway with `--force` from a manual dispatch. The'
+            printf ' comparison between them is at the end of this body.\n\n'
+            ;;
+    esac
     printf '**Its checks are awaiting approval rather than running, and that is'
     printf ' expected.** This pull request is opened by the nightly job with the'
     printf ' workflow GITHUB_TOKEN, so its author is `github-actions[bot]`, and'
@@ -195,6 +321,12 @@ trap 'rm -f "${BODY_FILE}"' EXIT
     if [ "${MATERIAL}" -eq 0 ]; then
         printf 'Opened with `--force` from a manual dispatch: the comparison above'
         printf ' did not consider the change material.\n\n'
+    fi
+    if [ -n "${PREVIOUS_REPORT}" ]; then
+        printf -- '---\n\n'
+        printf 'Against the previous measurement (%s) rather than the committed file:\n\n' \
+            "${PREVIOUS_SOURCE}"
+        printf '%s\n\n' "${PREVIOUS_REPORT}"
     fi
     printf -- '---\n'
     printf 'Measured by %s, opened by `tools/ci/publish-stestr-timing.sh`.\n' \
@@ -237,7 +369,8 @@ the whole Python suite in one stestr repository and re-derives the
 per-test durations tools/ci/seed-stestr-timing.sh loads before a run.
 The refresh was published because
 tools/ci/compare-stestr-timing.py found the suite's weight had moved
-materially; see the pull request body for the comparison.
+materially, and the previous measurement agreed where one was available;
+see the pull request body for the comparisons.
 
 This changes which worker a test runs on and nothing about what is
 tested."
