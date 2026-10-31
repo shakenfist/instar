@@ -580,10 +580,12 @@ jobs:
     # merge-queue protected, nothing in this repository pushes to it
     # from CI, and a file that only hints at scheduling is nowhere near
     # a good enough reason to be the first thing that does.
-    # `actions: read` is for downloading the previous night's measurement
-    # from an earlier run's artifact, which the persistence check below
-    # compares tonight's against. A read scope, on the job that already
-    # holds the write scopes, and nothing on the suite-running legs.
+    # `actions: read` is for fetching the previous night's measurement,
+    # which the persistence check below compares tonight's against:
+    # listing earlier runs, reading whether each one's `measure` job
+    # succeeded, and downloading its artifact. A read scope, on the job
+    # that already holds the write scopes, and nothing on the
+    # suite-running legs.
     permissions:
       actions: read
       contents: write
@@ -685,12 +687,15 @@ jobs:
       # material move publishes only once two consecutive measurements
       # agree on it, because one night's measurement on a shared pool
       # has turned out to move the heavy tests by 40% and back. The
-      # fetcher walks earlier runs of this workflow for the newest
-      # `stestr-timing` artifact, skipping this run's own. It exits zero
-      # whether or not it finds one, and the publisher below passes
-      # --previous only when a file arrived: with none, a material move
-      # publishes on one night's evidence as it did before, which is the
-      # visible failure direction rather than the silent one.
+      # fetcher walks earlier runs of this workflow on the same branch
+      # for the newest `stestr-timing` artifact from a run whose
+      # `measure` job succeeded -- the standard this run's own
+      # measurement had to meet to get here -- skipping this run's own.
+      # It exits zero whether or not it finds one, and the publisher
+      # below passes --previous only when a file arrived: with none, a
+      # material move publishes on one night's evidence as it did
+      # before, which is the visible failure direction rather than the
+      # silent one.
       - name: Fetch the previous measurement
         if: steps.measurement.outputs.publishable == 'true'
         env:

@@ -30,10 +30,11 @@
 # AND A MATERIAL MOVE HAS TO PERSIST. Given the previous night's
 # measurement (--previous), a measurement that differs materially from
 # the committed file is published only if it does NOT differ materially
-# from that previous measurement: two consecutive measurements that
-# agree with each other and disagree with the committed file. One that
-# disagrees with both is a night nobody can tell apart from contention,
-# and it waits for the next.
+# from that previous measurement AND that previous measurement itself
+# differs materially from the committed file: two consecutive
+# measurements that agree with each other and both disagree with the
+# committed file. Anything short of that is one night's move, which
+# nobody can tell apart from contention, and it waits for the next.
 #
 # This exists because of what the first three refreshes showed. The
 # Hyper-V VHD roundtrip measured 647s, 357s and 600s on three
@@ -101,7 +102,9 @@
 #                  the most recent earlier measurement, in the same
 #                  format, as tools/ci/fetch-previous-stestr-timing.sh
 #                  leaves it. A material move is published only if it
-#                  is immaterial against this file too. If FILE.source
+#                  is immaterial against this file too, and this file
+#                  is itself material against the committed one. If
+#                  FILE.source
 #                  exists its one line names where the measurement came
 #                  from and is quoted in the pull request body. Omit it
 #                  when there is no previous measurement; naming a file
@@ -214,15 +217,26 @@ if [ "${MATERIAL}" -eq 0 ]; then
 fi
 
 # The persistence check. Only a material move reaches here, so the
-# question is whether the previous measurement already showed it: the
-# same comparison, with the previous measurement in the committed file's
-# place, must come back IMMATERIAL for the two nights to count as
-# agreeing. PERSISTENCE is what the pull request body says about it:
-#   agreed    two measurements agree against the committed file
+# question is whether the previous measurement already showed the same
+# move, which takes two comparisons, both of which must hold:
+#   - previous against tonight must be IMMATERIAL: the two nights agree
+#     with each other;
+#   - committed against previous must be MATERIAL: the previous night
+#     had itself moved away from the committed file.
+# The second is not implied by the first, because "immaterial" is a
+# threshold and thresholds are not transitive. A previous night just
+# short of the threshold and a tonight just over it agree with each
+# other while only one of them disagrees with the committed file; that
+# is one night's move, and publishing it as "persisted" would be the
+# exact noise this check exists to hold back.
+#
+# PERSISTENCE is what the pull request body says about it:
+#   agreed    both comparisons hold
 #   unchecked no previous measurement was available
-#   forced    the previous measurement disagrees and --force overrode it
+#   forced    one of them does not hold and --force overrode it
 PERSISTENCE="unchecked"
 PREVIOUS_REPORT=""
+PREVIOUS_MOVED_REPORT=""
 PREVIOUS_SOURCE=""
 if [ "${MATERIAL}" -eq 1 ] && [ -n "${PREVIOUS}" ]; then
     if [ -s "${PREVIOUS}.source" ]; then
@@ -233,35 +247,54 @@ if [ "${MATERIAL}" -eq 1 ] && [ -n "${PREVIOUS}" ]; then
     set +e
     PREVIOUS_REPORT=$(python3 "${REPO_ROOT}/tools/ci/compare-stestr-timing.py" "${PREVIOUS}" "${MEASURED}")
     PREVIOUS_RC=$?
+    PREVIOUS_MOVED_REPORT=$(python3 "${REPO_ROOT}/tools/ci/compare-stestr-timing.py" "${COMMITTED}" "${PREVIOUS}")
+    PREVIOUS_MOVED_RC=$?
     set -e
-    case "${PREVIOUS_RC}" in
-        10) PERSISTENCE="agreed" ;;
-        0)
-            echo "The previous measurement (${PREVIOUS_SOURCE}) disagrees with this one:"
-            echo ""
-            printf '%s\n' "${PREVIOUS_REPORT}"
-            echo ""
-            if [ "${FORCE}" -eq 0 ]; then
-                echo "Timings moved materially against ${COMMITTED_REL}, but the two most recent"
-                echo "measurements also differ materially from each other, so this cannot be told"
-                echo "apart from a contended night. Waiting for a measurement that agrees with"
-                echo "the one before it; leaving ${COMMITTED_REL} alone."
-                echo "Pass --force to publish anyway."
-                exit 0
-            fi
-            echo "note: --force set, publishing a refresh the previous measurement does not confirm."
-            PERSISTENCE="forced"
-            ;;
-        *)
-            echo "error: comparing ${MEASURED} against the previous measurement ${PREVIOUS} failed" >&2
-            printf '%s\n' "${PREVIOUS_REPORT}" >&2
-            exit 1
-            ;;
-    esac
-fi
-if [ "${MATERIAL}" -eq 1 ] && [ "${PERSISTENCE}" = "agreed" ]; then
-    echo "The previous measurement (${PREVIOUS_SOURCE}) agrees with this one; the move has persisted."
+    if [ "${PREVIOUS_RC}" -ne 0 ] && [ "${PREVIOUS_RC}" -ne 10 ]; then
+        echo "error: comparing ${MEASURED} against the previous measurement ${PREVIOUS} failed" >&2
+        printf '%s\n' "${PREVIOUS_REPORT}" >&2
+        exit 1
+    fi
+    if [ "${PREVIOUS_MOVED_RC}" -ne 0 ] && [ "${PREVIOUS_MOVED_RC}" -ne 10 ]; then
+        echo "error: comparing the previous measurement ${PREVIOUS} against ${COMMITTED_REL} failed" >&2
+        printf '%s\n' "${PREVIOUS_MOVED_REPORT}" >&2
+        exit 1
+    fi
+
+    # Both comparisons go to the log whatever the verdict, so a night
+    # that waits is diagnosable from the log alone.
+    echo "Against the previous measurement (${PREVIOUS_SOURCE}) rather than the committed file:"
     echo ""
+    printf '%s\n' "${PREVIOUS_REPORT}"
+    echo ""
+    echo "The previous measurement (${PREVIOUS_SOURCE}) against ${COMMITTED_REL}:"
+    echo ""
+    printf '%s\n' "${PREVIOUS_MOVED_REPORT}"
+    echo ""
+
+    if [ "${PREVIOUS_RC}" -eq 10 ] && [ "${PREVIOUS_MOVED_RC}" -eq 0 ]; then
+        PERSISTENCE="agreed"
+        echo "The previous measurement (${PREVIOUS_SOURCE}) agrees with this one and had already"
+        echo "moved materially from ${COMMITTED_REL}; the move has persisted."
+        echo ""
+    else
+        PERSISTENCE_GAP=""
+        if [ "${PREVIOUS_RC}" -eq 0 ]; then
+            PERSISTENCE_GAP="the previous measurement differs materially from this one"
+        else
+            PERSISTENCE_GAP="the previous measurement had not itself moved materially from ${COMMITTED_REL}, so this is the first night of the move"
+        fi
+        echo "Timings moved materially against ${COMMITTED_REL}, but ${PERSISTENCE_GAP}."
+        if [ "${FORCE}" -eq 0 ]; then
+            echo "One night's move cannot be told apart from a contended night."
+            echo "Waiting for a measurement that agrees with the one before it; leaving"
+            echo "${COMMITTED_REL} alone."
+            echo "Pass --force to publish anyway."
+            exit 0
+        fi
+        echo "note: --force set, publishing a refresh the previous measurement does not confirm."
+        PERSISTENCE="forced"
+    fi
 fi
 
 TITLE="Refresh the committed stestr test timings"
@@ -289,10 +322,10 @@ trap 'rm -f "${BODY_FILE}"' EXIT
             printf '**The move has persisted.** The previous measurement, from %s,' \
                 "${PREVIOUS_SOURCE}"
             printf ' agrees with this one -- compared against each other the two are'
-            printf ' immaterial -- while both differ materially from the committed file.'
-            printf ' Two consecutive measurements that agree is what rules out the'
-            printf ' one-night contention artefact that earlier refreshes turned out to'
-            printf ' be; the comparison between them is at the end of this body.\n\n'
+            printf ' immaterial -- and had itself already moved materially from the'
+            printf ' committed file. Two consecutive measurements that agree is what rules'
+            printf ' out the one-night contention artefact that earlier refreshes turned'
+            printf ' out to be; both comparisons are at the end of this body.\n\n'
             ;;
         unchecked)
             printf '**No previous measurement was available to check this against**,'
@@ -304,9 +337,9 @@ trap 'rm -f "${BODY_FILE}"' EXIT
         forced)
             printf '**The previous measurement, from %s, does not confirm this one**' \
                 "${PREVIOUS_SOURCE}"
-            printf ' -- the two differ materially from each other -- and the refresh'
-            printf ' was opened anyway with `--force` from a manual dispatch. The'
-            printf ' comparison between them is at the end of this body.\n\n'
+            printf ' -- %s -- and the refresh was opened anyway with `--force` from a' \
+                "${PERSISTENCE_GAP}"
+            printf ' manual dispatch. Both comparisons are at the end of this body.\n\n'
             ;;
     esac
     printf '**Its checks are awaiting approval rather than running, and that is'
@@ -327,6 +360,9 @@ trap 'rm -f "${BODY_FILE}"' EXIT
         printf 'Against the previous measurement (%s) rather than the committed file:\n\n' \
             "${PREVIOUS_SOURCE}"
         printf '%s\n\n' "${PREVIOUS_REPORT}"
+        printf 'The previous measurement (%s) against the committed file:\n\n' \
+            "${PREVIOUS_SOURCE}"
+        printf '%s\n\n' "${PREVIOUS_MOVED_REPORT}"
     fi
     printf -- '---\n'
     printf 'Measured by %s, opened by `tools/ci/publish-stestr-timing.sh`.\n' \

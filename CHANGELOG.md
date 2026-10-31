@@ -405,9 +405,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (`tools/ci/fetch-previous-stestr-timing.sh`, with a new `actions:
   read` scope on that job only) and passes it to the publisher as
   `--previous`: a measurement material against the committed file is
-  published only if it is immaterial against the previous one. A
-  measurement that disagrees with both waits, logging both comparisons;
-  with no previous measurement it publishes on one night's evidence as
+  published only if it is immaterial against the previous one and the
+  previous one was itself material against the committed file. The
+  previous measurement must come from a night whose `measure` job
+  succeeded, on the same branch. Anything less waits, logging every
+  comparison; with no previous measurement it publishes on one night's
+  evidence as
   before, so the failure direction stays the visible one. `--force` and
   the `force_timing_pr` dispatch input override the check. Both earlier
   pull requests would have been held back; a genuine recomposition

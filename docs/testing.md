@@ -801,11 +801,12 @@ actually moved.
   tests. What it cannot cancel is non-uniform contention, which slows a
   ten-minute conversion far more than a sub-second case and so moves
   shares; the persistence check in the publisher below is the answer to
-  that, and this stays a pure two-file comparison. It is also where the measured test ids
-  are validated, because this is the path that publishes them: an id
-  must be a dotted `module.Class.method` with an optional parenthesised
-  scenario suffix, drawn from a conservative charset, and anything else
-  stops the refresh rather than being dropped. The ids come from the job
+  that, and this stays a pure two-file comparison. It is also where the
+  measured test ids are validated, because this is the path that
+  publishes them: an id must be a dotted `module.Class.method` with an
+  optional parenthesised scenario suffix, drawn from a conservative
+  charset, and anything else stops the refresh rather than being
+  dropped. The ids come from the job
   that ran the suite over the malicious images, and they travel from
   here into a Markdown report, into the body of a pull request opened
   unattended, and into the committed file — so a backtick, a pipe, a
@@ -815,12 +816,19 @@ actually moved.
   file, that one only reads it.
 - **`tools/ci/fetch-previous-stestr-timing.sh OUTPUT`** finds the most
   recent *earlier* night's measurement: it walks the nightly workflow's
-  recent runs newest first, skips the run it is part of, and downloads
-  the first `stestr-timing` artifact it finds, so a night whose
-  measuring leg failed is passed over rather than resetting the
+  recent runs on the same branch newest first, skips the run it is part
+  of, and takes the `stestr-timing` artifact of the first run whose
+  `measure` job concluded `success`. That is the same standard tonight's
+  measurement had to meet to reach the publisher at all, and it matters
+  because the artifact is uploaded even when the suite fails: a night
+  where a heavy test failed in seconds rather than ran for minutes still
+  leaves a timing file, and it is not a measurement of the suite. A
+  night that did not measure is passed over rather than resetting the
   comparison. It leaves the file at `OUTPUT` with a one-line
   `OUTPUT.source` naming the run, or leaves nothing. It exits 0 either
-  way, and a GitHub API failure is a warning: without a previous
+  way, and a GitHub API failure -- listing the runs, reading a run's
+  jobs, or downloading the artifact of a run that did measure -- is a
+  warning quoting `gh`'s error: without a previous
   measurement the publisher falls back to publishing on one night's
   evidence, which is the visible failure (a pull request that may be
   noise) rather than the silent one (a file ageing with nothing to say
@@ -829,11 +837,15 @@ actually moved.
   [--dry-run] [--force]`** acts on those verdicts. A material change
   against the committed file is published only if it has **persisted**:
   compared against the previous measurement, with the same two rules,
-  it must come back *immaterial* — two consecutive measurements that
-  agree with each other and disagree with the committed file. A
-  measurement that differs materially from both is one night nobody can
-  tell apart from contention, and the publisher logs both comparisons,
-  says it is waiting, and exits 0. That rule would have held back both
+  it must come back *immaterial*, and the previous measurement compared
+  against the committed file must come back *material* — two
+  consecutive measurements that agree with each other and both disagree
+  with the committed file. The third comparison is not redundant: a
+  threshold is not transitive, so a previous night just short of it and
+  a tonight just over it agree with each other while only one of them
+  has moved. Anything short of both is one night nobody can tell apart
+  from contention, and the publisher logs every comparison, says it is
+  waiting, and exits 0. That rule would have held back both
   #857 and #862; a genuine recomposition such as #840's 459 new tests
   publishes one night later than it otherwise would. With no previous
   measurement a material change publishes on one night's evidence, and
@@ -846,13 +858,22 @@ actually moved.
   be the first thing in this repository that writes to a
   merge-queue-protected branch. On an immaterial change it prints the
   comparison and exits 0 having done nothing, which is the normal case.
-  If two idle-host nights keep disagreeing with each other by more than
-  the thresholds, the thresholds are below the measurement's noise floor
-  and want raising; the uploaded publisher log is where that shows. It assigns the pull
-  request to nobody unless `TIMING_PR_ASSIGNEE` names a login, and a
-  failed assignment is a warning rather than a failed nightly: a
-  hardcoded account that is renamed or loses access would turn a
-  scheduling hint into a failure issue.
+  It assigns the pull request to nobody unless `TIMING_PR_ASSIGNEE`
+  names a login, and a failed assignment is a warning rather than a
+  failed nightly: a hardcoded account that is renamed or loses access
+  would turn a scheduling hint into a failure issue.
+
+**Known gap: a run of waiting nights is silent.** A night that waits
+exits 0, opens no pull request and files no issue, which is right for
+one contended night. A run of nights that each fail to confirm the one
+before leaves the committed file ageing with nothing saying so — the
+silent failure the rest of this mechanism avoids. It means either the
+thresholds sit below the measuring leg's night-to-night noise and want
+raising, or something still contends with the measuring leg; the only
+record is the `publish-timing` job's uploaded log, where each waiting
+night says `Waiting for a measurement that agrees with the one before
+it`. Escalating after N consecutive waits is tracked in
+[#864](https://github.com/shakenfist/instar/issues/864).
 
 **Failure reporting.**
 `tools/ci/report-nightly-matrix-failure.sh DISTRO IMAGE LOG_FILE` files

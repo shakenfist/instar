@@ -52,12 +52,14 @@ conversion far more than a sub-second case, so the heavy tests' SHARES
 move, not just their seconds, and that passes both rules above. Three
 consecutive nightly measurements showed it: the same tests swung by a
 material amount each night and the first and third nights were
-immaterial against each other. So this verdict is one of two the
+immaterial against each other. So this verdict is one of three the
 publisher asks for -- tools/ci/publish-stestr-timing.sh also compares
-the measurement against the previous night's and publishes only when
-that second comparison is immaterial, which is "two nights that agree
-with each other and disagree with the committed file". This script
-stays a pure two-file comparison; the persistence rule lives there.
+the measurement against the previous night's, which must be immaterial,
+and the previous night's against the committed file, which must be
+material: "two nights that agree with each other and both disagree with
+the committed file". The third is needed because a threshold is not
+transitive. This script stays a pure two-file comparison; the
+persistence rule lives there.
 
 usage: compare-stestr-timing.py OLD_FILE NEW_FILE
 
