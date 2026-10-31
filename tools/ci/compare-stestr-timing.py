@@ -46,6 +46,21 @@ A refresh is published when either holds:
 
 Anything smaller is noise, and noise is what a quiet default is for.
 
+**What this cannot cancel on its own.** Contention is not uniform. A
+measuring leg sharing its host with seven other legs slows a ten-minute
+conversion far more than a sub-second case, so the heavy tests' SHARES
+move, not just their seconds, and that passes both rules above. Three
+consecutive nightly measurements showed it: the same tests swung by a
+material amount each night and the first and third nights were
+immaterial against each other. So this verdict is one of three the
+publisher asks for -- tools/ci/publish-stestr-timing.sh also compares
+the measurement against the previous night's, which must be immaterial,
+and the previous night's against the committed file, which must be
+material: "two nights that agree with each other and both disagree with
+the committed file". The third is needed because a threshold is not
+transitive. This script stays a pure two-file comparison; the
+persistence rule lives there.
+
 usage: compare-stestr-timing.py OLD_FILE NEW_FILE
 
 Writes a Markdown report to stdout -- the verdict, the totals and the

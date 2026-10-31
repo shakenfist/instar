@@ -388,6 +388,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **The nightly stestr timing refresh publishes only a move that
+  persists across two measurements, taken after the distro legs rather
+  than beside them.** The first three refreshes showed the committed
+  `tests/stestr-timing.txt` chasing the measuring leg's host load, not
+  the suite: the Hyper-V VHD roundtrip measured 647s, 357s and 600s on
+  three consecutive nights, the six nightly-only VHD tests swung from
+  44% of the suite's weight to 34% and back to 43%, and the file two
+  nights apart was immaterial against itself while each single night's
+  step crossed the threshold ([#857](https://github.com/shakenfist/instar/pull/857),
+  [#862](https://github.com/shakenfist/instar/pull/862)). The measuring
+  leg had run its whole hour alongside the seven distro legs on the same
+  pool, and contention of that kind is not the uniform slowdown the
+  share-based comparison cancels. The `measure` job now `needs` the
+  legs, and `publish-timing` fetches the previous night's measurement
+  (`tools/ci/fetch-previous-stestr-timing.sh`, with a new `actions:
+  read` scope on that job only) and passes it to the publisher as
+  `--previous`: a measurement material against the committed file is
+  published only if it is immaterial against the previous one and the
+  previous one was itself material against the committed file. The
+  previous measurement must come from a night whose `measure` job
+  succeeded, on the same branch. Anything less waits, logging every
+  comparison; with no previous measurement it publishes on one night's
+  evidence as
+  before, so the failure direction stays the visible one. `--force` and
+  the `force_timing_pr` dispatch input override the check. Both earlier
+  pull requests would have been held back; a genuine recomposition
+  publishes one night later.
+
 - **A VHDX written with no block size uses qemu-img's default for its
   size**: 8 MiB up to 1 GiB, 16 MiB up to 100 GiB, 32 MiB up to 32 TiB,
   then 64 MiB, each threshold a strict `>`

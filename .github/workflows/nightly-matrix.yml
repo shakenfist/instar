@@ -55,9 +55,11 @@ on:
   # (export-repo-config, differential-fuzz, coverage-fuzz), and seven
   # `xl` legs plus a full-suite leg is the largest nightly this
   # repository runs. Starting four hours ahead of that cluster gives it
-  # the shared on-demand pool to itself -- which matters, because the
-  # pool has a measured ceiling of about three concurrent legs, so these
-  # eight `xl` jobs stagger rather than run at once.
+  # the shared on-demand pool to itself. The pool once had a measured
+  # ceiling of about three concurrent legs; by 2026-10-30 it ran all
+  # seven distro legs and the measuring leg at once, which is why the
+  # measuring leg now waits for the legs (see `measure`) rather than
+  # relying on the pool to keep it apart from them.
   schedule:
     - cron: '0 22 * * *'
 
@@ -66,8 +68,9 @@ on:
       force_timing_pr:
         description: >-
           Open the timing-refresh pull request even if the measurement
-          did not move materially. A measurement that FAILED still
-          publishes nothing: the publishing job needs a successful
+          did not move materially, or moved but the previous night's
+          measurement does not confirm it. A measurement that FAILED
+          still publishes nothing: the publishing job needs a successful
           measuring job, because timings from a run that fell over are
           not worth committing.
         required: false
@@ -358,7 +361,27 @@ jobs:
   # does so. The two halves hand over through an artifact, exactly as
   # `package-build` hands the legs their packages.
   measure:
-    needs: package-build
+    # After the seven distro legs, not beside them, and that ordering is
+    # load-bearing. Measured on the nights of 2026-10-29 and -30: the
+    # measuring leg started within a minute of the legs and ran its
+    # whole hour alongside them on the same `xl` pool, and the result
+    # was a file whose heavy tests swung by 40% between nights (the
+    # Hyper-V roundtrip: 647s, 357s, 600s) while the sub-second ones did
+    # not move. That is contention, it is not the uniform slowdown the
+    # share-based comparison cancels, and it published two refresh pull
+    # requests (#857, #862) for a file that was immaterial against itself
+    # two nights apart. Waiting for the legs costs about 35 minutes of
+    # nightly wall time that nothing waits on, and buys a measurement of
+    # the suite rather than of the pool's load.
+    #
+    # `!cancelled()` with an explicit check on the build, rather than a
+    # bare `needs`: a distro leg that fails is a divergence on that
+    # distro and says nothing about Debian 13's durations, so the
+    # measurement must still run. A failed build is different -- there
+    # is no package to measure -- and a cancelled run has nothing to
+    # report.
+    needs: [package-build, nightly-legs]
+    if: ${{ !cancelled() && needs.package-build.result == 'success' }}
     name: "Measure: full suite on Debian 13"
     # `instar` asks the fleet for a runner carrying the pre-seeded
     # instar-testdata dependencies disk, which is what lets the step below
@@ -557,7 +580,14 @@ jobs:
     # merge-queue protected, nothing in this repository pushes to it
     # from CI, and a file that only hints at scheduling is nowhere near
     # a good enough reason to be the first thing that does.
+    # `actions: read` is for fetching the previous night's measurement,
+    # which the persistence check below compares tonight's against:
+    # listing earlier runs, reading whether each one's `measure` job
+    # succeeded, and downloading its artifact. A read scope, on the job
+    # that already holds the write scopes, and nothing on the
+    # suite-running legs.
     permissions:
+      actions: read
       contents: write
       issues: write
       pull-requests: write
@@ -653,19 +683,44 @@ jobs:
             exit 1
           fi
 
-      - name: Publish refreshed timings if they moved materially
+      # The previous night's measurement, for the persistence check: a
+      # material move publishes only once two consecutive measurements
+      # agree on it, because one night's measurement on a shared pool
+      # has turned out to move the heavy tests by 40% and back. The
+      # fetcher walks earlier runs of this workflow on the same branch
+      # for the newest `stestr-timing` artifact from a run whose
+      # `measure` job succeeded -- the standard this run's own
+      # measurement had to meet to get here -- skipping this run's own.
+      # It exits zero whether or not it finds one, and the publisher
+      # below passes --previous only when a file arrived: with none, a
+      # material move publishes on one night's evidence as it did
+      # before, which is the visible failure direction rather than the
+      # silent one.
+      - name: Fetch the previous measurement
+        if: steps.measurement.outputs.publishable == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          cd ${GITHUB_WORKSPACE}/instar
+          tools/ci/fetch-previous-stestr-timing.sh \
+            "${{ github.workspace }}/timing-previous/stestr-timing.txt"
+
+      - name: Publish refreshed timings if they moved materially and persistently
         if: steps.measurement.outputs.publishable == 'true'
         id: publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           FORCE: ${{ inputs.force_timing_pr }}
+          PREVIOUS: ${{ github.workspace }}/timing-previous/stestr-timing.txt
         # Captured as well as printed, so that if this step is what
         # failed, the issue filed below can quote the publisher's own
         # output.
         run: |
           cd ${GITHUB_WORKSPACE}/instar
           ARGS=("${{ github.workspace }}/timing/stestr-timing.txt")
+          if [ -s "${PREVIOUS}" ]; then ARGS+=(--previous "${PREVIOUS}"); fi
           if [ "${FORCE}" = "true" ]; then ARGS+=(--force); fi
           # PIPESTATUS, not a bare pipeline: a run step's default shell
           # is "bash -e" without pipefail, so piping into tee reports

@@ -322,6 +322,17 @@ jobs:
       - name: Test the stestr timing publisher
         run: tools/ci/test-publish-stestr-timing.sh
 
+      # The publisher's persistence check compares tonight's measurement
+      # against the previous night's, which this fetches from an earlier
+      # run's artifact. Picking the current run's own artifact would make
+      # every move "persist" on its first night, taking the artifact a
+      # night whose suite failed still uploads would make a fast failure
+      # the baseline, and failing on an API error would file a failure
+      # issue over a scheduling hint, so each is asserted against a
+      # stubbed gh.
+      - name: Test the previous-measurement fetcher
+        run: tools/ci/test-fetch-previous-stestr-timing.sh
+
       # The nightly matrix's issue reporter only runs when a leg fails,
       # so nothing else here executes it -- which is exactly how the
       # fuzz crash reporter broke every nightly fuzz run for a month

@@ -183,6 +183,275 @@ else
     fail "the body does not say the refresh was forced"
 fi
 
+# --- A material move has to persist ------------------------------------
+# The case the first three refreshes turned out to be: a measurement that
+# differs materially from the committed file but ALSO from the previous
+# night's measurement is one bad night, not a change, and must wait. The
+# previous measurement here is the committed file itself, which is
+# exactly the shape #862 had -- #857 had committed the night before's
+# measurement -- so the two comparisons the publisher runs give the same
+# answer and the refresh must not publish.
+start "a material move the previous measurement does not confirm waits"
+cp "${COMMITTED}" "${WORK}/previous-disagrees.txt"
+echo "run 1 on 2026-10-30T02:00:00Z (https://example.invalid/runs/1)" \
+    > "${WORK}/previous-disagrees.txt.source"
+OUT="${WORK}/persist-wait.log"
+STATUS=0
+run_publisher "${OUT}" "${WORK}/halved.txt" --previous "${WORK}/previous-disagrees.txt" --dry-run \
+    || STATUS=$?
+if [ "${STATUS}" -ne 0 ]; then
+    fail "waiting exited ${STATUS}; it is a normal night and must succeed"
+else
+    ok "exited zero"
+fi
+if grep -q "would publish" "${OUT}"; then
+    fail "published a move the previous measurement does not confirm"
+else
+    ok "published nothing"
+fi
+if grep -q "Waiting for a measurement that agrees" "${OUT}"; then
+    ok "said it is waiting, and why"
+else
+    fail "did not say it is waiting"
+fi
+if grep -q "previous measurement (run 1 on 2026-10-30" "${OUT}"; then
+    ok "named the previous measurement by its source"
+else
+    fail "did not name where the previous measurement came from"
+fi
+# Every comparison goes to the log -- committed against tonight,
+# previous against tonight, committed against previous -- so a night
+# that waits is diagnosable from the log alone.
+if [ "$(grep -c 'weight moved between tests' "${OUT}")" -eq 3 ]; then
+    ok "logged all three comparisons"
+else
+    fail "did not log every comparison against the previous measurement"
+fi
+if grep -q "the previous measurement differs materially from this one" "${OUT}"; then
+    ok "said the two nights disagree"
+else
+    fail "did not say which persistence condition failed"
+fi
+
+start "a material move the previous measurement confirms publishes"
+# The previous night saw the same halving, with a little jitter on top so
+# this proves the comparison ran rather than a byte-for-byte match.
+awk -F '\t' -v id="${HEAVIEST}" 'BEGIN { OFS = "\t" }
+    $1 == id { $2 = sprintf("%.2f", $2 * 1.02); print; next }
+    { print }' "${WORK}/halved.txt" > "${WORK}/previous-agrees.txt"
+if cmp -s "${WORK}/halved.txt" "${WORK}/previous-agrees.txt"; then
+    fail "fixture did not jitter the previous measurement"
+fi
+echo "run 2 on 2026-10-30T02:00:00Z (https://example.invalid/runs/2)" \
+    > "${WORK}/previous-agrees.txt.source"
+OUT="${WORK}/persist-agree.log"
+STATUS=0
+run_publisher "${OUT}" "${WORK}/halved.txt" --previous "${WORK}/previous-agrees.txt" --dry-run \
+    || STATUS=$?
+if [ "${STATUS}" -ne 0 ]; then
+    fail "a persistent move exited ${STATUS}"
+else
+    ok "exited zero"
+fi
+if grep -q "would publish" "${OUT}"; then
+    ok "offered to publish"
+else
+    fail "did not publish a move two measurements agree on"
+fi
+if grep -q "The move has persisted" "${OUT}" && grep -q "from run 2 on 2026-10-30" "${OUT}"; then
+    ok "the body says the move persisted and names the previous measurement"
+else
+    fail "the body does not say the move persisted"
+fi
+# The body, not the log: three reports in it -- committed against
+# tonight, then both comparisons against the previous measurement.
+if grep -q "Against the previous measurement" "${OUT}" \
+    && grep -q "The previous measurement (run 2 on 2026-10-30.*) against the committed file" "${OUT}" \
+    && [ "$(sed -n '/^--- body ---$/,/^--- end body ---$/p' "${OUT}" | grep -c 'weight moved between tests')" -eq 3 ]; then
+    ok "the body carries both comparisons against the previous measurement"
+else
+    fail "the body does not carry both comparisons against the previous measurement"
+fi
+
+start "a previous night that had not itself moved does not confirm tonight's move"
+# Thresholds are not transitive. A previous night that moved the
+# heaviest test's share by a little over half the single-test threshold,
+# and a tonight that moved it by a little over the whole of it, agree
+# with each other while only tonight disagrees with the committed file.
+# That is one night's move, and calling it "persisted" would be false.
+# The fixtures are built to a target share move and their three
+# relationships are checked with the comparator itself before the
+# publisher is asked, so this proves the case rather than assuming it.
+share_shift() {
+    # share_shift FILE POINTS -- FILE with the heaviest test's duration
+    # set so its share of the suite's weight rises by POINTS.
+    awk -F '\t' -v id="${HEAVIEST}" -v pp="$2" 'BEGIN { OFS = "\t" }
+        NR == FNR { total += $2; if ($1 == id) d = $2; next }
+        $1 == id {
+            share = 100 * d / total + pp
+            $2 = sprintf("%.2f", share * (total - d) / (100 - share))
+        }
+        { print }' "$1" "$1"
+}
+share_shift "${COMMITTED}" 1.2 > "${WORK}/previous-unmoved.txt"
+share_shift "${COMMITTED}" 2.4 > "${WORK}/just-over.txt"
+compare_rc() {
+    local rc=0
+    python3 "${REPO_ROOT}/tools/ci/compare-stestr-timing.py" "$1" "$2" > /dev/null 2>&1 || rc=$?
+    echo "${rc}"
+}
+if [ "$(compare_rc "${COMMITTED}" "${WORK}/just-over.txt")" = 0 ] \
+    && [ "$(compare_rc "${WORK}/previous-unmoved.txt" "${WORK}/just-over.txt")" = 10 ] \
+    && [ "$(compare_rc "${COMMITTED}" "${WORK}/previous-unmoved.txt")" = 10 ]; then
+    ok "fixture: tonight is material against committed, immaterial against the previous night,"
+    ok "    and the previous night is immaterial against committed"
+else
+    fail "fixture does not have the non-transitive shape this case needs"
+fi
+echo "run 3 on 2026-10-30T02:00:00Z (https://example.invalid/runs/3)" \
+    > "${WORK}/previous-unmoved.txt.source"
+OUT="${WORK}/persist-unmoved.log"
+STATUS=0
+run_publisher "${OUT}" "${WORK}/just-over.txt" --previous "${WORK}/previous-unmoved.txt" --dry-run \
+    || STATUS=$?
+if [ "${STATUS}" -eq 0 ] && ! grep -q "would publish" "${OUT}"; then
+    ok "published nothing"
+else
+    fail "published a move only one night showed (exit ${STATUS})"
+fi
+if grep -q "had not itself moved materially" "${OUT}" && grep -q "Waiting for a" "${OUT}"; then
+    ok "said the previous night had not moved, and that it is waiting"
+else
+    fail "did not say the previous night had not itself moved"
+fi
+
+start "a previous night that moved the other way does not confirm tonight's move"
+# The oscillation #857 and #862 actually were: both nights material
+# against the committed file, in opposite directions, so they disagree
+# with each other. The case above cannot catch a publisher that skips
+# the previous-against-tonight comparison, because there the previous
+# night had not moved at all; this one can.
+share_shift "${COMMITTED}" 4.8 > "${WORK}/previous-swung.txt"
+if [ "$(compare_rc "${COMMITTED}" "${WORK}/previous-swung.txt")" = 0 ] \
+    && [ "$(compare_rc "${WORK}/previous-swung.txt" "${WORK}/halved.txt")" = 0 ]; then
+    ok "fixture: the previous night moved materially, and differs materially from tonight"
+else
+    fail "fixture does not have the swung shape this case needs"
+fi
+OUT="${WORK}/persist-swung.log"
+STATUS=0
+run_publisher "${OUT}" "${WORK}/halved.txt" --previous "${WORK}/previous-swung.txt" --dry-run \
+    || STATUS=$?
+if [ "${STATUS}" -eq 0 ] && ! grep -q "would publish" "${OUT}"; then
+    ok "published nothing"
+else
+    fail "published a move two swinging nights disagree on (exit ${STATUS})"
+fi
+if grep -q "the previous measurement differs materially from this one" "${OUT}"; then
+    ok "said the two nights disagree"
+else
+    fail "did not say the two swinging nights disagree"
+fi
+
+OUT="${WORK}/persist-unmoved-forced.log"
+STATUS=0
+run_publisher "${OUT}" "${WORK}/just-over.txt" --previous "${WORK}/previous-unmoved.txt" --dry-run --force \
+    || STATUS=$?
+if [ "${STATUS}" -eq 0 ] && grep -q "would publish" "${OUT}" \
+    && grep -q "does not confirm this one\*\* -- the previous measurement had not itself moved" "${OUT}"; then
+    ok "--force publishes it, and the body says why it is unconfirmed"
+else
+    fail "--force did not publish it with the reason in the body (exit ${STATUS})"
+fi
+
+start "a previous measurement without a sidecar is named by its path"
+rm -f "${WORK}/previous-agrees.txt.source"
+OUT="${WORK}/persist-nosource.log"
+STATUS=0
+run_publisher "${OUT}" "${WORK}/halved.txt" --previous "${WORK}/previous-agrees.txt" --dry-run \
+    || STATUS=$?
+if [ "${STATUS}" -eq 0 ] && grep -q "from ${WORK}/previous-agrees.txt," "${OUT}"; then
+    ok "fell back to the path"
+else
+    fail "did not fall back to the path (exit ${STATUS})"
+fi
+
+start "with no previous measurement a material move publishes on one night's evidence"
+# The fallback direction, asserted on purpose: the first night, or a
+# night where every earlier artifact expired or the listing failed, must
+# publish as it always did -- visibly -- rather than wait for a
+# confirmation that can never arrive.
+OUT="${WORK}/persist-unchecked.log"
+STATUS=0
+run_publisher "${OUT}" "${WORK}/halved.txt" --dry-run || STATUS=$?
+if [ "${STATUS}" -eq 0 ] && grep -q "would publish" "${OUT}"; then
+    ok "offered to publish"
+else
+    fail "did not publish without a previous measurement (exit ${STATUS})"
+fi
+if grep -q "No previous measurement was available" "${OUT}"; then
+    ok "the body says the move is unconfirmed"
+else
+    fail "the body does not say no previous measurement was available"
+fi
+
+start "--force publishes a move the previous measurement does not confirm"
+OUT="${WORK}/persist-forced.log"
+STATUS=0
+run_publisher "${OUT}" "${WORK}/halved.txt" --previous "${WORK}/previous-disagrees.txt" --dry-run --force \
+    || STATUS=$?
+if [ "${STATUS}" -eq 0 ] && grep -q "would publish" "${OUT}"; then
+    ok "offered to publish"
+else
+    fail "--force did not publish (exit ${STATUS})"
+fi
+if grep -q "does not confirm this one\*\* -- the previous measurement differs materially" "${OUT}"; then
+    ok "the body says the previous measurement does not confirm it, and why"
+else
+    fail "the body hides that the previous measurement disagrees"
+fi
+
+start "an immaterial move is not checked for persistence at all"
+OUT="${WORK}/persist-immaterial.log"
+STATUS=0
+run_publisher "${OUT}" "${WORK}/slower.txt" --previous "${WORK}/previous-agrees.txt" --dry-run \
+    || STATUS=$?
+if [ "${STATUS}" -eq 0 ] && ! grep -q "would publish" "${OUT}"; then
+    ok "published nothing"
+else
+    fail "an immaterial move with a previous measurement misbehaved (exit ${STATUS})"
+fi
+if grep -q "previous measurement" "${OUT}"; then
+    fail "compared an immaterial move against the previous measurement"
+else
+    ok "did not mention the previous measurement"
+fi
+
+start "a previous measurement that is missing or malformed is an error"
+OUT="${WORK}/persist-missing.log"
+STATUS=0
+run_publisher "${OUT}" "${WORK}/halved.txt" --previous "${WORK}/not-there.txt" --dry-run || STATUS=$?
+if [ "${STATUS}" -eq 0 ]; then
+    fail "a missing previous measurement was quietly skipped"
+else
+    ok "missing previous measurement exited ${STATUS}"
+fi
+printf 'test_info.TestInfo.test_a 1.00\n' > "${WORK}/previous-malformed.txt"
+OUT="${WORK}/persist-malformed.log"
+STATUS=0
+run_publisher "${OUT}" "${WORK}/halved.txt" --previous "${WORK}/previous-malformed.txt" --dry-run \
+    || STATUS=$?
+if [ "${STATUS}" -eq 0 ]; then
+    fail "a malformed previous measurement reported success"
+else
+    ok "malformed previous measurement exited ${STATUS}"
+fi
+if "${PUBLISHER}" "${WORK}/halved.txt" --previous > /dev/null 2>&1; then
+    fail "--previous without a file was accepted"
+else
+    ok "--previous without a file rejected"
+fi
+
 # --- Bad input fails loudly --------------------------------------------
 start "a malformed measurement is an error, not a quiet no-op"
 printf 'test_info.TestInfo.test_a 1.00\n' > "${WORK}/malformed.txt"
