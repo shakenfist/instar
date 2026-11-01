@@ -19,6 +19,14 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 FETCHER="${REPO_ROOT}/tools/ci/fetch-previous-stestr-timing.sh"
 
+# The fetcher reads these from its environment, and a runner sets the
+# GITHUB_ ones for itself: on a pull request GITHUB_REF_NAME is
+# "N/merge", so a case that means the default branch would list that
+# ref's runs instead of develop's. Each case sets what it tests on the
+# run_fetcher line; nothing reaches the fetcher from outside.
+unset GITHUB_RUN_ID GITHUB_REF_NAME TIMING_BRANCH TIMING_ARTIFACT TIMING_FILE_NAME \
+    TIMING_JOB TIMING_RUN_LIMIT TIMING_WORKFLOW
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK}"' EXIT
 
