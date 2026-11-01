@@ -54,6 +54,8 @@
 #                    it means the job was renamed and this default was
 #                    not.
 #   TIMING_ARTIFACT  (default stestr-timing) the artifact's name.
+#   TIMING_FILE_NAME (default stestr-timing.txt) the file in it, as the
+#                    measuring leg uploads it.
 #   TIMING_RUN_LIMIT (default 10) how many recent runs to look through.
 #
 # Exits 0 whether or not a previous measurement was found: OUTPUT_FILE
@@ -83,6 +85,7 @@ WORKFLOW="${TIMING_WORKFLOW:-nightly-matrix.yml}"
 BRANCH="${TIMING_BRANCH:-${GITHUB_REF_NAME:-develop}}"
 JOB="${TIMING_JOB:-Measure: full suite on Debian 13}"
 ARTIFACT="${TIMING_ARTIFACT:-stestr-timing}"
+TIMING_FILE_NAME="${TIMING_FILE_NAME:-stestr-timing.txt}"
 LIMIT="${TIMING_RUN_LIMIT:-10}"
 CURRENT="${GITHUB_RUN_ID:-}"
 
@@ -137,8 +140,12 @@ for job in jobs:
 PY
 }
 
+# The run list is read on descriptor 3 rather than stdin, which the gh
+# calls in the loop inherit: a gh that read stdin -- a prompt, an
+# extension -- would swallow the rest of the list, and the result would
+# read as a quiet night.
 UNCHECKED=0
-while IFS=$'\t' read -r run_id created url; do
+while IFS=$'\t' read -r -u 3 run_id created url; do
     [ -n "${run_id}" ] || continue
     if [ "${run_id}" = "${CURRENT}" ]; then
         continue
@@ -174,10 +181,12 @@ while IFS=$'\t' read -r run_id created url; do
         UNCHECKED=$((UNCHECKED + 1))
         continue
     fi
-    # The artifact is the one file the measuring leg uploads, which
-    # download-artifact unpacks under its own name.
-    CANDIDATE="$(find "${SCRATCH}/download" -type f -name '*.txt' -print -quit)"
-    if [ -z "${CANDIDATE}" ] || [ ! -s "${CANDIDATE}" ]; then
+    # The measuring leg uploads timing/stestr-timing.txt, which gh
+    # unpacks under its own name. Named exactly rather than globbed, so
+    # that anything else the artifact one day carries cannot become the
+    # baseline.
+    CANDIDATE="${SCRATCH}/download/${TIMING_FILE_NAME}"
+    if [ ! -s "${CANDIDATE}" ]; then
         echo "warning: run ${run_id} measured, but its ${ARTIFACT} artifact holds no timing file" >&2
         UNCHECKED=$((UNCHECKED + 1))
         continue
@@ -188,7 +197,7 @@ while IFS=$'\t' read -r run_id created url; do
     echo "Previous measurement: $(cat "${OUTPUT}.source")"
     echo "$(wc -l < "${OUTPUT}") test durations, at ${OUTPUT}"
     exit 0
-done < "${SCRATCH}/runs.tsv"
+done 3< "${SCRATCH}/runs.tsv"
 
 if [ "${UNCHECKED}" -gt 0 ]; then
     echo "warning: no previous measurement among the last ${LIMIT} ${WORKFLOW} runs on ${BRANCH}," >&2

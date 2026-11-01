@@ -53,8 +53,15 @@ cat > "${STUB_BIN}/gh" <<'STUB'
 # artifact GH_STUB_ARTIFACTS/ID.txt into DIR/stestr-timing.txt if it
 # exists, fails the way the real one does for a run with no such
 # artifact, or fails with a 403 if GH_STUB_DOWNLOAD_FAILS is set. With
-# GH_STUB_DOWNLOAD_NO_TXT set it succeeds but unpacks no .txt file.
+# GH_STUB_DOWNLOAD_OTHER_TXT set it succeeds but unpacks only a log.txt,
+# a well-formed timing file that is not the one the leg uploads; with
+# GH_STUB_DOWNLOAD_EXTRA_TXT set it unpacks that log.txt alongside the
+# real one. With GH_STUB_EATS_STDIN set every call reads its stdin to
+# the end first, as a gh that prompted would.
 printf '%s\n' "$*" >> "${GH_STUB_LOG}"
+if [ -n "${GH_STUB_EATS_STDIN:-}" ]; then
+    cat > /dev/null
+fi
 case "${1:-} ${2:-}" in
     "run list")
         if [ -n "${GH_STUB_LIST_FAILS:-}" ]; then
@@ -85,12 +92,15 @@ case "${1:-} ${2:-}" in
             if [ "$1" = "--dir" ]; then dir="$2"; fi
             shift
         done
-        if [ -n "${GH_STUB_DOWNLOAD_NO_TXT:-}" ]; then
+        if [ -n "${GH_STUB_DOWNLOAD_OTHER_TXT:-}" ]; then
             mkdir -p "${dir}"
-            echo "not a timing file" > "${dir}/README.md"
+            printf 'test_info.TestInfo.test_a\t999.00\n' > "${dir}/log.txt"
         elif [ -f "${GH_STUB_ARTIFACTS}/${run_id}.txt" ]; then
             mkdir -p "${dir}"
             cp "${GH_STUB_ARTIFACTS}/${run_id}.txt" "${dir}/stestr-timing.txt"
+            if [ -n "${GH_STUB_DOWNLOAD_EXTRA_TXT:-}" ]; then
+                printf 'test_info.TestInfo.test_a\t999.00\n' > "${dir}/log.txt"
+            fi
         else
             echo "stub: no artifact matches any of the names or patterns provided" >&2
             exit 1
@@ -106,7 +116,8 @@ chmod +x "${STUB_BIN}/gh"
 
 run_fetcher() {
     # run_fetcher OUTFILE ARGS... -- returns the exit status, writes
-    # combined output to OUTFILE.
+    # combined output to OUTFILE. Stdin is empty, as on a runner, so a
+    # stub reading it ends rather than waiting on a terminal.
     local out="$1"
     shift
     local status=0
@@ -119,11 +130,13 @@ run_fetcher() {
         GH_STUB_LIST_FAILS="${GH_STUB_LIST_FAILS:-}" \
         GH_STUB_VIEW_FAILS="${GH_STUB_VIEW_FAILS:-}" \
         GH_STUB_DOWNLOAD_FAILS="${GH_STUB_DOWNLOAD_FAILS:-}" \
-        GH_STUB_DOWNLOAD_NO_TXT="${GH_STUB_DOWNLOAD_NO_TXT:-}" \
+        GH_STUB_DOWNLOAD_OTHER_TXT="${GH_STUB_DOWNLOAD_OTHER_TXT:-}" \
+        GH_STUB_DOWNLOAD_EXTRA_TXT="${GH_STUB_DOWNLOAD_EXTRA_TXT:-}" \
+        GH_STUB_EATS_STDIN="${GH_STUB_EATS_STDIN:-}" \
         GITHUB_RUN_ID="${GITHUB_RUN_ID:-}" \
         GITHUB_REF_NAME="${GITHUB_REF_NAME:-}" \
         TIMING_BRANCH="${TIMING_BRANCH:-}" \
-        "${FETCHER}" "$@" > "${out}" 2>&1 || status=$?
+        "${FETCHER}" "$@" < /dev/null > "${out}" 2>&1 || status=$?
     return "${status}"
 }
 
@@ -261,6 +274,57 @@ else
     fail "did not take the newest artifact (exit ${STATUS})"
 fi
 
+start "a gh that reads stdin does not swallow the run list"
+# The loop's gh calls inherit its stdin. Were the list on stdin, the
+# first of them to read it would leave nothing to walk, and the result
+# would read as a night with nothing measured.
+OUT="${WORK}/stdin.log"
+PREV="${WORK}/stdin/previous.txt"
+STATUS=0
+GH_STUB_EATS_STDIN=1 GITHUB_RUN_ID=400 run_fetcher "${OUT}" "${PREV}" || STATUS=$?
+if [ "${STATUS}" -eq 0 ] && [ -s "${PREV}" ] && grep -q '200.00' "${PREV}"; then
+    ok "still walked to run 200"
+else
+    fail "the run list was consumed by a gh call (exit ${STATUS})"
+    sed 's/^/      /' "${OUT}" >&2
+fi
+
+start "another .txt in the artifact is not taken for the timing file"
+OUT="${WORK}/extratxt.log"
+PREV="${WORK}/extratxt/previous.txt"
+STATUS=0
+GH_STUB_DOWNLOAD_EXTRA_TXT=1 GITHUB_RUN_ID=400 run_fetcher "${OUT}" "${PREV}" || STATUS=$?
+if [ "${STATUS}" -eq 0 ] && [ -s "${PREV}" ] && grep -q '200.00' "${PREV}" && ! grep -q '999.00' "${PREV}"; then
+    ok "took stestr-timing.txt, not log.txt"
+else
+    fail "did not take the uploaded timing file by name (exit ${STATUS})"
+fi
+
+start "an expired artifact on the newest night that measured falls through to an older one"
+# Artifacts are kept 30 days; a run that measured can outlive its own.
+: > "${GH_LOG}"
+mv "${ARTIFACTS}/200.txt" "${WORK}/200.txt.expired"
+OUT="${WORK}/expired.log"
+PREV="${WORK}/expired/previous.txt"
+STATUS=0
+GITHUB_RUN_ID=400 run_fetcher "${OUT}" "${PREV}" || STATUS=$?
+mv "${WORK}/200.txt.expired" "${ARTIFACTS}/200.txt"
+if [ "${STATUS}" -eq 0 ] && [ -s "${PREV}" ] && grep -q '100.00' "${PREV}"; then
+    ok "took run 100's artifact"
+else
+    fail "did not move on to the older night (exit ${STATUS})"
+fi
+if grep -q 'warning: run 200 measured, but its stestr-timing artifact could not be downloaded' "${OUT}"; then
+    ok "warned about run 200 on the way past"
+else
+    fail "passed over run 200's missing artifact in silence"
+fi
+if grep -q 'run 100 on' "${PREV}.source" 2> /dev/null; then
+    ok "the sidecar names run 100"
+else
+    fail "the sidecar does not name run 100"
+fi
+
 start "no earlier night measured: exit zero, no file, says so"
 jobs_json failure > "${JOBS}/200.json"
 jobs_json cancelled > "${JOBS}/100.json"
@@ -361,10 +425,12 @@ else
 fi
 
 start "an artifact that holds no timing file is a warning, not 'did not measure'"
+# The artifact holds a well-formed .txt under another name: only the
+# name the leg uploads counts.
 OUT="${WORK}/notxt.log"
 PREV="${WORK}/notxt/previous.txt"
 STATUS=0
-GH_STUB_DOWNLOAD_NO_TXT=1 GITHUB_RUN_ID=400 run_fetcher "${OUT}" "${PREV}" || STATUS=$?
+GH_STUB_DOWNLOAD_OTHER_TXT=1 GITHUB_RUN_ID=400 run_fetcher "${OUT}" "${PREV}" || STATUS=$?
 if [ "${STATUS}" -eq 0 ] && [ ! -e "${PREV}" ]; then
     ok "exited zero with no file"
 else

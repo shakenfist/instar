@@ -410,11 +410,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   previous measurement must come from a night whose `measure` job
   succeeded, on the same branch. Anything less waits, logging every
   comparison; with no previous measurement it publishes on one night's
-  evidence as
-  before, so the failure direction stays the visible one. `--force` and
-  the `force_timing_pr` dispatch input override the check. Both earlier
-  pull requests would have been held back; a genuine recomposition
-  publishes one night later.
+  evidence as before, so the failure direction stays the visible one.
+  `--force` and the `force_timing_pr` dispatch input override the check.
+  Both earlier pull requests would have been held back; a genuine
+  recomposition publishes one night later.
 
 - **A VHDX written with no block size uses qemu-img's default for its
   size**: 8 MiB up to 1 GiB, 16 MiB up to 100 GiB, 32 MiB up to 32 TiB,

@@ -826,13 +826,15 @@ actually moved.
   night that did not measure is passed over rather than resetting the
   comparison. It leaves the file at `OUTPUT` with a one-line
   `OUTPUT.source` naming the run, or leaves nothing. It exits 0 either
-  way, and a GitHub API failure -- listing the runs, reading a run's
-  jobs, or downloading the artifact of a run that did measure -- is a
-  warning quoting `gh`'s error: without a previous
-  measurement the publisher falls back to publishing on one night's
-  evidence, which is the visible failure (a pull request that may be
-  noise) rather than the silent one (a file ageing with nothing to say
-  why). It needs `actions: read`, which only `publish-timing` holds.
+  way, and a GitHub API failure — listing the runs, reading a run's
+  jobs, or downloading the artifact of a run that did measure — is a
+  warning quoting `gh`'s error: without a previous measurement the
+  publisher falls back to publishing on one night's evidence, which is
+  the visible failure (a pull request that may be noise) rather than
+  the silent one (a file ageing with nothing to say why). The workflow
+  holds it to that with `continue-on-error`, so even a fault in the
+  fetcher itself leaves the publisher running without `--previous`. It
+  needs `actions: read`, which only `publish-timing` holds.
 - **`tools/ci/publish-stestr-timing.sh MEASURED [--previous FILE]
   [--dry-run] [--force]`** acts on those verdicts. A material change
   against the committed file is published only if it has **persisted**:

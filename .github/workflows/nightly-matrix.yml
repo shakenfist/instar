@@ -696,8 +696,17 @@ jobs:
       # material move publishes on one night's evidence as it did
       # before, which is the visible failure direction rather than the
       # silent one.
+      # continue-on-error holds the workflow to that contract rather
+      # than trusting every future edit of the script to: a red step
+      # here would skip the publisher, and with it the failure issue
+      # keyed on the publisher, leaving a red run and nothing else. The
+      # publisher checks this step's outcome, not just the file, so a
+      # fetcher that died part way through writing it is not taken as
+      # the previous night.
       - name: Fetch the previous measurement
         if: steps.measurement.outputs.publishable == 'true'
+        id: fetch_previous
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_RUN_ID: ${{ github.run_id }}
@@ -714,13 +723,16 @@ jobs:
           WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           FORCE: ${{ inputs.force_timing_pr }}
           PREVIOUS: ${{ github.workspace }}/timing-previous/stestr-timing.txt
+          FETCH_OUTCOME: ${{ steps.fetch_previous.outcome }}
         # Captured as well as printed, so that if this step is what
         # failed, the issue filed below can quote the publisher's own
         # output.
         run: |
           cd ${GITHUB_WORKSPACE}/instar
           ARGS=("${{ github.workspace }}/timing/stestr-timing.txt")
-          if [ -s "${PREVIOUS}" ]; then ARGS+=(--previous "${PREVIOUS}"); fi
+          if [ "${FETCH_OUTCOME}" = "success" ] && [ -s "${PREVIOUS}" ]; then
+            ARGS+=(--previous "${PREVIOUS}")
+          fi
           if [ "${FORCE}" = "true" ]; then ARGS+=(--force); fi
           # PIPESTATUS, not a bare pipeline: a run step's default shell
           # is "bash -e" without pipefail, so piping into tee reports
