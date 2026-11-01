@@ -849,7 +849,11 @@ actually moved.
   #857 and #862; a genuine recomposition such as #840's 459 new tests
   publishes one night later than it otherwise would. With no previous
   measurement a material change publishes on one night's evidence, and
-  the pull request body says so. When it does publish it copies the
+  the pull request body says so, pointing at the fetch step's log as
+  the one place that tells "no earlier night measured" from "the fetch
+  failed". A `--force` refresh of an immaterial change consults no
+  previous measurement and says nothing about persistence, because
+  there is no move to persist. When it does publish it copies the
   measurement over the committed file, force-pushes the single
   long-lived `stestr-timing/refresh` branch, and opens a pull request —
   or, if one is already open for that branch, says so and leaves it to

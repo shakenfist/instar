@@ -227,10 +227,17 @@ if [ "$(grep -c 'weight moved between tests' "${OUT}")" -eq 3 ]; then
 else
     fail "did not log every comparison against the previous measurement"
 fi
-if grep -q "the previous measurement differs materially from this one" "${OUT}"; then
-    ok "said the two nights disagree"
+# The previous measurement is the committed file, so BOTH conditions
+# fail, and the summary has to name both rather than stop at the first.
+if grep -q "the previous measurement differs materially from this one, and the previous measurement had not itself moved materially" "${OUT}"; then
+    ok "said the two nights disagree, and that the previous night had not moved"
 else
-    fail "did not say which persistence condition failed"
+    fail "did not name every persistence condition that failed"
+fi
+if grep -q "first night of the move" "${OUT}"; then
+    fail "called a swing the first night of a move"
+else
+    ok "did not call it the first night of the move"
 fi
 
 start "a material move the previous measurement confirms publishes"
@@ -389,10 +396,11 @@ if [ "${STATUS}" -eq 0 ] && grep -q "would publish" "${OUT}"; then
 else
     fail "did not publish without a previous measurement (exit ${STATUS})"
 fi
-if grep -q "No previous measurement was available" "${OUT}"; then
-    ok "the body says the move is unconfirmed"
+if grep -q "No previous measurement reached this job" "${OUT}" \
+    && grep -q "Fetch the previous measurement" "${OUT}"; then
+    ok "the body says the move is unconfirmed, and where to look for why"
 else
-    fail "the body does not say no previous measurement was available"
+    fail "the body does not say no previous measurement reached this job"
 fi
 
 start "--force publishes a move the previous measurement does not confirm"
@@ -405,7 +413,7 @@ if [ "${STATUS}" -eq 0 ] && grep -q "would publish" "${OUT}"; then
 else
     fail "--force did not publish (exit ${STATUS})"
 fi
-if grep -q "does not confirm this one\*\* -- the previous measurement differs materially" "${OUT}"; then
+if grep -q "does not confirm this one\*\* -- the previous measurement differs materially from this one, and" "${OUT}"; then
     ok "the body says the previous measurement does not confirm it, and why"
 else
     fail "the body hides that the previous measurement disagrees"
@@ -425,6 +433,42 @@ if grep -q "previous measurement" "${OUT}"; then
     fail "compared an immaterial move against the previous measurement"
 else
     ok "did not mention the previous measurement"
+fi
+
+start "--force on an immaterial move with a previous measurement says nothing false about it"
+# A force_timing_pr dispatch on a quiet night: the fetch step found a
+# previous measurement, and the move has nothing to persist. The body
+# must neither claim no previous measurement was available nor call the
+# move unconfirmed -- the --force paragraph is the whole story.
+OUT="${WORK}/persist-immaterial-forced.log"
+STATUS=0
+run_publisher "${OUT}" "${WORK}/slower.txt" --previous "${WORK}/previous-agrees.txt" --dry-run --force \
+    || STATUS=$?
+if [ "${STATUS}" -eq 0 ] && grep -q "would publish" "${OUT}"; then
+    ok "offered to publish"
+else
+    fail "--force did not publish an immaterial move with a previous measurement (exit ${STATUS})"
+fi
+BODY="$(sed -n '/^--- body ---$/,/^--- end body ---$/p' "${OUT}")"
+if printf '%s\n' "${BODY}" | grep -q "No previous measurement" \
+    || printf '%s\n' "${BODY}" | grep -q "does not confirm this one" \
+    || printf '%s\n' "${BODY}" | grep -q "The move has persisted"; then
+    fail "the body says something about persistence for a move that has none"
+else
+    ok "the body has no persistence paragraph"
+fi
+if printf '%s\n' "${BODY}" | grep -q "did not consider the change material"; then
+    ok "the body says the change was forced though immaterial"
+else
+    fail "the body does not say the change was immaterial"
+fi
+# The committed-file comparison, once in the log and once in the body,
+# and nothing else: a comparison against the previous measurement would
+# add one to each.
+if [ "$(grep -c 'weight moved between tests' "${OUT}")" -eq 2 ]; then
+    ok "ran no comparison against the previous measurement"
+else
+    fail "compared an immaterial forced move against the previous measurement"
 fi
 
 start "a previous measurement that is missing or malformed is an error"

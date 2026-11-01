@@ -216,9 +216,9 @@ if [ "${MATERIAL}" -eq 0 ]; then
     echo "note: --force set, publishing an immaterial refresh anyway."
 fi
 
-# The persistence check. Only a material move reaches here, so the
-# question is whether the previous measurement already showed the same
-# move, which takes two comparisons, both of which must hold:
+# The persistence check, for a material move: whether the previous
+# measurement already showed the same move, which takes two comparisons,
+# both of which must hold:
 #   - previous against tonight must be IMMATERIAL: the two nights agree
 #     with each other;
 #   - committed against previous must be MATERIAL: the previous night
@@ -230,15 +230,26 @@ fi
 # is one night's move, and publishing it as "persisted" would be the
 # exact noise this check exists to hold back.
 #
+# An immaterial move reaches here only under --force, and has no move to
+# persist: the previous measurement is not consulted, and the body says
+# nothing about it beyond the --force paragraph.
+#
 # PERSISTENCE is what the pull request body says about it:
-#   agreed    both comparisons hold
-#   unchecked no previous measurement was available
-#   forced    one of them does not hold and --force overrode it
-PERSISTENCE="unchecked"
+#   agreed         both comparisons hold
+#   unchecked      no previous measurement reached this job
+#   forced         one of them does not hold and --force overrode it
+#   not-applicable the move is immaterial, so there is nothing to check
 PREVIOUS_REPORT=""
 PREVIOUS_MOVED_REPORT=""
 PREVIOUS_SOURCE=""
-if [ "${MATERIAL}" -eq 1 ] && [ -n "${PREVIOUS}" ]; then
+if [ "${MATERIAL}" -eq 0 ]; then
+    PERSISTENCE="not-applicable"
+    if [ -n "${PREVIOUS}" ]; then
+        echo "note: an immaterial move has nothing to persist; not comparing it with ${PREVIOUS}."
+    fi
+elif [ -z "${PREVIOUS}" ]; then
+    PERSISTENCE="unchecked"
+else
     if [ -s "${PREVIOUS}.source" ]; then
         PREVIOUS_SOURCE="$(head -n 1 "${PREVIOUS}.source")"
     else
@@ -278,11 +289,18 @@ if [ "${MATERIAL}" -eq 1 ] && [ -n "${PREVIOUS}" ]; then
         echo "moved materially from ${COMMITTED_REL}; the move has persisted."
         echo ""
     else
+        # Every condition that failed, not just the first: the
+        # summary is what a reader of the body sees, and the two point
+        # at different things -- a swing, or the first night of a move.
         PERSISTENCE_GAP=""
         if [ "${PREVIOUS_RC}" -eq 0 ]; then
             PERSISTENCE_GAP="the previous measurement differs materially from this one"
-        else
-            PERSISTENCE_GAP="the previous measurement had not itself moved materially from ${COMMITTED_REL}, so this is the first night of the move"
+        fi
+        if [ "${PREVIOUS_MOVED_RC}" -eq 10 ]; then
+            PERSISTENCE_GAP="${PERSISTENCE_GAP:+${PERSISTENCE_GAP}, and }the previous measurement had not itself moved materially from ${COMMITTED_REL}"
+            if [ "${PREVIOUS_RC}" -eq 10 ]; then
+                PERSISTENCE_GAP="${PERSISTENCE_GAP}, so this is the first night of the move"
+            fi
         fi
         echo "Timings moved materially against ${COMMITTED_REL}, but ${PERSISTENCE_GAP}."
         if [ "${FORCE}" -eq 0 ]; then
@@ -328,11 +346,19 @@ trap 'rm -f "${BODY_FILE}"' EXIT
             printf ' out to be; both comparisons are at the end of this body.\n\n'
             ;;
         unchecked)
-            printf '**No previous measurement was available to check this against**,'
-            printf ' so this refresh rests on one night'"'"'s evidence. A move that'
-            printf ' is contention rather than change will reverse on the next'
-            printf ' measurement, and that is a reason to leave this open a day'
-            printf ' rather than a reason to doubt the file.\n\n'
+            # "Reached this job" rather than "existed": the fetcher
+            # leaves no file both when no earlier night measured and
+            # when it could not ask -- a lost `actions: read` scope, a
+            # rejected token -- and only its log tells the two apart.
+            printf '**No previous measurement reached this job to check this'
+            printf ' against**, so this refresh rests on one night'"'"'s evidence.'
+            printf ' Either no earlier night measured, or fetching its'
+            printf ' measurement failed; the "Fetch the previous measurement"'
+            printf ' step'"'"'s log says which, and a warning there is worth'
+            printf ' fixing. A move that is contention rather than change will'
+            printf ' reverse on the next measurement, and that is a reason to'
+            printf ' leave this open a day rather than a reason to doubt the'
+            printf ' file.\n\n'
             ;;
         forced)
             printf '**The previous measurement, from %s, does not confirm this one**' \
@@ -340,6 +366,12 @@ trap 'rm -f "${BODY_FILE}"' EXIT
             printf ' -- %s -- and the refresh was opened anyway with `--force` from a' \
                 "${PERSISTENCE_GAP}"
             printf ' manual dispatch. Both comparisons are at the end of this body.\n\n'
+            ;;
+        not-applicable)
+            ;;
+        *)
+            echo "error: unknown persistence state '${PERSISTENCE}'" >&2
+            exit 1
             ;;
     esac
     printf '**Its checks are awaiting approval rather than running, and that is'
@@ -403,10 +435,10 @@ git commit -m "Refresh the committed stestr test timings.
 Measured by the nightly matrix workflow's measurement leg, which runs
 the whole Python suite in one stestr repository and re-derives the
 per-test durations tools/ci/seed-stestr-timing.sh loads before a run.
-The refresh was published because
-tools/ci/compare-stestr-timing.py found the suite's weight had moved
-materially, and the previous measurement agreed where one was available;
-see the pull request body for the comparisons.
+The pull request body carries tools/ci/compare-stestr-timing.py's
+comparison against the committed file, says whether the previous
+measurement confirmed it, and says why it was published if it was
+forced.
 
 This changes which worker a test runs on and nothing about what is
 tested."

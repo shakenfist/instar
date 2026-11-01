@@ -176,7 +176,7 @@ while IFS=$'\t' read -r run_id created url; do
     fi
     # The artifact is the one file the measuring leg uploads, which
     # download-artifact unpacks under its own name.
-    CANDIDATE="$(find "${SCRATCH}/download" -type f -name '*.txt' | head -n 1)"
+    CANDIDATE="$(find "${SCRATCH}/download" -type f -name '*.txt' -print -quit)"
     if [ -z "${CANDIDATE}" ] || [ ! -s "${CANDIDATE}" ]; then
         echo "warning: run ${run_id} measured, but its ${ARTIFACT} artifact holds no timing file" >&2
         UNCHECKED=$((UNCHECKED + 1))

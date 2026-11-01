@@ -52,7 +52,8 @@ cat > "${STUB_BIN}/gh" <<'STUB'
 # set. `gh run download ID --name NAME --dir DIR` copies the canned
 # artifact GH_STUB_ARTIFACTS/ID.txt into DIR/stestr-timing.txt if it
 # exists, fails the way the real one does for a run with no such
-# artifact, or fails with a 403 if GH_STUB_DOWNLOAD_FAILS is set.
+# artifact, or fails with a 403 if GH_STUB_DOWNLOAD_FAILS is set. With
+# GH_STUB_DOWNLOAD_NO_TXT set it succeeds but unpacks no .txt file.
 printf '%s\n' "$*" >> "${GH_STUB_LOG}"
 case "${1:-} ${2:-}" in
     "run list")
@@ -84,7 +85,10 @@ case "${1:-} ${2:-}" in
             if [ "$1" = "--dir" ]; then dir="$2"; fi
             shift
         done
-        if [ -f "${GH_STUB_ARTIFACTS}/${run_id}.txt" ]; then
+        if [ -n "${GH_STUB_DOWNLOAD_NO_TXT:-}" ]; then
+            mkdir -p "${dir}"
+            echo "not a timing file" > "${dir}/README.md"
+        elif [ -f "${GH_STUB_ARTIFACTS}/${run_id}.txt" ]; then
             mkdir -p "${dir}"
             cp "${GH_STUB_ARTIFACTS}/${run_id}.txt" "${dir}/stestr-timing.txt"
         else
@@ -115,6 +119,7 @@ run_fetcher() {
         GH_STUB_LIST_FAILS="${GH_STUB_LIST_FAILS:-}" \
         GH_STUB_VIEW_FAILS="${GH_STUB_VIEW_FAILS:-}" \
         GH_STUB_DOWNLOAD_FAILS="${GH_STUB_DOWNLOAD_FAILS:-}" \
+        GH_STUB_DOWNLOAD_NO_TXT="${GH_STUB_DOWNLOAD_NO_TXT:-}" \
         GITHUB_RUN_ID="${GITHUB_RUN_ID:-}" \
         GITHUB_REF_NAME="${GITHUB_REF_NAME:-}" \
         TIMING_BRANCH="${TIMING_BRANCH:-}" \
@@ -353,6 +358,36 @@ if grep -q 'could not be checked' "${OUT}" && ! grep -q '^No previous measuremen
     ok "the summary says runs could not be checked, not that none measured"
 else
     fail "the summary reads as a quiet night"
+fi
+
+start "an artifact that holds no timing file is a warning, not 'did not measure'"
+OUT="${WORK}/notxt.log"
+PREV="${WORK}/notxt/previous.txt"
+STATUS=0
+GH_STUB_DOWNLOAD_NO_TXT=1 GITHUB_RUN_ID=400 run_fetcher "${OUT}" "${PREV}" || STATUS=$?
+if [ "${STATUS}" -eq 0 ] && [ ! -e "${PREV}" ]; then
+    ok "exited zero with no file"
+else
+    fail "an artifact without a timing file did not fall back (exit ${STATUS})"
+fi
+if grep -q 'warning: run 200 measured, but its stestr-timing artifact holds no timing file' "${OUT}" \
+    && grep -q 'could not be checked' "${OUT}"; then
+    ok "warned, naming the run"
+else
+    fail "an artifact without a timing file was not reported"
+fi
+
+start "a run list that is not JSON is a warning, not 'did not measure'"
+echo 'this is not json' > "${WORK}/runs-malformed.json"
+OUT="${WORK}/badjson.log"
+PREV="${WORK}/badjson/previous.txt"
+STATUS=0
+RUNS_JSON="${WORK}/runs-malformed.json" GITHUB_RUN_ID=400 run_fetcher "${OUT}" "${PREV}" || STATUS=$?
+if [ "${STATUS}" -eq 0 ] && [ ! -e "${PREV}" ] \
+    && grep -q 'warning: could not read the run list' "${OUT}"; then
+    ok "exited zero with no file, and warned"
+else
+    fail "a malformed run list was not reported as a warning (exit ${STATUS})"
 fi
 
 start "reading a run's jobs failing is a warning, not 'did not measure'"
