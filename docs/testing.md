@@ -817,7 +817,8 @@ actually moved.
 - **`tools/ci/fetch-previous-stestr-timing.sh OUTPUT`** finds the most
   recent *earlier* night's measurement: it walks the nightly workflow's
   recent runs on the same branch newest first, skips the run it is part
-  of, and takes the `stestr-timing` artifact of the first run whose
+  of and any run newer than it (so a re-run of an old night's publish
+  job does not compare against a later night), and takes the `stestr-timing` artifact of the first run whose
   `measure` job concluded `success`. That is the same standard tonight's
   measurement had to meet to reach the publisher at all, and it matters
   because the artifact is uploaded even when the suite fails: a night
@@ -875,8 +876,12 @@ one contended night. A run of nights that each fail to confirm the one
 before leaves the committed file ageing with nothing saying so — the
 silent failure the rest of this mechanism avoids. It means either the
 thresholds sit below the measuring leg's night-to-night noise and want
-raising, or something still contends with the measuring leg; the only
-record is the `publish-timing` job's uploaded log, where each waiting
+raising, or something still contends with the measuring leg. It can
+also be a busy stretch of changes to the suite itself: the previous
+night's measurement is of whatever commit that night ran, so a night
+that added or removed heavy tests differs from the one before, and
+nights that each change the test set keep postponing the refresh. The
+only record is the `publish-timing` job's uploaded log, where each waiting
 night says `Waiting for a measurement that agrees with the one before
 it`. Escalating after N consecutive waits is tracked in
 [#864](https://github.com/shakenfist/instar/issues/864).

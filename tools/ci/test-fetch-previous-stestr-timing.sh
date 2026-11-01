@@ -274,6 +274,43 @@ else
     fail "did not take the newest artifact (exit ${STATUS})"
 fi
 
+start "a run newer than the current one is not its previous night"
+# A re-run of run 200's publish job, after 300, 350 and 400 have run:
+# 400 measured, and is newer, so it must not stand in for the night
+# before 200.
+: > "${GH_LOG}"
+OUT="${WORK}/newer.log"
+PREV="${WORK}/newer/previous.txt"
+STATUS=0
+GITHUB_RUN_ID=200 run_fetcher "${OUT}" "${PREV}" || STATUS=$?
+if [ "${STATUS}" -eq 0 ] && [ -s "${PREV}" ] && grep -q '100.00' "${PREV}"; then
+    ok "took run 100's artifact"
+else
+    fail "did not take the night before the current run (exit ${STATUS})"
+fi
+if grep -q 'run download 400' "${GH_LOG}"; then
+    fail "took a newer run's artifact as the previous night"
+else
+    ok "never asked for a newer run's artifact"
+fi
+if grep -q 'Run 400 .*newer than this run' "${OUT}"; then
+    ok "said why the newer run did not count"
+else
+    fail "passed over the newer run without saying why"
+fi
+
+start "a current run missing from the list leaves no previous measurement"
+OUT="${WORK}/unlisted.log"
+PREV="${WORK}/unlisted/previous.txt"
+STATUS=0
+GITHUB_RUN_ID=50 run_fetcher "${OUT}" "${PREV}" || STATUS=$?
+if [ "${STATUS}" -eq 0 ] && [ ! -e "${PREV}" ] \
+    && grep -q 'warning: this run (50) is not among the last' "${OUT}"; then
+    ok "exited zero with no file, and warned"
+else
+    fail "a current run older than every listed run took a newer one (exit ${STATUS})"
+fi
+
 start "a gh that reads stdin does not swallow the run list"
 # The loop's gh calls inherit its stdin. Were the list on stdin, the
 # first of them to read it would leave nothing to walk, and the result

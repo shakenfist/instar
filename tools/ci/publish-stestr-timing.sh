@@ -101,16 +101,16 @@
 #   --previous FILE
 #                  the most recent earlier measurement, in the same
 #                  format, as tools/ci/fetch-previous-stestr-timing.sh
-#                  leaves it. A material move is published only if it
-#                  is immaterial against this file too, and this file
-#                  is itself material against the committed one. If
-#                  FILE.source
-#                  exists its one line names where the measurement came
-#                  from and is quoted in the pull request body. Omit it
-#                  when there is no previous measurement; naming a file
-#                  that does not exist is an error, because a publisher
-#                  that quietly skipped the check would be back to
-#                  publishing noise with nothing in the log to say so.
+#                  leaves it. A material move is published only if it is
+#                  immaterial against this file too, and this file is
+#                  itself material against the committed one. If
+#                  FILE.source exists its one line names where the
+#                  measurement came from and is quoted in the pull
+#                  request body. Omit it when there is no previous
+#                  measurement; naming a file that does not exist is an
+#                  error, because a publisher that quietly skipped the
+#                  check would be back to publishing noise with nothing
+#                  in the log to say so.
 #   --dry-run      print the verdict, the title and the body, and touch
 #                  neither git nor the GitHub API. How
 #                  tools/ci/test-publish-stestr-timing.sh exercises the

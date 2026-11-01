@@ -429,10 +429,13 @@ if [ "${STATUS}" -eq 0 ] && ! grep -q "would publish" "${OUT}"; then
 else
     fail "an immaterial move with a previous measurement misbehaved (exit ${STATUS})"
 fi
-if grep -q "previous measurement" "${OUT}"; then
-    fail "compared an immaterial move against the previous measurement"
+# The committed-file comparison, once in the log and nowhere else: no
+# body is written, and a comparison against the previous measurement
+# would add one.
+if [ "$(grep -c 'weight moved between tests' "${OUT}")" -eq 1 ]; then
+    ok "ran no comparison against the previous measurement"
 else
-    ok "did not mention the previous measurement"
+    fail "compared an immaterial move against the previous measurement"
 fi
 
 start "--force on an immaterial move with a previous measurement says nothing false about it"

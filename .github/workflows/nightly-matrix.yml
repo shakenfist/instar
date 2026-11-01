@@ -382,6 +382,8 @@ jobs:
     # report.
     needs: [package-build, nightly-legs]
     if: ${{ !cancelled() && needs.package-build.result == 'success' }}
+    # TIMING_JOB in tools/ci/fetch-previous-stestr-timing.sh matches
+    # this name; a rename must change both.
     name: "Measure: full suite on Debian 13"
     # `instar` asks the fleet for a runner carrying the pre-seeded
     # instar-testdata dependencies disk, which is what lets the step below

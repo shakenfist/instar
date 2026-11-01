@@ -8,8 +8,10 @@
 # as the `stestr-timing` artifact of its run, kept for 30 days whether
 # or not anything was published from it. This walks the recent runs of
 # the nightly workflow on one branch, newest first, skipping the run it
-# is itself part of, and takes the artifact of the first run whose
-# measuring job concluded `success`.
+# is itself part of and every run newer than it, and takes the artifact
+# of the first run whose measuring job concluded `success`. A re-run of
+# an old night's publish job must compare against the night before that
+# one, not against a later night that measured since.
 #
 # That job conclusion is the same standard tonight's measurement had to
 # meet: `publish-timing` refuses a measurement unless `measure`
@@ -40,6 +42,9 @@
 #   GITHUB_RUN_ID    (optional) the current run, which is never a
 #                    candidate: its own artifact is the measurement being
 #                    checked, and a measurement always agrees with itself.
+#                    Nor is any run listed before it, which is newer. If
+#                    it is not among the runs listed at all, every one of
+#                    them is newer and there is no previous measurement.
 #   TIMING_WORKFLOW  (default nightly-matrix.yml) the workflow whose runs
 #                    carry the artifact.
 #   TIMING_BRANCH    (default GITHUB_REF_NAME, else develop) the branch
@@ -145,9 +150,18 @@ PY
 # extension -- would swallow the rest of the list, and the result would
 # read as a quiet night.
 UNCHECKED=0
+# With no current run every listed run is a candidate; with one, only
+# those listed after it, which is the order gh lists them in.
+PAST_CURRENT=0
+[ -n "${CURRENT}" ] || PAST_CURRENT=1
 while IFS=$'\t' read -r -u 3 run_id created url; do
     [ -n "${run_id}" ] || continue
     if [ "${run_id}" = "${CURRENT}" ]; then
+        PAST_CURRENT=1
+        continue
+    fi
+    if [ "${PAST_CURRENT}" -eq 0 ]; then
+        echo "Run ${run_id} (${created}) is newer than this run, so it is not its previous night."
         continue
     fi
 
@@ -199,6 +213,11 @@ while IFS=$'\t' read -r -u 3 run_id created url; do
     exit 0
 done 3< "${SCRATCH}/runs.tsv"
 
+if [ "${PAST_CURRENT}" -eq 0 ]; then
+    echo "warning: this run (${CURRENT}) is not among the last ${LIMIT} ${WORKFLOW} runs on ${BRANCH}," >&2
+    echo "    so every run listed is newer than it; nothing to check persistence against." >&2
+    exit 0
+fi
 if [ "${UNCHECKED}" -gt 0 ]; then
     echo "warning: no previous measurement among the last ${LIMIT} ${WORKFLOW} runs on ${BRANCH}," >&2
     echo "    and ${UNCHECKED} of them could not be checked (see above); nothing to check persistence against." >&2
