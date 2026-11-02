@@ -76,6 +76,8 @@ set -euo pipefail
 # testdata clone, so a relative $0 would not survive to the fixture
 # check below.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=tools/ci/gitlab-credential.sh
+. "${SCRIPT_DIR}/gitlab-credential.sh"
 
 TESTDATA_CACHE="${TESTDATA_CACHE:-/srv/ci/cached/instar-testdata}"
 REPO_HOST='gitlab.home.stillhq.com'
@@ -123,9 +125,13 @@ if [ -z "${GITHUB_WORKSPACE:-}" ]; then
     exit 1
 fi
 
-# Token only ever appears inside git command arguments below, never in a
-# traced or echoed line, so keep shell tracing off.
-AUTHED_URL="https://oauth2:${TESTDATA_TOKEN}@${REPO_HOST}/${REPO_PATH}"
+# The remote is always the clean URL, and the token reaches git and
+# git-lfs through a credential store on tmpfs that is removed when this
+# script exits; see tools/ci/gitlab-credential.sh. A token in the URL
+# would be recorded in the tree's .git/config, and anything that later
+# reads the tree -- the fuzz corpus seeding did, until 4757d5b1 -- can
+# carry it somewhere it is published (shakenfist/shakenfist#4714).
+CLEAN_URL="https://${REPO_HOST}/${REPO_PATH}"
 
 # Read as a tri-state rather than compared against '1', because the
 # two ways of getting this wrong are not symmetric. An unrecognised
@@ -189,6 +195,9 @@ fi
 STAT_DIRTY=''
 LFS_POINTERS=''
 
+stage_gitlab_credential TESTDATA_TOKEN
+trap clear_gitlab_credential EXIT
+
 if [ -d "${TESTDATA_CACHE}/.git" ]; then
     echo "Using cached testdata at ${TESTDATA_CACHE}, updating in place..."
     cd "${TESTDATA_CACHE}"
@@ -213,7 +222,8 @@ if [ -d "${TESTDATA_CACHE}/.git" ]; then
     # evidence before it could be read. Nothing may run them here
     # first.
     STAT_DIRTY="$(git diff-files --name-only -z | tr '\0' '\n')"
-    git remote set-url origin "${AUTHED_URL}"
+    # Also scrubs a credential URL an older cache may still carry.
+    git remote set-url origin "${CLEAN_URL}"
     git fetch --depth 1 origin main
     git reset --hard origin/main
     TESTDATA_PATH="${TESTDATA_CACHE}"
@@ -237,7 +247,7 @@ else
     echo "No cache at ${TESTDATA_CACHE}, cloning fresh..."
     TESTDATA_PATH="${GITHUB_WORKSPACE}/instar-testdata"
     TESTDATA_SOURCE='clone'
-    git clone --depth 1 "${AUTHED_URL}" "${TESTDATA_PATH}"
+    git clone --depth 1 "${CLEAN_URL}" "${TESTDATA_PATH}"
     cd "${TESTDATA_PATH}"
 fi
 
@@ -259,6 +269,8 @@ if [ "${TESTDATA_SOURCE}" = 'cache' ]; then
     LFS_POINTERS="$(git lfs ls-files | sed -n 's/^[0-9a-f]* - //p')"
 fi
 git lfs pull
+# Nothing after this talks to GitLab. The trap covers a failure above.
+clear_gitlab_credential
 
 # The paths this update brought in, for a later step that needs to treat
 # them differently from the rest of the tree -- resparsifying only them,

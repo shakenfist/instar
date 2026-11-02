@@ -134,6 +134,31 @@ check "says there is nothing to push" \
 check "no commit was made" \
     "$(git_q -C "${UP}" rev-list --count HEAD)" "1"
 
+echo "--- an entry holding a credential URL stops the push"
+# shakenfist/shakenfist#4714: a .git/config with the push token in its
+# remote URL was kept by the fuzzer and pushed. One clean entry rides
+# along to prove the refusal is of the whole push, not of one file.
+UP="${WORK}/up6"
+SRC="${WORK}/src6"
+make_upstream "${UP}"
+make_local_corpus "${SRC}"
+echo clean > "${SRC}/fuzz_alpha/eeee5555"
+printf '[remote "origin"]\n\turl = https://oauth2:%s@gitlab.example/x.git\n' \
+    'fake-token-value' > "${SRC}/fuzz_beta/ffff6666"
+
+if PUSH_TOKEN=unused PUSH_URL="${UP}" CORPUS_SRC="${SRC}" \
+        "${PUSHER}" > "${WORK}/out6" 2>&1; then
+    fail "a credential URL in the corpus should exit non-zero"
+else
+    ok "a credential URL in the corpus exits non-zero"
+fi
+check "names the offending entry" \
+    "$(grep -c '^    fuzz_beta/ffff6666$' "${WORK}/out6" || true)" "1"
+check "never prints the credential" \
+    "$(grep -c 'fake-token-value' "${WORK}/out6" || true)" "0"
+check "nothing was pushed, not even the clean entry" \
+    "$(git_q -C "${UP}" rev-list --count HEAD)" "1"
+
 echo "--- missing token and missing corpus are not failures"
 if PUSH_URL="${UP}" CORPUS_SRC="${SRC}" "${PUSHER}" \
         > "${WORK}/out4" 2>&1; then

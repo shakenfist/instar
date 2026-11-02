@@ -48,6 +48,18 @@
 #
 # Exits 0 without pushing when there is no token or no corpus, so a
 # fork or a local dry run is not an error.
+#
+# Refuses, pushing nothing, when a new entry contains a GitLab
+# credential URL (oauth2:<token>@). Fuzzers keep any input that reaches
+# new code, and a seed walk that once read the testdata tree's
+# .git/config put the push token into instar-testdata this way, where
+# every instar runner's testdata disk then carried it
+# (shakenfist/shakenfist#4714). A night's corpus is cheap to lose next
+# to that.
+#
+# The token here is in the URL of a throwaway clone under a mktemp
+# directory that the EXIT trap removes, and that clone is never read
+# by anything else, so it is left as it is.
 
 set -euo pipefail
 
@@ -109,6 +121,29 @@ fi
 mkdir -p "${PUSH_DIR}/${CORPUS_PREFIX}"
 tar -C "${CORPUS_SRC}" -cf - --files-from "${WORK}/new" \
     | tar -C "${PUSH_DIR}/${CORPUS_PREFIX}" -xf -
+
+# The corpus directory in the clone holds only what was just copied in:
+# it lies outside the sparse cone, so nothing committed is checked out
+# there. -a so that a binary seed is searched too, not skipped. Only the
+# names are printed, never the matching text.
+leak_rc=0
+grep -rlaE -e 'oauth2:[^@[:space:]]*@' -- "${PUSH_DIR}/${CORPUS_PREFIX}" \
+    > "${WORK}/leaks" || leak_rc=$?
+case "${leak_rc}" in
+    0)
+        echo "::error::Refusing to push the fuzz corpus: these new entries" \
+             "contain a GitLab credential URL. Find how a credential reached" \
+             "the fuzzer's inputs, rotate the token, and delete the entries" \
+             "from ${CORPUS_SRC}." >&2
+        sed "s|^${PUSH_DIR}/${CORPUS_PREFIX}/|    |" "${WORK}/leaks" >&2
+        exit 1
+        ;;
+    1) ;;
+    *)
+        echo "::error::Could not search the new corpus entries for credentials" >&2
+        exit "${leak_rc}"
+        ;;
+esac
 
 sed "s|^|${CORPUS_PREFIX}/|" "${WORK}/new" > "${WORK}/new-paths"
 git -C "${PUSH_DIR}" add --sparse --pathspec-from-file="${WORK}/new-paths"
