@@ -61,8 +61,35 @@ cat > "${STUB_BIN}/git" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Credentials travel in the clone/remote URL, so the log records the
-# subcommand and strips anything carrying one.
+# Where git would find the token, recorded beside the log: whether any
+# argument carries it, and whether the credential store this git was
+# pointed at by GIT_CONFIG_* holds it. The values are yes or no, never
+# the token. The store paths go to a third file, so the test can check
+# they are gone once the script has exited.
+args_token=no
+for arg in "$@"; do
+    case "${arg}" in
+        *"${TESTDATA_TOKEN}"*) args_token=yes ;;
+    esac
+done
+store_token=no
+for (( i = 0; i < ${GIT_CONFIG_COUNT:-0}; i++ )); do
+    value_var="GIT_CONFIG_VALUE_${i}"
+    case "${!value_var}" in
+        'store --file='*)
+            store="${!value_var#store --file=}"
+            echo "${store}" >> "${GIT_STUB_LOG}.stores"
+            if grep -qF "${TESTDATA_TOKEN}" "${store}" 2>/dev/null; then
+                store_token=yes
+            fi
+            ;;
+    esac
+done
+printf '%s args-token=%s store-token=%s\n' "$1" "${args_token}" "${store_token}" \
+    >> "${GIT_STUB_LOG}.credential"
+
+# The script no longer puts a credential in a URL, but the log still
+# strips URLs, so that a regression that did cannot print one.
 {
     printf '%s' "$1"
     for arg in "${@:2}"; do
@@ -409,6 +436,39 @@ if [ "$(blocks "${NARROW_TREE}/downloaded/qemu-iotests/updated.qcow2")" -lt "${U
 else
     fail "wrong images rewritten: ${OUTPUT}"
 fi
+
+start "the token reaches git through a tmpfs store, never an argument"
+# shakenfist/shakenfist#4714: a token in the remote URL is written to
+# the tree's .git/config, and from there the fuzz corpus seeding carried
+# one into instar-testdata. Both branches are checked, because they put
+# the URL in different places: the cache branch with set-url, the clone
+# branch with clone.
+for case_name in cache clone; do
+    cred_log="${WORK}/${case_name}/log.credential"
+    if grep -q 'args-token=yes' "${cred_log}"; then
+        fail "${case_name}: a git command was given the token as an argument"
+    else
+        ok "${case_name}: no git command was given the token as an argument"
+    fi
+    for cmd in clone fetch lfs; do
+        if ! grep -q "^${cmd} " "${cred_log}"; then
+            continue
+        fi
+        if grep "^${cmd} " "${cred_log}" | grep -q 'store-token=no'; then
+            fail "${case_name}: git ${cmd} ran without the staged credential"
+        else
+            ok "${case_name}: git ${cmd} ran with the staged credential"
+        fi
+    done
+    stores="${WORK}/${case_name}/log.stores"
+    if [ ! -s "${stores}" ]; then
+        fail "${case_name}: no credential store was ever staged"
+    elif sort -u "${stores}" | while read -r store; do [ ! -e "${store}" ]; done; then
+        ok "${case_name}: the credential store is gone after exit"
+    else
+        fail "${case_name}: the credential store survived the script"
+    fi
+done
 
 start "running by hand, with no \$GITHUB_ENV"
 # Developers and anyone debugging a runner run this directly. An
