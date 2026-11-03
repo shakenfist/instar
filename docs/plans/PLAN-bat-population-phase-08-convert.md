@@ -347,6 +347,43 @@ Every brief also carries the session's standing rules:
   no test allocates a data region.
 * Leave the work uncommitted.
 
+## Execution notes
+
+* **Back brief, 2026-11-04 (AEDT).** The operator kept decision 2 as
+  recommended: the host extends the fixed convert output to its
+  `fixed_file_length` at open, mirroring phase 7's create. They kept the
+  planned models (opus/high for 8a and 8b, sonnet/medium for 8c) and
+  allowed this session to push the branch and open the pull request once
+  the definition of done passes. The steps run in order.
+* **8a.** Implemented as planned. Two management-session corrections,
+  both in the step commit (`86ffcebd`):
+  * the brief carried a wrong line reference for `ConvertArgs.subformat`
+    (`:7382-7386` is `MeasureArgs`, not `ConvertArgs`), so the agent
+    added `dynamic`/`fixed` to **measure**'s `--subformat` value_parser,
+    which is out of scope (measure is phase 9). Reverted. `ConvertArgs`
+    has no `value_parser`, so convert already accepts any `--subformat`
+    string and the host `match` validates it; the convert path needed no
+    parser change. Its stale "Only valid with -O vmdk" doc comment was
+    corrected to name vhdx instead.
+  * one over-long line in `docs/testing.md` was rewrapped.
+* **8a verification (management session, built at `86ffcebd`).**
+  `make instar` clean; `make check-binary-sizes` OK (`convert.bin`
+  375,800 B, 47% of the 768 KiB cap, up from 370,960 B at `d88c6e37`);
+  `pre-commit run --all-files` passes; `tools/mutate-differencing.sh
+  --check-patterns` reports 149 land, 0 drifted. `TestConvertVhdxFixed`
+  (4 tests) passes, including the structural comparison against live
+  `qemu-img convert -o subformat=fixed,block_state_zero=off`,
+  `qemu-img compare` identical and both `check`s clean. The dynamic
+  convert output is unchanged: the agent's `cmp` against a `d88c6e37`
+  build was byte-identical, and the management corrections touch neither
+  `convert.bin` nor the dynamic convert host path, so it carries over.
+  The agent's full-suite stestr run showed 5 failures that all passed on
+  `--concurrency 1` replay (host-contention flakes in untouched
+  vhd/vmdk/qcow2 paths), as earlier phases saw.
+* **Decision 6 settled.** The dynamic path's silent in-memory-BAT
+  ceiling is reachable from the CLI; recorded in the master plan's
+  Future work, not fixed.
+
 ## Risks and mitigations
 
 * **A fixed convert image that is structurally right and still has the
