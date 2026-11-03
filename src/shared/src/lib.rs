@@ -2714,6 +2714,18 @@ impl ConvertConfig {
     /// window fields and behaves identically to a plain `convert`.
     pub const FLAG_DD_WINDOW: u32 = 1 << 5;
 
+    /// Flag: Write a fixed-subformat VHDX (`-O vhdx --subformat fixed`).
+    ///
+    /// Set only for VHDX output. When set, the guest streams a BAT whose
+    /// every payload entry is `PAYLOAD_BLOCK_FULLY_PRESENT` at the block's
+    /// fixed file offset and writes each non-zero payload block in place
+    /// (zero blocks stay holes), matching qemu-img's
+    /// `-o subformat=fixed,block_state_zero=off` layout. When clear, the
+    /// guest writes the dynamic layout it always has. Convert's fixed
+    /// layout is always `block_state_zero=off`, so no second flag carries
+    /// the block state.
+    pub const FLAG_VHDX_FIXED: u32 = 1 << 6;
+
     /// Flag: Verbose logging
     pub const FLAG_VERBOSE: u32 = 1 << 31;
 
@@ -2757,6 +2769,11 @@ impl ConvertConfig {
     /// Check if a `dd` input window (`window_start`/`window_end`) is active.
     pub fn has_dd_window(&self) -> bool {
         (self.flags & Self::FLAG_DD_WINDOW) != 0
+    }
+
+    /// Check if the fixed VHDX subformat was requested.
+    pub fn vhdx_fixed(&self) -> bool {
+        (self.flags & Self::FLAG_VHDX_FIXED) != 0
     }
 
     /// Check if compression is enabled

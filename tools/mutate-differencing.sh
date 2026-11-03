@@ -682,7 +682,7 @@ self_test() {
 # phase's definition of done asks the two to stay in step, which until
 # now was a promise kept by hand. Asserting it makes the drift a
 # failure instead of a documentation bug nobody reads.
-EXPECTED_CASES=145
+EXPECTED_CASES=149
 
 check_case_count() {
     # Only meaningful for a whole run; a selection is expected to be short.
@@ -2575,6 +2575,7 @@ integration_case 'check-chain-device-count-guard-removed' "${VMM_MAIN}" \
 # ---------------------------------------------------------------------
 
 CREATE_OP='src/operations/create/src/main.rs'
+CONVERT_OP='src/operations/convert/src/main.rs'
 ROUND_TRIP='test_create.TestCreateSmoke.test_create_vhd_and_vhdx_differencing_round_trip'
 MISMATCH='test_create.TestCreateSmoke.test_create_vhd_and_vhdx_reject_mismatched_parent_format'
 FIXED_PARENT='test_create.TestCreateSmoke.test_create_vhd_differencing_from_a_fixed_parent'
@@ -2708,6 +2709,44 @@ integration_case 'create-host-vhdx-fixed-efbig-mapping-removed' "${VMM_MAIN}" \
     $'    BackingStore::open(path, false, Some(geometry.fixed_file_length), false).map_err(|e| {\n        if e.raw_os_error() == Some(libc::EFBIG) {\n            let _ = std::fs::remove_file(path);\n        }\n        fixed_vhdx_open_error(&e, filename, geometry).into()\n    })' \
     $'    BackingStore::open(path, false, Some(geometry.fixed_file_length), false).map_err(|e| { // MUTATED\n        format!("create: open \'{}\' for write failed: {}", filename, e).into()\n    })' \
     'test_create.TestCreateVhdxFixedLarge.test_file_size_limit_is_refused_like_a_filesystem_ceiling'
+
+# A fixed VHDX convert, from the host's CLI gate to the guest's BAT
+# stream and in-place payload. Each mutation below still writes a file a
+# reader opens (or fails the convert outright), so the comparison with a
+# live qemu-img convert, or its refusal, is what sees it. The first makes
+# the guest write a dynamic image when a fixed one was asked for, into a
+# file the host has already made the fixed length, so the metadata flag
+# and BAT differ from qemu's. The second stops the BAT stream one 64 KiB
+# slot early: a small image's whole BAT fits one slot, so the mutated
+# guard never fires and the BAT is left a hole, read as NOT_PRESENT. The
+# third writes every non-zero payload block at the data region start
+# instead of its own fixed slot (a payload that is packed, not in place):
+# the BAT still names the fixed slots, so qemu reads holes where data
+# should be and `qemu-img compare` diverges. The fourth sizes and opens
+# the output as a dynamic convert would, sparse and with the dynamic
+# capacity hint, which is shorter than the fixed file length, so the
+# guest's capacity check refuses the convert.
+FIXED_CONVERT='test_convert.TestConvertVhdxFixed.test_raw_source_matches_qemu'
+
+integration_case 'convert-op-vhdx-fixed-flag-ignored' "${CONVERT_OP}" \
+    '    if vhdx_fixed {' \
+    '    if false { // MUTATED' \
+    "${FIXED_CONVERT}"
+
+integration_case 'convert-op-vhdx-fixed-bat-one-slot-short' "${CONVERT_OP}" \
+    '    while written < bat_total {' \
+    '    while written.saturating_add(MAX_SECTOR_SIZE as u64) < bat_total { // MUTATED' \
+    "${FIXED_CONVERT}"
+
+integration_case 'convert-op-vhdx-fixed-payload-not-in-place' "${CONVERT_OP}" \
+    '            let block_file_offset = geometry.fixed_data_start + block_idx as u64 * block_size;' \
+    '            let block_file_offset = geometry.fixed_data_start; // MUTATED' \
+    "${FIXED_CONVERT}"
+
+integration_case 'convert-host-vhdx-fixed-output-sized-as-dynamic' "${VMM_MAIN}" \
+    '    let is_vhdx_fixed = is_vhdx_output && exec.flags & CONVERT_CONFIG_FLAG_VHDX_FIXED != 0;' \
+    '    let is_vhdx_fixed = false; // MUTATED' \
+    "${FIXED_CONVERT}"
 
 # ---------------------------------------------------------------------
 # The libvhdi oracle cross-check.

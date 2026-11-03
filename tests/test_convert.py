@@ -3527,6 +3527,129 @@ class TestConvertToVhdx(InstarTestBase):
         self._test_to_vhdx_roundtrip('qemu-vhdx')
 
 
+class TestConvertVhdxFixed(InstarTestBase):
+    """`convert -O vhdx --subformat fixed` writes qemu's fixed layout.
+
+    instar's fixed convert is qemu-img's `-o
+    subformat=fixed,block_state_zero=off`: every payload BAT entry
+    FULLY_PRESENT at its own fixed offset, each non-zero block written in
+    place, zero blocks left as holes. Each case converts the same source
+    with instar and with a live qemu-img and requires their VHDX structure
+    to be identical field for field (through `helpers.vhdx_structure`,
+    never `qemu-img info`), `qemu-img compare` to call them identical, and
+    both `instar check` and `qemu-img check` to exit 0.
+
+    Sources are built here rather than taken from the manifest so the
+    block layout is known: at a 1 MiB block size a few blocks past the
+    first carry data and the rest are holes, which makes a payload written
+    anywhere but its own fixed slot visible to `qemu-img compare`. Every
+    image is sparse; none allocates a data region.
+    """
+
+    BLOCK_SIZE = 1024 * 1024
+    IMAGE_SIZE = 16 * 1024 * 1024
+    # Block indices (at BLOCK_SIZE) that carry data. The first is not 0, so
+    # a packed writer that drops the holes before it lands this block at
+    # the wrong offset.
+    DATA_BLOCKS = (1, 5, 15)
+
+    def _build_raw_source(self, path):
+        """Write a raw image with DATA_BLOCKS non-zero and the rest holes."""
+        data = bytearray(self.IMAGE_SIZE)
+        for block in self.DATA_BLOCKS:
+            start = block * self.BLOCK_SIZE
+            data[start:start + self.BLOCK_SIZE] = bytes(
+                (block * 7 + i) % 256 for i in range(self.BLOCK_SIZE))
+        with open(path, 'wb') as f:
+            f.write(data)
+
+    def _qemu_fixed_convert(self, src, src_format, out):
+        """`qemu-img convert -O vhdx -o subformat=fixed,block_state_zero=off` of src."""
+        options = f'subformat=fixed,block_state_zero=off,block_size={self.BLOCK_SIZE}'
+        r = subprocess.run(
+            ['qemu-img', 'convert', '-f', src_format, '-O', 'vhdx', '-o', options,
+             str(src), str(out)],
+            capture_output=True, text=True, timeout=120)
+        self.assertEqual(0, r.returncode, f'qemu-img fixed convert: {r.stdout}{r.stderr}')
+
+    def _assert_matches_qemu(self, src, src_format, label):
+        with tempfile.TemporaryDirectory() as td:
+            ours = Path(td) / 'instar.vhdx'
+            theirs = Path(td) / 'qemu.vhdx'
+            _, stderr, rc = self.run_instar_convert(
+                Path(src), ours, output_format='vhdx', subformat='fixed',
+                block_size=self.BLOCK_SIZE, timeout=120)
+            self.assertEqual(0, rc, f'{label}: instar fixed convert: {stderr}')
+            self._qemu_fixed_convert(src, src_format, theirs)
+
+            differences = vhdx_structure.structural_diff(
+                vhdx_structure.parse_vhdx(ours), vhdx_structure.parse_vhdx(theirs))
+            self.assertEqual([], differences,
+                             f'{label}: instar != qemu-img:\n' + '\n'.join(differences))
+
+            cmp = subprocess.run(
+                ['qemu-img', 'compare', '-f', 'vhdx', '-F', 'vhdx', str(ours), str(theirs)],
+                capture_output=True, text=True, timeout=120)
+            self.assertEqual(0, cmp.returncode, f'{label}: qemu-img compare: {cmp.stdout}{cmp.stderr}')
+            self.assertIn('Images are identical', cmp.stdout)
+
+            _, chk_stderr, chk_rc = self.run_instar_check(ours, timeout=120)
+            self.assertEqual(0, chk_rc, f'{label}: instar check: {chk_stderr}')
+
+            qchk = subprocess.run(
+                ['qemu-img', 'check', '-f', 'vhdx', str(ours)],
+                capture_output=True, text=True, timeout=120)
+            self.assertEqual(0, qchk.returncode, f'{label}: qemu-img check: {qchk.stdout}{qchk.stderr}')
+
+    def test_raw_source_matches_qemu(self):
+        """A raw source's fixed convert equals qemu-img's, and both tools check it clean."""
+        self._require_qemu_img()
+        self.skip_unless_qemu_supports('vhdx')
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / 'src.raw'
+            self._build_raw_source(src)
+            self._assert_matches_qemu(src, 'raw', 'raw source')
+
+    def test_qcow2_source_matches_qemu(self):
+        """A qcow2 source's fixed convert equals qemu-img's, and both tools check it clean."""
+        self._require_qemu_img()
+        self.skip_unless_qemu_supports('vhdx')
+        with tempfile.TemporaryDirectory() as td:
+            raw = Path(td) / 'src.raw'
+            self._build_raw_source(raw)
+            qcow2 = Path(td) / 'src.qcow2'
+            r = subprocess.run(
+                ['qemu-img', 'convert', '-f', 'raw', '-O', 'qcow2', str(raw), str(qcow2)],
+                capture_output=True, text=True, timeout=120)
+            self.assertEqual(0, r.returncode, f'build qcow2 source: {r.stderr}')
+            self._assert_matches_qemu(qcow2, 'qcow2', 'qcow2 source')
+
+    def test_fixed_is_refused_on_non_vhdx_targets(self):
+        """`--subformat fixed` is vhdx-only: a raw, qcow2 or vpc target refuses it, and names why."""
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / 'src.raw'
+            self._build_raw_source(src)
+            for fmt in ('raw', 'qcow2', 'vpc'):
+                with self.subTest(target=fmt):
+                    _, stderr, rc = self.run_instar_convert(
+                        src, Path(td) / f'out.{fmt}', output_format=fmt, subformat='fixed')
+                    self.assertEqual(1, rc, stderr)
+                    self.assertIn(
+                        '--subformat is only supported with VMDK (-O vmdk) or VHDX (-O vhdx) output',
+                        stderr)
+
+    def test_unknown_subformat_is_refused(self):
+        """A `--subformat` value neither target knows is refused and leaves no image."""
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / 'src.raw'
+            self._build_raw_source(src)
+            out = Path(td) / 'out.vhdx'
+            _, stderr, rc = self.run_instar_convert(
+                src, out, output_format='vhdx', subformat='bogus')
+            self.assertEqual(1, rc, stderr)
+            self.assertFalse(out.exists(), 'a refused convert left an image behind')
+
+
 class TestConvertVhdxCheckOutput(InstarTestBase):
     """Test that instar-produced VHDX output passes check.
 
