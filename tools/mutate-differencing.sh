@@ -682,7 +682,7 @@ self_test() {
 # phase's definition of done asks the two to stay in step, which until
 # now was a promise kept by hand. Asserting it makes the drift a
 # failure instead of a documentation bug nobody reads.
-EXPECTED_CASES=149
+EXPECTED_CASES=150
 
 check_case_count() {
     # Only meaningful for a whole run; a selection is expected to be short.
@@ -2747,6 +2747,18 @@ integration_case 'convert-host-vhdx-fixed-output-sized-as-dynamic' "${VMM_MAIN}"
     '    let is_vhdx_fixed = is_vhdx_output && exec.flags & CONVERT_CONFIG_FLAG_VHDX_FIXED != 0;' \
     '    let is_vhdx_fixed = false; // MUTATED' \
     "${FIXED_CONVERT}"
+
+# The convert host's handling of a fixed VHDX the filesystem cannot
+# store, mirroring create's. With the EFBIG mapping gone, extending the
+# output is reported like any other open failure, which does not say the
+# file was too long, and the empty file the open created is left behind.
+# The test target hits EFBIG through a file-size limit, so it runs on
+# every filesystem; the 16 TiB convert test beside it fails the same
+# way, but only where ext4 or another ceiling makes it run.
+integration_case 'convert-host-vhdx-fixed-efbig-mapping-removed' "${VMM_MAIN}" \
+    $'    BackingStore::open(path, false, Some(geometry.fixed_file_length), false).map_err(|e| {\n        if e.raw_os_error() == Some(libc::EFBIG) {\n            let _ = std::fs::remove_file(path);\n            format!(\n                "convert: a fixed VHDX of {} bytes needs a {}-byte file, which the filesystem \\\n                 holding \'{}\' cannot store: {}",\n                geometry.virtual_size, geometry.fixed_file_length, filename, e\n            )\n            .into()\n        } else {\n            format!("convert: open \'{}\' for write failed: {}", filename, e).into()\n        }\n    })' \
+    $'    BackingStore::open(path, false, Some(geometry.fixed_file_length), false).map_err(|e| { // MUTATED\n        format!("convert: open \'{}\' for write failed: {}", filename, e).into()\n    })' \
+    'test_convert.TestConvertVhdxFixedLarge.test_file_size_limit_is_refused_like_a_filesystem_ceiling'
 
 # ---------------------------------------------------------------------
 # The libvhdi oracle cross-check.

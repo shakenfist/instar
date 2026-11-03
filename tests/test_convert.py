@@ -1,15 +1,22 @@
 """Tests for convert operation."""
 
+import errno
 import json
 import os
+import resource
 import shutil
+import signal
 import subprocess
 import tempfile
 from pathlib import Path
 
-from base import InstarTestBase
+from base import QEMU_TOOL_TIMEOUT, InstarTestBase
 from helpers import qemu_pins
 from helpers import vhdx_structure
+from test_create import (VHDX_FIXED_TOO_LARGE_FOR_EXT4,
+                         VHDX_FIXED_TOO_LARGE_FOR_EXT4_FILE_LENGTH)
+from test_vhdx_fixed_fixtures import (PARTIAL_PAST_FIRST_CHUNK, QEMU_CANNOT_OPEN,
+                                      RUNTIME_CREATE_IMAGES)
 
 
 class TestConvertBasicQcow2ToRaw(InstarTestBase):
@@ -3648,6 +3655,186 @@ class TestConvertVhdxFixed(InstarTestBase):
                 src, out, output_format='vhdx', subformat='bogus')
             self.assertEqual(1, rc, stderr)
             self.assertFalse(out.exists(), 'a refused convert left an image behind')
+
+
+# How instar refuses a fixed VHDX convert whose output the filesystem cannot store, up to the OS error that follows
+# it. The create path carries the same wording (test_create.VHDX_FIXED_FILE_TOO_LARGE_MESSAGE) under a 'create:'
+# prefix; convert sizes its output from the same vhdx::layout, so the file length it names for a given source is the
+# one create names for an image of that size.
+VHDX_FIXED_CONVERT_FILE_TOO_LARGE_MESSAGE = ("convert: a fixed VHDX of {size} bytes needs a {length}-byte file, "
+                                             "which the filesystem holding '{path}' cannot store: ")
+
+# Convert reads every block of its source, so its cost scales with the source's virtual size, not with the data in it
+# (an all-hole source does the same read work). A 2 TiB fixed convert takes about fifteen minutes on an idle host,
+# where a 2 TiB fixed *create* -- which writes only structure -- takes under a second. That full 2 TiB convert was
+# verified once (about fifteen minutes; its output equalled qemu-img's and both tools checked it clean) and is
+# recorded in the phase plan, rather than kept as a gate test. The permanent large case below uses 256 GiB, which
+# still streams a many-slot BAT and places a data block past 128 GiB but finishes in about two minutes. Its timeout
+# is a hang guard above the default, not a performance assertion.
+VHDX_FIXED_LARGE_CONVERT_SIZE = 256 * 1024 * 1024 * 1024
+VHDX_FIXED_LARGE_CONVERT_TIMEOUT = 600
+
+
+class TestConvertVhdxFixedLarge(InstarTestBase):
+    """Fixed VHDX convert at sizes the small cases do not reach, and against the filesystem.
+
+    `TestConvertVhdxFixed` covers the small cases byte for byte. Here the output is large, awkward, or larger than the
+    filesystem can hold. Convert exposes no `block_state_zero`, so there is one mode: instar's output is qemu-img's
+    `-o subformat=fixed,block_state_zero=off`. Every source is a sparse qcow2 with a handful of non-zero blocks and the
+    rest holes, built from a sparse raw file; no test allocates a data region, and the fixed VHDX each produces is
+    sparse too.
+    """
+
+    BLOCK_SIZE = 1024 * 1024
+
+    def _run_instar_convert(self, src, out, *extra, preexec_fn=None, timeout=QEMU_TOOL_TIMEOUT):
+        """`instar convert -O vhdx <extra> src out`, run directly so a preexec_fn can set a resource limit."""
+        cmd = [str(self.get_instar_binary()), 'convert', '-O', 'vhdx', *[str(a) for a in extra], str(src), str(out)]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, preexec_fn=preexec_fn)
+        return r.stdout, r.stderr, r.returncode
+
+    def _build_sparse_qcow2(self, td, virtual_size, data_blocks):
+        """A sparse qcow2 of `virtual_size`, with the `data_blocks` BLOCK_SIZE blocks written and the rest holes.
+
+        The raw is laid down with seeks and holes so nothing allocates the whole image, then converted to qcow2 by the
+        host qemu-img (which only copies the data blocks), and removed. The first data block is not block 0, so a
+        writer that packed the non-zero blocks instead of placing each at its own offset would land them wrong.
+        """
+        raw = Path(td) / 'src.raw'
+        with open(raw, 'wb') as f:
+            f.truncate(virtual_size)
+            for block in data_blocks:
+                f.seek(block * self.BLOCK_SIZE)
+                f.write(bytes((block * 7 + i) % 256 for i in range(self.BLOCK_SIZE)))
+        qcow2 = Path(td) / 'src.qcow2'
+        self._run_tool(['qemu-img', 'convert', '-f', 'raw', '-O', 'qcow2', str(raw), str(qcow2)], td)
+        raw.unlink()
+        return qcow2
+
+    def _assert_same_structure(self, ours, theirs, label):
+        differences = vhdx_structure.structural_diff(vhdx_structure.parse_vhdx(ours),
+                                                     vhdx_structure.parse_vhdx(theirs))
+        self.assertEqual([], differences, f'{label}: instar != qemu-img:\n' + '\n'.join(differences))
+
+    def test_large_source_matches_qemu_img(self):
+        """At 256 GiB with 1 MiB blocks, instar's fixed convert equals qemu-img's, and both tools check it clean.
+
+        256 GiB streams a BAT of many 64 KiB slots and places a data block past 128 GiB, so it exercises the
+        streaming path and the in-place placement the small cases cannot, without the fifteen-minute cost of the
+        full 2 TiB convert (which is O(source size); verified once and recorded in the phase plan).
+        """
+        self._require_qemu_img()
+        self.skip_unless_qemu_supports('vhdx')
+        size = VHDX_FIXED_LARGE_CONVERT_SIZE
+        last_block = size // self.BLOCK_SIZE - 1
+        # Block 200000 (at 1 MiB) sits past 128 GiB (131072 blocks), so the BAT and payload reach beyond the guest
+        # budget; the first data block is not block 0, so a packed writer would place these at the wrong offset.
+        with tempfile.TemporaryDirectory() as td:
+            src = self._build_sparse_qcow2(td, size, (1, 5, 200000, last_block))
+            ours = Path(td) / 'instar.vhdx'
+            _, stderr, rc = self._run_instar_convert(src, ours, '--subformat', 'fixed',
+                                                     '--block-size', self.BLOCK_SIZE,
+                                                     timeout=VHDX_FIXED_LARGE_CONVERT_TIMEOUT)
+            self.assertEqual(0, rc, f'instar fixed convert of 256 GiB: {stderr}')
+            self.assertEqual(size, vhdx_structure.parse_vhdx(ours).virtual_disk_size)
+
+            theirs = Path(td) / 'qemu.vhdx'
+            options = f'subformat=fixed,block_state_zero=off,block_size={self.BLOCK_SIZE}'
+            self._run_tool(['qemu-img', 'convert', '-f', 'qcow2', '-O', 'vhdx', '-o', options, str(src), str(theirs)],
+                           td)
+            self._assert_same_structure(ours, theirs, '256 GiB fixed convert')
+
+            _, chk_stderr, chk_rc = self.run_instar_check(ours, timeout=QEMU_TOOL_TIMEOUT)
+            self.assertEqual(0, chk_rc, f'instar check of 256 GiB fixed convert: {chk_stderr}')
+            r = subprocess.run(['qemu-img', 'check', '-f', 'vhdx', str(ours)], capture_output=True, text=True,
+                               timeout=QEMU_TOOL_TIMEOUT)
+            self.assertEqual(0, r.returncode, f'qemu-img check of 256 GiB fixed convert: {r.stdout}{r.stderr}')
+
+    def test_partial_last_block_past_the_first_chunk_matches_qemu_img(self):
+        """The size qemu-img creates but cannot reopen converts to qemu-img's structure, and instar checks it clean.
+
+        Its last payload block is partial, FULLY_PRESENT and past the first chunk, so qemu's open-time BAT check
+        demands a whole block the file does not hold ("VHDX partial last block past the first chunk" in
+        docs/quirks.md). `qemu-img convert` cannot finalise its own output here -- it reopens it and fails the same
+        way -- so the oracle is `qemu-img create` of the same virtual size, which writes the identical fixed
+        structure (block_state_zero=off, every payload entry FULLY_PRESENT, a function of size and block size alone).
+        Neither `qemu-img check` nor `info` can read instar's output, so the structure is compared instead.
+        """
+        self._require_qemu_img()
+        self.skip_unless_qemu_supports('vhdx')
+        options, create_size = RUNTIME_CREATE_IMAGES[PARTIAL_PAST_FIRST_CHUNK]
+        virtual_size = QEMU_CANNOT_OPEN[PARTIAL_PAST_FIRST_CHUNK]
+        with tempfile.TemporaryDirectory() as td:
+            src = self._build_sparse_qcow2(td, virtual_size, (1, 5, 100))
+            ours = Path(td) / 'instar.vhdx'
+            _, stderr, rc = self._run_instar_convert(src, ours, '--subformat', 'fixed',
+                                                     '--block-size', self.BLOCK_SIZE)
+            self.assertEqual(0, rc, f'instar fixed convert of {PARTIAL_PAST_FIRST_CHUNK}: {stderr}')
+
+            theirs = Path(td) / 'qemu.vhdx'
+            self._run_tool(['qemu-img', 'create', '-q', '-f', 'vhdx', '-o', options, str(theirs), create_size], td)
+            self._assert_same_structure(ours, theirs, PARTIAL_PAST_FIRST_CHUNK)
+
+            _, chk_stderr, chk_rc = self.run_instar_check(ours, timeout=QEMU_TOOL_TIMEOUT)
+            self.assertEqual(0, chk_rc, f'instar check of {PARTIAL_PAST_FIRST_CHUNK}: {chk_stderr}')
+
+    def test_file_too_large_for_the_filesystem_is_refused(self):
+        """A 16 TiB fixed convert is refused, naming the file length the filesystem cannot store, and leaves no file.
+
+        Only a filesystem with a file-size ceiling below the fixed file length can refuse it, ext4 among them. The
+        test first asks the directory's filesystem for a sparse file of that length, and skips if it is given one (as
+        on XFS). The source is a tiny sparse qcow2 of the refused virtual size.
+        """
+        self._require_qemu_img()
+        with tempfile.TemporaryDirectory() as td:
+            probe = Path(td) / 'probe'
+            try:
+                with open(probe, 'wb') as f:
+                    f.truncate(VHDX_FIXED_TOO_LARGE_FOR_EXT4_FILE_LENGTH)
+            except OSError as e:
+                if e.errno != errno.EFBIG:
+                    raise
+            else:
+                self.skipTest(f'the filesystem holding {td} stores a sparse file of '
+                              f'{VHDX_FIXED_TOO_LARGE_FOR_EXT4_FILE_LENGTH} bytes, so it has no ceiling to refuse')
+            finally:
+                probe.unlink(missing_ok=True)
+
+            src = Path(td) / 'src.qcow2'
+            self._run_tool(['qemu-img', 'create', '-q', '-f', 'qcow2', str(src), str(VHDX_FIXED_TOO_LARGE_FOR_EXT4)],
+                           td)
+            out = Path(td) / 'big.vhdx'
+            _, stderr, rc = self._run_instar_convert(src, out, '--subformat', 'fixed')
+            self.assertEqual(1, rc, stderr)
+            self.assertIn(VHDX_FIXED_CONVERT_FILE_TOO_LARGE_MESSAGE.format(
+                size=VHDX_FIXED_TOO_LARGE_FOR_EXT4, length=VHDX_FIXED_TOO_LARGE_FOR_EXT4_FILE_LENGTH, path=out)
+                + os.strerror(errno.EFBIG), stderr)
+            self.assertFalse(out.exists(), 'a refused convert left a file behind')
+
+    def test_file_size_limit_is_refused_like_a_filesystem_ceiling(self):
+        """A process file-size limit fails the same way as a filesystem ceiling, so the refusal is seen everywhere.
+
+        Extending a file past RLIMIT_FSIZE fails with EFBIG, as extending it past ext4's ceiling does, on any
+        filesystem. The source is a 16 MiB qcow2, whose fixed convert is the `vhdx-fixed-16M` pin's length, so the
+        message names qemu-img's length for that image.
+        """
+        def limit_file_size():
+            # The signal that comes with EFBIG is ignored, so the error is seen.
+            signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+            resource.setrlimit(resource.RLIMIT_FSIZE, (1024 * 1024, 1024 * 1024))
+
+        self._require_qemu_img()
+        want = qemu_pins.expected('vhdx-fixed-16M')['summary']
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / 'src.qcow2'
+            self._run_tool(['qemu-img', 'create', '-q', '-f', 'qcow2', str(src), '16M'], td)
+            out = Path(td) / 'limited.vhdx'
+            _, stderr, rc = self._run_instar_convert(src, out, '--subformat', 'fixed', preexec_fn=limit_file_size)
+            self.assertEqual(1, rc, stderr)
+            self.assertIn(VHDX_FIXED_CONVERT_FILE_TOO_LARGE_MESSAGE.format(
+                size=want['virtual_disk_size'], length=want['file_length'], path=out) + os.strerror(errno.EFBIG),
+                stderr)
+            self.assertFalse(out.exists(), 'a refused convert left a file behind')
 
 
 class TestConvertVhdxCheckOutput(InstarTestBase):
