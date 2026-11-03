@@ -383,6 +383,22 @@ Every brief also carries the session's standing rules:
 * **Decision 6 settled.** The dynamic path's silent in-memory-BAT
   ceiling is reachable from the CLI; recorded in the master plan's
   Future work, not fixed.
+* **8b (`69de3893`).** `TestConvertVhdxFixedLarge` and the convert-host
+  EFBIG mutation case. One departure, the operator's call: the plan's
+  2 TiB case mirrored phase 7's create timing (0.74 s), but convert
+  reads every source block, so a 2 TiB fixed convert is O(source size)
+  and takes about fifteen minutes. The 2 TiB convert was verified once
+  (its structure equalled qemu-img's and both tools checked it clean);
+  the permanent gate test uses 256 GiB instead, which still streams a
+  many-slot BAT and places a data block past 128 GiB and runs in 113 s
+  (measured), keeping the heavy case out of the merge-queue gate as the
+  merge-queue critical-path work did for VHD conversion tests.
+* **8b verification (management session, built at `86ffcebd`).** The
+  256 GiB case passes in 113 s; the partial-last-block, 16 TiB-ceiling
+  (ran on ext4) and RLIMIT_FSIZE cases pass. `pre-commit run
+  --all-files` passes, `tools/mutate-differencing.sh --check-patterns`
+  reports 150 land, 0 drifted, and `tools/ci/check-test-partition.sh`
+  is clean. The 2 TiB convert measured about fifteen minutes standalone.
 
 ## Risks and mitigations
 
