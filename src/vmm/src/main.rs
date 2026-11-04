@@ -20689,14 +20689,10 @@ mod create_option_tests {
 
     #[test]
     fn measure_o_vhdx_subformat_parses() {
-        assert_eq!(
-            parse_o_options("vhdx", &s("subformat=fixed")).unwrap().vhdx_fixed,
-            Some(true)
-        );
-        assert_eq!(
-            parse_o_options("vhdx", &s("subformat=dynamic")).unwrap().vhdx_fixed,
-            Some(false)
-        );
+        let fixed = parse_o_options("vhdx", &s("subformat=fixed")).unwrap();
+        assert_eq!(fixed.vhdx_fixed, Some(true));
+        let dynamic = parse_o_options("vhdx", &s("subformat=dynamic")).unwrap();
+        assert_eq!(dynamic.vhdx_fixed, Some(false));
         let err = parse_o_options("vhdx", &s("subformat=bogus"))
             .unwrap_err()
             .to_string();
