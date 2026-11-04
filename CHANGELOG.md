@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`instar convert -O vhdx --subformat fixed` writes a fixed VHDX.**
+  Blocks are written in place: every payload BAT entry is
+  `PAYLOAD_BLOCK_FULLY_PRESENT` at its fixed offset, all-zero blocks are
+  left as holes, and the file is the data start plus the virtual size
+  long. This is qemu-img's `subformat=fixed,block_state_zero=off`
+  layout, not the layout of qemu's default fixed convert. A size the
+  filesystem cannot hold is refused with no file left behind, and
+  `--subformat` with an output other than VMDK or VHDX is refused.
+  See `docs/convert.md` and the VHDX partial last block entry in
+  `docs/quirks.md`.
+
 - **`instar create -f vhdx -o subformat=fixed` creates a fixed VHDX.**
   The image has qemu-img's structure field for field: the
   `LeaveBlocksAllocated` file parameter, a BAT entry for every payload
