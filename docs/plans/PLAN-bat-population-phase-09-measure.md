@@ -243,6 +243,30 @@ build, and its expected result.
   run --all-files` all pass; the four new crate tests
   (`vhdx_fixed_*`) pass; `make fuzz-build` clean; the `-O vhdx -o
   subformat=fixed` "not yet supported" refusal is gone from the VMM.
+* **9b.** `TestMeasureVhdxFixed` (6 tests) and three measure mutation
+  cases added (`EXPECTED_CASES` 150 to 153). The management session
+  corrected the mutation-doc group count (`docs/testing.md`: the three
+  measure cases are a new twelfth group, not the eleven the agent left)
+  and reproduced the headline equality independently: a 64 MiB source
+  measures `required == fully allocated == 75497472`, equal to the
+  fixed convert output length; `--check-patterns` reports 153 land, 0
+  drifted. The agent kept the partial-last-block test's source data in
+  the last full 64 KiB rather than the partial block, to sidestep the
+  convert bug below.
+* **9b found a convert bug (out of scope; recorded, not fixed).**
+  `convert -O vhdx --subformat fixed` fails (`convert operation
+  failed`) when the source virtual size is not a block multiple *and*
+  has data in the partial last block -- the phase 8 writer does not
+  clamp the final block's write to `fixed_file_length`. qemu-img
+  converts the same source fine, and raw/dynamic/qcow2 targets do too,
+  so it is an instar-specific defect in the merged phase 8 `convert`
+  writer, not in phase 9's `measure` (whose answer is correct
+  regardless). Recorded in the master plan's Future work; the GitHub
+  issue is pending (the session's sandbox denied `gh issue create`,
+  so it is filed with the operator's go-ahead). Measure is unaffected:
+  `measure_vhdx_fixed` returns the fixed file length without touching
+  the source, so it gives the right number even for the sizes convert
+  cannot currently write.
 
 ## Back brief
 
