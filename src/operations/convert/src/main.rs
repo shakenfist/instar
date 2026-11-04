@@ -4961,8 +4961,8 @@ unsafe fn convert_to_vhdx(
 /// This is qemu-img's `-o subformat=fixed,block_state_zero=off` layout. The
 /// BAT is a pure function of the block index: every payload entry is
 /// `PAYLOAD_BLOCK_FULLY_PRESENT` at `fixed_data_start + block * block_size`,
-/// with no per-block choice (open question 3's in-place layout, not qemu's
-/// default convert-to-fixed, which appends). Each non-zero payload block is
+/// with no per-block choice: the in-place layout, not qemu's default
+/// convert-to-fixed, which appends. Each non-zero payload block is
 /// written at that same fixed offset; a zero block is left a hole so the
 /// file stays sparse. The host extends the output to `fixed_file_length`
 /// before this runs, so the device is already that long and this never
@@ -5077,6 +5077,12 @@ unsafe fn convert_to_vhdx_fixed(
         oss,
         oc,
     ) {
+        (call_table.send_error)(
+            b"convert\0".as_ptr(),
+            b"output\0".as_ptr(),
+            vhdx::HEADER1_OFFSET / oss as u64,
+            2,
+        );
         (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
         return *bytes_read;
     }
@@ -5092,6 +5098,12 @@ unsafe fn convert_to_vhdx_fixed(
         oss,
         oc,
     ) {
+        (call_table.send_error)(
+            b"convert\0".as_ptr(),
+            b"output\0".as_ptr(),
+            vhdx::HEADER2_OFFSET / oss as u64,
+            2,
+        );
         (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
         return *bytes_read;
     }

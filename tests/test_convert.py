@@ -3570,24 +3570,32 @@ class TestConvertVhdxFixed(InstarTestBase):
         with open(path, 'wb') as f:
             f.write(data)
 
-    def _qemu_fixed_convert(self, src, src_format, out):
-        """`qemu-img convert -O vhdx -o subformat=fixed,block_state_zero=off` of src."""
-        options = f'subformat=fixed,block_state_zero=off,block_size={self.BLOCK_SIZE}'
+    def _qemu_fixed_convert(self, src, src_format, out, block_size=-1):
+        """`qemu-img convert -O vhdx -o subformat=fixed,block_state_zero=off` of src.
+
+        `block_size` is BLOCK_SIZE by default; `None` leaves the option off so qemu-img picks
+        its size-scaled default.
+        """
+        bs = self.BLOCK_SIZE if block_size == -1 else block_size
+        options = 'subformat=fixed,block_state_zero=off'
+        if bs is not None:
+            options += f',block_size={bs}'
         r = subprocess.run(
             ['qemu-img', 'convert', '-f', src_format, '-O', 'vhdx', '-o', options,
              str(src), str(out)],
             capture_output=True, text=True, timeout=120)
         self.assertEqual(0, r.returncode, f'qemu-img fixed convert: {r.stdout}{r.stderr}')
 
-    def _assert_matches_qemu(self, src, src_format, label):
+    def _assert_matches_qemu(self, src, src_format, label, block_size=-1):
+        bs = self.BLOCK_SIZE if block_size == -1 else block_size
         with tempfile.TemporaryDirectory() as td:
             ours = Path(td) / 'instar.vhdx'
             theirs = Path(td) / 'qemu.vhdx'
             _, stderr, rc = self.run_instar_convert(
                 Path(src), ours, output_format='vhdx', subformat='fixed',
-                block_size=self.BLOCK_SIZE, timeout=120)
+                block_size=bs, timeout=120)
             self.assertEqual(0, rc, f'{label}: instar fixed convert: {stderr}')
-            self._qemu_fixed_convert(src, src_format, theirs)
+            self._qemu_fixed_convert(src, src_format, theirs, bs)
 
             differences = vhdx_structure.structural_diff(
                 vhdx_structure.parse_vhdx(ours), vhdx_structure.parse_vhdx(theirs))
@@ -3630,6 +3638,20 @@ class TestConvertVhdxFixed(InstarTestBase):
                 capture_output=True, text=True, timeout=120)
             self.assertEqual(0, r.returncode, f'build qcow2 source: {r.stderr}')
             self._assert_matches_qemu(qcow2, 'qcow2', 'qcow2 source')
+
+    def test_default_block_size_matches_qemu(self):
+        """With no --block-size, a fixed convert uses qemu's size-scaled default block and matches it.
+
+        The other cases all pin a 1 MiB block. Omitting --block-size takes qemu's default for the
+        size (8 MiB for this 16 MiB source, a different chunk ratio), so this proves the default-block
+        layout end to end rather than only through the host capacity math.
+        """
+        self._require_qemu_img()
+        self.skip_unless_qemu_supports('vhdx')
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / 'src.raw'
+            self._build_raw_source(src)
+            self._assert_matches_qemu(src, 'raw', 'raw source, default block size', block_size=None)
 
     def test_fixed_is_refused_on_non_vhdx_targets(self):
         """`--subformat fixed` is vhdx-only: a raw, qcow2 or vpc target refuses it, and names why."""
