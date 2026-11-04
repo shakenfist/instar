@@ -680,9 +680,10 @@ KNOWN_SOURCE_SCANNER_DIVERGENCES = {
     # now passes for both. `sf-vda` still diverges and remains entered.
     'sf-vda':            ('qcow2', 'instar qcow2 scanner counts allocated bytes differently'),
 
-    # VHDX scanner treats every block as fully allocated; qemu-img returns
-    # the actual block-state distribution.
-    'qemu-vhdx': ('qcow2', 'instar vhdx scanner reports full allocation for all blocks'),
+    # VHDX scanner counts only blocks whose BAT entry is present; qemu-img
+    # counts every block as allocated (required == fully allocated), so it
+    # reports the larger required size.
+    'qemu-vhdx': ('qcow2', 'instar vhdx scanner counts only present blocks, qemu-img counts every block'),
 
     # VMDK scanner sparse-detection differs from qemu-img for some
     # multi-extent / non-trivial layouts.
