@@ -138,8 +138,11 @@ Accepted but no size effect:
 `-o subformat=fixed` measures a fixed VHDX, which is dense: every payload
 byte is in the file whether or not the source block held data. `required
 size` and `fully allocated size` are therefore equal, and both are the
-fixed file length, the data start (which `block_size` sizes, through the
-BAT) plus the virtual size rounded up to 512 bytes. The source's
+fixed file length: the fixed data start — the end of the BAT and metadata
+regions plus the 4 MiB qemu-img leaves for future expansion, which
+`block_size` sizes through the BAT and which is 4 MiB past the data start
+a dynamic image uses (8 MiB rather than 4 MiB for a small image) — plus
+the virtual size rounded up to 512 bytes. The source's
 allocation is not read, so the answer does not vary with its content.
 `block_state_zero` does not change the answer either: `off` and `on`
 differ in the BAT entry state written (`FULLY_PRESENT` versus `ZERO`),
@@ -172,12 +175,15 @@ qemu-img's:
   plumbing closes this for a VHD or VHDX chain, whichever format the
   chain is in.
 - **VHDX sources**: instar counts only blocks whose BAT entry is fully or
-  partially present, so it reports a smaller `required` than qemu-img.
-  qemu-img counts every block of a VHDX source as allocated: its `required`
-  equals its `fully allocated`, whatever the BAT says. For a 64 MiB dynamic
-  VHDX with 2 of 8 blocks written, `measure -O qcow2` gives instar
-  `required size: 17104896` and qemu-img `required size: 67436544`; both
-  report `fully allocated size: 67436544`.
+  partially present, so it reports a smaller `required` than qemu-img for
+  any source with `ZERO`, `NOT_PRESENT` or unmapped blocks, and an equal
+  one when every payload block is present (as in a fixed VHDX). qemu-img
+  counts every block of a VHDX source as allocated: its `required` equals
+  its `fully allocated`, whatever the BAT says. A partially present block
+  counts as a whole block on both sides, so instar can over-report within
+  such a block. For a 64 MiB dynamic VHDX with 2 of 8 blocks written,
+  `measure -O qcow2` gives instar `required size: 17104896` and qemu-img
+  `required size: 67436544`; both report `fully allocated size: 67436544`.
 - **VMDK multi-extent source layouts**: instar's extent map propagation
   differs from qemu-img for some non-trivial layouts.
 - **VHD legacy CHS-only sources**: instar's reported virtual_size differs

@@ -1268,6 +1268,10 @@ class TestMeasureVhdxFixed(InstarTestBase):
         raw = Path(td) / 'src.raw'
         with open(raw, 'wb') as f:
             f.truncate(virtual_size)
+            # The third write lands in the last full 64 KiB on purpose. A fixed-VHDX convert of a source whose
+            # virtual size is not a block multiple fails ('convert operation failed') when the partial last block
+            # holds data, so writing into that block here would break _convert_length rather than measure. measure
+            # itself predicts the dense length correctly regardless.
             for offset in (0, (virtual_size // 2) & ~511, ((virtual_size & ~0xFFFF) - 512) & ~511):
                 f.seek(offset)
                 f.write(b'\x5a' * 512)
@@ -1310,8 +1314,11 @@ class TestMeasureVhdxFixed(InstarTestBase):
             src = self._make_qcow2(td, 40 * MIB + 512 * 3)
             predicted = self._measure_fixed(src)
             self.assertEqual(predicted, self._convert_length(td, src))
-            # Dense data after the metadata: the last block is not padded out to a whole 32 MiB block.
-            self.assertLess(predicted, 4 * MIB + 64 * MIB)
+            # The fixed data start is 8 MiB here (a 1 MiB BAT region floored, plus the 5 MiB gap, after the
+            # 2 MiB BAT offset; the default block size at this virtual size is 8 MiB). What follows is the
+            # virtual size rounded to a sector, not up to a whole 8 MiB block, so the file ends part way through
+            # the last block. A measure that padded to a block would give 8 MiB + 6 * 8 MiB instead.
+            self.assertEqual(predicted - 8 * MIB, 40 * MIB + 512 * 3)
 
     def test_non_default_block_size_matches_the_convert_output(self):
         """-o block_size= sizes the BAT, so the prediction follows the block size convert is given."""
@@ -1335,8 +1342,9 @@ class TestMeasureVhdxFixed(InstarTestBase):
             src = self._make_qcow2(td, 64 * MIB)
             stdout, stderr, rc = self.run_instar_measure('--size', 64 * MIB, '-O', 'vhdx', '-o', 'subformat=fixed')
             self.assertEqual(rc, 0, stderr)
-            self.assertEqual(f'required size: {self._measure_fixed(src)}\n'
-                             f'fully allocated size: {self._measure_fixed(src)}\n', stdout)
+            expected = self._measure_fixed(src)
+            self.assertEqual(f'required size: {expected}\n'
+                             f'fully allocated size: {expected}\n', stdout)
 
     def test_qemu_img_cannot_measure_vhdx(self):
         """There is no external oracle: qemu-img refuses to measure a VHDX target at all."""

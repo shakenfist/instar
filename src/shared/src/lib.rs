@@ -2909,7 +2909,10 @@ pub struct MeasureConfig {
     pub _pad2: u16,
     /// vmdk grain size in bytes. 0 = default (65536).
     pub vmdk_grain_size: u32,
-    /// vhd subformat: 0=Dynamic, 1=Fixed.
+    /// vhd subformat: 0=Dynamic, 1=Fixed. The VHDX subformat has no byte
+    /// field of its own: it travels in `flags` as `FLAG_VHDX_FIXED`,
+    /// because the struct layout is fixed by the call-table contract and
+    /// a spare flag bit was free (see `vhdx_fixed`).
     pub vhd_subformat: u8,
     /// Reserved padding.
     pub _pad3: [u8; 3],

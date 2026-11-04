@@ -1017,6 +1017,14 @@ pub struct VhdxOpts {
 /// prediction is 4 MiB rather than the 3 MiB a region sized from the
 /// count alone would give.
 ///
+/// # Fixed VHDX
+///
+/// When `opts.subformat` is [`VhdxSubformat::Fixed`] this dispatches to
+/// [`measure_vhdx_fixed`] after the block size has been resolved and
+/// checked. The formula above is the dynamic path; a fixed image is
+/// dense and sized from `layout.fixed_file_length` instead. This mirrors
+/// [`measure_vhd`], which documents its two subformats the same way.
+///
 /// # Errors
 ///
 /// A block size the layout refuses is [`MeasureError::InvalidOption`];
@@ -1099,6 +1107,13 @@ pub fn measure_vhdx(s: &AllocationSummary, opts: &VhdxOpts) -> MeasureResult {
 /// because it sizes the BAT region and therefore `fixed_data_start`, so
 /// the layout call stays; the source allocation does not, so this reads
 /// neither `allocated_bytes` nor `target_units_with_data`.
+///
+/// `measure_vhdx` dispatches here only after `vhdx::layout` has resolved
+/// and validated the block size, so `-o subformat=fixed,block_size=512K`
+/// is still refused with `InvalidOption`. This is deliberately the
+/// opposite order from `measure_vhd`, which dispatches to its fixed path
+/// before validating: for VHDX the block size changes the BAT region and
+/// therefore the fixed file length, so it has to be checked first.
 fn measure_vhdx_fixed(geometry: &vhdx::VhdxLayout) -> MeasureResult {
     MeasureOutput::try_new(geometry.fixed_file_length, geometry.fixed_file_length)
 }
@@ -3143,6 +3158,33 @@ mod tests {
             assert_vhdx_fixed(GIB, alloc, MIB as u32);
         }
         assert_vhdx_fixed(64 * GIB, 0, 256 * MIB as u32);
+    }
+
+    #[test]
+    fn vhdx_fixed_block_size_moves_the_data_start_above_the_bat_floor() {
+        // Every other fixed case is small enough that the BAT region
+        // floors at 1 MiB, so fixed_data_start is the constant 8 MiB and
+        // block_size cannot be seen to move it. At 1 TiB the 1 MiB-block
+        // BAT exceeds the floor, pushing fixed_data_start past 8 MiB,
+        // while a 256 MiB block keeps the BAT under the floor at 8 MiB.
+        // The two predictions therefore differ by the BAT growth alone,
+        // which only happens if measure propagates block_size into the
+        // layout.
+        let virtual_size = 1024 * GIB;
+
+        let small_block = vhdx::layout(virtual_size, MIB as u32, false).unwrap();
+        assert!(
+            small_block.fixed_data_start > 8 * MIB,
+            "BAT region did not exceed the 1 MiB floor: {}",
+            small_block.fixed_data_start
+        );
+        assert_vhdx_fixed(virtual_size, 0, MIB as u32);
+
+        let big_block = vhdx::layout(virtual_size, 256 * MIB as u32, false).unwrap();
+        assert_eq!(big_block.fixed_data_start, 8 * MIB);
+        assert_vhdx_fixed(virtual_size, 0, 256 * MIB as u32);
+
+        assert_ne!(small_block.fixed_file_length, big_block.fixed_file_length);
     }
 
     #[test]

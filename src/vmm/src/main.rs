@@ -20687,6 +20687,22 @@ mod create_option_tests {
         }
     }
 
+    #[test]
+    fn measure_o_vhdx_subformat_parses() {
+        assert_eq!(
+            parse_o_options("vhdx", &s("subformat=fixed")).unwrap().vhdx_fixed,
+            Some(true)
+        );
+        assert_eq!(
+            parse_o_options("vhdx", &s("subformat=dynamic")).unwrap().vhdx_fixed,
+            Some(false)
+        );
+        let err = parse_o_options("vhdx", &s("subformat=bogus"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("bad value 'bogus'"), "{}", err);
+    }
+
     fn create_args(fmt: &str, mode: &str) -> CreateArgs {
         parse_create_cli(&["-f", fmt, "--preallocation", mode, "image.img", "1M"])
     }
