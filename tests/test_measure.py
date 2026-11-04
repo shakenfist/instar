@@ -1250,6 +1250,103 @@ class TestMeasureVhdxDefaultBlockSize(InstarTestBase):
             self.assertEqual(16 * MIB, json.loads(r.stdout)['cluster-size'])
 
 
+class TestMeasureVhdxFixed(InstarTestBase):
+    """measure -O vhdx -o subformat=fixed predicts the length of the file a fixed VHDX convert writes.
+
+    A fixed VHDX is dense, so required and fully allocated are the same number: the data region start plus the
+    virtual size rounded up to a sector. qemu-img cannot measure VHDX at all, so instar's own convert writer is the
+    oracle, and the comparison is an exact equality rather than a range.
+    """
+
+    # Borrowed rather than inherited, so the smoke tests do not run twice.
+    run_instar_measure = TestMeasureSmoke.run_instar_measure
+
+    def _make_qcow2(self, td, virtual_size):
+        """Return a qcow2 of virtual_size holding data at the start, in the middle and in its last full 64 KiB."""
+        self._require_qemu_img()
+        raw = Path(td) / 'src.raw'
+        with open(raw, 'wb') as f:
+            f.truncate(virtual_size)
+            for offset in (0, (virtual_size // 2) & ~511, ((virtual_size & ~0xFFFF) - 512) & ~511):
+                f.seek(offset)
+                f.write(b'\x5a' * 512)
+        src = Path(td) / 'src.qcow2'
+        r = subprocess.run(['qemu-img', 'convert', '-f', 'raw', '-O', 'qcow2', str(raw), str(src)],
+                           capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        raw.unlink()
+        return src
+
+    def _measure_fixed(self, src, opts='subformat=fixed'):
+        stdout, stderr, rc = self.run_instar_measure('-O', 'vhdx', '-o', opts, str(src))
+        self.assertEqual(rc, 0, stderr)
+        lines = stdout.splitlines()
+        self.assertEqual(2, len(lines), stdout)
+        self.assertTrue(lines[0].startswith('required size: '), stdout)
+        self.assertTrue(lines[1].startswith('fully allocated size: '), stdout)
+        required = int(lines[0].split(': ')[1])
+        fully_allocated = int(lines[1].split(': ')[1])
+        self.assertEqual(required, fully_allocated)
+        return required
+
+    def _convert_length(self, td, src, block_size=None):
+        out = Path(td) / 'out.vhdx'
+        _, stderr, rc = self.run_instar_convert(src, out, output_format='vhdx', subformat='fixed',
+                                                block_size=block_size, timeout=300)
+        self.assertEqual(rc, 0, stderr)
+        return out.stat().st_size
+
+    def test_matches_the_convert_output(self):
+        """required == fully allocated == the byte length convert writes for a mixed zero/data source."""
+        with tempfile.TemporaryDirectory() as td:
+            src = self._make_qcow2(td, 64 * MIB)
+            predicted = self._measure_fixed(src)
+            self.assertEqual(predicted, self._convert_length(td, src))
+
+    def test_partial_last_block_matches_the_convert_output(self):
+        """A virtual size that is not a block multiple is not padded to a block, only to a sector."""
+        with tempfile.TemporaryDirectory() as td:
+            src = self._make_qcow2(td, 40 * MIB + 512 * 3)
+            predicted = self._measure_fixed(src)
+            self.assertEqual(predicted, self._convert_length(td, src))
+            # Dense data after the metadata: the last block is not padded out to a whole 32 MiB block.
+            self.assertLess(predicted, 4 * MIB + 64 * MIB)
+
+    def test_non_default_block_size_matches_the_convert_output(self):
+        """-o block_size= sizes the BAT, so the prediction follows the block size convert is given."""
+        with tempfile.TemporaryDirectory() as td:
+            src = self._make_qcow2(td, 64 * MIB)
+            for block_size in (1 * MIB, 256 * MIB):
+                predicted = self._measure_fixed(src, f'subformat=fixed,block_size={block_size}')
+                self.assertEqual(predicted, self._convert_length(td, src, block_size=block_size), block_size)
+
+    def test_block_state_zero_does_not_change_the_answer(self):
+        """block_state_zero only picks the BAT entry state, never the file length."""
+        with tempfile.TemporaryDirectory() as td:
+            src = self._make_qcow2(td, 64 * MIB)
+            plain = self._measure_fixed(src)
+            self.assertEqual(plain, self._measure_fixed(src, 'subformat=fixed,block_state_zero=off'))
+            self.assertEqual(plain, self._measure_fixed(src, 'subformat=fixed,block_state_zero=on'))
+
+    def test_size_mode_agrees_with_a_source(self):
+        """--size and a source of the same virtual size give the same fixed prediction."""
+        with tempfile.TemporaryDirectory() as td:
+            src = self._make_qcow2(td, 64 * MIB)
+            stdout, stderr, rc = self.run_instar_measure('--size', 64 * MIB, '-O', 'vhdx', '-o', 'subformat=fixed')
+            self.assertEqual(rc, 0, stderr)
+            self.assertEqual(f'required size: {self._measure_fixed(src)}\n'
+                             f'fully allocated size: {self._measure_fixed(src)}\n', stdout)
+
+    def test_qemu_img_cannot_measure_vhdx(self):
+        """There is no external oracle: qemu-img refuses to measure a VHDX target at all."""
+        with tempfile.TemporaryDirectory() as td:
+            src = self._make_qcow2(td, 4 * MIB)
+            r = subprocess.run(['qemu-img', 'measure', '-O', 'vhdx', str(src)],
+                               capture_output=True, text=True, timeout=60)
+            self.assertNotEqual(r.returncode, 0, r.stdout)
+            self.assertIn('does not support size measurement', r.stderr)
+
+
 class TestMeasureOtherTargetsUnchanged(InstarTestBase):
     """Choosing the VHDX block size from the source's size changes no other target's answer.
 
