@@ -717,7 +717,7 @@ rather than merge requests.
 | 6. Streaming BAT emitter and the fixed `plan_vhdx` | [PLAN-bat-population-phase-06-emitter.md](PLAN-bat-population-phase-06-emitter.md) | Complete | `aef757d2` (#853) |
 | 7. `create -f vhdx -o subformat=fixed`: guest streaming and host CLI | [PLAN-bat-population-phase-07-create.md](PLAN-bat-population-phase-07-create.md) | Complete | `03269d7f` (#858) |
 | 8. `convert -O vhdx --subformat fixed` | [PLAN-bat-population-phase-08-convert.md](PLAN-bat-population-phase-08-convert.md) | Complete | `e49b6275` (#874) |
-| 9. `measure -O vhdx -o subformat=fixed` | PLAN-bat-population-phase-09-measure.md | Not started | |
+| 9. `measure -O vhdx -o subformat=fixed` | [PLAN-bat-population-phase-09-measure.md](PLAN-bat-population-phase-09-measure.md) | In progress | |
 | 10. Cross-version matrix and derived-profile validation | PLAN-bat-population-phase-10-matrix.md | Not started | |
 | 11. Coverage and differential fuzzing | PLAN-bat-population-phase-11-fuzz.md | Not started | |
 | 12. Documentation | PLAN-bat-population-phase-12-docs.md | Not started | |
