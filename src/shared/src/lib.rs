@@ -2941,6 +2941,15 @@ impl MeasureConfig {
     pub const PREALLOC_FALLOC: u32 = 2 << 4;
     pub const PREALLOC_FULL: u32 = 3 << 4;
 
+    /// Flag: measure a fixed-subformat VHDX (`-O vhdx -o subformat=fixed`).
+    ///
+    /// Set only for VHDX output. When set, the guest predicts the size of
+    /// a fixed (dense) VHDX, whose `required` and `fully allocated` sizes
+    /// are both the fixed file length, rather than the dynamic layout it
+    /// always has. A fixed image's file length does not depend on
+    /// `block_state_zero`, so no second flag carries the block state.
+    pub const FLAG_VHDX_FIXED: u32 = 1 << 6;
+
     /// True if magic matches.
     pub fn is_valid(&self) -> bool {
         self.magic == Self::MAGIC
@@ -2949,6 +2958,11 @@ impl MeasureConfig {
     /// Extract the preallocation bits from `flags`.
     pub fn preallocation(&self) -> u32 {
         self.flags & Self::PREALLOC_MASK
+    }
+
+    /// Check if the fixed VHDX subformat was requested.
+    pub fn vhdx_fixed(&self) -> bool {
+        (self.flags & Self::FLAG_VHDX_FIXED) != 0
     }
 }
 

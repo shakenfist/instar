@@ -149,6 +149,8 @@ const MEASURE_CONFIG_PREALLOC_METADATA: u32 = 1 << 4;
 const MEASURE_CONFIG_PREALLOC_FALLOC: u32 = 2 << 4;
 #[allow(dead_code)]
 const MEASURE_CONFIG_PREALLOC_FULL: u32 = 3 << 4;
+// Bit 6: measure a fixed-subformat VHDX (`-O vhdx -o subformat=fixed`).
+const MEASURE_CONFIG_FLAG_VHDX_FIXED: u32 = 1 << 6;
 
 // MeasureResult constants (must match shared crate)
 const MEASURE_RESULT_MAGIC: u32 = 0x4D524553; // "MRES"
@@ -15212,6 +15214,7 @@ struct MeasureOptionOverrides {
     vmdk_subformat: Option<u8>,
     grain_size: Option<u32>,
     vhd_subformat: Option<u8>,
+    vhdx_fixed: Option<bool>,
     block_size: Option<u32>,
 }
 
@@ -15411,12 +15414,8 @@ fn parse_o_options(
 
                 // -------- vhdx --------
                 ("vhdx", "subformat") => match value {
-                    "dynamic" => { /* default */ }
-                    "fixed" => {
-                        return Err(
-                            "measure: -O vhdx -o subformat=fixed is not yet supported".into()
-                        );
-                    }
+                    "dynamic" => out.vhdx_fixed = Some(false),
+                    "fixed" => out.vhdx_fixed = Some(true),
                     _ => {
                         return Err(format!(
                             "measure: bad value '{}' for -o key 'subformat' \
@@ -16196,6 +16195,13 @@ fn run_measure(args: MeasureArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     let mut vhd_subformat: u8 = 0; // Dynamic unless `-o subformat` overrides.
     if let Some(v) = overrides.vhd_subformat {
         vhd_subformat = v;
+    }
+
+    // Fixed VHDX travels as a flag bit; dynamic is the absence of it. Only
+    // a VHDX target reads it (`-o subformat` is per-format), so gate on the
+    // target format as well as the parsed override.
+    if args.target_format == "vhdx" && overrides.vhdx_fixed == Some(true) {
+        measure_flags |= MEASURE_CONFIG_FLAG_VHDX_FIXED;
     }
 
     // Resolve --size into a u64 virtual size override; 0 means "scan source".

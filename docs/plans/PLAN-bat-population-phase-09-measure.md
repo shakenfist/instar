@@ -224,8 +224,25 @@ build, and its expected result.
 
 ## Execution notes
 
-(Filled in as steps land: the back brief answers, per-step outcomes and
-commits, any departure from this plan, and the CI link and result.)
+* **Back brief (Michael Still, 2026-11-05, Australia/Brisbane).** All
+  three gates answered with the recommendation: D4 the `VhdxSubformat`
+  enum (not a bool); D1 `-o subformat=fixed` only (no `--subformat`);
+  push and open the pull request once the Definition of done passes.
+* **9a.** Implemented as planned, no deviations in the four briefed
+  files. One extra kept deliberately: the agent also extended
+  `src/fuzz/fuzz_targets/fuzz_measure_calc.rs` to drive the fixed path
+  (a free `flag_bits` bit selects the subformat), so the no_std
+  panic-free guarantee covers the new calculator. Kept because the
+  fixed path is a new measure calculator and this is its natural fuzz
+  home; phase 11's fuzz scope is create/convert and the differential
+  fuzzer, not this target. The management session verified it with
+  `make fuzz-build` (the agent had not run it): clean.
+* **9a verification (management session).** `make instar`, `make lint`,
+  `make check-binary-sizes` (measure.bin 39,496 B after, up from
+  39,448 B, 5% of the 768 KiB cap), `make test-rust` and `pre-commit
+  run --all-files` all pass; the four new crate tests
+  (`vhdx_fixed_*`) pass; `make fuzz-build` clean; the `-O vhdx -o
+  subformat=fixed` "not yet supported" refusal is gone from the VMM.
 
 ## Back brief
 

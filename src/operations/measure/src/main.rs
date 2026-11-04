@@ -33,8 +33,8 @@ use shared::{
 
 use measure::{
     measure_qcow2, measure_raw, measure_vhd, measure_vhdx, measure_vmdk, MeasureError,
-    MeasureOutput, Preallocation, Qcow2Opts, VhdOpts, VhdSubformat, VhdxOpts, VmdkOpts,
-    VmdkSubformat,
+    MeasureOutput, Preallocation, Qcow2Opts, VhdOpts, VhdSubformat, VhdxOpts, VhdxSubformat,
+    VmdkOpts, VmdkSubformat,
 };
 
 /// Scratch memory layout for measure: one header buffer plus four
@@ -158,7 +158,17 @@ pub unsafe extern "C" fn _start() -> u64 {
         ImageFormat::Qcow2 => measure_qcow2(&summary, &qcow2_opts_from(config)),
         ImageFormat::Vmdk4 => measure_vmdk(&summary, &vmdk_opts_from(config)),
         ImageFormat::Vhd => measure_vhd(&summary, &vhd_opts_from(config)),
-        ImageFormat::Vhdx => measure_vhdx(&summary, &VhdxOpts { block_size: unit }),
+        ImageFormat::Vhdx => measure_vhdx(
+            &summary,
+            &VhdxOpts {
+                subformat: if config.vhdx_fixed() {
+                    VhdxSubformat::Fixed
+                } else {
+                    VhdxSubformat::Dynamic
+                },
+                block_size: unit,
+            },
+        ),
         _ => Err(MeasureError::InvalidOption),
     };
 
