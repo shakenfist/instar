@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **`instar measure -O vhdx -o subformat=fixed` measures a fixed VHDX.**
+  `required size` and `fully allocated size` are equal and are the fixed
+  file length, whatever the source holds and whatever `block_state_zero`
+  is. qemu-img cannot measure VHDX, so the number is checked against the
+  length of the file `convert -O vhdx --subformat fixed` writes. The
+  documented VHDX source divergence is also corrected: instar counts only
+  present blocks, where qemu-img counts every block. See `docs/measure.md`.
+
 - **`instar convert -O vhdx --subformat fixed` writes a fixed VHDX.**
   Blocks are written in place: every payload BAT entry is
   `PAYLOAD_BLOCK_FULLY_PRESENT` at its fixed offset, all-zero blocks are

@@ -2909,7 +2909,10 @@ pub struct MeasureConfig {
     pub _pad2: u16,
     /// vmdk grain size in bytes. 0 = default (65536).
     pub vmdk_grain_size: u32,
-    /// vhd subformat: 0=Dynamic, 1=Fixed.
+    /// vhd subformat: 0=Dynamic, 1=Fixed. The VHDX subformat has no byte
+    /// field of its own: it travels in `flags` as `FLAG_VHDX_FIXED`,
+    /// because the struct layout is fixed by the call-table contract and
+    /// a spare flag bit was free (see `vhdx_fixed`).
     pub vhd_subformat: u8,
     /// Reserved padding.
     pub _pad3: [u8; 3],
@@ -2941,6 +2944,15 @@ impl MeasureConfig {
     pub const PREALLOC_FALLOC: u32 = 2 << 4;
     pub const PREALLOC_FULL: u32 = 3 << 4;
 
+    /// Flag: measure a fixed-subformat VHDX (`-O vhdx -o subformat=fixed`).
+    ///
+    /// Set only for VHDX output. When set, the guest predicts the size of
+    /// a fixed (dense) VHDX, whose `required` and `fully allocated` sizes
+    /// are both the fixed file length, rather than the dynamic layout it
+    /// always has. A fixed image's file length does not depend on
+    /// `block_state_zero`, so no second flag carries the block state.
+    pub const FLAG_VHDX_FIXED: u32 = 1 << 6;
+
     /// True if magic matches.
     pub fn is_valid(&self) -> bool {
         self.magic == Self::MAGIC
@@ -2949,6 +2961,11 @@ impl MeasureConfig {
     /// Extract the preallocation bits from `flags`.
     pub fn preallocation(&self) -> u32 {
         self.flags & Self::PREALLOC_MASK
+    }
+
+    /// Check if the fixed VHDX subformat was requested.
+    pub fn vhdx_fixed(&self) -> bool {
+        (self.flags & Self::FLAG_VHDX_FIXED) != 0
     }
 }
 

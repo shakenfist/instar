@@ -118,6 +118,18 @@ pub enum VhdSubformat {
     Fixed,
 }
 
+/// VHDX sub-format selector.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum VhdxSubformat {
+    /// Dynamic VHDX: the BAT grows on demand and only allocated payload
+    /// blocks occupy the file.
+    #[default]
+    Dynamic,
+    /// Fixed VHDX: every payload block is present at its fixed file
+    /// offset, so the file is dense.
+    Fixed,
+}
+
 // ---------------------------------------------------------------------------
 // Raw
 // ---------------------------------------------------------------------------
@@ -944,6 +956,8 @@ fn measure_vhd_dynamic(s: &AllocationSummary, block_size: u64) -> MeasureResult 
 /// Options for a VHDX output image.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct VhdxOpts {
+    /// VHDX sub-format. Default: `VhdxSubformat::Dynamic`.
+    pub subformat: VhdxSubformat,
     /// Block size in bytes: a power of two in `[1 MiB, 256 MiB]`, or 0 for
     /// qemu's default for the size (`vhdx::default_block_size`).
     /// Default: 0, because qemu's default depends on the virtual size,
@@ -1003,6 +1017,14 @@ pub struct VhdxOpts {
 /// prediction is 4 MiB rather than the 3 MiB a region sized from the
 /// count alone would give.
 ///
+/// # Fixed VHDX
+///
+/// When `opts.subformat` is [`VhdxSubformat::Fixed`] this dispatches to
+/// [`measure_vhdx_fixed`] after the block size has been resolved and
+/// checked. The formula above is the dynamic path; a fixed image is
+/// dense and sized from `layout.fixed_file_length` instead. This mirrors
+/// [`measure_vhd`], which documents its two subformats the same way.
+///
 /// # Errors
 ///
 /// A block size the layout refuses is [`MeasureError::InvalidOption`];
@@ -1029,6 +1051,10 @@ pub fn measure_vhdx(s: &AllocationSummary, opts: &VhdxOpts) -> MeasureResult {
     // ---- Validate sizes. ---------------------------------------------------
     if s.allocated_bytes > s.virtual_size {
         return Err(MeasureError::InvalidSize);
+    }
+
+    if opts.subformat == VhdxSubformat::Fixed {
+        return measure_vhdx_fixed(&geometry);
     }
 
     let bs = u64::from(geometry.block_size);
@@ -1069,6 +1095,27 @@ pub fn measure_vhdx(s: &AllocationSummary, opts: &VhdxOpts) -> MeasureResult {
         .ok_or(MeasureError::Overflow)?;
 
     MeasureOutput::try_new(required, fully_allocated)
+}
+
+/// Fixed VHDX size calculation.
+///
+/// A fixed VHDX is dense: every payload byte is in the file at its fixed
+/// offset whether or not the source block held data, so `required ==
+/// fully_allocated`, both equal to `layout.fixed_file_length` (the length
+/// qemu-img truncates the file to: `fixed_data_start + virtual_size`,
+/// already checked in `vhdx::layout`). The block size still matters,
+/// because it sizes the BAT region and therefore `fixed_data_start`, so
+/// the layout call stays; the source allocation does not, so this reads
+/// neither `allocated_bytes` nor `target_units_with_data`.
+///
+/// `measure_vhdx` dispatches here only after `vhdx::layout` has resolved
+/// and validated the block size, so `-o subformat=fixed,block_size=512K`
+/// is still refused with `InvalidOption`. This is deliberately the
+/// opposite order from `measure_vhd`, which dispatches to its fixed path
+/// before validating: for VHDX the block size changes the BAT region and
+/// therefore the fixed file length, so it has to be checked first.
+fn measure_vhdx_fixed(geometry: &vhdx::VhdxLayout) -> MeasureResult {
+    MeasureOutput::try_new(geometry.fixed_file_length, geometry.fixed_file_length)
 }
 
 // ---------------------------------------------------------------------------
@@ -1234,6 +1281,7 @@ mod tests {
             target_units_with_data: 0,
         };
         let opts = VhdxOpts {
+            subformat: VhdxSubformat::Dynamic,
             block_size: 32 * 1024 * 1024,
         };
         let r = measure_vhdx(&s, &opts);
@@ -2851,6 +2899,7 @@ mod tests {
             measure_vhdx(
                 &s,
                 &VhdxOpts {
+                    subformat: VhdxSubformat::Dynamic,
                     block_size: 16 * MIB as u32
                 }
             ),
@@ -2879,6 +2928,7 @@ mod tests {
             target_units_with_data: 0,
         };
         let opts = VhdxOpts {
+            subformat: VhdxSubformat::Dynamic,
             block_size: 32 * MIB as u32,
         };
         assert_eq!(
@@ -2903,6 +2953,7 @@ mod tests {
             target_units_with_data: 0,
         };
         let opts = VhdxOpts {
+            subformat: VhdxSubformat::Dynamic,
             block_size: 32 * MIB as u32,
         };
         let expected = 4 * MIB + 32 * 32 * MIB;
@@ -2935,6 +2986,7 @@ mod tests {
             target_units_with_data: 0,
         };
         let opts = VhdxOpts {
+            subformat: VhdxSubformat::Dynamic,
             block_size: MIB as u32,
         };
         assert_eq!(
@@ -2966,6 +3018,7 @@ mod tests {
             target_units_with_data: 0,
         };
         let opts = VhdxOpts {
+            subformat: VhdxSubformat::Dynamic,
             block_size: 256 * MIB as u32,
         };
         assert_eq!(
@@ -3000,6 +3053,7 @@ mod tests {
             target_units_with_data: 0,
         };
         let opts = VhdxOpts {
+            subformat: VhdxSubformat::Dynamic,
             block_size: MIB as u32,
         };
         assert_eq!(
@@ -3024,6 +3078,7 @@ mod tests {
             target_units_with_data: 0,
         };
         let opts = VhdxOpts {
+            subformat: VhdxSubformat::Dynamic,
             block_size: 32 * MIB as u32,
         };
         assert_eq!(
@@ -3040,6 +3095,7 @@ mod tests {
         // 64 TiB is the largest VHDX qemu creates, a strict `>` on the
         // size rounded up to 512 bytes (`vhdx_co_create`, qemu 7.0.0).
         let opts = VhdxOpts {
+            subformat: VhdxSubformat::Dynamic,
             block_size: 32 * MIB as u32,
         };
         let at = AllocationSummary {
@@ -3062,6 +3118,125 @@ mod tests {
         }
     }
 
+    // --- VHDX fixed subformat tests ---
+    //
+    // A fixed VHDX is dense: `required == fully_allocated ==
+    // vhdx::layout(...).fixed_file_length`, independent of the source
+    // allocation. Each case takes the fixed file length straight from
+    // `vhdx::layout` (the writer's own helper) so the measure path is
+    // checked against it, not against a hand-worked constant.
+
+    fn assert_vhdx_fixed(virtual_size: u64, allocated_bytes: u64, block_size: u32) {
+        let s = AllocationSummary {
+            virtual_size,
+            allocated_bytes,
+            target_units_with_data: 0,
+        };
+        let opts = VhdxOpts {
+            subformat: VhdxSubformat::Fixed,
+            block_size,
+        };
+        let layout = vhdx::layout(virtual_size, block_size, false)
+            .unwrap_or_else(|e| panic!("layout vs={virtual_size} bs={block_size}: {e:?}"));
+        assert_eq!(
+            measure_vhdx(&s, &opts),
+            Ok(MeasureOutput {
+                required: layout.fixed_file_length,
+                fully_allocated: layout.fixed_file_length,
+            }),
+            "vs={virtual_size} alloc={allocated_bytes} bs={block_size}"
+        );
+    }
+
+    #[test]
+    fn vhdx_fixed_is_fixed_file_length_regardless_of_allocation() {
+        // A spread of sizes and block sizes, with the source allocation
+        // varied from empty to full, to prove the fixed answer does not
+        // depend on it.
+        for &alloc in &[0, GIB / 2, GIB] {
+            assert_vhdx_fixed(GIB, alloc, 32 * MIB as u32);
+            assert_vhdx_fixed(GIB, alloc, MIB as u32);
+        }
+        assert_vhdx_fixed(64 * GIB, 0, 256 * MIB as u32);
+    }
+
+    #[test]
+    fn vhdx_fixed_block_size_moves_the_data_start_above_the_bat_floor() {
+        // Every other fixed case is small enough that the BAT region
+        // floors at 1 MiB, so fixed_data_start is the constant 8 MiB and
+        // block_size cannot be seen to move it. At 1 TiB the 1 MiB-block
+        // BAT exceeds the floor, pushing fixed_data_start past 8 MiB,
+        // while a 256 MiB block keeps the BAT under the floor at 8 MiB.
+        // The two predictions therefore differ by the BAT growth alone,
+        // which only happens if measure propagates block_size into the
+        // layout.
+        let virtual_size = 1024 * GIB;
+
+        let small_block = vhdx::layout(virtual_size, MIB as u32, false).unwrap();
+        assert!(
+            small_block.fixed_data_start > 8 * MIB,
+            "BAT region did not exceed the 1 MiB floor: {}",
+            small_block.fixed_data_start
+        );
+        assert_vhdx_fixed(virtual_size, 0, MIB as u32);
+
+        let big_block = vhdx::layout(virtual_size, 256 * MIB as u32, false).unwrap();
+        assert_eq!(big_block.fixed_data_start, 8 * MIB);
+        assert_vhdx_fixed(virtual_size, 0, 256 * MIB as u32);
+
+        assert_ne!(small_block.fixed_file_length, big_block.fixed_file_length);
+    }
+
+    #[test]
+    fn vhdx_fixed_uses_qemus_default_block_size() {
+        // block_size 0 resolves to qemu's default for the size; the fixed
+        // file length still comes from the same layout call.
+        let s = AllocationSummary {
+            virtual_size: 1025 * MIB,
+            allocated_bytes: 1025 * MIB,
+            target_units_with_data: 0,
+        };
+        let opts = VhdxOpts {
+            subformat: VhdxSubformat::Fixed,
+            ..VhdxOpts::default()
+        };
+        let layout = vhdx::layout(1025 * MIB, 0, false).unwrap();
+        assert_eq!(
+            measure_vhdx(&s, &opts),
+            Ok(MeasureOutput {
+                required: layout.fixed_file_length,
+                fully_allocated: layout.fixed_file_length,
+            })
+        );
+    }
+
+    #[test]
+    fn vhdx_fixed_partial_last_block_is_not_padded_to_a_block() {
+        // A virtual size that is neither a whole number of blocks nor a
+        // whole number of 512-byte sectors. The fixed file ends at
+        // fixed_data_start + round_up(virtual_size, 512), part way through
+        // the last block, so measure must not round it to a block boundary.
+        let virtual_size = GIB + 1234 * 512 + 7;
+        assert_vhdx_fixed(virtual_size, 0, 32 * MIB as u32);
+        let layout = vhdx::layout(virtual_size, 32 * MIB as u32, false).unwrap();
+        let payload = layout.fixed_file_length - layout.fixed_data_start;
+        assert_eq!(payload, virtual_size.div_ceil(512) * 512);
+        assert_ne!(
+            payload % (32 * MIB),
+            0,
+            "payload unexpectedly block-aligned"
+        );
+    }
+
+    #[test]
+    fn vhdx_fixed_zero_virtual_size_is_the_data_start() {
+        // Zero virtual size: no payload, so fixed_file_length equals
+        // fixed_data_start.
+        assert_vhdx_fixed(0, 0, 32 * MIB as u32);
+        let layout = vhdx::layout(0, 32 * MIB as u32, false).unwrap();
+        assert_eq!(layout.fixed_file_length, layout.fixed_data_start);
+    }
+
     // --- VHDX option validation tests ---
 
     #[test]
@@ -3073,6 +3248,7 @@ mod tests {
             target_units_with_data: 0,
         };
         let opts = VhdxOpts {
+            subformat: VhdxSubformat::Dynamic,
             block_size: 512 * 1024,
         };
         assert_eq!(measure_vhdx(&s, &opts), Err(MeasureError::InvalidOption));
@@ -3087,6 +3263,7 @@ mod tests {
             target_units_with_data: 0,
         };
         let opts = VhdxOpts {
+            subformat: VhdxSubformat::Dynamic,
             block_size: 512 * 1024 * 1024,
         };
         assert_eq!(measure_vhdx(&s, &opts), Err(MeasureError::InvalidOption));
@@ -3101,6 +3278,7 @@ mod tests {
             target_units_with_data: 0,
         };
         let opts = VhdxOpts {
+            subformat: VhdxSubformat::Dynamic,
             block_size: 3 * 1024 * 1024,
         };
         assert_eq!(measure_vhdx(&s, &opts), Err(MeasureError::InvalidOption));

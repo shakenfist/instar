@@ -17,7 +17,7 @@ use libfuzzer_sys::fuzz_target;
 use measure::{
     measure_qcow2, measure_raw, measure_vhd, measure_vhdx, measure_vmdk,
     AllocationSummary, MeasureOutput, Preallocation, Qcow2Opts, VhdOpts,
-    VhdSubformat, VhdxOpts, VmdkOpts, VmdkSubformat,
+    VhdSubformat, VhdxOpts, VhdxSubformat, VmdkOpts, VmdkSubformat,
 };
 
 fuzz_target!(|data: &[u8]| {
@@ -64,6 +64,13 @@ fuzz_target!(|data: &[u8]| {
         1 => VhdSubformat::Fixed,
         _ => VhdSubformat::Dynamic,
     };
+    // Bits 0-3 of flag_bits drive qcow2; bit 4 is free and selects the
+    // VHDX subformat, so the fixed path is fuzzed for panic-freedom too.
+    let vhdx_subformat = if flag_bits & 0x10 != 0 {
+        VhdxSubformat::Fixed
+    } else {
+        VhdxSubformat::Dynamic
+    };
 
     let summary = AllocationSummary {
         virtual_size,
@@ -104,7 +111,10 @@ fuzz_target!(|data: &[u8]| {
             measure_vhd(&summary, &opts).ok()
         }
         _ => {
-            let opts = VhdxOpts { block_size };
+            let opts = VhdxOpts {
+                subformat: vhdx_subformat,
+                block_size,
+            };
             measure_vhdx(&summary, &opts).ok()
         }
     };

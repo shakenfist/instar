@@ -682,7 +682,7 @@ self_test() {
 # phase's definition of done asks the two to stay in step, which until
 # now was a promise kept by hand. Asserting it makes the drift a
 # failure instead of a documentation bug nobody reads.
-EXPECTED_CASES=150
+EXPECTED_CASES=153
 
 check_case_count() {
     # Only meaningful for a whole run; a selection is expected to be short.
@@ -2759,6 +2759,32 @@ integration_case 'convert-host-vhdx-fixed-efbig-mapping-removed' "${VMM_MAIN}" \
     $'    BackingStore::open(path, false, Some(geometry.fixed_file_length), false).map_err(|e| {\n        if e.raw_os_error() == Some(libc::EFBIG) {\n            let _ = std::fs::remove_file(path);\n            format!(\n                "convert: a fixed VHDX of {} bytes needs a {}-byte file, which the filesystem \\\n                 holding \'{}\' cannot store: {}",\n                geometry.virtual_size, geometry.fixed_file_length, filename, e\n            )\n            .into()\n        } else {\n            format!("convert: open \'{}\' for write failed: {}", filename, e).into()\n        }\n    })' \
     $'    BackingStore::open(path, false, Some(geometry.fixed_file_length), false).map_err(|e| { // MUTATED\n        format!("convert: open \'{}\' for write failed: {}", filename, e).into()\n    })' \
     'test_convert.TestConvertVhdxFixedLarge.test_file_size_limit_is_refused_like_a_filesystem_ceiling'
+
+# Fixed VHDX measure, from the host's -o parser to the guest's calculator.
+# The prediction is checked against the length of the file a fixed VHDX
+# convert writes, so each mutation below changes the number and no longer
+# matches it. The first drops the flag bit on the host, so a fixed
+# target is measured as a dynamic one. The second returns the data
+# region start where the whole file length belongs, so the payload is
+# left out of the prediction. The third restores the old refusal of
+# subformat=fixed, which fails the measure outright.
+FIXED_MEASURE='test_measure.TestMeasureVhdxFixed.test_matches_the_convert_output'
+MEASURE_CRATE='src/crates/measure/src/lib.rs'
+
+integration_case 'measure-host-vhdx-fixed-flag-ignored' "${VMM_MAIN}" \
+    '    if args.target_format == "vhdx" && overrides.vhdx_fixed == Some(true) {' \
+    '    if false { // MUTATED' \
+    "${FIXED_MEASURE}"
+
+integration_case 'measure-vhdx-fixed-returns-data-start' "${MEASURE_CRATE}" \
+    '    MeasureOutput::try_new(geometry.fixed_file_length, geometry.fixed_file_length)' \
+    '    MeasureOutput::try_new(geometry.data_start, geometry.data_start) // MUTATED' \
+    "${FIXED_MEASURE}"
+
+integration_case 'measure-host-vhdx-fixed-arm-refused' "${VMM_MAIN}" \
+    '                    "fixed" => out.vhdx_fixed = Some(true),' \
+    $'                    "fixed" => return Err("measure: -O vhdx -o subformat=fixed is not yet supported".into()), // MUTATED' \
+    "${FIXED_MEASURE}"
 
 # ---------------------------------------------------------------------
 # The libvhdi oracle cross-check.
