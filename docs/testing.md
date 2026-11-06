@@ -3052,6 +3052,62 @@ header-id) prevent dedup from collapsing duplicate-output
 versions, so each version gets its own profile; the comparison logic excludes those random fields from the
 field-equivalence check.
 
+### Adding or refreshing one baseline
+
+`scripts/generate-baselines.py` in `instar-testdata` takes repeatable,
+exact-match filters, so a new fixture or create case no longer needs a
+full run across all 80 versions. `--image ID` selects manifest images
+and applies to `info`, `check`, `compare`, `measure`, `map` and
+`snapshot-list`; `--case NAME` selects case names and applies to
+`create`, `resize`, `amend`, `bitmap`, `dd`, `rebase`, `commit` and
+`measure`. `measure` takes both (a `--size` axis and a source-image
+axis); one filter runs the sub-mode it names, both run both. A filter
+that matches nothing exits 1 rather than running empty. Run from the
+`instar-testdata` checkout:
+
+```bash
+scripts/generate-baselines.py --command map --no-commit --image vhdx-fixed-16M
+scripts/generate-baselines.py --command create --no-commit --case 16M-fixed
+scripts/detect-profiles.py --no-commit
+make validate-profiles
+```
+
+`make baselines-create` and `make baselines-map` run the unfiltered
+form; neither is part of the umbrella `baselines` target, because they
+write real disk blocks (create) or walk every safe image at every
+version (map), so prefer the filtered form.
+
+**Always run `make validate-profiles` after a regeneration.** It checks,
+for every version in each output type's `version-map.json`, that the
+mapped profile holds a byte-identical copy of each of that version's
+source files, and it exits non-zero on any mismatch, orphan file or
+output type that compared nothing. The derived profiles have gone
+silently wrong twice while the raw baselines were fine and the suite
+stayed green: once by stamping a stale snapshot into every profile, once
+by flattening buckets so a third of the files were dropped. Two
+defects of the same shape have since been fixed in `detect-profiles.py`
+(a raw change that never reached the profiles, and hand-authored goldens
+dropped when a profile boundary moved). Nothing else notices these, so
+the validator is the check.
+
+**The create-case list is mirrored in two repositories.** `CREATE_CASES`
+in `tests/test_create.py` mirrors the generator's `CREATE_CASES`, and
+the two must land together. Drift shows as
+`test_create_cases_match_baselines` failing in one direction: "baselines
+on disk not in CREATE_CASES" means the generator and testdata moved
+ahead of instar; "CREATE_CASES entries with no baseline" means instar
+moved ahead of testdata.
+
+**Reading a baseline failure: which side is "reference"?** In
+`tests/test_map.py` and `tests/test_measure.py` the baseline
+comparisons call `assertEqual(instar_output, baseline, ...)`, so
+testtools labels *instar's output* "reference" and the baseline
+"actual". That is the reverse of what the words suggest; read a
+divergence there as "reference = instar, actual = qemu-img baseline".
+`assert_info_equivalent` in `tests/test_create.py` passes the baseline
+first and reads the conventional way. Check the argument order before
+deciding which side moved.
+
 ### qemu-img create pins
 
 `tests/golden/qemu-create-pins.json` records what every static

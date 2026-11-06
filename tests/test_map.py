@@ -28,6 +28,11 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+# NOTE: baseline comparisons here call assertEqual(instar_output, baseline),
+# so a failure labels instar's output "reference" and the qemu-img baseline
+# "actual" -- the reverse of what the words suggest. See docs/testing.md,
+# "Adding or refreshing one baseline".
+
 from base import InstarTestBase
 from helpers.comparators import substitute_testdata_root
 
