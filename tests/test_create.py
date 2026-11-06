@@ -2597,6 +2597,9 @@ CREATE_CASES = {
         ('1G-default',              '1G',  []),
         ('1G-stream-optimized',     '1G',  ['subformat=streamOptimized']),
         ('1G-monolithic-sparse',    '1G',  ['subformat=monolithicSparse']),
+        ('1M-monolithic-flat',      '1M',  ['subformat=monolithicFlat']),
+        ('1M-prealloc-falloc',      '1M',  ['preallocation=falloc']),
+        ('1M-prealloc-full',        '1M',  ['preallocation=full']),
     ],
     'vhd': [
         ('1M-default',              '1M',  []),
@@ -2604,6 +2607,8 @@ CREATE_CASES = {
         ('1G-default',              '1G',  []),
         ('1M-fixed',                '1M',  ['subformat=fixed']),
         ('16M-fixed',               '16M', ['subformat=fixed']),
+        ('1M-prealloc-falloc',      '1M',  ['preallocation=falloc']),
+        ('1M-prealloc-full',        '1M',  ['preallocation=full']),
     ],
     'vhdx': [
         ('1M-default',              '1M',  []),
@@ -2611,6 +2616,11 @@ CREATE_CASES = {
         ('1G-default',              '1G',  []),
         ('1G-block-16M',            '1G',  ['block_size=16M']),
         ('1G-block-32M',            '1G',  ['block_size=32M']),
+        ('16M-fixed',               '16M', ['subformat=fixed']),
+        ('17M-fixed',               '17M', ['subformat=fixed']),
+        ('16M-fixed-bsz-off',       '16M', ['subformat=fixed,block_state_zero=off']),
+        ('1M-prealloc-falloc',      '1M',  ['preallocation=falloc']),
+        ('1M-prealloc-full',        '1M',  ['preallocation=full']),
     ],
     'raw': [
         ('1M-default',              '1M',  []),
@@ -2658,6 +2668,14 @@ KNOWN_WRITER_DIVERGENCES = {
     ('vhd', '1G-default'):  'qemu rounds VHD virtual_size to CHS geometry',
     ('vhd', '1M-fixed'):    'qemu rounds VHD virtual_size to CHS geometry',
     ('vhd', '16M-fixed'):   'qemu rounds VHD virtual_size to CHS geometry',
+    # The preallocation modes change only how much of the file is written, so
+    # they inherit the same geometry divergence as the cases above: qemu-img
+    # reports virtual-size 1079296 for a 1M VHD where instar reports 1048576,
+    # exactly as it does for '1M-default'.
+    ('vhd', '1M-prealloc-falloc'):
+        'qemu rounds VHD virtual_size to CHS geometry',
+    ('vhd', '1M-prealloc-full'):
+        'qemu rounds VHD virtual_size to CHS geometry',
 }
 
 
@@ -3017,6 +3035,15 @@ KNOWN_CHECK_FAILURES = {
     # refcount_order=4 header over differently-packed on-disk entries and
     # instar check rejected it. Fixed by deriving refcount_order from
     # refcount_bits and packing sub-byte widths LSB-first — instar #365.)
+    #
+    # instar check exits 63 with 'This image format (vmdk) does not support
+    # checks' on a monolithicFlat VMDK — whether instar or qemu-img wrote it —
+    # while it checks the monolithicSparse, streamOptimized and preallocated
+    # VMDKs in this same matrix cleanly, and qemu-img check reports the flat
+    # image free of errors. The writer is fine (the create baseline matches);
+    # it is the reader that has no check path for a flat extent.
+    ('vmdk', '1M-monolithic-flat'):
+        'instar check has no path for a monolithicFlat extent',
 }
 
 

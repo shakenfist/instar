@@ -685,6 +685,18 @@ KNOWN_SOURCE_SCANNER_DIVERGENCES = {
     # reports the larger required size.
     'qemu-vhdx': ('qcow2', 'instar vhdx scanner counts only present blocks, qemu-img counts every block'),
 
+    # The same family, for the VHDX fixtures written with block_state_zero=on:
+    # every payload BAT entry is in a zero state, so instar's scanner counts
+    # none of them and reports the bare qcow2 metadata floor, while qemu-img
+    # counts every block and reports required == fully allocated. Measured on
+    # vhdx-fixed-16M against qemu-img 10.0: instar 327680, qemu-img 17104896,
+    # of 17104896 fully allocated. The -bsz-off-data fixtures hold real data in
+    # fully-present blocks and the two agree there, so they are not listed.
+    'vhdx-fixed-16M': ('qcow2', 'instar counts only non-zero-state VHDX blocks, qemu-img counts all'),
+    'vhdx-fixed-17M': ('qcow2', 'instar counts only non-zero-state VHDX blocks, qemu-img counts all'),
+    'vhdx-dynamic-131041M-block-1M':
+        ('qcow2', 'instar counts only non-zero-state VHDX blocks, qemu-img counts all'),
+
     # VMDK scanner sparse-detection differs from qemu-img for some
     # multi-extent / non-trivial layouts.
     'vmdk-multi-partition': ('qcow2', 'instar vmdk scanner sparse-detection differs'),

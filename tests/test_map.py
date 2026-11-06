@@ -265,6 +265,35 @@ KNOWN_MAP_DIVERGENCES = {
     'qemu-vhdx':
         ('json', 'instar vhdx walker exposes BAT-level detail; '
                  'qemu-img emits one whole-image extent'),
+
+    # The VHDX coverage fixtures diverge in two ways, both measured against
+    # qemu-img 10.0:
+    #
+    #   * Written with block_state_zero=on, every payload BAT entry is in a
+    #     zero state. instar reports the extent as zero and not data; qemu-img
+    #     reports the same extent as data, having not read the BAT state.
+    #   * For the -bsz-off-data pair both walkers agree the extent holds data,
+    #     and instar additionally reports the payload block's offset in the
+    #     file, which qemu-img leaves out of its extent entirely.
+    #
+    # Only `json` is listed: qemu-img itself exits non-zero on these files in
+    # human mode ("File contains external, encrypted or compressed clusters"),
+    # so the baseline records rc=1 and the human scenario skips on that.
+    'vhdx-fixed-16M':
+        ('json', 'instar reports zero-state VHDX blocks as zero; '
+                 'qemu-img reports them as data'),
+    'vhdx-fixed-17M':
+        ('json', 'instar reports zero-state VHDX blocks as zero; '
+                 'qemu-img reports them as data'),
+    'vhdx-dynamic-131041M-block-1M':
+        ('json', 'instar reports zero-state VHDX blocks as zero; '
+                 'qemu-img reports them as data'),
+    'vhdx-fixed-16M-bsz-off-data':
+        ('json', 'instar reports the payload block offset; '
+                 'qemu-img omits it'),
+    'vhdx-fixed-17M-bsz-off-data':
+        ('json', 'instar reports the payload block offset; '
+                 'qemu-img omits it'),
 }
 
 
