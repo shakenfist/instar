@@ -1,0 +1,420 @@
+# Phase 10: cross-version matrix and derived-profile validation
+
+Phase 10 of [PLAN-bat-population.md](PLAN-bat-population.md). Read its
+Situation (in particular "A standing caution about the baseline tooling",
+which is this phase's reason to exist) and the phase 10 paragraph of
+"Sequencing rationale". Also read
+[the phase 2 plan](PLAN-bat-population-phase-02-fixtures.md)'s decision 5,
+which moved both pieces of work here and says why, and
+[the phase 3 plan](PLAN-bat-population-phase-03-host-create.md)'s
+decision 5, which moved the monolithicFlat and preallocation create cases
+here for the same reason. This file assumes them.
+
+Two repositories are in play. `instar-testdata` owns the generator, the
+baselines and the derived profiles, and takes direct commits to `main`
+rather than merge requests. `instar` owns the mirror of the generator's
+case list and the tests that consume the baselines. The ordering between
+them is decision 3, and it is the part of this phase most likely to go
+wrong.
+
+Planning effort: medium, as the master plan sets for phase 10 ("only
+tests"). The work is running established tooling and reading its output;
+what needed judgement was deciding how to generate a handful of baselines
+without rewriting thousands, and that is settled in decisions 1 and 2.
+
+Review effort: high. The master plan's caution is that this exact
+procedure has produced silently wrong derived profiles twice, so the
+review that matters is of the validator and of the before/after file
+counts, not of the baseline bytes.
+
+## What the survey found
+
+Surveyed on 2026-11-06 against `instar` `develop` at `56a6303c` (phase 9
+merged as `3b74ba8d`, #877) and `instar-testdata` `main` at `d2f9467719`.
+The master plan's phase 10 premises hold, but the survey found four
+things the paragraph does not say, and two of them change the shape of
+the phase. Corrections to the master plan's phase 10 paragraph and to the
+`index.md` row are made in this planning commit, so a later step does not
+redo them.
+
+### The generator cannot be aimed at one image or one case
+
+`instar-testdata/scripts/generate-baselines.py` takes `--version`,
+`--manifest`, `--arch`, `--all-images`, `--output-type`, `--command` and
+`--no-commit` (`:3100-3136`). There is no `--image` and no `--case`
+filter, and nothing skips an output that already exists: the per-version
+loop walks every image `load_test_images` returns (`:1004-1016`) and
+overwrites. So "add baselines for phase 2's five fixtures" is today the
+same command as "regenerate every safe image's baselines", and
+"add the fixed VHDX create cases" is the same command as "rewrite all
+108 create baselines for all 80 versions".
+
+That matters twice over:
+
+* **The baselines are a long way behind the manifest.** `instar`'s
+  `tests/manifest.json` holds 218 images, 124 of them `safety: safe`.
+  `expected-outputs/check-human/raw/10.0.0/` holds 38, and
+  `expected-outputs/qemu-img-json/raw/10.0.0/` holds 71; the
+  `check-human` `version-map.json` is stamped `2026-08-29`. A plain
+  `--command check` run would therefore add roughly 86 images' baselines
+  across 80 versions as a side effect, un-skipping tests across the
+  suite that have never run. That is issue #845's territory, not this
+  phase's (see *Out of scope*).
+* **Regenerating create baselines rewrites 400 files to no purpose.**
+  qemu-img writes a random VMDK `cid` on every create, so the five
+  `vmdk` create cases' `stdout` differs on every run and across every
+  version (measured: `create-info-json/vmdk/10.0.0/1M-default.stdout.txt`
+  vs `10.0.1`'s differ in exactly one line, `"cid"`). A full
+  `--command create` run would change 400 vmdk baseline files and then
+  all 80 create profiles, with no information in the diff.
+
+Decision 1 adds the two filters.
+
+### `create-info-json`'s 80 profiles are the VMDK `cid`, and are harmless
+
+`expected-outputs/create-info-json/` has 80 profiles for 80 versions --
+no deduplication at all -- while `check-human`, `map-human`, `map-json`,
+`measure-human` and `measure-json` each have exactly one profile for all
+80. Both looked like the "silently wrong profiles" failure mode and
+neither is:
+
+* The single-profile types are genuine. Sampled `6.0.0` against `10.2.0`
+  for three images in each of `check-human`, `map-human` and
+  `measure-json`: byte-identical every time. qemu-img's `check`, `map`
+  and `measure` output really has not moved across those images in nine
+  releases.
+* The 80 create profiles are the `cid`. `detect-profiles.py`'s
+  `hash_version_multi_bucket` (`:203-236`) deliberately hashes only
+  `return_code` and `timed_out` out of each `meta.json`, so timestamps
+  are excluded -- but it hashes `stdout` whole, and the five vmdk cases'
+  `stdout` carries the random `cid`. Confirmed by computing the hash for
+  `10.0.0` and `10.0.1` directly and diffing every contributing part: the
+  only differences are those five files, in that one field.
+
+Nothing consumes the redundancy incorrectly -- `instar`'s
+`tests/helpers/info_json.py:39` already strips `cid` and `parent-cid` for
+vmdk before comparing -- so this is recorded in Future work, not fixed
+here. It does mean the validator must accept 80 create profiles as
+correct, and that adding a sixth vmdk create case (monolithicFlat) will
+not make it worse.
+
+### The two historical profile failures, and what a validator must check
+
+Both are in `instar-testdata`'s history, both are fixed, and both
+describe the check this phase should automate:
+
+* `ec01915058` ("detect-profiles: fix preserve-baseline corruption"):
+  the preserve-hand-maintained-baselines path compared ids at mismatched
+  granularity, so it matched nothing, flagged every image as hand
+  maintained, and stamped one stale snapshot into every regenerated
+  profile -- 41 of 44 images wrong while `raw/` stayed correct. Its
+  verification was "regeneration now produces profiles byte-identical to
+  `raw/` for 154/154 sampled checks".
+* `03c379a08a` ("Stop the profile copy silently dropping outputs"):
+  `copy_multi_bucket_version_to_profile` flattened buckets under bare
+  filenames, so `create-info-json`'s five buckets all contributing a
+  `1G-default` left only the last in sorted order. 36 files in, 25 out,
+  no warning. The fix qualifies a basename with its bucket only for
+  output types where basenames collide, which is why `create-info-json`
+  profiles hold `vhdx-16M-fixed.stdout.txt` while `map-json` profiles
+  hold bare image ids.
+
+Neither check is committed anywhere. There is no validator script, no
+`make` target for one, and `instar-testdata` has no CI of any kind (no
+`.github/`, no `.gitlab-ci.yml`, no pre-commit config), so a validator
+here is a tool a human or an agent runs, not a gate. Decision 4 defines
+it.
+
+### Smaller findings, all verified
+
+* **`CREATE_CASES` holds none of this plan's output.** Both copies --
+  `instar-testdata/scripts/generate-baselines.py:404` and its mirror at
+  `instar/tests/test_create.py:2572` -- are identical today and have no
+  vhdx `fixed` case, no vmdk `monolithicFlat` case, and no non-qcow2
+  preallocation case. `vhdx`'s comment still reads "vhdx is dynamic-only
+  in instar", which phase 7 made false. `vhd` already has `1M-fixed` and
+  `16M-fixed`, so the fixed-subformat baseline shape is established.
+* **`test_create_cases_match_baselines` asserts set equality in both
+  directions** (`instar/tests/test_create.py:2741-2774`), which is what
+  makes the cross-repo ordering a real problem rather than a cosmetic
+  one. It skips only when a target has no baselines at all, and `vhdx`
+  has 80 versions of them.
+* **`TestProfileSelectionMatrix` hardcodes six expected info profile
+  names** (`instar/tests/test_version_detection.py:268-276`), so a
+  shifted info profile boundary breaks it. Measured whether phase 2's
+  fixtures would shift one: `qemu-img info --output=json` on
+  `vhdx-fixed-16M.vhdx` is identical for 6.0.0 and 7.2.19, and identical
+  again for 8.0.0, 10.0.0 and 10.2.0, differing between them only by the
+  `children` block qemu added in 8.0.0 -- an *existing* boundary
+  (`profile-8-0-0`). So no new boundary is expected. Verify, do not
+  assume: step 10d runs `detect-profiles.py --dry-run` and compares the
+  profile list before and after.
+* **The `$FILENAME` normalisation will not cover a monolithicFlat
+  baseline.** `generate_create_baseline` substitutes the literal tmp
+  path (`:1636-1639`). A monolithicFlat create writes a second file whose
+  name is the stem plus `-flat.vmdk`, which that literal will not match,
+  so the baseline would embed a host-specific path; and the generator
+  deletes only `tmp_file` (`:1676`), so the extent leaks into tmp on
+  every version. Both are fixed in step 10a.
+* **`info` and `check` baselines are flat; `map`, `measure`, `dd`,
+  `resize` and `create` are bucketed.** `expected-outputs/check-human/`
+  and `qemu-img-{human,json}/` hold `raw/<version>/<image>.*` where
+  `raw` means "all formats"; `map-*`, `measure-*` and `create-info-json`
+  hold `<format-or-target>/<version>/...` where a sibling `raw/` means
+  "the raw format". The word means two different things in the same
+  tree. `detect-profiles.py`'s own docstring (`:9-34`) documents only the
+  first shape and is stale.
+* **There is no `baselines-create` or `baselines-map` Makefile target**,
+  although three other targets' comments cite "the same policy as
+  `baselines-create`" (`Makefile:197`, `:209`, `:223`). Those two
+  commands have only ever been run by hand. Step 10a adds them.
+* **Phase 2's five fixtures are registered and ready.** All five are in
+  `instar/tests/manifest.json` as `safety: safe`, `run_in_ci: true`,
+  with sha256 values, and none has a baseline anywhere under
+  `expected-outputs/`. All 329 LFS objects in the testdata clone are
+  materialised.
+
+## Decisions
+
+1. **Add `--image` and `--case` filters to the generator rather than
+   mass-regenerate.** Both repeatable, both matching exactly (no
+   globbing), both erroring if a given id or case name matches nothing --
+   a silent no-match filter would produce a green run that generated
+   nothing, which is the hardest kind of failure to notice: the command
+   succeeds, prints per-version progress, and leaves the tree
+   unchanged.
+   `--image` filters the manifest-derived image list; `--case` filters
+   the per-target case list for `--command create` (and is accepted for
+   any case-driven command, so `resize` and `dd` inherit it). This is the
+   decision that makes the phase possible at all: without it, "add five
+   fixtures' baselines" is a ~10,000-invocation run that un-skips
+   suite-wide tests, and "add ten create cases" is a 400-file no-op diff.
+   The alternative -- generate everything and accept the fallout -- was
+   rejected because the fallout is exactly issue #845, which deserves its
+   own phase with its own review.
+
+2. **Four commands get fixture baselines: `info`, `check`, `map`,
+   `measure`.** These are the four phase 2 named as skipping the new
+   fixtures (`tests/test_info_safe.py:75-82`, `test_map.py`'s and
+   `test_measure.py`'s "no baseline meta" skips). `dd`, `resize`,
+   `amend`, `bitmap`, `snapshot-list`, `rebase`, `commit` and `compare`
+   are not added: they are case-driven or qcow2-only matrices, not
+   per-image ones, and nothing in `instar` reads a per-image baseline for
+   them for a VHDX source.
+
+3. **`instar-testdata` pushes only once the `instar` branch is finished,
+   and the red window is accepted, not engineered around.** Because
+   `test_create_cases_match_baselines` asserts equality in both
+   directions and `tools/ci/prepare-testdata.sh` clones testdata `main`
+   unpinned, there is no ordering that keeps `develop` green: baselines
+   first fails `missing_from_mirror`, mirror first fails
+   `missing_from_disk`. Phase 2's decision 5 already accepted this. So:
+   every testdata commit is made locally and left unpushed until the
+   `instar` pull request is written and verified against the local
+   testdata tree; then testdata is rebased and pushed, then the `instar`
+   PR's CI is run (it is green, because it carries the matching mirror)
+   and merged. `develop` is red for one queue cycle, about 76 minutes,
+   and only for other people's PRs. The rejected alternative was a
+   `PENDING_BASELINE_CASES` escape hatch in the instar test: it trades a
+   76-minute window for a permanent hole in the only guard that catches
+   mirror drift.
+
+4. **The validator asserts byte-identity between each version's source
+   buckets and the profile its `version-map.json` names.** One new
+   script, `instar-testdata/scripts/validate-profiles.py`, for every
+   output type: read `version-map.json`, and for each mapped version and
+   each file in each of that version's source bucket directories, assert
+   the profile directory holds a byte-identical file under the name
+   `detect-profiles.py` would have given it (bare, or bucket-qualified
+   where `output_type_needs_bucket_prefix` says the type qualifies).
+   Report, per output type, versions checked, files compared, mismatches,
+   files present in the profile with no source, and sources with no
+   profile file. Exit non-zero on any of the last three. The two
+   historical failures are each caught by one of those counts: the
+   `03c379a08a` dropped-output bug by "sources with no profile file", the
+   `ec01915058` stale-snapshot bug by "mismatches". It takes
+   `--output-type` and prints its totals, because the totals in a commit
+   body are the evidence the regeneration was sound. The deliberate
+   exception is the hand-maintained `luks-v1`/`luks-v2` goldens, which
+   have no `raw/` source by design -- the script knows them by that
+   property (no source file anywhere), not by name.
+
+5. **`preallocation=metadata` gets no create case; `falloc` and `full`
+   do.** The metadata refusal for vmdk, vpc and vhdx is already pinned
+   across all 80 builds by phase 1's `tests/golden/qemu-create-pins.json`,
+   and a baseline whose `create_return_code` is non-zero makes
+   `instar`'s matrix test skip, so the files would buy nothing. `falloc`
+   and `full` are added for all three formats, at 1M, matching the
+   qcow2 cases' size discipline -- their whole point is that qemu
+   accepts them and the resulting image is indistinguishable from the
+   default, which is a claim a cross-version baseline can hold and a pin
+   cannot.
+
+6. **Three fixed VHDX create cases, at the shapes phase 1 pinned.**
+   `16M-fixed` and `17M-fixed` (whole blocks, and a partial last block)
+   with `subformat=fixed`, and `16M-fixed-bsz-off` with
+   `subformat=fixed,block_state_zero=off`. Capped at 17M for the same
+   disk-economy reason the `vhd` fixed cases are capped at 16M: these are
+   dense files written 80 times. `block_state_zero=on` is not a separate
+   case -- it is the default, so `16M-fixed` already covers it.
+
+7. **No `KNOWN_WRITER_DIVERGENCES` entries are added up front.** Phase 7
+   landed `create -f vhdx -o subformat=fixed` tested against every fixed
+   pin case "with nothing masked", so instar is expected to match qemu
+   byte for byte on all three new vhdx cases. If a new case does
+   diverge, that is a finding to report to the management session before
+   it is tabled -- it means phase 7 left a gap -- not a line to add
+   quietly. The same applies to monolithicFlat, which phase 3 tested
+   against the host qemu-img.
+
+## Step plan
+
+Steps 10a to 10d work in the `instar-testdata` clone at
+`/srv/kasm_profiles/mikal/vscode/src/shakenfist/instar-testdata`, which
+takes direct commits to `main`; rebase before committing, because the
+fuzz automation moves `main` daily. **No step pushes.** Steps 10e and
+10f work in this worktree. 10b and 10d both run the generator and both
+touch `expected-outputs/`, so they cannot run concurrently; 10c only
+reads it. Each step is its own commit.
+
+| Step | Effort | Model | Isolation | Brief for sub-agent |
+|------|--------|-------|-----------|---------------------|
+| 10a | high | opus | none | In `instar-testdata`, make the generator aimable and fix two monolithicFlat hazards. **(1) `scripts/generate-baselines.py`:** add `--image ID` (repeatable, `action='append'`) and `--case NAME` (repeatable). `--image` filters the list `load_test_images` returns (`:1004-1016`) to exactly those `id` values; `--case` filters the per-target case lists the `create` branch of the main loop walks (and any other case-driven command that iterates a `(case_name, ...)` tuple list) to exactly those case names. Both match exactly -- no globbing, no prefix matching. If any supplied id or case name matches nothing, print what was asked for and what is available and `sys.exit(1)`: a filter that silently matches nothing produces a successful run that generated no files, which is the failure this filter exists to make impossible. Document both in the module docstring's Options and Examples blocks. **(2) same file, `generate_create_baseline` (`:~1600-1680`):** the `$FILENAME` substitution replaces only the literal `str(tmp_file)` (`:1636-1639`), so a monolithicFlat descriptor's `children[*].info.filename` -- which is the tmp stem plus `-flat.vmdk` -- survives into the baseline as a host path. Substitute the stem-derived flat extent name too (to `$FILENAME-flat` or similar; pick one and say so in a comment), and extend the cleanup at `:1676` to unlink any sibling file the create produced, so the extent does not leak into tmp on all 80 versions. Verify by creating a monolithicFlat image by hand with `qemu-img-binaries/x86_64/10.2.0/qemu-img` and checking what `info --output=json` prints for both filename fields. **(3) `Makefile`:** add `baselines-create` and `baselines-map` targets calling the generator with `--command create` / `--command map` and `--no-commit`, in the style of `baselines-resize` (`:198`) including its "deliberately not wired into the umbrella `baselines:` target" comment -- three other targets' comments already cite a `baselines-create` that does not exist (`:197`, `:209`, `:223`). Do not add them to the `baselines:` aggregate. Verification you must run and report: `python3 -I scripts/generate-baselines.py --command create --version 10.2.0 --case 1M-default --no-commit`, then `git status --porcelain expected-outputs | wc -l`, and show that the number of touched files is exactly the number of buckets holding a `1M-default` case (expect 5 buckets x 3 files = 15, minus any whose content is unchanged -- vmdk's will change because of the random cid). Then `git checkout -- expected-outputs`. Also run `--command info --version 10.2.0 --image vhdx-fixed-16M --no-commit` and show that exactly 3 files appear, under `expected-outputs/qemu-img-*/raw/10.2.0/`. Leave everything uncommitted; report both file counts, the flat-extent filename before and after substitution, and any place you found a case list the `--case` filter does not reach. ≤400 words. |
+| 10b | medium | sonnet | none | In `instar-testdata`, add this plan's create cases and generate only those baselines. Requires 10a. **(1) `scripts/generate-baselines.py`, `CREATE_CASES` (`:404`):** add to `vhdx` -- `('16M-fixed', '16M', ['subformat=fixed'])`, `('17M-fixed', '17M', ['subformat=fixed'])`, `('16M-fixed-bsz-off', '16M', ['subformat=fixed,block_state_zero=off'])`; add to `vmdk` -- `('1M-monolithic-flat', '1M', ['subformat=monolithicFlat'])`; add to each of `vmdk`, `vhd` and `vhdx` -- `('1M-prealloc-falloc', '1M', ['preallocation=falloc'])` and `('1M-prealloc-full', '1M', ['preallocation=full'])`. Ten new cases in total. Do **not** add a `preallocation=metadata` case (decision 5). Replace the stale `vhdx` comment "vhdx is dynamic-only in instar; qemu defaults match" with one that says fixed is supported since the fixed-subformat work and that these cases are capped at 17M because the files are dense. **(2)** Generate exactly those cases across all 80 builds: `python3 -I scripts/generate-baselines.py --command create --case 16M-fixed --case 17M-fixed --case 16M-fixed-bsz-off --case 1M-monolithic-flat --case 1M-prealloc-falloc --case 1M-prealloc-full --no-commit`. Note that the three prealloc case names are shared by vmdk, vhd and vhdx, so one `--case` covers all three targets. **(3)** Run `python3 -I scripts/detect-profiles.py --no-commit` and record the before/after profile count for `create-info-json` (expect 80 both times -- decision/finding: the random VMDK `cid` prevents dedup). **(4)** Check the new baselines before committing: for `16M-fixed`, confirm `git diff --stat` touched only the ten new cases' files plus profiles; confirm the `1M-monolithic-flat` baseline contains no host path (grep it for `/tmp` and for your username); confirm `meta.json`'s `create_return_code` is 0 for all ten on 10.2.0 and note any version where it is not, with the stderr. **(5)** `git add` and commit (do not push -- decision 3) with a message naming the ten cases, the profile counts, and the file count added. Report: the ten case names, added file count, any non-zero `create_return_code` by version, and the before/after `create-info-json` profile counts. ≤350 words. |
+| 10c | high | opus | none | In `instar-testdata`, write the derived-profile validator. Independent of 10b and 10d, but run it after both. New file `scripts/validate-profiles.py`, plus a `validate-profiles` Makefile target. Contract: for each output type under `expected-outputs/` (or just the one given by `--output-type`), read `version-map.json`, and for every version in `version_to_profile`, for every file in every source bucket directory for that version, assert the mapped profile directory holds a byte-identical file. Import the naming rules from `detect-profiles.py` rather than reimplementing them -- `output_type_needs_bucket_prefix` and whatever builds the destination name -- so the validator cannot drift from the generator; if that needs a small refactor in `detect-profiles.py` to expose them, do it, and keep `detect-profiles.py`'s behaviour identical. Report per output type: versions checked, files compared, byte mismatches, profile files with no source, and source files with no profile file. Exit non-zero if any of the last three is non-zero. The one legitimate exception is the hand-maintained `luks-v1`/`luks-v2` goldens, which exist only in `profiles/` by design: recognise them by having no source file in any bucket for any version, not by name, and count them in a separate "hand-maintained" line rather than as an error. Read the two commit messages that describe the failures this must catch before you start: `git log -1 ec01915058` (stale snapshot stamped into every profile; 41 of 44 images wrong while `raw/` was right) and `git log -1 03c379a08a` (bucket flattening dropped 11 of 36 files silently). Prove it catches both: temporarily corrupt one profile file's bytes and confirm a mismatch is reported; temporarily delete one and confirm "source files with no profile file" catches it; restore both and show `git status` clean afterwards. Note that `create-info-json` legitimately has 80 profiles for 80 versions (random VMDK `cid`) and `check-human` / `map-*` / `measure-*` legitimately have one -- neither is an error. `instar-testdata` has no CI and no pre-commit config, so this is a tool, not a gate; say so in the module docstring. Commit (do not push); report the full per-output-type table from a clean run, and the two deliberate-corruption results. ≤400 words. |
+| 10d | medium | sonnet | none | In `instar-testdata`, generate per-image cross-version baselines for phase 2's five fixtures, and only those. Requires 10a; run after 10b. The five image ids are `vhdx-fixed-16M`, `vhdx-fixed-16M-bsz-off-data`, `vhdx-fixed-17M`, `vhdx-fixed-17M-bsz-off-data`, `vhdx-dynamic-131041M-block-1M`. **(1)** Record the current profile list for every output type you are about to touch: `python3 -I scripts/detect-profiles.py --dry-run > /path/to/scratch/profiles-before.txt`. **(2)** For each of `info`, `check`, `map`, `measure` (decision 2), run the generator across all 80 builds with the five `--image` filters and `--no-commit`. **(3)** Re-run `detect-profiles.py --no-commit` and diff the profile list against `profiles-before.txt`. The expectation, measured during planning, is that no profile boundary moves: these fixtures' `qemu-img info` output changes only at the 8.0.0 `children` boundary, which already exists. **If any boundary does move, stop and report before committing** -- `instar`'s `tests/test_version_detection.py:268-276` hardcodes six expected info profile names and step 10e would have to change them. **(4)** Sanity-check the new baselines: confirm each of the five images now has files under the expected directories (`qemu-img-{human,json}/raw/<version>/`, `check-{human,json}/raw/<version>/`, `map-{human,json}/vhdx/<version>/`, `measure-{human,json}/vhdx/<version>/__<target>`), note for each image and command any version whose `meta.json` records a non-zero return code, and say plainly whether `qemu-img check` refuses the 17M fixtures on any version (instar #797 predicts it may -- that is a finding, not a failure). **(5)** Run `scripts/validate-profiles.py` from 10c over everything and paste its table. **(6)** Commit (do not push) with a message naming the five images, the four commands, the added file count, and the validator totals. Report: added file count per output type, the profile-list diff (or "no change"), the non-zero-return-code table, and the validator output. ≤400 words. |
+| 10e | high | opus | none | In the `instar` worktree, mirror the new create cases and consume the new fixture baselines. Requires 10b and 10d committed locally in the testdata clone; point the suite at it with `INSTAR_TESTDATA_PATH` (or whatever `tests/base.py` reads -- check) so this step's tests see the uncommitted-upstream baselines. **(1) `tests/test_create.py:2572`:** add the same ten entries 10b added to `CREATE_CASES`, in the same order, and update the stale `vhdx` comment to match. The mirror and the generator must be identical -- `test_create_cases_match_baselines` (`:2741`) asserts set equality in both directions. Add no `KNOWN_WRITER_DIVERGENCES` entries up front (decision 7): phase 7 and phase 3 tested these shapes against qemu with nothing masked, so if a generated baseline test fails, that is a gap in a landed phase and a finding to report to the management session -- do not mask it. **(2)** Run the whole `TestCreateBaselineMatrix` class and report every new test's result individually, including skips and why. **(3)** Confirm the five phase 2 fixtures now run rather than skip in `tests/test_info_safe.py`, `tests/test_map.py` and `tests/test_measure.py` -- phase 2's plan (`:212-217`) says they skip for want of baselines -- and report each module's before/after skip count for those five image ids. If any of the five now runs and *fails*, that is the most important thing in your report: say which image, which command, and paste both outputs. **(4)** If and only if 10d reported a moved profile boundary, update `TestProfileSelectionMatrix.MATRIX` (`tests/test_version_detection.py:268-276`) to the measured names and say which rows changed and why. **(5)** Run `pre-commit run --all-files` and the three affected test modules plus `test_create.py` and `test_version_detection.py` via `tests/.venv/bin/stestr` with `INSTAR_BINARY_PATH` set; replay any VHDX contention flake at `--concurrency 1` before reporting it. Leave uncommitted; report test names and counts, the skip-count deltas, and any failure in full. ≤400 words. |
+| 10f | medium | sonnet | none | In the `instar` worktree, document the procedure this phase automated. **(1) `docs/testing.md`:** document how to add a baseline for one image or one create case now that the generator takes `--image` and `--case`, and that the derived profiles must be validated with `instar-testdata`'s `scripts/validate-profiles.py` after any regeneration, with the reason (the two historical silent failures, described by their shape, not by commit hash). Keep it short and link rather than duplicate. **(2) `docs/testing.md` again:** note that the create-case list is mirrored in two repositories and that the two must land together, and what the symptom of drift is (`test_create_cases_match_baselines` failing in one direction or the other). **(3) `CHANGELOG.md`:** one entry for the new cross-version coverage -- fixed VHDX create cases, monolithicFlat, non-qcow2 preallocation, and the five VHDX fixtures' per-image baselines. **(4)** Do not touch `docs/format-coverage.md`, `docs/create.md` or `docs/format-internals.md`: phase 12 owns the cross-cutting pages. Do not add plan, phase or decision numbers or `PLAN-*.md` references to any code, comment or user-facing doc. Check whether `AGENTS.md` states a convention this changes -- "how to add a baseline" is a convention, so if it says anything about regenerating baselines, it needs one line and a link to `docs/testing.md`, not a copy. Run `pre-commit run --all-files`. Leave uncommitted; report every file changed and the exact `AGENTS.md` wording you added, if any. ≤300 words. |
+
+## Risks and mitigations
+
+* **The `--image` or `--case` filter silently matches nothing, and a
+  green run generates no baselines.** It would be invisible: the
+  generator prints per-version progress and exits 0 either way.
+  Mitigation:
+  decision 1 requires both filters to exit non-zero on a no-match, and
+  10a's verification is a file count, not a successful exit. The
+  management session re-runs one filtered invocation and checks
+  `git status --porcelain | wc -l` itself.
+* **A regeneration moves an info profile boundary and breaks the
+  hardcoded matrix.** `tests/test_version_detection.py:268-276` names
+  six profiles. Planning measured that phase 2's fixtures should not
+  move a boundary, but measured on one fixture. Mitigation: 10d captures
+  the profile list before and after and stops rather than committing if
+  it changed; 10e has an explicit conditional step to update the matrix
+  with measured names.
+* **The red `develop` window outlasts one queue cycle.** Decision 3
+  accepts about 76 minutes. If the `instar` PR needs a second round the
+  window doubles, and other people's PRs fail meanwhile for a reason
+  that is not theirs. Mitigation: nothing is pushed to testdata until
+  10e has run green locally against the local testdata tree; the push
+  and the PR are a single management-session action; and if the PR does
+  go red, reverting the testdata commit is one `git revert` and a push,
+  which is the documented fallback, not a judgement call.
+* **The validator passes because it checks nothing.** A validator that
+  resolves names wrongly reports "0 mismatches" over an empty
+  comparison, which looks exactly like success -- and this phase exists
+  because this family of bug has shipped twice. Mitigation: 10c must
+  report files-compared counts (an empty comparison is visible as a
+  zero), and must demonstrate a caught corruption and a caught deletion.
+  The management session repeats one of the two deliberate corruptions.
+* **A new create case diverges from qemu and gets masked.** The cheapest
+  way to make `TestCreateBaselineMatrix` green is a
+  `KNOWN_WRITER_DIVERGENCES` entry, which would silently retract part of
+  phase 7 or phase 3. Mitigation: decision 7 forbids adding entries in
+  this phase, and 10e's brief says a divergence is a finding to escalate.
+* **The monolithicFlat baseline embeds a host path and is unusable on
+  another machine.** Mitigation: 10a fixes the substitution and verifies
+  it by hand on one version; 10b greps the generated baseline for `/tmp`
+  and for the username before committing.
+
+## Definition of done
+
+Each item is a command and its expected result. Testdata commands run in
+the `instar-testdata` clone, instar commands in this worktree with
+`INSTAR_BINARY_PATH` set.
+
+* `python3 -I scripts/generate-baselines.py --command info --version
+  10.2.0 --image no-such-image --no-commit` exits non-zero and names the
+  unmatched id. The same with `--case no-such-case` does likewise.
+* `python3 -I scripts/generate-baselines.py --command create --version
+  10.2.0 --case 16M-fixed --no-commit` touches files only under
+  `expected-outputs/create-info-json/vhdx/10.2.0/`, and exactly three of
+  them.
+* `make validate-profiles` exits 0, and its output shows a non-zero
+  files-compared count for every output type, zero mismatches, zero
+  profile files with no source, and zero source files with no profile
+  file (the hand-maintained luks goldens are counted on their own line).
+* Deliberately corrupting one byte of one profile `stdout.txt` makes
+  `make validate-profiles` exit non-zero and name that file; deleting one
+  makes it exit non-zero and name that file. `git status --short` is
+  clean after restoring both.
+* Each of the ten new create cases has 80 versions x 3 files under
+  `expected-outputs/create-info-json/<target>/<version>/`, and
+  `grep -rl "$(whoami)\|/tmp/" expected-outputs/create-info-json` matches
+  nothing.
+* Each of the five phase 2 fixtures has baselines for `info`, `check`,
+  `map` and `measure` at all 80 versions, and
+  `python3 -I scripts/detect-profiles.py --dry-run` reports the same
+  profile list as before this phase, for every output type -- or, if it
+  does not, `tests/test_version_detection.py`'s `MATRIX` names the new
+  profiles and that test passes.
+* `stestr run test_create.TestCreateBaselineMatrix` passes with no new
+  `KNOWN_WRITER_DIVERGENCES` entry, and
+  `test_create_cases_match_baselines` passes rather than skips.
+* `tests/test_info_safe.py`, `tests/test_map.py` and
+  `tests/test_measure.py` each run, rather than skip, every scenario for
+  the five fixture image ids, and pass.
+* `tests/test_version_detection.py` passes.
+* `make instar`, `make lint`, `pre-commit run --all-files` and the full
+  integration suite pass with 0 failures. (The suite is zero-fail on
+  healthy testdata; any failure is this phase's until bisected against
+  testdata `main`.)
+* `docs/testing.md` states how to generate a baseline for one image and
+  one case, and that profiles are validated after regeneration; no
+  plan-file reference, phase number or decision number appears in any
+  code, comment or user-facing document.
+
+## Back brief
+
+Before executing any step, back brief the operator on this understanding
+of the plan. The gates that need an answer:
+
+1. **Decision 1, the generator filters** -- the one most likely to be
+   argued, because it is new tooling in a phase the master plan scoped as
+   "only tests". Confirm adding `--image` and `--case`, or say to
+   mass-regenerate and absorb issue #845's fallout into this phase.
+2. **Decision 3, the accepted red window on `develop`.** Confirm the
+   testdata-push-then-instar-PR ordering and the ~76-minute window, or
+   ask for the `PENDING_BASELINE_CASES` escape hatch instead.
+3. **Decision 2, four commands for the fixture baselines.** Confirm
+   `info`, `check`, `map`, `measure`, or name others.
+4. **Nothing outstanding on the phase 9 convert bug.** It is filed as
+   #879 and recorded in the master plan's Future work. It is not this
+   phase's to fix; confirm it stays out of scope.
+
+## Out of scope
+
+* **Generating baselines for the ~86 safe manifest images that have
+  none.** `check-human` baselines 38 of 124 safe images; `qemu-img-json`
+  baselines 71. That is issue #845's territory and a phase of its own:
+  it un-skips tests across the whole suite, each of which may have a real
+  failure behind it, and that review has nothing to do with fixed VHDX.
+  Decision 1's filters are what keep this phase out of it. Recorded in
+  the master plan's Future work.
+* **The `create-info-json` 80-profile redundancy.** Caused by qemu-img's
+  random VMDK `cid`; harmless because every consumer strips `cid`.
+  Normalising it (or excluding the field from the profile hash) would
+  change 80 profiles' contents for a disk-space win. Recorded in Future
+  work.
+* **The phase 9 `convert -O vhdx --subformat fixed` partial-last-block
+  bug (#879).** Recorded in the master plan's Future work by phase 9;
+  it needs a fix of its own. This phase does not add a create or
+  convert case at that geometry, because the case would fail for a known
+  reason.
+* **Fuzzing (phase 11) and the cross-cutting documentation pages (phase
+  12).** 10f touches only `docs/testing.md`, `CHANGELOG.md` and, if a
+  convention changed, one line of `AGENTS.md`.
+* **`detect-profiles.py`'s stale module docstring**, which documents only
+  the flat `raw/<version>/` layout and not the bucketed one. 10c may fix
+  it in passing if it refactors that file; it is not a required outcome.
