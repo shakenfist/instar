@@ -16,6 +16,7 @@ forms with a readable diff on failure.
 
 import copy
 import json
+from pathlib import PurePath
 
 
 # Fields whose values are filesystem-dependent or absolute-path-
@@ -78,17 +79,50 @@ def _strip_keys(obj, keys):
             _strip_keys(item, keys)
 
 
+def _placeholder_for(filename, tmp_path):
+    """Return the placeholder for one `filename` value, or None.
+
+    `tmp_path` itself becomes FILENAME_PLACEHOLDER. A file qemu-img
+    wrote beside it becomes the placeholder plus whatever its stem adds:
+    vmdk's monolithicFlat subformat writes a flat extent named after the
+    descriptor's stem with `-flat` appended, and `qemu-img info` reports
+    that extent's absolute path in `children[*].info.filename` and in
+    `format-specific.data.extents[*].filename`. So a flat extent reads
+    `$FILENAME-flat`, which is the same on every host and in every
+    temporary directory.
+
+    This is the same rule instar-testdata's baseline generator applies
+    when it records the baseline, so the two sides meet. Any other
+    filename is left alone (None).
+    """
+    if filename == tmp_path:
+        return FILENAME_PLACEHOLDER
+
+    primary = PurePath(tmp_path)
+    sibling = PurePath(filename)
+    if (sibling.parent == primary.parent and
+            sibling.suffix == primary.suffix and
+            sibling.stem.startswith(primary.stem)):
+        return FILENAME_PLACEHOLDER + sibling.stem[len(primary.stem):]
+
+    return None
+
+
 def _substitute_path(obj, tmp_path):
-    """Recursively replace `filename` fields equalling `tmp_path` with
-    the FILENAME_PLACEHOLDER sentinel.
+    """Recursively replace `filename` fields derived from `tmp_path`
+    with the FILENAME_PLACEHOLDER sentinel.
 
     Matches the convention instar-testdata's baseline generator uses
-    when it records info JSON baselines.
+    when it records info JSON baselines, including the sibling files
+    some create subformats write (see `_placeholder_for`).
     """
     if isinstance(obj, dict):
         for k, v in obj.items():
-            if k == 'filename' and isinstance(v, str) and v == tmp_path:
-                obj[k] = FILENAME_PLACEHOLDER
+            placeholder = None
+            if k == 'filename' and isinstance(v, str):
+                placeholder = _placeholder_for(v, tmp_path)
+            if placeholder is not None:
+                obj[k] = placeholder
             else:
                 _substitute_path(v, tmp_path)
     elif isinstance(obj, list):
@@ -99,6 +133,9 @@ def _substitute_path(obj, tmp_path):
 def normalise_info_json(obj, target, tmp_path=None):
     """Return a deep-copied dict with divergence fields stripped and
     `tmp_path` substituted to `$FILENAME` in any `filename` field.
+
+    Files written beside `tmp_path` are substituted too, keeping
+    whatever their name adds to its stem (`$FILENAME-flat`).
 
     Args:
         obj: parsed JSON dict.

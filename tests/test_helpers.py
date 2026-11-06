@@ -135,6 +135,50 @@ class TestNormaliseInfoJsonStripsDivergence(unittest.TestCase):
         self.assertEqual(norm['children'][0]['info']['filename'],
                          FILENAME_PLACEHOLDER)
 
+    def test_flat_extent_sibling_substitution(self):
+        """A file written beside tmp_path keeps what its stem adds."""
+        obj = {
+            'format': 'vmdk',
+            'filename': '/tmp/abc/image.vmdk',
+            'children': [
+                {'name': 'extents.0',
+                 'info': {'filename': '/tmp/abc/image-flat.vmdk'}},
+                {'name': 'file', 'info': {'filename': '/tmp/abc/image.vmdk'}},
+            ],
+            'format-specific': {
+                'type': 'vmdk',
+                'data': {
+                    'create-type': 'monolithicFlat',
+                    'extents': [{'filename': '/tmp/abc/image-flat.vmdk'}],
+                },
+            },
+        }
+        norm = normalise_info_json(obj, 'vmdk', tmp_path='/tmp/abc/image.vmdk')
+        self.assertEqual(norm['filename'], FILENAME_PLACEHOLDER)
+        self.assertEqual(norm['children'][0]['info']['filename'],
+                         FILENAME_PLACEHOLDER + '-flat')
+        self.assertEqual(norm['children'][1]['info']['filename'],
+                         FILENAME_PLACEHOLDER)
+        self.assertEqual(
+            norm['format-specific']['data']['extents'][0]['filename'],
+            FILENAME_PLACEHOLDER + '-flat')
+
+    def test_unrelated_sibling_not_substituted(self):
+        """A neighbour whose name does not extend the stem is left alone."""
+        obj = {
+            'format': 'qcow2',
+            'filename': '/tmp/abc/overlay.qcow2',
+            'backing-filename': '/tmp/abc/base.qcow2',
+            'children': [
+                {'name': 'file', 'info': {'filename': '/tmp/abc/base.qcow2'}},
+            ],
+        }
+        norm = normalise_info_json(obj, 'qcow2',
+                                   tmp_path='/tmp/abc/overlay.qcow2')
+        self.assertEqual(norm['filename'], FILENAME_PLACEHOLDER)
+        self.assertEqual(norm['children'][0]['info']['filename'],
+                         '/tmp/abc/base.qcow2')
+
     def test_input_unchanged(self):
         """normalise_info_json must not mutate its input."""
         obj = {'format': 'qcow2', 'actual-size': 1234}
