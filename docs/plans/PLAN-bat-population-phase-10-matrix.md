@@ -344,9 +344,15 @@ the `instar-testdata` clone, instar commands in this worktree with
   10.2.0 --image no-such-image --no-commit` exits non-zero and names the
   unmatched id. The same with `--case no-such-case` does likewise.
 * `python3 -I scripts/generate-baselines.py --command create --version
-  10.2.0 --case 16M-fixed --no-commit` touches files only under
-  `expected-outputs/create-info-json/vhdx/10.2.0/`, and exactly three of
-  them.
+  10.2.0 --case 16M-fixed --no-commit` touches two files and no others:
+  `create-info-json/vhdx/10.2.0/16M-fixed.meta.json` and
+  `create-info-json/vhd/10.2.0/16M-fixed.meta.json`. Both targets have a
+  case of that name -- `--case` filters by name across targets -- and
+  only each `meta.json` changes, because the re-measured `stdout.txt` and
+  `stderr.txt` come out byte-identical. (This criterion originally read
+  "only under `.../vhdx/10.2.0/`, and exactly three of them", which was
+  wrong on both counts; it was written before the survey's twin-name
+  finding was understood.)
 * `make validate-profiles` exits 0, and its output shows a non-zero
   files-compared count for every output type, zero mismatches, zero
   profile files with no source, and zero source files with no profile
@@ -468,6 +474,108 @@ the `instar-testdata` clone, instar commands in this worktree with
   written. 10b now proves the twins' `stdout` and `stderr` are
   byte-identical and restores them, so the commit holds only the new
   cases.
+* **10b.** As planned. Ten cases, 4882 files. The management session
+  re-verified the substance rather than the plumbing: the `16M-fixed`
+  baseline is byte-identical to an independent `qemu-img create` run,
+  and that run's file length is 25,165,824 -- the committed fixture's
+  length exactly. The preallocation no-op phase 3 landed against one
+  host qemu now holds byte-for-byte on all 80 builds: 320 vhd and vhdx
+  `1M-default` versus `1M-prealloc-*` pairs compared, 0 differ. Two
+  judgement calls kept: the agent reverted timestamp-only churn
+  `detect-profiles.py` wrote into other output types, and restored the
+  three re-measured twins after proving their `stdout`/`stderr`
+  unchanged, keeping 240 timestamp-only files out of the diff.
+* **10c.** As planned, plus the finding that became 10g. The validator
+  imports `detect-profiles.py`'s naming rules rather than restating
+  them, which needed one behaviour-neutral extract
+  (`profile_filename()`); the management session confirmed the extract
+  is faithful (`f.parent.parent.name` resolves to the same bucket the
+  old `bucket_dir.parent.name` did) and reproduced the clean run
+  (163,932 files compared, 0 problems), the corruption proof and the
+  deletion proof. Five output types report "not a profiled output
+  type"; they have no `profiles/` directory at all, so that is accurate
+  and not a gap.
+* **10d.** As planned, and the headline result is stronger than the
+  step was asked to prove: not merely the version grouping but the
+  version-to-profile *names* are identical for all 12 output types to
+  what they were before the fixtures landed, checked against git. So
+  `MATRIX` needed no change. `map-human` exits 1 for all five fixtures
+  at every version ("File contains external, encrypted or compressed
+  clusters"); that is qemu's behaviour for VHDX in human map mode --
+  the two pre-existing VHDX images already do it and a live run
+  reproduces it while `map --output=json` succeeds -- so the baseline
+  records it and the human scenarios skip on it. `qemu-img check` does
+  **not** refuse the 17M fixtures at any version, which open issue #797
+  had left as a possibility.
+* **10e.** Two rounds. The first reported three divergences as new
+  instar defects; all three had instar and qemu transposed, and the
+  management session measured each before accepting any of it. In the
+  measured direction they are the VHDX source-scanner divergence
+  already registered for `qemu-vhdx`, whose existing wording predicts
+  exactly what was measured: with `block_state_zero=on` every payload
+  BAT entry is a zero state, so instar counts none and qemu counts all
+  (instar `required` 327,680 against qemu's 17,104,896 on a 16 MiB
+  fixed image), and instar reports the extent as zero and not data
+  where qemu reports data. The cause of the inversion is worth knowing
+  and is now documented: `test_map` and `test_measure` pass instar's
+  output as `assertEqual`'s first argument, so testtools labels it
+  "reference". Taken at face value the phase would have filed two bugs
+  against correct behaviour and left the real divergences untabled.
+  Second round tabled them in the measured direction, plus the vhd
+  preallocation cases under the pre-existing CHS-rounding divergence,
+  and one genuine new defect as a known check failure. One change
+  beyond the brief kept: `tests/helpers/info_json.py` mirrors 10a's
+  sibling rule, without which the monolithicFlat baseline compares a
+  placeholder against a host path; committed separately, with tests.
+* **10e: a real defect found, not fixed here.** `instar check` refuses
+  a monolithicFlat VMDK that instar itself created ("This image format
+  (vmdk) does not support checks"), while checking every other vmdk
+  subformat and while `qemu-img check` passes the same file. Confirmed
+  by the management session on both an instar-written and a
+  qemu-written flat image. Phase 3 added flat create without a check
+  path. Recorded in the master plan's Future work; `gh issue create`
+  was denied in this session, so it has no issue number.
+* **10f.** As planned. The documentation example commands were not run
+  by the agent, so the management session ran both: each exits 0 and
+  touches only timestamp metadata. `AGENTS.md` gained nothing, on the
+  grounds that it says nothing about baselines today and the procedure
+  belongs in `docs/testing.md`.
+* **10g.** As planned, and verified from both sides on scratch copies:
+  with the pre-fix script a perturbed raw baseline never reaches the
+  profile and the validator fails; with the fix it propagates and the
+  validator is clean. The agent found a second defect of the same
+  family and reported it rather than extending its own fix, which is
+  what let the scope question reach Michael; that became 10h.
+* **10h.** As planned. The boundary-move experiment reproduced from
+  both sides (28 goldens kept where the old code left 24), and the
+  restored content is the correct per-version variant -- the renamed
+  `profile-6-0-1` received the early-version golden, not the 8.0.0 one
+  -- which is the substantive gain of keying by version. The
+  hand-maintained invariant was measured rather than assumed: all
+  seven profiles of both affected types hold all four golden files, and
+  the "applies only from version N onward" worry cannot arise, because
+  an id with a generated source for even one version is never
+  classified hand-authored. The strong invariant was encoded, per
+  filename rather than per id.
+* **A management-session error, corrected.** The step 10h plan commit
+  was made with `git add -A` while step 10e was working in the same
+  worktree, so it swallowed 10e's ten-line mirror hunk. The commit was
+  unpushed and on top, so it was split: the plan commit holds only the
+  plan file and the mirror change went back to the working tree for
+  10e's own commit. Staging in that worktree was by explicit path
+  thereafter.
+* **Definition of done, one criterion corrected at source.** The
+  `--case 16M-fixed` file-count criterion was wrong as written: it
+  named only the vhdx bucket and expected three files. `--case`
+  filters by name across targets and vhd has a case of that name too,
+  and only the two `meta.json` files change because the re-measured
+  outputs are byte-identical. Corrected above; the intent -- that the
+  filter is surgical -- holds.
+* **A pre-existing breach noted, not touched.** Landed code and docs
+  cite `PLAN-*.md` files in 95 places across 34 files outside
+  `docs/plans/`, against the repository's own rule: `docs/quirks.md`
+  (25), `src/crates` (11) and `scripts/differential-fuzz.py` (11) lead.
+  This phase added none and cleaned up none.
 
 ## Back brief
 
