@@ -28,7 +28,7 @@ from pathlib import Path
 from base import QEMU_TOOL_TIMEOUT, InstarTestBase
 from helpers import qemu_pins
 from helpers import vhdx_structure
-from helpers.info_json import assert_info_equivalent
+from helpers.info_json import FLAT_EXTENT_NAMES, assert_info_equivalent
 from test_vhdx_fixed_fixtures import PARTIAL_PAST_FIRST_CHUNK, RUNTIME_CREATE_IMAGES
 
 # ----------------------------------------------------------------------
@@ -2294,14 +2294,10 @@ class TestCreateVhdxSizeLimits(InstarTestBase):
             self.assertEqual(json.loads(r.stdout)['virtual-size'], self.ROUNDED_SIZE)
 
 
-# Output name -> the extent qemu-img writes beside it (block/vmdk.c
-# filename_decompose and the "%s-flat%s" format).
-FLAT_CREATE_EXTENT_NAMES = (
-    ('out.vmdk', 'out-flat.vmdk'),
-    ('out.img', 'out-flat.img'),
-    ('out', 'out-flat'),
-    ('.hid', '-flat.hid'),
-)
+# Output name -> the extent qemu-img writes beside it. Defined in
+# helpers/info_json.py, beside the baseline-normalisation rule that has
+# to recognise every name in it.
+FLAT_CREATE_EXTENT_NAMES = FLAT_EXTENT_NAMES
 
 FLAT = ('-f', 'vmdk', '-o', 'subformat=monolithicFlat')
 
@@ -2597,6 +2593,9 @@ CREATE_CASES = {
         ('1G-default',              '1G',  []),
         ('1G-stream-optimized',     '1G',  ['subformat=streamOptimized']),
         ('1G-monolithic-sparse',    '1G',  ['subformat=monolithicSparse']),
+        ('1M-monolithic-flat',      '1M',  ['subformat=monolithicFlat']),
+        ('1M-prealloc-falloc',      '1M',  ['preallocation=falloc']),
+        ('1M-prealloc-full',        '1M',  ['preallocation=full']),
     ],
     'vhd': [
         ('1M-default',              '1M',  []),
@@ -2604,6 +2603,8 @@ CREATE_CASES = {
         ('1G-default',              '1G',  []),
         ('1M-fixed',                '1M',  ['subformat=fixed']),
         ('16M-fixed',               '16M', ['subformat=fixed']),
+        ('1M-prealloc-falloc',      '1M',  ['preallocation=falloc']),
+        ('1M-prealloc-full',        '1M',  ['preallocation=full']),
     ],
     'vhdx': [
         ('1M-default',              '1M',  []),
@@ -2611,6 +2612,11 @@ CREATE_CASES = {
         ('1G-default',              '1G',  []),
         ('1G-block-16M',            '1G',  ['block_size=16M']),
         ('1G-block-32M',            '1G',  ['block_size=32M']),
+        ('16M-fixed',               '16M', ['subformat=fixed']),
+        ('17M-fixed',               '17M', ['subformat=fixed']),
+        ('16M-fixed-bsz-off',       '16M', ['subformat=fixed,block_state_zero=off']),
+        ('1M-prealloc-falloc',      '1M',  ['preallocation=falloc']),
+        ('1M-prealloc-full',        '1M',  ['preallocation=full']),
     ],
     'raw': [
         ('1M-default',              '1M',  []),
@@ -2658,6 +2664,17 @@ KNOWN_WRITER_DIVERGENCES = {
     ('vhd', '1G-default'):  'qemu rounds VHD virtual_size to CHS geometry',
     ('vhd', '1M-fixed'):    'qemu rounds VHD virtual_size to CHS geometry',
     ('vhd', '16M-fixed'):   'qemu rounds VHD virtual_size to CHS geometry',
+    # The preallocation modes change only how much of the file is written, so
+    # they inherit the same geometry divergence as the cases above: qemu-img
+    # reports virtual-size 1079296 for a 1M VHD where instar reports 1048576,
+    # exactly as it does for '1M-default'. Skipping here does not leave the
+    # vhd preallocation no-op unasserted: test_vpc_noop_preallocation and
+    # test_vpc_fixed_noop_preallocation prove it directly against the pinned
+    # qemu-img behaviour, where no virtual-size comparison is involved.
+    ('vhd', '1M-prealloc-falloc'):
+        'qemu rounds VHD virtual_size to CHS geometry',
+    ('vhd', '1M-prealloc-full'):
+        'qemu rounds VHD virtual_size to CHS geometry',
 }
 
 
@@ -3017,6 +3034,18 @@ KNOWN_CHECK_FAILURES = {
     # refcount_order=4 header over differently-packed on-disk entries and
     # instar check rejected it. Fixed by deriving refcount_order from
     # refcount_bits and packing sub-byte widths LSB-first — instar #365.)
+    #
+    # instar check exits 63 with 'This image format (vmdk) does not support
+    # checks' on a monolithicFlat VMDK — whether instar or qemu-img wrote it —
+    # while it checks the monolithicSparse, streamOptimized and preallocated
+    # VMDKs in this same matrix cleanly, and qemu-img check reports the flat
+    # image free of errors. The writer is fine (the create baseline matches);
+    # it is the reader that has no check path for a flat extent. Tracked as
+    # instar #822, which also covers the docs/check.md claim that check
+    # validates these images; TestCreateVmdkFlat accepts exit 0 or
+    # 63 for the same reason and tightens to 0 when #822 is fixed.
+    ('vmdk', '1M-monolithic-flat'):
+        'instar check has no path for a monolithicFlat extent (#822)',
 }
 
 

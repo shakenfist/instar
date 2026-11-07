@@ -16,6 +16,7 @@ from pathlib import Path
 from helpers import qemu_pins
 from helpers.info_json import (
     FILENAME_PLACEHOLDER,
+    FLAT_EXTENT_NAMES,
     assert_info_equivalent,
     normalise_info_json,
 )
@@ -134,6 +135,106 @@ class TestNormaliseInfoJsonStripsDivergence(unittest.TestCase):
         self.assertEqual(norm['filename'], FILENAME_PLACEHOLDER)
         self.assertEqual(norm['children'][0]['info']['filename'],
                          FILENAME_PLACEHOLDER)
+
+    def test_flat_extent_sibling_substitution(self):
+        """A file written beside tmp_path keeps what its stem adds."""
+        obj = {
+            'format': 'vmdk',
+            'filename': '/tmp/abc/image.vmdk',
+            'children': [
+                {'name': 'extents.0',
+                 'info': {'filename': '/tmp/abc/image-flat.vmdk'}},
+                {'name': 'file', 'info': {'filename': '/tmp/abc/image.vmdk'}},
+            ],
+            'format-specific': {
+                'type': 'vmdk',
+                'data': {
+                    'create-type': 'monolithicFlat',
+                    'extents': [{'filename': '/tmp/abc/image-flat.vmdk'}],
+                },
+            },
+        }
+        norm = normalise_info_json(obj, 'vmdk', tmp_path='/tmp/abc/image.vmdk')
+        self.assertEqual(norm['filename'], FILENAME_PLACEHOLDER)
+        self.assertEqual(norm['children'][0]['info']['filename'],
+                         FILENAME_PLACEHOLDER + '-flat')
+        self.assertEqual(norm['children'][1]['info']['filename'],
+                         FILENAME_PLACEHOLDER)
+        self.assertEqual(
+            norm['format-specific']['data']['extents'][0]['filename'],
+            FILENAME_PLACEHOLDER + '-flat')
+
+    def test_unrelated_sibling_not_substituted(self):
+        """A neighbour whose name does not extend the stem is left alone."""
+        obj = {
+            'format': 'qcow2',
+            'filename': '/tmp/abc/overlay.qcow2',
+            'backing-filename': '/tmp/abc/base.qcow2',
+            'children': [
+                {'name': 'file', 'info': {'filename': '/tmp/abc/base.qcow2'}},
+            ],
+        }
+        norm = normalise_info_json(obj, 'qcow2',
+                                   tmp_path='/tmp/abc/overlay.qcow2')
+        self.assertEqual(norm['filename'], FILENAME_PLACEHOLDER)
+        self.assertEqual(norm['children'][0]['info']['filename'],
+                         '/tmp/abc/base.qcow2')
+
+    def test_every_flat_extent_name_is_recognised(self):
+        """Each shape in the writer's extent-naming table normalises.
+
+        FLAT_EXTENT_NAMES is what qemu-img and instar name the extent
+        for a given output name, including the suffixless and dotfile
+        shapes where `PurePath.stem` and `.suffix` do not describe the
+        split qemu-img made. A name missing here would leave an
+        absolute path in the comparison.
+        """
+        for primary, extent in FLAT_EXTENT_NAMES:
+            obj = {
+                'format': 'vmdk',
+                'filename': f'/tmp/abc/{primary}',
+                'children': [{'name': 'extents.0',
+                              'info': {'filename': f'/tmp/abc/{extent}'}}],
+            }
+            norm = normalise_info_json(obj, 'vmdk',
+                                       tmp_path=f'/tmp/abc/{primary}')
+            self.assertEqual(norm['filename'], FILENAME_PLACEHOLDER)
+            self.assertEqual(
+                norm['children'][0]['info']['filename'],
+                FILENAME_PLACEHOLDER + '-flat',
+                f'extent {extent} of {primary} was not recognised')
+
+    def test_sibling_substitution_boundaries(self):
+        """Only a known writer-added suffix in the same directory matches.
+
+        These are the three conditions the sibling rule is made of, each
+        broken in turn. Normalising any of them would hide a real path
+        difference instead of comparing it; leaving the absolute path in
+        makes the comparison fail visibly.
+        """
+        tmp_path = '/tmp/abc/image.vmdk'
+        neighbours = (
+            # Stem merely starts with the primary's: not a writer suffix.
+            '/tmp/abc/image2.vmdk',
+            # Dash-prefixed, but not a suffix either repository knows.
+            '/tmp/abc/image-backing.vmdk',
+            # Same stem, different suffix: a different image entirely.
+            '/tmp/abc/image.qcow2',
+            # Known suffix, but in another directory.
+            '/tmp/other/image-flat.vmdk',
+        )
+        for neighbour in neighbours:
+            obj = {
+                'format': 'vmdk',
+                'filename': tmp_path,
+                'children': [{'name': 'file',
+                              'info': {'filename': neighbour}}],
+            }
+            norm = normalise_info_json(obj, 'vmdk', tmp_path=tmp_path)
+            self.assertEqual(norm['filename'], FILENAME_PLACEHOLDER)
+            self.assertEqual(
+                norm['children'][0]['info']['filename'], neighbour,
+                f'{neighbour} should not have been substituted')
 
     def test_input_unchanged(self):
         """normalise_info_json must not mutate its input."""

@@ -16,6 +16,7 @@ forms with a readable diff on failure.
 
 import copy
 import json
+from pathlib import PurePath
 
 
 # Fields whose values are filesystem-dependent or absolute-path-
@@ -64,6 +65,24 @@ SNAPSHOT_DIVERGENCE = {
 
 FILENAME_PLACEHOLDER = '$FILENAME'
 
+# Suffixes a create subformat inserts before the extension when it writes
+# a second file beside the one it was asked for. Only these become
+# `$FILENAME<suffix>`; every other neighbouring file keeps its real path
+# (see `_placeholder_for`).
+SIBLING_NAME_SUFFIXES = ('-flat',)
+
+# Output name -> the extent qemu-img writes beside it, which instar's
+# writer matches (`block/vmdk.c`'s `filename_decompose` and its
+# "%s-flat%s" format). Lives here because it is the table the rule in
+# `_placeholder_for` has to satisfy; `tests/test_create.py` imports it
+# for the writer's own assertions, so the two cannot drift apart.
+FLAT_EXTENT_NAMES = (
+    ('out.vmdk', 'out-flat.vmdk'),
+    ('out.img', 'out-flat.img'),
+    ('out', 'out-flat'),
+    ('.hid', '-flat.hid'),
+)
+
 
 def _strip_keys(obj, keys):
     """Recursively delete `keys` wherever they appear as dict keys."""
@@ -78,17 +97,86 @@ def _strip_keys(obj, keys):
             _strip_keys(item, keys)
 
 
+def _decompose_name(name):
+    """Split a file name into base and extension as qemu-img does.
+
+    `filename_decompose` splits at the last `.`, so a dotfile output
+    such as `.hid` has an empty base and `.hid` as its extension, and
+    its flat extent is `-flat.hid`. `PurePath.stem`/`.suffix` read the
+    same name as stem `.hid` with no suffix, which would make the
+    extent unrecognisable -- hence this rather than the Path properties.
+    A name with no `.` at all is all base, so `out` gives `out-flat`.
+    FLAT_EXTENT_NAMES is the table of shapes this has to reproduce.
+    """
+    base, dot, extension = name.rpartition('.')
+    if not dot:
+        return name, ''
+    return base, dot + extension
+
+
+def _placeholder_for(filename, tmp_path):
+    """Return the placeholder for one `filename` value, or None.
+
+    `tmp_path` itself becomes FILENAME_PLACEHOLDER. A file a create
+    subformat wrote beside it becomes the placeholder plus the suffix
+    its stem adds: vmdk's monolithicFlat subformat writes a flat extent
+    named after the descriptor's stem with `-flat` appended, and
+    `qemu-img info` reports that extent's absolute path in
+    `children[*].info.filename` and in
+    `format-specific.data.extents[*].filename`. So a flat extent reads
+    `$FILENAME-flat`, which is the same on every host and in every
+    temporary directory.
+
+    instar-testdata's baseline generator produces the same token, from
+    `sibling_placeholder()` in `scripts/generate-baselines.py`, so the
+    two sides meet on `$FILENAME-flat`. The two rules are deliberately
+    not identical, and both differences matter:
+
+    * The generator replaces the sibling's literal path string anywhere
+      in the stdout and stderr it records. This rewrites only values
+      under a `filename` key, because a field holding an unresolved
+      reference -- `backing-filename` -- must still compare as written.
+    * The generator accepts any sibling whose stem extends the
+      primary's, falling back to `$FILENAME(<name>)`. This accepts only
+      the names SIBLING_NAME_SUFFIXES can build, which is deliberately
+      the stricter side: an unrecognised neighbour keeps its absolute
+      path, so the comparison fails showing a path difference rather
+      than normalising a real difference away. A new multi-file
+      subformat therefore has to be taught to both repositories.
+
+    Any other filename is left alone (None).
+    """
+    if filename == tmp_path:
+        return FILENAME_PLACEHOLDER
+
+    primary = PurePath(tmp_path)
+    sibling = PurePath(filename)
+    if sibling.parent != primary.parent:
+        return None
+
+    base, extension = _decompose_name(primary.name)
+    for suffix in SIBLING_NAME_SUFFIXES:
+        if sibling.name == base + suffix + extension:
+            return FILENAME_PLACEHOLDER + suffix
+
+    return None
+
+
 def _substitute_path(obj, tmp_path):
-    """Recursively replace `filename` fields equalling `tmp_path` with
-    the FILENAME_PLACEHOLDER sentinel.
+    """Recursively replace `filename` fields derived from `tmp_path`
+    with the FILENAME_PLACEHOLDER sentinel.
 
     Matches the convention instar-testdata's baseline generator uses
-    when it records info JSON baselines.
+    when it records info JSON baselines, including the sibling files
+    some create subformats write (see `_placeholder_for`).
     """
     if isinstance(obj, dict):
         for k, v in obj.items():
-            if k == 'filename' and isinstance(v, str) and v == tmp_path:
-                obj[k] = FILENAME_PLACEHOLDER
+            placeholder = None
+            if k == 'filename' and isinstance(v, str):
+                placeholder = _placeholder_for(v, tmp_path)
+            if placeholder is not None:
+                obj[k] = placeholder
             else:
                 _substitute_path(v, tmp_path)
     elif isinstance(obj, list):
@@ -99,6 +187,10 @@ def _substitute_path(obj, tmp_path):
 def normalise_info_json(obj, target, tmp_path=None):
     """Return a deep-copied dict with divergence fields stripped and
     `tmp_path` substituted to `$FILENAME` in any `filename` field.
+
+    A file a create subformat wrote beside `tmp_path` is substituted
+    too, keeping the suffix its name adds to the stem
+    (`$FILENAME-flat`).
 
     Args:
         obj: parsed JSON dict.
