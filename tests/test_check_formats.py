@@ -1207,76 +1207,146 @@ class TestZstdBackingChain(InstarTestBase):
     image is part of a backing chain that needs to be flattened.
     """
 
-    def _zstd_supported(self):
-        """Check if qemu-img supports ZSTD compression."""
-        result = subprocess.run(
+    def _require_zstd(self, td):
+        """Skip unless the installed qemu-img really produces ZSTD.
+
+        Probed by creating an image in *td*: asking qemu-img to format
+        /dev/null fails on every build, whatever it supports, because
+        the result cannot then be read back as qcow2 -- which is how
+        this class never ran at all until #813.
+
+        The recorded compression type is checked as well as the exit
+        code. A build that accepted the option and wrote a zlib image
+        would otherwise look supported here, and the comparison that
+        follows would prove nothing about ZSTD.
+        """
+        probe = Path(td) / 'zstd-probe.qcow2'
+        r = subprocess.run(
             ['qemu-img', 'create', '-f', 'qcow2',
-             '-o', 'compression_type=zstd',
-             '/dev/null', '1M'],
-            capture_output=True
+             '-o', 'compression_type=zstd', str(probe), '1M'],
+            capture_output=True, text=True
         )
-        return result.returncode == 0
+        if r.returncode != 0:
+            self.skipTest(
+                f'qemu-img cannot create a ZSTD image: {r.stderr.strip()!r}'
+            )
+        info = subprocess.run(
+            ['qemu-img', 'info', '--output=json', str(probe)],
+            capture_output=True, text=True, check=True
+        )
+        fmt = json.loads(info.stdout).get('format-specific', {})
+        actual = fmt.get('data', {}).get('compression-type')
+        if actual != 'zstd':
+            self.skipTest(
+                f'qemu-img accepted compression_type=zstd but recorded '
+                f'{actual!r}, so it cannot build a ZSTD fixture'
+            )
+
+    def _build_zstd_overlay(self, td, base_fill, overlay_fill):
+        """Build a ZSTD-compressed overlay over a qcow2 base in *td*.
+
+        Returns (overlay, base). The overlay's own clusters are
+        genuinely ZSTD-compressed: a plain `qemu-io write` into an
+        image created with compression_type=zstd stores *uncompressed*
+        clusters, so writing one and calling the result a ZSTD fixture
+        exercises no decompression at all. Compressed clusters come
+        from `qemu-img convert -c`, and that is asserted against
+        `qemu-img map` rather than assumed.
+        """
+        td = Path(td)
+        base_raw = td / 'base.raw'
+        base = td / 'base.qcow2'
+        src = td / 'src.qcow2'
+        overlay = td / 'overlay.qcow2'
+
+        subprocess.run(
+            ['qemu-img', 'create', '-f', 'raw', str(base_raw), '1M'],
+            capture_output=True, check=True
+        )
+        subprocess.run(
+            ['qemu-io', '-f', 'raw', '-c',
+             f'write -P 0x{base_fill:02X} 0 1M', str(base_raw)],
+            capture_output=True, check=True
+        )
+        subprocess.run(
+            ['qemu-img', 'convert', '-f', 'raw', '-O', 'qcow2',
+             str(base_raw), str(base)],
+            capture_output=True, check=True
+        )
+
+        # The content the overlay should hold: the base, with one
+        # cluster overwritten.
+        subprocess.run(
+            ['qemu-img', 'create', '-f', 'qcow2',
+             '-b', str(base), '-F', 'qcow2', str(src), '1M'],
+            capture_output=True, check=True
+        )
+        subprocess.run(
+            ['qemu-io', '-f', 'qcow2', '-c',
+             f'write -P 0x{overlay_fill:02X} 65536 65536', str(src)],
+            capture_output=True, check=True
+        )
+
+        # -c compresses what convert writes; -B keeps the backing
+        # reference, so only the differing cluster lands in the
+        # overlay, compressed with the type -o asks for.
+        subprocess.run(
+            ['qemu-img', 'convert', '-c', '-O', 'qcow2',
+             '-o', 'compression_type=zstd',
+             '-B', str(base), '-F', 'qcow2',
+             str(src), str(overlay)],
+            capture_output=True, check=True
+        )
+
+        info = subprocess.run(
+            ['qemu-img', 'info', '--output=json', str(overlay)],
+            capture_output=True, text=True, check=True
+        )
+        parsed = json.loads(info.stdout)
+        self.assertEqual(
+            parsed.get('format-specific', {}).get(
+                'data', {}).get('compression-type'),
+            'zstd',
+            'fixture overlay must record compression type zstd'
+        )
+        self.assertEqual(
+            parsed.get('backing-filename'), str(base),
+            'fixture overlay must keep its backing reference'
+        )
+
+        mapped = subprocess.run(
+            ['qemu-img', 'map', '--output=json', str(overlay)],
+            capture_output=True, text=True, check=True
+        )
+        compressed = [
+            e for e in json.loads(mapped.stdout)
+            if e.get('compressed') and e.get('depth') == 0
+        ]
+        self.assertTrue(
+            compressed,
+            f'fixture overlay holds no compressed cluster of its own, '
+            f'so nothing in this test decompresses: {mapped.stdout}'
+        )
+
+        return overlay, base
 
     def test_convert_zstd_with_backing_chain(self):
         """Convert a ZSTD image that has a backing chain."""
-        if not self._zstd_supported():
-            self.skipTest(
-                'qemu-img does not support ZSTD'
-            )
-
-        with tempfile.NamedTemporaryFile(
-            suffix='.raw'
-        ) as base_raw, \
-                tempfile.NamedTemporaryFile(
-                    suffix='.qcow2'
-                ) as base_qcow2, \
-                tempfile.NamedTemporaryFile(
-                    suffix='.qcow2'
-                ) as overlay, \
-                tempfile.NamedTemporaryFile(
-                    suffix='.raw'
-                ) as instar_raw, \
-                tempfile.NamedTemporaryFile(
-                    suffix='.raw'
-                ) as qemu_raw:
-            # Create base raw with data
-            subprocess.run(
-                ['qemu-img', 'create', '-f', 'raw',
-                 base_raw.name, '1M'],
-                capture_output=True, check=True
-            )
-            with open(base_raw.name, 'r+b') as f:
-                f.write(b'\xAA' * 65536)
-
-            # Convert base to QCOW2
-            subprocess.run(
-                ['qemu-img', 'convert', '-f', 'raw',
-                 '-O', 'qcow2',
-                 base_raw.name, base_qcow2.name],
-                capture_output=True, check=True
-            )
-
-            # Create ZSTD overlay with backing
-            subprocess.run(
-                ['qemu-img', 'create', '-f', 'qcow2',
-                 '-o', 'compression_type=zstd',
-                 '-b', base_qcow2.name,
-                 '-F', 'qcow2',
-                 overlay.name, '1M'],
-                capture_output=True, check=True
-            )
-            # Write different data to overlay
-            subprocess.run(
-                ['qemu-io', '-c',
-                 'write -P 0xBB 65536 65536',
-                 overlay.name],
-                capture_output=True, check=True
-            )
+        # qemu-io as well as qemu-img: the fixture's differing cluster
+        # has to be written into a qcow2 before it can be compressed
+        # into the overlay. The class asked for neither before, so a
+        # host without qemu-io failed in the fixture rather than
+        # skipping.
+        self._require_qemu_tools()
+        with tempfile.TemporaryDirectory() as td:
+            self._require_zstd(td)
+            overlay, _ = self._build_zstd_overlay(td, 0xAA, 0xBB)
+            instar_raw = Path(td) / 'instar.raw'
+            qemu_raw = Path(td) / 'qemu.raw'
 
             # Convert with instar (flattens chain)
             stdout, stderr, rc = self.run_instar_convert(
-                Path(overlay.name),
-                Path(instar_raw.name)
+                overlay, instar_raw
             )
             self.assertEqual(
                 rc, 0,
@@ -1287,15 +1357,13 @@ class TestZstdBackingChain(InstarTestBase):
             # Convert with qemu-img for comparison
             subprocess.run(
                 ['qemu-img', 'convert', '-f', 'qcow2',
-                 '-O', 'raw',
-                 overlay.name, qemu_raw.name],
+                 '-O', 'raw', str(overlay), str(qemu_raw)],
                 capture_output=True, check=True
             )
 
             # Compare outputs
             stdout2, stderr2, rc2 = self.run_instar_compare(
-                Path(instar_raw.name),
-                Path(qemu_raw.name)
+                instar_raw, qemu_raw
             )
             self.assertEqual(
                 rc2, 0,
@@ -1305,68 +1373,22 @@ class TestZstdBackingChain(InstarTestBase):
 
     def test_compare_zstd_backing_vs_flattened(self):
         """Compare a ZSTD overlay (with backing) against flat raw."""
-        if not self._zstd_supported():
-            self.skipTest(
-                'qemu-img does not support ZSTD'
-            )
-
-        with tempfile.NamedTemporaryFile(
-            suffix='.raw'
-        ) as base_raw, \
-                tempfile.NamedTemporaryFile(
-                    suffix='.qcow2'
-                ) as base_qcow2, \
-                tempfile.NamedTemporaryFile(
-                    suffix='.qcow2'
-                ) as overlay, \
-                tempfile.NamedTemporaryFile(
-                    suffix='.raw'
-                ) as flat_raw:
-            # Create base raw with data
-            subprocess.run(
-                ['qemu-img', 'create', '-f', 'raw',
-                 base_raw.name, '1M'],
-                capture_output=True, check=True
-            )
-            with open(base_raw.name, 'r+b') as f:
-                f.write(b'\xCC' * 65536)
-
-            # Convert base to QCOW2
-            subprocess.run(
-                ['qemu-img', 'convert', '-f', 'raw',
-                 '-O', 'qcow2',
-                 base_raw.name, base_qcow2.name],
-                capture_output=True, check=True
-            )
-
-            # Create ZSTD overlay with backing
-            subprocess.run(
-                ['qemu-img', 'create', '-f', 'qcow2',
-                 '-o', 'compression_type=zstd',
-                 '-b', base_qcow2.name,
-                 '-F', 'qcow2',
-                 overlay.name, '1M'],
-                capture_output=True, check=True
-            )
-            subprocess.run(
-                ['qemu-io', '-c',
-                 'write -P 0xDD 65536 65536',
-                 overlay.name],
-                capture_output=True, check=True
-            )
+        self._require_qemu_tools()
+        with tempfile.TemporaryDirectory() as td:
+            self._require_zstd(td)
+            overlay, _ = self._build_zstd_overlay(td, 0xCC, 0xDD)
+            flat_raw = Path(td) / 'flat.raw'
 
             # Flatten with qemu-img for reference
             subprocess.run(
                 ['qemu-img', 'convert', '-f', 'qcow2',
-                 '-O', 'raw',
-                 overlay.name, flat_raw.name],
+                 '-O', 'raw', str(overlay), str(flat_raw)],
                 capture_output=True, check=True
             )
 
             # Compare ZSTD overlay vs flattened raw
             stdout, stderr, rc = self.run_instar_compare(
-                Path(overlay.name),
-                Path(flat_raw.name)
+                overlay, flat_raw
             )
             self.assertEqual(
                 rc, 0,

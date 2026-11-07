@@ -45,6 +45,19 @@ nineteen tests only assert that instar refuses an image and leaves it
 byte-identical, so the class takes `_require_qemu_img()` and the one
 zstd test that needs a `qemu-io` write asks for it itself.
 
+**A capability probe has to be able to succeed.** The same invisible
+skip arrives by a second route: a probe that fails on every host,
+whatever it supports. `TestZstdBackingChain`'s probe asked qemu-img to
+create a qcow2 image on `/dev/null`, which fails on every build
+because the result cannot be read back as qcow2, so both its tests
+skipped from the day they were written in February 2026 until #813 was
+fixed — in CI and locally, with nothing to distinguish that from two
+passes. Probe by building the real thing in a temporary directory, and
+assert the result carries what the probe claims: a build that accepted
+`compression_type=zstd` and recorded zlib would otherwise look
+supported, and the comparison that followed would prove nothing about
+ZSTD.
+
 **A `_run_tool` timeout is a hang guard, not a performance
 assertion.** The budget (`QEMU_TOOL_TIMEOUT`, 300s) exists so a wedged
 `qemu-img` cannot block a stestr worker forever; it is not a claim
