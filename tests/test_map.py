@@ -19,6 +19,11 @@ from `TestMapSmoke`:
 * `TestMapDivergenceRegression` — for each
   `KNOWN_MAP_DIVERGENCES` entry, asserts the divergence
   still happens so accidental fixes surface loudly.
+
+The baseline comparisons call ``assertEqual(instar_output, baseline)``,
+so a failure labels instar's output "reference" and the qemu-img
+baseline "actual" -- the reverse of what the words suggest. See
+docs/testing.md, "Adding or refreshing one baseline".
 """
 
 import json
@@ -27,11 +32,6 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-
-# NOTE: baseline comparisons here call assertEqual(instar_output, baseline),
-# so a failure labels instar's output "reference" and the qemu-img baseline
-# "actual" -- the reverse of what the words suggest. See docs/testing.md,
-# "Adding or refreshing one baseline".
 
 from base import InstarTestBase
 from helpers.comparators import substitute_testdata_root
@@ -284,6 +284,9 @@ KNOWN_MAP_DIVERGENCES = {
     # Only `json` is listed: qemu-img itself exits non-zero on these files in
     # human mode ("File contains external, encrypted or compressed clusters"),
     # so the baseline records rc=1 and the human scenario skips on that.
+    #
+    # Both shapes are in docs/quirks.md, "VHDX blocks in a zero state are
+    # reported as `zero: true`".
     'vhdx-fixed-16M':
         ('json', 'instar reports zero-state VHDX blocks as zero; '
                  'qemu-img reports them as data'),
@@ -404,6 +407,9 @@ def _make_map_source_test(image_dict, output_type):
                 f'{profile_name}'
             )
 
+        # instar's output is the first argument, so testtools labels it
+        # "reference" and the qemu-img baseline "actual" (see the module
+        # docstring) -- read a diff here with that in mind.
         self.assertEqual(
             stdout, expected,
             f'output differs from baseline for {image_id} '

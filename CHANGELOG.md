@@ -12,8 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **Cross-version baselines for fixed VHDX, monolithicFlat and non-qcow2
   preallocation.** Ten new create cases (fixed VHDX, monolithicFlat,
   and `preallocation` on vpc, vmdk and vhdx) and per-image info, check,
-  map and measure baselines for the five VHDX fixtures are now compared against
-  every recorded qemu-img version's profile. See `docs/testing.md`.
+  map and measure baselines for the five VHDX fixtures are recorded for
+  all 80 qemu-img builds, and each run compares against the profile
+  matching the host's qemu-img. See `docs/testing.md`.
 
 - **`instar measure -O vhdx -o subformat=fixed` measures a fixed VHDX.**
   `required size` and `fully allocated size` are equal and are the fixed

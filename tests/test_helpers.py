@@ -179,6 +179,38 @@ class TestNormaliseInfoJsonStripsDivergence(unittest.TestCase):
         self.assertEqual(norm['children'][0]['info']['filename'],
                          '/tmp/abc/base.qcow2')
 
+    def test_sibling_substitution_boundaries(self):
+        """Only a known writer-added suffix in the same directory matches.
+
+        These are the three conditions the sibling rule is made of, each
+        broken in turn. Normalising any of them would hide a real path
+        difference instead of comparing it; leaving the absolute path in
+        makes the comparison fail visibly.
+        """
+        tmp_path = '/tmp/abc/image.vmdk'
+        neighbours = (
+            # Stem merely starts with the primary's: not a writer suffix.
+            '/tmp/abc/image2.vmdk',
+            # Dash-prefixed, but not a suffix either repository knows.
+            '/tmp/abc/image-backing.vmdk',
+            # Same stem, different suffix: a different image entirely.
+            '/tmp/abc/image.qcow2',
+            # Known suffix, but in another directory.
+            '/tmp/other/image-flat.vmdk',
+        )
+        for neighbour in neighbours:
+            obj = {
+                'format': 'vmdk',
+                'filename': tmp_path,
+                'children': [{'name': 'file',
+                              'info': {'filename': neighbour}}],
+            }
+            norm = normalise_info_json(obj, 'vmdk', tmp_path=tmp_path)
+            self.assertEqual(norm['filename'], FILENAME_PLACEHOLDER)
+            self.assertEqual(
+                norm['children'][0]['info']['filename'], neighbour,
+                f'{neighbour} should not have been substituted')
+
     def test_input_unchanged(self):
         """normalise_info_json must not mutate its input."""
         obj = {'format': 'qcow2', 'actual-size': 1234}

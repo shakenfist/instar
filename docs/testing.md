@@ -3077,11 +3077,15 @@ form; neither is part of the umbrella `baselines` target, because they
 write real disk blocks (create) or walk every safe image at every
 version (map), so prefer the filtered form.
 
-**Always run `make validate-profiles` after a regeneration.** It checks,
-for every version in each output type's `version-map.json`, that the
-mapped profile holds a byte-identical copy of each of that version's
+**Always run `make validate-profiles` after a regeneration**, in the
+`instar-testdata` checkout — it is a target there, not in instar. It
+checks, for every version in each output type's `version-map.json`, that
+the mapped profile holds a byte-identical copy of each of that version's
 source files, and it exits non-zero on any mismatch, orphan file or
-output type that compared nothing. The derived profiles have gone
+*profiled* output type that compared nothing. An output type with no
+`version-map.json` is reported as "not a profiled output type" and
+skipped, which is not a failure: several output types have no profiles
+directory at all. The derived profiles have gone
 silently wrong twice while the raw baselines were fine and the suite
 stayed green: once by stamping a stale snapshot into every profile, once
 by flattening buckets so a third of the files were dropped. Two
@@ -3097,6 +3101,19 @@ the two must land together. Drift shows as
 on disk not in CREATE_CASES" means the generator and testdata moved
 ahead of instar; "CREATE_CASES entries with no baseline" means instar
 moved ahead of testdata.
+
+**So is the placeholder vocabulary in recorded output.** A baseline has
+the image's own path rewritten to `$FILENAME`, and a file a create
+subformat wrote beside it — vmdk's monolithicFlat extent — rewritten to
+`$FILENAME` plus the suffix its name adds, so a flat extent reads
+`$FILENAME-flat`. The generator writes it from `sibling_placeholder()`
+in `scripts/generate-baselines.py`; instar reproduces it in
+`_placeholder_for()` in `tests/helpers/info_json.py`. The two rules are
+deliberately not identical, and `_placeholder_for`'s docstring says how:
+instar's is the stricter side, accepting only the suffixes it knows, so
+an unrecognised neighbour fails the comparison with a visible path
+rather than being normalised away. A new multi-file subformat has to be
+taught to both.
 
 **Reading a baseline failure: which side is "reference"?** In
 `tests/test_map.py` and `tests/test_measure.py` the baseline

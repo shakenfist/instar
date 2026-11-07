@@ -571,6 +571,31 @@ the `instar-testdata` clone, instar commands in this worktree with
   and only the two `meta.json` files change because the re-measured
   outputs are byte-identical. Corrected above; the intent -- that the
   filter is surgical -- holds.
+* **The instar-testdata revision this branch requires.** The six
+  testdata commits landed directly on `main` as
+  `88bf8566e1..f73d43670a`. Two of them are what these tests assert
+  against: `a78c06a2eb` adds the ten create cases' baselines, which
+  `test_create_cases_match_baselines` demands in both directions, and
+  `049305c62d` adds the five fixtures' info, check, map and measure
+  baselines. `tools/ci/prepare-testdata.sh` clones testdata's default
+  branch shallow and unpinned, so a run resolves whatever `main` holds
+  at the time; there is no revision to pin here, which makes the
+  ordering load-bearing in both directions. Reverting the testdata
+  commits therefore requires reverting this branch's `CREATE_CASES`
+  hunk in the same change, or `develop` goes red on
+  "CREATE_CASES entries with no baseline".
+* **A review round, 2026-11-07.** The automated reviewer raised 1
+  fix, 4 document, 7 consider. Two of its items found false claims
+  this phase's own fixtures created: `docs/measure.md` and
+  `docs/quirks.md` both said a fixed VHDX source is the case where
+  instar and qemu-img agree, which `block_state_zero=on` makes untrue,
+  and the CHANGELOG claimed the new baselines are compared against
+  every version's profile where a run compares exactly one. A third
+  found a real over-match in the new sibling-placeholder rule. The
+  review also reported the monolithicFlat `check` gap as untracked; it
+  is tracked, as #822, filed by phase 3 -- so no issue needed filing
+  and the earlier report of a denied `gh issue create` was about a
+  defect already on record.
 * **A pre-existing breach noted, not touched.** Landed code and docs
   cite `PLAN-*.md` files in 95 places across 34 files outside
   `docs/plans/`, against the repository's own rule: `docs/quirks.md`

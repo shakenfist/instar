@@ -65,6 +65,12 @@ SNAPSHOT_DIVERGENCE = {
 
 FILENAME_PLACEHOLDER = '$FILENAME'
 
+# Suffixes a create subformat appends to the primary file's stem when it
+# writes a second file beside it. Only these become
+# `$FILENAME<suffix>`; every other neighbouring file keeps its real
+# path (see `_placeholder_for`).
+SIBLING_STEM_SUFFIXES = ('-flat',)
+
 
 def _strip_keys(obj, keys):
     """Recursively delete `keys` wherever they appear as dict keys."""
@@ -82,28 +88,44 @@ def _strip_keys(obj, keys):
 def _placeholder_for(filename, tmp_path):
     """Return the placeholder for one `filename` value, or None.
 
-    `tmp_path` itself becomes FILENAME_PLACEHOLDER. A file qemu-img
-    wrote beside it becomes the placeholder plus whatever its stem adds:
-    vmdk's monolithicFlat subformat writes a flat extent named after the
-    descriptor's stem with `-flat` appended, and `qemu-img info` reports
-    that extent's absolute path in `children[*].info.filename` and in
+    `tmp_path` itself becomes FILENAME_PLACEHOLDER. A file a create
+    subformat wrote beside it becomes the placeholder plus the suffix
+    its stem adds: vmdk's monolithicFlat subformat writes a flat extent
+    named after the descriptor's stem with `-flat` appended, and
+    `qemu-img info` reports that extent's absolute path in
+    `children[*].info.filename` and in
     `format-specific.data.extents[*].filename`. So a flat extent reads
     `$FILENAME-flat`, which is the same on every host and in every
     temporary directory.
 
-    This is the same rule instar-testdata's baseline generator applies
-    when it records the baseline, so the two sides meet. Any other
-    filename is left alone (None).
+    instar-testdata's baseline generator produces the same token, from
+    `sibling_placeholder()` in `scripts/generate-baselines.py`, so the
+    two sides meet on `$FILENAME-flat`. The two rules are deliberately
+    not identical, and both differences matter:
+
+    * The generator replaces the sibling's literal path string anywhere
+      in the stdout and stderr it records. This rewrites only values
+      under a `filename` key, because a field holding an unresolved
+      reference -- `backing-filename` -- must still compare as written.
+    * The generator accepts any sibling whose stem extends the
+      primary's, falling back to `$FILENAME(<name>)`. This accepts only
+      SIBLING_STEM_SUFFIXES, which is deliberately the stricter side: an
+      unrecognised neighbour keeps its absolute path, so the comparison
+      fails showing a path difference rather than normalising a real
+      difference away. A new multi-file subformat therefore has to be
+      taught to both repositories.
+
+    Any other filename is left alone (None).
     """
     if filename == tmp_path:
         return FILENAME_PLACEHOLDER
 
     primary = PurePath(tmp_path)
     sibling = PurePath(filename)
-    if (sibling.parent == primary.parent and
-            sibling.suffix == primary.suffix and
-            sibling.stem.startswith(primary.stem)):
-        return FILENAME_PLACEHOLDER + sibling.stem[len(primary.stem):]
+    if sibling.parent == primary.parent and sibling.suffix == primary.suffix:
+        for suffix in SIBLING_STEM_SUFFIXES:
+            if sibling.stem == primary.stem + suffix:
+                return FILENAME_PLACEHOLDER + suffix
 
     return None
 
@@ -134,8 +156,9 @@ def normalise_info_json(obj, target, tmp_path=None):
     """Return a deep-copied dict with divergence fields stripped and
     `tmp_path` substituted to `$FILENAME` in any `filename` field.
 
-    Files written beside `tmp_path` are substituted too, keeping
-    whatever their name adds to its stem (`$FILENAME-flat`).
+    A file a create subformat wrote beside `tmp_path` is substituted
+    too, keeping the suffix its name adds to the stem
+    (`$FILENAME-flat`).
 
     Args:
         obj: parsed JSON dict.

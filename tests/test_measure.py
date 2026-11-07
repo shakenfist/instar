@@ -7,6 +7,11 @@ cross-version baseline matrix (``TestMeasureBaselineSize`` and
 ``TestMeasureBaselineSource``), registered divergences, a
 convert round-trip against measure's prediction, and the
 source-image formats measure refuses.
+
+The baseline comparisons call ``assertEqual(instar_output, baseline)``,
+so a failure labels instar's output "reference" and the qemu-img
+baseline "actual" -- the reverse of what the words suggest. See
+docs/testing.md, "Adding or refreshing one baseline".
 """
 
 import json
@@ -14,11 +19,6 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-
-# NOTE: baseline comparisons here call assertEqual(instar_output, baseline),
-# so a failure labels instar's output "reference" and the qemu-img baseline
-# "actual" -- the reverse of what the words suggest. See docs/testing.md,
-# "Adding or refreshing one baseline".
 
 from base import InstarTestBase
 
@@ -664,8 +664,11 @@ class TestMeasureBaselineSource(TestMeasureSmoke):
 # Known divergences from qemu-img's source-scanning behaviour. Each entry
 # is `image_id -> (target_pattern, reason)`. The test factory skips matching
 # (image, target) pairs with the documented reason rather than failing.
-# These are real gaps in instar's parser scanners — see the Future work
-# section of PLAN-measure.md for follow-up.
+# Most of these are real gaps in instar's parser scanners — see the Future
+# work section of PLAN-measure.md for follow-up. Some are not: where an
+# entry says so, instar is the more precise reader and the entry exists
+# only because the baseline records qemu-img's number. Read the entry
+# before setting out to close one.
 KNOWN_SOURCE_SCANNER_DIVERGENCES = {
     # raw scanner does not call SEEK_HOLE/SEEK_DATA on the underlying file,
     # so genuinely-sparse raw images (with on-disk fallocate holes) count
@@ -697,6 +700,11 @@ KNOWN_SOURCE_SCANNER_DIVERGENCES = {
     # vhdx-fixed-16M against qemu-img 10.0: instar 327680, qemu-img 17104896,
     # of 17104896 fully allocated. The -bsz-off-data fixtures hold real data in
     # fully-present blocks and the two agree there, so they are not listed.
+    # instar's number is the accurate one: with block_state_zero=on every
+    # payload block really is zero, so these three entries are not gaps to
+    # close. They exist because the baseline records qemu-img's answer.
+    # docs/measure.md and docs/quirks.md carry the numbers for a user
+    # comparing the two tools.
     'vhdx-fixed-16M': ('qcow2', 'instar counts only non-zero-state VHDX blocks, qemu-img counts all'),
     'vhdx-fixed-17M': ('qcow2', 'instar counts only non-zero-state VHDX blocks, qemu-img counts all'),
     'vhdx-dynamic-131041M-block-1M':

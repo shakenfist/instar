@@ -2671,7 +2671,10 @@ KNOWN_WRITER_DIVERGENCES = {
     # The preallocation modes change only how much of the file is written, so
     # they inherit the same geometry divergence as the cases above: qemu-img
     # reports virtual-size 1079296 for a 1M VHD where instar reports 1048576,
-    # exactly as it does for '1M-default'.
+    # exactly as it does for '1M-default'. Skipping here does not leave the
+    # vhd preallocation no-op unasserted: test_vpc_noop_preallocation and
+    # test_vpc_fixed_noop_preallocation prove it directly against the pinned
+    # qemu-img behaviour, where no virtual-size comparison is involved.
     ('vhd', '1M-prealloc-falloc'):
         'qemu rounds VHD virtual_size to CHS geometry',
     ('vhd', '1M-prealloc-full'):
@@ -3041,9 +3044,12 @@ KNOWN_CHECK_FAILURES = {
     # while it checks the monolithicSparse, streamOptimized and preallocated
     # VMDKs in this same matrix cleanly, and qemu-img check reports the flat
     # image free of errors. The writer is fine (the create baseline matches);
-    # it is the reader that has no check path for a flat extent.
+    # it is the reader that has no check path for a flat extent. Tracked as
+    # instar #822, which also covers the docs/check.md claim that check
+    # validates these images; TestCreateVmdkMonolithicFlat accepts exit 0 or
+    # 63 for the same reason and tightens to 0 when #822 is fixed.
     ('vmdk', '1M-monolithic-flat'):
-        'instar check has no path for a monolithicFlat extent',
+        'instar check has no path for a monolithicFlat extent (#822)',
 }
 
 
