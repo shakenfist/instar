@@ -1563,6 +1563,12 @@ We should list obvious extensions, known issues, unrelated bugs we
 encountered, and anything else we should one day do but have
 chosen to defer to here, so that we do not forget them.
 
+* `src/fuzz` is excluded from the cargo workspace
+  (`src/Cargo.toml`, `exclude = ["fuzz"]`), so neither `make lint` nor
+  CI's rustfmt and clippy has ever checked a fuzz target. Found while
+  adding phase 11's VHDX invariants. Bringing the fuzz crate under the
+  workspace lints, or giving it its own lint step, would want a pass
+  over the existing 43 targets' formatting first.
 * A `vpc` create target for the differential fuzzer. It is excluded
   today (`scripts/differential-fuzz.py`'s `_create_option_picker`)
   because qemu-img rounds a VHD's virtual size up to CHS geometry and

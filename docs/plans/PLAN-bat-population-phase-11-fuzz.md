@@ -251,7 +251,7 @@ Each step is its own commit.
 
 | Step | Effort | Model | Isolation | Brief for sub-agent |
 |------|--------|-------|-----------|---------------------|
-| 11a | high | opus | none | Extend `src/fuzz/fuzz_targets/fuzz_create_emitters.rs` to the fixed VHDX subformat and add the BAT invariants. **(1)** Replace the hardcoded `subformat: VhdxSubformat::Dynamic` / `block_state_zero: true` at `:194-201` with values drawn from the corpus bytes, in the style of the `vhd_sub` and `vmdk_sub` draws above (`:102-110`): fixed and dynamic, and both `block_state_zero` values. Delete the comment at `:197-199` — its first sentence ("Fixed output reaches no caller yet") is false since the fixed create and convert CLI paths landed, and its second is what you are fixing. Write a comment that says what the arm now covers. **(2)** Add invariants to `assert_invariants` (`:~230-290`) for a plan that carries a BAT, guarded so dynamic plans are unaffected: every payload entry's offset lies inside the payload region and does not run past `minimum_file_size`; offsets are strictly increasing across payload entries; every offset is 1 MiB aligned; every sector-bitmap slot in the emitted region is zero; and the entry count matches the block count the layout implies. Number them continuing from invariant 5 and give each the one-sentence "what breaking this looks like" comment the existing five have. **(3)** Keep the target panic-free on bad input: a rejected plan must come back as `Err`, never a panic, so any arithmetic you add is checked. **Verification you must run and report:** build with `make lint` and the repo's fuzz build (find how `src/fuzz` is built — it is a Docker path, do not install a Rust toolchain on the host); run the target against its existing corpus for a bounded time under `timeout`; and prove the new invariants can fail by breaking each one in turn in a scratch copy of the vhdx crate (e.g. make one offset non-aligned, make offsets non-monotonic, write a non-zero sector-bitmap slot) and confirming the target reports the invariant you broke and not a different one. Restore from a copy, never with `git checkout <dir>`, and clear any stale build artefacts after restoring. Leave uncommitted. Report: the invariant list, the corpus run's iteration count, and one line per deliberate break naming which assertion fired. ≤400 words. |
+| 11a | high | opus | none | Extend `src/fuzz/fuzz_targets/fuzz_create_emitters.rs` to the fixed VHDX subformat and add the BAT invariants. **(1)** Replace the hardcoded `subformat: VhdxSubformat::Dynamic` / `block_state_zero: true` at `:194-201` with values drawn from the corpus bytes, in the style of the `vhd_sub` and `vmdk_sub` draws above (`:102-110`): fixed and dynamic, and both `block_state_zero` values. Delete the comment at `:197-199` — its first sentence ("Fixed output reaches no caller yet") is false since the fixed create and convert CLI paths landed, and its second is what you are fixing. Write a comment that says what the arm now covers. **(2)** Add invariants to `assert_invariants` (`:223`) for a fixed VHDX, guarded so dynamic plans are unaffected: every payload entry's offset lies inside the payload region; offsets are strictly increasing across payload entries; every offset is a whole number of MiB; every sector-bitmap slot in the emitted region is zero; and the entry count matches the block count the layout implies. (This sentence originally said "for a plan that carries a BAT", bounded the offsets by `minimum_file_size`, and asked for the alignment check on the decoded offset. All three were wrong and the step corrected them rather than working around them -- see the execution notes.) Number them continuing from invariant 5 and give each the one-sentence "what breaking this looks like" comment the existing five have. **(3)** Keep the target panic-free on bad input: a rejected plan must come back as `Err`, never a panic, so any arithmetic you add is checked. **Verification you must run and report:** build with `make lint` and the repo's fuzz build (find how `src/fuzz` is built — it is a Docker path, do not install a Rust toolchain on the host); run the target against its existing corpus for a bounded time under `timeout`; and prove the new invariants can fail by breaking each one in turn in a scratch copy of the vhdx crate (e.g. make one offset non-aligned, make offsets non-monotonic, write a non-zero sector-bitmap slot) and confirming the target reports the invariant you broke and not a different one. Restore from a copy, never with `git checkout <dir>`, and clear any stale build artefacts after restoring. Leave uncommitted. Report: the invariant list, the corpus run's iteration count, and one line per deliberate break naming which assertion fired. ≤400 words. |
 | 11b | medium | opus | none | Add a new libfuzzer target `src/fuzz/fuzz_targets/fuzz_vhdx_fixed_bat.rs` for `vhdx::fill_fixed_bat` (`src/crates/vhdx/src/lib.rs:4374`), and register it in `src/fuzz/Cargo.toml` beside the existing targets. `src/fuzz` already depends on the `vhdx` crate, so no plumbing is needed. Read the six unit tests at `src/crates/vhdx/src/lib.rs:5598-5784` first: they pin specific layouts and this target's job is the arbitrary ones. Draw from the corpus bytes a virtual size, a block size, a block state, a first BAT index and an output buffer length, derive the layout with the shared VHDX layout function phase 5 introduced (find it; do not recompute the layout by hand in the target), and call the filler. Assert on success: every entry written parses; payload entries carry the state the call asked for; offsets are strictly increasing and 1 MiB aligned; sector-bitmap slots are zero; the call wrote exactly the number of entries the index range and buffer size imply; and calling across any partition of the same index range into two calls produces byte-identical output to one call (the property phase 6's `fill_fixed_bat_is_the_same_through_any_buffer_size` pins for one layout — generalise it). Assert on failure: the error is one of the declared variants and the output buffer is untouched, as `fill_fixed_bat_errors_leave_the_buffer_untouched` requires. Never panic on any input. **Verification:** build it, run it under `timeout` long enough to be meaningful, report the iteration count and any crash with its `iter_seed`; then mutate the filler in a scratch copy (drop the 1 MiB alignment, skip the last entry, leave a sector-bitmap slot non-zero) and show the target catches each, naming which assertion fired. Restore from a copy. Leave uncommitted. Report ≤350 words. |
 | 11c | high | opus | none | In `scripts/differential-fuzz.py`, replace the hand-maintained mirror of `tests/helpers/info_json.py` with an import of it. This is decision 1 and it is a precondition for 11d. **The mirror** is `:1504-1572`: `_CREATE_UNIVERSAL_STRIP`, `_CREATE_TARGET_STRIP`, `_CREATE_NESTED_INFO_STRIP`, `_create_strip_keys`, `_create_substitute_filename`, `_normalise_create_info`, under a comment admitting it must be kept in sync by hand. Its one caller is `op_create` (`:1653`). **The mechanism already exists in this file:** `:41-47` inserts `tests/` on `sys.path` and imports `helpers.snapshot_readback`; follow it exactly rather than inventing a second pattern. Read `tests/helpers/info_json.py` and use its public normaliser; match its target-name vocabulary (it keys both `vhd` and `vpc`) and check what it expects for the primary path argument. Delete the mirror and its comment. **Before you change anything, prove the swap is behaviour-preserving for what runs today**, because this is a refactor of a comparison function and a silent widening of it would make the fuzzer stop reporting real divergences: capture the normaliser's output for both sides on a sample of each existing create target (`qcow2`, `vmdk`, `vhdx`, `raw`) with the real `qemu-img info --output=json`, through the old code and the new, and show them byte-identical. Where they are not identical, do not "fix" the canonical copy to match the mirror — report the difference and stop; the canonical copy is the reference and a difference is a finding about the mirror. Note in your report whether the canonical copy's extra handling (snapshot date fields, the sibling rule) can reach `op_create`'s inputs at all today. **Verification:** the comparison above; `pre-commit run --all-files`; and a bounded `--ops create` fuzz run under `timeout` at a fixed seed before and after the change, showing the same iteration count and the same divergence count (expect zero). Leave uncommitted. Report ≤350 words. |
 | 11d | high | opus | none | Teach `_create_option_picker` in `scripts/differential-fuzz.py` (`:1574`) the shapes this plan added. Requires 11c committed. **(1) vhdx arm** (`:1641-1647`): draw `subformat=fixed` as well as dynamic, and when fixed, draw `block_state_zero=on` and `off`. Keep the existing `block_size` draw, including the `None` case. Note that a fixed VHDX is dense: hold fixed sizes to the small end of the existing list so an iteration does not write a gigabyte, and say so in a comment. **(2) vmdk arm** (`:1637`): add `monolithicFlat`. **(3) preallocation for vmdk and vhdx**: draw `falloc` and `full` as well as none. Do **not** draw `metadata` for these targets (decision 4: both tools refuse it). **(4)** Do **not** add a `vhd` target (decision 2, the CHS virtual-size divergence) — instead update the function's docstring `Excludes:` block to say that vpc create is excluded for that reason *and* that it is therefore the one target whose preallocation no-op the differential fuzzer does not cover, naming the two host tests that do (`test_vpc_noop_preallocation`, `test_vpc_fixed_noop_preallocation`). **(5)** The docstring's existing claims are part of the diff you own: check each against the code and correct any that the last five phases falsified. **Verification you must run and report:** a bounded `--ops create` run under `timeout` at a fixed seed with enough iterations to hit every new shape at least once — report the per-shape hit counts, and if any shape is unreachable say so, because an option that is never drawn is not coverage. Any divergence the run reports is the most important thing in your report: for each, say whether it is a real instar/qemu difference, a normaliser gap, or a picker mistake, and paste both sides. Do not add a divergence whitelist entry to make a run clean — a real divergence here is a finding for the management session. Leave uncommitted. Report ≤400 words. |
@@ -348,6 +348,69 @@ the Docker path; no Rust toolchain is installed on the host.
 * No plan-file reference, phase number, step number or decision number
   appears in any code, comment or user-facing document this phase adds
   or edits.
+
+## Execution notes
+
+Implementation started 2026-11-07 (AEDT, +1100), on `e0b0fe13`.
+
+**Back brief answers.** All four decisions put to the operator were
+accepted as planned: vpc stays out of the differential create picker
+(decision 2), the fixed convert arm compares against the pinned
+expectations rather than inventing a symmetric oracle qemu-img cannot
+provide (11e), the new fuzz targets are not wired into the
+coverage-fuzz CI schedule (decision 7), and this session may push the
+branch and open the pull request once the steps are committed and the
+definition of done is checked.
+
+**Step 11a corrected three premises of its own row**, all verified
+against the tree by the management session before the step was
+committed:
+
+* **The BAT is not among the plan's writes.** `plan_vhdx` returns it
+  separately as `VhdxPlan::fixed` for the caller to stream, because at
+  the 64 TiB ceiling it is 513 MiB and the planner works in a bounded
+  scratch buffer. So the harness keeps `plan.fixed` and fills the BAT
+  itself through `vhdx::fill_fixed_bat`, in two bounded windows: one at
+  entry 0, which always covers a sector-bitmap slot because the largest
+  legal `chunk_ratio` is 4096, and one straddling the last entry the
+  image needs, which is the only window that sees the entry-to-padding
+  boundary.
+* **`minimum_file_size` is the wrong bound.** It is the end of the
+  metadata region, and a fixed image's payload blocks start 5 MiB
+  further on, so the bound is the payload region
+  `[layout.fixed_data_start, fixed.file_length)`.
+* **The alignment invariant was unfalsifiable as worded.**
+  `BAT_ENTRY_OFFSET_MASK` is `0xFFFF_FFFF_FFF0_0000`, so masking an
+  entry yields a whole number of MiB whatever was encoded, and an
+  assertion on the decoded offset can never fail. It is asserted on the
+  entry's bits instead, which is where a misaligned offset survives.
+  Reproduced by the management session: the mutant that writes
+  `(offset + 512) | PAYLOAD_BLOCK_FULLY_PRESENT` makes invariant 9 fire
+  with "entry 0 (0x800206) encodes offset 0x800200, not a whole number
+  of MiB", and `0x800200` masks to `0x800000`, which is aligned -- so
+  the original wording would have missed exactly this mutant.
+
+The invariants are numbered 6 to 10 continuing the existing five, and
+ordered so that each mutant's own assertion fires first rather than
+being pre-empted by the entry-count check.
+
+**The VHDX subformat and `block_state_zero` ride in two spare bits of
+the existing `flag_bits` header byte** rather than in a new header byte.
+Only the qcow2 arm reads that byte, and it reads bits 0 to 2; a 25th
+header byte would have moved where the backing path starts and changed
+what every existing corpus entry means.
+
+**Finding, outside this phase's scope: `src/fuzz` is excluded from the
+cargo workspace** (`src/Cargo.toml:4`, `exclude = ["fuzz"]`), so
+neither `make lint` nor CI's rustfmt and clippy has ever looked at any
+fuzz target. The step matched the file's existing hand-wrapped style
+rather than relying on a gate that does not exist. Recorded in the
+master plan's Future work.
+
+**There was no committed corpus for `fuzz_create_emitters`.** The step
+crafted six seeds covering both subformats and both block states at two
+block sizes; the corpus directory is gitignored, so they do not appear
+in the diff, and the originals are kept with the step's scratch output.
 
 ## Back brief
 
