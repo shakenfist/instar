@@ -3062,8 +3062,14 @@ and applies to `info`, `check`, `compare`, `measure`, `map` and
 `create`, `resize`, `amend`, `bitmap`, `dd`, `rebase`, `commit` and
 `measure`. `measure` takes both (a `--size` axis and a source-image
 axis); one filter runs the sub-mode it names, both run both. A filter
-that matches nothing exits 1 rather than running empty. Run from the
-`instar-testdata` checkout:
+that matches nothing exits 1 rather than running empty.
+
+Both filters match by name across every target that defines one, so
+`--case 16M-fixed` regenerates the vhd case of that name as well as the
+vhdx one; three of the current case names are shared that way. Check
+`git status --porcelain expected-outputs` after a run to see what
+actually moved rather than assuming the target you had in mind. Run
+from the `instar-testdata` checkout:
 
 ```bash
 scripts/generate-baselines.py --command map --no-commit --image vhdx-fixed-16M
@@ -3100,7 +3106,11 @@ the two must land together. Drift shows as
 `test_create_cases_match_baselines` failing in one direction: "baselines
 on disk not in CREATE_CASES" means the generator and testdata moved
 ahead of instar; "CREATE_CASES entries with no baseline" means instar
-moved ahead of testdata.
+moved ahead of testdata. The coupling holds for reverts too, and that
+is the direction that catches people: reverting the instar-side case
+list needs the matching testdata commit reverted with it, and vice
+versa, because `tools/ci/prepare-testdata.sh` clones testdata's
+default branch unpinned and the assertion runs both ways.
 
 **So is the placeholder vocabulary in recorded output.** A baseline has
 the image's own path rewritten to `$FILENAME`, and a file a create

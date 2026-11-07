@@ -704,7 +704,9 @@ KNOWN_SOURCE_SCANNER_DIVERGENCES = {
     # payload block really is zero, so these three entries are not gaps to
     # close. They exist because the baseline records qemu-img's answer.
     # docs/measure.md and docs/quirks.md carry the numbers for a user
-    # comparing the two tools.
+    # comparing the two tools. Scoped to the qcow2 target because the raw
+    # target agrees for all three: its six source scenarios pass unskipped,
+    # the same way the `qemu-vhdx` entry above is scoped.
     'vhdx-fixed-16M': ('qcow2', 'instar counts only non-zero-state VHDX blocks, qemu-img counts all'),
     'vhdx-fixed-17M': ('qcow2', 'instar counts only non-zero-state VHDX blocks, qemu-img counts all'),
     'vhdx-dynamic-131041M-block-1M':

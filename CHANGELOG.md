@@ -14,7 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and `preallocation` on vpc, vmdk and vhdx) and per-image info, check,
   map and measure baselines for the five VHDX fixtures are recorded for
   all 80 qemu-img builds, and each run compares against the profile
-  matching the host's qemu-img. See `docs/testing.md`.
+  matching the host's qemu-img. The map baselines for these five serve
+  the divergence registry rather than an equality assertion: every one
+  of them diverges, so what they pin is that the divergence persists.
+  See `docs/testing.md`.
 
 - **`instar measure -O vhdx -o subformat=fixed` measures a fixed VHDX.**
   `required size` and `fully allocated size` are equal and are the fixed

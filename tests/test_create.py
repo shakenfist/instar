@@ -28,7 +28,7 @@ from pathlib import Path
 from base import QEMU_TOOL_TIMEOUT, InstarTestBase
 from helpers import qemu_pins
 from helpers import vhdx_structure
-from helpers.info_json import assert_info_equivalent
+from helpers.info_json import FLAT_EXTENT_NAMES, assert_info_equivalent
 from test_vhdx_fixed_fixtures import PARTIAL_PAST_FIRST_CHUNK, RUNTIME_CREATE_IMAGES
 
 # ----------------------------------------------------------------------
@@ -2294,14 +2294,10 @@ class TestCreateVhdxSizeLimits(InstarTestBase):
             self.assertEqual(json.loads(r.stdout)['virtual-size'], self.ROUNDED_SIZE)
 
 
-# Output name -> the extent qemu-img writes beside it (block/vmdk.c
-# filename_decompose and the "%s-flat%s" format).
-FLAT_CREATE_EXTENT_NAMES = (
-    ('out.vmdk', 'out-flat.vmdk'),
-    ('out.img', 'out-flat.img'),
-    ('out', 'out-flat'),
-    ('.hid', '-flat.hid'),
-)
+# Output name -> the extent qemu-img writes beside it. Defined in
+# helpers/info_json.py, beside the baseline-normalisation rule that has
+# to recognise every name in it.
+FLAT_CREATE_EXTENT_NAMES = FLAT_EXTENT_NAMES
 
 FLAT = ('-f', 'vmdk', '-o', 'subformat=monolithicFlat')
 
@@ -3046,7 +3042,7 @@ KNOWN_CHECK_FAILURES = {
     # image free of errors. The writer is fine (the create baseline matches);
     # it is the reader that has no check path for a flat extent. Tracked as
     # instar #822, which also covers the docs/check.md claim that check
-    # validates these images; TestCreateVmdkMonolithicFlat accepts exit 0 or
+    # validates these images; TestCreateVmdkFlat accepts exit 0 or
     # 63 for the same reason and tightens to 0 when #822 is fixed.
     ('vmdk', '1M-monolithic-flat'):
         'instar check has no path for a monolithicFlat extent (#822)',

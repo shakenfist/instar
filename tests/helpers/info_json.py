@@ -65,11 +65,23 @@ SNAPSHOT_DIVERGENCE = {
 
 FILENAME_PLACEHOLDER = '$FILENAME'
 
-# Suffixes a create subformat appends to the primary file's stem when it
-# writes a second file beside it. Only these become
-# `$FILENAME<suffix>`; every other neighbouring file keeps its real
-# path (see `_placeholder_for`).
-SIBLING_STEM_SUFFIXES = ('-flat',)
+# Suffixes a create subformat inserts before the extension when it writes
+# a second file beside the one it was asked for. Only these become
+# `$FILENAME<suffix>`; every other neighbouring file keeps its real path
+# (see `_placeholder_for`).
+SIBLING_NAME_SUFFIXES = ('-flat',)
+
+# Output name -> the extent qemu-img writes beside it, which instar's
+# writer matches (`block/vmdk.c`'s `filename_decompose` and its
+# "%s-flat%s" format). Lives here because it is the table the rule in
+# `_placeholder_for` has to satisfy; `tests/test_create.py` imports it
+# for the writer's own assertions, so the two cannot drift apart.
+FLAT_EXTENT_NAMES = (
+    ('out.vmdk', 'out-flat.vmdk'),
+    ('out.img', 'out-flat.img'),
+    ('out', 'out-flat'),
+    ('.hid', '-flat.hid'),
+)
 
 
 def _strip_keys(obj, keys):
@@ -83,6 +95,23 @@ def _strip_keys(obj, keys):
     elif isinstance(obj, list):
         for item in obj:
             _strip_keys(item, keys)
+
+
+def _decompose_name(name):
+    """Split a file name into base and extension as qemu-img does.
+
+    `filename_decompose` splits at the last `.`, so a dotfile output
+    such as `.hid` has an empty base and `.hid` as its extension, and
+    its flat extent is `-flat.hid`. `PurePath.stem`/`.suffix` read the
+    same name as stem `.hid` with no suffix, which would make the
+    extent unrecognisable -- hence this rather than the Path properties.
+    A name with no `.` at all is all base, so `out` gives `out-flat`.
+    FLAT_EXTENT_NAMES is the table of shapes this has to reproduce.
+    """
+    base, dot, extension = name.rpartition('.')
+    if not dot:
+        return name, ''
+    return base, dot + extension
 
 
 def _placeholder_for(filename, tmp_path):
@@ -109,11 +138,11 @@ def _placeholder_for(filename, tmp_path):
       reference -- `backing-filename` -- must still compare as written.
     * The generator accepts any sibling whose stem extends the
       primary's, falling back to `$FILENAME(<name>)`. This accepts only
-      SIBLING_STEM_SUFFIXES, which is deliberately the stricter side: an
-      unrecognised neighbour keeps its absolute path, so the comparison
-      fails showing a path difference rather than normalising a real
-      difference away. A new multi-file subformat therefore has to be
-      taught to both repositories.
+      the names SIBLING_NAME_SUFFIXES can build, which is deliberately
+      the stricter side: an unrecognised neighbour keeps its absolute
+      path, so the comparison fails showing a path difference rather
+      than normalising a real difference away. A new multi-file
+      subformat therefore has to be taught to both repositories.
 
     Any other filename is left alone (None).
     """
@@ -122,10 +151,13 @@ def _placeholder_for(filename, tmp_path):
 
     primary = PurePath(tmp_path)
     sibling = PurePath(filename)
-    if sibling.parent == primary.parent and sibling.suffix == primary.suffix:
-        for suffix in SIBLING_STEM_SUFFIXES:
-            if sibling.stem == primary.stem + suffix:
-                return FILENAME_PLACEHOLDER + suffix
+    if sibling.parent != primary.parent:
+        return None
+
+    base, extension = _decompose_name(primary.name)
+    for suffix in SIBLING_NAME_SUFFIXES:
+        if sibling.name == base + suffix + extension:
+            return FILENAME_PLACEHOLDER + suffix
 
     return None
 

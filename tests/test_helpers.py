@@ -16,6 +16,7 @@ from pathlib import Path
 from helpers import qemu_pins
 from helpers.info_json import (
     FILENAME_PLACEHOLDER,
+    FLAT_EXTENT_NAMES,
     assert_info_equivalent,
     normalise_info_json,
 )
@@ -178,6 +179,30 @@ class TestNormaliseInfoJsonStripsDivergence(unittest.TestCase):
         self.assertEqual(norm['filename'], FILENAME_PLACEHOLDER)
         self.assertEqual(norm['children'][0]['info']['filename'],
                          '/tmp/abc/base.qcow2')
+
+    def test_every_flat_extent_name_is_recognised(self):
+        """Each shape in the writer's extent-naming table normalises.
+
+        FLAT_EXTENT_NAMES is what qemu-img and instar name the extent
+        for a given output name, including the suffixless and dotfile
+        shapes where `PurePath.stem` and `.suffix` do not describe the
+        split qemu-img made. A name missing here would leave an
+        absolute path in the comparison.
+        """
+        for primary, extent in FLAT_EXTENT_NAMES:
+            obj = {
+                'format': 'vmdk',
+                'filename': f'/tmp/abc/{primary}',
+                'children': [{'name': 'extents.0',
+                              'info': {'filename': f'/tmp/abc/{extent}'}}],
+            }
+            norm = normalise_info_json(obj, 'vmdk',
+                                       tmp_path=f'/tmp/abc/{primary}')
+            self.assertEqual(norm['filename'], FILENAME_PLACEHOLDER)
+            self.assertEqual(
+                norm['children'][0]['info']['filename'],
+                FILENAME_PLACEHOLDER + '-flat',
+                f'extent {extent} of {primary} was not recognised')
 
     def test_sibling_substitution_boundaries(self):
         """Only a known writer-added suffix in the same directory matches.
