@@ -269,7 +269,7 @@ Each step is its own commit.
 | 11b | medium | opus | none | Add a new libfuzzer target `src/fuzz/fuzz_targets/fuzz_vhdx_fixed_bat.rs` for `vhdx::fill_fixed_bat` (`src/crates/vhdx/src/lib.rs:4374`), and register it in `src/fuzz/Cargo.toml` beside the existing targets. `src/fuzz` already depends on the `vhdx` crate, so no plumbing is needed. Read the six unit tests at `src/crates/vhdx/src/lib.rs:5598-5784` first: they pin specific layouts and this target's job is the arbitrary ones. Draw from the corpus bytes a virtual size, a block size, a block state, a first BAT index and an output buffer length, derive the layout with the shared VHDX layout function phase 5 introduced (find it; do not recompute the layout by hand in the target), and call the filler. Assert on success: every entry written parses; payload entries carry the state the call asked for; offsets are strictly increasing and 1 MiB aligned; sector-bitmap slots are zero; the call wrote exactly the number of entries the index range and buffer size imply; and calling across any partition of the same index range into two calls produces byte-identical output to one call (the property phase 6's `fill_fixed_bat_is_the_same_through_any_buffer_size` pins for one layout — generalise it). Assert on failure: the error is one of the declared variants and the output buffer is untouched, as `fill_fixed_bat_errors_leave_the_buffer_untouched` requires. Never panic on any input. **Verification:** build it, run it under `timeout` long enough to be meaningful, report the iteration count and any crash with its `iter_seed`; then mutate the filler in a scratch copy (drop the 1 MiB alignment, skip the last entry, leave a sector-bitmap slot non-zero) and show the target catches each, naming which assertion fired. Restore from a copy. Leave uncommitted. Report ≤350 words. |
 | 11c | high | opus | none | In `scripts/differential-fuzz.py`, replace the hand-maintained mirror of `tests/helpers/info_json.py` with an import of it. This is decision 1 and it is a precondition for 11d. **The mirror** is `:1504-1572`: `_CREATE_UNIVERSAL_STRIP`, `_CREATE_TARGET_STRIP`, `_CREATE_NESTED_INFO_STRIP`, `_create_strip_keys`, `_create_substitute_filename`, `_normalise_create_info`, under a comment admitting it must be kept in sync by hand. Its callers are `op_create`, `op_resize`, `op_amend`, `op_rebase` and `op_commit` -- ten call expressions, instar side and qemu side in each. (This row originally claimed `op_create` was the only one; it is not, and the row's definition of done only holds if every call site moves.) **The mechanism already exists in this file:** `:41-47` inserts `tests/` on `sys.path` and imports `helpers.snapshot_readback`; follow it exactly rather than inventing a second pattern. Read `tests/helpers/info_json.py` and use its public normaliser; match its target-name vocabulary (it keys both `vhd` and `vpc`) and check what it expects for the primary path argument. Delete the mirror and its comment. **Before you change anything, prove the swap is behaviour-preserving for what runs today**, because this is a refactor of a comparison function and a silent widening of it would make the fuzzer stop reporting real divergences: capture the normaliser's output for both sides on a sample of each existing create target (`qcow2`, `vmdk`, `vhdx`, `raw`) with the real `qemu-img info --output=json`, through the old code and the new, and show them byte-identical. Where they are not identical, do not "fix" the canonical copy to match the mirror — report the difference and stop; the canonical copy is the reference and a difference is a finding about the mirror. Note in your report whether the canonical copy's extra handling (snapshot date fields, the sibling rule) can reach `op_create`'s inputs at all today. **Verification:** the comparison above; `pre-commit run --all-files`; and a bounded `--ops create` fuzz run under `timeout` at a fixed seed before and after the change, showing the same iteration count and the same divergence count (expect zero). Leave uncommitted. Report ≤350 words. |
 | 11d | high | opus | none | Teach `_create_option_picker` in `scripts/differential-fuzz.py` (`:1574`) the shapes this plan added. Requires 11c committed. **(1) vhdx arm** (`:1641-1647`): draw `subformat=fixed` as well as dynamic, and when fixed, draw `block_state_zero=on` and `off`. Keep the existing `block_size` draw, including the `None` case. Note that a fixed VHDX is dense: hold fixed sizes to the small end of the existing list so an iteration does not write a gigabyte, and say so in a comment. **(2) vmdk arm** (`:1637`): add `monolithicFlat`. **(3) preallocation for vmdk and vhdx**: draw `falloc` and `full` as well as none. Do **not** draw `metadata` for these targets (decision 4: both tools refuse it). **(4)** Do **not** add a `vhd` target (decision 2, the CHS virtual-size divergence) — instead update the function's docstring `Excludes:` block to say that vpc create is excluded for that reason *and* that it is therefore the one target whose preallocation no-op the differential fuzzer does not cover, naming the two host tests that do (`test_vpc_noop_preallocation`, `test_vpc_fixed_noop_preallocation`). **(5)** The docstring's existing claims are part of the diff you own: check each against the code and correct any that the last five phases falsified. **Verification you must run and report:** a bounded `--ops create` run under `timeout` at a fixed seed with enough iterations to hit every new shape at least once — report the per-shape hit counts, and if any shape is unreachable say so, because an option that is never drawn is not coverage. Any divergence the run reports is the most important thing in your report: for each, say whether it is a real instar/qemu difference, a normaliser gap, or a picker mistake, and paste both sides. Do not add a divergence whitelist entry to make a run clean — a real divergence here is a finding for the management session. Leave uncommitted. Report ≤400 words. |
-| 11e | high | opus | none | Add a VHDX arm to `op_convert` in `scripts/differential-fuzz.py` (`:1009`) that compares structure, not just content. Requires 11c committed. **Why this is not a picker edit:** `op_convert` picks only `['raw', 'qcow2']` (`:1017`), and for any non-raw target it flattens both outputs to raw with `qemu-img convert -O raw` and compares bytes (`:1066-1090`). A raw flatten erases every property the fixed subformat exists to get right, so adding `vhdx` to that list alone would buy no coverage. **(1)** Add `vhdx` to the target choice, with a `--subformat fixed` draw and a dynamic draw. **(2)** For the vhdx target, run both comparisons and report which diverged: the existing raw-flatten content comparison, and a structural comparison through `tests/helpers/vhdx_structure.py`, imported by the `sys.path`/`helpers.` pattern at `:41-47`. Read the comparator first and use what it already offers; if it needs a new accessor, add it there rather than parsing VHDX inline in the fuzzer, and keep its existing callers (five test modules) working. Emit distinct divergence `type` values for a content difference and a structural difference — a single `convert_vhdx_divergence` would make the triage read the payload to find out which. **(3)** Confine the fixed sizes to whole multiples of the block size (decision 6), with a comment naming **#879** — `convert -O vhdx --subformat fixed` fails on a partial last block holding data — and saying to lift the restriction when #879 closes. Verify by hand that the geometries you generate do not hit it: create one at an excluded geometry and confirm it still fails, so the comment is justified rather than inherited. **(4)** qemu-img cannot write VHDX, so there is no qemu side for the fixed convert output. Establish what the two sides actually are before you write the comparison (instar fixed against instar dynamic? against the phase 1 pin? against a qemu-written dynamic VHDX?) and say in your report which oracle you chose and why; if the honest answer is that there is no qemu oracle for this target, say so plainly and make the arm compare instar against the pinned expectations instead — do not invent a comparison that looks symmetric but is not. **Verification:** a bounded `--ops convert` run under `timeout` at a fixed seed, with per-shape hit counts; one deliberately corrupted instar output showing the structural arm reports it and names the field. Leave uncommitted. Report ≤400 words. |
+| 11e | high | opus | none | Add a VHDX arm to `op_convert` in `scripts/differential-fuzz.py` (`:1009`) that compares structure, not just content. Requires 11c committed. **Why this is not a picker edit:** `op_convert` picks only `['raw', 'qcow2']` (`:1017`), and for any non-raw target it flattens both outputs to raw with `qemu-img convert -O raw` and compares bytes (`:1066-1090`). A raw flatten erases every property the fixed subformat exists to get right, so adding `vhdx` to that list alone would buy no coverage. **(1)** Add `vhdx` to the target choice, with a `--subformat fixed` draw and a dynamic draw. **(2)** For the vhdx target, run both comparisons and report which diverged: the existing raw-flatten content comparison, and a structural comparison through `tests/helpers/vhdx_structure.py`, imported by the `sys.path`/`helpers.` pattern at `:41-47`. Read the comparator first and use what it already offers; if it needs a new accessor, add it there rather than parsing VHDX inline in the fuzzer, and keep its existing callers (five test modules) working. Emit distinct divergence `type` values for a content difference and a structural difference — a single `convert_vhdx_divergence` would make the triage read the payload to find out which. **(3)** Confine the fixed sizes to whole multiples of the block size (decision 6), with a comment naming **#879** — `convert -O vhdx --subformat fixed` fails on a partial last block holding data — and saying to lift the restriction when #879 closes. Verify by hand that the geometries you generate do not hit it: create one at an excluded geometry and confirm it still fails, so the comment is justified rather than inherited. **(4)** (This row originally said qemu-img cannot write VHDX, so no qemu side exists for the fixed convert output. That is wrong -- qemu-img writes VHDX, and the pins are themselves generated with it. The pin oracle is still the right choice, for the reason the execution notes record.) Establish what the two sides actually are before you write the comparison (instar fixed against instar dynamic? against the phase 1 pin? against a qemu-written dynamic VHDX?) and say in your report which oracle you chose and why; if the honest answer is that there is no qemu oracle for this target, say so plainly and make the arm compare instar against the pinned expectations instead — do not invent a comparison that looks symmetric but is not. **Verification:** a bounded `--ops convert` run under `timeout` at a fixed seed, with per-shape hit counts; one deliberately corrupted instar output showing the structural arm reports it and names the field. Leave uncommitted. Report ≤400 words. |
 | 11f | medium | sonnet | none | Document the fuzzing this phase added. **(1) `docs/testing.md`:** extend its fuzzing section with the two new targets (`fuzz_create_emitters`' fixed arm and `fuzz_vhdx_fixed_bat`), how to run a target by hand, and the differential fuzzer's new create and convert shapes. State plainly which targets the differential fuzzer does **not** cover and why — vpc create (CHS virtual-size rounding) and the partial-last-block fixed convert geometry (#879) — because an undocumented exclusion reads as coverage. Reference the issue by number; do not cite plan, phase, step or decision numbers or any `PLAN-*.md` file in user-facing documentation. **(2) `CHANGELOG.md`:** one entry for the new fuzz coverage. **(3)** Check whether `AGENTS.md` states a convention this phase changed — "how to add a fuzz target" is a convention, so if it says anything about the fuzz crate it needs one line and a link to `docs/testing.md`, not a copy. Do not touch `docs/format-coverage.md`, `docs/quirks.md` or `docs/format-internals.md`: phase 12 owns the cross-cutting pages. **(4)** Run `pre-commit run --all-files`. Leave uncommitted; report every file changed and the exact `AGENTS.md` wording you added, if any. ≤250 words. |
 
 ## Risks and mitigations
@@ -295,7 +295,9 @@ Each step is its own commit.
   report per-shape hit counts, and an unreachable shape is a reportable
   failure of the step rather than a footnote.
 
-* **The fixed convert arm has no honest qemu oracle.** qemu-img cannot
+* **The fixed convert arm's oracle needed settling.** (This risk first
+  said qemu-img cannot write VHDX, which is wrong; see the execution
+  notes for what the oracle actually compares and why.) qemu-img cannot
   write VHDX, so a symmetric differential comparison may not exist for
   this target. Mitigation: 11e's brief makes naming the oracle a
   required output and explicitly permits the answer "there is no qemu
@@ -555,6 +557,65 @@ fuzzer's own target name is `vpc` and the divergence is specifically on
 claims against the live tools instead of assuming them, and all three
 hold.
 
+**Step 11e found a real instar defect, filed as #883.** `convert -O
+vhdx` writing a dynamic image ends the file short of the metadata
+region its own region table declares, whenever the conversion allocates
+no payload block. Reproduced by the management session from the command
+line and by reading the region table directly: a 64 MiB all-zero source
+gives a 3,276,800-byte file whose metadata region is declared at offset
+3,145,728 with length 1,048,576, ending at 4,194,304 -- 917,504 bytes
+past the end. `instar create -f vhdx` is correct at 4,194,304, and a
+convert whose source allocates a block is fine. Neither tool's
+validation reads a declared region against the file length, so
+`qemu-img info` succeeds and `instar check` reports no errors; the
+structural comparison this step added is currently the only check that
+sees it.
+
+**The operator chose to file it and stop the fuzzer reporting it**,
+rather than fix the writer inside a fuzzing phase or land a fuzzer that
+reports a known defect every run -- the same treatment this plan gives
+#879 and the qemu-img partial-block bug. The suppression is narrow by
+construction and the narrowness was verified by the management session,
+not just claimed: the predicate requires both a declared region
+overrunning the file *and* an all-zero BAT region, and the same file
+with a single BAT entry set is still reported. A different parse
+failure is still reported, and a corrupted BAT still comes back as a
+structural divergence.
+
+**It is a visible skip, not a silent pass.** The run prints
+"Comparisons skipped for an already-filed defect (not a pass):
+convert_vhdx_truncated_region_issue_883 x35" and records the count in
+the run's summary JSON. Reproduced at an independent seed: 60
+iterations, zero divergences, 35 skips.
+
+**The cost, which the operator should see rather than discover.** Fixed
+structural coverage is intact -- every fixed draw is fully compared.
+Dynamic is thin: of 184 dynamic draws in a 200-iteration run, 113 were
+skipped for #883 and 57 more parsed cleanly but had no pin for their
+geometry, leaving 14 actual structural comparisons. Fixing #883 returns
+about 61% of it; the pin gap is separate and is recorded in the master
+plan's Future work.
+
+**Two more of the management session's premises were wrong, and both
+are corrected above.** qemu-img *does* write VHDX -- the pins are
+generated with it -- so the back-brief question about 11e's oracle was
+put on a false premise. The answer is unchanged but the reason is
+different: instar's fixed convert deliberately writes qemu's *create*
+layout rather than its *convert* layout (`docs/quirks.md` records the
+difference), so a live convert-against-convert comparison would report
+that documented divergence on every iteration. And #879 is
+source-format dependent: its repro fails from a qcow2 source and the
+same geometry passes from a raw one, so "an excluded geometry still
+fails" holds only for some of the eight source formats, though the
+whole-multiple restriction is still right.
+
+**One comparator change, flagged because that helper is shared.**
+`parse_vhdx` refuses these files, so the suppression condition cannot
+be established through the existing API; the step added one public
+function, `truncated_inside_region`, and removed nothing. All five
+consuming test modules still import names that exist, and
+`test_helpers` is 40 OK, reproduced by the management session.
+
 ## Back brief
 
 Points needing the operator's answer before any step runs:
@@ -569,7 +630,11 @@ Points needing the operator's answer before any step runs:
    CI-cost call rather than a correctness one. Accept, or wire them in?
 3. **Decision 6 — the fixed convert picker avoids the #879 geometry**
    rather than generating it and expecting the failure. Accept?
-4. **11e's oracle.** qemu-img cannot write VHDX, so the fixed convert
+4. **11e's oracle.** (Asked and answered on a false premise: the
+   question said qemu-img cannot write VHDX. It can. The answer given --
+   compare against the pins -- remains correct for a different reason,
+   recorded in the execution notes.) The question as put: qemu-img
+   cannot write VHDX, so the fixed convert
    arm may have no symmetric differential comparison. The brief lets
    the step report that and fall back to the pinned expectations. Is
    that the right shape, or should fixed convert fuzzing wait until

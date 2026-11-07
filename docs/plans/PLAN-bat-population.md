@@ -1563,6 +1563,20 @@ We should list obvious extensions, known issues, unrelated bugs we
 encountered, and anything else we should one day do but have
 chosen to defer to here, so that we do not forget them.
 
+* `op_dd` in `scripts/differential-fuzz.py` compares a VHDX target the
+  same layout-blind way `op_convert` used to -- its docstring says
+  "Mirrors `op_convert`" -- so the structural comparison phase 11 added
+  for convert is a call away but not yet wired in. `compare_vhdx_structure`
+  takes the expected virtual size, which `dd` would have to probe rather
+  than being told. Phase 11 deliberately left `op_dd` alone as outside
+  its row.
+* Dynamic VHDX convert has a pin for only two of the six source sizes
+  the differential fuzzer draws, so most dynamic iterations parse the
+  output and then have no reference to compare it against. Found while
+  measuring phase 11's structural coverage: of 184 dynamic draws in a
+  200-iteration run, 57 parsed cleanly with no pin for their geometry.
+  Adding the missing dynamic pins would widen that coverage
+  independently of #883.
 * qemu-img writes a fixed VHDX it cannot then read, at a geometry
   whose last payload block is partial and with `block_state_zero=off`.
   Measured on qemu-img 10.0.13: creating a 4608.5M image with 1 MiB
