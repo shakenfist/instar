@@ -352,6 +352,27 @@ jobs:
       - name: Test the fuzz target registration guard
         run: tools/ci/test-check-fuzz-targets.sh
 
+      # Five operations compose a differencing image, so anything in
+      # the tree saying instar cannot read or compose one is false.
+      # This lint was written for that sweep, documented in
+      # docs/testing.md as the guard for the convention, and then run
+      # nowhere: its only evidence was a one-off exit 0 recorded in a
+      # plan (#663). Pure text parsing: no docker, no cargo, no
+      # testdata. The self-test runs too, because a lint that has only
+      # ever been run against a clean tree has not been shown to catch
+      # anything.
+      - name: Check for false capability claims
+        run: python3 tools/check-no-capability-claims.py
+
+      - name: Test the capability-claim lint
+        run: python3 tools/check-no-capability-claims.py --self-test
+
+      # A green stestr run can be a partial one. These are the tests
+      # for the guard that both the integration-core job and the
+      # package matrix now use to tell the difference.
+      - name: Test the stestr run-integrity guard
+        run: tools/ci/test-check-stestr-run.sh
+
       # A bad automated replace once spliced the word "work" into plan
       # filenames named in doc prose, and the result reads like a typo
       # rather than a break -- one sweep fixed seven instances in
@@ -1031,6 +1052,19 @@ jobs:
             echo "Core integration tests failed with exit code ${test_exit_code}"
             exit ${test_exit_code}
           fi
+
+      # The exit code above is not the whole result. A stestr worker
+      # that crashes -- the subunit >4MB packet-size limit is one real
+      # way -- drops every test remaining in it, and the run then
+      # reports a totals block for what it did see and exits 0: a
+      # 454-of-3253 run passed here once. This is the only pull-request
+      # job that runs every integration test, and until #663 it was the
+      # one job that could not tell that run from a full one. The same
+      # guards run in the package matrix, from the same script.
+      - name: Check the core run was not truncated
+        run: |
+          cd ${GITHUB_WORKSPACE}/instar
+          tools/ci/check-stestr-run.sh ${GITHUB_WORKSPACE}/test-output.txt
 
       - name: Test --chain flag (backing chain discovery)
         run: |

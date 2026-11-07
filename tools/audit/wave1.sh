@@ -118,6 +118,51 @@ fi
 green "PASS: mermaid-lint"
 echo
 
+# The info-output parity gate, for the changes it was written for. It
+# builds the merge-base's instar as well as this tree's and requires
+# byte-identical `instar info` output over every differencing fixture,
+# so it is the only check here that can say a parser change left
+# behaviour alone. It was committed as a gate -- its own header says so
+# -- and then wired into nothing, while fourteen later phases touched
+# those crates (#663).
+#
+# Scoped, because it costs a second full build: it runs when the audit
+# scope touches the vhd or vhdx crates, or the script itself. Any
+# change that means to alter info output will fail it, which is the
+# point: say so, by not claiming parity.
+if [[ "$AUDIT_SCOPE_SKIP_SCOPED" -eq 0 ]]; then
+    PARITY_SCOPE=$(audit_scope_names_all \
+        | grep -E '^(src/crates/(vhd|vhdx)/|tools/verify-info-output-parity\.sh$)' \
+        || true)
+else
+    PARITY_SCOPE=""
+fi
+if [[ -n "$PARITY_SCOPE" ]]; then
+    PARITY_BASE="$(git merge-base origin/develop HEAD 2>/dev/null || true)"
+    if [[ -z "$PARITY_BASE" || "$PARITY_BASE" == "$(git rev-parse HEAD)" ]]; then
+        # Nothing to compare against: on develop itself, or with no
+        # origin/develop to compute a merge-base from. Said out loud
+        # rather than skipped quietly, because the files that ask for
+        # this check are in the scope.
+        echo "SKIP: info-output parity -- no merge-base to compare against"
+        echo "      (run \`git fetch origin\` if origin/develop is stale)"
+        while IFS= read -r scoped; do echo "      scope: $scoped"; done \
+            <<< "$PARITY_SCOPE"
+    else
+        bold "=== wave 1a: tools/verify-info-output-parity.sh (vhd/vhdx scope) ==="
+        while IFS= read -r scoped; do echo "  $scoped"; done \
+            <<< "$PARITY_SCOPE"
+        if ! ./tools/verify-info-output-parity.sh; then
+            red "FAIL: instar info output differs from the merge-base build"
+            red "      (if the change means to alter info output, say so and"
+            red "       do not claim parity)"
+            exit 10
+        fi
+        green "PASS: info-output parity"
+    fi
+    echo
+fi
+
 bold "=== wave 1b: mechanical style checks ==="
 
 # 1. Long-line check: warn on Rust source lines over 120 chars in

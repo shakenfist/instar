@@ -28,7 +28,12 @@ Two trees are deliberately not read. `docs/plans/` records what was
 true when each phase was planned, and prescribes the sweeps that made
 it false; `CHANGELOG.md` entries were true for the release they
 describe. Editing either to satisfy this script would falsify a
-record.
+record. `docs/plans/` is skipped by an explicit prefix: it used to be
+skipped only as a side effect of a non-recursive `docs/*.md` glob,
+which also meant the 36 pages under `docs/commentary/`,
+`docs/crates/`, `docs/qcow2/` and the rest were never read at all,
+while the docstring presented the plans exclusion as the deliberate
+part.
 """
 import argparse
 import pathlib
@@ -46,10 +51,20 @@ NEGATED = re.compile(
     r'(?:claim|say|assert|state|impl|imply|mean)\w*\s+(?:that\s+)?$'
 )
 
-GLOBS = ('src/**/*.rs', 'tests/**/*.py', 'docs/*.md')
+GLOBS = (
+    'src/**/*.rs',
+    'tests/**/*.py',
+    'docs/**/*.md',
+    'tools/**/*.py',
+    'scripts/**/*.py',
+)
 # This file quotes the pattern it searches for, so it would always
-# match itself.
+# match itself. The exclusion was unreachable until `tools/**/*.py`
+# joined GLOBS, because no glob reached `tools/`.
 EXCLUDED = ('tools/check-no-capability-claims.py',)
+# Trees whose records were true when written: see the module
+# docstring. A prefix rather than a glob that happens to miss them.
+EXCLUDED_PREFIXES = ('docs/plans/',)
 # Resolved from this file rather than the working directory. Globbed
 # relative to `.`, every pattern matched nothing when the script was
 # run from anywhere but the repository root -- from `tools/`, or from
@@ -62,6 +77,12 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 # needs no maintenance, while still catching a glob that has stopped
 # matching.
 MIN_FILES_SCANNED = 20
+
+
+def excluded(relative):
+    """Whether *relative* (a repo-relative posix path) is not scanned."""
+    return (relative in EXCLUDED
+            or relative.startswith(EXCLUDED_PREFIXES))
 
 
 def paragraphs(text):
@@ -152,7 +173,7 @@ def self_test():
                 1
                 for glob in GLOBS
                 for path in REPO_ROOT.glob(glob)
-                if path.relative_to(REPO_ROOT).as_posix() not in EXCLUDED
+                if not excluded(path.relative_to(REPO_ROOT).as_posix())
             )
         finally:
             os.chdir(here)
@@ -185,7 +206,7 @@ def main():
     for glob in GLOBS:
         for path in sorted(REPO_ROOT.glob(glob)):
             relative = path.relative_to(REPO_ROOT).as_posix()
-            if relative in EXCLUDED:
+            if excluded(relative):
                 continue
             scanned += 1
             for lineno, claim in claims_in(path.read_text()):

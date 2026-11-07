@@ -59,6 +59,10 @@ class TestCommitSmoke(InstarTestBase):
         except subprocess.TimeoutExpired:
             return '', f'Timeout after {timeout}s', -1
 
+    @staticmethod
+    def _digest(path):
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+
 
 # ----------------------------------------------------------------------
 # Error-path tests — pin the host CLI rejection contracts: the
@@ -239,10 +243,6 @@ class TestCommitBackingAllowlist(TestCommitSmoke):
             capture_output=True, text=True, timeout=30)
         self.assertEqual(
             r.returncode, 0, f'qemu-io seed failed: {r.stderr!r}')
-
-    @staticmethod
-    def _digest(path):
-        return hashlib.sha256(path.read_bytes()).hexdigest()
 
     @staticmethod
     def _masked(text, root, image_dir, reference):
@@ -1182,19 +1182,49 @@ class TestCommitSnapshotCow(TestCommitSmoke):
 
     # -- COW parity helpers ---------------------------------------------
 
-    def _qemu_commit_twin(self, instar_overlay):
-        """Copy the instar fixture dir to a sibling qemu twin and
-        `qemu-img commit` it there. Returns (twin_overlay, twin_base).
+    def _pristine_twin(self, instar_overlay):
+        """Copy the fixture dir to a sibling qemu twin, before instar runs.
 
-        The whole fixture directory is copied so the overlay's
-        relative `base.qcow2` backing resolves inside the twin.
+        Returns the twin's overlay path, to hand to
+        `_qemu_commit_twin` after the instar commit. The whole
+        directory is copied so the overlay's relative `base.qcow2`
+        backing resolves inside the twin.
+
+        Call this *before* `run_instar_commit`. `instar commit`
+        modifies the backing in place, so a copy taken afterwards is a
+        copy of instar's own output: `qemu-img commit` in it then
+        re-commits data that is already there, which is a no-op, and
+        the parity assertion compares instar's result against a
+        near-copy of itself. These two tests did exactly that until
+        #571, and passed.
         """
         src_dir = instar_overlay.parent
         twin_dir = src_dir.parent / (src_dir.name + '_qemu')
         shutil.copytree(src_dir, twin_dir)
-        twin_overlay = twin_dir / instar_overlay.name
+        return twin_dir / instar_overlay.name
+
+    def _qemu_commit_twin(self, twin_overlay):
+        """`qemu-img commit` the pristine twin. Returns (overlay, base).
+
+        Takes the path `_pristine_twin` returned, and asserts the
+        commit actually changed the twin's backing. That is the
+        signature of the #571 defect, measured: a twin derived from
+        instar's post-commit state gives a byte-identical base before
+        and after `qemu-img commit`, because there is nothing left to
+        commit. Every fixture here writes data into its overlay, so a
+        reference commit that changes nothing means the reference is
+        not independent, and the parity assertions that follow would
+        be comparing instar against itself.
+        """
+        twin_dir = twin_overlay.parent
+        twin_base = twin_dir / 'base.qcow2'
+        before = self._digest(twin_base)
         self._run_tool(['qemu-img', 'commit', twin_overlay.name], twin_dir)
-        return twin_overlay, twin_dir / 'base.qcow2'
+        self.assertNotEqual(
+            before, self._digest(twin_base),
+            'the reference `qemu-img commit` changed nothing, so the twin '
+            'was not pristine: it must be copied before instar commits')
+        return twin_overlay, twin_base
 
     def _assert_compare_identical(self, a, b):
         r = subprocess.run(
@@ -1243,6 +1273,7 @@ class TestCommitSnapshotCow(TestCommitSmoke):
                         base_snapshot=True,
                         base_post_snapshot_write=psw)
                     snap1_pre = snapshot_readback('qemu-img', base, 'snap1')
+                    twin_pristine = self._pristine_twin(overlay)
 
                     _, stderr, rc = self.run_instar_commit(
                         overlay, timeout=120)
@@ -1251,7 +1282,8 @@ class TestCommitSnapshotCow(TestCommitSmoke):
                         f'COW commit into snapshot-bearing backing failed; '
                         f'stderr={stderr!r}')
 
-                    twin_overlay, twin_base = self._qemu_commit_twin(overlay)
+                    twin_overlay, twin_base = self._qemu_commit_twin(
+                        twin_pristine)
                     # Active-view parity + check clean.
                     self._assert_compare_identical(base, twin_base)
                     self._assert_check_clean(base)
@@ -1300,6 +1332,7 @@ class TestCommitSnapshotCow(TestCommitSmoke):
                         Path(td) / 'fixture', cluster_size=cs,
                         overlay_snapshot=True,
                         overlay_post_snapshot_write=post_write)
+                    twin_pristine = self._pristine_twin(overlay)
 
                     _, stderr, rc = self.run_instar_commit(
                         overlay, timeout=120)
@@ -1308,7 +1341,8 @@ class TestCommitSnapshotCow(TestCommitSmoke):
                         f'COW commit from snapshot-bearing overlay ({shape}) '
                         f'failed; stderr={stderr!r}')
 
-                    twin_overlay, twin_base = self._qemu_commit_twin(overlay)
+                    twin_overlay, twin_base = self._qemu_commit_twin(
+                        twin_pristine)
                     # Backing + overlay active views parity, check clean.
                     self._assert_compare_identical(base, twin_base)
                     self._assert_compare_identical(overlay, twin_overlay)

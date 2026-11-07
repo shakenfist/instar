@@ -45,6 +45,19 @@ nineteen tests only assert that instar refuses an image and leaves it
 byte-identical, so the class takes `_require_qemu_img()` and the one
 zstd test that needs a `qemu-io` write asks for it itself.
 
+**A capability probe has to be able to succeed.** The same invisible
+skip arrives by a second route: a probe that fails on every host,
+whatever it supports. `TestZstdBackingChain`'s probe asked qemu-img to
+create a qcow2 image on `/dev/null`, which fails on every build
+because the result cannot be read back as qcow2, so both its tests
+skipped from the day they were written in February 2026 until #813 was
+fixed — in CI and locally, with nothing to distinguish that from two
+passes. Probe by building the real thing in a temporary directory, and
+assert the result carries what the probe claims: a build that accepted
+`compression_type=zstd` and recorded zlib would otherwise look
+supported, and the comparison that followed would prove nothing about
+ZSTD.
+
 **A `_run_tool` timeout is a hang guard, not a performance
 assertion.** The budget (`QEMU_TOOL_TIMEOUT`, 300s) exists so a wedged
 `qemu-img` cannot block a stestr worker forever; it is not a claim
@@ -1710,6 +1723,33 @@ single kernel fault (#787); under these rules it would have filed five,
 and its log would have said why it stopped.
 `tools/ci/test_differential_fuzz_issues.py` holds both, in `ci-tooling`.
 
+### The libyal oracles are mandatory in CI
+
+qemu-img is not the fuzzer's only reference. The libyal parsers --
+`vmdkinfo`, `vhdiinfo` and `qcowinfo`, from `libvmdk-utils`,
+`libvhdi-utils` and `libqcow-utils` -- are the only *independent* one
+for VMDK, VHD and VHDX: qemu-img shares a family of assumptions with
+instar, and for a differencing child it has no opinion at all.
+
+Each is optional by default, because a developer host need not have the
+packages: a missing tool is warned about, and that format's comparison
+is dropped. The trap is that the run then exits 0 and reports the same
+"N iterations, 0 divergences" as a run that had every oracle, so
+dropping a package from the devcontainer image -- a Dockerfile edit, a
+base-image bump that renames one, a Debian package split -- would halve
+the oracle coverage of every later nightly with nothing turning red.
+
+So `INSTAR_REQUIRE_LIBYAL` makes the tools mandatory: a missing one
+exits 2 naming the tool, its package and the formats that lost their
+cross-check, instead of warning. The nightly workflow sets it, since it
+rebuilds the image that installs all three. This is the same bargain
+`INSTAR_REQUIRE_LIBVHDI` strikes for the integration suite. Every run
+also logs which oracles it used, reports them on its `PASSED` line and
+records them as `libyal_tools` in `summary-<seed>.json`, so a degraded
+run is distinguishable from a clean one after the fact.
+`tools/ci/test_differential_fuzz_oracles.py` holds this, in
+`ci-tooling`.
+
 ### Reproducing a divergence
 
 Each divergence report includes the seed and iteration number. To
@@ -2776,12 +2816,14 @@ None of them needs docker, a venv, testdata or a build.
 not one of the three above: it fails, naming the line, if anything in
 the tree says instar cannot read or compose a differencing image — a
 claim that was true when earlier phases wrote it and became false once
-five operations learned to compose one. It is not wired into
-`pre-commit` or CI; a contributor gets it only by running it, the same
-as this harness.
+five operations learned to compose one. It runs in the `ci-tooling`
+job, with its `--self-test` beside it; until #663 it ran nowhere, and
+the only evidence the convention held was a one-off `exit 0` recorded
+in a plan file.
 
 It reads whole paragraphs — runs of non-blank lines, flattened —
-across `src/**/*.rs`, `tests/**/*.py` and top-level `docs/*.md`, so
+across `src/**/*.rs`, `tests/**/*.py`, `docs/**/*.md`,
+`tools/**/*.py` and `scripts/**/*.py`, so
 Rust comments and block comments, Python docstrings, assertion
 messages and Markdown prose all fall out of one pass. That breadth is
 not incidental. A line-granular grep missed a claim in
