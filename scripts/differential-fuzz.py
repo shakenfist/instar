@@ -46,6 +46,12 @@ _TESTS_DIR = Path(__file__).resolve().parent.parent / 'tests'
 if str(_TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(_TESTS_DIR))
 from helpers.snapshot_readback import snapshot_readback  # noqa: E402
+# The image-writing ops (create, resize, amend, rebase, commit) filter
+# `qemu-img info` JSON through the same helper the integration suite
+# uses, rather than through a copy of it. A copy has to be kept in step
+# by hand, and the rule for the sibling file a multi-file create
+# subformat writes beside its output reached only one of the two.
+from helpers.info_json import normalise_info_json  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -1560,74 +1566,6 @@ def op_measure(instar_bin, instar_copy, qemu_copy, fmt,
 # ---------------------------------------------------------------------------
 # op_create: instar create vs qemu-img create
 # ---------------------------------------------------------------------------
-#
-# Mirrors tests/helpers/info_json.py — keep in sync by hand. A divergence
-# whitelist change in either copy should also land in the other.
-_CREATE_UNIVERSAL_STRIP = {
-    'actual-size', 'dirty-flag',
-    'refcount-block-cache-size', 'l2-cache-size',
-    'l2-cache-entry-size', 'cache-clean-interval',
-}
-_CREATE_TARGET_STRIP = {
-    'qcow2': set(),
-    'vmdk': {'cid', 'parent-cid'},
-    'vhd': set(),
-    'vhdx': {'log-size'},
-    'raw': set(),
-}
-_CREATE_NESTED_INFO_STRIP = {'virtual-size'}
-
-
-def _create_strip_keys(obj, keys):
-    if isinstance(obj, dict):
-        for k in list(obj.keys()):
-            if k in keys:
-                del obj[k]
-            else:
-                _create_strip_keys(obj[k], keys)
-    elif isinstance(obj, list):
-        for item in obj:
-            _create_strip_keys(item, keys)
-
-
-def _create_substitute_filename(obj, tmp_path):
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            if k == 'filename' and isinstance(v, str) and v == tmp_path:
-                obj[k] = '$FILENAME'
-            else:
-                _create_substitute_filename(v, tmp_path)
-    elif isinstance(obj, list):
-        for item in obj:
-            _create_substitute_filename(item, tmp_path)
-
-
-def _normalise_create_info(obj, target, tmp_path):
-    """Strip divergence-whitelist fields and substitute $FILENAME.
-
-    Returns a normalised deep copy ready for dict-equality comparison
-    against another normalised side.
-    """
-    import copy as _copy
-    result = _copy.deepcopy(obj)
-    strip = set(_CREATE_UNIVERSAL_STRIP)
-    strip.update(_CREATE_TARGET_STRIP.get(target, set()))
-    _create_strip_keys(result, strip)
-    # Nested children[*].info: strip the wrapping-file physical size
-    # (writer-layout artefact; the top-level virtual-size is the
-    # contract field and stays).
-    if isinstance(result, dict):
-        children = result.get('children')
-        if isinstance(children, list):
-            for child in children:
-                if isinstance(child, dict):
-                    info = child.get('info')
-                    if isinstance(info, dict):
-                        for k in _CREATE_NESTED_INFO_STRIP:
-                            info.pop(k, None)
-    _create_substitute_filename(result, tmp_path)
-    return result
-
 
 def _create_option_picker(rng):
     """Pick a (target, size_str, options_list) triple biased to avoid
@@ -1782,8 +1720,8 @@ def op_create(instar_bin, instar_copy, qemu_copy, fmt, timeout, rng):
             'qemu_info_stdout': qemu_info_out[:500],
         }
 
-    inst_norm = _normalise_create_info(inst_json, target, str(inst_path))
-    qemu_norm = _normalise_create_info(qemu_json, target, str(qemu_path))
+    inst_norm = normalise_info_json(inst_json, target, str(inst_path))
+    qemu_norm = normalise_info_json(qemu_json, target, str(qemu_path))
 
     if inst_norm != qemu_norm:
         return {
@@ -2052,8 +1990,8 @@ def op_resize(instar_bin, instar_copy, qemu_copy, fmt, timeout, rng):
             'qemu_info_stdout': qemu_info_out[:500],
         }
 
-    inst_norm = _normalise_create_info(inst_json, target, str(inst_path))
-    qemu_norm = _normalise_create_info(qemu_json, target, str(qemu_path))
+    inst_norm = normalise_info_json(inst_json, target, str(inst_path))
+    qemu_norm = normalise_info_json(qemu_json, target, str(qemu_path))
 
     if inst_norm != qemu_norm:
         return {
@@ -2237,8 +2175,8 @@ def op_amend(instar_bin, instar_copy, qemu_copy, fmt, timeout, rng):
             'qemu_info_stdout': qemu_info_out[:500],
         }
 
-    inst_norm = _normalise_create_info(inst_json, 'qcow2', str(inst_path))
-    qemu_norm = _normalise_create_info(qemu_json, 'qcow2', str(qemu_path))
+    inst_norm = normalise_info_json(inst_json, 'qcow2', str(inst_path))
+    qemu_norm = normalise_info_json(qemu_json, 'qcow2', str(qemu_path))
 
     if inst_norm != qemu_norm:
         return {
@@ -3533,9 +3471,9 @@ def op_rebase(instar_bin, instar_copy, qemu_copy, fmt, timeout, rng):
             'qemu_info_stdout': qemu_info_out[:500],
         }
 
-    inst_norm = _normalise_create_info(
+    inst_norm = normalise_info_json(
         inst_json, target, str(inst_overlay))
-    qemu_norm = _normalise_create_info(
+    qemu_norm = normalise_info_json(
         qemu_json, target, str(qemu_overlay))
 
     # The instar-side and qemu-side new backing files live at
@@ -3790,9 +3728,9 @@ def op_commit(instar_bin, instar_copy, qemu_copy, fmt, timeout, rng):
                 'qemu_info_stdout': qemu_info_out[:500],
             }
 
-        inst_norm = _normalise_create_info(
+        inst_norm = normalise_info_json(
             inst_json, target, str(inst_path))
-        qemu_norm = _normalise_create_info(
+        qemu_norm = normalise_info_json(
             qemu_json, target, str(qemu_path))
 
         # The overlay info JSON references the backing's
