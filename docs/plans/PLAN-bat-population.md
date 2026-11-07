@@ -719,7 +719,7 @@ rather than merge requests.
 | 8. `convert -O vhdx --subformat fixed` | [PLAN-bat-population-phase-08-convert.md](PLAN-bat-population-phase-08-convert.md) | Complete | `e49b6275` (#874) |
 | 9. `measure -O vhdx -o subformat=fixed` | [PLAN-bat-population-phase-09-measure.md](PLAN-bat-population-phase-09-measure.md) | Complete | `3b74ba8d` (#877) |
 | 10. Cross-version matrix and derived-profile validation | [PLAN-bat-population-phase-10-matrix.md](PLAN-bat-population-phase-10-matrix.md) | Complete | `e0b0fe13` (#881) |
-| 11. Coverage and differential fuzzing | PLAN-bat-population-phase-11-fuzz.md | Not started | |
+| 11. Coverage and differential fuzzing | [PLAN-bat-population-phase-11-fuzz.md](PLAN-bat-population-phase-11-fuzz.md) | In progress | |
 | 12. Documentation | PLAN-bat-population-phase-12-docs.md | Not started | |
 | 13. Push audit: `PUSH-AUDIT.md` over every phase above | PLAN-bat-population-phase-13-push-audit.md | Not started | |
 
@@ -959,9 +959,26 @@ and the filler's invariants (every payload entry in range, every
 sector-bitmap slot zero, offsets strictly increasing and 1 MiB
 aligned, nothing past the region), adds a target for the filler at
 arbitrary index ranges, and teaches the differential fuzzer's create
-and convert pickers the fixed subformat, `block_state_zero`, the
-non-qcow2 preallocation modes and monolithicFlat, comparing through
-the structural comparator for VHDX.
+picker the fixed subformat, `block_state_zero`, the non-qcow2
+preallocation modes and monolithicFlat.
+
+Phase 11's survey corrected four things this paragraph used to
+assume. The differential fuzzer hand-mirrors
+`tests/helpers/info_json.py` and the mirror never gained phase 10's
+sibling-file rule, so a monolithicFlat pick would report the two
+sides' differing `-flat` extent paths as a divergence on every
+iteration; the mirror is replaced by an import before any picker
+changes. The fuzzer excludes the `vhd` create target entirely for a
+CHS virtual-size rounding divergence that is still live, so the
+non-qcow2 preallocation coverage reaches vmdk and vhdx only, and
+vpc's no-op stays covered by the host tests and phase 10's
+baselines. There is no convert *picker* to teach: `op_convert`
+chooses only raw and qcow2, and for non-raw targets it flattens both
+outputs to raw and compares bytes -- an oracle blind to every layout
+property the fixed subformat exists to get right -- so phase 11 adds
+a structural comparison arm rather than a picker entry. And the
+comment in `fuzz_create_emitters` saying fixed output reaches no
+caller has been false since phases 7 and 8.
 
 **Phase 12** carries the cross-cutting documentation. Per-phase pages
 change in their own phases (see the constraints below); phase 12 is
@@ -1546,6 +1563,25 @@ We should list obvious extensions, known issues, unrelated bugs we
 encountered, and anything else we should one day do but have
 chosen to defer to here, so that we do not forget them.
 
+* A `vpc` create target for the differential fuzzer. It is excluded
+  today (`scripts/differential-fuzz.py`'s `_create_option_picker`)
+  because qemu-img rounds a VHD's virtual size up to CHS geometry and
+  instar writes the exact byte count, so every iteration would
+  diverge on `virtual-size` for a reason unrelated to whatever else
+  it is testing. Closing it means either resolving that divergence or
+  masking the field, and masking it blinds the comparison to the
+  field most worth checking in a VHD writer. Phase 11 left it out,
+  which is why the differential fuzzer covers the non-qcow2
+  preallocation no-op for vmdk and vhdx but not vpc; the five
+  `KNOWN_WRITER_DIVERGENCES` vhd entries in `tests/test_create.py`
+  and the two `test_vpc_*_noop_preallocation` tests are the current
+  coverage.
+* Wiring the fuzz targets phase 11 added (`fuzz_vhdx_fixed_bat`, and
+  `fuzz_create_emitters`' widened VHDX arm) into the coverage-fuzz CI
+  schedule. Phase 11 committed and documented them but left the
+  schedule alone, because the target list and time budget are a
+  CI-cost decision and the merge queue's provisioning is its own live
+  issue.
 * VMDK `twoGbMaxExtentSparse` and `twoGbMaxExtentFlat` output, the
   remaining leaf of the same goal. The streaming filler this plan
   builds is the shape a grain-table writer would want; the multiple
