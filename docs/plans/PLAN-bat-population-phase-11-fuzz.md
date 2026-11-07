@@ -616,6 +616,32 @@ function, `truncated_inside_region`, and removed nothing. All five
 consuming test modules still import names that exist, and
 `test_helpers` is 40 OK, reproduced by the management session.
 
+**Mutation harnesses and the running count.** Nine mutants across the
+two Rust steps, each killed by the assertion it targets rather than by
+a different one firing first. 11a's five -- a wrong entry count, an
+offset outside the payload region, non-monotonic offsets, a sub-MiB
+offset and a non-zero sector-bitmap slot -- are in
+`scratchpad/11a/mutate.py`; 11b's four -- a sub-MiB offset, a skipped
+last entry, a filled sector-bitmap slot, and a slot filled as payload
+only when it falls at a call's first index -- are in
+`scratchpad/11b/mutate.py`, which extends 11a's and reuses its tree
+copy, both under this session's scratch root
+`/srv/nobackups/claude-tmp/claude-1000/-srv-kasm-profiles-mikal-vscode-src-shakenfist-instar/6a4545b4-9585-4a35-9845-8a8f9c2c83ea/`.
+The last of 11b's is the one worth keeping: it is invisible to a single
+whole-range call and only the partition property catches it. The
+management session reproduced one mutant from each step independently,
+confirming `Compiling vhdx` in the log first so the verdict could not
+come from a stale object.
+
+**The integration suite ran against instar-testdata `f73d43670a`**,
+which is the revision phase 10 validated and landed against. Its
+`main` had moved two commits further by the time this phase ran -- the
+fuzz automation moves it daily -- and those were deliberately not
+pulled, because phase 11 changes no baseline and no test expectation
+that depends on testdata, so the validated revision isolates this
+phase's changes. CI clones testdata's default branch unpinned, so CI
+will run against whatever `main` holds then.
+
 ## Back brief
 
 Points needing the operator's answer before any step runs:
