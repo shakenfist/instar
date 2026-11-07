@@ -105,6 +105,17 @@ It performs (and exits non-zero on any failure):
   `src/fuzz` crate is outside the main workspace, so this
   catches a fuzz target drifting out of sync with a
   workspace struct change before it fails in coverage-fuzz CI)
+- `tools/verify-info-output-parity.sh`, but only when the
+  audit scope touches `src/crates/vhd/`, `src/crates/vhdx/`
+  or the script itself. It builds the merge-base's instar
+  as well as this tree's and requires byte-identical
+  `instar info` output over every differencing fixture, so
+  it costs a second full build and earns it only for the
+  changes it was written for. A change that means to alter
+  info output will fail it; say so rather than claiming
+  parity. Skipped, out loud, when there is no merge-base to
+  compare against (on `develop`, or with no
+  `origin/develop`)
 - `tools/mermaid-lint.sh` (renders every mermaid diagram in
   the tree through the upstream mermaid-cli container;
   mermaid fails at render time, so a broken diagram commits
@@ -130,6 +141,7 @@ Exit codes:
 | 6    | could not enter the repo root  |
 | 7    | `make fuzz-build` failed       |
 | 8    | `tools/mermaid-lint.sh` failed |
+| 10   | `instar info` output differs from the merge-base build |
 | 9    | could not resolve a usable audit scope (bad `--range`/`--commits-file`, or an explicitly-given `--range`/`--commits-file` resolved to zero files -- the implicit `develop...HEAD` default resolving to zero files is not an error) |
 
 If wave 1 fails, fix the cause and re-run before

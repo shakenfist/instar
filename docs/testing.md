@@ -2816,12 +2816,14 @@ None of them needs docker, a venv, testdata or a build.
 not one of the three above: it fails, naming the line, if anything in
 the tree says instar cannot read or compose a differencing image — a
 claim that was true when earlier phases wrote it and became false once
-five operations learned to compose one. It is not wired into
-`pre-commit` or CI; a contributor gets it only by running it, the same
-as this harness.
+five operations learned to compose one. It runs in the `ci-tooling`
+job, with its `--self-test` beside it; until #663 it ran nowhere, and
+the only evidence the convention held was a one-off `exit 0` recorded
+in a plan file.
 
 It reads whole paragraphs — runs of non-blank lines, flattened —
-across `src/**/*.rs`, `tests/**/*.py` and top-level `docs/*.md`, so
+across `src/**/*.rs`, `tests/**/*.py`, `docs/**/*.md`,
+`tools/**/*.py` and `scripts/**/*.py`, so
 Rust comments and block comments, Python docstrings, assertion
 messages and Markdown prose all fall out of one pass. That breadth is
 not incidental. A line-granular grep missed a claim in

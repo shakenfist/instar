@@ -374,85 +374,16 @@ set +e
 STESTR_RC=${PIPESTATUS[0]}
 set -e
 
-# Truncation guard. A stestr worker that dies mid-stream (the subunit v2
-# packet-size limit is one real way: a test attaching more than ~4MB of
-# captured output raises "ValueError: Length too long") silently drops
-# every remaining test in that worker. stestr then reports a totals block
-# for the tests it did see and exits 0 if none of them failed -- a
-# partial run that looks green. Never let that pass as a result.
-if grep -q "Length too long" /tmp/stestr-output.txt; then
-    echo "" >&2
-    echo "Error: a stestr worker died on the subunit packet-size limit" >&2
-    echo "(a test attached >4MB of captured output). The run is PARTIAL:" >&2
-    echo "the tests remaining in that worker never executed." >&2
+# Is this run a result at all? A crashed stestr worker, a worker lost
+# to the subunit packet-size limit, a run shorter than its own
+# discovery, and a selection in which every test skipped all exit 0
+# with a totals block that reads like a pass. The guards live in
+# tools/ci/check-stestr-run.sh so this script and the integration-core
+# CI job share one implementation rather than one having them and the
+# other not (#663).
+if ! /workspace/tools/ci/check-stestr-run.sh /tmp/stestr-output.txt "$EXPECTED"; then
     exit 1
 fi
-if grep -qE "^ - Worker [0-9]+ \([0-9]+ tests\) => N/A" /tmp/stestr-output.txt; then
-    echo "" >&2
-    echo "Error: stestr reported a worker with no elapsed time (N/A)," >&2
-    echo "which means that worker crashed rather than finishing. The run" >&2
-    echo "is PARTIAL and its result is not trustworthy." >&2
-    exit 1
-fi
-# Length floor, against the count discovered above rather than a
-# constant, so it covers every selection instead of only an unselected
-# full run. The previous form was keyed on SELECT_RE being empty, which
-# meant any selected run -- including the merge-queue gate once that
-# started passing a selector -- skipped this check entirely, and a
-# truncated gate run reads as green.
-RAN=$(sed -n "s/^Ran: \([0-9]*\) tests.*/\1/p" /tmp/stestr-output.txt | tail -n1)
-if [ -z "$RAN" ]; then
-    echo "" >&2
-    echo "Error: stestr printed no \"Ran: N tests\" total, so the run" >&2
-    echo "length cannot be checked. Treat it as a failure." >&2
-    exit 1
-fi
-if [ "$RAN" -lt "$EXPECTED" ]; then
-    echo "" >&2
-    echo "Error: run executed $RAN tests, fewer than the $EXPECTED ids" >&2
-    echo "discovery found for this selection. Since load-time cases make" >&2
-    echo "a real run longer than the listing, not shorter, the run was" >&2
-    echo "truncated; treat it as a failure, not a pass." >&2
-    exit 1
-fi
-
-# Skip floor, the complement of the length floor above. A skipped test
-# reports a result, so it counts towards "Ran", which means a selection
-# in which every test skipped satisfies the floor exactly as a
-# selection in which every test executed. That is not hypothetical
-# here: every test in the nightly selection calls skipTest when its VHD
-# fixture is missing, so one absent file would give a green leg that
-# tested nothing. The length floor cannot see it, because the count is
-# right.
-#
-# The rule is "nothing executed at all" and not "fewer than some
-# fraction executed", and the reason is that there is no legitimate
-# skip rate to compare against. Skips are a property of the distro, not
-# of the change: the EL streams that cannot install qemu-storage-daemon
-# skip the whole bitmap oracle set, every distro skips whichever
-# fixtures its qemu cannot produce, and the full suite legitimately
-# skips hundreds. Any fraction tight enough to catch a real loss on
-# Debian would fail Rocky on a good night. Zero executed tests needs no
-# tuning, is never legitimate, and is the shape every realistic cause
-# of a silently-empty run takes.
-#
-# One deliberate consequence: a hand-run --select whose every case
-# skips on this distro now fails rather than passing. That run did not
-# test anything either, and saying so is the point.
-SKIPPED=$(sed -n "s/^ *- Skipped: \([0-9]*\).*/\1/p" /tmp/stestr-output.txt | tail -n1)
-SKIPPED=${SKIPPED:-0}
-EXECUTED=$((RAN - SKIPPED))
-if [ "$EXECUTED" -le 0 ]; then
-    echo "" >&2
-    echo "Error: all $RAN tests in this selection skipped; nothing was" >&2
-    echo "actually executed. A skip counts towards the \"Ran\" total" >&2
-    echo "that stestr prints, so this run passes the length floor above" >&2
-    echo "while testing nothing at all. The usual cause is missing test" >&2
-    echo "fixtures, so check the testdata preparation rather than the" >&2
-    echo "tests." >&2
-    exit 1
-fi
-echo "$EXECUTED of $RAN tests executed, $SKIPPED skipped"
 
 # Derive the timing data, if this run was asked to measure. Deliberately
 # after the truncation guards and before the verdict: a truncated run

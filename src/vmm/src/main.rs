@@ -4121,13 +4121,21 @@ fn write_chain_config(
     guest_mem: &GuestMemoryMmap,
     chain: &BackingChain,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Refused rather than logged. The entry writer stops at
+    // MAX_CHAIN_DEVICES, so a chain longer than that was silently
+    // truncated here and the guest was handed a prefix of the chain it
+    // asked about -- a wrong read, reported as a success, with only a
+    // debug line to say so. Every caller refuses a too-deep chain
+    // before reaching this point, so this is unreachable today and is
+    // the backstop for the first caller that forgets to.
     if chain.total_devices() > MAX_CHAIN_DEVICES {
-        debug!(
-            "Chain truncated: {} devices exceeds maximum of {}, only first {} will be passed",
+        return Err(format!(
+            "chain depth {} exceeds maximum of {} devices; \
+             refusing to pass a truncated chain to the guest",
             chain.total_devices(),
-            MAX_CHAIN_DEVICES,
             MAX_CHAIN_DEVICES
-        );
+        )
+        .into());
     }
 
     // Write device entries (handles data file insertion) before the
@@ -4184,6 +4192,39 @@ mod chain_config_writer_tests {
             chain.push(image);
         }
         chain
+    }
+
+    #[test]
+    fn write_chain_config_refuses_a_chain_deeper_than_the_guest_can_hold() {
+        let guest_mem =
+            GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(CHAIN_CONFIG_ADDR), 0x2000)])
+                .expect("guest memory");
+        let deep = chain(
+            (0..MAX_CHAIN_DEVICES + 1)
+                .map(|_| image(ImageFormat::Qcow2, 0, &[]))
+                .collect(),
+        );
+        let err = write_chain_config(&guest_mem, &deep)
+            .expect_err("a chain the guest cannot hold must be refused");
+        let message = err.to_string();
+        // The depth and the limit both have to be in the message: the
+        // caller that hits this is the one that forgot to check, and
+        // the numbers are what says by how much.
+        assert!(
+            message.contains(&(MAX_CHAIN_DEVICES + 1).to_string())
+                && message.contains(&MAX_CHAIN_DEVICES.to_string()),
+            "message must name the depth and the limit: {message}"
+        );
+
+        // The boundary itself is accepted, so the refusal is not one
+        // device early.
+        let at_limit = chain(
+            (0..MAX_CHAIN_DEVICES)
+                .map(|_| image(ImageFormat::Qcow2, 0, &[]))
+                .collect(),
+        );
+        write_chain_config(&guest_mem, &at_limit)
+            .expect("a chain exactly at the limit must be written");
     }
 
     #[test]
