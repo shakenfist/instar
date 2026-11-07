@@ -1563,6 +1563,17 @@ We should list obvious extensions, known issues, unrelated bugs we
 encountered, and anything else we should one day do but have
 chosen to defer to here, so that we do not forget them.
 
+* qemu-img writes a fixed VHDX it cannot then read, at a geometry
+  whose last payload block is partial and with `block_state_zero=off`.
+  Measured on qemu-img 10.0.13: creating a 4608.5M image with 1 MiB
+  blocks succeeds, and `qemu-img info` on it then fails with "VHDX BAT
+  entry 4609 end offset ... points after end of file ... Image has
+  probably been truncated". This is the other tool's defect, not
+  instar's #879, and the two should not be conflated when either is
+  worked on; it is why phase 11's create picker holds fixed sizes to
+  whole multiples of the block size. Worth reporting upstream, and
+  worth a quirks entry once someone decides which of the two tools is
+  right about such a geometry.
 * `src/fuzz` is excluded from the cargo workspace
   (`src/Cargo.toml`, `exclude = ["fuzz"]`), so neither `make lint` nor
   CI's rustfmt and clippy has ever checked a fuzz target. Found while

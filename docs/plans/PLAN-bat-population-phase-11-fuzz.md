@@ -511,6 +511,50 @@ hooks are Rust, CI-config and shell checks -- so the step ran flake8 in
 a scratch venv as well. It reports four E127s, the same four present
 before the change and none on changed lines.
 
+**Step 11d found no divergence, and the shapes are genuinely drawn.**
+The step reported 300 iterations at a fixed seed with 883 create draws
+and zero divergences, every new shape hit at least 16 times. The
+management session reproduced the verdict at an independent seed rather
+than replaying the step's: 80 iterations, zero divergences. The sibling
+rule was measured firing rather than assumed -- 24 of 24 monolithicFlat
+images carried a side-specific extent name in the raw `qemu-img info`
+output and all 24 normalised to `$FILENAME-flat`, in three places per
+image (the top-level extent, `children.extents.0` and
+`format-specific.extents`).
+
+**A qemu-img bug, reproduced by the management session.** The step's
+justification for holding fixed sizes to whole multiples of the block
+size is not instar's #879 but a defect in the other tool, and it was
+re-measured here rather than taken from the report: qemu-img 10.0.13
+creates a fixed VHDX with `block_state_zero=off` at a partial-last-block
+geometry and then cannot open the file it has just written --
+`qemu-img create -f vhdx -o
+subformat=fixed,block_state_zero=off,block_size=1M probe.vhdx 4608.5M`
+succeeds, and `qemu-img info probe.vhdx` then fails with "VHDX BAT entry
+4609 end offset 4841275391 points after end of file (4840751104). Image
+has probably been truncated." Both sides would fail the info read-back
+at such a geometry, so the comparison would never happen. Recorded in
+the master plan's Future work; it is the other tool's bug and is kept
+separate from #879, which is instar's.
+
+**Two judgement calls the step flagged, both kept.** The vhdx arm draws
+`subformat` from `[None, 'dynamic', 'fixed']`, where `None` preserves
+the arm's existing unset-default coverage on the same reasoning that
+keeps `block_size`'s `None` -- an unset option is a shape in its own
+right, and the one qemu's own default picks. And the fixed size list is
+the dynamic arm's minus its largest entry, so an iteration does not
+declare a gigabyte of dense file; that is a cost decision, separate
+from the partial-last-block one above, and the comment states both
+reasons rather than conflating them.
+
+**The step corrected the picker docstring's own vocabulary**, which the
+management session had not asked for and has kept: the exclusion said
+"vhd target entirely (CHS-geometry rounding divergence)" where the
+fuzzer's own target name is `vpc` and the divergence is specifically on
+`virtual-size`. It also checked the docstring's three pre-existing
+claims against the live tools instead of assuming them, and all three
+hold.
+
 ## Back brief
 
 Points needing the operator's answer before any step runs:
