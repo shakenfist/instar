@@ -180,6 +180,17 @@ Beyond the Rust hooks, `pre-commit run --all-files` also runs:
   the `Agent context` check.
 - `actionlint` over `.github/workflows/`, and `shellcheck` over
   `scripts/` and `tools/`.
+- `docs-line-references`, which fails when documentation cites a source
+  line number, in either the `file.rs:NNN` form or a prose form such as
+  "(line NNN)", "lines NNN-NNN" or "at line NNN" (spelled with digits,
+  which this page cannot do without tripping the hook that reads it).
+  Both rot on the next
+  edit to the code they point into, in a change that never touches the
+  document, and then point at something unrelated; name the function,
+  class or constant instead, or use a permalink pinned to a commit SHA.
+  It covers `docs/` (excluding `docs/plans/`, which records what was
+  true when each phase was planned), `README.md`, `AGENTS.md`,
+  `ARCHITECTURE.md` and the skills under `.claude/`.
 - `binary-sizes`, which checks the built binaries against the guest
   memory layout, and `devcontainer-pins`, which fails if the two
   devcontainer Dockerfiles disagree about the Rust nightly or about the

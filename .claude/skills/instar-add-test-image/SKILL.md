@@ -56,7 +56,7 @@ every baseline, so keep it filesystem-safe:
 sha256sum ../instar-testdata/<path-to-image>
 ```
 
-Verified at test time (`tests/base.py:360`). If the image changes without its
+Verified at test time by `verify_image_hash()` in `tests/base.py`. If the image changes without its
 baselines being regenerated, the test skips with a clear message rather than
 failing with a confusing diff.
 
@@ -175,7 +175,7 @@ These get **no baselines** — every malformed entry in the manifest has zero,
 which is why `--all-images` is not part of the workflow above.
 
 Be aware of what registering one does and does not buy you. `expected_error` is
-parsed into the `TestImage` dataclass (`tests/helpers/types.py:20`) but no test
+parsed into the `TestImage` dataclass (`tests/helpers/types.py`) but no test
 asserts against it; it is documentation of the contract, not an executable one.
 `tests/test_info_malicious.py` is a stub whose `scenarios` list is entirely
 commented out, so it always skips. There is no `tests/expected_outputs/`
@@ -230,7 +230,7 @@ implementation gets graded against.
 **Fields normalised before comparison.** Do not chase diffs in these:
 
 - `disk size` / `actual-size` is substituted from the live filesystem
-  (`tests/helpers/comparators.py:111`), because it is allocation state, not a
+  (`substitute_actual_size()` in `tests/helpers/comparators.py`), because it is allocation state, not a
   format decision. Baseline values for it are cosmetic.
 - vmdk `cid`/`parent-cid`, the dirty flag and vhdx log-size are stripped by
   `assert_info_equivalent`. A vmdk content ID is a random nonce.
