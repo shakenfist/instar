@@ -13,12 +13,18 @@ missing tool raises; without it, the run degrades as before.
 
 `shutil.which` is replaced rather than relying on what this host has
 installed, so the tests give the same answer on a developer machine and
-in the container.
+in the container. It is patched through `unittest.mock.patch` on
+`shutil.which` itself: the fuzzer holds the stdlib module, not a
+module-local alias, so assigning to `df.shutil.which` would replace
+`shutil.which` for every other test in the same `unittest discover`
+run. Patching it by name says so, and restores it on error as well as
+on success.
 """
 
 import os
 import types
 import unittest
+from unittest import mock
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _DF_PATH = os.path.join(_HERE, '..', '..', 'scripts', 'differential-fuzz.py')
@@ -45,34 +51,42 @@ df = _load(_DF_PATH, 'differential_fuzz')
 # and only noise in a test.
 df.logger.disabled = True
 
-ALL_TOOLS = ('vmdkinfo', 'vhdiinfo', 'qcowinfo')
+# Derived, not written out: a fourth tool added to the format map must
+# appear in these tests without anyone remembering to add it here.
+ALL_TOOLS = tuple(sorted(set(df.LIBYAL_TOOLS.values())))
 
 
 class WhichStub:
-    """Stand in for shutil.which over a fixed set of installed tools."""
+    """Stand in for shutil.which over a fixed set of installed tools.
+
+    Records what it was asked for, so a test can assert which tools the
+    detector actually probed rather than only what it returned.
+    """
 
     def __init__(self, installed):
         self.installed = set(installed)
+        self.queried = []
 
     def __call__(self, name):
+        self.queried.append(name)
         return f'/usr/bin/{name}' if name in self.installed else None
 
 
 class DetectLibyalToolsTest(unittest.TestCase):
 
     def setUp(self):
-        self.real_which = df.shutil.which
-        self.addCleanup(setattr, df.shutil, 'which', self.real_which)
         self.real_environ = dict(os.environ)
         self.addCleanup(self._restore_environ)
+        self.stub = None
 
     def _restore_environ(self):
         os.environ.clear()
         os.environ.update(self.real_environ)
 
     def _detect(self, installed, **kwargs):
-        df.shutil.which = WhichStub(installed)
-        return df.detect_libyal_tools(**kwargs)
+        self.stub = WhichStub(installed)
+        with mock.patch('shutil.which', self.stub):
+            return df.detect_libyal_tools(**kwargs)
 
     def test_all_present_returns_every_path(self):
         tools = self._detect(ALL_TOOLS, require=True)
@@ -123,6 +137,17 @@ class DetectLibyalToolsTest(unittest.TestCase):
         # one code path that only runs when something is already wrong.
         for tool in set(df.LIBYAL_TOOLS.values()):
             self.assertIn(tool, df.LIBYAL_PACKAGES)
+
+    def test_every_tool_in_the_format_map_is_probed(self):
+        # The other half of that relationship, and the one with teeth: a
+        # tool the detector never looks for is never reported missing,
+        # so a format would lose its only independent cross-check and
+        # the run would still print "0 divergences". Asserted on what
+        # `which` was asked for, not on what came back, because an
+        # unprobed tool and an installed one both leave no complaint.
+        self._detect(ALL_TOOLS, require=True)
+        for tool in set(df.LIBYAL_TOOLS.values()):
+            self.assertIn(tool, self.stub.queried)
 
 
 if __name__ == '__main__':

@@ -4125,9 +4125,16 @@ fn write_chain_config(
     // MAX_CHAIN_DEVICES, so a chain longer than that was silently
     // truncated here and the guest was handed a prefix of the chain it
     // asked about -- a wrong read, reported as a success, with only a
-    // debug line to say so. Every caller refuses a too-deep chain
-    // before reaching this point, so this is unreachable today and is
-    // the backstop for the first caller that forgets to.
+    // debug line to say so.
+    //
+    // Reachable, not merely a backstop. `security.max_chain_depth` (16
+    // by default, and configurable upwards) counts images, while
+    // total_devices() counts images plus the external data files that
+    // each take a device slot of their own, so a chain standing at the
+    // depth limit whose top image has a qcow2 external data file is 17
+    // devices. run_check and execute_convert refuse that themselves
+    // before reaching here; run_commit_guest and run_bench_guest have
+    // no device-budget guard of their own and arrive with it.
     if chain.total_devices() > MAX_CHAIN_DEVICES {
         return Err(format!(
             "chain depth {} exceeds maximum of {} devices; \

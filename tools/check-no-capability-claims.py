@@ -64,7 +64,18 @@ GLOBS = (
 EXCLUDED = ('tools/check-no-capability-claims.py',)
 # Trees whose records were true when written: see the module
 # docstring. A prefix rather than a glob that happens to miss them.
-EXCLUDED_PREFIXES = ('docs/plans/',)
+#
+# The build trees are here for a different reason: `src/**/*.rs` and
+# `tests/**/*.py` reach generated and vendored code once a tree has
+# been built, and pathlib's globs match dotted directories, so a
+# developer with src/target/ and tests/.venv/ present scanned 1199
+# files where CI's fresh checkout scans 277. Those 922 files are not
+# this repository's claims, a vendored crate's comment would be
+# reported against a path nobody can edit, and the two counts
+# disagreeing makes the number this prints useless as evidence. The
+# self-test asserts nothing git ignores is scanned, so the next build
+# directory does not have to be remembered here.
+EXCLUDED_PREFIXES = ('docs/plans/', 'src/target/', 'tests/.venv/')
 # Resolved from this file rather than the working directory. Globbed
 # relative to `.`, every pattern matched nothing when the script was
 # run from anywhere but the repository root -- from `tools/`, or from
@@ -74,8 +85,15 @@ EXCLUDED_PREFIXES = ('docs/plans/',)
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 # The floor below which an empty scan is a broken checker rather than a
 # clean tree. Deliberately far under the real count (hundreds) so it
-# needs no maintenance, while still catching a glob that has stopped
-# matching.
+# needs no maintenance.
+#
+# It is the weaker of the two floors, and only a backstop against a
+# total collapse. It was sized for three globs and cannot catch one
+# glob going quiet now that there are five: any one of them could stop
+# matching -- the precise failure a floor exists to catch -- while the
+# other four keep the total in the thousands. So every glob must also
+# match at least one file it is allowed to read, which is a floor that
+# needs no number at all.
 MIN_FILES_SCANNED = 20
 
 
@@ -83,6 +101,27 @@ def excluded(relative):
     """Whether *relative* (a repo-relative posix path) is not scanned."""
     return (relative in EXCLUDED
             or relative.startswith(EXCLUDED_PREFIXES))
+
+
+def scan_paths():
+    """Return {glob: [repo-relative posix path, ...]} for every glob.
+
+    One implementation for the real scan and for the self-test, so the
+    self-test cannot pass against a set of files the scan does not read.
+    """
+    found = {}
+    for glob in GLOBS:
+        found[glob] = [
+            path.relative_to(REPO_ROOT).as_posix()
+            for path in sorted(REPO_ROOT.glob(glob))
+            if not excluded(path.relative_to(REPO_ROOT).as_posix())
+        ]
+    return found
+
+
+def empty_globs(found):
+    """Which globs matched no file they are allowed to read."""
+    return [glob for glob, paths in found.items() if not paths]
 
 
 def paragraphs(text):
@@ -158,6 +197,17 @@ def self_test():
             bad += 1
         else:
             print(f'ok   {"flags" if expected else "clears"}: {description}')
+    checks = len(SELF_TEST_CASES)
+
+    def check(ok, passed, failed):
+        nonlocal bad, checks
+        checks += 1
+        if ok:
+            print(f'ok   {passed}')
+        else:
+            print(f'FAIL {failed}')
+            bad += 1
+
     # The pattern cases above are all this used to check, and a pattern
     # that works proves nothing if the scan never reaches a file. Run
     # the real glob from a directory that is not the repository root,
@@ -169,25 +219,82 @@ def self_test():
         here = os.getcwd()
         try:
             os.chdir(elsewhere)
-            found = sum(
-                1
-                for glob in GLOBS
-                for path in REPO_ROOT.glob(glob)
-                if not excluded(path.relative_to(REPO_ROOT).as_posix())
-            )
+            found = scan_paths()
         finally:
             os.chdir(here)
-    if found < MIN_FILES_SCANNED:
-        print(f'FAIL the scan reads only {found} file(s) from a working '
-              f'directory other than the repository root')
+    total = sum(len(paths) for paths in found.values())
+    check(total >= MIN_FILES_SCANNED,
+          f'reads {total} files regardless of working directory',
+          f'the scan reads only {total} file(s) from a working directory '
+          f'other than the repository root')
+
+    empty = empty_globs(found)
+    check(not empty,
+          'every glob matches at least one file it may read',
+          f'these globs match nothing: {", ".join(empty)}')
+
+    # The two halves of the widening that the pattern cases cannot see:
+    # a docs tree below the top level is read, and docs/plans/ is not.
+    # Without these, a later edit that put back the non-recursive
+    # `docs/*.md` glob -- the blind spot that hid 36 pages, including
+    # every commentary page -- would self-test clean.
+    scanned = {path for paths in found.values() for path in paths}
+    nested_docs = sorted(p for p in scanned
+                         if p.startswith('docs/') and p.count('/') >= 2)
+    check(bool(nested_docs),
+          f'reads nested docs pages ({len(nested_docs)}, e.g. '
+          f'{nested_docs[0] if nested_docs else ""})',
+          'no docs page below docs/ itself is scanned, so the glob is '
+          'back to the non-recursive form')
+
+    plans = sorted(p for p in scanned if p.startswith('docs/plans/'))
+    check(not plans,
+          'reads nothing under docs/plans/',
+          f'{len(plans)} file(s) under docs/plans/ are scanned, e.g. '
+          f'{plans[0] if plans else ""}')
+
+    # Asserted on this file's own path rather than on EXCLUDED, which
+    # would make the check vacuous: `not any(p in EXCLUDED ...)` passes
+    # trivially the moment EXCLUDED is empty, which is the edit it is
+    # supposed to catch. This script quotes the pattern it searches
+    # for, so a scan that reads it reports itself.
+    myself = pathlib.Path(__file__).resolve().relative_to(
+        REPO_ROOT).as_posix()
+    check(myself not in scanned,
+          'does not scan itself',
+          f'{myself} scans itself, so it will report its own specimens')
+
+    # Nothing generated. This is the non-vacuous half of the build-tree
+    # exclusion above: restating the prefixes would assert only that the
+    # code does what it says, while asking git catches the next build
+    # directory -- which is how the first two got in.
+    import subprocess
+    try:
+        ignored = subprocess.run(
+            ['git', '-C', str(REPO_ROOT), 'check-ignore', '--stdin'],
+            input='\n'.join(sorted(scanned)), capture_output=True,
+            text=True, check=False)
+    except OSError as exc:
+        print(f'FAIL cannot ask git what it ignores: {exc}')
         bad += 1
+        checks += 1
     else:
-        print(f'ok   reads {found} files regardless of working directory')
+        # check-ignore exits 1 when nothing matched, which is the pass.
+        if ignored.returncode not in (0, 1):
+            check(False, '', f'git check-ignore failed: '
+                             f'{ignored.stderr.strip()}')
+        else:
+            listed = [line for line in ignored.stdout.split('\n')
+                      if line.strip()]
+            check(not listed,
+                  'scans no file git ignores',
+                  f'{len(listed)} generated file(s) are scanned, e.g. '
+                  f'{listed[0] if listed else ""}')
 
     if bad:
-        print(f'{bad} of {len(SELF_TEST_CASES) + 1} self-test checks failed')
+        print(f'{bad} of {checks} self-test checks failed')
         return 1
-    print(f'{len(SELF_TEST_CASES) + 1} self-test checks pass')
+    print(f'{checks} self-test checks pass')
     return 0
 
 
@@ -201,15 +308,21 @@ def main():
     if args.self_test:
         return self_test()
 
+    found = scan_paths()
+    empty = empty_globs(found)
+    if empty:
+        print('ERROR: these globs match no file they are allowed to read, '
+              'so whatever they cover is not being checked: '
+              + ', '.join(empty))
+        return 1
+
     hits = []
     scanned = 0
-    for glob in GLOBS:
-        for path in sorted(REPO_ROOT.glob(glob)):
-            relative = path.relative_to(REPO_ROOT).as_posix()
-            if excluded(relative):
-                continue
+    for paths in found.values():
+        for relative in paths:
             scanned += 1
-            for lineno, claim in claims_in(path.read_text()):
+            for lineno, claim in claims_in(
+                    (REPO_ROOT / relative).read_text()):
                 hits.append(f'{relative}:{lineno}: {claim!r}')
     for hit in hits:
         print(hit)

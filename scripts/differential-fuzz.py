@@ -589,7 +589,11 @@ def detect_libyal_tools(require=None):
 
     available = {}
     missing = []
-    for tool in ('vmdkinfo', 'vhdiinfo', 'qcowinfo'):
+    # Derived from LIBYAL_TOOLS rather than written out again: a format
+    # arm naming a fourth tool would otherwise go unprobed, and an
+    # unprobed tool is never reported missing, which is the silence this
+    # whole function exists to remove.
+    for tool in sorted(set(LIBYAL_TOOLS.values())):
         path = shutil.which(tool)
         if path:
             available[tool] = path
@@ -603,14 +607,14 @@ def detect_libyal_tools(require=None):
 
     if missing and require:
         packages = sorted({LIBYAL_PACKAGES[t] for t in missing})
+        formats = sorted(f for f, t in LIBYAL_TOOLS.items() if t in missing)
         raise MissingOracleError(
             f'{REQUIRE_LIBYAL_ENV} is set, so this environment has '
             f'declared the libyal oracles mandatory, but these are not '
             f'on PATH: {", ".join(missing)}. Install '
             f'{", ".join(packages)} or unset {REQUIRE_LIBYAL_ENV}. '
             f'Continuing would drop the only independent cross-check '
-            f'for {", ".join(sorted(f for f, t in LIBYAL_TOOLS.items() if t in missing))} '
-            f'and still report a clean run.'
+            f'for {", ".join(formats)} and still report a clean run.'
         )
 
     return available

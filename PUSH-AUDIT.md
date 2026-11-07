@@ -141,8 +141,9 @@ Exit codes:
 | 6    | could not enter the repo root  |
 | 7    | `make fuzz-build` failed       |
 | 8    | `tools/mermaid-lint.sh` failed |
-| 10   | `instar info` output differs from the merge-base build |
 | 9    | could not resolve a usable audit scope (bad `--range`/`--commits-file`, or an explicitly-given `--range`/`--commits-file` resolved to zero files -- the implicit `develop...HEAD` default resolving to zero files is not an error) |
+| 10   | `instar info` output differs from the merge-base build |
+| 11   | the info-output parity gate could not run: it needs an `../instar-testdata` checkout holding the four differencing fixtures, and a buildable tree at both this commit and the merge-base. Not a statement about info output either way |
 
 If wave 1 fails, fix the cause and re-run before
 spending on wave 2.

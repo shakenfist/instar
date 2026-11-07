@@ -22,14 +22,22 @@
 # from a truncated one (#663). They are here so both callers share one
 # implementation.
 #
-# Usage: tools/ci/check-stestr-run.sh OUTPUT_FILE [EXPECTED]
+# Usage: tools/ci/check-stestr-run.sh OUTPUT_FILE EXPECTED
 #
 #   OUTPUT_FILE  the captured stdout+stderr of `stestr run`
-#   EXPECTED     optional: the number of test ids the selection's
-#                discovery found. Given, the run must have executed at
-#                least that many; load-time cases make a real run
-#                longer than the listing, never shorter, so fewer means
-#                truncated.
+#   EXPECTED     how many test ids the selection's discovery found: a
+#                number, or the word "in-output" to read it from the
+#                "selection contains N tests" line the run printed
+#                before running. The run must have executed at least
+#                that many; load-time cases make a real run longer than
+#                the listing, never shorter, so fewer means truncated.
+#
+# EXPECTED used to be optional, and the one caller that could leave it
+# off did. `integration-core` ran the four shape guards below with no
+# length floor at all -- the one guard the 454-of-3253 run actually
+# needed -- while the step above it claimed the run was checked for
+# truncation. A floor that can be omitted is a floor that will be, so
+# it is now required and there is no mode that silently checks less.
 #
 # Exits 0 with a one-line summary when the run is trustworthy, 1 when
 # it is not, naming which guard refused it, and 2 when it was called
@@ -44,8 +52,8 @@ set -uo pipefail
 OUTPUT_FILE="${1:-}"
 EXPECTED="${2:-}"
 
-if [ -z "$OUTPUT_FILE" ]; then
-    echo "usage: $0 OUTPUT_FILE [EXPECTED]" >&2
+if [ -z "$OUTPUT_FILE" ] || [ -z "$EXPECTED" ]; then
+    echo "usage: $0 OUTPUT_FILE EXPECTED|in-output" >&2
     exit 2
 fi
 if [ ! -f "$OUTPUT_FILE" ]; then
@@ -53,12 +61,40 @@ if [ ! -f "$OUTPUT_FILE" ]; then
     echo "checked. Treat it as a failure rather than a pass." >&2
     exit 2
 fi
-if [ -n "$EXPECTED" ] && ! [ "$EXPECTED" -ge 0 ] 2>/dev/null; then
-    echo "Error: EXPECTED must be a number, got '$EXPECTED'" >&2
+if [ "$EXPECTED" = 'in-output' ]; then
+    # The count the run itself printed. Both callers print it in the
+    # same words, from the same `stestr list` of the same selection, so
+    # a caller that cannot derive a count cannot accidentally run with
+    # the floor switched off: the line is missing and this refuses.
+    EXPECTED=$(sed -n "s/^selection contains \([0-9]*\) tests$/\1/p" \
+        "$OUTPUT_FILE" | tail -n1)
+    if [ -z "$EXPECTED" ]; then
+        echo "" >&2
+        echo "Error: the run printed no \"selection contains N tests\"" >&2
+        echo "line, so the length floor has nothing to check against." >&2
+        echo "The caller is expected to list the selection before running" >&2
+        echo "it; a run whose size is unknown is a failure here, not a" >&2
+        echo "run with one guard switched off." >&2
+        exit 1
+    fi
+    if [ "$EXPECTED" -eq 0 ]; then
+        echo "" >&2
+        echo "Error: the selection matched no tests at all. A selector" >&2
+        echo "that matches nothing exits zero with everything passing," >&2
+        echo "which is indistinguishable from a green run." >&2
+        exit 1
+    fi
+elif ! [ "$EXPECTED" -ge 0 ] 2>/dev/null; then
+    echo "Error: EXPECTED must be a number or 'in-output', got" >&2
+    echo "'$EXPECTED'" >&2
     exit 2
 fi
 
-if grep -q "Length too long" "$OUTPUT_FILE"; then
+# Anchored on the traceback shape rather than the bare phrase: the
+# whole captured output is searched, so a test that prints or asserts
+# "Length too long" in its own output would otherwise make a complete
+# run unreportable -- including a future test of this guard.
+if grep -qE "(ValueError|subunit).*Length too long" "$OUTPUT_FILE"; then
     echo "" >&2
     echo "Error: a stestr worker died on the subunit packet-size limit" >&2
     echo "(a test attached >4MB of captured output). The run is PARTIAL:" >&2
@@ -82,7 +118,7 @@ if [ -z "$RAN" ]; then
     exit 1
 fi
 
-if [ -n "$EXPECTED" ] && [ "$RAN" -lt "$EXPECTED" ]; then
+if [ "$RAN" -lt "$EXPECTED" ]; then
     echo "" >&2
     echo "Error: run executed $RAN tests, fewer than the $EXPECTED ids" >&2
     echo "discovery found for this selection. Since load-time cases make" >&2
@@ -112,10 +148,5 @@ if [ "$EXECUTED" -le 0 ]; then
     exit 1
 fi
 
-if [ -n "$EXPECTED" ]; then
-    echo "check-stestr-run: $EXECUTED of $RAN tests executed," \
-        "$SKIPPED skipped, against $EXPECTED discovered; no worker lost."
-else
-    echo "check-stestr-run: $EXECUTED of $RAN tests executed," \
-        "$SKIPPED skipped; no worker lost."
-fi
+echo "check-stestr-run: $EXECUTED of $RAN tests executed," \
+    "$SKIPPED skipped, against $EXPECTED discovered; no worker lost."

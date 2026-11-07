@@ -152,11 +152,27 @@ if [[ -n "$PARITY_SCOPE" ]]; then
         bold "=== wave 1a: tools/verify-info-output-parity.sh (vhd/vhdx scope) ==="
         while IFS= read -r scoped; do echo "  $scoped"; done \
             <<< "$PARITY_SCOPE"
-        if ! ./tools/verify-info-output-parity.sh; then
+        # Its two failure statuses mean opposite things. 1 is a real
+        # stdout difference; 2 is "the gate could not run" -- no
+        # ../instar-testdata checkout, a failed `make instar` in either
+        # tree, none of the four differencing fixtures present, or zero
+        # images compared. Reporting both as a difference sends someone
+        # whose testdata sibling is simply missing to look for a diff
+        # that does not exist.
+        ./tools/verify-info-output-parity.sh
+        PARITY_RC=$?
+        if [[ "$PARITY_RC" -eq 1 ]]; then
             red "FAIL: instar info output differs from the merge-base build"
             red "      (if the change means to alter info output, say so and"
             red "       do not claim parity)"
             exit 10
+        elif [[ "$PARITY_RC" -ne 0 ]]; then
+            red "FAIL: could not run the info-output parity gate (exit"
+            red "      $PARITY_RC): it needs an ../instar-testdata checkout"
+            red "      holding the differencing fixtures, and a buildable"
+            red "      tree at both this commit and the merge-base. This is"
+            red "      not a statement about info output either way."
+            exit 11
         fi
         green "PASS: info-output parity"
     fi

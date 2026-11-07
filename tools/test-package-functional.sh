@@ -381,9 +381,13 @@ set -e
 # tools/ci/check-stestr-run.sh so this script and the integration-core
 # CI job share one implementation rather than one having them and the
 # other not (#663).
-if ! /workspace/tools/ci/check-stestr-run.sh /tmp/stestr-output.txt "$EXPECTED"; then
-    exit 1
-fi
+# Its status is propagated rather than flattened to 1: the guard
+# distinguishes "this run is not trustworthy" (1) from "the guard was
+# called wrongly" (2), and a missing /tmp/stestr-output.txt reading as a
+# truncated run would send the reader to the suite instead of to this
+# script.
+/workspace/tools/ci/check-stestr-run.sh /tmp/stestr-output.txt "$EXPECTED" \
+    || exit $?
 
 # Derive the timing data, if this run was asked to measure. Deliberately
 # after the truncation guards and before the verdict: a truncated run

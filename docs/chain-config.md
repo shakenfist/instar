@@ -177,6 +177,16 @@ An operation whose devices form a single chain writes the config via
    written, via `write_chain_config_header()`
 3. All writes use `guest_mem.write_obj()` for type-safe memory access
 
+A chain holding more than `MAX_CHAIN_DEVICES` (16) devices is refused
+here, naming the depth and the limit, rather than written as its first
+16 slots. The budget is in devices and not images, which is what makes
+it reachable: `security.max_chain_depth` (16 by default) counts images,
+and each external data file takes a slot of its own, so a chain
+standing at the depth limit whose top image has a qcow2 external data
+file is 17 devices. `check` and `convert` refuse such a chain before
+reaching this function; `commit` and `bench` reach it, and used to be
+run against a prefix of the chain with only a debug line to say so.
+
 `compare` and `rebase` attach two unrelated chains, so they call
 `write_chain_device_entries()` once per chain and then
 `write_chain_config_header()` with one segment per chain. Both take

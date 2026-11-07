@@ -11,7 +11,14 @@
 #
 # The risk the guard carries is the opposite: refusing a legitimate run
 # that merely skipped a lot, which is normal on a distro whose qemu
-# cannot build some fixtures. That case is asserted here too.
+# cannot build some fixtures. That case is asserted here too, along
+# with the other way a legitimate run could be refused: a test whose
+# own output contains the words the packet-size guard looks for.
+#
+# The cases that assert the discovery count is mandatory are what stop
+# the #663 defect coming back in the shape the #882 review found it:
+# a caller that invokes the guard with no floor, and reports that the
+# run was checked for truncation.
 
 set -uo pipefail
 
@@ -41,6 +48,22 @@ expect_rc() {
     fi
 }
 
+# expect_message DESCRIPTION PATTERN FILE [EXPECTED]
+expect_message() {
+    local description="$1" pattern="$2"
+    shift 2
+    local output
+    output="$("${CHECK}" "$@" 2>&1)"
+    if echo "${output}" | grep -qE "${pattern}"; then
+        ok "${description}"
+    else
+        fail "${description}: no match for '${pattern}' in: ${output}"
+    fi
+}
+
+# The line both callers print before running, which "in-output" reads.
+selection() { echo "selection contains $1 tests"; }
+
 # A totals block in the shape stestr prints, with the worker summary.
 totals() {
     local ran="$1" skipped="$2" worker_elapsed="${3:-0:00:04.123456}"
@@ -66,7 +89,6 @@ EOF
 
 start "a clean run"
 totals 1273 41 > "${WORK}/clean.txt"
-expect_rc "passes with no expected count" 0 "${WORK}/clean.txt"
 expect_rc "passes when it reached its discovery count" 0 \
     "${WORK}/clean.txt" 1273
 expect_rc "passes when it exceeded its discovery count" 0 \
@@ -77,35 +99,84 @@ start "a run whose worker died on the subunit packet-size limit"
     echo 'ValueError: Length too long: 4194400'
     totals 454 0
 } > "${WORK}/length.txt"
-expect_rc "refuses the partial run" 1 "${WORK}/length.txt"
+expect_rc "refuses the partial run" 1 "${WORK}/length.txt" 454
 expect_rc "refuses it even against a lower floor" 1 "${WORK}/length.txt" 100
+{
+    echo 'subunit.ParseError: Length too long: 4194400'
+    totals 454 0
+} > "${WORK}/length-subunit.txt"
+expect_rc "refuses it when subunit names the limit" 1 \
+    "${WORK}/length-subunit.txt" 454
+
+start "a complete run that merely mentions the phrase"
+{
+    echo '{2} tools.test_guard.TestGuard.test_length_too_long ... ok'
+    echo 'captured stdout: refuses a worker lost to Length too long'
+    totals 1273 41
+} > "${WORK}/phrase.txt"
+expect_rc "passes: the phrase is not a traceback" 0 "${WORK}/phrase.txt" 1273
 
 start "a run with a crashed worker"
 totals 454 0 'N/A' > "${WORK}/crashed.txt"
-expect_rc "refuses a worker with no elapsed time" 1 "${WORK}/crashed.txt"
+expect_rc "refuses a worker with no elapsed time" 1 "${WORK}/crashed.txt" 454
 
 start "a run with no totals block"
 echo 'running=test_info.TestInfo.test_qcow2' > "${WORK}/nototals.txt"
-expect_rc "refuses a run it cannot measure" 1 "${WORK}/nototals.txt"
+expect_rc "refuses a run it cannot measure" 1 "${WORK}/nototals.txt" 100
 
 start "a run shorter than its own discovery"
 totals 454 0 > "${WORK}/short.txt"
 expect_rc "refuses 454 of 3253" 1 "${WORK}/short.txt" 3253
-expect_rc "passes the same run with no floor to check" 0 "${WORK}/short.txt"
 
 start "a run in which every test skipped"
 totals 120 120 > "${WORK}/allskip.txt"
-expect_rc "refuses a run that executed nothing" 1 "${WORK}/allskip.txt"
+expect_rc "refuses a run that executed nothing" 1 "${WORK}/allskip.txt" 120
 expect_rc "refuses it although it met its discovery count" 1 \
-    "${WORK}/allskip.txt" 120
+    "${WORK}/allskip.txt" 100
 
 start "a legitimate run with many skips"
 totals 1273 900 > "${WORK}/manyskip.txt"
 expect_rc "passes: some tests executed" 0 "${WORK}/manyskip.txt" 1273
 
+start "the count taken from the run's own output"
+{
+    selection 1100
+    totals 1273 41
+} > "${WORK}/inoutput.txt"
+expect_rc "passes when the run exceeded the count it printed" 0 \
+    "${WORK}/inoutput.txt" in-output
+{
+    selection 3253
+    totals 454 0
+} > "${WORK}/inoutput-short.txt"
+expect_rc "refuses a run shorter than the count it printed" 1 \
+    "${WORK}/inoutput-short.txt" in-output
+expect_message "names the discovered count it compared against" \
+    "fewer than the 3253 ids" "${WORK}/inoutput-short.txt" in-output
+expect_rc "refuses a run that printed no count at all" 1 \
+    "${WORK}/clean.txt" in-output
+expect_message "says the count line is what is missing" \
+    "selection contains N tests" "${WORK}/clean.txt" in-output
+# A count of zero with a full totals block, which is the shape that
+# matters: a selector that lists nothing but runs everything -- an
+# `--exclude-regex` typo excluding the whole suite from the listing, say
+# -- yields a floor of zero that any run clears. Every other guard here
+# passes this run, so the zero check is the only thing that refuses it.
+{
+    selection 0
+    totals 120 0
+} > "${WORK}/inoutput-zero.txt"
+expect_rc "refuses a selection that matched nothing" 1 \
+    "${WORK}/inoutput-zero.txt" in-output
+
+start "the discovery count is mandatory"
+expect_rc "exits 2 when called with no count" 2 "${WORK}/clean.txt"
+expect_message "the usage line names the count" \
+    "usage:.*OUTPUT_FILE EXPECTED" "${WORK}/clean.txt"
+
 start "called wrongly"
 expect_rc "exits 2 with no argument" 2
-expect_rc "exits 2 on a missing file" 2 "${WORK}/nonexistent.txt"
+expect_rc "exits 2 on a missing file" 2 "${WORK}/nonexistent.txt" 100
 expect_rc "exits 2 on a non-numeric expected count" 2 \
     "${WORK}/clean.txt" "lots"
 

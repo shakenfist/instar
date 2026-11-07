@@ -417,6 +417,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **An over-budget backing chain is refused by name instead of silently
+  truncated.** `commit` and `bench` on a chain holding more than
+  `MAX_CHAIN_DEVICES` (16) devices now fail, naming the depth and the
+  limit, where the host used to write the first 16 device slots, log a
+  debug line and run the operation against a prefix of the chain the
+  user asked about -- a wrong answer reported as a success. The budget
+  counts devices, not images: `security.max_chain_depth` (16 by
+  default) counts images, and each external data file takes a slot of
+  its own, so the reachable case is a chain at the depth limit whose
+  top image has a qcow2 external data file. `check` and `convert`
+  already refused it. See `docs/chain-config.md`.
+
 - **The nightly stestr timing refresh publishes only a move that
   persists across two measurements, taken after the distro legs rather
   than beside them.** The first three refreshes showed the committed

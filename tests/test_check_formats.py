@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import struct
 import subprocess
 import tempfile
@@ -1207,19 +1208,56 @@ class TestZstdBackingChain(InstarTestBase):
     image is part of a backing chain that needs to be flattened.
     """
 
-    def _require_zstd(self, td):
-        """Skip unless the installed qemu-img really produces ZSTD.
+    # Set by CI in the job whose image supplies qemu-img and qemu-io.
+    # See `_missing_zstd` below and .github/workflows/functional-tests.yml.
+    REQUIRE_ZSTD_ENV = 'INSTAR_REQUIRE_ZSTD'
 
-        Probed by creating an image in *td*: asking qemu-img to format
-        /dev/null fails on every build, whatever it supports, because
-        the result cannot then be read back as qcow2 -- which is how
-        this class never ran at all until #813.
+    def _missing_zstd(self, reason):
+        """Skip because the ZSTD fixture cannot be built -- or fail.
+
+        An honest probe that skips is still a probe whose failure looks
+        exactly like a pass, which is the shape the rest of this change
+        argues against: if a devcontainer base-image bump dropped ZSTD
+        from qemu-img, or dropped qemu-io, these two tests would go back
+        to skipping on every run with nothing turning red. So the skip
+        is conditional, as `_require_vhdiinfo` makes it for libvhdi: an
+        environment that sets `INSTAR_REQUIRE_ZSTD` has declared the
+        fixture buildable, and anything missing there is a failure.
+        """
+        if os.environ.get(self.REQUIRE_ZSTD_ENV):
+            self.fail(
+                f'{self.REQUIRE_ZSTD_ENV} is set, so this environment has '
+                f'declared the ZSTD fixture buildable, but {reason}. Either '
+                f'restore the tool in the image or unset the variable -- do '
+                f'not let these tests skip, because a skip reads as a pass.'
+            )
+        self.skipTest(reason)
+
+    def _require_zstd(self, td):
+        """Skip unless this host can really build the ZSTD fixture.
+
+        Both halves, because either one missing skips the same two
+        tests: qemu-img and qemu-io have to be installed (the fixture's
+        differing cluster is written into a qcow2 before being
+        compressed into the overlay), and qemu-img has to produce real
+        ZSTD. Checked here rather than through `_require_qemu_tools`
+        because that one skips unconditionally for every caller in the
+        suite, and these tests have a CI environment that has declared
+        the tools present.
+
+        ZSTD is probed by creating an image in *td*: asking qemu-img to
+        format /dev/null fails on every build, whatever it supports,
+        because the result cannot then be read back as qcow2 -- which
+        is how this class never ran at all until #813.
 
         The recorded compression type is checked as well as the exit
         code. A build that accepted the option and wrote a zlib image
         would otherwise look supported here, and the comparison that
         follows would prove nothing about ZSTD.
         """
+        for tool in ('qemu-img', 'qemu-io'):
+            if shutil.which(tool) is None:
+                self._missing_zstd(f'system {tool} is not installed')
         probe = Path(td) / 'zstd-probe.qcow2'
         r = subprocess.run(
             ['qemu-img', 'create', '-f', 'qcow2',
@@ -1227,7 +1265,7 @@ class TestZstdBackingChain(InstarTestBase):
             capture_output=True, text=True
         )
         if r.returncode != 0:
-            self.skipTest(
+            self._missing_zstd(
                 f'qemu-img cannot create a ZSTD image: {r.stderr.strip()!r}'
             )
         info = subprocess.run(
@@ -1237,7 +1275,7 @@ class TestZstdBackingChain(InstarTestBase):
         fmt = json.loads(info.stdout).get('format-specific', {})
         actual = fmt.get('data', {}).get('compression-type')
         if actual != 'zstd':
-            self.skipTest(
+            self._missing_zstd(
                 f'qemu-img accepted compression_type=zstd but recorded '
                 f'{actual!r}, so it cannot build a ZSTD fixture'
             )
@@ -1332,12 +1370,11 @@ class TestZstdBackingChain(InstarTestBase):
 
     def test_convert_zstd_with_backing_chain(self):
         """Convert a ZSTD image that has a backing chain."""
-        # qemu-io as well as qemu-img: the fixture's differing cluster
-        # has to be written into a qcow2 before it can be compressed
-        # into the overlay. The class asked for neither before, so a
-        # host without qemu-io failed in the fixture rather than
-        # skipping.
-        self._require_qemu_tools()
+        # _require_zstd asks for qemu-io as well as qemu-img: the
+        # fixture's differing cluster has to be written into a qcow2
+        # before it can be compressed into the overlay. The class asked
+        # for neither before, so a host without qemu-io failed in the
+        # fixture rather than skipping.
         with tempfile.TemporaryDirectory() as td:
             self._require_zstd(td)
             overlay, _ = self._build_zstd_overlay(td, 0xAA, 0xBB)
@@ -1373,7 +1410,6 @@ class TestZstdBackingChain(InstarTestBase):
 
     def test_compare_zstd_backing_vs_flattened(self):
         """Compare a ZSTD overlay (with backing) against flat raw."""
-        self._require_qemu_tools()
         with tempfile.TemporaryDirectory() as td:
             self._require_zstd(td)
             overlay, _ = self._build_zstd_overlay(td, 0xCC, 0xDD)

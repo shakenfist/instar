@@ -782,5 +782,95 @@ class TestSelectorExtractorsAgree(unittest.TestCase):
                 self._assert_agree('test-container-matrix-queue', reformatted, d)
 
 
+# A recipe that lists its own selection so the run has a discovery count
+# to check its length against. The selector is written twice, which is
+# the drift this guard exists to catch.
+LISTING_MAKEFILE = '''\
+test-container-listed: instar-devcontainer instar
+\tdocker run --rm "$(INSTAR_IMAGE)" bash -c '\\
+\t\tcd tests && \\
+\t\tstestr list \\
+\t\t\t--exclude-regex "%s" \\
+\t\t\t"%s" \\
+\t\t\t> /tmp/stestr-list.txt && \\
+\t\techo "selection contains $$(grep -c . /tmp/stestr-list.txt) tests" && \\
+\t\tstestr run \\
+\t\t\t--exclude-regex "%s" \\
+\t\t\t--concurrency 4 \\
+\t\t\t"%s" \\
+\t'
+'''
+
+
+class TestListMatchesRun(unittest.TestCase):
+    '''The run-length floor comes from the recipe\'s own `stestr list`,
+    so the selector is written twice in the same recipe. The dangerous
+    drift is silent: a list narrower than the run yields a floor lower
+    than the selection, which passes while checking less than it says.
+    These assert the second copy cannot rot unnoticed.'''
+
+    def _makefile(self, list_exclude, list_include, run_exclude,
+                  run_include):
+        return LISTING_MAKEFILE % (list_exclude, list_include, run_exclude,
+                                   run_include)
+
+    def test_a_matching_pair_is_accepted(self):
+        text = self._makefile('Vhd', 'test_convert\\.', 'Vhd',
+                              'test_convert\\.')
+        self.assertEqual(
+            guard.check_list_matches_run(text, ['test-container-listed']), [])
+
+    def test_a_narrower_list_is_reported(self):
+        # The silent direction: listing fewer tests than the run runs
+        # leaves a floor the run clears without being complete.
+        text = self._makefile('(Vhd|test_bench)', 'test_convert\\.', 'Vhd',
+                              'test_convert\\.')
+        problems = guard.check_list_matches_run(text,
+                                                ['test-container-listed'])
+        self.assertEqual(len(problems), 1)
+        self.assertEqual(problems[0][0], 'test-container-listed')
+
+    def test_a_different_positional_selector_is_reported(self):
+        text = self._makefile('Vhd', 'test_compare\\.', 'Vhd',
+                              'test_convert\\.')
+        problems = guard.check_list_matches_run(text,
+                                                ['test-container-listed'])
+        self.assertEqual(len(problems), 1)
+
+    def test_a_recipe_that_does_not_list_is_not_a_problem(self):
+        # Only a recipe that claims a floor is held to it; the matrix
+        # targets are read for their selectors and run through
+        # tools/test-package-functional.sh, which counts its own
+        # selection.
+        self.assertIsNone(
+            guard.parse_makefile_list(MAKEFILE, 'test-container-matrix-queue'))
+        self.assertEqual(
+            guard.check_list_matches_run(
+                MAKEFILE, ['test-container-core',
+                           'test-container-matrix-queue']), [])
+
+    def test_the_real_targets_agree(self):
+        with open(os.path.join(_REPO_ROOT, 'Makefile'), encoding='utf-8') as f:
+            makefile_text = f.read()
+        targets = sorted(re.findall(r'^(test-container-[a-z0-9-]+):',
+                                    makefile_text, re.MULTILINE))
+        self.assertEqual(guard.check_list_matches_run(makefile_text, targets),
+                         [])
+
+    def test_the_real_comparison_is_not_vacuous(self):
+        # A guard over an empty set passes. These three targets are the
+        # ones whose CI job calls check-stestr-run.sh with "in-output",
+        # so if one stops listing its selection the floor it reports is
+        # gone and this is what says so.
+        with open(os.path.join(_REPO_ROOT, 'Makefile'), encoding='utf-8') as f:
+            makefile_text = f.read()
+        for target in ('test-container-core', 'test-container-convert-qcow2',
+                       'test-container-convert-vhd'):
+            self.assertIsNotNone(
+                guard.parse_makefile_list(makefile_text, target),
+                '%s no longer lists its selection, so the CI job that '
+                'passes "in-output" has no floor' % target)
+
+
 if __name__ == '__main__':
     unittest.main()

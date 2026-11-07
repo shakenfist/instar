@@ -162,9 +162,8 @@ def _quoted_tokens(text):
     return results
 
 
-def parse_makefile_target(makefile_text, target):
-    '''Extract (includes, excludes) for a Makefile test-container target
-    by reading the stestr invocation in its recipe.'''
+def _recipe_text(makefile_text, target):
+    '''The recipe lines of a Makefile target, as one string.'''
     # Recipe runs from the target line to the next top-level target or a
     # blank-line-separated stanza. We scan until the closing single quote
     # of the `bash -c '...'` block, or the next `^<word>:` target line.
@@ -183,14 +182,12 @@ def parse_makefile_target(makefile_text, target):
         if re.match(r'^[A-Za-z0-9_.-]+:', line):
             break
         recipe.append(line)
-    recipe_text = '\n'.join(recipe)
+    return '\n'.join(recipe)
 
-    # Only consider the stestr run invocation.
-    m = re.search(r'stestr\s+run\b(.*?)(?:\n\s*\'|\Z)', recipe_text, re.DOTALL)
-    if not m:
-        raise LookupError('no `stestr run` found in target %s' % target)
-    invocation = m.group(1)
 
+def _selectors_from_invocation(invocation):
+    '''Split a stestr invocation's quoted arguments into (includes,
+    excludes).'''
     includes, excludes = [], []
     for token, prev in _quoted_tokens(invocation):
         # A recipe writes a literal dollar as "$$" so make passes one
@@ -205,6 +202,53 @@ def parse_makefile_target(makefile_text, target):
         else:
             includes.append(token)
     return includes, excludes
+
+
+def parse_makefile_target(makefile_text, target):
+    '''Extract (includes, excludes) for a Makefile test-container target
+    by reading the stestr invocation in its recipe.'''
+    recipe_text = _recipe_text(makefile_text, target)
+
+    # Only consider the stestr run invocation.
+    m = re.search(r'stestr\s+run\b(.*?)(?:\n\s*\'|\Z)', recipe_text, re.DOTALL)
+    if not m:
+        raise LookupError('no `stestr run` found in target %s' % target)
+    return _selectors_from_invocation(m.group(1))
+
+
+def parse_makefile_list(makefile_text, target):
+    '''Extract (includes, excludes) of the `stestr list` a recipe runs
+    before its `stestr run`, or None when it does not list at all.
+
+    A recipe lists its own selection so the run has a discovery count to
+    check its length against (tools/ci/check-stestr-run.sh). That makes
+    the selector appear twice in the recipe, and the dangerous drift is
+    silent: a list narrower than the run yields a floor lower than the
+    suite, which passes while checking less. check_list_matches_run()
+    below is what stops it, so the second copy cannot rot.'''
+    recipe_text = _recipe_text(makefile_text, target)
+    # A list invocation ends at the next shell command, i.e. the first
+    # `&&` or `;` after it -- unlike the run, which is the last command
+    # in the block and ends at its closing quote.
+    m = re.search(r'stestr\s+list\b(.*?)(?:&&|;|\Z)', recipe_text, re.DOTALL)
+    if not m:
+        return None
+    return _selectors_from_invocation(m.group(1))
+
+
+def check_list_matches_run(makefile_text, targets):
+    '''Report every test-container target whose `stestr list` selects
+    something other than its `stestr run`.'''
+    problems = []
+    for target in targets:
+        listed = parse_makefile_list(makefile_text, target)
+        if listed is None:
+            continue
+        run = parse_makefile_target(makefile_text, target)
+        if sorted(listed[0]) != sorted(run[0]) or \
+                sorted(listed[1]) != sorted(run[1]):
+            problems.append((target, listed, run))
+    return problems
 
 
 def parse_inline_stestr(command):
@@ -808,6 +852,29 @@ def main(argv=None):
         print()
         print('PASS: every discovered test is claimed by at least one '
               'pull-request job.')
+
+    # Every recipe that lists its own selection, checked against the run
+    # it is the floor for. Also whatever the verdict above was, for the
+    # same reason.
+    drift = check_list_matches_run(
+        makefile_text, sorted(re.findall(r'^(test-container-[a-z0-9-]+):',
+                                        makefile_text, re.MULTILINE)))
+    print()
+    if drift:
+        print('FAIL: %d target(s) list a different selection from the one '
+              'they run:' % len(drift))
+        for target, listed, run in drift:
+            print('  %s' % target)
+            print('    stestr list: includes=%s excludes=%s' % listed)
+            print('    stestr run : includes=%s excludes=%s' % run)
+        print()
+        print('Fix: the list is where the run-length floor comes from '
+              '(tools/ci/check-stestr-run.sh), so a list narrower than '
+              'the run lowers the floor silently. Make the two agree.')
+        rc = 1
+    else:
+        print('PASS: every recipe that lists its selection lists the one '
+              'it runs.')
 
     # The merge-queue matrix and the nightly are a second partition over
     # the same suite and are checked whatever the pull-request verdict

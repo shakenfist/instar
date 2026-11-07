@@ -58,6 +58,18 @@ assert the result carries what the probe claims: a build that accepted
 supported, and the comparison that followed would prove nothing about
 ZSTD.
 
+An honest probe still skips, and a skip still reads as a pass, so the
+probe is also made mandatory where the environment can promise the
+tools: `INSTAR_REQUIRE_ZSTD` turns every reason
+`TestZstdBackingChain` would skip -- no `qemu-img`, no `qemu-io`, or a
+`qemu-img` that does not really produce ZSTD -- into a failure, and
+the `integration-core` job sets it because the devcontainer supplies
+all three. A base-image bump that dropped ZSTD support would otherwise
+return both tests to skipping on every run, which is the state #813
+found them in. This is the same bargain `INSTAR_REQUIRE_LIBVHDI`
+strikes for the libvhdi oracle, and `INSTAR_REQUIRE_LIBYAL` for the
+fuzzer's.
+
 **A `_run_tool` timeout is a hang guard, not a performance
 assertion.** The budget (`QEMU_TOOL_TIMEOUT`, 300s) exists so a wedged
 `qemu-img` cannot block a stestr worker forever; it is not a claim
@@ -2837,6 +2849,16 @@ Two trees are excluded on purpose: `docs/plans/` records what was true
 when each phase was planned and prescribes the sweeps that made it
 false, and `CHANGELOG.md` entries were true for the release they
 describe. Editing either to satisfy the script would falsify a record.
+
+Build trees are excluded for a duller reason: `src/target/` and
+`tests/.venv/` are inside two of the globs, and pathlib matches dotted
+directories, so a developer who had built the tree scanned 1,199 files
+where CI's fresh checkout scans 277. Those 922 extra files are
+generated and vendored code, where a claim would be reported against a
+path nobody can edit — and the two counts disagreeing makes the figure
+the script prints useless as evidence. The self-test asserts that
+nothing `git check-ignore` matches is scanned, so the next build
+directory needs no new entry.
 The pattern is anchored on what a claim says instar cannot act *on*
 rather than on the verb, because that is what decides whether the
 claim is false. An unscoped claim naming a differencing image or a
@@ -2850,14 +2872,29 @@ form out, because a page containing it verbatim is indistinguishable,
 to anyone skimming, from a page making the claim — and the checker
 reads this page too.
 
-`--self-test` pins ten checks: nine claim forms it must flag or clear,
-each one that actually appeared in this repository, and one that the
-scan reads files at all from a working directory other than the
-repository root. That last one exists because the script globbed
-relative to the current directory and reported a clean tree, exit 0,
-having read nothing, whenever it was run from anywhere else. It now
-resolves the repository from its own path and refuses to report a
-clean tree on a scan that matched almost no files.
+`--self-test` pins fifteen checks: nine claim forms it must flag or
+clear, each one that actually appeared in this repository, and six
+about the scan itself. That it reads files at all from a working
+directory other than the repository root exists because the script
+globbed relative to the current directory and reported a clean tree,
+exit 0, having read nothing, whenever it was run from anywhere else;
+it now resolves the repository from its own path and refuses to report
+a clean tree on a scan that matched almost no files.
+
+The other five are about what the widened scan reads, which the claim
+forms cannot see: that every glob matches at least one file, that a
+docs page below `docs/` itself is read, that nothing under
+`docs/plans/` is, that nothing named in `EXCLUDED` is, and that
+nothing git ignores is. The per-glob floor is the load-bearing one.
+The aggregate floor was sized for three globs, and with five any
+single glob could stop matching -- the precise failure a floor exists
+to catch -- while the other four held the total in the hundreds. The
+real scan refuses for the same reason: a glob that matches nothing it
+may read means whatever that glob covers is not being checked, which
+is reported rather than passed. The nested-docs check is there because
+the glob *was* `docs/*.md`, non-recursive, which hid 36 pages
+including every commentary page while the docstring presented the
+`docs/plans/` exclusion as the deliberate one.
 
 `--self-test` exists because the classifier is the one part of the
 harness nothing else checks — everything else is checked *by* it — and
