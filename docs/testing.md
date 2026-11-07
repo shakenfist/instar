@@ -1710,6 +1710,33 @@ single kernel fault (#787); under these rules it would have filed five,
 and its log would have said why it stopped.
 `tools/ci/test_differential_fuzz_issues.py` holds both, in `ci-tooling`.
 
+### The libyal oracles are mandatory in CI
+
+qemu-img is not the fuzzer's only reference. The libyal parsers --
+`vmdkinfo`, `vhdiinfo` and `qcowinfo`, from `libvmdk-utils`,
+`libvhdi-utils` and `libqcow-utils` -- are the only *independent* one
+for VMDK, VHD and VHDX: qemu-img shares a family of assumptions with
+instar, and for a differencing child it has no opinion at all.
+
+Each is optional by default, because a developer host need not have the
+packages: a missing tool is warned about, and that format's comparison
+is dropped. The trap is that the run then exits 0 and reports the same
+"N iterations, 0 divergences" as a run that had every oracle, so
+dropping a package from the devcontainer image -- a Dockerfile edit, a
+base-image bump that renames one, a Debian package split -- would halve
+the oracle coverage of every later nightly with nothing turning red.
+
+So `INSTAR_REQUIRE_LIBYAL` makes the tools mandatory: a missing one
+exits 2 naming the tool, its package and the formats that lost their
+cross-check, instead of warning. The nightly workflow sets it, since it
+rebuilds the image that installs all three. This is the same bargain
+`INSTAR_REQUIRE_LIBVHDI` strikes for the integration suite. Every run
+also logs which oracles it used, reports them on its `PASSED` line and
+records them as `libyal_tools` in `summary-<seed>.json`, so a degraded
+run is distinguishable from a clean one after the fact.
+`tools/ci/test_differential_fuzz_oracles.py` holds this, in
+`ci-tooling`.
+
 ### Reproducing a divergence
 
 Each divergence report includes the seed and iteration number. To

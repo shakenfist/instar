@@ -138,6 +138,15 @@ jobs:
           # the container.  gh and qemu-utils are pre-installed in
           # the container image so the fuzzer can file issues and
           # create test images.
+          #
+          # INSTAR_REQUIRE_LIBYAL makes a missing libyal tool fail the
+          # run instead of quietly dropping that format's independent
+          # cross-check. The image installs libqcow-utils,
+          # libvhdi-utils and libvmdk-utils (src/.devcontainer/
+          # Dockerfile), and this step rebuilds it, so anything that
+          # drops one of those packages turns this job red rather than
+          # leaving every later nightly reporting a clean run it did
+          # not perform.
           mkdir -p fuzz-logs
 
           docker run --rm \
@@ -147,6 +156,7 @@ jobs:
             -e HOME=/build \
             -e GH_TOKEN="$GH_TOKEN" \
             -e WORKFLOW_URL="$WORKFLOW_URL" \
+            -e INSTAR_REQUIRE_LIBYAL=1 \
             -v "$(pwd):/workspace" \
             -w "/workspace" \
             instar-build \
