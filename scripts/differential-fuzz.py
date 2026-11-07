@@ -1567,6 +1567,20 @@ def op_measure(instar_bin, instar_copy, qemu_copy, fmt,
 # op_create: instar create vs qemu-img create
 # ---------------------------------------------------------------------------
 
+def _create_noop_preallocation(rng):
+    """Draw a preallocation option for a non-qcow2 create target.
+
+    Returns a list of zero or one option strings. `falloc` and `full`
+    are expected to be no-ops: both tools write the image "off" writes.
+    `metadata` is never drawn because both tools reject it outside
+    qcow2 ("preallocation=metadata is not supported for vhdx" /
+    "Unsupported preallocation mode: metadata"), so drawing it would
+    fuzz two error paths against each other.
+    """
+    prealloc = rng.choice([None, 'falloc', 'full'])
+    return [] if prealloc is None else [f'preallocation={prealloc}']
+
+
 def _create_option_picker(rng):
     """Pick a (target, size_str, options_list) triple biased to avoid
     instar/qemu writer divergences documented in
@@ -1577,12 +1591,32 @@ def _create_option_picker(rng):
     LSB-first (instar #365).
 
     Excludes:
-        vhd target entirely        (CHS-geometry rounding divergence)
+        vpc (vhd) target entirely  (CHS virtual-size rounding
+                                    divergence)
         qcow2 compat=0.10          (instar hardcodes compat=1.1)
         compression_type=zstd      (instar accept-ignores; emits zlib)
+        preallocation=metadata on  (both tools refuse it there)
+          vmdk and vhdx
+
+    Leaving vpc out makes it the one create target whose preallocation
+    no-op this fuzzer does not cover. qemu-img rounds a VHD's virtual
+    size up to CHS geometry and instar does not (the five "qemu rounds
+    VHD virtual_size to CHS geometry" entries in
+    KNOWN_WRITER_DIVERGENCES), so a vpc arm would diverge on
+    virtual-size on every iteration, for a reason that has nothing to
+    do with preallocation, and masking the field would blind the
+    comparison to the number most worth checking in a VHD writer.
+    test_vpc_noop_preallocation and test_vpc_fixed_noop_preallocation
+    in tests/test_create.py assert that no-op directly against the
+    pinned qemu builds instead.
 
     The vhdx block size is drawn from no block_size (qemu's size-scaled
-    default, which instar matches) as well as explicit values.
+    default, which instar matches) as well as explicit values, and the
+    arm also draws both subformats, both block_state_zero values for a
+    fixed image, and the no-op preallocation modes. The vmdk arm draws
+    monolithicFlat as well as the single-file subformats; its descriptor
+    names a sibling extent, which the two sides write under different
+    temp names and normalise_info_json reduces to $FILENAME-flat.
     """
     target = rng.choice(['qcow2', 'vmdk', 'vhdx', 'raw'])
 
@@ -1630,16 +1664,50 @@ def _create_option_picker(rng):
         return target, size, options
 
     if target == 'vmdk':
-        subformat = rng.choice(['monolithicSparse', 'streamOptimized'])
+        # monolithicFlat writes a descriptor plus a sparse flat extent
+        # beside it, so the two sides' info output names different
+        # files; the shared normaliser derives the sibling from the
+        # primary's own name.
+        subformat = rng.choice(
+            ['monolithicSparse', 'streamOptimized', 'monolithicFlat'])
         size = rng.choice(['1M', '16M', '64M', '256M'])
-        return target, size, [f'subformat={subformat}']
+        options = [f'subformat={subformat}']
+        options.extend(_create_noop_preallocation(rng))
+        return target, size, options
 
     if target == 'vhdx':
         # None leaves block_size unset, so both tools choose their default
         # for the size.
         bs = rng.choice([None, '16M', '32M'])
-        size = rng.choice(['64M', '256M', '1G'])
-        return target, size, [f'block_size={bs}'] if bs else []
+        options = [f'block_size={bs}'] if bs else []
+        # None leaves subformat unset, which is dynamic in both tools;
+        # 'dynamic' covers the explicit spelling of the same layout.
+        subformat = rng.choice([None, 'dynamic', 'fixed'])
+        if subformat is not None:
+            options.append(f'subformat={subformat}')
+        if subformat == 'fixed':
+            # The BAT state only a fixed image carries: PAYLOAD_BLOCK_ZERO
+            # for block_state_zero=on (both tools' default),
+            # PAYLOAD_BLOCK_FULLY_PRESENT for off.
+            bsz = rng.choice(['on', 'off'])
+            options.append(f'block_state_zero={bsz}')
+            # A fixed VHDX's file length covers its whole payload region,
+            # so the size list is the dynamic arm's without its largest
+            # entry, rather than declaring a gigabyte per iteration.
+            # Every size left is a whole multiple of every block size
+            # this arm draws (including the 8 MiB default at these
+            # sizes), so no iteration has a partial last block: with
+            # block_state_zero=off qemu-img writes a whole block's BAT
+            # entry for a partial last block and then refuses to open the
+            # image it has just written ("points after end of file",
+            # measured on qemu-img 10.0.13 at 4608.5M with 1 MiB blocks),
+            # which would make both sides fail the info read-back instead
+            # of being compared.
+            size = rng.choice(['64M', '256M'])
+        else:
+            size = rng.choice(['64M', '256M', '1G'])
+        options.extend(_create_noop_preallocation(rng))
+        return target, size, options
 
     # raw
     size = rng.choice(['1M', '16M', '64M', '256M'])
