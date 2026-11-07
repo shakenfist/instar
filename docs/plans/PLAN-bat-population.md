@@ -1582,12 +1582,6 @@ chosen to defer to here, so that we do not forget them.
   `KNOWN_WRITER_DIVERGENCES` vhd entries in `tests/test_create.py`
   and the two `test_vpc_*_noop_preallocation` tests are the current
   coverage.
-* Wiring the fuzz targets phase 11 added (`fuzz_vhdx_fixed_bat`, and
-  `fuzz_create_emitters`' widened VHDX arm) into the coverage-fuzz CI
-  schedule. Phase 11 committed and documented them but left the
-  schedule alone, because the target list and time budget are a
-  CI-cost decision and the merge queue's provisioning is its own live
-  issue.
 * VMDK `twoGbMaxExtentSparse` and `twoGbMaxExtentFlat` output, the
   remaining leaf of the same goal. The streaming filler this plan
   builds is the shape a grain-table writer would want; the multiple

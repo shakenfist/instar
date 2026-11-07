@@ -231,13 +231,24 @@ the survey found, so the next reader does not re-derive it.
    the restriction when it is fixed. Phase 10 made the same call for
    the same reason and did not add a create case at that geometry.
 
-7. **Fuzz targets are not added to CI's fuzzing schedule by this
-   phase.** The coverage-fuzz workflow's target list and time budget
-   are a CI-cost decision, not a correctness one, and the merge queue
-   is already the subject of its own live issue. The targets are
-   committed, buildable and runnable by hand; wiring them into the
-   schedule is one line and is recorded in Future work. Step 11f
-   documents how to run them.
+7. **A new fuzz target is registered in the coverage-fuzz workflow,
+   because the repository gives no choice; the tier it lands in is the
+   real decision, and it is the fast one.** This decision originally
+   read "fuzz targets are not added to CI's fuzzing schedule by this
+   phase", on the reasoning that the target list and time budget are a
+   CI-cost call rather than a correctness one. Step 11b found that
+   option does not exist: `tools/ci/check-fuzz-targets.sh` requires the
+   filesystem's `fuzz_targets/*.rs`, the cargo bin targets and
+   `coverage-fuzz.yml`'s `TARGETS` array to name the same set, and it
+   runs in `functional-tests.yml`, so a target absent from the workflow
+   is a red CI rather than a deferred cost. What *is* optional is
+   `tools/ci/fuzz-tier.sh`'s `FAST_TIER`, which the guard checks as a
+   subset: an unlisted target defaults to the **deep** tier. So the new
+   target is listed in `FAST_TIER`, beside `fuzz_create_emitters`,
+   which is the same shape of bounded pure-function target. That keeps
+   the deep tier's budget where it was, which is what the original
+   decision was actually trying to protect. Step 11f still documents
+   how to run a target by hand.
 
 ## Step plan
 
@@ -412,6 +423,46 @@ crafted six seeds covering both subformats and both block states at two
 block sizes; the corpus directory is gitignored, so they do not appear
 in the diff, and the originals are kept with the step's scratch output.
 
+**Step 11b overrode decision 7, and had to.** The decision as
+written was not an available option, which the management session
+confirmed against the tree: `tools/ci/check-fuzz-targets.sh` requires
+the filesystem targets, the cargo bin targets and
+`coverage-fuzz.yml`'s `TARGETS` array to name the same set, and it runs
+as a step of `functional-tests.yml`, so leaving a new target out of the
+workflow turns CI red rather than deferring a cost. `FAST_TIER` in
+`tools/ci/fuzz-tier.sh` is the part that is genuinely optional, checked
+as a subset, with an unlisted target defaulting to the deep tier. The
+target is therefore registered in both, in `FAST_TIER` beside
+`fuzz_create_emitters`, so the deep tier's budget is unchanged --
+which is what decision 7 was trying to protect. The decision is
+corrected at its source above, its out-of-scope bullet is gone, and the
+Future work entry that promised the wiring as deferred work has been
+removed from the master plan, because the work is done. **This is a
+change to something the operator approved in the back brief**, and it
+is reported as such rather than absorbed quietly.
+
+**Assertion 7's qemu claim was checked, not taken.** The new target
+asserts that a payload block's offset is the one qemu's forward map
+gives it, citing `vhdx_block_translate` in `block/vhdx.c`. Verified in
+`instar-testdata/qemu-sources/7.0.0/block/vhdx.c:1129`:
+`sinfo->bat_idx += sinfo->bat_idx >> s->chunk_ratio_bits`, which is
+exactly the `p + p / chunk_ratio` the assertion inverts. The assertion
+derives the offset independently of the filler's own arithmetic, so a
+map right about its shape and wrong about which block an index belongs
+to is still caught.
+
+**A defect in 11a's mutation harness, found by 11b.** The
+`clear_artefacts` step cleared a cargo `.fingerprint` directory that
+does not exist on this tree, so it had always been a no-op and only
+the mtime bump was forcing rebuilds. 11b's first harness lacked even
+that and produced one phantom baseline failure from a stale mutant
+object -- the same shape as the stale-bytecode trap this session hit
+earlier, in a different language. Both harnesses now confirm
+`Compiling vhdx` appears in each mutant's log before trusting its
+verdict. 11a's five verdicts stand: the management session had already
+reproduced one of them independently and watched the right assertion
+fire.
+
 ## Back brief
 
 Points needing the operator's answer before any step runs:
@@ -443,8 +494,6 @@ Points needing the operator's answer before any step runs:
 * **Fixing #879** (`convert -O vhdx --subformat fixed` on a partial
   last block holding data). Already recorded in Future work by phase 9;
   decision 6 routes around it and names it.
-* **Wiring the new targets into the coverage-fuzz CI schedule.**
-  Decision 7; recorded in Future work.
 * **The cross-cutting documentation pages.** Phase 12 owns
   `docs/format-coverage.md`, `docs/quirks.md`,
   `docs/format-internals.md` and `ARCHITECTURE.md`. 11f touches only
