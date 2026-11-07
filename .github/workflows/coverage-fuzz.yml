@@ -213,6 +213,7 @@ jobs:
               fuzz_measure_scan
               fuzz_map_iter
               fuzz_create_emitters
+              fuzz_vhdx_fixed_bat
               fuzz_resize_planners
               fuzz_rebase_planners
               fuzz_commit_planners
