@@ -79,7 +79,7 @@ Usage::
 import os
 import struct
 from dataclasses import dataclass, field
-from typing import List, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 KiB = 1024
 MiB = 1024 * KiB
@@ -531,6 +531,45 @@ def parse_vhdx(path) -> VhdxStructure:
             bat_runs=runs,
             allocated_bytes=allocated,
         )
+
+
+def truncated_inside_region(path) -> Optional[Tuple[str, int, int]]:
+    """Describe a VHDX whose file ends inside a region it declares, with nothing allocated.
+
+    Returns `(region_name, declared_end, file_length)` when `path`'s region
+    table declares a region whose extent ends past the end of the file,
+    *and* no payload block is allocated -- every byte of the BAT region,
+    which does itself lie inside the file, is zero. Returns None otherwise,
+    including when the file cannot be read far enough to tell.
+
+    This is the shape of a writer that ends the file after the metadata it
+    wrote rather than after the region it declared. `parse_vhdx` refuses
+    such a file, because the geometry it needs is in a region it cannot
+    read whole, so a caller that has to tell this shape apart from any
+    other parse failure cannot use `parse_vhdx` to do it.
+    """
+    try:
+        handle = open(path, 'rb')
+    except OSError:
+        return None
+    with handle:
+        reader = _Reader(handle, os.fstat(handle.fileno()).st_size)
+        try:
+            if reader.read(0, 8, 'file identifier') != FILE_IDENTIFIER_SIGNATURE:
+                return None
+            table = _parse_region_table(reader, REGION_TABLE_OFFSETS[0])
+            overrunning = [entry for entry in table if entry.offset + entry.length > reader.length]
+            if not overrunning:
+                return None
+            bat_region = _find_region(table, BAT_REGION_GUID)
+            if bat_region.offset + bat_region.length > reader.length:
+                return None
+            if any(reader.read(bat_region.offset, bat_region.length, 'bat region')):
+                return None
+        except VhdxParseError:
+            return None
+    worst = max(overrunning, key=lambda entry: entry.offset + entry.length)
+    return worst.name, worst.offset + worst.length, reader.length
 
 
 def patch_virtual_disk_size(path, virtual_disk_size):

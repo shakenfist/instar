@@ -52,6 +52,13 @@ from helpers.snapshot_readback import snapshot_readback  # noqa: E402
 # by hand, and the rule for the sibling file a multi-file create
 # subformat writes beside its output reached only one of the two.
 from helpers.info_json import normalise_info_json  # noqa: E402
+# The VHDX structural comparator and the committed record of what each
+# qemu-img build writes, by the same mechanism. `convert -O vhdx` output is
+# compared through these as well as by content, because a raw flatten
+# cannot see a container's layout.
+from helpers.qemu_pins import PinError, expected, load_pin  # noqa: E402
+from helpers.vhdx_structure import (VhdxParseError, parse_vhdx, structural_diff,  # noqa: E402
+                                    summarise, truncated_inside_region)
 
 
 # ---------------------------------------------------------------------------
@@ -1070,15 +1077,237 @@ def op_check(instar_bin, instar_copy, qemu_copy, fmt, timeout,
     return None
 
 
+# ---------------------------------------------------------------------------
+# VHDX output: the structural oracle
+# ---------------------------------------------------------------------------
+#
+# Flattening two images to raw and hashing them compares content and is
+# blind to the container. Every property the fixed VHDX subformat exists to
+# get right -- a BAT entry for every payload block, FULLY_PRESENT against
+# PAYLOAD_BLOCK_ZERO, strictly increasing 1 MiB-aligned offsets, nothing
+# written past the payload region -- survives a raw flatten identically
+# whether instar got it right or wrong, so an op that only flattens buys no
+# coverage of the layout.
+#
+# The two sides of the structural comparison are instar's output and the
+# committed pin in tests/golden/qemu-create-pins.json, which records the
+# structure each static qemu-img build writes for a named command. qemu-img
+# does write VHDX, so a live qemu side exists, but for a fixed target it is
+# the wrong side: instar deliberately writes the layout of `qemu-img create
+# -o subformat=fixed,block_state_zero=off`, where every payload entry is
+# FULLY_PRESENT at its fixed offset, while `qemu-img convert -o
+# subformat=fixed` appends new data after the preallocated region and
+# leaves the untouched entries ZERO. That difference is intended and
+# documented (docs/quirks.md, the VHDX sections), so comparing the two
+# convert outputs would report it on every iteration. The pin of what qemu
+# *creates* is the layout instar means to reproduce, and the pin is checked
+# across every qemu build rather than against whichever one is installed.
+
+# A fixed VHDX's file length is its whole virtual size, so an iteration's
+# output is held to this much even though its untouched blocks are holes.
+_VHDX_PIN_MAX_VIRTUAL_SIZE = 1024 * 1024 * 1024
+
+# What a dynamic VHDX's structure takes from the source's data rather than
+# from its geometry, and so cannot be compared with a pinned create. A
+# fixed VHDX has neither: its BAT and its file length follow from the
+# geometry alone, whatever the source held.
+_VHDX_DATA_DEPENDENT_FIELDS = ('file_length', 'bat')
+
+_VHDX_PIN_GEOMETRIES = None
+
+# Iterations not compared because they hit a defect already filed, by
+# issue. These are skips, not passes: they are logged and reported in the
+# run summary, because a suppression nobody can see reads as coverage.
+KNOWN_DEFECT_SKIPS = {}
+
+
+def _vhdx_pin_geometries():
+    """Pinned geometries this fuzzer can referee: `{subformat: {(virtual_size, block_size): case_name}}`.
+
+    Read out of the committed pin rather than written out here, so adding a
+    pin case widens the fuzzer without a second edit. A case qualifies when
+
+    * it writes the layout instar's own writer copies: for `fixed` the
+      `block_state_zero=off` create, and for `dynamic` the default one --
+      the two dynamic layouts differ only in their BAT entry states, and
+      the BAT is not compared for a dynamic target anyway;
+    * every pinned qemu version agrees on it, so the comparison does not
+      depend on which build the pin was taken from;
+    * qemu created it successfully and this parser could read it;
+    * its virtual size is small enough to write many times over; and
+    * for `fixed`, its virtual size is a whole number of blocks. That is
+      #879: `convert -O vhdx --subformat fixed` fails when the partial last
+      block holds data, so generating such a geometry would report a known
+      bug on those iterations instead of coverage. Drop this filter when
+      #879 is fixed.
+    """
+    global _VHDX_PIN_GEOMETRIES
+    if _VHDX_PIN_GEOMETRIES is not None:
+        return _VHDX_PIN_GEOMETRIES
+
+    geometries = {'fixed': {}, 'dynamic': {}}
+    try:
+        pin = load_pin()
+    except (OSError, ValueError) as e:
+        _log_once('vhdx-pin', 'no VHDX structural comparison: the qemu pin could not be read: %s', e)
+        _VHDX_PIN_GEOMETRIES = geometries
+        return geometries
+
+    for name in pin['cases']:
+        if name.startswith('vhdx-fixed-'):
+            subformat = 'fixed'
+            if not name.endswith('-bsz-off'):
+                continue
+        elif name.startswith('vhdx-dynamic-'):
+            subformat = 'dynamic'
+            if name.endswith('-bsz-off'):
+                continue
+        else:
+            continue
+        try:
+            result = expected(name, pin=pin)
+        except PinError:
+            # The case's result changed across qemu versions, so there is
+            # no single structure to hold instar's output to.
+            continue
+        summary = result.get('summary')
+        if result.get('rc') != 0 or not summary or 'parse_error' in summary:
+            continue
+        virtual_size = summary.get('virtual_disk_size')
+        block_size = summary.get('block_size')
+        if not virtual_size or not block_size:
+            continue
+        if virtual_size > _VHDX_PIN_MAX_VIRTUAL_SIZE:
+            continue
+        if subformat == 'fixed' and virtual_size % block_size:
+            continue
+        geometries[subformat][(virtual_size, block_size)] = name
+
+    _VHDX_PIN_GEOMETRIES = geometries
+    return geometries
+
+
+def compare_vhdx_structure(image, subformat, virtual_size, operation, context):
+    """Compare a VHDX `image` instar wrote with the pinned structure for its geometry.
+
+    Returns a divergence dict, or None when the two agree or when no pinned
+    case referees this geometry. `virtual_size` is the size the output must
+    have, which is the source's: keying the pin on it rather than on the
+    size the file claims means a wrong `virtual_disk_size` is reported as a
+    difference instead of moving the image off the pinned geometry and
+    silencing the comparison. The block size is read back out of the image,
+    so an output whose block size came from the tool's own default is
+    refereed too.
+
+    For a `fixed` image the whole structure is compared, the BAT and the
+    file length included, because both follow from the geometry alone. For
+    a `dynamic` one those two follow the source's data, so they are left
+    out and the comparison covers the region tables, the metadata items and
+    the geometry.
+
+    `operation` names the op in the divergence `type`, which is distinct
+    from the content comparison's so that triage reads which of the two
+    differed off the type rather than out of the payload. `context` is
+    merged into the result. This is a helper rather than inline code
+    because `dd` draws a `vhdx` target too and compares its output exactly
+    as `convert` does, so that output's layout is just as unexamined.
+    """
+    try:
+        summary = summarise(parse_vhdx(image))
+    except (VhdxParseError, OSError) as e:
+        # #883: `convert -O vhdx` ends the output file after the metadata
+        # it wrote rather than after the metadata region it declared, so an
+        # output that allocates no payload block stops inside its own
+        # region table's extent. Both tools' `info` and `check` accept such
+        # a file and its content compares equal, so this comparison is the
+        # only one that sees it -- and it would see it on most of the
+        # dynamic iterations this fuzzer runs, which would bury every other
+        # finding. The condition is established structurally rather than
+        # from the message text, so a reworded error neither silently stops
+        # the skip nor widens it. Remove this when #883 is fixed.
+        known = truncated_inside_region(image)
+        if known is not None:
+            region, declared_end, file_length = known
+            key = f'{operation}_vhdx_truncated_region_issue_883'
+            KNOWN_DEFECT_SKIPS[key] = KNOWN_DEFECT_SKIPS.get(key, 0) + 1
+            _log_once(
+                key,
+                'skipping the VHDX structural comparison where issue 883 applies: the %s region is '
+                'declared to end at %d but the file is %d bytes, and no payload block is allocated. '
+                'Counted as a skip, not a pass; the total is in the run summary.',
+                region, declared_end, file_length,
+            )
+            return None
+        return dict(context, type=f'{operation}_vhdx_parse_failure',
+                    vhdx_subformat=subformat, parse_error=str(e))
+
+    geometry = (virtual_size, summary.get('block_size'))
+    case = _vhdx_pin_geometries().get(subformat, {}).get(geometry)
+    if case is None:
+        return None
+
+    want = expected(case)['summary']
+    if subformat == 'dynamic':
+        fields = [key for key in want if key not in _VHDX_DATA_DEPENDENT_FIELDS]
+    else:
+        fields = list(want)
+    differences = structural_diff({key: summary.get(key) for key in fields},
+                                  {key: want[key] for key in fields})
+    if not differences:
+        return None
+    return dict(context, type=f'{operation}_vhdx_structure_divergence',
+                vhdx_subformat=subformat, pin_case=case,
+                virtual_size=geometry[0], block_size=geometry[1],
+                differences=differences)
+
+
+def _convert_vhdx_shape(rng, source, timeout):
+    """Pick `(subformat, block_size, virtual_size)` for a `-O vhdx` convert target.
+
+    `virtual_size` is the source's, probed once here and passed on to the
+    structural comparison, or None if it could not be probed.
+
+    A `block_size` of None leaves the option unset, which is a shape in its
+    own right: the one the tools' own default picks.
+
+    `fixed` is drawn only at a geometry the pin referees, and always with an
+    explicit block size, for two reasons that are separate. The pin is the
+    oracle, and there is no pinned structure for a geometry the sweep never
+    ran. And a fixed target left to the default block size would land on a
+    partial last block for most of the virtual sizes this fuzzer generates,
+    which is #879 -- `convert -O vhdx --subformat fixed` fails when the
+    partial last block holds data -- so it would report a known bug rather
+    than coverage. `dynamic` has neither constraint, so it is always
+    available and may leave the block size unset.
+    """
+    virtual_size = _map_probe_virtual_size(source, timeout)
+    geometries = _vhdx_pin_geometries()
+    fixed_blocks = sorted(block for (vsize, block) in geometries['fixed'] if vsize == virtual_size)
+    if fixed_blocks and rng.random() < 0.5:
+        return 'fixed', rng.choice(fixed_blocks), virtual_size
+    dynamic_blocks = sorted(block for (vsize, block) in geometries['dynamic'] if vsize == virtual_size)
+    return 'dynamic', rng.choice([None] + dynamic_blocks), virtual_size
+
+
 def op_convert(instar_bin, instar_copy, qemu_copy, fmt,
                timeout, rng, compress=False):
     """Convert both copies to a random output format; compare results.
 
     Converts both to raw and then SHA-compares the raw outputs to
-    ensure data content is identical.
+    ensure data content is identical. A `vhdx` target is compared twice:
+    by that content comparison, and by `compare_vhdx_structure`, because
+    the flatten to raw cannot see the container's layout.
     """
-    # Pick a target format for the convert
-    target_fmt = rng.choice(['raw', 'qcow2'])
+    # Pick a target format for the convert. vhdx is here for its layout,
+    # which the structural comparison below examines; the content
+    # comparison alone would buy no coverage of it.
+    target_fmt = rng.choice(['raw', 'qcow2', 'vhdx'])
+
+    vhdx_subformat = None
+    vhdx_block_size = None
+    vhdx_virtual_size = None
+    if target_fmt == 'vhdx':
+        vhdx_subformat, vhdx_block_size, vhdx_virtual_size = _convert_vhdx_shape(rng, qemu_copy, timeout)
 
     instar_out = instar_copy.parent / f'{instar_copy.stem}-conv.{target_fmt}'
     qemu_out = qemu_copy.parent / f'{qemu_copy.stem}-conv.{target_fmt}'
@@ -1087,28 +1316,43 @@ def op_convert(instar_bin, instar_copy, qemu_copy, fmt,
     instar_args = ['-O', target_fmt]
     if compress and target_fmt == 'qcow2':
         instar_args.append('--compress')
+    if vhdx_subformat:
+        instar_args.extend(['--subformat', vhdx_subformat])
+    if vhdx_block_size:
+        instar_args.extend(['--block-size', str(vhdx_block_size)])
     instar_args.extend([str(instar_copy), str(instar_out)])
 
     i_out, i_err, i_rc = run_instar(
         instar_bin, ['convert'], instar_args, timeout=timeout,
     )
 
-    # Convert with qemu-img
+    # Convert with qemu-img, on the same geometry: the exit-code and
+    # content comparisons below are only meaningful when both sides were
+    # asked for the same thing.
     qemu_args = ['-O', target_fmt]
     if compress and target_fmt == 'qcow2':
         qemu_args.append('-c')
+    if vhdx_subformat:
+        options = [f'subformat={vhdx_subformat}']
+        if vhdx_block_size:
+            options.append(f'block_size={vhdx_block_size}')
+        qemu_args.extend(['-o', ','.join(options)])
     qemu_args.extend([str(qemu_copy), str(qemu_out)])
 
     q_out, q_err, q_rc = run_qemu_img(
         ['convert'], qemu_args, timeout=timeout,
     )
 
-    div = compare_exit_codes(i_rc, q_rc, 'convert', {
-        'target_format': target_fmt,
-        'compress': compress,
-        'instar_stderr': i_err[:500],
-        'qemu_stderr': q_err[:500],
-    })
+    context = {'target_format': target_fmt, 'compress': compress}
+    if vhdx_subformat:
+        context['vhdx_subformat'] = vhdx_subformat
+        context['vhdx_block_size'] = vhdx_block_size
+
+    div = compare_exit_codes(i_rc, q_rc, 'convert', dict(
+        context,
+        instar_stderr=i_err[:500],
+        qemu_stderr=q_err[:500],
+    ))
     if div:
         return div
 
@@ -1116,16 +1360,25 @@ def op_convert(instar_bin, instar_copy, qemu_copy, fmt,
         # Both failed; no further comparison needed
         return None
 
+    # The layout comparison, for a vhdx target. It runs as well as the
+    # content comparison below, not instead of it, and carries its own
+    # divergence type.
+    structural_div = None
+    if target_fmt == 'vhdx':
+        structural_div = compare_vhdx_structure(
+            instar_out, vhdx_subformat, vhdx_virtual_size, 'convert', context,
+        )
+
     # Compare content: convert both outputs to raw and hash
+    content_div = None
     if target_fmt == 'raw':
         if not files_match(instar_out, qemu_out):
-            return {
-                'type': 'convert_content_divergence',
-                'target_format': target_fmt,
-                'compress': compress,
-                'instar_sha256': _file_sha256(instar_out),
-                'qemu_sha256': _file_sha256(qemu_out),
-            }
+            content_div = dict(
+                context,
+                type='convert_content_divergence',
+                instar_sha256=_file_sha256(instar_out),
+                qemu_sha256=_file_sha256(qemu_out),
+            )
     else:
         # For non-raw targets, convert both to raw and compare
         instar_raw = instar_copy.parent / f'{instar_copy.stem}-verify.raw'
@@ -1146,16 +1399,22 @@ def op_convert(instar_bin, instar_copy, qemu_copy, fmt,
 
         if instar_raw.exists() and qemu_raw.exists():
             if not files_match(instar_raw, qemu_raw):
-                return {
-                    'type': 'convert_content_divergence',
-                    'target_format': target_fmt,
-                    'compress': compress,
-                    'note': 'raw-flattened content differs',
-                    'instar_sha256': _file_sha256(instar_raw),
-                    'qemu_sha256': _file_sha256(qemu_raw),
-                }
+                content_div = dict(
+                    context,
+                    type='convert_content_divergence',
+                    note='raw-flattened content differs',
+                    instar_sha256=_file_sha256(instar_raw),
+                    qemu_sha256=_file_sha256(qemu_raw),
+                )
 
-    return None
+    # A content difference is reported in preference to a layout one,
+    # because an output whose payload is wrong is the larger finding; the
+    # flag says whether the layout differed as well, so neither is lost.
+    if content_div:
+        if structural_div:
+            content_div['structure_also_diverged'] = True
+        return content_div
+    return structural_div
 
 
 # ---------------------------------------------------------------------------
@@ -5609,6 +5868,11 @@ def main():
                 'Inconclusive iterations (external-tool timeout, '
                 'not a divergence): %d', len(inconclusive),
             )
+        for name, count in sorted(KNOWN_DEFECT_SKIPS.items()):
+            logger.info(
+                'Comparisons skipped for an already-filed defect (not a pass): %s x%d',
+                name, count,
+            )
 
         # Write summary (including in --fail-fast mode)
         summary = {
@@ -5624,6 +5888,7 @@ def main():
             # a degraded run is distinguishable from a clean one after
             # the fact rather than only in the log.
             'libyal_tools': sorted(libyal_tools),
+            'known_defect_skips': dict(KNOWN_DEFECT_SKIPS),
         }
         if issues is not None:
             summary.update(issues.finish())
