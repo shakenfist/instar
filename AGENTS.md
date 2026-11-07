@@ -71,6 +71,10 @@ Per-format feature detail is in
 
 ## Things that will bite you
 
+- **A new fuzz target must be registered in three places or CI fails:**
+  the `.rs` file, a `[[bin]]` stanza in `src/fuzz/Cargo.toml`, and the
+  `TARGETS` array in `.github/workflows/coverage-fuzz.yml`
+  (`tools/ci/check-fuzz-targets.sh` checks). See `docs/testing.md`.
 - **Never call `.unwrap()` in production code.** The workspace enables
   clippy's `unwrap_used` lint and CI runs `-D warnings`, so a new unwrap
   fails lint. Use `?` and proper error propagation, or
