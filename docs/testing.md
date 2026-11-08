@@ -1712,6 +1712,15 @@ is the structure, so triage can tell which differed from the type
 alone. Dynamic comparisons skip the fields that depend on the data
 written. A geometry with no pin is not structurally compared.
 
+Which pin referees an output is decided by the virtual size and block
+size that were *asked for*, not by the ones the output claims: a wrong
+`virtual_disk_size` or `block_size` is then reported as a difference,
+rather than moving the image off the pinned geometry and silencing the
+comparison that would have caught it. The block size is read back out
+of the image only for the draw that leaves the option unset, which is
+the one case where what was asked for is whatever the tool's own
+default picked.
+
 #### What the differential fuzzer does not cover
 
 An exclusion that is not written down reads as coverage, so these are
@@ -2207,6 +2216,11 @@ checked as a subset rather than for equality, since an unlisted target
 legitimately defaults to the deep tier. The guard needs no docker, no
 cargo and no testdata, and `tools/ci/test-check-fuzz-targets.sh` proves
 it still fails when one list loses an entry.
+
+Two prose counts of the same set are not checked by anything and have
+to be updated by hand with the table above: "N fuzz targets cover all
+parser crates" in [development.md](development.md) and "has grown to
+**N targets**" in [security-audits.md](security-audits.md).
 
 #### Crash reporting
 

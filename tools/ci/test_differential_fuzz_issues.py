@@ -14,8 +14,10 @@ callables are replaced with recorders.
 
 import ast
 import os
+import re
 import types
 import unittest
+from unittest import mock
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _DF_PATH = os.path.join(_HERE, '..', '..', 'scripts', 'differential-fuzz.py')
@@ -162,38 +164,161 @@ class ContentDivergenceKeyTestCase(unittest.TestCase):
         self.assertNotEqual(df.divergence_key(bench('raw')), df.divergence_key(bench('qcow2')))
 
 
+# Every dict the fuzzer builds with a literal `type` is one of its
+# records, so the scan matches on having a type at all rather than on a
+# list of suffixes. The 66 types in the file end in nine different words
+# -- _divergence, _failure, _failed, _timeout, _unparseable, _error,
+# _crash, _bound, _conservative -- and an allowlist of those is stale
+# the moment a tenth is written, which is how the fields below went
+# unclassified in the first place.
+#
+# The one kind of record that is not a divergence is excluded by the
+# same prefix the fuzzer itself routes it by: an `inconclusive_` record
+# is logged and never reaches `divergence_key` or the issue filer. A
+# crash record does reach both, so it is in.
+_NOT_A_DIVERGENCE_PREFIX = 'inconclusive_'
+
+# The fuzzer's name for a variable holding a divergence. A field added by
+# subscript assignment (div['x'] = y) cannot be tied to a dict by reading
+# alone, so the scan goes by this convention and
+# test_every_divergence_variable_follows_the_naming_convention keeps the
+# convention true.
+_DIVERGENCE_NAME = re.compile(r'(^|_)div(ergence)?$')
+
+
+def _type_text(node):
+    """The literal tail of a divergence `type` expression, or None.
+
+    A plain string is itself; an f-string is its last piece, which is
+    where the fuzzer puts the part that names the comparison.
+    """
+    if isinstance(node, ast.Constant):
+        return str(node.value)
+    if isinstance(node, ast.JoinedStr) and node.values:
+        tail = node.values[-1]
+        if isinstance(tail, ast.Constant):
+            return str(tail.value)
+    return None
+
+
+def _is_divergence_type(node):
+    """Whether a `type` expression names a record that can file an issue.
+
+    Only the literal tail of an interpolated type is knowable here, so an
+    `inconclusive_` type built by interpolation would read as a
+    divergence. Every one in the file is a plain literal today, and the
+    error is in the safe direction: a field classified that is never
+    keyed costs nothing, while an unclassified one fails CI.
+    """
+    text = _type_text(node)
+    return bool(text) and not text.startswith(_NOT_A_DIVERGENCE_PREFIX)
+
+
 class ShapeFieldsTestCase(unittest.TestCase):
     def divergence_fields(self):
         """Every field named in a divergence the fuzzer builds.
 
-        Reads the source rather than running it: a divergence is a dict
-        literal with a 'type' ending in _divergence, plus the context
-        dicts some of them spread in with **ctx, which are found by name.
+        Reads the source rather than running it. A divergence is built in
+        one of four shapes, and all four have carried a field the lists
+        below had to classify:
+
+        * a dict literal whose 'type' is a divergence type;
+        * `dict(ctx, type=..., ...)`, which spreads a context in by call
+          rather than by `**`;
+        * the context dicts spread in either way, found by name; and
+        * `div['field'] = value` after the fact.
         """
         with open(_DF_PATH, encoding='utf-8') as f:
             tree = ast.parse(f.read())
         spread = set()
         fields = set()
         for node in ast.walk(tree):
-            if not isinstance(node, ast.Dict):
-                continue
-            keys = [k.value if isinstance(k, ast.Constant) else None for k in node.keys]
-            types_ = [v.value for k, v in zip(keys, node.values)
-                      if k == 'type' and isinstance(v, ast.Constant)]
-            if types_ and str(types_[0]).endswith('_divergence'):
-                fields.update(k for k in keys if k and k != 'type')
-                spread.update(v.id for k, v in zip(keys, node.values) if k is None and isinstance(v, ast.Name))
+            if isinstance(node, ast.Dict):
+                keys = [k.value if isinstance(k, ast.Constant) else None for k in node.keys]
+                types_ = [v for k, v in zip(keys, node.values) if k == 'type']
+                if types_ and _is_divergence_type(types_[0]):
+                    fields.update(k for k in keys if k and k != 'type')
+                    spread.update(v.id for k, v in zip(keys, node.values)
+                                  if k is None and isinstance(v, ast.Name))
+            elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id == 'dict'):
+                types_ = [kw.value for kw in node.keywords if kw.arg == 'type']
+                if types_ and _is_divergence_type(types_[0]):
+                    fields.update(kw.arg for kw in node.keywords if kw.arg and kw.arg != 'type')
+                    spread.update(a.id for a in node.args if isinstance(a, ast.Name))
         for node in ast.walk(tree):
-            if (isinstance(node, ast.Assign) and isinstance(node.value, ast.Dict)
-                    and any(isinstance(t, ast.Name) and t.id in spread for t in node.targets)):
+            if not isinstance(node, ast.Assign):
+                continue
+            if isinstance(node.value, ast.Dict) and any(
+                    isinstance(t, ast.Name) and t.id in spread for t in node.targets):
                 fields.update(k.value for k in node.value.keys if isinstance(k, ast.Constant))
+            for target in node.targets:
+                if (isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name)
+                        and _DIVERGENCE_NAME.search(target.value.id)
+                        and isinstance(target.slice, ast.Constant)):
+                    fields.add(str(target.slice.value))
         return fields
+
+    def divergence_variables(self):
+        """Every variable the fuzzer assigns a divergence it built inline."""
+        with open(_DF_PATH, encoding='utf-8') as f:
+            tree = ast.parse(f.read())
+        names = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign):
+                continue
+            value = node.value
+            if isinstance(value, ast.Dict):
+                keys = [k.value if isinstance(k, ast.Constant) else None for k in value.keys]
+                types_ = [v for k, v in zip(keys, value.values) if k == 'type']
+            elif (isinstance(value, ast.Call) and isinstance(value.func, ast.Name)
+                    and value.func.id == 'dict'):
+                types_ = [kw.value for kw in value.keywords if kw.arg == 'type']
+            else:
+                continue
+            if types_ and _is_divergence_type(types_[0]):
+                names.update(t.id for t in node.targets if isinstance(t, ast.Name))
+        return names
 
     def test_the_scan_finds_the_divergences(self):
         # A scan that matched nothing would pass the test below vacuously.
         fields = self.divergence_fields()
         for expected in ('target_format', 'field_divergences', 'corruption', 'shape'):
             self.assertIn(expected, fields)
+
+    def test_the_scan_sees_every_shape_a_divergence_is_built_in(self):
+        # One field per shape, so a scan that lost one of the four shapes
+        # fails here rather than going quiet: a dict literal, a
+        # dict(ctx, type=...) call with an interpolated type, a context
+        # spread in by name, and a subscript assignment after the fact.
+        fields = self.divergence_fields()
+        for expected in ('corruption', 'vhdx_subformat', 'instar_stderr', 'structure_also_diverged',
+                         'error'):
+            self.assertIn(expected, fields)
+
+    def test_the_scan_does_not_depend_on_how_a_type_is_spelled(self):
+        # `cushion` is carried only by measure_above_fully_allocated_bound,
+        # whose type ends in none of the words a suffix allowlist would
+        # have held. Its presence is what says the scan matches on having
+        # a type rather than on the type's last word.
+        self.assertIn('cushion', self.divergence_fields())
+
+    def test_inconclusive_records_are_not_divergences(self):
+        # An inconclusive record is logged for visibility and never
+        # reaches divergence_key or the issue filer, so its own fields are
+        # deliberately out of the scan's scope. `timed_out` is carried by
+        # nothing else.
+        self.assertNotIn('timed_out', self.divergence_fields())
+
+    def test_every_divergence_variable_follows_the_naming_convention(self):
+        # The subscript half of the scan goes by variable name, so a
+        # divergence held in a variable the pattern does not match would
+        # take its later fields out of the scan's sight.
+        stray = {name for name in self.divergence_variables()
+                 if not _DIVERGENCE_NAME.search(name)}
+        self.assertEqual(set(), stray,
+                         'name a variable holding a divergence `div`, `..._div` or `divergence` '
+                         'so fields assigned into it later are still scanned')
 
     def test_every_divergence_field_is_classified(self):
         unclassified = self.divergence_fields() - set(df.SHAPE_FIELDS) - df.PER_ITERATION_FIELDS
@@ -283,6 +408,155 @@ class IssueFilerTestCase(unittest.TestCase):
         # A broken gh is tried no more often than a working one would be.
         self.assertEqual([0, 1, 2], attempts)
         self.assertEqual(2, summary['issue_shapes_suppressed'])
+
+
+MiB = 1024 * 1024
+
+
+class VhdxPinCaseSelectionTestCase(unittest.TestCase):
+    """The cases the structural comparison referees are chosen by option, not by name."""
+
+    def test_a_case_is_selected_whichever_order_its_options_are_in(self):
+        # A pin case's name is built by joining option abbreviations in
+        # the order the case lists them, so a selector that read the name
+        # would drop this case the moment someone wrote its two options
+        # the other way round.
+        ordered = {
+            'name': 'vhdx-fixed-64M-block-1M-bsz-off', 'kind': df.KIND_VHDX_CREATE, 'size': '64M',
+            'args': ['-f', 'vhdx', '-o', 'subformat=fixed,block_size=1M,block_state_zero=off'],
+        }
+        swapped = dict(
+            ordered, name='vhdx-fixed-64M-bsz-off-block-1M',
+            args=['-f', 'vhdx', '-o', 'subformat=fixed,block_state_zero=off,block_size=1M'],
+        )
+        for case in (ordered, swapped):
+            with self.subTest(name=case['name']):
+                with mock.patch.object(df, 'CASES', [case]):
+                    self.assertEqual({case['name']: 'fixed'}, df._vhdx_pin_case_subformats())
+
+    def test_the_layouts_instar_does_not_write_are_refused(self):
+        cases = [
+            # Fixed without block_state_zero=off: not the layout instar's
+            # writer copies.
+            {'name': 'fixed-on', 'kind': df.KIND_VHDX_CREATE,
+             'args': ['-f', 'vhdx', '-o', 'subformat=fixed']},
+            # Dynamic with it: the default dynamic case stands in for
+            # both, since a dynamic BAT is not compared.
+            {'name': 'dynamic-off', 'kind': df.KIND_VHDX_CREATE,
+             'args': ['-f', 'vhdx', '-o', 'block_state_zero=off']},
+            # A differencing image's structure follows its parent.
+            {'name': 'fixed-base', 'kind': df.KIND_VHDX_CREATE, 'base': 'vhdx',
+             'args': ['-f', 'vhdx', '-o', 'subformat=fixed,block_state_zero=off']},
+            # Another kind of pinned command entirely.
+            {'name': 'prealloc', 'kind': 'prealloc', 'args': ['-f', 'vhdx']},
+        ]
+        with mock.patch.object(df, 'CASES', cases):
+            self.assertEqual({}, df._vhdx_pin_case_subformats())
+
+    def test_the_committed_cases_still_offer_both_subformats(self):
+        # Vacuity guard: both tests above would pass against a selector
+        # that matched nothing in the real case list.
+        self.assertEqual({'fixed', 'dynamic'}, set(df._vhdx_pin_case_subformats().values()))
+
+
+class VhdxStructureIssueShapeTestCase(unittest.TestCase):
+    """A structural divergence files per subformat and geometry, not one issue for all of them."""
+
+    @staticmethod
+    def divergence(subformat, case, **overrides):
+        return dict({
+            'type': 'convert_vhdx_structure_divergence', 'operation': 'convert',
+            'target_format': 'vhdx', 'compress': False,
+            'vhdx_subformat': subformat, 'pin_case': case,
+            'virtual_size': 64 * MiB, 'block_size': MiB,
+            'differences': ['file_length: 1 != 2'],
+        }, **overrides)
+
+    def test_fixed_and_dynamic_are_separate_findings(self):
+        # The distinction the structural arm exists to expose: without
+        # the subformat in the shape these two share a type, an
+        # operation, a target format and a compress flag, so one issue
+        # would stand for both.
+        self.assertNotEqual(
+            df.divergence_key(self.divergence('fixed', 'vhdx-fixed-64M-bsz-off')),
+            df.divergence_key(self.divergence('dynamic', 'vhdx-dynamic-64M')))
+
+    def test_two_subformats_failing_to_parse_are_separate_findings(self):
+        # A parse failure carries no pin case, because the geometry was
+        # never established, so the subformat is the only thing telling a
+        # fixed output that could not be read from a dynamic one. This is
+        # what `vhdx_subformat` is in the shape for; `pin_case` carries
+        # the distinction on its own whenever there is a pin case.
+        def failure(subformat):
+            return {'type': 'convert_vhdx_parse_failure', 'operation': 'convert',
+                    'target_format': 'vhdx', 'compress': False,
+                    'vhdx_subformat': subformat,
+                    'parse_error': 'bat region at offset 2097152 lies outside the file'}
+        self.assertNotEqual(df.divergence_key(failure('fixed')),
+                            df.divergence_key(failure('dynamic')))
+
+    def test_two_geometries_of_one_subformat_are_separate_findings(self):
+        self.assertNotEqual(
+            df.divergence_key(self.divergence('fixed', 'vhdx-fixed-64M-bsz-off')),
+            df.divergence_key(self.divergence('fixed', 'vhdx-fixed-16M-bsz-off')))
+
+    def test_the_values_compared_do_not_split_a_finding(self):
+        # The other half of the classification: a run where every
+        # iteration differs by a different amount must still file one
+        # issue for the geometry, which is what SHAPE_FIELDS is for.
+        self.assertEqual(
+            df.divergence_key(self.divergence('fixed', 'vhdx-fixed-64M-bsz-off')),
+            df.divergence_key(self.divergence('fixed', 'vhdx-fixed-64M-bsz-off',
+                                              differences=['bat: 9 != 8'], block_size=8 * MiB)))
+
+
+class VhdxStructureGeometryKeyTestCase(unittest.TestCase):
+    """The pin lookup is keyed on the geometry asked for, not the one the output claims."""
+
+    PIN = {'block_size': MiB, 'virtual_disk_size': 64 * MiB, 'bat_entry_count': 64}
+
+    def compare(self, claimed_block_size, requested_block_size, extra=None):
+        """`compare_vhdx_structure` against a pin, with the parse stubbed out."""
+        summary = dict(self.PIN, block_size=claimed_block_size, **(extra or {}))
+        with mock.patch.object(df, 'parse_vhdx', lambda path: None), \
+                mock.patch.object(df, 'summarise', lambda parsed: summary), \
+                mock.patch.object(df, '_vhdx_pin_geometries',
+                                  lambda: {'fixed': {(64 * MiB, MiB): 'vhdx-fixed-64M-block-1M-bsz-off'}}), \
+                mock.patch.object(df, 'expected', lambda case, pin=None: {'summary': dict(self.PIN)}):
+            return df.compare_vhdx_structure('out.vhdx', 'fixed', 64 * MiB, 'convert', {},
+                                             block_size=requested_block_size)
+
+    def test_a_wrong_block_size_is_a_difference_not_a_silencer(self):
+        # The defect this keying avoids: an output whose block size is
+        # wrong must not move itself off the pinned geometry and skip the
+        # comparison that would have reported it.
+        divergence = self.compare(claimed_block_size=2 * MiB, requested_block_size=MiB)
+        self.assertIsNotNone(divergence)
+        self.assertEqual('convert_vhdx_structure_divergence', divergence['type'])
+        self.assertEqual(['block_size: 2097152 != 1048576'], divergence['differences'])
+        # The pin case names the geometry, which is what separates one
+        # issue shape from another; the sizes travel per iteration.
+        self.assertEqual('vhdx-fixed-64M-block-1M-bsz-off', divergence['pin_case'])
+
+    def test_an_output_matching_the_pin_is_not_a_divergence(self):
+        self.assertIsNone(self.compare(claimed_block_size=MiB, requested_block_size=MiB))
+
+    def test_a_field_the_pin_predates_is_reported_not_dropped(self):
+        # The comparison takes its field set from both sides, so a field
+        # `summarise` gains after the pin was taken is reported as
+        # present on one side only rather than quietly left out of the
+        # comparison on both.
+        divergence = self.compare(claimed_block_size=MiB, requested_block_size=MiB,
+                                  extra={'log_offset': 1048576})
+        self.assertIsNotNone(divergence)
+        self.assertEqual(['log_offset: 1048576 != None'], divergence['differences'])
+
+    def test_an_unset_block_size_is_keyed_on_what_the_tool_chose(self):
+        # The one draw with nothing to compare against: the option was
+        # left unset, so the value asked for is whatever the default
+        # picked, and the read-back value is what finds the pin.
+        self.assertIsNone(self.compare(claimed_block_size=MiB, requested_block_size=None))
+        self.assertIsNone(self.compare(claimed_block_size=2 * MiB, requested_block_size=None))
 
 
 if __name__ == '__main__':

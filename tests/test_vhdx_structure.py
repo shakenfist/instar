@@ -36,6 +36,7 @@ from helpers.vhdx_structure import (
     parse_vhdx,
     structural_diff,
     summarise,
+    truncated_inside_region,
 )
 
 KiB = 1024
@@ -514,3 +515,74 @@ class TestVhdxStructureMalformed(_VhdxTestCase):
                     f.seek(at)
                     f.write(original)
                     f.flush()
+
+
+class TestVhdxTruncatedInsideRegion(_VhdxTestCase):
+    """`truncated_inside_region` describes one shape and refuses the rest.
+
+    The differential fuzzer uses this predicate alone to decide that a
+    structural comparison hit issue #883 and may be skipped, so what it
+    refuses matters as much as what it accepts: a predicate that widened
+    would turn real divergences into silent skips. Every case here is
+    built from a qemu-written image, truncated or patched, so the shape is
+    pinned against another writer's output rather than against the one the
+    defect is in.
+    """
+
+    # Inside the metadata region (3 MiB to 4 MiB) of a 64 MiB dynamic
+    # image, and past the end of the BAT region (2 MiB to 3 MiB) so the
+    # BAT is readable whole. This is where instar's own `convert -O vhdx`
+    # stops in #883.
+    INSIDE_METADATA = 3 * MiB + 200 * KiB
+    METADATA_END = 4 * MiB
+
+    def setUp(self):
+        super().setUp()
+        # block_state_zero=off, because the shape requires a BAT with
+        # nothing in it at all: the default `on` fills every entry with
+        # PAYLOAD_BLOCK_ZERO instead, which is a BAT that says something.
+        self.image = self.qemu_create('image.vhdx', 64 * MiB,
+                                      'subformat=dynamic', 'block_state_zero=off')
+
+    def truncated(self, name, length, source=None):
+        """A copy of `source` (the dynamic image) cut to `length` bytes."""
+        path = self.workdir / name
+        shutil.copyfile(source or self.image, path)
+        os.truncate(path, length)
+        return path
+
+    def test_a_file_ending_inside_a_declared_region(self):
+        path = self.truncated('truncated.vhdx', self.INSIDE_METADATA)
+        self.assertEqual(('metadata', self.METADATA_END, self.INSIDE_METADATA),
+                         truncated_inside_region(path))
+
+    def test_one_allocated_payload_block_is_not_the_shape(self):
+        # The case the suppression's narrowness rests on: a truncated file
+        # that allocated anything is a finding, not #883.
+        path = self.truncated('allocated.vhdx', self.INSIDE_METADATA)
+        with open(path, 'r+b') as f:
+            f.seek(2 * MiB)
+            f.write(struct.pack('<Q', 8 * MiB | PAYLOAD_BLOCK_FULLY_PRESENT))
+        self.assertIsNone(truncated_inside_region(path))
+
+    def test_a_bat_of_zero_blocks_is_not_the_shape(self):
+        # PAYLOAD_BLOCK_ZERO is a state the writer chose, so a BAT full of
+        # it is not a BAT that was never written. The default dynamic
+        # image is this, which is why setUp turns block_state_zero off.
+        default = self.qemu_create('default.vhdx', 64 * MiB, 'subformat=dynamic')
+        path = self.truncated('default-truncated.vhdx', self.INSIDE_METADATA, source=default)
+        self.assertIsNone(truncated_inside_region(path))
+
+    def test_a_whole_image_is_not_the_shape(self):
+        self.assertIsNone(truncated_inside_region(self.image))
+
+    def test_a_file_stopping_before_the_bat_region_is_not_the_shape(self):
+        # The BAT region has to be readable whole to say that nothing is
+        # allocated; a file that stops inside it says nothing either way.
+        self.assertIsNone(truncated_inside_region(self.truncated('short.vhdx', 2 * MiB + 4 * KiB)))
+
+    def test_an_absent_or_foreign_file_is_not_the_shape(self):
+        self.assertIsNone(truncated_inside_region(self.workdir / 'absent.vhdx'))
+        foreign = self.workdir / 'foreign.vhdx'
+        foreign.write_bytes(b'not a vhdx at all' * 1024)
+        self.assertIsNone(truncated_inside_region(foreign))

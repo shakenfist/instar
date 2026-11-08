@@ -56,7 +56,7 @@ from helpers.info_json import normalise_info_json  # noqa: E402
 # qemu-img build writes, by the same mechanism. `convert -O vhdx` output is
 # compared through these as well as by content, because a raw flatten
 # cannot see a container's layout.
-from helpers.qemu_pins import PinError, expected, load_pin  # noqa: E402
+from helpers.qemu_pins import CASES, KIND_VHDX_CREATE, PinError, expected, load_pin  # noqa: E402
 from helpers.vhdx_structure import (VhdxParseError, parse_vhdx, structural_diff,  # noqa: E402
                                     summarise, truncated_inside_region)
 
@@ -1105,6 +1105,9 @@ def op_check(instar_bin, instar_copy, qemu_copy, fmt, timeout,
 
 # A fixed VHDX's file length is its whole virtual size, so an iteration's
 # output is held to this much even though its untouched blocks are holes.
+# In practice this binds only on dynamic geometries: the pin's fixed cases
+# that survive the filters below are 16M and 64M, far under the cap, and
+# the create arm caps its own fixed sizes at 256M for the same reason.
 _VHDX_PIN_MAX_VIRTUAL_SIZE = 1024 * 1024 * 1024
 
 # What a dynamic VHDX's structure takes from the source's data rather than
@@ -1114,6 +1117,12 @@ _VHDX_PIN_MAX_VIRTUAL_SIZE = 1024 * 1024 * 1024
 _VHDX_DATA_DEPENDENT_FIELDS = ('file_length', 'bat')
 
 _VHDX_PIN_GEOMETRIES = None
+
+# The parsed pin, memoised beside the index built from it. `load_pin`
+# caches the parse but deep-copies the whole pin on every call -- every
+# case across every pinned qemu version, with the BAT run lists unfolded --
+# which is 80ms an iteration to hand `expected` a pin it already has.
+_VHDX_PIN = None
 
 # Iterations not compared because they hit a defect already filed, by
 # issue. These are skips, not passes: they are logged and reported in the
@@ -1127,10 +1136,8 @@ def _vhdx_pin_geometries():
     Read out of the committed pin rather than written out here, so adding a
     pin case widens the fuzzer without a second edit. A case qualifies when
 
-    * it writes the layout instar's own writer copies: for `fixed` the
-      `block_state_zero=off` create, and for `dynamic` the default one --
-      the two dynamic layouts differ only in their BAT entry states, and
-      the BAT is not compared for a dynamic target anyway;
+    * it writes the layout instar's own writer copies, which is what
+      `_vhdx_pin_case_subformats` selects;
     * every pinned qemu version agrees on it, so the comparison does not
       depend on which build the pin was taken from;
     * qemu created it successfully and this parser could read it;
@@ -1141,7 +1148,7 @@ def _vhdx_pin_geometries():
       bug on those iterations instead of coverage. Drop this filter when
       #879 is fixed.
     """
-    global _VHDX_PIN_GEOMETRIES
+    global _VHDX_PIN_GEOMETRIES, _VHDX_PIN
     if _VHDX_PIN_GEOMETRIES is not None:
         return _VHDX_PIN_GEOMETRIES
 
@@ -1152,17 +1159,10 @@ def _vhdx_pin_geometries():
         _log_once('vhdx-pin', 'no VHDX structural comparison: the qemu pin could not be read: %s', e)
         _VHDX_PIN_GEOMETRIES = geometries
         return geometries
+    _VHDX_PIN = pin
 
-    for name in pin['cases']:
-        if name.startswith('vhdx-fixed-'):
-            subformat = 'fixed'
-            if not name.endswith('-bsz-off'):
-                continue
-        elif name.startswith('vhdx-dynamic-'):
-            subformat = 'dynamic'
-            if name.endswith('-bsz-off'):
-                continue
-        else:
+    for name, subformat in _vhdx_pin_case_subformats().items():
+        if name not in pin['cases']:
             continue
         try:
             result = expected(name, pin=pin)
@@ -1187,17 +1187,50 @@ def _vhdx_pin_geometries():
     return geometries
 
 
-def compare_vhdx_structure(image, subformat, virtual_size, operation, context):
+def _vhdx_pin_case_subformats():
+    """The pinned create cases whose layout instar's writer copies: `{name: subformat}`.
+
+    Read off each case's own options rather than off its name. The names
+    are built by joining option abbreviations in the order the case lists
+    them, so matching a `-bsz-off` suffix would drop
+    `vhdx-fixed-64M-block-1M-bsz-off` the moment someone wrote that case's
+    two options the other way round -- a silent coverage loss in the one
+    function that promises a new pin case widens the fuzzer by itself.
+
+    A case with a `base` is a differencing image, whose structure follows
+    its parent rather than its geometry, so it is not refereed here.
+    """
+    wanted = {}
+    for case in CASES:
+        if case.get('kind') != KIND_VHDX_CREATE or case.get('base'):
+            continue
+        args = case.get('args', [])
+        options = set(args[args.index('-o') + 1].split(',')) if '-o' in args else set()
+        fixed = 'subformat=fixed' in options
+        # The two dynamic layouts differ only in their BAT entry states,
+        # and a dynamic target's BAT is not compared, so the default case
+        # stands in for both; a fixed one's BAT is compared, and instar
+        # writes the block_state_zero=off layout.
+        if ('block_state_zero=off' in options) != fixed:
+            continue
+        wanted[case['name']] = 'fixed' if fixed else 'dynamic'
+    return wanted
+
+
+def compare_vhdx_structure(image, subformat, virtual_size, operation, context, block_size=None):
     """Compare a VHDX `image` instar wrote with the pinned structure for its geometry.
 
     Returns a divergence dict, or None when the two agree or when no pinned
     case referees this geometry. `virtual_size` is the size the output must
-    have, which is the source's: keying the pin on it rather than on the
-    size the file claims means a wrong `virtual_disk_size` is reported as a
-    difference instead of moving the image off the pinned geometry and
-    silencing the comparison. The block size is read back out of the image,
-    so an output whose block size came from the tool's own default is
-    refereed too.
+    have, which is the source's, and `block_size` is the size that was
+    asked for, or None where the option was left unset. Keying the pin on
+    what was requested rather than on what the file claims means a wrong
+    `virtual_disk_size` or `block_size` is reported as a difference instead
+    of moving the image off the pinned geometry and silencing the
+    comparison; both stay in the compared field set, so a tool that ignored
+    the option says so as a difference. Only for the unset draw is the
+    block size read back out of the image, which is the one case where the
+    value asked for is whatever the tool's own default picked.
 
     For a `fixed` image the whole structure is compared, the BAT and the
     file length included, because both follow from the geometry alone. For
@@ -1241,18 +1274,21 @@ def compare_vhdx_structure(image, subformat, virtual_size, operation, context):
         return dict(context, type=f'{operation}_vhdx_parse_failure',
                     vhdx_subformat=subformat, parse_error=str(e))
 
-    geometry = (virtual_size, summary.get('block_size'))
+    geometry = (virtual_size, block_size if block_size is not None else summary.get('block_size'))
     case = _vhdx_pin_geometries().get(subformat, {}).get(geometry)
     if case is None:
         return None
 
-    want = expected(case)['summary']
+    want = expected(case, pin=_VHDX_PIN)['summary']
+    # Both sides' keys, not just the pin's: a field `summarise` gains after
+    # the pin was taken is then reported as present on one side only, which
+    # is the honest answer when the pin is older than the comparator,
+    # rather than dropped from the comparison on both sides.
+    fields = sorted(set(want) | set(summary))
     if subformat == 'dynamic':
-        fields = [key for key in want if key not in _VHDX_DATA_DEPENDENT_FIELDS]
-    else:
-        fields = list(want)
+        fields = [key for key in fields if key not in _VHDX_DATA_DEPENDENT_FIELDS]
     differences = structural_diff({key: summary.get(key) for key in fields},
-                                  {key: want[key] for key in fields})
+                                  {key: want.get(key) for key in fields})
     if not differences:
         return None
     return dict(context, type=f'{operation}_vhdx_structure_divergence',
@@ -1268,7 +1304,12 @@ def _convert_vhdx_shape(rng, source, timeout):
     structural comparison, or None if it could not be probed.
 
     A `block_size` of None leaves the option unset, which is a shape in its
-    own right: the one the tools' own default picks.
+    own right: the one the tools' own default picks. `subformat` is never
+    unset, unlike the create arm's draw, for two reasons. The structural
+    comparison has to know which subformat's pin set referees the output,
+    and an explicit flag is what puts that in the divergence's own
+    `vhdx_subformat`; and the unset default is already drawn as a shape by
+    the create arm, which pins the same layouts.
 
     `fixed` is drawn only at a geometry the pin referees, and always with an
     explicit block size, for two reasons that are separate. The pin is the
@@ -1367,6 +1408,7 @@ def op_convert(instar_bin, instar_copy, qemu_copy, fmt,
     if target_fmt == 'vhdx':
         structural_div = compare_vhdx_structure(
             instar_out, vhdx_subformat, vhdx_virtual_size, 'convert', context,
+            block_size=vhdx_block_size,
         )
 
     # Compare content: convert both outputs to raw and hash
@@ -1408,11 +1450,17 @@ def op_convert(instar_bin, instar_copy, qemu_copy, fmt,
                 )
 
     # A content difference is reported in preference to a layout one,
-    # because an output whose payload is wrong is the larger finding; the
-    # flag says whether the layout differed as well, so neither is lost.
+    # because an output whose payload is wrong is the larger finding. What
+    # the layout comparison found travels with it rather than being
+    # reduced to a flag, because the field names are what make the layout
+    # half of the finding triageable.
     if content_div:
         if structural_div:
             content_div['structure_also_diverged'] = True
+            if structural_div.get('differences') is not None:
+                content_div['structure_differences'] = structural_div['differences']
+            if structural_div.get('parse_error') is not None:
+                content_div['structure_parse_error'] = structural_div['parse_error']
         return content_div
     return structural_div
 
@@ -5427,7 +5475,8 @@ def write_divergence_report(log_dir, seed, iteration, attrs, divergence):
 # The fields a divergence carries that say *what* diverged rather than by
 # how much: the format converted to, the libyal tool, the measure or map
 # field, the convert or resize option in play, whether a rebase detaches,
-# the snapshot scenario, the repair corruption class and tier, and the
+# the snapshot scenario, the repair corruption class and tier, the VHDX
+# subformat and the pin case refereeing a structural comparison, and the
 # fixed wording some checks give their finding. Everything else a divergence carries is in
 # PER_ITERATION_FIELDS: values that change every iteration (sizes,
 # hashes, option strings, outputs), which would stop any two matching.
@@ -5437,6 +5486,11 @@ SHAPE_FIELDS = (
     'target_format', 'format', 'tool', 'field', 'compress',
     'preallocation', 'apply_shrink', 'note', 'reason',
     'shape', 'corruption', 'tier', 'is_detach',
+    'vhdx_subformat', 'pin_case',
+    # Which side or image of a multi-image scenario differed, and whether
+    # a commit named its base explicitly. A scenario's `shape` says what
+    # was built; these say where in it the finding is.
+    'side', 'image', 'explicit_base',
 )
 PER_ITERATION_FIELDS = frozenset({
     # Handled by divergence_key itself.
@@ -5454,6 +5508,22 @@ PER_ITERATION_FIELDS = frozenset({
     'window_args', 'extent_index', 'start_size', 'end_spec', 'size', 'vsize', 'out_vsize',
     'overlay_size', 'new_backing_name', 'new_backing_size', 'rebase_flags', 'bs',
     'count', 'skip', 'cluster_size', 'snaps', 'chain', 'element_index', 'element', 'iteration',
+    'vhdx_block_size', 'virtual_size', 'block_size',
+    # A snapshot scenario's generated tag and the carrier its `shape`
+    # already fixes, the outputs of the per-image check and compare
+    # passes, the read-back hashes, a JSON parse error's text, and the
+    # iteration's seed and fill pattern.
+    'snapshot', 'carrier', 'check_rc', 'check_stdout', 'check_stderr',
+    'compare_stdout', 'instar_info_stdout', 'qemu_info_stdout',
+    'instar_sha', 'qemu_sha', 'error', 'seed_spec', 'pattern',
+    # A bare stderr and the info exit codes, the path a record names, and
+    # the byte counts a measure bound compares.
+    'stderr', 'path', 'instar_info_rc', 'qemu_info_rc',
+    'measured_required', 'measured_fully_allocated', 'convert_actual_size', 'cushion',
+    # What a structural comparison found, and what it could not read. The
+    # pin case in SHAPE_FIELDS already names the geometry these describe.
+    'differences', 'parse_error', 'structure_also_diverged',
+    'structure_differences', 'structure_parse_error',
 })
 
 

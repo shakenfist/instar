@@ -562,8 +562,10 @@ def truncated_inside_region(path) -> Optional[Tuple[str, int, int]]:
             if not overrunning:
                 return None
             bat_region = _find_region(table, BAT_REGION_GUID)
-            if bat_region.offset + bat_region.length > reader.length:
-                return None
+            # A BAT region that does not itself lie inside the file says
+            # nothing about what was allocated, and the bounds-checked
+            # read raises rather than returning short, so the parse error
+            # below is what refuses that file.
             if any(reader.read(bat_region.offset, bat_region.length, 'bat region')):
                 return None
         except VhdxParseError:

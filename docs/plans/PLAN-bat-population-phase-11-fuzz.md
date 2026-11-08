@@ -633,6 +633,13 @@ management session reproduced one mutant from each step independently,
 confirming `Compiling vhdx` in the log first so the verdict could not
 come from a stale object.
 
+**Round 1's fuzz run is unchanged from the branch point.** 60
+iterations at seed 2024 give 0 divergences and 4 #883 skips both on
+the round's tree and on a pristine checkout of the pre-round head,
+which is how the round's changes to the comparison were attributed:
+they alter neither count. The 200-iteration figures quoted in
+`docs/testing.md` come from a wider run and are untouched.
+
 **The integration suite ran against instar-testdata `f73d43670a`**,
 which is the revision phase 10 validated and landed against. Its
 `main` had moved two commits further by the time this phase ran -- the
@@ -641,6 +648,50 @@ pulled, because phase 11 changes no baseline and no test expectation
 that depends on testdata, so the validated revision isolates this
 phase's changes. CI clones testdata's default branch unpinned, so CI
 will run against whatever `main` holds then.
+
+**Review round 1 (2026-11-08 AEDT).** The automated reviewer raised 3
+fix, 1 document, 7 consider and 1 none on the pull request; all three
+fix items and the document item were taken, with six of the seven
+consider items and a docstring for the seventh. Two of them changed
+more than the review asked for:
+
+* The field-classification guard in
+  `tools/ci/test_differential_fuzz_issues.py` was blind to three of
+  the four ways the fuzzer builds a divergence -- an f-string `type`,
+  a `dict(ctx, type=...)` call, and a field assigned by subscript
+  afterwards -- so it had never checked most of the file. It was also
+  matching on a two-item suffix allowlist, and the file's 66 record
+  types end in nine different words, so the allowlist was the deeper
+  cause: it now matches any dict carrying a literal `type`, excluding
+  only `inconclusive_` records, which is the same prefix the fuzzer
+  itself routes them by when it decides what may file an issue.
+  Widening it surfaced twenty-four unclassified fields that predate
+  this phase, all now classified; the guard would have caught this
+  phase's own omission.
+* `truncated_inside_region`'s check that the BAT region lies inside
+  the file was removed rather than tested. The mutation run showed it
+  could not fail: every input that trips it already raises inside the
+  bounds-checked read, which the parse-error branch catches.
+
+**Mutation count after round 1: twenty-four.** Fifteen Python mutants
+join the phase's nine Rust ones, each killed by the named test rather
+than by another failing first, in
+`scratchpad/review-round-1/mutate.py` under this session's scratch
+root. They break the classification list and each of its two new shape
+fields, each of the scan's four shapes, its type matching and its
+exclusion of inconclusive records, the holder-naming convention, the
+pin's geometry key, the compared field set, the option-based case
+selector, and three properties of the #883 predicate.
+
+Two mutants survived their first run and both were worth the run.
+One was the redundant BAT-reachability check above, removed rather
+than given a test that could not fail. The other showed that
+`vhdx_subformat` in `SHAPE_FIELDS` is redundant with `pin_case` for a
+structural divergence, since a pin case's name already carries the
+subformat -- but not for a parse failure, which has no pin case
+because its geometry was never established. The isolating test is
+therefore over two parse failures, which is the only place that field
+separates two findings on its own.
 
 ## Back brief
 
