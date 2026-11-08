@@ -203,6 +203,12 @@ doc = false
 test = false
 
 [[bin]]
+name = "fuzz_vhdx_fixed_bat"
+path = "fuzz_targets/fuzz_vhdx_fixed_bat.rs"
+doc = false
+test = false
+
+[[bin]]
 name = "fuzz_resize_planners"
 path = "fuzz_targets/fuzz_resize_planners.rs"
 doc = false

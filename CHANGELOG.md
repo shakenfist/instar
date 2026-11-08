@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Fuzzing covers the fixed VHDX BAT, fixed VHDX and flat VMDK creation,
+  and VHDX convert output.** `fuzz_create_emitters` draws both VHDX
+  subformats and both `block_state_zero` values and asserts five more
+  invariants over the fixed BAT; a new target, `fuzz_vhdx_fixed_bat`,
+  fuzzes `vhdx::fill_fixed_bat` directly (44 targets). The differential
+  fuzzer's create picker draws fixed and dynamic VHDX, `monolithicFlat`
+  and `preallocation=falloc`/`full`, and its convert op compares a VHDX
+  target structurally against the committed qemu-img pins. vpc create,
+  partial-last-block fixed geometries (#879) and the #883 truncated-region
+  shape are not covered, and #883 is counted in the run summary rather
+  than passed silently. See `docs/testing.md`.
+
 - **Cross-version baselines for fixed VHDX, monolithicFlat and non-qcow2
   preallocation.** Ten new create cases (fixed VHDX, monolithicFlat,
   and `preallocation` on vpc, vmdk and vhdx) and per-image info, check,

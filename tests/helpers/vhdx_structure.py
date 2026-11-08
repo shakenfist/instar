@@ -79,7 +79,7 @@ Usage::
 import os
 import struct
 from dataclasses import dataclass, field
-from typing import List, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 KiB = 1024
 MiB = 1024 * KiB
@@ -531,6 +531,74 @@ def parse_vhdx(path) -> VhdxStructure:
             bat_runs=runs,
             allocated_bytes=allocated,
         )
+
+
+# How much of a BAT region `truncated_inside_region` holds at once while
+# looking for a non-zero byte.
+_BAT_SCAN_CHUNK = 1024 * 1024
+
+
+def truncated_inside_region(path) -> Optional[Tuple[str, int, int]]:
+    """Describe a VHDX whose file ends inside its metadata region, with nothing allocated.
+
+    Returns `('metadata', declared_end, file_length)` when `path`'s region
+    table declares a metadata region whose extent ends past the end of the
+    file, *and* no payload block is allocated -- every byte of the BAT
+    region, which does itself lie inside the file, is zero. Returns None
+    otherwise, including when the file cannot be read far enough to tell.
+
+    Deliberately narrow on all three counts. A different region running
+    past the end of the file, or a readable BAT with anything in it, is a
+    finding of its own and not the shape this describes, so a caller using
+    this to suppress a comparison suppresses only what it means to.
+
+    This is the shape of a writer that ends the file after the metadata it
+    wrote rather than after the region it declared. `parse_vhdx` refuses
+    such a file, because the geometry it needs is in a region it cannot
+    read whole, so a caller that has to tell this shape apart from any
+    other parse failure cannot use `parse_vhdx` to do it.
+    """
+    try:
+        handle = open(path, 'rb')
+    except OSError:
+        return None
+    with handle:
+        reader = _Reader(handle, os.fstat(handle.fileno()).st_size)
+        try:
+            if reader.read(0, 8, 'file identifier') != FILE_IDENTIFIER_SIGNATURE:
+                return None
+            table = _parse_region_table(reader, REGION_TABLE_OFFSETS[0])
+            # Only the metadata region, which is the one the writer this
+            # describes stops inside. Any region whose extent runs past
+            # the end of the file would also match the shape, and a
+            # region table with a garbage offset or length is a finding
+            # of its own rather than this one.
+            metadata = _find_region(table, METADATA_REGION_GUID)
+            if metadata.offset + metadata.length <= reader.length:
+                return None
+            bat_region = _find_region(table, BAT_REGION_GUID)
+            # A BAT region that does not itself lie inside the file says
+            # nothing about what was allocated, and the bounds-checked
+            # read raises rather than returning short, so the parse error
+            # below is what refuses that file.
+            #
+            # Read in chunks and stop at the first non-zero byte. A BAT
+            # region is one entry per block, so it grows with the virtual
+            # size: holding a multi-hundred-megabyte one in memory to ask
+            # a yes-or-no question is not worth it, and the answer is
+            # usually in the first chunk.
+            reader.check(bat_region.offset, bat_region.length, 'bat region')
+            remaining = bat_region.length
+            at = bat_region.offset
+            while remaining:
+                size = min(remaining, _BAT_SCAN_CHUNK)
+                if any(reader.read(at, size, 'bat region')):
+                    return None
+                at += size
+                remaining -= size
+        except VhdxParseError:
+            return None
+    return metadata.name, metadata.offset + metadata.length, reader.length
 
 
 def patch_virtual_disk_size(path, virtual_disk_size):

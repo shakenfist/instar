@@ -56,6 +56,7 @@ FAST_TIER=(
   fuzz_chs_rounded_size
   fuzz_measure_calc
   fuzz_create_emitters
+  fuzz_vhdx_fixed_bat
   fuzz_vhd_parent
   fuzz_vhdx_parent
   fuzz_resize_planners
