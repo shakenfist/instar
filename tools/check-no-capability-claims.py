@@ -138,6 +138,21 @@ def git_ignored(candidates):
     return {line.strip() for line in asked.stdout.split('\n') if line.strip()}
 
 
+def generated_by_prefix(candidates):
+    """Which of *candidates* the build-tree prefixes account for.
+
+    What the scan falls back to when git cannot be asked -- an exported
+    source drop, a tarball. A function rather than a set comprehension
+    inside scan_paths so that the self-test can check the fallback
+    itself: in a real checkout git always answers, so the fallback is
+    the half that is never exercised, and it is also the half that has
+    already rotted once (.gitignore covered src/fuzz/target/ and this
+    tuple did not).
+    """
+    return {path for path in candidates
+            if path.startswith(GENERATED_PREFIXES)}
+
+
 def scan_paths():
     """Return {glob: [repo-relative posix path, ...]} for every glob.
 
@@ -154,8 +169,7 @@ def scan_paths():
     every = {path for paths in candidates.values() for path in paths}
     ignored = git_ignored(every)
     if ignored is None:
-        ignored = {path for path in every
-                   if path.startswith(GENERATED_PREFIXES)}
+        ignored = generated_by_prefix(every)
     return {glob: [path for path in paths if path not in ignored]
             for glob, paths in candidates.items()}
 
@@ -327,6 +341,18 @@ def self_test():
               f'the ignore filter answered {sorted(ignored)}, not the two '
               f'build trees alone')
 
+    # The fallback, against the same three paths and the same
+    # expectation. Asked directly because git answers in every
+    # checkout, so the branch that runs when it cannot be asked is the
+    # one nobody ever reaches -- and it is where the exclusion had
+    # already drifted once. One expectation over both halves means a
+    # prefix tuple that stops covering a build tree git ignores fails
+    # here rather than in an exported source drop nobody is testing.
+    check(generated_by_prefix(probes) == set(probes[:2]),
+          'falls back to prefixes that cover the same build trees',
+          f'the prefix fallback answered {sorted(generated_by_prefix(probes))}, '
+          f'not the two build trees alone')
+
     if bad:
         print(f'{bad} of {checks} self-test checks failed')
         return 1
@@ -357,8 +383,18 @@ def main():
     for paths in found.values():
         for relative in paths:
             scanned += 1
+            # UTF-8 explicitly, as the rest of the repo's tooling
+            # reads files: the default is the locale's, and the globs
+            # now cover docs/**/*.md, which is full of em dashes. An
+            # interpreter whose preferred encoding resolved to ASCII
+            # would fail the lint with a UnicodeDecodeError traceback
+            # rather than a claim. errors='replace' because a file that
+            # is not text is not a capability claim either way, and a
+            # stray binary in a glob must not be able to fail this for
+            # a reason unrelated to what it checks.
             for lineno, claim in claims_in(
-                    (REPO_ROOT / relative).read_text()):
+                    (REPO_ROOT / relative).read_text(
+                        encoding='utf-8', errors='replace')):
                 hits.append(f'{relative}:{lineno}: {claim!r}')
     for hit in hits:
         print(hit)

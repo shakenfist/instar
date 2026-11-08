@@ -712,7 +712,12 @@ test-container: instar-devcontainer instar
 # INSTAR_REQUIRE_ZSTD is the same bargain for the two ZSTD
 # backing-chain tests, which need a qemu-img that produces ZSTD and a
 # qemu-io to write the fixture's differing cluster; see
-# tests/test_check_formats.py, TestZstdBackingChain.
+# tests/test_check_formats.py, TestZstdBackingChain. The two convert
+# targets pass it through as well, not just this one: the class is in
+# this selection today, and a variable that reaches the tests only
+# because of which selection their module falls in is a requirement
+# waiting to go quiet. tools/ci/check-test-partition.py asserts that
+# whichever pull-request job claims the class is one that sets it.
 #
 # The selection is listed before it is run so the run has a discovery
 # count to be checked against: a crashed stestr worker leaves a totals
@@ -773,6 +778,7 @@ test-container-convert-qcow2: instar-devcontainer instar
 		--group-add "$$(stat -c '%g' /dev/kvm)" \
 		-e HOME=/build \
 		-e INSTAR_TESTDATA_PATH=/testdata \
+		-e INSTAR_REQUIRE_ZSTD \
 		-v "$(CURDIR):/workspace" \
 		-v "$(TESTDATA_PATH):/testdata:ro" \
 		-w "/workspace" \
@@ -809,6 +815,7 @@ test-container-convert-vhd: instar-devcontainer instar
 		--group-add "$$(stat -c '%g' /dev/kvm)" \
 		-e HOME=/build \
 		-e INSTAR_TESTDATA_PATH=/testdata \
+		-e INSTAR_REQUIRE_ZSTD \
 		-v "$(CURDIR):/workspace" \
 		-v "$(TESTDATA_PATH):/testdata:ro" \
 		-w "/workspace" \

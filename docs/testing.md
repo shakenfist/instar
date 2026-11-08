@@ -58,15 +58,30 @@ assert the result carries what the probe claims: a build that accepted
 supported, and the comparison that followed would prove nothing about
 ZSTD.
 
+What the probe cannot promise is read where it is needed rather than
+assumed: `qemu-img map --output=json` only reports a `compressed` key
+from 8.2.0 onwards (measured against instar-testdata's per-version
+builds; it is absent at 6.0.0 through 8.1.0), while the
+`compression_type=zstd` the probe tests has existed since 5.1. So a
+map carrying no such key anywhere means the host cannot report
+compression, and declares itself the same way a missing tool does; a
+map that carries the key and reports nothing compressed is the fixture
+having built the wrong thing, and stays an assertion.
+
 An honest probe still skips, and a skip still reads as a pass, so the
 probe is also made mandatory where the environment can promise the
 tools: `INSTAR_REQUIRE_ZSTD` turns every reason
 `TestZstdBackingChain` would skip -- no `qemu-img`, no `qemu-io`, or a
 `qemu-img` that does not really produce ZSTD -- into a failure, and
 the `integration-core` job sets it because the devcontainer supplies
-all three. A base-image bump that dropped ZSTD support would otherwise
-return both tests to skipping on every run, which is the state #813
-found them in. This is the same bargain `INSTAR_REQUIRE_LIBVHDI`
+all three. All three container targets pass the variable into the
+container, not only that one, and `check-test-partition.py` asserts
+that whichever pull-request job claims `TestZstdBackingChain` is a job
+that sets it: a variable that reaches the tests only because of which
+selection their module happens to fall in is a requirement waiting to
+go quiet, and moving the class would unset it with nothing red. A
+base-image bump that dropped ZSTD support would otherwise return both
+tests to skipping on every run, which is the state #813 found them in. This is the same bargain `INSTAR_REQUIRE_LIBVHDI`
 strikes for the libvhdi oracle, and `INSTAR_REQUIRE_LIBYAL` for the
 fuzzer's.
 
@@ -999,6 +1014,16 @@ could drop a whole module from CI with no test failure. The
 class-level convert split has a subtler gap: a `test_convert` class
 containing `Vhd` but not matching `TestConvert.*Vhd` would be excluded
 by the qcow2 job and missed by the vhd job.
+
+The run-integrity guard that those jobs share,
+`tools/ci/check-stestr-run.sh`, expects one run per file and refuses a
+file holding two totals blocks: every number it reads is the last one
+in the file, so a second run would hide whatever the first did. It
+also matches the subunit packet-size failure in two shapes -- the
+traceback line, and the bare message as a whole line -- because
+anchoring on the traceback alone is what stops a test that merely
+prints the phrase from making a complete run unreportable, and the
+copy this replaced matched the phrase anywhere.
 
 The **`ci-tooling` CI job** guards against both. It runs
 `tools/ci/check-test-partition.sh`, which enumerates the suite with
@@ -2881,8 +2906,8 @@ form out, because a page containing it verbatim is indistinguishable,
 to anyone skimming, from a page making the claim — and the checker
 reads this page too.
 
-`--self-test` pins fifteen checks: nine claim forms it must flag or
-clear, each one that actually appeared in this repository, and six
+`--self-test` pins sixteen checks: nine claim forms it must flag or
+clear, each one that actually appeared in this repository, and seven
 about the scan itself. That it reads files at all from a working
 directory other than the repository root exists because the script
 globbed relative to the current directory and reported a clean tree,
@@ -2890,12 +2915,20 @@ exit 0, having read nothing, whenever it was run from anywhere else;
 it now resolves the repository from its own path and refuses to report
 a clean tree on a scan that matched almost no files.
 
-The other five are about what the widened scan reads, which the claim
+The other six are about what the widened scan reads, which the claim
 forms cannot see: that every glob matches at least one file, that a
 docs page below `docs/` itself is read, that nothing under
-`docs/plans/` is, that nothing named in `EXCLUDED` is, and that the
-ignore filter drops the build trees git ignores and only those. The
-per-glob floor is the load-bearing one.
+`docs/plans/` is, that nothing named in `EXCLUDED` is, that the
+ignore filter drops the build trees git ignores and only those, and
+that the prefix fallback drops the same two. The per-glob floor is the
+load-bearing one.
+
+The fallback is checked because git answers in every checkout, so the
+branch that runs when it cannot be asked is the one nobody reaches --
+and it is the half that has already rotted once. One expectation over
+both halves means a prefix tuple that stops covering a build tree git
+ignores fails here, rather than in an exported source drop where
+nobody is running the self-test.
 The aggregate floor was sized for three globs, and with five any
 single glob could stop matching -- the precise failure a floor exists
 to catch -- while the other four held the total in the hundreds. The

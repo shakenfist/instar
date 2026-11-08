@@ -294,13 +294,21 @@ MATRIX_IDS = [
 
 
 def run_guard(test_ids, makefile=None, workflow=None, nightly=None,
-              entry_runner=None, functional_runner=None, with_nightly=True):
+              entry_runner=None, functional_runner=None, with_nightly=True,
+              required_env=()):
     '''Invoke the guard's main() with synthetic inputs; return (rc, out).
 
     Every input is overridable so a test can break exactly one link in
     the workflow -> MATRIX_SET -> Makefile chain and prove the guard
     notices. `with_nightly=False` drops the nightly workflow from the
-    invocation altogether.'''
+    invocation altogether.
+
+    `required_env` is the ENV_REQUIRED_BY this synthetic repository
+    declares, and is empty by default: the real tuple names a class of
+    this repository's suite, which the fixtures below do not have, and
+    a pairing that matches no discovered id is a failure by design --
+    that is what stops the entry surviving a rename. The cases for the
+    pairing check pass their own.'''
     with tempfile.TemporaryDirectory() as d:
         paths = {}
         for name, text in (('Makefile', makefile if makefile is not None else MAKEFILE),
@@ -323,8 +331,13 @@ def run_guard(test_ids, makefile=None, workflow=None, nightly=None,
                  '--functional-runner', paths['test-package-functional.sh'],
                  '--test-ids', ids]
         buf = io.StringIO()
-        with redirect_stdout(buf):
-            rc = guard.main(argv)
+        was = guard.ENV_REQUIRED_BY
+        guard.ENV_REQUIRED_BY = required_env
+        try:
+            with redirect_stdout(buf):
+                rc = guard.main(argv)
+        finally:
+            guard.ENV_REQUIRED_BY = was
         return rc, buf.getvalue()
 
 
@@ -870,6 +883,175 @@ class TestListMatchesRun(unittest.TestCase):
                 guard.parse_makefile_list(makefile_text, target),
                 '%s no longer lists its selection, so the CI job that '
                 'passes "in-output" has no floor' % target)
+
+
+class TestEnvFollowsClaim(unittest.TestCase):
+    """A test whose teeth depend on a variable, and the job that claims it.
+
+    The failure being guarded against has no symptom: an unset
+    INSTAR_REQUIRE_ZSTD turns the two ZSTD tests back into skips, which
+    read as passes. So each assertion here has a case that breaks one
+    half of the pairing and demands it be reported.
+    """
+
+    MAKEFILE = (
+        'test-container-core: instar-devcontainer instar\n'
+        '\tdocker run --rm \\\n'
+        '\t\t-e INSTAR_REQUIRE_ZSTD \\\n'
+        '\t\t"$(INSTAR_IMAGE)" bash -c \'\\\n'
+        '\t\tcd tests && \\\n'
+        '\t\tstestr run --concurrency 4 \\\n'
+        '\t\'\n'
+        '\n'
+    )
+    WORKFLOW = (
+        'jobs:\n'
+        '  integration-core:\n'
+        '    env:\n'
+        "      INSTAR_REQUIRE_ZSTD: '1'\n"
+        '    steps:\n'
+        '      - run: make test-container-core\n'
+    )
+    IDS = ['test_check_formats.TestZstdBackingChain.test_convert_zstd']
+    PAIRS = (('TestZstdBackingChain', 'INSTAR_REQUIRE_ZSTD'),)
+
+    def _problems(self, makefile=None, workflow=None, ids=None, pairs=None):
+        makefile = self.MAKEFILE if makefile is None else makefile
+        workflow = self.WORKFLOW if workflow is None else workflow
+        ids = self.IDS if ids is None else ids
+        jobs = guard.discover_jobs(makefile, workflow)
+        return guard.check_env_follows_claim(
+            makefile, [('functional-tests.yml', workflow)], jobs, ids,
+            required=self.PAIRS if pairs is None else pairs)
+
+    def test_a_job_that_sets_the_variable_is_accepted(self):
+        self.assertEqual(self._problems(), [])
+
+    def test_a_claiming_job_that_does_not_set_it_is_reported(self):
+        workflow = self.WORKFLOW.replace(
+            "    env:\n      INSTAR_REQUIRE_ZSTD: '1'\n", '')
+        problems = self._problems(workflow=workflow)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn('does not set INSTAR_REQUIRE_ZSTD', problems[0][2])
+        self.assertIn('integration-core', problems[0][2])
+
+    def test_a_target_that_does_not_pass_it_into_the_container_is_reported(self):
+        # The other half: the job sets it and the recipe drops it, so
+        # the container never sees it and the tests skip anyway.
+        makefile = self.MAKEFILE.replace(
+            '\t\t-e INSTAR_REQUIRE_ZSTD \\\n', '')
+        problems = self._problems(makefile=makefile)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn('does not pass -e INSTAR_REQUIRE_ZSTD', problems[0][2])
+
+    def test_a_pairing_whose_test_no_longer_exists_is_reported(self):
+        # A pairing that matches nothing checks nothing, which must not
+        # read as a pass: that is how the entry would survive a rename.
+        problems = self._problems(ids=['test_check_formats.TestSomethingElse.test_x'])
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn('checking nothing', problems[0][2])
+
+    def test_a_test_claimed_by_no_job_is_left_to_the_orphan_check(self):
+        # Reporting it here as well would make one defect look like two,
+        # and the orphan check's message is the useful one.
+        workflow = self.WORKFLOW.replace(
+            '      - run: make test-container-core\n', '      - run: true\n')
+        self.assertEqual(self._problems(workflow=workflow), [])
+
+    def test_main_fails_on_a_pairing_that_does_not_travel(self):
+        # End to end, because the cases above call the check directly
+        # and a check nothing calls reports nothing.
+        rc, out = run_guard(
+            ['test_info_safe.TestInfo.test_a',
+             'test_create.TestCreate.test_b',
+             'test_convert.TestConvertQcow.test_c',
+             'test_convert.TestConvertVhd.test_d',
+             'test_compare.TestCompare.test_e',
+             'test_oslo_crossval.TestOslo.test_f'],
+            required_env=(('TestInfo', 'INSTAR_REQUIRE_SOMETHING'),))
+        self.assertEqual(rc, 1, out)
+        self.assertIn('do not travel together', out)
+        self.assertIn('INSTAR_REQUIRE_SOMETHING', out)
+
+    def test_main_passes_when_it_does(self):
+        # The same world with the variable plumbed through both halves,
+        # so the failing case above is not failing for some other
+        # reason the fixtures carry.
+        makefile = MAKEFILE.replace(
+            'test-container-core: instar-devcontainer instar\n'
+            '\tdocker run --rm ',
+            'test-container-core: instar-devcontainer instar\n'
+            '\tdocker run --rm -e INSTAR_REQUIRE_SOMETHING ')
+        workflow = WORKFLOW.replace(
+            '  integration-core:\n    steps:\n',
+            '  integration-core:\n'
+            '    env:\n'
+            "      INSTAR_REQUIRE_SOMETHING: '1'\n"
+            '    steps:\n')
+        rc, out = run_guard(
+            ['test_info_safe.TestInfo.test_a',
+             'test_create.TestCreate.test_b',
+             'test_convert.TestConvertQcow.test_c',
+             'test_convert.TestConvertVhd.test_d',
+             'test_compare.TestCompare.test_e',
+             'test_oslo_crossval.TestOslo.test_f'],
+            makefile=makefile, workflow=workflow,
+            required_env=(('TestInfo', 'INSTAR_REQUIRE_SOMETHING'),))
+        self.assertEqual(rc, 0, out)
+        self.assertIn('claimed by a job that sets it', out)
+
+    def test_the_real_pairings_are_not_vacuous(self):
+        # The real tree, the real ENV_REQUIRED_BY: an entry naming a
+        # class the suite no longer has would pass every case above and
+        # check nothing in anger.
+        with open(os.path.join(_REPO_ROOT, 'Makefile'), encoding='utf-8') as f:
+            makefile_text = f.read()
+        workflow_path = os.path.join(_REPO_ROOT, '.github', 'workflows',
+                                     'functional-tests.yml')
+        with open(workflow_path, encoding='utf-8') as f:
+            workflow_text = f.read()
+        jobs = guard.discover_jobs(makefile_text, workflow_text)
+        for needle, var in guard.ENV_REQUIRED_BY:
+            ids = [tid for tid in _real_test_ids() if needle in tid]
+            self.assertTrue(
+                ids, '%s matches no test in tests/, so the pairing with %s '
+                     'is checking nothing' % (needle, var))
+            claimants = [job.name for job in jobs
+                         for tid in ids if job.selects(tid)]
+            self.assertTrue(
+                claimants, '%s is claimed by no pull-request job, so %s '
+                           'reaches it nowhere' % (needle, var))
+            self.assertEqual(
+                guard.check_env_follows_claim(
+                    makefile_text, [('functional-tests.yml', workflow_text)],
+                    jobs, ids, required=((needle, var),)),
+                [])
+
+
+def _real_test_ids():
+    """Test ids as stestr would list them, read from the test files.
+
+    Discovery needs a venv; the class and method names are in the
+    source, and a pairing only needs to know whether a class still
+    exists under a name some selector can match.
+    """
+    ids = []
+    tests_dir = os.path.join(_REPO_ROOT, 'tests')
+    for name in sorted(os.listdir(tests_dir)):
+        if not name.startswith('test_') or not name.endswith('.py'):
+            continue
+        with open(os.path.join(tests_dir, name), encoding='utf-8') as f:
+            module = name[:-3]
+            current = None
+            for line in f:
+                klass = re.match(r'^class ([A-Za-z0-9_]+)\(', line)
+                if klass:
+                    current = klass.group(1)
+                    continue
+                method = re.match(r'^    def (test_[A-Za-z0-9_]+)\(', line)
+                if method and current:
+                    ids.append('%s.%s.%s' % (module, current, method.group(1)))
+    return ids
 
 
 if __name__ == '__main__':

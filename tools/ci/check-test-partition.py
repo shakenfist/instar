@@ -236,6 +236,89 @@ def parse_makefile_list(makefile_text, target):
     return _selectors_from_invocation(m.group(1))
 
 
+# Tests that mean nothing unless an environment variable is set, and
+# the variable each needs. The teeth of such a variable reach a test
+# only through the job that claims it, so the claim and the variable
+# have to travel together: #813 found the two ZSTD tests skipping on
+# every run with nothing red, and INSTAR_REQUIRE_ZSTD is what makes
+# that a failure instead. It reaches them today because
+# test_check_formats falls in the core selection, which is a fact about
+# where a class lives rather than a guarantee, so it is asserted.
+ENV_REQUIRED_BY = (
+    ('TestZstdBackingChain', 'INSTAR_REQUIRE_ZSTD'),
+)
+
+
+def _job_text_running(workflows, target):
+    """Every workflow job whose steps invoke `make <target>`."""
+    out = []
+    for label, text in workflows:
+        for key, job_text in split_workflow_jobs(text):
+            for m in re.finditer(r'make\s+%s\b' % re.escape(target), job_text):
+                if _in_yaml_comment(job_text, m.start()):
+                    continue
+                out.append(('%s:%s' % (label, key), job_text))
+                break
+    return out
+
+
+def check_env_follows_claim(makefile_text, workflows, jobs, test_ids,
+                           required=None):
+    """Report every (test, variable) pair the claiming job does not set.
+
+    Both halves, because either one missing loses the teeth: the
+    Makefile target has to pass the variable into the container, and
+    the workflow job that runs that target has to set it.
+    """
+    problems = []
+    for needle, var in (ENV_REQUIRED_BY if required is None else required):
+        matching = [tid for tid in test_ids if needle in tid]
+        if not matching:
+            # Not a pass: the entry names a test this suite no longer
+            # has, so nothing here is checking anything. Either the
+            # class was renamed (update the entry) or it is gone (drop
+            # it).
+            problems.append(
+                (needle, var,
+                 'no discovered test id contains %r, so this pairing is '
+                 'checking nothing' % needle))
+            continue
+        claimants = sorted({job.name for job in jobs
+                            for tid in matching if job.selects(tid)})
+        # A test claimed by no job at all is the orphan check's finding,
+        # not this one's; reporting it twice would make one defect look
+        # like two.
+        for target in claimants:
+            if not target.startswith('test-container-'):
+                continue
+            try:
+                recipe = _recipe_text(makefile_text, target)
+            except LookupError as exc:
+                problems.append((needle, var, str(exc)))
+                continue
+            if ('-e %s' % var) not in recipe:
+                problems.append(
+                    (needle, var,
+                     'Makefile target %s claims it but does not pass '
+                     '-e %s into the container' % (target, var)))
+                continue
+            running = _job_text_running(workflows, target)
+            if not running:
+                problems.append(
+                    (needle, var,
+                     'no workflow job runs %s, so nothing sets %s for it'
+                     % (target, var)))
+                continue
+            for job_label, job_text in running:
+                if not re.search(r'^\s*%s:' % re.escape(var), job_text,
+                                 re.MULTILINE):
+                    problems.append(
+                        (needle, var,
+                         'job %s runs %s, which claims it, but does not set '
+                         '%s' % (job_label, target, var)))
+    return problems
+
+
 def check_list_matches_run(makefile_text, targets):
     '''Report every test-container target whose `stestr list` selects
     something other than its `stestr run`.'''
@@ -875,6 +958,27 @@ def main(argv=None):
     else:
         print('PASS: every recipe that lists its selection lists the one '
               'it runs.')
+
+    # Every test whose teeth depend on an environment variable, against
+    # the job that claims it. Reported whatever the verdicts above were,
+    # for the same reason they are.
+    stray = check_env_follows_claim(makefile_text, workflows, jobs, test_ids)
+    print()
+    if stray:
+        print('FAIL: %d test/variable pairing(s) do not travel together:'
+              % len(stray))
+        for needle, var, why in stray:
+            print('  %s needs %s: %s' % (needle, var, why))
+        print()
+        print('Fix: a test that skips when its requirement is unset reads '
+              'as a pass, which is the defect ENV_REQUIRED_BY exists to '
+              'keep fixed. Set the variable in the job that claims the '
+              'test, pass it into the container from the Makefile target, '
+              'or update ENV_REQUIRED_BY if the test moved or went away.')
+        rc = 1
+    else:
+        print('PASS: every test that needs an environment variable is '
+              'claimed by a job that sets it.')
 
     # The merge-queue matrix and the nightly are a second partition over
     # the same suite and are checked whatever the pull-request verdict

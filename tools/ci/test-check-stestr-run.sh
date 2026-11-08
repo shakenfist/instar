@@ -108,6 +108,18 @@ expect_rc "refuses it even against a lower floor" 1 "${WORK}/length.txt" 100
 expect_rc "refuses it when subunit names the limit" 1 \
     "${WORK}/length-subunit.txt" 454
 
+start "a run whose packet-size failure is not a traceback line"
+{
+    # The bare message as a whole line: a shape the package suite's own
+    # copy caught and the first version of this guard did not.
+    echo 'Length too long: 4194400'
+    totals 454 0
+} > "${WORK}/length-bare.txt"
+expect_rc "refuses the limit reported on a line of its own" 1 \
+    "${WORK}/length-bare.txt" 454
+expect_message "names the packet-size limit for the bare line too" \
+    'subunit packet-size limit' "${WORK}/length-bare.txt" 454
+
 start "a complete run that merely mentions the phrase"
 {
     echo '{2} tools.test_guard.TestGuard.test_length_too_long ... ok'
@@ -115,6 +127,20 @@ start "a complete run that merely mentions the phrase"
     totals 1273 41
 } > "${WORK}/phrase.txt"
 expect_rc "passes: the phrase is not a traceback" 0 "${WORK}/phrase.txt" 1273
+
+start "a file holding two runs"
+{
+    totals 454 0
+    totals 1273 41
+} > "${WORK}/two-runs.txt"
+expect_rc "refuses a file with two totals blocks" 1 \
+    "${WORK}/two-runs.txt" 1273
+expect_message "says it checks one run per file" \
+    'one run' "${WORK}/two-runs.txt" 1273
+# The point of refusing: read with tail -n1, the truncated first run
+# would be invisible behind a clean second one.
+expect_rc "refuses it even though the last run is clean" 1 \
+    "${WORK}/two-runs.txt" 454
 
 start "a run with a crashed worker"
 totals 454 0 'N/A' > "${WORK}/crashed.txt"

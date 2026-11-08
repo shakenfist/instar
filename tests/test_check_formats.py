@@ -1315,6 +1315,30 @@ class TestZstdBackingChain(InstarTestBase):
                 f'{stderr.strip()!r}'
             )
 
+    def test_a_map_without_a_compressed_key_is_declared(self):
+        """An old qemu-img's map shape skips rather than failing.
+
+        The two halves asserted separately, because conflating them is
+        the defect: entries with no `compressed` key anywhere mean the
+        host cannot report compression, while entries that carry the
+        key and say false mean the fixture built the wrong thing.
+        """
+        cannot_report = [{'start': 0, 'length': 65536, 'depth': 0,
+                          'zero': False, 'data': True}]
+        reports_none = [{'start': 0, 'length': 65536, 'depth': 0,
+                         'zero': False, 'data': True, 'compressed': False}]
+        with mock.patch.dict(os.environ):
+            os.environ.pop(self.REQUIRE_ZSTD_ENV, None)
+            with self.assertRaises(unittest.SkipTest) as caught:
+                self._compressed_extents(cannot_report)
+            self.assertIn('compressed', str(caught.exception))
+            # The other shape is a fixture defect and must not skip.
+            with self.assertRaises(self.failureException):
+                self._compressed_extents(reports_none)
+        with mock.patch.dict(os.environ, {self.REQUIRE_ZSTD_ENV: '1'}):
+            with self.assertRaises(self.failureException):
+                self._compressed_extents(cannot_report)
+
     def test_a_fixture_command_the_host_cannot_run_is_declared(self):
         """A failed fixture command skips, or fails where it is declared.
 
@@ -1333,6 +1357,43 @@ class TestZstdBackingChain(InstarTestBase):
         with mock.patch.dict(os.environ, {self.REQUIRE_ZSTD_ENV: '1'}):
             with self.assertRaises(self.failureException):
                 self._zstd_cmd(argv, 'build the overlay')
+
+    def _compressed_extents(self, entries):
+        """The overlay's own compressed extents, from a map's entries.
+
+        Two different answers, which this used to conflate. A qemu-img
+        that reports no `compressed` key at all cannot say whether
+        anything is compressed: measured against instar-testdata's
+        per-version builds, the key arrives in 8.2.0 and is absent at
+        6.0.0, 6.1.0, 6.2.0, 7.2.22, 8.0.5 and 8.1.0, while the
+        compression_type=zstd that `_require_zstd` probes has existed
+        since 5.1. Such a host supports ZSTD, passes the probe, and
+        then hard failed here -- the host-dependent failure every
+        command in this class now declares instead. Declared the same
+        way, so it skips on an old developer host and still fails
+        under INSTAR_REQUIRE_ZSTD, where the image is supposed to be
+        new enough. No CI leg is in that window today: the only job
+        that runs this class is integration-core, in the devcontainer.
+
+        A map that does carry the key and reports nothing compressed is
+        the fixture having built the wrong thing, which is a failure
+        wherever it happens.
+        """
+        if not any('compressed' in entry for entry in entries):
+            self._missing_zstd(
+                'this host\'s qemu-img map does not report compression '
+                '(no entry carries a "compressed" key), so a compressed '
+                'cluster of the overlay\'s own cannot be verified: '
+                f'{entries!r}'
+            )
+        compressed = [entry for entry in entries
+                      if entry.get('compressed') and entry.get('depth') == 0]
+        self.assertTrue(
+            compressed,
+            f'fixture overlay holds no compressed cluster of its own, '
+            f'so nothing in this test decompresses: {entries!r}'
+        )
+        return compressed
 
     def _build_zstd_overlay(self, td, base_fill, overlay_fill):
         """Build a ZSTD-compressed overlay over a qcow2 base in *td*.
@@ -1410,15 +1471,7 @@ class TestZstdBackingChain(InstarTestBase):
             ['qemu-img', 'map', '--output=json', str(overlay)],
             'report an allocation map as JSON', text=True
         )
-        compressed = [
-            e for e in json.loads(mapped.stdout)
-            if e.get('compressed') and e.get('depth') == 0
-        ]
-        self.assertTrue(
-            compressed,
-            f'fixture overlay holds no compressed cluster of its own, '
-            f'so nothing in this test decompresses: {mapped.stdout}'
-        )
+        self._compressed_extents(json.loads(mapped.stdout))
 
         return overlay, base
 

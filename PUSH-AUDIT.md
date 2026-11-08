@@ -105,6 +105,13 @@ It performs (and exits non-zero on any failure):
   `src/fuzz` crate is outside the main workspace, so this
   catches a fuzz target drifting out of sync with a
   workspace struct change before it fails in coverage-fuzz CI)
+- `tools/mermaid-lint.sh` (renders every mermaid diagram in
+  the tree through the upstream mermaid-cli container;
+  mermaid fails at render time, so a broken diagram commits
+  cleanly and nothing else here reads one. It also refuses a
+  fence `mmdc` cannot read -- a tilde fence, or a space
+  before the language -- which GitHub renders and the
+  renderer does not, naming the file and the line)
 - `tools/verify-info-output-parity.sh`, but only when the
   audit scope touches `src/crates/vhd/`, `src/crates/vhdx/`
   or the script itself. It builds the merge-base's instar
@@ -116,13 +123,16 @@ It performs (and exits non-zero on any failure):
   parity. Skipped, out loud, when there is no merge-base to
   compare against (on `develop`, or with no
   `origin/develop`)
-- `tools/mermaid-lint.sh` (renders every mermaid diagram in
-  the tree through the upstream mermaid-cli container;
-  mermaid fails at render time, so a broken diagram commits
-  cleanly and nothing else here reads one. It also refuses a
-  fence `mmdc` cannot read -- a tilde fence, or a space
-  before the language -- which GitHub renders and the
-  renderer does not, naming the file and the line)
+
+  Its scope is the two differencing parsers and the script,
+  and nothing else. A change to the info operation, to the
+  vmm's handling of an info result, or to the output
+  formatters can alter `instar info` output over the same
+  fixtures without this running: parity-check such a change
+  by hand rather than reading a green wave 1 as a statement
+  about it. The scope is deliberately narrower than the
+  risk, because widening it would make a second full build
+  the standing cost of an info-path change.
 - mechanical style checks: lines wrapped at 120
   characters in changed Rust files, no large inline
   scripts in CI workflow steps (advisory), single

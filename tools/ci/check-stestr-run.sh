@@ -45,6 +45,10 @@
 # it is not, naming which guard refused it, and 2 when it was called
 # wrongly (no output file, a non-numeric EXPECTED) -- never a pass.
 #
+# It expects one run per file, and refuses a file holding two: every
+# total it reads is the last one, so a second run would hide whatever
+# the first did.
+#
 # It reads the totals block subunit-trace prints, which is stestr's
 # default. A run invoked with --no-subunit-trace prints "Ran N tests"
 # with no colon and no worker balance, and is refused here for having
@@ -63,6 +67,25 @@ if [ ! -f "$OUTPUT_FILE" ]; then
     echo "checked. Treat it as a failure rather than a pass." >&2
     exit 2
 fi
+# One run per file. Every number below is read with `tail -n1`, so a
+# file holding two runs would be judged entirely on the second and the
+# first would pass unexamined -- including a first run that was
+# truncated. No caller can produce that today: the three CI steps and
+# tools/test-package-functional.sh each tee exactly one `stestr run`
+# into a file they truncate. That is why this refuses the shape instead
+# of checking both blocks: a guard whose value is that it cannot pass a
+# run it did not look at should not quietly look at half a file.
+TOTALS_BLOCKS=$(grep -cE "^Ran: [0-9]+ tests" "$OUTPUT_FILE" || true)
+if [ "$TOTALS_BLOCKS" -gt 1 ]; then
+    echo "" >&2
+    echo "Error: $OUTPUT_FILE holds $TOTALS_BLOCKS stestr totals blocks," >&2
+    echo "so it captured more than one run. This guard checks one run" >&2
+    echo "per file -- every total it reads is the last one in the file," >&2
+    echo "which would leave the earlier run checked by nothing. Capture" >&2
+    echo "each run separately and check each." >&2
+    exit 1
+fi
+
 if [ "$EXPECTED" = 'in-output' ]; then
     # The count the run itself printed. Both callers print it in the
     # same words, from the same `stestr list` of the same selection, so
@@ -101,11 +124,20 @@ if [ "$EXPECTED" -eq 0 ]; then
     exit 1
 fi
 
-# Anchored on the traceback shape rather than the bare phrase: the
-# whole captured output is searched, so a test that prints or asserts
-# "Length too long" in its own output would otherwise make a complete
-# run unreportable -- including a future test of this guard.
-if grep -qE "(ValueError|subunit).*Length too long" "$OUTPUT_FILE"; then
+# Two shapes, because one of them is not the bare phrase. The whole
+# captured output is searched, so a test that prints or asserts "Length
+# too long" in its own output would make a complete run unreportable --
+# including the tests of this guard. Anchoring on the traceback shape
+# fixes that, but it also narrows what the package suite's own copy
+# used to catch: that matched the phrase anywhere, so the limit
+# reported on a line of its own, or wrapped in some other exception
+# name, stops being caught. Hence the second alternative, which is the
+# bare message as a whole line and nothing else. Captured output
+# carries it inside a sentence or behind a prefix, so the false
+# positive stays fixed while the one failure mode this script exists
+# for is caught in either shape.
+if grep -qE "(ValueError|subunit).*Length too long|^Length too long: [0-9]+$" \
+        "$OUTPUT_FILE"; then
     echo "" >&2
     echo "Error: a stestr worker died on the subunit packet-size limit" >&2
     echo "(a test attached >4MB of captured output). The run is PARTIAL:" >&2

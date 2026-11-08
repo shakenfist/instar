@@ -131,9 +131,10 @@ echo
 # change that means to alter info output will fail it, which is the
 # point: say so, by not claiming parity.
 if [[ "$AUDIT_SCOPE_SKIP_SCOPED" -eq 0 ]]; then
-    PARITY_SCOPE=$(audit_scope_names_all \
-        | grep -E '^(src/crates/(vhd|vhdx)/|tools/verify-info-output-parity\.sh$)' \
-        || true)
+    # The pattern is audit-scope.sh's, so tools/audit/test-audit-scope.sh
+    # can assert that it selects these crates out of a real scope rather
+    # than out of a copy of the pattern.
+    PARITY_SCOPE=$(audit_scope_parity_names)
 else
     PARITY_SCOPE=""
 fi

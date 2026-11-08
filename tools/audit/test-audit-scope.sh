@@ -99,6 +99,14 @@ build_fixture() {
         git checkout -q -b feat-b
         printf 'three\n' > f3.rs
         printf 'changed\n' >> b.rs
+        # Two paths for the info-output parity scope: one the gate is
+        # for, and one that can change `instar info` output and is
+        # deliberately outside it. They are real paths in a real scope,
+        # so the filter is asserted against what the resolver emits
+        # rather than against a list written here.
+        mkdir -p src/crates/vhdx/src src/operations/info/src
+        printf 'vhdx\n' > src/crates/vhdx/src/lib.rs
+        printf 'info\n' > src/operations/info/src/main.rs
         git rm -q keep.txt
         git add -A
         git commit -q -m 'feat b'
@@ -703,6 +711,41 @@ else
 fi
 
 echo
+start "the info-output parity scope selects the files the gate is for"
+# Out of a real scope, through the real resolver: this is the half that
+# fails silently, because a resolver that stopped emitting
+# repo-relative names would match nothing and the gate would run
+# nowhere while wave 1 stayed green.
+expected='src/crates/vhdx/src/lib.rs'
+actual="$(in_fixture "audit_scope_init --commits-file '${TWO_CFILE}'; audit_scope_parity_names")"
+expect_names "parity scope resolved from the fixture's own history" \
+    "$expected" "$actual"
+# The scope is narrower than the risk, by decision, so the info path
+# that the same merge added must not be selected. Asserted because the
+# narrowness is what PUSH-AUDIT.md now promises a reader.
+if echo "$actual" | grep -q 'operations/info'; then
+    fail "the parity scope selected the info path; PUSH-AUDIT.md says it does not"
+else
+    ok "leaves the info path to be parity-checked by hand, as documented"
+fi
+
+start "the parity filter over the shapes the tree can hold"
+cat > "${WORK}/parity-shapes.txt" <<'SHAPES'
+src/crates/vhd/src/lib.rs
+src/crates/vhdx/src/parse.rs
+tools/verify-info-output-parity.sh
+src/crates/vhdx-notes.txt
+src/operations/info/src/main.rs
+docs/vhdx.md
+tools/verify-info-output-parity.sh.orig
+SHAPES
+expected='src/crates/vhd/src/lib.rs
+src/crates/vhdx/src/parse.rs
+tools/verify-info-output-parity.sh'
+actual="$(in_fixture "audit_scope_parity_filter < '${WORK}/parity-shapes.txt'")"
+expect_names "selects both crates and the script, and nothing adjacent" \
+    "$expected" "$actual"
+
 if [ "$FAILURES" -ne 0 ]; then
     echo "${FAILURES} failure(s)" >&2
     exit 1

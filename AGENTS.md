@@ -106,6 +106,11 @@ Per-format feature detail is in
   merge-queue and nightly halves of the distro matrix to being exact
   complements: a distro added to one must be added to the other, while a
   test belongs to exactly one -- claiming it in both fails the guard too.
+  A test whose teeth depend on an environment variable, as
+  `TestZstdBackingChain` depends on `INSTAR_REQUIRE_ZSTD`, must be
+  claimed by a job that sets it: the pairing goes in `ENV_REQUIRED_BY`
+  and is asserted, because an unset requirement turns the test back
+  into a skip, and a skip reads as a pass.
 
 - **A new vCPU must be given a guest CPUID.** A fresh KVM vCPU
   advertises no long mode, so since Linux 6.12.112 `KVM_SET_SREGS`

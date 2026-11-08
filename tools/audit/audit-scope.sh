@@ -372,6 +372,31 @@ audit_scope_names_all() {
     fi
 }
 
+# Which of the scope's files the info-output parity gate is for.
+#
+# The pattern lives here, beside the resolver, rather than inline in
+# wave1.sh, so that it can be tested against what the resolver really
+# emits. Its silent failure is the one that matters: if these names
+# ever stopped being repo-relative -- an absolute path, a leading ./ --
+# the pattern would match nothing, the gate would never run, and wave 1
+# would stay green while saying nothing about info output. That is the
+# "a guard that runs nowhere" shape the gate was wired up to end, so it
+# does not get to live in the gate's own scoping.
+#
+# The scope is deliberately narrower than the risk: a change to the
+# info operation, to the vmm's handling of an info result, or to the
+# output formatters can alter `instar info` output without matching
+# this, because the gate costs a second full build. PUSH-AUDIT.md says
+# so where someone reading a green wave 1 will see it.
+audit_scope_parity_filter() {
+    grep -E '^(src/crates/(vhd|vhdx)/|tools/verify-info-output-parity\.sh$)' || true
+}
+
+audit_scope_parity_names() {
+    # shellcheck disable=SC2119  # the no-pathspec call is the whole scope
+    audit_scope_names_all | audit_scope_parity_filter
+}
+
 # The scope is "every file the audited commits touched", which
 # deliberately includes files they deleted -- that is the honest count
 # of what was changed, and audit_scope_report keeps reporting it. A
