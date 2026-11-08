@@ -31,6 +31,8 @@
 #                before running. The run must have executed at least
 #                that many; load-time cases make a real run longer than
 #                the listing, never shorter, so fewer means truncated.
+#                Zero is refused in either spelling: a selection that
+#                matched nothing clears every floor there is.
 #
 # EXPECTED used to be optional, and the one caller that could leave it
 # off did. `integration-core` ran the four shape guards below with no
@@ -77,17 +79,26 @@ if [ "$EXPECTED" = 'in-output' ]; then
         echo "run with one guard switched off." >&2
         exit 1
     fi
-    if [ "$EXPECTED" -eq 0 ]; then
-        echo "" >&2
-        echo "Error: the selection matched no tests at all. A selector" >&2
-        echo "that matches nothing exits zero with everything passing," >&2
-        echo "which is indistinguishable from a green run." >&2
-        exit 1
-    fi
 elif ! [ "$EXPECTED" -ge 0 ] 2>/dev/null; then
     echo "Error: EXPECTED must be a number or 'in-output', got" >&2
     echo "'$EXPECTED'" >&2
     exit 2
+fi
+
+# One zero check for both spellings. `in-output` refused a count of
+# zero while an explicit numeric 0 was accepted and then cleared the
+# length floor trivially, so the floor could still be switched off --
+# by a caller passing a count it had derived as zero rather than by a
+# caller passing none. tools/test-package-functional.sh refuses zero
+# itself, so nothing was broken; the asymmetry was the defect, which is
+# why this is one check above both paths and not a second copy of the
+# message inside the numeric branch.
+if [ "$EXPECTED" -eq 0 ]; then
+    echo "" >&2
+    echo "Error: the selection matched no tests at all. A selector" >&2
+    echo "that matches nothing exits zero with everything passing," >&2
+    echo "which is indistinguishable from a green run." >&2
+    exit 1
 fi
 
 # Anchored on the traceback shape rather than the bare phrase: the

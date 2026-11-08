@@ -179,13 +179,16 @@ An operation whose devices form a single chain writes the config via
 
 A chain holding more than `MAX_CHAIN_DEVICES` (16) devices is refused
 here, naming the depth and the limit, rather than written as its first
-16 slots. The budget is in devices and not images, which is what makes
-it reachable: `security.max_chain_depth` (16 by default) counts images,
-and each external data file takes a slot of its own, so a chain
-standing at the depth limit whose top image has a qcow2 external data
-file is 17 devices. `check` and `convert` refuse such a chain before
-reaching this function; `commit` and `bench` reach it, and used to be
-run against a prefix of the chain with only a debug line to say so.
+16 slots. No command reaches that refusal: `check`, `convert`, `bench`
+and `commit` each count the devices of the chain they are about to
+write and refuse an over-budget one themselves, with a message naming
+the operation. It is a backstop against a caller whose own count
+drifts from the chain it passes, which the budget makes easy to get
+wrong -- it is in devices and not images, so
+`security.max_chain_depth` (16 by default) counts images while each
+external data file takes a slot of its own. A guard taking its number
+from the depth limit would undershoot, and the chain would be
+truncated here with only a debug line to say so.
 
 `compare` and `rebase` attach two unrelated chains, so they call
 `write_chain_device_entries()` once per chain and then

@@ -46,10 +46,20 @@ repos:
       # Both spellings are matched. `file.rs:123` is the obvious one;
       # the prose forms -- "(line 123)", "lines 754-755", "at line 1092",
       # "(ln 1624)" -- say exactly the same thing and rot exactly the
-      # same way, and a regex for the first form alone passes them. Only
-      # the forms that name a line deliberately are matched, so prose
-      # about the lines of a log window or of tool output ("the panic is
-      # line 30 of 91") is left alone.
+      # same way, and a regex for the first form alone passes them.
+      #
+      # The examples above are here, and not in the page that documents
+      # the convention, because this hook reads markdown only: a
+      # markdown page cannot show the forms it forbids without tripping
+      # the hook that reads it, so docs/development.md describes them in
+      # prose and the specimens live beside the pattern.
+      #
+      # Most alternations need the line to be named deliberately -- "at
+      # line 30", "(line 30)" -- so prose about a log window or tool
+      # output is left alone. The bare range form is the exception: it
+      # matches "lines 10-20" wherever it appears, including of a
+      # captured log. Rephrase such a sentence rather than widening the
+      # pattern, which is what would let a real citation through.
       - id: docs-line-references
         name: No source line-number references in documentation
         language: pygrep

@@ -2856,9 +2856,18 @@ directories, so a developer who had built the tree scanned 1,199 files
 where CI's fresh checkout scans 277. Those 922 extra files are
 generated and vendored code, where a claim would be reported against a
 path nobody can edit — and the two counts disagreeing makes the figure
-the script prints useless as evidence. The self-test asserts that
-nothing `git check-ignore` matches is scanned, so the next build
-directory needs no new entry.
+the script prints useless as evidence.
+
+Which trees those are is git's answer and not a list here: the scan
+asks `git check-ignore` about everything its globs matched and drops
+what git ignores. The first version of the exclusion was a hardcoded
+prefix tuple and had already drifted — `.gitignore` is `**/target/`
+and `src/fuzz` carries its own, so `src/fuzz/target/`, where the
+cargo-fuzz crate builds outside the main workspace, was ignored by git
+and scanned here. A tree git cannot be asked about, such as an
+exported source drop, falls back to the prefixes, and the self-test
+reports that check as skipped rather than failing on it.
+
 The pattern is anchored on what a claim says instar cannot act *on*
 rather than on the verb, because that is what decides whether the
 claim is false. An unscoped claim naming a differencing image or a
@@ -2884,8 +2893,9 @@ a clean tree on a scan that matched almost no files.
 The other five are about what the widened scan reads, which the claim
 forms cannot see: that every glob matches at least one file, that a
 docs page below `docs/` itself is read, that nothing under
-`docs/plans/` is, that nothing named in `EXCLUDED` is, and that
-nothing git ignores is. The per-glob floor is the load-bearing one.
+`docs/plans/` is, that nothing named in `EXCLUDED` is, and that the
+ignore filter drops the build trees git ignores and only those. The
+per-glob floor is the load-bearing one.
 The aggregate floor was sized for three globs, and with five any
 single glob could stop matching -- the precise failure a floor exists
 to catch -- while the other four held the total in the hundreds. The

@@ -56,9 +56,9 @@ every baseline, so keep it filesystem-safe:
 sha256sum ../instar-testdata/<path-to-image>
 ```
 
-Verified at test time by `verify_image_hash()` in `tests/base.py`. If the image changes without its
-baselines being regenerated, the test skips with a clear message rather than
-failing with a confusing diff.
+Verified at test time by `verify_image_hash()` in `tests/base.py`. If
+the image changes without its baselines being regenerated, the test
+skips with a clear message rather than failing with a confusing diff.
 
 ## Step 4: Update the Manifest
 
@@ -230,8 +230,9 @@ implementation gets graded against.
 **Fields normalised before comparison.** Do not chase diffs in these:
 
 - `disk size` / `actual-size` is substituted from the live filesystem
-  (`substitute_actual_size()` in `tests/helpers/comparators.py`), because it is allocation state, not a
-  format decision. Baseline values for it are cosmetic.
+  (`substitute_actual_size()` in `tests/helpers/comparators.py`),
+  because it is allocation state, not a format decision. Baseline
+  values for it are cosmetic.
 - vmdk `cid`/`parent-cid`, the dirty flag and vhdx log-size are stripped by
   `assert_info_equivalent`. A vmdk content ID is a random nonce.
 

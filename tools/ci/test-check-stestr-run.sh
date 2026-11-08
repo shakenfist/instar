@@ -173,6 +173,26 @@ start "the discovery count is mandatory"
 expect_rc "exits 2 when called with no count" 2 "${WORK}/clean.txt"
 expect_message "the usage line names the count" \
     "usage:.*OUTPUT_FILE EXPECTED" "${WORK}/clean.txt"
+# A count of zero spelled as a number, which the in-output path refused
+# and this one accepted. The run below is clean and long, so every
+# other guard passes it: only the zero check can refuse it.
+expect_rc "refuses a numeric count of zero" 1 "${WORK}/clean.txt" 0
+expect_message "refuses it in the same words as in-output" \
+    "selection matched no tests at all" "${WORK}/clean.txt" 0
+
+start "a run whose totals block this cannot read"
+# What --no-subunit-trace prints: "Ran N tests" with no colon and no
+# worker balance. The header says such a run is refused for having no
+# totals block rather than passed on a format this cannot read, and a
+# future Makefile edit is what would produce it.
+{
+    echo 'test_info.TestInfo.test_qcow2 ... ok'
+    echo 'Ran 1273 tests in 12.3456 sec.'
+    echo 'OK (skipped=41)'
+} > "${WORK}/nocolon.txt"
+expect_rc "refuses the no-subunit-trace shape" 1 "${WORK}/nocolon.txt" 1273
+expect_message "says the totals block is what is missing" \
+    "no \"Ran: N tests\" total" "${WORK}/nocolon.txt" 1273
 
 start "called wrongly"
 expect_rc "exits 2 with no argument" 2

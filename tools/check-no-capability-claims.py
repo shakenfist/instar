@@ -38,6 +38,7 @@ part.
 import argparse
 import pathlib
 import re
+import subprocess
 import sys
 
 CLAIM = re.compile(
@@ -64,18 +65,28 @@ GLOBS = (
 EXCLUDED = ('tools/check-no-capability-claims.py',)
 # Trees whose records were true when written: see the module
 # docstring. A prefix rather than a glob that happens to miss them.
+EXCLUDED_PREFIXES = ('docs/plans/',)
+# Build trees are excluded for a different reason, and by asking git
+# rather than by listing them: `src/**/*.rs` and `tests/**/*.py` reach
+# generated and vendored code once a tree has been built, and pathlib's
+# globs match dotted directories, so a developer with src/target/ and
+# tests/.venv/ present scanned 1199 files where CI's fresh checkout
+# scans 277. Those 922 files are not this repository's claims, a
+# vendored crate's comment would be reported against a path nobody can
+# edit, and the two counts disagreeing makes the number this prints
+# useless as evidence.
 #
-# The build trees are here for a different reason: `src/**/*.rs` and
-# `tests/**/*.py` reach generated and vendored code once a tree has
-# been built, and pathlib's globs match dotted directories, so a
-# developer with src/target/ and tests/.venv/ present scanned 1199
-# files where CI's fresh checkout scans 277. Those 922 files are not
-# this repository's claims, a vendored crate's comment would be
-# reported against a path nobody can edit, and the two counts
-# disagreeing makes the number this prints useless as evidence. The
-# self-test asserts nothing git ignores is scanned, so the next build
-# directory does not have to be remembered here.
-EXCLUDED_PREFIXES = ('docs/plans/', 'src/target/', 'tests/.venv/')
+# The first version of that exclusion was a hardcoded prefix tuple, and
+# it had already drifted: .gitignore is `**/target/` and src/fuzz
+# carries its own, so src/fuzz/target/ -- where the cargo-fuzz crate
+# builds, outside the main workspace -- was ignored by git and scanned
+# here. Asking git instead means the scan and the self-test share one
+# definition of generated, and the next build directory needs
+# remembering in neither.
+#
+# These are the fallback for a tree git cannot be asked about: an
+# exported source drop or a release tarball is not a repository.
+GENERATED_PREFIXES = ('src/target/', 'src/fuzz/target/', 'tests/.venv/')
 # Resolved from this file rather than the working directory. Globbed
 # relative to `.`, every pattern matched nothing when the script was
 # run from anywhere but the repository root -- from `tools/`, or from
@@ -103,20 +114,50 @@ def excluded(relative):
             or relative.startswith(EXCLUDED_PREFIXES))
 
 
+def git_ignored(candidates):
+    """Which of *candidates* git ignores, or None when git cannot say.
+
+    None is "could not be asked" and not "nothing is ignored", so the
+    caller falls back to GENERATED_PREFIXES rather than scanning a
+    build tree. `check-ignore` exits 0 when something matched, 1 when
+    nothing did, and 128 outside a working tree -- which an exported
+    source drop or a release tarball really is, so that is a fallback
+    and not an error.
+    """
+    if not candidates:
+        return set()
+    try:
+        asked = subprocess.run(
+            ['git', '-C', str(REPO_ROOT), 'check-ignore', '--stdin'],
+            input='\n'.join(sorted(candidates)), capture_output=True,
+            text=True, check=False)
+    except OSError:
+        return None
+    if asked.returncode not in (0, 1):
+        return None
+    return {line.strip() for line in asked.stdout.split('\n') if line.strip()}
+
+
 def scan_paths():
     """Return {glob: [repo-relative posix path, ...]} for every glob.
 
     One implementation for the real scan and for the self-test, so the
     self-test cannot pass against a set of files the scan does not read.
     """
-    found = {}
+    candidates = {}
     for glob in GLOBS:
-        found[glob] = [
+        candidates[glob] = [
             path.relative_to(REPO_ROOT).as_posix()
             for path in sorted(REPO_ROOT.glob(glob))
             if not excluded(path.relative_to(REPO_ROOT).as_posix())
         ]
-    return found
+    every = {path for paths in candidates.values() for path in paths}
+    ignored = git_ignored(every)
+    if ignored is None:
+        ignored = {path for path in every
+                   if path.startswith(GENERATED_PREFIXES)}
+    return {glob: [path for path in paths if path not in ignored]
+            for glob, paths in candidates.items()}
 
 
 def empty_globs(found):
@@ -264,32 +305,27 @@ def self_test():
           'does not scan itself',
           f'{myself} scans itself, so it will report its own specimens')
 
-    # Nothing generated. This is the non-vacuous half of the build-tree
-    # exclusion above: restating the prefixes would assert only that the
-    # code does what it says, while asking git catches the next build
-    # directory -- which is how the first two got in.
-    import subprocess
-    try:
-        ignored = subprocess.run(
-            ['git', '-C', str(REPO_ROOT), 'check-ignore', '--stdin'],
-            input='\n'.join(sorted(scanned)), capture_output=True,
-            text=True, check=False)
-    except OSError as exc:
-        print(f'FAIL cannot ask git what it ignores: {exc}')
-        bad += 1
-        checks += 1
+    # The ignore filter, asserted on paths rather than on the tree.
+    # Observing the real scan cannot check this: the scan filters
+    # through git, so "nothing scanned is ignored" is now true by
+    # construction, and in CI's fresh checkout no build tree exists to
+    # be excluded in the first place -- the same vacuity as asserting
+    # `not any(p in EXCLUDED ...)`. So the filter is asked directly,
+    # about the two build trees that matter and about a tracked file. A
+    # filter that excluded nothing, excluded everything, or missed
+    # src/fuzz/target/ -- as the hardcoded prefixes did, while
+    # .gitignore always covered it -- fails all three at once.
+    probes = ['src/target/debug/probe.rs', 'src/fuzz/target/probe.rs',
+              'tools/check-no-capability-claims.py']
+    ignored = git_ignored(probes)
+    if ignored is None:
+        print('skip git cannot be asked what it ignores here, so the scan '
+              f'falls back to {GENERATED_PREFIXES}')
     else:
-        # check-ignore exits 1 when nothing matched, which is the pass.
-        if ignored.returncode not in (0, 1):
-            check(False, '', f'git check-ignore failed: '
-                             f'{ignored.stderr.strip()}')
-        else:
-            listed = [line for line in ignored.stdout.split('\n')
-                      if line.strip()]
-            check(not listed,
-                  'scans no file git ignores',
-                  f'{len(listed)} generated file(s) are scanned, e.g. '
-                  f'{listed[0] if listed else ""}')
+        check(ignored == set(probes[:2]),
+              'excludes the build trees git ignores, and only those',
+              f'the ignore filter answered {sorted(ignored)}, not the two '
+              f'build trees alone')
 
     if bad:
         print(f'{bad} of {checks} self-test checks failed')

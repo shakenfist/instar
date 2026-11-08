@@ -4127,14 +4127,23 @@ fn write_chain_config(
     // asked about -- a wrong read, reported as a success, with only a
     // debug line to say so.
     //
-    // Reachable, not merely a backstop. `security.max_chain_depth` (16
-    // by default, and configurable upwards) counts images, while
-    // total_devices() counts images plus the external data files that
-    // each take a device slot of their own, so a chain standing at the
-    // depth limit whose top image has a qcow2 external data file is 17
-    // devices. run_check and execute_convert refuse that themselves
-    // before reaching here; run_commit_guest and run_bench_guest have
-    // no device-budget guard of their own and arrive with it.
+    // A backstop, and no command reaches it today. All four callers
+    // refuse an over-budget chain at the command level first, and each
+    // counts the devices of the very chain it then writes here:
+    // run_check and run_bench from `chain.total_devices()`,
+    // execute_convert from that plus its output slot, and run_commit
+    // from the overlay plus the backing's parents -- which is the same
+    // arithmetic as the `combined_chain` it hands over, because the
+    // overlay's ChainImage is built with no external data files.
+    //
+    // What this closes is a caller whose own count drifts from the
+    // chain it passes. The budget is in devices and not images:
+    // `security.max_chain_depth` (16 by default, and configurable
+    // upwards) counts images, while total_devices() adds a slot for
+    // each external data file, so a guard that took its number from
+    // the depth limit would undershoot by one per data file and
+    // truncate here instead of refusing. Hence a refusal naming both
+    // numbers rather than a debug line.
     if chain.total_devices() > MAX_CHAIN_DEVICES {
         return Err(format!(
             "chain depth {} exceeds maximum of {} devices; \
@@ -4201,6 +4210,11 @@ mod chain_config_writer_tests {
         chain
     }
 
+    // Unit-level because there is nothing reachable to drive: every
+    // caller refuses an over-budget chain before this function sees
+    // one (see write_chain_config), so an end-to-end case would be
+    // asserting the caller's guard, not this one. What has to hold is
+    // the writer's own contract, which is what this asserts.
     #[test]
     fn write_chain_config_refuses_a_chain_deeper_than_the_guest_can_hold() {
         let guest_mem =
