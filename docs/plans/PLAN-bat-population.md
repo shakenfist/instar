@@ -1563,6 +1563,15 @@ We should list obvious extensions, known issues, unrelated bugs we
 encountered, and anything else we should one day do but have
 chosen to defer to here, so that we do not forget them.
 
+* The differential fuzzer's fixed VHDX convert arm is reachable only
+  when the source's virtual size exactly equals a pinned fixed
+  geometry's, which after the filters is 16M or 64M, and then at
+  probability 0.5 -- so roughly 8% of vhdx convert iterations exercise
+  the subject of this plan. Biasing the convert source size toward the
+  pinned geometries would fix it, but it shifts the fuzzer's draw
+  sequence, so it wants measuring rather than tacking onto a review
+  round. The `structural_outcomes` counts in the run summary now make
+  the balance visible without re-measuring it by hand.
 * Nothing re-checks that every option the differential fuzzer's create
   picker draws is still reachable. The plan makes "an option that is
   never drawn is not coverage" a reportable failure, and phase 11d

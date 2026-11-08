@@ -750,6 +750,75 @@ is weak evidence on this host, and the right response to a cluster of
 `Content mismatch at offset 0` failures is to replay the named tests
 at low concurrency before believing them -- not to bisect.
 
+**Review round 3 (2026-11-08 AEDT).** 1 fix, 6 consider, 3 none. The
+fix item was an off-by-one in 11b, not in either review round:
+`MAX_BUFFER_ENTRIES` was 4096 and its comment claimed that cleared the
+largest legal `chunk_ratio` so a call from index 0 could reach the
+sector-bitmap slot after a whole group. It cannot. The BAT repeats
+every `chunk_ratio + 1` entries with the slot last, so at ratio 4096
+the slot is index 4096 and a 4096-entry call stops exactly one short.
+No single call in the target could ever span a group and its slot.
+The constant is now 4097, and the reason is a `const _: () =
+assert!(MAX_BUFFER_ENTRIES > MAX_CHUNK_RATIO)` rather than a comment,
+so lowering it is a build failure -- verified by lowering it and
+reading the error.
+
+Five of the six consider items were taken. Two were the last wide
+dimensions of guards these rounds built:
+
+* `truncated_inside_region` accepted *any* region whose extent ran
+  past the end of the file. The filed defect is the metadata region
+  specifically, so a corrupt region table plus an unallocated BAT was
+  being suppressed as #883 -- the exact class of finding the arm
+  exists to catch. Now metadata-only. Making that falsifiable needed a
+  test with a *third* region, since with only bat and metadata the
+  BAT is the only other candidate and an overrunning BAT cannot be
+  read at all; the test crafts the third region-table entry.
+* The field-classification scan read an interpolated type by its
+  literal tail and silently dropped any record whose type it could not
+  read -- the one way that guard fails unsafely. An unreadable type is
+  now a hard failure. The first version of that test was vacuous,
+  which the mutation run caught: it asserted the real file has none,
+  so it passed against a detector that found nothing. The detector is
+  now a function over source text, tested against fixtures.
+
+The third worth naming: a structural comparison that found no pinned
+case, or whose source size could not be probed, returned None with no
+record, which reads exactly like a clean comparison.
+`STRUCTURAL_OUTCOMES` now counts every comparison by outcome and
+reports it in the run summary, on the same reasoning as the #883 skip
+counting -- a comparison nobody can see did not happen is not
+coverage. The hand-measured coverage figures in `docs/testing.md` are
+now reported numbers.
+
+Declined and recorded in the master plan's Future work: biasing the
+convert source size toward pinned geometries so the fixed arm is drawn
+more than ~8% of the time. It is a real coverage gap, but it shifts
+the fuzzer's draw sequence and wants measuring rather than a review
+round.
+
+**The outcome counter found something on its first run.** The 60
+iterations at seed 2024 that rounds 1 and 2 used as their fuzz
+evidence report `convert:skipped_issue_883 x4` and
+`convert:no_pin_for_geometry x3` -- and no `compared` at all. That run
+exercises the rest of the fuzzer, but the structural arm compared
+nothing in it, so quoting its "0 divergences" as evidence that the
+comparison still behaved was quoting a comparison that never ran. This
+is exactly the blindness the review item described, found by the
+counter added to answer it. A convert-only run of 150 iterations at
+seed 7 gives `compared x34`, `no_pin_for_geometry x44`,
+`skipped_issue_883 x56`, which is the arm working end to end and the
+same shape as the hand measurement quoted in `docs/testing.md`.
+
+**Mutation count after round 3: forty-four.** Thirty-four Python
+mutants plus the compile-time assertion above, over the phase's nine
+Rust ones. Round 3 had to retarget two of the earlier mutants again
+and rewrite three of its own, because the first versions were killed
+by the wrong test or could not fail at all -- which is twice now that
+the mutation run has found a weakness in a test written in the same
+round, and the argument for running it before claiming a guard works
+rather than after.
+
 ## Back brief
 
 Points needing the operator's answer before any step runs:

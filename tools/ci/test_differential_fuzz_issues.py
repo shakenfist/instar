@@ -14,6 +14,7 @@ callables are replaced with recorders.
 
 import ast
 import os
+import random
 import re
 import types
 import unittest
@@ -201,14 +202,44 @@ def _type_text(node):
     return None
 
 
+def unreadable_record_types(source):
+    """Line numbers in `source` of records whose `type` text cannot be read.
+
+    A record is a dict or `dict()` call carrying a `type` key. When that
+    key's text cannot be determined -- an f-string ending in an
+    interpolation -- every field of the record leaves the field
+    classification scan without a word, so the scan treats this as a
+    hard failure rather than skipping the record.
+    """
+    lines = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Dict):
+            keys = [k.value if isinstance(k, ast.Constant) else None for k in node.keys]
+            types_ = [v for k, v in zip(keys, node.values) if k == 'type']
+        elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == 'dict'):
+            types_ = [kw.value for kw in node.keywords if kw.arg == 'type']
+        else:
+            continue
+        if types_ and _type_text(types_[0]) is None:
+            lines.append(node.lineno)
+    return lines
+
+
 def _is_divergence_type(node):
     """Whether a `type` expression names a record that can file an issue.
 
     Only the literal tail of an interpolated type is knowable here, so an
     `inconclusive_` type built by interpolation would read as a
-    divergence. Every one in the file is a plain literal today, and the
+    divergence. Every one in the file is a plain literal today, and that
     error is in the safe direction: a field classified that is never
     keyed costs nothing, while an unclassified one fails CI.
+
+    The unsafe direction is a `type` whose text cannot be read at all --
+    an f-string ending in an interpolation, say -- because every field of
+    that record would leave the scan silently.
+    `test_every_record_type_can_be_read` refuses that rather than
+    leaving the guard best-effort.
     """
     text = _type_text(node)
     return bool(text) and not text.startswith(_NOT_A_DIVERGENCE_PREFIX)
@@ -328,6 +359,34 @@ class ShapeFieldsTestCase(unittest.TestCase):
         # Named separately from the table above so a regression in this
         # one path is attributable.
         self.assertIn('vhdx_block_size', self.divergence_fields())
+
+    def test_every_record_type_can_be_read(self):
+        # The scan reads an interpolated type by its literal tail, so a
+        # type that ends in an interpolation is unreadable and every
+        # field of that record leaves the scan without a word. That is
+        # the one way this guard fails unsafely, so it is refused here
+        # rather than tolerated.
+        with open(_DF_PATH, encoding='utf-8') as f:
+            source = f.read()
+        self.assertEqual([], unreadable_record_types(source),
+                         'end an interpolated divergence `type` in a literal, so the field '
+                         'classification guard can still read which record it is')
+
+    def test_an_unreadable_type_is_detected(self):
+        # The test above holds over a file that has none, so it would
+        # pass against a detector that found nothing. These fixtures say
+        # the detector works: a type ending in an interpolation is
+        # caught, in both shapes a record is built in, and a type ending
+        # in a literal is not.
+        caught = (
+            "d = {'type': f'{op}_{kind}', 'a': 1}\n"
+            "e = dict(ctx, type=f'prefix_{suffix}')\n"
+        )
+        self.assertEqual([1, 2], unreadable_record_types(caught))
+        self.assertEqual([], unreadable_record_types("d = {'type': f'{op}_divergence', 'a': 1}\n"))
+        self.assertEqual([], unreadable_record_types("d = {'type': 'exit_code_divergence'}\n"))
+        # A dict with no type at all is not a record.
+        self.assertEqual([], unreadable_record_types("d = {'a': f'{x}'}\n"))
 
     def test_inconclusive_records_are_not_divergences(self):
         # An inconclusive record is logged for visibility and never
@@ -610,6 +669,158 @@ class KnownDefectSkipScopeTestCase(unittest.TestCase):
         result, skips = self.compare('dynamic', 'dd')
         self.assertEqual('dd_vhdx_parse_failure', result['type'])
         self.assertEqual({}, skips)
+
+
+class ArguableClassificationsTestCase(unittest.TestCase):
+    """The field classifications whose call is a judgement, held by a test.
+
+    Widening the scan surfaced two dozen fields that had never been
+    classified, and most are obvious from their name. These three are
+    not: mis-binning one is silent, and it goes wrong in both
+    directions -- a shape field left per-iteration merges distinct
+    findings into one issue, and the reverse splits one finding across
+    many -- so the reasoning is pinned here rather than left to the
+    comment beside the list.
+    """
+
+    @staticmethod
+    def divergence(**fields):
+        return dict({'type': 'amend_check_divergence', 'operation': 'amend'}, **fields)
+
+    def test_note_separates_two_findings(self):
+        # `note` is the fixed wording a check gives its finding, from a
+        # small vocabulary, so two different notes are two findings.
+        self.assertNotEqual(
+            df.divergence_key(self.divergence(note='raw-flattened content differs')),
+            df.divergence_key(self.divergence(note='qemu-img check could not parse image')))
+
+    def test_error_does_not_separate_two_findings(self):
+        # `error` is an exception's text, which carries paths and offsets
+        # from the iteration that raised it. Shaping on it would file one
+        # issue per iteration, which is the fault divergence_key exists
+        # to prevent.
+        self.assertEqual(
+            df.divergence_key(self.divergence(error="can't open /tmp/fuzz-1/img.qcow2")),
+            df.divergence_key(self.divergence(error="can't open /tmp/fuzz-2/img.qcow2")))
+
+    def test_path_does_not_separate_two_findings(self):
+        # Every iteration works in its own directory, so a path differs
+        # every time by construction.
+        self.assertEqual(
+            df.divergence_key(self.divergence(path='/tmp/fuzz-1/out.vhdx')),
+            df.divergence_key(self.divergence(path='/tmp/fuzz-2/out.vhdx')))
+
+
+class StructuralOutcomeCountTestCase(unittest.TestCase):
+    """Every structural comparison that did not happen is counted, not silent."""
+
+    PIN = {'block_size': MiB, 'virtual_disk_size': 64 * MiB}
+
+    def outcomes(self, virtual_size=64 * MiB, block_size=MiB, parse_error=None, shape=None,
+                 subformat='fixed'):
+        def parse(path):
+            if parse_error:
+                raise df.VhdxParseError(parse_error)
+            return None
+
+        with mock.patch.object(df, 'parse_vhdx', parse), \
+                mock.patch.object(df, 'summarise', lambda parsed: dict(self.PIN)), \
+                mock.patch.object(df, 'truncated_inside_region', lambda path: shape), \
+                mock.patch.object(df, '_vhdx_pin_geometries',
+                                  lambda: {subformat: {(64 * MiB, MiB): 'case'}}), \
+                mock.patch.object(df, 'expected', lambda name, pin=None: {'summary': dict(self.PIN)}), \
+                mock.patch.dict(df.STRUCTURAL_OUTCOMES, {}, clear=True), \
+                mock.patch.dict(df.KNOWN_DEFECT_SKIPS, {}, clear=True):
+            df.compare_vhdx_structure('out.vhdx', subformat, virtual_size, 'convert', {},
+                                      block_size=block_size)
+            return dict(df.STRUCTURAL_OUTCOMES)
+
+    def test_a_comparison_that_happened_is_counted(self):
+        self.assertEqual({'convert:compared': 1}, self.outcomes())
+
+    def test_the_counters_are_emptied_per_run(self):
+        # Both counters are module globals read only when a run reports,
+        # so a second run in one process would otherwise report the
+        # first run's counts as its own.
+        with mock.patch.dict(df.STRUCTURAL_OUTCOMES, {'convert:compared': 7}, clear=True), \
+                mock.patch.dict(df.KNOWN_DEFECT_SKIPS, {'convert_vhdx_x': 3}, clear=True):
+            df.reset_run_counters()
+            self.assertEqual({}, df.STRUCTURAL_OUTCOMES)
+            self.assertEqual({}, df.KNOWN_DEFECT_SKIPS)
+
+    def test_an_unpinned_geometry_is_counted_not_silent(self):
+        # The failure this closes: an iteration that parsed its output
+        # and found no pin returns no divergence, which reads exactly
+        # like a clean comparison in the summary.
+        self.assertEqual({'convert:no_pin_for_geometry': 1}, self.outcomes(block_size=8 * MiB))
+
+    def test_an_unprobeable_source_is_counted_not_silent(self):
+        self.assertEqual({'convert:no_virtual_size': 1}, self.outcomes(virtual_size=None))
+
+    def test_a_parse_failure_is_counted(self):
+        self.assertEqual({'convert:parse_failure': 1}, self.outcomes(parse_error='truncated'))
+
+    def test_the_known_defect_skip_is_counted_under_its_own_name(self):
+        # Dynamic, because the skip is scoped to the shape the defect was
+        # measured on; a fixed output of the same shape counts as a parse
+        # failure, which the case below holds.
+        self.assertEqual({'convert:skipped_issue_883': 1},
+                         self.outcomes(subformat='dynamic', parse_error='truncated',
+                                       shape=('metadata', 4 * MiB, 3 * MiB)))
+
+    def test_a_fixed_output_of_the_known_shape_counts_as_a_parse_failure(self):
+        self.assertEqual({'convert:parse_failure': 1},
+                         self.outcomes(subformat='fixed', parse_error='truncated',
+                                       shape=('metadata', 4 * MiB, 3 * MiB)))
+
+
+class ConvertShapePickerTestCase(unittest.TestCase):
+    """What `_convert_vhdx_shape` can draw, over a stubbed pin and probe."""
+
+    GEOMETRIES = {
+        'fixed': {(64 * MiB, MiB): 'vhdx-fixed-64M-block-1M-bsz-off'},
+        'dynamic': {(64 * MiB, 8 * MiB): 'vhdx-dynamic-64M'},
+    }
+
+    def draws(self, virtual_size=64 * MiB, count=400):
+        rng = random.Random(1234)
+        with mock.patch.object(df, '_vhdx_pin_geometries', lambda: self.GEOMETRIES), \
+                mock.patch.object(df, '_map_probe_virtual_size', lambda source, timeout: virtual_size):
+            return [df._convert_vhdx_shape(rng, 'src.qcow2', 30) for _ in range(count)]
+
+    def test_both_subformats_are_reachable(self):
+        # An arm that is never drawn is not coverage, and fixed VHDX is
+        # the subject of the phase this picker was added for.
+        self.assertEqual({'fixed', 'dynamic'}, {subformat for subformat, _, _ in self.draws()})
+
+    def test_every_fixed_draw_names_its_block_size(self):
+        # The pin is the oracle and there is no pinned structure for a
+        # geometry the sweep never ran, so a fixed draw may not leave the
+        # block size to the tool's default.
+        for subformat, block_size, _ in self.draws():
+            if subformat == 'fixed':
+                self.assertIsNotNone(block_size)
+
+    def test_every_fixed_draw_is_a_whole_number_of_blocks(self):
+        # #879: `convert -O vhdx --subformat fixed` fails when the
+        # partial last block holds data, so a geometry that is not a
+        # whole multiple would report a known bug every run instead of
+        # coverage.
+        for subformat, block_size, virtual_size in self.draws():
+            if subformat == 'fixed':
+                self.assertEqual(0, virtual_size % block_size)
+
+    def test_an_unpinned_source_size_only_draws_dynamic(self):
+        shapes = self.draws(virtual_size=65 * MiB)
+        self.assertEqual({'dynamic'}, {subformat for subformat, _, _ in shapes})
+
+    def test_an_unprobeable_source_degrades_to_dynamic(self):
+        # The probe is a qemu-img subprocess; when it cannot answer, the
+        # iteration still runs and the comparison finds no pin for a
+        # None virtual size.
+        shapes = self.draws(virtual_size=None)
+        self.assertEqual({'dynamic'}, {subformat for subformat, _, _ in shapes})
+        self.assertEqual({None}, {virtual_size for _, _, virtual_size in shapes})
 
 
 class VhdxStructureGeometryKeyTestCase(unittest.TestCase):

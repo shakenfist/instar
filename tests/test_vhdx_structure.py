@@ -62,6 +62,8 @@ REGION_TABLE_2_OFFSET = 256 * KiB
 REGION_TABLE_HEADER_SIZE = 16
 REGION_TABLE_ENTRY_SIZE = 32
 REGION_ENTRY_FILE_OFFSET = 16
+# The 32-bit Length that follows the 64-bit FileOffset (SPEC(VHDX) 2.3.2).
+REGION_ENTRY_LENGTH_OFFSET = 24
 
 
 def _round_up(value, multiple):
@@ -585,6 +587,45 @@ class TestVhdxTruncatedInsideRegion(_VhdxTestCase):
 
     def test_a_whole_image_is_not_the_shape(self):
         self.assertIsNone(truncated_inside_region(self.image))
+
+    def test_a_bogus_bat_length_is_not_the_shape(self):
+        # A region table with a garbage length is its own finding. Here
+        # the BAT region itself is declared past the end, so it cannot
+        # be read to say whether anything is allocated.
+        structure = parse_vhdx(self.image)
+        entry = [i for i, e in enumerate(structure.region_table_1) if e.name == 'bat'][0]
+        at = (REGION_TABLE_1_OFFSET + REGION_TABLE_HEADER_SIZE + entry * REGION_TABLE_ENTRY_SIZE
+              + REGION_ENTRY_LENGTH_OFFSET)
+        path = self.workdir / 'bogus-bat-length.vhdx'
+        shutil.copyfile(self.image, path)
+        with open(path, 'r+b') as f:
+            f.seek(at)
+            f.write(struct.pack('<I', 0xFFF00000))
+        self.assertIsNone(truncated_inside_region(path))
+
+    def test_a_third_region_running_past_the_end_is_not_the_shape(self):
+        # The case the metadata-only condition exists for: a whole file
+        # whose metadata region is fine and whose BAT is readable and
+        # empty, but which declares some *other* region past the end.
+        # That is a corrupt region table, not the shape #883 makes, and
+        # a predicate that accepted any overrunning region would
+        # suppress it. SPEC(VHDX) 2.3.1: EntryCount at offset 8, then
+        # 32-byte entries of GUID, FileOffset, Length, Required.
+        path = self.workdir / 'third-region.vhdx'
+        shutil.copyfile(self.image, path)
+        count = len(parse_vhdx(self.image).region_table_1)
+        third = (REGION_TABLE_1_OFFSET + REGION_TABLE_HEADER_SIZE
+                 + count * REGION_TABLE_ENTRY_SIZE)
+        with open(path, 'r+b') as f:
+            f.seek(REGION_TABLE_1_OFFSET + 8)
+            f.write(struct.pack('<I', count + 1))
+            f.seek(third)
+            f.write(bytes(range(16)) + struct.pack('<QII', 1 * MiB, 0xFFF00000, 0))
+        # The new region really is seen and really does overrun.
+        regions = parse_vhdx(path).region_table_1
+        self.assertEqual(count + 1, len(regions))
+        self.assertGreater(regions[-1].offset + regions[-1].length, os.path.getsize(path))
+        self.assertIsNone(truncated_inside_region(path))
 
     def test_a_file_stopping_before_the_bat_region_is_not_the_shape(self):
         # The BAT region has to be readable whole to say that nothing is

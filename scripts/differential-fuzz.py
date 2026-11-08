@@ -1130,6 +1130,32 @@ _VHDX_PIN = None
 # run summary, because a suppression nobody can see reads as coverage.
 KNOWN_DEFECT_SKIPS = {}
 
+# What became of each structural comparison, by operation and outcome.
+# The same reasoning as KNOWN_DEFECT_SKIPS, applied to the other ways a
+# comparison does not happen: an iteration that parsed its output and
+# then found no pinned case to judge it against returns no divergence,
+# which is indistinguishable from a clean comparison unless it is
+# counted. A pin set that stopped matching, or a `qemu-img info` probe
+# that stopped answering, would otherwise zero this arm with the run
+# summary still reading nothing wrong.
+STRUCTURAL_OUTCOMES = {}
+
+
+def _count_structural_outcome(operation, outcome):
+    key = f'{operation}:{outcome}'
+    STRUCTURAL_OUTCOMES[key] = STRUCTURAL_OUTCOMES.get(key, 0) + 1
+
+
+def reset_run_counters():
+    """Empty the per-run counters, so a second run in one process starts clean.
+
+    Both are module globals read only when a run reports, so a reused
+    module would otherwise carry the first run's counts into the second
+    run's summary.
+    """
+    KNOWN_DEFECT_SKIPS.clear()
+    STRUCTURAL_OUTCOMES.clear()
+
 
 def _vhdx_pin_geometries():
     """Pinned geometries this fuzzer can referee: `{subformat: {(virtual_size, block_size): case_name}}`.
@@ -1281,14 +1307,23 @@ def compare_vhdx_structure(image, subformat, virtual_size, operation, context, b
                 'Counted as a skip, not a pass; the total is in the run summary.',
                 region, declared_end, file_length,
             )
+            _count_structural_outcome(operation, 'skipped_issue_883')
             return None
+        _count_structural_outcome(operation, 'parse_failure')
         return dict(context, type=f'{operation}_vhdx_parse_failure',
                     vhdx_subformat=subformat, parse_error=str(e))
 
+    if virtual_size is None:
+        # The source's size could not be probed, so there is nothing to
+        # key the pin on. Counted rather than returned silently.
+        _count_structural_outcome(operation, 'no_virtual_size')
+        return None
     geometry = (virtual_size, block_size if block_size is not None else summary.get('block_size'))
     case = _vhdx_pin_geometries().get(subformat, {}).get(geometry)
     if case is None:
+        _count_structural_outcome(operation, 'no_pin_for_geometry')
         return None
+    _count_structural_outcome(operation, 'compared')
 
     want = expected(case, pin=_VHDX_PIN)['summary']
     # Both sides' keys, not just the pin's: a field `summarise` gains after
@@ -5754,9 +5789,9 @@ def file_github_issue(seed, iteration, attrs, divergence, workflow_url):
 # ---------------------------------------------------------------------------
 
 def main():
-    # Per run, not per process: the counts reported in the summary and in
-    # `known_defect_skips` belong to this run, and the module is reusable.
-    KNOWN_DEFECT_SKIPS.clear()
+    # Per run, not per process: the counts reported in the summary
+    # belong to this run, and the module is reusable.
+    reset_run_counters()
 
     parser = argparse.ArgumentParser(
         description='Differential fuzzing: instar vs qemu-img',
@@ -5965,6 +6000,11 @@ def main():
                 'Comparisons skipped for an already-filed defect (not a pass): %s x%d',
                 name, count,
             )
+        if STRUCTURAL_OUTCOMES:
+            logger.info(
+                'VHDX structural comparisons by outcome (anything but "compared" is not a pass): %s',
+                ', '.join(f'{name} x{count}' for name, count in sorted(STRUCTURAL_OUTCOMES.items())),
+            )
 
         # Write summary (including in --fail-fast mode)
         summary = {
@@ -5981,6 +6021,7 @@ def main():
             # the fact rather than only in the log.
             'libyal_tools': sorted(libyal_tools),
             'known_defect_skips': dict(KNOWN_DEFECT_SKIPS),
+            'structural_outcomes': dict(STRUCTURAL_OUTCOMES),
         }
         if issues is not None:
             summary.update(issues.finish())

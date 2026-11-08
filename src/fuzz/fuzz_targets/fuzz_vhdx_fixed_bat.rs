@@ -63,11 +63,25 @@ const ENTRY_LEN: usize = 8;
 ///
 /// A fixed BAT runs to 513 MiB at the 64 TiB ceiling, so a target that
 /// filled whole regions would spend every iteration in one geometry.
-/// 4096 entries clears the largest `chunk_ratio` a legal layout
-/// produces (4096, at a 1 MiB block size), so a call starting at entry
-/// 0 can still span a whole group and reach the sector-bitmap slot
-/// after it.
-const MAX_BUFFER_ENTRIES: u64 = 4096;
+/// The bound is one more than the largest `chunk_ratio` a legal layout
+/// produces (4096, at a 1 MiB block size), because the BAT repeats
+/// every `chunk_ratio + 1` entries with the sector-bitmap slot last:
+/// 4096 entries from index 0 stop one short of that slot, and 4097
+/// reach it, so a single call can span a whole group and its slot at
+/// every legal ratio.
+const MAX_BUFFER_ENTRIES: u64 = 4097;
+
+/// The largest `chunk_ratio` a legal layout produces: 8 MiB of sectors
+/// per chunk at a 512-byte logical sector size divided by the smallest
+/// 1 MiB block size (SPEC(VHDX) 3.4.1.2).
+const MAX_CHUNK_RATIO: u64 = 4096;
+
+/// The buffer bound's reason, checked at build time rather than left to
+/// the comment above it: the BAT repeats every `chunk_ratio + 1`
+/// entries with the sector-bitmap slot last, so spanning a whole group
+/// and its slot from index 0 needs strictly more than `MAX_CHUNK_RATIO`
+/// entries.
+const _: () = assert!(MAX_BUFFER_ENTRIES > MAX_CHUNK_RATIO);
 
 /// Bytes past the slice handed to the filler, left as the fill pattern
 /// so a write past the end of the buffer is caught here rather than

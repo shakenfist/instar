@@ -1753,6 +1753,26 @@ stated. They are three different kinds of gap.
   200-iteration run, 113 of 184 dynamic draws were skipped and 14 were
   structurally compared. Fixed draws are fully compared.
 
+Those proportions are reported rather than measured by hand.
+`structural_outcomes` in `summary-<seed>.json` counts every VHDX
+structural comparison by what became of it, keyed `<operation>:<outcome>`:
+`compared`, `no_pin_for_geometry`, `no_virtual_size` (the `qemu-img
+info` probe could not answer), `parse_failure`, and
+`skipped_issue_883`. Only `compared` is coverage. The counts are
+logged once at the end of a run as well, because an iteration that
+parsed its output and then found no pinned case to judge it against
+returns no divergence, which otherwise reads exactly like a clean
+comparison -- so a pin set that stopped matching, or a probe that
+stopped answering, could zero this arm with the summary still saying
+nothing was wrong.
+
+A short mixed-operation run can easily compare nothing at all: 60
+iterations at seed 2024 draw 7 vhdx convert targets, of which 4 are
+skipped for #883 and 3 have no pin. To exercise this arm, run it
+against `--ops convert` with a few hundred iterations -- 150 at seed 7
+gives `compared x34`, `no_pin_for_geometry x44`,
+`skipped_issue_883 x56`.
+
 ### libyal cross-validation
 
 When libyal tools are installed in the environment (`libvmdk-utils`,

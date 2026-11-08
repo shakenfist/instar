@@ -539,13 +539,18 @@ _BAT_SCAN_CHUNK = 1024 * 1024
 
 
 def truncated_inside_region(path) -> Optional[Tuple[str, int, int]]:
-    """Describe a VHDX whose file ends inside a region it declares, with nothing allocated.
+    """Describe a VHDX whose file ends inside its metadata region, with nothing allocated.
 
-    Returns `(region_name, declared_end, file_length)` when `path`'s region
-    table declares a region whose extent ends past the end of the file,
-    *and* no payload block is allocated -- every byte of the BAT region,
-    which does itself lie inside the file, is zero. Returns None otherwise,
-    including when the file cannot be read far enough to tell.
+    Returns `('metadata', declared_end, file_length)` when `path`'s region
+    table declares a metadata region whose extent ends past the end of the
+    file, *and* no payload block is allocated -- every byte of the BAT
+    region, which does itself lie inside the file, is zero. Returns None
+    otherwise, including when the file cannot be read far enough to tell.
+
+    Deliberately narrow on all three counts. A different region running
+    past the end of the file, or a readable BAT with anything in it, is a
+    finding of its own and not the shape this describes, so a caller using
+    this to suppress a comparison suppresses only what it means to.
 
     This is the shape of a writer that ends the file after the metadata it
     wrote rather than after the region it declared. `parse_vhdx` refuses
@@ -563,8 +568,13 @@ def truncated_inside_region(path) -> Optional[Tuple[str, int, int]]:
             if reader.read(0, 8, 'file identifier') != FILE_IDENTIFIER_SIGNATURE:
                 return None
             table = _parse_region_table(reader, REGION_TABLE_OFFSETS[0])
-            overrunning = [entry for entry in table if entry.offset + entry.length > reader.length]
-            if not overrunning:
+            # Only the metadata region, which is the one the writer this
+            # describes stops inside. Any region whose extent runs past
+            # the end of the file would also match the shape, and a
+            # region table with a garbage offset or length is a finding
+            # of its own rather than this one.
+            metadata = _find_region(table, METADATA_REGION_GUID)
+            if metadata.offset + metadata.length <= reader.length:
                 return None
             bat_region = _find_region(table, BAT_REGION_GUID)
             # A BAT region that does not itself lie inside the file says
@@ -588,8 +598,7 @@ def truncated_inside_region(path) -> Optional[Tuple[str, int, int]]:
                 remaining -= size
         except VhdxParseError:
             return None
-    worst = max(overrunning, key=lambda entry: entry.offset + entry.length)
-    return worst.name, worst.offset + worst.length, reader.length
+    return metadata.name, metadata.offset + metadata.length, reader.length
 
 
 def patch_virtual_disk_size(path, virtual_disk_size):
