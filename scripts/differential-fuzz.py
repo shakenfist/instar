@@ -26,6 +26,7 @@ import base64
 import hashlib
 import json
 import logging
+import os
 import random
 import re
 import shutil
@@ -541,24 +542,81 @@ LIBYAL_TOOLS = {
     'qcow2': 'qcowinfo',
 }
 
+# Which Debian package provides each tool, for the error message.
+LIBYAL_PACKAGES = {
+    'vmdkinfo': 'libvmdk-utils',
+    'vhdiinfo': 'libvhdi-utils',
+    'qcowinfo': 'libqcow-utils',
+}
 
-def detect_libyal_tools():
+# Set by CI in the image that installs all three packages. See
+# detect_libyal_tools() and .github/workflows/differential-fuzz.yml.
+REQUIRE_LIBYAL_ENV = 'INSTAR_REQUIRE_LIBYAL'
+
+
+class MissingOracleError(RuntimeError):
+    """A cross-check this environment declared mandatory is unavailable."""
+
+
+def detect_libyal_tools(require=None):
     """Detect which libyal tools are available on PATH.
 
-    Returns a dict mapping tool name to its absolute path, or
-    an empty dict entry is omitted when unavailable.
+    Returns a dict mapping tool name to its absolute path; a tool that
+    is not installed is simply absent, and every caller guards on
+    membership, so it loses that format's comparison.
+
+    That degradation is deliberate for a developer host -- the packages
+    are not installed everywhere -- but it must not be silent in CI.
+    The libyal parsers are the only *independent* reference for VHD,
+    VHDX and VMDK: qemu-img shares a family of assumptions with instar
+    and for some cases (a differencing child) has no opinion at all. A
+    run that lost them exits 0 and reports the same "N iterations, 0
+    divergences" as a run that kept them, so the signal that something
+    is wrong is an absence, and absences do not fail builds. Dropping a
+    package from the devcontainer image, or a base-image bump that
+    renames one, would halve the oracle coverage of every nightly run
+    thereafter with nothing turning red.
+
+    So the degradation is conditional: an environment that sets
+    INSTAR_REQUIRE_LIBYAL has declared the tools installed and
+    mandatory, and a missing one there raises MissingOracleError
+    instead of warning. `require` overrides the environment, for tests.
+    This mirrors INSTAR_REQUIRE_LIBVHDI in the integration suite
+    (tests/base.py, _require_vhdiinfo).
     """
+    if require is None:
+        require = bool(os.environ.get(REQUIRE_LIBYAL_ENV))
+
     available = {}
-    for tool in ('vmdkinfo', 'vhdiinfo', 'qcowinfo'):
+    missing = []
+    # Derived from LIBYAL_TOOLS rather than written out again: a format
+    # arm naming a fourth tool would otherwise go unprobed, and an
+    # unprobed tool is never reported missing, which is the silence this
+    # whole function exists to remove.
+    for tool in sorted(set(LIBYAL_TOOLS.values())):
         path = shutil.which(tool)
         if path:
             available[tool] = path
             logger.info('  libyal:     %s found at %s', tool, path)
         else:
+            missing.append(tool)
             logger.warning(
                 '  libyal:     %s not found, skipping %s comparisons',
                 tool, tool,
             )
+
+    if missing and require:
+        packages = sorted({LIBYAL_PACKAGES[t] for t in missing})
+        formats = sorted(f for f, t in LIBYAL_TOOLS.items() if t in missing)
+        raise MissingOracleError(
+            f'{REQUIRE_LIBYAL_ENV} is set, so this environment has '
+            f'declared the libyal oracles mandatory, but these are not '
+            f'on PATH: {", ".join(missing)}. Install '
+            f'{", ".join(packages)} or unset {REQUIRE_LIBYAL_ENV}. '
+            f'Continuing would drop the only independent cross-check '
+            f'for {", ".join(formats)} and still report a clean run.'
+        )
+
     return available
 
 
@@ -5438,8 +5496,18 @@ def main():
     logger.info('  ops:        %s',
                 ','.join(operations) if operations else 'all')
 
-    # Detect libyal tools (optional — graceful degradation)
-    libyal_tools = detect_libyal_tools()
+    # Detect libyal tools. Optional by default, mandatory where
+    # INSTAR_REQUIRE_LIBYAL says the packages are installed.
+    try:
+        libyal_tools = detect_libyal_tools()
+    except MissingOracleError as e:
+        logger.error('%s', e)
+        print(f'\nFAILED: {e}', file=sys.stderr)
+        sys.exit(2)
+    logger.info(
+        '  libyal in use: %s',
+        ', '.join(sorted(libyal_tools)) if libyal_tools else 'none',
+    )
 
     # Create or use workdir
     if args.workdir:
@@ -5546,6 +5614,10 @@ def main():
             'divergence_iterations': [d[0] for d in divergences],
             'inconclusive_count': len(inconclusive),
             'inconclusive_iterations': [d[0] for d in inconclusive],
+            # Which independent cross-checks this run actually had, so
+            # a degraded run is distinguishable from a clean one after
+            # the fact rather than only in the log.
+            'libyal_tools': sorted(libyal_tools),
         }
         if issues is not None:
             summary.update(issues.finish())
@@ -5565,9 +5637,14 @@ def main():
         )
         sys.exit(1)
     else:
+        # The oracle list is part of the result, not decoration: a run
+        # that lost the libyal cross-checks prints the same iteration
+        # count and the same zero as a run that had them.
+        oracles = ', '.join(sorted(libyal_tools)) if libyal_tools else 'none'
         print(
             f'\nPASSED: {args.iterations} iterations, '
-            f'0 divergences. Seed: {seed}',
+            f'0 divergences. Seed: {seed}. '
+            f'libyal oracles: {oracles}',
         )
         sys.exit(0)
 

@@ -334,10 +334,15 @@ const CHECK_RESULT_FLAG_NOT_SUPPORTED: u32 = 1 << 6;
 // repaired_corruptions counters carried by the CheckResultMessage protobuf.
 const CHECK_RESULT_FLAG_REPAIR_INCOMPLETE: u32 = 1 << 8;
 
-// ChainConfig constants (must match shared crate)
-// These are used by write_chain_config(), which every chain-reading op calls.
-#[allow(dead_code)]
-const MAX_CHAIN_DEVICES: usize = 16;
+// The guest's device budget, which every chain-reading op is checked
+// against. An alias for the shared crate's constant rather than a copy
+// of its value: this number now decides whether an operation fails
+// instead of what gets logged, and three guards in this file reach for
+// `shared::MAX_CHAIN_DEVICES` directly, so a second 16 here would be a
+// drift that made a pre-check and its backstop disagree about the
+// budget. An alias cannot drift, so there is nothing to assert about
+// it.
+const MAX_CHAIN_DEVICES: usize = shared::MAX_CHAIN_DEVICES;
 
 // InfoResult constants (must match shared crate)
 // These are defined for future use when parsing results from guest
@@ -3774,11 +3779,56 @@ fn write_chain_device_entries(
     devices_base: u64,
     start_idx: usize,
 ) -> Result<usize, Box<dyn std::error::Error>> {
+    // Refused here rather than truncated, and here rather than in the
+    // callers, because this is the one function every caller reaches
+    // the guest's device array through: write_chain_config for a
+    // single chain, run_compare and run_rebase_guest for two of them
+    // at successive start_idx. The refusal used to live in
+    // write_chain_config alone, so the two-chain paths kept the silent
+    // `break` this replaces -- and a prefix of the chain the user
+    // asked about is a wrong answer reported as a success.
+    //
+    // A backstop: no command reaches it today, because each counts the
+    // devices of the chain it is about to write and refuses an
+    // over-budget one itself, with a message naming the operation.
+    // What it closes is a caller whose own count drifts from the chain
+    // it passes, which the budget makes easy to get wrong -- it is in
+    // devices and not images, so `security.max_chain_depth` (16 by
+    // default, and configurable upwards) counts images while
+    // total_devices() adds a slot for each external data file. A guard
+    // taking its number from the depth limit would undershoot by one
+    // per data file.
+    let needed = chain.total_devices();
+    if start_idx + needed > MAX_CHAIN_DEVICES {
+        return Err(format!(
+            "chain needs {needed} device slots from slot {start_idx}, which exceeds \
+             the maximum of {MAX_CHAIN_DEVICES} devices; refusing to pass a truncated \
+             chain to the guest"
+        )
+        .into());
+    }
+
+    // The bound is still enforced slot by slot below. The check above
+    // is on total_devices(), which is exactly what this loop writes --
+    // one slot per image, one per external data file -- so the two can
+    // only disagree if one of them is wrong, and then the loop would
+    // write past the device array into whatever follows it in guest
+    // memory. It refuses rather than breaking, because breaking is
+    // what handed the guest a prefix of the chain in the first place.
+    fn overflowed(idx: usize) -> Box<dyn std::error::Error> {
+        format!(
+            "internal error: the chain config needs more than the \
+             {MAX_CHAIN_DEVICES} device slots the guest can hold (at slot \
+             {idx}); refusing to truncate it"
+        )
+        .into()
+    }
+
     let mut idx = start_idx;
 
     for image in chain.images().iter() {
         if idx >= MAX_CHAIN_DEVICES {
-            break;
+            return Err(overflowed(idx));
         }
 
         let has_data_files = !image.external_data_files.is_empty();
@@ -3811,7 +3861,7 @@ fn write_chain_device_entries(
         // Insert external data file device entries after this image
         for data_file in &image.external_data_files {
             if idx >= MAX_CHAIN_DEVICES {
-                break;
+                return Err(overflowed(idx));
             }
             let data_size = std::fs::metadata(&data_file.path)
                 .map(|m| m.len())
@@ -4121,21 +4171,27 @@ fn write_chain_config(
     guest_mem: &GuestMemoryMmap,
     chain: &BackingChain,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if chain.total_devices() > MAX_CHAIN_DEVICES {
-        debug!(
-            "Chain truncated: {} devices exceeds maximum of {}, only first {} will be passed",
-            chain.total_devices(),
-            MAX_CHAIN_DEVICES,
-            MAX_CHAIN_DEVICES
-        );
-    }
-
+    // An over-budget chain is refused by write_chain_device_entries
+    // below rather than written as its first MAX_CHAIN_DEVICES slots,
+    // and the refusal is there and not here so that it also covers
+    // run_compare and run_rebase_guest, which write entries for two
+    // chains without going through this function.
+    //
+    // No command reaches it: all four callers of this function refuse
+    // an over-budget chain at the command level first, and each counts
+    // the devices of the very chain it then writes here -- run_check
+    // and run_bench from `chain.total_devices()`, execute_convert from
+    // that plus its output slot, and run_commit from the overlay plus
+    // the backing's parents, which is the same arithmetic as the
+    // `combined_chain` it hands over, because that overlay's
+    // ChainImage is built with no external data files.
+    //
     // Write device entries (handles data file insertion) before the
     // header, so `device_count` and the segment are the count of slots
-    // actually written rather than a separately derived figure. The
-    // entry writer inserts a slot per external data file and stops at
-    // MAX_CHAIN_DEVICES, so a count taken from the chain can name
-    // slots the guest was never given.
+    // actually written rather than a separately derived figure: the
+    // entry writer inserts a slot per external data file, so a count
+    // taken from the images alone would name slots the guest was never
+    // given.
     let devices_base = CHAIN_CONFIG_ADDR + 16;
     let device_count = write_chain_device_entries(guest_mem, chain, devices_base, 0)?;
 
@@ -4184,6 +4240,108 @@ mod chain_config_writer_tests {
             chain.push(image);
         }
         chain
+    }
+
+    // Unit-level because there is nothing reachable to drive: every
+    // caller refuses an over-budget chain before the writer sees one
+    // (see write_chain_device_entries), so an end-to-end case would be
+    // asserting the caller's guard, not this one. What has to hold is
+    // the writer's own contract, which is what these assert.
+    #[test]
+    fn write_chain_config_refuses_a_chain_deeper_than_the_guest_can_hold() {
+        let guest_mem =
+            GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(CHAIN_CONFIG_ADDR), 0x2000)])
+                .expect("guest memory");
+        let deep = chain(
+            (0..MAX_CHAIN_DEVICES + 1)
+                .map(|_| image(ImageFormat::Qcow2, 0, &[]))
+                .collect(),
+        );
+        let err = write_chain_config(&guest_mem, &deep)
+            .expect_err("a chain the guest cannot hold must be refused");
+        let message = err.to_string();
+        // The depth and the limit both have to be in the message: the
+        // caller that hits this is the one that forgot to check, and
+        // the numbers are what says by how much.
+        assert!(
+            message.contains(&(MAX_CHAIN_DEVICES + 1).to_string())
+                && message.contains(&MAX_CHAIN_DEVICES.to_string()),
+            "message must name the depth and the limit: {message}"
+        );
+
+        // The boundary itself is accepted, so the refusal is not one
+        // device early.
+        let at_limit = chain(
+            (0..MAX_CHAIN_DEVICES)
+                .map(|_| image(ImageFormat::Qcow2, 0, &[]))
+                .collect(),
+        );
+        write_chain_config(&guest_mem, &at_limit)
+            .expect("a chain exactly at the limit must be written");
+    }
+
+    // The two-chain callers -- run_compare and run_rebase_guest --
+    // write entries for each chain at successive start_idx without
+    // going through write_chain_config, so the budget has to hold
+    // against the slots already written and not just against one
+    // chain's own length. That is the case the refusal used to miss.
+    #[test]
+    fn write_chain_device_entries_refuses_a_second_chain_that_does_not_fit() {
+        let guest_mem =
+            GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(CHAIN_CONFIG_ADDR), 0x2000)])
+                .expect("guest memory");
+        let devices_base = CHAIN_CONFIG_ADDR + 16;
+        let ten = chain((0..10).map(|_| image(ImageFormat::Qcow2, 0, &[])).collect());
+        let seven = chain((0..7).map(|_| image(ImageFormat::Qcow2, 0, &[])).collect());
+        let written =
+            write_chain_device_entries(&guest_mem, &ten, devices_base, 0).expect("ten devices fit");
+        assert_eq!(written, 10);
+        // Seven would fit on its own; after ten it does not.
+        write_chain_device_entries(&guest_mem, &seven, devices_base, 0)
+            .expect("seven devices fit on their own");
+        let err = write_chain_device_entries(&guest_mem, &seven, devices_base, written)
+            .expect_err("a second chain past the budget must be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("10") && message.contains(&MAX_CHAIN_DEVICES.to_string()),
+            "message must name the slot it starts at and the limit: {message}"
+        );
+        // The combined boundary is accepted, so the refusal is not one
+        // device early for the two-chain callers either.
+        let six = chain((0..6).map(|_| image(ImageFormat::Qcow2, 0, &[])).collect());
+        write_chain_device_entries(&guest_mem, &six, devices_base, written)
+            .expect("ten plus six is exactly the budget");
+    }
+
+    // A data file takes a device slot of its own, so a chain can be
+    // inside the depth limit in images and over the budget in devices.
+    // That is the drift the backstop exists for, so it is asserted in
+    // the shape a caller would hit it in.
+    #[test]
+    fn write_chain_device_entries_counts_data_files_towards_the_budget() {
+        let guest_mem =
+            GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(CHAIN_CONFIG_ADDR), 0x2000)])
+                .expect("guest memory");
+        let devices_base = CHAIN_CONFIG_ADDR + 16;
+        // Sixteen images is exactly the budget; make one of them carry
+        // a data file and the same sixteen images need seventeen slots.
+        let mut images: Vec<ChainImage> = (0..MAX_CHAIN_DEVICES)
+            .map(|_| image(ImageFormat::Qcow2, 0, &[]))
+            .collect();
+        images[0] = image(
+            ImageFormat::Qcow2,
+            shared::InfoResult::FLAG_HAS_EXTERNAL_DATA,
+            &[1 << 20],
+        );
+        let with_data = chain(images);
+        assert_eq!(with_data.total_devices(), MAX_CHAIN_DEVICES + 1);
+        let err = write_chain_device_entries(&guest_mem, &with_data, devices_base, 0)
+            .expect_err("a data file takes a slot, so this is over the budget");
+        assert!(
+            err.to_string()
+                .contains(&(MAX_CHAIN_DEVICES + 1).to_string()),
+            "message must name the slots the chain needs: {err}"
+        );
     }
 
     #[test]

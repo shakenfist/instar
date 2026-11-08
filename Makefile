@@ -709,6 +709,22 @@ test-container: instar-devcontainer instar
 # turns a silently-skipping libvhdi oracle into a failure instead of an
 # invisible skip; see tests/base.py:_require_vhdiinfo.
 #
+# INSTAR_REQUIRE_ZSTD is the same bargain for the two ZSTD
+# backing-chain tests, which need a qemu-img that produces ZSTD and a
+# qemu-io to write the fixture's differing cluster; see
+# tests/test_check_formats.py, TestZstdBackingChain. The two convert
+# targets pass it through as well, not just this one: the class is in
+# this selection today, and a variable that reaches the tests only
+# because of which selection their module falls in is a requirement
+# waiting to go quiet. tools/ci/check-test-partition.py asserts that
+# whichever pull-request job claims the class is one that sets it.
+#
+# The selection is listed before it is run so the run has a discovery
+# count to be checked against: a crashed stestr worker leaves a totals
+# block that exits 0, and tools/ci/check-stestr-run.sh needs the count
+# to tell that run from a complete one. The count is printed rather
+# than passed, because the guard runs outside this container.
+#
 # The venv is built with --system-site-packages for the other half of
 # that oracle: python3-libvhdi installs the pyvhdi binding into the
 # image's dist-packages, and an isolated venv would not see it, so the
@@ -727,6 +743,7 @@ test-container-core: instar-devcontainer instar
 		-e HOME=/build \
 		-e INSTAR_TESTDATA_PATH=/testdata \
 		-e INSTAR_REQUIRE_LIBVHDI \
+		-e INSTAR_REQUIRE_ZSTD \
 		-v "$(CURDIR):/workspace" \
 		-v "$(TESTDATA_PATH):/testdata:ro" \
 		-w "/workspace" \
@@ -735,8 +752,13 @@ test-container-core: instar-devcontainer instar
 			echo "Setting up test environment..."; \
 			python3 -m venv --system-site-packages /build/test-venv && \
 			/build/test-venv/bin/pip install -q -r tests/requirements.txt && \
-			echo "Running core tests (excluding convert, compare, malicious)..."; \
 			cd tests && \
+			if [ ! -d .stestr ]; then /build/test-venv/bin/stestr init > /dev/null; fi && \
+			/build/test-venv/bin/stestr list \
+				--exclude-regex "(test_convert\.|test_compare\.|test_info_malicious)" \
+				> /tmp/stestr-list.txt && \
+			echo "selection contains $$(grep -c . /tmp/stestr-list.txt) tests" && \
+			echo "Running core tests (excluding convert, compare, malicious)..."; \
 			/build/test-venv/bin/stestr run \
 				--exclude-regex "(test_convert\.|test_compare\.|test_info_malicious)" \
 				--concurrency 4 \
@@ -756,6 +778,7 @@ test-container-convert-qcow2: instar-devcontainer instar
 		--group-add "$$(stat -c '%g' /dev/kvm)" \
 		-e HOME=/build \
 		-e INSTAR_TESTDATA_PATH=/testdata \
+		-e INSTAR_REQUIRE_ZSTD \
 		-v "$(CURDIR):/workspace" \
 		-v "$(TESTDATA_PATH):/testdata:ro" \
 		-w "/workspace" \
@@ -764,8 +787,14 @@ test-container-convert-qcow2: instar-devcontainer instar
 			echo "Setting up test environment..."; \
 			python3 -m venv /build/test-venv && \
 			/build/test-venv/bin/pip install -q -r tests/requirements.txt && \
-			echo "Running QCOW2/VMDK/RAW convert + compare tests..."; \
 			cd tests && \
+			if [ ! -d .stestr ]; then /build/test-venv/bin/stestr init > /dev/null; fi && \
+			/build/test-venv/bin/stestr list \
+				--exclude-regex "Vhd" \
+				"(test_convert\.|test_compare\.)" \
+				> /tmp/stestr-list.txt && \
+			echo "selection contains $$(grep -c . /tmp/stestr-list.txt) tests" && \
+			echo "Running QCOW2/VMDK/RAW convert + compare tests..."; \
 			/build/test-venv/bin/stestr run \
 				--exclude-regex "Vhd" \
 				--concurrency 4 \
@@ -786,6 +815,7 @@ test-container-convert-vhd: instar-devcontainer instar
 		--group-add "$$(stat -c '%g' /dev/kvm)" \
 		-e HOME=/build \
 		-e INSTAR_TESTDATA_PATH=/testdata \
+		-e INSTAR_REQUIRE_ZSTD \
 		-v "$(CURDIR):/workspace" \
 		-v "$(TESTDATA_PATH):/testdata:ro" \
 		-w "/workspace" \
@@ -794,8 +824,13 @@ test-container-convert-vhd: instar-devcontainer instar
 			echo "Setting up test environment..."; \
 			python3 -m venv /build/test-venv && \
 			/build/test-venv/bin/pip install -q -r tests/requirements.txt && \
-			echo "Running VHD/VHDX convert tests..."; \
 			cd tests && \
+			if [ ! -d .stestr ]; then /build/test-venv/bin/stestr init > /dev/null; fi && \
+			/build/test-venv/bin/stestr list \
+				"test_convert\.TestConvert.*Vhd" \
+				> /tmp/stestr-list.txt && \
+			echo "selection contains $$(grep -c . /tmp/stestr-list.txt) tests" && \
+			echo "Running VHD/VHDX convert tests..."; \
 			/build/test-venv/bin/stestr run \
 				--concurrency 4 \
 				"test_convert\.TestConvert.*Vhd" \

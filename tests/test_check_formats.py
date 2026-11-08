@@ -2,10 +2,14 @@
 
 import json
 import os
+import shutil
 import struct
 import subprocess
+import sys
 import tempfile
+import unittest
 from pathlib import Path
+from unittest import mock
 
 from base import InstarTestBase
 
@@ -1207,76 +1211,286 @@ class TestZstdBackingChain(InstarTestBase):
     image is part of a backing chain that needs to be flattened.
     """
 
-    def _zstd_supported(self):
-        """Check if qemu-img supports ZSTD compression."""
-        result = subprocess.run(
+    # Set by CI in the job whose image supplies qemu-img and qemu-io.
+    # See `_missing_zstd` below and .github/workflows/functional-tests.yml.
+    REQUIRE_ZSTD_ENV = 'INSTAR_REQUIRE_ZSTD'
+
+    def _missing_zstd(self, reason):
+        """Skip because the ZSTD fixture cannot be built -- or fail.
+
+        An honest probe that skips is still a probe whose failure looks
+        exactly like a pass, which is the shape the rest of this change
+        argues against: if a devcontainer base-image bump dropped ZSTD
+        from qemu-img, or dropped qemu-io, these two tests would go back
+        to skipping on every run with nothing turning red. So the skip
+        is conditional, as `_require_vhdiinfo` makes it for libvhdi: an
+        environment that sets `INSTAR_REQUIRE_ZSTD` has declared the
+        fixture buildable, and anything missing there is a failure.
+        """
+        if os.environ.get(self.REQUIRE_ZSTD_ENV):
+            self.fail(
+                f'{self.REQUIRE_ZSTD_ENV} is set, so this environment has '
+                f'declared the ZSTD fixture buildable, but {reason}. Either '
+                f'restore the tool in the image or unset the variable -- do '
+                f'not let these tests skip, because a skip reads as a pass.'
+            )
+        self.skipTest(reason)
+
+    def _require_zstd(self, td):
+        """Skip unless this host can really build the ZSTD fixture.
+
+        Both halves, because either one missing skips the same two
+        tests: qemu-img and qemu-io have to be installed (the fixture's
+        differing cluster is written into a qcow2 before being
+        compressed into the overlay), and qemu-img has to produce real
+        ZSTD. Checked here rather than through `_require_qemu_tools`
+        because that one skips unconditionally for every caller in the
+        suite, and these tests have a CI environment that has declared
+        the tools present.
+
+        ZSTD is probed by creating an image in *td*: asking qemu-img to
+        format /dev/null fails on every build, whatever it supports,
+        because the result cannot then be read back as qcow2 -- which
+        is how this class never ran at all until #813.
+
+        The recorded compression type is checked as well as the exit
+        code. A build that accepted the option and wrote a zlib image
+        would otherwise look supported here, and the comparison that
+        follows would prove nothing about ZSTD.
+
+        What this probe deliberately does not do is rehearse every
+        command the fixture runs. `convert -c` with `-B` and `-F` are
+        separate capabilities, and a probe that ran them would be the
+        fixture build twice over; `_zstd_cmd` declares a host that
+        fails any of them instead.
+        """
+        for tool in ('qemu-img', 'qemu-io'):
+            if shutil.which(tool) is None:
+                self._missing_zstd(f'system {tool} is not installed')
+        probe = Path(td) / 'zstd-probe.qcow2'
+        r = subprocess.run(
             ['qemu-img', 'create', '-f', 'qcow2',
-             '-o', 'compression_type=zstd',
-             '/dev/null', '1M'],
-            capture_output=True
+             '-o', 'compression_type=zstd', str(probe), '1M'],
+            capture_output=True, text=True
         )
-        return result.returncode == 0
+        if r.returncode != 0:
+            self._missing_zstd(
+                f'qemu-img cannot create a ZSTD image: {r.stderr.strip()!r}'
+            )
+        info = subprocess.run(
+            ['qemu-img', 'info', '--output=json', str(probe)],
+            capture_output=True, text=True, check=True
+        )
+        fmt = json.loads(info.stdout).get('format-specific', {})
+        actual = fmt.get('data', {}).get('compression-type')
+        if actual != 'zstd':
+            self._missing_zstd(
+                f'qemu-img accepted compression_type=zstd but recorded '
+                f'{actual!r}, so it cannot build a ZSTD fixture'
+            )
+
+    def _zstd_cmd(self, argv, what, text=False):
+        """Run a fixture command, declaring a host that cannot run it.
+
+        `check=True` on the fixture build turned a host whose qemu-img
+        lacks a capability into a CalledProcessError rather than a
+        skip. The probe above proves `create -o compression_type=zstd`;
+        the fixture also needs `convert -c` with `-B` and `-F`, which
+        are separate, later capabilities a passing probe does not
+        promise. An error is at least visible, unlike the invisible
+        skip #813 was about, but it is still the host-dependent hard
+        failure this class is structured to avoid -- and where it
+        matters, under INSTAR_REQUIRE_ZSTD, `_missing_zstd` fails
+        anyway, so nothing is hidden by routing through it.
+        """
+        try:
+            return subprocess.run(argv, capture_output=True, text=text,
+                                  check=True)
+        except subprocess.CalledProcessError as exc:
+            stderr = exc.stderr if exc.stderr else b''
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode('utf-8', 'replace')
+            self._missing_zstd(
+                f'this host\'s qemu tools cannot {what}: '
+                f'{stderr.strip()!r}'
+            )
+
+    def test_a_map_without_a_compressed_key_is_declared(self):
+        """An old qemu-img's map shape skips rather than failing.
+
+        The two halves asserted separately, because conflating them is
+        the defect: entries with no `compressed` key anywhere mean the
+        host cannot report compression, while entries that carry the
+        key and say false mean the fixture built the wrong thing.
+        """
+        cannot_report = [{'start': 0, 'length': 65536, 'depth': 0,
+                          'zero': False, 'data': True}]
+        reports_none = [{'start': 0, 'length': 65536, 'depth': 0,
+                         'zero': False, 'data': True, 'compressed': False}]
+        with mock.patch.dict(os.environ):
+            os.environ.pop(self.REQUIRE_ZSTD_ENV, None)
+            with self.assertRaises(unittest.SkipTest) as caught:
+                self._compressed_extents(cannot_report)
+            self.assertIn('compressed', str(caught.exception))
+            # The other shape is a fixture defect and must not skip.
+            with self.assertRaises(self.failureException):
+                self._compressed_extents(reports_none)
+        with mock.patch.dict(os.environ, {self.REQUIRE_ZSTD_ENV: '1'}):
+            with self.assertRaises(self.failureException):
+                self._compressed_extents(cannot_report)
+
+    def test_a_fixture_command_the_host_cannot_run_is_declared(self):
+        """A failed fixture command skips, or fails where it is declared.
+
+        Pins `_zstd_cmd`'s whole purpose: the two outcomes are a
+        declared skip and a loud failure, and never the
+        CalledProcessError the build raised before. Asserted on both
+        branches rather than on the ambient environment, so it proves
+        the same thing in CI and on a developer host.
+        """
+        argv = [sys.executable, '-c', 'import sys; sys.exit(1)']
+        with mock.patch.dict(os.environ):
+            os.environ.pop(self.REQUIRE_ZSTD_ENV, None)
+            with self.assertRaises(unittest.SkipTest) as caught:
+                self._zstd_cmd(argv, 'build the overlay')
+            self.assertIn('build the overlay', str(caught.exception))
+        with mock.patch.dict(os.environ, {self.REQUIRE_ZSTD_ENV: '1'}):
+            with self.assertRaises(self.failureException):
+                self._zstd_cmd(argv, 'build the overlay')
+
+    def _compressed_extents(self, entries):
+        """The overlay's own compressed extents, from a map's entries.
+
+        Two different answers, which this used to conflate. A qemu-img
+        that reports no `compressed` key at all cannot say whether
+        anything is compressed: measured against instar-testdata's
+        per-version builds, the key arrives in 8.2.0 and is absent at
+        6.0.0, 6.1.0, 6.2.0, 7.2.22, 8.0.5 and 8.1.0, while the
+        compression_type=zstd that `_require_zstd` probes has existed
+        since 5.1. Such a host supports ZSTD, passes the probe, and
+        then hard failed here -- the host-dependent failure every
+        command in this class now declares instead. Declared the same
+        way, so it skips on an old developer host and still fails
+        under INSTAR_REQUIRE_ZSTD, where the image is supposed to be
+        new enough. No CI leg is in that window today: the only job
+        that runs this class is integration-core, in the devcontainer.
+
+        A map that does carry the key and reports nothing compressed is
+        the fixture having built the wrong thing, which is a failure
+        wherever it happens.
+        """
+        if not any('compressed' in entry for entry in entries):
+            self._missing_zstd(
+                'this host\'s qemu-img map does not report compression '
+                '(no entry carries a "compressed" key), so a compressed '
+                'cluster of the overlay\'s own cannot be verified: '
+                f'{entries!r}'
+            )
+        compressed = [entry for entry in entries
+                      if entry.get('compressed') and entry.get('depth') == 0]
+        self.assertTrue(
+            compressed,
+            f'fixture overlay holds no compressed cluster of its own, '
+            f'so nothing in this test decompresses: {entries!r}'
+        )
+        return compressed
+
+    def _build_zstd_overlay(self, td, base_fill, overlay_fill):
+        """Build a ZSTD-compressed overlay over a qcow2 base in *td*.
+
+        Returns (overlay, base). The overlay's own clusters are
+        genuinely ZSTD-compressed: a plain `qemu-io write` into an
+        image created with compression_type=zstd stores *uncompressed*
+        clusters, so writing one and calling the result a ZSTD fixture
+        exercises no decompression at all. Compressed clusters come
+        from `qemu-img convert -c`, and that is asserted against
+        `qemu-img map` rather than assumed.
+        """
+        td = Path(td)
+        base_raw = td / 'base.raw'
+        base = td / 'base.qcow2'
+        src = td / 'src.qcow2'
+        overlay = td / 'overlay.qcow2'
+
+        self._zstd_cmd(
+            ['qemu-img', 'create', '-f', 'raw', str(base_raw), '1M'],
+            'create a raw image'
+        )
+        self._zstd_cmd(
+            ['qemu-io', '-f', 'raw', '-c',
+             f'write -P 0x{base_fill:02X} 0 1M', str(base_raw)],
+            'write a pattern into a raw image'
+        )
+        self._zstd_cmd(
+            ['qemu-img', 'convert', '-f', 'raw', '-O', 'qcow2',
+             str(base_raw), str(base)],
+            'convert raw to qcow2'
+        )
+
+        # The content the overlay should hold: the base, with one
+        # cluster overwritten.
+        self._zstd_cmd(
+            ['qemu-img', 'create', '-f', 'qcow2',
+             '-b', str(base), '-F', 'qcow2', str(src), '1M'],
+            'create an overlay with -b and -F'
+        )
+        self._zstd_cmd(
+            ['qemu-io', '-f', 'qcow2', '-c',
+             f'write -P 0x{overlay_fill:02X} 65536 65536', str(src)],
+            'write a pattern into a qcow2 overlay'
+        )
+
+        # -c compresses what convert writes; -B keeps the backing
+        # reference, so only the differing cluster lands in the
+        # overlay, compressed with the type -o asks for.
+        self._zstd_cmd(
+            ['qemu-img', 'convert', '-c', '-O', 'qcow2',
+             '-o', 'compression_type=zstd',
+             '-B', str(base), '-F', 'qcow2',
+             str(src), str(overlay)],
+            'compress a convert with -c, -B and -F'
+        )
+
+        info = self._zstd_cmd(
+            ['qemu-img', 'info', '--output=json', str(overlay)],
+            'report image info as JSON', text=True
+        )
+        parsed = json.loads(info.stdout)
+        self.assertEqual(
+            parsed.get('format-specific', {}).get(
+                'data', {}).get('compression-type'),
+            'zstd',
+            'fixture overlay must record compression type zstd'
+        )
+        self.assertEqual(
+            parsed.get('backing-filename'), str(base),
+            'fixture overlay must keep its backing reference'
+        )
+
+        mapped = self._zstd_cmd(
+            ['qemu-img', 'map', '--output=json', str(overlay)],
+            'report an allocation map as JSON', text=True
+        )
+        self._compressed_extents(json.loads(mapped.stdout))
+
+        return overlay, base
 
     def test_convert_zstd_with_backing_chain(self):
         """Convert a ZSTD image that has a backing chain."""
-        if not self._zstd_supported():
-            self.skipTest(
-                'qemu-img does not support ZSTD'
-            )
-
-        with tempfile.NamedTemporaryFile(
-            suffix='.raw'
-        ) as base_raw, \
-                tempfile.NamedTemporaryFile(
-                    suffix='.qcow2'
-                ) as base_qcow2, \
-                tempfile.NamedTemporaryFile(
-                    suffix='.qcow2'
-                ) as overlay, \
-                tempfile.NamedTemporaryFile(
-                    suffix='.raw'
-                ) as instar_raw, \
-                tempfile.NamedTemporaryFile(
-                    suffix='.raw'
-                ) as qemu_raw:
-            # Create base raw with data
-            subprocess.run(
-                ['qemu-img', 'create', '-f', 'raw',
-                 base_raw.name, '1M'],
-                capture_output=True, check=True
-            )
-            with open(base_raw.name, 'r+b') as f:
-                f.write(b'\xAA' * 65536)
-
-            # Convert base to QCOW2
-            subprocess.run(
-                ['qemu-img', 'convert', '-f', 'raw',
-                 '-O', 'qcow2',
-                 base_raw.name, base_qcow2.name],
-                capture_output=True, check=True
-            )
-
-            # Create ZSTD overlay with backing
-            subprocess.run(
-                ['qemu-img', 'create', '-f', 'qcow2',
-                 '-o', 'compression_type=zstd',
-                 '-b', base_qcow2.name,
-                 '-F', 'qcow2',
-                 overlay.name, '1M'],
-                capture_output=True, check=True
-            )
-            # Write different data to overlay
-            subprocess.run(
-                ['qemu-io', '-c',
-                 'write -P 0xBB 65536 65536',
-                 overlay.name],
-                capture_output=True, check=True
-            )
+        # _require_zstd asks for qemu-io as well as qemu-img: the
+        # fixture's differing cluster has to be written into a qcow2
+        # before it can be compressed into the overlay. The class asked
+        # for neither before, so a host without qemu-io failed in the
+        # fixture rather than skipping.
+        with tempfile.TemporaryDirectory() as td:
+            self._require_zstd(td)
+            overlay, _ = self._build_zstd_overlay(td, 0xAA, 0xBB)
+            instar_raw = Path(td) / 'instar.raw'
+            qemu_raw = Path(td) / 'qemu.raw'
 
             # Convert with instar (flattens chain)
             stdout, stderr, rc = self.run_instar_convert(
-                Path(overlay.name),
-                Path(instar_raw.name)
+                overlay, instar_raw
             )
             self.assertEqual(
                 rc, 0,
@@ -1284,18 +1498,19 @@ class TestZstdBackingChain(InstarTestBase):
                 f'backing chain: {stderr}'
             )
 
-            # Convert with qemu-img for comparison
-            subprocess.run(
+            # Convert with qemu-img for comparison. Declared like
+            # the fixture build: this is the oracle instar is checked
+            # against, so a host whose qemu-img cannot flatten the
+            # image has nothing to compare with and should say so.
+            self._zstd_cmd(
                 ['qemu-img', 'convert', '-f', 'qcow2',
-                 '-O', 'raw',
-                 overlay.name, qemu_raw.name],
-                capture_output=True, check=True
+                 '-O', 'raw', str(overlay), str(qemu_raw)],
+                'flatten a ZSTD overlay to raw'
             )
 
             # Compare outputs
             stdout2, stderr2, rc2 = self.run_instar_compare(
-                Path(instar_raw.name),
-                Path(qemu_raw.name)
+                instar_raw, qemu_raw
             )
             self.assertEqual(
                 rc2, 0,
@@ -1305,68 +1520,22 @@ class TestZstdBackingChain(InstarTestBase):
 
     def test_compare_zstd_backing_vs_flattened(self):
         """Compare a ZSTD overlay (with backing) against flat raw."""
-        if not self._zstd_supported():
-            self.skipTest(
-                'qemu-img does not support ZSTD'
-            )
+        with tempfile.TemporaryDirectory() as td:
+            self._require_zstd(td)
+            overlay, _ = self._build_zstd_overlay(td, 0xCC, 0xDD)
+            flat_raw = Path(td) / 'flat.raw'
 
-        with tempfile.NamedTemporaryFile(
-            suffix='.raw'
-        ) as base_raw, \
-                tempfile.NamedTemporaryFile(
-                    suffix='.qcow2'
-                ) as base_qcow2, \
-                tempfile.NamedTemporaryFile(
-                    suffix='.qcow2'
-                ) as overlay, \
-                tempfile.NamedTemporaryFile(
-                    suffix='.raw'
-                ) as flat_raw:
-            # Create base raw with data
-            subprocess.run(
-                ['qemu-img', 'create', '-f', 'raw',
-                 base_raw.name, '1M'],
-                capture_output=True, check=True
-            )
-            with open(base_raw.name, 'r+b') as f:
-                f.write(b'\xCC' * 65536)
-
-            # Convert base to QCOW2
-            subprocess.run(
-                ['qemu-img', 'convert', '-f', 'raw',
-                 '-O', 'qcow2',
-                 base_raw.name, base_qcow2.name],
-                capture_output=True, check=True
-            )
-
-            # Create ZSTD overlay with backing
-            subprocess.run(
-                ['qemu-img', 'create', '-f', 'qcow2',
-                 '-o', 'compression_type=zstd',
-                 '-b', base_qcow2.name,
-                 '-F', 'qcow2',
-                 overlay.name, '1M'],
-                capture_output=True, check=True
-            )
-            subprocess.run(
-                ['qemu-io', '-c',
-                 'write -P 0xDD 65536 65536',
-                 overlay.name],
-                capture_output=True, check=True
-            )
-
-            # Flatten with qemu-img for reference
-            subprocess.run(
+            # Flatten with qemu-img for reference, declared for the
+            # same reason as the oracle in the test above.
+            self._zstd_cmd(
                 ['qemu-img', 'convert', '-f', 'qcow2',
-                 '-O', 'raw',
-                 overlay.name, flat_raw.name],
-                capture_output=True, check=True
+                 '-O', 'raw', str(overlay), str(flat_raw)],
+                'flatten a ZSTD overlay to raw'
             )
 
             # Compare ZSTD overlay vs flattened raw
             stdout, stderr, rc = self.run_instar_compare(
-                Path(overlay.name),
-                Path(flat_raw.name)
+                overlay, flat_raw
             )
             self.assertEqual(
                 rc, 0,

@@ -112,6 +112,27 @@ It performs (and exits non-zero on any failure):
   fence `mmdc` cannot read -- a tilde fence, or a space
   before the language -- which GitHub renders and the
   renderer does not, naming the file and the line)
+- `tools/verify-info-output-parity.sh`, but only when the
+  audit scope touches `src/crates/vhd/`, `src/crates/vhdx/`
+  or the script itself. It builds the merge-base's instar
+  as well as this tree's and requires byte-identical
+  `instar info` output over every differencing fixture, so
+  it costs a second full build and earns it only for the
+  changes it was written for. A change that means to alter
+  info output will fail it; say so rather than claiming
+  parity. Skipped, out loud, when there is no merge-base to
+  compare against (on `develop`, or with no
+  `origin/develop`)
+
+  Its scope is the two differencing parsers and the script,
+  and nothing else. A change to the info operation, to the
+  vmm's handling of an info result, or to the output
+  formatters can alter `instar info` output over the same
+  fixtures without this running: parity-check such a change
+  by hand rather than reading a green wave 1 as a statement
+  about it. The scope is deliberately narrower than the
+  risk, because widening it would make a second full build
+  the standing cost of an info-path change.
 - mechanical style checks: lines wrapped at 120
   characters in changed Rust files, no large inline
   scripts in CI workflow steps (advisory), single
@@ -131,6 +152,8 @@ Exit codes:
 | 7    | `make fuzz-build` failed       |
 | 8    | `tools/mermaid-lint.sh` failed |
 | 9    | could not resolve a usable audit scope (bad `--range`/`--commits-file`, or an explicitly-given `--range`/`--commits-file` resolved to zero files -- the implicit `develop...HEAD` default resolving to zero files is not an error) |
+| 10   | `instar info` output differs from the merge-base build |
+| 11   | the info-output parity gate could not run: it needs an `../instar-testdata` checkout holding the four differencing fixtures, and a buildable tree at both this commit and the merge-base. Not a statement about info output either way |
 
 If wave 1 fails, fix the cause and re-run before
 spending on wave 2.
