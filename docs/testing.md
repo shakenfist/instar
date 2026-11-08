@@ -2186,14 +2186,20 @@ availability before adding jobs.
 `fuzz_create_emitters` draws both VHDX subformats and both
 `block_state_zero` values, and asserts invariants over the fixed BAT it
 fills (numbered 6 to 10 in the source): the entry count matches the
-layout; a payload entry is fully present (or `block_state_zero`'s
-state) and its offset is the one qemu's forward map
-(`vhdx_block_translate`) gives that block; offsets strictly increase;
-the offset an entry encodes is a whole number of MiB, asserted on the
-entry's bits; and a sector-bitmap slot is zero. `fuzz_vhdx_fixed_bat`
-drives `vhdx::fill_fixed_bat` directly, at arbitrary layouts, index
-ranges and buffer sizes, which the emitter target reaches only through
-a bounded window.
+layout; a payload entry is in the state asked for and its offset lies
+inside the payload region; offsets strictly increase; the offset an
+entry encodes is a whole number of MiB, asserted on the entry's bits;
+and a sector-bitmap slot is zero.
+
+`fuzz_vhdx_fixed_bat` drives `vhdx::fill_fixed_bat` directly, at
+arbitrary layouts, index ranges and buffer sizes, which the emitter
+target reaches only through a bounded window. It is also the target
+that holds each offset to the exact place qemu's forward map
+(`vhdx_create_bat` and `vhdx_block_translate`, `block/vhdx.c`) gives
+that block, inverted from the BAT index independently of the filler's
+own arithmetic — a stronger oracle than the emitter target's region
+membership, and the one that catches a map right about its shape and
+wrong about which block an index belongs to.
 
 Run either by hand with the Makefile, which uses the devcontainer:
 

@@ -533,6 +533,11 @@ def parse_vhdx(path) -> VhdxStructure:
         )
 
 
+# How much of a BAT region `truncated_inside_region` holds at once while
+# looking for a non-zero byte.
+_BAT_SCAN_CHUNK = 1024 * 1024
+
+
 def truncated_inside_region(path) -> Optional[Tuple[str, int, int]]:
     """Describe a VHDX whose file ends inside a region it declares, with nothing allocated.
 
@@ -566,8 +571,21 @@ def truncated_inside_region(path) -> Optional[Tuple[str, int, int]]:
             # nothing about what was allocated, and the bounds-checked
             # read raises rather than returning short, so the parse error
             # below is what refuses that file.
-            if any(reader.read(bat_region.offset, bat_region.length, 'bat region')):
-                return None
+            #
+            # Read in chunks and stop at the first non-zero byte. A BAT
+            # region is one entry per block, so it grows with the virtual
+            # size: holding a multi-hundred-megabyte one in memory to ask
+            # a yes-or-no question is not worth it, and the answer is
+            # usually in the first chunk.
+            reader.check(bat_region.offset, bat_region.length, 'bat region')
+            remaining = bat_region.length
+            at = bat_region.offset
+            while remaining:
+                size = min(remaining, _BAT_SCAN_CHUNK)
+                if any(reader.read(at, size, 'bat region')):
+                    return None
+                at += size
+                remaining -= size
         except VhdxParseError:
             return None
     worst = max(overrunning, key=lambda entry: entry.offset + entry.length)

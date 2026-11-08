@@ -56,7 +56,8 @@ from helpers.info_json import normalise_info_json  # noqa: E402
 # qemu-img build writes, by the same mechanism. `convert -O vhdx` output is
 # compared through these as well as by content, because a raw flatten
 # cannot see a container's layout.
-from helpers.qemu_pins import CASES, KIND_VHDX_CREATE, PinError, expected, load_pin  # noqa: E402
+from helpers.qemu_pins import CASES as PIN_CASES  # noqa: E402
+from helpers.qemu_pins import KIND_VHDX_CREATE, PinError, expected, load_pin  # noqa: E402
 from helpers.vhdx_structure import (VhdxParseError, parse_vhdx, structural_diff,  # noqa: E402
                                     summarise, truncated_inside_region)
 
@@ -1201,11 +1202,12 @@ def _vhdx_pin_case_subformats():
     its parent rather than its geometry, so it is not refereed here.
     """
     wanted = {}
-    for case in CASES:
+    for case in PIN_CASES:
         if case.get('kind') != KIND_VHDX_CREATE or case.get('base'):
             continue
         args = case.get('args', [])
-        options = set(args[args.index('-o') + 1].split(',')) if '-o' in args else set()
+        at = args.index('-o') + 1 if '-o' in args else len(args)
+        options = set(args[at].split(',')) if at < len(args) else set()
         fixed = 'subformat=fixed' in options
         # The two dynamic layouts differ only in their BAT entry states,
         # and a dynamic target's BAT is not compared, so the default case
@@ -1258,7 +1260,16 @@ def compare_vhdx_structure(image, subformat, virtual_size, operation, context, b
         # finding. The condition is established structurally rather than
         # from the message text, so a reworded error neither silently stops
         # the skip nor widens it. Remove this when #883 is fixed.
-        known = truncated_inside_region(image)
+        #
+        # Scoped to the subformat and operation the defect was measured
+        # on, because the same file shape means something else anywhere
+        # else: a fixed output carries a present entry for every block, so
+        # an all-zero BAT region in one is a finding of its own rather than
+        # this defect, and a caller other than convert reaching this shape
+        # would be a new defect wearing a filed one's clothes.
+        known = None
+        if subformat == 'dynamic' and operation == 'convert':
+            known = truncated_inside_region(image)
         if known is not None:
             region, declared_end, file_length = known
             key = f'{operation}_vhdx_truncated_region_issue_883'
@@ -5547,8 +5558,10 @@ def divergence_key(divergence):
     fault had nothing to do with.
 
     The shape is the divergence type, the operation, the SHAPE_FIELDS the
-    divergence carries, the names of the fields a libyal comparison found
-    different, and the first line of instar's stderr with the
+    divergence carries -- at the top level, or inside the `context` some
+    divergence types nest whole, which `exit_code_divergence` does with
+    every field of its own -- the names of the fields a libyal comparison
+    found different, and the first line of instar's stderr with the
     per-iteration noise taken out: paths (every iteration works in its own
     files), hex values and numbers of three or more digits (offsets and
     sizes). Short numbers stay, because an errno or exit code is part of
@@ -5559,9 +5572,14 @@ def divergence_key(divergence):
     context = divergence.get('context') or {}
     stderr = divergence.get('instar_stderr') or context.get('instar_stderr') or ''
     operation = divergence.get('operation') or divergence.get('operation_in_chain') or ''
-    fields = tuple(
-        (name, str(divergence[name])) for name in SHAPE_FIELDS if divergence.get(name) is not None
-    )
+    shape_values = []
+    for name in SHAPE_FIELDS:
+        value = divergence.get(name)
+        if value is None:
+            value = context.get(name)
+        if value is not None:
+            shape_values.append((name, str(value)))
+    fields = tuple(shape_values)
     recipe = divergence.get('recipe')
     if isinstance(recipe, dict) and recipe.get('fmt'):
         fields += (('recipe.fmt', str(recipe['fmt'])),)
@@ -5736,6 +5754,10 @@ def file_github_issue(seed, iteration, attrs, divergence, workflow_url):
 # ---------------------------------------------------------------------------
 
 def main():
+    # Per run, not per process: the counts reported in the summary and in
+    # `known_defect_skips` belong to this run, and the module is reusable.
+    KNOWN_DEFECT_SKIPS.clear()
+
     parser = argparse.ArgumentParser(
         description='Differential fuzzing: instar vs qemu-img',
     )

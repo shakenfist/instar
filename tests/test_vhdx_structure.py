@@ -529,13 +529,6 @@ class TestVhdxTruncatedInsideRegion(_VhdxTestCase):
     defect is in.
     """
 
-    # Inside the metadata region (3 MiB to 4 MiB) of a 64 MiB dynamic
-    # image, and past the end of the BAT region (2 MiB to 3 MiB) so the
-    # BAT is readable whole. This is where instar's own `convert -O vhdx`
-    # stops in #883.
-    INSIDE_METADATA = 3 * MiB + 200 * KiB
-    METADATA_END = 4 * MiB
-
     def setUp(self):
         super().setUp()
         # block_state_zero=off, because the shape requires a BAT with
@@ -543,6 +536,23 @@ class TestVhdxTruncatedInsideRegion(_VhdxTestCase):
         # PAYLOAD_BLOCK_ZERO instead, which is a BAT that says something.
         self.image = self.qemu_create('image.vhdx', 64 * MiB,
                                       'subformat=dynamic', 'block_state_zero=off')
+        # Read the two offsets off the image rather than writing in the
+        # layout of one qemu build. On the builds this is run against the
+        # BAT region is 2 MiB to 3 MiB and the metadata region 3 MiB to
+        # 4 MiB, but a build that moves either would otherwise fail these
+        # tests for a reason that has nothing to do with the predicate.
+        structure = parse_vhdx(self.image)
+        bat, metadata = structure.bat_region, structure.metadata_region
+        self.metadata_end = metadata.offset + metadata.length
+        self.bat_end = bat.offset + bat.length
+        # Past the end of the BAT region, so the BAT is readable whole,
+        # and inside the metadata region, which is where instar's own
+        # `convert -O vhdx` stops in #883.
+        self.inside_metadata = (self.bat_end + self.metadata_end) // 2
+        self.inside_bat = (bat.offset + self.bat_end) // 2
+        self.assertLess(self.bat_end, self.inside_metadata)
+        self.assertLess(self.inside_metadata, self.metadata_end)
+        self.assertLess(self.metadata_end, os.path.getsize(self.image))
 
     def truncated(self, name, length, source=None):
         """A copy of `source` (the dynamic image) cut to `length` bytes."""
@@ -552,16 +562,16 @@ class TestVhdxTruncatedInsideRegion(_VhdxTestCase):
         return path
 
     def test_a_file_ending_inside_a_declared_region(self):
-        path = self.truncated('truncated.vhdx', self.INSIDE_METADATA)
-        self.assertEqual(('metadata', self.METADATA_END, self.INSIDE_METADATA),
+        path = self.truncated('truncated.vhdx', self.inside_metadata)
+        self.assertEqual(('metadata', self.metadata_end, self.inside_metadata),
                          truncated_inside_region(path))
 
     def test_one_allocated_payload_block_is_not_the_shape(self):
         # The case the suppression's narrowness rests on: a truncated file
         # that allocated anything is a finding, not #883.
-        path = self.truncated('allocated.vhdx', self.INSIDE_METADATA)
+        path = self.truncated('allocated.vhdx', self.inside_metadata)
         with open(path, 'r+b') as f:
-            f.seek(2 * MiB)
+            f.seek(parse_vhdx(self.image).bat_region.offset)
             f.write(struct.pack('<Q', 8 * MiB | PAYLOAD_BLOCK_FULLY_PRESENT))
         self.assertIsNone(truncated_inside_region(path))
 
@@ -570,7 +580,7 @@ class TestVhdxTruncatedInsideRegion(_VhdxTestCase):
         # it is not a BAT that was never written. The default dynamic
         # image is this, which is why setUp turns block_state_zero off.
         default = self.qemu_create('default.vhdx', 64 * MiB, 'subformat=dynamic')
-        path = self.truncated('default-truncated.vhdx', self.INSIDE_METADATA, source=default)
+        path = self.truncated('default-truncated.vhdx', self.inside_metadata, source=default)
         self.assertIsNone(truncated_inside_region(path))
 
     def test_a_whole_image_is_not_the_shape(self):
@@ -579,7 +589,7 @@ class TestVhdxTruncatedInsideRegion(_VhdxTestCase):
     def test_a_file_stopping_before_the_bat_region_is_not_the_shape(self):
         # The BAT region has to be readable whole to say that nothing is
         # allocated; a file that stops inside it says nothing either way.
-        self.assertIsNone(truncated_inside_region(self.truncated('short.vhdx', 2 * MiB + 4 * KiB)))
+        self.assertIsNone(truncated_inside_region(self.truncated('short.vhdx', self.inside_bat)))
 
     def test_an_absent_or_foreign_file_is_not_the_shape(self):
         self.assertIsNone(truncated_inside_region(self.workdir / 'absent.vhdx'))

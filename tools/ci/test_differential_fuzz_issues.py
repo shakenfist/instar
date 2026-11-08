@@ -226,7 +226,8 @@ class ShapeFieldsTestCase(unittest.TestCase):
         * `dict(ctx, type=..., ...)`, which spreads a context in by call
           rather than by `**`;
         * the context dicts spread in either way, found by name; and
-        * `div['field'] = value` after the fact.
+        * `div['field'] = value` after the fact, onto either the
+          divergence or a context that is spread into one.
         """
         with open(_DF_PATH, encoding='utf-8') as f:
             tree = ast.parse(f.read())
@@ -253,9 +254,15 @@ class ShapeFieldsTestCase(unittest.TestCase):
                     isinstance(t, ast.Name) and t.id in spread for t in node.targets):
                 fields.update(k.value for k in node.value.keys if isinstance(k, ast.Constant))
             for target in node.targets:
-                if (isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name)
-                        and _DIVERGENCE_NAME.search(target.value.id)
+                if not (isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name)
                         and isinstance(target.slice, ast.Constant)):
+                    continue
+                # Onto the divergence, by the naming convention below, or
+                # onto a context that is spread into one: `op_convert`
+                # sets context['vhdx_subformat'] before building the
+                # divergence that spreads it, so a field can reach a
+                # divergence without ever being written on it.
+                if _DIVERGENCE_NAME.search(target.value.id) or target.value.id in spread:
                     fields.add(str(target.slice.value))
         return fields
 
@@ -286,15 +293,25 @@ class ShapeFieldsTestCase(unittest.TestCase):
         for expected in ('target_format', 'field_divergences', 'corruption', 'shape'):
             self.assertIn(expected, fields)
 
+    # One field per way the fuzzer can name a field in a record, each
+    # reachable by that way and no other, so losing any one path fails
+    # this test rather than going quiet. Checked by construction: a
+    # scan-path audit over the source found each of these in exactly one.
+    SHAPES = {
+        'dict literal, plain type': 'cushion',
+        'dict literal, interpolated type': 'instar_sha',
+        'dict(ctx, ...) call, plain type': 'compare_stdout',
+        'dict(ctx, ...) call, interpolated type': 'parse_error',
+        'a context dict spread in by name': 'corruption',
+        'subscript onto the divergence': 'structure_also_diverged',
+        'subscript onto a spread context': 'vhdx_block_size',
+    }
+
     def test_the_scan_sees_every_shape_a_divergence_is_built_in(self):
-        # One field per shape, so a scan that lost one of the four shapes
-        # fails here rather than going quiet: a dict literal, a
-        # dict(ctx, type=...) call with an interpolated type, a context
-        # spread in by name, and a subscript assignment after the fact.
         fields = self.divergence_fields()
-        for expected in ('corruption', 'vhdx_subformat', 'instar_stderr', 'structure_also_diverged',
-                         'error'):
-            self.assertIn(expected, fields)
+        for shape, field in self.SHAPES.items():
+            with self.subTest(shape=shape):
+                self.assertIn(field, fields, f'{shape} is no longer scanned')
 
     def test_the_scan_does_not_depend_on_how_a_type_is_spelled(self):
         # `cushion` is carried only by measure_above_fully_allocated_bound,
@@ -302,6 +319,15 @@ class ShapeFieldsTestCase(unittest.TestCase):
         # have held. Its presence is what says the scan matches on having
         # a type rather than on the type's last word.
         self.assertIn('cushion', self.divergence_fields())
+
+    def test_the_scan_sees_a_field_set_on_a_spread_context(self):
+        # `op_convert` sets context['vhdx_block_size'] and then builds a
+        # divergence that spreads that context, so the field reaches a
+        # divergence without ever being written on one. A scan that only
+        # followed subscripts on the divergence itself would miss it.
+        # Named separately from the table above so a regression in this
+        # one path is attributable.
+        self.assertIn('vhdx_block_size', self.divergence_fields())
 
     def test_inconclusive_records_are_not_divergences(self):
         # An inconclusive record is logged for visibility and never
@@ -410,7 +436,8 @@ class IssueFilerTestCase(unittest.TestCase):
         self.assertEqual(2, summary['issue_shapes_suppressed'])
 
 
-MiB = 1024 * 1024
+KiB = 1024
+MiB = 1024 * KiB
 
 
 class VhdxPinCaseSelectionTestCase(unittest.TestCase):
@@ -431,7 +458,7 @@ class VhdxPinCaseSelectionTestCase(unittest.TestCase):
         )
         for case in (ordered, swapped):
             with self.subTest(name=case['name']):
-                with mock.patch.object(df, 'CASES', [case]):
+                with mock.patch.object(df, 'PIN_CASES', [case]):
                     self.assertEqual({case['name']: 'fixed'}, df._vhdx_pin_case_subformats())
 
     def test_the_layouts_instar_does_not_write_are_refused(self):
@@ -450,8 +477,17 @@ class VhdxPinCaseSelectionTestCase(unittest.TestCase):
             # Another kind of pinned command entirely.
             {'name': 'prealloc', 'kind': 'prealloc', 'args': ['-f', 'vhdx']},
         ]
-        with mock.patch.object(df, 'CASES', cases):
+        with mock.patch.object(df, 'PIN_CASES', cases):
             self.assertEqual({}, df._vhdx_pin_case_subformats())
+
+    def test_a_pin_case_whose_options_are_missing_does_not_crash(self):
+        # The selector runs once at first use, so an IndexError here is a
+        # startup crash in the fuzzer rather than a wrong comparison. A
+        # case listing `-o` last is malformed, but it should drop out
+        # rather than take the run with it.
+        cases = [{'name': 'dangling-o', 'kind': df.KIND_VHDX_CREATE, 'args': ['-f', 'vhdx', '-o']}]
+        with mock.patch.object(df, 'PIN_CASES', cases):
+            self.assertEqual({'dangling-o': 'dynamic'}, df._vhdx_pin_case_subformats())
 
     def test_the_committed_cases_still_offer_both_subformats(self):
         # Vacuity guard: both tests above would pass against a selector
@@ -510,20 +546,87 @@ class VhdxStructureIssueShapeTestCase(unittest.TestCase):
                                               differences=['bat: 9 != 8'], block_size=8 * MiB)))
 
 
+class NestedContextShapeTestCase(unittest.TestCase):
+    """A divergence that nests its whole context is still shaped by it."""
+
+    @staticmethod
+    def exit_code(**context):
+        return {'type': 'exit_code_divergence', 'operation': 'convert',
+                'instar_rc': 1, 'qemu_rc': 0, 'context': context}
+
+    def test_a_nested_shape_field_separates_two_findings(self):
+        # exit_code_divergence puts every field of its own under
+        # 'context', so without the fallback a fixed and a dynamic
+        # `convert -O vhdx` refusal share every shape component and file
+        # as one issue whenever their stderr normalises the same.
+        self.assertNotEqual(
+            df.divergence_key(self.exit_code(target_format='vhdx', vhdx_subformat='fixed')),
+            df.divergence_key(self.exit_code(target_format='vhdx', vhdx_subformat='dynamic')))
+
+    def test_a_nested_per_iteration_field_does_not(self):
+        self.assertEqual(
+            df.divergence_key(self.exit_code(target_format='vhdx', vhdx_block_size=1048576)),
+            df.divergence_key(self.exit_code(target_format='vhdx', vhdx_block_size=8388608)))
+
+    def test_a_top_level_field_still_wins_over_the_context(self):
+        # The top level is the divergence's own answer; the context is
+        # only consulted where it has none.
+        divergence = dict(self.exit_code(target_format='qcow2'), target_format='vhdx')
+        self.assertIn(('target_format', 'vhdx'), df.divergence_key(divergence)[2])
+
+
+class KnownDefectSkipScopeTestCase(unittest.TestCase):
+    """The #883 skip covers the subformat and operation the defect was measured on."""
+
+    SHAPE = ('metadata', 4 * MiB, 3 * MiB + 128 * KiB)
+
+    def compare(self, subformat, operation):
+        """`compare_vhdx_structure` where the parse fails in the #883 shape."""
+        def unparseable(path):
+            raise df.VhdxParseError('metadata region at 3145728 lies outside the file')
+
+        with mock.patch.object(df, 'parse_vhdx', unparseable), \
+                mock.patch.object(df, 'truncated_inside_region', lambda path: self.SHAPE), \
+                mock.patch.dict(df.KNOWN_DEFECT_SKIPS, {}, clear=True):
+            result = df.compare_vhdx_structure('out.vhdx', subformat, 64 * MiB, operation, {})
+            return result, dict(df.KNOWN_DEFECT_SKIPS)
+
+    def test_a_dynamic_convert_output_is_skipped_and_counted(self):
+        result, skips = self.compare('dynamic', 'convert')
+        self.assertIsNone(result)
+        self.assertEqual({'convert_vhdx_truncated_region_issue_883': 1}, skips)
+
+    def test_a_fixed_output_of_the_same_shape_is_reported(self):
+        # A fixed image carries a present entry for every block, so an
+        # all-zero BAT region in one is a finding of its own, not #883.
+        result, skips = self.compare('fixed', 'convert')
+        self.assertEqual('convert_vhdx_parse_failure', result['type'])
+        self.assertEqual('fixed', result['vhdx_subformat'])
+        self.assertEqual({}, skips)
+
+    def test_another_operation_reaching_the_same_shape_is_reported(self):
+        # `dd` draws a vhdx target too. The same file shape from a caller
+        # the defect was never measured on is a new defect, not this one.
+        result, skips = self.compare('dynamic', 'dd')
+        self.assertEqual('dd_vhdx_parse_failure', result['type'])
+        self.assertEqual({}, skips)
+
+
 class VhdxStructureGeometryKeyTestCase(unittest.TestCase):
     """The pin lookup is keyed on the geometry asked for, not the one the output claims."""
 
     PIN = {'block_size': MiB, 'virtual_disk_size': 64 * MiB, 'bat_entry_count': 64}
 
-    def compare(self, claimed_block_size, requested_block_size, extra=None):
+    def compare(self, claimed_block_size, requested_block_size, extra=None, subformat='fixed'):
         """`compare_vhdx_structure` against a pin, with the parse stubbed out."""
         summary = dict(self.PIN, block_size=claimed_block_size, **(extra or {}))
+        case = f'vhdx-{subformat}-64M-block-1M'
         with mock.patch.object(df, 'parse_vhdx', lambda path: None), \
                 mock.patch.object(df, 'summarise', lambda parsed: summary), \
                 mock.patch.object(df, '_vhdx_pin_geometries',
-                                  lambda: {'fixed': {(64 * MiB, MiB): 'vhdx-fixed-64M-block-1M-bsz-off'}}), \
-                mock.patch.object(df, 'expected', lambda case, pin=None: {'summary': dict(self.PIN)}):
-            return df.compare_vhdx_structure('out.vhdx', 'fixed', 64 * MiB, 'convert', {},
+                                  lambda: {subformat: {(64 * MiB, MiB): case}}), \
+                mock.patch.object(df, 'expected', lambda name, pin=None: {'summary': dict(self.PIN)}):
+            return df.compare_vhdx_structure('out.vhdx', subformat, 64 * MiB, 'convert', {},
                                              block_size=requested_block_size)
 
     def test_a_wrong_block_size_is_a_difference_not_a_silencer(self):
@@ -536,7 +639,7 @@ class VhdxStructureGeometryKeyTestCase(unittest.TestCase):
         self.assertEqual(['block_size: 2097152 != 1048576'], divergence['differences'])
         # The pin case names the geometry, which is what separates one
         # issue shape from another; the sizes travel per iteration.
-        self.assertEqual('vhdx-fixed-64M-block-1M-bsz-off', divergence['pin_case'])
+        self.assertEqual('vhdx-fixed-64M-block-1M', divergence['pin_case'])
 
     def test_an_output_matching_the_pin_is_not_a_divergence(self):
         self.assertIsNone(self.compare(claimed_block_size=MiB, requested_block_size=MiB))
@@ -550,6 +653,23 @@ class VhdxStructureGeometryKeyTestCase(unittest.TestCase):
                                   extra={'log_offset': 1048576})
         self.assertIsNotNone(divergence)
         self.assertEqual(['log_offset: 1048576 != None'], divergence['differences'])
+
+    def test_a_dynamic_comparison_drops_exactly_the_data_dependent_fields(self):
+        # A dynamic image's BAT and file length follow the source's data,
+        # so they are excluded -- and nothing else is. Widening
+        # _VHDX_DATA_DEPENDENT_FIELDS thins dynamic coverage with no
+        # visible symptom, which is what this holds.
+        wrong = {'file_length': 1, 'bat': [], 'log_offset': 7, 'chunk_ratio': 9}
+        divergence = self.compare(claimed_block_size=MiB, requested_block_size=MiB,
+                                  subformat='dynamic', extra=wrong)
+        self.assertIsNotNone(divergence)
+        self.assertEqual(['chunk_ratio: 9 != None', 'log_offset: 7 != None'],
+                         sorted(divergence['differences']))
+
+    def test_a_dynamic_comparison_with_only_data_differences_is_not_a_divergence(self):
+        self.assertIsNone(self.compare(
+            claimed_block_size=MiB, requested_block_size=MiB, subformat='dynamic',
+            extra={'file_length': 1, 'bat': [{'index': 0, 'state': 6, 'offset': 0}]}))
 
     def test_an_unset_block_size_is_keyed_on_what_the_tool_chose(self):
         # The one draw with nothing to compare against: the option was

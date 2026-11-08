@@ -1563,6 +1563,17 @@ We should list obvious extensions, known issues, unrelated bugs we
 encountered, and anything else we should one day do but have
 chosen to defer to here, so that we do not forget them.
 
+* Nothing re-checks that every option the differential fuzzer's create
+  picker draws is still reachable. The plan makes "an option that is
+  never drawn is not coverage" a reportable failure, and phase 11d
+  measured hit counts for each new shape at a fixed seed by hand, but a
+  later edit that made `monolithicFlat`, `block_state_zero=off` or a
+  fixed VHDX geometry unreachable -- a mis-ordered `rng.choice`, a size
+  list that excludes every pinned geometry -- would pass CI silently. A
+  seeded test that draws a few thousand times and asserts each
+  documented shape appears at least once would close it. Raised in
+  review on the phase 11 pull request and deferred as its own task
+  rather than grown into that review.
 * `op_dd` in `scripts/differential-fuzz.py` compares a VHDX target the
   same layout-blind way `op_convert` used to -- its docstring says
   "Mirrors `op_convert`" -- so the structural comparison phase 11 added

@@ -693,6 +693,63 @@ because its geometry was never established. The isolating test is
 therefore over two parse failures, which is the only place that field
 separates two findings on its own.
 
+**Review round 2 (2026-11-08 AEDT).** 1 fix, 10 consider, 2 none. The
+fix item was a documentation error worth having: the new
+`docs/testing.md` section credited `fuzz_create_emitters` with holding
+each BAT offset to qemu's forward map, which is `fuzz_vhdx_fixed_bat`'s
+invariant 7; the emitter target asserts only the state and region
+membership. Documenting a stronger oracle than exists is the failure
+the plan's own review risk names, so the section now attributes each
+invariant to the target that asserts it.
+
+Nine of the ten consider items were taken, all small and all about
+code these rounds added. Two are worth naming. The #883 suppression
+applied on any parse failure of the right shape, for either subformat
+and any operation, while the defect as filed is dynamic `convert`; a
+fixed image carries a present entry for every block, so an all-zero
+BAT region in one is a finding of its own, and the skip would have
+hidden it. And round 1's claim to have swept the ways a field reaches
+a divergence was one short: a field can be set by subscript on a
+*context* that is later spread in, which is exactly what `op_convert`
+does with `context['vhdx_block_size']`. The scan now covers all seven
+paths, and a table in the test names one field reachable by each path
+and no other, established by auditing the source rather than by
+assertion.
+
+The tenth was declined and recorded in the master plan's Future work:
+a seeded test that every create-picker option is still reachable. It
+guards real ground -- the plan makes "an option that is never drawn is
+not coverage" reportable -- but it tests phase 11d's draws rather than
+anything these rounds changed, and it is its own task.
+
+**Mutation count after round 2: thirty-three.** Nine more Python
+mutants in `scratchpad/review-round-1/mutate-round2.py`, which extends
+round 1's set and reruns all of it. Three of round 1's mutants needed
+retargeting because round 2 rewrote the code they patched, and one
+survived the first round-2 run for a reason worth recording: round 1's
+f-string marker field had become reachable by a second path, so the
+mutant that blinded the scan to interpolated types no longer failed
+any test. That is what the one-field-per-path table fixes.
+
+**The integration suite is flaky on this host at 16 workers, and round
+1's single 0-fail run was a lucky sample.** Round 2 was verified
+against three full runs of the same tree: 0 failed, then 32, then 4.
+Every failure was `Content mismatch at offset 0!` from a `convert`
+content comparison, every one was in `tests/test_convert.py`, and the
+sets were unstable in both directions -- only 2 of the 32 reappeared
+among the 4, and 2 of the 4 were new. All 36 distinct tests pass when
+replayed away from a loaded run (32 at concurrency 2, 4 at concurrency
+4), and load average was 6 to 10 during the failing runs. A
+deterministic regression cannot produce different failure sets from
+one tree, and nothing in these rounds touches `convert` or the two
+`vhdx_structure` functions `test_convert` uses, so the attribution is
+host contention between 16 concurrent qemu conversions.
+
+Two things follow for anyone verifying work here. A single 0-fail run
+is weak evidence on this host, and the right response to a cluster of
+`Content mismatch at offset 0` failures is to replay the named tests
+at low concurrency before believing them -- not to bisect.
+
 ## Back brief
 
 Points needing the operator's answer before any step runs:
