@@ -55,6 +55,21 @@ no suffix, or with `B`/`b`, is refused, because a fraction of a byte
 is not a size. A fraction that is not a whole number of bytes rounds
 to the nearest byte, halves upwards.
 
+The resolved size must be a whole sector for every format but raw --
+512 bytes for qcow2, vmdk and vhd, and a VHDX's own logical sector
+size, because each records its size in sectors:
+
+```
+$ instar resize disk.qcow2 33554433
+Error: "resize: the new size must be a multiple of 512"
+```
+
+Nothing is written, and `qemu-img resize` refuses the same request on
+a qcow2 ("The new size must be a multiple of 512"). A raw image takes
+any byte count, as it does under qemu-img: it has no metadata to keep
+aligned, so `instar resize -f raw disk.raw 33554433` leaves a file of
+exactly 33554433 bytes.
+
 A subtractive end-spec implies shrink, but `--shrink` must still be
 passed explicitly — it documents the user's intent to discard data
 beyond the new EOF.

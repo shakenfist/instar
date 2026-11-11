@@ -8569,6 +8569,24 @@ fn run_resize(args: ResizeArgs, verbose: bool) -> Result<(), Box<dyn std::error:
         check_vhdx_virtual_size("resize", new_virtual_size)?;
     }
 
+    // A size that is not a whole sector is refused before anything is
+    // written, as qemu-img's qcow2 truncate refuses it ("The new size
+    // must be a multiple of 512"). Raw is the exception, with a
+    // granularity of one byte: it has no metadata to keep aligned and
+    // qemu-img writes whatever length is asked for. The three formats
+    // qemu-img cannot resize at all count sectors as well -- a VHDX's
+    // VirtualDiskSize is a multiple of its logical sector size, a VHD's
+    // footer records a sector count, and a VMDK descriptor's capacity
+    // is in 512-byte sectors -- so each is held to its own granularity
+    // rather than silently truncated into it.
+    if !new_virtual_size.is_multiple_of(probed.size_granularity) {
+        return Err(format!(
+            "resize: the new size must be a multiple of {}",
+            probed.size_granularity
+        )
+        .into());
+    }
+
     if probed.format == IMAGE_FORMAT_RAW {
         run_resize_raw(&args, &probed, new_virtual_size)
     } else {
@@ -8589,6 +8607,10 @@ struct ProbedResizeTarget {
     /// QCOW2 only: extended_l2 bit from the header.  False for
     /// other formats.
     qcow2_extended_l2: bool,
+    /// The multiple, in bytes, a new virtual size has to be: 512 for
+    /// the formats whose metadata counts sectors, a VHDX's own logical
+    /// sector size, and 1 for raw, which takes any byte count.
+    size_granularity: u64,
 }
 
 /// Probe the resize target's format and current virtual size.
@@ -8642,8 +8664,10 @@ fn probe_resize_target(
         }
     };
 
-    let (format_code, current_virtual_size, qcow2_extended_l2) = match detected {
-        shared::ImageFormat::Raw => (IMAGE_FORMAT_RAW, current_file_size, false),
+    let (format_code, current_virtual_size, qcow2_extended_l2, size_granularity) = match detected {
+        // Raw takes any length: there is no metadata to keep aligned,
+        // and qemu-img truncates the file to exactly what was asked for.
+        shared::ImageFormat::Raw => (IMAGE_FORMAT_RAW, current_file_size, false, 1),
         shared::ImageFormat::Qcow2 => {
             let header = qcow2::QcowHeader::parse(&buf).ok_or("resize: invalid qcow2 header")?;
             // Defensive guard against silent backing-chain
@@ -8662,11 +8686,16 @@ fn probe_resize_target(
                      `instar convert` first"
                     .into());
             }
-            (IMAGE_FORMAT_QCOW2, header.virtual_size, header.extended_l2)
+            (
+                IMAGE_FORMAT_QCOW2,
+                header.virtual_size,
+                header.extended_l2,
+                512,
+            )
         }
         shared::ImageFormat::Vmdk4 | shared::ImageFormat::Vmdk3 => {
             let header = vmdk::Vmdk4Header::parse(&buf).ok_or("resize: invalid vmdk header")?;
-            (IMAGE_FORMAT_VMDK4, header.virtual_size, false)
+            (IMAGE_FORMAT_VMDK4, header.virtual_size, false, 512)
         }
         shared::ImageFormat::Vhd => {
             // VHD footer lives at file end (last 512 bytes).
@@ -8677,13 +8706,21 @@ fn probe_resize_target(
             let mut footer = [0u8; 512];
             file.read_exact(&mut footer)?;
             let parsed = vhd::VhdFooter::parse(&footer).ok_or("resize: invalid vhd footer")?;
-            (IMAGE_FORMAT_VHD, parsed.current_size, false)
+            (IMAGE_FORMAT_VHD, parsed.current_size, false, 512)
         }
         shared::ImageFormat::Vhdx => {
             // VHDX VirtualDiskSize lives in the metadata region;
-            // walk header → region table → metadata to find it.
-            let vds = probe_vhdx_virtual_size(&mut file, current_file_size)?;
-            (IMAGE_FORMAT_VHDX, vds, false)
+            // walk header → region table → metadata to find it. The
+            // same walk reads the logical sector size, which is the
+            // multiple VirtualDiskSize has to be; the metadata parser
+            // accepts only 512 or 4096 for it.
+            let (vds, logical_sector_size) = probe_vhdx_virtual_size(&mut file, current_file_size)?;
+            (
+                IMAGE_FORMAT_VHDX,
+                vds,
+                false,
+                u64::from(logical_sector_size),
+            )
         }
         other => {
             return Err(format!(
@@ -8698,18 +8735,19 @@ fn probe_resize_target(
         current_virtual_size,
         current_file_size,
         qcow2_extended_l2,
+        size_granularity,
     })
 }
 
-/// Read the VHDX `VirtualDiskSize` metadata field by walking
-/// the active header → region table → metadata layout.  This is
-/// the host-side mirror of what the guest does during the
-/// vhdx pre-pass — the host only needs the size, so we read
-/// the minimum necessary regions.
+/// Read the VHDX `VirtualDiskSize` and `LogicalSectorSize` metadata
+/// fields by walking the active header → region table → metadata
+/// layout.  This is the host-side mirror of what the guest does during
+/// the vhdx pre-pass — the host needs the size and the multiple it has
+/// to be, so we read the minimum necessary regions.
 fn probe_vhdx_virtual_size(
     file: &mut std::fs::File,
     current_file_size: u64,
-) -> Result<u64, Box<dyn std::error::Error>> {
+) -> Result<(u64, u32), Box<dyn std::error::Error>> {
     use std::io::{Read, Seek, SeekFrom};
     if current_file_size < 0x40000 + 64 * 1024 {
         return Err("resize: file too small for vhdx layout".into());
@@ -8758,7 +8796,7 @@ fn probe_vhdx_virtual_size(
     file.seek(SeekFrom::Start(metadata.file_offset))?;
     file.read_exact(&mut meta)?;
     let items = vhdx::parse_metadata_region(&meta).ok_or("resize: vhdx metadata invalid")?;
-    Ok(items.virtual_disk_size)
+    Ok((items.virtual_disk_size, items.logical_sector_size))
 }
 
 /// Host-side raw resize: `set_len` to the new size, optional

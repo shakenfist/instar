@@ -1033,6 +1033,60 @@ RESIZE_CROSS_VALIDATION_CASES = [
 ]
 
 
+class TestResizeSizeAlignment(TestResizeSmoke):
+    """A new size has to be a whole sector, except on raw.
+
+    Measured with qemu-img 10.0.13: a qcow2 resize to 33554433 is
+    refused ("The new size must be a multiple of 512") and the image
+    is untouched, while a raw file is resized to exactly 33554433
+    bytes, because raw has no metadata to keep aligned. qemu-img
+    cannot resize vmdk, vhd or vhdx at all, and all three record
+    their size in sectors, so instar holds them to the same rule --
+    a VHDX to its own logical sector size.
+    """
+
+    def test_qcow2_refuses_a_size_that_is_not_a_whole_sector(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'a.qcow2'
+            _, c_stderr, c_rc = self.run_instar_create(
+                '-f', 'qcow2', str(path), '16M')
+            self.assertEqual(c_rc, 0, f'create failed: {c_stderr}')
+            _, stderr, rc = self.run_instar_resize(
+                '-f', 'qcow2', str(path), '33554433')
+            self.assertNotEqual(rc, 0, 'expected 16M + 1 byte to be refused')
+            self.assertIn('multiple of 512', stderr)
+            # Refused before anything was written.
+            info_stdout, info_err, info_rc = self.run_instar_info(
+                path, output_format='json')
+            self.assertEqual(info_rc, 0, f'info failed: {info_err}')
+            self.assertEqual(json.loads(info_stdout)['virtual-size'],
+                             16 * 1024 ** 2)
+
+    def test_vhdx_refuses_a_size_that_is_not_a_whole_sector(self):
+        """A VHDX's VirtualDiskSize is a multiple of its logical sector size."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'a.vhdx'
+            _, c_stderr, c_rc = self.run_instar_create(
+                '-f', 'vhdx', str(path), '16M')
+            self.assertEqual(c_rc, 0, f'create failed: {c_stderr}')
+            _, stderr, rc = self.run_instar_resize(
+                '-f', 'vhdx', str(path), '33554433')
+            self.assertNotEqual(rc, 0, 'expected 16M + 1 byte to be refused')
+            self.assertIn('multiple of 512', stderr)
+
+    def test_raw_takes_any_byte_count(self):
+        """qemu-img resizes a raw file to whatever length is asked for."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'a.raw'
+            _, c_stderr, c_rc = self.run_instar_create(
+                '-f', 'raw', str(path), '16M')
+            self.assertEqual(c_rc, 0, f'create failed: {c_stderr}')
+            _, stderr, rc = self.run_instar_resize(
+                '-f', 'raw', str(path), '33554433')
+            self.assertEqual(rc, 0, f'raw resize refused: {stderr}')
+            self.assertEqual(path.stat().st_size, 33554433)
+
+
 class TestResizeSizeSuffixes(TestResizeSmoke):
     """The size suffixes mean what qemu-img's `suffix_mul` means.
 
