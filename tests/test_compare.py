@@ -1622,3 +1622,94 @@ class TestCompareQcow1(InstarTestBase):
                 f'compare qcow1-backing vs its flattened raw should be '
                 f'identical; stdout={stdout!r} stderr={stderr!r}')
             self.assertIn('identical', (stdout + stderr).lower())
+
+
+class TestCompareFailureIsNotAVerdict(InstarTestBase):
+    """A compare that could not read an image says so, and never exits 1.
+
+    Exit 1 means "the images differ". Every failure used to be reported
+    as one: a read that failed sent the guest's default result, which
+    printed "Content mismatch at offset 0!" and exited 1, so a script
+    was told two images differed when instar had never compared them
+    (issue #807). qemu-img compare gives an image it cannot open exit 2
+    and a failed read exit 4 (measured with qemu-img 10.0.13, the read
+    error injected with blkdebug), and so does instar now.
+
+    The fixture is a qcow2 whose only data cluster has been truncated off
+    the end of the file, which instar's reader refuses. qemu-img reads
+    past the end of a file as zeroes and calls the images identical; that
+    is a separate difference between the two, and not what these tests
+    are about.
+    """
+
+    #: The truncated qcow2's data cluster, at 512 KiB of a 1 MiB disk.
+    DATA_OFFSET = 512 * 1024
+
+    def _fixture(self, td):
+        """Return (truncated qcow2, 1 MiB zero raw, 512 KiB zero raw)."""
+        self._require_qemu_tools()
+        broken = td / 'broken.qcow2'
+        self._run_tool(['qemu-img', 'create', '-f', 'qcow2', broken.name, '1M'], td)
+        self._run_tool(
+            ['qemu-io', '-f', 'qcow2', '-c', f'write -P 0x5a {self.DATA_OFFSET} 64k', broken.name], td)
+        # The data cluster is the last one allocated, so cutting one cluster
+        # off the file leaves its L2 entry pointing past the end.
+        size = broken.stat().st_size
+        with open(broken, 'r+b') as f:
+            f.truncate(size - 65536)
+        zeros = td / 'zeros.raw'
+        self._run_tool(['qemu-img', 'create', '-f', 'raw', zeros.name, '1M'], td)
+        small = td / 'small.raw'
+        self._run_tool(['qemu-img', 'create', '-f', 'raw', small.name, '512K'], td)
+        return broken, zeros, small
+
+    def _assert_read_error(self, stdout, stderr, rc, which, path):
+        self.assertEqual(
+            rc, 4,
+            f'a failed read must exit 4, not {rc}; stdout={stdout!r} stderr={stderr!r}')
+        self.assertEqual(stdout, '', 'a failed comparison prints no verdict on stdout')
+        self.assertIn(
+            f'compare: reading the {which} image, {path}, failed at virtual offset '
+            f'{self.DATA_OFFSET} ({self.DATA_OFFSET:#x}); the images were not compared',
+            stderr)
+
+    def test_a_failed_read_of_the_first_image_is_an_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            broken, zeros, _ = self._fixture(Path(td))
+            stdout, stderr, rc = self.run_instar_compare(broken, zeros)
+            self._assert_read_error(stdout, stderr, rc, 'first', broken)
+
+    def test_a_failed_read_of_the_second_image_is_an_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            broken, zeros, _ = self._fixture(Path(td))
+            stdout, stderr, rc = self.run_instar_compare(zeros, broken)
+            self._assert_read_error(stdout, stderr, rc, 'second', broken)
+
+    def test_a_failed_read_past_the_smaller_image_is_an_error(self):
+        """The scan of the larger image's tail for zeroes fails the same way.
+
+        It used to be reported as a mismatch at the offset of the failed
+        read, which is the one place a failed read became a plausible
+        verdict rather than "offset 0".
+        """
+        with tempfile.TemporaryDirectory() as td:
+            broken, _, small = self._fixture(Path(td))
+            stdout, stderr, rc = self.run_instar_compare(small, broken)
+            self._assert_read_error(stdout, stderr, rc, 'second', broken)
+
+    def test_a_failed_read_prints_no_json_verdict(self):
+        with tempfile.TemporaryDirectory() as td:
+            broken, zeros, _ = self._fixture(Path(td))
+            stdout, stderr, rc = self.run_instar_compare(broken, zeros, output_format='json')
+            self._assert_read_error(stdout, stderr, rc, 'first', broken)
+
+    def test_an_image_that_cannot_be_opened_exits_2(self):
+        """A missing file is an open error, qemu-img's exit 2, not a difference."""
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            present = td / 'present.raw'
+            subprocess.run(['qemu-img', 'create', '-f', 'raw', str(present), '1M'], capture_output=True, check=True)
+            stdout, stderr, rc = self.run_instar_compare(td / 'missing.raw', present)
+            self.assertEqual(rc, 2, f'stdout={stdout!r} stderr={stderr!r}')
+            self.assertEqual(stdout, '')
+            self.assertIn('missing.raw', stderr)

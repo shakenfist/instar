@@ -3072,7 +3072,7 @@ already carries unconsumed VDI check baselines from `generate-baselines.py`
 operation); wiring instar's `check` up to consume them is recorded as
 master-plan future work.
 
-### Malformed VDI: `compare` Reports a Mismatch, `info` Stays Lenient
+### Malformed VDI: `compare` Refuses, `info` Stays Lenient
 
 **Classification: Safe Quirk**
 
@@ -3087,12 +3087,13 @@ identically — but *how* each op surfaces that refusal differs, because
 
 #### Why This Matters
 
-`convert` and `dd` surface the reader's init failure as a normal
-operation error on stderr. `compare`, however, treats a source it
-cannot open as a content mismatch rather than a hard error: comparing
-a malformed VDI against any other file reports a non-zero-exit
-mismatch on stdout, not "Images are identical" — proving compare is
-not silently falling back to a raw read of the malformed container.
+`convert`, `dd` and `compare` surface the reader's init failure as an
+operation error on stderr. `compare` once reported a source it could
+not open as a content mismatch on stdout, with exit 1, the "images
+differ" code; it now refuses with exit 2, qemu-img's code for an image
+it cannot open (#807). Either way it does not report "Images are
+identical", which shows it is not silently falling back to a raw read
+of the malformed container.
 `info`'s header parser (`parse_vdi_header`) is intentionally out of
 scope for the reader graduation — it still reports whatever
 detection-level fields (format name, a plausible virtual size) the
@@ -3103,10 +3104,11 @@ established for malformed DMGs (see above).
 #### instar Behavior
 
 **Always**: `convert`/`dd` exit non-zero with a clean error;
-`compare` exits non-zero reporting a mismatch; `info` exits 0 with
-best-effort header fields. Pinned by `TestAdversarialVdiManifest` in
-`tests/test_adversarial.py`, which asserts exit codes and non-empty
-output for all four ops across the five malformed fixtures without
+`compare` exits 2 or 4 with an error and never reports a mismatch;
+`info` exits 0 with best-effort header fields. Pinned by
+`TestAdversarialVdiManifest` in `tests/test_adversarial.py`, which
+asserts exit codes and output for all four ops across the five
+malformed fixtures without
 pinning instar's exact error string (only qemu-img's error strings are
 version-stable enough to pin).
 

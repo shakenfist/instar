@@ -2566,6 +2566,28 @@ impl CompareResult {
     /// Flag: Images have different sizes
     pub const FLAG_SIZE_MISMATCH: u32 = 1 << 0;
 
+    /// Flag: the guest could not set up a comparison (a chain failed
+    /// to initialise, an unsupported feature, a LUKS key that could
+    /// not be derived, an inconsistent config), so nothing was
+    /// compared. `identical` and `first_mismatch_offset` carry no
+    /// verdict. Without this flag a failed setup read as "the images
+    /// differ at offset 0" (issue #807); the host renders it as an
+    /// error instead, with qemu-img's exit code for an image it could
+    /// not open.
+    pub const FLAG_SETUP_FAILED: u32 = 1 << 1;
+
+    /// Flag: a read failed part-way through the comparison.
+    /// `first_mismatch_offset` holds the virtual byte offset of the
+    /// read that failed, not of a difference, and
+    /// [`Self::FLAG_FAILED_IMAGE2`] says which image it was. The host
+    /// renders it as an error with qemu-img's exit code for a read
+    /// error (issue #807).
+    pub const FLAG_READ_FAILED: u32 = 1 << 2;
+
+    /// Flag: qualifies [`Self::FLAG_READ_FAILED`]; set when the read
+    /// that failed was of the second image, clear for the first.
+    pub const FLAG_FAILED_IMAGE2: u32 = 1 << 3;
+
     /// Create a new empty result (defaults to not identical)
     pub const fn new() -> Self {
         Self {
@@ -2591,6 +2613,17 @@ impl CompareResult {
     /// Check if images have different sizes
     pub fn has_size_mismatch(&self) -> bool {
         (self.flags & Self::FLAG_SIZE_MISMATCH) != 0
+    }
+
+    /// A result that reports a failure rather than a verdict: `flags`
+    /// is [`Self::FLAG_SETUP_FAILED`], or [`Self::FLAG_READ_FAILED`]
+    /// (with [`Self::FLAG_FAILED_IMAGE2`] when the second image's read
+    /// failed), and `offset` is the virtual offset of a failed read.
+    pub const fn failure(flags: u32, offset: u64) -> Self {
+        let mut result = Self::new();
+        result.flags = flags;
+        result.first_mismatch_offset = offset;
+        result
     }
 }
 

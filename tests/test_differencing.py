@@ -675,19 +675,23 @@ class DifferencingTestBase(InstarTestBase):
         not a cosmetic one -- the two messages send a user to different
         places.
 
-        Exit code 1 is asserted exactly, not merely as non-zero. For
+        The exit code is asserted exactly, not merely as non-zero. For
         `check` in particular that matters: exit 2 means corruption,
         and a differencing source was deliberately classified away
         from corruption, so a future 2 here would be a regression even
-        though it is non-zero.
+        though it is non-zero. `compare` is the exception that proves
+        the rule: its exit 1 means "the images differ", so a refusal
+        takes qemu-img's exit 2 for an image it could not open
+        (issue #807).
         """
         expected = (
             self.expected_refusal(op, format_name) if composing
             else self.expected_non_composing_refusal(op, format_name)
         )
+        expected_rc = 2 if op == 'compare' else 1
         self.assertEqual(
-            1, rc,
-            f'{context}: expected exit 1, got {rc}; '
+            expected_rc, rc,
+            f'{context}: expected exit {expected_rc}, got {rc}; '
             f'stdout={stdout[:400]!r} stderr={stderr[:400]!r}'
         )
         self.assertIn(

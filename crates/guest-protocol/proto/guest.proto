@@ -188,12 +188,17 @@ message CheckResultMessage {
 message CompareResultMessage {
   // Whether the images are logically identical
   bool identical = 1;
-  // Byte offset of first content mismatch (only valid if not identical)
+  // Byte offset of first content mismatch (only valid if not identical
+  // and no failure bit is set); with bit 2 set, the virtual offset of
+  // the read that failed
   uint64 first_mismatch_offset = 2;
   // Total bytes compared
   uint64 total_bytes_compared = 3;
-  // Status flags:
+  // Status flags (shared::CompareResult::FLAG_*):
   //   bit 0: size_mismatch (images have different sizes)
+  //   bit 1: setup_failed (nothing was compared; no verdict)
+  //   bit 2: read_failed (a read failed mid-comparison; no verdict)
+  //   bit 3: failed_image2 (with bit 2: the second image's read failed)
   uint32 flags = 4;
 }
 

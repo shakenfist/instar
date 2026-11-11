@@ -13480,7 +13480,66 @@ fn print_measure_result_json(
     println!("}}");
 }
 
+/// A compare failure that happened while reading, after both images
+/// had been opened. Carried as its own error type so [`run_compare`]
+/// can give it qemu-img's read-error exit code rather than the
+/// open-error one. `Debug` prints the message the way a `String` error
+/// prints, so the `Error: "..."` line on stderr reads the same as every
+/// other error's.
+struct CompareReadError(String);
+
+impl std::fmt::Debug for CompareReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.0)
+    }
+}
+
+impl std::fmt::Display for CompareReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CompareReadError {}
+
+/// qemu-img compare's exit code for an image it could not open, and
+/// instar's for every compare error that is not a read failure.
+const COMPARE_EXIT_OPEN_ERROR: i32 = 2;
+/// qemu-img compare's exit code for a read that failed mid-comparison.
+const COMPARE_EXIT_READ_ERROR: i32 = 4;
+
+/// The exit code for a compare that ended in `err`.
+///
+/// Exit 1 means "the images differ", and only a comparison that found a
+/// difference may claim it. Every error used to leave `main` as exit 1
+/// too, so a script reading that code was told two images differed when
+/// instar had never compared them (issue #807). qemu-img compare
+/// reserves 1 for a difference and gives errors their own codes: 2 for
+/// an image it cannot open, 4 for a failed read (measured with qemu-img
+/// 10.0.13, the read error injected with blkdebug).
+fn compare_error_exit_code(err: &(dyn std::error::Error + 'static)) -> i32 {
+    if err.is::<CompareReadError>() {
+        COMPARE_EXIT_READ_ERROR
+    } else {
+        COMPARE_EXIT_OPEN_ERROR
+    }
+}
+
 fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+    match compare_images(args, verbose) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            eprintln!("Error: {err:?}");
+            std::process::exit(compare_error_exit_code(err.as_ref()));
+        }
+    }
+}
+
+/// Compare two images and print the verdict. Returns `Ok` when they
+/// are identical, exits 1 when they differ, and returns `Err` for
+/// anything that is not a verdict; [`run_compare`] picks that error's
+/// exit code.
+fn compare_images(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Validate sector size (must be power of 2, 512 to 64KB)
     if !(512..=MAX_SECTOR_SIZE).contains(&args.sector_size) || !args.sector_size.is_power_of_two() {
         return Err(format!(
@@ -13856,6 +13915,9 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     // Track compare result for exit code
     let mut compare_identical = false;
     let mut compare_result_received = false;
+    // A result whose flags say the guest could not compare, as
+    // `(flags, offset of the failed read)`. It carries no verdict.
+    let mut compare_failure: Option<(u32, u64)> = None;
 
     // Track VM errors
     let mut vm_error: Option<String> = None;
@@ -13884,11 +13946,20 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
                                 if let Some(guest_::GuestMessage_::Payload::CompareResult(result)) =
                                     &msg.payload
                                 {
-                                    let size_mismatch = (result.flags & 1) != 0;
-                                    // In strict mode, size mismatch means not identical
-                                    // regardless of content
-                                    compare_identical =
-                                        result.identical && !(args.strict && size_mismatch);
+                                    let failure_flags = shared::CompareResult::FLAG_SETUP_FAILED
+                                        | shared::CompareResult::FLAG_READ_FAILED;
+                                    if result.flags & failure_flags != 0 {
+                                        compare_failure =
+                                            Some((result.flags, result.first_mismatch_offset));
+                                    } else {
+                                        let size_mismatch = (result.flags
+                                            & shared::CompareResult::FLAG_SIZE_MISMATCH)
+                                            != 0;
+                                        // In strict mode, size mismatch means not
+                                        // identical regardless of content
+                                        compare_identical =
+                                            result.identical && !(args.strict && size_mismatch);
+                                    }
                                     compare_result_received = true;
                                 }
                                 // A differencing source makes the guest
@@ -13897,8 +13968,12 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
                                 // at offset 0!" for a refusal (issue #548).
                                 // A corrupt qcow2 L2 entry refused mid-read
                                 // does the same. The tail renders the
-                                // captured reason instead.
-                                if serial_decoder.last_differencing_refusal.is_none()
+                                // captured reason instead. Any other
+                                // failure is flagged on the result
+                                // itself, and is not a verdict either
+                                // (issue #807).
+                                if compare_failure.is_none()
+                                    && serial_decoder.last_differencing_refusal.is_none()
                                     && !serial_decoder.l2_entry_refused()
                                 {
                                     print_compare_result(&msg, &args.output, args.strict);
@@ -14001,7 +14076,14 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     // Likewise for a corrupt qcow2 L2 entry refused inside the chain
     // reader: the guest's result for a failed read is not a comparison.
     if serial_decoder.l2_entry_refused() {
-        return Err(serial_decoder.l2_entry_refusal_error("compare").into());
+        return Err(Box::new(CompareReadError(
+            serial_decoder.l2_entry_refusal_error("compare"),
+        )));
+    }
+
+    // Any other failure the guest flagged on its result.
+    if let Some((flags, offset)) = compare_failure {
+        return Err(compare_failure_error(&args, flags, offset));
     }
 
     // Return error if no result was received
@@ -20394,6 +20476,37 @@ fn validate_create_args(args: &CreateArgs) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
+/// The error for a compare result the guest flagged as a failure
+/// rather than a verdict (issue #807).
+///
+/// A failed read names the image and the virtual offset, and is a
+/// [`CompareReadError`] so it exits with qemu-img's read-error code.
+/// A setup failure has no offset and the guest does not say which
+/// image it was, so the message says only that nothing was compared;
+/// the guest's own reason is in its `--verbose` output.
+fn compare_failure_error(
+    args: &CompareArgs,
+    flags: u32,
+    offset: u64,
+) -> Box<dyn std::error::Error> {
+    if flags & shared::CompareResult::FLAG_READ_FAILED != 0 {
+        let (which, path) = if flags & shared::CompareResult::FLAG_FAILED_IMAGE2 != 0 {
+            ("second", &args.image2)
+        } else {
+            ("first", &args.image1)
+        };
+        Box::new(CompareReadError(format!(
+            "compare: reading the {which} image, {}, failed at virtual offset {offset} \
+             ({offset:#x}); the images were not compared",
+            terminal_safe_path(Path::new(path))
+        )))
+    } else {
+        "compare: the guest could not set up a comparison of the two images, so nothing \
+         was compared (--verbose shows the guest's reason)"
+            .into()
+    }
+}
+
 /// Print compare result in human-readable or JSON format.
 ///
 /// Human output matches qemu-img compare (all output to stdout):
@@ -20401,6 +20514,9 @@ fn validate_create_args(args: &CreateArgs) -> Result<(), Box<dyn std::error::Err
 /// - Different: "Content mismatch at offset {offset}!\n"
 /// - Size warning (non-strict): "Warning: Image size mismatch!\n"
 /// - Size strict: "Strict mode: Image size mismatch!\n"
+///
+/// A result with a failure flag set is not a verdict and must not
+/// reach this function; [`compare_failure_error`] renders it.
 fn print_compare_result(msg: &guest_::GuestMessage, output_format: &str, strict: bool) {
     if let Some(guest_::GuestMessage_::Payload::CompareResult(result)) = &msg.payload {
         if output_format == "json" {
