@@ -1593,6 +1593,58 @@ class TestCommitBackingClassification(TestCommitSmoke):
             'committed')
         self.assertNotIn('the backing file uses', stderr)
 
+    def test_commit_over_a_grandparent_with_a_data_file(self):
+        """A data file further down the chain than the backing is no reason to refuse.
+
+        commit reads the overlay and writes the backing; the backing's
+        own parent is attached but never read. Chain discovery refuses a
+        backing image's external data file for a caller that reads
+        through the chain (issue #806), and commit's walk of its
+        backing's ancestors must not inherit that refusal, which would
+        withdraw a commit that worked.
+        """
+        self._require_qemu_tools()
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            self._run_tool(
+                ['qemu-img', 'create', '-f', 'qcow2',
+                 '-o', 'data_file=base.data', 'base.qcow2', '1M'],
+                td)
+            self._run_tool(
+                ['qemu-img', 'create', '-f', 'qcow2',
+                 '-o', 'backing_file=base.qcow2,backing_fmt=qcow2',
+                 'backing.qcow2', '1M'],
+                td)
+            self._run_tool(
+                ['qemu-img', 'create', '-f', 'qcow2',
+                 '-o', 'backing_file=backing.qcow2,backing_fmt=qcow2',
+                 'overlay.qcow2', '1M'],
+                td)
+            self._run_tool(
+                ['qemu-io', '-f', 'qcow2', '-c', 'write -P 0xbb 0 64k',
+                 'overlay.qcow2'],
+                td)
+            base_before = {
+                name: self.sha256(td / name)
+                for name in ('base.qcow2', 'base.data')}
+
+            _, stderr, rc = self.run_instar_commit(
+                td / 'overlay.qcow2', timeout=120)
+            self.assertEqual(rc, 0, f'commit failed: stderr={stderr!r}')
+            self.assertNotIn('external data file', stderr)
+
+            # The overlay's data reached the backing, and the image
+            # under it was not touched.
+            r = self._run_tool(
+                ['qemu-io', '-f', 'qcow2', '-c', 'read -P 0xbb 0 64k',
+                 'backing.qcow2'],
+                td)
+            self.assertNotIn('Pattern verification failed', r.stdout)
+            self.assertEqual(
+                {name: self.sha256(td / name)
+                 for name in ('base.qcow2', 'base.data')},
+                base_before)
+
     def test_refuse_sparse_refcount_table_backing(self):
         """Commit into a holed-refcount-table backing refuses pre-mutation.
 

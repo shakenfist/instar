@@ -2615,14 +2615,46 @@ impl CompareResult {
         (self.flags & Self::FLAG_SIZE_MISMATCH) != 0
     }
 
-    /// A result that reports a failure rather than a verdict: `flags`
-    /// is [`Self::FLAG_SETUP_FAILED`], or [`Self::FLAG_READ_FAILED`]
-    /// (with [`Self::FLAG_FAILED_IMAGE2`] when the second image's read
-    /// failed), and `offset` is the virtual offset of a failed read.
-    pub const fn failure(flags: u32, offset: u64) -> Self {
+    /// The flag bits that make a result a failure rather than a
+    /// verdict. A result with any of them set says nothing about
+    /// whether the images differ.
+    pub const FAILURE_FLAGS: u32 = Self::FLAG_SETUP_FAILED | Self::FLAG_READ_FAILED;
+
+    /// Whether `flags` (a result's flags, as they arrive over the wire)
+    /// report a failure rather than a verdict.
+    pub const fn flags_report_failure(flags: u32) -> bool {
+        flags & Self::FAILURE_FLAGS != 0
+    }
+
+    /// Whether this result reports a failure rather than a verdict.
+    pub const fn has_failure(&self) -> bool {
+        Self::flags_report_failure(self.flags)
+    }
+
+    /// A result saying the comparison could not be set up, so nothing
+    /// was compared.
+    ///
+    /// The failure results are built only here and by
+    /// [`Self::read_failed`], so no caller can pair a failure with a
+    /// flag that the host would read as a verdict instead.
+    pub const fn setup_failed() -> Self {
         let mut result = Self::new();
-        result.flags = flags;
+        result.flags = Self::FLAG_SETUP_FAILED;
+        result
+    }
+
+    /// A result saying a read of the first image (`image2` false) or the
+    /// second (`image2` true) failed at virtual byte `offset`. Nothing
+    /// was compared past `offset`, which `total_bytes_compared` records.
+    pub const fn read_failed(image2: bool, offset: u64) -> Self {
+        let mut result = Self::new();
+        result.flags = if image2 {
+            Self::FLAG_READ_FAILED | Self::FLAG_FAILED_IMAGE2
+        } else {
+            Self::FLAG_READ_FAILED
+        };
         result.first_mismatch_offset = offset;
+        result.total_bytes_compared = offset;
         result
     }
 }
@@ -5530,6 +5562,36 @@ pub type OperationEntry = unsafe extern "C" fn() -> u64;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compare_failure_results_carry_no_verdict() {
+        let setup = CompareResult::setup_failed();
+        assert!(setup.has_failure());
+        assert_eq!(setup.flags, CompareResult::FLAG_SETUP_FAILED);
+
+        let first = CompareResult::read_failed(false, 4096);
+        assert!(first.has_failure());
+        assert_eq!(first.flags, CompareResult::FLAG_READ_FAILED);
+        assert_eq!(
+            (first.first_mismatch_offset, first.total_bytes_compared),
+            (4096, 4096)
+        );
+
+        let second = CompareResult::read_failed(true, 8192);
+        assert!(second.has_failure());
+        assert_eq!(
+            second.flags,
+            CompareResult::FLAG_READ_FAILED | CompareResult::FLAG_FAILED_IMAGE2
+        );
+
+        // A verdict, including a size mismatch, is not a failure.
+        let mut verdict = CompareResult::new();
+        verdict.flags = CompareResult::FLAG_SIZE_MISMATCH;
+        assert!(!verdict.has_failure());
+        assert!(!CompareResult::flags_report_failure(
+            CompareResult::FLAG_FAILED_IMAGE2
+        ));
+    }
 
     #[test]
     fn measure_config_magic_uniqueness() {

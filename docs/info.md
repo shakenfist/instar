@@ -123,3 +123,12 @@ already in Windows convention, such as a VHD parent name of
 being normalised. The full account, including which locator key `info`
 prefers and why the relative case is rendered back, is the "VHD/VHDX
 differencing" section of [quirks.md](quirks.md).
+
+For a qcow2 or VMDK backing reference, `info` and the reading operations
+can still disagree. A name such as `C:\images\base.qcow2` is also a
+legal POSIX file name, and chain discovery treats it as relative: if a
+file of exactly that name sits in the image's directory, `convert` and
+`compare` read it, while `info` reports the reference with no "actual
+path". Making discovery refuse a Windows absolute reference instead
+would change what those operations open, so it is left for its own
+change.

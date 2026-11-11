@@ -121,7 +121,7 @@ pub unsafe extern "C" fn _start() -> u64 {
     // Each chain must have at least one device (the top image itself)
     if image1_device_count < 1 || image2_device_count < 1 {
         (call_table.debug_print)(b"compare: each chain must have >= 1 device\n\0".as_ptr());
-        let result = CompareResult::failure(CompareResult::FLAG_SETUP_FAILED, 0);
+        let result = CompareResult::setup_failed();
         (call_table.send_compare_result)(&result);
         (call_table.send_complete)(b"compare\0".as_ptr(), 0, false);
         return 0;
@@ -130,7 +130,7 @@ pub unsafe extern "C" fn _start() -> u64 {
     // Bounds-check total_devices against the fixed-size arrays it will index
     if total_devices > MAX_CHAIN_DEVICES {
         (call_table.debug_print)(b"compare: total devices exceeds max\n\0".as_ptr());
-        let result = CompareResult::failure(CompareResult::FLAG_SETUP_FAILED, 0);
+        let result = CompareResult::setup_failed();
         (call_table.send_compare_result)(&result);
         (call_table.send_complete)(b"compare\0".as_ptr(), 0, false);
         return 0;
@@ -146,7 +146,7 @@ pub unsafe extern "C" fn _start() -> u64 {
         // loop would read from uninitialized memory. The VMM always writes
         // a ChainConfig for compare, so this is a defensive guard.
         (call_table.debug_print)(b"compare: missing chain config\n\0".as_ptr());
-        let result = CompareResult::failure(CompareResult::FLAG_SETUP_FAILED, 0);
+        let result = CompareResult::setup_failed();
         (call_table.send_compare_result)(&result);
         (call_table.send_complete)(b"compare\0".as_ptr(), 0, false);
         return 0;
@@ -157,7 +157,7 @@ pub unsafe extern "C" fn _start() -> u64 {
         (call_table.debug_print)(
             b"compare: chain_config.device_count != total_devices\n\0".as_ptr(),
         );
-        let result = CompareResult::failure(CompareResult::FLAG_SETUP_FAILED, 0);
+        let result = CompareResult::setup_failed();
         (call_table.send_compare_result)(&result);
         (call_table.send_complete)(b"compare\0".as_ptr(), 0, false);
         return 0;
@@ -170,7 +170,7 @@ pub unsafe extern "C" fn _start() -> u64 {
             (call_table.debug_print)(b"compare: sector size mismatch\n\0".as_ptr());
             // Not a size mismatch between the images: the devices'
             // sector sizes disagree, so no comparison can be made.
-            let result = CompareResult::failure(CompareResult::FLAG_SETUP_FAILED, 0);
+            let result = CompareResult::setup_failed();
             (call_table.send_compare_result)(&result);
             (call_table.send_complete)(b"compare\0".as_ptr(), 0, false);
             return 0;
@@ -220,7 +220,7 @@ pub unsafe extern "C" fn _start() -> u64 {
         &mut bytes_read,
     ) {
         (call_table.debug_print)(b"compare: failed to init chain states\n\0".as_ptr());
-        let result = CompareResult::failure(CompareResult::FLAG_SETUP_FAILED, 0);
+        let result = CompareResult::setup_failed();
         (call_table.send_compare_result)(&result);
         (call_table.send_complete)(b"compare\0".as_ptr(), bytes_read, false);
         return bytes_read;
@@ -231,7 +231,7 @@ pub unsafe extern "C" fn _start() -> u64 {
         let unsupported = state.unsupported_incompat_features(qcow2::SUPPORTED_INCOMPAT_FEATURES);
         if unsupported != 0 {
             (call_table.debug_print)(b"compare: unsupported incompatible features\n\0".as_ptr());
-            let result = CompareResult::failure(CompareResult::FLAG_SETUP_FAILED, 0);
+            let result = CompareResult::setup_failed();
             (call_table.send_compare_result)(&result);
             (call_table.send_complete)(b"compare\0".as_ptr(), bytes_read, false);
             return bytes_read;
@@ -308,7 +308,7 @@ pub unsafe extern "C" fn _start() -> u64 {
                     (call_table.debug_print)(
                         b"compare: crypt_method=2 but no LUKS extension found\n\0".as_ptr(),
                     );
-                    let result = CompareResult::failure(CompareResult::FLAG_SETUP_FAILED, 0);
+                    let result = CompareResult::setup_failed();
                     (call_table.send_compare_result)(&result);
                     (call_table.send_complete)(b"compare\0".as_ptr(), bytes_read, false);
                     return bytes_read;
@@ -336,7 +336,7 @@ pub unsafe extern "C" fn _start() -> u64 {
                         (call_table.debug_print)(
                             b"compare: LUKS key derivation failed\n\0".as_ptr(),
                         );
-                        let result = CompareResult::failure(CompareResult::FLAG_SETUP_FAILED, 0);
+                        let result = CompareResult::setup_failed();
                         (call_table.send_compare_result)(&result);
                         (call_table.send_complete)(b"compare\0".as_ptr(), bytes_read, false);
                         return bytes_read;
@@ -346,7 +346,7 @@ pub unsafe extern "C" fn _start() -> u64 {
                 (call_table.debug_print)(
                     b"compare: LUKS-encrypted QCOW2 requires --luks-passphrase\n\0".as_ptr(),
                 );
-                let result = CompareResult::failure(CompareResult::FLAG_SETUP_FAILED, 0);
+                let result = CompareResult::setup_failed();
                 (call_table.send_compare_result)(&result);
                 (call_table.send_complete)(b"compare\0".as_ptr(), bytes_read, false);
                 return bytes_read;
@@ -404,10 +404,8 @@ pub unsafe extern "C" fn _start() -> u64 {
                 1,
             );
             // A failed read is not a difference (issue #807).
-            let mut result =
-                CompareResult::failure(CompareResult::FLAG_READ_FAILED, virtual_offset);
-            result.total_bytes_compared = virtual_offset;
-            (call_table.send_compare_result)(&result);
+            let failed = CompareResult::read_failed(false, virtual_offset);
+            (call_table.send_compare_result)(&failed);
             (call_table.send_complete)(b"compare\0".as_ptr(), bytes_read, false);
             return bytes_read;
         }
@@ -445,12 +443,8 @@ pub unsafe extern "C" fn _start() -> u64 {
                 1,
             );
             // A failed read is not a difference (issue #807).
-            let mut result = CompareResult::failure(
-                CompareResult::FLAG_READ_FAILED | CompareResult::FLAG_FAILED_IMAGE2,
-                virtual_offset,
-            );
-            result.total_bytes_compared = virtual_offset;
-            (call_table.send_compare_result)(&result);
+            let failed = CompareResult::read_failed(true, virtual_offset);
+            (call_table.send_compare_result)(&failed);
             (call_table.send_complete)(b"compare\0".as_ptr(), bytes_read, false);
             return bytes_read;
         }
@@ -547,16 +541,21 @@ pub unsafe extern "C" fn _start() -> u64 {
             }
 
             if extra_read_failed {
-                let image_flag = if extra_chain_start == 0 {
-                    0
-                } else {
-                    CompareResult::FLAG_FAILED_IMAGE2
-                };
-                let mut failed = CompareResult::failure(
-                    CompareResult::FLAG_READ_FAILED | image_flag,
-                    extra_offset,
+                // The same report as a failed read in the main loop: an
+                // error line for --verbose, and a result that names the
+                // image and the offset reached.
+                let image2 = extra_chain_start != 0;
+                (call_table.send_error)(
+                    b"compare\0".as_ptr(),
+                    if image2 {
+                        b"input1\0".as_ptr()
+                    } else {
+                        b"input0\0".as_ptr()
+                    },
+                    extra_offset / sector_size as u64,
+                    1,
                 );
-                failed.total_bytes_compared = compare_size;
+                let failed = CompareResult::read_failed(image2, extra_offset);
                 (call_table.send_compare_result)(&failed);
                 (call_table.send_complete)(b"compare\0".as_ptr(), bytes_read, false);
                 return bytes_read;

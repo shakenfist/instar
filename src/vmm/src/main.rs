@@ -1339,12 +1339,15 @@ mod differencing_parent_classification_tests {
     #[test]
     fn chain_use_variants_are_copy_and_distinct() {
         let compose = ChainUse::Compose;
+        let top_only = ChainUse::ComposeTopOnly;
         let report = ChainUse::Report;
         // `Copy`: reading `compose` again after this binding must not
         // be a move.
         let compose_again = compose;
         assert_eq!(compose, compose_again);
         assert_ne!(compose, report);
+        assert_ne!(compose, top_only);
+        assert_ne!(top_only, report);
     }
 
     // --- classify_parent_walk -----------------------------------------
@@ -3186,6 +3189,14 @@ enum ChainUse {
     /// The caller goes on to attach the chain as virtio devices and
     /// launch a guest.
     Compose,
+    /// The caller attaches the chain and launches a guest that reads
+    /// only the top image: the ancestor slots are populated and never
+    /// read. `commit` walks its backing's ancestors this way. A backing
+    /// image's external data file is refused for [`ChainUse::Compose`]
+    /// because a read through that image would fail with no reason
+    /// given (issue #806); nothing reads through an ancestor here, so
+    /// refusing would withdraw a command that works.
+    ComposeTopOnly,
     /// The caller only prints the chain and returns.
     Report,
 }
@@ -3368,7 +3379,7 @@ fn classify_parent_walk(
         // behind it could do with one, because it has no refusal to
         // make contingent on the parent's presence.
         ChainUse::Report => ParentWalk::ResolveOrEndListing,
-        ChainUse::Compose => match differencing_composition {
+        ChainUse::Compose | ChainUse::ComposeTopOnly => match differencing_composition {
             DifferencingComposition::Supported => ParentWalk::Resolve,
             DifferencingComposition::Unsupported => ParentWalk::RecordWithoutResolving,
         },
@@ -3515,7 +3526,9 @@ fn discover_backing_chain(
         // of a cluster it maps would fail in the guest with no reason
         // given -- "convert operation failed", "Input/output error", a
         // rebase blaming the overlay's header (issue #806). A reporting
-        // caller reads nothing, so it lists the chain as before.
+        // caller reads nothing, so it lists the chain as before, and a
+        // caller that reads only the top image (commit's walk of its
+        // backing's ancestors) never reads through the backing either.
         // The data file path is untrusted (parsed from the QCOW2 header
         // inside the sandbox), so we validate it against the allowlist.
         let mut data_files = Vec::new();
@@ -8314,12 +8327,14 @@ fn run_commit(args: CommitArgs, verbose: bool) -> Result<(), Box<dyn std::error:
     // the ancestor slots the host populates here, so a differencing
     // parent is nothing it would ever open. Resolving one could only
     // turn a command that works today into a path error whenever the
-    // parent is absent.
+    // parent is absent. For the same reason an ancestor's external data
+    // file is not refused: `ComposeTopOnly` says nothing reads through
+    // these slots.
     let backing_chain_full = discover_backing_chain(
         &resolved_backing_path,
         sector_size,
         &security_config,
-        ChainUse::Compose,
+        ChainUse::ComposeTopOnly,
         DifferencingComposition::Unsupported,
     )
     .map_err(|e| -> Box<dyn std::error::Error> { format!("commit: {e}").into() })?;
@@ -13984,9 +13999,7 @@ fn compare_images(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::e
                                 if let Some(guest_::GuestMessage_::Payload::CompareResult(result)) =
                                     &msg.payload
                                 {
-                                    let failure_flags = shared::CompareResult::FLAG_SETUP_FAILED
-                                        | shared::CompareResult::FLAG_READ_FAILED;
-                                    if result.flags & failure_flags != 0 {
+                                    if shared::CompareResult::flags_report_failure(result.flags) {
                                         compare_failure =
                                             Some((result.flags, result.first_mismatch_offset));
                                     } else {

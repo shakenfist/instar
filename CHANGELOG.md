@@ -429,6 +429,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **`instar compare` errors exit 2 or 4, never 1.** Exit 1 now means
+  the images differ and nothing else. An image that cannot be opened or
+  a comparison that cannot be set up (a missing file, a discovery error,
+  an unsupported feature, a LUKS image without its passphrase, the
+  differencing refusal) exits 2, and a read that fails part-way exits 4,
+  as qemu-img compare does. A failure prints no verdict on stdout; it
+  used to print `Content mismatch at offset 0!` and exit 1
+  ([#807](https://github.com/shakenfist/instar/issues/807)). Scripts
+  that treated any non-zero exit as "differ" should check for 1. See
+  `docs/compare.md`.
+
+- **`instar info` reports a Windows drive-letter or UNC backing
+  reference as recorded.** It no longer prints an `(actual path: …)`
+  joined onto the image directory, and JSON's `full-backing-filename`
+  repeats the reference instead of a path that cannot exist
+  ([#658](https://github.com/shakenfist/instar/issues/658)). See
+  `docs/info.md`.
+
 - **The nightly stestr timing refresh publishes only a move that
   persists across two measurements, taken after the distro legs rather
   than beside them.** The first three refreshes showed the committed
@@ -784,6 +802,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   fixed by hand.
 
 ### Fixed
+
+- **`instar map` refuses an extent in a state the guest cannot name**,
+  exiting 1 with the offset and the state, instead of printing it as a
+  data extent ([#816](https://github.com/shakenfist/instar/issues/816)).
+  See `docs/map.md`.
+
+- **`instar commit` names the backing when the backing's external data
+  file is why it refuses.** A new result code (18) replaces the overlay's
+  message, which blamed an overlay that has no data file
+  ([#815](https://github.com/shakenfist/instar/issues/815)).
+
+- **A chain whose backing image has an external data file is refused by
+  name** by `convert`, `dd`, `compare`, `bench`, `rebase` and
+  `check --chain`, which used to fail with no reason given. `info --chain`
+  still lists the chain, and `commit` still commits over a backing whose
+  own ancestor has one, since it never reads through it. Attaching such
+  a data file is still to do
+  ([#806](https://github.com/shakenfist/instar/issues/806)).
 
 - **A VHDX larger than 64 TiB is refused by name**, as qemu-img refuses
   to create one, in `create`, `convert`, `dd`, `measure -O vhdx` and
