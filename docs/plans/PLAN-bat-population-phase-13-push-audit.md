@@ -207,16 +207,31 @@ first commit.
    same scripts, which decision 3 does cover. The phase says so rather
    than implying coverage it does not have.
 
-5. **Findings are recorded here and fixed in a follow-up pull request.**
-   Per the shared block and the `implement-phase` skill. The exception
-   is a finding that makes this phase's own record wrong, which is fixed
-   here. The plan is not complete until the findings are resolved or
-   declined in writing, so the follow-up pull request is what marks the
-   plan `Complete` and fills in this phase's `Merged` cell, which this
-   phase leaves empty because its own merge commit is not knowable while
-   it is being written. Two of the three push-audit phases already in
-   this repository carry a filled cell and one is empty; the filled ones
-   were filled afterwards, which is the same thing.
+5. **Findings are recorded and fixed in this phase.** This reverses
+   what this plan originally decided, on Mikal's instruction at the back
+   brief. The shared block and the `implement-phase` skill both say a
+   push audit records its findings and a follow-up pull request resolves
+   them, and the reason is that an audit-plus-fixes diff stops being
+   reviewable as an audit. That cost was put to him and he chose to
+   accept it, so the fixes land here and there is no follow-up pull
+   request to wait for.
+
+   Two consequences follow and are handled rather than left implicit.
+   This phase therefore *does* change code, so the definition-of-done
+   item asserting it changed none is replaced by one bounding what it
+   may change. And this phase's own pull request is what marks the plan
+   `Complete`; its `Merged` cell stays empty, because a phase cannot
+   know its own merge commit while it is being written, and whoever
+   next touches the plan fills it in. Two of the three push-audit
+   phases already in this repository carry a filled cell and one is
+   empty; the filled ones were filled afterwards, which is the same
+   thing.
+
+   The audit steps themselves are still readers. Nothing in 2a to 2e
+   may change a file: findings come back as reports, the management
+   session triages them, and the fixes are made afterwards as their own
+   commits so that the audit and its remedies stay separable in the
+   history even though they share a pull request.
 
 6. **The four judgement steps run in parallel.** They are read-only, so
    they cannot collide in the worktree, and none consumes another's
@@ -271,9 +286,11 @@ the management session.
   `PUSH-AUDIT.md` and what was done instead.
 * A "Coverage this audit did not have" section exists and names at least
   the integration suite and the mutation harnesses.
-* This phase changed no code: `git diff --name-only origin/develop --
-  src/ tests/ tools/ scripts/` is empty, and the only files it changed
-  are `docs/plans/PLAN-bat-population*.md` and `docs/plans/index.md`.
+* Every file this phase changed outside `docs/plans/` is traceable to a
+  recorded finding: for each path in `git diff --name-only
+  origin/develop`, either it is a plan file, or the "Audit findings"
+  section names the finding it fixes. A fix with no finding behind it is
+  scope creep and is reverted.
 * Phase 13's row leaves its `Merged` cell empty, for the follow-up
   pull request to fill once this phase has merged.
 
@@ -296,7 +313,9 @@ Answer before any step runs:
 
 ## Out of scope
 
-* Fixing anything the audit finds (decision 5).
+* Nothing the audit finds is out of scope to fix, by the back brief's
+  instruction -- but a fix still needs a finding behind it. Something
+  noticed in passing that no audit step reported is filed, not fixed.
 * The 17,271 generated `expected-outputs` files in `instar-testdata`
   (decision 3).
 * Re-auditing phase 2's `instar-testdata` fixtures (decision 4).
