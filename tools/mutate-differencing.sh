@@ -2244,14 +2244,14 @@ integration_case 'commit-host-capability-reverted-to-supported' "${VMM_MAIN}" \
         &resolved_backing_path,
         sector_size,
         &security_config,
-        ChainUse::Compose,
+        ChainUse::ComposeTopOnly,
         DifferencingComposition::Unsupported,
     )' \
     '    let backing_chain_full = discover_backing_chain(
         &resolved_backing_path,
         sector_size,
         &security_config,
-        ChainUse::Compose,
+        ChainUse::ComposeTopOnly,
         DifferencingComposition::Supported, // MUTATED
     )' \
     "${COMMIT_ANCESTOR_ABSENT}"
