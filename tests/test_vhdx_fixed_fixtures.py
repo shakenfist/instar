@@ -38,7 +38,11 @@ whole block.
 while instar reads every image here as qemu-img does; a listed pair must
 still fail, with the message recorded there, and once instar reads it
 correctly the test fails and asks for the entry to be removed, so a fix
-shows up here rather than going unnoticed.
+shows up here rather than going unnoticed. Because the dict is empty, the
+two checks that police it — `unrun_known_failures` and
+`known_read_problem` — would assert nothing against the live data, so each
+is a plain function proven here against literal entries that are stale in
+each of the ways it must catch.
 """
 
 import json
@@ -273,6 +277,35 @@ def _virtual_disk(path: Path) -> bytes:
     return bytes(disk)
 
 
+def unrun_known_failures(known_failures, matrix):
+    """The (image, operation) pairs `known_failures` lists that `matrix` does not run, sorted.
+
+    A pair naming an image the matrix has no row for, or an operation the
+    matrix does not run for that image, is never exercised: nothing would
+    notice if instar started reading it correctly, or began failing some
+    other way. Empty while every recorded pair has a test behind it.
+    """
+    return sorted(pair for pair in known_failures if pair[1] not in matrix.get(pair[0], ()))
+
+
+def known_read_problem(image_name, op, issue, message, problems, output):
+    """Why the KNOWN_READ_FAILURES entry for (`image_name`, `op`) is stale, or None while it still holds.
+
+    `problems` and `output` are what the operation's oracle returned. A read
+    with no problems has been fixed, and one that fails without the recorded
+    message has changed; either way the entry no longer describes instar, so
+    it must be removed or rewritten rather than left to excuse a failure
+    nobody has looked at.
+    """
+    if not problems:
+        return (f'instar {op} now reads {image_name} correctly, so #{issue} looks fixed: remove this entry, '
+                f'({image_name!r}, {op!r}), from KNOWN_READ_FAILURES')
+    if message not in output:
+        return (f'instar {op} on {image_name} fails, but not with the message KNOWN_READ_FAILURES records for '
+                f'#{issue} ({message!r}): {problems}')
+    return None
+
+
 def _map_coverage_problems(extents, virtual_size):
     """Why `extents` do not tile `[0, virtual_size)` exactly, or nothing if they do."""
     position = 0
@@ -471,12 +504,9 @@ class TestVhdxFixedReads(InstarTestBase):
             self.assertEqual([], problems, f'instar {op} misreads {image_name}')
             return
         issue, message = known
-        if not problems:
-            self.fail(f'instar {op} now reads {image_name} correctly, so #{issue} looks fixed: remove this entry, '
-                      f'({image_name!r}, {op!r}), from KNOWN_READ_FAILURES')
-        if message not in output:
-            self.fail(f'instar {op} on {image_name} fails, but not with the message KNOWN_READ_FAILURES records for '
-                      f'#{issue} ({message!r}): {problems}')
+        problem = known_read_problem(image_name, op, issue, message, problems, output)
+        if problem is not None:
+            self.fail(problem)
 
     def test_map_coverage_finds_gaps_overlaps_and_short_ends(self):
         """The map oracle accepts only extents that tile the virtual disk exactly."""
@@ -611,8 +641,51 @@ class TestVhdxFixedReads(InstarTestBase):
 
     def test_known_failures_are_in_the_matrix(self):
         """Every KNOWN_READ_FAILURES entry names a pair the matrix runs, so none is silently unchecked."""
-        unrun = sorted(pair for pair in KNOWN_READ_FAILURES if pair[1] not in READ_MATRIX.get(pair[0], ()))
-        self.assertEqual([], unrun)
+        self.assertEqual([], unrun_known_failures(KNOWN_READ_FAILURES, READ_MATRIX))
+
+    def test_known_failure_matrix_check_rejects_an_unrun_image(self):
+        """An entry naming an image the matrix has no row for is reported as unrun."""
+        pair = ('vhdx-fixed-no-such-image', OP_CHECK)
+        self.assertNotIn(pair[0], READ_MATRIX)
+        self.assertEqual([pair], unrun_known_failures({pair: (626, 'nothing reads this')}, READ_MATRIX))
+
+    def test_known_failure_matrix_check_rejects_an_unrun_operation(self):
+        """An entry naming an operation the matrix does not run for its image is reported as unrun.
+
+        The dynamic image at the #626 geometry gets only the metadata
+        operations, because converting 128 GiB would read the whole disk, so
+        a convert entry for it would never run.
+        """
+        pair = (DYNAMIC_131041M, OP_CONVERT)
+        self.assertNotIn(OP_CONVERT, READ_MATRIX[DYNAMIC_131041M])
+        self.assertEqual([pair], unrun_known_failures({pair: (626, 'nothing reads this')}, READ_MATRIX))
+
+    def test_known_failure_matrix_check_accepts_a_pair_the_matrix_runs(self):
+        """An entry naming an image and an operation the matrix pairs is not reported."""
+        pair = (DYNAMIC_131041M, OP_CHECK)
+        self.assertIn(OP_CHECK, READ_MATRIX[DYNAMIC_131041M])
+        self.assertEqual([], unrun_known_failures({pair: (626, 'a read that still fails')}, READ_MATRIX))
+
+    def test_known_read_check_rejects_a_passing_read(self):
+        """A recorded failure the oracle now finds no problem with asks for its entry to be removed."""
+        problem = known_read_problem(DYNAMIC_131041M, OP_CHECK, 626, 'BAT entry out of range', [], 'no problems')
+        self.assertIsNotNone(problem, 'a recorded failure that now passes must be reported')
+        self.assertIn('remove this entry', problem)
+        self.assertIn('#626', problem)
+
+    def test_known_read_check_rejects_a_different_failure(self):
+        """A recorded failure that now fails some other way no longer matches its entry."""
+        problem = known_read_problem(DYNAMIC_131041M, OP_CHECK, 626, 'BAT entry out of range',
+                                     ['instar check exited 2: unrecognised format'],
+                                     '[GUEST] check: unrecognised format')
+        self.assertIsNotNone(problem, 'a recorded failure with a different message must be reported')
+        self.assertIn('not with the message', problem)
+
+    def test_known_read_check_accepts_the_recorded_failure(self):
+        """A recorded failure that still fails, with the message recorded for it, is accepted."""
+        self.assertIsNone(known_read_problem(DYNAMIC_131041M, OP_CHECK, 626, 'BAT entry out of range',
+                                             ['instar check exited 2: BAT entry out of range'],
+                                             '[GUEST] check: BAT entry out of range'))
 
 
 def _make_read_test(image_name, op):
