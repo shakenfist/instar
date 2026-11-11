@@ -14202,45 +14202,6 @@ fn compute_output_capacity(
     }
 }
 
-/// Open a fixed VHDX convert's output, extended sparsely to its final
-/// length.
-///
-/// Mirrors create's `open_fixed_vhdx_output`: `BackingStore::open`
-/// creates (or truncates) the file and `set_len`s it to the fixed file
-/// length the layout gives, before the guest runs. The device is then
-/// exactly that long, so the guest cannot leave the file the wrong
-/// length, and the guest's own capacity check catches a host that sized
-/// it differently. When the filesystem refuses the length with `EFBIG`
-/// the empty file the open created is removed, and the error names the
-/// file length that could not be stored.
-///
-/// `virtual_size` is the output's virtual size before 512-byte rounding;
-/// the message reports the rounded size the layout records, matching
-/// create's wording.
-fn open_fixed_vhdx_convert_output(
-    path: &Path,
-    filename: &str,
-    virtual_size: u64,
-    block_size: u32,
-) -> Result<BackingStore, Box<dyn std::error::Error>> {
-    let geometry = vhdx::layout(virtual_size, block_size, false).map_err(|e| {
-        format!("convert: cannot lay out a fixed VHDX of {virtual_size} bytes: {e:?}")
-    })?;
-    BackingStore::open(path, false, Some(geometry.fixed_file_length), false).map_err(|e| {
-        if e.raw_os_error() == Some(libc::EFBIG) {
-            let _ = std::fs::remove_file(path);
-            format!(
-                "convert: a fixed VHDX of {} bytes needs a {}-byte file, which the filesystem \
-                 holding '{}' cannot store: {}",
-                geometry.virtual_size, geometry.fixed_file_length, filename, e
-            )
-            .into()
-        } else {
-            format!("convert: open '{}' for write failed: {}", filename, e).into()
-        }
-    })
-}
-
 fn run_convert(args: ConvertArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Parse and validate output format
     let target_format = parse_output_format(&args.output_format)?;
@@ -14732,14 +14693,15 @@ fn execute_convert(
         // A fixed VHDX's file is as long as qemu-img's from the start, so
         // the device is exactly that long and the file is extended to it
         // before the guest runs. `output_capacity` is the layout's file
-        // length (compute_output_capacity's fixed branch). An EFBIG from
-        // the filesystem is refused by name, as create's fixed output is.
-        open_fixed_vhdx_convert_output(
-            &output_file_path,
-            &exec.output,
-            capacity_vsize,
-            exec.output_block_size,
-        )?
+        // length (compute_output_capacity's fixed branch). The layout is
+        // computed here, as create computes its own, so both pass the
+        // same geometry to the shared opener; an EFBIG from the
+        // filesystem is then refused by name for both.
+        let geometry =
+            vhdx::layout(capacity_vsize, exec.output_block_size, false).map_err(|e| {
+                format!("convert: cannot lay out a fixed VHDX of {capacity_vsize} bytes: {e:?}")
+            })?;
+        open_fixed_vhdx_output("convert", &output_file_path, &exec.output, &geometry)?
     } else if is_structured_output {
         BackingStore::open(
             &output_file_path,
@@ -18922,7 +18884,7 @@ fn run_create_nonraw(args: &CreateArgs, verbose: bool) -> Result<(), Box<dyn std
     let fixed_vhdx = fixed_vhdx_geometry(args, virtual_size, block_size);
     let (output_backing, output_capacity_hint) = match fixed_vhdx {
         Some(geometry) => (
-            open_fixed_vhdx_output(output_path, &args.filename, &geometry)?,
+            open_fixed_vhdx_output("create", output_path, &args.filename, &geometry)?,
             geometry.fixed_file_length,
         ),
         None => {
@@ -19228,11 +19190,20 @@ fn fixed_vhdx_geometry(
 
 /// Open a fixed VHDX's output, extended sparsely to its final length.
 ///
-/// `BackingStore::open` creates (or truncates) the file and then sets its
-/// length. When the filesystem refuses the length with `EFBIG` the file is
-/// removed again, so a refused create leaves nothing behind, and the
-/// error says what was asked for and why it could not be stored.
+/// `BackingStore::open` creates (or truncates) the file and `set_len`s it
+/// to the fixed file length the layout gives, before the guest runs. The
+/// device is then exactly that long, so the guest cannot leave the file
+/// the wrong length, and the guest's own capacity check catches a host
+/// that sized it differently. When the filesystem refuses the length with
+/// `EFBIG` the file is removed again, so a refused open leaves nothing
+/// behind, and the error says what was asked for and why it could not be
+/// stored.
+///
+/// Both create and convert write fixed VHDX output and open it this way;
+/// `op` is the subcommand, which prefixes the message, so the two report
+/// the same failure in the same words.
 fn open_fixed_vhdx_output(
+    op: &str,
     path: &Path,
     filename: &str,
     geometry: &vhdx::VhdxLayout,
@@ -19241,26 +19212,32 @@ fn open_fixed_vhdx_output(
         if e.raw_os_error() == Some(libc::EFBIG) {
             let _ = std::fs::remove_file(path);
         }
-        fixed_vhdx_open_error(&e, filename, geometry).into()
+        fixed_vhdx_open_error(op, &e, filename, geometry).into()
     })
 }
 
 /// The message for a failure to open a fixed VHDX's output at its final
 /// length: a file too large for the filesystem is named as that, and
-/// anything else keeps the message every create output open gives.
+/// anything else keeps the message every output open gives. `op` is the
+/// subcommand, which prefixes the message.
+///
+/// The size reported is the one the layout records, which is the
+/// requested virtual size rounded up to 512 bytes, as the image declares
+/// it.
 fn fixed_vhdx_open_error(
+    op: &str,
     e: &std::io::Error,
     filename: &str,
     geometry: &vhdx::VhdxLayout,
 ) -> String {
     if e.raw_os_error() == Some(libc::EFBIG) {
         format!(
-            "create: a fixed VHDX of {} bytes needs a {}-byte file, which the filesystem \
+            "{op}: a fixed VHDX of {} bytes needs a {}-byte file, which the filesystem \
              holding '{}' cannot store: {}",
             geometry.virtual_size, geometry.fixed_file_length, filename, e
         )
     } else {
-        format!("create: open '{}' for write failed: {}", filename, e)
+        format!("{op}: open '{}' for write failed: {}", filename, e)
     }
 }
 
@@ -21329,7 +21306,7 @@ mod create_option_tests {
         let path = dir.path().join("f.vhdx");
         std::fs::write(&path, b"old contents").unwrap();
         let geometry = vhdx::layout(64 * 1024 * 1024, 0, false).unwrap();
-        let backing = open_fixed_vhdx_output(&path, "f.vhdx", &geometry).unwrap();
+        let backing = open_fixed_vhdx_output("create", &path, "f.vhdx", &geometry).unwrap();
         assert_eq!(backing.size(), geometry.fixed_file_length);
         assert!(!backing.is_sparse());
         drop(backing);
@@ -21346,7 +21323,7 @@ mod create_option_tests {
     fn fixed_vhdx_open_error_names_a_file_too_large_for_the_filesystem() {
         let geometry = vhdx::layout(16 << 40, 0, false).unwrap();
         let efbig = std::io::Error::from_raw_os_error(libc::EFBIG);
-        let message = fixed_vhdx_open_error(&efbig, "big.vhdx", &geometry);
+        let message = fixed_vhdx_open_error("create", &efbig, "big.vhdx", &geometry);
         assert_eq!(
             message,
             format!(
@@ -21359,8 +21336,35 @@ mod create_option_tests {
         );
         let eacces = std::io::Error::from_raw_os_error(libc::EACCES);
         assert_eq!(
-            fixed_vhdx_open_error(&eacces, "big.vhdx", &geometry),
+            fixed_vhdx_open_error("create", &eacces, "big.vhdx", &geometry),
             format!("create: open 'big.vhdx' for write failed: {}", eacces)
+        );
+    }
+
+    #[test]
+    fn fixed_vhdx_open_error_names_convert_when_convert_asked() {
+        // convert opens its fixed VHDX output through the same helper, so
+        // its messages differ from create's only in the subcommand that
+        // prefixes them. Spelled out here rather than built from the
+        // argument, so a prefix that went missing or named the wrong
+        // subcommand fails this test.
+        let geometry = vhdx::layout(16 << 40, 0, false).unwrap();
+        let efbig = std::io::Error::from_raw_os_error(libc::EFBIG);
+        let message = fixed_vhdx_open_error("convert", &efbig, "big.vhdx", &geometry);
+        assert_eq!(
+            message,
+            format!(
+                "convert: a fixed VHDX of {} bytes needs a {}-byte file, which the filesystem \
+                 holding 'big.vhdx' cannot store: {}",
+                16u64 << 40,
+                geometry.fixed_file_length,
+                efbig
+            )
+        );
+        let eacces = std::io::Error::from_raw_os_error(libc::EACCES);
+        assert_eq!(
+            fixed_vhdx_open_error("convert", &eacces, "big.vhdx", &geometry),
+            format!("convert: open 'big.vhdx' for write failed: {}", eacces)
         );
     }
 

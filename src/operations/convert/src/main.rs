@@ -4980,6 +4980,14 @@ unsafe fn convert_to_vhdx(
 /// `#[inline(never)]` for the reason `run_amend` gives (and create's
 /// `emit_vhdx_fixed_bat` repeats): a large function inlined into `_start`
 /// has miscompiled before on `x86_64-unknown-none`.
+///
+/// # Safety
+///
+/// `call_table` must be valid, with the input devices of
+/// `input_device_count` and the output device attached. Nothing else may
+/// be using `layout.buf_multipurpose`, over which this builds mutable
+/// slices of `MAX_SECTOR_SIZE` and `vhdx::HEADER_SIZE` bytes, or
+/// `layout.buf_data`.
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
 unsafe fn convert_to_vhdx_fixed(
