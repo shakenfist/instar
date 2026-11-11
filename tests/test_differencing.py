@@ -3695,6 +3695,39 @@ class TestDifferencingAdversarialLocators(DifferencingTestBase):
                     f'failing; stderr={stderr!r}'
                 )
 
+    def test_info_joins_no_actual_path_onto_a_windows_absolute_locator(self):
+        """A UNC parent is reported as recorded, never resolved into a path.
+
+        `info` shows where a relative reference resolves, as qemu-img
+        does. A Windows drive-letter or UNC reference is not
+        POSIX-absolute, so it used to be joined onto the image's
+        directory, and `info` printed an "actual path" of the image
+        directory followed by `\\attacker\share\probe` -- a file that
+        cannot exist (issue #658). In both renderings the reference is
+        now treated as the absolute path it is in its own convention.
+        """
+        source = self.differencing_image('vhd-diff-locator-unc')
+        unc = '\\\\attacker\\share\\probe'
+
+        stdout, stderr, rc = self.run_instar_info(source)
+        self.assertEqual(0, rc, f'info must not refuse; stderr={stderr!r}')
+        self.assertIn(
+            f'backing file: {unc}\n', stdout,
+            f'the UNC reference must be reported alone; stdout={stdout!r}')
+        self.assertNotIn(
+            '(actual path:', stdout,
+            f'a Windows absolute reference resolves to no host path; '
+            f'stdout={stdout!r}')
+
+        stdout, stderr, rc = self.run_instar_info(source, output_format='json')
+        self.assertEqual(0, rc, f'info must not refuse; stderr={stderr!r}')
+        data = json.loads(stdout)
+        self.assertEqual(unc, data.get('backing-filename'), f'{data!r}')
+        self.assertEqual(
+            unc, data.get('full-backing-filename'),
+            f'full-backing-filename must not join the UNC reference onto '
+            f'the image directory; {data!r}')
+
     def test_info_json_names_the_parent_as_a_vhd(self):
         """`backing-filename-format` says vpc, not qcow2.
 

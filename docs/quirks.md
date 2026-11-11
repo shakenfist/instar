@@ -5030,12 +5030,12 @@ rather than fixed, because none of them was that change's job to close:
    compose its sectors into their own read. See
    [chain-discovery.md](chain-discovery.md#known-limitations) for the
    current policy.
-2. **`instar info` prints an unresolvable "actual path" for a parent
-   recorded in Windows convention — in either format.** The host's
-   "actual path" resolution treats any string that is not POSIX-absolute
-   as relative and joins it onto the image's directory, so a parent name
-   carrying backslashes becomes a single literal filename that cannot
-   exist on the filesystem. This was originally recorded as a VHDX-only
+2. **`instar info` printed an unresolvable "actual path" for a parent
+   recorded in Windows convention — in either format** (fixed for
+   absolute references). The host's "actual path" resolution treated
+   any string that is not POSIX-absolute as relative and joined it onto
+   the image's directory, so a parent name carrying backslashes became
+   a single literal filename that cannot exist on the filesystem. This was originally recorded as a VHDX-only
    limitation, on the strength of an instar-created child reporting
    `.\vhdx-diff-parent.vhdx`; that particular case is now closed. `info`
    renders the VHDX `relative_path` locator key back into POSIX
@@ -5048,12 +5048,16 @@ rather than fixed, because none of them was that change's job to close:
    in either direction. The adversarial fixture `vhd-diff-locator-unc`
    is the concrete case — a VHD whose parent name is
    `\\attacker\share\probe`, reported exactly as stored
-   (`ADVERSARIAL_LOCATOR_FIXTURES` in `tests/test_differencing.py`) and
-   then joined onto the image
-   directory. Fixing it is path normalisation and needs a decision
-   rather than a guard, so it is tracked in
-   [issue #658](https://github.com/shakenfist/instar/issues/658). See
-   [info.md](info.md#known-limitations).
+   (`ADVERSARIAL_LOCATOR_FIXTURES` in `tests/test_differencing.py`),
+   which used to be joined onto the image directory. A Windows absolute
+   reference -- a drive letter, or anything rooted at `\\` -- is now
+   classified as absolute, as the reporting walk already classified it
+   ("a Windows absolute path and cannot be resolved on this host"), so
+   `info` prints no "actual path" for it and JSON's
+   `full-backing-filename` repeats it verbatim
+   ([issue #658](https://github.com/shakenfist/instar/issues/658)). A
+   relative reference in Windows convention is still joined without
+   being normalised. See [info.md](info.md#known-limitations).
 3. **`instar resize` accepted a differencing VHDX** (fixed). This was a
    write path, predated the differencing work, and `resize` never called
    `VhdxState::init`, so the read-side refusal neither caused it nor fixed

@@ -1455,6 +1455,18 @@ mod differencing_parent_classification_tests {
         assert!(!is_windows_absolute_reference("\u{e9}:\\foo"));
     }
 
+    #[test]
+    fn backing_reference_is_absolute_in_either_convention() {
+        // #658: a Windows absolute reference must not be joined onto
+        // the image directory as though it were relative.
+        assert!(backing_reference_is_absolute("/abs/parent.vhdx"));
+        assert!(backing_reference_is_absolute(r"C:\images\parent.vhdx"));
+        assert!(backing_reference_is_absolute(r"\\attacker\share\probe"));
+        assert!(!backing_reference_is_absolute("parent.vhdx"));
+        assert!(!backing_reference_is_absolute("../sub/parent.vhdx"));
+        assert!(!backing_reference_is_absolute("C:/unix/style"));
+    }
+
     // --- resolve_reported_parent: Windows-absolute classification ------
 
     #[test]
@@ -2171,8 +2183,9 @@ fn print_info_result(
         if info.flags & INFO_RESULT_FLAG_HAS_BACKING_FILE != 0 && !info.backing_file.is_empty() {
             let backing_file_str = info.backing_file.as_str();
             // If backing file is relative, show both the stored name and actual path
-            // (qemu-img shows "backing file: <name> (actual path: <resolved>)")
-            if !std::path::Path::new(backing_file_str).is_absolute() {
+            // (qemu-img shows "backing file: <name> (actual path: <resolved>)").
+            // A Windows absolute reference is not relative, whatever POSIX says.
+            if !backing_reference_is_absolute(backing_file_str) {
                 // Resolve relative to image's directory
                 let image_dir = std::path::Path::new(&abs_path)
                     .parent()
@@ -2823,7 +2836,7 @@ fn print_info_result_json(
         // full-backing-filename is the resolved absolute path
         // If backing_file is relative, resolve it relative to the image's directory
         let backing_file_str = info.backing_file.as_str();
-        let full_backing_filename = if std::path::Path::new(backing_file_str).is_absolute() {
+        let full_backing_filename = if backing_reference_is_absolute(backing_file_str) {
             backing_file_str.to_string()
         } else {
             // Get the directory containing the image file
@@ -3287,6 +3300,19 @@ fn is_windows_absolute_reference(reference: &str) -> bool {
     }
     let bytes = reference.as_bytes();
     bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\'
+}
+
+/// Is this backing reference absolute, in either convention?
+///
+/// `info` joins a relative reference onto the image's directory to show
+/// where it resolves, as qemu-img does. A Windows drive-letter or UNC
+/// reference is not POSIX-absolute either, so a POSIX test alone sent it
+/// down the relative branch and printed a joined path such as
+/// `/images/C:\parent.vhdx`, a file that cannot exist (issue #658).
+/// Such a reference is absolute in its own convention, and like a POSIX
+/// absolute one it is reported only as the image records it.
+fn backing_reference_is_absolute(reference: &str) -> bool {
+    Path::new(reference).is_absolute() || is_windows_absolute_reference(reference)
 }
 
 /// Resolve a differencing parent for a caller that only reports the
