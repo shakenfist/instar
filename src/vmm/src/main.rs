@@ -17227,17 +17227,20 @@ fn run_map(args: MapArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error
 /// a host cluster, so emit `offset` as qemu-img does for qcow2
 /// ZERO_ALLOC and UNALLOCATED_ALLOC (`block/qcow2.c:2171-2177` at
 /// qemu v10.0.0).
-fn map_state_triple(state: &str) -> (bool, bool, bool, bool) {
+///
+/// Any other string is `None`. That includes the guest's own
+/// `"unknown"`, which `send_map_extent` sends for a record state it
+/// cannot name, so it marks a guest bug rather than a property of the
+/// image. The caller refuses it: rendering it as anything would print
+/// a plausible extent the guest never described (issue #816).
+fn map_state_triple(state: &str) -> Option<(bool, bool, bool, bool)> {
     match state {
-        "hole" => (false, true, false, false),
-        "zero" => (true, true, false, false),
-        "data" => (true, false, true, true),
-        "zero-at" => (true, true, false, true),
-        "hole-at" => (false, true, false, true),
-        // Defensive fallback for an unknown state code (the guest
-        // emits only the five above). Treat as data so the offset
-        // is preserved for debugging.
-        _ => (true, false, true, true),
+        "hole" => Some((false, true, false, false)),
+        "zero" => Some((true, true, false, false)),
+        "data" => Some((true, false, true, true)),
+        "zero-at" => Some((true, true, false, true)),
+        "hole-at" => Some((false, true, false, true)),
+        _ => None,
     }
 }
 
@@ -17363,8 +17366,24 @@ impl<'a, W: std::io::Write> MapRenderer<'a, W> {
     /// Write one extent's representation. Human mode emits a row
     /// only when `data: true`; JSON mode emits every extent with
     /// the qemu-img-compatible field set.
+    ///
+    /// An extent in a state [`map_state_triple`] does not recognise is
+    /// an `InvalidData` error, which the caller propagates as a map
+    /// failure, and nothing is written for it.
     fn emit_extent(&mut self, ext: &guest_::MapExtentMessage) -> std::io::Result<()> {
-        let (present, zero, data, has_offset) = map_state_triple(&ext.state);
+        let Some((present, zero, data, has_offset)) = map_state_triple(&ext.state) else {
+            // The state string came from the guest, so it is escaped
+            // before it reaches the terminal.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "map: the guest reported an extent at offset {} in an unrecognised \
+                     state '{}'; refusing to render it as data",
+                    ext.start,
+                    terminal_safe(&ext.state)
+                ),
+            ));
+        };
         match self.output_format {
             MapOutputFormat::Human => {
                 if !data {
@@ -21950,25 +21969,28 @@ mod map_renderer_tests {
 
     #[test]
     fn state_triple_hole() {
-        assert_eq!(map_state_triple("hole"), (false, true, false, false));
+        assert_eq!(map_state_triple("hole"), Some((false, true, false, false)));
     }
 
     #[test]
     fn state_triple_zero() {
-        assert_eq!(map_state_triple("zero"), (true, true, false, false));
+        assert_eq!(map_state_triple("zero"), Some((true, true, false, false)));
     }
 
     #[test]
     fn state_triple_data() {
-        assert_eq!(map_state_triple("data"), (true, false, true, true));
+        assert_eq!(map_state_triple("data"), Some((true, false, true, true)));
     }
 
     #[test]
     fn state_triple_offset_bearing_zero_and_hole() {
         // qcow2 ZERO_ALLOC and UNALLOCATED_ALLOC: qemu-img map prints
         // an offset for both, which the offset-less states do not.
-        assert_eq!(map_state_triple("zero-at"), (true, true, false, true));
-        assert_eq!(map_state_triple("hole-at"), (false, true, false, true));
+        assert_eq!(map_state_triple("zero-at"), Some((true, true, false, true)));
+        assert_eq!(
+            map_state_triple("hole-at"),
+            Some((false, true, false, true))
+        );
     }
 
     #[test]
@@ -21991,10 +22013,38 @@ mod map_renderer_tests {
     }
 
     #[test]
-    fn state_triple_unknown_falls_back_to_data() {
-        // Defensive: an unknown state preserves the offset for
-        // debugging rather than dropping it.
-        assert_eq!(map_state_triple("future-state"), (true, false, true, true));
+    fn state_triple_unknown_is_not_a_state() {
+        // An unrecognised state, including the guest's own "unknown"
+        // fallback, has no triple: it must not read as data (#816).
+        assert_eq!(map_state_triple("future-state"), None);
+        assert_eq!(map_state_triple("unknown"), None);
+    }
+
+    #[test]
+    fn renderer_refuses_an_unknown_state_and_writes_nothing_for_it() {
+        // In both modes, an extent the guest could not name is an
+        // InvalidData error and leaves no row or object behind.
+        for mode in ["human", "json"] {
+            let mut buf: Vec<u8> = Vec::new();
+            let mut r = MapRenderer::new(
+                &mut buf,
+                mode,
+                "img".to_string(),
+                &version::OutputProfile::newest(),
+            );
+            r.begin().unwrap();
+            let err = r
+                .emit_extent(&ext(0x10000, 0x10000, "unknown", 0x50000))
+                .unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{mode}");
+            assert!(err.to_string().contains("'unknown'"), "{mode}: {err}");
+            assert_eq!(r.extents_written, 0, "{mode}");
+            let after_begin = match mode {
+                "json" => "[",
+                _ => "Offset          Length          Mapped to       File\n",
+            };
+            assert_eq!(String::from_utf8(buf).unwrap(), after_begin, "{mode}");
+        }
     }
 
     // Byte-exact human / JSON output tests live in the
