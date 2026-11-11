@@ -19,7 +19,8 @@ Common options:
 ```
   -O, --target-format <FMT>       raw | qcow2 | vmdk | vpc | vhdx
                                   Default: raw
-  -s, --size <SIZE>               Hypothetical image size with K/M/G/T suffix
+  -s, --size <SIZE>               Hypothetical image size, qemu-img's grammar
+                                  (B/K/M/G/T/P/E suffix, fraction allowed)
   -f, --format <FMT>              Source format override (usually auto-detected)
       --output <FORMAT>           human (default) | json
   -o, --options <KEY=VALUE,...>   qemu-img-style options (repeatable)

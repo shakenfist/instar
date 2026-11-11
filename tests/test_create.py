@@ -13,7 +13,6 @@ These tests require /dev/kvm access for the non-raw paths.
 """
 
 import copy
-import decimal
 import errno
 import json
 import os
@@ -1184,6 +1183,55 @@ class TestCreateSmoke(InstarTestBase):
                              f'backing-filename mismatch for {path}')
 
 
+class TestCreateFractionalSize(TestCreateSmoke):
+    """A size may carry a decimal fraction, as qemu-img's does.
+
+    qemu-img takes a fraction before a scaling suffix (do_strtosz in util/cutils.c); instar refused one, so a size
+    spelt the way qemu-img takes it -- `4608.5M`, the size in the fixed-VHDX pins -- had to be converted to a byte
+    count before instar would take it. Both tools are given the identical spelling here.
+    """
+
+    def _qemu_create(self, path, fmt, size):
+        r = subprocess.run(['qemu-img', 'create', '-q', '-f', fmt, str(path), size],
+                           capture_output=True, text=True, timeout=QEMU_TOOL_TIMEOUT)
+        self.assertEqual(0, r.returncode, f'qemu-img create {fmt} {size}: {r.stderr}')
+
+    def test_raw_fractional_size(self):
+        """`1.5M` is 1572864 bytes, and instar's file is as long as qemu-img's."""
+        with tempfile.TemporaryDirectory() as td:
+            ours = Path(td) / 'ours.raw'
+            theirs = Path(td) / 'theirs.raw'
+            _, stderr, rc = self.run_instar_create('-f', 'raw', ours, '1.5M')
+            self.assertEqual(0, rc, f'create -f raw 1.5M: {stderr}')
+            self._qemu_create(theirs, 'raw', '1.5M')
+            self.assertEqual(1572864, ours.stat().st_size)
+            self.assertEqual(theirs.stat().st_size, ours.stat().st_size)
+
+    def test_qcow2_fractional_size(self):
+        """`20.5M` reaches the qcow2 header as 21495808, the size qemu-img records."""
+        with tempfile.TemporaryDirectory() as td:
+            ours = Path(td) / 'ours.qcow2'
+            theirs = Path(td) / 'theirs.qcow2'
+            _, stderr, rc = self.run_instar_create('-f', 'qcow2', ours, '20.5M')
+            self.assertEqual(0, rc, f'create -f qcow2 20.5M: {stderr}')
+            self._qemu_create(theirs, 'qcow2', '20.5M')
+            out, _, info_rc = self.run_instar_info(ours, output='json')
+            self.assertEqual(0, info_rc)
+            self.assertEqual(21495808, json.loads(out)['virtual-size'])
+            r = subprocess.run(['qemu-img', 'info', '--output=json', str(theirs)],
+                               capture_output=True, text=True, timeout=QEMU_TOOL_TIMEOUT)
+            self.assertEqual(json.loads(r.stdout)['virtual-size'], 21495808)
+
+    def test_fraction_without_a_scale_is_refused(self):
+        """A fraction of a byte is not a size, and qemu-img refuses it too."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'f.raw'
+            _, stderr, rc = self.run_instar_create('-f', 'raw', path, '1.5')
+            self.assertNotEqual(0, rc, 'expected a bare fraction to be refused')
+            self.assertIn('1.5', stderr)
+            self.assertFalse(path.exists(), 'nothing should have been created')
+
+
 class TestCreateOOptions(InstarTestBase):
     """Integration tests for `-o key=value,...` parsing wired through to run_create."""
 
@@ -2059,21 +2107,6 @@ VHDX_FIXED_TOO_LARGE_FOR_EXT4_FILE_LENGTH = VHDX_FIXED_TOO_LARGE_FOR_EXT4 + 12 *
 VHDX_FIXED_FILE_TOO_LARGE_MESSAGE = ("create: a fixed VHDX of {size} bytes needs a {length}-byte file, which the "
                                      "filesystem holding '{path}' cannot store: ")
 
-# The suffixes a qemu-img size may carry, as powers of 1024.
-QEMU_SIZE_SUFFIXES = {'': 1, 'K': 1 << 10, 'M': 1 << 20, 'G': 1 << 30, 'T': 1 << 40}
-
-
-def qemu_size_in_bytes(size):
-    """A qemu-img size such as `4608.5M`, in bytes.
-
-    qemu-img takes a fraction before the suffix (do_strtosz, qemu 7.0.0 util/cutils.c), and instar's create does not,
-    so a size spelt for qemu-img is given to instar as a byte count.
-    """
-    suffix = size[-1].upper() if size[-1].isalpha() else ''
-    number = size[:-1] if suffix else size
-    return int(decimal.Decimal(number) * QEMU_SIZE_SUFFIXES[suffix])
-
-
 class TestCreateVhdxFixedLarge(InstarTestBase):
     """Fixed VHDX at sizes the pin does not hold: compared with the host qemu-img, and against the filesystem.
 
@@ -2091,7 +2124,8 @@ class TestCreateVhdxFixedLarge(InstarTestBase):
     def _create_both(self, workdir, options, size):
         """Create the same fixed VHDX with instar and with the host qemu-img; return their paths."""
         ours = Path(workdir) / 'instar.vhdx'
-        _, stderr, rc = self.run_instar_create('-f', 'vhdx', '-o', options, ours, qemu_size_in_bytes(size))
+        # instar and qemu-img are handed the identical size spelling, fractions and all.
+        _, stderr, rc = self.run_instar_create('-f', 'vhdx', '-o', options, ours, size)
         self.assertEqual(0, rc, f'instar create -o {options} {size}: {stderr}')
         theirs = Path(workdir) / 'qemu.vhdx'
         self._run_tool(['qemu-img', 'create', '-q', '-f', 'vhdx', '-o', options, str(theirs), size], workdir)

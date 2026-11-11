@@ -49,6 +49,12 @@ Suffix multipliers: `B`/`b`=1, `k`/`K`=1024, `M`=1024², `G`=1024³,
 `b` — qemu-img's `b` is one byte, not qemu-io's 512-byte block, so
 `4096b` is 4096 bytes and shrinks a 1 MiB image.
 
+A decimal fraction may precede any suffix that scales: `+1.5M`,
+`20.5M` and `.5G` are all accepted, and so is `1.M`. A fraction with
+no suffix, or with `B`/`b`, is refused, because a fraction of a byte
+is not a size. A fraction that is not a whole number of bytes rounds
+to the nearest byte, halves upwards.
+
 A subtractive end-spec implies shrink, but `--shrink` must still be
 passed explicitly — it documents the user's intent to discard data
 beyond the new EOF.

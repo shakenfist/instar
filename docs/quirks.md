@@ -175,6 +175,42 @@ For the QCOW2 v2 test file:
 
 **With `--ignore-quirks` flag**: instar reports the actual file size.
 
+## The size grammar on the command line
+
+**Classification: Safe Quirk**
+
+Every size instar takes on the command line -- `create`'s `SIZE`,
+`resize`'s `[+-]SIZE`, `measure --size`, `bench`'s buffer, step and
+offset, `map`'s window -- is parsed with qemu's grammar: an integer, an
+optional decimal fraction, and an optional one-character multiplier
+from `B`/`b` (one byte), `K`, `M`, `G`, `T`, `P`, `E`. A fraction needs
+a multiplier that scales, so `1.5M` is 1572864 and `1.5` and `1.5b` are
+refused; a fraction that is not a whole number of bytes rounds to the
+nearest byte, halves upwards.
+
+Two things differ from qemu-img 10.0.13, both deliberate:
+
+* **A hexadecimal size is refused.** `qemu-img create -f qcow2 h 0x10`
+  creates a 16-byte (512-byte, rounded) image; `instar create` answers
+  `invalid memory size: '0x10'`. qemu's own behaviour here moved
+  between versions -- qemu 7.0.0 accepted a multiplier on a hex number
+  with a deprecation warning, and 10.0.13 refuses `0x10M` outright --
+  so matching it means picking a version's behaviour and measuring the
+  boundary across the pinned builds. Nothing instar does needs a hex
+  size, and the refusal is a clear message rather than a wrong answer.
+
+* **A trailing space is tolerated.** instar's parsers trim their input,
+  so `1.5M ` is a size; qemu-img refuses it, because its parser
+  requires the suffix to be the last character. Leading whitespace and
+  a leading `+` are accepted by both.
+
+qemu's rules were read from `do_strtosz` and `suffix_mul` in
+`util/cutils.c` (`instar-testdata/qemu-sources/7.0.0`) and then
+measured against qemu-img 10.0.13, which is the oracle the suite
+cross-validates against. The measurement reads a parsed size back
+exactly by resizing a raw file, whose length is whatever was asked for;
+`create` would round it up to 512 and hide the last byte.
+
 ## Human-Readable Size Formatting
 
 **Classification: Safe Quirk**
