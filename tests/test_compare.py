@@ -1644,6 +1644,13 @@ class TestCompareFailureIsNotAVerdict(InstarTestBase):
     past the end of a file as zeroes and calls the images identical; that
     is a separate difference between the two, and not what these tests
     are about.
+
+    The exact offset the tests expect rests on two things this class does
+    not control: the fixture's 64 KiB data cluster is the last cluster in
+    the file, so truncating the file removes it and nothing else, and the
+    guest reads in chunks that divide DATA_OFFSET, so the chunk whose read
+    fails starts there. If either changes, the offset in the error moves
+    and these tests fail on it, not on the exit code.
     """
 
     #: The truncated qcow2's data cluster, at 512 KiB of a 1 MiB disk.

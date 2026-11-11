@@ -131,4 +131,4 @@ file of exactly that name sits in the image's directory, `convert` and
 `compare` read it, while `info` reports the reference with no "actual
 path". Making discovery refuse a Windows absolute reference instead
 would change what those operations open, so it is left for its own
-change.
+change ([issue #899](https://github.com/shakenfist/instar/issues/899)).

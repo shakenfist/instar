@@ -5032,32 +5032,32 @@ rather than fixed, because none of them was that change's job to close:
    current policy.
 2. **`instar info` printed an unresolvable "actual path" for a parent
    recorded in Windows convention — in either format** (fixed for
-   absolute references). The host's "actual path" resolution treated
-   any string that is not POSIX-absolute as relative and joined it onto
-   the image's directory, so a parent name carrying backslashes became
-   a single literal filename that cannot exist on the filesystem. This was originally recorded as a VHDX-only
-   limitation, on the strength of an instar-created child reporting
-   `.\vhdx-diff-parent.vhdx`; that particular case is now closed. `info`
-   renders the VHDX `relative_path` locator key back into POSIX
-   convention — see "**`instar info` reports a parent path in POSIX
-   convention where the stored form permits it**" above — so a relative
-   VHDX locator reports and resolves correctly today. What remains open
-   is every parent string that is *already* in Windows convention and so
-   is reported verbatim: a VHDX `absolute_win32_path` or `volume_path`
-   locator key, and a VHD parent unicode name, which is never normalised
-   in either direction. The adversarial fixture `vhd-diff-locator-unc`
-   is the concrete case — a VHD whose parent name is
-   `\\attacker\share\probe`, reported exactly as stored
-   (`ADVERSARIAL_LOCATOR_FIXTURES` in `tests/test_differencing.py`),
-   which used to be joined onto the image directory. A Windows absolute
-   reference -- a drive letter, or anything rooted at `\\` -- is now
-   classified as absolute, as the reporting walk already classified it
-   ("a Windows absolute path and cannot be resolved on this host"), so
-   `info` prints no "actual path" for it and JSON's
-   `full-backing-filename` repeats it verbatim
-   ([issue #658](https://github.com/shakenfist/instar/issues/658)). A
-   relative reference in Windows convention is still joined without
-   being normalised. See [info.md](info.md#known-limitations).
+   absolute references). The host's "actual path" resolution treated any
+   string that is not POSIX-absolute as relative and joined it onto the
+   image's directory, so a parent name carrying backslashes became a
+   single literal filename that cannot exist on the filesystem. This was
+   originally recorded as a VHDX-only limitation, on the strength of an
+   instar-created child reporting `.\vhdx-diff-parent.vhdx`; that
+   particular case is now closed. `info` renders the VHDX
+   `relative_path` locator key back into POSIX convention — see
+   "**`instar info` reports a parent path in POSIX convention where the
+   stored form permits it**" above — so a relative VHDX locator reports
+   and resolves correctly today. What remains open is every parent
+   string that is *already* in Windows convention and so is reported
+   verbatim: a VHDX `absolute_win32_path` or `volume_path` locator key,
+   and a VHD parent unicode name, which is never normalised in either
+   direction. The adversarial fixture `vhd-diff-locator-unc` is the
+   concrete case — a VHD whose parent name is `\\attacker\share\probe`,
+   reported exactly as stored (`ADVERSARIAL_LOCATOR_FIXTURES` in
+   `tests/test_differencing.py`), which used to be joined onto the image
+   directory. A Windows absolute reference -- a drive letter, or
+   anything rooted at `\\` -- is now classified as absolute, as the
+   reporting walk already classified it ("a Windows absolute path and
+   cannot be resolved on this host"), so `info` prints no "actual path"
+   for it and JSON's `full-backing-filename` repeats it verbatim ([issue
+   #658](https://github.com/shakenfist/instar/issues/658)). A relative
+   reference in Windows convention is still joined without being
+   normalised. See [info.md](info.md#known-limitations).
 3. **`instar resize` accepted a differencing VHDX** (fixed). This was a
    write path, predated the differencing work, and `resize` never called
    `VhdxState::init`, so the read-side refusal neither caused it nor fixed

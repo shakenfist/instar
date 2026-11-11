@@ -17227,7 +17227,7 @@ fn run_map(args: MapArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error
                                                 // emitting; exit cleanly.
                                                 broken_pipe = true;
                                             }
-                                            Err(err) => return Err(err.into()),
+                                            Err(err) => return Err(map_extent_error(err)),
                                         }
                                     }
                                 }
@@ -17352,6 +17352,17 @@ fn run_map(args: MapArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error
     drop(writer);
 
     Ok(())
+}
+
+/// The error `run_map` returns when [`MapRenderer::emit_extent`] fails
+/// for any reason other than a closed stdout.
+///
+/// `main` prints an error with `Debug`, and an `io::Error`'s `Debug` is
+/// `Custom { kind: InvalidData, error: "..." }`. Carrying the message as
+/// a `String` error instead makes the `Error: "..."` line on stderr read
+/// the same as every other error's, and as docs/map.md shows it.
+fn map_extent_error(err: std::io::Error) -> Box<dyn std::error::Error> {
+    err.to_string().into()
 }
 
 /// Translate a guest-side state code (the string sent in
@@ -20570,6 +20581,10 @@ fn compare_failure_error(
 /// reach this function; [`compare_failure_error`] renders it.
 fn print_compare_result(msg: &guest_::GuestMessage, output_format: &str, strict: bool) {
     if let Some(guest_::GuestMessage_::Payload::CompareResult(result)) = &msg.payload {
+        debug_assert!(
+            !shared::CompareResult::flags_report_failure(result.flags),
+            "a failure is not a verdict (#807)"
+        );
         if output_format == "json" {
             print_compare_result_json(result);
             return;
@@ -22209,7 +22224,14 @@ mod map_renderer_tests {
                 .emit_extent(&ext(0x10000, 0x10000, "unknown", 0x50000))
                 .unwrap_err();
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{mode}");
-            assert!(err.to_string().contains("'unknown'"), "{mode}: {err}");
+            // What main prints after `Error: ` is the Debug of the
+            // error run_map returns: the bare message, quoted.
+            assert_eq!(
+                format!("{:?}", map_extent_error(err)),
+                "\"map: the guest reported an extent at offset 65536 in an unrecognised \
+                 state 'unknown'; refusing to render it as data\"",
+                "{mode}"
+            );
             assert_eq!(r.extents_written, 0, "{mode}");
             let after_begin = match mode {
                 "json" => "[",

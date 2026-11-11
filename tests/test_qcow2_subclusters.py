@@ -225,6 +225,50 @@ class TestQcow2Subclusters(InstarTestBase):
                                                      f'stdout={stdout!r}')
         self.assert_fails_closed_message(name, stderr)
 
+    # ------------------------------------------------- the mid-chain data file
+
+    def check_mid_chain_refused(self, operation):
+        """One operation that composes a chain refuses a mid-chain data file by name.
+
+        convert and compare are pinned through FAILS_CLOSED. dd, bench, rebase
+        and check --chain reach the same refusal through the same discovery
+        call, and each is pinned by its own test below, so moving one to
+        commit's top-only walk cannot quietly bring back the reasonless
+        in-guest failure #806 was filed over.
+        """
+        name = 'data_file_mid_chain'
+        path = self._fixtures[name].path
+        if operation == 'dd':
+            result = self._instar('dd', f'if={path}', f'of={self._tmpdir / "mid-chain.dd.raw"}')
+        elif operation == 'bench':
+            result = self._instar('bench', '-c', '1', '-s', '4096', '--output', 'json', path)
+        elif operation == 'rebase':
+            # rebase writes its overlay, so it is given a copy: a regression
+            # must not change the fixture the other tests read. The copy sits
+            # beside the fixture, because the backing allowlist is the image's
+            # own directory, and so still reads the same chain.
+            overlay = path.with_name(f'{name}.rebase-copy.qcow2')
+            shutil.copyfile(path, overlay)
+            result = self._instar('rebase', '-b', '', overlay)
+            self.assertEqual(overlay.read_bytes(), path.read_bytes(), 'rebase changed the overlay it refused')
+        else:
+            result = self.run_instar_check(path, output_format='json', chain=True)
+        stdout, stderr, rc = result
+        self.assertNotEqual(rc, 0, f'{operation}: read through a mid-chain data file; '
+                                   f'stdout={stdout!r} stderr={stderr!r}')
+        self.assertIn(FAILS_CLOSED_MESSAGES[name], stderr + stdout,
+                      f'{operation}: the refusal must say why; stderr={stderr!r}')
+
+    def test_info_chain_lists_a_mid_chain_data_file(self):
+        """info --chain reads no data, so it still reports a chain with a mid-chain data file."""
+        fixture = self._fixtures['data_file_mid_chain']
+        stdout, stderr, rc = self.run_instar_info(fixture.path, output_format='json', chain=True)
+        self.assertEqual(rc, 0, f'info --chain refused the chain; stderr={stderr!r}')
+        images = json.loads(stdout)
+        self.assertEqual([Path(image['filename']).name for image in images],
+                         [fixture.path.name, fixture.backing.name, 'data_file_mid_chain_middle.backing.raw'],
+                         f'info --chain did not list the whole chain: {stdout}')
+
     def check_compare(self, name):
         fixture = self._fixtures[name]
         qemu_out = self._qemu_raw[name][0]
@@ -372,6 +416,18 @@ for _operation, _names in (('compare_reversed', REVERSED_COMPARE_FIXTURES), ('ch
                            ('compare_pair', qcow2_subclusters.COMPARE_PAIRS)):
     for _name in _names:
         setattr(TestQcow2Subclusters, f'test_{_operation}_{_name}', _make_test(_operation, _name))
+
+
+def _make_mid_chain_test(operation):
+    def test(self):
+        self.check_mid_chain_refused(operation)
+    test.__doc__ = f'{operation} refuses a chain with an external data file below the top image, by name (#806).'
+    return test
+
+
+for _operation in ('dd', 'bench', 'rebase', 'check --chain'):
+    setattr(TestQcow2Subclusters, f'test_mid_chain_data_file_refused_by_{_operation.replace(" --", "_")}',
+            _make_mid_chain_test(_operation))
 
 for _label, _table in (('EXPECTED_FAILURES', EXPECTED_FAILURES), ('FAILS_CLOSED', FAILS_CLOSED)):
     _unknown = {key for key in _table if key[1] not in qcow2_subclusters.BUILDERS}

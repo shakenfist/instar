@@ -170,6 +170,9 @@ pub unsafe extern "C" fn _start() -> u64 {
             (call_table.debug_print)(b"compare: sector size mismatch\n\0".as_ptr());
             // Not a size mismatch between the images: the devices'
             // sector sizes disagree, so no comparison can be made.
+            // Defensive: the host builds one VmmConfig with the single
+            // --sector-size for every device, so the CLI cannot reach
+            // this; --verbose shows the line above if anything does.
             let result = CompareResult::setup_failed();
             (call_table.send_compare_result)(&result);
             (call_table.send_complete)(b"compare\0".as_ptr(), 0, false);
@@ -475,11 +478,12 @@ pub unsafe extern "C" fn _start() -> u64 {
             // Content within the common range matches, but sizes differ.
             // Check if the extra virtual data in the larger image is all zeros.
             // qemu-img treats as identical when the extra data is zeros.
-            let (extra_chain_start, extra_chain_len, extra_vsize) = if vsize1 > vsize2 {
-                (0usize, image1_device_count, vsize1)
-            } else {
-                (image2_start, image2_device_count, vsize2)
-            };
+            let (extra_chain_start, extra_chain_len, extra_vsize, extra_is_image2) =
+                if vsize1 > vsize2 {
+                    (0usize, image1_device_count, vsize1, false)
+                } else {
+                    (image2_start, image2_device_count, vsize2, true)
+                };
 
             (call_table.verbose_print)(
                 b"compare: checking extra virtual data for zeros\n\0".as_ptr(),
@@ -544,10 +548,9 @@ pub unsafe extern "C" fn _start() -> u64 {
                 // The same report as a failed read in the main loop: an
                 // error line for --verbose, and a result that names the
                 // image and the offset reached.
-                let image2 = extra_chain_start != 0;
                 (call_table.send_error)(
                     b"compare\0".as_ptr(),
-                    if image2 {
+                    if extra_is_image2 {
                         b"input1\0".as_ptr()
                     } else {
                         b"input0\0".as_ptr()
@@ -555,7 +558,7 @@ pub unsafe extern "C" fn _start() -> u64 {
                     extra_offset / sector_size as u64,
                     1,
                 );
-                let failed = CompareResult::read_failed(image2, extra_offset);
+                let failed = CompareResult::read_failed(extra_is_image2, extra_offset);
                 (call_table.send_compare_result)(&failed);
                 (call_table.send_complete)(b"compare\0".as_ptr(), bytes_read, false);
                 return bytes_read;
