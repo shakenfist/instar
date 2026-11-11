@@ -8931,8 +8931,8 @@ fn render_commit_success(
 }
 
 /// Map a `CommitResult::ERROR_*` code to a user-facing string.
-/// Exhaustive on the 18 constants from
-/// `src/shared/src/lib.rs` (0..=17); the trailing catch-all
+/// Exhaustive on the 19 constants from
+/// `src/shared/src/lib.rs` (0..=18); the trailing catch-all
 /// covers future code additions only.
 fn map_commit_error(code: u32) -> String {
     match code {
@@ -8947,6 +8947,11 @@ fn map_commit_error(code: u32) -> String {
         }
         c if c == shared::CommitResult::ERROR_EXTERNAL_DATA_FILE => {
             "qcow2 overlays with the external-data-file feature cannot be committed".into()
+        }
+        c if c == shared::CommitResult::ERROR_BACKING_EXTERNAL_DATA_FILE => {
+            "the backing file uses the qcow2 external-data-file feature; instar \
+             cannot commit into it. Fall back to `qemu-img commit`"
+                .into()
         }
         c if c == shared::CommitResult::ERROR_LUKS_UNSUPPORTED => {
             "LUKS-encrypted overlays and backings are not yet supported for commit".into()

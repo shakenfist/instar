@@ -1524,6 +1524,75 @@ class TestCommitBackingClassification(TestCommitSmoke):
                 self.sha256(overlay), overlay_before,
                 'a refused commit must not touch the overlay')
 
+    def _external_data_file_chain(self, td, data_file_on):
+        """Build overlay.qcow2 over backing.qcow2, one of them with a data file.
+
+        `data_file_on` is 'backing' or 'overlay': the image that owns
+        an external data file. The overlay carries 64 KiB of its own
+        data, so a commit that got as far as copying would change the
+        backing.
+        """
+        backing_opts = 'data_file=backing.data' if data_file_on == 'backing' else ''
+        argv = ['qemu-img', 'create', '-f', 'qcow2']
+        if backing_opts:
+            argv += ['-o', backing_opts]
+        self._run_tool(argv + ['backing.qcow2', '1M'], td)
+        overlay_opts = 'backing_file=backing.qcow2,backing_fmt=qcow2'
+        if data_file_on == 'overlay':
+            overlay_opts += ',data_file=overlay.data'
+        self._run_tool(
+            ['qemu-img', 'create', '-f', 'qcow2', '-o', overlay_opts,
+             'overlay.qcow2', '1M'],
+            td)
+        self._run_tool(
+            ['qemu-io', '-f', 'qcow2', '-c', 'write -P 0xbb 0 64k',
+             'overlay.qcow2'],
+            td)
+
+    def _assert_external_data_file_refusal(self, data_file_on, expected):
+        self._require_qemu_tools()
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            self._external_data_file_chain(td, data_file_on)
+            before = {
+                p.name: self.sha256(p) for p in sorted(td.iterdir())}
+
+            _, stderr, rc = self.run_instar_commit(
+                td / 'overlay.qcow2', timeout=120)
+            self.assertNotEqual(
+                rc, 0,
+                f'expected a {data_file_on} data file to be refused; '
+                f'stderr={stderr!r}')
+            self.assertIn(expected, stderr, f'unexpected stderr: {stderr!r}')
+            after = {p.name: self.sha256(p) for p in sorted(td.iterdir())}
+            self.assertEqual(
+                after, before, 'a refused commit must not touch any file')
+            return stderr
+
+    def test_refuse_backing_external_data_file(self):
+        """A backing that owns an external data file is refused by name.
+
+        The refusal used to share the overlay's code, so it said
+        "qcow2 overlays with the external-data-file feature cannot be
+        committed" about an overlay that has no data file (issue
+        #815). qemu-img 10.0.13 commits this chain; instar refuses it,
+        before any byte changes, and now says which image is the
+        reason.
+        """
+        stderr = self._assert_external_data_file_refusal(
+            'backing',
+            'the backing file uses the qcow2 external-data-file feature; '
+            'instar cannot commit into it. Fall back to `qemu-img commit`')
+        self.assertNotIn('qcow2 overlays with', stderr)
+
+    def test_refuse_overlay_external_data_file(self):
+        """An overlay that owns an external data file keeps its own message."""
+        stderr = self._assert_external_data_file_refusal(
+            'overlay',
+            'qcow2 overlays with the external-data-file feature cannot be '
+            'committed')
+        self.assertNotIn('the backing file uses', stderr)
+
     def test_refuse_sparse_refcount_table_backing(self):
         """Commit into a holed-refcount-table backing refuses pre-mutation.
 

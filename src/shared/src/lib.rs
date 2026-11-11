@@ -4881,8 +4881,11 @@ impl CommitResult {
     pub const ERROR_UNSUPPORTED_FORMAT: u32 = 1;
     /// Overlay has no backing reference.
     pub const ERROR_NO_BACKING: u32 = 2;
-    /// qcow2 with the external-data-file incompatible feature.
-    /// Refused to match qemu-img.
+    /// The qcow2 overlay has the external-data-file incompatible
+    /// feature. A backing with the feature has its own code,
+    /// [`Self::ERROR_BACKING_EXTERNAL_DATA_FILE`], so the refusal
+    /// names the image that owns the data file. qemu-img commits
+    /// either shape; instar refuses both.
     pub const ERROR_EXTERNAL_DATA_FILE: u32 = 3;
     /// Overlay or backing is LUKS-wrapped. v1 of commit
     /// refuses; a future plan can lift this.
@@ -4967,6 +4970,14 @@ impl CommitResult {
     /// previously committed cluster data in place, the same
     /// posture as [`Self::ERROR_REFCOUNT_EXHAUSTED`].
     pub const ERROR_BACKING_INCONSISTENT: u32 = 17;
+    /// The qcow2 backing being committed into has the
+    /// external-data-file incompatible feature. The overlay's own
+    /// data-file refusal is [`Self::ERROR_EXTERNAL_DATA_FILE`]; this
+    /// one was split out of it because reporting the backing's data
+    /// file under the overlay's name sent the user to an image with
+    /// no data file at all (GitHub issue #815). Refused before any
+    /// staging or mutation.
+    pub const ERROR_BACKING_EXTERNAL_DATA_FILE: u32 = 18;
 
     /// True if magic matches.
     pub fn is_valid(&self) -> bool {
@@ -5984,13 +5995,14 @@ mod tests {
             CommitResult::ERROR_OVERLAY_HAS_SNAPSHOTS,
             CommitResult::ERROR_BACKING_UNSUPPORTED,
             CommitResult::ERROR_BACKING_INCONSISTENT,
+            CommitResult::ERROR_BACKING_EXTERNAL_DATA_FILE,
         ];
         for i in 0..codes.len() {
             for j in (i + 1)..codes.len() {
                 assert_ne!(codes[i], codes[j], "codes {i} and {j} alias");
             }
         }
-        // Confirm contiguous 0..=17 numbering (append-only wire
+        // Confirm contiguous 0..=18 numbering (append-only wire
         // codes).
         for (i, c) in codes.iter().enumerate() {
             assert_eq!(*c, i as u32);
