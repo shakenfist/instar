@@ -93,6 +93,15 @@ by `tests/test_resize.py:TestResizeBaselineMatrix`). For vmdk / vpc
 post-resize state is verified by `tests/test_resize.py:TestResize
 Consistency` (instar resize → instar info → instar check).
 
+**A qcow2 shrink keeps the size it was given.** The header records
+the requested size, not a cluster-aligned version of it, as qemu does:
+shrinking a 10 MiB image to 5 MiB + 4096 reports a virtual size of
+5246976, which is not a multiple of the 64 KiB cluster. Only whole
+clusters are discarded, so the cluster holding the new last byte stays
+allocated. A size inside the first cluster is a size like any other --
+`--shrink` to 4096 on a 64 KiB-cluster image gives a 4096-byte disk --
+and only a size of zero is refused.
+
 **Image-size ceiling.** qcow2 grow is bounded only by what the
 filesystem can hold — followup-01's targeted refcount-block
 pre-pass keeps the guest's metadata staging budget O(1) blocks

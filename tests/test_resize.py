@@ -1033,6 +1033,73 @@ RESIZE_CROSS_VALIDATION_CASES = [
 ]
 
 
+class TestResizeShrinkExactSize(TestResizeSmoke):
+    """A qcow2 shrink records the size it was given, not a cluster-aligned one.
+
+    Measured with qemu-img 10.0.13: shrinking a 10 MiB image to
+    5 MiB + 4096 leaves a virtual size of 5246976, which is not a
+    multiple of the 64 KiB cluster. instar rounded down to 5242880,
+    so the disk came out smaller than both the request and qemu's.
+    """
+
+    def _qemu(self, *cmd, timeout=60):
+        r = subprocess.run(['qemu-img', *[str(c) for c in cmd]],
+                           capture_output=True, text=True, timeout=timeout)
+        return r.stdout, r.stderr, r.returncode
+
+    def test_shrink_to_a_size_inside_a_cluster(self):
+        target = 5 * 1024 ** 2 + 4096
+        with tempfile.TemporaryDirectory() as td:
+            ours = Path(td) / 'ours.qcow2'
+            theirs = Path(td) / 'theirs.qcow2'
+            for path in (ours, theirs):
+                _, err, rc = self._qemu('create', '-q', '-f', 'qcow2', path, '10M')
+                self.assertEqual(rc, 0, f'qemu-img create: {err}')
+            _, stderr, rc = self.run_instar_resize(
+                '--shrink', '-f', 'qcow2', str(ours), str(target))
+            self.assertEqual(rc, 0, f'instar resize --shrink failed: {stderr}')
+            _, err, rc = self._qemu('resize', '-q', '--shrink', '-f', 'qcow2',
+                                    theirs, str(target))
+            self.assertEqual(rc, 0, f'qemu-img resize: {err}')
+
+            for path, tool in ((ours, 'instar'), (theirs, 'qemu-img')):
+                out, err, rc = self._qemu('info', '--output=json', path)
+                self.assertEqual(rc, 0, f'info on the {tool} result: {err}')
+                self.assertEqual(json.loads(out)['virtual-size'], target,
+                                 f'{tool} virtual size')
+            # instar's result is still a well-formed image.
+            _, err, rc = self._qemu('check', ours)
+            self.assertEqual(rc, 0, f'qemu-img check on instar result: {err}')
+
+    def test_shrink_below_one_cluster(self):
+        """qemu-img shrinks to 4096 on a 64 KiB-cluster image; instar refused."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'small.qcow2'
+            _, err, rc = self._qemu('create', '-q', '-f', 'qcow2', path, '10M')
+            self.assertEqual(rc, 0, f'qemu-img create: {err}')
+            _, stderr, rc = self.run_instar_resize(
+                '--shrink', '-f', 'qcow2', str(path), '4096')
+            self.assertEqual(rc, 0, f'instar resize --shrink 4096 failed: {stderr}')
+            out, err, rc = self._qemu('info', '--output=json', path)
+            self.assertEqual(rc, 0, f'info: {err}')
+            self.assertEqual(json.loads(out)['virtual-size'], 4096)
+            _, err, rc = self._qemu('check', path)
+            self.assertEqual(rc, 0, f'qemu-img check: {err}')
+
+    def test_shrink_to_zero_is_refused(self):
+        """qemu-img: "New image size must be positive"."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'z.qcow2'
+            _, err, rc = self._qemu('create', '-q', '-f', 'qcow2', path, '10M')
+            self.assertEqual(rc, 0, f'qemu-img create: {err}')
+            _, _, rc = self.run_instar_resize(
+                '--shrink', '-f', 'qcow2', str(path), '0')
+            self.assertNotEqual(rc, 0, 'expected a shrink to zero to be refused')
+            out, err, rc = self._qemu('info', '--output=json', path)
+            self.assertEqual(rc, 0, f'info: {err}')
+            self.assertEqual(json.loads(out)['virtual-size'], 10 * 1024 ** 2)
+
+
 class TestResizeSizeAlignment(TestResizeSmoke):
     """A new size has to be a whole sector, except on raw.
 

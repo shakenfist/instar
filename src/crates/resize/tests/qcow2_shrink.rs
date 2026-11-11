@@ -324,17 +324,74 @@ fn shrink_to_cluster_boundary_no_straddle() {
 }
 
 #[test]
-fn shrink_rounds_down_to_cluster_boundary() {
-    // Ask for 32 MiB + 1 byte; planner rounds down to 32 MiB.
+fn shrink_keeps_a_size_inside_a_cluster() {
+    // Ask for 32 MiB + 4096 and the header records exactly that,
+    // as qemu does: measured with qemu-img 10.0.13, a 10 MiB image
+    // shrunk to 5 MiB + 4096 reports 5246976, which is not a
+    // multiple of the 64 KiB cluster.
     let (bytes, header) = build_starting_image(64 << 20, 65536);
-    let opts = opts_from_image(&bytes, &header, (32 << 20) + 1, true, &[]);
+    let opts = opts_from_image(&bytes, &header, (32 << 20) + 4096, true, &[]);
     let mut scratch = vec![0u8; QCOW2_MAX_RESIZE_SCRATCH];
     let plan = plan_resize_qcow2(&opts, &mut scratch).expect("shrink plan");
 
     let mut file = bytes.clone();
     apply_resize(&mut file, &plan);
     let parsed = QcowHeader::parse(&file).expect("re-parse");
-    assert_eq!(parsed.virtual_size, 32 << 20);
+    assert_eq!(parsed.virtual_size, (32 << 20) + 4096);
+}
+
+#[test]
+fn shrink_keeps_the_cluster_holding_the_last_byte() {
+    // A data cluster at guest offset 32 MiB (L1[0] / L2[512] at
+    // 64 KiB clusters), shrinking to 32 MiB + 4096. The new last
+    // byte is inside that cluster, so it has to survive -- rounding
+    // the size down to 32 MiB discarded it along with the bytes the
+    // user asked to keep.
+    let (mut bytes, header) = build_starting_image(64 << 20, 65536);
+    let data_host = forge_allocated_cluster(&mut bytes, &header, 0, 512);
+
+    let opts = opts_from_image(&bytes, &header, (32 << 20) + 4096, true, &[0]);
+    let mut scratch = vec![0u8; QCOW2_MAX_RESIZE_SCRATCH];
+    let plan = plan_resize_qcow2(&opts, &mut scratch).expect("shrink plan");
+
+    let mut file = bytes.clone();
+    apply_resize(&mut file, &plan);
+
+    let parsed = QcowHeader::parse(&file).expect("re-parse");
+    assert_eq!(parsed.virtual_size, (32 << 20) + 4096);
+    let l1_entry = be_u64(&file, parsed.l1_table_offset as usize);
+    let l2_host = l1_entry & qcow2::L2_OFFSET_MASK;
+    let l2_entry = be_u64(&file, l2_host as usize + 512 * 8);
+    assert_eq!(l2_entry & qcow2::L2_OFFSET_MASK, data_host);
+}
+
+#[test]
+fn shrink_below_one_cluster() {
+    // qemu takes a virtual size smaller than a cluster: measured
+    // with qemu-img 10.0.13, --shrink to 4096 on a 64 KiB-cluster
+    // image reports a virtual size of 4096. The planner refused it
+    // as an invalid new size.
+    let (bytes, header) = build_starting_image(10 << 20, 65536);
+    let opts = opts_from_image(&bytes, &header, 4096, true, &[]);
+    let mut scratch = vec![0u8; QCOW2_MAX_RESIZE_SCRATCH];
+    let plan = plan_resize_qcow2(&opts, &mut scratch).expect("shrink plan");
+
+    let mut file = bytes.clone();
+    apply_resize(&mut file, &plan);
+    let parsed = QcowHeader::parse(&file).expect("re-parse");
+    assert_eq!(parsed.virtual_size, 4096);
+}
+
+#[test]
+fn shrink_to_zero_is_refused() {
+    // qemu: "New image size must be positive".
+    let (bytes, header) = build_starting_image(64 << 20, 65536);
+    let opts = opts_from_image(&bytes, &header, 0, true, &[]);
+    let mut scratch = vec![0u8; QCOW2_MAX_RESIZE_SCRATCH];
+    assert!(matches!(
+        plan_resize_qcow2(&opts, &mut scratch),
+        Err(ResizeError::InvalidNewVirtualSize)
+    ));
 }
 
 #[test]
@@ -419,15 +476,24 @@ fn shrink_with_flag_proceeds_even_with_allocated_cluster() {
 }
 
 #[test]
-fn shrink_below_minimum_cluster_rejected() {
+fn shrink_to_one_sector() {
+    // A single sector is a size: the header records 512 and the
+    // cluster holding it stays. This used to round down to 0 and be
+    // refused as an invalid new size, where qemu-img 10.0.13 shrinks
+    // to 512 and its own check passes. qemu refuses only 0 ("New
+    // image size must be positive"), which
+    // `shrink_to_zero_is_refused` covers. 512 rather than one byte
+    // because the host refuses anything that is not a whole sector
+    // before the planner sees it.
     let (bytes, header) = build_starting_image(64 << 20, 65536);
-    // Ask for 1 byte → rounds down to 0 → reject.
-    let opts = opts_from_image(&bytes, &header, 1, true, &[]);
+    let opts = opts_from_image(&bytes, &header, 512, true, &[]);
     let mut scratch = vec![0u8; QCOW2_MAX_RESIZE_SCRATCH];
-    assert_eq!(
-        plan_resize_qcow2(&opts, &mut scratch).unwrap_err(),
-        ResizeError::InvalidNewVirtualSize
-    );
+    let plan = plan_resize_qcow2(&opts, &mut scratch).expect("shrink plan");
+
+    let mut file = bytes.clone();
+    apply_resize(&mut file, &plan);
+    let parsed = QcowHeader::parse(&file).expect("re-parse");
+    assert_eq!(parsed.virtual_size, 512);
 }
 
 #[test]

@@ -1337,7 +1337,7 @@ fn stage_cleanup_decrement(
     Ok(())
 }
 
-/// Shrink planner: walk L1/L2 to identify clusters above
+/// Shrink planner: walk L1/L2 to identify clusters wholly above
 /// `new_virtual_size`, zero their L2 entries and L1 entries
 /// (where the entire L2 coverage is above the boundary),
 /// decrement refcounts to 0, and rewrite the header. No file
@@ -1360,18 +1360,16 @@ fn plan_shrink<'a>(
     let cluster_size_us = opts.cluster_size as usize;
     let cluster_bits = cluster_bits_from(opts.cluster_size)?;
 
-    // Round down to a cluster boundary so the walk below only ever
-    // discards whole clusters. The rounded size is what lands in the
-    // header (pinned by `shrink_rounds_down_to_cluster_boundary`).
-    // This was meant to match qemu, but qemu-img 10.0.13 keeps the
-    // exact requested size instead (10M shrunk to 5M + 4096 reports
-    // 5246976, not a 64 KiB multiple); see #791.
-    let new_virtual_size = (opts.new_virtual_size / cluster_size) * cluster_size;
-    if new_virtual_size < cluster_size {
-        // Minimum one cluster of virtual size; smaller asks
-        // are rejected.
-        return Err(ResizeError::InvalidNewVirtualSize);
-    }
+    // The size is used as it was asked for, not rounded to a cluster
+    // boundary, because that is what lands in the header and what qemu
+    // records: 10 MiB shrunk to 5 MiB + 4096 reports 5246976, which is
+    // not a multiple of the 64 KiB cluster, and a size inside the first
+    // cluster is a size like any other (qemu reports 4096 for a shrink
+    // to 4096). The walk below discards a cluster only when it *starts*
+    // at or above the new size, so the cluster holding the new last byte
+    // stays allocated and only whole clusters are ever dropped. A size
+    // of zero is refused by `plan_grow` before this is reached.
+    let new_virtual_size = opts.new_virtual_size;
 
     let l2_entry_size: u64 = if opts.extended_l2 { 16 } else { 8 };
     let entries_per_l2: u64 = cluster_size / l2_entry_size;
@@ -1503,9 +1501,10 @@ fn plan_shrink<'a>(
         let l1_entry = be_u64(opts.existing_l1_bytes, (i as usize) * 8);
         if l1_entry != 0 {
             let l2_bytes = lookup_l2(opts, i, cluster_size_us)?;
-            // Stage the L2 table; zero the entries whose guest
-            // offset is >= new_virtual_size, decrement the
-            // referenced data clusters.
+            // Stage the L2 table; zero the entries that start at or
+            // above the new size, decrement the referenced data
+            // clusters. An entry whose cluster straddles the new size
+            // starts below it and is kept.
             let base_virtual = (i as u64) * l2_coverage;
             // Copy l2_bytes into staging, then mutate.
             scratch[straddle_l2_off..straddle_l2_end].copy_from_slice(l2_bytes);
