@@ -252,7 +252,7 @@ the management session.
 | 2c | high | sonnet | none | Wave 2c, documentation, per `PUSH-AUDIT.md`'s 2c section, over the 30 `docs/` files in the audit scope plus `ARCHITECTURE.md`, `AGENTS.md` and `CHANGELOG.md`. Resolve the scope with `--commits-file` and state the count. Phase 12 swept the cross-cutting pages six commits ago, so the question is not whether they were updated but whether twelve phases left any fact stated two different ways -- the VHDX default block size, which subformats each command writes, and the preallocation behaviour are the three that moved most and are where to look first. Also check no file under `docs/` outside `docs/plans/` cites a source line number or a plan phase, step or decision number; both are pre-commit-enforced, so a hit is a real escape. Change no file. |
 | 2d | high | opus | none | Wave 2d, security, per `PUSH-AUDIT.md`'s 2d section, over the parsing and writing paths this plan touched: the VHDX BAT and metadata paths in `src/crates/vhdx/`, the fixed-layout emitters in `src/crates/create/`, and the host-side option and size handling in `src/vmm/`. Resolve the scope with `--commits-file` and state the count. This plan writes attacker-influenced geometry into on-disk structures and reads it back, so the shapes that matter are: an arithmetic overflow in a BAT offset or entry count, a length used before it is bounds-checked, a cast narrowing a u64 to u32, and a guest-side buffer sized from image-supplied values. The crates are `no_std` and must be panic-free, so an unchecked arithmetic operation is a defect even where the value cannot currently reach it. Report with file, function and the input that would reach it. Change no file. |
 | 2e | medium | sonnet | none | Audit the `instar-testdata` half. Work in the clone at `../instar-testdata` (branch `main`); do NOT create a worktree there and do NOT commit anything. Scope: the five non-generated files in `99c8663c34..f73d43670a` -- `scripts/detect-profiles.py`, `scripts/generate-baselines.py`, `scripts/validate-profiles.py`, `README.md` and `Makefile`. Read the three scripts as code (Python conventions: single quotes, 120 columns). Then RUN `scripts/validate-profiles.py` and report its exit status, what it printed, and -- the question that matters -- which of the 17,271 generated files under `expected-outputs/` it actually validates, and which it does not look at. Do not read the generated files individually; there are 17,000 of them and that is not an audit. Note this repository has no `PUSH-AUDIT.md`, so there is no runbook to follow and no prior audit to cite; say what you checked and what you could not. |
-| 3 | high | — | none | Management session. Triage every finding from 1 and 2a-2e into blocking, fix-in-follow-up, or filed-as-issue, record the disposition of each in this plan under "Audit findings", write the "Coverage this audit did not have" section, and commit the record. |
+| 3 | high | — | none | Management session. Triage every finding from 1 and 2a-2e into blocking, fixed-in-this-phase, or filed-as-issue (fix-in-follow-up until decision 5's reversal), record the disposition of each in this plan under "Audit findings", write the "Coverage this audit did not have" section, and commit the record. |
 
 ## Risks and mitigations
 
@@ -263,7 +263,7 @@ the management session.
 | The 17,271 generated testdata files swamp step 2e | The brief bounds it to five files and forbids reading the generated set, and redirects the effort to the validator's coverage, which is the useful question. |
 | The audit reports nothing and that is taken as a pass | The phase records a negative result as a negative result, in one sentence per step, and the "Coverage this audit did not have" section is a required part of the record rather than an optional caveat. |
 | A judgement agent fixes what it finds | Every brief says to change no file. The steps are readers; step 3 writes. A step that returns a diff has its diff discarded and its finding triaged. |
-| Findings grow into a thirteenth implementation phase | Decision 5: findings are recorded here and fixed in a follow-up pull request, which is what marks the plan complete. |
+| Findings grow into a thirteenth implementation phase | Decision 5 as amended at the back brief: findings are recorded here and fixed here, and every fix must trace to a recorded finding or be reverted. That traceability rule is what bounds the phase, in place of the follow-up pull request the original decision relied on. |
 
 ## Definition of done
 
@@ -278,8 +278,13 @@ the management session.
   resolved file count it saw, and either findings or an explicit
   statement that it found nothing.
 * Every finding is recorded under "Audit findings" with a disposition of
-  blocking, fix-in-follow-up, or filed-as-issue, and every one filed as
-  an issue has an issue number.
+  blocking, fixed-in-this-phase, or filed-as-issue -- the middle one
+  replacing fix-in-follow-up, which decision 5's reversal removed -- and
+  every one filed as an issue carries its number. A master-plan Future
+  work entry alone does not satisfy this: Future work records what is
+  worth doing, an issue is what somebody is handed, and this plan's own
+  findings include a consequence that was recorded in a plan and never
+  reached either.
 * The master plan's phase 10 row names the `instar-testdata` range, and
   its phase 12 row reads `Complete` with `2da0c22e`.
 * The plan states in writing that `instar-testdata` has no
@@ -291,8 +296,10 @@ the management session.
   origin/develop`, either it is a plan file, or the "Audit findings"
   section names the finding it fixes. A fix with no finding behind it is
   scope creep and is reverted.
-* Phase 13's row leaves its `Merged` cell empty, for the follow-up
-  pull request to fill once this phase has merged.
+* Phase 13's row leaves its `Merged` cell empty. A phase cannot know its
+  own merge commit while it is being written, and decision 5's reversal
+  removed the follow-up pull request that would have filled it, so
+  whoever next touches the plan fills it in.
 
 ## Execution notes
 
@@ -375,8 +382,14 @@ decided each one.
   against literal stale entries in each of the ways they must catch, in
   the shape `known_refusal_problem` in `tests/test_create.py` already
   used for an identically empty dict. Six mutants, each killed by
-  exactly the intended test; the management session reproduced two of
-  them independently.
+  exactly the intended test. All six were re-run in the review round, on
+  a copy of `tests/` with a control run first so that a mutant could not
+  look killed by a broken setup: `unrun_known_failures` returning
+  nothing, matching on the image where it must match on the operation,
+  and defaulting the matrix lookup to the operation it is testing for;
+  and `known_read_problem` accepting a read that now passes, accepting a
+  failure with the wrong message, and rejecting the recorded failure it
+  must accept.
 
 * **A duplicated host helper.** Phase 8 added
   `open_fixed_vhdx_convert_output`, which re-implemented phase 7's
@@ -388,6 +401,19 @@ decided each one.
   create's separately-testable error builder had no convert equivalent,
   so the convert wording was untested. Now parameterised by `op`, with
   the messages proven unchanged for both.
+
+  The fix changed `tools/mutate-differencing.sh` as well, which is why
+  that file appears in this phase's diff. Collapsing the two open bodies
+  into one left the create mutant's search text stale and deleted the
+  convert mutant's target, so both of the
+  `*-host-vhdx-fixed-efbig-mapping-removed` cases were retargeted at
+  the shared body. They now carry identical
+  search and replacement text and differ only in the test each names:
+  one code path can break, and create's and convert's integration tests
+  must each notice it, because sharing the opener would otherwise have
+  left convert's filesystem-ceiling refusal resting on create's test.
+  `--check-patterns` reported the drift and now reports 153 of 153
+  landing.
 
 * **The resize preallocation modes, stated two ways.** This plan added
   text to `docs/create.md` and `docs/quirks.md` saying
@@ -403,6 +429,15 @@ decided each one.
   contradiction does not, because the plan added the claim that exposed
   them. `metadata` remains rejected and is left saying so.
 
+  What the tables now advertise is barely tested: `RESIZE_CASES` has no
+  preallocation case for vmdk, only `off` for vhdx, and `off` and `full`
+  for vhd, so a host-side gate added later would fail no test and these
+  tables would go stale again the same way. The review round filed that
+  as #898 rather than fixing it here: qemu-img refuses these resizes, so
+  there is no baseline to compare against, and the matrix mirrors
+  `instar-testdata`'s generator, making it a cross-repository change
+  rather than a correction.
+
 * **The block-size range without its constraint.** `docs/convert.md`
   (twice) and `docs/format-coverage.md` gave the VHDX block size as
   1 MiB to 256 MiB without saying it must be a power of two, which
@@ -410,60 +445,77 @@ decided each one.
   plan.
 
 * **An `unsafe fn` with no `# Safety` section.**
-  `convert_to_vhdx_fixed` in `src/operations/convert/src/main.rs`. Its
-  sibling in `create/src/main.rs` documents all nine of its own, so the
-  new function was the outlier; one was written naming the call-table
-  and buffer invariants it actually relies on.
+  `convert_to_vhdx_fixed` in `src/operations/convert/src/main.rs`. One
+  was written naming the call-table and buffer invariants it actually
+  relies on, bringing it up to the standard
+  `src/operations/create/src/main.rs` holds, where all 8 `unsafe fn` are
+  documented.
+
+  The review of this pull request corrected the reason first recorded
+  here, which was that create documents all of its own "so the new
+  function was the outlier". That is true only across files. Within
+  convert there are 22 `unsafe fn` and, with this fix, 2 `# Safety`
+  sections: the file is the outlier, not the function, and the 20
+  undocumented ones include `convert_to_vhdx`, the dynamic sibling
+  immediately above. Filed as #897 rather than fixed here, because
+  documenting 20 `unsafe fn` is its own piece of work and an audit is
+  not the place to do it. The correction is kept visible because a
+  misleading rationale in an audit record is what the next audit
+  trusts.
 
 ### Filed, not fixed
 
-Each of these has a finding behind it and a reason it is not a fix.
+Each of these has a finding behind it, an issue number, and a reason it
+is not a fix. The issues were filed during this pull request's review
+round: the five findings here were recorded as master-plan Future work
+entries first, which this plan's own definition of done does not accept
+as a disposition, and one of the five is precisely a consequence that
+was recorded in a plan and never carried into an issue.
 
-* **Nothing enforces the differential fuzzer's structural counters.**
-  Phase 11 added `STRUCTURAL_OUTCOMES` and `KNOWN_DEFECT_SKIPS` and
+* **Nothing enforces the differential fuzzer's structural counters**
+  (#892). Phase 11 added `STRUCTURAL_OUTCOMES` and `KNOWN_DEFECT_SKIPS` and
   reports them; nothing reads them. A nightly in which every structural
   comparison ended `no_pin_for_geometry` -- a pin set that stopped
-  matching, which the code's own comment names as the risk -- logs one
-  INFO line and exits 0. Making the counters a threshold anyone fails
-  on is new capability, not a defect fix.
+  matching, which the code's own comment names as the risk -- logs one INFO
+  line and exits 0. Making the counters a threshold anyone fails on is new
+  capability, not a defect fix.
 
-* **The structural oracle is wired to `op_convert` only.** `op_create`,
-  whose output is this plan's subject, still compares exit codes and
-  `qemu-img info`. So the differential fuzzer never checks that an
-  instar-*created* fixed VHDX has qemu's structure; that rests on the
-  Rust fuzz target, whose oracle is a spec model rather than qemu, and
-  on the Python pin tests. Possibly a deliberate phase 11 decision and
-  in any case a new arm, not a repair.
+* **The structural oracle is wired to `op_convert` only** (#893).
+  `op_create`, whose output is this plan's subject, still compares exit
+  codes and `qemu-img info`. So the differential fuzzer never checks that
+  an instar-*created* fixed VHDX has qemu's structure; that rests on the
+  Rust fuzz target, whose oracle is a spec model rather than qemu, and on
+  the Python pin tests. Possibly a deliberate phase 11 decision and in any
+  case a new arm, not a repair.
 
-* **`instar-testdata`'s profile validator has no gate.** Phase 10 added
-  `scripts/validate-profiles.py` because that repository's derived
-  profile directories had been silently wrong twice while the raw
-  baselines were fine. It works -- 960 version-to-profile mappings,
-  163,932 comparisons, 0 mismatches, reaching essentially all of the
-  17,271 files the plan generated -- but that repository has no CI, no
-  pre-commit and no `tox`, so it runs only when somebody types `make
-  validate-profiles`. Phase 10's plan recorded that the repository had
-  no CI; the consequence that nothing would ever run the validator it
-  was adding was never carried into Future work or an issue. That
-  dropped follow-up is the finding, and recording it is its fix.
+* **`instar-testdata`'s profile validator has no gate** (#894). Phase 10
+  added `scripts/validate-profiles.py` because that repository's derived
+  profile directories had been silently wrong twice while the raw baselines
+  were fine. It works -- 960 version-to-profile mappings, 163,932
+  comparisons, 0 mismatches, reaching essentially all of the 17,271 files
+  the plan generated -- but that repository has no CI, no pre-commit and no
+  `tox`, so it runs only when somebody types `make validate-profiles`.
+  Phase 10's plan recorded that the repository had no CI; the consequence
+  that nothing would ever run the validator it was adding was never carried
+  into Future work or an issue. That dropped follow-up is the finding, and
+  recording it is its fix.
 
-* **Two `instar-testdata` script defects**, both added by phase 10.
-  `generate-baselines.py` validates `--image` against the manifest and
-  then silently skips images the per-command loop does not apply to, so
-  `--command snapshot-list --image <valid non-qcow2 id>` generates
-  nothing and exits 0 -- the exact failure the filter's docstring claims
-  to close. And `validate-profiles.py` counts a profile whose name no
-  source produces as hand-maintained, so a stale leftover from a
-  deleted case is absorbed rather than reported. Both are in a
-  repository that takes direct commits to `main` rather than pull
-  requests, so they cannot land in this one.
+* **Two `instar-testdata` script defects** (#895), both added by phase 10.
+  `generate-baselines.py` validates `--image` against the manifest and then
+  silently skips images the per-command loop does not apply to, so
+  `--command snapshot-list --image <valid non-qcow2 id>` generates nothing
+  and exits 0 -- the exact failure the filter's docstring claims to close.
+  And `validate-profiles.py` counts a profile whose name no source produces
+  as hand-maintained, so a stale leftover from a deleted case is absorbed
+  rather than reported. Both are in a repository that takes direct commits
+  to `main` rather than pull requests, so they cannot land in this one.
 
-* **Advisories from the code-quality and security reads.** No named
+* **Advisories from the code-quality and security reads** (#896). No named
   constant for the VHDX BAT entry size, where the crate names its three
   other table entry sizes and this plan added six more bare `8`s; four
-  call-table mirror constants written as literals where a fifth in the
-  same plan uses `shared::`; and `src/crates/vhdx/src/lib.rs` growing
-  34% to 9,017 lines with a seam visible in its own banner comments.
+  call-table mirror constants written as literals where a fifth in the same
+  plan uses `shared::`; and `src/crates/vhdx/src/lib.rs` growing 34% to
+  9,017 lines with a seam visible in its own banner comments.
 
 ### Negative results worth recording
 
@@ -522,9 +574,22 @@ audit that records only what it found is half a result.
   `test_vhdx_structure.py` and `test_convert.py` unexecuted here. They
   ran in their own phases and in CI; they did not run in this audit.
   The in-scope Rust test modules *are* covered by wave 1.
-* **The mutation harnesses were not run.** A full run needs docker,
-  testdata and `/dev/kvm` together. The audit's own mutants were run,
-  on copies, in scratch directories.
+
+  **The exception is this phase's own fixes**, which the review round
+  ran rather than leaving to CI, because an audit whose remedies are the
+  only unexercised part of the tree is arguing against itself. In a
+  throwaway virtualenv built from `tests/requirements.txt`:
+  `TestVhdxFixedFixturePins` 9 tests pass in 0.7 s, and the seven
+  known-failure guards -- the one that could not fail before, plus the
+  six new ones -- pass in 0.006 s. Neither needs docker, `/dev/kvm` or
+  the instar binary, which is why they could run here; the rest of the
+  module still cannot.
+* **The full mutation harnesses were not run.** A full run needs docker,
+  testdata and `/dev/kvm` together. Its pattern check does not:
+  `tools/mutate-differencing.sh --check-patterns` reports 153 of 153
+  landing, re-run in the review round after it had caught this phase's
+  own refactor drifting both EFBIG cases. The audit's own mutants were
+  run, on copies, in scratch directories.
 * **The fuzz targets were not built.** `src/fuzz` is outside the cargo
   workspace, so `make lint` never sees it; `check-fuzz-targets.sh`
   confirms registration, not compilation. `coverage-fuzz.yml` fires on
