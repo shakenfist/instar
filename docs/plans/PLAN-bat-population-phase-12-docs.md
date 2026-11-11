@@ -320,6 +320,173 @@ worktree.
 * 12a's audit table is recorded in the execution notes, and every row
   is marked fixed, already-correct, or deliberately left with a reason.
 
+## Execution notes
+
+Implemented 2026-11-11 (+1100), in one session, on branch
+`bat-population-phase-12-docs` from `41f74d40`.
+
+### Back brief answers
+
+| Question | Answer |
+|---|---|
+| Run 12a, or go straight to the survey's five pages? | Run it as planned |
+| Is `CHANGELOG.md` really finished? | Yes, leave it alone |
+| May 12b run the pinned static qemu-img builds? | Yes |
+| May this session push and open the pull request? | Yes |
+
+The last answer is why this phase does not stop at the commit.
+
+### Step order, and the step that was added
+
+12a and 12b ran at the same time: 12a changes no file, so it could not
+collide with 12b's write to `docs/quirks.md`. 12c, 12d, 12e and 12f ran
+one after another, because each runs `pre-commit run --all-files` in the
+one shared worktree and two of those in flight trip over each other.
+
+**12f is not in the step plan above.** The management session added it
+after 12a reported, because the audit found stale claims on two pages
+the survey had never opened -- `docs/guest-architecture.md` and
+`docs/configuration.md`. Both are cross-cutting rather than per-phase
+pages, so they fall inside this phase's remit, and the four corrections
+are factual one-liners rather than rewrites. It is a separate step so
+that the scope growth is visible in the history instead of arriving
+inside an unrelated diff.
+
+### Decision 4 was worth its step
+
+The decision argued for an audit on the grounds that the survey had
+checked one axis -- the words "fixed" and "preallocation" -- and that
+nothing ruled out another page carrying the stale 32 MiB default. That
+is exactly what it found: `docs/guest-architecture.md` gives the VHDX
+writer's default block size as 32MB, and no search for "fixed" would
+have reached it, because that page does not use the word.
+
+It also found a claim worth more than the rest of the phase put
+together: the same page said the non-qcow2 sparse formats *reject*
+non-`off` preallocation. They accept it. That one predates this plan,
+and it qualifies the phase's own headline finding -- the per-phase
+constraint held for the pages each phase owned, not for every page its
+change made wrong.
+
+### 12a's audit table
+
+Rows the audit found wrong, and what became of each:
+
+| File | Claim | Outcome |
+|---|---|---|
+| `docs/format-internals.md` | creatable: vhdx dynamic only | fixed, 12c |
+| `docs/format-internals.md` | creatable: vmdk sparse + streamOptimized only | fixed, 12c |
+| `docs/format-internals.md` | "Dynamic VHDX ... 32 MiB blocks" | fixed, 12c |
+| `ARCHITECTURE.md` | creatable roster omits monolithicFlat and fixed | fixed, 12e |
+| `docs/format-coverage.md` | convert-output vhdx row: dynamic only | fixed, 12d |
+| `docs/format-coverage.md` | VHDX note: dynamic output, one block-size tier | fixed, 12d |
+| `docs/format-coverage.md` | output-side prose names no VHDX subformat, no preallocation | fixed, 12d |
+| `docs/guest-architecture.md` | VHDX writer "default 32MB", dynamic only | fixed, 12f |
+| `docs/guest-architecture.md` | non-qcow2 formats "reject non-`off` preallocation" | fixed, 12f |
+| `docs/guest-architecture.md` | "vhdx default block_size" a live writer divergence | fixed, 12f |
+| `docs/configuration.md` | `-O FORMAT` offers "(raw, qcow2)" | fixed, 12f |
+
+Rows the audit checked and found correct, so deliberately left: the
+`create / convert-output / dd-output` roster table and the resize rows
+in `docs/format-coverage.md`; `docs/dd.md`'s block-size tiers;
+`AGENTS.md` and `README.md`, which name write formats without claiming a
+subformat; `docs/create.md`, `docs/convert.md`, `docs/measure.md`,
+`docs/resize.md`, `docs/info.md`, `docs/quirks.md` and
+`docs/testing.md`; `docs/commentary/reading-order.md`; and
+`docs/guest-architecture.md`'s resize and dd-output claims.
+
+Two rows the audit could not resolve and the management session then
+settled. `docs/configuration.md`'s `-O` cell was resolved by its own
+section heading, "Convert Options", which makes it instar's flag table
+rather than an integration wish-list, and then against
+`parse_output_format`, which accepts five formats and lists all five in
+its error message -- so it was fixed in 12f. `docs/usage.md`'s format
+list is an OpenStack "must support" set rather than a roster of what
+instar writes, so it is left alone.
+
+### Measurements
+
+Every qemu-img claim this phase added was measured against the pinned
+static builds under `instar-testdata/qemu-img-binaries/x86_64/`. The
+host qemu-img was never used. Transcripts are in this session's
+scratchpad under `step-12b/transcripts/`, covering `log_size` and
+dynamic `block_state_zero` at 10.2.0 and 6.0.0, their structural
+comparisons at 16 MiB and 4 GiB, the edge cases, and a sweep of all 80
+builds (`sweep-all-versions.txt`, 80 versions x 9 probes).
+
+`log_size` is honoured by qemu-img: the header's `LogLength` and the
+`bat` and `metadata` region offsets move with it, carrying the file
+length, and nothing else changes. A value that is not a whole MiB is
+rounded up rather than refused; `log_size=0` is refused and leaves a
+zero-length file.
+
+`block_state_zero=off` is honoured by qemu-img on a *dynamic* image,
+which this plan had not assumed either way: every payload BAT entry
+becomes `PAYLOAD_BLOCK_NOT_PRESENT` instead of `PAYLOAD_BLOCK_ZERO`,
+and nothing else changes. instar accepts the option and ignores it for
+a dynamic image, so this is a real divergence rather than a shared
+no-op.
+
+The management session re-measured one case from each entry
+independently on 6.0.0 and reproduced both, and separately measured the
+preallocation parity that 12d and 12f assert, because the brief had
+asserted it without evidence. That measurement is worth recording for
+the next person, because byte comparison is the wrong oracle and says
+so loudly: every qemu-img create writes fresh random identifiers, so
+two creates with the *same* mode differ too. With identical output
+filenames and the per-creation fields accounted for, `off`, `falloc`
+and `full` are indistinguishable -- vmdk differs only in its `CID`, vpc
+in its unique ID and the footer copy of it, vhdx in the two header
+write GUIDs and one metadata GUID, and all three VHDX modes compare
+structurally equal through `tests/helpers/vhdx_structure.py`.
+`metadata` is refused on all three formats.
+
+### Definition of done, extended
+
+The definition of done above was written against five pages, and the
+audit found seven. Four items were added when 12f was added, and they
+are marked as such in the report: a criterion written after seeing the
+work is weaker evidence than one written before it.
+
+* `docs/guest-architecture.md` states no single VHDX default block size,
+  and names both subformats for the VHDX writer.
+* `docs/guest-architecture.md` does not say the non-qcow2 sparse formats
+  refuse a non-`off` preallocation mode.
+* `docs/guest-architecture.md` does not list a vhdx item among the
+  writer divergences carried as per-case skips.
+* `docs/configuration.md`'s `-O FORMAT` cell names all five output
+  formats `parse_output_format` accepts.
+
+### Corrections made at source
+
+The master plan's phase 12 paragraph and the `docs/plans/index.md` row
+were corrected in this phase's planning commit, before any step ran:
+`CHANGELOG.md` recorded as already complete, the `ARCHITECTURE.md`
+trigger restated as a roster correction, and the convert-layout quirk
+marked as written by phase 8.
+
+### Review corrections to step output
+
+Each editing step's output needed at least one correction, and all but
+one were the same shape: a sentence that would have created a *fresh*
+disagreement between two pages, which is the defect this phase exists to
+remove.
+
+* 12c dropped the power-of-two constraint from the block-size range that
+  `docs/create.md` states, omitted `check` from the fixed VHDX line
+  where `docs/check.md` documents `check` accepting fixed images
+  qemu-img calls truncated, and named measuring while linking only
+  create and convert.
+* 12e and 12f each left one line past the file's wrap width after an
+  edit, rewrapped by the management session.
+
+Two steps reported that a claim came from their brief rather than from
+the code -- 12c the block-size range, 12d and 12f the preallocation
+parity and the five output formats. Both flags were warranted, and both
+gaps were the brief's rather than the step's. The parity claim in
+particular was asserted without evidence by the management session and
+then had to be measured.
+
 ## Back brief
 
 Answer before any step runs:
