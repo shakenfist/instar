@@ -3430,10 +3430,14 @@ class TestDifferencingParentAbsent(DifferencingTestBase):
                                 a_stdout, a_stderr, a_rc = self._run_op(
                                     op, orphan, tmp_orphan
                                 )
+                        # compare's exit 1 means "the images differ", so
+                        # an image it could not open takes qemu-img's exit
+                        # 2 instead (issue #807).
+                        expected_rc = 2 if op == 'compare' else 1
                         self.assertEqual(
-                            1, a_rc,
-                            f'{image_id}/{op}: expected exit 1 with the '
-                            f'parent absent; stdout={a_stdout[:400]!r} '
+                            expected_rc, a_rc,
+                            f'{image_id}/{op}: expected exit {expected_rc} '
+                            f'with the parent absent; stdout={a_stdout[:400]!r} '
                             f'stderr={a_stderr[:400]!r}'
                         )
                         self.assertIn(
