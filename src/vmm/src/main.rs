@@ -533,7 +533,9 @@ fn parse_qemu_img_size_classified(s: &str) -> Result<u64, QemuImgSizeError> {
         Some(b'G' | b'g') => (&s[..s.len() - 1], 1u64 << 30),
         Some(b'M' | b'm') => (&s[..s.len() - 1], 1u64 << 20),
         Some(b'K' | b'k') => (&s[..s.len() - 1], 1u64 << 10),
-        Some(b'b') => (&s[..s.len() - 1], 512u64),
+        // `B`/`b` is one byte, as qemu's `suffix_mul` has it — 512 is
+        // qemu-io's convention for `b`, not qemu-img's (#900).
+        Some(b'B' | b'b') => (&s[..s.len() - 1], 1u64),
         _ => (s, 1u64),
     };
     let num: u64 = num_str
@@ -545,9 +547,9 @@ fn parse_qemu_img_size_classified(s: &str) -> Result<u64, QemuImgSizeError> {
 }
 
 /// Parse a qemu-img size string with the full suffix set:
-/// `b`=512, `k`/`K`=KiB, `M`/`m`=MiB, `G`/`g`=GiB, `T`/`t`=TiB,
-/// `P`/`p`=PiB, `E`/`e`=EiB.  Used by `instar resize` for the
-/// `[+-]SIZE` argument.  Strict superset of `parse_memory_size`
+/// `B`/`b`=1 byte, `k`/`K`=KiB, `M`/`m`=MiB, `G`/`g`=GiB,
+/// `T`/`t`=TiB, `P`/`p`=PiB, `E`/`e`=EiB.  Used by `instar resize`
+/// for the `[+-]SIZE` argument.  Strict superset of `parse_memory_size`
 /// — kept as a sibling rather than replacing it to avoid
 /// disturbing the create/measure call sites.
 fn parse_qemu_img_size(s: &str) -> Result<u64, Box<dyn std::error::Error>> {
@@ -21670,7 +21672,10 @@ mod resize_size_parser_tests {
 
     #[test]
     fn qemu_img_size_suffixes() {
-        assert_eq!(parse_qemu_img_size("1b").unwrap(), 512);
+        // `b` is one byte, not qemu-io's 512-byte block (#900).
+        assert_eq!(parse_qemu_img_size("1b").unwrap(), 1);
+        assert_eq!(parse_qemu_img_size("1B").unwrap(), 1);
+        assert_eq!(parse_qemu_img_size("1024b").unwrap(), 1024);
         assert_eq!(parse_qemu_img_size("1k").unwrap(), 1024);
         assert_eq!(parse_qemu_img_size("1K").unwrap(), 1024);
         assert_eq!(parse_qemu_img_size("1M").unwrap(), 1 << 20);

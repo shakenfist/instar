@@ -145,7 +145,10 @@ RESIZE_CASES = {
 # qemu-img size-suffix grammar; ported from
 # instar-testdata/scripts/generate-baselines.py.
 _SIZE_SUFFIX_MULTIPLIERS = {
-    'b': 512,
+    # qemu-img's `b` is one byte (suffix_mul in util/cutils.c), not
+    # qemu-io's 512-byte block.
+    'B': 1,
+    'b': 1,
     'k': 1024,
     'K': 1024,
     'M': 1024 ** 2,
@@ -160,7 +163,8 @@ def parse_qemu_size(size_str):
     """Parse a qemu-img SIZE string to bytes.
 
     Same grammar as qemu-img: optional integer + single-letter
-    suffix (b/k/K/M/G/T/P/E). Bare integers are bytes.
+    suffix (B/b/k/K/M/G/T/P/E). Bare integers are bytes, as is a
+    `b` suffix.
     """
     s = size_str.strip()
     if not s:
@@ -1027,6 +1031,52 @@ RESIZE_CROSS_VALIDATION_CASES = [
     ('raw',   ('64M-to-1M-shrink',     '64M', '1M',   [],     None)),
     ('raw',   ('1M-to-4M-prealloc-full','1M', '4M',   [],     'full')),
 ]
+
+
+class TestResizeSizeSuffixes(TestResizeSmoke):
+    """The size suffixes mean what qemu-img's `suffix_mul` means.
+
+    `b` is the one worth testing: qemu-io reads it as a 512-byte
+    block and qemu-img reads it as a single byte, and instar had
+    qemu-io's value, so every `b` size was 512 times too large.
+    """
+
+    def test_b_suffix_is_one_byte(self):
+        """`2097152b` on a 1 MiB image is a grow to exactly 2 MiB.
+
+        With `b` read as 512 this asked for 1 GiB and got it.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'b.qcow2'
+            _, c_stderr, c_rc = self.run_instar_create(
+                '-f', 'qcow2', str(path), '1M')
+            self.assertEqual(c_rc, 0, f'create failed: {c_stderr}')
+            _, r_stderr, r_rc = self.run_instar_resize(
+                '-f', 'qcow2', str(path), '2097152b')
+            self.assertEqual(r_rc, 0, f'resize failed: {r_stderr}')
+            info_stdout, info_err, info_rc = self.run_instar_info(
+                path, output_format='json')
+            self.assertEqual(info_rc, 0, f'info failed: {info_err}')
+            self.assertEqual(json.loads(info_stdout)['virtual-size'],
+                             2 * 1024 ** 2)
+
+    def test_b_suffix_shrink_is_refused_without_the_flag(self):
+        """`4096b` on a 1 MiB image is a shrink, so it needs --shrink.
+
+        qemu-img refuses the same request with "Use the --shrink
+        option". With `b` read as 512 it was a 2 MiB grow and
+        instar performed it.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'b.qcow2'
+            _, c_stderr, c_rc = self.run_instar_create(
+                '-f', 'qcow2', str(path), '1M')
+            self.assertEqual(c_rc, 0, f'create failed: {c_stderr}')
+            _, stderr, rc = self.run_instar_resize(
+                '-f', 'qcow2', str(path), '4096b')
+            self.assertNotEqual(
+                rc, 0, 'expected a 4096-byte shrink to need --shrink')
+            self.assertIn('shrink', stderr.lower())
 
 
 class TestResizeCrossValidation(TestResizeSmoke):

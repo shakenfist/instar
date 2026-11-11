@@ -44,8 +44,10 @@ The SIZE positional accepts three forms, matching `qemu-img resize`:
 | `+1G`    | Additive: `current_virtual_size + 1 GiB`.               |
 | `-512M`  | Subtractive: `current_virtual_size - 512 MiB`.          |
 
-Suffix multipliers: `b`=512, `k`/`K`=1024, `M`=1024², `G`=1024³,
-`T`=1024⁴, `P`=1024⁵, `E`=1024⁶. An absent suffix is bytes.
+Suffix multipliers: `B`/`b`=1, `k`/`K`=1024, `M`=1024², `G`=1024³,
+`T`=1024⁴, `P`=1024⁵, `E`=1024⁶. An absent suffix is bytes, and so is
+`b` — qemu-img's `b` is one byte, not qemu-io's 512-byte block, so
+`4096b` is 4096 bytes and shrinks a 1 MiB image.
 
 A subtractive end-spec implies shrink, but `--shrink` must still be
 passed explicitly — it documents the user's intent to discard data
