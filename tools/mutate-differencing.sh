@@ -2704,10 +2704,12 @@ rust_case 'create-host-vhdx-fixed-backing-refusal-removed' "${VMM_MAIN}" \
 # fixed_vhdx_open_error cannot see this, because it never opens a file.
 # The test target hits EFBIG through a file-size limit, so it runs on
 # every filesystem; the 16 TiB test beside it fails the same way, but
-# only where ext4 or another ceiling makes it run.
+# only where ext4 or another ceiling makes it run. The body mutated here
+# serves convert as well, so the convert case below mutates the same
+# lines against its own test.
 integration_case 'create-host-vhdx-fixed-efbig-mapping-removed' "${VMM_MAIN}" \
-    $'    BackingStore::open(path, false, Some(geometry.fixed_file_length), false).map_err(|e| {\n        if e.raw_os_error() == Some(libc::EFBIG) {\n            let _ = std::fs::remove_file(path);\n        }\n        fixed_vhdx_open_error(&e, filename, geometry).into()\n    })' \
-    $'    BackingStore::open(path, false, Some(geometry.fixed_file_length), false).map_err(|e| { // MUTATED\n        format!("create: open \'{}\' for write failed: {}", filename, e).into()\n    })' \
+    $'    BackingStore::open(path, false, Some(geometry.fixed_file_length), false).map_err(|e| {\n        if e.raw_os_error() == Some(libc::EFBIG) {\n            let _ = std::fs::remove_file(path);\n        }\n        fixed_vhdx_open_error(op, &e, filename, geometry).into()\n    })' \
+    $'    BackingStore::open(path, false, Some(geometry.fixed_file_length), false).map_err(|e| { // MUTATED\n        format!(\"{op}: open \'{}\' for write failed: {}\", filename, e).into()\n    })' \
     'test_create.TestCreateVhdxFixedLarge.test_file_size_limit_is_refused_like_a_filesystem_ceiling'
 
 # A fixed VHDX convert, from the host's CLI gate to the guest's BAT
@@ -2755,9 +2757,15 @@ integration_case 'convert-host-vhdx-fixed-output-sized-as-dynamic' "${VMM_MAIN}"
 # The test target hits EFBIG through a file-size limit, so it runs on
 # every filesystem; the 16 TiB convert test beside it fails the same
 # way, but only where ext4 or another ceiling makes it run.
+# This mutates the same lines as the create case above, deliberately.
+# Both operations open their fixed output through one
+# open_fixed_vhdx_output, which takes the operation's name as a prefix,
+# so there is one place to break and two tests that must each notice:
+# sharing the helper would otherwise have left convert's ceiling
+# refusal resting on create's test.
 integration_case 'convert-host-vhdx-fixed-efbig-mapping-removed' "${VMM_MAIN}" \
-    $'    BackingStore::open(path, false, Some(geometry.fixed_file_length), false).map_err(|e| {\n        if e.raw_os_error() == Some(libc::EFBIG) {\n            let _ = std::fs::remove_file(path);\n            format!(\n                "convert: a fixed VHDX of {} bytes needs a {}-byte file, which the filesystem \\\n                 holding \'{}\' cannot store: {}",\n                geometry.virtual_size, geometry.fixed_file_length, filename, e\n            )\n            .into()\n        } else {\n            format!("convert: open \'{}\' for write failed: {}", filename, e).into()\n        }\n    })' \
-    $'    BackingStore::open(path, false, Some(geometry.fixed_file_length), false).map_err(|e| { // MUTATED\n        format!("convert: open \'{}\' for write failed: {}", filename, e).into()\n    })' \
+    $'    BackingStore::open(path, false, Some(geometry.fixed_file_length), false).map_err(|e| {\n        if e.raw_os_error() == Some(libc::EFBIG) {\n            let _ = std::fs::remove_file(path);\n        }\n        fixed_vhdx_open_error(op, &e, filename, geometry).into()\n    })' \
+    $'    BackingStore::open(path, false, Some(geometry.fixed_file_length), false).map_err(|e| { // MUTATED\n        format!(\"{op}: open \'{}\' for write failed: {}\", filename, e).into()\n    })' \
     'test_convert.TestConvertVhdxFixedLarge.test_file_size_limit_is_refused_like_a_filesystem_ceiling'
 
 # Fixed VHDX measure, from the host's -o parser to the guest's calculator.
