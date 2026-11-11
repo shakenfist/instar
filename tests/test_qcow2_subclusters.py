@@ -87,9 +87,16 @@ for _fixture in ('mixed_classic_nobacking_nodatafile', 'mixed_ext_nobacking_noda
 # exits non-zero, and no output is claimed correct. When instar starts reading
 # one, that check fails, and the entry has to move back to the ordinary check.
 FAILS_CLOSED = {}
-_MID_CHAIN = 'the VMM discovers no external data file below the top image, so the read fails closed (#806)'
+_MID_CHAIN = 'the VMM attaches no external data file below the top image, so it refuses the chain by name (#806)'
 for _operation in ('convert', 'compare'):
     FAILS_CLOSED[(_operation, 'data_file_mid_chain')] = _MID_CHAIN
+
+# fixture -> the phrase a fails-closed refusal must carry, so the refusal says
+# why rather than failing with no reason given, as it did before #806's
+# interim refusal.
+FAILS_CLOSED_MESSAGES = {
+    'data_file_mid_chain': 'external data files are only supported on the top image of a chain',
+}
 
 # Data-file images over qcow2 backing files that check --chain must pass
 # without a chain error.
@@ -192,6 +199,12 @@ class TestQcow2Subclusters(InstarTestBase):
                                    f'({FAILS_CLOSED[("convert", name)]}); stdout={stdout!r} stderr={stderr!r}')
         self.assertNotIn('Invalid cluster entry found', stderr, f'{name}: qemu reads this chain, so no entry in it '
                                                                 f'is invalid; stderr={stderr!r}')
+        self.assert_fails_closed_message(name, stderr)
+
+    def assert_fails_closed_message(self, name, stderr):
+        expected = FAILS_CLOSED_MESSAGES.get(name)
+        if expected is not None:
+            self.assertIn(expected, stderr, f'{name}: the refusal must say why; stderr={stderr!r}')
 
     # ---------------------------------------------------------------- compare
 
@@ -205,6 +218,12 @@ class TestQcow2Subclusters(InstarTestBase):
                                    f'({FAILS_CLOSED[("compare", name)]}); stdout={stdout!r} stderr={stderr!r}')
         self.assertNotIn('identical', stdout.lower(), f'{name}: instar compare claims the images are identical '
                                                       f'under a non-zero exit; stdout={stdout!r}')
+        # Nor that they differ: exit 1 and "Content mismatch" are a verdict,
+        # and a refusal is not one (#807).
+        self.assertIn(rc, (2, 4), f'{name}: a compare refusal must exit 2 or 4, not {rc}; stderr={stderr!r}')
+        self.assertNotIn('Content mismatch', stdout, f'{name}: a refusal reported as a difference; '
+                                                     f'stdout={stdout!r}')
+        self.assert_fails_closed_message(name, stderr)
 
     def check_compare(self, name):
         fixture = self._fixtures[name]

@@ -3482,13 +3482,25 @@ fn discover_backing_chain(
             file_size
         };
 
-        // For the top image only, check for external data file.
-        // External data files on backing images are not currently supported;
-        // only the top image's data file is discovered and passed to the guest.
+        // Only the top image's QCOW2 external data file is discovered and
+        // passed to the guest. A backing image's data file is refused by
+        // name for a caller that will compose the chain: attached without
+        // it, the backing's data device index would be 0, and every read
+        // of a cluster it maps would fail in the guest with no reason
+        // given -- "convert operation failed", "Input/output error", a
+        // rebase blaming the overlay's header (issue #806). A reporting
+        // caller reads nothing, so it lists the chain as before.
         // The data file path is untrusted (parsed from the QCOW2 header
         // inside the sandbox), so we validate it against the allowlist.
-        // For the top image only, check for QCOW2 external data file.
         let mut data_files = Vec::new();
+        if !chain.images.is_empty() && chain_use == ChainUse::Compose {
+            if let Some(ref data_path) = info_result.external_data_file {
+                return Err(ChainError::BackingDataFileUnsupported {
+                    image: current.clone(),
+                    data_file: data_path.clone(),
+                });
+            }
+        }
         if chain.images.is_empty() {
             if let Some(ref data_path) = info_result.external_data_file {
                 let data_resolved = validate_backing_path(&current, data_path, security_config)?;

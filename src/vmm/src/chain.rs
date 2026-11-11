@@ -258,6 +258,13 @@ pub enum ChainError {
     /// no read path, so treating it as raw would silently misrepresent its
     /// contents. Carries the detected format string reported by info.
     UnsupportedInputFormat(String),
+    /// A backing image (not the top of the chain) records a qcow2
+    /// external data file. Only the top image's data file is attached
+    /// to the guest, so a read through this image would find no device
+    /// behind its data and fail with no explanation (issue #806).
+    /// Carries the backing image's path and the data file reference as
+    /// its header records it, which is untrusted text.
+    BackingDataFileUnsupported { image: PathBuf, data_file: String },
     /// I/O error
     IoError(std::io::Error),
 }
@@ -293,6 +300,15 @@ impl std::fmt::Display for ChainError {
                     f,
                     "input format '{fmt}' is detected but not supported for reading \
                      (detection and info only)"
+                )
+            }
+            ChainError::BackingDataFileUnsupported { image, data_file } => {
+                write!(
+                    f,
+                    "backing image {} has an external data file ({}), and external data \
+                     files are only supported on the top image of a chain",
+                    terminal_safe(&image.to_string_lossy()),
+                    terminal_safe(data_file)
                 )
             }
             ChainError::IoError(e) => write!(f, "I/O error: {e}"),
@@ -1066,6 +1082,23 @@ pub fn check_circular_reference(path: &Path, seen_paths: &[PathBuf]) -> Result<(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn backing_data_file_refusal_names_both_files_and_escapes_them() {
+        // The data file reference comes out of the image's header, so a
+        // control character in it must not reach the terminal raw.
+        let err = ChainError::BackingDataFileUnsupported {
+            image: PathBuf::from("/images/mid.qcow2"),
+            data_file: "mid\x1b[2J.data".to_string(),
+        };
+        let message = err.to_string();
+        assert!(message.contains("/images/mid.qcow2"), "{message}");
+        assert!(
+            message.contains("only supported on the top image of a chain"),
+            "{message}"
+        );
+        assert!(!message.contains('\x1b'), "{message:?}");
+    }
 
     #[test]
     fn test_image_format_from_str() {
