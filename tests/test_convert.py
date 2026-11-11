@@ -400,6 +400,69 @@ class TestConvertRawToRaw(InstarTestBase):
             )
 
 
+class TestConvertSourceVirtualSize(InstarTestBase):
+    """The output is as big as the source, not as big as the sandbox's view of it.
+
+    A raw image has no header to state a virtual size, so the guest
+    reports the capacity of the virtio device it was given, which is
+    the file padded up to the 64 KiB input sector. convert sized its
+    output from that, so a 1536-byte raw source produced a 65536-byte
+    image, while `instar info` reported 1536 for the same file.
+    qemu-img reports a raw image's own length rounded up to a 512-byte
+    sector and converts it to exactly that.
+    """
+
+    # Source lengths and the virtual size qemu-img gives them, measured
+    # with qemu-img 10.0.13: the length rounded up to a 512-byte sector.
+    SIZES = ((100, 512), (1536, 1536), (66048, 66048), (753664, 753664))
+
+    def _make_source(self, path, length):
+        with open(path, 'wb') as f:
+            f.write(b'\xa5' * length)
+
+    def test_raw_source_length_survives_convert_to_raw(self):
+        for length, expected in self.SIZES:
+            with self.subTest(length=length):
+                with tempfile.TemporaryDirectory() as td:
+                    src = Path(td) / 'src.raw'
+                    ours = Path(td) / 'ours.raw'
+                    theirs = Path(td) / 'theirs.raw'
+                    self._make_source(src, length)
+                    _, stderr, rc = self.run_instar_convert(src, ours)
+                    self.assertEqual(rc, 0, f'convert failed: {stderr}')
+                    r = subprocess.run(
+                        ['qemu-img', 'convert', '-O', 'raw', str(src), str(theirs)],
+                        capture_output=True, text=True, timeout=120)
+                    self.assertEqual(r.returncode, 0, f'qemu-img convert: {r.stderr}')
+                    self.assertEqual(ours.stat().st_size, expected)
+                    self.assertEqual(theirs.stat().st_size, ours.stat().st_size)
+                    self.assertEqual(ours.read_bytes()[:length], src.read_bytes())
+
+    def test_raw_source_length_survives_convert_to_qcow2(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / 'src.raw'
+            out = Path(td) / 'out.qcow2'
+            self._make_source(src, 1536)
+            _, stderr, rc = self.run_instar_convert(src, out, output_format='qcow2')
+            self.assertEqual(rc, 0, f'convert failed: {stderr}')
+            r = subprocess.run(['qemu-img', 'info', '--output=json', str(out)],
+                               capture_output=True, text=True, timeout=120)
+            self.assertEqual(r.returncode, 0, f'qemu-img info: {r.stderr}')
+            self.assertEqual(json.loads(r.stdout)['virtual-size'], 1536)
+
+    def test_info_and_convert_agree_about_the_source(self):
+        """The two used to disagree: info said 1536 and convert said 65536."""
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / 'src.raw'
+            out = Path(td) / 'out.raw'
+            self._make_source(src, 1536)
+            info_out, info_err, info_rc = self.run_instar_info(src, output_format='json')
+            self.assertEqual(info_rc, 0, f'info failed: {info_err}')
+            _, stderr, rc = self.run_instar_convert(src, out)
+            self.assertEqual(rc, 0, f'convert failed: {stderr}')
+            self.assertEqual(json.loads(info_out)['virtual-size'], out.stat().st_size)
+
+
 class TestConvertErrors(InstarTestBase):
     """Test error handling in convert."""
 

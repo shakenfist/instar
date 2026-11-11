@@ -482,6 +482,15 @@ const PTE_PRESENT: u64 = 1 << 0;
 const PTE_WRITABLE: u64 = 1 << 1;
 const PTE_PAGE_SIZE: u64 = 1 << 7;
 
+/// A length as qemu-img reports it for a node it opens at sector
+/// granularity: rounded up to a 512-byte sector. That is the virtual
+/// size of an image with no header of its own -- raw, or unidentified
+/// -- and the protocol-level length of the container formats whose
+/// driver reads in sectors.
+fn sector_rounded_length(length: u64) -> u64 {
+    length.div_ceil(512) * 512
+}
+
 /// Multiplier for one qemu size suffix, or `None` when the byte is not
 /// a suffix at all. Transcribed from qemu's `suffix_mul`
 /// (`util/cutils.c`), where `B` is a single byte and is also the
@@ -2225,8 +2234,7 @@ fn print_info_result(
         // rounded up to 512-byte sectors. For structured formats (qcow2, vmdk, etc.),
         // use the virtual size from headers.
         let effective_virtual_size = if info.format == "raw" || info.format == "unknown" {
-            // Round up to 512-byte sector boundary
-            file_size.div_ceil(512) * 512
+            sector_rounded_length(file_size)
         } else {
             info.virtual_size
         };
@@ -2483,7 +2491,7 @@ fn print_info_result(
                 "raw" | "parallels" | "bochs" | "cloop" | "dmg" | "qcow"
             ) || vmdk_flat.is_some();
             let effective_child_file_length = if rounds_protocol_length {
-                child_file_length.div_ceil(512) * 512
+                sector_rounded_length(child_file_length)
             } else {
                 child_file_length
             };
@@ -2524,8 +2532,7 @@ fn print_info_result_json(
     // VMM must use the real file length instead.
     let is_unstructured = info.format == "raw" || info.format == "unknown";
     let effective_virtual_size = if is_unstructured {
-        // Round up to 512-byte sector boundary
-        child_file_length.div_ceil(512) * 512
+        sector_rounded_length(child_file_length)
     } else {
         info.virtual_size
     };
@@ -2546,7 +2553,7 @@ fn print_info_result_json(
             "parallels" | "bochs" | "cloop" | "dmg" | "qcow"
         );
     let effective_child_file_length = if rounds_protocol_length {
-        child_file_length.div_ceil(512) * 512
+        sector_rounded_length(child_file_length)
     } else {
         child_file_length
     };
@@ -2612,7 +2619,7 @@ fn print_info_result_json(
         // descriptor file as unstructured (qemu-img does) and round
         // its virtual-size up to a sector.
         let descriptor_vsize = if vmdk_flat.is_some() {
-            effective_child_file_length.div_ceil(512) * 512
+            sector_rounded_length(effective_child_file_length)
         } else {
             effective_child_file_length
         };
@@ -3651,10 +3658,23 @@ fn discover_backing_chain(
 
         // Build chain image entry
         let image_format = ImageFormat::from_str(&info_result.format);
+        // A raw or unknown image has no header stating a virtual size,
+        // so the guest reports the capacity of the virtio device it was
+        // handed, which the VMM padded up to the input sector size
+        // (64 KiB). The file's own length rounded up to a 512-byte
+        // sector is what qemu-img reports and what every caller of the
+        // chain needs: convert sized a 1536-byte raw source's output at
+        // 65536 bytes while `instar info`, which applies this rule for
+        // itself when it prints, said 1536 for the same file.
+        let virtual_size = if matches!(image_format, ImageFormat::Raw | ImageFormat::Unknown) {
+            sector_rounded_length(file_size)
+        } else {
+            info_result.virtual_size
+        };
         let chain_image = ChainImage {
             path: current.clone(),
             format: image_format,
-            virtual_size: info_result.virtual_size,
+            virtual_size,
             actual_size,
             cluster_size: info_result.cluster_size,
             backing_file_raw: info_result.backing_file.clone(),
