@@ -294,6 +294,266 @@ the management session.
 * Phase 13's row leaves its `Merged` cell empty, for the follow-up
   pull request to fill once this phase has merged.
 
+## Execution notes
+
+Run 2026-11-11 (+1100), in one session, on branch
+`bat-population-phase-13-push-audit` from `2da0c22e`.
+
+### Back brief answers
+
+| Question | Answer |
+|---|---|
+| Keep the generated `instar-testdata` baselines out of scope? | Yes, audit the validator instead |
+| May step 2e run `validate-profiles.py` in that clone? | Yes |
+| Findings: record here, or fix here? | **Fix here** -- see below |
+| May this session push and open the pull request? | Yes |
+
+### The departure, and what it cost
+
+The third answer reverses this plan's decision 5, which had findings
+recorded here and resolved in a follow-up pull request, as both the
+shared block and the `implement-phase` skill prefer. The reason they
+prefer it is that an audit-plus-fixes diff stops being reviewable as an
+audit. That was put to Mikal with the recommendation against it and he
+chose to accept it, so the reversal is recorded in its own commit
+rather than applied quietly, and two consequences were handled rather
+than left implicit: the definition-of-done item asserting this phase
+changes no code was replaced by one requiring every changed file to
+trace to a recorded finding, and this phase's own pull request is what
+marks the plan `Complete`, there being no follow-up to do it.
+
+The audit steps stayed readers throughout. Nothing in 2a to 2e changed
+a file; the fixes were made afterwards, so the audit and its remedies
+are separate commits even though they share a pull request.
+
+### Step order
+
+Step 1 ran alone, because the five judgement steps consume its resolved
+scope and its mechanical report. 2a, 2b, 2c, 2d and 2e then ran
+concurrently -- they are read-only, so they cannot collide in the one
+worktree, which is the single way a push-audit phase is cheaper than an
+implementation phase. The two fix agents ran concurrently on disjoint
+files and were told not to run `pre-commit`, which the management
+session ran once over the finished tree instead.
+
+### What the scope check was worth
+
+Every one of the six steps printed `audit scope: 78 files` and said so
+in its report. That mattered: on this machine the default scope is not
+the empty range `PUSH-AUDIT.md` warns about but 47 files of unrelated
+work, because the local `develop` branch is four merges stale. A step
+that had silently resolved it would have audited renovate bumps and
+reported them clean. One step also noted, correctly, that the line
+numbers in the pre-computed added-line extracts are per-commit and
+have shifted at HEAD, and re-derived its own from HEAD plus
+`git blame`.
+
+## Audit findings
+
+Ran 2026-11-11 (+1100). Scope resolved to **78 files** from the twelve
+merge commits, confirmed in both mechanical scripts' banners and in each
+of the five judgement steps' reports. Wave 1 passed: `make test-rust`
+gave 78 cargo suites, 2,800 tests, 0 failures, and
+`verify-info-output-parity` compared 218 images with 0 failures.
+
+The counts below separate what this plan introduced from what it
+inherited, because the distinction decides the disposition: a defect in
+the plan's own work is a finding and was fixed here, and a defect older
+than the plan is an issue to file. `git blame` against the twelve merges
+decided each one.
+
+### Fixed in this phase
+
+* **A test that could not fail.** `test_known_failures_are_in_the_matrix`
+  in `tests/test_vhdx_fixed_fixtures.py` policed `KNOWN_READ_FAILURES`,
+  which is empty by design, so its body reduced to
+  `assertEqual([], [])` and it passed against any matrix -- including one
+  that had stopped running. The known-failure branch of `_check_read`
+  had no coverage at all for the same reason. Added by `fc5e982e` in
+  phase 4's merge, so this plan's own. Both checks are now pure
+  functions, `unrun_known_failures` and `known_read_problem`, proven
+  against literal stale entries in each of the ways they must catch, in
+  the shape `known_refusal_problem` in `tests/test_create.py` already
+  used for an identically empty dict. Six mutants, each killed by
+  exactly the intended test; the management session reproduced two of
+  them independently.
+
+* **A duplicated host helper.** Phase 8 added
+  `open_fixed_vhdx_convert_output`, which re-implemented phase 7's
+  `open_fixed_vhdx_output` and inlined both of
+  `fixed_vhdx_open_error`'s message shapes with a `convert:` prefix in
+  place of `create:`. The plan had already solved this shape:
+  `check_vhdx_virtual_size(op, virtual_size)` takes the operation
+  prefix and serves five call sites. A second-order cost came with it --
+  create's separately-testable error builder had no convert equivalent,
+  so the convert wording was untested. Now parameterised by `op`, with
+  the messages proven unchanged for both.
+
+* **The resize preallocation modes, stated two ways.** This plan added
+  text to `docs/create.md` and `docs/quirks.md` saying
+  `resize --preallocation falloc|full` allocates the appended region on
+  vmdk, vpc and vhdx. Three older tables said only `off` was supported
+  there and that `falloc` and `full` were "rejected (planner gap)":
+  `docs/resize.md`'s target-format and preallocation-mode tables, and
+  `docs/format-coverage.md`'s resize table. The code agrees with the new
+  text -- the three resize crates refuse only
+  `Preallocation::Metadata`, and `run_resize_nonraw` calls
+  `apply_preallocation` for both modes -- so the tables were the stale
+  side and are corrected. The stale tables predate the plan; the
+  contradiction does not, because the plan added the claim that exposed
+  them. `metadata` remains rejected and is left saying so.
+
+* **The block-size range without its constraint.** `docs/convert.md`
+  (twice) and `docs/format-coverage.md` gave the VHDX block size as
+  1 MiB to 256 MiB without saying it must be a power of two, which
+  `vhdx::layout` requires and five other pages state. Added by this
+  plan.
+
+* **An `unsafe fn` with no `# Safety` section.**
+  `convert_to_vhdx_fixed` in `src/operations/convert/src/main.rs`. Its
+  sibling in `create/src/main.rs` documents all nine of its own, so the
+  new function was the outlier; one was written naming the call-table
+  and buffer invariants it actually relies on.
+
+### Filed, not fixed
+
+Each of these has a finding behind it and a reason it is not a fix.
+
+* **Nothing enforces the differential fuzzer's structural counters.**
+  Phase 11 added `STRUCTURAL_OUTCOMES` and `KNOWN_DEFECT_SKIPS` and
+  reports them; nothing reads them. A nightly in which every structural
+  comparison ended `no_pin_for_geometry` -- a pin set that stopped
+  matching, which the code's own comment names as the risk -- logs one
+  INFO line and exits 0. Making the counters a threshold anyone fails
+  on is new capability, not a defect fix.
+
+* **The structural oracle is wired to `op_convert` only.** `op_create`,
+  whose output is this plan's subject, still compares exit codes and
+  `qemu-img info`. So the differential fuzzer never checks that an
+  instar-*created* fixed VHDX has qemu's structure; that rests on the
+  Rust fuzz target, whose oracle is a spec model rather than qemu, and
+  on the Python pin tests. Possibly a deliberate phase 11 decision and
+  in any case a new arm, not a repair.
+
+* **`instar-testdata`'s profile validator has no gate.** Phase 10 added
+  `scripts/validate-profiles.py` because that repository's derived
+  profile directories had been silently wrong twice while the raw
+  baselines were fine. It works -- 960 version-to-profile mappings,
+  163,932 comparisons, 0 mismatches, reaching essentially all of the
+  17,271 files the plan generated -- but that repository has no CI, no
+  pre-commit and no `tox`, so it runs only when somebody types `make
+  validate-profiles`. Phase 10's plan recorded that the repository had
+  no CI; the consequence that nothing would ever run the validator it
+  was adding was never carried into Future work or an issue. That
+  dropped follow-up is the finding, and recording it is its fix.
+
+* **Two `instar-testdata` script defects**, both added by phase 10.
+  `generate-baselines.py` validates `--image` against the manifest and
+  then silently skips images the per-command loop does not apply to, so
+  `--command snapshot-list --image <valid non-qcow2 id>` generates
+  nothing and exits 0 -- the exact failure the filter's docstring claims
+  to close. And `validate-profiles.py` counts a profile whose name no
+  source produces as hand-maintained, so a stale leftover from a
+  deleted case is absorbed rather than reported. Both are in a
+  repository that takes direct commits to `main` rather than pull
+  requests, so they cannot land in this one.
+
+* **Advisories from the code-quality and security reads.** No named
+  constant for the VHDX BAT entry size, where the crate names its three
+  other table entry sizes and this plan added six more bare `8`s; four
+  call-table mirror constants written as literals where a fifth in the
+  same plan uses `shared::`; and `src/crates/vhdx/src/lib.rs` growing
+  34% to 9,017 lines with a seam visible in its own banner comments.
+
+### Negative results worth recording
+
+These are the questions the audit asked and answered cleanly. A push
+audit that records only what it found is half a result.
+
+* **The format crates ship no `.unwrap()` or `.expect()`.** The plan
+  added 63 across four crate source files, and every one is inside a
+  `#[cfg(test)]` region: 42 in `src/crates/vhdx/src/lib.rs`, 14 in
+  `create`, 5 in `measure`, 2 in `resize/src/vhdx.rs`. The same
+  production-versus-test boundary was re-checked at all twelve merge
+  commits, so no intermediate state shipped one either. These crates
+  are declared panic-free, so this was the plan's sharpest open
+  question.
+
+* **No security finding.** The new write path is checked end to end:
+  `vhdx::layout` and `fill_fixed_bat` use `checked_*` at every step with
+  `u32::try_from` for both narrowings, and `fill_fixed_bat` proves
+  `bat_entries * block_size + fixed_data_start` before writing a byte.
+  No `as u32` on anything derived from `virtual_size` or `block_size`
+  outside tests. No buffer is sized from an image-supplied value -- the
+  guest BAT slot is a constant `MAX_SECTOR_SIZE`, and convert's buffers
+  are sized from a host-validated sector size -- so nothing can overrun
+  into the call table. Zero new host-side `unsafe`. Of the 44 added
+  `unsafe` lines, 42 are test code and the two production ones are
+  `unsafe fn` declarations, not blocks.
+
+* **The VHDX layout really is one function.** `vhdx::layout` is the
+  sole producer of `VhdxLayout`, and every writer and sizer reads
+  fields off it rather than recomputing: both guest ops, three crates,
+  four host call sites and the fuzz target. No independent region
+  arithmetic survives outside the crate. The one direct
+  `calculate_bat_layout` call outside it is for a sector size the layout
+  does not model and says so.
+
+* **Three guards were proven killable by mutation**, not read and
+  trusted: the differential fuzzer's classification scan, the VHDX
+  structural comparison, and the two fuzz targets, whose expected
+  values are recomputed from the specification rather than from the
+  code under test.
+
+* **Documentation is internally consistent on the three facts that
+  moved most.** The size-scaled block size, the subformat sets, and the
+  `create`/`measure` preallocation behaviour each now read the same on
+  every page that states them, checked against the code. No file
+  outside `docs/plans/` cites a source line number or a plan phase,
+  step or decision number; line-number citations were added during the
+  plan and removed before it ended.
+
+### Coverage this audit did not have
+
+* **The Python integration suite was not run.** `wave1.sh` has no
+  integration step -- its 2,800 tests are all cargo -- and this
+  worktree has no `tests/.venv`. That leaves roughly 2,500 added lines
+  of Python test code in `test_create.py`, `test_vhdx_fixed_fixtures.py`,
+  `test_vhdx_structure.py` and `test_convert.py` unexecuted here. They
+  ran in their own phases and in CI; they did not run in this audit.
+  The in-scope Rust test modules *are* covered by wave 1.
+* **The mutation harnesses were not run.** A full run needs docker,
+  testdata and `/dev/kvm` together. The audit's own mutants were run,
+  on copies, in scratch directories.
+* **The fuzz targets were not built.** `src/fuzz` is outside the cargo
+  workspace, so `make lint` never sees it; `check-fuzz-targets.sh`
+  confirms registration, not compilation. `coverage-fuzz.yml` fires on
+  `pull_request` for those paths, so CI covers it.
+* **`instar-testdata`'s 17,271 generated baselines were not read**, by
+  decision. The validator was run instead and its reach measured.
+* **The validator proves the derived profiles equal the raw baselines,
+  not that the raw baselines are right.** It cannot detect a wrong raw
+  baseline, and six output types have no version map and are skipped
+  entirely -- none of them in this plan's range.
+
+### Corrections the audit made to this plan's own text
+
+Three claims in this plan or in the briefs written from it were wrong,
+and each was caught by the step it was given to:
+
+* **"Five fuzz targets were added across the plan."** One was:
+  `fuzz_vhdx_fixed_bat.rs`. The scope table's "5 files under
+  `src/fuzz/`" counts three modified targets and `Cargo.toml`.
+  Confirmed by `--diff-filter=A` across all twelve merges.
+* **"Both documentation rules are pre-commit-enforced."** Only
+  `docs-line-references` is. There is no hook for plan-phase citations,
+  so that rule rests on review, and the plan should not have implied
+  otherwise.
+* **One production `unsafe` was attributed to
+  `src/crates/vhdx/src/lib.rs`.** It is inside that file's
+  `#[cfg(test)] mod tests`, so 42 of the 44 added `unsafe` lines are
+  test code and only two are production.
+
 ## Back brief
 
 Answer before any step runs:
