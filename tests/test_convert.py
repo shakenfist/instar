@@ -7522,8 +7522,10 @@ class TestConvertDetectOnlyRefusal(InstarTestBase):
     def test_convert_iso_passthrough(self):
         """convert keeps reading iso as raw (deliberate qemu parity).
 
-        Pins the raw pass-through: rc 0, output sector-padded to the
-        393216-byte virtual size.
+        Pins the raw pass-through: rc 0, output is the exact 376832-byte
+        container length -- the file's own length rounded up to a sector,
+        as qemu-img sizes a raw source -- not the 64 KiB-padded 393216
+        the guest's virtio device reports (#821).
         """
         image = self._refusal_image('iso-simple')
         with tempfile.NamedTemporaryFile(suffix='.raw') as out:
@@ -7531,4 +7533,4 @@ class TestConvertDetectOnlyRefusal(InstarTestBase):
                 image.path, Path(out.name)
             )
             self.assertEqual(rc, 0, f'iso convert should succeed; stderr={stderr!r}')
-            self.assertEqual(os.path.getsize(out.name), 393216)
+            self.assertEqual(os.path.getsize(out.name), 376832)
