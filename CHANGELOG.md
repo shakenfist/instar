@@ -1204,6 +1204,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+- **Two qcow2 L2 entry shapes qemu refuses are now refused by name.**
+  Both are corruption checks in qemu's `qcow2_get_host_offset` rather
+  than in its subcluster classifier, which is why transcribing the
+  classifier did not pick them up, and both apply to every qcow2 image
+  rather than only to one with an external data file. A host cluster
+  offset that is not a multiple of the cluster size is refused as
+  `Cluster allocation offset unaligned`; the all-zeroes flag in a v2
+  image, where the flag does not exist, as `Zero cluster entry found in
+  pre-v3 image`. Before this, `instar map` printed the host offset qemu
+  calls invalid and exited 0, `measure` counted the cluster, and
+  `convert` zero-filled a pre-v3 cluster whose own host offset holds
+  data and reported success. The chain reader, `map` and `measure` all
+  apply the rules, so one image no longer gets three answers; `info`
+  still opens such an image, as `qemu-img info` does, and `check`
+  reports what qemu-img check reports. Measured against qemu-img
+  10.0.13. Closes
+  [#812](https://github.com/shakenfist/instar/issues/812).
+
 - **An extended-L2 qcow2 needs clusters of at least 16 KiB, in both
   directions.** qemu refuses to open an extended-L2 image whose
   subclusters would be under 512 bytes ("Unsupported subcluster size:

@@ -826,6 +826,14 @@ struct SerialDecoder {
     /// `shared::DataFileEntryRefusal::OPERATION`. Same pattern as
     /// `last_invalid_l2_entry`, and rendered wherever that is.
     last_data_file_entry: Option<(u64, u32)>,
+    /// The last qcow2 L2 entry the guest refused under one of qemu's
+    /// two host-offset corruption rules (#812) -- an unaligned host
+    /// cluster offset, or the all-zeroes flag in a pre-v3 image -- as
+    /// `(guest cluster offset, status)`: the `sector` and `status`
+    /// fields of an `error` message whose `operation` is
+    /// `shared::MalformedL2EntryRefusal::OPERATION`. Same pattern as
+    /// `last_data_file_entry`, and rendered wherever that is.
+    last_malformed_l2_entry: Option<(u64, u32)>,
 }
 
 /// Maximum serial decoder buffer size: frame header + max protobuf message
@@ -840,6 +848,7 @@ impl SerialDecoder {
             last_differencing_refusal: None,
             last_invalid_l2_entry: None,
             last_data_file_entry: None,
+            last_malformed_l2_entry: None,
         }
     }
 
@@ -848,7 +857,9 @@ impl SerialDecoder {
     /// renders [`Self::l2_entry_refusal_error`] instead of its own
     /// result or failure text.
     fn l2_entry_refused(&self) -> bool {
-        self.last_invalid_l2_entry.is_some() || self.last_data_file_entry.is_some()
+        self.last_invalid_l2_entry.is_some()
+            || self.last_data_file_entry.is_some()
+            || self.last_malformed_l2_entry.is_some()
     }
 
     /// The terminal error for a read or metadata walk the guest ended by
@@ -858,10 +869,48 @@ impl SerialDecoder {
     /// renders one cannot forget the other (#665 was a refusal raised
     /// with no renderer).
     fn l2_entry_refusal_error(&self, op: &str) -> String {
-        if self.last_data_file_entry.is_some() {
+        if self.last_malformed_l2_entry.is_some() {
+            self.malformed_l2_entry_error(op)
+        } else if self.last_data_file_entry.is_some() {
             self.data_file_entry_error(op)
         } else {
             self.invalid_l2_entry_error(op)
+        }
+    }
+
+    /// Format the terminal error for a read or walk the guest refused
+    /// under one of qemu's two host-offset corruption rules (#812).
+    /// Sibling to [`Self::data_file_entry_error`].
+    ///
+    /// The wording is qemu's (`block/qcow2-cluster.c:659-662` and
+    /// `:688-692` at v10.0.0), so a user who has seen `qemu-img` refuse
+    /// the image recognises the same refusal here. qemu also prints the
+    /// L2 table's offset and the entry's index, which the refusal does
+    /// not carry; the guest cluster offset it names is the virtual
+    /// offset given here.
+    fn malformed_l2_entry_error(&self, op: &str) -> String {
+        match self.last_malformed_l2_entry {
+            Some((offset, status)) => {
+                let what = match status {
+                    shared::MalformedL2EntryRefusal::STATUS_UNALIGNED_HOST_OFFSET => {
+                        "Cluster allocation offset unaligned"
+                    }
+                    shared::MalformedL2EntryRefusal::STATUS_ZERO_FLAG_PRE_V3 => {
+                        "Zero cluster entry found in pre-v3 image"
+                    }
+                    // Only the guest writes the port, so this is a guest
+                    // that knows a rule this host does not, or a garbled
+                    // frame: say so, rather than describe the image.
+                    _ => {
+                        return format!(
+                            "{op}: guest refused a qcow2 L2 entry with an unrecognised \
+                             corruption status {status} at virtual offset {offset} ({offset:#x})"
+                        );
+                    }
+                };
+                format!("{op}: {what} at virtual offset {offset} ({offset:#x})")
+            }
+            None => format!("{op}: guest did not return a result"),
         }
     }
 
@@ -1042,6 +1091,10 @@ impl SerialDecoder {
                     // `sector` is the refused cluster's virtual byte offset,
                     // `status` the rule its entry breaks.
                     self.last_data_file_entry = Some((err.sector, err.status));
+                } else if err.operation == shared::MalformedL2EntryRefusal::OPERATION {
+                    // As above: the cluster's virtual byte offset, and
+                    // which of qemu's two host-offset rules it breaks.
+                    self.last_malformed_l2_entry = Some((err.sector, err.status));
                 }
             }
             return Some(msg);

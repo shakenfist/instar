@@ -5317,6 +5317,37 @@ entries with an allocated offset as well as to normal ones. instar's
 message omits the host offset that qemu prints, because the refusal
 carries only the virtual offset.
 
+Two more shapes are refused the same way, from the other half of
+qemu's `qcow2_get_host_offset` — the half that is not the subcluster
+classifier, which is why transcribing the classifier did not pick them
+up. Neither is a data-file rule: both apply to every qcow2 image
+([issue #812](https://github.com/shakenfist/instar/issues/812)).
+
+| Shape | instar and qemu-img | What instar did before |
+|---|---|---|
+| A host cluster offset that is not a multiple of the cluster size | refused: `Cluster allocation offset unaligned` | `map` printed the offset, `measure` counted the cluster, `convert` failed with the generic text |
+| The all-zeroes flag (bit 0) in a v2 image, where the flag does not exist | refused: `Zero cluster entry found in pre-v3 image` | the cluster read as zeros, though its own host offset held data |
+
+The second rule applies only to an entry that classifies as a zero
+cluster, which is where qemu's own check sits. In a *compressed* entry
+the low bits are part of the compressed size rather than the all-zeroes
+flag, and real v2 images are full of them: the suite's 2007
+`debian_etch_sparc_small.qcow2` carries `0x40800000000505e7` and two
+more like it. Reading bit 0 before the cluster type would refuse an
+image qemu-img converts without complaint.
+
+Measured with qemu-img 10.0.13. For the unaligned offset, `qemu-img
+map`, `measure` and `convert` all fail with `EIO` and `qemu-img check`
+reports `Data cluster is not properly aligned; L2 entry corrupted`
+(exit 2); `instar map` reported `"offset": 328192` and exit 0 for the
+same entry. For the pre-v3 zero flag, qemu-img's read path fails while
+`qemu-img check` reports no error at all, and instar's `check` likewise
+leaves it alone: the rule belongs to the read path, and `check`
+follows qemu-img.
+
+`qemu-img info` opens both images and reports them, and so does
+`instar info`: neither reads an L2 entry to answer.
+
 ## Future Additions
 
 Additional quirks will be documented here as they are discovered during
