@@ -10410,6 +10410,63 @@ mod tests {
     // backing device. `is_differencing` is false throughout, so neither
     // the sector-bitmap composition nor the differencing child's
     // bottom-of-chain refusal is ever reached.
+    /// A dynamic VHD whose BAT places a block on the image's own
+    /// metadata is refused, rather than serving that metadata to the
+    /// guest as payload.
+    ///
+    /// With a BAT entry of 0, the block's sector bitmap lands on the
+    /// footer copy and its payload on the dynamic header, so a read of
+    /// guest block 0 returned `cxsparse...` -- the image's own
+    /// structure. Measured against qemu-img 10.0.13, which reads the
+    /// same bytes out, so this is deliberately stricter than qemu and
+    /// matches what instar's VHDX reader already does (issue #662).
+    #[cfg(feature = "vhd-input")]
+    #[test]
+    fn vhd_arm_refuses_a_block_placed_on_the_images_own_metadata() {
+        let block_size = 4096u32;
+        let sound = build_vhd_dynamic_two_block(block_size);
+        let parent = build_vhd_parent_raw(2 * block_size as usize);
+
+        // Sound as built: block 0 is allocated at sector 8.
+        let devices = [
+            VhdDevice {
+                bytes: sound.clone(),
+                format: ImageFormat::Vhd,
+            },
+            VhdDevice {
+                bytes: parent.clone(),
+                format: ImageFormat::Raw,
+            },
+        ];
+        let (ok, _) = run_vhd_chain_read(&devices, 512, 0, block_size as u64);
+        assert!(ok, "the sound fixture must read, or this proves nothing");
+
+        // Repoint block 0 at sector 0: its bitmap covers the footer copy
+        // and its payload the dynamic header.
+        for entry in [0u32, 1, 3] {
+            let mut crafted = sound.clone();
+            let table_offset = 1536usize;
+            vhd_put_u32(&mut crafted, table_offset, entry);
+            let devices = [
+                VhdDevice {
+                    bytes: crafted,
+                    format: ImageFormat::Vhd,
+                },
+                VhdDevice {
+                    bytes: parent.clone(),
+                    format: ImageFormat::Raw,
+                },
+            ];
+            let (ok, out) = run_vhd_chain_read(&devices, 512, 0, block_size as u64);
+            assert!(
+                !ok,
+                "BAT entry {entry} places a block on the image's own metadata and \
+                 must be refused; the read returned {:?}",
+                &out[..8]
+            );
+        }
+    }
+
     /// A dynamic VHD whose footer copy at offset 0 carries the cookie
     /// and a wrong checksum is refused, not re-read from its trailing
     /// footer.

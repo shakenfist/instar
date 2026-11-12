@@ -1508,6 +1508,13 @@ pub struct VhdState {
     pub block_data_offset: u32,
     pub max_table_entries: u32,
     pub table_offset: u64,
+    /// File offset of the dynamic header, from the footer's
+    /// `data_offset`. Zero for a fixed VHD, which has none.
+    ///
+    /// Kept so that the BAT-placement guard can name the regions the
+    /// image itself declares; see
+    /// [`Self::block_overlaps_a_declared_region`].
+    pub header_offset: u64,
     pub current_size: u64,
     // Sector cache for BAT reads
     pub bat_cached_sector: u64,
@@ -1709,6 +1716,7 @@ impl VhdState {
             block_data_offset: bitmap_bytes,
             max_table_entries: dyn_header.max_table_entries,
             table_offset: dyn_header.table_offset,
+            header_offset: footer.data_offset,
             current_size: footer.current_size,
             bat_cached_sector: u64::MAX,
             bat_cache_buf,
@@ -1736,6 +1744,10 @@ impl VhdState {
             block_data_offset: 0,
             max_table_entries: 0,
             table_offset: 0,
+            // A fixed VHD has no dynamic header, and no BAT to place a
+            // block with, so it declares none of the regions the guard
+            // protects.
+            header_offset: 0,
             current_size: footer.current_size,
             bat_cached_sector: u64::MAX,
             bat_cache_buf,
@@ -1747,6 +1759,82 @@ impl VhdState {
     /// Check if this is a fixed VHD (raw data, no BAT).
     pub fn is_fixed(&self) -> bool {
         self.disk_type == DISK_TYPE_FIXED
+    }
+
+    /// Whether a block's byte range `[offset, offset + len)` overlaps a
+    /// region this image declares for its own metadata: the footer copy
+    /// at offset 0, the dynamic header the footer locates, or the BAT
+    /// the dynamic header locates.
+    ///
+    /// Nothing checked a BAT entry's placement, so a dynamic VHD whose
+    /// first BAT entry was 0 had its block's bitmap land on the footer
+    /// copy and its payload on the dynamic header, and instar served the
+    /// image's own structure to the guest as data (issue #662). Measured
+    /// against qemu-img 10.0.13: qemu reads such a block out too, so
+    /// this is deliberately stricter than qemu. It is the rule instar
+    /// already applies on three of its own paths -- the VHDX reader
+    /// refuses a payload block overlapping a declared region (#625,
+    /// #634), and this crate's `locator_defect` refuses a *locator*
+    /// whose data overlaps the footer or the dynamic header -- and a VHD
+    /// block is the one of the three that reaches the guest as payload.
+    ///
+    /// All four BAT consumers go through here, for the reason #634
+    /// records on the VHDX side: with the guard on the reader alone,
+    /// `map` would report a block at an offset inside the dynamic header
+    /// as data there and `measure` would count its bytes, while
+    /// `convert` refused to read it -- three answers to one question
+    /// about one image.
+    ///
+    /// The trailing footer is not among the regions. It is located by
+    /// the file's length rather than declared by the image, and the
+    /// guest knows the length only as a sector count rounded up past
+    /// end-of-file, so a range computed from it would refuse legitimate
+    /// blocks in an image whose sector size is above 512. Reads are
+    /// bounded by `input_capacity` regardless.
+    ///
+    /// Arithmetic that overflows counts as overlap: an end this cannot
+    /// compute is not one it can prove clear of a region.
+    fn block_overlaps_a_declared_region(&self, offset: u64, len: u64) -> bool {
+        if self.disk_type == DISK_TYPE_FIXED || len == 0 {
+            return false;
+        }
+        let Some(end) = offset.checked_add(len) else {
+            return true;
+        };
+
+        // The footer copy a dynamic or differencing VHD keeps at
+        // offset 0.
+        if ranges_overlap(offset, end, 0, FOOTER_SIZE as u64) {
+            return true;
+        }
+
+        let Some(header_end) = self.header_offset.checked_add(DYNAMIC_HEADER_SIZE as u64) else {
+            return true;
+        };
+        if ranges_overlap(offset, end, self.header_offset, header_end) {
+            return true;
+        }
+
+        let Some(bat_bytes) = (self.max_table_entries as u64).checked_mul(4) else {
+            return true;
+        };
+        let Some(bat_end) = self.table_offset.checked_add(bat_bytes) else {
+            return true;
+        };
+        ranges_overlap(offset, end, self.table_offset, bat_end)
+    }
+
+    /// The byte range a block occupies: its 512-byte sector bitmap, if
+    /// it has one, followed by its payload.
+    ///
+    /// The whole block is checked rather than the bytes one read wants,
+    /// so that the answer for an entry does not depend on where in the
+    /// block the read began.
+    fn block_extent(&self, block_host_offset: u64) -> (u64, u64) {
+        (
+            block_host_offset,
+            (self.block_data_offset as u64).saturating_add(self.block_size as u64),
+        )
     }
 
     /// Look up the host location for a given virtual byte offset.
@@ -1801,6 +1889,10 @@ impl VhdState {
         // BAT entry is the absolute sector number (512-byte sectors)
         // of the block's sector bitmap. Data follows the bitmap.
         let block_host_offset = (bat_entry as u64).checked_mul(512)?;
+        let (extent_start, extent_len) = self.block_extent(block_host_offset);
+        if self.block_overlaps_a_declared_region(extent_start, extent_len) {
+            return None;
+        }
         let data_start = block_host_offset.checked_add(self.block_data_offset as u64)?;
 
         // Offset within the block
@@ -1881,6 +1973,10 @@ impl VhdState {
         // BAT entry is the absolute sector number (512-byte sectors) of
         // the block's sector bitmap. Data follows the bitmap.
         let bitmap_host_offset = (bat_entry as u64).checked_mul(512)?;
+        let (extent_start, extent_len) = self.block_extent(bitmap_host_offset);
+        if self.block_overlaps_a_declared_region(extent_start, extent_len) {
+            return None;
+        }
         let data_start = bitmap_host_offset.checked_add(self.block_data_offset as u64)?;
 
         // Offset within the block, and the 512-byte sector it lands in.
@@ -2057,7 +2153,23 @@ impl VhdState {
                 (total_bat_bytes - bat_bytes_consumed).min((buf_end - buf_start) as u64) as usize;
             let meaningful = &chunk[..meaningful_len];
 
-            allocated_blocks += count_allocated_in_bat(meaningful);
+            // Counted entry by entry rather than with
+            // `count_allocated_in_bat`, because each allocated entry's
+            // placement is checked as the reader checks it: measure
+            // must not count the bytes of a block the reader refuses
+            // to read (issue #662).
+            for c in meaningful.chunks_exact(4) {
+                let entry = u32::from_be_bytes([c[0], c[1], c[2], c[3]]);
+                if entry == BAT_UNALLOCATED {
+                    continue;
+                }
+                let block_host_offset = (entry as u64).saturating_mul(512);
+                let (extent_start, extent_len) = self.block_extent(block_host_offset);
+                if self.block_overlaps_a_declared_region(extent_start, extent_len) {
+                    return None;
+                }
+                allocated_blocks += 1;
+            }
             bat_bytes_consumed += meaningful_len as u64;
 
             sector += 1;
@@ -2190,6 +2302,19 @@ impl VhdState {
                     break 'walk;
                 }
                 let block_visible = block_size.min(self.current_size - block_virt);
+
+                // An entry whose block lands on the image's own
+                // metadata is refused here as the reader refuses it, so
+                // map does not report a block inside the dynamic header
+                // as data at that offset while convert declines to read
+                // it (issue #662).
+                if entry != BAT_UNALLOCATED {
+                    let block_host_offset = (entry as u64).saturating_mul(512);
+                    let (extent_start, extent_len) = self.block_extent(block_host_offset);
+                    if self.block_overlaps_a_declared_region(extent_start, extent_len) {
+                        return None;
+                    }
+                }
 
                 let mut ext =
                     classify_vhd_bat_entry(entry, block_virt, block_size, block_data_offset);
@@ -5057,12 +5182,80 @@ mod tests {
             block_data_offset: 512,
             max_table_entries: 4,
             table_offset: 1536,
+            // The layout every VHD writer uses: footer copy at 0,
+            // dynamic header at 512, BAT at 1536.
+            header_offset: 512,
             current_size: 4 * block_size as u64,
             bat_cached_sector: u64::MAX,
             bat_cache_buf: core::ptr::null_mut(),
             data_cached_sector: u64::MAX,
             data_cache_buf: core::ptr::null_mut(),
         }
+    }
+
+    #[test]
+    fn a_block_on_the_images_own_metadata_overlaps_a_declared_region() {
+        // The layout: footer copy [0, 512), dynamic header [512, 1536),
+        // BAT [1536, 1552) for four entries. A block is its 512-byte
+        // bitmap plus its payload.
+        let state = arithmetic_only_state(4096);
+
+        // BAT entry 0 -- the shape issue #662 names. The bitmap lands on
+        // the footer copy and the payload on the dynamic header.
+        assert!(state.block_overlaps_a_declared_region(0, 512 + 4096));
+        // A block whose bitmap starts inside the dynamic header, and one
+        // that starts on the BAT.
+        assert!(state.block_overlaps_a_declared_region(512, 512 + 4096));
+        assert!(state.block_overlaps_a_declared_region(1536, 512 + 4096));
+        // A block below the BAT whose payload runs up into it.
+        assert!(state.block_overlaps_a_declared_region(1024, 512 + 4096));
+
+        // The footer copy has to be a region in its own right. With
+        // the usual layout any block that reaches it also reaches the
+        // dynamic header, so the case that needs it is a header the
+        // footer puts far away: then a block at offset 0 overlaps the
+        // footer copy and nothing else.
+        let mut distant = arithmetic_only_state(4096);
+        distant.header_offset = 0x10_0000;
+        distant.table_offset = 0x10_1000;
+        assert!(
+            distant.block_overlaps_a_declared_region(0, 512 + 4096),
+            "a block on the footer copy must be refused even when the \
+             dynamic header and the BAT are elsewhere"
+        );
+        assert!(distant.block_overlaps_a_declared_region(0x10_0000, 512 + 4096));
+        assert!(distant.block_overlaps_a_declared_region(0x10_1000, 512 + 4096));
+        assert!(!distant.block_overlaps_a_declared_region(4 * 512, 512 + 4096));
+
+        // The first placement clear of all three: sector 4, which is
+        // where every writer in this tree puts the first block.
+        assert!(!state.block_overlaps_a_declared_region(4 * 512, 512 + 4096));
+        // Abutting the BAT's last byte is not overlapping it.
+        assert!(!state.block_overlaps_a_declared_region(1552, 512 + 4096));
+    }
+
+    #[test]
+    fn a_fixed_vhd_declares_no_regions_to_overlap() {
+        // A fixed VHD has no footer copy at offset 0, no dynamic header
+        // and no BAT: its data starts at byte 0 and the guard must not
+        // refuse it.
+        let mut state = arithmetic_only_state(4096);
+        state.disk_type = DISK_TYPE_FIXED;
+        assert!(!state.block_overlaps_a_declared_region(0, 512 + 4096));
+    }
+
+    #[test]
+    fn placement_arithmetic_that_overflows_counts_as_overlap() {
+        // Every input here is read out of the image. An end that cannot
+        // be computed is not one that can be proved clear of a region,
+        // so it is refused rather than waved through.
+        let mut state = arithmetic_only_state(4096);
+        assert!(state.block_overlaps_a_declared_region(u64::MAX - 8, 512));
+        state.header_offset = u64::MAX;
+        assert!(state.block_overlaps_a_declared_region(4 * 512, 512 + 4096));
+        state.header_offset = 512;
+        state.table_offset = u64::MAX;
+        assert!(state.block_overlaps_a_declared_region(4 * 512, 512 + 4096));
     }
 
     #[test]

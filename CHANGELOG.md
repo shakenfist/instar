@@ -1217,6 +1217,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   be 512-byte aligned, which only holds above this floor.
   Closes [#805](https://github.com/shakenfist/instar/issues/805).
 
+- **A VHD block whose BAT entry places it on the image's own metadata is
+  refused.** `VhdState::block_lookup` and `differencing_block_lookup`
+  used a BAT entry's sector number as given, so a BAT entry of 0 put a
+  block's sector bitmap on the footer copy and its payload on the
+  dynamic header, and instar served the image's own structure to the
+  guest as data. A block — bitmap plus payload — is now refused when its
+  range overlaps the footer copy at offset 0, the dynamic header or the
+  BAT, and all four BAT consumers apply the rule, so `map` and `measure`
+  cannot report a block that the chain reader refuses. qemu reads such a
+  block out, so this is deliberately stricter; it is the rule instar
+  already applied to a VHD locator's data and to a VHDX payload block.
+  Also, a VHDX parent locator is honoured only when its `LocatorType` is
+  the GUID SPEC(VHDX) 2.6.2.6 defines and the locator item carries no
+  defect: a locator declaring another type had its path reported, and
+  opened by `convert`, where libvhdi refuses the image outright.
+  Closes [#662](https://github.com/shakenfist/instar/issues/662).
+
 - **A VHDX whose metadata table declares overlapping items is refused**
   (SPEC(VHDX) 2.6.1.2). A table that laid a parent locator over the File
   Parameters, Virtual Disk Size and sector-size items read back as fully

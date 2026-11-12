@@ -1073,6 +1073,37 @@ unsafe fn parse_vhdx_metadata(
         None => return false,
     };
 
+    // SPEC(VHDX) 2.6.2.6 defines exactly one LocatorType GUID, and a
+    // locator carrying any other is not a VHDX parent locator -- it is
+    // a file saying "this is not for you" that instar read anyway.
+    // Measured: patching the GUID to `deadbeef` x4 still had instar
+    // report that locator's path, and report it as the parent `convert`
+    // would open; libvhdi refuses the whole image for it ("unsupported
+    // type indicator"). `is_vhdx_locator_type` existed for this and had
+    // no caller (issue #662).
+    //
+    // Reporting no parent is the refusal: the image claims one through
+    // `HasParent`, nothing resolves it, and every composing operation
+    // then refuses the image by name, as it does for a differencing
+    // image with no parent behind it.
+    if !locator.is_vhdx_locator_type() {
+        (call_table.verbose_print)(
+            b"info: VHDX parent locator type is not the one SPEC(VHDX) defines\n\0".as_ptr(),
+        );
+        return false;
+    }
+
+    // A locator-level defect is the same kind of statement: the item's
+    // own header does not describe the entries that follow it, so an
+    // entry's path is not something the item vouches for.
+    // `VhdxParentLocator::value_of` checks only the per-*entry* defect,
+    // so a locator declaring `key_value_count = 0xFFFF` reported its
+    // parent normally.
+    if locator.defect.is_some() {
+        (call_table.verbose_print)(b"info: VHDX parent locator item is malformed\n\0".as_ptr());
+        return false;
+    }
+
     // Which key to report is `VhdxParentLocator::preferred_path` (it
     // lives there so the preference order is tested under crates/vhdx's
     // own suite rather than as a free function here that could never

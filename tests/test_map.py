@@ -993,3 +993,104 @@ for _ot in ('human', 'json'):
             _name,
             _make_cross_profile_test(_profile, _version, _ot),
         )
+
+
+class TestMapVhdBlockPlacement(TestMapSmoke):
+    """map and measure refuse a VHD block laid on the image's metadata.
+
+    A dynamic VHD's BAT entry is the absolute 512-byte sector number of
+    a block's sector bitmap, with the payload just after it. Nothing
+    checked that placement, so an entry of 0 put the bitmap on the
+    footer copy and the payload on the dynamic header, and instar
+    served the image's own structure to the guest as data (#662).
+
+    This covers the two whole-BAT walks rather than the chain reader:
+    with the guard on the reader alone, `map` would report a block
+    inside the dynamic header as data at that offset and `measure`
+    would count its bytes, while `convert` refused to read the same
+    block -- three answers to one question about one image, which is
+    the trap issue #634 recorded on the VHDX side.
+
+    qemu reads such a block out (measured: `qemu-img convert` of this
+    fixture yields the image's own `cxsparse` header as payload), so
+    instar is deliberately stricter here, and matches its own VHDX
+    reader.
+    """
+
+    def _crafted_vhd(self, tmpdir, bat_entry):
+        """A dynamic VHD whose first BAT entry is `bat_entry`."""
+        import struct
+
+        path = Path(tmpdir) / 'placement.vhd'
+        r = subprocess.run(
+            ['qemu-img', 'create', '-q', '-f', 'vpc', str(path), '4M'],
+            capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, f'qemu-img create failed: {r.stderr}')
+        r = subprocess.run(
+            ['qemu-io', '-f', 'vpc', '-c', 'write -P 0x55 0 2M', str(path)],
+            capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, f'qemu-io write failed: {r.stderr}')
+
+        data = bytearray(path.read_bytes())
+        header_offset = struct.unpack_from('>Q', data, 16)[0]
+        table_offset = struct.unpack_from('>Q', data, header_offset + 16)[0]
+        sound = struct.unpack_from('>I', data, table_offset)[0]
+        self.assertNotEqual(
+            sound, bat_entry, 'the fixture already has the crafted entry')
+        struct.pack_into('>I', data, table_offset, bat_entry)
+        path.write_bytes(bytes(data))
+        return path
+
+    def _require_qemu(self):
+        for tool in ('qemu-img', 'qemu-io'):
+            if shutil.which(tool) is None:
+                self.skipTest(f'{tool} is not installed')
+
+    def test_map_refuses_a_block_on_the_images_own_metadata(self):
+        self._require_qemu()
+        with tempfile.TemporaryDirectory() as td:
+            # Sector 0: the block's bitmap covers the footer copy and
+            # its payload the dynamic header.
+            image = self._crafted_vhd(td, 0)
+            stdout, stderr, rc = self.run_instar_map(image)
+            self.assertNotEqual(
+                rc, 0,
+                f'map reported a block placed on the image\'s own metadata; '
+                f'stdout={stdout[:400]!r}')
+
+    def test_measure_refuses_a_block_on_the_images_own_metadata(self):
+        self._require_qemu()
+        with tempfile.TemporaryDirectory() as td:
+            image = self._crafted_vhd(td, 0)
+            instar = self.get_instar_binary()
+            r = subprocess.run(
+                [str(instar), 'measure', '-O', 'raw', str(image)],
+                capture_output=True, text=True, timeout=60)
+            self.assertNotEqual(
+                r.returncode, 0,
+                f'measure counted a block placed on the image\'s own '
+                f'metadata; stdout={r.stdout[:400]!r}')
+
+    def test_a_sound_dynamic_vhd_still_maps(self):
+        """The control: an untouched image from the same builder maps.
+
+        Without this, a guard that refused every dynamic VHD would pass
+        the two tests above.
+        """
+        self._require_qemu()
+        with tempfile.TemporaryDirectory() as td:
+            # The same fixture with its real BAT entry left alone.
+            image = self._crafted_vhd(td, 0)
+            sound = Path(td) / 'sound.vhd'
+            r = subprocess.run(
+                ['qemu-img', 'create', '-q', '-f', 'vpc', str(sound), '4M'],
+                capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            r = subprocess.run(
+                ['qemu-io', '-f', 'vpc', '-c', 'write -P 0x55 0 2M', str(sound)],
+                capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            stdout, stderr, rc = self.run_instar_map(sound)
+            self.assertEqual(rc, 0, f'a sound dynamic VHD was refused: {stderr}')
+            self.assertIn('0x200000', stdout.replace('2097152', '0x200000'))
+            del image

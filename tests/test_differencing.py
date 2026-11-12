@@ -4917,15 +4917,24 @@ class TestDifferencingCreatedChildComposes(DifferencingTestBase):
 class TestVhdxMalformedMetadata(DifferencingTestBase):
     """A VHDX whose metadata does not describe itself is refused.
 
-    A metadata table declaring two items that overlap is a structure
-    instar parsed and then ignored the verdict on: SPEC(VHDX) 2.6.1.2
-    forbids it, and the image read back as fully sound.
+    Both cases here are structures instar parsed and then ignored
+    the verdict on: a metadata table declaring two items that overlap,
+    which SPEC(VHDX) 2.6.1.2 forbids, and a parent locator carrying a
+    `LocatorType` that is not the one SPEC(VHDX) 2.6.2.6 defines. Each
+    was read as a sound image.
 
-    The fixture is built by patching a copy of `vhdx-diff-child.vhdx`
-    rather than shipped, because it is a one-field edit of a sound
-    image and shipping it would add a near-duplicate of an 11 MiB
+    The fixtures are built by patching a copy of `vhdx-diff-child.vhdx`
+    rather than shipped, because both are one-field edits of a sound
+    image and shipping them would add two near-duplicates of an 11 MiB
     fixture to instar-testdata.
     """
+
+    # SPEC(VHDX) 2.6.2.6, bytes_le, as `VHDX_PARENT_LOCATOR_TYPE_GUID`
+    # in the vhdx crate has it.
+    LOCATOR_TYPE_GUID = bytes([
+        0xB7, 0xEF, 0x4A, 0xB0, 0x9E, 0xD1, 0x81, 0x4A,
+        0xB7, 0x89, 0x25, 0xB8, 0xE9, 0x44, 0x59, 0x13,
+    ])
 
     # The metadata region of these fixtures, and the table entries for
     # the Logical and Physical Sector Size items within it. Both region
@@ -4952,6 +4961,36 @@ class TestVhdxMalformedMetadata(DifferencingTestBase):
         with tempfile.TemporaryDirectory() as td:
             child = self._child(td)
             self.assertIn('backing-filename', self._info(child))
+
+    def test_a_foreign_locator_type_is_not_a_parent_locator(self):
+        """A locator declaring another type does not name the parent.
+
+        Measured before the fix: patching the GUID to `deadbeef` x4
+        left `instar info` reporting the parent path, and reporting it
+        as the file `convert` would open. libvhdi refuses the whole
+        image for it ("unsupported type indicator"). Reporting no
+        parent is the refusal: the image claims one through HasParent,
+        so every composing operation then refuses it by name.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            child = self._child(td)
+            data = bytearray(child.read_bytes())
+            at = data.find(self.LOCATOR_TYPE_GUID)
+            self.assertNotEqual(
+                at, -1, 'the fixture carries no parent locator type GUID')
+            data[at:at + 16] = b'\xde\xad\xbe\xef' * 4
+            child.write_bytes(bytes(data))
+
+            self.assertNotIn(
+                'backing-filename', self._info(child),
+                'a locator whose type is not the spec\'s still named the '
+                'parent instar would open')
+
+            out = Path(td) / 'out.raw'
+            stdout, stderr, rc = self.run_instar_convert(
+                child, out, output_format='raw')
+            self.assert_refused('convert', 'VHDX', stdout, stderr, rc,
+                                'foreign locator type')
 
     def test_overlapping_metadata_items_are_refused(self):
         """Two metadata items claiming the same bytes are refused.
