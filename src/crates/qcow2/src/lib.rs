@@ -9907,6 +9907,19 @@ mod tests {
         img[off..off + 8].copy_from_slice(&val.to_be_bytes());
     }
 
+    /// Stamp the footer copy at offset 0 with its own checksum, which is
+    /// the last thing a VHD writer does.
+    ///
+    /// Every synthetic image below needs it: a reader that acts on a
+    /// footer's fields verifies the checksum (issue #583), so a fixture
+    /// that leaves the field zero is one no reader will open -- and one
+    /// Hyper-V, qemu and instar's own emitter would never have written.
+    #[cfg(feature = "vhd-input")]
+    fn vhd_stamp_footer_checksum(img: &mut [u8]) {
+        let checksum = vhd::compute_checksum(&img[..vhd::FOOTER_SIZE], vhd::FOOTER_CHECKSUM_OFFSET);
+        vhd_put_u32(img, vhd::FOOTER_CHECKSUM_OFFSET, checksum);
+    }
+
     /// A device in the mock chain: its raw bytes and its detected format.
     #[cfg(feature = "vhd-input")]
     struct VhdDevice {
@@ -9994,6 +10007,7 @@ mod tests {
                 }
             }
         }
+        vhd_stamp_footer_checksum(&mut img);
         img
     }
 
@@ -10034,6 +10048,7 @@ mod tests {
         vhd_put_u32(&mut img, dyn_off + vhd::DYN_MAX_TABLE_ENTRIES_OFFSET, 1);
         vhd_put_u32(&mut img, dyn_off + vhd::DYN_BLOCK_SIZE_OFFSET, block_size);
         vhd_put_u32(&mut img, table_offset as usize, vhd::BAT_UNALLOCATED);
+        vhd_stamp_footer_checksum(&mut img);
         img
     }
 
@@ -10081,6 +10096,7 @@ mod tests {
         for i in 0..block_size as u64 {
             img[payload0_off + i as usize] = vhd_child_byte(payload0_off as u64 + i);
         }
+        vhd_stamp_footer_checksum(&mut img);
         img
     }
 
@@ -10210,6 +10226,77 @@ mod tests {
     // backing device. `is_differencing` is false throughout, so neither
     // the sector-bitmap composition nor the differencing child's
     // bottom-of-chain refusal is ever reached.
+    /// A dynamic VHD whose footer copy at offset 0 carries the cookie
+    /// and a wrong checksum is refused, not re-read from its trailing
+    /// footer.
+    ///
+    /// The fallback to the last sector exists for a fixed VHD, which
+    /// keeps no copy at offset 0 at all. Using it for a *bad* copy
+    /// would open an image qemu's vpc driver refuses ("Incorrect header
+    /// checksum") with the image's two footers disagreeing about its
+    /// own geometry, so `init` tells "no footer here" from "a footer
+    /// here that does not hold up" (issue #583).
+    ///
+    /// This is the reader's own guard rather than format detection's:
+    /// detection refuses such an image too, but the guest is told the
+    /// format by the host, which can learn it from a parent image's
+    /// recorded backing format rather than by probing.
+    #[cfg(feature = "vhd-input")]
+    #[test]
+    fn vhd_init_refuses_a_bad_footer_copy_rather_than_falling_back() {
+        let block_size = 4096u32;
+        let good = build_vhd_dynamic_two_block(block_size);
+
+        // The trailing footer is sound in both images: a dynamic VHD's
+        // copy at 0 and its real footer are byte-identical, so this is
+        // exactly the shape where a fallback would succeed.
+        let mut with_tail = good.clone();
+        let tail = with_tail.len() - vhd::FOOTER_SIZE;
+        let footer: std::vec::Vec<u8> = good[..vhd::FOOTER_SIZE].to_vec();
+        with_tail[tail..].copy_from_slice(&footer);
+
+        let mut bad = with_tail.clone();
+        vhd_put_u32(&mut bad, vhd::FOOTER_CHECKSUM_OFFSET, 0xdead_beef);
+
+        for (name, img, expect_some) in [
+            ("a sound footer copy", with_tail, true),
+            ("a footer copy whose checksum fails", bad, false),
+        ] {
+            let _guard = VHD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let mut bat_buf = std::vec![0u8; MAX_SECTOR_SIZE];
+            let mut data_buf = std::vec![0u8; MAX_SECTOR_SIZE];
+            let mut bytes_read = 0u64;
+            unsafe {
+                VHD_SSZ = 512;
+                let imgs = core::ptr::addr_of_mut!(VHD_IMAGES) as *mut *const u8;
+                let lens = core::ptr::addr_of_mut!(VHD_LENS) as *mut usize;
+                *imgs = img.as_ptr();
+                *lens = img.len();
+                for i in 1..VHD_MAX_DEVS {
+                    *imgs.add(i) = core::ptr::null();
+                    *lens.add(i) = 0;
+                }
+                let call_table = vhd_call_table();
+                let cap = (call_table.get_input_capacity)(0);
+                let state = VhdState::init(
+                    &call_table,
+                    0,
+                    512,
+                    cap,
+                    bat_buf.as_mut_ptr(),
+                    data_buf.as_mut_ptr(),
+                    &mut bytes_read,
+                );
+                assert_eq!(
+                    state.is_some(),
+                    expect_some,
+                    "{name}: init should {} the image",
+                    if expect_some { "open" } else { "refuse" }
+                );
+            }
+        }
+    }
+
     #[cfg(feature = "vhd-input")]
     #[test]
     fn vhd_arm_dynamic_reads_as_a_plain_dynamic_vhd() {

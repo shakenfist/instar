@@ -720,7 +720,9 @@ supported formats:
 - **VMDK**: Validates header version (1-3), capacity > 0, grain size power of 2,
   descriptor offset within file bounds
 - **VHDX**: Validates file signature and region table signature at offset 0x30000
-- **VHD**: Validates footer cookie and disk type (2=fixed, 3=dynamic, 4=diff)
+- **VHD**: Validates footer cookie, footer checksum and disk type (2=fixed,
+  3=dynamic, 4=diff). See
+  [A `conectix` block is not a VHD footer on its own](#a-conectix-block-is-not-a-vhd-footer-on-its-own)
 
 Images with structural problems are marked with `FLAG_HAS_CORRUPTIONS` and
 report specific error counts. Images that pass validation are marked `FLAG_VALID`.
@@ -1521,6 +1523,42 @@ has no block-state switch. `measure -O vhdx` accept-ignores
 number — a fixed target is dense either way, and qemu-img cannot
 measure VHDX at all. Writing not-present entries for a dynamic
 `block_state_zero=off` is future work.
+
+### A `conectix` block is not a VHD footer on its own
+
+A VHD footer is identified by its `conectix` cookie and by its own
+checksum: the one's complement of its other 508 bytes, stored at footer
+offset 64. instar verifies both wherever it is about to *act* on a
+footer's fields — chain reads, `info`, `resize`, and the last-sector
+probe that promotes an apparently-raw file to vpc — because the cookie
+is eight bytes of payload that any file can hold by accident or by
+design, while the checksum is the only field in a footer that constrains
+the rest of it.
+
+Consequences, all measured against qemu-img 10.0.13:
+
+| Image | instar | qemu-img |
+|---|---|---|
+| dynamic VHD, footer copy at 0 fails its checksum | refused | refused ("Incorrect header checksum") |
+| fixed VHD, trailing footer fails its checksum | reported as `unknown`, i.e. not a VHD | reported as `raw` |
+| a raw file whose last sector begins with `conectix` | stays raw | stays raw |
+| dynamic VHD, *trailing* footer fails its checksum (copy at 0 is sound) | opens | opens |
+
+A dynamic VHD whose footer copy at offset 0 carries the cookie and a bad
+checksum is refused rather than read from the trailing footer instead.
+The fallback to the tail exists for a fixed VHD, which keeps no copy at
+offset 0 at all; using it for a *bad* copy would open an image qemu will
+not touch, with the image's two footers disagreeing about its geometry.
+
+`check` is the exception, and deliberately: it parses a footer without
+verifying it, so that it can decode a corrupt one and report
+`VHD footer checksum mismatch` as a finding. A reader that refuses the
+image cannot tell the user what is wrong with it.
+
+libvhdi disagrees with both: `vhdiinfo` reports a VHD whose footer
+checksum is wrong as a sound dynamic disk. libvhdi is instar's oracle for
+*differencing* VHD, which qemu-img cannot read at all; for a footer
+qemu-img does read, qemu-img is the one instar follows.
 
 ### VHD fixed subformat carries footer-only metadata
 

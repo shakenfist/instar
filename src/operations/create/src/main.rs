@@ -301,7 +301,14 @@ unsafe fn probe_backing(
         && (call_table.read_input_sector)(0, capacity - 1, header_ptr, sector_size)
     {
         let last_sector = core::slice::from_raw_parts(header_ptr, sector_size);
-        vhd_footer = vhd::VhdFooter::parse_last_sector(last_sector);
+        // The checksum is verified here, which is what stops this
+        // fallback promoting a file that merely *ends* in a sector
+        // starting with `conectix` to a VHD parent, and copying its
+        // uuid, timestamp and size into a differencing child's parent
+        // identity. `-u` is exactly the flag reached for when the file
+        // cannot be vouched for, so this is the path that most needs the
+        // footer to constrain itself (issue #583).
+        vhd_footer = vhd::VhdFooter::parse_last_sector_verified(last_sector);
         if vhd_footer.is_some() {
             format = ImageFormat::Vhd;
         }

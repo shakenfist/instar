@@ -1204,6 +1204,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+- **A VHD footer's checksum is verified before anything acts on its
+  fields.** `VhdFooter::parse` validated the `conectix` cookie and the
+  buffer length and read the checksum without checking it, so any
+  512-byte block beginning with `conectix` was an authoritative footer
+  and its size, disk type, uuid and timestamp were taken at face value.
+  The sharpest edge was `create -b`: under `-u`, with no `-F`, a backing
+  file that header-detects as raw had its last sector scanned, and a
+  match promoted it to a VHD parent and copied attacker-chosen bytes
+  into a differencing child's parent identity. Chain reads, `info`,
+  `resize`, `create`'s parent probe and last-sector format detection now
+  verify the checksum; a dynamic VHD whose footer copy at offset 0 fails
+  it is refused rather than re-read from the trailing footer, which is
+  what qemu's vpc driver does ("Incorrect header checksum"). `check`
+  still parses without verifying, so it can keep reporting the mismatch
+  as a finding. See
+  [quirks.md](https://github.com/shakenfist/instar/blob/develop/docs/quirks.md#a-conectix-block-is-not-a-vhd-footer-on-its-own).
+  Closes [#583](https://github.com/shakenfist/instar/issues/583).
+
 - **Text read from an image can no longer drive the terminal it is
   printed on.** Backing file names, external data file paths, VMDK
   create types and extent file names, snapshot IDs and tags, and the

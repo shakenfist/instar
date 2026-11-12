@@ -19,6 +19,10 @@ pub const VMDK4_MAGIC: u32 = 0x564d444b;
 pub const VMDK3_MAGIC: u32 = 0x434f5744;
 /// VHD cookie: "conectix" (big-endian at footer offset 0)
 pub const VHD_COOKIE: u64 = 0x636f6e6563746978;
+/// Size of a VHD footer in bytes.
+pub const VHD_FOOTER_SIZE: usize = 512;
+/// Byte offset of the checksum field within a VHD footer.
+pub const VHD_FOOTER_CHECKSUM_OFFSET: usize = 64;
 /// VDI magic signature (little-endian at offset 64)
 pub const VDI_MAGIC: u32 = 0xbeda107f;
 /// QED magic: "QED\0" (little-endian at offset 0)
@@ -185,8 +189,21 @@ pub fn detect_format_from_header(buffer: &[u8], len: usize, _extra_detail: bool)
     let vhd_cookie = u64::from_be_bytes([
         buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6], buffer[7],
     ]);
+    // The copy at offset 0 has to check out, or this is not the dynamic
+    // VHD it claims to be: everything downstream -- the virtual size,
+    // the disk type, the dynamic header's location, a differencing
+    // child's parent identity -- is read out of these same 512 bytes,
+    // and the checksum is the only field that constrains the rest of
+    // them (issue #583). qemu's vpc driver refuses such a file
+    // ("Incorrect header checksum"); instar declines to call it a VHD,
+    // so nothing reports a size derived from bytes nothing vouches for.
     if vhd_cookie == VHD_COOKIE {
-        return ImageFormat::Vhd;
+        if len >= VHD_FOOTER_SIZE && vhd_footer_checksum_holds(buffer) {
+            return ImageFormat::Vhd;
+        }
+        // Nothing else can match a header that begins with `conectix`,
+        // so there is no point falling through to the other magics.
+        return ImageFormat::Raw;
     }
 
     // Check VDI magic at offset 64 (little-endian)
@@ -286,9 +303,24 @@ pub fn detect_format_from_header(buffer: &[u8], len: usize, _extra_detail: bool)
 ///
 /// # Returns
 ///
-/// `ImageFormat::Vhd` if the buffer contains a valid VHD cookie, otherwise `Raw`.
+/// `ImageFormat::Vhd` if the buffer holds a whole footer whose cookie is
+/// `conectix` and whose checksum is the one the rest of the footer
+/// computes to; otherwise `Raw`.
+///
+/// The cookie alone is not enough. It is eight bytes of an image's own
+/// payload, so any file ending in a sector that happens to start with
+/// `conectix` promotes to VHD on the strength of it, and every field the
+/// footer declares -- size, disk type, parent identity -- is then taken
+/// from attacker-chosen bytes. qemu's vpc driver refuses such a file
+/// ("Incorrect header checksum"), and the checksum is the only thing in a
+/// footer that constrains the other 500 bytes, so it is verified here
+/// rather than at each of the four sites that promote a tail to VHD.
+///
+/// A buffer shorter than a whole footer cannot be checked, and an
+/// unverifiable footer is not a verified one, so it reads as `Raw`. Every
+/// production caller passes at least one 512-byte sector.
 pub fn detect_vhd_footer(buffer: &[u8]) -> ImageFormat {
-    if buffer.len() < 8 {
+    if buffer.len() < VHD_FOOTER_SIZE {
         return ImageFormat::Raw;
     }
 
@@ -297,11 +329,61 @@ pub fn detect_vhd_footer(buffer: &[u8]) -> ImageFormat {
         buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6], buffer[7],
     ]);
 
-    if cookie == VHD_COOKIE {
-        return ImageFormat::Vhd;
+    if cookie != VHD_COOKIE || !vhd_footer_checksum_holds(buffer) {
+        return ImageFormat::Raw;
     }
 
-    ImageFormat::Raw
+    ImageFormat::Vhd
+}
+
+/// Whether the 512 bytes at the start of `buffer` carry the checksum
+/// their own contents compute to.
+///
+/// The cookie says what a block claims to be; this says whether the
+/// claim is self-consistent. Both VHD detection entry points go through
+/// here -- [`detect_vhd_footer`] for the trailing footer of an
+/// apparently-raw file, and [`detect_format_from_header`] for the copy a
+/// dynamic VHD keeps at offset 0 -- so one rule decides, rather than
+/// each caller deciding whether to bother (issue #583).
+///
+/// A buffer too short to hold a whole footer cannot be checked, and an
+/// unverifiable footer is not a verified one, so it answers `false`.
+#[must_use]
+pub fn vhd_footer_checksum_holds(buffer: &[u8]) -> bool {
+    if buffer.len() < VHD_FOOTER_SIZE {
+        return false;
+    }
+    let stored = u32::from_be_bytes([
+        buffer[VHD_FOOTER_CHECKSUM_OFFSET],
+        buffer[VHD_FOOTER_CHECKSUM_OFFSET + 1],
+        buffer[VHD_FOOTER_CHECKSUM_OFFSET + 2],
+        buffer[VHD_FOOTER_CHECKSUM_OFFSET + 3],
+    ]);
+    stored == vhd_ones_complement_checksum(&buffer[..VHD_FOOTER_SIZE], VHD_FOOTER_CHECKSUM_OFFSET)
+}
+
+/// The VHD checksum of `buf`: the one's complement of the sum of its
+/// bytes, with the four bytes of the checksum field itself treated as
+/// zero.
+///
+/// Both VHD structures that carry a checksum use this rule -- the footer
+/// at [`VHD_FOOTER_CHECKSUM_OFFSET`] and the dynamic header at its own
+/// offset -- so the offset is a parameter.
+///
+/// It lives in `shared` rather than in the `vhd` crate because
+/// [`detect_vhd_footer`] needs it and `vhd` depends on `shared`, not the
+/// other way about. `vhd::compute_checksum` calls through to here, so
+/// the readers, the writers and detection cannot drift onto different
+/// arithmetic.
+pub fn vhd_ones_complement_checksum(buf: &[u8], checksum_offset: usize) -> u32 {
+    let mut sum: u32 = 0;
+    for (i, &b) in buf.iter().enumerate() {
+        if i >= checksum_offset && i < checksum_offset + 4 {
+            continue;
+        }
+        sum = sum.wrapping_add(b as u32);
+    }
+    !sum
 }
 
 /// Locate a DMG "koly" trailer within a buffer holding the final
@@ -533,6 +615,112 @@ pub fn detect_iso_at_offset(buffer: &[u8], offset: usize) -> ImageFormat {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A 512-byte footer carrying the cookie and a correct checksum,
+    /// built the way the writers build one: fill the fields, then
+    /// compute the checksum over the result.
+    fn well_formed_footer() -> [u8; VHD_FOOTER_SIZE] {
+        let mut footer = [0u8; VHD_FOOTER_SIZE];
+        footer[0..8].copy_from_slice(&VHD_COOKIE.to_be_bytes());
+        // A few non-zero fields, so the checksum is not the trivial one
+        // a run of zeroes produces: format version 1.0, disk type 2
+        // (fixed), and a size.
+        footer[12..16].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+        footer[60..64].copy_from_slice(&2u32.to_be_bytes());
+        footer[48..56].copy_from_slice(&(4 * 1024 * 1024u64).to_be_bytes());
+        let checksum =
+            vhd_ones_complement_checksum(&footer, VHD_FOOTER_CHECKSUM_OFFSET).to_be_bytes();
+        footer[VHD_FOOTER_CHECKSUM_OFFSET..VHD_FOOTER_CHECKSUM_OFFSET + 4]
+            .copy_from_slice(&checksum);
+        footer
+    }
+
+    #[test]
+    fn a_tail_footer_with_a_correct_checksum_detects_as_vhd() {
+        assert_eq!(detect_vhd_footer(&well_formed_footer()), ImageFormat::Vhd);
+    }
+
+    #[test]
+    fn a_tail_footer_with_a_wrong_checksum_stays_raw() {
+        // The cookie is the only thing a planted footer needs today;
+        // this is issue #583's `create -b` promotion, measured on the
+        // detection side. qemu's vpc driver likewise refuses a footer
+        // whose checksum disagrees.
+        let mut footer = well_formed_footer();
+        footer[VHD_FOOTER_CHECKSUM_OFFSET..VHD_FOOTER_CHECKSUM_OFFSET + 4]
+            .copy_from_slice(&0xdead_beefu32.to_be_bytes());
+        assert_eq!(detect_vhd_footer(&footer), ImageFormat::Raw);
+    }
+
+    #[test]
+    fn a_tail_whose_payload_merely_starts_with_the_cookie_stays_raw() {
+        // Image-derived bytes: the cookie followed by whatever the file
+        // happened to hold. The checksum will not agree, so this is the
+        // shape the verification is for.
+        let mut tail = [0x41u8; VHD_FOOTER_SIZE];
+        tail[0..8].copy_from_slice(&VHD_COOKIE.to_be_bytes());
+        assert_eq!(detect_vhd_footer(&tail), ImageFormat::Raw);
+    }
+
+    #[test]
+    fn a_header_footer_copy_must_also_check_out() {
+        // A dynamic VHD keeps a copy of its footer at offset 0, so this
+        // is the header-detection half of the same rule: the fields
+        // every operation then reads -- virtual size, disk type, the
+        // dynamic header's location -- come out of these 512 bytes.
+        let good = well_formed_footer();
+        assert_eq!(
+            detect_format_from_header(&good, good.len(), false),
+            ImageFormat::Vhd
+        );
+
+        let mut bad = good;
+        bad[VHD_FOOTER_CHECKSUM_OFFSET] ^= 0xff;
+        assert_eq!(
+            detect_format_from_header(&bad, bad.len(), false),
+            ImageFormat::Raw,
+            "a footer copy whose checksum fails was still called a VHD"
+        );
+
+        // A buffer holding the cookie and nothing verifiable is not a
+        // VHD either; it must not fall through to another format's
+        // magic, since offset 0 is the cookie.
+        assert_eq!(
+            detect_format_from_header(&good[..64], 64, false),
+            ImageFormat::Raw
+        );
+    }
+
+    #[test]
+    fn a_buffer_too_short_to_hold_a_footer_stays_raw() {
+        // An unverifiable footer is not a verified one. Every
+        // production caller passes a whole sector; the fuzz target does
+        // not, and must not be told a truncated buffer is a VHD.
+        let full = well_formed_footer();
+        for len in [0usize, 8, 64, VHD_FOOTER_SIZE - 1] {
+            assert_eq!(
+                detect_vhd_footer(&full[..len]),
+                ImageFormat::Raw,
+                "a {len}-byte buffer cannot be verified"
+            );
+        }
+    }
+
+    #[test]
+    fn the_checksum_ignores_the_checksum_field_itself() {
+        // Both VHD structures compute the checksum with the field
+        // treated as zero, so whatever is stored there cannot change
+        // the answer. Without this the verification could never fail:
+        // the stored value would feed its own expected value.
+        let mut footer = well_formed_footer();
+        let expected = vhd_ones_complement_checksum(&footer, VHD_FOOTER_CHECKSUM_OFFSET);
+        footer[VHD_FOOTER_CHECKSUM_OFFSET..VHD_FOOTER_CHECKSUM_OFFSET + 4]
+            .copy_from_slice(&0xffff_ffffu32.to_be_bytes());
+        assert_eq!(
+            vhd_ones_complement_checksum(&footer, VHD_FOOTER_CHECKSUM_OFFSET),
+            expected
+        );
+    }
 
     #[test]
     fn detects_vmdk_descriptor_magic() {

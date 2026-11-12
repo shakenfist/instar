@@ -1757,13 +1757,15 @@ pub fn parent_format_matches(
 /// `-u` alone is *not* `-F raw`: it leaves the hint `Unknown`, so the
 /// fallback still applies. See `docs/create.md`.
 ///
-/// What the fallback promotes is not otherwise validated: `VhdFooter`
-/// checks the cookie and not the checksum, so under `-u` a file whose
-/// last sector merely begins with `conectix` is accepted and its
-/// identity fields copied into the child. Issue #583 tracks that. It
-/// is deliberately not narrowed here, because the point of this
-/// predicate is to agree with `info`, `check` and `resize`, which
-/// reach a footer through the same lenient parse.
+/// What the fallback promotes is validated by the footer's own
+/// checksum: the caller reaches it through
+/// `VhdFooter::parse_last_sector_verified`, so a file whose last sector
+/// merely begins with `conectix` is no longer promoted, and no identity
+/// field is copied out of unconstrained bytes. That is a property of the
+/// footer, not of this predicate, which still decides only whether the
+/// tail may be looked at at all -- and it keeps this in step with
+/// `info`, `check` and `resize`, each of which now verifies the same
+/// checksum before acting on a footer's fields.
 #[must_use]
 pub fn footer_fallback_applies(detected: ImageFormat, hint: ImageFormat) -> bool {
     match detected {

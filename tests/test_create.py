@@ -47,6 +47,7 @@ _VHD_FOOTER_SIZE = 512
 _VHD_FOOTER_DATA_OFFSET = 16
 _VHD_FOOTER_TIMESTAMP = 24
 _VHD_FOOTER_DISK_TYPE = 60
+_VHD_FOOTER_CHECKSUM = 64
 _VHD_FOOTER_UUID = 68
 
 # VHD dynamic-disk header, big-endian, at the footer's data_offset.
@@ -86,6 +87,18 @@ def _vhd_child_parent_identity(data):
     return uuid, timestamp
 
 
+def _stamp_vhd_footer_checksum(footer):
+    """Write the VHD footer checksum a validating reader will expect.
+
+    The field is the ones' complement of the sum of the footer's other
+    508 bytes, so it is computed with the field itself zeroed.
+    """
+    struct.pack_into('>I', footer, _VHD_FOOTER_CHECKSUM, 0)
+    struct.pack_into('>I', footer, _VHD_FOOTER_CHECKSUM,
+                     (~sum(footer)) & 0xFFFFFFFF)
+    return footer
+
+
 def _fixed_vhd_from(dynamic_path, dest):
     """Write a fixed-subformat VHD carrying a dynamic fixture's identity.
 
@@ -105,10 +118,10 @@ def _fixed_vhd_from(dynamic_path, dest):
     struct.pack_into('>Q', footer, _VHD_FOOTER_DATA_OFFSET, 0xFFFFFFFFFFFFFFFF)
     struct.pack_into('>I', footer, _VHD_FOOTER_DISK_TYPE, 2)
     # Checksum is the ones' complement of the byte sum with the
-    # checksum field zeroed. instar's reader does not validate it, but
-    # a fixture that would fail a validating reader is not a fixture.
-    struct.pack_into('>I', footer, 64, 0)
-    struct.pack_into('>I', footer, 64, (~sum(footer)) & 0xFFFFFFFF)
+    # checksum field zeroed. Every reader that acts on a footer's
+    # fields verifies it (#583), so without this the fixture would not
+    # be read as a VHD at all.
+    _stamp_vhd_footer_checksum(footer)
     with open(dest, 'wb') as f:
         f.truncate(current_size)
         f.seek(current_size)
@@ -921,6 +934,77 @@ class TestCreateSmoke(InstarTestBase):
                 child_size('as-unsafe.qcow2', '-u'), current_size,
                 '-u suppressed the footer fallback; it asserts nothing '
                 'about the format, so only -F raw should')
+
+    def test_create_refuses_a_planted_footer_as_a_vhd_parent(self):
+        """A `conectix` block alone does not make a file a VHD parent.
+
+        `create -b` with no `-F` scans a raw-looking backing file's last
+        sector for a VHD footer, and what it finds there decides the
+        parent's size -- and, for a vpc child, is copied into the
+        child's parent identity. The cookie is eight bytes any file can
+        hold, so before #583 a raw image whose tail began with
+        `conectix` was promoted on the strength of it and sized from
+        attacker-chosen bytes. The checksum is the only field in a
+        footer that constrains the other 508, so it is now verified.
+
+        The fixture is built here rather than taken from testdata so
+        this runs without it, and the two sizes differ by construction:
+        the planted footer declares a `current_size` of 1 MiB while the
+        file itself is 4 MiB + 512, so a child sized from the footer and
+        a child sized from the file length cannot be confused.
+
+        `-u` is the flag that matters: it is what a caller reaches for
+        when they cannot vouch for the file, and it leaves the format
+        hint unset, so the fallback runs.
+        """
+        planted_size = 1 * 1024 * 1024
+        file_data_len = 4 * 1024 * 1024
+
+        def planted_parent(path, valid_checksum):
+            footer = bytearray(_VHD_FOOTER_SIZE)
+            footer[0:8] = b'conectix'
+            struct.pack_into('>Q', footer, _VHD_FOOTER_DATA_OFFSET,
+                             0xFFFFFFFFFFFFFFFF)
+            struct.pack_into('>I', footer, 12, 0x00010000)
+            struct.pack_into('>Q', footer, 48, planted_size)
+            struct.pack_into('>I', footer, _VHD_FOOTER_DISK_TYPE, 2)
+            _stamp_vhd_footer_checksum(footer)
+            if not valid_checksum:
+                struct.pack_into('>I', footer, _VHD_FOOTER_CHECKSUM,
+                                 0xDEADBEEF)
+            with open(path, 'wb') as f:
+                f.truncate(file_data_len)
+                f.seek(file_data_len)
+                f.write(bytes(footer))
+            return Path(path)
+
+        def child_virtual_size(td, parent, name):
+            child = Path(td) / name
+            _, stderr, rc = self.run_instar_create(
+                '-f', 'qcow2', '-b', parent.name, '-u', str(child), cwd=td)
+            self.assertEqual(rc, 0, f'create was refused: {stderr}')
+            stdout, stderr, rc = self.run_instar_info(child, output='json')
+            self.assertEqual(rc, 0, stderr)
+            return json.loads(stdout)['virtual-size']
+
+        with tempfile.TemporaryDirectory() as td:
+            # A correct checksum still promotes the file: the fix is
+            # about unconstrained bytes, not about refusing VHDs.
+            good = planted_parent(Path(td) / 'good.img', True)
+            self.assertEqual(
+                child_virtual_size(td, good, 'from-good.qcow2'), planted_size,
+                'a footer whose checksum holds up was not used to size the '
+                'parent, so the fallback has stopped working altogether')
+
+            # The same bytes with the checksum broken: the tail is no
+            # longer a footer, so the parent is sized as the raw file it
+            # is, which is larger than the planted declaration.
+            bad = planted_parent(Path(td) / 'bad.img', False)
+            self.assertEqual(
+                child_virtual_size(td, bad, 'from-bad.qcow2'),
+                file_data_len + _VHD_FOOTER_SIZE,
+                'a planted footer with a wrong checksum was still read as a '
+                'VHD footer, so the parent was sized from unverified bytes')
 
     def test_create_differencing_refuses_a_size_that_is_not_the_parents(self):
         """A differencing child inherits its parent's size, or is refused.
