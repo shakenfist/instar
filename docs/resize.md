@@ -70,6 +70,16 @@ any byte count, as it does under qemu-img: it has no metadata to keep
 aligned, so `instar resize -f raw disk.raw 33554433` leaves a file of
 exactly 33554433 bytes.
 
+`create` is deliberately more forgiving than `resize` here: `instar
+create -f vhdx x 33554433` succeeds, because qemu's `vhdx_co_create_opts`
+rounds a requested size up to a sector and instar matches it, while
+`instar resize -f vhdx x 33554433` fails. The asymmetry is the safer
+pair of the two defaults -- a create has no data to lose, so rounding
+is a courtesy, whereas rounding a resize down would silently discard
+what lies past the rounded size and rounding it up would hand back a
+disk bigger than the one asked for. See the VHDX and VHD create-rounding
+entries in [quirks.md](quirks.md) for the rounding `create` applies.
+
 A subtractive end-spec implies shrink, but `--shrink` must still be
 passed explicitly — it documents the user's intent to discard data
 beyond the new EOF.
@@ -101,6 +111,16 @@ clusters are discarded, so the cluster holding the new last byte stays
 allocated. A size inside the first cluster is a size like any other --
 `--shrink` to 4096 on a 64 KiB-cluster image gives a 4096-byte disk --
 and only a size of zero is refused.
+
+The kept cluster's tail is left as it was. Shrinking past the middle of
+a cluster and then growing back exposes the bytes that were above the
+new size again, rather than zeros, because the shrink discards whole
+clusters and writes nothing into the one it keeps. qemu-img does the
+same, measured on 10.0.13: a 10 MiB qcow2 holding `0xa5` across 6 MiB,
+shrunk to 5246976 and grown back to 10 MiB, reads `0xa5` for all 61440
+bytes from 5246976 to the end of that cluster under both tools. A grow
+*past* the old EOF still reads as zeros, which is what the plan's
+zero-check covers.
 
 **Image-size ceiling.** qcow2 grow is bounded only by what the
 filesystem can hold — followup-01's targeted refcount-block

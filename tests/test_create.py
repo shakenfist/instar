@@ -181,8 +181,15 @@ def _format_guid(raw):
         d1, d2, d3, rest[:2].hex(), rest[2:].hex())
 
 
-class TestCreateSmoke(InstarTestBase):
-    """End-to-end smoke tests for `instar create`."""
+class _CreateCommandHelpers:
+    """`instar create` / `instar info` wrappers, without the tests.
+
+    A class that wants the wrappers mixes this in rather than
+    subclassing a test class to inherit them: unittest discovers a
+    subclass's inherited `test_` methods too, so deriving from
+    `TestCreateSmoke` for its helpers runs all 28 of its
+    guest-spawning cases a second time under the new name.
+    """
 
     def run_instar_create(self, *args, timeout=60, cwd=None):
         """Helper: invoke `instar create` with the given args.
@@ -216,6 +223,10 @@ class TestCreateSmoke(InstarTestBase):
             return r.stdout, r.stderr, r.returncode
         except subprocess.TimeoutExpired:
             return '', f'Timeout after {timeout}s', -1
+
+
+class TestCreateSmoke(_CreateCommandHelpers, InstarTestBase):
+    """End-to-end smoke tests for `instar create`."""
 
     # ------------------------------------------------------------------
     # Baseline reachability
@@ -1183,7 +1194,7 @@ class TestCreateSmoke(InstarTestBase):
                              f'backing-filename mismatch for {path}')
 
 
-class TestCreateFractionalSize(TestCreateSmoke):
+class TestCreateFractionalSize(_CreateCommandHelpers, InstarTestBase):
     """A size may carry a decimal fraction, as qemu-img's does.
 
     qemu-img takes a fraction before a scaling suffix (do_strtosz in util/cutils.c); instar refused one, so a size

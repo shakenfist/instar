@@ -608,7 +608,7 @@ fn parse_qemu_size_classified(s: &str) -> Result<u64, QemuImgSizeError> {
     let frac_scaled = u128::from(frac_fixed) * u128::from(mul);
     // Half a byte or more of remainder rounds upwards, as qemu's
     // "Round 0.5 upward" step does.
-    let rounding = u128::from((frac_scaled as u64) >> 63);
+    let rounding = (frac_scaled >> 63) & 1;
     let total = scaled + (frac_scaled >> 64) + rounding;
     u64::try_from(total).map_err(|_| QemuImgSizeError::Overflow)
 }
@@ -3610,7 +3610,14 @@ fn discover_backing_chain(
         // (by design), but the chain config needs the real file size so
         // format readers can locate structures relative to EOF (e.g.
         // streamOptimized VMDK footer).
-        let file_size = std::fs::metadata(&current).map(|m| m.len()).unwrap_or(0);
+        //
+        // A stat failure is reported rather than read as a zero length:
+        // a raw or unknown member's virtual size is derived from this
+        // below, and a zero there surfaces downstream as "input image
+        // has zero virtual size", which names neither the file nor the
+        // real fault. The info operation has already opened the file by
+        // this point, so this is a guard, not an expected path.
+        let file_size = std::fs::metadata(&current)?.len();
         let actual_size = if info_result.actual_size > 0 {
             info_result.actual_size
         } else {
@@ -21862,6 +21869,64 @@ mod resize_size_parser_tests {
         assert_eq!(
             parse_qemu_img_size("16384.000244140625K").unwrap(),
             16_777_216
+        );
+    }
+
+    #[test]
+    fn qemu_img_size_fractions_carry_the_same_double_qemu_carries() {
+        // qemu's `do_strtosz` reads the fraction into a double before
+        // scaling it to 64.64 fixed point, so a fraction qemu cannot
+        // represent exactly is wrong in qemu too, by the same amount.
+        // That makes the double here a parity requirement rather than
+        // a shortcut: computing the fraction exactly with integer
+        // long division would make instar disagree with the oracle at
+        // the top of the range, where a double's 53-bit mantissa runs
+        // out before a 64-bit fixed-point fraction does.
+        //
+        // Measured against qemu-img 10.0.13, which echoes the size it
+        // parsed before it tries to allocate it: `qemu-img create -f
+        // raw f 1.1E` prints `size=1268213655067531680`, so an EiB
+        // value is readable without an EiB of filesystem. The exact
+        // answer for 1.1 EiB is ...673.6; both tools say ...680.
+        assert_eq!(
+            parse_qemu_img_size("1.1E").unwrap(),
+            1_268_213_655_067_531_680
+        );
+        assert_eq!(
+            parse_qemu_img_size("0.1E").unwrap(),
+            115_292_150_460_684_704
+        );
+        assert_eq!(
+            parse_qemu_img_size("3.3E").unwrap(),
+            3_804_640_965_202_595_008
+        );
+        assert_eq!(
+            parse_qemu_img_size("1.333333333333333333E").unwrap(),
+            1_537_228_672_809_129_280
+        );
+        assert_eq!(
+            parse_qemu_img_size("3.14159265358979E").unwrap(),
+            3_622_009_729_038_557_696
+        );
+        assert_eq!(
+            parse_qemu_img_size("0.123456789012345678901E").unwrap(),
+            142_335_986_942_043_632
+        );
+        assert_eq!(parse_qemu_img_size("7.7P").unwrap(), 8_669_429_282_688_205);
+        assert_eq!(parse_qemu_img_size("1.1P").unwrap(), 1_238_489_897_526_886);
+        assert_eq!(parse_qemu_img_size("1.1T").unwrap(), 1_209_462_790_554);
+        assert_eq!(parse_qemu_img_size("1.1G").unwrap(), 1_181_116_006);
+        assert_eq!(parse_qemu_img_size("1.1M").unwrap(), 1_153_434);
+        // A fraction within half a rounding step of the next whole
+        // byte saturates to it rather than wrapping, at both ends of
+        // the double's resolution. qemu-img says 1 EiB for both.
+        assert_eq!(
+            parse_qemu_img_size("0.99999999999999999999E").unwrap(),
+            1 << 60
+        );
+        assert_eq!(
+            parse_qemu_img_size("1.0000000000000000001E").unwrap(),
+            1 << 60
         );
     }
 
