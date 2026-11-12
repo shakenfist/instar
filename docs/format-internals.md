@@ -134,6 +134,18 @@ VHDX uses CRC-32C (Castagnoli) checksums, GUID-identified metadata,
 64-bit BAT entries with interleaved sector bitmap entries, and 1MB-aligned
 structures. All on-disk fields are little-endian.
 
+The metadata table must not declare two items that overlap each other
+(SPEC(VHDX) 2.6.1.2: an item "MUST NOT overlap with any other region in
+the file"), and an image whose table does is refused. Overlapping items
+have no single meaning: which item's bytes a reader uses depends on the
+reader, so the same file can describe two different disks. Neither
+oracle refuses them — libvhdi reads a clean overlap of two items as a
+sound image, and qemu-img cannot open a differencing VHDX at all — so
+this rule follows the specification rather than an implementation. It
+covers the items instar reads, each over the length the table declares
+for it; items instar does not recognise, and a GUID listed twice, are
+not checked.
+
 The check operation performs full structural validation: file identifier
 signature check, dual header CRC-32C validation with active header
 selection by sequence number, dirty log detection, region table 1 and 2

@@ -1211,6 +1211,11 @@ fn locate_metadata_items(table: &[u8]) -> Option<MetadataItemLocations> {
     let mut logical_sector_size = None;
     let mut physical_sector_size = None;
     let mut parent_locator = None;
+    // (offset, declared length) of each item recognised below, for the
+    // overlap check after the scan. Six: the five this crate reads,
+    // plus room for one more should another be recognised later.
+    let mut extents: [(u32, u32); 6] = [(0, 0); 6];
+    let mut extent_count = 0usize;
 
     for i in 0..entry_count.min(32) as usize {
         let entry_start = METADATA_TABLE_HEADER_SIZE + i * METADATA_TABLE_ENTRY_SIZE;
@@ -1233,6 +1238,49 @@ fn locate_metadata_items(table: &[u8]) -> Option<MetadataItemLocations> {
             // Metadata table entry Length, at entry offset +20
             // (SPEC(VHDX) 2.6.1.2).
             parent_locator = Some((item_offset, le_u32(table, entry_start + 20)));
+        } else {
+            continue;
+        }
+        // Every item recognised above is also recorded as an extent,
+        // so the table can be checked for items that overlap each
+        // other. Its declared Length is the extent, not the item's
+        // spec size: a table that claims more bytes for an item than
+        // the item needs is claiming those bytes.
+        if extent_count < extents.len() {
+            extents[extent_count] = (item_offset, le_u32(table, entry_start + 20));
+            extent_count += 1;
+        }
+    }
+
+    // SPEC(VHDX) 2.6.1.2: a metadata item "MUST NOT overlap with any
+    // other region in the file", which includes the other metadata
+    // items. Nothing checked, so a table declaring a parent locator on
+    // top of the File Parameters, Virtual Disk Size and sector-size
+    // items read back as fully sound: no defect, no refusal. Which
+    // item's bytes a reader then uses depends on the reader, so an
+    // image like this has no single meaning -- and `parse_parent_locator`
+    // cannot catch it even in principle, being handed only its own
+    // item's slice, with every offset it decodes relative to that
+    // slice's start (issue #576).
+    //
+    // instar's own emitter never produces one: `build_metadata` writes
+    // the five fixed items back to back and `build_parent_locator`
+    // appends the locator immediately above them. This is entirely
+    // about reading what another producer wrote.
+    //
+    // Neither oracle refuses such an image -- libvhdi reads a clean
+    // overlap of two items as sound, and qemu-img cannot open a
+    // differencing VHDX at all -- so this is the specification being
+    // followed rather than a reference implementation. Items this
+    // crate does not read are not checked, and nor is a GUID listed
+    // twice.
+    for i in 1..extent_count {
+        for j in 0..i {
+            let (a_off, a_len) = extents[i];
+            let (b_off, b_len) = extents[j];
+            if ranges_overlap(u64::from(a_off), u64::from(a_len), u64::from(b_off), b_len) {
+                return None;
+            }
         }
     }
 
@@ -7739,6 +7787,69 @@ mod tests {
         let items = parse_metadata_region(&region).unwrap();
         assert_eq!(items.virtual_disk_size, 3 * 1024 * 1024);
         assert_eq!(items.virtual_disk_size_offset, 0x10100);
+    }
+
+    #[test]
+    fn metadata_region_refuses_two_items_that_overlap() {
+        // SPEC(VHDX) 2.6.1.2: an item must not overlap another region.
+        // Point the Physical Sector Size entry at the Logical Sector
+        // Size item: both are four-byte sector sizes and both read 512,
+        // so each item is individually valid and the image reads as
+        // sound -- which is exactly the shape nothing caught (#576).
+        // Measured: libvhdi reports this image as a sound differencing
+        // disk, so the specification is the authority here, not an
+        // implementation.
+        let mut region = metadata_region(false, false);
+        let logical = METADATA_TABLE_HEADER_SIZE + 3 * METADATA_TABLE_ENTRY_SIZE;
+        let physical = METADATA_TABLE_HEADER_SIZE + 4 * METADATA_TABLE_ENTRY_SIZE;
+        assert_eq!(&region[logical..logical + 16], &LOGICAL_SECTOR_SIZE_GUID);
+        assert_eq!(&region[physical..physical + 16], &PHYSICAL_SECTOR_SIZE_GUID);
+        let logical_offset = le_u32(&region, logical + 16);
+
+        // Sound as written.
+        assert!(parse_metadata_region(&region).is_some());
+
+        write_le_u32(&mut region, physical + 16, logical_offset);
+        assert!(
+            parse_metadata_region(&region).is_none(),
+            "two metadata items at the same offset were read as sound"
+        );
+    }
+
+    #[test]
+    fn metadata_region_refuses_a_locator_laid_over_the_fixed_items() {
+        // The shape the issue describes: a parent locator item placed
+        // on top of the File Parameters, Virtual Disk Size and
+        // sector-size items rather than above them. Its own bytes are
+        // copied to the new offset, so the locator still parses; what
+        // is wrong is that two items claim the same bytes.
+        let mut region = metadata_region(true, true);
+        assert!(parse_metadata_region(&region).is_some());
+
+        let e = METADATA_TABLE_HEADER_SIZE + 5 * METADATA_TABLE_ENTRY_SIZE;
+        assert_eq!(&region[e..e + 16], &PARENT_LOCATOR_GUID);
+        let item_offset = le_u32(&region, e + 16) as usize;
+        let item_len = le_u32(&region, e + 20) as usize;
+        let item: std::vec::Vec<u8> = region[item_offset..item_offset + item_len].to_vec();
+
+        let over_the_items = METADATA_ITEMS_MIN_OFFSET as usize;
+        region[over_the_items..over_the_items + item_len].copy_from_slice(&item);
+        write_le_u32(&mut region, e + 16, over_the_items as u32);
+        assert!(
+            parse_metadata_region(&region).is_none(),
+            "a parent locator covering the fixed items was read as sound"
+        );
+    }
+
+    #[test]
+    fn metadata_region_still_accepts_items_that_merely_abut() {
+        // The guard is about overlap, not adjacency: the five items
+        // `build_metadata` writes are back to back, and the locator
+        // starts at the first free byte above them. If a half-open
+        // range were compared as closed, every image instar writes
+        // would be refused.
+        assert!(parse_metadata_region(&metadata_region(false, false)).is_some());
+        assert!(parse_metadata_region(&metadata_region(true, true)).is_some());
     }
 
     #[test]

@@ -1217,6 +1217,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   be 512-byte aligned, which only holds above this floor.
   Closes [#805](https://github.com/shakenfist/instar/issues/805).
 
+- **A VHDX whose metadata table declares overlapping items is refused**
+  (SPEC(VHDX) 2.6.1.2). A table that laid a parent locator over the File
+  Parameters, Virtual Disk Size and sector-size items read back as fully
+  sound: no defect, no refusal. Which item's bytes a reader uses depends
+  on the reader, so such an image has no single meaning. Neither oracle
+  refuses it — libvhdi reads a clean two-item overlap as sound, and
+  qemu-img cannot open a differencing VHDX at all — so this follows the
+  specification rather than an implementation.
+  Closes [#576](https://github.com/shakenfist/instar/issues/576).
+
 - **A VHD footer's checksum is verified before anything acts on its
   fields.** `VhdFooter::parse` validated the `conectix` cookie and the
   buffer length and read the checksum without checking it, so any

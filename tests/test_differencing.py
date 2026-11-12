@@ -122,6 +122,7 @@ The classes are:
 import json
 import re
 import shutil
+import struct
 import subprocess
 import tempfile
 from pathlib import Path
@@ -4911,3 +4912,79 @@ class TestDifferencingCreatedChildComposes(DifferencingTestBase):
                     finally:
                         parent_file.close()
                         child_file.close()
+
+
+class TestVhdxMalformedMetadata(DifferencingTestBase):
+    """A VHDX whose metadata does not describe itself is refused.
+
+    A metadata table declaring two items that overlap is a structure
+    instar parsed and then ignored the verdict on: SPEC(VHDX) 2.6.1.2
+    forbids it, and the image read back as fully sound.
+
+    The fixture is built by patching a copy of `vhdx-diff-child.vhdx`
+    rather than shipped, because it is a one-field edit of a sound
+    image and shipping it would add a near-duplicate of an 11 MiB
+    fixture to instar-testdata.
+    """
+
+    # The metadata region of these fixtures, and the table entries for
+    # the Logical and Physical Sector Size items within it. Both region
+    # tables name the same region offset, so one patch covers both.
+    METADATA_REGION = 0x300000
+    LOGICAL_SECTOR_SIZE_ENTRY = 0x300080
+    PHYSICAL_SECTOR_SIZE_ENTRY = 0x3000A0
+
+    def _child(self, workdir):
+        """A copy of the differencing child, beside its parent."""
+        return self.chain_copy('vhdx-diff-child', workdir)
+
+    def _info(self, image):
+        stdout, stderr, rc = self.run_instar_info(
+            image, output_format='json')
+        self.assertEqual(rc, 0, f'info failed: {stderr}')
+        return json.loads(stdout)
+
+    def test_a_sound_child_still_reports_its_parent(self):
+        """The control: without a patch, the parent is reported.
+
+        If this ever fails, the two refusal tests below prove nothing.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            child = self._child(td)
+            self.assertIn('backing-filename', self._info(child))
+
+    def test_overlapping_metadata_items_are_refused(self):
+        """Two metadata items claiming the same bytes are refused.
+
+        SPEC(VHDX) 2.6.1.2: an item must not overlap any other region.
+        The Physical Sector Size entry is pointed at the Logical Sector
+        Size item: both are four-byte sector sizes reading 512, so each
+        item is individually valid and the image read back as sound.
+        Measured: libvhdi reports this file as a sound differencing
+        disk, so the specification is the authority, not an oracle.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            child = self._child(td)
+            data = bytearray(child.read_bytes())
+            logical = struct.unpack_from(
+                '<I', data, self.LOGICAL_SECTOR_SIZE_ENTRY + 16)[0]
+            physical = struct.unpack_from(
+                '<I', data, self.PHYSICAL_SECTOR_SIZE_ENTRY + 16)[0]
+            self.assertNotEqual(
+                logical, physical,
+                'the fixture already overlaps these two items')
+            struct.pack_into(
+                '<I', data, self.PHYSICAL_SECTOR_SIZE_ENTRY + 16, logical)
+            child.write_bytes(bytes(data))
+
+            # The metadata no longer parses, so no parent is reported
+            # and the composing read is refused.
+            self.assertNotIn('backing-filename', self._info(child))
+
+            out = Path(td) / 'out.raw'
+            _, stderr, rc = self.run_instar_convert(
+                child, out, output_format='raw')
+            self.assertNotEqual(
+                rc, 0,
+                f'an image with overlapping metadata items converted: '
+                f'{stderr!r}')
