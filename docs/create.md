@@ -534,10 +534,11 @@ Create a 1 GiB qcow2 with default options:
 instar create -f qcow2 disk.qcow2 1G
 ```
 
-Same but with a 4 KiB cluster size and extended L2:
+Same but with extended L2, which needs a cluster size of at least 16 KiB
+so that its 32 subclusters are 512 bytes or more:
 
 ```
-instar create -f qcow2 -o cluster_size=4k,extended_l2=on disk.qcow2 1G
+instar create -f qcow2 -o cluster_size=16k,extended_l2=on disk.qcow2 1G
 ```
 
 Create a vmdk with the stream-optimised subformat:

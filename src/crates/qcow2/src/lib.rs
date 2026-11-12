@@ -438,6 +438,25 @@ impl QcowHeader {
         // valid `l1_size` could reference it, and downstream consumers
         // re-expanding `cluster_count * cluster_size` would overflow u64
         // (issue #438 — a rebase overlay with virtual_size ≈ u64::MAX).
+        // An extended-L2 image divides each cluster into 32 subclusters,
+        // and qemu refuses to open one whose subclusters would be under
+        // 512 bytes: "Unsupported subcluster size: N", which is any
+        // cluster size below 16 KiB. Its own `qemu-img create` refuses
+        // the same shape ("Extended L2 entries are only supported with
+        // cluster sizes of at least 16384 bytes"), so only a crafted
+        // image has it.
+        //
+        // Beyond parity, the reader's encrypted paths rest on it. In a
+        // mixed extended-L2 cluster a `Normal` run starts on a
+        // subcluster boundary, and AES-CBC and XTS decryption need
+        // 512-byte-aligned runs; that holds only while a subcluster is
+        // at least 512 bytes (issue #805).
+        if incompatible_features & INCOMPAT_EXTENDED_L2 != 0
+            && cluster_bits < MIN_EXTENDED_L2_CLUSTER_BITS
+        {
+            return None;
+        }
+
         let l2_entry_size = if incompatible_features & INCOMPAT_EXTENDED_L2 != 0 {
             16u64
         } else {
@@ -1436,6 +1455,17 @@ pub enum ClusterLookup {
 // Subcluster classification (qemu's qcow2_get_subcluster_type)
 // ============================================================================
 
+/// Smallest `cluster_bits` an extended-L2 image may declare: 14, a
+/// 16 KiB cluster, which is the smallest that divides into 32
+/// subclusters of at least 512 bytes.
+///
+/// qemu enforces the subcluster size rather than the cluster size
+/// (`Unsupported subcluster size: N` at open, and a matching refusal in
+/// `qemu-img create`), but with `QCOW_EXTL2_SUBCLUSTERS_PER_CLUSTER`
+/// fixed at 32 the two are the same rule. Expressed in bits because
+/// that is the field an image actually carries.
+pub const MIN_EXTENDED_L2_CLUSTER_BITS: u32 = 14;
+
 /// Subclusters per cluster in an extended-L2 image
 /// (`QCOW_EXTL2_SUBCLUSTERS_PER_CLUSTER`, `block/qcow2.h:81` at qemu
 /// v10.0.0). A classic image has one subcluster per cluster.
@@ -2395,6 +2425,16 @@ impl Qcow2State {
                 bytes_read,
             )?;
             state.extended_l2 = (state.incompatible_features & INCOMPAT_EXTENDED_L2) != 0;
+            // An extended-L2 image needs subclusters of at least 512
+            // bytes, so clusters of at least 16 KiB, which is what
+            // qemu enforces at open ("Unsupported subcluster size")
+            // and what `QcowHeader::parse` refuses (issue #805). The
+            // host refuses such an image before the guest runs, but
+            // the guest is told the format rather than probing for
+            // it, so the reader checks for itself.
+            if state.extended_l2 && cluster_bits < MIN_EXTENDED_L2_CLUSTER_BITS {
+                return None;
+            }
 
             // compression_type is a single byte at offset 104.
             // Read the containing u32 at offset 104 and take the
@@ -3671,6 +3711,51 @@ mod tests {
         assert_eq!(hdr.l1_size, 256);
         assert_eq!(hdr.l1_table_offset, 0x30000);
         assert_eq!(hdr.refcount_bits, 16);
+    }
+
+    #[test]
+    fn parse_rejects_extended_l2_with_subclusters_under_512_bytes() {
+        // qemu refuses to open such an image ("Unsupported subcluster
+        // size: 128" for a 4 KiB cluster) and refuses to create one.
+        // instar opened and read them, and the reader's AES-CBC and XTS
+        // paths assume a `Normal` subcluster run is 512-byte aligned,
+        // which only holds above this floor (issue #805).
+        for bits in 9..MIN_EXTENDED_L2_CLUSTER_BITS {
+            let mut buf = make_qcow2_header();
+            buf[CLUSTER_BITS_OFFSET..CLUSTER_BITS_OFFSET + 4].copy_from_slice(&bits.to_be_bytes());
+            buf[INCOMPATIBLE_FEATURES_OFFSET..INCOMPATIBLE_FEATURES_OFFSET + 8]
+                .copy_from_slice(&INCOMPAT_EXTENDED_L2.to_be_bytes());
+            assert!(
+                QcowHeader::parse(&buf).is_none(),
+                "cluster_bits {bits} gives {}-byte subclusters and must be refused",
+                (1u32 << bits) / QCOW_EXTL2_SUBCLUSTERS_PER_CLUSTER
+            );
+
+            // Without the extended-L2 feature the same cluster size is
+            // perfectly ordinary, so the floor must not leak into it.
+            buf[INCOMPATIBLE_FEATURES_OFFSET..INCOMPATIBLE_FEATURES_OFFSET + 8]
+                .copy_from_slice(&0u64.to_be_bytes());
+            let hdr = QcowHeader::parse(&buf)
+                .unwrap_or_else(|| panic!("cluster_bits {bits} is legal without extended L2"));
+            assert!(!hdr.extended_l2);
+        }
+    }
+
+    #[test]
+    fn parse_accepts_extended_l2_at_the_subcluster_floor() {
+        // 16 KiB clusters are exactly 512-byte subclusters, which is
+        // the smallest qemu accepts; measured against qemu-img 10.0.13.
+        let mut buf = make_qcow2_header();
+        buf[CLUSTER_BITS_OFFSET..CLUSTER_BITS_OFFSET + 4]
+            .copy_from_slice(&MIN_EXTENDED_L2_CLUSTER_BITS.to_be_bytes());
+        buf[INCOMPATIBLE_FEATURES_OFFSET..INCOMPATIBLE_FEATURES_OFFSET + 8]
+            .copy_from_slice(&INCOMPAT_EXTENDED_L2.to_be_bytes());
+        let hdr = QcowHeader::parse(&buf).expect("512-byte subclusters are legal");
+        assert!(hdr.extended_l2);
+        assert_eq!(
+            hdr.cluster_size / u64::from(QCOW_EXTL2_SUBCLUSTERS_PER_CLUSTER),
+            512
+        );
     }
 
     #[test]
@@ -6589,6 +6674,105 @@ mod tests {
             *out_buf.add(i) = read_test_pattern_byte(base + i as u64);
         }
         true
+    }
+
+    // ------------------------------------------------------------------
+    // Qcow2State::init over an in-memory header
+    // ------------------------------------------------------------------
+
+    /// The bytes device 0 serves to `Qcow2State::init` in the tests
+    /// below. A global with a lock because the mock callback is an
+    /// `extern "C" fn` and can close over nothing else, as every other
+    /// mock in this module does.
+    static mut INIT_IMAGE: [u8; 512] = [0u8; 512];
+    static INIT_IMAGE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    unsafe extern "C" fn init_image_read_sector(
+        _device_idx: u32,
+        sector: u64,
+        out_buf: *mut u8,
+        sector_size: usize,
+    ) -> bool {
+        if sector_size > 512 {
+            return false;
+        }
+        // Sector 0 is the header under test; the rest of the device
+        // reads as zeros, which is what a sparse image's unwritten
+        // metadata looks like.
+        core::ptr::write_bytes(out_buf, 0, sector_size);
+        if sector == 0 {
+            let image = core::ptr::addr_of!(INIT_IMAGE) as *const u8;
+            core::ptr::copy_nonoverlapping(image, out_buf, sector_size);
+        }
+        true
+    }
+
+    /// Run `Qcow2State::init` over a 512-byte header.
+    ///
+    /// The guest reader parses the header itself rather than going
+    /// through `QcowHeader::parse`, so its own validation needs its own
+    /// cover.
+    fn init_over_header(header: &[u8; 512]) -> Option<Qcow2State> {
+        let _guard = INIT_IMAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut l1 = std::vec![0u8; MAX_SECTOR_SIZE];
+        let mut l2 = std::vec![0u8; MAX_SECTOR_SIZE];
+        let mut bytes_read = 0u64;
+        unsafe {
+            let image = core::ptr::addr_of_mut!(INIT_IMAGE) as *mut u8;
+            core::ptr::copy_nonoverlapping(header.as_ptr(), image, 512);
+            let call_table = shared::CallTable {
+                read_input_sector: init_image_read_sector,
+                ..stub_call_table()
+            };
+            Qcow2State::init(
+                &call_table,
+                0,
+                512,
+                // A megabyte of device, so nothing fails for want of
+                // capacity: the header under test is what decides.
+                2048,
+                l1.as_mut_ptr(),
+                l2.as_mut_ptr(),
+                &mut bytes_read,
+            )
+        }
+    }
+
+    #[test]
+    fn the_guest_reader_refuses_extended_l2_below_the_subcluster_floor() {
+        // `Qcow2State::init` reads the header field by field rather
+        // than through `QcowHeader::parse`, so the subcluster floor has
+        // to be applied there too (issue #805). The host refuses such
+        // an image before the guest runs, but the guest is told the
+        // format rather than probing for it.
+        let mut header = make_qcow2_header();
+        header[INCOMPATIBLE_FEATURES_OFFSET..INCOMPATIBLE_FEATURES_OFFSET + 8]
+            .copy_from_slice(&INCOMPAT_EXTENDED_L2.to_be_bytes());
+
+        for bits in 9..MIN_EXTENDED_L2_CLUSTER_BITS {
+            let mut small = header;
+            small[CLUSTER_BITS_OFFSET..CLUSTER_BITS_OFFSET + 4]
+                .copy_from_slice(&bits.to_be_bytes());
+            assert!(
+                init_over_header(&small).is_none(),
+                "cluster_bits {bits} with extended L2 must not open"
+            );
+        }
+
+        // At the floor, and without the feature, the same image opens.
+        let mut at_floor = header;
+        at_floor[CLUSTER_BITS_OFFSET..CLUSTER_BITS_OFFSET + 4]
+            .copy_from_slice(&MIN_EXTENDED_L2_CLUSTER_BITS.to_be_bytes());
+        let state = init_over_header(&at_floor).expect("512-byte subclusters open");
+        assert!(state.extended_l2);
+        assert_eq!(state.version, 3);
+
+        let mut plain = make_qcow2_header();
+        plain[CLUSTER_BITS_OFFSET..CLUSTER_BITS_OFFSET + 4].copy_from_slice(&12u32.to_be_bytes());
+        assert!(
+            init_over_header(&plain).is_some(),
+            "a 4 KiB cluster without extended L2 is ordinary"
+        );
     }
 
     fn read_test_call_table() -> shared::CallTable {

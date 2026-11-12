@@ -1364,16 +1364,21 @@ class TestCreateOOptions(InstarTestBase):
         through `instar info`. (refcount_bits != 16 also round-trips
         now that build_header derives refcount_order from
         refcount_bits — instar #365.)
+
+        The cluster size is 16k, not 4k: extended L2 needs
+        subclusters of at least 512 bytes, so `create` refuses
+        anything smaller, as `qemu-img create` does (#805). What this
+        test is about is the comma, not the cluster size.
         """
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / 'foo.qcow2'
             _, stderr, rc = self.run_instar_create(
                 '-f', 'qcow2',
-                '-o', 'cluster_size=4k,extended_l2=on',
+                '-o', 'cluster_size=16k,extended_l2=on',
                 str(path), '16M')
             self.assertEqual(rc, 0, f'compound -o failed: {stderr}')
             info = self._info_json(path)
-            self.assertEqual(info['cluster-size'], 4096)
+            self.assertEqual(info['cluster-size'], 16384)
             self.assertTrue(info.get('format-specific', {})
                             .get('data', {}).get('extended-l2', False))
 

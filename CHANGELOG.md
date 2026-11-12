@@ -1204,6 +1204,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+- **An extended-L2 qcow2 needs clusters of at least 16 KiB, in both
+  directions.** qemu refuses to open an extended-L2 image whose
+  subclusters would be under 512 bytes ("Unsupported subcluster size:
+  128"), which is any cluster size below 16 KiB, and `qemu-img create`
+  refuses to make one. instar opened and read such an image, and -- the
+  worse half, found while fixing the read side -- `instar create -f
+  qcow2 -o extended_l2=on,cluster_size=4k` *wrote* one, so instar
+  produced a file qemu-img cannot open. The header parse, `plan_qcow2`
+  and `measure -O qcow2` now all refuse the combination. Beyond parity,
+  the reader's AES-CBC and XTS paths need a `Normal` subcluster run to
+  be 512-byte aligned, which only holds above this floor.
+  Closes [#805](https://github.com/shakenfist/instar/issues/805).
+
 - **A VHD footer's checksum is verified before anything acts on its
   fields.** `VhdFooter::parse` validated the `conectix` cookie and the
   buffer length and read the checksum without checking it, so any

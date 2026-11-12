@@ -104,6 +104,21 @@ fn sweep_qcow2() {
                         skipped += 1;
                         continue;
                     }
+                    Err(create::CreateError::InvalidClusterSize)
+                        if extended_l2
+                            && (cluster_size as u64)
+                                < (1 << qcow2::MIN_EXTENDED_L2_CLUSTER_BITS) =>
+                    {
+                        // An extended-L2 image needs 512-byte
+                        // subclusters, so clusters of at least 16 KiB;
+                        // `qemu-img create` refuses smaller ones and its
+                        // driver cannot open them (issue #805). The
+                        // sweep used to build these and assert they
+                        // round-tripped, which is how instar came to
+                        // write an image qemu-img could not read.
+                        skipped += 1;
+                        continue;
+                    }
                     Err(e) => panic!(
                         "plan_qcow2 failed for virtual_size={}, cluster_size={}, extended_l2={}, scratch_len={}: {:?}",
                         virtual_size, cluster_size, extended_l2, scratch_len, e
