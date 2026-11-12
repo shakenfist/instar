@@ -2566,6 +2566,28 @@ impl CompareResult {
     /// Flag: Images have different sizes
     pub const FLAG_SIZE_MISMATCH: u32 = 1 << 0;
 
+    /// Flag: the guest could not set up a comparison (a chain failed
+    /// to initialise, an unsupported feature, a LUKS key that could
+    /// not be derived, an inconsistent config), so nothing was
+    /// compared. `identical` and `first_mismatch_offset` carry no
+    /// verdict. Without this flag a failed setup read as "the images
+    /// differ at offset 0" (issue #807); the host renders it as an
+    /// error instead, with qemu-img's exit code for an image it could
+    /// not open.
+    pub const FLAG_SETUP_FAILED: u32 = 1 << 1;
+
+    /// Flag: a read failed part-way through the comparison.
+    /// `first_mismatch_offset` holds the virtual byte offset of the
+    /// read that failed, not of a difference, and
+    /// [`Self::FLAG_FAILED_IMAGE2`] says which image it was. The host
+    /// renders it as an error with qemu-img's exit code for a read
+    /// error (issue #807).
+    pub const FLAG_READ_FAILED: u32 = 1 << 2;
+
+    /// Flag: qualifies [`Self::FLAG_READ_FAILED`]; set when the read
+    /// that failed was of the second image, clear for the first.
+    pub const FLAG_FAILED_IMAGE2: u32 = 1 << 3;
+
     /// Create a new empty result (defaults to not identical)
     pub const fn new() -> Self {
         Self {
@@ -2591,6 +2613,49 @@ impl CompareResult {
     /// Check if images have different sizes
     pub fn has_size_mismatch(&self) -> bool {
         (self.flags & Self::FLAG_SIZE_MISMATCH) != 0
+    }
+
+    /// The flag bits that make a result a failure rather than a
+    /// verdict. A result with any of them set says nothing about
+    /// whether the images differ.
+    pub const FAILURE_FLAGS: u32 = Self::FLAG_SETUP_FAILED | Self::FLAG_READ_FAILED;
+
+    /// Whether `flags` (a result's flags, as they arrive over the wire)
+    /// report a failure rather than a verdict.
+    pub const fn flags_report_failure(flags: u32) -> bool {
+        flags & Self::FAILURE_FLAGS != 0
+    }
+
+    /// Whether this result reports a failure rather than a verdict.
+    pub const fn has_failure(&self) -> bool {
+        Self::flags_report_failure(self.flags)
+    }
+
+    /// A result saying the comparison could not be set up, so nothing
+    /// was compared.
+    ///
+    /// The failure results are built only here and by
+    /// [`Self::read_failed`], so no caller can pair a failure with a
+    /// flag that the host would read as a verdict instead.
+    pub const fn setup_failed() -> Self {
+        let mut result = Self::new();
+        result.flags = Self::FLAG_SETUP_FAILED;
+        result
+    }
+
+    /// A result saying a read of the first image (`image2` false) or the
+    /// second (`image2` true) failed at virtual byte `offset`. Nothing
+    /// was compared past `offset`, which `total_bytes_compared` records.
+    pub const fn read_failed(image2: bool, offset: u64) -> Self {
+        let mut result = Self::new();
+        result.flags = if image2 {
+            Self::FLAG_READ_FAILED | Self::FLAG_FAILED_IMAGE2
+        } else {
+            Self::FLAG_READ_FAILED
+        };
+        result.first_mismatch_offset = offset;
+        result.total_bytes_compared = offset;
+        result
     }
 }
 
@@ -4881,8 +4946,11 @@ impl CommitResult {
     pub const ERROR_UNSUPPORTED_FORMAT: u32 = 1;
     /// Overlay has no backing reference.
     pub const ERROR_NO_BACKING: u32 = 2;
-    /// qcow2 with the external-data-file incompatible feature.
-    /// Refused to match qemu-img.
+    /// The qcow2 overlay has the external-data-file incompatible
+    /// feature. A backing with the feature has its own code,
+    /// [`Self::ERROR_BACKING_EXTERNAL_DATA_FILE`], so the refusal
+    /// names the image that owns the data file. qemu-img commits
+    /// either shape; instar refuses both.
     pub const ERROR_EXTERNAL_DATA_FILE: u32 = 3;
     /// Overlay or backing is LUKS-wrapped. v1 of commit
     /// refuses; a future plan can lift this.
@@ -4967,6 +5035,14 @@ impl CommitResult {
     /// previously committed cluster data in place, the same
     /// posture as [`Self::ERROR_REFCOUNT_EXHAUSTED`].
     pub const ERROR_BACKING_INCONSISTENT: u32 = 17;
+    /// The qcow2 backing being committed into has the
+    /// external-data-file incompatible feature. The overlay's own
+    /// data-file refusal is [`Self::ERROR_EXTERNAL_DATA_FILE`]; this
+    /// one was split out of it because reporting the backing's data
+    /// file under the overlay's name sent the user to an image with
+    /// no data file at all (GitHub issue #815). Refused before any
+    /// staging or mutation.
+    pub const ERROR_BACKING_EXTERNAL_DATA_FILE: u32 = 18;
 
     /// True if magic matches.
     pub fn is_valid(&self) -> bool {
@@ -5488,6 +5564,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn compare_failure_results_carry_no_verdict() {
+        let setup = CompareResult::setup_failed();
+        assert!(setup.has_failure());
+        assert_eq!(setup.flags, CompareResult::FLAG_SETUP_FAILED);
+
+        let first = CompareResult::read_failed(false, 4096);
+        assert!(first.has_failure());
+        assert_eq!(first.flags, CompareResult::FLAG_READ_FAILED);
+        assert_eq!(
+            (first.first_mismatch_offset, first.total_bytes_compared),
+            (4096, 4096)
+        );
+
+        let second = CompareResult::read_failed(true, 8192);
+        assert!(second.has_failure());
+        assert_eq!(
+            second.flags,
+            CompareResult::FLAG_READ_FAILED | CompareResult::FLAG_FAILED_IMAGE2
+        );
+
+        // A verdict, including a size mismatch, is not a failure.
+        let mut verdict = CompareResult::new();
+        verdict.flags = CompareResult::FLAG_SIZE_MISMATCH;
+        assert!(!verdict.has_failure());
+        assert!(!CompareResult::flags_report_failure(
+            CompareResult::FLAG_FAILED_IMAGE2
+        ));
+    }
+
+    #[test]
     fn measure_config_magic_uniqueness() {
         assert_ne!(MeasureConfig::MAGIC, InfoConfig::MAGIC);
         assert_ne!(MeasureConfig::MAGIC, CopyConfig::MAGIC);
@@ -5984,13 +6090,14 @@ mod tests {
             CommitResult::ERROR_OVERLAY_HAS_SNAPSHOTS,
             CommitResult::ERROR_BACKING_UNSUPPORTED,
             CommitResult::ERROR_BACKING_INCONSISTENT,
+            CommitResult::ERROR_BACKING_EXTERNAL_DATA_FILE,
         ];
         for i in 0..codes.len() {
             for j in (i + 1)..codes.len() {
                 assert_ne!(codes[i], codes[j], "codes {i} and {j} alias");
             }
         }
-        // Confirm contiguous 0..=17 numbering (append-only wire
+        // Confirm contiguous 0..=18 numbering (append-only wire
         // codes).
         for (i, c) in codes.iter().enumerate() {
             assert_eq!(*c, i as u32);

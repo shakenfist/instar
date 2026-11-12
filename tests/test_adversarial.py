@@ -17,6 +17,26 @@ from pathlib import Path
 from base import InstarTestBase
 
 
+#: The exit codes `instar compare` gives an image it refuses: qemu-img's
+#: 2 (could not open) and 4 (a read failed). Exit 1 means "the images
+#: differ" and is a verdict, so a refusal must never use it (issue #807).
+COMPARE_REFUSAL_EXIT_CODES = (2, 4)
+
+
+def assert_compare_refused(test, stdout, stderr, rc, image_id):
+    """Assert a compare refused `image_id` rather than reaching a verdict."""
+    test.assertIn(
+        rc, COMPARE_REFUSAL_EXIT_CODES,
+        f'compare should refuse {image_id} with exit 2 or 4, not exit {rc}; '
+        f'stdout={stdout[:400]!r} stderr={stderr[:400]!r}')
+    test.assertNotIn(
+        'Content mismatch', stdout,
+        f'compare must not report a refusal of {image_id} as a difference')
+    test.assertTrue(
+        stderr.strip(),
+        f'compare should explain refusing {image_id} on stderr')
+
+
 class TestAdversarialCompressionBomb(InstarTestBase):
     """Verify compression bomb images are handled safely."""
 
@@ -1067,19 +1087,14 @@ class TestAdversarialDmgReaderRefusals(InstarTestBase):
                 Path(out.name).stat().st_size, self._OUTPUT_CAP,
                 f'convert output suspiciously large for {image_id}')
 
-        # compare against itself: the read failure surfaces as a mismatch
-        # (proving compare is not silently reading it as raw), never a crash.
+        # compare against itself: refused as an error, never a crash, and
+        # never as "Content mismatch", which would claim an image differs
+        # from itself (issue #807).
         m_out, m_err, m_rc = self.run_adversarial(
             [instar, 'compare', str(image.path), str(image.path)],
             timeout=15,
         )
-        self.assertNotEqual(
-            m_rc, 0, f'compare(self) should refuse {image_id}')
-        self.assertNotEqual(
-            m_rc, 139, f'instar must not SIGSEGV comparing {image_id}')
-        self.assertTrue(
-            (m_out + m_err).strip(),
-            f'compare should emit a non-empty message for {image_id}')
+        assert_compare_refused(self, m_out, m_err, m_rc, image_id)
 
         with tempfile.NamedTemporaryFile(suffix='.raw') as out:
             d_out, d_err, d_rc = self.run_adversarial(
@@ -1213,21 +1228,13 @@ class TestAdversarialVdiManifest(InstarTestBase):
                 f'convert should emit a non-empty error for {image_id}',
             )
 
-            # compare against the raw file: must refuse, non-zero, no hang.
-            # compare reports the read failure as a mismatch on stdout, so
-            # the combined output (not just stderr) is checked non-empty.
+            # compare against the raw file: must refuse as an error, not
+            # as a difference (issue #807), and not hang.
             m_out, m_err, m_rc = self.run_adversarial(
                 [instar, 'compare', str(image.path), other.name],
                 timeout=15,
             )
-            self.assertNotEqual(
-                m_rc, 0,
-                f'compare should refuse malformed {image_id}',
-            )
-            self.assertTrue(
-                (m_out + m_err).strip(),
-                f'compare should emit a non-empty message for {image_id}',
-            )
+            assert_compare_refused(self, m_out, m_err, m_rc, image_id)
 
             # dd: must refuse, non-zero, non-empty message, no hang.
             _d_out, d_err, d_rc = self.run_adversarial(
@@ -1340,21 +1347,13 @@ class TestAdversarialParallelsManifest(InstarTestBase):
                 f'convert should emit a non-empty error for {image_id}',
             )
 
-            # compare against the raw file: must refuse, non-zero, no hang.
-            # compare reports the read failure as a mismatch on stdout, so
-            # the combined output (not just stderr) is checked non-empty.
+            # compare against the raw file: must refuse as an error, not
+            # as a difference (issue #807), and not hang.
             m_out, m_err, m_rc = self.run_adversarial(
                 [instar, 'compare', str(image.path), other.name],
                 timeout=15,
             )
-            self.assertNotEqual(
-                m_rc, 0,
-                f'compare should refuse malformed {image_id}',
-            )
-            self.assertTrue(
-                (m_out + m_err).strip(),
-                f'compare should emit a non-empty message for {image_id}',
-            )
+            assert_compare_refused(self, m_out, m_err, m_rc, image_id)
 
             # dd: must refuse, non-zero, non-empty message, no hang.
             _d_out, d_err, d_rc = self.run_adversarial(
@@ -1456,19 +1455,13 @@ class TestAdversarialQcow1Manifest(InstarTestBase):
                 c_err.strip(),
                 f'convert should emit a non-empty error for {image_id}')
 
-            # compare: read failure surfaces as a mismatch on stdout, so
-            # the combined output is checked non-empty.  A malformed
-            # fixture reporting a mismatch (not "identical") proves it is
-            # not silently read as raw.
+            # compare: refused as an error rather than read as raw, and
+            # not reported as a difference (issue #807).
             m_out, m_err, m_rc = self.run_adversarial(
                 [instar, 'compare', str(image.path), other.name],
                 timeout=15,
             )
-            self.assertNotEqual(
-                m_rc, 0, f'compare should refuse malformed {image_id}')
-            self.assertTrue(
-                (m_out + m_err).strip(),
-                f'compare should emit a non-empty message for {image_id}')
+            assert_compare_refused(self, m_out, m_err, m_rc, image_id)
 
             # dd: must refuse, non-zero, non-empty message, no hang.
             _d_out, d_err, d_rc = self.run_adversarial(

@@ -79,7 +79,7 @@ pub fn plan_commit_qcow2(opts: &Qcow2CommitOpts<'_>) -> Result<Qcow2CommitContex
         return Err(CommitError::BackingCorrupt);
     }
     if backing.has_external_data || (backing.incompatible_features & INCOMPAT_EXTERNAL_DATA) != 0 {
-        return Err(CommitError::ExternalDataFile);
+        return Err(CommitError::BackingExternalDataFile);
     }
     if (backing.incompatible_features & (INCOMPAT_DIRTY | INCOMPAT_CORRUPT)) != 0 {
         return Err(CommitError::BackingCorrupt);
@@ -219,7 +219,7 @@ mod tests {
         let oh = make_header(1 << 20);
         let bh = make_header_with_external_data();
         let r = plan_commit_qcow2(&baseline_opts(&oh, &bh));
-        assert_eq!(r.err(), Some(CommitError::ExternalDataFile));
+        assert_eq!(r.err(), Some(CommitError::BackingExternalDataFile));
     }
 
     #[test]

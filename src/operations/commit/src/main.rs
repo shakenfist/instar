@@ -228,6 +228,7 @@ fn map_commit_error(e: CommitError) -> u32 {
             CommitResult::ERROR_UNSUPPORTED_FORMAT
         }
         CommitError::ExternalDataFile => CommitResult::ERROR_EXTERNAL_DATA_FILE,
+        CommitError::BackingExternalDataFile => CommitResult::ERROR_BACKING_EXTERNAL_DATA_FILE,
         CommitError::LuksUnsupported => CommitResult::ERROR_LUKS_UNSUPPORTED,
         CommitError::OverlayLargerThanBacking => CommitResult::ERROR_OVERLAY_LARGER_THAN_BACKING,
         CommitError::BackingTooSmall => CommitResult::ERROR_BACKING_TOO_SMALL,
@@ -255,7 +256,9 @@ fn map_backing_gate(gate: Gate) -> u32 {
     match gate {
         Gate::UnknownIncompatible => CommitResult::ERROR_BACKING_UNSUPPORTED,
         Gate::RefcountWidth | Gate::ExtendedL2 => CommitResult::ERROR_UNSUPPORTED_FORMAT,
-        Gate::ExternalDataFile => CommitResult::ERROR_EXTERNAL_DATA_FILE,
+        // This gate runs on the backing header, so the data file is
+        // the backing's (issue #815).
+        Gate::ExternalDataFile => CommitResult::ERROR_BACKING_EXTERNAL_DATA_FILE,
         Gate::Encryption => CommitResult::ERROR_LUKS_UNSUPPORTED,
         Gate::DirtyCorrupt => CommitResult::ERROR_BACKING_CORRUPT,
         Gate::HasSnapshots => CommitResult::ERROR_BACKING_HAS_SNAPSHOTS,
@@ -900,12 +903,13 @@ unsafe fn run_qcow2(call_table: &CallTable, config: &CommitConfig) -> CommitResu
     if backing.dirty || backing.corrupt {
         return err(config, CommitResult::ERROR_BACKING_CORRUPT);
     }
-    if overlay.has_external_data
-        || (overlay.incompatible_features & INCOMPAT_EXTERNAL_DATA) != 0
-        || backing.has_external_data
-        || (backing.incompatible_features & INCOMPAT_EXTERNAL_DATA) != 0
-    {
+    // Each image's data file is refused under its own code, so the
+    // message names the image that owns it (issue #815).
+    if overlay.has_external_data || (overlay.incompatible_features & INCOMPAT_EXTERNAL_DATA) != 0 {
         return err(config, CommitResult::ERROR_EXTERNAL_DATA_FILE);
+    }
+    if backing.has_external_data || (backing.incompatible_features & INCOMPAT_EXTERNAL_DATA) != 0 {
+        return err(config, CommitResult::ERROR_BACKING_EXTERNAL_DATA_FILE);
     }
     if (overlay.incompatible_features & (INCOMPAT_DIRTY | INCOMPAT_CORRUPT)) != 0 {
         return err(config, CommitResult::ERROR_OVERLAY_CORRUPT);

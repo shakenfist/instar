@@ -485,9 +485,12 @@ class TestIncompatibleFeatureBits(InstarTestBase):
             stdout, stderr, rc = self.run_instar_compare(
                 Path(img.name), Path(raw.name)
             )
-            self.assertNotEqual(
-                rc, 0,
-                'compare should reject unknown feature bits'
+            # Refused, which is an error rather than a difference: exit
+            # 2, never compare's exit 1 (issue #807).
+            self.assertEqual(
+                rc, 2,
+                f'compare should reject unknown feature bits; '
+                f'stdout={stdout!r} stderr={stderr!r}'
             )
 
     def test_convert_rejects_unknown_feature_bit(self):

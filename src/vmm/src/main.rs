@@ -1339,12 +1339,15 @@ mod differencing_parent_classification_tests {
     #[test]
     fn chain_use_variants_are_copy_and_distinct() {
         let compose = ChainUse::Compose;
+        let top_only = ChainUse::ComposeTopOnly;
         let report = ChainUse::Report;
         // `Copy`: reading `compose` again after this binding must not
         // be a move.
         let compose_again = compose;
         assert_eq!(compose, compose_again);
         assert_ne!(compose, report);
+        assert_ne!(compose, top_only);
+        assert_ne!(top_only, report);
     }
 
     // --- classify_parent_walk -----------------------------------------
@@ -1453,6 +1456,18 @@ mod differencing_parent_classification_tests {
         // The check is byte-based, not character-based: a non-ASCII
         // lead byte must not be mistaken for a drive letter.
         assert!(!is_windows_absolute_reference("\u{e9}:\\foo"));
+    }
+
+    #[test]
+    fn backing_reference_is_absolute_in_either_convention() {
+        // #658: a Windows absolute reference must not be joined onto
+        // the image directory as though it were relative.
+        assert!(backing_reference_is_absolute("/abs/parent.vhdx"));
+        assert!(backing_reference_is_absolute(r"C:\images\parent.vhdx"));
+        assert!(backing_reference_is_absolute(r"\\attacker\share\probe"));
+        assert!(!backing_reference_is_absolute("parent.vhdx"));
+        assert!(!backing_reference_is_absolute("../sub/parent.vhdx"));
+        assert!(!backing_reference_is_absolute("C:/unix/style"));
     }
 
     // --- resolve_reported_parent: Windows-absolute classification ------
@@ -2171,8 +2186,9 @@ fn print_info_result(
         if info.flags & INFO_RESULT_FLAG_HAS_BACKING_FILE != 0 && !info.backing_file.is_empty() {
             let backing_file_str = info.backing_file.as_str();
             // If backing file is relative, show both the stored name and actual path
-            // (qemu-img shows "backing file: <name> (actual path: <resolved>)")
-            if !std::path::Path::new(backing_file_str).is_absolute() {
+            // (qemu-img shows "backing file: <name> (actual path: <resolved>)").
+            // A Windows absolute reference is not relative, whatever POSIX says.
+            if !backing_reference_is_absolute(backing_file_str) {
                 // Resolve relative to image's directory
                 let image_dir = std::path::Path::new(&abs_path)
                     .parent()
@@ -2823,7 +2839,7 @@ fn print_info_result_json(
         // full-backing-filename is the resolved absolute path
         // If backing_file is relative, resolve it relative to the image's directory
         let backing_file_str = info.backing_file.as_str();
-        let full_backing_filename = if std::path::Path::new(backing_file_str).is_absolute() {
+        let full_backing_filename = if backing_reference_is_absolute(backing_file_str) {
             backing_file_str.to_string()
         } else {
             // Get the directory containing the image file
@@ -3173,6 +3189,14 @@ enum ChainUse {
     /// The caller goes on to attach the chain as virtio devices and
     /// launch a guest.
     Compose,
+    /// The caller attaches the chain and launches a guest that reads
+    /// only the top image: the ancestor slots are populated and never
+    /// read. `commit` walks its backing's ancestors this way. A backing
+    /// image's external data file is refused for [`ChainUse::Compose`]
+    /// because a read through that image would fail with no reason
+    /// given (issue #806); nothing reads through an ancestor here, so
+    /// refusing would withdraw a command that works.
+    ComposeTopOnly,
     /// The caller only prints the chain and returns.
     Report,
 }
@@ -3289,6 +3313,19 @@ fn is_windows_absolute_reference(reference: &str) -> bool {
     bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\'
 }
 
+/// Is this backing reference absolute, in either convention?
+///
+/// `info` joins a relative reference onto the image's directory to show
+/// where it resolves, as qemu-img does. A Windows drive-letter or UNC
+/// reference is not POSIX-absolute either, so a POSIX test alone sent it
+/// down the relative branch and printed a joined path such as
+/// `/images/C:\parent.vhdx`, a file that cannot exist (issue #658).
+/// Such a reference is absolute in its own convention, and like a POSIX
+/// absolute one it is reported only as the image records it.
+fn backing_reference_is_absolute(reference: &str) -> bool {
+    Path::new(reference).is_absolute() || is_windows_absolute_reference(reference)
+}
+
 /// Resolve a differencing parent for a caller that only reports the
 /// chain, classifying each failure rather than propagating it.
 ///
@@ -3342,7 +3379,7 @@ fn classify_parent_walk(
         // behind it could do with one, because it has no refusal to
         // make contingent on the parent's presence.
         ChainUse::Report => ParentWalk::ResolveOrEndListing,
-        ChainUse::Compose => match differencing_composition {
+        ChainUse::Compose | ChainUse::ComposeTopOnly => match differencing_composition {
             DifferencingComposition::Supported => ParentWalk::Resolve,
             DifferencingComposition::Unsupported => ParentWalk::RecordWithoutResolving,
         },
@@ -3482,13 +3519,27 @@ fn discover_backing_chain(
             file_size
         };
 
-        // For the top image only, check for external data file.
-        // External data files on backing images are not currently supported;
-        // only the top image's data file is discovered and passed to the guest.
+        // Only the top image's QCOW2 external data file is discovered and
+        // passed to the guest. A backing image's data file is refused by
+        // name for a caller that will compose the chain: attached without
+        // it, the backing's data device index would be 0, and every read
+        // of a cluster it maps would fail in the guest with no reason
+        // given -- "convert operation failed", "Input/output error", a
+        // rebase blaming the overlay's header (issue #806). A reporting
+        // caller reads nothing, so it lists the chain as before, and a
+        // caller that reads only the top image (commit's walk of its
+        // backing's ancestors) never reads through the backing either.
         // The data file path is untrusted (parsed from the QCOW2 header
         // inside the sandbox), so we validate it against the allowlist.
-        // For the top image only, check for QCOW2 external data file.
         let mut data_files = Vec::new();
+        if !chain.images.is_empty() && chain_use == ChainUse::Compose {
+            if let Some(ref data_path) = info_result.external_data_file {
+                return Err(ChainError::BackingDataFileUnsupported {
+                    image: current.clone(),
+                    data_file: data_path.clone(),
+                });
+            }
+        }
         if chain.images.is_empty() {
             if let Some(ref data_path) = info_result.external_data_file {
                 let data_resolved = validate_backing_path(&current, data_path, security_config)?;
@@ -8276,12 +8327,14 @@ fn run_commit(args: CommitArgs, verbose: bool) -> Result<(), Box<dyn std::error:
     // the ancestor slots the host populates here, so a differencing
     // parent is nothing it would ever open. Resolving one could only
     // turn a command that works today into a path error whenever the
-    // parent is absent.
+    // parent is absent. For the same reason an ancestor's external data
+    // file is not refused: `ComposeTopOnly` says nothing reads through
+    // these slots.
     let backing_chain_full = discover_backing_chain(
         &resolved_backing_path,
         sector_size,
         &security_config,
-        ChainUse::Compose,
+        ChainUse::ComposeTopOnly,
         DifferencingComposition::Unsupported,
     )
     .map_err(|e| -> Box<dyn std::error::Error> { format!("commit: {e}").into() })?;
@@ -8931,8 +8984,8 @@ fn render_commit_success(
 }
 
 /// Map a `CommitResult::ERROR_*` code to a user-facing string.
-/// Exhaustive on the 18 constants from
-/// `src/shared/src/lib.rs` (0..=17); the trailing catch-all
+/// Exhaustive on the 19 constants from
+/// `src/shared/src/lib.rs` (0..=18); the trailing catch-all
 /// covers future code additions only.
 fn map_commit_error(code: u32) -> String {
     match code {
@@ -8947,6 +9000,11 @@ fn map_commit_error(code: u32) -> String {
         }
         c if c == shared::CommitResult::ERROR_EXTERNAL_DATA_FILE => {
             "qcow2 overlays with the external-data-file feature cannot be committed".into()
+        }
+        c if c == shared::CommitResult::ERROR_BACKING_EXTERNAL_DATA_FILE => {
+            "the backing file uses the qcow2 external-data-file feature; instar \
+             cannot commit into it. Fall back to `qemu-img commit`"
+                .into()
         }
         c if c == shared::CommitResult::ERROR_LUKS_UNSUPPORTED => {
             "LUKS-encrypted overlays and backings are not yet supported for commit".into()
@@ -13475,7 +13533,66 @@ fn print_measure_result_json(
     println!("}}");
 }
 
+/// A compare failure that happened while reading, after both images
+/// had been opened. Carried as its own error type so [`run_compare`]
+/// can give it qemu-img's read-error exit code rather than the
+/// open-error one. `Debug` prints the message the way a `String` error
+/// prints, so the `Error: "..."` line on stderr reads the same as every
+/// other error's.
+struct CompareReadError(String);
+
+impl std::fmt::Debug for CompareReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.0)
+    }
+}
+
+impl std::fmt::Display for CompareReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CompareReadError {}
+
+/// qemu-img compare's exit code for an image it could not open, and
+/// instar's for every compare error that is not a read failure.
+const COMPARE_EXIT_OPEN_ERROR: i32 = 2;
+/// qemu-img compare's exit code for a read that failed mid-comparison.
+const COMPARE_EXIT_READ_ERROR: i32 = 4;
+
+/// The exit code for a compare that ended in `err`.
+///
+/// Exit 1 means "the images differ", and only a comparison that found a
+/// difference may claim it. Every error used to leave `main` as exit 1
+/// too, so a script reading that code was told two images differed when
+/// instar had never compared them (issue #807). qemu-img compare
+/// reserves 1 for a difference and gives errors their own codes: 2 for
+/// an image it cannot open, 4 for a failed read (measured with qemu-img
+/// 10.0.13, the read error injected with blkdebug).
+fn compare_error_exit_code(err: &(dyn std::error::Error + 'static)) -> i32 {
+    if err.is::<CompareReadError>() {
+        COMPARE_EXIT_READ_ERROR
+    } else {
+        COMPARE_EXIT_OPEN_ERROR
+    }
+}
+
 fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
+    match compare_images(args, verbose) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            eprintln!("Error: {err:?}");
+            std::process::exit(compare_error_exit_code(err.as_ref()));
+        }
+    }
+}
+
+/// Compare two images and print the verdict. Returns `Ok` when they
+/// are identical, exits 1 when they differ, and returns `Err` for
+/// anything that is not a verdict; [`run_compare`] picks that error's
+/// exit code.
+fn compare_images(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Validate sector size (must be power of 2, 512 to 64KB)
     if !(512..=MAX_SECTOR_SIZE).contains(&args.sector_size) || !args.sector_size.is_power_of_two() {
         return Err(format!(
@@ -13851,6 +13968,9 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     // Track compare result for exit code
     let mut compare_identical = false;
     let mut compare_result_received = false;
+    // A result whose flags say the guest could not compare, as
+    // `(flags, offset of the failed read)`. It carries no verdict.
+    let mut compare_failure: Option<(u32, u64)> = None;
 
     // Track VM errors
     let mut vm_error: Option<String> = None;
@@ -13879,11 +13999,18 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
                                 if let Some(guest_::GuestMessage_::Payload::CompareResult(result)) =
                                     &msg.payload
                                 {
-                                    let size_mismatch = (result.flags & 1) != 0;
-                                    // In strict mode, size mismatch means not identical
-                                    // regardless of content
-                                    compare_identical =
-                                        result.identical && !(args.strict && size_mismatch);
+                                    if shared::CompareResult::flags_report_failure(result.flags) {
+                                        compare_failure =
+                                            Some((result.flags, result.first_mismatch_offset));
+                                    } else {
+                                        let size_mismatch = (result.flags
+                                            & shared::CompareResult::FLAG_SIZE_MISMATCH)
+                                            != 0;
+                                        // In strict mode, size mismatch means not
+                                        // identical regardless of content
+                                        compare_identical =
+                                            result.identical && !(args.strict && size_mismatch);
+                                    }
                                     compare_result_received = true;
                                 }
                                 // A differencing source makes the guest
@@ -13892,8 +14019,12 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
                                 // at offset 0!" for a refusal (issue #548).
                                 // A corrupt qcow2 L2 entry refused mid-read
                                 // does the same. The tail renders the
-                                // captured reason instead.
-                                if serial_decoder.last_differencing_refusal.is_none()
+                                // captured reason instead. Any other
+                                // failure is flagged on the result
+                                // itself, and is not a verdict either
+                                // (issue #807).
+                                if compare_failure.is_none()
+                                    && serial_decoder.last_differencing_refusal.is_none()
                                     && !serial_decoder.l2_entry_refused()
                                 {
                                     print_compare_result(&msg, &args.output, args.strict);
@@ -13996,7 +14127,14 @@ fn run_compare(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::erro
     // Likewise for a corrupt qcow2 L2 entry refused inside the chain
     // reader: the guest's result for a failed read is not a comparison.
     if serial_decoder.l2_entry_refused() {
-        return Err(serial_decoder.l2_entry_refusal_error("compare").into());
+        return Err(Box::new(CompareReadError(
+            serial_decoder.l2_entry_refusal_error("compare"),
+        )));
+    }
+
+    // Any other failure the guest flagged on its result.
+    if let Some((flags, offset)) = compare_failure {
+        return Err(compare_failure_error(&args, flags, offset));
     }
 
     // Return error if no result was received
@@ -17051,7 +17189,7 @@ fn run_map(args: MapArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error
                                                 // emitting; exit cleanly.
                                                 broken_pipe = true;
                                             }
-                                            Err(err) => return Err(err.into()),
+                                            Err(err) => return Err(map_extent_error(err)),
                                         }
                                     }
                                 }
@@ -17178,6 +17316,17 @@ fn run_map(args: MapArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
+/// The error `run_map` returns when [`MapRenderer::emit_extent`] fails
+/// for any reason other than a closed stdout.
+///
+/// `main` prints an error with `Debug`, and an `io::Error`'s `Debug` is
+/// `Custom { kind: InvalidData, error: "..." }`. Carrying the message as
+/// a `String` error instead makes the `Error: "..."` line on stderr read
+/// the same as every other error's, and as docs/map.md shows it.
+fn map_extent_error(err: std::io::Error) -> Box<dyn std::error::Error> {
+    err.to_string().into()
+}
+
 /// Translate a guest-side state code (the string sent in
 /// `MapExtentMessage::state`) to the (present, zero, data,
 /// emit_offset) tuple used by qemu-img map's JSON output.
@@ -17189,17 +17338,20 @@ fn run_map(args: MapArgs, verbose: bool) -> Result<(), Box<dyn std::error::Error
 /// a host cluster, so emit `offset` as qemu-img does for qcow2
 /// ZERO_ALLOC and UNALLOCATED_ALLOC (`block/qcow2.c:2171-2177` at
 /// qemu v10.0.0).
-fn map_state_triple(state: &str) -> (bool, bool, bool, bool) {
+///
+/// Any other string is `None`. That includes the guest's own
+/// `"unknown"`, which `send_map_extent` sends for a record state it
+/// cannot name, so it marks a guest bug rather than a property of the
+/// image. The caller refuses it: rendering it as anything would print
+/// a plausible extent the guest never described (issue #816).
+fn map_state_triple(state: &str) -> Option<(bool, bool, bool, bool)> {
     match state {
-        "hole" => (false, true, false, false),
-        "zero" => (true, true, false, false),
-        "data" => (true, false, true, true),
-        "zero-at" => (true, true, false, true),
-        "hole-at" => (false, true, false, true),
-        // Defensive fallback for an unknown state code (the guest
-        // emits only the five above). Treat as data so the offset
-        // is preserved for debugging.
-        _ => (true, false, true, true),
+        "hole" => Some((false, true, false, false)),
+        "zero" => Some((true, true, false, false)),
+        "data" => Some((true, false, true, true)),
+        "zero-at" => Some((true, true, false, true)),
+        "hole-at" => Some((false, true, false, true)),
+        _ => None,
     }
 }
 
@@ -17325,8 +17477,24 @@ impl<'a, W: std::io::Write> MapRenderer<'a, W> {
     /// Write one extent's representation. Human mode emits a row
     /// only when `data: true`; JSON mode emits every extent with
     /// the qemu-img-compatible field set.
+    ///
+    /// An extent in a state [`map_state_triple`] does not recognise is
+    /// an `InvalidData` error, which the caller propagates as a map
+    /// failure, and nothing is written for it.
     fn emit_extent(&mut self, ext: &guest_::MapExtentMessage) -> std::io::Result<()> {
-        let (present, zero, data, has_offset) = map_state_triple(&ext.state);
+        let Some((present, zero, data, has_offset)) = map_state_triple(&ext.state) else {
+            // The state string came from the guest, so it is escaped
+            // before it reaches the terminal.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "map: the guest reported an extent at offset {} in an unrecognised \
+                     state '{}'; refusing to render it as data",
+                    ext.start,
+                    terminal_safe(&ext.state)
+                ),
+            ));
+        };
         match self.output_format {
             MapOutputFormat::Human => {
                 if !data {
@@ -20347,6 +20515,37 @@ fn validate_create_args(args: &CreateArgs) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
+/// The error for a compare result the guest flagged as a failure
+/// rather than a verdict (issue #807).
+///
+/// A failed read names the image and the virtual offset, and is a
+/// [`CompareReadError`] so it exits with qemu-img's read-error code.
+/// A setup failure has no offset and the guest does not say which
+/// image it was, so the message says only that nothing was compared;
+/// the guest's own reason is in its `--verbose` output.
+fn compare_failure_error(
+    args: &CompareArgs,
+    flags: u32,
+    offset: u64,
+) -> Box<dyn std::error::Error> {
+    if flags & shared::CompareResult::FLAG_READ_FAILED != 0 {
+        let (which, path) = if flags & shared::CompareResult::FLAG_FAILED_IMAGE2 != 0 {
+            ("second", &args.image2)
+        } else {
+            ("first", &args.image1)
+        };
+        Box::new(CompareReadError(format!(
+            "compare: reading the {which} image, {}, failed at virtual offset {offset} \
+             ({offset:#x}); the images were not compared",
+            terminal_safe_path(Path::new(path))
+        )))
+    } else {
+        "compare: the guest could not set up a comparison of the two images, so nothing \
+         was compared (--verbose shows the guest's reason)"
+            .into()
+    }
+}
+
 /// Print compare result in human-readable or JSON format.
 ///
 /// Human output matches qemu-img compare (all output to stdout):
@@ -20354,8 +20553,15 @@ fn validate_create_args(args: &CreateArgs) -> Result<(), Box<dyn std::error::Err
 /// - Different: "Content mismatch at offset {offset}!\n"
 /// - Size warning (non-strict): "Warning: Image size mismatch!\n"
 /// - Size strict: "Strict mode: Image size mismatch!\n"
+///
+/// A result with a failure flag set is not a verdict and must not
+/// reach this function; [`compare_failure_error`] renders it.
 fn print_compare_result(msg: &guest_::GuestMessage, output_format: &str, strict: bool) {
     if let Some(guest_::GuestMessage_::Payload::CompareResult(result)) = &msg.payload {
+        debug_assert!(
+            !shared::CompareResult::flags_report_failure(result.flags),
+            "a failure is not a verdict (#807)"
+        );
         if output_format == "json" {
             print_compare_result_json(result);
             return;
@@ -21954,25 +22160,28 @@ mod map_renderer_tests {
 
     #[test]
     fn state_triple_hole() {
-        assert_eq!(map_state_triple("hole"), (false, true, false, false));
+        assert_eq!(map_state_triple("hole"), Some((false, true, false, false)));
     }
 
     #[test]
     fn state_triple_zero() {
-        assert_eq!(map_state_triple("zero"), (true, true, false, false));
+        assert_eq!(map_state_triple("zero"), Some((true, true, false, false)));
     }
 
     #[test]
     fn state_triple_data() {
-        assert_eq!(map_state_triple("data"), (true, false, true, true));
+        assert_eq!(map_state_triple("data"), Some((true, false, true, true)));
     }
 
     #[test]
     fn state_triple_offset_bearing_zero_and_hole() {
         // qcow2 ZERO_ALLOC and UNALLOCATED_ALLOC: qemu-img map prints
         // an offset for both, which the offset-less states do not.
-        assert_eq!(map_state_triple("zero-at"), (true, true, false, true));
-        assert_eq!(map_state_triple("hole-at"), (false, true, false, true));
+        assert_eq!(map_state_triple("zero-at"), Some((true, true, false, true)));
+        assert_eq!(
+            map_state_triple("hole-at"),
+            Some((false, true, false, true))
+        );
     }
 
     #[test]
@@ -21995,10 +22204,45 @@ mod map_renderer_tests {
     }
 
     #[test]
-    fn state_triple_unknown_falls_back_to_data() {
-        // Defensive: an unknown state preserves the offset for
-        // debugging rather than dropping it.
-        assert_eq!(map_state_triple("future-state"), (true, false, true, true));
+    fn state_triple_unknown_is_not_a_state() {
+        // An unrecognised state, including the guest's own "unknown"
+        // fallback, has no triple: it must not read as data (#816).
+        assert_eq!(map_state_triple("future-state"), None);
+        assert_eq!(map_state_triple("unknown"), None);
+    }
+
+    #[test]
+    fn renderer_refuses_an_unknown_state_and_writes_nothing_for_it() {
+        // In both modes, an extent the guest could not name is an
+        // InvalidData error and leaves no row or object behind.
+        for mode in ["human", "json"] {
+            let mut buf: Vec<u8> = Vec::new();
+            let mut r = MapRenderer::new(
+                &mut buf,
+                mode,
+                "img".to_string(),
+                &version::OutputProfile::newest(),
+            );
+            r.begin().unwrap();
+            let err = r
+                .emit_extent(&ext(0x10000, 0x10000, "unknown", 0x50000))
+                .unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{mode}");
+            // What main prints after `Error: ` is the Debug of the
+            // error run_map returns: the bare message, quoted.
+            assert_eq!(
+                format!("{:?}", map_extent_error(err)),
+                "\"map: the guest reported an extent at offset 65536 in an unrecognised \
+                 state 'unknown'; refusing to render it as data\"",
+                "{mode}"
+            );
+            assert_eq!(r.extents_written, 0, "{mode}");
+            let after_begin = match mode {
+                "json" => "[",
+                _ => "Offset          Length          Mapped to       File\n",
+            };
+            assert_eq!(String::from_utf8(buf).unwrap(), after_begin, "{mode}");
+        }
     }
 
     // Byte-exact human / JSON output tests live in the

@@ -55,6 +55,12 @@ pub enum CommitError {
     /// incompatible feature set. Maps to
     /// `CommitResult::ERROR_EXTERNAL_DATA_FILE` (3).
     ExternalDataFile,
+    /// The backing is a qcow2 image with the external-data-file
+    /// incompatible feature set. Maps to
+    /// `CommitResult::ERROR_BACKING_EXTERNAL_DATA_FILE` (18).
+    /// Distinct from [`Self::ExternalDataFile`] so the refusal names
+    /// the image that owns the data file.
+    BackingExternalDataFile,
     /// The overlay or backing is LUKS-wrapped. Maps to
     /// `CommitResult::ERROR_LUKS_UNSUPPORTED` (4).
     LuksUnsupported,

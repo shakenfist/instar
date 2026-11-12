@@ -675,19 +675,23 @@ class DifferencingTestBase(InstarTestBase):
         not a cosmetic one -- the two messages send a user to different
         places.
 
-        Exit code 1 is asserted exactly, not merely as non-zero. For
+        The exit code is asserted exactly, not merely as non-zero. For
         `check` in particular that matters: exit 2 means corruption,
         and a differencing source was deliberately classified away
         from corruption, so a future 2 here would be a regression even
-        though it is non-zero.
+        though it is non-zero. `compare` is the exception that proves
+        the rule: its exit 1 means "the images differ", so a refusal
+        takes qemu-img's exit 2 for an image it could not open
+        (issue #807).
         """
         expected = (
             self.expected_refusal(op, format_name) if composing
             else self.expected_non_composing_refusal(op, format_name)
         )
+        expected_rc = 2 if op == 'compare' else 1
         self.assertEqual(
-            1, rc,
-            f'{context}: expected exit 1, got {rc}; '
+            expected_rc, rc,
+            f'{context}: expected exit {expected_rc}, got {rc}; '
             f'stdout={stdout[:400]!r} stderr={stderr[:400]!r}'
         )
         self.assertIn(
@@ -3426,10 +3430,14 @@ class TestDifferencingParentAbsent(DifferencingTestBase):
                                 a_stdout, a_stderr, a_rc = self._run_op(
                                     op, orphan, tmp_orphan
                                 )
+                        # compare's exit 1 means "the images differ", so
+                        # an image it could not open takes qemu-img's exit
+                        # 2 instead (issue #807).
+                        expected_rc = 2 if op == 'compare' else 1
                         self.assertEqual(
-                            1, a_rc,
-                            f'{image_id}/{op}: expected exit 1 with the '
-                            f'parent absent; stdout={a_stdout[:400]!r} '
+                            expected_rc, a_rc,
+                            f'{image_id}/{op}: expected exit {expected_rc} '
+                            f'with the parent absent; stdout={a_stdout[:400]!r} '
                             f'stderr={a_stderr[:400]!r}'
                         )
                         self.assertIn(
@@ -3690,6 +3698,39 @@ class TestDifferencingAdversarialLocators(DifferencingTestBase):
                     f'did the rejecting rather than resolution silently '
                     f'failing; stderr={stderr!r}'
                 )
+
+    def test_info_joins_no_actual_path_onto_a_windows_absolute_locator(self):
+        """A UNC parent is reported as recorded, never resolved into a path.
+
+        `info` shows where a relative reference resolves, as qemu-img
+        does. A Windows drive-letter or UNC reference is not
+        POSIX-absolute, so it used to be joined onto the image's
+        directory, and `info` printed an "actual path" of the image
+        directory followed by `\\attacker\share\probe` -- a file that
+        cannot exist (issue #658). In both renderings the reference is
+        now treated as the absolute path it is in its own convention.
+        """
+        source = self.differencing_image('vhd-diff-locator-unc')
+        unc = '\\\\attacker\\share\\probe'
+
+        stdout, stderr, rc = self.run_instar_info(source)
+        self.assertEqual(0, rc, f'info must not refuse; stderr={stderr!r}')
+        self.assertIn(
+            f'backing file: {unc}\n', stdout,
+            f'the UNC reference must be reported alone; stdout={stdout!r}')
+        self.assertNotIn(
+            '(actual path:', stdout,
+            f'a Windows absolute reference resolves to no host path; '
+            f'stdout={stdout!r}')
+
+        stdout, stderr, rc = self.run_instar_info(source, output_format='json')
+        self.assertEqual(0, rc, f'info must not refuse; stderr={stderr!r}')
+        data = json.loads(stdout)
+        self.assertEqual(unc, data.get('backing-filename'), f'{data!r}')
+        self.assertEqual(
+            unc, data.get('full-backing-filename'),
+            f'full-backing-filename must not join the UNC reference onto '
+            f'the image directory; {data!r}')
 
     def test_info_json_names_the_parent_as_a_vhd(self):
         """`backing-filename-format` says vpc, not qcow2.
