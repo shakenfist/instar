@@ -682,7 +682,7 @@ self_test() {
 # phase's definition of done asks the two to stay in step, which until
 # now was a promise kept by hand. Asserting it makes the drift a
 # failure instead of a documentation bug nobody reads.
-EXPECTED_CASES=153
+EXPECTED_CASES=155
 
 check_case_count() {
     # Only meaningful for a whole run; a selection is expected to be short.
@@ -1985,9 +1985,24 @@ rust_case 'vmm-data-file-refusal-not-captured' "${VMM_MAIN_LIB}" \
     instar 'add_byte_captures_the_data_file_entry_refusal'
 
 rust_case 'vmm-data-file-refusal-not-rendered' "${VMM_MAIN_LIB}" \
-    '        self.last_invalid_l2_entry.is_some() || self.last_data_file_entry.is_some()' \
-    '        self.last_invalid_l2_entry.is_some() // MUTATED' \
+    '            || self.last_data_file_entry.is_some()' \
+    '            // MUTATED: the data-file refusal not rendered' \
     instar 'data_file_entry_error_names_qemu_wording_for_each_rule'
+
+# The same pair for qemu's two host-offset corruption rules (#812),
+# which are a third refusal behind the same predicate and the same
+# renderer entry point. Without these, deleting either the capture or
+# the disjunct leaves the refusal raised and never shown -- which is
+# what #665 was, and what the pair above exists to stop happening again.
+rust_case 'vmm-malformed-l2-refusal-not-captured' "${VMM_MAIN_LIB}" \
+    '                    self.last_malformed_l2_entry = Some((err.sector, err.status));' \
+    '                    // MUTATED: the refusal not captured' \
+    instar 'add_byte_captures_the_malformed_l2_entry_refusal'
+
+rust_case 'vmm-malformed-l2-refusal-not-rendered' "${VMM_MAIN_LIB}" \
+    '            || self.last_malformed_l2_entry.is_some()' \
+    '            // MUTATED: the host-offset refusal not rendered' \
+    instar 'malformed_l2_entry_error_names_qemu_wording_for_each_rule'
 
 # ---------------------------------------------------------------------
 # Two chains in one device array, which is `compare` alone.

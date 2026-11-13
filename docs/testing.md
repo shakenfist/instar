@@ -2560,7 +2560,7 @@ guards. See the VHD and VHDX notes in
 [chain-config.md](chain-config.md#format-specific-notes) for the
 composing path being guarded.
 
-There are **153 cases**, in twelve groups.
+There are **155 cases**, in thirteen groups.
 
 Forty-seven cover the writer. Twenty-four mutate a library crate
 (`create`, `vhd`, `vhdx`) and are caught by a Rust unit or round-trip
@@ -2862,6 +2862,21 @@ classic `measure` walk and the extended `map` walk, caught by a unit
 test of the metadata walkers. The last two are the host's half: the
 `vmm` decoder no longer captures the refusal, or the run loops no longer
 see it, and the reason falls back to the generic failure text.
+
+Then **2 host-offset refusal cases**, guarding the host's half of the
+fix for issue #812. qemu applies two further rules when it turns any
+L2 entry into a host offset, in `qcow2_get_host_offset` rather than in
+its subcluster classifier: a host cluster offset that is not a multiple
+of the cluster size, and the all-zeroes flag in an image whose version
+predates it. Neither is a data-file rule, so the host renders them from
+their own function behind the same entry point, and both cases break
+that path rather than the rules themselves: the `vmm` decoder no longer
+captures the refusal, or `l2_entry_refused` no longer reports it, so a
+refusal the guest raised reaches the user as the generic failure text.
+That is #665 again, which is why the data-file pair above exists, and
+the pair here keeps the third refusal from drifting out of the same
+guard. The rules' own guest-side half is checked by the `qcow2` crate's
+unit tests and is not yet mutated here.
 
 The last group is **4 partial-last-block cases**, guarding how `check`
 sizes a VHDX's partial last block (#797) and how many BAT entries a

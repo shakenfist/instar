@@ -852,10 +852,11 @@ impl SerialDecoder {
         }
     }
 
-    /// Whether the guest refused a qcow2 L2 entry by name, either as an
-    /// invalid entry or under a data-file rule. A run loop that saw one
-    /// renders [`Self::l2_entry_refusal_error`] instead of its own
-    /// result or failure text.
+    /// Whether the guest refused a qcow2 L2 entry by name: as an invalid
+    /// entry, under a data-file rule, or under one of qemu's two
+    /// host-offset corruption rules. A run loop that saw one renders
+    /// [`Self::l2_entry_refusal_error`] instead of its own result or
+    /// failure text.
     fn l2_entry_refused(&self) -> bool {
         self.last_invalid_l2_entry.is_some()
             || self.last_data_file_entry.is_some()
@@ -863,11 +864,12 @@ impl SerialDecoder {
     }
 
     /// The terminal error for a read or metadata walk the guest ended by
-    /// refusing a qcow2 L2 entry: [`Self::data_file_entry_error`] or
+    /// refusing a qcow2 L2 entry: [`Self::malformed_l2_entry_error`],
+    /// [`Self::data_file_entry_error`] or
     /// [`Self::invalid_l2_entry_error`], whichever the decoder captured.
-    /// The two are kept behind one entry point so that an operation that
-    /// renders one cannot forget the other (#665 was a refusal raised
-    /// with no renderer).
+    /// The three are kept behind one entry point so that an operation
+    /// that renders one cannot forget the others (#665 was a refusal
+    /// raised with no renderer).
     fn l2_entry_refusal_error(&self, op: &str) -> String {
         if self.last_malformed_l2_entry.is_some() {
             self.malformed_l2_entry_error(op)
@@ -1300,6 +1302,40 @@ mod guest_exception_tests {
     }
 
     #[test]
+    fn malformed_l2_entry_error_names_qemu_wording_for_each_rule() {
+        // qemu's wording, block/qcow2-cluster.c:659-662 and :688-692 at
+        // v10.0.0, for each host-offset rule the guest raises (#812).
+        // These two apply to every qcow2 image rather than only to one
+        // with an external data file, so they are rendered by their own
+        // function and need their own pin. The assertion that
+        // `l2_entry_refused` is true for this field alone is what makes
+        // the refusal reach the user at all.
+        for (status, words) in [
+            (
+                shared::MalformedL2EntryRefusal::STATUS_UNALIGNED_HOST_OFFSET,
+                "Cluster allocation offset unaligned",
+            ),
+            (
+                shared::MalformedL2EntryRefusal::STATUS_ZERO_FLAG_PRE_V3,
+                "Zero cluster entry found in pre-v3 image",
+            ),
+        ] {
+            let mut decoder = super::SerialDecoder::new();
+            decoder.last_malformed_l2_entry = Some((65536, status));
+            assert!(decoder.l2_entry_refused());
+            for op in [
+                "convert", "dd", "compare", "bench", "rebase", "map", "measure",
+            ] {
+                let msg = decoder.l2_entry_refusal_error(op);
+                assert_eq!(
+                    msg,
+                    format!("{op}: {words} at virtual offset 65536 (0x10000)")
+                );
+            }
+        }
+    }
+
+    #[test]
     fn data_file_entry_error_names_an_unrecognised_status_as_such() {
         // A status this host does not know is a fact about the guest, not
         // about the image: the message must say the status was not
@@ -1363,6 +1399,43 @@ mod guest_exception_tests {
                 shared::DataFileEntryRefusal::STATUS_HOST_OFFSET_MISMATCH
             ))
         );
+        assert_eq!(decoder.last_invalid_l2_entry, None);
+        assert_eq!(decoder.last_malformed_l2_entry, None);
+        assert_eq!(decoder.last_differencing_refusal, None);
+        assert_eq!(decoder.last_cpu_exception, None);
+    }
+
+    #[test]
+    fn add_byte_captures_the_malformed_l2_entry_refusal() {
+        // As for the data-file refusal above, under this marker: the
+        // cluster's virtual byte offset as the sector, and which of
+        // qemu's two host-offset rules the entry breaks as the status.
+        // Nothing else may be captured, because `l2_entry_refusal_error`
+        // picks the renderer by which field is set.
+        let msg = guest_protocol::error_message(
+            shared::MalformedL2EntryRefusal::OPERATION,
+            "input",
+            131072,
+            shared::MalformedL2EntryRefusal::STATUS_UNALIGNED_HOST_OFFSET,
+        );
+        let mut framed = [0u8; 256];
+        let n = guest_protocol::encode_framed(&msg, &mut framed).expect("encode");
+        let mut decoder = super::SerialDecoder::new();
+        let mut decoded = 0;
+        for &b in &framed[..n] {
+            if decoder.add_byte(b).is_some() {
+                decoded += 1;
+            }
+        }
+        assert_eq!(decoded, 1);
+        assert_eq!(
+            decoder.last_malformed_l2_entry,
+            Some((
+                131072,
+                shared::MalformedL2EntryRefusal::STATUS_UNALIGNED_HOST_OFFSET
+            ))
+        );
+        assert_eq!(decoder.last_data_file_entry, None);
         assert_eq!(decoder.last_invalid_l2_entry, None);
         assert_eq!(decoder.last_differencing_refusal, None);
         assert_eq!(decoder.last_cpu_exception, None);
