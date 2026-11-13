@@ -189,21 +189,27 @@ pub fn detect_format_from_header(buffer: &[u8], len: usize, _extra_detail: bool)
     let vhd_cookie = u64::from_be_bytes([
         buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6], buffer[7],
     ]);
-    // The copy at offset 0 has to check out, or this is not the dynamic
-    // VHD it claims to be: everything downstream -- the virtual size,
-    // the disk type, the dynamic header's location, a differencing
-    // child's parent identity -- is read out of these same 512 bytes,
-    // and the checksum is the only field that constrains the rest of
-    // them (issue #583). qemu's vpc driver refuses such a file
-    // ("Incorrect header checksum"); instar declines to call it a VHD,
-    // so nothing reports a size derived from bytes nothing vouches for.
+    // A cookie at offset 0 is a VHD by probe, whether or not the copy's
+    // checksum holds -- as qemu's `vpc_probe` decides it. The checksum
+    // is then the *reader's* to verify, and every reader that acts on
+    // these 512 bytes does (`VhdState::init`, `info`, `resize`), so a
+    // bad copy refuses the image, as qemu's vpc driver does ("Incorrect
+    // header checksum"), while `check` can still decode it and report
+    // the mismatch (issue #583).
+    //
+    // Calling such a file `Raw` here instead is not a refusal: it is a
+    // verdict every operation then acts on. Measured: with that rule,
+    // `convert` of a dynamic VHD whose copy at 0 fails its checksum
+    // exited 0 and wrote the VHD's own footer, dynamic header and BAT
+    // out as disk content -- the bug class #662 closes, reached from
+    // detection instead.
+    //
+    // The trailing-footer probe, `detect_vhd_footer` below, is
+    // different, and does verify: a fixed VHD keeps no copy at offset
+    // 0, so a planted tail is the only evidence, and qemu itself reads
+    // a fixed VHD whose footer fails as raw.
     if vhd_cookie == VHD_COOKIE {
-        if len >= VHD_FOOTER_SIZE && vhd_footer_checksum_holds(buffer) {
-            return ImageFormat::Vhd;
-        }
-        // Nothing else can match a header that begins with `conectix`,
-        // so there is no point falling through to the other magics.
-        return ImageFormat::Raw;
+        return ImageFormat::Vhd;
     }
 
     // Check VDI magic at offset 64 (little-endian)
@@ -663,11 +669,13 @@ mod tests {
     }
 
     #[test]
-    fn a_header_footer_copy_must_also_check_out() {
-        // A dynamic VHD keeps a copy of its footer at offset 0, so this
-        // is the header-detection half of the same rule: the fields
-        // every operation then reads -- virtual size, disk type, the
-        // dynamic header's location -- come out of these 512 bytes.
+    fn a_header_footer_copy_is_a_vhd_by_its_cookie_alone() {
+        // The copy a dynamic VHD keeps at offset 0 is probed as qemu's
+        // `vpc_probe` probes it: by the cookie. A copy whose checksum
+        // fails is still a VHD here, so that the VHD reader -- which
+        // verifies it -- refuses the image. Calling it `Raw` instead
+        // made `convert` write the VHD's own structures out as disk
+        // content and exit 0.
         let good = well_formed_footer();
         assert_eq!(
             detect_format_from_header(&good, good.len(), false),
@@ -676,18 +684,11 @@ mod tests {
 
         let mut bad = good;
         bad[VHD_FOOTER_CHECKSUM_OFFSET] ^= 0xff;
+        assert!(!vhd_footer_checksum_holds(&bad));
         assert_eq!(
             detect_format_from_header(&bad, bad.len(), false),
-            ImageFormat::Raw,
-            "a footer copy whose checksum fails was still called a VHD"
-        );
-
-        // A buffer holding the cookie and nothing verifiable is not a
-        // VHD either; it must not fall through to another format's
-        // magic, since offset 0 is the cookie.
-        assert_eq!(
-            detect_format_from_header(&good[..64], 64, false),
-            ImageFormat::Raw
+            ImageFormat::Vhd,
+            "a footer copy whose checksum fails was handed on as another format"
         );
     }
 

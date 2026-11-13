@@ -1535,16 +1535,27 @@ is eight bytes of payload that any file can hold by accident or by
 design, while the checksum is the only field in a footer that constrains
 the rest of it.
 
-Consequences, all measured against qemu-img 10.0.13:
+The two probes differ, as qemu's do. A cookie at offset 0 makes a file a
+VHD by probe whatever its checksum says, and the reader then refuses it:
+calling it raw instead would not be a refusal but a verdict every
+operation acts on. (Measured, on an earlier revision that did exactly
+that: `convert` of such a dynamic VHD exited 0 and wrote the VHD's own
+footer, dynamic header and BAT out as disk content.) The last-sector
+probe verifies before promoting, because a fixed VHD keeps no copy at
+offset 0 and a planted tail is the only evidence there is.
 
-| Image | instar | qemu-img |
-|---|---|---|
-| dynamic VHD, footer copy at 0 fails its checksum | refused | refused ("Incorrect header checksum") |
-| fixed VHD, trailing footer fails its checksum | reported as `unknown`, i.e. not a VHD | reported as `raw` |
-| a raw file whose last sector begins with `conectix` | stays raw | stays raw |
-| dynamic VHD, *trailing* footer fails its checksum (copy at 0 is sound) | opens | opens |
+Consequences, measured against qemu-img 10.0.13 and libvhdi 20240509:
 
-A dynamic VHD whose footer copy at offset 0 carries the cookie and a bad
+| Image | instar | qemu-img | libvhdi |
+|---|---|---|---|
+| dynamic VHD, footer copy at 0 fails its checksum | refused ("Incorrect header checksum") | refused ("Incorrect header checksum") | sound |
+| differencing VHD, footer copy at 0 fails its checksum | refused ("Incorrect header checksum") | cannot read differencing VHD | sound |
+| fixed VHD, trailing footer fails its checksum | reported as `unknown`, i.e. not a VHD | reported as `raw` | sound |
+| a raw file whose last sector begins with `conectix` | stays raw | stays raw | — |
+| dynamic VHD, *trailing* footer fails its checksum (copy at 0 is sound) | opens | opens | sound |
+| differencing VHD, *trailing* footer fails its checksum (copy at 0 is sound) | opens | cannot read differencing VHD | sound |
+
+A VHD whose footer copy at offset 0 carries the cookie and a bad
 checksum is refused rather than read from the trailing footer instead.
 The fallback to the tail exists for a fixed VHD, which keeps no copy at
 offset 0 at all; using it for a *bad* copy would open an image qemu will
@@ -1556,9 +1567,16 @@ verifying it, so that it can decode a corrupt one and report
 image cannot tell the user what is wrong with it.
 
 libvhdi disagrees with both: `vhdiinfo` reports a VHD whose footer
-checksum is wrong as a sound dynamic disk. libvhdi is instar's oracle for
-*differencing* VHD, which qemu-img cannot read at all; for a footer
-qemu-img does read, qemu-img is the one instar follows.
+checksum is wrong as a sound disk, whichever footer it is. For a footer
+qemu-img does read, qemu-img is the one instar follows. For a
+differencing VHD neither oracle backs the refusal: qemu-img cannot read
+one at all, and libvhdi, instar's oracle for differencing VHD, reads the
+bad copy as sound. instar refuses it anyway, for the same reason as the
+dynamic case: the copy at offset 0 is where every field a reader acts
+on comes from, including the parent identity, and a differencing child
+is the one image where those fields choose which *other* file is read.
+`TestVhdFooterCopyChecksum` in `tests/test_differencing.py` pins all of
+it.
 
 ### VHD fixed subformat carries footer-only metadata
 

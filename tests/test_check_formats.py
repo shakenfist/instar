@@ -181,15 +181,16 @@ class TestCheckCorruptImages(InstarTestBase):
         The fixture carries two defects at once: `disk_type` 255, and a
         checksum field left at zero, which no VHD writer produces.
         qemu-img refuses it for the checksum before it ever looks at
-        the disk type ("Incorrect header checksum"), and since #583 so
-        does instar's detection -- a `conectix` block whose checksum
-        does not hold up is not a footer. The fixture's manifest entry
-        sets `skip_qemu_img`, which is how it went unnoticed.
+        the disk type ("Incorrect header checksum"), and so does every
+        instar reader since #583. `check` is the deliberate exception:
+        it decodes a footer without verifying it so that it can report
+        the mismatch as a finding. The fixture's manifest entry sets
+        `skip_qemu_img`, which is how the checksum went unnoticed.
 
-        So the test states both halves. The fixture as shipped is not a
-        VHD, and a copy with its checksum made consistent -- corrupt in
-        the one way its name claims -- is a VHD whose disk type `check`
-        faults.
+        So the test states both halves. The fixture as shipped is a VHD
+        `check` reports as corrupt, and a copy with its checksum made
+        consistent -- corrupt in the one way its name claims -- is a VHD
+        whose disk type `check` still faults.
         """
         testdata_root = self._testdata_root
         vhd_path = (
@@ -204,9 +205,15 @@ class TestCheckCorruptImages(InstarTestBase):
             vhd_path, output_format='json'
         )
         result = json.loads(stdout)
-        self.assertNotIn(
+        # A cookie at offset 0 is a VHD by probe, as qemu's is; calling it
+        # anything else would hand the footer to another reader as data.
+        self.assertIn(
             result.get('format', '').lower(), ['vhd', 'vpc'],
-            'a footer whose checksum does not hold up is not a VHD'
+            'a VHD whose footer checksum fails was not diagnosed as a VHD'
+        )
+        self.assertGreater(
+            result.get('check-errors', 0) + result.get('corruptions', 0), 0,
+            'a VHD whose footer checksum fails was reported as clean'
         )
 
         with tempfile.TemporaryDirectory() as td:

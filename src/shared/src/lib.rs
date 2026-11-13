@@ -3401,6 +3401,26 @@ impl MalformedL2EntryRefusal {
     pub const STATUS_ZERO_FLAG_PRE_V3: u32 = 2;
 }
 
+/// `info`'s refusal of a VHD whose footer copy at offset 0 fails its
+/// checksum (issue #583), raised on `send_error`.
+///
+/// Header detection calls a `conectix` cookie at offset 0 a VHD, as
+/// qemu's probe does, so verifying the copy is the reader's job. `info`
+/// has no result to send for an image it will not read, so the reason
+/// travels on `send_error`, and the host renders it in qemu's wording
+/// ("Incorrect header checksum") rather than reporting nothing.
+pub struct VhdFooterChecksumRefusal;
+
+impl VhdFooterChecksumRefusal {
+    /// Reserved `send_error` operation marker for this signal, distinct
+    /// from every real operation name and every other refusal marker.
+    pub const OPERATION: &'static str = "vhd-footer-checksum";
+
+    /// The same marker as [`Self::OPERATION`], NUL-terminated, for the
+    /// call table's `send_error`.
+    pub const OPERATION_C: &'static [u8] = b"vhd-footer-checksum\0";
+}
+
 // ============================================================================
 // Snapshot configuration and result structures
 // ============================================================================
@@ -6971,6 +6991,30 @@ mod tests {
         ] {
             assert_ne!(MalformedL2EntryRefusal::OPERATION, other);
         }
+    }
+
+    #[test]
+    fn vhd_footer_checksum_marker_is_distinct_and_matches_its_c_string() {
+        for other in [
+            "cpu-exception",
+            "info",
+            DifferencingRefusal::OPERATION,
+            InvalidL2EntryRefusal::OPERATION,
+            DataFileEntryRefusal::OPERATION,
+            MalformedL2EntryRefusal::OPERATION,
+        ] {
+            assert_ne!(VhdFooterChecksumRefusal::OPERATION, other);
+        }
+        let c = VhdFooterChecksumRefusal::OPERATION_C;
+        assert_eq!(
+            c.last().copied(),
+            Some(0),
+            "the C marker must be NUL-terminated"
+        );
+        assert_eq!(
+            &c[..c.len() - 1],
+            VhdFooterChecksumRefusal::OPERATION.as_bytes()
+        );
     }
 
     #[test]

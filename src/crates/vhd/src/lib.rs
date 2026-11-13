@@ -1300,27 +1300,6 @@ pub fn footer_geometry(current_size: u64) -> (u16, u8, u8) {
     }
 }
 
-// ============================================================================
-// Allocation scanning — pure helper
-// ============================================================================
-
-/// Count allocated entries in a dynamic-VHD BAT byte slice.
-///
-/// Each entry is a big-endian u32 sector pointer. The unallocated
-/// marker is `0xFFFF_FFFF`. Any other value indicates an allocated
-/// block.
-///
-/// `bat_bytes` may have a trailing partial entry (length not a
-/// multiple of 4); the trailing bytes are ignored. The caller is
-/// expected to pass a slice covering exactly `total_blocks * 4`
-/// bytes after BAT padding.
-pub fn count_allocated_in_bat(bat_bytes: &[u8]) -> u64 {
-    bat_bytes
-        .chunks_exact(4)
-        .filter(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]) != BAT_UNALLOCATED)
-        .count() as u64
-}
-
 /// Classify one dynamic-VHD BAT entry into a single `MapExtent`.
 ///
 /// Mirrors `VhdState::block_lookup`'s dynamic-VHD decision tree:
@@ -2074,8 +2053,8 @@ impl VhdState {
     // meaningful_len / per-sector read) is duplicated near-verbatim in
     // `vhdx::VhdxState::scan_allocation`. The two formats walk single
     // contiguous BAT tables; the only differences are the entry
-    // decoder (`count_allocated_in_bat` vs the vhdx chunk_ratio-aware
-    // variant) and one cache-invalidation line. Extracting a shared
+    // decoder (a placement-checked per-entry count here, the vhdx
+    // chunk_ratio-aware `count_allocated_in_bat_chunk` there) and one cache-invalidation line. Extracting a shared
     // `walk_table_sectors(call_table, byte_offset, byte_len, ...,
     // FnMut(&[u8]))` helper into `shared` is captured as future work
     // in PLAN-measure.md; deferred because the FnMut + &mut self
@@ -2153,9 +2132,8 @@ impl VhdState {
                 (total_bat_bytes - bat_bytes_consumed).min((buf_end - buf_start) as u64) as usize;
             let meaningful = &chunk[..meaningful_len];
 
-            // Counted entry by entry rather than with
-            // `count_allocated_in_bat`, because each allocated entry's
-            // placement is checked as the reader checks it: measure
+            // Counted entry by entry, with each allocated entry's
+            // placement checked as the reader checks it: measure
             // must not count the bytes of a block the reader refuses
             // to read (issue #662).
             for c in meaningful.chunks_exact(4) {
@@ -4198,91 +4176,6 @@ mod tests {
         // Verify checksum
         let computed = compute_checksum(&buf, DYN_CHECKSUM_OFFSET);
         assert_eq!(hdr.checksum, computed);
-    }
-
-    // ====================================================================
-    // count_allocated_in_bat tests
-    // ====================================================================
-
-    /// Helper: encode a u32 as 4 big-endian bytes.
-    fn be32(v: u32) -> [u8; 4] {
-        v.to_be_bytes()
-    }
-
-    #[test]
-    fn bat_count_empty() {
-        // Empty slice → 0 allocated entries.
-        assert_eq!(count_allocated_in_bat(&[]), 0);
-    }
-
-    #[test]
-    fn bat_count_all_allocated() {
-        // 4 entries, all with small non-0xFFFFFFFF values → all allocated.
-        let mut buf = [0u8; 16];
-        buf[0..4].copy_from_slice(&be32(0x0000_0001));
-        buf[4..8].copy_from_slice(&be32(0x0000_0002));
-        buf[8..12].copy_from_slice(&be32(0x0000_0003));
-        buf[12..16].copy_from_slice(&be32(0x0000_0004));
-        assert_eq!(count_allocated_in_bat(&buf), 4);
-    }
-
-    #[test]
-    fn bat_count_all_unallocated() {
-        // 4 entries, all 0xFFFFFFFF → 0 allocated.
-        let buf = [0xFF_u8; 16];
-        assert_eq!(count_allocated_in_bat(&buf), 0);
-    }
-
-    #[test]
-    fn bat_count_mixed() {
-        // 5 entries: entries 0 and 3 are allocated, entries 1, 2, 4 are not.
-        // Expected: 2.
-        let mut buf = [0u8; 20];
-        buf[0..4].copy_from_slice(&be32(0x0000_0010)); // allocated
-        buf[4..8].copy_from_slice(&be32(BAT_UNALLOCATED)); // unallocated
-        buf[8..12].copy_from_slice(&be32(BAT_UNALLOCATED)); // unallocated
-        buf[12..16].copy_from_slice(&be32(0x0000_0020)); // allocated
-        buf[16..20].copy_from_slice(&be32(BAT_UNALLOCATED)); // unallocated
-        assert_eq!(count_allocated_in_bat(&buf), 2);
-    }
-
-    #[test]
-    fn bat_count_trailing_partial_entry() {
-        // 3 complete entries + 1 trailing byte (13 bytes total).
-        // chunks_exact(4) must discard the tail and count only 3 entries.
-        // Entries: allocated, unallocated, allocated → expected 2.
-        let mut buf = [0u8; 13];
-        buf[0..4].copy_from_slice(&be32(0x0000_0001)); // allocated
-        buf[4..8].copy_from_slice(&be32(BAT_UNALLOCATED)); // unallocated
-        buf[8..12].copy_from_slice(&be32(0x0000_0002)); // allocated
-        buf[12] = 0x00; // trailing garbage byte — must be ignored
-        assert_eq!(count_allocated_in_bat(&buf), 2);
-    }
-
-    #[test]
-    fn bat_count_large_every_seventh_allocated() {
-        // 1024 entries, with every 7th entry allocated (indices 0, 7, 14, ...).
-        // Count = number of i in 0..1024 where i % 7 == 0.
-        let mut buf = [0xFF_u8; 1024 * 4];
-        let mut expected: u64 = 0;
-        for i in 0usize..1024 {
-            if i % 7 == 0 {
-                let off = i * 4;
-                buf[off..off + 4].copy_from_slice(&be32(i as u32));
-                expected += 1;
-            }
-        }
-        // Verify expected: ceil(1023 / 7) + 1 = 146 + 1 = 147.
-        assert_eq!(expected, 147);
-        assert_eq!(count_allocated_in_bat(&buf), 147);
-    }
-
-    #[test]
-    fn bat_count_zero_value_is_allocated() {
-        // BAT entry value 0 is a valid sector pointer → must count as allocated.
-        // Only 0xFFFFFFFF is the unallocated sentinel.
-        let buf = be32(0x0000_0000);
-        assert_eq!(count_allocated_in_bat(&buf), 1);
     }
 
     // ====================================================================

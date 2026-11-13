@@ -834,6 +834,30 @@ struct SerialDecoder {
     /// `shared::MalformedL2EntryRefusal::OPERATION`. Same pattern as
     /// `last_data_file_entry`, and rendered wherever that is.
     last_malformed_l2_entry: Option<(u64, u32)>,
+    /// Whether `info` refused a VHD whose footer copy at offset 0 fails
+    /// its checksum: an `error` message whose `operation` is
+    /// `shared::VhdFooterChecksumRefusal::OPERATION` (issue #583). `info`
+    /// sends no result for an image it will not read, so this is what
+    /// [`info_without_a_result`] renders in place of the generic text.
+    vhd_footer_checksum_refused: bool,
+}
+
+/// The error for an `info` run that ended without a result.
+///
+/// The guest sends no result for an image it refuses, and both info run
+/// loops used to treat that differently: the chain-discovery one failed
+/// with generic text, and `instar info` itself printed nothing and
+/// exited 0. Both now fail, and name the reason when the guest gave one.
+fn info_without_a_result(decoder: &SerialDecoder, input: &str) -> String {
+    if decoder.vhd_footer_checksum_refused {
+        // qemu-img's wording: `Could not open 'X': Incorrect header checksum`.
+        format!(
+            "Could not open '{input}': Incorrect header checksum \
+             (the VHD footer copy at offset 0 does not match its checksum)"
+        )
+    } else {
+        "No info result received from guest".to_string()
+    }
 }
 
 /// Maximum serial decoder buffer size: frame header + max protobuf message
@@ -849,6 +873,7 @@ impl SerialDecoder {
             last_invalid_l2_entry: None,
             last_data_file_entry: None,
             last_malformed_l2_entry: None,
+            vhd_footer_checksum_refused: false,
         }
     }
 
@@ -1086,6 +1111,8 @@ impl SerialDecoder {
                     self.last_cpu_exception = Some((err.status, err.sector));
                 } else if err.operation == shared::DifferencingRefusal::OPERATION {
                     self.last_differencing_refusal = Some(err.status);
+                } else if err.operation == shared::VhdFooterChecksumRefusal::OPERATION {
+                    self.vhd_footer_checksum_refused = true;
                 } else if err.operation == shared::InvalidL2EntryRefusal::OPERATION {
                     // `sector` is the virtual byte offset of the refused read.
                     self.last_invalid_l2_entry = Some(err.sector);
@@ -1403,6 +1430,40 @@ mod guest_exception_tests {
         assert_eq!(decoder.last_malformed_l2_entry, None);
         assert_eq!(decoder.last_differencing_refusal, None);
         assert_eq!(decoder.last_cpu_exception, None);
+    }
+
+    #[test]
+    fn info_names_a_vhd_footer_checksum_refusal_in_qemus_wording() {
+        // `info` sends no result for a VHD whose footer copy at offset 0
+        // fails its checksum, only this marker. Without the capture, or
+        // without the renderer reading it, the failure is generic text
+        // -- or, before #583's follow-up, `instar info` exited 0 having
+        // printed nothing at all.
+        let decoder = super::SerialDecoder::new();
+        assert_eq!(
+            super::info_without_a_result(&decoder, "x.vhd"),
+            "No info result received from guest"
+        );
+
+        let msg = guest_protocol::error_message(
+            shared::VhdFooterChecksumRefusal::OPERATION,
+            "input",
+            0,
+            0,
+        );
+        let mut framed = [0u8; 256];
+        let n = guest_protocol::encode_framed(&msg, &mut framed).expect("encode");
+        let mut decoder = super::SerialDecoder::new();
+        for &b in &framed[..n] {
+            decoder.add_byte(b);
+        }
+        assert!(decoder.vhd_footer_checksum_refused);
+        assert_eq!(decoder.last_differencing_refusal, None);
+        let text = super::info_without_a_result(&decoder, "x.vhd");
+        assert!(
+            text.starts_with("Could not open 'x.vhd': Incorrect header checksum"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -3285,7 +3346,9 @@ fn execute_info_operation(
         thread.stop();
     }
 
-    captured_result.ok_or_else(|| "No info result received from guest".into())
+    captured_result.ok_or_else(|| {
+        info_without_a_result(&serial_decoder, &input_path.display().to_string()).into()
+    })
 }
 
 /// What the caller will do with the chain it asks for.
@@ -12252,6 +12315,10 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
 
     // Track VM errors - if set, we return an error instead of Ok(())
     let mut vm_error: Option<String> = None;
+    // Whether the guest sent its result. A guest that refuses the image
+    // sends none, and that must fail rather than exit 0 having printed
+    // nothing.
+    let mut saw_info_result = false;
 
     loop {
         match vcpu.run()? {
@@ -12272,6 +12339,7 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
                                 Some(guest_::GuestMessage_::Payload::InfoResult(_))
                             );
                             if is_info_result {
+                                saw_info_result = true;
                                 print_info_result(
                                     &msg,
                                     &args.input,
@@ -12384,6 +12452,9 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     // Return error if VM crashed or failed
     if let Some(error) = vm_error {
         return Err(error.into());
+    }
+    if !saw_info_result {
+        return Err(info_without_a_result(&serial_decoder, &args.input).into());
     }
 
     Ok(())

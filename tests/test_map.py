@@ -4,7 +4,7 @@ Exercises the streaming map renderer end-to-end against the
 cross-version qemu-img map baseline matrix in
 `instar-testdata/expected-outputs/map-{human,json}/`.
 
-The test suite is split into five classes, all inheriting
+The test suite is split into seven classes, all inheriting
 from `TestMapSmoke`:
 
 * `TestMapSmoke` — wiring checks (binary, baselines,
@@ -19,6 +19,10 @@ from `TestMapSmoke`:
 * `TestMapDivergenceRegression` — for each
   `KNOWN_MAP_DIVERGENCES` entry, asserts the divergence
   still happens so accidental fixes surface loudly.
+* `TestMapCrossProfile` — every map profile emitted correctly,
+  on any host.
+* `TestMapVhdBlockPlacement` — map and measure refuse a VHD
+  block laid on the image's own metadata.
 
 The baseline comparisons call ``assertEqual(instar_output, baseline)``,
 so a failure labels instar's output "reference" and the qemu-img
@@ -1017,10 +1021,8 @@ class TestMapVhdBlockPlacement(TestMapSmoke):
     reader.
     """
 
-    def _crafted_vhd(self, tmpdir, bat_entry):
-        """A dynamic VHD whose first BAT entry is `bat_entry`."""
-        import struct
-
+    def _sound_vhd(self, tmpdir):
+        """A 4 MiB dynamic VHD with its first 2 MiB block written."""
         path = Path(tmpdir) / 'placement.vhd'
         r = subprocess.run(
             ['qemu-img', 'create', '-q', '-f', 'vpc', str(path), '4M'],
@@ -1030,7 +1032,13 @@ class TestMapVhdBlockPlacement(TestMapSmoke):
             ['qemu-io', '-f', 'vpc', '-c', 'write -P 0x55 0 2M', str(path)],
             capture_output=True, text=True, timeout=60)
         self.assertEqual(r.returncode, 0, f'qemu-io write failed: {r.stderr}')
+        return path
 
+    def _crafted_vhd(self, tmpdir, bat_entry):
+        """`_sound_vhd`, with its first BAT entry replaced by `bat_entry`."""
+        import struct
+
+        path = self._sound_vhd(tmpdir)
         data = bytearray(path.read_bytes())
         header_offset = struct.unpack_from('>Q', data, 16)[0]
         table_offset = struct.unpack_from('>Q', data, header_offset + 16)[0]
@@ -1041,13 +1049,8 @@ class TestMapVhdBlockPlacement(TestMapSmoke):
         path.write_bytes(bytes(data))
         return path
 
-    def _require_qemu(self):
-        for tool in ('qemu-img', 'qemu-io'):
-            if shutil.which(tool) is None:
-                self.skipTest(f'{tool} is not installed')
-
     def test_map_refuses_a_block_on_the_images_own_metadata(self):
-        self._require_qemu()
+        self._require_qemu_tools()
         with tempfile.TemporaryDirectory() as td:
             # Sector 0: the block's bitmap covers the footer copy and
             # its payload the dynamic header.
@@ -1059,7 +1062,7 @@ class TestMapVhdBlockPlacement(TestMapSmoke):
                 f'stdout={stdout[:400]!r}')
 
     def test_measure_refuses_a_block_on_the_images_own_metadata(self):
-        self._require_qemu()
+        self._require_qemu_tools()
         with tempfile.TemporaryDirectory() as td:
             image = self._crafted_vhd(td, 0)
             instar = self.get_instar_binary()
@@ -1077,20 +1080,13 @@ class TestMapVhdBlockPlacement(TestMapSmoke):
         Without this, a guard that refused every dynamic VHD would pass
         the two tests above.
         """
-        self._require_qemu()
+        self._require_qemu_tools()
         with tempfile.TemporaryDirectory() as td:
             # The same fixture with its real BAT entry left alone.
-            image = self._crafted_vhd(td, 0)
-            sound = Path(td) / 'sound.vhd'
-            r = subprocess.run(
-                ['qemu-img', 'create', '-q', '-f', 'vpc', str(sound), '4M'],
-                capture_output=True, text=True, timeout=60)
-            self.assertEqual(r.returncode, 0, r.stderr)
-            r = subprocess.run(
-                ['qemu-io', '-f', 'vpc', '-c', 'write -P 0x55 0 2M', str(sound)],
-                capture_output=True, text=True, timeout=60)
-            self.assertEqual(r.returncode, 0, r.stderr)
-            stdout, stderr, rc = self.run_instar_map(sound)
+            sound = self._sound_vhd(td)
+            stdout, stderr, rc = self.run_instar_map(sound, '--output', 'json')
             self.assertEqual(rc, 0, f'a sound dynamic VHD was refused: {stderr}')
-            self.assertIn('0x200000', stdout.replace('2097152', '0x200000'))
-            del image
+            data = [e for e in json.loads(stdout) if e['data']]
+            self.assertEqual(
+                [(e['start'], e['length']) for e in data], [(0, 2 * 1024 * 1024)],
+                f'expected one 2 MiB data extent at 0; stdout={stdout[:400]!r}')
