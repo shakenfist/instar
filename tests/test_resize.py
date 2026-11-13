@@ -144,8 +144,19 @@ RESIZE_CASES = {
 
 # qemu-img size-suffix grammar; ported from
 # instar-testdata/scripts/generate-baselines.py.
+#
+# This mirror deliberately leads its upstream: the generator still has
+# `b` = 512, the error #900 fixed here, and no baseline case uses a `b`
+# suffix, so nothing it generates changes either way. Correcting it
+# there is a one-line commit in that repository, which this one cannot
+# make; until then the two disagree, and the first `b`-suffixed case
+# added to RESIZE_CASES has to be generated with that fixed first or it
+# will fail for a reason that looks nothing like the cause.
 _SIZE_SUFFIX_MULTIPLIERS = {
-    'b': 512,
+    # qemu-img's `b` is one byte (suffix_mul in util/cutils.c), not
+    # qemu-io's 512-byte block.
+    'B': 1,
+    'b': 1,
     'k': 1024,
     'K': 1024,
     'M': 1024 ** 2,
@@ -160,7 +171,8 @@ def parse_qemu_size(size_str):
     """Parse a qemu-img SIZE string to bytes.
 
     Same grammar as qemu-img: optional integer + single-letter
-    suffix (b/k/K/M/G/T/P/E). Bare integers are bytes.
+    suffix (B/b/k/K/M/G/T/P/E). Bare integers are bytes, as is a
+    `b` suffix.
     """
     s = size_str.strip()
     if not s:
@@ -1027,6 +1039,305 @@ RESIZE_CROSS_VALIDATION_CASES = [
     ('raw',   ('64M-to-1M-shrink',     '64M', '1M',   [],     None)),
     ('raw',   ('1M-to-4M-prealloc-full','1M', '4M',   [],     'full')),
 ]
+
+
+class TestResizeShrinkExactSize(TestResizeSmoke):
+    """A qcow2 shrink records the size it was given, not a cluster-aligned one.
+
+    Measured with qemu-img 10.0.13: shrinking a 10 MiB image to
+    5 MiB + 4096 leaves a virtual size of 5246976, which is not a
+    multiple of the 64 KiB cluster. instar rounded down to 5242880,
+    so the disk came out smaller than both the request and qemu's.
+    """
+
+    def _qemu(self, *cmd, timeout=60):
+        r = subprocess.run(['qemu-img', *[str(c) for c in cmd]],
+                           capture_output=True, text=True, timeout=timeout)
+        return r.stdout, r.stderr, r.returncode
+
+    def test_shrink_to_a_size_inside_a_cluster(self):
+        target = 5 * 1024 ** 2 + 4096
+        with tempfile.TemporaryDirectory() as td:
+            ours = Path(td) / 'ours.qcow2'
+            theirs = Path(td) / 'theirs.qcow2'
+            for path in (ours, theirs):
+                _, err, rc = self._qemu('create', '-q', '-f', 'qcow2', path, '10M')
+                self.assertEqual(rc, 0, f'qemu-img create: {err}')
+            _, stderr, rc = self.run_instar_resize(
+                '--shrink', '-f', 'qcow2', str(ours), str(target))
+            self.assertEqual(rc, 0, f'instar resize --shrink failed: {stderr}')
+            _, err, rc = self._qemu('resize', '-q', '--shrink', '-f', 'qcow2',
+                                    theirs, str(target))
+            self.assertEqual(rc, 0, f'qemu-img resize: {err}')
+
+            for path, tool in ((ours, 'instar'), (theirs, 'qemu-img')):
+                out, err, rc = self._qemu('info', '--output=json', path)
+                self.assertEqual(rc, 0, f'info on the {tool} result: {err}')
+                self.assertEqual(json.loads(out)['virtual-size'], target,
+                                 f'{tool} virtual size')
+            # instar's result is still a well-formed image.
+            _, err, rc = self._qemu('check', ours)
+            self.assertEqual(rc, 0, f'qemu-img check on instar result: {err}')
+
+    def test_the_kept_clusters_tail_survives_a_shrink_and_a_grow(self):
+        """The tail of the straddling cluster is left as it was.
+
+        A shrink to a size inside a cluster keeps that cluster and
+        writes nothing into it, so the bytes above the new size are
+        still there and a grow back exposes them again rather than
+        zeros. qemu-img does the same -- measured on 10.0.13, which is
+        why this is a parity test and not a fix: both tools read 0xa5
+        for all 61440 bytes from 5246976 to the end of that cluster.
+        A grow past the *old* EOF still reads as zeros on both.
+        """
+        self._require_qemu_tools()
+        target = 5 * 1024 ** 2 + 4096          # 5246976, mid-cluster
+        cluster_end = 5 * 1024 ** 2 + 64 * 1024  # 5308416
+        with tempfile.TemporaryDirectory() as td:
+            ours = Path(td) / 'ours.qcow2'
+            theirs = Path(td) / 'theirs.qcow2'
+            # 0xa5 across the first 6 MiB, so the cluster holding the
+            # new last byte holds data on both sides of it.
+            _, err, rc = self._qemu('create', '-q', '-f', 'qcow2', ours, '10M')
+            self.assertEqual(rc, 0, f'qemu-img create: {err}')
+            r = subprocess.run(
+                ['qemu-io', '-f', 'qcow2', '-c',
+                 f'write -P 0xa5 0 {6 * 1024 ** 2}', str(ours)],
+                capture_output=True, text=True, timeout=60)
+            self.assertEqual(0, r.returncode, f'qemu-io write: {r.stderr}')
+            shutil.copyfile(ours, theirs)
+
+            _, stderr, rc = self.run_instar_resize(
+                '--shrink', '-f', 'qcow2', str(ours), str(target))
+            self.assertEqual(rc, 0, f'instar resize --shrink: {stderr}')
+            _, stderr, rc = self.run_instar_resize(
+                '-f', 'qcow2', str(ours), str(10 * 1024 ** 2))
+            self.assertEqual(rc, 0, f'instar resize (grow back): {stderr}')
+
+            _, err, rc = self._qemu('resize', '-q', '--shrink', '-f', 'qcow2',
+                                    theirs, str(target))
+            self.assertEqual(rc, 0, f'qemu-img resize --shrink: {err}')
+            _, err, rc = self._qemu('resize', '-q', '-f', 'qcow2', theirs,
+                                    str(10 * 1024 ** 2))
+            self.assertEqual(rc, 0, f'qemu-img resize (grow back): {err}')
+
+            tails = {}
+            for path, tool in ((ours, 'instar'), (theirs, 'qemu-img')):
+                flat = Path(td) / f'{tool}.raw'
+                _, err, rc = self._qemu('convert', '-f', 'qcow2', '-O', 'raw',
+                                        path, flat)
+                self.assertEqual(rc, 0, f'convert of the {tool} result: {err}')
+                data = flat.read_bytes()
+                self.assertEqual(10 * 1024 ** 2, len(data), tool)
+                tails[tool] = data[target:cluster_end]
+                # Past the straddling cluster, both read as zeros: that
+                # is the grow path's zero-check, not the shrink's.
+                self.assertEqual(bytes(64 * 1024), data[cluster_end:cluster_end + 64 * 1024],
+                                 f'{tool} should read zeros past the kept cluster')
+            self.assertEqual(b'\xa5' * (cluster_end - target), tails['qemu-img'],
+                             'qemu-img is expected to leave the tail as it was')
+            self.assertEqual(tails['qemu-img'], tails['instar'],
+                             'instar and qemu-img disagree about the kept tail')
+
+    def test_shrink_below_one_cluster(self):
+        """qemu-img shrinks to 4096 on a 64 KiB-cluster image; instar refused."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'small.qcow2'
+            _, err, rc = self._qemu('create', '-q', '-f', 'qcow2', path, '10M')
+            self.assertEqual(rc, 0, f'qemu-img create: {err}')
+            _, stderr, rc = self.run_instar_resize(
+                '--shrink', '-f', 'qcow2', str(path), '4096')
+            self.assertEqual(rc, 0, f'instar resize --shrink 4096 failed: {stderr}')
+            out, err, rc = self._qemu('info', '--output=json', path)
+            self.assertEqual(rc, 0, f'info: {err}')
+            self.assertEqual(json.loads(out)['virtual-size'], 4096)
+            _, err, rc = self._qemu('check', path)
+            self.assertEqual(rc, 0, f'qemu-img check: {err}')
+
+    def test_shrink_to_zero_is_refused(self):
+        """qemu-img: "New image size must be positive"."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'z.qcow2'
+            _, err, rc = self._qemu('create', '-q', '-f', 'qcow2', path, '10M')
+            self.assertEqual(rc, 0, f'qemu-img create: {err}')
+            _, _, rc = self.run_instar_resize(
+                '--shrink', '-f', 'qcow2', str(path), '0')
+            self.assertNotEqual(rc, 0, 'expected a shrink to zero to be refused')
+            out, err, rc = self._qemu('info', '--output=json', path)
+            self.assertEqual(rc, 0, f'info: {err}')
+            self.assertEqual(json.loads(out)['virtual-size'], 10 * 1024 ** 2)
+
+
+class TestResizeSizeAlignment(TestResizeSmoke):
+    """A new size has to be a whole sector, except on raw.
+
+    Measured with qemu-img 10.0.13: a qcow2 resize to 33554433 is
+    refused ("The new size must be a multiple of 512") and the image
+    is untouched, while a raw file is resized to exactly 33554433
+    bytes, because raw has no metadata to keep aligned. qemu-img
+    cannot resize vmdk, vhd or vhdx at all, and all three record
+    their size in sectors, so instar holds them to the same rule --
+    a VHDX to its own logical sector size.
+    """
+
+    def test_qcow2_refuses_a_size_that_is_not_a_whole_sector(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'a.qcow2'
+            _, c_stderr, c_rc = self.run_instar_create(
+                '-f', 'qcow2', str(path), '16M')
+            self.assertEqual(c_rc, 0, f'create failed: {c_stderr}')
+            _, stderr, rc = self.run_instar_resize(
+                '-f', 'qcow2', str(path), '33554433')
+            self.assertNotEqual(rc, 0, 'expected 16M + 1 byte to be refused')
+            self.assertIn('multiple of 512', stderr)
+            # Refused before anything was written.
+            info_stdout, info_err, info_rc = self.run_instar_info(
+                path, output_format='json')
+            self.assertEqual(info_rc, 0, f'info failed: {info_err}')
+            self.assertEqual(json.loads(info_stdout)['virtual-size'],
+                             16 * 1024 ** 2)
+
+    def test_vhdx_refuses_a_size_that_is_not_a_whole_sector(self):
+        """A VHDX's VirtualDiskSize is a multiple of its logical sector size."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'a.vhdx'
+            _, c_stderr, c_rc = self.run_instar_create(
+                '-f', 'vhdx', str(path), '16M')
+            self.assertEqual(c_rc, 0, f'create failed: {c_stderr}')
+            _, stderr, rc = self.run_instar_resize(
+                '-f', 'vhdx', str(path), '33554433')
+            self.assertNotEqual(rc, 0, 'expected 16M + 1 byte to be refused')
+            self.assertIn('multiple of 512', stderr)
+
+    def test_vhdx_with_4096_byte_sectors_names_4096(self):
+        """The multiple comes from the image, not from a constant.
+
+        `LogicalSectorSize` is the only thing that makes the gate
+        anything other than 512, and the VHDX metadata parser accepts
+        512 or 4096. Nothing in the tree creates a 4096-sector VHDX --
+        neither `instar create` nor `qemu-img create` has an option
+        for it -- so the field is patched in place here. The metadata
+        region carries no checksum, so a patched image is a valid one:
+        `instar info` reads it, and a size that *is* a multiple of
+        4096 still resizes.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'a.vhdx'
+            _, c_stderr, c_rc = self.run_instar_create(
+                '-f', 'vhdx', str(path), '16M')
+            self.assertEqual(c_rc, 0, f'create failed: {c_stderr}')
+
+            summary = vhdx_structure.summarise(vhdx_structure.parse_vhdx(path))
+            self.assertEqual(512, summary['logical_sector_size'])
+            region = next(r for r in summary['region_table_1']
+                          if r['region'] == 'metadata')
+            item = summary['metadata_items']['logical_sector_size']
+            self.assertEqual(4, item['length'])
+            with path.open('r+b') as f:
+                f.seek(region['offset'] + item['offset'])
+                f.write((4096).to_bytes(4, 'little'))
+            self.assertEqual(
+                4096,
+                vhdx_structure.summarise(
+                    vhdx_structure.parse_vhdx(path))['logical_sector_size'])
+
+            # 16 MiB + 512: a whole 512-byte sector, and not a whole
+            # 4096-byte one.
+            _, stderr, rc = self.run_instar_resize(
+                '-f', 'vhdx', str(path), '16777728')
+            self.assertNotEqual(rc, 0, 'expected 16M + 512 to be refused')
+            self.assertIn('multiple of 4096', stderr)
+
+            # 16 MiB + 4096 is a whole sector for this image.
+            _, stderr, rc = self.run_instar_resize(
+                '-f', 'vhdx', str(path), '16781312')
+            self.assertEqual(rc, 0, f'16M + 4096 should resize: {stderr}')
+
+    def test_vmdk_refuses_a_size_that_is_not_a_whole_sector(self):
+        """A VMDK records its capacity in 512-byte sectors."""
+        self._assert_non_sector_size_refused('vmdk')
+
+    def test_vpc_refuses_a_size_that_is_not_a_whole_sector(self):
+        """A VHD footer records its size and geometry in sectors."""
+        self._assert_non_sector_size_refused('vpc')
+
+    def _assert_non_sector_size_refused(self, fmt):
+        """create 16M in `fmt`, then refuse a resize to 16 MiB + 1."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / f'a.{fmt}'
+            _, c_stderr, c_rc = self.run_instar_create(
+                '-f', fmt, str(path), '16M')
+            self.assertEqual(c_rc, 0, f'create -f {fmt} failed: {c_stderr}')
+            _, stderr, rc = self.run_instar_resize(
+                '-f', fmt, str(path), '33554433')
+            self.assertNotEqual(rc, 0,
+                                f'expected {fmt} 16M + 1 byte to be refused')
+            self.assertIn('multiple of 512', stderr)
+            # Refused before anything was written: the image still
+            # reads back at its created size.
+            info_stdout, info_err, info_rc = self.run_instar_info(
+                path, output_format='json')
+            self.assertEqual(info_rc, 0, f'info failed: {info_err}')
+            self.assertEqual(json.loads(info_stdout)['virtual-size'],
+                             16 * 1024 ** 2)
+
+    def test_raw_takes_any_byte_count(self):
+        """qemu-img resizes a raw file to whatever length is asked for."""
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'a.raw'
+            _, c_stderr, c_rc = self.run_instar_create(
+                '-f', 'raw', str(path), '16M')
+            self.assertEqual(c_rc, 0, f'create failed: {c_stderr}')
+            _, stderr, rc = self.run_instar_resize(
+                '-f', 'raw', str(path), '33554433')
+            self.assertEqual(rc, 0, f'raw resize refused: {stderr}')
+            self.assertEqual(path.stat().st_size, 33554433)
+
+
+class TestResizeSizeSuffixes(TestResizeSmoke):
+    """The size suffixes mean what qemu-img's `suffix_mul` means.
+
+    `b` is the one worth testing: qemu-io reads it as a 512-byte
+    block and qemu-img reads it as a single byte, and instar had
+    qemu-io's value, so every `b` size was 512 times too large.
+    """
+
+    def test_b_suffix_is_one_byte(self):
+        """`2097152b` on a 1 MiB image is a grow to exactly 2 MiB.
+
+        With `b` read as 512 this asked for 1 GiB and got it.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'b.qcow2'
+            _, c_stderr, c_rc = self.run_instar_create(
+                '-f', 'qcow2', str(path), '1M')
+            self.assertEqual(c_rc, 0, f'create failed: {c_stderr}')
+            _, r_stderr, r_rc = self.run_instar_resize(
+                '-f', 'qcow2', str(path), '2097152b')
+            self.assertEqual(r_rc, 0, f'resize failed: {r_stderr}')
+            info_stdout, info_err, info_rc = self.run_instar_info(
+                path, output_format='json')
+            self.assertEqual(info_rc, 0, f'info failed: {info_err}')
+            self.assertEqual(json.loads(info_stdout)['virtual-size'],
+                             2 * 1024 ** 2)
+
+    def test_b_suffix_shrink_is_refused_without_the_flag(self):
+        """`4096b` on a 1 MiB image is a shrink, so it needs --shrink.
+
+        qemu-img refuses the same request with "Use the --shrink
+        option". With `b` read as 512 it was a 2 MiB grow and
+        instar performed it.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / 'b.qcow2'
+            _, c_stderr, c_rc = self.run_instar_create(
+                '-f', 'qcow2', str(path), '1M')
+            self.assertEqual(c_rc, 0, f'create failed: {c_stderr}')
+            _, stderr, rc = self.run_instar_resize(
+                '-f', 'qcow2', str(path), '4096b')
+            self.assertNotEqual(
+                rc, 0, 'expected a 4096-byte shrink to need --shrink')
+            self.assertIn('shrink', stderr.lower())
 
 
 class TestResizeCrossValidation(TestResizeSmoke):

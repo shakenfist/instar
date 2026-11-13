@@ -287,6 +287,63 @@ class TestCompareRawSizeMismatch(InstarTestBase):
             self.assertEqual(instar_rc, qemu_rc)
 
 
+
+class TestCompareShortRawSourceLength(InstarTestBase):
+    """compare sees a raw source's own length, not the device capacity.
+
+    A raw image's virtual size comes from chain discovery, which
+    records the file's own length rounded up to a 512-byte sector
+    rather than the 64 KiB-padded capacity of the virtio device the
+    guest is handed (#821). Two sources shorter than one input sector
+    therefore have to differ in size for compare to say so: before
+    the fix both were 65536 and the size mismatch was invisible.
+    Cross-validated against qemu-img 10.0.13, which agrees on both
+    cases.
+    """
+
+    @staticmethod
+    def _write_pattern(path, length):
+        pattern = bytes(range(256)) * ((length // 256) + 1)
+        Path(path).write_bytes(pattern[:length])
+
+    def test_two_short_raws_of_different_lengths_mismatch_in_size(self):
+        """1536 against 2048 is a size mismatch, not two 65536s."""
+        with tempfile.TemporaryDirectory() as td:
+            short = Path(td) / 'short.raw'
+            longer = Path(td) / 'longer.raw'
+            self._write_pattern(short, 1536)
+            # The same 1536 bytes, then a sector of zeros: the extra
+            # is zero, so non-strict compare calls them identical and
+            # only warns about the length.
+            longer.write_bytes(short.read_bytes() + bytes(512))
+
+            stdout, stderr, rc = self.run_instar_compare(short, longer)
+            self.assertEqual(rc, 0, f'stderr: {stderr}')
+            self.assertIn('Warning: Image size mismatch!', stdout)
+            self.assertIn('Images are identical.', stdout)
+
+            qemu_out, _, qemu_rc = self.run_qemu_img_compare(short, longer)
+            self.assertEqual(stdout, qemu_out)
+            self.assertEqual(rc, qemu_rc)
+
+    def test_two_short_raws_of_the_same_length_are_identical(self):
+        """1536 against the same 1536 bytes: no warning from either tool."""
+        with tempfile.TemporaryDirectory() as td:
+            one = Path(td) / 'one.raw'
+            two = Path(td) / 'two.raw'
+            self._write_pattern(one, 1536)
+            two.write_bytes(one.read_bytes())
+
+            stdout, stderr, rc = self.run_instar_compare(one, two)
+            self.assertEqual(rc, 0, f'stderr: {stderr}')
+            self.assertNotIn('size mismatch', stdout)
+            self.assertIn('Images are identical.', stdout)
+
+            qemu_out, _, qemu_rc = self.run_qemu_img_compare(one, two)
+            self.assertEqual(stdout, qemu_out)
+            self.assertEqual(rc, qemu_rc)
+
+
 class TestCompareRawJson(InstarTestBase):
     """Test JSON output for compare operation."""
 

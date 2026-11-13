@@ -421,6 +421,27 @@ class TestBenchHeaderParity(BenchTestBase):
             self._assert_header_parity(
                 ['-c', '100', '-o', '1k', '-f', 'raw', str(img)])
 
+    def test_raw_fractional_buffer_step_and_offset(self):
+        """raw, `-s 0.5k -S 1.5k -o 0.5k`: fractions reach the header.
+
+        bench's three size operands take qemu-img's grammar,
+        fractions included (#861). The shared parser is unit-tested;
+        what this pins is the fraction surviving bench's own argument
+        plumbing, by requiring qemu-img to render the identical
+        header from the identical spelling -- 512, 1536 and 512.
+        """
+        self._require_kvm()
+        with tempfile.TemporaryDirectory() as td:
+            img = Path(td) / 'raw.img'
+            self.make_raw_mbr(img)
+            i_out, _ = self._assert_header_parity(
+                ['-c', '100', '-s', '0.5k', '-S', '1.5k', '-o', '0.5k',
+                 '-f', 'raw', str(img)])
+            header = self.header_line(i_out)
+            self.assertIn('512 bytes each', header)
+            self.assertIn('step size 1536', header)
+            self.assertIn('offset 512', header)
+
     def test_raw_step_zero(self):
         """raw, `-S 0`: effective step renders as bufsize (4096)."""
         self._require_kvm()

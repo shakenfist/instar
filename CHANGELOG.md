@@ -447,6 +447,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   ([#658](https://github.com/shakenfist/instar/issues/658)). See
   `docs/info.md`.
 
+- **The `b` and `B` size suffixes are one byte, not 512.** qemu-img's
+  `suffix_mul` makes `b` a single byte; qemu-io's 512-byte block is the
+  other convention, and instar's `resize` had it
+  ([#900](https://github.com/shakenfist/instar/issues/900)). **This is a
+  breaking change for a caller scripting instar**: `instar resize img
+  4096b` used to grow a 1 MiB image to 2 MiB and now asks for a
+  4096-byte disk, which needs `--shrink`. `dd`'s `bs`, `count` and
+  `skip` take the same suffix and so change with it -- `bs=1b` is one
+  byte. See [docs/resize.md](docs/resize.md) and
+  [docs/dd.md](docs/dd.md).
+- **Every size on the command line takes qemu-img's whole grammar.** One
+  parser serves `create`, `resize`, `measure --size`, `map`'s window,
+  `dd`'s operands and `bench`'s buffer, step and offset, so all of them
+  now accept a decimal fraction (`1.5M`, `4608.5M`, `.5G`) and the `B`,
+  `P` and `E` suffixes that only `resize` had
+  ([#861](https://github.com/shakenfist/instar/issues/861)). Nothing
+  that parsed before parses differently, apart from `b`/`B` above. The
+  grammar, and the two places it still differs from qemu-img, are in
+  [docs/quirks.md](docs/quirks.md#the-size-grammar-on-the-command-line).
+- **`resize` refuses a new size that is not a whole sector**, per format:
+  512 bytes for qcow2, vmdk and vpc, a VHDX's own logical sector size,
+  and any byte count for raw, which has no metadata to keep aligned
+  ([#844](https://github.com/shakenfist/instar/issues/844)). vmdk and
+  vhdx were silently rounding, so a script that resized either to a
+  non-sector size used to "work". `create` still rounds such a size up
+  rather than refusing it, which [docs/resize.md](docs/resize.md)
+  explains.
+
 - **The nightly stestr timing refresh publishes only a move that
   persists across two measurements, taken after the distro legs rather
   than beside them.** The first three refreshes showed the committed
@@ -821,6 +849,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   a data file is still to do
   ([#806](https://github.com/shakenfist/instar/issues/806)).
 
+- **A qcow2 shrink records the size it was asked for.** `resize --shrink
+  disk.qcow2 5246976` left a 5242880-byte disk -- rounded down to the
+  cluster, smaller than the request and smaller than qemu's -- and any
+  shrink below one cluster was refused outright
+  ([#791](https://github.com/shakenfist/instar/issues/791)). Only whole
+  clusters are discarded now, so the cluster holding the new last byte
+  stays allocated; a shrink therefore yields a *larger* disk than it used
+  to, and accepts sub-cluster targets. The kept cluster's tail is not
+  zeroed, as in qemu-img, so a shrink past the middle of a cluster
+  followed by a grow exposes those bytes again
+  ([docs/resize.md](docs/resize.md)).
+- **A raw or unknown source's virtual size is its own length**, rounded
+  up to a 512-byte sector, rather than the capacity of the virtio device
+  the VMM padded to the 64 KiB input sector
+  ([#821](https://github.com/shakenfist/instar/issues/821)). A 1536-byte
+  raw file converted to a 65536-byte image while `instar info` said 1536
+  for the same file. Every operation that reads the size through chain
+  discovery sees the corrected one; measured on a 1536-byte source,
+  `convert -O raw` writes 1536 rather than 65536 bytes and `compare`
+  now reports the size mismatch against a 2048-byte file that it used
+  to miss, while `dd` already ended its raw output at the source's real
+  length. `map` and `measure` have their own paths to the guest and
+  still report the padded size, which is
+  [#907](https://github.com/shakenfist/instar/issues/907) and is
+  recorded in [docs/map.md](docs/map.md) and
+  [docs/measure.md](docs/measure.md).
 - **A VHDX larger than 64 TiB is refused by name**, as qemu-img refuses
   to create one, in `create`, `convert`, `dd`, `measure -O vhdx` and
   `resize`, before any output is written

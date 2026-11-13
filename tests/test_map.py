@@ -580,6 +580,33 @@ class TestMapWindowFilter(TestMapSmoke):
             f'got {data_count}: {stdout!r}'
         )
 
+    def test_a_fractional_window_is_the_same_window(self):
+        """`0.5M`/`0.0625M` is the `512K`/`64K` window.
+
+        `--start-offset` and `--max-length` take qemu-img's size
+        grammar, fractions included (#861). The parser itself is
+        pinned by unit tests; what this pins is the fraction
+        surviving map's own argument plumbing, by asking for the
+        same window two ways and requiring the same answer.
+        """
+        self._require_fixture()
+        fractional, stderr, rc = self.run_instar_map(
+            self._fixture_path,
+            '--start-offset', '0.5M',
+            '--max-length', '0.0625M',
+            '--output', 'json',
+        )
+        self.assertEqual(rc, 0, f'stderr: {stderr}')
+        integral, _, int_rc = self.run_instar_map(
+            self._fixture_path,
+            '--start-offset', '512K',
+            '--max-length', '64K',
+            '--output', 'json',
+        )
+        self.assertEqual(int_rc, 0)
+        self.assertEqual(fractional, integral)
+        self.assertEqual(1, fractional.count('"data": true'))
+
     def test_start_offset_past_eof_emits_empty(self):
         """--start-offset >= virtual_size silently emits empty
         output and exits 0, matching qemu-img map's behaviour.
@@ -752,6 +779,60 @@ class TestMapErrorPaths(TestMapSmoke):
         stdout, stderr, rc = self.run_instar_map(str(image.path))
         self.assertEqual(rc, 0, f'stdout: {stdout!r} stderr: {stderr!r}')
         self.assertIn(str(image.path), stdout)
+
+
+
+class TestMapRawVirtualSize(InstarTestBase):
+    """map pads a short raw source's extent, and that is a divergence.
+
+    A raw image has no header stating a virtual size, so the guest
+    reports the capacity of the virtio device it was handed, counted
+    in 64 KiB input sectors. `instar info` and the operations that go
+    through chain discovery correct that to the file's own length
+    rounded up to a sector (#821); `map` has its own path to the
+    guest and does not, so a 1536-byte raw file maps as one extent of
+    65536 bytes where qemu-img says 1536.
+
+    This pins the divergence rather than the right answer, with the
+    qemu-img value measured alongside it: when #907 fixes the guest's
+    view of a raw source's length, this test fails and says so.
+    """
+
+    def run_instar_map(self, *args, timeout=60):
+        """Invoke `instar map`; (stdout, stderr, returncode)."""
+        instar = self.get_instar_binary()
+        cmd = [str(instar), 'map', *[str(a) for a in args]]
+        try:
+            r = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=timeout
+            )
+            return r.stdout, r.stderr, r.returncode
+        except subprocess.TimeoutExpired:
+            return '', f'Timeout after {timeout}s', -1
+
+    def test_a_short_raw_sources_extent_is_padded_to_the_input_sector(self):
+        """1536 bytes of file, one 65536-byte extent (#907)."""
+        self._require_qemu_img()
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / 'short.raw'
+            src.write_bytes((bytes(range(256)) * 6))
+            self.assertEqual(1536, src.stat().st_size)
+
+            stdout, stderr, rc = self.run_instar_map(src, '--output', 'json')
+            self.assertEqual(rc, 0, f'stderr: {stderr}')
+            extents = json.loads(stdout)
+            self.assertEqual(1, len(extents), stdout)
+            self.assertEqual(65536, extents[0]['length'],
+                             'instar still reports the padded capacity')
+
+            r = subprocess.run(
+                ['qemu-img', 'map', '--output=json', str(src)],
+                capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(0, r.returncode, r.stderr)
+            theirs = json.loads(r.stdout)
+            self.assertEqual(1536, theirs[0]['length'],
+                             'qemu-img reports the file length')
 
 
 class TestMapDivergenceRegression(TestMapSmoke):

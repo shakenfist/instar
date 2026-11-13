@@ -482,24 +482,149 @@ const PTE_PRESENT: u64 = 1 << 0;
 const PTE_WRITABLE: u64 = 1 << 1;
 const PTE_PAGE_SIZE: u64 = 1 << 7;
 
-/// Parse a memory size string like "256M", "1G", "4096" into bytes.
+/// A length as qemu-img reports it for a node it opens at sector
+/// granularity: rounded up to a 512-byte sector. That is the virtual
+/// size of an image with no header of its own -- raw, or unidentified
+/// -- and the protocol-level length of the container formats whose
+/// driver reads in sectors.
+fn sector_rounded_length(length: u64) -> u64 {
+    length.div_ceil(512) * 512
+}
+
+/// Multiplier for one qemu size suffix, or `None` when the byte is not
+/// a suffix at all. Transcribed from qemu's `suffix_mul`
+/// (`util/cutils.c`), where `B` is a single byte and is also the
+/// multiplier a bare number gets.
+fn qemu_size_suffix_mul(suffix: u8) -> Option<u64> {
+    match suffix.to_ascii_uppercase() {
+        b'B' => Some(1),
+        b'K' => Some(1u64 << 10),
+        b'M' => Some(1u64 << 20),
+        b'G' => Some(1u64 << 30),
+        b'T' => Some(1u64 << 40),
+        b'P' => Some(1u64 << 50),
+        b'E' => Some(1u64 << 60),
+        _ => None,
+    }
+}
+
+/// Parse a size string -- an integer, an optional decimal fraction and
+/// an optional one-character multiplier suffix -- into bytes, as
+/// qemu's `qemu_strtosz` does.
+///
+/// The fraction is the part worth care. qemu turns it into a 64.64
+/// fixed-point value, multiplies that by the suffix in 128-bit
+/// arithmetic, and rounds a remainder of half a byte or more upwards,
+/// so `1.9999K` is 2048 bytes and `0.0001K` is 0. A fraction needs a
+/// suffix that scales: `1.5`, `1.5b` and `1.5B` are refused, because a
+/// fraction of a byte is not a size. An exponent makes the whole string
+/// invalid (`1.5e3`), because qemu's `strtod` consumes it and qemu then
+/// refuses what it consumed. Here the suffix rules refuse it without a
+/// test of their own: `e` is the EiB suffix, so the exponent's digits
+/// are left over as trailing input. A bare `E` is that same suffix, so
+/// `1.5E` is 1.5 EiB.
+///
+/// Measured against qemu-img 10.0.13 rather than transcribed from one
+/// version, because the two disagree: 10.0.13 takes an absent integral
+/// part (`.5M` is 524288) where qemu 7.0.0's `qemu_strtou64` refused
+/// it, and refuses a suffix on a hex number (`0x10M`) where 7.0.0
+/// warned and accepted. Hex sizes are refused here either way; see
+/// the size-grammar section of `docs/quirks.md`.
+///
+/// Returns the structured failure reason rather than a display string;
+/// `bench`'s message contract distinguishes the two (see
+/// [`QemuImgSizeError`]).
+fn parse_qemu_size_classified(s: &str) -> Result<u64, QemuImgSizeError> {
+    let s = s.trim();
+    let b = s.as_bytes();
+    let mut i = 0usize;
+
+    // Integral part. qemu reads it with `qemu_strtou64`, which skips
+    // leading whitespace (trimmed above) and accepts a leading `+`.
+    if b.first() == Some(&b'+') {
+        i += 1;
+    }
+    let int_start = i;
+    while i < b.len() && b[i].is_ascii_digit() {
+        i += 1;
+    }
+    let int_digits = i - int_start;
+    // A number too long for u64 is unparseable rather than a value out
+    // of range, which is the distinction `bench` renders.
+    let int_val: u64 = if int_digits == 0 {
+        0
+    } else {
+        s[int_start..i]
+            .parse()
+            .map_err(|_| QemuImgSizeError::Invalid)?
+    };
+
+    // Fractional part, as a 64.64 fixed-point value.
+    let mut frac_fixed: u64 = 0;
+    let mut frac_digits = 0usize;
+    if b.get(i) == Some(&b'.') {
+        i += 1;
+        let frac_start = i;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        frac_digits = i - frac_start;
+        if frac_digits > 0 {
+            let frac: f64 = format!("0.{}", &s[frac_start..i])
+                .parse()
+                .map_err(|_| QemuImgSizeError::Invalid)?;
+            // `frac` is below 1, so this is below 2^64. A fraction
+            // within half a rounding step of 1 saturates to u64::MAX,
+            // where C's conversion would be undefined.
+            frac_fixed = (frac * 2f64.powi(64)) as u64;
+        }
+        // `1.M` has no fractional digits and is simply 1 MiB.
+    }
+    if int_digits == 0 && frac_digits == 0 {
+        // No number at all: "", "+", ".", "M", ".M".
+        return Err(QemuImgSizeError::Invalid);
+    }
+
+    // The suffix, and then nothing else: a byte that is not a suffix
+    // leaves the default multiplier and unconsumed input, which qemu
+    // refuses.
+    let mul = match b.get(i) {
+        None => 1u64,
+        Some(&c) => {
+            let m = qemu_size_suffix_mul(c).ok_or(QemuImgSizeError::Invalid)?;
+            i += 1;
+            m
+        }
+    };
+    if i != b.len() {
+        return Err(QemuImgSizeError::Invalid);
+    }
+    if mul == 1 && frac_fixed != 0 {
+        // A fraction of a byte, with no scale to make it whole.
+        return Err(QemuImgSizeError::Invalid);
+    }
+
+    let scaled = u128::from(int_val) * u128::from(mul);
+    let frac_scaled = u128::from(frac_fixed) * u128::from(mul);
+    // Half a byte or more of remainder rounds upwards, as qemu's
+    // "Round 0.5 upward" step does.
+    let rounding = (frac_scaled >> 63) & 1;
+    let total = scaled + (frac_scaled >> 64) + rounding;
+    u64::try_from(total).map_err(|_| QemuImgSizeError::Overflow)
+}
+
+/// Parse a memory size string like "256M", "1G", "1.5M", "4096" into
+/// bytes, with qemu's size grammar (see
+/// [`parse_qemu_size_classified`]).
 fn parse_memory_size(s: &str) -> Result<u64, Box<dyn std::error::Error>> {
     let s = s.trim();
     if s.is_empty() {
         return Err("empty memory size string".into());
     }
-    let (num_str, multiplier) = match s.as_bytes().last() {
-        Some(b'T' | b't') => (&s[..s.len() - 1], 1u64 << 40),
-        Some(b'G' | b'g') => (&s[..s.len() - 1], 1u64 << 30),
-        Some(b'M' | b'm') => (&s[..s.len() - 1], 1u64 << 20),
-        Some(b'K' | b'k') => (&s[..s.len() - 1], 1u64 << 10),
-        _ => (s, 1u64),
-    };
-    let num: u64 = num_str
-        .parse()
-        .map_err(|_| format!("invalid memory size: '{s}'"))?;
-    num.checked_mul(multiplier)
-        .ok_or_else(|| format!("memory size overflow: '{s}'").into())
+    parse_qemu_size_classified(s).map_err(|e| match e {
+        QemuImgSizeError::Invalid => format!("invalid memory size: '{s}'").into(),
+        QemuImgSizeError::Overflow => format!("memory size overflow: '{s}'").into(),
+    })
 }
 
 /// Why a qemu-img size string failed to parse. `bench`'s message
@@ -519,43 +644,18 @@ enum QemuImgSizeError {
     Overflow,
 }
 
-/// Core of [`parse_qemu_img_size`], returning the structured
-/// failure reason instead of a display string.
-fn parse_qemu_img_size_classified(s: &str) -> Result<u64, QemuImgSizeError> {
-    let s = s.trim();
-    if s.is_empty() {
-        return Err(QemuImgSizeError::Invalid);
-    }
-    let (num_str, multiplier) = match s.as_bytes().last() {
-        Some(b'E' | b'e') => (&s[..s.len() - 1], 1u64 << 60),
-        Some(b'P' | b'p') => (&s[..s.len() - 1], 1u64 << 50),
-        Some(b'T' | b't') => (&s[..s.len() - 1], 1u64 << 40),
-        Some(b'G' | b'g') => (&s[..s.len() - 1], 1u64 << 30),
-        Some(b'M' | b'm') => (&s[..s.len() - 1], 1u64 << 20),
-        Some(b'K' | b'k') => (&s[..s.len() - 1], 1u64 << 10),
-        Some(b'b') => (&s[..s.len() - 1], 512u64),
-        _ => (s, 1u64),
-    };
-    let num: u64 = num_str
-        .trim()
-        .parse()
-        .map_err(|_| QemuImgSizeError::Invalid)?;
-    num.checked_mul(multiplier)
-        .ok_or(QemuImgSizeError::Overflow)
-}
-
 /// Parse a qemu-img size string with the full suffix set:
-/// `b`=512, `k`/`K`=KiB, `M`/`m`=MiB, `G`/`g`=GiB, `T`/`t`=TiB,
-/// `P`/`p`=PiB, `E`/`e`=EiB.  Used by `instar resize` for the
-/// `[+-]SIZE` argument.  Strict superset of `parse_memory_size`
-/// — kept as a sibling rather than replacing it to avoid
-/// disturbing the create/measure call sites.
+/// `B`/`b`=1 byte, `k`/`K`=KiB, `M`/`m`=MiB, `G`/`g`=GiB,
+/// `T`/`t`=TiB, `P`/`p`=PiB, `E`/`e`=EiB, and a decimal fraction
+/// before any of them but `B`/`b`.  Used by `instar resize` for the
+/// `[+-]SIZE` argument; `parse_memory_size` renders the same grammar
+/// with its own messages.
 fn parse_qemu_img_size(s: &str) -> Result<u64, Box<dyn std::error::Error>> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
         return Err("empty size string".into());
     }
-    parse_qemu_img_size_classified(trimmed).map_err(|e| match e {
+    parse_qemu_size_classified(trimmed).map_err(|e| match e {
         QemuImgSizeError::Invalid => format!("invalid size: '{trimmed}'").into(),
         QemuImgSizeError::Overflow => format!("size overflow: '{trimmed}'").into(),
     })
@@ -2134,8 +2234,7 @@ fn print_info_result(
         // rounded up to 512-byte sectors. For structured formats (qcow2, vmdk, etc.),
         // use the virtual size from headers.
         let effective_virtual_size = if info.format == "raw" || info.format == "unknown" {
-            // Round up to 512-byte sector boundary
-            file_size.div_ceil(512) * 512
+            sector_rounded_length(file_size)
         } else {
             info.virtual_size
         };
@@ -2392,7 +2491,7 @@ fn print_info_result(
                 "raw" | "parallels" | "bochs" | "cloop" | "dmg" | "qcow"
             ) || vmdk_flat.is_some();
             let effective_child_file_length = if rounds_protocol_length {
-                child_file_length.div_ceil(512) * 512
+                sector_rounded_length(child_file_length)
             } else {
                 child_file_length
             };
@@ -2433,8 +2532,7 @@ fn print_info_result_json(
     // VMM must use the real file length instead.
     let is_unstructured = info.format == "raw" || info.format == "unknown";
     let effective_virtual_size = if is_unstructured {
-        // Round up to 512-byte sector boundary
-        child_file_length.div_ceil(512) * 512
+        sector_rounded_length(child_file_length)
     } else {
         info.virtual_size
     };
@@ -2455,7 +2553,7 @@ fn print_info_result_json(
             "parallels" | "bochs" | "cloop" | "dmg" | "qcow"
         );
     let effective_child_file_length = if rounds_protocol_length {
-        child_file_length.div_ceil(512) * 512
+        sector_rounded_length(child_file_length)
     } else {
         child_file_length
     };
@@ -2521,7 +2619,7 @@ fn print_info_result_json(
         // descriptor file as unstructured (qemu-img does) and round
         // its virtual-size up to a sector.
         let descriptor_vsize = if vmdk_flat.is_some() {
-            effective_child_file_length.div_ceil(512) * 512
+            sector_rounded_length(effective_child_file_length)
         } else {
             effective_child_file_length
         };
@@ -3512,7 +3610,14 @@ fn discover_backing_chain(
         // (by design), but the chain config needs the real file size so
         // format readers can locate structures relative to EOF (e.g.
         // streamOptimized VMDK footer).
-        let file_size = std::fs::metadata(&current).map(|m| m.len()).unwrap_or(0);
+        //
+        // A stat failure is reported rather than read as a zero length:
+        // a raw or unknown member's virtual size is derived from this
+        // below, and a zero there surfaces downstream as "input image
+        // has zero virtual size", which names neither the file nor the
+        // real fault. The info operation has already opened the file by
+        // this point, so this is a guard, not an expected path.
+        let file_size = std::fs::metadata(&current)?.len();
         let actual_size = if info_result.actual_size > 0 {
             info_result.actual_size
         } else {
@@ -3560,10 +3665,23 @@ fn discover_backing_chain(
 
         // Build chain image entry
         let image_format = ImageFormat::from_str(&info_result.format);
+        // A raw or unknown image has no header stating a virtual size,
+        // so the guest reports the capacity of the virtio device it was
+        // handed, which the VMM padded up to the input sector size
+        // (64 KiB). The file's own length rounded up to a 512-byte
+        // sector is what qemu-img reports and what every caller of the
+        // chain needs: convert sized a 1536-byte raw source's output at
+        // 65536 bytes while `instar info`, which applies this rule for
+        // itself when it prints, said 1536 for the same file.
+        let virtual_size = if matches!(image_format, ImageFormat::Raw | ImageFormat::Unknown) {
+            sector_rounded_length(file_size)
+        } else {
+            info_result.virtual_size
+        };
         let chain_image = ChainImage {
             path: current.clone(),
             format: image_format,
-            virtual_size: info_result.virtual_size,
+            virtual_size,
             actual_size,
             cluster_size: info_result.cluster_size,
             backing_file_raw: info_result.backing_file.clone(),
@@ -4857,13 +4975,15 @@ struct MapArgs {
     output: String,
 
     /// Start emission at this virtual byte offset. Accepts
-    /// K/M/G/T suffixes (parsed by parse_memory_size).
+    /// B/K/M/G/T/P/E suffixes and a fraction before one of them,
+    /// as qemu-img does (parsed by parse_memory_size).
     /// Default: 0 (start of image).
     #[arg(long = "start-offset")]
     start_offset: Option<String>,
 
     /// Stop emission after this many virtual bytes from
-    /// --start-offset. Accepts K/M/G/T suffixes. Default:
+    /// --start-offset. Accepts the same suffixes and fractions.
+    /// Default:
     /// emit to end of image.
     #[arg(long = "max-length")]
     max_length: Option<String>,
@@ -5535,7 +5655,7 @@ enum BenchSizeParse {
 /// `-S -1`); everything else (e.g. `abc`, `-1k`) is unparseable and
 /// gets the value-echoing form.
 fn parse_bench_size(s: &str) -> BenchSizeParse {
-    match parse_qemu_img_size_classified(s) {
+    match parse_qemu_size_classified(s) {
         Ok(v) => BenchSizeParse::Value(v),
         Err(QemuImgSizeError::Overflow) => BenchSizeParse::OutOfRange,
         Err(QemuImgSizeError::Invalid) => match parse_bench_plain_int(s) {
@@ -7536,7 +7656,8 @@ struct MeasureArgs {
 
     /// Compute the measure for a hypothetical empty image of this size.
     /// Mutually exclusive with FILENAME.
-    /// Accepts suffixes K, M, G, T (parsed by parse_memory_size).
+    /// Accepts suffixes B, K, M, G, T, P, E and a fraction before
+    /// one of them, as qemu-img does (parsed by parse_memory_size).
     #[arg(long, short = 's', value_name = "SIZE", conflicts_with = "input")]
     size: Option<String>,
 
@@ -7626,7 +7747,7 @@ struct CreateArgs {
     /// already exists (matches qemu-img).
     filename: String,
 
-    /// Virtual disk size (e.g. "1G", "512M", "1T"). Required unless
+    /// Virtual disk size (e.g. "1G", "512M", "1.5M"). Required unless
     /// -b BACKING is given, in which case it defaults to the backing
     /// file's virtual size.
     #[arg(value_name = "SIZE")]
@@ -8475,6 +8596,24 @@ fn run_resize(args: ResizeArgs, verbose: bool) -> Result<(), Box<dyn std::error:
         check_vhdx_virtual_size("resize", new_virtual_size)?;
     }
 
+    // A size that is not a whole sector is refused before anything is
+    // written, as qemu-img's qcow2 truncate refuses it ("The new size
+    // must be a multiple of 512"). Raw is the exception, with a
+    // granularity of one byte: it has no metadata to keep aligned and
+    // qemu-img writes whatever length is asked for. The three formats
+    // qemu-img cannot resize at all count sectors as well -- a VHDX's
+    // VirtualDiskSize is a multiple of its logical sector size, a VHD's
+    // footer records a sector count, and a VMDK descriptor's capacity
+    // is in 512-byte sectors -- so each is held to its own granularity
+    // rather than silently truncated into it.
+    if !new_virtual_size.is_multiple_of(probed.size_granularity) {
+        return Err(format!(
+            "resize: the new size must be a multiple of {}",
+            probed.size_granularity
+        )
+        .into());
+    }
+
     if probed.format == IMAGE_FORMAT_RAW {
         run_resize_raw(&args, &probed, new_virtual_size)
     } else {
@@ -8495,6 +8634,10 @@ struct ProbedResizeTarget {
     /// QCOW2 only: extended_l2 bit from the header.  False for
     /// other formats.
     qcow2_extended_l2: bool,
+    /// The multiple, in bytes, a new virtual size has to be: 512 for
+    /// the formats whose metadata counts sectors, a VHDX's own logical
+    /// sector size, and 1 for raw, which takes any byte count.
+    size_granularity: u64,
 }
 
 /// Probe the resize target's format and current virtual size.
@@ -8548,8 +8691,10 @@ fn probe_resize_target(
         }
     };
 
-    let (format_code, current_virtual_size, qcow2_extended_l2) = match detected {
-        shared::ImageFormat::Raw => (IMAGE_FORMAT_RAW, current_file_size, false),
+    let (format_code, current_virtual_size, qcow2_extended_l2, size_granularity) = match detected {
+        // Raw takes any length: there is no metadata to keep aligned,
+        // and qemu-img truncates the file to exactly what was asked for.
+        shared::ImageFormat::Raw => (IMAGE_FORMAT_RAW, current_file_size, false, 1),
         shared::ImageFormat::Qcow2 => {
             let header = qcow2::QcowHeader::parse(&buf).ok_or("resize: invalid qcow2 header")?;
             // Defensive guard against silent backing-chain
@@ -8568,11 +8713,16 @@ fn probe_resize_target(
                      `instar convert` first"
                     .into());
             }
-            (IMAGE_FORMAT_QCOW2, header.virtual_size, header.extended_l2)
+            (
+                IMAGE_FORMAT_QCOW2,
+                header.virtual_size,
+                header.extended_l2,
+                512,
+            )
         }
         shared::ImageFormat::Vmdk4 | shared::ImageFormat::Vmdk3 => {
             let header = vmdk::Vmdk4Header::parse(&buf).ok_or("resize: invalid vmdk header")?;
-            (IMAGE_FORMAT_VMDK4, header.virtual_size, false)
+            (IMAGE_FORMAT_VMDK4, header.virtual_size, false, 512)
         }
         shared::ImageFormat::Vhd => {
             // VHD footer lives at file end (last 512 bytes).
@@ -8583,13 +8733,21 @@ fn probe_resize_target(
             let mut footer = [0u8; 512];
             file.read_exact(&mut footer)?;
             let parsed = vhd::VhdFooter::parse(&footer).ok_or("resize: invalid vhd footer")?;
-            (IMAGE_FORMAT_VHD, parsed.current_size, false)
+            (IMAGE_FORMAT_VHD, parsed.current_size, false, 512)
         }
         shared::ImageFormat::Vhdx => {
             // VHDX VirtualDiskSize lives in the metadata region;
-            // walk header → region table → metadata to find it.
-            let vds = probe_vhdx_virtual_size(&mut file, current_file_size)?;
-            (IMAGE_FORMAT_VHDX, vds, false)
+            // walk header → region table → metadata to find it. The
+            // same walk reads the logical sector size, which is the
+            // multiple VirtualDiskSize has to be; the metadata parser
+            // accepts only 512 or 4096 for it.
+            let (vds, logical_sector_size) = probe_vhdx_virtual_size(&mut file, current_file_size)?;
+            (
+                IMAGE_FORMAT_VHDX,
+                vds,
+                false,
+                u64::from(logical_sector_size),
+            )
         }
         other => {
             return Err(format!(
@@ -8604,18 +8762,19 @@ fn probe_resize_target(
         current_virtual_size,
         current_file_size,
         qcow2_extended_l2,
+        size_granularity,
     })
 }
 
-/// Read the VHDX `VirtualDiskSize` metadata field by walking
-/// the active header → region table → metadata layout.  This is
-/// the host-side mirror of what the guest does during the
-/// vhdx pre-pass — the host only needs the size, so we read
-/// the minimum necessary regions.
+/// Read the VHDX `VirtualDiskSize` and `LogicalSectorSize` metadata
+/// fields by walking the active header → region table → metadata
+/// layout.  This is the host-side mirror of what the guest does during
+/// the vhdx pre-pass — the host needs the size and the multiple it has
+/// to be, so we read the minimum necessary regions.
 fn probe_vhdx_virtual_size(
     file: &mut std::fs::File,
     current_file_size: u64,
-) -> Result<u64, Box<dyn std::error::Error>> {
+) -> Result<(u64, u32), Box<dyn std::error::Error>> {
     use std::io::{Read, Seek, SeekFrom};
     if current_file_size < 0x40000 + 64 * 1024 {
         return Err("resize: file too small for vhdx layout".into());
@@ -8664,7 +8823,7 @@ fn probe_vhdx_virtual_size(
     file.seek(SeekFrom::Start(metadata.file_offset))?;
     file.read_exact(&mut meta)?;
     let items = vhdx::parse_metadata_region(&meta).ok_or("resize: vhdx metadata invalid")?;
-    Ok(items.virtual_disk_size)
+    Ok((items.virtual_disk_size, items.logical_sector_size))
 }
 
 /// Host-side raw resize: `set_len` to the new size, optional
@@ -21670,7 +21829,10 @@ mod resize_size_parser_tests {
 
     #[test]
     fn qemu_img_size_suffixes() {
-        assert_eq!(parse_qemu_img_size("1b").unwrap(), 512);
+        // `b` is one byte, not qemu-io's 512-byte block (#900).
+        assert_eq!(parse_qemu_img_size("1b").unwrap(), 1);
+        assert_eq!(parse_qemu_img_size("1B").unwrap(), 1);
+        assert_eq!(parse_qemu_img_size("1024b").unwrap(), 1024);
         assert_eq!(parse_qemu_img_size("1k").unwrap(), 1024);
         assert_eq!(parse_qemu_img_size("1K").unwrap(), 1024);
         assert_eq!(parse_qemu_img_size("1M").unwrap(), 1 << 20);
@@ -21678,6 +21840,141 @@ mod resize_size_parser_tests {
         assert_eq!(parse_qemu_img_size("1T").unwrap(), 1u64 << 40);
         assert_eq!(parse_qemu_img_size("1P").unwrap(), 1u64 << 50);
         assert_eq!(parse_qemu_img_size("1E").unwrap(), 1u64 << 60);
+    }
+
+    #[test]
+    fn qemu_img_size_fractions() {
+        // Every value measured against qemu-img 10.0.13, reading the
+        // result back as the exact length of a resized raw file.
+        assert_eq!(parse_qemu_img_size("1.5M").unwrap(), 1_572_864);
+        assert_eq!(parse_qemu_img_size("1.5k").unwrap(), 1536);
+        assert_eq!(parse_qemu_img_size("4608.5M").unwrap(), 4_832_362_496);
+        assert_eq!(parse_qemu_img_size("20.5M").unwrap(), 21_495_808);
+        // An absent integral part, and an absent fraction after the
+        // point: `.5M` and `1.M`.
+        assert_eq!(parse_qemu_img_size(".5M").unwrap(), 524_288);
+        assert_eq!(parse_qemu_img_size("+.5M").unwrap(), 524_288);
+        assert_eq!(parse_qemu_img_size("1.M").unwrap(), 1 << 20);
+        assert_eq!(parse_qemu_img_size("1.0M").unwrap(), 1 << 20);
+        // The fraction is a whole number of bytes, rounded to nearest
+        // with a half rounding upwards: 0.4 of a byte is nothing, 0.5
+        // is one byte, and 2047.8976 bytes is 2048.
+        assert_eq!(parse_qemu_img_size("0.00039062500000000002K").unwrap(), 0);
+        assert_eq!(parse_qemu_img_size("0.00048828125K").unwrap(), 1);
+        assert_eq!(parse_qemu_img_size("1.9999K").unwrap(), 2048);
+        assert_eq!(
+            parse_qemu_img_size("1.99999999999999999999K").unwrap(),
+            2048
+        );
+        assert_eq!(
+            parse_qemu_img_size("16384.000244140625K").unwrap(),
+            16_777_216
+        );
+    }
+
+    #[test]
+    fn qemu_img_size_fractions_carry_the_same_double_qemu_carries() {
+        // qemu's `do_strtosz` reads the fraction into a double before
+        // scaling it to 64.64 fixed point, so a fraction qemu cannot
+        // represent exactly is wrong in qemu too, by the same amount.
+        // That makes the double here a parity requirement rather than
+        // a shortcut: computing the fraction exactly with integer
+        // long division would make instar disagree with the oracle at
+        // the top of the range, where a double's 53-bit mantissa runs
+        // out before a 64-bit fixed-point fraction does.
+        //
+        // Measured against qemu-img 10.0.13, which echoes the size it
+        // parsed before it tries to allocate it: `qemu-img create -f
+        // raw f 1.1E` prints `size=1268213655067531680`, so an EiB
+        // value is readable without an EiB of filesystem. The exact
+        // answer for 1.1 EiB is ...673.6; both tools say ...680.
+        assert_eq!(
+            parse_qemu_img_size("1.1E").unwrap(),
+            1_268_213_655_067_531_680
+        );
+        assert_eq!(
+            parse_qemu_img_size("0.1E").unwrap(),
+            115_292_150_460_684_704
+        );
+        assert_eq!(
+            parse_qemu_img_size("3.3E").unwrap(),
+            3_804_640_965_202_595_008
+        );
+        assert_eq!(
+            parse_qemu_img_size("1.333333333333333333E").unwrap(),
+            1_537_228_672_809_129_280
+        );
+        assert_eq!(
+            parse_qemu_img_size("3.14159265358979E").unwrap(),
+            3_622_009_729_038_557_696
+        );
+        assert_eq!(
+            parse_qemu_img_size("0.123456789012345678901E").unwrap(),
+            142_335_986_942_043_632
+        );
+        assert_eq!(parse_qemu_img_size("7.7P").unwrap(), 8_669_429_282_688_205);
+        assert_eq!(parse_qemu_img_size("1.1P").unwrap(), 1_238_489_897_526_886);
+        assert_eq!(parse_qemu_img_size("1.1T").unwrap(), 1_209_462_790_554);
+        assert_eq!(parse_qemu_img_size("1.1G").unwrap(), 1_181_116_006);
+        assert_eq!(parse_qemu_img_size("1.1M").unwrap(), 1_153_434);
+        // A fraction within half a rounding step of the next whole
+        // byte saturates to it rather than wrapping, at both ends of
+        // the double's resolution. qemu-img says 1 EiB for both.
+        assert_eq!(
+            parse_qemu_img_size("0.99999999999999999999E").unwrap(),
+            1 << 60
+        );
+        assert_eq!(
+            parse_qemu_img_size("1.0000000000000000001E").unwrap(),
+            1 << 60
+        );
+    }
+
+    #[test]
+    fn qemu_img_size_fraction_needs_a_scale() {
+        // qemu refuses a fraction the suffix cannot make whole: a
+        // bare number and `b`/`B` are both one byte.
+        assert!(parse_qemu_img_size("1.5").is_err());
+        assert!(parse_qemu_img_size("1.5b").is_err());
+        assert!(parse_qemu_img_size("1.5B").is_err());
+        assert!(parse_qemu_img_size(".5").is_err());
+    }
+
+    #[test]
+    fn qemu_img_size_rejects_malformed_fractions() {
+        // An exponent qemu's strtod would consume invalidates the
+        // whole string, while a bare `E` is the EiB suffix.
+        assert!(parse_qemu_img_size("1.5e3").is_err());
+        assert!(parse_qemu_img_size("1.5E+1").is_err());
+        assert!(parse_qemu_img_size("1e3").is_err());
+        assert_eq!(
+            parse_qemu_img_size("1.5E").unwrap(),
+            1_729_382_256_910_270_464
+        );
+        assert!(parse_qemu_img_size("1..5M").is_err());
+        assert!(parse_qemu_img_size("0.5.5M").is_err());
+        assert!(parse_qemu_img_size(".").is_err());
+        assert!(parse_qemu_img_size(".M").is_err());
+        assert!(parse_qemu_img_size("M").is_err());
+        // instar's parsers trim, so a trailing space is tolerated
+        // where qemu-img refuses it. Pre-existing, and pinned here so
+        // a later change to the grammar is a deliberate one.
+        assert!(parse_qemu_img_size("1.5M ").is_ok());
+        assert!(parse_qemu_img_size("1.5 M").is_err());
+        // Hex is qemu's and not instar's; see docs/quirks.md.
+        assert!(parse_qemu_img_size("0x10").is_err());
+    }
+
+    #[test]
+    fn memory_size_takes_the_same_grammar() {
+        // create, measure and the rest parse through
+        // parse_memory_size, which shares the grammar.
+        assert_eq!(parse_memory_size("1.5M").unwrap(), 1_572_864);
+        assert_eq!(parse_memory_size("4608.5M").unwrap(), 4_832_362_496);
+        assert_eq!(parse_memory_size("256M").unwrap(), 256 << 20);
+        assert_eq!(parse_memory_size("1P").unwrap(), 1u64 << 50);
+        assert_eq!(parse_memory_size("1024b").unwrap(), 1024);
+        assert!(parse_memory_size("1.5").is_err());
     }
 
     #[test]

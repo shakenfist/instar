@@ -2,6 +2,9 @@
 
 TestDdWholeImage covers whole-image copies.
 
+TestDdRawSourceLength pins the default window for a raw source
+whose length is not a multiple of the 64 KiB input sector.
+
 TestDdRawWindow is an output-window matrix: each case
 runs `instar dd` and `qemu-img dd` with the same bs/count/skip
 operands and asserts byte-identical output.  Both a raw and a qcow2
@@ -257,6 +260,68 @@ def _assert_dd_parity(
             f'[{label}] instar dd output differs from qemu-img dd '
             f'(instar={len(instar_bytes)} B, qemu={len(qemu_bytes)} B)'
         )
+
+
+
+class TestDdRawSourceLength(InstarTestBase):
+    """dd copies a raw source's own length, not the device's capacity.
+
+    A raw image has no header stating a virtual size, so the guest
+    reports the capacity of the virtio device it was handed -- which
+    the VMM counts in 64 KiB input sectors. Chain discovery records
+    the file's own length rounded up to a 512-byte sector instead
+    (#821), and that is what sizes dd's default window.
+
+    Measured against qemu-img 10.0.13, which copies 1536 and 512
+    bytes respectively. These are parity pins rather than proof of
+    #821: a pre-#821 instar already wrote 1536 and 512 here, because
+    a raw dd output ends where the source's bytes do whatever the
+    window says. `convert` is where that padding was visible (65536
+    bytes out of a 1536-byte source), and `compare` is where the
+    chain's value is load-bearing -- see
+    TestCompareShortRawSourceLength. What these two pin is that dd
+    keeps agreeing with qemu-img for a source shorter than one input
+    sector, which nothing covered.
+    """
+
+    @staticmethod
+    def _write_pattern(path, length):
+        """A recognisable, non-repeating-at-512 pattern of `length` bytes."""
+        pattern = bytes(range(256)) * ((length // 256) + 1)
+        Path(path).write_bytes(pattern[:length])
+
+    def _assert_dd_copies(self, source_length, expected_output_length):
+        with tempfile.TemporaryDirectory() as td:
+            src = Path(td) / 'src.raw'
+            ours = Path(td) / 'ours.raw'
+            theirs = Path(td) / 'theirs.raw'
+            self._write_pattern(src, source_length)
+
+            _, stderr, rc = self.run_instar_dd([f'if={src}', f'of={ours}'])
+            self.assertEqual(rc, 0, f'instar dd failed: {stderr!r}')
+            self.assertEqual(
+                ours.stat().st_size, expected_output_length,
+                f'a {source_length}-byte raw source should copy to '
+                f'{expected_output_length} bytes'
+            )
+
+            _, q_stderr, q_rc = self.run_qemu_img_dd(
+                [f'if={src}', f'of={theirs}']
+            )
+            self.assertEqual(q_rc, 0, f'qemu-img dd failed: {q_stderr!r}')
+            self.assertEqual(
+                theirs.stat().st_size, ours.stat().st_size,
+                'instar dd and qemu-img dd disagree about the output length'
+            )
+            self.assertEqual(theirs.read_bytes(), ours.read_bytes())
+
+    def test_dd_copies_a_raw_sources_own_length(self):
+        """A 1536-byte raw source copies to 1536 bytes, not 65536."""
+        self._assert_dd_copies(1536, 1536)
+
+    def test_dd_rounds_a_sub_sector_raw_source_up_to_a_sector(self):
+        """A 100-byte raw source copies to 512 bytes: one whole sector."""
+        self._assert_dd_copies(100, 512)
 
 
 class TestDdRawWindow(InstarTestBase):

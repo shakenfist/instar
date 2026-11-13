@@ -101,6 +101,26 @@ class TestMeasureSmoke(InstarTestBase):
             'required size: 1048576\nfully allocated size: 1048576\n',
         )
 
+    def test_size_fraction_matches_qemu_img(self):
+        """`--size 1.5M` is 1572864 to both tools, through the CLI.
+
+        `--size` takes qemu-img's grammar, fractions included
+        (#861). The parser has unit tests; this pins the fraction
+        surviving measure's argument plumbing, against the oracle
+        given the identical spelling.
+        """
+        self._require_qemu_img()
+        stdout, stderr, rc = self.run_instar_measure(
+            '--size', '1.5M', '-O', 'qcow2'
+        )
+        self.assertEqual(rc, 0, f'stderr: {stderr}')
+        r = subprocess.run(
+            ['qemu-img', 'measure', '--size', '1.5M', '-O', 'qcow2'],
+            capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(0, r.returncode, r.stderr)
+        self.assertEqual(r.stdout, stdout)
+
     def test_size_raw_json(self):
         """--size 1M -O raw --output json matches qemu-img --output=json byte-for-byte."""
         stdout, stderr, rc = self.run_instar_measure(
@@ -817,6 +837,77 @@ for _img in _safe_tier_images():
                 _name,
                 _make_source_test(_img, _target, _ot)
             )
+
+
+
+class TestMeasureRawVirtualSize(InstarTestBase):
+    """measure pads a short raw source, and that is a divergence.
+
+    A raw image has no header stating a virtual size, so the guest
+    reports the capacity of the virtio device it was handed, counted
+    in 64 KiB input sectors. `instar info` and the operations that go
+    through chain discovery correct that to the file's own length
+    rounded up to a sector (#821); `measure` has its own path to the
+    guest and does not, so a 1536-byte raw source measures to `-O
+    raw` as 65536 where qemu-img says 1536.
+
+    These pin the divergence rather than the right answer, with the
+    qemu-img value measured alongside it: when #907 fixes the guest's
+    view of a raw source's length, the first test fails and says so.
+    The qcow2 target is the reason the baseline matrix never caught
+    this -- its cluster rounding swallows the difference.
+    """
+
+    def run_instar_measure(self, *args, timeout=60):
+        """Invoke `instar measure`; (stdout, stderr, returncode)."""
+        instar = self.get_instar_binary()
+        cmd = [str(instar), 'measure', *[str(a) for a in args]]
+        try:
+            r = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=timeout
+            )
+            return r.stdout, r.stderr, r.returncode
+        except subprocess.TimeoutExpired:
+            return '', f'Timeout after {timeout}s', -1
+
+    @staticmethod
+    def _short_raw(directory):
+        path = Path(directory) / 'short.raw'
+        path.write_bytes(bytes(range(256)) * 6)
+        return path
+
+    def _qemu_measure(self, *args):
+        r = subprocess.run(
+            ['qemu-img', 'measure', *[str(a) for a in args]],
+            capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(0, r.returncode, r.stderr)
+        return r.stdout
+
+    def test_raw_target_pads_a_short_raw_source(self):
+        """1536 bytes of file, 65536 bytes of answer (#907)."""
+        self._require_qemu_img()
+        with tempfile.TemporaryDirectory() as td:
+            src = self._short_raw(td)
+            self.assertEqual(1536, src.stat().st_size)
+            stdout, stderr, rc = self.run_instar_measure('-O', 'raw', src)
+            self.assertEqual(rc, 0, f'stderr: {stderr}')
+            self.assertEqual(
+                'required size: 65536\nfully allocated size: 65536\n',
+                stdout, 'instar still measures the padded capacity')
+            self.assertEqual(
+                'required size: 1536\nfully allocated size: 1536\n',
+                self._qemu_measure('-O', 'raw', src),
+                'qemu-img measures the file length')
+
+    def test_qcow2_target_agrees_despite_the_padding(self):
+        """The qcow2 target rounds both answers to the same clusters."""
+        self._require_qemu_img()
+        with tempfile.TemporaryDirectory() as td:
+            src = self._short_raw(td)
+            stdout, stderr, rc = self.run_instar_measure('-O', 'qcow2', src)
+            self.assertEqual(rc, 0, f'stderr: {stderr}')
+            self.assertEqual(self._qemu_measure('-O', 'qcow2', src), stdout)
 
 
 class TestMeasureDivergenceRegression(TestMeasureSmoke):
