@@ -14,8 +14,9 @@
 # below resolves its fixture through a helper that calls skipTest when
 # the path does not exist -- get_adversarial_image in tests/base.py,
 # differencing_image and composed_golden in tests/test_differencing.py,
-# and the explicit `if not image.path.exists()` in tests/test_security.py
-# and in the VHD conversion tests in tests/test_convert.py.
+# and the explicit `if not image.path.exists()` in tests/test_security.py,
+# in the VHD and LUKS conversion tests in tests/test_convert.py, and in
+# the LUKS tests in tests/test_bench.py and tests/test_compare.py.
 # An absent or renamed fixture therefore deletes its proof from the suite
 # and leaves CI green -- greener, in fact: stestr counts a skip towards
 # its `Ran:` total, so even a run that is checked for having executed
@@ -57,7 +58,7 @@ REQUIRED_FIXTURES=(
     "downloaded/qemu-iotests/hyperv2012r2-dynamic.vhd"
     "downloaded/qemu-iotests/virtualpc-dynamic.vhd"
     # The only LUKS image the suite has: tests may not make one at
-    # runtime (see no-runtime-luks-create in .pre-commit-config.yaml).
+    # runtime (see tools/ci/check-no-runtime-luks-create.sh).
     # Without it the bench write refusal for encryption, the compare
     # setup-failure exit-2 case and the LUKS convert and compare classes
     # all skip, and test_bench.py is in the merge-gating selection.

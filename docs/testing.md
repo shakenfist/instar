@@ -125,10 +125,16 @@ the merge queue
 prebuilt `qcow2-luks` image, `self.get_image('qcow2-luks')`, and skip
 when it is missing, as `TestCompareLuksQcow2` does. Copy it into the
 temporary directory first if the code under test could write to it.
-The `no-runtime-luks-create` pre-commit hook rejects, under `tests/`, a
-`qemu-img create` or `qemu-img convert` argv list that carries
-`encrypt.format=luks`, and any `cryptsetup luksFormat`. Opening an existing LUKS image with `--object secret` does
-no timing and is fine.
+Opening an existing LUKS image with `--object secret` does no timing
+and is fine.
+
+`tools/ci/check-no-runtime-luks-create.sh` enforces this, as a
+pre-commit hook and in the `ci-tooling` job. It rejects any
+`encrypt.format=luks` or `luksFormat` in a Python or shell file under
+`tests/`, whatever the command around it, so a test that only mentions
+the option has to be exempted by name in the script, with its reason;
+`tests/test_measure.py`, which passes it to `instar measure` to check
+the refusal, is the one exemption.
 
 ## Test Categories
 
