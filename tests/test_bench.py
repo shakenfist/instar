@@ -1194,16 +1194,23 @@ class TestBenchWriteRefusals(BenchTestBase):
                 '(compression)')
 
     def test_refuse_luks(self):
+        """A LUKS qcow2 is refused for writes.
+
+        The image is a copy of the prebuilt ``qcow2-luks`` fixture, not
+        one made here: ``qemu-img create`` of a LUKS image times a key
+        derivation first and, on some qemu-img builds, fails about one
+        time in three with "Unable to get accurate CPU usage" (#905).
+        ``encrypt.iter-time`` does not help; the timing runs regardless.
+        It is copied because the write path is what is under test, and
+        a refusal that wrongly wrote would otherwise change the fixture.
+        """
         self._require_kvm()
+        fixture = self.get_image('qcow2-luks')
+        if not fixture.path.exists():
+            self.skipTest(f'Image not found: {fixture.path}')
         with tempfile.TemporaryDirectory() as td:
             img = Path(td) / 'luks.qcow2'
-            r = subprocess.run(
-                ['qemu-img', 'create', '-f', 'qcow2',
-                 '--object', 'secret,id=sec0,data=test-passphrase',
-                 '-o', 'encrypt.format=luks,encrypt.key-secret=sec0,encrypt.iter-time=10',
-                 str(img), '16M'],
-                capture_output=True, text=True, timeout=30)
-            self.assertEqual(r.returncode, 0, f'create luks failed: {r.stderr}')
+            shutil.copyfile(fixture.path, img)
             self._assert_write_refused(
                 img, 'qcow2',
                 'bench: write tests are not supported for this image '
