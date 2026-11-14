@@ -56,6 +56,12 @@ REQUIRED_FIXTURES=(
     # only place those six run across all seven distros.
     "downloaded/qemu-iotests/hyperv2012r2-dynamic.vhd"
     "downloaded/qemu-iotests/virtualpc-dynamic.vhd"
+    # The only LUKS image the suite has: tests may not make one at
+    # runtime (see no-runtime-luks-create in .pre-commit-config.yaml).
+    # Without it the bench write refusal for encryption, the compare
+    # setup-failure exit-2 case and the LUKS convert and compare classes
+    # all skip, and test_bench.py is in the merge-gating selection.
+    "custom/format-coverage/qcow2-luks.qcow2"
 )
 
 ANNOTATE=0

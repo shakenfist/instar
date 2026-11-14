@@ -198,6 +198,11 @@ Beyond the Rust hooks, `pre-commit run --all-files` also runs:
   version of any cargo tool they both install, if a `cargo install` line
   has lost its `--locked`, or if a version pin has stopped being visible
   to Renovate. See "Cargo tool pinning" below.
+- `no-runtime-luks-create`, which fails when a Python file under
+  `tests/` makes a LUKS image at runtime, with `qemu-img create` or
+  `qemu-img convert` and `encrypt.format=luks`, or with `cryptsetup
+  luksFormat`. Use the prebuilt `qcow2-luks` fixture instead; the flake
+  this prevents is explained in [testing.md](testing.md).
 
 To auto-fix formatting issues:
 

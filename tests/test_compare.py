@@ -1801,13 +1801,16 @@ class TestCompareFailureIsNotAVerdict(InstarTestBase):
         made here: ``qemu-img create`` of a LUKS image times a key
         derivation first and, on some qemu-img builds, fails about one
         time in three with "Unable to get accurate CPU usage" (#905).
+        The zero raw matches its 10 MiB virtual size, so a regression
+        cannot be reported as a size mismatch instead of the verdict
+        this guards against.
         """
         image = self.get_image('qcow2-luks')
         if not image.path.exists():
             self.skipTest(f'Image not found: {image.path}')
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
-            zeros = self._raw(td, 'zeros.raw', 1024 * 1024)
+            zeros = self._raw(td, 'zeros.raw', 10 * 1024 * 1024)
             stdout, stderr, rc = self.run_instar_compare(image.path, zeros)
             self.assertEqual(rc, 2, f'stdout={stdout!r} stderr={stderr!r}')
             self.assertEqual(stdout, '')

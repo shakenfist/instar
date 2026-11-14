@@ -1203,6 +1203,8 @@ class TestBenchWriteRefusals(BenchTestBase):
         ``encrypt.iter-time`` does not help; the timing runs regardless.
         It is copied because the write path is what is under test, and
         a refusal that wrongly wrote would otherwise change the fixture.
+        ``shutil.copyfile``, not ``copy2``: the copy must be writable,
+        or a permission error would mask the refusal under test.
         """
         self._require_kvm()
         fixture = self.get_image('qcow2-luks')
