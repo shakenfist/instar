@@ -418,7 +418,17 @@ jobs:
       - name: Test the diff line attribution
         run: tools/audit/test-diff-added-lines.sh
 
-      # The testdata fixture guard. Every test that reads these three
+      # A test that makes a LUKS image at runtime flakes in the merge
+      # queue, where the failure ejects unrelated pull requests (#905),
+      # so the pre-commit hook alone is too late and too easy to skip.
+      # Pure text parsing: no docker, no cargo, no testdata.
+      - name: Check no test makes a LUKS image at runtime
+        run: tools/ci/check-no-runtime-luks-create.sh
+
+      - name: Test the runtime LUKS create guard
+        run: tools/ci/test-check-no-runtime-luks-create.sh
+
+      # The testdata fixture guard. Every test that reads these
       # fixtures skips rather than fails when its file is absent, so a
       # partial checkout used to shrink the suite with CI still green.
       - name: Test the testdata fixture check

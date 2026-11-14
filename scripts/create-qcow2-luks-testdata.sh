@@ -10,6 +10,12 @@
 #   qcow2-luks.qcow2 - 10MB QCOW2 v3 with LUKS encryption (crypt_method=2)
 #
 # Requirements: qemu-img, qemu-io (with --object secret support)
+#
+# On some qemu-img builds (Debian 12's 7.2 among them) the LUKS create
+# fails about one time in three with "Unable to get accurate CPU usage"
+# while timing its key derivation; encrypt.iter-time does not prevent
+# it. Re-run the script. This is why tests use the image this makes
+# rather than creating their own (#905).
 
 set -euo pipefail
 
