@@ -682,7 +682,7 @@ self_test() {
 # phase's definition of done asks the two to stay in step, which until
 # now was a promise kept by hand. Asserting it makes the drift a
 # failure instead of a documentation bug nobody reads.
-EXPECTED_CASES=153
+EXPECTED_CASES=165
 
 check_case_count() {
     # Only meaningful for a whole run; a selection is expected to be short.
@@ -1985,9 +1985,100 @@ rust_case 'vmm-data-file-refusal-not-captured' "${VMM_MAIN_LIB}" \
     instar 'add_byte_captures_the_data_file_entry_refusal'
 
 rust_case 'vmm-data-file-refusal-not-rendered' "${VMM_MAIN_LIB}" \
-    '        self.last_invalid_l2_entry.is_some() || self.last_data_file_entry.is_some()' \
-    '        self.last_invalid_l2_entry.is_some() // MUTATED' \
+    '            || self.last_data_file_entry.is_some()' \
+    '            // MUTATED: the data-file refusal not rendered' \
     instar 'data_file_entry_error_names_qemu_wording_for_each_rule'
+
+# The same pair for qemu's two host-offset corruption rules (#812),
+# which are a third refusal behind the same predicate and the same
+# renderer entry point. Without these, deleting either the capture or
+# the disjunct leaves the refusal raised and never shown -- which is
+# what #665 was, and what the pair above exists to stop happening again.
+rust_case 'vmm-malformed-l2-refusal-not-captured' "${VMM_MAIN_LIB}" \
+    '                    self.last_malformed_l2_entry = Some((err.sector, err.status));' \
+    '                    // MUTATED: the refusal not captured' \
+    instar 'add_byte_captures_the_malformed_l2_entry_refusal'
+
+rust_case 'vmm-malformed-l2-refusal-not-rendered' "${VMM_MAIN_LIB}" \
+    '            || self.last_malformed_l2_entry.is_some()' \
+    '            // MUTATED: the host-offset refusal not rendered' \
+    instar 'malformed_l2_entry_error_names_qemu_wording_for_each_rule'
+
+# ---------------------------------------------------------------------
+# The VHDX metadata table and parent locator (#576, #662). Each rule
+# that decides whether a metadata table or a locator is sound, broken
+# in turn. The overlap check is only as good as the extents it is
+# given, so the two rules that decide those extents -- one slot per
+# GUID, and never less than the bytes the reader reads -- are cases of
+# their own beside the check itself.
+# ---------------------------------------------------------------------
+
+rust_case 'vhdx-metadata-duplicate-item-accepted' "${VHDX_LIB}" \
+    '        if found[slot].is_some() {' \
+    '        if false && found[slot].is_some() { // MUTATED' \
+    vhdx 'metadata_region_refuses_a_recognised_item_listed_twice'
+
+rust_case 'vhdx-metadata-extent-trusts-declared-length' "${VHDX_LIB}" \
+    '        Some((u64::from(offset), u64::from(declared.max(read_size))))' \
+    '        Some((u64::from(offset), u64::from(declared.max(read_size & 0)))) // MUTATED' \
+    vhdx 'metadata_region_refuses_an_item_over_one_declaring_a_short_length'
+
+rust_case 'vhdx-metadata-overlap-check-removed' "${VHDX_LIB}" \
+    '            if ranges_overlap(a_off, a_len, b_off, u32::try_from(b_len).ok()?) {' \
+    '            if false && ranges_overlap(a_off, a_len, b_off, u32::try_from(b_len).ok()?) { // MUTATED' \
+    vhdx 'metadata_region_refuses_a_locator_laid_over_the_fixed_items'
+
+rust_case 'vhdx-locator-capacity-bound-refused' "${VHDX_LIB}" \
+    '            None | Some(VhdxParentLocatorDefect::EntryCountExceedsCapacity) => Ok(self),' \
+    '            None => Ok(self), Some(VhdxParentLocatorDefect::EntryCountExceedsCapacity) => Err(VhdxParentLocatorRefusal::Malformed(VhdxParentLocatorDefect::EntryCountExceedsCapacity)), // MUTATED' \
+    vhdx 'a_locator_with_more_entries_than_retained_is_still_usable'
+
+rust_case 'vhdx-locator-item-defect-accepted' "${VHDX_LIB}" \
+    '            None | Some(VhdxParentLocatorDefect::EntryCountExceedsCapacity) => Ok(self),' \
+    '            None | Some(_) => Ok(self), // MUTATED' \
+    vhdx 'a_locator_whose_count_exceeds_its_item_is_not_usable'
+
+rust_case 'vhdx-locator-foreign-type-accepted' "${VHDX_LIB}" \
+    '            return Err(VhdxParentLocatorRefusal::ForeignLocatorType);' \
+    '            // MUTATED: a foreign LocatorType accepted' \
+    vhdx 'a_locator_of_a_foreign_type_is_not_usable'
+
+# ---------------------------------------------------------------------
+# A VHD whose footer copy at offset 0 fails its checksum (#583). Probed
+# as a VHD by its cookie, as qemu probes it, and refused by the reader.
+# Each case breaks one link: detection calling the file raw again (which
+# had `convert` exit 0 and write the VHD's own structures out as disk
+# content), `info` not verifying the copy, the host not capturing the
+# refusal's marker, and the host exiting 0 when no result arrives.
+# ---------------------------------------------------------------------
+
+FOOTER_COPY_TEST='test_differencing.TestVhdFooterCopyChecksum.test_a_differencing_child_is_refused'
+INFO_OP='src/operations/info/src/main.rs'
+SHARED_DETECTION='src/shared/src/format_detection.rs'
+
+rust_case 'vhd-header-detection-gated-on-checksum' "${SHARED_DETECTION}" \
+    '    if vhd_cookie == VHD_COOKIE {
+        return ImageFormat::Vhd;
+    }' \
+    '    if vhd_cookie == VHD_COOKIE && vhd_footer_checksum_holds(buffer) { // MUTATED
+        return ImageFormat::Vhd;
+    }' \
+    shared 'a_header_footer_copy_is_a_vhd_by_its_cookie_alone'
+
+rust_case 'vmm-vhd-footer-checksum-refusal-not-captured' "${VMM_MAIN_LIB}" \
+    '                    self.vhd_footer_checksum_refused = true;' \
+    '                    // MUTATED: the refusal not captured' \
+    instar 'info_names_a_vhd_footer_checksum_refusal_in_qemus_wording'
+
+integration_case 'info-vhd-footer-copy-unverified' "${INFO_OP}" \
+    '            if head_cookie == VHD_COOKIE && !vhd_footer_checksum_holds(&buffer[..input_sector_size])' \
+    '            if false && head_cookie == VHD_COOKIE && !vhd_footer_checksum_holds(&buffer[..input_sector_size])' \
+    "${FOOTER_COPY_TEST}"
+
+integration_case 'info-host-no-result-exits-zero' "${VMM_MAIN_LIB}" \
+    '    if !saw_info_result {' \
+    '    if false && !saw_info_result { // MUTATED' \
+    "${FOOTER_COPY_TEST}"
 
 # ---------------------------------------------------------------------
 # Two chains in one device array, which is `compare` alone.

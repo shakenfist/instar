@@ -12,9 +12,9 @@ use core::panic::PanicInfo;
 use shared::{
     format_detection::{
         detect_dmg_koly_offset, detect_format_from_header, detect_iso_at_offset, detect_vhd_footer,
-        dmg_sector_count, BOCHS_VERSION_2, BOCHS_VERSION_OFFSET, DMG_KOLY_MAGIC,
-        DMG_KOLY_TRAILER_LEN, ISO_MAGIC_BYTE_OFFSET, PARALLELS_MAGIC_V1, VDI_SIGNATURE_OFFSET,
-        VHD_COOKIE,
+        dmg_sector_count, vhd_footer_checksum_holds, BOCHS_VERSION_2, BOCHS_VERSION_OFFSET,
+        DMG_KOLY_MAGIC, DMG_KOLY_TRAILER_LEN, ISO_MAGIC_BYTE_OFFSET, PARALLELS_MAGIC_V1,
+        VDI_SIGNATURE_OFFSET, VHD_COOKIE,
     },
     validate_call_table, CallTable, ImageFormat, InfoConfig, InfoResult, LuksInfo, Qcow2Info,
     VdiInfo, VmdkInfo, ARGON2_MEM_BASE, CALL_TABLE_ADDR, MAX_SECTOR_SIZE, SCRATCH_MEM_BASE,
@@ -435,6 +435,33 @@ pub unsafe extern "C" fn _start() -> u64 {
             // refusing would remove the only way to inspect an image the
             // data ops decline to read.
             let mut backing_file_buf = [0u8; MAX_BACKING_FILE_LEN + 1];
+
+            // Header detection calls a cookie at offset 0 a VHD without
+            // looking at the checksum, as qemu's probe does; verifying it
+            // is the reader's job, and here `info` is the reader. Every
+            // field reported below -- size, disk type, parent -- comes out
+            // of these 512 bytes, and the checksum is the only thing that
+            // constrains them, so a copy that fails it refuses the image,
+            // as qemu does ("Incorrect header checksum") (issue #583). A
+            // trailing footer reaching this arm was verified by
+            // `detect_vhd_footer` already.
+            let head_cookie = u64::from_be_bytes([
+                buffer[0], buffer[1], buffer[2], buffer[3], buffer[4], buffer[5], buffer[6],
+                buffer[7],
+            ]);
+            if head_cookie == VHD_COOKIE && !vhd_footer_checksum_holds(&buffer[..input_sector_size])
+            {
+                (call_table.verbose_print)(
+                    b"info: VHD footer copy at offset 0 fails its checksum\n\0".as_ptr(),
+                );
+                (call_table.send_error)(
+                    shared::VhdFooterChecksumRefusal::OPERATION_C.as_ptr(),
+                    b"input\0".as_ptr(),
+                    0,
+                    0,
+                );
+                return 0;
+            }
 
             if detailed {
                 // VHD footer may be in first sector (dynamic) or last sector (fixed)
@@ -1071,6 +1098,37 @@ unsafe fn parse_vhdx_metadata(
     let locator = match metadata.parent_locator.parsed() {
         Some(l) => l,
         None => return false,
+    };
+
+    // Whether this locator vouches for a parent at all is
+    // `VhdxParentLocator::usable`, which refuses a foreign LocatorType
+    // (measured: patching the GUID to `deadbeef` x4 had instar report
+    // that locator's path as the parent `convert` would open, where
+    // libvhdi refuses the image -- issue #662) and a locator whose own
+    // header does not describe its entries (`key_value_count = 0xFFFF`
+    // reported its parent normally, because `value_of` checks only the
+    // per-*entry* defect). It deliberately lets through a locator with
+    // more entries than the parser retains, which is a bound of
+    // instar's and not a fault of the image. The rule lives in the crate
+    // so it is unit-tested there and any other consumer gets the same
+    // one.
+    //
+    // Reporting no parent is the refusal: the image claims one through
+    // `HasParent`, nothing resolves it, and every composing operation
+    // then refuses the image by name, as it does for a differencing
+    // image with no parent behind it.
+    let locator = match locator.usable() {
+        Ok(l) => l,
+        Err(vhdx::VhdxParentLocatorRefusal::ForeignLocatorType) => {
+            (call_table.verbose_print)(
+                b"info: VHDX parent locator type is not the one SPEC(VHDX) defines\n\0".as_ptr(),
+            );
+            return false;
+        }
+        Err(vhdx::VhdxParentLocatorRefusal::Malformed(_)) => {
+            (call_table.verbose_print)(b"info: VHDX parent locator item is malformed\n\0".as_ptr());
+            return false;
+        }
     };
 
     // Which key to report is `VhdxParentLocator::preferred_path` (it

@@ -438,6 +438,25 @@ impl QcowHeader {
         // valid `l1_size` could reference it, and downstream consumers
         // re-expanding `cluster_count * cluster_size` would overflow u64
         // (issue #438 — a rebase overlay with virtual_size ≈ u64::MAX).
+        // An extended-L2 image divides each cluster into 32 subclusters,
+        // and qemu refuses to open one whose subclusters would be under
+        // 512 bytes: "Unsupported subcluster size: N", which is any
+        // cluster size below 16 KiB. Its own `qemu-img create` refuses
+        // the same shape ("Extended L2 entries are only supported with
+        // cluster sizes of at least 16384 bytes"), so only a crafted
+        // image has it.
+        //
+        // Beyond parity, the reader's encrypted paths rest on it. In a
+        // mixed extended-L2 cluster a `Normal` run starts on a
+        // subcluster boundary, and AES-CBC and XTS decryption need
+        // 512-byte-aligned runs; that holds only while a subcluster is
+        // at least 512 bytes (issue #805).
+        if incompatible_features & INCOMPAT_EXTENDED_L2 != 0
+            && cluster_bits < MIN_EXTENDED_L2_CLUSTER_BITS
+        {
+            return None;
+        }
+
         let l2_entry_size = if incompatible_features & INCOMPAT_EXTENDED_L2 != 0 {
             16u64
         } else {
@@ -1430,11 +1449,29 @@ pub enum ClusterLookup {
     /// callers must refuse it too, not inflate it from the image or read
     /// the data file at the entry's offset.
     DataFileRefused(DataFileEntryViolation),
+    /// The entry breaks one of qemu's two host-offset corruption rules:
+    /// an unaligned host cluster offset, or the all-zeroes flag in a
+    /// pre-v3 image. qemu fails the read with `EIO`
+    /// (`block/qcow2-cluster.c:657-694` at v10.0.0); callers must
+    /// refuse it too, rather than reading the offset or zero-filling
+    /// the cluster (#812).
+    Malformed(MalformedEntryViolation),
 }
 
 // ============================================================================
 // Subcluster classification (qemu's qcow2_get_subcluster_type)
 // ============================================================================
+
+/// Smallest `cluster_bits` an extended-L2 image may declare: 14, a
+/// 16 KiB cluster, which is the smallest that divides into 32
+/// subclusters of at least 512 bytes.
+///
+/// qemu enforces the subcluster size rather than the cluster size
+/// (`Unsupported subcluster size: N` at open, and a matching refusal in
+/// `qemu-img create`), but with `QCOW_EXTL2_SUBCLUSTERS_PER_CLUSTER`
+/// fixed at 32 the two are the same rule. Expressed in bits because
+/// that is the field an image actually carries.
+pub const MIN_EXTENDED_L2_CLUSTER_BITS: u32 = 14;
 
 /// Subclusters per cluster in an extended-L2 image
 /// (`QCOW_EXTL2_SUBCLUSTERS_PER_CLUSTER`, `block/qcow2.h:81` at qemu
@@ -1736,6 +1773,13 @@ pub fn validate_subcluster_bitmap(
 /// with per-device sector caches. Create with [`Qcow2State::init()`].
 pub struct Qcow2State {
     pub device_idx: u32,
+    /// The image's qcow2 version, from the header.
+    ///
+    /// Kept because one of qemu's corruption rules depends on it: the
+    /// all-zeroes flag does not exist before v3, and an entry carrying
+    /// it in a v2 image is corrupt rather than a zero cluster
+    /// (issue #812).
+    pub version: u32,
     pub cluster_size: u64,
     pub cluster_bits: u32,
     pub l1_size: u32,
@@ -1882,6 +1926,8 @@ impl TargetUnitTracker {
 pub fn walk_l2_standard(
     l2_bytes: &[u8],
     cluster_size: u64,
+    // The image's qcow2 version, for the pre-v3 zero-flag rule.
+    version: u32,
     base_virtual_offset: u64,
     virtual_size: u64,
     has_data_file: bool,
@@ -1901,6 +1947,7 @@ pub fn walk_l2_standard(
             // guest-visible bytes here. See doc comment.
             continue;
         }
+        RefusedL2Entry::check_malformed(entry, 0, false, version, cluster_size, has_data_file, v)?;
         RefusedL2Entry::check_data_file(entry, 0, false, has_data_file, v)?;
         // A classic entry is never `Invalid` (block/qcow2.h:781-796).
         if !matches!(
@@ -1967,9 +2014,10 @@ impl DataFileEntryViolation {
 /// cluster and break neither rule.
 ///
 /// qemu refuses an unaligned host cluster offset before it compares
-/// offsets (`:687-695`). instar has no separate unaligned rule, so in a
-/// data-file image such an offset is refused as a mismatch, since it
-/// cannot equal a cluster-aligned guest offset.
+/// offsets (`:687-695`), and so does instar, in
+/// [`malformed_entry_violation`]. In a data-file image an unaligned
+/// offset breaks both rules; the callers check the alignment first, so
+/// it is reported as what it is rather than as a mismatch.
 pub fn data_file_entry_violation(
     l2_entry: u64,
     bitmap: u64,
@@ -1990,6 +2038,102 @@ pub fn data_file_entry_violation(
         }
         _ => None,
     }
+}
+
+/// Which of qemu's two host-offset corruption rules an L2 entry breaks.
+///
+/// Both live in `qcow2_get_host_offset` (`block/qcow2-cluster.c` at
+/// qemu v10.0.0) rather than in `qcow2_get_subcluster_type`, which is
+/// why transcribing the classifier did not pick them up, and both apply
+/// to every qcow2 image rather than only to one with a data file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MalformedEntryViolation {
+    /// The entry names a host cluster whose offset is not a multiple of
+    /// the cluster size: "Cluster allocation offset %#llx unaligned"
+    /// (`:686-694`).
+    UnalignedHostOffset,
+    /// The all-zeroes flag is set in an image whose version predates
+    /// it: "Zero cluster entry found in pre-v3 image" (`:657-664`).
+    ZeroFlagPreV3,
+}
+
+impl MalformedEntryViolation {
+    /// The [`shared::MalformedL2EntryRefusal`] status code that names
+    /// this rule to the host.
+    pub fn status(self) -> u32 {
+        match self {
+            Self::UnalignedHostOffset => {
+                shared::MalformedL2EntryRefusal::STATUS_UNALIGNED_HOST_OFFSET
+            }
+            Self::ZeroFlagPreV3 => shared::MalformedL2EntryRefusal::STATUS_ZERO_FLAG_PRE_V3,
+        }
+    }
+}
+
+/// Whether an L2 entry breaks one of qemu's two host-offset corruption
+/// rules, and which.
+///
+/// `version` is the image's qcow2 version and `cluster_size` its
+/// cluster size, both from the header. Checked in qemu's order: the
+/// zero flag first (`:657-664`), then the alignment (`:686-694`).
+///
+/// * **The zero flag in a pre-v3 image.** Bit 0 of an L2 entry is the
+///   all-zeroes flag from qcow2 v3 onward; in a v2 image it is not
+///   defined, so qemu treats an entry carrying it as corrupt rather
+///   than as a zero cluster. Without the rule instar served the
+///   cluster as zeros, where the cluster's own host offset holds data:
+///   measured as `instar convert -O raw` returning zeros for a cluster
+///   `qemu-io` had written `0x55` into, while qemu-img refused the
+///   image. The flag has no meaning under extended L2 either
+///   ([`cluster_type`] ignores it there), and extended L2 requires v3,
+///   so the rule is written against the classic entry.
+/// * **An unaligned host cluster offset.** Every entry that names a
+///   host cluster -- `Normal`, `ZeroAlloc` or `UnallocatedAlloc`, as
+///   [`l2_entry_names_host_cluster`] has it -- must name a
+///   cluster-aligned one. A compressed entry is exempt: its offset is
+///   byte-granular with a length field beside it, and qemu applies the
+///   check only on the path that reads a whole host cluster. Measured:
+///   with the second L2 entry of a 64 KiB-cluster image patched to
+///   `0x8000000000050200`, `qemu-img map`, `measure` and `convert` all
+///   fail with `EIO`, while instar's `map` reported `"offset": 328192`
+///   and its `measure` counted the cluster.
+///
+/// An `Invalid` entry is not reported here: the classifier's own
+/// refusal reaches it first, as it does for the data-file rules.
+pub fn malformed_entry_violation(
+    l2_entry: u64,
+    bitmap: u64,
+    extended_l2: bool,
+    version: u32,
+    cluster_size: u64,
+    has_data_file: bool,
+) -> Option<MalformedEntryViolation> {
+    let ty = subcluster_type(l2_entry, bitmap, 0, extended_l2, has_data_file);
+    if matches!(ty, SubclusterType::Invalid) {
+        return None;
+    }
+    // qemu reaches the version check inside the arm for a zero cluster,
+    // so the entry has to classify as one first. Gating on the
+    // classification rather than on bit 0 alone is what keeps a
+    // *compressed* entry out of it: in a compressed entry the low bits
+    // are part of the compressed size, not the all-zeroes flag, and a
+    // real v2 image is full of them. `debian_etch_sparc_small.qcow2`,
+    // a 2007 Debian image in the test suite, carries
+    // `0x40800000000505e7` -- compressed, with bit 0 set -- and
+    // refusing it would be refusing an image qemu-img converts.
+    if version < 3
+        && l2_entry & QCOW_OFLAG_ZERO != 0
+        && matches!(ty, SubclusterType::ZeroPlain | SubclusterType::ZeroAlloc)
+    {
+        return Some(MalformedEntryViolation::ZeroFlagPreV3);
+    }
+    if cluster_size != 0
+        && l2_entry_names_host_cluster(l2_entry, extended_l2, has_data_file)
+        && !(l2_entry & L2_OFFSET_MASK).is_multiple_of(cluster_size)
+    {
+        return Some(MalformedEntryViolation::UnalignedHostOffset);
+    }
+    None
 }
 
 /// An L2 entry a metadata walk (measure, map) or the chain reader
@@ -2016,6 +2160,14 @@ pub enum RefusedL2Entry {
         virtual_offset: u64,
         violation: DataFileEntryViolation,
     },
+    /// The entry breaks one of qemu's two host-offset corruption rules
+    /// (#812); see [`malformed_entry_violation`]. Raised as
+    /// [`shared::MalformedL2EntryRefusal`].
+    Malformed {
+        /// Virtual byte offset of the cluster the entry describes.
+        virtual_offset: u64,
+        violation: MalformedEntryViolation,
+    },
 }
 
 impl RefusedL2Entry {
@@ -2036,6 +2188,39 @@ impl RefusedL2Entry {
             guest_cluster_offset,
         ) {
             Some(violation) => Err(RefusedL2Entry::DataFile {
+                virtual_offset: guest_cluster_offset,
+                violation,
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// `Err` with the malformed-entry refusal of the cluster at
+    /// `guest_cluster_offset` if its entry breaks one of qemu's two
+    /// host-offset rules.
+    ///
+    /// Checked before [`Self::check_data_file`] at every call site, so
+    /// an unaligned offset in a data-file image -- which breaks both
+    /// rules -- is reported as the alignment failure it is rather than
+    /// as a host-offset mismatch.
+    fn check_malformed(
+        l2_entry: u64,
+        bitmap: u64,
+        extended_l2: bool,
+        version: u32,
+        cluster_size: u64,
+        has_data_file: bool,
+        guest_cluster_offset: u64,
+    ) -> Result<(), RefusedL2Entry> {
+        match malformed_entry_violation(
+            l2_entry,
+            bitmap,
+            extended_l2,
+            version,
+            cluster_size,
+            has_data_file,
+        ) {
+            Some(violation) => Err(RefusedL2Entry::Malformed {
                 virtual_offset: guest_cluster_offset,
                 violation,
             }),
@@ -2074,6 +2259,8 @@ impl RefusedL2Entry {
 pub fn count_allocated_in_l2_extended(
     l2_bytes: &[u8],
     cluster_size: u64,
+    // The image's qcow2 version, for the pre-v3 zero-flag rule.
+    version: u32,
     base_virtual_offset: u64,
     virtual_size: u64,
     has_data_file: bool,
@@ -2100,6 +2287,15 @@ pub fn count_allocated_in_l2_extended(
             continue;
         }
         let cluster_cap = cluster_size.min(virtual_size - cluster_start);
+        RefusedL2Entry::check_malformed(
+            l2_entry,
+            sc_bitmap,
+            true,
+            version,
+            cluster_size,
+            has_data_file,
+            cluster_start,
+        )?;
         RefusedL2Entry::check_data_file(l2_entry, sc_bitmap, true, has_data_file, cluster_start)?;
 
         let mut sc: u32 = 0;
@@ -2194,8 +2390,18 @@ pub fn classify_qcow2_l2_standard(
     entry: u64,
     virtual_offset: u64,
     cluster_size: u64,
+    version: u32,
     has_data_file: bool,
 ) -> Result<MapExtent, RefusedL2Entry> {
+    RefusedL2Entry::check_malformed(
+        entry,
+        0,
+        false,
+        version,
+        cluster_size,
+        has_data_file,
+        virtual_offset,
+    )?;
     RefusedL2Entry::check_data_file(entry, 0, false, has_data_file, virtual_offset)?;
     let ty = subcluster_type(entry, 0, 0, false, has_data_file);
     Ok(MapExtent {
@@ -2230,6 +2436,7 @@ pub fn classify_qcow2_l2_extended<F: FnMut(MapExtent) -> bool>(
     virtual_offset: u64,
     cluster_size: u64,
     cluster_length: u64,
+    version: u32,
     has_data_file: bool,
     sink: &mut MapExtentCoalescer<'_, F>,
 ) -> Result<bool, RefusedL2Entry> {
@@ -2240,6 +2447,15 @@ pub fn classify_qcow2_l2_extended<F: FnMut(MapExtent) -> bool>(
     if subcluster_size == 0 {
         return Ok(true);
     }
+    RefusedL2Entry::check_malformed(
+        l2_entry,
+        sc_bitmap,
+        true,
+        version,
+        cluster_size,
+        has_data_file,
+        virtual_offset,
+    )?;
     RefusedL2Entry::check_data_file(l2_entry, sc_bitmap, true, has_data_file, virtual_offset)?;
     let host_offset = l2_entry & L2_OFFSET_MASK;
 
@@ -2304,6 +2520,9 @@ impl Qcow2State {
     ) -> Option<Qcow2State> {
         let mut state = Qcow2State {
             device_idx,
+            // Overwritten from the header below; a state that has not
+            // read its version yet must not read like a v3 image.
+            version: 0,
             cluster_size: 0,
             cluster_bits: 0,
             l1_size: 0,
@@ -2334,6 +2553,7 @@ impl Qcow2State {
         if version != 2 && version != 3 {
             return None;
         }
+        state.version = version;
 
         // Read cluster_bits
         let cluster_bits = read_u32_be_cached(
@@ -2395,6 +2615,16 @@ impl Qcow2State {
                 bytes_read,
             )?;
             state.extended_l2 = (state.incompatible_features & INCOMPAT_EXTENDED_L2) != 0;
+            // An extended-L2 image needs subclusters of at least 512
+            // bytes, so clusters of at least 16 KiB, which is what
+            // qemu enforces at open ("Unsupported subcluster size")
+            // and what `QcowHeader::parse` refuses (issue #805). The
+            // host refuses such an image before the guest runs, but
+            // the guest is told the format rather than probing for
+            // it, so the reader checks for itself.
+            if state.extended_l2 && cluster_bits < MIN_EXTENDED_L2_CLUSTER_BITS {
+                return None;
+            }
 
             // compression_type is a single byte at offset 104.
             // Read the containing u32 at offset 104 and take the
@@ -2684,6 +2914,16 @@ impl Qcow2State {
         let extended_l2 = self.extended_l2;
         let has_data_file = self.has_data_file();
         let (ty, run) = subcluster_range(l2_entry, bitmap, 0, extended_l2, has_data_file);
+        if let Some(violation) = malformed_entry_violation(
+            l2_entry,
+            bitmap,
+            extended_l2,
+            self.version,
+            self.cluster_size,
+            has_data_file,
+        ) {
+            return ClusterLookup::Malformed(violation);
+        }
         if let Some(violation) = data_file_entry_violation(
             l2_entry,
             bitmap,
@@ -2749,6 +2989,7 @@ impl Qcow2State {
         let cluster_size = self.cluster_size;
         let extended_l2 = self.extended_l2;
         let has_data_file = self.has_data_file();
+        let version = self.version;
         let l1_size = self.l1_size as u64;
         let l1_table_offset = self.l1_table_offset;
 
@@ -2865,6 +3106,7 @@ impl Qcow2State {
                     count_allocated_in_l2_extended(
                         meaningful,
                         cluster_size,
+                        version,
                         base_virtual_offset,
                         virtual_size,
                         has_data_file,
@@ -2874,6 +3116,7 @@ impl Qcow2State {
                     walk_l2_standard(
                         meaningful,
                         cluster_size,
+                        version,
                         base_virtual_offset,
                         virtual_size,
                         has_data_file,
@@ -2956,6 +3199,7 @@ impl Qcow2State {
         let cluster_size = self.cluster_size;
         let extended_l2 = self.extended_l2;
         let has_data_file = self.has_data_file();
+        let version = self.version;
         let l1_size = self.l1_size as u64;
         let l1_table_offset = self.l1_table_offset;
 
@@ -3109,6 +3353,7 @@ impl Qcow2State {
                             cluster_virt,
                             cluster_size,
                             cluster_visible,
+                            version,
                             has_data_file,
                             &mut coalescer,
                         )
@@ -3117,6 +3362,7 @@ impl Qcow2State {
                             l2_entry,
                             cluster_virt,
                             cluster_size,
+                            version,
                             has_data_file,
                         )
                         .map(|mut ext| {
@@ -3674,6 +3920,51 @@ mod tests {
     }
 
     #[test]
+    fn parse_rejects_extended_l2_with_subclusters_under_512_bytes() {
+        // qemu refuses to open such an image ("Unsupported subcluster
+        // size: 128" for a 4 KiB cluster) and refuses to create one.
+        // instar opened and read them, and the reader's AES-CBC and XTS
+        // paths assume a `Normal` subcluster run is 512-byte aligned,
+        // which only holds above this floor (issue #805).
+        for bits in 9..MIN_EXTENDED_L2_CLUSTER_BITS {
+            let mut buf = make_qcow2_header();
+            buf[CLUSTER_BITS_OFFSET..CLUSTER_BITS_OFFSET + 4].copy_from_slice(&bits.to_be_bytes());
+            buf[INCOMPATIBLE_FEATURES_OFFSET..INCOMPATIBLE_FEATURES_OFFSET + 8]
+                .copy_from_slice(&INCOMPAT_EXTENDED_L2.to_be_bytes());
+            assert!(
+                QcowHeader::parse(&buf).is_none(),
+                "cluster_bits {bits} gives {}-byte subclusters and must be refused",
+                (1u32 << bits) / QCOW_EXTL2_SUBCLUSTERS_PER_CLUSTER
+            );
+
+            // Without the extended-L2 feature the same cluster size is
+            // perfectly ordinary, so the floor must not leak into it.
+            buf[INCOMPATIBLE_FEATURES_OFFSET..INCOMPATIBLE_FEATURES_OFFSET + 8]
+                .copy_from_slice(&0u64.to_be_bytes());
+            let hdr = QcowHeader::parse(&buf)
+                .unwrap_or_else(|| panic!("cluster_bits {bits} is legal without extended L2"));
+            assert!(!hdr.extended_l2);
+        }
+    }
+
+    #[test]
+    fn parse_accepts_extended_l2_at_the_subcluster_floor() {
+        // 16 KiB clusters are exactly 512-byte subclusters, which is
+        // the smallest qemu accepts; measured against qemu-img 10.0.13.
+        let mut buf = make_qcow2_header();
+        buf[CLUSTER_BITS_OFFSET..CLUSTER_BITS_OFFSET + 4]
+            .copy_from_slice(&MIN_EXTENDED_L2_CLUSTER_BITS.to_be_bytes());
+        buf[INCOMPATIBLE_FEATURES_OFFSET..INCOMPATIBLE_FEATURES_OFFSET + 8]
+            .copy_from_slice(&INCOMPAT_EXTENDED_L2.to_be_bytes());
+        let hdr = QcowHeader::parse(&buf).expect("512-byte subclusters are legal");
+        assert!(hdr.extended_l2);
+        assert_eq!(
+            hdr.cluster_size / u64::from(QCOW_EXTL2_SUBCLUSTERS_PER_CLUSTER),
+            512
+        );
+    }
+
+    #[test]
     fn parse_rejects_oversized_l1() {
         // Header claims l1_size = 4 * 1024 * 1024 + 1 entries, exceeding
         // the absolute QCOW2_MAX_L1_SIZE_ENTRIES cap.
@@ -4022,6 +4313,7 @@ mod tests {
         }
         let state = Qcow2State {
             device_idx: 0,
+            version: 3,
             cluster_size: 65536,
             cluster_bits: 16,
             l1_size: 1,
@@ -4038,6 +4330,102 @@ mod tests {
             l2_cache_buf: core::ptr::null_mut(),
         };
         state.classify_l2_entry(entry, bitmap, 0)
+    }
+
+    /// `sc_verdict` with the image's version, for the pre-v3 rule.
+    fn sc_verdict_at_version(entry: u64, bitmap: u64, ext: bool, version: u32) -> ClusterLookup {
+        let state = Qcow2State {
+            device_idx: 0,
+            version,
+            cluster_size: 65536,
+            cluster_bits: 16,
+            l1_size: 1,
+            l1_table_offset: 0,
+            incompatible_features: if ext { INCOMPAT_EXTENDED_L2 } else { 0 },
+            compression_type: 0,
+            crypt_method: 0,
+            luks_ext_offset: 0,
+            luks_ext_len: 0,
+            extended_l2: ext,
+            l1_cached_sector: u64::MAX,
+            l1_cache_buf: core::ptr::null_mut(),
+            l2_cached_sector: u64::MAX,
+            l2_cache_buf: core::ptr::null_mut(),
+        };
+        state.classify_l2_entry(entry, bitmap, 0)
+    }
+
+    #[test]
+    fn the_read_path_refuses_a_malformed_entry_rather_than_reading_it() {
+        // The chain reader's verdict, not just the predicate: before
+        // the fix `convert` served the bytes at an unaligned offset and
+        // zero-filled a pre-v3 zero-flag cluster whose host offset
+        // holds data (#812).
+        assert_eq!(
+            sc_verdict_at_version(OFLAG_COPIED | 0x5_0200, 0, false, 3),
+            ClusterLookup::Malformed(MalformedEntryViolation::UnalignedHostOffset)
+        );
+        assert_eq!(
+            sc_verdict_at_version(QCOW_OFLAG_ZERO | 0x5_0000, 0, false, 2),
+            ClusterLookup::Malformed(MalformedEntryViolation::ZeroFlagPreV3)
+        );
+
+        // The sound forms of both still read.
+        assert_eq!(
+            sc_verdict_at_version(OFLAG_COPIED | 0x5_0000, 0, false, 3),
+            ClusterLookup::Standard(0x5_0000)
+        );
+        assert_eq!(
+            sc_verdict_at_version(QCOW_OFLAG_ZERO | 0x5_0000, 0, false, 3),
+            ClusterLookup::Zero
+        );
+    }
+
+    #[test]
+    fn the_metadata_walks_refuse_a_malformed_entry() {
+        // map and measure must refuse what the reader refuses, or one
+        // image gets three answers (the #634 trap, here for #812):
+        // `map` reported "offset": 328192 for the measured
+        // 0x8000000000050200 entry and `measure` counted its cluster,
+        // while `convert` failed.
+        let mut t = TargetUnitTracker::new(0);
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&(OFLAG_COPIED | 0x5_0200u64).to_be_bytes());
+        assert_eq!(
+            walk_l2_standard(&buf, 65536, 3, 0, u64::MAX, false, &mut t),
+            Err(RefusedL2Entry::Malformed {
+                virtual_offset: 0,
+                violation: MalformedEntryViolation::UnalignedHostOffset,
+            })
+        );
+        assert_eq!(
+            classify_qcow2_l2_standard(OFLAG_COPIED | 0x5_0200, 0, 65536, 3, false),
+            Err(RefusedL2Entry::Malformed {
+                virtual_offset: 0,
+                violation: MalformedEntryViolation::UnalignedHostOffset,
+            })
+        );
+
+        // And the pre-v3 zero flag, which reads as a zero cluster at
+        // v3 and is corruption at v2.
+        let mut zero_buf = [0u8; 8];
+        zero_buf.copy_from_slice(&(QCOW_OFLAG_ZERO | 0x5_0000u64).to_be_bytes());
+        assert_eq!(
+            walk_l2_standard(&zero_buf, 65536, 2, 0, u64::MAX, false, &mut t),
+            Err(RefusedL2Entry::Malformed {
+                virtual_offset: 0,
+                violation: MalformedEntryViolation::ZeroFlagPreV3,
+            })
+        );
+        assert!(walk_l2_standard(&zero_buf, 65536, 3, 0, u64::MAX, false, &mut t).is_ok());
+        assert_eq!(
+            classify_qcow2_l2_standard(QCOW_OFLAG_ZERO | 0x5_0000, 0, 65536, 2, false),
+            Err(RefusedL2Entry::Malformed {
+                virtual_offset: 0,
+                violation: MalformedEntryViolation::ZeroFlagPreV3,
+            })
+        );
+        assert!(classify_qcow2_l2_standard(QCOW_OFLAG_ZERO | 0x5_0000, 0, 65536, 3, false).is_ok());
     }
 
     #[test]
@@ -4203,6 +4591,97 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn malformed_entry_violation_follows_qcow2_get_host_offset() {
+        // qemu's two host-offset corruption rules,
+        // block/qcow2-cluster.c:657-664 and :686-694 at v10.0.0 (#812).
+        use MalformedEntryViolation::{UnalignedHostOffset as U, ZeroFlagPreV3 as Z};
+        const CS: u64 = 0x1_0000;
+
+        let v = |entry: u64, bitmap: u64, ext: bool, version: u32, df: bool| {
+            malformed_entry_violation(entry, bitmap, ext, version, CS, df)
+        };
+
+        // A cluster-aligned Normal entry is sound at either version.
+        assert_eq!(v(OFLAG_COPIED | 0x5_0000, 0, false, 3, false), None);
+        assert_eq!(v(OFLAG_COPIED | 0x5_0000, 0, false, 2, false), None);
+
+        // The same entry one sector along is not: this is the measured
+        // 0x8000000000050200 shape, which qemu-img map, measure and
+        // convert all refuse with EIO.
+        assert_eq!(
+            v(OFLAG_COPIED | 0x5_0200, 0, false, 3, false),
+            Some(U),
+            "an unaligned host cluster offset must be refused"
+        );
+        // It is not a data-file-only rule.
+        assert_eq!(v(OFLAG_COPIED | 0x5_0200, 0, false, 3, true), Some(U));
+
+        // The zero flag is a v3 feature. In a v2 image an entry
+        // carrying it is corrupt, not a zero cluster -- instar read it
+        // as zeros, where the host offset holds data.
+        assert_eq!(v(QCOW_OFLAG_ZERO | 0x5_0000, 0, false, 2, false), Some(Z));
+        assert_eq!(v(QCOW_OFLAG_ZERO, 0, false, 2, false), Some(Z));
+        assert_eq!(v(QCOW_OFLAG_ZERO | 0x5_0000, 0, false, 3, false), None);
+
+        // Under extended L2 bit 0 is not the zero flag at all, and
+        // extended L2 requires v3, so the rule does not reach there.
+        assert_eq!(v(QCOW_OFLAG_ZERO | 0x5_0000, 1, true, 3, false), None);
+
+        // A compressed entry's offset is byte-granular with a length
+        // beside it, so the alignment rule does not apply to it.
+        assert_eq!(v(OFLAG_COMPRESSED | 0x5_0200, 0, false, 3, false), None);
+
+        // Nor does the zero-flag rule, at any version: in a compressed
+        // entry the low bits are the compressed size, not the
+        // all-zeroes flag. These three are the first L2 entries of
+        // `downloaded/aurel32/debian_etch_sparc_small.qcow2`, a real
+        // v2 image whose compressed clusters all carry bit 0; qemu-img
+        // converts it, and a rule that read bit 0 before the cluster
+        // type refused it.
+        for entry in [
+            0x4080_0000_0005_05e7u64,
+            0x4040_0000_0005_086bu64,
+            0x4040_0000_0005_0aefu64,
+        ] {
+            assert_eq!(entry & QCOW_OFLAG_ZERO, 1, "the fixture's bit 0 is set");
+            assert_eq!(
+                v(entry, 0, false, 2, false),
+                None,
+                "a compressed v2 entry is not a zero cluster"
+            );
+        }
+
+        // An unallocated entry names no host cluster.
+        assert_eq!(v(0, 0, false, 3, false), None);
+
+        // Order matters: qemu checks the zero flag before the
+        // alignment, so a v2 entry that breaks both is reported as the
+        // zero-flag failure.
+        assert_eq!(v(QCOW_OFLAG_ZERO | 0x5_0200, 0, false, 2, false), Some(Z));
+
+        // A cluster size of zero cannot divide; the parser refuses such
+        // an image, and this must not divide by zero on the way there.
+        assert_eq!(
+            malformed_entry_violation(OFLAG_COPIED | 0x5_0200, 0, false, 3, 0, false),
+            None
+        );
+    }
+
+    #[test]
+    fn malformed_entry_statuses_round_trip_to_the_host_codes() {
+        // The host renders by code, so a swap here would relabel every
+        // refusal.
+        assert_eq!(
+            MalformedEntryViolation::UnalignedHostOffset.status(),
+            shared::MalformedL2EntryRefusal::STATUS_UNALIGNED_HOST_OFFSET
+        );
+        assert_eq!(
+            MalformedEntryViolation::ZeroFlagPreV3.status(),
+            shared::MalformedL2EntryRefusal::STATUS_ZERO_FLAG_PRE_V3
+        );
     }
 
     #[test]
@@ -4855,6 +5334,7 @@ mod tests {
             count_allocated_in_l2_extended(
                 &[],
                 65536,
+                3,
                 0,
                 u64::MAX,
                 false,
@@ -4873,6 +5353,7 @@ mod tests {
             count_allocated_in_l2_extended(
                 &buf,
                 65536,
+                3,
                 0,
                 u64::MAX,
                 false,
@@ -4895,6 +5376,7 @@ mod tests {
             count_allocated_in_l2_extended(
                 &buf,
                 65536,
+                3,
                 0,
                 u64::MAX,
                 false,
@@ -4915,6 +5397,7 @@ mod tests {
             count_allocated_in_l2_extended(
                 &buf,
                 65536,
+                3,
                 0,
                 u64::MAX,
                 false,
@@ -4937,6 +5420,7 @@ mod tests {
             count_allocated_in_l2_extended(
                 &buf,
                 65536,
+                3,
                 0,
                 u64::MAX,
                 false,
@@ -4957,6 +5441,7 @@ mod tests {
             count_allocated_in_l2_extended(
                 &buf,
                 65536,
+                3,
                 0,
                 u64::MAX,
                 false,
@@ -4983,6 +5468,7 @@ mod tests {
             count_allocated_in_l2_extended(
                 &buf,
                 65536,
+                3,
                 0,
                 u64::MAX,
                 false,
@@ -4999,11 +5485,14 @@ mod tests {
         // bits set → 16 * 65536 = 1 MiB.
         let bitmap: u64 = 0x0000_0000_0000_FFFF;
         let mut buf = [0u8; 16];
-        put_ext_entry(&mut buf, 0, 0x100000, bitmap);
+        // 0x20_0000, not 0x10_0000: a 2 MiB cluster's host offset has
+        // to be 2 MiB-aligned or qemu refuses the entry (#812).
+        put_ext_entry(&mut buf, 0, 0x20_0000, bitmap);
         assert_eq!(
             count_allocated_in_l2_extended(
                 &buf,
                 2 * 1024 * 1024,
+                3,
                 0,
                 u64::MAX,
                 false,
@@ -5027,6 +5516,7 @@ mod tests {
             count_allocated_in_l2_extended(
                 &buf,
                 65536,
+                3,
                 0,
                 u64::MAX,
                 false,
@@ -5046,6 +5536,7 @@ mod tests {
             count_allocated_in_l2_extended(
                 &buf,
                 0,
+                3,
                 0,
                 u64::MAX,
                 false,
@@ -5068,6 +5559,7 @@ mod tests {
             count_allocated_in_l2_extended(
                 &buf,
                 65536,
+                3,
                 0,
                 u64::MAX,
                 false,
@@ -5091,6 +5583,7 @@ mod tests {
             count_allocated_in_l2_extended(
                 &buf,
                 65536,
+                3,
                 0,
                 u64::MAX,
                 true,
@@ -5102,6 +5595,7 @@ mod tests {
             count_allocated_in_l2_extended(
                 &buf,
                 65536,
+                3,
                 0x10_0000,
                 u64::MAX,
                 false,
@@ -5124,6 +5618,7 @@ mod tests {
             count_allocated_in_l2_extended(
                 &buf,
                 65536,
+                3,
                 0,
                 2 * 65536,
                 false,
@@ -5137,6 +5632,7 @@ mod tests {
             count_allocated_in_l2_extended(
                 &buf,
                 65536,
+                3,
                 0,
                 65536,
                 false,
@@ -5157,7 +5653,7 @@ mod tests {
         put_ext_entry(&mut buf, 3, OFLAG_COMPRESSED | 0x70000, 0);
         let mut t = TargetUnitTracker::new(65536);
         assert_eq!(
-            count_allocated_in_l2_extended(&buf, 65536, 0, u64::MAX, false, &mut t),
+            count_allocated_in_l2_extended(&buf, 65536, 3, 0, u64::MAX, false, &mut t),
             Ok(2 * 4096 + 65536)
         );
         assert_eq!(t.target_units_with_data, 3);
@@ -5174,6 +5670,7 @@ mod tests {
             count_allocated_in_l2_extended(
                 &buf,
                 65536,
+                3,
                 0,
                 u64::MAX,
                 false,
@@ -5195,7 +5692,7 @@ mod tests {
         put_std_entry(&mut buf, 4, OFLAG_COMPRESSED | 0x30000);
         let mut t = TargetUnitTracker::new(0);
         assert_eq!(
-            walk_l2_standard(&buf, 4096, 0, u64::MAX, false, &mut t).unwrap(),
+            walk_l2_standard(&buf, 4096, 3, 0, u64::MAX, false, &mut t).unwrap(),
             2 * 4096
         );
         // With a data file, COPIED at host offset 0 is NORMAL. A data
@@ -5208,7 +5705,7 @@ mod tests {
         put_std_entry(&mut buf, 3, OFLAG_COPIED | 0x3000 | QCOW_OFLAG_ZERO);
         let mut t = TargetUnitTracker::new(0);
         assert_eq!(
-            walk_l2_standard(&buf, 4096, 0, u64::MAX, true, &mut t).unwrap(),
+            walk_l2_standard(&buf, 4096, 3, 0, u64::MAX, true, &mut t).unwrap(),
             2 * 4096
         );
     }
@@ -5229,33 +5726,33 @@ mod tests {
         put_std_entry(&mut buf, 1, OFLAG_COPIED | 0x2000);
         let mut t = TargetUnitTracker::new(0);
         assert_eq!(
-            walk_l2_standard(&buf, 4096, 0, u64::MAX, true, &mut t),
+            walk_l2_standard(&buf, 4096, 3, 0, u64::MAX, true, &mut t),
             Err(refused(0x1000, M))
         );
         // Past virtual_size the entry has no guest-visible meaning.
         let mut t = TargetUnitTracker::new(0);
         assert_eq!(
-            walk_l2_standard(&buf, 4096, 0, 4096, true, &mut t),
+            walk_l2_standard(&buf, 4096, 3, 0, 4096, true, &mut t),
             Ok(4096)
         );
         // Without a data file both rules are off.
         let mut t = TargetUnitTracker::new(0);
         assert_eq!(
-            walk_l2_standard(&buf, 4096, 0, u64::MAX, false, &mut t),
+            walk_l2_standard(&buf, 4096, 3, 0, u64::MAX, false, &mut t),
             Ok(4096)
         );
         assert_eq!(
-            classify_qcow2_l2_standard(OFLAG_COPIED | 0x2000, 0x1000, 4096, true),
+            classify_qcow2_l2_standard(OFLAG_COPIED | 0x2000, 0x1000, 4096, 3, true),
             Err(refused(0x1000, M))
         );
         put_std_entry(&mut buf, 1, OFLAG_COMPRESSED | 0x30000);
         let mut t = TargetUnitTracker::new(0);
         assert_eq!(
-            walk_l2_standard(&buf, 4096, 0, u64::MAX, true, &mut t),
+            walk_l2_standard(&buf, 4096, 3, 0, u64::MAX, true, &mut t),
             Err(refused(0x1000, C))
         );
         assert_eq!(
-            classify_qcow2_l2_standard(OFLAG_COMPRESSED | 0x30000, 0x1000, 4096, true),
+            classify_qcow2_l2_standard(OFLAG_COMPRESSED | 0x30000, 0x1000, 4096, 3, true),
             Err(refused(0x1000, C))
         );
 
@@ -5273,6 +5770,7 @@ mod tests {
                 count_allocated_in_l2_extended(
                     &buf,
                     65536,
+                    3,
                     0x10_0000,
                     u64::MAX,
                     true,
@@ -5290,7 +5788,7 @@ mod tests {
                 let mut sink = MapExtentCoalescer::new(&mut emit);
                 assert_eq!(
                     classify_qcow2_l2_extended(
-                        entry, bitmap, 0x11_0000, 65536, 65536, true, &mut sink
+                        entry, bitmap, 0x11_0000, 65536, 65536, 3, true, &mut sink
                     ),
                     Err(refused(0x11_0000, violation)),
                     "entry {entry:#x} bitmap {bitmap:#x}"
@@ -5359,7 +5857,7 @@ mod tests {
         put_std_entry(&mut buf, 16, 0x20000);
         put_std_entry(&mut buf, 17, 0x30000);
         let mut t = TargetUnitTracker::new(65536);
-        let allocated = walk_l2_standard(&buf, 4096, 0, u64::MAX, false, &mut t).unwrap();
+        let allocated = walk_l2_standard(&buf, 4096, 3, 0, u64::MAX, false, &mut t).unwrap();
         assert_eq!(allocated, 3 * 4096);
         // Entry 0 covers virtual [0, 4096) → unit 0.
         // Entry 16 covers virtual [65536, 69632) → unit 1.
@@ -5374,7 +5872,7 @@ mod tests {
         let mut buf = [0u8; 8 * 8];
         put_std_entry(&mut buf, 0, 0x10000);
         let mut t = TargetUnitTracker::new(65536);
-        let _ = walk_l2_standard(&buf, 4096, 1 << 30, u64::MAX, false, &mut t).unwrap();
+        let _ = walk_l2_standard(&buf, 4096, 3, 1 << 30, u64::MAX, false, &mut t).unwrap();
         // After the call, last_unit_idx should reflect the high offset.
         assert_eq!(t.last_unit_idx, (1u64 << 30) / 65536);
     }
@@ -5398,7 +5896,7 @@ mod tests {
         put_std_entry(&mut buf, 2, 0x30000);
         put_std_entry(&mut buf, 3, 0x40000);
         let mut t = TargetUnitTracker::new(0);
-        let allocated = walk_l2_standard(&buf, 4096, 0, 8192, false, &mut t).unwrap();
+        let allocated = walk_l2_standard(&buf, 4096, 3, 0, 8192, false, &mut t).unwrap();
         assert_eq!(allocated, 2 * 4096);
     }
 
@@ -5410,7 +5908,7 @@ mod tests {
         put_std_entry(&mut buf, 0, 0x10000);
         put_std_entry(&mut buf, 1, 0x20000);
         let mut t = TargetUnitTracker::new(0);
-        let allocated = walk_l2_standard(&buf, 4096, 0, 6000, false, &mut t).unwrap();
+        let allocated = walk_l2_standard(&buf, 4096, 3, 0, 6000, false, &mut t).unwrap();
         assert_eq!(allocated, 4096 + 1904);
     }
 
@@ -5426,7 +5924,7 @@ mod tests {
         let virtual_size: u64 = 8192;
         let target_unit: u64 = 4096;
         let mut t = TargetUnitTracker::new(target_unit);
-        let _ = walk_l2_standard(&buf, 4096, 0, virtual_size, false, &mut t).unwrap();
+        let _ = walk_l2_standard(&buf, 4096, 3, 0, virtual_size, false, &mut t).unwrap();
         let cap = virtual_size.div_ceil(target_unit);
         assert!(
             t.target_units_with_data <= cap,
@@ -5448,6 +5946,7 @@ mod tests {
             count_allocated_in_l2_extended(
                 &buf,
                 65536,
+                3,
                 0,
                 65536,
                 false,
@@ -5469,6 +5968,7 @@ mod tests {
             count_allocated_in_l2_extended(
                 &buf,
                 65536,
+                3,
                 0,
                 30000,
                 false,
@@ -5485,7 +5985,7 @@ mod tests {
 
     #[test]
     fn classify_standard_zero_is_hole() {
-        let e = classify_qcow2_l2_standard(0, 0, 65536, false).unwrap();
+        let e = classify_qcow2_l2_standard(0, 0, 65536, 3, false).unwrap();
         assert_eq!(e.start, 0);
         assert_eq!(e.length, 65536);
         assert_eq!(e.state, MapExtentState::Hole);
@@ -5494,7 +5994,7 @@ mod tests {
     #[test]
     fn classify_standard_normal_is_data() {
         // host_offset = 0x50000, no flag bits.
-        let e = classify_qcow2_l2_standard(0x0005_0000, 0, 65536, false).unwrap();
+        let e = classify_qcow2_l2_standard(0x0005_0000, 0, 65536, 3, false).unwrap();
         assert_eq!(
             e.state,
             MapExtentState::Data {
@@ -5507,7 +6007,7 @@ mod tests {
     fn classify_standard_compressed_is_data() {
         // OFLAG_COMPRESSED set; offset bits in L2_OFFSET_MASK range.
         let entry = OFLAG_COMPRESSED | 0x0001_2000;
-        let e = classify_qcow2_l2_standard(entry, 65536, 65536, false).unwrap();
+        let e = classify_qcow2_l2_standard(entry, 65536, 65536, 3, false).unwrap();
         assert_eq!(e.start, 65536);
         assert_eq!(e.length, 65536);
         // file_offset masked with L2_OFFSET_MASK.
@@ -5524,7 +6024,7 @@ mod tests {
     fn classify_standard_oflag_copied_only_is_hole() {
         // OFLAG_COPIED is bit 63; on its own with no offset and no
         // external data file the entry is UNALLOCATED_PLAIN.
-        let e = classify_qcow2_l2_standard(OFLAG_COPIED, 0, 65536, false).unwrap();
+        let e = classify_qcow2_l2_standard(OFLAG_COPIED, 0, 65536, 3, false).unwrap();
         assert_eq!(e.state, MapExtentState::Hole);
     }
 
@@ -5534,17 +6034,17 @@ mod tests {
         // NORMAL cluster at data-file offset 0 (block/qcow2.h:724-733):
         // qemu-img map reports a data-file image's cluster 0 as data at
         // offset 0.
-        let e = classify_qcow2_l2_standard(OFLAG_COPIED, 0, 65536, true).unwrap();
+        let e = classify_qcow2_l2_standard(OFLAG_COPIED, 0, 65536, 3, true).unwrap();
         assert_eq!(e.state, MapExtentState::Data { file_offset: 0 });
         // Without COPIED it is still unallocated.
-        let e = classify_qcow2_l2_standard(0, 0, 65536, true).unwrap();
+        let e = classify_qcow2_l2_standard(0, 0, 65536, 3, true).unwrap();
         assert_eq!(e.state, MapExtentState::Hole);
     }
 
     #[test]
     fn classify_standard_oflag_copied_with_offset_is_data() {
         let entry = OFLAG_COPIED | 0x0001_0000;
-        let e = classify_qcow2_l2_standard(entry, 0, 65536, false).unwrap();
+        let e = classify_qcow2_l2_standard(entry, 0, 65536, 3, false).unwrap();
         assert_eq!(
             e.state,
             MapExtentState::Data {
@@ -5603,6 +6103,7 @@ mod tests {
                     virtual_offset,
                     cluster_size,
                     cluster_visible,
+                    3,
                     has_data_file,
                     &mut sink,
                 ),
@@ -5703,7 +6204,10 @@ mod tests {
         // 1 Data extent then 1 HoleAt extent (31 UNALLOCATED_ALLOC
         // subclusters, coalesced, at the host offset that follows).
         let alloc: u64 = 1;
-        let host_offset: u64 = 0x8000;
+        // Cluster-aligned, as qemu requires of every entry naming a
+        // host cluster (#812): 0x8000 is half of a 64 KiB cluster, and
+        // an image carrying it is one qemu-img refuses to read.
+        let host_offset: u64 = 0x1_0000;
         let (buf, count) = extract_extents(host_offset, alloc, 0, 65536, 65536);
         assert_eq!(count, 2);
         assert_eq!(
@@ -5747,6 +6251,7 @@ mod tests {
                         0x20_0000,
                         65536,
                         65536,
+                        3,
                         has_data_file,
                         &mut sink
                     ),
@@ -5843,7 +6348,7 @@ mod tests {
     fn classify_standard_compressed_offset_masked() {
         // Make sure high garbage bits don't leak into file_offset.
         let entry = OFLAG_COMPRESSED | OFLAG_COPIED | 0x0007_0000;
-        let e = classify_qcow2_l2_standard(entry, 0, 65536, false).unwrap();
+        let e = classify_qcow2_l2_standard(entry, 0, 65536, 3, false).unwrap();
         let want = entry & L2_OFFSET_MASK;
         assert_eq!(e.state, MapExtentState::Data { file_offset: want });
     }
@@ -6591,6 +7096,105 @@ mod tests {
         true
     }
 
+    // ------------------------------------------------------------------
+    // Qcow2State::init over an in-memory header
+    // ------------------------------------------------------------------
+
+    /// The bytes device 0 serves to `Qcow2State::init` in the tests
+    /// below. A global with a lock because the mock callback is an
+    /// `extern "C" fn` and can close over nothing else, as every other
+    /// mock in this module does.
+    static mut INIT_IMAGE: [u8; 512] = [0u8; 512];
+    static INIT_IMAGE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    unsafe extern "C" fn init_image_read_sector(
+        _device_idx: u32,
+        sector: u64,
+        out_buf: *mut u8,
+        sector_size: usize,
+    ) -> bool {
+        if sector_size > 512 {
+            return false;
+        }
+        // Sector 0 is the header under test; the rest of the device
+        // reads as zeros, which is what a sparse image's unwritten
+        // metadata looks like.
+        core::ptr::write_bytes(out_buf, 0, sector_size);
+        if sector == 0 {
+            let image = core::ptr::addr_of!(INIT_IMAGE) as *const u8;
+            core::ptr::copy_nonoverlapping(image, out_buf, sector_size);
+        }
+        true
+    }
+
+    /// Run `Qcow2State::init` over a 512-byte header.
+    ///
+    /// The guest reader parses the header itself rather than going
+    /// through `QcowHeader::parse`, so its own validation needs its own
+    /// cover.
+    fn init_over_header(header: &[u8; 512]) -> Option<Qcow2State> {
+        let _guard = INIT_IMAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut l1 = std::vec![0u8; MAX_SECTOR_SIZE];
+        let mut l2 = std::vec![0u8; MAX_SECTOR_SIZE];
+        let mut bytes_read = 0u64;
+        unsafe {
+            let image = core::ptr::addr_of_mut!(INIT_IMAGE) as *mut u8;
+            core::ptr::copy_nonoverlapping(header.as_ptr(), image, 512);
+            let call_table = shared::CallTable {
+                read_input_sector: init_image_read_sector,
+                ..stub_call_table()
+            };
+            Qcow2State::init(
+                &call_table,
+                0,
+                512,
+                // A megabyte of device, so nothing fails for want of
+                // capacity: the header under test is what decides.
+                2048,
+                l1.as_mut_ptr(),
+                l2.as_mut_ptr(),
+                &mut bytes_read,
+            )
+        }
+    }
+
+    #[test]
+    fn the_guest_reader_refuses_extended_l2_below_the_subcluster_floor() {
+        // `Qcow2State::init` reads the header field by field rather
+        // than through `QcowHeader::parse`, so the subcluster floor has
+        // to be applied there too (issue #805). The host refuses such
+        // an image before the guest runs, but the guest is told the
+        // format rather than probing for it.
+        let mut header = make_qcow2_header();
+        header[INCOMPATIBLE_FEATURES_OFFSET..INCOMPATIBLE_FEATURES_OFFSET + 8]
+            .copy_from_slice(&INCOMPAT_EXTENDED_L2.to_be_bytes());
+
+        for bits in 9..MIN_EXTENDED_L2_CLUSTER_BITS {
+            let mut small = header;
+            small[CLUSTER_BITS_OFFSET..CLUSTER_BITS_OFFSET + 4]
+                .copy_from_slice(&bits.to_be_bytes());
+            assert!(
+                init_over_header(&small).is_none(),
+                "cluster_bits {bits} with extended L2 must not open"
+            );
+        }
+
+        // At the floor, and without the feature, the same image opens.
+        let mut at_floor = header;
+        at_floor[CLUSTER_BITS_OFFSET..CLUSTER_BITS_OFFSET + 4]
+            .copy_from_slice(&MIN_EXTENDED_L2_CLUSTER_BITS.to_be_bytes());
+        let state = init_over_header(&at_floor).expect("512-byte subclusters open");
+        assert!(state.extended_l2);
+        assert_eq!(state.version, 3);
+
+        let mut plain = make_qcow2_header();
+        plain[CLUSTER_BITS_OFFSET..CLUSTER_BITS_OFFSET + 4].copy_from_slice(&12u32.to_be_bytes());
+        assert!(
+            init_over_header(&plain).is_some(),
+            "a 4 KiB cluster without extended L2 is ordinary"
+        );
+    }
+
     fn read_test_call_table() -> shared::CallTable {
         shared::CallTable {
             read_input_sector: read_test_sector,
@@ -6869,6 +7473,7 @@ mod tests {
     fn z432_state(l1_cache: &mut [u8], l2_cache: &mut [u8]) -> Qcow2State {
         Qcow2State {
             device_idx: 0,
+            version: 3,
             cluster_size: Z432_SSZ as u64,
             cluster_bits: 9,
             l1_size: 1,
@@ -6983,7 +7588,7 @@ mod tests {
     #[test]
     fn classify_standard_zero_flag_host_zero_is_zeroallocated() {
         // QCOW_OFLAG_ZERO with host_offset == 0 (ZERO_PLAIN).
-        let e = classify_qcow2_l2_standard(QCOW_OFLAG_ZERO, 0, 65536, false).unwrap();
+        let e = classify_qcow2_l2_standard(QCOW_OFLAG_ZERO, 0, 65536, 3, false).unwrap();
         assert_eq!(e.state, MapExtentState::ZeroAllocated);
     }
 
@@ -6995,7 +7600,7 @@ mod tests {
         // (block/qcow2.c:2171-2177; measured on qemu-img 10.0.13 as
         // `"present": true, "zero": true, "data": false, "offset": ...`).
         let entry = 0x0005_0000 | OFLAG_COPIED | QCOW_OFLAG_ZERO;
-        let e = classify_qcow2_l2_standard(entry, 0, 65536, false).unwrap();
+        let e = classify_qcow2_l2_standard(entry, 0, 65536, 3, false).unwrap();
         assert_eq!(
             e.state,
             MapExtentState::ZeroAllocatedAt {
@@ -7309,6 +7914,7 @@ mod tests {
         }
         Qcow2State {
             device_idx: 0,
+            version: 3,
             cluster_size: SC_CLUSTER,
             cluster_bits: SC_CLUSTER_BITS,
             l1_size: 1,
@@ -7402,6 +8008,7 @@ mod tests {
         if bc != 0 {
             chain_states.qcow2_states[backing_idx] = Some(Qcow2State {
                 device_idx: backing_idx as u32,
+                version: 3,
                 cluster_size: bc,
                 cluster_bits: bc.trailing_zeros(),
                 l1_size: 1,
@@ -9907,6 +10514,19 @@ mod tests {
         img[off..off + 8].copy_from_slice(&val.to_be_bytes());
     }
 
+    /// Stamp the footer copy at offset 0 with its own checksum, which is
+    /// the last thing a VHD writer does.
+    ///
+    /// Every synthetic image below needs it: a reader that acts on a
+    /// footer's fields verifies the checksum (issue #583), so a fixture
+    /// that leaves the field zero is one no reader will open -- and one
+    /// Hyper-V, qemu and instar's own emitter would never have written.
+    #[cfg(feature = "vhd-input")]
+    fn vhd_stamp_footer_checksum(img: &mut [u8]) {
+        let checksum = vhd::compute_checksum(&img[..vhd::FOOTER_SIZE], vhd::FOOTER_CHECKSUM_OFFSET);
+        vhd_put_u32(img, vhd::FOOTER_CHECKSUM_OFFSET, checksum);
+    }
+
     /// A device in the mock chain: its raw bytes and its detected format.
     #[cfg(feature = "vhd-input")]
     struct VhdDevice {
@@ -9994,6 +10614,7 @@ mod tests {
                 }
             }
         }
+        vhd_stamp_footer_checksum(&mut img);
         img
     }
 
@@ -10034,6 +10655,7 @@ mod tests {
         vhd_put_u32(&mut img, dyn_off + vhd::DYN_MAX_TABLE_ENTRIES_OFFSET, 1);
         vhd_put_u32(&mut img, dyn_off + vhd::DYN_BLOCK_SIZE_OFFSET, block_size);
         vhd_put_u32(&mut img, table_offset as usize, vhd::BAT_UNALLOCATED);
+        vhd_stamp_footer_checksum(&mut img);
         img
     }
 
@@ -10081,6 +10703,7 @@ mod tests {
         for i in 0..block_size as u64 {
             img[payload0_off + i as usize] = vhd_child_byte(payload0_off as u64 + i);
         }
+        vhd_stamp_footer_checksum(&mut img);
         img
     }
 
@@ -10210,6 +10833,134 @@ mod tests {
     // backing device. `is_differencing` is false throughout, so neither
     // the sector-bitmap composition nor the differencing child's
     // bottom-of-chain refusal is ever reached.
+    /// A dynamic VHD whose BAT places a block on the image's own
+    /// metadata is refused, rather than serving that metadata to the
+    /// guest as payload.
+    ///
+    /// With a BAT entry of 0, the block's sector bitmap lands on the
+    /// footer copy and its payload on the dynamic header, so a read of
+    /// guest block 0 returned `cxsparse...` -- the image's own
+    /// structure. Measured against qemu-img 10.0.13, which reads the
+    /// same bytes out, so this is deliberately stricter than qemu and
+    /// matches what instar's VHDX reader already does (issue #662).
+    #[cfg(feature = "vhd-input")]
+    #[test]
+    fn vhd_arm_refuses_a_block_placed_on_the_images_own_metadata() {
+        let block_size = 4096u32;
+        let sound = build_vhd_dynamic_two_block(block_size);
+        let parent = build_vhd_parent_raw(2 * block_size as usize);
+
+        // Sound as built: block 0 is allocated at sector 8.
+        let devices = [
+            VhdDevice {
+                bytes: sound.clone(),
+                format: ImageFormat::Vhd,
+            },
+            VhdDevice {
+                bytes: parent.clone(),
+                format: ImageFormat::Raw,
+            },
+        ];
+        let (ok, _) = run_vhd_chain_read(&devices, 512, 0, block_size as u64);
+        assert!(ok, "the sound fixture must read, or this proves nothing");
+
+        // Repoint block 0 at sector 0: its bitmap covers the footer copy
+        // and its payload the dynamic header.
+        for entry in [0u32, 1, 3] {
+            let mut crafted = sound.clone();
+            let table_offset = 1536usize;
+            vhd_put_u32(&mut crafted, table_offset, entry);
+            let devices = [
+                VhdDevice {
+                    bytes: crafted,
+                    format: ImageFormat::Vhd,
+                },
+                VhdDevice {
+                    bytes: parent.clone(),
+                    format: ImageFormat::Raw,
+                },
+            ];
+            let (ok, out) = run_vhd_chain_read(&devices, 512, 0, block_size as u64);
+            assert!(
+                !ok,
+                "BAT entry {entry} places a block on the image's own metadata and \
+                 must be refused; the read returned {:?}",
+                &out[..8]
+            );
+        }
+    }
+
+    /// A dynamic VHD whose footer copy at offset 0 carries the cookie
+    /// and a wrong checksum is refused, not re-read from its trailing
+    /// footer.
+    ///
+    /// The fallback to the last sector exists for a fixed VHD, which
+    /// keeps no copy at offset 0 at all. Using it for a *bad* copy
+    /// would open an image qemu's vpc driver refuses ("Incorrect header
+    /// checksum") with the image's two footers disagreeing about its
+    /// own geometry, so `init` tells "no footer here" from "a footer
+    /// here that does not hold up" (issue #583).
+    ///
+    /// This is the reader's own guard rather than format detection's:
+    /// detection refuses such an image too, but the guest is told the
+    /// format by the host, which can learn it from a parent image's
+    /// recorded backing format rather than by probing.
+    #[cfg(feature = "vhd-input")]
+    #[test]
+    fn vhd_init_refuses_a_bad_footer_copy_rather_than_falling_back() {
+        let block_size = 4096u32;
+        let good = build_vhd_dynamic_two_block(block_size);
+
+        // The trailing footer is sound in both images: a dynamic VHD's
+        // copy at 0 and its real footer are byte-identical, so this is
+        // exactly the shape where a fallback would succeed.
+        let mut with_tail = good.clone();
+        let tail = with_tail.len() - vhd::FOOTER_SIZE;
+        let footer: std::vec::Vec<u8> = good[..vhd::FOOTER_SIZE].to_vec();
+        with_tail[tail..].copy_from_slice(&footer);
+
+        let mut bad = with_tail.clone();
+        vhd_put_u32(&mut bad, vhd::FOOTER_CHECKSUM_OFFSET, 0xdead_beef);
+
+        for (name, img, expect_some) in [
+            ("a sound footer copy", with_tail, true),
+            ("a footer copy whose checksum fails", bad, false),
+        ] {
+            let _guard = VHD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let mut bat_buf = std::vec![0u8; MAX_SECTOR_SIZE];
+            let mut data_buf = std::vec![0u8; MAX_SECTOR_SIZE];
+            let mut bytes_read = 0u64;
+            unsafe {
+                VHD_SSZ = 512;
+                let imgs = core::ptr::addr_of_mut!(VHD_IMAGES) as *mut *const u8;
+                let lens = core::ptr::addr_of_mut!(VHD_LENS) as *mut usize;
+                *imgs = img.as_ptr();
+                *lens = img.len();
+                for i in 1..VHD_MAX_DEVS {
+                    *imgs.add(i) = core::ptr::null();
+                    *lens.add(i) = 0;
+                }
+                let call_table = vhd_call_table();
+                let cap = (call_table.get_input_capacity)(0);
+                let state = VhdState::init(
+                    &call_table,
+                    0,
+                    512,
+                    cap,
+                    bat_buf.as_mut_ptr(),
+                    data_buf.as_mut_ptr(),
+                    &mut bytes_read,
+                );
+                assert_eq!(
+                    state.is_some(),
+                    expect_some,
+                    "{name}: init should {} the image",
+                    if expect_some { "open" } else { "refuse" }
+                );
+            }
+        }
+    }
+
     #[cfg(feature = "vhd-input")]
     #[test]
     fn vhd_arm_dynamic_reads_as_a_plain_dynamic_vhd() {
@@ -16850,6 +17601,24 @@ pub unsafe fn read_chain_virtual_cluster(
                         );
                         return false;
                     }
+                    Some(ClusterLookup::Malformed(violation)) => {
+                        // qemu fails the read with EIO on both rules
+                        // (block/qcow2-cluster.c:657-694 at v10.0.0).
+                        // Reading on would serve the bytes at an
+                        // offset qemu calls invalid, or zero-fill a
+                        // pre-v3 cluster whose host offset holds data
+                        // (#812).
+                        let virtual_offset = virtual_offset - virtual_offset % qcow2_cluster_size;
+                        send_refused_l2_entry(
+                            call_table,
+                            dev_idx as u32,
+                            RefusedL2Entry::Malformed {
+                                virtual_offset,
+                                violation,
+                            },
+                        );
+                        return false;
+                    }
                     Some(ClusterLookup::DataFileRefused(violation)) => {
                         // qemu fails the read with EIO before it reads
                         // anything (block/qcow2-cluster.c:668-675 and
@@ -18372,6 +19141,30 @@ unsafe fn send_data_file_entry_refusal(
     );
 }
 
+/// Report that a read or metadata walk refused an L2 entry under one of
+/// qemu's two host-offset corruption rules (#812), on the `send_error`
+/// channel, as [`send_data_file_entry_refusal`] does for the data-file
+/// rules. `guest_cluster_offset` travels in the `sector` argument as a
+/// byte offset and the rule's status code in `status`; see
+/// [`shared::MalformedL2EntryRefusal`].
+///
+/// # Safety
+///
+/// `call_table` must be a valid initialised [`CallTable`].
+#[allow(clippy::manual_c_str_literals)]
+unsafe fn send_malformed_l2_entry_refusal(
+    call_table: &CallTable,
+    guest_cluster_offset: u64,
+    violation: MalformedEntryViolation,
+) {
+    (call_table.send_error)(
+        shared::MalformedL2EntryRefusal::OPERATION_C.as_ptr(),
+        b"input\0".as_ptr(),
+        guest_cluster_offset,
+        violation.status(),
+    );
+}
+
 /// Raise the named refusal a metadata walk or the chain reader found.
 ///
 /// # Safety
@@ -18386,6 +19179,10 @@ unsafe fn send_refused_l2_entry(call_table: &CallTable, dev_idx: u32, refused: R
             virtual_offset,
             violation,
         } => send_data_file_entry_refusal(call_table, virtual_offset, violation),
+        RefusedL2Entry::Malformed {
+            virtual_offset,
+            violation,
+        } => send_malformed_l2_entry_refusal(call_table, virtual_offset, violation),
     }
 }
 

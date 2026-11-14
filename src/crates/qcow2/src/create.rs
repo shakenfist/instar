@@ -201,6 +201,19 @@ pub fn compute_layout(
     if !(MIN_CLUSTER_BITS..=MAX_CLUSTER_BITS).contains(&cluster_bits) {
         return Err(Qcow2CreateError::InvalidClusterBits);
     }
+    // An extended-L2 image needs subclusters of at least 512 bytes, so
+    // clusters of at least 16 KiB. `qemu-img create` refuses anything
+    // smaller ("Extended L2 entries are only supported with cluster
+    // sizes of at least 16384 bytes") and its qcow2 driver refuses to
+    // open such an image ("Unsupported subcluster size: 128").
+    //
+    // Refused here as well as on the read side (issue #805): without
+    // it `create -f qcow2 -o extended_l2=on,cluster_size=4k` wrote an
+    // image qemu-img cannot open and instar can no longer read -- a
+    // file with no reader at all.
+    if extended_l2 && cluster_bits < crate::MIN_EXTENDED_L2_CLUSTER_BITS {
+        return Err(Qcow2CreateError::InvalidClusterBits);
+    }
     if !matches!(refcount_bits, 1 | 2 | 4 | 8 | 16 | 32 | 64) {
         return Err(Qcow2CreateError::InvalidRefcountBits);
     }

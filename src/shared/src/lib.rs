@@ -3409,6 +3409,84 @@ impl DataFileEntryRefusal {
 }
 
 // ============================================================================
+// qcow2 malformed L2 entry refusal signal
+// ============================================================================
+
+/// The `send_error` channel used to report that a qcow2 read or
+/// metadata walk refused an L2 entry for one of the two corruption
+/// checks qemu applies when it turns an entry into a host offset
+/// (`qcow2_get_host_offset`, `block/qcow2-cluster.c:657-694` at qemu
+/// v10.0.0), rather than in the subcluster classifier instar
+/// transcribes:
+///
+/// * a host cluster offset that is not cluster-aligned, which qemu
+///   reports as "Cluster allocation offset %#llx unaligned" and fails
+///   with `EIO` (`:686-694`). It applies to every image, not only one
+///   with a data file;
+/// * the all-zeroes flag set in a pre-v3 image, where the flag does not
+///   exist: "Zero cluster entry found in pre-v3 image" (`:657-664`).
+///   Without the rule instar read the cluster as zeros, where the
+///   cluster's own host offset holds data.
+///
+/// Both were quiet wrong answers rather than failures: `map` handed out
+/// a host offset qemu calls invalid, `measure` counted the cluster, and
+/// `convert` zero-filled a cluster holding data (#812).
+///
+/// It travels as [`DataFileEntryRefusal`] does: the guest calls
+/// `send_error(operation, device, sector, status)` with
+/// [`MalformedL2EntryRefusal::OPERATION`] as the operation string, and
+/// the host's `SerialDecoder` captures it and renders it in place of
+/// the generic failure text.
+///
+/// The `sector` argument carries the **virtual byte offset of the
+/// cluster** whose entry was refused, not a sector number. `status`
+/// carries which rule the entry breaks, one of the `STATUS_*`
+/// constants.
+pub struct MalformedL2EntryRefusal;
+
+impl MalformedL2EntryRefusal {
+    /// Reserved `send_error` operation marker for this signal. Distinct
+    /// from every real operation name, from `"cpu-exception"`, from
+    /// [`DifferencingRefusal::OPERATION`], from
+    /// [`InvalidL2EntryRefusal::OPERATION`] and from
+    /// [`DataFileEntryRefusal::OPERATION`], so the host's decoder can
+    /// tell the `send_error` uses apart.
+    pub const OPERATION: &'static str = "qcow2-malformed-l2-entry";
+
+    /// The same marker as [`Self::OPERATION`], NUL-terminated, for the
+    /// call table's `send_error`.
+    /// `malformed_l2_entry_marker_c_string_matches_operation` asserts
+    /// the two spellings agree.
+    pub const OPERATION_C: &'static [u8] = b"qcow2-malformed-l2-entry\0";
+
+    // Status codes are stable: only appended, never reordered.
+    /// A host cluster offset that is not a multiple of the cluster size.
+    pub const STATUS_UNALIGNED_HOST_OFFSET: u32 = 1;
+    /// The all-zeroes flag in an image whose version predates it.
+    pub const STATUS_ZERO_FLAG_PRE_V3: u32 = 2;
+}
+
+/// `info`'s refusal of a VHD whose footer copy at offset 0 fails its
+/// checksum (issue #583), raised on `send_error`.
+///
+/// Header detection calls a `conectix` cookie at offset 0 a VHD, as
+/// qemu's probe does, so verifying the copy is the reader's job. `info`
+/// has no result to send for an image it will not read, so the reason
+/// travels on `send_error`, and the host renders it in qemu's wording
+/// ("Incorrect header checksum") rather than reporting nothing.
+pub struct VhdFooterChecksumRefusal;
+
+impl VhdFooterChecksumRefusal {
+    /// Reserved `send_error` operation marker for this signal, distinct
+    /// from every real operation name and every other refusal marker.
+    pub const OPERATION: &'static str = "vhd-footer-checksum";
+
+    /// The same marker as [`Self::OPERATION`], NUL-terminated, for the
+    /// call table's `send_error`.
+    pub const OPERATION_C: &'static [u8] = b"vhd-footer-checksum\0";
+}
+
+// ============================================================================
 // Snapshot configuration and result structures
 // ============================================================================
 
@@ -7004,6 +7082,77 @@ mod tests {
             !DataFileEntryRefusal::OPERATION.as_bytes().contains(&0),
             "OPERATION must not embed a NUL, or the C marker truncates it"
         );
+    }
+
+    #[test]
+    fn malformed_l2_entry_operation_marker_is_distinct_from_the_other_senders() {
+        assert_eq!(
+            MalformedL2EntryRefusal::OPERATION,
+            "qcow2-malformed-l2-entry"
+        );
+        for other in [
+            "cpu-exception",
+            DifferencingRefusal::OPERATION,
+            InvalidL2EntryRefusal::OPERATION,
+            DataFileEntryRefusal::OPERATION,
+        ] {
+            assert_ne!(MalformedL2EntryRefusal::OPERATION, other);
+        }
+    }
+
+    #[test]
+    fn vhd_footer_checksum_marker_is_distinct_and_matches_its_c_string() {
+        for other in [
+            "cpu-exception",
+            "info",
+            DifferencingRefusal::OPERATION,
+            InvalidL2EntryRefusal::OPERATION,
+            DataFileEntryRefusal::OPERATION,
+            MalformedL2EntryRefusal::OPERATION,
+        ] {
+            assert_ne!(VhdFooterChecksumRefusal::OPERATION, other);
+        }
+        let c = VhdFooterChecksumRefusal::OPERATION_C;
+        assert_eq!(
+            c.last().copied(),
+            Some(0),
+            "the C marker must be NUL-terminated"
+        );
+        assert_eq!(
+            &c[..c.len() - 1],
+            VhdFooterChecksumRefusal::OPERATION.as_bytes()
+        );
+    }
+
+    #[test]
+    fn malformed_l2_entry_marker_c_string_matches_operation() {
+        // As for the other two entry refusals: a drift between the C
+        // string the guest raises and the &str the host compares means
+        // the refusal is raised and never captured, and the failure
+        // reverts to the generic text with no reason in it.
+        let c = MalformedL2EntryRefusal::OPERATION_C;
+        assert_eq!(
+            c.last().copied(),
+            Some(0),
+            "the C marker must be NUL-terminated"
+        );
+        assert_eq!(
+            &c[..c.len() - 1],
+            MalformedL2EntryRefusal::OPERATION.as_bytes(),
+            "the C marker must spell the same operation as OPERATION"
+        );
+        assert!(
+            !MalformedL2EntryRefusal::OPERATION.as_bytes().contains(&0),
+            "OPERATION must not embed a NUL, or the C marker truncates it"
+        );
+    }
+
+    #[test]
+    fn malformed_l2_entry_status_codes_are_stable() {
+        // The host renders by code, so reordering these would relabel
+        // every refusal a deployed guest binary raises.
+        assert_eq!(MalformedL2EntryRefusal::STATUS_UNALIGNED_HOST_OFFSET, 1);
+        assert_eq!(MalformedL2EntryRefusal::STATUS_ZERO_FLAG_PRE_V3, 2);
     }
 
     #[test]

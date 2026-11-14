@@ -926,6 +926,38 @@ struct SerialDecoder {
     /// `shared::DataFileEntryRefusal::OPERATION`. Same pattern as
     /// `last_invalid_l2_entry`, and rendered wherever that is.
     last_data_file_entry: Option<(u64, u32)>,
+    /// The last qcow2 L2 entry the guest refused under one of qemu's
+    /// two host-offset corruption rules (#812) -- an unaligned host
+    /// cluster offset, or the all-zeroes flag in a pre-v3 image -- as
+    /// `(guest cluster offset, status)`: the `sector` and `status`
+    /// fields of an `error` message whose `operation` is
+    /// `shared::MalformedL2EntryRefusal::OPERATION`. Same pattern as
+    /// `last_data_file_entry`, and rendered wherever that is.
+    last_malformed_l2_entry: Option<(u64, u32)>,
+    /// Whether `info` refused a VHD whose footer copy at offset 0 fails
+    /// its checksum: an `error` message whose `operation` is
+    /// `shared::VhdFooterChecksumRefusal::OPERATION` (issue #583). `info`
+    /// sends no result for an image it will not read, so this is what
+    /// [`info_without_a_result`] renders in place of the generic text.
+    vhd_footer_checksum_refused: bool,
+}
+
+/// The error for an `info` run that ended without a result.
+///
+/// The guest sends no result for an image it refuses, and both info run
+/// loops used to treat that differently: the chain-discovery one failed
+/// with generic text, and `instar info` itself printed nothing and
+/// exited 0. Both now fail, and name the reason when the guest gave one.
+fn info_without_a_result(decoder: &SerialDecoder, input: &str) -> String {
+    if decoder.vhd_footer_checksum_refused {
+        // qemu-img's wording: `Could not open 'X': Incorrect header checksum`.
+        format!(
+            "Could not open '{input}': Incorrect header checksum \
+             (the VHD footer copy at offset 0 does not match its checksum)"
+        )
+    } else {
+        "No info result received from guest".to_string()
+    }
 }
 
 /// Maximum serial decoder buffer size: frame header + max protobuf message
@@ -940,28 +972,72 @@ impl SerialDecoder {
             last_differencing_refusal: None,
             last_invalid_l2_entry: None,
             last_data_file_entry: None,
+            last_malformed_l2_entry: None,
+            vhd_footer_checksum_refused: false,
         }
     }
 
-    /// Whether the guest refused a qcow2 L2 entry by name, either as an
-    /// invalid entry or under a data-file rule. A run loop that saw one
-    /// renders [`Self::l2_entry_refusal_error`] instead of its own
-    /// result or failure text.
+    /// Whether the guest refused a qcow2 L2 entry by name: as an invalid
+    /// entry, under a data-file rule, or under one of qemu's two
+    /// host-offset corruption rules. A run loop that saw one renders
+    /// [`Self::l2_entry_refusal_error`] instead of its own result or
+    /// failure text.
     fn l2_entry_refused(&self) -> bool {
-        self.last_invalid_l2_entry.is_some() || self.last_data_file_entry.is_some()
+        self.last_invalid_l2_entry.is_some()
+            || self.last_data_file_entry.is_some()
+            || self.last_malformed_l2_entry.is_some()
     }
 
     /// The terminal error for a read or metadata walk the guest ended by
-    /// refusing a qcow2 L2 entry: [`Self::data_file_entry_error`] or
+    /// refusing a qcow2 L2 entry: [`Self::malformed_l2_entry_error`],
+    /// [`Self::data_file_entry_error`] or
     /// [`Self::invalid_l2_entry_error`], whichever the decoder captured.
-    /// The two are kept behind one entry point so that an operation that
-    /// renders one cannot forget the other (#665 was a refusal raised
-    /// with no renderer).
+    /// The three are kept behind one entry point so that an operation
+    /// that renders one cannot forget the others (#665 was a refusal
+    /// raised with no renderer).
     fn l2_entry_refusal_error(&self, op: &str) -> String {
-        if self.last_data_file_entry.is_some() {
+        if self.last_malformed_l2_entry.is_some() {
+            self.malformed_l2_entry_error(op)
+        } else if self.last_data_file_entry.is_some() {
             self.data_file_entry_error(op)
         } else {
             self.invalid_l2_entry_error(op)
+        }
+    }
+
+    /// Format the terminal error for a read or walk the guest refused
+    /// under one of qemu's two host-offset corruption rules (#812).
+    /// Sibling to [`Self::data_file_entry_error`].
+    ///
+    /// The wording is qemu's (`block/qcow2-cluster.c:659-662` and
+    /// `:688-692` at v10.0.0), so a user who has seen `qemu-img` refuse
+    /// the image recognises the same refusal here. qemu also prints the
+    /// L2 table's offset and the entry's index, which the refusal does
+    /// not carry; the guest cluster offset it names is the virtual
+    /// offset given here.
+    fn malformed_l2_entry_error(&self, op: &str) -> String {
+        match self.last_malformed_l2_entry {
+            Some((offset, status)) => {
+                let what = match status {
+                    shared::MalformedL2EntryRefusal::STATUS_UNALIGNED_HOST_OFFSET => {
+                        "Cluster allocation offset unaligned"
+                    }
+                    shared::MalformedL2EntryRefusal::STATUS_ZERO_FLAG_PRE_V3 => {
+                        "Zero cluster entry found in pre-v3 image"
+                    }
+                    // Only the guest writes the port, so this is a guest
+                    // that knows a rule this host does not, or a garbled
+                    // frame: say so, rather than describe the image.
+                    _ => {
+                        return format!(
+                            "{op}: guest refused a qcow2 L2 entry with an unrecognised \
+                             corruption status {status} at virtual offset {offset} ({offset:#x})"
+                        );
+                    }
+                };
+                format!("{op}: {what} at virtual offset {offset} ({offset:#x})")
+            }
+            None => format!("{op}: guest did not return a result"),
         }
     }
 
@@ -1135,6 +1211,8 @@ impl SerialDecoder {
                     self.last_cpu_exception = Some((err.status, err.sector));
                 } else if err.operation == shared::DifferencingRefusal::OPERATION {
                     self.last_differencing_refusal = Some(err.status);
+                } else if err.operation == shared::VhdFooterChecksumRefusal::OPERATION {
+                    self.vhd_footer_checksum_refused = true;
                 } else if err.operation == shared::InvalidL2EntryRefusal::OPERATION {
                     // `sector` is the virtual byte offset of the refused read.
                     self.last_invalid_l2_entry = Some(err.sector);
@@ -1142,6 +1220,10 @@ impl SerialDecoder {
                     // `sector` is the refused cluster's virtual byte offset,
                     // `status` the rule its entry breaks.
                     self.last_data_file_entry = Some((err.sector, err.status));
+                } else if err.operation == shared::MalformedL2EntryRefusal::OPERATION {
+                    // As above: the cluster's virtual byte offset, and
+                    // which of qemu's two host-offset rules it breaks.
+                    self.last_malformed_l2_entry = Some((err.sector, err.status));
                 }
             }
             return Some(msg);
@@ -1347,6 +1429,40 @@ mod guest_exception_tests {
     }
 
     #[test]
+    fn malformed_l2_entry_error_names_qemu_wording_for_each_rule() {
+        // qemu's wording, block/qcow2-cluster.c:659-662 and :688-692 at
+        // v10.0.0, for each host-offset rule the guest raises (#812).
+        // These two apply to every qcow2 image rather than only to one
+        // with an external data file, so they are rendered by their own
+        // function and need their own pin. The assertion that
+        // `l2_entry_refused` is true for this field alone is what makes
+        // the refusal reach the user at all.
+        for (status, words) in [
+            (
+                shared::MalformedL2EntryRefusal::STATUS_UNALIGNED_HOST_OFFSET,
+                "Cluster allocation offset unaligned",
+            ),
+            (
+                shared::MalformedL2EntryRefusal::STATUS_ZERO_FLAG_PRE_V3,
+                "Zero cluster entry found in pre-v3 image",
+            ),
+        ] {
+            let mut decoder = super::SerialDecoder::new();
+            decoder.last_malformed_l2_entry = Some((65536, status));
+            assert!(decoder.l2_entry_refused());
+            for op in [
+                "convert", "dd", "compare", "bench", "rebase", "map", "measure",
+            ] {
+                let msg = decoder.l2_entry_refusal_error(op);
+                assert_eq!(
+                    msg,
+                    format!("{op}: {words} at virtual offset 65536 (0x10000)")
+                );
+            }
+        }
+    }
+
+    #[test]
     fn data_file_entry_error_names_an_unrecognised_status_as_such() {
         // A status this host does not know is a fact about the guest, not
         // about the image: the message must say the status was not
@@ -1410,6 +1526,77 @@ mod guest_exception_tests {
                 shared::DataFileEntryRefusal::STATUS_HOST_OFFSET_MISMATCH
             ))
         );
+        assert_eq!(decoder.last_invalid_l2_entry, None);
+        assert_eq!(decoder.last_malformed_l2_entry, None);
+        assert_eq!(decoder.last_differencing_refusal, None);
+        assert_eq!(decoder.last_cpu_exception, None);
+    }
+
+    #[test]
+    fn info_names_a_vhd_footer_checksum_refusal_in_qemus_wording() {
+        // `info` sends no result for a VHD whose footer copy at offset 0
+        // fails its checksum, only this marker. Without the capture, or
+        // without the renderer reading it, the failure is generic text
+        // -- or, before #583's follow-up, `instar info` exited 0 having
+        // printed nothing at all.
+        let decoder = super::SerialDecoder::new();
+        assert_eq!(
+            super::info_without_a_result(&decoder, "x.vhd"),
+            "No info result received from guest"
+        );
+
+        let msg = guest_protocol::error_message(
+            shared::VhdFooterChecksumRefusal::OPERATION,
+            "input",
+            0,
+            0,
+        );
+        let mut framed = [0u8; 256];
+        let n = guest_protocol::encode_framed(&msg, &mut framed).expect("encode");
+        let mut decoder = super::SerialDecoder::new();
+        for &b in &framed[..n] {
+            decoder.add_byte(b);
+        }
+        assert!(decoder.vhd_footer_checksum_refused);
+        assert_eq!(decoder.last_differencing_refusal, None);
+        let text = super::info_without_a_result(&decoder, "x.vhd");
+        assert!(
+            text.starts_with("Could not open 'x.vhd': Incorrect header checksum"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn add_byte_captures_the_malformed_l2_entry_refusal() {
+        // As for the data-file refusal above, under this marker: the
+        // cluster's virtual byte offset as the sector, and which of
+        // qemu's two host-offset rules the entry breaks as the status.
+        // Nothing else may be captured, because `l2_entry_refusal_error`
+        // picks the renderer by which field is set.
+        let msg = guest_protocol::error_message(
+            shared::MalformedL2EntryRefusal::OPERATION,
+            "input",
+            131072,
+            shared::MalformedL2EntryRefusal::STATUS_UNALIGNED_HOST_OFFSET,
+        );
+        let mut framed = [0u8; 256];
+        let n = guest_protocol::encode_framed(&msg, &mut framed).expect("encode");
+        let mut decoder = super::SerialDecoder::new();
+        let mut decoded = 0;
+        for &b in &framed[..n] {
+            if decoder.add_byte(b).is_some() {
+                decoded += 1;
+            }
+        }
+        assert_eq!(decoded, 1);
+        assert_eq!(
+            decoder.last_malformed_l2_entry,
+            Some((
+                131072,
+                shared::MalformedL2EntryRefusal::STATUS_UNALIGNED_HOST_OFFSET
+            ))
+        );
+        assert_eq!(decoder.last_data_file_entry, None);
         assert_eq!(decoder.last_invalid_l2_entry, None);
         assert_eq!(decoder.last_differencing_refusal, None);
         assert_eq!(decoder.last_cpu_exception, None);
@@ -3273,7 +3460,9 @@ fn execute_info_operation(
         thread.stop();
     }
 
-    captured_result.ok_or_else(|| "No info result received from guest".into())
+    captured_result.ok_or_else(|| {
+        info_without_a_result(&serial_decoder, &input_path.display().to_string()).into()
+    })
 }
 
 /// What the caller will do with the chain it asks for.
@@ -12343,6 +12532,10 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
 
     // Track VM errors - if set, we return an error instead of Ok(())
     let mut vm_error: Option<String> = None;
+    // Whether the guest sent its result. A guest that refuses the image
+    // sends none, and that must fail rather than exit 0 having printed
+    // nothing.
+    let mut saw_info_result = false;
 
     loop {
         match vcpu.run()? {
@@ -12363,6 +12556,7 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
                                 Some(guest_::GuestMessage_::Payload::InfoResult(_))
                             );
                             if is_info_result {
+                                saw_info_result = true;
                                 print_info_result(
                                     &msg,
                                     &args.input,
@@ -12475,6 +12669,9 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
     // Return error if VM crashed or failed
     if let Some(error) = vm_error {
         return Err(error.into());
+    }
+    if !saw_info_result {
+        return Err(info_without_a_result(&serial_decoder, &args.input).into());
     }
 
     Ok(())

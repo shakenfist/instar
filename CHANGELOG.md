@@ -1294,6 +1294,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Security
 
+- **Two qcow2 L2 entry shapes qemu refuses are now refused by name.**
+  Both are corruption checks in qemu's `qcow2_get_host_offset` rather
+  than in its subcluster classifier, which is why transcribing the
+  classifier did not pick them up, and both apply to every qcow2 image
+  rather than only to one with an external data file. A host cluster
+  offset that is not a multiple of the cluster size is refused as
+  `Cluster allocation offset unaligned`; the all-zeroes flag in a v2
+  image, where the flag does not exist, as `Zero cluster entry found in
+  pre-v3 image`. Before this, `instar map` printed the host offset qemu
+  calls invalid and exited 0, `measure` counted the cluster, and
+  `convert` zero-filled a pre-v3 cluster whose own host offset holds
+  data and reported success. The chain reader, `map` and `measure` all
+  apply the rules, so one image no longer gets three answers; `info`
+  still opens such an image, as `qemu-img info` does, and `check`
+  reports what qemu-img check reports. Measured against qemu-img
+  10.0.13. Closes
+  [#812](https://github.com/shakenfist/instar/issues/812).
+
+- **An extended-L2 qcow2 needs clusters of at least 16 KiB, in both
+  directions.** qemu refuses to open an extended-L2 image whose
+  subclusters would be under 512 bytes ("Unsupported subcluster size:
+  128"), which is any cluster size below 16 KiB, and `qemu-img create`
+  refuses to make one. instar opened and read such an image, and -- the
+  worse half, found while fixing the read side -- `instar create -f
+  qcow2 -o extended_l2=on,cluster_size=4k` *wrote* one, so instar
+  produced a file qemu-img cannot open. The header parse, `plan_qcow2`
+  and `measure -O qcow2` now all refuse the combination. Beyond parity,
+  the reader's AES-CBC and XTS paths need a `Normal` subcluster run to
+  be 512-byte aligned, which only holds above this floor.
+  Closes [#805](https://github.com/shakenfist/instar/issues/805).
+
+- **A VHD block whose BAT entry places it on the image's own metadata is
+  refused.** `VhdState::block_lookup` and `differencing_block_lookup`
+  used a BAT entry's sector number as given, so a BAT entry of 0 put a
+  block's sector bitmap on the footer copy and its payload on the
+  dynamic header, and instar served the image's own structure to the
+  guest as data. A block — bitmap plus payload — is now refused when its
+  range overlaps the footer copy at offset 0, the dynamic header or the
+  BAT, and all four BAT consumers apply the rule, so `map` and `measure`
+  cannot report a block that the chain reader refuses. qemu reads such a
+  block out, so this is deliberately stricter; it is the rule instar
+  already applied to a VHD locator's data and to a VHDX payload block.
+  Also, a VHDX parent locator is honoured only when its `LocatorType` is
+  the GUID SPEC(VHDX) 2.6.2.6 defines and the locator item carries no
+  defect: a locator declaring another type had its path reported, and
+  opened by `convert`, where libvhdi refuses the image outright.
+  Closes [#662](https://github.com/shakenfist/instar/issues/662).
+
+- **A VHDX whose metadata table declares overlapping items is refused**
+  (SPEC(VHDX) 2.6.1.2). A table that laid a parent locator over the File
+  Parameters, Virtual Disk Size and sector-size items read back as fully
+  sound: no defect, no refusal. Which item's bytes a reader uses depends
+  on the reader, so such an image has no single meaning. Neither oracle
+  refuses it — libvhdi reads a clean two-item overlap as sound, and
+  qemu-img cannot open a differencing VHDX at all — so this follows the
+  specification rather than an implementation.
+  Closes [#576](https://github.com/shakenfist/instar/issues/576).
+
+- **A VHD footer's checksum is verified before anything acts on its
+  fields.** `VhdFooter::parse` validated the `conectix` cookie and the
+  buffer length and read the checksum without checking it, so any
+  512-byte block beginning with `conectix` was an authoritative footer
+  and its size, disk type, uuid and timestamp were taken at face value.
+  The sharpest edge was `create -b`: under `-u`, with no `-F`, a backing
+  file that header-detects as raw had its last sector scanned, and a
+  match promoted it to a VHD parent and copied attacker-chosen bytes
+  into a differencing child's parent identity. Chain reads, `info`,
+  `resize`, `create`'s parent probe and last-sector format detection now
+  verify the checksum; a dynamic VHD whose footer copy at offset 0 fails
+  it is refused rather than re-read from the trailing footer, which is
+  what qemu's vpc driver does ("Incorrect header checksum"). `check`
+  still parses without verifying, so it can keep reporting the mismatch
+  as a finding. See
+  [quirks.md](https://github.com/shakenfist/instar/blob/develop/docs/quirks.md#a-conectix-block-is-not-a-vhd-footer-on-its-own).
+  Closes [#583](https://github.com/shakenfist/instar/issues/583).
+
 - **Text read from an image can no longer drive the terminal it is
   printed on.** Backing file names, external data file paths, VMDK
   create types and extent file names, snapshot IDs and tags, and the

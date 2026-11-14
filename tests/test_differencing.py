@@ -122,6 +122,7 @@ The classes are:
 import json
 import re
 import shutil
+import struct
 import subprocess
 import tempfile
 from pathlib import Path
@@ -4952,3 +4953,223 @@ class TestDifferencingCreatedChildComposes(DifferencingTestBase):
                     finally:
                         parent_file.close()
                         child_file.close()
+
+
+class TestVhdxMalformedMetadata(DifferencingTestBase):
+    """A VHDX whose metadata does not describe itself is refused.
+
+    Both cases here are structures instar parsed and then ignored
+    the verdict on: a metadata table declaring two items that overlap,
+    which SPEC(VHDX) 2.6.1.2 forbids, and a parent locator carrying a
+    `LocatorType` that is not the one SPEC(VHDX) 2.6.2.6 defines. Each
+    was read as a sound image.
+
+    The fixtures are built by patching a copy of `vhdx-diff-child.vhdx`
+    rather than shipped, because both are one-field edits of a sound
+    image and shipping them would add two near-duplicates of an 11 MiB
+    fixture to instar-testdata.
+    """
+
+    # SPEC(VHDX) 2.6.2.6, bytes_le, as `VHDX_PARENT_LOCATOR_TYPE_GUID`
+    # in the vhdx crate has it.
+    LOCATOR_TYPE_GUID = bytes([
+        0xB7, 0xEF, 0x4A, 0xB0, 0x9E, 0xD1, 0x81, 0x4A,
+        0xB7, 0x89, 0x25, 0xB8, 0xE9, 0x44, 0x59, 0x13,
+    ])
+
+    # SPEC(VHDX) 2.6.2.4 and 2.6.2.5, bytes_le, as the vhdx crate has
+    # them. The table entries are found by these rather than by offset,
+    # so a fixture regenerated with its table in another order fails the
+    # precondition below instead of patching unrelated bytes.
+    LOGICAL_SECTOR_SIZE_GUID = bytes([
+        0x1D, 0xBF, 0x41, 0x81, 0x6F, 0xA9, 0x09, 0x47,
+        0xBA, 0x47, 0xF2, 0x33, 0xA8, 0xFA, 0xAB, 0x5F,
+    ])
+    PHYSICAL_SECTOR_SIZE_GUID = bytes([
+        0xC7, 0x48, 0xA3, 0xCD, 0x5D, 0x44, 0x71, 0x44,
+        0x9C, 0xC9, 0xE9, 0x88, 0x52, 0x51, 0xC5, 0x56,
+    ])
+
+    def _table_entry(self, data, guid):
+        """The offset of the one metadata table entry naming `guid`."""
+        self.assertEqual(
+            data.count(guid), 1,
+            'the fixture should name this metadata item exactly once')
+        return data.find(guid)
+
+    def _child(self, workdir):
+        """A copy of the differencing child, beside its parent."""
+        return self.chain_copy('vhdx-diff-child', workdir)
+
+    def _info(self, image):
+        stdout, stderr, rc = self.run_instar_info(
+            image, output_format='json')
+        self.assertEqual(rc, 0, f'info failed: {stderr}')
+        return json.loads(stdout)
+
+    def test_a_sound_child_still_reports_its_parent(self):
+        """The control: without a patch, the parent is reported.
+
+        If this ever fails, the two refusal tests below prove nothing.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            child = self._child(td)
+            self.assertIn('backing-filename', self._info(child))
+
+    def test_a_foreign_locator_type_is_not_a_parent_locator(self):
+        """A locator declaring another type does not name the parent.
+
+        Measured before the fix: patching the GUID to `deadbeef` x4
+        left `instar info` reporting the parent path, and reporting it
+        as the file `convert` would open. libvhdi refuses the whole
+        image for it ("unsupported type indicator"). Reporting no
+        parent is the refusal: the image claims one through HasParent,
+        so every composing operation then refuses it by name.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            child = self._child(td)
+            data = bytearray(child.read_bytes())
+            at = data.find(self.LOCATOR_TYPE_GUID)
+            self.assertNotEqual(
+                at, -1, 'the fixture carries no parent locator type GUID')
+            data[at:at + 16] = b'\xde\xad\xbe\xef' * 4
+            child.write_bytes(bytes(data))
+
+            self.assertNotIn(
+                'backing-filename', self._info(child),
+                'a locator whose type is not the spec\'s still named the '
+                'parent instar would open')
+
+            out = Path(td) / 'out.raw'
+            stdout, stderr, rc = self.run_instar_convert(
+                child, out, output_format='raw')
+            self.assert_refused('convert', 'VHDX', stdout, stderr, rc,
+                                'foreign locator type')
+
+    def test_overlapping_metadata_items_are_refused(self):
+        """Two metadata items claiming the same bytes are refused.
+
+        SPEC(VHDX) 2.6.1.2: an item must not overlap any other region.
+        The Physical Sector Size entry is pointed at the Logical Sector
+        Size item: both are four-byte sector sizes reading 512, so each
+        item is individually valid and the image read back as sound.
+        Measured: libvhdi reports this file as a sound differencing
+        disk, so the specification is the authority, not an oracle.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            child = self._child(td)
+            data = bytearray(child.read_bytes())
+            logical_entry = self._table_entry(
+                data, self.LOGICAL_SECTOR_SIZE_GUID)
+            physical_entry = self._table_entry(
+                data, self.PHYSICAL_SECTOR_SIZE_GUID)
+            # Item offset at entry +16 (SPEC(VHDX) 2.6.1.2).
+            logical = struct.unpack_from('<I', data, logical_entry + 16)[0]
+            physical = struct.unpack_from('<I', data, physical_entry + 16)[0]
+            self.assertNotEqual(
+                logical, physical,
+                'the fixture already overlaps these two items')
+            struct.pack_into('<I', data, physical_entry + 16, logical)
+            child.write_bytes(bytes(data))
+
+            # The metadata no longer parses, so no parent is reported
+            # and the composing read is refused.
+            self.assertNotIn('backing-filename', self._info(child))
+
+            out = Path(td) / 'out.raw'
+            _, stderr, rc = self.run_instar_convert(
+                child, out, output_format='raw')
+            self.assertNotEqual(
+                rc, 0,
+                f'an image with overlapping metadata items converted: '
+                f'{stderr!r}')
+
+
+class TestVhdFooterCopyChecksum(DifferencingTestBase):
+    """A VHD whose footer copy at offset 0 fails its checksum is refused.
+
+    Every field a reader acts on -- size, disk type, the dynamic header's
+    location, a differencing child's parent -- is read from those 512
+    bytes, and the checksum is the only thing that constrains them
+    (#583). qemu-img refuses such an image ("Incorrect header
+    checksum"), and so does instar, in the same words.
+
+    The refusal is the reader's, not detection's. Detection that called
+    the file raw instead had `convert` exit 0 and write the VHD's own
+    footer, dynamic header and BAT out as disk content, while `info`
+    reported `unknown` -- which is why both commands are asserted here,
+    not just one.
+
+    For a differencing child neither oracle backs the refusal: qemu-img
+    cannot read a differencing VHD at all, and libvhdi 20240509 reports
+    a child whose copy at 0 fails its checksum as a sound differencing
+    disk. instar refuses it for the same reason it refuses a dynamic
+    image, recorded in docs/quirks.md.
+    """
+
+    WORDING = 'Incorrect header checksum'
+
+    def _break_checksum(self, path, at):
+        """Flip one bit of the footer checksum at byte offset `at`."""
+        data = bytearray(path.read_bytes())
+        self.assertEqual(
+            bytes(data[at:at + 8]), b'conectix', 'no footer at that offset')
+        checksum = struct.unpack_from('>I', data, at + 64)[0]
+        struct.pack_into('>I', data, at + 64, checksum ^ 1)
+        path.write_bytes(bytes(data))
+
+    def _assert_info_and_convert_refuse(self, image, workdir):
+        stdout, stderr, rc = self.run_instar_info(image)
+        self.assertEqual(
+            rc, 1, f'info read a VHD whose footer copy fails its checksum; '
+                   f'stdout={stdout[:400]!r} stderr={stderr[:400]!r}')
+        self.assertIn(self.WORDING, stderr)
+
+        out = Path(workdir) / 'out.raw'
+        stdout, stderr, rc = self.run_instar_convert(
+            image, out, output_format='raw')
+        self.assertNotEqual(
+            rc, 0, f'convert read a VHD whose footer copy fails its '
+                   f'checksum; stderr={stderr[:400]!r}')
+        self.assertIn(self.WORDING, stderr)
+
+    def test_a_dynamic_vhd_is_refused_as_qemu_refuses_it(self):
+        self._require_qemu_img()
+        with tempfile.TemporaryDirectory() as td:
+            image = Path(td) / 'dynamic.vhd'
+            r = subprocess.run(
+                ['qemu-img', 'create', '-q', '-f', 'vpc', str(image), '4M'],
+                capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self._break_checksum(image, 0)
+
+            r = subprocess.run(
+                ['qemu-img', 'info', str(image)],
+                capture_output=True, text=True, timeout=60)
+            self.assertNotEqual(r.returncode, 0, 'qemu-img opened it')
+            self.assertIn(self.WORDING, r.stderr)
+
+            self._assert_info_and_convert_refuse(image, td)
+
+    def test_a_differencing_child_is_refused(self):
+        with tempfile.TemporaryDirectory() as td:
+            child = self.chain_copy('vhd-diff-child-aligned', td)
+            self._break_checksum(child, 0)
+            self._assert_info_and_convert_refuse(child, td)
+
+    def test_a_bad_trailing_footer_does_not_refuse_the_image(self):
+        """The copy at offset 0 is what a reader acts on, and qemu agrees.
+
+        A dynamic or differencing VHD whose *trailing* footer fails its
+        checksum, with a sound copy at 0, opens: the readers take every
+        field from the copy, and qemu-img opens the dynamic case too.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            child = self.chain_copy('vhd-diff-child-aligned', td)
+            self._break_checksum(child, child.stat().st_size - 512)
+            stdout, stderr, rc = self.run_instar_info(child)
+            self.assertEqual(rc, 0, stderr)
+            out = Path(td) / 'out.raw'
+            stdout, stderr, rc = self.run_instar_convert(
+                child, out, output_format='raw')
+            self.assertEqual(rc, 0, stderr)

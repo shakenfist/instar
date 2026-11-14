@@ -621,7 +621,12 @@ unsafe fn run_vhd(
         return err_result(config, ResizeResult::ERROR_READ_FAILED);
     }
     let footer_slice = core::slice::from_raw_parts(state_base.add(footer_off), 512);
-    let parsed_footer = match vhd::VhdFooter::parse(footer_slice) {
+    // Verified, not just parsed: resize reads the disk type, geometry
+    // and size out of this footer and then writes a new footer built
+    // from them, so a footer whose checksum does not hold up would have
+    // its bytes laundered into an image that *does* check out
+    // (issue #583).
+    let parsed_footer = match vhd::VhdFooter::parse_verified(footer_slice) {
         Some(p) => p,
         None => return err_result(config, ResizeResult::ERROR_PARSE_FAILED),
     };

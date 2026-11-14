@@ -231,6 +231,14 @@ pub fn measure_qcow2(s: &AllocationSummary, opts: &Qcow2Opts) -> MeasureResult {
     if opts.extended_l2 && !opts.compat_v3 {
         return Err(MeasureError::InvalidOption);
     }
+    // An extended-L2 image needs 512-byte subclusters, so clusters of
+    // at least 16 KiB: `qemu-img create` refuses smaller ones and the
+    // qcow2 driver cannot open them. Refused here as well as in
+    // `plan_qcow2`, so measure does not size a target that nothing
+    // could create or read (issue #805).
+    if opts.extended_l2 && opts.cluster_size < (1u32 << qcow2::MIN_EXTENDED_L2_CLUSTER_BITS) {
+        return Err(MeasureError::InvalidOption);
+    }
 
     // ---- Validate sizes. ---------------------------------------------------
     // qcow2 caps virtual_size at 2^63.
@@ -1923,6 +1931,44 @@ mod tests {
             ..Qcow2Opts::default()
         };
         assert_eq!(measure_qcow2(&s, &opts), Err(MeasureError::InvalidOption));
+    }
+
+    #[test]
+    fn qcow2_extended_l2_requires_sixteen_kib_clusters() {
+        // Measuring a target nothing can create or open is a number
+        // with no image behind it (issue #805).
+        let s = AllocationSummary {
+            virtual_size: MIB,
+            allocated_bytes: 0,
+            target_units_with_data: 0,
+        };
+        for cluster_size in [512u32, 4096, 8192] {
+            let opts = Qcow2Opts {
+                extended_l2: true,
+                cluster_size,
+                ..Qcow2Opts::default()
+            };
+            assert_eq!(
+                measure_qcow2(&s, &opts),
+                Err(MeasureError::InvalidOption),
+                "extended_l2 with a {cluster_size}-byte cluster must be refused"
+            );
+
+            // The same cluster size without the feature is measurable.
+            let plain = Qcow2Opts {
+                extended_l2: false,
+                cluster_size,
+                ..Qcow2Opts::default()
+            };
+            assert!(measure_qcow2(&s, &plain).is_ok());
+        }
+
+        let at_floor = Qcow2Opts {
+            extended_l2: true,
+            cluster_size: 1 << qcow2::MIN_EXTENDED_L2_CLUSTER_BITS,
+            ..Qcow2Opts::default()
+        };
+        assert!(measure_qcow2(&s, &at_floor).is_ok());
     }
 
     #[test]

@@ -566,3 +566,145 @@ class TestQcow2RefusalReaders(InstarTestBase):
         overlay = self._overlay('data_file', self._old_base)
         stdout, stderr, rc = self.run_instar_rebase(overlay, '-F', 'qcow2', '-b', self._data_file.path)
         self._assert_refusal('rebase', DATA_FILE_REFUSAL_MESSAGES['data_file_offset_mismatch'], stdout, stderr, rc)
+
+
+class TestQcow2MalformedHostOffsets(InstarTestBase):
+    """The two corruption rules qemu applies when it forms a host offset.
+
+    Both live in qemu's `qcow2_get_host_offset` rather than in its
+    subcluster classifier, which is why transcribing the classifier did
+    not pick them up, and both apply to every qcow2 image rather than
+    only to one with an external data file (#812):
+
+    * a host cluster offset that is not a multiple of the cluster size,
+      which qemu reports as "Cluster allocation offset ... unaligned";
+    * the all-zeroes flag in a v2 image, where the flag does not exist:
+      "Zero cluster entry found in pre-v3 image".
+
+    Before the fix, `map` handed out the unaligned offset and exited 0,
+    `measure` counted the cluster, and `convert` zero-filled the pre-v3
+    cluster -- whose own host offset holds data -- and reported success.
+
+    The images are built here rather than shipped: each is a one-word
+    patch of an image qemu-img wrote, and the patch is the whole point.
+    """
+
+    _CLUSTER = 65536
+    _OFFSET_TEXT = 'at virtual offset 65536 (0x10000)'
+    UNALIGNED = 'Cluster allocation offset unaligned'
+    PRE_V3_ZERO = 'Zero cluster entry found in pre-v3 image'
+
+    def setUp(self):
+        super().setUp()
+        self._require_qemu_tools()
+        self.instar = self.get_instar_binary()
+        self._tmpdir = Path(tempfile.mkdtemp(prefix='qcow2-malformed-offsets.'))
+        self.addCleanup(shutil.rmtree, self._tmpdir, ignore_errors=True)
+
+    def _image(self, name, compat, patch):
+        """A 1 MiB qcow2 with data in cluster 1, whose L2 entry is patched.
+
+        `patch` is called with the entry qemu-img wrote and returns the
+        one to store, so each test states its corruption as a change to
+        a real entry rather than as a hand-built word.
+        """
+        import struct
+
+        path = self._tmpdir / name
+        argv = ['qemu-img', 'create', '-q', '-f', 'qcow2']
+        if compat is not None:
+            argv += ['-o', f'compat={compat}']
+        _, stderr, rc = _run(argv + [path, '1M'])
+        self.assertEqual(rc, 0, f'qemu-img create failed: {stderr}')
+        _, stderr, rc = _run(['qemu-io', '-f', 'qcow2', '-c',
+                              f'write -P 0x55 {self._CLUSTER} {self._CLUSTER}', path])
+        self.assertEqual(rc, 0, f'qemu-io write failed: {stderr}')
+
+        data = bytearray(path.read_bytes())
+        l1_offset = struct.unpack_from('>Q', data, 40)[0]
+        l2_offset = struct.unpack_from('>Q', data, l1_offset)[0] & 0x00FFFFFFFFFFFE00
+        entry_at = l2_offset + 8
+        entry = struct.unpack_from('>Q', data, entry_at)[0]
+        patched = patch(entry)
+        self.assertNotEqual(entry, patched, 'the patch changed nothing')
+        struct.pack_into('>Q', data, entry_at, patched)
+        path.write_bytes(bytes(data))
+
+        # The oracle: qemu-img must refuse to read this image, or the
+        # test is pinning instar against nothing.
+        _, stderr, rc = _run(['qemu-img', 'convert', '-O', 'raw', path,
+                              self._tmpdir / f'{name}.qemu.raw'])
+        self.assertNotEqual(rc, 0, f'qemu-img read {name}, so it is not corrupt: {stderr}')
+        return path
+
+    def _unaligned_image(self):
+        # One 512-byte sector past the cluster boundary, which is the
+        # shape measured against qemu-img 10.0.13.
+        return self._image('unaligned.qcow2', None, lambda e: e + 512)
+
+    def _pre_v3_zero_image(self):
+        # Bit 0 is the all-zeroes flag from v3 on; compat=0.10 is v2.
+        return self._image('prev3.qcow2', '0.10', lambda e: e | 1)
+
+    def _assert_refused(self, op, message, stdout, stderr, rc):
+        self.assertNotEqual(
+            rc, 0,
+            f'{op}: the malformed entry was read; stdout={stdout[:400]!r} stderr={stderr!r}')
+        self.assertIn(
+            f'{op}: {message} {self._OFFSET_TEXT}', stderr,
+            f'{op}: the refusal is not rendered by name at the refused cluster; '
+            f'stderr={stderr!r}')
+
+    def test_convert_refuses_an_unaligned_host_offset(self):
+        image = self._unaligned_image()
+        out = self._tmpdir / 'out.raw'
+        stdout, stderr, rc = self.run_instar_convert(image, out, output_format='raw')
+        self._assert_refused('convert', self.UNALIGNED, stdout, stderr, rc)
+
+    def test_map_refuses_an_unaligned_host_offset(self):
+        image = self._unaligned_image()
+        stdout, stderr, rc = _run([self.instar, 'map', '--output=json', image])
+        self._assert_refused('map', self.UNALIGNED, stdout, stderr, rc)
+        self.assertNotIn(
+            '"offset": 328192', stdout,
+            'map handed out the host offset qemu calls invalid')
+
+    def test_measure_refuses_an_unaligned_host_offset(self):
+        image = self._unaligned_image()
+        stdout, stderr, rc = _run([self.instar, 'measure', '-O', 'qcow2', image])
+        self._assert_refused('measure', self.UNALIGNED, stdout, stderr, rc)
+
+    def test_convert_refuses_a_pre_v3_zero_flag(self):
+        """The data the cluster holds is not silently replaced with zeros."""
+        image = self._pre_v3_zero_image()
+        out = self._tmpdir / 'prev3.raw'
+        stdout, stderr, rc = self.run_instar_convert(image, out, output_format='raw')
+        self._assert_refused('convert', self.PRE_V3_ZERO, stdout, stderr, rc)
+
+    def test_map_refuses_a_pre_v3_zero_flag(self):
+        image = self._pre_v3_zero_image()
+        stdout, stderr, rc = _run([self.instar, 'map', '--output=json', image])
+        self._assert_refused('map', self.PRE_V3_ZERO, stdout, stderr, rc)
+
+    def test_a_sound_v2_image_is_unaffected(self):
+        """The control: v2 images without the flag still read.
+
+        Bit 0 is only corruption in a v2 image when it is set, and most
+        v2 images in the world are sound. If this fails, the rule is
+        refusing every v2 image rather than the corrupt ones.
+        """
+        path = self._tmpdir / 'sound-v2.qcow2'
+        _, stderr, rc = _run(['qemu-img', 'create', '-q', '-f', 'qcow2',
+                              '-o', 'compat=0.10', path, '1M'])
+        self.assertEqual(rc, 0, f'qemu-img create failed: {stderr}')
+        _, stderr, rc = _run(['qemu-io', '-f', 'qcow2', '-c',
+                              f'write -P 0x55 {self._CLUSTER} {self._CLUSTER}', path])
+        self.assertEqual(rc, 0, f'qemu-io write failed: {stderr}')
+
+        out = self._tmpdir / 'sound-v2.raw'
+        stdout, stderr, rc = self.run_instar_convert(path, out, output_format='raw')
+        self.assertEqual(rc, 0, f'a sound v2 image was refused: {stderr}')
+        data = out.read_bytes()
+        self.assertEqual(
+            data[self._CLUSTER:self._CLUSTER + 8], b'\x55' * 8,
+            'the written data did not survive the conversion')

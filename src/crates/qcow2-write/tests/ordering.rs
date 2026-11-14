@@ -1343,10 +1343,6 @@ fn gated_images_never_yield_a_write_state() {
         Gate::UnknownIncompatible,
     );
     with(
-        &|h| h[72..80].copy_from_slice(&qcow2::INCOMPAT_EXTENDED_L2.to_be_bytes()),
-        Gate::ExtendedL2,
-    );
-    with(
         &|h| h[72..80].copy_from_slice(&qcow2::INCOMPAT_EXTERNAL_DATA.to_be_bytes()),
         Gate::ExternalDataFile,
     );
@@ -1377,6 +1373,27 @@ fn gated_images_never_yield_a_write_state() {
             "gated header must refuse before any step can exist"
         );
     }
+
+    // Extended L2 needs its own base header: the feature requires
+    // clusters of at least 16 KiB (512-byte subclusters), and a header
+    // pairing it with this test's 4 KiB clusters no longer parses --
+    // qemu-img create refuses to write one and its driver refuses to
+    // open one (issue #805). The gate under test is the write
+    // planner's, so the image has to be one a reader would accept.
+    let extended_l2_bits = qcow2::MIN_EXTENDED_L2_CLUSTER_BITS;
+    let extended_l2_cs = 1u64 << extended_l2_bits;
+    let mut extended_l2_base = header_bytes(
+        extended_l2_bits,
+        L1_TABLES as u64 * (extended_l2_cs / 16) * extended_l2_cs,
+        L1_TABLES,
+        false,
+    );
+    extended_l2_base[72..80].copy_from_slice(&qcow2::INCOMPAT_EXTENDED_L2.to_be_bytes());
+    assert_eq!(
+        new_state(&parse(&extended_l2_base), &cfg).err(),
+        Some(Gate::ExtendedL2),
+        "gated header must refuse before any step can exist"
+    );
 
     // Unsupported version (parse cannot produce it; defend the
     // direct-construction path).

@@ -723,6 +723,16 @@ pub enum VhdxParentLocatorDefect {
     DuplicateKey,
 }
 
+/// Why [`VhdxParentLocator::usable`] would not resolve a parent from a
+/// locator.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum VhdxParentLocatorRefusal {
+    /// `LocatorType` is not the one SPEC(VHDX) 2.6.2.6 defines.
+    ForeignLocatorType,
+    /// A locator-level defect that is a statement about the image.
+    Malformed(VhdxParentLocatorDefect),
+}
+
 /// One key/value entry of a parent locator item.
 ///
 /// The four raw fields are preserved exactly as they were read, for
@@ -931,6 +941,55 @@ impl VhdxParentLocator {
         match self.parent_linkage() {
             Some(linkage) => linkage.eq_ignore_ascii_case(expected),
             None => false,
+        }
+    }
+
+    /// This locator, if it vouches for the parent path it carries, or
+    /// why it does not.
+    ///
+    /// The struct reports what the item holds and decides nothing; this
+    /// is the one place the decision is made, so every consumer that
+    /// resolves a parent from a locator applies the same rule, and the
+    /// rule is tested under this crate's suite rather than living in an
+    /// operation binary where no test can reach it.
+    ///
+    /// Two things disqualify a locator:
+    ///
+    /// * A `LocatorType` other than the one SPEC(VHDX) 2.6.2.6 defines.
+    ///   Such an item is not a VHDX parent locator at all; libvhdi
+    ///   refuses the whole image for it ("unsupported type indicator")
+    ///   (issue #662).
+    /// * A locator-level defect that is a statement about the image.
+    ///   `EntryCountExceedsItem` says the item's own header does not
+    ///   describe the entries that follow it, so no entry's path is one
+    ///   the item vouches for.
+    ///
+    /// `EntryCountExceedsCapacity` does **not** disqualify it.
+    /// [`MAX_PARENT_LOCATOR_ENTRIES`] is a bound of this parser, not of
+    /// the spec, and a spec-legal locator with more entries than that
+    /// still holds the entries that were read; the preferred path is
+    /// resolved from those.
+    ///
+    /// The match is exhaustive on purpose. The entry-level kinds are
+    /// never recorded at locator level today; should one ever be, it
+    /// describes the image and refusing is the safe default -- and a
+    /// new kind has to be placed on one side or the other to compile.
+    pub fn usable(&self) -> Result<&Self, VhdxParentLocatorRefusal> {
+        if !self.is_vhdx_locator_type() {
+            return Err(VhdxParentLocatorRefusal::ForeignLocatorType);
+        }
+        match self.defect {
+            None | Some(VhdxParentLocatorDefect::EntryCountExceedsCapacity) => Ok(self),
+            Some(
+                defect @ (VhdxParentLocatorDefect::EntryCountExceedsItem
+                | VhdxParentLocatorDefect::KeyOutOfBounds
+                | VhdxParentLocatorDefect::ValueOutOfBounds
+                | VhdxParentLocatorDefect::KeyTooLong
+                | VhdxParentLocatorDefect::ValueTooLong
+                | VhdxParentLocatorDefect::KeyUndecodable
+                | VhdxParentLocatorDefect::ValueUndecodable
+                | VhdxParentLocatorDefect::DuplicateKey),
+            ) => Err(VhdxParentLocatorRefusal::Malformed(defect)),
         }
     }
 
@@ -1191,12 +1250,33 @@ struct MetadataItemLocations {
     parent_locator: Option<(u32, u32)>,
 }
 
+/// The metadata items `locate_metadata_items` looks for, each with the
+/// number of bytes `parse_metadata_region` reads from it (SPEC(VHDX)
+/// 2.6.2.1, 2.6.2.2, 2.6.2.4, 2.6.2.5). The parent locator's size is
+/// variable, so its declared Length is all there is: 0 here.
+///
+/// Indexed by the `SLOT_*` constants below (not the `ITEM_*` ones, which
+/// are byte offsets in the emitter's layout).
+const RECOGNISED_METADATA_ITEMS: [([u8; 16], u32); 5] = [
+    (FILE_PARAMETERS_GUID, 8),
+    (VIRTUAL_DISK_SIZE_GUID, 8),
+    (LOGICAL_SECTOR_SIZE_GUID, 4),
+    (PHYSICAL_SECTOR_SIZE_GUID, 4),
+    (PARENT_LOCATOR_GUID, 0),
+];
+const SLOT_FILE_PARAMETERS: usize = 0;
+const SLOT_VIRTUAL_DISK_SIZE: usize = 1;
+const SLOT_LOGICAL_SECTOR_SIZE: usize = 2;
+const SLOT_PHYSICAL_SECTOR_SIZE: usize = 3;
+const SLOT_PARENT_LOCATOR: usize = 4;
+
 /// Scan a metadata table for the items this crate reads, by GUID.
 ///
 /// `table` starts at the table header. Entries that would run past the
 /// end of `table` are not scanned, and at most 32 are. Returns `None`
 /// if the signature is wrong, the entry count exceeds the spec limit,
-/// or any of the four required items is not listed.
+/// any item this crate reads is listed twice, two of them overlap, or
+/// any of the four required items is not listed.
 fn locate_metadata_items(table: &[u8]) -> Option<MetadataItemLocations> {
     if table.len() < METADATA_TABLE_HEADER_SIZE || le_u64(table, 0) != METADATA_TABLE_SIGNATURE {
         return None;
@@ -1206,11 +1286,15 @@ fn locate_metadata_items(table: &[u8]) -> Option<MetadataItemLocations> {
         return None;
     }
 
-    let mut file_parameters = None;
-    let mut virtual_disk_size = None;
-    let mut logical_sector_size = None;
-    let mut physical_sector_size = None;
-    let mut parent_locator = None;
+    // (offset, declared Length) of each item this crate reads, indexed
+    // as `RECOGNISED_METADATA_ITEMS` lists them. One slot per GUID, and
+    // a GUID listed twice is refused below, so every slot that is set
+    // is the entry the reader will use -- there is no "first N
+    // recorded" array that a table can fill with entries it then never
+    // reads (an earlier fixed six-slot array let a seventh recognised
+    // entry go unchecked).
+    let mut found: [Option<(u32, u32)>; RECOGNISED_METADATA_ITEMS.len()] =
+        [None; RECOGNISED_METADATA_ITEMS.len()];
 
     for i in 0..entry_count.min(32) as usize {
         let entry_start = METADATA_TABLE_HEADER_SIZE + i * METADATA_TABLE_ENTRY_SIZE;
@@ -1219,29 +1303,84 @@ fn locate_metadata_items(table: &[u8]) -> Option<MetadataItemLocations> {
         }
 
         let guid = &table[entry_start..entry_start + 16];
-        let item_offset = le_u32(table, entry_start + 16);
+        let Some(slot) = RECOGNISED_METADATA_ITEMS
+            .iter()
+            .position(|(g, _)| guid == &g[..])
+        else {
+            continue;
+        };
+        // A recognised GUID listed twice leaves the image with two
+        // answers to the same question, and which one a reader uses
+        // depends on the reader. SPEC(VHDX) 2.6.1.2 requires the
+        // ItemId/IsUser pair to be unique, and qemu refuses the image
+        // whatever IsUser says (`vhdx_parse_metadata` returns -EINVAL
+        // on a repeat; measured with qemu-img 10.0.13 on a table whose
+        // Page 83 entry was relabelled File Parameters at the same
+        // offset), so this follows both.
+        if found[slot].is_some() {
+            return None;
+        }
+        // Offset at entry +16, Length at entry +20 (SPEC(VHDX) 2.6.1.2).
+        found[slot] = Some((
+            le_u32(table, entry_start + 16),
+            le_u32(table, entry_start + 20),
+        ));
+    }
 
-        if guid == FILE_PARAMETERS_GUID {
-            file_parameters = Some(item_offset);
-        } else if guid == VIRTUAL_DISK_SIZE_GUID {
-            virtual_disk_size = Some(item_offset);
-        } else if guid == LOGICAL_SECTOR_SIZE_GUID {
-            logical_sector_size = Some(item_offset);
-        } else if guid == PHYSICAL_SECTOR_SIZE_GUID {
-            physical_sector_size = Some(item_offset);
-        } else if guid == PARENT_LOCATOR_GUID {
-            // Metadata table entry Length, at entry offset +20
-            // (SPEC(VHDX) 2.6.1.2).
-            parent_locator = Some((item_offset, le_u32(table, entry_start + 20)));
+    // SPEC(VHDX) 2.6.1.2: a metadata item "MUST NOT overlap with any
+    // other region in the file", which includes the other metadata
+    // items. Nothing checked, so a table declaring a parent locator on
+    // top of the File Parameters, Virtual Disk Size and sector-size
+    // items read back as fully sound: no defect, no refusal. Which
+    // item's bytes a reader then uses depends on the reader, so an
+    // image like this has no single meaning -- and `parse_parent_locator`
+    // cannot catch it even in principle, being handed only its own
+    // item's slice, with every offset it decodes relative to that
+    // slice's start (issue #576).
+    //
+    // instar's own emitter never produces one: `build_metadata` writes
+    // the five fixed items back to back and `build_parent_locator`
+    // appends the locator immediately above them. This is entirely
+    // about reading what another producer wrote.
+    //
+    // Neither oracle refuses such an image -- libvhdi reads a clean
+    // overlap of two items as sound, and qemu-img cannot open a
+    // differencing VHDX at all -- so this is the specification being
+    // followed rather than a reference implementation. Items this
+    // crate does not read are not checked.
+    //
+    // The extent checked is the bytes the item can be read from: its
+    // declared Length, but never less than what `parse_metadata_region`
+    // reads for a fixed-size item. A table that claims more bytes than
+    // the item needs is claiming those bytes; one that claims fewer --
+    // `Length = 0`, say -- must not make the bytes the reader actually
+    // uses invisible to this check. qemu-img reads a File Parameters
+    // entry declaring `Length = 0` as normal, so the short Length is not
+    // refused on its own, only widened here.
+    let extent = |slot: usize| -> Option<(u64, u64)> {
+        let (offset, declared) = found[slot]?;
+        let read_size = RECOGNISED_METADATA_ITEMS[slot].1;
+        Some((u64::from(offset), u64::from(declared.max(read_size))))
+    };
+    for i in 1..found.len() {
+        for j in 0..i {
+            let (Some((a_off, a_len)), Some((b_off, b_len))) = (extent(i), extent(j)) else {
+                continue;
+            };
+            // `ranges_overlap` takes the second length as a u32, and
+            // both extents came from u32 fields, so this cannot fail.
+            if ranges_overlap(a_off, a_len, b_off, u32::try_from(b_len).ok()?) {
+                return None;
+            }
         }
     }
 
     Some(MetadataItemLocations {
-        file_parameters: file_parameters?,
-        virtual_disk_size: virtual_disk_size?,
-        logical_sector_size: logical_sector_size?,
-        physical_sector_size: physical_sector_size?,
-        parent_locator,
+        file_parameters: found[SLOT_FILE_PARAMETERS]?.0,
+        virtual_disk_size: found[SLOT_VIRTUAL_DISK_SIZE]?.0,
+        logical_sector_size: found[SLOT_LOGICAL_SECTOR_SIZE]?.0,
+        physical_sector_size: found[SLOT_PHYSICAL_SECTOR_SIZE]?.0,
+        parent_locator: found[SLOT_PARENT_LOCATOR],
     })
 }
 
@@ -6573,6 +6712,65 @@ mod tests {
     }
 
     #[test]
+    fn a_locator_with_more_entries_than_retained_is_still_usable() {
+        // Hyper-V's five entries plus four more: spec-legal (SPEC(VHDX)
+        // 2.6.2.6.1 sets no bound), past what the parser retains, and
+        // the preferred path is among the entries that were read. The
+        // capacity is instar's limit, not a fault of the image, so the
+        // locator must still resolve its parent.
+        let mut buf = [0u8; 2048];
+        let pairs = [
+            ("parent_linkage", HYPERV_LINKAGE),
+            ("relative_path", r".\parent.vhdx"),
+            ("k2", "v2"),
+            ("k3", "v3"),
+            ("k4", "v4"),
+            ("k5", "v5"),
+            ("k6", "v6"),
+            ("k7", "v7"),
+            ("k8", "v8"),
+        ];
+        let len = build_locator_item(&pairs, &mut buf);
+        let locator = parse_parent_locator(&buf[..len]).unwrap();
+        assert_eq!(
+            locator.defect,
+            Some(VhdxParentLocatorDefect::EntryCountExceedsCapacity)
+        );
+        let usable = locator.usable().expect("a parser bound refused the image");
+        assert_eq!(usable.preferred_path(), Some(&br".\parent.vhdx"[..]));
+    }
+
+    #[test]
+    fn a_locator_whose_count_exceeds_its_item_is_not_usable() {
+        let mut buf = [0u8; 1024];
+        let len = build_locator_item(&[("relative_path", r".\parent.vhdx")], &mut buf);
+        write_le_u16(&mut buf, 18, 0xFFFF);
+        let locator = parse_parent_locator(&buf[..len]).unwrap();
+        assert_eq!(
+            locator.usable().err(),
+            Some(VhdxParentLocatorRefusal::Malformed(
+                VhdxParentLocatorDefect::EntryCountExceedsItem
+            ))
+        );
+    }
+
+    #[test]
+    fn a_locator_of_a_foreign_type_is_not_usable() {
+        let mut buf = [0u8; 1024];
+        let len = build_locator_item(&[("relative_path", r".\parent.vhdx")], &mut buf);
+        buf[..16].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef].repeat(4));
+        let locator = parse_parent_locator(&buf[..len]).unwrap();
+        assert!(locator.defect.is_none());
+        assert_eq!(
+            locator.usable().err(),
+            Some(VhdxParentLocatorRefusal::ForeignLocatorType)
+        );
+        // And a sound one is.
+        let len = build_locator_item(&[("relative_path", r".\parent.vhdx")], &mut buf);
+        assert!(parse_parent_locator(&buf[..len]).unwrap().usable().is_ok());
+    }
+
+    #[test]
     fn parent_locator_key_offset_past_region_end() {
         let mut buf = [0u8; 1024];
         let len = build_locator_item(&[("relative_path", r".\parent.vhdx")], &mut buf);
@@ -7739,6 +7937,195 @@ mod tests {
         let items = parse_metadata_region(&region).unwrap();
         assert_eq!(items.virtual_disk_size, 3 * 1024 * 1024);
         assert_eq!(items.virtual_disk_size_offset, 0x10100);
+    }
+
+    #[test]
+    fn metadata_region_refuses_two_items_that_overlap() {
+        // SPEC(VHDX) 2.6.1.2: an item must not overlap another region.
+        // Point the Physical Sector Size entry at the Logical Sector
+        // Size item: both are four-byte sector sizes and both read 512,
+        // so each item is individually valid and the image reads as
+        // sound -- which is exactly the shape nothing caught (#576).
+        // Measured: libvhdi reports this image as a sound differencing
+        // disk, so the specification is the authority here, not an
+        // implementation.
+        let mut region = metadata_region(false, false);
+        let logical = METADATA_TABLE_HEADER_SIZE + 3 * METADATA_TABLE_ENTRY_SIZE;
+        let physical = METADATA_TABLE_HEADER_SIZE + 4 * METADATA_TABLE_ENTRY_SIZE;
+        assert_eq!(&region[logical..logical + 16], &LOGICAL_SECTOR_SIZE_GUID);
+        assert_eq!(&region[physical..physical + 16], &PHYSICAL_SECTOR_SIZE_GUID);
+        let logical_offset = le_u32(&region, logical + 16);
+
+        // Sound as written.
+        assert!(parse_metadata_region(&region).is_some());
+
+        write_le_u32(&mut region, physical + 16, logical_offset);
+        assert!(
+            parse_metadata_region(&region).is_none(),
+            "two metadata items at the same offset were read as sound"
+        );
+    }
+
+    #[test]
+    fn metadata_region_refuses_a_locator_laid_over_the_fixed_items() {
+        // The shape the issue describes: a parent locator item placed
+        // on top of a fixed item rather than above it. Its own bytes
+        // are copied to the new offset, so the locator still parses;
+        // what is wrong is that two items claim the same bytes.
+        //
+        // It is laid over Virtual Disk Size, whose value no reader
+        // validates, and the two sector-size items it would otherwise
+        // also cover are moved above it. So every item still reads as
+        // individually valid and only the overlap check can refuse the
+        // image. An earlier version laid the locator over File
+        // Parameters, which made the block size the locator's GUID
+        // bytes: the image was refused for an invalid block size, and
+        // the test passed with the overlap check deleted.
+        let mut region = metadata_region(true, true);
+        assert!(parse_metadata_region(&region).is_some());
+
+        let e = METADATA_TABLE_HEADER_SIZE + 5 * METADATA_TABLE_ENTRY_SIZE;
+        assert_eq!(&region[e..e + 16], &PARENT_LOCATOR_GUID);
+        let item_offset = le_u32(&region, e + 16) as usize;
+        let item_len = le_u32(&region, e + 20) as usize;
+        let item: std::vec::Vec<u8> = region[item_offset..item_offset + item_len].to_vec();
+
+        // Move the sector-size items clear of where the locator goes.
+        for (n, guid, at) in [
+            (3, LOGICAL_SECTOR_SIZE_GUID, 0x1_0800u32),
+            (4, PHYSICAL_SECTOR_SIZE_GUID, 0x1_0804u32),
+        ] {
+            let entry = METADATA_TABLE_HEADER_SIZE + n * METADATA_TABLE_ENTRY_SIZE;
+            assert_eq!(&region[entry..entry + 16], &guid);
+            write_le_u32(&mut region, at as usize, 512);
+            write_le_u32(&mut region, entry + 16, at);
+        }
+        let vds = METADATA_TABLE_HEADER_SIZE + METADATA_TABLE_ENTRY_SIZE;
+        assert_eq!(&region[vds..vds + 16], &VIRTUAL_DISK_SIZE_GUID);
+        let over_vds = le_u32(&region, vds + 16) as usize;
+        assert!(over_vds + item_len <= 0x1_0800);
+
+        region[over_vds..over_vds + item_len].copy_from_slice(&item);
+        write_le_u32(&mut region, e + 16, over_vds as u32);
+        let items = parse_metadata_region(&region);
+        assert!(
+            items.is_none(),
+            "a parent locator covering the Virtual Disk Size item was read as sound"
+        );
+    }
+
+    /// Append one metadata table entry to `region` and bump the count.
+    fn append_metadata_entry(region: &mut [u8], guid: &[u8; 16], offset: u32, length: u32) {
+        let count = le_u16(region, METADATA_TABLE_ENTRY_COUNT_OFFSET) as usize;
+        let e = METADATA_TABLE_HEADER_SIZE + count * METADATA_TABLE_ENTRY_SIZE;
+        region[e..e + 16].copy_from_slice(guid);
+        write_le_u32(region, e + 16, offset);
+        write_le_u32(region, e + 20, length);
+        write_le_u16(
+            region,
+            METADATA_TABLE_ENTRY_COUNT_OFFSET,
+            (count + 1) as u16,
+        );
+    }
+
+    #[test]
+    fn metadata_region_refuses_a_recognised_item_listed_twice() {
+        // The same item, the same offset: harmless-looking, and still
+        // two answers to one question. qemu-img 10.0.13 refuses this
+        // exact shape (a Page 83 entry relabelled File Parameters at
+        // the real item's offset) with EINVAL.
+        let mut region = metadata_region(false, false);
+        let fp = METADATA_TABLE_HEADER_SIZE;
+        assert_eq!(&region[fp..fp + 16], &FILE_PARAMETERS_GUID);
+        let fp_offset = le_u32(&region, fp + 16);
+        append_metadata_entry(&mut region, &FILE_PARAMETERS_GUID, fp_offset, 8);
+        assert!(
+            parse_metadata_region(&region).is_none(),
+            "a File Parameters item listed twice was read as sound"
+        );
+    }
+
+    #[test]
+    fn metadata_region_refuses_a_locator_over_the_items_after_many_entries() {
+        // The shape that defeated a fixed six-slot extent array: enough
+        // recognised entries ahead of the locator to fill it, so the
+        // locator -- laid over the fixed items -- was never recorded
+        // and never checked. Six extra Logical Sector Size entries at
+        // distinct, non-overlapping offsets, then the locator.
+        //
+        // With one slot per GUID there is no longer an array to fill:
+        // seven recognised entries means a GUID repeated, which is
+        // refused on its own. This pins that the shape stays refused
+        // whichever rule catches it; the rules are guarded one at a
+        // time by the tests either side.
+        let mut region = metadata_region(true, true);
+        let e = METADATA_TABLE_HEADER_SIZE + 5 * METADATA_TABLE_ENTRY_SIZE;
+        assert_eq!(&region[e..e + 16], &PARENT_LOCATOR_GUID);
+        let item_offset = le_u32(&region, e + 16) as usize;
+        let item_len = le_u32(&region, e + 20) as usize;
+        let item: std::vec::Vec<u8> = region[item_offset..item_offset + item_len].to_vec();
+        // Drop the locator entry, add the padding entries, then put the
+        // locator back last, on top of the fixed items.
+        write_le_u16(&mut region, METADATA_TABLE_ENTRY_COUNT_OFFSET, 5);
+        for k in 0..6u32 {
+            let at = 0x1_0800 + k * 0x10;
+            write_le_u32(&mut region, at as usize, 512);
+            append_metadata_entry(&mut region, &LOGICAL_SECTOR_SIZE_GUID, at, 4);
+        }
+        let over_the_items = METADATA_ITEMS_MIN_OFFSET as usize;
+        region[over_the_items..over_the_items + item_len].copy_from_slice(&item);
+        append_metadata_entry(
+            &mut region,
+            &PARENT_LOCATOR_GUID,
+            over_the_items as u32,
+            item_len as u32,
+        );
+        assert_eq!(le_u16(&region, METADATA_TABLE_ENTRY_COUNT_OFFSET), 12);
+        assert!(
+            parse_metadata_region(&region).is_none(),
+            "a locator over the fixed items, listed after six other entries, was read as sound"
+        );
+    }
+
+    #[test]
+    fn metadata_region_refuses_an_item_over_one_declaring_a_short_length() {
+        // File Parameters declares Length = 0, and Virtual Disk Size is
+        // pointed at the same bytes. The reader still reads eight bytes
+        // of each, so they overlap whatever the table says the File
+        // Parameters item's length is. qemu-img reads a zero Length as
+        // normal, so only the overlap is refused, not the short Length.
+        let mut region = metadata_region(false, false);
+        let fp = METADATA_TABLE_HEADER_SIZE;
+        let vds = METADATA_TABLE_HEADER_SIZE + METADATA_TABLE_ENTRY_SIZE;
+        assert_eq!(&region[fp..fp + 16], &FILE_PARAMETERS_GUID);
+        assert_eq!(&region[vds..vds + 16], &VIRTUAL_DISK_SIZE_GUID);
+
+        write_le_u32(&mut region, fp + 20, 0);
+        assert!(
+            parse_metadata_region(&region).is_some(),
+            "a short declared Length on its own is not a refusal"
+        );
+
+        // Both declare Length 0, so neither declared extent covers a
+        // byte: only the read size makes the overlap visible.
+        write_le_u32(&mut region, vds + 20, 0);
+        let fp_offset = le_u32(&region, fp + 16);
+        write_le_u32(&mut region, vds + 16, fp_offset);
+        assert!(
+            parse_metadata_region(&region).is_none(),
+            "an item laid over one declaring Length 0 was read as sound"
+        );
+    }
+
+    #[test]
+    fn metadata_region_still_accepts_items_that_merely_abut() {
+        // The guard is about overlap, not adjacency: the five items
+        // `build_metadata` writes are back to back, and the locator
+        // starts at the first free byte above them. If a half-open
+        // range were compared as closed, every image instar writes
+        // would be refused.
+        assert!(parse_metadata_region(&metadata_region(false, false)).is_some());
+        assert!(parse_metadata_region(&metadata_region(true, true)).is_some());
     }
 
     #[test]

@@ -256,6 +256,51 @@ impl VhdFooter {
         let offset = find_footer_offset(last_sector)?;
         Self::parse(last_sector.get(offset..)?)
     }
+
+    /// Parse a VHD footer and verify its checksum, for a caller that
+    /// will act on the fields it returns.
+    ///
+    /// [`Self::parse`] validates the length and the cookie and reads the
+    /// stored checksum without checking it, which is what `check` wants:
+    /// `check`'s job is to decode a corrupt footer and *report* the
+    /// mismatch, so it cannot be handed a `None`. Every other reader is
+    /// in the opposite position -- it is about to take a size, a disk
+    /// type or a parent identity from these bytes and act on it -- and
+    /// for those the checksum is the only field that constrains the
+    /// other 500. qemu's vpc driver refuses a footer whose checksum
+    /// disagrees ("Incorrect header checksum"), so these callers do too.
+    ///
+    /// Splitting the two is deliberate: tightening `parse` itself would
+    /// take `check`'s diagnostic away, and leaving every consumer to
+    /// verify for itself is how four of them end up disagreeing about
+    /// whether they bothered.
+    pub fn parse_verified(buf: &[u8]) -> Option<Self> {
+        let footer = Self::parse(buf)?;
+        let expected = compute_checksum(buf.get(..FOOTER_SIZE)?, FOOTER_CHECKSUM_OFFSET);
+        if footer.checksum != expected {
+            return None;
+        }
+        Some(footer)
+    }
+
+    /// [`Self::parse_last_sector`], with the checksum verified as
+    /// [`Self::parse_verified`] verifies it.
+    pub fn parse_last_sector_verified(last_sector: &[u8]) -> Option<Self> {
+        let offset = find_footer_offset(last_sector)?;
+        Self::parse_verified(last_sector.get(offset..)?)
+    }
+
+    /// Whether `buf` begins with the VHD footer cookie, whatever else is
+    /// wrong with it.
+    ///
+    /// A reader that falls back to another location when a footer does
+    /// not parse needs to tell "there is no footer here" from "there is
+    /// a footer here and it is bad". Falling back on the second is how a
+    /// corrupt footer gets replaced by a sound one from elsewhere in the
+    /// file and the image opens anyway.
+    pub fn has_cookie(buf: &[u8]) -> bool {
+        buf.len() >= FOOTER_COOKIE_OFFSET + 8 && be_u64(buf, FOOTER_COOKIE_OFFSET) == VHD_COOKIE
+    }
 }
 
 /// Locate the VHD footer inside a buffer holding the image's final
@@ -1078,15 +1123,14 @@ impl<'a> VhdParentInfo<'a> {
 ///
 /// The checksum is the one's complement of the sum of all bytes in the
 /// structure, with the checksum field itself set to zero during computation.
+///
+/// The arithmetic itself is
+/// [`shared::format_detection::vhd_ones_complement_checksum`], where
+/// format detection can reach it: a footer's checksum is what decides
+/// whether a tail sector is a footer at all, and detection cannot depend
+/// on this crate.
 pub fn compute_checksum(buf: &[u8], checksum_offset: usize) -> u32 {
-    let mut sum: u32 = 0;
-    for (i, &b) in buf.iter().enumerate() {
-        if i >= checksum_offset && i < checksum_offset + 4 {
-            continue;
-        }
-        sum = sum.wrapping_add(b as u32);
-    }
-    !sum
+    shared::format_detection::vhd_ones_complement_checksum(buf, checksum_offset)
 }
 
 // ============================================================================
@@ -1254,27 +1298,6 @@ pub fn footer_geometry(current_size: u64) -> (u16, u8, u8) {
     } else {
         compute_vhd_geometry(current_size)
     }
-}
-
-// ============================================================================
-// Allocation scanning — pure helper
-// ============================================================================
-
-/// Count allocated entries in a dynamic-VHD BAT byte slice.
-///
-/// Each entry is a big-endian u32 sector pointer. The unallocated
-/// marker is `0xFFFF_FFFF`. Any other value indicates an allocated
-/// block.
-///
-/// `bat_bytes` may have a trailing partial entry (length not a
-/// multiple of 4); the trailing bytes are ignored. The caller is
-/// expected to pass a slice covering exactly `total_blocks * 4`
-/// bytes after BAT padding.
-pub fn count_allocated_in_bat(bat_bytes: &[u8]) -> u64 {
-    bat_bytes
-        .chunks_exact(4)
-        .filter(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]) != BAT_UNALLOCATED)
-        .count() as u64
 }
 
 /// Classify one dynamic-VHD BAT entry into a single `MapExtent`.
@@ -1464,6 +1487,13 @@ pub struct VhdState {
     pub block_data_offset: u32,
     pub max_table_entries: u32,
     pub table_offset: u64,
+    /// File offset of the dynamic header, from the footer's
+    /// `data_offset`. Zero for a fixed VHD, which has none.
+    ///
+    /// Kept so that the BAT-placement guard can name the regions the
+    /// image itself declares; see
+    /// [`Self::block_overlaps_a_declared_region`].
+    pub header_offset: u64,
     pub current_size: u64,
     // Sector cache for BAT reads
     pub bat_cached_sector: u64,
@@ -1507,8 +1537,22 @@ impl VhdState {
         }
         *bytes_read += sector_size as u64;
 
-        // Try parsing footer from first sector
-        let footer = VhdFooter::parse(&first_sector);
+        // Try parsing footer from first sector. The checksum is
+        // verified, so the fields this reader is about to act on are
+        // constrained by something (issue #583).
+        let footer = VhdFooter::parse_verified(&first_sector);
+
+        // A footer cookie at offset 0 is a claim that this is a dynamic
+        // or differencing VHD whose authoritative footer is *here*, and
+        // qemu's vpc driver refuses the file outright when the copy at 0
+        // does not verify. Refuse it here too rather than reading on to
+        // the tail: the fallback below exists for a fixed VHD, which has
+        // no footer copy at 0 at all, and letting a bad copy fall through
+        // to a sound trailing footer opens an image qemu will not touch,
+        // with the two footers disagreeing about the disk's own geometry.
+        if footer.is_none() && VhdFooter::has_cookie(&first_sector) {
+            return None;
+        }
 
         if footer.is_none() {
             // No footer at start — try the last sector (fixed VHD
@@ -1527,7 +1571,7 @@ impl VhdState {
 
             // For large sectors the footer is at the start of the
             // last sector (footer is only 512 bytes).
-            let footer = VhdFooter::parse(&last_sector)?;
+            let footer = VhdFooter::parse_verified(&last_sector)?;
             return Self::init_fixed(
                 footer,
                 device_idx,
@@ -1651,6 +1695,7 @@ impl VhdState {
             block_data_offset: bitmap_bytes,
             max_table_entries: dyn_header.max_table_entries,
             table_offset: dyn_header.table_offset,
+            header_offset: footer.data_offset,
             current_size: footer.current_size,
             bat_cached_sector: u64::MAX,
             bat_cache_buf,
@@ -1678,6 +1723,10 @@ impl VhdState {
             block_data_offset: 0,
             max_table_entries: 0,
             table_offset: 0,
+            // A fixed VHD has no dynamic header, and no BAT to place a
+            // block with, so it declares none of the regions the guard
+            // protects.
+            header_offset: 0,
             current_size: footer.current_size,
             bat_cached_sector: u64::MAX,
             bat_cache_buf,
@@ -1689,6 +1738,82 @@ impl VhdState {
     /// Check if this is a fixed VHD (raw data, no BAT).
     pub fn is_fixed(&self) -> bool {
         self.disk_type == DISK_TYPE_FIXED
+    }
+
+    /// Whether a block's byte range `[offset, offset + len)` overlaps a
+    /// region this image declares for its own metadata: the footer copy
+    /// at offset 0, the dynamic header the footer locates, or the BAT
+    /// the dynamic header locates.
+    ///
+    /// Nothing checked a BAT entry's placement, so a dynamic VHD whose
+    /// first BAT entry was 0 had its block's bitmap land on the footer
+    /// copy and its payload on the dynamic header, and instar served the
+    /// image's own structure to the guest as data (issue #662). Measured
+    /// against qemu-img 10.0.13: qemu reads such a block out too, so
+    /// this is deliberately stricter than qemu. It is the rule instar
+    /// already applies on three of its own paths -- the VHDX reader
+    /// refuses a payload block overlapping a declared region (#625,
+    /// #634), and this crate's `locator_defect` refuses a *locator*
+    /// whose data overlaps the footer or the dynamic header -- and a VHD
+    /// block is the one of the three that reaches the guest as payload.
+    ///
+    /// All four BAT consumers go through here, for the reason #634
+    /// records on the VHDX side: with the guard on the reader alone,
+    /// `map` would report a block at an offset inside the dynamic header
+    /// as data there and `measure` would count its bytes, while
+    /// `convert` refused to read it -- three answers to one question
+    /// about one image.
+    ///
+    /// The trailing footer is not among the regions. It is located by
+    /// the file's length rather than declared by the image, and the
+    /// guest knows the length only as a sector count rounded up past
+    /// end-of-file, so a range computed from it would refuse legitimate
+    /// blocks in an image whose sector size is above 512. Reads are
+    /// bounded by `input_capacity` regardless.
+    ///
+    /// Arithmetic that overflows counts as overlap: an end this cannot
+    /// compute is not one it can prove clear of a region.
+    fn block_overlaps_a_declared_region(&self, offset: u64, len: u64) -> bool {
+        if self.disk_type == DISK_TYPE_FIXED || len == 0 {
+            return false;
+        }
+        let Some(end) = offset.checked_add(len) else {
+            return true;
+        };
+
+        // The footer copy a dynamic or differencing VHD keeps at
+        // offset 0.
+        if ranges_overlap(offset, end, 0, FOOTER_SIZE as u64) {
+            return true;
+        }
+
+        let Some(header_end) = self.header_offset.checked_add(DYNAMIC_HEADER_SIZE as u64) else {
+            return true;
+        };
+        if ranges_overlap(offset, end, self.header_offset, header_end) {
+            return true;
+        }
+
+        let Some(bat_bytes) = (self.max_table_entries as u64).checked_mul(4) else {
+            return true;
+        };
+        let Some(bat_end) = self.table_offset.checked_add(bat_bytes) else {
+            return true;
+        };
+        ranges_overlap(offset, end, self.table_offset, bat_end)
+    }
+
+    /// The byte range a block occupies: its 512-byte sector bitmap, if
+    /// it has one, followed by its payload.
+    ///
+    /// The whole block is checked rather than the bytes one read wants,
+    /// so that the answer for an entry does not depend on where in the
+    /// block the read began.
+    fn block_extent(&self, block_host_offset: u64) -> (u64, u64) {
+        (
+            block_host_offset,
+            (self.block_data_offset as u64).saturating_add(self.block_size as u64),
+        )
     }
 
     /// Look up the host location for a given virtual byte offset.
@@ -1743,6 +1868,10 @@ impl VhdState {
         // BAT entry is the absolute sector number (512-byte sectors)
         // of the block's sector bitmap. Data follows the bitmap.
         let block_host_offset = (bat_entry as u64).checked_mul(512)?;
+        let (extent_start, extent_len) = self.block_extent(block_host_offset);
+        if self.block_overlaps_a_declared_region(extent_start, extent_len) {
+            return None;
+        }
         let data_start = block_host_offset.checked_add(self.block_data_offset as u64)?;
 
         // Offset within the block
@@ -1823,6 +1952,10 @@ impl VhdState {
         // BAT entry is the absolute sector number (512-byte sectors) of
         // the block's sector bitmap. Data follows the bitmap.
         let bitmap_host_offset = (bat_entry as u64).checked_mul(512)?;
+        let (extent_start, extent_len) = self.block_extent(bitmap_host_offset);
+        if self.block_overlaps_a_declared_region(extent_start, extent_len) {
+            return None;
+        }
         let data_start = bitmap_host_offset.checked_add(self.block_data_offset as u64)?;
 
         // Offset within the block, and the 512-byte sector it lands in.
@@ -1920,8 +2053,8 @@ impl VhdState {
     // meaningful_len / per-sector read) is duplicated near-verbatim in
     // `vhdx::VhdxState::scan_allocation`. The two formats walk single
     // contiguous BAT tables; the only differences are the entry
-    // decoder (`count_allocated_in_bat` vs the vhdx chunk_ratio-aware
-    // variant) and one cache-invalidation line. Extracting a shared
+    // decoder (a placement-checked per-entry count here, the vhdx
+    // chunk_ratio-aware `count_allocated_in_bat_chunk` there) and one cache-invalidation line. Extracting a shared
     // `walk_table_sectors(call_table, byte_offset, byte_len, ...,
     // FnMut(&[u8]))` helper into `shared` is captured as future work
     // in PLAN-measure.md; deferred because the FnMut + &mut self
@@ -1999,7 +2132,22 @@ impl VhdState {
                 (total_bat_bytes - bat_bytes_consumed).min((buf_end - buf_start) as u64) as usize;
             let meaningful = &chunk[..meaningful_len];
 
-            allocated_blocks += count_allocated_in_bat(meaningful);
+            // Counted entry by entry, with each allocated entry's
+            // placement checked as the reader checks it: measure
+            // must not count the bytes of a block the reader refuses
+            // to read (issue #662).
+            for c in meaningful.chunks_exact(4) {
+                let entry = u32::from_be_bytes([c[0], c[1], c[2], c[3]]);
+                if entry == BAT_UNALLOCATED {
+                    continue;
+                }
+                let block_host_offset = (entry as u64).saturating_mul(512);
+                let (extent_start, extent_len) = self.block_extent(block_host_offset);
+                if self.block_overlaps_a_declared_region(extent_start, extent_len) {
+                    return None;
+                }
+                allocated_blocks += 1;
+            }
             bat_bytes_consumed += meaningful_len as u64;
 
             sector += 1;
@@ -2132,6 +2280,19 @@ impl VhdState {
                     break 'walk;
                 }
                 let block_visible = block_size.min(self.current_size - block_virt);
+
+                // An entry whose block lands on the image's own
+                // metadata is refused here as the reader refuses it, so
+                // map does not report a block inside the dynamic header
+                // as data at that offset while convert declines to read
+                // it (issue #662).
+                if entry != BAT_UNALLOCATED {
+                    let block_host_offset = (entry as u64).saturating_mul(512);
+                    let (extent_start, extent_len) = self.block_extent(block_host_offset);
+                    if self.block_overlaps_a_declared_region(extent_start, extent_len) {
+                        return None;
+                    }
+                }
 
                 let mut ext =
                     classify_vhd_bat_entry(entry, block_virt, block_size, block_data_offset);
@@ -2642,6 +2803,48 @@ mod tests {
     fn place_footer(sector: &mut [u8], offset: usize, head: &[u8; 84]) {
         sector[offset..offset + head.len()].copy_from_slice(head);
         sector[offset + head.len()..offset + FOOTER_SIZE].fill(0);
+    }
+
+    #[test]
+    fn a_real_qemu_footer_verifies() {
+        // The fixture is the first 84 bytes of a footer qemu wrote, and
+        // the rest of a VHD footer is zero, so its stored checksum is
+        // the one this buffer computes to. If this ever fails, the
+        // verification is wrong rather than the image.
+        let mut sector = [0u8; 512];
+        place_footer(&mut sector, 0, &QEMU_DYNAMIC_FOOTER_HEAD);
+        assert!(VhdFooter::parse_verified(&sector).is_some());
+        assert!(VhdFooter::parse_last_sector_verified(&sector).is_some());
+    }
+
+    #[test]
+    fn a_footer_whose_checksum_disagrees_parses_but_does_not_verify() {
+        // The two constructors differ on purpose: `check` decodes a
+        // corrupt footer so it can report the mismatch, and every
+        // reader that acts on the fields refuses it (issue #583).
+        let mut sector = [0u8; 512];
+        place_footer(&mut sector, 0, &QEMU_DYNAMIC_FOOTER_HEAD);
+        write_be_u32(&mut sector, FOOTER_CHECKSUM_OFFSET, 0xdead_beef);
+
+        let lenient = VhdFooter::parse(&sector).expect("the cookie and length still hold");
+        assert_eq!(lenient.checksum, 0xdead_beef);
+        assert!(VhdFooter::parse_verified(&sector).is_none());
+        assert!(VhdFooter::parse_last_sector_verified(&sector).is_none());
+    }
+
+    #[test]
+    fn a_planted_cookie_is_distinguishable_from_no_footer_at_all() {
+        // `VhdState::init` falls back to the tail only when there is no
+        // footer at offset 0. Telling "nothing here" from "a footer
+        // here that does not hold up" is what stops a bad footer copy
+        // being replaced by a sound trailing one.
+        let mut sector = [0x41u8; 512];
+        assert!(!VhdFooter::has_cookie(&sector));
+        write_be_u64(&mut sector, FOOTER_COOKIE_OFFSET, VHD_COOKIE);
+        assert!(VhdFooter::has_cookie(&sector));
+        assert!(VhdFooter::parse_verified(&sector).is_none());
+        assert!(VhdFooter::has_cookie(&sector[..8]));
+        assert!(!VhdFooter::has_cookie(&sector[..7]));
     }
 
     #[test]
@@ -3976,91 +4179,6 @@ mod tests {
     }
 
     // ====================================================================
-    // count_allocated_in_bat tests
-    // ====================================================================
-
-    /// Helper: encode a u32 as 4 big-endian bytes.
-    fn be32(v: u32) -> [u8; 4] {
-        v.to_be_bytes()
-    }
-
-    #[test]
-    fn bat_count_empty() {
-        // Empty slice → 0 allocated entries.
-        assert_eq!(count_allocated_in_bat(&[]), 0);
-    }
-
-    #[test]
-    fn bat_count_all_allocated() {
-        // 4 entries, all with small non-0xFFFFFFFF values → all allocated.
-        let mut buf = [0u8; 16];
-        buf[0..4].copy_from_slice(&be32(0x0000_0001));
-        buf[4..8].copy_from_slice(&be32(0x0000_0002));
-        buf[8..12].copy_from_slice(&be32(0x0000_0003));
-        buf[12..16].copy_from_slice(&be32(0x0000_0004));
-        assert_eq!(count_allocated_in_bat(&buf), 4);
-    }
-
-    #[test]
-    fn bat_count_all_unallocated() {
-        // 4 entries, all 0xFFFFFFFF → 0 allocated.
-        let buf = [0xFF_u8; 16];
-        assert_eq!(count_allocated_in_bat(&buf), 0);
-    }
-
-    #[test]
-    fn bat_count_mixed() {
-        // 5 entries: entries 0 and 3 are allocated, entries 1, 2, 4 are not.
-        // Expected: 2.
-        let mut buf = [0u8; 20];
-        buf[0..4].copy_from_slice(&be32(0x0000_0010)); // allocated
-        buf[4..8].copy_from_slice(&be32(BAT_UNALLOCATED)); // unallocated
-        buf[8..12].copy_from_slice(&be32(BAT_UNALLOCATED)); // unallocated
-        buf[12..16].copy_from_slice(&be32(0x0000_0020)); // allocated
-        buf[16..20].copy_from_slice(&be32(BAT_UNALLOCATED)); // unallocated
-        assert_eq!(count_allocated_in_bat(&buf), 2);
-    }
-
-    #[test]
-    fn bat_count_trailing_partial_entry() {
-        // 3 complete entries + 1 trailing byte (13 bytes total).
-        // chunks_exact(4) must discard the tail and count only 3 entries.
-        // Entries: allocated, unallocated, allocated → expected 2.
-        let mut buf = [0u8; 13];
-        buf[0..4].copy_from_slice(&be32(0x0000_0001)); // allocated
-        buf[4..8].copy_from_slice(&be32(BAT_UNALLOCATED)); // unallocated
-        buf[8..12].copy_from_slice(&be32(0x0000_0002)); // allocated
-        buf[12] = 0x00; // trailing garbage byte — must be ignored
-        assert_eq!(count_allocated_in_bat(&buf), 2);
-    }
-
-    #[test]
-    fn bat_count_large_every_seventh_allocated() {
-        // 1024 entries, with every 7th entry allocated (indices 0, 7, 14, ...).
-        // Count = number of i in 0..1024 where i % 7 == 0.
-        let mut buf = [0xFF_u8; 1024 * 4];
-        let mut expected: u64 = 0;
-        for i in 0usize..1024 {
-            if i % 7 == 0 {
-                let off = i * 4;
-                buf[off..off + 4].copy_from_slice(&be32(i as u32));
-                expected += 1;
-            }
-        }
-        // Verify expected: ceil(1023 / 7) + 1 = 146 + 1 = 147.
-        assert_eq!(expected, 147);
-        assert_eq!(count_allocated_in_bat(&buf), 147);
-    }
-
-    #[test]
-    fn bat_count_zero_value_is_allocated() {
-        // BAT entry value 0 is a valid sector pointer → must count as allocated.
-        // Only 0xFFFFFFFF is the unallocated sentinel.
-        let buf = be32(0x0000_0000);
-        assert_eq!(count_allocated_in_bat(&buf), 1);
-    }
-
-    // ====================================================================
     // classify_vhd_bat_entry tests
     // ====================================================================
 
@@ -4957,12 +5075,80 @@ mod tests {
             block_data_offset: 512,
             max_table_entries: 4,
             table_offset: 1536,
+            // The layout every VHD writer uses: footer copy at 0,
+            // dynamic header at 512, BAT at 1536.
+            header_offset: 512,
             current_size: 4 * block_size as u64,
             bat_cached_sector: u64::MAX,
             bat_cache_buf: core::ptr::null_mut(),
             data_cached_sector: u64::MAX,
             data_cache_buf: core::ptr::null_mut(),
         }
+    }
+
+    #[test]
+    fn a_block_on_the_images_own_metadata_overlaps_a_declared_region() {
+        // The layout: footer copy [0, 512), dynamic header [512, 1536),
+        // BAT [1536, 1552) for four entries. A block is its 512-byte
+        // bitmap plus its payload.
+        let state = arithmetic_only_state(4096);
+
+        // BAT entry 0 -- the shape issue #662 names. The bitmap lands on
+        // the footer copy and the payload on the dynamic header.
+        assert!(state.block_overlaps_a_declared_region(0, 512 + 4096));
+        // A block whose bitmap starts inside the dynamic header, and one
+        // that starts on the BAT.
+        assert!(state.block_overlaps_a_declared_region(512, 512 + 4096));
+        assert!(state.block_overlaps_a_declared_region(1536, 512 + 4096));
+        // A block below the BAT whose payload runs up into it.
+        assert!(state.block_overlaps_a_declared_region(1024, 512 + 4096));
+
+        // The footer copy has to be a region in its own right. With
+        // the usual layout any block that reaches it also reaches the
+        // dynamic header, so the case that needs it is a header the
+        // footer puts far away: then a block at offset 0 overlaps the
+        // footer copy and nothing else.
+        let mut distant = arithmetic_only_state(4096);
+        distant.header_offset = 0x10_0000;
+        distant.table_offset = 0x10_1000;
+        assert!(
+            distant.block_overlaps_a_declared_region(0, 512 + 4096),
+            "a block on the footer copy must be refused even when the \
+             dynamic header and the BAT are elsewhere"
+        );
+        assert!(distant.block_overlaps_a_declared_region(0x10_0000, 512 + 4096));
+        assert!(distant.block_overlaps_a_declared_region(0x10_1000, 512 + 4096));
+        assert!(!distant.block_overlaps_a_declared_region(4 * 512, 512 + 4096));
+
+        // The first placement clear of all three: sector 4, which is
+        // where every writer in this tree puts the first block.
+        assert!(!state.block_overlaps_a_declared_region(4 * 512, 512 + 4096));
+        // Abutting the BAT's last byte is not overlapping it.
+        assert!(!state.block_overlaps_a_declared_region(1552, 512 + 4096));
+    }
+
+    #[test]
+    fn a_fixed_vhd_declares_no_regions_to_overlap() {
+        // A fixed VHD has no footer copy at offset 0, no dynamic header
+        // and no BAT: its data starts at byte 0 and the guard must not
+        // refuse it.
+        let mut state = arithmetic_only_state(4096);
+        state.disk_type = DISK_TYPE_FIXED;
+        assert!(!state.block_overlaps_a_declared_region(0, 512 + 4096));
+    }
+
+    #[test]
+    fn placement_arithmetic_that_overflows_counts_as_overlap() {
+        // Every input here is read out of the image. An end that cannot
+        // be computed is not one that can be proved clear of a region,
+        // so it is refused rather than waved through.
+        let mut state = arithmetic_only_state(4096);
+        assert!(state.block_overlaps_a_declared_region(u64::MAX - 8, 512));
+        state.header_offset = u64::MAX;
+        assert!(state.block_overlaps_a_declared_region(4 * 512, 512 + 4096));
+        state.header_offset = 512;
+        state.table_offset = u64::MAX;
+        assert!(state.block_overlaps_a_declared_region(4 * 512, 512 + 4096));
     }
 
     #[test]

@@ -1757,13 +1757,15 @@ pub fn parent_format_matches(
 /// `-u` alone is *not* `-F raw`: it leaves the hint `Unknown`, so the
 /// fallback still applies. See `docs/create.md`.
 ///
-/// What the fallback promotes is not otherwise validated: `VhdFooter`
-/// checks the cookie and not the checksum, so under `-u` a file whose
-/// last sector merely begins with `conectix` is accepted and its
-/// identity fields copied into the child. Issue #583 tracks that. It
-/// is deliberately not narrowed here, because the point of this
-/// predicate is to agree with `info`, `check` and `resize`, which
-/// reach a footer through the same lenient parse.
+/// What the fallback promotes is validated by the footer's own
+/// checksum: the caller reaches it through
+/// `VhdFooter::parse_last_sector_verified`, so a file whose last sector
+/// merely begins with `conectix` is no longer promoted, and no identity
+/// field is copied out of unconstrained bytes. That is a property of the
+/// footer, not of this predicate, which still decides only whether the
+/// tail may be looked at at all -- and it keeps this in step with
+/// `info`, `check` and `resize`, each of which now verifies the same
+/// checksum before acting on a footer's fields.
 #[must_use]
 pub fn footer_fallback_applies(detected: ImageFormat, hint: ImageFormat) -> bool {
     match detected {
@@ -2199,6 +2201,39 @@ mod qcow2_plan_tests {
     }
 
     #[test]
+    fn plan_qcow2_refuses_extended_l2_below_the_subcluster_floor() {
+        // `create -f qcow2 -o extended_l2=on,cluster_size=4k` wrote an
+        // image qemu-img refuses to open ("Unsupported subcluster size:
+        // 128"), and `qemu-img create` refuses the same request. A file
+        // with no reader is worse than a refused request (issue #805).
+        for cluster_size in [512u32, 4096, 8192] {
+            let mut opts = default_opts(1 << 30);
+            opts.extended_l2 = true;
+            opts.cluster_size = cluster_size;
+            let mut scratch = vec![0u8; QCOW2_MAX_METADATA_SCRATCH];
+            assert_eq!(
+                plan_qcow2(&opts, &mut scratch).err(),
+                Some(CreateError::InvalidClusterSize),
+                "extended_l2 with a {cluster_size}-byte cluster must be refused"
+            );
+
+            // The same cluster size without the feature is ordinary.
+            opts.extended_l2 = false;
+            assert!(plan_qcow2(&opts, &mut scratch).is_ok());
+        }
+
+        // 16 KiB clusters give exactly 512-byte subclusters, the
+        // smallest qemu accepts.
+        let mut opts = default_opts(1 << 30);
+        opts.extended_l2 = true;
+        opts.cluster_size = 1 << qcow2::MIN_EXTENDED_L2_CLUSTER_BITS;
+        let bytes = run_round_trip(&opts);
+        let parsed = qcow2::QcowHeader::parse(&bytes).expect("parse header");
+        assert!(parsed.extended_l2);
+        assert_eq!(parsed.cluster_size, 16384);
+    }
+
+    #[test]
     fn plan_qcow2_refcount_bits_1_round_trips() {
         let mut opts = default_opts(1 << 30);
         opts.refcount_bits = 1;
@@ -2289,15 +2324,21 @@ mod qcow2_plan_tests {
 
     #[test]
     fn plan_qcow2_handles_many_refcount_blocks() {
-        // virtual_size=32 GiB with cluster_size=512 and extended_l2
-        // forces ~130 refcount blocks. They must coalesce into a
-        // single MetadataWrite so the plan's inline write storage
-        // doesn't overflow.
+        // virtual_size=32 GiB with cluster_size=512 forces ~130
+        // refcount blocks. They must coalesce into a single
+        // MetadataWrite so the plan's inline write storage doesn't
+        // overflow.
+        //
+        // This used to pair those 512-byte clusters with extended_l2,
+        // which `qemu-img create` refuses and its driver cannot open,
+        // and which `plan_qcow2` now refuses too (issue #805). The
+        // small cluster size is what makes the refcount blocks
+        // numerous; the feature flag was incidental.
         let opts = Qcow2CreateOpts {
             virtual_size: 1u64 << 35,
             cluster_size: 512,
             refcount_bits: 16,
-            extended_l2: true,
+            extended_l2: false,
             lazy_refcounts: false,
             compat_v3: true,
             backing: None,
