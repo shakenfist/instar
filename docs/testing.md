@@ -113,6 +113,23 @@ budget that was ample at ~20 concurrent qemu processes and blows at
 that wants doubling. Raising 300 to 600 reflexively buys one more
 round of the same ejection.
 
+**Never build a LUKS image with `qemu-img create` in a test.** Before
+it writes a LUKS header, qemu-img times a key derivation to choose the
+iteration count. On some builds, Debian 12's qemu-img 7.2 among them,
+that timing reads zero CPU time about one time in three, and the create
+fails with `Unable to get accurate CPU usage`. Setting
+`encrypt.iter-time` does not help, because the timing runs either way.
+A fixture built like this ejected three unrelated pull requests from
+the merge queue
+([#905](https://github.com/shakenfist/instar/issues/905)). Use the
+prebuilt `qcow2-luks` image, `self.get_image('qcow2-luks')`, and skip
+when it is missing, as `TestCompareLuksQcow2` does. Copy it into the
+temporary directory first if the code under test could write to it.
+The `no-runtime-luks-create` pre-commit hook rejects a
+`qemu-img create` argv list that carries `encrypt.format=luks` under
+`tests/`. Opening an existing LUKS image with `--object secret` does
+no timing and is fine.
+
 ## Test Categories
 
 ### Safe Images (`test_info_safe.py`)

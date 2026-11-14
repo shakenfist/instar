@@ -1796,20 +1796,19 @@ class TestCompareFailureIsNotAVerdict(InstarTestBase):
 
         The guest refuses it before reading anything, which used to
         reach the user as "Content mismatch at offset 0!" and exit 1.
+
+        The LUKS image is the prebuilt ``qcow2-luks`` fixture, not one
+        made here: ``qemu-img create`` of a LUKS image times a key
+        derivation first and, on some qemu-img builds, fails about one
+        time in three with "Unable to get accurate CPU usage" (#905).
         """
-        self._require_qemu_tools()
+        image = self.get_image('qcow2-luks')
+        if not image.path.exists():
+            self.skipTest(f'Image not found: {image.path}')
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
-            self._run_tool(
-                ['qemu-img', 'create',
-                 '--object', 'secret,id=sec0,data=correct-horse',
-                 '-f', 'qcow2',
-                 '-o', 'encrypt.format=luks,encrypt.key-secret=sec0',
-                 'luks.qcow2', '1M'],
-                td)
             zeros = self._raw(td, 'zeros.raw', 1024 * 1024)
-            stdout, stderr, rc = self.run_instar_compare(
-                td / 'luks.qcow2', zeros)
+            stdout, stderr, rc = self.run_instar_compare(image.path, zeros)
             self.assertEqual(rc, 2, f'stdout={stdout!r} stderr={stderr!r}')
             self.assertEqual(stdout, '')
             self.assertIn(
