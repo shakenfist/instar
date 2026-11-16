@@ -322,7 +322,7 @@ instar should do.
 | The sweep's spurious failures get attributed as version boundaries | Known failure mode in this repository under host load. Step 1d re-runs any boundary case alone on the versions either side before recording it, and reports rather than writes when a result contradicts the master plan. |
 | 80 versions × new cases is slow enough to tempt shortcuts | Decision 2 caps pinned cases at 11 extents and keeps the ceiling probe to a four-version sample. `--jobs` exists but concurrency is what causes the spurious failures above, so step 1d runs at the default of 1 and the wall time goes in *Sweep results*. |
 | A green stestr run that ran almost nothing | Every step that runs tests checks "Ran: N" against the expected count rather than the exit code. A subunit attachment over 4 MiB kills a worker and the run still exits 0. |
-| The parser in 1b is written against one qemu version's layout | 1b asserts against host-written images and 1d then exercises it across 80 builds through the sparse cases; a layout difference shows up as a pin group rather than as a silent misparse. |
+| The parser in 1b is written against one qemu version's layout | 1b asserts against host-written images and 1d then exercises it across 80 builds through the sparse cases; a layout difference shows up as a pin group rather than as a silent misparse. Only the sparse ones: a flat extent has no header to read, so every flat case pins a null `structure` and the parser's flat path is covered by `tests/test_vmdk_structure.py` against the host alone. |
 
 ## Definition of done
 
@@ -432,3 +432,19 @@ sweep.
   checking an extent's declared sectors against its own header -- is
   recorded in the master plan's Future work rather than guessed at
   here. The mutation set is twelve, all killed.
+* 2026-11-17 (AEDT), review round 3: 1 fix, 1 document, 6 consider,
+  4 none -- and the round where the loop stopped converging, so it is
+  the last. The fix is in code round 2 added: asked to tell a refused
+  extent path from a missing one, round 2 added a string sentinel to a
+  function annotated as returning an int. Two more items are likewise
+  about code that did not exist two rounds ago. Four items were taken,
+  four declined, three of the four having been declined in an earlier
+  round already. The mutation set is thirteen; repairing it found a
+  fourteenth problem of its own, below.
+* The carried mutation script reported a **skip**, not a kill, on the
+  round-2 normaliser guard: round 3 restructured the line its anchor
+  pointed at, so that guard quietly stopped being exercised while the
+  totals still looked healthy. The anchor was repaired and all
+  thirteen then killed. A mutation harness carried across rounds needs
+  its skips read as failures, which is why this one prints them
+  separately rather than folding them into the count.

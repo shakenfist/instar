@@ -40,7 +40,7 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 from helpers.vhdx_structure import VhdxParseError, allocated_bytes, parse_vhdx, structural_diff, summarise
 from helpers.vmdk_structure import KIND_SPARSE as VMDK_SPARSE_EXTENT
@@ -588,12 +588,21 @@ def normalise_descriptor(text: str) -> str:
         # `$EXTENT<n>` indices and the `extent_names` indices would be
         # describing different extents inside one pinned result.
         match = EXTENT_LINE.match(line.strip())
-        if match is None or match.group('filename') is None:
+        if match is None:
+            lines.append(line)
+            continue
+        index = next(counter)
+        if match.group('filename') is None:
+            # A ZERO extent carries no filename, and there is nothing here
+            # to replace -- but `descriptor_extents` still returns an entry
+            # for it, so it has to take a number. Skipping it silently
+            # would put `$EXTENT2` on the third extent while
+            # `extent_names[1]` held the second.
             lines.append(line)
             continue
         start, end = match.span('filename')
         offset = len(line) - len(line.lstrip())
-        placeholder = f'{EXTENT_PLACEHOLDER_PREFIX}{next(counter)}'
+        placeholder = f'{EXTENT_PLACEHOLDER_PREFIX}{index}'
         lines.append(line[:offset + start] + placeholder + line[offset + end:])
     return '\n'.join(lines)
 
@@ -623,7 +632,7 @@ def _extent_name(filename: str) -> str:
     return filename
 
 
-def _extent_length(directory: Path, filename: Optional[str]) -> Optional[int]:
+def _extent_length(directory: Path, filename: Optional[str]) -> Union[int, str, None]:
     """The length of the file an extent line names, or None if there is no such file.
 
     `filename` is taken from the descriptor as qemu wrote it and resolved

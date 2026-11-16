@@ -800,7 +800,13 @@ Filled in as the plan runs. Already known:
   [#921](https://github.com/shakenfist/instar/pull/921) and left to the
   phases that use the parser as an oracle (10, 11 and 16), because what
   counts as internally consistent is a property of the writer those
-  phases build, and a refusal added now would be guessing at it.
+  phases build, and a refusal added now would be guessing at it. The
+  same entry covers two neighbours raised in the same review: a start
+  offset is carried through on any extent kind although only `FLAT`
+  lines are supposed to have one, and a `ZERO` extent that carries a
+  filename is opened and measured as though it held data. No writer
+  produces either, so each is a rule about malformed input rather than
+  a defect against anything that exists.
 
 ### Bugs fixed during this work
 

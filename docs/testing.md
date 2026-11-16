@@ -3474,8 +3474,11 @@ A split-subformat case records the normalised descriptor and, beside
 it, the extents it names: `extent_names`, each name with the image's
 stem replaced by `$STEM`, so the pin holds the naming scheme and not
 a scratch path; `extent_lengths`, the length of the file each extent
-line names, resolved against the directory holding the descriptor and
-`null` for one that is not there; and, for a sparse extent, the
+line names, resolved against the directory holding the descriptor,
+`null` for one that is not there and the string `refused` for a name
+that resolves outside that directory -- a writer that failed to create
+a file it promised and one that pointed at a file the image does not
+own are different findings; and, for a sparse extent, the
 `structure` that `tests/helpers/vmdk_structure.py` reads, which
 carries the VMDK4 header fields a reader walks the extent with. The
 names and the lengths come from the descriptor qemu wrote rather than
