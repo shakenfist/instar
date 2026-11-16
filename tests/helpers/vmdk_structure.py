@@ -99,6 +99,9 @@ HEADER_DESCRIPTOR_OFFSET = 28
 HEADER_DESCRIPTOR_SIZE = 36
 HEADER_RGD_OFFSET = 48
 HEADER_GD_OFFSET = 56
+# The VMDK spec calls this `overHead`; qemu's `VMDK4Header` calls the same
+# field `grain_offset`. Both names are here because a reader checking this
+# against `block/vmdk.c` will not find "overhead" in it.
 HEADER_OVERHEAD = 64
 # Everything above lies in the first 72 bytes, which is what is read.
 HEADER_PARSED_SIZE = 72
@@ -352,6 +355,14 @@ def read_descriptor(path) -> Tuple[str, bool]:
             size = header.descriptor_size_sectors * SECTOR_SIZE
             if size == 0:
                 raise VmdkParseError(f'{path}: the sparse header reserves no descriptor')
+            if size > MAX_DESCRIPTOR_BYTES:
+                # The sector count comes from the file's own header, so a
+                # corrupt or crafted one otherwise reads the whole image
+                # into memory and decodes it. qemu reads no more of a
+                # descriptor than this wherever it finds one.
+                raise VmdkParseError(
+                    f'{path}: the sparse header reserves {size} bytes for its descriptor, past the '
+                    f'{MAX_DESCRIPTOR_BYTES}-byte maximum')
             return _decode(reader.read(offset, size, 'embedded descriptor'), str(path)), True
         if head == VMDK3_MAGIC:
             raise VmdkParseError(f'{path}: a VMDK3 ({VMDK3_MAGIC.decode()}) image is not read structurally')

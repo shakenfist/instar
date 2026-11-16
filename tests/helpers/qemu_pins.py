@@ -44,8 +44,8 @@ from typing import List, Optional, Tuple
 
 from helpers.vhdx_structure import VhdxParseError, allocated_bytes, parse_vhdx, structural_diff, summarise
 from helpers.vmdk_structure import KIND_SPARSE as VMDK_SPARSE_EXTENT
-from helpers.vmdk_structure import VmdkParseError, descriptor_extents, parse_vmdk, read_descriptor
-from helpers.vmdk_structure import resolve_extent_path
+from helpers.vmdk_structure import EXTENT_LINE, VmdkParseError, descriptor_extents, parse_vmdk
+from helpers.vmdk_structure import read_descriptor, resolve_extent_path
 from helpers.vmdk_structure import structural_diff as vmdk_structural_diff
 from helpers.vmdk_structure import summarise as vmdk_summarise
 
@@ -87,6 +87,11 @@ SOURCE_NAME = 'source.raw'
 # bytes means qemu unlinked what it found and created its own file, and the
 # kept link holding an extent means qemu truncated the file in place.
 EXISTING_EXTENT_SIZE = 1024 * 1024
+# Recorded as an extent's length when its name does not resolve inside the
+# directory holding the descriptor. No qemu build writes such a descriptor,
+# so this does not appear in the committed pin; it is there so that one
+# appearing is legible rather than reading as a file qemu failed to create.
+REFUSED_EXTENT = 'refused'
 KEPT_LINK_SUFFIX = '.kept'
 
 # The convert source: 64 MiB of raw, zero except for three whole 8 MiB
@@ -575,15 +580,22 @@ def normalise_descriptor(text: str) -> str:
     """
     text = re.sub(r'^CID=[0-9a-fA-F]+$', f'CID={CID_PLACEHOLDER}', text, flags=re.MULTILINE)
     counter = itertools.count(1)
-
-    def _extent(match):
-        return f'{match.group(1)}"{EXTENT_PLACEHOLDER_PREFIX}{next(counter)}"'
-
-    # The same access modes `helpers.vmdk_structure` parses. Numbering only
-    # `RW` lines would leave a non-RW extent its literal filename here while
-    # still counting it in `extent_names`, so the two would describe
-    # different extents at the same index within one pinned result.
-    return re.sub(r'^((?:RW|RDONLY|NOACCESS)\s+\d+\s+[A-Z]+\s+)"[^"]*"', _extent, text, flags=re.MULTILINE)
+    lines = []
+    for line in text.split('\n'):
+        # `EXTENT_LINE` is the one definition of the syntax, shared with the
+        # parser that produces `extent_names` beside this. A second pattern
+        # here could accept a line the parser rejects, and then the
+        # `$EXTENT<n>` indices and the `extent_names` indices would be
+        # describing different extents inside one pinned result.
+        match = EXTENT_LINE.match(line.strip())
+        if match is None or match.group('filename') is None:
+            lines.append(line)
+            continue
+        start, end = match.span('filename')
+        offset = len(line) - len(line.lstrip())
+        placeholder = f'{EXTENT_PLACEHOLDER_PREFIX}{next(counter)}'
+        lines.append(line[:offset + start] + placeholder + line[offset + end:])
+    return '\n'.join(lines)
 
 
 def _run_vmdk_flat(qemu_img, case: dict, workdir: Path) -> dict:
@@ -617,17 +629,20 @@ def _extent_length(directory: Path, filename: Optional[str]) -> Optional[int]:
     `filename` is taken from the descriptor as qemu wrote it and resolved
     against the directory holding the descriptor, so an extent named wrongly
     or never created records a None rather than being looked for under the
-    name qemu was expected to use. A name that resolves outside that
-    directory, or onto something that is not a regular file, records None
-    too: it is not an extent of this image, and the pin is a record of what
-    the command wrote.
+    name qemu was expected to use.
+
+    A name that leaves that directory records `REFUSED_EXTENT` instead of
+    None. The two are different findings -- one says the writer did not
+    create a file it promised, the other says it pointed at a file the
+    image does not own -- and a pin that spelled them the same way could
+    not tell a reader which had happened.
     """
     if filename is None:
         return None
     try:
         path = Path(resolve_extent_path(filename, directory, 'extent'))
     except VmdkParseError:
-        return None
+        return REFUSED_EXTENT
     return os.path.getsize(path) if path.is_file() else None
 
 

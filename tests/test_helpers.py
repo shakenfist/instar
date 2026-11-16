@@ -8,6 +8,7 @@ lists, the preallocation byte comparison, and the normalisers).
 """
 
 import json
+import shutil
 import struct
 import tempfile
 import unittest
@@ -451,6 +452,43 @@ class TestQemuPinNormalisers(unittest.TestCase):
                          'RW 4194304 SPARSE "$EXTENT1"\n'
                          'RW 4194304 SPARSE "$EXTENT2"\n'
                          'RW 2097152 SPARSE "$EXTENT3"\n')
+
+
+class TestQemuPinExtentHelpers(unittest.TestCase):
+    """The extent name and length helpers, without a qemu-img anywhere."""
+
+    def setUp(self):
+        self.workdir = Path(tempfile.mkdtemp(prefix='instar-extent-helpers-'))
+        self.addCleanup(shutil.rmtree, self.workdir, ignore_errors=True)
+
+    def test_a_name_built_from_the_stem_is_placeheld(self):
+        self.assertEqual(f'{qemu_pins.STEM_PLACEHOLDER}-s001.vmdk',
+                         qemu_pins._extent_name(f'{qemu_pins.IMAGE_STEM}-s001.vmdk'))
+
+    def test_a_name_not_built_from_the_stem_is_kept(self):
+        # What a descriptor pointing somewhere else looks like; recording it
+        # verbatim is what makes that visible in the pin.
+        self.assertEqual('elsewhere.vmdk', qemu_pins._extent_name('elsewhere.vmdk'))
+
+    def test_a_present_extent_reports_its_length(self):
+        (self.workdir / 'image-s001.vmdk').write_bytes(b'\0' * 2048)
+
+        self.assertEqual(2048, qemu_pins._extent_length(self.workdir, 'image-s001.vmdk'))
+
+    def test_an_extent_that_was_never_created_is_none(self):
+        self.assertIsNone(qemu_pins._extent_length(self.workdir, 'image-s001.vmdk'))
+
+    def test_a_name_leaving_the_directory_is_refused_not_missing(self):
+        outside = self.workdir.parent / 'outside.raw'
+        outside.write_bytes(b'\0' * 512)
+        self.addCleanup(outside.unlink, missing_ok=True)
+
+        for name in ('/etc/hostname', f'../{outside.name}'):
+            with self.subTest(name=name):
+                self.assertEqual(qemu_pins.REFUSED_EXTENT, qemu_pins._extent_length(self.workdir, name))
+
+    def test_no_filename_is_none(self):
+        self.assertIsNone(qemu_pins._extent_length(self.workdir, None))
 
 
 class TestQemuPinVolatileMask(unittest.TestCase):

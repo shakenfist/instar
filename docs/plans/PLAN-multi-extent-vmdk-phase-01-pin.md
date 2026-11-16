@@ -423,3 +423,12 @@ sweep.
   first sweep measured for the sparse writer only, and normalised the
   extent filenames inside a pinned `structure` block, so both required
   a second full 80-build sweep.
+* 2026-11-17 (AEDT), review round 2: 1 fix, 9 consider. The fix is a
+  real one in step 1b's parser, found by review rather than by this
+  phase's own tests: an embedded descriptor was read at whatever
+  length the image's own header claimed, against a module docstring
+  that promises bounded reads. Six `consider` items were taken, three
+  declined in the pull request thread, and the one worth revisiting --
+  checking an extent's declared sectors against its own header -- is
+  recorded in the master plan's Future work rather than guessed at
+  here. The mutation set is twelve, all killed.

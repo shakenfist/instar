@@ -17,15 +17,18 @@ differential fuzzer feeds the parser output that may be wrong.
 
 import os
 import shutil
-import subprocess
+import struct
 import tempfile
 from pathlib import Path
 
-from base import QEMU_TOOL_TIMEOUT, InstarTestBase
+from base import InstarTestBase
 from helpers.vmdk_structure import (
+    MAX_DESCRIPTOR_BYTES,
     SECTOR_SIZE,
+    VMDK3_MAGIC,
     VMDK4_MAGIC,
     VmdkParseError,
+    describe_flags,
     descriptor_extents,
     parse_vmdk,
     structural_diff,
@@ -78,9 +81,8 @@ class _VmdkTestCase(InstarTestBase):
         parent = self.workdir if directory is None else self.workdir / directory
         parent.mkdir(parents=True, exist_ok=True)
         path = parent / name
-        argv = ['qemu-img', 'create', '-q', '-f', 'vmdk', '-o', f'subformat={subformat}', str(path), str(size)]
-        result = subprocess.run(argv, capture_output=True, text=True, timeout=QEMU_TOOL_TIMEOUT)
-        self.assertEqual(0, result.returncode, f'{" ".join(argv)} failed: {result.stderr}')
+        self._run_tool(['qemu-img', 'create', '-q', '-f', 'vmdk', '-o', f'subformat={subformat}',
+                        str(path), str(size)], parent)
         return path
 
 
@@ -327,3 +329,96 @@ class TestDescriptorExtentLines(InstarTestBase):
 
         self.assertEqual(['RDONLY', 'NOACCESS'], [extent['access'] for extent in extents])
         self.assertEqual([2048, 4096], [extent['sectors'] for extent in extents])
+
+
+class TestVmdkStructureRefusals(InstarTestBase):
+    """The refusals that no qemu build produces, so nothing else reaches."""
+
+    def setUp(self):
+        super().setUp()
+        self.workdir = Path(tempfile.mkdtemp(prefix='instar-vmdk-refusals-'))
+        self.addCleanup(shutil.rmtree, self.workdir, ignore_errors=True)
+
+    def sparse_header(self, name, *, grain_size=128, descriptor_sectors=20, length=64 * KiB):
+        """A file with a hand-built VMDK4 header and nothing else in it."""
+        header = bytearray(length)
+        header[0:4] = VMDK4_MAGIC
+        struct.pack_into('<II', header, 4, 1, 0)
+        struct.pack_into('<QQ', header, 12, 131072, grain_size)
+        struct.pack_into('<QQ', header, 28, 1, descriptor_sectors)
+        path = self.workdir / name
+        path.write_bytes(bytes(header))
+        return path
+
+    def test_vmdk3_is_refused(self):
+        path = self.workdir / 'cowd.vmdk'
+        path.write_bytes(VMDK3_MAGIC + bytes(4096))
+
+        with self.assertRaises(VmdkParseError) as caught:
+            parse_vmdk(path)
+        self.assertIn('VMDK3', str(caught.exception))
+
+    def test_oversized_standalone_descriptor_is_refused(self):
+        path = self.workdir / 'huge.vmdk'
+        path.write_bytes(b'createType="monolithicFlat"\n'.ljust(MAX_DESCRIPTOR_BYTES + 1, b'#'))
+
+        with self.assertRaises(VmdkParseError) as caught:
+            parse_vmdk(path)
+        self.assertIn('maximum for a descriptor file', str(caught.exception))
+
+    def test_embedded_descriptor_larger_than_the_maximum_is_refused(self):
+        # The sector count is the file's own, so without a cap this reads
+        # as much of the image as the header asks for and decodes it.
+        sectors = (MAX_DESCRIPTOR_BYTES // SECTOR_SIZE) + 1
+        path = self.sparse_header('oversized.vmdk', descriptor_sectors=sectors, length=4 * MiB)
+
+        with self.assertRaises(VmdkParseError) as caught:
+            parse_vmdk(path)
+        self.assertIn('past the', str(caught.exception))
+
+    def test_embedded_descriptor_of_no_size_is_refused(self):
+        path = self.sparse_header('empty-descriptor.vmdk', descriptor_sectors=0)
+
+        with self.assertRaises(VmdkParseError) as caught:
+            parse_vmdk(path)
+        self.assertIn('reserves no descriptor', str(caught.exception))
+
+    def test_zero_grain_size_is_refused(self):
+        path = self.sparse_header('no-grain.vmdk', grain_size=0)
+
+        with self.assertRaises(VmdkParseError) as caught:
+            parse_vmdk(path)
+        self.assertIn('grain size of zero', str(caught.exception))
+
+    def test_describe_flags_names_the_bits_it_knows(self):
+        self.assertEqual('none', describe_flags(0))
+        self.assertIn('compressed', describe_flags(1 << 16))
+        # An unknown bit is reported rather than dropped.
+        self.assertIn('0x80000000', describe_flags(1 << 31))
+
+    def test_structural_diff_refuses_something_that_is_neither(self):
+        with self.assertRaises(TypeError):
+            structural_diff({'extents': []}, 'not a structure')
+
+
+class TestVmdkHeaderDiff(_VmdkTestCase):
+    """A sparse header present on one side and absent on the other."""
+
+    def test_header_present_on_one_side_only(self):
+        sparse = summarise(parse_vmdk(self.qemu_create('monolithicSparse', 64 * MiB, directory='s')))
+        flat = summarise(parse_vmdk(self.qemu_create('monolithicFlat', 64 * MiB, directory='f')))
+
+        differences = structural_diff(sparse, flat)
+
+        self.assertTrue(any('header' in message for message in differences), differences)
+
+    def test_one_header_field_differs(self):
+        image = self.qemu_create('monolithicSparse', 64 * MiB)
+        one = summarise(parse_vmdk(image))
+        other = summarise(parse_vmdk(image))
+        other['extents'][0]['header']['grain_size_sectors'] = 999
+
+        differences = structural_diff(one, other)
+
+        self.assertEqual(1, len(differences), differences)
+        self.assertIn('grain_size_sectors', differences[0])

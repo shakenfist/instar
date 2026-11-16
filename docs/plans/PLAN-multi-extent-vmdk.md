@@ -791,6 +791,16 @@ Filled in as the plan runs. Already known:
   from scope above.
 * `instar map` on flat sources, which is refused today for all flat
   sources and is wider than this plan.
+* Making `tests/helpers/vmdk_structure.py` check an image against
+  itself, rather than only against another image. It never compares an
+  extent line's declared sector count with the sparse header's capacity
+  or with a flat extent's file length, so an image whose descriptor and
+  extents disagree parses cleanly and is caught only if the image it is
+  compared against happens to be right. Raised in review on
+  [#921](https://github.com/shakenfist/instar/pull/921) and left to the
+  phases that use the parser as an oracle (10, 11 and 16), because what
+  counts as internally consistent is a property of the writer those
+  phases build, and a refusal added now would be guessing at it.
 
 ### Bugs fixed during this work
 
