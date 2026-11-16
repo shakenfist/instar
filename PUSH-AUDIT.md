@@ -289,7 +289,7 @@ copy lives in shakenfist/development at
   reduced to a pointer.
 <!-- shared-block-end -->
 
-<!-- shared-block: source-file-size v1 -->
+<!-- shared-block: source-file-size v2 -->
 Source file size (shared block; do not edit -- the canonical
 copy lives in shakenfist/development at
 `templates/shared-blocks/source-file-size.md`):
@@ -303,13 +303,29 @@ copy lives in shakenfist/development at
   split, and one over roughly 1,500 as wanting a stated reason to
   stay whole. These hold whether or not a repository tracks review
   per file: tracking is what makes the cost repeat and become
-  measurable, not what makes a long file expensive to read. Both
-  are advisory. Neither is a gate, there is no hard cap, and a
-  reviewer who raises one is opening a question, not recording a
-  defect.
+  measurable, not what makes a long file expensive to read.
+- There is no cap, and no file is ever forced to split: a file
+  already over 1,500 lines may stay exactly that long. What it may
+  not do is grow, and no file may cross 1,500, without a reviewed
+  edit to the repository's baseline of oversize files -- the
+  ratchet in shakenfist/development's
+  `templates/source-size-ratchet/` checks that on every commit.
+  Raising an entry is allowed: it is the stated reason, asked for
+  where a reviewer cannot scroll past it. Where a repository has
+  not adopted the ratchet, the push auditor applies the same rule
+  by hand.
+- The push auditor reads the files the diff touches, not only the
+  diff. A branch that grows a file already over 800 lines is a
+  finding to raise even when its own addition is small, because
+  per-diff review is how slow growth gets past: every step looks
+  reasonable on its own. Under 1,500 the finding opens a question
+  rather than recording a defect. A raised baseline entry is
+  reviewed as the decision it is, and its reason belongs in the
+  pull request description.
 - Generated files, vendored trees and protocol or data tables are
   exempt: they are not read the way source is, and a tool that
-  counts them is measuring the wrong thing.
+  counts them -- the ratchet included -- is measuring the wrong
+  thing, so they belong in its exclusion list, not its baseline.
 - Split along a seam that already exists -- one module's public
   entry point, one check, one subcommand, one endpoint -- so that
   a later change touches one of the pieces rather than all of
@@ -318,9 +334,12 @@ copy lives in shakenfist/development at
 - Length is never reduced by deleting the comments and docstrings
   that explain why the code is the way it is. Those are what make
   a long file reviewable, and trading them for a line count makes
-  the review worse while making the number better. Cut duplicated
-  scaffolding first; see `comment-proportion` for what earns its
-  length.
+  the review worse while making the number better. A diff that
+  shrinks a baselined file by deleting rationale comments or
+  docstrings is a finding, not a win: the ratchet counts lines and
+  cannot tell the difference, so the reviewer has to. Cut
+  duplicated scaffolding first; see `comment-proportion` for what
+  earns its length.
 <!-- shared-block-end -->
 
 !!! note "In this project"
@@ -328,13 +347,28 @@ copy lives in shakenfist/development at
     instar does not track per-file human review, so the first bullet's
     repeated-review cost does not apply here; the length thresholds
     still do. Apply them to files the diff touches, not to the tree.
-    Several files are already far past 1,500 lines --
-    `src/vmm/src/main.rs`, `src/crates/qcow2/src/lib.rs`,
-    `src/shared/src/lib.rs`, the `vhd` and `vhdx` crates' `lib.rs`,
-    and `src/operations/convert/src/main.rs` among them -- so their
-    length alone is not a new finding. Raise one only when the diff
-    grows it materially, or adds to it something that already has a
-    seam of its own.
+
+    instar has not adopted the `source-size-ratchet` tooling, so
+    nothing checks the ratchet on commit and there is no baseline
+    file to edit. The push auditor applies the rule by hand, and the
+    set it applies it to is every Rust source file already over
+    1,500 lines, which is what the baseline would otherwise hold:
+
+    ```
+    find src -name '*.rs' -not -path '*/target/*' \
+        | xargs wc -l | awk '$1 > 1500 && $2 != "total"' | sort -rn
+    ```
+
+    Those files may stay the length they are -- `src/vmm/src/main.rs`
+    and `src/crates/qcow2/src/lib.rs` are the largest by a wide
+    margin -- but a branch that grows one is a finding, and the
+    reason it had to grow belongs in the pull request description,
+    which is where the reviewed baseline edit would otherwise record
+    it. A file crossing 1,500 for the first time is the same finding.
+    Growth of a file already over 800 lines is raised too, however
+    small the branch's own addition; under 1,500 that opens a
+    question rather than recording a defect, and the best answer is
+    often that the addition has a seam of its own.
 
 <!-- shared-block: plan-references-in-code v1 -->
 Plan references in code (shared block; do not edit -- the
