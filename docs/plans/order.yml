@@ -24,7 +24,6 @@
 - PLAN-fuzzing-bugs.md: Fuzzing bug backlog
 - PLAN-bug-fixes.md: June 2026 fuzzer bug backlog
 - PLAN-amend.md: instar amend subcommand
-- PLAN-dd.md: instar dd subcommand
 - PLAN-bitmap.md: instar bitmap subcommand
 - PLAN-bench.md: instar bench subcommand
 - PLAN-bench-refcount-growth.md: bench qcow2 refcount growth

@@ -23,9 +23,9 @@ Format naming:
 
 Special case ``1M-raw-count0-vhdx``: instar's empty (0-virtual-size)
 vhdx is rejected by ``qemu-img info``, while qemu's own empty vhdx is
-readable. This is a known, still-open limitation (see Future work in
-PLAN-dd.md). For that case only ``instar dd`` exit 0 is asserted; the
-info comparison is skipped.
+readable. This is a known, still-open limitation, tracked as
+https://github.com/shakenfist/instar/issues/917. For that case only
+``instar dd`` exit 0 is asserted; the info comparison is skipped.
 
 Known writer divergences (``KNOWN_DD_DIVERGENCES``):
   none at present. Cases listed there are skipped rather than compared.
