@@ -350,14 +350,42 @@ copy lives in shakenfist/development at
 
     instar has not adopted the `source-size-ratchet` tooling, so
     nothing checks the ratchet on commit and there is no baseline
-    file to edit. The push auditor applies the rule by hand, and the
-    set it applies it to is every Rust source file already over
-    1,500 lines, which is what the baseline would otherwise hold:
+    file to edit. The push auditor applies the rule by hand. The set
+    below is the **baseline**, not the finding list: findings still
+    come only from the files the diff touches, and the scan is how
+    the auditor knows which of those are already over the line.
+
+    It is every tracked source file over 1,500 lines, in any
+    language and any tree, which is what the baseline would
+    otherwise hold:
 
     ```
-    find src -name '*.rs' -not -path '*/target/*' \
-        | xargs wc -l | awk '$1 > 1500 && $2 != "total"' | sort -rn
+    git ls-files -z '*.rs' '*.py' '*.sh' \
+        | grep -zv '^prototypes/' \
+        | xargs -0 wc -l | awk '$1 > 1500 && $2 != "total"' | sort -rn
     ```
+
+    `git ls-files` is deliberate: rooting a `find` at a directory
+    list goes stale the next time a tree is added, and it has
+    already missed two -- `crates/` (guest-protocol) sits beside
+    `src/`, and `scripts/differential-fuzz.py` is the third-largest
+    source file in the repository. Listing tracked files instead
+    also excludes build output under `target/` and the vendored
+    crates under `.cargo-cache/` for free, since both are
+    gitignored, which is what the shared block's exemption for
+    generated and vendored trees asks for. `prototypes/` is filtered
+    out for the same reason: AGENTS.md calls it reference material
+    rather than shipped code, so it is not read as source, and it is
+    what the ratchet's exclusion list would hold. Swap `1500` for
+    `800` to get the candidate-to-split set the last paragraph
+    raises.
+
+    The Python integration suite is in scope and is where the rule
+    bites hardest: `tests/test_convert.py` is over 7,500 lines and
+    thirteen other test modules are over 1,500. A per-operation test
+    module is a real seam, so these are not automatically defects,
+    but they are baselined like any other file and a branch that
+    grows one answers for it.
 
     Those files may stay the length they are -- `src/vmm/src/main.rs`
     and `src/crates/qcow2/src/lib.rs` are the largest by a wide
