@@ -502,7 +502,7 @@ cannot corrupt an output, before the write path depends on it.
 
 | Phase | Plan | Status | Merged |
 |-------|------|--------|--------|
-| 1. Pin and measure qemu's output | PLAN-multi-extent-vmdk-phase-01-pin.md | Not started | |
+| 1. Pin and measure qemu's output | [PLAN-multi-extent-vmdk-phase-01-pin.md](PLAN-multi-extent-vmdk-phase-01-pin.md) | Not started | |
 | 2. Fixtures and baselines | PLAN-multi-extent-vmdk-phase-02-fixtures.md | Not started | |
 | 3. Read side: lift the extent ceiling | PLAN-multi-extent-vmdk-phase-03-read-ceiling.md | Not started | |
 | 4. Multi-extent descriptor emitter | PLAN-multi-extent-vmdk-phase-04-descriptor.md | Not started | |
@@ -527,9 +527,16 @@ Each phase gets its own plan file before it is implemented; these are
 the one-paragraph intents the phase plans expand.
 
 **1. Pin and measure qemu's output.** Establish the oracle before
-writing anything, using the per-version static qemu-img builds in
-`instar-testdata/qemu-img-binaries/x86_64/<version>/qemu-img` as well
-as the host's 10.0.13. Measure, per version: descriptor bytes for both
+writing anything. Phase 1's survey corrected this section: the
+cross-version sweep already exists, built by
+`PLAN-bat-population-phase-01-pin.md` -- `tools/sweep-qemu-create.py`,
+`tests/helpers/qemu_pins.py`, `tests/golden/qemu-create-pins.json` and
+`tests/test_qemu_create_pins.py`, over the 80 static builds in
+`instar-testdata/qemu-img-binaries/x86_64/<version>/qemu-img` -- and
+this phase extends it rather than starting one. It also adds the VMDK
+structural parser that phases 10, 11 and 16 depend on, and makes the
+pinned descriptor able to prove an extent naming scheme and ordering,
+which it cannot today. Measure, per version: descriptor bytes for both
 subformats; extent naming; per-extent sector counts for sizes that are
 and are not multiples of 2 GiB; the `ddb.*` values and how geometry is
 derived; the maximum extent count and the refusal past it; behaviour
