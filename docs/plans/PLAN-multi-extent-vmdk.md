@@ -238,9 +238,9 @@ opens every extent at once moves instar's ceiling by one device and
 leaves a parity gap that grows with image size; it would also roughly
 double the virtio statics in core's `.bss`, the one region of the guest
 memory map with a history of silently corrupting loaded operations.
-Open question 1 proposes sequential extent rotation instead, which
-bounds the device count at one regardless of extent count and fixes
-the read-side ceiling with the same mechanism.
+Open question 1, resolved on 2026-11-16, takes sequential extent
+rotation instead, which bounds the device count at one regardless of
+extent count and fixes the read-side ceiling with the same mechanism.
 
 In scope:
 
@@ -293,8 +293,10 @@ Out of scope:
 ## Open questions
 
 Each question carries the planner's recommendation and its reasoning.
-**None of these are resolved** -- they need the operator's decisions
-before phase 1's plan is written.
+The operator resolved questions 1 and 2 on 2026-11-16, before phase 1's
+plan was written, adopting both recommendations as drafted; each
+question records it. Questions 3 to 6 are still open, and phase 1's
+measurements settle much of 4 and 5.
 
 1. **Simultaneous output devices, or sequential extent rotation?**
    *Recommendation: rotation.* Four reasons, in order of weight.
@@ -333,6 +335,11 @@ before phase 1's plan is written.
    control flow, and it would still close the goals-graph node as
    drawn, but instar would carry a size limit qemu does not.
 
+   **Resolved 2026-11-16: rotation**, as recommended. The alternative
+   stays recorded here so a later reader knows it was weighed and why
+   it lost, not to leave the decision open. Phase 8 owns the lifecycle
+   cost this choice accepts.
+
 2. **Does lifting the read-side ceiling belong in this plan?**
    *Recommendation: yes.* It is the same mechanism and the same
    ceiling, it is a bug users can hit today on images instar otherwise
@@ -345,6 +352,8 @@ before phase 1's plan is written.
    has value on its own. If the operator wants it split, phase 3 is the
    clean seam -- it would become its own small plan that this one
    depends on.
+
+   **Resolved 2026-11-16: in this plan, as phase 3**, as recommended.
 
 3. **Does multi-extent output emit qemu's `ddb.*` lines?**
    *Recommendation: yes for the new subformats, and do not retrofit the
@@ -749,6 +758,7 @@ has something to close.
 
 Before implementation begins, the implementing session restates this
 plan's mission, the resolved open questions, and the phase it is
-starting, in its own words, and the operator confirms. Open questions 1
-and 2 in particular change the shape of the whole plan and must be
-resolved before phase 1's plan file is written.
+starting, in its own words, and the operator confirms. Questions 1 and
+2, which change the shape of the whole plan, were resolved on
+2026-11-16; questions 3 to 6 remain open, and phase 1's plan file names
+which of them its measurements settle.
