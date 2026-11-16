@@ -346,57 +346,69 @@ copy lives in shakenfist/development at
 
     instar does not track per-file human review, so the first bullet's
     repeated-review cost does not apply here; the length thresholds
-    still do. Apply them to files the diff touches, not to the tree.
+    still do.
 
     instar has not adopted the `source-size-ratchet` tooling, so
     nothing checks the ratchet on commit and there is no baseline
-    file to edit. The push auditor applies the rule by hand. The set
-    below is the **baseline**, not the finding list: findings still
-    come only from the files the diff touches, and the scan is how
-    the auditor knows which of those are already over the line.
-
-    It is every tracked source file over 1,500 lines, in any
-    language and any tree, which is what the baseline would
-    otherwise hold:
+    file to edit: the push auditor applies the block's rule by hand.
+    Run this from anywhere in the worktree. The first command prints
+    the **baseline**, which is context rather than a finding list;
+    the second prints the **findings** -- each file the branch grows
+    that ends up over 800 lines, with its length before and after:
 
     ```
-    git ls-files -z '*.rs' '*.py' '*.sh' \
-        | grep -zv '^prototypes/' \
-        | xargs -0 wc -l | awk '$1 > 1500 && $2 != "total"' | sort -rn
+    cd "$(git rev-parse --show-toplevel)"
+    skip=(':!prototypes/' ':!*.md' ':!*.toml' ':!*.json'
+          ':!*.yml' ':!*.yaml' ':!*.txt')
+
+    git ls-files -z -- "${skip[@]}" \
+        | xargs -0r wc -l | awk '$1 > 1500 && $2 != "total"' | sort -rn
+
+    base=$(git merge-base origin/develop HEAD)
+    git diff -z --name-only --no-renames --diff-filter=AM \
+            "${base}" HEAD -- "${skip[@]}" \
+        | while IFS= read -r -d '' f; do
+            before=$(git show "${base}:${f}" 2>/dev/null | wc -l)
+            after=$(git show "HEAD:${f}" | wc -l)
+            if [ "${after}" -gt 800 ] && [ "${after}" -gt "${before}" ]; then
+                echo "${f}: ${before} -> ${after}"
+            fi
+        done
     ```
 
-    `git ls-files` is deliberate: rooting a `find` at a directory
-    list goes stale the next time a tree is added, and it has
-    already missed two -- `crates/` (guest-protocol) sits beside
-    `src/`, and `scripts/differential-fuzz.py` is the third-largest
-    source file in the repository. Listing tracked files instead
-    also excludes build output under `target/` and the vendored
-    crates under `.cargo-cache/` for free, since both are
-    gitignored, which is what the shared block's exemption for
-    generated and vendored trees asks for. `prototypes/` is filtered
-    out for the same reason: AGENTS.md calls it reference material
-    rather than shipped code, so it is not read as source, and it is
-    what the ratchet's exclusion list would hold. Swap `1500` for
-    `800` to get the candidate-to-split set the last paragraph
-    raises.
+    A finding whose "after" is over 1,500 is the block's ratchet
+    breach; one between 800 and 1,500 opens a question. A file that
+    is new on the branch, or renamed, shows a "before" of 0. Neither
+    command can see the block's last bullet -- a file that shrank by
+    losing its rationale comments -- so read the diff of any baselined
+    file the branch shrinks.
+
+    The file set is every tracked file except the formats that are
+    not source, rather than a list of source languages, so that a new
+    language is in scope the day it is committed and a new data
+    format shows up as noise rather than going missing. A list of
+    languages already went stale once: `*.rs`, `*.py` and `*.sh` left
+    out the top-level `Makefile`, which is over 1,000 lines, and an
+    earlier `find` rooted at `src/` left out `crates/` and `scripts/`,
+    which holds one of the largest Python files in the repository.
+    Listing tracked files also leaves out build output under
+    `target/` and the vendored crates under `.cargo-cache/`, since
+    both are gitignored, which is what the shared block's exemption for
+    generated and vendored trees asks for. `prototypes/` is excluded
+    for the same reason: AGENTS.md calls it reference material rather
+    than shipped code, so it is not read as source, and it is what
+    the ratchet's exclusion list would hold. The `cd` matters:
+    `git diff` reads pathspecs relative to the current directory but
+    prints paths from the top, so run from a subdirectory the
+    exclusions silently stop applying. Swap `1500` for `800` in the
+    first command to see the whole candidate-to-split set.
 
     The Python integration suite is in scope and is where the rule
-    bites hardest: `tests/test_convert.py` is over 7,500 lines and
-    thirteen other test modules are over 1,500. A per-operation test
-    module is a real seam, so these are not automatically defects,
-    but they are baselined like any other file and a branch that
-    grows one answers for it.
-
-    Those files may stay the length they are -- `src/vmm/src/main.rs`
-    and `src/crates/qcow2/src/lib.rs` are the largest by a wide
-    margin -- but a branch that grows one is a finding, and the
-    reason it had to grow belongs in the pull request description,
-    which is where the reviewed baseline edit would otherwise record
-    it. A file crossing 1,500 for the first time is the same finding.
-    Growth of a file already over 800 lines is raised too, however
-    small the branch's own addition; under 1,500 that opens a
-    question rather than recording a defect, and the best answer is
-    often that the addition has a seam of its own.
+    bites hardest: `tests/test_convert.py` is several thousand lines
+    and around a dozen other test modules are over 1,500. A
+    per-operation test module is a real seam, so these are not
+    automatically defects, but they are baselined like any other
+    file, and the block's rule applies to them unchanged.
 
 <!-- shared-block: plan-references-in-code v1 -->
 Plan references in code (shared block; do not edit -- the
