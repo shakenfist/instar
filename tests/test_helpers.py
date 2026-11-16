@@ -422,7 +422,20 @@ class TestQemuPinNormalisers(unittest.TestCase):
                 'RW 131072 FLAT "image-flat.vmdk" 0\nRW 131072 SPARSE "image.vmdk"\n')
         self.assertEqual(qemu_pins.normalise_descriptor(text),
                          'version=1\nCID=$CID\nparentCID=ffffffff\n'
-                         'RW 131072 FLAT "$EXTENT" 0\nRW 131072 SPARSE "$EXTENT"\n')
+                         'RW 131072 FLAT "$EXTENT1" 0\nRW 131072 SPARSE "$EXTENT2"\n')
+
+    def test_descriptor_numbers_every_extent(self):
+        text = ('version=1\nCID=8432577\nparentCID=ffffffff\ncreateType="twoGbMaxExtentSparse"\n\n'
+                '# Extent description\n'
+                'RW 4194304 SPARSE "image-s001.vmdk"\n'
+                'RW 4194304 SPARSE "image-s002.vmdk"\n'
+                'RW 2097152 SPARSE "image-s003.vmdk"\n')
+        self.assertEqual(qemu_pins.normalise_descriptor(text),
+                         'version=1\nCID=$CID\nparentCID=ffffffff\ncreateType="twoGbMaxExtentSparse"\n\n'
+                         '# Extent description\n'
+                         'RW 4194304 SPARSE "$EXTENT1"\n'
+                         'RW 4194304 SPARSE "$EXTENT2"\n'
+                         'RW 2097152 SPARSE "$EXTENT3"\n')
 
 
 class TestQemuPinVolatileMask(unittest.TestCase):

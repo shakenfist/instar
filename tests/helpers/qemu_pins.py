@@ -30,6 +30,7 @@ Stdlib only, and nothing from `tests/base.py`, so that
 import contextlib
 import copy
 import difflib
+import itertools
 import json
 import os
 import re
@@ -57,7 +58,10 @@ PREALLOC_MODES = ('off', 'falloc', 'full', 'metadata')
 # appears in stderr.
 DIR_PLACEHOLDER = '$DIR'
 CID_PLACEHOLDER = '$CID'
-EXTENT_PLACEHOLDER = '$EXTENT'
+# Extent filenames become `$EXTENT1`, `$EXTENT2`, ... in descriptor order, so
+# a descriptor proves the order and the count of its extents and not just
+# that each line named some file.
+EXTENT_PLACEHOLDER_PREFIX = '$EXTENT'
 
 # Where `run_case` puts things inside its per-case directory. `{base}` in a
 # case's `args` is replaced by the path of a base image it creates first.
@@ -505,10 +509,18 @@ def normalise_descriptor(text: str) -> str:
     """A VMDK descriptor with its random CID and its extent filenames replaced.
 
     The CID is random at create (qemu 7.0.0 block/vmdk.c:2525-2526); an
-    extent's filename follows the image's name.
+    extent's filename follows the image's name. Each extent line's filename
+    becomes `$EXTENT<n>`, numbered from 1 in descriptor order, so a
+    descriptor with several extents pins their order and count as well as
+    their declared sector counts.
     """
     text = re.sub(r'^CID=[0-9a-fA-F]+$', f'CID={CID_PLACEHOLDER}', text, flags=re.MULTILINE)
-    return re.sub(r'^(RW \d+ [A-Z]+ )"[^"]*"', rf'\1"{EXTENT_PLACEHOLDER}"', text, flags=re.MULTILINE)
+    counter = itertools.count(1)
+
+    def _extent(match):
+        return f'{match.group(1)}"{EXTENT_PLACEHOLDER_PREFIX}{next(counter)}"'
+
+    return re.sub(r'^(RW \d+ [A-Z]+ )"[^"]*"', _extent, text, flags=re.MULTILINE)
 
 
 def _run_vmdk_flat(qemu_img, case: dict, workdir: Path) -> dict:

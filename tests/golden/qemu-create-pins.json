@@ -1667,7 +1667,7 @@
         "result": {
           "rc": 0,
           "stderr": "",
-          "descriptor": "# Disk DescriptorFile\nversion=1\nCID=$CID\nparentCID=ffffffff\ncreateType=\"monolithicFlat\"\n\n# Extent description\nRW 131072 FLAT \"$EXTENT\" 0\n\n# The Disk Data Base\n#DDB\n\nddb.virtualHWVersion = \"4\"\nddb.geometry.cylinders = \"130\"\nddb.geometry.heads = \"16\"\nddb.geometry.sectors = \"63\"\nddb.adapterType = \"ide\"\n",
+          "descriptor": "# Disk DescriptorFile\nversion=1\nCID=$CID\nparentCID=ffffffff\ncreateType=\"monolithicFlat\"\n\n# Extent description\nRW 131072 FLAT \"$EXTENT1\" 0\n\n# The Disk Data Base\n#DDB\n\nddb.virtualHWVersion = \"4\"\nddb.geometry.cylinders = \"130\"\nddb.geometry.heads = \"16\"\nddb.geometry.sectors = \"63\"\nddb.adapterType = \"ide\"\n",
           "extent_length": 67108864
         }
       },
@@ -1684,7 +1684,7 @@
         "result": {
           "rc": 0,
           "stderr": "",
-          "descriptor": "# Disk DescriptorFile\nversion=1\nCID=$CID\nparentCID=ffffffff\ncreateType=\"monolithicFlat\"\n\n# Extent description\nRW 131072 FLAT \"$EXTENT\" 0\n\n# The Disk Data Base\n#DDB\n\nddb.virtualHWVersion = \"4\"\nddb.geometry.cylinders = \"130\"\nddb.geometry.heads = \"16\"\nddb.geometry.sectors = \"63\"\nddb.adapterType = \"ide\"\nddb.toolsVersion = \"2147483647\"\n",
+          "descriptor": "# Disk DescriptorFile\nversion=1\nCID=$CID\nparentCID=ffffffff\ncreateType=\"monolithicFlat\"\n\n# Extent description\nRW 131072 FLAT \"$EXTENT1\" 0\n\n# The Disk Data Base\n#DDB\n\nddb.virtualHWVersion = \"4\"\nddb.geometry.cylinders = \"130\"\nddb.geometry.heads = \"16\"\nddb.geometry.sectors = \"63\"\nddb.adapterType = \"ide\"\nddb.toolsVersion = \"2147483647\"\n",
           "extent_length": 67108864
         }
       }
