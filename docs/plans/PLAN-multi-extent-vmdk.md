@@ -122,6 +122,11 @@ ddb.toolsVersion = "2147483647"
 Note the `ddb.*` block. `docs/create.md`'s Future work records that
 instar emits none of those lines; open question 3 takes that up.
 
+The 80-build sweep (qemu 6.0.0 to 10.2.0) confirmed the naming and
+descriptor shape above for both subformats; the only difference
+across builds is `ddb.toolsVersion = "2147483647"` appearing from
+6.2.0 onward. The pin is `tests/golden/qemu-create-pins.json`.
+
 **The ceiling.** A 40 GiB image is 20 extents, which qemu-img reads
 without complaint. instar refuses it:
 
@@ -383,6 +388,19 @@ measurements settle much of 4 and 5.
    pre-existing targets -- because matching it matters more than any
    rule invented here.
 
+   *Measurement (phase 1, 80 qemu builds; not a resolution):* a
+   pre-existing file where an extent goes is not refused. On all 80
+   builds qemu returns rc 0 with empty stderr and writes the image
+   exactly as it does without the obstruction. A second hard link
+   kept to the file reports the extent's length, not the original
+   1 MiB, so qemu truncated it in place rather than unlinking it and
+   creating its own file. Any other hard link, and any open
+   descriptor, follows the image. What qemu does is not by itself
+   what instar should do: silently truncating a file the user did not
+   name is a different risk calculus for a tool whose threat model
+   assumes hostile input. The recommendation above stands
+   unresolved; the decision is the operator's.
+
 5. **What is the maximum extent count, and what happens past it?**
    The `%03d` naming implies 999 extents, about 2 TiB. *Recommendation:*
    measure qemu's real ceiling in phase 1 and match it, refusing above
@@ -390,6 +408,23 @@ measurements settle much of 4 and 5.
    it, before the output file is opened -- the shape
    `PLAN-bat-population.md` used for VHDX's 64 TiB refusal, which
    leaves nothing behind where qemu-img leaves an empty file.
+
+   *Measurement (phase 1; not a resolution):* the premise above is
+   false. `%03d` is a minimum field width, not a cap. Probed on
+   6.0.0, 7.2.0, 8.2.0 and 10.2.0, both split subformats: at 2000 GiB
+   all four builds write 1000 extents, rc 0, empty stderr, and the
+   thousandth descriptor line is verbatim
+   `RW 4194304 SPARSE "image-s1000.vmdk"`. At 32 TiB all four write
+   16384 extents. At 1 PiB 10.2.0 still does not refuse; a 60 s
+   timeout stopped it at extent 70168 of 524288. The only refusal
+   anywhere near is qemu-img's generic size parser, identical on
+   every build: `qemu-img: Invalid image size specified. Must be
+   between 0 and 9223372036854775807.` So there is no qemu ceiling
+   to match. The recommendation above was written before this
+   measurement and its "measure and match" reasoning no longer
+   applies as stated. Whether instar matches qemu or imposes a
+   documented limit of its own is the operator's decision, still
+   open.
 
 6. **Is flat create host-only, like monolithicFlat?**
    *Recommendation: yes,* and it should land *before* the ABI work.
