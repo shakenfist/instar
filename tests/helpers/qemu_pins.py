@@ -43,6 +43,10 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from helpers.vhdx_structure import VhdxParseError, allocated_bytes, parse_vhdx, structural_diff, summarise
+from helpers.vmdk_structure import KIND_SPARSE as VMDK_SPARSE_EXTENT
+from helpers.vmdk_structure import VmdkParseError, descriptor_extents, parse_vmdk, read_descriptor
+from helpers.vmdk_structure import structural_diff as vmdk_structural_diff
+from helpers.vmdk_structure import summarise as vmdk_summarise
 
 PIN_PATH = Path(__file__).resolve().parent.parent / 'golden' / 'qemu-create-pins.json'
 
@@ -50,6 +54,7 @@ KIND_VHDX_CREATE = 'vhdx-create'
 KIND_VHDX_CONVERT = 'vhdx-convert'
 KIND_PREALLOC = 'prealloc'
 KIND_VMDK_FLAT = 'vmdk-flat'
+KIND_VMDK_MULTI = 'vmdk-multi'
 
 PREALLOC_MODES = ('off', 'falloc', 'full', 'metadata')
 
@@ -62,12 +67,26 @@ CID_PLACEHOLDER = '$CID'
 # a descriptor proves the order and the count of its extents and not just
 # that each line named some file.
 EXTENT_PLACEHOLDER_PREFIX = '$EXTENT'
+# An extent file is named after the image, so a recorded extent name has the
+# image's stem replaced by this. What is left is the naming scheme itself:
+# the separator, the index width and the suffix.
+STEM_PLACEHOLDER = '$STEM'
 
 # Where `run_case` puts things inside its per-case directory. `{base}` in a
 # case's `args` is replaced by the path of a base image it creates first.
 IMAGE_STEM = 'image'
 BASE_STEM = 'base'
 SOURCE_NAME = 'source.raw'
+
+# A multi-extent case may drop a file where one of the extents is about to
+# go. It is made larger than any extent qemu writes for these sizes, so its
+# length says what happened to it. A second hard link is kept to it under
+# a name no extent has, because the file at the extent's name says only
+# what is there afterwards: the kept link still holding `EXISTING_EXTENT_SIZE`
+# bytes means qemu unlinked what it found and created its own file, and the
+# kept link holding an extent means qemu truncated the file in place.
+EXISTING_EXTENT_SIZE = 1024 * 1024
+KEPT_LINK_SUFFIX = '.kept'
 
 # The convert source: 64 MiB of raw, zero except for three whole 8 MiB
 # blocks of a non-zero byte. 8 MiB is qemu's default VHDX block size below
@@ -135,12 +154,28 @@ def _prealloc(name, fmt, options, suffix, measure=None):
     return case
 
 
+def _vmdk_multi(subformat: str, size: str, suffix: str = '', existing=None) -> dict:
+    short = 'sparse' if subformat.endswith('Sparse') else 'flat'
+    case = {'name': f'vmdk-multi-{short}-{size}{suffix}', 'kind': KIND_VMDK_MULTI,
+            'args': ['-f', 'vmdk', '-o', f'subformat={subformat}'], 'size': size}
+    if existing:
+        case['existing'] = existing
+    return case
+
+
+def _vmdk_multi_pair(size: str) -> list:
+    """The same size in both split subformats, sparse first."""
+    return [_vmdk_multi('twoGbMaxExtentSparse', size), _vmdk_multi('twoGbMaxExtentFlat', size)]
+
+
 # The commands whose results are pinned. Each is a dict with a unique
 # `name`, a `kind` (which decides what `run_case` measures), and the
-# arguments: for `vhdx-create` and `vmdk-flat` the argv between `create`
-# and the image path, plus the size; for `vhdx-convert` the `-o` value; for
-# `prealloc` the format, its other options and the image suffix. Adding a
-# case is a row here and a re-run of tools/sweep-qemu-create.py --write.
+# arguments: for `vhdx-create`, `vmdk-flat` and `vmdk-multi` the argv
+# between `create` and the image path, plus the size; for `vhdx-convert`
+# the `-o` value; for `prealloc` the format, its other options and the
+# image suffix. A `vmdk-multi` case may also carry `existing`, files to
+# create in the image's directory before the command runs. Adding a case is
+# a row here and a re-run of tools/sweep-qemu-create.py --write.
 CASES = [
     # Fixed VHDX in both BAT modes, on a size that fills its last block and
     # one that does not, and at the smallest block size, where the BAT
@@ -204,6 +239,23 @@ CASES = [
     {'name': 'vmdk-flat-backing', 'kind': KIND_VMDK_FLAT,
      'args': ['-f', 'vmdk', '-o', 'subformat=monolithicFlat', '-b', '{base}', '-F', 'vmdk'], 'size': '64M',
      'base': 'vmdk'},
+
+    # The split subformats, whose extents are capped at the constant 2 GiB
+    # split size (qemu 7.0.0 block/vmdk.c:2364). The sizes bracket it: far
+    # below it, exactly on it, one MiB past it, an exact multiple of it, a
+    # multiple with a partial last extent, and the largest extent count
+    # these cases pin.
+    *_vmdk_multi_pair('1M'),
+    *_vmdk_multi_pair('2G'),
+    *_vmdk_multi_pair('2049M'),
+    *_vmdk_multi_pair('4G'),
+    *_vmdk_multi_pair('5G'),
+    *_vmdk_multi_pair('21G'),
+    # What qemu does when a file is already sitting where an extent goes.
+    # The second of three extents, so the extents on either side say
+    # whether the rest of the image was written as usual.
+    _vmdk_multi('twoGbMaxExtentSparse', '5G', suffix='-existing-extent',
+                existing=[f'{IMAGE_STEM}-s002.vmdk']),
 ]
 
 CASES_BY_NAME = {case['name']: case for case in CASES}
@@ -535,11 +587,91 @@ def _run_vmdk_flat(qemu_img, case: dict, workdir: Path) -> dict:
     return result
 
 
+def _extent_name(filename: str) -> str:
+    """`filename` with the image's stem replaced by `$STEM`.
+
+    The stem is a constant, so an extent's real name is the same in every
+    run, but recording it as it is would read as a filename rather than as
+    a naming scheme. A name not built from the stem -- which is what a
+    descriptor pointing somewhere else looks like -- is recorded verbatim.
+    """
+    if filename.startswith(IMAGE_STEM):
+        return STEM_PLACEHOLDER + filename[len(IMAGE_STEM):]
+    return filename
+
+
+def _extent_length(directory: Path, filename: Optional[str]) -> Optional[int]:
+    """The length of the file an extent line names, or None if there is no such file.
+
+    `filename` is taken from the descriptor as qemu wrote it and resolved
+    against the directory holding the descriptor, so an extent named wrongly
+    or never created records a None rather than being looked for under the
+    name qemu was expected to use.
+    """
+    if filename is None:
+        return None
+    path = Path(os.path.join(str(directory), filename))
+    return os.path.getsize(path) if path.is_file() else None
+
+
+def _vmdk_structure(image: Path) -> dict:
+    try:
+        return vmdk_summarise(parse_vmdk(image))
+    except VmdkParseError as e:
+        # As for VHDX: an image this parser cannot read is a result to pin
+        # and look at, not a reason to abandon the sweep.
+        return {'parse_error': str(e)}
+
+
+def _place_existing(workdir: Path, names) -> list:
+    """Create each of `names` in `workdir`, and return the kept link to each."""
+    kept = []
+    for name in names:
+        path = workdir / name
+        with open(path, 'wb') as f:
+            f.truncate(EXISTING_EXTENT_SIZE)
+        link = workdir / f'{name}{KEPT_LINK_SUFFIX}'
+        os.link(path, link)
+        kept.append(link)
+    return kept
+
+
+def _run_vmdk_multi(qemu_img, case: dict, workdir: Path) -> dict:
+    """Create a split VMDK and record the descriptor and the extents it names."""
+    image = workdir / f'{IMAGE_STEM}.vmdk'
+    kept = _place_existing(workdir, case.get('existing', []))
+    proc = _create(qemu_img, case, image, workdir)
+    result = {'rc': proc.returncode, 'stderr': normalise_stderr(proc.stderr, workdir), 'descriptor': None,
+              'extent_names': None, 'extent_lengths': None, 'existing_kept_lengths': None, 'structure': None}
+    if kept:
+        result['existing_kept_lengths'] = [os.path.getsize(link) for link in kept]
+    if proc.returncode != 0:
+        return result
+    try:
+        text, _ = read_descriptor(image)
+    except VmdkParseError as e:
+        result['structure'] = {'parse_error': str(e)}
+        return result
+    # The extent filenames are read before the descriptor is normalised,
+    # because normalising replaces them.
+    declared = descriptor_extents(text)
+    result['descriptor'] = normalise_descriptor(text)
+    result['extent_names'] = [None if one['filename'] is None else _extent_name(one['filename'])
+                              for one in declared]
+    result['extent_lengths'] = [_extent_length(image.parent, one['filename']) for one in declared]
+    if any(one['kind'] == VMDK_SPARSE_EXTENT for one in declared):
+        # A sparse extent has a header whose fields decide how it is walked,
+        # and nothing in the descriptor says what they are.
+        result['structure'] = _vmdk_structure(image)
+    return result
+
+
 RUNNERS = {
     KIND_VHDX_CREATE: _run_vhdx_create,
     KIND_VHDX_CONVERT: _run_vhdx_convert,
     KIND_PREALLOC: _run_prealloc,
     KIND_VMDK_FLAT: _run_vmdk_flat,
+    KIND_VMDK_MULTI: _run_vmdk_multi,
 }
 
 
@@ -575,12 +707,20 @@ def canonical(result) -> str:
     return json.dumps(result, sort_keys=True, separators=(',', ':'))
 
 
+def _summary_diff(field: str, want: dict, got: dict, differ) -> List[str]:
+    """Differences between two structural summaries, or between their parse errors."""
+    if 'parse_error' in want or 'parse_error' in got:
+        return [f'{field}: {want.get("parse_error", "parsed")!r} != {got.get("parse_error", "parsed")!r}']
+    return [f'{field}: {message}' for message in differ(want, got)]
+
+
 def result_diff(expected: dict, actual: dict, path: str = '') -> List[str]:
     """Human-readable differences between a pinned and a measured result.
 
     Each message names the field, then the pinned value, then the measured
-    one. VHDX summaries are compared with `structural_diff`, so a BAT
-    difference reads as runs rather than as two long lists.
+    one. VHDX summaries are compared with `structural_diff` and VMDK ones
+    with its VMDK counterpart, so a BAT difference reads as runs rather
+    than as two long lists, and an extent difference names the extent.
     """
     differences = []
     for key in sorted(set(expected) | set(actual), key=str):
@@ -590,11 +730,9 @@ def result_diff(expected: dict, actual: dict, path: str = '') -> List[str]:
         if want == got:
             continue
         if key == 'summary' and isinstance(want, dict) and isinstance(got, dict):
-            if 'parse_error' in want or 'parse_error' in got:
-                differences.append(f'{field}: {want.get("parse_error", "parsed")!r} != '
-                                   f'{got.get("parse_error", "parsed")!r}')
-            else:
-                differences.extend(f'{field}: {message}' for message in structural_diff(want, got))
+            differences.extend(_summary_diff(field, want, got, structural_diff))
+        elif key == 'structure' and isinstance(want, dict) and isinstance(got, dict):
+            differences.extend(_summary_diff(field, want, got, vmdk_structural_diff))
         elif isinstance(want, dict) and isinstance(got, dict):
             differences.extend(result_diff(want, got, f'{field}.'))
         elif isinstance(want, str) and isinstance(got, str) and '\n' in want + got:
