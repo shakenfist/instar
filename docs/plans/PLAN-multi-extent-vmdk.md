@@ -389,12 +389,14 @@ measurements settle much of 4 and 5.
    rule invented here.
 
    *Measurement (phase 1, 80 qemu builds; not a resolution):* a
-   pre-existing file where an extent goes is not refused. On all 80
-   builds qemu returns rc 0 with empty stderr and writes the image
-   exactly as it does without the obstruction. A second hard link
-   kept to the file reports the extent's length, not the original
-   1 MiB, so qemu truncated it in place rather than unlinking it and
-   creating its own file. Any other hard link, and any open
+   pre-existing file where an extent goes is not refused, in either
+   split subformat. On all 80 builds qemu returns rc 0 with empty
+   stderr and writes the image exactly as it does without the
+   obstruction. A second hard link kept to the file reports the
+   extent's length, not the original 1 MiB, so qemu truncated it in
+   place rather than unlinking it and creating its own file --
+   shrinking it for a sparse extent and growing it for a flat one,
+   which is the same `ftruncate` in both directions. Any other hard link, and any open
    descriptor, follows the image. What qemu does is not by itself
    what instar should do: silently truncating a file the user did not
    name is a different risk calculus for a tool whose threat model

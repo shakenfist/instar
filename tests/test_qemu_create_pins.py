@@ -139,10 +139,18 @@ class TestQemuCreatePins(InstarTestBase):
                                  f'not the two expected; {hint}')
                 old = qemu_pins.expected(name, VMDK_MULTI_LAST_OLD, pin=pin)
                 new = qemu_pins.expected(name, VMDK_MULTI_FIRST_NEW, pin=pin)
-                want_spans = [(pin['versions'][0], VMDK_MULTI_LAST_OLD), (VMDK_MULTI_FIRST_NEW, pin['versions'][-1])]
-                self.assertEqual(want_spans, spans,
-                                 f'{name} splits at {spans}, not at {VMDK_MULTI_LAST_OLD} / {VMDK_MULTI_FIRST_NEW}; '
-                                 f'{hint}')
+                # The whole membership of each group, not its first and last
+                # entries: a group holding a gap, or versions out of order,
+                # has endpoints that can still look right.
+                ordered = sorted(pin['versions'], key=qemu_pins.version_key)
+                split = ordered.index(VMDK_MULTI_FIRST_NEW)
+                want = [ordered[:split], ordered[split:]]
+                self.assertEqual(ordered[split - 1], VMDK_MULTI_LAST_OLD,
+                                 f'{VMDK_MULTI_LAST_OLD} is no longer the version before '
+                                 f'{VMDK_MULTI_FIRST_NEW} in the pin; {hint}')
+                self.assertEqual(want, [group['versions'] for group in groups],
+                                 f'{name} groups the versions as {spans}, not as every build up to '
+                                 f'{VMDK_MULTI_LAST_OLD} and every build from {VMDK_MULTI_FIRST_NEW}; {hint}')
 
                 # The only difference is the added descriptor line.
                 self.assertEqual(sorted(old), sorted(new), f'{name} result fields differ between the groups')

@@ -45,6 +45,7 @@ from typing import List, Optional, Tuple
 from helpers.vhdx_structure import VhdxParseError, allocated_bytes, parse_vhdx, structural_diff, summarise
 from helpers.vmdk_structure import KIND_SPARSE as VMDK_SPARSE_EXTENT
 from helpers.vmdk_structure import VmdkParseError, descriptor_extents, parse_vmdk, read_descriptor
+from helpers.vmdk_structure import resolve_extent_path
 from helpers.vmdk_structure import structural_diff as vmdk_structural_diff
 from helpers.vmdk_structure import summarise as vmdk_summarise
 
@@ -254,8 +255,14 @@ CASES = [
     # What qemu does when a file is already sitting where an extent goes.
     # The second of three extents, so the extents on either side say
     # whether the rest of the image was written as usual.
+    # Both subformats, because they take different paths: the flat writer
+    # extends each extent to its full declared length where the sparse one
+    # writes a header, so what becomes of the file already there is a
+    # separate measurement rather than an inference from the other.
     _vmdk_multi('twoGbMaxExtentSparse', '5G', suffix='-existing-extent',
                 existing=[f'{IMAGE_STEM}-s002.vmdk']),
+    _vmdk_multi('twoGbMaxExtentFlat', '5G', suffix='-existing-extent',
+                existing=[f'{IMAGE_STEM}-f002.vmdk']),
 ]
 
 CASES_BY_NAME = {case['name']: case for case in CASES}
@@ -572,7 +579,11 @@ def normalise_descriptor(text: str) -> str:
     def _extent(match):
         return f'{match.group(1)}"{EXTENT_PLACEHOLDER_PREFIX}{next(counter)}"'
 
-    return re.sub(r'^(RW \d+ [A-Z]+ )"[^"]*"', _extent, text, flags=re.MULTILINE)
+    # The same access modes `helpers.vmdk_structure` parses. Numbering only
+    # `RW` lines would leave a non-RW extent its literal filename here while
+    # still counting it in `extent_names`, so the two would describe
+    # different extents at the same index within one pinned result.
+    return re.sub(r'^((?:RW|RDONLY|NOACCESS)\s+\d+\s+[A-Z]+\s+)"[^"]*"', _extent, text, flags=re.MULTILINE)
 
 
 def _run_vmdk_flat(qemu_img, case: dict, workdir: Path) -> dict:
@@ -606,21 +617,35 @@ def _extent_length(directory: Path, filename: Optional[str]) -> Optional[int]:
     `filename` is taken from the descriptor as qemu wrote it and resolved
     against the directory holding the descriptor, so an extent named wrongly
     or never created records a None rather than being looked for under the
-    name qemu was expected to use.
+    name qemu was expected to use. A name that resolves outside that
+    directory, or onto something that is not a regular file, records None
+    too: it is not an extent of this image, and the pin is a record of what
+    the command wrote.
     """
     if filename is None:
         return None
-    path = Path(os.path.join(str(directory), filename))
+    try:
+        path = Path(resolve_extent_path(filename, directory, 'extent'))
+    except VmdkParseError:
+        return None
     return os.path.getsize(path) if path.is_file() else None
 
 
 def _vmdk_structure(image: Path) -> dict:
     try:
-        return vmdk_summarise(parse_vmdk(image))
+        summary = vmdk_summarise(parse_vmdk(image))
     except VmdkParseError as e:
         # As for VHDX: an image this parser cannot read is a result to pin
         # and look at, not a reason to abandon the sweep.
         return {'parse_error': str(e)}
+    # The parser reports a filename as the descriptor spells it. Pinning it
+    # that way would record the image stem in a second spelling, so that one
+    # field says `image-s001.vmdk` where `extent_names` beside it says
+    # `$STEM-s001.vmdk`, and renaming the stem would mean a re-sweep.
+    for extent in summary['extents']:
+        if extent.get('filename') is not None:
+            extent['filename'] = _extent_name(extent['filename'])
+    return summary
 
 
 def _place_existing(workdir: Path, names) -> list:
@@ -649,12 +674,12 @@ def _run_vmdk_multi(qemu_img, case: dict, workdir: Path) -> dict:
         return result
     try:
         text, _ = read_descriptor(image)
+        # The extent filenames are read before the descriptor is normalised,
+        # because normalising replaces them.
+        declared = descriptor_extents(text)
     except VmdkParseError as e:
         result['structure'] = {'parse_error': str(e)}
         return result
-    # The extent filenames are read before the descriptor is normalised,
-    # because normalising replaces them.
-    declared = descriptor_extents(text)
     result['descriptor'] = normalise_descriptor(text)
     result['extent_names'] = [None if one['filename'] is None else _extent_name(one['filename'])
                               for one in declared]

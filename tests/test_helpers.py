@@ -424,6 +424,21 @@ class TestQemuPinNormalisers(unittest.TestCase):
                          'version=1\nCID=$CID\nparentCID=ffffffff\n'
                          'RW 131072 FLAT "$EXTENT1" 0\nRW 131072 SPARSE "$EXTENT2"\n')
 
+    def test_descriptor_numbers_non_rw_extents_too(self):
+        # The same access modes helpers.vmdk_structure parses. A line left
+        # unnumbered here would keep its literal filename while still being
+        # counted in extent_names, so the two would disagree on which
+        # extent sits at which index.
+        text = ('createType="twoGbMaxExtentFlat"\n'
+                'RW 4194304 FLAT "image-f001.vmdk" 0\n'
+                'RDONLY 2048 FLAT "image-f002.vmdk" 0\n'
+                'NOACCESS 4096 FLAT "image-f003.vmdk" 0\n')
+        self.assertEqual(qemu_pins.normalise_descriptor(text),
+                         'createType="twoGbMaxExtentFlat"\n'
+                         'RW 4194304 FLAT "$EXTENT1" 0\n'
+                         'RDONLY 2048 FLAT "$EXTENT2" 0\n'
+                         'NOACCESS 4096 FLAT "$EXTENT3" 0\n')
+
     def test_descriptor_numbers_every_extent(self):
         text = ('version=1\nCID=8432577\nparentCID=ffffffff\ncreateType="twoGbMaxExtentSparse"\n\n'
                 '# Extent description\n'

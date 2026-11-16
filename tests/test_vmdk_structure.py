@@ -26,6 +26,7 @@ from helpers.vmdk_structure import (
     SECTOR_SIZE,
     VMDK4_MAGIC,
     VmdkParseError,
+    descriptor_extents,
     parse_vmdk,
     structural_diff,
     summarise,
@@ -241,3 +242,88 @@ class TestVmdkStructureMalformed(_VmdkTestCase):
         image.write_text(stripped + '\n', encoding='utf-8')
 
         self.assertRaises(VmdkParseError, parse_vmdk, image)
+
+
+class TestVmdkStructureHostileDescriptor(_VmdkTestCase):
+    """An extent line names a file this image does not own."""
+
+    def rewritten(self, image, filename):
+        """A copy of a flat image whose single extent line names `filename`."""
+        source = self.qemu_create('monolithicFlat', 64 * MiB, directory=image, name='image.vmdk')
+        text = source.read_text(encoding='utf-8')
+        lines = [f'RW 131072 FLAT "{filename}" 0' if line.startswith('RW ') else line
+                 for line in text.splitlines()]
+        source.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+        return source
+
+    def test_absolute_extent_path(self):
+        image = self.rewritten('one', '/dev/zero')
+
+        with self.assertRaises(VmdkParseError) as caught:
+            parse_vmdk(image)
+        # The reason, not just a refusal: without the absolute-path rule the
+        # containment rule refuses this too, and an assertion that cannot
+        # tell them apart cannot tell whether the first rule is still there.
+        self.assertIn('absolute extent path', str(caught.exception))
+
+    def test_extent_path_climbing_out(self):
+        # A real file, so that without the containment rule the parse
+        # succeeds rather than failing for want of something to open.
+        target = self.workdir / 'target.raw'
+        target.write_bytes(b'\0' * SECTOR_SIZE)
+        image = self.rewritten('two', '../target.raw')
+
+        with self.assertRaises(VmdkParseError) as caught:
+            parse_vmdk(image)
+        self.assertIn('resolves outside', str(caught.exception))
+
+    def test_extent_symlink_pointing_away(self):
+        outside = self.workdir / 'away.raw'
+        outside.write_bytes(b'\0' * SECTOR_SIZE)
+        image = self.rewritten('three', 'extent.vmdk')
+        os.symlink(outside, image.parent / 'extent.vmdk')
+
+        # The name stays inside the directory; what it resolves to does not.
+        with self.assertRaises(VmdkParseError, msg='a symlink out of the directory was followed'):
+            parse_vmdk(image)
+
+    def test_extent_fifo_does_not_block(self):
+        image = self.rewritten('four', 'extent.vmdk')
+        os.mkfifo(image.parent / 'extent.vmdk')
+
+        # With no writer, a blocking open of this never returns. The test
+        # hanging rather than failing is itself the regression.
+        with self.assertRaises(VmdkParseError) as caught:
+            parse_vmdk(image)
+        self.assertIn('not a regular file', str(caught.exception))
+
+
+class TestDescriptorExtentLines(InstarTestBase):
+    """descriptor_extents reads every extent line, or refuses."""
+
+    HEAD = 'version=1\nCID=fffffffe\nparentCID=ffffffff\ncreateType="twoGbMaxExtentFlat"\n'
+
+    def test_non_extent_lines_are_passed_over(self):
+        text = self.HEAD + '\n# Extent description\nRW 4194304 FLAT "a-f001.vmdk" 0\n\nddb.adapterType = "ide"\n'
+
+        extents = descriptor_extents(text)
+
+        self.assertEqual(1, len(extents))
+        self.assertEqual('a-f001.vmdk', extents[0]['filename'])
+
+    def test_a_malformed_extent_line_is_refused(self):
+        # One good line and one that opens like an extent and is not: the
+        # count alone would read as a one-extent image.
+        text = self.HEAD + 'RW 4194304 FLAT "a-f001.vmdk" 0\nRW 4194304 FLAT "a-f002.vmdk\n'
+
+        with self.assertRaises(VmdkParseError) as caught:
+            descriptor_extents(text)
+        self.assertIn('malformed extent line', str(caught.exception))
+
+    def test_non_rw_access_modes_are_read(self):
+        text = self.HEAD + 'RDONLY 2048 FLAT "a-f001.vmdk" 0\nNOACCESS 4096 ZERO\n'
+
+        extents = descriptor_extents(text)
+
+        self.assertEqual(['RDONLY', 'NOACCESS'], [extent['access'] for extent in extents])
+        self.assertEqual([2048, 4096], [extent['sectors'] for extent in extents])

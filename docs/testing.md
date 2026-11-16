@@ -3481,9 +3481,12 @@ carries the VMDK4 header fields a reader walks the extent with. The
 names and the lengths come from the descriptor qemu wrote rather than
 from qemu's naming rule, so an extent named wrongly or never created
 reads as a missing file instead of being looked for under the name it
-should have had. One case puts a file where the second extent is about
-to go and keeps a second hard link to it, so its `existing_kept_lengths`
-says whether qemu truncated that file in place or replaced it.
+should have had. Two cases, one per subformat, put a file where the
+second extent is about to go and keep a second hard link to it, so
+their `existing_kept_lengths` says whether qemu truncated that file in
+place or replaced it. Both writers are measured because they take
+different paths: a flat extent is extended to its full declared
+length where a sparse one is written a header.
 
 `tests/test_qemu_create_pins.py` keeps it honest. It fails when a
 build is present that the pin does not list, when 6.0.0, 6.2.0,

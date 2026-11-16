@@ -1,6 +1,6 @@
 # Multi-extent VMDK phase 1: pin qemu's output
 
-## Status: Not started
+## Status: Complete
 
 Master plan: `PLAN-multi-extent-vmdk.md`.
 
@@ -203,8 +203,14 @@ builds from 6.0.0 to 10.2.0, the host `qemu-img` excluded:
         --scratch <scratchpad>/sweep
 
 Wall time 694 s (11 m 35 s) at the default `--jobs 1`. The pin lists
-exactly the 80 version directories in `qemu-img-binaries/x86_64`, holds
-48 cases and is 150042 bytes.
+exactly the 80 version directories in `qemu-img-binaries/x86_64`.
+
+Review round 1 re-swept it on the same builds, for the flat
+pre-existing-extent case it adds and for the extent filenames it
+normalises inside a `structure` block. That run changed one field of
+the seven sparse multi-extent cases and added one case, leaving every
+other case byte for byte as the first sweep recorded it. The pin now
+holds 49 cases and is 152498 bytes.
 
 Before the sweep, `--check --versions 6.0.0,8.2.0,10.2.0 --cases
 vmdk-flat-64M` exited 0 against the unmodified pin. Afterwards the pin
@@ -238,6 +244,7 @@ already has, so no new one appeared.
 | `vmdk-multi-sparse-21G` | 11 | 2 | as above |
 | `vmdk-multi-flat-21G` | 11 | 2 | as above |
 | `vmdk-multi-sparse-5G-existing-extent` | 3 | 2 | as above |
+| `vmdk-multi-flat-5G-existing-extent` | 3 | 2 | as above |
 
 The boundary was replayed on its own, all 13 cases against
 `--versions 6.1.0,6.1.1,6.2.0 --check`, and matched the pin, so it is
@@ -280,17 +287,27 @@ question 5, which this phase does not resolve.
 
 ### A pre-existing file where an extent goes
 
-`vmdk-multi-sparse-5G-existing-extent` drops a 1 MiB file at
-`image-s002.vmdk`, with a second hard link to it under a name no extent
-uses, then creates a 5 GiB `twoGbMaxExtentSparse` image over it.
+Two cases, one per subformat, drop a 1 MiB file where the second extent
+goes -- `image-s002.vmdk` and `image-f002.vmdk` -- with a second hard
+link to it under a name no extent uses, then create a 5 GiB image over
+it. Both writers are measured rather than one inferred from the other,
+because the flat writer extends each extent to its full declared length
+where the sparse one writes a header.
 
 **It is not a refusal.** On all 80 builds qemu returns rc 0 with empty
 stderr and writes the image exactly as it does without the obstruction:
 the same three extents, the same names, the same lengths 327680 /
-327680 / 196608. The kept link reports 327680 bytes, the length of the
-extent and not of the 1 MiB file it used to name, so qemu **truncated
-the existing file in place** rather than unlinking it and creating its
-own. Any other hard link, and any open descriptor, follows the image.
+327680 / 196608. The kept link reports the length of the extent and
+not of the 1 MiB file it used to name -- 327680 bytes for the sparse
+case, 2147483648 for the flat one -- so qemu **truncated the existing
+file in place** rather than unlinking it and creating its own. Any
+other hard link, and any open descriptor, follows the image.
+
+The two subformats differ only in direction. `ftruncate` is what sets
+an extent's length either way, so the sparse case shrinks the 1 MiB
+file to 320 KiB and the flat case grows it to 2 GiB. Neither reports
+anything, and neither leaves the original contents reachable under the
+old name.
 
 This is a measurement for open question 4 -- what instar should do
 with a file already sitting where an extent goes -- which this phase
@@ -397,3 +414,12 @@ sweep.
   with SC2016. That failure predates this branch: it is present on an
   untouched `develop` checkout, and nothing in this phase touches the
   file. Offered as a fix of its own; not taken up.
+* 2026-11-17 (AEDT), review round 1 on
+  [#921](https://github.com/shakenfist/instar/pull/921): 0 fix, 1
+  document, 8 consider, 2 none. Six of the eight `consider` items were
+  taken because each is a defect in code this branch added; two were
+  declined, in the pull request thread. The round added a
+  `twoGbMaxExtentFlat` case for a pre-existing extent file, which the
+  first sweep measured for the sparse writer only, and normalised the
+  extent filenames inside a pinned `structure` block, so both required
+  a second full 80-build sweep.

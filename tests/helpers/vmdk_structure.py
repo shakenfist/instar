@@ -40,7 +40,11 @@ Not compared, deliberately:
 Malformed input raises `VmdkParseError`, never `IndexError`,
 `struct.error`, `UnicodeDecodeError` or `OSError`: the differential fuzzer
 feeds this module images that may be wrong, and a parse failure has to be
-reportable as a finding about the image. Every offset and length is
+reportable as a finding about the image. Because that input is untrusted,
+an extent is opened only when the name on its line resolves inside the
+directory holding the descriptor and names a regular file; an absolute
+path, a name that climbs out with `..` or through a symlink, a device or
+a FIFO is refused rather than opened. Every offset and length is
 bounds-checked against the file before it is read, and files are read with
 `seek` and `read` in bounded pieces, never whole, because a `FLAT` extent
 is as large as the slice of the disk it carries.
@@ -74,6 +78,7 @@ Usage::
 
 import os
 import re
+import stat
 import struct
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
@@ -122,6 +127,11 @@ MAX_DESCRIPTOR_BYTES = (1 << 20) - 1
 EXTENT_LINE = re.compile(
     r'^(?P<access>RW|RDONLY|NOACCESS)\s+(?P<sectors>\d+)\s+(?P<kind>[A-Z]+)'
     r'(?:\s+"(?P<filename>[^"]*)"(?:\s+(?P<offset>\d+))?)?\s*$')
+
+# A line opening with an access mode is an extent line, whether or not the
+# rest of it parses. Anything else in a descriptor -- `version=1`, a
+# `ddb.*` entry, a comment -- is not, and is passed over.
+EXTENT_LINE_START = re.compile(r'^(?:RW|RDONLY|NOACCESS)\b')
 
 KIND_SPARSE = 'SPARSE'
 KIND_FLAT = 'FLAT'
@@ -259,13 +269,27 @@ class _Reader:
 
 
 def _open_reader(path, what: str):
-    """Open `path` for a bounds-checked read, raising `VmdkParseError`."""
+    """Open `path` for a bounds-checked read, raising `VmdkParseError`.
+
+    Opened without blocking and refused unless it is a regular file. An
+    extent line can name a FIFO, which a plain `open` waits on until
+    something writes to it -- hanging a fuzzer that has no timeout around
+    this module -- or a device, whose length is not a property of the
+    image.
+    """
     try:
-        handle = open(path, 'rb')
-        length = os.fstat(handle.fileno()).st_size
+        descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
     except OSError as e:
         raise VmdkParseError(f'{what}: cannot open {path}: {e}') from e
-    return handle, _Reader(handle, length, what)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            raise VmdkParseError(f'{what}: {path} is not a regular file')
+        handle = os.fdopen(descriptor, 'rb')
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return handle, _Reader(handle, info.st_size, what)
 
 
 def _parse_sparse_header(reader: _Reader) -> SparseHeader:
@@ -365,6 +389,10 @@ def descriptor_extents(text: str) -> List[dict]:
     touches no extent file, so a caller that has to describe an image whose
     extents are missing -- a create that failed part way, say -- can read
     the names out of the descriptor without `parse_vmdk` refusing it.
+
+    A line that opens with an access mode but does not parse raises, rather
+    than being passed over: a descriptor with one good extent line and
+    three broken ones is a corrupt image, not a one-extent image.
     """
     extents = []
     for line in text.splitlines():
@@ -373,6 +401,11 @@ def descriptor_extents(text: str) -> List[dict]:
             continue
         match = EXTENT_LINE.match(line)
         if match is None:
+            if EXTENT_LINE_START.match(line):
+                # Skipping it would report a corrupt image as a smaller
+                # intact one, which is the wrong answer rather than a
+                # missing one.
+                raise VmdkParseError(f'malformed extent line: {line!r}')
             continue
         sectors = int(match.group('sectors'))
         offset = match.group('offset')
@@ -384,6 +417,25 @@ def descriptor_extents(text: str) -> List[dict]:
             'flat_offset_sectors': None if offset is None else int(offset),
         })
     return extents
+
+
+def resolve_extent_path(filename: str, directory, what: str) -> str:
+    """Resolve an extent filename against the directory holding its descriptor.
+
+    A descriptor is untrusted input, and the filename on an extent line is
+    whatever its writer put there. qemu resolves one relative to the
+    descriptor's own directory, so anything that leaves that directory --
+    an absolute path, a `..` that climbs out of it, a symlink pointing
+    away -- names a file this image does not own, and is refused rather
+    than opened and measured.
+    """
+    if os.path.isabs(filename):
+        raise VmdkParseError(f'{what}: absolute extent path {filename!r}')
+    base = os.path.realpath(str(directory))
+    path = os.path.realpath(os.path.join(base, filename))
+    if path != base and not path.startswith(base + os.sep):
+        raise VmdkParseError(f'{what}: extent path {filename!r} resolves outside {base}')
+    return path
 
 
 def _parse_extent(index: int, declared: dict, directory) -> Extent:
@@ -400,8 +452,8 @@ def _parse_extent(index: int, declared: dict, directory) -> Extent:
     if kind == KIND_FLAT and declared['flat_offset_sectors'] is None:
         raise VmdkParseError(f'extent {index} is a FLAT extent with no start offset')
 
-    path = filename if os.path.isabs(filename) else os.path.join(directory, filename)
     what = f'extent {index} ({filename})'
+    path = resolve_extent_path(filename, directory, what)
     handle, reader = _open_reader(path, what)
     with handle:
         header = _parse_sparse_header(reader) if kind == KIND_SPARSE else None
