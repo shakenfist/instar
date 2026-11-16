@@ -142,16 +142,22 @@ master plan's Situation.
    weakening an oracle. If review disagrees, the second normaliser is a
    clean fallback and nothing downstream changes.
 
-2. **Pin cases stay small; the true extent ceiling is measured once and
-   recorded in this plan, not in the pin.** The pin runs in CI, and the
-   `%03d` naming implies a ceiling near 999 extents. Creating hundreds
-   of files per case per version across 80 builds is not affordable,
-   and the ceiling is a constant rather than something that needs
-   per-version proof. Pinned cases are capped at 11 extents (21 GiB,
+2. **Pin cases stay small; the extent ceiling is measured once and
+   recorded in this plan, not in the pin.** The pin runs in CI, and
+   creating hundreds of files per case per version across 80 builds is
+   not affordable. Pinned cases are capped at 11 extents (21 GiB,
    which is also past the 15-extent read ceiling phase 3 removes, so
-   phase 3 has a pinned case to prove itself against). The ceiling and
-   the refusal past it are probed once on a four-version sample
-   (6.0.0, 7.2.0, 8.2.0, 10.2.0) and written into *Sweep results*.
+   phase 3 has a pinned case to prove itself against). The ceiling is
+   probed once on a four-version sample (6.0.0, 7.2.0, 8.2.0, 10.2.0)
+   and written into *Sweep results*.
+
+   This decision was written expecting the `%03d` naming to imply a
+   ceiling near 999 extents, and the probe to find qemu refusing past
+   it. It does not: `%03d` is a minimum field width, 1000 extents are
+   named `-s1000.vmdk` and created without complaint, and 16384 work
+   too. The conclusion stands and the reason changes -- a large case
+   is kept out of the pin because it costs thousands of files per
+   version, not because it would pin a boundary.
 
 3. **Extent paths come from the descriptor, not from qemu's naming
    rule.** The new runner parses extent filenames out of the descriptor
@@ -181,10 +187,115 @@ One commit per step, each passing `pre-commit run --all-files` after
 |------|--------|-------|-----------|---------------------|
 | 1a | medium | opus | none | **Index the extent placeholder.** In `tests/helpers/qemu_pins.py`, change `normalise_descriptor` (`:504-511`) so each `RW <sectors> <KIND> "<name>"` line's filename is replaced by `$EXTENT<n>`, numbered from 1 in descriptor order, keeping the `CID=` substitution as it is. `EXTENT_PLACEHOLDER` (`:60`) becomes a prefix; keep the name or rename it, but update every use. Migrate `tests/golden/qemu-create-pins.json` in the same commit by replacing `"$EXTENT"` with `"$EXTENT1"` wherever it appears in a descriptor field — every existing pinned descriptor has exactly one extent line, so this is deterministic; confirm that with `grep -c` before and after and state both counts in the commit message. Prove the migration: `python3 tools/sweep-qemu-create.py --check tests/golden/qemu-create-pins.json --versions 6.0.0,8.2.0,10.2.0 --cases vmdk-flat-64M --scratch <scratchpad>/pin1a` must exit 0. Add a unit test for the normaliser with a three-extent descriptor (use the one in the phase plan's survey section) asserting the three distinct placeholders and the preserved sector counts. Do not add the new case kind here. Commit subject: `Number the extent placeholders in VMDK pins.` |
 | 1b | high | opus | worktree | **The VMDK structural parser.** Write `tests/helpers/vmdk_structure.py`: stdlib only, no import from `tests/base.py` (it must be importable the way `scripts/differential-fuzz.py:41-47` imports helpers), single quotes, 120 columns, trailing whitespace trimmed. Follow `tests/helpers/vhdx_structure.py` for API shape: `VmdkParseError(ValueError)`; `parse_vmdk(path) -> VmdkStructure` (frozen dataclass); `summarise(structure) -> dict`; `structural_diff(a, b) -> list[str]`. Parse the descriptor (plain text, or embedded in a VMDK4 sparse file at the offset/size the header records — `qemu_pins.py:380-401` already does that read and is the reference, do not edit it): `version`, `parentCID`, `createType`, and an ordered list of extents, each `(access, sectors, kind, filename)`. For each extent file resolved relative to the descriptor's directory, record the kind, declared sectors and actual length; and for a `SPARSE` extent parse the VMDK4 header after the `KDMV` magic per decision 4 — version, flags, capacity, grain size, descriptor offset and size, GD offset, RGD offset, overhead. Bounds-check every offset and length against the file before reading, and read with `seek`/`read`, never whole-file. `structural_diff` names the differing field and the extent index. Tests in a new `tests/test_vmdk_structure.py` (an `InstarTestBase` subclass using `_require_qemu_img`, `tests/base.py:473`, and `skip_unless_qemu_supports` for vmdk, `:456`): for host-qemu-written images, assert the parse of monolithicSparse 64M, monolithicFlat 64M, twoGbMaxExtentSparse 5G and twoGbMaxExtentFlat 5G; that the 5G cases have 3 extents with 4194304/4194304/2097152 declared sectors; that `structural_diff` is empty between two images made by the same command and names `createType` between sparse and flat; and that a truncated file, a bad `KDMV` magic, an extent line pointing at a missing file, and a descriptor with no extent lines each raise `VmdkParseError`. Run the module with stestr and confirm "Ran: N" matches the test count — do not trust the exit code, a >4 MiB attachment can kill a worker and still exit 0. Commit subject: `Add a structural VMDK parser for tests and the fuzzer.` |
-| 1c | high | opus | none | **The multi-extent case kind and its cases.** In `tests/helpers/qemu_pins.py` add `KIND_VMDK_MULTI = 'vmdk-multi'` beside the existing kinds (`:51`), a `_run_vmdk_multi` runner registered in `RUNNERS` (`:526-531`), and the cases. The runner creates the image, and on rc 0 records: `rc`; normalised `stderr`; the normalised `descriptor` (now index-aware, from 1a); `extent_lengths`, a list of actual file lengths in descriptor order, with extent paths parsed out of the descriptor **before** normalisation per decision 3 and resolved relative to the image directory, `null` for any that does not exist; `extent_names`, the basenames with the image stem replaced by `$STEM`, so the naming scheme is pinned without pinning the scratch path; and for sparse, `summarise()` from `helpers.vmdk_structure` per extent. Cases, each both subformats unless noted: 2 GiB exactly (1 extent, the boundary), 2 GiB + 1 MiB (2 extents, tiny second), 5 GiB (3 extents, partial last — the measured 4194304/4194304/2097152 case), 4 GiB (2 extents, exact multiple), 21 GiB (11 extents, decision 2's cap, which is also past phase 3's 15-extent read ceiling), 1 MiB (1 extent, far below the split), and a refusal case creating into a directory where `<stem>-s002.vmdk` already exists (sparse only). Do not add a 999-extent case; decision 2 keeps the ceiling out of the pin. Smoke-test with `--versions 6.0.0,10.2.0 --write <scratchpad>/pin.json --cases <the new ones>` and confirm the 5 GiB sparse case reports the three sector counts above; **do not commit a pin in this step**. Commit subject: `Add multi-extent VMDK cases to the qemu sweep.` |
+| 1c | high | opus | none | **The multi-extent case kind and its cases.** In `tests/helpers/qemu_pins.py` add `KIND_VMDK_MULTI = 'vmdk-multi'` beside the existing kinds (`:51`), a `_run_vmdk_multi` runner registered in `RUNNERS` (`:526-531`), and the cases. The runner creates the image, and on rc 0 records: `rc`; normalised `stderr`; the normalised `descriptor` (now index-aware, from 1a); `extent_lengths`, a list of actual file lengths in descriptor order, with extent paths parsed out of the descriptor **before** normalisation per decision 3 and resolved relative to the image directory, `null` for any that does not exist; `extent_names`, the basenames with the image stem replaced by `$STEM`, so the naming scheme is pinned without pinning the scratch path; and for sparse, `summarise()` from `helpers.vmdk_structure` per extent. Cases, each both subformats unless noted: 2 GiB exactly (1 extent, the boundary), 2 GiB + 1 MiB (2 extents, tiny second), 5 GiB (3 extents, partial last — the measured 4194304/4194304/2097152 case), 4 GiB (2 extents, exact multiple), 21 GiB (11 extents, decision 2's cap, which is also past phase 3's 15-extent read ceiling), 1 MiB (1 extent, far below the split), and a case creating into a directory where `<stem>-s002.vmdk` already exists (sparse only), whatever qemu does with it. Do not add a 999-extent case; decision 2 keeps the ceiling out of the pin. Smoke-test with `--versions 6.0.0,10.2.0 --write <scratchpad>/pin.json` -- `--cases` cannot be combined with `--write`, which always writes every case, so narrow by version and write to the scratchpad -- and confirm the 5 GiB sparse case reports the three sector counts above; **do not commit a pin in this step**. Commit subject: `Add multi-extent VMDK cases to the qemu sweep.` |
 | 1d | medium | opus | none | **Run the full sweep and commit the pin.** Run `python3 tools/sweep-qemu-create.py --write tests/golden/qemu-create-pins.json --scratch <scratchpad>/sweep` over all 80 versions, host qemu-img excluded. This rewrites the whole pin, so confirm first that `--check` passes on the unmodified pin for a three-version sample, and afterwards that the only changed cases are the new ones plus 1a's placeholder migration — `git diff` the pin and say so in the commit message. Host load has made qemu commands fail spuriously in this repository before: before attributing any version boundary, re-run that case alone on the versions either side with `--check` and confirm it reproduces. Then probe decision 2's ceiling on 6.0.0, 7.2.0, 8.2.0 and 10.2.0 only: find the largest size that creates and the refusal past it, for both subformats, and record the exact stderr. Add a *Sweep results* section to this plan: the command, the date, wall time, the `instar-testdata` commit, a table of new cases with group count and any boundary, the ceiling probe, and what qemu did with a pre-existing extent. Any result contradicting the master plan's Situation is reported to the management session **before** anything depends on it. Commit subject: `Pin qemu-img multi-extent VMDK output.` |
 | 1e | medium | sonnet | none | **CI check of the new cases.** Extend `tests/test_qemu_create_pins.py` (119 lines; follow its existing discovery of `self._testdata_root / 'qemu-img-binaries' / 'x86_64'` and its skip when absent) so the new cases are checked the way the existing ones are: every version directory present is listed in the pin; for 6.0.0, 6.2.0, 8.2.0 and 10.2.0 when present, each new case's `run_case` result equals `expected(case, version)`, one subTest per (version, case), reporting `structural_diff` output on failure; and the host `qemu-img` is compared against the group of the newest pinned version at or below its own, calling `skip_unless_qemu_supports` for vmdk first. If a new case turns out to have exactly one group across all 80 builds, assert that too, so a boundary appearing later is a failure until a phase handles it. Run `tools/ci/check-test-partition.sh` and confirm the module is still claimed, then run it with stestr and check "Ran: N" and 0 failures. Add `tests/stestr-timing.txt` lines only if the module exceeds 30 s, sorted by id, per `docs/testing.md`. Commit subject: `Check the multi-extent VMDK pins in CI.` |
 | 1f | low | sonnet | none | **Close the phase.** Fold this phase's findings back into the master plan: if step 1d found a boundary or a result contradicting `PLAN-multi-extent-vmdk.md`'s Situation, correct the Situation at source and say so in the commit; if it found none, add one sentence saying the 80-build sweep confirmed it, naming the pin file. Record the ceiling probe's answer against open question 5 and the pre-existing-extent behaviour against open question 4, as measurements, **without resolving either question** — those are the operator's. Confirm `git diff --name-only origin/develop...HEAD -- src/` is empty, and that `git diff origin/develop...HEAD -- tests tools docs/ \| grep -nE 'PLAN-\|[Pp]hase [0-9]\|step 1[a-f]'` prints nothing: no plan, phase or step references in landed code or docs. Do not change the Execution table's status; the next phase's first commit closes this one out. Commit subject: `Record the multi-extent sweep in the plan.` |
+
+## Sweep results
+
+Run on 2026-11-17, starting 05:27 +11:00, against instar-testdata
+`f73d4367` (`f73d43670af5e6ba75e4b135bc807d3e33bbd50d`), all 80 static
+builds from 6.0.0 to 10.2.0, the host `qemu-img` excluded:
+
+    python3 tools/sweep-qemu-create.py \
+        --write tests/golden/qemu-create-pins.json \
+        --scratch <scratchpad>/sweep
+
+Wall time 694 s (11 m 35 s) at the default `--jobs 1`. The pin lists
+exactly the 80 version directories in `qemu-img-binaries/x86_64`, holds
+48 cases and is 150042 bytes.
+
+Before the sweep, `--check --versions 6.0.0,8.2.0,10.2.0 --cases
+vmdk-flat-64M` exited 0 against the unmodified pin. Afterwards the pin
+is a pure insertion: 1478 added lines, no deleted ones, the 13 new
+cases added and no pre-existing case's recorded result changed (`rc`,
+`stderr` and every measured field of all 35 existing cases compare
+equal to `HEAD`'s copy, and the version list is identical).
+
+### The new cases
+
+Every new case has exactly two groups, 6.0.0..6.1.1 and 6.2.0..10.2.0,
+and in every one of them the only differing field is `descriptor`,
+which gains the single line `ddb.toolsVersion = "2147483647"` from
+6.2.0. `rc`, `stderr`, `extent_names`, `extent_lengths`, the sparse
+`structure` and (where present) `existing_kept_lengths` are identical
+across all 80 builds. This is the same boundary `vmdk-flat-64M`
+already has, so no new one appeared.
+
+| Case | Extents | Groups | Boundary |
+|------|---------|--------|----------|
+| `vmdk-multi-sparse-1M` | 1 | 2 | 6.1.1 / 6.2.0, `descriptor` only |
+| `vmdk-multi-flat-1M` | 1 | 2 | as above |
+| `vmdk-multi-sparse-2G` | 1 | 2 | as above |
+| `vmdk-multi-flat-2G` | 1 | 2 | as above |
+| `vmdk-multi-sparse-2049M` | 2 | 2 | as above |
+| `vmdk-multi-flat-2049M` | 2 | 2 | as above |
+| `vmdk-multi-sparse-4G` | 2 | 2 | as above |
+| `vmdk-multi-flat-4G` | 2 | 2 | as above |
+| `vmdk-multi-sparse-5G` | 3 | 2 | as above |
+| `vmdk-multi-flat-5G` | 3 | 2 | as above |
+| `vmdk-multi-sparse-21G` | 11 | 2 | as above |
+| `vmdk-multi-flat-21G` | 11 | 2 | as above |
+| `vmdk-multi-sparse-5G-existing-extent` | 3 | 2 | as above |
+
+The boundary was replayed on its own, all 13 cases against
+`--versions 6.1.0,6.1.1,6.2.0 --check`, and matched the pin, so it is
+qemu's and not host load.
+
+The 5 GiB sparse case records the expected split, `RW 4194304 SPARSE
+"$EXTENT1"`, `RW 4194304 SPARSE "$EXTENT2"`, `RW 2097152 SPARSE
+"$EXTENT3"`, with names `$STEM-s001.vmdk`, `$STEM-s002.vmdk`,
+`$STEM-s003.vmdk` and file lengths 327680, 327680 and 196608. Its flat
+twin names `$STEM-f00{1,2,3}.vmdk` with lengths 2147483648, 2147483648
+and 1073741824: a flat extent is its full declared length, a sparse one
+is a header plus directories only. 2 GiB exactly is one extent, not two.
+
+### The extent ceiling
+
+Probed on 6.0.0, 7.2.0, 8.2.0 and 10.2.0, both subformats.
+
+**There is no extent-count ceiling to find.** `%03d` is a minimum field
+width, not a cap: past 999 the names simply grow a digit. At 2000 GiB
+every one of the four builds writes 1000 extents, rc 0, empty stderr,
+and the thousandth descriptor line is verbatim
+
+    RW 4194304 SPARSE "image-s1000.vmdk"
+
+on 6.0.0 and on 10.2.0 alike. At 32 TiB all four builds write 16384
+extents, rc 0, empty stderr, 16384 `RW` lines in the descriptor, in
+12-14 s each. At 1 PiB 10.2.0 does not refuse either: it was still
+creating extents when a 60 s timeout stopped it, 70168 of the 524288
+the size implies.
+
+The only refusal past it is `qemu-img`'s generic size parser, not the
+vmdk driver, and it is identical on all four builds and both
+subformats:
+
+    qemu-img: Invalid image size specified. Must be between 0 and 9223372036854775807.
+
+So the practical limit on a split VMDK is the filesystem's inodes and
+the operator's patience, not qemu. That is a measurement for open
+question 5, which this phase does not resolve.
+
+### A pre-existing file where an extent goes
+
+`vmdk-multi-sparse-5G-existing-extent` drops a 1 MiB file at
+`image-s002.vmdk`, with a second hard link to it under a name no extent
+uses, then creates a 5 GiB `twoGbMaxExtentSparse` image over it.
+
+**It is not a refusal.** On all 80 builds qemu returns rc 0 with empty
+stderr and writes the image exactly as it does without the obstruction:
+the same three extents, the same names, the same lengths 327680 /
+327680 / 196608. The kept link reports 327680 bytes, the length of the
+extent and not of the 1 MiB file it used to name, so qemu **truncated
+the existing file in place** rather than unlinking it and creating its
+own. Any other hard link, and any open descriptor, follows the image.
+
+This is a measurement for open question 4 -- what instar should do
+with a file already sitting where an extent goes -- which this phase
+records and does not resolve. What qemu does is not by itself what
+instar should do.
 
 ## Risks and mitigations
 
@@ -215,9 +326,11 @@ Falsifiable; each is checkable by someone who did not do the work.
 6. `tests/test_vmdk_structure.py` and `tests/test_qemu_create_pins.py`
    both run under stestr with "Ran: N" matching their test counts and
    0 failures.
-7. This plan's *Sweep results* section names the maximum extent count
-   qemu accepts, the verbatim stderr of the refusal past it, and what
-   qemu does when a target extent already exists.
+7. This plan's *Sweep results* section reports the ceiling probe --
+   the largest extent count measured, and the verbatim stderr of the
+   only refusal found -- and what qemu does when a target extent
+   already exists. (Written expecting an extent-count ceiling; there
+   is none. See *Execution notes*.)
 8. `git diff --name-only origin/develop...HEAD -- src/` is empty.
 9. No plan, phase or step reference appears in anything landed outside
    `docs/plans/`.
@@ -236,3 +349,51 @@ gates CI across 80 builds, and it is cheap to propose and expensive to
 redo. The management session reviews 1c's smoke-test output and agrees
 the case list before 1d runs. A case added after 1d means another full
 sweep.
+
+## Execution notes
+
+* 2026-11-16 (AEDT), back brief. Michael chose the index-aware
+  `$EXTENT<n>` placeholder with a migration of the existing pin over a
+  second normaliser (decision 1), and asked for the run to stop at the
+  gate before 1d.
+* Step 1b's planned commit subject, `Add a structural VMDK parser for
+  tests and the fuzzer.`, is 54 characters against the hook's limit of
+  50. It was shortened to `Add a structural VMDK parser for tests.`,
+  with the fuzzer's claim on the parser kept in the body.
+* The 1c row specified a smoke test that cannot be run:
+  `tools/sweep-qemu-create.py` rejects `--cases` together with
+  `--write`, because a write always writes every case. The step worked
+  around it by narrowing to two versions and writing to the
+  scratchpad, and the row has been corrected at source rather than the
+  tool changed.
+* 2026-11-17 (AEDT), the gate before 1d. The gate was proposed on the
+  assumption that the sweep was long enough that a redo would hurt.
+  Measured, 13 cases across 2 versions take 0.30 s; the full 80-build
+  run took 694 s, and all of that is the 35 pre-existing cases, the 64
+  TiB VHDX ones above all. The correction was put to Michael with the
+  gate. He signed off the case list as it stood.
+* **Steps 1c and 1d landed as one commit**, `bf9c987a`. Committing 1c
+  alone leaves `tests/test_qemu_create_pins.py` at 7 run, 5 failed,
+  because the cases exist and the pin does not yet hold them. Michael
+  chose to run the full sweep immediately and land the two as one
+  green unit rather than leave a red commit on the branch. 1c's and
+  1d's commit subjects are therefore replaced by one.
+* The management session reproduced 1d's two load-bearing claims
+  rather than taking the report for them: the pin diff is a pure
+  insertion of 13 cases with no pre-existing case's result changed
+  (compared field by field against `HEAD`'s copy in Python, 1478 added
+  lines and none deleted), and `--check` over the new cases on
+  6.0.0, 6.1.1, 6.2.0, 8.2.0 and 10.2.0 replays the pin in 0.2 s,
+  across the boundary in both directions.
+* The ceiling probe falsified the premise of decision 2 and of
+  done-item 7, both of which expected qemu to refuse past some extent
+  count. It does not: `%03d` is a minimum field width, so the names
+  grow a digit and keep going. Decision 2's conclusion is unaffected
+  -- the pin still should not carry a 1000-extent case -- but its
+  reason is now the cost of the case, not a boundary to pin.
+  Done-item 7 is corrected at source.
+* `pre-commit run --all-files` passes every hook but `shellcheck`,
+  which fails on `tools/ci/test-check-no-runtime-luks-create.sh:122`
+  with SC2016. That failure predates this branch: it is present on an
+  untouched `develop` checkout, and nothing in this phase touches the
+  file. Offered as a fix of its own; not taken up.
