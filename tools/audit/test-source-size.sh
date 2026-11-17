@@ -28,6 +28,15 @@
 #   * a path with a space, a path with a tab, and an added line whose
 #     content is "++";
 #   * a file the scope grew that a later commit deleted;
+#   * a commit on develop between the two phases that grows a file the
+#     phases also grow, and is not in the commits file -- it must not be
+#     charged to them, though a --range spanning it must;
+#   * a scope that touches no source at all, where git apply refuses
+#     the empty patch;
+#   * a file whose name starts with "total", which wc's summary line
+#     must not be confused with;
+#   * wc, git apply and git diff each failing, through PATH shims, which
+#     must come out as an error and never as "(none)";
 #   * diff.renames=false in the repository's config, so the rename case
 #     proves the script asks for rename detection rather than
 #     inheriting it.
@@ -96,6 +105,7 @@ build_fixture() {
         lines gone.rs 900
         lines churn.rs 2000
         lines "${TABBED}" 900
+        lines 'total counts.rs' 1600
         git add -A
         git commit -q -m 'base'
 
@@ -109,6 +119,10 @@ build_fixture() {
         git commit -q -am 'feat a'
         git checkout -q develop
         git merge -q --no-ff -m 'merge feat a' feat-a
+
+        # Unrelated work on develop between the phases, not audited.
+        seq 5 >> big.rs
+        git commit -q -am 'unrelated'
 
         # Merge 2: a rename, a shrink, excluded growth, workflow growth,
         # a new spaced path, and an added line that looks like a header.
@@ -125,6 +139,10 @@ build_fixture() {
         git commit -q -m 'feat b'
         git checkout -q develop
         git merge -q --no-ff -m 'merge feat b' feat-b
+
+        # A documentation-only commit: no source in it at all.
+        printf 'x\n' >> docs/huge.md
+        git commit -q -am 'docs only'
 
         # The audit branch: one commit of its own, under 800 lines.
         git checkout -q -b audit
@@ -145,7 +163,8 @@ printf '%s\n%s\n' "$M1" "$M2" > "$CFILE"
 
 start "--commits-file sees growth the phases merged"
 out="$("$TOOL" --commits-file "$CFILE" 2>&1)"
-expect_line "file over 1,500 that grew" '^ *1601 lines +\+1 in scope +big\.rs +\(over 1500' "$out"
+expect_line "file over 1,500 that grew, charged only its audited growth" \
+    '^ *1606 lines +\+1 in scope +big\.rs +\(over 1500' "$out"
 expect_line "file over 800 that grew, a header-shaped line counted" \
     '^ *902 lines +\+2 in scope +mid\.rs +\(over 800: a question\)' "$out"
 expect_line "new file over 1,500, path with a space" '^ *1700 lines +\+1700 in scope +new spaced\.rs ' "$out"
@@ -158,6 +177,52 @@ expect_no_line "rewritten into fewer lines is a net loss" 'churn\.rs' "$out"
 expect_no_line "pure rename is not growth" 'move[sd]\.rs' "$out"
 expect_no_line "prototypes/ is excluded" 'prototypes/' "$out"
 expect_no_line "markdown is excluded" '\.md' "$out"
+
+start "--range measures everything in the range"
+out="$("$TOOL" --range "${M1}^1..develop" 2>&1)"
+expect_line "unrelated commit inside the range is counted" '^ *1606 lines +\+6 in scope +big\.rs ' "$out"
+expect_line "range finds a file over 800" '^ *902 lines +\+2 in scope +mid\.rs ' "$out"
+expect_no_line "rename is not growth in range mode either" 'move[sd]\.rs' "$out"
+expect_no_line "no (none) beside findings" '^\(none\)' "$out"
+
+start "a scope with no source in it says so, without an error"
+DOCS_ONLY="$(git -C "${FIX}" log --format=%H -1 --grep='^docs only$' develop)"
+out="$("$TOOL" --range "${DOCS_ONLY}^..${DOCS_ONLY}" 2>&1)"
+expect_line "the reason is given" '^\(none\): the scope changes no file that counts as source$' "$out"
+expect_no_line "git apply is not handed an empty patch" 'error|No valid patches' "$out"
+
+start "a failure to measure is an error, never (none)"
+SHIM="${WORK}/shim"
+mkdir -p "${SHIM}/wc" "${SHIM}/apply" "${SHIM}/diff"
+REAL_GIT="$(command -v git)"
+REAL_WC="$(command -v wc)"
+# Each shim breaks one thing as narrowly as it can, so that a failure
+# the script handles only partly -- the last commit's diff but not the
+# first's, the count of every file but not one -- still shows. wc reads
+# the file on stdin, so the shim finds out which file through /proc.
+# shellcheck disable=SC2016  # the shim expands these, not this script
+printf '#!/bin/sh\ncase "$(readlink /proc/$$/fd/0)" in */big.rs) exit 1;; esac\nexec "%s" "$@"\n' \
+    "${REAL_WC}" > "${SHIM}/wc/wc"
+# shellcheck disable=SC2016  # the shim expands these, not this script
+printf '#!/bin/sh\n[ "$1" = apply ] && exit 1\nexec "%s" "$@"\n' "${REAL_GIT}" > "${SHIM}/apply/git"
+# shellcheck disable=SC2016  # the shim expands these, not this script
+printf '#!/bin/sh\nfor a; do [ "$a" = "%s" ] && exit 1; done\nexec "%s" "$@"\n' \
+    "${M1}" "${REAL_GIT}" > "${SHIM}/diff/git"
+chmod +x "${SHIM}"/*/*
+for broken in wc apply diff; do
+    out="$(PATH="${SHIM}/${broken}:${PATH}" "$TOOL" --commits-file "$CFILE" 2>&1)"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then ok "${broken} failing exits non-zero"; else fail "${broken} failing exited 0"; fi
+    expect_line "${broken} failing is reported" '^error: .*not a clean result$' "$out"
+    if [ "$broken" = wc ]; then
+        expect_line "the file that could not be counted is named" '^error: could not count the lines in big\.rs$' "$out"
+    fi
+    expect_no_line "${broken} failing is not (none)" '^\(none\)' "$out"
+done
+out="$(PATH="${SHIM}/wc:${PATH}" "$TOOL" --baseline 2>&1)"
+rc=$?
+if [ "$rc" -ne 0 ]; then ok "--baseline exits non-zero with wc failing"; else fail "--baseline exited 0 with wc failing"; fi
+expect_line "--baseline names the file it could not count" '^error: could not count the lines in big\.rs$' "$out"
 
 start "the default scope on an audit branch sees only the branch"
 out="$(cd "${FIX}/docs" && "$TOOL" 2>&1)"
@@ -183,6 +248,7 @@ start "--baseline lists the tracked tree, from any directory"
 out="$(cd "${FIX}/docs" && "$TOOL" --baseline 2>&1)"
 expect_line "file over 1,500 listed" '^ *1700 new spaced\.rs$' "$out"
 expect_line "renamed file listed under its new name" '^ *3000 moved\.rs$' "$out"
+expect_line "a name starting with total is listed" '^ *1600 total counts\.rs$' "$out"
 expect_no_line "file under 1,500 not listed" 'mid\.rs' "$out"
 expect_no_line "prototypes/ excluded from a subdirectory" 'prototypes/' "$out"
 expect_no_line "markdown excluded from a subdirectory" '\.md' "$out"
@@ -190,11 +256,10 @@ expect_no_line "no wc total line" ' total$' "$out"
 out="$("$TOOL" --baseline 800 2>&1)"
 expect_line "a threshold argument is honoured" '^ *902 mid\.rs$' "$out"
 expect_line "workflow YAML in the baseline" '^ *1001 \.github/workflows/ci\.yml$' "$out"
-if "$TOOL" --baseline lots > /dev/null 2>&1; then
-    fail "a non-numeric threshold exited 0"
-else
-    ok "a non-numeric threshold is refused"
-fi
+out="$("$TOOL" --baseline lots 2>&1)"
+rc=$?
+if [ "$rc" -ne 0 ]; then ok "a non-numeric threshold exits non-zero"; else fail "a non-numeric threshold exited 0"; fi
+expect_line "a non-numeric threshold is refused by name" "^--baseline takes a line count, not 'lots'$" "$out"
 
 if [ "$FAILURES" -ne 0 ]; then
     echo "${FAILURES} failure(s)" >&2

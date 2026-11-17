@@ -365,8 +365,9 @@ copy lives in shakenfist/development at
       grows that is over 800 lines now, with its net growth. Because
       it uses the audit scope, `--commits-file` covers merged phases
       as it does for every other check, and a scope that cannot be
-      resolved is reported as skipped rather than as "(none)". A pure
-      rename is not growth and does not appear.
+      resolved, or a diff or count that fails, is reported as such
+      rather than as "(none)". A pure rename is not growth and does
+      not appear.
 
     A finding over 1,500 lines is the block's ratchet breach unless the
     pull request description names the file and says why it had to
@@ -382,11 +383,11 @@ copy lives in shakenfist/development at
     material rather than shipped code. Workflow YAML is counted.
 
     The Python integration suite is in scope and is where the rule
-    bites hardest: `tests/test_convert.py` is several thousand lines
-    and around a dozen other test modules are over 1,500. A
-    per-operation test module is a real seam, so these are not
-    automatically defects, but they are baselined like any other
-    file, and the block's rule applies to them unchanged.
+    bites hardest: several of its modules are well past 1,500 lines,
+    and `--baseline` is the current list. A per-operation test module
+    is a real seam, so length alone is not a defect, but they are
+    baselined like any other file, and the block's rule applies to
+    them unchanged.
 
 <!-- shared-block: plan-references-in-code v1 -->
 Plan references in code (shared block; do not edit -- the
