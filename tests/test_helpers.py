@@ -8,6 +8,7 @@ lists, the preallocation byte comparison, and the normalisers).
 """
 
 import json
+import shutil
 import struct
 import tempfile
 import unittest
@@ -422,7 +423,90 @@ class TestQemuPinNormalisers(unittest.TestCase):
                 'RW 131072 FLAT "image-flat.vmdk" 0\nRW 131072 SPARSE "image.vmdk"\n')
         self.assertEqual(qemu_pins.normalise_descriptor(text),
                          'version=1\nCID=$CID\nparentCID=ffffffff\n'
-                         'RW 131072 FLAT "$EXTENT" 0\nRW 131072 SPARSE "$EXTENT"\n')
+                         'RW 131072 FLAT "$EXTENT1" 0\nRW 131072 SPARSE "$EXTENT2"\n')
+
+    def test_descriptor_numbers_non_rw_extents_too(self):
+        # The same access modes helpers.vmdk_structure parses. A line left
+        # unnumbered here would keep its literal filename while still being
+        # counted in extent_names, so the two would disagree on which
+        # extent sits at which index.
+        text = ('createType="twoGbMaxExtentFlat"\n'
+                'RW 4194304 FLAT "image-f001.vmdk" 0\n'
+                'RDONLY 2048 FLAT "image-f002.vmdk" 0\n'
+                'NOACCESS 4096 FLAT "image-f003.vmdk" 0\n')
+        self.assertEqual(qemu_pins.normalise_descriptor(text),
+                         'createType="twoGbMaxExtentFlat"\n'
+                         'RW 4194304 FLAT "$EXTENT1" 0\n'
+                         'RDONLY 2048 FLAT "$EXTENT2" 0\n'
+                         'NOACCESS 4096 FLAT "$EXTENT3" 0\n')
+
+    def test_an_extent_without_a_filename_still_takes_a_number(self):
+        # descriptor_extents returns an entry for a ZERO extent, so the
+        # numbering here has to count it. Skipping it would put $EXTENT2 on
+        # the third extent while extent_names[1] held the second.
+        text = ('createType="twoGbMaxExtentSparse"\n'
+                'RW 2048 SPARSE "image-s001.vmdk"\n'
+                'RW 4096 ZERO\n'
+                'RW 2048 SPARSE "image-s002.vmdk"\n')
+        self.assertEqual(qemu_pins.normalise_descriptor(text),
+                         'createType="twoGbMaxExtentSparse"\n'
+                         'RW 2048 SPARSE "$EXTENT1"\n'
+                         'RW 4096 ZERO\n'
+                         'RW 2048 SPARSE "$EXTENT3"\n')
+
+    def test_descriptor_numbers_every_extent(self):
+        text = ('version=1\nCID=8432577\nparentCID=ffffffff\ncreateType="twoGbMaxExtentSparse"\n\n'
+                '# Extent description\n'
+                'RW 4194304 SPARSE "image-s001.vmdk"\n'
+                'RW 4194304 SPARSE "image-s002.vmdk"\n'
+                'RW 2097152 SPARSE "image-s003.vmdk"\n')
+        self.assertEqual(qemu_pins.normalise_descriptor(text),
+                         'version=1\nCID=$CID\nparentCID=ffffffff\ncreateType="twoGbMaxExtentSparse"\n\n'
+                         '# Extent description\n'
+                         'RW 4194304 SPARSE "$EXTENT1"\n'
+                         'RW 4194304 SPARSE "$EXTENT2"\n'
+                         'RW 2097152 SPARSE "$EXTENT3"\n')
+
+
+class TestQemuPinExtentHelpers(unittest.TestCase):
+    """The extent name and length helpers, without a qemu-img anywhere."""
+
+    def setUp(self):
+        self.workdir = Path(tempfile.mkdtemp(prefix='instar-extent-helpers-'))
+        self.addCleanup(shutil.rmtree, self.workdir, ignore_errors=True)
+
+    def test_a_name_built_from_the_stem_is_placeheld(self):
+        self.assertEqual(f'{qemu_pins.STEM_PLACEHOLDER}-s001.vmdk',
+                         qemu_pins._extent_name(f'{qemu_pins.IMAGE_STEM}-s001.vmdk'))
+
+    def test_a_name_not_built_from_the_stem_is_kept(self):
+        # What a descriptor pointing somewhere else looks like; recording it
+        # verbatim is what makes that visible in the pin.
+        self.assertEqual('elsewhere.vmdk', qemu_pins._extent_name('elsewhere.vmdk'))
+
+    def test_a_present_extent_reports_its_length(self):
+        (self.workdir / 'image-s001.vmdk').write_bytes(b'\0' * 2048)
+
+        self.assertEqual(2048, qemu_pins._extent_length(self.workdir, 'image-s001.vmdk'))
+
+    def test_an_extent_that_was_never_created_is_none(self):
+        self.assertIsNone(qemu_pins._extent_length(self.workdir, 'image-s001.vmdk'))
+
+    def test_a_name_leaving_the_directory_is_refused_not_missing(self):
+        # Both the directory the name escapes from and the file it reaches
+        # live under this test's own scratch directory, so nothing here
+        # shares a path with another test or another run.
+        inner = self.workdir / 'descriptor'
+        inner.mkdir()
+        outside = self.workdir / 'outside.raw'
+        outside.write_bytes(b'\0' * 512)
+
+        for name in ('/etc/hostname', f'../{outside.name}'):
+            with self.subTest(name=name):
+                self.assertEqual(qemu_pins.REFUSED_EXTENT, qemu_pins._extent_length(inner, name))
+
+    def test_no_filename_is_none(self):
+        self.assertIsNone(qemu_pins._extent_length(self.workdir, None))
 
 
 class TestQemuPinVolatileMask(unittest.TestCase):

@@ -1667,7 +1667,7 @@
         "result": {
           "rc": 0,
           "stderr": "",
-          "descriptor": "# Disk DescriptorFile\nversion=1\nCID=$CID\nparentCID=ffffffff\ncreateType=\"monolithicFlat\"\n\n# Extent description\nRW 131072 FLAT \"$EXTENT\" 0\n\n# The Disk Data Base\n#DDB\n\nddb.virtualHWVersion = \"4\"\nddb.geometry.cylinders = \"130\"\nddb.geometry.heads = \"16\"\nddb.geometry.sectors = \"63\"\nddb.adapterType = \"ide\"\n",
+          "descriptor": "# Disk DescriptorFile\nversion=1\nCID=$CID\nparentCID=ffffffff\ncreateType=\"monolithicFlat\"\n\n# Extent description\nRW 131072 FLAT \"$EXTENT1\" 0\n\n# The Disk Data Base\n#DDB\n\nddb.virtualHWVersion = \"4\"\nddb.geometry.cylinders = \"130\"\nddb.geometry.heads = \"16\"\nddb.geometry.sectors = \"63\"\nddb.adapterType = \"ide\"\n",
           "extent_length": 67108864
         }
       },
@@ -1684,7 +1684,7 @@
         "result": {
           "rc": 0,
           "stderr": "",
-          "descriptor": "# Disk DescriptorFile\nversion=1\nCID=$CID\nparentCID=ffffffff\ncreateType=\"monolithicFlat\"\n\n# Extent description\nRW 131072 FLAT \"$EXTENT\" 0\n\n# The Disk Data Base\n#DDB\n\nddb.virtualHWVersion = \"4\"\nddb.geometry.cylinders = \"130\"\nddb.geometry.heads = \"16\"\nddb.geometry.sectors = \"63\"\nddb.adapterType = \"ide\"\nddb.toolsVersion = \"2147483647\"\n",
+          "descriptor": "# Disk DescriptorFile\nversion=1\nCID=$CID\nparentCID=ffffffff\ncreateType=\"monolithicFlat\"\n\n# Extent description\nRW 131072 FLAT \"$EXTENT1\" 0\n\n# The Disk Data Base\n#DDB\n\nddb.virtualHWVersion = \"4\"\nddb.geometry.cylinders = \"130\"\nddb.geometry.heads = \"16\"\nddb.geometry.sectors = \"63\"\nddb.adapterType = \"ide\"\nddb.toolsVersion = \"2147483647\"\n",
           "extent_length": 67108864
         }
       }
@@ -1705,6 +1705,1518 @@
           "stderr": "qemu-img: $DIR/image.vmdk: Flat image can't have backing file\n",
           "descriptor": null,
           "extent_length": null
+        }
+      }
+    ],
+    "vmdk-multi-sparse-1M": [
+      {
+        "versions": ["6.0.0", "6.0.1", "6.1.0", "6.1.1"],
+        "result": {
+          "rc": 0,
+          "stderr": "",
+          "descriptor": "# Disk DescriptorFile\nversion=1\nCID=$CID\nparentCID=ffffffff\ncreateType=\"twoGbMaxExtentSparse\"\n\n# Extent description\nRW 2048 SPARSE \"$EXTENT1\"\n\n# The Disk Data Base\n#DDB\n\nddb.virtualHWVersion = \"4\"\nddb.geometry.cylinders = \"2\"\nddb.geometry.heads = \"16\"\nddb.geometry.sectors = \"63\"\nddb.adapterType = \"ide\"\n",
+          "extent_names": ["$STEM-s001.vmdk"],
+          "extent_lengths": [65536],
+          "existing_kept_lengths": null,
+          "structure": {
+            "descriptor_embedded": false,
+            "version": "1",
+            "has_cid": true,
+            "parent_cid": "ffffffff",
+            "create_type": "twoGbMaxExtentSparse",
+            "extent_count": 1,
+            "total_sectors": 2048,
+            "extents": [
+              {
+                "access": "RW",
+                "sectors": 2048,
+                "kind": "SPARSE",
+                "filename": "$STEM-s001.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 65536,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 2048,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 26,
+                  "overhead_sectors": 128
+                }
+              }
+            ]
+          }
+        }
+      },
+      {
+        "versions": [
+          "6.2.0", "7.0.0", "7.1.0", "7.2.0", "7.2.1", "7.2.2", "7.2.3", "7.2.4", "7.2.5", "7.2.6", "7.2.7", "7.2.8",
+          "7.2.9", "7.2.10", "7.2.11", "7.2.12", "7.2.13", "7.2.14", "7.2.15", "7.2.16", "7.2.17", "7.2.18", "7.2.19",
+          "7.2.20", "7.2.21", "7.2.22", "8.0.0", "8.0.1", "8.0.2", "8.0.3", "8.0.4", "8.0.5", "8.1.0", "8.1.1", "8.1.2",
+          "8.1.3", "8.1.4", "8.1.5", "8.2.0", "8.2.1", "8.2.2", "8.2.3", "8.2.4", "8.2.5", "8.2.6", "8.2.7", "8.2.8",
+          "8.2.9", "8.2.10", "9.0.0", "9.0.1", "9.0.2", "9.0.3", "9.0.4", "9.1.0", "9.1.1", "9.1.2", "9.1.3", "9.2.0",
+          "9.2.1", "9.2.2", "9.2.3", "9.2.4", "10.0.0", "10.0.1", "10.0.2", "10.0.3", "10.0.4", "10.0.5", "10.0.6",
+          "10.0.7", "10.1.0", "10.1.1", "10.1.2", "10.1.3", "10.2.0"
+        ],
+        "result": {
+          "rc": 0,
+          "stderr": "",
+          "descriptor": "# Disk DescriptorFile\nversion=1\nCID=$CID\nparentCID=ffffffff\ncreateType=\"twoGbMaxExtentSparse\"\n\n# Extent description\nRW 2048 SPARSE \"$EXTENT1\"\n\n# The Disk Data Base\n#DDB\n\nddb.virtualHWVersion = \"4\"\nddb.geometry.cylinders = \"2\"\nddb.geometry.heads = \"16\"\nddb.geometry.sectors = \"63\"\nddb.adapterType = \"ide\"\nddb.toolsVersion = \"2147483647\"\n",
+          "extent_names": ["$STEM-s001.vmdk"],
+          "extent_lengths": [65536],
+          "existing_kept_lengths": null,
+          "structure": {
+            "descriptor_embedded": false,
+            "version": "1",
+            "has_cid": true,
+            "parent_cid": "ffffffff",
+            "create_type": "twoGbMaxExtentSparse",
+            "extent_count": 1,
+            "total_sectors": 2048,
+            "extents": [
+              {
+                "access": "RW",
+                "sectors": 2048,
+                "kind": "SPARSE",
+                "filename": "$STEM-s001.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 65536,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 2048,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 26,
+                  "overhead_sectors": 128
+                }
+              }
+            ]
+          }
+        }
+      }
+    ],
+    "vmdk-multi-flat-1M": [
+      {
+        "versions": ["6.0.0", "6.0.1", "6.1.0", "6.1.1"],
+        "result": {
+          "rc": 0,
+          "stderr": "",
+          "descriptor": "# Disk DescriptorFile\nversion=1\nCID=$CID\nparentCID=ffffffff\ncreateType=\"twoGbMaxExtentFlat\"\n\n# Extent description\nRW 2048 FLAT \"$EXTENT1\" 0\n\n# The Disk Data Base\n#DDB\n\nddb.virtualHWVersion = \"4\"\nddb.geometry.cylinders = \"2\"\nddb.geometry.heads = \"16\"\nddb.geometry.sectors = \"63\"\nddb.adapterType = \"ide\"\n",
+          "extent_names": ["$STEM-f001.vmdk"],
+          "extent_lengths": [1048576],
+          "existing_kept_lengths": null,
+          "structure": null
+        }
+      },
+      {
+        "versions": [
+          "6.2.0", "7.0.0", "7.1.0", "7.2.0", "7.2.1", "7.2.2", "7.2.3", "7.2.4", "7.2.5", "7.2.6", "7.2.7", "7.2.8",
+          "7.2.9", "7.2.10", "7.2.11", "7.2.12", "7.2.13", "7.2.14", "7.2.15", "7.2.16", "7.2.17", "7.2.18", "7.2.19",
+          "7.2.20", "7.2.21", "7.2.22", "8.0.0", "8.0.1", "8.0.2", "8.0.3", "8.0.4", "8.0.5", "8.1.0", "8.1.1", "8.1.2",
+          "8.1.3", "8.1.4", "8.1.5", "8.2.0", "8.2.1", "8.2.2", "8.2.3", "8.2.4", "8.2.5", "8.2.6", "8.2.7", "8.2.8",
+          "8.2.9", "8.2.10", "9.0.0", "9.0.1", "9.0.2", "9.0.3", "9.0.4", "9.1.0", "9.1.1", "9.1.2", "9.1.3", "9.2.0",
+          "9.2.1", "9.2.2", "9.2.3", "9.2.4", "10.0.0", "10.0.1", "10.0.2", "10.0.3", "10.0.4", "10.0.5", "10.0.6",
+          "10.0.7", "10.1.0", "10.1.1", "10.1.2", "10.1.3", "10.2.0"
+        ],
+        "result": {
+          "rc": 0,
+          "stderr": "",
+          "descriptor": "# Disk DescriptorFile\nversion=1\nCID=$CID\nparentCID=ffffffff\ncreateType=\"twoGbMaxExtentFlat\"\n\n# Extent description\nRW 2048 FLAT \"$EXTENT1\" 0\n\n# The Disk Data Base\n#DDB\n\nddb.virtualHWVersion = \"4\"\nddb.geometry.cylinders = \"2\"\nddb.geometry.heads = \"16\"\nddb.geometry.sectors = \"63\"\nddb.adapterType = \"ide\"\nddb.toolsVersion = \"2147483647\"\n",
+          "extent_names": ["$STEM-f001.vmdk"],
+          "extent_lengths": [1048576],
+          "existing_kept_lengths": null,
+          "structure": null
+        }
+      }
+    ],
+    "vmdk-multi-sparse-2G": [
+      {
+        "versions": ["6.0.0", "6.0.1", "6.1.0", "6.1.1"],
+        "result": {
+          "rc": 0,
+          "stderr": "",
+          "descriptor": "# Disk DescriptorFile\nversion=1\nCID=$CID\nparentCID=ffffffff\ncreateType=\"twoGbMaxExtentSparse\"\n\n# Extent description\nRW 4194304 SPARSE \"$EXTENT1\"\n\n# The Disk Data Base\n#DDB\n\nddb.virtualHWVersion = \"4\"\nddb.geometry.cylinders = \"4161\"\nddb.geometry.heads = \"16\"\nddb.geometry.sectors = \"63\"\nddb.adapterType = \"ide\"\n",
+          "extent_names": ["$STEM-s001.vmdk"],
+          "extent_lengths": [327680],
+          "existing_kept_lengths": null,
+          "structure": {
+            "descriptor_embedded": false,
+            "version": "1",
+            "has_cid": true,
+            "parent_cid": "ffffffff",
+            "create_type": "twoGbMaxExtentSparse",
+            "extent_count": 1,
+            "total_sectors": 4194304,
+            "extents": [
+              {
+                "access": "RW",
+                "sectors": 4194304,
+                "kind": "SPARSE",
+                "filename": "$STEM-s001.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 327680,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 4194304,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 278,
+                  "overhead_sectors": 640
+                }
+              }
+            ]
+          }
+        }
+      },
+      {
+        "versions": [
+          "6.2.0", "7.0.0", "7.1.0", "7.2.0", "7.2.1", "7.2.2", "7.2.3", "7.2.4", "7.2.5", "7.2.6", "7.2.7", "7.2.8",
+          "7.2.9", "7.2.10", "7.2.11", "7.2.12", "7.2.13", "7.2.14", "7.2.15", "7.2.16", "7.2.17", "7.2.18", "7.2.19",
+          "7.2.20", "7.2.21", "7.2.22", "8.0.0", "8.0.1", "8.0.2", "8.0.3", "8.0.4", "8.0.5", "8.1.0", "8.1.1", "8.1.2",
+          "8.1.3", "8.1.4", "8.1.5", "8.2.0", "8.2.1", "8.2.2", "8.2.3", "8.2.4", "8.2.5", "8.2.6", "8.2.7", "8.2.8",
+          "8.2.9", "8.2.10", "9.0.0", "9.0.1", "9.0.2", "9.0.3", "9.0.4", "9.1.0", "9.1.1", "9.1.2", "9.1.3", "9.2.0",
+          "9.2.1", "9.2.2", "9.2.3", "9.2.4", "10.0.0", "10.0.1", "10.0.2", "10.0.3", "10.0.4", "10.0.5", "10.0.6",
+          "10.0.7", "10.1.0", "10.1.1", "10.1.2", "10.1.3", "10.2.0"
+        ],
+        "result": {
+          "rc": 0,
+          "stderr": "",
+          "descriptor": "# Disk DescriptorFile\nversion=1\nCID=$CID\nparentCID=ffffffff\ncreateType=\"twoGbMaxExtentSparse\"\n\n# Extent description\nRW 4194304 SPARSE \"$EXTENT1\"\n\n# The Disk Data Base\n#DDB\n\nddb.virtualHWVersion = \"4\"\nddb.geometry.cylinders = \"4161\"\nddb.geometry.heads = \"16\"\nddb.geometry.sectors = \"63\"\nddb.adapterType = \"ide\"\nddb.toolsVersion = \"2147483647\"\n",
+          "extent_names": ["$STEM-s001.vmdk"],
+          "extent_lengths": [327680],
+          "existing_kept_lengths": null,
+          "structure": {
+            "descriptor_embedded": false,
+            "version": "1",
+            "has_cid": true,
+            "parent_cid": "ffffffff",
+            "create_type": "twoGbMaxExtentSparse",
+            "extent_count": 1,
+            "total_sectors": 4194304,
+            "extents": [
+              {
+                "access": "RW",
+                "sectors": 4194304,
+                "kind": "SPARSE",
+                "filename": "$STEM-s001.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 327680,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 4194304,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 278,
+                  "overhead_sectors": 640
+                }
+              }
+            ]
+          }
+        }
+      }
+    ],
+    "vmdk-multi-flat-2G": [
+      {
+        "versions": ["6.0.0", "6.0.1", "6.1.0", "6.1.1"],
+        "result": {
+          "rc": 0,
+          "stderr": "",
+          "descriptor": "# Disk DescriptorFile\nversion=1\nCID=$CID\nparentCID=ffffffff\ncreateType=\"twoGbMaxExtentFlat\"\n\n# Extent description\nRW 4194304 FLAT \"$EXTENT1\" 0\n\n# The Disk Data Base\n#DDB\n\nddb.virtualHWVersion = \"4\"\nddb.geometry.cylinders = \"4161\"\nddb.geometry.heads = \"16\"\nddb.geometry.sectors = \"63\"\nddb.adapterType = \"ide\"\n",
+          "extent_names": ["$STEM-f001.vmdk"],
+          "extent_lengths": [2147483648],
+          "existing_kept_lengths": null,
+          "structure": null
+        }
+      },
+      {
+        "versions": [
+          "6.2.0", "7.0.0", "7.1.0", "7.2.0", "7.2.1", "7.2.2", "7.2.3", "7.2.4", "7.2.5", "7.2.6", "7.2.7", "7.2.8",
+          "7.2.9", "7.2.10", "7.2.11", "7.2.12", "7.2.13", "7.2.14", "7.2.15", "7.2.16", "7.2.17", "7.2.18", "7.2.19",
+          "7.2.20", "7.2.21", "7.2.22", "8.0.0", "8.0.1", "8.0.2", "8.0.3", "8.0.4", "8.0.5", "8.1.0", "8.1.1", "8.1.2",
+          "8.1.3", "8.1.4", "8.1.5", "8.2.0", "8.2.1", "8.2.2", "8.2.3", "8.2.4", "8.2.5", "8.2.6", "8.2.7", "8.2.8",
+          "8.2.9", "8.2.10", "9.0.0", "9.0.1", "9.0.2", "9.0.3", "9.0.4", "9.1.0", "9.1.1", "9.1.2", "9.1.3", "9.2.0",
+          "9.2.1", "9.2.2", "9.2.3", "9.2.4", "10.0.0", "10.0.1", "10.0.2", "10.0.3", "10.0.4", "10.0.5", "10.0.6",
+          "10.0.7", "10.1.0", "10.1.1", "10.1.2", "10.1.3", "10.2.0"
+        ],
+        "result": {
+          "rc": 0,
+          "stderr": "",
+          "descriptor": "# Disk DescriptorFile\nversion=1\nCID=$CID\nparentCID=ffffffff\ncreateType=\"twoGbMaxExtentFlat\"\n\n# Extent description\nRW 4194304 FLAT \"$EXTENT1\" 0\n\n# The Disk Data Base\n#DDB\n\nddb.virtualHWVersion = \"4\"\nddb.geometry.cylinders = \"4161\"\nddb.geometry.heads = \"16\"\nddb.geometry.sectors = \"63\"\nddb.adapterType = \"ide\"\nddb.toolsVersion = \"2147483647\"\n",
+          "extent_names": ["$STEM-f001.vmdk"],
+          "extent_lengths": [2147483648],
+          "existing_kept_lengths": null,
+          "structure": null
+        }
+      }
+    ],
+    "vmdk-multi-sparse-2049M": [
+      {
+        "versions": ["6.0.0", "6.0.1", "6.1.0", "6.1.1"],
+        "result": {
+          "rc": 0,
+          "stderr": "",
+          "descriptor": "# Disk DescriptorFile\nversion=1\nCID=$CID\nparentCID=ffffffff\ncreateType=\"twoGbMaxExtentSparse\"\n\n# Extent description\nRW 4194304 SPARSE \"$EXTENT1\"\nRW 2048 SPARSE \"$EXTENT2\"\n\n# The Disk Data Base\n#DDB\n\nddb.virtualHWVersion = \"4\"\nddb.geometry.cylinders = \"4163\"\nddb.geometry.heads = \"16\"\nddb.geometry.sectors = \"63\"\nddb.adapterType = \"ide\"\n",
+          "extent_names": ["$STEM-s001.vmdk", "$STEM-s002.vmdk"],
+          "extent_lengths": [327680, 65536],
+          "existing_kept_lengths": null,
+          "structure": {
+            "descriptor_embedded": false,
+            "version": "1",
+            "has_cid": true,
+            "parent_cid": "ffffffff",
+            "create_type": "twoGbMaxExtentSparse",
+            "extent_count": 2,
+            "total_sectors": 4196352,
+            "extents": [
+              {
+                "access": "RW",
+                "sectors": 4194304,
+                "kind": "SPARSE",
+                "filename": "$STEM-s001.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 327680,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 4194304,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 278,
+                  "overhead_sectors": 640
+                }
+              },
+              {
+                "access": "RW",
+                "sectors": 2048,
+                "kind": "SPARSE",
+                "filename": "$STEM-s002.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 65536,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 2048,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 26,
+                  "overhead_sectors": 128
+                }
+              }
+            ]
+          }
+        }
+      },
+      {
+        "versions": [
+          "6.2.0", "7.0.0", "7.1.0", "7.2.0", "7.2.1", "7.2.2", "7.2.3", "7.2.4", "7.2.5", "7.2.6", "7.2.7", "7.2.8",
+          "7.2.9", "7.2.10", "7.2.11", "7.2.12", "7.2.13", "7.2.14", "7.2.15", "7.2.16", "7.2.17", "7.2.18", "7.2.19",
+          "7.2.20", "7.2.21", "7.2.22", "8.0.0", "8.0.1", "8.0.2", "8.0.3", "8.0.4", "8.0.5", "8.1.0", "8.1.1", "8.1.2",
+          "8.1.3", "8.1.4", "8.1.5", "8.2.0", "8.2.1", "8.2.2", "8.2.3", "8.2.4", "8.2.5", "8.2.6", "8.2.7", "8.2.8",
+          "8.2.9", "8.2.10", "9.0.0", "9.0.1", "9.0.2", "9.0.3", "9.0.4", "9.1.0", "9.1.1", "9.1.2", "9.1.3", "9.2.0",
+          "9.2.1", "9.2.2", "9.2.3", "9.2.4", "10.0.0", "10.0.1", "10.0.2", "10.0.3", "10.0.4", "10.0.5", "10.0.6",
+          "10.0.7", "10.1.0", "10.1.1", "10.1.2", "10.1.3", "10.2.0"
+        ],
+        "result": {
+          "rc": 0,
+          "stderr": "",
+          "descriptor": "# Disk DescriptorFile\nversion=1\nCID=$CID\nparentCID=ffffffff\ncreateType=\"twoGbMaxExtentSparse\"\n\n# Extent description\nRW 4194304 SPARSE \"$EXTENT1\"\nRW 2048 SPARSE \"$EXTENT2\"\n\n# The Disk Data Base\n#DDB\n\nddb.virtualHWVersion = \"4\"\nddb.geometry.cylinders = \"4163\"\nddb.geometry.heads = \"16\"\nddb.geometry.sectors = \"63\"\nddb.adapterType = \"ide\"\nddb.toolsVersion = \"2147483647\"\n",
+          "extent_names": ["$STEM-s001.vmdk", "$STEM-s002.vmdk"],
+          "extent_lengths": [327680, 65536],
+          "existing_kept_lengths": null,
+          "structure": {
+            "descriptor_embedded": false,
+            "version": "1",
+            "has_cid": true,
+            "parent_cid": "ffffffff",
+            "create_type": "twoGbMaxExtentSparse",
+            "extent_count": 2,
+            "total_sectors": 4196352,
+            "extents": [
+              {
+                "access": "RW",
+                "sectors": 4194304,
+                "kind": "SPARSE",
+                "filename": "$STEM-s001.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 327680,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 4194304,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 278,
+                  "overhead_sectors": 640
+                }
+              },
+              {
+                "access": "RW",
+                "sectors": 2048,
+                "kind": "SPARSE",
+                "filename": "$STEM-s002.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 65536,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 2048,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 26,
+                  "overhead_sectors": 128
+                }
+              }
+            ]
+          }
+        }
+      }
+    ],
+    "vmdk-multi-flat-2049M": [
+      {
+        "versions": ["6.0.0", "6.0.1", "6.1.0", "6.1.1"],
+        "result": {
+          "rc": 0,
+          "stderr": "",
+          "descriptor": "# Disk DescriptorFile\nversion=1\nCID=$CID\nparentCID=ffffffff\ncreateType=\"twoGbMaxExtentFlat\"\n\n# Extent description\nRW 4194304 FLAT \"$EXTENT1\" 0\nRW 2048 FLAT \"$EXTENT2\" 0\n\n# The Disk Data Base\n#DDB\n\nddb.virtualHWVersion = \"4\"\nddb.geometry.cylinders = \"4163\"\nddb.geometry.heads = \"16\"\nddb.geometry.sectors = \"63\"\nddb.adapterType = \"ide\"\n",
+          "extent_names": ["$STEM-f001.vmdk", "$STEM-f002.vmdk"],
+          "extent_lengths": [2147483648, 1048576],
+          "existing_kept_lengths": null,
+          "structure": null
+        }
+      },
+      {
+        "versions": [
+          "6.2.0", "7.0.0", "7.1.0", "7.2.0", "7.2.1", "7.2.2", "7.2.3", "7.2.4", "7.2.5", "7.2.6", "7.2.7", "7.2.8",
+          "7.2.9", "7.2.10", "7.2.11", "7.2.12", "7.2.13", "7.2.14", "7.2.15", "7.2.16", "7.2.17", "7.2.18", "7.2.19",
+          "7.2.20", "7.2.21", "7.2.22", "8.0.0", "8.0.1", "8.0.2", "8.0.3", "8.0.4", "8.0.5", "8.1.0", "8.1.1", "8.1.2",
+          "8.1.3", "8.1.4", "8.1.5", "8.2.0", "8.2.1", "8.2.2", "8.2.3", "8.2.4", "8.2.5", "8.2.6", "8.2.7", "8.2.8",
+          "8.2.9", "8.2.10", "9.0.0", "9.0.1", "9.0.2", "9.0.3", "9.0.4", "9.1.0", "9.1.1", "9.1.2", "9.1.3", "9.2.0",
+          "9.2.1", "9.2.2", "9.2.3", "9.2.4", "10.0.0", "10.0.1", "10.0.2", "10.0.3", "10.0.4", "10.0.5", "10.0.6",
+          "10.0.7", "10.1.0", "10.1.1", "10.1.2", "10.1.3", "10.2.0"
+        ],
+        "result": {
+          "rc": 0,
+          "stderr": "",
+          "descriptor": "# Disk DescriptorFile\nversion=1\nCID=$CID\nparentCID=ffffffff\ncreateType=\"twoGbMaxExtentFlat\"\n\n# Extent description\nRW 4194304 FLAT \"$EXTENT1\" 0\nRW 2048 FLAT \"$EXTENT2\" 0\n\n# The Disk Data Base\n#DDB\n\nddb.virtualHWVersion = \"4\"\nddb.geometry.cylinders = \"4163\"\nddb.geometry.heads = \"16\"\nddb.geometry.sectors = \"63\"\nddb.adapterType = \"ide\"\nddb.toolsVersion = \"2147483647\"\n",
+          "extent_names": ["$STEM-f001.vmdk", "$STEM-f002.vmdk"],
+          "extent_lengths": [2147483648, 1048576],
+          "existing_kept_lengths": null,
+          "structure": null
+        }
+      }
+    ],
+    "vmdk-multi-sparse-4G": [
+      {
+        "versions": ["6.0.0", "6.0.1", "6.1.0", "6.1.1"],
+        "result": {
+          "rc": 0,
+          "stderr": "",
+          "descriptor": "# Disk DescriptorFile\nversion=1\nCID=$CID\nparentCID=ffffffff\ncreateType=\"twoGbMaxExtentSparse\"\n\n# Extent description\nRW 4194304 SPARSE \"$EXTENT1\"\nRW 4194304 SPARSE \"$EXTENT2\"\n\n# The Disk Data Base\n#DDB\n\nddb.virtualHWVersion = \"4\"\nddb.geometry.cylinders = \"8322\"\nddb.geometry.heads = \"16\"\nddb.geometry.sectors = \"63\"\nddb.adapterType = \"ide\"\n",
+          "extent_names": ["$STEM-s001.vmdk", "$STEM-s002.vmdk"],
+          "extent_lengths": [327680, 327680],
+          "existing_kept_lengths": null,
+          "structure": {
+            "descriptor_embedded": false,
+            "version": "1",
+            "has_cid": true,
+            "parent_cid": "ffffffff",
+            "create_type": "twoGbMaxExtentSparse",
+            "extent_count": 2,
+            "total_sectors": 8388608,
+            "extents": [
+              {
+                "access": "RW",
+                "sectors": 4194304,
+                "kind": "SPARSE",
+                "filename": "$STEM-s001.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 327680,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 4194304,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 278,
+                  "overhead_sectors": 640
+                }
+              },
+              {
+                "access": "RW",
+                "sectors": 4194304,
+                "kind": "SPARSE",
+                "filename": "$STEM-s002.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 327680,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 4194304,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 278,
+                  "overhead_sectors": 640
+                }
+              }
+            ]
+          }
+        }
+      },
+      {
+        "versions": [
+          "6.2.0", "7.0.0", "7.1.0", "7.2.0", "7.2.1", "7.2.2", "7.2.3", "7.2.4", "7.2.5", "7.2.6", "7.2.7", "7.2.8",
+          "7.2.9", "7.2.10", "7.2.11", "7.2.12", "7.2.13", "7.2.14", "7.2.15", "7.2.16", "7.2.17", "7.2.18", "7.2.19",
+          "7.2.20", "7.2.21", "7.2.22", "8.0.0", "8.0.1", "8.0.2", "8.0.3", "8.0.4", "8.0.5", "8.1.0", "8.1.1", "8.1.2",
+          "8.1.3", "8.1.4", "8.1.5", "8.2.0", "8.2.1", "8.2.2", "8.2.3", "8.2.4", "8.2.5", "8.2.6", "8.2.7", "8.2.8",
+          "8.2.9", "8.2.10", "9.0.0", "9.0.1", "9.0.2", "9.0.3", "9.0.4", "9.1.0", "9.1.1", "9.1.2", "9.1.3", "9.2.0",
+          "9.2.1", "9.2.2", "9.2.3", "9.2.4", "10.0.0", "10.0.1", "10.0.2", "10.0.3", "10.0.4", "10.0.5", "10.0.6",
+          "10.0.7", "10.1.0", "10.1.1", "10.1.2", "10.1.3", "10.2.0"
+        ],
+        "result": {
+          "rc": 0,
+          "stderr": "",
+          "descriptor": "# Disk DescriptorFile\nversion=1\nCID=$CID\nparentCID=ffffffff\ncreateType=\"twoGbMaxExtentSparse\"\n\n# Extent description\nRW 4194304 SPARSE \"$EXTENT1\"\nRW 4194304 SPARSE \"$EXTENT2\"\n\n# The Disk Data Base\n#DDB\n\nddb.virtualHWVersion = \"4\"\nddb.geometry.cylinders = \"8322\"\nddb.geometry.heads = \"16\"\nddb.geometry.sectors = \"63\"\nddb.adapterType = \"ide\"\nddb.toolsVersion = \"2147483647\"\n",
+          "extent_names": ["$STEM-s001.vmdk", "$STEM-s002.vmdk"],
+          "extent_lengths": [327680, 327680],
+          "existing_kept_lengths": null,
+          "structure": {
+            "descriptor_embedded": false,
+            "version": "1",
+            "has_cid": true,
+            "parent_cid": "ffffffff",
+            "create_type": "twoGbMaxExtentSparse",
+            "extent_count": 2,
+            "total_sectors": 8388608,
+            "extents": [
+              {
+                "access": "RW",
+                "sectors": 4194304,
+                "kind": "SPARSE",
+                "filename": "$STEM-s001.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 327680,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 4194304,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 278,
+                  "overhead_sectors": 640
+                }
+              },
+              {
+                "access": "RW",
+                "sectors": 4194304,
+                "kind": "SPARSE",
+                "filename": "$STEM-s002.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 327680,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 4194304,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 278,
+                  "overhead_sectors": 640
+                }
+              }
+            ]
+          }
+        }
+      }
+    ],
+    "vmdk-multi-flat-4G": [
+      {
+        "versions": ["6.0.0", "6.0.1", "6.1.0", "6.1.1"],
+        "result": {
+          "rc": 0,
+          "stderr": "",
+          "descriptor": "# Disk DescriptorFile\nversion=1\nCID=$CID\nparentCID=ffffffff\ncreateType=\"twoGbMaxExtentFlat\"\n\n# Extent description\nRW 4194304 FLAT \"$EXTENT1\" 0\nRW 4194304 FLAT \"$EXTENT2\" 0\n\n# The Disk Data Base\n#DDB\n\nddb.virtualHWVersion = \"4\"\nddb.geometry.cylinders = \"8322\"\nddb.geometry.heads = \"16\"\nddb.geometry.sectors = \"63\"\nddb.adapterType = \"ide\"\n",
+          "extent_names": ["$STEM-f001.vmdk", "$STEM-f002.vmdk"],
+          "extent_lengths": [2147483648, 2147483648],
+          "existing_kept_lengths": null,
+          "structure": null
+        }
+      },
+      {
+        "versions": [
+          "6.2.0", "7.0.0", "7.1.0", "7.2.0", "7.2.1", "7.2.2", "7.2.3", "7.2.4", "7.2.5", "7.2.6", "7.2.7", "7.2.8",
+          "7.2.9", "7.2.10", "7.2.11", "7.2.12", "7.2.13", "7.2.14", "7.2.15", "7.2.16", "7.2.17", "7.2.18", "7.2.19",
+          "7.2.20", "7.2.21", "7.2.22", "8.0.0", "8.0.1", "8.0.2", "8.0.3", "8.0.4", "8.0.5", "8.1.0", "8.1.1", "8.1.2",
+          "8.1.3", "8.1.4", "8.1.5", "8.2.0", "8.2.1", "8.2.2", "8.2.3", "8.2.4", "8.2.5", "8.2.6", "8.2.7", "8.2.8",
+          "8.2.9", "8.2.10", "9.0.0", "9.0.1", "9.0.2", "9.0.3", "9.0.4", "9.1.0", "9.1.1", "9.1.2", "9.1.3", "9.2.0",
+          "9.2.1", "9.2.2", "9.2.3", "9.2.4", "10.0.0", "10.0.1", "10.0.2", "10.0.3", "10.0.4", "10.0.5", "10.0.6",
+          "10.0.7", "10.1.0", "10.1.1", "10.1.2", "10.1.3", "10.2.0"
+        ],
+        "result": {
+          "rc": 0,
+          "stderr": "",
+          "descriptor": "# Disk DescriptorFile\nversion=1\nCID=$CID\nparentCID=ffffffff\ncreateType=\"twoGbMaxExtentFlat\"\n\n# Extent description\nRW 4194304 FLAT \"$EXTENT1\" 0\nRW 4194304 FLAT \"$EXTENT2\" 0\n\n# The Disk Data Base\n#DDB\n\nddb.virtualHWVersion = \"4\"\nddb.geometry.cylinders = \"8322\"\nddb.geometry.heads = \"16\"\nddb.geometry.sectors = \"63\"\nddb.adapterType = \"ide\"\nddb.toolsVersion = \"2147483647\"\n",
+          "extent_names": ["$STEM-f001.vmdk", "$STEM-f002.vmdk"],
+          "extent_lengths": [2147483648, 2147483648],
+          "existing_kept_lengths": null,
+          "structure": null
+        }
+      }
+    ],
+    "vmdk-multi-sparse-5G": [
+      {
+        "versions": ["6.0.0", "6.0.1", "6.1.0", "6.1.1"],
+        "result": {
+          "rc": 0,
+          "stderr": "",
+          "descriptor": "# Disk DescriptorFile\nversion=1\nCID=$CID\nparentCID=ffffffff\ncreateType=\"twoGbMaxExtentSparse\"\n\n# Extent description\nRW 4194304 SPARSE \"$EXTENT1\"\nRW 4194304 SPARSE \"$EXTENT2\"\nRW 2097152 SPARSE \"$EXTENT3\"\n\n# The Disk Data Base\n#DDB\n\nddb.virtualHWVersion = \"4\"\nddb.geometry.cylinders = \"10402\"\nddb.geometry.heads = \"16\"\nddb.geometry.sectors = \"63\"\nddb.adapterType = \"ide\"\n",
+          "extent_names": ["$STEM-s001.vmdk", "$STEM-s002.vmdk", "$STEM-s003.vmdk"],
+          "extent_lengths": [327680, 327680, 196608],
+          "existing_kept_lengths": null,
+          "structure": {
+            "descriptor_embedded": false,
+            "version": "1",
+            "has_cid": true,
+            "parent_cid": "ffffffff",
+            "create_type": "twoGbMaxExtentSparse",
+            "extent_count": 3,
+            "total_sectors": 10485760,
+            "extents": [
+              {
+                "access": "RW",
+                "sectors": 4194304,
+                "kind": "SPARSE",
+                "filename": "$STEM-s001.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 327680,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 4194304,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 278,
+                  "overhead_sectors": 640
+                }
+              },
+              {
+                "access": "RW",
+                "sectors": 4194304,
+                "kind": "SPARSE",
+                "filename": "$STEM-s002.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 327680,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 4194304,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 278,
+                  "overhead_sectors": 640
+                }
+              },
+              {
+                "access": "RW",
+                "sectors": 2097152,
+                "kind": "SPARSE",
+                "filename": "$STEM-s003.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 196608,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 2097152,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 150,
+                  "overhead_sectors": 384
+                }
+              }
+            ]
+          }
+        }
+      },
+      {
+        "versions": [
+          "6.2.0", "7.0.0", "7.1.0", "7.2.0", "7.2.1", "7.2.2", "7.2.3", "7.2.4", "7.2.5", "7.2.6", "7.2.7", "7.2.8",
+          "7.2.9", "7.2.10", "7.2.11", "7.2.12", "7.2.13", "7.2.14", "7.2.15", "7.2.16", "7.2.17", "7.2.18", "7.2.19",
+          "7.2.20", "7.2.21", "7.2.22", "8.0.0", "8.0.1", "8.0.2", "8.0.3", "8.0.4", "8.0.5", "8.1.0", "8.1.1", "8.1.2",
+          "8.1.3", "8.1.4", "8.1.5", "8.2.0", "8.2.1", "8.2.2", "8.2.3", "8.2.4", "8.2.5", "8.2.6", "8.2.7", "8.2.8",
+          "8.2.9", "8.2.10", "9.0.0", "9.0.1", "9.0.2", "9.0.3", "9.0.4", "9.1.0", "9.1.1", "9.1.2", "9.1.3", "9.2.0",
+          "9.2.1", "9.2.2", "9.2.3", "9.2.4", "10.0.0", "10.0.1", "10.0.2", "10.0.3", "10.0.4", "10.0.5", "10.0.6",
+          "10.0.7", "10.1.0", "10.1.1", "10.1.2", "10.1.3", "10.2.0"
+        ],
+        "result": {
+          "rc": 0,
+          "stderr": "",
+          "descriptor": "# Disk DescriptorFile\nversion=1\nCID=$CID\nparentCID=ffffffff\ncreateType=\"twoGbMaxExtentSparse\"\n\n# Extent description\nRW 4194304 SPARSE \"$EXTENT1\"\nRW 4194304 SPARSE \"$EXTENT2\"\nRW 2097152 SPARSE \"$EXTENT3\"\n\n# The Disk Data Base\n#DDB\n\nddb.virtualHWVersion = \"4\"\nddb.geometry.cylinders = \"10402\"\nddb.geometry.heads = \"16\"\nddb.geometry.sectors = \"63\"\nddb.adapterType = \"ide\"\nddb.toolsVersion = \"2147483647\"\n",
+          "extent_names": ["$STEM-s001.vmdk", "$STEM-s002.vmdk", "$STEM-s003.vmdk"],
+          "extent_lengths": [327680, 327680, 196608],
+          "existing_kept_lengths": null,
+          "structure": {
+            "descriptor_embedded": false,
+            "version": "1",
+            "has_cid": true,
+            "parent_cid": "ffffffff",
+            "create_type": "twoGbMaxExtentSparse",
+            "extent_count": 3,
+            "total_sectors": 10485760,
+            "extents": [
+              {
+                "access": "RW",
+                "sectors": 4194304,
+                "kind": "SPARSE",
+                "filename": "$STEM-s001.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 327680,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 4194304,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 278,
+                  "overhead_sectors": 640
+                }
+              },
+              {
+                "access": "RW",
+                "sectors": 4194304,
+                "kind": "SPARSE",
+                "filename": "$STEM-s002.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 327680,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 4194304,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 278,
+                  "overhead_sectors": 640
+                }
+              },
+              {
+                "access": "RW",
+                "sectors": 2097152,
+                "kind": "SPARSE",
+                "filename": "$STEM-s003.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 196608,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 2097152,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 150,
+                  "overhead_sectors": 384
+                }
+              }
+            ]
+          }
+        }
+      }
+    ],
+    "vmdk-multi-flat-5G": [
+      {
+        "versions": ["6.0.0", "6.0.1", "6.1.0", "6.1.1"],
+        "result": {
+          "rc": 0,
+          "stderr": "",
+          "descriptor": "# Disk DescriptorFile\nversion=1\nCID=$CID\nparentCID=ffffffff\ncreateType=\"twoGbMaxExtentFlat\"\n\n# Extent description\nRW 4194304 FLAT \"$EXTENT1\" 0\nRW 4194304 FLAT \"$EXTENT2\" 0\nRW 2097152 FLAT \"$EXTENT3\" 0\n\n# The Disk Data Base\n#DDB\n\nddb.virtualHWVersion = \"4\"\nddb.geometry.cylinders = \"10402\"\nddb.geometry.heads = \"16\"\nddb.geometry.sectors = \"63\"\nddb.adapterType = \"ide\"\n",
+          "extent_names": ["$STEM-f001.vmdk", "$STEM-f002.vmdk", "$STEM-f003.vmdk"],
+          "extent_lengths": [2147483648, 2147483648, 1073741824],
+          "existing_kept_lengths": null,
+          "structure": null
+        }
+      },
+      {
+        "versions": [
+          "6.2.0", "7.0.0", "7.1.0", "7.2.0", "7.2.1", "7.2.2", "7.2.3", "7.2.4", "7.2.5", "7.2.6", "7.2.7", "7.2.8",
+          "7.2.9", "7.2.10", "7.2.11", "7.2.12", "7.2.13", "7.2.14", "7.2.15", "7.2.16", "7.2.17", "7.2.18", "7.2.19",
+          "7.2.20", "7.2.21", "7.2.22", "8.0.0", "8.0.1", "8.0.2", "8.0.3", "8.0.4", "8.0.5", "8.1.0", "8.1.1", "8.1.2",
+          "8.1.3", "8.1.4", "8.1.5", "8.2.0", "8.2.1", "8.2.2", "8.2.3", "8.2.4", "8.2.5", "8.2.6", "8.2.7", "8.2.8",
+          "8.2.9", "8.2.10", "9.0.0", "9.0.1", "9.0.2", "9.0.3", "9.0.4", "9.1.0", "9.1.1", "9.1.2", "9.1.3", "9.2.0",
+          "9.2.1", "9.2.2", "9.2.3", "9.2.4", "10.0.0", "10.0.1", "10.0.2", "10.0.3", "10.0.4", "10.0.5", "10.0.6",
+          "10.0.7", "10.1.0", "10.1.1", "10.1.2", "10.1.3", "10.2.0"
+        ],
+        "result": {
+          "rc": 0,
+          "stderr": "",
+          "descriptor": "# Disk DescriptorFile\nversion=1\nCID=$CID\nparentCID=ffffffff\ncreateType=\"twoGbMaxExtentFlat\"\n\n# Extent description\nRW 4194304 FLAT \"$EXTENT1\" 0\nRW 4194304 FLAT \"$EXTENT2\" 0\nRW 2097152 FLAT \"$EXTENT3\" 0\n\n# The Disk Data Base\n#DDB\n\nddb.virtualHWVersion = \"4\"\nddb.geometry.cylinders = \"10402\"\nddb.geometry.heads = \"16\"\nddb.geometry.sectors = \"63\"\nddb.adapterType = \"ide\"\nddb.toolsVersion = \"2147483647\"\n",
+          "extent_names": ["$STEM-f001.vmdk", "$STEM-f002.vmdk", "$STEM-f003.vmdk"],
+          "extent_lengths": [2147483648, 2147483648, 1073741824],
+          "existing_kept_lengths": null,
+          "structure": null
+        }
+      }
+    ],
+    "vmdk-multi-sparse-21G": [
+      {
+        "versions": ["6.0.0", "6.0.1", "6.1.0", "6.1.1"],
+        "result": {
+          "rc": 0,
+          "stderr": "",
+          "descriptor": "# Disk DescriptorFile\nversion=1\nCID=$CID\nparentCID=ffffffff\ncreateType=\"twoGbMaxExtentSparse\"\n\n# Extent description\nRW 4194304 SPARSE \"$EXTENT1\"\nRW 4194304 SPARSE \"$EXTENT2\"\nRW 4194304 SPARSE \"$EXTENT3\"\nRW 4194304 SPARSE \"$EXTENT4\"\nRW 4194304 SPARSE \"$EXTENT5\"\nRW 4194304 SPARSE \"$EXTENT6\"\nRW 4194304 SPARSE \"$EXTENT7\"\nRW 4194304 SPARSE \"$EXTENT8\"\nRW 4194304 SPARSE \"$EXTENT9\"\nRW 4194304 SPARSE \"$EXTENT10\"\nRW 2097152 SPARSE \"$EXTENT11\"\n\n# The Disk Data Base\n#DDB\n\nddb.virtualHWVersion = \"4\"\nddb.geometry.cylinders = \"43690\"\nddb.geometry.heads = \"16\"\nddb.geometry.sectors = \"63\"\nddb.adapterType = \"ide\"\n",
+          "extent_names": [
+            "$STEM-s001.vmdk", "$STEM-s002.vmdk", "$STEM-s003.vmdk", "$STEM-s004.vmdk", "$STEM-s005.vmdk",
+            "$STEM-s006.vmdk", "$STEM-s007.vmdk", "$STEM-s008.vmdk", "$STEM-s009.vmdk", "$STEM-s010.vmdk",
+            "$STEM-s011.vmdk"
+          ],
+          "extent_lengths": [327680, 327680, 327680, 327680, 327680, 327680, 327680, 327680, 327680, 327680, 196608],
+          "existing_kept_lengths": null,
+          "structure": {
+            "descriptor_embedded": false,
+            "version": "1",
+            "has_cid": true,
+            "parent_cid": "ffffffff",
+            "create_type": "twoGbMaxExtentSparse",
+            "extent_count": 11,
+            "total_sectors": 44040192,
+            "extents": [
+              {
+                "access": "RW",
+                "sectors": 4194304,
+                "kind": "SPARSE",
+                "filename": "$STEM-s001.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 327680,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 4194304,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 278,
+                  "overhead_sectors": 640
+                }
+              },
+              {
+                "access": "RW",
+                "sectors": 4194304,
+                "kind": "SPARSE",
+                "filename": "$STEM-s002.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 327680,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 4194304,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 278,
+                  "overhead_sectors": 640
+                }
+              },
+              {
+                "access": "RW",
+                "sectors": 4194304,
+                "kind": "SPARSE",
+                "filename": "$STEM-s003.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 327680,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 4194304,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 278,
+                  "overhead_sectors": 640
+                }
+              },
+              {
+                "access": "RW",
+                "sectors": 4194304,
+                "kind": "SPARSE",
+                "filename": "$STEM-s004.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 327680,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 4194304,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 278,
+                  "overhead_sectors": 640
+                }
+              },
+              {
+                "access": "RW",
+                "sectors": 4194304,
+                "kind": "SPARSE",
+                "filename": "$STEM-s005.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 327680,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 4194304,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 278,
+                  "overhead_sectors": 640
+                }
+              },
+              {
+                "access": "RW",
+                "sectors": 4194304,
+                "kind": "SPARSE",
+                "filename": "$STEM-s006.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 327680,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 4194304,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 278,
+                  "overhead_sectors": 640
+                }
+              },
+              {
+                "access": "RW",
+                "sectors": 4194304,
+                "kind": "SPARSE",
+                "filename": "$STEM-s007.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 327680,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 4194304,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 278,
+                  "overhead_sectors": 640
+                }
+              },
+              {
+                "access": "RW",
+                "sectors": 4194304,
+                "kind": "SPARSE",
+                "filename": "$STEM-s008.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 327680,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 4194304,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 278,
+                  "overhead_sectors": 640
+                }
+              },
+              {
+                "access": "RW",
+                "sectors": 4194304,
+                "kind": "SPARSE",
+                "filename": "$STEM-s009.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 327680,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 4194304,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 278,
+                  "overhead_sectors": 640
+                }
+              },
+              {
+                "access": "RW",
+                "sectors": 4194304,
+                "kind": "SPARSE",
+                "filename": "$STEM-s010.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 327680,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 4194304,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 278,
+                  "overhead_sectors": 640
+                }
+              },
+              {
+                "access": "RW",
+                "sectors": 2097152,
+                "kind": "SPARSE",
+                "filename": "$STEM-s011.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 196608,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 2097152,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 150,
+                  "overhead_sectors": 384
+                }
+              }
+            ]
+          }
+        }
+      },
+      {
+        "versions": [
+          "6.2.0", "7.0.0", "7.1.0", "7.2.0", "7.2.1", "7.2.2", "7.2.3", "7.2.4", "7.2.5", "7.2.6", "7.2.7", "7.2.8",
+          "7.2.9", "7.2.10", "7.2.11", "7.2.12", "7.2.13", "7.2.14", "7.2.15", "7.2.16", "7.2.17", "7.2.18", "7.2.19",
+          "7.2.20", "7.2.21", "7.2.22", "8.0.0", "8.0.1", "8.0.2", "8.0.3", "8.0.4", "8.0.5", "8.1.0", "8.1.1", "8.1.2",
+          "8.1.3", "8.1.4", "8.1.5", "8.2.0", "8.2.1", "8.2.2", "8.2.3", "8.2.4", "8.2.5", "8.2.6", "8.2.7", "8.2.8",
+          "8.2.9", "8.2.10", "9.0.0", "9.0.1", "9.0.2", "9.0.3", "9.0.4", "9.1.0", "9.1.1", "9.1.2", "9.1.3", "9.2.0",
+          "9.2.1", "9.2.2", "9.2.3", "9.2.4", "10.0.0", "10.0.1", "10.0.2", "10.0.3", "10.0.4", "10.0.5", "10.0.6",
+          "10.0.7", "10.1.0", "10.1.1", "10.1.2", "10.1.3", "10.2.0"
+        ],
+        "result": {
+          "rc": 0,
+          "stderr": "",
+          "descriptor": "# Disk DescriptorFile\nversion=1\nCID=$CID\nparentCID=ffffffff\ncreateType=\"twoGbMaxExtentSparse\"\n\n# Extent description\nRW 4194304 SPARSE \"$EXTENT1\"\nRW 4194304 SPARSE \"$EXTENT2\"\nRW 4194304 SPARSE \"$EXTENT3\"\nRW 4194304 SPARSE \"$EXTENT4\"\nRW 4194304 SPARSE \"$EXTENT5\"\nRW 4194304 SPARSE \"$EXTENT6\"\nRW 4194304 SPARSE \"$EXTENT7\"\nRW 4194304 SPARSE \"$EXTENT8\"\nRW 4194304 SPARSE \"$EXTENT9\"\nRW 4194304 SPARSE \"$EXTENT10\"\nRW 2097152 SPARSE \"$EXTENT11\"\n\n# The Disk Data Base\n#DDB\n\nddb.virtualHWVersion = \"4\"\nddb.geometry.cylinders = \"43690\"\nddb.geometry.heads = \"16\"\nddb.geometry.sectors = \"63\"\nddb.adapterType = \"ide\"\nddb.toolsVersion = \"2147483647\"\n",
+          "extent_names": [
+            "$STEM-s001.vmdk", "$STEM-s002.vmdk", "$STEM-s003.vmdk", "$STEM-s004.vmdk", "$STEM-s005.vmdk",
+            "$STEM-s006.vmdk", "$STEM-s007.vmdk", "$STEM-s008.vmdk", "$STEM-s009.vmdk", "$STEM-s010.vmdk",
+            "$STEM-s011.vmdk"
+          ],
+          "extent_lengths": [327680, 327680, 327680, 327680, 327680, 327680, 327680, 327680, 327680, 327680, 196608],
+          "existing_kept_lengths": null,
+          "structure": {
+            "descriptor_embedded": false,
+            "version": "1",
+            "has_cid": true,
+            "parent_cid": "ffffffff",
+            "create_type": "twoGbMaxExtentSparse",
+            "extent_count": 11,
+            "total_sectors": 44040192,
+            "extents": [
+              {
+                "access": "RW",
+                "sectors": 4194304,
+                "kind": "SPARSE",
+                "filename": "$STEM-s001.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 327680,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 4194304,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 278,
+                  "overhead_sectors": 640
+                }
+              },
+              {
+                "access": "RW",
+                "sectors": 4194304,
+                "kind": "SPARSE",
+                "filename": "$STEM-s002.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 327680,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 4194304,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 278,
+                  "overhead_sectors": 640
+                }
+              },
+              {
+                "access": "RW",
+                "sectors": 4194304,
+                "kind": "SPARSE",
+                "filename": "$STEM-s003.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 327680,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 4194304,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 278,
+                  "overhead_sectors": 640
+                }
+              },
+              {
+                "access": "RW",
+                "sectors": 4194304,
+                "kind": "SPARSE",
+                "filename": "$STEM-s004.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 327680,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 4194304,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 278,
+                  "overhead_sectors": 640
+                }
+              },
+              {
+                "access": "RW",
+                "sectors": 4194304,
+                "kind": "SPARSE",
+                "filename": "$STEM-s005.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 327680,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 4194304,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 278,
+                  "overhead_sectors": 640
+                }
+              },
+              {
+                "access": "RW",
+                "sectors": 4194304,
+                "kind": "SPARSE",
+                "filename": "$STEM-s006.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 327680,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 4194304,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 278,
+                  "overhead_sectors": 640
+                }
+              },
+              {
+                "access": "RW",
+                "sectors": 4194304,
+                "kind": "SPARSE",
+                "filename": "$STEM-s007.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 327680,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 4194304,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 278,
+                  "overhead_sectors": 640
+                }
+              },
+              {
+                "access": "RW",
+                "sectors": 4194304,
+                "kind": "SPARSE",
+                "filename": "$STEM-s008.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 327680,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 4194304,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 278,
+                  "overhead_sectors": 640
+                }
+              },
+              {
+                "access": "RW",
+                "sectors": 4194304,
+                "kind": "SPARSE",
+                "filename": "$STEM-s009.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 327680,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 4194304,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 278,
+                  "overhead_sectors": 640
+                }
+              },
+              {
+                "access": "RW",
+                "sectors": 4194304,
+                "kind": "SPARSE",
+                "filename": "$STEM-s010.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 327680,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 4194304,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 278,
+                  "overhead_sectors": 640
+                }
+              },
+              {
+                "access": "RW",
+                "sectors": 2097152,
+                "kind": "SPARSE",
+                "filename": "$STEM-s011.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 196608,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 2097152,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 150,
+                  "overhead_sectors": 384
+                }
+              }
+            ]
+          }
+        }
+      }
+    ],
+    "vmdk-multi-flat-21G": [
+      {
+        "versions": ["6.0.0", "6.0.1", "6.1.0", "6.1.1"],
+        "result": {
+          "rc": 0,
+          "stderr": "",
+          "descriptor": "# Disk DescriptorFile\nversion=1\nCID=$CID\nparentCID=ffffffff\ncreateType=\"twoGbMaxExtentFlat\"\n\n# Extent description\nRW 4194304 FLAT \"$EXTENT1\" 0\nRW 4194304 FLAT \"$EXTENT2\" 0\nRW 4194304 FLAT \"$EXTENT3\" 0\nRW 4194304 FLAT \"$EXTENT4\" 0\nRW 4194304 FLAT \"$EXTENT5\" 0\nRW 4194304 FLAT \"$EXTENT6\" 0\nRW 4194304 FLAT \"$EXTENT7\" 0\nRW 4194304 FLAT \"$EXTENT8\" 0\nRW 4194304 FLAT \"$EXTENT9\" 0\nRW 4194304 FLAT \"$EXTENT10\" 0\nRW 2097152 FLAT \"$EXTENT11\" 0\n\n# The Disk Data Base\n#DDB\n\nddb.virtualHWVersion = \"4\"\nddb.geometry.cylinders = \"43690\"\nddb.geometry.heads = \"16\"\nddb.geometry.sectors = \"63\"\nddb.adapterType = \"ide\"\n",
+          "extent_names": [
+            "$STEM-f001.vmdk", "$STEM-f002.vmdk", "$STEM-f003.vmdk", "$STEM-f004.vmdk", "$STEM-f005.vmdk",
+            "$STEM-f006.vmdk", "$STEM-f007.vmdk", "$STEM-f008.vmdk", "$STEM-f009.vmdk", "$STEM-f010.vmdk",
+            "$STEM-f011.vmdk"
+          ],
+          "extent_lengths": [
+            2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648,
+            2147483648, 1073741824
+          ],
+          "existing_kept_lengths": null,
+          "structure": null
+        }
+      },
+      {
+        "versions": [
+          "6.2.0", "7.0.0", "7.1.0", "7.2.0", "7.2.1", "7.2.2", "7.2.3", "7.2.4", "7.2.5", "7.2.6", "7.2.7", "7.2.8",
+          "7.2.9", "7.2.10", "7.2.11", "7.2.12", "7.2.13", "7.2.14", "7.2.15", "7.2.16", "7.2.17", "7.2.18", "7.2.19",
+          "7.2.20", "7.2.21", "7.2.22", "8.0.0", "8.0.1", "8.0.2", "8.0.3", "8.0.4", "8.0.5", "8.1.0", "8.1.1", "8.1.2",
+          "8.1.3", "8.1.4", "8.1.5", "8.2.0", "8.2.1", "8.2.2", "8.2.3", "8.2.4", "8.2.5", "8.2.6", "8.2.7", "8.2.8",
+          "8.2.9", "8.2.10", "9.0.0", "9.0.1", "9.0.2", "9.0.3", "9.0.4", "9.1.0", "9.1.1", "9.1.2", "9.1.3", "9.2.0",
+          "9.2.1", "9.2.2", "9.2.3", "9.2.4", "10.0.0", "10.0.1", "10.0.2", "10.0.3", "10.0.4", "10.0.5", "10.0.6",
+          "10.0.7", "10.1.0", "10.1.1", "10.1.2", "10.1.3", "10.2.0"
+        ],
+        "result": {
+          "rc": 0,
+          "stderr": "",
+          "descriptor": "# Disk DescriptorFile\nversion=1\nCID=$CID\nparentCID=ffffffff\ncreateType=\"twoGbMaxExtentFlat\"\n\n# Extent description\nRW 4194304 FLAT \"$EXTENT1\" 0\nRW 4194304 FLAT \"$EXTENT2\" 0\nRW 4194304 FLAT \"$EXTENT3\" 0\nRW 4194304 FLAT \"$EXTENT4\" 0\nRW 4194304 FLAT \"$EXTENT5\" 0\nRW 4194304 FLAT \"$EXTENT6\" 0\nRW 4194304 FLAT \"$EXTENT7\" 0\nRW 4194304 FLAT \"$EXTENT8\" 0\nRW 4194304 FLAT \"$EXTENT9\" 0\nRW 4194304 FLAT \"$EXTENT10\" 0\nRW 2097152 FLAT \"$EXTENT11\" 0\n\n# The Disk Data Base\n#DDB\n\nddb.virtualHWVersion = \"4\"\nddb.geometry.cylinders = \"43690\"\nddb.geometry.heads = \"16\"\nddb.geometry.sectors = \"63\"\nddb.adapterType = \"ide\"\nddb.toolsVersion = \"2147483647\"\n",
+          "extent_names": [
+            "$STEM-f001.vmdk", "$STEM-f002.vmdk", "$STEM-f003.vmdk", "$STEM-f004.vmdk", "$STEM-f005.vmdk",
+            "$STEM-f006.vmdk", "$STEM-f007.vmdk", "$STEM-f008.vmdk", "$STEM-f009.vmdk", "$STEM-f010.vmdk",
+            "$STEM-f011.vmdk"
+          ],
+          "extent_lengths": [
+            2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648, 2147483648,
+            2147483648, 1073741824
+          ],
+          "existing_kept_lengths": null,
+          "structure": null
+        }
+      }
+    ],
+    "vmdk-multi-sparse-5G-existing-extent": [
+      {
+        "versions": ["6.0.0", "6.0.1", "6.1.0", "6.1.1"],
+        "result": {
+          "rc": 0,
+          "stderr": "",
+          "descriptor": "# Disk DescriptorFile\nversion=1\nCID=$CID\nparentCID=ffffffff\ncreateType=\"twoGbMaxExtentSparse\"\n\n# Extent description\nRW 4194304 SPARSE \"$EXTENT1\"\nRW 4194304 SPARSE \"$EXTENT2\"\nRW 2097152 SPARSE \"$EXTENT3\"\n\n# The Disk Data Base\n#DDB\n\nddb.virtualHWVersion = \"4\"\nddb.geometry.cylinders = \"10402\"\nddb.geometry.heads = \"16\"\nddb.geometry.sectors = \"63\"\nddb.adapterType = \"ide\"\n",
+          "extent_names": ["$STEM-s001.vmdk", "$STEM-s002.vmdk", "$STEM-s003.vmdk"],
+          "extent_lengths": [327680, 327680, 196608],
+          "existing_kept_lengths": [327680],
+          "structure": {
+            "descriptor_embedded": false,
+            "version": "1",
+            "has_cid": true,
+            "parent_cid": "ffffffff",
+            "create_type": "twoGbMaxExtentSparse",
+            "extent_count": 3,
+            "total_sectors": 10485760,
+            "extents": [
+              {
+                "access": "RW",
+                "sectors": 4194304,
+                "kind": "SPARSE",
+                "filename": "$STEM-s001.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 327680,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 4194304,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 278,
+                  "overhead_sectors": 640
+                }
+              },
+              {
+                "access": "RW",
+                "sectors": 4194304,
+                "kind": "SPARSE",
+                "filename": "$STEM-s002.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 327680,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 4194304,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 278,
+                  "overhead_sectors": 640
+                }
+              },
+              {
+                "access": "RW",
+                "sectors": 2097152,
+                "kind": "SPARSE",
+                "filename": "$STEM-s003.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 196608,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 2097152,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 150,
+                  "overhead_sectors": 384
+                }
+              }
+            ]
+          }
+        }
+      },
+      {
+        "versions": [
+          "6.2.0", "7.0.0", "7.1.0", "7.2.0", "7.2.1", "7.2.2", "7.2.3", "7.2.4", "7.2.5", "7.2.6", "7.2.7", "7.2.8",
+          "7.2.9", "7.2.10", "7.2.11", "7.2.12", "7.2.13", "7.2.14", "7.2.15", "7.2.16", "7.2.17", "7.2.18", "7.2.19",
+          "7.2.20", "7.2.21", "7.2.22", "8.0.0", "8.0.1", "8.0.2", "8.0.3", "8.0.4", "8.0.5", "8.1.0", "8.1.1", "8.1.2",
+          "8.1.3", "8.1.4", "8.1.5", "8.2.0", "8.2.1", "8.2.2", "8.2.3", "8.2.4", "8.2.5", "8.2.6", "8.2.7", "8.2.8",
+          "8.2.9", "8.2.10", "9.0.0", "9.0.1", "9.0.2", "9.0.3", "9.0.4", "9.1.0", "9.1.1", "9.1.2", "9.1.3", "9.2.0",
+          "9.2.1", "9.2.2", "9.2.3", "9.2.4", "10.0.0", "10.0.1", "10.0.2", "10.0.3", "10.0.4", "10.0.5", "10.0.6",
+          "10.0.7", "10.1.0", "10.1.1", "10.1.2", "10.1.3", "10.2.0"
+        ],
+        "result": {
+          "rc": 0,
+          "stderr": "",
+          "descriptor": "# Disk DescriptorFile\nversion=1\nCID=$CID\nparentCID=ffffffff\ncreateType=\"twoGbMaxExtentSparse\"\n\n# Extent description\nRW 4194304 SPARSE \"$EXTENT1\"\nRW 4194304 SPARSE \"$EXTENT2\"\nRW 2097152 SPARSE \"$EXTENT3\"\n\n# The Disk Data Base\n#DDB\n\nddb.virtualHWVersion = \"4\"\nddb.geometry.cylinders = \"10402\"\nddb.geometry.heads = \"16\"\nddb.geometry.sectors = \"63\"\nddb.adapterType = \"ide\"\nddb.toolsVersion = \"2147483647\"\n",
+          "extent_names": ["$STEM-s001.vmdk", "$STEM-s002.vmdk", "$STEM-s003.vmdk"],
+          "extent_lengths": [327680, 327680, 196608],
+          "existing_kept_lengths": [327680],
+          "structure": {
+            "descriptor_embedded": false,
+            "version": "1",
+            "has_cid": true,
+            "parent_cid": "ffffffff",
+            "create_type": "twoGbMaxExtentSparse",
+            "extent_count": 3,
+            "total_sectors": 10485760,
+            "extents": [
+              {
+                "access": "RW",
+                "sectors": 4194304,
+                "kind": "SPARSE",
+                "filename": "$STEM-s001.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 327680,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 4194304,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 278,
+                  "overhead_sectors": 640
+                }
+              },
+              {
+                "access": "RW",
+                "sectors": 4194304,
+                "kind": "SPARSE",
+                "filename": "$STEM-s002.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 327680,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 4194304,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 278,
+                  "overhead_sectors": 640
+                }
+              },
+              {
+                "access": "RW",
+                "sectors": 2097152,
+                "kind": "SPARSE",
+                "filename": "$STEM-s003.vmdk",
+                "flat_offset_sectors": null,
+                "file_length": 196608,
+                "header": {
+                  "version": 1,
+                  "flags": 3,
+                  "capacity_sectors": 2097152,
+                  "grain_size_sectors": 128,
+                  "descriptor_offset_sectors": 1,
+                  "descriptor_size_sectors": 20,
+                  "rgd_offset_sectors": 21,
+                  "gd_offset_sectors": 150,
+                  "overhead_sectors": 384
+                }
+              }
+            ]
+          }
+        }
+      }
+    ],
+    "vmdk-multi-flat-5G-existing-extent": [
+      {
+        "versions": ["6.0.0", "6.0.1", "6.1.0", "6.1.1"],
+        "result": {
+          "rc": 0,
+          "stderr": "",
+          "descriptor": "# Disk DescriptorFile\nversion=1\nCID=$CID\nparentCID=ffffffff\ncreateType=\"twoGbMaxExtentFlat\"\n\n# Extent description\nRW 4194304 FLAT \"$EXTENT1\" 0\nRW 4194304 FLAT \"$EXTENT2\" 0\nRW 2097152 FLAT \"$EXTENT3\" 0\n\n# The Disk Data Base\n#DDB\n\nddb.virtualHWVersion = \"4\"\nddb.geometry.cylinders = \"10402\"\nddb.geometry.heads = \"16\"\nddb.geometry.sectors = \"63\"\nddb.adapterType = \"ide\"\n",
+          "extent_names": ["$STEM-f001.vmdk", "$STEM-f002.vmdk", "$STEM-f003.vmdk"],
+          "extent_lengths": [2147483648, 2147483648, 1073741824],
+          "existing_kept_lengths": [2147483648],
+          "structure": null
+        }
+      },
+      {
+        "versions": [
+          "6.2.0", "7.0.0", "7.1.0", "7.2.0", "7.2.1", "7.2.2", "7.2.3", "7.2.4", "7.2.5", "7.2.6", "7.2.7", "7.2.8",
+          "7.2.9", "7.2.10", "7.2.11", "7.2.12", "7.2.13", "7.2.14", "7.2.15", "7.2.16", "7.2.17", "7.2.18", "7.2.19",
+          "7.2.20", "7.2.21", "7.2.22", "8.0.0", "8.0.1", "8.0.2", "8.0.3", "8.0.4", "8.0.5", "8.1.0", "8.1.1", "8.1.2",
+          "8.1.3", "8.1.4", "8.1.5", "8.2.0", "8.2.1", "8.2.2", "8.2.3", "8.2.4", "8.2.5", "8.2.6", "8.2.7", "8.2.8",
+          "8.2.9", "8.2.10", "9.0.0", "9.0.1", "9.0.2", "9.0.3", "9.0.4", "9.1.0", "9.1.1", "9.1.2", "9.1.3", "9.2.0",
+          "9.2.1", "9.2.2", "9.2.3", "9.2.4", "10.0.0", "10.0.1", "10.0.2", "10.0.3", "10.0.4", "10.0.5", "10.0.6",
+          "10.0.7", "10.1.0", "10.1.1", "10.1.2", "10.1.3", "10.2.0"
+        ],
+        "result": {
+          "rc": 0,
+          "stderr": "",
+          "descriptor": "# Disk DescriptorFile\nversion=1\nCID=$CID\nparentCID=ffffffff\ncreateType=\"twoGbMaxExtentFlat\"\n\n# Extent description\nRW 4194304 FLAT \"$EXTENT1\" 0\nRW 4194304 FLAT \"$EXTENT2\" 0\nRW 2097152 FLAT \"$EXTENT3\" 0\n\n# The Disk Data Base\n#DDB\n\nddb.virtualHWVersion = \"4\"\nddb.geometry.cylinders = \"10402\"\nddb.geometry.heads = \"16\"\nddb.geometry.sectors = \"63\"\nddb.adapterType = \"ide\"\nddb.toolsVersion = \"2147483647\"\n",
+          "extent_names": ["$STEM-f001.vmdk", "$STEM-f002.vmdk", "$STEM-f003.vmdk"],
+          "extent_lengths": [2147483648, 2147483648, 1073741824],
+          "existing_kept_lengths": [2147483648],
+          "structure": null
         }
       }
     ]

@@ -4,8 +4,10 @@
 instar-testdata writes for the commands in `helpers.qemu_pins.CASES`. These
 tests keep the pin honest: it must cover every build that is present, a
 spread of those builds and the host qemu-img must still produce what it
-says, and every VHDX create case must have one answer across versions
-unless a test says otherwise.
+says, every VHDX create case must have one answer across versions unless a
+test says otherwise, and every split-subformat VMDK case must have exactly
+the one known boundary, where qemu 6.2.0 starts adding a toolsVersion line
+to the descriptor.
 """
 
 import tempfile
@@ -21,6 +23,12 @@ REPIN_HINT = 're-run tools/sweep-qemu-create.py --write tests/golden/qemu-create
 # so they are left to the pinned-version tests rather than required to
 # have one answer across every version.
 VHDX_SINGLE_ANSWER_EXCLUDED = {'vhdx-dynamic-65T', 'vhdx-fixed-backing', 'vhdx-fixed-prealloc-metadata'}
+
+# The split-subformat VMDK writer changed once across the pinned builds: the
+# last version without and the first with the descriptor line below.
+VMDK_MULTI_LAST_OLD = '6.1.1'
+VMDK_MULTI_FIRST_NEW = '6.2.0'
+VMDK_TOOLS_VERSION_LINE = 'ddb.toolsVersion = "2147483647"'
 
 
 class TestQemuCreatePins(InstarTestBase):
@@ -117,3 +125,46 @@ class TestQemuCreatePins(InstarTestBase):
                     qemu_pins.expected(name, pin=pin)
                 except qemu_pins.PinError as e:
                     self.fail(f'{e}; a boundary in the VHDX writer needs handling before this can pass')
+
+    def test_vmdk_multi_cases_have_one_known_boundary(self):
+        names = [case['name'] for case in qemu_pins.CASES if case['kind'] == qemu_pins.KIND_VMDK_MULTI]
+        self.assertTrue(names)
+        pin = qemu_pins.load_pin()
+        hint = 'a new boundary in the VMDK split-subformat writer needs handling before this can pass'
+        for name in names:
+            with self.subTest(case=name):
+                groups = pin['cases'][name]
+                spans = [(group['versions'][0], group['versions'][-1]) for group in groups]
+                self.assertEqual(2, len(groups), f'{name} has {len(groups)} groups across qemu versions ({spans}), '
+                                 f'not the two expected; {hint}')
+                old = qemu_pins.expected(name, VMDK_MULTI_LAST_OLD, pin=pin)
+                new = qemu_pins.expected(name, VMDK_MULTI_FIRST_NEW, pin=pin)
+                # The whole membership of each group, not its first and last
+                # entries: a group holding a gap, or versions out of order,
+                # has endpoints that can still look right.
+                ordered = sorted(pin['versions'], key=qemu_pins.version_key)
+                split = ordered.index(VMDK_MULTI_FIRST_NEW)
+                want = [ordered[:split], ordered[split:]]
+                self.assertEqual(ordered[split - 1], VMDK_MULTI_LAST_OLD,
+                                 f'{VMDK_MULTI_LAST_OLD} is no longer the version before '
+                                 f'{VMDK_MULTI_FIRST_NEW} in the pin; {hint}')
+                self.assertEqual(want, [group['versions'] for group in groups],
+                                 f'{name} groups the versions as {spans}, not as every build up to '
+                                 f'{VMDK_MULTI_LAST_OLD} and every build from {VMDK_MULTI_FIRST_NEW}; {hint}')
+
+                # The only difference is the added descriptor line.
+                self.assertEqual(sorted(old), sorted(new), f'{name} result fields differ between the groups')
+                others = [key for key in old if key != 'descriptor']
+                self.assertEqual({key: old[key] for key in others}, {key: new[key] for key in others},
+                                 f'{name} differs between the groups in more than the descriptor: '
+                                 + '; '.join(qemu_pins.result_diff(old, new)) + f'; {hint}')
+                old_lines = old['descriptor'].splitlines()
+                new_lines = new['descriptor'].splitlines()
+                self.assertNotIn(VMDK_TOOLS_VERSION_LINE, old_lines,
+                                 f'{name} already has the toolsVersion line before {VMDK_MULTI_FIRST_NEW}; {hint}')
+                self.assertEqual(1, new_lines.count(VMDK_TOOLS_VERSION_LINE),
+                                 f'{name} does not have exactly one toolsVersion line from {VMDK_MULTI_FIRST_NEW}; '
+                                 f'{hint}')
+                self.assertEqual(old_lines, [line for line in new_lines if line != VMDK_TOOLS_VERSION_LINE],
+                                 f'{name} descriptor differs between the groups in more than the toolsVersion '
+                                 f'line:\n' + '\n'.join(qemu_pins.result_diff(old, new)) + f'\n{hint}')
