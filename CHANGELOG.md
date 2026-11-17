@@ -1666,7 +1666,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   correct fix is `qcow2::read_chain_virtual_range`, which fills the
   full output grain by chaining as many input-cluster reads as
   needed. This is a pre-existing bug in the shipped `instar convert`
-  command, found and fixed during `dd` implementation (phase 9).
+  command, found and fixed while `instar dd` was being implemented.
 
 - **Dense VHD output capacity under-estimate could stall the final
   write (commit `b80c5d7`).** The VHD writer computed output
@@ -2312,7 +2312,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   baselines (6.0.0–10.2.0), and coverage + differential fuzzing. See
   [docs/amend.md](docs/amend.md).
 
-- **New `instar dd` subcommand (PLAN-dd phases 1-10).** Windowed block
+- **New `instar dd` subcommand.** Windowed block
   copy compatible with `qemu-img dd`:
   `instar dd [-f FMT] [-O OUTPUT_FMT] if=INPUT of=OUTPUT [bs=N]
   [count=N] [skip=N]`. Both `if=`/`of=` mandatory; all other
