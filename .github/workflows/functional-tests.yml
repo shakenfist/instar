@@ -418,6 +418,15 @@ jobs:
       - name: Test the diff line attribution
         run: tools/audit/test-diff-added-lines.sh
 
+      # The push auditor's by-hand stand-in for the source-size ratchet.
+      # It replaced two commands in PUSH-AUDIT.md that measured growth
+      # against merge-base(origin/develop, HEAD), which on a push-audit
+      # branch sees none of the merged work and with no origin/develop
+      # printed nothing -- both read as a clean audit. Fixture-based, so
+      # it runs at this job's fetch-depth of 1.
+      - name: Test the source size audit check
+        run: tools/audit/test-source-size.sh
+
       # A test that makes a LUKS image at runtime flakes in the merge
       # queue, where the failure ejects unrelated pull requests (#905),
       # so the pre-commit hook alone is too late and too easy to skip.

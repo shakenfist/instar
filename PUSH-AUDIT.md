@@ -213,6 +213,8 @@ It reports (does not block; never exits non-zero on
 findings):
 
 - TODO / FIXME / HACK / XXX in changed source files.
+- Source files over 800 lines that the scope grows, for
+  the source-file-size block below.
 - Newly added `#[allow(dead_code)]` annotations.
 - Count of new `#[test]` functions vs Rust files
   changed.
@@ -350,58 +352,34 @@ copy lives in shakenfist/development at
 
     instar has not adopted the `source-size-ratchet` tooling, so
     nothing checks the ratchet on commit and there is no baseline
-    file to edit: the push auditor applies the block's rule by hand.
-    Run this from anywhere in the worktree. The first command prints
-    the **baseline**, which is context rather than a finding list;
-    the second prints the **findings** -- each file the branch grows
-    that ends up over 800 lines, with its length before and after:
+    file. The push auditor applies the block's rule by hand, and
+    `tools/audit/source-size.sh` does the counting:
 
-    ```
-    cd "$(git rev-parse --show-toplevel)"
-    skip=(':!prototypes/' ':!*.md' ':!*.toml' ':!*.json'
-          ':!*.yml' ':!*.yaml' ':!*.txt')
+    - `tools/audit/source-size.sh --baseline` prints the **baseline**:
+      every tracked source file over 1,500 lines. In this repository
+      that output *is* the baseline -- "baselined" below means "listed
+      there" -- and it is context, not a finding list. Pass `800` to
+      see the whole candidate-to-split set.
+    - The **findings** are in wave 2's mechanical pass, which runs the
+      same script over the audit scope: every source file the scope
+      grows that is over 800 lines now, with its net growth. Because
+      it uses the audit scope, `--commits-file` covers merged phases
+      as it does for every other check, and a scope that cannot be
+      resolved is reported as skipped rather than as "(none)". A pure
+      rename is not growth and does not appear.
 
-    git ls-files -z -- "${skip[@]}" \
-        | xargs -0r wc -l | awk '$1 > 1500 && $2 != "total"' | sort -rn
+    A finding over 1,500 lines is the block's ratchet breach unless the
+    pull request description names the file and says why it had to
+    grow: with no baseline file to raise, the description is where the
+    reviewed decision is recorded. A finding between 800 and 1,500
+    opens a question. Neither command can see the block's last bullet
+    -- a baselined file that shrank by losing its rationale comments --
+    so read the diff of any baselined file the scope shrinks.
 
-    base=$(git merge-base origin/develop HEAD)
-    git diff -z --name-only --no-renames --diff-filter=AM \
-            "${base}" HEAD -- "${skip[@]}" \
-        | while IFS= read -r -d '' f; do
-            before=$(git show "${base}:${f}" 2>/dev/null | wc -l)
-            after=$(git show "HEAD:${f}" | wc -l)
-            if [ "${after}" -gt 800 ] && [ "${after}" -gt "${before}" ]; then
-                echo "${f}: ${before} -> ${after}"
-            fi
-        done
-    ```
-
-    A finding whose "after" is over 1,500 is the block's ratchet
-    breach; one between 800 and 1,500 opens a question. A file that
-    is new on the branch, or renamed, shows a "before" of 0. Neither
-    command can see the block's last bullet -- a file that shrank by
-    losing its rationale comments -- so read the diff of any baselined
-    file the branch shrinks.
-
-    The file set is every tracked file except the formats that are
-    not source, rather than a list of source languages, so that a new
-    language is in scope the day it is committed and a new data
-    format shows up as noise rather than going missing. A list of
-    languages already went stale once: `*.rs`, `*.py` and `*.sh` left
-    out the top-level `Makefile`, which is over 1,000 lines, and an
-    earlier `find` rooted at `src/` left out `crates/` and `scripts/`,
-    which holds one of the largest Python files in the repository.
-    Listing tracked files also leaves out build output under
-    `target/` and the vendored crates under `.cargo-cache/`, since
-    both are gitignored, which is what the shared block's exemption for
-    generated and vendored trees asks for. `prototypes/` is excluded
-    for the same reason: AGENTS.md calls it reference material rather
-    than shipped code, so it is not read as source, and it is what
-    the ratchet's exclusion list would hold. The `cd` matters:
-    `git diff` reads pathspecs relative to the current directory but
-    prints paths from the top, so run from a subdirectory the
-    exclusions silently stop applying. Swap `1500` for `800` in the
-    first command to see the whole candidate-to-split set.
+    The script's header says what counts as source and why; in short,
+    every tracked file except formats that are not source, with
+    `prototypes/` excluded because AGENTS.md calls it reference
+    material rather than shipped code. Workflow YAML is counted.
 
     The Python integration suite is in scope and is where the rule
     bites hardest: `tests/test_convert.py` is several thousand lines
