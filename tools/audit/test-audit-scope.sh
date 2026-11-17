@@ -140,7 +140,7 @@ install_tools_into() {
     local dir="$1"
     mkdir -p "${dir}/tools/audit"
     cp "$LIB" "$SCOPE_PATCH" "$WAVE2" "${SCRIPT_DIR}/diff-added-lines.awk" \
-        "${dir}/tools/audit/"
+        "${SCRIPT_DIR}/source-size.sh" "${dir}/tools/audit/"
 }
 
 # expect_names NAME EXPECTED ACTUAL -- compare two newline-delimited
@@ -702,7 +702,9 @@ if [ "$rc" -eq 0 ] \
     && [[ "$out" != *"audit scope: 0 files"* ]] \
     && [[ "$out" == *"1 no longer on disk"* ]] \
     && [[ "$out" == *"wave 2a"* ]] \
-    && [[ "$out" == *"wave 2d"* ]]; then
+    && [[ "$out" == *"wave 2d"* ]] \
+    && grep -A1 'source files over 800 lines that this work grows' <<< "$out" \
+        | grep -qx '(none)'; then
     ok "a valid --commits-file resolves a non-empty scope and every section runs"
 else
     fail "wave2-mechanical.sh did not complete over a valid --commits-file (rc=$rc)"

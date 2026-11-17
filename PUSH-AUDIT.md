@@ -213,6 +213,8 @@ It reports (does not block; never exits non-zero on
 findings):
 
 - TODO / FIXME / HACK / XXX in changed source files.
+- Source files over 800 lines that the scope grows, for
+  the source-file-size block below.
 - Newly added `#[allow(dead_code)]` annotations.
 - Count of new `#[test]` functions vs Rust files
   changed.
@@ -289,7 +291,7 @@ copy lives in shakenfist/development at
   reduced to a pointer.
 <!-- shared-block-end -->
 
-<!-- shared-block: source-file-size v1 -->
+<!-- shared-block: source-file-size v2 -->
 Source file size (shared block; do not edit -- the canonical
 copy lives in shakenfist/development at
 `templates/shared-blocks/source-file-size.md`):
@@ -303,13 +305,29 @@ copy lives in shakenfist/development at
   split, and one over roughly 1,500 as wanting a stated reason to
   stay whole. These hold whether or not a repository tracks review
   per file: tracking is what makes the cost repeat and become
-  measurable, not what makes a long file expensive to read. Both
-  are advisory. Neither is a gate, there is no hard cap, and a
-  reviewer who raises one is opening a question, not recording a
-  defect.
+  measurable, not what makes a long file expensive to read.
+- There is no cap, and no file is ever forced to split: a file
+  already over 1,500 lines may stay exactly that long. What it may
+  not do is grow, and no file may cross 1,500, without a reviewed
+  edit to the repository's baseline of oversize files -- the
+  ratchet in shakenfist/development's
+  `templates/source-size-ratchet/` checks that on every commit.
+  Raising an entry is allowed: it is the stated reason, asked for
+  where a reviewer cannot scroll past it. Where a repository has
+  not adopted the ratchet, the push auditor applies the same rule
+  by hand.
+- The push auditor reads the files the diff touches, not only the
+  diff. A branch that grows a file already over 800 lines is a
+  finding to raise even when its own addition is small, because
+  per-diff review is how slow growth gets past: every step looks
+  reasonable on its own. Under 1,500 the finding opens a question
+  rather than recording a defect. A raised baseline entry is
+  reviewed as the decision it is, and its reason belongs in the
+  pull request description.
 - Generated files, vendored trees and protocol or data tables are
   exempt: they are not read the way source is, and a tool that
-  counts them is measuring the wrong thing.
+  counts them -- the ratchet included -- is measuring the wrong
+  thing, so they belong in its exclusion list, not its baseline.
 - Split along a seam that already exists -- one module's public
   entry point, one check, one subcommand, one endpoint -- so that
   a later change touches one of the pieces rather than all of
@@ -318,23 +336,58 @@ copy lives in shakenfist/development at
 - Length is never reduced by deleting the comments and docstrings
   that explain why the code is the way it is. Those are what make
   a long file reviewable, and trading them for a line count makes
-  the review worse while making the number better. Cut duplicated
-  scaffolding first; see `comment-proportion` for what earns its
-  length.
+  the review worse while making the number better. A diff that
+  shrinks a baselined file by deleting rationale comments or
+  docstrings is a finding, not a win: the ratchet counts lines and
+  cannot tell the difference, so the reviewer has to. Cut
+  duplicated scaffolding first; see `comment-proportion` for what
+  earns its length.
 <!-- shared-block-end -->
 
 !!! note "In this project"
 
     instar does not track per-file human review, so the first bullet's
     repeated-review cost does not apply here; the length thresholds
-    still do. Apply them to files the diff touches, not to the tree.
-    Several files are already far past 1,500 lines --
-    `src/vmm/src/main.rs`, `src/crates/qcow2/src/lib.rs`,
-    `src/shared/src/lib.rs`, the `vhd` and `vhdx` crates' `lib.rs`,
-    and `src/operations/convert/src/main.rs` among them -- so their
-    length alone is not a new finding. Raise one only when the diff
-    grows it materially, or adds to it something that already has a
-    seam of its own.
+    still do.
+
+    instar has not adopted the `source-size-ratchet` tooling, so
+    nothing checks the ratchet on commit and there is no baseline
+    file. The push auditor applies the block's rule by hand, and
+    `tools/audit/source-size.sh` does the counting:
+
+    - `tools/audit/source-size.sh --baseline` prints the **baseline**:
+      every tracked source file over 1,500 lines. In this repository
+      that output *is* the baseline -- "baselined" below means "listed
+      there" -- and it is context, not a finding list. Pass `800` to
+      see the whole candidate-to-split set.
+    - The **findings** are in wave 2's mechanical pass, which runs the
+      same script over the audit scope: every source file the scope
+      grows that is over 800 lines now, with its net growth. Because
+      it uses the audit scope, `--commits-file` covers merged phases
+      as it does for every other check, and a scope that cannot be
+      resolved, or a diff or count that fails, is reported as such
+      rather than as "(none)". A pure rename is not growth and does
+      not appear.
+
+    A finding over 1,500 lines is the block's ratchet breach unless the
+    pull request description names the file and says why it had to
+    grow: with no baseline file to raise, the description is where the
+    reviewed decision is recorded. A finding between 800 and 1,500
+    opens a question. Neither command can see the block's last bullet
+    -- a baselined file that shrank by losing its rationale comments --
+    so read the diff of any baselined file the scope shrinks.
+
+    The script's header says what counts as source and why; in short,
+    every tracked file except formats that are not source, with
+    `prototypes/` excluded because AGENTS.md calls it reference
+    material rather than shipped code. Workflow YAML is counted.
+
+    The Python integration suite is in scope and is where the rule
+    bites hardest: several of its modules are well past 1,500 lines,
+    and `--baseline` is the current list. A per-operation test module
+    is a real seam, so length alone is not a defect, but they are
+    baselined like any other file, and the block's rule applies to
+    them unchanged.
 
 <!-- shared-block: plan-references-in-code v1 -->
 Plan references in code (shared block; do not edit -- the

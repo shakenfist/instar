@@ -418,6 +418,15 @@ jobs:
       - name: Test the diff line attribution
         run: tools/audit/test-diff-added-lines.sh
 
+      # The push auditor's by-hand stand-in for the source-size ratchet.
+      # Its scope comes from the audit scope library, so --commits-file
+      # sees phases that have already merged, and every way it can fail
+      # to measure is asserted to come out as an error rather than as a
+      # clean "(none)". Fixture-based, so it runs at this job's
+      # fetch-depth of 1.
+      - name: Test the source size audit check
+        run: tools/audit/test-source-size.sh
+
       # A test that makes a LUKS image at runtime flakes in the merge
       # queue, where the failure ejects unrelated pull requests (#905),
       # so the pre-commit hook alone is too late and too easy to skip.

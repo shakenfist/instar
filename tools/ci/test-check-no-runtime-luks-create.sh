@@ -119,6 +119,7 @@ EOF
 )"
 expect_fail 'the compare argv' "${T}" 'tests/test_compare.py:5:'
 
+# shellcheck disable=SC2016  # backticks are literal text in the test name
 start 'a `]` inside the list does not hide it'
 # The argv-shaped pattern this guard replaced stopped at the first `]`,
 # so a subscript in an f-string before the option let it through.

@@ -29,6 +29,8 @@ cd "$REPO_ROOT" || exit 1
 
 # shellcheck source=tools/audit/audit-scope.sh
 source "$SCRIPT_DIR/audit-scope.sh"
+# shellcheck source=tools/audit/source-size.sh
+source "$SCRIPT_DIR/source-size.sh"
 audit_scope_init "$@"
 audit_scope_report
 
@@ -97,6 +99,15 @@ if [[ "$AUDIT_SCOPE_SKIP_SCOPED" -eq 0 ]]; then
         echo "(none)"
     fi
 fi
+echo
+
+# PUSH-AUDIT.md's source-file-size block, applied by hand because
+# instar has not adopted the source-size ratchet. source-size.sh owns
+# what counts as source and how growth is measured. Called whatever the
+# scope, unlike the sections around it: it states a skip itself, and the
+# runbook promises a skip here is said out loud rather than left blank.
+bold "=== wave 2a: source files over ${SOURCE_SIZE_SPLIT} lines that this work grows ==="
+source_size_growth
 echo
 
 bold "=== wave 2a: new #[allow(dead_code)] in changed files ==="
