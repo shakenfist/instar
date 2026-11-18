@@ -323,8 +323,8 @@ phase 2 is planned.
    recorded before that date should not be assumed still live.
    Phase 1 therefore starts from a reproduction rather than a
    hypothesis, and carries two defects worth fixing with no network
-   in sight: the budget itself, and convert's silence about an I/O
-   failure.
+   in sight: the budget itself (#923), and convert's silence about
+   an I/O failure (#924).
 
 6. **A server with no `Range` support: refuse, or spool?**
    *Recommendation: refuse by name, with `--spool` as an explicit
@@ -991,16 +991,20 @@ Filled in as the plan runs. Already known:
 
 Filled in as the plan runs. Already known or suspected:
 
-* **The guest spin budget**, reproduced on 2026-11-18 (open
-  question 5): one host read slower than about a second fails the
-  operation. Needs an issue filed before phase 1 starts, carrying
-  the `strace -e inject` recipe, so the fix has something to close.
-* **convert's reporting of an I/O failure**, from the same
-  reproduction: a bare "convert operation failed" at exit 1, with
-  no mention of I/O unless `--verbose` is passed, and a truncated
-  output file left on disk. `compare` gets this right since issue
+* **The guest spin budget**, issue #923, reproduced on
+  2026-11-18 (open question 5): one host read slower than about a
+  second fails the operation. The issue carries the
+  `strace -e inject` recipe and weighs the three candidate fixes;
+  phase 1 closes it.
+* **convert's reporting of an I/O failure**, issue #924, from the
+  same reproduction: a bare "convert operation failed" at exit 1,
+  with no mention of I/O unless `--verbose` is passed. The
+  `SerialDecoder` error chain at `src/vmm/src/main.rs:1209` names
+  six guest refusals and not `"timeout"`, so the diagnosis is
+  decoded and discarded. `compare` gets this right since issue
   #807, naming the image and offset and exiting 4, so there is a
-  pattern in the tree to follow. Worth its own issue.
+  pattern in the tree to follow. The truncated output file left
+  behind is #849, not part of #924.
 * `src/operations/convert/src/main.rs:789` chains a
   `read_input_sector` call with `&&`, so a failed read there is a
   condition rather than an error. It should be read carefully during
