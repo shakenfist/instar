@@ -1013,13 +1013,17 @@ chosen to defer to here, so that we do not forget them.
 * **The VMM installs no logger unless `--verbose` is passed**
   (`main.rs`'s single `init_verbose_logger` call), so every
   diagnostic record in the binary is discarded by default, not only
-  guest I/O errors. Wider than #924 was; wants its own issue.
+  guest I/O errors. Wider than #924 was, and filed as **#931**,
+  which weighs always installing the logger at a lower level
+  against documenting the current behaviour as deliberate.
 * **`copy` reports a failed read as success.** Every `send_error`
   path in `src/operations/copy/src/main.rs` returns before the single
   `send_complete(..., true)` at the end, and the host's `run_copy`
   neither requires a completion nor inspects one, so a failed read
   gives exit 0, no message outside `--verbose`, and a silently short
-  output file. Wants its own issue.
+  output file. Filed as **#930**; the host half is the one that
+  matters, since `run_copy` should require a completion the way the
+  other operations' hosts do.
 * **Carrying the virtio status byte into the guest's I/O helpers.**
   `do_request` reduces it to `status == VIRTIO_BLK_S_OK`, and
   `read_sector`, `write_sector` and `flush` return `bool`, so
