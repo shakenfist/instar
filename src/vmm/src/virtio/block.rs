@@ -104,6 +104,16 @@ pub struct VirtioBlockDevice {
     mmio_base: u64,
     _vq_base: u64, // Reserved for future use
     state: MmioState,
+    /// What the backing store said the first time servicing a request
+    /// failed, as `io::Error`'s own text ("Input/output error" for an
+    /// `EIO`). The guest learns only that the request failed and which
+    /// sector it was on, because the virtio status byte carries one bit
+    /// of reason; the errno is the most useful word in the error the
+    /// user finally reads, so it is kept here for the host side to
+    /// render. The first one is kept rather than the last: an operation
+    /// gives up on the first failed request, so the first is the one
+    /// that failed it.
+    last_io_error: Option<String>,
 }
 
 impl VirtioBlockDevice {
@@ -135,12 +145,32 @@ impl VirtioBlockDevice {
             mmio_base,
             _vq_base: vq_base,
             state: MmioState::default(),
+            last_io_error: None,
         }
     }
 
     /// Get the sector size
     pub fn sector_size(&self) -> u64 {
         self.sector_size
+    }
+
+    /// Record a backing-store failure, and log it. The request is still
+    /// completed, with an error status, so this is the only place the
+    /// errno is kept.
+    fn record_io_error(&mut self, what: &str, offset: u64, err: &std::io::Error) {
+        log::debug!(
+            "virtio-block at MMIO 0x{:x}: {what} at offset {offset} failed: {err}",
+            self.mmio_base
+        );
+        if self.last_io_error.is_none() {
+            // `io::Error`'s Display appends " (os error 5)" to
+            // "Input/output error", which says the same thing twice and
+            // is not what `qemu-img` prints for the same failure. Keep
+            // the name of the errno and drop the number.
+            let text = err.to_string();
+            let name = text.split(" (os error ").next().unwrap_or(&text);
+            self.last_io_error = Some(name.to_string());
+        }
     }
 
     /// Get the MMIO base address
@@ -379,6 +409,31 @@ impl VirtioBlockDevice {
     /// Process a single block request.
     ///
     /// Returns (bytes_written_to_used_ring, io_stats).
+    ///
+    /// # Failing a request versus failing the queue
+    ///
+    /// There are two kinds of failure here and they must not be
+    /// confused, because the guest waits for a used-ring entry and has
+    /// no deadline of its own.
+    ///
+    /// A failure to **service** a request -- the backing store will not
+    /// read, will not write, or will not flush -- is answered with
+    /// `request_status::IOERR` in the status descriptor. The request is
+    /// completed: it gets its used-ring entry and its interrupt, and the
+    /// guest sees a request that finished and failed, which is what lets
+    /// the operation report the failure and exit. This is the same shape
+    /// `validate_io_request` already uses for an out-of-range request.
+    ///
+    /// A failure to **read the virtqueue** -- a descriptor index outside
+    /// the queue, a chain with no data or status descriptor, a guest
+    /// address that is not mapped -- propagates. That is not a request
+    /// that can be completed: the status byte would have to be written
+    /// through the very chain that did not parse, so there is nowhere to
+    /// put an answer, and a guess at where it goes would corrupt guest
+    /// memory. It is also not an ordinary event: the only writer of
+    /// these rings is the guest this VMM loaded, so a malformed one is a
+    /// bug in instar rather than a condition to report to the image's
+    /// owner. The caller fails the run instead.
     fn process_request(
         &mut self,
         guest_mem: &GuestMemoryMmap,
@@ -435,10 +490,13 @@ impl VirtioBlockDevice {
                     result
                 }
             }
-            request_type::FLUSH => {
-                self.backing.sync()?;
-                request_status::OK
-            }
+            request_type::FLUSH => match self.backing.sync() {
+                Ok(()) => request_status::OK,
+                Err(e) => {
+                    self.record_io_error("flush", 0, &e);
+                    request_status::IOERR
+                }
+            },
             _ => request_status::UNSUPP,
         };
 
@@ -509,8 +567,14 @@ impl VirtioBlockDevice {
         };
 
         let mut buf = vec![0u8; len as usize];
-        self.backing.read_at(offset, &mut buf)?;
+        if let Err(e) = self.backing.read_at(offset, &mut buf) {
+            self.record_io_error("read", offset, &e);
+            return Ok(request_status::IOERR);
+        }
 
+        // Not a failure to service the request: the guest handed us an
+        // address we cannot write, so the chain is not one we can answer
+        // through either. Propagate.
         guest_mem.write_slice(&buf, GuestAddress(addr))?;
         Ok(request_status::OK)
     }
@@ -528,10 +592,15 @@ impl VirtioBlockDevice {
             None => return Ok(request_status::IOERR),
         };
 
+        // As in `do_read`: an unreadable guest address is not a request
+        // we can answer, so it propagates rather than completing.
         let mut buf = vec![0u8; len as usize];
         guest_mem.read_slice(&mut buf, GuestAddress(addr))?;
 
-        self.backing.write_at(offset, &buf)?;
+        if let Err(e) = self.backing.write_at(offset, &buf) {
+            self.record_io_error("write", offset, &e);
+            return Ok(request_status::IOERR);
+        }
         Ok(request_status::OK)
     }
 }
@@ -602,6 +671,7 @@ mod tests {
             mmio_base: 0x10000000,
             _vq_base: 0x100000,
             state: MmioState::default(),
+            last_io_error: None,
         };
         // sector_size=1 so offset = sector. Pick sector near u64::MAX
         // so that offset + len overflows.
@@ -625,6 +695,59 @@ mod tests {
         let dev = test_device(4096, 512);
         let result = dev.validate_io_request(0, 0).unwrap();
         assert_eq!(result, Some(0));
+    }
+
+    /// A request the backing store refuses is *completed* with an error
+    /// status, not propagated. The guest waits for a used-ring entry
+    /// with no deadline of its own, so an unanswered request is a hang:
+    /// the status byte is the only thing that ends the wait, and the
+    /// operation needs it to report the failure and exit.
+    #[test]
+    fn a_refused_write_completes_with_an_error_status() {
+        let tmp = NamedTempFile::new().unwrap();
+        // A capacity that is not a whole number of sectors: the device
+        // rounds up to two sectors, so sector 1 passes
+        // `validate_io_request` and then runs past the backing store's
+        // own byte capacity, which is a failure to service the request
+        // without needing an injected errno.
+        let backing = BackingStore::open(tmp.path(), false, Some(1000), false).unwrap();
+        let mut dev = VirtioBlockDevice::new(backing, 1000, 512, false, 0x10000000, 0x100000);
+        let guest_mem =
+            GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0x1000), 0x1000)]).unwrap();
+
+        assert_eq!(dev.last_io_error, None);
+        let status = dev.do_write(&guest_mem, 1, 0x1000, 512).unwrap();
+        assert_eq!(status, request_status::IOERR);
+        // The errno is kept where the host can render it: the guest is
+        // told only which sector failed.
+        assert!(dev.last_io_error.is_some(), "the reason must be kept");
+    }
+
+    /// The same for a read, which is the path an `EIO` on the input
+    /// image takes. The failure here is a file that shrank behind the
+    /// backing store's cached size, so `read_exact` cannot fill the
+    /// buffer -- a different errno from an injected `EIO`, but the same
+    /// code path and the same obligation to answer the request.
+    #[test]
+    fn a_failed_read_completes_with_an_error_status() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(&vec![0u8; 1024]).unwrap();
+        tmp.flush().unwrap();
+        let backing = BackingStore::open(tmp.path(), true, Some(1024), false).unwrap();
+        let mut dev = VirtioBlockDevice::new(backing, 1024, 512, true, 0x10000000, 0x100000);
+        let guest_mem =
+            GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0x1000), 0x1000)]).unwrap();
+
+        // A read that is serviced leaves the reason field clear.
+        let status = dev.do_read(&guest_mem, 0, 0x1000, 512).unwrap();
+        assert_eq!(status, request_status::OK);
+        assert_eq!(dev.last_io_error, None);
+
+        // Now take the bytes away without telling the device.
+        tmp.as_file().set_len(0).unwrap();
+        let status = dev.do_read(&guest_mem, 0, 0x1000, 512).unwrap();
+        assert_eq!(status, request_status::IOERR);
+        assert!(dev.last_io_error.is_some(), "the reason must be kept");
     }
 
     #[test]
