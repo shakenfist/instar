@@ -477,7 +477,7 @@ there is a confined process to put it in.
 
 | Phase | Plan | Status | Merged |
 |-------|------|--------|--------|
-| 1. Guest I/O wait | PLAN-http-input-phase-01-guest-wait.md | Not started | |
+| 1. Guest I/O wait | [PLAN-http-input-phase-01-guest-wait.md](PLAN-http-input-phase-01-guest-wait.md) | Not started | |
 | 2. Fetch protocol and a file-backed fetcher | PLAN-http-input-phase-02-protocol.md | Not started | |
 | 3. Remote backing store | PLAN-http-input-phase-03-backing.md | Not started | |
 | 4. Confinement | PLAN-http-input-phase-04-confinement.md | Not started | |
@@ -491,16 +491,27 @@ there is a confined process to put it in.
 
 **1. Guest I/O wait.** Replace the iteration-counted spin in
 `src/core/src/virtio.rs` `do_request` with a wait that does not
-expire because the host was slow, and move the deadline to the host
-where it can be generous and per-request. Open question 5 settled
-this as a bug fix rather than enabling work: a single host I/O
-slower than about a second already fails a local operation, with no
-network in sight, and the reproduction is in that question. The
-phase also carries the two defects the reproduction exposed --
-convert reporting an I/O timeout as a bare "convert operation
-failed" with no mention of I/O outside `--verbose`, and leaving a
-truncated output file behind when it does. Touches every
-operation's I/O path, so it lands alone.
+expire because the host was slow. Open question 5 settled this as a
+bug fix rather than enabling work: a single host I/O slower than
+about a second already fails a local operation, with no network in
+sight, and the reproduction is in that question. The phase also
+carries convert reporting such a failure as a bare "convert
+operation failed" with no mention of I/O outside `--verbose`.
+Touches every operation's I/O path, so it lands alone.
+
+This section said, until the phase was planned, that the deadline
+should move "to the host where it can be generous and per-request".
+The phase's survey found there is no host deadline to move it to --
+nothing in the VMM times a request, and the 100 ms `epoll_wait`
+timeout in `src/vmm/src/io_thread.rs` exists only so the loop can
+re-check its `running` flag -- and that neither thread which
+services a virtio queue could enforce one, because both block
+inside the synchronous `read_at`. The operator therefore decided on
+2026-11-18 that the guest waits indefinitely and the host enforces
+no deadline at all; the phase plan argues it, and
+`src/core/src/serial.rs` `read_config` is the precedent, waiting
+unbounded on the host already. The truncated output file, which this
+section also used to claim, is #849 and is out of the phase's scope.
 
 **2. Fetch protocol and a file-backed fetcher.** Define the wire
 protocol -- fixed-layout headers, offset-addressed reads,
