@@ -34,6 +34,13 @@ RUN printf '%s\n' 'Acquire::Retries "3";' > /etc/apt/apt.conf.d/99retries
 #   composed bytes out of the binding instead. It installs into the
 #   distribution's dist-packages, so the test venv the Makefile builds
 #   is created with --system-site-packages to see it.
+# - strace: injects latency into a host read so the integration suite
+#   can prove a slow read does not fail a guest operation. Nothing else
+#   can make a read slow from outside the process without privileges
+#   this suite does not have, and the test that uses it fails rather
+#   than skips here (INSTAR_REQUIRE_STRACE), so removing the package
+#   turns that job red instead of leaving it quietly green; see
+#   tests/test_slow_host_read.py.
 # - wget: for downloading gh CLI keyring
 # - rpm: provides /usr/lib/rpm/find-requires so `make rpm` here
 #   generates the same dependencies as the release build image. Without
@@ -51,6 +58,7 @@ RUN apt-get update && apt-get install -y \
     python3-venv \
     qemu-utils \
     rpm \
+    strace \
     wget \
     && rm -rf /var/lib/apt/lists/*
 

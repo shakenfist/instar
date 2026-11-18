@@ -82,8 +82,9 @@ selection their module happens to fall in is a requirement waiting to
 go quiet, and moving the class would unset it with nothing red. A
 base-image bump that dropped ZSTD support would otherwise return both
 tests to skipping on every run, which is the state #813 found them in. This is the same bargain `INSTAR_REQUIRE_LIBVHDI`
-strikes for the libvhdi oracle, and `INSTAR_REQUIRE_LIBYAL` for the
-fuzzer's.
+strikes for the libvhdi oracle, `INSTAR_REQUIRE_LIBYAL` for the
+fuzzer's, and `INSTAR_REQUIRE_STRACE` for the latency injection in
+`TestSlowHostRead` (below).
 
 **A `_run_tool` timeout is a hang guard, not a performance
 assertion.** The budget (`QEMU_TOOL_TIMEOUT`, 300s) exists so a wedged
@@ -437,6 +438,48 @@ Tests verifying instar's security properties:
 - Backing file references are detected but not followed
 - External data file references are reported but not read
 - VMDK descriptor extent paths are not accessed
+
+### Slow Host Read Tests (`test_slow_host_read.py`)
+
+A guest operation reads every byte through the host, and waits on the
+host while it does. A read that takes seconds -- a loaded runner, a
+network filesystem, a backing store that is not a local disk -- must
+therefore make an operation slow and not make it fail. The test
+injects a three second delay into one host read with
+`strace -e inject=read:delay_enter=...:when=N` and requires the
+conversion to exit 0 with bytes identical to an undelayed run.
+
+Three things about it are worth knowing before changing it.
+
+**The injection index is derived, never hardcoded.** `when=N` counts
+a syscall's invocations *per thread*, so the number names a different
+read as soon as anything changes how many reads the VMM does before
+the guest starts. The test traces the very conversion it is about to
+run, finds the thread servicing the virtio queue (the one reading an
+order of magnitude more than anything else in the process, because it
+reads once per guest request), and picks a data read in the middle of
+that thread's sequence, past the read count of every other thread so
+that no other thread can reach the index.
+
+**The test asserts the delay landed.** Everything else it checks
+passes just as well with no injection at all: an undelayed conversion
+also exits 0 and also produces identical bytes. So it reads strace's
+own per-syscall timing (`-T`) back and insists that the read at the
+derived index took most of the injected delay, and that it was a data
+read rather than a queue notification. An injection that silently
+stopped working is the most likely way for this test to rot, and that
+assertion is what stops it.
+
+**The capability is probed, not the binary.** strace can be installed
+and unable to inject: `-e inject=` and its `delay_enter` are not in
+every build old enough to be packaged somewhere, a container that
+cannot `ptrace` traces nothing at all, and `yama/ptrace_scope` of 2 or
+more refuses an unprivileged tracer. So the probe delays a real
+syscall in `/bin/true` and insists on seeing the delay. A host that
+fails the probe skips, unless `INSTAR_REQUIRE_STRACE` is set, which
+the `integration-core` job does because the devcontainer installs
+strace -- dropping the package turns that job red rather than quietly
+green.
 
 ## Running Tests
 

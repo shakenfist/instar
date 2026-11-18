@@ -244,8 +244,15 @@ def parse_makefile_list(makefile_text, target):
 # that a failure instead. It reaches them today because
 # test_check_formats falls in the core selection, which is a fact about
 # where a class lives rather than a guarantee, so it is asserted.
+#
+# The same holds for the slow-host-read test, whose latency injection
+# needs an strace that can inject: a host where it cannot would skip
+# the one test standing between the guest's I/O wait and a regression
+# that fails every slow read, and INSTAR_REQUIRE_STRACE is what turns
+# that into a failure.
 ENV_REQUIRED_BY = (
     ('TestZstdBackingChain', 'INSTAR_REQUIRE_ZSTD'),
+    ('TestSlowHostRead', 'INSTAR_REQUIRE_STRACE'),
 )
 
 
