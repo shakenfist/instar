@@ -187,14 +187,24 @@ than left to fail obscurely.
 
 ## Open questions
 
-Each question carries the planner's recommendation and its
-reasoning. Question 5 was resolved by measurement on 2026-11-18;
-none of the others has been resolved by the operator yet. Questions
-1 to 3 fix the shape of phases 2 and 3 and should be settled before
-phase 2 is planned.
+All nine are resolved. Question 5 was settled by measurement on
+2026-11-18; the operator settled the other eight the same day,
+taking the planner's recommendation in every case. Each question
+keeps the reasoning that was offered for it, which is now the
+rationale of record rather than an argument for a decision still to
+be made -- a reviewer asking "why a framed protocol and not a
+virtqueue?" should find the answer here, along with what was
+rejected and on what grounds. Nothing in the phase table is waiting
+on a decision; phase 2 can be planned as written.
+
+A decision recorded here is not immovable. Questions 2 and 4 are
+the two most likely to be revisited by measurement -- the datagram
+ceiling and block size against phase 6's round-trip counts, and the
+HTTP client if `ureq` turns out to want something the fetcher cannot
+give it -- and both say so in their own text.
 
 1. **A virtio-derived protocol over the socket, or a plain framed
-   one?** *Recommendation: a plain framed protocol that borrows
+   one?** *Resolved 2026-11-18: a plain framed protocol that borrows
    virtio-blk's model and not its mechanism.*
 
    *What virtio-blk is for does not survive the move.* A descriptor
@@ -255,48 +265,48 @@ phase 2 is planned.
    should be small enough to fuzz exhaustively.
 
 2. **`SOCK_SEQPACKET` or `SOCK_STREAM`, and what block size?**
-   *Recommendation: `SOCK_SEQPACKET`, 64 KiB default, 256 KiB
+   *Resolved 2026-11-18: `SOCK_SEQPACKET`, 64 KiB default, 256 KiB
    ceiling negotiated at init.* SEQPACKET makes message boundaries
    the kernel's problem, which removes framing desynchronisation
    from the privileged parser entirely. 64 KiB matches the guest's
    own request size, and readahead comes from many outstanding
    requests rather than larger ones. The measured `wmem_max` of
-   212992 caps a single datagram near 256 KiB here and will be
-   lower on some machines, so the ceiling is negotiated rather than
+   212992 caps a single datagram near 256 KiB here and will be lower
+   on some machines, so the ceiling is negotiated rather than
    assumed. If phase 6's measurement shows round-trip count
    dominating, phase 6 revisits it -- `SOCK_STREAM` with fixed
    headers, or scatter-gather across several datagrams -- rather
    than phase 2 guessing now.
 
 3. **Where do the cache and the readahead live?**
-   *Recommendation: in the fetcher.* The VMM's `read_at` stays one
-   round trip, and the fetcher owns the block cache, the coalescing
-   of 512-byte requests, and the asynchronous readahead, issuing
-   overlapping HTTP requests without the VMM knowing. A compromised
-   fetcher serving stale or wrong cached bytes is still only
-   serving wrong bytes. Putting the cache in the VMM would mean the
-   privileged process holding and indexing attacker-influenced data
-   and scheduling the prefetch, which is more privileged code for
-   no gain. Consequence: the VMM's memory does not grow, and any
+   *Resolved 2026-11-18: in the fetcher.* The VMM's `read_at` stays
+   one round trip, and the fetcher owns the block cache, the
+   coalescing of 512-byte requests, and the asynchronous readahead,
+   issuing overlapping HTTP requests without the VMM knowing. A
+   compromised fetcher serving stale or wrong cached bytes is still
+   only serving wrong bytes. Putting the cache in the VMM would mean
+   the privileged process holding and indexing attacker-influenced
+   data and scheduling the prefetch, which is more privileged code
+   for no gain. Consequence: the VMM's memory does not grow, and any
    `--cache-size` control is a fetcher argument.
 
 4. **What implements HTTP inside the fetcher?**
-   *Recommendation: `ureq` with `rustls`, in the fetcher's own
+   *Resolved 2026-11-18: `ureq` with `rustls`, in the fetcher's own
    crate, never a dependency of the VMM binary.* It is blocking,
-   which suits a thread-per-outstanding-request fetcher; it does
-   not pull tokio; and rustls is memory-safe Rust, so the residual
-   risk is low even before confinement. Being pure Rust it also
-   adds no shared library, which matters because `cargo deb`'s
-   `$auto` and `generate-rpm`'s `auto-req` scan the packaged
-   binaries: a C TLS stack would show up in the package metadata,
-   and rustls will not. Phase 5's plan should record the rejected
-   alternatives: `reqwest` (tokio and hundreds of crates, which
-   still have to be audited and packaged even though the VMM does
-   not link them); `libcurl` (C in the fetcher, but mature and
-   distro-patched -- the reasonable second choice); and exec'ing
-   `curl --range` per block (zero HTTP code anywhere in instar and
-   the most auditable of all, but one process per cache fill, which
-   the operator has ruled out as the primary design).
+   which suits a thread-per-outstanding-request fetcher; it does not
+   pull tokio; and rustls is memory-safe Rust, so the residual risk
+   is low even before confinement. Being pure Rust it also adds no
+   shared library, which matters because `cargo deb`'s `$auto` and
+   `generate-rpm`'s `auto-req` scan the packaged binaries: a C TLS
+   stack would show up in the package metadata, and rustls will not.
+   Phase 5's plan should record the rejected alternatives: `reqwest`
+   (tokio and hundreds of crates, which still have to be audited and
+   packaged even though the VMM does not link them); `libcurl` (C in
+   the fetcher, but mature and distro-patched -- the reasonable
+   second choice); and exec'ing `curl --range` per block (zero HTTP
+   code anywhere in instar and the most auditable of all, but one
+   process per cache fill, which the operator has ruled out as the
+   primary design).
 
 5. **Does the spin budget already cause the kasm `test_convert`
    flake?** *Resolved 2026-11-18 by measurement: the mechanism is
@@ -327,37 +337,37 @@ phase 2 is planned.
    an I/O failure (#924).
 
 6. **A server with no `Range` support: refuse, or spool?**
-   *Recommendation: refuse by name, with `--spool` as an explicit
-   opt-in that says what it is doing and where it is writing.*
-   Silently spooling turns a streaming operation into a full
-   download plus a disk write, which is what the user would have
-   chosen `curl` for. Note the asymmetry: `Accept-Ranges` is
+   *Resolved 2026-11-18: refuse by name, with `--spool` as an
+   explicit opt-in that says what it is doing and where it is
+   writing.* Silently spooling turns a streaming operation into a
+   full download plus a disk write, which is what the user would
+   have chosen `curl` for. Note the asymmetry: `Accept-Ranges` is
    advisory, so the only reliable probe is a ranged request checked
    for `206`, which phase 5 does once at open.
 
-7. **Credentials.** *Recommendation: none in v1.* A URL containing
-   userinfo is refused; no `.netrc`, no bearer token, no
+7. **Credentials.** *Resolved 2026-11-18: none in v1.* A URL
+   containing userinfo is refused; no `.netrc`, no bearer token, no
    `--header`. The fetcher then never holds a secret, which is one
    fewer thing a compromise can take. Signed URLs carry their
    credential in the query string and work anyway, covering most
    object-store cases -- but they must then be kept out of verbose
    output and out of error strings, which phase 8 owns.
 
-8. **How is the fetcher found and packaged?** *Recommendation: the
-   same pattern as the guest `.bin` files* -- probe the executable's
-   own directory first for developer builds, then
+8. **How is the fetcher found and packaged?** *Resolved 2026-11-18:
+   the same pattern as the guest `.bin` files* -- probe the
+   executable's own directory first for developer builds, then
    `/usr/lib/instar/`. It is a workspace binary built by `make
    instar` and added to the `.deb` and `.rpm` asset lists at mode
    755.
 
-9. **Remote output, and remote backing files.** *Recommendation:
-   both out of scope, and both refused by name.* Output stays local
-   because every writer seeks backwards. Backing files stay local
-   as policy rather than as a limitation: an image-supplied URL is
-   attacker-controlled data, and following one is server-side
-   request forgery from a process the attacker is trying to reach.
-   The only URL instar ever fetches is the one on the command line.
-   Phase 7 enforces it; phase 10 writes it down.
+9. **Remote output, and remote backing files.**
+   *Resolved 2026-11-18: both out of scope, and both refused by
+   name.* Output stays local because every writer seeks backwards.
+   Backing files stay local as policy rather than as a limitation:
+   an image-supplied URL is attacker-controlled data, and following
+   one is server-side request forgery from a process the attacker is
+   trying to reach. The only URL instar ever fetches is the one on
+   the command line. Phase 7 enforces it; phase 10 writes it down.
 
 ## Execution
 
@@ -954,7 +964,10 @@ canonical copy lives in shakenfist/development at
 
 ### Future work
 
-Filled in as the plan runs. Already known:
+We should list obvious extensions, known issues, unrelated bugs we
+encountered, and anything else we should one day do but have
+chosen to defer to here, so that we do not forget them.
+
 
 * **Queue depth greater than one.** The real fix for serialised
   latency is for the guest to have several reads outstanding, which
@@ -989,7 +1002,12 @@ Filled in as the plan runs. Already known:
 
 ### Bugs fixed during this work
 
-Filled in as the plan runs. Already known or suspected:
+This section should list any bugs we encounter during development
+that we fixed. You should also scan the project's issue tracker,
+where one exists, for directly related issues that we should
+either resolve as part of this master plan or at least be aware of
+while planning it.
+
 
 * **The guest spin budget**, issue #923, reproduced on
   2026-11-18 (open question 5): one host read slower than about a
@@ -1018,10 +1036,7 @@ tracker at planning time found none.
 
 ### Back brief
 
-Before implementation begins, the implementing session restates
-this plan's mission, the resolved open questions, and the phase it
-is starting, in its own words, and the operator confirms. No open
-question 5 was resolved by measurement on 2026-11-18, and the rest
-are open: questions 1 to 3 fix the shape of phases 2 and 3 and want
-answers before phase 2 is planned.
+Before executing any step of this plan, please back brief the
+operator as to your understanding of the plan and how the work you
+intend to do aligns with that plan.
 <!-- shared-block-end -->
