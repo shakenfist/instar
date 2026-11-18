@@ -1,6 +1,6 @@
 # Multi-extent VMDK output: twoGbMaxExtentSparse and twoGbMaxExtentFlat
 
-## Status: Not started
+## Status: In progress
 
 ## Prompt
 
@@ -539,7 +539,7 @@ cannot corrupt an output, before the write path depends on it.
 
 | Phase | Plan | Status | Merged |
 |-------|------|--------|--------|
-| 1. Pin and measure qemu's output | [PLAN-multi-extent-vmdk-phase-01-pin.md](PLAN-multi-extent-vmdk-phase-01-pin.md) | Not started | |
+| 1. Pin and measure qemu's output | [PLAN-multi-extent-vmdk-phase-01-pin.md](PLAN-multi-extent-vmdk-phase-01-pin.md) | Complete | 34832d47 |
 | 2. Fixtures and baselines | PLAN-multi-extent-vmdk-phase-02-fixtures.md | Not started | |
 | 3. Read side: lift the extent ceiling | PLAN-multi-extent-vmdk-phase-03-read-ceiling.md | Not started | |
 | 4. Multi-extent descriptor emitter | PLAN-multi-extent-vmdk-phase-04-descriptor.md | Not started | |
