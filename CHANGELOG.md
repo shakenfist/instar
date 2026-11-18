@@ -831,6 +831,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **`info` reports the allocation and child order qemu-img does for a
+  VMDK made of separate extent files.** This covers `monolithicFlat` as
+  well as the `twoGbMaxExtent*` split subformats. The top-level
+  `actual-size` was the descriptor's own block count alone, where
+  qemu-img reports the sum over the descriptor and every extent (4096
+  bytes against 1576960 on a multi-extent flat image); the human format
+  printed the descriptor's allocation on every per-extent child line
+  instead of that extent's own; and `children[]` was emitted in
+  descriptor order, where qemu walks the extents from last to first and
+  lists the descriptor afterwards, and was emitted whatever version was
+  asked for, so `--qemu-version 7.2` produced an array that no qemu
+  build before 8.0.0 emits at all. All three now match qemu-img
+  ([#922](https://github.com/shakenfist/instar/issues/922)).
+
 - **`instar map` refuses an extent in a state the guest cannot name**,
   exiting 1 with the offset and the state, instead of printing it as a
   data extent ([#816](https://github.com/shakenfist/instar/issues/816)).

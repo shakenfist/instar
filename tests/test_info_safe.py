@@ -16,11 +16,13 @@ import struct
 import subprocess
 import tempfile
 from pathlib import Path
+from typing import Optional
 
 import testscenarios
 
 from base import InstarTestBase
 from helpers import load_manifest_images
+from helpers.comparators import get_disk_size
 
 
 def _get_safe_images_from_manifest():
@@ -485,3 +487,204 @@ class TestInfoVhdxMetadataLayout(InstarTestBase):
             info = self._info_json(child)
             self.assertEqual(self.VIRTUAL_SIZE, info['virtual-size'])
             self.assertEqual('parent.vhdx', info.get('backing-filename'))
+
+
+class TestInstarUnsupportedIsStillUnsupported(InstarTestBase):
+    """Every image the manifest calls unsupported really is refused.
+
+    `instar_unsupported` makes the baseline comparison skip, which is
+    the right behaviour while the gap is real -- qemu-img reads these
+    images, so a baseline exists and the parity gap stays measurable,
+    and asserting equality would pin a known gap as a hard failure. But
+    a skip proves nothing on its own, and nothing else reads the field,
+    so until this test the claim behind every one of those skips was
+    unchecked and a flag left behind after the gap closed would have
+    gone on silently suppressing the comparison it was hiding.
+
+    So the field is falsifiable here: the image must fail. When one
+    starts succeeding, this is what says so, and the fix is to clear
+    `instar_unsupported` in the manifest and let the baseline
+    comparison run.
+    """
+
+    def test_every_unsupported_image_is_refused(self):
+        flagged = [image for image in load_manifest_images() if image.get('instar_unsupported')]
+        self.assertTrue(flagged, 'the manifest sets instar_unsupported on no image at all')
+        for entry in flagged:
+            with self.subTest(image=entry['id']):
+                image = self.get_image(entry['id'])
+                if not image.path.exists():
+                    self.skipTest(f'Image file not found: {image.path}')
+                stdout, stderr, rc = self.run_instar_info(image.path)
+                self.assertNotEqual(
+                    0, rc,
+                    f'{entry["id"]} is marked unsupported but instar info succeeded. '
+                    f'If the gap has closed, clear instar_unsupported in the manifest '
+                    f'so the baseline comparison runs. Output: {stdout!r}'
+                )
+
+
+# The static qemu-img builds the multi-file VMDK tests below compare
+# against. qemu reports a multi-file image's children only from 8.0, so
+# these bracket that boundary with two builds either side of it.
+MULTI_FILE_VMDK_VERSIONS = ('6.0.0', '7.2.0', '8.0.0', '10.2.0')
+
+# The children array a qemu build of 8.0 or later emits for each image,
+# in order: the extents from last to first, each keeping its own index,
+# and the descriptor afterwards.
+MULTI_FILE_VMDK_CHILDREN = {
+    'vmdk-flat-1m': ['extents.0', 'file'],
+    'vmdk-multi-flat': ['extents.2', 'extents.1', 'extents.0', 'file'],
+}
+
+
+def _qemu_version_flag(version: str) -> str:
+    """The `--qemu-version` argument that selects a build's profile."""
+    return '.'.join(version.split('.')[:2])
+
+
+class TestInfoMultiFileVmdk(InstarTestBase):
+    """`info` on a VMDK whose descriptor resolves to separate extent files.
+
+    These compare instar against the static qemu-img builds in
+    instar-testdata directly, rather than against a stored baseline. Both
+    programs read the allocation figures involved off the filesystem as
+    they run, and those figures are not reproducible: git-LFS stores a
+    sparse file's holes as bytes, so a fresh clone's block counts differ
+    from the machine a baseline was generated on. Running the two
+    programs on the same file needs neither a baseline nor the
+    substitution a baseline comparison requires -- which is what lets
+    these cover the multi-extent image, the one shape a flat-descriptor
+    reader gets wrong that monolithicFlat cannot show. See issue #922.
+    """
+
+    def _qemu_img(self, version: str) -> Path:
+        """The pinned qemu-img build for `version`."""
+        binary = (
+            self._testdata_root / 'qemu-img-binaries' / 'x86_64' /
+            version / 'qemu-img'
+        )
+        if not (binary.is_file() and os.access(binary, os.X_OK)):
+            self.skipTest(f'no executable pinned qemu-img build at {binary}')
+        return binary
+
+    def _image_path(self, image_id: str) -> Path:
+        """The resolved path of a manifest image, skipping if it is absent."""
+        image = self.get_image(image_id)
+        if not image.path.exists():
+            self.skipTest(f'Image file not found: {image.path}')
+        # instar canonicalises the path it reports and qemu-img echoes
+        # the one it was given, so both are given a resolved path.
+        return image.path.resolve()
+
+    def _qemu_info(self, version: str, image_path: Path,
+                   output_format: Optional[str] = None) -> str:
+        """`qemu-img info` from the pinned build, as text."""
+        cmd = [str(self._qemu_img(version)), 'info']
+        if output_format:
+            cmd.extend(['--output', output_format])
+        cmd.append(str(image_path))
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        self.assertEqual(
+            0, result.returncode,
+            f'qemu-img {version} info failed: {result.stderr}'
+        )
+        return result.stdout
+
+    def _instar_info(self, version: str, image_path: Path,
+                     output_format: Optional[str] = None) -> str:
+        """`instar info` emulating `version`, as text."""
+        stdout, stderr, rc = self.run_instar_info(
+            image_path,
+            qemu_version=_qemu_version_flag(version),
+            output_format=output_format,
+        )
+        self.assertEqual(
+            0, rc,
+            f'instar info --qemu-version {_qemu_version_flag(version)} failed '
+            f'for {image_path}: {stderr}'
+        )
+        return stdout
+
+    def test_human_output_matches_qemu_img(self):
+        """The human text is qemu-img's, byte for byte, at every version."""
+        for version in MULTI_FILE_VMDK_VERSIONS:
+            for image_id in MULTI_FILE_VMDK_CHILDREN:
+                with self.subTest(version=version, image=image_id):
+                    path = self._image_path(image_id)
+                    self.assertEqual(
+                        self._qemu_info(version, path),
+                        self._instar_info(version, path),
+                        f'{image_id}: human info differs from qemu-img {version}'
+                    )
+
+    def test_json_output_matches_qemu_img(self):
+        """The JSON is qemu-img's at every version, key for key.
+
+        Parsed rather than compared as text: the two programs lay out an
+        empty array or object differently, which the baseline comparator
+        normalises the same way by parsing and re-serialising.
+        """
+        for version in MULTI_FILE_VMDK_VERSIONS:
+            for image_id in MULTI_FILE_VMDK_CHILDREN:
+                with self.subTest(version=version, image=image_id):
+                    path = self._image_path(image_id)
+                    self.assertEqual(
+                        json.loads(self._qemu_info(version, path, 'json')),
+                        json.loads(self._instar_info(version, path, 'json')),
+                        f'{image_id}: JSON info differs from qemu-img {version}'
+                    )
+
+    def test_json_children_are_reversed_and_only_from_qemu_8(self):
+        """The children array's order, and the versions that have one.
+
+        qemu walks the extents from last to first and prints the
+        descriptor afterwards, and emits no children array at all below
+        8.0. Asserted apart from the comparison above so that a failure
+        says which of the two is wrong.
+        """
+        for image_id, expected in MULTI_FILE_VMDK_CHILDREN.items():
+            path = self._image_path(image_id)
+            for version in ('6.0.0', '7.2.0'):
+                with self.subTest(version=version, image=image_id):
+                    info = json.loads(self._instar_info(version, path, 'json'))
+                    self.assertNotIn(
+                        'children', info,
+                        f'{image_id}: qemu-img {version} emits no children '
+                        f'array for a multi-file VMDK, so neither may instar'
+                    )
+            for version in ('8.0.0', '10.2.0'):
+                with self.subTest(version=version, image=image_id):
+                    info = json.loads(self._instar_info(version, path, 'json'))
+                    self.assertEqual(
+                        expected,
+                        [child['name'] for child in info['children']],
+                        f'{image_id}: children are in qemu {version}\'s order'
+                    )
+
+    def test_allocation_is_the_sum_over_the_files_the_output_names(self):
+        """The image's allocation sums the descriptor and every extent.
+
+        Each protocol child still reports the allocation of its own file,
+        so the two figures are asserted together: reporting the
+        descriptor's few blocks as the image's allocation understated a
+        fully-written multi-extent image by three orders of magnitude.
+        """
+        for image_id in MULTI_FILE_VMDK_CHILDREN:
+            with self.subTest(image=image_id):
+                path = self._image_path(image_id)
+                info = json.loads(self._instar_info('10.2.0', path, 'json'))
+                for child in info['children']:
+                    self.assertEqual(
+                        get_disk_size(child['info']['filename']),
+                        child['info']['actual-size'],
+                        f'{image_id}: child {child["name"]} must report its '
+                        f'own file\'s allocation'
+                    )
+                self.assertEqual(
+                    sum(child['info']['actual-size']
+                        for child in info['children']),
+                    info['actual-size'],
+                    f'{image_id}: the image\'s allocation is the sum over '
+                    f'the descriptor and every extent'
+                )

@@ -8,6 +8,13 @@ import re
 # Placeholder used in baseline files for the testdata root path
 TESTDATA_ROOT_PLACEHOLDER = '$TESTDATA_ROOT'
 
+# Human-format info output: the lines that name a file, and the disk-size
+# lines whose value is resolved from them.
+_HUMAN_IMAGE_RE = re.compile(r'^image:\s*(.*)$', re.MULTILINE)
+_HUMAN_FILENAME_RE = re.compile(r'^\s*filename:\s*(.*)$', re.MULTILINE)
+_HUMAN_CHILD_NODE_RE = re.compile(r"^Child node '")
+_HUMAN_DISK_SIZE_RE = re.compile(r'^(\s*disk size:\s*).*$')
+
 # Size unit multipliers for parsing human-readable sizes
 SIZE_UNITS = {
     'B': 1,
@@ -136,7 +143,67 @@ def substitute_actual_size(expected_output: str, disk_size: int) -> str:
     return _substitute_human_disk_size(expected_output, disk_size)
 
 
-def _substitute_json_actual_size(data: dict, disk_size: int) -> dict:
+def _iter_named_files(data):
+    """
+    Yield every existing file path a parsed info output names.
+
+    Only 'filename' keys are followed. A backing file is named by
+    'backing-filename' / 'full-backing-filename' and is deliberately not
+    yielded: it is a separate image, and qemu-img does not count it in the
+    allocation it reports for this one.
+
+    Args:
+        data: Parsed JSON data (dict or list)
+
+    Yields:
+        Path strings, with duplicates and non-existent paths left in for
+        the caller to resolve.
+    """
+    if isinstance(data, dict):
+        filename = data.get('filename')
+        if isinstance(filename, str) and os.path.exists(filename):
+            yield filename
+        for value in data.values():
+            if isinstance(value, (dict, list)):
+                yield from _iter_named_files(value)
+    elif isinstance(data, list):
+        for item in data:
+            if isinstance(item, (dict, list)):
+                yield from _iter_named_files(item)
+
+
+def _image_total_disk_size(data, fallback: int) -> int:
+    """
+    Sum the allocations of the distinct files an image's output names.
+
+    An image is usually one file, and then this is that file's allocation
+    and nothing changes. A VMDK descriptor that resolves to separate extent
+    files is several files, and qemu-img reports the image's allocation as
+    the sum over the descriptor and every extent, so the oracle has to sum
+    them too -- resolving the top-level object's own filename would get the
+    descriptor's few blocks and substitute away the very figure a
+    multi-file image is being compared on (issue #922).
+
+    Paths are deduplicated by realpath, because the same file is named more
+    than once: a single-file image appears as both the image and its '/file'
+    protocol child, and each VMDK extent appears as both a child and an
+    entry in the format-specific extents array.
+
+    Args:
+        data: Parsed JSON data for one image
+        fallback: Allocation to use when the output names no existing file
+
+    Returns:
+        Allocation in bytes
+    """
+    paths = {os.path.realpath(path) for path in _iter_named_files(data)}
+    if not paths:
+        return fallback
+    return sum(get_disk_size(path) for path in sorted(paths))
+
+
+def _substitute_json_actual_size(data: dict, disk_size: int,
+                                 top_level: bool = True) -> dict:
     """
     Recursively substitute actual-size values in JSON data.
 
@@ -146,10 +213,17 @@ def _substitute_json_actual_size(data: dict, disk_size: int) -> dict:
     filename fall back to the passed-in disk_size, preserving the
     single-file behaviour used by every other format.
 
+    The outermost object is the image rather than one of its files, so its
+    actual-size is the sum over every file the output names. See
+    _image_total_disk_size.
+
     Args:
         data: Parsed JSON data (dict or list)
         disk_size: Actual disk allocation in bytes (the fallback when
             a dict has no filename of its own)
+        top_level: True while data is an image object rather than one of
+            its children. A list at the top level (info --chain) holds one
+            image per element, so each element stays top-level.
 
     Returns:
         JSON data with actual-size values replaced
@@ -166,17 +240,22 @@ def _substitute_json_actual_size(data: dict, disk_size: int) -> dict:
         filename = data.get('filename')
         if isinstance(filename, str) and os.path.exists(filename):
             effective_size = get_disk_size(filename)
+        if top_level:
+            effective_size = _image_total_disk_size(data, effective_size)
         result = {}
         for key, value in data.items():
             if key == 'actual-size':
                 result[key] = effective_size
             elif isinstance(value, (dict, list)):
-                result[key] = _substitute_json_actual_size(value, disk_size)
+                result[key] = _substitute_json_actual_size(
+                    value, disk_size, top_level=False
+                )
             else:
                 result[key] = value
         return result
     elif isinstance(data, list):
-        return [_substitute_json_actual_size(item, disk_size)
+        return [_substitute_json_actual_size(item, disk_size,
+                                             top_level=top_level)
                 if isinstance(item, (dict, list)) else item
                 for item in data]
     return data
@@ -184,22 +263,86 @@ def _substitute_json_actual_size(data: dict, disk_size: int) -> dict:
 
 def _substitute_human_disk_size(text: str, disk_size: int) -> str:
     """
-    Substitute disk size value in human-readable output.
+    Substitute disk size values in human-readable output.
 
-    Replaces lines like 'disk size: 36 KiB' with the actual disk size.
+    Human output carries the image's own 'disk size' line and, from
+    qemu-img 8.0, one per protocol child node. They are not the same
+    number once an image is more than one file: the image's line is the
+    sum over every file it names, while each child node reports its own
+    file. Substituting one allocation into all of them hid a real
+    divergence on multi-file VMDK (issue #922), so each line is resolved
+    from the path the output names for it.
 
     Args:
         text: Human-readable output text
-        disk_size: Actual disk allocation in bytes
+        disk_size: Actual disk allocation of the image file itself, used
+            where the output names no path that exists
 
     Returns:
-        Text with disk size line replaced
+        Text with disk size lines replaced
     """
-    formatted_size = _format_human_size(disk_size)
-    # Match 'disk size: <value>' pattern, preserving leading whitespace
-    pattern = r'^(\s*disk size:\s*).*$'
-    replacement = rf'\g<1>{formatted_size}'
-    return re.sub(pattern, replacement, text, flags=re.MULTILINE)
+    total_size = _total_human_disk_size(text, disk_size)
+
+    result = []
+    in_child_node = False
+    child_path = None
+    for line in text.split('\n'):
+        if _HUMAN_CHILD_NODE_RE.match(line):
+            in_child_node = True
+            child_path = None
+            result.append(line)
+            continue
+
+        filename_match = _HUMAN_FILENAME_RE.match(line)
+        if filename_match and in_child_node:
+            child_path = filename_match.group(1).strip()
+            result.append(line)
+            continue
+
+        disk_size_match = _HUMAN_DISK_SIZE_RE.match(line)
+        if disk_size_match:
+            if not in_child_node:
+                line_size = total_size
+            elif child_path and os.path.exists(child_path):
+                line_size = get_disk_size(child_path)
+            else:
+                line_size = disk_size
+            result.append(
+                f'{disk_size_match.group(1)}{_format_human_size(line_size)}'
+            )
+            continue
+
+        result.append(line)
+
+    return '\n'.join(result)
+
+
+def _total_human_disk_size(text: str, fallback: int) -> int:
+    """
+    Sum the allocations of the distinct files human output names.
+
+    The image itself is named by the 'image:' line, and every other file
+    it is made of by a 'filename:' line -- the VMDK extents appear in the
+    format-specific extents block even on the qemu versions that print no
+    child nodes. Paths are deduplicated by realpath because the same file
+    is named more than once. A 'backing file:' line is not a 'filename:'
+    line, so a backing image is correctly left out of the sum.
+
+    Args:
+        text: Human-readable output text
+        fallback: Allocation to use when no named path exists
+
+    Returns:
+        Allocation in bytes
+    """
+    named = []
+    for pattern in (_HUMAN_IMAGE_RE, _HUMAN_FILENAME_RE):
+        named.extend(match.group(1).strip()
+                     for match in pattern.finditer(text))
+    paths = {os.path.realpath(path) for path in named if os.path.exists(path)}
+    if not paths:
+        return fallback
+    return sum(get_disk_size(path) for path in sorted(paths))
 
 
 def _parse_human_size(size_str: str) -> int:
