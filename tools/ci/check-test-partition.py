@@ -249,10 +249,15 @@ def parse_makefile_list(makefile_text, target):
 # needs an strace that can inject: a host where it cannot would skip
 # the one test standing between the guest's I/O wait and a regression
 # that fails every slow read, and INSTAR_REQUIRE_STRACE is what turns
-# that into a failure.
+# that into a failure. The LUKS inner-format probe test injects an
+# error rather than a delay, through the same machinery and with the
+# same consequence if it skips: the outcome it guards against is a
+# conversion that exits 0, so a skipped run and a passing run look
+# alike twice over.
 ENV_REQUIRED_BY = (
     ('TestZstdBackingChain', 'INSTAR_REQUIRE_ZSTD'),
     ('TestSlowHostRead', 'INSTAR_REQUIRE_STRACE'),
+    ('TestLuksInnerFormatProbeReadFailure', 'INSTAR_REQUIRE_STRACE'),
 )
 
 

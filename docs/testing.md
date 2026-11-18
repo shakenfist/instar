@@ -481,6 +481,37 @@ the `integration-core` job does because the devcontainer installs
 strace -- dropping the package turns that job red rather than quietly
 green.
 
+The probe, and the parser that reads an injection back out of a trace,
+live in `tests/strace_injection.py` because the test below shares
+them.
+
+### Failed Host Read Tests (`test_luks_probe_read_failure.py`)
+
+The sibling of the test above, and the same machinery pointed the
+other way: `strace -e inject=read:error=EIO:when=N` fails one host
+read instead of delaying it. What it guards is `convert`'s choice
+between a LUKS container's two payload shapes, which it makes by
+reading the first payload sector and looking for QCOW2 magic. A read
+failure there must not read as "no inner format", because the
+conversion would then write a decrypted QCOW2 out as a flat payload
+and exit 0.
+
+Two differences from the slow-read test matter if you change either.
+
+**The index is derived from an offset, not from a thread's busiest
+stretch.** strace is run with `-P` on the image path, so only reads of
+the image are traced -- and therefore counted by `when=`, which keeps
+instar's own binaries and the eventfd queue notifications out of the
+numbering. The test reads the payload offset out of the fixture's own
+LUKS v1 header and injects into the first read of that offset, which
+is the probe's.
+
+**One read must fail where the next identical read succeeds.** The
+flat payload path re-reads the sector the probe read, and treats a
+failure there as fatal, so a hard error on every read of that offset
+is reported correctly and proves nothing. `when=N` failing exactly one
+invocation is what reproduces the transient failure the defect needed.
+
 ## Running Tests
 
 ### Make Targets

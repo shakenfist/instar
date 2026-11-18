@@ -785,9 +785,23 @@ unsafe fn convert_native_luks(
     {
         let buf = layout.buf_data as *mut u8;
         let payload_sector = payload_byte_offset / sector_size as u64;
-        if payload_sector < input_capacity
-            && (call_table.read_input_sector)(0, payload_sector, buf, sector_size)
-        {
+        // A payload sector past the end of the device is a legitimate
+        // negative result: there is nothing to probe, so there is no
+        // inner format. A failed read of a sector that does exist is
+        // an error, and must not be reported as "no inner format" --
+        // that would convert a LUKS-wrapped QCOW2 as a flat payload.
+        if payload_sector < input_capacity {
+            if !(call_table.read_input_sector)(0, payload_sector, buf, sector_size) {
+                (call_table.send_error)(
+                    shared::IoFailure::OPERATION_C.as_ptr(),
+                    b"input\0".as_ptr(),
+                    payload_sector,
+                    0,
+                );
+                (call_table.send_complete)(b"convert\0".as_ptr(), bytes_read, false);
+                return bytes_read;
+            }
+
             let offset_in_sector = (payload_byte_offset % sector_size as u64) as usize;
             // Decrypt the sector to inspect the inner header
             qcow2::decrypt_cluster_aes_xts(
