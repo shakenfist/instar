@@ -2350,6 +2350,79 @@ fn should_emit_encrypted_line(info: &guest_::InfoResultMessage) -> bool {
     info.flags & INFO_RESULT_FLAG_ENCRYPTED != 0 && info.format != "luks"
 }
 
+/// The allocation of one file, as qemu-img's `actual-size` (JSON) and
+/// `disk size` (human) report it: `st_blocks * 512`, so a sparse file
+/// counts only the blocks it really holds. `apparent` asks for the file's
+/// length instead, which is what `--ignore-quirks` substitutes everywhere
+/// else a disk size is printed. Returns None when the file cannot be
+/// stat'd, leaving the fallback to the caller.
+fn file_disk_size(path: &Path, apparent: bool) -> Option<u64> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if apparent {
+        return Some(metadata.len());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(metadata.blocks() * 512)
+    }
+    #[cfg(not(unix))]
+    {
+        Some(metadata.len())
+    }
+}
+
+/// The allocation figures one `info` rendering needs.
+///
+/// A VMDK descriptor that resolves to separate extent files is several
+/// files on disk — monolithicFlat as much as the twoGbMaxExtent* split
+/// subformats — and qemu-img reports the image's allocation as the sum
+/// over the descriptor and every extent, while each protocol child still
+/// reports the allocation of its own file. Those figures cannot be derived
+/// from one number, so they are measured together here rather than at each
+/// print site, which is how the sum came to be missing (issue #922).
+struct InfoDiskSizes {
+    /// The input file's own allocation: the `/file` child's figure, and
+    /// the whole image's for every single-file format.
+    descriptor: u64,
+    /// Each resolved flat extent's own allocation, in descriptor order.
+    /// Empty for an image that is a single file.
+    extents: Vec<u64>,
+    /// The image's allocation: the descriptor plus every extent.
+    total: u64,
+}
+
+impl InfoDiskSizes {
+    /// Measure `vmdk_flat`'s extents, if any, beside the already computed
+    /// `descriptor` allocation. An extent that cannot be stat'd falls back
+    /// to its declared size.
+    fn new(
+        descriptor: u64,
+        vmdk_flat: Option<&crate::chain::ResolvedVmdkDescriptor>,
+        apparent: bool,
+    ) -> Self {
+        let extents: Vec<u64> = vmdk_flat
+            .map(|resolved| {
+                resolved
+                    .flat_extents
+                    .iter()
+                    .map(|extent| {
+                        file_disk_size(&extent.flat_path, apparent).unwrap_or(extent.extent_size)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let total = extents
+            .iter()
+            .fold(descriptor, |acc, size| acc.saturating_add(*size));
+        Self {
+            descriptor,
+            extents,
+            total,
+        }
+    }
+}
+
 /// Print InfoResult in qemu-img compatible format
 #[allow(clippy::too_many_arguments)]
 fn print_info_result(
@@ -2379,6 +2452,10 @@ fn print_info_result(
             // st_blocks is in 512-byte units
             disk_blocks * 512
         };
+        // The input file's allocation is the whole image's only when the
+        // image is one file. A resolved VMDK descriptor names extents that
+        // carry the data, and they count towards the image's allocation.
+        let disk_sizes = InfoDiskSizes::new(disk_size, vmdk_flat, ignore_quirks);
 
         if output_format == "json" {
             // For child file length, qemu-img reports the larger of:
@@ -2396,7 +2473,7 @@ fn print_info_result(
                 info,
                 &abs_path,
                 child_file_length,
-                disk_size,
+                &disk_sizes,
                 extra_detail,
                 profile,
                 vmdk_flat,
@@ -2435,15 +2512,12 @@ fn print_info_result(
 
         // Line 4: disk size
         // qemu-img reports disk size based on st_blocks (actual disk blocks used),
-        // which accounts for sparse files. st_blocks is in 512-byte units.
-        // With --ignore-quirks, use the actual file size.
-        let disk_size = if ignore_quirks {
-            file_size
-        } else {
-            // st_blocks is in 512-byte units
-            disk_blocks * 512
-        };
-        println!("disk size: {}", format_size_human(disk_size, qemu_compat));
+        // which accounts for sparse files, and for an image made of several
+        // files it reports the sum over all of them.
+        println!(
+            "disk size: {}",
+            format_size_human(disk_sizes.total, qemu_compat)
+        );
 
         // Encrypted line: qemu-img prints "encrypted: yes" between the
         // disk-size and cluster_size lines when the image declares
@@ -2628,14 +2702,15 @@ fn print_info_result(
             // VMDK monolithicFlat / twoGbMaxExtentFlat images expose one
             // '/extents.N' protocol child per resolved flat extent,
             // ahead of the descriptor's own '/file' child. This mirrors
-            // the JSON children rendering. The extent's "file length" is
-            // its declared virtual size (matching qemu-img, which opens
-            // the flat file as a raw protocol node); the "disk size"
-            // line is substituted from the filesystem at test time, so
-            // we report the descriptor's disk size like every other
-            // disk-size line here.
+            // the JSON children rendering, including the order: qemu-img
+            // walks the extents from last to first, keeping each one's
+            // own index, and prints the descriptor afterwards. The
+            // extent's "file length" is its declared virtual size
+            // (matching qemu-img, which opens the flat file as a raw
+            // protocol node), and its "disk size" is that extent file's
+            // own allocation, not the descriptor's.
             if let Some(resolved) = vmdk_flat {
-                for (i, extent) in resolved.flat_extents.iter().enumerate() {
+                for (i, extent) in resolved.flat_extents.iter().enumerate().rev() {
                     println!("Child node '/extents.{i}':");
                     println!("    filename: {}", terminal_safe_path(&extent.flat_path));
                     println!("    protocol type: file");
@@ -2646,7 +2721,7 @@ fn print_info_result(
                     );
                     println!(
                         "    disk size: {}",
-                        format_size_human(disk_size, qemu_compat)
+                        format_size_human(disk_sizes.extents[i], qemu_compat)
                     );
                 }
             }
@@ -2692,7 +2767,7 @@ fn print_info_result(
             );
             println!(
                 "    disk size: {}",
-                format_size_human(disk_size, qemu_compat)
+                format_size_human(disk_sizes.descriptor, qemu_compat)
             );
         }
     }
@@ -2703,7 +2778,7 @@ fn print_info_result_json(
     info: &guest_::InfoResultMessage,
     abs_path: &str,
     child_file_length: u64,
-    disk_size: u64,
+    disk_sizes: &InfoDiskSizes,
     extra_detail: bool,
     profile: &version::OutputProfile,
     vmdk_flat: Option<&crate::chain::ResolvedVmdkDescriptor>,
@@ -2751,33 +2826,26 @@ fn print_info_result_json(
     let has_backing_file =
         info.flags & INFO_RESULT_FLAG_HAS_BACKING_FILE != 0 && !info.backing_file.is_empty();
 
-    // Children section (qemu-img 8.0+ generally).
+    // Children section (qemu-img 8.0+ only).
     //
-    // VMDK monolithicFlat (and twoGbMaxExtentFlat in future) is the
-    // exception — qemu-img has emitted per-extent children for these
-    // images since at least 6.0 because they genuinely are multi-file
-    // images. Emit children whenever we have resolved flat extents,
-    // regardless of profile. The descriptor's virtual-size is rounded
-    // up to the 512-byte sector boundary (qemu treats it as an
-    // unstructured file). See bug #286 PR follow-up.
-    if profile.include_child_node || vmdk_flat.is_some() {
+    // A VMDK whose descriptor resolves to separate extent files gets one
+    // '/extents.N' child per extent ahead of the descriptor's own 'file'
+    // child, because it genuinely is a multi-file image. qemu-img walks
+    // those extents from last to first, keeping each one's own index, so
+    // the array reads extents.N-1 … extents.0, file; this was measured on
+    // every static qemu build from 6.0.0 to 10.2.0, which puts the array's
+    // first appearance at 8.0.0 — exactly where include_child_node turns
+    // on — and the reversal identically on all 50 builds above it. The
+    // separate format-specific extents array stays in descriptor order,
+    // because qemu-img keeps it that way. The descriptor's virtual-size is
+    // rounded up to the 512-byte sector boundary (qemu treats it as an
+    // unstructured file). See issue #922.
+    if profile.include_child_node {
         println!("    \"children\": [");
         let mut emitted_any_child = false;
         if let Some(resolved) = vmdk_flat {
-            for (i, extent) in resolved.flat_extents.iter().enumerate() {
-                let extent_disk = std::fs::metadata(&extent.flat_path)
-                    .map(|m| {
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::fs::MetadataExt;
-                            m.blocks() * 512
-                        }
-                        #[cfg(not(unix))]
-                        {
-                            m.len()
-                        }
-                    })
-                    .unwrap_or(extent.extent_size);
+            for (i, extent) in resolved.flat_extents.iter().enumerate().rev() {
+                let extent_disk = disk_sizes.extents[i];
                 let extent_path = extent.flat_path.to_string_lossy();
                 if emitted_any_child {
                     println!("        }},");
@@ -2823,7 +2891,10 @@ fn print_info_result_json(
             json_escape(abs_path)
         );
         println!("                \"format\": \"file\",");
-        println!("                \"actual-size\": {disk_size},");
+        println!(
+            "                \"actual-size\": {},",
+            disk_sizes.descriptor
+        );
         println!("                \"format-specific\": {{");
         println!("                    \"type\": \"file\",");
         println!("                    \"data\": {{}}");
@@ -2890,9 +2961,9 @@ fn print_info_result_json(
         "parallels" | "bochs" | "cloop" | "dmg"
     );
     if emit_dirty_flag {
-        println!("    \"actual-size\": {disk_size},");
+        println!("    \"actual-size\": {},", disk_sizes.total);
     } else {
-        println!("    \"actual-size\": {disk_size}");
+        println!("    \"actual-size\": {}", disk_sizes.total);
     }
 
     // Encrypted key: qemu-img emits "encrypted": true immediately after
