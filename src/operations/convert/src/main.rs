@@ -856,7 +856,12 @@ unsafe fn convert_native_luks(
             core::ptr::write_bytes(buf, 0, this_chunk as usize);
         } else {
             if !(call_table.read_input_sector)(0, read_sector, buf, sector_size) {
-                (call_table.send_error)(b"convert\0".as_ptr(), b"input\0".as_ptr(), read_sector, 1);
+                (call_table.send_error)(
+                    shared::IoFailure::OPERATION_C.as_ptr(),
+                    b"input\0".as_ptr(),
+                    read_sector,
+                    0,
+                );
                 (call_table.send_complete)(b"convert\0".as_ptr(), bytes_read, false);
                 return bytes_read;
             }
@@ -913,10 +918,10 @@ unsafe fn convert_native_luks(
                     write_len as usize,
                 ) {
                     (call_table.send_error)(
-                        b"convert\0".as_ptr(),
+                        shared::IoFailure::OPERATION_C.as_ptr(),
                         b"output\0".as_ptr(),
                         output_first_sector + s,
-                        1,
+                        0,
                     );
                     (call_table.send_complete)(b"convert\0".as_ptr(), bytes_read, false);
                     return bytes_read;
@@ -1745,10 +1750,10 @@ unsafe fn convert_to_raw(
             bytes_read,
         ) {
             (call_table.send_error)(
-                b"convert\0".as_ptr(),
+                shared::IoFailure::OPERATION_C.as_ptr(),
                 b"input\0".as_ptr(),
                 virtual_offset / sector_size as u64,
-                1,
+                0,
             );
             (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
             return *bytes_read;
@@ -1837,10 +1842,10 @@ unsafe fn convert_to_raw(
             if !(call_table.write_output_sector)(output_sector, buf.add(offset), output_sector_size)
             {
                 (call_table.send_error)(
-                    b"convert\0".as_ptr(),
+                    shared::IoFailure::OPERATION_C.as_ptr(),
                     b"output\0".as_ptr(),
                     output_sector,
-                    2,
+                    0,
                 );
                 (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
                 return *bytes_read;
@@ -2525,10 +2530,10 @@ unsafe fn convert_to_qcow2(
                     bytes_read,
                 ) {
                     (call_table.send_error)(
-                        b"convert\0".as_ptr(),
+                        shared::IoFailure::OPERATION_C.as_ptr(),
                         b"input\0".as_ptr(),
                         (read_start + virtual_offset + buf_filled_q) / sector_size as u64,
-                        1,
+                        0,
                     );
                     (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
                     return *bytes_read;
@@ -2608,10 +2613,10 @@ unsafe fn convert_to_qcow2(
                 layout.output_capacity,
             ) {
                 (call_table.send_error)(
-                    b"convert\0".as_ptr(),
+                    shared::IoFailure::OPERATION_C.as_ptr(),
                     b"output\0".as_ptr(),
                     data_offset / layout.output_sector_size as u64,
-                    2,
+                    0,
                 );
                 (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
                 return *bytes_read;
@@ -2652,10 +2657,10 @@ unsafe fn convert_to_qcow2(
                 layout.output_capacity,
             ) {
                 (call_table.send_error)(
-                    b"convert\0".as_ptr(),
+                    shared::IoFailure::OPERATION_C.as_ptr(),
                     b"output\0".as_ptr(),
                     l2_offset / layout.output_sector_size as u64,
-                    2,
+                    0,
                 );
                 (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
                 return *bytes_read;
@@ -2908,10 +2913,10 @@ unsafe fn convert_to_qcow2_compressed(
                     bytes_read,
                 ) {
                     (call_table.send_error)(
-                        b"convert\0".as_ptr(),
+                        shared::IoFailure::OPERATION_C.as_ptr(),
                         b"input\0".as_ptr(),
                         (read_start + virtual_offset + buf_filled) / sector_size as u64,
-                        1,
+                        0,
                     );
                     (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
                     return *bytes_read;
@@ -2988,10 +2993,10 @@ unsafe fn convert_to_qcow2_compressed(
                     layout.output_capacity,
                 ) {
                     (call_table.send_error)(
-                        b"convert\0".as_ptr(),
+                        shared::IoFailure::OPERATION_C.as_ptr(),
                         b"output\0".as_ptr(),
                         write_pos / layout.output_sector_size as u64,
-                        2,
+                        0,
                     );
                     (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
                     return *bytes_read;
@@ -3031,10 +3036,10 @@ unsafe fn convert_to_qcow2_compressed(
                     layout.output_capacity,
                 ) {
                     (call_table.send_error)(
-                        b"convert\0".as_ptr(),
+                        shared::IoFailure::OPERATION_C.as_ptr(),
                         b"output\0".as_ptr(),
                         write_pos / layout.output_sector_size as u64,
-                        2,
+                        0,
                     );
                     (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
                     return *bytes_read;
@@ -3085,10 +3090,10 @@ unsafe fn convert_to_qcow2_compressed(
                 layout.output_capacity,
             ) {
                 (call_table.send_error)(
-                    b"convert\0".as_ptr(),
+                    shared::IoFailure::OPERATION_C.as_ptr(),
                     b"output\0".as_ptr(),
                     write_pos / layout.output_sector_size as u64,
-                    2,
+                    0,
                 );
                 (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
                 return *bytes_read;
@@ -3338,10 +3343,10 @@ unsafe fn convert_to_vmdk(
                 )
             {
                 (call_table.send_error)(
-                    b"convert\0".as_ptr(),
+                    shared::IoFailure::OPERATION_C.as_ptr(),
                     b"input\0".as_ptr(),
                     input_offset / sector_size as u64,
-                    1,
+                    0,
                 );
                 (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
                 return *bytes_read;
@@ -3401,10 +3406,10 @@ unsafe fn convert_to_vmdk(
                 oc,
             ) {
                 (call_table.send_error)(
-                    b"convert\0".as_ptr(),
+                    shared::IoFailure::OPERATION_C.as_ptr(),
                     b"output\0".as_ptr(),
                     grain_byte_offset / oss as u64,
-                    2,
+                    0,
                 );
                 (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
                 return *bytes_read;
@@ -3434,10 +3439,10 @@ unsafe fn convert_to_vmdk(
             let gt_write_bytes = align_up(layout.gt_bytes, oss);
             if !write_bytes_to_output(call_table, buf_gt, gt_byte_offset, gt_write_bytes, oss, oc) {
                 (call_table.send_error)(
-                    b"convert\0".as_ptr(),
+                    shared::IoFailure::OPERATION_C.as_ptr(),
                     b"output\0".as_ptr(),
                     gt_byte_offset / oss as u64,
-                    2,
+                    0,
                 );
                 (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
                 return *bytes_read;
@@ -3641,10 +3646,10 @@ unsafe fn convert_to_vmdk_compressed(
                 )
             {
                 (call_table.send_error)(
-                    b"convert\0".as_ptr(),
+                    shared::IoFailure::OPERATION_C.as_ptr(),
                     b"input\0".as_ptr(),
                     input_offset / sector_size as u64,
-                    1,
+                    0,
                 );
                 (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
                 return *bytes_read;
@@ -3719,10 +3724,10 @@ unsafe fn convert_to_vmdk_compressed(
             // Write marker + compressed data to output
             if !write_bytes_to_output(call_table, buf_staging, write_pos, padded, oss, oc) {
                 (call_table.send_error)(
-                    b"convert\0".as_ptr(),
+                    shared::IoFailure::OPERATION_C.as_ptr(),
                     b"output\0".as_ptr(),
                     write_pos / oss as u64,
-                    2,
+                    0,
                 );
                 (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
                 return *bytes_read;
@@ -4030,7 +4035,12 @@ unsafe fn convert_to_vhd(
         oss,
         oc,
     ) {
-        (call_table.send_error)(b"convert\0".as_ptr(), b"output\0".as_ptr(), 0, 2);
+        (call_table.send_error)(
+            shared::IoFailure::OPERATION_C.as_ptr(),
+            b"output\0".as_ptr(),
+            0,
+            0,
+        );
         (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
         return *bytes_read;
     }
@@ -4048,10 +4058,10 @@ unsafe fn convert_to_vhd(
         oc,
     ) {
         (call_table.send_error)(
-            b"convert\0".as_ptr(),
+            shared::IoFailure::OPERATION_C.as_ptr(),
             b"output\0".as_ptr(),
             dyn_header_offset / oss as u64,
-            2,
+            0,
         );
         (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
         return *bytes_read;
@@ -4146,10 +4156,10 @@ unsafe fn convert_to_vhd(
                 bytes_read,
             ) {
                 (call_table.send_error)(
-                    b"convert\0".as_ptr(),
+                    shared::IoFailure::OPERATION_C.as_ptr(),
                     b"input\0".as_ptr(),
                     (read_start + virtual_offset + intra_offset) / sector_size as u64,
-                    1,
+                    0,
                 );
                 (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
                 return *bytes_read;
@@ -4261,10 +4271,10 @@ unsafe fn convert_to_vhd(
                     bytes_read,
                 ) {
                     (call_table.send_error)(
-                        b"convert\0".as_ptr(),
+                        shared::IoFailure::OPERATION_C.as_ptr(),
                         b"input\0".as_ptr(),
                         (read_start + virtual_offset + vdata_read) / sector_size as u64,
-                        1,
+                        0,
                     );
                     (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
                     return *bytes_read;
@@ -4289,10 +4299,10 @@ unsafe fn convert_to_vhd(
             // Write full sector (unused bytes are already zeroed)
             if !write_bytes_to_output(call_table, buf_data, write_offset, chunk_size, oss, oc) {
                 (call_table.send_error)(
-                    b"convert\0".as_ptr(),
+                    shared::IoFailure::OPERATION_C.as_ptr(),
                     b"output\0".as_ptr(),
                     write_offset / oss as u64,
-                    2,
+                    0,
                 );
                 (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
                 return *bytes_read;
@@ -4515,7 +4525,12 @@ unsafe fn convert_to_vhdx(
         oss,
         oc,
     ) {
-        (call_table.send_error)(b"convert\0".as_ptr(), b"output\0".as_ptr(), 0, 2);
+        (call_table.send_error)(
+            shared::IoFailure::OPERATION_C.as_ptr(),
+            b"output\0".as_ptr(),
+            0,
+            0,
+        );
         (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
         return *bytes_read;
     }
@@ -4534,10 +4549,10 @@ unsafe fn convert_to_vhdx(
         oc,
     ) {
         (call_table.send_error)(
-            b"convert\0".as_ptr(),
+            shared::IoFailure::OPERATION_C.as_ptr(),
             b"output\0".as_ptr(),
             vhdx::HEADER1_OFFSET / oss as u64,
-            2,
+            0,
         );
         (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
         return *bytes_read;
@@ -4556,10 +4571,10 @@ unsafe fn convert_to_vhdx(
         oc,
     ) {
         (call_table.send_error)(
-            b"convert\0".as_ptr(),
+            shared::IoFailure::OPERATION_C.as_ptr(),
             b"output\0".as_ptr(),
             vhdx::HEADER2_OFFSET / oss as u64,
-            2,
+            0,
         );
         (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
         return *bytes_read;
@@ -4748,10 +4763,10 @@ unsafe fn convert_to_vhdx(
                 bytes_read,
             ) {
                 (call_table.send_error)(
-                    b"convert\0".as_ptr(),
+                    shared::IoFailure::OPERATION_C.as_ptr(),
                     b"input\0".as_ptr(),
                     (read_start + virtual_offset + intra_offset) / sector_size as u64,
-                    1,
+                    0,
                 );
                 (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
                 return *bytes_read;
@@ -4817,10 +4832,10 @@ unsafe fn convert_to_vhdx(
                 bytes_read,
             ) {
                 (call_table.send_error)(
-                    b"convert\0".as_ptr(),
+                    shared::IoFailure::OPERATION_C.as_ptr(),
                     b"input\0".as_ptr(),
                     (read_start + virtual_offset + intra_offset) / sector_size as u64,
-                    1,
+                    0,
                 );
                 (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
                 return *bytes_read;
@@ -4844,10 +4859,10 @@ unsafe fn convert_to_vhdx(
                 oc,
             ) {
                 (call_table.send_error)(
-                    b"convert\0".as_ptr(),
+                    shared::IoFailure::OPERATION_C.as_ptr(),
                     b"output\0".as_ptr(),
                     (block_file_offset + intra_offset) / oss as u64,
-                    2,
+                    0,
                 );
                 (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
                 return *bytes_read;
@@ -5069,7 +5084,12 @@ unsafe fn convert_to_vhdx_fixed(
     let fi_slice = core::slice::from_raw_parts_mut(buf_hdr, MAX_SECTOR_SIZE);
     vhdx::build_file_identifier(fi_slice);
     if !write_bytes_to_output(call_table, buf_hdr, 0, MAX_SECTOR_SIZE as u64, oss, oc) {
-        (call_table.send_error)(b"convert\0".as_ptr(), b"output\0".as_ptr(), 0, 2);
+        (call_table.send_error)(
+            shared::IoFailure::OPERATION_C.as_ptr(),
+            b"output\0".as_ptr(),
+            0,
+            0,
+        );
         (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
         return *bytes_read;
     }
@@ -5086,10 +5106,10 @@ unsafe fn convert_to_vhdx_fixed(
         oc,
     ) {
         (call_table.send_error)(
-            b"convert\0".as_ptr(),
+            shared::IoFailure::OPERATION_C.as_ptr(),
             b"output\0".as_ptr(),
             vhdx::HEADER1_OFFSET / oss as u64,
-            2,
+            0,
         );
         (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
         return *bytes_read;
@@ -5107,10 +5127,10 @@ unsafe fn convert_to_vhdx_fixed(
         oc,
     ) {
         (call_table.send_error)(
-            b"convert\0".as_ptr(),
+            shared::IoFailure::OPERATION_C.as_ptr(),
             b"output\0".as_ptr(),
             vhdx::HEADER2_OFFSET / oss as u64,
-            2,
+            0,
         );
         (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
         return *bytes_read;
@@ -5287,10 +5307,10 @@ unsafe fn convert_to_vhdx_fixed(
                 bytes_read,
             ) {
                 (call_table.send_error)(
-                    b"convert\0".as_ptr(),
+                    shared::IoFailure::OPERATION_C.as_ptr(),
                     b"input\0".as_ptr(),
                     (read_start + virtual_offset + intra_offset) / sector_size as u64,
-                    1,
+                    0,
                 );
                 (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
                 return *bytes_read;
@@ -5335,10 +5355,10 @@ unsafe fn convert_to_vhdx_fixed(
                     bytes_read,
                 ) {
                     (call_table.send_error)(
-                        b"convert\0".as_ptr(),
+                        shared::IoFailure::OPERATION_C.as_ptr(),
                         b"input\0".as_ptr(),
                         (read_start + virtual_offset + intra_offset) / sector_size as u64,
-                        1,
+                        0,
                     );
                     (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
                     return *bytes_read;
@@ -5361,10 +5381,10 @@ unsafe fn convert_to_vhdx_fixed(
                     oc,
                 ) {
                     (call_table.send_error)(
-                        b"convert\0".as_ptr(),
+                        shared::IoFailure::OPERATION_C.as_ptr(),
                         b"output\0".as_ptr(),
                         (block_file_offset + intra_offset) / oss as u64,
-                        2,
+                        0,
                     );
                     (call_table.send_complete)(b"convert\0".as_ptr(), *bytes_read, false);
                     return *bytes_read;

@@ -257,6 +257,115 @@ One commit per step, with the subject given in the brief.
 | 1f | medium | opus | none | **The LUKS inner-format probe (#926).** In `src/operations/convert/src/main.rs`, the LUKS path's inner-format detection reads the first payload sector inside an `if` whose condition `&&`-chains `(call_table.read_input_sector)(...)`, so a failed read skips the QCOW2 magic check and falls through to the flat LUKS path. Make the failed read an error: report it through `shared::IoFailure` and fail the operation the way the main read loop below it already does (`send_error` then `send_complete(..., false)`), rather than continuing with an undetected inner format. Read the survey section of this plan first -- the reason this matters is that the main loop re-reads *the same sector* and treats a failure as fatal, so the only way to reach the bad outcome is a read that fails once and succeeds on retry, and the output is then a decrypted qcow2 written out as a flat image at exit 0. The commit message must carry that reasoning, because the diff alone looks like a redundant check. Do not reference this plan. If there is an existing LUKS-wrapped-qcow2 fixture in `tests/manifest.json`, add a test that the probe's failure path fails the operation rather than converting wrongly; if there is not, say so and record it in Future work rather than building a fixture here. Commit subject: `Fail convert when the LUKS inner-format probe cannot read.` |
 | 1g | low | sonnet | none | **Close the phase.** Fold this phase's findings back into `PLAN-http-input.md`: record in the Bugs-fixed section what #923 and #924 turned out to be, and add to Future work the two things this phase deliberately left: the VMM installing no logger without `--verbose` (worth its own issue), and #849. Confirm `git diff origin/develop...HEAD -- src/ docs/ tests/ \| grep -nE 'PLAN-\|[Pp]hase [0-9]\|step 1[a-g]'` prints nothing: no plan, phase or step references in landed code, docs or tests. Confirm `docs/guest-architecture.md`'s statement that call-table I/O is synchronous is now true without qualification, and if it needs a sentence to say the wait is unbounded, add it there -- that file is the summary-and-index for the guest, so keep it to a sentence. Do not change the Execution table's status; the next phase's first commit closes this one out. Commit subject: `Record phase 1's findings in the master plan.` |
 
+## Step 1d: the I/O error sites
+
+**The population is larger than the step brief says, and the
+correction matters.** "13 sites" was counted with a grep that only
+sees a `send_error` written on a single source line. Twelve of those
+thirteen are calls (the thirteenth is a doc comment in `measure`), but
+the operations raise 37 more from calls rustfmt has broken across
+lines, which that grep cannot see. The real population of
+I/O-shaped `send_error` calls is 49, across six operations, and
+`convert` holds 33 of them rather than four. The four single-line
+`convert` sites are a LUKS payload read and three VHD/VHDX header
+writes; none of them is the site an ordinary failed input read
+reaches, which is `convert_to_raw`'s chain-read failure for raw
+output and the matching site in each other writer. Converting only
+those four would have left the common case rendering the generic
+text.
+
+### The twelve single-line sites
+
+| Operation | Function | Passes | What raises it | What the host does today | Verdict |
+|---|---|---|---|---|---|
+| copy | `_start` | `"copy"`, `"input"`, 0, 1 | input sector size not a power of two in 512..=64K | nothing: `run_copy` breaks on HLT, logs its "completed successfully" line at debug level and returns `Ok(())` | Not I/O. Left: this is a configuration refusal, not a failed request |
+| copy | `_start` | `"copy"`, `"output"`, 0, 2 | output sector size likewise | as above | Not I/O. Left |
+| copy | `_start` | `"copy"`, `"input"`, `input_sector`, 1 | `read_input_sector` returned false | as above: exit 0, no message, short output | I/O, and the host drops it entirely -- but the host side is a missing failure, not a vague message, and this phase may not touch `src/vmm/`. Left; see finding 1 |
+| copy | `_start` | `"copy"`, `"output"`, `output_sector`, 2 | `write_output_sector` returned false | as above | I/O. Left, same reason |
+| check | `_start` | `"check"`, `"input"`, 0, 1 | sector size out of range | `Err("image check failed: no result received")` | Not I/O. Left |
+| check | `_start` | `"check"`, `"input"`, 0, 1 | header `read_input_sector` returned false | `Err("image check failed: no result received")` -- a sentence that says what happened, and nothing step 1e renders | I/O, but converting it changes no host output while the decoder ignores the marker. Left |
+| convert | `convert_native_luks` | `"convert"`, `"input"`, `read_sector`, 1 | `read_input_sector` returned false | `Err("convert operation failed")` | Converted |
+| convert | `convert_to_vhd` | `"convert"`, `"output"`, 0, 2 | footer-copy `write_bytes_to_output` returned false | `Err("convert operation failed")` | Converted |
+| convert | `convert_to_vhdx` | `"convert"`, `"output"`, 0, 2 | file-identifier write returned false | `Err("convert operation failed")` | Converted |
+| convert | `convert_to_vhdx_fixed` | `"convert"`, `"output"`, 0, 2 | file-identifier write returned false | `Err("convert operation failed")` | Converted |
+| info | `_start` | `"info"`, `"input"`, 0, 1 | sector size out of range | `info_without_a_result`: "No info result received from guest" | Not I/O. Left |
+| info | `_start` | `"info"`, `"input"`, 0, 1 | header `read_input_sector` returned false | same sentence | I/O, not rendered by step 1e. Left |
+
+### The rest of the population, by operation
+
+| Operation | Sites | What raises them | What the host does today | Verdict |
+|---|---|---|---|---|
+| convert | 29 further sites, in `convert_to_raw`, `convert_to_qcow2`, `convert_to_qcow2_compressed`, `convert_to_vmdk`, `convert_to_vmdk_compressed`, `convert_to_vhd`, `convert_to_vhdx`, `convert_to_vhdx_fixed` and `convert_native_luks` | a false return from `read_input_sector`, `write_output_sector`, `write_bytes_to_output`, `write_cluster_to_output` or `qcow2::read_chain_virtual_cluster` | `Err("convert operation failed")` -- the only generic failure string in the VMM, as the survey said | Converted, all 29 |
+| convert | 2 sites in `convert_to_vhdx` and `convert_to_vhdx_fixed` | `vhdx::layout` rejected the geometry; the device argument carries a reason string, not a device | `Err("convert operation failed")` | Not I/O. Left: the device field is already a human reason, and a marker would discard it |
+| copy | 2 further sites in `_start` | read and write failures in the many-to-one and one-to-many sector paths | nothing, as above | I/O. Left with the other two copy sites |
+| bench | 3 sites in `run_qcow2_write` and `_start`, device `"read"` / `"write"` | a false return from the chain reader or a write | each is followed by `fail(..., ERROR_IO_READ` or `ERROR_IO_WRITE, ...)`, so the result struct carries the reason and `map_bench_error` renders it by name | Adequate. Left |
+| compare | 3 sites in `_start`, device `"input0"` / `"input1"` | a false return from the chain reader | `CompareResult::read_failed` carries the image and the offset, and `compare_failure_error` renders "compare: reading the second image, ref.raw, failed at virtual offset N (0xN); the images were not compared" -- the wording step 1e copies | Adequate. Left |
+| check, info, measure | the refusal sites (`DifferencingRefusal`, `VhdFooterChecksumRefusal`) | a named refusal, not I/O | captured and rendered by name already | Not I/O. Left |
+| every operation | the `panic` sites, device = the operation name, status `0xDEAD` | a guest panic | rendered through the panic path | Not I/O. Left |
+
+So the survey's claim holds: `convert` is the only operation whose
+host side answers an I/O failure with a generic string. `copy` is
+worse in a different way, and `check` and `info` answer with a
+sentence that says no result arrived. Converting a site whose host
+side does not capture the marker would change nothing a user sees,
+and step 1e renders only `convert` and `dd`, so everything outside
+`convert` is left as it is.
+
+### Findings
+
+1. **`copy` reports a failed read as success.** Every `send_error`
+   path in `copy` returns early, skipping the
+   `send_complete(..., true)` at the end of its run, and `run_copy`
+   neither requires a completion nor inspects one: it breaks on HLT,
+   logs "Copy operation completed successfully!" at debug level and
+   returns `Ok(())`. A `copy` whose input read fails therefore exits
+   0, prints nothing, and leaves a short output. That is a
+   success-shaped wrong answer, not a wording problem, and it needs
+   its own issue and a host-side fix.
+2. **A host read error reaches the guest as a hang, not a status
+   byte.** `VirtioBlockDevice::do_read` propagates a
+   `BackingStore::read_at` failure with `?`, so `process_request`
+   returns `Err` without writing the used ring, and the I/O thread
+   discards it (`if let Ok(io_stats) = device.process_queue(...)`).
+   Measured: a single injected `EIO` on any read of the input image
+   makes `convert` spin forever (three indices tried, each killed at
+   25 s), with no error and no completion. The pre-step-1a budget
+   would have ended that wait with the misleading "timeout"; now
+   nothing ends it. So the I/O-failure marker is raised today only
+   when the device *completes* a request with an error status, which
+   `validate_io_request` does for an out-of-range request -- the
+   reproduction used below. Giving a backing-store error a status
+   byte belongs with the VMM work, and it is what makes the marker
+   reachable for the case the master plan cares about.
+3. **The `status` argument's old convention was redundant and not
+   even consistent.** It duplicated `device` (1 for input, 2 for
+   output) except in `convert_native_luks`, where an *output* write
+   failure passed 1. Every converted site now passes 0, as
+   `IoFailure` documents.
+4. **Step 1e must keep the refusal branches ahead of the I/O
+   branch.** Eleven of the converted sites report a false return from
+   `qcow2::read_chain_virtual_cluster`, which fails for a structural
+   refusal as well as for a failed request; the refusal markers are
+   the specific signal and already come first in `execute_convert`,
+   `run_compare` and `run_bench`. Appending the I/O branch after them
+   preserves that order. A structural failure with no marker of its
+   own will render as an I/O failure, which is the same claim the
+   operation already makes when it passes `device = "input"`.
+
+### Reproduction used
+
+With no way to deliver a failed read through the device (finding 2),
+the marker was exercised through the completed-but-failed path: a
+1 MiB qcow2 whose second L2 entry was repointed to a cluster-aligned
+host offset past the end of the file, so `validate_io_request`
+answers the guest's read with `IOERR`. Before this step,
+`instar -v convert -O raw` on it logged
+`[ERROR] error op=convert device=input sector=1 status=1`; after it,
+`[ERROR] error op=io-failure device=input sector=1 status=0`. The
+user-visible error is unchanged in both
+cases -- `Error: "convert operation failed"`, exit 1 -- which is step
+1e's half.
+
 ## Risks and mitigations
 
 | Risk | Mitigation |
