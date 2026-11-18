@@ -88,7 +88,6 @@ pub struct VirtioBlock {
     capacity: u64,
     sector_size: usize,
     avail_idx: u16,
-    name: &'static str,
 }
 
 impl VirtioBlock {
@@ -114,7 +113,6 @@ impl VirtioBlock {
             capacity: 0,
             sector_size,
             avail_idx: 0,
-            name,
         };
 
         send_init("probe", name, mmio_base as u64);
@@ -288,6 +286,11 @@ impl VirtioBlock {
         let avail_idx = self.avail_idx;
         let ring_idx = avail_idx % QUEUE_SIZE;
 
+        // Read where the used index stands before the request becomes
+        // visible to the host, so the wait below can test that it moved
+        // rather than that it reached one particular value.
+        let used_idx_before = unsafe { read_volatile((self.used_base + 2) as *const u16) };
+
         unsafe {
             let avail_ring = (self.avail_base + 4 + (ring_idx as usize * 2)) as *mut u16;
             write_volatile(avail_ring, desc_idx);
@@ -299,27 +302,38 @@ impl VirtioBlock {
         self.avail_idx = avail_idx.wrapping_add(1);
         self.write_reg(reg::QUEUE_NOTIFY, 0);
 
-        // Wait for device to process the request with timeout.
-        // In bare-metal no_std, we use iteration count as a timeout mechanism.
-        // 100M iterations is generous - typical I/O completes in <1M iterations.
-        const MAX_WAIT_ITERATIONS: u64 = 100_000_000;
-
-        let expected_used_idx = avail_idx.wrapping_add(1);
-        let mut timed_out = true;
-        for _ in 0..MAX_WAIT_ITERATIONS {
-            unsafe {
-                let used_idx = read_volatile((self.used_base + 2) as *const u16);
-                if used_idx == expected_used_idx {
-                    timed_out = false;
-                    break;
-                }
+        // Wait for the device to publish the completion. The wait is
+        // deliberately unbounded. The guest already trusts the host for
+        // every byte it reads, and `serial::read_config` waits on it the
+        // same way for the device configuration at startup, so an
+        // unbounded wait is how the other channel between them already
+        // works. A bound could not be derived in any case: the guest
+        // cannot tell a host that is slow from one that is stuck, and any
+        // budget large enough to survive a legitimately slow read on a
+        // loaded machine is also large enough that a host which has truly
+        // lost the completion looks like a hang regardless.
+        //
+        // Giving up would also be unsafe rather than merely unhelpful. A
+        // request cannot be cancelled once it is on the ring, and the
+        // header, data and status buffers live at fixed offsets from
+        // DMA_POOL_BASE for every request while only the descriptor slot
+        // rotates. Returning early therefore leaves the host still writing
+        // into the buffers that the caller's next request will use.
+        //
+        // The wait ends when the used index has *moved*, not when it
+        // reaches one particular value. Queue depth is one today, so the
+        // host advances it by exactly one per request and the two tests
+        // agree; but this loop is now the only thing that can end the
+        // wait, and the master plan's Future work proposes raising the
+        // depth. Testing for movement degrades to proceeding early if
+        // that lockstep ever breaks, where testing for equality degrades
+        // to spinning forever.
+        loop {
+            let used_idx = unsafe { read_volatile((self.used_base + 2) as *const u16) };
+            if used_idx.wrapping_sub(used_idx_before) >= 1 {
+                break;
             }
             core::hint::spin_loop();
-        }
-
-        if timed_out {
-            send_error("timeout", self.name, sector, 0xDEAD);
-            return false;
         }
 
         let int_status = self.read_reg(reg::INTERRUPT_STATUS);

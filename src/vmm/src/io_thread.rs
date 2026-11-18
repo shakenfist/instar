@@ -170,18 +170,38 @@ impl IoThread {
                     // Process the queue
                     if let Ok(mut device) = io_device.device.lock() {
                         device.set_queue_notify();
-                        if let Ok(io_stats) = device.process_queue(&guest_mem) {
-                            if let Ok(mut s) = stats.lock() {
-                                // Record stats based on device role
-                                if io_device.role.is_read_device() {
-                                    s.record_read(io_stats.bytes_read, io_stats.sectors_read);
+                        match device.process_queue(&guest_mem) {
+                            Ok(io_stats) => {
+                                if let Ok(mut s) = stats.lock() {
+                                    // Record stats based on device role
+                                    if io_device.role.is_read_device() {
+                                        s.record_read(io_stats.bytes_read, io_stats.sectors_read);
+                                    }
+                                    if io_device.role.is_write_device() {
+                                        s.record_write(
+                                            io_stats.bytes_written,
+                                            io_stats.sectors_written,
+                                        );
+                                    }
                                 }
-                                if io_device.role.is_write_device() {
-                                    s.record_write(
-                                        io_stats.bytes_written,
-                                        io_stats.sectors_written,
-                                    );
-                                }
+                            }
+                            // A request this device could not service is
+                            // completed with an error status and never
+                            // reaches here, so what does is a virtqueue
+                            // the device could not read: a malformed
+                            // descriptor chain or an unmapped guest
+                            // address. Nothing was written to the used
+                            // ring, so the guest's wait for this
+                            // request will not end, and this thread
+                            // cannot fail the run. Say so on stderr --
+                            // as the epoll failures above do -- rather
+                            // than let the run look like a stall with no
+                            // cause.
+                            Err(e) => {
+                                eprintln!(
+                                    "IoThread: device {dev_idx} could not process its \
+                                     virtqueue: {e}"
+                                );
                             }
                         }
                     }

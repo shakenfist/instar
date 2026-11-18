@@ -719,6 +719,14 @@ test-container: instar-devcontainer instar
 # waiting to go quiet. tools/ci/check-test-partition.py asserts that
 # whichever pull-request job claims the class is one that sets it.
 #
+# INSTAR_REQUIRE_STRACE is the same bargain again, for the test that
+# injects latency into a host read to prove a slow read does not fail a
+# guest operation. strace can be installed and still be unable to
+# inject -- an old build, or a container that cannot ptrace -- so that
+# test probes the capability rather than the binary, and this variable
+# is what makes a failed probe red here instead of a skip that reads as
+# a pass; see tests/test_slow_host_read.py.
+#
 # The selection is listed before it is run so the run has a discovery
 # count to be checked against: a crashed stestr worker leaves a totals
 # block that exits 0, and tools/ci/check-stestr-run.sh needs the count
@@ -743,6 +751,7 @@ test-container-core: instar-devcontainer instar
 		-e HOME=/build \
 		-e INSTAR_TESTDATA_PATH=/testdata \
 		-e INSTAR_REQUIRE_LIBVHDI \
+		-e INSTAR_REQUIRE_STRACE \
 		-e INSTAR_REQUIRE_ZSTD \
 		-v "$(CURDIR):/workspace" \
 		-v "$(TESTDATA_PATH):/testdata:ro" \

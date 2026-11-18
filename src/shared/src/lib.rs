@@ -3487,6 +3487,56 @@ impl VhdFooterChecksumRefusal {
 }
 
 // ============================================================================
+// Host I/O failure signal
+// ============================================================================
+
+/// The `send_error` channel used to report that a request the guest
+/// made of the host's virtio device completed with an error. The
+/// guest's read and write helpers return a bare `bool`, so a failure
+/// otherwise reaches the user as the operation's generic "operation
+/// failed" text with no hint that the cause was I/O, or which image
+/// and offset it was on.
+///
+/// It travels the way [`InvalidL2EntryRefusal`] does: the guest calls
+/// `send_error(operation, device, sector, status)` with
+/// [`IoFailure::OPERATION`] as the operation string, the host's
+/// `SerialDecoder` captures it, and a formatter renders it by name in
+/// place of the generic failure text.
+///
+/// Unlike the refusal markers this one is raised by several
+/// operations, so the arguments are defined by what failed rather
+/// than by one operation's logic:
+///
+/// * `device` is the name of the device the failed request was made
+///   against, as the operations already pass it to the I/O helpers:
+///   `input`, `output` or `chain`.
+/// * `sector` is the sector the operation was reading or writing when
+///   the request failed.
+/// * `status` is unused and is sent as 0. The refusal markers carry a
+///   reason code there because the guest knows why it refused; here
+///   it does not. The device publishes a status byte for the failed
+///   request, but `read_sector` and `write_sector` reduce it to a
+///   `bool` before any caller sees it, so the operation raising this
+///   signal has nothing to put in the field. Carrying the byte would
+///   mean widening those return types and every call site with them.
+///   Until that happens the decoder must not read meaning into the
+///   field, and must not treat 0 as "success".
+pub struct IoFailure;
+
+impl IoFailure {
+    /// Reserved `send_error` operation marker for this signal.
+    /// Distinct from every real operation name, from `"cpu-exception"`
+    /// and from every refusal marker above, so the host's decoder can
+    /// tell the `send_error` uses apart.
+    pub const OPERATION: &'static str = "io-failure";
+
+    /// The same marker as [`Self::OPERATION`], NUL-terminated, for the
+    /// call table's `send_error`. `io_failure_marker_is_distinct_and_c_string_matches_operation`
+    /// asserts the two spellings agree.
+    pub const OPERATION_C: &'static [u8] = b"io-failure\0";
+}
+
+// ============================================================================
 // Snapshot configuration and result structures
 // ============================================================================
 
@@ -7121,6 +7171,38 @@ mod tests {
         assert_eq!(
             &c[..c.len() - 1],
             VhdFooterChecksumRefusal::OPERATION.as_bytes()
+        );
+    }
+
+    #[test]
+    fn io_failure_marker_is_distinct_and_c_string_matches_operation() {
+        // A drift between the C string the guest raises and the &str the
+        // host compares means the failure is raised but never captured,
+        // and it reverts to the generic text with no cause in it.
+        for other in [
+            "cpu-exception",
+            DifferencingRefusal::OPERATION,
+            InvalidL2EntryRefusal::OPERATION,
+            DataFileEntryRefusal::OPERATION,
+            MalformedL2EntryRefusal::OPERATION,
+            VhdFooterChecksumRefusal::OPERATION,
+        ] {
+            assert_ne!(IoFailure::OPERATION, other);
+        }
+        let c = IoFailure::OPERATION_C;
+        assert_eq!(
+            c.last().copied(),
+            Some(0),
+            "the C marker must be NUL-terminated"
+        );
+        assert_eq!(
+            &c[..c.len() - 1],
+            IoFailure::OPERATION.as_bytes(),
+            "the C marker must spell the same operation as OPERATION"
+        );
+        assert!(
+            !IoFailure::OPERATION.as_bytes().contains(&0),
+            "OPERATION must not embed a NUL, or the C marker truncates it"
         );
     }
 
