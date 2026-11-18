@@ -17,6 +17,10 @@ from helpers.vmdk_split import split_flat_image
 from helpers.vmdk_structure import descriptor_extents, read_descriptor
 
 
+class _DeliberateFailure(Exception):
+    """Raised inside the context manager, to prove cleanup runs anyway."""
+
+
 def _testdata_root() -> Path:
     """The testdata checkout, resolved the way base.py resolves it.
 
@@ -60,9 +64,9 @@ class TestSplitFlatImage(unittest.TestCase):
         self.assertEqual(list(self.workdir.iterdir()), [])
 
     def test_directory_is_removed_on_error(self):
-        with self.assertRaises(ZeroDivisionError):
+        with self.assertRaises(_DeliberateFailure):
             with split_flat_image(self.qemu_img, '5G', self.workdir):
-                1 / 0
+                raise _DeliberateFailure
         self.assertEqual(list(self.workdir.iterdir()), [])
 
     def test_missing_qemu_img_raises(self):
