@@ -464,6 +464,30 @@ happen.
    to name it with. Note for a bisect: the guest-side commit alone
    leaves an `EIO` hanging, so it and the host-side commit are a
    pair.
+9. The branch was rebased onto `develop` at `2e8a3022` on 2026-11-19
+   (AEDT) after #925 landed, which conflicted twice: the
+   multi-extent-VMDK row in `docs/plans/index.md` (five of this
+   branch's commits rewrite the row below it) and both sides adding
+   a `### Fixed` entry to `CHANGELOG.md`. Both were resolved
+   mechanically, keeping `develop`'s row and entry and this
+   branch's; `git range-diff` showed no other commit changed.
+10. Review round 1, 2026-11-19 (AEDT):
+    [PR #929 review](https://github.com/shakenfist/instar/pull/929#pullrequestreview-5956655575),
+    0 fix / 1 document / 9 consider / 3 none. Six `consider` items
+    were taken as defects in code this phase added -- the errno
+    paired with the wrong side of the operation, the wait's exit
+    condition, the generic message naming `convert` for `dd`, the
+    errno parsing being untested, the used-ring length on a failed
+    request, and a fixture skip that an environment declaring
+    `INSTAR_REQUIRE_STRACE` could still take silently. Three were
+    recorded rather than coded: the unanswerable virtqueue request
+    (#932, and a new `docs/guest-architecture.md` section), the
+    busy-spin's now-unbounded cost (master plan Future work), and
+    index-drift triage (`docs/testing.md`). The `document` item's
+    premise was wrong -- `docs/testing.md`'s test-structure list
+    names 11 of 35 modules, so it was never the exhaustive index the
+    item assumed -- so this phase's modules were added, the list was
+    marked as curated, and the real gap is #933.
 
 ## Measurements
 
@@ -535,6 +559,35 @@ Against a `convert.bin` built from the pre-fix source the test fails
 and the conversion *succeeds*: exit 0, with the output beginning
 `QFI\xfb` -- the decrypted inner QCOW2 written out as a flat
 payload, which is the defect itself rather than a proxy for it.
+
+**Review round 1** (2026-11-19 AEDT) added two mutations, run against
+`make test-rust` because a wrapper script and a direct `docker run`
+were both refused by this session's tool layer:
+
+* The rendered reason taken from the input side regardless of which
+  side the guest named -- `match &side.reason` to
+  `match &context.input.reason` in `io_failure_error`. Killed by
+  `io_failure_error_does_not_quote_the_other_sides_errno` and by the
+  pre-existing `io_failure_error_names_the_output_image_for_a_failed_write`.
+* The errno suffix no longer stripped in `record_io_error`. Killed
+  only by the new
+  `the_recorded_reason_drops_the_errno_number_but_keeps_other_wording`,
+  which is the finding: both tests that provoke a real backing-store
+  failure produce errors with no `" (os error N)"` suffix (the write
+  case is `BackingStore`'s own "write at offset 512 + 512 bytes
+  exceeds capacity 1000"), so neither exercised the parsing they were
+  nominally about.
+
+Two of the round's changes are deliberately not covered by a test,
+which is recorded here rather than left to be rediscovered. The
+used-ring length is no longer counted for a failed request, and
+nothing reads that field -- the guest never looks at the used
+element's length -- so no test can distinguish the fix from its
+absence; it is correctness against the virtio spec for a future
+multi-request path. And the wait's exit condition now tests that the
+used index *moved* rather than that it reached one value, which at
+queue depth one is the same condition, so it is hardening for the
+depth increase in Future work rather than a behaviour change.
 
 ## Back brief
 

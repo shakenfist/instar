@@ -485,6 +485,20 @@ The probe, and the parser that reads an injection back out of a trace,
 live in `tests/strace_injection.py` because the test below shares
 them.
 
+**Triaging a red from either test.** Both derive the index from a
+baseline run and then inject into a second run, so anything that
+changes the read sequence between the two -- scheduling on a loaded
+runner, a buffering difference, whether an ioeventfd could be
+registered -- moves the read the index names. That is deliberately a
+red rather than a skip: the alternative is a test that stops
+exercising anything and still passes. It is also why the first thing
+to read is *which* assertion failed. A failure from the
+injection-landed assertion ("strace was asked to...", "the injected
+run read...") is index drift, and re-running is the right response. A
+failure from the behavioural assertion -- a delayed conversion that
+exited non-zero, or a failed probe read that converted anyway -- is
+the defect these tests exist for, and re-running it is not.
+
 ### Failed Host Read Tests (`test_luks_probe_read_failure.py`)
 
 The sibling of the test above, and the same machinery pointed the
@@ -654,7 +668,8 @@ number of spin iterations for — about 1.3 s on a modern host, which
 a loaded runner reaches with nothing wrong. The guest now waits for
 the host however long it takes, so contention alone no longer
 produces either message. In a current tree they mean something else:
-`convert operation failed` is a guest failure the host captured no
+`<op> operation failed` — `convert operation failed`,
+`dd operation failed` — is a guest failure the host captured no
 reason for, and a genuine I/O error names the image and the offset
 it stopped at. Treat either as a real defect rather than replaying
 it for load.
@@ -3744,7 +3759,10 @@ make test-container-convert-vhd      # VHD/VHDX convert (slowest)
 make clean-tests
 ```
 
-**Test structure:**
+**Test structure:** a guide to the modules a reader is most likely to
+want, not an inventory -- `ls tests/test_*.py` lists a good many more,
+and this section has never named all of them.
+
 - `tests/manifest.json` - Defines test images and their safety levels
 - `tests/test_info_safe.py` - Tests against known-safe images
 - `tests/test_info_malicious.py` - Tests against malicious images using expected overrides
@@ -3804,6 +3822,17 @@ make clean-tests
   round-trips (create/delete/apply) with `qemu-img check` post-op
   assertions, error paths and qcow2-only enforcement, empty-table
   behaviour. JSON goldens in `tests/golden/snapshot-list/`.
+- `tests/test_slow_host_read.py` - A host read delayed by three
+  seconds must make a conversion slow and not make it fail
+  (`strace -e inject=read:delay_enter=`); see "Slow Host Read Tests"
+  above
+- `tests/test_luks_probe_read_failure.py` - A failed read of the
+  first payload sector must fail the conversion rather than read as
+  "no inner format" (`strace -e inject=read:error=EIO`); see "Failed
+  Host Read Tests" above
+- `tests/strace_injection.py` - The shared syscall-injection rig for
+  the two modules above: the capability probe, the per-thread index
+  derivation and the did-it-land parsers
 - `tests/test_bench.py` - Integration tests for the `instar bench`
   subcommand (62 tests): read/write request scheduling, host-side
   validation matrix, the qcow2 write-envelope gates, `--output json`

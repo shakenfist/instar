@@ -187,7 +187,7 @@ class TestLuksInnerFormatProbeReadFailure(StraceInjectionMixin, InstarTestBase):
         """A failed probe read fails the convert, and says what failed."""
         image = self.get_image(self.IMAGE_ID)
         if not image.path.exists():
-            self.skipTest(f'Image not found: {image.path}')
+            self._missing_injection_fixture(f'image not found: {image.path}')
 
         binary = self.get_instar_binary()
         offset = self._payload_byte_offset(image.path)

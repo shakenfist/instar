@@ -507,7 +507,16 @@ impl VirtioBlockDevice {
             _ => request_status::UNSUPP,
         };
 
-        total_written += data_desc.len;
+        // Only count bytes the device actually put in the guest's data
+        // buffer. A request completed with an error status wrote none,
+        // and claiming otherwise in the used ring is wrong even though
+        // the guest ignores the field today: every backing-store failure
+        // now takes this path, so a future out-of-order or multi-request
+        // path would read it. The status byte's own `+= 1` below is
+        // separate and is always written.
+        if status == request_status::OK {
+            total_written += data_desc.len;
+        }
 
         // Move to status descriptor
         if data_desc.flags & VirtqDesc::F_NEXT == 0 {
@@ -726,8 +735,56 @@ mod tests {
         let status = dev.do_write(&guest_mem, 1, 0x1000, 512).unwrap();
         assert_eq!(status, request_status::IOERR);
         // The errno is kept where the host can render it: the guest is
-        // told only which sector failed.
-        assert!(dev.last_io_error.is_some(), "the reason must be kept");
+        // told only which sector failed. Asserted exactly, because this
+        // string is rendered to the user verbatim.
+        assert_eq!(
+            dev.last_io_error.as_deref(),
+            Some("write at offset 512 + 512 bytes exceeds capacity 1000")
+        );
+    }
+
+    /// The reason is recorded by trimming `io::Error`'s Display, so the
+    /// trimming is worth a test of its own: neither failure a unit test
+    /// can provoke through the device is an OS error, so neither of the
+    /// two tests around this one exercises the suffix at all.
+    #[test]
+    fn the_recorded_reason_drops_the_errno_number_but_keeps_other_wording() {
+        let tmp = NamedTempFile::new().unwrap();
+        let backing = BackingStore::open(tmp.path(), false, Some(512), false).unwrap();
+        let mut dev = VirtioBlockDevice::new(backing, 512, 512, false, 0x10000000, 0x100000);
+
+        // An OS error: Display is "Input/output error (os error 5)" and
+        // the number is what `qemu-img` does not print either.
+        dev.record_io_error("read", 0, &std::io::Error::from_raw_os_error(5));
+        assert_eq!(dev.last_io_error.as_deref(), Some("Input/output error"));
+
+        // The first reason wins, so a later failure cannot overwrite the
+        // one the operation stopped on.
+        dev.record_io_error("read", 512, &std::io::Error::from_raw_os_error(28));
+        assert_eq!(dev.last_io_error.as_deref(), Some("Input/output error"));
+
+        // An error with no such suffix is kept whole rather than being
+        // truncated at a substring that is not there.
+        let mut other = VirtioBlockDevice::new(
+            BackingStore::open(tmp.path(), false, Some(512), false).unwrap(),
+            512,
+            512,
+            false,
+            0x10000000,
+            0x100000,
+        );
+        other.record_io_error(
+            "read",
+            0,
+            &std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "failed to fill whole buffer",
+            ),
+        );
+        assert_eq!(
+            other.last_io_error.as_deref(),
+            Some("failed to fill whole buffer")
+        );
     }
 
     /// The same for a read, which is the path an `EIO` on the input
@@ -754,7 +811,10 @@ mod tests {
         tmp.as_file().set_len(0).unwrap();
         let status = dev.do_read(&guest_mem, 0, 0x1000, 512).unwrap();
         assert_eq!(status, request_status::IOERR);
-        assert!(dev.last_io_error.is_some(), "the reason must be kept");
+        assert_eq!(
+            dev.last_io_error.as_deref(),
+            Some("failed to fill whole buffer")
+        );
     }
 
     #[test]

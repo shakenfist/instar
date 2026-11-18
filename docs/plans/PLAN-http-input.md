@@ -985,6 +985,19 @@ chosen to defer to here, so that we do not forget them.
   would speed up local operation too. It is much wider than this
   plan -- it changes the call table and every operation's read loop
   -- and this plan works around it with host-side readahead instead.
+* **The guest's wait is a busy poll, and phase 1 made its cost
+  unbounded.** `do_request` spins on `core::hint::spin_loop()` with no
+  yield, so a host read that takes N seconds now burns a vCPU core for
+  N seconds where the old spin budget capped it at about 1.3 s before
+  failing. That is a non-issue against a local disk and exactly the
+  case this plan creates: a remote backing store with multi-second
+  cache misses and roughly 164,000 serialised round trips would spin
+  at 100% for the whole transfer. Making the wait yield -- an `hlt`
+  woken by the completion interrupt, or a notification MMIO exit --
+  belongs with phase 3 or phase 6, where the latency arrives, and it
+  pairs with the queue-depth entry above because both are changes to
+  how the guest waits. Raised as a `consider` item on the phase 1
+  review.
 * **Remote output**, which needs a writer that does not seek
   backwards, or a staging file, and is a different feature.
 * **Authentication**, deliberately excluded by open question 7. If
@@ -1033,6 +1046,17 @@ chosen to defer to here, so that we do not forget them.
   fails) stays out of scope. The phase 1 plan's Measurements section
   records that qemu-img keeps its own output on the same failure,
   which is evidence for whoever takes it.
+* **Issue #932**, a virtqueue error the host cannot read, which is
+  never completed and so hangs the guest now that the wait is
+  unbounded. Every trigger is an instar bug rather than image-supplied
+  data, and the fix is shared fatal state plus a way to kick the vCPU
+  out of `KVM_RUN`, so phase 1 documented the case in
+  `docs/guest-architecture.md` instead of fixing it. It is the one
+  real cost of removing the spin budget.
+* **Issue #933**, `docs/testing.md`'s test-structure list naming 11 of
+  35 test modules. Phase 1 added its own two and the shared rig, and
+  marked the list as curated rather than complete; completing it, with
+  a CI guard in `tools/ci/check-test-partition.py`, is the fix.
 
 ### Bugs fixed during this work
 

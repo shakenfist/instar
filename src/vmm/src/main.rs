@@ -833,19 +833,27 @@ impl DeviceSet {
         Ok(())
     }
 
-    /// What the backing store said the first time any device in the set
-    /// failed to service a request, if one did.
+    /// What the backing store said the first time a device on the given
+    /// side of the operation failed to service a request, if one did.
     ///
     /// Such a request is still completed, with an error status, so the
-    /// guest fails its operation and names the sector it was on; this is
-    /// the reason to go with it. The devices are scanned in index order
-    /// and the first recorded reason wins, which for an operation that
-    /// stops on its first failed request is the reason it stopped.
-    fn last_io_error(&self) -> Option<String> {
-        self.devices.iter().find_map(|managed| {
-            let device = managed.device.lock().expect("lock poisoned");
-            device.last_io_error().map(str::to_string)
-        })
+    /// guest fails its operation and names the sector and the device it
+    /// was on; this is the reason to go with it.
+    ///
+    /// The side is a parameter rather than this scanning every device
+    /// because the guest names which side failed, and pairing that with
+    /// the first reason any device happened to record is how an output
+    /// write's message comes to carry an input read's errno. Within one
+    /// side the first recorded reason still wins, which for an operation
+    /// that stops on its first failed request is the reason it stopped.
+    fn io_error_for(&self, is_input: bool) -> Option<String> {
+        self.devices
+            .iter()
+            .filter(|managed| managed.is_input == is_input)
+            .find_map(|managed| {
+                let device = managed.device.lock().expect("lock poisoned");
+                device.last_io_error().map(str::to_string)
+            })
     }
 
     /// Create IoDevice entries for the I/O thread.
@@ -921,17 +929,30 @@ fn exception_name(vector: u32) -> &'static str {
 /// always share the input chain's, so both pairs travel together.
 struct IoFailureContext<'a> {
     /// The input image as the user spelled it, with the sector size the
-    /// input chain's devices were created with.
-    input: (&'a str, u32),
+    /// input chain's devices were created with, and what the backing
+    /// store said if an input device refused a request.
+    input: IoFailureSide<'a>,
     /// The output image as the user spelled it, with the sector size the
-    /// output device was created with.
-    output: (&'a str, u32),
-    /// What the backing store said when it refused the request, where
-    /// the host recorded a reason -- "Input/output error" for an `EIO`.
-    /// The guest cannot supply this: the virtio status byte carries one
-    /// bit of reason, and the errno is the most useful word in the
-    /// finished message. `None` for a failure the host did not cause,
-    /// such as a chain read the guest gave up on for its own reasons.
+    /// output device was created with, and what the backing store said
+    /// if the output device refused a request.
+    output: IoFailureSide<'a>,
+}
+
+/// One side of an operation, as the renderer needs to describe it.
+struct IoFailureSide<'a> {
+    /// The image as the user spelled it on the command line.
+    path: &'a str,
+    /// The sector size this side's devices were created with, which is
+    /// what turns the guest's sector number into a byte offset.
+    sector_size: u32,
+    /// What the backing store said when it refused a request on this
+    /// side, where the host recorded a reason -- "Input/output error"
+    /// for an `EIO`. The guest cannot supply this: the virtio status
+    /// byte carries one bit of reason, and the errno is the most useful
+    /// word in the finished message. `None` for a failure the host did
+    /// not cause, such as a chain read the guest gave up on for its own
+    /// reasons -- and `None` for the side that did not fail, so that a
+    /// message about one side can never quote the other's errno.
     reason: Option<String>,
 }
 
@@ -1180,23 +1201,24 @@ impl SerialDecoder {
     ///
     /// With nothing captured this is the generic text it replaces, so
     /// one call site cannot render one of the two and forget the other.
+    /// That text names the operation, where the string it replaces said
+    /// "convert" for `dd` as well; nothing asserts the old wording for
+    /// `dd`, and `docs/quirks.md`'s record of it describes a release
+    /// that predates the named refusals.
     fn io_failure_error(&self, op: &str, context: &IoFailureContext) -> String {
         let Some((device, sector)) = &self.last_io_failure else {
-            return "convert operation failed".to_string();
+            return format!("{op} operation failed");
         };
 
         // Only the output device is written to, so any other device the
-        // guest can name is one of the input chain's.
-        let (doing, path, sector_size) = if device == "output" {
-            (
-                "writing the output image",
-                context.output.0,
-                context.output.1,
-            )
+        // guest can name is one of the input chain's. The side chosen
+        // here also chooses the errno, so the two cannot disagree.
+        let (doing, side) = if device == "output" {
+            ("writing the output image", &context.output)
         } else {
-            ("reading the input image", context.input.0, context.input.1)
+            ("reading the input image", &context.input)
         };
-        let offset = sector.saturating_mul(sector_size as u64);
+        let offset = sector.saturating_mul(side.sector_size as u64);
 
         // `dd` and `convert` share this run loop and this renderer, and
         // each has to say what it did not do.
@@ -1206,8 +1228,8 @@ impl SerialDecoder {
             "the image was not converted"
         };
 
-        let path = terminal_safe_path(Path::new(path));
-        match &context.reason {
+        let path = terminal_safe_path(Path::new(side.path));
+        match &side.reason {
             Some(reason) => format!(
                 "{op}: {doing}, {path}, failed at offset {offset} ({offset:#x}): {reason}; \
                  {outcome}"
@@ -1726,13 +1748,21 @@ mod guest_exception_tests {
     }
 
     /// The images and sector sizes a convert run would hand the
-    /// renderer. 512-byte sectors on both sides, so a sector number
-    /// reads straight off as 512 times itself.
+    /// renderer, with the reason recorded against the input side.
+    /// 512-byte sectors on both sides, so a sector number reads
+    /// straight off as 512 times itself.
     fn io_failure_context(reason: Option<&str>) -> super::IoFailureContext<'static> {
         super::IoFailureContext {
-            input: ("src.qcow2", 512),
-            output: ("out.raw", 512),
-            reason: reason.map(str::to_string),
+            input: super::IoFailureSide {
+                path: "src.qcow2",
+                sector_size: 512,
+                reason: reason.map(str::to_string),
+            },
+            output: super::IoFailureSide {
+                path: "out.raw",
+                sector_size: 512,
+                reason: None,
+            },
         }
     }
 
@@ -1742,7 +1772,7 @@ mod guest_exception_tests {
         for op in ["convert", "dd"] {
             assert_eq!(
                 decoder.io_failure_error(op, &io_failure_context(None)),
-                "convert operation failed"
+                format!("{op} operation failed")
             );
         }
     }
@@ -1778,14 +1808,54 @@ mod guest_exception_tests {
         let mut decoder = super::SerialDecoder::new();
         decoder.last_io_failure = Some(("output".to_string(), 3));
         let context = super::IoFailureContext {
-            input: ("src.qcow2", 65536),
-            output: ("out.qcow2", 512),
-            reason: Some("No space left on device".to_string()),
+            input: super::IoFailureSide {
+                path: "src.qcow2",
+                sector_size: 65536,
+                reason: None,
+            },
+            output: super::IoFailureSide {
+                path: "out.qcow2",
+                sector_size: 512,
+                reason: Some("No space left on device".to_string()),
+            },
         };
         assert_eq!(
             decoder.io_failure_error("convert", &context),
             "convert: writing the output image, out.qcow2, failed at offset 1536 (0x600): \
              No space left on device; the image was not converted"
+        );
+    }
+
+    /// The errno comes from the side the guest named, not from whichever
+    /// device recorded one first. An input device that failed earlier in
+    /// the run -- a chain read the operation recovered from, or a read
+    /// that failed after the write already had -- must not have its
+    /// errno attached to the output image's sentence.
+    #[test]
+    fn io_failure_error_does_not_quote_the_other_sides_errno() {
+        let mut decoder = super::SerialDecoder::new();
+        decoder.last_io_failure = Some(("output".to_string(), 3));
+        let context = super::IoFailureContext {
+            input: super::IoFailureSide {
+                path: "src.qcow2",
+                sector_size: 512,
+                reason: Some("Input/output error".to_string()),
+            },
+            output: super::IoFailureSide {
+                path: "out.qcow2",
+                sector_size: 512,
+                reason: None,
+            },
+        };
+        let msg = decoder.io_failure_error("convert", &context);
+        assert_eq!(
+            msg,
+            "convert: writing the output image, out.qcow2, failed at offset 1536 (0x600); \
+             the image was not converted"
+        );
+        assert!(
+            !msg.contains("Input/output error"),
+            "the output image's failure quoted the input device's errno: {msg}"
         );
     }
 
@@ -16079,9 +16149,16 @@ fn execute_convert(
             .io_failure_error(
                 op,
                 &IoFailureContext {
-                    input: (&exec.input, exec.sector_size),
-                    output: (&exec.output, output_sector_size),
-                    reason: device_set.last_io_error(),
+                    input: IoFailureSide {
+                        path: &exec.input,
+                        sector_size: exec.sector_size,
+                        reason: device_set.io_error_for(true),
+                    },
+                    output: IoFailureSide {
+                        path: &exec.output,
+                        sector_size: output_sector_size,
+                        reason: device_set.io_error_for(false),
+                    },
                 },
             )
             .into());

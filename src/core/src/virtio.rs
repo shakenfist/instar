@@ -286,6 +286,11 @@ impl VirtioBlock {
         let avail_idx = self.avail_idx;
         let ring_idx = avail_idx % QUEUE_SIZE;
 
+        // Read where the used index stands before the request becomes
+        // visible to the host, so the wait below can test that it moved
+        // rather than that it reached one particular value.
+        let used_idx_before = unsafe { read_volatile((self.used_base + 2) as *const u16) };
+
         unsafe {
             let avail_ring = (self.avail_base + 4 + (ring_idx as usize * 2)) as *mut u16;
             write_volatile(avail_ring, desc_idx);
@@ -314,13 +319,19 @@ impl VirtioBlock {
         // DMA_POOL_BASE for every request while only the descriptor slot
         // rotates. Returning early therefore leaves the host still writing
         // into the buffers that the caller's next request will use.
-        let expected_used_idx = avail_idx.wrapping_add(1);
+        //
+        // The wait ends when the used index has *moved*, not when it
+        // reaches one particular value. Queue depth is one today, so the
+        // host advances it by exactly one per request and the two tests
+        // agree; but this loop is now the only thing that can end the
+        // wait, and the master plan's Future work proposes raising the
+        // depth. Testing for movement degrades to proceeding early if
+        // that lockstep ever breaks, where testing for equality degrades
+        // to spinning forever.
         loop {
-            unsafe {
-                let used_idx = read_volatile((self.used_base + 2) as *const u16);
-                if used_idx == expected_used_idx {
-                    break;
-                }
+            let used_idx = unsafe { read_volatile((self.used_base + 2) as *const u16) };
+            if used_idx.wrapping_sub(used_idx_before) >= 1 {
+                break;
             }
             core::hint::spin_loop();
         }

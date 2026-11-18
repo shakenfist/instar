@@ -70,6 +70,28 @@ class StraceInjectionMixin:
             )
         self.skipTest(reason)
 
+    def _missing_injection_fixture(self, reason):
+        """Skip because the image this test injects into is absent -- or fail.
+
+        Same gate as `_missing_strace`, for the same reason: these two
+        modules exist because a failure that looks like a success is
+        what the defects they guard did, so a silent skip is the one
+        outcome they must not have. An environment that sets
+        `INSTAR_REQUIRE_STRACE` has declared the injection rig complete,
+        and the test data is part of that rig -- `make test-container-core`
+        mounts the image set and the functional-tests workflow prepares
+        it. A developer without the images still gets a skip.
+        """
+        if os.environ.get(self.REQUIRE_STRACE_ENV):
+            self.fail(
+                f'{self.REQUIRE_STRACE_ENV} is set, so this environment has '
+                f'declared the injection rig available, but {reason}. Either '
+                f'restore the test data (see tests/manifest.json) or unset '
+                f'the variable -- do not let this test skip, because the '
+                f'behaviour it guards fails by succeeding.'
+            )
+        self.skipTest(reason)
+
     def _require_strace_injection(self, workdir):
         """Skip unless strace can really inject into a syscall here.
 
