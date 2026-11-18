@@ -504,6 +504,38 @@ qemu-img's image data at all, because it reads the source with
 `pread64` from several threads. #923's recipe is written for instar,
 which seeks and reads.
 
+## Mutation results
+
+Each of the phase's three behavioural fixes was shown to fail
+without the fix, so that no test in it is passing for a reason other
+than the one claimed. All three were measured on 2026-11-18 (AEDT).
+
+**The spin budget**, guarded by
+`tests/test_slow_host_read.py::TestSlowHostRead::test_slow_host_read_does_not_fail_convert`.
+Proven twice, independently. The implementing sub-agent restored the
+budget in a scratch copy of `src/core/src/virtio.rs`, rebuilt, and
+recorded the test failing with `rc=1 stderr='Error: "convert
+operation failed"'`, then restored the file from its copy and
+rebuilt. The management session then reproduced it without a
+rebuild, by pointing `INSTAR_BINARY_PATH` at a `develop` build,
+which still carries the budget: the test fails at its
+`assertEqual(injected.returncode, 0)` with `rc=1`, and passes
+against this branch's binary in 4.0 s.
+
+**The unanswered request.** The hang was reproduced before the fix
+and timed after it: `strace -f -qq -e trace=read -e
+inject=read:error=EIO:when=8` against the branch before the host-side
+commit was killed at 20.001 s (`rc=137`), and after it exits 1 in
+0.29 s. A `develop` binary exits 1 in about a second at the same
+injection, because the budget ended the wait there.
+
+**The LUKS probe**, guarded by
+`tests/test_luks_probe_read_failure.py::TestLuksInnerFormatProbeReadFailure::test_failed_probe_read_fails_the_conversion`.
+Against a `convert.bin` built from the pre-fix source the test fails
+and the conversion *succeeds*: exit 0, with the output beginning
+`QFI\xfb` -- the decrypted inner QCOW2 written out as a flat
+payload, which is the defect itself rather than a proxy for it.
+
 ## Back brief
 
 Before executing any step of this plan, please back brief the
