@@ -32,3 +32,4 @@
 - PLAN-differencing.md: VHD and VHDX differencing output
 - PLAN-bat-population.md: Populated BAT output
 - PLAN-multi-extent-vmdk.md: Multi-extent VMDK output
+- PLAN-http-input.md: Streaming image input over HTTP and HTTPS
