@@ -188,10 +188,10 @@ than left to fail obscurely.
 ## Open questions
 
 Each question carries the planner's recommendation and its
-reasoning. None has been resolved by the operator yet. Questions 1
-to 3 fix the shape of phases 2 and 3 and should be settled before
-phase 2 is planned; question 5 is a measurement phase 1 can make
-cheaply.
+reasoning. Question 5 was resolved by measurement on 2026-11-18;
+none of the others has been resolved by the operator yet. Questions
+1 to 3 fix the shape of phases 2 and 3 and should be settled before
+phase 2 is planned.
 
 1. **A virtio-derived protocol over the socket, or a plain framed
    one?** *Recommendation: a plain framed protocol that borrows
@@ -299,21 +299,32 @@ cheaply.
    the operator has ruled out as the primary design).
 
 5. **Does the spin budget already cause the kasm `test_convert`
-   flake?** *Recommendation: check before phase 1 designs the fix,
-   because it is nearly free and it changes the phase from enabling
-   work into a bug fix.* The suite has a known contention cluster on
-   this machine under sixteen workers, reporting "convert operation
-   failed" and "Content mismatch at offset 0" from unchanged trees.
-   The mechanism is plausible for the first message: the budget is
-   1.3 s of guest spinning, the vCPU keeps running while the I/O
-   thread waits on a loaded disk, and convert reports
-   `send_error("convert", "input", sector, 1)` when
-   `read_input_sector` returns false. It does not explain a content
-   mismatch, because that path aborts -- unless a reader ignores the
-   result, and `src/operations/convert/src/main.rs:789` chains a
-   read with `&&` and should be read carefully. Phase 1 greps the
-   stored failure logs for the guest timeout message; if it is
-   there, the flake gets an issue and this plan closes it.
+   flake?** *Resolved 2026-11-18 by measurement: the mechanism is
+   real, it explains one of the cluster's two messages, and the
+   other was already fixed.* Injecting a single delayed `read` with
+   `strace -e inject=read:delay_enter=...` into a release build of
+   `develop` makes the guest declare
+   `error op=timeout device=... status=57005` once the host takes
+   longer than somewhere between 0.5 s and 1.0 s to answer one
+   request, against the 1.3 s the budget measures on an idle host.
+   It fires on output writes as well as input reads, because both
+   go through the same `do_request`. `convert` then reports
+   `Error: "convert operation failed"` with exit 1, says nothing
+   about I/O unless `--verbose` is passed, and leaves a truncated
+   output file behind -- 524288 bytes of an 8388608-byte conversion.
+   That is the cluster's first message. `compare` handles the same
+   timeout correctly: "compare: reading the second image, ref.raw,
+   failed at virtual offset 327680 (0x50000); the images were not
+   compared", exit 4, which is qemu-img's read-error code. So the
+   cluster's other message, "Content mismatch at offset 0!", is not
+   this. It was issue #807, fixed on 2026-11-12 by 360bfdf4: a
+   pre-fix binary reproduces it under the same injection and a
+   current one does not, which also means flake observations
+   recorded before that date should not be assumed still live.
+   Phase 1 therefore starts from a reproduction rather than a
+   hypothesis, and carries two defects worth fixing with no network
+   in sight: the budget itself, and convert's silence about an I/O
+   failure.
 
 6. **A server with no `Range` support: refuse, or spool?**
    *Recommendation: refuse by name, with `--spool` as an explicit
@@ -471,9 +482,15 @@ there is a confined process to put it in.
 **1. Guest I/O wait.** Replace the iteration-counted spin in
 `src/core/src/virtio.rs` `do_request` with a wait that does not
 expire because the host was slow, and move the deadline to the host
-where it can be generous and per-request. Answers open question 5
-first, because the answer decides whether this is a bug fix with its
-own issue. Touches every operation's I/O path, so it lands alone.
+where it can be generous and per-request. Open question 5 settled
+this as a bug fix rather than enabling work: a single host I/O
+slower than about a second already fails a local operation, with no
+network in sight, and the reproduction is in that question. The
+phase also carries the two defects the reproduction exposed --
+convert reporting an I/O timeout as a bare "convert operation
+failed" with no mention of I/O outside `--verbose`, and leaving a
+truncated output file behind when it does. Touches every
+operation's I/O path, so it lands alone.
 
 **2. Fetch protocol and a file-backed fetcher.** Define the wire
 protocol -- fixed-layout headers, offset-addressed reads,
@@ -974,10 +991,16 @@ Filled in as the plan runs. Already known:
 
 Filled in as the plan runs. Already known or suspected:
 
-* The guest spin budget may be the mechanism behind the kasm
-  `test_convert` contention flake (open question 5). If phase 1
-  confirms it, that needs an issue filed before phase 1 starts, so
-  that the fix has something to close.
+* **The guest spin budget**, reproduced on 2026-11-18 (open
+  question 5): one host read slower than about a second fails the
+  operation. Needs an issue filed before phase 1 starts, carrying
+  the `strace -e inject` recipe, so the fix has something to close.
+* **convert's reporting of an I/O failure**, from the same
+  reproduction: a bare "convert operation failed" at exit 1, with
+  no mention of I/O unless `--verbose` is passed, and a truncated
+  output file left on disk. `compare` gets this right since issue
+  #807, naming the image and offset and exiting 4, so there is a
+  pattern in the tree to follow. Worth its own issue.
 * `src/operations/convert/src/main.rs:789` chains a
   `read_input_sector` call with `&&`, so a failed read there is a
   condition rather than an error. It should be read carefully during
@@ -994,7 +1017,7 @@ tracker at planning time found none.
 Before implementation begins, the implementing session restates
 this plan's mission, the resolved open questions, and the phase it
 is starting, in its own words, and the operator confirms. No open
-question has been resolved yet: questions 1 to 3 fix the shape of
-phases 2 and 3 and want answers before phase 2 is planned, and
-question 5 is a measurement phase 1 makes first.
+question 5 was resolved by measurement on 2026-11-18, and the rest
+are open: questions 1 to 3 fix the shape of phases 2 and 3 and want
+answers before phase 2 is planned.
 <!-- shared-block-end -->
