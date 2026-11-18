@@ -608,20 +608,22 @@ profile directories rather than trusting them; they have twice been
 silently wrong while the raw baselines were fine. A fixture that
 carries `skip_qemu_img` gets no baselines at all, which is how the
 existing multi-extent fixtures came to have none. The phase also fixes
-the two `info` divergences its survey found on multi-file VMDK, which
-the operator pulled forward from phase 3.
+the `info` divergences on multi-file VMDK that the operator pulled
+forward from phase 3: the two its survey found, and a third the
+80-build `children[]` sweep turned up while the phase ran.
 
 **3. Read side: lift the extent ceiling.** Implement rotation on the
 input path and remove the 15-extent limit for multi-extent sources, and
 add `twoGbMaxExtentSparse` as a readable input. Read each extent's
 declared sector count rather than inferring 2 GiB from the create type:
 phase 2 measured the one real-world split-sparse image in the corpus
-declaring 3.96 GiB extents under `twoGbMaxExtentSparse`. The two `info` divergences on
-multi-file VMDK that phase 2's survey found -- the top-level
-`actual-size` reporting the descriptor's allocation where qemu reports
-the sum over the descriptor and every extent, and `children[]` coming
-back in the opposite order -- were first deferred to this phase and
-then pulled back into phase 2 by the operator, together with the
+declaring 3.96 GiB extents under `twoGbMaxExtentSparse`. The `info`
+divergences on multi-file VMDK -- the top-level `actual-size` reporting
+the descriptor's allocation where qemu reports the sum over the
+descriptor and every extent, `children[]` coming back in the opposite
+order, and the version gate the array bypassed -- were first deferred
+to this phase and then pulled back into phase 2 by the operator,
+together with the
 single-file substitution in `tests/helpers/comparators.py` that masked
 the first of them. So this phase inherits a VMM that already sums
 extent allocations. This is where rotation

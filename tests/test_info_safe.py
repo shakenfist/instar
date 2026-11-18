@@ -489,6 +489,41 @@ class TestInfoVhdxMetadataLayout(InstarTestBase):
             self.assertEqual('parent.vhdx', info.get('backing-filename'))
 
 
+class TestInstarUnsupportedIsStillUnsupported(InstarTestBase):
+    """Every image the manifest calls unsupported really is refused.
+
+    `instar_unsupported` makes the baseline comparison skip, which is
+    the right behaviour while the gap is real -- qemu-img reads these
+    images, so a baseline exists and the parity gap stays measurable,
+    and asserting equality would pin a known gap as a hard failure. But
+    a skip proves nothing on its own, and nothing else reads the field,
+    so until this test the claim behind every one of those skips was
+    unchecked and a flag left behind after the gap closed would have
+    gone on silently suppressing the comparison it was hiding.
+
+    So the field is falsifiable here: the image must fail. When one
+    starts succeeding, this is what says so, and the fix is to clear
+    `instar_unsupported` in the manifest and let the baseline
+    comparison run.
+    """
+
+    def test_every_unsupported_image_is_refused(self):
+        flagged = [image for image in load_manifest_images() if image.get('instar_unsupported')]
+        self.assertTrue(flagged, 'the manifest sets instar_unsupported on no image at all')
+        for entry in flagged:
+            with self.subTest(image=entry['id']):
+                image = self.get_image(entry['id'])
+                if not image.path.exists():
+                    self.skipTest(f'Image file not found: {image.path}')
+                stdout, stderr, rc = self.run_instar_info(image.path)
+                self.assertNotEqual(
+                    0, rc,
+                    f'{entry["id"]} is marked unsupported but instar info succeeded. '
+                    f'If the gap has closed, clear instar_unsupported in the manifest '
+                    f'so the baseline comparison runs. Output: {stdout!r}'
+                )
+
+
 # The static qemu-img builds the multi-file VMDK tests below compare
 # against. qemu reports a multi-file image's children only from 8.0, so
 # these bracket that boundary with two builds either side of it.

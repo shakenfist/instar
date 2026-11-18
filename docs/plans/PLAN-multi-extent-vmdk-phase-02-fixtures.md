@@ -544,3 +544,85 @@ reversal identical on all 50 builds above it, and briefed step 2d to
 match the order. The sweep also turned up the third divergence, the
 `vmdk_flat.is_some()` override that emits children under a pre-8
 profile, which 2b's four-build sample could not have shown.
+
+**Steps 2c to 2e, 2026-11-18 (AEDT).** Step 2c invented three of its
+four reasons. The row asked it to add, to each fixture that keeps
+`skip_qemu_img`, the reason it cannot have a qemu baseline -- and the
+row asserted what those reasons were. Measured with the pinned 10.2.0
+build, qemu-img opens `vmdk-multi-extent` (reporting 2 GiB without
+opening its absent extents), `vmdk-flat-parent` and
+`vmdk-flat-with-parent`; only `vmdk-twogb-flat` is refused. `git log
+-S` puts each flag in the commit that created its fixture with no
+explanation, so the real reason is unrecoverable and the three invented
+sentences were removed rather than reworded. Decision 7 was written on
+the same wrong premise as the row. This is recorded as future work.
+
+Step 2e needed a step the brief omitted: `make profiles` after
+generation, without which `make validate-profiles` exits 2 with a
+`no-profile` problem for every new file. It also found that
+`generate-baselines.py`'s `find_manifest()` auto-detection resolves to
+the primary clone rather than the worktree whose manifest has the new
+images, which would have generated nothing and exited 0; it passed
+`--manifest` explicitly instead. Both are now in `docs/testing.md`.
+
+The testdata push happened after step 2d rather than at the end of the
+phase. Pushing baselines that then need regenerating is the worse
+order, so the push waited until the instar side was proved to agree
+with them.
+
+**Step 2d ran out of weekly quota and the management session finished
+it, 2026-11-18 (AEDT).** The sub-agent completed all five changes and
+its mutation pass -- eight mutants, all killed by a named test -- and
+then terminated on a rate limit before running the suite or the gate.
+Its work was left uncommitted in the worktree and reviewed as written;
+nothing was redone. Review reproduced every load-bearing claim rather
+than reading the report: human and JSON `info` are byte-identical to
+the pinned 6.0.0, 7.2.0, 8.0.0 and 10.2.0 builds on `vmdk-multi-flat`,
+and the allocation sum was confirmed by stat (three extents of 524288
+plus a 4096 descriptor against a reported 1576960).
+
+Removing the `vmdk_flat.is_some()` override was the change most worth
+checking, since it narrows output. `git show c284872c` states the
+premise it was added on -- that qemu-img emitted children for
+monolithicFlat "back to 6.0" -- which is exactly the claim the 80-build
+sweep disproved, and no baseline below 8.0.0 carries a `children` array
+at any profile. The override was the bug and `version.rs` was right.
+
+`make test` reported five failures, all of them the known contention
+cluster on this host: the four `test_convert` VHD cases exit 4, which
+is `COMPARE_EXIT_READ_ERROR` rather than the exit code for a content
+difference, and the `test_dd` case reports a guest info operation
+timing out. The host was at a load average near 20 on 16 cores. All
+five pass on replay at concurrency 2. That the convert helper reports a
+read error as a content difference, and discards the stderr that would
+say so, is recorded as future work.
+
+**Steps 2f and 2g, 2026-11-18 (AEDT).** Both ran as planned and both
+needed review corrections, none of them large enough to send back.
+
+In 2f the generator looked its build up with `shutil.which`, which
+searches PATH for a bare name and would quietly resolve to the host's
+qemu-img -- the fallback every other part of this work refuses. It now
+takes a path and checks it, with a test that a bare name raises. Its
+tests resolved the testdata checkout from the environment alone and
+failed outright without it, but `make test` sets no such variable and
+every other test in the suite reaches its data through `base.py`'s
+sibling-directory fallback, so the suite would have gone red for
+anyone whose shell did not export it; they now resolve it the same way.
+They also moved out of `tests/test_helpers.py`, whose tests touch
+neither the binary nor testdata. The runner shared with the pin harness
+was made public with its call sites renamed, rather than left behind an
+alias.
+
+In 2g the record said four VMDK fixtures carry `skip_qemu_img` where
+fifteen do -- four of the *safe* ones, which was the claim meant. The
+CHANGELOG entry attributed the `--qemu-version 7.2` array to the
+descriptor ordering, where the two were separate faults. The read-side
+ceiling appeared under both future work and bugs fixed. And the brief
+had missed `docs/output-formats.md` entirely, whose child-node section
+described a single `/file` child and so was incomplete for every
+multi-file image; the management session wrote that part.
+
+The master plan and the index row said "two" `info` divergences
+throughout, which was true when the survey wrote it and stopped being
+true when the sweep found the third. Both are corrected at source.
