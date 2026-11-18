@@ -540,7 +540,7 @@ cannot corrupt an output, before the write path depends on it.
 | Phase | Plan | Status | Merged |
 |-------|------|--------|--------|
 | 1. Pin and measure qemu's output | [PLAN-multi-extent-vmdk-phase-01-pin.md](PLAN-multi-extent-vmdk-phase-01-pin.md) | Complete | 34832d47 |
-| 2. Fixtures and baselines | [PLAN-multi-extent-vmdk-phase-02-fixtures.md](PLAN-multi-extent-vmdk-phase-02-fixtures.md) | Not started | |
+| 2. Fixtures and baselines | [PLAN-multi-extent-vmdk-phase-02-fixtures.md](PLAN-multi-extent-vmdk-phase-02-fixtures.md) | In progress | |
 | 3. Read side: lift the extent ceiling | PLAN-multi-extent-vmdk-phase-03-read-ceiling.md | Not started | |
 | 4. Multi-extent descriptor emitter | PLAN-multi-extent-vmdk-phase-04-descriptor.md | Not started | |
 | 5. Host-only flat create | PLAN-multi-extent-vmdk-phase-05-flat-create.md | Not started | |
@@ -607,20 +607,24 @@ backed. Generate baselines with `--no-commit` and validate the derived
 profile directories rather than trusting them; they have twice been
 silently wrong while the raw baselines were fine. A fixture that
 carries `skip_qemu_img` gets no baselines at all, which is how the
-existing multi-extent fixtures came to have none.
+existing multi-extent fixtures came to have none. The phase also fixes
+the two `info` divergences its survey found on multi-file VMDK, which
+the operator pulled forward from phase 3.
 
 **3. Read side: lift the extent ceiling.** Implement rotation on the
 input path and remove the 15-extent limit for multi-extent sources, and
 add `twoGbMaxExtentSparse` as a readable input. Read each extent's
 declared sector count rather than inferring 2 GiB from the create type:
 phase 2 measured the one real-world split-sparse image in the corpus
-declaring 3.96 GiB extents under `twoGbMaxExtentSparse`. This phase
-also owns the two `info` divergences phase 2 found and filed on
-multi-file VMDK -- the top-level `actual-size` reporting the
-descriptor's allocation where qemu reports the sum over the descriptor
-and every extent, and `children[]` coming back in the opposite order --
-together with the single-file substitution in
-`tests/helpers/comparators.py` that masks the first of them. This is where rotation
+declaring 3.96 GiB extents under `twoGbMaxExtentSparse`. The two `info` divergences on
+multi-file VMDK that phase 2's survey found -- the top-level
+`actual-size` reporting the descriptor's allocation where qemu reports
+the sum over the descriptor and every extent, and `children[]` coming
+back in the opposite order -- were first deferred to this phase and
+then pulled back into phase 2 by the operator, together with the
+single-file substitution in `tests/helpers/comparators.py` that masked
+the first of them. So this phase inherits a VMM that already sums
+extent allocations. This is where rotation
 is designed and proved; a mistake here fails a read, not an image.
 Includes the guard at `src/vmm/src/main.rs:15088` and its siblings, and
 `DeviceSet::add_device`'s panic, which should become unreachable by

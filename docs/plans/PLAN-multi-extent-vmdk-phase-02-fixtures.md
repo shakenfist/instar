@@ -41,22 +41,24 @@ In scope:
   are measured below to be unstorable.
 * Baselines for the four new fixtures across all 80 static qemu builds,
   for every image-driven command, with the derived profiles validated.
-* An issue for the two `info` divergences the survey found, and the
-  measurements recorded in the master plan.
+* Both `info` divergences the survey found on multi-file VMDK: the
+  top-level allocation figure and the order of `children[]`, in the
+  VMM, with the test helper that masks the first of them, and the
+  fixture un-flagged that lets a multi-extent flat image be compared
+  at all. An issue records them, and the measurements go into the
+  master plan.
 
 Out of scope:
 
-* Any change under `src/`. As in phase 1,
-  `git diff --name-only origin/develop...HEAD -- src/` must be empty at
-  the end of it.
-* Fixing either divergence the survey found. Both predate this plan,
-  both are in the multi-extent read path, and phase 3 owns that path.
-  See decision 6.
-* Giving `vmdk-multi-flat` and `vmdk-twogb-flat` baselines. They carry
-  `skip_qemu_img` today, and un-flagging them is what would expose the
-  divergences as a red suite. Same reason, same phase.
 * Reading `twoGbMaxExtent*` images (phase 3) and the structural
   comparison arm of the differential fuzzer (phase 16).
+* Baselines for the three VMDK fixtures that stay `skip_qemu_img`.
+  `vmdk-twogb-flat` and `vmdk-multi-extent` name extents that
+  deliberately do not exist, so the only baseline they could have is
+  qemu's error text, and error-text parity is its own subject;
+  `vmdk-flat-parent` and `vmdk-flat-with-parent` are a
+  `parentFileNameHint` chain, which is neither multi-extent nor this
+  plan's. Decision 7 records the reason against each.
 * `instar map` on flat sources, refused for every flat source and wider
   than this plan.
 
@@ -256,25 +258,53 @@ later reads the mismatch as a bug in `resparsify_images`.
    and about 4 KiB each allocated, which is free on a sparse filesystem
    and unstorable in LFS.
 
-6. **The two `info` divergences are filed and left to phase 3.** This is
-   the decision most likely to be argued with, so the reasoning in full:
-   the fix is a few lines -- sum the descriptor's and every extent's
-   allocation for the top-level figure, and stat each extent in the
-   human path -- and a reviewer could fairly say to just do it. Three
-   reasons not to. It is not this phase's blast radius: it changes
-   `info` output for every monolithicFlat image instar has ever read,
-   which is a baseline churn and a differential-fuzz exposure of its
-   own. It cannot be proved without also teaching
-   `comparators.get_disk_size` to sum siblings, and that change makes
-   the oracle meaningful for images this phase is deliberately not
-   un-flagging, so it would land red. And phase 3 is already inside
-   extent resolution, which is where both the stat loop and the child
-   ordering live. Phase 2's job is to leave the oracle in place -- the
-   baselines are qemu's output and correct regardless of what instar
-   does -- so that phase 3's fix has something to be measured against
-   the day it is written.
+6. **Both `info` divergences are fixed here.** The plan as first
+   written filed them and left them to phase 3, on the grounds that the
+   fix changes `info` output for every monolithicFlat image instar has
+   ever read and cannot be proved without also changing the comparator.
+   The operator overrode that in the back brief on 2026-11-18: fix them
+   in this phase. So the phase gains three changes it did not have.
 
-7. **Baselines for all four image-driven commands across all 80
+   The VMM reports the top-level allocation as the sum over the
+   descriptor and every resolved extent, and the human path stats each
+   extent instead of reusing the input file's block count. The JSON
+   children path already stats each extent correctly
+   (`src/vmm/src/main.rs:2768`), so the defect is the top-level figure
+   and the human rendering, not the per-child JSON.
+
+   `children[]` is emitted in qemu's order. Step 2b measures that order
+   across builds before anything copies it: qemu walks its block-driver
+   children, which comes out reversed relative to the descriptor, and a
+   reversal that is not stable across 6.0.0 to 10.2.0 is a divergence to
+   document rather than match.
+
+   `tests/helpers/comparators.py` sums the siblings for the top-level
+   figure of a multi-file image, so the oracle stops substituting the
+   descriptor's own allocation over qemu's sum. This is what makes the
+   first fix provable, and it is why the fix and the helper change land
+   together: either alone turns a green suite red.
+
+   What makes this affordable is something the survey found late.
+   `vmdk-flat-1m` and `vmdk-flat-10m` do **not** carry
+   `skip_qemu_img` -- they run in CI and already have `info` baselines
+   -- so the monolithicFlat half of the fix is provable against
+   baselines that already exist, with no generation step in between.
+   That is also the answer to how a shipping divergence on a CI fixture
+   went unnoticed: the masking, not a missing fixture.
+
+7. **`vmdk-multi-flat` loses `skip_qemu_img`; three other VMDK
+   fixtures keep it.** It is the one complete multi-extent flat image
+   in the corpus -- three 512 KiB extents, all present -- so it is the
+   only fixture that can compare a multi-extent flat `info` against
+   qemu's, which is half of what decision 6 fixes. The three that keep
+   the flag keep it for stated reasons: `vmdk-twogb-flat` and
+   `vmdk-multi-extent` name extents that deliberately do not exist, and
+   `vmdk-flat-parent` with `vmdk-flat-with-parent` form a
+   `parentFileNameHint` chain that is not multi-extent. Each reason is
+   recorded in the manifest entry's description rather than left to be
+   rediscovered.
+
+8. **Baselines for all four image-driven commands across all 80
    builds** (`info`, `check`, `measure`, `map`), generated with
    `--no-commit` and `--image`, with `make validate-profiles` run
    afterwards and a profile spot-checked by hand. The testdata half
@@ -284,19 +314,23 @@ later reads the mismatch as a bug in `resparsify_images`.
 
 Steps 2a and 2b are independent and may run in parallel: 2a writes only
 into the testdata checkout, 2b only builds in the instar worktree and
-reads. Everything after 2c is sequential, because 2d consumes the
-manifest entries and 2f consumes 2d's counts. 2e touches only
-`tests/helpers/` in the instar worktree and may run alongside 2d, which
-works in the testdata clone.
+reads. 2c consumes 2b's measured refusal text and 2a's fixtures, so it
+follows both. 2d and 2e may then run together, because 2d changes only
+the instar worktree and 2e only the testdata clone; 2d must not be
+reviewed as passing before 2e has produced `vmdk-multi-flat`'s
+baselines, since that is what makes its multi-extent half provable.
+2f and 2g follow 2d, because both run `pre-commit` in the same
+worktree.
 
 | Step | Effort | Model | Isolation | Brief for sub-agent |
 |------|--------|-------|-----------|---------------------|
 | 2a | medium | sonnet | none | Write `scripts/create-vmdk-split-testdata.sh` in the instar worktree and generate the four fixtures of decision 2 into `../instar-testdata/custom/format-coverage/`. Read `scripts/create-vmdk-flat-testdata.sh` first and follow its shape: `set -euo pipefail`, an output directory as `$1` defaulting to `../instar-testdata/custom/format-coverage`, `rm -f` of every file it is about to write (including the extents, whose names it must derive, not glob), and an `ls -la` of what it made at the end. Use `QEMU_IMG` from the environment, defaulting to `$INSTAR_TESTDATA_PATH/qemu-img-binaries/x86_64/10.2.0/qemu-img`, and exit non-zero with a message naming the path if it is not executable -- do not fall back to the host's `qemu-img`. Three fixtures are `qemu-img create -f vmdk -o subformat=twoGbMaxExtentSparse <out> <size>` at 2049M, 5G and 33G. The fourth, `vmdk-split-sparse-5g-boundary`, is made by writing a 5 GiB raw file with 128 KiB of 0xAB at offset 2147418112 (2 GiB − 64 KiB) via a short `python3 -c` heredoc exactly as the existing script seeds its flat extent, then `qemu-img convert -f raw -O vmdk -o subformat=twoGbMaxExtentSparse`, then deleting the raw source. Verify before finishing, and report the numbers: each descriptor's extent count and the declared sector count of its last extent; that every named extent file exists; and for the boundary fixture that `qemu-img map --output=json` reports a data range covering 2147418112 through 2147549184. Do NOT commit anything in either repository, and do not run `git add` in the testdata clone. Python inside the script follows this repo's conventions: single quotes, 120 columns. |
-| 2b | medium | sonnet | none | Re-measure three things with a freshly built binary and report them verbatim, changing no files. Build with `make instar` in the instar worktree (it builds in Docker; see the `build-and-test` skill) and say what the binary's mtime and `git describe`/HEAD are, because the measurements in the phase plan were taken with a binary dated 2026-10-19 that predates several merges. (1) The exact refusal `instar info` gives for a multi-extent SPARSE descriptor, run against `downloaded/osboxes/android-x86-5.1-rc1-split-sparse/Android-x86 5.1 RC1.vmdk` in the testdata checkout -- quote the whole line. (2) `instar info` and `instar info --output json` against `custom/format-coverage/vmdk-multi-flat.vmdk` and `custom/format-coverage/vmdk-flat-1m.vmdk`, compared field by field with `qemu-img-binaries/x86_64/10.2.0/qemu-img` on the same files: report the top-level `actual-size`/`disk size`, every child's, and the order of `children[]`. Say for each whether the divergence in the phase plan's table still reproduces. (3) Whether `instar info` resolves `custom/format-coverage/vmdk-twogb-flat.vmdk`, whose extents do not exist, and what it says. Report only; file no issue and fix nothing. |
-| 2c | low | sonnet | none | Add four image entries to `tests/manifest.json` in the instar worktree, for the fixtures step 2a generated. Copy the field set of the existing `vmdk-multi-flat` entry (around line 483) -- `id`, `path`, `format`, `safety: safe`, `run_in_ci: true`, `description`, `tags`, `generated_by` -- with two differences. Do **not** set `skip_qemu_img`: `generate-baselines.py:1043` never generates baselines for an image that has it, which is why the existing multi-extent entries have none. And set `instar_unsupported` to the refusal step 2b measured, worded like the `osboxes-vmdk-split-sparse` entry's (around line 2380), because `tests/test_info_safe.py:124` reads that key as an assertion that instar fails. Tags: `vmdk`, `twoGbMaxExtentSparse`, `multi-extent`, `format-coverage`, plus `extent-boundary` on the boundary fixture and `past-device-ceiling` on the 33G one. `generated_by` is `scripts/create-vmdk-split-testdata.sh`. Each description states the virtual size, the extent count, the tail extent's sector count and, for the boundary fixture, where the pattern sits. Then confirm `python3 -c "import json; json.load(open('tests/manifest.json'))"` succeeds and report the manifest's new image count. |
-| 2d | high | opus | none | Generate and validate baselines for the four new fixtures in the testdata clone at `../instar-testdata` (branch `main`; do not create a worktree there). This step is the one with a history of silent wrongness, so it reports numbers, not assurances. For each of the four image ids and each of `info`, `check`, `measure`, `map`, run `scripts/generate-baselines.py --command <cmd> --image <id> ... --no-commit`. **`--no-commit` is not optional**: without it the script commits by itself (see its `main()` around line 4104). Both `--image` and `--case` refuse to match nothing, so a typo fails loudly rather than generating zero files. Expect every one of the 80 version directories under `qemu-img-binaries/x86_64/` to be covered; say so with a count per command, and name any version that produced nothing. Note that `info` baselines land under the legacy `expected-outputs/qemu-img-human` and `qemu-img-json` directories, not `info-*`. Then run `make validate-profiles` (it runs `scripts/validate-profiles.py`) and report its exit status and output in full, and open one derived profile for one new fixture by hand and confirm it matches the raw baseline it was derived from -- the derived directories have twice been silently wrong while the raw ones were fine. Report the wall time, the total file count added, and `git status --short | wc -l` in the testdata clone. Do NOT commit and do NOT push. |
-| 2e | medium | sonnet | none | Add a test-time generator for split-flat images to the instar worktree, with unit tests. It belongs beside the existing helpers in `tests/helpers/`; read `tests/helpers/qemu_pins.py` for how that package already locates a static qemu-img build and runs it, and reuse rather than duplicate. The function takes a directory and a size, builds `qemu-img create -f vmdk -o subformat=twoGbMaxExtentFlat` there, and returns the descriptor path and the extent paths in descriptor order. It exists because a split-flat image cannot be stored: its extents are full-length sparse files -- 2 GiB each -- and git-LFS stores holes as bytes, so a 33 GiB fixture would be a 33 GiB LFS object. Say that in the module or function docstring, with the numbers. Add unit tests in `tests/test_helpers.py` (or a new file if that one is near 1500 lines -- check, `PUSH-AUDIT.md`'s source-size rule bites at 800 and 1500) asserting a 5 GiB image gives three extents whose declared sector counts are 4194304, 4194304 and 2097152 and whose file lengths are 2147483648, 2147483648 and 1073741824, that the directory is cleaned up, and that a missing qemu-img raises rather than silently skipping. Run the new tests with the venv at `tests/.venv` and `INSTAR_TESTDATA_PATH` set, under stestr, and report the "Ran: N" line. Python conventions: single quotes except docstrings, 120 columns, no trailing whitespace. |
-| 2f | medium | sonnet | none | Record what this phase found, in three places, in the instar worktree. (1) File a GitHub issue for the two `info` divergences on multi-file VMDK, using step 2b's freshly measured numbers rather than the phase plan's: the top-level `actual-size` is the descriptor's allocation where qemu reports the sum over the descriptor and every extent, and `children[]` comes back in the opposite order. Include that it affects monolithicFlat as well as the split subformats, that it is invisible today because every multi-file VMDK fixture carries `skip_qemu_img`, and that `tests/helpers/comparators.py:139-168` would mask it even after the flag came off because it substitutes a per-file `get_disk_size()` into the baseline and the top-level dict's filename is the descriptor. Say that phase 3 of the multi-extent VMDK work is where it is expected to be fixed, but do not cite the plan, the phase number or the file -- that rule holds for issues as it does for code. (2) Add the issue to the master plan's *Bugs fixed during this work*, and a *Future work* entry only for whatever the issue does not cover. (3) Update `docs/testing.md` where it describes recording split-subformat behaviour (phase 1 added that paragraph): the LFS cost rule from decision 1, with the measured numbers, and the `skip_qemu_img`-blocks-baselines mechanism. Report the issue number and the sections you touched. |
+| 2b | medium | sonnet | none | Re-measure four things with a freshly built binary and report them verbatim, changing no files. Build with `make instar` in the instar worktree (it builds in Docker; see the `build-and-test` skill) and say what the binary's mtime and `git describe`/HEAD are, because the measurements in the phase plan were taken with a binary dated 2026-10-19 that predates several merges. (1) The exact refusal `instar info` gives for a multi-extent SPARSE descriptor, run against `downloaded/osboxes/android-x86-5.1-rc1-split-sparse/Android-x86 5.1 RC1.vmdk` in the testdata checkout -- quote the whole line. (2) `instar info` and `instar info --output json` against `custom/format-coverage/vmdk-multi-flat.vmdk` and `custom/format-coverage/vmdk-flat-1m.vmdk`, compared field by field with `qemu-img-binaries/x86_64/10.2.0/qemu-img` on the same files: report the top-level `actual-size`/`disk size`, every child's, and the order of `children[]`. Say for each whether the divergence in the phase plan's table still reproduces. (3) Whether `instar info` resolves `custom/format-coverage/vmdk-twogb-flat.vmdk`, whose extents do not exist, and what it says. (4) Whether the `children[]` order is stable across builds: run `qemu-img info --output json` on `vmdk-multi-flat.vmdk` with the 6.0.0, 7.2.0, 8.2.0 and 10.2.0 static binaries and report the order each one gives. Step 2d copies that order, so a build where it differs is a divergence to document rather than match, and this is the measurement that decides which. Report only; file no issue and fix nothing. |
+| 2c | low | sonnet | none | Add four image entries to `tests/manifest.json` in the instar worktree, for the fixtures step 2a generated. Copy the field set of the existing `vmdk-multi-flat` entry (around line 483) -- `id`, `path`, `format`, `safety: safe`, `run_in_ci: true`, `description`, `tags`, `generated_by` -- with two differences. Do **not** set `skip_qemu_img`: `generate-baselines.py:1043` never generates baselines for an image that has it, which is why the existing multi-extent entries have none. And set `instar_unsupported` to the refusal step 2b measured, worded like the `osboxes-vmdk-split-sparse` entry's (around line 2380), because `tests/test_info_safe.py:124` reads that key as an assertion that instar fails. Tags: `vmdk`, `twoGbMaxExtentSparse`, `multi-extent`, `format-coverage`, plus `extent-boundary` on the boundary fixture and `past-device-ceiling` on the 33G one. `generated_by` is `scripts/create-vmdk-split-testdata.sh`. Each description states the virtual size, the extent count, the tail extent's sector count and, for the boundary fixture, where the pattern sits. Then remove `skip_qemu_img` from the `vmdk-multi-flat` entry, because it is the one complete multi-extent flat image in the corpus and step 2e needs it to have baselines; add to its description, in a sentence, that all three extents are present. Leave the flag on `vmdk-twogb-flat`, `vmdk-multi-extent`, `vmdk-flat-parent` and `vmdk-flat-with-parent`, and add to each of those four descriptions the reason it cannot have a qemu baseline -- the first two name extents that deliberately do not exist, the last two are a `parentFileNameHint` chain -- so the next reader does not have to rediscover it. Then confirm `python3 -c "import json; json.load(open('tests/manifest.json'))"` succeeds and report the manifest's new image count and which entries you changed. |
+| 2d | high | opus | none | Fix both `info` divergences of decision 6 in the instar worktree, and the test helper that hides one of them. Three changes, and they land together because either alone turns a green suite red. (1) In `src/vmm/src/main.rs`, the top-level allocation figure for a VMDK whose descriptor resolves to extents must be the sum over the descriptor and every extent, as qemu-img reports it; today it is the input file's own `st_blocks` alone (`input_disk_blocks` around line 12287). (2) In the same file's human-format `info` rendering, each extent's line must carry that extent's own allocation, not the input file's; the JSON children path around line 2768 already stats each extent and is the pattern to follow rather than a second implementation. (3) Emit `children[]` in the order step 2b measured qemu using, and only if 2b found that order the same on all four builds it tried -- if it differs between builds, leave instar's order alone and say so in the report, because a divergence that moves is documented, not copied. (4) In `tests/helpers/comparators.py`, `_substitute_json_actual_size` resolves a dict's own `filename` to that file's allocation (lines 139-168), which for the top-level dict is the descriptor, so qemu's sum is substituted away and instar's wrong answer matches. Make the top-level figure of a multi-file image the sum of the files the output names, and do the same for the human-format path. Verify against baselines that already exist: `vmdk-flat-1m` and `vmdk-flat-10m` are not `skip_qemu_img` and have `info` baselines under `expected-outputs/qemu-img-json/raw/10.2.0/`, so the monolithicFlat half needs no generation step -- run those tests and report the counts. Then mutation-check all four changes: break each one in turn in a COPY of the tree, confirm a test fails and names the right thing, run each mutant under `timeout` and count a timeout as killed, restore from a copy and never with `git checkout <dir>`, clear `__pycache__` after restoring, and keep the mutations in a runnable script whose path you report. Read a skip as a failure, not a kill. Also run `make test` -- this changes VMM output and there are unit tests in that file -- and `pre-commit run --all-files`. Report which files changed, the test counts, the mutation results, and anything you did not do. |
+| 2e | high | opus | none | Generate and validate baselines for the four new fixtures, and for `vmdk-multi-flat`, in the testdata clone at `../instar-testdata` (branch `main`; do not create a worktree there). `vmdk-multi-flat` is in the list because step 2c removed its `skip_qemu_img`: it is the one complete multi-extent flat image in the corpus and it has no baselines at all today, which is why a shipping `info` divergence on it went unnoticed. This step is the one with a history of silent wrongness, so it reports numbers, not assurances. For each of the five image ids and each of `info`, `check`, `measure`, `map`, run `scripts/generate-baselines.py --command <cmd> --image <id> ... --no-commit`. **`--no-commit` is not optional**: without it the script commits by itself (see its `main()` around line 4104). Both `--image` and `--case` refuse to match nothing, so a typo fails loudly rather than generating zero files. Expect every one of the 80 version directories under `qemu-img-binaries/x86_64/` to be covered; say so with a count per command, and name any version that produced nothing. Existing coverage is uneven -- `vmdk-flat-1m` has `info` baselines for 10.2.0 only, and one raw version directory holds 78 ids against 124 safe images -- so do not take a partially populated tree as a sign the run failed. Note that `info` baselines land under the legacy `expected-outputs/qemu-img-human` and `qemu-img-json` directories, not `info-*`. Then run `make validate-profiles` (it runs `scripts/validate-profiles.py`) and report its exit status and output in full, and open one derived profile for one new fixture by hand and confirm it matches the raw baseline it was derived from -- the derived directories have twice been silently wrong while the raw ones were fine. Report the wall time, the total file count added, and `git status --short | wc -l` in the testdata clone. Do NOT commit and do NOT push. |
+| 2f | medium | sonnet | none | Add a test-time generator for split-flat images to the instar worktree, with unit tests. It belongs beside the existing helpers in `tests/helpers/`; read `tests/helpers/qemu_pins.py` for how that package already locates a static qemu-img build and runs it, and reuse rather than duplicate. The function takes a directory and a size, builds `qemu-img create -f vmdk -o subformat=twoGbMaxExtentFlat` there, and returns the descriptor path and the extent paths in descriptor order. It exists because a split-flat image cannot be stored: its extents are full-length sparse files -- 2 GiB each -- and git-LFS stores holes as bytes, so a 33 GiB fixture would be a 33 GiB LFS object. Say that in the module or function docstring, with the numbers. Add unit tests in `tests/test_helpers.py` (or a new file if that one is near 1500 lines -- check, `PUSH-AUDIT.md`'s source-size rule bites at 800 and 1500) asserting a 5 GiB image gives three extents whose declared sector counts are 4194304, 4194304 and 2097152 and whose file lengths are 2147483648, 2147483648 and 1073741824, that the directory is cleaned up, and that a missing qemu-img raises rather than silently skipping. Run the new tests with the venv at `tests/.venv` and `INSTAR_TESTDATA_PATH` set, under stestr, and report the "Ran: N" line. Python conventions: single quotes except docstrings, 120 columns, no trailing whitespace. |
+| 2g | medium | sonnet | none | Record what this phase found and fixed, in the instar worktree. The management session has already filed the issue for the two `info` divergences and will give you its number; you do not file it. (1) Add that issue to the master plan's *Bugs fixed during this work*, with one sentence on each divergence, and a *Future work* entry only for anything the phase found and did not fix. (2) Update `docs/testing.md` where it describes recording split-subformat behaviour (phase 1 added that paragraph): the LFS cost rule of decision 1 with the measured numbers, the `skip_qemu_img`-blocks-baselines mechanism and which VMDK fixtures still carry it and why, and that the top-level allocation figure of a multi-file image is a sum, so a test helper comparing it must sum the siblings too. (3) Add a `CHANGELOG.md` entry for the `info` fix if that file takes one for a user-visible output change -- read how the last few entries are worded before deciding, and say in your report which way you went and why. Cite no plan, phase or step number anywhere outside `docs/plans/`. Report the sections you touched. |
 
 ## Risks and mitigations
 
@@ -306,11 +340,11 @@ works in the testdata clone.
   management session checks each file's apparent size against the table
   in decision 2 before anything is added.
 * **The baseline generator auto-commits.** Without `--no-commit` it
-  commits to `main` by itself. *Mitigation:* stated in step 2d's brief
+  commits to `main` by itself. *Mitigation:* stated in step 2e's brief
   as not optional; the management session checks `git log` in the
   testdata clone before reviewing the diff.
 * **The derived profiles have twice been silently wrong while the raw
-  baselines were fine.** *Mitigation:* step 2d runs
+  baselines were fine.** *Mitigation:* step 2e runs
   `make validate-profiles` and additionally opens one profile by hand;
   the management session re-runs the validator itself.
 * **A fixture that quietly joins the #845 cohort.** 31 of 124 safe
@@ -322,9 +356,28 @@ works in the testdata clone.
   `twoGbMaxExtentSparse` create type. *Mitigation:* recorded in the
   survey above and carried into the master plan, so phase 3 reads
   declared sector counts rather than inferring from the create type.
+* **An `info` output change has a wide blast radius.** Decision 6's fix
+  changes the allocation figure instar prints for every multi-file VMDK
+  it has ever read, which is monolithicFlat as well as the split
+  subformats. *Mitigation:* step 2d runs `make test` as well as the
+  python suite, because the VMM's own unit tests live in the file it
+  edits; it mutation-checks each of the four changes rather than
+  reading the guards; and the management session re-runs the
+  monolithicFlat comparison against the baselines that already exist,
+  which is the one case provable without any generation step.
+* **Copying a divergence that is not stable.** Matching qemu's
+  `children[]` order is only parity if qemu's order is the same across
+  builds. *Mitigation:* step 2b measures it on 6.0.0, 7.2.0, 8.2.0 and
+  10.2.0 before step 2d copies anything, and step 2d is told to leave
+  instar's order alone and report it if the four disagree.
+* **The comparator change and the VMM change must land together.**
+  Either alone turns a green suite red: the helper would reject
+  instar's current output, and the VMM fix would be substituted away.
+  *Mitigation:* both are one step and one commit, and the step's brief
+  says so.
 * **Measuring instar with a stale binary.** The divergence table was
   taken with a binary dated 2026-10-19. *Mitigation:* step 2b rebuilds
-  and re-measures before anything is filed, and step 2f uses 2b's
+  and re-measures before anything is filed, and steps 2d and 2g use 2b's
   numbers rather than the plan's.
 
 ## Definition of done
@@ -342,7 +395,7 @@ Falsifiable; each is checkable by someone who did not do the work.
 4. None of the four new manifest entries sets `skip_qemu_img`, and all
    four set `instar_unsupported`.
 5. `find expected-outputs -name 'vmdk-split-sparse-*' | wc -l` in the
-   testdata clone equals the count step 2d reports, and every one of
+   testdata clone equals the count step 2e reports, and every one of
    the 80 version directories appears for `info`, `check`, `measure`
    and `map`.
 6. `measure-json` contains at least one file for each of the four ids,
@@ -354,13 +407,25 @@ Falsifiable; each is checkable by someone who did not do the work.
 9. The split-flat test-time generator builds a 5 GiB image whose three
    extents have file lengths 2147483648, 2147483648 and 1073741824, and
    a unit test asserts it.
-10. `pre-commit run --all-files` passes in the instar worktree.
-11. `git diff --name-only origin/develop...HEAD -- src/` is empty.
-12. The issue for the two `info` divergences exists, cites step 2b's
+10. `pre-commit run --all-files` passes in the instar worktree, and
+    `make test` passes, because this phase now changes the VMM.
+11. `instar info` and `qemu-img info` agree on the top-level
+    allocation figure for `custom/format-coverage/vmdk-flat-1m.vmdk`
+    and `custom/format-coverage/vmdk-multi-flat.vmdk`, in both the
+    human and the JSON output, where before the fix instar reported
+    the descriptor's 4 KiB against qemu's sum.
+12. `instar info --output json` lists `children[]` for
+    `vmdk-multi-flat.vmdk` in the order step 2b measured qemu using,
+    or the report says which builds disagreed and instar's order was
+    left alone.
+13. Breaking each of the four changes of step 2d in turn makes a test
+    fail, and the mutation script that does it is reported with a
+    killed count and no skips read as kills.
+14. The issue for the two `info` divergences exists, cites step 2b's
     numbers, and is linked from the master plan.
-13. No plan, phase or step reference appears in anything landed outside
+15. No plan, phase or step reference appears in anything landed outside
     `docs/plans/` -- including the issue body.
-14. The master plan's phase 2 intent and the `docs/plans/index.md` row
+16. The master plan's phase 2 intent and the `docs/plans/index.md` row
     say what the survey found, not what the intent said before it.
 
 ## Back brief
@@ -380,9 +445,36 @@ phase's scope and the four gates below, and the operator confirms.
    repositories -- the instar merge commit and the testdata
    `first..last` range -- which
    `PLAN-bat-population-phase-13-push-audit.md` found missing once.
-4. **Decision 6**, leaving both `info` divergences to phase 3 rather
-   than fixing them here.
+4. **Decision 6**, which asked whether to leave both `info`
+   divergences to phase 3 or fix them here.
 
 ## Execution notes
 
-Filled in as the phase runs.
+**Back brief, 2026-11-18 (AEDT).** All four gates were put to the
+operator in one question. Three were confirmed as planned: the fixture
+set of decision 2, no stored split-flat fixture, and a direct push to
+`instar-testdata` `main` after the management session has reviewed the
+fixtures and baselines. The fourth was **overridden**: decision 6 had
+filed the two `info` divergences and left them to phase 3, and the
+answer was to fix them in this phase instead.
+
+The plan was amended at source before any step ran, rather than carried
+as a departure note. What changed: `src/` is no longer out of scope, and
+the definition of done no longer requires an empty `src/` diff;
+decision 6 is rewritten to describe the fix; decision 7 is new and
+records which VMDK fixtures lose `skip_qemu_img` and which keep it, with
+a reason each; a new step 2d makes the three code changes and
+mutation-checks them, which renumbered the old 2d, 2e and 2f to 2e, 2f
+and 2g; step 2b gained a fourth measurement, the `children[]` order
+across four builds, because matching an order that moves between builds
+would not be parity; step 2c un-flags `vmdk-multi-flat`; step 2e covers
+it; step 2g no longer files the issue, which the management session
+files from 2b's measurements, and gained a CHANGELOG question.
+
+The survey finding that makes the override cheap was already in the
+plan but not weighed there: `vmdk-flat-1m` and `vmdk-flat-10m` are not
+`skip_qemu_img` and already have `info` baselines, so the monolithicFlat
+half of the fix is provable with no generation step between the change
+and the evidence.
+
+The pull request may be opened by this session.
