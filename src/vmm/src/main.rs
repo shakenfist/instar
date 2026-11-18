@@ -833,6 +833,21 @@ impl DeviceSet {
         Ok(())
     }
 
+    /// What the backing store said the first time any device in the set
+    /// failed to service a request, if one did.
+    ///
+    /// Such a request is still completed, with an error status, so the
+    /// guest fails its operation and names the sector it was on; this is
+    /// the reason to go with it. The devices are scanned in index order
+    /// and the first recorded reason wins, which for an operation that
+    /// stops on its first failed request is the reason it stopped.
+    fn last_io_error(&self) -> Option<String> {
+        self.devices.iter().find_map(|managed| {
+            let device = managed.device.lock().expect("lock poisoned");
+            device.last_io_error().map(str::to_string)
+        })
+    }
+
     /// Create IoDevice entries for the I/O thread.
     fn create_io_devices(&self, events: Vec<IoEvent>) -> Vec<IoDevice> {
         assert_eq!(
@@ -896,6 +911,30 @@ fn exception_name(vector: u32) -> &'static str {
     }
 }
 
+/// What [`SerialDecoder::io_failure_error`] needs from the run loop to
+/// render a captured I/O failure.
+///
+/// The guest reports the device that failed and a sector number: it
+/// knows neither the path the user typed nor what the host thought went
+/// wrong. Turning the sector into a byte offset needs the sector size
+/// *that* device was created with, and convert's output device does not
+/// always share the input chain's, so both pairs travel together.
+struct IoFailureContext<'a> {
+    /// The input image as the user spelled it, with the sector size the
+    /// input chain's devices were created with.
+    input: (&'a str, u32),
+    /// The output image as the user spelled it, with the sector size the
+    /// output device was created with.
+    output: (&'a str, u32),
+    /// What the backing store said when it refused the request, where
+    /// the host recorded a reason -- "Input/output error" for an `EIO`.
+    /// The guest cannot supply this: the virtio status byte carries one
+    /// bit of reason, and the errno is the most useful word in the
+    /// finished message. `None` for a failure the host did not cause,
+    /// such as a chain read the guest gave up on for its own reasons.
+    reason: Option<String>,
+}
+
 struct SerialDecoder {
     buffer: VecDeque<u8>,
     /// The last guest CPU exception the IDT reported, as `(vector, rip)`.
@@ -934,6 +973,21 @@ struct SerialDecoder {
     /// `shared::MalformedL2EntryRefusal::OPERATION`. Same pattern as
     /// `last_data_file_entry`, and rendered wherever that is.
     last_malformed_l2_entry: Option<(u64, u32)>,
+    /// The device and sector of the last failed request the guest
+    /// reported: the `device` and `sector` fields of an `error` message
+    /// whose `operation` is `shared::IoFailure::OPERATION`. Same
+    /// pattern as `last_invalid_l2_entry` -- the guest's I/O helpers
+    /// return a bare bool, so the reason travels on `send_error` and
+    /// the tail of the run loop renders it instead of the generic
+    /// failure text.
+    ///
+    /// `device` is which of the operation's devices the failed request
+    /// was made against (`input` or `output`); `sector` is the sector
+    /// the operation was reading or writing, counted in *that*
+    /// device's sector size, which convert does not always configure
+    /// alike for the input chain and the output. `status` carries
+    /// nothing for this marker and is not kept.
+    last_io_failure: Option<(String, u64)>,
     /// Whether `info` refused a VHD whose footer copy at offset 0 fails
     /// its checksum: an `error` message whose `operation` is
     /// `shared::VhdFooterChecksumRefusal::OPERATION` (issue #583). `info`
@@ -973,6 +1027,7 @@ impl SerialDecoder {
             last_invalid_l2_entry: None,
             last_data_file_entry: None,
             last_malformed_l2_entry: None,
+            last_io_failure: None,
             vhd_footer_checksum_refused: false,
         }
     }
@@ -1102,6 +1157,67 @@ impl SerialDecoder {
         }
     }
 
+    /// Format the terminal error for an operation the guest ended
+    /// because a request against one of its devices failed.
+    ///
+    /// Ordered *after* [`Self::differencing_refusal_error`] and
+    /// [`Self::l2_entry_refusal_error`] wherever all three are
+    /// rendered, and that order is load-bearing: most of the sites that
+    /// raise this signal are chain reads, and a chain read returns the
+    /// same bare `false` for a failed request as for a structural
+    /// refusal. A refusal that named itself is the better answer, so it
+    /// must win; this is what is left when nothing did.
+    ///
+    /// The wording follows [`compare_failure_error`], which is the
+    /// house style for a read that failed: name the image by the path
+    /// the user passed, give the offset in decimal and hex, and end by
+    /// saying what did not happen. The offset is called an offset
+    /// rather than a virtual offset because the sites raising this do
+    /// not all count the same way -- a chain read's sector is virtual,
+    /// a LUKS payload read's is a physical offset into the image, and a
+    /// write's is an offset into the output file -- and only the device
+    /// that failed is known here.
+    ///
+    /// With nothing captured this is the generic text it replaces, so
+    /// one call site cannot render one of the two and forget the other.
+    fn io_failure_error(&self, op: &str, context: &IoFailureContext) -> String {
+        let Some((device, sector)) = &self.last_io_failure else {
+            return "convert operation failed".to_string();
+        };
+
+        // Only the output device is written to, so any other device the
+        // guest can name is one of the input chain's.
+        let (doing, path, sector_size) = if device == "output" {
+            (
+                "writing the output image",
+                context.output.0,
+                context.output.1,
+            )
+        } else {
+            ("reading the input image", context.input.0, context.input.1)
+        };
+        let offset = sector.saturating_mul(sector_size as u64);
+
+        // `dd` and `convert` share this run loop and this renderer, and
+        // each has to say what it did not do.
+        let outcome = if op == "dd" {
+            "the data was not copied"
+        } else {
+            "the image was not converted"
+        };
+
+        let path = terminal_safe_path(Path::new(path));
+        match &context.reason {
+            Some(reason) => format!(
+                "{op}: {doing}, {path}, failed at offset {offset} ({offset:#x}): {reason}; \
+                 {outcome}"
+            ),
+            None => {
+                format!("{op}: {doing}, {path}, failed at offset {offset} ({offset:#x}); {outcome}")
+            }
+        }
+    }
+
     /// Format the terminal error for a run loop that ended without a
     /// result. If the guest IDT reported a CPU exception (issue #375),
     /// name the vector and faulting address; otherwise fall back to the
@@ -1224,6 +1340,13 @@ impl SerialDecoder {
                     // As above: the cluster's virtual byte offset, and
                     // which of qemu's two host-offset rules it breaks.
                     self.last_malformed_l2_entry = Some((err.sector, err.status));
+                } else if err.operation == shared::IoFailure::OPERATION {
+                    // A request against one of the operation's devices
+                    // was completed with an error status: `device` is
+                    // the device it was made against and `sector` the
+                    // sector the operation was on, in that device's
+                    // sector size. `status` is unused here.
+                    self.last_io_failure = Some((err.device.as_str().to_string(), err.sector));
                 }
             }
             return Some(msg);
@@ -1598,6 +1721,106 @@ mod guest_exception_tests {
         );
         assert_eq!(decoder.last_data_file_entry, None);
         assert_eq!(decoder.last_invalid_l2_entry, None);
+        assert_eq!(decoder.last_differencing_refusal, None);
+        assert_eq!(decoder.last_cpu_exception, None);
+    }
+
+    /// The images and sector sizes a convert run would hand the
+    /// renderer. 512-byte sectors on both sides, so a sector number
+    /// reads straight off as 512 times itself.
+    fn io_failure_context(reason: Option<&str>) -> super::IoFailureContext<'static> {
+        super::IoFailureContext {
+            input: ("src.qcow2", 512),
+            output: ("out.raw", 512),
+            reason: reason.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn io_failure_error_is_generic_without_a_captured_failure() {
+        let decoder = super::SerialDecoder::new();
+        for op in ["convert", "dd"] {
+            assert_eq!(
+                decoder.io_failure_error(op, &io_failure_context(None)),
+                "convert operation failed"
+            );
+        }
+    }
+
+    #[test]
+    fn io_failure_error_names_the_image_the_offset_and_the_reason() {
+        // Mimic add_byte having decoded `op=io-failure device=input
+        // sector=5120`: an input read that failed 2.5 MiB in.
+        let mut decoder = super::SerialDecoder::new();
+        decoder.last_io_failure = Some(("input".to_string(), 5120));
+        let msg =
+            decoder.io_failure_error("convert", &io_failure_context(Some("Input/output error")));
+        assert_eq!(
+            msg,
+            "convert: reading the input image, src.qcow2, failed at offset 2621440 \
+             (0x280000): Input/output error; the image was not converted"
+        );
+        // Without a reason from the host the sentence still names the
+        // image and the offset, and does not invent an errno.
+        let msg = decoder.io_failure_error("convert", &io_failure_context(None));
+        assert_eq!(
+            msg,
+            "convert: reading the input image, src.qcow2, failed at offset 2621440 \
+             (0x280000); the image was not converted"
+        );
+    }
+
+    /// A write failure names the *output* image, and takes its sector
+    /// size from the output device, which convert does not always
+    /// configure the same as the input chain's.
+    #[test]
+    fn io_failure_error_names_the_output_image_for_a_failed_write() {
+        let mut decoder = super::SerialDecoder::new();
+        decoder.last_io_failure = Some(("output".to_string(), 3));
+        let context = super::IoFailureContext {
+            input: ("src.qcow2", 65536),
+            output: ("out.qcow2", 512),
+            reason: Some("No space left on device".to_string()),
+        };
+        assert_eq!(
+            decoder.io_failure_error("convert", &context),
+            "convert: writing the output image, out.qcow2, failed at offset 1536 (0x600): \
+             No space left on device; the image was not converted"
+        );
+    }
+
+    /// `dd` shares this run loop and this renderer, and says what *it*
+    /// did not do.
+    #[test]
+    fn io_failure_error_has_a_dd_spelling() {
+        let mut decoder = super::SerialDecoder::new();
+        decoder.last_io_failure = Some(("input".to_string(), 1));
+        let msg = decoder.io_failure_error("dd", &io_failure_context(Some("Input/output error")));
+        assert_eq!(
+            msg,
+            "dd: reading the input image, src.qcow2, failed at offset 512 (0x200): \
+             Input/output error; the data was not copied"
+        );
+    }
+
+    #[test]
+    fn add_byte_captures_the_io_failure() {
+        // The guest raises it with the marker as the operation, the
+        // device that failed and the sector it was on; the decoder must
+        // capture exactly that and no refusal.
+        let msg = guest_protocol::error_message(shared::IoFailure::OPERATION, "input", 640, 0);
+        let mut framed = [0u8; 256];
+        let n = guest_protocol::encode_framed(&msg, &mut framed).expect("encode");
+        let mut decoder = super::SerialDecoder::new();
+        let mut decoded = 0;
+        for &b in &framed[..n] {
+            if decoder.add_byte(b).is_some() {
+                decoded += 1;
+            }
+        }
+        assert_eq!(decoded, 1);
+        assert_eq!(decoder.last_io_failure, Some(("input".to_string(), 640)));
+        assert!(!decoder.l2_entry_refused());
         assert_eq!(decoder.last_differencing_refusal, None);
         assert_eq!(decoder.last_cpu_exception, None);
     }
@@ -2043,6 +2266,16 @@ fn format_message(msg: &guest_::GuestMessage) -> String {
                 format!(
                     "error op={} device={} virtual_offset={} rule={}",
                     err.operation, err.device, err.sector, err.status
+                )
+            } else if err.operation == shared::IoFailure::OPERATION {
+                // A request against one of the operation's devices was
+                // completed with an error status: sector is the sector
+                // the operation was on, in that device's sector size.
+                // status carries nothing for this marker, so it is left
+                // out rather than printed as a misleading zero.
+                format!(
+                    "error op={} device={} sector={}",
+                    err.operation, err.device, err.sector
                 )
             } else {
                 format!(
@@ -15831,7 +16064,27 @@ fn execute_convert(
             };
             return Err(serial_decoder.l2_entry_refusal_error(op).into());
         }
-        return Err("convert operation failed".into());
+        // Last: a request against one of the devices failed. The chain
+        // reader raises this for a failed request and for a structural
+        // refusal alike, so it comes after the two branches above,
+        // which name a refusal the guest could identify. With nothing
+        // captured at all this renders the generic text, which is what
+        // every convert failure said before any of them could say more.
+        let op = if exec.window.is_some() {
+            "dd"
+        } else {
+            "convert"
+        };
+        return Err(serial_decoder
+            .io_failure_error(
+                op,
+                &IoFailureContext {
+                    input: (&exec.input, exec.sector_size),
+                    output: (&exec.output, output_sector_size),
+                    reason: device_set.last_io_error(),
+                },
+            )
+            .into());
     }
 
     // For monolithicFlat output, write the descriptor file on the

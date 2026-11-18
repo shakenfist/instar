@@ -605,17 +605,28 @@ spread is still this narrow; a fresh measurement is being taken on
 
 **Classify before you attribute.** Running two matrix containers at
 once — or any other heavy job on the host — starves the suite, and the
-resulting failures do not look like resource problems. The large
-`test_convert` re-encodes fail under load with
-`Error: "convert operation failed"` and, from `compare`, a read error
-(before #807, `Content mismatch at offset 0!`), which reads as data
-corruption, and they abort early (~26s) rather than
-timing out at the ~110s they need when passing. Nine such failures
-appeared across the 2026-08-09 matrix inventory and **every one passed
-on an idle host**. A failure counts as a divergence only once it
-reproduces with the host otherwise quiet; `--select` gives you that
-replay cheaply. Same discipline as the differential-fuzzing
+resulting failures do not look like resource problems. Nine such
+failures appeared across the 2026-08-09 matrix inventory and **every
+one passed on an idle host**. A failure counts as a divergence only
+once it reproduces with the host otherwise quiet; `--select` gives
+you that replay cheaply. Same discipline as the differential-fuzzing
 spurious-divergence rule.
+
+The signature that cluster used to carry is gone, and the history
+matters when reading an old log. Large `test_convert` re-encodes
+failed under load with `Error: "convert operation failed"`, aborting
+early (~26s) rather than timing out at the ~110s they need when
+passing, and from `compare` a read error (before #807,
+`Content mismatch at offset 0!`) that read as data corruption. Both
+came from the guest giving up on a host read it had waited a fixed
+number of spin iterations for — about 1.3 s on a modern host, which
+a loaded runner reaches with nothing wrong. The guest now waits for
+the host however long it takes, so contention alone no longer
+produces either message. In a current tree they mean something else:
+`convert operation failed` is a guest failure the host captured no
+reason for, and a genuine I/O error names the image and the offset
+it stopped at. Treat either as a real defect rather than replaying
+it for load.
 
 The design is **tests from the source tree, binary from the package**:
 the whole `tests/` tree is copied into the container and driven by

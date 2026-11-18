@@ -154,6 +154,13 @@ impl VirtioBlockDevice {
         self.sector_size
     }
 
+    /// What the backing store said the first time this device failed to
+    /// service a request, if it ever did. The guest reports the sector;
+    /// this is the reason.
+    pub fn last_io_error(&self) -> Option<&str> {
+        self.last_io_error.as_deref()
+    }
+
     /// Record a backing-store failure, and log it. The request is still
     /// completed, with an error status, so this is the only place the
     /// errno is kept.
