@@ -322,7 +322,8 @@ def qemu_img_version(qemu_img) -> str:
 # Running a case
 # ---------------------------------------------------------------------------
 
-def _run(argv, workdir: Path) -> subprocess.CompletedProcess:
+def run_command(argv, workdir: Path) -> subprocess.CompletedProcess:
+    """Run `argv` in `workdir` under LC_ALL=C and the command timeout, and return the completed process."""
     env = dict(os.environ, LC_ALL='C')
     try:
         return subprocess.run([str(arg) for arg in argv], capture_output=True, text=True, cwd=workdir, env=env,
@@ -338,7 +339,7 @@ def normalise_stderr(stderr: str, workdir) -> str:
 
 def _create_base(qemu_img, fmt: str, workdir: Path) -> Path:
     base = workdir / f'{BASE_STEM}.{fmt}'
-    proc = _run([qemu_img, 'create', '-f', fmt, base, '64M'], workdir)
+    proc = run_command([qemu_img, 'create', '-f', fmt, base, '64M'], workdir)
     if proc.returncode != 0:
         raise RuntimeError(f'creating the {fmt} base image failed: {proc.stderr.strip()}')
     return base
@@ -347,7 +348,7 @@ def _create_base(qemu_img, fmt: str, workdir: Path) -> Path:
 def _create(qemu_img, case: dict, image: Path, workdir: Path) -> subprocess.CompletedProcess:
     base = _create_base(qemu_img, case['base'], workdir) if case.get('base') else None
     args = [str(base) if arg == '{base}' else arg for arg in case['args']]
-    return _run([qemu_img, 'create'] + args + [image, case['size']], workdir)
+    return run_command([qemu_img, 'create'] + args + [image, case['size']], workdir)
 
 
 def _check_rc(qemu_img, fmt: str, image: Path, workdir: Path) -> int:
@@ -356,8 +357,8 @@ def _check_rc(qemu_img, fmt: str, image: Path, workdir: Path) -> int:
     # argument (exit 2), so it is not given one; qemu-img is told the format
     # so that it never probes.
     if Path(qemu_img).name == 'instar':
-        return _run([qemu_img, 'check', image], workdir).returncode
-    return _run([qemu_img, 'check', '-f', fmt, image], workdir).returncode
+        return run_command([qemu_img, 'check', image], workdir).returncode
+    return run_command([qemu_img, 'check', '-f', fmt, image], workdir).returncode
 
 
 def _vhdx_summary(image: Path) -> dict:
@@ -394,13 +395,13 @@ def _run_vhdx_convert(qemu_img, case: dict, workdir: Path) -> dict:
     source = workdir / SOURCE_NAME
     write_convert_source(source)
     image = workdir / f'{IMAGE_STEM}.vhdx'
-    proc = _run([qemu_img, 'convert', '-f', 'raw', '-O', 'vhdx', '-o', case['options'], source, image], workdir)
+    proc = run_command([qemu_img, 'convert', '-f', 'raw', '-O', 'vhdx', '-o', case['options'], source, image], workdir)
     result = {'rc': proc.returncode, 'stderr': normalise_stderr(proc.stderr, workdir), 'summary': None,
               'check_rc': None, 'compare_rc': None}
     if proc.returncode == 0:
         result['summary'] = _vhdx_summary(image)
         result['check_rc'] = _check_rc(qemu_img, 'vhdx', image, workdir)
-        result['compare_rc'] = _run([qemu_img, 'compare', '-f', 'raw', '-F', 'vhdx', source, image],
+        result['compare_rc'] = run_command([qemu_img, 'compare', '-f', 'raw', '-F', 'vhdx', source, image],
                                     workdir).returncode
     return result
 
@@ -514,7 +515,7 @@ def _prealloc_create(qemu_img, case: dict, mode: str, label: str, workdir: Path)
     imagedir.mkdir()
     image = imagedir / f'{IMAGE_STEM}.{case["suffix"]}'
     options = ','.join(case['options'] + [f'preallocation={mode}'])
-    proc = _run([qemu_img, 'create', '-f', case['format'], '-o', options, image, case['size']], imagedir)
+    proc = run_command([qemu_img, 'create', '-f', case['format'], '-o', options, image, case['size']], imagedir)
     measured = _prealloc_measured_file(case, image)
     if proc.returncode == 0:
         # `st_blocks` of a file with delayed allocation still pending counts
