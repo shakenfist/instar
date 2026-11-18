@@ -253,7 +253,7 @@ One commit per step, with the subject given in the brief.
 | 1b | high | opus | none | **Make the reproduction a test.** Add a test that proves a slow host read no longer fails an operation. Decide where it lives by reading `tools/ci/check-test-partition.sh` and the job claims it checks -- a new module must be claimed by a pull-request job or that guard fails, so either extend an existing claimed module or add the claim in the same commit. The test injects latency with `strace -e inject=read:delay_enter=...:when=...` exactly as #923 documents, asserts exit 0 and a byte-identical output, and must **fail loudly rather than skip** when `strace` cannot inject: probe the capability (run `strace -e inject=read:delay_enter=1:when=1 /bin/true` and check it works, do not test for the binary's presence), and gate the skip behind an environment variable in the style of `INSTAR_REQUIRE_LIBVHDI`, so CI sets it and a missing tool is a failure there while a developer without `strace` still gets a skip. `strace` is in no Dockerfile and no workflow in this repository: add it where the suite runs (`src/.devcontainer/Dockerfile` and/or the CI workflow's package step -- find which actually runs the Python suite, do not guess) and say in your report which files you changed and why. The `when=` index is fragile across trees; make the test derive or search for a value that lands inside the guest run loop rather than hardcoding 30, and say how. Prove the test would have caught the bug: follow the `mutation-check` skill's method, restoring the spin budget in a scratch copy of `virtio.rs`, and confirm this test fails with the budget present and passes without it. Run the module with stestr and check the "Ran: N" line, not just the exit code -- a crashed worker exits 0 in this suite. Commit subject: `Test that a slow host read no longer fails an operation.` |
 | 1c | medium | sonnet | none | **The shared I/O-failure marker.** In `src/shared/src/lib.rs`, add an `IoFailure` marker type following `InvalidL2EntryRefusal` as the model, which is the closest existing one: a unit struct, an `OPERATION` string constant distinct from every real operation name and from the six existing markers, the NUL-terminated twin for the call table's `send_error`, and doc comments stating what `device` and `sector` carry (the device that failed, and the sector the operation was reading or writing). Copy the existing markers' test pattern -- there is a test asserting the C string matches the Rust string for each; add the equivalent one here. No guest or host code changes in this step. Run `cargo test -p shared` through the devcontainer (`make test-rust` or the narrower target; do not run native cargo) and report the test count. Commit subject: `Add a shared marker for a guest I/O failure.` |
 | 1d | high | opus | none | **Report I/O failures through the marker, and audit the rest.** There are 13 `send_error` call sites across `src/operations/*/src/main.rs` whose arguments look like an I/O failure (grep for `send_error` and filter for `"input`, `"output`, `"chain`, read and write). For each one, record in a table in this plan: the operation, the file and line, what it passes, and what the host does with it today -- whether the host path renders a specific error or drops it into a generic one. The survey established that `convert` is the only operation whose host side has a generic `"... operation failed"` string, so expect most of the 13 to be fine; confirm that rather than assuming it. Convert *only* the sites whose host side drops the detail to use `shared::IoFailure` from step 1c, keeping the sector and adding the device. `dd` shares `execute_convert`, so its sites travel with convert's. Leave the rest as they are and say in the table why each is already adequate. Do not change any operation's result struct or completion message. Build with `make instar` and confirm the guest binaries still fit (the binary-size hook). Commit subject: `Report guest I/O failures through the shared marker.` |
-| 1e | high | opus | none | **Render it host-side.** In `src/vmm/src/main.rs`: add a field to `SerialDecoder` for a captured I/O failure, capture `shared::IoFailure::OPERATION` in the `Payload::Error` chain alongside the six existing markers (follow `last_invalid_l2_entry` for the shape, including its comment style explaining what `sector` means), add a `format_message` arm so a `--verbose` run reads well, and render it in `execute_convert`'s failure tail in place of `"convert operation failed"` -- in the same position as the existing `last_differencing_refusal` and `l2_entry_refused` branches, which are the pattern to copy. Word it after `compare`'s existing read-failure error: name the image by the path the user passed, name the offset in both decimal and hex, and say what did not happen. `dd` and `convert` share the function, so pick the operation name the way the existing branches do (`exec.window.is_some()`). **Measure the exit code before choosing it**: run `qemu-img convert` against a source whose read fails (inject with `strace` as #923 documents, or use a source on a FUSE or loop device you can fail) and record qemu-img's exit code, the `qemu-img` version, and the exact command in a *Measurements* section of this plan. Use that code if `convert` can; if instar's exit-code plumbing cannot express it, say so in the plan and use the nearest thing, naming both. Add unit tests beside the existing decoder tests (`differencing_refusal_error_*` are the models) for: nothing captured yields the generic message, a captured failure names the image and offset, and the `dd` spelling. Commit subject: `Say what failed when a guest I/O error stops convert.` |
+| 1e | high | opus | none | **Complete a failed request, then render it.** Two commits. **First**, the host must answer a failed request instead of abandoning it: `BlockDevice::do_read` propagates a `BackingStore::read_at` failure with `?`, so `process_queue` returns before writing the used ring and the I/O thread drops the error, which since the first commit of this phase means an `EIO` hangs the guest forever rather than failing it. A failure to service a request must complete it with `request_status::IOERR` so the guest sees a completed-but-failed request, raises the marker from the previous step, and fails the operation. Cover the write and flush paths the same way, and do not swallow the underlying error silently -- the host knows the errno and the guest does not. Verify with an injected `EIO` on an input read: `convert` must exit non-zero promptly where it now hangs (reproduce the hang first, bounded by `timeout`, so you know your fix is what changed it). **Second**, render it: in `src/vmm/src/main.rs`: add a field to `SerialDecoder` for a captured I/O failure, capture `shared::IoFailure::OPERATION` in the `Payload::Error` chain alongside the six existing markers (follow `last_invalid_l2_entry` for the shape, including its comment style explaining what `sector` means), add a `format_message` arm so a `--verbose` run reads well, and render it in `execute_convert`'s failure tail in place of `"convert operation failed"` -- in the same position as the existing `last_differencing_refusal` and `l2_entry_refused` branches, which are the pattern to copy. Word it after `compare`'s existing read-failure error: name the image by the path the user passed, name the offset in both decimal and hex, and say what did not happen. `dd` and `convert` share the function, so pick the operation name the way the existing branches do (`exec.window.is_some()`). **Measure the exit code before choosing it**: run `qemu-img convert` against a source whose read fails (inject with `strace` as #923 documents, or use a source on a FUSE or loop device you can fail) and record qemu-img's exit code, the `qemu-img` version, and the exact command in a *Measurements* section of this plan. Use that code if `convert` can; if instar's exit-code plumbing cannot express it, say so in the plan and use the nearest thing, naming both. Add unit tests beside the existing decoder tests (`differencing_refusal_error_*` are the models) for: nothing captured yields the generic message, a captured failure names the image and offset, and the `dd` spelling. Commit subject: `Say what failed when a guest I/O error stops convert.` |
 | 1f | medium | opus | none | **The LUKS inner-format probe (#926).** In `src/operations/convert/src/main.rs`, the LUKS path's inner-format detection reads the first payload sector inside an `if` whose condition `&&`-chains `(call_table.read_input_sector)(...)`, so a failed read skips the QCOW2 magic check and falls through to the flat LUKS path. Make the failed read an error: report it through `shared::IoFailure` and fail the operation the way the main read loop below it already does (`send_error` then `send_complete(..., false)`), rather than continuing with an undetected inner format. Read the survey section of this plan first -- the reason this matters is that the main loop re-reads *the same sector* and treats a failure as fatal, so the only way to reach the bad outcome is a read that fails once and succeeds on retry, and the output is then a decrypted qcow2 written out as a flat image at exit 0. The commit message must carry that reasoning, because the diff alone looks like a redundant check. Do not reference this plan. If there is an existing LUKS-wrapped-qcow2 fixture in `tests/manifest.json`, add a test that the probe's failure path fails the operation rather than converting wrongly; if there is not, say so and record it in Future work rather than building a fixture here. Commit subject: `Fail convert when the LUKS inner-format probe cannot read.` |
 | 1g | low | sonnet | none | **Close the phase.** Fold this phase's findings back into `PLAN-http-input.md`: record in the Bugs-fixed section what #923 and #924 turned out to be, and add to Future work the two things this phase deliberately left: the VMM installing no logger without `--verbose` (worth its own issue), and #849. Confirm `git diff origin/develop...HEAD -- src/ docs/ tests/ \| grep -nE 'PLAN-\|[Pp]hase [0-9]\|step 1[a-g]'` prints nothing: no plan, phase or step references in landed code, docs or tests. Confirm `docs/guest-architecture.md`'s statement that call-table I/O is synchronous is now true without qualification, and if it needs a sentence to say the wait is unbounded, add it there -- that file is the summary-and-index for the guest, so keep it to a sentence. Do not change the Execution table's status; the next phase's first commit closes this one out. Commit subject: `Record phase 1's findings in the master plan.` |
 
@@ -370,7 +370,7 @@ cases -- `Error: "convert operation failed"`, exit 1 -- which is step
 
 | Risk | Mitigation |
 |------|------------|
-| An unbounded wait turns a VMM bug into a hang, in CI or for a user | The test harness already bounds every subprocess (30 s by default in `tests/base.py`), so a lost completion fails a test rather than hanging a run. For a user it is interruptible, and it is the behaviour qemu-img has against a hung mount. Decision 2 states the trade rather than hiding it; step 1g records it in Future work so a watchdog can be argued for on its own merits |
+| An unbounded wait turns a VMM bug into a hang, in CI or for a user | **Understated as written, and measured during step 1d: it is not only a VMM bug that hangs.** An ordinary `EIO` from the backing store never completes the request at all, so before step 1e's host-side half the wait is indefinite for a failing disk, not just a wedged VMM. Step 1e completes a failed request with an error status, which is what makes the unbounded wait safe. What remains afterwards is the genuinely lost completion, for which the mitigation as written stands: the harness bounds every subprocess (30 s by default in `tests/base.py`), a user can interrupt, and step 1g records a watchdog in Future work to be argued on its own merits |
 | Step 1b's test passes everywhere and runs nowhere | The step requires a capability probe rather than a presence check, an environment-variable guard in the style of `INSTAR_REQUIRE_LIBVHDI`, and the tool added where the suite actually runs. The management session checks the claim by running the module with the variable set and unset and confirming the two outcomes differ |
 | The `when=` injection index drifts as the tree changes, so the test silently stops injecting into the guest run loop | Step 1b must derive or search for the index rather than hardcoding it, and assert that the injection actually delayed a read -- a test that injects into the wrong syscall and passes is worse than no test. The mutation check in the same step is what proves it is injecting where it matters |
 | Converting the 13 `send_error` sites changes a message some test asserts on | Step 1d converts only the sites whose host side drops the detail, and the audit table is produced before any edit. The full Python suite is the check; per the repository's standing rule, a failure is root-caused against `develop` rather than waved through as pre-existing |
@@ -441,6 +441,68 @@ happen.
    **#926**, so step 1f has an issue to close. Its body carries the
    reasoning that the defect is reachable only through #923, which
    is why fixing #923 would otherwise hide it.
+5. **Step 1e grew a second half, and step 1a is incomplete without
+   it.** Step 1d measured what a real host read error does, and the
+   answer is that it never reaches the guest at all.
+   `BlockDevice::do_read` propagates a `BackingStore::read_at`
+   failure with `?`, so `process_queue` returns before it writes the
+   used ring, and the I/O thread discards the error because it
+   matches only `Ok`. No status byte, no used-ring entry, no
+   interrupt. While the spin budget existed it ended that wait after
+   about 1.3 s and blamed a timeout; with the budget gone nothing
+   ends it. Reproduced on this branch: one injected `EIO` on an
+   input read hangs `convert` indefinitely, killed at 20 s, where
+   the same injection against a `develop` binary exits 1 in one
+   second. So the honest reading of the first commit on its own is
+   that it trades a misleading failure for a hang.
+
+   Step 1e therefore covers the host completing a failed request
+   with an error status before it renders anything, and lands as two
+   commits. This is not scope creep: the phase's own definition of
+   done requires a genuinely failing read to produce an error that
+   names the image, and until the request completes there is nothing
+   to name it with. Note for a bisect: the guest-side commit alone
+   leaves an `EIO` hanging, so it and the host-side commit are a
+   pair.
+
+## Measurements
+
+### qemu-img convert's exit code on a source read error
+
+Measured 2026-11-18 (AEDT) on kasm, qemu-img 10.0.13 (Debian
+1:10.0.13+ds-0+deb13u1), against an 8 MiB qcow2 written from
+`/dev/urandom`:
+
+```
+strace -f -qq -e trace=pread64 -e inject=pread64:error=EIO:when=N \
+    -o /dev/null qemu-img convert -O raw src.qcow2 out.raw
+```
+
+| when | rc | out.raw | stderr |
+|------|----|---------|--------|
+| 6 | 1 | 8388608 | `qemu-img: error while reading at byte 6291456: Input/output error` |
+| 8 | 1 | 8388608 | `qemu-img: error while reading at byte 0: Input/output error` |
+| 10 | 1 | 8388608 | as the first |
+| 12 | 0 | 8388608 | injection landed past the last image read |
+
+Three conclusions, which settle decision 5:
+
+* **Exit 1**, which is what instar's `convert` already exits. So this
+  phase changes the message and not the code, and `compare`'s exit 4
+  is not the precedent to follow -- that is qemu-img *compare*'s own
+  read-error code, from a vocabulary `convert` does not share.
+* The offset is reported in decimal bytes, with no hex and no sector
+  number. instar's `compare` gives both decimal and hex, which is the
+  house style this phase follows instead.
+* qemu-img **keeps** its output file, at full declared size. That is
+  evidence for #849's keep-or-unlink question -- qemu's answer on this
+  failure is to keep -- recorded here for whoever takes that issue,
+  and not acted on in this phase.
+
+Note for anyone reproducing it: injecting on `read` does not reach
+qemu-img's image data at all, because it reads the source with
+`pread64` from several threads. #923's recipe is written for instar,
+which seeks and reads.
 
 ## Back brief
 
