@@ -1010,6 +1010,25 @@ chosen to defer to here, so that we do not forget them.
 * **Caching across invocations**, so that chain discovery and a
   following convert do not refetch the same headers in separate
   runs.
+* **The VMM installs no logger unless `--verbose` is passed**
+  (`main.rs`'s single `init_verbose_logger` call), so every
+  diagnostic record in the binary is discarded by default, not only
+  guest I/O errors. Wider than #924 was; wants its own issue.
+* **`copy` reports a failed read as success.** Every `send_error`
+  path in `src/operations/copy/src/main.rs` returns before the single
+  `send_complete(..., true)` at the end, and the host's `run_copy`
+  neither requires a completion nor inspects one, so a failed read
+  gives exit 0, no message outside `--verbose`, and a silently short
+  output file. Wants its own issue.
+* **Carrying the virtio status byte into the guest's I/O helpers.**
+  `do_request` reduces it to `status == VIRTIO_BLK_S_OK`, and
+  `read_sector`, `write_sector` and `flush` return `bool`, so
+  `shared::IoFailure`'s `status` field is unused. Widening those three
+  signatures would let the guest say why.
+* **Issue #849** (convert and dd keep their output file when the guest
+  fails) stays out of scope. The phase 1 plan's Measurements section
+  records that qemu-img keeps its own output on the same failure,
+  which is evidence for whoever takes it.
 
 ### Bugs fixed during this work
 
@@ -1022,22 +1041,28 @@ while planning it.
 
 * **The guest spin budget**, issue #923, reproduced on
   2026-11-18 (open question 5): one host read slower than about a
-  second fails the operation. The issue carries the
-  `strace -e inject` recipe and weighs the three candidate fixes;
-  phase 1 closes it.
+  second failed the operation. Fixed in phase 1: the guest now waits
+  for the host to complete the request.
 * **convert's reporting of an I/O failure**, issue #924, from the
   same reproduction: a bare "convert operation failed" at exit 1,
-  with no mention of I/O unless `--verbose` is passed. The
-  `SerialDecoder` error chain at `src/vmm/src/main.rs:1209` names
-  six guest refusals and not `"timeout"`, so the diagnosis is
-  decoded and discarded. `compare` gets this right since issue
-  #807, naming the image and offset and exiting 4, so there is a
-  pattern in the tree to follow. The truncated output file left
-  behind is #849, not part of #924.
-* `src/operations/convert/src/main.rs:789` chains a
-  `read_input_sector` call with `&&`, so a failed read there is a
-  condition rather than an error. It should be read carefully during
-  phase 1; it may be correct, and it may be a silent-zero-fill bug.
+  with no mention of I/O unless `--verbose` was passed. Fixed in
+  phase 1: `convert` and `dd` now name the image, the offset in
+  decimal and hex, and the errno, at exit 1. The truncated output
+  file left behind is #849, not part of #924.
+* **The LUKS inner-format probe**, issue #926. The `&&`-chained
+  `read_input_sector` call in `convert_native_luks` was not a
+  silent-zero-fill bug but a transient-failure misdetection: a failed
+  read of the first payload sector looked like "no QCOW2 magic", so a
+  LUKS-wrapped QCOW2 was converted as a flat payload at exit 0. Fixed
+  in phase 1: a failed read of a sector that exists now fails the
+  operation.
+* **A host-side hang, found and fixed with no issue of its own.**
+  `BlockDevice::do_read` propagated a backing-store failure without
+  completing the virtio request, so once the guest's wait became
+  unbounded an ordinary `EIO` hung it forever. A failed request is now
+  completed with `request_status::IOERR`. This commit and the guest
+  wait change are a pair for a bisect: between them, one host read
+  error hangs `convert`.
 * Issue #860 (`create` issues one 512-byte virtio request per
   sector) is adjacent rather than in scope: it makes the remote case
   pathological, and phase 6 has to coalesce regardless.

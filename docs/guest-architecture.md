@@ -336,7 +336,10 @@ provides a modular architecture with:
  (never `static`) plus the two executor service sectors (one shared
  RMW bounce — safe because all call-table I/O is synchronous and
  steps execute serially — and a fill-synthesis sector). Barrier
- policy: `Ordering` is a no-op (issue order is completion order),
+ policy: `Ordering` is a no-op (issue order is completion order,
+ because the guest waits for each request without a deadline and the
+ host always completes one, with an error status when it cannot
+ serve it),
  `Durability` fsyncs where the capability exists and degrades to
  `Ordering` elsewhere (matching commit/rebase's no-fsync
  output-device reality). Host-unit-tested against a mock `DeviceIo`

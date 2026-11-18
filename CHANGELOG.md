@@ -429,6 +429,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **`instar convert` and `instar dd` say what failed when guest I/O
+  stops them.** They used to print a bare `convert operation failed`,
+  with the cause available only under `--verbose`. They now name the
+  image, the offset in decimal and hex, and the errno, and exit 1:
+  `convert: reading the input image, disk.qcow2, failed at offset
+  262144 (0x40000): Input/output error; the image was not converted`
+  ([#924](https://github.com/shakenfist/instar/issues/924)). A named
+  refusal still wins over this message. A read that fails structurally
+  rather than at the host, such as a gap in a DMG's chunk table, now
+  reports the offset it stopped at, without an errno, instead of the
+  generic string. qemu-img also exits 1 on a source read error. See
+  `docs/convert.md`, `docs/dd.md` and `docs/format-coverage.md`.
+
 - **`instar compare` errors exit 2 or 4, never 1.** Exit 1 now means
   the images differ and nothing else. An image that cannot be opened or
   a comparison that cannot be set up (a missing file, a discovery error,
@@ -844,6 +857,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   asked for, so `--qemu-version 7.2` produced an array that no qemu
   build before 8.0.0 emits at all. All three now match qemu-img
   ([#922](https://github.com/shakenfist/instar/issues/922)).
+
+- **A slow host read no longer fails an operation.** The guest waited a
+  fixed 100,000,000 spin iterations for the host to complete a virtio
+  request, about 1.3 s on a modern host, and then reported a timeout, so
+  one slow read failed the whole operation. This is what made 16-worker
+  CI runs produce clusters of `convert operation failed`
+  ([#923](https://github.com/shakenfist/instar/issues/923)). The guest
+  now waits until the host completes the request. See
+  `docs/guest-architecture.md` and `docs/testing.md`.
+
+- **A host I/O error no longer hangs the guest.** When the backing store
+  failed a read, the VMM returned without completing the virtio request
+  at all. The guest's old spin budget ended that wait by giving up, and
+  once the guest waited properly nothing did: one injected `EIO` hung
+  `convert` indefinitely. A failed request is now completed with an
+  error status, so the operation fails and exits. This fix and the one
+  above are a pair, and a bisect that lands between them finds the hang.
+
+- **`instar convert` no longer mis-detects a LUKS-wrapped QCOW2 as a flat
+  payload when the probe read fails.** The probe of the first payload
+  sector was chained into a condition, so a failed read looked the same as
+  "no QCOW2 magic" and the container was converted as raw data, at exit 0
+  ([#926](https://github.com/shakenfist/instar/issues/926)). A failed
+  read of a sector that exists now fails the operation; a payload whose
+  offset lies past the end of the device still has no inner format, which
+  is a result and not a failure. See `docs/convert.md`.
 
 - **`instar map` refuses an extent in a state the guest cannot name**,
   exiting 1 with the offset and the state, instead of printing it as a
