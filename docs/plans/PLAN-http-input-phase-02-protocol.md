@@ -384,6 +384,51 @@ two concurrent steps would trip over.
 | An error the host cannot read hangs the guest (#932), and this phase adds new ways for the host to fail | Not this phase's to fix -- nothing here is wired into the VMM, so no new hang is reachable until phase 3. Step 2g records that phase 3 should fix #932 as part of its own work, before a remote source makes host-side failure ordinary rather than exotic |
 | A new fuzz target exists but is never fuzzed in CI, silently | `tools/ci/check-fuzz-targets.sh` exists precisely for this and is a done criterion. Step 2e runs it and reports the exit code |
 
+## Execution notes
+
+Back brief answered 2026-11-19 (AEDT). Decisions taken there, and
+departures from the plan as written, are recorded here as they
+happen.
+
+1. **The back brief confirmed decisions 8 and 10 unchanged.** A typed
+   status enum and no free-form reason string on the wire, ever; and
+   the fetcher inherits descriptors rather than taking a path. Both
+   were offered with their alternatives and both were kept.
+2. **Step 2d's end-to-end test is a Rust integration test**, under
+   `src/crates/fetch-protocol/tests/`, rather than a Python module.
+   The step's brief offered the choice; the operator settled it. This
+   removes the `tools/ci/check-test-partition.sh` claim and the
+   pull-request job wiring from the phase's scope entirely -- nothing
+   in this phase touches `tests/` or `.github/workflows/` except the
+   fuzz target's registration in step 2e.
+3. **This session may push the branch and open the pull request** for
+   this phase, granted in the back brief rather than asked for again
+   at the end.
+4. **`std` really cannot make a `SOCK_SEQPACKET` socket**, which the
+   plan's survey could not confirm on the host. Step 2a established it
+   by extracting the pinned toolchain's own standard-library source
+   from the devcontainer image and reading
+   `library/std/src/os/unix/net`: the only pair constructors are
+   `SOCK_STREAM` and `SOCK_DGRAM`, and no exported type takes a socket
+   type. It is now a test asserting `SO_TYPE` on both `std` pair
+   constructors, so the day `std` grows the capability, that test is
+   where it surfaces rather than a comment nobody rereads.
+5. **Step 2a's socket module carries more than the bare constructor
+   the brief asked for**, and it was kept deliberately: `send` with
+   `MSG_NOSIGNAL` so a dead fetcher is an error rather than a
+   `SIGPIPE` that kills the privileged process mid-operation; `recv`
+   with `MSG_TRUNC` so an oversized datagram is detectable rather than
+   silently truncated, which is the whole reason `SOCK_SEQPACKET` was
+   chosen; buffer sizing, `max_datagram` and a receive timeout. Steps
+   2b and 2c both need all of it, and decision 5's point is that the
+   `unsafe` lives in one reviewed place rather than being written
+   twice.
+6. **The build-order rule is narrower than it looked.** `make instar`
+   on a cold `src/target`, then `make test-rust`, then `make instar`
+   again all succeed in this worktree. The ordering constraint applies
+   to the first build on a cold tree, not to every alternation between
+   the dev and release images, and no `clean-instar` was needed.
+
 ## Definition of done
 
 Each item is falsifiable; the management session checks them before
