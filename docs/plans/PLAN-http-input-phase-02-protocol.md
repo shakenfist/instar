@@ -429,6 +429,34 @@ happen.
    to the first build on a cold tree, not to every alternation between
    the dev and release images, and no `clean-instar` was needed.
 
+7. **This phase does touch `.github/workflows/release.yml` after
+   all**, contrary to note 2. Step 2b found that the release
+   workflow stages its tarball with `cp instar` and `cp *.bin`, so
+   adding a host binary that is neither of those ships a tarball
+   without it -- silently, and only visibly at release time. It is one
+   line, it is a direct consequence of adding the binary, and
+   deferring it to phase 3 means the tarball is wrong for however
+   long phase 3 takes. Taken here. The class was swept rather than
+   the instance fixed: the `.deb` list, the `.rpm` list, `build.sh`,
+   the release tarball and `docs/installation.md` are the five places
+   that enumerate what instar ships, and the first four now name the
+   fetcher. The fifth is step 2f's, and it is wrong already for
+   reasons that predate this plan -- it says the packages install
+   "the six guest binaries" when there are seventeen.
+8. **The plan's step 2b brief was wrong about the `.rpm` asset
+   form.** It gave the same array form for both lists; the
+   `generate-rpm` list is a list of objects with `source`, `dest` and
+   `mode` keys, and `cargo-generate-rpm` does not accept the array
+   form the `.deb` list uses. Step 2b used the right one and said so.
+9. **The version-mismatch sentence was unified at source during
+   review.** The shared error's wording named the two sides as "this
+   build" and "the fetcher", which reads backwards on the fetcher's
+   own stderr, and the step had worked around it by rendering that one
+   case a second time in the fetcher. Since both ends link the same
+   crate and a mismatch means the binaries came from different builds,
+   the sentence now says "this build" and "the peer", reads correctly
+   from either end, and the duplicate renderer is gone.
+
 ## Definition of done
 
 Each item is falsifiable; the management session checks them before
