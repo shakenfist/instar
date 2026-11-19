@@ -2683,15 +2683,16 @@ fn file_disk_size(path: &Path, apparent: bool) -> Option<u64> {
     }
 }
 
-/// The allocation figures one `info` rendering needs.
+/// The per-file figures one `info` rendering needs.
 ///
 /// A VMDK descriptor that resolves to separate extent files is several
 /// files on disk — monolithicFlat as much as the twoGbMaxExtent* split
 /// subformats — and qemu-img reports the image's allocation as the sum
 /// over the descriptor and every extent, while each protocol child still
-/// reports the allocation of its own file. Those figures cannot be derived
-/// from one number, so they are measured together here rather than at each
-/// print site, which is how the sum came to be missing (issue #922).
+/// reports the allocation and the length of its own file. Those figures
+/// cannot be derived from one number, so they are measured together here
+/// rather than at each print site, which is how the sum came to be
+/// missing (issue #922).
 struct InfoDiskSizes {
     /// The input file's own allocation: the `/file` child's figure, and
     /// the whole image's for every single-file format.
@@ -2699,8 +2700,32 @@ struct InfoDiskSizes {
     /// Each resolved flat extent's own allocation, in descriptor order.
     /// Empty for an image that is a single file.
     extents: Vec<u64>,
+    /// Each resolved extent file's own length, in descriptor order, as
+    /// its protocol child reports it. Empty for an image that is a
+    /// single file.
+    extent_lengths: Vec<u64>,
     /// The image's allocation: the descriptor plus every extent.
     total: u64,
+}
+
+/// The cluster size `info` prints for the image as a whole, and 0 for
+/// an image that prints none.
+///
+/// Every format but a VMDK descriptor whose extents are separate files
+/// reports it from inside the sandbox, where the header was parsed. A
+/// descriptor is text, and the guest reading it sees no extent file, so
+/// its figure comes from the extents' own headers, which the host read
+/// as it resolved them. A descriptor whose extents do not agree on one
+/// grain size, or has none to agree on because they are flat, falls
+/// back to the guest's figure of 0 and prints no cluster size, which is
+/// what qemu-img does for the same images.
+fn info_cluster_size(
+    info: &guest_::InfoResultMessage,
+    vmdk_flat: Option<&crate::chain::ResolvedVmdkDescriptor>,
+) -> u64 {
+    vmdk_flat
+        .and_then(crate::chain::ResolvedVmdkDescriptor::cluster_size)
+        .unwrap_or_else(|| u64::from(info.cluster_size))
 }
 
 /// The token `info` prints for an extent's kind, in both the human and
@@ -2736,10 +2761,21 @@ impl InfoDiskSizes {
                 )
             })
             .unwrap_or_default();
+        let extent_lengths: Vec<u64> = vmdk_flat
+            .map(|resolved| {
+                measure_extent_lengths(
+                    resolved
+                        .extents
+                        .iter()
+                        .map(|extent| (extent.path.as_path(), extent.extent_size)),
+                )
+            })
+            .unwrap_or_default();
         let total = sum_with_descriptor(descriptor, &extents);
         Self {
             descriptor,
             extents,
+            extent_lengths,
             total,
         }
     }
@@ -2755,6 +2791,31 @@ fn measure_extent_files<'a>(
 ) -> Vec<u64> {
     extents
         .map(|(path, declared)| file_disk_size(path, apparent).unwrap_or(declared))
+        .collect()
+}
+
+/// Each extent file's own length rounded up to a 512-byte sector, in
+/// the order given: what an `/extents.N` protocol child reports as its
+/// `file length` in the human rendering and its `virtual-size` in JSON.
+///
+/// The length, not the allocation and not the span the descriptor line
+/// declares. qemu-img opens an extent as a raw protocol node, which
+/// reports the file's own length rounded up to a sector: measured
+/// against qemu-img 10.2.0, a sparse extent of 196609 bytes reports
+/// 197120 and a flat extent of 524289 bytes reports 524800. A flat
+/// extent's file is exactly as long as its span, which is why the span
+/// stood in for the length until sparse extents resolved; a sparse
+/// extent's file is nothing like its span. An extent that cannot be
+/// stat'd falls back to its declared span.
+fn measure_extent_lengths<'a>(extents: impl Iterator<Item = (&'a Path, u64)>) -> Vec<u64> {
+    extents
+        .map(|(path, declared)| {
+            // The apparent size is the file's length, which is what a
+            // protocol node reports whether the file is sparse or not.
+            file_disk_size(path, true)
+                .map(sector_rounded_length)
+                .unwrap_or(declared)
+        })
         .collect()
 }
 
@@ -2786,6 +2847,37 @@ fn chain_member_disk_size(image: &ChainImage, apparent: bool) -> u64 {
         apparent,
     );
     sum_with_descriptor(descriptor, &extents)
+}
+
+/// The cluster size a chain member is reported with, and 0 for a member
+/// that reports none.
+///
+/// A VMDK descriptor carries `cluster_size` 0 through chain discovery,
+/// because the field is also written into the guest's device table and
+/// the descriptor's own device has no cluster size; the figure qemu-img
+/// reports for such a member comes from its sparse extents' headers and
+/// is worked out here, where the chain is printed, so that `info` and
+/// `info --chain` cannot come to different answers for one image. Any
+/// other member reports the cluster size discovery found for it.
+fn chain_member_cluster_size(image: &ChainImage) -> u64 {
+    if image.format != ImageFormat::VmdkDescriptor {
+        return u64::from(image.cluster_size);
+    }
+    // An extent whose kind did not survive discovery is neither flat
+    // nor sparse here, so the image-wide figure is withheld rather than
+    // taken from the extents that did arrive with one.
+    let extents: Option<Vec<_>> = image
+        .external_data_files
+        .iter()
+        .map(|extent| {
+            extent
+                .vmdk_extent_kind
+                .map(|kind| (extent.path.as_path(), kind))
+        })
+        .collect();
+    extents
+        .and_then(crate::chain::descriptor_cluster_size)
+        .unwrap_or_else(|| u64::from(image.cluster_size))
 }
 
 /// Print InfoResult in qemu-img compatible format
@@ -2897,8 +2989,9 @@ fn print_info_result(
         // set by the info op so the chain reader chunks on cluster
         // boundaries), but qemu-img prints no cluster_size for parallels,
         // so suppress it by format to keep info output byte-identical.
-        if info.cluster_size > 0 && info.format != "parallels" {
-            println!("cluster_size: {}", info.cluster_size);
+        let cluster_size = info_cluster_size(info, vmdk_flat);
+        if cluster_size > 0 && info.format != "parallels" {
+            println!("cluster_size: {cluster_size}");
         }
 
         // QCOW2: "cleanly shut down: no" if dirty bit is set
@@ -3011,8 +3104,11 @@ fn print_info_result(
             // A descriptor naming its extents in separate files has one
             // entry per resolved extent, rendered with the kind the
             // descriptor's extent line declared, the resolved extent
-            // filename and no cluster-size line -- exactly like the
-            // JSON extents rendering and qemu-img's human output. All
+            // filename and the grain size that extent's own header
+            // declares -- exactly like the JSON extents rendering and
+            // qemu-img's human output. A flat extent has no grain size
+            // and qemu-img prints no cluster-size line for one, which
+            // is why an all-flat descriptor's entries carry none. All
             // other create types (monolithicSparse, streamOptimized, …)
             // have a single self-referential extent described by the
             // descriptor's own virtual size and cluster size, with an
@@ -3023,6 +3119,9 @@ fn print_info_result(
                     println!("        [{idx}]:");
                     println!("            virtual size: {}", extent.extent_size);
                     println!("            filename: {}", terminal_safe_path(&extent.path));
+                    if let Some(extent_cluster_size) = extent.cluster_size {
+                        println!("            cluster size: {extent_cluster_size}");
+                    }
                     println!("            format: {}", vmdk_extent_format(extent.kind));
                 }
             } else {
@@ -3062,25 +3161,27 @@ fn print_info_result(
         // Child node sections (qemu-img 8.0+)
         // These sections expose information about the underlying protocol layer.
         if profile.include_child_node {
-            // VMDK monolithicFlat / twoGbMaxExtentFlat images expose one
-            // '/extents.N' protocol child per resolved flat extent,
-            // ahead of the descriptor's own '/file' child. This mirrors
-            // the JSON children rendering, including the order: qemu-img
-            // walks the extents from last to first, keeping each one's
-            // own index, and prints the descriptor afterwards. The
-            // extent's "file length" is its declared virtual size
-            // (matching qemu-img, which opens the flat file as a raw
-            // protocol node), and its "disk size" is that extent file's
-            // own allocation, not the descriptor's.
+            // A VMDK descriptor naming its extents in separate files
+            // exposes one '/extents.N' protocol child per resolved
+            // extent, ahead of the descriptor's own '/file' child. This
+            // mirrors the JSON children rendering, including the order:
+            // qemu-img walks the extents from last to first, keeping
+            // each one's own index, and prints the descriptor
+            // afterwards. The extent's "file length" is that file's own
+            // length rounded to a sector, matching qemu-img, which
+            // opens the extent as a raw protocol node, and its "disk
+            // size" is that extent file's own allocation, not the
+            // descriptor's.
             if let Some(resolved) = vmdk_flat {
                 for (i, extent) in resolved.extents.iter().enumerate().rev() {
+                    let extent_length = disk_sizes.extent_lengths[i];
                     println!("Child node '/extents.{i}':");
                     println!("    filename: {}", terminal_safe_path(&extent.path));
                     println!("    protocol type: file");
                     println!(
                         "    file length: {} ({} bytes)",
-                        format_size_human(extent.extent_size, qemu_compat),
-                        extent.extent_size
+                        format_size_human(extent_length, qemu_compat),
+                        extent_length
                     );
                     println!(
                         "    disk size: {}",
@@ -3200,15 +3301,19 @@ fn print_info_result_json(
     // first appearance at 8.0.0 — exactly where include_child_node turns
     // on — and the reversal identically on all 50 builds above it. The
     // separate format-specific extents array stays in descriptor order,
-    // because qemu-img keeps it that way. The descriptor's virtual-size is
-    // rounded up to the 512-byte sector boundary (qemu treats it as an
-    // unstructured file). See issue #922.
+    // because qemu-img keeps it that way. A protocol node's virtual-size
+    // is its file's own length rounded up to the 512-byte sector
+    // boundary -- qemu treats each of these files as unstructured -- so
+    // an extent child reports the extent file's length and not the span
+    // the descriptor line declares for it, while the format-specific
+    // extents array below reports the span. See issue #922.
     if profile.include_child_node {
         println!("    \"children\": [");
         let mut emitted_any_child = false;
         if let Some(resolved) = vmdk_flat {
             for (i, extent) in resolved.extents.iter().enumerate().rev() {
                 let extent_disk = disk_sizes.extents[i];
+                let extent_length = disk_sizes.extent_lengths[i];
                 let extent_path = extent.path.to_string_lossy();
                 if emitted_any_child {
                     println!("        }},");
@@ -3217,7 +3322,7 @@ fn print_info_result_json(
                 println!("            \"name\": \"extents.{i}\",");
                 println!("            \"info\": {{");
                 println!("                \"children\": [],");
-                println!("                \"virtual-size\": {},", extent.extent_size);
+                println!("                \"virtual-size\": {extent_length},");
                 println!(
                     "                \"filename\": \"{}\",",
                     json_escape(&extent_path)
@@ -3305,8 +3410,9 @@ fn print_info_result_json(
     // by the info op so the chain reader chunks on cluster boundaries),
     // but qemu-img emits no cluster-size for parallels, so suppress it by
     // format to keep the JSON byte-identical.
-    if info.cluster_size > 0 && info.format != "parallels" {
-        println!("    \"cluster-size\": {},", info.cluster_size);
+    let cluster_size = info_cluster_size(info, vmdk_flat);
+    if cluster_size > 0 && info.format != "parallels" {
+        println!("    \"cluster-size\": {cluster_size},");
     }
 
     println!("    \"format\": \"{}\",", json_escape(&info.format));
@@ -3418,9 +3524,11 @@ fn print_info_result_json(
         );
         println!("            \"extents\": [");
         if let Some(resolved) = vmdk_flat {
-            // One entry per resolved extent, with the kind its extent
-            // line declared and no cluster-size. Matches qemu-img
-            // info --output=json.
+            // One entry per resolved extent, with the span its extent
+            // line declared, the kind that line named, and the grain
+            // size the extent's own header declares -- which a flat
+            // extent does not have, and qemu-img emits no cluster-size
+            // for one. Matches qemu-img info --output=json.
             for (idx, extent) in resolved.extents.iter().enumerate() {
                 if idx > 0 {
                     println!("                }},");
@@ -3434,6 +3542,9 @@ fn print_info_result_json(
                     "                    \"filename\": \"{}\",",
                     json_escape(&extent.path.to_string_lossy())
                 );
+                if let Some(extent_cluster_size) = extent.cluster_size {
+                    println!("                    \"cluster-size\": {extent_cluster_size},");
+                }
                 println!(
                     "                    \"format\": \"{}\"",
                     vmdk_extent_format(extent.kind)
@@ -4505,8 +4616,9 @@ fn print_backing_chain(chain: &BackingChain, apparent: bool) {
             format_size_human(disk_size, false),
             disk_size
         );
-        if image.cluster_size > 0 {
-            println!("      cluster size: {} bytes", image.cluster_size);
+        let cluster_size = chain_member_cluster_size(image);
+        if cluster_size > 0 {
+            println!("      cluster size: {cluster_size} bytes");
         }
     }
 }
@@ -4551,8 +4663,9 @@ fn print_backing_chain_json(chain: &BackingChain, apparent: bool) {
                 chain_member_disk_size(image, apparent)
             ),
         ];
-        if image.cluster_size > 0 {
-            fields.push(format!("        \"cluster-size\": {}", image.cluster_size));
+        let cluster_size = chain_member_cluster_size(image);
+        if cluster_size > 0 {
+            fields.push(format!("        \"cluster-size\": {cluster_size}"));
         }
         if let Some(backing) = &image.backing_file_raw {
             fields.push(format!(
@@ -5469,6 +5582,203 @@ mod chain_member_disk_size_tests {
             vec![(extent, 1)],
         );
         assert_eq!(chain_member_disk_size(&image, true), 7 + 1000);
+    }
+}
+
+#[cfg(test)]
+mod info_extent_figures_tests {
+    //! The two per-extent figures `info` cannot get from the guest: an
+    //! extent file's own length, and the cluster size a descriptor's
+    //! sparse extents declare.
+    use super::*;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    /// A sparse extent file `length` bytes long whose header declares
+    /// `grain_size_sectors`.
+    fn sparse_extent(dir: &TempDir, name: &str, grain_size_sectors: u64, length: usize) -> PathBuf {
+        let path = dir.path().join(name);
+        let mut bytes = vec![0u8; length];
+        bytes[vmdk::MAGIC_OFFSET..vmdk::MAGIC_OFFSET + 4]
+            .copy_from_slice(&vmdk::VMDK4_MAGIC.to_le_bytes());
+        bytes[vmdk::GRAIN_SIZE_OFFSET..vmdk::GRAIN_SIZE_OFFSET + 8]
+            .copy_from_slice(&grain_size_sectors.to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    fn resolved(
+        extents: Vec<crate::chain::ResolvedVmdkExtent>,
+    ) -> crate::chain::ResolvedVmdkDescriptor {
+        let virtual_size = extents.iter().map(|extent| extent.extent_size).sum();
+        crate::chain::ResolvedVmdkDescriptor {
+            extents,
+            virtual_size,
+            parent_hint: None,
+        }
+    }
+
+    fn extent(
+        path: PathBuf,
+        extent_size: u64,
+        kind: crate::chain::VmdkExtentKind,
+        cluster_size: Option<u64>,
+    ) -> crate::chain::ResolvedVmdkExtent {
+        crate::chain::ResolvedVmdkExtent {
+            path,
+            extent_size,
+            kind,
+            cluster_size,
+        }
+    }
+
+    #[test]
+    fn an_extents_length_is_its_file_rounded_to_a_sector() {
+        // Not the span its descriptor line declares, and not the
+        // blocks the file holds: a sparse extent is shorter than its
+        // span and holds fewer blocks than it is long, and qemu-img
+        // reports the length between the two, rounded up.
+        let dir = TempDir::new().unwrap();
+        let odd = dir.path().join("odd.vmdk");
+        std::fs::write(&odd, vec![0u8; 1000]).unwrap();
+        let hollow = dir.path().join("hollow.vmdk");
+        std::fs::File::create(&hollow)
+            .unwrap()
+            .set_len(1 << 20)
+            .unwrap();
+        let gone = dir.path().join("gone.vmdk");
+        let lengths = measure_extent_lengths(
+            [
+                (odd.as_path(), 1 << 30),
+                (hollow.as_path(), 1 << 30),
+                (gone.as_path(), 4096),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(lengths, vec![1024, 1 << 20, 4096]);
+    }
+
+    #[test]
+    fn the_image_cluster_size_comes_from_a_descriptors_sparse_extents() {
+        // Every other format reports its cluster size from inside the
+        // sandbox, and a descriptor that has none to offer leaves that
+        // figure alone rather than overriding it with a zero.
+        let dir = TempDir::new().unwrap();
+        let mut info = guest_::InfoResultMessage::default();
+        assert_eq!(info_cluster_size(&info, None), 0);
+        info.cluster_size = 65536;
+        assert_eq!(info_cluster_size(&info, None), 65536);
+
+        let sparse = resolved(vec![extent(
+            sparse_extent(&dir, "s001.vmdk", 256, 512),
+            1 << 31,
+            crate::chain::VmdkExtentKind::Sparse,
+            Some(131072),
+        )]);
+        assert_eq!(info_cluster_size(&info, Some(&sparse)), 131072);
+
+        let flat = resolved(vec![extent(
+            dir.path().join("f001.vmdk"),
+            1 << 31,
+            crate::chain::VmdkExtentKind::Flat,
+            None,
+        )]);
+        assert_eq!(info_cluster_size(&info, Some(&flat)), 65536);
+    }
+
+    fn descriptor_member(
+        path: PathBuf,
+        extents: Vec<(PathBuf, crate::chain::VmdkExtentKind)>,
+    ) -> ChainImage {
+        ChainImage {
+            path,
+            format: ImageFormat::VmdkDescriptor,
+            virtual_size: 1 << 20,
+            actual_size: 7,
+            cluster_size: 0,
+            backing_file_raw: None,
+            flags: 0,
+            external_data_files: extents
+                .into_iter()
+                .map(|(path, kind)| ExternalDataFile {
+                    path,
+                    extent_size: 1 << 20,
+                    vmdk_extent_kind: Some(kind),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_chain_members_cluster_size_reads_a_descriptors_extents() {
+        // A descriptor arrives from chain discovery with cluster_size
+        // 0, because the field is also the guest's, so the chain
+        // printer works the figure out from the extents -- and reports
+        // the same one `info` does for the same image.
+        let dir = TempDir::new().unwrap();
+        let descriptor = dir.path().join("d.vmdk");
+        std::fs::write(&descriptor, b"# Disk DescriptorFile\n").unwrap();
+        let first = sparse_extent(&dir, "s001.vmdk", 128, 512);
+        let second = sparse_extent(&dir, "s002.vmdk", 128, 512);
+        let image = descriptor_member(
+            descriptor.clone(),
+            vec![
+                (first.clone(), crate::chain::VmdkExtentKind::Sparse),
+                (second, crate::chain::VmdkExtentKind::Sparse),
+            ],
+        );
+        assert_eq!(chain_member_cluster_size(&image), 65536);
+
+        // A flat extent beside a sparse one takes the image-wide
+        // figure away, as it does in `info`.
+        let flat = sparse_extent(&dir, "f001.vmdk", 128, 512);
+        let mixed = descriptor_member(
+            descriptor,
+            vec![
+                (first, crate::chain::VmdkExtentKind::Sparse),
+                (flat, crate::chain::VmdkExtentKind::Flat),
+            ],
+        );
+        assert_eq!(chain_member_cluster_size(&mixed), 0);
+    }
+
+    #[test]
+    fn another_format_reports_the_cluster_size_discovery_found() {
+        // The file is a real sparse VMDK header naming a grain size, so
+        // only the format check can keep that figure out of a member
+        // that is not a descriptor.
+        let dir = TempDir::new().unwrap();
+        let path = sparse_extent(&dir, "top.vmdk", 128, 512);
+        for format in [ImageFormat::Qcow2, ImageFormat::Raw, ImageFormat::Vmdk4] {
+            let mut image = descriptor_member(
+                path.clone(),
+                vec![(path.clone(), crate::chain::VmdkExtentKind::Sparse)],
+            );
+            image.format = format;
+            image.cluster_size = 4096;
+            assert_eq!(chain_member_cluster_size(&image), 4096, "{format:?}");
+        }
+    }
+
+    #[test]
+    fn an_extent_with_no_kind_takes_the_image_cluster_size_away() {
+        // A VMDK extent reaching the host without a kind is a bug, not
+        // a default, so the figure is withheld rather than taken from
+        // the extents that did arrive with one.
+        let dir = TempDir::new().unwrap();
+        let descriptor = dir.path().join("d.vmdk");
+        std::fs::write(&descriptor, b"# Disk DescriptorFile\n").unwrap();
+        let sparse = sparse_extent(&dir, "s001.vmdk", 128, 512);
+        let mut image = descriptor_member(
+            descriptor,
+            vec![(sparse, crate::chain::VmdkExtentKind::Sparse)],
+        );
+        image.external_data_files.push(ExternalDataFile {
+            path: sparse_extent(&dir, "s002.vmdk", 128, 512),
+            extent_size: 1 << 20,
+            vmdk_extent_kind: None,
+        });
+        assert_eq!(chain_member_cluster_size(&image), 0);
     }
 }
 

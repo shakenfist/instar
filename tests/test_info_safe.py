@@ -340,6 +340,49 @@ class TestInfoChainJsonOutput(InstarTestBase):
         )
         self.assertEqual(expected, stdout)
 
+    def test_chain_reports_a_split_sparse_descriptors_cluster_size(self):
+        """A split-sparse descriptor's chain entry carries its grain size.
+
+        qemu-img reports 65536 for this image whether it is asked for
+        one image or for the chain, and the grain size is in the extent
+        files rather than in the descriptor, so a chain listing that
+        read only what chain discovery recorded for the descriptor
+        would omit the field here while the non-chain listing reported
+        it -- two answers for one image.
+        """
+        source = self._chain_image('vmdk-split-sparse-5g')
+        stdout, stderr, rc = self.run_instar_info(
+            source, chain=True, output_format='json'
+        )
+        self.assertEqual(0, rc, f'stderr={stderr!r}')
+        chain = json.loads(stdout)
+        self.assertEqual(1, len(chain), f'expected a one-image chain; got {chain!r}')
+        self.assertEqual(65536, chain[0]['cluster-size'])
+
+        stdout, stderr, rc = self.run_instar_info(source, chain=True)
+        self.assertEqual(0, rc, f'stderr={stderr!r}')
+        self.assertIn('      cluster size: 65536 bytes\n', stdout)
+
+    def test_chain_reports_no_cluster_size_for_a_flat_descriptor(self):
+        """A flat descriptor's chain entry carries no cluster size.
+
+        A flat extent has no grain size, and qemu-img reports no
+        cluster size for either member of this chain. The figure is
+        read from the extents, so an implementation that reported
+        something for a file whose first bytes happened to look like a
+        sparse header would show it here.
+        """
+        source = self._chain_image('vmdk-flat-with-parent')
+        self._chain_image('vmdk-flat-parent')
+        stdout, stderr, rc = self.run_instar_info(
+            source, chain=True, output_format='json'
+        )
+        self.assertEqual(0, rc, f'stderr={stderr!r}')
+        chain = json.loads(stdout)
+        self.assertEqual(2, len(chain), f'expected a two-image chain; got {chain!r}')
+        for member in chain:
+            self.assertNotIn('cluster-size', member)
+
 
 # VHDX region table at 192 KiB: a 16-byte header ('regi', checksum,
 # entry count, reserved) then 32-byte entries of (GUID, file offset

@@ -965,6 +965,12 @@ pub struct ResolvedVmdkExtent {
     pub extent_size: u64,
     /// Which kind the descriptor's extent line called this file.
     pub kind: VmdkExtentKind,
+    /// The grain size this extent's own binary header declares, in
+    /// bytes, and `None` for a flat extent or a sparse one whose header
+    /// could not be read. This is what `info` reports as the extent's
+    /// cluster size, so it is read here, where the path has just been
+    /// validated and the line's kind is known.
+    pub cluster_size: Option<u64>,
 }
 
 /// Result of resolving a VMDK descriptor's extents on the host.
@@ -978,6 +984,79 @@ pub struct ResolvedVmdkDescriptor {
     /// Parent filename hint from descriptor, if present.
     /// Analogous to QCOW2 backing-filename.
     pub parent_hint: Option<String>,
+}
+
+impl ResolvedVmdkDescriptor {
+    /// The cluster size the image reports as a whole, and `None` when
+    /// it reports none.
+    ///
+    /// A descriptor is text and names no grain size of its own, so the
+    /// figure comes from the extents. Measured against qemu-img 10.2.0:
+    /// it is printed only when every extent is sparse and every one of
+    /// them declares the same grain size. A descriptor mixing flat and
+    /// sparse extents prints none, and neither does one whose sparse
+    /// extents disagree -- in both cases each extent still reports its
+    /// own, so the image-wide figure is the only thing withheld. An
+    /// all-flat descriptor has no grain size to report at all.
+    pub fn cluster_size(&self) -> Option<u64> {
+        common_cluster_size(self.extents.iter().map(|extent| extent.cluster_size))
+    }
+}
+
+/// The one cluster size a set of extents agrees on, or `None` if any of
+/// them has none or they disagree. The rule `ResolvedVmdkDescriptor::
+/// cluster_size` documents, kept in one place because the chain printer
+/// applies it to extents it has only the paths and kinds of.
+fn common_cluster_size(sizes: impl IntoIterator<Item = Option<u64>>) -> Option<u64> {
+    let mut sizes = sizes.into_iter();
+    let first = sizes.next()??;
+    sizes.all(|size| size == Some(first)).then_some(first)
+}
+
+/// The cluster size reported for a descriptor whose extents are known
+/// only as paths and kinds, reading each sparse extent's header to get
+/// it. `ResolvedVmdkDescriptor::cluster_size` is the same rule over
+/// extents already resolved.
+pub fn descriptor_cluster_size<'a>(
+    extents: impl IntoIterator<Item = (&'a Path, VmdkExtentKind)>,
+) -> Option<u64> {
+    common_cluster_size(
+        extents
+            .into_iter()
+            .map(|(path, kind)| extent_cluster_size(path, kind)),
+    )
+}
+
+/// The grain size a sparse extent's own binary header declares, in
+/// bytes. `None` for a flat extent, which has no grain size, and for a
+/// sparse extent whose header cannot be read, does not carry the VMDK4
+/// magic, or declares a zero grain size.
+///
+/// qemu-img refuses to open an image whose sparse extent is any of
+/// those three, so there is no output to be unlike; reporting no
+/// cluster size is as close as an `info` that still describes the
+/// descriptor can come, and the guest's reader refuses the same extent
+/// when something tries to read it.
+fn extent_cluster_size(path: &Path, kind: VmdkExtentKind) -> Option<u64> {
+    use std::io::Read;
+
+    if kind != VmdkExtentKind::Sparse {
+        return None;
+    }
+    let mut header = [0u8; vmdk::HEADER_FULL_SIZE];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut header))
+        .ok()?;
+    let magic = u32::from_le_bytes(
+        header[vmdk::MAGIC_OFFSET..vmdk::MAGIC_OFFSET + 4]
+            .try_into()
+            .expect("four bytes"),
+    );
+    if magic != vmdk::VMDK4_MAGIC {
+        return None;
+    }
+    let grain_size = vmdk::Vmdk4HeaderFull::parse(&header)?.grain_size_bytes;
+    (grain_size > 0).then_some(grain_size)
 }
 
 /// Read a VMDK descriptor, validate it, and resolve its extent file(s)
@@ -1106,10 +1185,13 @@ pub fn resolve_vmdk_flat_descriptor(
             ))
         })?;
 
+        let cluster_size = extent_cluster_size(&path, kind);
+
         resolved_extents.push(ResolvedVmdkExtent {
             path,
             extent_size,
             kind,
+            cluster_size,
         });
     }
 
@@ -2162,9 +2244,9 @@ mod tests {
     #[test]
     fn resolve_descriptor_carries_each_extents_kind() {
         // The kinds a descriptor may mix, each reported as the line
-        // declared it. Nothing here looks at the files: a sparse
-        // extent's bytes are not read until the guest parses its
-        // header, and a flat one's never are.
+        // declared it. The only thing read from an extent file here is
+        // a sparse one's grain size, and these two carry no header, so
+        // neither reports a cluster size.
         let tmp = TempDir::new().unwrap();
         let desc = tmp.path().join("foo.vmdk");
         let first = tmp.path().join("foo-s001.vmdk");
@@ -2187,6 +2269,152 @@ mod tests {
         assert_eq!(resolved.extents[1].kind, VmdkExtentKind::Flat);
         assert_eq!(resolved.extents[1].extent_size, 2048 * 512);
         assert_eq!(resolved.virtual_size, (1024 + 2048) * 512);
+        assert_eq!(resolved.extents[0].cluster_size, None);
+        assert_eq!(resolved.extents[1].cluster_size, None);
+    }
+
+    /// Write a sparse extent file whose header declares
+    /// `grain_size_sectors`. The grain size is all the host reads from
+    /// a sparse extent, so nothing else in the header is filled in.
+    fn write_sparse_extent(path: &Path, grain_size_sectors: u64) {
+        let mut header = vec![0u8; 512];
+        header[vmdk::MAGIC_OFFSET..vmdk::MAGIC_OFFSET + 4]
+            .copy_from_slice(&vmdk::VMDK4_MAGIC.to_le_bytes());
+        header[vmdk::GRAIN_SIZE_OFFSET..vmdk::GRAIN_SIZE_OFFSET + 8]
+            .copy_from_slice(&grain_size_sectors.to_le_bytes());
+        std::fs::write(path, header).unwrap();
+    }
+
+    /// Resolve a two-extent descriptor whose lines declare `kinds`,
+    /// over extent files written by `write_extents`.
+    fn resolve_two_extent_descriptor(
+        tmp: &TempDir,
+        kinds: [&str; 2],
+        write_extents: impl Fn(&Path, &Path),
+    ) -> ResolvedVmdkDescriptor {
+        let desc = tmp.path().join("foo.vmdk");
+        let first = tmp.path().join("foo-s001.vmdk");
+        let second = tmp.path().join("foo-s002.vmdk");
+        let text = format!(
+            "# Disk DescriptorFile\n\
+             version=1\n\
+             CID=1\n\
+             createType=\"twoGbMaxExtentSparse\"\n\
+             RW 1024 {} \"foo-s001.vmdk\" 0\n\
+             RW 1024 {} \"foo-s002.vmdk\" 0\n",
+            kinds[0], kinds[1]
+        );
+        std::fs::write(&desc, text).unwrap();
+        write_extents(&first, &second);
+        resolve_vmdk_flat_descriptor(&desc, &default_security_config()).unwrap()
+    }
+
+    #[test]
+    fn resolve_descriptor_reads_each_sparse_extents_grain_size() {
+        // A descriptor states no grain size of its own: it is in each
+        // sparse extent's binary header, and the span its line declares
+        // is nothing like it.
+        let tmp = TempDir::new().unwrap();
+        let resolved = resolve_two_extent_descriptor(&tmp, ["SPARSE", "SPARSE"], |a, b| {
+            write_sparse_extent(a, 128);
+            write_sparse_extent(b, 128);
+        });
+        assert_eq!(resolved.extents[0].cluster_size, Some(65536));
+        assert_eq!(resolved.extents[1].cluster_size, Some(65536));
+        assert_eq!(resolved.cluster_size(), Some(65536));
+    }
+
+    #[test]
+    fn a_flat_extent_reports_no_cluster_size_whatever_its_bytes_hold() {
+        // The extent line is the authority on an extent's kind, so a
+        // flat extent whose file happens to begin with a sparse header
+        // still has no grain size -- and a descriptor mixing the kinds
+        // reports none for the image, which is what qemu-img does.
+        let tmp = TempDir::new().unwrap();
+        let resolved = resolve_two_extent_descriptor(&tmp, ["SPARSE", "FLAT"], |a, b| {
+            write_sparse_extent(a, 128);
+            write_sparse_extent(b, 128);
+        });
+        assert_eq!(resolved.extents[0].cluster_size, Some(65536));
+        assert_eq!(resolved.extents[1].cluster_size, None);
+        assert_eq!(resolved.cluster_size(), None);
+    }
+
+    #[test]
+    fn a_descriptor_whose_sparse_extents_disagree_reports_no_cluster_size() {
+        // Each extent still reports its own: only the image-wide figure
+        // is withheld, and qemu-img withholds it the same way.
+        let tmp = TempDir::new().unwrap();
+        let resolved = resolve_two_extent_descriptor(&tmp, ["SPARSE", "SPARSE"], |a, b| {
+            write_sparse_extent(a, 128);
+            write_sparse_extent(b, 256);
+        });
+        assert_eq!(resolved.extents[0].cluster_size, Some(65536));
+        assert_eq!(resolved.extents[1].cluster_size, Some(131072));
+        assert_eq!(resolved.cluster_size(), None);
+    }
+
+    #[test]
+    fn a_sparse_extent_header_that_says_nothing_reports_no_cluster_size() {
+        // Three files qemu-img refuses to open at all: one carrying a
+        // grain size where a header would have one but no VMDK4 magic,
+        // one declaring a zero grain size, and one too short to hold a
+        // header. An `info` that still describes the descriptor reports
+        // no cluster size for them rather than a figure read out of
+        // whatever bytes are there.
+        for prepare in [
+            (|path: &Path| {
+                let mut bytes = vec![0u8; 512];
+                bytes[vmdk::GRAIN_SIZE_OFFSET..vmdk::GRAIN_SIZE_OFFSET + 8]
+                    .copy_from_slice(&128u64.to_le_bytes());
+                std::fs::write(path, bytes).unwrap();
+            }) as fn(&Path),
+            |path: &Path| write_sparse_extent(path, 0),
+            |path: &Path| {
+                // Shorter than a whole header, so there is nothing to
+                // parse however good the first bytes look.
+                let mut header = vec![0u8; vmdk::HEADER_FULL_SIZE - 1];
+                header[vmdk::MAGIC_OFFSET..vmdk::MAGIC_OFFSET + 4]
+                    .copy_from_slice(&vmdk::VMDK4_MAGIC.to_le_bytes());
+                std::fs::write(path, header).unwrap();
+            },
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let resolved = resolve_two_extent_descriptor(&tmp, ["SPARSE", "SPARSE"], |a, b| {
+                write_sparse_extent(a, 128);
+                prepare(b);
+            });
+            assert_eq!(resolved.extents[1].cluster_size, None);
+            assert_eq!(resolved.cluster_size(), None);
+        }
+    }
+
+    #[test]
+    fn descriptor_cluster_size_reads_the_extents_it_is_given() {
+        // The same rule over extents known only as paths and kinds,
+        // which is how the chain printer sees a descriptor's.
+        let tmp = TempDir::new().unwrap();
+        let sparse = tmp.path().join("s001.vmdk");
+        let flat = tmp.path().join("f001.vmdk");
+        write_sparse_extent(&sparse, 128);
+        write_sparse_extent(&flat, 128);
+        assert_eq!(
+            descriptor_cluster_size([(sparse.as_path(), VmdkExtentKind::Sparse)]),
+            Some(65536)
+        );
+        assert_eq!(
+            descriptor_cluster_size([
+                (sparse.as_path(), VmdkExtentKind::Sparse),
+                (flat.as_path(), VmdkExtentKind::Flat),
+            ]),
+            None
+        );
+        assert_eq!(
+            descriptor_cluster_size([(flat.as_path(), VmdkExtentKind::Flat)]),
+            None
+        );
+        let no_extents: [(&Path, VmdkExtentKind); 0] = [];
+        assert_eq!(descriptor_cluster_size(no_extents), None);
     }
 
     #[test]
