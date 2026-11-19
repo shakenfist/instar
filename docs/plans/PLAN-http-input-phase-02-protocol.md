@@ -481,6 +481,50 @@ happen.
     is a placeholder rather than a policy; deadlines and caps are phase
     8's subject, and it should set this from the same policy as the
     rest.
+12. **Step 2d's tests live in `src/fetch/tests/`, not in
+    `src/crates/fetch-protocol/tests/`** as note 2 said. Both are Rust
+    integration tests, so note 2's substance stands -- no Python module, no
+    test-partition claim -- but the package matters:
+    `env!("CARGO_BIN_EXE_instar-fetch")` is defined only for integration
+    tests in the same package as the binary, so a test there is handed the
+    exact path of the binary cargo built for it, and there is no case where
+    the binary is absent to skip over. `src/fetch/tests/end_to_end.rs` is
+    the end-to-end half (10 tests) and `src/fetch/tests/hostile_peer.rs`
+    the adversarial half (7 tests); both run under
+    `cargo test --release --workspace`.
+13. **The negotiation really does follow the kernel's grant, measured both
+    ways.** On this host a socket left alone is granted 212992 bytes, which
+    is a 212960-byte datagram ceiling and a 212480-byte block; one asking
+    for 4096 is granted 8192, which is an 8160-byte ceiling and a
+    7680-byte block. Step 2d's small-buffer cases assert the relationship
+    rather than those numbers -- the block equals
+    `negotiate_block_size(granted, granted)` and is below both
+    `DEFAULT_BLOCK_SIZE` and `MAX_BLOCK_SIZE` -- so neither the 64 KiB
+    default nor the 256 KiB ceiling can satisfy them, and a read several
+    times that block still comes back byte-identical, which it can only do
+    by splitting.
+
+## Mutation results
+
+Step 2d's tests are only worth their runtime if they fail when the thing
+they describe stops working. Each of the three mutations below was applied
+on its own to a scratch copy's original, the narrowed suite
+(`cargo test --release --no-fail-fast -p instar-fetch -p fetch-protocol`)
+was run against it, and the file was restored from the copy. All three were
+killed, and in every case one of step 2d's own tests is among the failures
+rather than only a pre-existing unit test.
+
+| Mutation | The exact edit | Tests that failed |
+|---|---|---|
+| The read reply's length check stops refusing a claim past the negotiated maximum | In `ReadReply::decode` (`wire.rs`), delete the `if length > max_block { return Err(ProtocolError::LengthTooLarge { length, max: max_block }); }` block, leaving `let length = ...` followed directly by `let available = ...` | `hostile_peer::a_reply_claiming_more_than_the_negotiated_maximum_is_refused`, `wire::tests::length_past_the_negotiated_maximum_is_refused` |
+| The client stops matching a reply to the request in flight by id | In `FetchClient::read_block` (`client.rs`), delete the whole `if header.id != id { ... }` block | `hostile_peer::a_reply_replayed_from_an_earlier_block_is_refused`, `client::tests::reply_with_an_unrequested_id_is_an_error`, `client::tests::a_failed_exchange_ends_the_connection` |
+| The block-size clamp stops following the granted socket buffer | In `InitReply::accepted_block_size` (`wire.rs`), change `if self.block_size > ours {` to `if self.block_size > MAX_BLOCK_SIZE {`, so the proposal is judged against the protocol's constant ceiling instead of what this side's socket was actually granted | `hostile_peer::a_peer_advertising_a_block_this_side_cannot_carry_is_refused`, `wire::tests::a_greedy_peer_block_size_is_clamped_to_what_this_side_can_carry` |
+
+The third mutation is the one worth reading twice: it leaves every unit test
+that uses a default-sized socket passing, because a 64 KiB proposal is
+inside the constant ceiling. Only a test that shrinks its own socket buffer
+and then watches where the negotiation lands can see it, which is why the
+small-buffer cases exist in both halves.
 
 ## Definition of done
 
