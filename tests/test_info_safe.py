@@ -117,18 +117,6 @@ class TestInfoSafe(testscenarios.WithScenarios, InstarTestBase):
         if not image.path.exists():
             self.skipTest(f'Image file not found: {image.path}')
 
-        # Skip images whose format instar does not implement yet. qemu-img
-        # reads these fine, so a baseline exists and the parity gap stays
-        # measurable, but asserting equality would just pin a known TODO as a
-        # hard failure. Currently twoGbMaxExtentSparse: multi-extent SPARSE
-        # descriptors report FLAG_NOT_SUPPORTED (docs/format-coverage.md).
-        # Clear the manifest field to re-enable these tests.
-        if image.is_instar_unsupported:
-            self.skipTest(
-                f'instar does not support {self.image_id} yet: '
-                f'{image.instar_unsupported}'
-            )
-
         # Skip if image hash doesn't match (indicates baselines need regeneration)
         self.skip_if_hash_mismatch(image)
 
@@ -487,41 +475,6 @@ class TestInfoVhdxMetadataLayout(InstarTestBase):
             info = self._info_json(child)
             self.assertEqual(self.VIRTUAL_SIZE, info['virtual-size'])
             self.assertEqual('parent.vhdx', info.get('backing-filename'))
-
-
-class TestInstarUnsupportedIsStillUnsupported(InstarTestBase):
-    """Every image the manifest calls unsupported really is refused.
-
-    `instar_unsupported` makes the baseline comparison skip, which is
-    the right behaviour while the gap is real -- qemu-img reads these
-    images, so a baseline exists and the parity gap stays measurable,
-    and asserting equality would pin a known gap as a hard failure. But
-    a skip proves nothing on its own, and nothing else reads the field,
-    so until this test the claim behind every one of those skips was
-    unchecked and a flag left behind after the gap closed would have
-    gone on silently suppressing the comparison it was hiding.
-
-    So the field is falsifiable here: the image must fail. When one
-    starts succeeding, this is what says so, and the fix is to clear
-    `instar_unsupported` in the manifest and let the baseline
-    comparison run.
-    """
-
-    def test_every_unsupported_image_is_refused(self):
-        flagged = [image for image in load_manifest_images() if image.get('instar_unsupported')]
-        self.assertTrue(flagged, 'the manifest sets instar_unsupported on no image at all')
-        for entry in flagged:
-            with self.subTest(image=entry['id']):
-                image = self.get_image(entry['id'])
-                if not image.path.exists():
-                    self.skipTest(f'Image file not found: {image.path}')
-                stdout, stderr, rc = self.run_instar_info(image.path)
-                self.assertNotEqual(
-                    0, rc,
-                    f'{entry["id"]} is marked unsupported but instar info succeeded. '
-                    f'If the gap has closed, clear instar_unsupported in the manifest '
-                    f'so the baseline comparison runs. Output: {stdout!r}'
-                )
 
 
 # The static qemu-img builds the multi-file VMDK tests below compare
