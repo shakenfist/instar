@@ -1630,10 +1630,14 @@ pub fn parse_hex_value(bytes: &[u8]) -> Option<u32> {
 
 /// Maximum number of extent lines accepted in a descriptor.
 ///
-/// Real-world monolithicFlat uses a single extent;
-/// twoGbMaxExtentFlat caps at ~1TB/2GB extents per file so this
-/// limit comfortably covers any legitimate descriptor.
-pub const MAX_EXTENTS: usize = 32;
+/// This is the chain config's extent table size and not a number of
+/// its own: the two bound the same thing, and whichever is smaller is
+/// the one a user meets, so a descriptor this crate accepts is one the
+/// guest can be told about. At qemu's 2 GiB default extent size it
+/// covers a 128 GiB image. The largest in the corpus is 100 GiB in 26
+/// extents of 3.96 GiB each; the same image written with qemu's
+/// default would need 50.
+pub const MAX_EXTENTS: usize = shared::MAX_CHAIN_EXTENTS;
 
 /// Access mode declared on an extent line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

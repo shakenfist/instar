@@ -1024,13 +1024,12 @@ pub fn resolve_vmdk_flat_descriptor(
     }
 
     let extents = vmdk::parse_descriptor_extents(text).map_err(|e| {
-        // The extent-count bound names the limit that actually
-        // refused the image. Two of them apply -- the descriptor
-        // parser's `vmdk::MAX_EXTENTS` and the extent table's
-        // `shared::MAX_CHAIN_EXTENTS` -- and the parser's is the lower
-        // of the two, so an over-long descriptor never reaches the
-        // table. Reporting the table's bound here would send the user
-        // looking for room that was never the constraint.
+        // The parser refuses a descriptor with more extents than the
+        // chain config's extent table holds, because `MAX_EXTENTS` is
+        // that table's size, so this is the first and usually the only
+        // place an over-long descriptor is stopped. The table's own
+        // check still runs, for a chain or a comparison whose images
+        // each fit but whose extents together do not.
         if e == vmdk::ExtentParseError::TooManyExtents {
             return ChainError::PathResolutionError(format!(
                 "VMDK descriptor '{}' declares more than the {} extents \
@@ -2224,13 +2223,18 @@ mod tests {
 
     #[test]
     fn resolve_descriptor_names_the_extent_bound_that_applied() {
-        // Two bounds could refuse an over-long descriptor, and the
-        // descriptor parser's is the lower one, so it is the one the
-        // message must name -- a user told about the extent table's 64
-        // would go looking for room that was never the constraint.
-        assert!(
-            vmdk::MAX_EXTENTS <= shared::MAX_CHAIN_EXTENTS,
-            "the descriptor parser's bound is the tighter of the two"
+        // The parser's bound is the extent table's size, so the two
+        // cannot disagree about how many extents an image may have and
+        // the message names a number the user can act on. They are
+        // asserted equal here rather than only defined that way,
+        // because a later edit to either is what this test exists to
+        // catch: a parser that accepted more than the table holds would
+        // refuse the image later, from the host, naming a different
+        // bound.
+        assert_eq!(
+            vmdk::MAX_EXTENTS,
+            shared::MAX_CHAIN_EXTENTS,
+            "the parser's extent bound is the extent table's size"
         );
         let tmp = TempDir::new().unwrap();
         let desc = tmp.path().join("foo.vmdk");

@@ -167,11 +167,12 @@ extents than the table holds cannot be described to the guest and is
 refused with a message naming the bound; raising the bound means moving
 the config region rather than changing the constant.
 
-The descriptor parser has a bound of its own, `vmdk::MAX_EXTENTS`,
-which is 32 and so is the lower of the two today: an over-long
-descriptor is refused there, before the table is ever reached. A
-refusal names whichever bound applied to it, so a reader is not sent
-looking for room that was never the constraint.
+The descriptor parser's own bound, `vmdk::MAX_EXTENTS`, is defined as
+this constant rather than chosen separately, so a descriptor the parser
+accepts is always one the table can hold. A single over-long descriptor
+is refused by the parser, which reads it first; the table's own check
+still runs, for a backing chain or a comparison whose images each fit
+but whose extents together do not.
 
 ### Device Indexing
 
