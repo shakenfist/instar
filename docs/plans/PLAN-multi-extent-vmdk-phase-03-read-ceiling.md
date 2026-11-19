@@ -202,6 +202,33 @@ consequence.
    toward it. Raising the slot count is a separate change with a guest
    memory-map cost, and #934 records what it would involve.
 
+7. **One live sparse-extent parser state at a time, not one per
+   extent.** The guest keeps a format state per *device*:
+   `chain_states.vmdk_states[dev_idx]`, and each device's grain
+   directory and grain table caches come from
+   `shared::l1_cache_addr`/`l2_cache_addr`, which hand out
+   `2 * MAX_SECTOR_SIZE` -- 128 KiB -- per device slot from a region
+   sized `2 * MAX_SECTOR_SIZE * MAX_CHAIN_DEVICES`, or 2 MiB in total.
+   After step 3b a descriptor and all its extents are one device, so a
+   state per extent would want 64 slots and 8 MiB of cache, which does
+   not exist and cannot be made to exist inside the guest's memory map.
+
+   So the descriptor device holds one `VmdkState` at a time, re-read
+   when a read moves into a different extent, reusing that device's
+   single pair of cache buffers. Sequential access pays for this once
+   per extent boundary; a seeking workload pays per crossing, which is
+   the honest cost and is bounded by a header read plus a grain
+   directory read.
+
+   Two consequences the implementer must not have to discover.
+   `VmdkState::init` assumes its image begins at device offset 0, so it
+   needs the extent's base offset -- everything it reads, header, grain
+   directory and grain tables, is relative to that base. And the
+   rotation this plan removed from the device slots reappears here, in
+   the parser state. That is worth saying plainly: the master plan's
+   instinct that this phase would rehearse a rotation was not wrong,
+   only wrong about which layer rotates.
+
 ## Step plan
 
 Steps run in sequence except where noted. 3a must land before 3b, 3c
@@ -211,7 +238,7 @@ and 3d, because all three consume the ABI it defines.
 |------|--------|-------|-----------|---------------------|
 | 3a | high | opus | none | Define the extent-table ABI in `src/shared/src/lib.rs`. Add `pub const MAX_CHAIN_EXTENTS: usize = 64;` and a `#[repr(C)] pub struct ChainExtent { pub device_offset: u64, pub file_length: u64, pub virtual_span: u64 }` with a `const fn new()` returning zeros, mirroring `ChainSegment` at line 5219. Add to `ChainConfig` (line 5391): `pub extent_count: u32`, and `pub extents: [ChainExtent; MAX_CHAIN_EXTENTS]`. Bump `ChainConfig::version` to 5 and extend the version comment at line 5422 in the established style. Per-descriptor ownership: add `pub first_extent: u32` and `pub extent_count: u32` to `ChainDeviceInfo` (line 5274), so a device names its slice of the table; document that both are zero for a device with no extents. Two asserts matter: change line 664's `VQ_BASE_START + 16 * 0x10000 <= DMA_POOL_BASE` to use `MAX_CHAIN_DEVICES` instead of the literal (this is #934), and add a new compile-time assert that `core::mem::size_of::<ChainConfig>()` is at most `VMM_PARAMS_ADDR - CHAIN_CONFIG_ADDR`, with a message saying the chain config must fit its page. The idiom in this file is a free-standing `const _: () = assert!(..)`, as at lines 650 and 656; there is no `const_assert!` macro in this codebase. This crate is `no_std` and is linked into the guest, so run `scripts/check-binary-sizes.sh` and report the before and after numbers. Do not change any consumer yet; the build must still pass with the new fields unread. |
 | 3b | high | opus | worktree | Give `BackingStore` (`src/vmm/src/backing.rs:15`) the ability to span several files. It holds one `File` plus `capacity`, `current_size` and `sparse`. Add a constructor that takes an ordered `Vec` of (path, length) and keeps a `Vec<File>` with a running offset table, and route `read_at`/`write_at` to the file owning the offset, splitting a request that straddles a boundary into one call per file so every byte of the caller's buffer is filled. The single-file path must keep its exact current behaviour, including the zero-padding of reads past the file end that `src/vmm/src/virtio/block.rs:141` relies on; the cleanest shape is an internal enum with a `Single` and a `Concatenated` variant rather than a `Vec` of length one, so the common path keeps its current code. Every device in the VMM goes through this type, so this is the step where a mistake is widest: add unit tests in the file's existing `mod tests` style for a straddling read, a read entirely past the end, a boundary-aligned read, and a two-file store whose second file is shorter than its declared length. Read-only is the only mode this phase needs; make the multi-file constructor refuse a writable request rather than leaving it half-implemented. |
-| 3c | xhigh | fable | worktree | Teach the guest's reader to use the extent table from step 3a, and remove the per-device extent walk. Today a VMDK flat descriptor's extents arrive as separate marked data devices and the reader walks them; after this step the descriptor and all its extents are one device and the boundaries come from `ChainConfig::extents` with the slice named by `ChainDeviceInfo::first_extent`/`extent_count`. Resolve a virtual offset to an extent, then read within that extent at `device_offset + (virtual offset - extent base)`. For a SPARSE extent, parse that extent's own header, grain directory and grain tables at offsets relative to its `device_offset`, because each extent is a self-contained sparse VMDK covering only its own span -- this is the part that makes `twoGbMaxExtentSparse` readable and it is the hardest thing in the phase. A read past the last extent must still stop and return zeros rather than continue into whatever follows: rewrite the two tests at `src/crates/qcow2/src/lib.rs:15941` and `:15982` against the new mechanism, keeping what they assert. Honour each extent's declared `virtual_span` rather than assuming 2 GiB; one real corpus image declares 3.96 GiB extents. The crate is `no_std`, the guest binary cap is 768KB, and the reader frame budget noted at `src/crates/qcow2/src/lib.rs:16943` is about 10.7KB per device against a 4MB stack -- say in the report what your change does to frame size. Run the consumer operation suites, not only the crate tests. |
+| 3c | xhigh | fable | worktree | Teach the guest's reader to use the extent table from step 3a, and remove the per-device extent walk. Today a VMDK flat descriptor's extents arrive as separate marked data devices and the reader walks them; after this step the descriptor and all its extents are one device and the boundaries come from `ChainConfig::extents` with the slice named by `ChainDeviceInfo::first_extent`/`extent_count`. Resolve a virtual offset to an extent, then read within that extent at `device_offset + (virtual offset - extent base)`. For a SPARSE extent, parse that extent's own header, grain directory and grain tables at offsets relative to its `device_offset`, because each extent is a self-contained sparse VMDK covering only its own span -- this is the part that makes `twoGbMaxExtentSparse` readable and it is the hardest thing in the phase. A read past the last extent must still stop and return zeros rather than continue into whatever follows: rewrite the two tests at `src/crates/qcow2/src/lib.rs:15941` and `:15982` against the new mechanism, keeping what they assert. Keep honouring each extent's declared span, which the present walk already does by using each data device's `virtual_size`; after this step it comes from the extent table's `virtual_span` instead. Do not "fix" an assumption of 2 GiB on this path -- there is not one. One real corpus image declares 3.96 GiB extents. The crate is `no_std`, the guest binary cap is 768KB, and the reader frame budget noted at `src/crates/qcow2/src/lib.rs:16943` is about 10.7KB per device against a 4MB stack -- say in the report what your change does to frame size. Run the consumer operation suites, not only the crate tests. |
 | 3d | high | opus | none | Wire the VMM side. In `src/vmm/src/chain.rs`, let `resolve_vmdk_flat_descriptor` accept SPARSE extents (the refusal is at line 960) while keeping the non-zero `offset_sectors` refusal at line 967, and carry each extent's declared sector count through `ResolvedVmdkDescriptor`. In `src/vmm/src/main.rs`, attach a descriptor and its extents as one device built on step 3b's concatenated backing store instead of one device per extent, populate step 3a's extent table, and refuse an extent count above `MAX_CHAIN_EXTENTS` with a message naming the bound. Extents no longer count toward chain depth, so the four guards at `:6719`, `:13573`, `:14405` and `:15462` must now bound only real chain members -- change what they count, do not delete them, and keep their comments true by rewriting them. `DeviceSet::add_device`'s assert at `:738` should become unreachable for extents by construction; say in the report why it now cannot fire rather than asserting that it cannot. Both corpus images must read: `vmdk-split-sparse-33g` (17 extents) and `osboxes-vmdk-split-sparse` (26 extents of 8304640 sectors). |
 | 3e | medium | sonnet | none | Fix #927. `src/vmm/src/main.rs:3809` sets a chain member's `actual_size` to `std::fs::metadata(&current).map(|m| m.len())` -- the descriptor's apparent length, omitting every extent and ignoring `--ignore-quirks`. Make it the descriptor's allocation plus each resolved extent's, which is what `InfoDiskSizes::new` already computes for the non-chain paths (see its call site near `src/vmm/src/main.rs:2458` and the `--ignore-quirks` convention at `:2449`, where the flag means apparent length rather than `st_blocks * 512`). The resolved extents are in scope at that point; they are stored into `external_data_files` a few lines below. `ignore_quirks` is not currently threaded into the chain walk, so thread it. Verify against qemu-img 10.2.0 on `custom/format-coverage/vmdk-flat-with-parent.vmdk`, where `qemu-img info --backing-chain --output=json` reports 1052672 for both members and instar reports 368 before the fix. |
 | 3f | medium | sonnet | none | Un-flag the fixtures and resolve what that empties. Remove `instar_unsupported` from all five entries in `tests/manifest.json` that carry it (`vmdk-split-sparse-2049m`, `-5g`, `-5g-boundary`, `-33g`, and `osboxes-vmdk-split-sparse`) and give each a description of what it now proves. That empties the field across all 222 images, which makes `TestInstarUnsupportedIsStillUnsupported` in `tests/test_info_safe.py` fail by design -- it asserts the field is set somewhere. Nothing else in the suite reads the field except the skip at `tests/test_info_safe.py:126` and `is_instar_unsupported` in `tests/base.py`. Since no image is unsupported any more, remove the field's handling and that test together rather than leaving a mechanism with no subject, and say so in the commit message; if you find a reason to keep the field, keep the test too and say why. Then add the positive assertions the fixtures now support: each of the five reads, reports the virtual size its manifest entry declares, and for `-5g-boundary` the 131072 bytes of `0xAB` at offset 2147418112 straddling the first extent boundary read back correctly. |
@@ -291,6 +318,23 @@ was restored from it: `MAX_CHAIN_DEVICES = 17` fails the build with
 fails it with "ChainConfig does not fit the page reserved for it at
 CHAIN_CONFIG_ADDR". Both are the asserts the step added or rewired, so
 the guard this phase relies on is proved rather than read.
+
+**A design question the plan had not answered, decided before step 3c
+ran** (decision 7). The guest keeps format parser state per device, with
+128 KiB of grain-directory and grain-table cache per device slot out of
+a 2 MiB region, so the 64 extents now sharing one device cannot each
+have their own. The descriptor device keeps one extent's state at a
+time and re-reads it at an extent crossing. Noted because it means the
+rotation this phase removed from the device slots came back in the
+parser state, one layer down.
+
+**One step 3c premise the survey had backwards.** The plan asked for
+each extent's declared sector count to be honoured "rather than
+inferring 2 GiB from the create type". The read path never inferred
+2 GiB: the walk at `src/crates/qcow2/src/lib.rs:18878` already uses each
+data device's `virtual_size`. What changes is where the span comes
+from, not that it starts being respected. The row is corrected above so
+no one spends the step hunting a bug that is not there.
 
 ## Back brief
 
