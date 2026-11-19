@@ -4493,7 +4493,8 @@ fn print_backing_chain_json(chain: &BackingChain) {
 
 /// Write device info entries for a single backing chain to guest memory.
 ///
-/// Writes ChainDeviceInfo entries starting at `devices_base + start_idx * 32`.
+/// Writes one `ChainDeviceInfo` entry per device, the first at
+/// `devices_base + start_idx * size_of::<ChainDeviceInfo>()`.
 /// If the chain has an external data file, it is inserted as device `start_idx + 1`
 /// (between the top image and the rest of the backing chain).
 ///
@@ -4556,6 +4557,13 @@ fn write_chain_device_entries(
         .into()
     }
 
+    // The entry stride comes from the shared type rather than from a
+    // literal of its own. A field added to ChainDeviceInfo moves every
+    // entry after the first, and a literal here would go on writing at
+    // the old stride while the guest read at the new one -- which is a
+    // whole config misread, not a missing field.
+    const ENTRY_SIZE: u64 = core::mem::size_of::<shared::ChainDeviceInfo>() as u64;
+
     let mut idx = start_idx;
 
     for image in chain.images().iter() {
@@ -4564,7 +4572,7 @@ fn write_chain_device_entries(
         }
 
         let has_data_files = !image.external_data_files.is_empty();
-        let dev_offset = devices_base + (idx as u64 * 32);
+        let dev_offset = devices_base + (idx as u64 * ENTRY_SIZE);
         guest_mem.write_obj(
             image.format.to_shared_format_u32(),
             GuestAddress(dev_offset),
@@ -4598,7 +4606,7 @@ fn write_chain_device_entries(
             let data_size = std::fs::metadata(&data_file.path)
                 .map(|m| m.len())
                 .unwrap_or(0);
-            let dev_offset = devices_base + (idx as u64 * 32);
+            let dev_offset = devices_base + (idx as u64 * ENTRY_SIZE);
             guest_mem.write_obj(
                 ImageFormat::Raw.to_shared_format_u32(),
                 GuestAddress(dev_offset),
@@ -4822,20 +4830,30 @@ fn write_chain_config_header(
     // - version: u32 (offset 8)
     // - segment_count: u32 (offset 12)
     // - devices: [ChainDeviceInfo; 16] (offset 16)
-    // - segments: [ChainSegment; 16] (offset 528)
-    // - _reserved: [u8; 64] (offset 656)
+    // - segments: [ChainSegment; 16] (offset 656)
+    // - extent_count: u32 (offset 784)
+    // - extents: [ChainExtent; 64] (offset 792, 8-aligned, so four bytes
+    //   of padding follow extent_count)
+    // - _reserved: [u8; 64] (offset 2328)
     //
-    // ChainDeviceInfo layout (32 bytes each):
+    // ChainDeviceInfo layout (40 bytes each):
     // - format: u32 (offset 0)
     // - flags: u32 (offset 4)
     // - virtual_size: u64 (offset 8)
     // - actual_size: u64 (offset 16)
     // - cluster_size: u32 (offset 24)
     // - data_device_idx: u32 (offset 28)
+    // - first_extent: u32 (offset 32)
+    // - extent_count: u32 (offset 36)
     //
     // ChainSegment layout (8 bytes each):
     // - first: u32 (offset 0)
     // - count: u32 (offset 4)
+    //
+    // ChainExtent layout (24 bytes each):
+    // - device_offset: u64 (offset 0)
+    // - file_length: u64 (offset 8)
+    // - virtual_span: u64 (offset 16)
     if segments.len() > shared::MAX_CHAIN_SEGMENTS {
         return Err(format!(
             "chain config describes {} chains, more than the {} the config holds",
@@ -4867,7 +4885,13 @@ fn write_chain_config_header(
     )?;
     guest_mem.write_obj(segments.len() as u32, GuestAddress(CHAIN_CONFIG_ADDR + 12))?;
 
-    let segments_base = CHAIN_CONFIG_ADDR + 528;
+    // Derived for the same reason as the device stride in
+    // write_chain_device_entries: the byte length of the device array is
+    // what puts the segments where the guest looks for them, and a
+    // literal would stay behind when a device entry grows.
+    let segments_base = CHAIN_CONFIG_ADDR
+        + 16
+        + (MAX_CHAIN_DEVICES * core::mem::size_of::<shared::ChainDeviceInfo>()) as u64;
     for (i, seg) in segments.iter().enumerate() {
         let seg_offset = segments_base + (i as u64 * 8);
         guest_mem.write_obj(seg.first, GuestAddress(seg_offset))?;

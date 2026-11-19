@@ -2142,9 +2142,10 @@ mod tests {
     // Tests for shared::ChainConfig and shared::ChainDeviceInfo structures
     mod chain_config_tests {
         use shared::{
-            ChainConfig, ChainDeviceInfo, ChainSegment, ImageFormat as SharedImageFormat,
-            InfoResult, CALL_TABLE_ADDR, CHAIN_CONFIG_ADDR, MAX_CHAIN_DEVICES,
-            OPERATION_CONFIG_ADDR, OPERATION_LOAD_ADDR, VMM_PARAMS_ADDR, VQ_BASE_START,
+            ChainConfig, ChainDeviceInfo, ChainExtent, ChainSegment,
+            ImageFormat as SharedImageFormat, InfoResult, CALL_TABLE_ADDR, CHAIN_CONFIG_ADDR,
+            MAX_CHAIN_DEVICES, OPERATION_CONFIG_ADDR, OPERATION_LOAD_ADDR, VMM_PARAMS_ADDR,
+            VQ_BASE_START,
         };
 
         #[test]
@@ -2274,15 +2275,19 @@ mod tests {
         #[test]
         fn test_chain_config_struct_size() {
             // Verify the struct sizes are what we expect for FFI
-            // ChainDeviceInfo: 4 + 4 + 8 + 8 + 4 + 4 = 32 bytes
-            assert_eq!(core::mem::size_of::<ChainDeviceInfo>(), 32);
+            // ChainDeviceInfo: 4 + 4 + 8 + 8 + 4 + 4 + 4 + 4 = 40 bytes
+            assert_eq!(core::mem::size_of::<ChainDeviceInfo>(), 40);
 
             // ChainSegment: 4 + 4 = 8 bytes
             assert_eq!(core::mem::size_of::<ChainSegment>(), 8);
 
-            // ChainConfig: 16 header + (16 * 32) devices
-            // + (16 * 8) segments + 64 reserved = 720 bytes
-            assert_eq!(core::mem::size_of::<ChainConfig>(), 720);
+            // ChainExtent: 8 + 8 + 8 = 24 bytes
+            assert_eq!(core::mem::size_of::<ChainExtent>(), 24);
+
+            // ChainConfig: 16 header + (16 * 40) devices
+            // + (16 * 8) segments + 4 extent count + 4 padding
+            // + (64 * 24) extents + 64 reserved = 2392 bytes
+            assert_eq!(core::mem::size_of::<ChainConfig>(), 2392);
         }
 
         #[test]
@@ -2293,7 +2298,7 @@ mod tests {
             //   0x030000 (OPERATION_LOAD_ADDR): operation binary (up to 768KB)
             //   0x0F0000 (CALL_TABLE_ADDR): call table
             //   0x0F1000 (OPERATION_CONFIG_ADDR): operation config (4KB)
-            //   0x0F2000 (CHAIN_CONFIG_ADDR): chain config (1KB)
+            //   0x0F2000 (CHAIN_CONFIG_ADDR): chain config (4KB)
             //   0x0F3000 (VMM_PARAMS_ADDR): VMM params (4KB)
             //   [0x0F4000, 0x100000): 48KB guard gap below the virtqueue region
             //   0x100000 (VQ_BASE_START): virtqueue memory (16 devices * 64KB = 1MB)

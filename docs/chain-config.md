@@ -11,10 +11,10 @@ discovers backing chains in the first place, see
 
 ## Data Structures
 
-Both structures are defined in `src/shared/src/lib.rs` and use `#[repr(C)]`
-for a stable memory layout.
+These structures are all defined in `src/shared/src/lib.rs` and use
+`#[repr(C)]` for a stable memory layout.
 
-### ChainConfig (16 bytes header + device array + segment array)
+### ChainConfig (16 bytes header + device array + segment array + extent table)
 
 Written at `CHAIN_CONFIG_ADDR` (`0x000F2000`) in guest physical memory.
 
@@ -22,19 +22,23 @@ Written at `CHAIN_CONFIG_ADDR` (`0x000F2000`) in guest physical memory.
 |--------|------|------|-------|-------------|
 | 0 | 4 | u32 | `magic` | `0x4348414E` ("CHAN") |
 | 4 | 4 | u32 | `device_count` | Number of valid device entries (1 = no backing files) |
-| 8 | 4 | u32 | `version` | Structure version (currently 4) |
+| 8 | 4 | u32 | `version` | Structure version (currently 5) |
 | 12 | 4 | u32 | `segment_count` | Number of valid segment entries; never 0 |
-| 16 | 512 | | `devices` | Array of up to 16 `ChainDeviceInfo` entries |
-| 528 | 128 | | `segments` | Array of up to 16 `ChainSegment` entries |
-| 656 | 64 | | `_reserved` | Reserved, written as 0 |
+| 16 | 640 | | `devices` | Array of up to 16 `ChainDeviceInfo` entries |
+| 656 | 128 | | `segments` | Array of up to 16 `ChainSegment` entries |
+| 784 | 4 | u32 | `extent_count` | Number of valid extent entries; 0 when no device has extents |
+| 792 | 1536 | | `extents` | Array of up to 64 `ChainExtent` entries |
+| 2328 | 64 | | `_reserved` | Reserved, written as 0 |
 
-Total struct size: 720 bytes. The memory allocation at
-`CHAIN_CONFIG_ADDR` is 1024 bytes (`CHAIN_CONFIG_MAX_SIZE`) to allow
-for future growth.
+Total struct size: 2392 bytes. `extents` is 8-aligned, so four bytes of
+padding follow `extent_count`. The memory allocation at
+`CHAIN_CONFIG_ADDR` is the whole 4096-byte page up to `VMM_PARAMS_ADDR`
+(`CHAIN_CONFIG_MAX_SIZE`), and a compile-time assert in
+`src/shared/src/lib.rs` fails the build if the structure outgrows it.
 
 ### ChainSegment (8 bytes per chain)
 
-Each segment entry starts at offset `528 + (segment_index * 8)`.
+Each segment entry starts at offset `656 + (segment_index * 8)`.
 
 | Offset | Size | Type | Field | Description |
 |--------|------|------|-------|-------------|
@@ -71,9 +75,9 @@ The owner's `data_device_idx` must name the slot immediately after the
 owner, and every marked device must belong to an owner;
 `ChainConfig::data_devices_are_owned` refuses any other layout.
 
-### ChainDeviceInfo (32 bytes per device)
+### ChainDeviceInfo (40 bytes per device)
 
-Each device entry starts at offset `16 + (device_index * 32)` within the
+Each device entry starts at offset `16 + (device_index * 40)` within the
 chain config.
 
 | Offset | Size | Type | Field | Description |
@@ -84,6 +88,44 @@ chain config.
 | 16 | 8 | u64 | `actual_size` | Real file size in bytes (see note below) |
 | 24 | 4 | u32 | `cluster_size` | Cluster/grain size in bytes (0 for raw) |
 | 28 | 4 | u32 | `data_device_idx` | Device index holding this device's cluster data; 0 = this device itself |
+| 32 | 4 | u32 | `first_extent` | Index in `extents` of this device's first extent |
+| 36 | 4 | u32 | `extent_count` | Number of `extents` entries this device owns; 0 = the device is a single file |
+
+### ChainExtent (24 bytes per extent)
+
+Each extent entry starts at offset `792 + (extent_index * 24)`.
+
+| Offset | Size | Type | Field | Description |
+|--------|------|------|-------|-------------|
+| 0 | 8 | u64 | `device_offset` | Byte offset within the device where this extent's file begins |
+| 8 | 8 | u64 | `file_length` | Length in bytes of the extent's own file |
+| 16 | 8 | u64 | `virtual_span` | Bytes of the virtual disk this extent covers |
+
+The table describes a device whose bytes are several files laid end to
+end -- a VMDK descriptor and its extents -- so that the guest can find
+the boundaries between them. A read is served by locating the extent
+covering the wanted virtual offset and reading at `device_offset +
+(offset - that extent's virtual base)`; the entries of a device's run
+are in descriptor order, so the first extent's virtual base is zero and
+each later one's base is the sum of the spans before it.
+
+A config with no such device leaves `extent_count` zero and the table
+untouched: every device is then a single file whose own `extent_count`
+is zero as well, and nothing consults the table.
+
+`virtual_span` is carried rather than derived from `file_length`
+because a sparse extent is shorter on disk than the span it covers, and
+a descriptor may declare any span it likes. Nor is concatenation alone
+enough for a sparse split image: each sparse extent holds its own
+header, grain directory and grain tables covering only its own span, so
+without the boundaries the guest would read the wrong metadata and do
+it silently.
+
+`MAX_CHAIN_EXTENTS` is 64, which is 128 GiB at qemu's 2 GiB default
+extent size. qemu has no equivalent limit, so an image with more
+extents than the table holds cannot be described to the guest and is
+refused with a message naming the bound; raising the bound means moving
+the config region rather than changing the constant.
 
 ### Device Indexing
 
@@ -170,9 +212,13 @@ doesn't evenly divide the sector size.
 An operation whose devices form a single chain writes the config via
 `write_chain_config()` in `src/vmm/src/main.rs`. The function:
 
-1. Iterates over chain images and writes each 32-byte `ChainDeviceInfo`
-   at `CHAIN_CONFIG_ADDR + 16 + (i * 32)`, returning the number of
-   slots it wrote (an external data file costs an extra slot)
+1. Iterates over chain images and writes each 40-byte `ChainDeviceInfo`
+   at `CHAIN_CONFIG_ADDR + 16 + (i * 40)`, returning the number of
+   slots it wrote (an external data file costs an extra slot). The
+   stride and the base of the segment array are taken from
+   `size_of::<ChainDeviceInfo>()` rather than written as literals, so a
+   field added to a device entry cannot leave the host writing at one
+   stride while the guest reads at another
 2. Writes the 16-byte header and a single segment covering every slot
    written, via `write_chain_config_header()`
 3. All writes use `guest_mem.write_obj()` for type-safe memory access
@@ -328,9 +374,10 @@ All constants are defined in `src/shared/src/lib.rs`:
 
 ```
 CHAIN_CONFIG_ADDR      = 0x000F2000
-CHAIN_CONFIG_MAX_SIZE  = 1024 bytes
+CHAIN_CONFIG_MAX_SIZE  = 4096 bytes (VMM_PARAMS_ADDR - CHAIN_CONFIG_ADDR)
 MAX_CHAIN_DEVICES      = 16
 MAX_CHAIN_SEGMENTS     = 16
+MAX_CHAIN_EXTENTS      = 64
 ChainConfig::MAGIC     = 0x4348414E ("CHAN")
-ChainConfig::VERSION   = 4
+ChainConfig::VERSION   = 5
 ```

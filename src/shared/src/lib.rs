@@ -601,8 +601,16 @@ pub const LUKS_ENCRYPT_DATA_ADDR: usize = 0x01800000;
 /// safely below guest memory end (GUEST_MEM_SIZE = 0x02000000).
 pub const LUKS_HEADER_BUILD_ADDR: usize = 0x01840000;
 
-/// Maximum size of chain config in bytes
-pub const CHAIN_CONFIG_MAX_SIZE: usize = 1024;
+/// Maximum size of chain config in bytes: the whole page reserved for
+/// it, from [`CHAIN_CONFIG_ADDR`] up to the VMM parameter page above.
+///
+/// It was 1024 while the config held a header, a device array and a
+/// segment array. A VMDK descriptor's extents are located through a
+/// table in the same structure, which needs more than the slack that
+/// left, so the bound became the page it sits in: a byte past this is
+/// the region at [`VMM_PARAMS_ADDR`]. The compile-time assert beside
+/// [`ChainConfig`] is what holds the structure to it.
+pub const CHAIN_CONFIG_MAX_SIZE: usize = VMM_PARAMS_ADDR - CHAIN_CONFIG_ADDR;
 
 /// Address where VMM parameters are stored (set by VMM before guest starts).
 /// Layout: mmio_base (u64 at offset 0).
@@ -633,7 +641,8 @@ pub const OPERATION_LOAD_ADDR: usize = 0x00030000;
 
 /// Base address of the virtqueue memory region (consumed by vmm/main.rs and
 /// core/main.rs, which previously duplicated this constant). Virtqueue memory
-/// for up to 16 devices x 64 KiB occupies [VQ_BASE_START, DMA_POOL_BASE).
+/// for up to [`MAX_CHAIN_DEVICES`] devices at 64 KiB each occupies
+/// [VQ_BASE_START, DMA_POOL_BASE).
 pub const VQ_BASE_START: usize = 0x00100000;
 
 /// DMA pool base address (must match core/virtio.rs and vmm/main.rs).
@@ -658,10 +667,13 @@ const _: () = assert!(
     "guest data pages overlap the virtqueue region (VQ_BASE_START)"
 );
 
-// Compile-time check: virtqueue memory (16 devices x 64 KiB) must fit below
-// the DMA pool.
+// Compile-time check: virtqueue memory -- 64 KiB for each of the
+// MAX_CHAIN_DEVICES devices the guest can be handed -- must fit below the
+// DMA pool. The count comes from that constant rather than from a literal
+// of its own, so raising the device budget without moving the pool fails
+// the build instead of silently overlapping it.
 const _: () = assert!(
-    VQ_BASE_START + 16 * 0x10000 <= DMA_POOL_BASE,
+    VQ_BASE_START + MAX_CHAIN_DEVICES * 0x10000 <= DMA_POOL_BASE,
     "virtqueue region overlaps the DMA pool"
 );
 
@@ -5190,6 +5202,22 @@ pub const MAX_CHAIN_DEVICES: usize = 16;
 /// because the degenerate case is one chain per device.
 pub const MAX_CHAIN_SEGMENTS: usize = MAX_CHAIN_DEVICES;
 
+/// Maximum number of extents a single [`ChainConfig`] can describe.
+///
+/// This bounds the extent table, not the device array: a VMDK
+/// descriptor and all of its extents are attached as one device and the
+/// extents are found through [`ChainConfig::extents`], so an extent
+/// costs a table entry rather than a device slot.
+///
+/// The limit is what the page holds. At 24 bytes an entry, 64 extents
+/// is 1536 bytes of the space between [`CHAIN_CONFIG_ADDR`] and
+/// [`VMM_PARAMS_ADDR`], and it covers 128 GiB of image at qemu's 2 GiB
+/// default extent size. qemu has no equivalent limit, so a descriptor
+/// declaring more extents than this is refused with a message naming
+/// the bound; raising it means moving the config region, not editing
+/// this line.
+pub const MAX_CHAIN_EXTENTS: usize = 64;
+
 /// One independent backing chain inside a [`ChainConfig`]'s device
 /// array.
 ///
@@ -5264,6 +5292,50 @@ impl ChainSegment {
     }
 }
 
+/// One extent of a multi-extent image, in [`ChainConfig::extents`].
+///
+/// A VMDK descriptor and its extents are attached as a single device
+/// whose bytes are the extent files laid end to end, so a read is
+/// served by finding the extent covering the wanted virtual offset and
+/// reading at `device_offset + (offset - that extent's virtual base)`.
+/// A device's entries are in descriptor order, which is virtual-offset
+/// order: the first extent's virtual base is zero and each later
+/// extent's base is the sum of the spans before it.
+///
+/// `virtual_span` is carried rather than derived from `file_length`
+/// because the two differ. A sparse extent holds its own header, grain
+/// directory and grain tables and is shorter on disk than the span it
+/// covers, and a descriptor may declare any span it likes -- the
+/// corpus has an image declaring 3.96 GiB extents under
+/// `twoGbMaxExtentSparse` -- so the declared sector count is the only
+/// thing that puts the next extent's base in the right place.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct ChainExtent {
+    /// Byte offset within the device where this extent's file begins.
+    pub device_offset: u64,
+
+    /// Length in bytes of the extent's own file. For a sparse extent
+    /// this is where its metadata and grains live, not how much of the
+    /// virtual disk it covers.
+    pub file_length: u64,
+
+    /// Bytes of the virtual disk this extent covers, from the sector
+    /// count the descriptor declares for it.
+    pub virtual_span: u64,
+}
+
+impl ChainExtent {
+    /// Create an empty extent.
+    pub const fn new() -> Self {
+        Self {
+            device_offset: 0,
+            file_length: 0,
+            virtual_span: 0,
+        }
+    }
+}
+
 /// Information about a single device in the backing chain.
 ///
 /// This structure provides metadata about each image in the chain,
@@ -5296,6 +5368,22 @@ pub struct ChainDeviceInfo {
     /// and for a VMDK flat descriptor, whose extents start here.
     /// The device it names carries [`Self::FLAG_DATA_DEVICE`].
     pub data_device_idx: u32,
+
+    /// Index in [`ChainConfig::extents`] of this device's first extent.
+    /// Its slice of the table is [`Self::extent_count`] entries from
+    /// there, in ascending virtual-offset order.
+    pub first_extent: u32,
+
+    /// Number of entries in [`ChainConfig::extents`] this device owns,
+    /// starting at [`Self::first_extent`].
+    ///
+    /// Zero, with `first_extent` zero as well, for a device that is a
+    /// single file -- which is every device except a VMDK descriptor
+    /// attached together with its extents. Zero is unambiguous because
+    /// a device described by the extent table always has at least one
+    /// entry, so this field alone decides whether a read goes through
+    /// the table or straight to the device's own bytes.
+    pub extent_count: u32,
 }
 
 impl ChainDeviceInfo {
@@ -5327,6 +5415,8 @@ impl ChainDeviceInfo {
             actual_size: 0,
             cluster_size: 0,
             data_device_idx: 0,
+            first_extent: 0,
+            extent_count: 0,
         }
     }
 
@@ -5383,9 +5473,12 @@ impl ChainDeviceInfo {
 ///
 /// # Size and ConfigResult.len
 ///
-/// The actual struct size is 720 bytes, but `CHAIN_CONFIG_MAX_SIZE` is 1024
-/// to allow room for future growth. Guest code should use `device_count`
-/// to determine how many device entries are valid, not `ConfigResult.len`.
+/// `CHAIN_CONFIG_MAX_SIZE` is the whole page the structure is written
+/// into, which is larger than the structure itself; the compile-time
+/// assert below this definition is what keeps it inside the page.
+/// Guest code should use `device_count` for how many device entries are
+/// valid and `extent_count` for how much of the extent table is, not
+/// `ConfigResult.len`.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ChainConfig {
@@ -5411,16 +5504,48 @@ pub struct ChainConfig {
     /// they tile `[0, device_count)` exactly.
     pub segments: [ChainSegment; MAX_CHAIN_SEGMENTS],
 
+    /// Number of valid entries in `extents`. Zero when no device in
+    /// this config was attached as a concatenation of extent files.
+    pub extent_count: u32,
+
+    /// The extents of every device attached as a concatenation of
+    /// files, in device order (only the first `extent_count` entries
+    /// are valid).
+    ///
+    /// A device names its own run of entries through
+    /// [`ChainDeviceInfo::first_extent`] and
+    /// [`ChainDeviceInfo::extent_count`]; a device whose
+    /// `extent_count` is zero is a single file and is read straight
+    /// through. Concatenating extents without publishing their
+    /// boundaries would read a sparse split image wrongly and
+    /// silently, because each sparse extent's grain directory and
+    /// grain tables cover only that extent's own span: the table is
+    /// what lets the guest find each extent's metadata at its own
+    /// base.
+    pub extents: [ChainExtent; MAX_CHAIN_EXTENTS],
+
     /// Reserved for future use (flags, etc.)
     pub _reserved: [u8; 64],
 }
+
+// Compile-time check: the chain config must fit the page it is written
+// into. The region starts at CHAIN_CONFIG_ADDR and the next one begins at
+// VMM_PARAMS_ADDR, so a structure past that bound would have the guest
+// reading its own tail out of the VMM parameter page. A field added to
+// ChainConfig or an extent added to the table fails the build here rather
+// than at run time.
+const _: () = assert!(
+    core::mem::size_of::<ChainConfig>() <= VMM_PARAMS_ADDR - CHAIN_CONFIG_ADDR,
+    "ChainConfig does not fit the page reserved for it at CHAIN_CONFIG_ADDR"
+);
 
 impl ChainConfig {
     /// Magic value for chain config
     pub const MAGIC: u32 = 0x4348414E; // "CHAN"
 
     /// Current structure version (3 = segment_count / segments fields,
-    /// 4 = data devices carry [`ChainDeviceInfo::FLAG_DATA_DEVICE`]).
+    /// 4 = data devices carry [`ChainDeviceInfo::FLAG_DATA_DEVICE`],
+    /// 5 = the extent table, and the slice of it each device names).
     ///
     /// Version 4 changes no field offset. It is a new version anyway
     /// because the two sides would otherwise disagree about the same
@@ -5428,7 +5553,14 @@ impl ChainConfig {
     /// version 4 config ignores the mark and reads the data file as the
     /// layer under its owner (issue #792), and a version 3 host writes
     /// data devices unmarked. The bump turns that skew into a refusal.
-    pub const VERSION: u32 = 4;
+    ///
+    /// Version 5 does move field offsets, unlike version 4: a device
+    /// entry grew the two fields naming its extents, so the segment
+    /// array and everything after it sit further along. A guest reading
+    /// the new layout as the old one would take a segment's `first`
+    /// from the middle of a device entry, which is the silent misparse
+    /// the version check exists to turn into a refusal.
+    pub const VERSION: u32 = 5;
 
     /// Create a new empty chain config
     pub const fn new() -> Self {
@@ -5439,6 +5571,8 @@ impl ChainConfig {
             segment_count: 0,
             devices: [ChainDeviceInfo::new(); MAX_CHAIN_DEVICES],
             segments: [ChainSegment::new(); MAX_CHAIN_SEGMENTS],
+            extent_count: 0,
+            extents: [ChainExtent::new(); MAX_CHAIN_EXTENTS],
             _reserved: [0; 64],
         }
     }
@@ -7969,8 +8103,10 @@ mod tests {
         // comment cannot catch a reordered field or inserted padding.
         assert_eq!(core::mem::size_of::<ChainSegment>(), 8);
         assert_eq!(core::mem::align_of::<ChainSegment>(), 4);
-        assert_eq!(core::mem::size_of::<ChainDeviceInfo>(), 32);
-        assert_eq!(core::mem::size_of::<ChainConfig>(), 720);
+        assert_eq!(core::mem::size_of::<ChainExtent>(), 24);
+        assert_eq!(core::mem::align_of::<ChainExtent>(), 8);
+        assert_eq!(core::mem::size_of::<ChainDeviceInfo>(), 40);
+        assert_eq!(core::mem::size_of::<ChainConfig>(), 2392);
         assert_eq!(core::mem::align_of::<ChainConfig>(), 8);
         assert!(
             core::mem::size_of::<ChainConfig>() <= CHAIN_CONFIG_MAX_SIZE,
@@ -7993,8 +8129,18 @@ mod tests {
             12
         );
         assert_eq!(offset_of(config.devices.as_ptr() as *const u8), 16);
-        assert_eq!(offset_of(config.segments.as_ptr() as *const u8), 528);
-        assert_eq!(offset_of(config._reserved.as_ptr()), 656);
+        assert_eq!(offset_of(config.segments.as_ptr() as *const u8), 656);
+        // The extent array is 8-aligned and the count before it is a
+        // u32, so four bytes of padding sit between them. Measured here
+        // because the host writes these offsets by hand: a field writer
+        // that computed the array's base by adding four would land in
+        // the gap.
+        assert_eq!(
+            offset_of(&config.extent_count as *const u32 as *const u8),
+            784
+        );
+        assert_eq!(offset_of(config.extents.as_ptr() as *const u8), 792);
+        assert_eq!(offset_of(config._reserved.as_ptr()), 2328);
     }
 
     #[test]
@@ -8014,18 +8160,25 @@ mod tests {
     }
 
     #[test]
-    fn chain_config_version_4_is_the_one_that_marks_data_devices() {
+    fn chain_config_rejects_every_layout_before_this_one() {
         // Version 3 has the same field offsets as version 4. Its hosts
         // write data devices unmarked and its guests ignore the mark, so
         // either half of a 3/4 pair reads a data file as the layer under
-        // its owner (issue #792). Only the version tells them apart.
-        assert_eq!(ChainConfig::VERSION, 4);
-        let mut config = ChainConfig::single_chain(1);
-        config.version = 3;
-        assert!(
-            !config.is_valid(),
-            "a version 3 config predates the data device mark and must not validate"
-        );
+        // its owner (issue #792). Version 4 and 5 differ in their
+        // offsets instead: a device entry grew the two fields naming its
+        // extents, so a 4/5 pair would read a segment's `first` out of
+        // the middle of a device entry. Only the version tells any of
+        // them apart, which is why this pins the current one -- a bump
+        // has to come here and be thought about.
+        assert_eq!(ChainConfig::VERSION, 5);
+        for stale in [3, 4] {
+            let mut config = ChainConfig::single_chain(1);
+            config.version = stale;
+            assert!(
+                !config.is_valid(),
+                "a version {stale} config is an older layout and must not validate"
+            );
+        }
     }
 
     #[test]
