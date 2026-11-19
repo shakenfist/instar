@@ -649,6 +649,81 @@ is already proven -- a 26-extent image attaches as one device and the
 whole length -- so what is left is reporting parity on images that
 previously could not be read at all.
 
+**Step 3i closed both gaps, and corrected the brief that sent it.** Run
+2026-11-19 (AEDT) on opus at high effort. The grain size is read from
+each sparse extent's own binary header as the descriptor resolves, where
+the path has just been validated and the extent line's kind is known,
+and the extent child's length is measured beside the allocation the
+`info` renderings already measure.
+
+**The row below says to read the first SPARSE extent. That is wrong.**
+qemu-img reports a cluster size for every sparse extent in the
+format-specific `extents` array, and those accounted for 51 of the 70
+JSON differences; only the remaining image-wide figure could have come
+from one extent. The row is left as written, as step 3e's was, because
+it is the brief as given -- this note is the line to trust.
+
+**The image-wide figure is conditional, which the plan did not say.**
+Measured against the pinned qemu-img 10.2.0: it is printed only when
+every extent is sparse and all of them declare the same grain size. A
+descriptor mixing flat and sparse extents prints none, and so does one
+whose sparse extents disagree; in both cases each sparse extent still
+prints its own. The management session reproduced the mixed case on a
+hand-built descriptor rather than taking it from the step's report,
+because reporting a figure an all-flat descriptor does not have was the
+one way this change could have broken an image that already passed.
+
+Sector rounding is not cosmetic. An extent child reports its file's own
+length rounded up to 512, not the span its extent line declares and not
+the blocks the file holds: the last extent of the 33 GiB fixture
+declares a 1 GiB span in a 196608-byte file.
+
+**Verification, reproduced by the management session rather than read
+from the report.** `make test-rust` 2962 passed, 0 failed. The
+integration suite ran 4551 with 0 failed and no test exiting without a
+status. The 70 comparisons were counted from the run's subunit stream
+rather than from the totals block, because a baseline comparison that
+silently skips is indistinguishable from one that passes there: all 70
+report success, and both new chain tests with them. Field-by-field
+against the pinned qemu-img 10.2.0 across all five fixtures and both
+renderings, with monolithicSparse and the two flat descriptors as
+controls, there is no difference in the image's cluster size, any
+extent's cluster size, any child node's length or any declared span. No
+baseline was touched; the testdata worktree is clean.
+
+Mutation: 21 mutants, 21 killed, over two sets, and the copy the
+mutants ran in matches the worktree byte for byte afterwards.
+
+**Worth carrying forward: a mutation run whose selection matches
+nothing reports survivors, not an error.** The step's first print-mutant
+run reported four survivors and two unrecognised; the selection regex
+named scenarios that testscenarios expands at run time, so stestr
+filtered on ids that did not exist yet and ran nothing. The tell was in
+plain sight -- a baseline of 10.7 seconds, against 180.5 for the 1152
+tests the corrected selection runs. The step found and fixed this
+itself.
+
+**Left as it stands, and out of this phase's scope.** `instar info`
+prints a bare `0` for a zero byte size where qemu-img prints `0 B`,
+justified by a comment in `format_size_human` claiming qemu emits no
+unit for zero. The claim is false: qemu-img 10.2.0 prints `0 B` in
+every size field, and the divergence is reachable on an ordinary fully
+sparse raw image, not only on the zero-allocation extent that exposed
+it here. It survives because the test harness formats zero the same way
+when it substitutes a disk size into a baseline, so the oracle carries
+instar's convention for that one field. Pre-existing, unrelated to the
+read ceiling, and offered to Michael as an issue.
+
+`vmdk-multi-extent` still reports a different create type from qemu.
+That fixture names extents that deliberately do not exist and is
+`skip_qemu_img`, so nothing compares the two; it is unchanged by this
+step.
+
+**Kept as an extra.** The step documented both rules in
+`docs/output-formats.md` beside the disk-size paragraph they belong
+with. It was not asked for, and it is where a user-visible output change
+belongs; the CHANGELOG and the format-coverage table remain step 3h's.
+
 ## Back brief
 
 Points needing the operator's answer before any step runs.
