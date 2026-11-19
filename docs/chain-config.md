@@ -162,10 +162,12 @@ descriptor line declares, because then every later extent sits at a
 different virtual offset for each reader.
 
 `MAX_CHAIN_EXTENTS` is 64, which is 128 GiB at qemu's 2 GiB default
-extent size. qemu has no equivalent limit, so an image with more
-extents than the table holds cannot be described to the guest and is
-refused with a message naming the bound; raising the bound means moving
-the config region rather than changing the constant.
+extent size. qemu has no equivalent limit: the bound exists because the
+config region is fixed-size and shared with the guest, so the table
+cannot grow with the image. An image with more extents than the table
+holds cannot be described to the guest and is refused with a message
+naming the bound; raising the bound means moving the config region
+rather than changing the constant.
 
 The descriptor parser's own bound, `vmdk::MAX_EXTENTS`, is defined as
 this constant rather than chosen separately, so a descriptor the parser

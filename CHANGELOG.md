@@ -844,6 +844,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **A VMDK descriptor made of separate extent files is now read.** Both
+  split subformats, `twoGbMaxExtentFlat` and `twoGbMaxExtentSparse`, are
+  attached as one device whose extents are named by a table in the
+  chain config, rather than as one virtio device per extent, and
+  `info`, `check`, `compare` and `convert` read them: `convert -O raw`
+  of a 2049 MiB split-sparse image writes exactly the 2049 MiB the
+  descriptor declares. `info` agrees with qemu-img 10.2.0 field for
+  field, including the image's cluster size and each extent child's
+  length. A descriptor may name at most 64 extents, which is instar's
+  own bound and not qemu's; a larger one is refused with a message
+  naming the bound. `map` and `measure` still refuse every VMDK
+  descriptor, flat or sparse, and their message names `monolithicFlat`
+  whatever the descriptor is. See `docs/format-coverage.md` and
+  `docs/chain-config.md`.
+
+- **`info --chain` reported a VMDK descriptor's own length as its size.**
+  A chain member that was a descriptor had its `actual-size` taken from
+  the descriptor file alone, omitting every extent and ignoring
+  `--ignore-quirks`: 368 bytes against qemu-img's 1052672 on a flat
+  image with a parent
+  ([#927](https://github.com/shakenfist/instar/issues/927)). The figure
+  is now the descriptor's allocation plus each extent's, and `info` and
+  `info --chain` compute it the same way. See `docs/info.md`.
+
 - **`info` reports the allocation and child order qemu-img does for a
   VMDK made of separate extent files.** This covers `monolithicFlat` as
   well as the `twoGbMaxExtent*` split subformats. The top-level
