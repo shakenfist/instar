@@ -1,0 +1,23 @@
+[package]
+name = "instar-fetch"
+version = "0.3.0"
+edition = "2021"
+description = "Serves the bytes of one already-open file to instar over the fetch protocol"
+license = "Apache-2.0"
+repository = "https://github.com/shakenfist/instar"
+authors = ["Michael Still <mikal@stillhq.com>"]
+keywords = ["ipc", "seqpacket", "disk-image"]
+categories = ["os::unix-apis"]
+# Not published to crates.io: it is instar's own helper, not a library.
+publish = false
+
+# The wire format, and libc for the two syscalls std does not expose
+# safely. Nothing else: this process is the untrusted half of the
+# partition, and every dependency it takes is code running next to the
+# bytes an attacker controls.
+[dependencies]
+fetch-protocol = { path = "../crates/fetch-protocol" }
+libc = "0.2"
+
+[lints]
+workspace = true

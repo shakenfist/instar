@@ -198,6 +198,11 @@ pub enum ProtocolError {
         found: u32,
     },
     /// The peer speaks a different version of this protocol.
+    ///
+    /// Both ends link this crate, so the versions differ only when the two
+    /// binaries came from different builds. The rendered sentence names the
+    /// two sides as "this build" and "the peer" so that it reads correctly
+    /// whichever end of the socket produced it.
     VersionMismatch {
         /// The version this build speaks.
         ours: u32,
@@ -272,7 +277,7 @@ impl fmt::Display for ProtocolError {
             Self::VersionMismatch { ours, theirs } => write!(
                 f,
                 "fetch protocol version mismatch: this build speaks version {ours}, \
-                 the fetcher speaks version {theirs}"
+                 the peer speaks version {theirs}"
             ),
             Self::UnknownOpcode { opcode, id } => {
                 write!(f, "fetch request {id} carries unknown opcode {opcode}")

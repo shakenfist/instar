@@ -339,6 +339,16 @@ cd vmm
 cargo build --release
 cd ..
 
+# The fetcher is a separate host binary, and every cargo invocation in this
+# script is package-scoped rather than workspace-scoped, so it needs its own
+# build or it is simply never produced -- and the packages, which name each
+# artefact explicitly, would ship without it.
+echo ""
+echo "=== Building instar-fetch ==="
+cd fetch
+cargo build --release
+cd ..
+
 # Copy binaries to target/release/ so they're co-located with instar
 echo ""
 echo "=== Copying binaries to target/release/ ==="
@@ -426,6 +436,7 @@ echo "=== Build complete ==="
 echo ""
 echo "Binaries (all in target/release/):"
 echo "  - instar          Safe, sandboxed disk image operations"
+echo "  - instar-fetch    Serves one open file's bytes to instar over a socket"
 echo "  - core.bin       Core guest (device init, call table) - loaded at 0x10000"
 echo "  - info.bin       Info operation (format detection) - loaded at 0x30000"
 echo "  - copy.bin       Copy operation (file copy) - loaded at 0x30000"

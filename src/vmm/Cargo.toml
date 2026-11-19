@@ -68,6 +68,9 @@ images.
 """
 assets = [
     ["target/release/instar", "usr/bin/", "755"],
+    # An executable rather than a guest payload, so 755 where the .bin
+    # files are 644: the VMM spawns it, it does not load it into a guest.
+    ["target/release/instar-fetch", "usr/lib/instar/", "755"],
     ["target/release/core.bin", "usr/lib/instar/", "644"],
     ["target/release/amend.bin", "usr/lib/instar/", "644"],
     ["target/release/bench.bin", "usr/lib/instar/", "644"],
@@ -100,6 +103,9 @@ assets = [
 auto-req = "auto"
 assets = [
     { source = "target/release/instar",       dest = "/usr/bin/instar",             mode = "0755" },
+    # 755, like instar itself: the VMM spawns the fetcher, where it loads
+    # the .bin files into a guest.
+    { source = "target/release/instar-fetch", dest = "/usr/lib/instar/instar-fetch", mode = "0755" },
     { source = "target/release/core.bin",     dest = "/usr/lib/instar/core.bin",    mode = "0644" },
     { source = "target/release/amend.bin",    dest = "/usr/lib/instar/amend.bin",   mode = "0644" },
     { source = "target/release/bench.bin",    dest = "/usr/lib/instar/bench.bin",   mode = "0644" },

@@ -168,6 +168,7 @@ jobs:
           ARCHIVE="instar-${TAG_NAME}-${{ matrix.target }}.tar.gz"
           mkdir staging
           cp src/target/release/instar staging/
+          cp src/target/release/instar-fetch staging/
           cp src/target/release/*.bin staging/
           cp LICENSE README.md staging/
           tar -czf "${ARCHIVE}" -C staging .
