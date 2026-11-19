@@ -242,6 +242,48 @@ consequence.
    instinct that this phase would rehearse a rotation was not wrong,
    only wrong about which layer rotates.
 
+8. **Each extent file's place in the device is the running total of the
+   lengths before it, rounded up to 512** (added 2026-11-19 by step 3d).
+   The plan said the extent table's `device_offset` is where the
+   extent's bytes begin and left the placement to the implementer, and
+   those two things turned out to conflict: the reader requires a sparse
+   extent's base to be a multiple of 512, because sparse VMDK counts
+   512-byte sectors from the start of its own file, while a real extent
+   file's length is whatever it is. Rounding every extent's contribution
+   up to 512, unconditionally, satisfies that for every extent without
+   the placement depending on what the *next* entry is -- the
+   alternative, padding only before a sparse extent, makes one extent's
+   address depend on its neighbour's kind, which is the kind of rule
+   that is correct when written and wrong after an edit.
+
+   The table still carries the file's own length, not the rounded one,
+   so up to 511 bytes between two extents belong to neither. Nothing
+   addresses them: a flat read stops at `file_length` and zero-fills the
+   rest of the span, a sparse read stays inside its own file, and the
+   backing store returns zeros for a member's declared length past the
+   end of its file. The host test that pins this gives the first extent
+   a 1000-byte file and asserts that reading at offset 1000 returns
+   zeros rather than the second file's first bytes.
+
+9. **`vmdk::MAX_EXTENTS` is the extent table's size, not a number of
+   its own** (added 2026-11-19 in review of step 3d). The descriptor
+   parser had its own cap of 32, justified in a comment that said
+   twoGbMaxExtentFlat "caps at ~1TB/2GB extents per file so this limit
+   comfortably covers any legitimate descriptor". That arithmetic is
+   wrong -- 32 extents of 2 GiB is 64 GiB -- and it did not matter
+   before this phase, because the 16-device ceiling refused such an
+   image first. Lifting that ceiling promoted the parser's cap from
+   dead to live, and would have shipped a phase that documents 64 and
+   refuses at 33.
+
+   So `MAX_EXTENTS` is now defined as `shared::MAX_CHAIN_EXTENTS`. The
+   two bound the same thing, the smaller is what a user meets, and a
+   constant defined in terms of the other cannot drift from it. It costs
+   nothing measurable: the guest binaries are byte-identical, because
+   the descriptor parser's array is transient rather than static. The
+   corpus image that forced the question is 100 GiB in 26 extents of
+   3.96 GiB; written with qemu's 2 GiB default the same image needs 50.
+
 ## Step plan
 
 Steps run in sequence except where noted. 3a must land before 3b, 3c
@@ -441,6 +483,81 @@ inferring 2 GiB from the create type". The read path never inferred
 data device's `virtual_size`. What changes is where the span comes
 from, not that it starts being respected. The row is corrected above so
 no one spends the step hunting a bug that is not there.
+
+**Step 3d closed the ten tests step 3c opened**: `Ran: 4542`, 0 failed,
+verified by the management session on its own build. The reader and the
+host now agree, which is the first point in the phase at which a
+multi-extent sparse image can be read at all.
+
+**The suite is not clean yet, though, and 0 failed does not say so.**
+One test, `test_every_unsupported_image_is_refused`, crashed its stestr
+worker instead of failing -- "exited without returning a status" -- so
+`make test-container` exits non-zero while the totals block reports
+Failed: 0 and Worker 1 reports N/A. The cause is this phase working:
+that test asserts every image the manifest flags `instar_unsupported`
+really is refused, and all five of the flagged split-sparse fixtures
+now succeed. Checked directly, outside the runner, each returns rc=0
+with between 1480 and 14159 bytes of output. Step 3f is what resolves
+it, by clearing the flag and removing the mechanism.
+
+The lesson is worth keeping separate from the cause: a totals block
+saying `Failed: 0` is not the same as a clean run, and neither is a
+matching `Ran: N`. The line to look for is the one naming tests that
+exited without a status, and the signal beside it is a worker whose
+time reads N/A. Definition-of-done item 13 asks for the count rather
+than the exit code; it needs both, plus that line.
+
+Four things came out of the step that the plan had not said, two of
+them recorded above as decisions 8 and 9. The other two:
+
+* **`instar info` printed `format: FLAT` for every extent of a
+  descriptor.** True while only flat descriptors resolved, false the
+  moment sparse ones did, and qemu's JSON carries `"format": "SPARSE"`
+  for these images. Fixed in the step. It changes `info` output for the
+  five fixtures, so it has to land before their baselines are
+  generated.
+* **One parity gap confirmed, one not reproduced.** instar omits
+  `cluster-size` for a split descriptor where qemu reports 65536, both
+  at the top level and per extent -- measured against the pinned 10.2.0
+  build on `vmdk-split-sparse-33g.vmdk`. The step also reported that a
+  child node's `virtual-size` is the declared span where qemu reports
+  the extent file's length; that did not reproduce on either
+  `vmdk-split-sparse-33g.vmdk` or `vmdk-multi-flat.vmdk`, where both
+  readers agree and report a single node. Treat it as unconfirmed and
+  check it when the baselines are generated rather than carrying it as
+  fact.
+
+**One pre-existing fault fixed as a side effect, and kept.** The
+device-slot budget was checked in `write_chain_config` alone, so the
+two-chain paths (`compare` and `rebase`) kept a silent `break` that
+passed the guest a prefix of the chain the user asked about -- a wrong
+answer reported as success. The check now lives in
+`write_chain_device_entries`, which every caller reaches the device
+array through. No command reaches it today, because each counts its own
+devices first; what it closes is a caller whose count drifts from the
+chain it passes.
+
+**A security test's refusal moved rather than weakened.**
+`test_instar_handles_vmdk_descriptor_safely` used to pass because a
+SPARSE extent was refused outright; SPARSE extents are now read, so
+what refuses `vmdk-path-traversal` is the backing allowlist. Verified
+by reading the resolver: `validate_backing_path` runs for every extent
+of a descriptor, before anything opens a file, and its error is the one
+the test now asserts by name rather than inferring from a non-zero exit.
+
+**Two things left for later steps.** `print_backing_chain` still labels
+a descriptor's extents "External data file", which step 3e owns along
+with the rest of the chain printer. And `layout_descriptor_extents` is
+computed twice per image, once to open the backing store and once to
+write the table, so each extent is stat'd twice; the two cannot
+disagree harmfully, because the backing store clamps a member to the
+lesser of its declared length and the file's, but the duplication is a
+wart worth removing when something else touches that code.
+
+**Guest binary sizes are unchanged by this step** -- `core` 70KB,
+`convert` 372KB, `compare` 247KB, `bench` 224KB, against a 768KB cap --
+because the change is host-side. Raising the parser's extent bound did
+not move them either.
 
 ## Back brief
 
