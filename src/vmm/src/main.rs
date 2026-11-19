@@ -2727,24 +2727,65 @@ impl InfoDiskSizes {
     ) -> Self {
         let extents: Vec<u64> = vmdk_flat
             .map(|resolved| {
-                resolved
-                    .extents
-                    .iter()
-                    .map(|extent| {
-                        file_disk_size(&extent.path, apparent).unwrap_or(extent.extent_size)
-                    })
-                    .collect()
+                measure_extent_files(
+                    resolved
+                        .extents
+                        .iter()
+                        .map(|extent| (extent.path.as_path(), extent.extent_size)),
+                    apparent,
+                )
             })
             .unwrap_or_default();
-        let total = extents
-            .iter()
-            .fold(descriptor, |acc, size| acc.saturating_add(*size));
+        let total = sum_with_descriptor(descriptor, &extents);
         Self {
             descriptor,
             extents,
             total,
         }
     }
+}
+
+/// Each extent file's own allocation, in the order given. An extent that
+/// cannot be stat'd falls back to the size its descriptor declares for
+/// it. This is the one place extents are measured, so `info` and
+/// `info --chain` cannot come to different figures for the same image.
+fn measure_extent_files<'a>(
+    extents: impl Iterator<Item = (&'a Path, u64)>,
+    apparent: bool,
+) -> Vec<u64> {
+    extents
+        .map(|(path, declared)| file_disk_size(path, apparent).unwrap_or(declared))
+        .collect()
+}
+
+/// A descriptor's allocation plus every extent's: the image's allocation.
+fn sum_with_descriptor(descriptor: u64, extents: &[u64]) -> u64 {
+    extents
+        .iter()
+        .fold(descriptor, |acc, size| acc.saturating_add(*size))
+}
+
+/// The allocation a chain member is reported with.
+///
+/// A VMDK descriptor is the text file alone as far as `actual_size` goes
+/// (the guest device table reads that field for the descriptor's own
+/// device), so the image's allocation, which qemu-img reports as the sum
+/// over the descriptor and its extents, is worked out here where the
+/// chain is printed, and honours `--ignore-quirks` like every other
+/// disk size. Any other member reports `actual_size` as discovered.
+fn chain_member_disk_size(image: &ChainImage, apparent: bool) -> u64 {
+    if image.format != ImageFormat::VmdkDescriptor {
+        return image.actual_size;
+    }
+    let descriptor = file_disk_size(&image.path, apparent).unwrap_or(image.actual_size);
+    let extents = measure_extent_files(
+        image
+            .external_data_files
+            .iter()
+            .map(|e| (e.path.as_path(), e.extent_size)),
+        apparent,
+    );
+    sum_with_descriptor(descriptor, &extents)
 }
 
 /// Print InfoResult in qemu-img compatible format
@@ -4424,14 +4465,21 @@ fn discover_backing_chain(
 }
 
 /// Print the backing chain in human-readable format
-fn print_backing_chain(chain: &BackingChain) {
+///
+/// `apparent` is `--ignore-quirks`: report file lengths rather than
+/// allocated blocks.
+fn print_backing_chain(chain: &BackingChain, apparent: bool) {
     println!("Chain: {} image(s)", chain.len());
     for image in chain.images() {
         for data_file in &image.external_data_files {
-            println!(
-                "  External data file: {}",
-                terminal_safe_path(&data_file.path)
-            );
+            // A VMDK descriptor's files are extents of its one device,
+            // not data files of a device of their own.
+            let label = if image.format == ImageFormat::VmdkDescriptor {
+                "VMDK extent"
+            } else {
+                "External data file"
+            };
+            println!("  {}: {}", label, terminal_safe_path(&data_file.path));
         }
     }
     for (i, image) in chain.images().iter().enumerate() {
@@ -4451,10 +4499,11 @@ fn print_backing_chain(chain: &BackingChain) {
             format_size_human(image.virtual_size, false),
             image.virtual_size
         );
+        let disk_size = chain_member_disk_size(image, apparent);
         println!(
             "      disk size: {} ({} bytes)",
-            format_size_human(image.actual_size, false),
-            image.actual_size
+            format_size_human(disk_size, false),
+            disk_size
         );
         if image.cluster_size > 0 {
             println!("      cluster size: {} bytes", image.cluster_size);
@@ -4483,7 +4532,7 @@ fn print_backing_chain(chain: &BackingChain) {
 /// attacker-controlled parent references taken from image headers, and
 /// a name carrying a control character must not break the array it is
 /// rendered into.
-fn print_backing_chain_json(chain: &BackingChain) {
+fn print_backing_chain_json(chain: &BackingChain, apparent: bool) {
     if chain.images().is_empty() {
         println!("[]");
         return;
@@ -4497,7 +4546,10 @@ fn print_backing_chain_json(chain: &BackingChain) {
             ),
             format!("        \"format\": \"{}\"", image.format),
             format!("        \"virtual-size\": {}", image.virtual_size),
-            format!("        \"actual-size\": {}", image.actual_size),
+            format!(
+                "        \"actual-size\": {}",
+                chain_member_disk_size(image, apparent)
+            ),
         ];
         if image.cluster_size > 0 {
             fields.push(format!("        \"cluster-size\": {}", image.cluster_size));
@@ -5298,6 +5350,95 @@ fn write_chain_config(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod chain_member_disk_size_tests {
+    //! What a chain member is reported as occupying: the descriptor
+    //! plus every extent for a VMDK descriptor, `actual_size` as found
+    //! for anything else.
+    use super::*;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    fn member(format: ImageFormat, path: PathBuf, extents: Vec<(PathBuf, u64)>) -> ChainImage {
+        ChainImage {
+            path,
+            format,
+            virtual_size: 1 << 20,
+            actual_size: 7,
+            cluster_size: 0,
+            backing_file_raw: None,
+            flags: 0,
+            external_data_files: extents
+                .into_iter()
+                .map(|(path, extent_size)| ExternalDataFile {
+                    path,
+                    extent_size,
+                    vmdk_extent_kind: Some(crate::chain::VmdkExtentKind::Flat),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn descriptor_counts_its_extents_by_length() {
+        let dir = TempDir::new().unwrap();
+        let descriptor = dir.path().join("d.vmdk");
+        let first = dir.path().join("f1.vmdk");
+        let second = dir.path().join("f2.vmdk");
+        std::fs::write(&descriptor, vec![0u8; 100]).unwrap();
+        std::fs::write(&first, vec![0u8; 1000]).unwrap();
+        std::fs::write(&second, vec![0u8; 20000]).unwrap();
+        let image = member(
+            ImageFormat::VmdkDescriptor,
+            descriptor,
+            vec![(first, 1), (second, 2)],
+        );
+        assert_eq!(chain_member_disk_size(&image, true), 100 + 1000 + 20000);
+    }
+
+    #[test]
+    fn descriptor_unstatable_extent_falls_back_to_declared_size() {
+        let dir = TempDir::new().unwrap();
+        let descriptor = dir.path().join("d.vmdk");
+        std::fs::write(&descriptor, vec![0u8; 100]).unwrap();
+        let image = member(
+            ImageFormat::VmdkDescriptor,
+            descriptor,
+            vec![(dir.path().join("gone.vmdk"), 4096)],
+        );
+        assert_eq!(chain_member_disk_size(&image, true), 100 + 4096);
+    }
+
+    #[test]
+    fn descriptor_allocation_is_blocks_unless_apparent() {
+        let dir = TempDir::new().unwrap();
+        let descriptor = dir.path().join("d.vmdk");
+        let extent = dir.path().join("f1.vmdk");
+        std::fs::write(&descriptor, b"x").unwrap();
+        // A sparse file: a megabyte long, holding no blocks.
+        std::fs::File::create(&extent)
+            .unwrap()
+            .set_len(1 << 20)
+            .unwrap();
+        let image = member(
+            ImageFormat::VmdkDescriptor,
+            descriptor.clone(),
+            vec![(extent, 1)],
+        );
+        let apparent = chain_member_disk_size(&image, true);
+        let blocks = chain_member_disk_size(&image, false);
+        assert_eq!(apparent, 1 + (1 << 20));
+        assert!(blocks < apparent, "{blocks} should be below {apparent}");
+    }
+
+    #[test]
+    fn other_formats_report_their_discovered_size() {
+        let image = member(ImageFormat::Qcow2, PathBuf::from("/nonexistent"), vec![]);
+        assert_eq!(chain_member_disk_size(&image, true), 7);
+        assert_eq!(chain_member_disk_size(&image, false), 7);
+    }
 }
 
 #[cfg(test)]
@@ -13283,9 +13424,9 @@ fn run_info(args: InfoArgs, verbose: bool) -> Result<(), Box<dyn std::error::Err
         ) {
             Ok(chain) => {
                 if args.output == "json" {
-                    print_backing_chain_json(&chain);
+                    print_backing_chain_json(&chain, args.ignore_quirks);
                 } else {
-                    print_backing_chain(&chain);
+                    print_backing_chain(&chain, args.ignore_quirks);
                 }
                 return Ok(());
             }
@@ -14243,7 +14384,7 @@ fn run_check(args: CheckArgs, verbose: bool) -> Result<(), Box<dyn std::error::E
         ) {
             Ok(chain) => {
                 if verbose {
-                    print_backing_chain(&chain);
+                    print_backing_chain(&chain, false);
                 }
                 Some(chain)
             }
@@ -15086,9 +15227,9 @@ fn compare_images(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::e
 
     if verbose {
         debug!("Image 1 chain ({} image(s)):", chain1.len());
-        print_backing_chain(&chain1);
+        print_backing_chain(&chain1, false);
         debug!("Image 2 chain ({} image(s)):", chain2.len());
-        print_backing_chain(&chain2);
+        print_backing_chain(&chain2, false);
     }
 
     let total_devices = chain1.total_devices() + chain2.total_devices();
@@ -16166,7 +16307,7 @@ fn execute_convert(
 
     if verbose {
         debug!("Input chain ({} image(s)):", chain.len());
-        print_backing_chain(&chain);
+        print_backing_chain(&chain, false);
     }
 
     let input_device_count = chain.total_devices();
