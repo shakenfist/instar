@@ -765,6 +765,58 @@ sparse fixtures introduced. This phase makes a descriptor readable for
 monolithicFlat for an image that is not flat, which is now inaccurate.
 Both belong in the format coverage table.
 
+**The definition of done, as run.** Every item was checked by the
+management session against its own build at `d0684c0f`, and all
+fifteen pass. The items worth recording a number or a method for:
+
+- The boundary read (item 3) returns 131072 bytes of `0xAB` across the
+  2 GiB extent edge of `vmdk-split-sparse-5g-boundary.vmdk`, and the
+  bytes after it are zero, so the read neither stops at the edge nor
+  repeats the extent.
+- The device count (item 7) is 1 for descriptors of 1, 3, 17 and 26
+  extents alike, counted from the VMM's own device creation in verbose
+  output. Nothing grows with the extent count.
+- The virtqueue assert (item 6) was falsified rather than read: a copy
+  of the worktree with `MAX_CHAIN_DEVICES` at 17 fails to build with
+  "virtqueue region overlaps the DMA pool". The worktree itself was
+  never edited and the copy was deleted.
+- The chain allocation (item 8) is 1052672 for both members of
+  `vmdk-flat-with-parent.vmdk` from both instar and the pinned
+  qemu-img, against 368 before #927 was fixed.
+- The suite (item 13) ran 4551 tests with no failure and no worker
+  exiting without a status, and the 70 split-sparse baseline
+  comparisons were counted from the subunit stream as successes rather
+  than read from the totals block, because a comparison that skips
+  looks like one that passes there.
+- The profiles (item 12) validate at 175932 files across 960 versions
+  with no mismatch and no hand-maintained gap.
+- Mutation (items 10 and 15): step 3b 8 of 8 killed
+  (`.../scratchpad/step-3b/mutation.log`), step 3c 47 of 47
+  (`.../scratchpad/step-3c/mutants.yaml` and `mutation-final.log`),
+  step 3e 10 of 10 after review (`.../scratchpad/review-3e/`), step 3i
+  21 of 21 over two sets (`.../scratchpad/step-3i/run-mutants.sh`
+  with `mutants.yaml` and `mutants-print.yaml`). None of these counts
+  a skip as a kill; the helper reports separately on a mutant whose
+  output named no test, and that count is zero in every run. The rust
+  set of step 3i was re-run by the management session on its own
+  invocation and reproduced 13 of 13.
+- Item 11 passes with a caveat that is a property of the testdata
+  rather than of this work: `vmdk-multi-flat` compares clean at all
+  seven profiles, and `vmdk-flat-1m` and `vmdk-flat-10m` at the single
+  profile each has a baseline for. Neither has baselines at the other
+  versions, and that was true before this phase.
+
+**Found while reviewing, not fixed, and not this phase's to fix.**
+The host-side pre-check that makes `map` and `measure` refuse a
+descriptor carries a comment saying the guest's reader fails the VMDK4
+header parse for descriptor-driven layouts. That was the reason when it
+was written; the guest now reads a descriptor through the extent table,
+and only the pre-check stands between `map` and the same path. The
+refusal message also names monolithicFlat for an image that is not
+flat. `docs/measure.md` does not mention the refusal at all. All three
+are small, pre-existing, and belong with the work that lifts the
+refusal rather than with the work that made the images readable.
+
 ## Back brief
 
 Points needing the operator's answer before any step runs.
