@@ -209,7 +209,7 @@ and 3d, because all three consume the ABI it defines.
 
 | Step | Effort | Model | Isolation | Brief for sub-agent |
 |------|--------|-------|-----------|---------------------|
-| 3a | high | opus | none | Define the extent-table ABI in `src/shared/src/lib.rs`. Add `pub const MAX_CHAIN_EXTENTS: usize = 64;` and a `#[repr(C)] pub struct ChainExtent { pub device_offset: u64, pub file_length: u64, pub virtual_span: u64 }` with a `const fn new()` returning zeros, mirroring `ChainSegment` at line 5219. Add to `ChainConfig` (line 5391): `pub extent_count: u32`, and `pub extents: [ChainExtent; MAX_CHAIN_EXTENTS]`. Bump `ChainConfig::version` to 5 and extend the version comment at line 5422 in the established style. Per-descriptor ownership: add `pub first_extent: u32` and `pub extent_count: u32` to `ChainDeviceInfo` (line 5274), so a device names its slice of the table; document that both are zero for a device with no extents. Two asserts matter: change line 664's `VQ_BASE_START + 16 * 0x10000 <= DMA_POOL_BASE` to use `MAX_CHAIN_DEVICES` instead of the literal (this is #934), and add a new `const_assert!(core::mem::size_of::<ChainConfig>() <= VMM_PARAMS_ADDR - CHAIN_CONFIG_ADDR)` with a message saying the chain config must fit its page. This crate is `no_std` and is linked into the guest, so run `scripts/check-binary-sizes.sh` and report the before and after numbers. Do not change any consumer yet; the build must still pass with the new fields unread. |
+| 3a | high | opus | none | Define the extent-table ABI in `src/shared/src/lib.rs`. Add `pub const MAX_CHAIN_EXTENTS: usize = 64;` and a `#[repr(C)] pub struct ChainExtent { pub device_offset: u64, pub file_length: u64, pub virtual_span: u64 }` with a `const fn new()` returning zeros, mirroring `ChainSegment` at line 5219. Add to `ChainConfig` (line 5391): `pub extent_count: u32`, and `pub extents: [ChainExtent; MAX_CHAIN_EXTENTS]`. Bump `ChainConfig::version` to 5 and extend the version comment at line 5422 in the established style. Per-descriptor ownership: add `pub first_extent: u32` and `pub extent_count: u32` to `ChainDeviceInfo` (line 5274), so a device names its slice of the table; document that both are zero for a device with no extents. Two asserts matter: change line 664's `VQ_BASE_START + 16 * 0x10000 <= DMA_POOL_BASE` to use `MAX_CHAIN_DEVICES` instead of the literal (this is #934), and add a new compile-time assert that `core::mem::size_of::<ChainConfig>()` is at most `VMM_PARAMS_ADDR - CHAIN_CONFIG_ADDR`, with a message saying the chain config must fit its page. The idiom in this file is a free-standing `const _: () = assert!(..)`, as at lines 650 and 656; there is no `const_assert!` macro in this codebase. This crate is `no_std` and is linked into the guest, so run `scripts/check-binary-sizes.sh` and report the before and after numbers. Do not change any consumer yet; the build must still pass with the new fields unread. |
 | 3b | high | opus | worktree | Give `BackingStore` (`src/vmm/src/backing.rs:15`) the ability to span several files. It holds one `File` plus `capacity`, `current_size` and `sparse`. Add a constructor that takes an ordered `Vec` of (path, length) and keeps a `Vec<File>` with a running offset table, and route `read_at`/`write_at` to the file owning the offset, splitting a request that straddles a boundary into one call per file so every byte of the caller's buffer is filled. The single-file path must keep its exact current behaviour, including the zero-padding of reads past the file end that `src/vmm/src/virtio/block.rs:141` relies on; the cleanest shape is an internal enum with a `Single` and a `Concatenated` variant rather than a `Vec` of length one, so the common path keeps its current code. Every device in the VMM goes through this type, so this is the step where a mistake is widest: add unit tests in the file's existing `mod tests` style for a straddling read, a read entirely past the end, a boundary-aligned read, and a two-file store whose second file is shorter than its declared length. Read-only is the only mode this phase needs; make the multi-file constructor refuse a writable request rather than leaving it half-implemented. |
 | 3c | xhigh | fable | worktree | Teach the guest's reader to use the extent table from step 3a, and remove the per-device extent walk. Today a VMDK flat descriptor's extents arrive as separate marked data devices and the reader walks them; after this step the descriptor and all its extents are one device and the boundaries come from `ChainConfig::extents` with the slice named by `ChainDeviceInfo::first_extent`/`extent_count`. Resolve a virtual offset to an extent, then read within that extent at `device_offset + (virtual offset - extent base)`. For a SPARSE extent, parse that extent's own header, grain directory and grain tables at offsets relative to its `device_offset`, because each extent is a self-contained sparse VMDK covering only its own span -- this is the part that makes `twoGbMaxExtentSparse` readable and it is the hardest thing in the phase. A read past the last extent must still stop and return zeros rather than continue into whatever follows: rewrite the two tests at `src/crates/qcow2/src/lib.rs:15941` and `:15982` against the new mechanism, keeping what they assert. Honour each extent's declared `virtual_span` rather than assuming 2 GiB; one real corpus image declares 3.96 GiB extents. The crate is `no_std`, the guest binary cap is 768KB, and the reader frame budget noted at `src/crates/qcow2/src/lib.rs:16943` is about 10.7KB per device against a 4MB stack -- say in the report what your change does to frame size. Run the consumer operation suites, not only the crate tests. |
 | 3d | high | opus | none | Wire the VMM side. In `src/vmm/src/chain.rs`, let `resolve_vmdk_flat_descriptor` accept SPARSE extents (the refusal is at line 960) while keeping the non-zero `offset_sectors` refusal at line 967, and carry each extent's declared sector count through `ResolvedVmdkDescriptor`. In `src/vmm/src/main.rs`, attach a descriptor and its extents as one device built on step 3b's concatenated backing store instead of one device per extent, populate step 3a's extent table, and refuse an extent count above `MAX_CHAIN_EXTENTS` with a message naming the bound. Extents no longer count toward chain depth, so the four guards at `:6719`, `:13573`, `:14405` and `:15462` must now bound only real chain members -- change what they count, do not delete them, and keep their comments true by rewriting them. `DeviceSet::add_device`'s assert at `:738` should become unreachable for extents by construction; say in the report why it now cannot fire rather than asserting that it cannot. Both corpus images must read: `vmdk-split-sparse-33g` (17 extents) and `osboxes-vmdk-split-sparse` (26 extents of 8304640 sectors). |
@@ -237,7 +237,7 @@ Falsifiable; each is checkable by someone who did not do the work.
 2. `instar info --output json` on `vmdk-split-sparse-33g.vmdk` reports the same `virtual-size` as `qemu-img info --output=json` from the pinned 10.2.0 build.
 3. Reading offsets 2147418112 to 2147549184 of `vmdk-split-sparse-5g-boundary.vmdk` returns the 131072 bytes of `0xAB` the fixture places across the first extent boundary, proving the read crosses an extent rather than stopping or repeating.
 4. A descriptor with more than `MAX_CHAIN_EXTENTS` extents is refused with a message naming the bound, and the refusal is reached by a test rather than by inspection.
-5. `core::mem::size_of::<ChainConfig>()` is at most `VMM_PARAMS_ADDR - CHAIN_CONFIG_ADDR`, enforced by a `const_assert` that fails to compile if it is not.
+5. `core::mem::size_of::<ChainConfig>()` is at most `VMM_PARAMS_ADDR - CHAIN_CONFIG_ADDR`, enforced by a compile-time assert that fails the build if it is not.
 6. `src/shared/src/lib.rs`'s virtqueue-region assert refers to `MAX_CHAIN_DEVICES` rather than a literal `16`; setting `MAX_CHAIN_DEVICES` to 17 fails the build. Checked by making that edit, observing the failure, and restoring from a copy.
 7. No device is attached per extent: a 26-extent image reads with a chain device count that does not grow with the extent count, and the report states the count observed.
 8. `qemu-img info --backing-chain --output=json` and `instar info --chain --output json` agree on `actual-size` for every member of `vmdk-flat-with-parent.vmdk`, where instar reported 368 against qemu's 1052672 before the fix.
@@ -248,6 +248,49 @@ Falsifiable; each is checkable by someone who did not do the work.
 13. `pre-commit run --all-files` passes, and `make test` reports a "Ran: N" matching the selection with 0 failures. The count is checked, not the exit code.
 14. `scripts/check-binary-sizes.sh` passes, with the before and after numbers recorded in the execution notes because steps 3a and 3c change a crate linked into the guest.
 15. Breaking each of step 3b's routing cases and step 3c's extent resolution in turn makes a test fail, with the mutation script's path, a killed count, and no skip counted as a kill.
+
+## Execution notes
+
+Implementation began 2026-11-19 (AEDT).
+
+**Back brief, answered 2026-11-19.** #927 stays in this phase as step
+3e, rather than being split into its own pull request.
+`MAX_CHAIN_EXTENTS` is confirmed at 64. Step 3f removes the
+`instar_unsupported` mechanism outright once no image uses it, rather
+than keeping the field and relaxing its test. This session may push the
+testdata baselines after review, push the phase branch, and open the
+pull request.
+
+**Two facts this plan had wrong, corrected above at source.** The
+compile-time assert idiom is a free-standing `const _: () = assert!(..)`
+and not a `const_assert!` macro, which does not exist here. And
+decision 4's page arithmetic was right about the page but missed a
+second bound: `CHAIN_CONFIG_MAX_SIZE` was 1024, not the 4096-byte page,
+with a test asserting the structure fits it, so 2392 bytes would have
+failed. Step 3a raised that constant to
+`VMM_PARAMS_ADDR - CHAIN_CONFIG_ADDR`, which is what the name meant all
+along; its only consumer hands the guest a pointer and a length for the
+region rather than copying into a buffer, so nothing was sized by the
+old value.
+
+**Step 3a could not quite "change no consumer".** The host wrote device
+entries with a literal stride of 32 and the segment array at a literal
+`+528`, in three places, with two VMM tests pinning those numbers.
+Growing `ChainDeviceInfo` from 32 to 40 bytes moves both, and leaving
+the literals would have had the host writing at the old stride while the
+guest read at the new one -- a whole config misread rather than a
+missing field. Both are now derived from
+`size_of::<ChainDeviceInfo>()`. No behavioural consumer changed and
+nothing yet reads the new fields.
+
+**Definition of done items 5 and 6 were verified by the management
+session**, not by the step, because the sub-agent's permission settings
+refused the edit the check requires. Each mutant ran against a copy and
+was restored from it: `MAX_CHAIN_DEVICES = 17` fails the build with
+"virtqueue region overlaps the DMA pool", and `MAX_CHAIN_EXTENTS = 200`
+fails it with "ChainConfig does not fit the page reserved for it at
+CHAIN_CONFIG_ADDR". Both are the asserts the step added or rewired, so
+the guard this phase relies on is proved rather than read.
 
 ## Back brief
 
