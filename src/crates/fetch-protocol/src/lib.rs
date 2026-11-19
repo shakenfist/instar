@@ -31,12 +31,16 @@
 //!
 //! * [`wire`] -- the four headers, their encode and decode, the status
 //!   vocabulary, and the block-size negotiation.
+//! * [`client`] -- the privileged side's reader: init exchange, then
+//!   `read_at` over request and reply datagrams.
 //! * [`socket`] -- the `SOCK_SEQPACKET` socketpair and the handful of
 //!   `libc` calls it takes to own one safely.
 
+pub mod client;
 pub mod socket;
 pub mod wire;
 
+pub use client::FetchClient;
 pub use socket::{SeqPacketSocket, DATAGRAM_OVERHEAD};
 pub use wire::{
     negotiate_block_size, InitReply, InitRequest, ProtocolError, ReadReply, ReadRequest, Status,
