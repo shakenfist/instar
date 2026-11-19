@@ -545,6 +545,29 @@ happen.
     than against a number -- which is the reason that choice was worth
     making.
 
+17. **The survey's correction was incomplete, and step 2g found the
+    other instance.** Open question 2's datagram-ceiling claim was
+    corrected when this phase was planned, but the `## Situation`
+    section states the same measurement independently and still
+    concluded that a datagram is "capped near 256 KiB on default
+    sysctls" -- splitting the difference between the 208 KiB a side
+    gets without asking and the 416 KiB it gets after asking, and
+    matching neither. Corrected there too. The lesson is the one the
+    review guidance already gives: when a claim is wrong, the question
+    is how many places state it, not whether the reported one is fixed.
+18. **Definition-of-done item 11 could never have passed as written.**
+    Its `git diff` named `docs/` as a pathspec, and `docs/` contains
+    `docs/plans/`, where citing the plan by name is the entire point --
+    so the grep was guaranteed to match this plan's own diff. The item
+    now excludes `docs/plans`, and with that exclusion it passes.
+19. **Item 9 was verified without `cargo tree`,** which could not run:
+    the `docker run` it needs is denied by the project's own settings.
+    The static argument is decisive rather than a substitute. `instar`'s
+    `[dependencies]` section is byte-identical to the one on `develop`,
+    no existing dependency's version moved, and nothing under
+    `src/vmm/src` names the new crate -- and cargo links only what a
+    manifest declares, so the dependency tree cannot have changed.
+
 ## Mutation results
 
 Step 2d's tests are only worth their runtime if they fail when the thing
@@ -602,8 +625,11 @@ the push.
     `SO_SNDBUF`: with a small buffer set on the test peer, the
     negotiated block size is the small value and reads larger than it
     still succeed by splitting.
-11. `git diff origin/develop...HEAD -- src/ docs/ tests/ .github/ |
-    grep -nE 'PLAN-|[Pp]hase [0-9]|step 2[a-g]'` prints nothing.
+11. `git diff origin/develop...HEAD -- src/ docs/ tests/ .github/
+    ':!docs/plans' | grep -nE 'PLAN-|[Pp]hase [0-9]|step 2[a-g]'` prints
+    nothing. The exclusion is necessary and was missing when this plan was
+    written: `docs/` contains `docs/plans/`, where citing the plan is the
+    whole point, so the command as first written could never pass.
 12. `pre-commit run --all-files` exits 0, `make test-rust` passes with
     its count recorded here, and any Python module this phase adds or
     touches passes with its "Ran: N" line read rather than its exit

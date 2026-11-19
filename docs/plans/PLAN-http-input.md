@@ -104,9 +104,14 @@ taking longer than that to answer one read. Queue depth is one.
 **Unix-socket limits, measured here.** `net.core.wmem_max` is
 212992, so a `SOCK_SEQPACKET` socketpair's `SO_SNDBUF` saturates at
 425984 however much is requested: a single 256 KiB datagram sends,
-and a single 1 MiB datagram fails. Any design that carries a block
-of image data in one datagram is capped near 256 KiB on default
-sysctls, and that limit is a sysctl the user can lower.
+and a single 1 MiB datagram fails. So a design that carries a block
+of image data in one datagram is capped at 425952 bytes here once a
+side asks for the buffer, and at 212960 if it does not -- the kernel
+clamps a request to `wmem_max` and then doubles it, so neither
+figure follows from the sysctl by inspection, and both move if the
+user lowers it. Phase 2 measured this precisely; see open question 2,
+which this paragraph used to contradict by splitting the difference
+at "near 256 KiB".
 
 **What the host already reads for itself.** Backing-chain discovery
 (`src/vmm/src/chain.rs`) runs the sandboxed info operation once per
@@ -1102,6 +1107,23 @@ chosen to defer to here, so that we do not forget them.
   35 test modules. Phase 1 added its own two and the shared rig, and
   marked the list as curated rather than complete; completing it, with
   a CI guard in `tools/ci/check-test-partition.py`, is the fix.
+* **#932 should be fixed in phase 3, not later.** Phase 1 made the
+  guest's wait unbounded and made the host complete a failed request
+  with an error status, which is what makes a remote read's failure
+  survivable. But an error the host cannot *read* is still never
+  completed, and phase 3 multiplies the ways the host can fail to
+  answer by putting a socket and another process behind every read,
+  so the hang stops being a corner case once the fetcher exists.
+* **The measured datagram ceiling, for phase 6's block-size
+  decision.** On a stock Linux host a socket pair that asks for the
+  largest buffers is granted 425984 bytes an end, giving a
+  425952-byte datagram ceiling; a pair left alone gets 212992 and
+  212960. The kernel clamps a request to `wmem_max` and then doubles
+  it, so neither figure follows from the sysctl by inspection. The
+  negotiation settles on the 64 KiB default rather than either, and
+  phase 6 raising that default is a change to one constant, because
+  the headers and the requested buffers are already built for the
+  256 KiB maximum.
 
 ### Bugs fixed during this work
 
