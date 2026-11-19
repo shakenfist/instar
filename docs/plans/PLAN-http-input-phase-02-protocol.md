@@ -457,6 +457,31 @@ happen.
    the sentence now says "this build" and "the peer", reads correctly
    from either end, and the duplicate renderer is gone.
 
+10. **A failed exchange now ends the client**, added during review of
+    step 2c. The step's client reported a timeout, a socket error or an
+    undecodable reply and left itself usable, with the request still
+    owed an answer on the socket. Request ids make a stale reply
+    detectable rather than silent -- it carries an older id than the one
+    in flight -- but a half-finished conversation cannot be
+    resynchronised without knowing how many answers are outstanding,
+    which is the thing that was lost, and checking on every later read
+    turns one failure into a run of misleading ones. The first failure
+    now ends the client and the caller opens another. This matters more
+    at phase 6, which puts several requests in flight and so loses the
+    monotonic-id argument that makes the current behaviour merely
+    noisy rather than wrong. Proved by one mutation: removing the flag
+    makes `a_failed_exchange_ends_the_connection` fail.
+11. **A reply timeout exists and phase 8 owns its value.** The client
+    sets a 60-second default, which the plan did not ask for. A bound
+    is right here even though phase 1 deliberately removed one from the
+    guest: the guest waits on a host it trusts and cannot cancel a
+    request, whereas this peer is untrusted and killable, so a fetcher
+    that accepts a request and never answers would otherwise hang the
+    privileged process for ever and defeat the partition. Sixty seconds
+    is a placeholder rather than a policy; deadlines and caps are phase
+    8's subject, and it should set this from the same policy as the
+    rest.
+
 ## Definition of done
 
 Each item is falsifiable; the management session checks them before
