@@ -297,6 +297,7 @@ and 3d, because all three consume the ABI it defines.
 | 3d | high | opus | none | Wire the VMM side. In `src/vmm/src/chain.rs`, let `resolve_vmdk_flat_descriptor` accept SPARSE extents (the refusal is at line 960) while keeping the non-zero `offset_sectors` refusal at line 967, and carry each extent's declared sector count through `ResolvedVmdkDescriptor`. In `src/vmm/src/main.rs`, attach a descriptor and its extents as one device built on step 3b's concatenated backing store instead of one device per extent, populate step 3a's extent table, and refuse an extent count above `MAX_CHAIN_EXTENTS` with a message naming the bound. Extents no longer count toward chain depth, so the four guards at `:6719`, `:13573`, `:14405` and `:15462` must now bound only real chain members -- change what they count, do not delete them, and keep their comments true by rewriting them. `DeviceSet::add_device`'s assert at `:738` should become unreachable for extents by construction; say in the report why it now cannot fire rather than asserting that it cannot. Both corpus images must read: `vmdk-split-sparse-33g` (17 extents) and `osboxes-vmdk-split-sparse` (26 extents of 8304640 sectors). |
 | 3e | medium | sonnet | none | Fix #927. `src/vmm/src/main.rs:3809` sets a chain member's `actual_size` to `std::fs::metadata(&current).map(|m| m.len())` -- the descriptor's apparent length, omitting every extent and ignoring `--ignore-quirks`. Make it the descriptor's allocation plus each resolved extent's, which is what `InfoDiskSizes::new` already computes for the non-chain paths (see its call site near `src/vmm/src/main.rs:2458` and the `--ignore-quirks` convention at `:2449`, where the flag means apparent length rather than `st_blocks * 512`). The resolved extents are in scope at that point; they are stored into `external_data_files` a few lines below. `ignore_quirks` is not currently threaded into the chain walk, so thread it. Verify against qemu-img 10.2.0 on `custom/format-coverage/vmdk-flat-with-parent.vmdk`, where `qemu-img info --backing-chain --output=json` reports 1052672 for both members and instar reports 368 before the fix. |
 | 3f | medium | sonnet | none | Un-flag the fixtures and resolve what that empties. Remove `instar_unsupported` from all five entries in `tests/manifest.json` that carry it (`vmdk-split-sparse-2049m`, `-5g`, `-5g-boundary`, `-33g`, and `osboxes-vmdk-split-sparse`) and give each a description of what it now proves. That empties the field across all 222 images, which makes `TestInstarUnsupportedIsStillUnsupported` in `tests/test_info_safe.py` fail by design -- it asserts the field is set somewhere. Nothing else in the suite reads the field except the skip at `tests/test_info_safe.py:126` and `is_instar_unsupported` in `tests/base.py`. Since no image is unsupported any more, remove the field's handling and that test together rather than leaving a mechanism with no subject, and say so in the commit message; if you find a reason to keep the field, keep the test too and say why. Then add the positive assertions the fixtures now support: each of the five reads, reports the virtual size its manifest entry declares, and for `-5g-boundary` the 131072 bytes of `0xAB` at offset 2147418112 straddling the first extent boundary read back correctly. |
+| 3i | high | opus | none | Close the two `info` parity gaps that step 3f exposed, both specific to a split-sparse descriptor and both measured against the pinned qemu-img 10.2.0. First: the top-level `cluster-size` is absent where qemu reports 65536. A descriptor short-circuits the guest (`src/vmm/src/main.rs`, the `peek_is_vmdk_descriptor` branch of `discover_backing_chain`), so nothing ever reads a grain size; `vmdk::Vmdk4HeaderFull::parse` is public, pure and takes a byte slice, and `vmdk` is already a `vmm` dependency, so read `HEADER_FULL_SIZE` bytes from the first SPARSE extent host-side and take `grain_size_bytes`. Leave it absent for an all-FLAT descriptor, which is what qemu does -- verified on `vmdk-multi-flat.vmdk`, where neither reader reports one. Second: each `extents.N` child node's `virtual-size` is `extent.extent_size`, the declared span, where qemu reports the extent file's own length (`src/vmm/src/main.rs`, the `include_child_node` block, and the human printer above it). A flat extent's file is exactly its span, which is why no fixture caught this before. Use the file's length, sector-rounded as the descriptor's own child already is, not its allocation -- a sparse file's `blocks * 512` is smaller than its length. The 70 failures in `test_output_matches_baseline` are the measure of done: the baselines are byte-identical to what the pinned qemu prints today, so nothing is fixed by regenerating them. Run the five fixtures against qemu field by field, not just on the two fields named here. |
 | 3g | medium | sonnet | none | Generate baselines in `instar-testdata` for the five newly supported fixtures, across the version matrix, and validate them. That repository takes direct commits to `main`, never a merge request, and is git-LFS backed; rebase before pushing because the fuzz automation moves `main` daily. Run `generate-baselines.py --no-commit`, then `make profiles`, then `make validate-profiles`, and do not trust the derived `profiles/` directories -- they have twice been silently wrong while `raw/` was fine. Report the file count per operation and per version. Leave the work uncommitted in the instar worktree; the testdata commit is the management session's to make. |
 | 3h | medium | sonnet | none | Records. Add a `### Fixed` entry to `CHANGELOG.md` under `[Unreleased]` for reading multi-extent VMDK (both split subformats) and for #927, as two separate entries because they are two faults. Document the new readable subformat in `docs/format-coverage.md` and wherever `docs/` states the extent or device limit, including the `MAX_CHAIN_EXTENTS` bound and that qemu has no equivalent. Do not cite plan, phase or step numbers anywhere outside `docs/plans/`. |
 
@@ -516,16 +517,18 @@ them recorded above as decisions 8 and 9. The other two:
   for these images. Fixed in the step. It changes `info` output for the
   five fixtures, so it has to land before their baselines are
   generated.
-* **One parity gap confirmed, one not reproduced.** instar omits
-  `cluster-size` for a split descriptor where qemu reports 65536, both
-  at the top level and per extent -- measured against the pinned 10.2.0
-  build on `vmdk-split-sparse-33g.vmdk`. The step also reported that a
-  child node's `virtual-size` is the declared span where qemu reports
-  the extent file's length; that did not reproduce on either
-  `vmdk-split-sparse-33g.vmdk` or `vmdk-multi-flat.vmdk`, where both
-  readers agree and report a single node. Treat it as unconfirmed and
-  check it when the baselines are generated rather than carrying it as
-  fact.
+* **Two parity gaps, both confirmed.** instar omits `cluster-size` for
+  a split descriptor where qemu reports 65536, both at the top level and
+  per extent. And a child node's `virtual-size` is the extent's declared
+  span where qemu reports the extent file's length: 1073741824 against
+  196608 for the last extent of `vmdk-split-sparse-33g.vmdk`, on 17 of
+  its 17 extents.
+
+  The review first recorded the second as "did not reproduce", wrongly.
+  It was checked against `format-specific.data.extents`, where the two
+  readers do agree, when the claim was about the `children` array, where
+  they do not. The step that reported it was right. Both gaps are the
+  subject of step 3i below.
 
 **One pre-existing fault fixed as a side effect, and kept.** The
 device-slot budget was checked in `write_chain_config` alone, so the
@@ -618,6 +621,33 @@ and dd ask for block sizes, which only affects debug output.
 `:4128` by the time the step ran, having moved when step 3d rewrote the
 attachment code above it. The row is left as it was written, since it
 is the brief as given; the line to trust is this note.
+
+**Step 3f was expected to be clean and was not, and the phase grew by a
+step as a result.** Removing `instar_unsupported` let the output
+comparison run for the five fixtures for the first time, which turned up
+70 failures: five images, two output formats, seven profiles, all
+`test_output_matches_baseline`, all from the two `info` gaps recorded
+under step 3d above. Neither is baseline staleness. Each baseline was
+checked against the pinned qemu-img 10.2.0's live output and is
+byte-identical to it, so regenerating them -- which is what step 3g
+does -- cannot close either gap.
+
+Both gaps are specific to a split-sparse descriptor, which is why no
+existing fixture showed them. Measured on three subformats:
+monolithicSparse reports `cluster-size` correctly and its child node
+agrees; multi-extent flat correctly reports no `cluster-size` and its
+children agree, because a flat extent's file is exactly its declared
+span; only split-sparse diverges.
+
+Put to Michael as a fork, because the fix needs host-side sparse-header
+reading that this plan never scoped, and the alternatives were to defer
+the gaps and reinstate the mechanism he had just asked to delete, or to
+drop the fixtures from the phase. **Decided 2026-11-19: fix both here**,
+as step 3i, which runs before 3g. The reading work this phase exists for
+is already proven -- a 26-extent image attaches as one device and the
+5 GiB boundary fixture converts byte-identically to qemu across its
+whole length -- so what is left is reporting parity on images that
+previously could not be read at all.
 
 ## Back brief
 
