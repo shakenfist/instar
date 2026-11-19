@@ -32,7 +32,7 @@ mod version;
 mod virtio;
 
 use std::collections::VecDeque;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -729,6 +729,14 @@ impl DeviceSet {
 
     /// Add a device at the next available index.
     /// Returns the device index assigned.
+    ///
+    /// A VMDK descriptor's extents cannot reach here, and not because a
+    /// caller remembers to count them: `ChainImage::data_devices`
+    /// returns nothing for a descriptor, and the chain openers attach a
+    /// device for each image and for each of those, so a descriptor and
+    /// all of its extents are one call whatever the extent count. What
+    /// bounds the extents instead is `shared::MAX_CHAIN_EXTENTS`, on the
+    /// table the host writes them to.
     ///
     /// # Panics
     ///
@@ -2695,6 +2703,19 @@ struct InfoDiskSizes {
     total: u64,
 }
 
+/// The token `info` prints for an extent's kind, in both the human and
+/// the JSON renderings.
+///
+/// qemu-img prints the kind from the descriptor's extent line, so a
+/// sparse extent reads `SPARSE` rather than the `FLAT` every extent was
+/// labelled with while only flat extents resolved.
+fn vmdk_extent_format(kind: crate::chain::VmdkExtentKind) -> &'static str {
+    match kind {
+        crate::chain::VmdkExtentKind::Flat => "FLAT",
+        crate::chain::VmdkExtentKind::Sparse => "SPARSE",
+    }
+}
+
 impl InfoDiskSizes {
     /// Measure `vmdk_flat`'s extents, if any, beside the already computed
     /// `descriptor` allocation. An extent that cannot be stat'd falls back
@@ -2707,10 +2728,10 @@ impl InfoDiskSizes {
         let extents: Vec<u64> = vmdk_flat
             .map(|resolved| {
                 resolved
-                    .flat_extents
+                    .extents
                     .iter()
                     .map(|extent| {
-                        file_disk_size(&extent.flat_path, apparent).unwrap_or(extent.extent_size)
+                        file_disk_size(&extent.path, apparent).unwrap_or(extent.extent_size)
                     })
                     .collect()
             })
@@ -2946,24 +2967,22 @@ fn print_info_result(
 
             // Extents section.
             //
-            // monolithicFlat / twoGbMaxExtentFlat images have one entry
-            // per resolved flat extent, rendered as "format: FLAT" with
-            // the resolved extent filename and no cluster-size line —
-            // exactly like the JSON extents rendering and qemu-img's
-            // human output. All other create types (monolithicSparse,
-            // streamOptimized, …) have a single self-referential extent
-            // described by the descriptor's own virtual size and cluster
-            // size, with an empty format.
+            // A descriptor naming its extents in separate files has one
+            // entry per resolved extent, rendered with the kind the
+            // descriptor's extent line declared, the resolved extent
+            // filename and no cluster-size line -- exactly like the
+            // JSON extents rendering and qemu-img's human output. All
+            // other create types (monolithicSparse, streamOptimized, …)
+            // have a single self-referential extent described by the
+            // descriptor's own virtual size and cluster size, with an
+            // empty format.
             println!("    extents:");
             if let Some(resolved) = vmdk_flat {
-                for (idx, extent) in resolved.flat_extents.iter().enumerate() {
+                for (idx, extent) in resolved.extents.iter().enumerate() {
                     println!("        [{idx}]:");
                     println!("            virtual size: {}", extent.extent_size);
-                    println!(
-                        "            filename: {}",
-                        terminal_safe_path(&extent.flat_path)
-                    );
-                    println!("            format: FLAT");
+                    println!("            filename: {}", terminal_safe_path(&extent.path));
+                    println!("            format: {}", vmdk_extent_format(extent.kind));
                 }
             } else {
                 println!("        [0]:");
@@ -3013,9 +3032,9 @@ fn print_info_result(
             // protocol node), and its "disk size" is that extent file's
             // own allocation, not the descriptor's.
             if let Some(resolved) = vmdk_flat {
-                for (i, extent) in resolved.flat_extents.iter().enumerate().rev() {
+                for (i, extent) in resolved.extents.iter().enumerate().rev() {
                     println!("Child node '/extents.{i}':");
-                    println!("    filename: {}", terminal_safe_path(&extent.flat_path));
+                    println!("    filename: {}", terminal_safe_path(&extent.path));
                     println!("    protocol type: file");
                     println!(
                         "    file length: {} ({} bytes)",
@@ -3147,9 +3166,9 @@ fn print_info_result_json(
         println!("    \"children\": [");
         let mut emitted_any_child = false;
         if let Some(resolved) = vmdk_flat {
-            for (i, extent) in resolved.flat_extents.iter().enumerate().rev() {
+            for (i, extent) in resolved.extents.iter().enumerate().rev() {
                 let extent_disk = disk_sizes.extents[i];
-                let extent_path = extent.flat_path.to_string_lossy();
+                let extent_path = extent.path.to_string_lossy();
                 if emitted_any_child {
                     println!("        }},");
                 }
@@ -3358,10 +3377,10 @@ fn print_info_result_json(
         );
         println!("            \"extents\": [");
         if let Some(resolved) = vmdk_flat {
-            // monolithicFlat / twoGbMaxExtentFlat — one entry per
-            // resolved flat extent, "FLAT" format, no cluster-size.
-            // Matches qemu-img info --output=json.
-            for (idx, extent) in resolved.flat_extents.iter().enumerate() {
+            // One entry per resolved extent, with the kind its extent
+            // line declared and no cluster-size. Matches qemu-img
+            // info --output=json.
+            for (idx, extent) in resolved.extents.iter().enumerate() {
                 if idx > 0 {
                     println!("                }},");
                 }
@@ -3372,9 +3391,12 @@ fn print_info_result_json(
                 );
                 println!(
                     "                    \"filename\": \"{}\",",
-                    json_escape(&extent.flat_path.to_string_lossy())
+                    json_escape(&extent.path.to_string_lossy())
                 );
-                println!("                    \"format\": \"FLAT\"");
+                println!(
+                    "                    \"format\": \"{}\"",
+                    vmdk_extent_format(extent.kind)
+                );
             }
             println!("                }}");
         } else {
@@ -4099,7 +4121,7 @@ fn discover_backing_chain(
             debug!(
                 "VMDK descriptor resolved: {} -> {} extent(s) ({} bytes virtual)",
                 terminal_safe_path(&current),
-                resolved.flat_extents.len(),
+                resolved.extents.len(),
                 resolved.virtual_size
             );
 
@@ -4114,11 +4136,12 @@ fn discover_backing_chain(
                 backing_file_raw: resolved.parent_hint.clone(),
                 flags: 0,
                 external_data_files: resolved
-                    .flat_extents
+                    .extents
                     .iter()
                     .map(|e| ExternalDataFile {
-                        path: e.flat_path.clone(),
+                        path: e.path.clone(),
                         extent_size: e.extent_size,
+                        vmdk_extent_kind: Some(e.kind),
                     })
                     .collect(),
             });
@@ -4222,6 +4245,7 @@ fn discover_backing_chain(
                 data_files.push(ExternalDataFile {
                     path: data_resolved,
                     extent_size: data_size,
+                    vmdk_extent_kind: None,
                 });
             }
         }
@@ -4491,6 +4515,189 @@ fn print_backing_chain_json(chain: &BackingChain) {
     println!("]");
 }
 
+/// The 512-byte unit sparse VMDK counts its sectors in, whatever
+/// sector size the virtio device is configured with.
+const VMDK_SECTOR_SIZE: u64 = 512;
+
+/// Byte address in guest memory of the chain config's device array.
+const fn chain_devices_base() -> u64 {
+    CHAIN_CONFIG_ADDR + 16
+}
+
+/// Byte address of the chain config's segment array. Derived from the
+/// device array's byte length for the same reason as the device stride
+/// in [`write_chain_device_entries`]: a field added to a device entry
+/// moves everything after it, and a literal would stay behind.
+const fn chain_segments_base() -> u64 {
+    chain_devices_base()
+        + (MAX_CHAIN_DEVICES * core::mem::size_of::<shared::ChainDeviceInfo>()) as u64
+}
+
+/// Byte address of the chain config's `extent_count`.
+const fn chain_extent_count_addr() -> u64 {
+    chain_segments_base()
+        + (shared::MAX_CHAIN_SEGMENTS * core::mem::size_of::<shared::ChainSegment>()) as u64
+}
+
+/// Byte address of the chain config's extent table. `ChainExtent` is
+/// 8-aligned, so four bytes of padding follow the `u32` count.
+const fn chain_extents_base() -> u64 {
+    chain_extent_count_addr() + 8
+}
+
+/// One extent of a VMDK descriptor, placed in the single device the
+/// descriptor and all of its extents are attached as.
+#[derive(Debug)]
+struct DescriptorExtent {
+    /// Absolute, allowlist-validated path to the extent file.
+    path: PathBuf,
+    /// Byte offset within the device at which this extent's file begins.
+    device_offset: u64,
+    /// Length of the extent's own file on disk.
+    file_length: u64,
+    /// Bytes of the device given to this extent: its file's length
+    /// padded up to a 512-byte boundary.
+    device_len: u64,
+    /// Bytes of the virtual disk the descriptor declares for it.
+    virtual_span: u64,
+    /// `shared::ChainExtent::KIND_FLAT` or `KIND_SPARSE`.
+    kind: u32,
+}
+
+/// Lay a VMDK descriptor's extent files out as the one device the
+/// descriptor is attached as.
+///
+/// The files go end to end in descriptor order. What each one
+/// contributes is its own length, never the span the descriptor
+/// declares for it: a sparse extent whose grains are all allocated is
+/// longer than its span and a span would cut it short, while one that
+/// is mostly holes is far shorter and a span would leave the next
+/// extent's base inside a gap the guest would read as that extent's
+/// header.
+///
+/// Each contribution is padded up to a 512-byte boundary. Sparse VMDK
+/// counts sectors of 512 bytes from the start of its own file, and the
+/// guest refuses a sparse extent whose base is not a multiple of 512
+/// because only then does its header, and every entry of its tables,
+/// sit whole inside one device sector. qemu writes extent files in
+/// whole sectors, so for every image either reader has seen the padding
+/// is nothing; where a file does end mid-sector, the padding reads as
+/// zeros and nothing addresses it, because a flat read stops at the
+/// extent's `file_length` and a sparse one is held inside its own file.
+fn layout_descriptor_extents(
+    image: &ChainImage,
+) -> Result<Vec<DescriptorExtent>, Box<dyn std::error::Error>> {
+    // The guest's table is a fixed array in a page of its own, so an
+    // image with more extents than it holds is refused rather than
+    // read as its first MAX_CHAIN_EXTENTS. qemu has no such limit;
+    // lifting this one means moving the config region.
+    let count = image.external_data_files.len();
+    if count > shared::MAX_CHAIN_EXTENTS {
+        return Err(format!(
+            "VMDK descriptor '{}' declares {count} extents, more than the {} the \
+             guest's extent table holds; refusing to read part of the image",
+            terminal_safe_path(&image.path),
+            shared::MAX_CHAIN_EXTENTS
+        )
+        .into());
+    }
+
+    let mut laid_out = Vec::with_capacity(count);
+    let mut device_offset = 0u64;
+    for extent in &image.external_data_files {
+        // Every table entry has to state a kind, and the guest refuses
+        // one left at zero rather than guessing from the bytes. The
+        // descriptor's extent line is where the kind comes from, so an
+        // extent that reached here without one is a host bug: it is
+        // refused with the file named instead of at guest init, where
+        // nothing would say which file was at fault.
+        let kind = match extent.vmdk_extent_kind {
+            Some(crate::chain::VmdkExtentKind::Flat) => shared::ChainExtent::KIND_FLAT,
+            Some(crate::chain::VmdkExtentKind::Sparse) => shared::ChainExtent::KIND_SPARSE,
+            None => {
+                return Err(format!(
+                    "internal error: VMDK descriptor '{}' extent '{}' reached device \
+                     attachment without the kind its descriptor line declared",
+                    terminal_safe_path(&image.path),
+                    terminal_safe_path(&extent.path)
+                )
+                .into());
+            }
+        };
+
+        let file_length = std::fs::metadata(&extent.path)
+            .map_err(|e| {
+                format!(
+                    "VMDK descriptor '{}' extent '{}': {e}",
+                    terminal_safe_path(&image.path),
+                    terminal_safe_path(&extent.path)
+                )
+            })?
+            .len();
+
+        let too_long = || -> Box<dyn std::error::Error> {
+            format!(
+                "VMDK descriptor '{}' extents do not fit one device's address space",
+                terminal_safe_path(&image.path)
+            )
+            .into()
+        };
+        let device_len = file_length
+            .checked_next_multiple_of(VMDK_SECTOR_SIZE)
+            .ok_or_else(too_long)?;
+        let next_offset = device_offset.checked_add(device_len).ok_or_else(too_long)?;
+
+        laid_out.push(DescriptorExtent {
+            path: extent.path.clone(),
+            device_offset,
+            file_length,
+            device_len,
+            virtual_span: extent.extent_size,
+            kind,
+        });
+        device_offset = next_offset;
+    }
+
+    Ok(laid_out)
+}
+
+/// The capacity of the device a descriptor's extents make up: every
+/// file's contribution, padding included.
+///
+/// This and not the sum of the spans is what the device holds, and the
+/// guest bounds a flat read against it rather than against the extent's
+/// own length.
+fn descriptor_device_capacity(extents: &[DescriptorExtent]) -> u64 {
+    extents
+        .last()
+        .map_or(0, |last| last.device_offset + last.device_len)
+}
+
+/// Open the backing store for one chain image's device, and the
+/// capacity to expose for it.
+///
+/// A VMDK descriptor's device is its extent files concatenated, so the
+/// guest can reach each of them at the offset the extent table gives
+/// it. Every other image's device is the image's own file. The
+/// descriptor's own bytes are not in the device at all: they are the
+/// descriptor's text, and the disk's content is the extents.
+fn open_chain_image_backing(
+    image: &ChainImage,
+) -> Result<(BackingStore, u64), Box<dyn std::error::Error>> {
+    if image.is_vmdk_descriptor() {
+        let extents = layout_descriptor_extents(image)?;
+        let members: Vec<(PathBuf, u64)> = extents
+            .iter()
+            .map(|extent| (extent.path.clone(), extent.device_len))
+            .collect();
+        let capacity = descriptor_device_capacity(&extents);
+        return Ok((BackingStore::open_concatenated(&members, true)?, capacity));
+    }
+    let backing = BackingStore::open(&image.path, true, None, false)?;
+    let capacity = std::fs::metadata(&image.path)?.len();
+    Ok((backing, capacity))
+}
+
 /// Write device info entries for a single backing chain to guest memory.
 ///
 /// Writes one `ChainDeviceInfo` entry per device, the first at
@@ -4498,12 +4705,22 @@ fn print_backing_chain_json(chain: &BackingChain) {
 /// If the chain has an external data file, it is inserted as device `start_idx + 1`
 /// (between the top image and the rest of the backing chain).
 ///
-/// Every data device written -- a qcow2's data file, a VMDK flat
-/// descriptor's extents -- carries `ChainDeviceInfo::FLAG_DATA_DEVICE`,
-/// and nothing else does. The slot after an owner is otherwise
-/// indistinguishable from a raw backing file, and the guest's chain
-/// reader read it as one (issue #792). The guest checks the marks
-/// against `ChainConfig::data_devices_are_owned` before it reads.
+/// Every data device written -- a qcow2's external data file -- carries
+/// `ChainDeviceInfo::FLAG_DATA_DEVICE`, and nothing else does. The slot
+/// after an owner is otherwise indistinguishable from a raw backing
+/// file, and the guest's chain reader read it as one (issue #792). The
+/// guest checks the marks against `ChainConfig::data_devices_are_owned`
+/// before it reads.
+///
+/// A VMDK descriptor takes no data devices. It is written as one
+/// device, whose bytes are its extent files laid end to end, and this
+/// is also where the extent table entries naming those files are
+/// written. `extent_cursor` is how far the table has been filled: an
+/// operation reading two images calls this twice, and the guest
+/// requires the devices' slices to tile the table from its first entry
+/// in device order (`ChainConfig::extents_are_sound`), so the second
+/// call must carry on where the first stopped rather than start again
+/// at zero.
 ///
 /// Returns the number of device entries written.
 fn write_chain_device_entries(
@@ -4511,6 +4728,7 @@ fn write_chain_device_entries(
     chain: &BackingChain,
     devices_base: u64,
     start_idx: usize,
+    extent_cursor: &mut usize,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     // Refused here rather than truncated, and here rather than in the
     // callers, because this is the one function every caller reaches
@@ -4528,9 +4746,12 @@ fn write_chain_device_entries(
     // it passes, which the budget makes easy to get wrong -- it is in
     // devices and not images, so `security.max_chain_depth` (16 by
     // default, and configurable upwards) counts images while
-    // total_devices() adds a slot for each external data file. A guard
-    // taking its number from the depth limit would undershoot by one
-    // per data file.
+    // total_devices() adds a slot for each qcow2 external data file. A
+    // guard taking its number from the depth limit would undershoot by
+    // one per data file. A VMDK descriptor's extents add no slot: they
+    // share the descriptor's own device and are described by the extent
+    // table, so an extent costs a table entry, which is bounded
+    // separately below.
     let needed = chain.total_devices();
     if start_idx + needed > MAX_CHAIN_DEVICES {
         return Err(format!(
@@ -4564,6 +4785,9 @@ fn write_chain_device_entries(
     // whole config misread, not a missing field.
     const ENTRY_SIZE: u64 = core::mem::size_of::<shared::ChainDeviceInfo>() as u64;
 
+    // Same reasoning for the extent table's stride.
+    const EXTENT_SIZE: u64 = core::mem::size_of::<shared::ChainExtent>() as u64;
+
     let mut idx = start_idx;
 
     for image in chain.images().iter() {
@@ -4571,7 +4795,36 @@ fn write_chain_device_entries(
             return Err(overflowed(idx));
         }
 
-        let has_data_files = !image.external_data_files.is_empty();
+        // A VMDK descriptor and all of its extents are one device,
+        // whose bytes are the extent files laid end to end. Where the
+        // files sit in it is worked out once, here, and the device is
+        // opened from the same layout by `open_chain_image_backing`,
+        // so the offsets the guest is given and the offsets the host
+        // reads at cannot drift apart.
+        let descriptor_extents = if image.is_vmdk_descriptor() {
+            layout_descriptor_extents(image)?
+        } else {
+            Vec::new()
+        };
+
+        // Per-descriptor the bound is checked in the layout above. This
+        // is the table as a whole, which several descriptors share: a
+        // flat image with a flat parent is two of them, and `compare`
+        // packs two chains into one table.
+        let table_end = *extent_cursor + descriptor_extents.len();
+        if table_end > shared::MAX_CHAIN_EXTENTS {
+            return Err(format!(
+                "the chain's images declare more extents than the {} the guest's \
+                 extent table holds ({} laid out before '{}' and {} more for it); \
+                 refusing to pass a truncated image to the guest",
+                shared::MAX_CHAIN_EXTENTS,
+                *extent_cursor,
+                terminal_safe_path(&image.path),
+                descriptor_extents.len()
+            )
+            .into());
+        }
+
         let dev_offset = devices_base + (idx as u64 * ENTRY_SIZE);
         guest_mem.write_obj(
             image.format.to_shared_format_u32(),
@@ -4589,17 +4842,49 @@ fn write_chain_device_entries(
         guest_mem.write_obj(image.actual_size, GuestAddress(dev_offset + 16))?;
         guest_mem.write_obj(image.cluster_size, GuestAddress(dev_offset + 24))?;
 
-        // If this image has external data files, point to the next device
-        let data_dev_idx: u32 = if has_data_files {
+        // If this image has an external data device, point to it. A
+        // descriptor has none, because its extents are not devices, so
+        // this stays zero for one and the guest reads its content
+        // through the extent table alone.
+        let data_dev_idx: u32 = if image.data_device_count() > 0 {
             (idx + 1) as u32
         } else {
             0 // data is in self
         };
         guest_mem.write_obj(data_dev_idx, GuestAddress(dev_offset + 28))?;
+
+        // The device's slice of the extent table. Zero and zero for
+        // every device that is a single file, which is the value the
+        // guest reads as "this device has no extent table entries".
+        let first_extent: u32 = if descriptor_extents.is_empty() {
+            0
+        } else {
+            *extent_cursor as u32
+        };
+        guest_mem.write_obj(first_extent, GuestAddress(dev_offset + 32))?;
+        guest_mem.write_obj(
+            descriptor_extents.len() as u32,
+            GuestAddress(dev_offset + 36),
+        )?;
+
+        for extent in &descriptor_extents {
+            let entry = chain_extents_base() + (*extent_cursor as u64 * EXTENT_SIZE);
+            guest_mem.write_obj(extent.device_offset, GuestAddress(entry))?;
+            guest_mem.write_obj(extent.file_length, GuestAddress(entry + 8))?;
+            guest_mem.write_obj(extent.virtual_span, GuestAddress(entry + 16))?;
+            guest_mem.write_obj(extent.kind, GuestAddress(entry + 24))?;
+            guest_mem.write_obj(0u32, GuestAddress(entry + 28))?;
+            *extent_cursor += 1;
+        }
+
         idx += 1;
 
-        // Insert external data file device entries after this image
-        for data_file in &image.external_data_files {
+        // Insert external data file device entries after this image.
+        // A descriptor's extents are not among them: they share the
+        // descriptor's device and were written to the extent table
+        // above, so neither this loop nor the slot bound above ever
+        // sees one.
+        for data_file in image.data_devices() {
             if idx >= MAX_CHAIN_DEVICES {
                 return Err(overflowed(idx));
             }
@@ -4619,6 +4904,9 @@ fn write_chain_device_entries(
             guest_mem.write_obj(data_size, GuestAddress(dev_offset + 16))?;
             guest_mem.write_obj(0u32, GuestAddress(dev_offset + 24))?;
             guest_mem.write_obj(0u32, GuestAddress(dev_offset + 28))?;
+            // A data device is a single file and owns no extents.
+            guest_mem.write_obj(0u32, GuestAddress(dev_offset + 32))?;
+            guest_mem.write_obj(0u32, GuestAddress(dev_offset + 36))?;
             idx += 1;
         }
     }
@@ -4643,8 +4931,7 @@ fn open_chain_devices(
     let mut idx = start_idx;
 
     for image in chain.images().iter() {
-        let backing = BackingStore::open(&image.path, true, None, false)?;
-        let file_size = std::fs::metadata(&image.path)?.len();
+        let (backing, file_size) = open_chain_image_backing(image)?;
         let mmio = device_mmio_base(idx);
         let vq = device_vq_base(idx);
         let device = VirtioBlockDevice::new(
@@ -4655,11 +4942,17 @@ fn open_chain_devices(
             mmio,
             vq,
         );
+        // The path goes last: it is image-derived text, and a line that
+        // ends with it is what lets a reader -- and
+        // `test_verbose_stderr_escapes_chain_device_paths` -- see the
+        // whole escaped name without anything of ours after it.
         debug!(
-            "Created {} device [{}] at MMIO 0x{:x}: {}",
+            "Created {} device [{}] at MMIO 0x{:x} ({} extent(s), {} bytes): {}",
             label,
             idx,
             mmio,
+            image.external_data_files.len(),
+            file_size,
             terminal_safe_path(&image.path)
         );
         let device = Arc::new(Mutex::new(device));
@@ -4667,8 +4960,11 @@ fn open_chain_devices(
         io_events.push(IoEvent::new(mmio)?);
         idx += 1;
 
-        // Insert external data file devices after this image
-        for data_file in &image.external_data_files {
+        // Insert external data file devices after this image. A VMDK
+        // descriptor's extents are inside the device opened above and
+        // are never attached as devices of their own, which is what
+        // keeps a 26-extent image's slot count at one.
+        for data_file in image.data_devices() {
             let data_backing = BackingStore::open(&data_file.path, true, None, false)?;
             let data_size = std::fs::metadata(&data_file.path)?.len();
             let mmio = device_mmio_base(idx);
@@ -4739,6 +5035,19 @@ fn open_chain_devices_rw(
 
     for image in chain.images().iter() {
         let is_rw = rw_slots.contains(&slot_in_chain);
+        // A descriptor's device spans its extent files, and a write
+        // across them cannot be routed without saying which file it
+        // belongs in -- that is the write path, which nothing here
+        // reads an image for. Refused with the image named rather than
+        // left to fail inside the backing store.
+        if is_rw && image.is_vmdk_descriptor() {
+            return Err(format!(
+                "{label}: '{}' is a VMDK descriptor and cannot be attached for \
+                 writing; its content is in its extent files",
+                terminal_safe_path(&image.path)
+            )
+            .into());
+        }
         // An RW slot may need to grow past its current EOF (bench's
         // qcow2 `-w` appends fresh data / L2 / refcount clusters). When
         // a capacity hint is supplied, expose it to BOTH the backing
@@ -4748,12 +5057,14 @@ fn open_chain_devices_rw(
         // The file still grows sparsely on demand; the hint is only an
         // upper bound. RO slots and hint-less RW slots keep the file's
         // current size as the capacity.
-        let backing = if is_rw {
-            BackingStore::open_rw_existing(&image.path, rw_capacity_hint)?
+        let (backing, on_disk_size) = if is_rw {
+            (
+                BackingStore::open_rw_existing(&image.path, rw_capacity_hint)?,
+                std::fs::metadata(&image.path)?.len(),
+            )
         } else {
-            BackingStore::open(&image.path, true, None, false)?
+            open_chain_image_backing(image)?
         };
-        let on_disk_size = std::fs::metadata(&image.path)?.len();
         let file_size = if is_rw {
             rw_capacity_hint.unwrap_or(on_disk_size).max(on_disk_size)
         } else {
@@ -4776,7 +5087,10 @@ fn open_chain_devices_rw(
         idx += 1;
         slot_in_chain += 1;
 
-        for data_file in &image.external_data_files {
+        // A descriptor's extents are in the device opened above, not
+        // devices of their own, so `slot_in_chain` does not advance for
+        // them and an `rw_slots` index still counts devices.
+        for data_file in image.data_devices() {
             let is_rw = rw_slots.contains(&slot_in_chain);
             let data_backing = if is_rw {
                 BackingStore::open_rw_existing(&data_file.path, None)?
@@ -4819,10 +5133,17 @@ fn open_chain_devices_rw(
 /// is checked here as well as in the guest — the host has a real error
 /// channel, so a segmentation bug should surface as a message rather
 /// than as a guest that declines to start.
+///
+/// `extent_count` is how far those calls filled the extent table, which
+/// is how much of it the guest reads. The entries themselves are
+/// written beside the device entries that own them, because a device's
+/// slice of the table and the device's own entry describe one
+/// attachment.
 fn write_chain_config_header(
     guest_mem: &GuestMemoryMmap,
     device_count: usize,
     segments: &[shared::ChainSegment],
+    extent_count: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Layout matches shared::ChainConfig exactly:
     // - magic: u32 (offset 0)
@@ -4874,6 +5195,14 @@ fn write_chain_config_header(
         )
         .into());
     }
+    if extent_count > shared::MAX_CHAIN_EXTENTS {
+        return Err(format!(
+            "chain config describes {extent_count} extents, more than the {} the \
+             config holds",
+            shared::MAX_CHAIN_EXTENTS
+        )
+        .into());
+    }
 
     // The magic and the version come from the shared crate the guest
     // is built against, not from copies kept here: two definitions let
@@ -4891,14 +5220,14 @@ fn write_chain_config_header(
     // write_chain_device_entries: the byte length of the device array is
     // what puts the segments where the guest looks for them, and a
     // literal would stay behind when a device entry grows.
-    let segments_base = CHAIN_CONFIG_ADDR
-        + 16
-        + (MAX_CHAIN_DEVICES * core::mem::size_of::<shared::ChainDeviceInfo>()) as u64;
+    let segments_base = chain_segments_base();
     for (i, seg) in segments.iter().enumerate() {
         let seg_offset = segments_base + (i as u64 * 8);
         guest_mem.write_obj(seg.first, GuestAddress(seg_offset))?;
         guest_mem.write_obj(seg.count, GuestAddress(seg_offset + 4))?;
     }
+
+    guest_mem.write_obj(extent_count as u32, GuestAddress(chain_extent_count_addr()))?;
 
     Ok(())
 }
@@ -4950,8 +5279,10 @@ fn write_chain_config(
     // entry writer inserts a slot per external data file, so a count
     // taken from the images alone would name slots the guest was never
     // given.
-    let devices_base = CHAIN_CONFIG_ADDR + 16;
-    let device_count = write_chain_device_entries(guest_mem, chain, devices_base, 0)?;
+    let devices_base = chain_devices_base();
+    let mut extent_count = 0usize;
+    let device_count =
+        write_chain_device_entries(guest_mem, chain, devices_base, 0, &mut extent_count)?;
 
     // One chain, every device in it: device 0 is the top image and
     // each following slot is behind the one before it.
@@ -4959,9 +5290,12 @@ fn write_chain_config(
         first: 0,
         count: device_count as u32,
     }];
-    write_chain_config_header(guest_mem, device_count, &segments)?;
+    write_chain_config_header(guest_mem, device_count, &segments, extent_count)?;
 
-    debug!("Wrote chain config at 0x{CHAIN_CONFIG_ADDR:x} ({device_count} devices, 1 chain)");
+    debug!(
+        "Wrote chain config at 0x{CHAIN_CONFIG_ADDR:x} ({device_count} devices, \
+         1 chain, {extent_count} extents)"
+    );
 
     Ok(())
 }
@@ -4972,6 +5306,7 @@ mod chain_config_writer_tests {
     //! type and checked against the rule the guest checks it with.
     use super::*;
     use std::path::PathBuf;
+    use tempfile::TempDir;
 
     fn image(format: ImageFormat, flags: u32, extents: &[u64]) -> ChainImage {
         ChainImage {
@@ -4987,9 +5322,61 @@ mod chain_config_writer_tests {
                 .map(|&extent_size| ExternalDataFile {
                     path: PathBuf::from("/nonexistent/data"),
                     extent_size,
+                    vmdk_extent_kind: None,
                 })
                 .collect(),
         }
+    }
+
+    /// A VMDK descriptor image whose extent files exist on disk, since
+    /// the host lays them out from their real lengths.
+    ///
+    /// Each entry is `(file length, declared span, kind)`. The image's
+    /// `virtual_size` is the sum of the spans, which is what the
+    /// resolver reports for a real descriptor.
+    fn descriptor(
+        dir: &std::path::Path,
+        extents: &[(u64, u64, crate::chain::VmdkExtentKind)],
+    ) -> ChainImage {
+        let mut files = Vec::with_capacity(extents.len());
+        for (i, (file_length, span, kind)) in extents.iter().enumerate() {
+            let path = dir.join(format!("extent-s{i:03}.vmdk"));
+            std::fs::write(&path, vec![0u8; *file_length as usize]).expect("write extent");
+            files.push(ExternalDataFile {
+                path,
+                extent_size: *span,
+                vmdk_extent_kind: Some(*kind),
+            });
+        }
+        ChainImage {
+            path: dir.join("descriptor.vmdk"),
+            format: ImageFormat::VmdkDescriptor,
+            virtual_size: extents.iter().map(|(_, span, _)| *span).sum(),
+            actual_size: 1024,
+            cluster_size: 0,
+            backing_file_raw: None,
+            flags: 0,
+            external_data_files: files,
+        }
+    }
+
+    /// Read the config back out of guest memory as the type the guest
+    /// parses it with.
+    fn read_back(guest_mem: &GuestMemoryMmap) -> shared::ChainConfig {
+        let mut bytes = [0u8; core::mem::size_of::<shared::ChainConfig>()];
+        guest_mem
+            .read_slice(&mut bytes, GuestAddress(CHAIN_CONFIG_ADDR))
+            .expect("read back");
+        // SAFETY: ChainConfig is repr(C) and made of integers only, so
+        // every bit pattern is a valid value; read_unaligned copies it
+        // out of a byte buffer with no alignment of its own.
+        unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const shared::ChainConfig) }
+    }
+
+    /// Guest memory covering the whole chain config page.
+    fn config_memory() -> GuestMemoryMmap {
+        GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(CHAIN_CONFIG_ADDR), 0x2000)])
+            .expect("guest memory")
     }
 
     fn chain(images: Vec<ChainImage>) -> BackingChain {
@@ -5048,17 +5435,25 @@ mod chain_config_writer_tests {
         let guest_mem =
             GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(CHAIN_CONFIG_ADDR), 0x2000)])
                 .expect("guest memory");
-        let devices_base = CHAIN_CONFIG_ADDR + 16;
+        let devices_base = chain_devices_base();
+        let mut extent_count = 0usize;
         let ten = chain((0..10).map(|_| image(ImageFormat::Qcow2, 0, &[])).collect());
         let seven = chain((0..7).map(|_| image(ImageFormat::Qcow2, 0, &[])).collect());
         let written =
-            write_chain_device_entries(&guest_mem, &ten, devices_base, 0).expect("ten devices fit");
+            write_chain_device_entries(&guest_mem, &ten, devices_base, 0, &mut extent_count)
+                .expect("ten devices fit");
         assert_eq!(written, 10);
         // Seven would fit on its own; after ten it does not.
-        write_chain_device_entries(&guest_mem, &seven, devices_base, 0)
+        write_chain_device_entries(&guest_mem, &seven, devices_base, 0, &mut extent_count)
             .expect("seven devices fit on their own");
-        let err = write_chain_device_entries(&guest_mem, &seven, devices_base, written)
-            .expect_err("a second chain past the budget must be refused");
+        let err = write_chain_device_entries(
+            &guest_mem,
+            &seven,
+            devices_base,
+            written,
+            &mut extent_count,
+        )
+        .expect_err("a second chain past the budget must be refused");
         let message = err.to_string();
         assert!(
             message.contains("10") && message.contains(&MAX_CHAIN_DEVICES.to_string()),
@@ -5067,7 +5462,7 @@ mod chain_config_writer_tests {
         // The combined boundary is accepted, so the refusal is not one
         // device early for the two-chain callers either.
         let six = chain((0..6).map(|_| image(ImageFormat::Qcow2, 0, &[])).collect());
-        write_chain_device_entries(&guest_mem, &six, devices_base, written)
+        write_chain_device_entries(&guest_mem, &six, devices_base, written, &mut extent_count)
             .expect("ten plus six is exactly the budget");
     }
 
@@ -5080,7 +5475,8 @@ mod chain_config_writer_tests {
         let guest_mem =
             GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(CHAIN_CONFIG_ADDR), 0x2000)])
                 .expect("guest memory");
-        let devices_base = CHAIN_CONFIG_ADDR + 16;
+        let devices_base = chain_devices_base();
+        let mut extent_count = 0usize;
         // Sixteen images is exactly the budget; make one of them carry
         // a data file and the same sixteen images need seventeen slots.
         let mut images: Vec<ChainImage> = (0..MAX_CHAIN_DEVICES)
@@ -5093,8 +5489,9 @@ mod chain_config_writer_tests {
         );
         let with_data = chain(images);
         assert_eq!(with_data.total_devices(), MAX_CHAIN_DEVICES + 1);
-        let err = write_chain_device_entries(&guest_mem, &with_data, devices_base, 0)
-            .expect_err("a data file takes a slot, so this is over the budget");
+        let err =
+            write_chain_device_entries(&guest_mem, &with_data, devices_base, 0, &mut extent_count)
+                .expect_err("a data file takes a slot, so this is over the budget");
         assert!(
             err.to_string()
                 .contains(&(MAX_CHAIN_DEVICES + 1).to_string()),
@@ -5104,13 +5501,15 @@ mod chain_config_writer_tests {
 
     #[test]
     fn write_chain_device_entries_marks_every_data_device_and_nothing_else() {
-        let guest_mem =
-            GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(CHAIN_CONFIG_ADDR), 0x1000)])
-                .expect("guest memory");
+        use crate::chain::VmdkExtentKind::{Flat, Sparse};
+
+        let tmp = TempDir::new().unwrap();
+        let guest_mem = config_memory();
         // `compare`'s packing of two chains: a data-file qcow2 over a raw
         // backing file, whose info flags claim the data device mark for
-        // the image itself, and a flat descriptor with two extents over
-        // a parent.
+        // the image itself, and a descriptor with two extents over a
+        // parent. The descriptor's extents are not devices, so the
+        // second chain is two slots and not four.
         let chain1 = chain(vec![
             image(
                 ImageFormat::Qcow2,
@@ -5121,48 +5520,310 @@ mod chain_config_writer_tests {
             image(ImageFormat::Raw, 0, &[]),
         ]);
         let chain2 = chain(vec![
-            image(ImageFormat::VmdkDescriptor, 0, &[1 << 19, 1 << 19]),
+            descriptor(
+                tmp.path(),
+                &[(4096, 1 << 19, Flat), (8192, 1 << 19, Sparse)],
+            ),
             image(ImageFormat::Raw, 0, &[]),
         ]);
-        let devices_base = CHAIN_CONFIG_ADDR + 16;
-        let n1 = write_chain_device_entries(&guest_mem, &chain1, devices_base, 0).expect("chain 1");
+        let devices_base = chain_devices_base();
+        let mut extent_count = 0usize;
+        let n1 =
+            write_chain_device_entries(&guest_mem, &chain1, devices_base, 0, &mut extent_count)
+                .expect("chain 1");
         let n2 =
-            write_chain_device_entries(&guest_mem, &chain2, devices_base, n1).expect("chain 2");
-        assert_eq!((n1, n2), (3, 4));
+            write_chain_device_entries(&guest_mem, &chain2, devices_base, n1, &mut extent_count)
+                .expect("chain 2");
+        assert_eq!((n1, n2), (3, 2));
         let segments = [
             shared::ChainSegment { first: 0, count: 3 },
-            shared::ChainSegment { first: 3, count: 4 },
+            shared::ChainSegment { first: 3, count: 2 },
         ];
-        write_chain_config_header(&guest_mem, n1 + n2, &segments).expect("header");
+        write_chain_config_header(&guest_mem, n1 + n2, &segments, extent_count).expect("header");
 
-        let mut bytes = [0u8; core::mem::size_of::<shared::ChainConfig>()];
-        guest_mem
-            .read_slice(&mut bytes, GuestAddress(CHAIN_CONFIG_ADDR))
-            .expect("read back");
-        // SAFETY: ChainConfig is repr(C) and made of integers only, so
-        // every bit pattern is a valid value; read_unaligned copies it
-        // out of a byte buffer with no alignment of its own.
-        let config: shared::ChainConfig =
-            unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const shared::ChainConfig) };
+        let config = read_back(&guest_mem);
 
         assert!(config.is_valid());
-        let marked: Vec<bool> = config.devices[..7]
+        let marked: Vec<bool> = config.devices[..5]
             .iter()
             .map(|d| d.is_data_device())
             .collect();
-        assert_eq!(marked, [false, true, false, false, true, true, false]);
+        assert_eq!(marked, [false, true, false, false, false]);
         assert_eq!(config.devices[0].data_device_idx, 1);
-        assert_eq!(config.devices[3].data_device_idx, 4);
+        // A descriptor's content is its extents, so it names no data
+        // device at all.
+        assert_eq!(config.devices[3].data_device_idx, 0);
+        assert_eq!(config.devices[3].extent_count, 2);
         // The info flags survive; only the mark an image cannot give
         // itself is cleared.
         assert_eq!(
             config.devices[0].flags,
             shared::InfoResult::FLAG_HAS_EXTERNAL_DATA
         );
-        assert!(config.segmentation_covers(7));
+        assert!(config.segmentation_covers(5));
         assert!(
-            config.data_devices_are_owned(7),
+            config.data_devices_are_owned(5),
             "the guest must accept the layout the host writes"
+        );
+        assert!(
+            config.extents_are_sound(5),
+            "the guest must accept the extent table the host writes"
+        );
+    }
+
+    // The whole point of the extent table: a descriptor is one device
+    // whatever its extent count, and each entry says where that
+    // extent's file sits in the device, how long the file is, how much
+    // of the virtual disk it covers, and which kind it is.
+    #[test]
+    fn write_chain_device_entries_lays_a_descriptors_extents_out_as_one_device() {
+        use crate::chain::VmdkExtentKind::{Flat, Sparse};
+
+        let tmp = TempDir::new().unwrap();
+        let guest_mem = config_memory();
+        // A flat extent whose file is shorter than its span, a sparse
+        // one whose file is shorter still, and a flat one whose file
+        // does not end on a 512-byte boundary followed by a sparse one
+        // -- which is what makes the padding visible.
+        let image = descriptor(
+            tmp.path(),
+            &[
+                (4096, 1 << 20, Flat),
+                (2048, 1 << 20, Sparse),
+                (1000, 1 << 20, Flat),
+                (1536, 1 << 20, Sparse),
+            ],
+        );
+        let one = chain(vec![image]);
+        assert_eq!(
+            one.total_devices(),
+            1,
+            "a descriptor and its extents are one device"
+        );
+
+        let mut extent_count = 0usize;
+        let written = write_chain_device_entries(
+            &guest_mem,
+            &one,
+            chain_devices_base(),
+            0,
+            &mut extent_count,
+        )
+        .expect("entries");
+        assert_eq!(written, 1);
+        assert_eq!(extent_count, 4);
+        write_chain_config_header(
+            &guest_mem,
+            written,
+            &[shared::ChainSegment { first: 0, count: 1 }],
+            extent_count,
+        )
+        .expect("header");
+
+        let config = read_back(&guest_mem);
+        assert_eq!(config.extent_count, 4);
+        assert_eq!(config.devices[0].first_extent, 0);
+        assert_eq!(config.devices[0].extent_count, 4);
+        let laid_out: Vec<(u64, u64, u64, u32)> = config
+            .device_extents(0)
+            .iter()
+            .map(|e| (e.device_offset, e.file_length, e.virtual_span, e.kind))
+            .collect();
+        assert_eq!(
+            laid_out,
+            vec![
+                (0, 4096, 1 << 20, shared::ChainExtent::KIND_FLAT),
+                (4096, 2048, 1 << 20, shared::ChainExtent::KIND_SPARSE),
+                // The third file is 1000 bytes, so it is given 1024 and
+                // the fourth begins on a 512-byte boundary.
+                (6144, 1000, 1 << 20, shared::ChainExtent::KIND_FLAT),
+                (7168, 1536, 1 << 20, shared::ChainExtent::KIND_SPARSE),
+            ],
+            "offsets are the running sum of the files' own lengths, padded to 512"
+        );
+        for extent in config.device_extents(0) {
+            if extent.kind == shared::ChainExtent::KIND_SPARSE {
+                assert_eq!(
+                    extent.device_offset % 512,
+                    0,
+                    "sparse VMDK counts 512-byte sectors from its own file's start"
+                );
+            }
+        }
+        assert!(config.extents_are_sound(1));
+    }
+
+    // The device the host opens and the offsets it tells the guest come
+    // from one layout, so a read at an entry's `device_offset` has to
+    // land on that extent's own first byte.
+    #[test]
+    fn a_descriptors_device_reads_each_extent_where_its_entry_says() {
+        use crate::chain::VmdkExtentKind::Flat;
+
+        let tmp = TempDir::new().unwrap();
+        let image = descriptor(tmp.path(), &[(1000, 1 << 20, Flat), (512, 1 << 20, Flat)]);
+        // Make each file's bytes name it, so a read at the wrong offset
+        // cannot pass.
+        for (i, extent) in image.external_data_files.iter().enumerate() {
+            let len = std::fs::metadata(&extent.path).unwrap().len() as usize;
+            std::fs::write(&extent.path, vec![b'A' + i as u8; len]).unwrap();
+        }
+
+        let laid_out = layout_descriptor_extents(&image).expect("layout");
+        let (mut store, capacity) = open_chain_image_backing(&image).expect("device");
+        assert_eq!(capacity, 1024 + 512, "the padded lengths are the device");
+        assert_eq!(capacity, descriptor_device_capacity(&laid_out));
+
+        for (extent, expected) in laid_out.iter().zip([b'A', b'B']) {
+            let mut buf = [0u8; 4];
+            store
+                .read_at(extent.device_offset, &mut buf)
+                .expect("read the extent's first bytes");
+            assert_eq!(buf, [expected; 4], "extent at {}", extent.device_offset);
+        }
+        // The padding at the end of the first file is this extent's,
+        // and reads as zeros rather than as the next file's first bytes.
+        let mut buf = [0u8; 8];
+        store.read_at(1000, &mut buf).expect("read the padding");
+        assert_eq!(buf, [0u8; 8]);
+    }
+
+    // `compare` and `rebase` write two chains into one table, and the
+    // guest requires the slices to tile it from entry zero in device
+    // order. A second chain that started again at zero would have both
+    // descriptors reading the first one's extents.
+    #[test]
+    fn write_chain_device_entries_tiles_the_extent_table_across_two_chains() {
+        use crate::chain::VmdkExtentKind::Flat;
+
+        let first_dir = TempDir::new().unwrap();
+        let second_dir = TempDir::new().unwrap();
+        let guest_mem = config_memory();
+        let chain1 = chain(vec![descriptor(
+            first_dir.path(),
+            &[(512, 1 << 20, Flat), (512, 1 << 20, Flat)],
+        )]);
+        let chain2 = chain(vec![descriptor(
+            second_dir.path(),
+            &[
+                (1024, 1 << 20, Flat),
+                (1024, 1 << 20, Flat),
+                (1024, 1 << 20, Flat),
+            ],
+        )]);
+        let devices_base = chain_devices_base();
+        let mut extent_count = 0usize;
+        let n1 =
+            write_chain_device_entries(&guest_mem, &chain1, devices_base, 0, &mut extent_count)
+                .expect("chain 1");
+        let n2 =
+            write_chain_device_entries(&guest_mem, &chain2, devices_base, n1, &mut extent_count)
+                .expect("chain 2");
+        assert_eq!((n1, n2, extent_count), (1, 1, 5));
+        let segments = [
+            shared::ChainSegment { first: 0, count: 1 },
+            shared::ChainSegment { first: 1, count: 1 },
+        ];
+        write_chain_config_header(&guest_mem, n1 + n2, &segments, extent_count).expect("header");
+
+        let config = read_back(&guest_mem);
+        assert_eq!(
+            (
+                config.devices[0].first_extent,
+                config.devices[0].extent_count
+            ),
+            (0, 2)
+        );
+        assert_eq!(
+            (
+                config.devices[1].first_extent,
+                config.devices[1].extent_count
+            ),
+            (2, 3)
+        );
+        // The second descriptor's files start again at zero inside its
+        // own device, because each device is a concatenation of its own.
+        assert_eq!(config.device_extents(1)[0].device_offset, 0);
+        assert!(config.extents_are_sound(2));
+    }
+
+    // The table is a fixed array in a page of its own, so an image with
+    // more extents than it holds is refused with the bound named rather
+    // than read as its first MAX_CHAIN_EXTENTS. Asserted against the
+    // layout rather than the writer, because the writer has a bound of
+    // its own -- the table several descriptors share -- and a test of
+    // one that the other also satisfies would prove neither.
+    #[test]
+    fn layout_descriptor_extents_refuses_more_extents_than_the_table_holds() {
+        use crate::chain::VmdkExtentKind::Flat;
+
+        let tmp = TempDir::new().unwrap();
+        let too_many: Vec<(u64, u64, crate::chain::VmdkExtentKind)> = (0
+            ..shared::MAX_CHAIN_EXTENTS + 1)
+            .map(|_| (512u64, 1u64 << 20, Flat))
+            .collect();
+        let over = descriptor(tmp.path(), &too_many);
+        let err = layout_descriptor_extents(&over)
+            .expect_err("an image past the table's size must be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains(&shared::MAX_CHAIN_EXTENTS.to_string())
+                && message.contains(&(shared::MAX_CHAIN_EXTENTS + 1).to_string()),
+            "message must name the bound and the count: {message}"
+        );
+
+        // The boundary itself is accepted, so the refusal is not one
+        // extent early, and a table exactly full is written.
+        let at_limit: Vec<(u64, u64, crate::chain::VmdkExtentKind)> = (0
+            ..shared::MAX_CHAIN_EXTENTS)
+            .map(|_| (512u64, 1u64 << 20, Flat))
+            .collect();
+        let full_descriptor = descriptor(tmp.path(), &at_limit);
+        assert_eq!(
+            layout_descriptor_extents(&full_descriptor)
+                .expect("a descriptor exactly at the bound")
+                .len(),
+            shared::MAX_CHAIN_EXTENTS
+        );
+        let guest_mem = config_memory();
+        let full = chain(vec![full_descriptor]);
+        let mut extent_count = 0usize;
+        write_chain_device_entries(
+            &guest_mem,
+            &full,
+            chain_devices_base(),
+            0,
+            &mut extent_count,
+        )
+        .expect("a table exactly full must be written");
+        assert_eq!(extent_count, shared::MAX_CHAIN_EXTENTS);
+    }
+
+    // Two descriptors can each be inside the bound and together over
+    // it: a descriptor with a descriptor parent, or `compare`'s two
+    // inputs.
+    #[test]
+    fn write_chain_device_entries_refuses_a_second_descriptor_the_table_cannot_hold() {
+        use crate::chain::VmdkExtentKind::Flat;
+
+        let first_dir = TempDir::new().unwrap();
+        let second_dir = TempDir::new().unwrap();
+        let guest_mem = config_memory();
+        let half: Vec<(u64, u64, crate::chain::VmdkExtentKind)> =
+            (0..40).map(|_| (512u64, 1u64 << 20, Flat)).collect();
+        let chain1 = chain(vec![descriptor(first_dir.path(), &half)]);
+        let chain2 = chain(vec![descriptor(second_dir.path(), &half)]);
+        let devices_base = chain_devices_base();
+        let mut extent_count = 0usize;
+        write_chain_device_entries(&guest_mem, &chain1, devices_base, 0, &mut extent_count)
+            .expect("forty extents fit on their own");
+        let err =
+            write_chain_device_entries(&guest_mem, &chain2, devices_base, 1, &mut extent_count)
+                .expect_err("eighty extents do not fit the table");
+        let message = err.to_string();
+        assert!(
+            message.contains(&shared::MAX_CHAIN_EXTENTS.to_string()) && message.contains("40"),
+            "message must name the bound and what was already laid out: {message}"
         );
     }
 }
@@ -11899,11 +12560,22 @@ fn run_rebase_guest(
     // is a parent of the last device of the old one. The entries are
     // written here rather than through `write_chain_config`, which
     // takes a single chain and so cannot describe this.
-    let devices_base = CHAIN_CONFIG_ADDR + 16;
+    let devices_base = chain_devices_base();
     let mut segments: Vec<shared::ChainSegment> = Vec::new();
     let mut written = 0usize;
+    // One cursor across both chains: the guest requires the devices'
+    // slices to tile the extent table from its first entry in device
+    // order, so the second chain's descriptors carry on from where the
+    // first's stopped.
+    let mut extent_count = 0usize;
     for chain in [Some(old_chain_parents), new_chain].into_iter().flatten() {
-        let count = write_chain_device_entries(&guest_mem, chain, devices_base, written)?;
+        let count = write_chain_device_entries(
+            &guest_mem,
+            chain,
+            devices_base,
+            written,
+            &mut extent_count,
+        )?;
         // A detach with no parents, or a rebase onto a chain with
         // nothing to attach, contributes no devices. An empty segment
         // would be a chain with no top image, so skip it rather than
@@ -11934,9 +12606,10 @@ fn run_rebase_guest(
         .into());
     }
     if written > 0 {
-        write_chain_config_header(&guest_mem, written, &segments)?;
+        write_chain_config_header(&guest_mem, written, &segments, extent_count)?;
         debug!(
-            "Wrote chain config at 0x{CHAIN_CONFIG_ADDR:x} ({written} devices, {} chains)",
+            "Wrote chain config at 0x{CHAIN_CONFIG_ADDR:x} ({written} devices, {} chains, \
+             {extent_count} extents)",
             segments.len()
         );
     }
@@ -14591,10 +15264,21 @@ fn compare_images(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::e
     // inserts a slot per external data file and stops at
     // MAX_CHAIN_DEVICES, so a segment derived from the chain itself
     // can name slots the guest was never given.
-    let devices_base = CHAIN_CONFIG_ADDR + 16;
-    let chain1_written = write_chain_device_entries(&guest_mem, &chain1, devices_base, 0)?;
-    let chain2_written =
-        write_chain_device_entries(&guest_mem, &chain2, devices_base, chain1_written)?;
+    let devices_base = chain_devices_base();
+    // One cursor across both chains: the guest requires the devices'
+    // slices to tile the extent table from its first entry in device
+    // order, so the second input's descriptors carry on from where the
+    // first's stopped.
+    let mut extent_count = 0usize;
+    let chain1_written =
+        write_chain_device_entries(&guest_mem, &chain1, devices_base, 0, &mut extent_count)?;
+    let chain2_written = write_chain_device_entries(
+        &guest_mem,
+        &chain2,
+        devices_base,
+        chain1_written,
+        &mut extent_count,
+    )?;
 
     let segments = [
         shared::ChainSegment {
@@ -14606,7 +15290,12 @@ fn compare_images(args: CompareArgs, verbose: bool) -> Result<(), Box<dyn std::e
             count: chain2_written as u32,
         },
     ];
-    write_chain_config_header(&guest_mem, chain1_written + chain2_written, &segments)?;
+    write_chain_config_header(
+        &guest_mem,
+        chain1_written + chain2_written,
+        &segments,
+        extent_count,
+    )?;
 
     debug!(
         "Wrote chain config at 0x{:x}: device_count={}, chain1={}, chain2={}",

@@ -131,17 +131,31 @@ impl std::fmt::Display for ImageFormat {
     }
 }
 
-/// A single external data file (flat extent or QCOW2 external data
-/// file) to be opened as a separate virtio-block device.
+/// A single file holding an image's content outside the image itself:
+/// a QCOW2 external data file, or one extent of a VMDK descriptor.
+///
+/// The two reach the guest differently. A QCOW2 external data file is
+/// its own virtio-block device in the slot after its owner. A VMDK
+/// descriptor's extents share the descriptor's one device, laid end to
+/// end, and the guest finds each of them through the chain config's
+/// extent table -- so however many extents a descriptor has, it costs
+/// one device slot.
 #[derive(Debug, Clone)]
 pub struct ExternalDataFile {
     /// Absolute, validated path to the file.
     pub path: PathBuf,
     /// Size of this file's virtual address space contribution in
     /// bytes. For QCOW2 external data files this equals the file
-    /// size; for VMDK flat extents it equals the extent size from
-    /// the descriptor.
+    /// size; for VMDK extents it equals the span the descriptor
+    /// declares, which for a sparse extent is neither the file's
+    /// length nor derivable from it.
     pub extent_size: u64,
+    /// Which kind the descriptor's extent line called this file, for a
+    /// VMDK descriptor's extent, and `None` for a QCOW2 external data
+    /// file. The guest's extent table has no entry that leaves the
+    /// kind unsaid, so a VMDK extent reaching the host with `None`
+    /// here is a bug rather than a default.
+    pub vmdk_extent_kind: Option<VmdkExtentKind>,
 }
 
 /// Information about a single image in the backing chain.
@@ -164,10 +178,47 @@ pub struct ChainImage {
     /// Feature flags from the info operation
     #[allow(dead_code)]
     pub flags: u32,
-    /// External data files for this image (QCOW2 v3 external data
-    /// file or VMDK flat extent files). Inserted as separate
-    /// virtio-block devices immediately after this image's device.
+    /// Files holding this image's content outside the image itself: a
+    /// QCOW2 v3 external data file, or a VMDK descriptor's extents.
+    /// A QCOW2 data file becomes a virtio-block device of its own
+    /// immediately after this image's; a descriptor's extents are laid
+    /// end to end inside this image's own device and named by the chain
+    /// config's extent table. [`Self::data_device_count`] is which.
     pub external_data_files: Vec<ExternalDataFile>,
+}
+
+impl ChainImage {
+    /// Whether this image is a VMDK descriptor, whose content is the
+    /// extents in `external_data_files` and whose own bytes are text.
+    pub fn is_vmdk_descriptor(&self) -> bool {
+        self.format == ImageFormat::VmdkDescriptor
+    }
+
+    /// The external data files that become virtio-block devices of
+    /// their own, in the slots immediately after this image's.
+    ///
+    /// Empty for a VMDK descriptor: the host lays its extent files end
+    /// to end as the descriptor's own device and the guest reaches each
+    /// of them at an offset inside it, so an extent costs an entry in
+    /// the chain config's extent table rather than a device slot. That
+    /// is what keeps a 26-extent image inside the sixteen slots the
+    /// guest's virtqueue region holds, and it is why nothing can hand
+    /// an extent to `DeviceSet::add_device`: every device the VMM
+    /// attaches for a chain is an image or one of these, and a
+    /// descriptor's extents are neither. A QCOW2 external data file is
+    /// still a device of its own.
+    pub fn data_devices(&self) -> &[ExternalDataFile] {
+        if self.is_vmdk_descriptor() {
+            &[]
+        } else {
+            &self.external_data_files
+        }
+    }
+
+    /// How many devices [`Self::data_devices`] asks for.
+    pub fn data_device_count(&self) -> usize {
+        self.data_devices().len()
+    }
 }
 
 /// Complete backing chain for an image.
@@ -192,12 +243,20 @@ impl BackingChain {
         self.images.len()
     }
 
-    /// Total number of virtio-block devices needed for this chain.
-    /// Includes external data file devices for each image.
+    /// Total number of virtio-block devices needed for this chain:
+    /// one per image, plus one per external data file that is a device
+    /// of its own.
+    ///
+    /// A VMDK descriptor's extents are not, so a descriptor counts one
+    /// however many extents it has -- see
+    /// [`ChainImage::data_device_count`]. Every caller bounding a chain
+    /// against the sixteen device slots counts through here, so the
+    /// extents stopped consuming slots in one place rather than in each
+    /// of the guards.
     pub fn total_devices(&self) -> usize {
         self.images
             .iter()
-            .map(|img| 1 + img.external_data_files.len())
+            .map(|img| 1 + img.data_device_count())
             .sum()
     }
 
@@ -877,21 +936,43 @@ fn validate_reference(
 /// parse cheap and bounds the memory taken by an untrusted file.
 pub const MAX_DESCRIPTOR_BYTES: usize = 8192;
 
-/// A single resolved flat extent within a VMDK descriptor.
-#[derive(Debug, Clone)]
-pub struct ResolvedVmdkExtent {
-    /// Absolute, allowlist-validated path to the flat extent file.
-    pub flat_path: PathBuf,
-    /// Size of this extent in bytes (extent `size_sectors` × 512).
-    pub extent_size: u64,
+/// How an extent file holds the span its descriptor line declares for
+/// it.
+///
+/// The line is the authority, and nothing here looks at the file: qemu
+/// reads a file as whatever kind its line says, so a host that decided
+/// from the bytes could mean a different disk by the same image. A line
+/// naming any other kind is refused rather than mapped to the closer of
+/// these two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmdkExtentKind {
+    /// Raw sectors, byte for byte from the start of the file.
+    Flat,
+    /// A sparse VMDK image in its own right, with its own header, grain
+    /// directory and grain tables, covering only this extent's span.
+    Sparse,
 }
 
-/// Result of resolving a VMDK flat descriptor on the host.
+/// A single resolved extent within a VMDK descriptor.
+#[derive(Debug, Clone)]
+pub struct ResolvedVmdkExtent {
+    /// Absolute, allowlist-validated path to the extent file.
+    pub path: PathBuf,
+    /// Span of the virtual disk this extent covers, in bytes (extent
+    /// `size_sectors` × 512). Not the length of the file: a sparse
+    /// extent's file is shorter than its span until every grain is
+    /// allocated, and longer once its metadata is counted.
+    pub extent_size: u64,
+    /// Which kind the descriptor's extent line called this file.
+    pub kind: VmdkExtentKind,
+}
+
+/// Result of resolving a VMDK descriptor's extents on the host.
 #[derive(Debug, Clone)]
 pub struct ResolvedVmdkDescriptor {
-    /// Ordered flat extent files. For monolithicFlat, length 1;
-    /// for twoGbMaxExtentFlat, length N.
-    pub flat_extents: Vec<ResolvedVmdkExtent>,
+    /// Ordered extent files. For monolithicFlat, length 1; for the
+    /// `twoGbMaxExtent*` subformats, length N.
+    pub extents: Vec<ResolvedVmdkExtent>,
     /// Total virtual size across all extents in bytes.
     pub virtual_size: u64,
     /// Parent filename hint from descriptor, if present.
@@ -899,12 +980,13 @@ pub struct ResolvedVmdkDescriptor {
     pub parent_hint: Option<String>,
 }
 
-/// Read a VMDK flat descriptor, validate it, and resolve its flat
-/// extent file(s) against the backing-file allowlist.
+/// Read a VMDK descriptor, validate it, and resolve its extent file(s)
+/// against the backing-file allowlist.
 ///
-/// Supports both monolithicFlat (single extent) and
-/// twoGbMaxExtentFlat (multiple extents). All extents must be of
-/// kind `FLAT` with `offset_sectors == 0`.
+/// Supports monolithicFlat and monolithicSparse (single extent) and the
+/// `twoGbMaxExtentFlat` / `twoGbMaxExtentSparse` subformats (multiple
+/// extents). Every extent must be `FLAT` or `SPARSE` with
+/// `offset_sectors == 0`.
 ///
 /// If the descriptor contains a `parentFileNameHint=` line, the
 /// hint is returned in `parent_hint` so the caller can continue
@@ -942,6 +1024,21 @@ pub fn resolve_vmdk_flat_descriptor(
     }
 
     let extents = vmdk::parse_descriptor_extents(text).map_err(|e| {
+        // The extent-count bound names the limit that actually
+        // refused the image. Two of them apply -- the descriptor
+        // parser's `vmdk::MAX_EXTENTS` and the extent table's
+        // `shared::MAX_CHAIN_EXTENTS` -- and the parser's is the lower
+        // of the two, so an over-long descriptor never reaches the
+        // table. Reporting the table's bound here would send the user
+        // looking for room that was never the constraint.
+        if e == vmdk::ExtentParseError::TooManyExtents {
+            return ChainError::PathResolutionError(format!(
+                "VMDK descriptor '{}' declares more than the {} extents \
+                 a descriptor may have",
+                descriptor_path.display(),
+                vmdk::MAX_EXTENTS
+            ));
+        }
         ChainError::PathResolutionError(format!(
             "VMDK descriptor '{}' has malformed extent lines: {:?}",
             descriptor_path.display(),
@@ -949,21 +1046,30 @@ pub fn resolve_vmdk_flat_descriptor(
         ))
     })?;
 
-    let mut flat_extents = Vec::with_capacity(extents.len());
+    let mut resolved_extents = Vec::with_capacity(extents.len());
     let mut virtual_size: u64 = 0;
 
     for i in 0..extents.len() {
         let extent = extents.get(i).expect("index < len");
 
-        if extent.kind != vmdk::ExtentKind::Flat {
-            return Err(ChainError::PathResolutionError(format!(
-                "VMDK descriptor '{}' extent {} has kind {:?}; \
-                 only FLAT extents are supported",
-                descriptor_path.display(),
-                i,
-                extent.kind
-            )));
-        }
+        // FLAT and SPARSE are the kinds the guest's extent table can
+        // describe. ZERO has no file to attach, and the two VMFS kinds
+        // name a layout on a VMware filesystem that is not a file at
+        // all here, so each is refused rather than read as the nearest
+        // of the two.
+        let kind = match extent.kind {
+            vmdk::ExtentKind::Flat => VmdkExtentKind::Flat,
+            vmdk::ExtentKind::Sparse => VmdkExtentKind::Sparse,
+            _ => {
+                return Err(ChainError::PathResolutionError(format!(
+                    "VMDK descriptor '{}' extent {} has kind {:?}; \
+                     only FLAT and SPARSE extents are supported",
+                    descriptor_path.display(),
+                    i,
+                    extent.kind
+                )));
+            }
+        };
 
         if extent.offset_sectors != 0 {
             return Err(ChainError::PathResolutionError(format!(
@@ -984,7 +1090,7 @@ pub fn resolve_vmdk_flat_descriptor(
             )));
         }
 
-        let flat_path = validate_backing_path(descriptor_path, extent.filename, security_config)?;
+        let path = validate_backing_path(descriptor_path, extent.filename, security_config)?;
 
         let extent_size = extent.size_sectors.checked_mul(512).ok_or_else(|| {
             ChainError::PathResolutionError(format!(
@@ -1001,14 +1107,15 @@ pub fn resolve_vmdk_flat_descriptor(
             ))
         })?;
 
-        flat_extents.push(ResolvedVmdkExtent {
-            flat_path,
+        resolved_extents.push(ResolvedVmdkExtent {
+            path,
             extent_size,
+            kind,
         });
     }
 
     Ok(ResolvedVmdkDescriptor {
-        flat_extents,
+        extents: resolved_extents,
         virtual_size,
         parent_hint,
     })
@@ -1722,7 +1829,7 @@ mod tests {
         let resolved =
             resolve_vmdk_flat_descriptor(&l.via_link.join("foo.vmdk"), &default_security_config())
                 .unwrap();
-        assert_eq!(resolved.flat_extents[0].flat_path, flat);
+        assert_eq!(resolved.extents[0].path, flat);
     }
 
     #[test]
@@ -1997,12 +2104,9 @@ mod tests {
         let resolved = resolve_vmdk_flat_descriptor(&desc, &cfg).unwrap();
 
         assert_eq!(resolved.virtual_size, 20971520 * 512);
-        assert_eq!(resolved.flat_extents.len(), 1);
-        assert_eq!(
-            resolved.flat_extents[0].flat_path,
-            flat.canonicalize().unwrap()
-        );
-        assert_eq!(resolved.flat_extents[0].extent_size, 20971520 * 512);
+        assert_eq!(resolved.extents.len(), 1);
+        assert_eq!(resolved.extents[0].path, flat.canonicalize().unwrap());
+        assert_eq!(resolved.extents[0].extent_size, 20971520 * 512);
         assert!(resolved.parent_hint.is_none());
     }
 
@@ -2025,7 +2129,7 @@ mod tests {
         let cfg = default_security_config();
         let resolved = resolve_vmdk_flat_descriptor(&desc, &cfg).unwrap();
         assert_eq!(resolved.parent_hint.as_deref(), Some("parent.vmdk"));
-        assert_eq!(resolved.flat_extents.len(), 1);
+        assert_eq!(resolved.extents.len(), 1);
     }
 
     #[test]
@@ -2047,41 +2151,107 @@ mod tests {
 
         let cfg = default_security_config();
         let resolved = resolve_vmdk_flat_descriptor(&desc, &cfg).unwrap();
-        assert_eq!(resolved.flat_extents.len(), 2);
-        assert_eq!(
-            resolved.flat_extents[0].flat_path,
-            flat1.canonicalize().unwrap()
-        );
-        assert_eq!(
-            resolved.flat_extents[1].flat_path,
-            flat2.canonicalize().unwrap()
-        );
-        assert_eq!(resolved.flat_extents[0].extent_size, 4194304 * 512);
-        assert_eq!(resolved.flat_extents[1].extent_size, 4194304 * 512);
+        assert_eq!(resolved.extents.len(), 2);
+        assert_eq!(resolved.extents[0].path, flat1.canonicalize().unwrap());
+        assert_eq!(resolved.extents[1].path, flat2.canonicalize().unwrap());
+        assert_eq!(resolved.extents[0].extent_size, 4194304 * 512);
+        assert_eq!(resolved.extents[1].extent_size, 4194304 * 512);
         assert_eq!(resolved.virtual_size, 2 * 4194304 * 512);
         assert!(resolved.parent_hint.is_none());
     }
 
     #[test]
-    fn resolve_descriptor_rejects_non_flat_kind() {
+    fn resolve_descriptor_carries_each_extents_kind() {
+        // The kinds a descriptor may mix, each reported as the line
+        // declared it. Nothing here looks at the files: a sparse
+        // extent's bytes are not read until the guest parses its
+        // header, and a flat one's never are.
         let tmp = TempDir::new().unwrap();
         let desc = tmp.path().join("foo.vmdk");
-        let sparse = tmp.path().join("foo-sparse.vmdk");
+        let first = tmp.path().join("foo-s001.vmdk");
+        let second = tmp.path().join("foo-s002.vmdk");
         let text = "# Disk DescriptorFile\n\
                     version=1\n\
                     CID=1\n\
-                    createType=\"monolithicSparse\"\n\
-                    RW 1024 SPARSE \"foo-sparse.vmdk\"\n";
+                    createType=\"twoGbMaxExtentSparse\"\n\
+                    RW 1024 SPARSE \"foo-s001.vmdk\"\n\
+                    RW 2048 FLAT \"foo-s002.vmdk\"\n";
         std::fs::write(&desc, text).unwrap();
-        std::fs::write(&sparse, vec![0u8; 512]).unwrap();
+        std::fs::write(&first, vec![0u8; 512]).unwrap();
+        std::fs::write(&second, vec![0u8; 512]).unwrap();
+
+        let cfg = default_security_config();
+        let resolved = resolve_vmdk_flat_descriptor(&desc, &cfg).unwrap();
+        assert_eq!(resolved.extents.len(), 2);
+        assert_eq!(resolved.extents[0].kind, VmdkExtentKind::Sparse);
+        assert_eq!(resolved.extents[0].extent_size, 1024 * 512);
+        assert_eq!(resolved.extents[1].kind, VmdkExtentKind::Flat);
+        assert_eq!(resolved.extents[1].extent_size, 2048 * 512);
+        assert_eq!(resolved.virtual_size, (1024 + 2048) * 512);
+    }
+
+    #[test]
+    fn resolve_descriptor_rejects_a_kind_the_extent_table_cannot_describe() {
+        // ZERO has no file to lay in the device, and the VMFS kinds
+        // name a layout on a VMware filesystem rather than a file.
+        for kind in ["ZERO", "VMFS", "VMFSSPARSE"] {
+            let tmp = TempDir::new().unwrap();
+            let desc = tmp.path().join("foo.vmdk");
+            let extent = tmp.path().join("foo-extent.vmdk");
+            let text = format!(
+                "# Disk DescriptorFile\n\
+                 version=1\n\
+                 CID=1\n\
+                 createType=\"monolithicFlat\"\n\
+                 RW 1024 {kind} \"foo-extent.vmdk\"\n"
+            );
+            std::fs::write(&desc, text).unwrap();
+            std::fs::write(&extent, vec![0u8; 512]).unwrap();
+
+            let cfg = default_security_config();
+            let err = resolve_vmdk_flat_descriptor(&desc, &cfg).unwrap_err();
+            match err {
+                ChainError::PathResolutionError(msg) => {
+                    assert!(
+                        msg.contains("only FLAT and SPARSE extents are supported"),
+                        "expected error about the supported kinds for {kind}, got: {msg}"
+                    );
+                }
+                _ => panic!("expected PathResolutionError for {kind}, got {err:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_descriptor_names_the_extent_bound_that_applied() {
+        // Two bounds could refuse an over-long descriptor, and the
+        // descriptor parser's is the lower one, so it is the one the
+        // message must name -- a user told about the extent table's 64
+        // would go looking for room that was never the constraint.
+        assert!(
+            vmdk::MAX_EXTENTS <= shared::MAX_CHAIN_EXTENTS,
+            "the descriptor parser's bound is the tighter of the two"
+        );
+        let tmp = TempDir::new().unwrap();
+        let desc = tmp.path().join("foo.vmdk");
+        let mut text = String::from(
+            "# Disk DescriptorFile\n\
+             version=1\n\
+             CID=1\n\
+             createType=\"twoGbMaxExtentFlat\"\n",
+        );
+        for i in 0..=vmdk::MAX_EXTENTS {
+            text.push_str(&format!("RW 1024 FLAT \"foo-s{i:03}.vmdk\"\n"));
+        }
+        std::fs::write(&desc, &text).unwrap();
 
         let cfg = default_security_config();
         let err = resolve_vmdk_flat_descriptor(&desc, &cfg).unwrap_err();
         match err {
             ChainError::PathResolutionError(msg) => {
                 assert!(
-                    msg.contains("FLAT"),
-                    "expected error about FLAT kind, got: {msg}"
+                    msg.contains(&format!("more than the {} extents", vmdk::MAX_EXTENTS)),
+                    "expected the parser's bound to be named, got: {msg}"
                 );
             }
             _ => panic!("expected PathResolutionError, got {err:?}"),

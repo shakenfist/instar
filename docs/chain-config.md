@@ -27,10 +27,10 @@ Written at `CHAIN_CONFIG_ADDR` (`0x000F2000`) in guest physical memory.
 | 16 | 640 | | `devices` | Array of up to 16 `ChainDeviceInfo` entries |
 | 656 | 128 | | `segments` | Array of up to 16 `ChainSegment` entries |
 | 784 | 4 | u32 | `extent_count` | Number of valid extent entries; 0 when no device has extents |
-| 792 | 1536 | | `extents` | Array of up to 64 `ChainExtent` entries |
-| 2328 | 64 | | `_reserved` | Reserved, written as 0 |
+| 792 | 2048 | | `extents` | Array of up to 64 `ChainExtent` entries |
+| 2840 | 64 | | `_reserved` | Reserved, written as 0 |
 
-Total struct size: 2392 bytes. `extents` is 8-aligned, so four bytes of
+Total struct size: 2904 bytes. `extents` is 8-aligned, so four bytes of
 padding follow `extent_count`. The memory allocation at
 `CHAIN_CONFIG_ADDR` is the whole 4096-byte page up to `VMM_PARAMS_ADDR`
 (`CHAIN_CONFIG_MAX_SIZE`), and a compile-time assert in
@@ -69,10 +69,13 @@ the image that owns it, belongs to the chain it was inserted into and
 is covered by that chain's segment. It is marked with
 `FLAG_DATA_DEVICE` and is never a layer: it holds its owner's cluster
 data, it is not a backing file, and the chain reader steps over it
-(#792). A qcow2 owns one such device, its external data file; a VMDK
-flat descriptor owns the run of marked devices that holds its extents.
-The owner's `data_device_idx` must name the slot immediately after the
-owner, and every marked device must belong to an owner;
+(#792). A qcow2 owns one such device, its external data file, and a
+qcow2 is the only owner there is: a VMDK descriptor's extents share the
+descriptor's own device and are named by the extent table, so a
+descriptor whose `data_device_idx` is not zero is the host and the guest
+disagreeing about how the image was attached. The owner's
+`data_device_idx` must name the slot immediately after the owner, and
+every marked device must belong to an owner;
 `ChainConfig::data_devices_are_owned` refuses any other layout.
 
 ### ChainDeviceInfo (40 bytes per device)
@@ -91,15 +94,17 @@ chain config.
 | 32 | 4 | u32 | `first_extent` | Index in `extents` of this device's first extent |
 | 36 | 4 | u32 | `extent_count` | Number of `extents` entries this device owns; 0 = the device is a single file |
 
-### ChainExtent (24 bytes per extent)
+### ChainExtent (32 bytes per extent)
 
-Each extent entry starts at offset `792 + (extent_index * 24)`.
+Each extent entry starts at offset `792 + (extent_index * 32)`.
 
 | Offset | Size | Type | Field | Description |
 |--------|------|------|-------|-------------|
 | 0 | 8 | u64 | `device_offset` | Byte offset within the device where this extent's file begins |
 | 8 | 8 | u64 | `file_length` | Length in bytes of the extent's own file |
 | 16 | 8 | u64 | `virtual_span` | Bytes of the virtual disk this extent covers |
+| 24 | 4 | u32 | `kind` | 1 = `KIND_FLAT`, 2 = `KIND_SPARSE`; 0 is refused |
+| 28 | 4 | u32 | `_reserved` | Reserved, written as 0 |
 
 The table describes a device whose bytes are several files laid end to
 end -- a VMDK descriptor and its extents -- so that the guest can find
@@ -113,6 +118,29 @@ A config with no such device leaves `extent_count` zero and the table
 untouched: every device is then a single file whose own `extent_count`
 is zero as well, and nothing consults the table.
 
+The devices' slices must tile the table from its first entry in device
+order -- a device with extents starts where the last one ended, and a
+device with none has a `first_extent` of zero. A VMDK descriptor that
+is a layer of the chain has at least one entry and no other device has
+any, because a descriptor's own bytes are its text and reading them
+would serve the descriptor's source as the disk. Within a device the
+files are in ascending order and do not overlap, and the spans sum
+without overflowing. As with the segmentation, the host checks the rule
+before it writes the config and `qcow2::init_chain_states` checks it
+again before any read; `ChainConfig::extents_are_sound` is the rule
+both halves use.
+
+The host places each extent file at the running total of the lengths of
+the files before it, rounded up to a multiple of 512. The length is the
+file's own and never the span the descriptor declares for it: a sparse
+extent whose grains are all allocated is longer than its span, and one
+that is mostly holes is far shorter, so a span would leave the next
+extent's base in the wrong place either way. The rounding is what makes
+a sparse extent's `device_offset` a multiple of 512, which the guest
+requires because sparse VMDK counts 512-byte sectors from the start of
+its own file; qemu writes extent files in whole sectors, so for a
+qemu-written image the rounding adds nothing.
+
 `virtual_span` is carried rather than derived from `file_length`
 because a sparse extent is shorter on disk than the span it covers, and
 a descriptor may declare any span it likes. Nor is concatenation alone
@@ -121,11 +149,29 @@ header, grain directory and grain tables covering only its own span, so
 without the boundaries the guest would read the wrong metadata and do
 it silently.
 
+`kind` is carried rather than worked out from the bytes because the
+descriptor's extent line is the authority and qemu believes it. A guest
+that looked for a sparse header would read a flat extent whose first
+sector happened to hold one as sparse, and one that compared the file's
+length with its span would read a sparse extent padded out to its span
+as flat. Either way one file would mean different bytes to instar than
+to qemu. Two sparse extents the guest refuses that qemu would read: a
+compressed one, because nothing can hold a compressed grain to its
+extent's file, and one whose header capacity is not the span the
+descriptor line declares, because then every later extent sits at a
+different virtual offset for each reader.
+
 `MAX_CHAIN_EXTENTS` is 64, which is 128 GiB at qemu's 2 GiB default
 extent size. qemu has no equivalent limit, so an image with more
 extents than the table holds cannot be described to the guest and is
 refused with a message naming the bound; raising the bound means moving
 the config region rather than changing the constant.
+
+The descriptor parser has a bound of its own, `vmdk::MAX_EXTENTS`,
+which is 32 and so is the lower of the two today: an over-long
+descriptor is refused there, before the table is ever reached. A
+refusal names whichever bound applied to it, so a reader is not sent
+looking for room that was never the constraint.
 
 ### Device Indexing
 
@@ -135,6 +181,10 @@ the config region rather than changing the constant.
 - An external data file device sits immediately after the image that
   owns it, so the owner's `data_device_idx` is its own index plus one.
   It is not a backing file, and the next backing file follows it
+- A VMDK descriptor's extents take no device slot. The descriptor is
+  attached as one device whose bytes are its extent files laid end to
+  end, so a descriptor with twenty-six extents costs one slot and its
+  `data_device_idx` is zero
 - The **base** image (no backing file) is the last non-data device
 
 ## ImageFormat Values
@@ -153,7 +203,7 @@ the config region rather than changing the constant.
 | 9 | `Qed` | QED (read-refused by policy, not because qemu deprecates it — see `docs/quirks.md` "QED read-refusal as policy") |
 | 10 | `Iso` | ISO 9660 |
 | 11 | `Luks` | LUKS encrypted container |
-| 12 | `VmdkDescriptor` | VMDK monolithicFlat descriptor file (text; content lives in a separate flat extent file) |
+| 12 | `VmdkDescriptor` | VMDK descriptor file (text; content lives in one or more separate extent files, named by the extent table) |
 | 13 | `Parallels` | Parallels Disk Image, both magics — full read support (convert/compare/dd/bench) |
 | 14 | `Bochs` | Bochs growing disk image — detection and info only, no read path |
 | 15 | `Cloop` | cloop compressed loopback image — detection and info only, no read path |

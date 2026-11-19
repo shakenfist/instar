@@ -15811,12 +15811,35 @@ mod tests {
 
     #[test]
     fn init_chain_states_refuses_a_descriptor_attached_without_its_extents() {
-        use ImageFormat::{Qcow2, Raw, VmdkDescriptor};
+        use ImageFormat::{Raw, VmdkDescriptor};
         // The reader finds a descriptor's content through the extent
-        // table and nowhere else. A descriptor whose extents arrive as
-        // data devices in the slots after it, one device per extent, has
-        // no entry there: nothing would read those devices, and the
-        // descriptor's own bytes are its text.
+        // table and nowhere else, so a descriptor the table gives no
+        // entry has nothing of its content to read: its own bytes are
+        // its text, and serving them would hand the descriptor's source
+        // over as the disk.
+        for (devices, segments, label) in [
+            (
+                &[layer(VmdkDescriptor)][..],
+                &[(0u32, 1u32)][..],
+                "a descriptor on its own",
+            ),
+            (
+                &[layer(VmdkDescriptor), layer(Raw)][..],
+                &[(0, 2)][..],
+                "a descriptor with nothing but a parent",
+            ),
+        ] {
+            assert_extent_table_refused(devices, segments, |_| {}, label);
+        }
+    }
+
+    #[test]
+    fn init_chain_states_refuses_a_descriptor_that_owns_data_devices() {
+        use ImageFormat::{Qcow2, VmdkDescriptor};
+        // A descriptor's extents share its own device, so a descriptor
+        // naming a data device is the host and the guest disagreeing
+        // about how the image was attached. Only a qcow2's external
+        // data file is a device of its own.
         for (devices, segments, label) in [
             (
                 &[owner(VmdkDescriptor, 1), data_dev(), data_dev()][..],
@@ -15833,13 +15856,8 @@ mod tests {
                 &[(0, 4)][..],
                 "a data-file image over such a descriptor",
             ),
-            (
-                &[layer(VmdkDescriptor), layer(Raw)][..],
-                &[(0, 2)][..],
-                "a descriptor with nothing but a parent",
-            ),
         ] {
-            assert_extent_table_refused(devices, segments, |_| {}, label);
+            assert_data_device_layout_refused(devices, segments, label);
         }
     }
 

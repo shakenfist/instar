@@ -37,7 +37,6 @@ struct ConcatMember {
 /// one.
 enum Storage {
     Single(File),
-    #[allow(dead_code)]
     Concatenated(Vec<ConcatMember>),
 }
 
@@ -119,7 +118,6 @@ impl BackingStore {
     /// refused here rather than accepted and then mishandled per request,
     /// because a write silently landing in the wrong file is worse than a
     /// device that will not open.
-    #[allow(dead_code)]
     pub fn open_concatenated(extents: &[(PathBuf, u64)], read_only: bool) -> io::Result<Self> {
         if !read_only {
             return Err(io::Error::new(

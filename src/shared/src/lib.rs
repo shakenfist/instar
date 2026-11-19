@@ -5227,11 +5227,11 @@ pub const MAX_CHAIN_EXTENTS: usize = 64;
 /// top image, and no device outside the range is behind any device
 /// inside it.
 ///
-/// An external data device -- a qcow2's data file, or a VMDK flat
-/// descriptor's extents -- stays inside its owner's segment, in the
-/// slots immediately after the owner, but it is not a layer of the
-/// chain. It carries [`ChainDeviceInfo::FLAG_DATA_DEVICE`], the reader
-/// reaches it only through its owner's
+/// An external data device -- a qcow2's data file -- stays inside its
+/// owner's segment, in the slot immediately after the owner, but it is
+/// not a layer of the chain. It carries
+/// [`ChainDeviceInfo::FLAG_DATA_DEVICE`], the reader reaches it only
+/// through its owner's
 /// [`data_device_idx`](ChainDeviceInfo::data_device_idx), and a walk
 /// down the chain steps over it: nothing is behind a data device, and
 /// it is behind nothing. Reading it as the layer under its owner served
@@ -5403,10 +5403,9 @@ pub struct ChainDeviceInfo {
     /// metadata (L1/L2/refcounts) and cluster data are separate.
     /// The device it names carries [`Self::FLAG_DATA_DEVICE`].
     ///
-    /// A VMDK descriptor may name the first of a run of data devices
-    /// here too, but nothing reads its content through them: a
-    /// descriptor's extents are the ones the extent table gives it,
-    /// through [`Self::first_extent`] and [`Self::extent_count`].
+    /// Zero for a VMDK descriptor, whose extents are not devices: they
+    /// are the entries the extent table gives it, through
+    /// [`Self::first_extent`] and [`Self::extent_count`].
     pub data_device_idx: u32,
 
     /// Index in [`ChainConfig::extents`] of this device's first extent.
@@ -5427,9 +5426,8 @@ pub struct ChainDeviceInfo {
 }
 
 impl ChainDeviceInfo {
-    /// The device is an external data device -- a qcow2's data file or
-    /// one of a VMDK flat descriptor's extents -- and not a layer of
-    /// the chain.
+    /// The device is an external data device -- a qcow2's data file --
+    /// and not a layer of the chain.
     ///
     /// The host sets this on every data device it attaches, and the
     /// info operation never sets it: it describes the device's role in
@@ -5699,26 +5697,20 @@ impl ChainConfig {
     ///
     /// * no segment's first device is marked, because the top of a chain
     ///   is never a data device;
-    /// * only a qcow2 (its external data file) or a VMDK flat descriptor
-    ///   (its extents) has a non-zero `data_device_idx`, and never one
-    ///   that is itself marked, because a data device has no metadata
-    ///   that could point anywhere;
+    /// * only a qcow2, for its external data file, has a non-zero
+    ///   `data_device_idx`, and never one that is itself marked, because
+    ///   a data device has no metadata that could point anywhere. A VMDK
+    ///   descriptor's extents are not devices: they share the
+    ///   descriptor's own device and are named by the extent table, so a
+    ///   descriptor pointing at a data device is the host and the guest
+    ///   disagreeing about how the image was attached;
     /// * a non-zero `data_device_idx` names the slot immediately after
     ///   its owner, inside `device_count`, and that slot is marked;
-    /// * every marked device is claimed by an owner: a qcow2 claims the
-    ///   one device its `data_device_idx` names, and a VMDK descriptor
-    ///   claims the run of marked devices that starts there. That says
-    ///   only where such a run may sit. The reader does not read a
-    ///   descriptor through it: a descriptor's content is the extents
-    ///   the extent table gives its device, and
-    ///   [`Self::extents_are_sound`] refuses one the table gives none.
+    /// * every marked device is claimed by the one owner whose
+    ///   `data_device_idx` names it.
     ///
-    /// No device can be claimed twice under these rules. A second owner
-    /// would have to sit inside the first owner's run to name a device
-    /// in it, and everything in a run is marked, which an owner may not
-    /// be. Nor can a run leave its segment: it is contiguous from the
-    /// slot after its owner, and the next segment's first device is
-    /// unmarked.
+    /// No device can be claimed twice under these rules: two owners
+    /// would have to be the same slot's predecessor.
     ///
     /// Callers pass the device count they are about to walk, as for
     /// [`Self::segmentation_covers`].
@@ -5740,26 +5732,17 @@ impl ChainConfig {
 
         let mut claimed = [false; MAX_CHAIN_DEVICES];
         for (owner, info) in devices.iter().enumerate() {
-            let first = info.data_device_idx as usize;
-            if first == 0 {
+            let data = info.data_device_idx as usize;
+            if data == 0 {
                 continue;
             }
-            let claims_a_run = match (info.is_data_device(), info.detected_format()) {
-                (false, ImageFormat::Qcow2) => false,
-                (false, ImageFormat::VmdkDescriptor) => true,
-                _ => return false,
-            };
-            if first != owner + 1 || first >= device_count || !devices[first].is_data_device() {
+            if info.is_data_device() || !matches!(info.detected_format(), ImageFormat::Qcow2) {
                 return false;
             }
-            let mut d = first;
-            while d < device_count && devices[d].is_data_device() {
-                claimed[d] = true;
-                d += 1;
-                if !claims_a_run {
-                    break;
-                }
+            if data != owner + 1 || data >= device_count || !devices[data].is_data_device() {
+                return false;
             }
+            claimed[data] = true;
         }
 
         devices
