@@ -1155,13 +1155,18 @@ external, encrypted or compressed clusters").
 
 ### VMDK multi-extent sources are refused
 
-`qemu-img map` reads the VMDK descriptor and walks the
-multi-extent layout. instar's `VmdkState::init` only parses
-the VMDK4 binary header, so descriptor-driven (multi-extent
-monolithicFlat / 2GbMaxExtent…) sources fail init. The
-host CLI also refuses them via `peek_is_vmdk_descriptor`
-before launching the guest, pointing the user at `qemu-img
-map` as the workaround.
+**This applies to `map` and `measure` only.** `qemu-img map`
+reads the VMDK descriptor and walks the multi-extent layout.
+instar's `map` and `measure` refuse a descriptor-driven source
+(monolithicFlat or either `twoGbMaxExtent` subformat) in a
+host-side pre-check, `peek_is_vmdk_descriptor`, before launching
+the guest, pointing the user at `qemu-img` as the workaround;
+the guest's own map walker would fail the VMDK4 binary header
+parse on a descriptor anyway. The message names monolithicFlat
+whatever the descriptor is. Other commands do read these images:
+`info`, `check`, `compare` and `convert` attach the descriptor
+and its extents as one device and read through the extent table
+in the chain config.
 
 ### qcow2 v3 standard-L2 `QCOW_OFLAG_ZERO` honoured (fixed)
 
