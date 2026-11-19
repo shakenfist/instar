@@ -1,6 +1,6 @@
 # Streaming image input over HTTP and HTTPS
 
-## Status: Not started
+## Status: In progress
 
 ## Prompt
 
@@ -270,10 +270,22 @@ give it -- and both say so in their own text.
    the kernel's problem, which removes framing desynchronisation
    from the privileged parser entirely. 64 KiB matches the guest's
    own request size, and readahead comes from many outstanding
-   requests rather than larger ones. The measured `wmem_max` of
-   212992 caps a single datagram near 256 KiB here and will be lower
-   on some machines, so the ceiling is negotiated rather than
-   assumed. If phase 6's measurement shows round-trip count
+   requests rather than larger ones.
+
+   *Corrected by phase 2's survey, 2026-11-19.* This question
+   originally said that "the measured `wmem_max` of 212992 caps a
+   single datagram near 256 KiB here". It does not, in either
+   direction. A fresh `SOCK_SEQPACKET` socketpair on this host gets
+   `SO_SNDBUF` 212992 and caps a datagram at 212960 bytes, which is
+   208 KiB and below 256 KiB; after an explicit
+   `setsockopt(SO_SNDBUF, ...)` the kernel clamps the request to
+   `wmem_max` and then doubles it, giving 425984 and a 425952-byte
+   ceiling, which is 416 KiB and above it. Neither number follows
+   from the sysctl by inspection, so phase 2 negotiates from the
+   `SO_SNDBUF` the kernel actually granted on each side rather than
+   from any sysctl, and 64 KiB is the default because it is the only
+   size that fits everywhere without asking for anything. If phase
+   6's measurement shows round-trip count
    dominating, phase 6 revisits it -- `SOCK_STREAM` with fixed
    headers, or scatter-gather across several datagrams -- rather
    than phase 2 guessing now.
@@ -281,7 +293,8 @@ give it -- and both say so in their own text.
 3. **Where do the cache and the readahead live?**
    *Resolved 2026-11-18: in the fetcher.* The VMM's `read_at` stays
    one round trip, and the fetcher owns the block cache, the
-   coalescing of 512-byte requests, and the asynchronous readahead,
+   coalescing of repeated and overlapping 64 KiB requests, and the
+   asynchronous readahead,
    issuing overlapping HTTP requests without the VMM knowing. A
    compromised fetcher serving stale or wrong cached bytes is still
    only serving wrong bytes. Putting the cache in the VMM would mean
@@ -477,8 +490,8 @@ there is a confined process to put it in.
 
 | Phase | Plan | Status | Merged |
 |-------|------|--------|--------|
-| 1. Guest I/O wait | [PLAN-http-input-phase-01-guest-wait.md](PLAN-http-input-phase-01-guest-wait.md) | Not started | |
-| 2. Fetch protocol and a file-backed fetcher | PLAN-http-input-phase-02-protocol.md | Not started | |
+| 1. Guest I/O wait | [PLAN-http-input-phase-01-guest-wait.md](PLAN-http-input-phase-01-guest-wait.md) | Complete | a8387ffe |
+| 2. Fetch protocol and a file-backed fetcher | [PLAN-http-input-phase-02-protocol.md](PLAN-http-input-phase-02-protocol.md) | Not started | |
 | 3. Remote backing store | PLAN-http-input-phase-03-backing.md | Not started | |
 | 4. Confinement | PLAN-http-input-phase-04-confinement.md | Not started | |
 | 5. HTTP backend | PLAN-http-input-phase-05-http.md | Not started | |
@@ -519,11 +532,43 @@ out-of-order completion by request id -- and build `instar-fetch`
 serving a local file over it, with no network code at all. Records
 the NBD and virtqueue comparisons from open question 1.
 
+Planned 2026-11-19. Three things the phase plan decided that this
+section did not anticipate. The **VMM-side client lands in this
+phase too**, as a standalone type with `BackingStore::read_at`'s
+exact signature, because otherwise phase 2 can only be tested
+through throwaway code and phase 3 integrates a client written for
+the first time at the point of integration. The fetcher **takes
+descriptor numbers rather than a path** -- the VMM opens the file and
+the fetcher inherits it -- which keeps path resolution on the side
+that holds the user's authority and lets phase 4 confine the file
+backend to no filesystem access at all. And the **decoder's fuzz
+target lands here rather than in phase 9**, because this decoder is
+the only new untrusted parse the plan adds to the privileged
+process and phase 9's business is HTTP and fault injection.
+
+The survey also found that `std` cannot create a `SOCK_SEQPACKET`
+socket at all -- `std::os::unix::net` offers only `SOCK_STREAM` and
+`SOCK_DGRAM` -- so the socket is a `libc::socketpair` behind a safe
+wrapper in the pattern of `src/vmm/src/ioevent.rs`, rather than a
+new dependency in the privileged process.
+
 **3. Remote backing store.** `BackingStore` gains a second kind,
 the read-only operations accept a URL, and the fetcher's lifecycle
 is owned: started before `/dev/kvm` is opened, reaped on every exit
 path. End state: `instar info file:///path` works end to end
 through the socket.
+
+Phase 2's survey sharpened two things here. `BackingStore` is a
+plain struct today -- `src/vmm/src/backing.rs` holds a `File`, a
+capacity, a size and a sparse flag, with no enum, trait or
+indirection -- so "gains a second kind" means introducing the
+polymorphism as well as the remote implementation. And the VMM has
+never spawned a child process: the only `Command::new` under
+`src/vmm/src/` runs `qemu-img --version`, so there is no
+descriptor-passing, reaping or child signal handling to extend. This
+phase should also fix #932, the virtqueue error the host cannot read
+that hangs the guest, because it multiplies the ways the host can
+fail to answer a request.
 
 **4. Confinement.** Landlock, seccomp-bpf, user and mount
 namespaces, rlimits (`RLIMIT_FSIZE` 0 and `RLIMIT_NPROC` 0 are the
