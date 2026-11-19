@@ -42,9 +42,10 @@ rand = "0.10"
 [dev-dependencies]
 tempfile = "3"
 
-# Debian package metadata. The binary lives at /usr/bin/instar and the
-# six guest .bin files (loaded into KVM at runtime) live in the private
-# libdir /usr/lib/instar/. The runtime resolver in src/main.rs probes
+# Debian package metadata. The binary lives at /usr/bin/instar; the
+# sixteen guest .bin files (loaded into KVM at runtime) and the
+# host-side instar-fetch helper live in the private libdir
+# /usr/lib/instar/. The runtime resolver in src/main.rs probes
 # the executable directory first (developer mode) and falls back to
 # /usr/lib/instar/, so both layouts work without code changes per
 # install.

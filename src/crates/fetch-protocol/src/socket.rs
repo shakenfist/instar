@@ -21,6 +21,7 @@
 //! else to connect to, no directory to choose, no mode to get wrong, and
 //! nothing for a filesystem sandbox to have to permit.
 
+use crate::wire::{MAX_BLOCK_SIZE, READ_REPLY_LEN};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::time::Duration;
@@ -36,6 +37,14 @@ use std::time::Duration;
 /// sides read back what they were actually granted and derive the ceiling
 /// from that, which is what [`SeqPacketSocket::max_datagram`] does.
 pub const DATAGRAM_OVERHEAD: u32 = 32;
+
+/// The socket buffer each side asks for, so that the negotiation can reach
+/// the largest block the protocol permits.
+///
+/// A full payload, its reply header, and the per-datagram overhead the kernel
+/// charges on top. What a side can actually offer is the buffer it was
+/// granted, not this figure, so it is only ever a request.
+pub const WANTED_SOCKET_BUFFER: u32 = MAX_BLOCK_SIZE + READ_REPLY_LEN as u32 + DATAGRAM_OVERHEAD;
 
 /// One end of an `AF_UNIX`/`SOCK_SEQPACKET` socketpair.
 ///
@@ -74,7 +83,18 @@ impl SeqPacketSocket {
         let first = unsafe { OwnedFd::from_raw_fd(fds[0]) };
         // SAFETY: as above, for the other end of the same pair.
         let second = unsafe { OwnedFd::from_raw_fd(fds[1]) };
-        Ok((Self { fd: first }, Self { fd: second }))
+        let (first, second) = (Self { fd: first }, Self { fd: second });
+        // Size both ends here, because what a side can offer in the
+        // negotiation is the buffer it was granted and the default grant is
+        // below the largest block this protocol defines. Doing it at
+        // creation keeps it the owner's decision: a caller that wants
+        // something smaller -- a test proving the negotiation really does
+        // follow the grant, for instance -- shrinks it afterwards and
+        // nothing silently puts it back. A refusal is not fatal; the
+        // negotiation settles lower.
+        let _ = first.request_largest_buffers();
+        let _ = second.request_largest_buffers();
+        Ok((first, second))
     }
 
     /// Adopt a descriptor that is already a `SOCK_SEQPACKET` socket, such as
@@ -211,6 +231,28 @@ impl SeqPacketSocket {
             return Err(io::Error::last_os_error());
         }
         Ok(())
+    }
+
+    /// Ask the kernel for buffers large enough to carry the largest block
+    /// the protocol permits.
+    ///
+    /// Both ends have to do this, and the reason is not symmetry for its own
+    /// sake. The ceiling a side can offer is the buffer it was *granted*,
+    /// and the default grant is smaller than the largest block this protocol
+    /// defines -- so a side that never asks silently caps the negotiation
+    /// below the protocol's own maximum, whatever the other side can manage.
+    /// The cap is invisible in a default configuration, where the block is
+    /// far below either figure, and would surface much later as a ceiling
+    /// nobody chose.
+    ///
+    /// The kernel grants what it likes: it clamps the request to `wmem_max`
+    /// and then doubles it, so the figure that matters is always the one
+    /// read back afterwards and never the one asked for. A refusal is not
+    /// fatal either -- the negotiation simply settles lower -- so a caller
+    /// that has nowhere to report the error may ignore it.
+    pub fn request_largest_buffers(&self) -> io::Result<()> {
+        self.set_send_buffer_size(WANTED_SOCKET_BUFFER)?;
+        self.set_recv_buffer_size(WANTED_SOCKET_BUFFER)
     }
 
     /// The largest single datagram this end can send or receive.
@@ -457,6 +499,57 @@ mod tests {
                 io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
             ),
             "unexpected kind: {err:?}"
+        );
+    }
+    /// The buffer each side asks for has to be able to carry the largest
+    /// block the protocol permits.
+    ///
+    /// The negotiation aims for the smaller default rather than this
+    /// ceiling, so nothing today depends on the figure being this large.
+    /// That is the point: raising the default later should be a change to
+    /// one constant, not a discovery that the sockets were never sized for
+    /// it.
+    #[test]
+    fn the_wanted_buffer_covers_the_largest_block() {
+        let ceiling = WANTED_SOCKET_BUFFER - DATAGRAM_OVERHEAD;
+        assert!(
+            ceiling - READ_REPLY_LEN as u32 >= MAX_BLOCK_SIZE,
+            "the requested buffer cannot carry the protocol's largest block"
+        );
+    }
+    /// Asking for the largest buffers grows a socket that was made smaller.
+    #[test]
+    fn requesting_the_largest_buffers_grows_a_small_socket() {
+        let (socket, _peer) = SeqPacketSocket::pair().expect("pair");
+        socket.set_send_buffer_size(4096).expect("shrink send");
+        socket.set_recv_buffer_size(4096).expect("shrink recv");
+        let small = socket.max_datagram().expect("small");
+        socket.request_largest_buffers().expect("ask");
+        let asked = socket.max_datagram().expect("asked");
+        assert!(
+            asked > small,
+            "asking did not grow the buffers: {small} then {asked}"
+        );
+    }
+
+    /// A pair has already asked, so asking again changes nothing.
+    ///
+    /// The ceiling a side can offer in the negotiation is the buffer it was
+    /// granted, and the default grant is below the largest block this
+    /// protocol defines -- so a pair that did not ask would leave the
+    /// negotiation unable to reach that block however small the request.
+    /// Comparing a fresh pair against the same pair after an explicit ask
+    /// says whether the constructor did it, without naming a figure that
+    /// depends on the host's own limits.
+    #[test]
+    fn a_pair_has_already_asked_for_the_largest_buffers() {
+        let (socket, _peer) = SeqPacketSocket::pair().expect("pair");
+        let fresh = socket.max_datagram().expect("fresh");
+        socket.request_largest_buffers().expect("ask again");
+        assert_eq!(
+            socket.max_datagram().expect("asked"),
+            fresh,
+            "a fresh pair was not already sized: asking again changed it"
         );
     }
 }

@@ -242,13 +242,26 @@ records that phase 3 should, and the risk table says why it is phase
    permit. `SOCK_CLOEXEC` on creation, and the fetcher's end is
    `dup2`'d to a fixed descriptor number.
 
-6. **64 KiB default, ceiling negotiated from the granted
-   `SO_SNDBUF`.** Both ends ask for the largest buffer they want, read
-   back what the kernel granted, and the init exchange settles on the
-   smaller of the two achievable maxima, capped at 256 KiB. No sysctl
-   is read and no number is assumed. The survey explains why: the
-   value in open question 2 was neither the default ceiling nor the
-   reachable one.
+6. **64 KiB default, with what each side can carry measured from the
+   granted `SO_SNDBUF`.** Both ends ask for a buffer large enough to
+   carry the protocol's largest block, read back what the kernel
+   granted, and the init exchange settles on the smaller of the two
+   achievable maxima -- capped at the **64 KiB default**, not at the
+   256 KiB maximum. No sysctl is read and no number is assumed. The
+   survey explains why the measurement is necessary: the value in open
+   question 2 was neither the default ceiling nor the reachable one.
+
+   *Corrected 2026-11-19, during step 2f's review.* This decision
+   originally said "capped at 256 KiB", which contradicted open
+   question 2's "64 KiB default" -- and the code followed the
+   decision, so a well-provisioned pair negotiated 256 KiB and
+   `DEFAULT_BLOCK_SIZE` was used only by tests. The operator confirmed
+   the 64 KiB default. A larger block buys nothing while a guest
+   request is at most 64 KiB: it only changes how a larger read is
+   divided, and holds four times the receive buffer for payloads that
+   never arrive. The 256 KiB maximum stays the figure the headers and
+   the requested socket buffers are built to reach, so phase 6 raises
+   one constant rather than the protocol.
 
 7. **The client's API is `read_at(&mut self, offset: u64, buf: &mut
    [u8]) -> io::Result<()>`.** Identical to `BackingStore`'s, so
@@ -503,6 +516,34 @@ happen.
     default nor the 256 KiB ceiling can satisfy them, and a read several
     times that block still comes back byte-identical, which it can only do
     by splitting.
+
+14. **`docs/installation.md` was wrong before this work and is now
+    right.** It said the packages install "the six guest binaries";
+    there are sixteen `.bin` files in each packaging asset list, and a
+    stale comment above the `.deb` metadata in `src/vmm/Cargo.toml`
+    repeated the same number. Both now say sixteen, and both name the
+    host-side `instar-fetch` separately, with the page saying plainly
+    that nothing invokes it yet. That closes the fifth and last place
+    that enumerates what instar ships.
+15. **The two ends were not symmetric about asking the kernel for a
+    buffer, and it quietly lowered the ceiling.** Only the fetcher
+    asked; the client measured whatever its end happened to be given.
+    Since what a side can offer is its *granted* buffer, and the
+    default grant is below the protocol's largest block, the
+    negotiation could never have reached that block however much the
+    fetcher asked for -- invisibly, because the block in use is far
+    below either figure. Sizing now happens where the pair is made,
+    which is also the right place: it keeps the choice with the
+    socket's owner, so a test that deliberately shrinks a buffer to
+    prove the negotiation follows the grant is not silently
+    overridden. The first attempt at this fix put the request inside
+    the client and did override that test, which is how step 2d's test
+    earned its keep.
+16. **The block size the code settled on was not the one the operator
+    resolved**, which decision 6 now records. Step 2d's tests needed no
+    change, because they assert against `negotiate_block_size` rather
+    than against a number -- which is the reason that choice was worth
+    making.
 
 ## Mutation results
 

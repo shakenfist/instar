@@ -45,7 +45,7 @@ use std::process::ExitCode;
 
 use fetch_protocol::{
     negotiate_block_size, InitReply, InitRequest, ProtocolError, ReadReply, ReadRequest,
-    SeqPacketSocket, Status, DATAGRAM_OVERHEAD, MAX_BLOCK_SIZE, READ_REPLY_LEN,
+    SeqPacketSocket, Status,
 };
 
 /// What to print when the arguments do not make sense.
@@ -57,15 +57,6 @@ usage: instar-fetch <socket-fd> <file-fd>
 
 Both arguments are descriptor numbers that the parent process has already
 opened. instar-fetch takes no paths and opens nothing.";
-
-/// Socket buffer to ask the kernel for, on both directions.
-///
-/// It is the buffer that would allow the largest block the protocol permits:
-/// a full payload, its reply header, and the per-datagram overhead the kernel
-/// charges on top. The kernel grants what it likes -- it clamps the request
-/// to `wmem_max` and then doubles it -- so the figure that matters is the one
-/// read back afterwards, never this one.
-const WANTED_SOCKET_BUFFER: u32 = MAX_BLOCK_SIZE + READ_REPLY_LEN as u32 + DATAGRAM_OVERHEAD;
 
 /// Buffer for one incoming datagram.
 ///
@@ -251,11 +242,8 @@ fn serve(args: Args) -> io::Result<()> {
     // then read back what was granted: the ceiling is derived from the grant
     // and never from a sysctl or a constant. A kernel that refuses the
     // request is not fatal -- the negotiation simply settles lower.
-    if let Err(err) = socket.set_send_buffer_size(WANTED_SOCKET_BUFFER) {
-        eprintln!("instar-fetch: could not enlarge the send buffer: {err}");
-    }
-    if let Err(err) = socket.set_recv_buffer_size(WANTED_SOCKET_BUFFER) {
-        eprintln!("instar-fetch: could not enlarge the receive buffer: {err}");
+    if let Err(err) = socket.request_largest_buffers() {
+        eprintln!("instar-fetch: could not enlarge the socket buffers: {err}");
     }
     let max_datagram = socket.max_datagram()?;
 
@@ -602,17 +590,5 @@ mod tests {
     fn a_failing_source_is_reported_rather_than_answered() {
         let err = read_source(&Failing, 4096, &request(0, 512)).expect_err("fails");
         assert_eq!(err.raw_os_error(), Some(libc::EIO));
-    }
-
-    /// The wanted buffer has to be able to carry the largest block the
-    /// protocol permits, or the negotiation can never reach the ceiling even
-    /// on a host that would allow it.
-    #[test]
-    fn the_wanted_buffer_covers_the_largest_block() {
-        let ceiling = WANTED_SOCKET_BUFFER - DATAGRAM_OVERHEAD;
-        assert_eq!(
-            negotiate_block_size(ceiling, ceiling).expect("usable"),
-            MAX_BLOCK_SIZE
-        );
     }
 }

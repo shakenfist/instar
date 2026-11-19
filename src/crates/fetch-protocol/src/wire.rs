@@ -324,13 +324,23 @@ impl From<ProtocolError> for io::Error {
 /// from a sysctl: the granted socket buffer is not the value that was asked
 /// for, and the ceiling it implies is not derivable from the sysctl by
 /// inspection. The smaller side wins, the read reply's header is deducted,
-/// the result is capped at [`MAX_BLOCK_SIZE`] and rounded down to
-/// [`BLOCK_SIZE_GRANULARITY`], and anything below [`MIN_BLOCK_SIZE`] is
-/// refused rather than used.
+/// the result is rounded down to [`BLOCK_SIZE_GRANULARITY`], and anything
+/// below [`MIN_BLOCK_SIZE`] is refused rather than used.
+///
+/// The result is capped at [`DEFAULT_BLOCK_SIZE`] rather than at
+/// [`MAX_BLOCK_SIZE`], so a well-provisioned pair settles on the default
+/// instead of the largest block the protocol permits. A block above 64 KiB
+/// buys nothing while the guest's own request is at most that size: it only
+/// changes how a larger read is divided, and it would hold a receive buffer
+/// four times the size for payloads that never arrive. Reading ahead is a
+/// matter of having several requests in flight rather than of making one
+/// request bigger. [`MAX_BLOCK_SIZE`] remains the ceiling the wire format
+/// and the socket buffers are built to reach, so raising the default later
+/// is a change to this one constant and not to the protocol.
 pub fn negotiate_block_size(ours: u32, theirs: u32) -> Result<u32, ProtocolError> {
     let datagram = ours.min(theirs);
     let payload = datagram.saturating_sub(READ_REPLY_LEN as u32);
-    let capped = payload.min(MAX_BLOCK_SIZE);
+    let capped = payload.min(DEFAULT_BLOCK_SIZE);
     let aligned = capped - (capped % BLOCK_SIZE_GRANULARITY);
     if aligned < MIN_BLOCK_SIZE {
         return Err(ProtocolError::BlockSizeUnusable {
@@ -1207,12 +1217,22 @@ mod tests {
     }
 
     #[test]
-    fn negotiation_caps_at_the_maximum_block_size() {
-        assert_eq!(negotiate_block_size(u32::MAX, u32::MAX), Ok(MAX_BLOCK_SIZE));
+    fn negotiation_caps_at_the_default_block_size() {
+        assert_eq!(
+            negotiate_block_size(u32::MAX, u32::MAX),
+            Ok(DEFAULT_BLOCK_SIZE)
+        );
         // The measured ceiling on a host with the default wmem_max, both
-        // before and after asking the kernel for more, is well above the cap.
-        assert_eq!(negotiate_block_size(212_960, 212_960), Ok(212_480));
-        assert_eq!(negotiate_block_size(425_952, 425_952), Ok(MAX_BLOCK_SIZE));
+        // before and after asking the kernel for more, is well above the
+        // default block, so both settle there rather than on the grant.
+        assert_eq!(
+            negotiate_block_size(212_960, 212_960),
+            Ok(DEFAULT_BLOCK_SIZE)
+        );
+        assert_eq!(
+            negotiate_block_size(425_952, 425_952),
+            Ok(DEFAULT_BLOCK_SIZE)
+        );
     }
 
     #[test]

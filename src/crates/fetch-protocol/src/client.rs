@@ -111,6 +111,10 @@ impl FetchClient {
     /// a block size this side cannot carry.
     pub fn new(socket: SeqPacketSocket) -> io::Result<Self> {
         socket.set_recv_timeout(DEFAULT_REPLY_TIMEOUT)?;
+        // The socket arrives already sized by whoever created the pair, and
+        // this measures what it was given rather than changing it: a caller
+        // that deliberately chose a smaller buffer must not have it put
+        // back.
         let max_datagram = socket.max_datagram()?;
         socket.send(&InitRequest::new(max_datagram).encode())?;
 
